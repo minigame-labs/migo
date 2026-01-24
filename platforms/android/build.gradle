@@ -1,0 +1,38 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.1.2'
+    }
+}
+
+plugins {
+    id 'com.android.library' version '8.1.2' apply false
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
+
+task assembleDebug {
+    dependsOn ':library:assembleDebug'
+    doLast {
+        println "[INFO] Root assembleDebug completed (includes library:assembleDebug)"
+    }
+}
+
+task assembleRelease {
+    dependsOn ':library:assembleRelease'
+    doLast {
+        println "[INFO] Root assembleRelease completed (includes library:assembleRelease)"
+    }
+}
+
+task assemble {
+    dependsOn ':library:assemble'
+    doLast {
+        println "[INFO] Root assemble completed (includes library:assemble)"
+    }
+}

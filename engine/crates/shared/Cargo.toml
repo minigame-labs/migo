@@ -1,0 +1,23 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+base64 = "0.22.1"
+femtovg  = { workspace = true }
+image  = { workspace = true }
+hex = "0.4.3"
+tokio  = { workspace = true }
+bytemuck.workspace = true
+encoding_rs = "0.8.35"
+deno_core.workspace=true
+serde.workspace = true
+crossbeam-channel.workspace = true
+tracing = { workspace = true }
+smallvec = { workspace = true }
+raw-window-handle = { workspace = true }
+

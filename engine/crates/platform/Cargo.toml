@@ -1,0 +1,30 @@
+[package]
+name = "platform"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "platform"
+path = "lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+lazy_static = "1.5.0"
+core = {path = "../core"}
+shared = {path = "../shared"}
+js-runtime = {path = "../js-runtime"}
+graphics = {path = "../graphics"}
+io = {path = "../io"}
+crossbeam-channel = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-android = { workspace = true }
+tracing-subscriber = { workspace = true }
+smallvec = { workspace = true }
+deno_error = { workspace = true }
+
+jni = "0.21"
+deno_core = { workspace = true }
+raw-window-handle = { workspace = true }

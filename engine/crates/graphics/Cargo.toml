@@ -1,0 +1,20 @@
+[package]
+name = "graphics"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+glow = { workspace = true }
+khronos-egl = { workspace = true }
+tokio = { workspace = true }
+femtovg  = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+raw-window-handle = { workspace = true }
+shared = { path = "../shared" }
+
+libloading = { version = "^0.8" }
+parking_lot = "0.12.4"

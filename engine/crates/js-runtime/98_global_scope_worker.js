@@ -1,0 +1,4 @@
+const WorkerGloablScope = {
+};
+
+export { WorkerGloablScope };

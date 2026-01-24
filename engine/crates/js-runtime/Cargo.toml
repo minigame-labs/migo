@@ -1,0 +1,26 @@
+[package]
+name = "js-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+deno_core.workspace=true
+tokio = { version = "1.36.0", features = ["full"] }
+femtovg = { workspace = true }
+tracing = { workspace = true }
+shared = {path = "../shared"}
+serde.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+http.workspace = true
+data-url.workspace = true
+bytes.workspace = true
+crossbeam-channel.workspace = true
+deno_error.workspace = true
+glow.workspace = true
+bytemuck.workspace = true
+image.workspace = true
+once_cell.workspace = true
