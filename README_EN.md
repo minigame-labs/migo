@@ -26,7 +26,7 @@ Migo enables app developers to run mini-games inside their own apps, providing a
 |      Graphics       |       Audio        |        I/O       |      JS Runtime      |
 |      (OpenGL)       |     (WebAudio)     |     (File/Net)   |    (deno_core/V8)    |
 +---------------------+--------------------+------------------+----------------------+
-|                                    Rust Core Engine                                |
+|                                   Rust Core Engine                                 |
 +------------------------------------------------------------------------------------+
 |                       Platform Layer (Android / iOS / Windows)                     |
 +------------------------------------------------------------------------------------+
