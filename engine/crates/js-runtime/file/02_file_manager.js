@@ -13,6 +13,7 @@ import {
   op_rmdir, op_rmdir_sync,
   op_stat, op_stat_sync,
   op_write_file, op_write_file_sync,
+  op_read_file, op_read_file_sync,
 } from "ext:core/ops";
 
 import { core, primordials } from "ext:core/mod.js";
@@ -366,6 +367,98 @@ class BaseFileManager {
   }
 
   //
+  // readFile (path)
+  //
+  static readFile({ filePath, encoding, position, length, success, fail, complete }) {
+    // Convert position/length to BigInt for native op (or undefined)
+    const pos = typeof position === "number" && position > 0 ? BigInt(position) : undefined;
+    const len = typeof length === "number" && length >= 0 ? BigInt(length) : undefined;
+
+    const p = op_read_file(filePath, pos, len).then((data) => {
+      // data is Uint8Array from native (already sliced by position/length)
+      return BaseFileManager.#decodeReadData(data, encoding);
+    });
+
+    wrapAsync(p, "readFile:ok", "readFile", { success, fail, complete });
+  }
+
+  static readFileSync({ filePath, encoding, position, length }) {
+    // Convert position/length to BigInt for native op (or undefined)
+    const pos = typeof position === "number" && position > 0 ? BigInt(position) : undefined;
+    const len = typeof length === "number" && length >= 0 ? BigInt(length) : undefined;
+
+    return wrapSync(() => {
+      const data = op_read_file_sync(filePath, pos, len);
+      return BaseFileManager.#decodeReadData(data, encoding);
+    }, "readFileSync");
+  }
+
+  // Decode binary data based on encoding
+  // If encoding is undefined, return ArrayBuffer
+  // Otherwise decode to string with specified encoding
+  static #decodeReadData(data, encoding) {
+    const bytes = data;
+
+    // No encoding specified - return ArrayBuffer
+    if (encoding === undefined || encoding === null) {
+      return { data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
+    }
+
+    // Decode based on encoding
+    const enc = String(encoding).toLowerCase();
+    let result;
+
+    switch (enc) {
+      case "utf8":
+      case "utf-8":
+        result = new TextDecoder("utf-8").decode(bytes);
+        break;
+
+      case "utf16le":
+      case "utf-16le":
+      case "ucs2":
+      case "ucs-2":
+        result = new TextDecoder("utf-16le").decode(bytes);
+        break;
+
+      case "latin1":
+      case "binary":
+        // Latin1: each byte maps to a character (0x00-0xFF)
+        result = "";
+        for (let i = 0; i < bytes.length; i++) {
+          result += String.fromCharCode(bytes[i]);
+        }
+        break;
+
+      case "hex":
+        // Convert bytes to hex string
+        result = "";
+        for (let i = 0; i < bytes.length; i++) {
+          result += bytes[i].toString(16).padStart(2, "0");
+        }
+        break;
+
+      case "base64":
+        // Convert bytes to base64 string
+        result = btoa(String.fromCharCode(...bytes));
+        break;
+
+      case "ascii":
+        // ASCII: mask to 7-bit
+        result = "";
+        for (let i = 0; i < bytes.length; i++) {
+          result += String.fromCharCode(bytes[i] & 0x7F);
+        }
+        break;
+
+      default:
+        throw new IOError(`Unsupported encoding: ${encoding}`);
+    }
+
+    return { data: result };
+  }
+
+  //
   // placeholders
   //
   static unzip() { throw new IOError("target platform should handle this"); }
@@ -373,8 +466,6 @@ class BaseFileManager {
   static readSync() { throw new IOError("readSync: not implemented"); }
   static readCompressedFile() { throw new IOError("readCompressedFile: not implemented"); }
   static readCompressedFileSync() { throw new IOError("readCompressedFileSync: not implemented"); }
-  static readFile() { throw new IOError("readFile: not implemented"); }
-  static readFileSync() { throw new IOError("readFileSync: not implemented"); }
   static readZipEntry() { throw new IOError("readZipEntry: not implemented"); }
   static saveFile() { throw new IOError("saveFile: not implemented"); }
   static saveFileSync() { throw new IOError("saveFileSync: not implemented"); }

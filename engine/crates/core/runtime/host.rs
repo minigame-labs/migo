@@ -10,7 +10,7 @@ use shared::{
 
 use crate::{
     runtime::{HostId, loader::MyModuleLoader},
-    services::{IoService, PlatformServices, RenderService},
+    services::{AudioService, IoService, PlatformServices, RenderService},
 };
 
 use js_runtime::HostJsRuntime;
@@ -19,6 +19,7 @@ pub(crate) struct Host {
     pub(crate) id: HostId,
 
     pub(crate) io: IoService,
+    pub(crate) audio: AudioService,
     pub(crate) render: RenderService,
 
     pub(crate) js: HostJsRuntime,
@@ -31,6 +32,7 @@ impl Drop for Host {
             self.id
         );
         self.render.shutdown();
+        self.audio.shutdown();
         self.io.shutdown();
         info!("[Host {}] host cleanup complete.", self.id);
     }
@@ -46,6 +48,7 @@ impl Host {
     ) -> EngineResult<Self> {
         // ---- Services ----
         let io = IoService::new()?;
+        let audio = AudioService::new(js_tx.clone())?;
         let render = RenderService::new(js_tx.clone(), surface, init_options.pixel_ratio());
 
         // ---- HostOpState for extensions ----
@@ -55,6 +58,7 @@ impl Host {
             app_tmp_dir: init_options.tmp_dir().to_path_buf(),
             render_tx: render.sender(),
             io_tx: io.sender(),
+            audio_tx: audio.sender(),
         };
 
         let module_loader: Option<Rc<dyn ModuleLoader>> =
@@ -66,7 +70,7 @@ impl Host {
         // ---- JS runtime + bindings cache ----
         let js = HostJsRuntime::new(id as i32, host_state, extra_ext, module_loader);
 
-        Ok(Self { id, render, io, js })
+        Ok(Self { id, render, io, audio, js })
     }
 
     pub(crate) async fn handle_command(&mut self, cmd: HostCommand) {
@@ -109,6 +113,16 @@ impl Host {
             HostCommand::UpdateSurface { surface } => self.on_update_surface(surface),
 
             HostCommand::Shutdown => Ok(()),
+
+            HostCommand::InnerAudioEvent {
+                id,
+                event_type,
+                current_time,
+            } => {
+                self.js
+                    .dispatch_inner_audio_event(id, event_type.as_str(), current_time);
+                Ok(())
+            }
 
             _ => Ok(()),
         }

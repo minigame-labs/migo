@@ -2,11 +2,12 @@ use std::path::PathBuf;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::protocol::{io_cmd::IOCmd, render_cmd::RenderCommand};
+use crate::protocol::{audio_cmd::AudioCmd, io_cmd::IOCmd, render_cmd::RenderCommand};
 
 /// Host-side operational state shared across runtime layers.
 pub type RenderTx = crossbeam_channel::Sender<RenderCommand>;
 pub type IoTx = UnboundedSender<IOCmd>;
+pub type AudioTx = UnboundedSender<AudioCmd>;
 
 #[derive(Debug, Clone)]
 pub struct HostOpState {
@@ -15,6 +16,7 @@ pub struct HostOpState {
     pub code_dir: Option<String>,
     pub render_tx: RenderTx,
     pub io_tx: IoTx,
+    pub audio_tx: AudioTx,
 }
 
 #[derive(Debug, Clone)]

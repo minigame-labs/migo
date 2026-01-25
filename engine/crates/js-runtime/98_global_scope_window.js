@@ -7,6 +7,8 @@ import * as raf from "ext:host_v8_webgl/03_raf.js";
 import * as canvas from "ext:host_v8_web/03_canvas.js";
 import * as webgl from 'ext:host_v8_webgl/02_webgl_context.js';
 import * as touch from 'ext:host_v8_touch/01_touch.js';
+import * as audio from 'ext:host_v8_audio/01_audio_context.js';
+import * as innerAudio from 'ext:host_v8_audio/02_inner_audio_context.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -35,6 +37,20 @@ const WindowGlobalScope = {
     offTouchEnd: core.propNonEnumerable(touch.offTouchEnd),
     offTouchCancel: core.propNonEnumerable(touch.offTouchCancel),
     _internalEnqueueRawTouchEvent: core.propNonEnumerable(touch._internalEnqueueRawTouchEvent),
+
+    // Audio (WebAudio API)
+    AudioContext: core.propNonEnumerable(audio.AudioContext),
+    AudioBuffer: core.propNonEnumerable(audio.AudioBuffer),
+    AudioNode: core.propNonEnumerable(audio.AudioNode),
+    AudioDestinationNode: core.propNonEnumerable(audio.AudioDestinationNode),
+    AudioBufferSourceNode: core.propNonEnumerable(audio.AudioBufferSourceNode),
+    GainNode: core.propNonEnumerable(audio.GainNode),
+    AudioParam: core.propNonEnumerable(audio.AudioParam),
+
+    // InnerAudioContext
+    InnerAudioContext: core.propNonEnumerable(innerAudio.InnerAudioContext),
+    createInnerAudioContext: core.propNonEnumerable(innerAudio.createInnerAudioContext),
+    _internalEnqueueInnerAudioEvent: core.propNonEnumerable(innerAudio._internalEnqueueInnerAudioEvent),
 };
 
 export { WindowGlobalScope };

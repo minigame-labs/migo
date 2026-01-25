@@ -1,4 +1,6 @@
-use deno_core::{JsBuffer, OpState, op2, serde_json, v8};
+use std::{cell::RefCell, path::PathBuf, rc::Rc};
+
+use deno_core::{JsBuffer, OpState, ToJsBuffer, op2, serde_json, v8};
 use shared::{
     codec,
     error::{EngineError, ErrorCode},
@@ -8,7 +10,6 @@ use shared::{
         io_cmd::{FileId, FileStat, IOCmd, IOCmdResp, OpenFlag, WriteMode},
     },
 };
-use std::{cell::RefCell, rc::Rc};
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
@@ -54,15 +55,52 @@ fn ioerr(msg: impl Into<String>) -> IOError {
     IOError::Message(msg.into())
 }
 
+/// Get IO channel from async op state.
 #[inline]
 fn get_io_tx_async(state: Rc<RefCell<OpState>>) -> UnboundedSender<IOCmd> {
     let st = state.borrow();
     st.borrow::<HostOpState>().io_tx.clone()
 }
 
+/// Get IO channel and code_dir from async op state.
 #[inline]
-fn get_io_tx_sync(state: &mut OpState) -> &UnboundedSender<IOCmd> {
+fn get_host_state_async(state: &Rc<RefCell<OpState>>) -> (UnboundedSender<IOCmd>, Option<String>) {
+    let st = state.borrow();
+    let host = st.borrow::<HostOpState>();
+    (host.io_tx.clone(), host.code_dir.clone())
+}
+
+/// Get IO channel from sync op state.
+#[inline]
+fn get_io_tx_sync(state: &OpState) -> &UnboundedSender<IOCmd> {
     &state.borrow::<HostOpState>().io_tx
+}
+
+/// Get code_dir from sync op state.
+#[inline]
+fn get_code_dir_sync(state: &OpState) -> Option<&str> {
+    state.borrow::<HostOpState>().code_dir.as_deref()
+}
+
+/// Resolve a relative path against code_dir.
+/// If path is absolute or code_dir is None, return path as-is.
+#[inline]
+fn resolve_path(code_dir: Option<&str>, path: &str) -> String {
+    // If path is absolute, return as-is
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        return path.to_string();
+    }
+
+    // If code_dir exists, join with it
+    match code_dir {
+        Some(base) if !base.is_empty() => {
+            let mut full = PathBuf::from(base);
+            full.push(path);
+            full.to_string_lossy().into_owned()
+        }
+        _ => path.to_string(),
+    }
 }
 
 #[inline]
@@ -159,7 +197,7 @@ pub async fn op_write_or_append_file(
     #[string] encoding: Option<String>,
     append: bool,
 ) -> Result<bool, IOError> {
-    let tx = get_io_tx_async(state);
+    let tx: UnboundedSender<IOCmd> = get_io_tx_async(state);
     let mode = mode_from_append(append);
     let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
 
@@ -660,4 +698,50 @@ pub fn op_write_file_sync(
     };
 
     r.map_err(IOError::from)
+}
+
+//
+// readFile (path)
+//
+#[op2(async)]
+#[serde]
+pub async fn op_read_file(
+    state: Rc<RefCell<OpState>>,
+    #[string] path: String,
+    #[bigint] position: Option<u64>,
+    #[bigint] length: Option<u64>,
+) -> Result<ToJsBuffer, IOError> {
+    let (tx, code_dir) = get_host_state_async(&state);
+    let full_path = resolve_path(code_dir.as_deref(), &path);
+
+    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ReadFile {
+        path: full_path,
+        position,
+        length,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map(|data| data.into())
+    .map_err(IOError::from)
+}
+
+#[op2]
+#[serde]
+pub fn op_read_file_sync(
+    state: &mut OpState,
+    #[string] path: String,
+    #[bigint] position: Option<u64>,
+    #[bigint] length: Option<u64>,
+) -> Result<ToJsBuffer, IOError> {
+    let tx = get_io_tx_sync(state);
+    let full_path = resolve_path(get_code_dir_sync(state), &path);
+
+    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::ReadFile {
+        path: full_path,
+        position,
+        length,
+        resp: IOCmdResp::Sync(resp_tx),
+    })
+    .map(|data| data.into())
+    .map_err(IOError::from)
 }

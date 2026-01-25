@@ -15,6 +15,7 @@ use crate::{
     op_state::CanvasOpState,
 };
 
+pub mod audio_cmd;
 pub mod host_cmd;
 pub mod io_cmd;
 pub mod render_cmd;

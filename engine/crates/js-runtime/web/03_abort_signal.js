@@ -137,7 +137,6 @@ class AbortSignal extends EventTarget {
     }
 
     get aborted() {
-        console.log('abort check', this[abortReason] !== undefined);
         return this[abortReason] !== undefined;
     }
 

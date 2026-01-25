@@ -48,6 +48,14 @@ class ResponseBase {
         this._exception = exception;
     }
 
+    get useHttpDNS() {
+        return this._useHttpDNS;
+    }
+
+    get exception() {
+        return this._exception;
+    }
+
     toJSON() {
         return {
             useHttpDNS: this._useHttpDNS,
@@ -67,6 +75,15 @@ class Response extends ResponseBase {
     set data(value) {
         this._data = value;
     }
+
+    get data() {
+        return this._data;
+    }
+
+    get statusCode() {
+        return this._header?.statusCode;
+    }
+
 
     toJSON() {
         return {

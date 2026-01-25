@@ -84,6 +84,11 @@ impl HostJsRuntime {
             .dispatch_touch(&mut self.rt, self.host_id, touch_type, points, timestamp_ms);
     }
 
+    pub fn dispatch_inner_audio_event(&mut self, id: u32, event_type: &str, current_time: f64) {
+        self.bindings
+            .dispatch_inner_audio_event(&mut self.rt, self.host_id, id, event_type, current_time);
+    }
+
     // ---- Scripts / modules ----
 
     pub async fn exec_script_and_pump(

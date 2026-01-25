@@ -225,6 +225,19 @@ function Build-Platform {
         Print-Warning "Output .so not found: $srcSo"
     }
 
+    # --------------------------------------------------------
+    # Copy libc++_shared.so (required by cpal/oboe)
+    # --------------------------------------------------------
+    $libcppSrc = Join-Path $env:ANDROID_NDK_HOME "toolchains\llvm\prebuilt\windows-x86_64\sysroot\usr\lib\$targetTriple\libc++_shared.so"
+    $libcppDst = Join-Path $dstDir "libc++_shared.so"
+
+    if (Test-Path $libcppSrc) {
+        Copy-Item $libcppSrc $libcppDst -Force
+        Print-Success "Copied -> $libcppDst"
+    } else {
+        Print-Warning "libc++_shared.so not found: $libcppSrc"
+    }
+
     $env:RUSTFLAGS = $origRUSTFLAGS
     return $true
 }

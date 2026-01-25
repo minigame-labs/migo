@@ -8,6 +8,7 @@ use shared::protocol::host_cmd::{TouchPoint, TouchType};
 pub(crate) struct JsBindings {
     main_js_context: v8::Global<v8::Context>,
     enqueue_touch_event_fn: Option<v8::Global<v8::Function>>,
+    enqueue_inner_audio_event_fn: Option<v8::Global<v8::Function>>,
     schedule_raf_fn: Option<v8::Global<v8::Function>>,
 }
 
@@ -18,6 +19,7 @@ impl JsBindings {
         let mut this = Self {
             main_js_context,
             enqueue_touch_event_fn: None,
+            enqueue_inner_audio_event_fn: None,
             schedule_raf_fn: None,
         };
 
@@ -37,16 +39,25 @@ impl JsBindings {
             Some(v8::Global::new(scope, f))
         }
 
-        let (enqueue, raf) = self.with_main_context(rt, |scope, _ctx, global| {
-            let enqueue = get_global_fn(scope, global, "_internalEnqueueRawTouchEvent");
+        let (enqueue_touch, enqueue_audio, raf) = self.with_main_context(rt, |scope, _ctx, global| {
+            let enqueue_touch = get_global_fn(scope, global, "_internalEnqueueRawTouchEvent");
+            let enqueue_audio = get_global_fn(scope, global, "_internalEnqueueInnerAudioEvent");
             let raf = get_global_fn(scope, global, "_internalScheduleRaf");
-            (enqueue, raf)
+            (enqueue_touch, enqueue_audio, raf)
         });
 
-        self.enqueue_touch_event_fn = enqueue;
+        self.enqueue_touch_event_fn = enqueue_touch;
         if self.enqueue_touch_event_fn.is_none() {
             warn!(
                 "[Host {}] global function _internalEnqueueRawTouchEvent not found",
+                host_id
+            );
+        }
+
+        self.enqueue_inner_audio_event_fn = enqueue_audio;
+        if self.enqueue_inner_audio_event_fn.is_none() {
+            warn!(
+                "[Host {}] global function _internalEnqueueInnerAudioEvent not found",
                 host_id
             );
         }
@@ -119,6 +130,33 @@ impl JsBindings {
                 ab.into(),
                 v8::Integer::new(scope, points.len() as i32).into(),
                 v8::Number::new(scope, timestamp_ms as f64).into(),
+            ];
+
+            let func = v8::Local::new(scope, func_g);
+            let _ = func.call(scope, global.into(), &args);
+        });
+    }
+
+    /// Dispatch inner audio event to JS.
+    /// Args: (id: u32, event_type: &str, current_time: f64)
+    pub(crate) fn dispatch_inner_audio_event(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        host_id: i32,
+        id: u32,
+        event_type: &str,
+        current_time: f64,
+    ) {
+        let Some(func_g) = self.enqueue_inner_audio_event_fn.as_ref() else {
+            warn!("[Host {}] inner audio event handler not installed", host_id);
+            return;
+        };
+
+        self.with_main_context(rt, |scope, _ctx, global| {
+            let args = [
+                v8::Integer::new(scope, id as i32).into(),
+                v8::String::new(scope, event_type).unwrap().into(),
+                v8::Number::new(scope, current_time).into(),
             ];
 
             let func = v8::Local::new(scope, func_g);

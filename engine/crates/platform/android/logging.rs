@@ -91,7 +91,7 @@ pub fn init_logging() {
         };
 
         Registry::default()
-            .with(LevelFilter::INFO)
+            .with(LevelFilter::TRACE)
             .with(android_layer)
             .with(timing_layer)
             .init();

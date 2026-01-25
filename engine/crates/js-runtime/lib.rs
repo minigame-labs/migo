@@ -1,5 +1,6 @@
 use shared::op_state::HostOpState;
 
+mod audio;
 mod base;
 mod console;
 mod file;
@@ -39,6 +40,7 @@ pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
         .chain(web::web_extensions())
         .chain(url::url_extensions())
         .chain(network::network_extensions())
+        .chain(audio::audio_extensions())
         .chain(runtime_extensions)
         .collect()
 }

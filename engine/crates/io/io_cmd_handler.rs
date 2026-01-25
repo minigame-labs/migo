@@ -3,7 +3,7 @@ use std::{collections::HashMap, io::SeekFrom, ops::Range, path::PathBuf};
 use deno_core::v8::{BackingStore, SharedRef};
 use tokio::{
     fs::{self, OpenOptions},
-    io::{AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     time::Instant,
 };
 use tracing::{trace, warn};
@@ -271,8 +271,42 @@ impl IoCmdHandler {
                 Self::send_resp(resp, r);
             }
 
-            IOCmd::ReadFile { path, resp } => {
-                let r = fs::read(&path).await.map_err(Self::io_err);
+            IOCmd::ReadFile {
+                path,
+                position,
+                length,
+                resp,
+            } => {
+                let r: Result<Vec<u8>, EngineError> = (async {
+                    // If no position/length, read entire file (fast path)
+                    if position.is_none() && length.is_none() {
+                        return fs::read(&path).await.map_err(Self::io_err);
+                    }
+
+                    // Open file and seek/read specific range
+                    let mut file = fs::File::open(&path).await.map_err(Self::io_err)?;
+
+                    // Seek to position if specified
+                    if let Some(pos) = position {
+                        file.seek(SeekFrom::Start(pos)).await.map_err(Self::io_err)?;
+                    }
+
+                    // Read specified length or rest of file
+                    let data = if let Some(len) = length {
+                        let mut buf = vec![0u8; len as usize];
+                        let n = file.read(&mut buf).await.map_err(Self::io_err)?;
+                        buf.truncate(n);
+                        buf
+                    } else {
+                        let mut buf = Vec::new();
+                        file.read_to_end(&mut buf).await.map_err(Self::io_err)?;
+                        buf
+                    };
+
+                    Ok(data)
+                })
+                .await;
+
                 Self::send_resp(resp, r);
             }
 

@@ -1,0 +1,38 @@
+[package]
+name = "audio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Cross-platform audio output
+cpal = "0.15"
+
+# Decoders - lightweight combination
+minimp3 = "0.5"      # MP3, MIT license
+lewton = "0.10"      # OGG Vorbis, MIT/Apache-2.0
+hound = "3.5"        # WAV, Apache-2.0
+
+# Resampler for sample rate conversion
+rubato = "0.15"      # High quality resampler, MIT license
+
+# Thread-safe audio buffer
+ringbuf = "0.4"
+
+# Async
+tokio = { workspace = true, features = ["sync", "rt"] }
+
+# HTTP client for streaming download
+reqwest = { workspace = true }
+futures-util = "0.3"
+
+# Shared
+shared = { path = "../shared" }
+tracing = { workspace = true }
+
+# Android specific: use oboe backend + shared C++ STL
+[target.'cfg(target_os = "android")'.dependencies.cpal]
+version = "0.15"
+features = ["oboe-shared-stdcxx"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-context = "0.1"

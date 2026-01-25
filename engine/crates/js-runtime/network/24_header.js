@@ -21,6 +21,10 @@ class Header {
         return this._headers;
     }
 
+    get statusCode() {
+        return this._statusCode;
+    }
+
     toJSON() {
         return {
             header: this._headers,

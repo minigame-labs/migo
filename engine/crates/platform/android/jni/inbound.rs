@@ -31,6 +31,15 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
     // Initialize logging/tracing once.
     logging::init_logging();
 
+    // Initialize ndk-context for cpal/oboe audio backend.
+    // This must be done before any audio operations.
+    unsafe {
+        ndk_context::initialize_android_context(
+            vm.get_java_vm_pointer().cast(),
+            std::ptr::null_mut(), // activity can be null for audio-only usage
+        );
+    }
+
     // Initialize the global JNI environment helper.
     // This also registers Java exports + native exports.
     init_jni_env(vm).expect("Failed to initialize JNI environment");

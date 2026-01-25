@@ -1,11 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
- "crates/core", 
+ "crates/audio",
+ "crates/core",
  "crates/graphics",
- "crates/io", 
- "crates/js-runtime", 
- "crates/platform", 
+ "crates/io",
+ "crates/js-runtime",
+ "crates/platform",
  "crates/shared"
 ]
 

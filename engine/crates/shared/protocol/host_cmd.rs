@@ -33,6 +33,44 @@ pub enum HostCommand {
 
     /// RequestAnimationFrame callback with a `time` value (milliseconds).
     RequestAnimationFrame(f64),
+
+    /// InnerAudioContext event pushed from audio thread
+    InnerAudioEvent {
+        id: u32,
+        event_type: InnerAudioEventType,
+        current_time: f64,
+    },
+}
+
+/// Event types for InnerAudioContext (duplicated here for host_cmd module independence)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InnerAudioEventType {
+    CanPlay,
+    Play,
+    Pause,
+    Stop,
+    Ended,
+    Seeking,
+    Seeked,
+    TimeUpdate,
+    Error,
+}
+
+impl InnerAudioEventType {
+    /// Convert to JS-compatible camelCase string
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InnerAudioEventType::CanPlay => "canPlay",
+            InnerAudioEventType::Play => "play",
+            InnerAudioEventType::Pause => "pause",
+            InnerAudioEventType::Stop => "stop",
+            InnerAudioEventType::Ended => "ended",
+            InnerAudioEventType::Seeking => "seeking",
+            InnerAudioEventType::Seeked => "seeked",
+            InnerAudioEventType::TimeUpdate => "timeUpdate",
+            InnerAudioEventType::Error => "error",
+        }
+    }
 }
 
 /// Must match the memory layout produced by the Java side `ByteBuffer`.

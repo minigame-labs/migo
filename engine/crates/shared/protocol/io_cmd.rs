@@ -162,6 +162,8 @@ pub enum IOCmd {
 
     ReadFile {
         path: String,
+        position: Option<u64>,
+        length: Option<u64>,
         resp: IOCmdResp<Vec<u8>>,
     },
 
