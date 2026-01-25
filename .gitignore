@@ -1,2 +1,49 @@
+# Rust
 /target
 **/target
+**/*.rs.bk
+Cargo.lock
+
+# Build outputs
+*.aar
+*.apk
+*.so
+*.dylib
+*.dll
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Node (if used for tooling)
+node_modules/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Android
+*.iml
+.gradle/
+local.properties
+/build
+/captures
+.externalNativeBuild/
+.cxx/
+
+# Temporary
+*.tmp
+*.temp
