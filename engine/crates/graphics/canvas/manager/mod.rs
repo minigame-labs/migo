@@ -1,5 +1,6 @@
 extern crate khronos_egl as egl;
 
+use crate::{BoundContext, Canvas2DContext};
 use egl::EGL1_4;
 use femtovg::ImageId;
 use glow::HasContext;
@@ -14,16 +15,13 @@ use std::{
     collections::{HashMap, HashSet},
     sync::atomic::{AtomicU32, Ordering},
 };
-use tracing::info;
-
-use crate::{BoundContext, Canvas2DContext};
 
 mod context_2d_impl;
 mod egl_ops;
 mod image;
 mod types;
 
-pub(crate) use types::{ee, BufferMeta, CanvasGLState, CanvasInfo, ProgramMeta, ShaderMeta};
+pub(crate) use types::{BufferMeta, CanvasGLState, CanvasInfo, ProgramMeta, ShaderMeta, ee};
 use types::{CanvasEntry, EglContextHandle, SurfaceKind};
 
 use self::image::ImageRegistry;
@@ -667,9 +665,12 @@ impl CanvasManager {
                 if *bound == BoundContext::Canvas(canvas_id) {
                     return Ok(());
                 }
-                let entry = canvases
-                    .get(&canvas_id)
-                    .ok_or_else(|| ee(ErrorCode::NotFound, format!("canvas not found: {canvas_id:?}")))?;
+                let entry = canvases.get(&canvas_id).ok_or_else(|| {
+                    ee(
+                        ErrorCode::NotFound,
+                        format!("canvas not found: {canvas_id:?}"),
+                    )
+                })?;
 
                 egl.make_current(
                     display,

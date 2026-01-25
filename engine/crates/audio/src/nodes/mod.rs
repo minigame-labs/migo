@@ -8,6 +8,7 @@ pub use gain::GainNode;
 
 use shared::protocol::audio_cmd::AudioNodeId;
 
+#[allow(dead_code)]
 /// Trait for all audio nodes
 pub trait AudioNode: Send {
     /// Get the node ID

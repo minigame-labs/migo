@@ -3,6 +3,7 @@ use shared::protocol::audio_cmd::AudioNodeId;
 use super::AudioNode;
 
 pub struct GainNode {
+    #[allow(dead_code)]
     id: AudioNodeId,
     gain: f32,
 }
@@ -16,6 +17,7 @@ impl GainNode {
         self.gain = value;
     }
 
+    #[allow(dead_code)]
     pub fn gain(&self) -> f32 {
         self.gain
     }

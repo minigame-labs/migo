@@ -2,6 +2,8 @@ use shared::protocol::audio_cmd::AudioNodeId;
 
 use super::AudioNode;
 
+
+#[allow(dead_code)]
 /// The destination node represents the final output of the audio graph.
 /// It collects mixed audio from all connected source nodes.
 pub struct DestinationNode {

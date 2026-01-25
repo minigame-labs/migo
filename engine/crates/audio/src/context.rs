@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -134,7 +136,8 @@ impl AudioContext {
     /// Create a buffer source node with JS-provided node_id
     pub fn create_buffer_source(&mut self, node_id: AudioNodeId) {
         tracing::trace!("create_buffer_source: node_id={}", node_id);
-        self.source_nodes.insert(node_id, BufferSourceNode::new(node_id));
+        self.source_nodes
+            .insert(node_id, BufferSourceNode::new(node_id));
     }
 
     /// Create a gain node with JS-provided node_id
@@ -147,16 +150,23 @@ impl AudioContext {
         tracing::trace!("set_buffer: node_id={}, buffer_id={}", node_id, buffer_id);
         if let Some(node) = self.source_nodes.get_mut(&node_id) {
             if let Some(buffer) = self.buffers.get(&buffer_id) {
-                tracing::trace!("set_buffer: found node and buffer, samples={}, channels={}, sample_rate={}",
-                    buffer.samples.len(), buffer.channels, buffer.sample_rate);
+                tracing::trace!(
+                    "set_buffer: found node and buffer, samples={}, channels={}, sample_rate={}",
+                    buffer.samples.len(),
+                    buffer.channels,
+                    buffer.sample_rate
+                );
                 node.set_buffer(buffer.clone());
                 return true;
             } else {
                 tracing::warn!("set_buffer: buffer {} not found", buffer_id);
             }
         } else {
-            tracing::warn!("set_buffer: source node {} not found, available: {:?}",
-                node_id, self.source_nodes.keys().collect::<Vec<_>>());
+            tracing::warn!(
+                "set_buffer: source node {} not found, available: {:?}",
+                node_id,
+                self.source_nodes.keys().collect::<Vec<_>>()
+            );
         }
         false
     }
@@ -168,8 +178,13 @@ impl AudioContext {
         offset: f64,
         duration: Option<f64>,
     ) -> bool {
-        tracing::trace!("start_source: node_id={}, when={}, offset={}, duration={:?}",
-            node_id, when, offset, duration);
+        tracing::trace!(
+            "start_source: node_id={}, when={}, offset={}, duration={:?}",
+            node_id,
+            when,
+            offset,
+            duration
+        );
         let current_time = self.current_time();
         if let Some(node) = self.source_nodes.get_mut(&node_id) {
             node.start(when, offset, duration, current_time);
@@ -188,13 +203,7 @@ impl AudioContext {
         false
     }
 
-    pub fn set_loop(
-        &mut self,
-        node_id: AudioNodeId,
-        enabled: bool,
-        start: f64,
-        end: f64,
-    ) -> bool {
+    pub fn set_loop(&mut self, node_id: AudioNodeId, enabled: bool, start: f64, end: f64) -> bool {
         if let Some(node) = self.source_nodes.get_mut(&node_id) {
             node.set_loop(enabled, start, end);
             return true;
@@ -223,10 +232,17 @@ impl AudioContext {
     pub fn connect(&mut self, src: AudioNodeId, dst: AudioNodeId) {
         tracing::trace!("connect: src={}, dst={}", src, dst);
         // Avoid duplicate connections
-        if !self.connections.iter().any(|c| c.src == src && c.dst == dst) {
+        if !self
+            .connections
+            .iter()
+            .any(|c| c.src == src && c.dst == dst)
+        {
             self.connections.push(NodeConnection { src, dst });
             self.routes_dirty = true;
-            tracing::trace!("connect: added connection, total={}", self.connections.len());
+            tracing::trace!(
+                "connect: added connection, total={}",
+                self.connections.len()
+            );
         }
     }
 
@@ -265,8 +281,14 @@ impl AudioContext {
                     let gain_id = conn.src;
                     // Find sources connected to this gain node
                     for inner_conn in &self.connections {
-                        if inner_conn.dst == gain_id && self.source_nodes.contains_key(&inner_conn.src) {
-                            tracing::trace!("rebuild_routes: route from source {} via gain {}", inner_conn.src, gain_id);
+                        if inner_conn.dst == gain_id
+                            && self.source_nodes.contains_key(&inner_conn.src)
+                        {
+                            tracing::trace!(
+                                "rebuild_routes: route from source {} via gain {}",
+                                inner_conn.src,
+                                gain_id
+                            );
                             self.routes.push(SourceRoute {
                                 source_id: inner_conn.src,
                                 gain_id: Some(gain_id),
@@ -285,7 +307,8 @@ impl AudioContext {
 
     /// Process audio and fill the output buffer
     pub fn process(&mut self, output: &mut [f32]) {
-        static PROCESS_LOG_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        static PROCESS_LOG_COUNTER: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
 
         if self.state != AudioContextState::Running {
             output.fill(0.0);
@@ -316,7 +339,11 @@ impl AudioContext {
         let should_log = counter % 100 == 0;
 
         if should_log {
-            tracing::trace!("process: routes={}, source_nodes={}", routes.len(), self.source_nodes.len());
+            tracing::trace!(
+                "process: routes={}, source_nodes={}",
+                routes.len(),
+                self.source_nodes.len()
+            );
         }
 
         // Process each route
@@ -331,7 +358,11 @@ impl AudioContext {
             let frames_written = source.process_with_channels(buffer, channels as u32);
 
             if should_log && frames_written > 0 {
-                tracing::trace!("process: source {} wrote {} frames", route.source_id, frames_written);
+                tracing::trace!(
+                    "process: source {} wrote {} frames",
+                    route.source_id,
+                    frames_written
+                );
             }
 
             // Apply gain if present

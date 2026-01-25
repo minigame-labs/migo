@@ -18,6 +18,7 @@ pub enum BufferSourceState {
 }
 
 pub struct BufferSourceNode {
+    #[allow(dead_code)]
     id: AudioNodeId,
     buffer: Option<Arc<DecodedAudio>>,
     state: BufferSourceState,
@@ -91,6 +92,7 @@ impl BufferSourceNode {
         self.playback_rate = rate.max(0.0);
     }
 
+    #[allow(dead_code)]
     pub fn state(&self) -> BufferSourceState {
         self.state
     }

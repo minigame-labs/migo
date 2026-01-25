@@ -275,14 +275,6 @@ impl AudioSource {
             v.extend(samples);
         }
     }
-
-    /// Get mutable access to owned samples (for pre-allocation)
-    fn as_owned_mut(&mut self) -> Option<&mut Vec<f32>> {
-        match self {
-            AudioSource::Owned(v) => Some(v),
-            AudioSource::Cached(_) => None,
-        }
-    }
 }
 
 /// InnerAudioPlayer - handles playback of a single audio source

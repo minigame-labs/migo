@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 /// Simple audio mixer for combining multiple sources
 pub struct Mixer {
     channels: u32,
