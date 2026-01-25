@@ -10,7 +10,7 @@ import java.nio.ByteBuffer;
 
 final class HostJNI {
     static {
-        System.loadLibrary("minigame_host");
+        System.loadLibrary("migo");
     }
 
     static native String version();

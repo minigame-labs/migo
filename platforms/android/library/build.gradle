@@ -6,6 +6,9 @@ android {
     namespace 'com.minigame.host'
     compileSdk 34
 
+    // Output AAR file name
+    project.archivesBaseName = "migo"
+
     defaultConfig {
         minSdk 21
         targetSdk 34

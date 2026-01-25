@@ -25,7 +25,7 @@ $CRATE_DIR  = "crates/$CRATE_NAME"
 # cargo output naming rule: lib{crate}.so
 $CRATE_SO_NAME = "lib$CRATE_NAME.so"
 
-$OUTPUT_SO_NAME = "libminigame_host.so"
+$OUTPUT_SO_NAME = "libmigo.so"
 
 $PLATFORM_MAP = @{
     "arm64-v8a" = "aarch64-linux-android"

@@ -27,7 +27,7 @@ pub fn spawn_host_thread(
     registry::register_sender(id, js_tx.clone());
 
     let spawn_result = std::thread::Builder::new()
-        .name(format!("MiniGame-Main-{}", id))
+        .name(format!("Migo-Main-{}", id))
         .spawn(move || {
             let run = || {
                 let host = match Host::new(id, js_tx, surface, platform, opt) {

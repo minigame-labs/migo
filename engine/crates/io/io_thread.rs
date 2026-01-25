@@ -27,7 +27,7 @@ impl IOThread {
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<RuntimeInitResult>(1);
 
         let handle = thread::Builder::new()
-            .name("MiniGame-IOThread".into())
+            .name("Migo-IOThread".into())
             .spawn(move || {
                 // Build runtime first, report any error back to spawner
                 let rt = match tokio::runtime::Builder::new_current_thread()

@@ -15,7 +15,7 @@ pub fn init_logging() {
 
     // Android logcat layer.
     let android_layer =
-        tracing_android::layer("[minigame-host]").expect("failed to create tracing_android layer");
+        tracing_android::layer("[migo]").expect("failed to create tracing_android layer");
 
     #[cfg(debug_assertions)]
     {

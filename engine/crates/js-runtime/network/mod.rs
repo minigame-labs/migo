@@ -12,7 +12,7 @@ struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            user_agent: "minigame-host".to_string(),
+            user_agent: "migo".to_string(),
         }
     }
 }

@@ -37,7 +37,7 @@ impl AudioThread {
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<InitResult>(1);
 
         let handle = thread::Builder::new()
-            .name("MiniGame-AudioThread".into())
+            .name("Migo-AudioThread".into())
             .spawn(move || {
                 // Initialize audio output
                 let output = match AudioOutput::new() {

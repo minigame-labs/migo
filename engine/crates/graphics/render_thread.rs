@@ -19,7 +19,7 @@ impl RenderThread {
         let (cmd_tx, cmd_rx) = bounded::<RenderCommand>(128);
 
         let handle = std::thread::Builder::new()
-            .name("MiniGame-RenderThread".into())
+            .name("Migo-RenderThread".into())
             .spawn(move || {
                 #[cfg(target_os = "android")]
                 const EGL_LIB: &str = "libEGL.so";
