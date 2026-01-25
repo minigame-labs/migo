@@ -12,7 +12,7 @@ Migo enables app developers to run mini-games inside their own apps, providing a
 - **High performance** — Rust core engine with an optimized rendering pipeline
 - **Canvas 2D & WebGL** — Full support for 2D canvas and WebGL rendering
 - **Audio support** — WebAudio-style APIs (including streaming playback)
-- **Cross-platform** — Android, iOS, and Windows 
+- **Cross-platform** — Android (iOS and Windows planned) 
 - **Lightweight** — Small footprint and fast startup
 
 ## Architecture
@@ -28,7 +28,7 @@ Migo enables app developers to run mini-games inside their own apps, providing a
 +---------------------+--------------------+------------------+----------------------+
 |                                   Rust Core Engine                                 |
 +------------------------------------------------------------------------------------+
-|                       Platform Layer (Android / iOS / Windows)                     |
+|                         Platform Layer (Android | iOS | Windows)                   |
 +------------------------------------------------------------------------------------+
 ```
 
