@@ -18,18 +18,18 @@ Migo enables app developers to run mini-games inside their own apps, providing a
 ## Architecture
 
 ```text
-+---------------------------------------------------------+
-|                         Your App                        |
-+---------------------------------------------------------+
-|                         Migo SDK                        |
-+-----------+-----------+-----------+---------------------+
-| Graphics  |   Audio   |    I/O    |      JS Runtime     |
-| (OpenGL)  | (WebAudio)| (File/Net)|    (deno_core/V8)   |
-+-----------+-----------+-----------+---------------------+
-|                    Rust Core Engine                     |
-+---------------------------------------------------------+
-|        Platform Layer (Android / iOS / Windows)         |
-+---------------------------------------------------------+
++------------------------------------------------------------------------------------+
+|                                      Your App                                      |
++------------------------------------------------------------------------------------+
+|                                      Migo SDK                                      |
++---------------------+------------------- +------------------+----------------------+
+|      Graphics       |       Audio        |        I/O       |      JS Runtime      |
+|      (OpenGL)       |     (WebAudio)     |     (File/Net)   |    (deno_core/V8)    |
++---------------------+--------------------+------------------+----------------------+
+|                                    Rust Core Engine                                |
++------------------------------------------------------------------------------------+
+|                       Platform Layer (Android / iOS / Windows)                     |
++------------------------------------------------------------------------------------+
 ```
 
 ## Quick Start
@@ -130,4 +130,4 @@ See [NOTICE](NOTICE) for the full list of dependencies and licenses.
 ## Support
 
 - Issues: https://github.com/minigame-labs/migo/issues
-- Wiki/Docs (optional): https://github.com/minigame-labs/migo/wiki
+- Wiki/Docs: https://github.com/minigame-labs/migo/wiki
