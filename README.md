@@ -36,6 +36,8 @@ Migo 让 App 厂商可以在自己的应用中运行小游戏：提供**兼容�
 
 ### Android 集成
 
+> 完整示例项目请参考 [migo-android-demo](https://github.com/minigame-labs/migo-android-demo)
+
 1. 添加 AAR 依赖到项目：
 
 ```gradle

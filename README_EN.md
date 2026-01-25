@@ -36,6 +36,8 @@ Migo enables app developers to run mini-games inside their own apps, providing a
 
 ### Android Integration
 
+> For a complete sample project, see [migo-android-demo](https://github.com/minigame-labs/migo-android-demo)
+
 1. Add the AAR dependency:
 
 ```gradle
