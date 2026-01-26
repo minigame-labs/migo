@@ -22,10 +22,14 @@ pub(super) struct ImageRegistry {
 }
 
 impl ImageRegistry {
+    /// Default capacity for image maps.
+    /// Most games load a moderate number of images.
+    const DEFAULT_IMAGE_CAPACITY: usize = 32;
+
     pub fn new() -> Self {
         Self {
-            shared_fv_images: HashMap::new(),
-            fv_images: HashMap::new(),
+            shared_fv_images: HashMap::with_capacity(Self::DEFAULT_IMAGE_CAPACITY),
+            fv_images: HashMap::with_capacity(Self::DEFAULT_IMAGE_CAPACITY),
             next_image_id: AtomicU32::new(1),
         }
     }

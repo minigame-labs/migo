@@ -197,3 +197,82 @@ impl From<std::io::ErrorKind> for ErrorCode {
 pub fn io_error_to_error_code(e: &std::io::Error) -> ErrorCode {
     ErrorCode::from(e.kind())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_code_conversion_ok() {
+        assert_eq!(ErrorCode::try_from(0u16), Ok(ErrorCode::Ok));
+    }
+
+    #[test]
+    fn test_error_code_conversion_general() {
+        assert_eq!(ErrorCode::try_from(1u16), Ok(ErrorCode::Internal));
+        assert_eq!(ErrorCode::try_from(2u16), Ok(ErrorCode::InvalidArgument));
+        assert_eq!(ErrorCode::try_from(3u16), Ok(ErrorCode::NotFound));
+        assert_eq!(ErrorCode::try_from(4u16), Ok(ErrorCode::PermissionDenied));
+        assert_eq!(ErrorCode::try_from(5u16), Ok(ErrorCode::Timeout));
+        assert_eq!(ErrorCode::try_from(6u16), Ok(ErrorCode::Unsupported));
+        assert_eq!(ErrorCode::try_from(7u16), Ok(ErrorCode::NotImplemented));
+        assert_eq!(ErrorCode::try_from(8u16), Ok(ErrorCode::Cancelled));
+        assert_eq!(ErrorCode::try_from(9u16), Ok(ErrorCode::Disconnected));
+        assert_eq!(ErrorCode::try_from(10u16), Ok(ErrorCode::InvalidOperation));
+    }
+
+    #[test]
+    fn test_error_code_conversion_io() {
+        assert_eq!(ErrorCode::try_from(100u16), Ok(ErrorCode::IoError));
+        assert_eq!(ErrorCode::try_from(101u16), Ok(ErrorCode::BadFileDescriptor));
+    }
+
+    #[test]
+    fn test_error_code_conversion_invalid() {
+        assert_eq!(ErrorCode::try_from(9999u16), Err(()));
+        assert_eq!(ErrorCode::try_from(50u16), Err(()));
+        assert_eq!(ErrorCode::try_from(150u16), Err(()));
+    }
+
+    #[test]
+    fn test_error_code_roundtrip() {
+        let codes = [
+            ErrorCode::Ok,
+            ErrorCode::Internal,
+            ErrorCode::NotFound,
+            ErrorCode::IoError,
+            ErrorCode::JsException,
+            ErrorCode::RenderBackendError,
+        ];
+
+        for code in codes {
+            let as_u16: u16 = code.into();
+            let back = ErrorCode::try_from(as_u16).unwrap();
+            assert_eq!(code, back);
+        }
+    }
+
+    #[test]
+    fn test_error_code_default_message() {
+        assert_eq!(ErrorCode::Ok.default_message(), "ok");
+        assert_eq!(ErrorCode::NotFound.default_message(), "not found");
+        assert_eq!(ErrorCode::Internal.default_message(), "internal error");
+    }
+
+    #[test]
+    fn test_io_error_kind_conversion() {
+        use std::io::ErrorKind;
+
+        assert_eq!(ErrorCode::from(ErrorKind::NotFound), ErrorCode::NotFound);
+        assert_eq!(
+            ErrorCode::from(ErrorKind::PermissionDenied),
+            ErrorCode::PermissionDenied
+        );
+        assert_eq!(ErrorCode::from(ErrorKind::TimedOut), ErrorCode::Timeout);
+        assert_eq!(
+            ErrorCode::from(ErrorKind::InvalidInput),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(ErrorCode::from(ErrorKind::Other), ErrorCode::IoError);
+    }
+}

@@ -49,17 +49,41 @@ dependencies {
 2. 在 Activity 中初始化引擎：
 
 ```kotlin
-class GameActivity : Activity() {
-    private lateinit var gameView: MiniGameView
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import com.minigame.host.MiniGameSDK
+import com.minigame.host.InitOption
+
+class GameActivity : Activity(), SurfaceHolder.Callback {
+    private lateinit var surfaceView: SurfaceView
+    private var hostHandle: com.minigame.host.HostHandle? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        gameView = MiniGameView(this)
-        setContentView(gameView)
+        surfaceView = SurfaceView(this)
+        surfaceView.holder.addCallback(this)
+        setContentView(surfaceView)
+    }
+
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        val option = InitOption.Builder(this).build()
+        hostHandle = MiniGameSDK.getInstance().initialize(
+            holder.surface,
+            this,
+            option
+        )
 
         // 加载并运行小游戏
-        gameView.loadGame("path/to/game")
+        hostHandle?.startGame("/path/to/game", "game.js")
+    }
+
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        hostHandle?.updateSurface(holder.surface)
+    }
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        hostHandle?.destroy()
     }
 }
 ```
@@ -68,9 +92,8 @@ class GameActivity : Activity() {
 
 #### 前置要求
 
-- Rust 1.75+，需安装以下 target：
+- Rust 1.85+（需要 Edition 2024），需安装以下 target：
   - `aarch64-linux-android`
-  - `armv7-linux-androideabi`
   - `x86_64-linux-android`
 - Android NDK r23+
 - JDK 11+
@@ -78,11 +101,15 @@ class GameActivity : Activity() {
 #### 构建命令
 
 ```bash
-# 构建 Android AAR（PowerShell）
+# Linux/macOS
+./scripts/build-aar.sh release
+
+# Windows (PowerShell)
 ./scripts/build-aar.ps1 -BuildType release
 
 # 构建指定架构
-./scripts/build-aar.ps1 -Architectures arm64-v8a
+./scripts/build-aar.sh release arm64-v8a  # Linux/macOS
+./scripts/build-aar.ps1 -Architectures arm64-v8a  # Windows
 ```
 
 ## 项目结构

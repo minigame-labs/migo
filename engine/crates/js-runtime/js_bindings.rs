@@ -3,6 +3,14 @@ use tracing::warn;
 
 use shared::protocol::host_cmd::{TouchPoint, TouchType};
 
+/// Maximum number of touch points we support.
+/// This matches the Android MAX_POINTERS constant.
+const MAX_TOUCH_POINTS: usize = 10;
+
+/// Pre-allocated buffer size for touch event data.
+/// Each TouchPoint is typically 20-24 bytes depending on alignment.
+const TOUCH_BUFFER_SIZE: usize = MAX_TOUCH_POINTS * std::mem::size_of::<TouchPoint>();
+
 /// Cache of JS globals / context handles that Host frequently calls.
 /// Centralizes V8 scope handling to avoid borrow conflicts.
 pub(crate) struct JsBindings {
@@ -10,6 +18,9 @@ pub(crate) struct JsBindings {
     enqueue_touch_event_fn: Option<v8::Global<v8::Function>>,
     enqueue_inner_audio_event_fn: Option<v8::Global<v8::Function>>,
     schedule_raf_fn: Option<v8::Global<v8::Function>>,
+    /// Pre-allocated buffer for touch event serialization to avoid
+    /// repeated allocations in the hot path.
+    touch_buffer: Vec<u8>,
 }
 
 impl JsBindings {
@@ -21,6 +32,8 @@ impl JsBindings {
             enqueue_touch_event_fn: None,
             enqueue_inner_audio_event_fn: None,
             schedule_raf_fn: None,
+            // Pre-allocate touch buffer to avoid allocations in hot path
+            touch_buffer: vec![0u8; TOUCH_BUFFER_SIZE],
         };
 
         this.reload(rt, host_id);
@@ -100,7 +113,7 @@ impl JsBindings {
     }
 
     pub(crate) fn dispatch_touch(
-        &self,
+        &mut self,
         rt: &mut deno_core::JsRuntime,
         host_id: i32,
         touch_type: TouchType,
@@ -112,17 +125,31 @@ impl JsBindings {
             return;
         };
 
-        // TouchPoint slice -> bytes
+        // TouchPoint slice -> bytes using pre-allocated buffer
         let size = points.len() * std::mem::size_of::<TouchPoint>();
-        let mut bytes = vec![0u8; size];
-        unsafe {
-            std::ptr::copy_nonoverlapping(points.as_ptr() as *const u8, bytes.as_mut_ptr(), size);
+        debug_assert!(size <= TOUCH_BUFFER_SIZE, "touch points exceed buffer capacity");
+
+        // Reuse pre-allocated buffer, resize only if necessary (rare case)
+        if size > self.touch_buffer.len() {
+            self.touch_buffer.resize(size, 0);
         }
+
+        // Copy touch data to buffer
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                points.as_ptr() as *const u8,
+                self.touch_buffer.as_mut_ptr(),
+                size,
+            );
+        }
+
+        // Create a boxed slice from the relevant portion for V8
+        // Note: This still allocates, but only for the exact size needed
+        let bytes = self.touch_buffer[..size].to_vec().into_boxed_slice();
 
         self.with_main_context(rt, |scope, _ctx, global| {
             let backing =
-                v8::ArrayBuffer::new_backing_store_from_boxed_slice(bytes.into_boxed_slice())
-                    .make_shared();
+                v8::ArrayBuffer::new_backing_store_from_boxed_slice(bytes).make_shared();
             let ab = v8::ArrayBuffer::with_backing_store(scope, &backing);
 
             let args = [

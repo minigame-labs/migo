@@ -8,7 +8,8 @@ path = "lib.rs"
 
 [dependencies]
 deno_core.workspace=true
-tokio = { version = "1.36.0", features = ["full"] }
+# Only enable tokio features actually needed (not "full")
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "rt-multi-thread"] }
 femtovg = { workspace = true }
 tracing = { workspace = true }
 shared = {path = "../shared"}

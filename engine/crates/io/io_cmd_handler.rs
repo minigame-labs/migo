@@ -19,10 +19,14 @@ pub struct IoCmdHandler {
 }
 
 impl IoCmdHandler {
+    /// Initial capacity for the file handle map.
+    /// Most games use a small number of concurrent file handles.
+    const INITIAL_FILE_CAPACITY: usize = 8;
+
     pub fn new() -> Self {
         Self {
             next_id: 3, // 0,1,2 reserved for stdio
-            files: HashMap::new(),
+            files: HashMap::with_capacity(Self::INITIAL_FILE_CAPACITY),
         }
     }
 
@@ -537,13 +541,15 @@ impl IoCmdHandler {
         root: PathBuf,
     ) -> Result<deno_core::serde_json::Value, EngineError> {
         use deno_core::serde_json::{Value, json};
+        use std::collections::BTreeMap;
 
         let root_meta = fs::metadata(&root).await.map_err(Self::io_err)?;
         if root_meta.is_file() {
             return Ok(json!(Self::build_stat(root_meta)));
         }
 
-        let mut out: Vec<(String, Value)> = Vec::new();
+        // Use BTreeMap for automatic sorting by key, avoiding O(n log n) sort at the end
+        let mut out: BTreeMap<String, Value> = BTreeMap::new();
         let mut stack: Vec<PathBuf> = vec![root.clone()];
 
         while let Some(dir) = stack.pop() {
@@ -558,19 +564,19 @@ impl IoCmdHandler {
                 } else if ft.is_file() {
                     let meta = entry.metadata().await.map_err(Self::io_err)?;
                     let stat = Self::build_stat(meta);
+                    // Use into_owned() to avoid double allocation
                     let rel = path
                         .strip_prefix(&root)
                         .unwrap_or(&path)
                         .to_string_lossy()
-                        .to_string();
+                        .into_owned();
 
-                    out.push((rel, json!(stat)));
+                    out.insert(rel, json!(stat));
                 }
             }
         }
 
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-
+        // BTreeMap iteration is already sorted by key
         Ok(Value::Array(
             out.into_iter()
                 .map(|(path, stat)| json!({ "path": path, "stat": stat }))

@@ -1,35 +1,115 @@
+//! # Audio Command Protocol
+//!
+//! Defines the command protocol for audio operations in the Migo engine.
+//! All audio operations are performed asynchronously through message passing.
+//!
+//! ## API Categories
+//!
+//! ### WebAudio API
+//!
+//! Implements a subset of the W3C WebAudio API:
+//! - `AudioContext` management
+//! - `AudioBufferSourceNode` for sample-accurate playback
+//! - `GainNode` for volume control
+//! - Audio graph connections
+//!
+//! ### InnerAudioContext API
+//!
+//! Implements the WeChat Mini Program audio API:
+//! - Simple play/pause/stop control
+//! - URL-based loading with streaming support
+//! - Volume, loop, and playback rate control
+//! - Event callbacks (onPlay, onPause, onEnded, etc.)
+//!
+//! ## Thread Model
+//!
+//! Commands are sent from the JS runtime thread to the dedicated audio thread
+//! via an unbounded channel. Responses (where needed) use oneshot channels.
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::error::EngineResult;
 
+/// Unique identifier for an AudioContext instance.
 pub type AudioContextId = u32;
+
+/// Unique identifier for an AudioBuffer.
 pub type AudioBufferId = u32;
+
+/// Unique identifier for an AudioNode (source, gain, etc.).
 pub type AudioNodeId = u32;
+
+/// Unique identifier for an InnerAudioContext instance.
 pub type InnerAudioId = u32;
 
-/// Response sender for audio commands
+/// Response sender for async audio commands.
+///
+/// Commands that need a response (e.g., `CreateContext`, `DecodeAudioData`)
+/// include a oneshot sender for the result.
 pub type AudioResp<T> = oneshot::Sender<EngineResult<T>>;
 
-/// Information about a decoded audio buffer
+/// Information about a decoded audio buffer.
+///
+/// Returned by `DecodeAudioData` to provide metadata about the decoded audio.
+///
+/// # Example Response
+///
+/// ```json
+/// {
+///   "id": 1,
+///   "duration": 3.5,
+///   "sample_rate": 48000,
+///   "channels": 2,
+///   "length": 168000
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioBufferInfo {
+    /// Unique buffer identifier (used with `SetBuffer`).
     pub id: AudioBufferId,
+    /// Duration in seconds.
     pub duration: f64,
+    /// Sample rate in Hz (e.g., 44100, 48000).
     pub sample_rate: u32,
+    /// Number of channels (1 = mono, 2 = stereo).
     pub channels: u32,
-    pub length: u32, // number of sample frames
+    /// Total number of sample frames.
+    pub length: u32,
 }
 
-/// Playback state of an audio context
+/// Playback state of an AudioContext.
+///
+/// Follows the W3C AudioContext state machine:
+/// - `Suspended` → `Running` (via resume)
+/// - `Running` → `Suspended` (via suspend)
+/// - Any → `Closed` (via close, terminal state)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioContextState {
+    /// Audio processing is suspended (no output).
     Suspended,
+    /// Audio is actively processing and producing output.
     Running,
+    /// Context is closed and cannot be reused.
     Closed,
 }
 
-/// Audio command protocol
+/// Audio command protocol.
+///
+/// All audio operations are expressed as commands sent to the audio thread.
+/// Commands are categorized into:
+///
+/// - **Context**: Create, close, suspend, resume AudioContext
+/// - **Buffer**: Decode audio data, release buffers
+/// - **Nodes**: Create and configure AudioBufferSourceNode, GainNode
+/// - **Graph**: Connect and disconnect audio nodes
+/// - **InnerAudio**: WeChat InnerAudioContext operations
+/// - **Lifecycle**: Thread management (shutdown)
+///
+/// # Fire-and-Forget vs Request-Response
+///
+/// - Commands without `resp` field are fire-and-forget (best effort)
+/// - Commands with `resp: AudioResp<T>` require a response
 pub enum AudioCmd {
     // ==================== Context ====================
     /// Create a new AudioContext

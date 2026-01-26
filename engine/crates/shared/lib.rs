@@ -1,4 +1,43 @@
-//! Shared types used across crates.
+//! # Shared Types Library
+//!
+//! This crate provides shared types, utilities, and protocols used across the Migo engine.
+//! It serves as the common foundation for inter-crate communication and shared abstractions.
+//!
+//! ## Module Overview
+//!
+//! - [`codec`]: Encoding/decoding utilities for various text formats (UTF-8, Base64, Hex, etc.)
+//! - [`config`]: Engine initialization configuration options
+//! - [`device`]: Device and system settings abstractions
+//! - [`error`]: Unified error handling with [`ErrorCode`] and [`EngineError`](error::EngineError)
+//! - [`op_state`]: Shared operational state for Deno extensions
+//! - [`protocol`]: Inter-service communication protocols (Host, IO, Render, Audio commands)
+//! - [`surface`]: Platform-agnostic surface and window abstractions
+//!
+//! ## Quick Start
+//!
+//! ```rust,ignore
+//! use shared::prelude::*;
+//!
+//! // Create initialization options
+//! let options = InitOptions::new("/tmp/app", 2.0);
+//!
+//! // Handle errors with ErrorCode
+//! fn example_operation() -> shared::error::EngineResult<()> {
+//!     shared::bail!(ErrorCode::NotFound, "resource not available");
+//! }
+//! ```
+//!
+//! ## Protocol Architecture
+//!
+//! The engine uses a message-passing architecture with typed commands:
+//!
+//! - `HostCommand`: Commands sent to the JS runtime thread
+//! - `RenderCommand`: Graphics/rendering operations
+//! - `IOCmd`: File system and network I/O operations
+//! - `AudioCmd`: Audio playback and processing commands
+//!
+//! Each command type flows through dedicated channels, enabling concurrent
+//! processing across specialized threads (main, render, audio, IO).
 
 pub mod codec;
 pub mod config;
@@ -8,7 +47,16 @@ pub mod op_state;
 pub mod protocol;
 pub mod surface;
 
-/// Frequently used re-exports.
+/// Frequently used re-exports for convenient imports.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use shared::prelude::*;
+///
+/// let options = InitOptions::new("/tmp", 1.5);
+/// let window = WindowInfo::default();
+/// ```
 pub mod prelude {
     pub use crate::config::InitOptions;
     pub use crate::device::SystemSettings;

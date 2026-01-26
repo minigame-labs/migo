@@ -1,12 +1,45 @@
+# =============================================================================
+# Migo Engine - Android Build Configuration
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# ARM64 (aarch64) - Most modern Android devices
+# -----------------------------------------------------------------------------
 [target.aarch64-linux-android]
 ar = "aarch64-linux-android-ar"
 linker = "aarch64-linux-android23-clang"
 rustflags = [
+  # Basic strip (equivalent to -s)
   "-C", "link-arg=-s",
+  
+  # Garbage collection of unused sections
   "-C", "link-arg=-Wl,--gc-sections",
+  
+  # Static link C++ stdlib to avoid runtime dependency issues
   "-C", "link-arg=-static-libstdc++",
+  
+  # Use LLD linker for better optimization (if available)
+  "-C", "link-arg=-fuse-ld=lld",
+  
+  # ICF (Identical Code Folding) - merges identical functions
+  "-C", "link-arg=-Wl,--icf=all",
+  
+  # Use GNU hash style (smaller than sysv)
+  "-C", "link-arg=-Wl,--hash-style=gnu",
+  
+  # Strip all symbols including debug
+  "-C", "link-arg=-Wl,--strip-all",
+  
+  # Disable embed bitcode (not needed for final binary)
+  "-C", "embed-bitcode=no",
+  
+  # Exclude frame pointers (smaller but harder to debug crashes)
+  "-C", "force-frame-pointers=no",
 ]
 
+# -----------------------------------------------------------------------------
+# x86_64 - Emulators and Chromebooks
+# -----------------------------------------------------------------------------
 [target.x86_64-linux-android]
 ar = "x86_64-linux-android-ar"
 linker = "x86_64-linux-android23-clang"
@@ -14,8 +47,17 @@ rustflags = [
   "-C", "link-arg=-s",
   "-C", "link-arg=-Wl,--gc-sections",
   "-C", "link-arg=-static-libstdc++",
+  "-C", "link-arg=-fuse-ld=lld",
+  "-C", "link-arg=-Wl,--icf=all",
+  "-C", "link-arg=-Wl,--hash-style=gnu",
+  "-C", "link-arg=-Wl,--strip-all",
+  "-C", "embed-bitcode=no",
+  "-C", "force-frame-pointers=no",
 ]
 
+# -----------------------------------------------------------------------------
+# ARMv7 (32-bit) - Legacy devices
+# -----------------------------------------------------------------------------
 [target.armv7-linux-androideabi]
 ar = "arm-linux-androideabi-ar"
 linker = "armv7a-linux-androideabi23-clang"
@@ -23,7 +65,35 @@ rustflags = [
   "-C", "link-arg=-s",
   "-C", "link-arg=-Wl,--gc-sections",
   "-C", "link-arg=-static-libstdc++",
+  "-C", "link-arg=-fuse-ld=lld",
+  "-C", "link-arg=-Wl,--icf=all",
+  "-C", "link-arg=-Wl,--hash-style=gnu",
+  "-C", "link-arg=-Wl,--strip-all",
+  "-C", "embed-bitcode=no",
+  "-C", "force-frame-pointers=no",
 ]
 
+# -----------------------------------------------------------------------------
+# Build Configuration
+# -----------------------------------------------------------------------------
 [build]
-# General flags (non-Android targets will use these)
+# Use all available CPU cores for compilation
+# jobs = 8  # Uncomment and adjust if needed
+
+# -----------------------------------------------------------------------------
+# Nightly Features (Optional - requires nightly toolchain)
+# -----------------------------------------------------------------------------
+# Uncomment these lines if using nightly for additional size reduction:
+# 
+# [unstable]
+# build-std = ["std", "panic_abort"]
+# build-std-features = ["panic_immediate_abort"]
+
+# -----------------------------------------------------------------------------
+# Environment Variables for Build Scripts
+# -----------------------------------------------------------------------------
+[env]
+# These can be overridden by actual environment variables
+# CARGO_PROFILE_RELEASE_LTO = "fat"
+# CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1"
+# CARGO_PROFILE_RELEASE_OPT_LEVEL = "z"

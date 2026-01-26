@@ -95,6 +95,8 @@ impl CanvasManager {
             })
         };
 
+        // Pre-allocate with reasonable capacities to reduce rehashing.
+        // Most games use a small number of canvases and GL objects.
         Ok(Self {
             egl,
             gl,
@@ -103,15 +105,15 @@ impl CanvasManager {
             dpi,
             resource,
             bound: BoundContext::Resource,
-            canvases: HashMap::new(),
+            canvases: HashMap::with_capacity(4),
             next_canvas_id: AtomicU32::new(1),
-            contexts_2d: HashMap::new(),
-            dirty_2d: HashSet::new(),
+            contexts_2d: HashMap::with_capacity(4),
+            dirty_2d: HashSet::with_capacity(4),
             image_registry: ImageRegistry::new(),
-            programs: HashMap::new(),
-            shaders: HashMap::new(),
-            buffers: HashMap::new(),
-            gl_state: HashMap::new(),
+            programs: HashMap::with_capacity(16),
+            shaders: HashMap::with_capacity(32),
+            buffers: HashMap::with_capacity(32),
+            gl_state: HashMap::with_capacity(4),
         })
     }
 

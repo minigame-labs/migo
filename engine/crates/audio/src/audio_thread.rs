@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::audio_cmd::{
-    AudioBufferInfo, AudioCmd, AudioContextId, AudioContextState,
+    AudioBufferInfo, AudioCmd, AudioContextId, AudioContextState, AudioNodeId,
     InnerAudioId, InnerAudioInfo, InnerAudioState,
 };
 use shared::protocol::host_cmd::{HostCommand, InnerAudioEventType};
@@ -18,6 +19,77 @@ use crate::inner_audio::{InnerAudioPlayer, PlaybackState};
 use crate::output::AudioOutput;
 use crate::resampler;
 use crate::streaming::{self, StreamingState};
+
+/// Reverse lookup from node_id to context_id for O(1) access.
+/// This avoids iterating all contexts when looking up a node.
+struct NodeContextIndex {
+    node_to_ctx: HashMap<AudioNodeId, AudioContextId>,
+}
+
+impl NodeContextIndex {
+    fn new() -> Self {
+        Self {
+            node_to_ctx: HashMap::with_capacity(64),
+        }
+    }
+
+    #[inline]
+    fn register(&mut self, node_id: AudioNodeId, ctx_id: AudioContextId) {
+        self.node_to_ctx.insert(node_id, ctx_id);
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    fn unregister(&mut self, node_id: AudioNodeId) {
+        self.node_to_ctx.remove(&node_id);
+    }
+
+    #[inline]
+    fn get_context(&self, node_id: AudioNodeId) -> Option<AudioContextId> {
+        self.node_to_ctx.get(&node_id).copied()
+    }
+
+    fn clear_context(&mut self, ctx_id: AudioContextId) {
+        self.node_to_ctx.retain(|_, &mut v| v != ctx_id);
+    }
+}
+
+/// Wakeup signal for the audio thread to avoid busy-waiting.
+#[derive(Clone)]
+pub struct AudioWakeup {
+    inner: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl AudioWakeup {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    /// Signal the audio thread to wake up.
+    pub fn notify(&self) {
+        let (lock, cvar) = &*self.inner;
+        let mut signaled = lock.lock().unwrap();
+        *signaled = true;
+        cvar.notify_one();
+    }
+
+    /// Wait for a signal or timeout. Returns true if signaled.
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        let (lock, cvar) = &*self.inner;
+        let mut signaled = lock.lock().unwrap();
+        if *signaled {
+            *signaled = false;
+            return true;
+        }
+        let result = cvar.wait_timeout(signaled, timeout).unwrap();
+        signaled = result.0;
+        let was_signaled = *signaled;
+        *signaled = false;
+        was_signaled || result.1.timed_out()
+    }
+}
 
 /// Result of thread initialization
 enum InitResult {
@@ -113,6 +185,20 @@ impl Drop for AudioThread {
     }
 }
 
+/// Calculate optimal process buffer size based on sample rate.
+/// Higher sample rates need larger buffers for the same latency.
+#[inline]
+fn calculate_process_frames(sample_rate: u32) -> usize {
+    // Target ~21ms of audio data
+    // 48kHz * 0.021 ≈ 1008 frames, round to 1024 for alignment
+    // 44.1kHz * 0.021 ≈ 926 frames, round to 1024
+    // Higher rates like 96kHz would use 2048
+    let target_ms = 21.0;
+    let frames = (sample_rate as f32 * target_ms / 1000.0) as usize;
+    // Round up to nearest power of 2 for better cache alignment
+    frames.next_power_of_two().max(512).min(4096)
+}
+
 /// Audio thread main loop
 fn run_audio_thread(
     mut rx: UnboundedReceiver<AudioCmd>,
@@ -122,20 +208,26 @@ fn run_audio_thread(
     let sample_rate = output.sample_rate();
     let channels = output.channels();
 
-    let mut contexts: HashMap<AudioContextId, AudioContext> = HashMap::new();
+    // Pre-allocate with reasonable capacity to avoid rehashing
+    let mut contexts: HashMap<AudioContextId, AudioContext> = HashMap::with_capacity(4);
     let mut next_context_id: AudioContextId = 1;
 
-    // InnerAudioContext players
-    let mut inner_players: HashMap<InnerAudioId, InnerAudioPlayer> = HashMap::new();
+    // Node-to-context index for O(1) lookup
+    let mut node_index = NodeContextIndex::new();
+
+    // InnerAudioContext players with pre-allocated capacity
+    let mut inner_players: HashMap<InnerAudioId, InnerAudioPlayer> = HashMap::with_capacity(16);
 
     // Global audio cache (64MB default)
     let audio_cache = GlobalAudioCache::new();
 
-    // Audio processing buffer - process enough to fill buffer when needed
-    // ~21ms at 48kHz stereo = 1024 frames
-    const PROCESS_FRAMES: usize = 1024;
-    let buffer_size = PROCESS_FRAMES * channels as usize;
+    // Audio processing buffer - dynamically sized based on sample rate
+    let process_frames = calculate_process_frames(sample_rate);
+    let buffer_size = process_frames * channels as usize;
     let mut process_buffer = vec![0.0f32; buffer_size];
+
+    // Wakeup signal for efficient waiting
+    let wakeup = AudioWakeup::new();
 
     // Get sync handle for callback-driven wakeup
     let sync = output.sync().clone();
@@ -162,6 +254,8 @@ fn run_audio_thread(
                 AudioCmd::CloseContext { ctx_id, resp } => {
                     if let Some(mut ctx) = contexts.remove(&ctx_id) {
                         ctx.close();
+                        // Clear all nodes belonging to this context from the index
+                        node_index.clear_context(ctx_id);
                         let _ = resp.send(Ok(()));
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(
@@ -265,6 +359,8 @@ fn run_audio_thread(
                 AudioCmd::CreateBufferSource { ctx_id, node_id } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
                         ctx.create_buffer_source(node_id);
+                        // Register node in index for fast lookup
+                        node_index.register(node_id, ctx_id);
                     } else {
                         tracing::warn!("CreateBufferSource: AudioContext {} not found", ctx_id);
                     }
@@ -275,13 +371,13 @@ fn run_audio_thread(
                     buffer_id,
                     resp,
                 } => {
-                    let mut found = false;
-                    for ctx in contexts.values_mut() {
-                        if ctx.set_buffer(node_id, buffer_id) {
-                            found = true;
-                            break;
-                        }
-                    }
+                    // Use index for O(1) context lookup
+                    let found = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .map(|ctx| ctx.set_buffer(node_id, buffer_id))
+                        .unwrap_or(false);
+
                     if found {
                         let _ = resp.send(Ok(()));
                     } else {
@@ -299,13 +395,13 @@ fn run_audio_thread(
                     duration,
                     resp,
                 } => {
-                    let mut found = false;
-                    for ctx in contexts.values_mut() {
-                        if ctx.start_source(node_id, when, offset, duration) {
-                            found = true;
-                            break;
-                        }
-                    }
+                    // Use index for O(1) context lookup
+                    let found = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .map(|ctx| ctx.start_source(node_id, when, offset, duration))
+                        .unwrap_or(false);
+
                     if found {
                         let _ = resp.send(Ok(()));
                     } else {
@@ -317,13 +413,13 @@ fn run_audio_thread(
                 }
 
                 AudioCmd::Stop { node_id, when, resp } => {
-                    let mut found = false;
-                    for ctx in contexts.values_mut() {
-                        if ctx.stop_source(node_id, when) {
-                            found = true;
-                            break;
-                        }
-                    }
+                    // Use index for O(1) context lookup
+                    let found = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .map(|ctx| ctx.stop_source(node_id, when))
+                        .unwrap_or(false);
+
                     if found {
                         let _ = resp.send(Ok(()));
                     } else {
@@ -342,26 +438,26 @@ fn run_audio_thread(
                 } => {
                     tracing::trace!("SetLoop: node_id={}, enabled={}, start={}, end={}",
                         node_id, loop_enabled, loop_start, loop_end);
-                    let mut found = false;
-                    for ctx in contexts.values_mut() {
-                        if ctx.set_loop(node_id, loop_enabled, loop_start, loop_end) {
-                            found = true;
-                            break;
-                        }
-                    }
+                    // Use index for O(1) context lookup
+                    let found = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .map(|ctx| ctx.set_loop(node_id, loop_enabled, loop_start, loop_end))
+                        .unwrap_or(false);
+
                     if !found {
                         tracing::warn!("SetLoop: node {} not found", node_id);
                     }
                 }
 
                 AudioCmd::SetPlaybackRate { node_id, rate, resp } => {
-                    let mut found = false;
-                    for ctx in contexts.values_mut() {
-                        if ctx.set_playback_rate(node_id, rate) {
-                            found = true;
-                            break;
-                        }
-                    }
+                    // Use index for O(1) context lookup
+                    let found = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .map(|ctx| ctx.set_playback_rate(node_id, rate))
+                        .unwrap_or(false);
+
                     if found {
                         let _ = resp.send(Ok(()));
                     } else {
@@ -375,31 +471,37 @@ fn run_audio_thread(
                 AudioCmd::CreateGain { ctx_id, node_id } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
                         ctx.create_gain(node_id);
+                        // Register node in index for fast lookup
+                        node_index.register(node_id, ctx_id);
                     } else {
                         tracing::warn!("CreateGain: AudioContext {} not found", ctx_id);
                     }
                 }
 
                 AudioCmd::SetGainValue { node_id, value } => {
-                    let mut found = false;
-                    for ctx in contexts.values_mut() {
-                        if ctx.set_gain(node_id, value) {
-                            found = true;
-                            break;
-                        }
-                    }
+                    // Use index for O(1) context lookup
+                    let found = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .map(|ctx| ctx.set_gain(node_id, value))
+                        .unwrap_or(false);
+
                     if !found {
                         tracing::warn!("SetGainValue: GainNode {} not found", node_id);
                     }
                 }
 
                 AudioCmd::Connect { src, dst, resp } => {
-                    let mut found = false;
-                    for ctx in contexts.values_mut() {
-                        ctx.connect(src, dst);
-                        found = true;
-                        break;
-                    }
+                    // Use index to find the context containing the source node
+                    let found = node_index
+                        .get_context(src)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .map(|ctx| {
+                            ctx.connect(src, dst);
+                            true
+                        })
+                        .unwrap_or(false);
+
                     if found {
                         let _ = resp.send(Ok(()));
                     } else {
@@ -411,8 +513,11 @@ fn run_audio_thread(
                 }
 
                 AudioCmd::Disconnect { node_id, dst, resp } => {
-                    for ctx in contexts.values_mut() {
-                        ctx.disconnect(node_id, dst);
+                    // Use index for O(1) context lookup
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.disconnect(node_id, dst);
+                        }
                     }
                     let _ = resp.send(Ok(()));
                 }
@@ -650,12 +755,14 @@ fn run_audio_thread(
                 }
             }
 
-            // Short sleep - balance between latency and CPU usage
-            // ~5ms gives good responsiveness while keeping CPU low
-            thread::sleep(Duration::from_millis(5));
+            // Use condvar-based wait instead of busy-sleep for better efficiency.
+            // This reduces CPU usage while maintaining low latency when audio
+            // callback or commands arrive.
+            wakeup.wait_timeout(Duration::from_millis(5));
         } else {
-            // No active audio - longer sleep to save power
-            thread::sleep(Duration::from_millis(50));
+            // No active audio - use longer wait to save power.
+            // The wakeup signal ensures we respond quickly when audio starts.
+            wakeup.wait_timeout(Duration::from_millis(50));
         }
     }
 }

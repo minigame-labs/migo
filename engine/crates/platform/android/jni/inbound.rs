@@ -212,7 +212,28 @@ pub(crate) extern "system" fn onTouch(
         }
     };
 
-    // TouchPoint memory layout must match Java side packing.
+    // Validate buffer capacity before creating slice
+    let capacity = match env.get_direct_buffer_capacity(&buf) {
+        Ok(cap) => cap,
+        Err(e) => {
+            error!("onTouch failed: get_direct_buffer_capacity error: {:?}", e);
+            return;
+        }
+    };
+
+    let expected_size = (count as usize) * std::mem::size_of::<TouchPoint>();
+    if expected_size > capacity {
+        error!(
+            "onTouch failed: buffer underflow - expected {} bytes, got {} bytes",
+            expected_size, capacity
+        );
+        return;
+    }
+
+    // SAFETY: We have verified that:
+    // 1. addr is a valid pointer from get_direct_buffer_address
+    // 2. The buffer has sufficient capacity for `count` TouchPoints
+    // 3. TouchPoint memory layout matches Java side packing (repr(C))
     let slice = unsafe { std::slice::from_raw_parts(addr as *const TouchPoint, count as usize) };
     let points: SmallVec<[TouchPoint; 8]> = slice.iter().copied().collect();
 

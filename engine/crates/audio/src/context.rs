@@ -54,6 +54,11 @@ pub struct AudioContext {
 }
 
 impl AudioContext {
+    /// Default capacity for audio resources.
+    /// Most games use a small number of audio buffers/nodes at once.
+    const DEFAULT_BUFFER_CAPACITY: usize = 8;
+    const DEFAULT_NODE_CAPACITY: usize = 16;
+
     pub fn new(id: AudioContextId, sample_rate: u32, channels: u32) -> Self {
         Self {
             id,
@@ -61,14 +66,14 @@ impl AudioContext {
             sample_rate,
             channels,
             start_time: Instant::now(),
-            buffers: HashMap::new(),
+            buffers: HashMap::with_capacity(Self::DEFAULT_BUFFER_CAPACITY),
             next_buffer_id: 1,
-            source_nodes: HashMap::new(),
-            gain_nodes: HashMap::new(),
+            source_nodes: HashMap::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            gain_nodes: HashMap::with_capacity(Self::DEFAULT_NODE_CAPACITY),
             destination: DestinationNode::new(DESTINATION_NODE_ID, channels),
             next_node_id: 1, // 0 is reserved for destination
-            connections: Vec::new(),
-            routes: Vec::new(),
+            connections: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
+            routes: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
             routes_dirty: true,
             mixer: Mixer::new(channels),
             process_buffer: Vec::new(),

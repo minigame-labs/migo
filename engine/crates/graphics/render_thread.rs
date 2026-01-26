@@ -9,14 +9,30 @@ use shared::surface::SurfaceRef;
 use tokio::sync::mpsc::Sender as TokioSender;
 use tracing::{error, info, warn};
 
+/// Default render command queue capacity.
+/// Higher capacity reduces the chance of dropped frames under heavy load,
+/// but uses more memory. 512 provides good balance for most games.
+const DEFAULT_RENDER_QUEUE_CAPACITY: usize = 512;
+
 pub struct RenderThread {
     cmd_tx: crossbeam_channel::Sender<RenderCommand>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl RenderThread {
+    /// Spawn render thread with default queue capacity.
     pub fn spawn(js_tx: TokioSender<HostCommand>, initial_surface: Option<SurfaceRef>, dpi: f32) -> Self {
-        let (cmd_tx, cmd_rx) = bounded::<RenderCommand>(128);
+        Self::spawn_with_capacity(js_tx, initial_surface, dpi, DEFAULT_RENDER_QUEUE_CAPACITY)
+    }
+
+    /// Spawn render thread with custom queue capacity.
+    pub fn spawn_with_capacity(
+        js_tx: TokioSender<HostCommand>,
+        initial_surface: Option<SurfaceRef>,
+        dpi: f32,
+        queue_capacity: usize,
+    ) -> Self {
+        let (cmd_tx, cmd_rx) = bounded::<RenderCommand>(queue_capacity);
 
         let handle = std::thread::Builder::new()
             .name("Migo-RenderThread".into())

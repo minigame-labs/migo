@@ -36,10 +36,14 @@ impl AudioCache {
         Self::with_max_size(128 * 1024 * 1024)
     }
 
+    /// Default initial capacity for cache entries.
+    /// Most games load a moderate number of audio files.
+    const DEFAULT_CACHE_CAPACITY: usize = 16;
+
     /// Create cache with custom size limit
     pub fn with_max_size(max_size: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: HashMap::with_capacity(Self::DEFAULT_CACHE_CAPACITY),
             current_size: 0,
             max_size,
             access_counter: 0,
