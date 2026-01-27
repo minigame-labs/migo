@@ -36,15 +36,13 @@
 //!
 //! ## Implemented APIs
 //!
-//! ### WeChat Mini Program APIs (`wx.*`)
-//!
-//! - **File System**: `wx.getFileSystemManager()` - read, write, stat, mkdir, etc.
-//! - **Storage**: `wx.setStorageSync()`, `wx.getStorageSync()`
-//! - **Audio**: `wx.createInnerAudioContext()` - streaming audio playback
-//! - **Canvas**: `wx.createCanvas()`, `wx.createOffscreenCanvas()`
-//! - **Image**: `wx.createImage()` - async image loading
-//! - **System**: `wx.getSystemInfoSync()`, `wx.getWindowInfo()`
-//! - **Lifecycle**: `wx.onShow()`, `wx.onHide()`
+//! - **File System**: `migo.getFileSystemManager()` - read, write, stat, mkdir, etc.
+//! - **Storage**: `migo.setStorageSync()`, `migo.getStorageSync()`
+//! - **Audio**: `migo.createInnerAudioContext()` - streaming audio playback
+//! - **Canvas**: `migo.createCanvas()`, `migo.createOffscreenCanvas()`
+//! - **Image**: `migo.createImage()` - async image loading
+//! - **System**: `migo.getSystemInfoSync()`, `migo.getWindowInfo()`
+//! - **Lifecycle**: `migo.onShow()`, `migo.onHide()`
 //!
 //! ### Web Standard APIs
 //!

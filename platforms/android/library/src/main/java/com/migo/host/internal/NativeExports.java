@@ -296,8 +296,13 @@ public final class NativeExports {
             if (i > 0) sb.append(",");
             String state = "not determined";
             if (activity != null) {
-                int result = activity.checkSelfPermission(permissions[i]);
-                state = (result == PackageManager.PERMISSION_GRANTED) ? "authorized" : "denied";
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    int result = activity.checkSelfPermission(permissions[i]);
+                    state = (result == PackageManager.PERMISSION_GRANTED) ? "authorized" : "denied";
+                } else {
+                    // Pre-M: permissions are granted at install time
+                    state = "authorized";
+                }
             }
             sb.append("\"").append(keys[i]).append("\":\"").append(state).append("\"");
         }

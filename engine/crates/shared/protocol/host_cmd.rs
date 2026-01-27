@@ -95,12 +95,12 @@ pub enum HostCommand {
 
     /// Notify that the app has become visible/active.
     ///
-    /// Triggers `wx.onShow` callbacks in the game.
+    /// Triggers `migo.onShow` callbacks in the game.
     OnShow,
 
     /// Notify that the app has become hidden/inactive.
     ///
-    /// Triggers `wx.onHide` callbacks in the game.
+    /// Triggers `migo.onHide` callbacks in the game.
     OnHide,
 
     /// Update the rendering surface (e.g., after orientation change).
