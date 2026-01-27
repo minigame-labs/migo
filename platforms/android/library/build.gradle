@@ -3,7 +3,7 @@ plugins {
 }
 
 android {
-    namespace 'com.minigame.host'
+    namespace 'com.migo.host'
     compileSdk 34
 
     // Output AAR file name
@@ -54,6 +54,6 @@ android {
 }
 
 dependencies {
-    implementation 'androidx.appcompat:appcompat:1.6.1'
-    implementation 'com.google.android.material:material:1.10.0'
+    // Zero dependencies - no AndroidX required
+    // All annotations are replaced with JavaDoc comments
 }

@@ -1,18 +1,32 @@
 import { BaseFileManager } from "ext:host_v8_file/02_file_manager.js";
 import { op_unzip } from "ext:core/ops";
 
-let nextRequestId = 1;
-const unzipCallbacks = new Map();
-
 class FileManager extends BaseFileManager {
     constructor() {
         super();
     }
 
+    /**
+     * Extract a zip file to target directory.
+     * @param {Object} options
+     * @param {string} options.zipFilePath - Path to the zip file
+     * @param {string} options.targetPath - Destination directory
+     * @param {Function} [options.success] - Success callback
+     * @param {Function} [options.fail] - Failure callback  
+     * @param {Function} [options.complete] - Completion callback (always called)
+     */
     static unzip({ zipFilePath, targetPath, success, fail, complete }) {
-        const requestId = nextRequestId++;
-        unzipCallbacks.set(requestId, { zipFilePath, targetPath, success, fail, complete });
-        op_unzip(requestId, zipFilePath, targetPath);
+        op_unzip(zipFilePath, targetPath)
+            .then(() => {
+                const result = { errMsg: "unzip:ok" };
+                success && success(result);
+                complete && complete(result);
+            })
+            .catch((err) => {
+                const result = { errMsg: `unzip:fail ${err.message || err}` };
+                fail && fail(result);
+                complete && complete(result);
+            });
     }
 }
 
@@ -20,16 +34,4 @@ const getFileSystemManager = () => {
     return FileManager;
 }
 
-const _internalOnUnZipDone = (requestId) => {
-    const cb = unzipCallbacks.get(requestId);
-    if (cb) {
-        unzipCallbacks.delete(requestId);
-        cb.success && cb.success({ errMsg: "unzip:ok" });
-        cb.complete && cb.complete({ errMsg: "unzip:ok" });
-    }
-};
-
-export {
-    getFileSystemManager,
-    _internalOnUnZipDone,
-};
+export { getFileSystemManager };

@@ -174,7 +174,49 @@ pub enum IOCmd {
         resp: IOCmdResp<NormalizedImage>,
     },
 
+    /// Preload multiple images in parallel.
+    /// Returns a list of results (path, Ok((width, height)) or Err(error_message)).
+    PreloadImages {
+        paths: Vec<String>,
+        resp: IOCmdResp<Vec<(String, Result<(u32, u32), String>)>>,
+    },
+
+    /// Clear the image cache (useful for memory management)
+    ClearImageCache {
+        resp: IOCmdResp<()>,
+    },
+
+    /// Get image cache statistics
+    GetImageCacheStats {
+        resp: IOCmdResp<ImageCacheStats>,
+    },
+
+    /// Extract a zip file to destination directory.
+    /// Returns the number of files extracted.
+    Unzip {
+        zip_path: String,
+        dest_dir: String,
+        resp: IOCmdResp<usize>,
+    },
+
     Shutdown,
+}
+
+/// Image cache statistics
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImageCacheStats {
+    /// Number of cached entries
+    pub entries: usize,
+    /// Current size in bytes
+    pub size_bytes: usize,
+    /// Maximum size in bytes
+    pub max_bytes: usize,
+    /// Cache hits
+    pub hits: u64,
+    /// Cache misses
+    pub misses: u64,
+    /// Hit rate (0.0 to 1.0)
+    pub hit_rate: f64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -1,7 +1,7 @@
 use femtovg::{ImageFlags, ImageId, ImageInfo};
 use glow::HasContext;
 use shared::{
-    error::{EngineResult, ErrorCode},
+    error::EngineResult,
     protocol::{io_cmd::NormalizedImage, render_cmd::CanvasId},
 };
 use std::{
@@ -9,7 +9,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use super::types::ee;
+use super::pbo_upload::{self, PboPool};
 use crate::Canvas2DContext;
 
 /// Image registry for managing shared and per-canvas images
@@ -19,6 +19,10 @@ pub(super) struct ImageRegistry {
     /// per-canvas owned image replicas: image_id -> canvas_id -> (fv ImageId, native_tex, info)
     pub fv_images: HashMap<u32, HashMap<CanvasId, (ImageId, glow::NativeTexture, ImageInfo)>>,
     next_image_id: AtomicU32,
+    /// PBO pool for async texture uploads
+    pbo_pool: Option<PboPool>,
+    /// Whether PBO upload is enabled
+    use_pbo: bool,
 }
 
 impl ImageRegistry {
@@ -31,6 +35,18 @@ impl ImageRegistry {
             shared_fv_images: HashMap::with_capacity(Self::DEFAULT_IMAGE_CAPACITY),
             fv_images: HashMap::with_capacity(Self::DEFAULT_IMAGE_CAPACITY),
             next_image_id: AtomicU32::new(1),
+            pbo_pool: None, // Will be initialized on first upload
+            use_pbo: true,  // Enable by default, will auto-detect support
+        }
+    }
+
+    /// Initialize PBO pool (called once when GL context is available)
+    fn ensure_pbo_pool(&mut self, gl: &glow::Context) {
+        if self.pbo_pool.is_none() {
+            let pool = PboPool::new(gl, 4);
+            self.use_pbo = pool.is_pbo_supported();
+            self.pbo_pool = Some(pool);
+            tracing::debug!("PBO upload initialized: enabled={}", self.use_pbo);
         }
     }
 
@@ -44,66 +60,21 @@ impl ImageRegistry {
         image_id: u32,
         image: NormalizedImage,
     ) -> EngineResult<(u32, u32)> {
-        let tex = unsafe {
-            gl.create_texture().map_err(|e| {
-                ee(
-                    ErrorCode::RenderBackendError,
-                    format!("create_texture failed: {e:?}"),
-                )
-            })?
-        };
+        // Initialize PBO pool on first use
+        self.ensure_pbo_pool(gl);
 
-        unsafe {
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-
-            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MIN_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MAG_FILTER,
-                glow::LINEAR as i32,
-            );
-
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_S,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_T,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGBA as i32,
-                image.width as i32,
-                image.height as i32,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&image.rgba)),
-            );
-
-            gl.bind_texture(glow::TEXTURE_2D, None);
-        }
+        // Use PBO upload for better performance (async DMA transfer)
+        let result = pbo_upload::upload_texture_with_pbo(gl, &image, self.use_pbo)?;
 
         let info = ImageInfo::new(
             ImageFlags::empty(),
-            image.width as usize,
-            image.height as usize,
+            result.width as usize,
+            result.height as usize,
             femtovg::PixelFormat::Rgba8,
         );
 
-        self.shared_fv_images.insert(image_id, (tex, info));
-        Ok((image.width, image.height))
+        self.shared_fv_images.insert(image_id, (result.texture, info));
+        Ok((result.width, result.height))
     }
 
     pub fn destroy_shared_fv_image<F>(
@@ -166,5 +137,10 @@ impl ImageRegistry {
             unsafe { gl.delete_texture(tex) };
         }
         self.fv_images.clear();
+
+        // Clear PBO pool
+        if let Some(ref mut pool) = self.pbo_pool {
+            pool.clear(gl);
+        }
     }
 }

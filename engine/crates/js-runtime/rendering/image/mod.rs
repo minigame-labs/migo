@@ -177,9 +177,96 @@ pub fn op_destroy_image(state: &mut OpState, #[smi] image_id: u32) -> bool {
     true
 }
 
+/// Preload multiple images in parallel
+/// Returns array of [path, success, width, height, error_msg]
+#[op2(async)]
+#[serde]
+pub async fn op_preload_images(
+    state: Rc<RefCell<OpState>>,
+    #[serde] paths: Vec<String>,
+) -> Result<Vec<(String, bool, u32, u32, String)>, JsErrorBox> {
+    let (io_tx, code_dir) = {
+        let op = state.borrow();
+        let host = op.borrow::<HostOpState>();
+        (host.io_tx.clone(), host.code_dir.clone())
+    };
+
+    let code_dir = code_dir.unwrap_or_default();
+    if code_dir.is_empty() {
+        return Err(JsErrorBox::generic("code_dir not available"));
+    }
+
+    // Resolve all paths
+    let resolved_paths: Vec<String> = paths
+        .iter()
+        .map(|p| resolve_local_src(&code_dir, p).unwrap_or_else(|_| p.clone()))
+        .collect();
+
+    // Send preload command to IO thread
+    let results = send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::PreloadImages {
+        paths: resolved_paths.clone(),
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map_err(js_err_from_engine)?;
+
+    // Convert results to JS-friendly format
+    let output: Vec<(String, bool, u32, u32, String)> = results
+        .into_iter()
+        .map(|(path, result)| match result {
+            Ok((w, h)) => (path, true, w, h, String::new()),
+            Err(msg) => (path, false, 0, 0, msg),
+        })
+        .collect();
+
+    Ok(output)
+}
+
+/// Clear the image cache
+#[op2(async)]
+pub async fn op_clear_image_cache(state: Rc<RefCell<OpState>>) -> Result<(), JsErrorBox> {
+    let io_tx = {
+        let op = state.borrow();
+        let host = op.borrow::<HostOpState>();
+        host.io_tx.clone()
+    };
+
+    send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::ClearImageCache {
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map_err(js_err_from_engine)
+}
+
+/// Get image cache statistics
+#[op2(async)]
+#[serde]
+pub async fn op_get_image_cache_stats(
+    state: Rc<RefCell<OpState>>,
+) -> Result<shared::protocol::io_cmd::ImageCacheStats, JsErrorBox> {
+    let io_tx = {
+        let op = state.borrow();
+        let host = op.borrow::<HostOpState>();
+        host.io_tx.clone()
+    };
+
+    send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::GetImageCacheStats {
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map_err(js_err_from_engine)
+}
+
 extension!(host_v8_image,
     deps = [host_v8_console, host_v8_base, host_v8_file],
-    ops = [op_create_image, op_load_image, op_destroy_image],
+    ops = [
+        op_create_image,
+        op_load_image,
+        op_destroy_image,
+        op_preload_images,
+        op_clear_image_cache,
+        op_get_image_cache_stats
+    ],
     esm = [
         dir "rendering/image",
         "01_image.js",

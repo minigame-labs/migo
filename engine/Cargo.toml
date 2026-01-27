@@ -27,15 +27,26 @@ femtovg = { version = "0.19.3", features = ["image-loading"] }
 # Image decoding - only enable formats actually needed
 # Removing unused formats can save 500KB-1MB
 image = { version = "=0.25.8", default-features = false, features = [
-    "png",      # PNG format (required)
-    "jpeg",     # JPEG format (required)
+    "png",      # PNG format (fallback)
+    "jpeg",     # JPEG format (fallback)
     # Uncomment if needed:
     # "gif",    # GIF format
     # "webp",   # WebP format
     # "bmp",    # BMP format
     # "ico",    # ICO format
 ] }
+
+# Fast image decoders - significantly faster than image crate
+# zune-jpeg: ~3-5x faster JPEG decoding, pure Rust, no external deps
+# zune-png: ~2-3x faster PNG decoding, pure Rust, no external deps
+zune-jpeg = { version = "0.4", default-features = false }
+zune-png = { version = "0.4", default-features = false }
+zune-core = { version = "0.4", default-features = false, features = ["std"] }
+
 once_cell = "1.21.3"
+
+# LRU cache for decoded images
+lru = "0.12"
 crossbeam-channel = "0.5.15"
 
 tracing = { version = "0.1.41", default-features = false, features = ["std"] }

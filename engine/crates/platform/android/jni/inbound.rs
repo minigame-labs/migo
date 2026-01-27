@@ -77,6 +77,7 @@ pub(crate) extern "system" fn init(
         )
     };
 
+    // Read required fields
     let app_tmp_dir = match super::get_string_field(&mut env, "appTmpDir", &options) {
         Ok(s) => s,
         Err(e) => {
@@ -93,9 +94,37 @@ pub(crate) extern "system" fn init(
         }
     };
 
+    // Read optional fields with defaults
+    let code_cache_dir = super::get_string_field(&mut env, "codeCacheDir", &options)
+        .unwrap_or_else(|_| app_tmp_dir.clone());
+
+    let target_fps = super::get_i32(&mut env, "targetFps", &options).unwrap_or(60);
+
+    let debug_enabled = super::get_bool(&mut env, "debugEnabled", &options).unwrap_or(false);
+
+    let log_level_ordinal = super::get_enum_ordinal(
+        &mut env,
+        "logLevel",
+        "Lcom/migo/host/InitOption$LogLevel;",
+        &options,
+    )
+    .unwrap_or(2); // Default to Warn
+
+    let max_memory_mb = super::get_i32(&mut env, "maxMemoryMB", &options).unwrap_or(512);
+
     let init_options = InitOptions::new()
         .with_pixel_ratio(dpi)
-        .with_tmp_dir(PathBuf::from(app_tmp_dir));
+        .with_tmp_dir(PathBuf::from(app_tmp_dir))
+        .with_code_cache_dir(PathBuf::from(code_cache_dir))
+        .with_target_fps(target_fps)
+        .with_debug_enabled(debug_enabled)
+        .with_log_level(shared::config::LogLevel::from(log_level_ordinal))
+        .with_max_memory_mb(max_memory_mb);
+
+    info!(
+        "init: dpi={}, target_fps={}, debug={}, log_level={:?}, max_mem={}MB",
+        dpi, target_fps, debug_enabled, init_options.log_level(), max_memory_mb
+    );
 
     let platform = Arc::new(AndroidPlatform::new());
 
@@ -173,18 +202,6 @@ pub(crate) extern "system" fn onOpenSystemBluetoothSetting<'local>(
 ) {
     let cmd = HostCommand::EvalScript {
         source: format!("_internalOnOpenBluetoothSettingFinished({});", enabled),
-    };
-    let _ = send_command_to_host(host_id, cmd);
-}
-
-pub(crate) extern "system" fn onUnzipDone<'local>(
-    _env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    host_id: jint,
-    request_id: jint,
-) {
-    let cmd = HostCommand::EvalScript {
-        source: format!("_internalOnUnZipDone({});", request_id),
     };
     let _ = send_command_to_host(host_id, cmd);
 }

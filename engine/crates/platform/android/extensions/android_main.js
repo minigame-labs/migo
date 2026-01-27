@@ -48,7 +48,6 @@ const properties = {
 
     // File
     getFileSystemManager: core.propNonEnumerable(fileManager.getFileSystemManager),
-    _internalOnUnZipDone: core.propNonEnumerable(fileManager._internalOnUnZipDone),
 };
 
 ObjectDefineProperties(globalThis, properties);

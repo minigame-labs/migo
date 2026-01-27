@@ -6,12 +6,14 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     time::Instant,
 };
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use shared::{
     error::{EngineError, ErrorCode, io_error_to_error_code},
     protocol::io_cmd::{FileId, FileStat, IOCmd, IOCmdResp, NormalizedImage, OpenFlag, WriteMode},
 };
+
+use crate::{fast_image_decoder, image_cache, zip_extract};
 
 pub struct IoCmdHandler {
     next_id: FileId,
@@ -317,45 +319,56 @@ impl IoCmdHandler {
             IOCmd::ReadImageRgba8 { path, resp } => {
                 let start = Instant::now();
 
+                // Check LRU cache first
+                if let Some(cached) = image_cache::global_cache().get(&path) {
+                    debug!(
+                        "ReadImageRgba8 cache hit: {} ({}x{}) in {:.2?}",
+                        path,
+                        cached.image.width,
+                        cached.image.height,
+                        start.elapsed()
+                    );
+                    // Clone the Arc'd image data
+                    let img = NormalizedImage {
+                        width: cached.image.width,
+                        height: cached.image.height,
+                        rgba: cached.image.rgba.clone(),
+                    };
+                    Self::send_resp(resp, Ok(img));
+                    return;
+                }
+
+                // Cache miss - read and decode
+                let path_clone = path.clone();
                 let task =
                     tokio::task::spawn_blocking(move || -> Result<NormalizedImage, EngineError> {
-                        let img = image::ImageReader::open(&path)
-                            .map_err(|e| {
-                                EngineError::new(ErrorCode::ImageReadError)
-                                    .with_detail(e.to_string())
-                            })?
-                            .with_guessed_format()
-                            .map_err(|e| {
-                                EngineError::new(ErrorCode::ImageReadError)
-                                    .with_detail(e.to_string())
-                            })?
-                            .decode()
-                            .map_err(|e| {
-                                EngineError::new(ErrorCode::ImageReadError)
-                                    .with_detail(e.to_string())
-                            })?;
+                        // Read file into memory
+                        let data = std::fs::read(&path_clone).map_err(|e| {
+                            EngineError::new(ErrorCode::ImageReadError)
+                                .with_detail(format!("failed to read file: {}", e))
+                        })?;
 
-                        let rgba = img.into_rgba8();
-                        let (w, h) = rgba.dimensions();
-                        let raw = rgba.into_raw();
-
-                        debug_assert_eq!(
-                            raw.len(),
-                            (w as usize) * (h as usize) * 4,
-                            "rgba buffer size mismatch"
-                        );
-
-                        let out = NormalizedImage {
-                            width: w,
-                            height: h,
-                            rgba: raw,
-                        };
-
-                        Ok(out)
+                        // Use fast decoder with path hint for format detection
+                        fast_image_decoder::decode_image_fast(&data, Some(&path_clone))
                     });
 
                 let r = match task.await {
-                    Ok(v) => v,
+                    Ok(Ok(img)) => {
+                        // Cache the decoded image
+                        image_cache::global_cache().insert(path.clone(), img.clone());
+                        debug!(
+                            "ReadImageRgba8 decoded: {} ({}x{}) in {:.2?}",
+                            path,
+                            img.width,
+                            img.height,
+                            start.elapsed()
+                        );
+                        Ok(img)
+                    }
+                    Ok(Err(e)) => {
+                        warn!("ReadImageRgba8 decode error: {:?}", e);
+                        Err(e)
+                    }
                     Err(join_err) => {
                         warn!("ReadImageRgba8 spawn_blocking join error: {join_err}");
                         Err(EngineError::new(ErrorCode::ImageReadError)
@@ -364,6 +377,127 @@ impl IoCmdHandler {
                 };
 
                 trace!("ReadImageRgba8 total={:.2?}", start.elapsed());
+                Self::send_resp(resp, r);
+            }
+
+            IOCmd::PreloadImages { paths, resp } => {
+                let start = Instant::now();
+                debug!("PreloadImages: {} images", paths.len());
+
+                // Process all images in parallel using spawn_blocking for each
+                let handles: Vec<_> = paths
+                    .into_iter()
+                    .map(|path| {
+                        let path_clone = path.clone();
+                        let handle = tokio::task::spawn_blocking(move || {
+                            // Check cache first
+                            if let Some(cached) = image_cache::global_cache().get(&path_clone) {
+                                return (
+                                    path_clone,
+                                    Ok((cached.image.width, cached.image.height)),
+                                );
+                            }
+
+                            // Read and decode
+                            match std::fs::read(&path_clone) {
+                                Ok(data) => {
+                                    match fast_image_decoder::decode_image_fast(&data, Some(&path_clone)) {
+                                        Ok(img) => {
+                                            let dims = (img.width, img.height);
+                                            // Cache the result
+                                            image_cache::global_cache().insert(path_clone.clone(), img);
+                                            (path_clone, Ok(dims))
+                                        }
+                                        Err(e) => (path_clone, Err(format!("{:?}", e))),
+                                    }
+                                }
+                                Err(e) => (path_clone, Err(format!("read error: {}", e))),
+                            }
+                        });
+                        handle
+                    })
+                    .collect();
+
+                // Wait for all to complete
+                let mut results = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    match handle.await {
+                        Ok(result) => results.push(result),
+                        Err(e) => {
+                            warn!("PreloadImages task join error: {}", e);
+                        }
+                    }
+                }
+
+                debug!(
+                    "PreloadImages completed: {} images in {:.2?}",
+                    results.len(),
+                    start.elapsed()
+                );
+                Self::send_resp(resp, Ok(results));
+            }
+
+            IOCmd::ClearImageCache { resp } => {
+                image_cache::global_cache().clear();
+                debug!("Image cache cleared");
+                Self::send_resp(resp, Ok(()));
+            }
+
+            IOCmd::GetImageCacheStats { resp } => {
+                use shared::protocol::io_cmd::ImageCacheStats;
+                let stats = image_cache::global_cache().stats();
+                let result = ImageCacheStats {
+                    entries: stats.entries,
+                    size_bytes: stats.size_bytes,
+                    max_bytes: stats.max_bytes,
+                    hits: stats.hits,
+                    misses: stats.misses,
+                    hit_rate: stats.hit_rate(),
+                };
+                Self::send_resp(resp, Ok(result));
+            }
+
+            IOCmd::Unzip {
+                zip_path,
+                dest_dir,
+                resp,
+            } => {
+                let start = Instant::now();
+                debug!("Unzip: {} -> {}", zip_path, dest_dir);
+
+                let zip_path_clone = zip_path.clone();
+                let dest_dir_clone = dest_dir.clone();
+
+                let task = tokio::task::spawn_blocking(move || {
+                    let zip_path = PathBuf::from(&zip_path_clone);
+                    let dest_dir = PathBuf::from(&dest_dir_clone);
+
+                    // Use Arc<AtomicUsize> for shared ownership with 'static lifetime
+                    let file_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let file_count_clone = file_count.clone();
+
+                    let progress_cb = Box::new(move |_prog: f32, current: usize, _total: usize| {
+                        file_count_clone.store(current, std::sync::atomic::Ordering::Relaxed);
+                    });
+
+                    match zip_extract::extract_zip(&zip_path, &dest_dir, Some(progress_cb)) {
+                        Ok(()) => Ok(file_count.load(std::sync::atomic::Ordering::Relaxed)),
+                        Err(e) => Err(EngineError::new(ErrorCode::IoError).with_detail(e.to_string())),
+                    }
+                });
+
+                let r = match task.await {
+                    Ok(result) => {
+                        debug!("Unzip completed in {:.2?}", start.elapsed());
+                        result
+                    }
+                    Err(join_err) => {
+                        warn!("Unzip spawn_blocking join error: {join_err}");
+                        Err(EngineError::new(ErrorCode::IoError)
+                            .with_detail(format!("spawn_blocking join error: {join_err}")))
+                    }
+                };
+
                 Self::send_resp(resp, r);
             }
         }

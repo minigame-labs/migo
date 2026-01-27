@@ -10,6 +10,20 @@ path = "lib.rs"
 tokio = { workspace = true }
 image = { workspace = true }
 tracing = { workspace = true }
-shared = {path = "../shared"}
-deno_core.workspace=true
+shared = { path = "../shared" }
+deno_core.workspace = true
 parking_lot = "0.12.4"
+
+# Fast image decoders
+zune-jpeg = { workspace = true }
+zune-png = { workspace = true }
+zune-core = { workspace = true }
+
+# LRU cache for decoded images
+lru = { workspace = true }
+
+# Lazy static for global cache
+once_cell = { workspace = true }
+
+# Zip extraction
+zip = "2.2"

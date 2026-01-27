@@ -1,5 +1,12 @@
 import { primordials } from "ext:core/mod.js";
-import { op_create_image, op_load_image, op_destroy_image } from "ext:core/ops";
+import {
+    op_create_image,
+    op_load_image,
+    op_destroy_image,
+    op_preload_images,
+    op_clear_image_cache,
+    op_get_image_cache_stats
+} from "ext:core/ops";
 import { HTMLElement } from "ext:host_v8_web/02_html_element.js";
 
 const { SafeFinalizationRegistry } = primordials;
@@ -118,4 +125,103 @@ class Image extends HTMLElement {
 
 const createImage = () => new Image();
 
-export { createImage };
+/**
+ * ImagePreloader - Preload multiple images in parallel for better performance
+ *
+ * Usage:
+ *   const preloader = new ImagePreloader();
+ *   const results = await preloader.preload(["img1.png", "img2.png"]);
+ *   // After preloading, images load instantly from cache
+ *   const img = createImage();
+ *   img.src = "img1.png"; // instant load from cache
+ */
+class ImagePreloader {
+    constructor() {
+        this._results = new Map();
+    }
+
+    /**
+     * Preload multiple images in parallel
+     * @param {string[]} paths - Array of image paths to preload
+     * @returns {Promise<PreloadResult[]>} Array of results
+     */
+    async preload(paths) {
+        if (!Array.isArray(paths) || paths.length === 0) {
+            return [];
+        }
+
+        const results = await op_preload_images(paths);
+
+        // Store results for later query
+        const output = results.map(([path, success, width, height, errorMsg]) => {
+            const result = {
+                path,
+                success,
+                width: success ? width : 0,
+                height: success ? height : 0,
+                error: success ? null : errorMsg
+            };
+            this._results.set(path, result);
+            return result;
+        });
+
+        return output;
+    }
+
+    /**
+     * Check if a path was preloaded successfully
+     * @param {string} path
+     * @returns {boolean}
+     */
+    isLoaded(path) {
+        const result = this._results.get(path);
+        return result?.success ?? false;
+    }
+
+    /**
+     * Get preload result for a path
+     * @param {string} path
+     * @returns {PreloadResult|null}
+     */
+    getResult(path) {
+        return this._results.get(path) || null;
+    }
+
+    /**
+     * Get all preload results
+     * @returns {Map<string, PreloadResult>}
+     */
+    getAllResults() {
+        return new Map(this._results);
+    }
+
+    /**
+     * Clear preload results (does not clear the actual cache)
+     */
+    clearResults() {
+        this._results.clear();
+    }
+}
+
+/**
+ * ImageCache - Utility for managing the image cache
+ */
+const ImageCache = {
+    /**
+     * Clear the entire image cache
+     * Useful for memory management in resource-constrained environments
+     */
+    async clear() {
+        await op_clear_image_cache();
+    },
+
+    /**
+     * Get cache statistics
+     * @returns {Promise<CacheStats>}
+     */
+    async getStats() {
+        return await op_get_image_cache_stats();
+    }
+};
+
+export { createImage, ImagePreloader, ImageCache };

@@ -19,6 +19,7 @@ use std::{
 mod context_2d_impl;
 mod egl_ops;
 mod image;
+mod pbo_upload;
 mod types;
 
 pub(crate) use types::{BufferMeta, CanvasGLState, CanvasInfo, ProgramMeta, ShaderMeta, ee};

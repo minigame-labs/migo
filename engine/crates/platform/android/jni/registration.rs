@@ -5,12 +5,12 @@ use tracing::info;
 
 use crate::android::jni::{
     JAVA_METHOD_CACHE, JavaMethodCache, init, mod_main, onHide, onOpenSystemBluetoothSetting,
-    onShow, onTouch, onUnzipDone, shutdown, updateSurface, version,
+    onShow, onTouch, shutdown, updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
     let class = env
-        .find_class("com/minigame/host/internal/jni/HostJNI")
+        .find_class("com/migo/host/internal/jni/HostJNI")
         .map_err(|e| format!("Failed to find HostJNI: {e:?}"))?;
 
     env.register_native_methods(
@@ -23,7 +23,7 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
             },
             NativeMethod {
                 name: "init".into(),
-                sig: "(Ljava/lang/Object;Lcom/minigame/host/InitOption;)I".into(),
+                sig: "(Ljava/lang/Object;Lcom/migo/host/InitOption;)I".into(),
                 fn_ptr: init as *mut c_void,
             },
             NativeMethod {
@@ -52,11 +52,6 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 fn_ptr: updateSurface as *mut c_void,
             },
             NativeMethod {
-                name: "onUnzipDone".into(),
-                sig: "(II)V".into(),
-                fn_ptr: onUnzipDone as *mut c_void,
-            },
-            NativeMethod {
                 name: "onTouchEvent".into(),
                 sig: "(IIJILjava/nio/ByteBuffer;)V".into(),
                 fn_ptr: onTouch as *mut c_void,
@@ -76,7 +71,7 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
 
 pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
     let local_class = env
-        .find_class("com/minigame/host/internal/NativeExports")
+        .find_class("com/migo/host/internal/NativeExports")
         .map_err(|e| format!("Failed to find class NativeExports: {e}"))?;
 
     let methods = [
@@ -86,7 +81,6 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("getSystemSettingInfoBytes", "()[B"),
         ("getDeviceInfoJson", "()Ljava/lang/String;"),
         ("getAppAuthorizationSettingJson", "()Ljava/lang/String;"),
-        ("unzip", "(IILjava/lang/String;Ljava/lang/String;)V"),
     ];
 
     let global_class = env
@@ -97,7 +91,7 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
 
     for (name, sig) in methods {
         let mid = env
-            .get_static_method_id("com/minigame/host/internal/NativeExports", name, sig)
+            .get_static_method_id("com/migo/host/internal/NativeExports", name, sig)
             .map_err(|e| format!("Failed to get method id for {name} {sig}: {e}"))?;
         cache.insert_method_id(name, mid);
     }

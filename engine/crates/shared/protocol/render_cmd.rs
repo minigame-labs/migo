@@ -315,6 +315,41 @@ pub enum GLCmd {
     },
 }
 
+/// Text horizontal alignment for fillText/strokeText.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextAlign {
+    #[default]
+    Start,
+    End,
+    Left,
+    Right,
+    Center,
+}
+
+/// Text vertical baseline for fillText/strokeText.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextBaseline {
+    Top,
+    Hanging,
+    Middle,
+    #[default]
+    Alphabetic,
+    Ideographic,
+    Bottom,
+}
+
+/// Result of measureText operation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TextMetrics {
+    pub width: f32,
+    pub actual_bounding_box_left: f32,
+    pub actual_bounding_box_right: f32,
+    pub actual_bounding_box_ascent: f32,
+    pub actual_bounding_box_descent: f32,
+    pub font_bounding_box_ascent: f32,
+    pub font_bounding_box_descent: f32,
+}
+
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Canvas2DCmd {
@@ -322,98 +357,75 @@ pub enum Canvas2DCmd {
         resp: RenderCmdResp<Context2DId>,
     },
 
-    Arc {
-        x: f32,
-        y: f32,
-        radius: f32,
-        start_angle: f32,
-        end_angle: f32,
-        counterclockwise: bool,
-    },
-
-    SetFillStyle {
-        color: Color,
-    },
-    SetStrokeStyle {
-        color: Color,
-    },
-    SetLineWidth {
-        width: f32,
-    },
-
-    FillRect {
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-    },
-    ClearRect {
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-    },
-    StrokeRect {
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-    },
-
+    // ========== Path methods ==========
     BeginPath,
-
-    MoveTo {
-        x: f32,
-        y: f32,
-    },
-    LineTo {
-        x: f32,
-        y: f32,
-    },
-
     ClosePath,
+    MoveTo { x: f32, y: f32 },
+    LineTo { x: f32, y: f32 },
+    QuadraticCurveTo { cpx: f32, cpy: f32, x: f32, y: f32 },
+    BezierCurveTo { cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32 },
+    Arc { x: f32, y: f32, radius: f32, start_angle: f32, end_angle: f32, counterclockwise: bool },
+    ArcTo { x1: f32, y1: f32, x2: f32, y2: f32, radius: f32 },
+    Rect { x: f32, y: f32, w: f32, h: f32 },
+    Ellipse { x: f32, y: f32, radius_x: f32, radius_y: f32, rotation: f32, start_angle: f32, end_angle: f32, counterclockwise: bool },
+
+    // ========== Drawing methods ==========
     Fill,
     Stroke,
+    Clip,
+
+    // ========== Rectangle methods ==========
+    FillRect { x: f32, y: f32, w: f32, h: f32 },
+    StrokeRect { x: f32, y: f32, w: f32, h: f32 },
+    ClearRect { x: f32, y: f32, w: f32, h: f32 },
+
+    // ========== Text methods ==========
+    FillText { text: String, x: f32, y: f32, max_width: f32 },
+    StrokeText { text: String, x: f32, y: f32, max_width: f32 },
+    MeasureText { text: String, resp: RenderCmdResp<TextMetrics> },
+
+    // ========== Style setters ==========
+    SetFillStyle { color: Color },
+    SetStrokeStyle { color: Color },
+    SetLineWidth { width: f32 },
+    SetLineCap { cap: u8 },
+    SetLineJoin { join: u8 },
+    SetMiterLimit { limit: f32 },
+    SetGlobalAlpha { alpha: f32 },
+    SetFont { font: String },
+    SetTextAlign { align: TextAlign },
+    SetTextBaseline { baseline: TextBaseline },
+
+    // ========== State methods ==========
     Save,
     Restore,
 
-    FillText {
-        text: String,
-        x: f32,
-        y: f32,
-        max_width: f32,
-    },
-
-    StrokeText {
-        text: String,
-        x: f32,
-        y: f32,
-        max_width: f32,
-    },
-
-    SetFont {
-        font: String,
-    },
-
-    DrawImage {
-        image_id: ImageId,
-        sx: f32,
-        sy: f32,
-        sw: f32,
-        sh: f32,
-        dx: f32,
-        dy: f32,
-        dw: f32,
-        dh: f32,
-    },
-
-    SetTransform {
-        a: f32,
-        b: f32,
-        c: f32,
-        d: f32,
-        e: f32,
-        f: f32,
-    },
+    // ========== Transform methods ==========
+    SetTransform { a: f32, b: f32, c: f32, d: f32, e: f32, f: f32 },
     ResetTransform,
+    Translate { x: f32, y: f32 },
+    Rotate { angle: f32 },
+    Scale { x: f32, y: f32 },
+
+    // ========== Image methods ==========
+    DrawImage { image_id: ImageId, sx: f32, sy: f32, sw: f32, sh: f32, dx: f32, dy: f32, dw: f32, dh: f32 },
+    GetImageData { x: i32, y: i32, width: u32, height: u32, resp: RenderCmdResp<Vec<u8>> },
+
+    /// Batch draw multiple images for better performance
+    /// Each entry is (image_id, sx, sy, sw, sh, dx, dy, dw, dh)
+    DrawImageBatch { draws: Vec<DrawImageEntry> },
+}
+
+/// Single draw image entry for batch drawing
+#[derive(Debug, Clone, Copy)]
+pub struct DrawImageEntry {
+    pub image_id: ImageId,
+    pub sx: f32,
+    pub sy: f32,
+    pub sw: f32,
+    pub sh: f32,
+    pub dx: f32,
+    pub dy: f32,
+    pub dw: f32,
+    pub dh: f32,
 }
