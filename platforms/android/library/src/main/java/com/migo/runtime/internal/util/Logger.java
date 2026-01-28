@@ -1,3 +1,4 @@
+package com.migo.runtime.internal.util;
 
 import android.util.Log;
 

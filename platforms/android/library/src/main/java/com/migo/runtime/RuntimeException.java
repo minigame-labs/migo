@@ -1,3 +1,4 @@
+package com.migo.runtime;
 
 /**
  * Exception thrown by the Migo Runtime SDK.

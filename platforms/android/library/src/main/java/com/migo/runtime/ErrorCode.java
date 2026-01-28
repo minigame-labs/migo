@@ -1,3 +1,4 @@
+package com.migo.runtime;
 
 /**
  * Error codes for the Migo Runtime SDK.

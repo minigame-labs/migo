@@ -1,3 +1,4 @@
+package com.migo.runtime;
 
 import android.view.MotionEvent;
 import android.view.Surface;
@@ -218,18 +219,6 @@ public final class GameSession implements Closeable {
         } catch (Exception e) {
             return ErrorCode.ERR_JS_EXECUTION;
         }
-    }
-
-    /**
-     * Start a game using the default code directory.
-     * <p>
-     * Non-throwing version that returns a result code.
-     *
-     * @param entryPoint Entry point file (e.g., "game.js")
-     * @return {@link ErrorCode#SUCCESS} on success, or an error code
-     */
-    public int startGameSafe(String entryPoint) {
-        return startGameSafe(paths.getCodeDir().getAbsolutePath(), entryPoint);
     }
 
     // ==================== Lifecycle ====================

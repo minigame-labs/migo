@@ -1,3 +1,4 @@
+package com.migo.runtime.internal;
 
 import java.util.concurrent.ConcurrentHashMap;
 

@@ -1,3 +1,4 @@
+package com.migo.runtime.callback;
 
 import com.migo.runtime.ErrorCode;
 

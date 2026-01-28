@@ -1,3 +1,4 @@
+package com.migo.runtime.internal.util;
 
 import android.app.Activity;
 import android.content.Context;

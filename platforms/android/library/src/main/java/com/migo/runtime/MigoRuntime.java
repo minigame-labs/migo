@@ -1,6 +1,8 @@
+package com.migo.runtime;
 
 import android.app.Activity;
 import android.content.Context;
+import android.os.Build;
 import android.view.Surface;
 
 import com.migo.runtime.internal.AppContext;

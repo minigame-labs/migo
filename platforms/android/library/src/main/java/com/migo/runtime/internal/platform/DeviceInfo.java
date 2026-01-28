@@ -1,3 +1,4 @@
+package com.migo.runtime.internal.platform;
 
 import android.app.ActivityManager;
 import android.content.Context;

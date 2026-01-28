@@ -1,3 +1,4 @@
+package com.migo.runtime.callback;
 
 /**
  * Listener for runtime lifecycle events.

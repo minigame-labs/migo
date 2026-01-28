@@ -1,3 +1,4 @@
+package com.migo.runtime.internal;
 
 import com.migo.runtime.RuntimeConfig;
 
