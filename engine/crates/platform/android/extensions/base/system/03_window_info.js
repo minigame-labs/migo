@@ -52,6 +52,14 @@ class WindowInfo {
 function getWindowInfo() {
     const info = op_get_window_info()
 
+    // Convert safe_area from insets to absolute positions
+    // Rust returns: left/top/right/bottom as insets from edges
+    // API expects: left/top as positions, right/bottom as absolute coordinates
+    const safeLeft = info.safe_area.left;
+    const safeTop = info.safe_area.top;
+    const safeRight = info.screen_width - info.safe_area.right;
+    const safeBottom = info.screen_height - info.safe_area.bottom;
+
     return new WindowInfo(
         info.pixel_ratio,
         info.screen_width,
@@ -60,12 +68,7 @@ function getWindowInfo() {
         info.window_height,
         info.status_bar_height,
         info.screen_top,
-        new SafeArea(
-            info.safe_area.left,
-            info.safe_area.top,
-            info.safe_area.right,
-            info.safe_area.bottom
-        )
+        new SafeArea(safeLeft, safeTop, safeRight, safeBottom)
     );
 }
 
