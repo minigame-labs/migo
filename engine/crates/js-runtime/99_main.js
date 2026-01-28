@@ -11,6 +11,7 @@ ObjectDefineProperties(globalThis, WindowGlobalScope);
 ObjectSetPrototypeOf(globalThis, Window.prototype);
 
 globalThis.GameGlobal = globalThis;
+globalThis.migo = globalThis;
 
 event.defineEventHandler(globalThis, "error");
 event.defineEventHandler(globalThis, "load");
