@@ -272,8 +272,22 @@ impl Canvas2DContext {
         let mut paint = self.build_fill_paint();
         if let Some(font_id) = self.state.font_id { paint.set_font(&[font_id]); }
         paint.set_font_size(self.state.font_size);
+
+        // Get actual font metrics (use methods, not fields)
+        let (ascender, descender) = self.canvas.measure_font(&paint)
+            .map(|m| (m.ascender(), m.descender()))
+            .unwrap_or((self.state.font_size * 0.8, self.state.font_size * -0.2));
+
         match self.canvas.measure_text(0.0, 0.0, text, &paint) {
-            Ok(m) => TextMetrics { width: m.width(), actual_bounding_box_left: 0.0, actual_bounding_box_right: m.width(), actual_bounding_box_ascent: self.state.font_size * 0.8, actual_bounding_box_descent: self.state.font_size * 0.2, font_bounding_box_ascent: self.state.font_size * 0.8, font_bounding_box_descent: self.state.font_size * 0.2 },
+            Ok(m) => TextMetrics {
+                width: m.width(),
+                actual_bounding_box_left: 0.0,
+                actual_bounding_box_right: m.width(),
+                actual_bounding_box_ascent: ascender,
+                actual_bounding_box_descent: -descender, // descender is negative
+                font_bounding_box_ascent: ascender,
+                font_bounding_box_descent: -descender,
+            },
             Err(_) => TextMetrics { width: 0.0, actual_bounding_box_left: 0.0, actual_bounding_box_right: 0.0, actual_bounding_box_ascent: 0.0, actual_bounding_box_descent: 0.0, font_bounding_box_ascent: 0.0, font_bounding_box_descent: 0.0 },
         }
     }
