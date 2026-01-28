@@ -14,9 +14,8 @@ shared = { path = "../shared" }
 deno_core.workspace = true
 parking_lot = "0.12.4"
 
-# Fast image decoders
-zune-jpeg = { workspace = true }
-zune-png = { workspace = true }
+# Fast image decoder (unified, SIMD-optimized)
+zune-image = { workspace = true }
 zune-core = { workspace = true }
 
 # LRU cache for decoded images
