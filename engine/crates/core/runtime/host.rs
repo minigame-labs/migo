@@ -55,7 +55,10 @@ impl Host {
         let host_state = HostOpState {
             id,
             code_dir: None,
-            app_tmp_dir: init_options.tmp_dir().to_path_buf(),
+            game_paths: None, // Set when evaluating a module
+            vfs: None,        // Set when evaluating a module
+            app_cache_dir: init_options.cache_dir().to_path_buf(),
+            app_files_dir: init_options.files_dir().to_path_buf(),
             render_tx: render.sender(),
             io_tx: io.sender(),
             audio_tx: audio.sender(),
@@ -81,7 +84,9 @@ impl Host {
 
     async fn handle_command_inner(&mut self, cmd: HostCommand) -> EngineResult<()> {
         match cmd {
-            HostCommand::EvaluateModule { dir, entry } => self.on_evaluate_module(dir, entry).await,
+            HostCommand::EvaluateModule { game_id, entry } => {
+                self.on_evaluate_module(game_id, entry).await
+            }
             HostCommand::EvalScript { source } => self.on_eval_script(source).await,
 
             HostCommand::OnShow => {
@@ -128,8 +133,8 @@ impl Host {
         }
     }
 
-    async fn on_evaluate_module(&mut self, dir: String, entry: String) -> EngineResult<()> {
-        self.js.evaluate_module(dir, entry).await?;
+    async fn on_evaluate_module(&mut self, game_id: String, entry: String) -> EngineResult<()> {
+        self.js.evaluate_module(game_id, entry).await?;
 
         self.js
             .run_event_loop(PollEventLoopOptions::default())

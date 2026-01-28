@@ -1,4 +1,4 @@
-use std::{cell::RefCell, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use deno_core::{JsBuffer, OpState, ToJsBuffer, op2, serde_json, v8};
 use shared::{
@@ -9,6 +9,7 @@ use shared::{
         self,
         io_cmd::{FileId, FileStat, IOCmd, IOCmdResp, OpenFlag, WriteMode},
     },
+    vfs::{FileOp, VfsError, VirtualFS},
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -62,45 +63,52 @@ fn get_io_tx_async(state: Rc<RefCell<OpState>>) -> UnboundedSender<IOCmd> {
     st.borrow::<HostOpState>().io_tx.clone()
 }
 
-/// Get IO channel and code_dir from async op state.
-#[inline]
-fn get_host_state_async(state: &Rc<RefCell<OpState>>) -> (UnboundedSender<IOCmd>, Option<String>) {
-    let st = state.borrow();
-    let host = st.borrow::<HostOpState>();
-    (host.io_tx.clone(), host.code_dir.clone())
-}
-
 /// Get IO channel from sync op state.
 #[inline]
 fn get_io_tx_sync(state: &OpState) -> &UnboundedSender<IOCmd> {
     &state.borrow::<HostOpState>().io_tx
 }
 
-/// Get code_dir from sync op state.
+/// Get VFS from async op state.
 #[inline]
-fn get_code_dir_sync(state: &OpState) -> Option<&str> {
-    state.borrow::<HostOpState>().code_dir.as_deref()
+fn get_vfs_async(state: &Rc<RefCell<OpState>>) -> Option<Arc<VirtualFS>> {
+    state.borrow().borrow::<HostOpState>().vfs.clone()
 }
 
-/// Resolve a relative path against code_dir.
-/// If path is absolute or code_dir is None, return path as-is.
+/// Get VFS from sync op state.
 #[inline]
-fn resolve_path(code_dir: Option<&str>, path: &str) -> String {
-    // If path is absolute, return as-is
-    let p = PathBuf::from(path);
-    if p.is_absolute() {
-        return path.to_string();
-    }
+fn get_vfs_sync(state: &OpState) -> Option<Arc<VirtualFS>> {
+    state.borrow::<HostOpState>().vfs.clone()
+}
 
-    // If code_dir exists, join with it
-    match code_dir {
-        Some(base) if !base.is_empty() => {
-            let mut full = PathBuf::from(base);
-            full.push(path);
-            full.to_string_lossy().into_owned()
-        }
-        _ => path.to_string(),
-    }
+/// Resolve a path using VFS.
+///
+/// All file paths MUST be virtual paths starting with /user, /cache, /code, or /tmp.
+/// This ensures game isolation and prevents unauthorized file access.
+#[inline]
+fn resolve_path_vfs(
+    vfs: Option<&VirtualFS>,
+    path: &str,
+    op: FileOp,
+) -> Result<String, IOError> {
+    let vfs = vfs.ok_or_else(|| ioerr("File system not initialized"))?;
+
+    vfs.resolve(path, op)
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| match e {
+            VfsError::PathNotAllowed => {
+                ioerr(format!("Path not allowed: {}. Use /user, /cache, /code, or /tmp", path))
+            }
+            VfsError::PermissionDenied => {
+                ioerr(format!("Permission denied: {}", path))
+            }
+            VfsError::PathTraversal => {
+                ioerr(format!("Path traversal detected: {}", path))
+            }
+            VfsError::InvalidPath => {
+                ioerr(format!("Invalid path: {}", path))
+            }
+        })
 }
 
 #[inline]
@@ -113,6 +121,18 @@ fn parse_open_flag(flag: &str) -> Result<OpenFlag, IOError> {
         "a" => Ok(OpenFlag::AppendCreate),
         "a+" => Ok(OpenFlag::ReadAppendCreate),
         _ => Err(ioerr(format!("Invalid open flag: {flag}"))),
+    }
+}
+
+/// Convert OpenFlag to VFS FileOp for permission checking.
+#[inline]
+fn open_flag_to_vfs_op(flag: &OpenFlag) -> FileOp {
+    match flag {
+        OpenFlag::Read => FileOp::Read,
+        OpenFlag::ReadWrite | OpenFlag::ReadWriteTruncateCreate | OpenFlag::ReadAppendCreate => {
+            FileOp::Write // Write includes read
+        }
+        OpenFlag::WriteTruncateCreate | OpenFlag::AppendCreate => FileOp::Create,
     }
 }
 
@@ -153,17 +173,19 @@ fn prepare_data(
 }
 
 //
-// Access
+// Access - check if path exists (uses VFS)
 //
 #[op2(async)]
 pub async fn op_access(
     state: Rc<RefCell<OpState>>,
     #[string] path: String,
 ) -> Result<bool, IOError> {
+    let vfs = get_vfs_async(&state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
     let tx = get_io_tx_async(state);
 
     let r = protocol::send_fs_with_resp_async(&tx, |resp_tx| IOCmd::Access {
-        path,
+        path: full_path,
         resp: IOCmdResp::Async(resp_tx),
     })
     .await;
@@ -174,10 +196,12 @@ pub async fn op_access(
 
 #[op2(fast)]
 pub fn op_access_sync(state: &mut OpState, #[string] path: String) -> Result<bool, IOError> {
+    let vfs = get_vfs_sync(state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
     let tx = get_io_tx_sync(state);
 
     let r = protocol::send_fs_with_resp_sync(tx, |resp_tx| IOCmd::Access {
-        path,
+        path: full_path,
         resp: IOCmdResp::Sync(resp_tx),
     });
 
@@ -186,7 +210,7 @@ pub fn op_access_sync(state: &mut OpState, #[string] path: String) -> Result<boo
 }
 
 //
-// Write / append (path)
+// Write / append (path) - uses VFS with Write/Create permission
 //
 #[op2(async)]
 pub async fn op_write_or_append_file(
@@ -197,13 +221,15 @@ pub async fn op_write_or_append_file(
     #[string] encoding: Option<String>,
     append: bool,
 ) -> Result<bool, IOError> {
+    let vfs = get_vfs_async(&state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Write)?;
     let tx: UnboundedSender<IOCmd> = get_io_tx_async(state);
     let mode = mode_from_append(append);
     let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
 
     if let Some((store, range)) = buf_opt {
         let r = protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::WriteShared {
-            path,
+            path: full_path,
             store,
             range,
             mode,
@@ -215,7 +241,7 @@ pub async fn op_write_or_append_file(
 
     if let Some(data) = data_opt {
         let r = protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Write {
-            path,
+            path: full_path,
             data,
             mode,
             resp: IOCmdResp::Async(resp_tx),
@@ -236,13 +262,15 @@ pub fn op_write_or_append_file_sync(
     #[string] encoding: Option<String>,
     append: bool,
 ) -> Result<bool, IOError> {
+    let vfs = get_vfs_sync(state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Write)?;
     let tx = get_io_tx_sync(state);
     let mode = mode_from_append(append);
     let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
 
     if let Some((store, range)) = buf_opt {
         let r = protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::WriteShared {
-            path,
+            path: full_path,
             store,
             range,
             mode,
@@ -253,7 +281,7 @@ pub fn op_write_or_append_file_sync(
 
     if let Some(data) = data_opt {
         let r = protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Write {
-            path,
+            path: full_path,
             data,
             mode,
             resp: IOCmdResp::Sync(resp_tx),
@@ -265,7 +293,7 @@ pub fn op_write_or_append_file_sync(
 }
 
 //
-// Open / close
+// Open / close - uses VFS with appropriate permission based on open flag
 //
 #[op2(async)]
 pub async fn op_open_file(
@@ -273,12 +301,15 @@ pub async fn op_open_file(
     #[string] path: String,
     #[string] flag: String,
 ) -> Result<u32, IOError> {
+    let vfs = get_vfs_async(&state);
+    let open_flag = parse_open_flag(&flag)?;
+    let vfs_op = open_flag_to_vfs_op(&open_flag);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, vfs_op)?;
     let tx = get_io_tx_async(state);
-    let flag = parse_open_flag(&flag)?;
 
     protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Open {
-        path,
-        flag,
+        path: full_path,
+        flag: open_flag,
         resp: IOCmdResp::Async(resp_tx),
     })
     .await
@@ -291,12 +322,15 @@ pub fn op_open_file_sync(
     #[string] path: String,
     #[string] flag: String,
 ) -> Result<u32, IOError> {
+    let vfs = get_vfs_sync(state);
+    let open_flag = parse_open_flag(&flag)?;
+    let vfs_op = open_flag_to_vfs_op(&open_flag);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, vfs_op)?;
     let tx = get_io_tx_sync(state);
-    let flag = parse_open_flag(&flag)?;
 
     protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Open {
-        path,
-        flag,
+        path: full_path,
+        flag: open_flag,
         resp: IOCmdResp::Sync(resp_tx),
     })
     .map_err(IOError::from)
@@ -326,7 +360,7 @@ pub fn op_close_file_sync(state: &mut OpState, #[smi] rid: FileId) -> Result<(),
 }
 
 //
-// Copy
+// Copy - uses VFS for both source (Read) and destination (Create)
 //
 #[op2(async)]
 pub async fn op_copy_file(
@@ -334,11 +368,14 @@ pub async fn op_copy_file(
     #[string] src_path: String,
     #[string] dest_path: String,
 ) -> Result<(), IOError> {
+    let vfs = get_vfs_async(&state);
+    let src_full = resolve_path_vfs(vfs.as_deref(), &src_path, FileOp::Read)?;
+    let dest_full = resolve_path_vfs(vfs.as_deref(), &dest_path, FileOp::Create)?;
     let tx = get_io_tx_async(state);
 
     protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Copy {
-        src_path,
-        dest_path,
+        src_path: src_full,
+        dest_path: dest_full,
         resp: IOCmdResp::Async(resp_tx),
     })
     .await
@@ -351,11 +388,14 @@ pub fn op_copy_file_sync(
     #[string] src_path: String,
     #[string] dest_path: String,
 ) -> Result<(), IOError> {
+    let vfs = get_vfs_sync(state);
+    let src_full = resolve_path_vfs(vfs.as_deref(), &src_path, FileOp::Read)?;
+    let dest_full = resolve_path_vfs(vfs.as_deref(), &dest_path, FileOp::Create)?;
     let tx = get_io_tx_sync(state);
 
     protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Copy {
-        src_path,
-        dest_path,
+        src_path: src_full,
+        dest_path: dest_full,
         resp: IOCmdResp::Sync(resp_tx),
     })
     .map_err(IOError::from)
@@ -426,7 +466,7 @@ pub fn op_ftruncate_sync(
 }
 
 //
-// mkdir / readdir
+// mkdir / readdir - uses VFS with Create/Read permissions
 //
 #[op2(async)]
 pub async fn op_mkdir(
@@ -434,10 +474,12 @@ pub async fn op_mkdir(
     #[string] dir_path: String,
     recursive: bool,
 ) -> Result<(), IOError> {
+    let vfs = get_vfs_async(&state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &dir_path, FileOp::Create)?;
     let tx = get_io_tx_async(state);
 
     protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Mkdir {
-        dir_path,
+        dir_path: full_path,
         recursive,
         resp: IOCmdResp::Async(resp_tx),
     })
@@ -451,10 +493,12 @@ pub fn op_mkdir_sync(
     #[string] dir_path: String,
     recursive: bool,
 ) -> Result<(), IOError> {
+    let vfs = get_vfs_sync(state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &dir_path, FileOp::Create)?;
     let tx = get_io_tx_sync(state);
 
     protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Mkdir {
-        dir_path,
+        dir_path: full_path,
         recursive,
         resp: IOCmdResp::Sync(resp_tx),
     })
@@ -467,10 +511,12 @@ pub async fn op_readdir(
     state: Rc<RefCell<OpState>>,
     #[string] dir_path: String,
 ) -> Result<Vec<String>, IOError> {
+    let vfs = get_vfs_async(&state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &dir_path, FileOp::Read)?;
     let tx = get_io_tx_async(state);
 
     protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Readdir {
-        dir_path,
+        dir_path: full_path,
         resp: IOCmdResp::Async(resp_tx),
     })
     .await
@@ -483,27 +529,31 @@ pub fn op_readdir_sync(
     state: &mut OpState,
     #[string] dir_path: String,
 ) -> Result<Vec<String>, IOError> {
+    let vfs = get_vfs_sync(state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &dir_path, FileOp::Read)?;
     let tx = get_io_tx_sync(state);
 
     protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Readdir {
-        dir_path,
+        dir_path: full_path,
         resp: IOCmdResp::Sync(resp_tx),
     })
     .map_err(IOError::from)
 }
 
 //
-// unlink / rename / rmdir
+// unlink / rename / rmdir - uses VFS with Delete/Write permissions
 //
 #[op2(async)]
 pub async fn op_unlink(
     state: Rc<RefCell<OpState>>,
     #[string] file_path: String,
 ) -> Result<(), IOError> {
+    let vfs = get_vfs_async(&state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &file_path, FileOp::Delete)?;
     let tx = get_io_tx_async(state);
 
     protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Unlink {
-        file_path,
+        file_path: full_path,
         resp: IOCmdResp::Async(resp_tx),
     })
     .await
@@ -512,10 +562,12 @@ pub async fn op_unlink(
 
 #[op2(fast)]
 pub fn op_unlink_sync(state: &mut OpState, #[string] file_path: String) -> Result<(), IOError> {
+    let vfs = get_vfs_sync(state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &file_path, FileOp::Delete)?;
     let tx = get_io_tx_sync(state);
 
     protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Unlink {
-        file_path,
+        file_path: full_path,
         resp: IOCmdResp::Sync(resp_tx),
     })
     .map_err(IOError::from)
@@ -527,11 +579,15 @@ pub async fn op_rename(
     #[string] old_path: String,
     #[string] new_path: String,
 ) -> Result<(), IOError> {
+    let vfs = get_vfs_async(&state);
+    // Rename needs delete on source and create on destination
+    let old_full = resolve_path_vfs(vfs.as_deref(), &old_path, FileOp::Delete)?;
+    let new_full = resolve_path_vfs(vfs.as_deref(), &new_path, FileOp::Create)?;
     let tx = get_io_tx_async(state);
 
     protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Rename {
-        old_path,
-        new_path,
+        old_path: old_full,
+        new_path: new_full,
         resp: IOCmdResp::Async(resp_tx),
     })
     .await
@@ -544,11 +600,14 @@ pub fn op_rename_sync(
     #[string] old_path: String,
     #[string] new_path: String,
 ) -> Result<(), IOError> {
+    let vfs = get_vfs_sync(state);
+    let old_full = resolve_path_vfs(vfs.as_deref(), &old_path, FileOp::Delete)?;
+    let new_full = resolve_path_vfs(vfs.as_deref(), &new_path, FileOp::Create)?;
     let tx = get_io_tx_sync(state);
 
     protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Rename {
-        old_path,
-        new_path,
+        old_path: old_full,
+        new_path: new_full,
         resp: IOCmdResp::Sync(resp_tx),
     })
     .map_err(IOError::from)
@@ -560,10 +619,12 @@ pub async fn op_rmdir(
     #[string] dir_path: String,
     recursive: bool,
 ) -> Result<(), IOError> {
+    let vfs = get_vfs_async(&state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &dir_path, FileOp::Delete)?;
     let tx = get_io_tx_async(state);
 
     protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Rmdir {
-        dir_path,
+        dir_path: full_path,
         recursive,
         resp: IOCmdResp::Async(resp_tx),
     })
@@ -577,10 +638,12 @@ pub fn op_rmdir_sync(
     #[string] dir_path: String,
     recursive: bool,
 ) -> Result<(), IOError> {
+    let vfs = get_vfs_sync(state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &dir_path, FileOp::Delete)?;
     let tx = get_io_tx_sync(state);
 
     protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Rmdir {
-        dir_path,
+        dir_path: full_path,
         recursive,
         resp: IOCmdResp::Sync(resp_tx),
     })
@@ -588,7 +651,7 @@ pub fn op_rmdir_sync(
 }
 
 //
-// stat
+// stat - uses VFS with Read permission
 //
 #[op2(async)]
 #[serde]
@@ -597,10 +660,12 @@ pub async fn op_stat(
     #[string] path: String,
     recursive: bool,
 ) -> Result<serde_json::Value, IOError> {
+    let vfs = get_vfs_async(&state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
     let tx = get_io_tx_async(state);
 
     protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Stat {
-        path,
+        path: full_path,
         recursive,
         resp: IOCmdResp::Async(resp_tx),
     })
@@ -615,10 +680,12 @@ pub fn op_stat_sync(
     #[string] path: String,
     recursive: bool,
 ) -> Result<serde_json::Value, IOError> {
+    let vfs = get_vfs_sync(state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
     let tx = get_io_tx_sync(state);
 
     protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Stat {
-        path,
+        path: full_path,
         recursive,
         resp: IOCmdResp::Sync(resp_tx),
     })
@@ -701,7 +768,7 @@ pub fn op_write_file_sync(
 }
 
 //
-// readFile (path)
+// readFile (path) - uses VFS for path resolution
 //
 #[op2(async)]
 #[serde]
@@ -711,8 +778,9 @@ pub async fn op_read_file(
     #[bigint] position: Option<u64>,
     #[bigint] length: Option<u64>,
 ) -> Result<ToJsBuffer, IOError> {
-    let (tx, code_dir) = get_host_state_async(&state);
-    let full_path = resolve_path(code_dir.as_deref(), &path);
+    let vfs = get_vfs_async(&state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
+    let tx = get_io_tx_async(state);
 
     protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ReadFile {
         path: full_path,
@@ -733,8 +801,9 @@ pub fn op_read_file_sync(
     #[bigint] position: Option<u64>,
     #[bigint] length: Option<u64>,
 ) -> Result<ToJsBuffer, IOError> {
+    let vfs = get_vfs_sync(state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
     let tx = get_io_tx_sync(state);
-    let full_path = resolve_path(get_code_dir_sync(state), &path);
 
     protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::ReadFile {
         path: full_path,

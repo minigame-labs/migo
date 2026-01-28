@@ -10,8 +10,8 @@ use crate::android::jni::{
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
     let class = env
-        .find_class("com/migo/host/internal/jni/HostJNI")
-        .map_err(|e| format!("Failed to find HostJNI: {e:?}"))?;
+        .find_class("com/migo/runtime/internal/NativeBridge")
+        .map_err(|e| format!("Failed to find NativeBridge: {e:?}"))?;
 
     env.register_native_methods(
         &class,
@@ -23,7 +23,7 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
             },
             NativeMethod {
                 name: "init".into(),
-                sig: "(Ljava/lang/Object;Lcom/migo/host/InitOption;)I".into(),
+                sig: "(Ljava/lang/Object;Lcom/migo/runtime/RuntimeConfig;)I".into(),
                 fn_ptr: init as *mut c_void,
             },
             NativeMethod {
@@ -58,6 +58,7 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
             },
             NativeMethod {
                 name: "modMain".into(),
+                // (sessionId, gameId, entry) -> int
                 sig: "(ILjava/lang/String;Ljava/lang/String;)I".into(),
                 fn_ptr: mod_main as *mut c_void,
             },
@@ -65,13 +66,13 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
 
-    info!("Registered native methods for HostJNI");
+    info!("Registered native methods for NativeBridge");
     Ok(())
 }
 
 pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
     let local_class = env
-        .find_class("com/migo/host/internal/NativeExports")
+        .find_class("com/migo/runtime/internal/NativeExports")
         .map_err(|e| format!("Failed to find class NativeExports: {e}"))?;
 
     let methods = [
@@ -91,7 +92,7 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
 
     for (name, sig) in methods {
         let mid = env
-            .get_static_method_id("com/migo/host/internal/NativeExports", name, sig)
+            .get_static_method_id("com/migo/runtime/internal/NativeExports", name, sig)
             .map_err(|e| format!("Failed to get method id for {name} {sig}: {e}"))?;
         cache.insert_method_id(name, mid);
     }

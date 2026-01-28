@@ -46,6 +46,7 @@ pub mod error;
 pub mod op_state;
 pub mod protocol;
 pub mod surface;
+pub mod vfs;
 
 /// Frequently used re-exports for convenient imports.
 ///

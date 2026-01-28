@@ -82,9 +82,15 @@ pub struct InitOptions {
     /// Device pixel ratio (DPI scale factor).
     /// Values > 1.0 indicate high-DPI displays (e.g., 2.0 = Retina, 3.0 = xxhdpi).
     pixel_ratio: f32,
-    /// Temporary directory for cache files, decoded audio, etc.
-    tmp_dir: PathBuf,
-    /// Code cache directory for compiled scripts.
+    /// Cache directory (may be cleared by system).
+    /// - Android: `Context.getCacheDir()`
+    /// - iOS: `NSCachesDirectory`
+    cache_dir: PathBuf,
+    /// Persistent files directory (survives app updates).
+    /// - Android: `Context.getFilesDir()`
+    /// - iOS: `NSDocumentDirectory`
+    files_dir: PathBuf,
+    /// Code cache directory for compiled scripts (V8 bytecode).
     code_cache_dir: PathBuf,
     /// Target frames per second (1-120).
     target_fps: i32,
@@ -100,10 +106,12 @@ pub struct InitOptions {
 
 impl Default for InitOptions {
     fn default() -> Self {
+        let temp = std::env::temp_dir();
         Self {
             pixel_ratio: 1.0,
-            tmp_dir: std::env::temp_dir(),
-            code_cache_dir: std::env::temp_dir(),
+            cache_dir: temp.clone(),
+            files_dir: temp.clone(),
+            code_cache_dir: temp,
             target_fps: 60,
             debug_enabled: false,
             log_level: LogLevel::Warn,
@@ -138,12 +146,29 @@ impl InitOptions {
         self.pixel_ratio
     }
 
-    /// Returns the temporary directory path.
+    /// Returns the cache directory path.
     ///
-    /// Used for caching decoded audio, intermediate files, etc.
+    /// Used for caching decoded audio, images, intermediate files, etc.
+    /// May be cleared by the system when storage is low.
     #[inline]
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// Returns the persistent files directory path.
+    ///
+    /// Used for user data, game saves, persistent configuration.
+    /// Survives app updates and is not cleared by the system.
+    #[inline]
+    pub fn files_dir(&self) -> &Path {
+        &self.files_dir
+    }
+
+    /// Alias for cache_dir for backward compatibility.
+    #[inline]
+    #[deprecated(note = "Use cache_dir() instead")]
     pub fn tmp_dir(&self) -> &Path {
-        &self.tmp_dir
+        &self.cache_dir
     }
 
     /// Returns the code cache directory path.
@@ -208,14 +233,33 @@ impl InitOptions {
         self
     }
 
-    /// Sets the temporary directory (builder pattern).
+    /// Sets the cache directory (builder pattern).
     ///
     /// # Arguments
     ///
-    /// * `tmp_dir` - Path to the temporary directory
+    /// * `cache_dir` - Path to the cache directory
     #[must_use]
+    pub fn with_cache_dir(mut self, cache_dir: PathBuf) -> Self {
+        self.cache_dir = cache_dir;
+        self
+    }
+
+    /// Sets the persistent files directory (builder pattern).
+    ///
+    /// # Arguments
+    ///
+    /// * `files_dir` - Path to the files directory
+    #[must_use]
+    pub fn with_files_dir(mut self, files_dir: PathBuf) -> Self {
+        self.files_dir = files_dir;
+        self
+    }
+
+    /// Alias for with_cache_dir for backward compatibility.
+    #[must_use]
+    #[deprecated(note = "Use with_cache_dir() instead")]
     pub fn with_tmp_dir(mut self, tmp_dir: PathBuf) -> Self {
-        self.tmp_dir = tmp_dir;
+        self.cache_dir = tmp_dir;
         self
     }
 

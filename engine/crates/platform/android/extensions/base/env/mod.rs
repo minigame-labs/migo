@@ -1,15 +1,11 @@
-use deno_core::{Extension, OpState, extension, op2};
-use shared::op_state::HostOpState;
+//! Environment extension providing virtual path constants.
+//!
+//! All paths exposed to JavaScript are virtual and sandboxed.
+//! The actual path resolution happens in the file system ops via VirtualFS.
 
-#[op2]
-#[string]
-pub fn op_get_user_data_path(state: &mut OpState) -> Option<String> {
-    let options = state.borrow::<HostOpState>();
-    options.app_tmp_dir.to_str().map(|s| s.to_string())
-}
+use deno_core::{Extension, extension};
 
 extension!(host_v8_env,
- ops = [op_get_user_data_path],
  esm = [
     dir "android/extensions/base/env",
     "00_env.js"

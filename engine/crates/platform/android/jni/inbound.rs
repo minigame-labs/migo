@@ -77,26 +77,34 @@ pub(crate) extern "system" fn init(
         )
     };
 
-    // Read required fields
-    let app_tmp_dir = match super::get_string_field(&mut env, "appTmpDir", &options) {
+    // Read required fields from RuntimeConfig
+    let cache_dir = match super::get_string_field(&mut env, "cacheDir", &options) {
         Ok(s) => s,
         Err(e) => {
-            error!("init failed: read appTmpDir error: {}", e);
+            error!("init failed: read cacheDir error: {}", e);
             return -1;
         }
     };
 
-    let dpi = match super::get_f32(&mut env, "dpi", &options) {
+    let files_dir = match super::get_string_field(&mut env, "filesDir", &options) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("init failed: read filesDir error: {}", e);
+            return -1;
+        }
+    };
+
+    let display_density = match super::get_f32(&mut env, "displayDensity", &options) {
         Ok(v) => v,
         Err(e) => {
-            error!("init failed: read dpi error: {}", e);
+            error!("init failed: read displayDensity error: {}", e);
             return -1;
         }
     };
 
     // Read optional fields with defaults
     let code_cache_dir = super::get_string_field(&mut env, "codeCacheDir", &options)
-        .unwrap_or_else(|_| app_tmp_dir.clone());
+        .unwrap_or_else(|_| cache_dir.clone());
 
     let target_fps = super::get_i32(&mut env, "targetFps", &options).unwrap_or(60);
 
@@ -105,16 +113,17 @@ pub(crate) extern "system" fn init(
     let log_level_ordinal = super::get_enum_ordinal(
         &mut env,
         "logLevel",
-        "Lcom/migo/host/InitOption$LogLevel;",
+        "Lcom/migo/runtime/RuntimeConfig$LogLevel;",
         &options,
     )
-    .unwrap_or(2); // Default to Warn
+    .unwrap_or(3); // Default to Warn (index 3 in new enum)
 
     let max_memory_mb = super::get_i32(&mut env, "maxMemoryMB", &options).unwrap_or(512);
 
     let init_options = InitOptions::new()
-        .with_pixel_ratio(dpi)
-        .with_tmp_dir(PathBuf::from(app_tmp_dir))
+        .with_pixel_ratio(display_density)
+        .with_cache_dir(PathBuf::from(cache_dir))
+        .with_files_dir(PathBuf::from(files_dir))
         .with_code_cache_dir(PathBuf::from(code_cache_dir))
         .with_target_fps(target_fps)
         .with_debug_enabled(debug_enabled)
@@ -122,8 +131,8 @@ pub(crate) extern "system" fn init(
         .with_max_memory_mb(max_memory_mb);
 
     info!(
-        "init: dpi={}, target_fps={}, debug={}, log_level={:?}, max_mem={}MB",
-        dpi, target_fps, debug_enabled, init_options.log_level(), max_memory_mb
+        "init: density={}, target_fps={}, debug={}, log_level={:?}, max_mem={}MB",
+        display_density, target_fps, debug_enabled, init_options.log_level(), max_memory_mb
     );
 
     let platform = Arc::new(AndroidPlatform::new());
@@ -298,13 +307,13 @@ pub(crate) extern "system" fn mod_main<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
-    code_dir: JString<'local>,
+    game_id: JString<'local>,
     entry: JString<'local>,
 ) -> jint {
-    let code_dir = match env.get_string(&code_dir) {
+    let game_id = match env.get_string(&game_id) {
         Ok(s) => s.to_string_lossy().into_owned(),
         Err(e) => {
-            error!("modMain failed: convert code_dir JString error: {:?}", e);
+            error!("modMain failed: convert game_id JString error: {:?}", e);
             return -1;
         }
     };
@@ -317,12 +326,11 @@ pub(crate) extern "system" fn mod_main<'local>(
         }
     };
 
+    info!("modMain: game_id={}, entry={}", game_id, entry);
+
     match send_command_to_host(
         host_id,
-        HostCommand::EvaluateModule {
-            dir: code_dir,
-            entry,
-        },
+        HostCommand::EvaluateModule { game_id, entry },
     ) {
         Ok(_) => 0,
         Err(e) => {

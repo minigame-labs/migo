@@ -59,22 +59,23 @@ use smallvec::SmallVec;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum HostCommand {
-    /// Evaluate an ES module at `dir/entry`.
+    /// Evaluate an ES module with isolated VFS paths.
     ///
     /// This is the primary way to start a mini-game. The module is loaded
-    /// relative to `dir`, and `entry` specifies the main module file.
+    /// from the game's code directory, and sandboxed file access is enabled.
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// HostCommand::EvaluateModule {
-    ///     dir: "/data/games/puzzle".to_string(),
+    ///     game_id: "my-puzzle-game".to_string(),
     ///     entry: "game.js".to_string(),
     /// }
     /// ```
     EvaluateModule {
-        /// Base directory containing the game code.
-        dir: String,
+        /// Unique game identifier (1-64 alphanumeric, underscore, hyphen).
+        /// Used to derive all game paths from base directories.
+        game_id: String,
         /// Entry point module filename (e.g., "main.js", "game.js").
         entry: String,
     },

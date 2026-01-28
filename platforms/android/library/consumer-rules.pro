@@ -1,5 +1,5 @@
 # ============================================================================
-# MiniGame Host Library - Consumer ProGuard Rules
+# Migo Runtime SDK - Consumer ProGuard Rules
 # ============================================================================
 # These rules are automatically applied to apps that depend on this library.
 # They ensure that critical classes are not obfuscated or removed.
@@ -13,8 +13,8 @@
     native <methods>;
 }
 
-# Keep HostJNI - contains native method declarations
--keep class com.migo.host.internal.jni.HostJNI {
+# Keep NativeBridge - contains native method declarations
+-keep class com.migo.runtime.internal.NativeBridge {
     native <methods>;
     static { *; }
 }
@@ -25,8 +25,7 @@
 
 # Keep NativeExports - methods are called from native code via cached method IDs
 # WARNING: Do not rename these methods!
--keep class com.migo.host.internal.NativeExports {
-    static void unzip(int, int, java.lang.String, java.lang.String);
+-keep class com.migo.runtime.internal.NativeExports {
     static java.lang.String getCacheDirPath();
     static void openSystemBluetoothSetting(int);
     static byte[] getWindowInfoBytes(int);
@@ -36,16 +35,21 @@
 }
 
 # ============================================================================
-# InitOption (JNI Field Access)
+# RuntimeConfig (JNI Field Access)
 # ============================================================================
 
-# Keep InitOption - fields are accessed via JNI reflection
--keep class com.migo.host.InitOption {
+# Keep RuntimeConfig - fields are accessed via JNI reflection
+-keep class com.migo.runtime.RuntimeConfig {
     <fields>;
 }
 
 # Keep LogLevel enum - ordinal() is called from native code
--keep class com.migo.host.InitOption$LogLevel {
+-keep class com.migo.runtime.RuntimeConfig$LogLevel {
+    *;
+}
+
+# Keep RenderBackend enum
+-keep class com.migo.runtime.RuntimeConfig$RenderBackend {
     *;
 }
 
@@ -54,9 +58,15 @@
 # ============================================================================
 
 # Keep public API classes (apps may use reflection)
--keep public class com.migo.host.MiniGameSDK { public *; }
--keep public class com.migo.host.MiniGameSDK$InitResult { public *; }
--keep public class com.migo.host.HostHandle { public *; }
--keep public class com.migo.host.HostCallback { *; }
--keep public class com.migo.host.MiniGameError { public *; }
--keep public class com.migo.host.InitOption$Builder { public *; }
+-keep public class com.migo.runtime.MigoRuntime { public *; }
+-keep public class com.migo.runtime.MigoRuntime$BuildInfo { public *; }
+-keep public class com.migo.runtime.MigoRuntime$Result { public *; }
+-keep public class com.migo.runtime.GameSession { public *; }
+-keep public class com.migo.runtime.ErrorCode { public *; }
+-keep public class com.migo.runtime.RuntimeException { public *; }
+-keep public class com.migo.runtime.RuntimeConfig$Builder { public *; }
+
+# Keep callback interfaces
+-keep interface com.migo.runtime.callback.OnGameEventListener { *; }
+-keep interface com.migo.runtime.callback.OnErrorListener { *; }
+-keep interface com.migo.runtime.callback.OnLifecycleListener { *; }

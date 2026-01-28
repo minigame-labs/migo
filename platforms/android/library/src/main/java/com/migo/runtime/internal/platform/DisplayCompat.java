@@ -1,0 +1,341 @@
+
+import android.app.Activity;
+import android.content.Context;
+import android.graphics.Point;
+import android.os.Build;
+import android.util.DisplayMetrics;
+import android.view.Display;
+import android.view.View;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowManager;
+import android.view.WindowMetrics;
+
+/**
+ * Compatibility wrapper for display-related APIs.
+ * <p>
+ * Provides consistent APIs across Android API 21-34, handling deprecated
+ * methods appropriately for each API level.
+ *
+ * @hide
+ */
+public final class DisplayCompat {
+
+    private DisplayCompat() {}
+
+    // ==================== Screen Dimensions ====================
+
+    /**
+     * Get real screen width in pixels.
+     * <p>
+     * Uses WindowMetrics on API 30+, getRealMetrics on older versions.
+     *
+     * @param activity The activity
+     * @return Screen width in pixels
+     */
+    public static int getScreenWidth(Activity activity) {
+        if (activity == null) return 0;
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // API 30+: Use WindowMetrics
+            WindowMetrics metrics = activity.getWindowManager().getCurrentWindowMetrics();
+            return metrics.getBounds().width();
+        } else {
+            // API 21-29: Use deprecated getRealMetrics
+            DisplayMetrics dm = new DisplayMetrics();
+            activity.getWindowManager().getDefaultDisplay().getRealMetrics(dm);
+            return dm.widthPixels;
+        }
+    }
+
+    /**
+     * Get real screen height in pixels.
+     * <p>
+     * Uses WindowMetrics on API 30+, getRealMetrics on older versions.
+     *
+     * @param activity The activity
+     * @return Screen height in pixels
+     */
+    public static int getScreenHeight(Activity activity) {
+        if (activity == null) return 0;
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // API 30+: Use WindowMetrics
+            WindowMetrics metrics = activity.getWindowManager().getCurrentWindowMetrics();
+            return metrics.getBounds().height();
+        } else {
+            // API 21-29: Use deprecated getRealMetrics
+            DisplayMetrics dm = new DisplayMetrics();
+            activity.getWindowManager().getDefaultDisplay().getRealMetrics(dm);
+            return dm.heightPixels;
+        }
+    }
+
+    /**
+     * Get display density (pixels per dp).
+     *
+     * @param context The context
+     * @return Display density
+     */
+    public static float getDensity(Context context) {
+        if (context == null) return 1.0f;
+        return context.getResources().getDisplayMetrics().density;
+    }
+
+    /**
+     * Get display DPI.
+     *
+     * @param context The context
+     * @return Display DPI
+     */
+    public static int getDpi(Context context) {
+        if (context == null) return 160;
+        return context.getResources().getDisplayMetrics().densityDpi;
+    }
+
+    // ==================== Display Rotation ====================
+
+    /**
+     * Get current display rotation.
+     * <p>
+     * Uses Display.getRotation() which works on all API levels.
+     *
+     * @param activity The activity
+     * @return Rotation constant (Surface.ROTATION_0, ROTATION_90, etc.)
+     */
+    public static int getRotation(Activity activity) {
+        if (activity == null) return 0;
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // API 30+: Use context.getDisplay()
+            Display display = activity.getDisplay();
+            return display != null ? display.getRotation() : 0;
+        } else {
+            // API 21-29: Use deprecated getDefaultDisplay()
+            return activity.getWindowManager().getDefaultDisplay().getRotation();
+        }
+    }
+
+    /**
+     * Check if device is in landscape orientation.
+     *
+     * @param activity The activity
+     * @return true if landscape
+     */
+    public static boolean isLandscape(Activity activity) {
+        int rotation = getRotation(activity);
+        return rotation == android.view.Surface.ROTATION_90 
+            || rotation == android.view.Surface.ROTATION_270;
+    }
+
+    // ==================== Status Bar ====================
+
+    /**
+     * Get status bar height.
+     *
+     * @param context The context
+     * @return Status bar height in pixels
+     */
+    public static int getStatusBarHeight(Context context) {
+        if (context == null) return 0;
+        
+        int resourceId = context.getResources().getIdentifier(
+                "status_bar_height", "dimen", "android");
+        if (resourceId > 0) {
+            return context.getResources().getDimensionPixelSize(resourceId);
+        }
+        return 0;
+    }
+
+    /**
+     * Get navigation bar height.
+     *
+     * @param context The context
+     * @return Navigation bar height in pixels
+     */
+    public static int getNavigationBarHeight(Context context) {
+        if (context == null) return 0;
+        
+        int resourceId = context.getResources().getIdentifier(
+                "navigation_bar_height", "dimen", "android");
+        if (resourceId > 0) {
+            return context.getResources().getDimensionPixelSize(resourceId);
+        }
+        return 0;
+    }
+
+    // ==================== Safe Area / Insets ====================
+
+    /**
+     * Safe area insets container.
+     */
+    public static final class SafeAreaInsets {
+        public final int left;
+        public final int top;
+        public final int right;
+        public final int bottom;
+
+        public SafeAreaInsets(int left, int top, int right, int bottom) {
+            this.left = left;
+            this.top = top;
+            this.right = right;
+            this.bottom = bottom;
+        }
+
+        public static SafeAreaInsets empty() {
+            return new SafeAreaInsets(0, 0, 0, 0);
+        }
+    }
+
+    /**
+     * Get safe area insets (system bars + display cutout).
+     * <p>
+     * On API 21-22: Returns status bar height as top inset only.
+     * On API 23-27: Uses WindowInsets system window insets.
+     * On API 28-29: Adds DisplayCutout safe insets.
+     * On API 30+: Uses WindowInsets.Type for comprehensive insets.
+     *
+     * @param activity The activity
+     * @return Safe area insets
+     */
+    public static SafeAreaInsets getSafeAreaInsets(Activity activity) {
+        if (activity == null) {
+            return SafeAreaInsets.empty();
+        }
+
+        View decorView = activity.getWindow().getDecorView();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // API 30+: Modern WindowInsets API
+            WindowInsets insets = decorView.getRootWindowInsets();
+            if (insets != null) {
+                android.graphics.Insets systemBars = insets.getInsets(
+                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()
+                );
+                return new SafeAreaInsets(
+                        systemBars.left, systemBars.top,
+                        systemBars.right, systemBars.bottom
+                );
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            // API 28-29: WindowInsets + DisplayCutout
+            WindowInsets insets = decorView.getRootWindowInsets();
+            if (insets != null) {
+                int left = insets.getSystemWindowInsetLeft();
+                int top = insets.getSystemWindowInsetTop();
+                int right = insets.getSystemWindowInsetRight();
+                int bottom = insets.getSystemWindowInsetBottom();
+
+                android.view.DisplayCutout cutout = insets.getDisplayCutout();
+                if (cutout != null) {
+                    left = Math.max(left, cutout.getSafeInsetLeft());
+                    top = Math.max(top, cutout.getSafeInsetTop());
+                    right = Math.max(right, cutout.getSafeInsetRight());
+                    bottom = Math.max(bottom, cutout.getSafeInsetBottom());
+                }
+                return new SafeAreaInsets(left, top, right, bottom);
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // API 23-27: Basic WindowInsets
+            WindowInsets insets = decorView.getRootWindowInsets();
+            if (insets != null) {
+                return new SafeAreaInsets(
+                        insets.getSystemWindowInsetLeft(),
+                        insets.getSystemWindowInsetTop(),
+                        insets.getSystemWindowInsetRight(),
+                        insets.getSystemWindowInsetBottom()
+                );
+            }
+        }
+
+        // API 21-22: Fallback - just status bar
+        int statusBarHeight = getStatusBarHeight(activity);
+        return new SafeAreaInsets(0, statusBarHeight, 0, 0);
+    }
+
+    // ==================== Full Screen / Immersive Mode ====================
+
+    /**
+     * Enter immersive full-screen mode.
+     * <p>
+     * Uses WindowInsetsController on API 30+, deprecated setSystemUiVisibility on older versions.
+     *
+     * @param activity The activity
+     */
+    public static void enterImmersiveMode(Activity activity) {
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+            return;
+        }
+
+        Window window = activity.getWindow();
+        View decorView = window.getDecorView();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // API 30+: Use WindowInsetsController
+            window.setDecorFitsSystemWindows(false);
+            android.view.WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                controller.setSystemBarsBehavior(
+                        android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                );
+            }
+        } else {
+            // API 21-29: Use deprecated setSystemUiVisibility
+            window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            
+            int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
+
+            decorView.setSystemUiVisibility(flags);
+
+            // Re-apply flags when system UI visibility changes
+            int finalFlags = flags;
+            decorView.setOnSystemUiVisibilityChangeListener(visibility -> {
+                if ((visibility & View.SYSTEM_UI_FLAG_FULLSCREEN) == 0) {
+                    decorView.setSystemUiVisibility(finalFlags);
+                }
+            });
+        }
+
+        // Handle display cutout on Android P+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            WindowManager.LayoutParams lp = window.getAttributes();
+            lp.layoutInDisplayCutoutMode = 
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            window.setAttributes(lp);
+        }
+    }
+
+    /**
+     * Exit immersive mode and show system bars.
+     *
+     * @param activity The activity
+     */
+    public static void exitImmersiveMode(Activity activity) {
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+            return;
+        }
+
+        Window window = activity.getWindow();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // API 30+: Use WindowInsetsController
+            window.setDecorFitsSystemWindows(true);
+            android.view.WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                controller.show(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+            }
+        } else {
+            // API 21-29: Clear flags
+            window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            View decorView = window.getDecorView();
+            decorView.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+            decorView.setOnSystemUiVisibilityChangeListener(null);
+        }
+    }
+}

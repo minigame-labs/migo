@@ -1,4 +1,4 @@
-use std::{path::Path, rc::Rc};
+use std::{path::PathBuf, rc::Rc, sync::Arc};
 
 use deno_core::{
     Extension, JsRuntime, ModuleLoader, PollEventLoopOptions, RuntimeOptions, resolve_path,
@@ -8,6 +8,7 @@ use shared::{
     error::{EngineError, EngineResult, ErrorCode},
     op_state::HostOpState,
     protocol::host_cmd::{TouchPoint, TouchType},
+    vfs::{GamePaths, VirtualFS},
 };
 
 use crate::{js_bindings::JsBindings, main_extensions};
@@ -64,6 +65,24 @@ impl HostJsRuntime {
         self.update_host_op_state(|s| s.code_dir = dir);
     }
 
+    /// Set the VirtualFS for sandboxed file access.
+    pub fn set_vfs(&mut self, vfs: Option<Arc<VirtualFS>>) {
+        self.update_host_op_state(|s| s.vfs = vfs);
+    }
+
+    /// Set the GamePaths for the current game.
+    pub fn set_game_paths(&mut self, paths: Option<Arc<GamePaths>>) {
+        self.update_host_op_state(|s| s.game_paths = paths);
+    }
+
+    /// Read HostOpState values.
+    pub fn get_base_dirs(&self) -> (PathBuf, PathBuf) {
+        let op_state_rc = self.rt.op_state();
+        let op_state = op_state_rc.borrow();
+        let host = op_state.borrow::<HostOpState>();
+        (host.app_files_dir.clone(), host.app_cache_dir.clone())
+    }
+
     pub fn reload_bindings(&mut self) {
         self.bindings.reload(&mut self.rt, self.host_id);
     }
@@ -114,8 +133,45 @@ impl HostJsRuntime {
         Ok(())
     }
 
-    pub async fn evaluate_module(&mut self, dir: String, entry: String) -> EngineResult<()> {
-        let resolved = resolve_path(&entry, Path::new(&dir)).map_err(|e| {
+    /// Evaluate a module with VFS sandboxing.
+    ///
+    /// Creates game-specific paths from the game_id and base directories,
+    /// then sets up the VFS for sandboxed file access.
+    ///
+    /// # Arguments
+    /// * `game_id` - Unique game identifier (1-64 alphanumeric, underscore, hyphen)
+    /// * `entry` - Entry point file (e.g., "main.js")
+    pub async fn evaluate_module(&mut self, game_id: String, entry: String) -> EngineResult<()> {
+        // Get base directories from HostOpState
+        let (files_dir, cache_dir) = self.get_base_dirs();
+
+        // Create GamePaths from base dirs + game_id
+        let game_paths = GamePaths::new(&files_dir, &cache_dir, &game_id).map_err(|e| {
+            EngineError::new(ErrorCode::InvalidArgument)
+                .with_msg("create game paths")
+                .with_detail(e.to_string())
+        })?;
+
+        // Ensure directories exist
+        game_paths.ensure_directories().map_err(|e| {
+            EngineError::new(ErrorCode::IoError)
+                .with_msg("create game directories")
+                .with_detail(e.to_string())
+        })?;
+
+        // Create VFS from game paths
+        let vfs = VirtualFS::from_game_paths(&game_paths);
+        let code_dir = game_paths.code_dir().to_path_buf();
+        let code_dir_str = code_dir.to_string_lossy().into_owned();
+        let game_paths = Arc::new(game_paths);
+
+        // Store paths and VFS in op state
+        self.set_game_paths(Some(game_paths));
+        self.set_vfs(Some(Arc::new(vfs)));
+        self.set_code_dir(Some(code_dir_str));
+
+        // Resolve and load module
+        let resolved = resolve_path(&entry, &code_dir).map_err(|e| {
             EngineError::new(ErrorCode::InvalidArgument)
                 .with_msg("resolve module path")
                 .with_detail(e.to_string())
@@ -126,8 +182,6 @@ impl HostJsRuntime {
                 .with_msg("load main es module")
                 .with_detail(e.to_string())
         })?;
-
-        self.set_code_dir(Some(dir));
 
         let evaluation = self.rt.mod_evaluate(module_id);
         if let Err(e) = evaluation.await {

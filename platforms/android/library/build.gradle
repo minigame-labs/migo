@@ -3,7 +3,7 @@ plugins {
 }
 
 android {
-    namespace 'com.migo.host'
+    namespace 'com.migo.runtime'
     compileSdk 34
 
     // Output AAR file name
