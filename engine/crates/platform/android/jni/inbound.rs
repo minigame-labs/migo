@@ -118,8 +118,6 @@ pub(crate) extern "system" fn init(
     )
     .unwrap_or(3); // Default to Warn (index 3 in new enum)
 
-    let max_memory_mb = super::get_i32(&mut env, "maxMemoryMB", &options).unwrap_or(512);
-
     let init_options = InitOptions::new()
         .with_pixel_ratio(display_density)
         .with_cache_dir(PathBuf::from(cache_dir))
@@ -127,12 +125,11 @@ pub(crate) extern "system" fn init(
         .with_code_cache_dir(PathBuf::from(code_cache_dir))
         .with_target_fps(target_fps)
         .with_debug_enabled(debug_enabled)
-        .with_log_level(shared::config::LogLevel::from(log_level_ordinal))
-        .with_max_memory_mb(max_memory_mb);
+        .with_log_level(shared::config::LogLevel::from(log_level_ordinal));
 
     info!(
-        "init: density={}, target_fps={}, debug={}, log_level={:?}, max_mem={}MB",
-        display_density, target_fps, debug_enabled, init_options.log_level(), max_memory_mb
+        "init: density={}, target_fps={}, debug={}, log_level={:?}",
+        display_density, target_fps, debug_enabled, init_options.log_level()
     );
 
     let platform = Arc::new(AndroidPlatform::new());
