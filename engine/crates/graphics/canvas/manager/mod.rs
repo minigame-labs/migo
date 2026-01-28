@@ -183,8 +183,15 @@ impl CanvasManager {
                 let physical_w = (pw.max(1)) as u32;
                 let physical_h = (ph.max(1)) as u32;
 
-                entry.info.width = physical_w;
-                entry.info.height = physical_h;
+                // Calculate logical dimensions (CSS pixels) from physical pixels
+                let dpi = self.dpi.max(1.0);
+                let logical_w = (physical_w as f32 / dpi).round() as u32;
+                let logical_h = (physical_h as f32 / dpi).round() as u32;
+
+                entry.info.width = logical_w;
+                entry.info.height = logical_h;
+                entry.logical_width = logical_w;
+                entry.logical_height = logical_h;
 
                 if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
                     ctx2d
@@ -237,10 +244,15 @@ impl CanvasManager {
         let physical_w = (pw.max(1)) as u32;
         let physical_h = (ph.max(1)) as u32;
 
+        // Calculate logical dimensions (CSS pixels) from physical pixels
+        let dpi = self.dpi.max(1.0);
+        let logical_w = (physical_w as f32 / dpi).round() as u32;
+        let logical_h = (physical_h as f32 / dpi).round() as u32;
+
         let info = CanvasInfo {
             id,
-            width: physical_w,
-            height: physical_h,
+            width: logical_w,   // Return logical dimensions to JS
+            height: logical_h,
             is_onscreen: true,
         };
 
@@ -249,8 +261,8 @@ impl CanvasManager {
             CanvasEntry {
                 info,
                 kind: SurfaceKind::Window(window),
-                logical_width: 0,
-                logical_height: 0,
+                logical_width: logical_w,
+                logical_height: logical_h,
                 ctx: EglContextHandle { ctx, surf },
             },
         );
