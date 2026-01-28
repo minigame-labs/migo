@@ -572,8 +572,9 @@ impl CanvasManager {
             entry.logical_height = new_lh;
 
             entry.ctx.surf = new_surf;
-            entry.info.width = new_pw;
-            entry.info.height = new_ph;
+            // Store logical pixels in info (returned to JS), not physical pixels
+            entry.info.width = new_lw;
+            entry.info.height = new_lh;
         }
 
         if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
