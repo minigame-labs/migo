@@ -71,10 +71,27 @@ pub enum RenderCommand {
     Canvas(CanvasCmd),
     GL(GLCmd),
 
+    /// Single Canvas2D command (V1 - immediate mode)
     Canvas2D {
         canvas_id: CanvasId,
         cmd: Canvas2DCmd,
     },
+    
+    /// Batched Canvas2D commands (V2 - command batching)
+    ///
+    /// Contains all Canvas2D commands for a single frame, sent as one message.
+    /// This significantly reduces IPC overhead compared to sending each command individually.
+    Canvas2DBatch {
+        canvas_id: CanvasId,
+        commands: Vec<Canvas2DCmd>,
+    },
+    
+    /// Invalidate signal for on-demand rendering mode
+    ///
+    /// When in on-demand mode, the render thread only renders when:
+    /// 1. Content has changed (commands received)
+    /// 2. An explicit Invalidate signal is received
+    Invalidate,
 }
 
 #[non_exhaustive]

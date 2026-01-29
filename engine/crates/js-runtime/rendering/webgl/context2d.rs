@@ -7,19 +7,10 @@ use tracing::error;
 use shared::{
     op_state::CanvasOpState,
     protocol::{
-        render_cmd::{Canvas2DCmd, DrawImageEntry, RenderCommand, TextAlign, TextBaseline, TextMetrics},
+        render_cmd::{Canvas2DCmd, RenderCommand, TextMetrics},
         send_render_with_resp_sync,
     },
 };
-
-const OP_CREATE_CTX2D: &str = "canvas2d create context";
-
-#[inline]
-fn send_2d(ctx: &CanvasOpState, canvas_id: u32, cmd: Canvas2DCmd) {
-    if let Err(e) = ctx.tx.send(RenderCommand::Canvas2D { canvas_id, cmd }) {
-        error!("send_2d failed: {e}");
-    }
-}
 
 static NAMED_COLORS: Lazy<HashMap<&'static str, femtovg::Color>> = Lazy::new(|| {
     [
@@ -176,7 +167,7 @@ static NAMED_COLORS: Lazy<HashMap<&'static str, femtovg::Color>> = Lazy::new(|| 
     .collect()
 });
 
-fn parse_color_string(s: &str) -> femtovg::Color {
+pub(super) fn parse_color_string(s: &str) -> femtovg::Color {
     let s = s.trim().to_lowercase();
     if s.starts_with('#') { return Color::hex(&s); }
     if let Some(inner) = s.strip_prefix("rgba(").and_then(|v| v.strip_suffix(')')) {
@@ -203,6 +194,8 @@ fn parse_color_string(s: &str) -> femtovg::Color {
     NAMED_COLORS.get(s.as_str()).copied().unwrap_or(Color::black())
 }
 
+const OP_CREATE_CTX2D: &str = "canvas2d create context";
+
 #[op2(fast)]
 pub fn op_create_context_2d(state: &mut OpState, #[smi] canvas_id: u32) -> i32 {
     let ctx = state.borrow::<CanvasOpState>();
@@ -212,65 +205,6 @@ pub fn op_create_context_2d(state: &mut OpState, #[smi] canvas_id: u32) -> i32 {
     }
 }
 
-// Path methods
-#[op2(fast)] pub fn op_begin_path(state: &mut OpState, #[smi] canvas_id: u32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::BeginPath); }
-#[op2(fast)] pub fn op_close_path(state: &mut OpState, #[smi] canvas_id: u32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::ClosePath); }
-#[op2(fast)] pub fn op_move_to(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::MoveTo { x, y }); }
-#[op2(fast)] pub fn op_line_to(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::LineTo { x, y }); }
-#[op2(fast)] pub fn op_quadratic_curve_to(state: &mut OpState, #[smi] canvas_id: u32, cpx: f32, cpy: f32, x: f32, y: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::QuadraticCurveTo { cpx, cpy, x, y }); }
-#[op2(fast)] pub fn op_bezier_curve_to(state: &mut OpState, #[smi] canvas_id: u32, cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::BezierCurveTo { cp1x, cp1y, cp2x, cp2y, x, y }); }
-#[op2(fast)] pub fn op_arc(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, radius: f32, start_angle: f32, end_angle: f32, counterclockwise: bool) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::Arc { x, y, radius, start_angle, end_angle, counterclockwise }); }
-#[op2(fast)] pub fn op_arc_to(state: &mut OpState, #[smi] canvas_id: u32, x1: f32, y1: f32, x2: f32, y2: f32, radius: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::ArcTo { x1, y1, x2, y2, radius }); }
-#[op2(fast)] pub fn op_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::Rect { x, y, w, h }); }
-#[op2(fast)] #[allow(clippy::too_many_arguments)] pub fn op_ellipse(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, radius_x: f32, radius_y: f32, rotation: f32, start_angle: f32, end_angle: f32, counterclockwise: bool) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::Ellipse { x, y, radius_x, radius_y, rotation, start_angle, end_angle, counterclockwise }); }
-
-// Drawing methods
-#[op2(fast)] pub fn op_fill(state: &mut OpState, #[smi] canvas_id: u32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::Fill); }
-#[op2(fast)] pub fn op_stroke(state: &mut OpState, #[smi] canvas_id: u32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::Stroke); }
-#[op2(fast)] pub fn op_clip(state: &mut OpState, #[smi] canvas_id: u32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::Clip); }
-
-// Rectangle methods
-#[op2(fast)] pub fn op_fill_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::FillRect { x, y, w, h }); }
-#[op2(fast)] pub fn op_stroke_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::StrokeRect { x, y, w, h }); }
-#[op2(fast)] pub fn op_clear_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::ClearRect { x, y, w, h }); }
-
-// Text methods
-#[op2(fast)] pub fn op_fill_text(state: &mut OpState, #[smi] canvas_id: u32, #[string] text: String, x: f32, y: f32, max_width: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::FillText { text, x, y, max_width }); }
-#[op2(fast)] pub fn op_stroke_text(state: &mut OpState, #[smi] canvas_id: u32, #[string] text: String, x: f32, y: f32, max_width: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::StrokeText { text, x, y, max_width }); }
-
-// Style setters
-#[op2(fast)] pub fn op_set_fill_style(state: &mut OpState, #[smi] canvas_id: u32, #[string] color_str: String) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::SetFillStyle { color: parse_color_string(&color_str) }); }
-#[op2(fast)] pub fn op_set_stroke_style(state: &mut OpState, #[smi] canvas_id: u32, #[string] color_str: String) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::SetStrokeStyle { color: parse_color_string(&color_str) }); }
-#[op2(fast)] pub fn op_set_line_width(state: &mut OpState, #[smi] canvas_id: u32, width: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::SetLineWidth { width }); }
-#[op2(fast)] pub fn op_set_line_cap(state: &mut OpState, #[smi] canvas_id: u32, #[smi] cap: u8) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::SetLineCap { cap }); }
-#[op2(fast)] pub fn op_set_line_join(state: &mut OpState, #[smi] canvas_id: u32, #[smi] join: u8) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::SetLineJoin { join }); }
-#[op2(fast)] pub fn op_set_miter_limit(state: &mut OpState, #[smi] canvas_id: u32, limit: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::SetMiterLimit { limit }); }
-#[op2(fast)] pub fn op_set_global_alpha(state: &mut OpState, #[smi] canvas_id: u32, alpha: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::SetGlobalAlpha { alpha }); }
-#[op2(fast)] pub fn op_set_font(state: &mut OpState, #[smi] canvas_id: u32, #[string] font: String) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::SetFont { font }); }
-#[op2(fast)] pub fn op_set_text_align(state: &mut OpState, #[smi] canvas_id: u32, #[smi] align: u8) {
-    let align = match align { 0 => TextAlign::Start, 1 => TextAlign::End, 2 => TextAlign::Left, 3 => TextAlign::Right, 4 => TextAlign::Center, _ => TextAlign::Start };
-    send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::SetTextAlign { align });
-}
-#[op2(fast)] pub fn op_set_text_baseline(state: &mut OpState, #[smi] canvas_id: u32, #[smi] baseline: u8) {
-    let baseline = match baseline { 0 => TextBaseline::Top, 1 => TextBaseline::Hanging, 2 => TextBaseline::Middle, 3 => TextBaseline::Alphabetic, 4 => TextBaseline::Ideographic, 5 => TextBaseline::Bottom, _ => TextBaseline::Alphabetic };
-    send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::SetTextBaseline { baseline });
-}
-
-// State methods
-#[op2(fast)] pub fn op_save(state: &mut OpState, #[smi] canvas_id: u32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::Save); }
-#[op2(fast)] pub fn op_restore(state: &mut OpState, #[smi] canvas_id: u32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::Restore); }
-
-// Transform methods
-#[op2(fast)] pub fn op_translate(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::Translate { x, y }); }
-#[op2(fast)] pub fn op_rotate(state: &mut OpState, #[smi] canvas_id: u32, angle: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::Rotate { angle }); }
-#[op2(fast)] pub fn op_scale(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::Scale { x, y }); }
-#[op2(fast)] #[allow(clippy::too_many_arguments)] pub fn op_set_transform(state: &mut OpState, #[smi] canvas_id: u32, a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::SetTransform { a, b, c, d, e, f }); }
-#[op2(fast)] pub fn op_reset_transform(state: &mut OpState, #[smi] canvas_id: u32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::ResetTransform); }
-
-// Image methods
-#[op2(fast)] #[allow(clippy::too_many_arguments)] pub fn op_draw_image(state: &mut OpState, #[smi] canvas_id: u32, #[smi] image_id: u32, sx: f32, sy: f32, sw: f32, sh: f32, dx: f32, dy: f32, dw: f32, dh: f32) { send_2d(state.borrow::<CanvasOpState>(), canvas_id, Canvas2DCmd::DrawImage { image_id, sx, sy, sw, sh, dx, dy, dw, dh }); }
-
-// Measurement methods (synchronous)
 const OP_MEASURE_TEXT: &str = "canvas2d measure_text";
 #[op2] #[serde] pub fn op_measure_text(state: &mut OpState, #[smi] canvas_id: u32, #[string] text: String) -> TextMetrics {
     let ctx = state.borrow::<CanvasOpState>();
@@ -287,52 +221,4 @@ const OP_GET_IMAGE_DATA: &str = "canvas2d get_image_data";
         Ok(d) => d,
         Err(e) => { error!("{OP_GET_IMAGE_DATA} failed: {e}"); vec![] }
     }
-}
-
-/// Batch draw images for better performance
-/// Input format: [[image_id, sx, sy, sw, sh, dx, dy, dw, dh], ...]
-#[op2(fast)]
-pub fn op_draw_image_batch(
-    state: &mut OpState,
-    #[smi] canvas_id: u32,
-    #[buffer] data: &[u8],
-) {
-    // Parse the buffer: each entry is 9 f32s (36 bytes)
-    // image_id (as f32), sx, sy, sw, sh, dx, dy, dw, dh
-    const ENTRY_SIZE: usize = 9 * 4; // 9 floats * 4 bytes
-
-    if data.len() % ENTRY_SIZE != 0 {
-        error!("op_draw_image_batch: invalid buffer size");
-        return;
-    }
-
-    let entry_count = data.len() / ENTRY_SIZE;
-    if entry_count == 0 {
-        return;
-    }
-
-    let mut draws = Vec::with_capacity(entry_count);
-
-    for i in 0..entry_count {
-        let offset = i * ENTRY_SIZE;
-        let floats: &[f32] = bytemuck::cast_slice(&data[offset..offset + ENTRY_SIZE]);
-
-        draws.push(DrawImageEntry {
-            image_id: floats[0] as u32,
-            sx: floats[1],
-            sy: floats[2],
-            sw: floats[3],
-            sh: floats[4],
-            dx: floats[5],
-            dy: floats[6],
-            dw: floats[7],
-            dh: floats[8],
-        });
-    }
-
-    send_2d(
-        state.borrow::<CanvasOpState>(),
-        canvas_id,
-        Canvas2DCmd::DrawImageBatch { draws },
-    );
 }

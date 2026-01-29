@@ -20,13 +20,20 @@ const _internalScheduleRaf = () => {
 
     if (ids.length === 0) return;
 
-    setTimeout(() => {
-        for (let i = 0; i < ids.length; i++) {
-            const id = ids[i];
-            const cb = callbacks[id];
+    for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        const cb = callbacks[id];
+        try {
             cb(ts);
+        } catch (e) {
+            console.error('RAF callback error:', e);
         }
-    }, 0);
+    }
+
+    // Flush all batched canvas commands at end of frame
+    if (globalThis.__migo_frame_end_all) {
+        globalThis.__migo_frame_end_all();
+    }
 };
 
 export { requestAnimationFrame, cancelAnimationFrame, _internalScheduleRaf };

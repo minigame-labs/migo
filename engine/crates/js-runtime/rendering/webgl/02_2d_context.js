@@ -1,270 +1,399 @@
+/**
+ * Canvas 2D Context - Command Batching Implementation
+ *
+ * All draw commands within a RAF frame are batched and sent as a single
+ * message to the render thread, significantly reducing IPC overhead.
+ */
+
 import {
     op_create_context_2d,
-    // Path methods
-    op_begin_path,
-    op_close_path,
-    op_move_to,
-    op_line_to,
-    op_quadratic_curve_to,
-    op_bezier_curve_to,
-    op_arc,
-    op_arc_to,
-    op_rect,
-    op_ellipse,
-    // Drawing methods
-    op_fill,
-    op_stroke,
-    op_clip,
-    // Rectangle methods
-    op_fill_rect,
-    op_stroke_rect,
-    op_clear_rect,
-    // Text methods
-    op_fill_text,
-    op_stroke_text,
     op_measure_text,
-    // Style setters
-    op_set_fill_style,
-    op_set_stroke_style,
-    op_set_line_width,
-    op_set_line_cap,
-    op_set_line_join,
-    op_set_miter_limit,
-    op_set_global_alpha,
-    op_set_font,
-    op_set_text_align,
-    op_set_text_baseline,
-    // State methods
-    op_save,
-    op_restore,
-    // Transform methods
-    op_translate,
-    op_rotate,
-    op_scale,
-    op_set_transform,
-    op_reset_transform,
-    // Image methods
-    op_draw_image,
-    op_draw_image_batch,
     op_get_image_data,
+    // Frame lifecycle
+    op_frame_begin,
+    op_frame_end,
+    op_frame_end_all,
+    // Path methods
+    op_begin_path_v2,
+    op_close_path_v2,
+    op_move_to_v2,
+    op_line_to_v2,
+    op_quadratic_curve_to_v2,
+    op_bezier_curve_to_v2,
+    op_arc_v2,
+    op_arc_to_v2,
+    op_rect_v2,
+    op_ellipse_v2,
+    // Drawing methods
+    op_fill_v2,
+    op_stroke_v2,
+    op_clip_v2,
+    // Rectangle methods
+    op_fill_rect_v2,
+    op_stroke_rect_v2,
+    op_clear_rect_v2,
+    // Text methods
+    op_fill_text_v2,
+    op_stroke_text_v2,
+    // Style setters
+    op_set_fill_style_v2,
+    op_set_stroke_style_v2,
+    op_set_line_width_v2,
+    op_set_line_cap_v2,
+    op_set_line_join_v2,
+    op_set_miter_limit_v2,
+    op_set_global_alpha_v2,
+    op_set_font_v2,
+    op_set_text_align_v2,
+    op_set_text_baseline_v2,
+    // State methods
+    op_save_v2,
+    op_restore_v2,
+    // Transform methods
+    op_translate_v2,
+    op_rotate_v2,
+    op_scale_v2,
+    op_set_transform_v2,
+    op_reset_transform_v2,
+    // Image methods
+    op_draw_image_v2,
+    op_draw_image_batch_v2,
 } from "ext:core/ops";
 
-// Text align: 0=start, 1=end, 2=left, 3=right, 4=center
-const TEXT_ALIGN_MAP = { start: 0, end: 1, left: 2, right: 3, center: 4 };
-// Text baseline: 0=top, 1=hanging, 2=middle, 3=alphabetic, 4=ideographic, 5=bottom
-const TEXT_BASELINE_MAP = { top: 0, hanging: 1, middle: 2, alphabetic: 3, ideographic: 4, bottom: 5 };
-// Line cap: 0=butt, 1=round, 2=square
-const LINE_CAP_MAP = { butt: 0, round: 1, square: 2 };
-// Line join: 0=miter, 1=round, 2=bevel
-const LINE_JOIN_MAP = { miter: 0, round: 1, bevel: 2 };
+// Line cap constants
+const LINE_CAP_MAP = { 'butt': 0, 'round': 1, 'square': 2 };
+// Line join constants
+const LINE_JOIN_MAP = { 'miter': 0, 'round': 1, 'bevel': 2 };
+// Text align constants
+const TEXT_ALIGN_MAP = { 'start': 0, 'end': 1, 'left': 2, 'right': 3, 'center': 4 };
+// Text baseline constants
+const TEXT_BASELINE_MAP = {
+    'top': 0, 'hanging': 1, 'middle': 2,
+    'alphabetic': 3, 'ideographic': 4, 'bottom': 5,
+};
 
 class CanvasRenderingContext2D {
     constructor(canvas) {
         this._canvas = canvas;
         this._canvasId = canvas._rid;
+
+        // Create native 2D context on the render thread
         this._ctxId = op_create_context_2d(this._canvasId);
         if (this._ctxId < 0) { console.error("Failed to create 2d context"); }
-        // Initialize state
-        this._fillStyle = "rgb(0,0,0)";
-        this._strokeStyle = "rgb(0,0,0)";
+
+        // Shadow state (for JS-side queries)
+        this._fillStyle = '#000000';
+        this._strokeStyle = '#000000';
         this._lineWidth = 1;
-        this._lineCap = "butt";
-        this._lineJoin = "miter";
+        this._lineCap = 'butt';
+        this._lineJoin = 'miter';
         this._miterLimit = 10;
-        this._globalAlpha = 1.0;
-        this._font = "10px sans-serif";
-        this._textAlign = "start";
-        this._textBaseline = "alphabetic";
+        this._globalAlpha = 1;
+        this._font = '10px sans-serif';
+        this._textAlign = 'start';
+        this._textBaseline = 'alphabetic';
+
+        // State stack for save/restore
+        this._stateStack = [];
+
+        // Frame tracking
+        this._frameStarted = false;
     }
 
     get canvas() { return this._canvas; }
 
-    // ========== Style properties ==========
+    // ==================== Frame Lifecycle ====================
+
+    _frameBegin() {
+        if (!this._frameStarted) {
+            op_frame_begin(this._canvasId);
+            this._frameStarted = true;
+        }
+    }
+
+    _frameEnd() {
+        if (this._frameStarted) {
+            op_frame_end(this._canvasId);
+            this._frameStarted = false;
+        }
+    }
+
+    // ==================== Path Methods ====================
+
+    beginPath() {
+        this._frameBegin();
+        op_begin_path_v2(this._canvasId);
+    }
+
+    closePath() {
+        op_close_path_v2(this._canvasId);
+    }
+
+    moveTo(x, y) {
+        op_move_to_v2(this._canvasId, x, y);
+    }
+
+    lineTo(x, y) {
+        op_line_to_v2(this._canvasId, x, y);
+    }
+
+    quadraticCurveTo(cpx, cpy, x, y) {
+        op_quadratic_curve_to_v2(this._canvasId, cpx, cpy, x, y);
+    }
+
+    bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) {
+        op_bezier_curve_to_v2(this._canvasId, cp1x, cp1y, cp2x, cp2y, x, y);
+    }
+
+    arc(x, y, radius, startAngle, endAngle, counterclockwise = false) {
+        op_arc_v2(this._canvasId, x, y, radius, startAngle, endAngle, counterclockwise);
+    }
+
+    arcTo(x1, y1, x2, y2, radius) {
+        op_arc_to_v2(this._canvasId, x1, y1, x2, y2, radius);
+    }
+
+    rect(x, y, width, height) {
+        op_rect_v2(this._canvasId, x, y, width, height);
+    }
+
+    ellipse(x, y, radiusX, radiusY, rotation, startAngle, endAngle, counterclockwise = false) {
+        op_ellipse_v2(this._canvasId, x, y, radiusX, radiusY, rotation, startAngle, endAngle, counterclockwise);
+    }
+
+    // ==================== Drawing Methods ====================
+
+    fill(pathOrFillRule) {
+        op_fill_v2(this._canvasId);
+    }
+
+    stroke(path) {
+        op_stroke_v2(this._canvasId);
+    }
+
+    clip(pathOrFillRule) {
+        op_clip_v2(this._canvasId);
+    }
+
+    // ==================== Rectangle Methods ====================
+
+    fillRect(x, y, width, height) {
+        this._frameBegin();
+        op_fill_rect_v2(this._canvasId, x, y, width, height);
+    }
+
+    strokeRect(x, y, width, height) {
+        this._frameBegin();
+        op_stroke_rect_v2(this._canvasId, x, y, width, height);
+    }
+
+    clearRect(x, y, width, height) {
+        this._frameBegin();
+        op_clear_rect_v2(this._canvasId, x, y, width, height);
+    }
+
+    // ==================== Text Methods ====================
+
+    fillText(text, x, y, maxWidth = Infinity) {
+        this._frameBegin();
+        op_fill_text_v2(this._canvasId, String(text), x, y, maxWidth);
+    }
+
+    strokeText(text, x, y, maxWidth = Infinity) {
+        this._frameBegin();
+        op_stroke_text_v2(this._canvasId, String(text), x, y, maxWidth);
+    }
+
+    measureText(text) {
+        return op_measure_text(this._canvasId, String(text));
+    }
+
+    // ==================== Style Properties ====================
+
     get fillStyle() { return this._fillStyle; }
     set fillStyle(value) {
-        if (this._fillStyle === value) return;
-        if (typeof value !== "string") { throw new TypeError("fillStyle must be a string"); }
-        op_set_fill_style(this._canvasId, value);
         this._fillStyle = value;
+        this._frameBegin();
+        op_set_fill_style_v2(this._canvasId, String(value));
     }
 
     get strokeStyle() { return this._strokeStyle; }
     set strokeStyle(value) {
-        if (this._strokeStyle === value) return;
-        if (typeof value !== "string") { throw new TypeError("strokeStyle must be a string"); }
-        op_set_stroke_style(this._canvasId, value);
         this._strokeStyle = value;
+        this._frameBegin();
+        op_set_stroke_style_v2(this._canvasId, String(value));
     }
 
     get lineWidth() { return this._lineWidth; }
     set lineWidth(value) {
-        if (this._lineWidth === value) return;
-        if (typeof value !== "number" || value <= 0) { return; }
-        op_set_line_width(this._canvasId, value);
         this._lineWidth = value;
+        this._frameBegin();
+        op_set_line_width_v2(this._canvasId, value);
     }
 
     get lineCap() { return this._lineCap; }
     set lineCap(value) {
-        if (this._lineCap === value) return;
-        const code = LINE_CAP_MAP[value];
-        if (code === undefined) return;
-        op_set_line_cap(this._canvasId, code);
         this._lineCap = value;
+        this._frameBegin();
+        op_set_line_cap_v2(this._canvasId, LINE_CAP_MAP[value] ?? 0);
     }
 
     get lineJoin() { return this._lineJoin; }
     set lineJoin(value) {
-        if (this._lineJoin === value) return;
-        const code = LINE_JOIN_MAP[value];
-        if (code === undefined) return;
-        op_set_line_join(this._canvasId, code);
         this._lineJoin = value;
+        this._frameBegin();
+        op_set_line_join_v2(this._canvasId, LINE_JOIN_MAP[value] ?? 0);
     }
 
     get miterLimit() { return this._miterLimit; }
     set miterLimit(value) {
-        if (this._miterLimit === value) return;
-        if (typeof value !== "number" || value <= 0) return;
-        op_set_miter_limit(this._canvasId, value);
         this._miterLimit = value;
+        this._frameBegin();
+        op_set_miter_limit_v2(this._canvasId, value);
     }
 
     get globalAlpha() { return this._globalAlpha; }
     set globalAlpha(value) {
-        if (this._globalAlpha === value) return;
-        if (typeof value !== "number" || value < 0 || value > 1) return;
-        op_set_global_alpha(this._canvasId, value);
-        this._globalAlpha = value;
+        this._globalAlpha = Math.max(0, Math.min(1, value));
+        this._frameBegin();
+        op_set_global_alpha_v2(this._canvasId, this._globalAlpha);
     }
 
     get font() { return this._font; }
     set font(value) {
-        if (this._font === value) return;
-        if (typeof value !== "string") { throw new TypeError("font must be a string"); }
-        op_set_font(this._canvasId, value);
         this._font = value;
+        this._frameBegin();
+        op_set_font_v2(this._canvasId, value);
     }
 
     get textAlign() { return this._textAlign; }
     set textAlign(value) {
-        if (this._textAlign === value) return;
-        const code = TEXT_ALIGN_MAP[value];
-        if (code === undefined) return;
-        op_set_text_align(this._canvasId, code);
         this._textAlign = value;
+        this._frameBegin();
+        op_set_text_align_v2(this._canvasId, TEXT_ALIGN_MAP[value] ?? 0);
     }
 
     get textBaseline() { return this._textBaseline; }
     set textBaseline(value) {
-        if (this._textBaseline === value) return;
-        const code = TEXT_BASELINE_MAP[value];
-        if (code === undefined) return;
-        op_set_text_baseline(this._canvasId, code);
         this._textBaseline = value;
+        this._frameBegin();
+        op_set_text_baseline_v2(this._canvasId, TEXT_BASELINE_MAP[value] ?? 3);
     }
 
-    // ========== Path methods ==========
-    beginPath() { op_begin_path(this._canvasId); }
-    closePath() { op_close_path(this._canvasId); }
-    moveTo(x, y) { op_move_to(this._canvasId, x, y); }
-    lineTo(x, y) { op_line_to(this._canvasId, x, y); }
-    quadraticCurveTo(cpx, cpy, x, y) { op_quadratic_curve_to(this._canvasId, cpx, cpy, x, y); }
-    bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) { op_bezier_curve_to(this._canvasId, cp1x, cp1y, cp2x, cp2y, x, y); }
-    arc(x, y, radius, startAngle, endAngle, counterclockwise = false) { op_arc(this._canvasId, x, y, radius, startAngle, endAngle, counterclockwise); }
-    arcTo(x1, y1, x2, y2, radius) { op_arc_to(this._canvasId, x1, y1, x2, y2, radius); }
-    rect(x, y, w, h) { op_rect(this._canvasId, x, y, w, h); }
-    ellipse(x, y, radiusX, radiusY, rotation, startAngle, endAngle, counterclockwise = false) { op_ellipse(this._canvasId, x, y, radiusX, radiusY, rotation, startAngle, endAngle, counterclockwise); }
+    // ==================== State Methods ====================
 
-    // ========== Drawing methods ==========
-    fill(pathOrFillRule) {
-        if (pathOrFillRule !== undefined) { console.warn("fill() with argument is not fully supported"); }
-        op_fill(this._canvasId);
-    }
-    stroke(path) {
-        if (path !== undefined) { console.warn("stroke() with argument is not fully supported"); }
-        op_stroke(this._canvasId);
-    }
-    clip(pathOrFillRule) {
-        if (pathOrFillRule !== undefined) { console.warn("clip() with argument is not fully supported"); }
-        op_clip(this._canvasId);
+    save() {
+        this._stateStack.push({
+            fillStyle: this._fillStyle,
+            strokeStyle: this._strokeStyle,
+            lineWidth: this._lineWidth,
+            lineCap: this._lineCap,
+            lineJoin: this._lineJoin,
+            miterLimit: this._miterLimit,
+            globalAlpha: this._globalAlpha,
+            font: this._font,
+            textAlign: this._textAlign,
+            textBaseline: this._textBaseline,
+        });
+        this._frameBegin();
+        op_save_v2(this._canvasId);
     }
 
-    // ========== Rectangle methods ==========
-    fillRect(x, y, width, height) { op_fill_rect(this._canvasId, x, y, width, height); }
-    strokeRect(x, y, width, height) { op_stroke_rect(this._canvasId, x, y, width, height); }
-    clearRect(x, y, width, height) { op_clear_rect(this._canvasId, x, y, width, height); }
-
-    // ========== Text methods ==========
-    fillText(text, x, y, maxWidth) {
-        if (typeof text !== "string") text = String(text);
-        op_fill_text(this._canvasId, text, x, y, maxWidth ?? -1);
+    restore() {
+        if (this._stateStack.length > 0) {
+            const state = this._stateStack.pop();
+            Object.assign(this, {
+                _fillStyle: state.fillStyle,
+                _strokeStyle: state.strokeStyle,
+                _lineWidth: state.lineWidth,
+                _lineCap: state.lineCap,
+                _lineJoin: state.lineJoin,
+                _miterLimit: state.miterLimit,
+                _globalAlpha: state.globalAlpha,
+                _font: state.font,
+                _textAlign: state.textAlign,
+                _textBaseline: state.textBaseline,
+            });
+        }
+        this._frameBegin();
+        op_restore_v2(this._canvasId);
     }
-    strokeText(text, x, y, maxWidth) {
-        if (typeof text !== "string") text = String(text);
-        op_stroke_text(this._canvasId, text, x, y, maxWidth ?? -1);
-    }
-    measureText(text) {
-        if (typeof text !== "string") text = String(text);
-        return op_measure_text(this._canvasId, text);
+
+    // ==================== Transform Methods ====================
+
+    translate(x, y) {
+        this._frameBegin();
+        op_translate_v2(this._canvasId, x, y);
     }
 
-    // ========== State methods ==========
-    save() { op_save(this._canvasId); }
-    restore() { op_restore(this._canvasId); }
+    rotate(angle) {
+        this._frameBegin();
+        op_rotate_v2(this._canvasId, angle);
+    }
 
-    // ========== Transform methods ==========
-    translate(x, y) { op_translate(this._canvasId, x, y); }
-    rotate(angle) { op_rotate(this._canvasId, angle); }
-    scale(x, y) { op_scale(this._canvasId, x, y); }
-    setTransform(a, b, c, d, e, f) { op_set_transform(this._canvasId, a, b, c, d, e, f); }
-    resetTransform() { op_reset_transform(this._canvasId); }
+    scale(x, y) {
+        this._frameBegin();
+        op_scale_v2(this._canvasId, x, y);
+    }
+
+    setTransform(a, b, c, d, e, f) {
+        this._frameBegin();
+        op_set_transform_v2(this._canvasId, a, b, c, d, e, f);
+    }
+
+    resetTransform() {
+        this._frameBegin();
+        op_reset_transform_v2(this._canvasId);
+    }
+
     transform(a, b, c, d, e, f) {
-        // transform() multiplies the current matrix; we approximate by setTransform for now
-        console.warn("transform() is approximated; use setTransform() for precise control");
-        op_set_transform(this._canvasId, a, b, c, d, e, f);
+        // transform() multiplies current matrix; approximate with setTransform
+        this._frameBegin();
+        op_set_transform_v2(this._canvasId, a, b, c, d, e, f);
     }
+
     getTransform() {
-        console.warn("getTransform() not implemented, returning identity");
         return { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
     }
 
-    // ========== Image methods ==========
+    // ==================== Image Methods ====================
+
     drawImage(image, ...args) {
-        if (!image || !image.loaded) {
-            console.warn("image not loaded " + (image?._rid ?? "null") + " " + (image?.src ?? ""));
+        if (!image || !image.loaded) return;
+
+        this._frameBegin();
+
+        let sx, sy, sw, sh, dx, dy, dw, dh;
+
+        if (args.length === 2) {
+            [dx, dy] = args;
+            sx = sy = 0;
+            sw = image.width;
+            sh = image.height;
+            dw = sw;
+            dh = sh;
+        } else if (args.length === 4) {
+            [dx, dy, dw, dh] = args;
+            sx = sy = 0;
+            sw = image.width;
+            sh = image.height;
+        } else if (args.length === 8) {
+            [sx, sy, sw, sh, dx, dy, dw, dh] = args;
+        } else {
             return;
         }
-        const imgId = image.rid;
-        if (args.length === 2) {
-            const [dx, dy] = args;
-            op_draw_image(this._canvasId, imgId, -1, -1, -1, -1, dx, dy, -1, -1);
-        } else if (args.length === 4) {
-            const [dx, dy, dw, dh] = args;
-            op_draw_image(this._canvasId, imgId, -1, -1, -1, -1, dx, dy, dw, dh);
-        } else if (args.length === 8) {
-            const [sx, sy, sw, sh, dx, dy, dw, dh] = args;
-            op_draw_image(this._canvasId, imgId, sx, sy, sw, sh, dx, dy, dw, dh);
-        } else {
-            throw new TypeError("drawImage: invalid number of arguments");
-        }
+
+        op_draw_image_v2(this._canvasId, image.rid, sx, sy, sw, sh, dx, dy, dw, dh);
     }
 
-    /**
-     * Batch draw multiple images for better performance
-     * Reduces IPC overhead by sending all draws in a single call
-     *
-     * @param {Array<{image: Image, sx?: number, sy?: number, sw?: number, sh?: number, dx: number, dy: number, dw?: number, dh?: number}>} draws
-     */
     drawImageBatch(draws) {
         if (!Array.isArray(draws) || draws.length === 0) return;
 
-        // Filter out unloaded images and prepare data
+        this._frameBegin();
+
         const validDraws = draws.filter(d => d.image && d.image.loaded);
         if (validDraws.length === 0) return;
 
-        // Pack data into Float32Array: 9 floats per draw
-        // [image_id, sx, sy, sw, sh, dx, dy, dw, dh]
         const buffer = new Float32Array(validDraws.length * 9);
         let offset = 0;
 
@@ -280,7 +409,7 @@ class CanvasRenderingContext2D {
             buffer[offset++] = d.dh ?? -1;
         }
 
-        op_draw_image_batch(this._canvasId, new Uint8Array(buffer.buffer));
+        op_draw_image_batch_v2(this._canvasId, new Uint8Array(buffer.buffer));
     }
 
     getImageData(sx, sy, sw, sh) {
@@ -292,34 +421,37 @@ class CanvasRenderingContext2D {
         return { width: sw, height: sh, data: new Uint8ClampedArray(sw * sh * 4) };
     }
 
-    putImageData(imageData, dx, dy, dirtyX, dirtyY, dirtyWidth, dirtyHeight) {
-        console.warn("putImageData() is not implemented");
+    putImageData(imageData, dx, dy) {
+        // Not implemented
     }
 
-    // ========== Compositing (stubs) ==========
+    // ==================== Compositing (stubs) ====================
     get globalCompositeOperation() { return "source-over"; }
-    set globalCompositeOperation(value) { console.warn("globalCompositeOperation is not implemented"); }
+    set globalCompositeOperation(value) { }
 
-    // ========== Shadows (stubs) ==========
+    // ==================== Shadows (stubs) ====================
     get shadowBlur() { return 0; }
-    set shadowBlur(value) { console.warn("shadowBlur is not implemented"); }
+    set shadowBlur(value) { }
     get shadowColor() { return "rgba(0,0,0,0)"; }
-    set shadowColor(value) { console.warn("shadowColor is not implemented"); }
+    set shadowColor(value) { }
     get shadowOffsetX() { return 0; }
-    set shadowOffsetX(value) { console.warn("shadowOffsetX is not implemented"); }
+    set shadowOffsetX(value) { }
     get shadowOffsetY() { return 0; }
-    set shadowOffsetY(value) { console.warn("shadowOffsetY is not implemented"); }
+    set shadowOffsetY(value) { }
 
-    // ========== Other stubs ==========
-    isPointInPath(x, y, fillRule) { console.warn("isPointInPath not implemented"); return false; }
-    isPointInStroke(x, y) { console.warn("isPointInStroke not implemented"); return false; }
-    createLinearGradient(x0, y0, x1, y1) { console.warn("createLinearGradient not implemented"); return {}; }
-    createRadialGradient(x0, y0, r0, x1, y1, r1) { console.warn("createRadialGradient not implemented"); return {}; }
-    createPattern(image, repetition) { console.warn("createPattern not implemented"); return {}; }
-    setLineDash(segments) { console.warn("setLineDash not implemented"); }
+    // ==================== Other stubs ====================
+    isPointInPath() { return false; }
+    isPointInStroke() { return false; }
+    createLinearGradient() { return {}; }
+    createRadialGradient() { return {}; }
+    createPattern() { return {}; }
+    setLineDash() { }
     getLineDash() { return []; }
     get lineDashOffset() { return 0; }
-    set lineDashOffset(value) { console.warn("lineDashOffset not implemented"); }
+    set lineDashOffset(value) { }
 }
+
+// Expose frame-end-all for RAF integration
+globalThis.__migo_frame_end_all = () => { op_frame_end_all(); };
 
 export { CanvasRenderingContext2D };

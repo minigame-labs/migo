@@ -6,6 +6,12 @@ edition = "2024"
 [lib]
 path = "lib.rs"
 
+[features]
+default = []
+# Enable V2 render backend with full cross-platform abstraction
+# Currently experimental due to thread-safety requirements of EGL types
+backend_v2 = []
+
 [dependencies]
 glow = { workspace = true }
 khronos-egl = { workspace = true }

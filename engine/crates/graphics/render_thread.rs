@@ -143,6 +143,30 @@ impl RenderThread {
                             Err(e) => error!("Canvas2D failed: {}", e),
                         },
 
+                        // V2: Batched commands - process all commands in a single frame
+                        RenderCommand::Canvas2DBatch { canvas_id, commands } => {
+                            let mut batch_dirty = false;
+                            for cmd in commands {
+                                match renderer_2d.handle_command(cm, canvas_id, cmd) {
+                                    Ok(was_render) => {
+                                        if was_render {
+                                            batch_dirty = true;
+                                        }
+                                    }
+                                    Err(e) => error!("Canvas2DBatch cmd failed: {}", e),
+                                }
+                            }
+                            if batch_dirty {
+                                cm.mark_2d_dirty(canvas_id);
+                                *dirty = true;
+                            }
+                        }
+
+                        // Invalidate signal for on-demand rendering
+                        RenderCommand::Invalidate => {
+                            *dirty = true;
+                        }
+
                         _ => {}
                     }
 
@@ -170,32 +194,39 @@ impl RenderThread {
                 loop {
                     select! {
                         recv(ticker) -> _ => {
-                            // 1) Send RAF to JS (non-blocking).
+                            // Frame timing fix: drain → swap → RAF
+                            // This ensures we swap the COMPLETE frame drawn by the PREVIOUS RAF,
+                            // rather than swapping before JS has finished drawing.
+                            //
+                            // Timeline:
+                            // RAF(N) sent → JS draws frame N → commands arrive → 
+                            // ticker → drain frame N commands → swap frame N → RAF(N+1) sent
+
+                            // 1) Drain all pending commands from the previous frame.
+                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty) {
+                                LoopCtl::Continue => {}
+                                LoopCtl::Shutdown => return,
+                            }
+
+                            // 2) Present the completed frame.
+                            if dirty {
+                                if let Err(e) = cm.flush_dirty_2d_contexts() {
+                                    warn!("flush_dirty_2d_contexts failed: {}", e);
+                                }
+
+                                if let Err(e) = cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
+                                    warn!("swap_buffers_no_restore failed: {}", e);
+                                }
+                                dirty = false;
+                            }
+
+                            // 3) Send RAF to JS to start the NEXT frame (non-blocking).
                             let ts = start_time.elapsed().as_secs_f64() * 1000.0;
                             if let Err(_e) = js_tx.try_send(HostCommand::RequestAnimationFrame(ts)) {
                                 dropped_raf += 1;
                                 if dropped_raf % 100 == 0 {
                                     warn!("dropped raf messages: {}", dropped_raf);
                                 }
-                            }
-
-                            // 2) Drain commands before rendering to reduce latency.
-                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty) {
-                                LoopCtl::Continue => {}
-                                LoopCtl::Shutdown => return,
-                            }
-
-                            // 3) Present when dirty.
-                            if dirty {
-                                if let Err(e) = cm.flush_dirty_2d_contexts() {
-                                    warn!("flush_dirty_2d_contexts failed: {}", e);
-                                }
-
-                            
-                                if let Err(e) = cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
-                                    warn!("swap_buffers_no_restore failed: {}", e);
-                                }
-                                dirty = false;
                             }
                         }
 

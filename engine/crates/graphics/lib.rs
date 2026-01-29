@@ -3,39 +3,37 @@
 //! This crate provides 2D and WebGL rendering capabilities for the Migo engine,
 //! implementing Canvas 2D and WebGL 1.0 APIs.
 //!
-//! ## Architecture
+//! ## Architecture (V2)
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                       Render Thread                              │
-//! │                                                                  │
-//! │  ┌───────────────────────────────────────────────────────────┐  │
-//! │  │                    CanvasManager                          │  │
-//! │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐      │  │
-//! │  │  │   Canvas 1  │  │   Canvas 2  │  │   Canvas N  │  ... │  │
-//! │  │  │  (onscreen) │  │ (offscreen) │  │ (offscreen) │      │  │
-//! │  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘      │  │
-//! │  │         │                │                │              │  │
-//! │  │  ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐      │  │
-//! │  │  │ EGL Context │  │ EGL Context │  │ EGL Context │      │  │
-//! │  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘      │  │
-//! │  │         │                │                │              │  │
-//! │  │  ┌──────▼────────────────▼────────────────▼──────┐      │  │
-//! │  │  │                Shared Resource Context         │      │  │
-//! │  │  │           (textures, shaders, etc.)           │      │  │
-//! │  │  └───────────────────────────────────────────────┘      │  │
-//! │  └───────────────────────────────────────────────────────────┘  │
-//! │                                                                  │
-//! │  ┌─────────────────┐  ┌─────────────────┐                       │
-//! │  │   Renderer2D    │  │   RendererGL    │                       │
-//! │  │   (Canvas2D)    │  │   (WebGL 1.0)   │                       │
-//! │  │                 │  │                 │                       │
-//! │  │  ┌───────────┐  │  │  ┌───────────┐  │                       │
-//! │  │  │  FemtoVG  │  │  │  │   glow    │  │                       │
-//! │  │  │           │  │  │  │ (OpenGL)  │  │                       │
-//! │  │  └───────────┘  │  │  └───────────┘  │                       │
-//! │  └─────────────────┘  └─────────────────┘                       │
-//! └─────────────────────────────────────────────────────────────────┘
+//! ┌─────────────────────────────────────────────────────────────────────┐
+//! │                           JS Thread                                  │
+//! │                                                                      │
+//! │   RAF → CommandEncoder.fill_rect() → .draw_image() → .finish()      │
+//! │                                            │                         │
+//! │                                            ▼                         │
+//! │                                    CommandBuffer                     │
+//! │                                            │                         │
+//! └────────────────────────────────────────────┼─────────────────────────┘
+//!                                              │
+//!                            FrameSubmitter.submit(buffer)
+//!                                              │
+//!                                              ▼
+//! ┌─────────────────────────────────────────────────────────────────────┐
+//! │                         Render Thread                                │
+//! │                                                                      │
+//! │   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │
+//! │   │    Frame     │    │   Command    │    │   Backend    │          │
+//! │   │  Scheduler   │───▶│   Executor   │───▶│ (EGL/Metal/ │          │
+//! │   │              │    │              │    │   D3D11)    │          │
+//! │   └──────────────┘    └──────────────┘    └──────────────┘          │
+//! │                                                                      │
+//! │   Features:                                                          │
+//! │   - Command batching (1 message per frame)                          │
+//! │   - On-demand rendering (zero GPU when idle)                        │
+//! │   - VSync-aware frame pacing                                        │
+//! │   - Cross-platform backend abstraction                              │
+//! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! ## Features
@@ -58,32 +56,75 @@
 //! - **Multi-Canvas Support**: Multiple offscreen canvases with shared resources
 //!
 //! - **Efficient Rendering**:
-//!   - Dirty flag tracking for minimal redraws
-//!   - Batched command processing
-//!   - Frame rate control (default 60 FPS)
+//!   - Command batching (reduced IPC overhead)
+//!   - Dirty region tracking
+//!   - On-demand rendering mode
+//!   - Frame pacing with VSync
 //!
 //! ## Platform Support
 //!
 //! - **Android**: OpenGL ES 2.0/3.0 via EGL
-//! - **Desktop**: OpenGL via EGL (for testing)
+//! - **iOS**: Metal (planned)
+//! - **Windows**: Direct3D 11 or OpenGL via ANGLE (planned)
+//! - **macOS**: Metal (planned)
+//! - **Linux**: OpenGL via EGL
 //!
 //! ## Module Structure
 //!
-//! - [`render_thread`]: Main render thread and command dispatcher
+//! - [`backend`]: Cross-platform rendering backend traits and implementations
+//! - [`command_buffer`]: Command batching system
+//! - [`scheduler`]: Frame scheduling and timing
+//! - [`render_thread`]: Legacy render thread (V1)
+//! - [`render_thread_v2`]: New optimized render thread
 //! - [`canvas`]: Canvas and EGL context management
 //! - [`renderer2d`]: Canvas 2D rendering via FemtoVG
 //! - [`renderergl`]: WebGL command handler
 
+// Core modules
 mod canvas;
 mod render_thread;
 mod renderer2d;
 mod renderergl;
+
+// V2 architecture modules (command batching, frame scheduling)
+pub mod command_buffer;
+pub mod scheduler;
+
+// Performance optimization modules
+pub mod batching;
+pub mod pool;
+pub mod dirty_region;
+pub mod lifecycle;
+
+// Backend abstraction module (for future cross-platform support)
+// Note: EglBackend implementation requires careful thread-safety handling
+// and is currently not enabled by default.
+#[cfg(feature = "backend_v2")]
+pub mod backend;
+
+// V2 render thread (requires backend_v2 feature)
+#[cfg(feature = "backend_v2")]
+mod render_thread_v2;
 
 pub(crate) use canvas::*;
 pub use render_thread::*;
 
 pub(crate) use renderer2d::*;
 pub(crate) use renderergl::*;
+
+// Re-export key types from new modules (V2 command batching)
+pub use command_buffer::{CommandBuffer, CommandEncoder, Canvas2DCommand};
+pub use scheduler::{FrameConfig, FrameScheduler, RenderMode, FrameSubmitter};
+
+// Re-export optimization types
+pub use batching::{DrawBatcher, DrawOp, BatchStats, TextureAtlas, AtlasManager, GLState};
+pub use pool::{BufferPool, PathPool, ObjectPool, PoolStats};
+pub use dirty_region::{DirtyRect, DirtyRegionTracker, DirtyStats};
+pub use lifecycle::{AppLifecycleState, AppStateManager, LifecycleConfig, SharedLifecycleState};
+
+// V2 render thread (when backend_v2 feature is enabled)
+#[cfg(feature = "backend_v2")]
+pub use render_thread_v2::RenderThreadV2;
 
 use raw_window_handle::RawWindowHandle;
 use shared::error::{EngineResult, ErrorCode};
