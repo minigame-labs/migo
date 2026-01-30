@@ -236,8 +236,11 @@ public final class NativeExports {
      * @return JSON string with permission states
      */
     public static String getAppAuthorizationSettingJson() {
-        RuntimeContext context = RuntimeRegistry.getAny();
-        Activity activity = context != null ? context.getActivity() : null;
-        return Permissions.toJson(activity);
+        RuntimeContext runtimeContext = RuntimeRegistry.getAny();
+        Context context = runtimeContext != null ? runtimeContext.getActivity() : null;
+        if (context == null) {
+            context = AppContext.getOrNull();
+        }
+        return Permissions.toJson(context);
     }
 }

@@ -1,6 +1,7 @@
 package com.migo.runtime.internal.platform;
 
 import android.app.Activity;
+import android.app.NotificationManager;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.os.Build;
@@ -27,6 +28,9 @@ public final class Permissions {
     public static final String BLUETOOTH_ADMIN = "android.permission.BLUETOOTH_ADMIN";
     public static final String BLUETOOTH_CONNECT = "android.permission.BLUETOOTH_CONNECT";
     public static final String BLUETOOTH_SCAN = "android.permission.BLUETOOTH_SCAN";
+    public static final String READ_CALENDAR = "android.permission.READ_CALENDAR";
+    public static final String READ_MEDIA_IMAGES = "android.permission.READ_MEDIA_IMAGES";
+    public static final String POST_NOTIFICATIONS = "android.permission.POST_NOTIFICATIONS";
 
     /**
      * Permission state.
@@ -119,26 +123,85 @@ public final class Permissions {
     /**
      * Get app authorization settings as JSON string.
      * <p>
-     * Format matches the expected native protocol.
+     * Format matches wx.getAppAuthorizeSetting() protocol.
      *
-     * @param activity The activity
+     * @param context The context (Activity or application Context)
      * @return JSON string with permission states
      */
-    public static String toJson(Activity activity) {
-        StringBuilder sb = new StringBuilder(256);
+    public static String toJson(Context context) {
+        StringBuilder sb = new StringBuilder(512);
         sb.append("{");
 
-        String[] permissions = { CAMERA, RECORD_AUDIO, FINE_LOCATION, WRITE_STORAGE, READ_STORAGE };
-        String[] keys = { "camera", "record", "location", "writePhotosAlbum", "album" };
+        sb.append("\"albumAuthorized\":\"").append(getAlbumAuth(context)).append("\",");
+        sb.append("\"bluetoothAuthorized\":\"").append(getBluetoothAuth(context)).append("\",");
+        sb.append("\"cameraAuthorized\":\"").append(getAuth(context, CAMERA)).append("\",");
+        sb.append("\"locationAuthorized\":\"").append(getAuth(context, FINE_LOCATION)).append("\",");
+        sb.append("\"locationReducedAccuracy\":").append(getLocationReducedAccuracy(context)).append(",");
+        sb.append("\"microphoneAuthorized\":\"").append(getAuth(context, RECORD_AUDIO)).append("\",");
 
-        for (int i = 0; i < permissions.length; i++) {
-            if (i > 0) sb.append(",");
-            
-            State state = activity != null ? getState(activity, permissions[i]) : State.NOT_DETERMINED;
-            sb.append("\"").append(keys[i]).append("\":\"").append(state.getValue()).append("\"");
-        }
+        String notifAuth = getNotificationAuth(context);
+        sb.append("\"notificationAuthorized\":\"").append(notifAuth).append("\",");
+        sb.append("\"notificationAlertAuthorized\":\"").append(notifAuth).append("\",");
+        sb.append("\"notificationBadgeAuthorized\":\"").append(notifAuth).append("\",");
+        sb.append("\"notificationSoundAuthorized\":\"").append(notifAuth).append("\",");
+        sb.append("\"phoneCalendarAuthorized\":\"").append(getAuth(context, READ_CALENDAR)).append("\"");
 
         sb.append("}");
         return sb.toString();
+    }
+
+    // ==================== Authorization Helpers ====================
+
+    private static String getAuth(Context context, String permission) {
+        if (context == null) return "not determined";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            return context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+                    ? "authorized" : "denied";
+        }
+        // Pre-M: permissions granted at install time
+        return "authorized";
+    }
+
+    private static String getBluetoothAuth(Context context) {
+        if (context == null) return "not determined";
+        if (Build.VERSION.SDK_INT >= 31) {
+            return getAuth(context, BLUETOOTH_CONNECT);
+        }
+        // Pre-S: BLUETOOTH is a normal permission, always granted if declared
+        return "authorized";
+    }
+
+    private static String getNotificationAuth(Context context) {
+        if (context == null) return "not determined";
+        if (Build.VERSION.SDK_INT >= 33) {
+            return getAuth(context, POST_NOTIFICATIONS);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                NotificationManager nm = (NotificationManager)
+                        context.getSystemService(Context.NOTIFICATION_SERVICE);
+                if (nm != null) {
+                    return nm.areNotificationsEnabled() ? "authorized" : "denied";
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        // Pre-N: notifications always enabled
+        return "authorized";
+    }
+
+    private static String getAlbumAuth(Context context) {
+        if (context == null) return "not determined";
+        if (Build.VERSION.SDK_INT >= 33) {
+            return getAuth(context, READ_MEDIA_IMAGES);
+        }
+        return getAuth(context, READ_STORAGE);
+    }
+
+    private static boolean getLocationReducedAccuracy(Context context) {
+        if (context == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false;
+        boolean coarse = context.checkSelfPermission(COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+        boolean fine = context.checkSelfPermission(FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+        return coarse && !fine;
     }
 }
