@@ -5,7 +5,6 @@ import android.content.Context;
 import android.location.LocationManager;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
-import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.provider.Settings;
 
@@ -96,11 +95,12 @@ public final class SystemSettings {
      */
     public static boolean isWifiEnabled(Context context) {
         if (context == null) return false;
-        
+
         try {
-            WifiManager wm = (WifiManager) context.getApplicationContext()
-                    .getSystemService(Context.WIFI_SERVICE);
-            return wm != null && wm.isWifiEnabled();
+            return Settings.Global.getInt(
+                    context.getContentResolver(),
+                    Settings.Global.WIFI_ON, 0
+            ) != 0;
         } catch (Exception e) {
             return false;
         }
