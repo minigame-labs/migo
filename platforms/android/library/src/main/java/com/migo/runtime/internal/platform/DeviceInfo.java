@@ -209,6 +209,42 @@ public final class DeviceInfo {
         return locale.getLanguage() + "_" + locale.getCountry();
     }
 
+    // ==================== Benchmark ====================
+
+    /**
+     * Estimate device benchmark level based on hardware capabilities.
+     * <p>
+     * Uses total RAM as a heuristic to approximate the benchmark level
+     * returned by getDeviceInfo API.
+     *
+     * @param context The context (for memory info)
+     * @return Benchmark level (1-50), or -1 if cannot be determined
+     */
+    public static int getBenchmarkLevel(Context context) {
+        if (context == null) return -1;
+
+        long totalMemMB = getTotalMemoryMB(context);
+        if (totalMemMB <= 0) return -1;
+
+        double totalMemGB = totalMemMB / 1024.0;
+        int level = (int) Math.round(totalMemGB * 3.5);
+
+        // Clamp to reasonable range
+        return Math.max(1, Math.min(level, 50));
+    }
+
+    // ==================== CPU Type ====================
+
+    /**
+     * Get CPU type description.
+     *
+     * @return CPU type string, or "unknown" if not determinable
+     */
+    public static String getCpuType() {
+        String hardware = safeString(Build.HARDWARE);
+        return hardware.isEmpty() ? "unknown" : hardware;
+    }
+
     // ==================== JSON Export ====================
 
     /**
@@ -223,21 +259,21 @@ public final class DeviceInfo {
         StringBuilder sb = new StringBuilder(256);
         sb.append("{");
 
+        String abi = escapeJson(getPrimaryAbi());
         sb.append("\"brand\":\"").append(escapeJson(getBrand())).append("\",");
         sb.append("\"model\":\"").append(escapeJson(getModel())).append("\",");
-        sb.append("\"system\":\"Android\",");
+        sb.append("\"system\":\"Android ").append(getAndroidVersion()).append("\",");
         sb.append("\"platform\":\"android\",");
-        sb.append("\"version\":\"").append(getAndroidVersion()).append("\",");
-        sb.append("\"SDKVersion\":").append(getSdkVersion()).append(",");
-        sb.append("\"language\":\"").append(getLanguage()).append("\",");
-        sb.append("\"abi\":\"").append(escapeJson(getPrimaryAbi())).append("\",");
-        
+        sb.append("\"abi\":\"").append(abi).append("\",");
+        sb.append("\"deviceAbi\":\"").append(abi).append("\",");
+        sb.append("\"cpuType\":\"").append(escapeJson(getCpuType())).append("\",");
+
         if (context != null) {
             sb.append("\"memorySize\":").append(getTotalMemoryMB(context)).append(",");
+            sb.append("\"benchmarkLevel\":").append(getBenchmarkLevel(context));
+        } else {
+            sb.append("\"benchmarkLevel\":-1");
         }
-        
-        sb.append("\"fontSizeSetting\":16,");
-        sb.append("\"benchmarkLevel\":-1");
 
         sb.append("}");
         return sb.toString();

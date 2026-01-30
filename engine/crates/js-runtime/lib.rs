@@ -1,7 +1,7 @@
 //! # JavaScript Runtime Module
 //!
 //! This crate provides the JavaScript execution environment for the Migo engine,
-//! implementing WeChat Mini Program and standard Web APIs on top of Deno Core (V8).
+//! implementing Mini Program and standard Web APIs on top of Deno Core (V8).
 //!
 //! ## Architecture
 //!
@@ -118,7 +118,7 @@ deno_core::extension!(
 /// Creates all JavaScript runtime extensions with the given host state.
 ///
 /// This assembles the complete set of extensions needed for the Migo runtime,
-/// including both WeChat Mini Program APIs and Web standard APIs.
+/// including both Mini Program APIs and Web standard APIs.
 ///
 /// # Arguments
 ///

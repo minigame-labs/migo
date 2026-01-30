@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - WebAudio-style runtime with `AudioContext` and `AudioBuffer` support
-- `InnerAudioContext` API compatible with WeChat mini-game style
+- `InnerAudioContext` API compatible with mini-game style
 - Audio decoders for MP3, OGG, and WAV formats
 - Audio streaming and caching pipeline
 - Canvas 2D rendering API

@@ -1,7 +1,7 @@
 //! # Audio Processing Module
 //!
 //! This crate provides audio playback and processing capabilities for the Migo engine,
-//! implementing both WebAudio API semantics and WeChat's InnerAudioContext API.
+//! implementing both WebAudio API semantics and InnerAudioContext API.
 //!
 //! ## Architecture
 //!
@@ -30,7 +30,7 @@
 //! ## Features
 //!
 //! - **WebAudio API**: Supports `AudioContext`, `AudioBufferSourceNode`, `GainNode`
-//! - **InnerAudioContext**: WeChat-compatible audio player with streaming support
+//! - **InnerAudioContext**: audio player with streaming support
 //! - **Format Support**: MP3, OGG/Vorbis, WAV, FLAC (via symphonia)
 //! - **Streaming**: Edge-download-edge-play for large audio files
 //! - **Caching**: LRU cache for decoded audio to avoid repeated decoding

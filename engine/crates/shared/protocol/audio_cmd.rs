@@ -15,7 +15,7 @@
 //!
 //! ### InnerAudioContext API
 //!
-//! Implements the WeChat Mini Program audio API:
+//! Implements the Mini Program audio API:
 //! - Simple play/pause/stop control
 //! - URL-based loading with streaming support
 //! - Volume, loop, and playback rate control
@@ -103,7 +103,7 @@ pub enum AudioContextState {
 /// - **Buffer**: Decode audio data, release buffers
 /// - **Nodes**: Create and configure AudioBufferSourceNode, GainNode
 /// - **Graph**: Connect and disconnect audio nodes
-/// - **InnerAudio**: WeChat InnerAudioContext operations
+/// - **InnerAudio**: InnerAudioContext operations
 /// - **Lifecycle**: Thread management (shutdown)
 ///
 /// # Fire-and-Forget vs Request-Response

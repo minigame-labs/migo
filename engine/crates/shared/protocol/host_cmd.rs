@@ -146,7 +146,7 @@ pub enum HostCommand {
 
 /// Event types for InnerAudioContext.
 ///
-/// These map to the WeChat Mini Program InnerAudioContext events:
+/// These map to the Mini Program InnerAudioContext events:
 /// - `onCanplay`, `onPlay`, `onPause`, `onStop`, `onEnded`
 /// - `onSeeking`, `onSeeked`, `onTimeUpdate`, `onError`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
