@@ -1,10 +1,30 @@
+import { op_open_app_authorize_setting } from "ext:core/ops";
 
+const noop = () => { };
 
-// Mock
+let onOpenAppAuthorizeSettingSuccess = noop;
+let onOpenAppAuthorizeSettingFail = noop;
+let onOpenAppAuthorizeSettingComplete = noop;
+
 function openAppAuthorizeSetting({ success, fail, complete } = {}) {
-    success && success({ "code": 0, "message": "App authorization settings opened successfully" });
-    // fail && fail();
-    complete && complete({ "code": 0, "message": "App authorization settings operation completed" });
+    onOpenAppAuthorizeSettingSuccess = success || noop;
+    onOpenAppAuthorizeSettingFail = fail || noop;
+    onOpenAppAuthorizeSettingComplete = complete || noop;
+
+    op_open_app_authorize_setting();
 }
 
-export { openAppAuthorizeSetting }
+function _internalOnOpenAppAuthorizeSettingFinished(code) {
+    if (code >= 0) {
+        onOpenAppAuthorizeSettingSuccess({ "code": code, "message": "App authorization settings opened successfully" });
+    } else {
+        onOpenAppAuthorizeSettingFail({ "code": code, "message": "Failed to open app authorization settings" });
+    }
+    onOpenAppAuthorizeSettingComplete({ "code": code });
+
+    onOpenAppAuthorizeSettingSuccess = noop;
+    onOpenAppAuthorizeSettingFail = noop;
+    onOpenAppAuthorizeSettingComplete = noop;
+}
+
+export { openAppAuthorizeSetting, _internalOnOpenAppAuthorizeSettingFinished }

@@ -212,6 +212,18 @@ pub(crate) extern "system" fn onOpenSystemBluetoothSetting<'local>(
     let _ = send_command_to_host(host_id, cmd);
 }
 
+pub(crate) extern "system" fn onOpenAppAuthorizeSetting<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    code: jint,
+) {
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnOpenAppAuthorizeSettingFinished({});", code),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
 pub(crate) extern "system" fn onTouch(
     env: JNIEnv,
     _cls: JClass,

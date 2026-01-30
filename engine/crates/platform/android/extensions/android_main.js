@@ -23,6 +23,7 @@ const properties = {
     _internalOnOpenBluetoothSettingFinished: core.propNonEnumerable(bluetooth._internalOnOpenBluetoothSettingFinished),
     // Authorize
     openAppAuthorizeSetting: core.propNonEnumerable(authorize.openAppAuthorizeSetting),
+    _internalOnOpenAppAuthorizeSettingFinished: core.propNonEnumerable(authorize._internalOnOpenAppAuthorizeSettingFinished),
     // Window Info
     getWindowInfo: core.propNonEnumerable(windowInfo.getWindowInfo),
     // System Setting

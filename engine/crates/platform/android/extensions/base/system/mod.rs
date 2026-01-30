@@ -11,6 +11,13 @@ pub fn op_open_system_bluetooth_setting(state: &mut OpState) -> Result<(), JsErr
     Ok(())
 }
 
+#[op2(fast)]
+pub fn op_open_app_authorize_setting(state: &mut OpState) -> Result<(), JsErrorBox> {
+    let options = state.borrow::<HostOpState>();
+    open_app_authorize_setting(options.id).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(())
+}
+
 #[op2]
 #[serde]
 pub fn op_get_window_info(state: &mut OpState) -> Result<WindowInfo, JsErrorBox> {
@@ -37,7 +44,7 @@ pub fn op_get_app_authorization_setting(_: &mut OpState) -> Result<String, JsErr
 }
 
 extension!(host_v8_system,
- ops = [op_open_system_bluetooth_setting, op_get_window_info, op_get_system_settings, op_get_device_info, op_get_app_authorization_setting],
+ ops = [op_open_system_bluetooth_setting, op_open_app_authorize_setting, op_get_window_info, op_get_system_settings, op_get_device_info, op_get_app_authorization_setting],
  esm = [
     dir "android/extensions/base/system",
     "01_bluetooth.js",

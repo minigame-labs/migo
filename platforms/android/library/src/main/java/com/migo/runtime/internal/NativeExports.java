@@ -3,6 +3,7 @@ package com.migo.runtime.internal;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
+import android.net.Uri;
 import android.provider.Settings;
 
 import com.migo.runtime.internal.platform.DeviceInfo;
@@ -25,6 +26,7 @@ import java.nio.ByteOrder;
 public final class NativeExports {
 
     private static final int BLUETOOTH_SETTING_REQUEST_CODE = 10001;
+    private static final int APP_AUTHORIZE_SETTING_REQUEST_CODE = 10002;
 
     private NativeExports() {}
 
@@ -78,6 +80,34 @@ public final class NativeExports {
             activity.startActivityForResult(intent, BLUETOOTH_SETTING_REQUEST_CODE);
         } catch (Exception e) {
             NativeMethods.onBluetoothSettingResult(sessionId, false);
+        }
+    }
+
+    /**
+     * Open app authorization (permission) settings page.
+     *
+     * @param sessionId The session ID to receive the callback
+     */
+    public static void openAppAuthorizeSetting(int sessionId) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) {
+            NativeMethods.onAppAuthorizeSettingResult(sessionId, -1);
+            return;
+        }
+
+        Activity activity = context.getActivity();
+        if (activity == null) {
+            NativeMethods.onAppAuthorizeSettingResult(sessionId, -1);
+            return;
+        }
+
+        try {
+            Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+            Uri uri = Uri.fromParts("package", activity.getPackageName(), null);
+            intent.setData(uri);
+            activity.startActivityForResult(intent, APP_AUTHORIZE_SETTING_REQUEST_CODE);
+        } catch (Exception e) {
+            NativeMethods.onAppAuthorizeSettingResult(sessionId, -1);
         }
     }
 

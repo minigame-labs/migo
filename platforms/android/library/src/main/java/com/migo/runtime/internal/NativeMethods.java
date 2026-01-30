@@ -209,4 +209,16 @@ public final class NativeMethods {
             NativeBridge.onOpenSystemBluetoothSetting(sessionId, enabled ? 1 : 0);
         }
     }
+
+    /**
+     * Callback for app authorization setting result.
+     *
+     * @param sessionId The session ID
+     * @param code      0 on success, negative on failure
+     */
+    public static void onAppAuthorizeSettingResult(int sessionId, int code) {
+        if (sessionId >= 0) {
+            NativeBridge.onOpenAppAuthorizeSetting(sessionId, code);
+        }
+    }
 }

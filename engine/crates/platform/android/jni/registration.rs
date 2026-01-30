@@ -4,8 +4,8 @@ use jni::{JNIEnv, NativeMethod};
 use tracing::info;
 
 use crate::android::jni::{
-    JAVA_METHOD_CACHE, JavaMethodCache, init, mod_main, onHide, onOpenSystemBluetoothSetting,
-    onShow, onTouch, shutdown, updateSurface, version,
+    JAVA_METHOD_CACHE, JavaMethodCache, init, mod_main, onHide, onOpenAppAuthorizeSetting,
+    onOpenSystemBluetoothSetting, onShow, onTouch, shutdown, updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -35,6 +35,11 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "onOpenSystemBluetoothSetting".into(),
                 sig: "(II)V".into(),
                 fn_ptr: onOpenSystemBluetoothSetting as *mut c_void,
+            },
+            NativeMethod {
+                name: "onOpenAppAuthorizeSetting".into(),
+                sig: "(II)V".into(),
+                fn_ptr: onOpenAppAuthorizeSetting as *mut c_void,
             },
             NativeMethod {
                 name: "onShow".into(),
@@ -78,6 +83,7 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
     let methods = [
         ("getCacheDirPath", "()Ljava/lang/String;"),
         ("openSystemBluetoothSetting", "(I)V"),
+        ("openAppAuthorizeSetting", "(I)V"),
         ("getWindowInfoBytes", "(I)[B"),
         ("getSystemSettingInfoBytes", "()[B"),
         ("getDeviceInfoJson", "()Ljava/lang/String;"),

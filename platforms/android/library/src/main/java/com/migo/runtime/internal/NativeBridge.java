@@ -112,4 +112,12 @@ public final class NativeBridge {
      * @param enabled   1 if Bluetooth was enabled, 0 otherwise
      */
     public static native void onOpenSystemBluetoothSetting(int sessionId, int enabled);
+
+    /**
+     * Callback when app authorization setting result is received.
+     *
+     * @param sessionId The session ID
+     * @param code      0 on success, negative on failure
+     */
+    public static native void onOpenAppAuthorizeSetting(int sessionId, int code);
 }

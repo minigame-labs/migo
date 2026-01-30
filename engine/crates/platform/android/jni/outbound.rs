@@ -54,6 +54,15 @@ pub fn open_bluetooth_settings(host_id: i32) -> Result<(), String> {
     )
 }
 
+pub fn open_app_authorize_setting(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "openAppAuthorizeSetting",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
 pub fn get_window_info(host_id: i32) -> Result<WindowInfo, String> {
     call_static_method(
         "getWindowInfoBytes",
