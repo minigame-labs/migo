@@ -42,6 +42,8 @@ const properties = {
     // LifeCycle
     onShow: core.propNonEnumerable(lifeCycle.onShow),
     onHide: core.propNonEnumerable(lifeCycle.onHide),
+    offShow: core.propNonEnumerable(lifeCycle.offShow),
+    offHide: core.propNonEnumerable(lifeCycle.offHide),
     getLaunchOptionsSync: core.propNonEnumerable(lifeCycle.getLaunchOptionsSync),
     getEnterOptionsSync: core.propNonEnumerable(lifeCycle.getEnterOptionsSync),
     _internalTriggerOnShow: core.propNonEnumerable(lifeCycle._internalTriggerOnShow),

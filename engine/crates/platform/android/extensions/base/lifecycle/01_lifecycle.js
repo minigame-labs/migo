@@ -48,6 +48,28 @@ class AppLifecycleManager {
         }
     }
 
+    offShow(listener) {
+        if (typeof listener === 'function') {
+            const index = this.onShowListeners.indexOf(listener);
+            if (index !== -1) {
+                this.onShowListeners.splice(index, 1);
+            }
+        } else {
+            this.onShowListeners.length = 0;
+        }
+    }
+
+    offHide(listener) {
+        if (typeof listener === 'function') {
+            const index = this.onHideListeners.indexOf(listener);
+            if (index !== -1) {
+                this.onHideListeners.splice(index, 1);
+            }
+        } else {
+            this.onHideListeners.length = 0;
+        }
+    }
+
     _triggerShow(options) {
         this.isVisible = true;
         const showOptions = options || this.launchOptions;
@@ -92,6 +114,14 @@ function onHide(listener) {
     lifecycleManager.onHide(listener);
 }
 
+function offShow(listener) {
+    lifecycleManager.offShow(listener);
+}
+
+function offHide(listener) {
+    lifecycleManager.offHide(listener);
+}
+
 function getLaunchOptionsSync() {
     return lifecycleManager.getLaunchOptionsSync();
 }
@@ -108,4 +138,4 @@ function _internalTriggerOnHide() {
     lifecycleManager._triggerHide();
 }
 
-export { onShow, onHide, getLaunchOptionsSync, getEnterOptionsSync, _internalTriggerOnHide, _internalTriggerOnShow };
+export { onShow, onHide, offShow, offHide, getLaunchOptionsSync, getEnterOptionsSync, _internalTriggerOnHide, _internalTriggerOnShow };
