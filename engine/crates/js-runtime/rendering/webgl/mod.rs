@@ -1,17 +1,14 @@
 use deno_core::extension;
 
 mod context2d;
-mod context2d_v2;
 mod raf;
 mod webgl;
 
 use context2d::*;
-use context2d_v2::*;
 use raf::*;
 use webgl::*;
 
-// Re-export FrameCommandCollector for use in OpState initialization
-pub use context2d_v2::FrameCommandCollector;
+pub use context2d::FrameCommandCollector;
 
 extension!(host_v8_webgl,
     deps = [host_v8_console, host_v8_base],
@@ -53,7 +50,7 @@ extension!(host_v8_webgl,
         op_uniform3f,
         op_uniform_matrix_3fv,
 
-        // 2D Context (shared: context creation, sync queries)
+        // 2D Context (sync ops)
         op_create_context_2d,
         op_measure_text,
         op_get_image_data,
@@ -64,58 +61,58 @@ extension!(host_v8_webgl,
         op_frame_end_all,
         op_invalidate,
 
-        // Batched path methods
-        op_begin_path_v2,
-        op_close_path_v2,
-        op_move_to_v2,
-        op_line_to_v2,
-        op_quadratic_curve_to_v2,
-        op_bezier_curve_to_v2,
-        op_arc_v2,
-        op_arc_to_v2,
-        op_rect_v2,
-        op_ellipse_v2,
+        // Path methods
+        op_begin_path,
+        op_close_path,
+        op_move_to,
+        op_line_to,
+        op_quadratic_curve_to,
+        op_bezier_curve_to,
+        op_arc,
+        op_arc_to,
+        op_rect,
+        op_ellipse,
 
-        // Batched drawing methods
-        op_fill_v2,
-        op_stroke_v2,
-        op_clip_v2,
+        // Drawing methods
+        op_fill,
+        op_stroke,
+        op_clip,
 
-        // Batched rectangle methods
-        op_fill_rect_v2,
-        op_stroke_rect_v2,
-        op_clear_rect_v2,
+        // Rectangle methods
+        op_fill_rect,
+        op_stroke_rect,
+        op_clear_rect,
 
-        // Batched text methods
-        op_fill_text_v2,
-        op_stroke_text_v2,
+        // Text methods
+        op_fill_text,
+        op_stroke_text,
 
-        // Batched style setters
-        op_set_fill_style_v2,
-        op_set_stroke_style_v2,
-        op_set_line_width_v2,
-        op_set_line_cap_v2,
-        op_set_line_join_v2,
-        op_set_miter_limit_v2,
-        op_set_global_alpha_v2,
-        op_set_font_v2,
-        op_set_text_align_v2,
-        op_set_text_baseline_v2,
+        // Style setters
+        op_set_fill_style,
+        op_set_stroke_style,
+        op_set_line_width,
+        op_set_line_cap,
+        op_set_line_join,
+        op_set_miter_limit,
+        op_set_global_alpha,
+        op_set_font,
+        op_set_text_align,
+        op_set_text_baseline,
 
-        // Batched state methods
-        op_save_v2,
-        op_restore_v2,
+        // State methods
+        op_save,
+        op_restore,
 
-        // Batched transform methods
-        op_translate_v2,
-        op_rotate_v2,
-        op_scale_v2,
-        op_set_transform_v2,
-        op_reset_transform_v2,
+        // Transform methods
+        op_translate,
+        op_rotate,
+        op_scale,
+        op_set_transform,
+        op_reset_transform,
 
-        // Batched image methods
-        op_draw_image_v2,
-        op_draw_image_batch_v2,
+        // Image methods
+        op_draw_image,
+        op_draw_image_batch,
     ],
     esm = [
         dir "rendering/webgl",
