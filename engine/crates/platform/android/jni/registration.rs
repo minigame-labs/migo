@@ -4,8 +4,9 @@ use jni::{JNIEnv, NativeMethod};
 use tracing::info;
 
 use crate::android::jni::{
-    JAVA_METHOD_CACHE, JavaMethodCache, init, mod_main, onHide, onOpenAppAuthorizeSetting,
-    onOpenSystemBluetoothSetting, onShow, onTouch, shutdown, updateSurface, version,
+    JAVA_METHOD_CACHE, JavaMethodCache, init, mod_main, onAudioInterruptionBegin,
+    onAudioInterruptionEnd, onHide, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting,
+    onShow, onTouch, shutdown, updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -50,6 +51,16 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "onHide".into(),
                 sig: "(I)V".into(),
                 fn_ptr: onHide as *mut c_void,
+            },
+            NativeMethod {
+                name: "onAudioInterruptionBegin".into(),
+                sig: "(I)V".into(),
+                fn_ptr: onAudioInterruptionBegin as *mut c_void,
+            },
+            NativeMethod {
+                name: "onAudioInterruptionEnd".into(),
+                sig: "(I)V".into(),
+                fn_ptr: onAudioInterruptionEnd as *mut c_void,
             },
             NativeMethod {
                 name: "updateSurface".into(),

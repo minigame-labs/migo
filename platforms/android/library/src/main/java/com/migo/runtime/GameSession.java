@@ -1,5 +1,6 @@
 package com.migo.runtime;
 
+import android.content.Context;
 import android.view.MotionEvent;
 import android.view.Surface;
 
@@ -10,6 +11,7 @@ import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.RuntimeRegistry;
 import com.migo.runtime.internal.TouchEventHandler;
+import com.migo.runtime.internal.platform.AudioFocusManager;
 
 import java.io.Closeable;
 import java.io.File;
@@ -75,6 +77,7 @@ public final class GameSession implements Closeable {
     private final RuntimeConfig config;
     private final GamePaths paths;
     private final TouchEventHandler touchHandler;
+    private final AudioFocusManager audioFocusManager;
     private final Object lock = new Object();
 
     private volatile boolean destroyed = false;
@@ -93,16 +96,21 @@ public final class GameSession implements Closeable {
      * @param sessionId The native session ID
      * @param gameId    The unique game identifier
      * @param config    The runtime configuration
+     * @param context   The context for system services
      */
-    GameSession(int sessionId, String gameId, RuntimeConfig config) {
+    GameSession(int sessionId, String gameId, RuntimeConfig config, Context context) {
         this.sessionId = sessionId;
         this.gameId = gameId;
         this.config = config;
         this.paths = new GamePaths(config, gameId);
         this.touchHandler = new TouchEventHandler(config.getDisplayDensity());
+        this.audioFocusManager = new AudioFocusManager(sessionId, context);
 
         // Ensure game directories exist
         this.paths.ensureDirectories();
+
+        // Start listening for audio focus changes
+        this.audioFocusManager.start();
     }
 
     // ==================== Getters ====================
@@ -279,6 +287,7 @@ public final class GameSession implements Closeable {
             destroyed = true;
         }
 
+        audioFocusManager.stop();
         NativeMethods.shutdown(sessionId);
         RuntimeRegistry.unregister(sessionId);
 

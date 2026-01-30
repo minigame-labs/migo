@@ -9,6 +9,7 @@ import * as webgl from 'ext:host_v8_webgl/02_webgl_context.js';
 import * as touch from 'ext:host_v8_touch/01_touch.js';
 import * as audio from 'ext:host_v8_audio/01_audio_context.js';
 import * as innerAudio from 'ext:host_v8_audio/02_inner_audio_context.js';
+import * as audioInterruption from 'ext:host_v8_audio/03_audio_interruption.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -51,6 +52,14 @@ const WindowGlobalScope = {
     InnerAudioContext: core.propNonEnumerable(innerAudio.InnerAudioContext),
     createInnerAudioContext: core.propNonEnumerable(innerAudio.createInnerAudioContext),
     _internalEnqueueInnerAudioEvent: core.propNonEnumerable(innerAudio._internalEnqueueInnerAudioEvent),
+
+    // Audio Interruption
+    onAudioInterruptionBegin: core.propNonEnumerable(audioInterruption.onAudioInterruptionBegin),
+    offAudioInterruptionBegin: core.propNonEnumerable(audioInterruption.offAudioInterruptionBegin),
+    onAudioInterruptionEnd: core.propNonEnumerable(audioInterruption.onAudioInterruptionEnd),
+    offAudioInterruptionEnd: core.propNonEnumerable(audioInterruption.offAudioInterruptionEnd),
+    _internalTriggerAudioInterruptionBegin: core.propNonEnumerable(audioInterruption._internalTriggerAudioInterruptionBegin),
+    _internalTriggerAudioInterruptionEnd: core.propNonEnumerable(audioInterruption._internalTriggerAudioInterruptionEnd),
 };
 
 export { WindowGlobalScope };

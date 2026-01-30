@@ -48,7 +48,6 @@ const properties = {
     getEnterOptionsSync: core.propNonEnumerable(lifeCycle.getEnterOptionsSync),
     _internalTriggerOnShow: core.propNonEnumerable(lifeCycle._internalTriggerOnShow),
     _internalTriggerOnHide: core.propNonEnumerable(lifeCycle._internalTriggerOnHide),
-
     // File
     getFileSystemManager: core.propNonEnumerable(fileManager.getFileSystemManager),
 };

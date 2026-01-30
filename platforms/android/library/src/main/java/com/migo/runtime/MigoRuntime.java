@@ -219,7 +219,7 @@ public final class MigoRuntime {
         }
 
         // Create Java session wrapper with gameId
-        GameSession session = new GameSession(sessionId, gameId, config);
+        GameSession session = new GameSession(sessionId, gameId, config, activity);
 
         // Register runtime context
         RuntimeRegistry.register(new RuntimeContext(sessionId, activity));
@@ -268,7 +268,7 @@ public final class MigoRuntime {
         }
 
         // Create Java session wrapper with gameId
-        GameSession session = new GameSession(sessionId, gameId, config);
+        GameSession session = new GameSession(sessionId, gameId, config, context);
 
         // Register without Activity
         RuntimeRegistry.register(new RuntimeContext(sessionId, null));

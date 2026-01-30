@@ -69,6 +69,20 @@ public final class NativeBridge {
      */
     public static native void onHide(int sessionId);
 
+    /**
+     * Notify that audio playback has been interrupted by the system.
+     *
+     * @param sessionId The session ID
+     */
+    public static native void onAudioInterruptionBegin(int sessionId);
+
+    /**
+     * Notify that audio interruption has ended.
+     *
+     * @param sessionId The session ID
+     */
+    public static native void onAudioInterruptionEnd(int sessionId);
+
     // ==================== Input Events ====================
 
     /**

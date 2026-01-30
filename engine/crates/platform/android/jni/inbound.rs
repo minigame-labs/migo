@@ -368,3 +368,19 @@ pub(crate) extern "system" fn onShow(_env: JNIEnv, _class: JClass, host_id: jint
 pub(crate) extern "system" fn onHide(_env: JNIEnv, _class: JClass, host_id: jint) {
     let _ = send_command_to_host(host_id, HostCommand::OnHide);
 }
+
+pub(crate) extern "system" fn onAudioInterruptionBegin(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+) {
+    let _ = send_command_to_host(host_id, HostCommand::OnAudioInterruptionBegin);
+}
+
+pub(crate) extern "system" fn onAudioInterruptionEnd(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+) {
+    let _ = send_command_to_host(host_id, HostCommand::OnAudioInterruptionEnd);
+}

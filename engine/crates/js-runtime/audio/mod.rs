@@ -54,6 +54,7 @@ extension!(host_v8_audio,
         "00_gain_node.js",
         "01_audio_context.js",
         "02_inner_audio_context.js",
+        "03_audio_interruption.js",
     ],
 );
 

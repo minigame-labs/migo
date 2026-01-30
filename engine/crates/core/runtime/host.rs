@@ -101,6 +101,24 @@ impl Host {
                     .await
             }
 
+            HostCommand::OnAudioInterruptionBegin => {
+                self.js
+                    .exec_script_and_pump(
+                        "audio_interruption_begin",
+                        "_internalTriggerAudioInterruptionBegin()".to_string(),
+                    )
+                    .await
+            }
+
+            HostCommand::OnAudioInterruptionEnd => {
+                self.js
+                    .exec_script_and_pump(
+                        "audio_interruption_end",
+                        "_internalTriggerAudioInterruptionEnd()".to_string(),
+                    )
+                    .await
+            }
+
             HostCommand::OnTouch {
                 touch_type,
                 points,

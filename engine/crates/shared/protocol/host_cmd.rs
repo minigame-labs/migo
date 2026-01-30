@@ -104,6 +104,16 @@ pub enum HostCommand {
     /// Triggers `migo.onHide` callbacks in the game.
     OnHide,
 
+    /// Notify that audio playback has been interrupted.
+    ///
+    /// Triggered when the system takes audio focus (e.g., incoming call).
+    OnAudioInterruptionBegin,
+
+    /// Notify that audio interruption has ended.
+    ///
+    /// Triggered when the system returns audio focus.
+    OnAudioInterruptionEnd,
+
     /// Update the rendering surface (e.g., after orientation change).
     ///
     /// The render thread will recreate the EGL context with the new surface.

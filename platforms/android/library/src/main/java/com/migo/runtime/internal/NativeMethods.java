@@ -125,6 +125,30 @@ public final class NativeMethods {
         }
     }
 
+    /**
+     * Notify session that audio has been interrupted by the system
+     * (e.g., incoming phone call).
+     *
+     * @param sessionId The session ID
+     */
+    public static void onAudioInterruptionBegin(int sessionId) {
+        if (sessionId >= 0) {
+            NativeBridge.onAudioInterruptionBegin(sessionId);
+        }
+    }
+
+    /**
+     * Notify session that audio interruption has ended
+     * and playback can resume.
+     *
+     * @param sessionId The session ID
+     */
+    public static void onAudioInterruptionEnd(int sessionId) {
+        if (sessionId >= 0) {
+            NativeBridge.onAudioInterruptionEnd(sessionId);
+        }
+    }
+
     // ==================== Input Events ====================
 
     /**
