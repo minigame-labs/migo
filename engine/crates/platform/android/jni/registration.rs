@@ -5,8 +5,9 @@ use tracing::info;
 
 use crate::android::jni::{
     JAVA_METHOD_CACHE, JavaMethodCache, init, mod_main, onAudioInterruptionBegin,
-    onAudioInterruptionEnd, onHide, onModalResult, onOpenAppAuthorizeSetting,
-    onOpenSystemBluetoothSetting, onShow, onTouch, shutdown, updateSurface, version,
+    onAudioInterruptionEnd, onHide, onModalResult, onActionSheetResult,
+    onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting, onShow, onTouch, shutdown,
+    updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -83,6 +84,11 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(III)V".into(),
                 fn_ptr: onModalResult as *mut c_void,
             },
+            NativeMethod {
+                name: "onActionSheetResult".into(),
+                sig: "(II)V".into(),
+                fn_ptr: onActionSheetResult as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -110,6 +116,7 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("showModal", "(ILjava/lang/String;)V"),
         ("showLoading", "(ILjava/lang/String;)V"),
         ("hideLoading", "(I)V"),
+        ("showActionSheet", "(ILjava/lang/String;)V"),
     ];
 
     let global_class = env

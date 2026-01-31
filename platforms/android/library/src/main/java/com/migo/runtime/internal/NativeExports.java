@@ -305,6 +305,26 @@ public final class NativeExports {
         InteractionUI.hideLoading(activity);
     }
 
+    /**
+     * Show an action sheet.
+     *
+     * @param sessionId The session ID
+     * @param json      JSON params: {alertText, itemList, itemColor}
+     */
+    public static void showActionSheet(int sessionId, String json) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) {
+            NativeMethods.onActionSheetResult(sessionId, -1);
+            return;
+        }
+        Activity activity = context.getActivity();
+        if (activity == null) {
+            NativeMethods.onActionSheetResult(sessionId, -1);
+            return;
+        }
+        InteractionUI.showActionSheet(activity, sessionId, json);
+    }
+
     // ==================== Permissions ====================
 
     /**

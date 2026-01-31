@@ -266,3 +266,7 @@ pub fn hide_loading(host_id: i32) -> Result<(), String> {
         &[jvalue { i: host_id }],
     )
 }
+
+pub fn show_action_sheet(host_id: i32, json: &str) -> Result<(), String> {
+    call_void_with_string("showActionSheet", host_id, json)
+}

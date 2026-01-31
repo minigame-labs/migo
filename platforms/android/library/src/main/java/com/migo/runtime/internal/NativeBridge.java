@@ -143,4 +143,12 @@ public final class NativeBridge {
      * @param cancel    1 if user tapped cancel, 0 otherwise
      */
     public static native void onModalResult(int sessionId, int confirm, int cancel);
+
+    /**
+     * Callback when action sheet is dismissed.
+     *
+     * @param sessionId The session ID
+     * @param tapIndex  Index of selected item (0-based), or -1 if cancelled
+     */
+    public static native void onActionSheetResult(int sessionId, int tapIndex);
 }

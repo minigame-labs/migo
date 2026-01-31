@@ -58,6 +58,8 @@ const properties = {
     _internalOnModalResult: core.propNonEnumerable(interaction._internalOnModalResult),
     showLoading: core.propNonEnumerable(interaction.showLoading),
     hideLoading: core.propNonEnumerable(interaction.hideLoading),
+    showActionSheet: core.propNonEnumerable(interaction.showActionSheet),
+    _internalOnActionSheetResult: core.propNonEnumerable(interaction._internalOnActionSheetResult),
 };
 
 ObjectDefineProperties(globalThis, properties);

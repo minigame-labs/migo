@@ -397,3 +397,15 @@ pub(crate) extern "system" fn onModalResult<'local>(
     };
     let _ = send_command_to_host(host_id, cmd);
 }
+
+pub(crate) extern "system" fn onActionSheetResult<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    tap_index: jint,
+) {
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnActionSheetResult({});", tap_index),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}

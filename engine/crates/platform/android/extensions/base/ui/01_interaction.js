@@ -4,6 +4,7 @@ import {
     op_show_modal,
     op_show_loading,
     op_hide_loading,
+    op_show_action_sheet,
 } from "ext:core/ops";
 
 const noop = () => {};
@@ -111,8 +112,56 @@ function hideLoading({ success, fail, complete } = {}) {
     }
 }
 
+// ==================== Action Sheet ====================
+
+let _actionSheetSuccess = null;
+let _actionSheetFail = null;
+let _actionSheetComplete = null;
+
+function showActionSheet({ alertText = '', itemList = [], itemColor = '#000000',
+                           success, fail, complete } = {}) {
+    _actionSheetSuccess = success || noop;
+    _actionSheetFail = fail || noop;
+    _actionSheetComplete = complete || noop;
+
+    try {
+        op_show_action_sheet(JSON.stringify({ alertText, itemList, itemColor }));
+    } catch (e) {
+        const res = { errMsg: 'showActionSheet:fail ' + e.message };
+        _actionSheetFail(res);
+        _actionSheetComplete(res);
+        _actionSheetSuccess = null;
+        _actionSheetFail = null;
+        _actionSheetComplete = null;
+    }
+}
+
+function _internalOnActionSheetResult(tapIndex) {
+    if (tapIndex < 0) {
+        // User cancelled
+        const res = { errMsg: 'showActionSheet:fail cancel' };
+        const f = _actionSheetFail;
+        const c = _actionSheetComplete;
+        _actionSheetSuccess = null;
+        _actionSheetFail = null;
+        _actionSheetComplete = null;
+        if (f) f(res);
+        if (c) c(res);
+    } else {
+        const res = { tapIndex, errMsg: 'showActionSheet:ok' };
+        const s = _actionSheetSuccess;
+        const c = _actionSheetComplete;
+        _actionSheetSuccess = null;
+        _actionSheetFail = null;
+        _actionSheetComplete = null;
+        if (s) s(res);
+        if (c) c(res);
+    }
+}
+
 export {
     showToast, hideToast,
     showModal, _internalOnModalResult,
     showLoading, hideLoading,
+    showActionSheet, _internalOnActionSheetResult,
 };

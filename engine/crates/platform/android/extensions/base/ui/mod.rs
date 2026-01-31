@@ -39,8 +39,15 @@ pub fn op_hide_loading(state: &mut OpState) -> Result<(), JsErrorBox> {
     Ok(())
 }
 
+#[op2(fast)]
+pub fn op_show_action_sheet(state: &mut OpState, #[string] json: String) -> Result<(), JsErrorBox> {
+    let options = state.borrow::<HostOpState>();
+    show_action_sheet(options.id, &json).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(())
+}
+
 extension!(host_v8_ui,
-    ops = [op_show_toast, op_hide_toast, op_show_modal, op_show_loading, op_hide_loading],
+    ops = [op_show_toast, op_hide_toast, op_show_modal, op_show_loading, op_hide_loading, op_show_action_sheet],
     esm = [
         dir "android/extensions/base/ui",
         "01_interaction.js",

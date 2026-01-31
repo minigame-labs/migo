@@ -258,4 +258,16 @@ public final class NativeMethods {
             NativeBridge.onModalResult(sessionId, confirm, cancel);
         }
     }
+
+    /**
+     * Callback for action sheet result.
+     *
+     * @param sessionId The session ID
+     * @param tapIndex  Index of selected item (0-based), or -1 if cancelled
+     */
+    public static void onActionSheetResult(int sessionId, int tapIndex) {
+        if (sessionId >= 0) {
+            NativeBridge.onActionSheetResult(sessionId, tapIndex);
+        }
+    }
 }

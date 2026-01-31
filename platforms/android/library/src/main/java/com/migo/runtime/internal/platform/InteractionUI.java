@@ -221,6 +221,173 @@ public final class InteractionUI {
         }
     }
 
+    // ==================== Action Sheet ====================
+
+    public static void showActionSheet(final Activity activity, final int sessionId, final String json) {
+        sHandler.post(() -> {
+            try {
+                JSONObject params = new JSONObject(json);
+                String alertText = params.optString("alertText", "");
+                String itemColor = params.optString("itemColor", "#000000");
+                org.json.JSONArray itemArray = params.getJSONArray("itemList");
+
+                String[] items = new String[itemArray.length()];
+                for (int i = 0; i < itemArray.length(); i++) {
+                    items[i] = itemArray.getString(i);
+                }
+
+                showActionSheetDialog(activity, sessionId, alertText, items, itemColor);
+            } catch (Exception e) {
+                NativeMethods.onActionSheetResult(sessionId, -1);
+            }
+        });
+    }
+
+    private static void showActionSheetDialog(Activity activity, int sessionId,
+                                               String alertText, String[] items, String itemColor) {
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+            NativeMethods.onActionSheetResult(sessionId, -1);
+            return;
+        }
+
+        float density = activity.getResources().getDisplayMetrics().density;
+
+        int itemColorParsed;
+        try {
+            itemColorParsed = Color.parseColor(itemColor);
+        } catch (Exception e) {
+            itemColorParsed = Color.BLACK;
+        }
+
+        // Root: full-screen semi-transparent background
+        final FrameLayout root = new FrameLayout(activity);
+        root.setLayoutParams(new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+        root.setBackgroundColor(Color.parseColor("#80000000"));
+
+        // Bottom container
+        LinearLayout bottomContainer = new LinearLayout(activity);
+        bottomContainer.setOrientation(LinearLayout.VERTICAL);
+        int hMargin = (int) (8 * density);
+        int bottomMargin = (int) (8 * density);
+
+        FrameLayout.LayoutParams containerParams = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT);
+        containerParams.gravity = Gravity.BOTTOM;
+        containerParams.leftMargin = hMargin;
+        containerParams.rightMargin = hMargin;
+        containerParams.bottomMargin = bottomMargin;
+
+        // Items group (white rounded background)
+        LinearLayout itemsGroup = new LinearLayout(activity);
+        itemsGroup.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable itemsBg = new GradientDrawable();
+        itemsBg.setColor(Color.WHITE);
+        itemsBg.setCornerRadius(12 * density);
+        itemsGroup.setBackground(itemsBg);
+
+        // Alert text header
+        if (alertText != null && !alertText.isEmpty()) {
+            TextView headerView = new TextView(activity);
+            headerView.setText(alertText);
+            headerView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            headerView.setTextColor(Color.parseColor("#888888"));
+            headerView.setGravity(Gravity.CENTER);
+            headerView.setPadding(0, (int) (14 * density), 0, (int) (14 * density));
+            itemsGroup.addView(headerView, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT));
+
+            // Divider after header
+            View divider = new View(activity);
+            divider.setBackgroundColor(Color.parseColor("#E5E5E5"));
+            itemsGroup.addView(divider, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 1));
+        }
+
+        // Item rows
+        final int finalItemColor = itemColorParsed;
+        for (int i = 0; i < items.length; i++) {
+            final int index = i;
+
+            TextView itemView = new TextView(activity);
+            itemView.setText(items[i]);
+            itemView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+            itemView.setTextColor(finalItemColor);
+            itemView.setGravity(Gravity.CENTER);
+            itemView.setPadding(0, (int) (14 * density), 0, (int) (14 * density));
+            itemView.setClickable(true);
+
+            TypedValue outValue = new TypedValue();
+            activity.getTheme().resolveAttribute(android.R.attr.selectableItemBackground, outValue, true);
+            itemView.setBackgroundResource(outValue.resourceId);
+
+            itemView.setOnClickListener(v -> {
+                removeOverlay(activity, root);
+                NativeMethods.onActionSheetResult(sessionId, index);
+            });
+
+            itemsGroup.addView(itemView, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT));
+
+            // Divider between items (not after last)
+            if (i < items.length - 1) {
+                View divider = new View(activity);
+                divider.setBackgroundColor(Color.parseColor("#E5E5E5"));
+                itemsGroup.addView(divider, new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, 1));
+            }
+        }
+
+        bottomContainer.addView(itemsGroup, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        // Gap between items group and cancel button
+        View gap = new View(activity);
+        bottomContainer.addView(gap, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, (int) (8 * density)));
+
+        // Cancel button (separate rounded white background)
+        TextView cancelBtn = new TextView(activity);
+        cancelBtn.setText("\u53d6\u6d88"); // 取消
+        cancelBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+        cancelBtn.setTextColor(Color.BLACK);
+        cancelBtn.setGravity(Gravity.CENTER);
+        cancelBtn.setPadding(0, (int) (14 * density), 0, (int) (14 * density));
+        cancelBtn.setClickable(true);
+
+        GradientDrawable cancelBg = new GradientDrawable();
+        cancelBg.setColor(Color.WHITE);
+        cancelBg.setCornerRadius(12 * density);
+        cancelBtn.setBackground(cancelBg);
+
+        cancelBtn.setOnClickListener(v -> {
+            removeOverlay(activity, root);
+            NativeMethods.onActionSheetResult(sessionId, -1);
+        });
+
+        bottomContainer.addView(cancelBtn, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        root.addView(bottomContainer, containerParams);
+
+        // Tap on background to cancel
+        root.setOnClickListener(v -> {
+            removeOverlay(activity, root);
+            NativeMethods.onActionSheetResult(sessionId, -1);
+        });
+
+        // Prevent click-through on bottom container
+        bottomContainer.setOnClickListener(v -> { /* consume */ });
+
+        addOverlay(activity, root);
+    }
+
     // ==================== Overlay Helpers ====================
 
     private static View createOverlay(Activity activity, String title, String icon, boolean mask) {
