@@ -230,7 +230,7 @@ fn run_audio_thread(
     let wakeup = AudioWakeup::new();
 
     // Get sync handle for callback-driven wakeup
-    let sync = output.sync().clone();
+    let mut sync = output.sync().clone();
 
     // Pause state: when true, skip audio processing but still handle commands.
     let mut paused = false;
@@ -253,6 +253,20 @@ fn run_audio_thread(
                 AudioCmd::ResumeAll => {
                     if paused {
                         paused = false;
+                        // If the audio stream died while paused (e.g. device
+                        // disconnected during a phone call), recreate it now.
+                        if !output.is_alive() {
+                            match AudioOutput::new() {
+                                Ok(new_output) => {
+                                    sync = new_output.sync().clone();
+                                    output = new_output;
+                                    info!("AudioThread: audio output recreated after stream error");
+                                }
+                                Err(e) => {
+                                    error!("AudioThread: failed to recreate audio output: {}", e);
+                                }
+                            }
+                        }
                         info!("AudioThread resumed");
                     }
                 }
@@ -745,6 +759,24 @@ fn run_audio_thread(
                     event_type,
                     current_time: event.current_time,
                 });
+            }
+        }
+
+        // If the audio stream died (e.g. device disconnected during a call),
+        // try to recreate it so audio resumes without waiting for ResumeAll.
+        if !output.is_alive() {
+            match AudioOutput::new() {
+                Ok(new_output) => {
+                    sync = new_output.sync().clone();
+                    output = new_output;
+                    info!("AudioThread: audio output recovered after stream error");
+                }
+                Err(e) => {
+                    error!("AudioThread: failed to recover audio output: {}", e);
+                    // Wait before retrying to avoid busy-loop on persistent errors
+                    wakeup.wait_timeout(Duration::from_secs(1));
+                    continue;
+                }
             }
         }
 

@@ -58,6 +58,36 @@ public final class AudioFocusManager {
     }
 
     /**
+     * Re-request audio focus if currently interrupted.
+     * <p>
+     * After {@code AUDIOFOCUS_LOSS} (permanent loss), Android will not
+     * automatically send {@code AUDIOFOCUS_GAIN} back. Call this on resume
+     * so the game can recover audio after e.g. a phone call.
+     */
+    public void requestFocusIfNeeded() {
+        if (audioManager == null || !interrupted) return;
+
+        int result;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusRequest != null) {
+            result = audioManager.requestAudioFocus((AudioFocusRequest) focusRequest);
+        } else {
+            result = audioManager.requestAudioFocus(
+                    focusListener,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN
+            );
+        }
+
+        if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            // Focus granted immediately; the listener won't fire AUDIOFOCUS_GAIN
+            // in this case, so trigger the end event manually.
+            interrupted = false;
+            NativeMethods.onAudioInterruptionEnd(sessionId);
+        }
+        // If not granted, the listener will fire AUDIOFOCUS_GAIN later.
+    }
+
+    /**
      * Abandon audio focus and stop listening.
      */
     public void stop() {

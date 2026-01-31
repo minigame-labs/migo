@@ -249,6 +249,9 @@ public final class GameSession implements Closeable {
     public void resume() {
         if (!destroyed) {
             NativeMethods.onShow(sessionId);
+            // Re-request audio focus in case it was permanently lost (e.g.
+            // after a phone call). This ensures onAudioInterruptionEnd fires.
+            audioFocusManager.requestFocusIfNeeded();
             if (lifecycleListener != null) {
                 lifecycleListener.onResumed();
             }

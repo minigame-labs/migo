@@ -66,6 +66,7 @@ pub struct AudioOutput {
     channels: u32,
     sync: AudioSync,
     low_watermark_samples: usize,
+    stream_error: Arc<AtomicBool>,
 }
 
 impl AudioOutput {
@@ -102,16 +103,17 @@ impl AudioOutput {
 
         let sync = AudioSync::new();
         let low_watermark_samples = LOW_WATERMARK_FRAMES * channels as usize;
+        let stream_error = Arc::new(AtomicBool::new(false));
 
         let stream = match config.sample_format() {
             SampleFormat::F32 => {
-                build_stream_f32(&device, &config.into(), consumer, sync.clone(), low_watermark_samples)?
+                build_stream_f32(&device, &config.into(), consumer, sync.clone(), low_watermark_samples, stream_error.clone())?
             }
             SampleFormat::I16 => {
-                build_stream_i16(&device, &config.into(), consumer, sync.clone(), low_watermark_samples)?
+                build_stream_i16(&device, &config.into(), consumer, sync.clone(), low_watermark_samples, stream_error.clone())?
             }
             SampleFormat::U16 => {
-                build_stream_u16(&device, &config.into(), consumer, sync.clone(), low_watermark_samples)?
+                build_stream_u16(&device, &config.into(), consumer, sync.clone(), low_watermark_samples, stream_error.clone())?
             }
             format => {
                 return Err(EngineError::from_detail(
@@ -132,6 +134,7 @@ impl AudioOutput {
             channels,
             sync,
             low_watermark_samples,
+            stream_error,
         })
     }
 
@@ -171,6 +174,12 @@ impl AudioOutput {
     pub fn sync(&self) -> &AudioSync {
         &self.sync
     }
+
+    /// Check if the audio stream is still alive (no errors reported).
+    #[inline]
+    pub fn is_alive(&self) -> bool {
+        !self.stream_error.load(Ordering::Acquire)
+    }
 }
 
 // Separate functions for each sample format to avoid generic trait object overhead
@@ -182,6 +191,7 @@ fn build_stream_f32(
     mut consumer: HeapCons<f32>,
     sync: AudioSync,
     low_watermark: usize,
+    stream_error: Arc<AtomicBool>,
 ) -> EngineResult<Stream> {
     let stream = device
         .build_output_stream(
@@ -205,6 +215,7 @@ fn build_stream_f32(
             },
             move |err| {
                 error!("Audio output error: {}", err);
+                stream_error.store(true, Ordering::Release);
             },
             None,
         )
@@ -221,6 +232,7 @@ fn build_stream_i16(
     mut consumer: HeapCons<f32>,
     sync: AudioSync,
     low_watermark: usize,
+    stream_error: Arc<AtomicBool>,
 ) -> EngineResult<Stream> {
     // Pre-allocate conversion buffer based on typical callback size
     // Will be resized if needed (rare)
@@ -257,6 +269,7 @@ fn build_stream_i16(
             },
             move |err| {
                 error!("Audio output error: {}", err);
+                stream_error.store(true, Ordering::Release);
             },
             None,
         )
@@ -273,6 +286,7 @@ fn build_stream_u16(
     mut consumer: HeapCons<f32>,
     sync: AudioSync,
     low_watermark: usize,
+    stream_error: Arc<AtomicBool>,
 ) -> EngineResult<Stream> {
     let mut temp_buffer: Vec<f32> = Vec::with_capacity(4096);
 
@@ -305,6 +319,7 @@ fn build_stream_u16(
             },
             move |err| {
                 error!("Audio output error: {}", err);
+                stream_error.store(true, Ordering::Release);
             },
             None,
         )
