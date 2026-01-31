@@ -17,13 +17,8 @@ extension!(
     ],
     esm = [
         dir "web",
-        "01_dom_exception.js",
-        "02_event.js",
-        "02_html_element.js",
         "02_timers.js",
         "03_canvas.js",
-        "03_abort_signal.js",
-        "04_global_interfaces.js",
         "06_stream.js",
         "12_location.js",
         "12_performance.js",

@@ -7,7 +7,6 @@ import {
     op_clear_image_cache,
     op_get_image_cache_stats
 } from "ext:core/ops";
-import { HTMLElement } from "ext:host_v8_web/02_html_element.js";
 
 const { SafeFinalizationRegistry } = primordials;
 
@@ -17,10 +16,8 @@ const registry = new SafeFinalizationRegistry((rid) => {
     } catch (_) { }
 });
 
-class Image extends HTMLElement {
+class Image {
     constructor() {
-        super("Image");
-
         this._src = "";
         this.width = 0;
         this.height = 0;

@@ -79,10 +79,7 @@ class AudioBufferSourceNode extends AudioNode {
 
   start(when = 0, offset = 0, duration) {
     if (this.#started) {
-      throw new DOMException(
-        "AudioBufferSourceNode can only be started once",
-        "InvalidStateError"
-      );
+      throw new Error("AudioBufferSourceNode can only be started once");
     }
     this.#started = true;
     // Use -1 to indicate no duration limit
@@ -91,10 +88,7 @@ class AudioBufferSourceNode extends AudioNode {
 
   stop(when = 0) {
     if (!this.#started) {
-      throw new DOMException(
-        "AudioBufferSourceNode has not been started",
-        "InvalidStateError"
-      );
+      throw new Error("AudioBufferSourceNode has not been started");
     }
     op_audio_stop(this._nodeId, when);
   }

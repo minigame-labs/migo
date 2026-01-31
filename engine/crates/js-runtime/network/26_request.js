@@ -1,7 +1,6 @@
 import { core, primordials } from "ext:core/mod.js";
 import { Header } from "ext:host_v8_network/24_header.js";
 import { RequestTask } from "ext:host_v8_network/25_request_task.js";
-import { add, AbortController } from "ext:host_v8_web/03_abort_signal.js";
 import { ReadableStream } from "ext:host_v8_web/06_stream.js";
 import { abortedNetworkError, Response, ErrorResponse, nullBodyStatus, Exception } from "ext:host_v8_network/25_response.js";
 import { op_fetch, op_fetch_send } from "ext:core/ops";
@@ -90,17 +89,14 @@ function request(options = {}) {
         timeout
     );
 
-    const terminator = new AbortController();
-    terminator.signal[add](async () => {
-        if (cancelHandleRid !== null) core.tryClose(cancelHandleRid);
-    });
+    const cancellation = { aborted: false, abort() { this.aborted = true; if (cancelHandleRid !== null) core.tryClose(cancelHandleRid); } };
 
-    const requestTask = new RequestTask(terminator);
+    const requestTask = new RequestTask(cancellation);
 
     (async () => {
         try {
             let resp = await op_fetch_send(requestRid);
-            if (terminator.signal.aborted) throw abortedNetworkError();
+            if (cancellation.aborted) throw abortedNetworkError();
 
             if (resp?.error) {
                 const error = new ErrorResponse(resp.status, new Exception(resp.status, resp.error, 0));
@@ -110,7 +106,6 @@ function request(options = {}) {
             }
 
             const header = new Header(resp.headers, resp.status);
-            // Trigger onheader received first
             requestTask._triggerHeadersReceived(header);
 
             const cbResp = new Response(header);
@@ -121,9 +116,6 @@ function request(options = {}) {
             } else {
                 try {
                     const rds = new ReadableStream(resp.responseRid);
-                    terminator.signal[add](async () => {
-                        rds.cancel();
-                    });
                     cbResp.data = fromBodyBuffer(await rds.readAll(), dataType, responseType);
                 } catch (err) {
                     const error = new ErrorResponse(500, new Exception(500, "read data failed: " + err, 0));
@@ -135,7 +127,7 @@ function request(options = {}) {
             success(cbResp);
             complete(cbResp);
         } catch (err) {
-            const error = terminator.signal.aborted ? abortedNetworkError() : new ErrorResponse(500, new Exception(500, err.message, 0));
+            const error = cancellation.aborted ? abortedNetworkError() : new ErrorResponse(500, new Exception(500, err.message, 0));
             fail(error);
             complete(error);
         } finally {

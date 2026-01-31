@@ -5,7 +5,6 @@ deno_core::extension!(
     host_v8_base,
     esm = [
         dir "base",
-        "00_base.js",
         "01_amdshim.js",
     ],
     options = {

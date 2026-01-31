@@ -143,10 +143,7 @@ class AudioContext extends BaseAudioContext {
 
   async resume() {
     if (this.state === "closed") {
-      throw new DOMException(
-        "Cannot resume a closed AudioContext",
-        "InvalidStateError"
-      );
+      throw new Error("Cannot resume a closed AudioContext");
     }
     // TODO: call native resume
     this._setState("running");
@@ -154,10 +151,7 @@ class AudioContext extends BaseAudioContext {
 
   async suspend() {
     if (this.state === "closed") {
-      throw new DOMException(
-        "Cannot suspend a closed AudioContext",
-        "InvalidStateError"
-      );
+      throw new Error("Cannot suspend a closed AudioContext");
     }
     // TODO: call native suspend
     this._setState("suspended");

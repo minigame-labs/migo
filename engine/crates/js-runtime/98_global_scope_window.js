@@ -1,6 +1,5 @@
 import * as alert from "ext:host_v8_console/01_alert.js";
 import * as url from "ext:host_v8_url/03_url.js";
-import * as globalInterfaces from "ext:host_v8_web/04_global_interfaces.js";
 import * as location from "ext:host_v8_web/12_location.js";
 import * as performance from "ext:host_v8_web/12_performance.js";
 import * as raf from "ext:host_v8_webgl/03_raf.js";
@@ -17,8 +16,6 @@ const WindowGlobalScope = {
     alert: core.propWritable(alert.alert),
     URL: core.propNonEnumerable(url.URL),
     location: core.propNonEnumerable(location.location),
-    Window: core.propNonEnumerable(globalInterfaces.Window),
-    Canvas: core.propNonEnumerable(canvas.Canvas),
     createCanvas: core.propNonEnumerable(canvas.createCanvas),
     requestAnimationFrame: core.propWritable(raf.requestAnimationFrame),
     cancelAnimationFrame: core.propWritable(raf.cancelAnimationFrame),
