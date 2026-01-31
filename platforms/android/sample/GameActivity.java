@@ -59,7 +59,16 @@ public class GameActivity extends Activity {
         surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override
             public void surfaceCreated(SurfaceHolder holder) {
-                initializeGame(holder);
+                if (session != null && session.isValid()) {
+                    // Surface recreated (e.g., returning from background).
+                    // Re-attach the new surface so the render thread can recreate
+                    // its EGL onscreen context.
+                    session.updateSurface(holder.getSurface());
+                    Log.d(TAG, "Surface recreated, updated session surface");
+                } else {
+                    // First-time initialization.
+                    initializeGame(holder);
+                }
             }
 
             @Override
@@ -72,7 +81,12 @@ public class GameActivity extends Activity {
 
             @Override
             public void surfaceDestroyed(SurfaceHolder holder) {
-                destroyGame();
+                // Do NOT destroy the session when the surface is lost.
+                // On Android, the surface is destroyed when the activity goes
+                // to background (onStop). The session is paused via onPause()
+                // and will be resumed when surfaceCreated is called again.
+                // Full cleanup happens in onDestroy().
+                Log.d(TAG, "Surface destroyed (session kept alive)");
             }
         });
         

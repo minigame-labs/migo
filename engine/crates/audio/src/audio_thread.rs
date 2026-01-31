@@ -232,12 +232,29 @@ fn run_audio_thread(
     // Get sync handle for callback-driven wakeup
     let sync = output.sync().clone();
 
+    // Pause state: when true, skip audio processing but still handle commands.
+    let mut paused = false;
+
     loop {
         // Process commands (non-blocking)
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 AudioCmd::Shutdown => {
                     return;
+                }
+
+                AudioCmd::PauseAll => {
+                    if !paused {
+                        paused = true;
+                        info!("AudioThread paused");
+                    }
+                }
+
+                AudioCmd::ResumeAll => {
+                    if paused {
+                        paused = false;
+                        info!("AudioThread resumed");
+                    }
                 }
 
                 AudioCmd::CreateContext {
@@ -681,6 +698,12 @@ fn run_audio_thread(
                     let _ = resp.send(Ok(Vec::new()));
                 }
             }
+        }
+
+        // When paused, skip all audio processing and wait for commands.
+        if paused {
+            wakeup.wait_timeout(Duration::from_millis(100));
+            continue;
         }
 
         // Poll streaming data for all players and cache completed downloads

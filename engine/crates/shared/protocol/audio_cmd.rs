@@ -232,6 +232,18 @@ pub enum AudioCmd {
     /// Shutdown the audio thread
     Shutdown,
 
+    /// Pause all audio processing (app going to background).
+    ///
+    /// Stops audio output and timeline advancement for all contexts and
+    /// InnerAudioContext players. The audio thread stays alive and continues
+    /// processing commands so it can receive `ResumeAll` or `Shutdown`.
+    PauseAll,
+
+    /// Resume all audio processing (app returning to foreground).
+    ///
+    /// Restarts audio output and timeline advancement.
+    ResumeAll,
+
     // ==================== InnerAudioContext ====================
     /// Create an InnerAudioContext (JS provides id, fire-and-forget)
     CreateInnerAudio {

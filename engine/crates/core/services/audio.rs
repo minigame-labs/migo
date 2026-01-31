@@ -20,6 +20,16 @@ impl AudioService {
         self.thread.sender()
     }
 
+    /// Pause all audio processing (app going to background).
+    pub(crate) fn pause(&self) {
+        let _ = self.sender().send(AudioCmd::PauseAll);
+    }
+
+    /// Resume all audio processing (app returning to foreground).
+    pub(crate) fn resume(&self) {
+        let _ = self.sender().send(AudioCmd::ResumeAll);
+    }
+
     pub(crate) fn shutdown(&mut self) {
         self.thread.shutdown();
     }

@@ -77,6 +77,7 @@ impl RenderThread {
                 let mut ticker: Receiver<Instant> = tick(Duration::from_secs_f32(1.0 / fps as f32));
                 let start_time = Instant::now();
                 let mut dirty = true;
+                let mut paused = false;
 
                 let mut canvas_handler = CanvasHandler::new();
                 let mut renderer_2d = Renderer2d::new();
@@ -98,7 +99,8 @@ impl RenderThread {
                                           renderer_gl: &mut RendererGL,
                                           fps: &mut u32,
                                           ticker: &mut Receiver<Instant>,
-                                          dirty: &mut bool|
+                                          dirty: &mut bool,
+                                          paused: &mut bool|
                  -> LoopCtl {
                     match cmd {
                         RenderCommand::Shutdown => {
@@ -167,6 +169,22 @@ impl RenderThread {
                             *dirty = true;
                         }
 
+                        RenderCommand::Pause => {
+                            if !*paused {
+                                *paused = true;
+                                *ticker = crossbeam_channel::never();
+                                info!("RenderThread paused");
+                            }
+                        }
+
+                        RenderCommand::Resume => {
+                            if *paused {
+                                *paused = false;
+                                *ticker = tick(Duration::from_secs_f32(1.0 / *fps as f32));
+                                info!("RenderThread resumed");
+                            }
+                        }
+
                         _ => {}
                     }
 
@@ -180,10 +198,11 @@ impl RenderThread {
                                       renderer_gl: &mut RendererGL,
                                       fps: &mut u32,
                                       ticker: &mut Receiver<Instant>,
-                                      dirty: &mut bool|
+                                      dirty: &mut bool,
+                                      paused: &mut bool|
                  -> LoopCtl {
                     while let Ok(cmd) = cmd_rx.try_recv() {
-                        match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, ticker, dirty) {
+                        match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, ticker, dirty, paused) {
                             LoopCtl::Continue => {}
                             LoopCtl::Shutdown => return LoopCtl::Shutdown,
                         }
@@ -203,7 +222,7 @@ impl RenderThread {
                             // ticker → drain frame N commands → swap frame N → RAF(N+1) sent
 
                             // 1) Drain all pending commands from the previous frame.
-                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty) {
+                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused) {
                                 LoopCtl::Continue => {}
                                 LoopCtl::Shutdown => return,
                             }
@@ -233,12 +252,12 @@ impl RenderThread {
                         recv(cmd_rx) -> msg => {
                             match msg {
                                 Ok(cmd) => {
-                                    match handle_one_cmd(cmd, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty) {
+                                    match handle_one_cmd(cmd, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused) {
                                         LoopCtl::Continue => {}
                                         LoopCtl::Shutdown => return,
                                     }
 
-                                    match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty) {
+                                    match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused) {
                                         LoopCtl::Continue => {}
                                         LoopCtl::Shutdown => return,
                                     }

@@ -46,7 +46,7 @@ public class MinimalActivity extends Activity implements SurfaceHolder.Callback 
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        if (session != null) { session.close(); session = null; }
+        if (session != null) {}
     }
 
     @Override protected void onPause() { super.onPause(); if (session != null) session.pause(); }

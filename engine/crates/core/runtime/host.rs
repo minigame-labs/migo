@@ -90,12 +90,28 @@ impl Host {
             HostCommand::EvalScript { source } => self.on_eval_script(source).await,
 
             HostCommand::OnShow => {
+                // Resume audio thread before notifying JS so the game can
+                // immediately start playing audio in its onShow callback.
+                //
+                // The render thread is NOT resumed here. On Android, onResume
+                // fires before surfaceCreated, so the old surface is already
+                // destroyed at this point. The render thread will be resumed
+                // when UpdateSurface arrives with the new valid surface.
+                self.audio.resume();
+
                 self.js
                     .exec_script_and_pump("onshow", "_internalTriggerOnShow()".to_string())
                     .await
             }
 
             HostCommand::OnHide => {
+                // Pause render and audio threads to save resources while backgrounded.
+                // The render thread stops its RAF ticker (no more frames).
+                // The audio thread stops processing (no audio output).
+                // The host/V8 thread stays alive for timers, network, etc.
+                self.render.pause();
+                self.audio.pause();
+
                 self.js
                     .exec_script_and_pump("onhide", "_internalTriggerOnHide()".to_string())
                     .await
@@ -167,6 +183,17 @@ impl Host {
     }
 
     fn on_update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
-        self.render.update_surface(surface)
+        let result = self.render.update_surface(surface);
+
+        // Resume the render thread after the surface is successfully recreated.
+        // This handles the Android lifecycle where onResume fires before
+        // surfaceCreated: OnHide pauses the render thread, and it stays paused
+        // until a valid surface arrives here. If the render thread wasn't paused
+        // (e.g., normal orientation change), resume() is a no-op.
+        if result.is_ok() {
+            self.render.resume();
+        }
+
+        result
     }
 }

@@ -168,6 +168,12 @@ impl CanvasManager {
     pub(crate) fn create_onscreen(&mut self, window: usize) -> EngineResult<()> {
         let id = CanvasId::from(1u32);
 
+        // Track whether a 2D context existed before destruction, so we can
+        // re-initialize it after the new EGL context is created. This is
+        // needed for Android resume: the surface is a different native window
+        // but the game's JS code still expects canvas_id=1 to work.
+        let mut had_2d_context = false;
+
         if let Some(entry) = self.canvases.get_mut(&id) {
             if matches!(entry.kind, SurfaceKind::Window(w) if w == window) && entry.info.is_onscreen
             {
@@ -203,6 +209,7 @@ impl CanvasManager {
                 return Ok(());
             }
 
+            had_2d_context = self.contexts_2d.contains_key(&id);
             self.destroy_onscreen_internal(id)?;
         }
 
@@ -276,6 +283,14 @@ impl CanvasManager {
                 .set_size(physical_w, physical_h, self.dpi.max(0.1));
         }
 
+        // Re-initialize the femtovg 2D context if one existed before the old
+        // onscreen was destroyed. This happens on Android resume where the
+        // surface is a different native window but the game's JS code still
+        // expects canvas_id=1's 2D context to work.
+        if had_2d_context && !self.contexts_2d.contains_key(&id) {
+            context_2d_impl::init_femtovg_for_canvas(self, id)?;
+        }
+
         Ok(())
     }
 
@@ -285,6 +300,9 @@ impl CanvasManager {
 
             self.contexts_2d.remove(&id);
             self.dirty_2d.remove(&id);
+            // Clear per-canvas femtovg image registrations so they get
+            // lazily re-registered in the new femtovg canvas on next DrawImage.
+            self.image_registry.remove_canvas_images(id);
 
             let _ = self.egl.destroy_surface(self.display, entry.ctx.surf);
             let _ = self.egl.destroy_context(self.display, entry.ctx.ctx);

@@ -69,6 +69,16 @@ impl RenderService {
         }
     }
 
+    /// Pause rendering (stop RAF ticker and frame presentation).
+    pub(crate) fn pause(&self) {
+        let _ = self.sender().send(RenderCommand::Pause);
+    }
+
+    /// Resume rendering (restart RAF ticker and frame presentation).
+    pub(crate) fn resume(&self) {
+        let _ = self.sender().send(RenderCommand::Resume);
+    }
+
     pub(crate) fn shutdown(&mut self) {
         self.thread.shutdown();
     }
