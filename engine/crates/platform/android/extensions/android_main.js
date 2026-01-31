@@ -13,6 +13,7 @@ import * as updateApp from "ext:host_v8_update/01_update_app.js"
 import * as updateMgr from "ext:host_v8_update/02_update_mgr.js"
 import * as lifeCycle from "ext:host_v8_lifecycle/01_lifecycle.js"
 import * as fileManager from "ext:host_v8_file_android/01_file_manager.js"
+import * as interaction from "ext:host_v8_ui/01_interaction.js"
 
 const { ObjectDefineProperties } = primordials;
 const properties = {
@@ -50,6 +51,13 @@ const properties = {
     _internalTriggerOnHide: core.propNonEnumerable(lifeCycle._internalTriggerOnHide),
     // File
     getFileSystemManager: core.propNonEnumerable(fileManager.getFileSystemManager),
+    // UI Interaction
+    showToast: core.propNonEnumerable(interaction.showToast),
+    hideToast: core.propNonEnumerable(interaction.hideToast),
+    showModal: core.propNonEnumerable(interaction.showModal),
+    _internalOnModalResult: core.propNonEnumerable(interaction._internalOnModalResult),
+    showLoading: core.propNonEnumerable(interaction.showLoading),
+    hideLoading: core.propNonEnumerable(interaction.hideLoading),
 };
 
 ObjectDefineProperties(globalThis, properties);

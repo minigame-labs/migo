@@ -384,3 +384,16 @@ pub(crate) extern "system" fn onAudioInterruptionEnd(
 ) {
     let _ = send_command_to_host(host_id, HostCommand::OnAudioInterruptionEnd);
 }
+
+pub(crate) extern "system" fn onModalResult<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    confirm: jint,
+    cancel: jint,
+) {
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnModalResult({},{});", confirm, cancel),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}

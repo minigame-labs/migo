@@ -122,9 +122,6 @@ public final class Permissions {
 
     /**
      * Get app authorization settings as JSON string.
-     * <p>
-     * Format matches wx.getAppAuthorizeSetting() protocol.
-     *
      * @param context The context (Activity or application Context)
      * @return JSON string with permission states
      */

@@ -7,6 +7,7 @@ import android.net.Uri;
 import android.provider.Settings;
 
 import com.migo.runtime.internal.platform.DeviceInfo;
+import com.migo.runtime.internal.platform.InteractionUI;
 import com.migo.runtime.internal.platform.DisplayCompat;
 import com.migo.runtime.internal.platform.Permissions;
 import com.migo.runtime.internal.platform.SystemSettings;
@@ -226,6 +227,82 @@ public final class NativeExports {
     public static String getDeviceInfoJson() {
         Context appContext = AppContext.getOrNull();
         return DeviceInfo.toJson(appContext);
+    }
+
+    // ==================== UI Interaction ====================
+
+    /**
+     * Show a toast overlay.
+     *
+     * @param sessionId The session ID
+     * @param json      JSON params: {title, icon, duration, mask}
+     */
+    public static void showToast(int sessionId, String json) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) return;
+        Activity activity = context.getActivity();
+        if (activity == null) return;
+        InteractionUI.showToast(activity, json);
+    }
+
+    /**
+     * Hide the current toast.
+     *
+     * @param sessionId The session ID
+     */
+    public static void hideToast(int sessionId) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) return;
+        Activity activity = context.getActivity();
+        if (activity == null) return;
+        InteractionUI.hideToast(activity);
+    }
+
+    /**
+     * Show a modal dialog.
+     *
+     * @param sessionId The session ID
+     * @param json      JSON params: {title, content, showCancel, cancelText, confirmText, cancelColor, confirmColor}
+     */
+    public static void showModal(int sessionId, String json) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) {
+            NativeMethods.onModalResult(sessionId, 0, 1);
+            return;
+        }
+        Activity activity = context.getActivity();
+        if (activity == null) {
+            NativeMethods.onModalResult(sessionId, 0, 1);
+            return;
+        }
+        InteractionUI.showModal(activity, sessionId, json);
+    }
+
+    /**
+     * Show a loading overlay.
+     *
+     * @param sessionId The session ID
+     * @param json      JSON params: {title, mask}
+     */
+    public static void showLoading(int sessionId, String json) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) return;
+        Activity activity = context.getActivity();
+        if (activity == null) return;
+        InteractionUI.showLoading(activity, json);
+    }
+
+    /**
+     * Hide the current loading overlay.
+     *
+     * @param sessionId The session ID
+     */
+    public static void hideLoading(int sessionId) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) return;
+        Activity activity = context.getActivity();
+        if (activity == null) return;
+        InteractionUI.hideLoading(activity);
     }
 
     // ==================== Permissions ====================

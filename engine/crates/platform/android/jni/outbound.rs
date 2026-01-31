@@ -197,3 +197,72 @@ pub fn get_app_authorization_setting_json() -> Result<String, String> {
         &[],
     )
 }
+
+// ==================== UI Interaction ====================
+
+/// Call a void Java static method with signature (int, String).
+fn call_void_with_string(method_name: &str, host_id: i32, json: &str) -> Result<(), String> {
+    with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = cache
+            .get_method_id(method_name)
+            .ok_or("Method ID not found")?;
+        let class = cache.class();
+
+        let jstr = env
+            .new_string(json)
+            .map_err(|e| format!("Failed to create Java string: {e}"))?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Primitive(Primitive::Void),
+                &[jvalue { i: host_id }, jvalue { l: jstr.into_raw() as *mut _ }],
+            )
+        };
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("Failed to call method '{method_name}': {e}"))
+            }
+        }
+    })
+}
+
+pub fn show_toast(host_id: i32, json: &str) -> Result<(), String> {
+    call_void_with_string("showToast", host_id, json)
+}
+
+pub fn hide_toast(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "hideToast",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn show_modal(host_id: i32, json: &str) -> Result<(), String> {
+    call_void_with_string("showModal", host_id, json)
+}
+
+pub fn show_loading(host_id: i32, json: &str) -> Result<(), String> {
+    call_void_with_string("showLoading", host_id, json)
+}
+
+pub fn hide_loading(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "hideLoading",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}

@@ -5,8 +5,8 @@ use tracing::info;
 
 use crate::android::jni::{
     JAVA_METHOD_CACHE, JavaMethodCache, init, mod_main, onAudioInterruptionBegin,
-    onAudioInterruptionEnd, onHide, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting,
-    onShow, onTouch, shutdown, updateSurface, version,
+    onAudioInterruptionEnd, onHide, onModalResult, onOpenAppAuthorizeSetting,
+    onOpenSystemBluetoothSetting, onShow, onTouch, shutdown, updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -78,6 +78,11 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(ILjava/lang/String;Ljava/lang/String;)I".into(),
                 fn_ptr: mod_main as *mut c_void,
             },
+            NativeMethod {
+                name: "onModalResult".into(),
+                sig: "(III)V".into(),
+                fn_ptr: onModalResult as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -99,6 +104,12 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("getSystemSettingInfoBytes", "()[B"),
         ("getDeviceInfoJson", "()Ljava/lang/String;"),
         ("getAppAuthorizationSettingJson", "()Ljava/lang/String;"),
+        // UI interaction
+        ("showToast", "(ILjava/lang/String;)V"),
+        ("hideToast", "(I)V"),
+        ("showModal", "(ILjava/lang/String;)V"),
+        ("showLoading", "(ILjava/lang/String;)V"),
+        ("hideLoading", "(I)V"),
     ];
 
     let global_class = env

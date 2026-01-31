@@ -134,4 +134,13 @@ public final class NativeBridge {
      * @param code      0 on success, negative on failure
      */
     public static native void onOpenAppAuthorizeSetting(int sessionId, int code);
+
+    /**
+     * Callback when modal dialog is dismissed.
+     *
+     * @param sessionId The session ID
+     * @param confirm   1 if user tapped confirm, 0 otherwise
+     * @param cancel    1 if user tapped cancel, 0 otherwise
+     */
+    public static native void onModalResult(int sessionId, int confirm, int cancel);
 }

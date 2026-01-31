@@ -245,4 +245,17 @@ public final class NativeMethods {
             NativeBridge.onOpenAppAuthorizeSetting(sessionId, code);
         }
     }
+
+    /**
+     * Callback for modal dialog result.
+     *
+     * @param sessionId The session ID
+     * @param confirm   1 if user tapped confirm, 0 otherwise
+     * @param cancel    1 if user tapped cancel, 0 otherwise
+     */
+    public static void onModalResult(int sessionId, int confirm, int cancel) {
+        if (sessionId >= 0) {
+            NativeBridge.onModalResult(sessionId, confirm, cancel);
+        }
+    }
 }
