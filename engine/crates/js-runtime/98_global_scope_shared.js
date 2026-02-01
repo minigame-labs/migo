@@ -1,5 +1,6 @@
 import * as amdshim from "ext:host_v8_base/01_amdshim.js"
 import * as console from "ext:host_v8_console/01_console.js"
+import * as event from "ext:host_v8_event/01_event.js"
 import * as timers from "ext:host_v8_web/02_timers.js";
 import * as request from "ext:host_v8_network/04_request.js";
 import * as download from "ext:host_v8_network/05_download.js";
@@ -16,6 +17,11 @@ const windowOrWorkerGlobalScope = {
     define: core.propNonEnumerable(amdshim.define),
 
     console: core.propNonEnumerable(console.console),
+
+    // Event
+    onError: core.propWritable(event.onError),
+    offError: core.propWritable(event.offError),
+
     // Timers
     setTimeout: core.propWritable(timers.setTimeout),
     clearTimeout: core.propWritable(timers.clearTimeout),
