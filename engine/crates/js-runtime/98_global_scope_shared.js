@@ -1,7 +1,9 @@
 import * as amdshim from "ext:host_v8_base/01_amdshim.js"
 import * as console from "ext:host_v8_console/01_console.js"
 import * as timers from "ext:host_v8_web/02_timers.js";
-import * as request from "ext:host_v8_network/26_request.js";
+import * as request from "ext:host_v8_network/04_request.js";
+import * as download from "ext:host_v8_network/05_download.js";
+import * as upload from "ext:host_v8_network/06_upload.js";
 import * as save from "ext:host_v8_file/01_save.js";
 import * as fileManager from "ext:host_v8_file/02_file_manager.js";
 import * as codec from "ext:host_v8_utility/01_codec.js";
@@ -23,6 +25,8 @@ const windowOrWorkerGlobalScope = {
 
     // Network
     request: core.propWritable(request.request),
+    downloadFile: core.propWritable(download.downloadFile),
+    uploadFile: core.propWritable(upload.uploadFile),
 
     // File
     saveFileToDisk: core.propNonEnumerable(save.saveFileToDisk),

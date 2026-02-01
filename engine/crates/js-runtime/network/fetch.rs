@@ -517,8 +517,10 @@ pub fn create_http_client(
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, user_agent.parse().unwrap());
     let mut builder = Client::builder()
-        .redirect(Policy::none())
-        .default_headers(headers);
+        .redirect(Policy::limited(10))
+        .default_headers(headers)
+        .pool_max_idle_per_host(5)
+        .pool_idle_timeout(Duration::from_secs(90));
 
     if let Some(pool_max_idle_per_host) = options.pool_max_idle_per_host {
         builder = builder.pool_max_idle_per_host(pool_max_idle_per_host);
@@ -531,4 +533,128 @@ pub fn create_http_client(
 
     builder = builder.http2_adaptive_window(true);
     builder.build().map_err(|e| e.into())
+}
+
+// ── Upload ──
+
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchUploadResult {
+    pub data: String,
+    pub status_code: u16,
+    pub headers: Vec<(ByteString, ByteString)>,
+    pub total_bytes_sent: u64,
+    pub error: Option<String>,
+}
+
+#[op2(async)]
+#[serde]
+#[allow(clippy::too_many_arguments)]
+pub async fn op_fetch_upload(
+    state: Rc<RefCell<OpState>>,
+    #[string] url: String,
+    #[buffer] file_data: JsBuffer,
+    #[string] name: String,
+    #[string] filename: String,
+    #[serde] headers: Vec<(ByteString, ByteString)>,
+    #[serde] form_data: Vec<(String, String)>,
+    #[smi] timeout: u32,
+) -> Result<FetchUploadResult, JsErrorBox> {
+    let client = {
+        let mut st = state.borrow_mut();
+        get_or_create_client_from_state(&mut st)
+            .map_err(|e| JsErrorBox::generic(e.to_string()))?
+    };
+
+    let file_bytes = file_data.to_vec();
+    let file_size = file_bytes.len() as u64;
+
+    // Guess MIME type from filename extension
+    let mime = match filename.rsplit('.').next().map(|e| e.to_lowercase()) {
+        Some(ext) => match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "mp3" => "audio/mpeg",
+            "mp4" => "video/mp4",
+            "wav" => "audio/wav",
+            "ogg" => "audio/ogg",
+            "json" => "application/json",
+            "xml" => "application/xml",
+            "txt" => "text/plain",
+            "zip" => "application/zip",
+            _ => "application/octet-stream",
+        },
+        None => "application/octet-stream",
+    };
+
+    // Build multipart form
+    let file_part = reqwest::multipart::Part::bytes(file_bytes)
+        .file_name(filename)
+        .mime_str(mime)
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    let mut form = reqwest::multipart::Form::new().part(name, file_part);
+
+    for (key, value) in form_data {
+        form = form.text(key, value);
+    }
+
+    // Parse URL
+    let parsed_url =
+        Url::parse(&url).map_err(|_| JsErrorBox::type_error("Invalid URL"))?;
+
+    debug!("Upload request: POST {}", parsed_url);
+
+    // Build request
+    let mut request = client
+        .post(parsed_url)
+        .timeout(Duration::from_millis(timeout as u64))
+        .multipart(form);
+
+    // Apply custom headers (skip Content-Type as reqwest sets it for multipart)
+    let mut header_map = HeaderMap::new();
+    for (key, value) in headers {
+        let hname = HeaderName::from_bytes(&key)
+            .map_err(|_| JsErrorBox::type_error("Invalid Header"))?;
+        let hval = HeaderValue::from_bytes(&value)
+            .map_err(|_| JsErrorBox::type_error("Invalid Header Value"))?;
+        // Skip Content-Type and Content-Length for multipart (reqwest manages these)
+        if hname != http::header::CONTENT_TYPE && hname != CONTENT_LENGTH {
+            header_map.append(hname, hval);
+        }
+    }
+    request = request.headers(header_map);
+
+    // Send request
+    let res = match request.send().await {
+        Ok(res) => res,
+        Err(err) => {
+            return Ok(FetchUploadResult {
+                error: Some(err.to_string()),
+                ..Default::default()
+            });
+        }
+    };
+
+    // Extract response
+    let status = res.status().as_u16();
+    let mut res_headers = Vec::new();
+    for (key, val) in res.headers().iter() {
+        res_headers.push((key.as_str().into(), val.as_bytes().into()));
+    }
+
+    let body = res
+        .text()
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    Ok(FetchUploadResult {
+        data: body,
+        status_code: status,
+        headers: res_headers,
+        total_bytes_sent: file_size,
+        error: None,
+    })
 }

@@ -1,0 +1,221 @@
+import { core, primordials } from "ext:core/mod.js";
+import { Header } from "ext:host_v8_network/01_header.js";
+import { NetworkTask } from "ext:host_v8_network/03_task.js";
+import {
+    DownloadResponse, DownloadErrorResponse, Exception, abortedNetworkError,
+} from "ext:host_v8_network/02_response.js";
+import {
+    op_fetch, op_fetch_send,
+    op_open_file, op_write_file, op_close_file,
+} from "ext:core/ops";
+
+const { TypeError } = primordials;
+
+// -- DownloadTask --
+
+class DownloadTask extends NetworkTask {
+    constructor(terminator) {
+        super(terminator);
+        this._progressListeners = [];
+    }
+
+    _onCleanup() {
+        this._progressListeners = [];
+    }
+
+    onProgressUpdate(listener) {
+        if (typeof listener !== 'function') {
+            throw new TypeError('Listener must be a function');
+        }
+        if (this._aborted) {
+            return;
+        }
+        this._progressListeners.push(listener);
+    }
+
+    offProgressUpdate(listener) {
+        if (listener === undefined) {
+            this._progressListeners = [];
+            return;
+        }
+        if (typeof listener !== 'function') {
+            return;
+        }
+        const index = this._progressListeners.indexOf(listener);
+        if (index !== -1) {
+            this._progressListeners.splice(index, 1);
+        }
+    }
+
+    _triggerProgress(progress, totalBytesWritten, totalBytesExpectedToWrite) {
+        if (this._aborted) {
+            return;
+        }
+        const data = { progress, totalBytesWritten, totalBytesExpectedToWrite };
+        for (const listener of this._progressListeners) {
+            try {
+                listener(data);
+            } catch (error) {
+                console.error('Error in progress listener:', error);
+            }
+        }
+    }
+}
+
+// -- Helpers --
+
+let _dlCounter = 0;
+
+function generateTempFilePath() {
+    const id = (++_dlCounter).toString(36) + '_' + Date.now().toString(36);
+    return `/tmp/dl_${id}`;
+}
+
+function makeError(errno, msg) {
+    return new DownloadErrorResponse(errno, new Exception(errno, msg, 0));
+}
+
+// Progress throttle interval (ms)
+const PROGRESS_INTERVAL = 100;
+// Read chunk size
+const CHUNK_SIZE = 64 * 1024;
+
+// -- downloadFile() --
+
+function downloadFile(options = {}) {
+    const {
+        url, filePath, header = {}, timeout = 60000,
+        success = () => {}, fail = () => {}, complete = () => {}
+    } = options;
+
+    // Validate URL
+    if (!url || typeof url !== 'string') {
+        const error = makeError(0, "downloadFile:fail invalid url");
+        queueMicrotask(() => { fail(error); complete(error); });
+        return new DownloadTask(null);
+    }
+
+    const targetPath = filePath || generateTempFilePath();
+    const headers = Object.entries(header).map(([key, value]) => [key, String(value)]);
+
+    // Create fetch request (GET, no body)
+    let requestRid, cancelHandleRid;
+    try {
+        const result = op_fetch("GET", url, headers, null, false, null, null, timeout);
+        requestRid = result.requestRid;
+        cancelHandleRid = result.cancelHandleRid;
+    } catch (err) {
+        const error = makeError(0, "downloadFile:fail " + err.message);
+        queueMicrotask(() => { fail(error); complete(error); });
+        return new DownloadTask(null);
+    }
+
+    const cancellation = {
+        aborted: false,
+        abort() {
+            this.aborted = true;
+            if (cancelHandleRid !== null) core.tryClose(cancelHandleRid);
+        }
+    };
+
+    const downloadTask = new DownloadTask(cancellation);
+
+    (async () => {
+        let fd = null;
+        try {
+            // Send request and wait for response headers
+            const resp = await op_fetch_send(requestRid);
+            if (cancellation.aborted) throw "aborted";
+
+            if (resp?.error) {
+                const error = makeError(resp.status, resp.error);
+                fail(error);
+                complete(error);
+                return;
+            }
+
+            const statusCode = resp.status;
+            const respHeader = new Header(resp.headers, statusCode);
+            downloadTask._triggerHeadersReceived(respHeader);
+
+            const totalBytes = resp.contentLength || 0;
+
+            // Open target file for writing (truncate-create)
+            fd = await op_open_file(targetPath, "w");
+
+            // Stream response body to file chunk by chunk
+            let bytesWritten = 0;
+            let lastProgressTime = 0;
+            const buffer = new Uint8Array(CHUNK_SIZE);
+
+            while (true) {
+                if (cancellation.aborted) {
+                    core.tryClose(resp.responseRid);
+                    throw "aborted";
+                }
+
+                const bytesRead = await core.read(resp.responseRid, buffer);
+                if (bytesRead === 0) {
+                    break;
+                }
+
+                const chunk = buffer.subarray(0, bytesRead);
+
+                // Write chunk to file at current position
+                await op_write_file(fd, chunk, null, null, null);
+
+                bytesWritten += bytesRead;
+
+                // Throttled progress reporting
+                const now = Date.now();
+                if (now - lastProgressTime >= PROGRESS_INTERVAL) {
+                    const progress = totalBytes > 0
+                        ? Math.min(100, Math.round((bytesWritten / totalBytes) * 100))
+                        : 0;
+                    downloadTask._triggerProgress(progress, bytesWritten, totalBytes);
+                    lastProgressTime = now;
+                }
+            }
+
+            core.tryClose(resp.responseRid);
+
+            // Close file
+            await op_close_file(fd);
+            fd = null;
+
+            // Final progress at 100%
+            const finalTotal = totalBytes || bytesWritten;
+            downloadTask._triggerProgress(100, bytesWritten, finalTotal);
+
+            const result = new DownloadResponse(
+                filePath ? undefined : targetPath,  // tempFilePath only when no explicit filePath
+                filePath || undefined,
+                statusCode
+            );
+            success(result);
+            complete(result);
+
+        } catch (err) {
+            // Clean up file descriptor on error
+            if (fd !== null) {
+                try { await op_close_file(fd); } catch (_) {}
+            }
+
+            if (cancellation.aborted || err === "aborted") {
+                const error = abortedNetworkError();
+                fail(error);
+                complete(error);
+            } else {
+                const error = makeError(500, "downloadFile:fail " + (err.message || err));
+                fail(error);
+                complete(error);
+            }
+        } finally {
+            if (cancelHandleRid !== null) core.tryClose(cancelHandleRid);
+        }
+    })();
+
+    return downloadTask;
+}
+
+export { downloadFile };

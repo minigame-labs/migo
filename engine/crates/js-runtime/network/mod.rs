@@ -1,6 +1,6 @@
 use deno_core::extension;
 
-use crate::network::fetch::{op_fetch, op_fetch_send};
+use crate::network::fetch::{op_fetch, op_fetch_send, op_fetch_upload};
 
 mod fetch;
 
@@ -19,13 +19,15 @@ impl Default for Options {
 
 extension!(host_v8_network,
   deps = [host_v8_console, host_v8_web, host_v8_base],
-  ops = [op_fetch, op_fetch_send],
+  ops = [op_fetch, op_fetch_send, op_fetch_upload],
   esm = [
      dir "network",
-     "24_header.js",
-     "25_request_task.js",
-     "25_response.js",
-     "26_request.js"
+     "01_header.js",
+     "02_response.js",
+     "03_task.js",
+     "04_request.js",
+     "05_download.js",
+     "06_upload.js",
   ],
   options = {
     options: Options,
