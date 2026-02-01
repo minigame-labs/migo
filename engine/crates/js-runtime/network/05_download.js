@@ -85,6 +85,7 @@ const CHUNK_SIZE = 64 * 1024;
 function downloadFile(options = {}) {
     const {
         url, filePath, header = {}, timeout = 60000,
+        enableHttp2 = false,
         success = () => {}, fail = () => {}, complete = () => {}
     } = options;
 
@@ -101,7 +102,7 @@ function downloadFile(options = {}) {
     // Create fetch request (GET, no body)
     let requestRid, cancelHandleRid;
     try {
-        const result = op_fetch("GET", url, headers, null, false, null, null, timeout, false, false);
+        const result = op_fetch("GET", url, headers, null, false, null, null, timeout, enableHttp2, false);
         requestRid = result.requestRid;
         cancelHandleRid = result.cancelHandleRid;
     } catch (err) {

@@ -76,6 +76,7 @@ function uploadFile(options = {}) {
     const {
         url, filePath, name, header = {}, formData = {},
         timeout = 60000,
+        enableHttp2 = false,
         success = () => {}, fail = () => {}, complete = () => {}
     } = options;
 
@@ -125,6 +126,7 @@ function uploadFile(options = {}) {
                 headers,
                 formEntries,
                 timeout,
+                enableHttp2,
             );
 
             if (cancellation.aborted) throw "aborted";

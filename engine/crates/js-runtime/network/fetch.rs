@@ -564,10 +564,11 @@ pub async fn op_fetch_upload(
     #[serde] headers: Vec<(ByteString, ByteString)>,
     #[serde] form_data: Vec<(String, String)>,
     #[smi] timeout: u32,
+    enable_http2: bool,
 ) -> Result<FetchUploadResult, JsErrorBox> {
     let client = {
         let mut st = state.borrow_mut();
-        get_or_create_client_from_state(&mut st, false)
+        get_or_create_client_from_state(&mut st, enable_http2)
             .map_err(|e| JsErrorBox::generic(e.to_string()))?
     };
 
