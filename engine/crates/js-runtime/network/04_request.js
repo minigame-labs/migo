@@ -14,8 +14,8 @@ const {
 
 // -- Constants --
 
-const KNOWN_METHODS = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]);
-const NO_BODY_METHODS = new Set(["GET", "HEAD"]);
+const KNOWN_METHODS = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE", "CONNECT"]);
+const NO_BODY_METHODS = new Set(["GET", "HEAD", "TRACE", "CONNECT"]);
 
 // -- RequestTask --
 
