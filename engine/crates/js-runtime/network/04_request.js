@@ -190,6 +190,7 @@ function request(options = {}) {
         dataType = 'json', responseType = 'text',
         enableHttp2 = false, enableQuic = false,
         enableCache = false, enableHttpDNS = false,
+        enableChunked = false,
         success = () => {}, fail = () => {}, complete = () => {}
     } = options;
 
@@ -270,7 +271,31 @@ function request(options = {}) {
             } else {
                 try {
                     const rds = new ReadableStream(resp.responseRid);
-                    const bodyBytes = await rds.readAll();
+                    let bodyBytes;
+
+                    if (enableChunked) {
+                        const chunks = [];
+                        const buffer = new Uint8Array(64 * 1024);
+                        await rds.pull(buffer, (chunk) => {
+                            if (chunk === undefined) return;
+                            const chunkCopy = new Uint8Array(chunk);
+                            requestTask._triggerChunkReceived({ data: chunkCopy.buffer });
+                            chunks.push(chunkCopy);
+                        });
+
+                        const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
+                        if (totalLen > 0) {
+                            bodyBytes = new Uint8Array(totalLen);
+                            let offset = 0;
+                            for (const chunk of chunks) {
+                                bodyBytes.set(chunk, offset);
+                                offset += chunk.length;
+                            }
+                        }
+                    } else {
+                        bodyBytes = await rds.readAll();
+                    }
+
                     if (bodyBytes != null) {
                         cbResp.data = fromBodyBuffer(bodyBytes, dataType, responseType);
                     }
