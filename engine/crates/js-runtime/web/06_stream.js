@@ -33,7 +33,7 @@ class ReadableStream {
     if (this._pulling || this._closed) return;
     this._pulling = true;
 
-    const bytesRead = await core.read(this._rid, buffer);
+    let bytesRead = await core.read(this._rid, buffer);
     while (bytesRead > 0) {
       if (this._closed) {
         return;

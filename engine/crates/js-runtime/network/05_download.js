@@ -101,7 +101,7 @@ function downloadFile(options = {}) {
     // Create fetch request (GET, no body)
     let requestRid, cancelHandleRid;
     try {
-        const result = op_fetch("GET", url, headers, null, false, null, null, timeout);
+        const result = op_fetch("GET", url, headers, null, false, null, null, timeout, false, false);
         requestRid = result.requestRid;
         cancelHandleRid = result.cancelHandleRid;
     } catch (err) {

@@ -227,7 +227,9 @@ function request(options = {}) {
             reqBody !== null || reqRid !== null,
             reqBody,
             reqRid,
-            timeout
+            timeout,
+            enableHttp2,
+            enableCache
         );
         requestRid = result.requestRid;
         cancelHandleRid = result.cancelHandleRid;

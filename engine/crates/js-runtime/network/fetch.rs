@@ -36,8 +36,10 @@ use http::HeaderName;
 use http::HeaderValue;
 use http::Uri;
 use http::header::ACCEPT_ENCODING;
+use http::header::CACHE_CONTROL;
 use http::header::CONTENT_LENGTH;
 use http::header::HOST;
+use http::header::PRAGMA;
 use http::header::RANGE;
 use http::header::USER_AGENT;
 use reqwest::Body;
@@ -156,25 +158,35 @@ impl Default for FetchResponseReader {
     }
 }
 
-pub fn get_or_create_client_from_state(state: &mut OpState) -> Result<reqwest::Client, AnyError> {
-    if let Some(client) = state.try_borrow::<reqwest::Client>() {
-        Ok(client.clone())
-    } else {
-        let options = state.borrow::<Options>();
-        let client = create_client_from_options(options)?;
-        state.put::<reqwest::Client>(client.clone());
-        Ok(client)
-    }
-}
+/// Cached HTTP/1.1-only client
+struct Http1Client(Client);
 
-pub fn create_client_from_options(options: &Options) -> Result<reqwest::Client, AnyError> {
-    create_http_client(
-        &options.user_agent,
-        CreateHttpClientOptions {
-            pool_max_idle_per_host: None,
-            pool_idle_timeout: None,
-        },
-    )
+/// Cached HTTP/2-capable client
+struct Http2Client(Client);
+
+pub fn get_or_create_client_from_state(
+    state: &mut OpState,
+    enable_http2: bool,
+) -> Result<reqwest::Client, AnyError> {
+    if enable_http2 {
+        if let Some(client) = state.try_borrow::<Http2Client>() {
+            Ok(client.0.clone())
+        } else {
+            let options = state.borrow::<Options>();
+            let client = create_http_client(&options.user_agent, true)?;
+            state.put::<Http2Client>(Http2Client(client.clone()));
+            Ok(client)
+        }
+    } else {
+        if let Some(client) = state.try_borrow::<Http1Client>() {
+            Ok(client.0.clone())
+        } else {
+            let options = state.borrow::<Options>();
+            let client = create_http_client(&options.user_agent, false)?;
+            state.put::<Http1Client>(Http1Client(client.clone()));
+            Ok(client)
+        }
+    }
 }
 
 #[op2]
@@ -190,6 +202,8 @@ pub fn op_fetch(
     #[buffer] data: Option<JsBuffer>,
     #[smi] resource: Option<ResourceId>,
     #[smi] timeout: u32,
+    enable_http2: bool,
+    enable_cache: bool,
 ) -> Result<FetchReturn, JsErrorBox> {
     let (client, allow_host) = if let Some(rid) = client_rid {
         let r = state
@@ -199,7 +213,7 @@ pub fn op_fetch(
         (r.client.clone(), r.allow_host)
     } else {
         (
-            get_or_create_client_from_state(state)
+            get_or_create_client_from_state(state, enable_http2)
                 .map_err(|_e| JsErrorBox::generic("Failed to create HTTP client"))?,
             false,
         )
@@ -279,6 +293,16 @@ pub fn op_fetch(
             if header_map.contains_key(RANGE) {
                 header_map.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
             }
+
+            if !enable_cache {
+                if !header_map.contains_key(CACHE_CONTROL) {
+                    header_map.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+                }
+                if !header_map.contains_key(PRAGMA) {
+                    header_map.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+                }
+            }
+
             request = request.headers(header_map);
 
             let cancel_handle = CancelHandle::new_rc();
@@ -495,24 +519,9 @@ pub async fn op_fetch_send(
     })
 }
 
-#[derive(Debug, Clone)]
-pub struct CreateHttpClientOptions {
-    pub pool_max_idle_per_host: Option<usize>,
-    pub pool_idle_timeout: Option<Option<u64>>,
-}
-
-impl Default for CreateHttpClientOptions {
-    fn default() -> Self {
-        CreateHttpClientOptions {
-            pool_max_idle_per_host: None,
-            pool_idle_timeout: None,
-        }
-    }
-}
-
 pub fn create_http_client(
     user_agent: &str,
-    options: CreateHttpClientOptions,
+    enable_http2: bool,
 ) -> Result<Client, AnyError> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, user_agent.parse().unwrap());
@@ -522,16 +531,12 @@ pub fn create_http_client(
         .pool_max_idle_per_host(5)
         .pool_idle_timeout(Duration::from_secs(90));
 
-    if let Some(pool_max_idle_per_host) = options.pool_max_idle_per_host {
-        builder = builder.pool_max_idle_per_host(pool_max_idle_per_host);
+    if enable_http2 {
+        builder = builder.http2_adaptive_window(true);
+    } else {
+        builder = builder.http1_only();
     }
 
-    if let Some(pool_idle_timeout) = options.pool_idle_timeout {
-        builder =
-            builder.pool_idle_timeout(pool_idle_timeout.map(std::time::Duration::from_millis));
-    }
-
-    builder = builder.http2_adaptive_window(true);
     builder.build().map_err(|e| e.into())
 }
 
@@ -562,7 +567,7 @@ pub async fn op_fetch_upload(
 ) -> Result<FetchUploadResult, JsErrorBox> {
     let client = {
         let mut st = state.borrow_mut();
-        get_or_create_client_from_state(&mut st)
+        get_or_create_client_from_state(&mut st, false)
             .map_err(|e| JsErrorBox::generic(e.to_string()))?
     };
 
