@@ -10,17 +10,49 @@ ObjectDefineProperties(globalThis, WindowGlobalScope);
 globalThis.GameGlobal = globalThis;
 globalThis.migo = globalThis;
 
+// TODO: move to a sperate folder
+const _errorListeners = [];
+
+function onError(listener) {
+    if (typeof listener === 'function') {
+        _errorListeners.push(listener);
+    }
+}
+
+function offError(listener) {
+    if (listener === undefined) {
+        _errorListeners.length = 0;
+        return;
+    }
+    if (typeof listener === 'function') {
+        const index = _errorListeners.indexOf(listener);
+        if (index !== -1) {
+            _errorListeners.splice(index, 1);
+        }
+    }
+}
+
+globalThis.onError = onError;
+globalThis.offError = offError;
+
+// -- Unhandled promise rejection handler --
+
 core.setUnhandledPromiseRejectionHandler(processUnhandledPromiseRejection);
 core.setHandledPromiseRejectionHandler(processRejectionHandled);
 
-// Notification that the core received an unhandled promise rejection that is about to
-// terminate the runtime. If we can handle it, attempt to do so.
 function processUnhandledPromiseRejection(promise, reason) {
-  // TODO: proxy to migo.onUnhandledPromiseRejection
-   console.log(reason);
-   return false;
+    const message = reason instanceof Error
+        ? (reason.stack || reason.message || String(reason))
+        : String(reason);
+    console.error(message);
+    for (const listener of _errorListeners) {
+        try {
+            listener(message);
+        } catch (_) {}
+    }
+    return true;
 }
 
 function processRejectionHandled(promise, reason) {
-  console.log(reason);
+    console.log(reason);
 }
