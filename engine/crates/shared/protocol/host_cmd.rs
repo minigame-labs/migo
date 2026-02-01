@@ -89,6 +89,13 @@ pub enum HostCommand {
         source: String,
     },
 
+    /// Restart the current game runtime.
+    ///
+    /// Re-initializes the JS runtime and re-loads the last evaluated module
+    /// (or does nothing if none has been evaluated). This is analogous to
+    /// mini-program “restart” behavior.
+    Restart,
+
     /// Gracefully shut down the host thread.
     ///
     /// This triggers cleanup of all resources and terminates the event loop.

@@ -23,6 +23,12 @@ pub(crate) struct Host {
     pub(crate) render: RenderService,
 
     pub(crate) js: HostJsRuntime,
+
+    platform: Arc<dyn PlatformServices>,
+    init_options: InitOptions,
+
+    last_game_id: Option<String>,
+    last_entry: Option<String>,
 }
 
 impl Drop for Host {
@@ -73,7 +79,17 @@ impl Host {
         // ---- JS runtime + bindings cache ----
         let js = HostJsRuntime::new(id as i32, host_state, extra_ext, module_loader);
 
-        Ok(Self { id, render, io, audio, js })
+        Ok(Self {
+            id,
+            render,
+            io,
+            audio,
+            js,
+            platform,
+            init_options,
+            last_game_id: None,
+            last_entry: None,
+        })
     }
 
     pub(crate) async fn handle_command(&mut self, cmd: HostCommand) {
@@ -88,6 +104,8 @@ impl Host {
                 self.on_evaluate_module(game_id, entry).await
             }
             HostCommand::EvalScript { source } => self.on_eval_script(source).await,
+
+            HostCommand::Restart => self.on_restart().await,
 
             HostCommand::OnShow => {
                 // Resume audio thread before notifying JS so the game can
@@ -168,6 +186,9 @@ impl Host {
     }
 
     async fn on_evaluate_module(&mut self, game_id: String, entry: String) -> EngineResult<()> {
+        self.last_game_id = Some(game_id.clone());
+        self.last_entry = Some(entry.clone());
+
         self.js.evaluate_module(game_id, entry).await?;
 
         self.js
@@ -195,5 +216,43 @@ impl Host {
         }
 
         result
+    }
+
+    async fn on_restart(&mut self) -> EngineResult<()> {
+        // Pause subsystems to ensure a clean restart
+        self.render.pause();
+        self.audio.pause();
+
+        // Recreate JS runtime with fresh state
+        let (files_dir, cache_dir) = self.js.get_base_dirs();
+
+        let host_state = HostOpState {
+            id: self.id,
+            code_dir: None,
+            game_paths: None,
+            vfs: None,
+            app_cache_dir: cache_dir,
+            app_files_dir: files_dir,
+            render_tx: self.render.sender(),
+            io_tx: self.io.sender(),
+            audio_tx: self.audio.sender(),
+        };
+
+        let module_loader: Option<Rc<dyn ModuleLoader>> =
+            Some(Rc::new(MyModuleLoader(FsModuleLoader)));
+
+        let extra_ext = self.platform.extensions(&self.init_options);
+
+        self.js = HostJsRuntime::new(self.id as i32, host_state, extra_ext, module_loader);
+
+        // If we have a last evaluated module, reload it
+        if let (Some(game_id), Some(entry)) = (self.last_game_id.clone(), self.last_entry.clone()) {
+            self.on_evaluate_module(game_id, entry).await?;
+        }
+
+        // Resume audio; render will resume upon surface update if needed
+        self.audio.resume();
+
+        Ok(())
     }
 }
