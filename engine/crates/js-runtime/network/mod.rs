@@ -1,8 +1,10 @@
 use deno_core::extension;
 
 use crate::network::fetch::{op_fetch, op_fetch_send, op_fetch_upload};
+use crate::network::websocket::{op_ws_create, op_ws_next_event, op_ws_send, op_ws_close};
 
 mod fetch;
+mod websocket;
 
 #[derive(Clone)]
 struct Options {
@@ -19,7 +21,10 @@ impl Default for Options {
 
 extension!(host_v8_network,
   deps = [host_v8_console, host_v8_web, host_v8_base],
-  ops = [op_fetch, op_fetch_send, op_fetch_upload],
+  ops = [
+    op_fetch, op_fetch_send, op_fetch_upload,
+    op_ws_create, op_ws_next_event, op_ws_send, op_ws_close,
+  ],
   esm = [
      dir "network",
      "01_header.js",
@@ -28,6 +33,7 @@ extension!(host_v8_network,
      "04_request.js",
      "05_download.js",
      "06_upload.js",
+     "07_websocket.js",
   ],
   options = {
     options: Options,

@@ -5,6 +5,7 @@ import * as timers from "ext:host_v8_web/02_timers.js";
 import * as request from "ext:host_v8_network/04_request.js";
 import * as download from "ext:host_v8_network/05_download.js";
 import * as upload from "ext:host_v8_network/06_upload.js";
+import * as websocket from "ext:host_v8_network/07_websocket.js";
 import * as save from "ext:host_v8_file/01_save.js";
 import * as fileManager from "ext:host_v8_file/02_file_manager.js";
 import * as codec from "ext:host_v8_utility/01_codec.js";
@@ -33,6 +34,19 @@ const windowOrWorkerGlobalScope = {
     request: core.propWritable(request.request),
     downloadFile: core.propWritable(download.downloadFile),
     uploadFile: core.propWritable(upload.uploadFile),
+
+    // WebSocket
+    connectSocket: core.propWritable(websocket.connectSocket),
+    sendSocketMessage: core.propWritable(websocket.sendSocketMessage),
+    closeSocket: core.propWritable(websocket.closeSocket),
+    onSocketOpen: core.propWritable(websocket.onSocketOpen),
+    offSocketOpen: core.propWritable(websocket.offSocketOpen),
+    onSocketMessage: core.propWritable(websocket.onSocketMessage),
+    offSocketMessage: core.propWritable(websocket.offSocketMessage),
+    onSocketError: core.propWritable(websocket.onSocketError),
+    offSocketError: core.propWritable(websocket.offSocketError),
+    onSocketClose: core.propWritable(websocket.onSocketClose),
+    offSocketClose: core.propWritable(websocket.offSocketClose),
 
     // File
     saveFileToDisk: core.propNonEnumerable(save.saveFileToDisk),
