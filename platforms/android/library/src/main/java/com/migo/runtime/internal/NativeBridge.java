@@ -181,4 +181,13 @@ public final class NativeBridge {
      * @param value     One of: "portrait", "landscape", "landscapeReverse"
      */
     public static native void onDeviceOrientationChange(int sessionId, String value);
+
+    /**
+     * Callback when compass data is available.
+     *
+     * @param sessionId The session ID
+     * @param direction Direction in degrees (0-360, 0 = north)
+     * @param accuracy  Accuracy string: "high", "medium", "low", "no-contact", "unreliable"
+     */
+    public static native void onCompassChange(int sessionId, double direction, String accuracy);
 }

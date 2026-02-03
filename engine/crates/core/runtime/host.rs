@@ -218,6 +218,21 @@ impl Host {
                     .await
             }
 
+            HostCommand::OnCompassChange {
+                direction,
+                accuracy,
+            } => {
+                self.js
+                    .exec_script_and_pump(
+                        "compass",
+                        format!(
+                            "_internalTriggerCompassChange({},'{}')",
+                            direction, accuracy
+                        ),
+                    )
+                    .await
+            }
+
             _ => Ok(()),
         }
     }

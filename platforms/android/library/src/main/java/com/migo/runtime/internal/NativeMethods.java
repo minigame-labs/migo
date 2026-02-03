@@ -314,4 +314,17 @@ public final class NativeMethods {
             NativeBridge.onDeviceOrientationChange(sessionId, value);
         }
     }
+
+    /**
+     * Callback for compass data.
+     *
+     * @param sessionId The session ID
+     * @param direction Direction in degrees (0-360, 0 = north)
+     * @param accuracy  Accuracy string: "high", "medium", "low", "no-contact", "unreliable", or "unknow X"
+     */
+    public static void onCompassChange(int sessionId, double direction, String accuracy) {
+        if (sessionId >= 0) {
+            NativeBridge.onCompassChange(sessionId, direction, accuracy);
+        }
+    }
 }

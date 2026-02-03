@@ -187,6 +187,16 @@ pub enum HostCommand {
         /// One of: "portrait", "landscape", "landscapeReverse".
         value: String,
     },
+
+    /// Compass data (direction and accuracy).
+    ///
+    /// Sent by the platform compass listener (~5 times/second).
+    OnCompassChange {
+        /// Direction in degrees (0-360, 0 = north).
+        direction: f64,
+        /// Accuracy string (Android: "high"/"medium"/"low"/"no-contact"/"unreliable").
+        accuracy: String,
+    },
 }
 
 /// Event types for InnerAudioContext.

@@ -463,3 +463,23 @@ pub(crate) extern "system" fn onDeviceOrientationChange<'local>(
         HostCommand::OnDeviceOrientationChange { value: val },
     );
 }
+
+pub(crate) extern "system" fn onCompassChange<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    direction: jdouble,
+    accuracy: JString<'local>,
+) {
+    let acc = env
+        .get_string(&accuracy)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "unknow".to_string());
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnCompassChange {
+            direction: direction as f64,
+            accuracy: acc,
+        },
+    );
+}

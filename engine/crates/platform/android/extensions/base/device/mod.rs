@@ -74,6 +74,18 @@ pub fn op_set_device_orientation(state: &mut OpState, #[string] value: String) -
     set_device_orientation(host.id, &value).map_err(|e| JsErrorBox::generic(e))
 }
 
+#[op2(fast)]
+pub fn op_start_compass(state: &mut OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    start_compass(host.id).map_err(|e| JsErrorBox::generic(e))
+}
+
+#[op2(fast)]
+pub fn op_stop_compass(state: &mut OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    stop_compass(host.id).map_err(|e| JsErrorBox::generic(e))
+}
+
 extension!(host_v8_device_android,
     deps = [host_v8_device],
     ops = [
@@ -88,6 +100,8 @@ extension!(host_v8_device_android,
         op_set_screen_brightness,
         op_set_keep_screen_on,
         op_set_device_orientation,
+        op_start_compass,
+        op_stop_compass,
     ],
     esm = [
         dir "android/extensions/base/device",
@@ -95,6 +109,7 @@ extension!(host_v8_device_android,
         "02_battery.js",
         "03_vibrate.js",
         "04_screen.js",
+        "05_compass.js",
     ]
 );
 

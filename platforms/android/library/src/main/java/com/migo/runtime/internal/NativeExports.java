@@ -519,6 +519,32 @@ public final class NativeExports {
     }
 
     /**
+     * Start listening for compass events.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     */
+    public static void startCompass(int sessionId) {
+        DeviceSensorManager mgr = getOrCreateSensorManager(sessionId);
+        if (mgr != null) {
+            mgr.startCompass();
+        }
+    }
+
+    /**
+     * Stop listening for compass events.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     */
+    public static void stopCompass(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.stopCompass();
+        }
+    }
+
+    /**
      * Clean up sensor resources for a session. Call on session shutdown.
      *
      * @param sessionId The session ID

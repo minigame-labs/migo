@@ -18,6 +18,7 @@ import * as deviceSensor from "ext:host_v8_device_android/01_device_sensor.js"
 import * as battery from "ext:host_v8_device_android/02_battery.js"
 import * as vibrate from "ext:host_v8_device_android/03_vibrate.js"
 import * as screen from "ext:host_v8_device_android/04_screen.js"
+import * as compassOps from "ext:host_v8_device_android/05_compass.js"
 
 const { ObjectDefineProperties } = primordials;
 const properties = {
@@ -80,6 +81,9 @@ const properties = {
     setScreenBrightness: core.propNonEnumerable(screen.setScreenBrightness),
     setKeepScreenOn: core.propNonEnumerable(screen.setKeepScreenOn),
     setDeviceOrientation: core.propNonEnumerable(screen.setDeviceOrientation),
+    // Compass
+    startCompass: core.propNonEnumerable(compassOps.startCompass),
+    stopCompass: core.propNonEnumerable(compassOps.stopCompass),
 };
 
 ObjectDefineProperties(globalThis, properties);

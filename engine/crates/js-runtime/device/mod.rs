@@ -8,6 +8,7 @@ deno_core::extension!(
         "01_device_motion.js",
         "02_gyroscope.js",
         "03_orientation.js",
+        "04_compass.js",
     ]
 );
 

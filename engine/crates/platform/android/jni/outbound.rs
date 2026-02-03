@@ -432,3 +432,23 @@ pub fn stop_gyroscope(host_id: i32) -> Result<(), String> {
         &[jvalue { i: host_id }],
     )
 }
+
+// ==================== Compass ====================
+
+pub fn start_compass(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "startCompass",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn stop_compass(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "stopCompass",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}

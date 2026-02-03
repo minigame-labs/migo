@@ -12,6 +12,7 @@ import * as audioInterruption from 'ext:host_v8_audio/03_audio_interruption.js';
 import * as deviceMotion from 'ext:host_v8_device/01_device_motion.js';
 import * as gyroscope from 'ext:host_v8_device/02_gyroscope.js';
 import * as orientation from 'ext:host_v8_device/03_orientation.js';
+import * as compass from 'ext:host_v8_device/04_compass.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -75,6 +76,11 @@ const WindowGlobalScope = {
     onDeviceOrientationChange: core.propNonEnumerable(orientation.onDeviceOrientationChange),
     offDeviceOrientationChange: core.propNonEnumerable(orientation.offDeviceOrientationChange),
     _internalTriggerDeviceOrientationChange: core.propNonEnumerable(orientation._internalTriggerDeviceOrientationChange),
+
+    // Compass
+    onCompassChange: core.propNonEnumerable(compass.onCompassChange),
+    offCompassChange: core.propNonEnumerable(compass.offCompassChange),
+    _internalTriggerCompassChange: core.propNonEnumerable(compass._internalTriggerCompassChange),
 };
 
 export { WindowGlobalScope };

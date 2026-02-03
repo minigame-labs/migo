@@ -36,6 +36,7 @@ public final class DeviceSensorManager {
 
     private SensorEventListener motionListener;
     private SensorEventListener gyroscopeListener;
+    private SensorEventListener compassListener;
 
     public DeviceSensorManager(int sessionId, Context context) {
         this.sessionId = sessionId;
@@ -157,6 +158,115 @@ public final class DeviceSensorManager {
         }
     }
 
+    // ==================== Compass ====================
+
+    /**
+     * Start listening for compass (magnetic field + accelerometer) events.
+     * <p>
+     * Reports direction in degrees (0-360) and accuracy level.
+     * Uses TYPE_ORIENTATION sensor for simplicity (deprecated but widely supported),
+     * or falls back to TYPE_MAGNETIC_FIELD + TYPE_ACCELEROMETER.
+     * <p>
+     * Frequency: ~5 times/second (200ms interval, SENSOR_DELAY_NORMAL).
+     */
+    public void startCompass() {
+        if (sensorManager == null) return;
+        stopCompass();
+
+        // Use TYPE_ORIENTATION for simplicity (deprecated but still works)
+        Sensor orientationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ORIENTATION);
+        if (orientationSensor != null) {
+            compassListener = new SensorEventListener() {
+                @Override
+                public void onSensorChanged(SensorEvent event) {
+                    // event.values[0] = azimuth (direction, 0-360 degrees)
+                    double direction = event.values[0];
+                    // Accuracy as string for Android
+                    String accuracy = mapAccuracy(event.accuracy);
+                    NativeMethods.onCompassChange(sessionId, direction, accuracy);
+                }
+
+                @Override
+                public void onAccuracyChanged(Sensor sensor, int accuracy) {
+                }
+            };
+            // ~5 times/second = 200ms = SENSOR_DELAY_NORMAL
+            sensorManager.registerListener(compassListener, orientationSensor, SensorManager.SENSOR_DELAY_NORMAL);
+            return;
+        }
+
+        // Fallback: Use magnetic field + accelerometer
+        final Sensor magneticSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
+        final Sensor accelerometerSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+        if (magneticSensor == null || accelerometerSensor == null) return;
+
+        compassListener = new SensorEventListener() {
+            private final float[] gravity = new float[3];
+            private final float[] geomagnetic = new float[3];
+            private final float[] rotationMatrix = new float[9];
+            private final float[] orientation = new float[3];
+            private int currentAccuracy = SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM;
+
+            @Override
+            public void onSensorChanged(SensorEvent event) {
+                if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
+                    System.arraycopy(event.values, 0, gravity, 0, 3);
+                } else if (event.sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD) {
+                    System.arraycopy(event.values, 0, geomagnetic, 0, 3);
+                    currentAccuracy = event.accuracy;
+                }
+
+                if (SensorManager.getRotationMatrix(rotationMatrix, null, gravity, geomagnetic)) {
+                    SensorManager.getOrientation(rotationMatrix, orientation);
+                    double direction = Math.toDegrees(orientation[0]);
+                    if (direction < 0) direction += 360.0;
+                    String accuracy = mapAccuracy(currentAccuracy);
+                    NativeMethods.onCompassChange(sessionId, direction, accuracy);
+                }
+            }
+
+            @Override
+            public void onAccuracyChanged(Sensor sensor, int accuracy) {
+                if (sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD) {
+                    currentAccuracy = accuracy;
+                }
+            }
+        };
+
+        sensorManager.registerListener(compassListener, magneticSensor, SensorManager.SENSOR_DELAY_NORMAL);
+        sensorManager.registerListener(compassListener, accelerometerSensor, SensorManager.SENSOR_DELAY_NORMAL);
+    }
+
+    /**
+     * Stop listening for compass events.
+     */
+    public void stopCompass() {
+        if (sensorManager != null && compassListener != null) {
+            sensorManager.unregisterListener(compassListener);
+            compassListener = null;
+        }
+    }
+
+    /**
+     * Map Android sensor accuracy to spec string.
+     */
+    private static String mapAccuracy(int accuracy) {
+        switch (accuracy) {
+            case SensorManager.SENSOR_STATUS_ACCURACY_HIGH:
+                return "high";
+            case SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM:
+                return "medium";
+            case SensorManager.SENSOR_STATUS_ACCURACY_LOW:
+                return "low";
+            case SensorManager.SENSOR_STATUS_NO_CONTACT:
+                return "no-contact";
+            case SensorManager.SENSOR_STATUS_UNRELIABLE:
+                return "unreliable";
+            default:
+                return "unknow " + accuracy;
+        }
+    }
+
     // ==================== Cleanup ====================
 
     /**
@@ -165,6 +275,7 @@ public final class DeviceSensorManager {
     public void destroy() {
         stopDeviceMotionListening();
         stopGyroscope();
+        stopCompass();
     }
 
     // ==================== Internal ====================
