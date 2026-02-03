@@ -289,6 +289,57 @@ pub fn get_battery_info_json() -> Result<String, String> {
     )
 }
 
+// ==================== Vibration ====================
+
+/// Trigger a short vibration with intensity type.
+/// Returns 0 on success, -1 if unavailable, -2 if type not supported.
+pub fn vibrate_short(vibrate_type: &str) -> Result<i32, String> {
+    with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = cache
+            .get_method_id("vibrateShort")
+            .ok_or("Method ID not found for vibrateShort")?;
+        let class = cache.class();
+
+        let jstr = env
+            .new_string(vibrate_type)
+            .map_err(|e| format!("Failed to create Java string: {e}"))?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Primitive(Primitive::Int),
+                &[jvalue { l: jstr.into_raw() as *mut _ }],
+            )
+        };
+
+        match result {
+            Ok(val) => Ok(val.i().unwrap_or(-1)),
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("Failed to call vibrateShort: {e}"))
+            }
+        }
+    })
+}
+
+/// Trigger a long vibration.
+/// Returns 0 on success, -1 if unavailable.
+pub fn vibrate_long() -> Result<i32, String> {
+    call_static_method(
+        "vibrateLong",
+        ReturnType::Primitive(Primitive::Int),
+        |_env, val| Ok(val.i().unwrap_or(-1)),
+        &[],
+    )
+}
+
 // ==================== Device Sensor ====================
 
 pub fn start_device_motion(host_id: i32, interval: &str) -> Result<(), String> {

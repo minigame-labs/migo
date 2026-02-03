@@ -16,6 +16,7 @@ import * as fileManager from "ext:host_v8_file_android/01_file_manager.js"
 import * as interaction from "ext:host_v8_ui/01_interaction.js"
 import * as deviceSensor from "ext:host_v8_device_android/01_device_sensor.js"
 import * as battery from "ext:host_v8_device_android/02_battery.js"
+import * as vibrate from "ext:host_v8_device_android/03_vibrate.js"
 
 const { ObjectDefineProperties } = primordials;
 const properties = {
@@ -70,6 +71,9 @@ const properties = {
     // Battery
     getBatteryInfo: core.propNonEnumerable(battery.getBatteryInfo),
     getBatteryInfoSync: core.propNonEnumerable(battery.getBatteryInfoSync),
+    // Vibration
+    vibrateShort: core.propNonEnumerable(vibrate.vibrateShort),
+    vibrateLong: core.propNonEnumerable(vibrate.vibrateLong),
 };
 
 ObjectDefineProperties(globalThis, properties);

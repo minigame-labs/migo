@@ -13,6 +13,7 @@ import com.migo.runtime.internal.platform.InteractionUI;
 import com.migo.runtime.internal.platform.DisplayCompat;
 import com.migo.runtime.internal.platform.Permissions;
 import com.migo.runtime.internal.platform.SystemSettings;
+import com.migo.runtime.internal.platform.Vibrator;
 
 import java.io.File;
 import java.nio.ByteBuffer;
@@ -246,6 +247,29 @@ public final class NativeExports {
     public static String getBatteryInfoJson() {
         Context appContext = AppContext.getOrNull();
         return BatteryInfo.toJson(appContext);
+    }
+
+    // ==================== Vibration ====================
+
+    /**
+     * Trigger a short vibration (15ms).
+     *
+     * @param type Vibration type: "heavy", "medium", or "light"
+     * @return 0 on success, -1 if unavailable, -2 if type not supported
+     */
+    public static int vibrateShort(String type) {
+        Context appContext = AppContext.getOrNull();
+        return Vibrator.vibrateShort(appContext, type);
+    }
+
+    /**
+     * Trigger a long vibration (400ms).
+     *
+     * @return 0 on success, -1 if unavailable
+     */
+    public static int vibrateLong() {
+        Context appContext = AppContext.getOrNull();
+        return Vibrator.vibrateLong(appContext);
     }
 
     // ==================== UI Interaction ====================

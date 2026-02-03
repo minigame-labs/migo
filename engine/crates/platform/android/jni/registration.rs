@@ -135,6 +135,9 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("showActionSheet", "(ILjava/lang/String;)V"),
         // Battery
         ("getBatteryInfoJson", "()Ljava/lang/String;"),
+        // Vibration
+        ("vibrateShort", "(Ljava/lang/String;)I"),
+        ("vibrateLong", "()I"),
         // Device sensor
         ("startDeviceMotionListening", "(ILjava/lang/String;)V"),
         ("stopDeviceMotionListening", "(I)V"),

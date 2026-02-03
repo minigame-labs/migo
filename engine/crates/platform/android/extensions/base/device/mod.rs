@@ -40,6 +40,16 @@ pub fn op_get_battery_info(_: &mut OpState) -> Result<String, JsErrorBox> {
     get_battery_info_json().map_err(|e| JsErrorBox::generic(e))
 }
 
+#[op2(fast)]
+pub fn op_vibrate_short(_: &mut OpState, #[string] vibrate_type: String) -> Result<i32, JsErrorBox> {
+    vibrate_short(&vibrate_type).map_err(|e| JsErrorBox::generic(e))
+}
+
+#[op2(fast)]
+pub fn op_vibrate_long(_: &mut OpState) -> Result<i32, JsErrorBox> {
+    vibrate_long().map_err(|e| JsErrorBox::generic(e))
+}
+
 extension!(host_v8_device_android,
     deps = [host_v8_device],
     ops = [
@@ -48,11 +58,14 @@ extension!(host_v8_device_android,
         op_start_gyroscope,
         op_stop_gyroscope,
         op_get_battery_info,
+        op_vibrate_short,
+        op_vibrate_long,
     ],
     esm = [
         dir "android/extensions/base/device",
         "01_device_sensor.js",
         "02_battery.js",
+        "03_vibrate.js",
     ]
 );
 
