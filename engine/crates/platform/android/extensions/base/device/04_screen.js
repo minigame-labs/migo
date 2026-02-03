@@ -2,6 +2,7 @@ import {
     op_get_screen_brightness,
     op_set_screen_brightness,
     op_set_keep_screen_on,
+    op_set_device_orientation,
 } from "ext:core/ops";
 import { wrapAsync } from "ext:host_v8_base/02_async.js";
 
@@ -52,4 +53,27 @@ function setKeepScreenOn(options = {}) {
     }, options);
 }
 
-export { getScreenBrightness, setScreenBrightness, setKeepScreenOn };
+function setDeviceOrientation(options = {}) {
+    const { value } = options;
+    if (value !== 'landscape' && value !== 'portrait') {
+        const res = { errMsg: 'setDeviceOrientation:fail value must be "landscape" or "portrait"' };
+        if (typeof options.fail === 'function') {
+            queueMicrotask(function () { options.fail(res); });
+        }
+        if (typeof options.complete === 'function') {
+            queueMicrotask(function () { options.complete(res); });
+        }
+        return Promise.reject(res);
+    }
+    return wrapAsync('setDeviceOrientation', function () {
+        const code = op_set_device_orientation(value);
+        if (code === -2) {
+            throw new Error('invalid orientation value');
+        }
+        if (code !== 0) {
+            throw new Error('failed to set device orientation');
+        }
+    }, options);
+}
+
+export { getScreenBrightness, setScreenBrightness, setKeepScreenOn, setDeviceOrientation };

@@ -68,6 +68,12 @@ pub fn op_set_keep_screen_on(state: &mut OpState, keep_on: bool) -> Result<i32, 
     set_keep_screen_on(host.id, keep_on).map_err(|e| JsErrorBox::generic(e))
 }
 
+#[op2(fast)]
+pub fn op_set_device_orientation(state: &mut OpState, #[string] value: String) -> Result<i32, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    set_device_orientation(host.id, &value).map_err(|e| JsErrorBox::generic(e))
+}
+
 extension!(host_v8_device_android,
     deps = [host_v8_device],
     ops = [
@@ -81,6 +87,7 @@ extension!(host_v8_device_android,
         op_get_screen_brightness,
         op_set_screen_brightness,
         op_set_keep_screen_on,
+        op_set_device_orientation,
     ],
     esm = [
         dir "android/extensions/base/device",

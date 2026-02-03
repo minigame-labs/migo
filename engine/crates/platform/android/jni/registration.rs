@@ -142,6 +142,7 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("getScreenBrightness", "(I)F"),
         ("setScreenBrightness", "(IF)I"),
         ("setKeepScreenOn", "(IZ)I"),
+        ("setDeviceOrientation", "(ILjava/lang/String;)I"),
         // Device sensor
         ("startDeviceMotionListening", "(ILjava/lang/String;)V"),
         ("stopDeviceMotionListening", "(I)V"),

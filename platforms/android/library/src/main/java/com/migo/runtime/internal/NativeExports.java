@@ -316,6 +316,20 @@ public final class NativeExports {
         return ScreenBrightness.setKeepScreenOn(activity, keepScreenOn);
     }
 
+    /**
+     * Set device orientation (landscape or portrait).
+     *
+     * @param sessionId The session ID
+     * @param value     "landscape" or "portrait"
+     * @return 0 on success, -1 on failure, -2 if value is invalid
+     */
+    public static int setDeviceOrientation(int sessionId, String value) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) return -1;
+        Activity activity = context.getActivity();
+        return ScreenBrightness.setDeviceOrientation(activity, value);
+    }
+
     // ==================== UI Interaction ====================
 
     /**

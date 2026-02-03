@@ -79,6 +79,7 @@ const properties = {
     getScreenBrightness: core.propNonEnumerable(screen.getScreenBrightness),
     setScreenBrightness: core.propNonEnumerable(screen.setScreenBrightness),
     setKeepScreenOn: core.propNonEnumerable(screen.setKeepScreenOn),
+    setDeviceOrientation: core.propNonEnumerable(screen.setDeviceOrientation),
 };
 
 ObjectDefineProperties(globalThis, properties);

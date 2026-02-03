@@ -369,6 +369,42 @@ pub fn set_keep_screen_on(host_id: i32, keep_on: bool) -> Result<i32, String> {
     )
 }
 
+pub fn set_device_orientation(host_id: i32, value: &str) -> Result<i32, String> {
+    with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = cache
+            .get_method_id("setDeviceOrientation")
+            .ok_or("Method ID not found for setDeviceOrientation")?;
+        let class = cache.class();
+
+        let jstr = env
+            .new_string(value)
+            .map_err(|e| format!("Failed to create Java string: {e}"))?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Primitive(Primitive::Int),
+                &[jvalue { i: host_id }, jvalue { l: jstr.into_raw() as *mut _ }],
+            )
+        };
+
+        match result {
+            Ok(val) => Ok(val.i().unwrap_or(-1)),
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("Failed to call setDeviceOrientation: {e}"))
+            }
+        }
+    })
+}
+
 // ==================== Device Sensor ====================
 
 pub fn start_device_motion(host_id: i32, interval: &str) -> Result<(), String> {
