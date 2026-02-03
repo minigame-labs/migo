@@ -452,3 +452,18 @@ pub fn stop_compass(host_id: i32) -> Result<(), String> {
         &[jvalue { i: host_id }],
     )
 }
+
+// ==================== Accelerometer ====================
+
+pub fn start_accelerometer(host_id: i32, interval: &str) -> Result<(), String> {
+    call_void_with_string("startAccelerometer", host_id, interval)
+}
+
+pub fn stop_accelerometer(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "stopAccelerometer",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}

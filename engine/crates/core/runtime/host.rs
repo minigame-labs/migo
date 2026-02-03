@@ -233,6 +233,15 @@ impl Host {
                     .await
             }
 
+            HostCommand::OnAccelerometerChange { x, y, z } => {
+                self.js
+                    .exec_script_and_pump(
+                        "accelerometer",
+                        format!("_internalTriggerAccelerometerChange({},{},{})", x, y, z),
+                    )
+                    .await
+            }
+
             _ => Ok(()),
         }
     }

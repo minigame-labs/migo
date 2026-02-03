@@ -483,3 +483,21 @@ pub(crate) extern "system" fn onCompassChange<'local>(
         },
     );
 }
+
+pub(crate) extern "system" fn onAccelerometerChange(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    x: jdouble,
+    y: jdouble,
+    z: jdouble,
+) {
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnAccelerometerChange {
+            x: x as f64,
+            y: y as f64,
+            z: z as f64,
+        },
+    );
+}

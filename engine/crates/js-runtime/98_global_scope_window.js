@@ -13,6 +13,7 @@ import * as deviceMotion from 'ext:host_v8_device/01_device_motion.js';
 import * as gyroscope from 'ext:host_v8_device/02_gyroscope.js';
 import * as orientation from 'ext:host_v8_device/03_orientation.js';
 import * as compass from 'ext:host_v8_device/04_compass.js';
+import * as accelerometer from 'ext:host_v8_device/05_accelerometer.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -81,6 +82,11 @@ const WindowGlobalScope = {
     onCompassChange: core.propNonEnumerable(compass.onCompassChange),
     offCompassChange: core.propNonEnumerable(compass.offCompassChange),
     _internalTriggerCompassChange: core.propNonEnumerable(compass._internalTriggerCompassChange),
+
+    // Accelerometer
+    onAccelerometerChange: core.propNonEnumerable(accelerometer.onAccelerometerChange),
+    offAccelerometerChange: core.propNonEnumerable(accelerometer.offAccelerometerChange),
+    _internalTriggerAccelerometerChange: core.propNonEnumerable(accelerometer._internalTriggerAccelerometerChange),
 };
 
 export { WindowGlobalScope };

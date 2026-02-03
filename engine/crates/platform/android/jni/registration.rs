@@ -5,8 +5,8 @@ use tracing::info;
 
 use crate::android::jni::{
     JAVA_METHOD_CACHE, JavaMethodCache, init, mod_main, onAudioInterruptionBegin,
-    onAudioInterruptionEnd, onCompassChange, onDeviceMotionChange, onDeviceOrientationChange,
-    onGyroscopeChange, onHide, onModalResult, onActionSheetResult,
+    onAudioInterruptionEnd, onAccelerometerChange, onCompassChange, onDeviceMotionChange,
+    onDeviceOrientationChange, onGyroscopeChange, onHide, onModalResult, onActionSheetResult,
     onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting, onShow, onTouch, shutdown,
     updateSurface, version,
 };
@@ -110,6 +110,11 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(IDLjava/lang/String;)V".into(),
                 fn_ptr: onCompassChange as *mut c_void,
             },
+            NativeMethod {
+                name: "onAccelerometerChange".into(),
+                sig: "(IDDD)V".into(),
+                fn_ptr: onAccelerometerChange as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -156,6 +161,9 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         // Compass
         ("startCompass", "(I)V"),
         ("stopCompass", "(I)V"),
+        // Accelerometer
+        ("startAccelerometer", "(ILjava/lang/String;)V"),
+        ("stopAccelerometer", "(I)V"),
     ];
 
     let global_class = env

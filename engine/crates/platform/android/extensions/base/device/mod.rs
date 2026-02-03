@@ -86,6 +86,21 @@ pub fn op_stop_compass(state: &mut OpState) -> Result<(), JsErrorBox> {
     stop_compass(host.id).map_err(|e| JsErrorBox::generic(e))
 }
 
+#[op2(fast)]
+pub fn op_start_accelerometer(
+    state: &mut OpState,
+    #[string] interval: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    start_accelerometer(host.id, &interval).map_err(|e| JsErrorBox::generic(e))
+}
+
+#[op2(fast)]
+pub fn op_stop_accelerometer(state: &mut OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    stop_accelerometer(host.id).map_err(|e| JsErrorBox::generic(e))
+}
+
 extension!(host_v8_device_android,
     deps = [host_v8_device],
     ops = [
@@ -102,6 +117,8 @@ extension!(host_v8_device_android,
         op_set_device_orientation,
         op_start_compass,
         op_stop_compass,
+        op_start_accelerometer,
+        op_stop_accelerometer,
     ],
     esm = [
         dir "android/extensions/base/device",
@@ -110,6 +127,7 @@ extension!(host_v8_device_android,
         "03_vibrate.js",
         "04_screen.js",
         "05_compass.js",
+        "06_accelerometer.js",
     ]
 );
 

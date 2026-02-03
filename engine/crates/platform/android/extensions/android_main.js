@@ -19,6 +19,7 @@ import * as battery from "ext:host_v8_device_android/02_battery.js"
 import * as vibrate from "ext:host_v8_device_android/03_vibrate.js"
 import * as screen from "ext:host_v8_device_android/04_screen.js"
 import * as compassOps from "ext:host_v8_device_android/05_compass.js"
+import * as accelerometerOps from "ext:host_v8_device_android/06_accelerometer.js"
 
 const { ObjectDefineProperties } = primordials;
 const properties = {
@@ -84,6 +85,9 @@ const properties = {
     // Compass
     startCompass: core.propNonEnumerable(compassOps.startCompass),
     stopCompass: core.propNonEnumerable(compassOps.stopCompass),
+    // Accelerometer
+    startAccelerometer: core.propNonEnumerable(accelerometerOps.startAccelerometer),
+    stopAccelerometer: core.propNonEnumerable(accelerometerOps.stopAccelerometer),
 };
 
 ObjectDefineProperties(globalThis, properties);

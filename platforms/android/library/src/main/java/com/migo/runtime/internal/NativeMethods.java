@@ -327,4 +327,19 @@ public final class NativeMethods {
             NativeBridge.onCompassChange(sessionId, direction, accuracy);
         }
     }
+
+    /**
+     * Callback for accelerometer data.
+     * Called from {@link com.migo.runtime.internal.platform.DeviceSensorManager}.
+     *
+     * @param sessionId The session ID
+     * @param x         Acceleration along X axis in m/s^2
+     * @param y         Acceleration along Y axis in m/s^2
+     * @param z         Acceleration along Z axis in m/s^2
+     */
+    public static void onAccelerometerChange(int sessionId, double x, double y, double z) {
+        if (sessionId >= 0) {
+            NativeBridge.onAccelerometerChange(sessionId, x, y, z);
+        }
+    }
 }

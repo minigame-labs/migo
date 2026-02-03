@@ -190,4 +190,14 @@ public final class NativeBridge {
      * @param accuracy  Accuracy string: "high", "medium", "low", "no-contact", "unreliable"
      */
     public static native void onCompassChange(int sessionId, double direction, String accuracy);
+
+    /**
+     * Callback when accelerometer data is available.
+     *
+     * @param sessionId The session ID
+     * @param x         Acceleration along X axis in m/s^2
+     * @param y         Acceleration along Y axis in m/s^2
+     * @param z         Acceleration along Z axis in m/s^2
+     */
+    public static native void onAccelerometerChange(int sessionId, double x, double y, double z);
 }

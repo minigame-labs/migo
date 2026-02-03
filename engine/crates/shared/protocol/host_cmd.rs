@@ -197,6 +197,18 @@ pub enum HostCommand {
         /// Accuracy string (Android: "high"/"medium"/"low"/"no-contact"/"unreliable").
         accuracy: String,
     },
+
+    /// Accelerometer data (acceleration in m/s^2).
+    ///
+    /// Sent by the platform accelerometer listener at the requested interval.
+    OnAccelerometerChange {
+        /// Acceleration along X axis in m/s^2.
+        x: f64,
+        /// Acceleration along Y axis in m/s^2.
+        y: f64,
+        /// Acceleration along Z axis in m/s^2.
+        z: f64,
+    },
 }
 
 /// Event types for InnerAudioContext.

@@ -545,6 +545,33 @@ public final class NativeExports {
     }
 
     /**
+     * Start listening for accelerometer events.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     * @param interval  "game", "ui", or "normal"
+     */
+    public static void startAccelerometer(int sessionId, String interval) {
+        DeviceSensorManager mgr = getOrCreateSensorManager(sessionId);
+        if (mgr != null) {
+            mgr.startAccelerometer(interval);
+        }
+    }
+
+    /**
+     * Stop listening for accelerometer events.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     */
+    public static void stopAccelerometer(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.stopAccelerometer();
+        }
+    }
+
+    /**
      * Clean up sensor resources for a session. Call on session shutdown.
      *
      * @param sessionId The session ID

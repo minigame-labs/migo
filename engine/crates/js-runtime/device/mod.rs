@@ -9,6 +9,7 @@ deno_core::extension!(
         "02_gyroscope.js",
         "03_orientation.js",
         "04_compass.js",
+        "05_accelerometer.js",
     ]
 );
 

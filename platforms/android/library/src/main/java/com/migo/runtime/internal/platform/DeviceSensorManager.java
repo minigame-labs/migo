@@ -37,6 +37,7 @@ public final class DeviceSensorManager {
     private SensorEventListener motionListener;
     private SensorEventListener gyroscopeListener;
     private SensorEventListener compassListener;
+    private SensorEventListener accelerometerListener;
 
     public DeviceSensorManager(int sessionId, Context context) {
         this.sessionId = sessionId;
@@ -267,6 +268,53 @@ public final class DeviceSensorManager {
         }
     }
 
+    // ==================== Accelerometer ====================
+
+    /**
+     * Start listening for accelerometer events.
+     * <p>
+     * Reports acceleration in m/s^2 along x, y, z axes (including gravity).
+     *
+     * @param interval "game", "ui", or "normal"
+     */
+    public void startAccelerometer(String interval) {
+        if (sensorManager == null) return;
+        stopAccelerometer();
+
+        Sensor sensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+        if (sensor == null) return;
+
+        final int delay = parseInterval(interval);
+
+        accelerometerListener = new SensorEventListener() {
+            @Override
+            public void onSensorChanged(SensorEvent event) {
+                NativeMethods.onAccelerometerChange(
+                        sessionId,
+                        event.values[0],
+                        event.values[1],
+                        event.values[2]
+                );
+            }
+
+            @Override
+            public void onAccuracyChanged(Sensor sensor, int accuracy) {
+            }
+        };
+
+        sensorManager.registerListener(accelerometerListener, sensor, delay);
+    }
+
+    /**
+     * Stop listening for accelerometer events.
+     */
+    public void stopAccelerometer() {
+        if (sensorManager != null && accelerometerListener != null) {
+            sensorManager.unregisterListener(accelerometerListener);
+            accelerometerListener = null;
+        }
+    }
+
     // ==================== Cleanup ====================
 
     /**
@@ -276,6 +324,7 @@ public final class DeviceSensorManager {
         stopDeviceMotionListening();
         stopGyroscope();
         stopCompass();
+        stopAccelerometer();
     }
 
     // ==================== Internal ====================
