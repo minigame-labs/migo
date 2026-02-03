@@ -181,6 +181,43 @@ impl Host {
                 Ok(())
             }
 
+            HostCommand::OnDeviceMotionChange {
+                alpha,
+                beta,
+                gamma,
+            } => {
+                self.js
+                    .exec_script_and_pump(
+                        "device_motion",
+                        format!(
+                            "_internalTriggerDeviceMotionChange({},{},{})",
+                            alpha, beta, gamma
+                        ),
+                    )
+                    .await
+            }
+
+            HostCommand::OnGyroscopeChange { x, y, z } => {
+                self.js
+                    .exec_script_and_pump(
+                        "gyroscope",
+                        format!("_internalTriggerGyroscopeChange({},{},{})", x, y, z),
+                    )
+                    .await
+            }
+
+            HostCommand::OnDeviceOrientationChange { value } => {
+                self.js
+                    .exec_script_and_pump(
+                        "device_orientation",
+                        format!(
+                            "_internalTriggerDeviceOrientationChange('{}')",
+                            value
+                        ),
+                    )
+                    .await
+            }
+
             _ => Ok(()),
         }
     }

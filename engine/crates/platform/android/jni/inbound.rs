@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use jni::objects::{JByteBuffer, JClass, JObject, JString};
-use jni::sys::{jint, jlong, jobject, jstring};
+use jni::sys::{jdouble, jint, jlong, jobject, jstring};
 use jni::{JNIEnv, JavaVM};
 
 use smallvec::SmallVec;
@@ -408,4 +408,58 @@ pub(crate) extern "system" fn onActionSheetResult<'local>(
         source: format!("_internalOnActionSheetResult({});", tap_index),
     };
     let _ = send_command_to_host(host_id, cmd);
+}
+
+// ==================== Device Sensor ====================
+
+pub(crate) extern "system" fn onDeviceMotionChange(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    alpha: jdouble,
+    beta: jdouble,
+    gamma: jdouble,
+) {
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnDeviceMotionChange {
+            alpha: alpha as f64,
+            beta: beta as f64,
+            gamma: gamma as f64,
+        },
+    );
+}
+
+pub(crate) extern "system" fn onGyroscopeChange(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    x: jdouble,
+    y: jdouble,
+    z: jdouble,
+) {
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnGyroscopeChange {
+            x: x as f64,
+            y: y as f64,
+            z: z as f64,
+        },
+    );
+}
+
+pub(crate) extern "system" fn onDeviceOrientationChange<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    value: JString<'local>,
+) {
+    let val = env
+        .get_string(&value)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnDeviceOrientationChange { value: val },
+    );
 }

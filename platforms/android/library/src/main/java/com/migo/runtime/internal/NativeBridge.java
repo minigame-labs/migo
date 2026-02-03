@@ -151,4 +151,34 @@ public final class NativeBridge {
      * @param tapIndex  Index of selected item (0-based), or -1 if cancelled
      */
     public static native void onActionSheetResult(int sessionId, int tapIndex);
+
+    // ==================== Device Sensor Callbacks ====================
+
+    /**
+     * Callback when device motion (rotation vector) data is available.
+     *
+     * @param sessionId The session ID
+     * @param alpha     Rotation around Z axis in degrees (0-360)
+     * @param beta      Rotation around X axis in degrees (-180 to 180)
+     * @param gamma     Rotation around Y axis in degrees (-90 to 90)
+     */
+    public static native void onDeviceMotionChange(int sessionId, double alpha, double beta, double gamma);
+
+    /**
+     * Callback when gyroscope data is available.
+     *
+     * @param sessionId The session ID
+     * @param x         Angular velocity around X axis in rad/s
+     * @param y         Angular velocity around Y axis in rad/s
+     * @param z         Angular velocity around Z axis in rad/s
+     */
+    public static native void onGyroscopeChange(int sessionId, double x, double y, double z);
+
+    /**
+     * Callback when device screen orientation changes.
+     *
+     * @param sessionId The session ID
+     * @param value     One of: "portrait", "landscape", "landscapeReverse"
+     */
+    public static native void onDeviceOrientationChange(int sessionId, String value);
 }

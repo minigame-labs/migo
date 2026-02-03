@@ -1,0 +1,61 @@
+use deno_core::{extension, op2, Extension, OpState};
+use deno_error::JsErrorBox;
+use shared::op_state::HostOpState;
+
+use crate::android::jni::*;
+
+#[op2(fast)]
+pub fn op_start_device_motion(
+    state: &mut OpState,
+    #[string] interval: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    start_device_motion(host.id, &interval).map_err(|e| JsErrorBox::generic(e))
+}
+
+#[op2(fast)]
+pub fn op_stop_device_motion(state: &mut OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    stop_device_motion(host.id).map_err(|e| JsErrorBox::generic(e))
+}
+
+#[op2(fast)]
+pub fn op_start_gyroscope(
+    state: &mut OpState,
+    #[string] interval: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    start_gyroscope(host.id, &interval).map_err(|e| JsErrorBox::generic(e))
+}
+
+#[op2(fast)]
+pub fn op_stop_gyroscope(state: &mut OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    stop_gyroscope(host.id).map_err(|e| JsErrorBox::generic(e))
+}
+
+#[op2]
+#[string]
+pub fn op_get_battery_info(_: &mut OpState) -> Result<String, JsErrorBox> {
+    get_battery_info_json().map_err(|e| JsErrorBox::generic(e))
+}
+
+extension!(host_v8_device_android,
+    deps = [host_v8_device],
+    ops = [
+        op_start_device_motion,
+        op_stop_device_motion,
+        op_start_gyroscope,
+        op_stop_gyroscope,
+        op_get_battery_info,
+    ],
+    esm = [
+        dir "android/extensions/base/device",
+        "01_device_sensor.js",
+        "02_battery.js",
+    ]
+);
+
+pub fn device_extensions() -> Vec<Extension> {
+    vec![host_v8_device_android::init_ops_and_esm()]
+}

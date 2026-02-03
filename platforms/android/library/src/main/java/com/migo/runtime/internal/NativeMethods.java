@@ -270,4 +270,48 @@ public final class NativeMethods {
             NativeBridge.onActionSheetResult(sessionId, tapIndex);
         }
     }
+
+    // ==================== Device Sensor Callbacks ====================
+
+    /**
+     * Callback for device motion sensor data.
+     * Called from {@link com.migo.runtime.internal.platform.DeviceSensorManager}.
+     *
+     * @param sessionId The session ID
+     * @param alpha     Rotation around Z axis in degrees (0-360)
+     * @param beta      Rotation around X axis in degrees (-180 to 180)
+     * @param gamma     Rotation around Y axis in degrees (-90 to 90)
+     */
+    public static void onDeviceMotionChange(int sessionId, double alpha, double beta, double gamma) {
+        if (sessionId >= 0) {
+            NativeBridge.onDeviceMotionChange(sessionId, alpha, beta, gamma);
+        }
+    }
+
+    /**
+     * Callback for gyroscope sensor data.
+     * Called from {@link com.migo.runtime.internal.platform.DeviceSensorManager}.
+     *
+     * @param sessionId The session ID
+     * @param x         Angular velocity around X axis in rad/s
+     * @param y         Angular velocity around Y axis in rad/s
+     * @param z         Angular velocity around Z axis in rad/s
+     */
+    public static void onGyroscopeChange(int sessionId, double x, double y, double z) {
+        if (sessionId >= 0) {
+            NativeBridge.onGyroscopeChange(sessionId, x, y, z);
+        }
+    }
+
+    /**
+     * Callback for device orientation change.
+     *
+     * @param sessionId The session ID
+     * @param value     One of: "portrait", "landscape", "landscapeReverse"
+     */
+    public static void onDeviceOrientationChange(int sessionId, String value) {
+        if (sessionId >= 0 && value != null) {
+            NativeBridge.onDeviceOrientationChange(sessionId, value);
+        }
+    }
 }

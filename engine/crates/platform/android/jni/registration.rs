@@ -5,7 +5,8 @@ use tracing::info;
 
 use crate::android::jni::{
     JAVA_METHOD_CACHE, JavaMethodCache, init, mod_main, onAudioInterruptionBegin,
-    onAudioInterruptionEnd, onHide, onModalResult, onActionSheetResult,
+    onAudioInterruptionEnd, onDeviceMotionChange, onDeviceOrientationChange, onGyroscopeChange,
+    onHide, onModalResult, onActionSheetResult,
     onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting, onShow, onTouch, shutdown,
     updateSurface, version,
 };
@@ -89,6 +90,21 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(II)V".into(),
                 fn_ptr: onActionSheetResult as *mut c_void,
             },
+            NativeMethod {
+                name: "onDeviceMotionChange".into(),
+                sig: "(IDDD)V".into(),
+                fn_ptr: onDeviceMotionChange as *mut c_void,
+            },
+            NativeMethod {
+                name: "onGyroscopeChange".into(),
+                sig: "(IDDD)V".into(),
+                fn_ptr: onGyroscopeChange as *mut c_void,
+            },
+            NativeMethod {
+                name: "onDeviceOrientationChange".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onDeviceOrientationChange as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -117,6 +133,13 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("showLoading", "(ILjava/lang/String;)V"),
         ("hideLoading", "(I)V"),
         ("showActionSheet", "(ILjava/lang/String;)V"),
+        // Battery
+        ("getBatteryInfoJson", "()Ljava/lang/String;"),
+        // Device sensor
+        ("startDeviceMotionListening", "(ILjava/lang/String;)V"),
+        ("stopDeviceMotionListening", "(I)V"),
+        ("startGyroscope", "(ILjava/lang/String;)V"),
+        ("stopGyroscope", "(I)V"),
     ];
 
     let global_class = env

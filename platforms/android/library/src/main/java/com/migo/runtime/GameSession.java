@@ -7,6 +7,7 @@ import android.view.Surface;
 import com.migo.runtime.callback.OnErrorListener;
 import com.migo.runtime.callback.OnGameEventListener;
 import com.migo.runtime.callback.OnLifecycleListener;
+import com.migo.runtime.internal.NativeExports;
 import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.RuntimeRegistry;
@@ -291,6 +292,7 @@ public final class GameSession implements Closeable {
         }
 
         audioFocusManager.stop();
+        NativeExports.destroySensorManager(sessionId);
         NativeMethods.shutdown(sessionId);
         RuntimeRegistry.unregister(sessionId);
 

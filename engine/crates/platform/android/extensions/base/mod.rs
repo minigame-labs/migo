@@ -1,3 +1,4 @@
+mod device;
 mod env;
 mod lifecycle;
 mod system;
@@ -12,5 +13,6 @@ pub fn base_extensions() -> Vec<Extension> {
         .chain(update::update_extensions())
         .chain(lifecycle::lifecycle_extensions())
         .chain(ui::ui_extensions())
+        .chain(device::device_extensions())
         .collect()
 }

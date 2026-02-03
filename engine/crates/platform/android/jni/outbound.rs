@@ -270,3 +270,49 @@ pub fn hide_loading(host_id: i32) -> Result<(), String> {
 pub fn show_action_sheet(host_id: i32, json: &str) -> Result<(), String> {
     call_void_with_string("showActionSheet", host_id, json)
 }
+
+// ==================== Battery ====================
+
+pub fn get_battery_info_json() -> Result<String, String> {
+    call_static_method(
+        "getBatteryInfoJson",
+        ReturnType::Object,
+        |env, result| {
+            let jstring = result.l().map_err(|_| "Null string from Java")?;
+            let json_str = env
+                .get_string(&jni::objects::JString::from(jstring))
+                .map_err(|e| format!("Failed to convert battery info JSON string: {}", e))?
+                .into();
+            Ok(json_str)
+        },
+        &[],
+    )
+}
+
+// ==================== Device Sensor ====================
+
+pub fn start_device_motion(host_id: i32, interval: &str) -> Result<(), String> {
+    call_void_with_string("startDeviceMotionListening", host_id, interval)
+}
+
+pub fn stop_device_motion(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "stopDeviceMotionListening",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn start_gyroscope(host_id: i32, interval: &str) -> Result<(), String> {
+    call_void_with_string("startGyroscope", host_id, interval)
+}
+
+pub fn stop_gyroscope(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "stopGyroscope",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}

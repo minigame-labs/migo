@@ -91,6 +91,7 @@ use shared::op_state::HostOpState;
 mod audio;
 mod base;
 mod console;
+mod device;
 mod event;
 mod file;
 mod input;
@@ -151,6 +152,7 @@ pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
         .chain(console::console_extensions())
         .chain(event::event_extensions())
         .chain(utility::utility_extensions())
+        .chain(device::device_extensions())
         .chain(input::touch_extensions())
         .chain(file::file_extensions())
         .chain(rendering::rendering_extensions())

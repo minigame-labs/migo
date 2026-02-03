@@ -9,6 +9,9 @@ import * as touch from 'ext:host_v8_touch/01_touch.js';
 import * as audio from 'ext:host_v8_audio/01_audio_context.js';
 import * as innerAudio from 'ext:host_v8_audio/02_inner_audio_context.js';
 import * as audioInterruption from 'ext:host_v8_audio/03_audio_interruption.js';
+import * as deviceMotion from 'ext:host_v8_device/01_device_motion.js';
+import * as gyroscope from 'ext:host_v8_device/02_gyroscope.js';
+import * as orientation from 'ext:host_v8_device/03_orientation.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -57,6 +60,21 @@ const WindowGlobalScope = {
     offAudioInterruptionEnd: core.propNonEnumerable(audioInterruption.offAudioInterruptionEnd),
     _internalTriggerAudioInterruptionBegin: core.propNonEnumerable(audioInterruption._internalTriggerAudioInterruptionBegin),
     _internalTriggerAudioInterruptionEnd: core.propNonEnumerable(audioInterruption._internalTriggerAudioInterruptionEnd),
+
+    // Device Motion
+    onDeviceMotionChange: core.propNonEnumerable(deviceMotion.onDeviceMotionChange),
+    offDeviceMotionChange: core.propNonEnumerable(deviceMotion.offDeviceMotionChange),
+    _internalTriggerDeviceMotionChange: core.propNonEnumerable(deviceMotion._internalTriggerDeviceMotionChange),
+
+    // Gyroscope
+    onGyroscopeChange: core.propNonEnumerable(gyroscope.onGyroscopeChange),
+    offGyroscopeChange: core.propNonEnumerable(gyroscope.offGyroscopeChange),
+    _internalTriggerGyroscopeChange: core.propNonEnumerable(gyroscope._internalTriggerGyroscopeChange),
+
+    // Device Orientation
+    onDeviceOrientationChange: core.propNonEnumerable(orientation.onDeviceOrientationChange),
+    offDeviceOrientationChange: core.propNonEnumerable(orientation.offDeviceOrientationChange),
+    _internalTriggerDeviceOrientationChange: core.propNonEnumerable(orientation._internalTriggerDeviceOrientationChange),
 };
 
 export { WindowGlobalScope };

@@ -6,7 +6,9 @@ import android.content.Intent;
 import android.net.Uri;
 import android.provider.Settings;
 
+import com.migo.runtime.internal.platform.BatteryInfo;
 import com.migo.runtime.internal.platform.DeviceInfo;
+import com.migo.runtime.internal.platform.DeviceSensorManager;
 import com.migo.runtime.internal.platform.InteractionUI;
 import com.migo.runtime.internal.platform.DisplayCompat;
 import com.migo.runtime.internal.platform.Permissions;
@@ -15,6 +17,7 @@ import com.migo.runtime.internal.platform.SystemSettings;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Static methods exposed to native code via JNI.
@@ -28,6 +31,10 @@ public final class NativeExports {
 
     private static final int BLUETOOTH_SETTING_REQUEST_CODE = 10001;
     private static final int APP_AUTHORIZE_SETTING_REQUEST_CODE = 10002;
+
+    /** Per-session device sensor managers. */
+    private static final ConcurrentHashMap<Integer, DeviceSensorManager> sSensorManagers =
+            new ConcurrentHashMap<>();
 
     private NativeExports() {}
 
@@ -229,6 +236,18 @@ public final class NativeExports {
         return DeviceInfo.toJson(appContext);
     }
 
+    // ==================== Battery ====================
+
+    /**
+     * Get battery info as JSON string.
+     *
+     * @return JSON string with battery level, charging status, and low power mode
+     */
+    public static String getBatteryInfoJson() {
+        Context appContext = AppContext.getOrNull();
+        return BatteryInfo.toJson(appContext);
+    }
+
     // ==================== UI Interaction ====================
 
     /**
@@ -339,5 +358,93 @@ public final class NativeExports {
             context = AppContext.getOrNull();
         }
         return Permissions.toJson(context);
+    }
+
+    // ==================== Device Sensor ====================
+
+    /**
+     * Get or create a DeviceSensorManager for the given session.
+     *
+     * @param sessionId The session ID
+     * @return DeviceSensorManager, or null if context is unavailable
+     */
+    private static DeviceSensorManager getOrCreateSensorManager(int sessionId) {
+        DeviceSensorManager existing = sSensorManagers.get(sessionId);
+        if (existing != null) return existing;
+
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) return null;
+        Activity activity = ctx.getActivity();
+        if (activity == null) return null;
+
+        DeviceSensorManager mgr = new DeviceSensorManager(sessionId, activity);
+        sSensorManagers.put(sessionId, mgr);
+        return mgr;
+    }
+
+    /**
+     * Start listening for device motion (rotation vector) events.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     * @param interval  "game", "ui", or "normal"
+     */
+    public static void startDeviceMotionListening(int sessionId, String interval) {
+        DeviceSensorManager mgr = getOrCreateSensorManager(sessionId);
+        if (mgr != null) {
+            mgr.startDeviceMotionListening(interval);
+        }
+    }
+
+    /**
+     * Stop listening for device motion events.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     */
+    public static void stopDeviceMotionListening(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.stopDeviceMotionListening();
+        }
+    }
+
+    /**
+     * Start listening for gyroscope events.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     * @param interval  "game", "ui", or "normal"
+     */
+    public static void startGyroscope(int sessionId, String interval) {
+        DeviceSensorManager mgr = getOrCreateSensorManager(sessionId);
+        if (mgr != null) {
+            mgr.startGyroscope(interval);
+        }
+    }
+
+    /**
+     * Stop listening for gyroscope events.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     */
+    public static void stopGyroscope(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.stopGyroscope();
+        }
+    }
+
+    /**
+     * Clean up sensor resources for a session. Call on session shutdown.
+     *
+     * @param sessionId The session ID
+     */
+    public static void destroySensorManager(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.remove(sessionId);
+        if (mgr != null) {
+            mgr.destroy();
+        }
     }
 }

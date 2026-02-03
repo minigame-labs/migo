@@ -14,6 +14,8 @@ import * as updateMgr from "ext:host_v8_update/02_update_mgr.js"
 import * as lifeCycle from "ext:host_v8_lifecycle/01_lifecycle.js"
 import * as fileManager from "ext:host_v8_file_android/01_file_manager.js"
 import * as interaction from "ext:host_v8_ui/01_interaction.js"
+import * as deviceSensor from "ext:host_v8_device_android/01_device_sensor.js"
+import * as battery from "ext:host_v8_device_android/02_battery.js"
 
 const { ObjectDefineProperties } = primordials;
 const properties = {
@@ -60,6 +62,14 @@ const properties = {
     hideLoading: core.propNonEnumerable(interaction.hideLoading),
     showActionSheet: core.propNonEnumerable(interaction.showActionSheet),
     _internalOnActionSheetResult: core.propNonEnumerable(interaction._internalOnActionSheetResult),
+    // Device Sensor
+    startDeviceMotionListening: core.propNonEnumerable(deviceSensor.startDeviceMotionListening),
+    stopDeviceMotionListening: core.propNonEnumerable(deviceSensor.stopDeviceMotionListening),
+    startGyroscope: core.propNonEnumerable(deviceSensor.startGyroscope),
+    stopGyroscope: core.propNonEnumerable(deviceSensor.stopGyroscope),
+    // Battery
+    getBatteryInfo: core.propNonEnumerable(battery.getBatteryInfo),
+    getBatteryInfoSync: core.propNonEnumerable(battery.getBatteryInfoSync),
 };
 
 ObjectDefineProperties(globalThis, properties);
