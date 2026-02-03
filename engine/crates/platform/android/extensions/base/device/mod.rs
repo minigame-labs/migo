@@ -50,6 +50,24 @@ pub fn op_vibrate_long(_: &mut OpState) -> Result<i32, JsErrorBox> {
     vibrate_long().map_err(|e| JsErrorBox::generic(e))
 }
 
+#[op2(fast)]
+pub fn op_get_screen_brightness(state: &mut OpState) -> Result<f32, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    get_screen_brightness(host.id).map_err(|e| JsErrorBox::generic(e))
+}
+
+#[op2(fast)]
+pub fn op_set_screen_brightness(state: &mut OpState, value: f32) -> Result<i32, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    set_screen_brightness(host.id, value).map_err(|e| JsErrorBox::generic(e))
+}
+
+#[op2(fast)]
+pub fn op_set_keep_screen_on(state: &mut OpState, keep_on: bool) -> Result<i32, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    set_keep_screen_on(host.id, keep_on).map_err(|e| JsErrorBox::generic(e))
+}
+
 extension!(host_v8_device_android,
     deps = [host_v8_device],
     ops = [
@@ -60,12 +78,16 @@ extension!(host_v8_device_android,
         op_get_battery_info,
         op_vibrate_short,
         op_vibrate_long,
+        op_get_screen_brightness,
+        op_set_screen_brightness,
+        op_set_keep_screen_on,
     ],
     esm = [
         dir "android/extensions/base/device",
         "01_device_sensor.js",
         "02_battery.js",
         "03_vibrate.js",
+        "04_screen.js",
     ]
 );
 

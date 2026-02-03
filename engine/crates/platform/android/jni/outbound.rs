@@ -340,6 +340,35 @@ pub fn vibrate_long() -> Result<i32, String> {
     )
 }
 
+// ==================== Screen ====================
+
+pub fn get_screen_brightness(host_id: i32) -> Result<f32, String> {
+    call_static_method(
+        "getScreenBrightness",
+        ReturnType::Primitive(Primitive::Float),
+        |_env, val| Ok(val.f().unwrap_or(-1.0)),
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn set_screen_brightness(host_id: i32, value: f32) -> Result<i32, String> {
+    call_static_method(
+        "setScreenBrightness",
+        ReturnType::Primitive(Primitive::Int),
+        |_env, val| Ok(val.i().unwrap_or(-1)),
+        &[jvalue { i: host_id }, jvalue { f: value }],
+    )
+}
+
+pub fn set_keep_screen_on(host_id: i32, keep_on: bool) -> Result<i32, String> {
+    call_static_method(
+        "setKeepScreenOn",
+        ReturnType::Primitive(Primitive::Int),
+        |_env, val| Ok(val.i().unwrap_or(-1)),
+        &[jvalue { i: host_id }, jvalue { z: keep_on as u8 }],
+    )
+}
+
 // ==================== Device Sensor ====================
 
 pub fn start_device_motion(host_id: i32, interval: &str) -> Result<(), String> {

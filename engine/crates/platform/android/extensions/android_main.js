@@ -17,6 +17,7 @@ import * as interaction from "ext:host_v8_ui/01_interaction.js"
 import * as deviceSensor from "ext:host_v8_device_android/01_device_sensor.js"
 import * as battery from "ext:host_v8_device_android/02_battery.js"
 import * as vibrate from "ext:host_v8_device_android/03_vibrate.js"
+import * as screen from "ext:host_v8_device_android/04_screen.js"
 
 const { ObjectDefineProperties } = primordials;
 const properties = {
@@ -74,6 +75,10 @@ const properties = {
     // Vibration
     vibrateShort: core.propNonEnumerable(vibrate.vibrateShort),
     vibrateLong: core.propNonEnumerable(vibrate.vibrateLong),
+    // Screen
+    getScreenBrightness: core.propNonEnumerable(screen.getScreenBrightness),
+    setScreenBrightness: core.propNonEnumerable(screen.setScreenBrightness),
+    setKeepScreenOn: core.propNonEnumerable(screen.setKeepScreenOn),
 };
 
 ObjectDefineProperties(globalThis, properties);

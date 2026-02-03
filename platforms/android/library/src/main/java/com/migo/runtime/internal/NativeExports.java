@@ -12,6 +12,7 @@ import com.migo.runtime.internal.platform.DeviceSensorManager;
 import com.migo.runtime.internal.platform.InteractionUI;
 import com.migo.runtime.internal.platform.DisplayCompat;
 import com.migo.runtime.internal.platform.Permissions;
+import com.migo.runtime.internal.platform.ScreenBrightness;
 import com.migo.runtime.internal.platform.SystemSettings;
 import com.migo.runtime.internal.platform.Vibrator;
 
@@ -270,6 +271,49 @@ public final class NativeExports {
     public static int vibrateLong() {
         Context appContext = AppContext.getOrNull();
         return Vibrator.vibrateLong(appContext);
+    }
+
+    // ==================== Screen ====================
+
+    /**
+     * Get current screen brightness.
+     *
+     * @param sessionId The session ID
+     * @return Brightness value 0.0-1.0, or -1 if following system
+     */
+    public static float getScreenBrightness(int sessionId) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) return -1f;
+        Activity activity = context.getActivity();
+        return ScreenBrightness.getBrightness(activity);
+    }
+
+    /**
+     * Set screen brightness.
+     *
+     * @param sessionId The session ID
+     * @param value     Brightness value (0.0-1.0) or -1 for system default
+     * @return 0 on success, -1 on failure
+     */
+    public static int setScreenBrightness(int sessionId, float value) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) return -1;
+        Activity activity = context.getActivity();
+        return ScreenBrightness.setBrightness(activity, value);
+    }
+
+    /**
+     * Set whether to keep screen on.
+     *
+     * @param sessionId    The session ID
+     * @param keepScreenOn true to keep screen on
+     * @return 0 on success, -1 on failure
+     */
+    public static int setKeepScreenOn(int sessionId, boolean keepScreenOn) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) return -1;
+        Activity activity = context.getActivity();
+        return ScreenBrightness.setKeepScreenOn(activity, keepScreenOn);
     }
 
     // ==================== UI Interaction ====================

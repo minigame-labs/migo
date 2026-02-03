@@ -14,10 +14,10 @@ import android.os.VibrationEffect;
  */
 public final class Vibrator {
 
-    /** Short vibration duration in milliseconds (WeChat spec: 15ms). */
+    /** Short vibration duration in milliseconds (spec: 15ms). */
     private static final long SHORT_DURATION_MS = 15;
 
-    /** Long vibration duration in milliseconds (WeChat spec: 400ms). */
+    /** Long vibration duration in milliseconds (spec: 400ms). */
     private static final long LONG_DURATION_MS = 400;
 
     private Vibrator() {}
