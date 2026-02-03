@@ -175,7 +175,7 @@ function fromBodyBuffer(buffer, dataType, responseType) {
         try {
             return JSONParse(text);
         } catch (_) {
-            // WeChat behavior: return raw string if JSON parse fails
+            // Return raw string if JSON parse fails
             return text;
         }
     }

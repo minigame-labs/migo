@@ -1,5 +1,5 @@
 import { op_get_battery_info } from "ext:core/ops";
-import { wrapWxAsync } from "ext:host_v8_base/02_wx_async.js";
+import { wrapAsync } from "ext:host_v8_base/02_async.js";
 
 function getBatteryInfoSync() {
     try {
@@ -10,7 +10,7 @@ function getBatteryInfoSync() {
 }
 
 function getBatteryInfo(options) {
-    return wrapWxAsync('getBatteryInfo', function () {
+    return wrapAsync('getBatteryInfo', function () {
         return getBatteryInfoSync();
     }, options);
 }

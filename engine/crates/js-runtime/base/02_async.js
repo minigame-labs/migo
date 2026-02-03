@@ -1,13 +1,13 @@
-// Wraps a function with WeChat-style success/fail/complete callbacks + Promise return.
+// Wraps a function with success/fail/complete callbacks + Promise return.
 //
 // Usage:
-//   return wrapWxAsync('startDeviceMotionListening', () => op_start(interval), options);
+//   return wrapAsync('startDeviceMotionListening', () => op_start(interval), options);
 //
 // - If fn() returns a Promise, chains on it; otherwise wraps in Promise.resolve().
 // - Always returns a Promise (supports both callback and await patterns).
 // - On success: calls success(res), complete(res), resolves with res.
 // - On failure: calls fail(res), complete(res), rejects with res.
-function wrapWxAsync(apiName, fn, options) {
+function wrapAsync(apiName, fn, options) {
     const { success, fail, complete } = options || {};
     try {
         const result = fn();
@@ -33,4 +33,4 @@ function wrapWxAsync(apiName, fn, options) {
     }
 }
 
-export { wrapWxAsync };
+export { wrapAsync };

@@ -6,7 +6,7 @@ deno_core::extension!(
     esm = [
         dir "base",
         "01_amdshim.js",
-        "02_wx_async.js",
+        "02_async.js",
     ],
     options = {
         options: HostOpState,

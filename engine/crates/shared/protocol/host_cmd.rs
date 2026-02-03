@@ -163,7 +163,7 @@ pub enum HostCommand {
     /// Device motion sensor data (rotation angles from TYPE_ROTATION_VECTOR).
     ///
     /// Sent by the platform sensor listener at the requested interval.
-    /// Values follow the W3C DeviceOrientation spec (despite the WeChat name):
+    /// Values follow the W3C DeviceOrientation spec:
     /// alpha = rotation around Z (0-360), beta = X (-180..180), gamma = Y (-90..90).
     OnDeviceMotionChange {
         alpha: f64,

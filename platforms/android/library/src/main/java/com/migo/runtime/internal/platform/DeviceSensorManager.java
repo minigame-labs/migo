@@ -17,7 +17,7 @@ import com.migo.runtime.internal.NativeMethods;
  * Uses Android SensorManager to listen for sensor events and dispatches
  * data to the native layer via {@link NativeMethods}.
  * <p>
- * Interval mapping from WeChat Mini Game spec:
+ * Interval mapping from Mini Game spec:
  * <ul>
  *   <li>"game"   = ~20ms  (SENSOR_DELAY_GAME)</li>
  *   <li>"ui"     = ~60ms  (SENSOR_DELAY_UI)</li>
@@ -204,8 +204,6 @@ public final class DeviceSensorManager {
     }
 
     /**
-     * Parse WeChat interval string to Android SensorManager delay constant.
-     *
      * @param interval "game", "ui", or "normal" (default)
      * @return SensorManager delay constant
      */
