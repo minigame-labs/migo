@@ -20,6 +20,7 @@ import * as vibrate from "ext:host_v8_device_android/03_vibrate.js"
 import * as screen from "ext:host_v8_device_android/04_screen.js"
 import * as compassOps from "ext:host_v8_device_android/05_compass.js"
 import * as accelerometerOps from "ext:host_v8_device_android/06_accelerometer.js"
+import * as networkOps from "ext:host_v8_network_android/01_network.js"
 
 const { ObjectDefineProperties } = primordials;
 const properties = {
@@ -88,6 +89,9 @@ const properties = {
     // Accelerometer
     startAccelerometer: core.propNonEnumerable(accelerometerOps.startAccelerometer),
     stopAccelerometer: core.propNonEnumerable(accelerometerOps.stopAccelerometer),
+    // Network
+    getNetworkType: core.propNonEnumerable(networkOps.getNetworkType),
+    getLocalIPAddress: core.propNonEnumerable(networkOps.getLocalIPAddress),
 };
 
 ObjectDefineProperties(globalThis, properties);

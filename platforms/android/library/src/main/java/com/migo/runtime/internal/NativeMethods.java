@@ -342,4 +342,20 @@ public final class NativeMethods {
             NativeBridge.onAccelerometerChange(sessionId, x, y, z);
         }
     }
+
+    // ==================== Network Callbacks ====================
+
+    /**
+     * Callback for network status change.
+     * Called from {@link com.migo.runtime.internal.platform.NetworkMonitor}.
+     *
+     * @param sessionId   The session ID
+     * @param isConnected Whether network is connected
+     * @param networkType Network type: "wifi", "2g", "3g", "4g", "5g", "unknown", "none"
+     */
+    public static void onNetworkStatusChange(int sessionId, boolean isConnected, String networkType) {
+        if (sessionId >= 0) {
+            NativeBridge.onNetworkStatusChange(sessionId, isConnected, networkType);
+        }
+    }
 }

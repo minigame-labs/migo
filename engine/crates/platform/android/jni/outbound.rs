@@ -467,3 +467,55 @@ pub fn stop_accelerometer(host_id: i32) -> Result<(), String> {
         &[jvalue { i: host_id }],
     )
 }
+
+// ==================== Network ====================
+
+pub fn start_network_monitoring(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "startNetworkMonitoring",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn stop_network_monitoring(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "stopNetworkMonitoring",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn get_network_type_json(host_id: i32) -> Result<String, String> {
+    call_static_method(
+        "getNetworkTypeJson",
+        ReturnType::Object,
+        |env, result| {
+            let jstring = result.l().map_err(|_| "Null string from Java")?;
+            let json_str = env
+                .get_string(&jni::objects::JString::from(jstring))
+                .map_err(|e| format!("Failed to convert network type JSON string: {}", e))?
+                .into();
+            Ok(json_str)
+        },
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn get_local_ip_address_json() -> Result<String, String> {
+    call_static_method(
+        "getLocalIPAddressJson",
+        ReturnType::Object,
+        |env, result| {
+            let jstring = result.l().map_err(|_| "Null string from Java")?;
+            let json_str = env
+                .get_string(&jni::objects::JString::from(jstring))
+                .map_err(|e| format!("Failed to convert local IP JSON string: {}", e))?
+                .into();
+            Ok(json_str)
+        },
+        &[],
+    )
+}

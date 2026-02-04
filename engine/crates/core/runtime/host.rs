@@ -242,6 +242,21 @@ impl Host {
                     .await
             }
 
+            HostCommand::OnNetworkStatusChange {
+                is_connected,
+                network_type,
+            } => {
+                self.js
+                    .exec_script_and_pump(
+                        "network_status",
+                        format!(
+                            "_internalTriggerNetworkStatusChange({},'{}')",
+                            is_connected, network_type
+                        ),
+                    )
+                    .await
+            }
+
             _ => Ok(()),
         }
     }

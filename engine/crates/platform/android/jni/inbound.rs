@@ -501,3 +501,23 @@ pub(crate) extern "system" fn onAccelerometerChange(
         },
     );
 }
+
+pub(crate) extern "system" fn onNetworkStatusChange<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    is_connected: jni::sys::jboolean,
+    network_type: JString<'local>,
+) {
+    let net_type = env
+        .get_string(&network_type)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "none".to_string());
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnNetworkStatusChange {
+            is_connected: is_connected != 0,
+            network_type: net_type,
+        },
+    );
+}

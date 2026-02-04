@@ -209,6 +209,16 @@ pub enum HostCommand {
         /// Acceleration along Z axis in m/s^2.
         z: f64,
     },
+
+    /// Network status changed.
+    ///
+    /// Sent by the platform network monitor when connectivity changes.
+    OnNetworkStatusChange {
+        /// Whether network is connected.
+        is_connected: bool,
+        /// Network type: "wifi", "2g", "3g", "4g", "5g", "unknown", "none".
+        network_type: String,
+    },
 }
 
 /// Event types for InnerAudioContext.

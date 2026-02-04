@@ -14,6 +14,7 @@ import * as gyroscope from 'ext:host_v8_device/02_gyroscope.js';
 import * as orientation from 'ext:host_v8_device/03_orientation.js';
 import * as compass from 'ext:host_v8_device/04_compass.js';
 import * as accelerometer from 'ext:host_v8_device/05_accelerometer.js';
+import * as networkStatus from 'ext:host_v8_network/08_network_status.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -87,6 +88,11 @@ const WindowGlobalScope = {
     onAccelerometerChange: core.propNonEnumerable(accelerometer.onAccelerometerChange),
     offAccelerometerChange: core.propNonEnumerable(accelerometer.offAccelerometerChange),
     _internalTriggerAccelerometerChange: core.propNonEnumerable(accelerometer._internalTriggerAccelerometerChange),
+
+    // Network Status
+    onNetworkStatusChange: core.propNonEnumerable(networkStatus.onNetworkStatusChange),
+    offNetworkStatusChange: core.propNonEnumerable(networkStatus.offNetworkStatusChange),
+    _internalTriggerNetworkStatusChange: core.propNonEnumerable(networkStatus._internalTriggerNetworkStatusChange),
 };
 
 export { WindowGlobalScope };

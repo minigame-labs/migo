@@ -34,6 +34,7 @@ extension!(host_v8_network,
      "05_download.js",
      "06_upload.js",
      "07_websocket.js",
+     "08_network_status.js",
   ],
   options = {
     options: Options,

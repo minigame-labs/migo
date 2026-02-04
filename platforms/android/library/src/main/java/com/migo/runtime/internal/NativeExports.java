@@ -11,6 +11,7 @@ import com.migo.runtime.internal.platform.DeviceInfo;
 import com.migo.runtime.internal.platform.DeviceSensorManager;
 import com.migo.runtime.internal.platform.InteractionUI;
 import com.migo.runtime.internal.platform.DisplayCompat;
+import com.migo.runtime.internal.platform.NetworkMonitor;
 import com.migo.runtime.internal.platform.Permissions;
 import com.migo.runtime.internal.platform.ScreenBrightness;
 import com.migo.runtime.internal.platform.SystemSettings;
@@ -36,6 +37,10 @@ public final class NativeExports {
 
     /** Per-session device sensor managers. */
     private static final ConcurrentHashMap<Integer, DeviceSensorManager> sSensorManagers =
+            new ConcurrentHashMap<>();
+
+    /** Per-session network monitors. */
+    private static final ConcurrentHashMap<Integer, NetworkMonitor> sNetworkMonitors =
             new ConcurrentHashMap<>();
 
     private NativeExports() {}
@@ -578,6 +583,100 @@ public final class NativeExports {
      */
     public static void destroySensorManager(int sessionId) {
         DeviceSensorManager mgr = sSensorManagers.remove(sessionId);
+        if (mgr != null) {
+            mgr.destroy();
+        }
+    }
+
+    // ==================== Network ====================
+
+    /**
+     * Get or create a NetworkMonitor for the given session.
+     *
+     * @param sessionId The session ID
+     * @return NetworkMonitor, or null if context is unavailable
+     */
+    private static NetworkMonitor getOrCreateNetworkMonitor(int sessionId) {
+        NetworkMonitor existing = sNetworkMonitors.get(sessionId);
+        if (existing != null) return existing;
+
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) return null;
+        Activity activity = ctx.getActivity();
+        if (activity == null) return null;
+
+        NetworkMonitor mgr = new NetworkMonitor(sessionId, activity);
+        sNetworkMonitors.put(sessionId, mgr);
+        return mgr;
+    }
+
+    /**
+     * Start monitoring network status changes.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     */
+    public static void startNetworkMonitoring(int sessionId) {
+        NetworkMonitor mgr = getOrCreateNetworkMonitor(sessionId);
+        if (mgr != null) {
+            mgr.startMonitoring();
+        }
+    }
+
+    /**
+     * Stop monitoring network status changes.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     */
+    public static void stopNetworkMonitoring(int sessionId) {
+        NetworkMonitor mgr = sNetworkMonitors.get(sessionId);
+        if (mgr != null) {
+            mgr.stopMonitoring();
+        }
+    }
+
+    /**
+     * Get current network type as JSON string.
+     *
+     * @param sessionId The session ID
+     * @return JSON string with networkType, isConnected
+     */
+    public static String getNetworkTypeJson(int sessionId) {
+        NetworkMonitor mgr = getOrCreateNetworkMonitor(sessionId);
+        if (mgr == null) {
+            return "{\"networkType\":\"none\",\"isConnected\":false}";
+        }
+
+        NetworkMonitor.NetworkStatus status = mgr.getNetworkStatus();
+        return String.format(
+                "{\"networkType\":\"%s\",\"isConnected\":%s}",
+                status.networkType,
+                status.isConnected
+        );
+    }
+
+    /**
+     * Get local IP address as JSON string.
+     *
+     * @return JSON string with localip and netmask
+     */
+    public static String getLocalIPAddressJson() {
+        NetworkMonitor.LocalIPInfo info = NetworkMonitor.getLocalIPAddress();
+        return String.format(
+                "{\"localip\":\"%s\",\"netmask\":\"%s\"}",
+                info.localip,
+                info.netmask
+        );
+    }
+
+    /**
+     * Clean up network monitor resources for a session. Call on session shutdown.
+     *
+     * @param sessionId The session ID
+     */
+    public static void destroyNetworkMonitor(int sessionId) {
+        NetworkMonitor mgr = sNetworkMonitors.remove(sessionId);
         if (mgr != null) {
             mgr.destroy();
         }

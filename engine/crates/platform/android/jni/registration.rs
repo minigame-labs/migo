@@ -7,8 +7,8 @@ use crate::android::jni::{
     JAVA_METHOD_CACHE, JavaMethodCache, init, mod_main, onAudioInterruptionBegin,
     onAudioInterruptionEnd, onAccelerometerChange, onCompassChange, onDeviceMotionChange,
     onDeviceOrientationChange, onGyroscopeChange, onHide, onModalResult, onActionSheetResult,
-    onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting, onShow, onTouch, shutdown,
-    updateSurface, version,
+    onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting, onShow,
+    onTouch, shutdown, updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -115,6 +115,11 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(IDDD)V".into(),
                 fn_ptr: onAccelerometerChange as *mut c_void,
             },
+            NativeMethod {
+                name: "onNetworkStatusChange".into(),
+                sig: "(IZLjava/lang/String;)V".into(),
+                fn_ptr: onNetworkStatusChange as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -164,6 +169,11 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         // Accelerometer
         ("startAccelerometer", "(ILjava/lang/String;)V"),
         ("stopAccelerometer", "(I)V"),
+        // Network
+        ("startNetworkMonitoring", "(I)V"),
+        ("stopNetworkMonitoring", "(I)V"),
+        ("getNetworkTypeJson", "(I)Ljava/lang/String;"),
+        ("getLocalIPAddressJson", "()Ljava/lang/String;"),
     ];
 
     let global_class = env

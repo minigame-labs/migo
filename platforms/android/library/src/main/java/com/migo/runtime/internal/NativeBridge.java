@@ -200,4 +200,15 @@ public final class NativeBridge {
      * @param z         Acceleration along Z axis in m/s^2
      */
     public static native void onAccelerometerChange(int sessionId, double x, double y, double z);
+
+    // ==================== Network Callbacks ====================
+
+    /**
+     * Callback when network status changes.
+     *
+     * @param sessionId   The session ID
+     * @param isConnected Whether network is connected
+     * @param networkType Network type: "wifi", "2g", "3g", "4g", "5g", "unknown", "none"
+     */
+    public static native void onNetworkStatusChange(int sessionId, boolean isConnected, String networkType);
 }
