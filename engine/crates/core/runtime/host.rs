@@ -58,6 +58,7 @@ impl Host {
         let render = RenderService::new(js_tx.clone(), surface, init_options.pixel_ratio());
 
         // ---- HostOpState for extensions ----
+        let device_services = platform.create_device_services(id);
         let host_state = HostOpState {
             id,
             code_dir: None,
@@ -68,6 +69,7 @@ impl Host {
             render_tx: render.sender(),
             io_tx: io.sender(),
             audio_tx: audio.sender(),
+            device_services,
         };
 
         let module_loader: Option<Rc<dyn ModuleLoader>> =
@@ -301,6 +303,7 @@ impl Host {
 
         // Recreate JS runtime with fresh state
         let (files_dir, cache_dir) = self.js.get_base_dirs();
+        let device_services = self.platform.create_device_services(self.id);
 
         let host_state = HostOpState {
             id: self.id,
@@ -312,6 +315,7 @@ impl Host {
             render_tx: self.render.sender(),
             io_tx: self.io.sender(),
             audio_tx: self.audio.sender(),
+            device_services,
         };
 
         let module_loader: Option<Rc<dyn ModuleLoader>> =

@@ -14,22 +14,13 @@ function vibrateShort(options = {}) {
         return Promise.reject(res);
     }
     return wrapAsync('vibrateShort', function () {
-        const code = op_vibrate_short(type);
-        if (code === -1) {
-            throw new Error('vibrator unavailable');
-        }
-        if (code === -2) {
-            throw { errMsg: 'style is not support' };
-        }
+        op_vibrate_short(type);
     }, options);
 }
 
 function vibrateLong(options = {}) {
     return wrapAsync('vibrateLong', function () {
-        const code = op_vibrate_long();
-        if (code === -1) {
-            throw new Error('vibrator unavailable');
-        }
+        op_vibrate_long();
     }, options);
 }
 

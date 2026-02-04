@@ -1,9 +1,11 @@
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::protocol::{audio_cmd::AudioCmd, io_cmd::IOCmd, render_cmd::RenderCommand};
+use crate::services::DeviceServices;
 use crate::vfs::{GamePaths, VirtualFS};
 
 /// Host-side operational state shared across runtime layers.
@@ -11,7 +13,7 @@ pub type RenderTx = crossbeam_channel::Sender<RenderCommand>;
 pub type IoTx = UnboundedSender<IOCmd>;
 pub type AudioTx = UnboundedSender<AudioCmd>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HostOpState {
     pub id: i32,
     /// App-level cache directory (Context.getCacheDir()).
@@ -27,6 +29,22 @@ pub struct HostOpState {
     pub render_tx: RenderTx,
     pub io_tx: IoTx,
     pub audio_tx: AudioTx,
+    /// Platform device services (clipboard, sensors, etc.)
+    pub device_services: Option<Arc<dyn DeviceServices>>,
+}
+
+impl fmt::Debug for HostOpState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostOpState")
+            .field("id", &self.id)
+            .field("app_cache_dir", &self.app_cache_dir)
+            .field("app_files_dir", &self.app_files_dir)
+            .field("code_dir", &self.code_dir)
+            .field("game_paths", &self.game_paths)
+            .field("vfs", &self.vfs)
+            .field("device_services", &self.device_services.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

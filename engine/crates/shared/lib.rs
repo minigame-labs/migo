@@ -45,6 +45,7 @@ pub mod device;
 pub mod error;
 pub mod op_state;
 pub mod protocol;
+pub mod services;
 pub mod surface;
 pub mod vfs;
 

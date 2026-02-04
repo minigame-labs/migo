@@ -26,10 +26,7 @@ function setScreenBrightness(options = {}) {
         return Promise.reject(res);
     }
     return wrapAsync('setScreenBrightness', function () {
-        const code = op_set_screen_brightness(value);
-        if (code !== 0) {
-            throw new Error('failed to set screen brightness');
-        }
+        op_set_screen_brightness(value);
     }, options);
 }
 
@@ -46,10 +43,7 @@ function setKeepScreenOn(options = {}) {
         return Promise.reject(res);
     }
     return wrapAsync('setKeepScreenOn', function () {
-        const code = op_set_keep_screen_on(keepScreenOn);
-        if (code !== 0) {
-            throw new Error('failed to set keep screen on');
-        }
+        op_set_keep_screen_on(keepScreenOn);
     }, options);
 }
 
@@ -66,13 +60,7 @@ function setDeviceOrientation(options = {}) {
         return Promise.reject(res);
     }
     return wrapAsync('setDeviceOrientation', function () {
-        const code = op_set_device_orientation(value);
-        if (code === -2) {
-            throw new Error('invalid orientation value');
-        }
-        if (code !== 0) {
-            throw new Error('failed to set device orientation');
-        }
+        op_set_device_orientation(value);
     }, options);
 }
 

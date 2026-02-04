@@ -14,14 +14,6 @@ import * as updateMgr from "ext:host_v8_update/02_update_mgr.js"
 import * as lifeCycle from "ext:host_v8_lifecycle/01_lifecycle.js"
 import * as fileManager from "ext:host_v8_file_android/01_file_manager.js"
 import * as interaction from "ext:host_v8_ui/01_interaction.js"
-import * as deviceSensor from "ext:host_v8_device_android/01_device_sensor.js"
-import * as battery from "ext:host_v8_device_android/02_battery.js"
-import * as vibrate from "ext:host_v8_device_android/03_vibrate.js"
-import * as screen from "ext:host_v8_device_android/04_screen.js"
-import * as compassOps from "ext:host_v8_device_android/05_compass.js"
-import * as accelerometerOps from "ext:host_v8_device_android/06_accelerometer.js"
-import * as clipboardOps from "ext:host_v8_device_android/07_clipboard.js"
-import * as networkOps from "ext:host_v8_network_android/01_network.js"
 
 const { ObjectDefineProperties } = primordials;
 const properties = {
@@ -68,34 +60,6 @@ const properties = {
     hideLoading: core.propNonEnumerable(interaction.hideLoading),
     showActionSheet: core.propNonEnumerable(interaction.showActionSheet),
     _internalOnActionSheetResult: core.propNonEnumerable(interaction._internalOnActionSheetResult),
-    // Device Sensor
-    startDeviceMotionListening: core.propNonEnumerable(deviceSensor.startDeviceMotionListening),
-    stopDeviceMotionListening: core.propNonEnumerable(deviceSensor.stopDeviceMotionListening),
-    startGyroscope: core.propNonEnumerable(deviceSensor.startGyroscope),
-    stopGyroscope: core.propNonEnumerable(deviceSensor.stopGyroscope),
-    // Battery
-    getBatteryInfo: core.propNonEnumerable(battery.getBatteryInfo),
-    getBatteryInfoSync: core.propNonEnumerable(battery.getBatteryInfoSync),
-    // Vibration
-    vibrateShort: core.propNonEnumerable(vibrate.vibrateShort),
-    vibrateLong: core.propNonEnumerable(vibrate.vibrateLong),
-    // Screen
-    getScreenBrightness: core.propNonEnumerable(screen.getScreenBrightness),
-    setScreenBrightness: core.propNonEnumerable(screen.setScreenBrightness),
-    setKeepScreenOn: core.propNonEnumerable(screen.setKeepScreenOn),
-    setDeviceOrientation: core.propNonEnumerable(screen.setDeviceOrientation),
-    // Compass
-    startCompass: core.propNonEnumerable(compassOps.startCompass),
-    stopCompass: core.propNonEnumerable(compassOps.stopCompass),
-    // Accelerometer
-    startAccelerometer: core.propNonEnumerable(accelerometerOps.startAccelerometer),
-    stopAccelerometer: core.propNonEnumerable(accelerometerOps.stopAccelerometer),
-    // Network
-    getNetworkType: core.propNonEnumerable(networkOps.getNetworkType),
-    getLocalIPAddress: core.propNonEnumerable(networkOps.getLocalIPAddress),
-    // Clipboard
-    setClipboardData: core.propNonEnumerable(clipboardOps.setClipboardData),
-    getClipboardData: core.propNonEnumerable(clipboardOps.getClipboardData),
 };
 
 ObjectDefineProperties(globalThis, properties);
