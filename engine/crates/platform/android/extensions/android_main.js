@@ -20,6 +20,7 @@ import * as vibrate from "ext:host_v8_device_android/03_vibrate.js"
 import * as screen from "ext:host_v8_device_android/04_screen.js"
 import * as compassOps from "ext:host_v8_device_android/05_compass.js"
 import * as accelerometerOps from "ext:host_v8_device_android/06_accelerometer.js"
+import * as clipboardOps from "ext:host_v8_device_android/07_clipboard.js"
 import * as networkOps from "ext:host_v8_network_android/01_network.js"
 
 const { ObjectDefineProperties } = primordials;
@@ -92,6 +93,9 @@ const properties = {
     // Network
     getNetworkType: core.propNonEnumerable(networkOps.getNetworkType),
     getLocalIPAddress: core.propNonEnumerable(networkOps.getLocalIPAddress),
+    // Clipboard
+    setClipboardData: core.propNonEnumerable(clipboardOps.setClipboardData),
+    getClipboardData: core.propNonEnumerable(clipboardOps.getClipboardData),
 };
 
 ObjectDefineProperties(globalThis, properties);

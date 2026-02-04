@@ -519,3 +519,64 @@ pub fn get_local_ip_address_json() -> Result<String, String> {
         &[],
     )
 }
+
+// ==================== Clipboard ====================
+
+pub fn set_clipboard_data(host_id: i32, data: &str) -> Result<(), String> {
+    with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = cache
+            .get_method_id("setClipboardData")
+            .ok_or("Method ID not found")?;
+        let class = cache.class();
+
+        let jstr = env
+            .new_string(data)
+            .map_err(|e| format!("Failed to create Java string: {e}"))?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Primitive(Primitive::Int),
+                &[jvalue { i: host_id }, jvalue { l: jstr.into_raw() as *mut _ }],
+            )
+        };
+
+        match result {
+            Ok(val) => {
+                let code = val.i().unwrap_or(-1);
+                if code == 0 {
+                    Ok(())
+                } else {
+                    Err("Clipboard operation failed".to_string())
+                }
+            }
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("Failed to call setClipboardData: {e}"))
+            }
+        }
+    })
+}
+
+pub fn get_clipboard_data(host_id: i32) -> Result<String, String> {
+    call_static_method(
+        "getClipboardData",
+        ReturnType::Object,
+        |env, result| {
+            let jstring = result.l().map_err(|_| "Null string from Java")?;
+            let data = env
+                .get_string(&jni::objects::JString::from(jstring))
+                .map_err(|e| format!("Failed to convert clipboard string: {}", e))?
+                .into();
+            Ok(data)
+        },
+        &[jvalue { i: host_id }],
+    )
+}

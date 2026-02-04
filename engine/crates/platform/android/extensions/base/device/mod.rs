@@ -101,6 +101,22 @@ pub fn op_stop_accelerometer(state: &mut OpState) -> Result<(), JsErrorBox> {
     stop_accelerometer(host.id).map_err(|e| JsErrorBox::generic(e))
 }
 
+#[op2(fast)]
+pub fn op_set_clipboard_data(
+    state: &mut OpState,
+    #[string] data: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    set_clipboard_data(host.id, &data).map_err(|e| JsErrorBox::generic(e))
+}
+
+#[op2]
+#[string]
+pub fn op_get_clipboard_data(state: &mut OpState) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    get_clipboard_data(host.id).map_err(|e| JsErrorBox::generic(e))
+}
+
 extension!(host_v8_device_android,
     deps = [host_v8_device],
     ops = [
@@ -119,6 +135,8 @@ extension!(host_v8_device_android,
         op_stop_compass,
         op_start_accelerometer,
         op_stop_accelerometer,
+        op_set_clipboard_data,
+        op_get_clipboard_data,
     ],
     esm = [
         dir "android/extensions/base/device",
@@ -128,6 +146,7 @@ extension!(host_v8_device_android,
         "04_screen.js",
         "05_compass.js",
         "06_accelerometer.js",
+        "07_clipboard.js",
     ]
 );
 

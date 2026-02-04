@@ -7,6 +7,7 @@ import android.net.Uri;
 import android.provider.Settings;
 
 import com.migo.runtime.internal.platform.BatteryInfo;
+import com.migo.runtime.internal.platform.Clipboard;
 import com.migo.runtime.internal.platform.DeviceInfo;
 import com.migo.runtime.internal.platform.DeviceSensorManager;
 import com.migo.runtime.internal.platform.InteractionUI;
@@ -680,5 +681,39 @@ public final class NativeExports {
         if (mgr != null) {
             mgr.destroy();
         }
+    }
+
+    // ==================== Clipboard ====================
+
+    /**
+     * Set clipboard content.
+     * Shows a toast "内容已复制" for ~1.5 seconds.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     * @param data      The text data to copy
+     * @return 0 on success, -1 on failure
+     */
+    public static int setClipboardData(int sessionId, String data) {
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) return -1;
+        Activity activity = ctx.getActivity();
+        if (activity == null) return -1;
+        return Clipboard.setClipboardData(activity, data);
+    }
+
+    /**
+     * Get clipboard content.
+     * Called from native code via JNI.
+     *
+     * @param sessionId The session ID
+     * @return The clipboard text content, or empty string if unavailable
+     */
+    public static String getClipboardData(int sessionId) {
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) return "";
+        Activity activity = ctx.getActivity();
+        if (activity == null) return "";
+        return Clipboard.getClipboardData(activity);
     }
 }
