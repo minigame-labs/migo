@@ -48,18 +48,66 @@ dependencies {
 
 2. Initialize the engine in your Activity:
 
-```kotlin
-class GameActivity : Activity() {
-    private lateinit var gameView: MiniGameView
+```java
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import com.migo.runtime.MigoRuntime;
+import com.migo.runtime.RuntimeConfig;
+import com.migo.runtime.GameSession;
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+public class GameActivity extends Activity {
+    private SurfaceView surfaceView;
+    private GameSession session;
 
-        gameView = MiniGameView(this)
-        setContentView(gameView)
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
 
-        // Load and run a mini-game
-        gameView.loadGame("path/to/game")
+        surfaceView = new SurfaceView(this);
+        setContentView(surfaceView);
+
+        surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(SurfaceHolder holder) {
+                // 1. Create configuration
+                RuntimeConfig config = new RuntimeConfig.Builder(GameActivity.this)
+                    .setDebugEnabled(true)
+                    .build();
+
+                // 2. Create session
+                // "gameId" is used to isolate data directories for different games
+                session = MigoRuntime.getInstance().createSession(
+                    GameActivity.this,
+                    holder.getSurface(),
+                    config,
+                    "gameId"
+                );
+
+                // 3. Start game
+                session.startGame("game.js");
+            }
+
+            @Override
+            public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                if (session != null) {
+                    session.updateSurface(holder.getSurface());
+                }
+            }
+
+            @Override
+            public void surfaceDestroyed(SurfaceHolder holder) {
+                // Keep session alive, only clean up in onDestroy
+            }
+        });
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (session != null) {
+            session.close();
+            session = null;
+        }
+        super.onDestroy();
     }
 }
 ```
@@ -68,9 +116,8 @@ class GameActivity : Activity() {
 
 #### Prerequisites
 
-- Rust 1.75+ with the following targets:
+- Rust 1.85+ (Edition 2024 required), with targets:
   - `aarch64-linux-android`
-  - `armv7-linux-androideabi`
   - `x86_64-linux-android`
 - Android NDK r23+
 - JDK 11+
@@ -78,11 +125,15 @@ class GameActivity : Activity() {
 #### Build Commands
 
 ```bash
-# Build Android AAR (PowerShell)
+# Linux/macOS
+./scripts/build-aar.sh release
+
+# Windows (PowerShell)
 ./scripts/build-aar.ps1 -BuildType release
 
-# Build for a specific ABI
-./scripts/build-aar.ps1 -Architectures arm64-v8a
+# Build for specific architecture
+./scripts/build-aar.sh release arm64-v8a  # Linux/macOS
+./scripts/build-aar.ps1 -Architectures arm64-v8a  # Windows
 ```
 
 ## Project Structure

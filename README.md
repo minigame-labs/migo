@@ -48,42 +48,66 @@ dependencies {
 
 2. 在 Activity 中初始化引擎：
 
-```kotlin
-import android.view.SurfaceHolder
-import android.view.SurfaceView
-import com.minigame.host.MiniGameSDK
-import com.minigame.host.InitOption
+```java
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import com.migo.runtime.MigoRuntime;
+import com.migo.runtime.RuntimeConfig;
+import com.migo.runtime.GameSession;
 
-class GameActivity : Activity(), SurfaceHolder.Callback {
-    private lateinit var surfaceView: SurfaceView
-    private var hostHandle: com.minigame.host.HostHandle? = null
+public class GameActivity extends Activity {
+    private SurfaceView surfaceView;
+    private GameSession session;
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
 
-        surfaceView = SurfaceView(this)
-        surfaceView.holder.addCallback(this)
-        setContentView(surfaceView)
+        surfaceView = new SurfaceView(this);
+        setContentView(surfaceView);
+
+        surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(SurfaceHolder holder) {
+                // 1. 创建配置
+                RuntimeConfig config = new RuntimeConfig.Builder(GameActivity.this)
+                    .setDebugEnabled(true)
+                    .build();
+
+                // 2. 创建会话
+                // "gameId" 用于隔离不同游戏的数据目录
+                session = MigoRuntime.getInstance().createSession(
+                    GameActivity.this,
+                    holder.getSurface(),
+                    config,
+                    "gameId" 
+                );
+
+                // 3. 启动游戏
+                session.startGame("game.js");
+            }
+
+            @Override
+            public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                if (session != null) {
+                    session.updateSurface(holder.getSurface());
+                }
+            }
+
+            @Override
+            public void surfaceDestroyed(SurfaceHolder holder) {
+                // 保持会话存活，仅在 onDestroy 中清理
+            }
+        });
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        val option = InitOption.Builder(this).build()
-        hostHandle = MiniGameSDK.getInstance().initialize(
-            holder.surface,
-            this,
-            option
-        )
-
-        // 加载并运行小游戏
-        hostHandle?.startGame("/path/to/game", "game.js")
-    }
-
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        hostHandle?.updateSurface(holder.surface)
-    }
-
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        hostHandle?.destroy()
+    @Override
+    protected void onDestroy() {
+        if (session != null) {
+            session.close();
+            session = null;
+        }
+        super.onDestroy();
     }
 }
 ```
