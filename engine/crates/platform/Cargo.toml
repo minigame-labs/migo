@@ -6,7 +6,7 @@ edition = "2024"
 [lib]
 name = "platform"
 path = "lib.rs"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 lazy_static = "1.5.0"
@@ -20,12 +20,13 @@ futures = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
-tracing-android = { workspace = true }
 tracing-subscriber = { workspace = true }
 smallvec = { workspace = true }
 deno_error = { workspace = true }
-
-jni = "0.21"
-ndk-context = "0.1"
 deno_core = { workspace = true }
 raw-window-handle = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+tracing-android = { workspace = true }
