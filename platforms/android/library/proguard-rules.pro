@@ -11,20 +11,12 @@
 # Keep all native method declarations in NativeBridge
 # These are registered dynamically via JNI_OnLoad and must not be renamed
 -keep class com.migo.runtime.internal.NativeBridge {
-    native <methods>;
-    # Keep the static initializer that loads the native library
-    static { *; }
+    *;
 }
 
 # Keep NativeExports - called from native Rust code via cached method IDs
-# Method signatures must match exactly what Rust expects
 -keep class com.migo.runtime.internal.NativeExports {
-    static java.lang.String getCacheDirPath();
-    static void openSystemBluetoothSetting(int);
-    static byte[] getWindowInfoBytes(int);
-    static byte[] getSystemSettingInfoBytes();
-    static java.lang.String getDeviceInfoJson();
-    static java.lang.String getAppAuthorizationSettingJson();
+    *;
 }
 
 # ============================================================================
