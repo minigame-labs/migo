@@ -12,7 +12,7 @@ use shared::{
 
 /// Native unzip operation using Rust's `zip` crate.
 /// Executes on the IO thread for unified IO scheduling.
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_unzip(
     state: Rc<RefCell<OpState>>,
     #[string] zip_file_path: String,
@@ -42,5 +42,5 @@ extension!(host_v8_file_android,
 );
 
 pub fn file_extensions() -> Vec<Extension> {
-    vec![host_v8_file_android::init_ops_and_esm()]
+    vec![host_v8_file_android::init()]
 }

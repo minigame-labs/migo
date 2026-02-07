@@ -128,5 +128,5 @@ extension!(host_v8_webgl,
 );
 
 pub(super) fn webgl_extensions() -> Vec<deno_core::Extension> {
-    vec![host_v8_webgl::init_ops_and_esm()]
+    vec![host_v8_webgl::init()]
 }

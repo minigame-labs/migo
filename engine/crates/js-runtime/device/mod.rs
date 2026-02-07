@@ -331,5 +331,5 @@ deno_core::extension!(
 );
 
 pub fn device_extensions() -> Vec<Extension> {
-    vec![host_v8_device::init_ops_and_esm()]
+    vec![host_v8_device::init()]
 }

@@ -34,5 +34,5 @@ extension!(
 );
 
 pub(crate) fn web_extensions() -> Vec<deno_core::Extension> {
-    vec![host_v8_web::init_ops_and_esm()]
+    vec![host_v8_web::init()]
 }

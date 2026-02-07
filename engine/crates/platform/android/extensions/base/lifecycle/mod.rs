@@ -8,5 +8,5 @@ extension!(host_v8_lifecycle,
 );
 
 pub fn lifecycle_extensions() -> Vec<Extension> {
-    vec![host_v8_lifecycle::init_ops_and_esm()]
+    vec![host_v8_lifecycle::init()]
 }

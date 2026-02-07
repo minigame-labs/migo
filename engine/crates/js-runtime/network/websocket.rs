@@ -74,7 +74,7 @@ pub struct WsCreateResult {
     pub extensions: String,
 }
 
-#[op2(async)]
+#[op2(async(lazy))]
 #[serde]
 pub async fn op_ws_create(
     state: Rc<RefCell<OpState>>,
@@ -159,7 +159,7 @@ pub async fn op_ws_create(
 
 // ── op_ws_next_event ──
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_ws_next_event(
     state: Rc<RefCell<OpState>>,
@@ -224,7 +224,7 @@ pub async fn op_ws_next_event(
 
 // ── op_ws_send ──
 
-#[op2(async)]
+#[op2(async(lazy))]
 pub async fn op_ws_send(
     state: Rc<RefCell<OpState>>,
     #[smi] rid: ResourceId,
@@ -253,7 +253,7 @@ pub async fn op_ws_send(
 
 // ── op_ws_close ──
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_ws_close(
     state: Rc<RefCell<OpState>>,
     #[smi] rid: ResourceId,

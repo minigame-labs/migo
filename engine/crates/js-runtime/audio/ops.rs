@@ -64,7 +64,7 @@ fn get_audio_tx(state: Rc<RefCell<OpState>>) -> UnboundedSender<AudioCmd> {
 // Context Operations
 // ============================================================================
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 #[smi]
 pub async fn op_audio_create_context(
     state: Rc<RefCell<OpState>>,
@@ -91,7 +91,7 @@ pub async fn op_audio_create_context(
         .map_err(AudioError::from)
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_audio_close_context(
     state: Rc<RefCell<OpState>>,
     #[smi] ctx_id: AudioContextId,
@@ -115,7 +115,7 @@ pub async fn op_audio_close_context(
 // Buffer Operations
 // ============================================================================
 
-#[op2(async)]
+#[op2(async(lazy))]
 #[serde]
 pub async fn op_audio_decode_audio_data(
     state: Rc<RefCell<OpState>>,
@@ -155,7 +155,7 @@ pub fn op_audio_create_buffer_source(
         .map_err(|_| audio_err("Audio thread disconnected"))
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_audio_set_buffer(
     state: Rc<RefCell<OpState>>,
     #[smi] node_id: AudioNodeId,
@@ -177,7 +177,7 @@ pub async fn op_audio_set_buffer(
         .map_err(AudioError::from)
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_audio_start(
     state: Rc<RefCell<OpState>>,
     #[smi] node_id: AudioNodeId,
@@ -210,7 +210,7 @@ pub async fn op_audio_start(
         .map_err(AudioError::from)
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_audio_stop(
     state: Rc<RefCell<OpState>>,
     #[smi] node_id: AudioNodeId,
@@ -286,7 +286,7 @@ pub fn op_audio_set_gain_value(
 // Graph Operations
 // ============================================================================
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_audio_connect(
     state: Rc<RefCell<OpState>>,
     #[smi] src: AudioNodeId,
@@ -308,7 +308,7 @@ pub async fn op_audio_connect(
         .map_err(AudioError::from)
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_audio_disconnect(
     state: Rc<RefCell<OpState>>,
     #[smi] node_id: AudioNodeId,
@@ -356,7 +356,7 @@ pub fn op_inner_audio_destroy(
 }
 
 /// Load audio data into InnerAudioContext (full load mode - deprecated, use op_inner_audio_load_url)
-#[op2(async)]
+#[op2(async(lazy))]
 #[serde]
 pub async fn op_inner_audio_load(
     state: Rc<RefCell<OpState>>,
@@ -405,7 +405,7 @@ fn resolve_path(code_dir: Option<&str>, path: &str) -> String {
 /// Load audio from URL or local path
 /// - HTTP/HTTPS URLs: streaming download (edge-download-edge-play)
 /// - Local paths: read file and load synchronously
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_inner_audio_load_url(
     state: Rc<RefCell<OpState>>,
     #[smi] id: InnerAudioId,
@@ -556,7 +556,7 @@ pub fn op_inner_audio_set_autoplay(
 }
 
 /// Get current state
-#[op2(async)]
+#[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_inner_audio_get_state(
     state: Rc<RefCell<OpState>>,

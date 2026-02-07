@@ -9,5 +9,5 @@ extension!(host_v8_update,
 );
 
 pub fn update_extensions() -> Vec<Extension> {
-    vec![host_v8_update::init_ops_and_esm()]
+    vec![host_v8_update::init()]
 }

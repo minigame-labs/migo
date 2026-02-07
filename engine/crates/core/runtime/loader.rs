@@ -1,8 +1,8 @@
 use std::{borrow::Cow, future::Future, pin::Pin};
 
 use deno_core::{
-    FsModuleLoader, ModuleLoadResponse, ModuleLoader, ModuleSource, ModuleSourceCode,
-    ModuleSpecifier, RequestedModuleType, ResolutionKind, error::ModuleLoaderError,
+    FsModuleLoader, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader,
+    ModuleSource, ModuleSourceCode, ModuleSpecifier, ResolutionKind, error::ModuleLoaderError,
 };
 
 pub(crate) struct MyModuleLoader(pub(crate) FsModuleLoader);
@@ -42,16 +42,12 @@ impl MyModuleLoader {
 
     #[inline]
     fn patch_amd(mut source: ModuleSource) -> Result<ModuleSource, ModuleLoaderError> {
-        let mut code = String::from_utf8_lossy(source.code.as_bytes()).into_owned();
+        let code = String::from_utf8_lossy(source.code.as_bytes());
 
         if code.contains("define.amd") || code.contains("typeof define") {
-            code = format!(
-                r#"{orig}
-export default globalThis._lastDefinedModule;
-"#,
-                orig = code
-            );
-            source.code = ModuleSourceCode::String(code.into());
+            let mut patched = code.into_owned();
+            patched.push_str("\nexport default globalThis._lastDefinedModule;\n");
+            source.code = ModuleSourceCode::String(patched.into());
         }
 
         Ok(source)
@@ -72,15 +68,13 @@ impl ModuleLoader for MyModuleLoader {
     fn load(
         &self,
         module_specifier: &ModuleSpecifier,
-        maybe_referrer: Option<&ModuleSpecifier>,
-        is_dyn_import: bool,
-        requested_module_type: RequestedModuleType,
+        maybe_referrer: Option<&ModuleLoadReferrer>,
+        options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let resp = self.0.load(
             module_specifier,
             maybe_referrer,
-            is_dyn_import,
-            requested_module_type,
+            options,
         );
 
         match resp {
@@ -102,10 +96,11 @@ impl ModuleLoader for MyModuleLoader {
         &self,
         module_specifier: &ModuleSpecifier,
         maybe_referrer: Option<String>,
-        is_dyn_import: bool,
+        maybe_content: Option<String>,
+        options: ModuleLoadOptions,
     ) -> Pin<Box<dyn Future<Output = Result<(), ModuleLoaderError>>>> {
         self.0
-            .prepare_load(module_specifier, maybe_referrer, is_dyn_import)
+            .prepare_load(module_specifier, maybe_referrer, maybe_content, options)
     }
 
     fn finish_load(&self) {}

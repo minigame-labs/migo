@@ -55,5 +55,5 @@ extension!(host_v8_ui,
 );
 
 pub fn ui_extensions() -> Vec<Extension> {
-    vec![host_v8_ui::init_ops_and_esm()]
+    vec![host_v8_ui::init()]
 }

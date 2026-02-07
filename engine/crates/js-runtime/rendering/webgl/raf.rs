@@ -6,12 +6,14 @@ use std::sync::{Arc, Mutex};
 // TODO: remove this
 pub type CallbackMap = Arc<Mutex<HashMap<u32, v8::Global<v8::Function>>>>;
 
-#[op2]
+#[op2(fast)]
 pub(crate) fn op_register_raf_callback(
+    scope: &mut v8::PinScope,
     state: &mut OpState,
     #[smi] callback_id: u32,
-    #[global] callback: v8::Global<v8::Function>,
+    callback: v8::Local<v8::Function>,
 ) {
+    let callback = v8::Global::new(scope, callback);
     let cb_map = state.borrow::<CallbackMap>();
     cb_map.lock().unwrap().insert(callback_id, callback);
 }

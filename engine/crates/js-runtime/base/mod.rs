@@ -17,5 +17,5 @@ deno_core::extension!(
 );
 
 pub fn base_extensions(host: HostOpState) -> Vec<Extension> {
-    vec![host_v8_base::init_ops_and_esm(host)]
+    vec![host_v8_base::init(host)]
 }

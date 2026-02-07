@@ -8,5 +8,5 @@ esm = [
 );
 
 pub fn touch_extensions() -> Vec<Extension> {
-    vec![host_v8_touch::init_ops_and_esm()]
+    vec![host_v8_touch::init()]
 }

@@ -42,7 +42,7 @@ impl JsBindings {
 
     pub(crate) fn reload(&mut self, rt: &mut deno_core::JsRuntime, host_id: i32) {
         fn get_global_fn<'s>(
-            scope: &mut v8::HandleScope<'s>,
+            scope: &v8::PinScope<'s, '_>,
             global: v8::Local<'s, v8::Object>,
             name: &'static str,
         ) -> Option<v8::Global<v8::Function>> {
@@ -88,15 +88,15 @@ impl JsBindings {
     fn with_main_context<R>(
         &self,
         rt: &mut deno_core::JsRuntime,
-        f: impl for<'s> FnOnce(
-            &mut v8::HandleScope<'s>,
+        f: impl for<'s, 'i> FnOnce(
+            &v8::PinScope<'s, 'i>,
             v8::Local<'s, v8::Context>,
             v8::Local<'s, v8::Object>,
         ) -> R,
     ) -> R {
-        let scope = &mut rt.handle_scope();
+        let isolate = rt.v8_isolate();
+        v8::scope_with_context!(scope, isolate, &self.main_js_context);
         let context = v8::Local::new(scope, &self.main_js_context);
-        let scope = &mut v8::ContextScope::new(scope, context);
         let global = context.global(scope);
         f(scope, context, global)
     }

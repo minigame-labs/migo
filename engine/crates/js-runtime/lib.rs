@@ -145,7 +145,7 @@ deno_core::extension!(
 /// 10. `audio` - WebAudio/InnerAudio
 /// 11. `runtime` - Entry point script
 pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
-    let runtime_extensions = vec![runtime::init_ops_and_esm()];
+    let runtime_extensions = vec![runtime::init()];
 
     base::base_extensions(host)
         .into_iter()

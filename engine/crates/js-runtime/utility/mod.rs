@@ -15,5 +15,5 @@ extension!(
 );
 
 pub(crate) fn utility_extensions() -> Vec<deno_core::Extension> {
-    vec![host_v8_utility::init_ops_and_esm()]
+    vec![host_v8_utility::init()]
 }

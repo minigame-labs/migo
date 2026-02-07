@@ -446,7 +446,7 @@ impl Resource for FetchResponseResource {
     }
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_fetch_send(
     state: Rc<RefCell<OpState>>,
@@ -552,7 +552,7 @@ pub struct FetchUploadResult {
     pub error: Option<String>,
 }
 
-#[op2(async)]
+#[op2(async(lazy))]
 #[serde]
 #[allow(clippy::too_many_arguments)]
 pub async fn op_fetch_upload(

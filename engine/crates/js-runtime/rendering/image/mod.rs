@@ -149,7 +149,7 @@ async fn op_load_image_inner(
     }
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_load_image(
     state: Rc<RefCell<OpState>>,
@@ -179,7 +179,7 @@ pub fn op_destroy_image(state: &mut OpState, #[smi] image_id: u32) -> bool {
 
 /// Preload multiple images in parallel
 /// Returns array of [path, success, width, height, error_msg]
-#[op2(async)]
+#[op2(async(lazy))]
 #[serde]
 pub async fn op_preload_images(
     state: Rc<RefCell<OpState>>,
@@ -223,7 +223,7 @@ pub async fn op_preload_images(
 }
 
 /// Clear the image cache
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_clear_image_cache(state: Rc<RefCell<OpState>>) -> Result<(), JsErrorBox> {
     let io_tx = {
         let op = state.borrow();
@@ -239,7 +239,7 @@ pub async fn op_clear_image_cache(state: Rc<RefCell<OpState>>) -> Result<(), JsE
 }
 
 /// Get image cache statistics
-#[op2(async)]
+#[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_get_image_cache_stats(
     state: Rc<RefCell<OpState>>,
@@ -275,5 +275,5 @@ extension!(host_v8_image,
 );
 
 pub(super) fn image_extensions() -> Vec<deno_core::Extension> {
-    vec![host_v8_image::init_ops_and_esm()]
+    vec![host_v8_image::init()]
 }

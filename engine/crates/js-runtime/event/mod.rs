@@ -9,5 +9,5 @@ extension!(
 );
 
 pub fn event_extensions() -> Vec<Extension> {
-    vec![host_v8_event::init_ops_and_esm()]
+    vec![host_v8_event::init()]
 }

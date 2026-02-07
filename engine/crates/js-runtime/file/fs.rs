@@ -175,7 +175,7 @@ fn prepare_data(
 //
 // Access - check if path exists (uses VFS)
 //
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_access(
     state: Rc<RefCell<OpState>>,
     #[string] path: String,
@@ -212,7 +212,7 @@ pub fn op_access_sync(state: &mut OpState, #[string] path: String) -> Result<boo
 //
 // Write / append (path) - uses VFS with Write/Create permission
 //
-#[op2(async)]
+#[op2(async(lazy))]
 pub async fn op_write_or_append_file(
     state: Rc<RefCell<OpState>>,
     #[string] path: String,
@@ -295,7 +295,7 @@ pub fn op_write_or_append_file_sync(
 //
 // Open / close - uses VFS with appropriate permission based on open flag
 //
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_open_file(
     state: Rc<RefCell<OpState>>,
     #[string] path: String,
@@ -336,7 +336,7 @@ pub fn op_open_file_sync(
     .map_err(IOError::from)
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_close_file(state: Rc<RefCell<OpState>>, #[smi] rid: FileId) -> Result<(), IOError> {
     let tx = get_io_tx_async(state);
 
@@ -362,7 +362,7 @@ pub fn op_close_file_sync(state: &mut OpState, #[smi] rid: FileId) -> Result<(),
 //
 // Copy - uses VFS for both source (Read) and destination (Create)
 //
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_copy_file(
     state: Rc<RefCell<OpState>>,
     #[string] src_path: String,
@@ -404,7 +404,7 @@ pub fn op_copy_file_sync(
 //
 // fstat / ftruncate
 //
-#[op2(async)]
+#[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_fstat(
     state: Rc<RefCell<OpState>>,
@@ -432,7 +432,7 @@ pub fn op_fstat_sync(state: &mut OpState, #[smi] rid: FileId) -> Result<FileStat
     .map_err(IOError::from)
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_ftruncate(
     state: Rc<RefCell<OpState>>,
     #[smi] rid: FileId,
@@ -468,7 +468,7 @@ pub fn op_ftruncate_sync(
 //
 // mkdir / readdir - uses VFS with Create/Read permissions
 //
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_mkdir(
     state: Rc<RefCell<OpState>>,
     #[string] dir_path: String,
@@ -505,7 +505,7 @@ pub fn op_mkdir_sync(
     .map_err(IOError::from)
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_readdir(
     state: Rc<RefCell<OpState>>,
@@ -543,7 +543,7 @@ pub fn op_readdir_sync(
 //
 // unlink / rename / rmdir - uses VFS with Delete/Write permissions
 //
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_unlink(
     state: Rc<RefCell<OpState>>,
     #[string] file_path: String,
@@ -573,7 +573,7 @@ pub fn op_unlink_sync(state: &mut OpState, #[string] file_path: String) -> Resul
     .map_err(IOError::from)
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_rename(
     state: Rc<RefCell<OpState>>,
     #[string] old_path: String,
@@ -613,7 +613,7 @@ pub fn op_rename_sync(
     .map_err(IOError::from)
 }
 
-#[op2(async)]
+#[op2(async(lazy), fast)]
 pub async fn op_rmdir(
     state: Rc<RefCell<OpState>>,
     #[string] dir_path: String,
@@ -653,7 +653,7 @@ pub fn op_rmdir_sync(
 //
 // stat - uses VFS with Read permission
 //
-#[op2(async)]
+#[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_stat(
     state: Rc<RefCell<OpState>>,
@@ -695,7 +695,7 @@ pub fn op_stat_sync(
 //
 // write(fd)
 //
-#[op2(async)]
+#[op2(async(lazy))]
 #[bigint]
 pub async fn op_write_file(
     state: Rc<RefCell<OpState>>,
@@ -770,7 +770,7 @@ pub fn op_write_file_sync(
 //
 // readFile (path) - uses VFS for path resolution
 //
-#[op2(async)]
+#[op2(async(lazy))]
 #[serde]
 pub async fn op_read_file(
     state: Rc<RefCell<OpState>>,

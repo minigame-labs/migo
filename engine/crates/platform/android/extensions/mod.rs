@@ -15,7 +15,7 @@ deno_core::extension!(
 );
 
 pub fn android_extensions(_: &InitOptions) -> Vec<deno_core::Extension> {
-    let runtime_extensions = vec![android_runtime::init_ops_and_esm()];
+    let runtime_extensions = vec![android_runtime::init()];
 
     base_extensions()
         .into_iter()

@@ -9,5 +9,5 @@ extension!(host_v8_url,
 );
 
 pub(crate) fn url_extensions() -> Vec<deno_core::Extension> {
-    vec![host_v8_url::init_ops_and_esm()]
+    vec![host_v8_url::init()]
 }

@@ -45,5 +45,5 @@ extension!(host_v8_network,
 
 
 pub(crate) fn network_extensions() -> Vec<deno_core::Extension> {
-    vec![host_v8_network::init_ops_and_esm(Default::default())]
+    vec![host_v8_network::init(Default::default())]
 }

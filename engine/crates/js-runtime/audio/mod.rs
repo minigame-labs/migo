@@ -59,5 +59,5 @@ extension!(host_v8_audio,
 );
 
 pub fn audio_extensions() -> Vec<Extension> {
-    vec![host_v8_audio::init_ops_and_esm()]
+    vec![host_v8_audio::init()]
 }

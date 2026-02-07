@@ -54,5 +54,5 @@ extension!(host_v8_file,
 );
 
 pub fn file_extensions() -> Vec<Extension> {
-    vec![host_v8_file::init_ops_and_esm()]
+    vec![host_v8_file::init()]
 }
