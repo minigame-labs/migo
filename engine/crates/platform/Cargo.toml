@@ -21,7 +21,6 @@ tokio = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-smallvec = { workspace = true }
 deno_error = { workspace = true }
 deno_core = { workspace = true }
 raw-window-handle = { workspace = true }

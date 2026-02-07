@@ -157,10 +157,11 @@ impl Host {
 
             HostCommand::OnTouch {
                 touch_type,
+                count,
                 points,
                 timestamp_ms,
             } => {
-                self.js.dispatch_touch(touch_type, &points, timestamp_ms);
+                self.js.dispatch_touch(touch_type, &points[..count as usize], timestamp_ms);
                 Ok(())
             }
 

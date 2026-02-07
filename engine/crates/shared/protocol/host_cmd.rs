@@ -26,7 +26,6 @@
 //! - **Audio Events**: `InnerAudioEvent`
 
 use crate::surface::SurfaceRef;
-use smallvec::SmallVec;
 
 /// Commands sent to the host runtime thread.
 ///
@@ -52,7 +51,8 @@ use smallvec::SmallVec;
 /// // Send touch event
 /// let cmd = HostCommand::OnTouch {
 ///     touch_type: TouchType::Start,
-///     points: smallvec![TouchPoint { id: 0, x: 100.0, y: 200.0, .. }],
+///     count: 1,
+///     points: Default::default(), // filled via ptr::copy_nonoverlapping
 ///     timestamp_ms: 1234567890,
 /// };
 /// ```
@@ -131,13 +131,16 @@ pub enum HostCommand {
 
     /// Dispatch touch input events to the game.
     ///
-    /// Touch points are flattened from the platform's native format
-    /// and delivered as a batch for efficiency.
+    /// Touch data is stored inline — fixed `[TouchPoint; 10]` array with a count.
+    /// No heap allocation, single memcpy from JNI DirectByteBuffer.
     OnTouch {
         /// Type of touch event (start, move, end, cancel).
         touch_type: TouchType,
-        /// Array of active touch points (optimized for ≤8 simultaneous touches).
-        points: SmallVec<[TouchPoint; 8]>,
+        /// Number of valid touch points in the `points` array.
+        count: u8,
+        /// Fixed inline array of touch points (max 10 simultaneous).
+        /// Only `points[..count]` are valid.
+        points: [TouchPoint; 10],
         /// Event timestamp in milliseconds (from system boot or epoch).
         timestamp_ms: i64,
     },

@@ -9,7 +9,6 @@ use jni::objects::{JByteBuffer, JClass, JObject, JString};
 use jni::sys::{jdouble, jint, jlong, jobject, jstring};
 use jni::{JNIEnv, JavaVM};
 
-use smallvec::SmallVec;
 use tracing::{error, info};
 
 use core::{send_command_to_host, shutdown_host, spawn_host_thread};
@@ -233,7 +232,7 @@ pub(crate) extern "system" fn onTouch(
     count: jint,
     buffer: JObject,
 ) {
-    if count <= 0 {
+    if count <= 0 || count > 10 {
         return;
     }
 
@@ -247,7 +246,10 @@ pub(crate) extern "system" fn onTouch(
         }
     };
 
-    // Validate buffer capacity before creating slice
+    let n = count as usize;
+    let expected_size = n * std::mem::size_of::<TouchPoint>();
+
+    // Validate buffer capacity before reading
     let capacity = match env.get_direct_buffer_capacity(&buf) {
         Ok(cap) => cap,
         Err(e) => {
@@ -256,7 +258,6 @@ pub(crate) extern "system" fn onTouch(
         }
     };
 
-    let expected_size = (count as usize) * std::mem::size_of::<TouchPoint>();
     if expected_size > capacity {
         error!(
             "onTouch failed: buffer underflow - expected {} bytes, got {} bytes",
@@ -265,12 +266,17 @@ pub(crate) extern "system" fn onTouch(
         return;
     }
 
-    // SAFETY: We have verified that:
-    // 1. addr is a valid pointer from get_direct_buffer_address
-    // 2. The buffer has sufficient capacity for `count` TouchPoints
-    // 3. TouchPoint memory layout matches Java side packing (repr(C))
-    let slice = unsafe { std::slice::from_raw_parts(addr as *const TouchPoint, count as usize) };
-    let points: SmallVec<[TouchPoint; 8]> = slice.iter().copied().collect();
+    // Single memcpy from DirectByteBuffer into fixed inline array — no heap allocation.
+    // SAFETY: addr is valid (from get_direct_buffer_address), capacity verified,
+    // TouchPoint is repr(C) matching the Java-side packing.
+    let mut points = [TouchPoint::default(); 10];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            addr as *const TouchPoint,
+            points.as_mut_ptr(),
+            n,
+        );
+    }
 
     let touch_type = match action {
         0 | 5 => TouchType::Start,
@@ -282,6 +288,7 @@ pub(crate) extern "system" fn onTouch(
 
     let cmd = HostCommand::OnTouch {
         touch_type,
+        count: n as u8,
         points,
         timestamp_ms: time as i64,
     };
