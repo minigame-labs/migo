@@ -641,12 +641,12 @@ public final class NativeExports {
      * Get current network type as JSON string.
      *
      * @param sessionId The session ID
-     * @return JSON string with networkType, isConnected
+     * @return JSON string with networkType, isConnected, signalStrength, hasSystemProxy, weakNet
      */
     public static String getNetworkTypeJson(int sessionId) {
         NetworkMonitor mgr = getOrCreateNetworkMonitor(sessionId);
         if (mgr == null) {
-            return "{\"networkType\":\"none\",\"isConnected\":false}";
+            return "{\"networkType\":\"none\",\"isConnected\":false,\"signalStrength\":0,\"hasSystemProxy\":false,\"weakNet\":false}";
         }
 
         NetworkMonitor.NetworkStatus status = mgr.getNetworkStatus();
@@ -658,9 +658,12 @@ public final class NativeExports {
         }
 
         return String.format(
-                "{\"networkType\":\"%s\",\"isConnected\":%s}",
+                "{\"networkType\":\"%s\",\"isConnected\":%s,\"signalStrength\":%d,\"hasSystemProxy\":%s,\"weakNet\":%s}",
                 status.networkType,
-                status.isConnected
+                status.isConnected,
+                status.signalStrength,
+                status.hasSystemProxy,
+                status.weakNet
         );
     }
 

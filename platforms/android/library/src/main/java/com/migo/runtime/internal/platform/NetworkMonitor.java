@@ -6,8 +6,11 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
 import android.net.NetworkRequest;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.telephony.TelephonyManager;
+import android.text.TextUtils;
 
 import com.migo.runtime.internal.NativeMethods;
 
@@ -27,11 +30,13 @@ import java.util.Enumeration;
 public final class NetworkMonitor {
 
     private final int sessionId;
+    private final Context context;
     private final ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
 
     public NetworkMonitor(int sessionId, Context context) {
         this.sessionId = sessionId;
+        this.context = context;
         this.connectivityManager = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
     }
 
@@ -100,36 +105,77 @@ public final class NetworkMonitor {
         }
 
         try {
+            String networkType = "none";
+            boolean isConnected = false;
+            int signalStrength = 0;
+            boolean hasSystemProxy = checkSystemProxy();
+            boolean weakNet = false;
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 Network network = connectivityManager.getActiveNetwork();
-                if (network == null) {
-                    return new NetworkStatus(false, "none", null);
+                if (network != null) {
+                    NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
+                    if (capabilities != null) {
+                        networkType = getNetworkTypeFromCapabilities(capabilities);
+                        isConnected = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+                        
+                        // Calculate signal strength and weak net status
+                        if ("wifi".equals(networkType)) {
+                            signalStrength = getWifiSignalStrength();
+                        } else {
+                            // TODO: Implement cellular signal strength
+                            signalStrength = 0; 
+                        }
+                    }
                 }
-
-                NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
-                if (capabilities == null) {
-                    return new NetworkStatus(false, "none", null);
-                }
-
-                String networkType = getNetworkTypeFromCapabilities(capabilities);
-                boolean isConnected = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                        && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
-
-                return new NetworkStatus(isConnected, networkType, null);
             } else {
                 // Fallback for API 21-22
                 NetworkInfo activeNetwork = connectivityManager.getActiveNetworkInfo();
-                if (activeNetwork == null || !activeNetwork.isConnected()) {
-                    return new NetworkStatus(false, "none", null);
+                if (activeNetwork != null && activeNetwork.isConnected()) {
+                    networkType = getNetworkTypeFromNetworkInfo(activeNetwork);
+                    isConnected = true;
+                    if ("wifi".equals(networkType)) {
+                         signalStrength = getWifiSignalStrength();
+                    }
                 }
-
-                String networkType = getNetworkTypeFromNetworkInfo(activeNetwork);
-                return new NetworkStatus(true, networkType, null);
             }
+
+            // Simple heuristic for weak network based on signal strength
+            // This is a simplified logic, real implementation might be more complex
+            if (isConnected && "wifi".equals(networkType) && signalStrength < -85) {
+                weakNet = true;
+            }
+
+            return new NetworkStatus(isConnected, networkType, signalStrength, hasSystemProxy, weakNet, null);
+
         } catch (SecurityException e) {
-            return new NetworkStatus(false, "none", "getNetworkType:fail:no permission (ACCESS_NETWORK_STATE)");
+            return new NetworkStatus(false, "none", "getNetworkType:fail:no permission (android.permission.ACCESS_NETWORK_STATE)");
         } catch (Exception e) {
             return new NetworkStatus(false, "none", "getNetworkType:fail:" + e.getMessage());
+        }
+    }
+
+    private int getWifiSignalStrength() {
+        try {
+            WifiManager wifiManager = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            WifiInfo wifiInfo = wifiManager.getConnectionInfo();
+            if (wifiInfo != null) {
+                return wifiInfo.getRssi();
+            }
+        } catch (Exception e) {
+            android.util.Log.e("NetworkMonitor", "getWifiSignalStrength failed", e);
+        }
+        return 0;
+    }
+
+    private boolean checkSystemProxy() {
+        try {
+            String host = System.getProperty("http.proxyHost");
+            String port = System.getProperty("http.proxyPort");
+            return !TextUtils.isEmpty(host) && !TextUtils.isEmpty(port);
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -248,12 +294,23 @@ public final class NetworkMonitor {
     public static class NetworkStatus {
         public final boolean isConnected;
         public final String networkType;
+        public final int signalStrength;
+        public final boolean hasSystemProxy;
+        public final boolean weakNet;
         public final String error;
 
-        public NetworkStatus(boolean isConnected, String networkType, String error) {
+        public NetworkStatus(boolean isConnected, String networkType, int signalStrength, boolean hasSystemProxy, boolean weakNet, String error) {
             this.isConnected = isConnected;
             this.networkType = networkType;
+            this.signalStrength = signalStrength;
+            this.hasSystemProxy = hasSystemProxy;
+            this.weakNet = weakNet;
             this.error = error;
+        }
+
+        // Keep old constructor for compatibility if needed or update callers
+        public NetworkStatus(boolean isConnected, String networkType, String error) {
+            this(isConnected, networkType, 0, false, false, error);
         }
     }
 
