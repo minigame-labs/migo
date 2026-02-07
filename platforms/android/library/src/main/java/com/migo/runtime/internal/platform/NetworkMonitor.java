@@ -96,34 +96,40 @@ public final class NetworkMonitor {
      */
     public NetworkStatus getNetworkStatus() {
         if (connectivityManager == null) {
-            return new NetworkStatus(false, "none");
+            return new NetworkStatus(false, "none", "ConnectivityManager is null");
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Network network = connectivityManager.getActiveNetwork();
-            if (network == null) {
-                return new NetworkStatus(false, "none");
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                Network network = connectivityManager.getActiveNetwork();
+                if (network == null) {
+                    return new NetworkStatus(false, "none", null);
+                }
+
+                NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
+                if (capabilities == null) {
+                    return new NetworkStatus(false, "none", null);
+                }
+
+                String networkType = getNetworkTypeFromCapabilities(capabilities);
+                boolean isConnected = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+
+                return new NetworkStatus(isConnected, networkType, null);
+            } else {
+                // Fallback for API 21-22
+                NetworkInfo activeNetwork = connectivityManager.getActiveNetworkInfo();
+                if (activeNetwork == null || !activeNetwork.isConnected()) {
+                    return new NetworkStatus(false, "none", null);
+                }
+
+                String networkType = getNetworkTypeFromNetworkInfo(activeNetwork);
+                return new NetworkStatus(true, networkType, null);
             }
-
-            NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
-            if (capabilities == null) {
-                return new NetworkStatus(false, "none");
-            }
-
-            String networkType = getNetworkTypeFromCapabilities(capabilities);
-            boolean isConnected = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
-
-            return new NetworkStatus(isConnected, networkType);
-        } else {
-            // Fallback for API 21-22
-            NetworkInfo activeNetwork = connectivityManager.getActiveNetworkInfo();
-            if (activeNetwork == null || !activeNetwork.isConnected()) {
-                return new NetworkStatus(false, "none");
-            }
-
-            String networkType = getNetworkTypeFromNetworkInfo(activeNetwork);
-            return new NetworkStatus(true, networkType);
+        } catch (SecurityException e) {
+            return new NetworkStatus(false, "none", "getNetworkType:fail:no permission (ACCESS_NETWORK_STATE)");
+        } catch (Exception e) {
+            return new NetworkStatus(false, "none", "getNetworkType:fail:" + e.getMessage());
         }
     }
 
@@ -205,14 +211,16 @@ public final class NetworkMonitor {
                         // Get netmask from interface prefix length
                         short prefixLength = networkInterface.getInterfaceAddresses().get(0).getNetworkPrefixLength();
                         String netmask = prefixToNetmask(prefixLength);
-                        return new LocalIPInfo(localip, netmask);
+                        return new LocalIPInfo(localip, netmask, null);
                     }
                 }
             }
+        } catch (SecurityException e) {
+            return new LocalIPInfo("", "", "getLocalIPAddress:fail:no permission (INTERNET)");
         } catch (Exception e) {
-            // SocketException or SecurityException
+            return new LocalIPInfo("", "", "getLocalIPAddress:fail:" + e.getMessage());
         }
-        return new LocalIPInfo("", "");
+        return new LocalIPInfo("", "", null);
     }
 
     /**
@@ -240,10 +248,12 @@ public final class NetworkMonitor {
     public static class NetworkStatus {
         public final boolean isConnected;
         public final String networkType;
+        public final String error;
 
-        public NetworkStatus(boolean isConnected, String networkType) {
+        public NetworkStatus(boolean isConnected, String networkType, String error) {
             this.isConnected = isConnected;
             this.networkType = networkType;
+            this.error = error;
         }
     }
 
@@ -253,10 +263,12 @@ public final class NetworkMonitor {
     public static class LocalIPInfo {
         public final String localip;
         public final String netmask;
+        public final String error;
 
-        public LocalIPInfo(String localip, String netmask) {
+        public LocalIPInfo(String localip, String netmask, String error) {
             this.localip = localip;
             this.netmask = netmask;
+            this.error = error;
         }
     }
 }

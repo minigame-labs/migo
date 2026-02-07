@@ -52,13 +52,25 @@ function _internalTriggerNetworkStatusChange(isConnected, networkType) {
 
 function getNetworkType(options) {
     return wrapAsync('getNetworkType', function () {
-        return JSON.parse(op_get_network_type());
+        const res = JSON.parse(op_get_network_type());
+        if (res && res._error) {
+            let msg = res._error.errMsg || 'unknown error';
+            msg = msg.replace(/^getNetworkType:fail:?/, '').trim();
+            throw new Error(msg);
+        }
+        return res;
     }, options);
 }
 
 function getLocalIPAddress(options) {
     return wrapAsync('getLocalIPAddress', function () {
-        return JSON.parse(op_get_local_ip_address());
+        const res = JSON.parse(op_get_local_ip_address());
+        if (res && res._error) {
+            let msg = res._error.errMsg || 'unknown error';
+            msg = msg.replace(/^getLocalIPAddress:fail:?/, '').trim();
+            throw new Error(msg);
+        }
+        return res;
     }, options);
 }
 

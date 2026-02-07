@@ -650,6 +650,13 @@ public final class NativeExports {
         }
 
         NetworkMonitor.NetworkStatus status = mgr.getNetworkStatus();
+        if (status.error != null) {
+            return String.format(
+                "{\"_error\":{\"errMsg\":\"%s\"}}",
+                status.error
+            );
+        }
+
         return String.format(
                 "{\"networkType\":\"%s\",\"isConnected\":%s}",
                 status.networkType,
@@ -664,6 +671,13 @@ public final class NativeExports {
      */
     public static String getLocalIPAddressJson() {
         NetworkMonitor.LocalIPInfo info = NetworkMonitor.getLocalIPAddress();
+        if (info.error != null) {
+            return String.format(
+                "{\"_error\":{\"errMsg\":\"%s\"}}",
+                info.error
+            );
+        }
+
         return String.format(
                 "{\"localip\":\"%s\",\"netmask\":\"%s\"}",
                 info.localip,
