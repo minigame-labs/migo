@@ -121,7 +121,7 @@ fn create_basic_runtime() -> Runtime {
         .event_interval(event_interval)
         .global_queue_interval(global_queue_interval)
         .max_io_events_per_tick(max_io_events_per_tick)
-        .max_blocking_threads(32)
+        .max_blocking_threads(4)
         .build()
         .unwrap()
 }

@@ -1,4 +1,4 @@
-use bytemuck::cast_slice;
+use bytemuck::allocation::cast_vec;
 use deno_core::{JsBuffer, OpState, op2};
 use tracing::error;
 
@@ -419,7 +419,7 @@ pub fn op_uniform_matrix_3fv(
 ) {
     let ctx = state.borrow::<CanvasOpState>();
 
-    let value: Vec<f32> = cast_slice(&value).to_vec();
+    let value: Vec<f32> = cast_vec(value);
 
     send_gl(
         ctx,

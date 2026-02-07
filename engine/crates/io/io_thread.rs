@@ -33,7 +33,7 @@ impl IOThread {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_io()
                     .enable_time()
-                    .max_blocking_threads(128)
+                    .max_blocking_threads(8)
                     .build()
                 {
                     Ok(rt) => {
