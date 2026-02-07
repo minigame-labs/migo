@@ -353,20 +353,8 @@ pub struct InnerAudioState {
     pub buffered: bool,
 }
 
-/// Event types for InnerAudioContext
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum InnerAudioEventType {
-    CanPlay,
-    Play,
-    Pause,
-    Stop,
-    Ended,
-    Seeking,
-    Seeked,
-    TimeUpdate,
-    Error,
-}
+// Re-export the unified InnerAudioEventType from host_cmd (single source of truth).
+pub use super::host_cmd::InnerAudioEventType;
 
 /// Event from InnerAudioContext
 #[derive(Debug, Clone, Serialize, Deserialize)]

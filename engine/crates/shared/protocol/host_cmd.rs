@@ -229,7 +229,8 @@ pub enum HostCommand {
 /// These map to the Mini Program InnerAudioContext events:
 /// - `onCanplay`, `onPlay`, `onPause`, `onStop`, `onEnded`
 /// - `onSeeking`, `onSeeked`, `onTimeUpdate`, `onError`
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum InnerAudioEventType {
     /// Audio is ready to play (enough data buffered).
     CanPlay,

@@ -10,7 +10,7 @@
 use deno_core::{op2, OpState};
 use femtovg::Color;
 use once_cell::sync::Lazy;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use tracing::{error, trace};
 
@@ -327,8 +327,18 @@ impl FrameBuffer {
 /// Frame command collector stored in OpState.
 ///
 /// Manages command buffers for multiple canvases within a single frame.
+/// Optimized for the common single-canvas case: the first canvas used is
+/// stored directly in `primary` (single `u32` comparison, no HashMap).
+/// Additional canvases fall back to the `extra` HashMap.
 pub struct FrameCommandCollector {
-    buffers: RefCell<HashMap<u32, FrameBuffer>>,
+    /// Canvas ID occupying the primary slot (valid when `primary_active` is true).
+    primary_id: Cell<u32>,
+    /// Whether the primary slot has been claimed.
+    primary_active: Cell<bool>,
+    /// Fast-path buffer for the primary (usually only) canvas.
+    primary: RefCell<FrameBuffer>,
+    /// Overflow buffers for additional canvases (rare in practice).
+    extra: RefCell<HashMap<u32, FrameBuffer>>,
     total_commands: u64,
     total_frames: u64,
 }
@@ -336,68 +346,120 @@ pub struct FrameCommandCollector {
 impl FrameCommandCollector {
     pub fn new() -> Self {
         Self {
-            buffers: RefCell::new(HashMap::new()),
+            primary_id: Cell::new(0),
+            primary_active: Cell::new(false),
+            primary: RefCell::new(FrameBuffer::new()),
+            extra: RefCell::new(HashMap::new()),
             total_commands: 0,
             total_frames: 0,
         }
     }
 
-    fn get_or_create_buffer(&self, canvas_id: u32) -> std::cell::RefMut<'_, FrameBuffer> {
-        let mut buffers = self.buffers.borrow_mut();
-        if !buffers.contains_key(&canvas_id) {
-            buffers.insert(canvas_id, FrameBuffer::new());
+    /// Execute a closure with the mutable buffer for `canvas_id`, creating it if needed.
+    /// Fast path: single u32 comparison for the primary canvas (no hash, no HashMap lookup).
+    #[inline]
+    fn with_buffer<R>(&self, canvas_id: u32, f: impl FnOnce(&mut FrameBuffer) -> R) -> R {
+        if self.primary_active.get() {
+            if self.primary_id.get() == canvas_id {
+                return f(&mut self.primary.borrow_mut());
+            }
+        } else {
+            self.primary_id.set(canvas_id);
+            self.primary_active.set(true);
+            return f(&mut self.primary.borrow_mut());
         }
-        std::cell::RefMut::map(buffers, |b| b.get_mut(&canvas_id).unwrap())
+        // Slow path: multi-canvas fallback
+        let mut extra = self.extra.borrow_mut();
+        let buf = extra.entry(canvas_id).or_insert_with(FrameBuffer::new);
+        f(buf)
     }
 
     pub fn frame_begin(&self, canvas_id: u32) {
-        let mut buffers = self.buffers.borrow_mut();
-        if let Some(buf) = buffers.get_mut(&canvas_id) {
-            buf.clear();
-        } else {
-            buffers.insert(canvas_id, FrameBuffer::new());
-        }
+        self.with_buffer(canvas_id, |buf| buf.clear());
     }
 
     pub fn frame_end(&mut self, canvas_id: u32) -> Option<Vec<Canvas2DCmd>> {
-        let mut buffers = self.buffers.borrow_mut();
-        if let Some(buf) = buffers.get_mut(&canvas_id) {
-            if buf.commands.is_empty() {
-                return None;
-            }
-            self.total_commands += buf.commands.len() as u64;
-            self.total_frames += 1;
-            let commands = std::mem::take(&mut buf.commands);
-            buf.clear();
-            Some(commands)
+        // &mut self: use get_mut() on RefCells (zero-cost, no runtime borrow check).
+        let buf = if self.primary_active.get() && self.primary_id.get() == canvas_id {
+            self.primary.get_mut()
         } else {
-            None
+            self.extra.get_mut().get_mut(&canvas_id)?
+        };
+        if buf.commands.is_empty() {
+            return None;
+        }
+        self.total_commands += buf.commands.len() as u64;
+        self.total_frames += 1;
+        let commands = std::mem::take(&mut buf.commands);
+        buf.clear();
+        Some(commands)
+    }
+
+    /// Drain all active canvas buffers in a single pass. Returns (canvas_id, commands) pairs.
+    /// Uses get_mut() throughout (zero-cost RefCell access via &mut self).
+    pub fn frame_end_all(&mut self) -> Vec<(u32, Vec<Canvas2DCmd>)> {
+        let mut results = Vec::new();
+        if self.primary_active.get() {
+            let canvas_id = self.primary_id.get();
+            let buf = self.primary.get_mut();
+            if !buf.commands.is_empty() {
+                self.total_commands += buf.commands.len() as u64;
+                self.total_frames += 1;
+                results.push((canvas_id, std::mem::take(&mut buf.commands)));
+                buf.clear();
+            }
+        }
+        for (&canvas_id, buf) in self.extra.get_mut().iter_mut() {
+            if !buf.commands.is_empty() {
+                self.total_commands += buf.commands.len() as u64;
+                self.total_frames += 1;
+                results.push((canvas_id, std::mem::take(&mut buf.commands)));
+                buf.clear();
+            }
+        }
+        results
+    }
+
+    /// Reset dedup state and push Restore for an existing buffer (no-create).
+    /// Uses get_mut() throughout (zero-cost RefCell access via &mut self).
+    pub fn restore(&mut self, canvas_id: u32) {
+        let buf = if self.primary_active.get() && self.primary_id.get() == canvas_id {
+            Some(self.primary.get_mut())
+        } else {
+            self.extra.get_mut().get_mut(&canvas_id)
+        };
+        if let Some(buf) = buf {
+            buf.fill_color = None;
+            buf.stroke_color = None;
+            buf.line_width = None;
+            buf.global_alpha = None;
+            buf.commands.push(Canvas2DCmd::Restore);
         }
     }
 
     #[inline]
     fn push(&self, canvas_id: u32, cmd: Canvas2DCmd) {
-        self.get_or_create_buffer(canvas_id).push(cmd);
+        self.with_buffer(canvas_id, |buf| buf.push(cmd));
     }
 
     #[inline]
     fn set_fill_color(&self, canvas_id: u32, color: Color) {
-        self.get_or_create_buffer(canvas_id).set_fill_color(color);
+        self.with_buffer(canvas_id, |buf| buf.set_fill_color(color));
     }
 
     #[inline]
     fn set_stroke_color(&self, canvas_id: u32, color: Color) {
-        self.get_or_create_buffer(canvas_id).set_stroke_color(color);
+        self.with_buffer(canvas_id, |buf| buf.set_stroke_color(color));
     }
 
     #[inline]
     fn set_line_width(&self, canvas_id: u32, width: f32) {
-        self.get_or_create_buffer(canvas_id).set_line_width(width);
+        self.with_buffer(canvas_id, |buf| buf.set_line_width(width));
     }
 
     #[inline]
     fn set_global_alpha(&self, canvas_id: u32, alpha: f32) {
-        self.get_or_create_buffer(canvas_id).set_global_alpha(alpha);
+        self.with_buffer(canvas_id, |buf| buf.set_global_alpha(alpha));
     }
 }
 
@@ -477,34 +539,22 @@ pub fn op_frame_end(state: &mut OpState, #[smi] canvas_id: u32) {
 
 #[op2(fast)]
 pub fn op_frame_end_all(state: &mut OpState) {
-    let canvas_ids: Vec<u32> = {
-        if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-            collector.buffers.borrow().keys().copied().collect()
+    let pairs = {
+        if let Some(collector) = state.try_borrow_mut::<FrameCommandCollector>() {
+            collector.frame_end_all()
         } else {
             return;
         }
     };
 
-    for canvas_id in canvas_ids {
-        let commands = {
-            if let Some(collector) = state.try_borrow_mut::<FrameCommandCollector>() {
-                collector.frame_end(canvas_id)
-            } else {
-                None
-            }
-        };
-
-        if let Some(cmds) = commands {
-            if !cmds.is_empty() {
-                let ctx = state.borrow::<CanvasOpState>();
-                trace!("op_frame_end_all: sending {} commands for canvas {}", cmds.len(), canvas_id);
-                if let Err(e) = ctx.tx.send(RenderCommand::Canvas2DBatch {
-                    canvas_id,
-                    commands: cmds,
-                }) {
-                    error!("op_frame_end_all: send failed: {e}");
-                }
-            }
+    for (canvas_id, cmds) in pairs {
+        let ctx = state.borrow::<CanvasOpState>();
+        trace!("op_frame_end_all: sending {} commands for canvas {}", cmds.len(), canvas_id);
+        if let Err(e) = ctx.tx.send(RenderCommand::Canvas2DBatch {
+            canvas_id,
+            commands: cmds,
+        }) {
+            error!("op_frame_end_all: send failed: {e}");
         }
     }
 }
@@ -545,14 +595,7 @@ batched_op!(op_save, Canvas2DCmd::Save);
 #[op2(fast)]
 pub fn op_restore(state: &mut OpState, #[smi] canvas_id: u32) {
     if let Some(collector) = state.try_borrow_mut::<FrameCommandCollector>() {
-        let mut buffers = collector.buffers.borrow_mut();
-        if let Some(buf) = buffers.get_mut(&canvas_id) {
-            buf.fill_color = None;
-            buf.stroke_color = None;
-            buf.line_width = None;
-            buf.global_alpha = None;
-            buf.commands.push(Canvas2DCmd::Restore);
-        }
+        collector.restore(canvas_id);
     }
 }
 

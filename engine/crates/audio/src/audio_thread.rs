@@ -8,7 +8,7 @@ use shared::protocol::audio_cmd::{
     AudioBufferInfo, AudioCmd, AudioContextId, AudioContextState, AudioNodeId,
     InnerAudioId, InnerAudioInfo, InnerAudioState,
 };
-use shared::protocol::host_cmd::{HostCommand, InnerAudioEventType};
+use shared::protocol::host_cmd::HostCommand;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{error, info};
 
@@ -736,27 +736,17 @@ fn run_audio_thread(
             }
         }
 
-        // Collect events from all players and push to host
+        // Collect events from all players and push to host.
+        // audio_cmd::InnerAudioEventType is re-exported from host_cmd — same type, no mapping.
         for player in inner_players.values_mut() {
             for event in player.take_events() {
-                let event_type = match event.event_type {
-                    shared::protocol::audio_cmd::InnerAudioEventType::CanPlay => InnerAudioEventType::CanPlay,
-                    shared::protocol::audio_cmd::InnerAudioEventType::Play => InnerAudioEventType::Play,
-                    shared::protocol::audio_cmd::InnerAudioEventType::Pause => InnerAudioEventType::Pause,
-                    shared::protocol::audio_cmd::InnerAudioEventType::Stop => InnerAudioEventType::Stop,
-                    shared::protocol::audio_cmd::InnerAudioEventType::Ended => InnerAudioEventType::Ended,
-                    shared::protocol::audio_cmd::InnerAudioEventType::Seeking => InnerAudioEventType::Seeking,
-                    shared::protocol::audio_cmd::InnerAudioEventType::Seeked => InnerAudioEventType::Seeked,
-                    shared::protocol::audio_cmd::InnerAudioEventType::TimeUpdate => InnerAudioEventType::TimeUpdate,
-                    shared::protocol::audio_cmd::InnerAudioEventType::Error => InnerAudioEventType::Error,
-                };
                 tracing::trace!(
                     "Pushing InnerAudio event: id={}, type={:?}, time={:.2}s",
-                    event.id, event_type, event.current_time
+                    event.id, event.event_type, event.current_time
                 );
                 let _ = host_tx.try_send(HostCommand::InnerAudioEvent {
                     id: event.id,
-                    event_type,
+                    event_type: event.event_type,
                     current_time: event.current_time,
                 });
             }
