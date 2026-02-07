@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use deno_core::{serde_json, v8};
 use tokio::sync::oneshot;
 
@@ -235,7 +237,7 @@ pub struct FileStat {
 pub struct NormalizedImage {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub rgba: Arc<Vec<u8>>,
 }
 
 impl NormalizedImage {
@@ -244,7 +246,7 @@ impl NormalizedImage {
         Self {
             width,
             height,
-            rgba,
+            rgba: Arc::new(rgba),
         }
     }
 

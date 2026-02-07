@@ -188,75 +188,39 @@ impl Host {
                 beta,
                 gamma,
             } => {
-                self.js
-                    .exec_script_and_pump(
-                        "device_motion",
-                        format!(
-                            "_internalTriggerDeviceMotionChange({},{},{})",
-                            alpha, beta, gamma
-                        ),
-                    )
-                    .await
+                self.js.dispatch_device_motion(alpha, beta, gamma);
+                Ok(())
             }
 
             HostCommand::OnGyroscopeChange { x, y, z } => {
-                self.js
-                    .exec_script_and_pump(
-                        "gyroscope",
-                        format!("_internalTriggerGyroscopeChange({},{},{})", x, y, z),
-                    )
-                    .await
+                self.js.dispatch_gyroscope(x, y, z);
+                Ok(())
             }
 
             HostCommand::OnDeviceOrientationChange { value } => {
-                self.js
-                    .exec_script_and_pump(
-                        "device_orientation",
-                        format!(
-                            "_internalTriggerDeviceOrientationChange('{}')",
-                            value
-                        ),
-                    )
-                    .await
+                self.js.dispatch_device_orientation(&value);
+                Ok(())
             }
 
             HostCommand::OnCompassChange {
                 direction,
                 accuracy,
             } => {
-                self.js
-                    .exec_script_and_pump(
-                        "compass",
-                        format!(
-                            "_internalTriggerCompassChange({},'{}')",
-                            direction, accuracy
-                        ),
-                    )
-                    .await
+                self.js.dispatch_compass(direction, &accuracy);
+                Ok(())
             }
 
             HostCommand::OnAccelerometerChange { x, y, z } => {
-                self.js
-                    .exec_script_and_pump(
-                        "accelerometer",
-                        format!("_internalTriggerAccelerometerChange({},{},{})", x, y, z),
-                    )
-                    .await
+                self.js.dispatch_accelerometer(x, y, z);
+                Ok(())
             }
 
             HostCommand::OnNetworkStatusChange {
                 is_connected,
                 network_type,
             } => {
-                self.js
-                    .exec_script_and_pump(
-                        "network_status",
-                        format!(
-                            "_internalTriggerNetworkStatusChange({},'{}')",
-                            is_connected, network_type
-                        ),
-                    )
-                    .await
+                self.js.dispatch_network_status(is_connected, &network_type);
+                Ok(())
             }
 
             _ => Ok(()),

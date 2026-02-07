@@ -14,7 +14,7 @@ members = [
 # Tokio runtime - avoid "full" feature, use only what's needed
 tokio = { version = "1.46.1", default-features = false }
 futures = "0.3.31"
-serde = "1.0.219"
+serde = { version = "1.0.219", features = ["rc"] }
 reqwest = { version = "=0.12.4", default-features = false, features = ["rustls-tls", "stream", "json", "http2", "multipart"] }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 thiserror = "2.0.12"

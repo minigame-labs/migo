@@ -18,6 +18,13 @@ pub(crate) struct JsBindings {
     enqueue_touch_event_fn: Option<v8::Global<v8::Function>>,
     enqueue_inner_audio_event_fn: Option<v8::Global<v8::Function>>,
     schedule_raf_fn: Option<v8::Global<v8::Function>>,
+    // Sensor event functions (cached for high-frequency dispatch without JS parsing)
+    sensor_device_motion_fn: Option<v8::Global<v8::Function>>,
+    sensor_gyroscope_fn: Option<v8::Global<v8::Function>>,
+    sensor_accelerometer_fn: Option<v8::Global<v8::Function>>,
+    sensor_compass_fn: Option<v8::Global<v8::Function>>,
+    sensor_orientation_fn: Option<v8::Global<v8::Function>>,
+    sensor_network_fn: Option<v8::Global<v8::Function>>,
     /// Pre-allocated buffer for touch event serialization to avoid
     /// repeated allocations in the hot path.
     touch_buffer: Vec<u8>,
@@ -32,6 +39,12 @@ impl JsBindings {
             enqueue_touch_event_fn: None,
             enqueue_inner_audio_event_fn: None,
             schedule_raf_fn: None,
+            sensor_device_motion_fn: None,
+            sensor_gyroscope_fn: None,
+            sensor_accelerometer_fn: None,
+            sensor_compass_fn: None,
+            sensor_orientation_fn: None,
+            sensor_network_fn: None,
             // Pre-allocate touch buffer to avoid allocations in hot path
             touch_buffer: vec![0u8; TOUCH_BUFFER_SIZE],
         };
@@ -52,35 +65,38 @@ impl JsBindings {
             Some(v8::Global::new(scope, f))
         }
 
-        let (enqueue_touch, enqueue_audio, raf) = self.with_main_context(rt, |scope, _ctx, global| {
-            let enqueue_touch = get_global_fn(scope, global, "_internalEnqueueRawTouchEvent");
-            let enqueue_audio = get_global_fn(scope, global, "_internalEnqueueInnerAudioEvent");
-            let raf = get_global_fn(scope, global, "_internalScheduleRaf");
-            (enqueue_touch, enqueue_audio, raf)
+        let (
+            enqueue_touch, enqueue_audio, raf,
+            dev_motion, gyro, accel, compass, orientation, network,
+        ) = self.with_main_context(rt, |scope, _ctx, global| {
+            (
+                get_global_fn(scope, global, "_internalEnqueueRawTouchEvent"),
+                get_global_fn(scope, global, "_internalEnqueueInnerAudioEvent"),
+                get_global_fn(scope, global, "_internalScheduleRaf"),
+                get_global_fn(scope, global, "_internalTriggerDeviceMotionChange"),
+                get_global_fn(scope, global, "_internalTriggerGyroscopeChange"),
+                get_global_fn(scope, global, "_internalTriggerAccelerometerChange"),
+                get_global_fn(scope, global, "_internalTriggerCompassChange"),
+                get_global_fn(scope, global, "_internalTriggerDeviceOrientationChange"),
+                get_global_fn(scope, global, "_internalTriggerNetworkStatusChange"),
+            )
         });
 
         self.enqueue_touch_event_fn = enqueue_touch;
-        if self.enqueue_touch_event_fn.is_none() {
-            warn!(
-                "[Host {}] global function _internalEnqueueRawTouchEvent not found",
-                host_id
-            );
-        }
-
         self.enqueue_inner_audio_event_fn = enqueue_audio;
-        if self.enqueue_inner_audio_event_fn.is_none() {
-            warn!(
-                "[Host {}] global function _internalEnqueueInnerAudioEvent not found",
-                host_id
-            );
-        }
-
         self.schedule_raf_fn = raf;
+        self.sensor_device_motion_fn = dev_motion;
+        self.sensor_gyroscope_fn = gyro;
+        self.sensor_accelerometer_fn = accel;
+        self.sensor_compass_fn = compass;
+        self.sensor_orientation_fn = orientation;
+        self.sensor_network_fn = network;
+
+        if self.enqueue_touch_event_fn.is_none() {
+            warn!("[Host {}] _internalEnqueueRawTouchEvent not found", host_id);
+        }
         if self.schedule_raf_fn.is_none() {
-            warn!(
-                "[Host {}] global function _internalScheduleRaf not found",
-                host_id
-            );
+            warn!("[Host {}] _internalScheduleRaf not found", host_id);
         }
     }
 
@@ -189,5 +205,98 @@ impl JsBindings {
             let func = v8::Local::new(scope, func_g);
             let _ = func.call(scope, global.into(), &args);
         });
+    }
+
+    // ---- Sensor event dispatch (direct V8 calls, no JS parsing overhead) ----
+
+    /// Dispatch a 3-float sensor event (DeviceMotion, Gyroscope, Accelerometer).
+    #[inline]
+    fn dispatch_f64x3(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        func_g: &v8::Global<v8::Function>,
+        a: f64,
+        b: f64,
+        c: f64,
+    ) {
+        self.with_main_context(rt, |scope, _ctx, global| {
+            let args = [
+                v8::Number::new(scope, a).into(),
+                v8::Number::new(scope, b).into(),
+                v8::Number::new(scope, c).into(),
+            ];
+            let func = v8::Local::new(scope, func_g);
+            let _ = func.call(scope, global.into(), &args);
+        });
+    }
+
+    pub(crate) fn dispatch_device_motion(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        alpha: f64,
+        beta: f64,
+        gamma: f64,
+    ) {
+        if let Some(f) = self.sensor_device_motion_fn.as_ref() {
+            self.dispatch_f64x3(rt, f, alpha, beta, gamma);
+        }
+    }
+
+    pub(crate) fn dispatch_gyroscope(&self, rt: &mut deno_core::JsRuntime, x: f64, y: f64, z: f64) {
+        if let Some(f) = self.sensor_gyroscope_fn.as_ref() {
+            self.dispatch_f64x3(rt, f, x, y, z);
+        }
+    }
+
+    pub(crate) fn dispatch_accelerometer(&self, rt: &mut deno_core::JsRuntime, x: f64, y: f64, z: f64) {
+        if let Some(f) = self.sensor_accelerometer_fn.as_ref() {
+            self.dispatch_f64x3(rt, f, x, y, z);
+        }
+    }
+
+    pub(crate) fn dispatch_compass(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        direction: f64,
+        accuracy: &str,
+    ) {
+        if let Some(func_g) = self.sensor_compass_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [
+                    v8::Number::new(scope, direction).into(),
+                    v8::String::new(scope, accuracy).unwrap().into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    pub(crate) fn dispatch_device_orientation(&self, rt: &mut deno_core::JsRuntime, value: &str) {
+        if let Some(func_g) = self.sensor_orientation_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::String::new(scope, value).unwrap().into()];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    pub(crate) fn dispatch_network_status(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        is_connected: bool,
+        network_type: &str,
+    ) {
+        if let Some(func_g) = self.sensor_network_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [
+                    v8::Boolean::new(scope, is_connected).into(),
+                    v8::String::new(scope, network_type).unwrap().into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
     }
 }

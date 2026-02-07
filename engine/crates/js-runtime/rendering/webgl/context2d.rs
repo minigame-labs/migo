@@ -181,12 +181,45 @@ static NAMED_COLORS: Lazy<HashMap<&'static str, femtovg::Color>> = Lazy::new(|| 
     .collect()
 });
 
+/// Case-insensitive prefix check without allocation.
+#[inline]
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()]
+            .iter()
+            .zip(prefix.as_bytes())
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+}
+
+/// Parse comma-separated values from an already-trimmed inner string.
+/// Uses a stack-based array to avoid Vec allocation.
+#[inline]
+fn split_comma_parts(s: &str) -> ([&str; 4], usize) {
+    let mut parts = [""; 4];
+    let mut count = 0;
+    for part in s.split(',') {
+        if count >= 4 {
+            return (parts, count + 1); // signal overflow
+        }
+        parts[count] = part.trim();
+        count += 1;
+    }
+    (parts, count)
+}
+
 fn parse_color_string(s: &str) -> femtovg::Color {
-    let s = s.trim().to_lowercase();
-    if s.starts_with('#') { return Color::hex(&s); }
-    if let Some(inner) = s.strip_prefix("rgba(").and_then(|v| v.strip_suffix(')')) {
-        let parts: Vec<&str> = inner.split(',').map(|x| x.trim()).collect();
-        if parts.len() == 4 {
+    let s = s.trim();
+
+    // #hex — no lowercase needed
+    if s.starts_with('#') {
+        return Color::hex(s);
+    }
+
+    // rgba(...) — case-insensitive prefix, zero-alloc
+    if starts_with_ci(s, "rgba(") && s.ends_with(')') {
+        let inner = &s[5..s.len() - 1];
+        let (parts, count) = split_comma_parts(inner);
+        if count == 4 {
             let r = parts[0].parse::<u8>().unwrap_or(0);
             let g = parts[1].parse::<u8>().unwrap_or(0);
             let b = parts[2].parse::<u8>().unwrap_or(0);
@@ -195,9 +228,12 @@ fn parse_color_string(s: &str) -> femtovg::Color {
         }
         return Color::black();
     }
-    if let Some(inner) = s.strip_prefix("rgb(").and_then(|v| v.strip_suffix(')')) {
-        let parts: Vec<&str> = inner.split(',').map(|x| x.trim()).collect();
-        if parts.len() == 3 {
+
+    // rgb(...) — case-insensitive prefix, zero-alloc
+    if starts_with_ci(s, "rgb(") && s.ends_with(')') {
+        let inner = &s[4..s.len() - 1];
+        let (parts, count) = split_comma_parts(inner);
+        if count == 3 {
             let r = parts[0].parse::<u8>().unwrap_or(0);
             let g = parts[1].parse::<u8>().unwrap_or(0);
             let b = parts[2].parse::<u8>().unwrap_or(0);
@@ -205,7 +241,20 @@ fn parse_color_string(s: &str) -> femtovg::Color {
         }
         return Color::black();
     }
-    NAMED_COLORS.get(s.as_str()).copied().unwrap_or(Color::black())
+
+    // Named colors — lowercase on stack buffer (max 24 bytes, no heap alloc)
+    let bytes = s.as_bytes();
+    if bytes.len() <= 24 {
+        let mut buf = [0u8; 24];
+        for (i, &b) in bytes.iter().enumerate() {
+            buf[i] = b.to_ascii_lowercase();
+        }
+        // SAFETY: input is valid UTF-8, lowercasing ASCII preserves UTF-8 validity
+        let lower = unsafe { std::str::from_utf8_unchecked(&buf[..bytes.len()]) };
+        NAMED_COLORS.get(lower).copied().unwrap_or(Color::black())
+    } else {
+        Color::black()
+    }
 }
 
 // ============================================================================

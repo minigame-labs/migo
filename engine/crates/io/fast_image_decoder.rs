@@ -3,6 +3,8 @@
 //! Uses `zune-image` for fast decoding with automatic RGBA conversion,
 //! with fallback to `image` crate for unsupported formats.
 
+use std::sync::Arc;
+
 use shared::{
     error::{EngineError, ErrorCode},
     protocol::io_cmd::NormalizedImage,
@@ -72,7 +74,7 @@ fn decode_with_zune(data: &[u8]) -> Result<NormalizedImage, EngineError> {
     Ok(NormalizedImage {
         width: width as u32,
         height: height as u32,
-        rgba,
+        rgba: Arc::new(rgba),
     })
 }
 
@@ -91,6 +93,6 @@ fn decode_with_image_crate(data: &[u8]) -> Result<NormalizedImage, EngineError> 
     Ok(NormalizedImage {
         width,
         height,
-        rgba,
+        rgba: Arc::new(rgba),
     })
 }

@@ -319,7 +319,7 @@ impl IoCmdHandler {
             IOCmd::ReadImageRgba8 { path, resp } => {
                 let start = Instant::now();
 
-                // Check LRU cache first
+                // Check LRU cache first (Arc clone: O(1) ref-count increment)
                 if let Some(cached) = image_cache::global_cache().get(&path) {
                     debug!(
                         "ReadImageRgba8 cache hit: {} ({}x{}) in {:.2?}",
@@ -328,13 +328,7 @@ impl IoCmdHandler {
                         cached.image.height,
                         start.elapsed()
                     );
-                    // Clone the Arc'd image data
-                    let img = NormalizedImage {
-                        width: cached.image.width,
-                        height: cached.image.height,
-                        rgba: cached.image.rgba.clone(),
-                    };
-                    Self::send_resp(resp, Ok(img));
+                    Self::send_resp(resp, Ok(cached.image));
                     return;
                 }
 

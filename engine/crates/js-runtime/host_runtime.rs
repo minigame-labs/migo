@@ -108,6 +108,38 @@ impl HostJsRuntime {
             .dispatch_inner_audio_event(&mut self.rt, self.host_id, id, event_type, current_time);
     }
 
+    // ---- Sensor event dispatch (zero-alloc, no JS parsing) ----
+
+    #[inline]
+    pub fn dispatch_device_motion(&mut self, alpha: f64, beta: f64, gamma: f64) {
+        self.bindings.dispatch_device_motion(&mut self.rt, alpha, beta, gamma);
+    }
+
+    #[inline]
+    pub fn dispatch_gyroscope(&mut self, x: f64, y: f64, z: f64) {
+        self.bindings.dispatch_gyroscope(&mut self.rt, x, y, z);
+    }
+
+    #[inline]
+    pub fn dispatch_accelerometer(&mut self, x: f64, y: f64, z: f64) {
+        self.bindings.dispatch_accelerometer(&mut self.rt, x, y, z);
+    }
+
+    #[inline]
+    pub fn dispatch_compass(&mut self, direction: f64, accuracy: &str) {
+        self.bindings.dispatch_compass(&mut self.rt, direction, accuracy);
+    }
+
+    #[inline]
+    pub fn dispatch_device_orientation(&mut self, value: &str) {
+        self.bindings.dispatch_device_orientation(&mut self.rt, value);
+    }
+
+    #[inline]
+    pub fn dispatch_network_status(&mut self, is_connected: bool, network_type: &str) {
+        self.bindings.dispatch_network_status(&mut self.rt, is_connected, network_type);
+    }
+
     // ---- Scripts / modules ----
 
     pub async fn exec_script_and_pump(
