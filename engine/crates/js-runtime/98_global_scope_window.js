@@ -122,6 +122,8 @@ const WindowGlobalScope = {
     // Network
     onNetworkStatusChange: core.propNonEnumerable(network.onNetworkStatusChange),
     offNetworkStatusChange: core.propNonEnumerable(network.offNetworkStatusChange),
+    onNetworkWeakChange: core.propNonEnumerable(network.onNetworkWeakChange),
+    offNetworkWeakChange: core.propNonEnumerable(network.offNetworkWeakChange),
     _internalTriggerNetworkStatusChange: core.propNonEnumerable(network._internalTriggerNetworkStatusChange),
     getNetworkType: core.propNonEnumerable(network.getNetworkType),
     getLocalIPAddress: core.propNonEnumerable(network.getLocalIPAddress),
