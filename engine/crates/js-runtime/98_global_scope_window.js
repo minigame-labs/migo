@@ -41,6 +41,7 @@ const WindowGlobalScope = {
     onTouchMove: core.propNonEnumerable(touch.onTouchMove),
     onTouchEnd: core.propNonEnumerable(touch.onTouchEnd),
     onTouchCancel: core.propNonEnumerable(touch.onTouchCancel),
+    offTouchStart: core.propNonEnumerable(touch.offTouchStart),
     offTouchMove: core.propNonEnumerable(touch.offTouchMove),
     offTouchEnd: core.propNonEnumerable(touch.offTouchEnd),
     offTouchCancel: core.propNonEnumerable(touch.offTouchCancel),
