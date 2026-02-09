@@ -46,6 +46,7 @@ impl AudioNodeProcessor for ChannelSplitterNode {
         inputs: &[f32],
         output: &mut [f32],
         _sample_rate: u32,
+        channels: u32,
         _current_time: f64,
     ) -> usize {
         // Simplified: pass through
@@ -53,6 +54,6 @@ impl AudioNodeProcessor for ChannelSplitterNode {
         if len > 0 {
             output[..len].copy_from_slice(&inputs[..len]);
         }
-        len / 2
+        len / channels.max(1) as usize
     }
 }

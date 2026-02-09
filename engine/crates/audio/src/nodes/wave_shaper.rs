@@ -93,6 +93,7 @@ impl AudioNodeProcessor for WaveShaperNode {
         inputs: &[f32],
         output: &mut [f32],
         _sample_rate: u32,
+        channels: u32,
         _current_time: f64,
     ) -> usize {
         let len = inputs.len().min(output.len());
@@ -114,6 +115,6 @@ impl AudioNodeProcessor for WaveShaperNode {
             }
         }
 
-        len / 2 // Assume stereo
+        len / channels.max(1) as usize
     }
 }

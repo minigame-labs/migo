@@ -327,10 +327,11 @@ impl AudioNodeProcessor for BufferSourceNode {
         _inputs: &[f32],
         output: &mut [f32],
         _sample_rate: u32,
+        channels: u32,
         _current_time: f64,
     ) -> usize {
         // Source node: ignore inputs, generate from buffer
-        self.process_with_channels(output, 2)
+        self.process_with_channels(output, channels)
     }
 
     fn is_finished(&self) -> bool {

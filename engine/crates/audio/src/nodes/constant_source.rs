@@ -67,6 +67,7 @@ impl AudioNodeProcessor for ConstantSourceNode {
         _inputs: &[f32],
         output: &mut [f32],
         _sample_rate: u32,
+        channels: u32,
         current_time: f64,
     ) -> usize {
         if !self.started || current_time < self.start_when {
@@ -79,7 +80,7 @@ impl AudioNodeProcessor for ConstantSourceNode {
         }
 
         let value = self.offset.value();
-        let channels = 2usize;
+        let channels = channels.max(1) as usize;
         let frames = output.len() / channels;
 
         for i in 0..output.len().min(frames * channels) {

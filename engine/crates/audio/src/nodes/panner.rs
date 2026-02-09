@@ -166,8 +166,10 @@ impl AudioNodeProcessor for PannerNode {
         inputs: &[f32],
         output: &mut [f32],
         _sample_rate: u32,
+        channels: u32,
         _current_time: f64,
     ) -> usize {
+        let ch = channels.max(1) as usize;
         let len = inputs.len().min(output.len());
         if len == 0 {
             return 0;
@@ -183,9 +185,8 @@ impl AudioNodeProcessor for PannerNode {
         let distance_gain = self.compute_distance_gain(distance);
 
         // Equal-power panning based on azimuth (x position)
-        // Compute azimuth: angle in the horizontal plane
         let azimuth = if distance > 0.0001 {
-            (px / distance).asin() // Range: [-PI/2, PI/2]
+            (px / distance).asin()
         } else {
             0.0
         };
@@ -198,19 +199,24 @@ impl AudioNodeProcessor for PannerNode {
         let gain_l = (angle.cos() * distance_gain) as f32;
         let gain_r = (angle.sin() * distance_gain) as f32;
 
-        // Process stereo (assume 2 channels interleaved)
-        let frames = len / 2;
+        let frames = len / ch;
         for frame in 0..frames {
-            let idx = frame * 2;
-            // Mix input channels to mono, then pan
-            let mono = if idx + 1 < inputs.len() {
-                (inputs[idx] + inputs[idx + 1]) * 0.5
-            } else {
-                inputs[idx]
-            };
+            let base = frame * ch;
+            // Mix all input channels to mono
+            let mut mono = 0.0f32;
+            for c in 0..ch {
+                mono += inputs[base + c];
+            }
+            mono /= ch as f32;
 
-            output[idx] = mono * gain_l;
-            output[idx + 1] = mono * gain_r;
+            // Write panned output: ch0 = left, ch1 = right, rest = 0
+            output[base] = mono * gain_l;
+            if ch >= 2 {
+                output[base + 1] = mono * gain_r;
+            }
+            for c in 2..ch {
+                output[base + c] = 0.0;
+            }
         }
 
         frames

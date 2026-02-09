@@ -587,7 +587,7 @@ impl AudioContext {
                     &[] as &[f32]
                 };
 
-                let frames = node.process(input, &mut node_buf[..buffer_size], sample_rate, current_time);
+                let frames = node.process(input, &mut node_buf[..buffer_size], sample_rate, self.channels, current_time);
 
                 if should_log && frames > 0 {
                     tracing::trace!(

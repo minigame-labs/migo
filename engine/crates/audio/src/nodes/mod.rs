@@ -76,6 +76,7 @@ pub trait AudioNodeProcessor: Send + 'static {
     ///   Empty slice for source nodes with no upstream connections.
     /// - `output`: buffer to write this node's output to (interleaved samples).
     /// - `sample_rate`: the audio context's sample rate.
+    /// - `channels`: the number of interleaved channels in `inputs`/`output`.
     /// - `current_time`: the current context time in seconds (for automation).
     ///
     /// Returns the number of frames written to output.
@@ -84,6 +85,7 @@ pub trait AudioNodeProcessor: Send + 'static {
         inputs: &[f32],
         output: &mut [f32],
         sample_rate: u32,
+        channels: u32,
         current_time: f64,
     ) -> usize;
 

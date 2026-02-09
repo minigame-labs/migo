@@ -73,6 +73,7 @@ impl AudioNodeProcessor for IIRFilterNode {
         inputs: &[f32],
         output: &mut [f32],
         _sample_rate: u32,
+        _channels: u32,
         _current_time: f64,
     ) -> usize {
         let len = inputs.len().min(output.len());

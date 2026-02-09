@@ -35,6 +35,7 @@ impl AudioNodeProcessor for DestinationNode {
         inputs: &[f32],
         output: &mut [f32],
         _sample_rate: u32,
+        _channels: u32,
         _current_time: f64,
     ) -> usize {
         // Destination node: pass input to output (collected by the context)

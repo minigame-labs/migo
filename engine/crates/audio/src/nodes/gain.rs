@@ -47,6 +47,7 @@ impl AudioNodeProcessor for GainNode {
         inputs: &[f32],
         output: &mut [f32],
         _sample_rate: u32,
+        channels: u32,
         _current_time: f64,
     ) -> usize {
         let len = inputs.len().min(output.len());
@@ -65,7 +66,7 @@ impl AudioNodeProcessor for GainNode {
             }
         }
 
-        len / 2 // Assume stereo: frames = samples / channels
+        len / channels.max(1) as usize
     }
 
     fn get_param_mut(&mut self, name: &str) -> Option<&mut AudioParamTimeline> {

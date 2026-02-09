@@ -119,6 +119,7 @@ impl AudioNodeProcessor for OscillatorNode {
         _inputs: &[f32],
         output: &mut [f32],
         sample_rate: u32,
+        channels: u32,
         current_time: f64,
     ) -> usize {
         if !self.started || current_time < self.start_when {
@@ -130,7 +131,7 @@ impl AudioNodeProcessor for OscillatorNode {
             return 0;
         }
 
-        let channels = 2u32; // Stereo output
+        let channels = channels.max(1);
         let frames = output.len() / channels as usize;
         if frames == 0 {
             return 0;
