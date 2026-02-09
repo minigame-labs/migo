@@ -1,10 +1,12 @@
+use std::any::Any;
 use std::sync::Arc;
 
 use shared::protocol::audio_cmd::AudioNodeId;
 
 use crate::decoder::DecodedAudio;
+use crate::param::AudioParamTimeline;
 
-use super::AudioNode;
+use super::{AudioNodeProcessor, AudioNodeType};
 
 /// State of an AudioBufferSourceNode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +20,6 @@ pub enum BufferSourceState {
 }
 
 pub struct BufferSourceNode {
-    #[allow(dead_code)]
     id: AudioNodeId,
     buffer: Option<Arc<DecodedAudio>>,
     state: BufferSourceState,
@@ -36,8 +37,11 @@ pub struct BufferSourceNode {
     loop_start: f64,
     loop_end: f64,
 
-    // Playback rate
-    playback_rate: f32,
+    // AudioParam for playback rate
+    playback_rate: AudioParamTimeline,
+
+    // Detune AudioParam (in cents)
+    detune: AudioParamTimeline,
 
     // Context time when started (set when start() is called)
     start_time: Option<f64>,
@@ -56,7 +60,8 @@ impl BufferSourceNode {
             loop_enabled: false,
             loop_start: 0.0,
             loop_end: 0.0,
-            playback_rate: 1.0,
+            playback_rate: AudioParamTimeline::new(1.0, -3.4028235e38, 3.4028235e38),
+            detune: AudioParamTimeline::new(0.0, -3.4028235e38, 3.4028235e38),
             start_time: None,
         }
     }
@@ -89,39 +94,14 @@ impl BufferSourceNode {
     }
 
     pub fn set_playback_rate(&mut self, rate: f32) {
-        self.playback_rate = rate.max(0.0);
+        self.playback_rate.set_value(rate.max(0.0));
     }
 
     #[allow(dead_code)]
     pub fn state(&self) -> BufferSourceState {
         self.state
     }
-}
 
-impl AudioNode for BufferSourceNode {
-    fn id(&self) -> AudioNodeId {
-        self.id
-    }
-
-    /// Process audio with channel conversion support
-    /// output_channels: number of channels in the output buffer (typically 2 for stereo)
-    fn process(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
-        self.process_with_channels(output, 2)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.state == BufferSourceState::Finished
-    }
-
-    fn output_channels(&self) -> u32 {
-        self.buffer
-            .as_ref()
-            .map(|b| b.channels)
-            .unwrap_or(2)
-    }
-}
-
-impl BufferSourceNode {
     /// Process with explicit output channel count
     pub fn process_with_channels(&mut self, output: &mut [f32], output_channels: u32) -> usize {
         if self.state != BufferSourceState::Playing {
@@ -142,16 +122,30 @@ impl BufferSourceNode {
 
         // Dispatch to optimized path based on channel configuration
         match (src_channels, dst_channels) {
-            (1, 2) => self.process_mono_to_stereo(output, samples, buffer_frames, output_frames, sample_rate),
-            (2, 2) => self.process_stereo_to_stereo(output, samples, buffer_frames, output_frames, sample_rate),
-            _ => self.process_generic(output, samples, buffer_frames, output_frames, src_channels, dst_channels, sample_rate),
+            (1, 2) => self.process_mono_to_stereo(
+                output,
+                samples,
+                buffer_frames,
+                output_frames,
+                sample_rate,
+            ),
+            (2, 2) => self.process_stereo_to_stereo(
+                output,
+                samples,
+                buffer_frames,
+                output_frames,
+                sample_rate,
+            ),
+            _ => self.process_generic(
+                output,
+                samples,
+                buffer_frames,
+                output_frames,
+                src_channels,
+                dst_channels,
+                sample_rate,
+            ),
         }
-    }
-
-    /// Check if playback is finished
-    #[inline]
-    pub fn is_finished(&self) -> bool {
-        self.state == BufferSourceState::Finished
     }
 
     /// Optimized path: mono source to stereo output
@@ -165,7 +159,7 @@ impl BufferSourceNode {
         sample_rate: f64,
     ) -> usize {
         let mut frames_written = 0;
-        let playback_rate = self.playback_rate as f64;
+        let playback_rate = self.playback_rate.value() as f64;
 
         for frame_idx in 0..output_frames {
             let src_frame = self.position as usize;
@@ -214,7 +208,7 @@ impl BufferSourceNode {
         sample_rate: f64,
     ) -> usize {
         let mut frames_written = 0;
-        let playback_rate = self.playback_rate as f64;
+        let playback_rate = self.playback_rate.value() as f64;
 
         for frame_idx in 0..output_frames {
             let src_frame = self.position as usize;
@@ -264,7 +258,7 @@ impl BufferSourceNode {
         sample_rate: f64,
     ) -> usize {
         let mut frames_written = 0;
-        let playback_rate = self.playback_rate as f64;
+        let playback_rate = self.playback_rate.value() as f64;
 
         for frame_idx in 0..output_frames {
             let src_frame = self.position as usize;
@@ -291,7 +285,9 @@ impl BufferSourceNode {
             let src_base = src_frame * src_channels;
             let dst_base = frame_idx * dst_channels;
 
-            if src_base + copy_channels <= samples.len() && dst_base + dst_channels <= output.len() {
+            if src_base + copy_channels <= samples.len()
+                && dst_base + dst_channels <= output.len()
+            {
                 for ch in 0..copy_channels {
                     output[dst_base + ch] = samples[src_base + ch];
                 }
@@ -310,5 +306,53 @@ impl BufferSourceNode {
         }
 
         frames_written
+    }
+}
+
+impl AudioNodeProcessor for BufferSourceNode {
+    fn id(&self) -> AudioNodeId {
+        self.id
+    }
+
+    fn node_type(&self) -> AudioNodeType {
+        AudioNodeType::BufferSource
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn process(
+        &mut self,
+        _inputs: &[f32],
+        output: &mut [f32],
+        _sample_rate: u32,
+        _current_time: f64,
+    ) -> usize {
+        // Source node: ignore inputs, generate from buffer
+        self.process_with_channels(output, 2)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.state == BufferSourceState::Finished
+    }
+
+    fn is_source(&self) -> bool {
+        true
+    }
+
+    fn output_channels(&self) -> u32 {
+        self.buffer
+            .as_ref()
+            .map(|b| b.channels)
+            .unwrap_or(2)
+    }
+
+    fn get_param_mut(&mut self, name: &str) -> Option<&mut AudioParamTimeline> {
+        match name {
+            "playbackRate" => Some(&mut self.playback_rate),
+            "detune" => Some(&mut self.detune),
+            _ => None,
+        }
     }
 }

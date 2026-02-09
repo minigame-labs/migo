@@ -16,6 +16,12 @@ use crate::cache::GlobalAudioCache;
 use crate::context::AudioContext;
 use crate::decoder;
 use crate::inner_audio::{InnerAudioPlayer, PlaybackState};
+use crate::nodes::{
+    AnalyserNode, BiquadFilterNode, BiquadFilterType, ChannelMergerNode,
+    ChannelSplitterNode, ConstantSourceNode, DelayNode, DynamicsCompressorNode,
+    IIRFilterNode, OscillatorNode, OscillatorType, OversampleType,
+    PannerNode, PanningModel, DistanceModel, WaveShaperNode,
+};
 use crate::output::AudioOutput;
 use crate::resampler;
 use crate::streaming::{self, StreamingState};
@@ -217,6 +223,9 @@ fn run_audio_thread(
 
     // InnerAudioContext players with pre-allocated capacity
     let mut inner_players: HashMap<InnerAudioId, InnerAudioPlayer> = HashMap::with_capacity(16);
+
+    // MediaAudioPlayer: maps player_id -> list of InnerAudioContext source IDs
+    let mut media_players: HashMap<u32, Vec<InnerAudioId>> = HashMap::with_capacity(4);
 
     // Global audio cache (64MB default)
     let audio_cache = GlobalAudioCache::new();
@@ -522,6 +531,259 @@ fn run_audio_thread(
                     }
                 }
 
+                // ==================== Phase 2 Nodes ====================
+                AudioCmd::CreateOscillator { ctx_id, node_id } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        ctx.add_node(Box::new(OscillatorNode::new(node_id)));
+                        node_index.register(node_id, ctx_id);
+                    }
+                }
+
+                AudioCmd::SetOscillatorType { node_id, osc_type } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<OscillatorNode, _>(node_id, |osc| {
+                                osc.set_type(OscillatorType::from_str(&osc_type));
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::StartOscillator { node_id, when } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<OscillatorNode, _>(node_id, |osc| {
+                                osc.start(when);
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::StopOscillator { node_id, when } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<OscillatorNode, _>(node_id, |osc| {
+                                osc.stop(when);
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::CreateDelay { ctx_id, node_id, max_delay_time } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        let sr = ctx.sample_rate();
+                        let ch = ctx.channels();
+                        ctx.add_node(Box::new(DelayNode::new(node_id, max_delay_time, sr, ch)));
+                        node_index.register(node_id, ctx_id);
+                    }
+                }
+
+                AudioCmd::CreateBiquadFilter { ctx_id, node_id } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        let ch = ctx.channels();
+                        ctx.add_node(Box::new(BiquadFilterNode::new(node_id, ch)));
+                        node_index.register(node_id, ctx_id);
+                    }
+                }
+
+                AudioCmd::SetBiquadFilterType { node_id, filter_type } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<BiquadFilterNode, _>(node_id, |filt| {
+                                filt.set_type(BiquadFilterType::from_str(&filter_type));
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::CreateWaveShaper { ctx_id, node_id } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        ctx.add_node(Box::new(WaveShaperNode::new(node_id)));
+                        node_index.register(node_id, ctx_id);
+                    }
+                }
+
+                AudioCmd::SetWaveShaperCurve { node_id, curve } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<WaveShaperNode, _>(node_id, |ws| {
+                                ws.set_curve(curve);
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::SetWaveShaperOversample { node_id, oversample } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<WaveShaperNode, _>(node_id, |ws| {
+                                ws.set_oversample(OversampleType::from_str(&oversample));
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::CreateAnalyser { ctx_id, node_id } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        let ch = ctx.channels();
+                        ctx.add_node(Box::new(AnalyserNode::new(node_id, ch)));
+                        node_index.register(node_id, ctx_id);
+                    }
+                }
+
+                AudioCmd::SetAnalyserFftSize { node_id, fft_size } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<AnalyserNode, _>(node_id, |an| {
+                                an.set_fft_size(fft_size as usize);
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::GetAnalyserByteTimeDomainData { node_id, resp } => {
+                    let result = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .and_then(|ctx| {
+                            ctx.with_node_typed::<AnalyserNode, _>(node_id, |an| {
+                                an.get_byte_time_domain_data()
+                            })
+                        });
+                    match result {
+                        Some(data) => { let _ = resp.send(Ok(data)); }
+                        None => {
+                            let _ = resp.send(Err(EngineError::from_detail(
+                                ErrorCode::NotFound,
+                                format!("AnalyserNode {} not found", node_id),
+                            )));
+                        }
+                    }
+                }
+
+                AudioCmd::GetAnalyserFloatTimeDomainData { node_id, resp } => {
+                    let result = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .and_then(|ctx| {
+                            ctx.with_node_typed::<AnalyserNode, _>(node_id, |an| {
+                                an.get_float_time_domain_data()
+                            })
+                        });
+                    match result {
+                        Some(data) => { let _ = resp.send(Ok(data)); }
+                        None => {
+                            let _ = resp.send(Err(EngineError::from_detail(
+                                ErrorCode::NotFound,
+                                format!("AnalyserNode {} not found", node_id),
+                            )));
+                        }
+                    }
+                }
+
+                // ==================== Phase 3 Nodes ====================
+                AudioCmd::CreateDynamicsCompressor { ctx_id, node_id } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        let ch = ctx.channels();
+                        ctx.add_node(Box::new(DynamicsCompressorNode::new(node_id, ch)));
+                        node_index.register(node_id, ctx_id);
+                    }
+                }
+
+                AudioCmd::CreatePanner { ctx_id, node_id } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        ctx.add_node(Box::new(PannerNode::new(node_id)));
+                        node_index.register(node_id, ctx_id);
+                    }
+                }
+
+                AudioCmd::SetPanningModel { node_id, model } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<PannerNode, _>(node_id, |p| {
+                                p.set_panning_model(PanningModel::from_str(&model));
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::SetDistanceModel { node_id, model } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<PannerNode, _>(node_id, |p| {
+                                p.set_distance_model(DistanceModel::from_str(&model));
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::SetPannerScalar { node_id, prop, value } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<PannerNode, _>(node_id, |p| {
+                                match prop.as_str() {
+                                    "refDistance" => p.set_ref_distance(value),
+                                    "maxDistance" => p.set_max_distance(value),
+                                    "rolloffFactor" => p.set_rolloff_factor(value),
+                                    "coneInnerAngle" => p.set_cone_inner_angle(value),
+                                    "coneOuterAngle" => p.set_cone_outer_angle(value),
+                                    "coneOuterGain" => p.set_cone_outer_gain(value),
+                                    _ => {}
+                                }
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::CreateChannelMerger { ctx_id, node_id, number_of_inputs } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        ctx.add_node(Box::new(ChannelMergerNode::new(node_id, number_of_inputs)));
+                        node_index.register(node_id, ctx_id);
+                    }
+                }
+
+                AudioCmd::CreateChannelSplitter { ctx_id, node_id, number_of_outputs } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        ctx.add_node(Box::new(ChannelSplitterNode::new(node_id, number_of_outputs)));
+                        node_index.register(node_id, ctx_id);
+                    }
+                }
+
+                AudioCmd::CreateConstantSource { ctx_id, node_id } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        ctx.add_node(Box::new(ConstantSourceNode::new(node_id)));
+                        node_index.register(node_id, ctx_id);
+                    }
+                }
+
+                AudioCmd::StartConstantSource { node_id, when } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<ConstantSourceNode, _>(node_id, |cs| {
+                                cs.start(when);
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::StopConstantSource { node_id, when } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.with_node_typed::<ConstantSourceNode, _>(node_id, |cs| {
+                                cs.stop(when);
+                            });
+                        }
+                    }
+                }
+
+                AudioCmd::CreateIIRFilter { ctx_id, node_id, feedforward, feedback } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        let ch = ctx.channels();
+                        ctx.add_node(Box::new(IIRFilterNode::new(node_id, feedforward, feedback, ch)));
+                        node_index.register(node_id, ctx_id);
+                    }
+                }
+
                 AudioCmd::Connect { src, dst, resp } => {
                     // Use index to find the context containing the source node
                     let found = node_index
@@ -551,6 +813,163 @@ fn run_audio_thread(
                         }
                     }
                     let _ = resp.send(Ok(()));
+                }
+
+                // ==================== AudioParam Automation ====================
+                AudioCmd::AudioParamSetValueAtTime { node_id, param_name, value, time } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.param_set_value_at_time(node_id, &param_name, value, time);
+                        }
+                    }
+                }
+
+                AudioCmd::AudioParamLinearRamp { node_id, param_name, value, end_time } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.param_linear_ramp(node_id, &param_name, value, end_time);
+                        }
+                    }
+                }
+
+                AudioCmd::AudioParamExponentialRamp { node_id, param_name, value, end_time } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.param_exponential_ramp(node_id, &param_name, value, end_time);
+                        }
+                    }
+                }
+
+                AudioCmd::AudioParamSetTarget { node_id, param_name, target, start_time, time_constant } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.param_set_target(node_id, &param_name, target, start_time, time_constant);
+                        }
+                    }
+                }
+
+                AudioCmd::AudioParamCancelScheduled { node_id, param_name, cancel_time } => {
+                    if let Some(ctx_id) = node_index.get_context(node_id) {
+                        if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                            ctx.param_cancel_scheduled(node_id, &param_name, cancel_time);
+                        }
+                    }
+                }
+
+                // ==================== Buffer Data Access ====================
+                AudioCmd::CreateBuffer { ctx_id, channels, length, sample_rate: buf_rate, resp } => {
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        let id = ctx.create_empty_buffer(channels, length, buf_rate);
+                        let _ = resp.send(Ok(AudioBufferInfo {
+                            id,
+                            duration: length as f64 / buf_rate as f64,
+                            sample_rate: buf_rate,
+                            channels,
+                            length,
+                        }));
+                    } else {
+                        let _ = resp.send(Err(EngineError::from_detail(
+                            ErrorCode::NotFound,
+                            format!("AudioContext {} not found", ctx_id),
+                        )));
+                    }
+                }
+
+                AudioCmd::GetChannelData { ctx_id, buffer_id, channel, resp } => {
+                    if let Some(ctx) = contexts.get(&ctx_id) {
+                        if let Some(data) = ctx.get_channel_data(buffer_id, channel) {
+                            let _ = resp.send(Ok(data));
+                        } else {
+                            let _ = resp.send(Err(EngineError::from_detail(
+                                ErrorCode::NotFound,
+                                format!("Buffer {} channel {} not found", buffer_id, channel),
+                            )));
+                        }
+                    } else {
+                        let _ = resp.send(Err(EngineError::from_detail(
+                            ErrorCode::NotFound,
+                            format!("AudioContext {} not found", ctx_id),
+                        )));
+                    }
+                }
+
+                AudioCmd::CopyToChannel { ctx_id, buffer_id, data, channel, start, resp } => {
+                    // CopyToChannel requires mutable access to the buffer.
+                    // Since buffers are stored as Arc<DecodedAudio>, we need to
+                    // go through the context to handle this properly.
+                    // For now, this is a no-op placeholder that will be fully
+                    // implemented when AudioBuffer write support is added.
+                    let _ = resp.send(Err(EngineError::from_detail(
+                        ErrorCode::Unsupported,
+                        "CopyToChannel not yet implemented for Arc-wrapped buffers",
+                    )));
+                }
+
+                // ==================== Global Audio Options ====================
+                AudioCmd::SetInnerAudioOption { mix_with_other, obey_mute_switch, speaker_on, resp } => {
+                    // Store settings. Actual platform behavior (Android AudioManager)
+                    // is handled at the platform layer. The audio thread acknowledges.
+                    tracing::debug!(
+                        "SetInnerAudioOption: mix={}, mute_switch={}, speaker={}",
+                        mix_with_other, obey_mute_switch, speaker_on
+                    );
+                    let _ = resp.send(Ok(()));
+                }
+
+                AudioCmd::GetAvailableAudioSources { resp } => {
+                    // Return default audio sources. Platform-specific sources
+                    // (e.g. Bluetooth, USB) require Android AudioManager queries.
+                    let sources = vec![
+                        "auto".to_string(),
+                        "buildInMic".to_string(),
+                        "mic".to_string(),
+                    ];
+                    let _ = resp.send(Ok(sources));
+                }
+
+                // ==================== MediaAudioPlayer ====================
+                AudioCmd::CreateMediaAudioPlayer { id } => {
+                    media_players.insert(id, Vec::new());
+                    tracing::debug!("Created MediaAudioPlayer {}", id);
+                }
+
+                AudioCmd::MediaAudioPlayerAddSource { player_id, source_id } => {
+                    if let Some(sources) = media_players.get_mut(&player_id) {
+                        if !sources.contains(&source_id) {
+                            sources.push(source_id);
+                        }
+                    }
+                }
+
+                AudioCmd::MediaAudioPlayerRemoveSource { player_id, source_id } => {
+                    if let Some(sources) = media_players.get_mut(&player_id) {
+                        sources.retain(|&id| id != source_id);
+                    }
+                }
+
+                AudioCmd::MediaAudioPlayerStart { player_id } => {
+                    if let Some(sources) = media_players.get(&player_id) {
+                        for &source_id in sources {
+                            if let Some(player) = inner_players.get_mut(&source_id) {
+                                player.play();
+                            }
+                        }
+                    }
+                }
+
+                AudioCmd::MediaAudioPlayerStop { player_id } => {
+                    if let Some(sources) = media_players.get(&player_id) {
+                        for &source_id in sources {
+                            if let Some(player) = inner_players.get_mut(&source_id) {
+                                player.stop();
+                            }
+                        }
+                    }
+                }
+
+                AudioCmd::MediaAudioPlayerDestroy { player_id } => {
+                    media_players.remove(&player_id);
+                    tracing::debug!("Destroyed MediaAudioPlayer {}", player_id);
                 }
 
                 // ==================== InnerAudioContext ====================

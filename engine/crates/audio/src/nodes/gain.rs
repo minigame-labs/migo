@@ -1,48 +1,77 @@
+use std::any::Any;
+
 use shared::protocol::audio_cmd::AudioNodeId;
 
-use super::AudioNode;
+use crate::param::AudioParamTimeline;
+
+use super::{AudioNodeProcessor, AudioNodeType};
 
 pub struct GainNode {
-    #[allow(dead_code)]
     id: AudioNodeId,
-    gain: f32,
+    gain: AudioParamTimeline,
 }
 
 impl GainNode {
     pub fn new(id: AudioNodeId) -> Self {
-        Self { id, gain: 1.0 }
+        Self {
+            id,
+            gain: AudioParamTimeline::new(1.0, -3.4028235e38, 3.4028235e38),
+        }
     }
 
     pub fn set_gain(&mut self, value: f32) {
-        self.gain = value;
+        self.gain.set_value(value);
     }
 
     #[allow(dead_code)]
-    pub fn gain(&self) -> f32 {
-        self.gain
-    }
-
-    /// Apply gain to input samples in-place
-    pub fn apply(&self, samples: &mut [f32]) {
-        if (self.gain - 1.0).abs() < f32::EPSILON {
-            return; // No change needed
-        }
-
-        for sample in samples.iter_mut() {
-            *sample *= self.gain;
-        }
+    pub fn gain_value(&self) -> f32 {
+        self.gain.value()
     }
 }
 
-impl AudioNode for GainNode {
+impl AudioNodeProcessor for GainNode {
     fn id(&self) -> AudioNodeId {
         self.id
     }
 
-    fn process(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
-        // GainNode is a pass-through processor
-        // The actual gain application happens in the mixer when processing the graph
-        self.apply(output);
-        output.len() / 2 // Assume stereo
+    fn node_type(&self) -> AudioNodeType {
+        AudioNodeType::Gain
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn process(
+        &mut self,
+        inputs: &[f32],
+        output: &mut [f32],
+        _sample_rate: u32,
+        _current_time: f64,
+    ) -> usize {
+        let len = inputs.len().min(output.len());
+        if len == 0 {
+            return 0;
+        }
+
+        let gain = self.gain.value();
+
+        // Optimization: skip multiply if gain is 1.0
+        if (gain - 1.0).abs() < f32::EPSILON {
+            output[..len].copy_from_slice(&inputs[..len]);
+        } else {
+            for i in 0..len {
+                output[i] = inputs[i] * gain;
+            }
+        }
+
+        len / 2 // Assume stereo: frames = samples / channels
+    }
+
+    fn get_param_mut(&mut self, name: &str) -> Option<&mut AudioParamTimeline> {
+        match name {
+            "gain" => Some(&mut self.gain),
+            _ => None,
+        }
     }
 }

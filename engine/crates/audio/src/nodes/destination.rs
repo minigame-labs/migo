@@ -1,9 +1,9 @@
+use std::any::Any;
+
 use shared::protocol::audio_cmd::AudioNodeId;
 
-use super::AudioNode;
+use super::{AudioNodeProcessor, AudioNodeType};
 
-
-#[allow(dead_code)]
 /// The destination node represents the final output of the audio graph.
 /// It collects mixed audio from all connected source nodes.
 pub struct DestinationNode {
@@ -17,14 +17,32 @@ impl DestinationNode {
     }
 }
 
-impl AudioNode for DestinationNode {
+impl AudioNodeProcessor for DestinationNode {
     fn id(&self) -> AudioNodeId {
         self.id
     }
 
-    fn process(&mut self, _output: &mut [f32], _sample_rate: u32) -> usize {
-        // DestinationNode doesn't process - it just receives mixed audio
-        0
+    fn node_type(&self) -> AudioNodeType {
+        AudioNodeType::Destination
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn process(
+        &mut self,
+        inputs: &[f32],
+        output: &mut [f32],
+        _sample_rate: u32,
+        _current_time: f64,
+    ) -> usize {
+        // Destination node: pass input to output (collected by the context)
+        let len = inputs.len().min(output.len());
+        if len > 0 {
+            output[..len].copy_from_slice(&inputs[..len]);
+        }
+        len / self.channels.max(1) as usize
     }
 
     fn output_channels(&self) -> u32 {

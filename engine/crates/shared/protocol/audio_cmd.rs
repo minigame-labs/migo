@@ -228,6 +228,280 @@ pub enum AudioCmd {
         resp: AudioResp<()>,
     },
 
+    // ==================== Phase 2 Nodes ====================
+    /// Create an OscillatorNode (fire-and-forget)
+    CreateOscillator {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+    },
+
+    /// Set OscillatorNode type (fire-and-forget)
+    SetOscillatorType {
+        node_id: AudioNodeId,
+        osc_type: String,
+    },
+
+    /// Start an OscillatorNode
+    StartOscillator {
+        node_id: AudioNodeId,
+        when: f64,
+    },
+
+    /// Stop an OscillatorNode
+    StopOscillator {
+        node_id: AudioNodeId,
+        when: f64,
+    },
+
+    /// Create a DelayNode (fire-and-forget)
+    CreateDelay {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+        max_delay_time: f32,
+    },
+
+    /// Create a BiquadFilterNode (fire-and-forget)
+    CreateBiquadFilter {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+    },
+
+    /// Set BiquadFilterNode type (fire-and-forget)
+    SetBiquadFilterType {
+        node_id: AudioNodeId,
+        filter_type: String,
+    },
+
+    /// Create a WaveShaperNode (fire-and-forget)
+    CreateWaveShaper {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+    },
+
+    /// Set WaveShaperNode curve (fire-and-forget)
+    SetWaveShaperCurve {
+        node_id: AudioNodeId,
+        curve: Option<Vec<f32>>,
+    },
+
+    /// Set WaveShaperNode oversample (fire-and-forget)
+    SetWaveShaperOversample {
+        node_id: AudioNodeId,
+        oversample: String,
+    },
+
+    /// Create an AnalyserNode (fire-and-forget)
+    CreateAnalyser {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+    },
+
+    /// Set AnalyserNode fft_size (fire-and-forget)
+    SetAnalyserFftSize {
+        node_id: AudioNodeId,
+        fft_size: u32,
+    },
+
+    /// Get AnalyserNode time domain data (byte)
+    GetAnalyserByteTimeDomainData {
+        node_id: AudioNodeId,
+        resp: AudioResp<Vec<u8>>,
+    },
+
+    /// Get AnalyserNode time domain data (float)
+    GetAnalyserFloatTimeDomainData {
+        node_id: AudioNodeId,
+        resp: AudioResp<Vec<f32>>,
+    },
+
+    // ==================== Phase 3 Nodes ====================
+    /// Create a DynamicsCompressorNode (fire-and-forget)
+    CreateDynamicsCompressor {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+    },
+
+    /// Create a PannerNode (fire-and-forget)
+    CreatePanner {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+    },
+
+    /// Set PannerNode panning model (fire-and-forget)
+    SetPanningModel {
+        node_id: AudioNodeId,
+        model: String,
+    },
+
+    /// Set PannerNode distance model (fire-and-forget)
+    SetDistanceModel {
+        node_id: AudioNodeId,
+        model: String,
+    },
+
+    /// Set PannerNode scalar properties (fire-and-forget)
+    SetPannerScalar {
+        node_id: AudioNodeId,
+        prop: String,
+        value: f64,
+    },
+
+    /// Create a ChannelMergerNode (fire-and-forget)
+    CreateChannelMerger {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+        number_of_inputs: u32,
+    },
+
+    /// Create a ChannelSplitterNode (fire-and-forget)
+    CreateChannelSplitter {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+        number_of_outputs: u32,
+    },
+
+    /// Create a ConstantSourceNode (fire-and-forget)
+    CreateConstantSource {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+    },
+
+    /// Start a ConstantSourceNode
+    StartConstantSource {
+        node_id: AudioNodeId,
+        when: f64,
+    },
+
+    /// Stop a ConstantSourceNode
+    StopConstantSource {
+        node_id: AudioNodeId,
+        when: f64,
+    },
+
+    /// Create an IIRFilterNode (fire-and-forget)
+    CreateIIRFilter {
+        ctx_id: AudioContextId,
+        node_id: AudioNodeId,
+        feedforward: Vec<f64>,
+        feedback: Vec<f64>,
+    },
+
+    // ==================== AudioParam Automation ====================
+    /// Schedule a value change at a specific time
+    AudioParamSetValueAtTime {
+        node_id: AudioNodeId,
+        param_name: String,
+        value: f32,
+        time: f64,
+    },
+
+    /// Schedule a linear ramp to a value
+    AudioParamLinearRamp {
+        node_id: AudioNodeId,
+        param_name: String,
+        value: f32,
+        end_time: f64,
+    },
+
+    /// Schedule an exponential ramp to a value
+    AudioParamExponentialRamp {
+        node_id: AudioNodeId,
+        param_name: String,
+        value: f32,
+        end_time: f64,
+    },
+
+    /// Asymptotically approach a target value
+    AudioParamSetTarget {
+        node_id: AudioNodeId,
+        param_name: String,
+        target: f32,
+        start_time: f64,
+        time_constant: f64,
+    },
+
+    /// Cancel all scheduled events after a specific time
+    AudioParamCancelScheduled {
+        node_id: AudioNodeId,
+        param_name: String,
+        cancel_time: f64,
+    },
+
+    // ==================== Buffer Data Access ====================
+    /// Create an empty audio buffer
+    CreateBuffer {
+        ctx_id: AudioContextId,
+        channels: u32,
+        length: u32,
+        sample_rate: u32,
+        resp: AudioResp<AudioBufferInfo>,
+    },
+
+    /// Get channel data from a buffer
+    GetChannelData {
+        ctx_id: AudioContextId,
+        buffer_id: AudioBufferId,
+        channel: u32,
+        resp: AudioResp<Vec<f32>>,
+    },
+
+    /// Copy data to a buffer channel
+    CopyToChannel {
+        ctx_id: AudioContextId,
+        buffer_id: AudioBufferId,
+        data: Vec<f32>,
+        channel: u32,
+        start: u32,
+        resp: AudioResp<()>,
+    },
+
+    // ==================== Global Audio Options ====================
+    /// Set inner audio options (mixWithOther, obeyMuteSwitch, speakerOn)
+    SetInnerAudioOption {
+        mix_with_other: bool,
+        obey_mute_switch: bool,
+        speaker_on: bool,
+        resp: AudioResp<()>,
+    },
+
+    /// Get available audio sources
+    GetAvailableAudioSources {
+        resp: AudioResp<Vec<String>>,
+    },
+
+    // ==================== MediaAudioPlayer ====================
+    /// Create a MediaAudioPlayer
+    CreateMediaAudioPlayer {
+        id: u32,
+    },
+
+    /// Add an InnerAudioContext source to a MediaAudioPlayer
+    MediaAudioPlayerAddSource {
+        player_id: u32,
+        source_id: InnerAudioId,
+    },
+
+    /// Remove an InnerAudioContext source from a MediaAudioPlayer
+    MediaAudioPlayerRemoveSource {
+        player_id: u32,
+        source_id: InnerAudioId,
+    },
+
+    /// Start a MediaAudioPlayer
+    MediaAudioPlayerStart {
+        player_id: u32,
+    },
+
+    /// Stop a MediaAudioPlayer
+    MediaAudioPlayerStop {
+        player_id: u32,
+    },
+
+    /// Destroy a MediaAudioPlayer
+    MediaAudioPlayerDestroy {
+        player_id: u32,
+    },
+
     // ==================== Lifecycle ====================
     /// Shutdown the audio thread
     Shutdown,

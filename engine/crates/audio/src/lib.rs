@@ -80,6 +80,7 @@ mod inner_audio;
 mod mixer;
 mod nodes;
 mod output;
+pub mod param;
 mod resampler;
 pub mod streaming;
 pub mod power_manager;

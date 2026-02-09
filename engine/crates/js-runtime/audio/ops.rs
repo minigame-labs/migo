@@ -330,6 +330,622 @@ pub async fn op_audio_disconnect(
 }
 
 // ============================================================================
+// AudioParam Automation Operations (all fire-and-forget)
+// ============================================================================
+
+#[op2(fast)]
+pub fn op_audio_param_set_value_at_time(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] param_name: String,
+    value: f32,
+    time: f64,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::AudioParamSetValueAtTime {
+        node_id,
+        param_name,
+        value,
+        time,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_param_linear_ramp(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] param_name: String,
+    value: f32,
+    end_time: f64,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::AudioParamLinearRamp {
+        node_id,
+        param_name,
+        value,
+        end_time,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_param_exponential_ramp(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] param_name: String,
+    value: f32,
+    end_time: f64,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::AudioParamExponentialRamp {
+        node_id,
+        param_name,
+        value,
+        end_time,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_param_set_target(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] param_name: String,
+    target: f32,
+    start_time: f64,
+    time_constant: f64,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::AudioParamSetTarget {
+        node_id,
+        param_name,
+        target,
+        start_time,
+        time_constant,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_param_cancel_scheduled(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] param_name: String,
+    cancel_time: f64,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::AudioParamCancelScheduled {
+        node_id,
+        param_name,
+        cancel_time,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+// ============================================================================
+// Phase 2: OscillatorNode Operations
+// ============================================================================
+
+#[op2(fast)]
+pub fn op_audio_create_oscillator(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreateOscillator { ctx_id, node_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_set_oscillator_type(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] osc_type: String,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::SetOscillatorType { node_id, osc_type })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_start_oscillator(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    when: f64,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::StartOscillator { node_id, when })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_stop_oscillator(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    when: f64,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::StopOscillator { node_id, when })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+// ============================================================================
+// Phase 2: DelayNode Operations
+// ============================================================================
+
+#[op2(fast)]
+pub fn op_audio_create_delay(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+    max_delay_time: f32,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreateDelay { ctx_id, node_id, max_delay_time })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+// ============================================================================
+// Phase 2: BiquadFilterNode Operations
+// ============================================================================
+
+#[op2(fast)]
+pub fn op_audio_create_biquad_filter(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreateBiquadFilter { ctx_id, node_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_set_biquad_filter_type(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] filter_type: String,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::SetBiquadFilterType { node_id, filter_type })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+// ============================================================================
+// Phase 2: WaveShaperNode Operations
+// ============================================================================
+
+#[op2(fast)]
+pub fn op_audio_create_wave_shaper(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreateWaveShaper { ctx_id, node_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2]
+pub fn op_audio_set_wave_shaper_curve(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[buffer] curve_bytes: Option<JsBuffer>,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    let curve = curve_bytes.map(|buf| {
+        buf.chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<f32>>()
+    });
+    tx.send(AudioCmd::SetWaveShaperCurve { node_id, curve })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_set_wave_shaper_oversample(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] oversample: String,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::SetWaveShaperOversample { node_id, oversample })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+// ============================================================================
+// Phase 2: AnalyserNode Operations
+// ============================================================================
+
+#[op2(fast)]
+pub fn op_audio_create_analyser(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreateAnalyser { ctx_id, node_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_set_analyser_fft_size(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[smi] fft_size: u32,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::SetAnalyserFftSize { node_id, fft_size })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(async(lazy), fast)]
+#[buffer]
+pub async fn op_audio_analyser_byte_time_domain(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+) -> Result<Vec<u8>, AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(AudioCmd::GetAnalyserByteTimeDomainData { node_id, resp: resp_tx })
+        .map_err(|_| audio_err("Audio thread disconnected"))?;
+    resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)
+}
+
+#[op2(async(lazy), fast)]
+#[buffer]
+pub async fn op_audio_analyser_float_time_domain(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+) -> Result<Vec<u8>, AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(AudioCmd::GetAnalyserFloatTimeDomainData { node_id, resp: resp_tx })
+        .map_err(|_| audio_err("Audio thread disconnected"))?;
+    let data = resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)?;
+    // Convert Vec<f32> to raw bytes
+    Ok(data.iter().flat_map(|f| f.to_le_bytes()).collect())
+}
+
+// ============================================================================
+// Phase 3: DynamicsCompressorNode Operations
+// ============================================================================
+
+#[op2(fast)]
+pub fn op_audio_create_dynamics_compressor(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreateDynamicsCompressor { ctx_id, node_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+// ============================================================================
+// Phase 3: PannerNode Operations
+// ============================================================================
+
+#[op2(fast)]
+pub fn op_audio_create_panner(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreatePanner { ctx_id, node_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_set_panning_model(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] model: String,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::SetPanningModel { node_id, model })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_set_distance_model(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] model: String,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::SetDistanceModel { node_id, model })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_set_panner_scalar(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] prop: String,
+    value: f64,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::SetPannerScalar { node_id, prop, value })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+// ============================================================================
+// Phase 3: ChannelMerger/Splitter Operations
+// ============================================================================
+
+#[op2(fast)]
+pub fn op_audio_create_channel_merger(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+    #[smi] number_of_inputs: u32,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreateChannelMerger { ctx_id, node_id, number_of_inputs })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_create_channel_splitter(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+    #[smi] number_of_outputs: u32,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreateChannelSplitter { ctx_id, node_id, number_of_outputs })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+// ============================================================================
+// Phase 3: ConstantSourceNode Operations
+// ============================================================================
+
+#[op2(fast)]
+pub fn op_audio_create_constant_source(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreateConstantSource { ctx_id, node_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_start_constant_source(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    when: f64,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::StartConstantSource { node_id, when })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+#[op2(fast)]
+pub fn op_audio_stop_constant_source(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    when: f64,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::StopConstantSource { node_id, when })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+// ============================================================================
+// Phase 3: IIRFilterNode Operations
+// ============================================================================
+
+#[op2]
+pub fn op_audio_create_iir_filter(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] node_id: AudioNodeId,
+    #[serde] feedforward: Vec<f64>,
+    #[serde] feedback: Vec<f64>,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreateIIRFilter { ctx_id, node_id, feedforward, feedback })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+// ============================================================================
+// AudioBuffer Data Access Operations
+// ============================================================================
+
+/// Create an empty audio buffer
+#[op2(async(lazy), fast)]
+#[serde]
+pub async fn op_audio_create_buffer(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] channels: u32,
+    #[smi] length: u32,
+    #[smi] sample_rate: u32,
+) -> Result<AudioBufferInfo, AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(AudioCmd::CreateBuffer {
+        ctx_id,
+        channels,
+        length,
+        sample_rate,
+        resp: resp_tx,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)
+}
+
+/// Get channel data from a buffer (returns raw f32 bytes)
+#[op2(async(lazy), fast)]
+#[buffer]
+pub async fn op_audio_get_channel_data(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] buffer_id: AudioBufferId,
+    #[smi] channel: u32,
+) -> Result<Vec<u8>, AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(AudioCmd::GetChannelData {
+        ctx_id,
+        buffer_id,
+        channel,
+        resp: resp_tx,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    let data = resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)?;
+
+    // Convert Vec<f32> to Vec<u8> (raw bytes for Float32Array)
+    let bytes: Vec<u8> = data
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    Ok(bytes)
+}
+
+// ============================================================================
+// Global Audio Options
+// ============================================================================
+
+/// Set inner audio options (mixWithOther, obeyMuteSwitch, speakerOn)
+#[op2(async(lazy), fast)]
+pub async fn op_audio_set_inner_audio_option(
+    state: Rc<RefCell<OpState>>,
+    mix_with_other: bool,
+    obey_mute_switch: bool,
+    speaker_on: bool,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(AudioCmd::SetInnerAudioOption {
+        mix_with_other,
+        obey_mute_switch,
+        speaker_on,
+        resp: resp_tx,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)
+}
+
+/// Get available audio sources
+#[op2(async(lazy), fast)]
+#[serde]
+pub async fn op_audio_get_available_audio_sources(
+    state: Rc<RefCell<OpState>>,
+) -> Result<Vec<String>, AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(AudioCmd::GetAvailableAudioSources { resp: resp_tx })
+        .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)
+}
+
+// ============================================================================
+// MediaAudioPlayer Operations
+// ============================================================================
+
+/// Create a MediaAudioPlayer (fire and forget)
+#[op2(fast)]
+pub fn op_media_audio_player_create(
+    state: Rc<RefCell<OpState>>,
+    #[smi] player_id: u32,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::CreateMediaAudioPlayer { id: player_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+/// Add source to MediaAudioPlayer (fire and forget)
+#[op2(fast)]
+pub fn op_media_audio_player_add_source(
+    state: Rc<RefCell<OpState>>,
+    #[smi] player_id: u32,
+    #[smi] source_id: InnerAudioId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::MediaAudioPlayerAddSource { player_id, source_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+/// Remove source from MediaAudioPlayer (fire and forget)
+#[op2(fast)]
+pub fn op_media_audio_player_remove_source(
+    state: Rc<RefCell<OpState>>,
+    #[smi] player_id: u32,
+    #[smi] source_id: InnerAudioId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::MediaAudioPlayerRemoveSource { player_id, source_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+/// Start MediaAudioPlayer (fire and forget)
+#[op2(fast)]
+pub fn op_media_audio_player_start(
+    state: Rc<RefCell<OpState>>,
+    #[smi] player_id: u32,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::MediaAudioPlayerStart { player_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+/// Stop MediaAudioPlayer (fire and forget)
+#[op2(fast)]
+pub fn op_media_audio_player_stop(
+    state: Rc<RefCell<OpState>>,
+    #[smi] player_id: u32,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::MediaAudioPlayerStop { player_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+/// Destroy MediaAudioPlayer (fire and forget)
+#[op2(fast)]
+pub fn op_media_audio_player_destroy(
+    state: Rc<RefCell<OpState>>,
+    #[smi] player_id: u32,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    tx.send(AudioCmd::MediaAudioPlayerDestroy { player_id })
+        .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
+// ============================================================================
 // InnerAudioContext Operations
 // ============================================================================
 

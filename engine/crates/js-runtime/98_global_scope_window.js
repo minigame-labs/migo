@@ -9,6 +9,7 @@ import * as touch from 'ext:host_v8_touch/01_touch.js';
 import * as audio from 'ext:host_v8_audio/01_audio_context.js';
 import * as innerAudio from 'ext:host_v8_audio/02_inner_audio_context.js';
 import * as audioInterruption from 'ext:host_v8_audio/03_audio_interruption.js';
+import * as mediaAudioPlayer from 'ext:host_v8_audio/04_media_audio_player.js';
 import * as deviceMotion from 'ext:host_v8_device/01_device_motion.js';
 import * as gyroscope from 'ext:host_v8_device/02_gyroscope.js';
 import * as orientation from 'ext:host_v8_device/03_orientation.js';
@@ -55,11 +56,32 @@ const WindowGlobalScope = {
     AudioBufferSourceNode: core.propNonEnumerable(audio.AudioBufferSourceNode),
     GainNode: core.propNonEnumerable(audio.GainNode),
     AudioParam: core.propNonEnumerable(audio.AudioParam),
+    OscillatorNode: core.propNonEnumerable(audio.OscillatorNode),
+    DelayNode: core.propNonEnumerable(audio.DelayNode),
+    BiquadFilterNode: core.propNonEnumerable(audio.BiquadFilterNode),
+    WaveShaperNode: core.propNonEnumerable(audio.WaveShaperNode),
+    AnalyserNode: core.propNonEnumerable(audio.AnalyserNode),
+    DynamicsCompressorNode: core.propNonEnumerable(audio.DynamicsCompressorNode),
+    PannerNode: core.propNonEnumerable(audio.PannerNode),
+    ChannelMergerNode: core.propNonEnumerable(audio.ChannelMergerNode),
+    ChannelSplitterNode: core.propNonEnumerable(audio.ChannelSplitterNode),
+    ConstantSourceNode: core.propNonEnumerable(audio.ConstantSourceNode),
+    IIRFilterNode: core.propNonEnumerable(audio.IIRFilterNode),
+    ScriptProcessorNode: core.propNonEnumerable(audio.ScriptProcessorNode),
+    PeriodicWave: core.propNonEnumerable(audio.PeriodicWave),
+    AudioListener: core.propNonEnumerable(audio.AudioListener),
+    createWebAudioContext: core.propNonEnumerable(audio.createWebAudioContext),
 
     // InnerAudioContext
     InnerAudioContext: core.propNonEnumerable(innerAudio.InnerAudioContext),
     createInnerAudioContext: core.propNonEnumerable(innerAudio.createInnerAudioContext),
+    setInnerAudioOption: core.propNonEnumerable(innerAudio.setInnerAudioOption),
+    getAvailableAudioSources: core.propNonEnumerable(innerAudio.getAvailableAudioSources),
     _internalEnqueueInnerAudioEvent: core.propNonEnumerable(innerAudio._internalEnqueueInnerAudioEvent),
+
+    // MediaAudioPlayer
+    MediaAudioPlayer: core.propNonEnumerable(mediaAudioPlayer.MediaAudioPlayer),
+    createMediaAudioPlayer: core.propNonEnumerable(mediaAudioPlayer.createMediaAudioPlayer),
 
     // Audio Interruption
     onAudioInterruptionBegin: core.propNonEnumerable(audioInterruption.onAudioInterruptionBegin),

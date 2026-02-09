@@ -1,14 +1,31 @@
+import {
+  op_audio_param_set_value_at_time,
+  op_audio_param_linear_ramp,
+  op_audio_param_exponential_ramp,
+  op_audio_param_set_target,
+  op_audio_param_cancel_scheduled,
+} from "ext:core/ops";
+
 class AudioParam {
   #value;
   #defaultValue;
   #minValue;
   #maxValue;
+  // Node ID and param name for native automation dispatch
+  #nodeId = null;
+  #paramName = null;
 
   constructor(defaultValue, minValue = -3.4028235e38, maxValue = 3.4028235e38) {
     this.#value = defaultValue;
     this.#defaultValue = defaultValue;
     this.#minValue = minValue;
     this.#maxValue = maxValue;
+  }
+
+  // Internal: bind this param to a specific node and param name
+  _bind(nodeId, paramName) {
+    this.#nodeId = nodeId;
+    this.#paramName = paramName;
   }
 
   get value() {
@@ -33,36 +50,52 @@ class AudioParam {
     return this.#maxValue;
   }
 
-  // Automation methods (stubs for now)
   setValueAtTime(value, startTime) {
-    this.value = value;
+    this.#value = value;
+    if (this.#nodeId !== null) {
+      op_audio_param_set_value_at_time(this.#nodeId, this.#paramName, value, startTime);
+    }
     return this;
   }
 
   linearRampToValueAtTime(value, endTime) {
-    this.value = value;
+    this.#value = value;
+    if (this.#nodeId !== null) {
+      op_audio_param_linear_ramp(this.#nodeId, this.#paramName, value, endTime);
+    }
     return this;
   }
 
   exponentialRampToValueAtTime(value, endTime) {
-    this.value = value;
+    this.#value = value;
+    if (this.#nodeId !== null) {
+      op_audio_param_exponential_ramp(this.#nodeId, this.#paramName, value, endTime);
+    }
     return this;
   }
 
   setTargetAtTime(target, startTime, timeConstant) {
-    this.value = target;
+    this.#value = target;
+    if (this.#nodeId !== null) {
+      op_audio_param_set_target(this.#nodeId, this.#paramName, target, startTime, timeConstant);
+    }
     return this;
   }
 
   cancelScheduledValues(cancelTime) {
+    if (this.#nodeId !== null) {
+      op_audio_param_cancel_scheduled(this.#nodeId, this.#paramName, cancelTime);
+    }
     return this;
   }
 }
 
 /**
- * AudioParam with native callback support for GainNode etc.
+ * AudioParam with native callback support for immediate value changes.
+ * Used by GainNode, etc. where .value assignment must immediately
+ * update the native side.
  */
-class GainAudioParam extends AudioParam {
+class NativeAudioParam extends AudioParam {
   #onChangeCallback;
 
   constructor(defaultValue, minValue, maxValue, onChangeCallback) {
@@ -82,4 +115,4 @@ class GainAudioParam extends AudioParam {
   }
 }
 
-export { AudioParam, GainAudioParam };
+export { AudioParam, NativeAudioParam };

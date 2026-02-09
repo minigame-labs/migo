@@ -19,7 +19,9 @@ class AudioBufferSourceNode extends AudioNode {
       numberOfOutputs: 1,
     });
     this.#playbackRate = new AudioParam(1.0, -3.4028235e38, 3.4028235e38);
+    this.#playbackRate._bind(nodeId, "playbackRate");
     this.#detune = new AudioParam(0, -3.4028235e38, 3.4028235e38);
+    this.#detune._bind(nodeId, "detune");
   }
 
   get buffer() {

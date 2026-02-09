@@ -4,12 +4,39 @@ import {
   op_audio_decode_audio_data,
   op_audio_create_buffer_source,
   op_audio_create_gain,
+  op_audio_create_buffer,
+  op_audio_get_channel_data,
+  op_audio_create_oscillator,
+  op_audio_create_delay,
+  op_audio_create_biquad_filter,
+  op_audio_create_wave_shaper,
+  op_audio_create_analyser,
+  op_audio_create_dynamics_compressor,
+  op_audio_create_panner,
+  op_audio_create_channel_merger,
+  op_audio_create_channel_splitter,
+  op_audio_create_constant_source,
+  op_audio_create_iir_filter,
 } from "ext:core/ops";
 import { AudioParam } from "ext:host_v8_audio/00_audio_param.js";
 import { AudioBuffer } from "ext:host_v8_audio/00_audio_buffer.js";
 import { AudioNode, AudioDestinationNode } from "ext:host_v8_audio/00_audio_node.js";
 import { AudioBufferSourceNode } from "ext:host_v8_audio/00_buffer_source_node.js";
 import { GainNode } from "ext:host_v8_audio/00_gain_node.js";
+import { OscillatorNode } from "ext:host_v8_audio/00_oscillator_node.js";
+import { DelayNode } from "ext:host_v8_audio/00_delay_node.js";
+import { BiquadFilterNode } from "ext:host_v8_audio/00_biquad_filter_node.js";
+import { WaveShaperNode } from "ext:host_v8_audio/00_wave_shaper_node.js";
+import { AnalyserNode } from "ext:host_v8_audio/00_analyser_node.js";
+import { DynamicsCompressorNode } from "ext:host_v8_audio/00_dynamics_compressor_node.js";
+import { PannerNode } from "ext:host_v8_audio/00_panner_node.js";
+import { ChannelMergerNode } from "ext:host_v8_audio/00_channel_merger_node.js";
+import { ChannelSplitterNode } from "ext:host_v8_audio/00_channel_splitter_node.js";
+import { ConstantSourceNode } from "ext:host_v8_audio/00_constant_source_node.js";
+import { IIRFilterNode } from "ext:host_v8_audio/00_iir_filter_node.js";
+import { ScriptProcessorNode } from "ext:host_v8_audio/00_script_processor_node.js";
+import { PeriodicWave } from "ext:host_v8_audio/00_periodic_wave.js";
+import { AudioListener } from "ext:host_v8_audio/00_audio_listener.js";
 
 const CONTEXT_REGISTRY = new Map();
 const BUFFER_REGISTRY = new Map();
@@ -66,7 +93,14 @@ class BaseAudioContext {
         new Uint8Array(audioData)
       );
 
-      const buffer = new AudioBuffer(info.id, info);
+      // Eagerly fetch all channel data so getChannelData() can be synchronous
+      const channelData = [];
+      for (let ch = 0; ch < info.channels; ch++) {
+        const bytes = await op_audio_get_channel_data(this.#nativeId, info.id, ch);
+        channelData.push(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4));
+      }
+
+      const buffer = new AudioBuffer(info.id, info, channelData);
       BUFFER_REGISTRY.set(info.id, buffer);
 
       if (successCallback) {
@@ -82,6 +116,19 @@ class BaseAudioContext {
     }
   }
 
+  async createBuffer(numberOfChannels, length, sampleRate) {
+    const info = await op_audio_create_buffer(
+      this.#nativeId,
+      numberOfChannels,
+      length,
+      sampleRate
+    );
+    // createBuffer: zero-filled arrays allocated on JS side (channelData = null)
+    const buffer = new AudioBuffer(info.id, info);
+    BUFFER_REGISTRY.set(info.id, buffer);
+    return buffer;
+  }
+
   createBufferSource() {
     // Generate ID in JS, notify native asynchronously
     const nodeId = nextNodeId++;
@@ -91,11 +138,94 @@ class BaseAudioContext {
   }
 
   createGain() {
-    // Generate ID in JS, notify native asynchronously
     const nodeId = nextNodeId++;
-    // Fire and forget - native will create the node
     op_audio_create_gain(this.#nativeId, nodeId);
     return new GainNode(this, nodeId);
+  }
+
+  createOscillator() {
+    const nodeId = nextNodeId++;
+    op_audio_create_oscillator(this.#nativeId, nodeId);
+    return new OscillatorNode(this, nodeId);
+  }
+
+  createDelay(maxDelayTime = 1.0) {
+    const nodeId = nextNodeId++;
+    op_audio_create_delay(this.#nativeId, nodeId, maxDelayTime);
+    return new DelayNode(this, nodeId, maxDelayTime);
+  }
+
+  createBiquadFilter() {
+    const nodeId = nextNodeId++;
+    op_audio_create_biquad_filter(this.#nativeId, nodeId);
+    return new BiquadFilterNode(this, nodeId);
+  }
+
+  createWaveShaper() {
+    const nodeId = nextNodeId++;
+    op_audio_create_wave_shaper(this.#nativeId, nodeId);
+    return new WaveShaperNode(this, nodeId);
+  }
+
+  createAnalyser() {
+    const nodeId = nextNodeId++;
+    op_audio_create_analyser(this.#nativeId, nodeId);
+    return new AnalyserNode(this, nodeId);
+  }
+
+  createDynamicsCompressor() {
+    const nodeId = nextNodeId++;
+    op_audio_create_dynamics_compressor(this.#nativeId, nodeId);
+    return new DynamicsCompressorNode(this, nodeId);
+  }
+
+  createPanner() {
+    const nodeId = nextNodeId++;
+    op_audio_create_panner(this.#nativeId, nodeId);
+    return new PannerNode(this, nodeId);
+  }
+
+  createChannelMerger(numberOfInputs = 6) {
+    const nodeId = nextNodeId++;
+    op_audio_create_channel_merger(this.#nativeId, nodeId, numberOfInputs);
+    return new ChannelMergerNode(this, nodeId, numberOfInputs);
+  }
+
+  createChannelSplitter(numberOfOutputs = 6) {
+    const nodeId = nextNodeId++;
+    op_audio_create_channel_splitter(this.#nativeId, nodeId, numberOfOutputs);
+    return new ChannelSplitterNode(this, nodeId, numberOfOutputs);
+  }
+
+  createConstantSource() {
+    const nodeId = nextNodeId++;
+    op_audio_create_constant_source(this.#nativeId, nodeId);
+    return new ConstantSourceNode(this, nodeId);
+  }
+
+  createIIRFilter(feedforward, feedback) {
+    const nodeId = nextNodeId++;
+    op_audio_create_iir_filter(this.#nativeId, nodeId, feedforward, feedback);
+    return new IIRFilterNode(this, nodeId, feedforward, feedback);
+  }
+
+  createScriptProcessor(bufferSize = 0, numberOfInputChannels = 2, numberOfOutputChannels = 2) {
+    const nodeId = nextNodeId++;
+    return new ScriptProcessorNode(this, nodeId, bufferSize, numberOfInputChannels, numberOfOutputChannels);
+  }
+
+  createPeriodicWave(options = {}) {
+    const real = options.real || undefined;
+    const imag = options.imag || undefined;
+    const disableNormalization = options.disableNormalization || false;
+    return new PeriodicWave({ real, imag, disableNormalization });
+  }
+
+  get listener() {
+    if (!this._listener) {
+      this._listener = new AudioListener(this);
+    }
+    return this._listener;
   }
 
   _setState(state) {
@@ -158,7 +288,12 @@ class AudioContext extends BaseAudioContext {
   }
 }
 
+function createWebAudioContext(options) {
+  return new AudioContext(options);
+}
+
 export {
+  createWebAudioContext,
   AudioContext,
   BaseAudioContext,
   AudioBuffer,
@@ -166,5 +301,19 @@ export {
   AudioDestinationNode,
   AudioBufferSourceNode,
   GainNode,
+  OscillatorNode,
+  DelayNode,
+  BiquadFilterNode,
+  WaveShaperNode,
+  AnalyserNode,
+  DynamicsCompressorNode,
+  PannerNode,
+  ChannelMergerNode,
+  ChannelSplitterNode,
+  ConstantSourceNode,
+  IIRFilterNode,
+  ScriptProcessorNode,
+  PeriodicWave,
+  AudioListener,
   AudioParam,
 };

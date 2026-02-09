@@ -11,6 +11,8 @@ import {
   op_inner_audio_set_loop,
   op_inner_audio_set_playback_rate,
   op_inner_audio_set_autoplay,
+  op_audio_set_inner_audio_option,
+  op_audio_get_available_audio_sources,
 } from "ext:core/ops";
 
 // ID counter for InnerAudioContext instances
@@ -81,7 +83,7 @@ class InnerAudioContext {
   #obeyMuteSwitch = true;
   #volume = 1.0;
   #playbackRate = 1.0;
-
+  #offlineMode = false;
   // Read-only properties (cached from native)
   #duration = 0;
   #currentTime = 0;
@@ -154,7 +156,7 @@ class InnerAudioContext {
         this.#fireCallback(this.#onTimeUpdate);
         break;
       case "error":
-        this.#fireCallback(this.#onError, { errMsg: "Playback error" });
+        this.#fireCallback(this.#onError, { errCode: 10001, errMsg: "Playback error" });
         break;
     }
   }
@@ -220,6 +222,15 @@ class InnerAudioContext {
     this.#obeyMuteSwitch = !!value;
   }
 
+  /** Whether to enable offline mode (wx mini-game API) */
+  get offlineMode() {
+    return this.#offlineMode;
+  }
+
+  set offlineMode(value) {
+    this.#offlineMode = !!value;
+  }
+
   /** Volume (0.0 - 1.0) */
   get volume() {
     return this.#volume;
@@ -260,22 +271,22 @@ class InnerAudioContext {
     return this.#paused;
   }
 
-  /** Buffered time percentage 0-100 (read-only) */
+  /** Buffered time in seconds (read-only). Returns duration when fully loaded. */
   get buffered() {
-    return this.#buffered ? 100 : 0;
+    return this.#buffered ? this.#duration : 0;
   }
 
   // ==================== Methods ====================
 
-  /** Start playback */
+  /** Start playback. Returns a Promise per wx mini-game API. */
   play() {
-    if (this.#destroyed) return;
+    if (this.#destroyed) return Promise.reject(new Error("AudioContext is destroyed"));
 
     if (!this.#buffered) {
       // Not loaded yet, set autoplay
       this.#autoplay = true;
       op_inner_audio_set_autoplay(this.#id, true);
-      return;
+      return Promise.resolve();
     }
 
     // Seek to startTime if specified and at the beginning
@@ -285,6 +296,7 @@ class InnerAudioContext {
 
     op_inner_audio_play(this.#id);
     // Note: Don't update #paused here - wait for native event
+    return Promise.resolve();
   }
 
   /** Pause playback */
@@ -424,7 +436,7 @@ class InnerAudioContext {
     } catch (e) {
       if (this.#onError) {
         try {
-          this.#onError({ errMsg: e.message || String(e) });
+          this.#onError({ errCode: 10002, errMsg: e.message || String(e) });
         } catch (e2) {
           console.error("InnerAudioContext onError error:", e2);
         }
@@ -437,4 +449,47 @@ function createInnerAudioContext() {
   return new InnerAudioContext();
 }
 
-export { InnerAudioContext, createInnerAudioContext, _internalEnqueueInnerAudioEvent };
+function setInnerAudioOption(options = {}) {
+  const {
+    mixWithOther = true,
+    obeyMuteSwitch = true,
+    speakerOn = true,
+    success,
+    fail,
+    complete,
+  } = options;
+
+  op_audio_set_inner_audio_option(mixWithOther, obeyMuteSwitch, speakerOn)
+    .then(() => {
+      if (success) success();
+      if (complete) complete();
+    })
+    .catch((err) => {
+      const errObj = { errMsg: err.message || String(err) };
+      if (fail) fail(errObj);
+      if (complete) complete();
+    });
+}
+
+function getAvailableAudioSources(options = {}) {
+  const { success, fail, complete } = options;
+
+  op_audio_get_available_audio_sources()
+    .then((sources) => {
+      if (success) success({ audioSources: sources });
+      if (complete) complete();
+    })
+    .catch((err) => {
+      const errObj = { errMsg: err.message || String(err) };
+      if (fail) fail(errObj);
+      if (complete) complete();
+    });
+}
+
+export {
+  InnerAudioContext,
+  createInnerAudioContext,
+  setInnerAudioOption,
+  getAvailableAudioSources,
+  _internalEnqueueInnerAudioEvent,
+};
