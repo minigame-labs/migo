@@ -6,10 +6,7 @@ use graphics::RenderThread;
 
 use shared::{
     error::{EngineError, EngineResult, ErrorCode},
-    protocol::{
-        host_cmd::HostCommand,
-        render_cmd::{CanvasCmd, RenderCmdResp, RenderCommand},
-    },
+    protocol::render_cmd::{CanvasCmd, RenderCmdResp, RenderCommand},
     surface::SurfaceRef,
 };
 
@@ -22,11 +19,13 @@ impl RenderService {
     pub(crate) const RECREATE_ONSCREEN_TIMEOUT: Duration = Duration::from_millis(500);
 
     pub(crate) fn new(
-        js_tx: tokio::sync::mpsc::Sender<HostCommand>,
+        raf_tx: tokio::sync::mpsc::Sender<f64>,
+        vsync_rx: Option<crossbeam_channel::Receiver<f64>>,
+        host_id: i32,
         surface: SurfaceRef,
         pixel_ratio: f32,
     ) -> Self {
-        let thread = RenderThread::spawn(js_tx, Some(surface.clone()), pixel_ratio);
+        let thread = RenderThread::spawn(raf_tx, vsync_rx, host_id, Some(surface.clone()), pixel_ratio);
         Self { surface, thread }
     }
 

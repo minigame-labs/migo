@@ -1,9 +1,9 @@
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{onscreen_window_from_surface, CanvasHandler, CanvasManager, Renderer2d, RendererGL};
 use crossbeam_channel::{bounded, select, tick, Receiver};
-use shared::protocol::host_cmd::HostCommand;
 use shared::protocol::render_cmd::RenderCommand;
 use shared::surface::SurfaceRef;
 use tokio::sync::mpsc::Sender as TokioSender;
@@ -21,13 +21,25 @@ pub struct RenderThread {
 
 impl RenderThread {
     /// Spawn render thread with default queue capacity.
-    pub fn spawn(js_tx: TokioSender<HostCommand>, initial_surface: Option<SurfaceRef>, dpi: f32) -> Self {
-        Self::spawn_with_capacity(js_tx, initial_surface, dpi, DEFAULT_RENDER_QUEUE_CAPACITY)
+    ///
+    /// * `raf_tx` — tokio mpsc sender for frame timestamps (render → JS async op)
+    /// * `vsync_rx` — optional crossbeam receiver for Choreographer VSync signals
+    /// * `host_id` — host identifier for debug stats registry
+    pub fn spawn(
+        raf_tx: TokioSender<f64>,
+        vsync_rx: Option<Receiver<f64>>,
+        host_id: i32,
+        initial_surface: Option<SurfaceRef>,
+        dpi: f32,
+    ) -> Self {
+        Self::spawn_with_capacity(raf_tx, vsync_rx, host_id, initial_surface, dpi, DEFAULT_RENDER_QUEUE_CAPACITY)
     }
 
     /// Spawn render thread with custom queue capacity.
     pub fn spawn_with_capacity(
-        js_tx: TokioSender<HostCommand>,
+        raf_tx: TokioSender<f64>,
+        vsync_rx: Option<Receiver<f64>>,
+        host_id: i32,
         initial_surface: Option<SurfaceRef>,
         dpi: f32,
         queue_capacity: usize,
@@ -49,6 +61,8 @@ impl RenderThread {
                         return;
                     }
                 };
+
+                let has_initial_surface = initial_surface.is_some();
 
                 // If an initial surface is provided, create the onscreen context immediately.
                 if let Some(surface) = initial_surface {
@@ -72,19 +86,41 @@ impl RenderThread {
                     })
                 };
 
-                // Render loop state.
+                // ---- Timing sources ----
+                // When Choreographer VSync is available, use it as primary timing.
+                // Otherwise fall back to a software ticker at the configured FPS.
+                let has_vsync = vsync_rx.is_some();
+                let vsync: Receiver<f64> = vsync_rx.unwrap_or_else(crossbeam_channel::never);
+
                 let mut fps: u32 = 60;
-                let mut ticker: Receiver<Instant> = tick(Duration::from_secs_f32(1.0 / fps as f32));
+                let mut ticker: Receiver<Instant> = if has_vsync {
+                    crossbeam_channel::never()
+                } else {
+                    tick(Duration::from_secs_f32(1.0 / fps as f32))
+                };
+
                 let start_time = Instant::now();
                 let mut dirty = true;
                 let mut paused = false;
+                // Track whether we have a valid EGL surface for swap_buffers.
+                // Set to false on Pause (surface may be destroyed while backgrounded),
+                // restored to true when RecreateOnscreen succeeds.
+                let mut has_surface = has_initial_surface;
+
+                // Frame divisor for Choreographer fps control.
+                // E.g., frame_divisor=2 means deliver every 2nd VSync → ~30fps on 60Hz.
+                let mut frame_divisor: u32 = 1;
+                let mut vsync_count: u32 = 0;
 
                 let mut canvas_handler = CanvasHandler::new();
                 let mut renderer_2d = Renderer2d::new();
                 let mut renderer_gl = RendererGL::new();
 
-                // Stats.
-                let mut dropped_raf = 0u64;
+                // ---- FPS stats ----
+                let debug_stats = shared::stats::register_stats(host_id);
+                let mut frame_count: u32 = 0;
+                let mut fps_timer = Instant::now();
+                let mut last_frame_time = Instant::now();
 
                 enum LoopCtl {
                     Continue,
@@ -100,7 +136,10 @@ impl RenderThread {
                                           fps: &mut u32,
                                           ticker: &mut Receiver<Instant>,
                                           dirty: &mut bool,
-                                          paused: &mut bool|
+                                          paused: &mut bool,
+                                          frame_divisor: &mut u32,
+                                          has_vsync: bool,
+                                          has_surface: &mut bool|
                  -> LoopCtl {
                     match cmd {
                         RenderCommand::Shutdown => {
@@ -110,19 +149,35 @@ impl RenderThread {
                         }
 
                         RenderCommand::FrameRate(new_fps) => {
-                            let new_fps = new_fps.max(1);
-                            if new_fps != *fps {
+                            let new_fps = new_fps.clamp(1, 60);
+                            if has_vsync {
+                                // Choreographer mode: skip VSync signals to achieve target fps.
+                                *frame_divisor = (60 / new_fps).max(1);
+                                info!("RenderThread frame_divisor={} (target {}fps)", frame_divisor, new_fps);
+                            } else if new_fps != *fps {
+                                // Software ticker mode: recreate ticker at new interval.
                                 *fps = new_fps;
-                                *ticker = tick(Duration::from_secs_f32(1.0 / *fps as f32));
+                                if !*paused {
+                                    *ticker = tick(Duration::from_secs_f32(1.0 / *fps as f32));
+                                }
                                 info!("RenderThread fps changed to {}", fps);
                             }
                         }
 
                         RenderCommand::Canvas(canvas_cmd) => {
-                            if let Err(e) = canvas_handler.handle_command(cm, canvas_cmd) {
-                                error!("CanvasCmd failed: {}", e);
-                            } else {
-                                *dirty = true;
+                            // Track RecreateOnscreen to update has_surface.
+                            let is_recreate = matches!(&canvas_cmd, shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen { .. });
+                            match canvas_handler.handle_command(cm, canvas_cmd) {
+                                Ok(()) => {
+                                    if is_recreate {
+                                        *has_surface = true;
+                                        info!("RenderThread surface recreated");
+                                    }
+                                    *dirty = true;
+                                }
+                                Err(e) => {
+                                    error!("CanvasCmd failed: {}", e);
+                                }
                             }
                         }
 
@@ -172,7 +227,13 @@ impl RenderThread {
                         RenderCommand::Pause => {
                             if !*paused {
                                 *paused = true;
-                                *ticker = crossbeam_channel::never();
+                                // Mark surface as unavailable — the Android surface may be
+                                // destroyed while backgrounded. This prevents any lingering
+                                // VSync frames from attempting swap_buffers on a dead surface.
+                                *has_surface = false;
+                                if !has_vsync {
+                                    *ticker = crossbeam_channel::never();
+                                }
                                 info!("RenderThread paused");
                             }
                         }
@@ -180,7 +241,9 @@ impl RenderThread {
                         RenderCommand::Resume => {
                             if *paused {
                                 *paused = false;
-                                *ticker = tick(Duration::from_secs_f32(1.0 / *fps as f32));
+                                if !has_vsync {
+                                    *ticker = tick(Duration::from_secs_f32(1.0 / *fps as f32));
+                                }
                                 info!("RenderThread resumed");
                             }
                         }
@@ -199,10 +262,12 @@ impl RenderThread {
                                       fps: &mut u32,
                                       ticker: &mut Receiver<Instant>,
                                       dirty: &mut bool,
-                                      paused: &mut bool|
+                                      paused: &mut bool,
+                                      frame_divisor: &mut u32,
+                                      has_surface: &mut bool|
                  -> LoopCtl {
                     while let Ok(cmd) = cmd_rx.try_recv() {
-                        match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, ticker, dirty, paused) {
+                        match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, ticker, dirty, paused, frame_divisor, has_vsync, has_surface) {
                             LoopCtl::Continue => {}
                             LoopCtl::Shutdown => return LoopCtl::Shutdown,
                         }
@@ -210,61 +275,123 @@ impl RenderThread {
                     LoopCtl::Continue
                 };
 
+                // Shared frame presentation + RAF signal logic.
+                let present_frame_and_signal_raf = |cm: &mut CanvasManager,
+                                                        dirty: &mut bool,
+                                                        has_surface: bool,
+                                                        ts: f64,
+                                                        debug_stats: &shared::stats::DebugStats,
+                                                        frame_count: &mut u32,
+                                                        fps_timer: &mut Instant,
+                                                        last_frame_time: &mut Instant| {
+                    // Present the completed frame (only if we have a valid surface).
+                    if *dirty && has_surface {
+                        if let Err(e) = cm.flush_dirty_2d_contexts() {
+                            warn!("flush_dirty_2d_contexts failed: {}", e);
+                        }
+
+                        if let Err(e) = cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
+                            warn!("swap_buffers_no_restore failed: {}", e);
+                        }
+                        *dirty = false;
+                    }
+
+                    // FPS stats update.
+                    let now = Instant::now();
+                    let frame_dur = now.duration_since(*last_frame_time);
+                    *last_frame_time = now;
+                    debug_stats.frame_time_us.store(frame_dur.as_micros() as u32, Ordering::Relaxed);
+
+                    *frame_count += 1;
+                    let elapsed = fps_timer.elapsed();
+                    if elapsed >= Duration::from_millis(500) {
+                        let measured_fps = *frame_count as f32 / elapsed.as_secs_f32();
+                        debug_stats.fps_x10.store((measured_fps * 10.0) as u32, Ordering::Relaxed);
+                        *frame_count = 0;
+                        *fps_timer = now;
+                    }
+
+                    // Send RAF timestamp to JS async op (non-blocking).
+                    if let Err(_e) = raf_tx.try_send(ts) {
+                        debug_stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                    }
+                };
+
                 loop {
                     select! {
                         recv(ticker) -> _ => {
-                            // Frame timing fix: drain → swap → RAF
-                            // This ensures we swap the COMPLETE frame drawn by the PREVIOUS RAF,
-                            // rather than swapping before JS has finished drawing.
-                            //
-                            // Timeline:
-                            // RAF(N) sent → JS draws frame N → commands arrive → 
-                            // ticker → drain frame N commands → swap frame N → RAF(N+1) sent
+                            // Software ticker path (non-Android fallback).
+                            // Frame timing: drain → swap → RAF signal.
 
                             // 1) Drain all pending commands from the previous frame.
-                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused) {
+                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, &mut has_surface) {
                                 LoopCtl::Continue => {}
-                                LoopCtl::Shutdown => return,
+                                LoopCtl::Shutdown => {
+                                    shared::stats::unregister_stats(host_id);
+                                    return;
+                                }
                             }
 
-                            // 2) Present the completed frame.
-                            if dirty {
-                                if let Err(e) = cm.flush_dirty_2d_contexts() {
-                                    warn!("flush_dirty_2d_contexts failed: {}", e);
-                                }
-
-                                if let Err(e) = cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
-                                    warn!("swap_buffers_no_restore failed: {}", e);
-                                }
-                                dirty = false;
-                            }
-
-                            // 3) Send RAF to JS to start the NEXT frame (non-blocking).
+                            // 2) Present frame and signal RAF.
                             let ts = start_time.elapsed().as_secs_f64() * 1000.0;
-                            if let Err(_e) = js_tx.try_send(HostCommand::RequestAnimationFrame(ts)) {
-                                dropped_raf += 1;
-                                if dropped_raf % 100 == 0 {
-                                    warn!("dropped raf messages: {}", dropped_raf);
+                            present_frame_and_signal_raf(&mut cm, &mut dirty, has_surface, ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time);
+                        }
+
+                        recv(vsync) -> _msg => {
+                            // Choreographer VSync path (Android).
+                            // Discard VSync while paused or surface is destroyed.
+                            if paused || !has_surface {
+                                continue;
+                            }
+
+                            // Frame divisor: skip frames to achieve target fps.
+                            vsync_count += 1;
+                            if vsync_count % frame_divisor != 0 {
+                                continue;
+                            }
+
+                            // 1) Drain all pending commands.
+                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, &mut has_surface) {
+                                LoopCtl::Continue => {}
+                                LoopCtl::Shutdown => {
+                                    shared::stats::unregister_stats(host_id);
+                                    return;
                                 }
                             }
+
+                            // 2) Present frame and signal RAF.
+                            // Always use relative timestamp (elapsed since render thread start)
+                            // instead of the Choreographer's absolute frameTimeNanos. The RAF
+                            // callback timestamp must be relative to the time origin — an
+                            // absolute hardware timestamp causes broken animation calculations
+                            // (huge first-frame delta, incorrect absolute positions).
+                            let ts = start_time.elapsed().as_secs_f64() * 1000.0;
+                            present_frame_and_signal_raf(&mut cm, &mut dirty, has_surface, ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time);
                         }
 
                         recv(cmd_rx) -> msg => {
                             match msg {
                                 Ok(cmd) => {
-                                    match handle_one_cmd(cmd, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused) {
+                                    match handle_one_cmd(cmd, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, has_vsync, &mut has_surface) {
                                         LoopCtl::Continue => {}
-                                        LoopCtl::Shutdown => return,
+                                        LoopCtl::Shutdown => {
+                                            shared::stats::unregister_stats(host_id);
+                                            return;
+                                        }
                                     }
 
-                                    match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused) {
+                                    match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, &mut has_surface) {
                                         LoopCtl::Continue => {}
-                                        LoopCtl::Shutdown => return,
+                                        LoopCtl::Shutdown => {
+                                            shared::stats::unregister_stats(host_id);
+                                            return;
+                                        }
                                     }
                                 }
                                 Err(_) => {
                                     info!("cmd_rx closed, exiting RenderThread");
                                     cm.destroy_all(&gl);
+                                    shared::stats::unregister_stats(host_id);
                                     return;
                                 }
                             }

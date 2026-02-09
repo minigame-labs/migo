@@ -528,3 +528,44 @@ pub(crate) extern "system" fn onNetworkStatusChange<'local>(
         },
     );
 }
+
+// ==================== VSync (Choreographer) ====================
+
+pub(crate) extern "system" fn onVsync(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    frame_time_nanos: jlong,
+) {
+    let ts_ms = frame_time_nanos as f64 / 1_000_000.0;
+    core::send_vsync(host_id, ts_ms);
+}
+
+// ==================== Debug Stats ====================
+
+pub(crate) extern "system" fn getDebugStats(
+    env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+) -> jni::sys::jbyteArray {
+    use std::sync::atomic::Ordering;
+
+    let stats = match shared::stats::get_stats(host_id) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+
+    let fps_x10 = stats.fps_x10.load(Ordering::Relaxed);
+    let frame_time_us = stats.frame_time_us.load(Ordering::Relaxed);
+    let dropped = stats.dropped_frames.load(Ordering::Relaxed);
+
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&fps_x10.to_le_bytes());
+    buf[4..8].copy_from_slice(&frame_time_us.to_le_bytes());
+    buf[8..12].copy_from_slice(&dropped.to_le_bytes());
+
+    match env.byte_array_from_slice(&buf) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}

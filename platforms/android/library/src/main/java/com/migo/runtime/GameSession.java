@@ -12,6 +12,7 @@ import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.RuntimeRegistry;
 import com.migo.runtime.internal.TouchEventHandler;
+import com.migo.runtime.internal.VsyncScheduler;
 import com.migo.runtime.internal.platform.AudioFocusManager;
 
 import java.io.Closeable;
@@ -79,10 +80,13 @@ public final class GameSession implements Closeable {
     private final GamePaths paths;
     private final TouchEventHandler touchHandler;
     private final AudioFocusManager audioFocusManager;
+    private final VsyncScheduler vsyncScheduler;
     private final Object lock = new Object();
 
     private volatile boolean destroyed = false;
     private volatile boolean gameStarted = false;
+
+    private DebugOverlayView debugOverlay;
 
     // Callbacks
     private OnGameEventListener gameEventListener;
@@ -106,12 +110,22 @@ public final class GameSession implements Closeable {
         this.paths = new GamePaths(config, gameId);
         this.touchHandler = new TouchEventHandler(config.getDisplayDensity());
         this.audioFocusManager = new AudioFocusManager(sessionId, context);
+        this.vsyncScheduler = new VsyncScheduler(sessionId);
 
         // Ensure game directories exist
         this.paths.ensureDirectories();
 
         // Start listening for audio focus changes
         this.audioFocusManager.start();
+
+        // Start Choreographer-driven VSync immediately
+        this.vsyncScheduler.start();
+
+        // Create debug overlay if debug mode is enabled
+        if (config.isDebugEnabled()) {
+            this.debugOverlay = new DebugOverlayView(context, sessionId);
+            this.debugOverlay.startMonitoring();
+        }
     }
 
     // ==================== Getters ====================
@@ -161,6 +175,26 @@ public final class GameSession implements Closeable {
      */
     public boolean isGameStarted() {
         return gameStarted;
+    }
+
+    /**
+     * Get the debug overlay view, if debug mode is enabled.
+     * <p>
+     * The host app should add this view to its layout for FPS monitoring:
+     * <pre>{@code
+     * DebugOverlayView overlay = session.getDebugOverlay();
+     * if (overlay != null) {
+     *     FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+     *         WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP | Gravity.END);
+     *     lp.setMargins(0, statusBarHeight, dp(8), 0);
+     *     rootLayout.addView(overlay, lp);
+     * }
+     * }</pre>
+     *
+     * @return The debug overlay view, or null if debug mode is disabled
+     */
+    public DebugOverlayView getDebugOverlay() {
+        return debugOverlay;
     }
 
     // ==================== Game Control ====================
@@ -237,6 +271,10 @@ public final class GameSession implements Closeable {
      */
     public void pause() {
         if (!destroyed) {
+            vsyncScheduler.stop();
+            if (debugOverlay != null) {
+                debugOverlay.stopMonitoring();
+            }
             NativeMethods.onHide(sessionId);
             if (lifecycleListener != null) {
                 lifecycleListener.onPaused();
@@ -249,6 +287,10 @@ public final class GameSession implements Closeable {
      */
     public void resume() {
         if (!destroyed) {
+            vsyncScheduler.start();
+            if (debugOverlay != null) {
+                debugOverlay.startMonitoring();
+            }
             NativeMethods.onShow(sessionId);
             // Re-request audio focus in case it was permanently lost (e.g.
             // after a phone call). This ensures onAudioInterruptionEnd fires.
@@ -291,6 +333,10 @@ public final class GameSession implements Closeable {
             destroyed = true;
         }
 
+        vsyncScheduler.stop();
+        if (debugOverlay != null) {
+            debugOverlay.stopMonitoring();
+        }
         audioFocusManager.stop();
         NativeExports.destroySensorManager(sessionId);
         NativeMethods.shutdown(sessionId);

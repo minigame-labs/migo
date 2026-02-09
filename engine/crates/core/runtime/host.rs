@@ -1,15 +1,16 @@
 use std::{rc::Rc, sync::Arc};
 
-use deno_core::{FsModuleLoader, ModuleLoader, PollEventLoopOptions};
+use deno_core::{FsModuleLoader, ModuleLoader};
 use tracing::{error, info};
 
 use shared::{
-    config::InitOptions, error::EngineResult, op_state::HostOpState,
+    config::InitOptions, error::EngineResult,
+    op_state::{HostOpState, RafRx},
     protocol::host_cmd::HostCommand, surface::SurfaceRef,
 };
 
 use crate::{
-    runtime::{HostId, loader::MyModuleLoader},
+    runtime::{HostId, loader::MyModuleLoader, vsync},
     services::{AudioService, IoService, PlatformServices, RenderService},
 };
 
@@ -23,6 +24,9 @@ pub(crate) struct Host {
     pub(crate) render: RenderService,
 
     pub(crate) js: HostJsRuntime,
+
+    /// Shared RAF receiver — survives JS runtime restarts.
+    raf_rx: RafRx,
 
     platform: Arc<dyn PlatformServices>,
     init_options: InitOptions,
@@ -40,6 +44,8 @@ impl Drop for Host {
         self.render.shutdown();
         self.audio.shutdown();
         self.io.shutdown();
+        vsync::unregister_vsync_sender(self.id);
+        shared::stats::unregister_stats(self.id);
         info!("[Host {}] host cleanup complete.", self.id);
     }
 }
@@ -52,10 +58,24 @@ impl Host {
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,
     ) -> EngineResult<Self> {
+        // ---- RAF channel (render thread → JS async op) ----
+        let (raf_tx, raf_rx_raw) = tokio::sync::mpsc::channel::<f64>(2);
+        let raf_rx: RafRx = Arc::new(tokio::sync::Mutex::new(raf_rx_raw));
+
+        // ---- VSync channel (Choreographer JNI → render thread) ----
+        let (vsync_tx, vsync_rx) = crossbeam_channel::bounded::<f64>(1);
+        vsync::register_vsync_sender(id, vsync_tx);
+
         // ---- Services ----
         let io = IoService::new()?;
         let audio = AudioService::new(js_tx.clone())?;
-        let render = RenderService::new(js_tx.clone(), surface, init_options.pixel_ratio());
+        let render = RenderService::new(
+            raf_tx,
+            Some(vsync_rx),
+            id,
+            surface,
+            init_options.pixel_ratio(),
+        );
 
         // ---- HostOpState for extensions ----
         let device_services = platform.create_device_services(id);
@@ -70,6 +90,7 @@ impl Host {
             io_tx: io.sender(),
             audio_tx: audio.sender(),
             device_services,
+            raf_rx: Some(raf_rx.clone()),
         };
 
         let module_loader: Option<Rc<dyn ModuleLoader>> =
@@ -87,6 +108,7 @@ impl Host {
             io,
             audio,
             js,
+            raf_rx,
             platform,
             init_options,
             last_game_id: None,
@@ -105,7 +127,7 @@ impl Host {
             HostCommand::EvaluateModule { game_id, entry } => {
                 self.on_evaluate_module(game_id, entry).await
             }
-            HostCommand::EvalScript { source } => self.on_eval_script(source).await,
+            HostCommand::EvalScript { source } => self.on_eval_script(source),
 
             HostCommand::Restart => self.on_restart().await,
 
@@ -120,8 +142,7 @@ impl Host {
                 self.audio.resume();
 
                 self.js
-                    .exec_script_and_pump("onshow", "_internalTriggerOnShow()".to_string())
-                    .await
+                    .exec_script("onshow", "_internalTriggerOnShow()".to_string())
             }
 
             HostCommand::OnHide => {
@@ -133,26 +154,23 @@ impl Host {
                 self.audio.pause();
 
                 self.js
-                    .exec_script_and_pump("onhide", "_internalTriggerOnHide()".to_string())
-                    .await
+                    .exec_script("onhide", "_internalTriggerOnHide()".to_string())
             }
 
             HostCommand::OnAudioInterruptionBegin => {
                 self.js
-                    .exec_script_and_pump(
+                    .exec_script(
                         "audio_interruption_begin",
                         "_internalTriggerAudioInterruptionBegin()".to_string(),
                     )
-                    .await
             }
 
             HostCommand::OnAudioInterruptionEnd => {
                 self.js
-                    .exec_script_and_pump(
+                    .exec_script(
                         "audio_interruption_end",
                         "_internalTriggerAudioInterruptionEnd()".to_string(),
                     )
-                    .await
             }
 
             HostCommand::OnTouch {
@@ -162,11 +180,6 @@ impl Host {
                 timestamp_ms,
             } => {
                 self.js.dispatch_touch(touch_type, &points[..count as usize], timestamp_ms);
-                Ok(())
-            }
-
-            HostCommand::RequestAnimationFrame(_ts) => {
-                self.js.schedule_raf();
                 Ok(())
             }
 
@@ -234,16 +247,21 @@ impl Host {
 
         self.js.evaluate_module(game_id, entry).await?;
 
-        self.js
-            .run_event_loop(PollEventLoopOptions::default())
-            .await?;
+        // NOTE: Do NOT call run_event_loop() here. The op-based RAF
+        // (op_await_next_frame) creates a permanently-pending op that keeps
+        // the event loop alive forever. Calling run_event_loop() would block
+        // the host thread indefinitely, preventing all subsequent commands
+        // (UpdateSurface, OnHide, touch, etc.) from being processed.
+        //
+        // The main tokio::select! loop in thread.rs continuously drives the
+        // event loop via its run_event_loop branch, which handles all pending
+        // ops including RAF, microtasks, and timers.
 
         Ok(())
     }
 
-    async fn on_eval_script(&mut self, source: String) -> EngineResult<()> {
-        self.js.exec_script_and_pump("eval-script", source).await?;
-        Ok(())
+    fn on_eval_script(&mut self, source: String) -> EngineResult<()> {
+        self.js.exec_script("eval-script", source)
     }
 
     fn on_update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
@@ -281,6 +299,7 @@ impl Host {
             io_tx: self.io.sender(),
             audio_tx: self.audio.sender(),
             device_services,
+            raf_rx: Some(self.raf_rx.clone()),
         };
 
         let module_loader: Option<Rc<dyn ModuleLoader>> =

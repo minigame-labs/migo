@@ -22,7 +22,7 @@
 //! - **Module Loading**: `EvaluateModule`, `EvalScript`
 //! - **Lifecycle**: `Shutdown`, `OnShow`, `OnHide`
 //! - **Input**: `OnTouch`
-//! - **Rendering**: `RequestAnimationFrame`, `UpdateSurface`
+//! - **Rendering**: `UpdateSurface`
 //! - **Audio Events**: `InnerAudioEvent`
 
 use crate::surface::SurfaceRef;
@@ -144,12 +144,6 @@ pub enum HostCommand {
         /// Event timestamp in milliseconds (from system boot or epoch).
         timestamp_ms: i64,
     },
-
-    /// RequestAnimationFrame callback with a `time` value (milliseconds).
-    ///
-    /// Sent by the render thread at the target frame rate (usually 60 FPS).
-    /// The timestamp is relative to the render thread's start time.
-    RequestAnimationFrame(f64),
 
     /// InnerAudioContext event pushed from audio thread.
     ///

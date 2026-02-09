@@ -17,8 +17,8 @@ extension!(host_v8_webgl,
         op_clear,
         op_clear_color,
 
-        op_register_raf_callback,
-        op_cancel_raf_callback,
+        op_await_next_frame,
+        op_set_preferred_fps,
 
         op_create_program,
         op_use_program,
@@ -122,7 +122,6 @@ extension!(host_v8_webgl,
         "03_raf.js",
     ],
     state = |state| {
-        state.put(CallbackMap::default());
         state.put(FrameCommandCollector::new());
     }
 );

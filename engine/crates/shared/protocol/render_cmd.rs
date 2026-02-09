@@ -93,11 +93,11 @@ pub enum RenderCommand {
     /// 2. An explicit Invalidate signal is received
     Invalidate,
 
-    /// Pause rendering: stop the RAF ticker and frame presentation.
+    /// Pause rendering: stop the frame ticker/VSync and RAF signal.
     ///
     /// Used when the app goes to background. The render thread stays alive
     /// and continues processing commands (e.g., `RecreateOnscreen`), but
-    /// stops producing frames and sending `RequestAnimationFrame` to the host.
+    /// stops producing frames and sending RAF timestamps to the JS op.
     Pause,
 
     /// Resume rendering: restart the RAF ticker and frame presentation.

@@ -13,6 +13,10 @@ pub type RenderTx = crossbeam_channel::Sender<RenderCommand>;
 pub type IoTx = UnboundedSender<IOCmd>;
 pub type AudioTx = UnboundedSender<AudioCmd>;
 
+/// Receiver for RAF (requestAnimationFrame) frame signals from the render thread.
+/// Wrapped in Arc<Mutex> so the async op can lock and recv without borrowing OpState.
+pub type RafRx = Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<f64>>>;
+
 #[derive(Clone)]
 pub struct HostOpState {
     pub id: i32,
@@ -31,6 +35,8 @@ pub struct HostOpState {
     pub audio_tx: AudioTx,
     /// Platform device services (clipboard, sensors, etc.)
     pub device_services: Option<Arc<dyn DeviceServices>>,
+    /// RAF frame signal receiver (set by Host::new, consumed by op_await_next_frame).
+    pub raf_rx: Option<RafRx>,
 }
 
 impl fmt::Debug for HostOpState {

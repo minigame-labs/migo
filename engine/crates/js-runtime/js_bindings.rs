@@ -9,7 +9,6 @@ pub(crate) struct JsBindings {
     main_js_context: v8::Global<v8::Context>,
     enqueue_touch_event_fn: Option<v8::Global<v8::Function>>,
     enqueue_inner_audio_event_fn: Option<v8::Global<v8::Function>>,
-    schedule_raf_fn: Option<v8::Global<v8::Function>>,
     // Sensor event functions (cached for high-frequency dispatch without JS parsing)
     sensor_device_motion_fn: Option<v8::Global<v8::Function>>,
     sensor_gyroscope_fn: Option<v8::Global<v8::Function>>,
@@ -27,7 +26,6 @@ impl JsBindings {
             main_js_context,
             enqueue_touch_event_fn: None,
             enqueue_inner_audio_event_fn: None,
-            schedule_raf_fn: None,
             sensor_device_motion_fn: None,
             sensor_gyroscope_fn: None,
             sensor_accelerometer_fn: None,
@@ -53,13 +51,12 @@ impl JsBindings {
         }
 
         let (
-            enqueue_touch, enqueue_audio, raf,
+            enqueue_touch, enqueue_audio,
             dev_motion, gyro, accel, compass, orientation, network,
         ) = self.with_main_context(rt, |scope, _ctx, global| {
             (
                 get_global_fn(scope, global, "_internalEnqueueRawTouchEvent"),
                 get_global_fn(scope, global, "_internalEnqueueInnerAudioEvent"),
-                get_global_fn(scope, global, "_internalScheduleRaf"),
                 get_global_fn(scope, global, "_internalTriggerDeviceMotionChange"),
                 get_global_fn(scope, global, "_internalTriggerGyroscopeChange"),
                 get_global_fn(scope, global, "_internalTriggerAccelerometerChange"),
@@ -71,7 +68,6 @@ impl JsBindings {
 
         self.enqueue_touch_event_fn = enqueue_touch;
         self.enqueue_inner_audio_event_fn = enqueue_audio;
-        self.schedule_raf_fn = raf;
         self.sensor_device_motion_fn = dev_motion;
         self.sensor_gyroscope_fn = gyro;
         self.sensor_accelerometer_fn = accel;
@@ -81,9 +77,6 @@ impl JsBindings {
 
         if self.enqueue_touch_event_fn.is_none() {
             warn!("[Host {}] _internalEnqueueRawTouchEvent not found", host_id);
-        }
-        if self.schedule_raf_fn.is_none() {
-            warn!("[Host {}] _internalScheduleRaf not found", host_id);
         }
     }
 
@@ -102,17 +95,6 @@ impl JsBindings {
         let context = v8::Local::new(scope, &self.main_js_context);
         let global = context.global(scope);
         f(scope, context, global)
-    }
-
-    pub(crate) fn call_schedule_raf(&self, rt: &mut deno_core::JsRuntime) {
-        let Some(func_g) = self.schedule_raf_fn.as_ref() else {
-            return;
-        };
-
-        self.with_main_context(rt, |scope, _ctx, global| {
-            let func = v8::Local::new(scope, func_g);
-            let _ = func.call(scope, global.into(), &[]);
-        });
     }
 
     pub(crate) fn dispatch_touch(

@@ -89,10 +89,6 @@ impl HostJsRuntime {
 
     // ---- JS global calls ----
 
-    pub fn schedule_raf(&mut self) {
-        self.bindings.call_schedule_raf(&mut self.rt);
-    }
-
     pub fn dispatch_touch(
         &mut self,
         touch_type: TouchType,
@@ -142,25 +138,18 @@ impl HostJsRuntime {
 
     // ---- Scripts / modules ----
 
-    pub async fn exec_script_and_pump(
-        &mut self,
-        name: &'static str,
-        source: String,
-    ) -> EngineResult<()> {
+    /// Execute a script without pumping the event loop.
+    ///
+    /// The op-based RAF (op_await_next_frame) creates a permanently-pending op,
+    /// so run_event_loop() would block forever once the RAF loop is active.
+    /// The main tokio::select! loop in thread.rs continuously drives the event
+    /// loop, handling any resulting microtasks, promises, or timers.
+    pub fn exec_script(&mut self, name: &'static str, source: String) -> EngineResult<()> {
         self.rt.execute_script(name, source).map_err(|e| {
             EngineError::new(ErrorCode::JsException)
                 .with_msg(name)
                 .with_detail(e.to_string())
         })?;
-
-        self.rt
-            .run_event_loop(PollEventLoopOptions::default())
-            .await
-            .map_err(|e| {
-                EngineError::new(ErrorCode::JsException)
-                    .with_msg(name)
-                    .with_detail(e.to_string())
-            })?;
 
         Ok(())
     }

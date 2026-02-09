@@ -211,4 +211,31 @@ public final class NativeBridge {
      * @param networkType Network type: "wifi", "2g", "3g", "4g", "5g", "unknown", "none"
      */
     public static native void onNetworkStatusChange(int sessionId, boolean isConnected, String networkType);
+
+    // ==================== VSync (Choreographer) ====================
+
+    /**
+     * Send a VSync signal to the render thread.
+     * Called from {@link com.migo.runtime.internal.VsyncScheduler} on each Choreographer frame callback.
+     *
+     * @param sessionId      The session ID
+     * @param frameTimeNanos Frame timestamp from Choreographer in nanoseconds
+     */
+    public static native void onVsync(int sessionId, long frameTimeNanos);
+
+    // ==================== Debug Stats ====================
+
+    /**
+     * Get debug statistics from the render thread.
+     * Returns a 12-byte array containing (all little-endian u32):
+     * <ul>
+     *   <li>[0..4) fps_x10 — FPS multiplied by 10 (e.g., 598 = 59.8 FPS)</li>
+     *   <li>[4..8) frame_time_us — Last frame time in microseconds</li>
+     *   <li>[8..12) dropped_frames — Total dropped RAF signals</li>
+     * </ul>
+     *
+     * @param sessionId The session ID
+     * @return byte array with stats, or null if session not found
+     */
+    public static native byte[] getDebugStats(int sessionId);
 }

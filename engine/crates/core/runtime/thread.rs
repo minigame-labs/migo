@@ -2,7 +2,7 @@ use std::{panic, sync::Arc};
 
 use deno_core::PollEventLoopOptions;
 use tokio::runtime::{Builder, Runtime};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use shared::{
     config::InitOptions,
@@ -51,15 +51,15 @@ pub fn spawn_host_thread(
                     let poll = PollEventLoopOptions::default();
                     let mut host = host;
 
-                    loop {
+                    'outer: loop {
                         tokio::select! {
                             biased;
 
                             maybe_msg = js_rx.recv() => {
                                 match maybe_msg {
-                                    Some(HostCommand::Shutdown) => break,
+                                    Some(HostCommand::Shutdown) => break 'outer,
                                     Some(msg) => host.handle_command(msg).await,
-                                    None => break,
+                                    None => break 'outer,
                                 }
                             }
 
@@ -69,7 +69,22 @@ pub fn spawn_host_thread(
                                         "[Host {}] event loop error: code={:?}, msg={}, detail={:?}",
                                         id, e.code, e.msg, e.detail
                                     );
-                                    break;
+                                    break 'outer;
+                                }
+                                // Event loop returned Ok — no pending ops/timers/promises.
+                                // With op-based RAF this normally shouldn't happen (the pending
+                                // op_await_next_frame keeps the loop alive).  Safety fallback:
+                                // park on the command channel to avoid busy spinning.
+                                warn!("[Host {}] event loop idle, parking on command channel", id);
+                                loop {
+                                    match js_rx.recv().await {
+                                        Some(HostCommand::Shutdown) => break 'outer,
+                                        Some(msg) => {
+                                            host.handle_command(msg).await;
+                                            break; // back to outer select to re-poll event loop
+                                        }
+                                        None => break 'outer,
+                                    }
                                 }
                             }
                         }

@@ -30,8 +30,8 @@ const WindowGlobalScope = {
     createCanvas: core.propNonEnumerable(canvas.createCanvas),
     requestAnimationFrame: core.propWritable(raf.requestAnimationFrame),
     cancelAnimationFrame: core.propWritable(raf.cancelAnimationFrame),
-    _internalScheduleRaf: core.propNonEnumerable(raf._internalScheduleRaf),
-    
+    setPreferredFramesPerSecond: core.propWritable(raf.setPreferredFramesPerSecond),
+
     WebGLRenderingContext: core.propNonEnumerable(webgl.WebGLRenderingContext),
     WebGL2RenderingContext: core.propNonEnumerable(webgl.WebGL2RenderingContext),
 

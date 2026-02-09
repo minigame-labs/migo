@@ -8,7 +8,7 @@ use crate::android::jni::{
     onAudioInterruptionEnd, onAccelerometerChange, onCompassChange, onDeviceMotionChange,
     onDeviceOrientationChange, onGyroscopeChange, onHide, onModalResult, onActionSheetResult,
     onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting, onShow,
-    onTouch, shutdown, updateSurface, version,
+    onTouch, onVsync, getDebugStats, shutdown, updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -119,6 +119,16 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "onNetworkStatusChange".into(),
                 sig: "(IZLjava/lang/String;)V".into(),
                 fn_ptr: onNetworkStatusChange as *mut c_void,
+            },
+            NativeMethod {
+                name: "onVsync".into(),
+                sig: "(IJ)V".into(),
+                fn_ptr: onVsync as *mut c_void,
+            },
+            NativeMethod {
+                name: "getDebugStats".into(),
+                sig: "(I)[B".into(),
+                fn_ptr: getDebugStats as *mut c_void,
             },
         ],
     )
