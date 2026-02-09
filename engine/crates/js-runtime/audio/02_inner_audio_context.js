@@ -222,7 +222,7 @@ class InnerAudioContext {
     this.#obeyMuteSwitch = !!value;
   }
 
-  /** Whether to enable offline mode (wx mini-game API) */
+  /** Whether to enable offline mode */
   get offlineMode() {
     return this.#offlineMode;
   }
@@ -278,7 +278,7 @@ class InnerAudioContext {
 
   // ==================== Methods ====================
 
-  /** Start playback. Returns a Promise per wx mini-game API. */
+  /** Start playback. Returns a Promise per mini-game API. */
   play() {
     if (this.#destroyed) return Promise.reject(new Error("AudioContext is destroyed"));
 
