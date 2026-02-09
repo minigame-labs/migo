@@ -302,6 +302,15 @@ public final class GameSession implements Closeable {
     }
 
     /**
+     * Restart the game.
+     */
+    public void restart() {
+        if (!destroyed) {
+            NativeMethods.onRestart(sessionId);
+        }
+    }
+
+    /**
      * Update the rendering surface.
      * <p>
      * Call this when the surface is recreated (e.g., after configuration change).

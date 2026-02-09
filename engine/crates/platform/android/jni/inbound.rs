@@ -376,6 +376,10 @@ pub(crate) extern "system" fn onHide(_env: JNIEnv, _class: JClass, host_id: jint
     let _ = send_command_to_host(host_id, HostCommand::OnHide);
 }
 
+pub(crate) extern "system" fn onRestart(_env: JNIEnv, _class: JClass, host_id: jint) {
+    let _ = send_command_to_host(host_id, HostCommand::Restart);
+}
+
 pub(crate) extern "system" fn onAudioInterruptionBegin(
     _env: JNIEnv,
     _class: JClass,

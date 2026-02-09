@@ -70,6 +70,13 @@ public final class NativeBridge {
     public static native void onHide(int sessionId);
 
     /**
+     * Restart the game session.
+     *
+     * @param sessionId The session ID
+     */
+    public static native void onRestart(int sessionId);
+
+    /**
      * Notify that audio playback has been interrupted by the system.
      *
      * @param sessionId The session ID

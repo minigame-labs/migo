@@ -126,6 +126,17 @@ public final class NativeMethods {
     }
 
     /**
+     * Restart the game session.
+     *
+     * @param sessionId The session ID
+     */
+    public static void onRestart(int sessionId) {
+        if (sessionId >= 0) {
+            NativeBridge.onRestart(sessionId);
+        }
+    }
+
+    /**
      * Notify session that audio has been interrupted by the system
      * (e.g., incoming phone call).
      *

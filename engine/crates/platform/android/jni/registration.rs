@@ -8,7 +8,7 @@ use crate::android::jni::{
     onAudioInterruptionEnd, onAccelerometerChange, onCompassChange, onDeviceMotionChange,
     onDeviceOrientationChange, onGyroscopeChange, onHide, onModalResult, onActionSheetResult,
     onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting, onShow,
-    onTouch, onVsync, getDebugStats, shutdown, updateSurface, version,
+    onRestart, onTouch, onVsync, getDebugStats, shutdown, updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -53,6 +53,11 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "onHide".into(),
                 sig: "(I)V".into(),
                 fn_ptr: onHide as *mut c_void,
+            },
+            NativeMethod {
+                name: "onRestart".into(),
+                sig: "(I)V".into(),
+                fn_ptr: onRestart as *mut c_void,
             },
             NativeMethod {
                 name: "onAudioInterruptionBegin".into(),
