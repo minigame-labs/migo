@@ -85,6 +85,12 @@ impl Drop for Host {
         self.io.shutdown();
         vsync::unregister_vsync_sender(self.id);
         shared::stats::unregister_stats(self.id);
+
+        // Clear process-global caches to prevent stale state leaking into
+        // the next session (host_id increments, but caches are static).
+        js_runtime::clear_shared_image_cache();
+        io::global_cache().clear();
+
         info!("[Host {}] host cleanup complete.", self.id);
     }
 }
@@ -345,6 +351,10 @@ impl Host {
             Some(Rc::new(MyModuleLoader(FsModuleLoader)));
 
         let extra_ext = self.platform.extensions(&self.init_options);
+
+        // Clear process-global caches before recreating runtime.
+        js_runtime::clear_shared_image_cache();
+        io::global_cache().clear();
 
         // CRITICAL: Drop the old JsRuntime BEFORE creating the new one.
         // Two v8 isolates on the same thread during drop cleanup causes

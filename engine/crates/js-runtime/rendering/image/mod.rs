@@ -14,7 +14,7 @@ use shared::{
     },
 };
 
-mod cache;
+pub(crate) mod cache;
 
 const OP_CREATE_IMAGE: &str = "canvas create image";
 const OP_LOAD_IMAGE: &str = "canvas load image";

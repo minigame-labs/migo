@@ -154,3 +154,15 @@ impl ImageCache {
 }
 
 pub static IMAGE_CACHE: Lazy<Mutex<ImageCache>> = Lazy::new(|| Mutex::new(ImageCache::new()));
+
+/// Clear all shared image tracking state.
+///
+/// Must be called during host shutdown to prevent stale entries from
+/// leaking into the next session (IMAGE_CACHE is process-global).
+pub fn clear_shared_image_cache() {
+    let mut c = IMAGE_CACHE.lock().unwrap();
+    c.by_src.clear();
+    c.alias_to_shared.clear();
+    c.shared_to_src.clear();
+    c.loading_map.clear();
+}

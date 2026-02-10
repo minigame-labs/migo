@@ -105,6 +105,7 @@ mod host_runtime;
 mod js_bindings;
 
 pub use host_runtime::HostJsRuntime;
+pub use rendering::image::cache::clear_shared_image_cache;
 
 deno_core::extension!(
     runtime,
