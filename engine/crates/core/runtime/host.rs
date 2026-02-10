@@ -16,6 +16,45 @@ use crate::{
 
 use js_runtime::HostJsRuntime;
 
+/// Wrapper around `Option<HostJsRuntime>` with `Deref`/`DerefMut`.
+///
+/// During `on_restart`, the old v8 isolate must be fully destroyed **before**
+/// the new one is created — two concurrent isolates on the same thread causes
+/// "Cannot create a handle without a HandleScope" in the old isolate's cleanup.
+/// This wrapper allows `take_and_drop()` → `set()` sequencing while keeping
+/// all existing `self.js.xxx()` call sites working transparently via Deref.
+pub(crate) struct JsRuntimeSlot(Option<HostJsRuntime>);
+
+impl JsRuntimeSlot {
+    fn new(js: HostJsRuntime) -> Self {
+        Self(Some(js))
+    }
+
+    /// Drop the current runtime. Must be followed by `set()`.
+    fn take_and_drop(&mut self) {
+        self.0.take(); // moves out and drops
+    }
+
+    /// Install a new runtime (after `take_and_drop`).
+    fn set(&mut self, js: HostJsRuntime) {
+        debug_assert!(self.0.is_none(), "JsRuntimeSlot: replacing without dropping first");
+        self.0 = Some(js);
+    }
+}
+
+impl std::ops::Deref for JsRuntimeSlot {
+    type Target = HostJsRuntime;
+    fn deref(&self) -> &HostJsRuntime {
+        self.0.as_ref().expect("[BUG] JsRuntime accessed after drop")
+    }
+}
+
+impl std::ops::DerefMut for JsRuntimeSlot {
+    fn deref_mut(&mut self) -> &mut HostJsRuntime {
+        self.0.as_mut().expect("[BUG] JsRuntime accessed after drop")
+    }
+}
+
 pub(crate) struct Host {
     pub(crate) id: HostId,
 
@@ -23,7 +62,7 @@ pub(crate) struct Host {
     pub(crate) audio: AudioService,
     pub(crate) render: RenderService,
 
-    pub(crate) js: HostJsRuntime,
+    pub(crate) js: JsRuntimeSlot,
 
     /// Shared RAF receiver — survives JS runtime restarts.
     raf_rx: RafRx,
@@ -107,7 +146,7 @@ impl Host {
             render,
             io,
             audio,
-            js,
+            js: JsRuntimeSlot::new(js),
             raf_rx,
             platform,
             init_options,
@@ -307,7 +346,13 @@ impl Host {
 
         let extra_ext = self.platform.extensions(&self.init_options);
 
-        self.js = HostJsRuntime::new(self.id as i32, host_state, extra_ext, module_loader);
+        // CRITICAL: Drop the old JsRuntime BEFORE creating the new one.
+        // Two v8 isolates on the same thread during drop cleanup causes
+        // "Cannot create a handle without a HandleScope" crash — the old
+        // isolate's cleanup handler can't create a HandleScope when v8's
+        // thread-local state was modified by the new isolate's initialization.
+        self.js.take_and_drop();
+        self.js.set(HostJsRuntime::new(self.id as i32, host_state, extra_ext, module_loader));
 
         // If we have a last evaluated module, reload it
         if let (Some(game_id), Some(entry)) = (self.last_game_id.clone(), self.last_entry.clone()) {
