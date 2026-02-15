@@ -1,10 +1,12 @@
 use deno_core::extension;
 
 mod context2d;
+mod font;
 mod raf;
 mod webgl;
 
 use context2d::*;
+use font::*;
 use raf::*;
 use webgl::*;
 
@@ -113,6 +115,10 @@ extension!(host_v8_webgl,
         // Image methods
         op_draw_image,
         op_draw_image_batch,
+
+        // Font methods
+        op_load_font,
+        op_get_text_line_height,
     ],
     esm = [
         dir "rendering/webgl",
@@ -120,6 +126,7 @@ extension!(host_v8_webgl,
         "02_2d_context.js",
         "02_webgl_context.js",
         "03_raf.js",
+        "04_font.js",
     ],
     state = |state| {
         state.put(FrameCommandCollector::new());

@@ -2,7 +2,7 @@ use femtovg::{Canvas as FvCanvas, FontId, renderer::OpenGl};
 use std::{
     collections::HashMap,
     fs,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 use tracing::{debug, info, warn};
 
@@ -33,7 +33,7 @@ impl GlobalFontStore {
         }
     }
 
-    fn insert(&mut self, key: &str, data: FontData) {
+    pub(crate) fn insert(&mut self, key: &str, data: FontData) {
         self.fonts_by_key.insert(key.to_string(), data);
     }
 
@@ -54,8 +54,8 @@ impl GlobalFontStore {
     }
 }
 
-/// Singleton global font store.
-static GLOBAL_FONTS: OnceLock<GlobalFontStore> = OnceLock::new();
+/// Singleton global font store (behind RwLock for dynamic font loading).
+static GLOBAL_FONTS: OnceLock<RwLock<GlobalFontStore>> = OnceLock::new();
 
 /// Initialize/load the global font store once.
 ///
@@ -143,9 +143,20 @@ fn init_global_fonts() -> GlobalFontStore {
     store
 }
 
-/// Get global font store (lazy initialized).
-pub(crate) fn global_fonts() -> &'static GlobalFontStore {
-    GLOBAL_FONTS.get_or_init(init_global_fonts)
+/// Get global font store (lazy initialized, read lock).
+pub(crate) fn global_fonts() -> std::sync::RwLockReadGuard<'static, GlobalFontStore> {
+    GLOBAL_FONTS
+        .get_or_init(|| RwLock::new(init_global_fonts()))
+        .read()
+        .unwrap()
+}
+
+/// Get global font store (write lock, for dynamic font loading).
+pub(crate) fn global_fonts_mut() -> std::sync::RwLockWriteGuard<'static, GlobalFontStore> {
+    GLOBAL_FONTS
+        .get_or_init(|| RwLock::new(init_global_fonts()))
+        .write()
+        .unwrap()
 }
 
 /// FontManager is per-canvas:
@@ -317,6 +328,30 @@ impl FontManager {
 }
 
 impl FontManager {
+    /// Register a single font (already in GlobalFontStore) into this canvas.
+    /// Returns the FontId if successful.
+    pub(crate) fn register_font(
+        &mut self,
+        canvas: &mut FvCanvas<OpenGl>,
+        key: &str,
+        data: &FontData,
+    ) -> Option<FontId> {
+        if self.font_ids_by_key.contains_key(key) {
+            return self.font_ids_by_key.get(key).copied();
+        }
+        match canvas.add_font_mem(&data.bytes) {
+            Ok(fid) => {
+                self.font_ids_by_key.insert(key.to_string(), fid);
+                debug!("Registered dynamic font '{}' as FontId {:?}", key, fid);
+                Some(fid)
+            }
+            Err(e) => {
+                warn!("Failed to register dynamic font '{}' to canvas: {}", key, e);
+                None
+            }
+        }
+    }
+
     pub(crate) fn parse_font_string(&self, font: &str) -> (String, Option<f32>, bool, bool) {
         let (families, size, bold, italic) = self.parse_font_shorthand(font);
         let fam = families

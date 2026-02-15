@@ -3,6 +3,7 @@ import * as url from "ext:host_v8_url/03_url.js";
 import * as location from "ext:host_v8_web/12_location.js";
 import * as performance from "ext:host_v8_web/12_performance.js";
 import * as raf from "ext:host_v8_webgl/03_raf.js";
+import * as fontApi from "ext:host_v8_webgl/04_font.js";
 import * as canvas from "ext:host_v8_web/03_canvas.js";
 import * as webgl from 'ext:host_v8_webgl/02_webgl_context.js';
 import * as touch from 'ext:host_v8_touch/01_touch.js';
@@ -141,6 +142,10 @@ const WindowGlobalScope = {
     setScreenBrightness: core.propNonEnumerable(screen.setScreenBrightness),
     setKeepScreenOn: core.propNonEnumerable(screen.setKeepScreenOn),
     setDeviceOrientation: core.propNonEnumerable(screen.setDeviceOrientation),
+
+    // Font
+    loadFont: core.propNonEnumerable(fontApi.loadFont),
+    getTextLineHeight: core.propNonEnumerable(fontApi.getTextLineHeight),
 
     // Network
     onNetworkStatusChange: core.propNonEnumerable(network.onNetworkStatusChange),

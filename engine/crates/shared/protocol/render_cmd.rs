@@ -93,6 +93,24 @@ pub enum RenderCommand {
     /// 2. An explicit Invalidate signal is received
     Invalidate,
 
+    /// Load a custom font from raw bytes into the global font store and all existing canvases.
+    /// Returns the font family key (used in CSS font strings).
+    LoadFont {
+        key: String,
+        bytes: std::sync::Arc<Vec<u8>>,
+        resp: RenderCmdResp<String>,
+    },
+
+    /// Measure the line height for a given font configuration.
+    /// Returns the line height in pixels (ascender - descender).
+    GetTextLineHeight {
+        font_family: String,
+        font_size: f32,
+        bold: bool,
+        italic: bool,
+        resp: RenderCmdResp<f32>,
+    },
+
     /// Pause rendering: stop the frame ticker/VSync and RAF signal.
     ///
     /// Used when the app goes to background. The render thread stays alive

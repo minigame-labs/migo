@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{onscreen_window_from_surface, CanvasHandler, CanvasManager, Renderer2d, RendererGL};
+use crate::{onscreen_window_from_surface, CanvasHandler, CanvasManager, FontData, Renderer2d, RendererGL, global_fonts_mut};
 use crossbeam_channel::{bounded, select, tick, Receiver};
 use shared::protocol::render_cmd::RenderCommand;
 use shared::surface::SurfaceRef;
@@ -246,6 +246,48 @@ impl RenderThread {
                                 }
                                 info!("RenderThread resumed");
                             }
+                        }
+
+                        RenderCommand::LoadFont { key, bytes, resp } => {
+                            // 1) Insert into global font store.
+                            let data = FontData {
+                                name: key.clone(),
+                                bytes,
+                            };
+                            global_fonts_mut().insert(&key, data.clone());
+
+                            // 2) Register in all existing canvas FontManagers.
+                            for (_cid, ctx2d) in cm.contexts_2d_iter_mut() {
+                                ctx2d.font_manager.register_font(&mut ctx2d.canvas, &key, &data);
+                            }
+
+                            info!("RenderThread: loaded font '{}'", key);
+                            resp.ok(key);
+                        }
+
+                        RenderCommand::GetTextLineHeight { font_family, font_size, bold, italic, resp } => {
+                            // Find any 2D context to measure with.
+                            let result: f32 = if let Some((_cid, ctx2d)) = cm.contexts_2d_iter_mut().next() {
+                                // Resolve font id for the requested family/style.
+                                let font_id = ctx2d.font_manager.resolve_font_id(&font_family, bold, italic)
+                                    .or_else(|| ctx2d.font_manager.default_font_id());
+
+                                if let Some(fid) = font_id {
+                                    let mut paint = femtovg::Paint::color(femtovg::Color::black());
+                                    paint.set_font(&[fid]);
+                                    paint.set_font_size(font_size);
+                                    match ctx2d.canvas.measure_font(&paint) {
+                                        Ok(fm) => fm.ascender() - fm.descender(),
+                                        Err(_) => font_size * 1.2,
+                                    }
+                                } else {
+                                    font_size * 1.2
+                                }
+                            } else {
+                                // No canvas available, use common approximation.
+                                font_size * 1.2
+                            };
+                            resp.ok(result);
                         }
 
                         _ => {}

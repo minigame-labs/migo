@@ -657,6 +657,13 @@ impl CanvasManager {
         })
     }
 
+    /// Iterate over all 2D contexts mutably (for font registration, etc.).
+    pub(crate) fn contexts_2d_iter_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&CanvasId, &mut Canvas2DContext)> {
+        self.contexts_2d.iter_mut()
+    }
+
     pub(crate) fn mark_2d_dirty(&mut self, canvas_id: CanvasId) {
         self.dirty_2d.insert(canvas_id);
     }
