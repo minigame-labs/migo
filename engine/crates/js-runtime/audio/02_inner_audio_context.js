@@ -90,17 +90,19 @@ class InnerAudioContext {
   #paused = true;
   #buffered = false;
 
-  // Event callbacks
-  #onCanplay = null;
-  #onPlay = null;
-  #onPause = null;
-  #onStop = null;
-  #onEnded = null;
-  #onTimeUpdate = null;
-  #onError = null;
-  #onWaiting = null;
-  #onSeeking = null;
-  #onSeeked = null;
+  // Event listener arrays (multi-listener support per wx API)
+  #listeners = {
+    canplay: [],
+    play: [],
+    pause: [],
+    stop: [],
+    ended: [],
+    timeUpdate: [],
+    error: [],
+    waiting: [],
+    seeking: [],
+    seeked: [],
+  };
 
   // Loading state
   #destroyed = false;
@@ -126,43 +128,47 @@ class InnerAudioContext {
     switch (event.eventType) {
       case "canPlay":
         this.#buffered = true;
-        this.#fireCallback(this.#onCanplay);
+        this.#fireListeners("canplay");
         break;
       case "play":
         this.#paused = false;
-        this.#fireCallback(this.#onPlay);
+        this.#fireListeners("play");
         break;
       case "pause":
         this.#paused = true;
-        this.#fireCallback(this.#onPause);
+        this.#fireListeners("pause");
         break;
       case "stop":
         this.#paused = true;
         this.#currentTime = 0;
-        this.#fireCallback(this.#onStop);
+        this.#fireListeners("stop");
         break;
       case "ended":
         this.#paused = true;
         this.#currentTime = 0;
-        this.#fireCallback(this.#onEnded);
+        this.#fireListeners("ended");
         break;
       case "seeking":
-        this.#fireCallback(this.#onSeeking);
+        this.#fireListeners("seeking");
         break;
       case "seeked":
-        this.#fireCallback(this.#onSeeked);
+        this.#fireListeners("seeked");
         break;
       case "timeUpdate":
-        this.#fireCallback(this.#onTimeUpdate);
+        this.#fireListeners("timeUpdate");
         break;
       case "error":
-        this.#fireCallback(this.#onError, { errCode: 10001, errMsg: "Playback error" });
+        this.#fireListeners("error", { errCode: 10001, errMsg: "Playback error" });
         break;
     }
   }
 
-  #fireCallback(fn, arg) {
-    if (fn) {
+  #fireListeners(type, arg) {
+    const list = this.#listeners[type];
+    if (!list || list.length === 0) return;
+    // Iterate over a snapshot to be safe against mid-iteration removal
+    const snapshot = list.slice();
+    for (const fn of snapshot) {
       try {
         fn(arg);
       } catch (e) {
@@ -303,119 +309,125 @@ class InnerAudioContext {
   pause() {
     if (this.#destroyed) return;
     op_inner_audio_pause(this.#id);
-    // Note: Don't update #paused here - wait for native event
   }
 
   /** Stop playback and reset position */
   stop() {
     if (this.#destroyed) return;
     op_inner_audio_stop(this.#id);
-    // Note: Don't update state here - wait for native event
   }
 
   /** Seek to position in seconds */
   seek(position) {
     if (this.#destroyed) return;
     op_inner_audio_seek(this.#id, position);
-    // Note: Events will be fired from native
   }
 
   /** Destroy the audio context */
   destroy() {
     if (this.#destroyed) return;
     this.#destroyed = true;
+    // Clear all listeners
+    for (const key in this.#listeners) {
+      this.#listeners[key].length = 0;
+    }
     unregisterContext(this);
     op_inner_audio_destroy(this.#id);
   }
 
-  /** Register callback when audio can play */
+  // ==================== Event Listeners (multi-listener) ====================
+
   onCanplay(fn) {
-    this.#onCanplay = typeof fn === "function" ? fn : null;
+    if (typeof fn === "function") this.#listeners.canplay.push(fn);
   }
 
-  /** Register callback when playback starts */
   onPlay(fn) {
-    this.#onPlay = typeof fn === "function" ? fn : null;
+    if (typeof fn === "function") this.#listeners.play.push(fn);
   }
 
-  /** Register callback when playback pauses */
   onPause(fn) {
-    this.#onPause = typeof fn === "function" ? fn : null;
+    if (typeof fn === "function") this.#listeners.pause.push(fn);
   }
 
-  /** Register callback when playback stops */
   onStop(fn) {
-    this.#onStop = typeof fn === "function" ? fn : null;
+    if (typeof fn === "function") this.#listeners.stop.push(fn);
   }
 
-  /** Register callback when playback ends */
   onEnded(fn) {
-    this.#onEnded = typeof fn === "function" ? fn : null;
+    if (typeof fn === "function") this.#listeners.ended.push(fn);
   }
 
-  /** Register callback periodically during playback */
   onTimeUpdate(fn) {
-    this.#onTimeUpdate = typeof fn === "function" ? fn : null;
+    if (typeof fn === "function") this.#listeners.timeUpdate.push(fn);
   }
 
-  /** Register callback on error */
   onError(fn) {
-    this.#onError = typeof fn === "function" ? fn : null;
+    if (typeof fn === "function") this.#listeners.error.push(fn);
   }
 
-  /** Register callback when waiting for data */
   onWaiting(fn) {
-    this.#onWaiting = typeof fn === "function" ? fn : null;
+    if (typeof fn === "function") this.#listeners.waiting.push(fn);
   }
 
-  /** Register callback when seeking */
   onSeeking(fn) {
-    this.#onSeeking = typeof fn === "function" ? fn : null;
+    if (typeof fn === "function") this.#listeners.seeking.push(fn);
   }
 
-  /** Register callback when seek completes */
   onSeeked(fn) {
-    this.#onSeeked = typeof fn === "function" ? fn : null;
+    if (typeof fn === "function") this.#listeners.seeked.push(fn);
   }
 
   offCanplay(fn) {
-    if (!fn || this.#onCanplay === fn) this.#onCanplay = null;
+    this.#removeListener("canplay", fn);
   }
 
   offPlay(fn) {
-    if (!fn || this.#onPlay === fn) this.#onPlay = null;
+    this.#removeListener("play", fn);
   }
 
   offPause(fn) {
-    if (!fn || this.#onPause === fn) this.#onPause = null;
+    this.#removeListener("pause", fn);
   }
 
   offStop(fn) {
-    if (!fn || this.#onStop === fn) this.#onStop = null;
+    this.#removeListener("stop", fn);
   }
 
   offEnded(fn) {
-    if (!fn || this.#onEnded === fn) this.#onEnded = null;
+    this.#removeListener("ended", fn);
   }
 
   offTimeUpdate(fn) {
-    if (!fn || this.#onTimeUpdate === fn) this.#onTimeUpdate = null;
+    this.#removeListener("timeUpdate", fn);
   }
 
   offError(fn) {
-    if (!fn || this.#onError === fn) this.#onError = null;
+    this.#removeListener("error", fn);
   }
 
   offWaiting(fn) {
-    if (!fn || this.#onWaiting === fn) this.#onWaiting = null;
+    this.#removeListener("waiting", fn);
   }
 
   offSeeking(fn) {
-    if (!fn || this.#onSeeking === fn) this.#onSeeking = null;
+    this.#removeListener("seeking", fn);
   }
 
   offSeeked(fn) {
-    if (!fn || this.#onSeeked === fn) this.#onSeeked = null;
+    this.#removeListener("seeked", fn);
+  }
+
+  /** Remove a specific listener, or all listeners if fn is omitted */
+  #removeListener(type, fn) {
+    const list = this.#listeners[type];
+    if (!list) return;
+    if (!fn) {
+      // No argument: remove all listeners for this event type
+      list.length = 0;
+    } else {
+      const idx = list.indexOf(fn);
+      if (idx !== -1) list.splice(idx, 1);
+    }
   }
 
   // ==================== Internal Methods ====================
@@ -434,13 +446,7 @@ class InnerAudioContext {
       // Duration will be updated as streaming progresses
       // Autoplay is also handled by native
     } catch (e) {
-      if (this.#onError) {
-        try {
-          this.#onError({ errCode: 10002, errMsg: e.message || String(e) });
-        } catch (e2) {
-          console.error("InnerAudioContext onError error:", e2);
-        }
-      }
+      this.#fireListeners("error", { errCode: 10002, errMsg: e.message || String(e) });
     }
   }
 }

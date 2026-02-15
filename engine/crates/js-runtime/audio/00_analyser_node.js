@@ -2,6 +2,8 @@ import {
   op_audio_set_analyser_fft_size,
   op_audio_analyser_byte_time_domain,
   op_audio_analyser_float_time_domain,
+  op_audio_analyser_byte_frequency,
+  op_audio_analyser_float_frequency,
 } from "ext:core/ops";
 import { AudioNode } from "ext:host_v8_audio/00_audio_node.js";
 
@@ -73,13 +75,19 @@ class AnalyserNode extends AudioNode {
   }
 
   async getByteFrequencyData(array) {
-    // Stub: frequency domain analysis requires FFT implementation
-    array.fill(0);
+    const data = await op_audio_analyser_byte_frequency(this._nodeId);
+    const len = Math.min(array.length, data.length);
+    for (let i = 0; i < len; i++) {
+      array[i] = data[i];
+    }
   }
 
   async getFloatFrequencyData(array) {
-    // Stub: frequency domain analysis requires FFT implementation
-    array.fill(-Infinity);
+    const data = await op_audio_analyser_float_frequency(this._nodeId);
+    const len = Math.min(array.length, data.length);
+    for (let i = 0; i < len; i++) {
+      array[i] = data[i];
+    }
   }
 }
 

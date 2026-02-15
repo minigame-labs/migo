@@ -1,3 +1,4 @@
+import { op_audio_get_reduction } from "ext:core/ops";
 import { AudioParam } from "ext:host_v8_audio/00_audio_param.js";
 import { AudioNode } from "ext:host_v8_audio/00_audio_node.js";
 
@@ -7,6 +8,7 @@ class DynamicsCompressorNode extends AudioNode {
   #ratio;
   #attack;
   #release;
+  #reduction = 0;
 
   constructor(context, nodeId) {
     super(context, nodeId, {
@@ -47,8 +49,15 @@ class DynamicsCompressorNode extends AudioNode {
   }
 
   get reduction() {
-    // Read-only: actual value is computed on native side
-    return 0;
+    // Return cached value; update asynchronously
+    this.#pollReduction();
+    return this.#reduction;
+  }
+
+  #pollReduction() {
+    op_audio_get_reduction(this._nodeId).then((val) => {
+      this.#reduction = val;
+    }).catch(() => {});
   }
 }
 

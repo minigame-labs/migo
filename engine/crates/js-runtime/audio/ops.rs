@@ -111,6 +111,48 @@ pub async fn op_audio_close_context(
         .map_err(AudioError::from)
 }
 
+/// Resume a suspended AudioContext
+#[op2(async(lazy), fast)]
+pub async fn op_audio_resume_context(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(AudioCmd::ResumeContext {
+        ctx_id,
+        resp: resp_tx,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)
+}
+
+/// Suspend an AudioContext
+#[op2(async(lazy), fast)]
+pub async fn op_audio_suspend_context(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(AudioCmd::SuspendContext {
+        ctx_id,
+        resp: resp_tx,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)
+}
+
 // ============================================================================
 // Buffer Operations
 // ============================================================================
@@ -824,6 +866,100 @@ pub async fn op_audio_get_channel_data(
         .flat_map(|f| f.to_le_bytes())
         .collect();
     Ok(bytes)
+}
+
+// ============================================================================
+// Frequency Response & Analysis
+// ============================================================================
+
+/// Get frequency response from BiquadFilterNode or IIRFilterNode.
+/// Returns (magResponse, phaseResponse) as interleaved bytes.
+#[op2(async(lazy))]
+#[serde]
+pub async fn op_audio_get_frequency_response(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[serde] frequencies: Vec<f32>,
+) -> Result<(Vec<f32>, Vec<f32>), AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(AudioCmd::GetFrequencyResponse {
+        node_id,
+        frequencies,
+        resp: resp_tx,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)
+}
+
+/// Get current reduction value from DynamicsCompressorNode
+#[op2(async(lazy), fast)]
+pub async fn op_audio_get_reduction(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+) -> Result<f32, AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(AudioCmd::GetReduction {
+        node_id,
+        resp: resp_tx,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)
+}
+
+/// Get byte frequency data from AnalyserNode (FFT output, 0-255)
+#[op2(async(lazy), fast)]
+#[serde]
+pub async fn op_audio_analyser_byte_frequency(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+) -> Result<Vec<u8>, AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(AudioCmd::GetAnalyserByteFrequencyData {
+        node_id,
+        resp: resp_tx,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)
+}
+
+/// Get float frequency data from AnalyserNode (FFT output, dB values)
+#[op2(async(lazy), fast)]
+#[serde]
+pub async fn op_audio_analyser_float_frequency(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+) -> Result<Vec<f32>, AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(AudioCmd::GetAnalyserFloatFrequencyData {
+        node_id,
+        resp: resp_tx,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)
 }
 
 // ============================================================================

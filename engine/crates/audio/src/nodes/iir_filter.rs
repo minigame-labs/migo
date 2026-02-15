@@ -53,6 +53,58 @@ impl IIRFilterNode {
             channels,
         }
     }
+
+    /// Compute frequency response H(e^{jω}) for an array of frequencies.
+    /// H(z) = Σ(b[k]·z^{-k}) / Σ(a[k]·z^{-k})
+    pub fn get_frequency_response(
+        &self,
+        sample_rate: f64,
+        frequencies: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let len = frequencies.len();
+        let mut mag_response = Vec::with_capacity(len);
+        let mut phase_response = Vec::with_capacity(len);
+
+        for &freq_hz in frequencies {
+            let omega = std::f64::consts::TAU * freq_hz as f64 / sample_rate;
+
+            // Numerator: Σ b[k] · e^{-jkω}
+            let mut num_re = 0.0;
+            let mut num_im = 0.0;
+            for (k, &bk) in self.feedforward.iter().enumerate() {
+                let angle = k as f64 * omega;
+                num_re += bk * angle.cos();
+                num_im -= bk * angle.sin();
+            }
+
+            // Denominator: Σ a[k] · e^{-jkω}
+            let mut den_re = 0.0;
+            let mut den_im = 0.0;
+            for (k, &ak) in self.feedback.iter().enumerate() {
+                let angle = k as f64 * omega;
+                den_re += ak * angle.cos();
+                den_im -= ak * angle.sin();
+            }
+
+            let den_mag_sq = den_re * den_re + den_im * den_im;
+            if den_mag_sq < 1e-20 {
+                mag_response.push(0.0);
+                phase_response.push(0.0);
+                continue;
+            }
+
+            let h_re = (num_re * den_re + num_im * den_im) / den_mag_sq;
+            let h_im = (num_im * den_re - num_re * den_im) / den_mag_sq;
+
+            let magnitude = (h_re * h_re + h_im * h_im).sqrt();
+            let phase = h_im.atan2(h_re);
+
+            mag_response.push(magnitude as f32);
+            phase_response.push(phase as f32);
+        }
+
+        (mag_response, phase_response)
+    }
 }
 
 impl AudioNodeProcessor for IIRFilterNode {

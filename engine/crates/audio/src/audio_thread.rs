@@ -815,6 +815,95 @@ fn run_audio_thread(
                     let _ = resp.send(Ok(()));
                 }
 
+                // ==================== Frequency Response & Analysis ====================
+                AudioCmd::GetFrequencyResponse { node_id, frequencies, resp } => {
+                    let result = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .and_then(|ctx| {
+                            let sr = ctx.sample_rate() as f64;
+                            // Try BiquadFilterNode first
+                            if let Some(r) = ctx.with_node_typed::<BiquadFilterNode, _>(node_id, |n| {
+                                n.get_frequency_response(sr, &frequencies)
+                            }) {
+                                return Some(r);
+                            }
+                            // Try IIRFilterNode
+                            ctx.with_node_typed::<IIRFilterNode, _>(node_id, |n| {
+                                n.get_frequency_response(sr, &frequencies)
+                            })
+                        });
+                    match result {
+                        Some(data) => { let _ = resp.send(Ok(data)); }
+                        None => {
+                            let _ = resp.send(Err(EngineError::from_detail(
+                                ErrorCode::NotFound,
+                                format!("Filter node {} not found", node_id),
+                            )));
+                        }
+                    }
+                }
+
+                AudioCmd::GetReduction { node_id, resp } => {
+                    let result = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .and_then(|ctx| {
+                            ctx.with_node_typed::<DynamicsCompressorNode, _>(node_id, |n| {
+                                n.reduction()
+                            })
+                        });
+                    match result {
+                        Some(val) => { let _ = resp.send(Ok(val)); }
+                        None => {
+                            let _ = resp.send(Err(EngineError::from_detail(
+                                ErrorCode::NotFound,
+                                format!("DynamicsCompressorNode {} not found", node_id),
+                            )));
+                        }
+                    }
+                }
+
+                AudioCmd::GetAnalyserByteFrequencyData { node_id, resp } => {
+                    let result = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .and_then(|ctx| {
+                            ctx.with_node_typed::<AnalyserNode, _>(node_id, |an| {
+                                an.get_byte_frequency_data()
+                            })
+                        });
+                    match result {
+                        Some(data) => { let _ = resp.send(Ok(data)); }
+                        None => {
+                            let _ = resp.send(Err(EngineError::from_detail(
+                                ErrorCode::NotFound,
+                                format!("AnalyserNode {} not found", node_id),
+                            )));
+                        }
+                    }
+                }
+
+                AudioCmd::GetAnalyserFloatFrequencyData { node_id, resp } => {
+                    let result = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .and_then(|ctx| {
+                            ctx.with_node_typed::<AnalyserNode, _>(node_id, |an| {
+                                an.get_float_frequency_data()
+                            })
+                        });
+                    match result {
+                        Some(data) => { let _ = resp.send(Ok(data)); }
+                        None => {
+                            let _ = resp.send(Err(EngineError::from_detail(
+                                ErrorCode::NotFound,
+                                format!("AnalyserNode {} not found", node_id),
+                            )));
+                        }
+                    }
+                }
+
                 // ==================== AudioParam Automation ====================
                 AudioCmd::AudioParamSetValueAtTime { node_id, param_name, value, time } => {
                     if let Some(ctx_id) = node_index.get_context(node_id) {
@@ -894,15 +983,21 @@ fn run_audio_thread(
                 }
 
                 AudioCmd::CopyToChannel { ctx_id, buffer_id, data, channel, start, resp } => {
-                    // CopyToChannel requires mutable access to the buffer.
-                    // Since buffers are stored as Arc<DecodedAudio>, we need to
-                    // go through the context to handle this properly.
-                    // For now, this is a no-op placeholder that will be fully
-                    // implemented when AudioBuffer write support is added.
-                    let _ = resp.send(Err(EngineError::from_detail(
-                        ErrorCode::Unsupported,
-                        "CopyToChannel not yet implemented for Arc-wrapped buffers",
-                    )));
+                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                        if ctx.copy_to_channel(buffer_id, &data, channel, start) {
+                            let _ = resp.send(Ok(()));
+                        } else {
+                            let _ = resp.send(Err(EngineError::from_detail(
+                                ErrorCode::NotFound,
+                                format!("Buffer {} channel {} not found", buffer_id, channel),
+                            )));
+                        }
+                    } else {
+                        let _ = resp.send(Err(EngineError::from_detail(
+                            ErrorCode::NotFound,
+                            format!("AudioContext {} not found", ctx_id),
+                        )));
+                    }
                 }
 
                 // ==================== Global Audio Options ====================

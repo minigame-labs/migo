@@ -5,6 +5,8 @@ use crate::audio::ops::{
     op_audio_create_context, op_audio_create_gain, op_audio_decode_audio_data,
     op_audio_disconnect, op_audio_set_buffer, op_audio_set_gain_value, op_audio_set_loop,
     op_audio_start, op_audio_stop,
+    // Context resume/suspend ops
+    op_audio_resume_context, op_audio_suspend_context,
     // AudioParam automation ops
     op_audio_param_set_value_at_time, op_audio_param_linear_ramp,
     op_audio_param_exponential_ramp, op_audio_param_set_target,
@@ -36,6 +38,9 @@ use crate::audio::ops::{
     op_audio_stop_constant_source,
     // Phase 3: IIRFilterNode ops
     op_audio_create_iir_filter,
+    // Frequency response & analysis ops
+    op_audio_get_frequency_response, op_audio_get_reduction,
+    op_audio_analyser_byte_frequency, op_audio_analyser_float_frequency,
     // Phase 4: Global audio options ops
     op_audio_set_inner_audio_option, op_audio_get_available_audio_sources,
     // Phase 4: MediaAudioPlayer ops
@@ -57,6 +62,8 @@ extension!(host_v8_audio,
         // WebAudio ops
         op_audio_create_context,
         op_audio_close_context,
+        op_audio_resume_context,
+        op_audio_suspend_context,
         op_audio_decode_audio_data,
         op_audio_create_buffer_source,
         op_audio_set_buffer,
@@ -111,6 +118,11 @@ extension!(host_v8_audio,
         op_audio_stop_constant_source,
         // Phase 3: IIRFilterNode ops
         op_audio_create_iir_filter,
+        // Frequency response & analysis ops
+        op_audio_get_frequency_response,
+        op_audio_get_reduction,
+        op_audio_analyser_byte_frequency,
+        op_audio_analyser_float_frequency,
         // Phase 4: Global audio options ops
         op_audio_set_inner_audio_option,
         op_audio_get_available_audio_sources,

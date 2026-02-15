@@ -386,6 +386,32 @@ pub enum AudioCmd {
         feedback: Vec<f64>,
     },
 
+    // ==================== Frequency Response & Analysis ====================
+    /// Get frequency response from BiquadFilterNode or IIRFilterNode
+    GetFrequencyResponse {
+        node_id: AudioNodeId,
+        frequencies: Vec<f32>,
+        resp: AudioResp<(Vec<f32>, Vec<f32>)>,
+    },
+
+    /// Get current compression reduction from DynamicsCompressorNode
+    GetReduction {
+        node_id: AudioNodeId,
+        resp: AudioResp<f32>,
+    },
+
+    /// Get frequency domain data from AnalyserNode (byte, after FFT)
+    GetAnalyserByteFrequencyData {
+        node_id: AudioNodeId,
+        resp: AudioResp<Vec<u8>>,
+    },
+
+    /// Get frequency domain data from AnalyserNode (float, after FFT)
+    GetAnalyserFloatFrequencyData {
+        node_id: AudioNodeId,
+        resp: AudioResp<Vec<f32>>,
+    },
+
     // ==================== AudioParam Automation ====================
     /// Schedule a value change at a specific time
     AudioParamSetValueAtTime {

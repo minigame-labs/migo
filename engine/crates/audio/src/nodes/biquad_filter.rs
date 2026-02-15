@@ -95,6 +95,59 @@ impl BiquadFilterNode {
         self.last_freq = -1.0;
     }
 
+    /// Compute frequency response for an array of frequencies.
+    /// Evaluates H(e^{jω}) = (b0 + b1·e^{-jω} + b2·e^{-2jω}) / (1 + a1·e^{-jω} + a2·e^{-2jω})
+    /// at each frequency. Updates coefficients first to ensure they're current.
+    pub fn get_frequency_response(
+        &mut self,
+        sample_rate: f64,
+        frequencies: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        // Ensure coefficients are up-to-date
+        self.compute_coefficients(sample_rate);
+
+        let len = frequencies.len();
+        let mut mag_response = Vec::with_capacity(len);
+        let mut phase_response = Vec::with_capacity(len);
+
+        for &freq_hz in frequencies {
+            let omega = std::f64::consts::TAU * freq_hz as f64 / sample_rate;
+
+            // e^{-jω} components
+            let cos1 = omega.cos();
+            let sin1 = omega.sin();
+            let cos2 = (2.0 * omega).cos();
+            let sin2 = (2.0 * omega).sin();
+
+            // Numerator: b0 + b1·e^{-jω} + b2·e^{-2jω}
+            let num_re = self.b0 + self.b1 * cos1 + self.b2 * cos2;
+            let num_im = -(self.b1 * sin1 + self.b2 * sin2);
+
+            // Denominator: 1 + a1·e^{-jω} + a2·e^{-2jω}
+            let den_re = 1.0 + self.a1 * cos1 + self.a2 * cos2;
+            let den_im = -(self.a1 * sin1 + self.a2 * sin2);
+
+            // H = num / den (complex division)
+            let den_mag_sq = den_re * den_re + den_im * den_im;
+            if den_mag_sq < 1e-20 {
+                mag_response.push(0.0);
+                phase_response.push(0.0);
+                continue;
+            }
+
+            let h_re = (num_re * den_re + num_im * den_im) / den_mag_sq;
+            let h_im = (num_im * den_re - num_re * den_im) / den_mag_sq;
+
+            let magnitude = (h_re * h_re + h_im * h_im).sqrt();
+            let phase = h_im.atan2(h_re);
+
+            mag_response.push(magnitude as f32);
+            phase_response.push(phase as f32);
+        }
+
+        (mag_response, phase_response)
+    }
+
     /// Compute biquad coefficients using Robert Bristow-Johnson's formulas
     fn compute_coefficients(&mut self, sample_rate: f64) {
         let freq = self.frequency.value();

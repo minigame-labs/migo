@@ -17,6 +17,8 @@ import {
   op_audio_create_channel_splitter,
   op_audio_create_constant_source,
   op_audio_create_iir_filter,
+  op_audio_resume_context,
+  op_audio_suspend_context,
 } from "ext:core/ops";
 import { AudioParam } from "ext:host_v8_audio/00_audio_param.js";
 import { AudioBuffer } from "ext:host_v8_audio/00_audio_buffer.js";
@@ -275,7 +277,7 @@ class AudioContext extends BaseAudioContext {
     if (this.state === "closed") {
       throw new Error("Cannot resume a closed AudioContext");
     }
-    // TODO: call native resume
+    await op_audio_resume_context(this._nativeId);
     this._setState("running");
   }
 
@@ -283,7 +285,7 @@ class AudioContext extends BaseAudioContext {
     if (this.state === "closed") {
       throw new Error("Cannot suspend a closed AudioContext");
     }
-    // TODO: call native suspend
+    await op_audio_suspend_context(this._nativeId);
     this._setState("suspended");
   }
 }

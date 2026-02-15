@@ -174,6 +174,47 @@ impl AudioContext {
         Some(data)
     }
 
+    /// Copy data into a specific channel of a buffer (copy-on-write via Arc::make_mut).
+    pub fn copy_to_channel(
+        &mut self,
+        buffer_id: AudioBufferId,
+        data: &[f32],
+        channel: u32,
+        start_frame: u32,
+    ) -> bool {
+        let buffer = match self.buffers.get_mut(&buffer_id) {
+            Some(b) => b,
+            None => return false,
+        };
+
+        if channel >= buffer.channels {
+            return false;
+        }
+
+        let channels = buffer.channels as usize;
+        let frame_count = buffer.frame_count();
+        let start = start_frame as usize;
+        let ch = channel as usize;
+
+        // Clamp copy length to buffer bounds
+        let copy_len = data.len().min(frame_count.saturating_sub(start));
+        if copy_len == 0 {
+            return true; // Nothing to copy, but not an error
+        }
+
+        // Arc::make_mut clones the inner data only if there are other references
+        let audio = Arc::make_mut(buffer);
+
+        for i in 0..copy_len {
+            let sample_idx = (start + i) * channels + ch;
+            if sample_idx < audio.samples.len() {
+                audio.samples[sample_idx] = data[i];
+            }
+        }
+
+        true
+    }
+
     // ==================== Node Management ====================
 
     /// Create a buffer source node with JS-provided node_id

@@ -1,4 +1,7 @@
-import { op_audio_set_biquad_filter_type } from "ext:core/ops";
+import {
+  op_audio_set_biquad_filter_type,
+  op_audio_get_frequency_response,
+} from "ext:core/ops";
 import { AudioParam } from "ext:host_v8_audio/00_audio_param.js";
 import { AudioNode } from "ext:host_v8_audio/00_audio_node.js";
 
@@ -56,13 +59,13 @@ class BiquadFilterNode extends AudioNode {
     return this.#gain;
   }
 
-  getFrequencyResponse(frequencyHz, magResponse, phaseResponse) {
-    // Stub: compute response from biquad coefficients
-    // Full implementation requires the actual coefficients from native side
-    const len = frequencyHz.length;
+  async getFrequencyResponse(frequencyHz, magResponse, phaseResponse) {
+    const frequencies = Array.from(frequencyHz);
+    const [mag, phase] = await op_audio_get_frequency_response(this._nodeId, frequencies);
+    const len = Math.min(frequencyHz.length, mag.length);
     for (let i = 0; i < len; i++) {
-      magResponse[i] = 1.0;
-      phaseResponse[i] = 0.0;
+      magResponse[i] = mag[i];
+      phaseResponse[i] = phase[i];
     }
   }
 }
