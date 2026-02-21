@@ -1,10 +1,13 @@
 package com.migo.runtime.internal.platform;
 
 import android.app.Activity;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.ParcelFileDescriptor;
 
 import com.migo.runtime.internal.NativeMethods;
 
@@ -12,15 +15,24 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.File;
-import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Platform-level audio recorder wrapping Android's {@link MediaRecorder}.
- * <p>
- * Manages recording lifecycle (start/pause/resume/stop), option parsing,
- * auto-stop timer, and event dispatch to the native layer.
+ * Platform-level audio recorder with three operating modes:
+ * <ul>
+ *   <li><b>Encoded mode</b> ({@code frameSize == 0}): Uses {@link MediaRecorder} for
+ *       compressed output (AAC, etc.). No frame callbacks during recording.</li>
+ *   <li><b>PCM frame mode</b> ({@code frameSize > 0} and format is pcm/wav):
+ *       Uses {@link AudioRecord} for raw PCM capture with real-time frame callbacks
+ *       every {@code frameSize} KB.</li>
+ *   <li><b>Encoded frame mode</b> ({@code frameSize > 0} and format is mp3/aac):
+ *       Uses {@link MediaRecorder} writing to a {@link ParcelFileDescriptor} pipe.
+ *       A background thread reads encoded data from the pipe, accumulates to
+ *       {@code frameSize} KB, and fires frame callbacks with encoded data.</li>
+ * </ul>
  * <p>
  * Events are sent via {@link NativeMethods#onRecorderEvent} and
  * frame data via {@link NativeMethods#onRecorderFrameData}.
@@ -36,14 +48,33 @@ public final class AudioRecorderManager {
     private static final int STATE_RECORDING = 1;
     private static final int STATE_PAUSED = 2;
 
+    /** Frame mode sub-types. */
+    private static final int FRAME_NONE = 0;
+    private static final int FRAME_PCM = 1;
+    private static final int FRAME_ENCODED = 2;
+
     private final int sessionId;
     private final Activity activity;
     private final Handler mainHandler;
 
-    private MediaRecorder recorder;
+    // MediaRecorder (encoded mode + encoded frame mode)
+    private MediaRecorder mediaRecorder;
+
+    // AudioRecord (PCM frame mode)
+    private AudioRecord audioRecord;
+
+    // Pipe for encoded frame mode
+    private ParcelFileDescriptor pipeReadFd;
+    private ParcelFileDescriptor pipeWriteFd;
+
+    // Shared frame capture state
+    private Thread captureThread;
+    private volatile boolean captureRunning;
+    private FileOutputStream outputFileStream; // tee to file in encoded-frame mode
+
     private final AtomicInteger state = new AtomicInteger(STATE_IDLE);
 
-    // Recording options
+    // Recording options (parsed from JSON)
     private int maxDuration = 60000;
     private int sampleRate = 8000;
     private int numberOfChannels = 2;
@@ -55,12 +86,9 @@ public final class AudioRecorderManager {
     // Recording state
     private String outputFilePath;
     private long recordStartTime;
-    private long recordedDuration; // accumulated duration across pause/resume cycles
+    private long recordedDuration; // accumulated ms across pause/resume cycles
     private Runnable autoStopRunnable;
-
-    // Frame data reader (when frameSize > 0, uses PCM pipe)
-    private Thread frameReaderThread;
-    private volatile boolean frameReaderRunning;
+    private int frameMode = FRAME_NONE;
 
     public AudioRecorderManager(int sessionId, Activity activity) {
         this.sessionId = sessionId;
@@ -71,154 +99,418 @@ public final class AudioRecorderManager {
     /**
      * Start recording with the given options JSON.
      *
-     * @param optionsJson JSON string with keys: duration, sampleRate, numberOfChannels,
+     * @param optionsJson JSON with keys: duration, sampleRate, numberOfChannels,
      *                    encodeBitRate, format, frameSize, audioSource
      */
     public void start(String optionsJson) {
         if (state.get() != STATE_IDLE) {
-            // Already recording — stop first then restart
             stopInternal(false);
         }
 
         parseOptions(optionsJson);
 
-        try {
-            recorder = new MediaRecorder();
-
-            // Audio source
-            recorder.setAudioSource(mapAudioSource(audioSource));
-
-            // Output format + encoder
-            configureFormatAndEncoder(recorder);
-
-            // Audio parameters
-            recorder.setAudioSamplingRate(sampleRate);
-            recorder.setAudioChannels(numberOfChannels);
-            recorder.setAudioEncodingBitRate(encodeBitRate);
-
-            // Output file
-            outputFilePath = createOutputFile();
-            recorder.setOutputFile(outputFilePath);
-
-            // Max duration
-            if (maxDuration > 0) {
-                recorder.setMaxDuration(maxDuration);
+        if (frameSize > 0) {
+            String fmt = format.toLowerCase();
+            if ("pcm".equals(fmt) || "wav".equals(fmt)) {
+                frameMode = FRAME_PCM;
+            } else {
+                frameMode = FRAME_ENCODED;
             }
+        } else {
+            frameMode = FRAME_NONE;
+        }
 
-            recorder.setOnInfoListener((mr, what, extra) -> {
-                if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
-                    mainHandler.post(() -> stopInternal(true));
-                }
-            });
-
-            recorder.setOnErrorListener((mr, what, extra) -> {
-                String errMsg = "MediaRecorder error: what=" + what + " extra=" + extra;
-                fireEvent("error", "{\"errMsg\":\"" + escapeJson(errMsg) + "\"}");
-                mainHandler.post(() -> resetRecorder());
-            });
-
-            recorder.prepare();
-            recorder.start();
-
-            state.set(STATE_RECORDING);
-            recordStartTime = System.currentTimeMillis();
-            recordedDuration = 0;
-
-            // Schedule auto-stop
-            scheduleAutoStop();
-
-            fireEvent("start", "{}");
-        } catch (Exception e) {
-            fireEvent("error",
-                    "{\"errMsg\":\"" + escapeJson("recorderManager.start:fail " + e.getMessage()) + "\"}");
-            resetRecorder();
+        switch (frameMode) {
+            case FRAME_PCM:
+                startPcmFrameMode();
+                break;
+            case FRAME_ENCODED:
+                startEncodedFrameMode();
+                break;
+            default:
+                startEncodedMode();
+                break;
         }
     }
 
-    /**
-     * Pause recording (API 24+).
-     */
+    /** Pause recording. API 24+ required for MediaRecorder modes. */
     public void pause() {
         if (state.get() != STATE_RECORDING) return;
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                recorder.pause();
-                state.set(STATE_PAUSED);
-                // Accumulate duration
-                recordedDuration += System.currentTimeMillis() - recordStartTime;
-                cancelAutoStop();
-                fireEvent("pause", "{}");
-            } catch (Exception e) {
-                fireEvent("error",
-                        "{\"errMsg\":\"" + escapeJson("recorderManager.pause:fail " + e.getMessage()) + "\"}");
-            }
+        if (frameMode == FRAME_PCM) {
+            // AudioRecord: flip state, capture thread will sleep
+            state.set(STATE_PAUSED);
+            recordedDuration += System.currentTimeMillis() - recordStartTime;
+            cancelAutoStop();
+            fireEvent("pause", "{}");
         } else {
-            fireEvent("error",
-                    "{\"errMsg\":\"recorderManager.pause:fail not supported below API 24\"}");
+            // MediaRecorder-based (encoded mode or encoded-frame mode)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                try {
+                    mediaRecorder.pause();
+                    state.set(STATE_PAUSED);
+                    recordedDuration += System.currentTimeMillis() - recordStartTime;
+                    cancelAutoStop();
+                    fireEvent("pause", "{}");
+                } catch (Exception e) {
+                    fireEvent("error",
+                            "{\"errMsg\":\"" + escapeJson("recorderManager.pause:fail " + e.getMessage()) + "\"}");
+                }
+            } else {
+                fireEvent("error",
+                        "{\"errMsg\":\"recorderManager.pause:fail not supported below API 24\"}");
+            }
         }
     }
 
-    /**
-     * Resume recording after pause (API 24+).
-     */
+    /** Resume recording after pause. */
     public void resume() {
         if (state.get() != STATE_PAUSED) return;
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                recorder.resume();
-                state.set(STATE_RECORDING);
-                recordStartTime = System.currentTimeMillis();
-                scheduleAutoStop();
-                fireEvent("resume", "{}");
-            } catch (Exception e) {
-                fireEvent("error",
-                        "{\"errMsg\":\"" + escapeJson("recorderManager.resume:fail " + e.getMessage()) + "\"}");
-            }
+        if (frameMode == FRAME_PCM) {
+            state.set(STATE_RECORDING);
+            recordStartTime = System.currentTimeMillis();
+            scheduleAutoStop();
+            fireEvent("resume", "{}");
         } else {
-            fireEvent("error",
-                    "{\"errMsg\":\"recorderManager.resume:fail not supported below API 24\"}");
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                try {
+                    mediaRecorder.resume();
+                    state.set(STATE_RECORDING);
+                    recordStartTime = System.currentTimeMillis();
+                    scheduleAutoStop();
+                    fireEvent("resume", "{}");
+                } catch (Exception e) {
+                    fireEvent("error",
+                            "{\"errMsg\":\"" + escapeJson("recorderManager.resume:fail " + e.getMessage()) + "\"}");
+                }
+            } else {
+                fireEvent("error",
+                        "{\"errMsg\":\"recorderManager.resume:fail not supported below API 24\"}");
+            }
         }
     }
 
-    /**
-     * Stop recording.
-     */
+    /** Stop recording. */
     public void stop() {
         stopInternal(true);
     }
 
-    /**
-     * Release all resources. Call on session destruction.
-     */
+    /** Release all resources. Call on session destruction. */
     public void destroy() {
         stopInternal(false);
     }
 
-    // ==================== Internal ====================
+    // ========================================================================
+    // Mode 1: Encoded mode (MediaRecorder, no frame callbacks)
+    // ========================================================================
+
+    private void startEncodedMode() {
+        try {
+            mediaRecorder = new MediaRecorder();
+            mediaRecorder.setAudioSource(mapAudioSource(audioSource));
+            configureFormatAndEncoder(mediaRecorder);
+            mediaRecorder.setAudioSamplingRate(sampleRate);
+            mediaRecorder.setAudioChannels(numberOfChannels);
+            mediaRecorder.setAudioEncodingBitRate(encodeBitRate);
+
+            outputFilePath = createOutputFilePath();
+            mediaRecorder.setOutputFile(outputFilePath);
+
+            if (maxDuration > 0) {
+                mediaRecorder.setMaxDuration(maxDuration);
+            }
+
+            attachMediaRecorderListeners();
+            mediaRecorder.prepare();
+            mediaRecorder.start();
+
+            onRecordingStarted();
+        } catch (Exception e) {
+            fireEvent("error",
+                    "{\"errMsg\":\"" + escapeJson("recorderManager.start:fail " + e.getMessage()) + "\"}");
+            resetMediaRecorder();
+        }
+    }
+
+    // ========================================================================
+    // Mode 2: PCM frame mode (AudioRecord, raw PCM frame callbacks)
+    // ========================================================================
+
+    private void startPcmFrameMode() {
+        int channelConfig = (numberOfChannels == 1)
+                ? AudioFormat.CHANNEL_IN_MONO
+                : AudioFormat.CHANNEL_IN_STEREO;
+        int audioFmt = AudioFormat.ENCODING_PCM_16BIT;
+        int minBufSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFmt);
+        if (minBufSize == AudioRecord.ERROR_BAD_VALUE || minBufSize == AudioRecord.ERROR) {
+            fireEvent("error", "{\"errMsg\":\"recorderManager.start:fail invalid audio parameters\"}");
+            return;
+        }
+
+        int frameBufBytes = frameSize * 1024;
+        int bufferSize = Math.max(minBufSize, frameBufBytes * 2);
+
+        try {
+            audioRecord = new AudioRecord(
+                    mapAudioSource(audioSource),
+                    sampleRate,
+                    channelConfig,
+                    audioFmt,
+                    bufferSize);
+
+            if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
+                fireEvent("error", "{\"errMsg\":\"recorderManager.start:fail AudioRecord init failed\"}");
+                releaseAudioRecord();
+                return;
+            }
+
+            outputFilePath = createOutputFilePath();
+            outputFileStream = new FileOutputStream(outputFilePath);
+
+            audioRecord.startRecording();
+            startCaptureThread(this::pcmCaptureLoop);
+            onRecordingStarted();
+        } catch (Exception e) {
+            fireEvent("error",
+                    "{\"errMsg\":\"" + escapeJson("recorderManager.start:fail " + e.getMessage()) + "\"}");
+            releaseAudioRecord();
+            closeOutputStream();
+        }
+    }
+
+    /** PCM capture loop: reads from AudioRecord, writes to file, fires frame callbacks. */
+    private void pcmCaptureLoop() {
+        final int chunkBytes = frameSize * 1024;
+        byte[] accumulator = new byte[chunkBytes];
+        int accOffset = 0;
+        int readSize = Math.min(chunkBytes, 4096);
+        byte[] readBuf = new byte[readSize];
+
+        try {
+            while (captureRunning) {
+                int currentState = state.get();
+                if (currentState == STATE_PAUSED) {
+                    Thread.sleep(50);
+                    continue;
+                }
+                if (currentState != STATE_RECORDING) {
+                    break;
+                }
+
+                int bytesRead = audioRecord.read(readBuf, 0, readBuf.length);
+                if (bytesRead <= 0) {
+                    if (bytesRead == AudioRecord.ERROR_INVALID_OPERATION) break;
+                    continue;
+                }
+
+                // Write to file
+                if (outputFileStream != null) {
+                    outputFileStream.write(readBuf, 0, bytesRead);
+                }
+
+                // Accumulate and fire frame callbacks
+                accOffset = accumulateAndFire(readBuf, bytesRead, accumulator, accOffset, chunkBytes);
+            }
+        } catch (InterruptedException ignored) {
+            // Normal shutdown
+        } catch (IOException e) {
+            fireEvent("error",
+                    "{\"errMsg\":\"" + escapeJson("recording write error: " + e.getMessage()) + "\"}");
+        }
+
+        // Flush remaining
+        flushAccumulator(accumulator, accOffset);
+    }
+
+    // ========================================================================
+    // Mode 3: Encoded frame mode (MediaRecorder + pipe, encoded frame callbacks)
+    // ========================================================================
+
+    private void startEncodedFrameMode() {
+        try {
+            ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
+            pipeReadFd = pipe[0];
+            pipeWriteFd = pipe[1];
+
+            mediaRecorder = new MediaRecorder();
+            mediaRecorder.setAudioSource(mapAudioSource(audioSource));
+            configureFormatAndEncoder(mediaRecorder);
+            mediaRecorder.setAudioSamplingRate(sampleRate);
+            mediaRecorder.setAudioChannels(numberOfChannels);
+            mediaRecorder.setAudioEncodingBitRate(encodeBitRate);
+
+            // Write encoded data to the pipe instead of a file
+            mediaRecorder.setOutputFile(pipeWriteFd.getFileDescriptor());
+
+            if (maxDuration > 0) {
+                mediaRecorder.setMaxDuration(maxDuration);
+            }
+
+            attachMediaRecorderListeners();
+
+            // Prepare output file for tee
+            outputFilePath = createOutputFilePath();
+            outputFileStream = new FileOutputStream(outputFilePath);
+
+            mediaRecorder.prepare();
+            mediaRecorder.start();
+
+            // Start reading from the pipe
+            startCaptureThread(this::encodedCaptureLoop);
+            onRecordingStarted();
+        } catch (Exception e) {
+            fireEvent("error",
+                    "{\"errMsg\":\"" + escapeJson("recorderManager.start:fail " + e.getMessage()) + "\"}");
+            resetMediaRecorder();
+            closePipe();
+            closeOutputStream();
+        }
+    }
+
+    /** Encoded capture loop: reads encoded data from pipe, tees to file, fires frame callbacks. */
+    private void encodedCaptureLoop() {
+        final int chunkBytes = frameSize * 1024;
+        byte[] accumulator = new byte[chunkBytes];
+        int accOffset = 0;
+        int readSize = Math.min(chunkBytes, 8192);
+        byte[] readBuf = new byte[readSize];
+
+        try (InputStream pipeIn = new ParcelFileDescriptor.AutoCloseInputStream(pipeReadFd)) {
+            // pipeReadFd is now owned by the AutoCloseInputStream; null our reference
+            pipeReadFd = null;
+
+            while (captureRunning) {
+                int bytesRead = pipeIn.read(readBuf);
+                if (bytesRead <= 0) {
+                    // Pipe closed (MediaRecorder stopped) or error
+                    break;
+                }
+
+                // Tee to output file
+                if (outputFileStream != null) {
+                    outputFileStream.write(readBuf, 0, bytesRead);
+                }
+
+                // Accumulate and fire frame callbacks
+                accOffset = accumulateAndFire(readBuf, bytesRead, accumulator, accOffset, chunkBytes);
+            }
+        } catch (IOException e) {
+            if (captureRunning) {
+                fireEvent("error",
+                        "{\"errMsg\":\"" + escapeJson("pipe read error: " + e.getMessage()) + "\"}");
+            }
+            // else: pipe closed during normal stop, ignore
+        }
+
+        // Flush remaining
+        flushAccumulator(accumulator, accOffset);
+    }
+
+    // ========================================================================
+    // Shared frame accumulation
+    // ========================================================================
+
+    /**
+     * Append data to the accumulator. Each time it fills to {@code chunkBytes},
+     * fire a frame callback and reset.
+     *
+     * @return new accOffset after processing
+     */
+    private int accumulateAndFire(byte[] data, int dataLen,
+                                  byte[] accumulator, int accOffset, int chunkBytes) {
+        int srcOffset = 0;
+        while (srcOffset < dataLen) {
+            int toCopy = Math.min(dataLen - srcOffset, chunkBytes - accOffset);
+            System.arraycopy(data, srcOffset, accumulator, accOffset, toCopy);
+            accOffset += toCopy;
+            srcOffset += toCopy;
+
+            if (accOffset >= chunkBytes) {
+                NativeMethods.onRecorderFrameData(sessionId, accumulator.clone(), false);
+                accOffset = 0;
+            }
+        }
+        return accOffset;
+    }
+
+    /** Flush any remaining bytes in the accumulator as the last frame. */
+    private void flushAccumulator(byte[] accumulator, int accOffset) {
+        if (accOffset > 0) {
+            byte[] last = new byte[accOffset];
+            System.arraycopy(accumulator, 0, last, 0, accOffset);
+            NativeMethods.onRecorderFrameData(sessionId, last, true);
+        }
+    }
+
+    // ========================================================================
+    // Common helpers
+    // ========================================================================
+
+    private void startCaptureThread(Runnable loop) {
+        captureRunning = true;
+        captureThread = new Thread(loop, "AudioCapture-" + sessionId);
+        captureThread.setDaemon(true);
+        captureThread.start();
+    }
+
+    private void onRecordingStarted() {
+        state.set(STATE_RECORDING);
+        recordStartTime = System.currentTimeMillis();
+        recordedDuration = 0;
+        scheduleAutoStop();
+        fireEvent("start", "{}");
+    }
+
+    private void attachMediaRecorderListeners() {
+        mediaRecorder.setOnInfoListener((mr, what, extra) -> {
+            if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
+                mainHandler.post(() -> stopInternal(true));
+            }
+        });
+
+        mediaRecorder.setOnErrorListener((mr, what, extra) -> {
+            String errMsg = "MediaRecorder error: what=" + what + " extra=" + extra;
+            fireEvent("error", "{\"errMsg\":\"" + escapeJson(errMsg) + "\"}");
+            mainHandler.post(() -> stopInternal(false));
+        });
+    }
+
+    // ========================================================================
+    // Stop / cleanup
+    // ========================================================================
 
     private void stopInternal(boolean notifyStop) {
         int prevState = state.getAndSet(STATE_IDLE);
         if (prevState == STATE_IDLE) return;
 
         cancelAutoStop();
-        stopFrameReader();
 
-        // Accumulate final duration
         if (prevState == STATE_RECORDING) {
             recordedDuration += System.currentTimeMillis() - recordStartTime;
         }
 
-        try {
-            if (recorder != null) {
-                recorder.stop();
-            }
-        } catch (Exception e) {
-            // May throw if no data was recorded yet
+        switch (frameMode) {
+            case FRAME_PCM:
+                stopCaptureThread();
+                releaseAudioRecord();
+                closeOutputStream();
+                break;
+            case FRAME_ENCODED:
+                // Stop MediaRecorder first; this closes the pipe write end,
+                // which causes the capture thread's read to return -1 and exit.
+                stopMediaRecorderSafe();
+                closePipeWriteFd();
+                stopCaptureThread();
+                closePipeReadFd();
+                closeOutputStream();
+                break;
+            default:
+                stopMediaRecorderSafe();
+                break;
         }
 
-        resetRecorder();
+        resetMediaRecorder();
 
         if (notifyStop && outputFilePath != null) {
             File file = new File(outputFilePath);
@@ -232,23 +524,84 @@ public final class AudioRecorderManager {
             } catch (JSONException ignored) {}
 
             fireEvent("stop", result.toString());
+        }
+    }
 
-            // If frameSize was set, send the file as final frame data
-            if (frameSize > 0 && file.exists() && fileSize > 0) {
-                sendFileAsFrameData(file);
+    private void stopMediaRecorderSafe() {
+        if (mediaRecorder != null) {
+            try {
+                mediaRecorder.stop();
+            } catch (Exception ignored) {
+                // May throw if no data was recorded yet
             }
         }
     }
 
-    private void resetRecorder() {
-        if (recorder != null) {
+    private void stopCaptureThread() {
+        captureRunning = false;
+        if (captureThread != null) {
+            captureThread.interrupt();
             try {
-                recorder.reset();
-                recorder.release();
-            } catch (Exception ignored) {}
-            recorder = null;
+                captureThread.join(1000);
+            } catch (InterruptedException ignored) {}
+            captureThread = null;
         }
     }
+
+    private void releaseAudioRecord() {
+        if (audioRecord != null) {
+            try {
+                if (audioRecord.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+                    audioRecord.stop();
+                }
+                audioRecord.release();
+            } catch (Exception ignored) {}
+            audioRecord = null;
+        }
+    }
+
+    private void closeOutputStream() {
+        if (outputFileStream != null) {
+            try {
+                outputFileStream.flush();
+                outputFileStream.close();
+            } catch (IOException ignored) {}
+            outputFileStream = null;
+        }
+    }
+
+    private void resetMediaRecorder() {
+        if (mediaRecorder != null) {
+            try {
+                mediaRecorder.reset();
+                mediaRecorder.release();
+            } catch (Exception ignored) {}
+            mediaRecorder = null;
+        }
+    }
+
+    private void closePipe() {
+        closePipeReadFd();
+        closePipeWriteFd();
+    }
+
+    private void closePipeReadFd() {
+        if (pipeReadFd != null) {
+            try { pipeReadFd.close(); } catch (IOException ignored) {}
+            pipeReadFd = null;
+        }
+    }
+
+    private void closePipeWriteFd() {
+        if (pipeWriteFd != null) {
+            try { pipeWriteFd.close(); } catch (IOException ignored) {}
+            pipeWriteFd = null;
+        }
+    }
+
+    // ========================================================================
+    // Options / helpers
+    // ========================================================================
 
     private void parseOptions(String json) {
         if (json == null || json.isEmpty()) return;
@@ -280,8 +633,6 @@ public final class AudioRecorderManager {
             case "voice_communication":
                 return MediaRecorder.AudioSource.VOICE_COMMUNICATION;
             case "headsetMic":
-                // Android doesn't have a separate headset mic source;
-                // MIC will use headset if connected
                 return MediaRecorder.AudioSource.MIC;
             case "auto":
             default:
@@ -294,14 +645,11 @@ public final class AudioRecorderManager {
             case "mp3":
                 recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
                 recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
-                // Note: Android MediaRecorder doesn't natively support MP3 encoding.
+                // Android doesn't natively support MP3 encoding.
                 // Use AAC in MP4 container as closest equivalent.
                 break;
             case "wav":
             case "pcm":
-                // Android MediaRecorder doesn't support raw WAV/PCM output directly.
-                // Use AMR_WB as fallback for WAV, or AAC in MPEG4.
-                // For production, consider AudioRecord for raw PCM.
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     recorder.setOutputFormat(MediaRecorder.OutputFormat.OGG);
                     recorder.setAudioEncoder(MediaRecorder.AudioEncoder.OPUS);
@@ -318,7 +666,7 @@ public final class AudioRecorderManager {
         }
     }
 
-    private String createOutputFile() {
+    private String createOutputFilePath() {
         File cacheDir = activity.getCacheDir();
         File recordDir = new File(cacheDir, "recordings");
         if (!recordDir.exists()) {
@@ -327,18 +675,10 @@ public final class AudioRecorderManager {
 
         String ext;
         switch (format.toLowerCase()) {
-            case "mp3":
-                ext = ".mp3";
-                break;
-            case "wav":
-                ext = ".wav";
-                break;
-            case "pcm":
-                ext = ".pcm";
-                break;
-            default:
-                ext = ".m4a";
-                break;
+            case "mp3":  ext = ".mp3"; break;
+            case "wav":  ext = ".wav"; break;
+            case "pcm":  ext = ".pcm"; break;
+            default:     ext = ".m4a"; break;
         }
         return new File(recordDir, "rec_" + sessionId + "_" + System.currentTimeMillis() + ext)
                 .getAbsolutePath();
@@ -363,43 +703,6 @@ public final class AudioRecorderManager {
             mainHandler.removeCallbacks(autoStopRunnable);
             autoStopRunnable = null;
         }
-    }
-
-    private void stopFrameReader() {
-        frameReaderRunning = false;
-        if (frameReaderThread != null) {
-            frameReaderThread.interrupt();
-            frameReaderThread = null;
-        }
-    }
-
-    /**
-     * Read the recorded file and send as frame data (used when frameSize > 0).
-     */
-    private void sendFileAsFrameData(File file) {
-        final int chunkSize = frameSize * 1024; // frameSize is in KB
-        Thread thread = new Thread(() -> {
-            try (FileInputStream fis = new FileInputStream(file)) {
-                byte[] buffer = new byte[chunkSize];
-                int bytesRead;
-                while ((bytesRead = fis.read(buffer)) != -1) {
-                    int available = fis.available();
-                    boolean isLast = available == 0;
-                    if (bytesRead < buffer.length) {
-                        byte[] trimmed = new byte[bytesRead];
-                        System.arraycopy(buffer, 0, trimmed, 0, bytesRead);
-                        NativeMethods.onRecorderFrameData(sessionId, trimmed, isLast);
-                    } else {
-                        NativeMethods.onRecorderFrameData(sessionId, buffer.clone(), isLast);
-                    }
-                }
-            } catch (IOException e) {
-                fireEvent("error",
-                        "{\"errMsg\":\"" + escapeJson("frame read error: " + e.getMessage()) + "\"}");
-            }
-        }, "RecorderFrameReader-" + sessionId);
-        thread.setDaemon(true);
-        thread.start();
     }
 
     private void fireEvent(String eventType, String jsonPayload) {
