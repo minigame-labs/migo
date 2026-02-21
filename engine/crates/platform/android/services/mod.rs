@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use core::services::{
     AccelerometerService, AudioPlatformService, BatteryService, ClipboardService, CompassService,
-    DeviceMotionService, DeviceServices, GyroscopeService, NetworkService, ScreenService,
-    VibrationService,
+    DeviceMotionService, DeviceServices, GyroscopeService, NetworkService, RecorderService,
+    ScreenService, VibrationService,
 };
 
 use crate::android::jni;
@@ -62,6 +62,10 @@ impl DeviceServices for AndroidDeviceServices {
 
     fn audio_platform(&self) -> Option<Arc<dyn AudioPlatformService>> {
         Some(Arc::new(AndroidAudioPlatform { host_id: self.host_id }))
+    }
+
+    fn recorder(&self) -> Option<Arc<dyn RecorderService>> {
+        Some(Arc::new(AndroidRecorder { host_id: self.host_id }))
     }
 }
 
@@ -242,5 +246,29 @@ impl AudioPlatformService for AndroidAudioPlatform {
             .filter(|s| !s.is_empty())
             .collect();
         Ok(sources)
+    }
+}
+
+// ==================== Recorder ====================
+
+struct AndroidRecorder {
+    host_id: i32,
+}
+
+impl RecorderService for AndroidRecorder {
+    fn start(&self, options_json: &str) -> Result<(), String> {
+        jni::recorder_start(self.host_id, options_json)
+    }
+
+    fn pause(&self) -> Result<(), String> {
+        jni::recorder_pause(self.host_id)
+    }
+
+    fn resume(&self) -> Result<(), String> {
+        jni::recorder_resume(self.host_id)
+    }
+
+    fn stop(&self) -> Result<(), String> {
+        jni::recorder_stop(self.host_id)
     }
 }

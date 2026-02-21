@@ -1042,6 +1042,62 @@ pub fn op_audio_get_available_audio_sources(
 }
 
 // ============================================================================
+// Recorder Operations
+// ============================================================================
+
+/// Start recording with the given options (JSON string).
+/// Routes through DeviceServices RecorderService.
+#[op2(fast)]
+pub fn op_recorder_start(
+    state: &mut OpState,
+    #[string] options_json: &str,
+) -> Result<(), AudioError> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(recorder) = services.recorder() {
+            return recorder.start(options_json).map_err(AudioError::from);
+        }
+    }
+    Err(audio_err("recorderManager.start:fail not supported"))
+}
+
+/// Pause recording.
+#[op2(fast)]
+pub fn op_recorder_pause(state: &mut OpState) -> Result<(), AudioError> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(recorder) = services.recorder() {
+            return recorder.pause().map_err(AudioError::from);
+        }
+    }
+    Err(audio_err("recorderManager.pause:fail not supported"))
+}
+
+/// Resume recording after pause.
+#[op2(fast)]
+pub fn op_recorder_resume(state: &mut OpState) -> Result<(), AudioError> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(recorder) = services.recorder() {
+            return recorder.resume().map_err(AudioError::from);
+        }
+    }
+    Err(audio_err("recorderManager.resume:fail not supported"))
+}
+
+/// Stop recording. Results delivered asynchronously via RecorderEvent.
+#[op2(fast)]
+pub fn op_recorder_stop(state: &mut OpState) -> Result<(), AudioError> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(recorder) = services.recorder() {
+            return recorder.stop().map_err(AudioError::from);
+        }
+    }
+    Err(audio_err("recorderManager.stop:fail not supported"))
+}
+
+// ============================================================================
 // MediaAudioPlayer Operations
 // ============================================================================
 

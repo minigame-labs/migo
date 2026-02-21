@@ -533,6 +533,58 @@ pub(crate) extern "system" fn onNetworkStatusChange<'local>(
     );
 }
 
+// ==================== Recorder Events ====================
+
+pub(crate) extern "system" fn onRecorderEvent<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    event_type: JString<'local>,
+    json_payload: JString<'local>,
+) {
+    let evt = env
+        .get_string(&event_type)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let payload = env
+        .get_string(&json_payload)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "{}".to_string());
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::RecorderEvent {
+            event_type: evt,
+            json_payload: payload,
+        },
+    );
+}
+
+pub(crate) extern "system" fn onRecorderFrameData(
+    env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    frame_data: jni::sys::jbyteArray,
+    is_last_frame: jni::sys::jboolean,
+) {
+    let data = match env
+        .convert_byte_array(unsafe { jni::objects::JByteArray::from_raw(frame_data) })
+    {
+        Ok(v) => v,
+        Err(e) => {
+            error!("onRecorderFrameData: failed to read byte array: {:?}", e);
+            return;
+        }
+    };
+
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::RecorderFrameData {
+            data,
+            is_last_frame: is_last_frame != 0,
+        },
+    );
+}
+
 // ==================== VSync (Choreographer) ====================
 
 pub(crate) extern "system" fn onVsync(

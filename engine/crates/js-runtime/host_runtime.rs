@@ -136,6 +136,16 @@ impl HostJsRuntime {
         self.bindings.dispatch_network_status(&mut self.rt, is_connected, network_type);
     }
 
+    // ---- Recorder event dispatch ----
+
+    pub fn dispatch_recorder_event(&mut self, event_type: &str, json_payload: &str) {
+        self.bindings.dispatch_recorder_event(&mut self.rt, self.host_id, event_type, json_payload);
+    }
+
+    pub fn dispatch_recorder_frame_data(&mut self, data: &[u8], is_last_frame: bool) {
+        self.bindings.dispatch_recorder_frame_data(&mut self.rt, self.host_id, data, is_last_frame);
+    }
+
     // ---- Scripts / modules ----
 
     /// Execute a script without pumping the event loop.

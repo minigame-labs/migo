@@ -9,6 +9,7 @@ use crate::android::jni::{
     onDeviceOrientationChange, onGyroscopeChange, onHide, onModalResult, onActionSheetResult,
     onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting, onShow,
     onRestart, onTouch, onVsync, getDebugStats, shutdown, updateSurface, version,
+    onRecorderEvent, onRecorderFrameData,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -135,6 +136,16 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(I)[B".into(),
                 fn_ptr: getDebugStats as *mut c_void,
             },
+            NativeMethod {
+                name: "onRecorderEvent".into(),
+                sig: "(ILjava/lang/String;Ljava/lang/String;)V".into(),
+                fn_ptr: onRecorderEvent as *mut c_void,
+            },
+            NativeMethod {
+                name: "onRecorderFrameData".into(),
+                sig: "(I[BZ)V".into(),
+                fn_ptr: onRecorderFrameData as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -195,6 +206,11 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         // Audio platform
         ("setInnerAudioOption", "(IZZZ)V"),
         ("getAvailableAudioSources", "(I)Ljava/lang/String;"),
+        // Recorder
+        ("recorderStart", "(ILjava/lang/String;)V"),
+        ("recorderPause", "(I)V"),
+        ("recorderResume", "(I)V"),
+        ("recorderStop", "(I)V"),
     ];
 
     let global_class = env

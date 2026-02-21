@@ -17,6 +17,7 @@ import com.migo.runtime.internal.platform.Permissions;
 import com.migo.runtime.internal.platform.ScreenBrightness;
 import com.migo.runtime.internal.platform.SystemSettings;
 import com.migo.runtime.internal.platform.Vibrator;
+import com.migo.runtime.internal.platform.AudioRecorderManager;
 
 import java.io.File;
 import java.nio.ByteBuffer;
@@ -809,5 +810,89 @@ public final class NativeExports {
         Activity activity = ctx.getActivity();
         if (activity == null) return "";
         return Clipboard.getClipboardData(activity);
+    }
+
+    // ==================== Recorder ====================
+
+    /** Per-session recorder managers. */
+    private static final ConcurrentHashMap<Integer, AudioRecorderManager> sRecorderManagers =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Start recording with the given options.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON string with recording options:
+     *                    duration, sampleRate, numberOfChannels, encodeBitRate,
+     *                    format, frameSize, audioSource
+     */
+    public static void recorderStart(int sessionId, String optionsJson) {
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) {
+            NativeMethods.onRecorderEvent(sessionId, "error",
+                    "{\"errMsg\":\"recorderManager.start:fail no context\"}");
+            return;
+        }
+        Activity activity = ctx.getActivity();
+        if (activity == null) {
+            NativeMethods.onRecorderEvent(sessionId, "error",
+                    "{\"errMsg\":\"recorderManager.start:fail no activity\"}");
+            return;
+        }
+
+        AudioRecorderManager mgr = sRecorderManagers.get(sessionId);
+        if (mgr == null) {
+            mgr = new AudioRecorderManager(sessionId, activity);
+            sRecorderManagers.put(sessionId, mgr);
+        }
+        mgr.start(optionsJson);
+    }
+
+    /**
+     * Pause recording.
+     *
+     * @param sessionId The session ID
+     */
+    public static void recorderPause(int sessionId) {
+        AudioRecorderManager mgr = sRecorderManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.pause();
+        }
+    }
+
+    /**
+     * Resume recording after pause.
+     *
+     * @param sessionId The session ID
+     */
+    public static void recorderResume(int sessionId) {
+        AudioRecorderManager mgr = sRecorderManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.resume();
+        }
+    }
+
+    /**
+     * Stop recording.
+     *
+     * @param sessionId The session ID
+     */
+    public static void recorderStop(int sessionId) {
+        AudioRecorderManager mgr = sRecorderManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.stop();
+        }
+    }
+
+    /**
+     * Clean up recorder resources for a session. Call on session shutdown.
+     *
+     * @param sessionId The session ID
+     */
+    public static void destroyRecorderManager(int sessionId) {
+        AudioRecorderManager mgr = sRecorderManagers.remove(sessionId);
+        if (mgr != null) {
+            mgr.destroy();
+        }
     }
 }

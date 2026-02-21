@@ -216,6 +216,22 @@ pub enum HostCommand {
         /// Network type: "wifi", "2g", "3g", "4g", "5g", "unknown", "none".
         network_type: String,
     },
+
+    /// Recorder event pushed from platform (start, pause, resume, stop, error, interruption).
+    RecorderEvent {
+        /// Event type string (e.g., "start", "stop", "error", "interruptionBegin").
+        event_type: String,
+        /// JSON-encoded payload (e.g., stop result with tempFilePath/duration/fileSize).
+        json_payload: String,
+    },
+
+    /// Recorder frame data pushed from platform (for onFrameRecorded).
+    RecorderFrameData {
+        /// Raw PCM/encoded audio frame bytes.
+        data: Vec<u8>,
+        /// Whether this is the last frame before stop.
+        is_last_frame: bool,
+    },
 }
 
 /// Event types for InnerAudioContext.

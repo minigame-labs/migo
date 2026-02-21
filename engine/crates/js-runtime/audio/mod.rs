@@ -47,6 +47,8 @@ use crate::audio::ops::{
     op_media_audio_player_create, op_media_audio_player_add_source,
     op_media_audio_player_remove_source, op_media_audio_player_start,
     op_media_audio_player_stop, op_media_audio_player_destroy,
+    // Recorder ops
+    op_recorder_start, op_recorder_pause, op_recorder_resume, op_recorder_stop,
     // InnerAudioContext ops
     op_inner_audio_create, op_inner_audio_destroy, op_inner_audio_load, op_inner_audio_load_url,
     op_inner_audio_play, op_inner_audio_pause, op_inner_audio_stop,
@@ -134,6 +136,11 @@ extension!(host_v8_audio,
         op_media_audio_player_start,
         op_media_audio_player_stop,
         op_media_audio_player_destroy,
+        // Recorder ops
+        op_recorder_start,
+        op_recorder_pause,
+        op_recorder_resume,
+        op_recorder_stop,
         // InnerAudioContext ops
         op_inner_audio_create,
         op_inner_audio_destroy,
@@ -174,6 +181,7 @@ extension!(host_v8_audio,
         "02_inner_audio_context.js",
         "03_audio_interruption.js",
         "04_media_audio_player.js",
+        "05_recorder_manager.js",
     ],
 );
 

@@ -9,6 +9,9 @@ pub(crate) struct JsBindings {
     main_js_context: v8::Global<v8::Context>,
     enqueue_touch_event_fn: Option<v8::Global<v8::Function>>,
     enqueue_inner_audio_event_fn: Option<v8::Global<v8::Function>>,
+    // Recorder event functions
+    recorder_event_fn: Option<v8::Global<v8::Function>>,
+    recorder_frame_fn: Option<v8::Global<v8::Function>>,
     // Sensor event functions (cached for high-frequency dispatch without JS parsing)
     sensor_device_motion_fn: Option<v8::Global<v8::Function>>,
     sensor_gyroscope_fn: Option<v8::Global<v8::Function>>,
@@ -26,6 +29,8 @@ impl JsBindings {
             main_js_context,
             enqueue_touch_event_fn: None,
             enqueue_inner_audio_event_fn: None,
+            recorder_event_fn: None,
+            recorder_frame_fn: None,
             sensor_device_motion_fn: None,
             sensor_gyroscope_fn: None,
             sensor_accelerometer_fn: None,
@@ -52,11 +57,14 @@ impl JsBindings {
 
         let (
             enqueue_touch, enqueue_audio,
+            rec_event, rec_frame,
             dev_motion, gyro, accel, compass, orientation, network,
         ) = self.with_main_context(rt, |scope, _ctx, global| {
             (
                 get_global_fn(scope, global, "_internalEnqueueRawTouchEvent"),
                 get_global_fn(scope, global, "_internalEnqueueInnerAudioEvent"),
+                get_global_fn(scope, global, "_internalOnRecorderEvent"),
+                get_global_fn(scope, global, "_internalOnRecorderFrameData"),
                 get_global_fn(scope, global, "_internalTriggerDeviceMotionChange"),
                 get_global_fn(scope, global, "_internalTriggerGyroscopeChange"),
                 get_global_fn(scope, global, "_internalTriggerAccelerometerChange"),
@@ -68,6 +76,8 @@ impl JsBindings {
 
         self.enqueue_touch_event_fn = enqueue_touch;
         self.enqueue_inner_audio_event_fn = enqueue_audio;
+        self.recorder_event_fn = rec_event;
+        self.recorder_frame_fn = rec_frame;
         self.sensor_device_motion_fn = dev_motion;
         self.sensor_gyroscope_fn = gyro;
         self.sensor_accelerometer_fn = accel;
@@ -259,5 +269,67 @@ impl JsBindings {
                 let _ = func.call(scope, global.into(), &args);
             });
         }
+    }
+
+    // ---- Recorder event dispatch ----
+
+    /// Dispatch recorder event (start, pause, resume, stop, error, interruption).
+    pub(crate) fn dispatch_recorder_event(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        host_id: i32,
+        event_type: &str,
+        json_payload: &str,
+    ) {
+        let Some(func_g) = self.recorder_event_fn.as_ref() else {
+            warn!("[Host {}] recorder event handler not installed", host_id);
+            return;
+        };
+
+        self.with_main_context(rt, |scope, _ctx, global| {
+            let args = [
+                v8::String::new(scope, event_type).unwrap().into(),
+                v8::String::new(scope, json_payload).unwrap().into(),
+            ];
+            let func = v8::Local::new(scope, func_g);
+            let _ = func.call(scope, global.into(), &args);
+        });
+    }
+
+    /// Dispatch recorder frame data (binary audio frame for onFrameRecorded).
+    pub(crate) fn dispatch_recorder_frame_data(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        host_id: i32,
+        data: &[u8],
+        is_last_frame: bool,
+    ) {
+        let Some(func_g) = self.recorder_frame_fn.as_ref() else {
+            warn!("[Host {}] recorder frame handler not installed", host_id);
+            return;
+        };
+
+        self.with_main_context(rt, |scope, _ctx, global| {
+            let ab = v8::ArrayBuffer::new(scope, data.len());
+            if !data.is_empty() {
+                let backing = ab.get_backing_store();
+                if let Some(ptr) = backing.data() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            ptr.as_ptr() as *mut u8,
+                            data.len(),
+                        );
+                    }
+                }
+            }
+
+            let args = [
+                ab.into(),
+                v8::Boolean::new(scope, is_last_frame).into(),
+            ];
+            let func = v8::Local::new(scope, func_g);
+            let _ = func.call(scope, global.into(), &args);
+        });
     }
 }

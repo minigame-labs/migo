@@ -144,6 +144,45 @@ pub trait AudioPlatformService: Send + Sync {
     }
 }
 
+// ==================== Recorder ====================
+
+/// Audio recording service (microphone input, encoding, file output).
+///
+/// Manages the platform media recorder lifecycle. Commands are fire-and-forget;
+/// results and state changes are delivered asynchronously via `HostCommand::RecorderEvent`
+/// and `HostCommand::RecorderFrameData`.
+pub trait RecorderService: Send + Sync {
+    /// Start recording with the given options (JSON-encoded).
+    ///
+    /// JSON fields:
+    /// - `duration`: max recording duration in ms (default 60000, max 600000)
+    /// - `sampleRate`: sample rate Hz (8000,11025,12000,16000,22050,24000,32000,44100,48000)
+    /// - `numberOfChannels`: 1 or 2 (default 2)
+    /// - `encodeBitRate`: encode bit rate in bps (default 48000)
+    /// - `format`: "mp3", "aac", "wav", "PCM" (default "aac")
+    /// - `frameSize`: frame size in KB (if set, triggers onFrameRecorded)
+    /// - `audioSource`: "auto","buildInMic","headsetMic","mic","camcorder",
+    ///                   "voice_recognition","voice_communication" (default "auto")
+    fn start(&self, _options_json: &str) -> Result<(), String> {
+        Err("recorderManager.start:fail not supported".to_string())
+    }
+
+    /// Pause recording.
+    fn pause(&self) -> Result<(), String> {
+        Err("recorderManager.pause:fail not supported".to_string())
+    }
+
+    /// Resume recording after pause.
+    fn resume(&self) -> Result<(), String> {
+        Err("recorderManager.resume:fail not supported".to_string())
+    }
+
+    /// Stop recording. The platform will fire a RecorderEvent("stop", ...) with the file path.
+    fn stop(&self) -> Result<(), String> {
+        Err("recorderManager.stop:fail not supported".to_string())
+    }
+}
+
 // ==================== Aggregated Device Services ====================
 
 /// Aggregated device services provided by a platform.
@@ -178,6 +217,9 @@ pub trait DeviceServices: Send + Sync {
         None
     }
     fn audio_platform(&self) -> Option<Arc<dyn AudioPlatformService>> {
+        None
+    }
+    fn recorder(&self) -> Option<Arc<dyn RecorderService>> {
         None
     }
 }

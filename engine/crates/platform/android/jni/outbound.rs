@@ -561,6 +561,47 @@ pub fn get_available_audio_sources(host_id: i32) -> Result<String, String> {
     )
 }
 
+// ==================== Recorder ====================
+
+/// Start recording with options JSON.
+/// Calls Java: NativeExports.recorderStart(hostId, optionsJson)
+pub fn recorder_start(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("recorderStart", host_id, options_json)
+}
+
+/// Pause recording.
+/// Calls Java: NativeExports.recorderPause(hostId)
+pub fn recorder_pause(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "recorderPause",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+/// Resume recording.
+/// Calls Java: NativeExports.recorderResume(hostId)
+pub fn recorder_resume(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "recorderResume",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+/// Stop recording.
+/// Calls Java: NativeExports.recorderStop(hostId)
+pub fn recorder_stop(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "recorderStop",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
 // ==================== Clipboard ====================
 
 pub fn set_clipboard_data(host_id: i32, data: &str) -> Result<(), String> {

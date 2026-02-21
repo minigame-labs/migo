@@ -16,6 +16,7 @@ mod network;
 pub use clipboard::ClipboardService;
 pub use device::{
     AccelerometerService, AudioPlatformService, BatteryService, CompassService,
-    DeviceMotionService, DeviceServices, GyroscopeService, ScreenService, VibrationService,
+    DeviceMotionService, DeviceServices, GyroscopeService, RecorderService, ScreenService,
+    VibrationService,
 };
 pub use network::NetworkService;

@@ -369,4 +369,35 @@ public final class NativeMethods {
             NativeBridge.onNetworkStatusChange(sessionId, isConnected, networkType);
         }
     }
+
+    // ==================== Recorder Callbacks ====================
+
+    /**
+     * Callback for recorder events.
+     * Called from {@link com.migo.runtime.internal.platform.AudioRecorderManager}.
+     *
+     * @param sessionId   The session ID
+     * @param eventType   Event type: "start", "pause", "resume", "stop", "error",
+     *                    "interruptionBegin", "interruptionEnd"
+     * @param jsonPayload JSON-encoded event data
+     */
+    public static void onRecorderEvent(int sessionId, String eventType, String jsonPayload) {
+        if (sessionId >= 0 && eventType != null) {
+            NativeBridge.onRecorderEvent(sessionId, eventType, jsonPayload != null ? jsonPayload : "{}");
+        }
+    }
+
+    /**
+     * Callback for recorder frame data.
+     * Called from {@link com.migo.runtime.internal.platform.AudioRecorderManager}.
+     *
+     * @param sessionId   The session ID
+     * @param frameData   Raw audio frame bytes
+     * @param isLastFrame Whether this is the last frame before stop
+     */
+    public static void onRecorderFrameData(int sessionId, byte[] frameData, boolean isLastFrame) {
+        if (sessionId >= 0 && frameData != null) {
+            NativeBridge.onRecorderFrameData(sessionId, frameData, isLastFrame);
+        }
+    }
 }

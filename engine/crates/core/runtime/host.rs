@@ -282,6 +282,22 @@ impl Host {
                 Ok(())
             }
 
+            HostCommand::RecorderEvent {
+                event_type,
+                json_payload,
+            } => {
+                self.js.dispatch_recorder_event(&event_type, &json_payload);
+                Ok(())
+            }
+
+            HostCommand::RecorderFrameData {
+                data,
+                is_last_frame,
+            } => {
+                self.js.dispatch_recorder_frame_data(&data, is_last_frame);
+                Ok(())
+            }
+
             _ => Ok(()),
         }
     }

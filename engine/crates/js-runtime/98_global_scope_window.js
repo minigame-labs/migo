@@ -11,6 +11,7 @@ import * as audio from 'ext:host_v8_audio/01_audio_context.js';
 import * as innerAudio from 'ext:host_v8_audio/02_inner_audio_context.js';
 import * as audioInterruption from 'ext:host_v8_audio/03_audio_interruption.js';
 import * as mediaAudioPlayer from 'ext:host_v8_audio/04_media_audio_player.js';
+import * as recorderManager from 'ext:host_v8_audio/05_recorder_manager.js';
 import * as deviceMotion from 'ext:host_v8_device/01_device_motion.js';
 import * as gyroscope from 'ext:host_v8_device/02_gyroscope.js';
 import * as orientation from 'ext:host_v8_device/03_orientation.js';
@@ -83,6 +84,11 @@ const WindowGlobalScope = {
     // MediaAudioPlayer
     MediaAudioPlayer: core.propNonEnumerable(mediaAudioPlayer.MediaAudioPlayer),
     createMediaAudioPlayer: core.propNonEnumerable(mediaAudioPlayer.createMediaAudioPlayer),
+
+    // RecorderManager
+    getRecorderManager: core.propNonEnumerable(recorderManager.getRecorderManager),
+    _internalOnRecorderEvent: core.propNonEnumerable(recorderManager._internalOnRecorderEvent),
+    _internalOnRecorderFrameData: core.propNonEnumerable(recorderManager._internalOnRecorderFrameData),
 
     // Audio Interruption
     onAudioInterruptionBegin: core.propNonEnumerable(audioInterruption.onAudioInterruptionBegin),

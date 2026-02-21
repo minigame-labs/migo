@@ -230,6 +230,26 @@ public final class NativeBridge {
      */
     public static native void onVsync(int sessionId, long frameTimeNanos);
 
+    // ==================== Recorder Callbacks ====================
+
+    /**
+     * Callback when a recorder event occurs (start, pause, resume, stop, error, interruption).
+     *
+     * @param sessionId   The session ID
+     * @param eventType   Event type string
+     * @param jsonPayload JSON-encoded event data
+     */
+    public static native void onRecorderEvent(int sessionId, String eventType, String jsonPayload);
+
+    /**
+     * Callback when recorder frame data is available.
+     *
+     * @param sessionId   The session ID
+     * @param frameData   Raw audio frame bytes
+     * @param isLastFrame Whether this is the last frame before stop
+     */
+    public static native void onRecorderFrameData(int sessionId, byte[] frameData, boolean isLastFrame);
+
     // ==================== Debug Stats ====================
 
     /**
