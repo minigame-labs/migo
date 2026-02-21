@@ -12,7 +12,7 @@ use crate::audio::ops::{
     op_audio_param_exponential_ramp, op_audio_param_set_target,
     op_audio_param_cancel_scheduled,
     // AudioBuffer data access ops
-    op_audio_create_buffer, op_audio_get_channel_data,
+    op_audio_create_buffer, op_audio_get_channel_data, op_audio_copy_to_channel,
     // Phase 2: OscillatorNode ops
     op_audio_create_oscillator, op_audio_set_oscillator_type,
     op_audio_start_oscillator, op_audio_stop_oscillator,
@@ -83,6 +83,7 @@ extension!(host_v8_audio,
         // AudioBuffer data access ops
         op_audio_create_buffer,
         op_audio_get_channel_data,
+        op_audio_copy_to_channel,
         // Phase 2: OscillatorNode ops
         op_audio_create_oscillator,
         op_audio_set_oscillator_type,

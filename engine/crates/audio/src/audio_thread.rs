@@ -1000,28 +1000,6 @@ fn run_audio_thread(
                     }
                 }
 
-                // ==================== Global Audio Options ====================
-                AudioCmd::SetInnerAudioOption { mix_with_other, obey_mute_switch, speaker_on, resp } => {
-                    // Store settings. Actual platform behavior (Android AudioManager)
-                    // is handled at the platform layer. The audio thread acknowledges.
-                    tracing::debug!(
-                        "SetInnerAudioOption: mix={}, mute_switch={}, speaker={}",
-                        mix_with_other, obey_mute_switch, speaker_on
-                    );
-                    let _ = resp.send(Ok(()));
-                }
-
-                AudioCmd::GetAvailableAudioSources { resp } => {
-                    // Return default audio sources. Platform-specific sources
-                    // (e.g. Bluetooth, USB) require Android AudioManager queries.
-                    let sources = vec![
-                        "auto".to_string(),
-                        "buildInMic".to_string(),
-                        "mic".to_string(),
-                    ];
-                    let _ = resp.send(Ok(sources));
-                }
-
                 // ==================== MediaAudioPlayer ====================
                 AudioCmd::CreateMediaAudioPlayer { id } => {
                     media_players.insert(id, Vec::new());

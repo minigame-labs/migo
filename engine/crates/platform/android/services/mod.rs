@@ -5,8 +5,9 @@
 use std::sync::Arc;
 
 use core::services::{
-    AccelerometerService, BatteryService, ClipboardService, CompassService, DeviceMotionService,
-    DeviceServices, GyroscopeService, NetworkService, ScreenService, VibrationService,
+    AccelerometerService, AudioPlatformService, BatteryService, ClipboardService, CompassService,
+    DeviceMotionService, DeviceServices, GyroscopeService, NetworkService, ScreenService,
+    VibrationService,
 };
 
 use crate::android::jni;
@@ -57,6 +58,10 @@ impl DeviceServices for AndroidDeviceServices {
 
     fn network(&self) -> Option<Arc<dyn NetworkService>> {
         Some(Arc::new(AndroidNetwork { host_id: self.host_id }))
+    }
+
+    fn audio_platform(&self) -> Option<Arc<dyn AudioPlatformService>> {
+        Some(Arc::new(AndroidAudioPlatform { host_id: self.host_id }))
     }
 }
 
@@ -209,5 +214,33 @@ impl NetworkService for AndroidNetwork {
 
     fn get_local_ip_json(&self) -> Result<String, String> {
         jni::get_local_ip_address_json()
+    }
+}
+
+// ==================== Audio Platform ====================
+
+struct AndroidAudioPlatform {
+    host_id: i32,
+}
+
+impl AudioPlatformService for AndroidAudioPlatform {
+    fn set_inner_audio_option(
+        &self,
+        mix_with_other: bool,
+        obey_mute_switch: bool,
+        speaker_on: bool,
+    ) -> Result<(), String> {
+        jni::set_inner_audio_option(self.host_id, mix_with_other, obey_mute_switch, speaker_on)
+    }
+
+    fn get_available_audio_sources(&self) -> Result<Vec<String>, String> {
+        let csv = jni::get_available_audio_sources(self.host_id)?;
+        // Parse comma-separated list: "auto,mic,camcorder,voice_recognition,voice_communication"
+        let sources: Vec<String> = csv
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        Ok(sources)
     }
 }

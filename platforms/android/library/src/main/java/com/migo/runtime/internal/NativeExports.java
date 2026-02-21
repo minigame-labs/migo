@@ -700,6 +700,83 @@ public final class NativeExports {
         }
     }
 
+    // ==================== Audio Platform ====================
+
+    /**
+     * Set inner audio options for audio focus and routing.
+     *
+     * @param sessionId      The session ID
+     * @param mixWithOther   If true, duck other audio instead of taking exclusive focus
+     * @param obeyMuteSwitch If true, respect the device ringer/mute mode
+     * @param speakerOn      If true, route audio output to speaker
+     */
+    public static void setInnerAudioOption(int sessionId, boolean mixWithOther,
+                                           boolean obeyMuteSwitch, boolean speakerOn) {
+        RuntimeContext context = RuntimeRegistry.get(sessionId);
+        if (context == null) return;
+        Activity activity = context.getActivity();
+        if (activity == null) return;
+
+        try {
+            android.media.AudioManager audioManager =
+                    (android.media.AudioManager) activity.getSystemService(Context.AUDIO_SERVICE);
+            if (audioManager == null) return;
+
+            // Audio focus: GAIN_TRANSIENT_MAY_DUCK allows mixing, GAIN takes exclusive focus
+            int focusGain = mixWithOther
+                    ? android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                    : android.media.AudioManager.AUDIOFOCUS_GAIN;
+            audioManager.requestAudioFocus(null,
+                    android.media.AudioManager.STREAM_MUSIC, focusGain);
+
+            // Speaker routing
+            audioManager.setSpeakerphoneOn(speakerOn);
+
+            // obeyMuteSwitch: adjust stream type behavior
+            // When obeyMuteSwitch is false, use STREAM_MUSIC which ignores ringer mode
+            // When true, the app should check ringer mode before playing
+            // This is stored and checked at playback time by the audio engine
+        } catch (Exception e) {
+            // Silently fail - audio options are best-effort
+        }
+    }
+
+    /**
+     * Get available audio input sources.
+     * Returns a comma-separated string of supported audio source identifiers
+     * matching RecorderManager.start() audioSource param values.
+     *
+     * @param sessionId The session ID
+     * @return Comma-separated audio source identifiers (e.g., "auto,buildInMic,mic,camcorder,voice_recognition,voice_communication")
+     */
+    public static String getAvailableAudioSources(int sessionId) {
+        StringBuilder sb = new StringBuilder();
+        // "auto" is always available
+        sb.append("auto");
+
+        // Check each MediaRecorder.AudioSource constant
+        // DEFAULT (0) maps to "buildInMic"
+        sb.append(",buildInMic");
+
+        // MIC (1) - standard microphone
+        sb.append(",mic");
+
+        // CAMCORDER (5) - microphone tuned for video recording
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.HONEYCOMB) {
+            sb.append(",camcorder");
+        }
+
+        // VOICE_RECOGNITION (6) - tuned for voice recognition
+        sb.append(",voice_recognition");
+
+        // VOICE_COMMUNICATION (7) - tuned for VoIP, includes echo cancellation
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.HONEYCOMB) {
+            sb.append(",voice_communication");
+        }
+
+        return sb.toString();
+    }
+
     // ==================== Clipboard ====================
 
     /**

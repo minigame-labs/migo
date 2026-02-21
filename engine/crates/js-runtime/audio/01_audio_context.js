@@ -102,7 +102,7 @@ class BaseAudioContext {
         channelData.push(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4));
       }
 
-      const buffer = new AudioBuffer(info.id, info, channelData);
+      const buffer = new AudioBuffer(info.id, this.#nativeId, info, channelData);
       BUFFER_REGISTRY.set(info.id, buffer);
 
       if (successCallback) {
@@ -126,7 +126,7 @@ class BaseAudioContext {
       sampleRate
     );
     // createBuffer: zero-filled arrays allocated on JS side (channelData = null)
-    const buffer = new AudioBuffer(info.id, info);
+    const buffer = new AudioBuffer(info.id, this.#nativeId, info);
     BUFFER_REGISTRY.set(info.id, buffer);
     return buffer;
   }

@@ -868,6 +868,41 @@ pub async fn op_audio_get_channel_data(
     Ok(bytes)
 }
 
+/// Copy data to a buffer channel (sync write to native buffer)
+#[op2(async(lazy))]
+pub async fn op_audio_copy_to_channel(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] buffer_id: AudioBufferId,
+    #[buffer] data_bytes: JsBuffer,
+    #[smi] channel: u32,
+    #[smi] start: u32,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    // Convert raw bytes to Vec<f32>
+    let data: Vec<f32> = data_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+
+    tx.send(AudioCmd::CopyToChannel {
+        ctx_id,
+        buffer_id,
+        data,
+        channel,
+        start,
+        resp: resp_tx,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)
+}
+
 // ============================================================================
 // Frequency Response & Analysis
 // ============================================================================
@@ -966,47 +1001,44 @@ pub async fn op_audio_analyser_float_frequency(
 // Global Audio Options
 // ============================================================================
 
-/// Set inner audio options (mixWithOther, obeyMuteSwitch, speakerOn)
-#[op2(async(lazy), fast)]
-pub async fn op_audio_set_inner_audio_option(
-    state: Rc<RefCell<OpState>>,
+/// Set inner audio options via platform AudioManager.
+/// Routes through DeviceServices for platform-specific audio configuration:
+/// - mixWithOther: Android audio focus behavior (duck vs abandon)
+/// - obeyMuteSwitch: Respect device ringer/mute mode
+/// - speakerOn: Route audio output to speaker
+#[op2(fast)]
+pub fn op_audio_set_inner_audio_option(
+    state: &mut OpState,
     mix_with_other: bool,
     obey_mute_switch: bool,
     speaker_on: bool,
 ) -> Result<(), AudioError> {
-    let tx = get_audio_tx(state);
-    let (resp_tx, resp_rx) = oneshot::channel();
-
-    tx.send(AudioCmd::SetInnerAudioOption {
-        mix_with_other,
-        obey_mute_switch,
-        speaker_on,
-        resp: resp_tx,
-    })
-    .map_err(|_| audio_err("Audio thread disconnected"))?;
-
-    resp_rx
-        .await
-        .map_err(|_| audio_err("Response channel closed"))?
-        .map_err(AudioError::from)
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(audio) = services.audio_platform() {
+            return audio
+                .set_inner_audio_option(mix_with_other, obey_mute_switch, speaker_on)
+                .map_err(AudioError::from);
+        }
+    }
+    Err(audio_err("setInnerAudioOption:fail not supported"))
 }
 
-/// Get available audio sources
-#[op2(async(lazy), fast)]
+/// Get available audio input sources from platform.
+/// Queries Android AudioManager/MediaRecorder for supported audio sources.
+/// Returns source identifiers matching RecorderManager.start() audioSource param.
+#[op2]
 #[serde]
-pub async fn op_audio_get_available_audio_sources(
-    state: Rc<RefCell<OpState>>,
+pub fn op_audio_get_available_audio_sources(
+    state: &mut OpState,
 ) -> Result<Vec<String>, AudioError> {
-    let tx = get_audio_tx(state);
-    let (resp_tx, resp_rx) = oneshot::channel();
-
-    tx.send(AudioCmd::GetAvailableAudioSources { resp: resp_tx })
-        .map_err(|_| audio_err("Audio thread disconnected"))?;
-
-    resp_rx
-        .await
-        .map_err(|_| audio_err("Response channel closed"))?
-        .map_err(AudioError::from)
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(audio) = services.audio_platform() {
+            return audio.get_available_audio_sources().map_err(AudioError::from);
+        }
+    }
+    Err(audio_err("getAvailableAudioSources:fail not supported"))
 }
 
 // ============================================================================

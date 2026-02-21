@@ -4,8 +4,11 @@
 // or zero-filled (for createBuffer). This allows getChannelData() to be
 // synchronous as required by the Web Audio API spec.
 
+import { op_audio_copy_to_channel } from "ext:core/ops";
+
 class AudioBuffer {
   #id;
+  #ctxId;
   #duration;
   #sampleRate;
   #numberOfChannels;
@@ -14,11 +17,13 @@ class AudioBuffer {
 
   /**
    * @param {number} id - Native buffer ID
+   * @param {number} ctxId - Native AudioContext ID
    * @param {object} info - { duration, sample_rate, channels, length }
    * @param {Float32Array[]|null} channelData - Pre-fetched channel data arrays, or null to zero-fill
    */
-  constructor(id, info, channelData = null) {
+  constructor(id, ctxId, info, channelData = null) {
     this.#id = id;
+    this.#ctxId = ctxId;
     this.#duration = info.duration;
     this.#sampleRate = info.sample_rate;
     this.#numberOfChannels = info.channels;
@@ -81,6 +86,12 @@ class AudioBuffer {
     const len = Math.min(source.length, data.length - startInChannel);
     if (len > 0) {
       data.set(source.subarray(0, len), startInChannel);
+      // Sync to native buffer (fire-and-forget async)
+      const slice = new Float32Array(data.buffer, data.byteOffset + startInChannel * 4, len);
+      op_audio_copy_to_channel(
+        this.#ctxId, this.#id, new Uint8Array(slice.buffer, slice.byteOffset, slice.byteLength),
+        channelNumber, startInChannel
+      );
     }
   }
 }

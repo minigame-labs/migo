@@ -90,7 +90,7 @@ class InnerAudioContext {
   #paused = true;
   #buffered = false;
 
-  // Event listener arrays (multi-listener support per wx API)
+  // Event listener arrays (multi-listener support)
   #listeners = {
     canplay: [],
     play: [],
@@ -156,6 +156,9 @@ class InnerAudioContext {
         break;
       case "timeUpdate":
         this.#fireListeners("timeUpdate");
+        break;
+      case "waiting":
+        this.#fireListeners("waiting");
         break;
       case "error":
         this.#fireListeners("error", { errCode: 10001, errMsg: "Playback error" });
@@ -465,31 +468,29 @@ function setInnerAudioOption(options = {}) {
     complete,
   } = options;
 
-  op_audio_set_inner_audio_option(mixWithOther, obeyMuteSwitch, speakerOn)
-    .then(() => {
-      if (success) success();
-      if (complete) complete();
-    })
-    .catch((err) => {
-      const errObj = { errMsg: err.message || String(err) };
-      if (fail) fail(errObj);
-      if (complete) complete();
-    });
+  try {
+    op_audio_set_inner_audio_option(mixWithOther, obeyMuteSwitch, speakerOn);
+    if (success) success();
+  } catch (err) {
+    const errObj = { errMsg: err.message || String(err) };
+    if (fail) fail(errObj);
+  } finally {
+    if (complete) complete();
+  }
 }
 
 function getAvailableAudioSources(options = {}) {
   const { success, fail, complete } = options;
 
-  op_audio_get_available_audio_sources()
-    .then((sources) => {
-      if (success) success({ audioSources: sources });
-      if (complete) complete();
-    })
-    .catch((err) => {
-      const errObj = { errMsg: err.message || String(err) };
-      if (fail) fail(errObj);
-      if (complete) complete();
-    });
+  try {
+    const sources = op_audio_get_available_audio_sources();
+    if (success) success({ audioSources: sources });
+  } catch (err) {
+    const errObj = { errMsg: err.message || String(err) };
+    if (fail) fail(errObj);
+  } finally {
+    if (complete) complete();
+  }
 }
 
 export {

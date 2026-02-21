@@ -242,6 +242,8 @@ pub enum InnerAudioEventType {
     Seeked,
     /// Current playback time has updated (periodic).
     TimeUpdate,
+    /// Playback is waiting for more data (streaming buffer underrun).
+    Waiting,
     /// An error occurred during playback.
     Error,
 }
@@ -267,6 +269,7 @@ impl InnerAudioEventType {
             InnerAudioEventType::Seeking => "seeking",
             InnerAudioEventType::Seeked => "seeked",
             InnerAudioEventType::TimeUpdate => "timeUpdate",
+            InnerAudioEventType::Waiting => "waiting",
             InnerAudioEventType::Error => "error",
         }
     }

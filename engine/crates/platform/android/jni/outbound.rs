@@ -520,6 +520,47 @@ pub fn get_local_ip_address_json() -> Result<String, String> {
     )
 }
 
+// ==================== Audio Platform ====================
+
+/// Set inner audio options: mixWithOther, obeyMuteSwitch, speakerOn.
+/// Calls Java: NativeExports.setInnerAudioOption(hostId, mixWithOther, obeyMuteSwitch, speakerOn)
+pub fn set_inner_audio_option(
+    host_id: i32,
+    mix_with_other: bool,
+    obey_mute_switch: bool,
+    speaker_on: bool,
+) -> Result<(), String> {
+    call_static_method(
+        "setInnerAudioOption",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[
+            jvalue { i: host_id },
+            jvalue { z: mix_with_other as u8 },
+            jvalue { z: obey_mute_switch as u8 },
+            jvalue { z: speaker_on as u8 },
+        ],
+    )
+}
+
+/// Get available audio input sources as JSON array string.
+/// Calls Java: NativeExports.getAvailableAudioSources(hostId) -> String (JSON array)
+pub fn get_available_audio_sources(host_id: i32) -> Result<String, String> {
+    call_static_method(
+        "getAvailableAudioSources",
+        ReturnType::Object,
+        |env, result| {
+            let jstring = result.l().map_err(|_| "Null string from Java")?;
+            let json_str = env
+                .get_string(&jni::objects::JString::from(jstring))
+                .map_err(|e| format!("Failed to convert audio sources string: {}", e))?
+                .into();
+            Ok(json_str)
+        },
+        &[jvalue { i: host_id }],
+    )
+}
+
 // ==================== Clipboard ====================
 
 pub fn set_clipboard_data(host_id: i32, data: &str) -> Result<(), String> {

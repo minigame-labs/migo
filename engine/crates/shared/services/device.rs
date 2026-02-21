@@ -107,6 +107,43 @@ pub trait AccelerometerService: Send + Sync {
     }
 }
 
+// ==================== Audio Platform ====================
+
+/// Audio platform service for device-level audio configuration.
+///
+/// Handles operations that require platform AudioManager access,
+/// such as audio focus, speaker routing, and input source queries.
+pub trait AudioPlatformService: Send + Sync {
+    /// Configure inner audio behavior.
+    ///
+    /// - `mix_with_other`: Allow mixing with other audio apps (Android: abandon focus vs duck)
+    /// - `obey_mute_switch`: Respect device mute/ringer mode
+    /// - `speaker_on`: Route audio to speaker (vs earpiece/headset)
+    fn set_inner_audio_option(
+        &self,
+        _mix_with_other: bool,
+        _obey_mute_switch: bool,
+        _speaker_on: bool,
+    ) -> Result<(), String> {
+        Err("setInnerAudioOption:fail not supported".to_string())
+    }
+
+    /// Get available audio input sources.
+    ///
+    /// Returns source identifiers matching `RecorderManager.start()` audioSource param.
+    /// Maps to Android `MediaRecorder.AudioSource` constants:
+    /// - "auto" (DEFAULT=0)
+    /// - "buildInMic" (built-in microphone)
+    /// - "headsetMic" (headset microphone, if connected)
+    /// - "mic" (MIC=1)
+    /// - "camcorder" (CAMCORDER=5)
+    /// - "voice_recognition" (VOICE_RECOGNITION=6)
+    /// - "voice_communication" (VOICE_COMMUNICATION=7)
+    fn get_available_audio_sources(&self) -> Result<Vec<String>, String> {
+        Err("getAvailableAudioSources:fail not supported".to_string())
+    }
+}
+
 // ==================== Aggregated Device Services ====================
 
 /// Aggregated device services provided by a platform.
@@ -138,6 +175,9 @@ pub trait DeviceServices: Send + Sync {
         None
     }
     fn network(&self) -> Option<Arc<dyn NetworkService>> {
+        None
+    }
+    fn audio_platform(&self) -> Option<Arc<dyn AudioPlatformService>> {
         None
     }
 }

@@ -481,20 +481,6 @@ pub enum AudioCmd {
         resp: AudioResp<()>,
     },
 
-    // ==================== Global Audio Options ====================
-    /// Set inner audio options (mixWithOther, obeyMuteSwitch, speakerOn)
-    SetInnerAudioOption {
-        mix_with_other: bool,
-        obey_mute_switch: bool,
-        speaker_on: bool,
-        resp: AudioResp<()>,
-    },
-
-    /// Get available audio sources
-    GetAvailableAudioSources {
-        resp: AudioResp<Vec<String>>,
-    },
-
     // ==================== MediaAudioPlayer ====================
     /// Create a MediaAudioPlayer
     CreateMediaAudioPlayer {

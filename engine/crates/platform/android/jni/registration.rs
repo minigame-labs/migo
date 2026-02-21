@@ -192,6 +192,9 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         // Clipboard
         ("setClipboardData", "(ILjava/lang/String;)I"),
         ("getClipboardData", "(I)Ljava/lang/String;"),
+        // Audio platform
+        ("setInnerAudioOption", "(IZZZ)V"),
+        ("getAvailableAudioSources", "(I)Ljava/lang/String;"),
     ];
 
     let global_class = env

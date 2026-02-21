@@ -705,7 +705,7 @@ impl InnerAudioPlayer {
                     let final_frame = total_frames.saturating_sub(1);
                     self.position = final_frame * channels;
                     self.shared.set_position_frames(final_frame as u64);
-                    // TODO: could emit Waiting event here
+                    self.push_event(InnerAudioEventType::Waiting);
                     return true; // Still playing, waiting for data
                 }
 
