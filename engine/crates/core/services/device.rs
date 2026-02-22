@@ -3,6 +3,6 @@
 //! See [`shared::services`] for the actual trait definitions.
 
 pub use shared::services::{
-    AccelerometerService, BatteryService, ClipboardService, CompassService, DeviceMotionService,
+    AccelerometerService, AudioPlatformService, RecorderService, BatteryService, ClipboardService, CompassService, DeviceMotionService,
     DeviceServices, GyroscopeService, NetworkService, ScreenService, VibrationService,
 };
