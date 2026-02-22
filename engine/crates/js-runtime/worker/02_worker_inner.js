@@ -1,10 +1,6 @@
-import { core } from "ext:core/mod.js";
-
-const {
-    op_worker_inner_post_message,
+import { op_worker_inner_post_message,
     op_worker_inner_recv_message,
-    op_worker_get_camera_frame_data,
-} = core.ops;
+    op_worker_get_camera_frame_data } from "ext:core/ops";
 
 const messageListeners = [];
 const errorListeners = [];

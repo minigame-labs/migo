@@ -1,15 +1,10 @@
-import { core } from "ext:core/mod.js";
-
-const {
-    op_worker_create,
+import { op_worker_create,
     op_worker_post_message,
     op_worker_recv_message,
     op_worker_recv_error,
-    op_worker_terminate,
-} = core.ops;
+    op_worker_terminate } from "ext:core/ops";
 
 let currentWorker = null;
-
 class WorkerInstance {
     #messageListeners = [];
     #errorListeners = [];
