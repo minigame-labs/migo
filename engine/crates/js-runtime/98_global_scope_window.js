@@ -22,6 +22,7 @@ import * as clipboard from 'ext:host_v8_device/07_clipboard.js';
 import * as vibrate from 'ext:host_v8_device/08_vibrate.js';
 import * as screen from 'ext:host_v8_device/09_screen.js';
 import * as network from 'ext:host_v8_device/10_network.js';
+import * as workerApi from 'ext:host_v8_worker/01_worker.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -161,6 +162,9 @@ const WindowGlobalScope = {
     _internalTriggerNetworkStatusChange: core.propNonEnumerable(network._internalTriggerNetworkStatusChange),
     getNetworkType: core.propNonEnumerable(network.getNetworkType),
     getLocalIPAddress: core.propNonEnumerable(network.getLocalIPAddress),
+
+    // Worker
+    createWorker: core.propNonEnumerable(workerApi.createWorker),
 };
 
 export { WindowGlobalScope };

@@ -100,6 +100,7 @@ mod rendering;
 mod url;
 mod utility;
 mod web;
+pub(crate) mod worker;
 
 mod host_runtime;
 mod js_bindings;
@@ -115,6 +116,16 @@ deno_core::extension!(
         "98_global_scope_shared.js",
         "98_global_scope_window.js",
         "99_main.js",
+    ],
+);
+
+deno_core::extension!(
+    worker_runtime,
+    esm_entry_point = "ext:worker_runtime/99_worker_main.js",
+    esm = [
+        dir "",
+        "98_global_scope_shared.js",
+        "99_worker_main.js",
     ],
 );
 
@@ -161,6 +172,7 @@ pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
         .chain(url::url_extensions())
         .chain(network::network_extensions())
         .chain(audio::audio_extensions())
+        .chain(worker::worker_extensions())
         .chain(runtime_extensions)
         .collect()
 }
