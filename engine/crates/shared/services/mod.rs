@@ -9,10 +9,12 @@
 //! - `Err("vibrateShort:fail not supported")` - Feature not supported
 //! - `Err("vibrateShort:fail system error")` - Runtime error
 
+mod camera;
 mod clipboard;
 mod device;
 mod network;
 
+pub use camera::CameraService;
 pub use clipboard::ClipboardService;
 pub use device::{
     AccelerometerService, AudioPlatformService, BatteryService, CompassService,
