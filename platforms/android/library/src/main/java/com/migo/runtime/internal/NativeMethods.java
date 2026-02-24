@@ -370,6 +370,40 @@ public final class NativeMethods {
         }
     }
 
+    // ==================== Camera Callbacks ====================
+
+    /**
+     * Callback for camera events.
+     * Called from {@link com.migo.runtime.internal.platform.CameraManager}.
+     *
+     * @param sessionId   The session ID
+     * @param cameraId    The camera instance ID
+     * @param eventType   Event type: "stop", "error", "authCancel", "timeoutCallback"
+     * @param jsonPayload JSON-encoded event data
+     */
+    public static void onCameraEvent(int sessionId, int cameraId, String eventType, String jsonPayload) {
+        if (sessionId >= 0 && eventType != null) {
+            NativeBridge.onCameraEvent(sessionId, cameraId, eventType,
+                    jsonPayload != null ? jsonPayload : "{}");
+        }
+    }
+
+    /**
+     * Callback for camera frame data.
+     * Called from {@link com.migo.runtime.internal.platform.CameraManager}.
+     *
+     * @param sessionId The session ID
+     * @param cameraId  The camera instance ID
+     * @param frameData Raw frame bytes
+     * @param width     Frame width in pixels
+     * @param height    Frame height in pixels
+     */
+    public static void onCameraFrameData(int sessionId, int cameraId, byte[] frameData, int width, int height) {
+        if (sessionId >= 0 && frameData != null && width > 0 && height > 0) {
+            NativeBridge.onCameraFrameData(sessionId, cameraId, frameData, width, height);
+        }
+    }
+
     // ==================== Recorder Callbacks ====================
 
     /**

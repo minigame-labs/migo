@@ -18,6 +18,7 @@ import com.migo.runtime.internal.platform.ScreenBrightness;
 import com.migo.runtime.internal.platform.SystemSettings;
 import com.migo.runtime.internal.platform.Vibrator;
 import com.migo.runtime.internal.platform.AudioRecorderManager;
+import com.migo.runtime.internal.platform.CameraManager;
 
 import java.io.File;
 import java.nio.ByteBuffer;
@@ -893,6 +894,184 @@ public final class NativeExports {
         AudioRecorderManager mgr = sRecorderManagers.remove(sessionId);
         if (mgr != null) {
             mgr.destroy();
+        }
+    }
+
+    // ==================== Camera ====================
+
+    /** Per-session camera managers, keyed by "sessionId:cameraId". */
+    private static final ConcurrentHashMap<String, CameraManager> sCameraManagers =
+            new ConcurrentHashMap<>();
+
+    private static String cameraKey(int sessionId, int cameraId) {
+        return sessionId + ":" + cameraId;
+    }
+
+    /**
+     * Create a camera instance.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with keys: cameraId, pos, flash, size
+     * @return JSON result: {"cameraId": <id>} or error JSON
+     */
+    public static String cameraCreate(int sessionId, String optionsJson) {
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) {
+            return "{\"_error\":{\"errMsg\":\"createCamera:fail no context\"}}";
+        }
+        Activity activity = ctx.getActivity();
+        if (activity == null) {
+            return "{\"_error\":{\"errMsg\":\"createCamera:fail no activity\"}}";
+        }
+
+        // Extract cameraId from options
+        int cameraId = 0;
+        try {
+            org.json.JSONObject opts = new org.json.JSONObject(optionsJson);
+            cameraId = opts.optInt("cameraId", 0);
+        } catch (Exception ignored) {}
+
+        String key = cameraKey(sessionId, cameraId);
+        CameraManager existing = sCameraManagers.get(key);
+        if (existing != null) {
+            existing.destroy();
+            sCameraManagers.remove(key);
+        }
+
+        CameraManager mgr = new CameraManager(sessionId, cameraId, activity);
+        String result = mgr.create(optionsJson);
+        sCameraManagers.put(key, mgr);
+        return result;
+    }
+
+    /**
+     * Destroy a camera instance.
+     *
+     * @param sessionId The session ID
+     * @param cameraId  The camera instance ID
+     */
+    public static void cameraDestroy(int sessionId, int cameraId) {
+        String key = cameraKey(sessionId, cameraId);
+        CameraManager mgr = sCameraManagers.remove(key);
+        if (mgr != null) {
+            mgr.destroy();
+        }
+    }
+
+    /**
+     * Take a photo with the camera.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with keys: cameraId, quality
+     * @return JSON result or error JSON
+     */
+    public static String cameraTakePhoto(int sessionId, String optionsJson) {
+        int cameraId = extractCameraId(optionsJson);
+        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        if (mgr == null) {
+            return "{\"_error\":{\"errMsg\":\"camera.takePhoto:fail camera not found\"}}";
+        }
+        return mgr.takePhoto(optionsJson);
+    }
+
+    /**
+     * Start video recording.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with keys: cameraId, timeout
+     * @return JSON result or error JSON
+     */
+    public static String cameraStartRecord(int sessionId, String optionsJson) {
+        int cameraId = extractCameraId(optionsJson);
+        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        if (mgr == null) {
+            return "{\"_error\":{\"errMsg\":\"camera.startRecord:fail camera not found\"}}";
+        }
+        return mgr.startRecord(optionsJson);
+    }
+
+    /**
+     * Stop video recording.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with keys: cameraId, compressed
+     * @return JSON result or error JSON
+     */
+    public static String cameraStopRecord(int sessionId, String optionsJson) {
+        int cameraId = extractCameraId(optionsJson);
+        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        if (mgr == null) {
+            return "{\"_error\":{\"errMsg\":\"camera.stopRecord:fail camera not found\"}}";
+        }
+        return mgr.stopRecord(optionsJson);
+    }
+
+    /**
+     * Set camera zoom level.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with keys: cameraId, zoom
+     * @return JSON result or error JSON
+     */
+    public static String cameraSetZoom(int sessionId, String optionsJson) {
+        int cameraId = extractCameraId(optionsJson);
+        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        if (mgr == null) {
+            return "{\"_error\":{\"errMsg\":\"camera.setZoom:fail camera not found\"}}";
+        }
+        return mgr.setZoom(optionsJson);
+    }
+
+    /**
+     * Start listening for camera frame changes.
+     *
+     * @param sessionId The session ID
+     * @param cameraId  The camera instance ID
+     */
+    public static void cameraListenFrameChange(int sessionId, int cameraId) {
+        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        if (mgr != null) {
+            mgr.listenFrameChange();
+        }
+    }
+
+    /**
+     * Stop listening for camera frame changes.
+     *
+     * @param sessionId The session ID
+     * @param cameraId  The camera instance ID
+     */
+    public static void cameraCloseFrameChange(int sessionId, int cameraId) {
+        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        if (mgr != null) {
+            mgr.closeFrameChange();
+        }
+    }
+
+    /**
+     * Clean up all camera resources for a session. Call on session shutdown.
+     *
+     * @param sessionId The session ID
+     */
+    public static void destroyCameraManagers(int sessionId) {
+        String prefix = sessionId + ":";
+        for (String key : sCameraManagers.keySet()) {
+            if (key.startsWith(prefix)) {
+                CameraManager mgr = sCameraManagers.remove(key);
+                if (mgr != null) {
+                    mgr.destroy();
+                }
+            }
+        }
+    }
+
+    private static int extractCameraId(String optionsJson) {
+        if (optionsJson == null) return 0;
+        try {
+            org.json.JSONObject opts = new org.json.JSONObject(optionsJson);
+            return opts.optInt("cameraId", 0);
+        } catch (Exception e) {
+            return 0;
         }
     }
 }

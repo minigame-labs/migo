@@ -12,6 +12,9 @@ pub(crate) struct JsBindings {
     // Recorder event functions
     recorder_event_fn: Option<v8::Global<v8::Function>>,
     recorder_frame_fn: Option<v8::Global<v8::Function>>,
+    // Camera event functions
+    camera_event_fn: Option<v8::Global<v8::Function>>,
+    camera_frame_fn: Option<v8::Global<v8::Function>>,
     // Sensor event functions (cached for high-frequency dispatch without JS parsing)
     sensor_device_motion_fn: Option<v8::Global<v8::Function>>,
     sensor_gyroscope_fn: Option<v8::Global<v8::Function>>,
@@ -31,6 +34,8 @@ impl JsBindings {
             enqueue_inner_audio_event_fn: None,
             recorder_event_fn: None,
             recorder_frame_fn: None,
+            camera_event_fn: None,
+            camera_frame_fn: None,
             sensor_device_motion_fn: None,
             sensor_gyroscope_fn: None,
             sensor_accelerometer_fn: None,
@@ -58,6 +63,7 @@ impl JsBindings {
         let (
             enqueue_touch, enqueue_audio,
             rec_event, rec_frame,
+            cam_event, cam_frame,
             dev_motion, gyro, accel, compass, orientation, network,
         ) = self.with_main_context(rt, |scope, _ctx, global| {
             (
@@ -65,6 +71,8 @@ impl JsBindings {
                 get_global_fn(scope, global, "_internalEnqueueInnerAudioEvent"),
                 get_global_fn(scope, global, "_internalOnRecorderEvent"),
                 get_global_fn(scope, global, "_internalOnRecorderFrameData"),
+                get_global_fn(scope, global, "_internalOnCameraEvent"),
+                get_global_fn(scope, global, "_internalOnCameraFrameData"),
                 get_global_fn(scope, global, "_internalTriggerDeviceMotionChange"),
                 get_global_fn(scope, global, "_internalTriggerGyroscopeChange"),
                 get_global_fn(scope, global, "_internalTriggerAccelerometerChange"),
@@ -78,6 +86,8 @@ impl JsBindings {
         self.enqueue_inner_audio_event_fn = enqueue_audio;
         self.recorder_event_fn = rec_event;
         self.recorder_frame_fn = rec_frame;
+        self.camera_event_fn = cam_event;
+        self.camera_frame_fn = cam_frame;
         self.sensor_device_motion_fn = dev_motion;
         self.sensor_gyroscope_fn = gyro;
         self.sensor_accelerometer_fn = accel;
@@ -327,6 +337,74 @@ impl JsBindings {
             let args = [
                 ab.into(),
                 v8::Boolean::new(scope, is_last_frame).into(),
+            ];
+            let func = v8::Local::new(scope, func_g);
+            let _ = func.call(scope, global.into(), &args);
+        });
+    }
+
+    // ---- Camera event dispatch ----
+
+    /// Dispatch camera event (stop, authCancel, error, timeoutCallback).
+    pub(crate) fn dispatch_camera_event(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        host_id: i32,
+        camera_id: u32,
+        event_type: &str,
+        json_payload: &str,
+    ) {
+        let Some(func_g) = self.camera_event_fn.as_ref() else {
+            warn!("[Host {}] camera event handler not installed", host_id);
+            return;
+        };
+
+        self.with_main_context(rt, |scope, _ctx, global| {
+            let args = [
+                v8::Integer::new(scope, camera_id as i32).into(),
+                v8::String::new(scope, event_type).unwrap().into(),
+                v8::String::new(scope, json_payload).unwrap().into(),
+            ];
+            let func = v8::Local::new(scope, func_g);
+            let _ = func.call(scope, global.into(), &args);
+        });
+    }
+
+    /// Dispatch camera frame data (RGBA pixel buffer for onCameraFrame / listenFrameChange).
+    pub(crate) fn dispatch_camera_frame_data(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        host_id: i32,
+        camera_id: u32,
+        data: &[u8],
+        width: u32,
+        height: u32,
+    ) {
+        let Some(func_g) = self.camera_frame_fn.as_ref() else {
+            warn!("[Host {}] camera frame handler not installed", host_id);
+            return;
+        };
+
+        self.with_main_context(rt, |scope, _ctx, global| {
+            let ab = v8::ArrayBuffer::new(scope, data.len());
+            if !data.is_empty() {
+                let backing = ab.get_backing_store();
+                if let Some(ptr) = backing.data() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            ptr.as_ptr() as *mut u8,
+                            data.len(),
+                        );
+                    }
+                }
+            }
+
+            let args = [
+                v8::Integer::new(scope, camera_id as i32).into(),
+                ab.into(),
+                v8::Integer::new(scope, width as i32).into(),
+                v8::Integer::new(scope, height as i32).into(),
             ];
             let func = v8::Local::new(scope, func_g);
             let _ = func.call(scope, global.into(), &args);

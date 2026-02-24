@@ -232,6 +232,28 @@ pub enum HostCommand {
         /// Whether this is the last frame before stop.
         is_last_frame: bool,
     },
+
+    /// Camera event pushed from platform (stop, authCancel, error, timeoutCallback).
+    CameraEvent {
+        /// JS-assigned camera instance ID.
+        camera_id: u32,
+        /// Event type string (e.g., "stop", "authCancel", "error", "timeoutCallback").
+        event_type: String,
+        /// JSON-encoded payload.
+        json_payload: String,
+    },
+
+    /// Camera frame data pushed from platform (for onCameraFrame / listenFrameChange).
+    CameraFrameData {
+        /// JS-assigned camera instance ID.
+        camera_id: u32,
+        /// Raw pixel data (RGBA).
+        data: Vec<u8>,
+        /// Frame width in pixels.
+        width: u32,
+        /// Frame height in pixels.
+        height: u32,
+    },
 }
 
 /// Event types for InnerAudioContext.

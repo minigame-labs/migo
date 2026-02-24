@@ -250,6 +250,29 @@ public final class NativeBridge {
      */
     public static native void onRecorderFrameData(int sessionId, byte[] frameData, boolean isLastFrame);
 
+    // ==================== Camera Callbacks ====================
+
+    /**
+     * Callback when a camera event occurs (stop, error, authCancel, timeoutCallback).
+     *
+     * @param sessionId   The session ID
+     * @param cameraId    The camera instance ID
+     * @param eventType   Event type string
+     * @param jsonPayload JSON-encoded event data
+     */
+    public static native void onCameraEvent(int sessionId, int cameraId, String eventType, String jsonPayload);
+
+    /**
+     * Callback when camera frame data is available.
+     *
+     * @param sessionId The session ID
+     * @param cameraId  The camera instance ID
+     * @param frameData Raw frame bytes (YUV_420_888)
+     * @param width     Frame width in pixels
+     * @param height    Frame height in pixels
+     */
+    public static native void onCameraFrameData(int sessionId, int cameraId, byte[] frameData, int width, int height);
+
     // ==================== Debug Stats ====================
 
     /**

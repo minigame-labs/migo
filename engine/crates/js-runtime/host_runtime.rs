@@ -146,6 +146,16 @@ impl HostJsRuntime {
         self.bindings.dispatch_recorder_frame_data(&mut self.rt, self.host_id, data, is_last_frame);
     }
 
+    // ---- Camera event dispatch ----
+
+    pub fn dispatch_camera_event(&mut self, camera_id: u32, event_type: &str, json_payload: &str) {
+        self.bindings.dispatch_camera_event(&mut self.rt, self.host_id, camera_id, event_type, json_payload);
+    }
+
+    pub fn dispatch_camera_frame_data(&mut self, camera_id: u32, data: &[u8], width: u32, height: u32) {
+        self.bindings.dispatch_camera_frame_data(&mut self.rt, self.host_id, camera_id, data, width, height);
+    }
+
     // ---- Scripts / modules ----
 
     /// Execute a script without pumping the event loop.

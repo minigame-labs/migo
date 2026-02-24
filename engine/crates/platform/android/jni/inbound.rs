@@ -585,6 +585,64 @@ pub(crate) extern "system" fn onRecorderFrameData(
     );
 }
 
+// ==================== Camera ====================
+
+pub(crate) extern "system" fn onCameraEvent<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    camera_id: jint,
+    event_type: JString<'local>,
+    json_payload: JString<'local>,
+) {
+    let evt = env
+        .get_string(&event_type)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let payload = env
+        .get_string(&json_payload)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "{}".to_string());
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::CameraEvent {
+            camera_id: camera_id as u32,
+            event_type: evt,
+            json_payload: payload,
+        },
+    );
+}
+
+pub(crate) extern "system" fn onCameraFrameData(
+    env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    camera_id: jint,
+    frame_data: jni::sys::jbyteArray,
+    width: jint,
+    height: jint,
+) {
+    let data = match env
+        .convert_byte_array(unsafe { jni::objects::JByteArray::from_raw(frame_data) })
+    {
+        Ok(v) => v,
+        Err(e) => {
+            error!("onCameraFrameData: failed to read byte array: {:?}", e);
+            return;
+        }
+    };
+
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::CameraFrameData {
+            camera_id: camera_id as u32,
+            data,
+            width: width as u32,
+            height: height as u32,
+        },
+    );
+}
+
 // ==================== VSync (Choreographer) ====================
 
 pub(crate) extern "system" fn onVsync(

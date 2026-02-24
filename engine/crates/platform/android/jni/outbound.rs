@@ -662,3 +662,112 @@ pub fn get_clipboard_data(host_id: i32) -> Result<String, String> {
         &[jvalue { i: host_id }],
     )
 }
+
+// ==================== Camera ====================
+
+/// Call a Java camera method that takes (hostId, optionsJson) and returns a JSON string.
+fn call_camera_json(method_name: &str, host_id: i32, options_json: &str) -> Result<String, String> {
+    with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = cache
+            .get_method_id(method_name)
+            .ok_or("Method ID not found")?;
+        let class = cache.class();
+
+        let jstr = env
+            .new_string(options_json)
+            .map_err(|e| format!("Failed to create Java string: {e}"))?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Object,
+                &[jvalue { i: host_id }, jvalue { l: jstr.into_raw() as *mut _ }],
+            )
+        };
+
+        match result {
+            Ok(val) => {
+                let jstring = val.l().map_err(|_| "Null string from Java")?;
+                let json_str = env
+                    .get_string(&jni::objects::JString::from(jstring))
+                    .map_err(|e| format!("Failed to convert camera JSON string: {e}"))?
+                    .into();
+                Ok(json_str)
+            }
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("Failed to call method '{method_name}': {e}"))
+            }
+        }
+    })
+}
+
+/// Create a camera instance.
+/// Calls Java: NativeExports.cameraCreate(hostId, optionsJson) -> String
+pub fn camera_create(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_camera_json("cameraCreate", host_id, options_json)
+}
+
+/// Destroy a camera instance.
+/// Calls Java: NativeExports.cameraDestroy(hostId, cameraId)
+pub fn camera_destroy(host_id: i32, camera_id: u32) -> Result<(), String> {
+    call_static_method(
+        "cameraDestroy",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }, jvalue { i: camera_id as i32 }],
+    )
+}
+
+/// Take a photo.
+/// Calls Java: NativeExports.cameraTakePhoto(hostId, optionsJson) -> String
+pub fn camera_take_photo(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_camera_json("cameraTakePhoto", host_id, options_json)
+}
+
+/// Start video recording.
+/// Calls Java: NativeExports.cameraStartRecord(hostId, optionsJson) -> String
+pub fn camera_start_record(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_camera_json("cameraStartRecord", host_id, options_json)
+}
+
+/// Stop video recording.
+/// Calls Java: NativeExports.cameraStopRecord(hostId, optionsJson) -> String
+pub fn camera_stop_record(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_camera_json("cameraStopRecord", host_id, options_json)
+}
+
+/// Set camera zoom level.
+/// Calls Java: NativeExports.cameraSetZoom(hostId, optionsJson) -> String
+pub fn camera_set_zoom(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_camera_json("cameraSetZoom", host_id, options_json)
+}
+
+/// Start listening for camera frame changes.
+/// Calls Java: NativeExports.cameraListenFrameChange(hostId, cameraId)
+pub fn camera_listen_frame_change(host_id: i32, camera_id: u32) -> Result<(), String> {
+    call_static_method(
+        "cameraListenFrameChange",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }, jvalue { i: camera_id as i32 }],
+    )
+}
+
+/// Stop listening for camera frame changes.
+/// Calls Java: NativeExports.cameraCloseFrameChange(hostId, cameraId)
+pub fn camera_close_frame_change(host_id: i32, camera_id: u32) -> Result<(), String> {
+    call_static_method(
+        "cameraCloseFrameChange",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }, jvalue { i: camera_id as i32 }],
+    )
+}

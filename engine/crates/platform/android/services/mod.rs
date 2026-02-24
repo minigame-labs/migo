@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use core::services::{
-    AccelerometerService, AudioPlatformService, BatteryService, ClipboardService, CompassService,
-    DeviceMotionService, DeviceServices, GyroscopeService, NetworkService, RecorderService,
-    ScreenService, VibrationService,
+    AccelerometerService, AudioPlatformService, BatteryService, CameraService, ClipboardService,
+    CompassService, DeviceMotionService, DeviceServices, GyroscopeService, NetworkService,
+    RecorderService, ScreenService, VibrationService,
 };
 
 use crate::android::jni;
@@ -66,6 +66,10 @@ impl DeviceServices for AndroidDeviceServices {
 
     fn recorder(&self) -> Option<Arc<dyn RecorderService>> {
         Some(Arc::new(AndroidRecorder { host_id: self.host_id }))
+    }
+
+    fn camera(&self) -> Option<Arc<dyn CameraService>> {
+        Some(Arc::new(AndroidCamera { host_id: self.host_id }))
     }
 }
 
@@ -270,5 +274,45 @@ impl RecorderService for AndroidRecorder {
 
     fn stop(&self) -> Result<(), String> {
         jni::recorder_stop(self.host_id)
+    }
+}
+
+// ==================== Camera ====================
+
+struct AndroidCamera {
+    host_id: i32,
+}
+
+impl CameraService for AndroidCamera {
+    fn create(&self, options_json: &str) -> Result<String, String> {
+        jni::camera_create(self.host_id, options_json)
+    }
+
+    fn destroy(&self, camera_id: u32) -> Result<(), String> {
+        jni::camera_destroy(self.host_id, camera_id)
+    }
+
+    fn take_photo(&self, options_json: &str) -> Result<String, String> {
+        jni::camera_take_photo(self.host_id, options_json)
+    }
+
+    fn start_record(&self, options_json: &str) -> Result<String, String> {
+        jni::camera_start_record(self.host_id, options_json)
+    }
+
+    fn stop_record(&self, options_json: &str) -> Result<String, String> {
+        jni::camera_stop_record(self.host_id, options_json)
+    }
+
+    fn set_zoom(&self, options_json: &str) -> Result<String, String> {
+        jni::camera_set_zoom(self.host_id, options_json)
+    }
+
+    fn listen_frame_change(&self, camera_id: u32) -> Result<(), String> {
+        jni::camera_listen_frame_change(self.host_id, camera_id)
+    }
+
+    fn close_frame_change(&self, camera_id: u32) -> Result<(), String> {
+        jni::camera_close_frame_change(self.host_id, camera_id)
     }
 }

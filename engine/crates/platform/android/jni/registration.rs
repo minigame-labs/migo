@@ -10,6 +10,7 @@ use crate::android::jni::{
     onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting, onShow,
     onRestart, onTouch, onVsync, getDebugStats, shutdown, updateSurface, version,
     onRecorderEvent, onRecorderFrameData,
+    onCameraEvent, onCameraFrameData,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -146,6 +147,16 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(I[BZ)V".into(),
                 fn_ptr: onRecorderFrameData as *mut c_void,
             },
+            NativeMethod {
+                name: "onCameraEvent".into(),
+                sig: "(IILjava/lang/String;Ljava/lang/String;)V".into(),
+                fn_ptr: onCameraEvent as *mut c_void,
+            },
+            NativeMethod {
+                name: "onCameraFrameData".into(),
+                sig: "(II[BII)V".into(),
+                fn_ptr: onCameraFrameData as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -211,6 +222,15 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("recorderPause", "(I)V"),
         ("recorderResume", "(I)V"),
         ("recorderStop", "(I)V"),
+        // Camera
+        ("cameraCreate", "(ILjava/lang/String;)Ljava/lang/String;"),
+        ("cameraDestroy", "(II)V"),
+        ("cameraTakePhoto", "(ILjava/lang/String;)Ljava/lang/String;"),
+        ("cameraStartRecord", "(ILjava/lang/String;)Ljava/lang/String;"),
+        ("cameraStopRecord", "(ILjava/lang/String;)Ljava/lang/String;"),
+        ("cameraSetZoom", "(ILjava/lang/String;)Ljava/lang/String;"),
+        ("cameraListenFrameChange", "(II)V"),
+        ("cameraCloseFrameChange", "(II)V"),
     ];
 
     let global_class = env
