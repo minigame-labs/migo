@@ -1,5 +1,5 @@
 import { op_vibrate_short, op_vibrate_long } from "ext:core/ops";
-import { wrapAsync } from "ext:host_v8_base/02_async.js";
+import { promisify, wrapAsync } from "ext:host_v8_base/02_async.js";
 
 function vibrateShort(options = {}) {
     const { type } = options;
@@ -18,10 +18,6 @@ function vibrateShort(options = {}) {
     }, options);
 }
 
-function vibrateLong(options = {}) {
-    return wrapAsync('vibrateLong', function () {
-        op_vibrate_long();
-    }, options);
-}
+const vibrateLong = promisify('vibrateLong', () => op_vibrate_long());
 
 export { vibrateShort, vibrateLong };
