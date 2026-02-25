@@ -33,4 +33,30 @@ function wrapAsync(apiName, fn, options) {
     }
 }
 
-export { wrapAsync };
+// Higher-level factory: creates a callback+Promise async API from an executor.
+//
+// Usage:
+//   const getStorage = promisify("getStorage", (opts) => {
+//       return { data: getStorageSync(opts.key) };
+//   });
+//
+//   // Callback style
+//   getStorage({ key: "k", success(res) { console.log(res.data); } });
+//
+//   // Promise style
+//   const res = await getStorage({ key: "k" });
+//
+// The executor receives the options object (minus callbacks) and should:
+//   - Return nothing for void APIs (setStorage, removeStorage, ...)
+//   - Return an object whose fields are merged into the success result
+//   - Throw on error
+//   - Return a Promise for truly async work
+function promisify(apiName, executor) {
+    return function (options) {
+        return wrapAsync(apiName, function () {
+            return executor(options || {});
+        }, options);
+    };
+}
+
+export { wrapAsync, promisify };

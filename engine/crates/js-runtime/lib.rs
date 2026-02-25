@@ -98,6 +98,7 @@ mod input;
 mod media;
 mod network;
 mod rendering;
+mod storage;
 mod url;
 mod utility;
 mod web;
@@ -166,6 +167,7 @@ pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
         .chain(event::event_extensions())
         .chain(utility::utility_extensions())
         .chain(device::device_extensions())
+        .chain(storage::storage_extensions())
         .chain(input::touch_extensions())
         .chain(file::file_extensions())
         .chain(rendering::rendering_extensions())

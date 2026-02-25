@@ -22,6 +22,7 @@ import * as clipboard from 'ext:host_v8_device/07_clipboard.js';
 import * as vibrate from 'ext:host_v8_device/08_vibrate.js';
 import * as screen from 'ext:host_v8_device/09_screen.js';
 import * as network from 'ext:host_v8_device/10_network.js';
+import * as storageApi from 'ext:host_v8_storage/01_storage.js';
 import * as cameraApi from 'ext:host_v8_media/01_camera.js';
 import * as workerApi from 'ext:host_v8_worker/01_worker.js';
 
@@ -163,6 +164,20 @@ const WindowGlobalScope = {
     _internalTriggerNetworkStatusChange: core.propNonEnumerable(network._internalTriggerNetworkStatusChange),
     getNetworkType: core.propNonEnumerable(network.getNetworkType),
     getLocalIPAddress: core.propNonEnumerable(network.getLocalIPAddress),
+
+    // Storage
+    setStorage: core.propNonEnumerable(storageApi.setStorage),
+    setStorageSync: core.propNonEnumerable(storageApi.setStorageSync),
+    getStorage: core.propNonEnumerable(storageApi.getStorage),
+    getStorageSync: core.propNonEnumerable(storageApi.getStorageSync),
+    removeStorage: core.propNonEnumerable(storageApi.removeStorage),
+    removeStorageSync: core.propNonEnumerable(storageApi.removeStorageSync),
+    clearStorage: core.propNonEnumerable(storageApi.clearStorage),
+    clearStorageSync: core.propNonEnumerable(storageApi.clearStorageSync),
+    getStorageInfo: core.propNonEnumerable(storageApi.getStorageInfo),
+    getStorageInfoSync: core.propNonEnumerable(storageApi.getStorageInfoSync),
+    createBufferURL: core.propNonEnumerable(storageApi.createBufferURL),
+    revokeBufferURL: core.propNonEnumerable(storageApi.revokeBufferURL),
 
     // Camera
     createCamera: core.propNonEnumerable(cameraApi.createCamera),
