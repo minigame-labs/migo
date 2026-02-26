@@ -28,9 +28,8 @@ femtovg = { version = "0.19.3", features = ["image-loading"] }
 # Image decoding - only enable formats actually needed
 # Removing unused formats can save 500KB-1MB
 image = { version = "=0.25.8", default-features = false, features = [
-    "png",      # PNG format (fallback)
-    "jpeg",     # JPEG format (fallback)
-    # Uncomment if needed:
+    "png",      # PNG format (fallback, JPEG handled by zune-image)
+    # "jpeg",   # Removed: zune-image handles JPEG, avoids zune-jpeg 0.4 duplicate
     # "gif",    # GIF format
     # "webp",   # WebP format
     # "bmp",    # BMP format
@@ -44,8 +43,8 @@ zune-core = { version = "0.5", default-features = false, features = ["std"] }
 
 once_cell = "1.21.3"
 
-# LRU cache for decoded images
-lru = "0.12"
+# LRU cache for decoded images (0.16 to align with femtovg's dep)
+lru = "0.16"
 crossbeam-channel = "0.5.15"
 
 tracing = { version = "0.1.41", default-features = false, features = ["std"] }
