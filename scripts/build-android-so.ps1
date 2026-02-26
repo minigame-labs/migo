@@ -233,7 +233,17 @@ function Build-Platform {
 
     if (Test-Path $libcppSrc) {
         Copy-Item $libcppSrc $libcppDst -Force
-        Print-Success "Copied -> $libcppDst"
+        # Strip debug symbols from libc++_shared.so (NDK ships unstripped, ~6.6MB -> ~800KB)
+        $llvmStrip = Get-Command "llvm-strip" -ErrorAction SilentlyContinue
+        if (-not $llvmStrip) {
+            $llvmStrip = Get-Command (Join-Path $env:ANDROID_NDK_HOME "toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-strip.exe") -ErrorAction SilentlyContinue
+        }
+        if ($llvmStrip) {
+            & $llvmStrip.Source --strip-all $libcppDst
+            Print-Success "Copied + stripped -> $libcppDst"
+        } else {
+            Print-Success "Copied -> $libcppDst (llvm-strip not found, skipped stripping)"
+        }
     } else {
         Print-Warning "libc++_shared.so not found: $libcppSrc"
     }

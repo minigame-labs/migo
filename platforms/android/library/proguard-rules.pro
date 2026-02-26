@@ -40,6 +40,10 @@
     public *;
 }
 
+-keep public class com.migo.runtime.DebugOverlayView {
+    public *;
+}
+
 -keep public class com.migo.runtime.ErrorCode {
     public static final int *;
     public static java.lang.String getMessage(int);

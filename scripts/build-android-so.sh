@@ -215,7 +215,13 @@ build_platform() {
 
     if [[ -f "$libcpp_src" ]]; then
         cp "$libcpp_src" "$libcpp_dst"
-        print_success "Copied -> $libcpp_dst"
+        # Strip debug symbols from libc++_shared.so (NDK ships unstripped, ~6.6MB -> ~800KB)
+        if command -v llvm-strip &>/dev/null; then
+            llvm-strip --strip-all "$libcpp_dst"
+            print_success "Copied + stripped -> $libcpp_dst"
+        else
+            print_success "Copied -> $libcpp_dst (llvm-strip not found, skipped stripping)"
+        fi
     else
         print_warning "libc++_shared.so not found: $libcpp_src"
     fi
