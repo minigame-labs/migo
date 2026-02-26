@@ -3,6 +3,7 @@ use shared::config::InitOptions;
 use crate::android::extensions::base::base_extensions;
 
 mod base;
+mod codec;
 mod file;
 
 deno_core::extension!(
@@ -19,6 +20,7 @@ pub fn android_extensions(_: &InitOptions) -> Vec<deno_core::Extension> {
 
     base_extensions()
         .into_iter()
+        .chain(codec::codec_extensions())
         .chain(file::file_extensions())
         .chain(runtime_extensions)
         .collect()

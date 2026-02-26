@@ -1,4 +1,5 @@
 use base64::{Engine as _, engine::general_purpose};
+#[cfg(feature = "codec-gbk")]
 use encoding_rs::GBK;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9,6 +10,7 @@ enum Encoding {
     Latin1,
     Base64,
     Hex,
+    #[cfg(feature = "codec-gbk")]
     Gbk,
     Unsupported,
 }
@@ -22,6 +24,7 @@ fn normalize_encoding(input: &str) -> Encoding {
         "latin1" | "binary" => Encoding::Latin1,
         "base64" => Encoding::Base64,
         "hex" => Encoding::Hex,
+        #[cfg(feature = "codec-gbk")]
         "gbk" => Encoding::Gbk,
         _ => Encoding::Unsupported,
     }
@@ -77,6 +80,7 @@ pub fn encode_string(data: &str, encoding: &str) -> Result<Vec<u8>, String> {
             Ok(buf)
         }
 
+        #[cfg(feature = "codec-gbk")]
         Encoding::Gbk => {
             let (bytes, _, had_errors) = GBK.encode(data);
             if had_errors {
@@ -119,6 +123,7 @@ pub fn decode_bytes(data: &[u8], encoding: &str) -> Result<String, String> {
             String::from_utf16(&utf16).map_err(|_| "UTF-16LE decode error".to_string())
         }
 
+        #[cfg(feature = "codec-gbk")]
         Encoding::Gbk => {
             let (s, _, had_errors) = GBK.decode(data);
             if had_errors {

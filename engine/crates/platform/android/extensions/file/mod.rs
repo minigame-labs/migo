@@ -1,40 +1,29 @@
-use std::{cell::RefCell, rc::Rc};
-
-use deno_core::{Extension, OpState, extension, op2};
+use deno_core::{Extension, extension, op2};
 use deno_error::JsErrorBox;
-use shared::{
-    op_state::HostOpState,
-    protocol::{
-        self,
-        io_cmd::{IOCmd, IOCmdResp},
-    },
-};
 
-/// Native unzip operation using Rust's `zip` crate.
-/// Executes on the IO thread for unified IO scheduling.
+use crate::android::jni::outbound;
+
+/// Android-specific unzip using the platform's built-in java.util.zip via JNI.
+///
+/// This overrides the default `op_unzip` (Rust zip crate) at the JS layer.
+/// Android's `FileManager.unzip()` calls this op instead of the base `op_unzip`,
+/// eliminating the need for the Rust `zip` crate dependency on Android.
 #[op2(async(lazy), fast)]
-pub async fn op_unzip(
-    state: Rc<RefCell<OpState>>,
+pub async fn op_unzip_android(
     #[string] zip_file_path: String,
     #[string] target_path: String,
 ) -> Result<(), JsErrorBox> {
-    let io_tx = {
-        let st = state.borrow();
-        st.borrow::<HostOpState>().io_tx.clone()
-    };
-
-    protocol::send_fs_with_resp_async(&io_tx, move |resp_tx| IOCmd::Unzip {
-        zip_path: zip_file_path,
-        dest_dir: target_path,
-        resp: IOCmdResp::Async(resp_tx),
+    tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        outbound::unzip_file(&zip_file_path, &target_path)
     })
     .await
+    .map_err(|e| JsErrorBox::generic(format!("unzip task join error: {e}")))?
     .map(|_| ()) // Discard file count, JS doesn't need it
-    .map_err(|e| JsErrorBox::generic(e.to_string()))
+    .map_err(|e| JsErrorBox::generic(e))
 }
 
 extension!(host_v8_file_android,
- ops=[op_unzip],
+ ops=[op_unzip_android],
  esm = [
     dir "android/extensions/file",
     "01_file_manager.js"

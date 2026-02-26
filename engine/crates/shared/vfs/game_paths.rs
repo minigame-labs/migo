@@ -5,14 +5,6 @@
 //! across different platforms (Android, iOS, Desktop).
 
 use std::path::{Path, PathBuf};
-use regex::Regex;
-use once_cell::sync::Lazy;
-
-/// Regex for validating game IDs.
-/// Allowed: a-z, A-Z, 0-9, underscore, hyphen. Length: 1-64.
-static GAME_ID_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").unwrap()
-});
 
 /// Error types for game path operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,11 +44,18 @@ impl std::error::Error for GamePathError {}
 /// assert!(validate_game_id("../hack").is_err());
 /// ```
 pub fn validate_game_id(game_id: &str) -> Result<(), GamePathError> {
-    if GAME_ID_REGEX.is_match(game_id) {
-        Ok(())
-    } else {
-        Err(GamePathError::InvalidGameId(game_id.to_string()))
+    // Hand-rolled validation replaces regex crate dependency for this single use.
+    // Allowed: a-z, A-Z, 0-9, underscore, hyphen. Length: 1-64.
+    if game_id.is_empty() || game_id.len() > 64 {
+        return Err(GamePathError::InvalidGameId(game_id.to_string()));
     }
+    for b in game_id.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' => {}
+            _ => return Err(GamePathError::InvalidGameId(game_id.to_string())),
+        }
+    }
+    Ok(())
 }
 
 /// Paths for a specific game instance.

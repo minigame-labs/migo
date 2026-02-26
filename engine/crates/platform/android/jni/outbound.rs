@@ -602,6 +602,165 @@ pub fn recorder_stop(host_id: i32) -> Result<(), String> {
     )
 }
 
+// ==================== Charset Encoding (GBK) ====================
+
+/// Encode a string to GBK bytes using Android's java.nio.charset.Charset.
+/// Calls Java: NativeExports.encodeGbk(String) -> byte[]
+pub fn encode_gbk(data: &str) -> Result<Vec<u8>, String> {
+    with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = cache
+            .get_method_id("encodeGbk")
+            .ok_or("Method ID not found for encodeGbk")?;
+        let class = cache.class();
+
+        let j_data = env
+            .new_string(data)
+            .map_err(|e| format!("Failed to create Java string: {e}"))?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Array,
+                &[jvalue { l: j_data.into_raw() as *mut _ }],
+            )
+        };
+
+        match result {
+            Ok(val) => {
+                let obj = val.l().map_err(|e| format!("encodeGbk: expected object: {e}"))?;
+                if obj.is_null() {
+                    return Err("GBK encode error".to_string());
+                }
+                let byte_array = jni::objects::JByteArray::from(obj);
+                let bytes = env.convert_byte_array(byte_array)
+                    .map_err(|e| format!("encodeGbk: failed to convert byte array: {e}"))?;
+                Ok(bytes)
+            }
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("encodeGbk failed: {e}"))
+            }
+        }
+    })
+}
+
+/// Decode GBK bytes to a string using Android's java.nio.charset.Charset.
+/// Calls Java: NativeExports.decodeGbk(byte[]) -> String
+pub fn decode_gbk(data: &[u8]) -> Result<String, String> {
+    with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = cache
+            .get_method_id("decodeGbk")
+            .ok_or("Method ID not found for decodeGbk")?;
+        let class = cache.class();
+
+        let j_bytes = env
+            .byte_array_from_slice(data)
+            .map_err(|e| format!("Failed to create Java byte array: {e}"))?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Object,
+                &[jvalue { l: j_bytes.into_raw() as *mut _ }],
+            )
+        };
+
+        match result {
+            Ok(val) => {
+                let obj = val.l().map_err(|e| format!("decodeGbk: expected object: {e}"))?;
+                if obj.is_null() {
+                    return Err("GBK decode error".to_string());
+                }
+                let j_str = jni::objects::JString::from(obj);
+                let s = env.get_string(&j_str)
+                    .map_err(|e| format!("decodeGbk: failed to get string: {e}"))?;
+                Ok(s.into())
+            }
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("decodeGbk failed: {e}"))
+            }
+        }
+    })
+}
+
+// ==================== File Operations ====================
+
+/// Extract a zip file to target directory using Android's built-in java.util.zip.
+/// Calls Java: NativeExports.unzipFile(zipPath, destDir) -> String
+///
+/// Returns Ok(file_count) on success, Err(message) on failure.
+/// The Java side returns either a number string (success) or "ERR:..." (error).
+pub fn unzip_file(zip_path: &str, dest_dir: &str) -> Result<usize, String> {
+    with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = cache
+            .get_method_id("unzipFile")
+            .ok_or("Method ID not found")?;
+        let class = cache.class();
+
+        let j_zip_path = env
+            .new_string(zip_path)
+            .map_err(|e| format!("Failed to create Java string for zip_path: {e}"))?;
+        let j_dest_dir = env
+            .new_string(dest_dir)
+            .map_err(|e| format!("Failed to create Java string for dest_dir: {e}"))?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Object,
+                &[
+                    jvalue { l: j_zip_path.into_raw() as *mut _ },
+                    jvalue { l: j_dest_dir.into_raw() as *mut _ },
+                ],
+            )
+        };
+
+        match result {
+            Ok(val) => {
+                let jstring = val.l().map_err(|_| "Null string from Java")?;
+                let result_str: String = env
+                    .get_string(&jni::objects::JString::from(jstring))
+                    .map_err(|e| format!("Failed to convert unzip result string: {e}"))?
+                    .into();
+
+                if result_str.starts_with("ERR:") {
+                    Err(result_str[4..].to_string())
+                } else {
+                    result_str
+                        .parse::<usize>()
+                        .map_err(|_| format!("Invalid file count from Java: {result_str}"))
+                }
+            }
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("Failed to call unzipFile: {e}"))
+            }
+        }
+    })
+}
+
 // ==================== Clipboard ====================
 
 pub fn set_clipboard_data(host_id: i32, data: &str) -> Result<(), String> {

@@ -3,7 +3,7 @@
 mod cache;
 mod env;
 mod inbound;
-mod outbound;
+pub(crate) mod outbound;
 mod registration;
 mod utils;
 

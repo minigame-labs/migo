@@ -14,6 +14,7 @@ import {
   op_stat, op_stat_sync,
   op_write_file, op_write_file_sync,
   op_read_file, op_read_file_sync,
+  op_unzip,
 } from "ext:core/ops";
 
 import { core, primordials } from "ext:core/mod.js";
@@ -461,7 +462,19 @@ class BaseFileManager {
   //
   // placeholders
   //
-  static unzip() { throw new IOError("target platform should handle this"); }
+  /**
+   * Extract a zip file to target directory.
+   * Default implementation uses IOCmd::Unzip (Rust zip crate on IO thread).
+   * Platforms can override this (e.g. Android uses java.util.zip via JNI).
+   */
+  static unzip({ zipFilePath, targetPath, success, fail, complete }) {
+    wrapAsync(
+      op_unzip(zipFilePath, targetPath),
+      "unzip:ok",
+      "unzip",
+      { success, fail, complete }
+    );
+  }
   static read() { throw new IOError("read: not implemented"); }
   static readSync() { throw new IOError("readSync: not implemented"); }
   static readCompressedFile() { throw new IOError("readCompressedFile: not implemented"); }

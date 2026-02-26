@@ -211,6 +211,11 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("stopNetworkMonitoring", "(I)V"),
         ("getNetworkTypeJson", "(I)Ljava/lang/String;"),
         ("getLocalIPAddressJson", "()Ljava/lang/String;"),
+        // File operations
+        ("unzipFile", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
+        // Charset encoding (GBK via java.nio.charset)
+        ("encodeGbk", "(Ljava/lang/String;)[B"),
+        ("decodeGbk", "([B)Ljava/lang/String;"),
         // Clipboard
         ("setClipboardData", "(ILjava/lang/String;)I"),
         ("getClipboardData", "(I)Ljava/lang/String;"),

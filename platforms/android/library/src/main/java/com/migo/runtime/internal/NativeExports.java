@@ -73,6 +73,117 @@ public final class NativeExports {
         return cacheDir != null ? cacheDir.getAbsolutePath() : "";
     }
 
+    /**
+     * Extract a zip file to target directory using Android's built-in java.util.zip.
+     * <p>
+     * Includes path traversal protection (zip slip prevention).
+     *
+     * @param zipFilePath Path to the zip file
+     * @param targetPath  Destination directory
+     * @return Number of files extracted on success, or error message prefixed with "ERR:"
+     */
+    public static String unzipFile(String zipFilePath, String targetPath) {
+        if (zipFilePath == null || targetPath == null) {
+            return "ERR:unzip:fail invalid arguments";
+        }
+
+        File zipFile = new File(zipFilePath);
+        if (!zipFile.exists()) {
+            return "ERR:unzip:fail file not found: " + zipFilePath;
+        }
+
+        File destDir = new File(targetPath);
+        if (!destDir.exists() && !destDir.mkdirs()) {
+            return "ERR:unzip:fail cannot create destination directory";
+        }
+
+        String canonicalDest;
+        try {
+            canonicalDest = destDir.getCanonicalPath();
+        } catch (java.io.IOException e) {
+            return "ERR:unzip:fail cannot resolve destination path";
+        }
+
+        int fileCount = 0;
+        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
+                new java.io.BufferedInputStream(new java.io.FileInputStream(zipFile), 65536))) {
+
+            java.util.zip.ZipEntry entry;
+            byte[] buffer = new byte[8192];
+
+            while ((entry = zis.getNextEntry()) != null) {
+                File outFile = new File(destDir, entry.getName());
+
+                // Security: path traversal protection (zip slip)
+                String canonicalPath = outFile.getCanonicalPath();
+                if (!canonicalPath.startsWith(canonicalDest + File.separator)
+                        && !canonicalPath.equals(canonicalDest)) {
+                    zis.closeEntry();
+                    return "ERR:unzip:fail path traversal detected: " + entry.getName();
+                }
+
+                if (entry.isDirectory()) {
+                    if (!outFile.exists()) {
+                        outFile.mkdirs();
+                    }
+                } else {
+                    // Ensure parent directories exist
+                    File parent = outFile.getParentFile();
+                    if (parent != null && !parent.exists()) {
+                        parent.mkdirs();
+                    }
+
+                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(outFile)) {
+                        int len;
+                        while ((len = zis.read(buffer)) > 0) {
+                            fos.write(buffer, 0, len);
+                        }
+                    }
+                    fileCount++;
+                }
+                zis.closeEntry();
+            }
+        } catch (java.io.IOException e) {
+            return "ERR:unzip:fail " + (e.getMessage() != null ? e.getMessage() : "IO error");
+        }
+
+        return String.valueOf(fileCount);
+    }
+
+    // ==================== Charset Encoding (GBK) ====================
+
+    /**
+     * Encode a string to GBK bytes using Android's built-in java.nio.charset.Charset.
+     * Available on all Android API levels (API 1+).
+     *
+     * @param data The string to encode
+     * @return GBK-encoded bytes, or null on error
+     */
+    public static byte[] encodeGbk(String data) {
+        if (data == null) return null;
+        try {
+            return data.getBytes("GBK");
+        } catch (java.io.UnsupportedEncodingException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Decode GBK bytes to a string using Android's built-in java.nio.charset.Charset.
+     * Available on all Android API levels (API 1+).
+     *
+     * @param data The GBK-encoded bytes
+     * @return Decoded string, or null on error
+     */
+    public static String decodeGbk(byte[] data) {
+        if (data == null) return null;
+        try {
+            return new String(data, "GBK");
+        } catch (java.io.UnsupportedEncodingException e) {
+            return null;
+        }
+    }
+
     // ==================== System Settings ====================
 
     /**

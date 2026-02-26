@@ -814,3 +814,35 @@ pub fn op_read_file_sync(
     .map(|data| data.into())
     .map_err(IOError::from)
 }
+
+// ============================ Unzip ============================
+
+/// Default unzip operation using IOCmd::Unzip (Rust `zip` crate on IO thread).
+///
+/// Platforms can override this by providing their own `op_unzip_<platform>` op
+/// and overriding `BaseFileManager.unzip()` in JS. For example, Android uses
+/// `op_unzip_android` backed by `java.util.zip` via JNI.
+#[op2(async(lazy), fast)]
+pub async fn op_unzip(
+    state: Rc<RefCell<OpState>>,
+    #[string] zip_file_path: String,
+    #[string] target_path: String,
+) -> Result<(), IOError> {
+    let (io_tx, vfs) = {
+        let st = state.borrow();
+        let host = st.borrow::<HostOpState>();
+        (host.io_tx.clone(), host.vfs.clone())
+    };
+
+    let full_zip_path = resolve_path_vfs(vfs.as_deref(), &zip_file_path, FileOp::Read)?;
+    let full_dest_dir = resolve_path_vfs(vfs.as_deref(), &target_path, FileOp::Write)?;
+
+    protocol::send_fs_with_resp_async(&io_tx, move |resp_tx| IOCmd::Unzip {
+        zip_path: full_zip_path,
+        dest_dir: full_dest_dir,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map(|_| ()) // Discard file count, JS doesn't need it
+    .map_err(IOError::from)
+}

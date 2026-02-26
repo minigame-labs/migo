@@ -14,6 +14,7 @@ import * as updateMgr from "ext:host_v8_update/02_update_mgr.js"
 import * as lifeCycle from "ext:host_v8_lifecycle/01_lifecycle.js"
 import * as fileManager from "ext:host_v8_file_android/01_file_manager.js"
 import * as interaction from "ext:host_v8_ui/01_interaction.js"
+import * as codecAndroid from "ext:host_v8_codec_android/01_codec_android.js"
 
 const { ObjectDefineProperties } = primordials;
 const properties = {
@@ -49,6 +50,9 @@ const properties = {
     getEnterOptionsSync: core.propNonEnumerable(lifeCycle.getEnterOptionsSync),
     _internalTriggerOnShow: core.propNonEnumerable(lifeCycle._internalTriggerOnShow),
     _internalTriggerOnHide: core.propNonEnumerable(lifeCycle._internalTriggerOnHide),
+    // Codec (GBK via Android native java.nio.charset, others via base Rust ops)
+    encode: core.propNonEnumerable(codecAndroid.encode),
+    decode: core.propNonEnumerable(codecAndroid.decode),
     // File
     getFileSystemManager: core.propNonEnumerable(fileManager.getFileSystemManager),
     // UI Interaction

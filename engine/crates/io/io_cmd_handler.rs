@@ -13,7 +13,9 @@ use shared::{
     protocol::io_cmd::{FileId, FileStat, IOCmd, IOCmdResp, NormalizedImage, OpenFlag, WriteMode},
 };
 
-use crate::{fast_image_decoder, image_cache, zip_extract};
+use crate::{fast_image_decoder, image_cache};
+#[cfg(feature = "zip-extract")]
+use crate::zip_extract;
 
 pub struct IoCmdHandler {
     next_id: FileId,
@@ -451,6 +453,7 @@ impl IoCmdHandler {
                 Self::send_resp(resp, Ok(result));
             }
 
+            #[cfg(feature = "zip-extract")]
             IOCmd::Unzip {
                 zip_path,
                 dest_dir,
@@ -493,6 +496,15 @@ impl IoCmdHandler {
                 };
 
                 Self::send_resp(resp, r);
+            }
+
+            #[cfg(not(feature = "zip-extract"))]
+            IOCmd::Unzip { resp, .. } => {
+                Self::send_resp(
+                    resp,
+                    Err(EngineError::new(ErrorCode::Unsupported)
+                        .with_detail("zip-extract feature is not enabled")),
+                );
             }
         }
     }

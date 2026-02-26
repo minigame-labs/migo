@@ -10,10 +10,9 @@ path = "lib.rs"
 shared = {path = "../shared"}
 js-runtime = {path = "../js-runtime"}
 graphics = {path = "../graphics"}
-io = {path = "../io"}
+io = { path = "../io", default-features = false }
 audio = {path = "../audio"}
 crossbeam-channel = { workspace = true }
-lazy_static = "1.5.0"
 futures = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -21,3 +20,10 @@ tracing = { workspace = true }
 tracing-android = { workspace = true }
 tracing-subscriber = { workspace = true }
 deno_core = { workspace = true }
+
+# On non-Android platforms, enable Rust-native implementations:
+# - zip-extract: IOCmd::Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)
+# - codec-gbk: GBK encoding via `encoding_rs` crate (Android uses java.nio.charset via JNI)
+[target.'cfg(not(target_os = "android"))'.dependencies]
+io = { path = "../io", features = ["zip-extract"] }
+shared = { path = "../shared", features = ["codec-gbk"] }
