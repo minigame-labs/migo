@@ -10,6 +10,7 @@ extension!(
     deps = [host_v8_console, host_v8_base, host_v8_webgl],
     ops = [
         timers::op_now,
+        timers::op_now_us,
         canvas::op_create_canvas,
         canvas::op_get_canvas_info,
         canvas::op_resize_canvas,

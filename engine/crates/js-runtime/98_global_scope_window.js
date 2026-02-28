@@ -41,6 +41,7 @@ const WindowGlobalScope = {
     WebGL2RenderingContext: core.propNonEnumerable(webgl.WebGL2RenderingContext),
 
     performance: core.propNonEnumerable(performance.performance),
+    getPerformance: core.propNonEnumerable(performance.getPerformance),
 
     // Touch
     onTouchStart: core.propNonEnumerable(touch.onTouchStart),
