@@ -333,3 +333,7 @@ deno_core::extension!(
 pub fn device_extensions() -> Vec<Extension> {
     vec![host_v8_device::init()]
 }
+
+pub fn device_lazy_extensions() -> Vec<Extension> {
+    vec![host_v8_device::lazy_init()]
+}

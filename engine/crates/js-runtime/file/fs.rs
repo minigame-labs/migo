@@ -105,6 +105,12 @@ fn resolve_path_vfs(
             VfsError::PathTraversal => {
                 ioerr(format!("Path traversal detected: {}", path))
             }
+            VfsError::SymlinkEscape => {
+                ioerr(format!("Symlink resolves outside sandbox: {}", path))
+            }
+            VfsError::SymlinkNotAllowed => {
+                ioerr(format!("Symlinks not allowed in this directory: {}", path))
+            }
             VfsError::InvalidPath => {
                 ioerr(format!("Invalid path: {}", path))
             }

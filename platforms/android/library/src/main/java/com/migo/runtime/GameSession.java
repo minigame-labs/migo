@@ -126,6 +126,15 @@ public final class GameSession implements Closeable {
             this.debugOverlay = new DebugOverlayView(context, sessionId);
             this.debugOverlay.startMonitoring();
         }
+
+        // Register for native engine error callbacks (OOM, ANR, Panic, Timeout)
+        NativeExports.registerErrorCallback(sessionId, (errorCode, message, detail) -> {
+            // All native fatal errors are non-recoverable
+            String fullMessage = detail != null && !detail.isEmpty()
+                    ? message + " — " + detail
+                    : message;
+            notifyError(errorCode, fullMessage, /* recoverable */ false);
+        });
     }
 
     // ==================== Getters ====================
@@ -347,6 +356,7 @@ public final class GameSession implements Closeable {
             debugOverlay.stopMonitoring();
         }
         audioFocusManager.stop();
+        NativeExports.unregisterErrorCallback(sessionId);
         NativeExports.destroySensorManager(sessionId);
         NativeMethods.shutdown(sessionId);
         RuntimeRegistry.unregister(sessionId);

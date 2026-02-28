@@ -7,20 +7,21 @@ edition = "2024"
 path = "lib.rs"
 
 [features]
-default = ["zip-extract"]
+default = ["zip-extract", "rust-image-decode"]
 zip-extract = ["dep:zip"]
+rust-image-decode = ["dep:image", "dep:zune-image", "dep:zune-core"]
 
 [dependencies]
 tokio = { workspace = true }
-image = { workspace = true }
 tracing = { workspace = true }
 shared = { path = "../shared" }
 deno_core.workspace = true
 parking_lot = "0.12.4"
 
-# Fast image decoder (unified, SIMD-optimized)
-zune-image = { workspace = true }
-zune-core = { workspace = true }
+# Image decoders — optional, excluded on Android (uses BitmapFactory via JNI)
+image = { workspace = true, optional = true }
+zune-image = { workspace = true, optional = true }
+zune-core = { workspace = true, optional = true }
 
 # LRU cache for decoded images
 lru = { workspace = true }

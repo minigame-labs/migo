@@ -434,21 +434,25 @@ impl RendererGL {
             GLCmd::ShaderSource { shader_id, source, resp } => {
                 let _ = self.bind_for_contextless_gl(cm)?;
                 let Some(meta) = cm.shaders.get_mut(&shader_id) else {
-                    let _ = resp.send(Err(ee(ErrorCode::NotFound, format!("shader not found: {shader_id:?}"))));
+                    if let Some(r) = resp {
+                        r.send(Err(ee(ErrorCode::NotFound, format!("shader not found: {shader_id:?}"))));
+                    }
                     return Ok(false);
                 };
 
                 if meta.deleted {
-                    let _ = resp.send(Err(ee(ErrorCode::InvalidOperation, "shader already deleted")));
+                    if let Some(r) = resp {
+                        r.send(Err(ee(ErrorCode::InvalidOperation, "shader already deleted")));
+                    }
                     return Ok(false);
                 }
 
                 if let Some(sh) = meta.gl_handle {
                     meta.source_len = source.len();
                     unsafe { gl.shader_source(sh, &source) };
-                    let _ = resp.send(Ok(()));
-                } else {
-                    let _ = resp.send(Err(ee(ErrorCode::InvalidOperation, "shader handle missing")));
+                    if let Some(r) = resp { r.send(Ok(())); }
+                } else if let Some(r) = resp {
+                    r.send(Err(ee(ErrorCode::InvalidOperation, "shader handle missing")));
                 }
                 Ok(false)
             }
@@ -487,24 +491,28 @@ impl RendererGL {
                     .ok_or_else(|| ee(ErrorCode::NotFound, format!("shader not found: {shader_id:?}")))?;
 
                 if p.deleted || s.deleted {
-                    let _ = resp.send(Err(ee(ErrorCode::InvalidOperation, "program/shader deleted")));
+                    if let Some(r) = resp {
+                        r.send(Err(ee(ErrorCode::InvalidOperation, "program/shader deleted")));
+                    }
                     return Ok(false);
                 }
 
                 // WebGL-ish: must belong to same owner canvas
                 if p.owner_canvas != s.owner_canvas {
-                    let _ = resp.send(Err(ee(
-                        ErrorCode::InvalidOperation,
-                        "attach shader across different contexts",
-                    )));
+                    if let Some(r) = resp {
+                        r.send(Err(ee(
+                            ErrorCode::InvalidOperation,
+                            "attach shader across different contexts",
+                        )));
+                    }
                     return Ok(false);
                 }
 
                 if let (Some(ph), Some(sh)) = (p.gl_handle, s.gl_handle) {
                     unsafe { gl.attach_shader(ph, sh) };
-                    let _ = resp.send(Ok(()));
-                } else {
-                    let _ = resp.send(Err(ee(ErrorCode::InvalidOperation, "program/shader handle missing")));
+                    if let Some(r) = resp { r.send(Ok(())); }
+                } else if let Some(r) = resp {
+                    r.send(Err(ee(ErrorCode::InvalidOperation, "program/shader handle missing")));
                 }
                 Ok(false)
             }

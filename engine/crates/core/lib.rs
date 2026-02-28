@@ -43,8 +43,8 @@
 //! │  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             ││
 //! │  │         │                │                │                     ││
 //! │  │  ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐             ││
-//! │  │  │   Render    │  │    Audio    │  │     I/O     │             ││
-//! │  │  │   Thread    │  │    Thread   │  │   (Tokio)   │             ││
+//! │  │  │   Render    │  │    Audio    │  │  I/O Task   │             ││
+//! │  │  │   Thread    │  │    Thread   │  │(Host tokio) │             ││
 //! │  │  └─────────────┘  └─────────────┘  └─────────────┘             ││
 //! │  └─────────────────────────────────────────────────────────────────┘│
 //! └─────────────────────────────────────────────────────────────────────┘
@@ -78,14 +78,19 @@
 //!
 //! The engine uses a multi-threaded architecture:
 //!
-//! | Thread | Responsibility |
-//! |--------|---------------|
-//! | **Host** | JS runtime, event loop, command dispatch |
+//! | Thread / Task | Responsibility |
+//! |--------------|---------------|
+//! | **Host** | JS runtime, event loop, command dispatch, I/O dispatch (tokio task) |
 //! | **Render** | OpenGL/Canvas2D rendering, vsync |
 //! | **Audio** | Audio decoding, mixing, output |
-//! | **I/O** | File system, network (via Tokio) |
+//! | **Blocking pool** | File system ops, image decode, zip extract (`spawn_blocking`) |
 //!
-//! All threads communicate via typed channels, ensuring thread safety
+//! **P1-2**: I/O is no longer a separate thread with its own tokio runtime.
+//! The IO handler runs as a `tokio::spawn` task on the Host runtime, sharing
+//! the same epoll fd, timer wheel, and blocking thread pool.  Heavy I/O work
+//! is offloaded to the blocking pool via `tokio::fs` / `spawn_blocking`.
+//!
+//! All threads/tasks communicate via typed channels, ensuring thread safety
 //! without shared mutable state.
 //!
 //! ## Module Structure

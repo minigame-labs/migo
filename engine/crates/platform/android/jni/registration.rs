@@ -216,6 +216,8 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         // Charset encoding (GBK via java.nio.charset)
         ("encodeGbk", "(Ljava/lang/String;)[B"),
         ("decodeGbk", "([B)Ljava/lang/String;"),
+        // Image decoding (BitmapFactory)
+        ("decodeImageRgba", "([B)[B"),
         // Clipboard
         ("setClipboardData", "(ILjava/lang/String;)I"),
         ("getClipboardData", "(I)Ljava/lang/String;"),
@@ -236,6 +238,9 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("cameraSetZoom", "(ILjava/lang/String;)Ljava/lang/String;"),
         ("cameraListenFrameChange", "(II)V"),
         ("cameraCloseFrameChange", "(II)V"),
+        // Error notification callback
+        // onError(hostId, errorCode, message, detail)
+        ("onError", "(IILjava/lang/String;Ljava/lang/String;)V"),
     ];
 
     let global_class = env

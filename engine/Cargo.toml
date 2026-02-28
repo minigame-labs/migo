@@ -7,7 +7,8 @@ members = [
  "crates/io",
  "crates/js-runtime",
  "crates/platform",
- "crates/shared"
+ "crates/shared",
+ "crates/snapshot-gen",
 ]
 
 [workspace.dependencies]

@@ -8,6 +8,11 @@ name = "platform"
 path = "lib.rs"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["v8-limits", "code-signing"]
+v8-limits = ["core/v8-limits"]
+code-signing = ["core/code-signing"]
+
 [dependencies]
 core = {path = "../core"}
 shared = {path = "../shared"}
@@ -15,6 +20,7 @@ js-runtime = {path = "../js-runtime"}
 graphics = {path = "../graphics"}
 io = { path = "../io", default-features = false }
 crossbeam-channel = { workspace = true }
+bytemuck = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -28,7 +34,7 @@ raw-window-handle = { workspace = true }
 # - zip-extract: IOCmd::Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)
 # - codec-gbk: GBK encoding via `encoding_rs` crate (Android uses java.nio.charset via JNI)
 [target.'cfg(not(target_os = "android"))'.dependencies]
-io = { path = "../io", features = ["zip-extract"] }
+io = { path = "../io", features = ["zip-extract", "rust-image-decode"] }
 shared = { path = "../shared", features = ["codec-gbk"] }
 
 [target.'cfg(target_os = "android")'.dependencies]

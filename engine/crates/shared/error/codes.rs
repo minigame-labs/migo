@@ -29,6 +29,18 @@ pub enum ErrorCode {
     ArrayBufferDoesNotExist = 200,
     JsException = 201,
     ModuleLoadError = 202,
+    /// V8 heap limit reached (near-heap-limit triggered).
+    OutOfMemory = 203,
+    /// JS execution exceeded the configured watchdog timeout.
+    JsExecutionTimeout = 204,
+    /// Host thread panicked (Rust panic).
+    HostPanic = 205,
+    /// ANR: Host thread stopped responding within the watchdog timeout.
+    Anr = 206,
+    /// Code manifest signature is invalid (Ed25519 verification failed).
+    CodeSignatureInvalid = 207,
+    /// Code integrity check failed (SHA256 hash mismatch).
+    CodeIntegrityFailed = 208,
 
     // Image (300..399)
     ImageReadError = 300,
@@ -82,6 +94,12 @@ impl ErrorCode {
             ErrorCode::ArrayBufferDoesNotExist => "array buffer does not exist",
             ErrorCode::JsException => "js exception",
             ErrorCode::ModuleLoadError => "module load error",
+            ErrorCode::OutOfMemory => "out of memory",
+            ErrorCode::JsExecutionTimeout => "js execution timeout",
+            ErrorCode::HostPanic => "host thread panic",
+            ErrorCode::Anr => "application not responding",
+            ErrorCode::CodeSignatureInvalid => "code signature invalid",
+            ErrorCode::CodeIntegrityFailed => "code integrity check failed",
 
             ErrorCode::ImageReadError => "image read error",
             ErrorCode::InvalidImageBuffer => "invalid image buffer",
@@ -147,6 +165,12 @@ impl TryFrom<u16> for ErrorCode {
             200 => ErrorCode::ArrayBufferDoesNotExist,
             201 => ErrorCode::JsException,
             202 => ErrorCode::ModuleLoadError,
+            203 => ErrorCode::OutOfMemory,
+            204 => ErrorCode::JsExecutionTimeout,
+            205 => ErrorCode::HostPanic,
+            206 => ErrorCode::Anr,
+            207 => ErrorCode::CodeSignatureInvalid,
+            208 => ErrorCode::CodeIntegrityFailed,
 
             300 => ErrorCode::ImageReadError,
             301 => ErrorCode::InvalidImageBuffer,

@@ -149,6 +149,7 @@ public class DebugOverlayView extends FrameLayout {
         int fpsX10 = buf.getInt(0);
         int frameTimeUs = buf.getInt(4);
         int dropped = buf.getInt(8);
+        int fatalError = data.length >= 16 ? buf.getInt(12) : 0;
 
         // Treat as unsigned
         float fps = (fpsX10 & 0xFFFFFFFFL) / 10f;
@@ -164,6 +165,14 @@ public class DebugOverlayView extends FrameLayout {
                 tv.setTextColor(WARN_COLOR);
             }
             updatePanel("dropped", String.format("Dropped: %d", dropped & 0xFFFFFFFFL));
+        }
+
+        if (fatalError != 0) {
+            if (!panels.containsKey("fatal")) {
+                TextView tv = addPanel("fatal", "");
+                tv.setTextColor(WARN_COLOR);
+            }
+            updatePanel("fatal", "Fatal: " + fatalError);
         }
     }
 

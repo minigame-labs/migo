@@ -157,3 +157,7 @@ deno_core::extension!(
 pub fn media_extensions() -> Vec<Extension> {
     vec![host_v8_media::init()]
 }
+
+pub fn media_lazy_extensions() -> Vec<Extension> {
+    vec![host_v8_media::lazy_init()]
+}

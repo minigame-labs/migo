@@ -6,6 +6,11 @@ edition = "2024"
 [lib]
 path = "lib.rs"
 
+[features]
+default = ["v8-limits", "code-signing"]
+v8-limits = ["js-runtime/v8-limits", "shared/v8-limits"]
+code-signing = ["js-runtime/code-signing", "shared/code-signing"]
+
 [dependencies]
 shared = {path = "../shared"}
 js-runtime = {path = "../js-runtime"}
@@ -24,6 +29,7 @@ deno_core = { workspace = true }
 # On non-Android platforms, enable Rust-native implementations:
 # - zip-extract: IOCmd::Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)
 # - codec-gbk: GBK encoding via `encoding_rs` crate (Android uses java.nio.charset via JNI)
+# - rust-image-decode: image/zune-image decoders (Android uses BitmapFactory via JNI)
 [target.'cfg(not(target_os = "android"))'.dependencies]
-io = { path = "../io", features = ["zip-extract"] }
+io = { path = "../io", features = ["zip-extract", "rust-image-decode"] }
 shared = { path = "../shared", features = ["codec-gbk"] }

@@ -39,6 +39,37 @@ public final class ErrorCode {
     /** Activity is null or finishing */
     public static final int ERR_INVALID_ACTIVITY = -5004;
 
+    // ==================== Native Engine Errors (positive, from Rust ErrorCode) ====================
+    /**
+     * V8 heap out-of-memory: the near-heap-limit callback fired and the
+     * JS isolate was terminated to prevent a crash.
+     */
+    public static final int NATIVE_OUT_OF_MEMORY = 203;
+
+    /**
+     * JS execution timeout: a long-running script exceeded the watchdog
+     * timeout and was forcefully terminated.
+     */
+    public static final int NATIVE_JS_EXECUTION_TIMEOUT = 204;
+
+    /**
+     * Host thread panic: the Rust host thread encountered an unrecoverable
+     * panic (e.g. unwinding through {@code catch_unwind}).
+     */
+    public static final int NATIVE_HOST_PANIC = 205;
+
+    /**
+     * ANR (Application Not Responding): the host event loop has not sent a
+     * heartbeat for longer than the configured watchdog timeout.
+     */
+    public static final int NATIVE_ANR = 206;
+
+    /** Manifest signature verification failed. */
+    public static final int NATIVE_CODE_SIGNATURE_INVALID = 207;
+
+    /** Code file hash does not match manifest. */
+    public static final int NATIVE_CODE_INTEGRITY_FAILED = 208;
+
     /**
      * Get a human-readable message for an error code.
      *
@@ -57,6 +88,13 @@ public final class ErrorCode {
             case ERR_ENTRY_NOT_FOUND: return "Entry point not found";
             case ERR_JS_EXECUTION: return "JavaScript execution error";
             case ERR_INVALID_ACTIVITY: return "Invalid activity";
+            // Native engine errors
+            case NATIVE_OUT_OF_MEMORY: return "V8 out of memory";
+            case NATIVE_JS_EXECUTION_TIMEOUT: return "JS execution timeout";
+            case NATIVE_HOST_PANIC: return "Host thread panic";
+            case NATIVE_ANR: return "Application not responding (ANR)";
+            case NATIVE_CODE_SIGNATURE_INVALID: return "Code signature invalid";
+            case NATIVE_CODE_INTEGRITY_FAILED: return "Code integrity check failed";
             default: return "Unknown error (" + code + ")";
         }
     }

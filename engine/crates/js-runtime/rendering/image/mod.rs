@@ -277,3 +277,7 @@ extension!(host_v8_image,
 pub(super) fn image_extensions() -> Vec<deno_core::Extension> {
     vec![host_v8_image::init()]
 }
+
+pub(super) fn image_lazy_extensions() -> Vec<deno_core::Extension> {
+    vec![host_v8_image::lazy_init()]
+}

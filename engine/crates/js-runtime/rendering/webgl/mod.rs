@@ -51,6 +51,7 @@ extension!(host_v8_webgl,
         op_get_uniform_location,
         op_uniform3f,
         op_uniform_matrix_3fv,
+        op_gl_flush,
 
         // 2D Context (sync ops)
         op_create_context_2d,
@@ -130,9 +131,14 @@ extension!(host_v8_webgl,
     ],
     state = |state| {
         state.put(FrameCommandCollector::new());
+        state.put(GlBatchCollector::new());
     }
 );
 
 pub(super) fn webgl_extensions() -> Vec<deno_core::Extension> {
     vec![host_v8_webgl::init()]
+}
+
+pub(super) fn webgl_lazy_extensions() -> Vec<deno_core::Extension> {
+    vec![host_v8_webgl::lazy_init()]
 }

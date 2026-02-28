@@ -106,8 +106,13 @@ pub(crate) mod worker;
 
 mod host_runtime;
 mod js_bindings;
+pub mod snapshot;
 
 pub use host_runtime::HostJsRuntime;
+pub use host_runtime::V8LimitsConfig;
+
+#[cfg(test)]
+mod tests_v8_limits;
 pub use rendering::image::cache::clear_shared_image_cache;
 
 deno_core::extension!(

@@ -6,12 +6,16 @@ use std::{
 
 use deno_core::{
     Extension, FsModuleLoader, JsRuntime, ModuleLoader, OpState, PollEventLoopOptions,
-    RuntimeOptions, op2, resolve_path,
+    RuntimeOptions, op2, resolve_path, v8,
 };
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use shared::op_state::HostOpState;
+
+/// Maximum size for a single worker message payload (16 MB).
+/// Prevents large messages from bypassing V8 heap limits.
+const MAX_WORKER_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -199,7 +203,13 @@ async fn op_worker_create(
         // Create dummy channels for services the worker does not use
         let (render_tx, _render_rx) = crossbeam_channel::bounded(1);
         let (io_tx, _io_rx) = mpsc::unbounded_channel();
-        let (audio_tx, _audio_rx) = mpsc::unbounded_channel();
+        let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
+        // Workers don't send audio commands in practice, but the type
+        // system requires an AudioSender.  Use a no-op ThreadWakeup.
+        let audio_tx = shared::op_state::AudioSender::new(
+            audio_raw_tx,
+            shared::channel::ThreadWakeup::new(),
+        );
 
         let worker_state = HostOpState {
             id: host.id,
@@ -251,6 +261,14 @@ fn op_worker_post_message(
     state: &mut OpState,
     #[string] json_message: String,
 ) -> Result<(), WorkerError> {
+    if json_message.len() > MAX_WORKER_MESSAGE_BYTES {
+        return Err(WorkerError::Message(format!(
+            "Worker message too large: {} bytes (max {} bytes)",
+            json_message.len(),
+            MAX_WORKER_MESSAGE_BYTES
+        )));
+    }
+
     let handle = state
         .try_borrow::<WorkerHandle>()
         .ok_or_else(|| WorkerError::Message("No active worker".into()))?;
@@ -328,6 +346,14 @@ fn op_worker_inner_post_message(
     state: &mut OpState,
     #[string] json_message: String,
 ) -> Result<(), WorkerError> {
+    if json_message.len() > MAX_WORKER_MESSAGE_BYTES {
+        return Err(WorkerError::Message(format!(
+            "Worker message too large: {} bytes (max {} bytes)",
+            json_message.len(),
+            MAX_WORKER_MESSAGE_BYTES
+        )));
+    }
+
     let ctx = state.borrow::<WorkerCtx>();
     ctx.tx_to_main
         .send(json_message)
@@ -408,6 +434,10 @@ pub fn worker_extensions() -> Vec<Extension> {
     vec![host_v8_worker::init()]
 }
 
+pub fn worker_lazy_extensions() -> Vec<Extension> {
+    vec![host_v8_worker::lazy_init()]
+}
+
 pub fn worker_inner_extensions(ctx: WorkerCtx) -> Vec<Extension> {
     vec![host_v8_worker_inner::init(ctx)]
 }
@@ -474,11 +504,53 @@ fn spawn_worker_thread(
                     let module_loader: Option<Rc<dyn ModuleLoader>> =
                         Some(Rc::new(WorkerModuleLoader(FsModuleLoader)));
 
+                    // Apply the same V8 heap limits as the main thread to prevent
+                    // worker code from OOM-ing the entire process.
+                    let v8_limits = crate::V8LimitsConfig::default();
+                    let create_params = Some(
+                        v8::Isolate::create_params()
+                            .heap_limits(v8_limits.initial_heap_size, v8_limits.max_heap_size),
+                    );
+
                     let mut rt = JsRuntime::new(RuntimeOptions {
                         module_loader,
                         extensions: exts,
+                        create_params,
                         ..Default::default()
                     });
+
+                    // Register near-heap-limit callback for OOM protection
+                    {
+                        let hard_cap = v8_limits.max_heap_size.saturating_add(8 * 1024 * 1024);
+                        let oom_handle = rt.v8_isolate().thread_safe_handle();
+                        let oom_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let cb_fired = Arc::clone(&oom_fired);
+                        let cb_tx = tx_errors.clone();
+
+                        rt.add_near_heap_limit_callback(
+                            move |current_limit, _initial_limit| {
+                                let first = cb_fired
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    )
+                                    .is_ok();
+                                if first {
+                                    warn!("[Worker] V8 heap limit reached, terminating");
+                                    oom_handle.terminate_execution();
+                                    let _ = cb_tx.send(
+                                        r#"{"message":"Worker terminated: V8 heap limit exceeded"}"#
+                                            .to_string(),
+                                    );
+                                }
+                                current_limit
+                                    .saturating_add(1024 * 1024)
+                                    .min(hard_cap)
+                            },
+                        );
+                    }
 
                     // Resolve and load worker script
                     let code_path = std::path::PathBuf::from(&code_dir);

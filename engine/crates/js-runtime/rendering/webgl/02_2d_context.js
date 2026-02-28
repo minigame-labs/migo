@@ -451,7 +451,20 @@ class CanvasRenderingContext2D {
     set lineDashOffset(value) { }
 }
 
-// Expose frame-end-all for RAF integration
-globalThis.__migo_frame_end_all = () => { op_frame_end_all(); };
+// Frame-end callback registry.  Each module registers its own cleanup
+// function instead of overwriting a global.  This avoids load-order
+// dependencies between 2D and WebGL modules.
+if (!globalThis.__migo_frame_end_hooks) {
+    globalThis.__migo_frame_end_hooks = [];
+    globalThis.__migo_frame_end_all = () => {
+        const hooks = globalThis.__migo_frame_end_hooks;
+        for (let i = 0; i < hooks.length; i++) {
+            hooks[i]();
+        }
+    };
+}
+globalThis.__migo_frame_end_hooks.push(() => {
+    op_frame_end_all();
+});
 
 export { CanvasRenderingContext2D };

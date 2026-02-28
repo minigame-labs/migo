@@ -303,3 +303,7 @@ deno_core::extension!(
 pub fn storage_extensions() -> Vec<Extension> {
     vec![host_v8_storage::init()]
 }
+
+pub fn storage_lazy_extensions() -> Vec<Extension> {
+    vec![host_v8_storage::lazy_init()]
+}

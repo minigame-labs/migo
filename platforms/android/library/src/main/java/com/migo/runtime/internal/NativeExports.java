@@ -20,6 +20,11 @@ import com.migo.runtime.internal.platform.Vibrator;
 import com.migo.runtime.internal.platform.AudioRecorderManager;
 import com.migo.runtime.internal.platform.CameraManager;
 
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.os.Handler;
+import android.os.Looper;
+
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -46,7 +51,153 @@ public final class NativeExports {
     private static final ConcurrentHashMap<Integer, NetworkMonitor> sNetworkMonitors =
             new ConcurrentHashMap<>();
 
+    /** Per-session error callbacks (registered by GameSession). */
+    private static final ConcurrentHashMap<Integer, NativeErrorCallback> sErrorCallbacks =
+            new ConcurrentHashMap<>();
+
+    /** Handler for dispatching callbacks to the main thread. */
+    private static final Handler sMainHandler = new Handler(Looper.getMainLooper());
+
     private NativeExports() {}
+
+    // ==================== Error Notification (from native) ====================
+
+    /**
+     * Callback interface for native engine errors.
+     * <p>
+     * Implemented by the session owner (e.g. {@code GameSession}) to receive
+     * fatal error notifications from the Rust engine.
+     *
+     * @hide
+     */
+    public interface NativeErrorCallback {
+        /**
+         * Called when a fatal native engine error occurs.
+         * <p>
+         * Always called on the <b>main thread</b>.
+         *
+         * @param errorCode Native error code (see {@code ErrorCode.NATIVE_*} constants)
+         * @param message   Human-readable error message
+         * @param detail    Detailed information (stack trace, etc.), may be empty
+         */
+        void onNativeError(int errorCode, String message, String detail);
+    }
+
+    /**
+     * Register an error callback for a session.
+     * <p>
+     * Call during session creation. Only one callback per session is supported;
+     * a subsequent registration replaces the previous one.
+     *
+     * @param sessionId The session ID
+     * @param callback  The callback to receive error notifications
+     * @hide
+     */
+    public static void registerErrorCallback(int sessionId, NativeErrorCallback callback) {
+        if (callback != null) {
+            sErrorCallbacks.put(sessionId, callback);
+        }
+    }
+
+    /**
+     * Unregister the error callback for a session.
+     * <p>
+     * Call during session shutdown.
+     *
+     * @param sessionId The session ID
+     * @hide
+     */
+    public static void unregisterErrorCallback(int sessionId) {
+        sErrorCallbacks.remove(sessionId);
+    }
+
+    /**
+     * Called from native code (Rust) when a fatal engine error occurs.
+     * <p>
+     * This method is invoked from native threads (host thread, watchdog thread, etc.)
+     * and dispatches the error to the registered callback on the <b>main thread</b>.
+     * <p>
+     * JNI signature: {@code (IILjava/lang/String;Ljava/lang/String;)V}
+     *
+     * @param hostId    Session/host ID
+     * @param errorCode Native error code:
+     *                  203 = OutOfMemory, 204 = JsExecutionTimeout,
+     *                  205 = HostPanic, 206 = ANR,
+     *                  207 = CodeSignatureInvalid, 208 = CodeIntegrityFailed
+     * @param message   Human-readable error message
+     * @param detail    Detailed error information (stack trace, context)
+     */
+    public static void onError(int hostId, int errorCode, String message, String detail) {
+        NativeErrorCallback callback = sErrorCallbacks.get(hostId);
+        if (callback != null) {
+            // Dispatch to main thread — native calls may come from any thread
+            sMainHandler.post(() -> {
+                // Re-check: session may have been destroyed between post and dispatch
+                NativeErrorCallback cb = sErrorCallbacks.get(hostId);
+                if (cb != null) {
+                    cb.onNativeError(errorCode,
+                            message != null ? message : "Unknown native error",
+                            detail != null ? detail : "");
+                }
+            });
+        }
+    }
+
+    // ==================== Image Decoding ====================
+
+    /**
+     * Decode image bytes to RGBA using Android's BitmapFactory.
+     * Returns [width_le32, height_le32, RGBA_bytes...] or null on failure.
+     *
+     * <p>ARGB_8888 internal pixel format is 0xAARRGGBB. On little-endian devices
+     * (all Android), {@code copyPixelsToBuffer} writes bytes as B,G,R,A per pixel.
+     * We perform an in-place BGRA→RGBA swizzle before returning so the caller
+     * always receives true RGBA byte order.
+     *
+     * @param imageData Raw image file bytes (JPEG, PNG, BMP, etc.)
+     * @return Packed byte array: 8-byte header (width + height as little-endian int32) + RGBA pixels, or null
+     */
+    public static byte[] decodeImageRgba(byte[] imageData) {
+        if (imageData == null || imageData.length == 0) return null;
+
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        // Decode as non-premultiplied so RGB channels are unmodified.
+        // The GL pipeline handles alpha blending; premultiplied data
+        // would corrupt colours when used with straight-alpha blending.
+        opts.inPremultiplied = false;
+
+        Bitmap bitmap = BitmapFactory.decodeByteArray(imageData, 0, imageData.length, opts);
+        if (bitmap == null) return null;
+
+        // Ensure ARGB_8888 config for consistent pixel format
+        if (bitmap.getConfig() != Bitmap.Config.ARGB_8888) {
+            Bitmap converted = bitmap.copy(Bitmap.Config.ARGB_8888, false);
+            bitmap.recycle();
+            if (converted == null) return null;
+            bitmap = converted;
+        }
+
+        int w = bitmap.getWidth();
+        int h = bitmap.getHeight();
+        int pixelCount = w * h;
+
+        // Single allocation: 8-byte header + pixel data (eliminates the
+        // previous redundant pixelBuf allocation).
+        ByteBuffer buf = ByteBuffer.allocate(8 + pixelCount * 4);
+        buf.order(ByteOrder.LITTLE_ENDIAN);
+        buf.putInt(w);
+        buf.putInt(h);
+
+        // copyPixelsToBuffer writes raw pixel bytes in native memory order.
+        // Android's ARGB_8888 (backed by Skia kRGBA_8888) stores bytes as
+        // R, G, B, A from low to high address — already RGBA byte order.
+        // No swizzle needed.
+        bitmap.copyPixelsToBuffer(buf);
+        bitmap.recycle();
+
+        return buf.array();
+    }
 
     // ==================== File System ====================
 

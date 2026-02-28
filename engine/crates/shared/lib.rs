@@ -39,6 +39,7 @@
 //! Each command type flows through dedicated channels, enabling concurrent
 //! processing across specialized threads (main, render, audio, IO).
 
+pub mod channel;
 pub mod codec;
 pub mod config;
 pub mod device;

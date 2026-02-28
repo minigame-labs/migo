@@ -13,6 +13,10 @@ pub struct DebugStats {
     pub frame_time_us: AtomicU32,
     /// Total number of dropped RAF signals (cumulative).
     pub dropped_frames: AtomicU32,
+    /// Fatal error code from the engine (0 = no error).
+    /// Set when the host thread is terminated (e.g., OOM, Timeout).
+    /// Java layer can poll this to detect engine errors.
+    pub fatal_error_code: AtomicU32,
 }
 
 impl DebugStats {

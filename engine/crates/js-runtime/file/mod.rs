@@ -57,3 +57,7 @@ extension!(host_v8_file,
 pub fn file_extensions() -> Vec<Extension> {
     vec![host_v8_file::init()]
 }
+
+pub fn file_lazy_extensions() -> Vec<Extension> {
+    vec![host_v8_file::lazy_init()]
+}

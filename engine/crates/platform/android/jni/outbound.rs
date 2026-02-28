@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use jni::{
     JNIEnv,
     signature::{Primitive, ReturnType},
@@ -5,6 +7,8 @@ use jni::{
 };
 use shared::{
     device::{Orientation, SystemSettings},
+    error::{EngineError, ErrorCode},
+    protocol::io_cmd::NormalizedImage,
     surface::{SafeArea, WindowInfo},
 };
 
@@ -220,7 +224,7 @@ fn call_void_with_string(method_name: &str, host_id: i32, json: &str) -> Result<
                 class,
                 *method_id,
                 ReturnType::Primitive(Primitive::Void),
-                &[jvalue { i: host_id }, jvalue { l: jstr.into_raw() as *mut _ }],
+                &[jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }],
             )
         };
 
@@ -312,7 +316,7 @@ pub fn vibrate_short(vibrate_type: &str) -> Result<i32, String> {
                 class,
                 *method_id,
                 ReturnType::Primitive(Primitive::Int),
-                &[jvalue { l: jstr.into_raw() as *mut _ }],
+                &[jvalue { l: jstr.as_raw() as *mut _ }],
             )
         };
 
@@ -388,7 +392,7 @@ pub fn set_device_orientation(host_id: i32, value: &str) -> Result<i32, String> 
                 class,
                 *method_id,
                 ReturnType::Primitive(Primitive::Int),
-                &[jvalue { i: host_id }, jvalue { l: jstr.into_raw() as *mut _ }],
+                &[jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }],
             )
         };
 
@@ -625,7 +629,7 @@ pub fn encode_gbk(data: &str) -> Result<Vec<u8>, String> {
                 class,
                 *method_id,
                 ReturnType::Array,
-                &[jvalue { l: j_data.into_raw() as *mut _ }],
+                &[jvalue { l: j_data.as_raw() as *mut _ }],
             )
         };
 
@@ -672,7 +676,7 @@ pub fn decode_gbk(data: &[u8]) -> Result<String, String> {
                 class,
                 *method_id,
                 ReturnType::Object,
-                &[jvalue { l: j_bytes.into_raw() as *mut _ }],
+                &[jvalue { l: j_bytes.as_raw() as *mut _ }],
             )
         };
 
@@ -728,8 +732,8 @@ pub fn unzip_file(zip_path: &str, dest_dir: &str) -> Result<usize, String> {
                 *method_id,
                 ReturnType::Object,
                 &[
-                    jvalue { l: j_zip_path.into_raw() as *mut _ },
-                    jvalue { l: j_dest_dir.into_raw() as *mut _ },
+                    jvalue { l: j_zip_path.as_raw() as *mut _ },
+                    jvalue { l: j_dest_dir.as_raw() as *mut _ },
                 ],
             )
         };
@@ -782,7 +786,7 @@ pub fn set_clipboard_data(host_id: i32, data: &str) -> Result<(), String> {
                 class,
                 *method_id,
                 ReturnType::Primitive(Primitive::Int),
-                &[jvalue { i: host_id }, jvalue { l: jstr.into_raw() as *mut _ }],
+                &[jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }],
             )
         };
 
@@ -844,7 +848,7 @@ fn call_camera_json(method_name: &str, host_id: i32, options_json: &str) -> Resu
                 class,
                 *method_id,
                 ReturnType::Object,
-                &[jvalue { i: host_id }, jvalue { l: jstr.into_raw() as *mut _ }],
+                &[jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }],
             )
         };
 
@@ -929,4 +933,152 @@ pub fn camera_close_frame_change(host_id: i32, camera_id: u32) -> Result<(), Str
         |_env, _| Ok(()),
         &[jvalue { i: host_id }, jvalue { i: camera_id as i32 }],
     )
+}
+
+// ==================== Error Notification ====================
+
+/// Notify the Java layer about a fatal engine error.
+///
+/// Calls `NativeExports.onError(hostId, errorCode, message, detail)`.
+///
+/// This is called from:
+/// - `catch_unwind` when the host thread panics
+/// - Watchdog when an ANR is detected
+/// - V8 heap limit / execution timeout handlers
+///
+/// **Thread safety:** This function uses `with_env` which attaches the calling
+/// thread to the JVM if not already attached.  Safe to call from any thread
+/// (host thread, watchdog thread, etc.).
+pub fn notify_error(host_id: i32, error_code: u16, message: &str, detail: &str) -> Result<(), String> {
+    with_env(|env| {
+        // Defensively clear any pre-existing JNI exception state so that
+        // string creation below doesn't fail due to a stale exception from
+        // a prior JNI call (e.g., during OOM or crash paths).
+        if env.exception_check().unwrap_or(false) {
+            env.exception_clear().ok();
+        }
+
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = cache
+            .get_method_id("onError")
+            .ok_or("Method ID not found for onError")?;
+        let class = cache.class();
+
+        // OOM-resilient string creation: if new_string fails (e.g., under
+        // heavy memory pressure), fall back to empty strings so the error
+        // code still reaches Java.
+        let j_msg = env.new_string(message)
+            .or_else(|_| env.new_string(""))
+            .map_err(|e| format!("Failed to create Java string for message: {e}"))?;
+        let j_detail = env.new_string(detail)
+            .or_else(|_| env.new_string(""))
+            .map_err(|e| format!("Failed to create Java string for detail: {e}"))?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Primitive(Primitive::Void),
+                &[
+                    jvalue { i: host_id },
+                    jvalue { i: error_code as i32 },
+                    jvalue { l: j_msg.as_raw() as *mut _ },
+                    jvalue { l: j_detail.as_raw() as *mut _ },
+                ],
+            )
+        };
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("Failed to call onError: {e}"))
+            }
+        }
+    })
+}
+
+// ==================== Image Decoding ====================
+
+/// Decode image bytes to RGBA using Android's BitmapFactory via JNI.
+/// Returns NormalizedImage on success.
+///
+/// The Java side returns a packed byte array: `[width_le32, height_le32, RGBA_pixels...]`.
+/// We strip the 8-byte header in-place (`Vec::drain`) to avoid an extra allocation
+/// that the previous `bytes[8..].to_vec()` approach incurred.
+pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError> {
+    let result: Result<NormalizedImage, String> = with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports cache not initialized")?;
+        let method_id = cache
+            .get_method_id("decodeImageRgba")
+            .ok_or("decodeImageRgba method not found")?;
+        let class = cache.class();
+
+        let j_data = env
+            .byte_array_from_slice(data)
+            .map_err(|e| format!("Failed to create byte array: {e}"))?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Object,
+                &[jvalue { l: j_data.as_raw() as *mut _ }],
+            )
+        };
+
+        match result {
+            Ok(val) => {
+                let obj = val.l().map_err(|e| format!("expected object: {e}"))?;
+                if obj.is_null() {
+                    return Err("BitmapFactory returned null".into());
+                }
+                let byte_array = jni::objects::JByteArray::from(obj);
+                let mut bytes = env.convert_byte_array(byte_array)
+                    .map_err(|e| format!("Failed to read result bytes: {e}"))?;
+
+                if bytes.len() < 8 {
+                    return Err("BitmapFactory response too short".into());
+                }
+
+                let width = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let height = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+
+                let expected = (width as usize) * (height as usize) * 4;
+                if bytes.len() - 8 != expected {
+                    return Err(format!(
+                        "BitmapFactory: expected {} RGBA bytes, got {}",
+                        expected,
+                        bytes.len() - 8
+                    ));
+                }
+
+                // Strip the 8-byte header in-place, reusing the existing Vec allocation
+                // instead of `bytes[8..].to_vec()` which would allocate a second buffer.
+                bytes.drain(..8);
+
+                Ok(NormalizedImage {
+                    width,
+                    height,
+                    rgba: Arc::new(bytes),
+                })
+            }
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("BitmapFactory JNI call failed: {e}"))
+            }
+        }
+    });
+
+    result.map_err(|e| EngineError::new(ErrorCode::ImageReadError).with_detail(e))
 }

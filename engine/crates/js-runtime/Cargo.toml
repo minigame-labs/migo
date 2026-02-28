@@ -6,6 +6,11 @@ edition = "2024"
 [lib]
 path = "lib.rs"
 
+[features]
+default = ["v8-limits", "code-signing"]
+v8-limits = ["shared/v8-limits"]
+code-signing = ["shared/code-signing"]
+
 [dependencies]
 deno_core.workspace=true
 # Only enable tokio features actually needed (not "full")

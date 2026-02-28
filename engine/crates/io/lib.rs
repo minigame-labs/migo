@@ -5,8 +5,8 @@ mod io_thread;
 #[cfg(feature = "zip-extract")]
 mod zip_extract;
 
-pub use fast_image_decoder::decode_image_fast;
+pub use fast_image_decoder::{decode_image_fast, register_platform_decoder};
 pub use image_cache::{global_cache, CacheStats, CachedImage, ImageCache};
-pub use io_thread::*;
+pub use io_thread::run_io_handler;
 #[cfg(feature = "zip-extract")]
 pub use zip_extract::{extract_zip, extract_zip_async, ZipError};

@@ -47,3 +47,13 @@ extension!(host_v8_network,
 pub(crate) fn network_extensions() -> Vec<deno_core::Extension> {
     vec![host_v8_network::init(Default::default())]
 }
+
+pub(crate) fn network_lazy_extensions() -> Vec<deno_core::Extension> {
+    vec![host_v8_network::lazy_init()]
+}
+
+/// Create extension args with default Options.
+/// This wrapper avoids exposing the private `Options` type outside this module.
+pub(crate) fn network_extension_args() -> deno_core::ExtensionArguments {
+    host_v8_network::args(Default::default())
+}

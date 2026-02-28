@@ -10,3 +10,7 @@ esm = [
 pub fn touch_extensions() -> Vec<Extension> {
     vec![host_v8_touch::init()]
 }
+
+pub fn touch_lazy_extensions() -> Vec<Extension> {
+    vec![host_v8_touch::lazy_init()]
+}

@@ -64,6 +64,12 @@ public final class RuntimeConfig {
     private final boolean debugEnabled;
     private final LogLevel logLevel;
 
+    // Safety settings
+    private final boolean watchdogEnabled;
+    private final int watchdogTimeoutSecs;
+    private final boolean codeSigningEnabled;
+    private final String codeSigningPubkey;
+
     private RuntimeConfig(Builder builder) {
         this.cacheDir = builder.cacheDir;
         this.filesDir = builder.filesDir;
@@ -72,6 +78,10 @@ public final class RuntimeConfig {
         this.targetFps = builder.targetFps;
         this.debugEnabled = builder.debugEnabled;
         this.logLevel = builder.logLevel;
+        this.watchdogEnabled = builder.watchdogEnabled;
+        this.watchdogTimeoutSecs = builder.watchdogTimeoutSecs;
+        this.codeSigningEnabled = builder.codeSigningEnabled;
+        this.codeSigningPubkey = builder.codeSigningPubkey;
     }
 
     // ==================== Getters ====================
@@ -97,6 +107,18 @@ public final class RuntimeConfig {
     /** Get the log level */
     public LogLevel getLogLevel() { return logLevel; }
 
+    /** Check whether ANR watchdog is enabled */
+    public boolean isWatchdogEnabled() { return watchdogEnabled; }
+
+    /** Get ANR watchdog timeout in seconds */
+    public int getWatchdogTimeoutSecs() { return watchdogTimeoutSecs; }
+
+    /** Check whether code signing verification is enabled */
+    public boolean isCodeSigningEnabled() { return codeSigningEnabled; }
+
+    /** Get hex Ed25519 public key used by code signing verification (nullable) */
+    public String getCodeSigningPubkey() { return codeSigningPubkey; }
+
     // ==================== JNI field access ====================
 
     /** @hide */
@@ -110,6 +132,9 @@ public final class RuntimeConfig {
                 ", targetFps=" + targetFps +
                 ", debugEnabled=" + debugEnabled +
                 ", logLevel=" + logLevel +
+                ", watchdogEnabled=" + watchdogEnabled +
+                ", watchdogTimeoutSecs=" + watchdogTimeoutSecs +
+                ", codeSigningEnabled=" + codeSigningEnabled +
                 '}';
     }
 
@@ -131,6 +156,12 @@ public final class RuntimeConfig {
         // Debug
         private boolean debugEnabled = false;
         private LogLevel logLevel = LogLevel.WARN;
+
+        // Safety
+        private boolean watchdogEnabled = true;
+        private int watchdogTimeoutSecs = 10;
+        private boolean codeSigningEnabled = true;
+        private String codeSigningPubkey = null;
 
         /**
          * Create a new builder with required context.
@@ -222,6 +253,51 @@ public final class RuntimeConfig {
          */
         public Builder setLogLevel(LogLevel level) {
             this.logLevel = level != null ? level : LogLevel.WARN;
+            return this;
+        }
+
+        /**
+         * Enable or disable the native watchdog.
+         * <p>
+         * Default: enabled.
+         */
+        public Builder setWatchdogEnabled(boolean enabled) {
+            this.watchdogEnabled = enabled;
+            return this;
+        }
+
+        /**
+         * Set watchdog timeout in seconds.
+         * <p>
+         * Values are clamped to [5, 120]. Default: 10.
+         */
+        public Builder setWatchdogTimeoutSecs(int timeoutSecs) {
+            this.watchdogTimeoutSecs = Math.max(5, Math.min(120, timeoutSecs));
+            return this;
+        }
+
+        /**
+         * Enable or disable code signing verification.
+         * <p>
+         * Default: enabled.
+         */
+        public Builder setCodeSigningEnabled(boolean enabled) {
+            this.codeSigningEnabled = enabled;
+            return this;
+        }
+
+        /**
+         * Set Ed25519 public key (hex, 64 chars) for code signing verification.
+         * <p>
+         * Required when code signing is enabled.
+         */
+        public Builder setCodeSigningPubkey(String pubkeyHex) {
+            if (pubkeyHex == null) {
+                this.codeSigningPubkey = null;
+            } else {
+                String trimmed = pubkeyHex.trim();
+                this.codeSigningPubkey = trimmed.isEmpty() ? null : trimmed;
+            }
             return this;
         }
 

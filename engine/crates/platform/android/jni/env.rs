@@ -17,6 +17,12 @@ pub fn init_jni_env(jvm: JavaVM) -> Result<(), String> {
     with_env(|env| register_java_exports(env))?;
     with_env(|env| register_native_exports(env))?;
 
+    // Register Android BitmapFactory as the platform image decoder.
+    // This replaces Rust image/zune-image decoders on Android, saving ~2-4 MB in the binary.
+    io::register_platform_decoder(|data| {
+        crate::android::jni::outbound::decode_image_rgba_jni(data)
+    });
+
     Ok(())
 }
 

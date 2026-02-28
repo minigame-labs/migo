@@ -189,6 +189,33 @@ impl RenderThread {
                             }
                             Err(e) => error!("GLCmd failed: {}", e),
                         },
+                        RenderCommand::GLBatch { commands } => {
+                            let cmd_count = commands.len();
+                            let mut batch_dirty = false;
+                            let mut error_count: u32 = 0;
+                            for gl_cmd in commands {
+                                match renderer_gl.handle_command(cm, gl, gl_cmd) {
+                                    Ok(was_render) => {
+                                        if was_render {
+                                            batch_dirty = true;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // Log first error in detail; suppress the rest to avoid log spam.
+                                        if error_count == 0 {
+                                            error!("GLBatch cmd failed: {}", e);
+                                        }
+                                        error_count += 1;
+                                    }
+                                }
+                            }
+                            if error_count > 1 {
+                                warn!("GLBatch: {error_count}/{cmd_count} commands failed");
+                            }
+                            if batch_dirty {
+                                *dirty = true;
+                            }
+                        }
 
                         RenderCommand::Canvas2D { canvas_id, cmd } => match renderer_2d.handle_command(cm, canvas_id, cmd) {
                             Ok(was_render) => {

@@ -277,11 +277,12 @@ public final class NativeBridge {
 
     /**
      * Get debug statistics from the render thread.
-     * Returns a 12-byte array containing (all little-endian u32):
+     * Returns a 16-byte array containing (all little-endian u32):
      * <ul>
      *   <li>[0..4) fps_x10 — FPS multiplied by 10 (e.g., 598 = 59.8 FPS)</li>
      *   <li>[4..8) frame_time_us — Last frame time in microseconds</li>
      *   <li>[8..12) dropped_frames — Total dropped RAF signals</li>
+     *   <li>[12..16) fatal_error_code — Last fatal engine error code (0 = none)</li>
      * </ul>
      *
      * @param sessionId The session ID

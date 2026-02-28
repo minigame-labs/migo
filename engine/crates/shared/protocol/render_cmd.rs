@@ -70,6 +70,10 @@ pub enum RenderCommand {
 
     Canvas(CanvasCmd),
     GL(GLCmd),
+    /// Batched WebGL commands executed in-order by render thread.
+    GLBatch {
+        commands: Vec<GLCmd>,
+    },
 
     /// Single Canvas2D command (V1 - immediate mode)
     Canvas2D {
@@ -252,7 +256,8 @@ pub enum GLCmd {
     ShaderSource {
         shader_id: ShaderId,
         source: String,
-        resp: RenderCmdResp<()>,
+        /// `None` = fire-and-forget (batched path).
+        resp: Option<RenderCmdResp<()>>,
     },
 
     CompileShader {
@@ -263,7 +268,8 @@ pub enum GLCmd {
     AttachShader {
         program_id: ProgramId,
         shader_id: ShaderId,
-        resp: RenderCmdResp<()>,
+        /// `None` = fire-and-forget (batched path).
+        resp: Option<RenderCmdResp<()>>,
     },
 
     GetShaderParameter {

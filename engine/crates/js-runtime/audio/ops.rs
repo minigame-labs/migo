@@ -1,14 +1,14 @@
 use deno_core::{JsBuffer, OpState, op2};
 use shared::{
     error::{EngineError, ErrorCode},
-    op_state::HostOpState,
+    op_state::{AudioSender, HostOpState},
     protocol::audio_cmd::{
         AudioBufferId, AudioBufferInfo, AudioCmd, AudioContextId, AudioNodeId,
         InnerAudioId, InnerAudioInfo, InnerAudioState,
     },
 };
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio::sync::oneshot;
 use tracing;
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
@@ -55,7 +55,7 @@ fn audio_err(msg: impl Into<String>) -> AudioError {
 }
 
 #[inline]
-fn get_audio_tx(state: Rc<RefCell<OpState>>) -> UnboundedSender<AudioCmd> {
+fn get_audio_tx(state: Rc<RefCell<OpState>>) -> AudioSender {
     let st = state.borrow();
     st.borrow::<HostOpState>().audio_tx.clone()
 }

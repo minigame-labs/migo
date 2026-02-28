@@ -3,6 +3,26 @@ use jni::{
     objects::{JObject, JString},
 };
 
+/// Get an optional String field from a Java object.
+/// Returns `None` if the field is null, empty, or cannot be read.
+pub(crate) fn get_optional_string_field(
+    env: &mut JNIEnv,
+    field_name: &str,
+    obj: &JObject,
+) -> Option<String> {
+    let val = env.get_field(obj, field_name, "Ljava/lang/String;").ok()?;
+    let jobj = val.l().ok()?;
+    if jobj.is_null() {
+        return None;
+    }
+    let jstr = JString::from(jobj);
+    let s = env
+        .get_string(&jstr)
+        .ok()
+        .map(|s| s.to_string_lossy().into_owned())?;
+    if s.is_empty() { None } else { Some(s) }
+}
+
 pub(crate) fn get_string_field(
     env: &mut JNIEnv,
     field_name: &str,

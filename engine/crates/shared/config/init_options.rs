@@ -100,6 +100,23 @@ pub struct InitOptions {
     log_level: LogLevel,
     /// Maximum memory limit for JavaScript runtime in MB.
     max_memory_mb: i32,
+    /// Whether the ANR watchdog is enabled.
+    /// When enabled, a background thread monitors the host thread's heartbeat
+    /// and terminates the V8 isolate if it becomes unresponsive.
+    watchdog_enabled: bool,
+    /// ANR watchdog timeout in seconds.
+    /// If the host thread doesn't heartbeat within this duration, the watchdog
+    /// will terminate the V8 isolate and report an ANR.
+    /// Clamped to [5, 120]. Default: 10.
+    watchdog_timeout_secs: i32,
+    /// Whether code signing verification is enforced.
+    ///
+    /// When enabled, `code_signing_pubkey` must be provided and every module
+    /// load will validate manifest signature + file hash before execution.
+    code_signing_enabled: bool,
+    /// Ed25519 public key for code signing verification (hex-encoded, 64 chars).
+    /// Used only when `code_signing_enabled` is true.
+    code_signing_pubkey: Option<String>,
     /// Platform-specific or experimental options.
     extras: Extras,
 }
@@ -116,6 +133,10 @@ impl Default for InitOptions {
             debug_enabled: false,
             log_level: LogLevel::Warn,
             max_memory_mb: 512,
+            watchdog_enabled: true,
+            watchdog_timeout_secs: 10,
+            code_signing_enabled: true,
+            code_signing_pubkey: None,
             extras: Extras::new(),
         }
     }
@@ -201,6 +222,31 @@ impl InitOptions {
     #[inline]
     pub fn max_memory_mb(&self) -> i32 {
         self.max_memory_mb
+    }
+
+    /// Returns whether the ANR watchdog is enabled.
+    #[inline]
+    pub fn watchdog_enabled(&self) -> bool {
+        self.watchdog_enabled
+    }
+
+    /// Returns the ANR watchdog timeout in seconds.
+    #[inline]
+    pub fn watchdog_timeout_secs(&self) -> i32 {
+        self.watchdog_timeout_secs
+    }
+
+    /// Returns whether code signing verification is enabled.
+    #[inline]
+    pub fn code_signing_enabled(&self) -> bool {
+        self.code_signing_enabled
+    }
+
+    /// Returns the Ed25519 public key for code signing verification.
+    /// Used only when `code_signing_enabled()` returns true.
+    #[inline]
+    pub fn code_signing_pubkey(&self) -> Option<&str> {
+        self.code_signing_pubkey.as_deref()
     }
 
     /// Returns a reference to the extras map.
@@ -319,6 +365,57 @@ impl InitOptions {
     #[must_use]
     pub fn with_max_memory_mb(mut self, mb: i32) -> Self {
         self.max_memory_mb = mb.clamp(64, 2048);
+        self
+    }
+
+    /// Enable or disable the ANR watchdog (builder pattern).
+    ///
+    /// When enabled, a background thread monitors the host thread's heartbeat
+    /// and terminates the V8 isolate if it becomes unresponsive.
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` - Whether the watchdog should be active
+    #[must_use]
+    pub fn with_watchdog_enabled(mut self, enabled: bool) -> Self {
+        self.watchdog_enabled = enabled;
+        self
+    }
+
+    /// Sets the ANR watchdog timeout in seconds (builder pattern).
+    ///
+    /// Values are clamped to the range [5, 120].
+    ///
+    /// # Arguments
+    ///
+    /// * `secs` - Timeout in seconds
+    #[must_use]
+    pub fn with_watchdog_timeout_secs(mut self, secs: i32) -> Self {
+        self.watchdog_timeout_secs = secs.clamp(5, 120);
+        self
+    }
+
+    /// Enable or disable code signing verification (builder pattern).
+    ///
+    /// When enabled, a valid Ed25519 public key must be provided via
+    /// `with_code_signing_pubkey(...)`.
+    #[must_use]
+    pub fn with_code_signing_enabled(mut self, enabled: bool) -> Self {
+        self.code_signing_enabled = enabled;
+        self
+    }
+
+    /// Sets the Ed25519 public key for code signing verification (builder pattern).
+    ///
+    /// The key should be hex-encoded (64 characters for 32 bytes).
+    /// Pass `None` to disable code signing verification.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` - Hex-encoded Ed25519 public key, or `None` to disable
+    #[must_use]
+    pub fn with_code_signing_pubkey(mut self, pubkey: Option<String>) -> Self {
+        self.code_signing_pubkey = pubkey;
         self
     }
 

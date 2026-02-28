@@ -643,6 +643,14 @@ impl InnerAudioPlayer {
         self.shared.state() == PlaybackState::Playing && self.shared.is_loaded()
     }
 
+    /// Returns `true` if this player has an active streaming download
+    /// (receiving decoded chunks from the network). Used by the power
+    /// manager to keep the audio thread in Active state during downloads.
+    #[inline]
+    pub fn is_streaming(&self) -> bool {
+        self.stream_rx.is_some()
+    }
+
     /// Process and mix samples into output buffer
     /// Returns true if still playing, false if finished
     pub fn process(&mut self, output: &mut [f32]) -> bool {

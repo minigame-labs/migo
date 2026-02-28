@@ -17,3 +17,7 @@ extension!(
 pub(crate) fn utility_extensions() -> Vec<deno_core::Extension> {
     vec![host_v8_utility::init()]
 }
+
+pub(crate) fn utility_lazy_extensions() -> Vec<deno_core::Extension> {
+    vec![host_v8_utility::lazy_init()]
+}

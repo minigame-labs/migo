@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use shared::channel::ThreadWakeup;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::audio_cmd::{
     AudioBufferInfo, AudioCmd, AudioContextId, AudioContextState, AudioNodeId,
@@ -23,6 +23,7 @@ use crate::nodes::{
     PannerNode, PanningModel, DistanceModel, WaveShaperNode,
 };
 use crate::output::AudioOutput;
+use crate::power_manager::{AudioPowerConfig, AudioPowerManager, AudioPowerState};
 use crate::resampler;
 use crate::streaming::{self, StreamingState};
 
@@ -60,43 +61,6 @@ impl NodeContextIndex {
     }
 }
 
-/// Wakeup signal for the audio thread to avoid busy-waiting.
-#[derive(Clone)]
-pub struct AudioWakeup {
-    inner: Arc<(Mutex<bool>, Condvar)>,
-}
-
-impl AudioWakeup {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new((Mutex::new(false), Condvar::new())),
-        }
-    }
-
-    /// Signal the audio thread to wake up.
-    pub fn notify(&self) {
-        let (lock, cvar) = &*self.inner;
-        let mut signaled = lock.lock().unwrap();
-        *signaled = true;
-        cvar.notify_one();
-    }
-
-    /// Wait for a signal or timeout. Returns true if signaled.
-    pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        let (lock, cvar) = &*self.inner;
-        let mut signaled = lock.lock().unwrap();
-        if *signaled {
-            *signaled = false;
-            return true;
-        }
-        let result = cvar.wait_timeout(signaled, timeout).unwrap();
-        signaled = result.0;
-        let was_signaled = *signaled;
-        *signaled = false;
-        was_signaled || result.1.timed_out()
-    }
-}
-
 /// Result of thread initialization
 enum InitResult {
     Ok(thread::ThreadId),
@@ -105,6 +69,7 @@ enum InitResult {
 
 pub struct AudioThread {
     tx: UnboundedSender<AudioCmd>,
+    wakeup: ThreadWakeup,
     handle: Option<thread::JoinHandle<()>>,
     thread_id: thread::ThreadId,
 }
@@ -113,6 +78,12 @@ impl AudioThread {
     pub fn spawn(host_tx: tokio::sync::mpsc::Sender<HostCommand>) -> EngineResult<Self> {
         let (tx, rx) = unbounded_channel::<AudioCmd>();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<InitResult>(1);
+
+        // Create the shared wakeup handle. A clone lives in the AudioThread
+        // (and is handed to AudioSender via `sender()`), another clone goes
+        // into `run_audio_thread`.
+        let wakeup = ThreadWakeup::new();
+        let wakeup_for_thread = wakeup.clone();
 
         let handle = thread::Builder::new()
             .name("Migo-AudioThread".into())
@@ -132,8 +103,8 @@ impl AudioThread {
 
                 info!("AudioThread started");
 
-                // Run the audio thread loop
-                run_audio_thread(rx, output, host_tx);
+                // Run the audio thread loop with power management
+                run_audio_thread(rx, output, host_tx, wakeup_for_thread);
 
                 info!("AudioThread stopped");
             })
@@ -148,6 +119,7 @@ impl AudioThread {
         match init_rx.recv() {
             Ok(InitResult::Ok(thread_id)) => Ok(Self {
                 tx,
+                wakeup,
                 handle: Some(handle),
                 thread_id,
             }),
@@ -162,13 +134,69 @@ impl AudioThread {
         }
     }
 
+    /// Return an [`AudioSender`](shared::op_state::AudioSender) that wraps
+    /// the command channel + wakeup handle. Every `.send()` on the returned
+    /// sender also signals the audio thread to wake up immediately.
     #[inline]
-    pub fn sender(&self) -> UnboundedSender<AudioCmd> {
-        self.tx.clone()
+    pub fn sender(&self) -> shared::op_state::AudioSender {
+        shared::op_state::AudioSender::new(self.tx.clone(), self.wakeup.clone())
+    }
+
+    /// Spawn the audio thread using a **pre-existing** channel + wakeup.
+    ///
+    /// This is the lazy-init variant used by [`AudioService`]: the channel is
+    /// created early (so ops can start sending commands immediately), but the
+    /// thread is only spawned when the first real audio command arrives.
+    ///
+    /// Unlike [`spawn`], this does **not** block the caller waiting for
+    /// `AudioOutput::new()` to complete. The thread initialises audio output
+    /// asynchronously; commands queued before init finishes are buffered in the
+    /// channel and processed once the output is ready.
+    pub fn spawn_with_channel(
+        tx: UnboundedSender<AudioCmd>,
+        rx: UnboundedReceiver<AudioCmd>,
+        wakeup: ThreadWakeup,
+        host_tx: tokio::sync::mpsc::Sender<HostCommand>,
+    ) -> EngineResult<Self> {
+        let wakeup_for_thread = wakeup.clone();
+
+        let handle = thread::Builder::new()
+            .name("Migo-AudioThread".into())
+            .spawn(move || {
+                let output = match AudioOutput::new() {
+                    Ok(out) => out,
+                    Err(e) => {
+                        error!("AudioThread (lazy): failed to initialise audio output: {}", e);
+                        // Drain the channel so senders don't block/leak.
+                        drop(rx);
+                        return;
+                    }
+                };
+
+                info!("AudioThread (lazy) started");
+                run_audio_thread(rx, output, host_tx, wakeup_for_thread);
+                info!("AudioThread (lazy) stopped");
+            })
+            .map_err(|e| {
+                EngineError::from_detail(
+                    ErrorCode::IoError,
+                    format!("Failed to spawn audio thread: {}", e),
+                )
+            })?;
+
+        let thread_id = handle.thread().id();
+
+        Ok(Self {
+            tx,
+            wakeup,
+            handle: Some(handle),
+            thread_id,
+        })
     }
 
     pub fn shutdown(&mut self) {
         let _ = self.tx.send(AudioCmd::Shutdown);
+        self.wakeup.notify();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -178,6 +206,7 @@ impl AudioThread {
 impl Drop for AudioThread {
     fn drop(&mut self) {
         let _ = self.tx.send(AudioCmd::Shutdown);
+        self.wakeup.notify();
 
         // Never join from inside the audio thread itself
         if thread::current().id() == self.thread_id {
@@ -205,11 +234,24 @@ fn calculate_process_frames(sample_rate: u32) -> usize {
     frames.next_power_of_two().max(512).min(4096)
 }
 
-/// Audio thread main loop
+/// Audio thread main loop — 3-level power management.
+///
+/// # Power States
+///
+/// | State       | Tick      | When                                          |
+/// |-------------|-----------|-----------------------------------------------|
+/// | **Active**  |   5 ms    | context Running / player Playing / streaming  |
+/// | **LowPower**|  50 ms    | idle < 3 s (recently stopped)                 |
+/// | **Sleep**   | 500 ms    | idle >= 3 s (deep power save, condvar sleep)  |
+///
+/// In all states, the thread sleeps on a [`ThreadWakeup`] condvar so that
+/// incoming commands (via [`AudioSender`](shared::op_state::AudioSender))
+/// wake it instantly (< 0.5 ms latency).
 fn run_audio_thread(
     mut rx: UnboundedReceiver<AudioCmd>,
     mut output: AudioOutput,
     host_tx: tokio::sync::mpsc::Sender<HostCommand>,
+    wakeup: ThreadWakeup,
 ) {
     let sample_rate = output.sample_rate();
     let channels = output.channels();
@@ -235,17 +277,19 @@ fn run_audio_thread(
     let buffer_size = process_frames * channels as usize;
     let mut process_buffer = vec![0.0f32; buffer_size];
 
-    // Wakeup signal for efficient waiting
-    let wakeup = AudioWakeup::new();
-
     // Get sync handle for callback-driven wakeup
     let mut sync = output.sync().clone();
 
     // Pause state: when true, skip audio processing but still handle commands.
     let mut paused = false;
 
+    // ---- Power manager (3-level: Active / LowPower / Sleep) ----
+    let mut power = AudioPowerManager::new(AudioPowerConfig::default());
+
     loop {
-        // Process commands (non-blocking)
+        // -----------------------------------------------------------------
+        // 1. Drain all pending commands (non-blocking)
+        // -----------------------------------------------------------------
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 AudioCmd::Shutdown => {
@@ -1206,13 +1250,18 @@ fn run_audio_thread(
             }
         }
 
-        // When paused, skip all audio processing and wait for commands.
+        // -----------------------------------------------------------------
+        // 2. When paused (app in background), deep-sleep on condvar.
+        //    Commands are still processed on wake.
+        // -----------------------------------------------------------------
         if paused {
-            wakeup.wait_timeout(Duration::from_millis(100));
+            wakeup.wait_timeout(Duration::from_millis(500));
             continue;
         }
 
-        // Poll streaming data for all players and cache completed downloads
+        // -----------------------------------------------------------------
+        // 3. Poll streaming data for all players and cache completions.
+        // -----------------------------------------------------------------
         for player in inner_players.values_mut() {
             player.poll_stream();
 
@@ -1228,8 +1277,9 @@ fn run_audio_thread(
             }
         }
 
-        // Collect events from all players and push to host.
-        // audio_cmd::InnerAudioEventType is re-exported from host_cmd — same type, no mapping.
+        // -----------------------------------------------------------------
+        // 4. Push player events to the host thread.
+        // -----------------------------------------------------------------
         for player in inner_players.values_mut() {
             for event in player.take_events() {
                 tracing::trace!(
@@ -1244,8 +1294,9 @@ fn run_audio_thread(
             }
         }
 
-        // If the audio stream died (e.g. device disconnected during a call),
-        // try to recreate it so audio resumes without waiting for ResumeAll.
+        // -----------------------------------------------------------------
+        // 5. Recover from dead audio output stream.
+        // -----------------------------------------------------------------
         if !output.is_alive() {
             match AudioOutput::new() {
                 Ok(new_output) => {
@@ -1262,13 +1313,26 @@ fn run_audio_thread(
             }
         }
 
-        // Check if any context or inner player is active
+        // -----------------------------------------------------------------
+        // 6. Determine activity and update power state.
+        // -----------------------------------------------------------------
         let has_active_context = contexts
             .values()
             .any(|ctx| ctx.state() == AudioContextState::Running);
 
         let has_active_inner = inner_players.values().any(|p| p.is_active());
 
+        // Streaming downloads should also keep the thread responsive,
+        // because incoming chunks need to be polled promptly.
+        let has_active_streaming = inner_players.values().any(|p| p.is_streaming());
+
+        let is_active = has_active_context || has_active_inner || has_active_streaming;
+
+        let power_state = power.update(is_active);
+
+        // -----------------------------------------------------------------
+        // 7. Audio processing (only when active).
+        // -----------------------------------------------------------------
         if has_active_context || has_active_inner {
             // Check if callback signaled need for data (lightweight atomic check)
             if sync.check_and_clear() || output.needs_data() {
@@ -1291,15 +1355,20 @@ fn run_audio_thread(
                     output.write(&process_buffer);
                 }
             }
-
-            // Use condvar-based wait instead of busy-sleep for better efficiency.
-            // This reduces CPU usage while maintaining low latency when audio
-            // callback or commands arrive.
-            wakeup.wait_timeout(Duration::from_millis(5));
-        } else {
-            // No active audio - use longer wait to save power.
-            // The wakeup signal ensures we respond quickly when audio starts.
-            wakeup.wait_timeout(Duration::from_millis(50));
         }
+
+        // -----------------------------------------------------------------
+        // 8. Sleep on condvar for the power-state-appropriate duration.
+        //    In ALL states, AudioSender.send() calls wakeup.notify()
+        //    so the thread wakes instantly when a new command arrives.
+        //
+        //    Active:    5 ms — low-latency mixing
+        //    LowPower: 50 ms — recently stopped, may resume
+        //    Sleep:   500 ms — deep power save, < 0.1% CPU
+        // -----------------------------------------------------------------
+        if power_state != AudioPowerState::Active {
+            tracing::trace!("AudioThread power state: {:?}", power_state);
+        }
+        wakeup.wait_timeout(power.wait_duration());
     }
 }

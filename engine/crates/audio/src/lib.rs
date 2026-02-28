@@ -35,6 +35,7 @@
 //! - **Streaming**: Edge-download-edge-play for large audio files
 //! - **Caching**: LRU cache for decoded audio to avoid repeated decoding
 //! - **Resampling**: Automatic sample rate conversion for device compatibility
+//! - **3-Level Power Management**: Active (5ms) / LowPower (50ms) / Sleep (500ms+condvar)
 //!
 //! ## Usage
 //!
@@ -71,6 +72,7 @@
 //! - [`audio_thread`]: Main audio processing thread and command handler
 //! - [`cache`]: LRU audio cache for decoded audio data
 //! - [`streaming`]: HTTP streaming download and progressive decoding
+//! - [`power_manager`]: 3-level power state management
 
 mod audio_thread;
 pub mod cache;
@@ -87,4 +89,4 @@ pub mod power_manager;
 
 pub use audio_thread::*;
 pub use cache::GlobalAudioCache;
-pub use power_manager::{AudioPowerManager, AudioPowerState, AudioPowerConfig, SharedAudioPowerState};
+pub use power_manager::{AudioPowerManager, AudioPowerState, AudioPowerConfig};

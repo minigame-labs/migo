@@ -26,6 +26,7 @@ import {
     op_get_uniform_location,
     op_uniform3f,
     op_uniform_matrix_3fv,
+    op_gl_flush,
 } from "ext:core/ops";
 
 import { core, primordials } from "ext:core/mod.js";
@@ -93,6 +94,20 @@ class WebGLRenderingContext {
         this._canvas = canvas;
         this._options = options;
         this._canvasId = canvas._rid;
+        // Nested Map: programId -> Map(name -> location)
+        // Allows O(1) per-program invalidation via .delete(programId).
+        this._attribLocationCache = new Map();
+        this._uniformLocationCache = new Map();
+        this._programParameterCache = new Map();
+        // shaderId -> Map(pname -> value)
+        this._shaderParameterCache = new Map();
+    }
+
+    /** Invalidate all cached locations/params for a given program. O(1). */
+    _invalidateProgramCaches(programId) {
+        this._attribLocationCache.delete(programId);
+        this._uniformLocationCache.delete(programId);
+        this._programParameterCache.delete(programId);
     }
 
     get canvas() {
@@ -146,11 +161,37 @@ class WebGLRenderingContext {
     }
 
     linkProgram(program) {
-        return op_link_program(program?.id);
+        const programId = program?.id;
+        const ok = op_link_program(programId);
+        if (programId !== undefined) {
+            // Linking can change active attrib/uniform locations and link status.
+            this._invalidateProgramCaches(programId);
+        }
+        return ok;
     }
 
     getProgramParameter(program, pname) {
-        const param = op_get_program_parameter(program?.id, pname);
+        const programId = program?.id;
+        if (programId === undefined) return 0;
+        let inner = this._programParameterCache.get(programId);
+        if (inner) {
+            const cached = inner.get(pname);
+            if (cached !== undefined) {
+                if (
+                    pname === WebglConstants.DELETE_STATUS ||
+                    pname === WebglConstants.VALIDATE_STATUS ||
+                    pname === WebglConstants.LINK_STATUS
+                ) {
+                    return Boolean(cached);
+                }
+                return cached;
+            }
+        } else {
+            inner = new Map();
+            this._programParameterCache.set(programId, inner);
+        }
+        const param = op_get_program_parameter(programId, pname);
+        inner.set(pname, param);
         if (
             pname === WebglConstants.DELETE_STATUS ||
             pname === WebglConstants.VALIDATE_STATUS ||
@@ -166,7 +207,11 @@ class WebGLRenderingContext {
     }
 
     deleteProgram(program) {
-        op_delete_program(program?.id);
+        const programId = program?.id;
+        op_delete_program(programId);
+        if (programId !== undefined) {
+            this._invalidateProgramCaches(programId);
+        }
     }
 
     createShader(type) {
@@ -182,7 +227,23 @@ class WebGLRenderingContext {
     }
 
     getShaderParameter(shader, pname) {
-        const ret = op_get_shader_parameter(shader?.id, pname);
+        const shaderId = shader?.id;
+        if (shaderId === undefined) return 0;
+        // SHADER_TYPE is immutable after creation -- always cacheable.
+        if (pname === WebglConstants.SHADER_TYPE) {
+            let inner = this._shaderParameterCache.get(shaderId);
+            if (inner) {
+                const cached = inner.get(pname);
+                if (cached !== undefined) return cached;
+            } else {
+                inner = new Map();
+                this._shaderParameterCache.set(shaderId, inner);
+            }
+            const val = op_get_shader_parameter(shaderId, pname);
+            inner.set(pname, val);
+            return val;
+        }
+        const ret = op_get_shader_parameter(shaderId, pname);
         if (pname === WebglConstants.COMPILE_STATUS || pname === WebglConstants.DELETE_STATUS) {
             return Boolean(ret);
         }
@@ -198,7 +259,11 @@ class WebGLRenderingContext {
     }
 
     deleteShader(shader) {
-        op_delete_shader(shader?.id);
+        const shaderId = shader?.id;
+        op_delete_shader(shaderId);
+        if (shaderId !== undefined) {
+            this._shaderParameterCache.delete(shaderId);
+        }
     }
 
     drawArrays(mode, first, count) {
@@ -210,7 +275,19 @@ class WebGLRenderingContext {
     }
 
     getAttribLocation(program, name) {
-        return op_get_attrib_location(this._canvasId, program?.id, name);
+        const programId = program?.id;
+        if (programId === undefined) return -1;
+        let inner = this._attribLocationCache.get(programId);
+        if (inner) {
+            const cached = inner.get(name);
+            if (cached !== undefined) return cached;
+        } else {
+            inner = new Map();
+            this._attribLocationCache.set(programId, inner);
+        }
+        const location = op_get_attrib_location(this._canvasId, programId, name);
+        inner.set(name, location);
+        return location;
     }
 
     enableVertexAttribArray(index) {
@@ -249,9 +326,24 @@ class WebGLRenderingContext {
     }
 
     getUniformLocation(program, name) {
-        const id = op_get_uniform_location(this._canvasId, program?.id, name);
-        if (id === null || id === undefined) return null;
-        return new WebglObject(id);
+        const programId = program?.id;
+        if (programId === undefined) return null;
+        let inner = this._uniformLocationCache.get(programId);
+        if (inner) {
+            const cached = inner.get(name);
+            if (cached !== undefined) return cached;
+        } else {
+            inner = new Map();
+            this._uniformLocationCache.set(programId, inner);
+        }
+        const id = op_get_uniform_location(this._canvasId, programId, name);
+        if (id === null || id === undefined) {
+            inner.set(name, null);
+            return null;
+        }
+        const location = new WebglObject(id);
+        inner.set(name, location);
+        return location;
     }
 
     uniform3f(location, x, y, z) {
@@ -277,6 +369,22 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         throw new Error("Not implemented");
     }
 }
+
+// Register GL batch flush into the frame-end hook registry.
+// Uses the same __migo_frame_end_hooks array as 02_2d_context.js,
+// making the system load-order independent.
+if (!globalThis.__migo_frame_end_hooks) {
+    globalThis.__migo_frame_end_hooks = [];
+    globalThis.__migo_frame_end_all = () => {
+        const hooks = globalThis.__migo_frame_end_hooks;
+        for (let i = 0; i < hooks.length; i++) {
+            hooks[i]();
+        }
+    };
+}
+globalThis.__migo_frame_end_hooks.push(() => {
+    op_gl_flush();
+});
 
 export {
     WebGLRenderingContext,

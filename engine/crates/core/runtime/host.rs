@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc};
+use std::{rc::Rc, sync::Arc, time::Instant};
 
 use deno_core::{FsModuleLoader, ModuleLoader};
 use tracing::{error, info};
@@ -15,6 +15,11 @@ use crate::{
 };
 
 use js_runtime::HostJsRuntime;
+
+#[cfg(feature = "v8-limits")]
+use js_runtime::V8LimitsConfig;
+#[cfg(feature = "v8-limits")]
+use crate::runtime::watchdog::{self, WatchdogConfig, WatchdogHandle};
 
 /// Wrapper around `Option<HostJsRuntime>` with `Deref`/`DerefMut`.
 ///
@@ -72,6 +77,11 @@ pub(crate) struct Host {
 
     last_game_id: Option<String>,
     last_entry: Option<String>,
+
+    /// Watchdog handle for JS execution timeout detection.
+    /// Present only when `v8-limits` feature is enabled.
+    #[cfg(feature = "v8-limits")]
+    pub(crate) watchdog: Option<WatchdogHandle>,
 }
 
 impl Drop for Host {
@@ -103,6 +113,9 @@ impl Host {
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,
     ) -> EngineResult<Self> {
+        // ---- P1-5: Startup timing instrumentation ----
+        let t_start = Instant::now();
+
         // ---- RAF channel (render thread → JS async op) ----
         let (raf_tx, raf_rx_raw) = tokio::sync::mpsc::channel::<f64>(2);
         let raf_rx: RafRx = Arc::new(tokio::sync::Mutex::new(raf_rx_raw));
@@ -112,8 +125,12 @@ impl Host {
         vsync::register_vsync_sender(id, vsync_tx);
 
         // ---- Services ----
-        let io = IoService::new()?;
-        let audio = AudioService::new(js_tx.clone())?;
+        // P1-2: IoService only creates the channel here; the handler task
+        // is spawned later inside `runtime.block_on()` by `spawn_handler()`.
+        let io = IoService::new();
+        // P1-5: AudioService is lazy — no thread spawned until the first
+        // real audio command.  Saves ~80 ms on cold start.
+        let audio = AudioService::new(js_tx.clone());
         let render = RenderService::new(
             raf_tx,
             Some(vsync_rx),
@@ -144,8 +161,61 @@ impl Host {
         // ---- Extensions ----
         let extra_ext = platform.extensions(&init_options);
 
+        let t_services = Instant::now();
+        info!(
+            "[Host {}] services init: {:.1}ms (render + IO + audio channels)",
+            id,
+            t_services.duration_since(t_start).as_secs_f64() * 1000.0
+        );
+
+        // ---- V8 limits config ----
+        #[cfg(feature = "v8-limits")]
+        let v8_limits = V8LimitsConfig::from_max_memory_mb(init_options.max_memory_mb());
+
         // ---- JS runtime + bindings cache ----
-        let js = HostJsRuntime::new(id as i32, host_state, extra_ext, module_loader);
+        let t_js_start = Instant::now();
+        let mut js = HostJsRuntime::new(
+            id as i32,
+            host_state,
+            extra_ext,
+            module_loader,
+            #[cfg(feature = "v8-limits")]
+            v8_limits,
+            #[cfg(feature = "code-signing")]
+            init_options.code_signing_enabled(),
+            #[cfg(feature = "code-signing")]
+            init_options.code_signing_pubkey(),
+        );
+        let t_js_done = Instant::now();
+        info!(
+            "[Host {}] JsRuntime init: {:.1}ms (V8 isolate + extensions + bindings)",
+            id,
+            t_js_done.duration_since(t_js_start).as_secs_f64() * 1000.0
+        );
+
+        // ---- Watchdog (v8-limits) ----
+        #[cfg(feature = "v8-limits")]
+        let watchdog = if init_options.watchdog_enabled() {
+            let isolate_handle = js.isolate_handle();
+            let config = WatchdogConfig::default()
+                .with_timeout(std::time::Duration::from_secs(
+                    init_options.watchdog_timeout_secs() as u64,
+                ));
+            Some(watchdog::spawn_watchdog(isolate_handle, config, id as i32)?)
+        } else {
+            info!("[Host {}] ANR watchdog disabled via InitOptions", id);
+            None
+        };
+
+        let t_total = Instant::now();
+        info!(
+            "[Host {}] Host::new() total: {:.1}ms (services={:.1}ms, JsRuntime={:.1}ms, watchdog={:.1}ms)",
+            id,
+            t_total.duration_since(t_start).as_secs_f64() * 1000.0,
+            t_services.duration_since(t_start).as_secs_f64() * 1000.0,
+            t_js_done.duration_since(t_js_start).as_secs_f64() * 1000.0,
+            t_total.duration_since(t_js_done).as_secs_f64() * 1000.0,
+        );
 
         Ok(Self {
             id,
@@ -158,6 +228,8 @@ impl Host {
             init_options,
             last_game_id: None,
             last_entry: None,
+            #[cfg(feature = "v8-limits")]
+            watchdog,
         })
     }
 
@@ -322,10 +394,18 @@ impl Host {
     }
 
     async fn on_evaluate_module(&mut self, game_id: String, entry: String) -> EngineResult<()> {
+        let t_eval_start = Instant::now();
         self.last_game_id = Some(game_id.clone());
         self.last_entry = Some(entry.clone());
 
-        self.js.evaluate_module(game_id, entry).await?;
+        self.js.evaluate_module(game_id.clone(), entry.clone()).await?;
+        info!(
+            "[Host {}] evaluate_module('{}', '{}'): {:.1}ms",
+            self.id,
+            game_id,
+            entry,
+            t_eval_start.elapsed().as_secs_f64() * 1000.0,
+        );
 
         // NOTE: Do NOT call run_event_loop() here. The op-based RAF
         // (op_await_next_frame) creates a permanently-pending op that keeps
@@ -391,13 +471,61 @@ impl Host {
         js_runtime::clear_shared_image_cache();
         io::global_cache().clear();
 
+        // Drop the old watchdog before dropping the runtime.
+        #[cfg(feature = "v8-limits")]
+        {
+            self.watchdog.take();
+        }
+
+        // ---- V8 limits config ----
+        #[cfg(feature = "v8-limits")]
+        let v8_limits = V8LimitsConfig::from_max_memory_mb(self.init_options.max_memory_mb());
+
         // CRITICAL: Drop the old JsRuntime BEFORE creating the new one.
         // Two v8 isolates on the same thread during drop cleanup causes
         // "Cannot create a handle without a HandleScope" crash — the old
         // isolate's cleanup handler can't create a HandleScope when v8's
         // thread-local state was modified by the new isolate's initialization.
         self.js.take_and_drop();
-        self.js.set(HostJsRuntime::new(self.id as i32, host_state, extra_ext, module_loader));
+        let mut new_js = HostJsRuntime::new(
+            self.id as i32,
+            host_state,
+            extra_ext,
+            module_loader,
+            #[cfg(feature = "v8-limits")]
+            v8_limits,
+            #[cfg(feature = "code-signing")]
+            self.init_options.code_signing_enabled(),
+            #[cfg(feature = "code-signing")]
+            self.init_options.code_signing_pubkey(),
+        );
+
+        // Recreate watchdog for the new isolate
+        #[cfg(feature = "v8-limits")]
+        let mut new_watchdog = None;
+        #[cfg(feature = "v8-limits")]
+        if self.init_options.watchdog_enabled() {
+            let isolate_handle = new_js.isolate_handle();
+            let config = WatchdogConfig::default()
+                .with_timeout(std::time::Duration::from_secs(
+                    self.init_options.watchdog_timeout_secs() as u64,
+                ));
+            match watchdog::spawn_watchdog(isolate_handle, config, self.id as i32) {
+                Ok(handle) => new_watchdog = Some(handle),
+                Err(e) => {
+                    error!(
+                        "[Host {}] failed to start watchdog after restart: {} (continuing without watchdog)",
+                        self.id, e
+                    );
+                }
+            }
+        }
+
+        self.js.set(new_js);
+        #[cfg(feature = "v8-limits")]
+        {
+            self.watchdog = new_watchdog;
+        }
 
         // If we have a last evaluated module, reload it
         if let (Some(game_id), Some(entry)) = (self.last_game_id.clone(), self.last_entry.clone()) {

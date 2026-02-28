@@ -1,14 +1,107 @@
+use std::mem;
+
 use bytemuck::allocation::cast_vec;
-use deno_core::{JsBuffer, OpState, op2};
+use deno_core::{op2, JsBuffer, OpState};
 use tracing::error;
 
 use shared::{
+    error::EngineError,
     op_state::CanvasOpState,
     protocol::{
-        render_cmd::{GLCmd, RenderCommand, ShaderType},
-        send_gl, send_gl_with_resp_sync,
+        render_cmd::{GLCmd, RenderCmdResp, RenderCommand, ShaderType},
+        send_gl_with_resp_sync,
     },
 };
+
+/// Maximum number of fire-and-forget GL commands buffered before an
+/// automatic flush.  96 was chosen to keep the per-batch serialisation
+/// overhead below ~1 ms on mid-range Android devices (Snapdragon 7xx)
+/// while still amortising the cross-thread channel send cost.
+const GL_BATCH_FLUSH_THRESHOLD: usize = 96;
+
+pub(crate) struct GlBatchCollector {
+    commands: Vec<GLCmd>,
+}
+
+impl GlBatchCollector {
+    pub(crate) fn new() -> Self {
+        Self {
+            commands: Vec::with_capacity(GL_BATCH_FLUSH_THRESHOLD + 16),
+        }
+    }
+
+    /// Push a command. If the buffer is full, drain it and return the batch.
+    /// Uses `swap` instead of `mem::take` to preserve the allocated capacity.
+    fn push_and_take_if_full(&mut self, cmd: GLCmd) -> Option<Vec<GLCmd>> {
+        self.commands.push(cmd);
+        if self.commands.len() >= GL_BATCH_FLUSH_THRESHOLD {
+            let mut batch = Vec::with_capacity(GL_BATCH_FLUSH_THRESHOLD + 16);
+            mem::swap(&mut self.commands, &mut batch);
+            Some(batch)
+        } else {
+            None
+        }
+    }
+
+    /// Drain all pending commands. Preserves the allocated capacity.
+    fn take_all(&mut self) -> Vec<GLCmd> {
+        let mut batch = Vec::new();
+        mem::swap(&mut self.commands, &mut batch);
+        batch
+    }
+}
+
+#[inline]
+fn send_gl_batch_now(state: &mut OpState, commands: Vec<GLCmd>) {
+    if commands.is_empty() {
+        return;
+    }
+    let ctx = state.borrow::<CanvasOpState>();
+    if let Err(e) = ctx.tx.send(RenderCommand::GLBatch { commands }) {
+        error!("send_gl_batch failed: {e}");
+    }
+}
+
+#[inline]
+fn queue_gl_fire_and_forget(state: &mut OpState, cmd: GLCmd) {
+    let maybe_batch = {
+        let Some(collector) = state.try_borrow_mut::<GlBatchCollector>() else {
+            error!("GlBatchCollector missing in op state");
+            return;
+        };
+        collector.push_and_take_if_full(cmd)
+    };
+
+    if let Some(batch) = maybe_batch {
+        send_gl_batch_now(state, batch);
+    }
+}
+
+fn flush_gl_batch(state: &mut OpState) {
+    let commands = {
+        let Some(collector) = state.try_borrow_mut::<GlBatchCollector>() else {
+            error!("GlBatchCollector missing in op state");
+            return;
+        };
+        collector.take_all()
+    };
+    send_gl_batch_now(state, commands);
+}
+
+#[inline]
+fn send_gl_sync_with_flush<T>(
+    state: &mut OpState,
+    build: impl FnOnce(RenderCmdResp<T>) -> RenderCommand,
+) -> Result<T, EngineError> {
+    flush_gl_batch(state);
+    let ctx = state.borrow::<CanvasOpState>();
+    send_gl_with_resp_sync(ctx, build)
+}
+
+#[op2(fast)]
+pub fn op_gl_flush(state: &mut OpState) {
+    flush_gl_batch(state);
+}
 
 #[op2(fast)]
 pub fn op_viewport(
@@ -19,9 +112,8 @@ pub fn op_viewport(
     #[smi] width: u32,
     #[smi] height: u32,
 ) {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl(
-        ctx,
+    queue_gl_fire_and_forget(
+        state,
         GLCmd::Viewport {
             canvas_id,
             x,
@@ -34,9 +126,8 @@ pub fn op_viewport(
 
 #[op2(fast)]
 pub fn op_clear_color(state: &mut OpState, #[smi] canvas_id: u32, r: f32, g: f32, b: f32, a: f32) {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl(
-        ctx,
+    queue_gl_fire_and_forget(
+        state,
         GLCmd::ClearColor {
             canvas_id,
             r,
@@ -49,9 +140,8 @@ pub fn op_clear_color(state: &mut OpState, #[smi] canvas_id: u32, r: f32, g: f32
 
 #[op2(fast)]
 pub fn op_clear(state: &mut OpState, #[smi] canvas_id: u32, #[smi] bit_field: u32) {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl(
-        ctx,
+    queue_gl_fire_and_forget(
+        state,
         GLCmd::Clear {
             canvas_id,
             bit_field,
@@ -61,8 +151,9 @@ pub fn op_clear(state: &mut OpState, #[smi] canvas_id: u32, #[smi] bit_field: u3
 
 #[op2(fast)]
 pub fn op_create_program(state: &mut OpState) -> i32 {
-    let ctx = state.borrow::<CanvasOpState>();
-    match send_gl_with_resp_sync(ctx, |resp| RenderCommand::GL(GLCmd::CreateProgram { resp })) {
+    match send_gl_sync_with_flush(state, |resp| {
+        RenderCommand::GL(GLCmd::CreateProgram { resp })
+    }) {
         Ok(id) => id as i32,
         Err(e) => {
             error!("create program failed: {e}");
@@ -73,9 +164,8 @@ pub fn op_create_program(state: &mut OpState) -> i32 {
 
 #[op2(fast)]
 pub fn op_use_program(state: &mut OpState, #[smi] canvas_id: u32, #[smi] program_id: u32) {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl(
-        ctx,
+    queue_gl_fire_and_forget(
+        state,
         GLCmd::UseProgram {
             canvas_id,
             program_id,
@@ -85,8 +175,7 @@ pub fn op_use_program(state: &mut OpState, #[smi] canvas_id: u32, #[smi] program
 
 #[op2(fast)]
 pub fn op_link_program(state: &mut OpState, #[smi] program_id: u32) -> bool {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl_with_resp_sync(ctx, |resp| {
+    send_gl_sync_with_flush(state, |resp| {
         RenderCommand::GL(GLCmd::LinkProgram { program_id, resp })
     })
     .unwrap_or(false)
@@ -98,8 +187,7 @@ pub fn op_get_program_parameter(
     #[smi] program_id: u32,
     #[smi] pname: u32,
 ) -> i32 {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl_with_resp_sync(ctx, |resp| {
+    send_gl_sync_with_flush(state, |resp| {
         RenderCommand::GL(GLCmd::GetProgramParameter {
             program_id,
             pname,
@@ -112,8 +200,7 @@ pub fn op_get_program_parameter(
 #[op2]
 #[string]
 pub fn op_get_program_info_log(state: &mut OpState, #[smi] program_id: u32) -> String {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl_with_resp_sync(ctx, |resp| {
+    send_gl_sync_with_flush(state, |resp| {
         RenderCommand::GL(GLCmd::GetProgramInfoLog { program_id, resp })
     })
     .ok()
@@ -123,14 +210,11 @@ pub fn op_get_program_info_log(state: &mut OpState, #[smi] program_id: u32) -> S
 
 #[op2(fast)]
 pub fn op_delete_program(state: &mut OpState, #[smi] program_id: u32) {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl(ctx, GLCmd::DeleteProgram { program_id });
+    queue_gl_fire_and_forget(state, GLCmd::DeleteProgram { program_id });
 }
 
 #[op2(fast)]
 pub fn op_create_shader(state: &mut OpState, #[smi] ty: u32) -> i32 {
-    let ctx = state.borrow::<CanvasOpState>();
-
     let shader_type = match ty {
         glow::VERTEX_SHADER => ShaderType::Vertex,
         glow::FRAGMENT_SHADER => ShaderType::Fragment,
@@ -140,7 +224,7 @@ pub fn op_create_shader(state: &mut OpState, #[smi] ty: u32) -> i32 {
         }
     };
 
-    match send_gl_with_resp_sync(ctx, |resp| {
+    match send_gl_sync_with_flush(state, |resp| {
         RenderCommand::GL(GLCmd::CreateShader { shader_type, resp })
     }) {
         Ok(id) => id as i32,
@@ -153,20 +237,17 @@ pub fn op_create_shader(state: &mut OpState, #[smi] ty: u32) -> i32 {
 
 #[op2(fast)]
 pub fn op_shader_source(state: &mut OpState, #[smi] shader_id: u32, #[string] source: String) {
-    let ctx = state.borrow::<CanvasOpState>();
-    let _ = send_gl_with_resp_sync(ctx, |resp| {
-        RenderCommand::GL(GLCmd::ShaderSource {
-            shader_id,
-            source,
-            resp,
-        })
-    });
+    // Large shader sources are flushed immediately to avoid holding them in the batch queue.
+    let large = source.len() > 4096;
+    queue_gl_fire_and_forget(state, GLCmd::ShaderSource { shader_id, source, resp: None });
+    if large {
+        flush_gl_batch(state);
+    }
 }
 
 #[op2(fast)]
 pub fn op_compile_shader(state: &mut OpState, #[smi] shader_id: u32) -> bool {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl_with_resp_sync(ctx, |resp| {
+    send_gl_sync_with_flush(state, |resp| {
         RenderCommand::GL(GLCmd::CompileShader { shader_id, resp })
     })
     .unwrap_or(false)
@@ -174,14 +255,14 @@ pub fn op_compile_shader(state: &mut OpState, #[smi] shader_id: u32) -> bool {
 
 #[op2(fast)]
 pub fn op_attach_shader(state: &mut OpState, #[smi] program_id: u32, #[smi] shader_id: u32) {
-    let ctx = state.borrow::<CanvasOpState>();
-    let _ = send_gl_with_resp_sync(ctx, |resp| {
-        RenderCommand::GL(GLCmd::AttachShader {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::AttachShader {
             program_id,
             shader_id,
-            resp,
-        })
-    });
+            resp: None,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -190,8 +271,7 @@ pub fn op_get_shader_parameter(
     #[smi] shader_id: u32,
     #[smi] pname: u32,
 ) -> i32 {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl_with_resp_sync(ctx, |resp| {
+    send_gl_sync_with_flush(state, |resp| {
         RenderCommand::GL(GLCmd::GetShaderParameter {
             shader_id,
             pname,
@@ -204,8 +284,7 @@ pub fn op_get_shader_parameter(
 #[op2]
 #[string]
 pub fn op_get_shader_info_log(state: &mut OpState, #[smi] shader_id: u32) -> String {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl_with_resp_sync(ctx, |resp| {
+    send_gl_sync_with_flush(state, |resp| {
         RenderCommand::GL(GLCmd::GetShaderInfoLog { shader_id, resp })
     })
     .ok()
@@ -215,8 +294,7 @@ pub fn op_get_shader_info_log(state: &mut OpState, #[smi] shader_id: u32) -> Str
 
 #[op2(fast)]
 pub fn op_delete_shader(state: &mut OpState, #[smi] shader_id: u32) {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl(ctx, GLCmd::DeleteShader { shader_id });
+    queue_gl_fire_and_forget(state, GLCmd::DeleteShader { shader_id });
 }
 
 #[op2(fast)]
@@ -227,9 +305,8 @@ pub fn op_draw_arrays(
     #[smi] first: i32,
     #[smi] count: i32,
 ) {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl(
-        ctx,
+    queue_gl_fire_and_forget(
+        state,
         GLCmd::DrawArrays {
             canvas_id,
             mode,
@@ -248,9 +325,8 @@ pub fn op_draw_elements(
     #[smi] index_type: u32,
     #[smi] offset: i32,
 ) {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl(
-        ctx,
+    queue_gl_fire_and_forget(
+        state,
         GLCmd::DrawElements {
             canvas_id,
             mode,
@@ -268,8 +344,7 @@ pub fn op_get_attrib_location(
     #[smi] program_id: u32,
     #[string] name: String,
 ) -> i32 {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl_with_resp_sync(ctx, |resp| {
+    send_gl_sync_with_flush(state, |resp| {
         RenderCommand::GL(GLCmd::GetAttribLocation {
             canvas_id,
             program_id,
@@ -289,8 +364,7 @@ pub fn op_enable_vertex_attrib_array(
     #[smi] canvas_id: u32,
     #[smi] index: u32,
 ) {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl(ctx, GLCmd::EnableVertexAttribArray { canvas_id, index });
+    queue_gl_fire_and_forget(state, GLCmd::EnableVertexAttribArray { canvas_id, index });
 }
 
 #[op2(fast)]
@@ -304,9 +378,8 @@ pub fn op_vertex_attrib_pointer(
     #[smi] stride: i32,
     #[smi] offset: i32,
 ) {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl(
-        ctx,
+    queue_gl_fire_and_forget(
+        state,
         GLCmd::VertexAttribPointer {
             canvas_id,
             index,
@@ -321,21 +394,28 @@ pub fn op_vertex_attrib_pointer(
 
 #[op2(fast)]
 pub fn op_create_buffer(state: &mut OpState) -> i32 {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl_with_resp_sync(ctx, |resp| RenderCommand::GL(GLCmd::CreateBuffer { resp }))
-        .map(|id| id as i32)
-        .unwrap_or(-1)
+    send_gl_sync_with_flush(state, |resp| {
+        RenderCommand::GL(GLCmd::CreateBuffer { resp })
+    })
+    .map(|id| id as i32)
+    .unwrap_or(-1)
 }
 
 #[op2(fast)]
 pub fn op_bind_buffer(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32, buffer: i32) {
-    let ctx = state.borrow::<CanvasOpState>();
     let buffer = if buffer < 0 {
         None
     } else {
         Some(buffer as u32)
     };
-    send_gl(ctx, GLCmd::BindBuffer {canvas_id, target, buffer });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BindBuffer {
+            canvas_id,
+            target,
+            buffer,
+        },
+    );
 }
 
 #[op2]
@@ -347,16 +427,14 @@ pub fn op_buffer_data(
     #[buffer] data: Option<JsBuffer>,
     #[smi] usage: u32,
 ) {
-    let ctx = state.borrow::<CanvasOpState>();
-
     let data = data.map(|b| b.as_ref().to_vec());
     if data.is_none() && size <= 0 {
         error!("op_buffer_data: size must > 0 when data is None");
         return;
     }
 
-    send_gl(
-        ctx,
+    queue_gl_fire_and_forget(
+        state,
         GLCmd::BufferData {
             canvas_id,
             target,
@@ -365,6 +443,8 @@ pub fn op_buffer_data(
             usage,
         },
     );
+    // Avoid holding large upload payloads in JS thread batch queue.
+    flush_gl_batch(state);
 }
 
 #[op2]
@@ -374,8 +454,7 @@ pub fn op_get_uniform_location(
     #[smi] program_id: u32,
     #[string] name: String,
 ) -> Option<u32> {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl_with_resp_sync(ctx, |resp| {
+    send_gl_sync_with_flush(state, |resp| {
         RenderCommand::GL(GLCmd::GetUniformLocation {
             canvas_id,
             program_id,
@@ -396,9 +475,8 @@ pub fn op_uniform3f(
     y: f32,
     z: f32,
 ) {
-    let ctx = state.borrow::<CanvasOpState>();
-    send_gl(
-        ctx,
+    queue_gl_fire_and_forget(
+        state,
         GLCmd::Uniform3f {
             canvas_id,
             location,
@@ -417,12 +495,10 @@ pub fn op_uniform_matrix_3fv(
     transpose: bool,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let ctx = state.borrow::<CanvasOpState>();
-
     let value: Vec<f32> = cast_vec(value);
 
-    send_gl(
-        ctx,
+    queue_gl_fire_and_forget(
+        state,
         GLCmd::UniformMatrix3fv {
             canvas_id,
             location,

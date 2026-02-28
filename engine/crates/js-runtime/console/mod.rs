@@ -28,3 +28,7 @@ esm = [
 pub fn console_extensions() -> Vec<Extension> {
     vec![host_v8_console::init()]
 }
+
+pub fn console_lazy_extensions() -> Vec<Extension> {
+    vec![host_v8_console::lazy_init()]
+}

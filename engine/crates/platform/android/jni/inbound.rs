@@ -117,6 +117,14 @@ pub(crate) extern "system" fn init(
     )
     .unwrap_or(3); // Default to Warn (index 3 in new enum)
 
+    let watchdog_enabled = super::get_bool(&mut env, "watchdogEnabled", &options).unwrap_or(true);
+    let watchdog_timeout_secs = super::get_i32(&mut env, "watchdogTimeoutSecs", &options).unwrap_or(10);
+    let code_signing_enabled = super::get_bool(&mut env, "codeSigningEnabled", &options).unwrap_or(true);
+
+    // Read optional code signing public key (hex-encoded Ed25519, 64 chars).
+    // Returns None if the field is null, empty, or not present.
+    let code_signing_pubkey = super::get_optional_string_field(&mut env, "codeSigningPubkey", &options);
+
     let init_options = InitOptions::new()
         .with_pixel_ratio(display_density)
         .with_cache_dir(PathBuf::from(cache_dir))
@@ -124,7 +132,11 @@ pub(crate) extern "system" fn init(
         .with_code_cache_dir(PathBuf::from(code_cache_dir))
         .with_target_fps(target_fps)
         .with_debug_enabled(debug_enabled)
-        .with_log_level(shared::config::LogLevel::from(log_level_ordinal));
+        .with_log_level(shared::config::LogLevel::from(log_level_ordinal))
+        .with_watchdog_enabled(watchdog_enabled)
+        .with_watchdog_timeout_secs(watchdog_timeout_secs)
+        .with_code_signing_enabled(code_signing_enabled)
+        .with_code_signing_pubkey(code_signing_pubkey);
 
     info!(
         "init: density={}, target_fps={}, debug={}, log_level={:?}",
@@ -672,11 +684,13 @@ pub(crate) extern "system" fn getDebugStats(
     let fps_x10 = stats.fps_x10.load(Ordering::Relaxed);
     let frame_time_us = stats.frame_time_us.load(Ordering::Relaxed);
     let dropped = stats.dropped_frames.load(Ordering::Relaxed);
+    let fatal_error = stats.fatal_error_code.load(Ordering::Relaxed);
 
-    let mut buf = [0u8; 12];
+    let mut buf = [0u8; 16];
     buf[0..4].copy_from_slice(&fps_x10.to_le_bytes());
     buf[4..8].copy_from_slice(&frame_time_us.to_le_bytes());
     buf[8..12].copy_from_slice(&dropped.to_le_bytes());
+    buf[12..16].copy_from_slice(&fatal_error.to_le_bytes());
 
     match env.byte_array_from_slice(&buf) {
         Ok(arr) => arr.into_raw(),

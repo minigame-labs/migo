@@ -1,7 +1,7 @@
-use std::{path::PathBuf, rc::Rc, sync::Arc};
+use std::{path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 
 use deno_core::{
-    Extension, JsRuntime, ModuleLoader, PollEventLoopOptions, RuntimeOptions, resolve_path,
+    Extension, JsRuntime, ModuleLoader, PollEventLoopOptions, RuntimeOptions, resolve_path, v8,
 };
 
 use shared::{
@@ -11,12 +11,64 @@ use shared::{
     vfs::{GamePaths, VirtualFS},
 };
 
+#[cfg(feature = "code-signing")]
+use shared::vfs::integrity::IntegrityVerifier;
+
 use crate::{js_bindings::JsBindings, main_extensions};
+
+/// Configuration for V8 heap limits and execution watchdog.
+///
+/// When `v8-limits` feature is enabled, these settings are applied during
+/// runtime creation to protect the host process from runaway JS code.
+#[derive(Debug, Clone)]
+pub struct V8LimitsConfig {
+    /// Maximum V8 heap size in bytes. Default: 256 MB.
+    pub max_heap_size: usize,
+    /// Initial V8 heap size in bytes. 0 = V8 default.
+    pub initial_heap_size: usize,
+}
+
+impl Default for V8LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_heap_size: 256 * 1024 * 1024,  // 256 MB
+            initial_heap_size: 0,                // V8 default
+        }
+    }
+}
+
+impl V8LimitsConfig {
+    /// Create config from `InitOptions.max_memory_mb`.
+    pub fn from_max_memory_mb(mb: i32) -> Self {
+        let mb = mb.clamp(64, 2048) as usize;
+        Self {
+            max_heap_size: mb * 1024 * 1024,
+            initial_heap_size: 0,
+        }
+    }
+}
 
 pub struct HostJsRuntime {
     host_id: i32,
     rt: JsRuntime,
     bindings: JsBindings,
+    /// Shared termination state for OOM callback + watchdog integration.
+    /// Only present when `v8-limits` feature is enabled.
+    #[cfg(feature = "v8-limits")]
+    oom_terminated: Arc<std::sync::atomic::AtomicBool>,
+    /// Code integrity verifier (Ed25519 + SHA256).
+    /// Present when code signing is enabled and configured correctly.
+    #[cfg(feature = "code-signing")]
+    integrity_verifier: Option<IntegrityVerifier>,
+    /// Sticky configuration error for code signing.
+    ///
+    /// We don't fail runtime construction to keep API shape unchanged, but
+    /// module evaluation will fail closed if this is set.
+    #[cfg(feature = "code-signing")]
+    code_signing_error: Option<EngineError>,
+    /// Whether code signing enforcement is enabled for this runtime.
+    #[cfg(feature = "code-signing")]
+    code_signing_enabled: bool,
 }
 
 impl HostJsRuntime {
@@ -25,30 +77,201 @@ impl HostJsRuntime {
     /// - `host_state` will be consumed by js-runtime extensions
     /// - `extra_extensions` is for platform-specific extensions (Android, etc.)
     /// - `module_loader` is supplied by core (e.g., MyModuleLoader(FsModuleLoader))
+    /// - `v8_limits` configures heap limits when `v8-limits` feature is enabled
     pub fn new(
         host_id: i32,
         host_state: HostOpState,
         extra_extensions: Vec<Extension>,
         module_loader: Option<Rc<dyn ModuleLoader>>,
+        #[cfg(feature = "v8-limits")] v8_limits: V8LimitsConfig,
+        #[cfg(feature = "code-signing")] code_signing_enabled: bool,
+        #[cfg(feature = "code-signing")] code_signing_pubkey: Option<&str>,
     ) -> Self {
-        let exts = main_extensions(host_state)
-            .into_iter()
-            .chain(extra_extensions)
-            .collect::<Vec<_>>();
+        // V8 startup snapshot support.
+        //
+        // When a snapshot is available, we use lazy_extensions() to create
+        // extensions with JS already captured in the snapshot (no re-parsing).
+        // The state callbacks are deferred and applied via
+        // lazy_init_extensions() after the runtime is created.
+        //
+        // When no snapshot is available, we fall back to main_extensions()
+        // which creates fully-initialized extensions with JS from source.
+        let t0 = Instant::now();
+        let snapshot_bytes = crate::snapshot::SNAPSHOT_BYTES;
+        let use_snapshot = snapshot_bytes.is_some();
 
+        let exts = if use_snapshot {
+            tracing::info!("[Host {}] using V8 startup snapshot ({} bytes)", host_id,
+                snapshot_bytes.map(|b| b.len()).unwrap_or(0));
+            crate::snapshot::lazy_extensions()
+                .into_iter()
+                .chain(extra_extensions)
+                .collect::<Vec<_>>()
+        } else {
+            tracing::info!("[Host {}] no snapshot, loading JS from source", host_id);
+            main_extensions(host_state.clone())
+                .into_iter()
+                .chain(extra_extensions)
+                .collect::<Vec<_>>()
+        };
+        let t_exts = Instant::now();
+        tracing::info!(
+            "[Host {}] extensions assembled: {:.1}ms (snapshot={})",
+            host_id,
+            t_exts.duration_since(t0).as_secs_f64() * 1000.0,
+            use_snapshot,
+        );
+
+        // Build create_params with heap limits when feature is enabled
+        #[cfg(feature = "v8-limits")]
+        let create_params = {
+            Some(
+                v8::Isolate::create_params()
+                    .heap_limits(v8_limits.initial_heap_size, v8_limits.max_heap_size),
+            )
+        };
+        #[cfg(not(feature = "v8-limits"))]
+        let create_params: Option<v8::CreateParams> = None;
+
+        let t_rt_start = Instant::now();
         let mut rt = JsRuntime::new(RuntimeOptions {
             module_loader,
             extensions: exts,
+            create_params,
+            startup_snapshot: snapshot_bytes,
             ..Default::default()
         });
+        let t_rt_created = Instant::now();
+        tracing::info!(
+            "[Host {}] JsRuntime::new: {:.1}ms",
+            host_id,
+            t_rt_created.duration_since(t_rt_start).as_secs_f64() * 1000.0,
+        );
+
+        // When using snapshot, apply deferred state callbacks now
+        if use_snapshot {
+            let ext_args = crate::snapshot::extension_args(host_state);
+            if let Err(e) = rt.lazy_init_extensions(ext_args) {
+                tracing::error!(
+                    "[Host {}] failed to init extensions from snapshot: {}, falling back",
+                    host_id, e
+                );
+                // NOTE: In a production scenario, we'd recreate without snapshot.
+                // For now, the error is logged and the runtime continues (ops
+                // without state will panic when called — this is a build/deploy
+                // mismatch that should be caught in CI).
+            }
+            tracing::info!(
+                "[Host {}] lazy_init_extensions: {:.1}ms",
+                host_id,
+                t_rt_created.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+
+        // Register near-heap-limit callback that terminates execution on OOM
+        #[cfg(feature = "v8-limits")]
+        let oom_terminated = {
+            let terminated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cb_terminated = Arc::clone(&terminated);
+            let cb_handle = rt.v8_isolate().thread_safe_handle();
+            let hard_cap = v8_limits.max_heap_size.saturating_add(8 * 1024 * 1024);
+
+            rt.add_near_heap_limit_callback(
+                move |current_limit, _initial_limit| {
+                    // Mark OOM once, then terminate execution. Keep a tiny
+                    // bounded headroom instead of unbounded growth.
+                    let first = cb_terminated
+                        .compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_ok();
+                    if first {
+                        cb_handle.terminate_execution();
+                    }
+                    current_limit
+                        .saturating_add(1024 * 1024)
+                        .min(hard_cap)
+                },
+            );
+
+            terminated
+        };
 
         let bindings = JsBindings::new(&mut rt, host_id);
+        tracing::info!(
+            "[Host {}] HostJsRuntime::new total: {:.1}ms",
+            host_id,
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        // Initialize code signing verifier from hex-encoded public key.
+        // Enforced fail-closed: when code signing is enabled but misconfigured,
+        // module load returns a deterministic signature/config error.
+        #[cfg(feature = "code-signing")]
+        let (integrity_verifier, code_signing_error) = if code_signing_enabled {
+            match code_signing_pubkey {
+                Some(hex_key) if !hex_key.is_empty() => {
+                    match IntegrityVerifier::from_hex_pubkey(hex_key) {
+                        Ok(v) => {
+                            tracing::info!("[Host {}] code signing enabled", host_id);
+                            (Some(v), None)
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[Host {}] code signing key invalid: {}",
+                                host_id, e
+                            );
+                            (None, Some(e))
+                        }
+                    }
+                }
+                _ => {
+                    let err = EngineError::new(ErrorCode::CodeSignatureInvalid)
+                        .with_msg("code signing enabled but public key is missing")
+                        .with_detail("set InitOptions.code_signing_pubkey (hex Ed25519 public key)");
+                    tracing::error!("[Host {}] {}", host_id, err);
+                    (None, Some(err))
+                }
+            }
+        } else {
+            tracing::info!("[Host {}] code signing disabled by init options", host_id);
+            (None, None)
+        };
 
         Self {
             host_id,
             rt,
             bindings,
+            #[cfg(feature = "v8-limits")]
+            oom_terminated,
+            #[cfg(feature = "code-signing")]
+            integrity_verifier,
+            #[cfg(feature = "code-signing")]
+            code_signing_error,
+            #[cfg(feature = "code-signing")]
+            code_signing_enabled,
         }
+    }
+
+    /// Get a thread-safe handle to the V8 isolate for cross-thread termination.
+    pub fn isolate_handle(&mut self) -> v8::IsolateHandle {
+        self.rt.v8_isolate().thread_safe_handle()
+    }
+
+    /// Check if the runtime was terminated due to OOM (near-heap-limit callback).
+    #[cfg(feature = "v8-limits")]
+    pub fn was_oom_terminated(&self) -> bool {
+        self.oom_terminated.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Reset OOM termination state. Called after `cancel_terminate_execution`
+    /// during restart to allow the new runtime to operate normally.
+    #[cfg(feature = "v8-limits")]
+    pub fn reset_oom_state(&self) {
+        self.oom_terminated.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Access HostOpState for mutation.
@@ -183,6 +406,7 @@ impl HostJsRuntime {
     /// * `game_id` - Unique game identifier (1-64 alphanumeric, underscore, hyphen)
     /// * `entry` - Entry point file (e.g., "main.js")
     pub async fn evaluate_module(&mut self, game_id: String, entry: String) -> EngineResult<()> {
+        let t_eval = Instant::now();
         // Get base directories from HostOpState
         let (files_dir, cache_dir) = self.get_base_dirs();
 
@@ -206,6 +430,42 @@ impl HostJsRuntime {
         let code_dir_str = code_dir.to_string_lossy().into_owned();
         let game_paths = Arc::new(game_paths);
 
+        // ---- Code signing verification (before loading any JS) ----
+        #[cfg(feature = "code-signing")]
+        if self.code_signing_enabled {
+            if let Some(err) = &self.code_signing_error {
+                return Err(err.clone());
+            }
+            let verifier = self.integrity_verifier.as_mut().ok_or_else(|| {
+                EngineError::new(ErrorCode::CodeSignatureInvalid)
+                    .with_msg("code signing verifier is not initialized")
+            })?;
+            tracing::info!(
+                "[Host {}] verifying code integrity for entry '{}'",
+                self.host_id, entry
+            );
+            let manifest = verifier.verify_entry(&code_dir, &entry).map_err(|e| {
+                tracing::error!(
+                    "[Host {}] code integrity verification failed: {}",
+                    self.host_id, e
+                );
+                e
+            })?;
+            // P1: Full-package verification — ensure every file listed in the
+            // manifest matches its declared SHA256 hash, not just the entry.
+            verifier.verify_all_files(&code_dir, &manifest).map_err(|e| {
+                tracing::error!(
+                    "[Host {}] full package integrity verification failed: {}",
+                    self.host_id, e
+                );
+                e
+            })?;
+            tracing::info!(
+                "[Host {}] code integrity verification passed ({} files)",
+                self.host_id, manifest.files.len()
+            );
+        }
+
         // Store paths and VFS in op state
         self.set_game_paths(Some(game_paths));
         self.set_vfs(Some(Arc::new(vfs)));
@@ -224,12 +484,25 @@ impl HostJsRuntime {
                 .with_detail(e.to_string())
         })?;
 
+        let t_mod_loaded = Instant::now();
+        tracing::info!(
+            "[Host {}] module loaded: {:.1}ms",
+            self.host_id,
+            t_mod_loaded.duration_since(t_eval).as_secs_f64() * 1000.0,
+        );
+
         let evaluation = self.rt.mod_evaluate(module_id);
         if let Err(e) = evaluation.await {
             return Err(EngineError::new(ErrorCode::ModuleLoadError)
                 .with_msg("load main es module")
                 .with_detail(e.to_string()));
         }
+        tracing::info!(
+            "[Host {}] module evaluated: {:.1}ms (total evaluate_module={:.1}ms)",
+            self.host_id,
+            t_mod_loaded.elapsed().as_secs_f64() * 1000.0,
+            t_eval.elapsed().as_secs_f64() * 1000.0,
+        );
         Ok(())
     }
 

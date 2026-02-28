@@ -36,3 +36,7 @@ extension!(
 pub(crate) fn web_extensions() -> Vec<deno_core::Extension> {
     vec![host_v8_web::init()]
 }
+
+pub(crate) fn web_lazy_extensions() -> Vec<deno_core::Extension> {
+    vec![host_v8_web::lazy_init()]
+}

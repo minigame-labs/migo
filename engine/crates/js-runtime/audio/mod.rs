@@ -188,3 +188,7 @@ extension!(host_v8_audio,
 pub fn audio_extensions() -> Vec<Extension> {
     vec![host_v8_audio::init()]
 }
+
+pub fn audio_lazy_extensions() -> Vec<Extension> {
+    vec![host_v8_audio::lazy_init()]
+}

@@ -1,4 +1,5 @@
 import * as amdshim from "ext:host_v8_base/01_amdshim.js"
+import * as gc from "ext:host_v8_base/03_gc.js"
 import * as console from "ext:host_v8_console/01_console.js"
 import * as event from "ext:host_v8_event/01_event.js"
 import * as timers from "ext:host_v8_web/02_timers.js";
@@ -59,6 +60,10 @@ const windowOrWorkerGlobalScope = {
     // Image
     createImage: core.propNonEnumerable(image.createImage),
     createImageData: core.propNonEnumerable(imageData.createImageData),
+
+    // GC / Memory
+    triggerGC: core.propNonEnumerable(gc.triggerGC),
+    getHeapStatistics: core.propNonEnumerable(gc.getHeapStatistics),
 };
 
 export {
