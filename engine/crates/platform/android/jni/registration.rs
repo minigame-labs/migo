@@ -241,6 +241,8 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         // Error notification callback
         // onError(hostId, errorCode, message, detail)
         ("onError", "(IILjava/lang/String;Ljava/lang/String;)V"),
+        // Exit callback
+        ("onExit", "(I)V"),
     ];
 
     let global_class = env

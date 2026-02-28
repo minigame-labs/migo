@@ -191,12 +191,7 @@ pub fn spawn_host_thread(
                     // so it can finish() the Activity.  When Java itself called
                     // shutdown_host(), it can simply ignore this notification.
                     if notify_exit {
-                        platform_ref.notify_error(
-                            id,
-                            ErrorCode::ExitMiniProgram.as_u16(),
-                            "exit mini program",
-                            "",
-                        );
+                        platform_ref.notify_exit(id);
                     }
                 });
 

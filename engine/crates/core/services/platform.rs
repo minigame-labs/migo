@@ -25,6 +25,13 @@ pub trait PlatformServices: Send + Sync {
         None
     }
 
+    /// Notify the host application that the mini program is exiting.
+    ///
+    /// This is called when the JS side calls `exitMiniProgram`.
+    fn notify_exit(&self, _host_id: i32) {
+        // Default: no-op.
+    }
+
     /// Notify the host application about a fatal engine error.
     ///
     /// This is called when:

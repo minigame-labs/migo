@@ -81,6 +81,13 @@ public final class NativeExports {
          * @param detail    Detailed information (stack trace, etc.), may be empty
          */
         void onNativeError(int errorCode, String message, String detail);
+
+        /**
+         * Called when the mini program exits.
+         * <p>
+         * Always called on the <b>main thread</b>.
+         */
+        void onExit();
     }
 
     /**
@@ -138,6 +145,26 @@ public final class NativeExports {
                     cb.onNativeError(errorCode,
                             message != null ? message : "Unknown native error",
                             detail != null ? detail : "");
+                }
+            });
+        }
+    }
+
+    /**
+     * Called from native code (Rust) when the mini program exits.
+     * <p>
+     * JNI signature: {@code (I)V}
+     *
+     * @param hostId    Session/host ID
+     */
+    public static void onExit(int hostId) {
+        NativeErrorCallback callback = sErrorCallbacks.get(hostId);
+        if (callback != null) {
+            // Dispatch to main thread
+            sMainHandler.post(() -> {
+                NativeErrorCallback cb = sErrorCallbacks.get(hostId);
+                if (cb != null) {
+                    cb.onExit();
                 }
             });
         }

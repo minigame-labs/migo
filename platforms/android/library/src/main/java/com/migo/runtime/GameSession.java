@@ -128,12 +128,20 @@ public final class GameSession implements Closeable {
         }
 
         // Register for native engine error callbacks (OOM, ANR, Panic, Timeout)
-        NativeExports.registerErrorCallback(sessionId, (errorCode, message, detail) -> {
-            // All native fatal errors are non-recoverable
-            String fullMessage = detail != null && !detail.isEmpty()
-                    ? message + " — " + detail
-                    : message;
-            notifyError(errorCode, fullMessage, /* recoverable */ false);
+        NativeExports.registerErrorCallback(sessionId, new NativeExports.NativeErrorCallback() {
+            @Override
+            public void onNativeError(int errorCode, String message, String detail) {
+                // All native fatal errors are non-recoverable
+                String fullMessage = detail != null && !detail.isEmpty()
+                        ? message + " — " + detail
+                        : message;
+                notifyError(errorCode, fullMessage, /* recoverable */ false);
+            }
+
+            @Override
+            public void onExit() {
+                notifyGameExit(0);
+            }
         });
     }
 

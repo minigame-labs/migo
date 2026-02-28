@@ -937,6 +937,20 @@ pub fn camera_close_frame_change(host_id: i32, camera_id: u32) -> Result<(), Str
 
 // ==================== Error Notification ====================
 
+/// Notify the Java layer that the host is exiting normally.
+///
+/// Calls `NativeExports.onExit(hostId)` so Java can finish the Activity.
+/// Used when JS calls `exitMiniProgram()` — Java didn't initiate the
+/// shutdown and needs to be told.
+pub fn notify_exit(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "onExit",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
 /// Notify the Java layer about a fatal engine error.
 ///
 /// Calls `NativeExports.onError(hostId, errorCode, message, detail)`.

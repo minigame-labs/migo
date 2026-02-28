@@ -27,6 +27,12 @@ impl PlatformServices for AndroidPlatform {
         Some(Arc::new(AndroidDeviceServices::new(host_id)))
     }
 
+    fn notify_exit(&self, host_id: i32) {
+        if let Err(e) = jni::notify_exit(host_id) {
+            error!("[Host {}] Failed to notify Java of exit: {}", host_id, e);
+        }
+    }
+
     fn notify_error(&self, host_id: i32, error_code: u16, message: &str, detail: &str) {
         if let Err(e) = jni::notify_error(host_id, error_code, message, detail) {
             error!(

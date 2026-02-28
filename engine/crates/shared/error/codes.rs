@@ -41,9 +41,6 @@ pub enum ErrorCode {
     CodeSignatureInvalid = 207,
     /// Code integrity check failed (SHA256 hash mismatch).
     CodeIntegrityFailed = 208,
-    /// JS called `exitMiniProgram` — the host thread is exiting.
-    /// Not a real error; used to notify Java so it can finish the Activity.
-    ExitMiniProgram = 209,
 
     // Image (300..399)
     ImageReadError = 300,
@@ -103,7 +100,6 @@ impl ErrorCode {
             ErrorCode::Anr => "application not responding",
             ErrorCode::CodeSignatureInvalid => "code signature invalid",
             ErrorCode::CodeIntegrityFailed => "code integrity check failed",
-            ErrorCode::ExitMiniProgram => "exit mini program",
 
             ErrorCode::ImageReadError => "image read error",
             ErrorCode::InvalidImageBuffer => "invalid image buffer",
@@ -175,7 +171,6 @@ impl TryFrom<u16> for ErrorCode {
             206 => ErrorCode::Anr,
             207 => ErrorCode::CodeSignatureInvalid,
             208 => ErrorCode::CodeIntegrityFailed,
-            209 => ErrorCode::ExitMiniProgram,
 
             300 => ErrorCode::ImageReadError,
             301 => ErrorCode::InvalidImageBuffer,
