@@ -66,7 +66,5 @@
 -keep public class com.migo.runtime.RuntimeException { public *; }
 -keep public class com.migo.runtime.RuntimeConfig$Builder { public *; }
 
-# Keep callback interfaces
--keep interface com.migo.runtime.callback.OnGameEventListener { *; }
--keep interface com.migo.runtime.callback.OnErrorListener { *; }
--keep interface com.migo.runtime.callback.OnLifecycleListener { *; }
+# Keep callback interface
+-keep interface com.migo.runtime.callback.GameSessionListener { *; }

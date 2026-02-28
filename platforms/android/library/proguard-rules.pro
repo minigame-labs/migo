@@ -79,15 +79,7 @@
 # Callback Interfaces
 # ============================================================================
 
--keep interface com.migo.runtime.callback.OnGameEventListener {
-    *;
-}
-
--keep interface com.migo.runtime.callback.OnErrorListener {
-    *;
-}
-
--keep interface com.migo.runtime.callback.OnLifecycleListener {
+-keep interface com.migo.runtime.callback.GameSessionListener {
     *;
 }
 

@@ -9,8 +9,7 @@ import com.migo.runtime.ErrorCode
 import com.migo.runtime.GameSession
 import com.migo.runtime.MigoRuntime
 import com.migo.runtime.RuntimeConfig
-import com.migo.runtime.callback.OnErrorListener
-import com.migo.runtime.callback.OnGameEventListener
+import com.migo.runtime.callback.GameSessionListener
 
 /**
  * Kotlin example showing idiomatic usage with extension functions.
@@ -74,24 +73,24 @@ class KotlinGameActivity : Activity(), SurfaceHolder.Callback {
             Log.d(TAG, "Code dir: ${paths.codeDir}")
             Log.d(TAG, "User data dir: ${paths.userDataDir}")
 
-            // Set up callbacks using SAM conversion
-            setOnGameEventListener(object : OnGameEventListener {
+            // Set up unified listener
+            setListener(object : GameSessionListener {
                 override fun onGameReady() {
-                    Log.i(TAG, "🎮 Game ready!")
+                    Log.i(TAG, "Game ready!")
                 }
 
                 override fun onGameExit(exitCode: Int) {
-                    Log.i(TAG, "👋 Game exit: $exitCode")
+                    Log.i(TAG, "Game exit: $exitCode")
                     runOnUiThread { finish() }
+                }
+
+                override fun onError(errorCode: Int, message: String, recoverable: Boolean) {
+                    Log.e(TAG, "Error [$errorCode]: $message (recoverable: $recoverable)")
+                    if (!recoverable) {
+                        runOnUiThread { finish() }
+                    }
                 }
             })
-
-            setOnErrorListener { code, message, recoverable ->
-                Log.e(TAG, "❌ Error [$code]: $message (recoverable: $recoverable)")
-                if (!recoverable) {
-                    runOnUiThread { finish() }
-                }
-            }
 
             // Start game - game code should be in paths.codeDir
             startGameSafe(GAME_ENTRY).let { code ->
@@ -144,25 +143,17 @@ fun MigoRuntime.quickStart(
 }
 
 /**
- * Extension for DSL-style callback setup.
+ * Extension for DSL-style listener setup.
  */
-inline fun GameSession.onGameEvent(
+inline fun GameSession.listen(
     crossinline onReady: () -> Unit = {},
-    crossinline onExit: (Int) -> Unit = {}
+    crossinline onExit: (Int) -> Unit = {},
+    crossinline onError: (code: Int, message: String, recoverable: Boolean) -> Unit = { _, _, _ -> }
 ) {
-    setOnGameEventListener(object : OnGameEventListener {
+    setListener(object : GameSessionListener {
         override fun onGameReady() = onReady()
         override fun onGameExit(exitCode: Int) = onExit(exitCode)
+        override fun onError(errorCode: Int, message: String, recoverable: Boolean) =
+            onError(errorCode, message, recoverable)
     })
-}
-
-/**
- * Extension for simple error handling.
- */
-inline fun GameSession.onError(
-    crossinline handler: (code: Int, message: String, recoverable: Boolean) -> Unit
-) {
-    setOnErrorListener { code, message, recoverable ->
-        handler(code, message, recoverable)
-    }
 }

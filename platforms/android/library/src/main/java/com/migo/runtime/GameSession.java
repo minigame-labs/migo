@@ -4,9 +4,7 @@ import android.content.Context;
 import android.view.MotionEvent;
 import android.view.Surface;
 
-import com.migo.runtime.callback.OnErrorListener;
-import com.migo.runtime.callback.OnGameEventListener;
-import com.migo.runtime.callback.OnLifecycleListener;
+import com.migo.runtime.callback.GameSessionListener;
 import com.migo.runtime.internal.NativeExports;
 import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
@@ -31,8 +29,7 @@ import java.io.File;
  * GameSession session = MigoRuntime.getInstance()
  *     .createSession(activity, surface, config, "my-game-id");
  *
- * session.setOnGameEventListener(eventListener);
- * session.setOnErrorListener(errorListener);
+ * session.setListener(listener);
  *
  * // Start the game from its code directory
  * session.startGame("game.js");  // Uses paths.getCodeDir()
@@ -88,10 +85,8 @@ public final class GameSession implements Closeable {
 
     private DebugOverlayView debugOverlay;
 
-    // Callbacks
-    private OnGameEventListener gameEventListener;
-    private OnErrorListener errorListener;
-    private OnLifecycleListener lifecycleListener;
+    // Callback
+    private volatile GameSessionListener listener;
 
     /**
      * Create a new game session.
@@ -293,8 +288,8 @@ public final class GameSession implements Closeable {
                 debugOverlay.stopMonitoring();
             }
             NativeMethods.onHide(sessionId);
-            if (lifecycleListener != null) {
-                lifecycleListener.onPaused();
+            if (listener != null) {
+                listener.onPaused();
             }
         }
     }
@@ -312,8 +307,8 @@ public final class GameSession implements Closeable {
             // Re-request audio focus in case it was permanently lost (e.g.
             // after a phone call). This ensures onAudioInterruptionEnd fires.
             audioFocusManager.requestFocusIfNeeded();
-            if (lifecycleListener != null) {
-                lifecycleListener.onResumed();
+            if (listener != null) {
+                listener.onResumed();
             }
         }
     }
@@ -372,8 +367,8 @@ public final class GameSession implements Closeable {
         // Clean up temporary files
         paths.cleanupTemp();
 
-        if (lifecycleListener != null) {
-            lifecycleListener.onDestroyed();
+        if (listener != null) {
+            listener.onDestroyed();
         }
     }
 
@@ -400,55 +395,37 @@ public final class GameSession implements Closeable {
         return true;
     }
 
-    // ==================== Callbacks ====================
+    // ==================== Callback ====================
 
     /**
-     * Set a listener for game events.
+     * Set the listener for session events.
      *
      * @param listener The listener, or null to remove
      */
-    public void setOnGameEventListener(OnGameEventListener listener) {
-        this.gameEventListener = listener;
-    }
-
-    /**
-     * Set a listener for runtime errors.
-     *
-     * @param listener The listener, or null to remove
-     */
-    public void setOnErrorListener(OnErrorListener listener) {
-        this.errorListener = listener;
-    }
-
-    /**
-     * Set a listener for lifecycle events.
-     *
-     * @param listener The listener, or null to remove
-     */
-    public void setOnLifecycleListener(OnLifecycleListener listener) {
-        this.lifecycleListener = listener;
+    public void setListener(GameSessionListener listener) {
+        this.listener = listener;
     }
 
     // ==================== Internal callbacks from native ====================
 
     /** @hide Called from native code */
     void notifyGameReady() {
-        if (gameEventListener != null) {
-            gameEventListener.onGameReady();
+        if (listener != null) {
+            listener.onGameReady();
         }
     }
 
     /** @hide Called from native code */
     void notifyGameExit(int exitCode) {
-        if (gameEventListener != null) {
-            gameEventListener.onGameExit(exitCode);
+        if (listener != null) {
+            listener.onGameExit(exitCode);
         }
     }
 
     /** @hide Called from native code */
     void notifyError(int errorCode, String message, boolean recoverable) {
-        if (errorListener != null) {
-            errorListener.onError(errorCode, message, recoverable);
+        if (listener != null) {
+            listener.onError(errorCode, message, recoverable);
         }
     }
 

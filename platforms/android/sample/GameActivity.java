@@ -10,9 +10,7 @@ import com.migo.runtime.ErrorCode;
 import com.migo.runtime.GameSession;
 import com.migo.runtime.MigoRuntime;
 import com.migo.runtime.RuntimeConfig;
-import com.migo.runtime.callback.OnErrorListener;
-import com.migo.runtime.callback.OnGameEventListener;
-import com.migo.runtime.callback.OnLifecycleListener;
+import com.migo.runtime.callback.GameSessionListener;
 
 /**
  * Sample Activity demonstrating Migo Runtime integration.
@@ -145,8 +143,7 @@ public class GameActivity extends Activity {
      * Set up game callbacks.
      */
     private void setupCallbacks() {
-        // Game events
-        session.setOnGameEventListener(new OnGameEventListener() {
+        session.setListener(new GameSessionListener() {
             @Override
             public void onGameReady() {
                 Log.i(TAG, "Game is ready!");
@@ -168,68 +165,20 @@ public class GameActivity extends Activity {
             }
 
             @Override
-            public void onLoadingStart() {
-                Log.d(TAG, "Loading started");
-                runOnUiThread(() -> {
-                    // Show loading indicator
-                });
-            }
+            public void onError(int errorCode, String message, boolean recoverable) {
+                Log.e(TAG, "Error [" + errorCode + "]: " + message +
+                           " (recoverable: " + recoverable + ")");
 
-            @Override
-            public void onLoadingEnd() {
-                Log.d(TAG, "Loading ended");
-                runOnUiThread(() -> {
-                    // Hide loading indicator
-                });
+                if (!recoverable) {
+                    runOnUiThread(() -> {
+                        showErrorAndFinish(message);
+                    });
+                }
             }
 
             @Override
             public void onLoadingProgress(float progress, String message) {
                 Log.d(TAG, "Loading: " + (int)(progress * 100) + "% - " + message);
-                runOnUiThread(() -> {
-                    // Update progress bar
-                });
-            }
-        });
-        
-        // Error handling
-        session.setOnErrorListener((errorCode, message, recoverable) -> {
-            Log.e(TAG, "Error [" + errorCode + "]: " + message + 
-                       " (recoverable: " + recoverable + ")");
-            
-            if (!recoverable) {
-                runOnUiThread(() -> {
-                    // Show error dialog and finish
-                    showErrorAndFinish(message);
-                });
-            }
-        });
-        
-        // Lifecycle events
-        session.setOnLifecycleListener(new OnLifecycleListener() {
-            @Override
-            public void onInitialized() {
-                Log.d(TAG, "Runtime initialized");
-            }
-
-            @Override
-            public void onDestroyed() {
-                Log.d(TAG, "Runtime destroyed");
-            }
-
-            @Override
-            public void onPaused() {
-                Log.d(TAG, "Runtime paused");
-            }
-
-            @Override
-            public void onResumed() {
-                Log.d(TAG, "Runtime resumed");
-            }
-
-            @Override
-            public void onSurfaceChanged(int width, int height) {
-                Log.d(TAG, "Surface: " + width + "x" + height);
             }
         });
     }

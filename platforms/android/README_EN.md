@@ -121,8 +121,8 @@ public class GameActivity extends Activity {
 ### With Event Callbacks
 
 ```java
-// Set up game event listener
-session.setOnGameEventListener(new OnGameEventListener() {
+// Set up unified session listener
+session.setListener(new GameSessionListener() {
     @Override
     public void onGameReady() {
         Log.i(TAG, "Game is ready!");
@@ -136,30 +136,14 @@ session.setOnGameEventListener(new OnGameEventListener() {
     }
 
     @Override
-    public void onLoadingProgress(float progress, String message) {
-        updateLoadingProgress(progress, message);
-    }
-});
-
-// Set up error listener
-session.setOnErrorListener((errorCode, message, recoverable) -> {
-    Log.e(TAG, "Error " + errorCode + ": " + message);
-    if (!recoverable) {
-        showErrorDialog(message);
-    }
-});
-
-// Set up lifecycle listener
-session.setOnLifecycleListener(new OnLifecycleListener() {
-    @Override
-    public void onInitialized() {
-        Log.d(TAG, "Runtime initialized");
+    public void onError(int errorCode, String message, boolean recoverable) {
+        Log.e(TAG, "Error " + errorCode + ": " + message);
+        if (!recoverable) {
+            showErrorDialog(message);
+        }
     }
 
-    @Override
-    public void onDestroyed() {
-        Log.d(TAG, "Runtime destroyed");
-    }
+    // Optional: override onLoadingProgress / onPaused / onResumed etc.
 });
 ```
 

@@ -23,6 +23,8 @@ Cargo.lock
 *.log
 logs/
 
+.claude/
+
 # Environment
 .env
 .env.local

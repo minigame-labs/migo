@@ -121,8 +121,8 @@ public class GameActivity extends Activity {
 ### 使用事件回调
 
 ```java
-// 设置游戏事件监听器
-session.setOnGameEventListener(new OnGameEventListener() {
+// 设置统一事件监听器
+session.setListener(new GameSessionListener() {
     @Override
     public void onGameReady() {
         Log.i(TAG, "游戏已就绪!");
@@ -136,17 +136,14 @@ session.setOnGameEventListener(new OnGameEventListener() {
     }
 
     @Override
-    public void onLoadingProgress(float progress, String message) {
-        updateLoadingProgress(progress, message);
+    public void onError(int errorCode, String message, boolean recoverable) {
+        Log.e(TAG, "错误 " + errorCode + ": " + message);
+        if (!recoverable) {
+            showErrorDialog(message);
+        }
     }
-});
 
-// 设置错误监听器
-session.setOnErrorListener((errorCode, message, recoverable) -> {
-    Log.e(TAG, "错误 " + errorCode + ": " + message);
-    if (!recoverable) {
-        showErrorDialog(message);
-    }
+    // 可选: 覆写 onLoadingProgress / onPaused / onResumed 等
 });
 ```
 
