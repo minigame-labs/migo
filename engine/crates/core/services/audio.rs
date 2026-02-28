@@ -11,8 +11,6 @@ use tracing::{error, info};
 /// Lazy audio service — the actual `AudioThread` is not spawned until the
 /// first real audio command arrives.
 ///
-/// # P1-5: Startup Optimization
-///
 /// Creating the `AudioThread` during `Host::new()` was one of the most
 /// expensive steps (~50–100 ms on mid-range devices) because it:
 ///   - Initialises the `cpal` audio output (enumerates devices, opens stream)

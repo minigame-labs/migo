@@ -116,7 +116,7 @@ impl Host {
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,
     ) -> EngineResult<Self> {
-        // ---- P1-5: Startup timing instrumentation ----
+        // ---- Startup timing instrumentation ----
         let t_start = Instant::now();
 
         // ---- RAF channel (render thread → JS async op) ----
@@ -128,10 +128,10 @@ impl Host {
         vsync::register_vsync_sender(id, vsync_tx);
 
         // ---- Services ----
-        // P1-2: IoService only creates the channel here; the handler task
+        // IoService only creates the channel here; the handler task
         // is spawned later inside `runtime.block_on()` by `spawn_handler()`.
         let io = IoService::new();
-        // P1-5: AudioService is lazy — no thread spawned until the first
+        // AudioService is lazy — no thread spawned until the first
         // real audio command.  Saves ~80 ms on cold start.
         let audio = AudioService::new(host_tx.clone());
         let render = RenderService::new(
@@ -538,7 +538,18 @@ impl Host {
             self.on_evaluate_module(game_id, entry).await?;
         }
 
-        // Resume audio; render will resume upon surface update if needed
+        // Resume render and audio so the new runtime can start producing frames.
+        //
+        // Pause sets `has_surface = false` on the render thread (designed for
+        // the OnHide flow where the Android surface is destroyed). In the normal
+        // OnHide→OnShow→UpdateSurface flow, `RecreateOnscreen` restores it.
+        // But restart doesn't go through UpdateSurface (the surface is unchanged),
+        // so we must explicitly re-signal the surface to restore `has_surface`.
+        // Without this, VSync frames are discarded and the RAF loop never fires.
+        if let Err(e) = self.render.restore_surface() {
+            error!("[Host {}] on_restart: restore_surface failed: {}", self.id, e);
+        }
+        self.render.resume();
         self.audio.resume();
 
         Ok(())

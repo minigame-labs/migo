@@ -85,7 +85,6 @@
 //! | **Audio** | Audio decoding, mixing, output |
 //! | **Blocking pool** | File system ops, image decode, zip extract (`spawn_blocking`) |
 //!
-//! **P1-2**: I/O is no longer a separate thread with its own tokio runtime.
 //! The IO handler runs as a `tokio::spawn` task on the Host runtime, sharing
 //! the same epoll fd, timer wheel, and blocking thread pool.  Heavy I/O work
 //! is offloaded to the blocking pool via `tokio::fs` / `spawn_blocking`.

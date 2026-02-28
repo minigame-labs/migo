@@ -68,7 +68,7 @@ pub fn spawn_host_thread(
                     let poll = PollEventLoopOptions::default();
                     let mut host = host;
 
-                    // P1-2: Spawn IO handler as a cooperative task on the Host
+                    // Spawn IO handler as a cooperative task on the Host
                     // runtime.  This eliminates the separate IO tokio runtime
                     // (one fewer epoll fd, timer wheel, and blocking pool).
                     host.io.spawn_handler();
@@ -82,6 +82,13 @@ pub fn spawn_host_thread(
                     let heartbeat_sleep = tokio::time::sleep(std::time::Duration::from_secs(3));
                     tokio::pin!(heartbeat_sleep);
 
+                    // Track whether to notify Java on exit.
+                    // Error paths set this to false (they already call notify_error).
+                    // Normal Shutdown keeps it true so Java learns the host exited
+                    // (needed when JS calls exitMiniProgram — Java didn't initiate
+                    // the shutdown and must finish the Activity).
+                    let mut notify_exit = true;
+
                     'outer: loop {
                         // Tick the watchdog heartbeat before each iteration
                         #[cfg(feature = "v8-limits")]
@@ -89,7 +96,7 @@ pub fn spawn_host_thread(
                             wd.state.tick();
                         }
 
-                        // P1-5: Lazy audio — check if buffered audio commands
+                        // Lazy audio — check if buffered audio commands
                         // require spawning the AudioThread.  Cost when thread
                         // is already running: one branch (is_some check).
                         if let Err(e) = host.audio.check_and_start() {
@@ -133,6 +140,7 @@ pub fn spawn_host_thread(
                                                 &engine_err.msg,
                                                 engine_err.detail.as_deref().unwrap_or(""),
                                             );
+                                            notify_exit = false;
                                             break 'outer;
                                         }
                                     }
@@ -148,6 +156,7 @@ pub fn spawn_host_thread(
                                         &e.msg,
                                         e.detail.as_deref().unwrap_or(""),
                                     );
+                                    notify_exit = false;
                                     break 'outer;
                                 }
                                 // Event loop returned Ok — no pending ops/timers/promises.
@@ -175,6 +184,19 @@ pub fn spawn_host_thread(
                                 continue;
                             }
                         }
+                    }
+
+                    // Notify Java that the host is exiting.  When JS calls
+                    // exitMiniProgram, this is the only way Java learns about it
+                    // so it can finish() the Activity.  When Java itself called
+                    // shutdown_host(), it can simply ignore this notification.
+                    if notify_exit {
+                        platform_ref.notify_error(
+                            id,
+                            ErrorCode::ExitMiniProgram.as_u16(),
+                            "exit mini program",
+                            "",
+                        );
                     }
                 });
 
@@ -245,7 +267,6 @@ fn create_basic_runtime() -> Runtime {
         .event_interval(event_interval)
         .global_queue_interval(global_queue_interval)
         .max_io_events_per_tick(max_io_events_per_tick)
-        // P1-2: Raised from 4 to 8 — the Host runtime now serves both
         // JS (timer ops, module loading) and IO (file system, image decode,
         // zip extract) blocking work that was previously split across two
         // independent tokio runtimes.

@@ -4,8 +4,6 @@ use tracing::info;
 
 /// IO service — manages the channel to the IO handler task.
 ///
-/// # P1-2: Unified tokio runtime
-///
 /// The IO handler no longer runs on a separate thread with its own tokio
 /// runtime.  Instead, it is spawned as a `tokio::spawn` task on the Host
 /// runtime.  This eliminates one epoll fd, one timer wheel, and one set

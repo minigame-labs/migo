@@ -78,6 +78,16 @@ impl RenderService {
         let _ = self.sender().send(RenderCommand::Resume);
     }
 
+    /// Re-signal the current surface to the render thread.
+    ///
+    /// During `Pause`, the render thread sets `has_surface = false`.
+    /// In the normal OnHide→UpdateSurface flow, `RecreateOnscreen` restores it.
+    /// For restart (where the surface hasn't changed), call this before `resume()`
+    /// to restore `has_surface = true` so VSync frames are no longer discarded.
+    pub(crate) fn restore_surface(&mut self) -> EngineResult<()> {
+        self.update_surface(self.surface.clone())
+    }
+
     pub(crate) fn shutdown(&mut self) {
         self.thread.shutdown();
     }
