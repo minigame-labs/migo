@@ -1,3 +1,4 @@
+import * as lifecycle from "ext:host_v8_base/04_lifecycle.js";
 import * as alert from "ext:host_v8_console/01_alert.js";
 import * as url from "ext:host_v8_url/03_url.js";
 import * as location from "ext:host_v8_web/12_location.js";
@@ -187,6 +188,10 @@ const WindowGlobalScope = {
 
     // Worker
     createWorker: core.propNonEnumerable(workerApi.createWorker),
+
+    // App lifecycle
+    restartMiniProgram: core.propNonEnumerable(lifecycle.restartMiniProgram),
+    exitMiniProgram: core.propNonEnumerable(lifecycle.exitMiniProgram),
 };
 
 export { WindowGlobalScope };

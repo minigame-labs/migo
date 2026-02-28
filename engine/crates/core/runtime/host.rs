@@ -72,6 +72,9 @@ pub(crate) struct Host {
     /// Shared RAF receiver — survives JS runtime restarts.
     raf_rx: RafRx,
 
+    /// Sender back to the host event loop (for JS-initiated restart/exit).
+    host_tx: tokio::sync::mpsc::Sender<HostCommand>,
+
     platform: Arc<dyn PlatformServices>,
     init_options: InitOptions,
 
@@ -108,7 +111,7 @@ impl Drop for Host {
 impl Host {
     pub(crate) fn new(
         id: HostId,
-        js_tx: tokio::sync::mpsc::Sender<HostCommand>,
+        host_tx: tokio::sync::mpsc::Sender<HostCommand>,
         surface: SurfaceRef,
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,
@@ -130,7 +133,7 @@ impl Host {
         let io = IoService::new();
         // P1-5: AudioService is lazy — no thread spawned until the first
         // real audio command.  Saves ~80 ms on cold start.
-        let audio = AudioService::new(js_tx.clone());
+        let audio = AudioService::new(host_tx.clone());
         let render = RenderService::new(
             raf_tx,
             Some(vsync_rx),
@@ -151,6 +154,7 @@ impl Host {
             render_tx: render.sender(),
             io_tx: io.sender(),
             audio_tx: audio.sender(),
+            host_tx: host_tx.clone(),
             device_services,
             raf_rx: Some(raf_rx.clone()),
         };
@@ -224,6 +228,7 @@ impl Host {
             audio,
             js: JsRuntimeSlot::new(js),
             raf_rx,
+            host_tx,
             platform,
             init_options,
             last_game_id: None,
@@ -458,6 +463,7 @@ impl Host {
             render_tx: self.render.sender(),
             io_tx: self.io.sender(),
             audio_tx: self.audio.sender(),
+            host_tx: self.host_tx.clone(),
             device_services,
             raf_rx: Some(self.raf_rx.clone()),
         };

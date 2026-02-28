@@ -221,6 +221,7 @@ async fn op_worker_create(
             render_tx,
             io_tx,
             audio_tx,
+            host_tx: host.host_tx.clone(),
             device_services: None,
             raf_rx: None,
         };

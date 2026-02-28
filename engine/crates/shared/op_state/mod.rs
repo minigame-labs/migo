@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::channel::ThreadWakeup;
-use crate::protocol::{audio_cmd::AudioCmd, io_cmd::IOCmd, render_cmd::RenderCommand};
+use crate::protocol::{audio_cmd::AudioCmd, host_cmd::HostCommand, io_cmd::IOCmd, render_cmd::RenderCommand};
 use crate::services::DeviceServices;
 use crate::vfs::{GamePaths, VirtualFS};
 
@@ -13,6 +13,7 @@ use crate::vfs::{GamePaths, VirtualFS};
 pub type RenderTx = crossbeam_channel::Sender<RenderCommand>;
 pub type IoTx = UnboundedSender<IOCmd>;
 pub type AudioTx = AudioSender;
+pub type HostTx = tokio::sync::mpsc::Sender<HostCommand>;
 
 /// Receiver for RAF (requestAnimationFrame) frame signals from the render thread.
 /// Wrapped in Arc<Mutex> so the async op can lock and recv without borrowing OpState.
@@ -71,6 +72,7 @@ pub struct HostOpState {
     pub render_tx: RenderTx,
     pub io_tx: IoTx,
     pub audio_tx: AudioTx,
+    pub host_tx: HostTx,
     /// Platform device services (clipboard, sensors, etc.)
     pub device_services: Option<Arc<dyn DeviceServices>>,
     /// RAF frame signal receiver (set by Host::new, consumed by op_await_next_frame).

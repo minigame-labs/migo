@@ -24,10 +24,10 @@ pub fn spawn_host_thread(
 ) -> EngineResult<HostId> {
     let id = registry::alloc_host_id();
 
-    let (js_tx, mut js_rx) = tokio::sync::mpsc::channel::<HostCommand>(256);
+    let (host_tx, mut host_rx) = tokio::sync::mpsc::channel::<HostCommand>(256);
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
 
-    registry::register_sender(id, js_tx.clone());
+    registry::register_sender(id, host_tx.clone());
 
     // Clone the platform Arc so we can use it in the catch_unwind path
     // to notify Java about errors from any context (host loop, panic, etc.).
@@ -37,7 +37,7 @@ pub fn spawn_host_thread(
         .name(format!("Migo-Main-{}", id))
         .spawn(move || {
             let run = || {
-                let host = match Host::new(id, js_tx, surface, platform, opt) {
+                let host = match Host::new(id, host_tx, surface, platform, opt) {
                     Ok(h) => h,
                     Err(e) => {
                         error!("[Host {}] failed to create host: {}", id, e);
@@ -100,7 +100,7 @@ pub fn spawn_host_thread(
                         tokio::select! {
                             biased;
 
-                            maybe_msg = js_rx.recv() => {
+                            maybe_msg = host_rx.recv() => {
                                 match maybe_msg {
                                     Some(HostCommand::Shutdown) => break 'outer,
                                     Some(msg) => host.handle_command(msg).await,
@@ -156,7 +156,7 @@ pub fn spawn_host_thread(
                                 // park on the command channel to avoid busy spinning.
                                 warn!("[Host {}] event loop idle, parking on command channel", id);
                                 loop {
-                                    match js_rx.recv().await {
+                                    match host_rx.recv().await {
                                         Some(HostCommand::Shutdown) => break 'outer,
                                         Some(msg) => {
                                             host.handle_command(msg).await;
