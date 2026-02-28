@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use core::services::{
     AccelerometerService, AudioPlatformService, BatteryService, CameraService, ClipboardService,
-    CompassService, DeviceMotionService, DeviceServices, GyroscopeService, NetworkService,
-    RecorderService, ScreenService, VibrationService,
+    CompassService, DeviceMotionService, DeviceServices, GyroscopeService, InteractionService,
+    NetworkService, RecorderService, ScreenService, VibrationService,
 };
 
 use crate::android::jni;
@@ -70,6 +70,10 @@ impl DeviceServices for AndroidDeviceServices {
 
     fn camera(&self) -> Option<Arc<dyn CameraService>> {
         Some(Arc::new(AndroidCamera { host_id: self.host_id }))
+    }
+
+    fn interaction(&self) -> Option<Arc<dyn InteractionService>> {
+        Some(Arc::new(AndroidInteraction { host_id: self.host_id }))
     }
 }
 
@@ -314,5 +318,37 @@ impl CameraService for AndroidCamera {
 
     fn close_frame_change(&self, camera_id: u32) -> Result<(), String> {
         jni::camera_close_frame_change(self.host_id, camera_id)
+    }
+}
+
+// ==================== UI Interaction ====================
+
+struct AndroidInteraction {
+    host_id: i32,
+}
+
+impl InteractionService for AndroidInteraction {
+    fn show_toast(&self, json: &str) -> Result<(), String> {
+        jni::show_toast(self.host_id, json)
+    }
+
+    fn hide_toast(&self) -> Result<(), String> {
+        jni::hide_toast(self.host_id)
+    }
+
+    fn show_modal(&self, json: &str) -> Result<(), String> {
+        jni::show_modal(self.host_id, json)
+    }
+
+    fn show_loading(&self, json: &str) -> Result<(), String> {
+        jni::show_loading(self.host_id, json)
+    }
+
+    fn hide_loading(&self) -> Result<(), String> {
+        jni::hide_loading(self.host_id)
+    }
+
+    fn show_action_sheet(&self, json: &str) -> Result<(), String> {
+        jni::show_action_sheet(self.host_id, json)
     }
 }

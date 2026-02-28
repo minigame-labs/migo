@@ -23,6 +23,7 @@ import * as clipboard from 'ext:host_v8_device/07_clipboard.js';
 import * as vibrate from 'ext:host_v8_device/08_vibrate.js';
 import * as screen from 'ext:host_v8_device/09_screen.js';
 import * as network from 'ext:host_v8_device/10_network.js';
+import * as interaction from 'ext:host_v8_ui/01_interaction.js';
 import * as storageApi from 'ext:host_v8_storage/01_storage.js';
 import * as cameraApi from 'ext:host_v8_media/01_camera.js';
 import * as workerApi from 'ext:host_v8_worker/01_worker.js';
@@ -188,6 +189,16 @@ const WindowGlobalScope = {
 
     // Worker
     createWorker: core.propNonEnumerable(workerApi.createWorker),
+
+    // UI Interaction
+    showToast: core.propNonEnumerable(interaction.showToast),
+    hideToast: core.propNonEnumerable(interaction.hideToast),
+    showModal: core.propNonEnumerable(interaction.showModal),
+    _internalOnModalResult: core.propNonEnumerable(interaction._internalOnModalResult),
+    showLoading: core.propNonEnumerable(interaction.showLoading),
+    hideLoading: core.propNonEnumerable(interaction.hideLoading),
+    showActionSheet: core.propNonEnumerable(interaction.showActionSheet),
+    _internalOnActionSheetResult: core.propNonEnumerable(interaction._internalOnActionSheetResult),
 
     // App lifecycle
     restartMiniProgram: core.propNonEnumerable(lifecycle.restartMiniProgram),

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::{CameraService, ClipboardService, NetworkService};
+use super::{CameraService, ClipboardService, InteractionService, NetworkService};
 
 // ==================== Battery ====================
 
@@ -223,6 +223,9 @@ pub trait DeviceServices: Send + Sync {
         None
     }
     fn camera(&self) -> Option<Arc<dyn CameraService>> {
+        None
+    }
+    fn interaction(&self) -> Option<Arc<dyn InteractionService>> {
         None
     }
 }

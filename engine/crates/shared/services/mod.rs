@@ -12,6 +12,7 @@
 mod camera;
 mod clipboard;
 mod device;
+mod interaction;
 mod network;
 
 pub use camera::CameraService;
@@ -21,4 +22,5 @@ pub use device::{
     DeviceMotionService, DeviceServices, GyroscopeService, RecorderService, ScreenService,
     VibrationService,
 };
+pub use interaction::InteractionService;
 pub use network::NetworkService;
