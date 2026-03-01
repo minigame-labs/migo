@@ -1,4 +1,4 @@
-import * as lifecycle from "ext:host_v8_base/04_lifecycle.js";
+import * as lifecycle from "ext:host_v8_lifecycle/02_restart_exit.js";
 import * as alert from "ext:host_v8_console/01_alert.js";
 import * as url from "ext:host_v8_url/03_url.js";
 import * as location from "ext:host_v8_web/12_location.js";
@@ -24,6 +24,18 @@ import * as vibrate from 'ext:host_v8_device/08_vibrate.js';
 import * as screen from 'ext:host_v8_device/09_screen.js';
 import * as network from 'ext:host_v8_device/10_network.js';
 import * as interaction from 'ext:host_v8_ui/01_interaction.js';
+import * as envApi from 'ext:host_v8_env/00_env.js';
+import * as appLifecycle from 'ext:host_v8_lifecycle/01_lifecycle.js';
+import * as updateApp from 'ext:host_v8_update/01_update_app.js';
+import * as updateMgr from 'ext:host_v8_update/02_update_mgr.js';
+import * as bluetooth from 'ext:host_v8_system/01_bluetooth.js';
+import * as authorize from 'ext:host_v8_system/02_authorize.js';
+import * as windowInfo from 'ext:host_v8_system/03_window_info.js';
+import * as systemSetting from 'ext:host_v8_system/04_system_settings.js';
+import * as deviceInfo from 'ext:host_v8_system/05_device_info.js';
+import * as benchmarkLevel from 'ext:host_v8_system/06_benchmark_level.js';
+import * as appInfo from 'ext:host_v8_system/07_app_info.js';
+import * as authorizeSetting from 'ext:host_v8_system/08_authorize_setting.js';
 import * as storageApi from 'ext:host_v8_storage/01_storage.js';
 import * as cameraApi from 'ext:host_v8_media/01_camera.js';
 import * as workerApi from 'ext:host_v8_worker/01_worker.js';
@@ -200,9 +212,52 @@ const WindowGlobalScope = {
     showActionSheet: core.propNonEnumerable(interaction.showActionSheet),
     _internalOnActionSheetResult: core.propNonEnumerable(interaction._internalOnActionSheetResult),
 
-    // App lifecycle
+    // Env
+    env: core.propNonEnumerable(envApi.env),
+
+    // App Lifecycle (show/hide)
+    onShow: core.propNonEnumerable(appLifecycle.onShow),
+    onHide: core.propNonEnumerable(appLifecycle.onHide),
+    offShow: core.propNonEnumerable(appLifecycle.offShow),
+    offHide: core.propNonEnumerable(appLifecycle.offHide),
+    getLaunchOptionsSync: core.propNonEnumerable(appLifecycle.getLaunchOptionsSync),
+    getEnterOptionsSync: core.propNonEnumerable(appLifecycle.getEnterOptionsSync),
+    _internalTriggerOnShow: core.propNonEnumerable(appLifecycle._internalTriggerOnShow),
+    _internalTriggerOnHide: core.propNonEnumerable(appLifecycle._internalTriggerOnHide),
+
+    // App Lifecycle (restart/exit)
     restartMiniProgram: core.propNonEnumerable(lifecycle.restartMiniProgram),
     exitMiniProgram: core.propNonEnumerable(lifecycle.exitMiniProgram),
+
+    // Update
+    updateApp: core.propNonEnumerable(updateApp.updateApp),
+    getUpdateManager: core.propNonEnumerable(updateMgr.getUpdateManager),
+
+    // Bluetooth
+    openSystemBluetoothSetting: core.propNonEnumerable(bluetooth.openSystemBluetoothSetting),
+    _internalOnOpenBluetoothSettingFinished: core.propNonEnumerable(bluetooth._internalOnOpenBluetoothSettingFinished),
+
+    // Authorize
+    openAppAuthorizeSetting: core.propNonEnumerable(authorize.openAppAuthorizeSetting),
+    _internalOnOpenAppAuthorizeSettingFinished: core.propNonEnumerable(authorize._internalOnOpenAppAuthorizeSettingFinished),
+
+    // Window Info
+    getWindowInfo: core.propNonEnumerable(windowInfo.getWindowInfo),
+
+    // System Setting
+    getSystemSetting: core.propNonEnumerable(systemSetting.getSystemSetting),
+
+    // Device Info
+    getDeviceInfo: core.propNonEnumerable(deviceInfo.getDeviceInfo),
+
+    // Benchmark Level
+    getDeviceBenchmarkInfo: core.propNonEnumerable(benchmarkLevel.getDeviceBenchmarkInfo),
+
+    // App Info
+    getAppBaseInfo: core.propNonEnumerable(appInfo.getAppBaseInfo),
+
+    // Authorize Setting
+    getAppAuthorizeSetting: core.propNonEnumerable(authorizeSetting.getAppAuthorizeSetting),
 };
 
 export { WindowGlobalScope };

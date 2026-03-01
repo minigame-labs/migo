@@ -823,26 +823,41 @@ pub fn op_read_file_sync(
 
 // ============================ Unzip ============================
 
-/// Default unzip operation using IOCmd::Unzip (Rust `zip` crate on IO thread).
+/// Unzip operation with platform service dispatch.
 ///
-/// Platforms can override this by providing their own `op_unzip_<platform>` op
-/// and overriding `BaseFileManager.unzip()` in JS. For example, Android uses
-/// `op_unzip_android` backed by `java.util.zip` via JNI.
+/// If the platform provides a `FileService` (e.g. Android's JNI `java.util.zip`),
+/// uses that. Otherwise falls back to `IOCmd::Unzip` (Rust `zip` crate on IO thread).
 #[op2(async(lazy), fast)]
 pub async fn op_unzip(
     state: Rc<RefCell<OpState>>,
     #[string] zip_file_path: String,
     #[string] target_path: String,
 ) -> Result<(), IOError> {
-    let (io_tx, vfs) = {
+    let (io_tx, vfs, file_svc) = {
         let st = state.borrow();
         let host = st.borrow::<HostOpState>();
-        (host.io_tx.clone(), host.vfs.clone())
+        let file_svc = host
+            .device_services
+            .as_ref()
+            .and_then(|s| s.file());
+        (host.io_tx.clone(), host.vfs.clone(), file_svc)
     };
 
     let full_zip_path = resolve_path_vfs(vfs.as_deref(), &zip_file_path, FileOp::Read)?;
     let full_dest_dir = resolve_path_vfs(vfs.as_deref(), &target_path, FileOp::Write)?;
 
+    // Platform-specific unzip (e.g. Android JNI)
+    if let Some(svc) = file_svc {
+        let zip = full_zip_path.clone();
+        let dest = full_dest_dir.clone();
+        return tokio::task::spawn_blocking(move || svc.unzip(&zip, &dest))
+            .await
+            .map_err(|e| IOError::Message(format!("unzip task join error: {e}")))?
+            .map(|_| ())
+            .map_err(|e| IOError::Message(e));
+    }
+
+    // Default: Rust zip crate via IO thread
     protocol::send_fs_with_resp_async(&io_tx, move |resp_tx| IOCmd::Unzip {
         zip_path: full_zip_path,
         dest_dir: full_dest_dir,

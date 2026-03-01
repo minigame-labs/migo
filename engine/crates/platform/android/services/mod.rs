@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use core::services::{
     AccelerometerService, AudioPlatformService, BatteryService, CameraService, ClipboardService,
-    CompassService, DeviceMotionService, DeviceServices, GyroscopeService, InteractionService,
-    NetworkService, RecorderService, ScreenService, VibrationService,
+    CodecService, CompassService, DeviceMotionService, DeviceServices, FileService,
+    GyroscopeService, InteractionService, NetworkService, RecorderService, ScreenService,
+    SystemInfoService, VibrationService,
 };
 
 use crate::android::jni;
@@ -74,6 +75,18 @@ impl DeviceServices for AndroidDeviceServices {
 
     fn interaction(&self) -> Option<Arc<dyn InteractionService>> {
         Some(Arc::new(AndroidInteraction { host_id: self.host_id }))
+    }
+
+    fn system_info(&self) -> Option<Arc<dyn SystemInfoService>> {
+        Some(Arc::new(AndroidSystemInfo { host_id: self.host_id }))
+    }
+
+    fn codec(&self) -> Option<Arc<dyn CodecService>> {
+        Some(Arc::new(AndroidCodec))
+    }
+
+    fn file(&self) -> Option<Arc<dyn FileService>> {
+        Some(Arc::new(AndroidFile))
     }
 }
 
@@ -350,5 +363,63 @@ impl InteractionService for AndroidInteraction {
 
     fn show_action_sheet(&self, json: &str) -> Result<(), String> {
         jni::show_action_sheet(self.host_id, json)
+    }
+}
+
+// ==================== System Info ====================
+
+struct AndroidSystemInfo {
+    host_id: i32,
+}
+
+impl SystemInfoService for AndroidSystemInfo {
+    fn open_bluetooth_settings(&self) -> Result<(), String> {
+        jni::open_bluetooth_settings(self.host_id)
+    }
+
+    fn open_app_authorize_setting(&self) -> Result<(), String> {
+        jni::open_app_authorize_setting(self.host_id)
+    }
+
+    fn get_window_info_json(&self) -> Result<String, String> {
+        let info = jni::get_window_info(self.host_id)?;
+        deno_core::serde_json::to_string(&info).map_err(|e| format!("getWindowInfo:fail {}", e))
+    }
+
+    fn get_system_settings_json(&self) -> Result<String, String> {
+        let settings = jni::get_system_settings()?;
+        deno_core::serde_json::to_string(&settings).map_err(|e| format!("getSystemSetting:fail {}", e))
+    }
+
+    fn get_device_info_json(&self) -> Result<String, String> {
+        jni::get_device_info_json()
+    }
+
+    fn get_app_authorization_setting_json(&self) -> Result<String, String> {
+        jni::get_app_authorization_setting_json()
+    }
+}
+
+// ==================== Codec (GBK) ====================
+
+struct AndroidCodec;
+
+impl CodecService for AndroidCodec {
+    fn encode_gbk(&self, data: &str) -> Result<Vec<u8>, String> {
+        jni::outbound::encode_gbk(data)
+    }
+
+    fn decode_gbk(&self, data: &[u8]) -> Result<String, String> {
+        jni::outbound::decode_gbk(data)
+    }
+}
+
+// ==================== File (Unzip) ====================
+
+struct AndroidFile;
+
+impl FileService for AndroidFile {
+    fn unzip(&self, zip_path: &str, dest_dir: &str) -> Result<usize, String> {
+        jni::outbound::unzip_file(zip_path, dest_dir)
     }
 }

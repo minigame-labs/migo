@@ -11,16 +11,22 @@
 
 mod camera;
 mod clipboard;
+mod codec;
 mod device;
+mod file;
 mod interaction;
 mod network;
+mod system_info;
 
 pub use camera::CameraService;
 pub use clipboard::ClipboardService;
+pub use codec::CodecService;
 pub use device::{
     AccelerometerService, AudioPlatformService, BatteryService, CompassService,
     DeviceMotionService, DeviceServices, GyroscopeService, RecorderService, ScreenService,
     VibrationService,
 };
+pub use file::FileService;
 pub use interaction::InteractionService;
 pub use network::NetworkService;
+pub use system_info::SystemInfoService;

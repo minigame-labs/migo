@@ -72,6 +72,7 @@ function getStorageInfoSync() {
 
 // ==================== Async APIs ====================
 
+// FIXME: this is not really async
 const setStorage = promisify("setStorage", (opts) => setStorageSync(opts.key, opts.data));
 const getStorage = promisify("getStorage", (opts) => ({ data: getStorageSync(opts.key) }));
 const removeStorage = promisify("removeStorage", (opts) => removeStorageSync(opts.key));

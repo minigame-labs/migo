@@ -6,7 +6,6 @@ use deno_core::Extension;
 use shared::config::InitOptions;
 use tracing::error;
 
-use crate::android::extensions::android_extensions;
 use crate::android::jni;
 use crate::android::services::AndroidDeviceServices;
 
@@ -19,8 +18,8 @@ impl AndroidPlatform {
 }
 
 impl PlatformServices for AndroidPlatform {
-    fn extensions(&self, opts: &InitOptions) -> Vec<Extension> {
-        android_extensions(opts)
+    fn extensions(&self, _opts: &InitOptions) -> Vec<Extension> {
+        vec![]
     }
 
     fn create_device_services(&self, host_id: i32) -> Option<Arc<dyn DeviceServices>> {

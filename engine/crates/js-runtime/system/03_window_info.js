@@ -50,7 +50,7 @@ class WindowInfo {
 }
 
 function getWindowInfo() {
-    const info = op_get_window_info()
+    const info = JSON.parse(op_get_window_info());
 
     // Convert safe_area from insets to absolute positions
     // Rust returns: left/top/right/bottom as insets from edges

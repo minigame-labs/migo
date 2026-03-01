@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use super::{CameraService, ClipboardService, InteractionService, NetworkService};
+use super::{
+    CameraService, ClipboardService, CodecService, FileService, InteractionService,
+    NetworkService, SystemInfoService,
+};
 
 // ==================== Battery ====================
 
@@ -226,6 +229,15 @@ pub trait DeviceServices: Send + Sync {
         None
     }
     fn interaction(&self) -> Option<Arc<dyn InteractionService>> {
+        None
+    }
+    fn system_info(&self) -> Option<Arc<dyn SystemInfoService>> {
+        None
+    }
+    fn codec(&self) -> Option<Arc<dyn CodecService>> {
+        None
+    }
+    fn file(&self) -> Option<Arc<dyn FileService>> {
         None
     }
 }

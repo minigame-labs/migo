@@ -1,7 +1,5 @@
-use deno_core::{Extension, OpState, op2, v8};
-use deno_error::JsErrorBox;
+use deno_core::{Extension, op2, v8};
 use shared::op_state::HostOpState;
-use shared::protocol::host_cmd::HostCommand;
 use tracing::debug;
 
 /// Trigger a full V8 garbage collection cycle.
@@ -50,36 +48,17 @@ struct HeapStats {
     external_memory: usize,
 }
 
-#[op2(fast)]
-pub fn op_restart_mini_program(state: &mut OpState) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    host.host_tx
-        .try_send(HostCommand::Restart)
-        .map_err(|e| JsErrorBox::generic(format!("restartMiniProgram:fail {e}")))
-}
-
-#[op2(fast)]
-pub fn op_exit_mini_program(state: &mut OpState) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    host.host_tx
-        .try_send(HostCommand::Shutdown)
-        .map_err(|e| JsErrorBox::generic(format!("exitMiniProgram:fail {e}")))
-}
-
 deno_core::extension!(
     host_v8_base,
     ops = [
         op_trigger_gc,
         op_get_heap_statistics,
-        op_restart_mini_program,
-        op_exit_mini_program,
     ],
     esm = [
         dir "base",
         "01_amdshim.js",
         "02_async.js",
         "03_gc.js",
-        "04_lifecycle.js",
     ],
     options = {
         options: HostOpState,

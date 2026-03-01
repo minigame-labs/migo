@@ -92,14 +92,18 @@ mod audio;
 mod base;
 mod console;
 mod device;
+mod env;
 mod event;
 mod file;
 mod input;
+mod lifecycle;
 mod media;
 mod network;
 mod rendering;
 mod storage;
+mod system;
 mod ui;
+mod update;
 mod url;
 mod utility;
 mod web;
@@ -174,6 +178,10 @@ pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
         .chain(utility::utility_extensions())
         .chain(device::device_extensions())
         .chain(ui::ui_extensions())
+        .chain(system::system_extensions())
+        .chain(env::env_extensions())
+        .chain(lifecycle::lifecycle_extensions())
+        .chain(update::update_extensions())
         .chain(storage::storage_extensions())
         .chain(input::touch_extensions())
         .chain(file::file_extensions())

@@ -6,10 +6,10 @@
 use deno_core::{Extension, extension};
 
 extension!(host_v8_env,
- esm = [
-    dir "android/extensions/base/env",
-    "00_env.js"
- ]
+    esm = [
+        dir "env",
+        "00_env.js",
+    ]
 );
 
 pub fn env_extensions() -> Vec<Extension> {

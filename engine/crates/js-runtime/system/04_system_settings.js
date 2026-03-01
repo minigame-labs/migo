@@ -2,7 +2,7 @@
 import { op_get_system_settings } from "ext:core/ops";
 
 function getSystemSetting() {
-    const settings = op_get_system_settings();
+    const settings = JSON.parse(op_get_system_settings());
 
     return {
         bluetoothEnabled: settings.bluetooth_enabled,
