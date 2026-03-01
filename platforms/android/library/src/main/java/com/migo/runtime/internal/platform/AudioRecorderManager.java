@@ -369,7 +369,9 @@ public final class AudioRecorderManager {
 
             mediaRecorder = new MediaRecorder();
             mediaRecorder.setAudioSource(source);
-            configureFormatAndEncoder(mediaRecorder);
+            // Pipe is not seekable, so we must use streaming-compatible formats.
+            // MPEG_4 requires seek (for moov atom), use AAC_ADTS / OGG instead.
+            configureStreamingFormatAndEncoder(mediaRecorder);
             mediaRecorder.setAudioSamplingRate(sampleRate);
             mediaRecorder.setAudioChannels(numberOfChannels);
             mediaRecorder.setAudioEncodingBitRate(encodeBitRate);
@@ -672,6 +674,33 @@ public final class AudioRecorderManager {
             case "auto":
             default:
                 return MediaRecorder.AudioSource.DEFAULT;
+        }
+    }
+
+    /**
+     * Configure a streaming-compatible (non-seekable) output format for encoded frame mode.
+     * Pipe file descriptors are not seekable, so container formats that require seeking
+     * (e.g. MPEG_4) cannot be used.
+     */
+    private void configureStreamingFormatAndEncoder(MediaRecorder recorder) {
+        switch (format.toLowerCase()) {
+            case "wav":
+            case "pcm":
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    recorder.setOutputFormat(MediaRecorder.OutputFormat.OGG);
+                    recorder.setAudioEncoder(MediaRecorder.AudioEncoder.OPUS);
+                } else {
+                    recorder.setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP);
+                    recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AMR_WB);
+                }
+                break;
+            case "mp3":
+            case "aac":
+            default:
+                // AAC_ADTS is a streaming AAC format that does not require seeking.
+                recorder.setOutputFormat(MediaRecorder.OutputFormat.AAC_ADTS);
+                recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+                break;
         }
     }
 
