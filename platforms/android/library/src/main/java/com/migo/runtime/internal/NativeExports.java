@@ -1200,7 +1200,7 @@ public final class NativeExports {
      * Create a camera instance.
      *
      * @param sessionId   The session ID
-     * @param optionsJson JSON with keys: cameraId, pos, flash, size
+     * @param optionsJson JSON with keys: cameraId, x, y, width, height, devicePosition, flash, size
      * @return JSON result: {"cameraId": <id>} or error JSON
      */
     public static String cameraCreate(int sessionId, String optionsJson) {
@@ -1267,7 +1267,7 @@ public final class NativeExports {
      * Start video recording.
      *
      * @param sessionId   The session ID
-     * @param optionsJson JSON with keys: cameraId, timeout
+     * @param optionsJson JSON with keys: cameraId
      * @return JSON result or error JSON
      */
     public static String cameraStartRecord(int sessionId, String optionsJson) {

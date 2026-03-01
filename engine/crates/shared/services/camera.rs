@@ -14,9 +14,13 @@ pub trait CameraService: Send + Sync {
     ///
     /// JSON fields:
     /// - `cameraId`: u32 - JS-assigned camera instance ID
-    /// - `pos`: "back" | "front" (default "back")
-    /// - `flash`: "auto" | "on" | "off" | "torch" (default "auto")
-    /// - `size`: "medium" | "small" | "large" (default "medium")
+    /// - `x`: number (default 0) - left x coordinate
+    /// - `y`: number (default 0) - top y coordinate
+    /// - `width`: number (default 300) - camera width
+    /// - `height`: number (default 150) - camera height
+    /// - `devicePosition`: "back" | "front" (default "back")
+    /// - `flash`: "auto" | "on" | "off" (default "auto")
+    /// - `size`: "small" | "medium" | "large" (default "small")
     ///
     /// Returns JSON: `{"cameraId": <id>}` on success.
     fn create(&self, _options_json: &str) -> Result<String, String> {
@@ -34,7 +38,7 @@ pub trait CameraService: Send + Sync {
     /// - `cameraId`: u32
     /// - `quality`: "high" | "normal" | "low" (default "normal")
     ///
-    /// Returns JSON: `{"tempImagePath": "<path>"}` on success.
+    /// Returns JSON: `{"tempImagePath": "<path>", "width": <w>, "height": <h>}` on success.
     fn take_photo(&self, _options_json: &str) -> Result<String, String> {
         Err("camera.takePhoto:fail not supported".to_string())
     }
@@ -43,10 +47,8 @@ pub trait CameraService: Send + Sync {
     ///
     /// JSON fields:
     /// - `cameraId`: u32
-    /// - `timeout`: number (max recording duration in seconds, optional)
     ///
     /// Returns JSON: `{}` on success (recording started).
-    /// When timeout is reached, platform fires a "timeoutCallback" event.
     fn start_record(&self, _options_json: &str) -> Result<String, String> {
         Err("camera.startRecord:fail not supported".to_string())
     }

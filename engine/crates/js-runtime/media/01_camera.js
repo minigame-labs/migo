@@ -45,12 +45,9 @@ class Camera {
    * Start listening for camera frame changes.
    * Begins high-frequency frame data streaming from the native camera.
    *
-   * @param {Function} callback - Receives {data: ArrayBuffer, width: number, height: number}
+   * @param {Worker} [worker] - Optional Worker for iOS ExperimentalWorker frame data
    */
-  listenFrameChange(callback) {
-    if (typeof callback === "function") {
-      this.#listeners.cameraFrame.push(callback);
-    }
+  listenFrameChange(worker) {
     try {
       op_camera_listen_frame_change(this.#id);
     } catch (e) {
@@ -107,14 +104,13 @@ class Camera {
   /**
    * Take a photo.
    *
-   * @param {Object} [options={}]
-   * @param {string} [options.quality="normal"] - "high", "normal", or "low"
-   * @returns {Promise<{tempImagePath: string}>}
+   * @param {string} [quality] - "high", "normal", or "low"
+   * @returns {Promise<{tempImagePath: string, width: number, height: number}>}
    */
-  takePhoto(options = {}) {
+  takePhoto(quality) {
     const opts = JSON.stringify({
       cameraId: this.#id,
-      quality: options.quality ?? "normal",
+      quality: quality ?? "normal",
     });
 
     return new Promise((resolve, reject) => {
@@ -132,21 +128,12 @@ class Camera {
   /**
    * Start video recording.
    *
-   * @param {Object} [options={}]
-   * @param {number} [options.timeout] - Max recording duration in seconds
-   * @param {Function} [options.timeoutCallback] - Called when timeout is reached
    * @returns {Promise<void>}
    */
-  startRecord(options = {}) {
+  startRecord() {
     const opts = JSON.stringify({
       cameraId: this.#id,
-      timeout: options.timeout,
     });
-
-    // Store timeout callback for later dispatch
-    if (typeof options.timeoutCallback === "function") {
-      this._timeoutCallback = options.timeoutCallback;
-    }
 
     return new Promise((resolve, reject) => {
       try {
@@ -161,14 +148,13 @@ class Camera {
   /**
    * Stop video recording.
    *
-   * @param {Object} [options={}]
-   * @param {boolean} [options.compressed=false] - Whether to compress the video
+   * @param {boolean} [compressed] - Whether to compress the video
    * @returns {Promise<{tempThumbPath: string, tempVideoPath: string}>}
    */
-  stopRecord(options = {}) {
+  stopRecord(compressed) {
     const opts = JSON.stringify({
       cameraId: this.#id,
-      compressed: options.compressed ?? false,
+      compressed: compressed ?? false,
     });
 
     return new Promise((resolve, reject) => {
@@ -186,14 +172,14 @@ class Camera {
   /**
    * Set camera zoom level.
    *
-   * @param {Object} options
-   * @param {number} options.zoom - Zoom factor to set
+   * @param {Object} args
+   * @param {number} args.zoom - Zoom level, range [1, maxZoom]
    * @returns {Promise<{zoom: number}>} Actual zoom level applied
    */
-  setZoom(options = {}) {
+  setZoom(args = {}) {
     const opts = JSON.stringify({
       cameraId: this.#id,
-      zoom: options.zoom ?? 1,
+      zoom: args.zoom,
     });
 
     return new Promise((resolve, reject) => {
@@ -246,7 +232,7 @@ class Camera {
 
   /**
    * Internal: handle event from native layer.
-   * @param {string} eventType - "stop", "authCancel", "error", "timeoutCallback"
+   * @param {string} eventType - "stop", "authCancel", "error"
    * @param {string} jsonPayload - JSON data
    */
   _handleEvent(eventType, jsonPayload) {
@@ -265,15 +251,6 @@ class Camera {
         this.#fireListeners("error", errObj);
         break;
       }
-      case "timeoutCallback":
-        if (typeof this._timeoutCallback === "function") {
-          try {
-            this._timeoutCallback();
-          } catch (e) {
-            console.error("Camera timeoutCallback error:", e);
-          }
-        }
-        break;
     }
   }
 
@@ -292,9 +269,13 @@ class Camera {
  * Create a Camera instance.
  *
  * @param {Object} [options={}]
- * @param {string} [options.pos="back"] - Camera position: "back" or "front"
- * @param {string} [options.flash="auto"] - Flash mode: "auto", "on", "off", "torch"
- * @param {string} [options.size="medium"] - Preview size: "small", "medium", "large"
+ * @param {number} [options.x=0] - Left x coordinate
+ * @param {number} [options.y=0] - Top y coordinate
+ * @param {number} [options.width=300] - Camera width
+ * @param {number} [options.height=150] - Camera height
+ * @param {string} [options.devicePosition="back"] - Camera position: "front" or "back"
+ * @param {string} [options.flash="auto"] - Flash mode: "auto", "on", "off"
+ * @param {string} [options.size="small"] - Frame data image size: "small", "medium", "large"
  * @param {Function} [options.success] - Success callback
  * @param {Function} [options.fail] - Failure callback
  * @param {Function} [options.complete] - Complete callback (always called)
@@ -304,9 +285,13 @@ function createCamera(options = {}) {
   const cameraId = _nextCameraId++;
   const opts = JSON.stringify({
     cameraId,
-    pos: options.pos ?? "back",
+    x: options.x ?? 0,
+    y: options.y ?? 0,
+    width: options.width ?? 300,
+    height: options.height ?? 150,
+    devicePosition: options.devicePosition ?? "back",
     flash: options.flash ?? "auto",
-    size: options.size ?? "medium",
+    size: options.size ?? "small",
   });
 
   let camera;

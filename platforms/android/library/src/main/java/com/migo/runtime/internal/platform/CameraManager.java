@@ -83,7 +83,6 @@ public final class CameraManager {
     private MediaRecorder mediaRecorder;
     private String videoFilePath;
     private long recordStartTime;
-    private Runnable recordTimeoutRunnable;
 
     // Semaphore to prevent concurrent open/close
     private final Semaphore cameraOpenCloseLock = new Semaphore(1);
@@ -92,8 +91,8 @@ public final class CameraManager {
 
     // Configuration
     private String position = "back";   // "back" or "front"
-    private String flash = "auto";      // "auto", "on", "off", "torch"
-    private String sizePreset = "medium"; // "small", "medium", "large"
+    private String flash = "auto";      // "auto", "on", "off"
+    private String sizePreset = "small"; // "small", "medium", "large"
     private float currentZoom = 1.0f;
     private float maxZoom = 1.0f;
 
@@ -112,7 +111,7 @@ public final class CameraManager {
     /**
      * Create and open the camera with the given options.
      *
-     * @param optionsJson JSON with keys: pos, flash, size
+     * @param optionsJson JSON with keys: x, y, width, height, devicePosition, flash, size
      * @return JSON result string: {"cameraId": <id>}
      */
     public String create(String optionsJson) {
@@ -163,7 +162,7 @@ public final class CameraManager {
      * Take a photo.
      *
      * @param optionsJson JSON with keys: quality ("high", "normal", "low")
-     * @return JSON result: {"tempImagePath": "<path>"} or error
+     * @return JSON result: {"tempImagePath": "<path>", "width": <w>, "height": <h>} or error
      */
     public String takePhoto(String optionsJson) {
         if (state.get() == STATE_CLOSED || captureSession == null || cameraDevice == null) {
@@ -237,6 +236,8 @@ public final class CameraManager {
 
             JSONObject result = new JSONObject();
             result.put("tempImagePath", tempPath);
+            result.put("width", photoSize.getWidth());
+            result.put("height", photoSize.getHeight());
             return result.toString();
         } catch (Exception e) {
             return errorJson("camera.takePhoto:fail " + e.getMessage());
@@ -246,19 +247,13 @@ public final class CameraManager {
     /**
      * Start video recording.
      *
-     * @param optionsJson JSON with keys: timeout (seconds)
+     * @param optionsJson JSON with keys: cameraId
      * @return JSON result: {} on success
      */
     public String startRecord(String optionsJson) {
         if (state.get() != STATE_OPENED || cameraDevice == null) {
             return errorJson("camera.startRecord:fail camera not ready");
         }
-
-        int timeoutSec = 0;
-        try {
-            JSONObject opts = new JSONObject(optionsJson);
-            timeoutSec = opts.optInt("timeout", 0);
-        } catch (JSONException ignored) {}
 
         try {
             closeSession();
@@ -309,16 +304,6 @@ public final class CameraManager {
                         }
                     }, backgroundHandler);
 
-            // Schedule timeout
-            if (timeoutSec > 0) {
-                final int ts = timeoutSec;
-                recordTimeoutRunnable = () -> {
-                    fireEvent("timeoutCallback", "{}");
-                    stopRecordInternal();
-                };
-                mainHandler.postDelayed(recordTimeoutRunnable, timeoutSec * 1000L);
-            }
-
             return "{}";
         } catch (Exception e) {
             return errorJson("camera.startRecord:fail " + e.getMessage());
@@ -328,7 +313,7 @@ public final class CameraManager {
     /**
      * Stop video recording.
      *
-     * @param optionsJson JSON with keys: compressed (boolean)
+     * @param optionsJson JSON with keys: cameraId, compressed (boolean)
      * @return JSON result: {"tempThumbPath": "", "tempVideoPath": "<path>"}
      */
     public String stopRecord(String optionsJson) {
@@ -480,8 +465,6 @@ public final class CameraManager {
         }
 
         try {
-            cancelRecordTimeout();
-
             if (mediaRecorder != null) {
                 try {
                     if (state.get() == STATE_RECORDING) {
@@ -648,7 +631,6 @@ public final class CameraManager {
             return errorJson("camera.stopRecord:fail not recording");
         }
 
-        cancelRecordTimeout();
         state.set(STATE_OPENED);
 
         try {
@@ -680,13 +662,6 @@ public final class CameraManager {
         }
     }
 
-    private void cancelRecordTimeout() {
-        if (recordTimeoutRunnable != null) {
-            mainHandler.removeCallbacks(recordTimeoutRunnable);
-            recordTimeoutRunnable = null;
-        }
-    }
-
     // ========================================================================
     // Camera configuration helpers
     // ========================================================================
@@ -695,9 +670,9 @@ public final class CameraManager {
         if (json == null || json.isEmpty()) return;
         try {
             JSONObject opts = new JSONObject(json);
-            position = opts.optString("pos", "back");
+            position = opts.optString("devicePosition", "back");
             flash = opts.optString("flash", "auto");
-            sizePreset = opts.optString("size", "medium");
+            sizePreset = opts.optString("size", "small");
         } catch (JSONException ignored) {}
     }
 
