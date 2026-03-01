@@ -201,6 +201,41 @@ pub enum IOCmd {
         resp: IOCmdResp<usize>,
     },
 
+    // ── Storage (KV) ──────────────────────────────────────────────
+    /// Read a storage file; returns content or empty string if not found.
+    StorageGet {
+        path: String,
+        resp: IOCmdResp<String>,
+    },
+
+    /// Write a storage file after checking total-size limit.
+    StorageSet {
+        dir: String,
+        path: String,
+        data: String,
+        max_total: usize,
+        resp: IOCmdResp<()>,
+    },
+
+    /// Delete a storage file (silent on NotFound).
+    StorageRemove {
+        path: String,
+        resp: IOCmdResp<()>,
+    },
+
+    /// Remove all files in the storage directory.
+    StorageClear {
+        dir: String,
+        resp: IOCmdResp<()>,
+    },
+
+    /// Enumerate keys + sizes; returns a JSON string.
+    StorageInfo {
+        dir: String,
+        limit_size_kb: u32,
+        resp: IOCmdResp<String>,
+    },
+
     Shutdown,
 }
 

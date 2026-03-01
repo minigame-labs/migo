@@ -4,6 +4,11 @@ import {
     op_storage_remove,
     op_storage_clear,
     op_storage_info,
+    op_storage_get_async,
+    op_storage_set_async,
+    op_storage_remove_async,
+    op_storage_clear_async,
+    op_storage_info_async,
     op_create_buffer_url,
     op_revoke_buffer_url,
 } from "ext:core/ops";
@@ -72,12 +77,11 @@ function getStorageInfoSync() {
 
 // ==================== Async APIs ====================
 
-// FIXME: this is not really async
-const setStorage = promisify("setStorage", (opts) => setStorageSync(opts.key, opts.data));
-const getStorage = promisify("getStorage", (opts) => ({ data: getStorageSync(opts.key) }));
-const removeStorage = promisify("removeStorage", (opts) => removeStorageSync(opts.key));
-const clearStorage = promisify("clearStorage", () => clearStorageSync());
-const getStorageInfo = promisify("getStorageInfo", () => getStorageInfoSync());
+const setStorage = promisify("setStorage", (opts) => op_storage_set_async(opts.key, serialize(opts.data)));
+const getStorage = promisify("getStorage", async (opts) => ({ data: deserialize(await op_storage_get_async(opts.key)) }));
+const removeStorage = promisify("removeStorage", (opts) => op_storage_remove_async(opts.key));
+const clearStorage = promisify("clearStorage", () => op_storage_clear_async());
+const getStorageInfo = promisify("getStorageInfo", async () => JSON.parse(await op_storage_info_async()));
 
 // ==================== Buffer URL ====================
 

@@ -506,6 +506,118 @@ impl IoCmdHandler {
                         .with_detail("zip-extract feature is not enabled")),
                 );
             }
+
+            // ── Storage (KV) ─────────────────────────────────────────
+            IOCmd::StorageGet { path, resp } => {
+                let r = match fs::read_to_string(&path).await {
+                    Ok(content) => Ok(content),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+                    Err(e) => Err(Self::io_err(e)),
+                };
+                Self::send_resp(resp, r);
+            }
+
+            IOCmd::StorageSet {
+                dir,
+                path,
+                data,
+                max_total,
+                resp,
+            } => {
+                let r: Result<(), EngineError> = (async {
+                    fs::create_dir_all(&dir).await.map_err(Self::io_err)?;
+
+                    // Existing size of the target key (0 if new).
+                    let existing_size = fs::metadata(&path)
+                        .await
+                        .map(|m| m.len() as usize)
+                        .unwrap_or(0);
+
+                    // Sum current total.
+                    let mut total: usize = 0;
+                    let mut rd = fs::read_dir(&dir).await.map_err(Self::io_err)?;
+                    while let Some(entry) = rd.next_entry().await.map_err(Self::io_err)? {
+                        total += entry.metadata().await.map(|m| m.len() as usize).unwrap_or(0);
+                    }
+
+                    if total - existing_size + data.len() > max_total {
+                        return Err(EngineError::new(ErrorCode::IoError)
+                            .with_detail("setStorage:fail storage limit exceeded"));
+                    }
+
+                    fs::write(&path, &data).await.map_err(Self::io_err)?;
+                    Ok(())
+                })
+                .await;
+                Self::send_resp(resp, r);
+            }
+
+            IOCmd::StorageRemove { path, resp } => {
+                let r = match fs::remove_file(&path).await {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(Self::io_err(e)),
+                };
+                Self::send_resp(resp, r);
+            }
+
+            IOCmd::StorageClear { dir, resp } => {
+                let r: Result<(), EngineError> = (async {
+                    match fs::read_dir(&dir).await {
+                        Ok(mut rd) => {
+                            while let Some(entry) = rd.next_entry().await.map_err(Self::io_err)? {
+                                let _ = fs::remove_file(entry.path()).await;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(Self::io_err(e)),
+                    }
+                    Ok(())
+                })
+                .await;
+                Self::send_resp(resp, r);
+            }
+
+            IOCmd::StorageInfo {
+                dir,
+                limit_size_kb,
+                resp,
+            } => {
+                let r: Result<String, EngineError> = (async {
+                    let mut keys: Vec<String> = Vec::new();
+                    let mut total_bytes: u64 = 0;
+
+                    match fs::read_dir(&dir).await {
+                        Ok(mut rd) => {
+                            while let Some(entry) = rd.next_entry().await.map_err(Self::io_err)? {
+                                if let Some(name) = entry.file_name().to_str() {
+                                    if let Some(key) = Self::hex_to_key(name) {
+                                        keys.push(key);
+                                    }
+                                }
+                                total_bytes +=
+                                    entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(Self::io_err(e)),
+                    }
+
+                    let keys_json: String = keys
+                        .iter()
+                        .map(|k| format!("\"{}\"", Self::json_escape(k)))
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    let current_size_kb = (total_bytes + 1023) / 1024;
+
+                    Ok(format!(
+                        "{{\"keys\":[{keys_json}],\"currentSize\":{current_size_kb},\"limitSize\":{limit_size_kb}}}"
+                    ))
+                })
+                .await;
+                Self::send_resp(resp, r);
+            }
         }
     }
 
@@ -640,6 +752,52 @@ impl IoCmdHandler {
                 0o666
             }
         }
+    }
+
+    // ── Storage helpers ────────────────────────────────────────
+
+    /// Decode a hex filename back to the original storage key.
+    fn hex_to_key(hex: &str) -> Option<String> {
+        let hex = hex.as_bytes();
+        if hex.len() % 2 != 0 {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.chunks_exact(2) {
+            let hi = Self::hex_digit(pair[0])?;
+            let lo = Self::hex_digit(pair[1])?;
+            bytes.push((hi << 4) | lo);
+        }
+        String::from_utf8(bytes).ok()
+    }
+
+    #[inline]
+    fn hex_digit(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    /// Escape a string for safe embedding in a JSON string literal.
+    fn json_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        out
     }
 
     /// Async + iterative traversal (no recursion => no boxing).

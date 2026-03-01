@@ -17,13 +17,18 @@
 //!     {timestamp_hex}         <- raw binary blob
 //! ```
 
+use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use deno_core::{Extension, JsBuffer, OpState, op2};
 use deno_error::JsErrorBox;
+use shared::error::EngineError;
 use shared::op_state::HostOpState;
+use shared::protocol::{self, io_cmd::{IOCmd, IOCmdResp}};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Storage directory name under `app_files_dir`.
 const STORAGE_DIR: &str = "kv_storage";
@@ -238,6 +243,143 @@ pub fn op_storage_info(state: &mut OpState) -> Result<String, JsErrorBox> {
     ))
 }
 
+// ==================== Async Storage Ops ====================
+
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+pub enum StorageError {
+    #[class("StorageError")]
+    #[error("{0}")]
+    Message(String),
+}
+
+impl From<EngineError> for StorageError {
+    #[inline]
+    fn from(e: EngineError) -> Self {
+        match &e.detail {
+            Some(d) => StorageError::Message(format!("{} ({})", e.msg, d)),
+            None => StorageError::Message(e.msg.to_string()),
+        }
+    }
+}
+
+/// Get IO channel from async op state.
+#[inline]
+fn get_io_tx_async(state: Rc<RefCell<OpState>>) -> UnboundedSender<IOCmd> {
+    let st = state.borrow();
+    st.borrow::<HostOpState>().io_tx.clone()
+}
+
+#[op2(async(lazy), fast)]
+#[string]
+pub async fn op_storage_get_async(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+) -> Result<String, StorageError> {
+    let (path, tx) = {
+        let st = state.borrow();
+        let hos = st.borrow::<HostOpState>();
+        let path = hos.app_files_dir.join(STORAGE_DIR).join(key_to_hex(&key));
+        (path.to_string_lossy().into_owned(), hos.io_tx.clone())
+    };
+    protocol::send_fs_with_resp_async(&tx, |resp_tx| IOCmd::StorageGet {
+        path,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map_err(StorageError::from)
+}
+
+#[op2(async(lazy), fast)]
+pub async fn op_storage_set_async(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+    #[string] value: String,
+) -> Result<(), StorageError> {
+    if value.len() > MAX_VALUE_SIZE {
+        return Err(StorageError::Message(
+            "setStorage:fail data exceeds max size".into(),
+        ));
+    }
+
+    let (dir, path, tx) = {
+        let st = state.borrow();
+        let hos = st.borrow::<HostOpState>();
+        let dir = hos.app_files_dir.join(STORAGE_DIR);
+        let path = dir.join(key_to_hex(&key));
+        (
+            dir.to_string_lossy().into_owned(),
+            path.to_string_lossy().into_owned(),
+            hos.io_tx.clone(),
+        )
+    };
+    protocol::send_fs_with_resp_async(&tx, |resp_tx| IOCmd::StorageSet {
+        dir,
+        path,
+        data: value,
+        max_total: MAX_TOTAL_SIZE,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map_err(StorageError::from)
+}
+
+#[op2(async(lazy), fast)]
+pub async fn op_storage_remove_async(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+) -> Result<(), StorageError> {
+    let (path, tx) = {
+        let st = state.borrow();
+        let hos = st.borrow::<HostOpState>();
+        let path = hos.app_files_dir.join(STORAGE_DIR).join(key_to_hex(&key));
+        (path.to_string_lossy().into_owned(), hos.io_tx.clone())
+    };
+    protocol::send_fs_with_resp_async(&tx, |resp_tx| IOCmd::StorageRemove {
+        path,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map_err(StorageError::from)
+}
+
+#[op2(async(lazy), fast)]
+pub async fn op_storage_clear_async(
+    state: Rc<RefCell<OpState>>,
+) -> Result<(), StorageError> {
+    let (dir, tx) = {
+        let st = state.borrow();
+        let hos = st.borrow::<HostOpState>();
+        let dir = hos.app_files_dir.join(STORAGE_DIR);
+        (dir.to_string_lossy().into_owned(), hos.io_tx.clone())
+    };
+    protocol::send_fs_with_resp_async(&tx, |resp_tx| IOCmd::StorageClear {
+        dir,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map_err(StorageError::from)
+}
+
+#[op2(async(lazy), fast)]
+#[string]
+pub async fn op_storage_info_async(
+    state: Rc<RefCell<OpState>>,
+) -> Result<String, StorageError> {
+    let (dir, tx) = {
+        let st = state.borrow();
+        let hos = st.borrow::<HostOpState>();
+        let dir = hos.app_files_dir.join(STORAGE_DIR);
+        (dir.to_string_lossy().into_owned(), hos.io_tx.clone())
+    };
+    protocol::send_fs_with_resp_async(&tx, |resp_tx| IOCmd::StorageInfo {
+        dir,
+        limit_size_kb: LIMIT_SIZE_KB,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map_err(StorageError::from)
+}
+
 // ==================== Buffer URL Ops ====================
 
 #[op2]
@@ -291,6 +433,11 @@ deno_core::extension!(
         op_storage_remove,
         op_storage_clear,
         op_storage_info,
+        op_storage_get_async,
+        op_storage_set_async,
+        op_storage_remove_async,
+        op_storage_clear_async,
+        op_storage_info_async,
         op_create_buffer_url,
         op_revoke_buffer_url,
     ],
