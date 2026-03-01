@@ -9,6 +9,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 
+import android.util.Log;
+
 import com.migo.runtime.internal.NativeMethods;
 
 import org.json.JSONException;
@@ -103,6 +105,12 @@ public final class AudioRecorderManager {
      *                    encodeBitRate, format, frameSize, audioSource
      */
     public void start(String optionsJson) {
+        if (!Permissions.isGranted(activity, Permissions.RECORD_AUDIO)) {
+            fireEvent("error",
+                    "{\"errMsg\":\"recorderManager.start:fail auth deny, permission RECORD_AUDIO is required\"}");
+            return;
+        }
+
         if (state.get() != STATE_IDLE) {
             stopInternal(false);
         }
@@ -207,8 +215,16 @@ public final class AudioRecorderManager {
 
     private void startEncodedMode() {
         try {
+            int source = mapAudioSource(audioSource);
+            Log.d(TAG, "startEncodedMode: audioSource=" + audioSource + " mapped=" + source
+                    + " format=" + format + " sampleRate=" + sampleRate
+                    + " channels=" + numberOfChannels + " bitRate=" + encodeBitRate);
+            Log.d(TAG, "RECORD_AUDIO permission: "
+                    + (activity.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                        == android.content.pm.PackageManager.PERMISSION_GRANTED ? "GRANTED" : "DENIED"));
+
             mediaRecorder = new MediaRecorder();
-            mediaRecorder.setAudioSource(mapAudioSource(audioSource));
+            mediaRecorder.setAudioSource(source);
             configureFormatAndEncoder(mediaRecorder);
             mediaRecorder.setAudioSamplingRate(sampleRate);
             mediaRecorder.setAudioChannels(numberOfChannels);
@@ -227,6 +243,7 @@ public final class AudioRecorderManager {
 
             onRecordingStarted();
         } catch (Exception e) {
+            Log.e(TAG, "startEncodedMode failed", e);
             fireEvent("error",
                     "{\"errMsg\":\"" + escapeJson("recorderManager.start:fail " + e.getMessage()) + "\"}");
             resetMediaRecorder();
@@ -243,6 +260,14 @@ public final class AudioRecorderManager {
                 : AudioFormat.CHANNEL_IN_STEREO;
         int audioFmt = AudioFormat.ENCODING_PCM_16BIT;
         int minBufSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFmt);
+
+        Log.d(TAG, "startPcmFrameMode: audioSource=" + audioSource
+                + " sampleRate=" + sampleRate + " channels=" + numberOfChannels
+                + " minBufSize=" + minBufSize + " frameSize=" + frameSize);
+        Log.d(TAG, "RECORD_AUDIO permission: "
+                + (activity.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED ? "GRANTED" : "DENIED"));
+
         if (minBufSize == AudioRecord.ERROR_BAD_VALUE || minBufSize == AudioRecord.ERROR) {
             fireEvent("error", "{\"errMsg\":\"recorderManager.start:fail invalid audio parameters\"}");
             return;
@@ -333,8 +358,17 @@ public final class AudioRecorderManager {
             pipeReadFd = pipe[0];
             pipeWriteFd = pipe[1];
 
+            int source = mapAudioSource(audioSource);
+            Log.d(TAG, "startEncodedFrameMode: audioSource=" + audioSource + " mapped=" + source
+                    + " format=" + format + " sampleRate=" + sampleRate
+                    + " channels=" + numberOfChannels + " bitRate=" + encodeBitRate
+                    + " frameSize=" + frameSize);
+            Log.d(TAG, "RECORD_AUDIO permission: "
+                    + (activity.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                        == android.content.pm.PackageManager.PERMISSION_GRANTED ? "GRANTED" : "DENIED"));
+
             mediaRecorder = new MediaRecorder();
-            mediaRecorder.setAudioSource(mapAudioSource(audioSource));
+            mediaRecorder.setAudioSource(source);
             configureFormatAndEncoder(mediaRecorder);
             mediaRecorder.setAudioSamplingRate(sampleRate);
             mediaRecorder.setAudioChannels(numberOfChannels);
@@ -360,6 +394,7 @@ public final class AudioRecorderManager {
             startCaptureThread(this::encodedCaptureLoop);
             onRecordingStarted();
         } catch (Exception e) {
+            Log.e(TAG, "startEncodedFrameMode failed", e);
             fireEvent("error",
                     "{\"errMsg\":\"" + escapeJson("recorderManager.start:fail " + e.getMessage()) + "\"}");
             resetMediaRecorder();
