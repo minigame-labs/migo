@@ -241,7 +241,9 @@ async fn op_worker_create(
     };
 
     // Spawn worker thread
+    info!("[Worker] spawning worker thread for script: {}", script_path);
     let join_handle = spawn_worker_thread(script_path, code_dir, worker_ctx, worker_host_state)?;
+    info!("[Worker] worker thread spawned, storing handle");
 
     // Store handle in main OpState
     let handle = WorkerHandle {
@@ -278,6 +280,7 @@ fn op_worker_post_message(
         return Err(WorkerError::Message("Worker has been terminated".into()));
     }
 
+    info!("[Worker] main->worker postMessage: {} bytes", json_message.len());
     handle
         .tx_to_worker
         .send(WorkerMessage::Message(json_message))
@@ -298,8 +301,11 @@ async fn op_worker_recv_message(
         handle.rx_from_worker.clone()
     };
 
+    info!("[Worker] main waiting for worker message...");
     let mut guard = rx.lock().await;
-    Ok(guard.recv().await)
+    let msg = guard.recv().await;
+    info!("[Worker] main received from worker: {:?}", msg.as_ref().map(|s| s.len()));
+    Ok(msg)
 }
 
 /// Async op: wait for an error from the worker. Returns null when worker exits.
@@ -355,6 +361,7 @@ fn op_worker_inner_post_message(
         )));
     }
 
+    info!("[Worker] worker->main postMessage: {} bytes", json_message.len());
     let ctx = state.borrow::<WorkerCtx>();
     ctx.tx_to_main
         .send(json_message)
@@ -373,20 +380,23 @@ async fn op_worker_inner_recv_message(
         st.borrow::<WorkerCtx>().rx_from_main.clone()
     };
 
+    info!("[Worker] worker waiting for main message...");
     let mut guard = rx.lock().await;
     match guard.recv().await {
-        Some(WorkerMessage::Message(json)) => Ok(Some(json)),
-        Some(WorkerMessage::Terminate) | None => Ok(None),
+        Some(WorkerMessage::Message(json)) => {
+            info!("[Worker] worker received from main: {} bytes", json.len());
+            Ok(Some(json))
+        }
+        Some(WorkerMessage::Terminate) => {
+            info!("[Worker] worker received Terminate signal");
+            Ok(None)
+        }
+        None => {
+            info!("[Worker] worker channel closed (None)");
+            Ok(None)
+        }
     }
 }
-
-/// Stub: getCameraFrameData. Returns empty buffer.
-#[op2]
-#[buffer]
-fn op_worker_get_camera_frame_data() -> Vec<u8> {
-    Vec::new()
-}
-
 
 // ---------------------------------------------------------------------------
 // Extension declarations
@@ -413,7 +423,6 @@ deno_core::extension!(
     ops = [
         op_worker_inner_post_message,
         op_worker_inner_recv_message,
-        op_worker_get_camera_frame_data,
     ],
     esm = [
         dir "worker",
@@ -453,7 +462,8 @@ pub fn create_worker_runtime_extensions(
     host_state: HostOpState,
 ) -> Vec<Extension> {
     use crate::{
-        base, console, event, file, network, rendering, url, utility, web, worker_runtime,
+        audio, base, console, env, event, file, network, rendering, url, utility, web,
+        worker_runtime,
     };
 
     let runtime_exts = vec![worker_runtime::init()];
@@ -468,6 +478,8 @@ pub fn create_worker_runtime_extensions(
         .chain(web::web_extensions())
         .chain(url::url_extensions())
         .chain(network::network_extensions())
+        .chain(audio::audio_extensions())
+        .chain(env::env_extensions())
         .chain(worker_inner_extensions(ctx))
         .chain(runtime_exts)
         .collect()
@@ -513,12 +525,14 @@ fn spawn_worker_thread(
                             .heap_limits(v8_limits.initial_heap_size, v8_limits.max_heap_size),
                     );
 
+                    info!("[Worker] creating JsRuntime with {} extensions", exts.len());
                     let mut rt = JsRuntime::new(RuntimeOptions {
                         module_loader,
                         extensions: exts,
                         create_params,
                         ..Default::default()
                     });
+                    info!("[Worker] JsRuntime created successfully");
 
                     // Register near-heap-limit callback for OOM protection
                     {
@@ -558,6 +572,7 @@ fn spawn_worker_thread(
                     let resolved = match resolve_path(&script_path, &code_path) {
                         Ok(r) => r,
                         Err(e) => {
+                            error!("[Worker] failed to resolve worker script '{}' in '{}': {}", script_path, code_dir, e);
                             let _ = tx_errors.send(format!(
                                 r#"{{"message":"Failed to resolve worker script: {}"}}"#,
                                 e
@@ -566,9 +581,11 @@ fn spawn_worker_thread(
                         }
                     };
 
+                    info!("[Worker] loading main module: {}", resolved);
                     let module_id = match rt.load_main_es_module(&resolved).await {
                         Ok(id) => id,
                         Err(e) => {
+                            error!("[Worker] failed to load worker script: {}", e);
                             let _ = tx_errors.send(format!(
                                 r#"{{"message":"Failed to load worker script: {}"}}"#,
                                 e
@@ -577,7 +594,9 @@ fn spawn_worker_thread(
                         }
                     };
 
+                    info!("[Worker] module loaded (id={}), evaluating...", module_id);
                     if let Err(e) = rt.mod_evaluate(module_id).await {
+                        error!("[Worker] worker script evaluation error: {}", e);
                         let _ = tx_errors.send(format!(
                             r#"{{"message":"Worker script evaluation error: {}"}}"#,
                             e
@@ -585,9 +604,11 @@ fn spawn_worker_thread(
                         return;
                     }
 
+                    info!("[Worker] module evaluated, running event loop");
                     // Run event loop until it completes (message pump op keeps it alive)
                     let poll = PollEventLoopOptions::default();
                     if let Err(e) = rt.run_event_loop(poll).await {
+                        error!("[Worker] event loop error: {}", e);
                         let _ = tx_errors.send(format!(
                             r#"{{"message":"Worker event loop error: {}"}}"#,
                             e

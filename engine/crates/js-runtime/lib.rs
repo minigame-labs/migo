@@ -137,6 +137,7 @@ deno_core::extension!(
     esm = [
         dir "",
         "98_global_scope_shared.js",
+        "98_global_scope_worker.js",
         "99_worker_main.js",
     ],
 );

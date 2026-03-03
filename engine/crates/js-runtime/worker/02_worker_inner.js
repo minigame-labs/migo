@@ -1,20 +1,32 @@
 import { op_worker_inner_post_message,
-    op_worker_inner_recv_message,
-    op_worker_get_camera_frame_data } from "ext:core/ops";
+    op_worker_inner_recv_message } from "ext:core/ops";
+import * as request from "ext:host_v8_network/04_request.js";
+import * as download from "ext:host_v8_network/05_download.js";
+import * as upload from "ext:host_v8_network/06_upload.js";
+import * as websocket from "ext:host_v8_network/07_websocket.js";
+import * as innerAudio from "ext:host_v8_audio/02_inner_audio_context.js";
+import * as fileManager from "ext:host_v8_file/02_file_manager.js";
+import * as envApi from "ext:host_v8_env/00_env.js";
 
 const messageListeners = [];
-const errorListeners = [];
 
 async function _startMessagePump() {
+    console.log("[Worker-JS] message pump started, listeners:", messageListeners.length);
     while (true) {
         let json;
         try {
             json = await op_worker_inner_recv_message();
-        } catch (_) {
+        } catch (e) {
+            console.error("[Worker-JS] recv error:", e);
             break;
         }
         // null/undefined means Terminate signal received
-        if (json === null || json === undefined) break;
+        if (json === null || json === undefined) {
+            console.log("[Worker-JS] received null/terminate, exiting pump");
+            break;
+        }
+
+        console.log("[Worker-JS] received message, listeners:", messageListeners.length);
 
         let message;
         try {
@@ -27,7 +39,7 @@ async function _startMessagePump() {
             try {
                 messageListeners[i]({ message });
             } catch (e) {
-                console.error("Worker onMessage listener error:", e);
+                console.error("[Worker-JS] onMessage listener error:", e);
             }
         }
     }
@@ -35,6 +47,7 @@ async function _startMessagePump() {
 
 const worker = {
     postMessage(message) {
+        console.log("[Worker-JS] postMessage to main:", JSON.stringify(message));
         op_worker_inner_post_message(JSON.stringify(message));
     },
 
@@ -43,24 +56,18 @@ const worker = {
             throw new TypeError("listener must be a function");
         }
         messageListeners.push(listener);
+        console.log("[Worker-JS] onMessage listener registered, total:", messageListeners.length);
     },
 
-    onError(listener) {
-        if (typeof listener !== "function") {
-            throw new TypeError("listener must be a function");
-        }
-        errorListeners.push(listener);
+    connectSocket: websocket.connectSocket,
+    createInnerAudioContext: innerAudio.createInnerAudioContext,
+    downloadFile: download.downloadFile,
+    env: envApi.env,
+    getFileSystemManager() {
+        return fileManager.BaseFileManager;
     },
-
-    testOnProcessKilled() {
-        // Debug-only: simulate the system reclaiming the worker process.
-        // In a real environment, this would trigger onProcessKilled on the main thread.
-        console.warn("[Worker] testOnProcessKilled called - not implemented in this runtime");
-    },
-
-    getCameraFrameData() {
-        return op_worker_get_camera_frame_data();
-    },
+    request: request.request,
+    uploadFile: upload.uploadFile,
 };
 
 export { worker, _startMessagePump };
