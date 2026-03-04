@@ -88,6 +88,7 @@
 
 use shared::op_state::HostOpState;
 
+mod ad;
 mod audio;
 mod base;
 mod console;
@@ -193,6 +194,7 @@ pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
         .chain(media::media_extensions())
         .chain(audio::audio_extensions())
         .chain(worker::worker_extensions())
+        .chain(ad::ad_extensions())
         .chain(runtime_extensions)
         .collect()
 }

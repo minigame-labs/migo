@@ -39,6 +39,7 @@ import * as authorizeSetting from 'ext:host_v8_system/08_authorize_setting.js';
 import * as storageApi from 'ext:host_v8_storage/01_storage.js';
 import * as cameraApi from 'ext:host_v8_media/01_camera.js';
 import * as workerApi from 'ext:host_v8_worker/01_worker.js';
+import * as adApi from 'ext:host_v8_ad/01_ad.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -258,6 +259,15 @@ const WindowGlobalScope = {
 
     // Authorize Setting
     getAppAuthorizeSetting: core.propNonEnumerable(authorizeSetting.getAppAuthorizeSetting),
+
+    // Ad
+    createBannerAd: core.propNonEnumerable(adApi.createBannerAd),
+    createCustomAd: core.propNonEnumerable(adApi.createCustomAd),
+    createGridAd: core.propNonEnumerable(adApi.createGridAd),
+    createInterstitialAd: core.propNonEnumerable(adApi.createInterstitialAd),
+    createRewardedVideoAd: core.propNonEnumerable(adApi.createRewardedVideoAd),
+    getDirectAdStatusSync: core.propNonEnumerable(adApi.getDirectAdStatusSync),
+    getShowSplashAdStatus: core.propNonEnumerable(adApi.getShowSplashAdStatus),
 };
 
 export { WindowGlobalScope };
