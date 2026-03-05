@@ -55,6 +55,16 @@ pub trait ScreenService: Send + Sync {
     fn set_orientation(&self, _value: &str) -> Result<(), String> {
         Err("setDeviceOrientation:fail not supported".to_string())
     }
+
+    /// Start observing user screenshot events.
+    fn start_capture_screen(&self) -> Result<(), String> {
+        Err("onUserCaptureScreen:fail not supported".to_string())
+    }
+
+    /// Stop observing user screenshot events.
+    fn stop_capture_screen(&self) -> Result<(), String> {
+        Err("offUserCaptureScreen:fail not supported".to_string())
+    }
 }
 
 // ==================== Device Motion ====================

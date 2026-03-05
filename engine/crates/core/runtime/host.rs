@@ -394,6 +394,14 @@ impl Host {
                 Ok(())
             }
 
+            HostCommand::OnUserCaptureScreen => {
+                self.js
+                    .exec_script(
+                        "user_capture_screen",
+                        "_internalTriggerUserCaptureScreen()".to_string(),
+                    )
+            }
+
             _ => Ok(()),
         }
     }

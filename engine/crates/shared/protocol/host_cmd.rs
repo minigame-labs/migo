@@ -243,6 +243,11 @@ pub enum HostCommand {
         json_payload: String,
     },
 
+    /// User took a screenshot (system screenshot button pressed).
+    ///
+    /// Triggers `migo.onUserCaptureScreen` callback in the game.
+    OnUserCaptureScreen,
+
     /// Camera frame data pushed from platform (for onCameraFrame / listenFrameChange).
     CameraFrameData {
         /// JS-assigned camera instance ID.

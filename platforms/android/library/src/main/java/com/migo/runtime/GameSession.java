@@ -359,6 +359,7 @@ public final class GameSession implements Closeable {
             debugOverlay.stopMonitoring();
         }
         audioFocusManager.stop();
+        NativeExports.destroyCaptureObserver(sessionId);
         NativeExports.unregisterErrorCallback(sessionId);
         NativeExports.destroySensorManager(sessionId);
         NativeMethods.shutdown(sessionId);

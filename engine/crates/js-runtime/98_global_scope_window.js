@@ -167,6 +167,9 @@ const WindowGlobalScope = {
     setScreenBrightness: core.propNonEnumerable(screen.setScreenBrightness),
     setKeepScreenOn: core.propNonEnumerable(screen.setKeepScreenOn),
     setDeviceOrientation: core.propNonEnumerable(screen.setDeviceOrientation),
+    onUserCaptureScreen: core.propNonEnumerable(screen.onUserCaptureScreen),
+    offUserCaptureScreen: core.propNonEnumerable(screen.offUserCaptureScreen),
+    _internalTriggerUserCaptureScreen: core.propNonEnumerable(screen._internalTriggerUserCaptureScreen),
 
     // Font
     loadFont: core.propNonEnumerable(fontApi.loadFont),

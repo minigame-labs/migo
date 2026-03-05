@@ -125,6 +125,30 @@ pub fn op_set_device_orientation(
     Err(JsErrorBox::generic("setDeviceOrientation:fail not supported"))
 }
 
+// ==================== Screen Capture Ops ====================
+
+#[op2(fast)]
+pub fn op_start_capture_screen(state: &mut OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(screen) = services.screen() {
+            return screen.start_capture_screen().map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("onUserCaptureScreen:fail not supported"))
+}
+
+#[op2(fast)]
+pub fn op_stop_capture_screen(state: &mut OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(screen) = services.screen() {
+            return screen.stop_capture_screen().map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("offUserCaptureScreen:fail not supported"))
+}
+
 // ==================== Device Motion Ops ====================
 
 #[op2(fast)]
@@ -297,6 +321,8 @@ deno_core::extension!(
         op_set_screen_brightness,
         op_set_keep_screen_on,
         op_set_device_orientation,
+        op_start_capture_screen,
+        op_stop_capture_screen,
         // Device Motion
         op_start_device_motion,
         op_stop_device_motion,

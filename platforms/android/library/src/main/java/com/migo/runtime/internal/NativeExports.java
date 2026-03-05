@@ -19,6 +19,7 @@ import com.migo.runtime.internal.platform.SystemSettings;
 import com.migo.runtime.internal.platform.Vibrator;
 import com.migo.runtime.internal.platform.AudioRecorderManager;
 import com.migo.runtime.internal.platform.CameraManager;
+import com.migo.runtime.internal.platform.ScreenCaptureObserver;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -49,6 +50,10 @@ public final class NativeExports {
 
     /** Per-session network monitors. */
     private static final ConcurrentHashMap<Integer, NetworkMonitor> sNetworkMonitors =
+            new ConcurrentHashMap<>();
+
+    /** Per-session screen capture observers. */
+    private static final ConcurrentHashMap<Integer, ScreenCaptureObserver> sCaptureObservers =
             new ConcurrentHashMap<>();
 
     /** Per-session error callbacks (registered by GameSession). */
@@ -925,6 +930,52 @@ public final class NativeExports {
         NetworkMonitor mgr = sNetworkMonitors.get(sessionId);
         if (mgr != null) {
             mgr.stopMonitoring();
+        }
+    }
+
+    // ==================== Screen Capture ====================
+
+    /**
+     * Start observing user screenshot events (lazy, called from JS onUserCaptureScreen).
+     *
+     * @param sessionId The session ID
+     */
+    public static void startCaptureScreen(int sessionId) {
+        ScreenCaptureObserver observer = sCaptureObservers.get(sessionId);
+        if (observer == null) {
+            RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+            if (ctx == null) return;
+            Activity activity = ctx.getActivity();
+            Context appCtx = activity != null ? activity : AppContext.getOrNull();
+            if (appCtx == null) return;
+            observer = new ScreenCaptureObserver(sessionId, appCtx);
+            sCaptureObservers.put(sessionId, observer);
+        }
+        observer.start();
+    }
+
+    /**
+     * Stop observing user screenshot events (called from JS offUserCaptureScreen).
+     *
+     * @param sessionId The session ID
+     */
+    public static void stopCaptureScreen(int sessionId) {
+        ScreenCaptureObserver observer = sCaptureObservers.get(sessionId);
+        if (observer != null) {
+            observer.stop();
+        }
+    }
+
+    /**
+     * Destroy the screen capture observer for a session.
+     *
+     * @param sessionId The session ID
+     * @hide
+     */
+    public static void destroyCaptureObserver(int sessionId) {
+        ScreenCaptureObserver observer = sCaptureObservers.remove(sessionId);
+        if (observer != null) {
+            observer.destroy();
         }
     }
 

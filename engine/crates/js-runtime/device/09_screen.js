@@ -3,6 +3,8 @@ import {
     op_set_screen_brightness,
     op_set_keep_screen_on,
     op_set_device_orientation,
+    op_start_capture_screen,
+    op_stop_capture_screen,
 } from "ext:core/ops";
 import { wrapAsync } from "ext:host_v8_base/02_async.js";
 
@@ -64,4 +66,43 @@ function setDeviceOrientation(options = {}) {
     }, options);
 }
 
-export { getScreenBrightness, setScreenBrightness, setKeepScreenOn, setDeviceOrientation };
+// ==================== User Capture Screen ====================
+
+let _captureScreenListener = null;
+
+function onUserCaptureScreen(listener) {
+    if (typeof listener === 'function') {
+        const hadListener = _captureScreenListener !== null;
+        _captureScreenListener = listener;
+        if (!hadListener) {
+            try { op_start_capture_screen(); } catch (_) {}
+        }
+    }
+}
+
+function offUserCaptureScreen() {
+    if (_captureScreenListener !== null) {
+        _captureScreenListener = null;
+        try { op_stop_capture_screen(); } catch (_) {}
+    }
+}
+
+function _internalTriggerUserCaptureScreen() {
+    if (_captureScreenListener) {
+        try {
+            _captureScreenListener({});
+        } catch (e) {
+            console.error('onUserCaptureScreen listener error:', e);
+        }
+    }
+}
+
+export {
+    getScreenBrightness,
+    setScreenBrightness,
+    setKeepScreenOn,
+    setDeviceOrientation,
+    onUserCaptureScreen,
+    offUserCaptureScreen,
+    _internalTriggerUserCaptureScreen,
+};

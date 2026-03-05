@@ -408,6 +408,14 @@ pub(crate) extern "system" fn onAudioInterruptionEnd(
     let _ = send_command_to_host(host_id, HostCommand::OnAudioInterruptionEnd);
 }
 
+pub(crate) extern "system" fn onUserCaptureScreen(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+) {
+    let _ = send_command_to_host(host_id, HostCommand::OnUserCaptureScreen);
+}
+
 pub(crate) extern "system" fn onModalResult<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,

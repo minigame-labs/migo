@@ -11,6 +11,7 @@ use crate::android::jni::{
     onRestart, onTouch, onVsync, getDebugStats, shutdown, updateSurface, version,
     onRecorderEvent, onRecorderFrameData,
     onCameraEvent, onCameraFrameData,
+    onUserCaptureScreen,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -157,6 +158,11 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(II[BII)V".into(),
                 fn_ptr: onCameraFrameData as *mut c_void,
             },
+            NativeMethod {
+                name: "onUserCaptureScreen".into(),
+                sig: "(I)V".into(),
+                fn_ptr: onUserCaptureScreen as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -195,6 +201,9 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("setScreenBrightness", "(IF)I"),
         ("setKeepScreenOn", "(IZ)I"),
         ("setDeviceOrientation", "(ILjava/lang/String;)I"),
+        // Screen capture
+        ("startCaptureScreen", "(I)V"),
+        ("stopCaptureScreen", "(I)V"),
         // Device sensor
         ("startDeviceMotionListening", "(ILjava/lang/String;)V"),
         ("stopDeviceMotionListening", "(I)V"),

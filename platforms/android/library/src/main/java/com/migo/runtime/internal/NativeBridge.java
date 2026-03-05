@@ -273,6 +273,16 @@ public final class NativeBridge {
      */
     public static native void onCameraFrameData(int sessionId, int cameraId, byte[] frameData, int width, int height);
 
+    // ==================== Screen Capture ====================
+
+    /**
+     * Notify that the user took a screenshot (system screenshot button).
+     * Triggers migo.onUserCaptureScreen listener in JS.
+     *
+     * @param sessionId The session ID
+     */
+    public static native void onUserCaptureScreen(int sessionId);
+
     // ==================== Debug Stats ====================
 
     /**

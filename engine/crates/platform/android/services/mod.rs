@@ -152,6 +152,14 @@ impl ScreenService for AndroidScreen {
     fn set_orientation(&self, value: &str) -> Result<(), String> {
         jni::set_device_orientation(self.host_id, value).map(|_| ())
     }
+
+    fn start_capture_screen(&self) -> Result<(), String> {
+        jni::start_capture_screen(self.host_id)
+    }
+
+    fn stop_capture_screen(&self) -> Result<(), String> {
+        jni::stop_capture_screen(self.host_id)
+    }
 }
 
 // ==================== Device Motion ====================

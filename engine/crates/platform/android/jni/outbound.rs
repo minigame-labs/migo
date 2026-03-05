@@ -472,6 +472,26 @@ pub fn stop_accelerometer(host_id: i32) -> Result<(), String> {
     )
 }
 
+// ==================== Screen Capture ====================
+
+pub fn start_capture_screen(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "startCaptureScreen",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn stop_capture_screen(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "stopCaptureScreen",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
 // ==================== Network ====================
 
 pub fn start_network_monitoring(host_id: i32) -> Result<(), String> {

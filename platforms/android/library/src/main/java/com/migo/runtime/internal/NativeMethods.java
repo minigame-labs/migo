@@ -404,6 +404,20 @@ public final class NativeMethods {
         }
     }
 
+    // ==================== Screen Capture ====================
+
+    /**
+     * Notify that the user took a screenshot.
+     * Triggers migo.onUserCaptureScreen listener in JS.
+     *
+     * @param sessionId The session ID
+     */
+    public static void onUserCaptureScreen(int sessionId) {
+        if (sessionId >= 0) {
+            NativeBridge.onUserCaptureScreen(sessionId);
+        }
+    }
+
     // ==================== Recorder Callbacks ====================
 
     /**
