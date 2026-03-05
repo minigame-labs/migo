@@ -7,12 +7,12 @@
 #   ./build-aar.sh [release|debug] [architectures...]
 #
 # Examples:
-#   ./build-aar.sh                    # debug build, all architectures
+#   ./build-aar.sh                    # release build, all architectures
 #   ./build-aar.sh release            # release build, all architectures
 #   ./build-aar.sh release arm64-v8a  # release build, arm64 only
 # ============================================================
 
-set -e
+set -euo pipefail
 
 # ------------------------------------------------------------
 # Logging helpers
@@ -30,9 +30,12 @@ show_help() {
     echo ""
     echo "Usage:"
     echo "  ./build-aar.sh [release|debug] [architectures...]"
+    echo "  ./build-aar.sh [--build-type release|debug] [--output-dir dist] [--skip-rust] [architectures...]"
     echo ""
     echo "Options:"
-    echo "  release|debug    Build type (default: debug)"
+    echo "  release|debug    Build type (default: release)"
+    echo "  --build-type     Build type (release|debug)"
+    echo "  --output-dir     Output directory under platforms/android (default: dist)"
     echo "  arm64-v8a        Build for ARM64"
     echo "  x86_64           Build for x86_64"
     echo "  all              Build for all architectures"
@@ -40,6 +43,13 @@ show_help() {
     echo "  --help           Show this help"
     exit 0
 }
+
+# Fast path help (do not require environment/dependencies).
+for arg in "$@"; do
+    if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+        show_help
+    fi
+done
 
 # ------------------------------------------------------------
 # Path Resolution
@@ -81,17 +91,41 @@ fi
 # ------------------------------------------------------------
 # Parse arguments
 # ------------------------------------------------------------
-BUILD_TYPE="debug"
+BUILD_TYPE="release"
 SKIP_RUST=false
 ARCHITECTURES=()
+USE_ALL_ARCH=false
 
-for arg in "$@"; do
+while [[ $# -gt 0 ]]; do
+    arg="$1"
     case "$arg" in
         --help|-h)
             show_help
             ;;
         --skip-rust)
             SKIP_RUST=true
+            ;;
+        --build-type)
+            shift
+            if [[ $# -eq 0 ]]; then
+                print_error "--build-type requires a value"
+                exit 1
+            fi
+            BUILD_TYPE="$1"
+            ;;
+        --build-type=*)
+            BUILD_TYPE="${arg#*=}"
+            ;;
+        --output-dir)
+            shift
+            if [[ $# -eq 0 ]]; then
+                print_error "--output-dir requires a value"
+                exit 1
+            fi
+            OUTPUT_DIR="$1"
+            ;;
+        --output-dir=*)
+            OUTPUT_DIR="${arg#*=}"
             ;;
         release)
             BUILD_TYPE="release"
@@ -100,15 +134,29 @@ for arg in "$@"; do
             BUILD_TYPE="debug"
             ;;
         all)
-            ARCHITECTURES=("arm64-v8a" "x86_64")
+            USE_ALL_ARCH=true
             ;;
         arm64-v8a|x86_64)
             ARCHITECTURES+=("$arg")
             ;;
+        *)
+            print_error "Unknown argument: $arg"
+            exit 1
+            ;;
     esac
+    shift
 done
 
+if [[ "$BUILD_TYPE" != "release" && "$BUILD_TYPE" != "debug" ]]; then
+    print_error "Invalid build type: $BUILD_TYPE (expected release|debug)"
+    exit 1
+fi
+
 if [[ ${#ARCHITECTURES[@]} -eq 0 ]]; then
+    ARCHITECTURES=("arm64-v8a" "x86_64")
+fi
+
+if [[ "$USE_ALL_ARCH" == true ]]; then
     ARCHITECTURES=("arm64-v8a" "x86_64")
 fi
 

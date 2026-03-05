@@ -1,0 +1,72 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK + cargo-ndk
+        run: |
+          sdkmanager "ndk;23.2.8568313"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/ndk/23.2.8568313/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          cargo install cargo-ndk --locked
+
+      - name: Build Android AAR (release)
+        run: bash scripts/build-aar.sh release
+
+      - name: Generate checksums
+        run: |
+          cd platforms/android/dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Optional power baseline compare
+        run: |
+          if [ -f ci/metrics/current_power_metrics.json ]; then
+            bash scripts/ci/run_power.sh \
+              --current ci/metrics/current_power_metrics.json \
+              --baseline ci/baselines/android_power_default.json \
+              --summary-out reports/power-compare-summary.json
+          else
+            echo "skip power baseline compare: ci/metrics/current_power_metrics.json not found"
+          fi
+
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            platforms/android/dist/*
+            reports/*.json
+          generate_release_notes: true
+

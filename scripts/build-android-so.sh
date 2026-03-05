@@ -10,7 +10,7 @@
 #   ./build-android-so.sh all release
 # ============================================================
 
-set -e
+set -euo pipefail
 
 # ------------------------------------------------------------
 # Constants
@@ -52,6 +52,30 @@ if [[ ! -d "$ENGINE_ROOT" ]]; then
     print_error "engine directory not found at $ENGINE_ROOT"
     exit 1
 fi
+
+# ------------------------------------------------------------
+# Help
+# ------------------------------------------------------------
+show_help() {
+    echo "Android .so Builder"
+    echo ""
+    echo "Usage:"
+    echo "  ./build-android-so.sh [arm64-v8a|x86_64|all] [release|debug]"
+    echo "  ./build-android-so.sh [--build-type release|debug] [architectures...]"
+    echo ""
+    echo "Examples:"
+    echo "  ./build-android-so.sh"
+    echo "  ./build-android-so.sh arm64-v8a release"
+    echo "  ./build-android-so.sh all --build-type release"
+    exit 0
+}
+
+# Fast path help (do not require environment/dependencies).
+for arg in "$@"; do
+    if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+        show_help
+    fi
+done
 
 # ------------------------------------------------------------
 # Dependency check
@@ -105,11 +129,45 @@ find_arm64_builtins() {
 # Detect host platform
 # ------------------------------------------------------------
 get_host_platform() {
-    case "$(uname -s)" in
-        Linux*)  echo "linux-x86_64" ;;
-        Darwin*) echo "darwin-x86_64" ;;
-        *)       echo "linux-x86_64" ;;
+    local prebuilt_root="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt"
+    local candidates=()
+    local uname_s
+    local uname_m
+
+    uname_s="$(uname -s)"
+    uname_m="$(uname -m)"
+
+    case "$uname_s" in
+        Linux*)
+            candidates+=("linux-$uname_m")
+            candidates+=("linux-x86_64")
+            candidates+=("linux-aarch64")
+            ;;
+        Darwin*)
+            candidates+=("darwin-$uname_m")
+            candidates+=("darwin-arm64")
+            candidates+=("darwin-x86_64")
+            ;;
+        *)
+            candidates+=("linux-x86_64")
+            ;;
     esac
+
+    local c
+    for c in "${candidates[@]}"; do
+        if [[ -d "$prebuilt_root/$c" ]]; then
+            echo "$c"
+            return 0
+        fi
+    done
+
+    # fallback: pick first existing prebuilt directory
+    if compgen -G "$prebuilt_root/*" > /dev/null; then
+        basename "$(ls -d "$prebuilt_root"/* | head -1)"
+        return 0
+    fi
+
+    return 1
 }
 
 # ------------------------------------------------------------
@@ -124,7 +182,11 @@ build_platform() {
         return 1
     fi
 
-    local target_triple="${PLATFORM_MAP[$platform]}"
+    local target_triple="${PLATFORM_MAP[$platform]:-}"
+    if [[ -z "$target_triple" ]]; then
+        print_error "Unknown platform: $platform"
+        return 1
+    fi
     local profile_flag=""
     local out_dir="debug"
 
@@ -209,15 +271,26 @@ build_platform() {
     # Copy libc++_shared.so (required by cpal/oboe)
     # --------------------------------------------------------
     local host_platform
-    host_platform=$(get_host_platform)
+    if ! host_platform=$(get_host_platform); then
+        print_warning "Unable to detect NDK host platform under: $ANDROID_NDK_HOME/toolchains/llvm/prebuilt"
+        export RUSTFLAGS="$orig_rustflags"
+        return 1
+    fi
     local libcpp_src="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host_platform/sysroot/usr/lib/$target_triple/libc++_shared.so"
     local libcpp_dst="$dst_dir/libc++_shared.so"
 
     if [[ -f "$libcpp_src" ]]; then
         cp "$libcpp_src" "$libcpp_dst"
         # Strip debug symbols from libc++_shared.so (NDK ships unstripped, ~6.6MB -> ~800KB)
+        local llvm_strip_bin=""
         if command -v llvm-strip &>/dev/null; then
-            llvm-strip --strip-all "$libcpp_dst"
+            llvm_strip_bin="$(command -v llvm-strip)"
+        elif [[ -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host_platform/bin/llvm-strip" ]]; then
+            llvm_strip_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host_platform/bin/llvm-strip"
+        fi
+
+        if [[ -n "$llvm_strip_bin" ]]; then
+            "$llvm_strip_bin" --strip-all "$libcpp_dst"
             print_success "Copied + stripped -> $libcpp_dst"
         else
             print_success "Copied -> $libcpp_dst (llvm-strip not found, skipped stripping)"
@@ -237,17 +310,53 @@ check_dependencies
 
 build_type="debug"
 platforms=()
+use_all=false
 
-for arg in "$@"; do
-    if [[ "$arg" == "release" ]]; then
-        build_type="release"
-    elif [[ "$arg" == "all" ]]; then
-        platforms=("arm64-v8a" "x86_64")
-        break
-    elif [[ -n "${PLATFORM_MAP[$arg]:-}" ]]; then
-        platforms+=("$arg")
-    fi
+while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+        --help|-h)
+            show_help
+            ;;
+        --build-type)
+            shift
+            if [[ $# -eq 0 ]]; then
+                print_error "--build-type requires a value"
+                exit 1
+            fi
+            build_type="$1"
+            ;;
+        --build-type=*)
+            build_type="${arg#*=}"
+            ;;
+        release)
+            build_type="release"
+            ;;
+        debug)
+            build_type="debug"
+            ;;
+        all)
+            use_all=true
+            ;;
+        arm64-v8a|x86_64)
+            platforms+=("$arg")
+            ;;
+        *)
+            print_error "Unknown argument: $arg"
+            exit 1
+            ;;
+    esac
+    shift
 done
+
+if [[ "$build_type" != "release" && "$build_type" != "debug" ]]; then
+    print_error "Invalid build type: $build_type (expected release|debug)"
+    exit 1
+fi
+
+if [[ "$use_all" == true ]]; then
+    platforms=("arm64-v8a" "x86_64")
+fi
 
 if [[ ${#platforms[@]} -eq 0 ]]; then
     platforms=("arm64-v8a" "x86_64")
