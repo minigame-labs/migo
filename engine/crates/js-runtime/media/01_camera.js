@@ -9,6 +9,7 @@ import {
   op_camera_listen_frame_change,
   op_camera_close_frame_change,
 } from "ext:core/ops";
+import { wrapAsync } from "ext:host_v8_base/02_async.js";
 
 // Camera instance registry: cameraId -> Camera
 const _cameras = new Map();
@@ -104,23 +105,16 @@ class Camera {
   /**
    * Take a photo.
    *
-   * @param {string} [quality] - "high", "normal", or "low"
+   * @param {Object} [options]
+   * @param {string} [options.quality] - "high", "normal", or "low"
    * @returns {Promise<{tempImagePath: string, width: number, height: number}>}
    */
-  takePhoto(quality) {
+  takePhoto(options = {}) {
     const opts = JSON.stringify({
       cameraId: this.#id,
-      quality: quality ?? "normal",
+      quality: options.quality ?? "normal",
     });
-
-    return new Promise((resolve, reject) => {
-      try {
-        const result = JSON.parse(op_camera_take_photo(opts));
-        resolve(result);
-      } catch (e) {
-        reject({ errMsg: "camera.takePhoto:fail " + (e.message || String(e)) });
-      }
-    });
+    return wrapAsync('camera.takePhoto', () => JSON.parse(op_camera_take_photo(opts)), options);
   }
 
   // ==================== Video Recording ====================
@@ -128,43 +122,27 @@ class Camera {
   /**
    * Start video recording.
    *
+   * @param {Object} [options]
    * @returns {Promise<void>}
    */
-  startRecord() {
-    const opts = JSON.stringify({
-      cameraId: this.#id,
-    });
-
-    return new Promise((resolve, reject) => {
-      try {
-        op_camera_start_record(opts);
-        resolve();
-      } catch (e) {
-        reject({ errMsg: "camera.startRecord:fail " + (e.message || String(e)) });
-      }
-    });
+  startRecord(options = {}) {
+    const opts = JSON.stringify({ cameraId: this.#id });
+    return wrapAsync('camera.startRecord', () => { op_camera_start_record(opts); }, options);
   }
 
   /**
    * Stop video recording.
    *
-   * @param {boolean} [compressed] - Whether to compress the video
+   * @param {Object} [options]
+   * @param {boolean} [options.compressed] - Whether to compress the video
    * @returns {Promise<{tempThumbPath: string, tempVideoPath: string}>}
    */
-  stopRecord(compressed) {
+  stopRecord(options = {}) {
     const opts = JSON.stringify({
       cameraId: this.#id,
-      compressed: compressed ?? false,
+      compressed: options.compressed ?? false,
     });
-
-    return new Promise((resolve, reject) => {
-      try {
-        const result = JSON.parse(op_camera_stop_record(opts));
-        resolve(result);
-      } catch (e) {
-        reject({ errMsg: "camera.stopRecord:fail " + (e.message || String(e)) });
-      }
-    });
+    return wrapAsync('camera.stopRecord', () => JSON.parse(op_camera_stop_record(opts)), options);
   }
 
   // ==================== Zoom ====================
@@ -172,24 +150,16 @@ class Camera {
   /**
    * Set camera zoom level.
    *
-   * @param {Object} args
-   * @param {number} args.zoom - Zoom level, range [1, maxZoom]
+   * @param {Object} [options]
+   * @param {number} options.zoom - Zoom level, range [1, maxZoom]
    * @returns {Promise<{zoom: number}>} Actual zoom level applied
    */
-  setZoom(args = {}) {
+  setZoom(options = {}) {
     const opts = JSON.stringify({
       cameraId: this.#id,
-      zoom: args.zoom,
+      zoom: options.zoom,
     });
-
-    return new Promise((resolve, reject) => {
-      try {
-        const result = JSON.parse(op_camera_set_zoom(opts));
-        resolve(result);
-      } catch (e) {
-        reject({ errMsg: "camera.setZoom:fail " + (e.message || String(e)) });
-      }
-    });
+    return wrapAsync('camera.setZoom', () => JSON.parse(op_camera_set_zoom(opts)), options);
   }
 
   // ==================== Lifecycle ====================
@@ -294,32 +264,12 @@ function createCamera(options = {}) {
     size: options.size ?? "small",
   });
 
-  let camera;
-  try {
+  return wrapAsync('createCamera', () => {
     op_camera_create(opts);
-    camera = new Camera(cameraId);
+    const camera = new Camera(cameraId);
     _cameras.set(cameraId, camera);
-
-    if (typeof options.success === "function") {
-      options.success({ camera });
-    }
-  } catch (e) {
-    const errMsg = "createCamera:fail " + (e.message || String(e));
-    if (typeof options.fail === "function") {
-      options.fail({ errMsg });
-    }
-    // Still create the camera object for consistency, but mark failure
-    if (!camera) {
-      camera = new Camera(cameraId);
-      _cameras.set(cameraId, camera);
-    }
-  } finally {
-    if (typeof options.complete === "function") {
-      options.complete();
-    }
-  }
-
-  return camera;
+    return { camera };
+  }, options);
 }
 
 /**
