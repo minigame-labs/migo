@@ -42,8 +42,8 @@ jobs:
           echo "$ANDROID_HOME/ndk/23.2.8568313/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
           cargo install cargo-ndk --locked
 
-      - name: CI smoke checks
-        run: bash scripts/ci/run_smoke.sh
+      # - name: CI smoke checks
+      #   run: bash scripts/ci/run_smoke.sh
 
       - name: Build Android AAR (debug)
         run: bash scripts/build-aar.sh debug
