@@ -243,6 +243,62 @@ pub enum HostCommand {
         json_payload: String,
     },
 
+    /// Keyboard input event (user typed text in soft keyboard).
+    ///
+    /// Triggers `migo.onKeyboardInput` callbacks.
+    OnKeyboardInput {
+        /// Current text value of the keyboard input.
+        value: String,
+    },
+
+    /// Keyboard height changed (soft keyboard shown/hidden or resized).
+    ///
+    /// Triggers `migo.onKeyboardHeightChange` callbacks.
+    OnKeyboardHeightChange {
+        /// Keyboard height in CSS pixels (0 when hidden).
+        height: f64,
+    },
+
+    /// User pressed the confirm button on the soft keyboard.
+    ///
+    /// Triggers `migo.onKeyboardConfirm` callbacks.
+    OnKeyboardConfirm {
+        /// Current text value of the keyboard input.
+        value: String,
+    },
+
+    /// Soft keyboard dismissed/completed.
+    ///
+    /// Triggers `migo.onKeyboardComplete` callbacks.
+    OnKeyboardComplete {
+        /// Current text value of the keyboard input.
+        value: String,
+    },
+
+    /// Physical/PC keyboard key down event.
+    ///
+    /// Triggers `migo.onKeyDown` callbacks.
+    OnKeyDown {
+        /// Web KeyEvent.key value.
+        key: String,
+        /// Web KeyEvent.code value.
+        code: String,
+        /// Event timestamp in milliseconds.
+        timestamp_ms: f64,
+    },
+
+    /// Physical/PC keyboard key up event.
+    ///
+    /// Triggers `migo.onKeyUp` callbacks.
+    OnKeyUp {
+        /// Web KeyEvent.key value.
+        key: String,
+        /// Web KeyEvent.code value.
+        code: String,
+        /// Event timestamp in milliseconds.
+        timestamp_ms: f64,
+    },
+
     /// User took a screenshot (system screenshot button pressed).
     ///
     /// Triggers `migo.onUserCaptureScreen` callback in the game.

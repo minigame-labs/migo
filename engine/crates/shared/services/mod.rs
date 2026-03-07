@@ -23,8 +23,8 @@ pub use clipboard::ClipboardService;
 pub use codec::CodecService;
 pub use device::{
     AccelerometerService, AudioPlatformService, BatteryService, CompassService,
-    DeviceMotionService, DeviceServices, GyroscopeService, RecorderService, ScreenService,
-    VibrationService,
+    DeviceMotionService, DeviceServices, GyroscopeService, KeyboardService, RecorderService,
+    ScreenService, VibrationService,
 };
 pub use file::FileService;
 pub use interaction::InteractionService;

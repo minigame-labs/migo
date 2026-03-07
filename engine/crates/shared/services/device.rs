@@ -196,6 +196,34 @@ pub trait RecorderService: Send + Sync {
     }
 }
 
+// ==================== Keyboard ====================
+
+/// Soft keyboard service for text input.
+pub trait KeyboardService: Send + Sync {
+    /// Show the soft keyboard with options (JSON-encoded).
+    ///
+    /// JSON fields:
+    /// - `defaultValue`: default text value
+    /// - `maxLength`: max input length
+    /// - `multiple`: multi-line input
+    /// - `confirmHold`: keep keyboard on confirm
+    /// - `confirmType`: confirm button type ("done","next","search","go","send")
+    /// - `keyboardType`: keyboard type ("text","number")
+    fn show(&self, _options_json: &str) -> Result<(), String> {
+        Err("showKeyboard:fail not supported".to_string())
+    }
+
+    /// Hide the soft keyboard.
+    fn hide(&self) -> Result<(), String> {
+        Err("hideKeyboard:fail not supported".to_string())
+    }
+
+    /// Update the keyboard input value.
+    fn update(&self, _value: &str) -> Result<(), String> {
+        Err("updateKeyboard:fail not supported".to_string())
+    }
+}
+
 // ==================== Aggregated Device Services ====================
 
 /// Aggregated device services provided by a platform.
@@ -248,6 +276,9 @@ pub trait DeviceServices: Send + Sync {
         None
     }
     fn file(&self) -> Option<Arc<dyn FileService>> {
+        None
+    }
+    fn keyboard(&self) -> Option<Arc<dyn KeyboardService>> {
         None
     }
 }

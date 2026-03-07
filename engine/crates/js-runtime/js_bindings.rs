@@ -22,6 +22,13 @@ pub(crate) struct JsBindings {
     sensor_compass_fn: Option<v8::Global<v8::Function>>,
     sensor_orientation_fn: Option<v8::Global<v8::Function>>,
     sensor_network_fn: Option<v8::Global<v8::Function>>,
+    // Keyboard event functions
+    keyboard_input_fn: Option<v8::Global<v8::Function>>,
+    keyboard_height_change_fn: Option<v8::Global<v8::Function>>,
+    keyboard_confirm_fn: Option<v8::Global<v8::Function>>,
+    keyboard_complete_fn: Option<v8::Global<v8::Function>>,
+    key_down_fn: Option<v8::Global<v8::Function>>,
+    key_up_fn: Option<v8::Global<v8::Function>>,
 }
 
 impl JsBindings {
@@ -42,6 +49,12 @@ impl JsBindings {
             sensor_compass_fn: None,
             sensor_orientation_fn: None,
             sensor_network_fn: None,
+            keyboard_input_fn: None,
+            keyboard_height_change_fn: None,
+            keyboard_confirm_fn: None,
+            keyboard_complete_fn: None,
+            key_down_fn: None,
+            key_up_fn: None,
         };
 
         this.reload(rt, host_id);
@@ -65,6 +78,7 @@ impl JsBindings {
             rec_event, rec_frame,
             cam_event, cam_frame,
             dev_motion, gyro, accel, compass, orientation, network,
+            kb_input, kb_height, kb_confirm, kb_complete, key_down, key_up,
         ) = self.with_main_context(rt, |scope, _ctx, global| {
             (
                 get_global_fn(scope, global, "_internalEnqueueRawTouchEvent"),
@@ -79,6 +93,12 @@ impl JsBindings {
                 get_global_fn(scope, global, "_internalTriggerCompassChange"),
                 get_global_fn(scope, global, "_internalTriggerDeviceOrientationChange"),
                 get_global_fn(scope, global, "_internalTriggerNetworkStatusChange"),
+                get_global_fn(scope, global, "_internalTriggerKeyboardInput"),
+                get_global_fn(scope, global, "_internalTriggerKeyboardHeightChange"),
+                get_global_fn(scope, global, "_internalTriggerKeyboardConfirm"),
+                get_global_fn(scope, global, "_internalTriggerKeyboardComplete"),
+                get_global_fn(scope, global, "_internalTriggerKeyDown"),
+                get_global_fn(scope, global, "_internalTriggerKeyUp"),
             )
         });
 
@@ -94,6 +114,12 @@ impl JsBindings {
         self.sensor_compass_fn = compass;
         self.sensor_orientation_fn = orientation;
         self.sensor_network_fn = network;
+        self.keyboard_input_fn = kb_input;
+        self.keyboard_height_change_fn = kb_height;
+        self.keyboard_confirm_fn = kb_confirm;
+        self.keyboard_complete_fn = kb_complete;
+        self.key_down_fn = key_down;
+        self.key_up_fn = key_up;
 
         if self.enqueue_touch_event_fn.is_none() {
             warn!("[Host {}] _internalEnqueueRawTouchEvent not found", host_id);
@@ -368,6 +394,110 @@ impl JsBindings {
             let func = v8::Local::new(scope, func_g);
             let _ = func.call(scope, global.into(), &args);
         });
+    }
+
+    // ---- Keyboard event dispatch ----
+
+    /// Dispatch keyboard input event (soft keyboard text changed).
+    pub(crate) fn dispatch_keyboard_input(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        value: &str,
+    ) {
+        if let Some(func_g) = self.keyboard_input_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::String::new(scope, value).unwrap().into()];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Dispatch keyboard height change event.
+    pub(crate) fn dispatch_keyboard_height_change(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        height: f64,
+    ) {
+        if let Some(func_g) = self.keyboard_height_change_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::Number::new(scope, height).into()];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Dispatch keyboard confirm event.
+    pub(crate) fn dispatch_keyboard_confirm(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        value: &str,
+    ) {
+        if let Some(func_g) = self.keyboard_confirm_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::String::new(scope, value).unwrap().into()];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Dispatch keyboard complete (dismiss) event.
+    pub(crate) fn dispatch_keyboard_complete(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        value: &str,
+    ) {
+        if let Some(func_g) = self.keyboard_complete_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::String::new(scope, value).unwrap().into()];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Dispatch physical key down event (PC platform).
+    pub(crate) fn dispatch_key_down(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        key: &str,
+        code: &str,
+        timestamp_ms: f64,
+    ) {
+        if let Some(func_g) = self.key_down_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [
+                    v8::String::new(scope, key).unwrap().into(),
+                    v8::String::new(scope, code).unwrap().into(),
+                    v8::Number::new(scope, timestamp_ms).into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Dispatch physical key up event (PC platform).
+    pub(crate) fn dispatch_key_up(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        key: &str,
+        code: &str,
+        timestamp_ms: f64,
+    ) {
+        if let Some(func_g) = self.key_up_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [
+                    v8::String::new(scope, key).unwrap().into(),
+                    v8::String::new(scope, code).unwrap().into(),
+                    v8::Number::new(scope, timestamp_ms).into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
     }
 
     /// Dispatch camera frame data (RGBA pixel buffer for onCameraFrame / listenFrameChange).

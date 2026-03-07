@@ -394,6 +394,44 @@ impl Host {
                 Ok(())
             }
 
+            HostCommand::OnKeyboardInput { value } => {
+                self.js.dispatch_keyboard_input(&value);
+                Ok(())
+            }
+
+            HostCommand::OnKeyboardHeightChange { height } => {
+                self.js.dispatch_keyboard_height_change(height);
+                Ok(())
+            }
+
+            HostCommand::OnKeyboardConfirm { value } => {
+                self.js.dispatch_keyboard_confirm(&value);
+                Ok(())
+            }
+
+            HostCommand::OnKeyboardComplete { value } => {
+                self.js.dispatch_keyboard_complete(&value);
+                Ok(())
+            }
+
+            HostCommand::OnKeyDown {
+                key,
+                code,
+                timestamp_ms,
+            } => {
+                self.js.dispatch_key_down(&key, &code, timestamp_ms);
+                Ok(())
+            }
+
+            HostCommand::OnKeyUp {
+                key,
+                code,
+                timestamp_ms,
+            } => {
+                self.js.dispatch_key_up(&key, &code, timestamp_ms);
+                Ok(())
+            }
+
             HostCommand::OnUserCaptureScreen => {
                 self.js
                     .exec_script(

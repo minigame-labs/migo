@@ -379,6 +379,38 @@ impl HostJsRuntime {
         self.bindings.dispatch_camera_frame_data(&mut self.rt, self.host_id, camera_id, data, width, height);
     }
 
+    // ---- Keyboard event dispatch ----
+
+    #[inline]
+    pub fn dispatch_keyboard_input(&mut self, value: &str) {
+        self.bindings.dispatch_keyboard_input(&mut self.rt, value);
+    }
+
+    #[inline]
+    pub fn dispatch_keyboard_height_change(&mut self, height: f64) {
+        self.bindings.dispatch_keyboard_height_change(&mut self.rt, height);
+    }
+
+    #[inline]
+    pub fn dispatch_keyboard_confirm(&mut self, value: &str) {
+        self.bindings.dispatch_keyboard_confirm(&mut self.rt, value);
+    }
+
+    #[inline]
+    pub fn dispatch_keyboard_complete(&mut self, value: &str) {
+        self.bindings.dispatch_keyboard_complete(&mut self.rt, value);
+    }
+
+    #[inline]
+    pub fn dispatch_key_down(&mut self, key: &str, code: &str, timestamp_ms: f64) {
+        self.bindings.dispatch_key_down(&mut self.rt, key, code, timestamp_ms);
+    }
+
+    #[inline]
+    pub fn dispatch_key_up(&mut self, key: &str, code: &str, timestamp_ms: f64) {
+        self.bindings.dispatch_key_up(&mut self.rt, key, code, timestamp_ms);
+    }
+
     // ---- Scripts / modules ----
 
     /// Execute a script without pumping the event loop.

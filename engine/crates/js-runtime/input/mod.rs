@@ -4,6 +4,7 @@ extension!(host_v8_touch,
 esm = [
     dir "input",
     "01_touch.js",
+    "02_keyboard.js",
 ]
 );
 

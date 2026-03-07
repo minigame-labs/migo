@@ -8,6 +8,7 @@ import * as fontApi from "ext:host_v8_webgl/04_font.js";
 import * as canvas from "ext:host_v8_web/03_canvas.js";
 import * as webgl from 'ext:host_v8_webgl/02_webgl_context.js';
 import * as touch from 'ext:host_v8_touch/01_touch.js';
+import * as keyboard from 'ext:host_v8_touch/02_keyboard.js';
 import * as audio from 'ext:host_v8_audio/01_audio_context.js';
 import * as innerAudio from 'ext:host_v8_audio/02_inner_audio_context.js';
 import * as audioInterruption from 'ext:host_v8_audio/03_audio_interruption.js';
@@ -68,6 +69,31 @@ const WindowGlobalScope = {
     offTouchEnd: core.propNonEnumerable(touch.offTouchEnd),
     offTouchCancel: core.propNonEnumerable(touch.offTouchCancel),
     _internalEnqueueRawTouchEvent: core.propNonEnumerable(touch._internalEnqueueRawTouchEvent),
+
+    // Keyboard (soft keyboard)
+    showKeyboard: core.propNonEnumerable(keyboard.showKeyboard),
+    hideKeyboard: core.propNonEnumerable(keyboard.hideKeyboard),
+    updateKeyboard: core.propNonEnumerable(keyboard.updateKeyboard),
+    onKeyboardInput: core.propNonEnumerable(keyboard.onKeyboardInput),
+    offKeyboardInput: core.propNonEnumerable(keyboard.offKeyboardInput),
+    onKeyboardHeightChange: core.propNonEnumerable(keyboard.onKeyboardHeightChange),
+    offKeyboardHeightChange: core.propNonEnumerable(keyboard.offKeyboardHeightChange),
+    onKeyboardConfirm: core.propNonEnumerable(keyboard.onKeyboardConfirm),
+    offKeyboardConfirm: core.propNonEnumerable(keyboard.offKeyboardConfirm),
+    onKeyboardComplete: core.propNonEnumerable(keyboard.onKeyboardComplete),
+    offKeyboardComplete: core.propNonEnumerable(keyboard.offKeyboardComplete),
+    _internalTriggerKeyboardInput: core.propNonEnumerable(keyboard._internalTriggerKeyboardInput),
+    _internalTriggerKeyboardHeightChange: core.propNonEnumerable(keyboard._internalTriggerKeyboardHeightChange),
+    _internalTriggerKeyboardConfirm: core.propNonEnumerable(keyboard._internalTriggerKeyboardConfirm),
+    _internalTriggerKeyboardComplete: core.propNonEnumerable(keyboard._internalTriggerKeyboardComplete),
+
+    // Keyboard (PC physical keys)
+    onKeyDown: core.propNonEnumerable(keyboard.onKeyDown),
+    offKeyDown: core.propNonEnumerable(keyboard.offKeyDown),
+    onKeyUp: core.propNonEnumerable(keyboard.onKeyUp),
+    offKeyUp: core.propNonEnumerable(keyboard.offKeyUp),
+    _internalTriggerKeyDown: core.propNonEnumerable(keyboard._internalTriggerKeyDown),
+    _internalTriggerKeyUp: core.propNonEnumerable(keyboard._internalTriggerKeyUp),
 
     // Audio (WebAudio API)
     AudioContext: core.propNonEnumerable(audio.AudioContext),
