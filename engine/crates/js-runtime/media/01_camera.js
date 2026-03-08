@@ -264,12 +264,31 @@ function createCamera(options = {}) {
     size: options.size ?? "small",
   });
 
-  return wrapAsync('createCamera', () => {
+  let camera;
+  try {
     op_camera_create(opts);
-    const camera = new Camera(cameraId);
+    camera = new Camera(cameraId);
     _cameras.set(cameraId, camera);
-    return { camera };
-  }, options);
+
+    if (typeof options.success === "function") {
+      options.success({ camera });
+    }
+  } catch (e) {
+    const errMsg = "createCamera:fail " + (e.message || String(e));
+    if (typeof options.fail === "function") {
+      options.fail({ errMsg });
+    }
+    if (!camera) {
+      camera = new Camera(cameraId);
+      _cameras.set(cameraId, camera);
+    }
+  } finally {
+    if (typeof options.complete === "function") {
+      options.complete();
+    }
+  }
+
+  return camera;
 }
 
 /**
