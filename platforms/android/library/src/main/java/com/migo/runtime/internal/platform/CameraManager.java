@@ -20,6 +20,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.util.Log;
 import android.util.Size;
 
 import com.migo.runtime.internal.NativeMethods;
@@ -87,6 +88,9 @@ public final class CameraManager {
     // Semaphore to prevent concurrent open/close
     private final Semaphore cameraOpenCloseLock = new Semaphore(1);
 
+    // Semaphore to wait for camera opening to complete
+    private final Semaphore cameraOpenCompleteLock = new Semaphore(0);
+
     private final AtomicInteger state = new AtomicInteger(STATE_CLOSED);
 
     // Configuration
@@ -115,35 +119,57 @@ public final class CameraManager {
      * @return JSON result string: {"cameraId": <id>}
      */
     public String create(String optionsJson) {
+        Log.d(TAG, "create() called with optionsJson: " + optionsJson);
         parseOptions(optionsJson);
+        Log.d(TAG, "create() parsed options - position: " + position + ", flash: " + flash + ", size: " + sizePreset);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
                 && activity.checkSelfPermission(Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "create() camera permission denied");
             fireEvent("authCancel", "{}");
             return errorJson("createCamera:fail auth deny");
         }
+        Log.d(TAG, "create() permission check passed");
 
         cameraManager = (android.hardware.camera2.CameraManager)
                 activity.getSystemService(Context.CAMERA_SERVICE);
         if (cameraManager == null) {
+            Log.e(TAG, "create() failed to get camera service");
             return errorJson("createCamera:fail camera service unavailable");
         }
+        Log.d(TAG, "create() got camera manager");
 
         try {
             hardwareCameraId = findCameraId();
+            Log.d(TAG, "create() found hardwareCameraId: " + hardwareCameraId);
             if (hardwareCameraId == null) {
+                Log.e(TAG, "create() no camera found for position: " + position);
                 return errorJson("createCamera:fail no camera found for position: " + position);
             }
 
             resolveSizes();
+            Log.d(TAG, "create() resolved sizes - preview: " + previewSize + ", photo: " + photoSize + ", video: " + videoSize);
             startBackgroundThread();
+            Log.d(TAG, "create() started background thread");
             openCamera();
+            Log.d(TAG, "create() called openCamera()");
+
+            // Wait for camera to be fully opened and preview session configured
+            Log.d(TAG, "create() waiting for camera open to complete...");
+            boolean opened = cameraOpenCompleteLock.tryAcquire(5000, TimeUnit.MILLISECONDS);
+            if (!opened) {
+                Log.w(TAG, "create() timeout waiting for camera open");
+                return errorJson("createCamera:fail timeout waiting for camera open");
+            }
+            Log.d(TAG, "create() camera open completed");
 
             JSONObject result = new JSONObject();
             result.put("cameraId", cameraId);
+            Log.d(TAG, "create() returning successfully with cameraId: " + cameraId);
             return result.toString();
         } catch (Exception e) {
+            Log.e(TAG, "create() exception: " + e.getMessage(), e);
             return errorJson("createCamera:fail " + e.getMessage());
         }
     }
@@ -152,10 +178,12 @@ public final class CameraManager {
      * Destroy the camera and release all resources.
      */
     public void destroy() {
+        Log.d(TAG, "destroy() called");
         state.set(STATE_CLOSED);
         closeCamera();
         stopBackgroundThread();
         fireEvent("stop", "{}");
+        Log.d(TAG, "destroy() completed");
     }
 
     /**
@@ -165,7 +193,9 @@ public final class CameraManager {
      * @return JSON result: {"tempImagePath": "<path>", "width": <w>, "height": <h>} or error
      */
     public String takePhoto(String optionsJson) {
+        Log.d(TAG, "takePhoto() called with optionsJson: " + optionsJson);
         if (state.get() == STATE_CLOSED || captureSession == null || cameraDevice == null) {
+            Log.e(TAG, "takePhoto() camera not ready - state: " + state.get() + ", captureSession: " + (captureSession != null) + ", cameraDevice: " + (cameraDevice != null));
             return errorJson("camera.takePhoto:fail camera not ready");
         }
 
@@ -183,18 +213,19 @@ public final class CameraManager {
         }
 
         try {
-            // Create photo ImageReader
-            if (photoReader != null) {
-                photoReader.close();
+            if (photoReader == null) {
+                Log.e(TAG, "takePhoto() photoReader is null");
+                return errorJson("camera.takePhoto:fail photoReader not initialized");
             }
-            photoReader = ImageReader.newInstance(
-                    photoSize.getWidth(), photoSize.getHeight(),
-                    ImageFormat.JPEG, 1);
 
             final String tempPath = createTempFilePath("photo", ".jpg");
+            Log.d(TAG, "takePhoto() tempPath: " + tempPath);
             final int finalJpegQuality = jpegQuality;
+            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+            final AtomicBoolean saveSuccess = new AtomicBoolean(false);
 
             photoReader.setOnImageAvailableListener(reader -> {
+                Log.d(TAG, "takePhoto() onImageAvailable callback called");
                 Image image = null;
                 try {
                     image = reader.acquireLatestImage();
@@ -202,18 +233,25 @@ public final class CameraManager {
                         ByteBuffer buffer = image.getPlanes()[0].getBuffer();
                         byte[] bytes = new byte[buffer.remaining()];
                         buffer.get(bytes);
+                        Log.d(TAG, "takePhoto() writing " + bytes.length + " bytes to " + tempPath);
 
                         FileOutputStream fos = new FileOutputStream(tempPath);
                         fos.write(bytes);
                         fos.close();
+                        saveSuccess.set(true);
+                        Log.d(TAG, "takePhoto() photo saved successfully");
+                    } else {
+                        Log.e(TAG, "takePhoto() acquireLatestImage returned null");
                     }
                 } catch (IOException e) {
-                    // handled below
+                    Log.e(TAG, "takePhoto() failed to save photo: " + e.getMessage(), e);
                 } finally {
                     if (image != null) image.close();
+                    latch.countDown();
                 }
             }, backgroundHandler);
 
+            Log.d(TAG, "takePhoto() creating capture request");
             CaptureRequest.Builder captureBuilder =
                     cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
             captureBuilder.addTarget(photoReader.getSurface());
@@ -221,25 +259,38 @@ public final class CameraManager {
             applyFlashMode(captureBuilder);
             applyZoom(captureBuilder);
 
+            Log.d(TAG, "takePhoto() submitting capture request");
             captureSession.capture(captureBuilder.build(),
                     new CameraCaptureSession.CaptureCallback() {
                         @Override
                         public void onCaptureCompleted(CameraCaptureSession session,
                                                        CaptureRequest request,
                                                        TotalCaptureResult result) {
-                            // Photo captured successfully
+                            Log.d(TAG, "takePhoto() onCaptureCompleted callback called");
                         }
                     }, backgroundHandler);
 
-            // Wait briefly for photo processing
-            Thread.sleep(500);
+            // Wait for photo to be saved
+            Log.d(TAG, "takePhoto() waiting for photo save...");
+            boolean completed = latch.await(5, TimeUnit.SECONDS);
+            if (!completed) {
+                Log.e(TAG, "takePhoto() timeout waiting for photo save");
+                return errorJson("camera.takePhoto:fail timeout");
+            }
+
+            if (!saveSuccess.get()) {
+                Log.e(TAG, "takePhoto() photo save failed");
+                return errorJson("camera.takePhoto:fail save failed");
+            }
 
             JSONObject result = new JSONObject();
             result.put("tempImagePath", tempPath);
             result.put("width", photoSize.getWidth());
             result.put("height", photoSize.getHeight());
+            Log.d(TAG, "takePhoto() returning result: " + result.toString());
             return result.toString();
         } catch (Exception e) {
+            Log.e(TAG, "takePhoto() exception: " + e.getMessage(), e);
             return errorJson("camera.takePhoto:fail " + e.getMessage());
         }
     }
@@ -251,9 +302,12 @@ public final class CameraManager {
      * @return JSON result: {} on success
      */
     public String startRecord(String optionsJson) {
+        Log.d(TAG, "startRecord() called");
         if (state.get() != STATE_OPENED || cameraDevice == null) {
+            Log.e(TAG, "startRecord() camera not ready - state: " + state.get() + ", cameraDevice: " + (cameraDevice != null));
             return errorJson("camera.startRecord:fail camera not ready");
         }
+        Log.d(TAG, "startRecord() camera ready, starting recording");
 
         try {
             closeSession();
@@ -317,7 +371,9 @@ public final class CameraManager {
      * @return JSON result: {"tempThumbPath": "", "tempVideoPath": "<path>"}
      */
     public String stopRecord(String optionsJson) {
+        Log.d(TAG, "stopRecord() called");
         if (state.get() != STATE_RECORDING) {
+            Log.e(TAG, "stopRecord() not recording, state: " + state.get());
             return errorJson("camera.stopRecord:fail not recording");
         }
 
@@ -331,7 +387,9 @@ public final class CameraManager {
      * @return JSON result: {"zoom": <actual_zoom>}
      */
     public String setZoom(String optionsJson) {
+        Log.d(TAG, "setZoom() called with optionsJson: " + optionsJson);
         if (state.get() == STATE_CLOSED) {
+            Log.e(TAG, "setZoom() camera not ready");
             return errorJson("camera.setZoom:fail camera not ready");
         }
 
@@ -342,15 +400,20 @@ public final class CameraManager {
         } catch (JSONException ignored) {}
 
         currentZoom = Math.max(1.0f, Math.min(zoom, maxZoom));
+        Log.d(TAG, "setZoom() requested: " + zoom + ", actual: " + currentZoom + ", maxZoom: " + maxZoom);
 
         if (previewRequestBuilder != null && captureSession != null) {
             try {
                 applyZoom(previewRequestBuilder);
                 captureSession.setRepeatingRequest(
                         previewRequestBuilder.build(), null, backgroundHandler);
+                Log.d(TAG, "setZoom() applied to capture session");
             } catch (Exception e) {
+                Log.e(TAG, "setZoom() exception: " + e.getMessage(), e);
                 return errorJson("camera.setZoom:fail " + e.getMessage());
             }
+        } else {
+            Log.w(TAG, "setZoom() previewRequestBuilder or captureSession not ready");
         }
 
         try {
@@ -366,18 +429,23 @@ public final class CameraManager {
      * Start listening for camera frame changes.
      */
     public void listenFrameChange() {
+        Log.d(TAG, "listenFrameChange() called");
         if (frameListening.getAndSet(true)) {
+            Log.d(TAG, "listenFrameChange() already listening");
             return; // already listening
         }
 
         if (state.get() == STATE_CLOSED || cameraDevice == null) {
+            Log.w(TAG, "listenFrameChange() camera not ready, state: " + state.get());
             return;
         }
 
         try {
             createFrameReader();
             restartPreviewSession();
+            Log.d(TAG, "listenFrameChange() started successfully");
         } catch (Exception e) {
+            Log.e(TAG, "listenFrameChange() exception: " + e.getMessage(), e);
             fireEvent("error",
                     "{\"errMsg\":\"" + escapeJson("camera.listenFrameChange:fail " + e.getMessage()) + "\"}");
         }
@@ -387,13 +455,16 @@ public final class CameraManager {
      * Stop listening for camera frame changes.
      */
     public void closeFrameChange() {
+        Log.d(TAG, "closeFrameChange() called");
         if (!frameListening.getAndSet(false)) {
+            Log.d(TAG, "closeFrameChange() was not listening");
             return;
         }
 
         try {
             restartPreviewSession();
         } catch (Exception e) {
+            Log.w(TAG, "closeFrameChange() restart preview failed: " + e.getMessage());
             // Best effort
         }
 
@@ -401,6 +472,7 @@ public final class CameraManager {
             frameReader.close();
             frameReader = null;
         }
+        Log.d(TAG, "closeFrameChange() completed");
     }
 
     // ========================================================================
@@ -408,24 +480,37 @@ public final class CameraManager {
     // ========================================================================
 
     private void openCamera() throws CameraAccessException, InterruptedException {
+        Log.d(TAG, "openCamera() called");
         if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+            Log.e(TAG, "openCamera() timeout waiting for camera lock");
             throw new RuntimeException("Timeout waiting to acquire camera lock");
         }
+        Log.d(TAG, "openCamera() acquired camera lock");
 
         try {
+            Log.d(TAG, "openCamera() calling cameraManager.openCamera() with hardwareCameraId: " + hardwareCameraId);
             cameraManager.openCamera(hardwareCameraId, new CameraDevice.StateCallback() {
                 @Override
                 public void onOpened(CameraDevice camera) {
+                    Log.d(TAG, "openCamera() onOpened callback called");
                     cameraOpenCloseLock.release();
                     cameraDevice = camera;
                     state.set(STATE_OPENED);
+                    Log.d(TAG, "openCamera() camera opened successfully, state set to OPENED");
 
                     try {
                         if (frameListening.get()) {
+                            Log.d(TAG, "openCamera() frame listening is enabled, creating frame reader");
                             createFrameReader();
+                        } else {
+                            Log.d(TAG, "openCamera() frame listening is disabled");
                         }
+                        Log.d(TAG, "openCamera() starting preview session");
                         startPreviewSession();
+                        Log.d(TAG, "openCamera() preview session started successfully");
                     } catch (Exception e) {
+                        Log.e(TAG, "openCamera() onOpened exception: " + e.getMessage(), e);
+                        cameraOpenCompleteLock.release();
                         fireEvent("error",
                                 "{\"errMsg\":\"" + escapeJson("camera open:fail " + e.getMessage()) + "\"}");
                     }
@@ -433,7 +518,9 @@ public final class CameraManager {
 
                 @Override
                 public void onDisconnected(CameraDevice camera) {
+                    Log.w(TAG, "openCamera() onDisconnected callback called");
                     cameraOpenCloseLock.release();
+                    cameraOpenCompleteLock.release();
                     camera.close();
                     cameraDevice = null;
                     state.set(STATE_CLOSED);
@@ -442,15 +529,20 @@ public final class CameraManager {
 
                 @Override
                 public void onError(CameraDevice camera, int error) {
+                    Log.e(TAG, "openCamera() onError callback called with error code: " + error);
                     cameraOpenCloseLock.release();
+                    cameraOpenCompleteLock.release();
                     camera.close();
                     cameraDevice = null;
                     state.set(STATE_CLOSED);
                     fireEvent("error", "{\"errMsg\":\"camera device error: " + error + "\"}");
                 }
             }, backgroundHandler);
+            Log.d(TAG, "openCamera() openCamera() call completed");
         } catch (SecurityException e) {
+            Log.e(TAG, "openCamera() SecurityException: " + e.getMessage(), e);
             cameraOpenCloseLock.release();
+            cameraOpenCompleteLock.release();
             fireEvent("authCancel", "{}");
             throw new CameraAccessException(CameraAccessException.CAMERA_ERROR,
                     "Camera permission denied");
@@ -458,14 +550,17 @@ public final class CameraManager {
     }
 
     private void closeCamera() {
+        Log.d(TAG, "closeCamera() called");
         try {
             cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
+            Log.w(TAG, "closeCamera() interrupted while waiting for lock");
             // proceed anyway
         }
 
         try {
             if (mediaRecorder != null) {
+                Log.d(TAG, "closeCamera() stopping media recorder");
                 try {
                     if (state.get() == STATE_RECORDING) {
                         mediaRecorder.stop();
@@ -479,19 +574,23 @@ public final class CameraManager {
             closeSession();
 
             if (cameraDevice != null) {
+                Log.d(TAG, "closeCamera() closing camera device");
                 cameraDevice.close();
                 cameraDevice = null;
             }
 
             if (frameReader != null) {
+                Log.d(TAG, "closeCamera() closing frame reader");
                 frameReader.close();
                 frameReader = null;
             }
 
             if (photoReader != null) {
+                Log.d(TAG, "closeCamera() closing photo reader");
                 photoReader.close();
                 photoReader = null;
             }
+            Log.d(TAG, "closeCamera() all resources released");
         } finally {
             cameraOpenCloseLock.release();
         }
@@ -507,7 +606,11 @@ public final class CameraManager {
     }
 
     private void startPreviewSession() throws CameraAccessException {
-        if (cameraDevice == null) return;
+        Log.d(TAG, "startPreviewSession() called");
+        if (cameraDevice == null) {
+            Log.e(TAG, "startPreviewSession() cameraDevice is null, returning");
+            return;
+        }
 
         List<android.view.Surface> surfaces = new ArrayList<>();
 
@@ -516,28 +619,53 @@ public final class CameraManager {
         texture.setDefaultBufferSize(previewSize.getWidth(), previewSize.getHeight());
         android.view.Surface previewSurface = new android.view.Surface(texture);
         surfaces.add(previewSurface);
+        Log.d(TAG, "startPreviewSession() created preview surface");
+
+        // Pre-create photoReader so its surface is registered in the session
+        if (photoReader != null) {
+            photoReader.close();
+        }
+        photoReader = ImageReader.newInstance(
+                photoSize.getWidth(), photoSize.getHeight(),
+                ImageFormat.JPEG, 1);
+        surfaces.add(photoReader.getSurface());
+        Log.d(TAG, "startPreviewSession() created photo reader surface");
 
         previewRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
         previewRequestBuilder.addTarget(previewSurface);
 
         if (frameListening.get() && frameReader != null) {
+            Log.d(TAG, "startPreviewSession() adding frame reader surface");
             surfaces.add(frameReader.getSurface());
             previewRequestBuilder.addTarget(frameReader.getSurface());
         }
 
         applyFlashMode(previewRequestBuilder);
         applyZoom(previewRequestBuilder);
+        Log.d(TAG, "startPreviewSession() applied flash and zoom settings");
 
+        Log.d(TAG, "startPreviewSession() calling createCaptureSession with " + surfaces.size() + " surfaces");
         cameraDevice.createCaptureSession(surfaces,
                 new CameraCaptureSession.StateCallback() {
                     @Override
                     public void onConfigured(CameraCaptureSession session) {
-                        if (cameraDevice == null) return;
+                        Log.d(TAG, "startPreviewSession() onConfigured callback called");
+                        if (cameraDevice == null) {
+                            Log.e(TAG, "startPreviewSession() onConfigured cameraDevice is null");
+                            cameraOpenCompleteLock.release();
+                            return;
+                        }
                         captureSession = session;
                         try {
+                            Log.d(TAG, "startPreviewSession() setting repeating request");
                             captureSession.setRepeatingRequest(
                                     previewRequestBuilder.build(), null, backgroundHandler);
+                            Log.d(TAG, "startPreviewSession() repeating request set successfully");
+                            Log.d(TAG, "startPreviewSession() onConfigured completed, releasing lock");
+                            cameraOpenCompleteLock.release();
                         } catch (Exception e) {
+                            Log.e(TAG, "startPreviewSession() onConfigured exception: " + e.getMessage(), e);
+                            cameraOpenCompleteLock.release();
                             fireEvent("error",
                                     "{\"errMsg\":\"" + escapeJson("preview:fail " + e.getMessage()) + "\"}");
                         }
@@ -545,9 +673,12 @@ public final class CameraManager {
 
                     @Override
                     public void onConfigureFailed(CameraCaptureSession session) {
+                        Log.e(TAG, "startPreviewSession() onConfigureFailed callback called");
+                        cameraOpenCompleteLock.release();
                         fireEvent("error", "{\"errMsg\":\"preview session config failed\"}");
                     }
                 }, backgroundHandler);
+        Log.d(TAG, "startPreviewSession() createCaptureSession call completed");
     }
 
     private void restartPreviewSession() throws CameraAccessException {
@@ -627,19 +758,28 @@ public final class CameraManager {
     }
 
     private String stopRecordInternal() {
+        Log.d(TAG, "stopRecordInternal() called");
         if (state.get() != STATE_RECORDING) {
+            Log.e(TAG, "stopRecordInternal() not recording");
             return errorJson("camera.stopRecord:fail not recording");
         }
 
         state.set(STATE_OPENED);
+        Log.d(TAG, "stopRecordInternal() state set to OPENED");
 
         try {
             captureSession.stopRepeating();
-        } catch (Exception ignored) {}
+            Log.d(TAG, "stopRecordInternal() stopped repeating request");
+        } catch (Exception e) {
+            Log.w(TAG, "stopRecordInternal() error stopping repeating: " + e.getMessage());
+        }
 
         try {
             mediaRecorder.stop();
-        } catch (Exception ignored) {}
+            Log.d(TAG, "stopRecordInternal() media recorder stopped");
+        } catch (Exception e) {
+            Log.w(TAG, "stopRecordInternal() error stopping media recorder: " + e.getMessage());
+        }
 
         mediaRecorder.reset();
         mediaRecorder.release();
@@ -648,7 +788,9 @@ public final class CameraManager {
         // Restart preview
         try {
             startPreviewSession();
+            Log.d(TAG, "stopRecordInternal() preview session restarted");
         } catch (Exception e) {
+            Log.w(TAG, "stopRecordInternal() error restarting preview: " + e.getMessage());
             // Best effort
         }
 
@@ -656,6 +798,7 @@ public final class CameraManager {
             JSONObject result = new JSONObject();
             result.put("tempThumbPath", "");
             result.put("tempVideoPath", videoFilePath);
+            Log.d(TAG, "stopRecordInternal() returning: " + result.toString());
             return result.toString();
         } catch (JSONException e) {
             return "{\"tempThumbPath\":\"\",\"tempVideoPath\":\"" + escapeJson(videoFilePath) + "\"}";
@@ -677,42 +820,56 @@ public final class CameraManager {
     }
 
     private String findCameraId() throws CameraAccessException {
+        Log.d(TAG, "findCameraId() called, looking for position: " + position);
         int targetFacing = "front".equals(position)
                 ? CameraCharacteristics.LENS_FACING_FRONT
                 : CameraCharacteristics.LENS_FACING_BACK;
+        Log.d(TAG, "findCameraId() target facing: " + targetFacing);
 
-        for (String id : cameraManager.getCameraIdList()) {
+        String[] cameraIdList = cameraManager.getCameraIdList();
+        Log.d(TAG, "findCameraId() available cameras: " + cameraIdList.length);
+        for (String id : cameraIdList) {
+            Log.d(TAG, "findCameraId() checking camera id: " + id);
             CameraCharacteristics chars = cameraManager.getCameraCharacteristics(id);
             Integer facing = chars.get(CameraCharacteristics.LENS_FACING);
+            Log.d(TAG, "findCameraId() camera " + id + " facing: " + facing);
             if (facing != null && facing == targetFacing) {
+                Log.d(TAG, "findCameraId() found matching camera: " + id);
                 return id;
             }
         }
+        Log.w(TAG, "findCameraId() no matching camera found for position: " + position);
         return null;
     }
 
     private void resolveSizes() throws CameraAccessException {
+        Log.d(TAG, "resolveSizes() called");
         CameraCharacteristics chars =
                 cameraManager.getCameraCharacteristics(hardwareCameraId);
 
         // Get max zoom
         Float maxDigitalZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
         maxZoom = maxDigitalZoom != null ? maxDigitalZoom : 1.0f;
+        Log.d(TAG, "resolveSizes() max zoom: " + maxZoom);
 
         StreamConfigurationMap map = chars.get(
                 CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
         if (map == null) {
+            Log.e(TAG, "resolveSizes() stream configuration map is null");
             throw new CameraAccessException(CameraAccessException.CAMERA_ERROR,
                     "No stream configuration map");
         }
+        Log.d(TAG, "resolveSizes() got stream configuration map");
 
         // Determine target sizes based on preset
         Size[] jpegSizes = map.getOutputSizes(ImageFormat.JPEG);
         Size[] yuvSizes = map.getOutputSizes(ImageFormat.YUV_420_888);
+        Log.d(TAG, "resolveSizes() JPEG sizes available: " + jpegSizes.length + ", YUV sizes available: " + yuvSizes.length);
 
         photoSize = choosePhotoSize(jpegSizes);
         previewSize = choosePreviewSize(yuvSizes);
         videoSize = chooseVideoSize(map.getOutputSizes(MediaRecorder.class));
+        Log.d(TAG, "resolveSizes() selected - photo: " + photoSize + ", preview: " + previewSize + ", video: " + videoSize);
     }
 
     private Size choosePhotoSize(Size[] sizes) {
@@ -822,12 +979,15 @@ public final class CameraManager {
     // ========================================================================
 
     private void startBackgroundThread() {
+        Log.d(TAG, "startBackgroundThread() called");
         backgroundThread = new HandlerThread("CameraBackground-" + cameraId);
         backgroundThread.start();
         backgroundHandler = new Handler(backgroundThread.getLooper());
+        Log.d(TAG, "startBackgroundThread() background thread started");
     }
 
     private void stopBackgroundThread() {
+        Log.d(TAG, "stopBackgroundThread() called");
         if (backgroundThread != null) {
             backgroundThread.quitSafely();
             try {
@@ -835,6 +995,7 @@ public final class CameraManager {
             } catch (InterruptedException ignored) {}
             backgroundThread = null;
             backgroundHandler = null;
+            Log.d(TAG, "stopBackgroundThread() background thread stopped");
         }
     }
 
@@ -854,6 +1015,7 @@ public final class CameraManager {
     }
 
     private void fireEvent(String eventType, String jsonPayload) {
+        Log.d(TAG, "fireEvent() eventType: " + eventType + ", payload: " + jsonPayload);
         NativeMethods.onCameraEvent(sessionId, cameraId, eventType, jsonPayload);
     }
 
