@@ -299,6 +299,42 @@ pub enum HostCommand {
         timestamp_ms: f64,
     },
 
+    /// Bluetooth adapter state changed (available/discovering).
+    ///
+    /// Triggers `migo.onBluetoothAdapterStateChange` callbacks.
+    OnBluetoothAdapterStateChange {
+        /// Whether Bluetooth adapter is available.
+        available: bool,
+        /// Whether Bluetooth adapter is discovering devices.
+        discovering: bool,
+    },
+
+    /// New Bluetooth device(s) found during discovery.
+    ///
+    /// Triggers `migo.onBluetoothDeviceFound` callbacks.
+    OnBluetoothDeviceFound {
+        /// JSON-encoded array of discovered devices.
+        devices_json: String,
+    },
+
+    /// Beacon devices updated during discovery.
+    ///
+    /// Triggers `migo.onBeaconUpdate` callbacks.
+    OnBeaconUpdate {
+        /// JSON-encoded array of beacon devices.
+        beacons_json: String,
+    },
+
+    /// Beacon service state changed.
+    ///
+    /// Triggers `migo.onBeaconServiceChange` callbacks.
+    OnBeaconServiceChange {
+        /// Whether beacon service is available.
+        available: bool,
+        /// Whether beacon service is currently discovering.
+        discovering: bool,
+    },
+
     /// User took a screenshot (system screenshot button pressed).
     ///
     /// Triggers `migo.onUserCaptureScreen` callback in the game.

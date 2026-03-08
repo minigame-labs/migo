@@ -18,7 +18,9 @@ import com.migo.runtime.internal.platform.ScreenBrightness;
 import com.migo.runtime.internal.platform.SystemSettings;
 import com.migo.runtime.internal.platform.Vibrator;
 import com.migo.runtime.internal.platform.AudioRecorderManager;
+import com.migo.runtime.internal.platform.BluetoothManager;
 import com.migo.runtime.internal.platform.CameraManager;
+import com.migo.runtime.internal.platform.KeyboardManager;
 import com.migo.runtime.internal.platform.ScreenCaptureObserver;
 
 import android.graphics.Bitmap;
@@ -1412,6 +1414,181 @@ public final class NativeExports {
             return opts.optInt("cameraId", 0);
         } catch (Exception e) {
             return 0;
+        }
+    }
+
+    // ==================== Keyboard ====================
+
+    /** Per-session Keyboard managers. */
+    private static final ConcurrentHashMap<Integer, KeyboardManager> sKeyboardManagers =
+            new ConcurrentHashMap<>();
+
+    private static KeyboardManager getOrCreateKeyboardManager(int sessionId) {
+        KeyboardManager mgr = sKeyboardManagers.get(sessionId);
+        if (mgr != null) return mgr;
+
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) return null;
+        Activity activity = ctx.getActivity();
+        if (activity == null) return null;
+
+        mgr = new KeyboardManager(sessionId, activity);
+        sKeyboardManagers.put(sessionId, mgr);
+        return mgr;
+    }
+
+    public static void keyboardShow(int sessionId, String optionsJson) {
+        KeyboardManager mgr = getOrCreateKeyboardManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("showKeyboard:fail no context");
+        }
+        mgr.show(optionsJson);
+    }
+
+    public static void keyboardHide(int sessionId) {
+        KeyboardManager mgr = sKeyboardManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.hide();
+        }
+    }
+
+    public static void keyboardUpdate(int sessionId, String value) {
+        KeyboardManager mgr = sKeyboardManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.updateValue(value);
+        }
+    }
+
+    /**
+     * Clean up Keyboard resources for a session. Call on session shutdown.
+     */
+    public static void destroyKeyboardManager(int sessionId) {
+        KeyboardManager mgr = sKeyboardManagers.remove(sessionId);
+        if (mgr != null) {
+            mgr.destroy();
+        }
+    }
+
+    // ==================== Bluetooth ====================
+
+    /** Per-session Bluetooth managers. */
+    private static final ConcurrentHashMap<Integer, BluetoothManager> sBluetoothManagers =
+            new ConcurrentHashMap<>();
+
+    private static BluetoothManager getOrCreateBluetoothManager(int sessionId) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr != null) return mgr;
+
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) return null;
+        Activity activity = ctx.getActivity();
+        if (activity == null) return null;
+
+        mgr = new BluetoothManager(sessionId, activity);
+        sBluetoothManagers.put(sessionId, mgr);
+        return mgr;
+    }
+
+    public static void bluetoothOpenAdapter(int sessionId, String optionsJson) {
+        BluetoothManager mgr = getOrCreateBluetoothManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("openBluetoothAdapter:fail no context");
+        }
+        mgr.openAdapter(optionsJson);
+    }
+
+    public static void bluetoothCloseAdapter(int sessionId) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.closeAdapter();
+        }
+    }
+
+    public static String bluetoothGetAdapterState(int sessionId) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr != null) {
+            return mgr.getAdapterState();
+        }
+        return "{\"discovering\":false,\"available\":false}";
+    }
+
+    public static void bluetoothStartDevicesDiscovery(int sessionId, String optionsJson) {
+        BluetoothManager mgr = getOrCreateBluetoothManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("startBluetoothDevicesDiscovery:fail no context");
+        }
+        mgr.startDiscovery(optionsJson);
+    }
+
+    public static void bluetoothStopDevicesDiscovery(int sessionId) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.stopDiscovery();
+        }
+    }
+
+    public static String bluetoothGetDevices(int sessionId) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr != null) {
+            return mgr.getDevices();
+        }
+        return "{\"devices\":[]}";
+    }
+
+    public static String bluetoothGetConnectedDevices(int sessionId, String optionsJson) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr != null) {
+            return mgr.getConnectedDevices(optionsJson);
+        }
+        return "{\"devices\":[]}";
+    }
+
+    public static void bluetoothMakePair(int sessionId, String optionsJson) {
+        BluetoothManager mgr = getOrCreateBluetoothManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("makeBluetoothPair:fail no context");
+        }
+        mgr.makePair(optionsJson);
+    }
+
+    public static void bluetoothIsDevicePaired(int sessionId, String optionsJson) {
+        BluetoothManager mgr = getOrCreateBluetoothManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("isBluetoothDevicePaired:fail no context");
+        }
+        mgr.isDevicePaired(optionsJson);
+    }
+
+    public static void bluetoothStartBeaconDiscovery(int sessionId, String optionsJson) {
+        BluetoothManager mgr = getOrCreateBluetoothManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("startBeaconDiscovery:fail no context");
+        }
+        mgr.startBeaconDiscovery(optionsJson);
+    }
+
+    public static void bluetoothStopBeaconDiscovery(int sessionId) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.stopBeaconDiscovery();
+        }
+    }
+
+    public static String bluetoothGetBeacons(int sessionId) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr != null) {
+            return mgr.getBeacons();
+        }
+        return "{\"beacons\":[]}";
+    }
+
+    /**
+     * Clean up Bluetooth resources for a session. Call on session shutdown.
+     */
+    public static void destroyBluetoothManager(int sessionId) {
+        BluetoothManager mgr = sBluetoothManagers.remove(sessionId);
+        if (mgr != null) {
+            mgr.destroy();
         }
     }
 }

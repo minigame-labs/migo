@@ -22,7 +22,7 @@ pub use camera::CameraService;
 pub use clipboard::ClipboardService;
 pub use codec::CodecService;
 pub use device::{
-    AccelerometerService, AudioPlatformService, BatteryService, CompassService,
+    AccelerometerService, AudioPlatformService, BatteryService, BluetoothService, CompassService,
     DeviceMotionService, DeviceServices, GyroscopeService, KeyboardService, RecorderService,
     ScreenService, VibrationService,
 };

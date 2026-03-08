@@ -432,6 +432,32 @@ impl Host {
                 Ok(())
             }
 
+            HostCommand::OnBluetoothAdapterStateChange {
+                available,
+                discovering,
+            } => {
+                self.js.dispatch_bluetooth_adapter_state_change(available, discovering);
+                Ok(())
+            }
+
+            HostCommand::OnBluetoothDeviceFound { devices_json } => {
+                self.js.dispatch_bluetooth_device_found(&devices_json);
+                Ok(())
+            }
+
+            HostCommand::OnBeaconUpdate { beacons_json } => {
+                self.js.dispatch_beacon_update(&beacons_json);
+                Ok(())
+            }
+
+            HostCommand::OnBeaconServiceChange {
+                available,
+                discovering,
+            } => {
+                self.js.dispatch_beacon_service_change(available, discovering);
+                Ok(())
+            }
+
             HostCommand::OnUserCaptureScreen => {
                 self.js
                     .exec_script(

@@ -12,6 +12,9 @@ use crate::android::jni::{
     onRecorderEvent, onRecorderFrameData,
     onCameraEvent, onCameraFrameData,
     onUserCaptureScreen,
+    onBluetoothAdapterStateChange, onBluetoothDeviceFound,
+    onBeaconUpdate, onBeaconServiceChange,
+    onKeyboardInput, onKeyboardConfirm, onKeyboardComplete, onKeyboardHeightChange,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -163,6 +166,47 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(I)V".into(),
                 fn_ptr: onUserCaptureScreen as *mut c_void,
             },
+            NativeMethod {
+                name: "onBluetoothAdapterStateChange".into(),
+                sig: "(IZZ)V".into(),
+                fn_ptr: onBluetoothAdapterStateChange as *mut c_void,
+            },
+            NativeMethod {
+                name: "onBluetoothDeviceFound".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onBluetoothDeviceFound as *mut c_void,
+            },
+            NativeMethod {
+                name: "onBeaconUpdate".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onBeaconUpdate as *mut c_void,
+            },
+            NativeMethod {
+                name: "onBeaconServiceChange".into(),
+                sig: "(IZZ)V".into(),
+                fn_ptr: onBeaconServiceChange as *mut c_void,
+            },
+            // Keyboard callbacks
+            NativeMethod {
+                name: "onKeyboardInput".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onKeyboardInput as *mut c_void,
+            },
+            NativeMethod {
+                name: "onKeyboardConfirm".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onKeyboardConfirm as *mut c_void,
+            },
+            NativeMethod {
+                name: "onKeyboardComplete".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onKeyboardComplete as *mut c_void,
+            },
+            NativeMethod {
+                name: "onKeyboardHeightChange".into(),
+                sig: "(ID)V".into(),
+                fn_ptr: onKeyboardHeightChange as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -247,6 +291,23 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("cameraSetZoom", "(ILjava/lang/String;)Ljava/lang/String;"),
         ("cameraListenFrameChange", "(II)V"),
         ("cameraCloseFrameChange", "(II)V"),
+        // Bluetooth
+        ("bluetoothOpenAdapter", "(ILjava/lang/String;)V"),
+        ("bluetoothCloseAdapter", "(I)V"),
+        ("bluetoothGetAdapterState", "(I)Ljava/lang/String;"),
+        ("bluetoothStartDevicesDiscovery", "(ILjava/lang/String;)V"),
+        ("bluetoothStopDevicesDiscovery", "(I)V"),
+        ("bluetoothGetDevices", "(I)Ljava/lang/String;"),
+        ("bluetoothGetConnectedDevices", "(ILjava/lang/String;)Ljava/lang/String;"),
+        ("bluetoothMakePair", "(ILjava/lang/String;)V"),
+        ("bluetoothIsDevicePaired", "(ILjava/lang/String;)V"),
+        ("bluetoothStartBeaconDiscovery", "(ILjava/lang/String;)V"),
+        ("bluetoothStopBeaconDiscovery", "(I)V"),
+        ("bluetoothGetBeacons", "(I)Ljava/lang/String;"),
+        // Keyboard
+        ("keyboardShow", "(ILjava/lang/String;)V"),
+        ("keyboardHide", "(I)V"),
+        ("keyboardUpdate", "(ILjava/lang/String;)V"),
         // Error notification callback
         // onError(hostId, errorCode, message, detail)
         ("onError", "(IILjava/lang/String;Ljava/lang/String;)V"),

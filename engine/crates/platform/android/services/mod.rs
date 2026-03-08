@@ -5,10 +5,10 @@
 use std::sync::Arc;
 
 use core::services::{
-    AccelerometerService, AudioPlatformService, BatteryService, CameraService, ClipboardService,
-    CodecService, CompassService, DeviceMotionService, DeviceServices, FileService,
-    GyroscopeService, InteractionService, NetworkService, RecorderService, ScreenService,
-    SystemInfoService, VibrationService,
+    AccelerometerService, AudioPlatformService, BatteryService, BluetoothService, CameraService,
+    ClipboardService, CodecService, CompassService, DeviceMotionService, DeviceServices,
+    FileService, GyroscopeService, InteractionService, KeyboardService, NetworkService,
+    RecorderService, ScreenService, SystemInfoService, VibrationService,
 };
 
 use crate::android::jni;
@@ -87,6 +87,14 @@ impl DeviceServices for AndroidDeviceServices {
 
     fn file(&self) -> Option<Arc<dyn FileService>> {
         Some(Arc::new(AndroidFile))
+    }
+
+    fn bluetooth(&self) -> Option<Arc<dyn BluetoothService>> {
+        Some(Arc::new(AndroidBluetooth { host_id: self.host_id }))
+    }
+
+    fn keyboard(&self) -> Option<Arc<dyn KeyboardService>> {
+        Some(Arc::new(AndroidKeyboard { host_id: self.host_id }))
     }
 }
 
@@ -405,6 +413,82 @@ impl SystemInfoService for AndroidSystemInfo {
 
     fn get_app_authorization_setting_json(&self) -> Result<String, String> {
         jni::get_app_authorization_setting_json()
+    }
+}
+
+// ==================== Bluetooth ====================
+
+struct AndroidBluetooth {
+    host_id: i32,
+}
+
+impl BluetoothService for AndroidBluetooth {
+    fn open_adapter(&self, options_json: &str) -> Result<(), String> {
+        jni::bluetooth_open_adapter(self.host_id, options_json)
+    }
+
+    fn close_adapter(&self) -> Result<(), String> {
+        jni::bluetooth_close_adapter(self.host_id)
+    }
+
+    fn get_adapter_state(&self) -> Result<String, String> {
+        jni::bluetooth_get_adapter_state(self.host_id)
+    }
+
+    fn start_devices_discovery(&self, options_json: &str) -> Result<(), String> {
+        jni::bluetooth_start_devices_discovery(self.host_id, options_json)
+    }
+
+    fn stop_devices_discovery(&self) -> Result<(), String> {
+        jni::bluetooth_stop_devices_discovery(self.host_id)
+    }
+
+    fn get_devices(&self) -> Result<String, String> {
+        jni::bluetooth_get_devices(self.host_id)
+    }
+
+    fn get_connected_devices(&self, options_json: &str) -> Result<String, String> {
+        jni::bluetooth_get_connected_devices(self.host_id, options_json)
+    }
+
+    fn make_pair(&self, options_json: &str) -> Result<(), String> {
+        jni::bluetooth_make_pair(self.host_id, options_json)
+    }
+
+    fn is_device_paired(&self, options_json: &str) -> Result<(), String> {
+        jni::bluetooth_is_device_paired(self.host_id, options_json)
+    }
+
+    fn start_beacon_discovery(&self, options_json: &str) -> Result<(), String> {
+        jni::bluetooth_start_beacon_discovery(self.host_id, options_json)
+    }
+
+    fn stop_beacon_discovery(&self) -> Result<(), String> {
+        jni::bluetooth_stop_beacon_discovery(self.host_id)
+    }
+
+    fn get_beacons(&self) -> Result<String, String> {
+        jni::bluetooth_get_beacons(self.host_id)
+    }
+}
+
+// ==================== Keyboard ====================
+
+struct AndroidKeyboard {
+    host_id: i32,
+}
+
+impl KeyboardService for AndroidKeyboard {
+    fn show(&self, options_json: &str) -> Result<(), String> {
+        jni::keyboard_show(self.host_id, options_json)
+    }
+
+    fn hide(&self) -> Result<(), String> {
+        jni::keyboard_hide(self.host_id)
+    }
+
+    fn update(&self, value: &str) -> Result<(), String> {
+        jni::keyboard_update(self.host_id, value)
     }
 }
 

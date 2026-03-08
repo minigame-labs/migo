@@ -273,6 +273,76 @@ public final class NativeBridge {
      */
     public static native void onCameraFrameData(int sessionId, int cameraId, byte[] frameData, int width, int height);
 
+    // ==================== Bluetooth Callbacks ====================
+
+    /**
+     * Callback when Bluetooth adapter state changes.
+     *
+     * @param sessionId   The session ID
+     * @param available   Whether the adapter is available
+     * @param discovering Whether the adapter is discovering devices
+     */
+    public static native void onBluetoothAdapterStateChange(int sessionId, boolean available, boolean discovering);
+
+    /**
+     * Callback when Bluetooth devices are found during discovery.
+     *
+     * @param sessionId   The session ID
+     * @param devicesJson JSON-encoded array of discovered devices
+     */
+    public static native void onBluetoothDeviceFound(int sessionId, String devicesJson);
+
+    /**
+     * Callback when Beacon devices are updated during discovery.
+     *
+     * @param sessionId   The session ID
+     * @param beaconsJson JSON-encoded array of beacon devices
+     */
+    public static native void onBeaconUpdate(int sessionId, String beaconsJson);
+
+    /**
+     * Callback when Beacon service state changes.
+     *
+     * @param sessionId   The session ID
+     * @param available   Whether the beacon service is available
+     * @param discovering Whether the beacon service is discovering
+     */
+    public static native void onBeaconServiceChange(int sessionId, boolean available, boolean discovering);
+
+    // ==================== Keyboard Callbacks ====================
+
+    /**
+     * Callback when soft keyboard input text changes.
+     *
+     * @param sessionId The session ID
+     * @param value     Current text value
+     */
+    public static native void onKeyboardInput(int sessionId, String value);
+
+    /**
+     * Callback when user presses confirm on soft keyboard.
+     *
+     * @param sessionId The session ID
+     * @param value     Current text value
+     */
+    public static native void onKeyboardConfirm(int sessionId, String value);
+
+    /**
+     * Callback when soft keyboard is dismissed/completed.
+     *
+     * @param sessionId The session ID
+     * @param value     Current text value
+     */
+    public static native void onKeyboardComplete(int sessionId, String value);
+
+    /**
+     * Callback when soft keyboard height changes.
+     *
+     * @param sessionId The session ID
+     * @param height    Keyboard height in CSS pixels (0 when hidden)
+     */
+    public static native void onKeyboardHeightChange(int sessionId, double height);
+
     // ==================== Screen Capture ====================
 
     /**

@@ -379,6 +379,28 @@ impl HostJsRuntime {
         self.bindings.dispatch_camera_frame_data(&mut self.rt, self.host_id, camera_id, data, width, height);
     }
 
+    // ---- Bluetooth event dispatch ----
+
+    #[inline]
+    pub fn dispatch_bluetooth_adapter_state_change(&mut self, available: bool, discovering: bool) {
+        self.bindings.dispatch_bluetooth_adapter_state_change(&mut self.rt, available, discovering);
+    }
+
+    #[inline]
+    pub fn dispatch_bluetooth_device_found(&mut self, devices_json: &str) {
+        self.bindings.dispatch_bluetooth_device_found(&mut self.rt, devices_json);
+    }
+
+    #[inline]
+    pub fn dispatch_beacon_update(&mut self, beacons_json: &str) {
+        self.bindings.dispatch_beacon_update(&mut self.rt, beacons_json);
+    }
+
+    #[inline]
+    pub fn dispatch_beacon_service_change(&mut self, available: bool, discovering: bool) {
+        self.bindings.dispatch_beacon_service_change(&mut self.rt, available, discovering);
+    }
+
     // ---- Keyboard event dispatch ----
 
     #[inline]

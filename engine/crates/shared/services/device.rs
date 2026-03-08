@@ -224,6 +224,100 @@ pub trait KeyboardService: Send + Sync {
     }
 }
 
+// ==================== Bluetooth ====================
+
+/// Bluetooth service for BLE and Beacon operations.
+pub trait BluetoothService: Send + Sync {
+    /// Initialize the Bluetooth adapter.
+    ///
+    /// JSON fields:
+    /// - `mode`: "central" (default) or "peripheral" (iOS only)
+    fn open_adapter(&self, _options_json: &str) -> Result<(), String> {
+        Err("openBluetoothAdapter:fail not supported".to_string())
+    }
+
+    /// Close the Bluetooth adapter and release resources.
+    fn close_adapter(&self) -> Result<(), String> {
+        Err("closeBluetoothAdapter:fail not supported".to_string())
+    }
+
+    /// Get Bluetooth adapter state.
+    /// Returns JSON: `{"discovering": bool, "available": bool}`
+    fn get_adapter_state(&self) -> Result<String, String> {
+        Err("getBluetoothAdapterState:fail not supported".to_string())
+    }
+
+    /// Start scanning for BLE devices.
+    ///
+    /// JSON fields:
+    /// - `services`: array of service UUID strings to filter
+    /// - `allowDuplicatesKey`: bool (default false)
+    /// - `interval`: number in ms (default 0)
+    /// - `powerLevel`: "low" | "medium" | "high" (default "medium")
+    fn start_devices_discovery(&self, _options_json: &str) -> Result<(), String> {
+        Err("startBluetoothDevicesDiscovery:fail not supported".to_string())
+    }
+
+    /// Stop scanning for BLE devices.
+    fn stop_devices_discovery(&self) -> Result<(), String> {
+        Err("stopBluetoothDevicesDiscovery:fail not supported".to_string())
+    }
+
+    /// Get all discovered Bluetooth devices.
+    /// Returns JSON: `{"devices": [...]}`
+    fn get_devices(&self) -> Result<String, String> {
+        Err("getBluetoothDevices:fail not supported".to_string())
+    }
+
+    /// Get connected Bluetooth devices by service UUIDs.
+    ///
+    /// JSON fields:
+    /// - `services`: array of service UUID strings
+    ///
+    /// Returns JSON: `{"devices": [...]}`
+    fn get_connected_devices(&self, _options_json: &str) -> Result<String, String> {
+        Err("getConnectedBluetoothDevices:fail not supported".to_string())
+    }
+
+    /// Pair with a Bluetooth device (Android only).
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string
+    /// - `pin`: string (Base64)
+    /// - `timeout`: number in ms (default 20000)
+    fn make_pair(&self, _options_json: &str) -> Result<(), String> {
+        Err("makeBluetoothPair:fail not supported".to_string())
+    }
+
+    /// Check if a Bluetooth device is paired (Android only).
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string
+    fn is_device_paired(&self, _options_json: &str) -> Result<(), String> {
+        Err("isBluetoothDevicePaired:fail not supported".to_string())
+    }
+
+    /// Start Beacon discovery.
+    ///
+    /// JSON fields:
+    /// - `uuids`: array of UUID strings
+    /// - `ignoreBluetoothAvailable`: bool (default false)
+    fn start_beacon_discovery(&self, _options_json: &str) -> Result<(), String> {
+        Err("startBeaconDiscovery:fail not supported".to_string())
+    }
+
+    /// Stop Beacon discovery.
+    fn stop_beacon_discovery(&self) -> Result<(), String> {
+        Err("stopBeaconDiscovery:fail not supported".to_string())
+    }
+
+    /// Get all discovered Beacon devices.
+    /// Returns JSON: `{"beacons": [...]}`
+    fn get_beacons(&self) -> Result<String, String> {
+        Err("getBeacons:fail not supported".to_string())
+    }
+}
+
 // ==================== Aggregated Device Services ====================
 
 /// Aggregated device services provided by a platform.
@@ -279,6 +373,9 @@ pub trait DeviceServices: Send + Sync {
         None
     }
     fn keyboard(&self) -> Option<Arc<dyn KeyboardService>> {
+        None
+    }
+    fn bluetooth(&self) -> Option<Arc<dyn BluetoothService>> {
         None
     }
 }

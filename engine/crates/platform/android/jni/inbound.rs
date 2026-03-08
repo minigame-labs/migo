@@ -663,6 +663,140 @@ pub(crate) extern "system" fn onCameraFrameData(
     );
 }
 
+// ==================== Bluetooth Callbacks ====================
+
+pub(crate) extern "system" fn onBluetoothAdapterStateChange(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    available: jni::sys::jboolean,
+    discovering: jni::sys::jboolean,
+) {
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnBluetoothAdapterStateChange {
+            available: available != 0,
+            discovering: discovering != 0,
+        },
+    );
+}
+
+pub(crate) extern "system" fn onBluetoothDeviceFound<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    devices_json: JString<'local>,
+) {
+    let json = env
+        .get_string(&devices_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "[]".to_string());
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnBluetoothDeviceFound {
+            devices_json: json,
+        },
+    );
+}
+
+pub(crate) extern "system" fn onBeaconUpdate<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    beacons_json: JString<'local>,
+) {
+    let json = env
+        .get_string(&beacons_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "[]".to_string());
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnBeaconUpdate {
+            beacons_json: json,
+        },
+    );
+}
+
+pub(crate) extern "system" fn onBeaconServiceChange(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    available: jni::sys::jboolean,
+    discovering: jni::sys::jboolean,
+) {
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnBeaconServiceChange {
+            available: available != 0,
+            discovering: discovering != 0,
+        },
+    );
+}
+
+// ==================== Keyboard Callbacks ====================
+
+pub(crate) extern "system" fn onKeyboardInput<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    value: JString<'local>,
+) {
+    let val = env
+        .get_string(&value)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnKeyboardInput { value: val },
+    );
+}
+
+pub(crate) extern "system" fn onKeyboardConfirm<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    value: JString<'local>,
+) {
+    let val = env
+        .get_string(&value)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnKeyboardConfirm { value: val },
+    );
+}
+
+pub(crate) extern "system" fn onKeyboardComplete<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    value: JString<'local>,
+) {
+    let val = env
+        .get_string(&value)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnKeyboardComplete { value: val },
+    );
+}
+
+pub(crate) extern "system" fn onKeyboardHeightChange(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    height: jdouble,
+) {
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnKeyboardHeightChange {
+            height: height as f64,
+        },
+    );
+}
+
 // ==================== VSync (Choreographer) ====================
 
 pub(crate) extern "system" fn onVsync(

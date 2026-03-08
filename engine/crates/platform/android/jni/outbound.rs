@@ -955,6 +955,151 @@ pub fn camera_close_frame_change(host_id: i32, camera_id: u32) -> Result<(), Str
     )
 }
 
+// ==================== Bluetooth ====================
+
+/// Call a Java Bluetooth method that takes (hostId, optionsJson) and returns a JSON string.
+fn call_bluetooth_json(method_name: &str, host_id: i32, options_json: &str) -> Result<String, String> {
+    with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = cache
+            .get_method_id(method_name)
+            .ok_or("Method ID not found")?;
+        let class = cache.class();
+
+        let jstr = env
+            .new_string(options_json)
+            .map_err(|e| format!("Failed to create Java string: {e}"))?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Object,
+                &[jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }],
+            )
+        };
+
+        match result {
+            Ok(val) => {
+                let jstring = val.l().map_err(|_| "Null string from Java")?;
+                let json_str = env
+                    .get_string(&jni::objects::JString::from(jstring))
+                    .map_err(|e| format!("Failed to convert bluetooth JSON string: {e}"))?
+                    .into();
+                Ok(json_str)
+            }
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("Failed to call method '{method_name}': {e}"))
+            }
+        }
+    })
+}
+
+/// Call a Java Bluetooth method that takes (hostId) and returns a JSON string.
+fn call_bluetooth_json_no_args(method_name: &str, host_id: i32) -> Result<String, String> {
+    call_static_method(
+        method_name,
+        ReturnType::Object,
+        |env, result| {
+            let jstring = result.l().map_err(|_| "Null string from Java")?;
+            let json_str = env
+                .get_string(&jni::objects::JString::from(jstring))
+                .map_err(|e| format!("Failed to convert bluetooth JSON string: {e}"))?
+                .into();
+            Ok(json_str)
+        },
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn bluetooth_open_adapter(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("bluetoothOpenAdapter", host_id, options_json)
+}
+
+pub fn bluetooth_close_adapter(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "bluetoothCloseAdapter",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn bluetooth_get_adapter_state(host_id: i32) -> Result<String, String> {
+    call_bluetooth_json_no_args("bluetoothGetAdapterState", host_id)
+}
+
+pub fn bluetooth_start_devices_discovery(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("bluetoothStartDevicesDiscovery", host_id, options_json)
+}
+
+pub fn bluetooth_stop_devices_discovery(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "bluetoothStopDevicesDiscovery",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn bluetooth_get_devices(host_id: i32) -> Result<String, String> {
+    call_bluetooth_json_no_args("bluetoothGetDevices", host_id)
+}
+
+pub fn bluetooth_get_connected_devices(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_bluetooth_json("bluetoothGetConnectedDevices", host_id, options_json)
+}
+
+pub fn bluetooth_make_pair(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("bluetoothMakePair", host_id, options_json)
+}
+
+pub fn bluetooth_is_device_paired(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("bluetoothIsDevicePaired", host_id, options_json)
+}
+
+pub fn bluetooth_start_beacon_discovery(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("bluetoothStartBeaconDiscovery", host_id, options_json)
+}
+
+pub fn bluetooth_stop_beacon_discovery(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "bluetoothStopBeaconDiscovery",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn bluetooth_get_beacons(host_id: i32) -> Result<String, String> {
+    call_bluetooth_json_no_args("bluetoothGetBeacons", host_id)
+}
+
+// ==================== Keyboard ====================
+
+pub fn keyboard_show(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("keyboardShow", host_id, options_json)
+}
+
+pub fn keyboard_hide(host_id: i32) -> Result<(), String> {
+    call_static_method(
+        "keyboardHide",
+        ReturnType::Primitive(Primitive::Void),
+        |_env, _| Ok(()),
+        &[jvalue { i: host_id }],
+    )
+}
+
+pub fn keyboard_update(host_id: i32, value: &str) -> Result<(), String> {
+    call_void_with_string("keyboardUpdate", host_id, value)
+}
+
 // ==================== Error Notification ====================
 
 /// Notify the Java layer that the host is exiting normally.

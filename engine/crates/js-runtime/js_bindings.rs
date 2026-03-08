@@ -22,6 +22,11 @@ pub(crate) struct JsBindings {
     sensor_compass_fn: Option<v8::Global<v8::Function>>,
     sensor_orientation_fn: Option<v8::Global<v8::Function>>,
     sensor_network_fn: Option<v8::Global<v8::Function>>,
+    // Bluetooth event functions
+    bluetooth_adapter_state_change_fn: Option<v8::Global<v8::Function>>,
+    bluetooth_device_found_fn: Option<v8::Global<v8::Function>>,
+    beacon_update_fn: Option<v8::Global<v8::Function>>,
+    beacon_service_change_fn: Option<v8::Global<v8::Function>>,
     // Keyboard event functions
     keyboard_input_fn: Option<v8::Global<v8::Function>>,
     keyboard_height_change_fn: Option<v8::Global<v8::Function>>,
@@ -49,6 +54,10 @@ impl JsBindings {
             sensor_compass_fn: None,
             sensor_orientation_fn: None,
             sensor_network_fn: None,
+            bluetooth_adapter_state_change_fn: None,
+            bluetooth_device_found_fn: None,
+            beacon_update_fn: None,
+            beacon_service_change_fn: None,
             keyboard_input_fn: None,
             keyboard_height_change_fn: None,
             keyboard_confirm_fn: None,
@@ -78,6 +87,7 @@ impl JsBindings {
             rec_event, rec_frame,
             cam_event, cam_frame,
             dev_motion, gyro, accel, compass, orientation, network,
+            bt_adapter_state, bt_device_found, beacon_update, beacon_svc_change,
             kb_input, kb_height, kb_confirm, kb_complete, key_down, key_up,
         ) = self.with_main_context(rt, |scope, _ctx, global| {
             (
@@ -93,6 +103,10 @@ impl JsBindings {
                 get_global_fn(scope, global, "_internalTriggerCompassChange"),
                 get_global_fn(scope, global, "_internalTriggerDeviceOrientationChange"),
                 get_global_fn(scope, global, "_internalTriggerNetworkStatusChange"),
+                get_global_fn(scope, global, "_internalTriggerBluetoothAdapterStateChange"),
+                get_global_fn(scope, global, "_internalTriggerBluetoothDeviceFound"),
+                get_global_fn(scope, global, "_internalTriggerBeaconUpdate"),
+                get_global_fn(scope, global, "_internalTriggerBeaconServiceChange"),
                 get_global_fn(scope, global, "_internalTriggerKeyboardInput"),
                 get_global_fn(scope, global, "_internalTriggerKeyboardHeightChange"),
                 get_global_fn(scope, global, "_internalTriggerKeyboardConfirm"),
@@ -114,6 +128,10 @@ impl JsBindings {
         self.sensor_compass_fn = compass;
         self.sensor_orientation_fn = orientation;
         self.sensor_network_fn = network;
+        self.bluetooth_adapter_state_change_fn = bt_adapter_state;
+        self.bluetooth_device_found_fn = bt_device_found;
+        self.beacon_update_fn = beacon_update;
+        self.beacon_service_change_fn = beacon_svc_change;
         self.keyboard_input_fn = kb_input;
         self.keyboard_height_change_fn = kb_height;
         self.keyboard_confirm_fn = kb_confirm;
@@ -394,6 +412,76 @@ impl JsBindings {
             let func = v8::Local::new(scope, func_g);
             let _ = func.call(scope, global.into(), &args);
         });
+    }
+
+    // ---- Bluetooth event dispatch ----
+
+    /// Dispatch Bluetooth adapter state change event.
+    pub(crate) fn dispatch_bluetooth_adapter_state_change(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        available: bool,
+        discovering: bool,
+    ) {
+        if let Some(func_g) = self.bluetooth_adapter_state_change_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [
+                    v8::Boolean::new(scope, available).into(),
+                    v8::Boolean::new(scope, discovering).into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Dispatch Bluetooth device found event.
+    pub(crate) fn dispatch_bluetooth_device_found(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        devices_json: &str,
+    ) {
+        if let Some(func_g) = self.bluetooth_device_found_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::String::new(scope, devices_json).unwrap().into()];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Dispatch Beacon update event.
+    pub(crate) fn dispatch_beacon_update(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        beacons_json: &str,
+    ) {
+        if let Some(func_g) = self.beacon_update_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::String::new(scope, beacons_json).unwrap().into()];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Dispatch Beacon service change event.
+    pub(crate) fn dispatch_beacon_service_change(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        available: bool,
+        discovering: bool,
+    ) {
+        if let Some(func_g) = self.beacon_service_change_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [
+                    v8::Boolean::new(scope, available).into(),
+                    v8::Boolean::new(scope, discovering).into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
     }
 
     // ---- Keyboard event dispatch ----

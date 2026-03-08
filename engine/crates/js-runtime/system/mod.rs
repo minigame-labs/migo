@@ -21,6 +21,164 @@ pub fn op_open_system_bluetooth_setting(state: &mut OpState) -> Result<(), JsErr
     Err(JsErrorBox::generic("openSystemBluetoothSetting:fail not supported"))
 }
 
+// ==================== Bluetooth Adapter ====================
+
+#[op2(fast)]
+pub fn op_open_bluetooth_adapter(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.open_adapter(&options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("openBluetoothAdapter:fail not supported"))
+}
+
+#[op2(fast)]
+pub fn op_close_bluetooth_adapter(state: &mut OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.close_adapter().map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("closeBluetoothAdapter:fail not supported"))
+}
+
+#[op2]
+#[string]
+pub fn op_get_bluetooth_adapter_state(state: &mut OpState) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.get_adapter_state().map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("getBluetoothAdapterState:fail not supported"))
+}
+
+#[op2(fast)]
+pub fn op_start_bluetooth_devices_discovery(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.start_devices_discovery(&options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("startBluetoothDevicesDiscovery:fail not supported"))
+}
+
+#[op2(fast)]
+pub fn op_stop_bluetooth_devices_discovery(state: &mut OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.stop_devices_discovery().map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("stopBluetoothDevicesDiscovery:fail not supported"))
+}
+
+#[op2]
+#[string]
+pub fn op_get_bluetooth_devices(state: &mut OpState) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.get_devices().map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("getBluetoothDevices:fail not supported"))
+}
+
+#[op2]
+#[string]
+pub fn op_get_connected_bluetooth_devices(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.get_connected_devices(&options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("getConnectedBluetoothDevices:fail not supported"))
+}
+
+#[op2(fast)]
+pub fn op_make_bluetooth_pair(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.make_pair(&options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("makeBluetoothPair:fail not supported"))
+}
+
+#[op2(fast)]
+pub fn op_is_bluetooth_device_paired(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.is_device_paired(&options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("isBluetoothDevicePaired:fail not supported"))
+}
+
+// ==================== Beacon ====================
+
+#[op2(fast)]
+pub fn op_start_beacon_discovery(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.start_beacon_discovery(&options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("startBeaconDiscovery:fail not supported"))
+}
+
+#[op2(fast)]
+pub fn op_stop_beacon_discovery(state: &mut OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.stop_beacon_discovery().map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("stopBeaconDiscovery:fail not supported"))
+}
+
+#[op2]
+#[string]
+pub fn op_get_beacons(state: &mut OpState) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt.get_beacons().map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("getBeacons:fail not supported"))
+}
+
 // ==================== App Authorize Setting ====================
 
 #[op2(fast)]
@@ -97,6 +255,18 @@ deno_core::extension!(
     deps = [host_v8_base],
     ops = [
         op_open_system_bluetooth_setting,
+        op_open_bluetooth_adapter,
+        op_close_bluetooth_adapter,
+        op_get_bluetooth_adapter_state,
+        op_start_bluetooth_devices_discovery,
+        op_stop_bluetooth_devices_discovery,
+        op_get_bluetooth_devices,
+        op_get_connected_bluetooth_devices,
+        op_make_bluetooth_pair,
+        op_is_bluetooth_device_paired,
+        op_start_beacon_discovery,
+        op_stop_beacon_discovery,
+        op_get_beacons,
         op_open_app_authorize_setting,
         op_get_window_info,
         op_get_system_settings,

@@ -404,6 +404,62 @@ public final class NativeMethods {
         }
     }
 
+    // ==================== Bluetooth Callbacks ====================
+
+    /**
+     * Callback for Bluetooth adapter state change.
+     * Called from {@link com.migo.runtime.internal.platform.BluetoothManager}.
+     *
+     * @param sessionId   The session ID
+     * @param available   Whether the adapter is available
+     * @param discovering Whether the adapter is discovering devices
+     */
+    public static void onBluetoothAdapterStateChange(int sessionId, boolean available, boolean discovering) {
+        if (sessionId >= 0) {
+            NativeBridge.onBluetoothAdapterStateChange(sessionId, available, discovering);
+        }
+    }
+
+    /**
+     * Callback for Bluetooth device found.
+     * Called from {@link com.migo.runtime.internal.platform.BluetoothManager}.
+     *
+     * @param sessionId   The session ID
+     * @param devicesJson JSON-encoded array of discovered devices
+     */
+    public static void onBluetoothDeviceFound(int sessionId, String devicesJson) {
+        if (sessionId >= 0 && devicesJson != null) {
+            NativeBridge.onBluetoothDeviceFound(sessionId, devicesJson);
+        }
+    }
+
+    /**
+     * Callback for Beacon update.
+     * Called from {@link com.migo.runtime.internal.platform.BluetoothManager}.
+     *
+     * @param sessionId   The session ID
+     * @param beaconsJson JSON-encoded array of beacon devices
+     */
+    public static void onBeaconUpdate(int sessionId, String beaconsJson) {
+        if (sessionId >= 0 && beaconsJson != null) {
+            NativeBridge.onBeaconUpdate(sessionId, beaconsJson);
+        }
+    }
+
+    /**
+     * Callback for Beacon service state change.
+     * Called from {@link com.migo.runtime.internal.platform.BluetoothManager}.
+     *
+     * @param sessionId   The session ID
+     * @param available   Whether the beacon service is available
+     * @param discovering Whether the beacon service is discovering
+     */
+    public static void onBeaconServiceChange(int sessionId, boolean available, boolean discovering) {
+        if (sessionId >= 0) {
+            NativeBridge.onBeaconServiceChange(sessionId, available, discovering);
+        }
+    }
+
     // ==================== Screen Capture ====================
 
     /**
@@ -415,6 +471,56 @@ public final class NativeMethods {
     public static void onUserCaptureScreen(int sessionId) {
         if (sessionId >= 0) {
             NativeBridge.onUserCaptureScreen(sessionId);
+        }
+    }
+
+    // ==================== Keyboard Callbacks ====================
+
+    /**
+     * Callback for keyboard input text change.
+     *
+     * @param sessionId The session ID
+     * @param value     Current text value
+     */
+    public static void onKeyboardInput(int sessionId, String value) {
+        if (sessionId >= 0 && value != null) {
+            NativeBridge.onKeyboardInput(sessionId, value);
+        }
+    }
+
+    /**
+     * Callback for keyboard confirm action.
+     *
+     * @param sessionId The session ID
+     * @param value     Current text value
+     */
+    public static void onKeyboardConfirm(int sessionId, String value) {
+        if (sessionId >= 0 && value != null) {
+            NativeBridge.onKeyboardConfirm(sessionId, value);
+        }
+    }
+
+    /**
+     * Callback for keyboard complete (dismissed).
+     *
+     * @param sessionId The session ID
+     * @param value     Current text value
+     */
+    public static void onKeyboardComplete(int sessionId, String value) {
+        if (sessionId >= 0 && value != null) {
+            NativeBridge.onKeyboardComplete(sessionId, value);
+        }
+    }
+
+    /**
+     * Callback for keyboard height change.
+     *
+     * @param sessionId The session ID
+     * @param height    Keyboard height in CSS pixels (0 when hidden)
+     */
+    public static void onKeyboardHeightChange(int sessionId, double height) {
+        if (sessionId >= 0) {
+            NativeBridge.onKeyboardHeightChange(sessionId, height);
         }
     }
 

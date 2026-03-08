@@ -1,0 +1,328 @@
+package com.migo.runtime.internal.platform;
+
+import android.app.Activity;
+import android.graphics.Rect;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.Editable;
+import android.text.InputFilter;
+import android.text.InputType;
+import android.text.TextWatcher;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewTreeObserver;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+
+import com.migo.runtime.internal.NativeMethods;
+
+import org.json.JSONException;
+import org.json.JSONObject;
+
+/**
+ * Manages soft keyboard lifecycle for a session.
+ * <p>
+ * Creates a hidden {@link EditText} to interact with the Android IME,
+ * monitors keyboard height via layout changes, and dispatches events
+ * (input, confirm, complete, heightChange) back to native via {@link NativeMethods}.
+ * <p>
+ * Options from wx.showKeyboard:
+ * <ul>
+ *   <li>defaultValue - initial text</li>
+ *   <li>maxLength - max input length</li>
+ *   <li>multiple - multiline input</li>
+ *   <li>confirmHold - keep keyboard open on confirm</li>
+ *   <li>confirmType - IME action: "done", "next", "search", "go", "send"</li>
+ *   <li>keyboardType - input type: "text", "number", "digit", "email", "url", "phone"</li>
+ * </ul>
+ *
+ * @hide
+ */
+public class KeyboardManager {
+
+    private static final String TAG = "KeyboardManager";
+
+    private final int sessionId;
+    private final Activity activity;
+    private final Handler mainHandler;
+
+    private EditText editText;
+    private boolean confirmHold;
+    private boolean isShowing;
+    private int lastKeyboardHeight;
+
+    private ViewTreeObserver.OnGlobalLayoutListener layoutListener;
+
+    public KeyboardManager(int sessionId, Activity activity) {
+        this.sessionId = sessionId;
+        this.activity = activity;
+        this.mainHandler = new Handler(Looper.getMainLooper());
+    }
+
+    /**
+     * Show the soft keyboard with the given options JSON.
+     *
+     * @param optionsJson JSON string with showKeyboard options
+     */
+    public void show(String optionsJson) {
+        mainHandler.post(() -> showOnUiThread(optionsJson));
+    }
+
+    /**
+     * Hide the soft keyboard.
+     */
+    public void hide() {
+        mainHandler.post(this::hideOnUiThread);
+    }
+
+    /**
+     * Update the current text value programmatically.
+     *
+     * @param value New text value
+     */
+    public void updateValue(String value) {
+        mainHandler.post(() -> {
+            if (editText != null && value != null) {
+                editText.removeTextChangedListener(textWatcher);
+                editText.setText(value);
+                editText.setSelection(value.length());
+                editText.addTextChangedListener(textWatcher);
+            }
+        });
+    }
+
+    /**
+     * Release all resources. Called on session shutdown.
+     */
+    public void destroy() {
+        mainHandler.post(() -> {
+            hideOnUiThread();
+            removeEditText();
+        });
+    }
+
+    // ==================== Internal ====================
+
+    private void showOnUiThread(String optionsJson) {
+        String defaultValue = "";
+        int maxLength = 140;
+        boolean multiple = false;
+        confirmHold = false;
+        String confirmType = "done";
+        String keyboardType = "text";
+
+        if (optionsJson != null) {
+            try {
+                JSONObject opts = new JSONObject(optionsJson);
+                defaultValue = opts.optString("defaultValue", "");
+                maxLength = opts.optInt("maxLength", 140);
+                multiple = opts.optBoolean("multiple", false);
+                confirmHold = opts.optBoolean("confirmHold", false);
+                confirmType = opts.optString("confirmType", "done");
+                keyboardType = opts.optString("keyboardType", "text");
+            } catch (JSONException ignored) {
+            }
+        }
+
+        ensureEditText();
+
+        // Input type
+        int inputType = mapInputType(keyboardType, multiple);
+        editText.setInputType(inputType);
+
+        // Max length
+        if (maxLength > 0) {
+            editText.setFilters(new InputFilter[]{new InputFilter.LengthFilter(maxLength)});
+        } else {
+            editText.setFilters(new InputFilter[0]);
+        }
+
+        // IME action
+        int imeAction = mapImeAction(confirmType);
+        editText.setImeOptions(imeAction);
+
+        // Default value
+        editText.removeTextChangedListener(textWatcher);
+        editText.setText(defaultValue);
+        editText.setSelection(defaultValue.length());
+        editText.addTextChangedListener(textWatcher);
+
+        // Show
+        editText.setVisibility(View.VISIBLE);
+        editText.requestFocus();
+        isShowing = true;
+
+        InputMethodManager imm = getImm();
+        if (imm != null) {
+            imm.showSoftInput(editText, InputMethodManager.SHOW_FORCED);
+        }
+
+        startKeyboardHeightMonitoring();
+    }
+
+    private void hideOnUiThread() {
+        if (!isShowing) return;
+        isShowing = false;
+
+        if (editText != null) {
+            String value = editText.getText().toString();
+
+            InputMethodManager imm = getImm();
+            if (imm != null) {
+                imm.hideSoftInputFromWindow(editText.getWindowToken(), 0);
+            }
+
+            editText.setVisibility(View.GONE);
+            editText.clearFocus();
+
+            NativeMethods.onKeyboardComplete(sessionId, value);
+        }
+
+        stopKeyboardHeightMonitoring();
+    }
+
+    private void ensureEditText() {
+        if (editText != null) return;
+
+        editText = new EditText(activity);
+        editText.setVisibility(View.GONE);
+        // Make the EditText effectively invisible but focusable
+        editText.setBackgroundColor(0x00000000);
+        editText.setTextColor(0x00000000);
+        editText.setCursorVisible(false);
+        editText.setFocusable(true);
+        editText.setFocusableInTouchMode(true);
+
+        // 1x1 pixel at bottom-left, out of visual area
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(1, 1);
+        lp.gravity = Gravity.BOTTOM | Gravity.START;
+
+        View decorView = activity.getWindow().getDecorView();
+        if (decorView instanceof FrameLayout) {
+            ((FrameLayout) decorView).addView(editText, lp);
+        } else {
+            FrameLayout contentView = activity.findViewById(android.R.id.content);
+            if (contentView != null) {
+                contentView.addView(editText, lp);
+            }
+        }
+
+        // Editor action listener for confirm
+        editText.setOnEditorActionListener((v, actionId, event) -> {
+            String value = editText.getText().toString();
+            NativeMethods.onKeyboardConfirm(sessionId, value);
+            if (!confirmHold) {
+                hideOnUiThread();
+            }
+            return true;
+        });
+    }
+
+    private void removeEditText() {
+        if (editText != null) {
+            if (editText.getParent() instanceof FrameLayout) {
+                ((FrameLayout) editText.getParent()).removeView(editText);
+            }
+            editText = null;
+        }
+    }
+
+    private final TextWatcher textWatcher = new TextWatcher() {
+        @Override
+        public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+        }
+
+        @Override
+        public void onTextChanged(CharSequence s, int start, int before, int count) {
+        }
+
+        @Override
+        public void afterTextChanged(Editable s) {
+            NativeMethods.onKeyboardInput(sessionId, s.toString());
+        }
+    };
+
+    // ==================== Keyboard Height Monitoring ====================
+
+    private void startKeyboardHeightMonitoring() {
+        stopKeyboardHeightMonitoring();
+
+        View decorView = activity.getWindow().getDecorView();
+        layoutListener = () -> {
+            Rect r = new Rect();
+            decorView.getWindowVisibleDisplayFrame(r);
+            int screenHeight = decorView.getRootView().getHeight();
+            int keyboardHeight = screenHeight - r.bottom;
+
+            if (keyboardHeight != lastKeyboardHeight) {
+                lastKeyboardHeight = keyboardHeight;
+                // Convert physical pixels to CSS pixels (dp)
+                float density = activity.getResources().getDisplayMetrics().density;
+                double cssHeight = keyboardHeight / density;
+                NativeMethods.onKeyboardHeightChange(sessionId, cssHeight);
+            }
+        };
+        decorView.getViewTreeObserver().addOnGlobalLayoutListener(layoutListener);
+    }
+
+    private void stopKeyboardHeightMonitoring() {
+        if (layoutListener != null) {
+            View decorView = activity.getWindow().getDecorView();
+            decorView.getViewTreeObserver().removeOnGlobalLayoutListener(layoutListener);
+            layoutListener = null;
+            lastKeyboardHeight = 0;
+        }
+    }
+
+    // ==================== Helpers ====================
+
+    private InputMethodManager getImm() {
+        return (InputMethodManager) activity.getSystemService(Activity.INPUT_METHOD_SERVICE);
+    }
+
+    private static int mapInputType(String keyboardType, boolean multiple) {
+        int base;
+        switch (keyboardType) {
+            case "number":
+                base = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED
+                        | InputType.TYPE_NUMBER_FLAG_DECIMAL;
+                break;
+            case "digit":
+                base = InputType.TYPE_CLASS_NUMBER;
+                break;
+            case "email":
+                base = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS;
+                break;
+            case "url":
+                base = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI;
+                break;
+            case "phone":
+                base = InputType.TYPE_CLASS_PHONE;
+                break;
+            default: // "text"
+                base = InputType.TYPE_CLASS_TEXT;
+                break;
+        }
+        if (multiple) {
+            base |= InputType.TYPE_TEXT_FLAG_MULTI_LINE;
+        }
+        return base;
+    }
+
+    private static int mapImeAction(String confirmType) {
+        switch (confirmType) {
+            case "next":
+                return EditorInfo.IME_ACTION_NEXT;
+            case "search":
+                return EditorInfo.IME_ACTION_SEARCH;
+            case "go":
+                return EditorInfo.IME_ACTION_GO;
+            case "send":
+                return EditorInfo.IME_ACTION_SEND;
+            default: // "done"
+                return EditorInfo.IME_ACTION_DONE;
+        }
+    }
+}
