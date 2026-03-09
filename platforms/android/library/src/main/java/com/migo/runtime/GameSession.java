@@ -1,6 +1,7 @@
 package com.migo.runtime;
 
 import android.content.Context;
+import android.content.Intent;
 import android.view.MotionEvent;
 import android.view.Surface;
 
@@ -378,6 +379,34 @@ public final class GameSession implements Closeable {
      */
     public void destroy() {
         close();
+    }
+
+    // ==================== Activity Result ====================
+
+    /**
+     * Forward an Activity result to the session.
+     * <p>
+     * Call this from your Activity's {@code onActivityResult} so that SDK-initiated
+     * intents (image picker, file chooser, camera capture, etc.) can receive their results.
+     *
+     * <pre>{@code
+     * @Override
+     * protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+     *     super.onActivityResult(requestCode, resultCode, data);
+     *     if (session != null && session.isValid()) {
+     *         session.dispatchActivityResult(requestCode, resultCode, data);
+     *     }
+     * }
+     * }</pre>
+     *
+     * @param requestCode The request code originally supplied to startActivityForResult
+     * @param resultCode  The result code returned by the child activity
+     * @param data        The result data
+     */
+    public void dispatchActivityResult(int requestCode, int resultCode, Intent data) {
+        if (!destroyed) {
+            NativeExports.dispatchActivityResult(sessionId, requestCode, resultCode, data);
+        }
     }
 
     // ==================== Input ====================
