@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use super::{
-    CameraService, ClipboardService, CodecService, FileService, InteractionService,
-    NetworkService, SystemInfoService,
+    CameraService, ClipboardService, CodecService, FileService, ImageApiService,
+    InteractionService, NetworkService, SystemInfoService,
 };
 
 // ==================== Battery ====================
@@ -376,6 +376,9 @@ pub trait DeviceServices: Send + Sync {
         None
     }
     fn bluetooth(&self) -> Option<Arc<dyn BluetoothService>> {
+        None
+    }
+    fn image_api(&self) -> Option<Arc<dyn ImageApiService>> {
         None
     }
 }

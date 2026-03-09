@@ -1,0 +1,68 @@
+//! Image API service traits for image picking, preview, save, and compression.
+
+/// Image API service for image-related operations.
+///
+/// Methods follow wx mini-game API signatures. Complex parameters and results
+/// are passed as JSON strings for flexibility.
+pub trait ImageApiService: Send + Sync {
+    /// Save an image to the system photo album.
+    ///
+    /// JSON fields (input):
+    /// - `filePath`: string — local file path of the image
+    fn save_image_to_photos_album(&self, _options_json: &str) -> Result<(), String> {
+        Err("saveImageToPhotosAlbum:fail not supported".to_string())
+    }
+
+    /// Preview images and videos in a fullscreen viewer.
+    ///
+    /// JSON fields (input):
+    /// - `sources`: array of `{url, type, poster}` — resources to preview
+    /// - `current`: number — index of current resource (default 0)
+    /// - `showmenu`: boolean — show long-press menu (default true)
+    fn preview_media(&self, _options_json: &str) -> Result<(), String> {
+        Err("previewMedia:fail not supported".to_string())
+    }
+
+    /// Preview images in a fullscreen viewer.
+    ///
+    /// JSON fields (input):
+    /// - `urls`: array of string — image URLs
+    /// - `current`: string — current image URL
+    /// - `showmenu`: boolean — show long-press menu (default true)
+    fn preview_image(&self, _options_json: &str) -> Result<(), String> {
+        Err("previewImage:fail not supported".to_string())
+    }
+
+    /// Compress an image.
+    ///
+    /// JSON fields (input):
+    /// - `src`: string — image file path
+    /// - `quality`: number — compression quality 0-100 (default 80)
+    /// - `compressedWidth`: number (optional)
+    /// - `compressedHeight`: number (optional)
+    ///
+    /// Returns JSON: `{"tempFilePath": "..."}`
+    fn compress_image(&self, _options_json: &str) -> Result<String, String> {
+        Err("compressImage:fail not supported".to_string())
+    }
+
+    /// Choose files from client session (async, result via callback).
+    ///
+    /// JSON fields (input):
+    /// - `count`: number — max files to select (0-100)
+    /// - `type`: string — "all", "video", "image", "file"
+    /// - `extension`: array of string (only when type=="file")
+    fn choose_message_file(&self, _options_json: &str) -> Result<(), String> {
+        Err("chooseMessageFile:fail not supported".to_string())
+    }
+
+    /// Choose images from album or camera (async, result via callback).
+    ///
+    /// JSON fields (input):
+    /// - `count`: number — max images (default 9)
+    /// - `sizeType`: array of string — ["original", "compressed"]
+    /// - `sourceType`: array of string — ["album", "camera"]
+    fn choose_image(&self, _options_json: &str) -> Result<(), String> {
+        Err("chooseImage:fail not supported".to_string())
+    }
+}

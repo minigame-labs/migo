@@ -21,6 +21,7 @@ import com.migo.runtime.internal.platform.AudioRecorderManager;
 import com.migo.runtime.internal.platform.BluetoothManager;
 import com.migo.runtime.internal.platform.CameraManager;
 import com.migo.runtime.internal.platform.KeyboardManager;
+import com.migo.runtime.internal.platform.ImageApiManager;
 import com.migo.runtime.internal.platform.ScreenCaptureObserver;
 
 import android.graphics.Bitmap;
@@ -1587,6 +1588,84 @@ public final class NativeExports {
      */
     public static void destroyBluetoothManager(int sessionId) {
         BluetoothManager mgr = sBluetoothManagers.remove(sessionId);
+        if (mgr != null) {
+            mgr.destroy();
+        }
+    }
+
+    // ==================== Image API ====================
+
+    /** Per-session Image API managers. */
+    private static final ConcurrentHashMap<Integer, ImageApiManager> sImageApiManagers =
+            new ConcurrentHashMap<>();
+
+    private static ImageApiManager getOrCreateImageApiManager(int sessionId) {
+        ImageApiManager mgr = sImageApiManagers.get(sessionId);
+        if (mgr != null) return mgr;
+
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) return null;
+        Activity activity = ctx.getActivity();
+        if (activity == null) return null;
+
+        mgr = new ImageApiManager(sessionId, activity);
+        sImageApiManagers.put(sessionId, mgr);
+        return mgr;
+    }
+
+    public static void imageSaveToPhotosAlbum(int sessionId, String optionsJson) {
+        ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("saveImageToPhotosAlbum:fail no context");
+        }
+        mgr.saveToPhotosAlbum(optionsJson);
+    }
+
+    public static void imagePreviewMedia(int sessionId, String optionsJson) {
+        ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("previewMedia:fail no context");
+        }
+        mgr.previewMedia(optionsJson);
+    }
+
+    public static void imagePreviewImage(int sessionId, String optionsJson) {
+        ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("previewImage:fail no context");
+        }
+        mgr.previewImage(optionsJson);
+    }
+
+    public static String imageCompress(int sessionId, String optionsJson) {
+        ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("compressImage:fail no context");
+        }
+        return mgr.compress(optionsJson);
+    }
+
+    public static void imageChooseMessageFile(int sessionId, String optionsJson) {
+        ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("chooseMessageFile:fail no context");
+        }
+        mgr.chooseMessageFile(optionsJson);
+    }
+
+    public static void imageChooseImage(int sessionId, String optionsJson) {
+        ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
+        if (mgr == null) {
+            throw new RuntimeException("chooseImage:fail no context");
+        }
+        mgr.chooseImage(optionsJson);
+    }
+
+    /**
+     * Clean up Image API resources for a session. Call on session shutdown.
+     */
+    public static void destroyImageApiManager(int sessionId) {
+        ImageApiManager mgr = sImageApiManagers.remove(sessionId);
         if (mgr != null) {
             mgr.destroy();
         }

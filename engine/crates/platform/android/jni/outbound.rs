@@ -1081,6 +1081,32 @@ pub fn bluetooth_get_beacons(host_id: i32) -> Result<String, String> {
     call_bluetooth_json_no_args("bluetoothGetBeacons", host_id)
 }
 
+// ==================== Image API ====================
+
+pub fn image_save_to_photos_album(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("imageSaveToPhotosAlbum", host_id, options_json)
+}
+
+pub fn image_preview_media(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("imagePreviewMedia", host_id, options_json)
+}
+
+pub fn image_preview_image(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("imagePreviewImage", host_id, options_json)
+}
+
+pub fn image_compress(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_camera_json("imageCompress", host_id, options_json)
+}
+
+pub fn image_choose_message_file(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("imageChooseMessageFile", host_id, options_json)
+}
+
+pub fn image_choose_image(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("imageChooseImage", host_id, options_json)
+}
+
 // ==================== Keyboard ====================
 
 pub fn keyboard_show(host_id: i32, options_json: &str) -> Result<(), String> {

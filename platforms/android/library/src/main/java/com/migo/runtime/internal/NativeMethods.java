@@ -524,6 +524,34 @@ public final class NativeMethods {
         }
     }
 
+    // ==================== Image API Callbacks ====================
+
+    /**
+     * Callback for chooseImage result.
+     * Called from {@link com.migo.runtime.internal.platform.ImageApiManager}.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON result with tempFilePaths/tempFiles or error
+     */
+    public static void onChooseImageResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onChooseImageResult(sessionId, resultJson);
+        }
+    }
+
+    /**
+     * Callback for chooseMessageFile result.
+     * Called from {@link com.migo.runtime.internal.platform.ImageApiManager}.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON result with tempFiles or error
+     */
+    public static void onChooseMessageFileResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onChooseMessageFileResult(sessionId, resultJson);
+        }
+    }
+
     // ==================== Recorder Callbacks ====================
 
     /**

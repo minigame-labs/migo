@@ -133,6 +133,107 @@ pub fn op_camera_close_frame_change(
     Err(JsErrorBox::generic("camera.closeFrameChange:fail not supported"))
 }
 
+// ==================== Image API Ops ====================
+
+/// Save image to system photo album.
+#[op2(fast)]
+pub fn op_save_image_to_photos_album(
+    state: &mut OpState,
+    #[string] options_json: &str,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(svc) = services.image_api() {
+            return svc
+                .save_image_to_photos_album(options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "saveImageToPhotosAlbum:fail not supported",
+    ))
+}
+
+/// Preview images and videos.
+#[op2(fast)]
+pub fn op_preview_media(
+    state: &mut OpState,
+    #[string] options_json: &str,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(svc) = services.image_api() {
+            return svc.preview_media(options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("previewMedia:fail not supported"))
+}
+
+/// Preview images fullscreen.
+#[op2(fast)]
+pub fn op_preview_image(
+    state: &mut OpState,
+    #[string] options_json: &str,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(svc) = services.image_api() {
+            return svc.preview_image(options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("previewImage:fail not supported"))
+}
+
+/// Compress image. Returns JSON: `{"tempFilePath": "..."}`.
+#[op2]
+#[string]
+pub fn op_compress_image(
+    state: &mut OpState,
+    #[string] options_json: &str,
+) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(svc) = services.image_api() {
+            return svc
+                .compress_image(options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("compressImage:fail not supported"))
+}
+
+/// Choose files from client session (async, result via callback).
+#[op2(fast)]
+pub fn op_choose_message_file(
+    state: &mut OpState,
+    #[string] options_json: &str,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(svc) = services.image_api() {
+            return svc
+                .choose_message_file(options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("chooseMessageFile:fail not supported"))
+}
+
+/// Choose images from album or camera (async, result via callback).
+#[op2(fast)]
+pub fn op_choose_image(
+    state: &mut OpState,
+    #[string] options_json: &str,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(svc) = services.image_api() {
+            return svc.choose_image(options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("chooseImage:fail not supported"))
+}
+
 // ==================== Extension Definition ====================
 
 deno_core::extension!(
@@ -147,10 +248,17 @@ deno_core::extension!(
         op_camera_set_zoom,
         op_camera_listen_frame_change,
         op_camera_close_frame_change,
+        op_save_image_to_photos_album,
+        op_preview_media,
+        op_preview_image,
+        op_compress_image,
+        op_choose_message_file,
+        op_choose_image,
     ],
     esm = [
         dir "media",
         "01_camera.js",
+        "02_image_api.js",
     ],
 );
 

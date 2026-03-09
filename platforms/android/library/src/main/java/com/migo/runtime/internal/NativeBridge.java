@@ -353,6 +353,24 @@ public final class NativeBridge {
      */
     public static native void onUserCaptureScreen(int sessionId);
 
+    // ==================== Image API Callbacks ====================
+
+    /**
+     * Callback when chooseImage operation completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON-encoded result with tempFilePaths/tempFiles or error
+     */
+    public static native void onChooseImageResult(int sessionId, String resultJson);
+
+    /**
+     * Callback when chooseMessageFile operation completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON-encoded result with tempFiles or error
+     */
+    public static native void onChooseMessageFileResult(int sessionId, String resultJson);
+
     // ==================== Debug Stats ====================
 
     /**

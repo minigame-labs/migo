@@ -39,6 +39,7 @@ import * as appInfo from 'ext:host_v8_system/07_app_info.js';
 import * as authorizeSetting from 'ext:host_v8_system/08_authorize_setting.js';
 import * as storageApi from 'ext:host_v8_storage/01_storage.js';
 import * as cameraApi from 'ext:host_v8_media/01_camera.js';
+import * as imageApi from 'ext:host_v8_media/02_image_api.js';
 import * as workerApi from 'ext:host_v8_worker/01_worker.js';
 import * as adApi from 'ext:host_v8_ad/01_ad.js';
 
@@ -228,6 +229,16 @@ const WindowGlobalScope = {
     createCamera: core.propNonEnumerable(cameraApi.createCamera),
     _internalOnCameraEvent: core.propNonEnumerable(cameraApi._internalOnCameraEvent),
     _internalOnCameraFrameData: core.propNonEnumerable(cameraApi._internalOnCameraFrameData),
+
+    // Image API
+    saveImageToPhotosAlbum: core.propNonEnumerable(imageApi.saveImageToPhotosAlbum),
+    previewMedia: core.propNonEnumerable(imageApi.previewMedia),
+    previewImage: core.propNonEnumerable(imageApi.previewImage),
+    compressImage: core.propNonEnumerable(imageApi.compressImage),
+    chooseMessageFile: core.propNonEnumerable(imageApi.chooseMessageFile),
+    chooseImage: core.propNonEnumerable(imageApi.chooseImage),
+    _internalOnChooseMessageFileResult: core.propNonEnumerable(imageApi._internalOnChooseMessageFileResult),
+    _internalOnChooseImageResult: core.propNonEnumerable(imageApi._internalOnChooseImageResult),
 
     // Worker
     createWorker: core.propNonEnumerable(workerApi.createWorker),

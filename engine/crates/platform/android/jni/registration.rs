@@ -15,6 +15,7 @@ use crate::android::jni::{
     onBluetoothAdapterStateChange, onBluetoothDeviceFound,
     onBeaconUpdate, onBeaconServiceChange,
     onKeyboardInput, onKeyboardConfirm, onKeyboardComplete, onKeyboardHeightChange,
+    onChooseImageResult, onChooseMessageFileResult,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -207,6 +208,17 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(ID)V".into(),
                 fn_ptr: onKeyboardHeightChange as *mut c_void,
             },
+            // Image API callbacks
+            NativeMethod {
+                name: "onChooseImageResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onChooseImageResult as *mut c_void,
+            },
+            NativeMethod {
+                name: "onChooseMessageFileResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onChooseMessageFileResult as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -308,6 +320,13 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("keyboardShow", "(ILjava/lang/String;)V"),
         ("keyboardHide", "(I)V"),
         ("keyboardUpdate", "(ILjava/lang/String;)V"),
+        // Image API
+        ("imageSaveToPhotosAlbum", "(ILjava/lang/String;)V"),
+        ("imagePreviewMedia", "(ILjava/lang/String;)V"),
+        ("imagePreviewImage", "(ILjava/lang/String;)V"),
+        ("imageCompress", "(ILjava/lang/String;)Ljava/lang/String;"),
+        ("imageChooseMessageFile", "(ILjava/lang/String;)V"),
+        ("imageChooseImage", "(ILjava/lang/String;)V"),
         // Error notification callback
         // onError(hostId, errorCode, message, detail)
         ("onError", "(IILjava/lang/String;Ljava/lang/String;)V"),

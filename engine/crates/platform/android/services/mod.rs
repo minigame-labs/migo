@@ -7,8 +7,8 @@ use std::sync::Arc;
 use core::services::{
     AccelerometerService, AudioPlatformService, BatteryService, BluetoothService, CameraService,
     ClipboardService, CodecService, CompassService, DeviceMotionService, DeviceServices,
-    FileService, GyroscopeService, InteractionService, KeyboardService, NetworkService,
-    RecorderService, ScreenService, SystemInfoService, VibrationService,
+    FileService, GyroscopeService, ImageApiService, InteractionService, KeyboardService,
+    NetworkService, RecorderService, ScreenService, SystemInfoService, VibrationService,
 };
 
 use crate::android::jni;
@@ -95,6 +95,10 @@ impl DeviceServices for AndroidDeviceServices {
 
     fn keyboard(&self) -> Option<Arc<dyn KeyboardService>> {
         Some(Arc::new(AndroidKeyboard { host_id: self.host_id }))
+    }
+
+    fn image_api(&self) -> Option<Arc<dyn ImageApiService>> {
+        Some(Arc::new(AndroidImageApi { host_id: self.host_id }))
     }
 }
 
@@ -513,5 +517,37 @@ struct AndroidFile;
 impl FileService for AndroidFile {
     fn unzip(&self, zip_path: &str, dest_dir: &str) -> Result<usize, String> {
         jni::outbound::unzip_file(zip_path, dest_dir)
+    }
+}
+
+// ==================== Image API ====================
+
+struct AndroidImageApi {
+    host_id: i32,
+}
+
+impl ImageApiService for AndroidImageApi {
+    fn save_image_to_photos_album(&self, options_json: &str) -> Result<(), String> {
+        jni::image_save_to_photos_album(self.host_id, options_json)
+    }
+
+    fn preview_media(&self, options_json: &str) -> Result<(), String> {
+        jni::image_preview_media(self.host_id, options_json)
+    }
+
+    fn preview_image(&self, options_json: &str) -> Result<(), String> {
+        jni::image_preview_image(self.host_id, options_json)
+    }
+
+    fn compress_image(&self, options_json: &str) -> Result<String, String> {
+        jni::image_compress(self.host_id, options_json)
+    }
+
+    fn choose_message_file(&self, options_json: &str) -> Result<(), String> {
+        jni::image_choose_message_file(self.host_id, options_json)
+    }
+
+    fn choose_image(&self, options_json: &str) -> Result<(), String> {
+        jni::image_choose_image(self.host_id, options_json)
     }
 }
