@@ -1,9 +1,11 @@
 use deno_core::extension;
 
 use crate::network::fetch::{op_fetch, op_fetch_send, op_fetch_upload};
+use crate::network::tcp_socket::{op_tcp_connect, op_tcp_next_event, op_tcp_write, op_tcp_close};
 use crate::network::websocket::{op_ws_create, op_ws_next_event, op_ws_send, op_ws_close};
 
 mod fetch;
+mod tcp_socket;
 mod websocket;
 
 #[derive(Clone)]
@@ -24,6 +26,7 @@ extension!(host_v8_network,
   ops = [
     op_fetch, op_fetch_send, op_fetch_upload,
     op_ws_create, op_ws_next_event, op_ws_send, op_ws_close,
+    op_tcp_connect, op_tcp_next_event, op_tcp_write, op_tcp_close,
   ],
   esm = [
      dir "network",
@@ -34,6 +37,7 @@ extension!(host_v8_network,
      "05_download.js",
      "06_upload.js",
      "07_websocket.js",
+     "08_tcp_socket.js",
   ],
   options = {
     options: Options,

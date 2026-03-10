@@ -14,7 +14,7 @@ code-signing = ["shared/code-signing"]
 [dependencies]
 deno_core.workspace=true
 # Only enable tokio features actually needed (not "full")
-tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "rt-multi-thread", "net"] }
 femtovg = { workspace = true }
 tracing = { workspace = true }
 shared = {path = "../shared"}

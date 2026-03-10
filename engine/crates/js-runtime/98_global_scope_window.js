@@ -43,6 +43,7 @@ import * as cameraApi from 'ext:host_v8_media/01_camera.js';
 import * as imageApi from 'ext:host_v8_media/02_image_api.js';
 import * as workerApi from 'ext:host_v8_worker/01_worker.js';
 import * as adApi from 'ext:host_v8_ad/01_ad.js';
+import * as tcpSocket from 'ext:host_v8_network/08_tcp_socket.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -339,6 +340,9 @@ const WindowGlobalScope = {
     createRewardedVideoAd: core.propNonEnumerable(adApi.createRewardedVideoAd),
     getDirectAdStatusSync: core.propNonEnumerable(adApi.getDirectAdStatusSync),
     getShowSplashAdStatus: core.propNonEnumerable(adApi.getShowSplashAdStatus),
+
+    // TCP Socket
+    createTCPSocket: core.propNonEnumerable(tcpSocket.createTCPSocket),
 };
 
 export { WindowGlobalScope };
