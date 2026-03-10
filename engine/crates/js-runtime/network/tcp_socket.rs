@@ -1,5 +1,3 @@
-//! TCP Socket implementation for wx.createTCPSocket API.
-//!
 //! Uses Tokio's async TcpStream, managed as a deno_core Resource.
 //! The JS layer creates instances, and each socket has its own read/write
 //! halves protected by AsyncRefCell for single-threaded V8 access.

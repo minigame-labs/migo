@@ -28,7 +28,6 @@ import org.json.JSONObject;
  * monitors keyboard height via layout changes, and dispatches events
  * (input, confirm, complete, heightChange) back to native via {@link NativeMethods}.
  * <p>
- * Options from wx.showKeyboard:
  * <ul>
  *   <li>defaultValue - initial text</li>
  *   <li>maxLength - max input length</li>

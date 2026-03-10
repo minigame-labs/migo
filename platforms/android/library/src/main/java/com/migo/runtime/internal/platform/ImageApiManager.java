@@ -32,10 +32,6 @@ import java.util.List;
 
 /**
  * Manages image-related APIs for a session.
- * <p>
- * Implements wx.saveImageToPhotosAlbum, wx.previewMedia, wx.previewImage,
- * wx.compressImage, wx.chooseMessageFile, wx.chooseImage.
- * <p>
  * Sync-style APIs (save, preview, compress) throw on failure.
  * Async-style APIs (chooseImage, chooseMessageFile) call back via
  * {@link NativeMethods#onChooseImageResult} / {@link NativeMethods#onChooseMessageFileResult}.

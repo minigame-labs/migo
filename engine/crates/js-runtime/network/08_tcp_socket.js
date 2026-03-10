@@ -1,5 +1,3 @@
-// TCP Socket API - wx.createTCPSocket() compatible implementation.
-//
 // Architecture: Each TCPSocket instance wraps a Rust TcpSocketResource
 // (identified by rid). Events are polled via an async loop calling
 // op_tcp_next_event, matching the WebSocket pattern.
@@ -103,7 +101,6 @@ class TCPSocket {
 
     bindWifi(options = {}) {
         // bindWifi requires Android Network.bindSocket() -- not yet implemented.
-        // Fire error per wx semantics.
         this._fireError('bindWifi:fail not supported');
     }
 
@@ -235,7 +232,7 @@ class TCPSocket {
 
             switch (event.type) {
                 case 'message': {
-                    // Convert the raw byte array to ArrayBuffer for wx compatibility
+                    // Convert the raw byte array to ArrayBuffer
                     const buf = new Uint8Array(event.data).buffer;
                     this._fireMessage(
                         buf,

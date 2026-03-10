@@ -44,6 +44,7 @@ import * as imageApi from 'ext:host_v8_media/02_image_api.js';
 import * as workerApi from 'ext:host_v8_worker/01_worker.js';
 import * as adApi from 'ext:host_v8_ad/01_ad.js';
 import * as tcpSocket from 'ext:host_v8_network/08_tcp_socket.js';
+import * as udpSocket from 'ext:host_v8_network/09_udp_socket.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -343,6 +344,9 @@ const WindowGlobalScope = {
 
     // TCP Socket
     createTCPSocket: core.propNonEnumerable(tcpSocket.createTCPSocket),
+
+    // UDP Socket
+    createUDPSocket: core.propNonEnumerable(udpSocket.createUDPSocket),
 };
 
 export { WindowGlobalScope };

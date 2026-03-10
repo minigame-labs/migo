@@ -1,9 +1,6 @@
 //! Image API service traits for image picking, preview, save, and compression.
 
 /// Image API service for image-related operations.
-///
-/// Methods follow wx mini-game API signatures. Complex parameters and results
-/// are passed as JSON strings for flexibility.
 pub trait ImageApiService: Send + Sync {
     /// Save an image to the system photo album.
     ///
