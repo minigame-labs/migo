@@ -401,6 +401,13 @@ impl HostJsRuntime {
         self.bindings.dispatch_beacon_service_change(&mut self.rt, available, discovering);
     }
 
+    // ---- Memory warning dispatch ----
+
+    #[inline]
+    pub fn dispatch_memory_warning(&mut self, level: i32) {
+        self.bindings.dispatch_memory_warning(&mut self.rt, level);
+    }
+
     // ---- Keyboard event dispatch ----
 
     #[inline]

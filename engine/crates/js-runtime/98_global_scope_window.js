@@ -24,6 +24,7 @@ import * as clipboard from 'ext:host_v8_device/07_clipboard.js';
 import * as vibrate from 'ext:host_v8_device/08_vibrate.js';
 import * as screen from 'ext:host_v8_device/09_screen.js';
 import * as network from 'ext:host_v8_device/10_network.js';
+import * as memory from 'ext:host_v8_device/11_memory.js';
 import * as interaction from 'ext:host_v8_ui/01_interaction.js';
 import * as envApi from 'ext:host_v8_env/00_env.js';
 import * as appLifecycle from 'ext:host_v8_lifecycle/01_lifecycle.js';
@@ -210,6 +211,11 @@ const WindowGlobalScope = {
     _internalTriggerNetworkStatusChange: core.propNonEnumerable(network._internalTriggerNetworkStatusChange),
     getNetworkType: core.propNonEnumerable(network.getNetworkType),
     getLocalIPAddress: core.propNonEnumerable(network.getLocalIPAddress),
+
+    // Memory
+    onMemoryWarning: core.propNonEnumerable(memory.onMemoryWarning),
+    offMemoryWarning: core.propNonEnumerable(memory.offMemoryWarning),
+    _internalTriggerMemoryWarning: core.propNonEnumerable(memory._internalTriggerMemoryWarning),
 
     // Storage
     setStorage: core.propNonEnumerable(storageApi.setStorage),

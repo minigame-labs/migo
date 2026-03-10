@@ -797,6 +797,22 @@ pub(crate) extern "system" fn onKeyboardHeightChange(
     );
 }
 
+// ==================== Memory Warning Callbacks ====================
+
+pub(crate) extern "system" fn onMemoryWarning(
+    _env: JNIEnv,
+    _class: JClass,
+    host_id: jint,
+    level: jint,
+) {
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnMemoryWarning {
+            level: level as i32,
+        },
+    );
+}
+
 // ==================== Image API Callbacks ====================
 
 pub(crate) extern "system" fn onChooseImageResult<'local>(

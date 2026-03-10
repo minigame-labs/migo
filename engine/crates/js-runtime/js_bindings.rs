@@ -27,6 +27,8 @@ pub(crate) struct JsBindings {
     bluetooth_device_found_fn: Option<v8::Global<v8::Function>>,
     beacon_update_fn: Option<v8::Global<v8::Function>>,
     beacon_service_change_fn: Option<v8::Global<v8::Function>>,
+    // Memory warning
+    memory_warning_fn: Option<v8::Global<v8::Function>>,
     // Keyboard event functions
     keyboard_input_fn: Option<v8::Global<v8::Function>>,
     keyboard_height_change_fn: Option<v8::Global<v8::Function>>,
@@ -58,6 +60,7 @@ impl JsBindings {
             bluetooth_device_found_fn: None,
             beacon_update_fn: None,
             beacon_service_change_fn: None,
+            memory_warning_fn: None,
             keyboard_input_fn: None,
             keyboard_height_change_fn: None,
             keyboard_confirm_fn: None,
@@ -88,6 +91,7 @@ impl JsBindings {
             cam_event, cam_frame,
             dev_motion, gyro, accel, compass, orientation, network,
             bt_adapter_state, bt_device_found, beacon_update, beacon_svc_change,
+            mem_warning,
             kb_input, kb_height, kb_confirm, kb_complete, key_down, key_up,
         ) = self.with_main_context(rt, |scope, _ctx, global| {
             (
@@ -107,6 +111,7 @@ impl JsBindings {
                 get_global_fn(scope, global, "_internalTriggerBluetoothDeviceFound"),
                 get_global_fn(scope, global, "_internalTriggerBeaconUpdate"),
                 get_global_fn(scope, global, "_internalTriggerBeaconServiceChange"),
+                get_global_fn(scope, global, "_internalTriggerMemoryWarning"),
                 get_global_fn(scope, global, "_internalTriggerKeyboardInput"),
                 get_global_fn(scope, global, "_internalTriggerKeyboardHeightChange"),
                 get_global_fn(scope, global, "_internalTriggerKeyboardConfirm"),
@@ -132,6 +137,7 @@ impl JsBindings {
         self.bluetooth_device_found_fn = bt_device_found;
         self.beacon_update_fn = beacon_update;
         self.beacon_service_change_fn = beacon_svc_change;
+        self.memory_warning_fn = mem_warning;
         self.keyboard_input_fn = kb_input;
         self.keyboard_height_change_fn = kb_height;
         self.keyboard_confirm_fn = kb_confirm;
@@ -478,6 +484,23 @@ impl JsBindings {
                     v8::Boolean::new(scope, available).into(),
                     v8::Boolean::new(scope, discovering).into(),
                 ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    // ---- Memory warning dispatch ----
+
+    /// Dispatch memory warning event.
+    pub(crate) fn dispatch_memory_warning(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        level: i32,
+    ) {
+        if let Some(func_g) = self.memory_warning_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::Integer::new(scope, level).into()];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);
             });

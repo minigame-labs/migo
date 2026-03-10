@@ -409,6 +409,34 @@ public final class GameSession implements Closeable {
         }
     }
 
+    // ==================== Memory Warning ====================
+
+    /**
+     * Forward a memory warning to the game session.
+     * <p>
+     * Call this from your Activity's {@code onTrimMemory} or Application's
+     * {@code onTrimMemory} callback to notify the game of memory pressure.
+     *
+     * <pre>{@code
+     * @Override
+     * public void onTrimMemory(int level) {
+     *     super.onTrimMemory(level);
+     *     if (session != null && session.isValid()) {
+     *         session.dispatchMemoryWarning(level);
+     *     }
+     * }
+     * }</pre>
+     *
+     * @param level Android ComponentCallbacks2 trim memory level
+     *              (e.g., TRIM_MEMORY_RUNNING_MODERATE=5, TRIM_MEMORY_RUNNING_LOW=10,
+     *              TRIM_MEMORY_RUNNING_CRITICAL=15)
+     */
+    public void dispatchMemoryWarning(int level) {
+        if (!destroyed) {
+            NativeMethods.onMemoryWarning(sessionId, level);
+        }
+    }
+
     // ==================== Input ====================
 
     /**

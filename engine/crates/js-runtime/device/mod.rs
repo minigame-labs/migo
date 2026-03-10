@@ -398,6 +398,7 @@ deno_core::extension!(
         "08_vibrate.js",
         "09_screen.js",
         "10_network.js",
+        "11_memory.js",
     ]
 );
 

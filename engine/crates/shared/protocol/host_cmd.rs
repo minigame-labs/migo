@@ -335,6 +335,16 @@ pub enum HostCommand {
         discovering: bool,
     },
 
+    /// Memory warning from the system.
+    ///
+    /// Triggered when Android sends `onTrimMemory` or `onLowMemory`.
+    /// Triggers `migo.onMemoryWarning` callbacks in the game.
+    OnMemoryWarning {
+        /// Memory warning level (Android TRIM_MEMORY_* constants):
+        /// 5 = RUNNING_MODERATE, 10 = RUNNING_LOW, 15 = RUNNING_CRITICAL.
+        level: i32,
+    },
+
     /// User took a screenshot (system screenshot button pressed).
     ///
     /// Triggers `migo.onUserCaptureScreen` callback in the game.

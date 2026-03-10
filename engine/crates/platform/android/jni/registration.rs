@@ -16,6 +16,7 @@ use crate::android::jni::{
     onBeaconUpdate, onBeaconServiceChange,
     onKeyboardInput, onKeyboardConfirm, onKeyboardComplete, onKeyboardHeightChange,
     onChooseImageResult, onChooseMessageFileResult,
+    onMemoryWarning,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -207,6 +208,12 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "onKeyboardHeightChange".into(),
                 sig: "(ID)V".into(),
                 fn_ptr: onKeyboardHeightChange as *mut c_void,
+            },
+            // Memory warning callback
+            NativeMethod {
+                name: "onMemoryWarning".into(),
+                sig: "(II)V".into(),
+                fn_ptr: onMemoryWarning as *mut c_void,
             },
             // Image API callbacks
             NativeMethod {

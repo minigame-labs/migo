@@ -458,6 +458,11 @@ impl Host {
                 Ok(())
             }
 
+            HostCommand::OnMemoryWarning { level } => {
+                self.js.dispatch_memory_warning(level);
+                Ok(())
+            }
+
             HostCommand::OnUserCaptureScreen => {
                 self.js
                     .exec_script(

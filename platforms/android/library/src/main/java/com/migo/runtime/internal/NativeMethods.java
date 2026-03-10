@@ -474,6 +474,22 @@ public final class NativeMethods {
         }
     }
 
+    // ==================== Memory Warning ====================
+
+    /**
+     * Notify that the system has sent a memory warning.
+     * Triggers migo.onMemoryWarning listener in JS.
+     *
+     * @param sessionId The session ID
+     * @param level     Memory warning level (Android TRIM_MEMORY_* constant):
+     *                  5 = RUNNING_MODERATE, 10 = RUNNING_LOW, 15 = RUNNING_CRITICAL
+     */
+    public static void onMemoryWarning(int sessionId, int level) {
+        if (sessionId >= 0) {
+            NativeBridge.onMemoryWarning(sessionId, level);
+        }
+    }
+
     // ==================== Keyboard Callbacks ====================
 
     /**
