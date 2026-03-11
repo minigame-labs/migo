@@ -8,7 +8,8 @@ use core::services::{
     AccelerometerService, AudioPlatformService, BatteryService, BluetoothService, CameraService,
     ClipboardService, CodecService, CompassService, DeviceMotionService, DeviceServices,
     FileService, GyroscopeService, ImageApiService, InteractionService, KeyboardService,
-    NetworkService, RecorderService, ScreenService, SystemInfoService, VibrationService,
+    LocationService, NetworkService, RecorderService, ScreenService, SystemInfoService,
+    VibrationService,
 };
 
 use crate::android::jni;
@@ -99,6 +100,10 @@ impl DeviceServices for AndroidDeviceServices {
 
     fn image_api(&self) -> Option<Arc<dyn ImageApiService>> {
         Some(Arc::new(AndroidImageApi { host_id: self.host_id }))
+    }
+
+    fn location(&self) -> Option<Arc<dyn LocationService>> {
+        Some(Arc::new(AndroidLocation { host_id: self.host_id }))
     }
 }
 
@@ -549,5 +554,21 @@ impl ImageApiService for AndroidImageApi {
 
     fn choose_image(&self, options_json: &str) -> Result<(), String> {
         jni::image_choose_image(self.host_id, options_json)
+    }
+}
+
+// ==================== Location ====================
+
+struct AndroidLocation {
+    host_id: i32,
+}
+
+impl LocationService for AndroidLocation {
+    fn get_location(&self, options_json: &str) -> Result<(), String> {
+        jni::get_location(self.host_id, options_json)
+    }
+
+    fn get_fuzzy_location(&self, options_json: &str) -> Result<(), String> {
+        jni::get_fuzzy_location(self.host_id, options_json)
     }
 }

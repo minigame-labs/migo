@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::{
     CameraService, ClipboardService, CodecService, FileService, ImageApiService,
-    InteractionService, NetworkService, SystemInfoService,
+    InteractionService, LocationService, NetworkService, SystemInfoService,
 };
 
 // ==================== Battery ====================
@@ -379,6 +379,9 @@ pub trait DeviceServices: Send + Sync {
         None
     }
     fn image_api(&self) -> Option<Arc<dyn ImageApiService>> {
+        None
+    }
+    fn location(&self) -> Option<Arc<dyn LocationService>> {
         None
     }
 }

@@ -848,8 +848,9 @@ pub fn get_clipboard_data(host_id: i32) -> Result<String, String> {
 
 // ==================== Camera ====================
 
-/// Call a Java camera method that takes (hostId, optionsJson) and returns a JSON string.
-fn call_camera_json(method_name: &str, host_id: i32, options_json: &str) -> Result<String, String> {
+/// Call a Java static method with signature (int hostId, String json) -> String.
+/// Used by camera, image, location, and any other API that takes options JSON and returns a JSON result.
+fn call_json_method(method_name: &str, host_id: i32, options_json: &str) -> Result<String, String> {
     with_env(|env| {
         let cache = JAVA_METHOD_CACHE
             .get()
@@ -877,7 +878,7 @@ fn call_camera_json(method_name: &str, host_id: i32, options_json: &str) -> Resu
                 let jstring = val.l().map_err(|_| "Null string from Java")?;
                 let json_str = env
                     .get_string(&jni::objects::JString::from(jstring))
-                    .map_err(|e| format!("Failed to convert camera JSON string: {e}"))?
+                    .map_err(|e| format!("Failed to convert JSON string: {e}"))?
                     .into();
                 Ok(json_str)
             }
@@ -895,7 +896,7 @@ fn call_camera_json(method_name: &str, host_id: i32, options_json: &str) -> Resu
 /// Create a camera instance.
 /// Calls Java: NativeExports.cameraCreate(hostId, optionsJson) -> String
 pub fn camera_create(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_camera_json("cameraCreate", host_id, options_json)
+    call_json_method("cameraCreate", host_id, options_json)
 }
 
 /// Destroy a camera instance.
@@ -912,25 +913,25 @@ pub fn camera_destroy(host_id: i32, camera_id: u32) -> Result<(), String> {
 /// Take a photo.
 /// Calls Java: NativeExports.cameraTakePhoto(hostId, optionsJson) -> String
 pub fn camera_take_photo(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_camera_json("cameraTakePhoto", host_id, options_json)
+    call_json_method("cameraTakePhoto", host_id, options_json)
 }
 
 /// Start video recording.
 /// Calls Java: NativeExports.cameraStartRecord(hostId, optionsJson) -> String
 pub fn camera_start_record(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_camera_json("cameraStartRecord", host_id, options_json)
+    call_json_method("cameraStartRecord", host_id, options_json)
 }
 
 /// Stop video recording.
 /// Calls Java: NativeExports.cameraStopRecord(hostId, optionsJson) -> String
 pub fn camera_stop_record(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_camera_json("cameraStopRecord", host_id, options_json)
+    call_json_method("cameraStopRecord", host_id, options_json)
 }
 
 /// Set camera zoom level.
 /// Calls Java: NativeExports.cameraSetZoom(hostId, optionsJson) -> String
 pub fn camera_set_zoom(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_camera_json("cameraSetZoom", host_id, options_json)
+    call_json_method("cameraSetZoom", host_id, options_json)
 }
 
 /// Start listening for camera frame changes.
@@ -1096,7 +1097,7 @@ pub fn image_preview_image(host_id: i32, options_json: &str) -> Result<(), Strin
 }
 
 pub fn image_compress(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_camera_json("imageCompress", host_id, options_json)
+    call_json_method("imageCompress", host_id, options_json)
 }
 
 pub fn image_choose_message_file(host_id: i32, options_json: &str) -> Result<(), String> {
@@ -1124,6 +1125,16 @@ pub fn keyboard_hide(host_id: i32) -> Result<(), String> {
 
 pub fn keyboard_update(host_id: i32, value: &str) -> Result<(), String> {
     call_void_with_string("keyboardUpdate", host_id, value)
+}
+
+// ==================== Location ====================
+
+pub fn get_location(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("getLocation", host_id, options_json)
+}
+
+pub fn get_fuzzy_location(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("getFuzzyLocation", host_id, options_json)
 }
 
 // ==================== Error Notification ====================

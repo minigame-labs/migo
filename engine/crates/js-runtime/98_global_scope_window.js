@@ -25,6 +25,7 @@ import * as vibrate from 'ext:host_v8_device/08_vibrate.js';
 import * as screen from 'ext:host_v8_device/09_screen.js';
 import * as network from 'ext:host_v8_device/10_network.js';
 import * as memory from 'ext:host_v8_device/11_memory.js';
+import * as locationApi from 'ext:host_v8_device/12_location.js';
 import * as interaction from 'ext:host_v8_ui/01_interaction.js';
 import * as envApi from 'ext:host_v8_env/00_env.js';
 import * as appLifecycle from 'ext:host_v8_lifecycle/01_lifecycle.js';
@@ -218,6 +219,12 @@ const WindowGlobalScope = {
     onMemoryWarning: core.propNonEnumerable(memory.onMemoryWarning),
     offMemoryWarning: core.propNonEnumerable(memory.offMemoryWarning),
     _internalTriggerMemoryWarning: core.propNonEnumerable(memory._internalTriggerMemoryWarning),
+
+    // Location
+    getLocation: core.propNonEnumerable(locationApi.getLocation),
+    getFuzzyLocation: core.propNonEnumerable(locationApi.getFuzzyLocation),
+    _internalOnLocationResult: core.propNonEnumerable(locationApi._internalOnLocationResult),
+    _internalOnFuzzyLocationResult: core.propNonEnumerable(locationApi._internalOnFuzzyLocationResult),
 
     // Storage
     setStorage: core.propNonEnumerable(storageApi.setStorage),

@@ -16,6 +16,7 @@ mod device;
 mod file;
 mod image_api;
 mod interaction;
+mod location;
 mod network;
 mod system_info;
 
@@ -30,5 +31,6 @@ pub use device::{
 pub use file::FileService;
 pub use image_api::ImageApiService;
 pub use interaction::InteractionService;
+pub use location::LocationService;
 pub use network::NetworkService;
 pub use system_info::SystemInfoService;

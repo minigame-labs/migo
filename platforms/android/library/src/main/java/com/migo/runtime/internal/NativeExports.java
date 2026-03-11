@@ -22,6 +22,7 @@ import com.migo.runtime.internal.platform.BluetoothManager;
 import com.migo.runtime.internal.platform.CameraManager;
 import com.migo.runtime.internal.platform.KeyboardManager;
 import com.migo.runtime.internal.platform.ImageApiManager;
+import com.migo.runtime.internal.platform.LocationProvider;
 import com.migo.runtime.internal.platform.ScreenCaptureObserver;
 
 import android.graphics.Bitmap;
@@ -1677,6 +1678,56 @@ public final class NativeExports {
         if (mgr != null) {
             mgr.destroy();
         }
+    }
+
+    // ==================== Location ====================
+
+    /**
+     * Start an async location request (wx.getLocation).
+     * Result is delivered via {@link NativeMethods#onLocationResult}.
+     * Called from native code via JNI.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with: type, altitude, isHighAccuracy, highAccuracyExpireTime
+     */
+    public static void getLocation(int sessionId, String optionsJson) {
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) {
+            NativeMethods.onLocationResult(sessionId,
+                    "{\"error\":\"getLocation:fail invalid session\"}");
+            return;
+        }
+        Activity activity = ctx.getActivity();
+        if (activity == null) {
+            NativeMethods.onLocationResult(sessionId,
+                    "{\"error\":\"getLocation:fail no activity\"}");
+            return;
+        }
+        LocationProvider.getLocationAsync(activity, sessionId, optionsJson);
+    }
+
+    /**
+     * Start an async fuzzy location request (wx.getFuzzyLocation).
+     * Result is delivered via {@link NativeMethods#onFuzzyLocationResult}.
+     * Called from native code via JNI.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with: type
+     */
+    public static void getFuzzyLocation(int sessionId, String optionsJson) {
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) {
+            NativeMethods.onFuzzyLocationResult(sessionId,
+                    "{\"error\":\"getFuzzyLocation:fail invalid session\"}");
+            return;
+        }
+        Activity activity = ctx.getActivity();
+        if (activity == null) {
+            NativeMethods.onFuzzyLocationResult(sessionId,
+                    "{\"error\":\"getFuzzyLocation:fail no activity\"}");
+            return;
+        }
+        LocationProvider.getFuzzyLocationAsync(activity, sessionId, optionsJson);
     }
 
     // ==================== ActivityResult dispatch ====================

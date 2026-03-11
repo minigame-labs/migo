@@ -17,6 +17,7 @@ use crate::android::jni::{
     onKeyboardInput, onKeyboardConfirm, onKeyboardComplete, onKeyboardHeightChange,
     onChooseImageResult, onChooseMessageFileResult,
     onMemoryWarning,
+    onLocationResult, onFuzzyLocationResult,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -226,6 +227,17 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(ILjava/lang/String;)V".into(),
                 fn_ptr: onChooseMessageFileResult as *mut c_void,
             },
+            // Location callbacks
+            NativeMethod {
+                name: "onLocationResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onLocationResult as *mut c_void,
+            },
+            NativeMethod {
+                name: "onFuzzyLocationResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onFuzzyLocationResult as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -334,6 +346,9 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("imageCompress", "(ILjava/lang/String;)Ljava/lang/String;"),
         ("imageChooseMessageFile", "(ILjava/lang/String;)V"),
         ("imageChooseImage", "(ILjava/lang/String;)V"),
+        // Location
+        ("getLocation", "(ILjava/lang/String;)V"),
+        ("getFuzzyLocation", "(ILjava/lang/String;)V"),
         // Error notification callback
         // onError(hostId, errorCode, message, detail)
         ("onError", "(IILjava/lang/String;Ljava/lang/String;)V"),

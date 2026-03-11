@@ -383,6 +383,24 @@ public final class NativeBridge {
      */
     public static native void onChooseMessageFileResult(int sessionId, String resultJson);
 
+    // ==================== Location Callbacks ====================
+
+    /**
+     * Callback when getLocation operation completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON-encoded result with location data or error
+     */
+    public static native void onLocationResult(int sessionId, String resultJson);
+
+    /**
+     * Callback when getFuzzyLocation operation completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON-encoded result with location data or error
+     */
+    public static native void onFuzzyLocationResult(int sessionId, String resultJson);
+
     // ==================== Debug Stats ====================
 
     /**

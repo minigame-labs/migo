@@ -568,6 +568,34 @@ public final class NativeMethods {
         }
     }
 
+    // ==================== Location Callbacks ====================
+
+    /**
+     * Callback for getLocation result.
+     * Called from {@link com.migo.runtime.internal.platform.LocationProvider}.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON result with location data or error
+     */
+    public static void onLocationResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onLocationResult(sessionId, resultJson);
+        }
+    }
+
+    /**
+     * Callback for getFuzzyLocation result.
+     * Called from {@link com.migo.runtime.internal.platform.LocationProvider}.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON result with location data or error
+     */
+    public static void onFuzzyLocationResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onFuzzyLocationResult(sessionId, resultJson);
+        }
+    }
+
     // ==================== Recorder Callbacks ====================
 
     /**

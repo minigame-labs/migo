@@ -343,6 +343,36 @@ pub fn op_update_keyboard(
     Err(JsErrorBox::generic("updateKeyboard:fail not supported"))
 }
 
+// ==================== Location Ops ====================
+
+#[op2(fast)]
+pub fn op_get_location(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(location) = services.location() {
+            return location.get_location(&options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("getLocation:fail not supported"))
+}
+
+#[op2(fast)]
+pub fn op_get_fuzzy_location(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(location) = services.location() {
+            return location.get_fuzzy_location(&options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("getFuzzyLocation:fail not supported"))
+}
+
 // ==================== Extension Definition ====================
 
 deno_core::extension!(
@@ -385,6 +415,9 @@ deno_core::extension!(
         op_show_keyboard,
         op_hide_keyboard,
         op_update_keyboard,
+        // Location
+        op_get_location,
+        op_get_fuzzy_location,
     ],
     esm = [
         dir "device",
@@ -399,6 +432,7 @@ deno_core::extension!(
         "09_screen.js",
         "10_network.js",
         "11_memory.js",
+        "12_location.js",
     ]
 );
 
