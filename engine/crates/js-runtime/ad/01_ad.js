@@ -1,4 +1,4 @@
-// Ad APIs - WeChat compatible mock implementation
+// Ad APIs - compatible mock implementation
 // All ad types simulate successful load/show flow with proper event callbacks.
 
 const MOCK_LOAD_DELAY_MS = 100;

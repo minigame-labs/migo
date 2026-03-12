@@ -1,4 +1,4 @@
-//! Ad APIs - WeChat compatible mock implementation.
+//! Ad APIs - compatible mock implementation.
 //!
 //! Provides mock implementations of banner, interstitial, rewarded video,
 //! custom, and grid ad components. All ad content is simulated in JavaScript

@@ -6,7 +6,7 @@
 /// request and delivers the result via JNI inbound callback
 /// (`onLocationResult` / `onFuzzyLocationResult` → `EvalScript`).
 pub trait LocationService: Send + Sync {
-    /// Start a precise location request (wx.getLocation).
+    /// Start a precise location request (getLocation).
     ///
     /// Options JSON fields:
     /// - `type`: "wgs84" (default) or "gcj02"
@@ -17,7 +17,7 @@ pub trait LocationService: Send + Sync {
         Err("getLocation:fail not supported".to_string())
     }
 
-    /// Start a fuzzy location request (wx.getFuzzyLocation).
+    /// Start a fuzzy location request (getFuzzyLocation).
     ///
     /// Options JSON fields:
     /// - `type`: "wgs84" (default) or "gcj02"

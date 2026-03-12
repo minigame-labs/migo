@@ -1683,7 +1683,7 @@ public final class NativeExports {
     // ==================== Location ====================
 
     /**
-     * Start an async location request (wx.getLocation).
+     * Start an async location request (getLocation).
      * Result is delivered via {@link NativeMethods#onLocationResult}.
      * Called from native code via JNI.
      *
@@ -1707,7 +1707,7 @@ public final class NativeExports {
     }
 
     /**
-     * Start an async fuzzy location request (wx.getFuzzyLocation).
+     * Start an async fuzzy location request (getFuzzyLocation).
      * Result is delivered via {@link NativeMethods#onFuzzyLocationResult}.
      * Called from native code via JNI.
      *

@@ -59,4 +59,81 @@ function promisify(apiName, executor) {
     };
 }
 
-export { wrapAsync, promisify };
+// Factory for Mode C async APIs (platform callback via EvalScript).
+//
+// Creates a deferred Promise+callback pair for APIs where the op only fires
+// an async platform request and the result arrives later through a separate
+// `_internalOn*Result` callback.
+//
+// Usage:
+//   const _loc = createDeferredApi('getLocation');
+//
+//   function getLocation(options = {}) {
+//       return _loc.invoke(options, function (opts) {
+//           op_get_location(JSON.stringify({ type: opts.type || 'wgs84' }));
+//       });
+//   }
+//   function _internalOnLocationResult(json) { _loc.settle(json); }
+//
+// - invoke(options, executor): stores callbacks + resolve/reject, calls executor, returns Promise
+// - settle(resultJson): parses JSON, resolves/rejects, fires success/fail/complete
+//
+// Both callback and Promise styles are supported:
+//   getLocation({ success(res) { ... } });        // callback
+//   const res = await getLocation({ type: 'gcj02' }); // promise
+function createDeferredApi(apiName) {
+    let _resolve = null;
+    let _reject = null;
+    let _success = null;
+    let _fail = null;
+    let _complete = null;
+
+    function _clear() {
+        _resolve = _reject = _success = _fail = _complete = null;
+    }
+
+    function invoke(options, executor) {
+        const { success, fail, complete } = options || {};
+        return new Promise(function (resolve, reject) {
+            _resolve = resolve;
+            _reject = reject;
+            _success = typeof success === 'function' ? success : null;
+            _fail = typeof fail === 'function' ? fail : null;
+            _complete = typeof complete === 'function' ? complete : null;
+            try {
+                executor(options || {});
+            } catch (e) {
+                var res = { errMsg: apiName + ':fail ' + e.message };
+                _clear();
+                if (typeof fail === 'function') fail(res);
+                if (typeof complete === 'function') complete(res);
+                reject(res);
+            }
+        });
+    }
+
+    function settle(resultJson) {
+        var parsed;
+        try { parsed = JSON.parse(resultJson); } catch (e) { parsed = {}; }
+
+        var s = _success, f = _fail, c = _complete;
+        var resolve = _resolve, reject = _reject;
+        _clear();
+
+        if (parsed.error) {
+            var res = { errMsg: parsed.error };
+            if (f) f(res);
+            if (c) c(res);
+            if (reject) reject(res);
+        } else {
+            var res = { errMsg: apiName + ':ok', ...parsed };
+            if (s) s(res);
+            if (c) c(res);
+            if (resolve) resolve(res);
+        }
+    }
+
+    return { invoke: invoke, settle: settle };
+}
+
+export { wrapAsync, promisify, createDeferredApi };

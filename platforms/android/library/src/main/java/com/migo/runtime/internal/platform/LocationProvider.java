@@ -17,7 +17,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 /**
- * Async location provider for wx.getLocation / wx.getFuzzyLocation.
+ * Async location provider for getLocation / getFuzzyLocation.
  *
  * <p>Design decisions for broad Android compatibility (API 21+, domestic & international):
  * <ul>
@@ -42,7 +42,7 @@ public final class LocationProvider {
     // ==================== Public async entry points ====================
 
     /**
-     * Start an async location request (wx.getLocation).
+     * Start an async location request (getLocation).
      * Result is delivered via {@link NativeMethods#onLocationResult}.
      *
      * @param context     Android context
@@ -115,7 +115,7 @@ public final class LocationProvider {
     }
 
     /**
-     * Start an async fuzzy location request (wx.getFuzzyLocation).
+     * Start an async fuzzy location request (getFuzzyLocation).
      * Result is delivered via {@link NativeMethods#onFuzzyLocationResult}.
      *
      * @param context     Android context
