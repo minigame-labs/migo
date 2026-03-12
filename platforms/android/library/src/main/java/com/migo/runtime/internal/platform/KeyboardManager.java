@@ -9,6 +9,7 @@ import android.text.InputFilter;
 import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewTreeObserver;
 import android.view.inputmethod.EditorInfo;
@@ -24,7 +25,7 @@ import org.json.JSONObject;
 /**
  * Manages soft keyboard lifecycle for a session.
  * <p>
- * Creates a hidden {@link EditText} to interact with the Android IME,
+ * Creates an overlay {@link EditText} to interact with the Android IME,
  * monitors keyboard height via layout changes, and dispatches events
  * (input, confirm, complete, heightChange) back to native via {@link NativeMethods}.
  * <p>
@@ -42,6 +43,10 @@ import org.json.JSONObject;
 public class KeyboardManager {
 
     private static final String TAG = "KeyboardManager";
+    private static final int INPUT_BAR_HORIZONTAL_MARGIN_DP = 0;
+    private static final int INPUT_BAR_VERTICAL_PADDING_DP = 12;
+    private static final int INPUT_BAR_HORIZONTAL_PADDING_DP = 14;
+    private static final int INPUT_BAR_MIN_HEIGHT_DP = 44;
 
     private final int sessionId;
     private final Activity activity;
@@ -140,7 +145,10 @@ public class KeyboardManager {
 
         // IME action
         int imeAction = mapImeAction(confirmType);
-        editText.setImeOptions(imeAction);
+        editText.setImeOptions(imeAction | EditorInfo.IME_FLAG_NO_FULLSCREEN);
+        editText.setSingleLine(!multiple);
+        editText.setMaxLines(multiple ? 4 : 1);
+        editText.setHorizontallyScrolling(!multiple);
 
         // Default value
         editText.removeTextChangedListener(textWatcher);
@@ -149,7 +157,9 @@ public class KeyboardManager {
         editText.addTextChangedListener(textWatcher);
 
         // Show
+        updateInputBarBottomMargin(0);
         editText.setVisibility(View.VISIBLE);
+        editText.bringToFront();
         editText.requestFocus();
         isShowing = true;
 
@@ -175,6 +185,7 @@ public class KeyboardManager {
 
             editText.setVisibility(View.GONE);
             editText.clearFocus();
+            updateInputBarBottomMargin(0);
 
             NativeMethods.onKeyboardComplete(sessionId, value);
         }
@@ -187,16 +198,29 @@ public class KeyboardManager {
 
         editText = new EditText(activity);
         editText.setVisibility(View.GONE);
-        // Make the EditText effectively invisible but focusable
-        editText.setBackgroundColor(0x00000000);
-        editText.setTextColor(0x00000000);
-        editText.setCursorVisible(false);
+        editText.setBackgroundColor(0xFFFFFFFF);
+        editText.setTextColor(0xFF111111);
+        editText.setHintTextColor(0xFF999999);
+        editText.setCursorVisible(true);
+        editText.setPadding(
+                dpToPx(INPUT_BAR_HORIZONTAL_PADDING_DP),
+                dpToPx(INPUT_BAR_VERTICAL_PADDING_DP),
+                dpToPx(INPUT_BAR_HORIZONTAL_PADDING_DP),
+                dpToPx(INPUT_BAR_VERTICAL_PADDING_DP)
+        );
+        editText.setMinHeight(dpToPx(INPUT_BAR_MIN_HEIGHT_DP));
+        editText.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
         editText.setFocusable(true);
         editText.setFocusableInTouchMode(true);
 
-        // 1x1 pixel at bottom-left, out of visual area
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(1, 1);
-        lp.gravity = Gravity.BOTTOM | Gravity.START;
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+        );
+        int horizontalMargin = dpToPx(INPUT_BAR_HORIZONTAL_MARGIN_DP);
+        lp.leftMargin = horizontalMargin;
+        lp.rightMargin = horizontalMargin;
+        lp.gravity = Gravity.BOTTOM;
 
         View decorView = activity.getWindow().getDecorView();
         if (decorView instanceof FrameLayout) {
@@ -210,6 +234,11 @@ public class KeyboardManager {
 
         // Editor action listener for confirm
         editText.setOnEditorActionListener((v, actionId, event) -> {
+            boolean multiple = (editText.getInputType() & InputType.TYPE_TEXT_FLAG_MULTI_LINE) != 0;
+            if (!isConfirmAction(actionId, event, multiple)) {
+                return false;
+            }
+
             String value = editText.getText().toString();
             NativeMethods.onKeyboardConfirm(sessionId, value);
             if (!confirmHold) {
@@ -253,14 +282,22 @@ public class KeyboardManager {
             Rect r = new Rect();
             decorView.getWindowVisibleDisplayFrame(r);
             int screenHeight = decorView.getRootView().getHeight();
-            int keyboardHeight = screenHeight - r.bottom;
+            int keyboardHeight = Math.max(0, screenHeight - r.bottom);
 
             if (keyboardHeight != lastKeyboardHeight) {
+                int previousKeyboardHeight = lastKeyboardHeight;
                 lastKeyboardHeight = keyboardHeight;
+
+                updateInputBarBottomMargin(keyboardHeight);
+
                 // Convert physical pixels to CSS pixels (dp)
                 float density = activity.getResources().getDisplayMetrics().density;
                 double cssHeight = keyboardHeight / density;
                 NativeMethods.onKeyboardHeightChange(sessionId, cssHeight);
+
+                if (isShowing && previousKeyboardHeight > 0 && keyboardHeight == 0) {
+                    completeBySystemDismiss();
+                }
             }
         };
         decorView.getViewTreeObserver().addOnGlobalLayoutListener(layoutListener);
@@ -272,6 +309,61 @@ public class KeyboardManager {
             decorView.getViewTreeObserver().removeOnGlobalLayoutListener(layoutListener);
             layoutListener = null;
             lastKeyboardHeight = 0;
+        }
+    }
+
+    private void completeBySystemDismiss() {
+        if (!isShowing) {
+            return;
+        }
+        isShowing = false;
+
+        if (editText != null) {
+            String value = editText.getText().toString();
+            editText.setVisibility(View.GONE);
+            editText.clearFocus();
+            updateInputBarBottomMargin(0);
+            NativeMethods.onKeyboardComplete(sessionId, value);
+        }
+
+        stopKeyboardHeightMonitoring();
+    }
+
+    private void updateInputBarBottomMargin(int keyboardHeightPx) {
+        if (editText == null) {
+            return;
+        }
+        if (!(editText.getLayoutParams() instanceof FrameLayout.LayoutParams)) {
+            return;
+        }
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) editText.getLayoutParams();
+        int bottom = Math.max(0, keyboardHeightPx);
+        if (lp.bottomMargin != bottom) {
+            lp.bottomMargin = bottom;
+            editText.setLayoutParams(lp);
+        }
+    }
+
+    private int dpToPx(int dp) {
+        float density = activity.getResources().getDisplayMetrics().density;
+        return Math.round(dp * density);
+    }
+
+    private static boolean isConfirmAction(int actionId, KeyEvent event, boolean multiple) {
+        switch (actionId) {
+            case EditorInfo.IME_ACTION_DONE:
+            case EditorInfo.IME_ACTION_GO:
+            case EditorInfo.IME_ACTION_NEXT:
+            case EditorInfo.IME_ACTION_SEARCH:
+            case EditorInfo.IME_ACTION_SEND:
+                return true;
+            case EditorInfo.IME_NULL:
+                return !multiple
+                        && event != null
+                        && event.getKeyCode() == KeyEvent.KEYCODE_ENTER
+                        && event.getAction() == KeyEvent.ACTION_DOWN;
+            default:
+                return false;
         }
     }
 
