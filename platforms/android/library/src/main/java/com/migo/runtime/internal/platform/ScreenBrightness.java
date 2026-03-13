@@ -1,7 +1,6 @@
 package com.migo.runtime.internal.platform;
 
 import android.app.Activity;
-import android.content.pm.ActivityInfo;
 import android.view.Window;
 import android.view.WindowManager;
 
@@ -120,45 +119,4 @@ public final class ScreenBrightness {
         }
     }
 
-    /**
-     * Set device orientation (landscape or portrait).
-     * <p>
-     * Changes the activity's requested orientation. The change triggers
-     * an orientation change event via onDeviceOrientationChange callback.
-     *
-     * @param activity The activity
-     * @param value    "landscape" or "portrait"
-     * @return 0 on success, -1 on failure, -2 if value is invalid
-     */
-    public static int setDeviceOrientation(final Activity activity, String value) {
-        if (activity == null) return -1;
-        if (value == null) return -2;
-
-        final int orientation;
-        switch (value) {
-            case "landscape":
-                orientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
-                break;
-            case "portrait":
-                orientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
-                break;
-            default:
-                return -2; // Invalid value
-        }
-
-        try {
-            activity.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        activity.setRequestedOrientation(orientation);
-                    } catch (Exception ignored) {
-                    }
-                }
-            });
-            return 0;
-        } catch (Exception e) {
-            return -1;
-        }
-    }
 }

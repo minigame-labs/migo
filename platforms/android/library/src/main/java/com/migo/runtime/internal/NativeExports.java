@@ -641,7 +641,7 @@ public final class NativeExports {
         RuntimeContext context = RuntimeRegistry.get(sessionId);
         if (context == null) return -1;
         Activity activity = context.getActivity();
-        return ScreenBrightness.setDeviceOrientation(activity, value);
+        return DisplayCompat.setDeviceOrientation(activity, value);
     }
 
     // ==================== UI Interaction ====================
