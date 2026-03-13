@@ -1,7 +1,6 @@
 package com.example.migo.sample;
 
 import android.app.Activity;
-import android.content.Intent;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.SurfaceHolder;
@@ -207,16 +206,6 @@ public class GameActivity extends Activity {
             .show();
     }
     
-    // ==================== Activity Result ====================
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (session != null && session.isValid()) {
-            session.dispatchActivityResult(requestCode, resultCode, data);
-        }
-    }
-
     // ==================== Activity Lifecycle ====================
 
     @Override

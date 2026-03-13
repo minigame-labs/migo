@@ -8,9 +8,10 @@
 
     <application>
         <activity
-            android:name=".internal.bluetooth.BluetoothSettingActivity"
+            android:name=".internal.ResultProxyActivity"
             android:exported="false"
             android:launchMode="standard"
+            android:excludeFromRecents="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
     </application>
 </manifest>

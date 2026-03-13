@@ -48,10 +48,6 @@ public final class NativeExports {
     private static final int BLUETOOTH_SETTING_REQUEST_CODE = 10001;
     private static final int APP_AUTHORIZE_SETTING_REQUEST_CODE = 10002;
 
-    /** Tracks which session initiated a Bluetooth/AppAuthorize settings request. */
-    private static volatile int sPendingBluetoothSettingSessionId = -1;
-    private static volatile int sPendingAppAuthorizeSettingSessionId = -1;
-
     /** Per-session device sensor managers. */
     private static final ConcurrentHashMap<Integer, DeviceSensorManager> sSensorManagers =
             new ConcurrentHashMap<>();
@@ -396,11 +392,15 @@ public final class NativeExports {
         }
 
         try {
-            sPendingBluetoothSettingSessionId = sessionId;
             Intent intent = new Intent(Settings.ACTION_BLUETOOTH_SETTINGS);
-            activity.startActivityForResult(intent, BLUETOOTH_SETTING_REQUEST_CODE);
+            ResultProxyActivity.launch(activity, intent, BLUETOOTH_SETTING_REQUEST_CODE,
+                    (requestCode, resultCode, data) -> {
+                        android.bluetooth.BluetoothAdapter adapter =
+                                android.bluetooth.BluetoothAdapter.getDefaultAdapter();
+                        boolean enabled = adapter != null && adapter.isEnabled();
+                        NativeMethods.onBluetoothSettingResult(sessionId, enabled);
+                    });
         } catch (Exception e) {
-            sPendingBluetoothSettingSessionId = -1;
             NativeMethods.onBluetoothSettingResult(sessionId, false);
         }
     }
@@ -424,13 +424,13 @@ public final class NativeExports {
         }
 
         try {
-            sPendingAppAuthorizeSettingSessionId = sessionId;
             Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
             Uri uri = Uri.fromParts("package", activity.getPackageName(), null);
             intent.setData(uri);
-            activity.startActivityForResult(intent, APP_AUTHORIZE_SETTING_REQUEST_CODE);
+            ResultProxyActivity.launch(activity, intent, APP_AUTHORIZE_SETTING_REQUEST_CODE,
+                    (requestCode, resultCode, data) ->
+                            NativeMethods.onAppAuthorizeSettingResult(sessionId, 0));
         } catch (Exception e) {
-            sPendingAppAuthorizeSettingSessionId = -1;
             NativeMethods.onAppAuthorizeSettingResult(sessionId, -1);
         }
     }
@@ -1732,41 +1732,4 @@ public final class NativeExports {
         LocationProvider.getFuzzyLocationAsync(activity, sessionId, optionsJson);
     }
 
-    // ==================== ActivityResult dispatch ====================
-
-    /**
-     * Forward an Activity result to the appropriate manager for a session.
-     * Called by {@code GameSession.dispatchActivityResult()}.
-     */
-    public static void dispatchActivityResult(int sessionId, int requestCode, int resultCode, Intent data) {
-        switch (requestCode) {
-            case BLUETOOTH_SETTING_REQUEST_CODE: {
-                int sid = sPendingBluetoothSettingSessionId;
-                sPendingBluetoothSettingSessionId = -1;
-                if (sid >= 0) {
-                    // User returned from Bluetooth settings — report whether adapter is now on
-                    android.bluetooth.BluetoothAdapter adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter();
-                    boolean enabled = adapter != null && adapter.isEnabled();
-                    NativeMethods.onBluetoothSettingResult(sid, enabled);
-                }
-                return;
-            }
-            case APP_AUTHORIZE_SETTING_REQUEST_CODE: {
-                int sid = sPendingAppAuthorizeSettingSessionId;
-                sPendingAppAuthorizeSettingSessionId = -1;
-                if (sid >= 0) {
-                    NativeMethods.onAppAuthorizeSettingResult(sid, 0);
-                }
-                return;
-            }
-            default:
-                break;
-        }
-
-        // Image API (chooseImage / chooseMessageFile / camera capture)
-        ImageApiManager imgMgr = sImageApiManagers.get(sessionId);
-        if (imgMgr != null) {
-            imgMgr.onActivityResult(requestCode, resultCode, data);
-        }
-    }
 }

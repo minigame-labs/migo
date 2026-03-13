@@ -18,6 +18,7 @@ import android.util.Log;
 import android.webkit.MimeTypeMap;
 
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.ResultProxyActivity;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -353,9 +354,9 @@ public class ImageApiManager {
                     if (count > 1) {
                         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
                     }
-                    activity.startActivityForResult(
+                    ResultProxyActivity.launch(activity,
                             Intent.createChooser(intent, "Choose File"),
-                            REQUEST_CHOOSE_FILE);
+                            REQUEST_CHOOSE_FILE, this::onActivityResult);
                 } catch (Exception e) {
                     Log.e(TAG, "chooseMessageFile: failed to launch picker", e);
                     sendChooseMessageFileError("chooseMessageFile:fail " + e.getMessage());
@@ -418,10 +419,7 @@ public class ImageApiManager {
 
     // ==================== ActivityResult handling ====================
 
-    /**
-     * Must be called from the host Activity's onActivityResult.
-     */
-    public void onActivityResult(int requestCode, int resultCode, Intent data) {
+    private void onActivityResult(int requestCode, int resultCode, Intent data) {
         if (resultCode != Activity.RESULT_OK) {
             if (requestCode == REQUEST_CHOOSE_IMAGE || requestCode == REQUEST_CAPTURE_IMAGE) {
                 sendChooseImageError("chooseImage:fail cancel");
@@ -646,9 +644,9 @@ public class ImageApiManager {
         if (count > 1) {
             intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
         }
-        activity.startActivityForResult(
+        ResultProxyActivity.launch(activity,
                 Intent.createChooser(intent, "Choose Image"),
-                REQUEST_CHOOSE_IMAGE);
+                REQUEST_CHOOSE_IMAGE, this::onActivityResult);
     }
 
     private void launchCameraCapture() {
@@ -671,7 +669,8 @@ public class ImageApiManager {
             }
             intent.putExtra(MediaStore.EXTRA_OUTPUT, pendingCameraTempUri);
             intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-            activity.startActivityForResult(intent, REQUEST_CAPTURE_IMAGE);
+            ResultProxyActivity.launch(activity, intent,
+                    REQUEST_CAPTURE_IMAGE, this::onActivityResult);
         } catch (Exception e) {
             Log.e(TAG, "launchCameraCapture error", e);
             sendChooseImageError("chooseImage:fail " + e.getMessage());
