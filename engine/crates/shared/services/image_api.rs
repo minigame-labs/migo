@@ -30,7 +30,7 @@ pub trait ImageApiService: Send + Sync {
         Err("previewImage:fail not supported".to_string())
     }
 
-    /// Compress an image.
+    /// Compress an image (async, result via callback).
     ///
     /// JSON fields (input):
     /// - `src`: string — image file path
@@ -38,8 +38,8 @@ pub trait ImageApiService: Send + Sync {
     /// - `compressedWidth`: number (optional)
     /// - `compressedHeight`: number (optional)
     ///
-    /// Returns JSON: `{"tempFilePath": "..."}`
-    fn compress_image(&self, _options_json: &str) -> Result<String, String> {
+    /// Result delivered via `onCompressImageResult` callback with JSON: `{"tempFilePath": "..."}`
+    fn compress_image(&self, _options_json: &str) -> Result<(), String> {
         Err("compressImage:fail not supported".to_string())
     }
 

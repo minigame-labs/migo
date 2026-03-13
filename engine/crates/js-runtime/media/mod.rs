@@ -184,13 +184,12 @@ pub fn op_preview_image(
     Err(JsErrorBox::generic("previewImage:fail not supported"))
 }
 
-/// Compress image. Returns JSON: `{"tempFilePath": "..."}`.
-#[op2]
-#[string]
+/// Compress image (async, result via callback).
+#[op2(fast)]
 pub fn op_compress_image(
     state: &mut OpState,
     #[string] options_json: &str,
-) -> Result<String, JsErrorBox> {
+) -> Result<(), JsErrorBox> {
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(svc) = services.image_api() {

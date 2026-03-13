@@ -1096,8 +1096,8 @@ pub fn image_preview_image(host_id: i32, options_json: &str) -> Result<(), Strin
     call_void_with_string("imagePreviewImage", host_id, options_json)
 }
 
-pub fn image_compress(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("imageCompress", host_id, options_json)
+pub fn image_compress(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("imageCompress", host_id, options_json)
 }
 
 pub fn image_choose_message_file(host_id: i32, options_json: &str) -> Result<(), String> {

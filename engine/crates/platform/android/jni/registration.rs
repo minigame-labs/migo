@@ -15,7 +15,7 @@ use crate::android::jni::{
     onBluetoothAdapterStateChange, onBluetoothDeviceFound,
     onBeaconUpdate, onBeaconServiceChange,
     onKeyboardInput, onKeyboardConfirm, onKeyboardComplete, onKeyboardHeightChange,
-    onChooseImageResult, onChooseMessageFileResult,
+    onCompressImageResult, onChooseImageResult, onChooseMessageFileResult,
     onMemoryWarning,
     onLocationResult, onFuzzyLocationResult,
 };
@@ -218,6 +218,11 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
             },
             // Image API callbacks
             NativeMethod {
+                name: "onCompressImageResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onCompressImageResult as *mut c_void,
+            },
+            NativeMethod {
                 name: "onChooseImageResult".into(),
                 sig: "(ILjava/lang/String;)V".into(),
                 fn_ptr: onChooseImageResult as *mut c_void,
@@ -343,7 +348,7 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("imageSaveToPhotosAlbum", "(ILjava/lang/String;)V"),
         ("imagePreviewMedia", "(ILjava/lang/String;)V"),
         ("imagePreviewImage", "(ILjava/lang/String;)V"),
-        ("imageCompress", "(ILjava/lang/String;)Ljava/lang/String;"),
+        ("imageCompress", "(ILjava/lang/String;)V"),
         ("imageChooseMessageFile", "(ILjava/lang/String;)V"),
         ("imageChooseImage", "(ILjava/lang/String;)V"),
         // Location

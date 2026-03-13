@@ -1646,12 +1646,14 @@ public final class NativeExports {
         mgr.previewImage(optionsJson);
     }
 
-    public static String imageCompress(int sessionId, String optionsJson) {
+    public static void imageCompress(int sessionId, String optionsJson) {
         ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
         if (mgr == null) {
-            throw new RuntimeException("compressImage:fail no context");
+            NativeMethods.onCompressImageResult(sessionId,
+                    "{\"error\":\"compressImage:fail no context\"}");
+            return;
         }
-        return mgr.compress(optionsJson);
+        mgr.compressAsync(sessionId, optionsJson);
     }
 
     public static void imageChooseMessageFile(int sessionId, String optionsJson) {

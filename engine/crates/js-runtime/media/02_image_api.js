@@ -8,6 +8,7 @@ import {
 } from "ext:core/ops";
 import { wrapAsync, createDeferredApi } from "ext:host_v8_base/02_async.js";
 
+
 // ==================== saveImageToPhotosAlbum ====================
 
 function saveImageToPhotosAlbum(options = {}) {
@@ -54,22 +55,26 @@ function previewImage(options = {}) {
     }, options);
 }
 
-// ==================== compressImage ====================
+// ==================== compressImage (async, Mode C) ====================
+
+const _compressImageApi = createDeferredApi('compressImage');
 
 function compressImage(options = {}) {
-    const { src, quality, compressedWidth, compressedHeight } = options;
-    return wrapAsync('compressImage', function () {
-        if (!src) {
+    return _compressImageApi.invoke(options, function (opts) {
+        if (!opts.src) {
             throw new Error('src is required');
         }
-        const resultJson = op_compress_image(JSON.stringify({
-            src,
-            quality: quality !== undefined ? quality : 80,
-            compressedWidth: compressedWidth !== undefined ? compressedWidth : 0,
-            compressedHeight: compressedHeight !== undefined ? compressedHeight : 0,
+        op_compress_image(JSON.stringify({
+            src: opts.src,
+            quality: opts.quality !== undefined ? opts.quality : 80,
+            compressedWidth: opts.compressedWidth !== undefined ? opts.compressedWidth : 0,
+            compressedHeight: opts.compressedHeight !== undefined ? opts.compressedHeight : 0,
         }));
-        return JSON.parse(resultJson);
-    }, options);
+    });
+}
+
+function _internalOnCompressImageResult(resultJson) {
+    _compressImageApi.settle(resultJson);
 }
 
 // ==================== chooseMessageFile (async, Mode C) ====================
@@ -116,6 +121,7 @@ export {
     previewMedia,
     previewImage,
     compressImage,
+    _internalOnCompressImageResult,
     chooseMessageFile,
     _internalOnChooseMessageFileResult,
     chooseImage,

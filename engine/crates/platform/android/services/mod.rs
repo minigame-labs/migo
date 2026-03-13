@@ -544,7 +544,7 @@ impl ImageApiService for AndroidImageApi {
         jni::image_preview_image(self.host_id, options_json)
     }
 
-    fn compress_image(&self, options_json: &str) -> Result<String, String> {
+    fn compress_image(&self, options_json: &str) -> Result<(), String> {
         jni::image_compress(self.host_id, options_json)
     }
 

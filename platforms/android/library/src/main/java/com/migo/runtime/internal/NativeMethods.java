@@ -549,6 +549,12 @@ public final class NativeMethods {
      * @param sessionId  The session ID
      * @param resultJson JSON result with tempFilePaths/tempFiles or error
      */
+    public static void onCompressImageResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onCompressImageResult(sessionId, resultJson);
+        }
+    }
+
     public static void onChooseImageResult(int sessionId, String resultJson) {
         if (sessionId >= 0 && resultJson != null) {
             NativeBridge.onChooseImageResult(sessionId, resultJson);

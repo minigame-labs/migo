@@ -368,6 +368,14 @@ public final class NativeBridge {
     // ==================== Image API Callbacks ====================
 
     /**
+     * Callback when compressImage operation completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON-encoded result with tempFilePath or error
+     */
+    public static native void onCompressImageResult(int sessionId, String resultJson);
+
+    /**
      * Callback when chooseImage operation completes.
      *
      * @param sessionId  The session ID

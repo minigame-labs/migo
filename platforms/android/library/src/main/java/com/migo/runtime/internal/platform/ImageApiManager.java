@@ -208,102 +208,112 @@ public class ImageApiManager {
         }
     }
 
-    // ==================== compressImage ====================
+    // ==================== compressImage (async) ====================
 
     /**
-     * Compress an image and return result JSON.
+     * Compress an image asynchronously.
      * Options JSON: { "src": "...", "quality": 80, "compressedWidth": 0, "compressedHeight": 0 }
-     *
-     * @return JSON string with { "tempFilePath": "..." }
+     * Result delivered via NativeMethods.onCompressImageResult with { "tempFilePath": "..." }
      */
-    public String compress(String optionsJson) {
-        try {
-            JSONObject opts = new JSONObject(optionsJson);
-            String src = opts.getString("src");
-            int quality = opts.optInt("quality", 80);
-            int targetWidth = opts.optInt("compressedWidth", 0);
-            int targetHeight = opts.optInt("compressedHeight", 0);
-
-            quality = Math.max(0, Math.min(100, quality));
-
-            File srcFile = new File(src);
-            if (!srcFile.exists()) {
-                throw new RuntimeException("compressImage:fail file not found");
-            }
-
-            // First pass: get original dimensions
-            BitmapFactory.Options bmOpts = new BitmapFactory.Options();
-            bmOpts.inJustDecodeBounds = true;
-            BitmapFactory.decodeFile(src, bmOpts);
-            int origWidth = bmOpts.outWidth;
-            int origHeight = bmOpts.outHeight;
-
-            if (origWidth <= 0 || origHeight <= 0) {
-                throw new RuntimeException("compressImage:fail invalid image");
-            }
-
-            // Calculate target dimensions
-            int finalWidth = origWidth;
-            int finalHeight = origHeight;
-            if (targetWidth > 0 && targetHeight > 0) {
-                finalWidth = targetWidth;
-                finalHeight = targetHeight;
-            } else if (targetWidth > 0) {
-                float ratio = (float) targetWidth / origWidth;
-                finalWidth = targetWidth;
-                finalHeight = Math.round(origHeight * ratio);
-            } else if (targetHeight > 0) {
-                float ratio = (float) targetHeight / origHeight;
-                finalHeight = targetHeight;
-                finalWidth = Math.round(origWidth * ratio);
-            }
-
-            // Calculate inSampleSize for efficient decoding
-            bmOpts.inJustDecodeBounds = false;
-            bmOpts.inSampleSize = calculateInSampleSize(origWidth, origHeight, finalWidth, finalHeight);
-
-            Bitmap bitmap = BitmapFactory.decodeFile(src, bmOpts);
-            if (bitmap == null) {
-                throw new RuntimeException("compressImage:fail decode failed");
-            }
-
-            // Scale to exact target if needed
-            if (bitmap.getWidth() != finalWidth || bitmap.getHeight() != finalHeight) {
-                Bitmap scaled = Bitmap.createScaledBitmap(bitmap, finalWidth, finalHeight, true);
-                if (scaled != bitmap) {
-                    bitmap.recycle();
+    public void compressAsync(final int sessionId, final String optionsJson) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String resultJson = compressSync(optionsJson);
+                    NativeMethods.onCompressImageResult(sessionId, resultJson);
+                } catch (Exception e) {
+                    String msg = e.getMessage();
+                    if (msg == null) msg = "unknown error";
+                    NativeMethods.onCompressImageResult(sessionId,
+                            "{\"error\":\"" + msg.replace("\"", "\\\"") + "\"}");
                 }
-                bitmap = scaled;
             }
+        }, "migo-compress-image").start();
+    }
 
-            // Determine output format
-            String mimeType = bmOpts.outMimeType;
-            Bitmap.CompressFormat format = Bitmap.CompressFormat.JPEG;
-            String ext = ".jpg";
-            if (mimeType != null && mimeType.contains("png")) {
-                format = Bitmap.CompressFormat.PNG;
-                ext = ".png";
-            }
+    private String compressSync(String optionsJson) throws Exception {
+        JSONObject opts = new JSONObject(optionsJson);
+        String src = opts.getString("src");
+        int quality = opts.optInt("quality", 80);
+        int targetWidth = opts.optInt("compressedWidth", 0);
+        int targetHeight = opts.optInt("compressedHeight", 0);
 
-            // Write compressed to temp file
-            File tempFile = createTempFile("compress", ext);
-            try (FileOutputStream fos = new FileOutputStream(tempFile)) {
-                boolean ok = bitmap.compress(format, quality, fos);
-                if (!ok) {
-                    throw new RuntimeException("compressImage:fail compress failed");
-                }
-            } finally {
+        quality = Math.max(0, Math.min(100, quality));
+
+        File srcFile = new File(src);
+        if (!srcFile.exists()) {
+            throw new RuntimeException("compressImage:fail file not found");
+        }
+
+        // First pass: get original dimensions
+        BitmapFactory.Options bmOpts = new BitmapFactory.Options();
+        bmOpts.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(src, bmOpts);
+        int origWidth = bmOpts.outWidth;
+        int origHeight = bmOpts.outHeight;
+
+        if (origWidth <= 0 || origHeight <= 0) {
+            throw new RuntimeException("compressImage:fail invalid image");
+        }
+
+        // Calculate target dimensions
+        int finalWidth = origWidth;
+        int finalHeight = origHeight;
+        if (targetWidth > 0 && targetHeight > 0) {
+            finalWidth = targetWidth;
+            finalHeight = targetHeight;
+        } else if (targetWidth > 0) {
+            float ratio = (float) targetWidth / origWidth;
+            finalWidth = targetWidth;
+            finalHeight = Math.round(origHeight * ratio);
+        } else if (targetHeight > 0) {
+            float ratio = (float) targetHeight / origHeight;
+            finalHeight = targetHeight;
+            finalWidth = Math.round(origWidth * ratio);
+        }
+
+        // Calculate inSampleSize for efficient decoding
+        bmOpts.inJustDecodeBounds = false;
+        bmOpts.inSampleSize = calculateInSampleSize(origWidth, origHeight, finalWidth, finalHeight);
+
+        Bitmap bitmap = BitmapFactory.decodeFile(src, bmOpts);
+        if (bitmap == null) {
+            throw new RuntimeException("compressImage:fail decode failed");
+        }
+
+        // Scale to exact target if needed
+        if (bitmap.getWidth() != finalWidth || bitmap.getHeight() != finalHeight) {
+            Bitmap scaled = Bitmap.createScaledBitmap(bitmap, finalWidth, finalHeight, true);
+            if (scaled != bitmap) {
                 bitmap.recycle();
             }
-
-            JSONObject result = new JSONObject();
-            result.put("tempFilePath", tempFile.getAbsolutePath());
-            return result.toString();
-        } catch (RuntimeException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new RuntimeException("compressImage:fail " + e.getMessage());
+            bitmap = scaled;
         }
+
+        // Determine output format
+        String mimeType = bmOpts.outMimeType;
+        Bitmap.CompressFormat format = Bitmap.CompressFormat.JPEG;
+        String ext = ".jpg";
+        if (mimeType != null && mimeType.contains("png")) {
+            format = Bitmap.CompressFormat.PNG;
+            ext = ".png";
+        }
+
+        // Write compressed to temp file
+        File tempFile = createTempFile("compress", ext);
+        try (FileOutputStream fos = new FileOutputStream(tempFile)) {
+            boolean ok = bitmap.compress(format, quality, fos);
+            if (!ok) {
+                throw new RuntimeException("compressImage:fail compress failed");
+            }
+        } finally {
+            bitmap.recycle();
+        }
+
+        JSONObject result = new JSONObject();
+        result.put("tempFilePath", tempFile.getAbsolutePath());
+        return result.toString();
     }
 
     // ==================== chooseMessageFile (async) ====================

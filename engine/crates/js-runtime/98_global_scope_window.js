@@ -250,6 +250,7 @@ const WindowGlobalScope = {
     previewMedia: core.propNonEnumerable(imageApi.previewMedia),
     previewImage: core.propNonEnumerable(imageApi.previewImage),
     compressImage: core.propNonEnumerable(imageApi.compressImage),
+    _internalOnCompressImageResult: core.propNonEnumerable(imageApi._internalOnCompressImageResult),
     chooseMessageFile: core.propNonEnumerable(imageApi.chooseMessageFile),
     chooseImage: core.propNonEnumerable(imageApi.chooseImage),
     _internalOnChooseMessageFileResult: core.propNonEnumerable(imageApi._internalOnChooseMessageFileResult),
