@@ -18,6 +18,7 @@ mod image_api;
 mod interaction;
 mod location;
 mod network;
+mod scan_code;
 mod system_info;
 
 pub use camera::CameraService;
@@ -33,4 +34,5 @@ pub use image_api::ImageApiService;
 pub use interaction::InteractionService;
 pub use location::LocationService;
 pub use network::NetworkService;
+pub use scan_code::ScanCodeService;
 pub use system_info::SystemInfoService;

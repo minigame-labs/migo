@@ -373,6 +373,22 @@ pub fn op_get_fuzzy_location(
     Err(JsErrorBox::generic("getFuzzyLocation:fail not supported"))
 }
 
+// ==================== Scan Code Ops ====================
+
+#[op2(fast)]
+pub fn op_scan_code(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(scan_code) = services.scan_code() {
+            return scan_code.scan_code(&options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("scanCode:fail not supported"))
+}
+
 // ==================== Extension Definition ====================
 
 deno_core::extension!(
@@ -418,6 +434,8 @@ deno_core::extension!(
         // Location
         op_get_location,
         op_get_fuzzy_location,
+        // Scan Code
+        op_scan_code,
     ],
     esm = [
         dir "device",
@@ -433,6 +451,7 @@ deno_core::extension!(
         "10_network.js",
         "11_memory.js",
         "12_location.js",
+        "13_scan_code.js",
     ]
 );
 

@@ -18,6 +18,7 @@ use crate::android::jni::{
     onCompressImageResult, onChooseImageResult, onChooseMessageFileResult,
     onMemoryWarning,
     onLocationResult, onFuzzyLocationResult,
+    onScanCodeResult,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -243,6 +244,12 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(ILjava/lang/String;)V".into(),
                 fn_ptr: onFuzzyLocationResult as *mut c_void,
             },
+            // Scan Code callback
+            NativeMethod {
+                name: "onScanCodeResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onScanCodeResult as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -354,6 +361,8 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         // Location
         ("getLocation", "(ILjava/lang/String;)V"),
         ("getFuzzyLocation", "(ILjava/lang/String;)V"),
+        // Scan Code
+        ("scanCode", "(ILjava/lang/String;)V"),
         // Error notification callback
         // onError(hostId, errorCode, message, detail)
         ("onError", "(IILjava/lang/String;Ljava/lang/String;)V"),

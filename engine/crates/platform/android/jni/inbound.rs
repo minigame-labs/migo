@@ -903,6 +903,25 @@ pub(crate) extern "system" fn onFuzzyLocationResult<'local>(
     let _ = send_command_to_host(host_id, cmd);
 }
 
+// ==================== Scan Code Callbacks ====================
+
+pub(crate) extern "system" fn onScanCodeResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
+    let escaped = json.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n").replace('\r', "\\r");
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnScanCodeResult('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
 // ==================== VSync (Choreographer) ====================
 
 pub(crate) extern "system" fn onVsync(

@@ -23,6 +23,7 @@ import com.migo.runtime.internal.platform.CameraManager;
 import com.migo.runtime.internal.platform.KeyboardManager;
 import com.migo.runtime.internal.platform.ImageApiManager;
 import com.migo.runtime.internal.platform.LocationProvider;
+import com.migo.runtime.internal.platform.ScanCodeManager;
 import com.migo.runtime.internal.platform.ScreenCaptureObserver;
 
 import android.graphics.Bitmap;
@@ -1730,6 +1731,43 @@ public final class NativeExports {
             return;
         }
         LocationProvider.getFuzzyLocationAsync(activity, sessionId, optionsJson);
+    }
+
+    // ==================== Scan Code ====================
+
+    /** Per-session Scan Code managers. */
+    private static final ConcurrentHashMap<Integer, ScanCodeManager> sScanCodeManagers =
+            new ConcurrentHashMap<>();
+
+    private static ScanCodeManager getOrCreateScanCodeManager(int sessionId) {
+        ScanCodeManager mgr = sScanCodeManagers.get(sessionId);
+        if (mgr != null) return mgr;
+
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) return null;
+        Activity activity = ctx.getActivity();
+        if (activity == null) return null;
+
+        mgr = new ScanCodeManager(sessionId, activity);
+        sScanCodeManagers.put(sessionId, mgr);
+        return mgr;
+    }
+
+    public static void scanCode(int sessionId, String optionsJson) {
+        ScanCodeManager mgr = getOrCreateScanCodeManager(sessionId);
+        if (mgr == null) {
+            NativeMethods.onScanCodeResult(sessionId,
+                    "{\"error\":\"scanCode:fail no context\"}");
+            return;
+        }
+        mgr.scanCode(optionsJson);
+    }
+
+    public static void destroyScanCodeManager(int sessionId) {
+        ScanCodeManager mgr = sScanCodeManagers.remove(sessionId);
+        if (mgr != null) {
+            mgr.destroy();
+        }
     }
 
 }

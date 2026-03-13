@@ -602,6 +602,21 @@ public final class NativeMethods {
         }
     }
 
+    // ==================== Scan Code Callbacks ====================
+
+    /**
+     * Callback for scanCode result.
+     * Called from {@link com.migo.runtime.internal.platform.ScanCodeManager}.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON result with scan data or error
+     */
+    public static void onScanCodeResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onScanCodeResult(sessionId, resultJson);
+        }
+    }
+
     // ==================== Recorder Callbacks ====================
 
     /**

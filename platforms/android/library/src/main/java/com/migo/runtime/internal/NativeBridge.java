@@ -409,6 +409,16 @@ public final class NativeBridge {
      */
     public static native void onFuzzyLocationResult(int sessionId, String resultJson);
 
+    // ==================== Scan Code Callbacks ====================
+
+    /**
+     * Callback when scanCode operation completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON-encoded result with scan data or error
+     */
+    public static native void onScanCodeResult(int sessionId, String resultJson);
+
     // ==================== Debug Stats ====================
 
     /**
