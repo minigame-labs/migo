@@ -456,7 +456,7 @@ public final class GameSession implements Closeable {
     // ==================== Internal callbacks from native ====================
 
     /** @hide Called from native code via NativeExports.onGameReady */
-    void notifyGameReady() {
+    public void notifyGameReady() {
         startupTimeMs = (System.nanoTime() - creationNanos) / 1_000_000;
         if (debugOverlay != null) {
             debugOverlay.setStartupTimeMs(startupTimeMs);
