@@ -516,6 +516,11 @@ public final class GameSession implements Closeable {
     // ==================== Helpers ====================
 
     private void tryAttachDebugOverlay() {
+        // Skip if the overlay is already embedded in a ViewGroup (e.g. MigoGameView)
+        if (debugOverlay.getParent() != null) {
+            debugOverlayAttached = true;
+            return;
+        }
         RuntimeContext ctx = RuntimeRegistry.get(sessionId);
         if (ctx == null) return;
         Activity activity = ctx.getActivity();
