@@ -3,6 +3,7 @@ package com.migo.runtime.internal.platform;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.widget.Toast;
@@ -41,9 +42,12 @@ public final class Clipboard {
             clipboard.setPrimaryClip(clip);
 
             // Show toast on UI thread
-            new Handler(Looper.getMainLooper()).post(() -> {
-                Toast.makeText(context, "内容已复制", Toast.LENGTH_SHORT).show();
-            });
+            // Android 13+ shows clipboard toast automatically
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    Toast.makeText(context, "内容已复制", Toast.LENGTH_SHORT).show();
+                });
+            }
 
             return 0;
         } catch (Exception e) {

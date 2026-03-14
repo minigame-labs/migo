@@ -23,24 +23,47 @@
 # JNI Callbacks (Rust -> Java)
 # ============================================================================
 
-# Keep NativeExports - methods are called from native code via cached method IDs
-# WARNING: Do not rename these methods!
+# Keep NativeExports - ALL methods are called from native code via cached method IDs
+# WARNING: Do not rename or remove ANY methods!
 -keep class com.migo.runtime.internal.NativeExports {
-    static java.lang.String getCacheDirPath();
-    static void openSystemBluetoothSetting(int);
-    static byte[] getWindowInfoBytes(int);
-    static byte[] getSystemSettingInfoBytes();
-    static java.lang.String getDeviceInfoJson();
-    static java.lang.String getAppAuthorizationSettingJson();
+    *;
+}
+
+# Keep internal classes accessed from native code or NativeExports
+-keep class com.migo.runtime.internal.NativeMethods {
+    *;
+}
+
+-keep class com.migo.runtime.internal.RuntimeRegistry {
+    *;
+}
+
+-keep class com.migo.runtime.internal.RuntimeContext {
+    *;
+}
+
+-keep class com.migo.runtime.internal.AppContext {
+    *;
 }
 
 # ============================================================================
 # RuntimeConfig (JNI Field Access)
 # ============================================================================
 
-# Keep RuntimeConfig - fields are accessed via JNI reflection
+# Keep RuntimeConfig - fields and methods are accessed via JNI reflection
 -keep class com.migo.runtime.RuntimeConfig {
     <fields>;
+    <methods>;
+}
+
+# Keep DebugOverlayView - may be used by host apps
+-keep public class com.migo.runtime.DebugOverlayView {
+    public *;
+}
+
+# Keep GamePaths - used by host apps
+-keep public class com.migo.runtime.GamePaths {
+    public *;
 }
 
 # Keep LogLevel enum - ordinal() is called from native code
@@ -68,3 +91,10 @@
 
 # Keep callback interface
 -keep interface com.migo.runtime.callback.GameSessionListener { *; }
+
+# Keep new public API classes
+-keep public class com.migo.runtime.MigoGameView { public *; }
+-keep public class com.migo.runtime.MigoGameActivity { public *; protected *; }
+
+# Keep ResultProxyActivity - started via Intent
+-keep class com.migo.runtime.internal.ResultProxyActivity { *; }

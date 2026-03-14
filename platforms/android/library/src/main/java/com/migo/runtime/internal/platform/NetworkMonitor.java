@@ -16,8 +16,10 @@ import com.migo.runtime.internal.NativeMethods;
 
 import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
 import java.util.Enumeration;
+import java.util.List;
 
 /**
  * Network status monitoring utility.
@@ -124,8 +126,7 @@ public final class NetworkMonitor {
                         if ("wifi".equals(networkType)) {
                             signalStrength = getWifiSignalStrength();
                         } else {
-                            // TODO: Implement cellular signal strength
-                            signalStrength = 0; 
+                            signalStrength = getCellularSignalStrength();
                         }
                     }
                 }
@@ -153,6 +154,26 @@ public final class NetworkMonitor {
             return new NetworkStatus(false, "none", "getNetworkType:fail:no permission (android.permission.ACCESS_NETWORK_STATE)");
         } catch (Exception e) {
             return new NetworkStatus(false, "none", "getNetworkType:fail:" + e.getMessage());
+        }
+    }
+
+    private int getCellularSignalStrength() {
+        try {
+            TelephonyManager tm = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+            if (tm == null) return 0;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                android.telephony.SignalStrength ss = tm.getSignalStrength();
+                if (ss != null) {
+                    // getLevel() returns 0-4; map to approximate dBm range
+                    int level = ss.getLevel();
+                    // Map: 0 → -120, 1 → -105, 2 → -90, 3 → -75, 4 → -60
+                    return -120 + level * 15;
+                }
+            }
+            // Fallback: no direct API below P without READ_PHONE_STATE permission
+            return 0;
+        } catch (Exception e) {
+            return 0;
         }
     }
 
@@ -249,13 +270,13 @@ public final class NetworkMonitor {
                     continue;
                 }
 
-                Enumeration<InetAddress> addresses = networkInterface.getInetAddresses();
-                while (addresses.hasMoreElements()) {
-                    InetAddress address = addresses.nextElement();
+                List<InterfaceAddress> ifAddresses = networkInterface.getInterfaceAddresses();
+                for (InterfaceAddress ifAddr : ifAddresses) {
+                    InetAddress address = ifAddr.getAddress();
                     if (address instanceof Inet4Address && !address.isLoopbackAddress()) {
                         String localip = address.getHostAddress();
-                        // Get netmask from interface prefix length
-                        short prefixLength = networkInterface.getInterfaceAddresses().get(0).getNetworkPrefixLength();
+                        // Get netmask from the same InterfaceAddress that matched
+                        short prefixLength = ifAddr.getNetworkPrefixLength();
                         String netmask = prefixToNetmask(prefixLength);
                         return new LocalIPInfo(localip, netmask, null);
                     }

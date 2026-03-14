@@ -264,7 +264,7 @@ impl Host {
                 self.audio.resume();
 
                 self.js
-                    .exec_script("onshow", "_internalTriggerOnShow()".to_string())
+                    .exec_script("onshow", "_internalTriggerOnShow()")
             }
 
             HostCommand::OnHide => {
@@ -276,14 +276,14 @@ impl Host {
                 self.audio.pause();
 
                 self.js
-                    .exec_script("onhide", "_internalTriggerOnHide()".to_string())
+                    .exec_script("onhide", "_internalTriggerOnHide()")
             }
 
             HostCommand::OnAudioInterruptionBegin => {
                 self.js
                     .exec_script(
                         "audio_interruption_begin",
-                        "_internalTriggerAudioInterruptionBegin()".to_string(),
+                        "_internalTriggerAudioInterruptionBegin()",
                     )
             }
 
@@ -291,7 +291,7 @@ impl Host {
                 self.js
                     .exec_script(
                         "audio_interruption_end",
-                        "_internalTriggerAudioInterruptionEnd()".to_string(),
+                        "_internalTriggerAudioInterruptionEnd()",
                     )
             }
 
@@ -301,7 +301,8 @@ impl Host {
                 points,
                 timestamp_ms,
             } => {
-                self.js.dispatch_touch(touch_type, &points[..count as usize], timestamp_ms);
+                let count = (count as usize).min(points.len());
+                self.js.dispatch_touch(touch_type, &points[..count], timestamp_ms);
                 Ok(())
             }
 
@@ -467,7 +468,7 @@ impl Host {
                 self.js
                     .exec_script(
                         "user_capture_screen",
-                        "_internalTriggerUserCaptureScreen()".to_string(),
+                        "_internalTriggerUserCaptureScreen()",
                     )
             }
 
@@ -506,7 +507,7 @@ impl Host {
     }
 
     fn on_eval_script(&mut self, source: String) -> EngineResult<()> {
-        self.js.exec_script("eval-script", source)
+        self.js.exec_script("eval-script", &source)
     }
 
     fn on_update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
@@ -614,7 +615,7 @@ impl Host {
         }
 
         // If we have a last evaluated module, reload it
-        if let (Some(game_id), Some(entry)) = (self.last_game_id.clone(), self.last_entry.clone()) {
+        if let (Some(game_id), Some(entry)) = (self.last_game_id.take(), self.last_entry.take()) {
             self.on_evaluate_module(game_id, entry).await?;
         }
 

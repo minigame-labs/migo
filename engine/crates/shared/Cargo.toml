@@ -14,7 +14,6 @@ code-signing = ["dep:sha2", "dep:ed25519-dalek"]
 
 [dependencies]
 base64 = "0.22.1"
-femtovg  = { workspace = true }
 hex = "0.4.3"
 tokio  = { workspace = true }
 bytemuck.workspace = true

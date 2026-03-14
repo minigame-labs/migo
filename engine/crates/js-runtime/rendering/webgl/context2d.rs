@@ -8,7 +8,6 @@
 //! use `RenderCommand::Canvas2D` for synchronous request/response.
 
 use deno_core::{op2, OpState};
-use femtovg::Color;
 use once_cell::sync::Lazy;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -17,6 +16,7 @@ use tracing::{error, trace};
 use shared::{
     op_state::CanvasOpState,
     protocol::{
+        color::Color,
         render_cmd::{Canvas2DCmd, RenderCommand, TextAlign, TextBaseline, TextMetrics},
         send_render_with_resp_sync,
     },
@@ -26,7 +26,7 @@ use shared::{
 // Color parsing
 // ============================================================================
 
-static NAMED_COLORS: Lazy<HashMap<&'static str, femtovg::Color>> = Lazy::new(|| {
+static NAMED_COLORS: Lazy<HashMap<&'static str, Color>> = Lazy::new(|| {
     [
         ("aliceblue", Color::rgb(240, 248, 255)),
         ("antiquewhite", Color::rgb(250, 235, 215)),
@@ -207,7 +207,7 @@ fn split_comma_parts(s: &str) -> ([&str; 4], usize) {
     (parts, count)
 }
 
-fn parse_color_string(s: &str) -> femtovg::Color {
+fn parse_color_string(s: &str) -> Color {
     let s = s.trim();
 
     // #hex — no lowercase needed
@@ -224,7 +224,7 @@ fn parse_color_string(s: &str) -> femtovg::Color {
             let g = parts[1].parse::<u8>().unwrap_or(0);
             let b = parts[2].parse::<u8>().unwrap_or(0);
             let a = (parts[3].parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0) * 255.0) as u8;
-            return Color::rgba(r, g, b, a);
+            return Color::rgbai(r, g, b, a);
         }
         return Color::black();
     }

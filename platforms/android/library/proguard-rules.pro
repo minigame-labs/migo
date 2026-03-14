@@ -113,6 +113,27 @@
     public static *;
 }
 
+# Keep ResultProxyActivity - started via Intent
+-keep class com.migo.runtime.internal.ResultProxyActivity {
+    *;
+}
+
+# Keep MigoGameView - public API
+-keep public class com.migo.runtime.MigoGameView {
+    public *;
+}
+
+# Keep MigoGameActivity - started via Intent, may be subclassed
+-keep public class com.migo.runtime.MigoGameActivity {
+    public *;
+    protected *;
+}
+
+# Keep GamePaths - public API
+-keep public class com.migo.runtime.GamePaths {
+    public *;
+}
+
 # ============================================================================
 # Debugging
 # ============================================================================

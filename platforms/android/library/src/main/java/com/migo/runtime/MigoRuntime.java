@@ -208,8 +208,10 @@ public final class MigoRuntime {
         // Initialize app context
         AppContext.init(activity);
 
-        // Enter full-screen immersive mode
-        enterImmersiveMode(activity);
+        // Enter full-screen immersive mode (if enabled)
+        if (config.isImmersiveMode()) {
+            enterImmersiveMode(activity);
+        }
 
         // Create native session
         int sessionId = NativeMethods.init(surface, config);

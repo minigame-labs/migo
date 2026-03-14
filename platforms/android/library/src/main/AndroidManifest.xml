@@ -13,5 +13,11 @@
             android:launchMode="standard"
             android:excludeFromRecents="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <activity
+            android:name=".MigoGameActivity"
+            android:exported="false"
+            android:launchMode="standard"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
     </application>
 </manifest>

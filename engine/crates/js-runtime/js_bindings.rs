@@ -229,7 +229,7 @@ impl JsBindings {
         self.with_main_context(rt, |scope, _ctx, global| {
             let args = [
                 v8::Integer::new(scope, id as i32).into(),
-                v8::String::new(scope, event_type).unwrap().into(),
+                v8::String::new(scope, event_type).unwrap_or_else(|| v8::String::empty(scope)).into(),
                 v8::Number::new(scope, current_time).into(),
             ];
 
@@ -295,7 +295,7 @@ impl JsBindings {
             self.with_main_context(rt, |scope, _ctx, global| {
                 let args = [
                     v8::Number::new(scope, direction).into(),
-                    v8::String::new(scope, accuracy).unwrap().into(),
+                    v8::String::new(scope, accuracy).unwrap_or_else(|| v8::String::empty(scope)).into(),
                 ];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);
@@ -306,7 +306,7 @@ impl JsBindings {
     pub(crate) fn dispatch_device_orientation(&self, rt: &mut deno_core::JsRuntime, value: &str) {
         if let Some(func_g) = self.sensor_orientation_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
-                let args = [v8::String::new(scope, value).unwrap().into()];
+                let args = [v8::String::new(scope, value).unwrap_or_else(|| v8::String::empty(scope)).into()];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);
             });
@@ -323,7 +323,7 @@ impl JsBindings {
             self.with_main_context(rt, |scope, _ctx, global| {
                 let args = [
                     v8::Boolean::new(scope, is_connected).into(),
-                    v8::String::new(scope, network_type).unwrap().into(),
+                    v8::String::new(scope, network_type).unwrap_or_else(|| v8::String::empty(scope)).into(),
                 ];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);
@@ -348,8 +348,8 @@ impl JsBindings {
 
         self.with_main_context(rt, |scope, _ctx, global| {
             let args = [
-                v8::String::new(scope, event_type).unwrap().into(),
-                v8::String::new(scope, json_payload).unwrap().into(),
+                v8::String::new(scope, event_type).unwrap_or_else(|| v8::String::empty(scope)).into(),
+                v8::String::new(scope, json_payload).unwrap_or_else(|| v8::String::empty(scope)).into(),
             ];
             let func = v8::Local::new(scope, func_g);
             let _ = func.call(scope, global.into(), &args);
@@ -412,8 +412,8 @@ impl JsBindings {
         self.with_main_context(rt, |scope, _ctx, global| {
             let args = [
                 v8::Integer::new(scope, camera_id as i32).into(),
-                v8::String::new(scope, event_type).unwrap().into(),
-                v8::String::new(scope, json_payload).unwrap().into(),
+                v8::String::new(scope, event_type).unwrap_or_else(|| v8::String::empty(scope)).into(),
+                v8::String::new(scope, json_payload).unwrap_or_else(|| v8::String::empty(scope)).into(),
             ];
             let func = v8::Local::new(scope, func_g);
             let _ = func.call(scope, global.into(), &args);
@@ -449,7 +449,7 @@ impl JsBindings {
     ) {
         if let Some(func_g) = self.bluetooth_device_found_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
-                let args = [v8::String::new(scope, devices_json).unwrap().into()];
+                let args = [v8::String::new(scope, devices_json).unwrap_or_else(|| v8::String::empty(scope)).into()];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);
             });
@@ -464,7 +464,7 @@ impl JsBindings {
     ) {
         if let Some(func_g) = self.beacon_update_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
-                let args = [v8::String::new(scope, beacons_json).unwrap().into()];
+                let args = [v8::String::new(scope, beacons_json).unwrap_or_else(|| v8::String::empty(scope)).into()];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);
             });
@@ -517,7 +517,7 @@ impl JsBindings {
     ) {
         if let Some(func_g) = self.keyboard_input_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
-                let args = [v8::String::new(scope, value).unwrap().into()];
+                let args = [v8::String::new(scope, value).unwrap_or_else(|| v8::String::empty(scope)).into()];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);
             });
@@ -547,7 +547,7 @@ impl JsBindings {
     ) {
         if let Some(func_g) = self.keyboard_confirm_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
-                let args = [v8::String::new(scope, value).unwrap().into()];
+                let args = [v8::String::new(scope, value).unwrap_or_else(|| v8::String::empty(scope)).into()];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);
             });
@@ -562,7 +562,7 @@ impl JsBindings {
     ) {
         if let Some(func_g) = self.keyboard_complete_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
-                let args = [v8::String::new(scope, value).unwrap().into()];
+                let args = [v8::String::new(scope, value).unwrap_or_else(|| v8::String::empty(scope)).into()];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);
             });
@@ -580,8 +580,8 @@ impl JsBindings {
         if let Some(func_g) = self.key_down_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
                 let args = [
-                    v8::String::new(scope, key).unwrap().into(),
-                    v8::String::new(scope, code).unwrap().into(),
+                    v8::String::new(scope, key).unwrap_or_else(|| v8::String::empty(scope)).into(),
+                    v8::String::new(scope, code).unwrap_or_else(|| v8::String::empty(scope)).into(),
                     v8::Number::new(scope, timestamp_ms).into(),
                 ];
                 let func = v8::Local::new(scope, func_g);
@@ -601,8 +601,8 @@ impl JsBindings {
         if let Some(func_g) = self.key_up_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
                 let args = [
-                    v8::String::new(scope, key).unwrap().into(),
-                    v8::String::new(scope, code).unwrap().into(),
+                    v8::String::new(scope, key).unwrap_or_else(|| v8::String::empty(scope)).into(),
+                    v8::String::new(scope, code).unwrap_or_else(|| v8::String::empty(scope)).into(),
                     v8::Number::new(scope, timestamp_ms).into(),
                 ];
                 let func = v8::Local::new(scope, func_g);

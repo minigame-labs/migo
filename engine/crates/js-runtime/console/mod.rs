@@ -15,7 +15,6 @@ pub fn op_console<'s>(scope: &mut v8::PinScope<'s, '_>, value: v8::Local<'s, v8:
         _ => debug!("{}", msg),
     }
 }
-// TODO: remove
 extension!(host_v8_console,
 ops = [op_console],
 esm = [

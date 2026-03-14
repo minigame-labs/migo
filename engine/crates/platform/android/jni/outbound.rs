@@ -958,50 +958,6 @@ pub fn camera_close_frame_change(host_id: i32, camera_id: u32) -> Result<(), Str
 
 // ==================== Bluetooth ====================
 
-/// Call a Java Bluetooth method that takes (hostId, optionsJson) and returns a JSON string.
-fn call_bluetooth_json(method_name: &str, host_id: i32, options_json: &str) -> Result<String, String> {
-    with_env(|env| {
-        let cache = JAVA_METHOD_CACHE
-            .get()
-            .ok_or("NativeExports class cache not initialized")?;
-        let method_id = cache
-            .get_method_id(method_name)
-            .ok_or("Method ID not found")?;
-        let class = cache.class();
-
-        let jstr = env
-            .new_string(options_json)
-            .map_err(|e| format!("Failed to create Java string: {e}"))?;
-
-        let result = unsafe {
-            env.call_static_method_unchecked(
-                class,
-                *method_id,
-                ReturnType::Object,
-                &[jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }],
-            )
-        };
-
-        match result {
-            Ok(val) => {
-                let jstring = val.l().map_err(|_| "Null string from Java")?;
-                let json_str = env
-                    .get_string(&jni::objects::JString::from(jstring))
-                    .map_err(|e| format!("Failed to convert bluetooth JSON string: {e}"))?
-                    .into();
-                Ok(json_str)
-            }
-            Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
-                Err(format!("Failed to call method '{method_name}': {e}"))
-            }
-        }
-    })
-}
-
 /// Call a Java Bluetooth method that takes (hostId) and returns a JSON string.
 fn call_bluetooth_json_no_args(method_name: &str, host_id: i32) -> Result<String, String> {
     call_static_method(
@@ -1054,7 +1010,7 @@ pub fn bluetooth_get_devices(host_id: i32) -> Result<String, String> {
 }
 
 pub fn bluetooth_get_connected_devices(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_bluetooth_json("bluetoothGetConnectedDevices", host_id, options_json)
+    call_json_method("bluetoothGetConnectedDevices", host_id, options_json)
 }
 
 pub fn bluetooth_make_pair(host_id: i32, options_json: &str) -> Result<(), String> {
@@ -1246,8 +1202,7 @@ pub fn notify_error(host_id: i32, error_code: u16, message: &str, detail: &str) 
 /// Returns NormalizedImage on success.
 ///
 /// The Java side returns a packed byte array: `[width_le32, height_le32, RGBA_pixels...]`.
-/// We strip the 8-byte header in-place (`Vec::drain`) to avoid an extra allocation
-/// that the previous `bytes[8..].to_vec()` approach incurred.
+/// We read width/height from the first 8 bytes, then copy the RGBA payload from `bytes[8..]`.
 pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError> {
     let result: Result<NormalizedImage, String> = with_env(|env| {
         let cache = JAVA_METHOD_CACHE
@@ -1297,14 +1252,13 @@ pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError
                     ));
                 }
 
-                // Strip the 8-byte header in-place, reusing the existing Vec allocation
-                // instead of `bytes[8..].to_vec()` which would allocate a second buffer.
-                bytes.drain(..8);
+                // Use offset-based access to avoid O(n) shift from drain(..8).
+                let rgba = bytes[8..].to_vec();
 
                 Ok(NormalizedImage {
                     width,
                     height,
-                    rgba: Arc::new(bytes),
+                    rgba: Arc::new(rgba),
                 })
             }
             Err(e) => {

@@ -1,5 +1,5 @@
 use deno_core::extension;
-// TODO: move to web dir
+
 extension!(host_v8_url,
     deps = [host_v8_console],
     esm = [

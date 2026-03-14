@@ -106,8 +106,10 @@ class KotlinGameActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        session?.close()
-        session = null
+        // Do NOT close the session here. The surface is destroyed when the
+        // activity goes to background (onStop), but the activity is still alive.
+        // Session cleanup happens in onDestroy().
+        Log.d(TAG, "Surface destroyed (session kept alive)")
     }
 
     override fun onPause() {

@@ -97,6 +97,8 @@ impl FilePermissions {
 #[derive(Debug, Clone)]
 pub struct PathMapping {
     pub virtual_prefix: &'static str,
+    /// Pre-computed `"{virtual_prefix}/"` to avoid per-resolve allocation.
+    prefix_with_slash: String,
     pub real_path: PathBuf,
     /// Pre-resolved canonical base (follows symlinks at construction time).
     /// Falls back to the textually-normalized `real_path` when the directory
@@ -228,7 +230,8 @@ impl VirtualFS {
         Self { mappings, policy }
     }
 
-    /// Build a [`PathMapping`], pre-computing the canonical base.
+    /// Build a [`PathMapping`], pre-computing the canonical base and
+    /// the slash-appended prefix to avoid per-resolve allocations.
     fn make_mapping(
         prefix: &'static str,
         real_path: PathBuf,
@@ -238,6 +241,7 @@ impl VirtualFS {
             .unwrap_or_else(|_| normalize_path(&real_path));
         PathMapping {
             virtual_prefix: prefix,
+            prefix_with_slash: format!("{}/", prefix),
             real_path,
             canonical_base,
             permissions,
@@ -265,8 +269,8 @@ impl VirtualFS {
         let mapping = self
             .mappings
             .iter()
-            .find(|(prefix, _)| {
-                virtual_path == **prefix || virtual_path.starts_with(&format!("{}/", prefix))
+            .find(|(prefix, m)| {
+                virtual_path == **prefix || virtual_path.starts_with(&m.prefix_with_slash)
             })
             .map(|(_, m)| m)
             .ok_or(VfsError::PathNotAllowed)?;

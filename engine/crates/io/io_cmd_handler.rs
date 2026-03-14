@@ -302,8 +302,15 @@ impl IoCmdHandler {
                     // Read specified length or rest of file
                     let data = if let Some(len) = length {
                         let mut buf = vec![0u8; len as usize];
-                        let n = file.read(&mut buf).await.map_err(Self::io_err)?;
-                        buf.truncate(n);
+                        let mut total = 0;
+                        while total < buf.len() {
+                            match file.read(&mut buf[total..]).await {
+                                Ok(0) => break, // EOF
+                                Ok(n) => total += n,
+                                Err(e) => return Err(Self::io_err(e)),
+                            }
+                        }
+                        buf.truncate(total);
                         buf
                     } else {
                         let mut buf = Vec::new();

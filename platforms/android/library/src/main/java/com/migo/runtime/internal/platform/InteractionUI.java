@@ -443,14 +443,18 @@ public final class InteractionUI {
             } else {
                 // Custom drawn icon (success checkmark or error X)
                 View iconView = new View(activity) {
+                    private final Paint iconPaint;
+                    {
+                        iconPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                        iconPaint.setColor(Color.WHITE);
+                        iconPaint.setStyle(Paint.Style.STROKE);
+                        iconPaint.setStrokeWidth(3 * density);
+                        iconPaint.setStrokeCap(Paint.Cap.ROUND);
+                    }
+
                     @Override
                     protected void onDraw(Canvas canvas) {
                         super.onDraw(canvas);
-                        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-                        paint.setColor(Color.WHITE);
-                        paint.setStyle(Paint.Style.STROKE);
-                        paint.setStrokeWidth(3 * density);
-                        paint.setStrokeCap(Paint.Cap.ROUND);
 
                         float w = getWidth();
                         float h = getHeight();
@@ -460,24 +464,23 @@ public final class InteractionUI {
 
                         if ("success".equals(icon)) {
                             // Draw circle
-                            canvas.drawCircle(cx, cy, r, paint);
+                            canvas.drawCircle(cx, cy, r, iconPaint);
                             // Draw checkmark
-                            paint.setStrokeWidth(3 * density);
                             float startX = cx - r * 0.35f;
                             float startY = cy + r * 0.05f;
                             float midX = cx - r * 0.05f;
                             float midY = cy + r * 0.35f;
                             float endX = cx + r * 0.4f;
                             float endY = cy - r * 0.25f;
-                            canvas.drawLine(startX, startY, midX, midY, paint);
-                            canvas.drawLine(midX, midY, endX, endY, paint);
+                            canvas.drawLine(startX, startY, midX, midY, iconPaint);
+                            canvas.drawLine(midX, midY, endX, endY, iconPaint);
                         } else if ("error".equals(icon)) {
                             // Draw circle
-                            canvas.drawCircle(cx, cy, r, paint);
+                            canvas.drawCircle(cx, cy, r, iconPaint);
                             // Draw X
                             float offset = r * 0.35f;
-                            canvas.drawLine(cx - offset, cy - offset, cx + offset, cy + offset, paint);
-                            canvas.drawLine(cx + offset, cy - offset, cx - offset, cy + offset, paint);
+                            canvas.drawLine(cx - offset, cy - offset, cx + offset, cy + offset, iconPaint);
+                            canvas.drawLine(cx + offset, cy - offset, cx - offset, cy + offset, iconPaint);
                         }
                     }
                 };

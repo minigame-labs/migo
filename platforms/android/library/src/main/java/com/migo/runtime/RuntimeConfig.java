@@ -64,6 +64,9 @@ public final class RuntimeConfig {
     private final boolean debugEnabled;
     private final LogLevel logLevel;
 
+    // Display settings
+    private final boolean immersiveMode;
+
     // Safety settings
     private final boolean watchdogEnabled;
     private final int watchdogTimeoutSecs;
@@ -78,6 +81,7 @@ public final class RuntimeConfig {
         this.targetFps = builder.targetFps;
         this.debugEnabled = builder.debugEnabled;
         this.logLevel = builder.logLevel;
+        this.immersiveMode = builder.immersiveMode;
         this.watchdogEnabled = builder.watchdogEnabled;
         this.watchdogTimeoutSecs = builder.watchdogTimeoutSecs;
         this.codeSigningEnabled = builder.codeSigningEnabled;
@@ -106,6 +110,9 @@ public final class RuntimeConfig {
 
     /** Get the log level */
     public LogLevel getLogLevel() { return logLevel; }
+
+    /** Check whether full-screen immersive mode is enabled */
+    public boolean isImmersiveMode() { return immersiveMode; }
 
     /** Check whether ANR watchdog is enabled */
     public boolean isWatchdogEnabled() { return watchdogEnabled; }
@@ -156,6 +163,9 @@ public final class RuntimeConfig {
         // Debug
         private boolean debugEnabled = false;
         private LogLevel logLevel = LogLevel.WARN;
+
+        // Display
+        private boolean immersiveMode = true;
 
         // Safety
         private boolean watchdogEnabled = true;
@@ -253,6 +263,20 @@ public final class RuntimeConfig {
          */
         public Builder setLogLevel(LogLevel level) {
             this.logLevel = level != null ? level : LogLevel.WARN;
+            return this;
+        }
+
+        /**
+         * Enable or disable full-screen immersive mode.
+         * <p>
+         * Default: true. Set to false when embedding the game view
+         * alongside other UI elements (e.g., in a feed or partial-screen layout).
+         *
+         * @param enabled true to enter immersive mode on session creation
+         * @return this builder
+         */
+        public Builder setImmersiveMode(boolean enabled) {
+            this.immersiveMode = enabled;
             return this;
         }
 

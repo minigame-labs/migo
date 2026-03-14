@@ -34,6 +34,14 @@ public final class DeviceSensorManager {
     private final SensorManager sensorManager;
     private final WindowManager windowManager;
 
+    // Pre-allocated array for remapForDisplay() to avoid per-event allocation
+    private final float[] remappedMatrix = new float[9];
+
+    // Cached display rotation, updated periodically
+    private int cachedRotation = Surface.ROTATION_0;
+    private long lastRotationCheck = 0;
+    private static final long ROTATION_CHECK_INTERVAL_MS = 500;
+
     private SensorEventListener motionListener;
     private SensorEventListener gyroscopeListener;
     private SensorEventListener compassListener;
@@ -264,7 +272,7 @@ public final class DeviceSensorManager {
             case SensorManager.SENSOR_STATUS_UNRELIABLE:
                 return "unreliable";
             default:
-                return "unknow " + accuracy;
+                return "unknown " + accuracy;
         }
     }
 
@@ -338,9 +346,13 @@ public final class DeviceSensorManager {
         int axisY = SensorManager.AXIS_Y;
 
         if (windowManager != null) {
-            Display display = windowManager.getDefaultDisplay();
-            int rotation = display.getRotation();
-            switch (rotation) {
+            // Cache rotation to avoid querying display on every sensor event
+            long now = System.currentTimeMillis();
+            if (now - lastRotationCheck > ROTATION_CHECK_INTERVAL_MS) {
+                cachedRotation = windowManager.getDefaultDisplay().getRotation();
+                lastRotationCheck = now;
+            }
+            switch (cachedRotation) {
                 case Surface.ROTATION_90:
                     axisX = SensorManager.AXIS_Y;
                     axisY = SensorManager.AXIS_MINUS_X;
@@ -358,9 +370,8 @@ public final class DeviceSensorManager {
             }
         }
 
-        float[] remapped = new float[9];
-        SensorManager.remapCoordinateSystem(rotationMatrix, axisX, axisY, remapped);
-        return remapped;
+        SensorManager.remapCoordinateSystem(rotationMatrix, axisX, axisY, remappedMatrix);
+        return remappedMatrix;
     }
 
     /**

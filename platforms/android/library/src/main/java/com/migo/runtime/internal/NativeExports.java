@@ -33,6 +33,9 @@ import android.graphics.BitmapFactory;
 import android.os.Handler;
 import android.os.Looper;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -50,6 +53,16 @@ public final class NativeExports {
 
     private static final int BLUETOOTH_SETTING_REQUEST_CODE = 10001;
     private static final int APP_AUTHORIZE_SETTING_REQUEST_CODE = 10002;
+
+    // Locks for double-checked locking in getOrCreate methods
+    private static final Object sSensorLock = new Object();
+    private static final Object sNetworkLock = new Object();
+    private static final Object sCaptureLock = new Object();
+    private static final Object sRecorderLock = new Object();
+    private static final Object sKeyboardLock = new Object();
+    private static final Object sBluetoothLock = new Object();
+    private static final Object sImageApiLock = new Object();
+    private static final Object sScanCodeLock = new Object();
 
     /** Per-session device sensor managers. */
     private static final ConcurrentHashMap<Integer, DeviceSensorManager> sSensorManagers =
@@ -257,7 +270,12 @@ public final class NativeExports {
 
         int w = bitmap.getWidth();
         int h = bitmap.getHeight();
-        int pixelCount = w * h;
+        long pixelCountLong = (long) w * (long) h;
+        if (pixelCountLong > Integer.MAX_VALUE / 4) {
+            bitmap.recycle();
+            return null;  // Image too large
+        }
+        int pixelCount = (int) pixelCountLong;
 
         // Single allocation: 8-byte header + pixel data (eliminates the
         // previous redundant pixelBuf allocation).
@@ -808,15 +826,17 @@ public final class NativeExports {
     private static DeviceSensorManager getOrCreateSensorManager(int sessionId) {
         DeviceSensorManager existing = sSensorManagers.get(sessionId);
         if (existing != null) return existing;
-
-        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
-        if (ctx == null) return null;
-        Activity activity = ctx.getActivity();
-        if (activity == null) return null;
-
-        DeviceSensorManager mgr = new DeviceSensorManager(sessionId, activity);
-        sSensorManagers.put(sessionId, mgr);
-        return mgr;
+        synchronized (sSensorLock) {
+            existing = sSensorManagers.get(sessionId);
+            if (existing != null) return existing;
+            RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+            if (ctx == null) return null;
+            Activity activity = ctx.getActivity();
+            if (activity == null) return null;
+            DeviceSensorManager mgr = new DeviceSensorManager(sessionId, activity);
+            sSensorManagers.put(sessionId, mgr);
+            return mgr;
+        }
     }
 
     /**
@@ -949,15 +969,17 @@ public final class NativeExports {
     private static NetworkMonitor getOrCreateNetworkMonitor(int sessionId) {
         NetworkMonitor existing = sNetworkMonitors.get(sessionId);
         if (existing != null) return existing;
-
-        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
-        if (ctx == null) return null;
-        Activity activity = ctx.getActivity();
-        if (activity == null) return null;
-
-        NetworkMonitor mgr = new NetworkMonitor(sessionId, activity);
-        sNetworkMonitors.put(sessionId, mgr);
-        return mgr;
+        synchronized (sNetworkLock) {
+            existing = sNetworkMonitors.get(sessionId);
+            if (existing != null) return existing;
+            RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+            if (ctx == null) return null;
+            Activity activity = ctx.getActivity();
+            if (activity == null) return null;
+            NetworkMonitor mgr = new NetworkMonitor(sessionId, activity);
+            sNetworkMonitors.put(sessionId, mgr);
+            return mgr;
+        }
     }
 
     /**
@@ -996,13 +1018,18 @@ public final class NativeExports {
     public static void startCaptureScreen(int sessionId) {
         ScreenCaptureObserver observer = sCaptureObservers.get(sessionId);
         if (observer == null) {
-            RuntimeContext ctx = RuntimeRegistry.get(sessionId);
-            if (ctx == null) return;
-            Activity activity = ctx.getActivity();
-            Context appCtx = activity != null ? activity : AppContext.getOrNull();
-            if (appCtx == null) return;
-            observer = new ScreenCaptureObserver(sessionId, appCtx);
-            sCaptureObservers.put(sessionId, observer);
+            synchronized (sCaptureLock) {
+                observer = sCaptureObservers.get(sessionId);
+                if (observer == null) {
+                    RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+                    if (ctx == null) return;
+                    Activity activity = ctx.getActivity();
+                    Context appCtx = activity != null ? activity : AppContext.getOrNull();
+                    if (appCtx == null) return;
+                    observer = new ScreenCaptureObserver(sessionId, appCtx);
+                    sCaptureObservers.put(sessionId, observer);
+                }
+            }
         }
         observer.start();
     }
@@ -1046,20 +1073,28 @@ public final class NativeExports {
 
         NetworkMonitor.NetworkStatus status = mgr.getNetworkStatus();
         if (status.error != null) {
-            return String.format(
-                "{\"_error\":{\"errMsg\":\"%s\"}}",
-                status.error
-            );
+            try {
+                JSONObject err = new JSONObject();
+                JSONObject inner = new JSONObject();
+                inner.put("errMsg", status.error);
+                err.put("_error", inner);
+                return err.toString();
+            } catch (JSONException e) {
+                return "{}";
+            }
         }
 
-        return String.format(
-                "{\"networkType\":\"%s\",\"isConnected\":%s,\"signalStrength\":%d,\"hasSystemProxy\":%s,\"weakNet\":%s}",
-                status.networkType,
-                status.isConnected,
-                status.signalStrength,
-                status.hasSystemProxy,
-                status.weakNet
-        );
+        try {
+            JSONObject json = new JSONObject();
+            json.put("networkType", status.networkType);
+            json.put("isConnected", status.isConnected);
+            json.put("signalStrength", status.signalStrength);
+            json.put("hasSystemProxy", status.hasSystemProxy);
+            json.put("weakNet", status.weakNet);
+            return json.toString();
+        } catch (JSONException e) {
+            return "{}";
+        }
     }
 
     /**
@@ -1070,17 +1105,25 @@ public final class NativeExports {
     public static String getLocalIPAddressJson() {
         NetworkMonitor.LocalIPInfo info = NetworkMonitor.getLocalIPAddress();
         if (info.error != null) {
-            return String.format(
-                "{\"_error\":{\"errMsg\":\"%s\"}}",
-                info.error
-            );
+            try {
+                JSONObject err = new JSONObject();
+                JSONObject inner = new JSONObject();
+                inner.put("errMsg", info.error);
+                err.put("_error", inner);
+                return err.toString();
+            } catch (JSONException e) {
+                return "{}";
+            }
         }
 
-        return String.format(
-                "{\"localip\":\"%s\",\"netmask\":\"%s\"}",
-                info.localip,
-                info.netmask
-        );
+        try {
+            JSONObject json = new JSONObject();
+            json.put("localip", info.localip);
+            json.put("netmask", info.netmask);
+            return json.toString();
+        } catch (JSONException e) {
+            return "{}";
+        }
     }
 
     /**
@@ -1236,8 +1279,13 @@ public final class NativeExports {
 
         AudioRecorderManager mgr = sRecorderManagers.get(sessionId);
         if (mgr == null) {
-            mgr = new AudioRecorderManager(sessionId, activity);
-            sRecorderManagers.put(sessionId, mgr);
+            synchronized (sRecorderLock) {
+                mgr = sRecorderManagers.get(sessionId);
+                if (mgr == null) {
+                    mgr = new AudioRecorderManager(sessionId, activity);
+                    sRecorderManagers.put(sessionId, mgr);
+                }
+            }
         }
         mgr.start(optionsJson);
     }
@@ -1475,24 +1523,24 @@ public final class NativeExports {
             new ConcurrentHashMap<>();
 
     private static KeyboardManager getOrCreateKeyboardManager(int sessionId) {
-        KeyboardManager mgr = sKeyboardManagers.get(sessionId);
-        if (mgr != null) return mgr;
-
-        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
-        if (ctx == null) return null;
-        Activity activity = ctx.getActivity();
-        if (activity == null) return null;
-
-        mgr = new KeyboardManager(sessionId, activity);
-        sKeyboardManagers.put(sessionId, mgr);
-        return mgr;
+        KeyboardManager existing = sKeyboardManagers.get(sessionId);
+        if (existing != null) return existing;
+        synchronized (sKeyboardLock) {
+            existing = sKeyboardManagers.get(sessionId);
+            if (existing != null) return existing;
+            RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+            if (ctx == null) return null;
+            Activity activity = ctx.getActivity();
+            if (activity == null) return null;
+            KeyboardManager mgr = new KeyboardManager(sessionId, activity);
+            sKeyboardManagers.put(sessionId, mgr);
+            return mgr;
+        }
     }
 
     public static void keyboardShow(int sessionId, String optionsJson) {
         KeyboardManager mgr = getOrCreateKeyboardManager(sessionId);
-        if (mgr == null) {
-            throw new RuntimeException("showKeyboard:fail no context");
-        }
+        if (mgr == null) return;  // no context for session
         mgr.show(optionsJson);
     }
 
@@ -1527,24 +1575,24 @@ public final class NativeExports {
             new ConcurrentHashMap<>();
 
     private static BluetoothManager getOrCreateBluetoothManager(int sessionId) {
-        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
-        if (mgr != null) return mgr;
-
-        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
-        if (ctx == null) return null;
-        Activity activity = ctx.getActivity();
-        if (activity == null) return null;
-
-        mgr = new BluetoothManager(sessionId, activity);
-        sBluetoothManagers.put(sessionId, mgr);
-        return mgr;
+        BluetoothManager existing = sBluetoothManagers.get(sessionId);
+        if (existing != null) return existing;
+        synchronized (sBluetoothLock) {
+            existing = sBluetoothManagers.get(sessionId);
+            if (existing != null) return existing;
+            RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+            if (ctx == null) return null;
+            Activity activity = ctx.getActivity();
+            if (activity == null) return null;
+            BluetoothManager mgr = new BluetoothManager(sessionId, activity);
+            sBluetoothManagers.put(sessionId, mgr);
+            return mgr;
+        }
     }
 
     public static void bluetoothOpenAdapter(int sessionId, String optionsJson) {
         BluetoothManager mgr = getOrCreateBluetoothManager(sessionId);
-        if (mgr == null) {
-            throw new RuntimeException("openBluetoothAdapter:fail no context");
-        }
+        if (mgr == null) return;  // no context for session
         mgr.openAdapter(optionsJson);
     }
 
@@ -1565,9 +1613,7 @@ public final class NativeExports {
 
     public static void bluetoothStartDevicesDiscovery(int sessionId, String optionsJson) {
         BluetoothManager mgr = getOrCreateBluetoothManager(sessionId);
-        if (mgr == null) {
-            throw new RuntimeException("startBluetoothDevicesDiscovery:fail no context");
-        }
+        if (mgr == null) return;  // no context for session
         mgr.startDiscovery(optionsJson);
     }
 
@@ -1596,25 +1642,19 @@ public final class NativeExports {
 
     public static void bluetoothMakePair(int sessionId, String optionsJson) {
         BluetoothManager mgr = getOrCreateBluetoothManager(sessionId);
-        if (mgr == null) {
-            throw new RuntimeException("makeBluetoothPair:fail no context");
-        }
+        if (mgr == null) return;  // no context for session
         mgr.makePair(optionsJson);
     }
 
     public static void bluetoothIsDevicePaired(int sessionId, String optionsJson) {
         BluetoothManager mgr = getOrCreateBluetoothManager(sessionId);
-        if (mgr == null) {
-            throw new RuntimeException("isBluetoothDevicePaired:fail no context");
-        }
+        if (mgr == null) return;  // no context for session
         mgr.isDevicePaired(optionsJson);
     }
 
     public static void bluetoothStartBeaconDiscovery(int sessionId, String optionsJson) {
         BluetoothManager mgr = getOrCreateBluetoothManager(sessionId);
-        if (mgr == null) {
-            throw new RuntimeException("startBeaconDiscovery:fail no context");
-        }
+        if (mgr == null) return;  // no context for session
         mgr.startBeaconDiscovery(optionsJson);
     }
 
@@ -1650,40 +1690,36 @@ public final class NativeExports {
             new ConcurrentHashMap<>();
 
     private static ImageApiManager getOrCreateImageApiManager(int sessionId) {
-        ImageApiManager mgr = sImageApiManagers.get(sessionId);
-        if (mgr != null) return mgr;
-
-        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
-        if (ctx == null) return null;
-        Activity activity = ctx.getActivity();
-        if (activity == null) return null;
-
-        mgr = new ImageApiManager(sessionId, activity);
-        sImageApiManagers.put(sessionId, mgr);
-        return mgr;
+        ImageApiManager existing = sImageApiManagers.get(sessionId);
+        if (existing != null) return existing;
+        synchronized (sImageApiLock) {
+            existing = sImageApiManagers.get(sessionId);
+            if (existing != null) return existing;
+            RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+            if (ctx == null) return null;
+            Activity activity = ctx.getActivity();
+            if (activity == null) return null;
+            ImageApiManager mgr = new ImageApiManager(sessionId, activity);
+            sImageApiManagers.put(sessionId, mgr);
+            return mgr;
+        }
     }
 
     public static void imageSaveToPhotosAlbum(int sessionId, String optionsJson) {
         ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
-        if (mgr == null) {
-            throw new RuntimeException("saveImageToPhotosAlbum:fail no context");
-        }
+        if (mgr == null) return;  // no context for session
         mgr.saveToPhotosAlbum(optionsJson);
     }
 
     public static void imagePreviewMedia(int sessionId, String optionsJson) {
         ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
-        if (mgr == null) {
-            throw new RuntimeException("previewMedia:fail no context");
-        }
+        if (mgr == null) return;  // no context for session
         mgr.previewMedia(optionsJson);
     }
 
     public static void imagePreviewImage(int sessionId, String optionsJson) {
         ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
-        if (mgr == null) {
-            throw new RuntimeException("previewImage:fail no context");
-        }
+        if (mgr == null) return;  // no context for session
         mgr.previewImage(optionsJson);
     }
 
@@ -1699,17 +1735,13 @@ public final class NativeExports {
 
     public static void imageChooseMessageFile(int sessionId, String optionsJson) {
         ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
-        if (mgr == null) {
-            throw new RuntimeException("chooseMessageFile:fail no context");
-        }
+        if (mgr == null) return;  // no context for session
         mgr.chooseMessageFile(optionsJson);
     }
 
     public static void imageChooseImage(int sessionId, String optionsJson) {
         ImageApiManager mgr = getOrCreateImageApiManager(sessionId);
-        if (mgr == null) {
-            throw new RuntimeException("chooseImage:fail no context");
-        }
+        if (mgr == null) return;  // no context for session
         mgr.chooseImage(optionsJson);
     }
 
@@ -1780,17 +1812,19 @@ public final class NativeExports {
             new ConcurrentHashMap<>();
 
     private static ScanCodeManager getOrCreateScanCodeManager(int sessionId) {
-        ScanCodeManager mgr = sScanCodeManagers.get(sessionId);
-        if (mgr != null) return mgr;
-
-        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
-        if (ctx == null) return null;
-        Activity activity = ctx.getActivity();
-        if (activity == null) return null;
-
-        mgr = new ScanCodeManager(sessionId, activity);
-        sScanCodeManagers.put(sessionId, mgr);
-        return mgr;
+        ScanCodeManager existing = sScanCodeManagers.get(sessionId);
+        if (existing != null) return existing;
+        synchronized (sScanCodeLock) {
+            existing = sScanCodeManagers.get(sessionId);
+            if (existing != null) return existing;
+            RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+            if (ctx == null) return null;
+            Activity activity = ctx.getActivity();
+            if (activity == null) return null;
+            ScanCodeManager mgr = new ScanCodeManager(sessionId, activity);
+            sScanCodeManagers.put(sessionId, mgr);
+            return mgr;
+        }
     }
 
     public static void scanCode(int sessionId, String optionsJson) {
@@ -1808,6 +1842,27 @@ public final class NativeExports {
         if (mgr != null) {
             mgr.destroy();
         }
+    }
+
+    // ==================== Session Cleanup ====================
+
+    /**
+     * Destroy all per-session managers. Called from GameSession.close().
+     * This is the single cleanup entry point to prevent resource leaks.
+     *
+     * @param sessionId The session ID
+     */
+    public static void destroyAllManagers(int sessionId) {
+        destroySensorManager(sessionId);
+        destroyNetworkMonitor(sessionId);
+        destroyCaptureObserver(sessionId);
+        destroyRecorderManager(sessionId);
+        destroyCameraManagers(sessionId);
+        destroyKeyboardManager(sessionId);
+        destroyBluetoothManager(sessionId);
+        destroyImageApiManager(sessionId);
+        destroyScanCodeManager(sessionId);
+        unregisterErrorCallback(sessionId);
     }
 
 }

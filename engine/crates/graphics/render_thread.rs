@@ -49,9 +49,7 @@ impl RenderThread {
         let handle = std::thread::Builder::new()
             .name("Migo-RenderThread".into())
             .spawn(move || {
-                #[cfg(target_os = "android")]
-                const EGL_LIB: &str = "libEGL.so";
-                #[cfg(not(target_os = "android"))]
+                // Both Android and non-Android use the same EGL library name.
                 const EGL_LIB: &str = "libEGL.so";
 
                 let mut cm = match CanvasManager::new_with_resource(EGL_LIB, dpi) {

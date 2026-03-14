@@ -77,6 +77,10 @@ public final class CameraManager {
     private ImageReader frameReader;
     private final AtomicBoolean frameListening = new AtomicBoolean(false);
 
+    // Preview surface resources (must be released to avoid native leaks)
+    private SurfaceTexture previewTexture;
+    private android.view.Surface previewSurface;
+
     // Photo capture
     private ImageReader photoReader;
 
@@ -120,6 +124,7 @@ public final class CameraManager {
      */
     public String create(String optionsJson) {
         Log.d(TAG, "create() called with optionsJson: " + optionsJson);
+        cameraOpenCompleteLock.drainPermits(); // Clear any stale permits
         parseOptions(optionsJson);
         Log.d(TAG, "create() parsed options - position: " + position + ", flash: " + flash + ", size: " + sizePreset);
 
@@ -603,6 +608,14 @@ public final class CameraManager {
             } catch (Exception ignored) {}
             captureSession = null;
         }
+        if (previewSurface != null) {
+            previewSurface.release();
+            previewSurface = null;
+        }
+        if (previewTexture != null) {
+            previewTexture.release();
+            previewTexture = null;
+        }
     }
 
     private void startPreviewSession() throws CameraAccessException {
@@ -615,9 +628,16 @@ public final class CameraManager {
         List<android.view.Surface> surfaces = new ArrayList<>();
 
         // Use a dummy SurfaceTexture for preview (we don't render preview on screen)
-        SurfaceTexture texture = new SurfaceTexture(0);
-        texture.setDefaultBufferSize(previewSize.getWidth(), previewSize.getHeight());
-        android.view.Surface previewSurface = new android.view.Surface(texture);
+        // Release previous preview resources if any
+        if (previewSurface != null) {
+            previewSurface.release();
+        }
+        if (previewTexture != null) {
+            previewTexture.release();
+        }
+        previewTexture = new SurfaceTexture(0);
+        previewTexture.setDefaultBufferSize(previewSize.getWidth(), previewSize.getHeight());
+        previewSurface = new android.view.Surface(previewTexture);
         surfaces.add(previewSurface);
         Log.d(TAG, "startPreviewSession() created preview surface");
 

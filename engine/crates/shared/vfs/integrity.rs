@@ -425,14 +425,31 @@ fn normalize_textual_path(path: &Path) -> PathBuf {
 // Standalone hash utilities
 // ---------------------------------------------------------------------------
 
-/// Compute the SHA256 hex digest of a file.
+/// Compute the SHA256 hex digest of a file using streaming reads
+/// to avoid loading the entire file into memory at once.
 pub fn sha256_file(path: &Path) -> EngineResult<String> {
-    let data = std::fs::read(path).map_err(|e| {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).map_err(|e| {
         EngineError::new(ErrorCode::CodeIntegrityFailed)
             .with_msg("read file for hashing")
             .with_detail(format!("{}: {}", path.display(), e))
     })?;
-    Ok(sha256_bytes(&data))
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| {
+            EngineError::new(ErrorCode::CodeIntegrityFailed)
+                .with_msg("read file for hashing")
+                .with_detail(format!("{}: {}", path.display(), e))
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Compute the SHA256 hex digest of a byte slice.

@@ -112,9 +112,15 @@ impl AudioPowerManager {
     /// Returns the new power state.
     pub fn update(&mut self, is_active: bool) -> AudioPowerState {
         if is_active {
-            self.last_active_time = Instant::now();
+            // Don't update last_active_time while active — Instant::now()
+            // is a syscall on some platforms. We only need the timestamp
+            // when transitioning from Active → inactive.
             self.state = AudioPowerState::Active;
         } else {
+            if self.state == AudioPowerState::Active {
+                // Transitioning from Active to inactive — record the time once.
+                self.last_active_time = Instant::now();
+            }
             let idle = self.last_active_time.elapsed();
             self.state = if idle < self.config.idle_timeout {
                 AudioPowerState::LowPower

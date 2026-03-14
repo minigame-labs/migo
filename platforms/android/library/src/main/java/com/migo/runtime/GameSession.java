@@ -2,6 +2,8 @@ package com.migo.runtime;
 
 import android.app.Activity;
 import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
@@ -81,6 +83,7 @@ public final class GameSession implements Closeable {
     private final TouchEventHandler touchHandler;
     private final AudioFocusManager audioFocusManager;
     private final VsyncScheduler vsyncScheduler;
+    private final Handler mainHandler;
     private final Object lock = new Object();
 
     private volatile boolean destroyed = false;
@@ -113,6 +116,7 @@ public final class GameSession implements Closeable {
         this.touchHandler = new TouchEventHandler(config.getDisplayDensity());
         this.audioFocusManager = new AudioFocusManager(sessionId, context);
         this.vsyncScheduler = new VsyncScheduler(sessionId);
+        this.mainHandler = new Handler(Looper.getMainLooper());
 
         // Ensure game directories exist
         this.paths.ensureDirectories();
@@ -285,7 +289,8 @@ public final class GameSession implements Closeable {
      * Pause the game (call when activity goes to background).
      */
     public void pause() {
-        if (!destroyed) {
+        synchronized (lock) {
+            if (destroyed) return;
             vsyncScheduler.stop();
             if (debugOverlay != null) {
                 debugOverlay.stopMonitoring();
@@ -293,9 +298,10 @@ public final class GameSession implements Closeable {
                 debugOverlayAttached = false;
             }
             NativeMethods.onHide(sessionId);
-            if (listener != null) {
-                listener.onPaused();
-            }
+        }
+        GameSessionListener l = listener;
+        if (l != null) {
+            l.onPaused();
         }
     }
 
@@ -303,7 +309,8 @@ public final class GameSession implements Closeable {
      * Resume the game (call when activity comes to foreground).
      */
     public void resume() {
-        if (!destroyed) {
+        synchronized (lock) {
+            if (destroyed) return;
             vsyncScheduler.start();
             if (debugOverlay != null) {
                 debugOverlay.startMonitoring();
@@ -315,9 +322,10 @@ public final class GameSession implements Closeable {
             // Re-request audio focus in case it was permanently lost (e.g.
             // after a phone call). This ensures onAudioInterruptionEnd fires.
             audioFocusManager.requestFocusIfNeeded();
-            if (listener != null) {
-                listener.onResumed();
-            }
+        }
+        GameSessionListener l = listener;
+        if (l != null) {
+            l.onResumed();
         }
     }
 
@@ -325,7 +333,8 @@ public final class GameSession implements Closeable {
      * Restart the game.
      */
     public void restart() {
-        if (!destroyed) {
+        synchronized (lock) {
+            if (destroyed) return;
             NativeMethods.onRestart(sessionId);
         }
     }
@@ -338,16 +347,18 @@ public final class GameSession implements Closeable {
      * @param surface The new Surface object
      */
     public void updateSurface(Surface surface) {
-        ensureNotDestroyed();
         if (surface == null) {
             throw new RuntimeException(ErrorCode.ERR_INVALID_SURFACE);
         }
-        NativeMethods.updateSurface(sessionId, surface);
+        synchronized (lock) {
+            if (destroyed) return;
+            NativeMethods.updateSurface(sessionId, surface);
 
-        // Auto-attach debug overlay as a WindowManager panel on first surface update.
-        // At this point the Activity window is guaranteed to have a valid token.
-        if (debugOverlay != null && !debugOverlayAttached) {
-            tryAttachDebugOverlay();
+            // Auto-attach debug overlay as a WindowManager panel on first surface update.
+            // At this point the Activity window is guaranteed to have a valid token.
+            if (debugOverlay != null && !debugOverlayAttached) {
+                tryAttachDebugOverlay();
+            }
         }
     }
 
@@ -375,28 +386,19 @@ public final class GameSession implements Closeable {
         }
         audioFocusManager.stop();
 
-        // Destroy all per-session managers to release platform resources
-        // (Activity refs, BroadcastReceivers, sensors, camera, etc.)
-        NativeExports.destroyCaptureObserver(sessionId);
-        NativeExports.destroySensorManager(sessionId);
-        NativeExports.destroyNetworkMonitor(sessionId);
-        NativeExports.destroyRecorderManager(sessionId);
-        NativeExports.destroyCameraManagers(sessionId);
-        NativeExports.destroyKeyboardManager(sessionId);
-        NativeExports.destroyBluetoothManager(sessionId);
-        NativeExports.destroyImageApiManager(sessionId);
-        NativeExports.destroyScanCodeManager(sessionId);
-
-        NativeExports.unregisterErrorCallback(sessionId);
+        // Destroy all per-session managers (unified cleanup)
+        NativeExports.destroyAllManagers(sessionId);
         NativeExports.unregisterSession(sessionId);
+
         NativeMethods.shutdown(sessionId);
         RuntimeRegistry.unregister(sessionId);
 
         // Clean up temporary files
         paths.cleanupTemp();
 
-        if (listener != null) {
-            listener.onDestroyed();
+        GameSessionListener l = listener;
+        if (l != null) {
+            l.onDestroyed();
         }
     }
 
@@ -430,7 +432,8 @@ public final class GameSession implements Closeable {
      *              TRIM_MEMORY_RUNNING_CRITICAL=15)
      */
     public void dispatchMemoryWarning(int level) {
-        if (!destroyed) {
+        synchronized (lock) {
+            if (destroyed) return;
             NativeMethods.onMemoryWarning(sessionId, level);
         }
     }
@@ -444,11 +447,12 @@ public final class GameSession implements Closeable {
      * @return true if the event was handled
      */
     public boolean dispatchTouchEvent(MotionEvent event) {
-        if (destroyed || event == null) {
-            return false;
+        if (event == null) return false;
+        synchronized (lock) {
+            if (destroyed) return false;
+            touchHandler.dispatch(sessionId, event);
+            return true;
         }
-        touchHandler.dispatch(sessionId, event);
-        return true;
     }
 
     // ==================== Callback ====================
@@ -464,29 +468,49 @@ public final class GameSession implements Closeable {
 
     // ==================== Internal callbacks from native ====================
 
-    /** @hide Called from native code via NativeExports.onGameReady */
+    /**
+     * @hide Called from native code via NativeExports.onGameReady (potentially from a non-UI thread).
+     * Records startup timing, updates the debug overlay, then posts the listener
+     * callback to the main thread with double-check to handle session destruction
+     * between post and dispatch.
+     */
     public void notifyGameReady() {
         startupTimeMs = (System.nanoTime() - creationNanos) / 1_000_000;
         if (debugOverlay != null) {
             debugOverlay.setStartupTimeMs(startupTimeMs);
         }
-        if (listener != null) {
-            listener.onGameReady();
-        }
+        GameSessionListener l = listener;
+        if (l == null) return;
+        mainHandler.post(() -> {
+            GameSessionListener l2 = listener;
+            if (l2 != null && !destroyed) {
+                l2.onGameReady();
+            }
+        });
     }
 
-    /** @hide Called from native code */
+    /** @hide Called from native code (potentially from a non-UI thread). */
     void notifyGameExit(int exitCode) {
-        if (listener != null) {
-            listener.onGameExit(exitCode);
-        }
+        GameSessionListener l = listener;
+        if (l == null) return;
+        mainHandler.post(() -> {
+            GameSessionListener l2 = listener;
+            if (l2 != null) {
+                l2.onGameExit(exitCode);
+            }
+        });
     }
 
-    /** @hide Called from native code */
+    /** @hide Called from native code (potentially from a non-UI thread). */
     void notifyError(int errorCode, String message, boolean recoverable) {
-        if (listener != null) {
-            listener.onError(errorCode, message, recoverable);
-        }
+        GameSessionListener l = listener;
+        if (l == null) return;
+        mainHandler.post(() -> {
+            GameSessionListener l2 = listener;
+            if (l2 != null) {
+                l2.onError(errorCode, message, recoverable);
+            }
+        });
     }
 
     // ==================== Helpers ====================

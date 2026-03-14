@@ -10,12 +10,14 @@ path = "lib.rs"
 default = ["v8-limits", "code-signing"]
 v8-limits = ["shared/v8-limits"]
 code-signing = ["shared/code-signing"]
+# Gate the image crate behind a feature flag — js-runtime does not use it directly.
+# Image decoding is handled by the `io` crate (which has its own `rust-image-decode` feature).
+rust-image-decode = ["dep:image"]
 
 [dependencies]
 deno_core.workspace=true
 # Only enable tokio features actually needed (not "full")
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "rt-multi-thread", "net"] }
-femtovg = { workspace = true }
 tracing = { workspace = true }
 shared = {path = "../shared"}
 serde.workspace = true
@@ -28,7 +30,7 @@ crossbeam-channel.workspace = true
 deno_error.workspace = true
 glow.workspace = true
 bytemuck.workspace = true
-image.workspace = true
+image = { workspace = true, optional = true }
 once_cell.workspace = true
 tokio-tungstenite.workspace = true
 futures.workspace = true

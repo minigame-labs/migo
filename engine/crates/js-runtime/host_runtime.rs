@@ -448,7 +448,8 @@ impl HostJsRuntime {
     /// so run_event_loop() would block forever once the RAF loop is active.
     /// The main tokio::select! loop in thread.rs continuously drives the event
     /// loop, handling any resulting microtasks, promises, or timers.
-    pub fn exec_script(&mut self, name: &'static str, source: String) -> EngineResult<()> {
+    pub fn exec_script(&mut self, name: &'static str, source: &str) -> EngineResult<()> {
+        let source = deno_core::FastString::from(source.to_string());
         self.rt.execute_script(name, source).map_err(|e| {
             EngineError::new(ErrorCode::JsException)
                 .with_msg(name)
@@ -553,10 +554,21 @@ impl HostJsRuntime {
         );
 
         let evaluation = self.rt.mod_evaluate(module_id);
-        if let Err(e) = evaluation.await {
-            return Err(EngineError::new(ErrorCode::ModuleLoadError)
-                .with_msg("load main es module")
-                .with_detail(e.to_string()));
+        tokio::select! {
+            result = evaluation => {
+                if let Err(e) = result {
+                    return Err(EngineError::new(ErrorCode::ModuleLoadError)
+                        .with_msg("load main es module")
+                        .with_detail(e.to_string()));
+                }
+            }
+            result = self.rt.run_event_loop(PollEventLoopOptions::default()) => {
+                if let Err(e) = result {
+                    return Err(EngineError::new(ErrorCode::JsException)
+                        .with_msg("event loop error during module evaluation")
+                        .with_detail(e.to_string()));
+                }
+            }
         }
         tracing::info!(
             "[Host {}] module evaluated: {:.1}ms (total evaluate_module={:.1}ms)",

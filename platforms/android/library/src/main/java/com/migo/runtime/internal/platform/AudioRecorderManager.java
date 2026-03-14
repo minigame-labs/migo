@@ -220,8 +220,7 @@ public final class AudioRecorderManager {
                     + " format=" + format + " sampleRate=" + sampleRate
                     + " channels=" + numberOfChannels + " bitRate=" + encodeBitRate);
             Log.d(TAG, "RECORD_AUDIO permission: "
-                    + (activity.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
-                        == android.content.pm.PackageManager.PERMISSION_GRANTED ? "GRANTED" : "DENIED"));
+                    + (Permissions.isGranted(activity, Permissions.RECORD_AUDIO) ? "GRANTED" : "DENIED"));
 
             mediaRecorder = new MediaRecorder();
             mediaRecorder.setAudioSource(source);
@@ -265,8 +264,7 @@ public final class AudioRecorderManager {
                 + " sampleRate=" + sampleRate + " channels=" + numberOfChannels
                 + " minBufSize=" + minBufSize + " frameSize=" + frameSize);
         Log.d(TAG, "RECORD_AUDIO permission: "
-                + (activity.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
-                    == android.content.pm.PackageManager.PERMISSION_GRANTED ? "GRANTED" : "DENIED"));
+                + (Permissions.isGranted(activity, Permissions.RECORD_AUDIO) ? "GRANTED" : "DENIED"));
 
         if (minBufSize == AudioRecord.ERROR_BAD_VALUE || minBufSize == AudioRecord.ERROR) {
             fireEvent("error", "{\"errMsg\":\"recorderManager.start:fail invalid audio parameters\"}");
@@ -364,8 +362,7 @@ public final class AudioRecorderManager {
                     + " channels=" + numberOfChannels + " bitRate=" + encodeBitRate
                     + " frameSize=" + frameSize);
             Log.d(TAG, "RECORD_AUDIO permission: "
-                    + (activity.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
-                        == android.content.pm.PackageManager.PERMISSION_GRANTED ? "GRANTED" : "DENIED"));
+                    + (Permissions.isGranted(activity, Permissions.RECORD_AUDIO) ? "GRANTED" : "DENIED"));
 
             mediaRecorder = new MediaRecorder();
             mediaRecorder.setAudioSource(source);

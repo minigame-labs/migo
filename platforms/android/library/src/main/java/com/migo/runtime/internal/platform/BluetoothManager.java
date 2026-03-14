@@ -22,6 +22,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -36,11 +37,11 @@ public class BluetoothManager {
     private static final String TAG = "BluetoothManager";
 
     private final int sessionId;
-    private final Activity activity;
+    private final WeakReference<Activity> activityRef;
     private final BluetoothAdapter adapter;
 
     private boolean adapterOpened = false;
-    private boolean discovering = false;
+    private volatile boolean discovering = false;
 
     /** Discovered devices keyed by address. */
     private final ConcurrentHashMap<String, JSONObject> discoveredDevices = new ConcurrentHashMap<>();
@@ -51,8 +52,21 @@ public class BluetoothManager {
 
     public BluetoothManager(int sessionId, Activity activity) {
         this.sessionId = sessionId;
-        this.activity = activity;
-        this.adapter = BluetoothAdapter.getDefaultAdapter();
+        this.activityRef = new WeakReference<>(activity);
+        this.adapter = getAdapter(activity);
+    }
+
+    private Activity getActivity() {
+        return activityRef.get();
+    }
+
+    private static BluetoothAdapter getAdapter(Context context) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            android.bluetooth.BluetoothManager bm = (android.bluetooth.BluetoothManager)
+                    context.getSystemService(Context.BLUETOOTH_SERVICE);
+            return bm != null ? bm.getAdapter() : null;
+        }
+        return BluetoothAdapter.getDefaultAdapter();
     }
 
     // ==================== Adapter ====================
@@ -250,7 +264,7 @@ public class BluetoothManager {
     // Beacon discovery reuses BLE scanning with iBeacon/Eddystone parsing.
     // For simplicity, we use a separate flag and parse manufacturer data.
 
-    private boolean beaconDiscovering = false;
+    private volatile boolean beaconDiscovering = false;
     private BluetoothLeScanner beaconScanner;
     private ScanCallback beaconScanCallback;
     private final ConcurrentHashMap<String, JSONObject> discoveredBeacons = new ConcurrentHashMap<>();
@@ -440,6 +454,8 @@ public class BluetoothManager {
 
     private void registerAdapterStateReceiver() {
         if (adapterStateReceiver != null) return;
+        Activity activity = getActivity();
+        if (activity == null) return;
         adapterStateReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
@@ -460,9 +476,12 @@ public class BluetoothManager {
 
     private void unregisterAdapterStateReceiver() {
         if (adapterStateReceiver != null) {
-            try {
-                activity.unregisterReceiver(adapterStateReceiver);
-            } catch (Exception ignored) {}
+            Activity activity = getActivity();
+            if (activity != null) {
+                try {
+                    activity.unregisterReceiver(adapterStateReceiver);
+                } catch (Exception ignored) {}
+            }
             adapterStateReceiver = null;
         }
     }

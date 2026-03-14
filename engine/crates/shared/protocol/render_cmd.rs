@@ -1,6 +1,7 @@
 use crossbeam_channel::Sender;
-use femtovg::Color;
 use tokio::sync::oneshot;
+
+pub use crate::protocol::color::Color;
 
 use crate::error::{EngineError, ErrorCode};
 use crate::protocol::io_cmd::NormalizedImage;

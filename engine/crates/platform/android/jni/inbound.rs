@@ -1,6 +1,27 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
+/// Escape a string for safe interpolation into a JS single-quoted string literal.
+/// Handles all characters that could break out of the string or inject code.
+fn escape_for_js_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -505,7 +526,7 @@ pub(crate) extern "system" fn onCompassChange<'local>(
     let acc = env
         .get_string(&accuracy)
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "unknow".to_string());
+        .unwrap_or_else(|_| "unknown".to_string());
     let _ = send_command_to_host(
         host_id,
         HostCommand::OnCompassChange {
@@ -842,8 +863,7 @@ pub(crate) extern "system" fn onChooseImageResult<'local>(
         .get_string(&result_json)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
-    // Escape for JS string literal
-    let escaped = json.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n").replace('\r', "\\r");
+    let escaped = escape_for_js_string(&json);
     let cmd = HostCommand::EvalScript {
         source: format!("_internalOnChooseImageResult('{}');", escaped),
     };
@@ -860,7 +880,7 @@ pub(crate) extern "system" fn onChooseMessageFileResult<'local>(
         .get_string(&result_json)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
-    let escaped = json.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n").replace('\r', "\\r");
+    let escaped = escape_for_js_string(&json);
     let cmd = HostCommand::EvalScript {
         source: format!("_internalOnChooseMessageFileResult('{}');", escaped),
     };
@@ -879,7 +899,7 @@ pub(crate) extern "system" fn onLocationResult<'local>(
         .get_string(&result_json)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
-    let escaped = json.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n").replace('\r', "\\r");
+    let escaped = escape_for_js_string(&json);
     let cmd = HostCommand::EvalScript {
         source: format!("_internalOnLocationResult('{}');", escaped),
     };
@@ -896,7 +916,7 @@ pub(crate) extern "system" fn onFuzzyLocationResult<'local>(
         .get_string(&result_json)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
-    let escaped = json.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n").replace('\r', "\\r");
+    let escaped = escape_for_js_string(&json);
     let cmd = HostCommand::EvalScript {
         source: format!("_internalOnFuzzyLocationResult('{}');", escaped),
     };

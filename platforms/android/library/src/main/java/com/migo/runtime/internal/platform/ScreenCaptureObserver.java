@@ -133,8 +133,20 @@ public final class ScreenCaptureObserver {
     private boolean isScreenshotUri(Uri uri) {
         Cursor cursor = null;
         try {
-            cursor = contentResolver.query(uri, PROJECTION, null, null, null);
+            // Sort by DATE_ADDED DESC and limit to 1 to get the most recent image
+            String sortOrder = MediaStore.Images.Media.DATE_ADDED + " DESC LIMIT 1";
+            cursor = contentResolver.query(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    PROJECTION, null, null, sortOrder);
             if (cursor != null && cursor.moveToFirst()) {
+                // Verify the image was added recently (within the last few seconds)
+                int dateIdx = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED);
+                long dateAdded = cursor.getLong(dateIdx);
+                long nowSeconds = System.currentTimeMillis() / 1000;
+                if (Math.abs(nowSeconds - dateAdded) > 5) {
+                    return false;
+                }
+
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     String displayName = cursor.getString(
                             cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME));

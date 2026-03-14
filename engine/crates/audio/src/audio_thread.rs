@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -6,11 +7,34 @@ use shared::channel::ThreadWakeup;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::audio_cmd::{
     AudioBufferInfo, AudioCmd, AudioContextId, AudioContextState, AudioNodeId,
-    InnerAudioId, InnerAudioInfo, InnerAudioState,
+    AudioResp, InnerAudioId, InnerAudioInfo, InnerAudioState,
 };
 use shared::protocol::host_cmd::HostCommand;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{error, info};
+
+use crate::decoder::DecodedAudio;
+
+/// Result of an off-thread decode+resample operation.
+///
+/// The heavy work (decoding compressed audio, resampling) runs on a
+/// short-lived `std::thread`. When finished, the result is sent back
+/// to the audio loop via a [`std_mpsc::Receiver`] so the audio thread
+/// can integrate it without blocking.
+enum DecodeResult {
+    /// Completed decode for `AudioCmd::DecodeAudioData`.
+    AudioBuffer {
+        ctx_id: AudioContextId,
+        result: EngineResult<DecodedAudio>,
+        resp: AudioResp<AudioBufferInfo>,
+    },
+    /// Completed decode for `AudioCmd::InnerAudioLoad`.
+    InnerAudio {
+        id: InnerAudioId,
+        result: EngineResult<DecodedAudio>,
+        resp: AudioResp<InnerAudioInfo>,
+    },
+}
 
 use crate::cache::GlobalAudioCache;
 use crate::context::AudioContext;
@@ -46,7 +70,6 @@ impl NodeContextIndex {
     }
 
     #[inline]
-    #[allow(dead_code)]
     fn unregister(&mut self, node_id: AudioNodeId) {
         self.node_to_ctx.remove(&node_id);
     }
@@ -272,6 +295,11 @@ fn run_audio_thread(
     // Global audio cache (64MB default)
     let audio_cache = GlobalAudioCache::new();
 
+    // Channel for receiving decode+resample results from worker threads.
+    // Decode operations are offloaded to short-lived std::threads so they
+    // don't block the audio loop and cause audible glitches.
+    let (decode_tx, decode_rx) = std_mpsc::channel::<DecodeResult>();
+
     // Audio processing buffer - dynamically sized based on sample rate
     let process_frames = calculate_process_frames(sample_rate);
     let buffer_size = process_frames * channels as usize;
@@ -385,33 +413,30 @@ fn run_audio_thread(
                 }
 
                 AudioCmd::DecodeAudioData { ctx_id, data, resp } => {
-                    if let Some(ctx) = contexts.get_mut(&ctx_id) {
-                        match decoder::decode(&data) {
-                            Ok(decoded) => {
-                                // Resample to output device sample rate if needed
-                                match resampler::resample_if_needed(decoded, sample_rate) {
-                                    Ok(resampled) => {
-                                        let duration = resampled.duration();
-                                        let sr = resampled.sample_rate;
-                                        let ch = resampled.channels;
-                                        let length = resampled.frame_count() as u32;
-                                        let id = ctx.add_buffer(resampled);
-                                        let _ = resp.send(Ok(AudioBufferInfo {
-                                            id,
-                                            duration,
-                                            sample_rate: sr,
-                                            channels: ch,
-                                            length,
-                                        }));
-                                    }
-                                    Err(e) => {
-                                        let _ = resp.send(Err(e));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = resp.send(Err(e));
-                            }
+                    if contexts.contains_key(&ctx_id) {
+                        // Offload decode+resample to a worker thread so we
+                        // don't block audio processing on large files.
+                        let tx = decode_tx.clone();
+                        let sr = sample_rate;
+                        if let Err(e) = thread::Builder::new()
+                            .name("audio-decode".into())
+                            .spawn(move || {
+                                let result = decoder::decode(&data).and_then(
+                                    |decoded| resampler::resample_if_needed(decoded, sr),
+                                );
+                                // If the audio thread has already shut down the
+                                // receiver is dropped — that's fine, just exit.
+                                let _ = tx.send(DecodeResult::AudioBuffer {
+                                    ctx_id,
+                                    result,
+                                    resp,
+                                });
+                            })
+                        {
+                            // spawn failed — resp was consumed by the closure
+                            // which is now dropped, so the caller's oneshot
+                            // receiver will observe a channel-closed error.
+                            error!("Failed to spawn decode thread: {}", e);
                         }
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(
@@ -505,6 +530,9 @@ fn run_audio_thread(
                         .unwrap_or(false);
 
                     if found {
+                        // BufferSourceNodes are one-shot per Web Audio spec;
+                        // unregister from the index to prevent unbounded growth.
+                        node_index.unregister(node_id);
                         let _ = resp.send(Ok(()));
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(
@@ -611,6 +639,8 @@ fn run_audio_thread(
                             });
                         }
                     }
+                    // OscillatorNodes are one-shot; unregister to prevent unbounded growth.
+                    node_index.unregister(node_id);
                 }
 
                 AudioCmd::CreateDelay { ctx_id, node_id, max_delay_time } => {
@@ -818,6 +848,8 @@ fn run_audio_thread(
                             });
                         }
                     }
+                    // ConstantSourceNodes are one-shot; unregister to prevent unbounded growth.
+                    node_index.unregister(node_id);
                 }
 
                 AudioCmd::CreateIIRFilter { ctx_id, node_id, feedforward, feedback } => {
@@ -1104,28 +1136,25 @@ fn run_audio_thread(
                 }
 
                 AudioCmd::InnerAudioLoad { id, data, resp } => {
-                    if let Some(player) = inner_players.get_mut(&id) {
-                        match decoder::decode(&data) {
-                            Ok(decoded) => {
-                                // Resample to output device sample rate if needed
-                                match resampler::resample_if_needed(decoded, sample_rate) {
-                                    Ok(resampled) => {
-                                        let info = InnerAudioInfo {
-                                            duration: resampled.duration(),
-                                            sample_rate: resampled.sample_rate,
-                                            channels: resampled.channels,
-                                        };
-                                        player.load_audio(resampled);
-                                        let _ = resp.send(Ok(info));
-                                    }
-                                    Err(e) => {
-                                        let _ = resp.send(Err(e));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = resp.send(Err(e));
-                            }
+                    if inner_players.contains_key(&id) {
+                        // Offload decode+resample to a worker thread so we
+                        // don't block audio processing on large files.
+                        let tx = decode_tx.clone();
+                        let sr = sample_rate;
+                        if let Err(e) = thread::Builder::new()
+                            .name("audio-decode".into())
+                            .spawn(move || {
+                                let result = decoder::decode(&data).and_then(
+                                    |decoded| resampler::resample_if_needed(decoded, sr),
+                                );
+                                let _ = tx.send(DecodeResult::InnerAudio {
+                                    id,
+                                    result,
+                                    resp,
+                                });
+                            })
+                        {
+                            error!("Failed to spawn decode thread: {}", e);
                         }
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(
@@ -1251,6 +1280,69 @@ fn run_audio_thread(
         }
 
         // -----------------------------------------------------------------
+        // 1b. Drain completed decode results (non-blocking).
+        //     Worker threads send decoded audio back here so we can
+        //     integrate the buffers without blocking the audio loop.
+        // -----------------------------------------------------------------
+        while let Ok(result) = decode_rx.try_recv() {
+            match result {
+                DecodeResult::AudioBuffer { ctx_id, result, resp } => {
+                    match result {
+                        Ok(resampled) => {
+                            if let Some(ctx) = contexts.get_mut(&ctx_id) {
+                                let duration = resampled.duration();
+                                let sr = resampled.sample_rate;
+                                let ch = resampled.channels;
+                                let length = resampled.frame_count() as u32;
+                                let id = ctx.add_buffer(resampled);
+                                let _ = resp.send(Ok(AudioBufferInfo {
+                                    id,
+                                    duration,
+                                    sample_rate: sr,
+                                    channels: ch,
+                                    length,
+                                }));
+                            } else {
+                                // Context was closed while decode was in flight.
+                                let _ = resp.send(Err(EngineError::from_detail(
+                                    ErrorCode::NotFound,
+                                    format!("AudioContext {} closed during decode", ctx_id),
+                                )));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = resp.send(Err(e));
+                        }
+                    }
+                }
+                DecodeResult::InnerAudio { id, result, resp } => {
+                    match result {
+                        Ok(resampled) => {
+                            if let Some(player) = inner_players.get_mut(&id) {
+                                let info = InnerAudioInfo {
+                                    duration: resampled.duration(),
+                                    sample_rate: resampled.sample_rate,
+                                    channels: resampled.channels,
+                                };
+                                player.load_audio(resampled);
+                                let _ = resp.send(Ok(info));
+                            } else {
+                                // Player was destroyed while decode was in flight.
+                                let _ = resp.send(Err(EngineError::from_detail(
+                                    ErrorCode::NotFound,
+                                    format!("InnerAudioContext {} destroyed during decode", id),
+                                )));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = resp.send(Err(e));
+                        }
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
         // 2. When paused (app in background), deep-sleep on condvar.
         //    Commands are still processed on wake.
         // -----------------------------------------------------------------
@@ -1260,7 +1352,10 @@ fn run_audio_thread(
         }
 
         // -----------------------------------------------------------------
-        // 3. Poll streaming data for all players and cache completions.
+        // 3. Poll streaming data, cache completions, and push events.
+        //    Combined into a single pass to avoid iterating inner_players
+        //    twice (steps 3+4 merged). Step 7 (audio processing) remains
+        //    separate because it runs conditionally inside a nested loop.
         // -----------------------------------------------------------------
         for player in inner_players.values_mut() {
             player.poll_stream();
@@ -1275,22 +1370,25 @@ fn run_audio_thread(
                     }
                 }
             }
-        }
 
-        // -----------------------------------------------------------------
-        // 4. Push player events to the host thread.
-        // -----------------------------------------------------------------
-        for player in inner_players.values_mut() {
+            // Push player events to the host thread
             for event in player.take_events() {
                 tracing::trace!(
                     "Pushing InnerAudio event: id={}, type={:?}, time={:.2}s",
                     event.id, event.event_type, event.current_time
                 );
-                let _ = host_tx.try_send(HostCommand::InnerAudioEvent {
+                let ev_id = event.id;
+                let ev_type = event.event_type;
+                if let Err(e) = host_tx.try_send(HostCommand::InnerAudioEvent {
                     id: event.id,
                     event_type: event.event_type,
                     current_time: event.current_time,
-                });
+                }) {
+                    tracing::warn!(
+                        "Failed to send audio event (id={}, type={:?}): {}",
+                        ev_id, ev_type, e
+                    );
+                }
             }
         }
 

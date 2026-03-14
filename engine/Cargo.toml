@@ -17,7 +17,9 @@ tokio = { version = "1.46.1", default-features = false }
 futures = "0.3.31"
 serde = { version = "1.0.219", features = ["rc"] }
 reqwest = { version = "=0.12.4", default-features = false, features = ["rustls-tls", "stream", "http2", "multipart"] }
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# Use native-roots instead of webpki-roots to avoid bundling Mozilla's ~100KB root cert list.
+# reqwest's rustls-tls already bundles webpki-roots; for websocket we can use the OS cert store.
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 thiserror = "2.0.12"
 http = "1.0"
 data-url = "=0.3.1"

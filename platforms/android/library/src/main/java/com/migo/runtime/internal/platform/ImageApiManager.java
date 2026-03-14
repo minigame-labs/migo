@@ -718,10 +718,35 @@ public class ImageApiManager {
         // Local file path
         File f = new File(url);
         if (f.exists()) {
-            return Uri.fromFile(f);
+            return getFileUri(f);
         }
         // Treat as a URL (http/https)
         return Uri.parse(url);
+    }
+
+    /**
+     * Get a URI for a local file that is safe to pass to external apps.
+     * On API 24+, file:// URIs cause FileUriExposedException, so we use
+     * MediaStore to obtain a content:// URI instead.
+     */
+    private Uri getFileUri(File file) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Images.Media.DATA, file.getAbsolutePath());
+                values.put(MediaStore.Images.Media.MIME_TYPE, "image/*");
+                Uri uri = activity.getContentResolver().insert(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                if (uri != null) {
+                    return uri;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "getFileUri: MediaStore insert failed, falling back to file URI", e);
+            }
+            // Fallback: wrap in try-catch at the call site
+            return Uri.fromFile(file);
+        }
+        return Uri.fromFile(file);
     }
 
     private int calculateInSampleSize(int srcW, int srcH, int reqW, int reqH) {

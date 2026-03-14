@@ -107,14 +107,6 @@ pub fn spawn_host_thread(
                         tokio::select! {
                             biased;
 
-                            maybe_msg = host_rx.recv() => {
-                                match maybe_msg {
-                                    Some(HostCommand::Shutdown) => break 'outer,
-                                    Some(msg) => host.handle_command(msg).await,
-                                    None => break 'outer,
-                                }
-                            }
-
                             host_event = host.js.run_event_loop(poll) => {
                                 if let Err(e) = host_event {
                                     // Check if this was a watchdog/OOM termination
@@ -173,6 +165,14 @@ pub fn spawn_host_thread(
                                         }
                                         None => break 'outer,
                                     }
+                                }
+                            }
+
+                            maybe_msg = host_rx.recv() => {
+                                match maybe_msg {
+                                    Some(HostCommand::Shutdown) => break 'outer,
+                                    Some(msg) => host.handle_command(msg).await,
+                                    None => break 'outer,
                                 }
                             }
 

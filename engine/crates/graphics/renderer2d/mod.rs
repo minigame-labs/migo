@@ -4,7 +4,14 @@ use femtovg::{
     renderer::OpenGl, Canvas as FvCanvas, Color, FontId, ImageId, LineCap, LineJoin, Paint, Path,
     Transform2D,
 };
+use shared::protocol::color::Color as SharedColor;
 use shared::protocol::render_cmd::{TextAlign, TextBaseline, TextMetrics};
+
+/// Convert a shared protocol `Color` to femtovg's `Color`.
+#[inline]
+fn to_fv_color(c: SharedColor) -> Color {
+    Color::rgbaf(c.r, c.g, c.b, c.a)
+}
 
 mod font;
 mod handler;
@@ -156,8 +163,8 @@ impl Canvas2DContext {
     }
 
     // ========== Style setters ==========
-    pub fn set_fill_style_color(&mut self, color: Color) { self.state.fill_style = FillStyleKind::Color(color); }
-    pub fn set_stroke_style_color(&mut self, color: Color) { self.state.stroke_style = color; }
+    pub fn set_fill_style_color(&mut self, color: SharedColor) { self.state.fill_style = FillStyleKind::Color(to_fv_color(color)); }
+    pub fn set_stroke_style_color(&mut self, color: SharedColor) { self.state.stroke_style = to_fv_color(color); }
     pub fn set_line_width(&mut self, w: f32) { self.state.line_width = w.max(0.0); }
     pub fn set_line_cap(&mut self, cap: u8) {
         self.state.line_cap = match cap { 1 => CanvasLineCap::Round, 2 => CanvasLineCap::Square, _ => CanvasLineCap::Butt };
