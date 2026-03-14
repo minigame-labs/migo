@@ -148,6 +148,12 @@ public class DebugOverlayView extends LinearLayout {
     // ==================== Touch / Drag ====================
 
     @Override
+    public boolean onInterceptTouchEvent(MotionEvent ev) {
+        // Intercept all touches so child TextViews don't consume them
+        return true;
+    }
+
+    @Override
     public boolean onTouchEvent(MotionEvent event) {
         if (wmParams == null) return super.onTouchEvent(event);
 

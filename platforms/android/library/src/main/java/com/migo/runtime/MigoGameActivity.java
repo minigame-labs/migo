@@ -263,17 +263,6 @@ public class MigoGameActivity extends Activity
             session.setListener(listener);
         }
 
-        // Add debug overlay
-        DebugOverlayView overlay = session.getDebugOverlay();
-        if (overlay != null) {
-            FrameLayout root = (FrameLayout) surfaceView.getParent();
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT);
-            lp.gravity = Gravity.TOP | Gravity.END;
-            root.addView(overlay, lp);
-        }
-
         // Start the game
         int startResult = session.startGameSafe(entryPoint);
         if (startResult != ErrorCode.SUCCESS) {

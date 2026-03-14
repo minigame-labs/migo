@@ -196,15 +196,6 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
             session.setListener(gameListener);
         }
 
-        // Add debug overlay if enabled
-        DebugOverlayView overlay = session.getDebugOverlay();
-        if (overlay != null) {
-            LayoutParams lp = new LayoutParams(
-                    LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT);
-            lp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
-            addView(overlay, lp);
-        }
-
         session.startGame(pendingEntryPoint);
     }
 
