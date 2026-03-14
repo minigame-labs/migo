@@ -1,13 +1,16 @@
 package com.migo.runtime;
 
+import android.app.Activity;
 import android.content.Context;
 import android.view.MotionEvent;
 import android.view.Surface;
+import android.view.View;
 
 import com.migo.runtime.callback.GameSessionListener;
 import com.migo.runtime.internal.NativeExports;
 import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.RuntimeContext;
 import com.migo.runtime.internal.RuntimeRegistry;
 import com.migo.runtime.internal.TouchEventHandler;
 import com.migo.runtime.internal.VsyncScheduler;
@@ -87,6 +90,7 @@ public final class GameSession implements Closeable {
     private volatile long startupTimeMs = -1;
 
     private DebugOverlayView debugOverlay;
+    private boolean debugOverlayAttached = false;
 
     // Callback
     private volatile GameSessionListener listener;
@@ -198,16 +202,9 @@ public final class GameSession implements Closeable {
     /**
      * Get the debug overlay view, if debug mode is enabled.
      * <p>
-     * The host app should add this view to its layout for FPS monitoring:
-     * <pre>{@code
-     * DebugOverlayView overlay = session.getDebugOverlay();
-     * if (overlay != null) {
-     *     FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-     *         WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP | Gravity.END);
-     *     lp.setMargins(0, statusBarHeight, dp(8), 0);
-     *     rootLayout.addView(overlay, lp);
-     * }
-     * }</pre>
+     * The overlay is automatically attached as a WindowManager panel on the
+     * first {@link #updateSurface} call, floating above the game SurfaceView.
+     * No manual {@code addView()} is needed.
      *
      * @return The debug overlay view, or null if debug mode is disabled
      */
@@ -292,6 +289,8 @@ public final class GameSession implements Closeable {
             vsyncScheduler.stop();
             if (debugOverlay != null) {
                 debugOverlay.stopMonitoring();
+                debugOverlay.detachFromWindow();
+                debugOverlayAttached = false;
             }
             NativeMethods.onHide(sessionId);
             if (listener != null) {
@@ -308,6 +307,9 @@ public final class GameSession implements Closeable {
             vsyncScheduler.start();
             if (debugOverlay != null) {
                 debugOverlay.startMonitoring();
+                if (!debugOverlayAttached) {
+                    tryAttachDebugOverlay();
+                }
             }
             NativeMethods.onShow(sessionId);
             // Re-request audio focus in case it was permanently lost (e.g.
@@ -341,6 +343,12 @@ public final class GameSession implements Closeable {
             throw new RuntimeException(ErrorCode.ERR_INVALID_SURFACE);
         }
         NativeMethods.updateSurface(sessionId, surface);
+
+        // Auto-attach debug overlay as a WindowManager panel on first surface update.
+        // At this point the Activity window is guaranteed to have a valid token.
+        if (debugOverlay != null && !debugOverlayAttached) {
+            tryAttachDebugOverlay();
+        }
     }
 
     /**
@@ -363,6 +371,7 @@ public final class GameSession implements Closeable {
         vsyncScheduler.stop();
         if (debugOverlay != null) {
             debugOverlay.stopMonitoring();
+            debugOverlay.detachFromWindow();
         }
         audioFocusManager.stop();
 
@@ -481,6 +490,17 @@ public final class GameSession implements Closeable {
     }
 
     // ==================== Helpers ====================
+
+    private void tryAttachDebugOverlay() {
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) return;
+        Activity activity = ctx.getActivity();
+        if (activity == null || activity.isFinishing()) return;
+        View decor = activity.getWindow().getDecorView();
+        if (decor.getWindowToken() == null) return;
+        debugOverlay.attachToWindow(decor);
+        debugOverlayAttached = true;
+    }
 
     private void ensureNotDestroyed() {
         if (destroyed) {

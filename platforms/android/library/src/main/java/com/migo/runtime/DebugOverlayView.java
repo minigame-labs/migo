@@ -1,6 +1,7 @@
 package com.migo.runtime;
 
 import android.content.Context;
+import android.graphics.PixelFormat;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Debug;
@@ -9,7 +10,12 @@ import android.os.Looper;
 import android.os.Process;
 import android.os.SystemClock;
 import android.util.TypedValue;
-import android.widget.FrameLayout;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.ViewConfiguration;
+import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -22,27 +28,26 @@ import java.nio.ByteOrder;
 
 /**
  * Semi-transparent debug overlay that displays real-time engine statistics.
- *
- * <h3>Layout</h3>
- * <pre>
- *  59.8 FPS  16.7ms  D:0
- *  Startup: 342ms  1st: 156ms
- *  Mem: 87MB (N:62 J:25)
- *  CPU: 12.3%
- * </pre>
+ * <p>
+ * Uses a separate {@link WindowManager} panel so it is always rendered above
+ * the game SurfaceView, regardless of Z-order or elevation.
  *
  * @since 1.0.0
  */
-public class DebugOverlayView extends FrameLayout {
+public class DebugOverlayView extends LinearLayout {
 
-    private static final int BG_COLOR = 0xCC1A1A2E;
-    private static final int TEXT_COLOR = 0xFFE0E0E0;
-    private static final int ACCENT_COLOR = 0xFF4FC3F7;  // light blue for labels
-    private static final int WARN_COLOR = 0xFFFF9800;
-    private static final float TEXT_SIZE_SP = 10.5f;
+    private static final int BG_COLOR      = 0xCC1B1B1B; // 80% dark
+    private static final int TEXT_COLOR     = 0xFFE0E0E0; // Grey 300
+    private static final int LABEL_COLOR   = 0xFF90A4AE; // Blue Grey 300
+    private static final int ACCENT_COLOR  = 0xFF64B5F6; // Blue 300
+    private static final int WARN_COLOR    = 0xFFFFB74D; // Orange 300
+    private static final int ERROR_COLOR   = 0xFFEF5350; // Red 400
+
+    private static final float TEXT_SIZE_SP   = 11f;
     private static final int CORNER_RADIUS_DP = 6;
-    private static final int PADDING_H_DP = 8;
-    private static final int PADDING_V_DP = 5;
+    private static final int PADDING_H_DP     = 10;
+    private static final int PADDING_V_DP     = 6;
+    private static final int ROW_SPACING_DP   = 1;
     private static final int DEFAULT_UPDATE_INTERVAL_MS = 500;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -66,43 +71,150 @@ public class DebugOverlayView extends FrameLayout {
     private long prevCpuTime = -1;
     private long prevUptime = -1;
 
+    // Drag support — all coordinates in screen space
+    private float downRawX, downRawY;
+    private int downX, downY;          // WindowManager LayoutParams x/y at touch-down
+    private boolean isDragging = false;
+    private int touchSlop;
+
+    // WindowManager panel hosting
+    private WindowManager wm;
+    private WindowManager.LayoutParams wmParams;
+    private boolean attached = false;
+
     public DebugOverlayView(Context context, int sessionId) {
         super(context);
         this.sessionId = sessionId;
-
-        LinearLayout container = new LinearLayout(context);
-        container.setOrientation(LinearLayout.VERTICAL);
+        this.touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
+        setOrientation(VERTICAL);
 
         int padH = dpToPx(PADDING_H_DP);
         int padV = dpToPx(PADDING_V_DP);
-        container.setPadding(padH, padV, padH, padV);
+        setPadding(padH, padV, padH, padV);
 
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(BG_COLOR);
         bg.setCornerRadius(dpToPx(CORNER_RADIUS_DP));
-        container.setBackground(bg);
+        setBackground(bg);
 
-        rowFps = createRow(container, "-- FPS  --ms");
-        rowTiming = createRow(container, "Startup: --  1st: --");
-        rowMem = createRow(container, "Mem: --");
-        rowCpu = createRow(container, "CPU: --");
-
-        addView(container);
+        rowFps    = createRow("-- FPS  --ms");
+        rowCpu    = createRow("CPU: --");
+        rowMem    = createRow("Mem: --");
+        rowTiming = createRow("Start: --  1st: --");
     }
 
-    private TextView createRow(LinearLayout parent, String text) {
+    // ==================== WindowManager hosting ====================
+
+    /**
+     * Attach this view as a sub-panel window so it always floats above the
+     * SurfaceView used for game rendering.
+     *
+     * @param anchorToken window token of the host Activity's decor view
+     */
+    public void attachToWindow(View anchor) {
+        if (attached) return;
+        wm = (WindowManager) getContext().getSystemService(Context.WINDOW_SERVICE);
+        if (wm == null) return;
+
+        wmParams = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT);
+        wmParams.gravity = Gravity.TOP | Gravity.START;
+        wmParams.token = anchor.getWindowToken();
+        // Initial position: top-end with margin
+        wmParams.x = anchor.getWidth() - dpToPx(160);
+        wmParams.y = dpToPx(32);
+
+        wm.addView(this, wmParams);
+        attached = true;
+    }
+
+    /**
+     * Remove from WindowManager (call before Activity finishes).
+     */
+    public void detachFromWindow() {
+        if (!attached) return;
+        attached = false;
+        try {
+            wm.removeViewImmediate(this);
+        } catch (Exception ignored) {
+        }
+    }
+
+    // ==================== Touch / Drag ====================
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        if (wmParams == null) return super.onTouchEvent(event);
+
+        switch (event.getAction()) {
+            case MotionEvent.ACTION_DOWN:
+                downRawX = event.getRawX();
+                downRawY = event.getRawY();
+                downX = wmParams.x;
+                downY = wmParams.y;
+                isDragging = false;
+                return true;
+
+            case MotionEvent.ACTION_MOVE: {
+                float dx = event.getRawX() - downRawX;
+                float dy = event.getRawY() - downRawY;
+                if (!isDragging) {
+                    if (Math.abs(dx) > touchSlop || Math.abs(dy) > touchSlop) {
+                        isDragging = true;
+                    }
+                }
+                if (isDragging) {
+                    wmParams.x = downX + (int) dx;
+                    wmParams.y = downY + (int) dy;
+                    wm.updateViewLayout(this, wmParams);
+                }
+                return true;
+            }
+
+            case MotionEvent.ACTION_UP:
+                if (!isDragging) {
+                    performClick();
+                }
+                isDragging = false;
+                return true;
+
+            default:
+                return super.onTouchEvent(event);
+        }
+    }
+
+    @Override
+    public boolean performClick() {
+        return super.performClick();
+    }
+
+    // ==================== Row helpers ====================
+
+    private TextView createRow(String text) {
         TextView tv = new TextView(getContext());
         tv.setTypeface(Typeface.MONOSPACE);
         tv.setTextColor(TEXT_COLOR);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_SIZE_SP);
         tv.setText(text);
-        parent.addView(tv);
+        tv.setIncludeFontPadding(false);
+
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dpToPx(ROW_SPACING_DP);
+        tv.setLayoutParams(lp);
+
+        addView(tv);
         return tv;
     }
 
-    /**
-     * Set the startup time (session creation to modMain return).
-     */
+    // ==================== Data ====================
+
     void setStartupTimeMs(long ms) {
         this.startupTimeMs = ms;
         handler.post(new Runnable() {
@@ -141,16 +253,16 @@ public class DebugOverlayView extends FrameLayout {
         if (data == null || data.length < 12) return;
 
         ByteBuffer buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
-        int fpsX10 = buf.getInt(0);
+        int fpsX10      = buf.getInt(0);
         int frameTimeUs = buf.getInt(4);
-        int dropped = buf.getInt(8);
-        int fatalError = data.length >= 16 ? buf.getInt(12) : 0;
+        int dropped     = buf.getInt(8);
+        int fatalError  = data.length >= 16 ? buf.getInt(12) : 0;
         int firstFrameMs = data.length >= 20 ? buf.getInt(16) : 0;
 
-        float fps = (fpsX10 & 0xFFFFFFFFL) / 10f;
+        float fps     = (fpsX10 & 0xFFFFFFFFL) / 10f;
         float frameMs = (frameTimeUs & 0xFFFFFFFFL) / 1000f;
 
-        // Row 1: FPS + frame time + dropped (compact)
+        // Row 1: FPS + frame time + dropped
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("%.1f FPS  %.1fms", fps, frameMs));
         if (dropped > 0) {
@@ -166,33 +278,24 @@ public class DebugOverlayView extends FrameLayout {
             updateTimingRow();
         }
 
-        // Row 3: Memory
         refreshMemory();
-
-        // Row 4: CPU
         refreshCpu();
 
-        // Fatal error (extra row, only if needed)
+        // Fatal error row
         if (fatalError != 0) {
             if (rowFatal == null) {
-                rowFatal = new TextView(getContext());
-                rowFatal.setTypeface(Typeface.MONOSPACE);
-                rowFatal.setTextColor(WARN_COLOR);
-                rowFatal.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_SIZE_SP);
-                ((LinearLayout) rowFps.getParent()).addView(rowFatal);
+                rowFatal = createRow("FATAL: " + fatalError);
+                rowFatal.setTextColor(ERROR_COLOR);
+            } else {
+                rowFatal.setText("FATAL: " + fatalError);
             }
-            rowFatal.setText("FATAL: " + fatalError);
         }
     }
 
     private void updateTimingRow() {
-        String startup = startupTimeMs >= 0
-                ? String.format("%dms", startupTimeMs)
-                : "--";
-        String firstRender = firstRenderShown
-                ? String.format("%dms", firstRenderMs)
-                : "--";
-        rowTiming.setText(String.format("Startup: %s  1st: %s", startup, firstRender));
+        String startup = startupTimeMs >= 0 ? startupTimeMs + "ms" : "--";
+        String firstRender = firstRenderShown ? firstRenderMs + "ms" : "--";
+        rowTiming.setText(String.format("Start: %s (1st: %s)", startup, firstRender));
     }
 
     private void refreshMemory() {
@@ -224,7 +327,6 @@ public class DebugOverlayView extends FrameLayout {
                 long deltaCpu = cpuTime - prevCpuTime;
                 long deltaUptime = uptimeMs - prevUptime;
                 if (deltaUptime > 0) {
-                    // HZ=100 assumed, 1 jiffy = 10ms
                     float cpuPercent = (deltaCpu * 10.0f * 100.0f) / deltaUptime;
                     cpuPercent = Math.min(cpuPercent, 999.9f);
                     rowCpu.setText(String.format("CPU: %.1f%%", cpuPercent));
@@ -234,7 +336,7 @@ public class DebugOverlayView extends FrameLayout {
             prevCpuTime = cpuTime;
             prevUptime = uptimeMs;
         } catch (Exception e) {
-            // CPU stats not available on this device
+            // CPU stats not available
         }
     }
 
