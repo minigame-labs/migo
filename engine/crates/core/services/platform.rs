@@ -25,6 +25,14 @@ pub trait PlatformServices: Send + Sync {
         None
     }
 
+    /// Notify the host application that the game module has been loaded and
+    /// is ready to run.
+    ///
+    /// Called after `EvaluateModule` completes successfully.
+    fn notify_game_ready(&self, _host_id: i32) {
+        // Default: no-op.
+    }
+
     /// Notify the host application that the mini program is exiting.
     ///
     /// This is called when the JS side calls `exitMiniProgram`.

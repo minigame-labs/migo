@@ -1,15 +1,14 @@
 package com.migo.runtime;
 
 import android.content.Context;
-import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Debug;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
+import android.os.SystemClock;
 import android.util.TypedValue;
-import android.view.Gravity;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -20,49 +19,50 @@ import java.io.BufferedReader;
 import java.io.FileReader;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.LinkedHashMap;
-import java.util.Map;
 
 /**
  * Semi-transparent debug overlay that displays real-time engine statistics.
- * <p>
- * Designed for extensibility: use {@link #addPanel(String, String)} to add custom
- * metrics panels (e.g., memory usage, draw calls, network latency).
  *
- * <h3>Usage</h3>
- * <pre>{@code
- * DebugOverlayView overlay = new DebugOverlayView(context, sessionId);
- * rootLayout.addView(overlay, new FrameLayout.LayoutParams(
- *     FrameLayout.LayoutParams.WRAP_CONTENT,
- *     FrameLayout.LayoutParams.WRAP_CONTENT,
- *     Gravity.TOP | Gravity.END));
- * overlay.startMonitoring();
- * }</pre>
+ * <h3>Layout</h3>
+ * <pre>
+ *  59.8 FPS  16.7ms  D:0
+ *  Startup: 342ms  1st: 156ms
+ *  Mem: 87MB (N:62 J:25)
+ *  CPU: 12.3%
+ * </pre>
  *
  * @since 1.0.0
  */
 public class DebugOverlayView extends FrameLayout {
 
-    private static final int BG_COLOR = 0xCC1A1A2E;   // dark semi-transparent
-    private static final int TEXT_COLOR = 0xFFE0E0E0;  // light gray
-    private static final int WARN_COLOR = 0xFFFF9800;  // orange for warnings
-    private static final float TEXT_SIZE_SP = 11f;
+    private static final int BG_COLOR = 0xCC1A1A2E;
+    private static final int TEXT_COLOR = 0xFFE0E0E0;
+    private static final int ACCENT_COLOR = 0xFF4FC3F7;  // light blue for labels
+    private static final int WARN_COLOR = 0xFFFF9800;
+    private static final float TEXT_SIZE_SP = 10.5f;
     private static final int CORNER_RADIUS_DP = 6;
-    private static final int PADDING_DP = 8;
+    private static final int PADDING_H_DP = 8;
+    private static final int PADDING_V_DP = 5;
     private static final int DEFAULT_UPDATE_INTERVAL_MS = 500;
 
-    private final LinearLayout container;
-    private final Map<String, TextView> panels = new LinkedHashMap<>();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final int sessionId;
+
+    // Row TextViews
+    private final TextView rowFps;
+    private final TextView rowTiming;
+    private final TextView rowMem;
+    private final TextView rowCpu;
+    private TextView rowFatal;
 
     private Runnable updateRunnable;
     private int updateIntervalMs = DEFAULT_UPDATE_INTERVAL_MS;
 
     private volatile long startupTimeMs = -1;
     private boolean firstRenderShown = false;
+    private long firstRenderMs = 0;
 
-    // CPU usage tracking
+    // CPU delta tracking
     private long prevCpuTime = -1;
     private long prevUptime = -1;
 
@@ -70,86 +70,53 @@ public class DebugOverlayView extends FrameLayout {
         super(context);
         this.sessionId = sessionId;
 
-        container = new LinearLayout(context);
+        LinearLayout container = new LinearLayout(context);
         container.setOrientation(LinearLayout.VERTICAL);
 
-        int padPx = dpToPx(PADDING_DP);
-        container.setPadding(padPx, padPx, padPx, padPx);
+        int padH = dpToPx(PADDING_H_DP);
+        int padV = dpToPx(PADDING_V_DP);
+        container.setPadding(padH, padV, padH, padV);
 
-        // Rounded dark background
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(BG_COLOR);
         bg.setCornerRadius(dpToPx(CORNER_RADIUS_DP));
         container.setBackground(bg);
 
-        // Default panels
-        addPanel("fps", "-- FPS");
-        addPanel("frame", "-- ms");
-        addPanel("startup", "Startup: -- ms");
-        addPanel("first_render", "1st Render: -- ms");
-        addPanel("memory", "Mem: -- MB");
-        addPanel("cpu", "CPU: --%");
+        rowFps = createRow(container, "-- FPS  --ms");
+        rowTiming = createRow(container, "Startup: --  1st: --");
+        rowMem = createRow(container, "Mem: --");
+        rowCpu = createRow(container, "CPU: --");
 
         addView(container);
     }
 
-    /**
-     * Add a named panel row. Extensible for memory, draw calls, etc.
-     *
-     * @param key         Unique key for later updates via {@link #updatePanel}
-     * @param initialText Initial display text
-     * @return The created TextView for further customization
-     */
-    public TextView addPanel(String key, String initialText) {
+    private TextView createRow(LinearLayout parent, String text) {
         TextView tv = new TextView(getContext());
         tv.setTypeface(Typeface.MONOSPACE);
         tv.setTextColor(TEXT_COLOR);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_SIZE_SP);
-        tv.setText(initialText);
-        panels.put(key, tv);
-        container.addView(tv);
+        tv.setText(text);
+        parent.addView(tv);
         return tv;
     }
 
     /**
-     * Update a specific panel's text.
-     *
-     * @param key  Panel key (as passed to {@link #addPanel})
-     * @param text New display text
-     */
-    public void updatePanel(String key, String text) {
-        TextView tv = panels.get(key);
-        if (tv != null) tv.setText(text);
-    }
-
-    /**
-     * Set the polling interval for stats refresh.
-     *
-     * @param intervalMs Interval in milliseconds (default 500)
-     */
-    public void setUpdateInterval(int intervalMs) {
-        this.updateIntervalMs = Math.max(100, intervalMs);
-    }
-
-    /**
-     * Set the startup time (session creation to game ready).
-     * Called by GameSession when notifyGameReady fires.
-     *
-     * @param ms Startup duration in milliseconds
+     * Set the startup time (session creation to modMain return).
      */
     void setStartupTimeMs(long ms) {
         this.startupTimeMs = ms;
         handler.post(new Runnable() {
             @Override
             public void run() {
-                updatePanel("startup", String.format("Startup: %d ms", ms));
+                updateTimingRow();
             }
         });
     }
 
-    /**
-     * Start periodic stats polling from native.
-     */
+    public void setUpdateInterval(int intervalMs) {
+        this.updateIntervalMs = Math.max(100, intervalMs);
+    }
+
     public void startMonitoring() {
         stopMonitoring();
         updateRunnable = new Runnable() {
@@ -162,9 +129,6 @@ public class DebugOverlayView extends FrameLayout {
         handler.post(updateRunnable);
     }
 
-    /**
-     * Stop periodic stats polling.
-     */
     public void stopMonitoring() {
         if (updateRunnable != null) {
             handler.removeCallbacks(updateRunnable);
@@ -183,51 +147,60 @@ public class DebugOverlayView extends FrameLayout {
         int fatalError = data.length >= 16 ? buf.getInt(12) : 0;
         int firstFrameMs = data.length >= 20 ? buf.getInt(16) : 0;
 
-        // Treat as unsigned
         float fps = (fpsX10 & 0xFFFFFFFFL) / 10f;
         float frameMs = (frameTimeUs & 0xFFFFFFFFL) / 1000f;
 
-        updatePanel("fps", String.format("%.1f FPS", fps));
-        updatePanel("frame", String.format("%.1f ms", frameMs));
+        // Row 1: FPS + frame time + dropped (compact)
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("%.1f FPS  %.1fms", fps, frameMs));
+        if (dropped > 0) {
+            sb.append(String.format("  D:%d", dropped & 0xFFFFFFFFL));
+        }
+        rowFps.setText(sb.toString());
+        rowFps.setTextColor(fps < 25 ? WARN_COLOR : TEXT_COLOR);
 
-        // First render time (one-shot, from render thread start to first swap)
+        // First render (one-shot)
         if (!firstRenderShown && firstFrameMs > 0) {
             firstRenderShown = true;
-            updatePanel("first_render", String.format("1st Render: %d ms", firstFrameMs & 0xFFFFFFFFL));
+            firstRenderMs = firstFrameMs & 0xFFFFFFFFL;
+            updateTimingRow();
         }
 
-        // Memory usage
+        // Row 3: Memory
         refreshMemory();
 
-        // CPU usage
+        // Row 4: CPU
         refreshCpu();
 
-        // Show dropped frames panel only when > 0
-        if (dropped > 0) {
-            if (!panels.containsKey("dropped")) {
-                TextView tv = addPanel("dropped", "");
-                tv.setTextColor(WARN_COLOR);
-            }
-            updatePanel("dropped", String.format("Dropped: %d", dropped & 0xFFFFFFFFL));
-        }
-
+        // Fatal error (extra row, only if needed)
         if (fatalError != 0) {
-            if (!panels.containsKey("fatal")) {
-                TextView tv = addPanel("fatal", "");
-                tv.setTextColor(WARN_COLOR);
+            if (rowFatal == null) {
+                rowFatal = new TextView(getContext());
+                rowFatal.setTypeface(Typeface.MONOSPACE);
+                rowFatal.setTextColor(WARN_COLOR);
+                rowFatal.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_SIZE_SP);
+                ((LinearLayout) rowFps.getParent()).addView(rowFatal);
             }
-            updatePanel("fatal", "Fatal: " + fatalError);
+            rowFatal.setText("FATAL: " + fatalError);
         }
     }
 
+    private void updateTimingRow() {
+        String startup = startupTimeMs >= 0
+                ? String.format("%dms", startupTimeMs)
+                : "--";
+        String firstRender = firstRenderShown
+                ? String.format("%dms", firstRenderMs)
+                : "--";
+        rowTiming.setText(String.format("Startup: %s  1st: %s", startup, firstRender));
+    }
+
     private void refreshMemory() {
-        // Native heap (V8 + Rust allocations)
-        long nativeHeapMB = Debug.getNativeHeapAllocatedSize() / (1024 * 1024);
-        // Java heap
+        long nativeMB = Debug.getNativeHeapAllocatedSize() / (1024 * 1024);
         Runtime rt = Runtime.getRuntime();
-        long javaHeapMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
-        long totalMB = nativeHeapMB + javaHeapMB;
-        updatePanel("memory", String.format("Mem: %d MB (N:%d J:%d)", totalMB, nativeHeapMB, javaHeapMB));
+        long javaMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+        long totalMB = nativeMB + javaMB;
+        rowMem.setText(String.format("Mem: %dMB (N:%d J:%d)", totalMB, nativeMB, javaMB));
     }
 
     private void refreshCpu() {
@@ -238,34 +211,30 @@ public class DebugOverlayView extends FrameLayout {
             reader.close();
             if (line == null) return;
 
-            // Fields after the comm field (which may contain spaces and parentheses).
-            // Find the closing ')' to skip comm, then split the rest.
             int commEnd = line.lastIndexOf(')');
             if (commEnd < 0) return;
             String[] fields = line.substring(commEnd + 2).trim().split("\\s+");
-            // fields[11] = utime (index 13 in full stat), fields[12] = stime (index 14)
             if (fields.length < 13) return;
             long utime = Long.parseLong(fields[11]);
             long stime = Long.parseLong(fields[12]);
             long cpuTime = utime + stime;
-
-            // Uptime in jiffies (clock ticks)
-            long uptimeMs = android.os.SystemClock.elapsedRealtime();
+            long uptimeMs = SystemClock.elapsedRealtime();
 
             if (prevCpuTime >= 0 && prevUptime >= 0) {
                 long deltaCpu = cpuTime - prevCpuTime;
                 long deltaUptime = uptimeMs - prevUptime;
                 if (deltaUptime > 0) {
-                    // Convert jiffies to ms (assuming HZ=100, 1 jiffy = 10ms)
+                    // HZ=100 assumed, 1 jiffy = 10ms
                     float cpuPercent = (deltaCpu * 10.0f * 100.0f) / deltaUptime;
                     cpuPercent = Math.min(cpuPercent, 999.9f);
-                    updatePanel("cpu", String.format("CPU: %.1f%%", cpuPercent));
+                    rowCpu.setText(String.format("CPU: %.1f%%", cpuPercent));
+                    rowCpu.setTextColor(cpuPercent > 80 ? WARN_COLOR : TEXT_COLOR);
                 }
             }
             prevCpuTime = cpuTime;
             prevUptime = uptimeMs;
         } catch (Exception e) {
-            // Silently ignore - CPU stats not available
+            // CPU stats not available on this device
         }
     }
 

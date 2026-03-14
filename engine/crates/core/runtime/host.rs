@@ -481,13 +481,13 @@ impl Host {
         self.last_entry = Some(entry.clone());
 
         self.js.evaluate_module(game_id.clone(), entry.clone()).await?;
+        let eval_ms = t_eval_start.elapsed().as_secs_f64() * 1000.0;
         info!(
             "[Host {}] evaluate_module('{}', '{}'): {:.1}ms",
-            self.id,
-            game_id,
-            entry,
-            t_eval_start.elapsed().as_secs_f64() * 1000.0,
+            self.id, game_id, entry, eval_ms,
         );
+
+        self.platform.notify_game_ready(self.id);
 
         // NOTE: Do NOT call run_event_loop() here. The op-based RAF
         // (op_await_next_frame) creates a permanently-pending op that keeps

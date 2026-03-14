@@ -26,6 +26,12 @@ impl PlatformServices for AndroidPlatform {
         Some(Arc::new(AndroidDeviceServices::new(host_id)))
     }
 
+    fn notify_game_ready(&self, host_id: i32) {
+        if let Err(e) = jni::notify_game_ready(host_id) {
+            error!("[Host {}] Failed to notify Java of game ready: {}", host_id, e);
+        }
+    }
+
     fn notify_exit(&self, host_id: i32) {
         if let Err(e) = jni::notify_exit(host_id) {
             error!("[Host {}] Failed to notify Java of exit: {}", host_id, e);

@@ -363,6 +363,8 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("getFuzzyLocation", "(ILjava/lang/String;)V"),
         // Scan Code
         ("scanCode", "(ILjava/lang/String;)V"),
+        // Lifecycle callback
+        ("onGameReady", "(I)V"),
         // Error notification callback
         // onError(hostId, errorCode, message, detail)
         ("onError", "(IILjava/lang/String;Ljava/lang/String;)V"),

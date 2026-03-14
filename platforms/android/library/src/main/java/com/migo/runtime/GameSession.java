@@ -125,6 +125,9 @@ public final class GameSession implements Closeable {
             this.debugOverlay.startMonitoring();
         }
 
+        // Register session for lifecycle callbacks from native
+        NativeExports.registerSession(sessionId, this);
+
         // Register for native engine error callbacks (OOM, ANR, Panic, Timeout)
         NativeExports.registerErrorCallback(sessionId, new NativeExports.NativeErrorCallback() {
             @Override
@@ -364,6 +367,7 @@ public final class GameSession implements Closeable {
         audioFocusManager.stop();
         NativeExports.destroyCaptureObserver(sessionId);
         NativeExports.unregisterErrorCallback(sessionId);
+        NativeExports.unregisterSession(sessionId);
         NativeExports.destroySensorManager(sessionId);
         NativeMethods.shutdown(sessionId);
         RuntimeRegistry.unregister(sessionId);
@@ -440,7 +444,7 @@ public final class GameSession implements Closeable {
 
     // ==================== Internal callbacks from native ====================
 
-    /** @hide Called from native code */
+    /** @hide Called from native code via NativeExports.onGameReady */
     void notifyGameReady() {
         startupTimeMs = (System.nanoTime() - creationNanos) / 1_000_000;
         if (debugOverlay != null) {

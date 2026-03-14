@@ -26,6 +26,8 @@ import com.migo.runtime.internal.platform.LocationProvider;
 import com.migo.runtime.internal.platform.ScanCodeManager;
 import com.migo.runtime.internal.platform.ScreenCaptureObserver;
 
+import com.migo.runtime.GameSession;
+
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.os.Handler;
@@ -63,6 +65,10 @@ public final class NativeExports {
 
     /** Per-session error callbacks (registered by GameSession). */
     private static final ConcurrentHashMap<Integer, NativeErrorCallback> sErrorCallbacks =
+            new ConcurrentHashMap<>();
+
+    /** Per-session GameSession references for lifecycle callbacks. */
+    private static final ConcurrentHashMap<Integer, GameSession> sSessions =
             new ConcurrentHashMap<>();
 
     /** Handler for dispatching callbacks to the main thread. */
@@ -126,6 +132,40 @@ public final class NativeExports {
      */
     public static void unregisterErrorCallback(int sessionId) {
         sErrorCallbacks.remove(sessionId);
+    }
+
+    /**
+     * Register a GameSession for lifecycle callbacks from native.
+     * @hide
+     */
+    public static void registerSession(int sessionId, GameSession session) {
+        if (session != null) {
+            sSessions.put(sessionId, session);
+        }
+    }
+
+    /**
+     * Unregister a GameSession.
+     * @hide
+     */
+    public static void unregisterSession(int sessionId) {
+        sSessions.remove(sessionId);
+    }
+
+    /**
+     * Called from native code (Rust) when the game module has been loaded.
+     * <p>
+     * JNI signature: {@code (I)V}
+     *
+     * @param hostId Session/host ID
+     */
+    public static void onGameReady(int hostId) {
+        sMainHandler.post(() -> {
+            GameSession session = sSessions.get(hostId);
+            if (session != null) {
+                session.notifyGameReady();
+            }
+        });
     }
 
     /**
