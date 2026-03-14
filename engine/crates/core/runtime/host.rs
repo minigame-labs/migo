@@ -471,7 +471,10 @@ impl Host {
                     )
             }
 
-            _ => Ok(()),
+            other => {
+                tracing::warn!("[Host {}] unhandled HostCommand: {:?}", self.id, other);
+                Ok(())
+            }
         }
     }
 

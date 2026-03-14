@@ -365,10 +365,21 @@ public final class GameSession implements Closeable {
             debugOverlay.stopMonitoring();
         }
         audioFocusManager.stop();
+
+        // Destroy all per-session managers to release platform resources
+        // (Activity refs, BroadcastReceivers, sensors, camera, etc.)
         NativeExports.destroyCaptureObserver(sessionId);
+        NativeExports.destroySensorManager(sessionId);
+        NativeExports.destroyNetworkMonitor(sessionId);
+        NativeExports.destroyRecorderManager(sessionId);
+        NativeExports.destroyCameraManagers(sessionId);
+        NativeExports.destroyKeyboardManager(sessionId);
+        NativeExports.destroyBluetoothManager(sessionId);
+        NativeExports.destroyImageApiManager(sessionId);
+        NativeExports.destroyScanCodeManager(sessionId);
+
         NativeExports.unregisterErrorCallback(sessionId);
         NativeExports.unregisterSession(sessionId);
-        NativeExports.destroySensorManager(sessionId);
         NativeMethods.shutdown(sessionId);
         RuntimeRegistry.unregister(sessionId);
 
