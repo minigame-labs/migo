@@ -9,6 +9,7 @@ import android.os.Looper;
 import android.util.Log;
 
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.ResultProxyActivity;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
