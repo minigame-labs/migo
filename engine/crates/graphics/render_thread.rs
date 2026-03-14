@@ -121,6 +121,7 @@ impl RenderThread {
                 let mut frame_count: u32 = 0;
                 let mut fps_timer = Instant::now();
                 let mut last_frame_time = Instant::now();
+                let mut first_frame_recorded = false;
 
                 enum LoopCtl {
                     Continue,
@@ -352,7 +353,8 @@ impl RenderThread {
                                                         debug_stats: &shared::stats::DebugStats,
                                                         frame_count: &mut u32,
                                                         fps_timer: &mut Instant,
-                                                        last_frame_time: &mut Instant| {
+                                                        last_frame_time: &mut Instant,
+                                                        first_frame_recorded: &mut bool| {
                     // Present the completed frame (only if we have a valid surface).
                     if *dirty && has_surface {
                         if let Err(e) = cm.flush_dirty_2d_contexts() {
@@ -363,6 +365,13 @@ impl RenderThread {
                             warn!("swap_buffers_no_restore failed: {}", e);
                         }
                         *dirty = false;
+
+                        // Record first frame time only after a real swap_buffers.
+                        if !*first_frame_recorded {
+                            *first_frame_recorded = true;
+                            let first_ms = start_time.elapsed().as_millis() as u32;
+                            debug_stats.first_frame_ms.store(first_ms, Ordering::Relaxed);
+                        }
                     }
 
                     // FPS stats update.
@@ -403,7 +412,7 @@ impl RenderThread {
 
                             // 2) Present frame and signal RAF.
                             let ts = start_time.elapsed().as_secs_f64() * 1000.0;
-                            present_frame_and_signal_raf(&mut cm, &mut dirty, has_surface, ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time);
+                            present_frame_and_signal_raf(&mut cm, &mut dirty, has_surface, ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded);
                         }
 
                         recv(vsync) -> _msg => {
@@ -435,7 +444,7 @@ impl RenderThread {
                             // absolute hardware timestamp causes broken animation calculations
                             // (huge first-frame delta, incorrect absolute positions).
                             let ts = start_time.elapsed().as_secs_f64() * 1000.0;
-                            present_frame_and_signal_raf(&mut cm, &mut dirty, has_surface, ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time);
+                            present_frame_and_signal_raf(&mut cm, &mut dirty, has_surface, ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded);
                         }
 
                         recv(cmd_rx) -> msg => {

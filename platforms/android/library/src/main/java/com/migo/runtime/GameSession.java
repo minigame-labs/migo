@@ -83,6 +83,9 @@ public final class GameSession implements Closeable {
     private volatile boolean destroyed = false;
     private volatile boolean gameStarted = false;
 
+    private final long creationNanos = System.nanoTime();
+    private volatile long startupTimeMs = -1;
+
     private DebugOverlayView debugOverlay;
 
     // Callback
@@ -439,6 +442,10 @@ public final class GameSession implements Closeable {
 
     /** @hide Called from native code */
     void notifyGameReady() {
+        startupTimeMs = (System.nanoTime() - creationNanos) / 1_000_000;
+        if (debugOverlay != null) {
+            debugOverlay.setStartupTimeMs(startupTimeMs);
+        }
         if (listener != null) {
             listener.onGameReady();
         }

@@ -952,12 +952,14 @@ pub(crate) extern "system" fn getDebugStats(
     let frame_time_us = stats.frame_time_us.load(Ordering::Relaxed);
     let dropped = stats.dropped_frames.load(Ordering::Relaxed);
     let fatal_error = stats.fatal_error_code.load(Ordering::Relaxed);
+    let first_frame_ms = stats.first_frame_ms.load(Ordering::Relaxed);
 
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; 20];
     buf[0..4].copy_from_slice(&fps_x10.to_le_bytes());
     buf[4..8].copy_from_slice(&frame_time_us.to_le_bytes());
     buf[8..12].copy_from_slice(&dropped.to_le_bytes());
     buf[12..16].copy_from_slice(&fatal_error.to_le_bytes());
+    buf[16..20].copy_from_slice(&first_frame_ms.to_le_bytes());
 
     match env.byte_array_from_slice(&buf) {
         Ok(arr) => arr.into_raw(),

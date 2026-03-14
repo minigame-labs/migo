@@ -4,8 +4,10 @@ import android.content.Context;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Debug;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.widget.FrameLayout;
@@ -14,6 +16,8 @@ import android.widget.TextView;
 
 import com.migo.runtime.internal.NativeBridge;
 
+import java.io.BufferedReader;
+import java.io.FileReader;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.LinkedHashMap;
@@ -55,6 +59,13 @@ public class DebugOverlayView extends FrameLayout {
     private Runnable updateRunnable;
     private int updateIntervalMs = DEFAULT_UPDATE_INTERVAL_MS;
 
+    private volatile long startupTimeMs = -1;
+    private boolean firstRenderShown = false;
+
+    // CPU usage tracking
+    private long prevCpuTime = -1;
+    private long prevUptime = -1;
+
     public DebugOverlayView(Context context, int sessionId) {
         super(context);
         this.sessionId = sessionId;
@@ -74,6 +85,10 @@ public class DebugOverlayView extends FrameLayout {
         // Default panels
         addPanel("fps", "-- FPS");
         addPanel("frame", "-- ms");
+        addPanel("startup", "Startup: -- ms");
+        addPanel("first_render", "1st Render: -- ms");
+        addPanel("memory", "Mem: -- MB");
+        addPanel("cpu", "CPU: --%");
 
         addView(container);
     }
@@ -117,6 +132,22 @@ public class DebugOverlayView extends FrameLayout {
     }
 
     /**
+     * Set the startup time (session creation to game ready).
+     * Called by GameSession when notifyGameReady fires.
+     *
+     * @param ms Startup duration in milliseconds
+     */
+    void setStartupTimeMs(long ms) {
+        this.startupTimeMs = ms;
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                updatePanel("startup", String.format("Startup: %d ms", ms));
+            }
+        });
+    }
+
+    /**
      * Start periodic stats polling from native.
      */
     public void startMonitoring() {
@@ -150,6 +181,7 @@ public class DebugOverlayView extends FrameLayout {
         int frameTimeUs = buf.getInt(4);
         int dropped = buf.getInt(8);
         int fatalError = data.length >= 16 ? buf.getInt(12) : 0;
+        int firstFrameMs = data.length >= 20 ? buf.getInt(16) : 0;
 
         // Treat as unsigned
         float fps = (fpsX10 & 0xFFFFFFFFL) / 10f;
@@ -157,6 +189,18 @@ public class DebugOverlayView extends FrameLayout {
 
         updatePanel("fps", String.format("%.1f FPS", fps));
         updatePanel("frame", String.format("%.1f ms", frameMs));
+
+        // First render time (one-shot, from render thread start to first swap)
+        if (!firstRenderShown && firstFrameMs > 0) {
+            firstRenderShown = true;
+            updatePanel("first_render", String.format("1st Render: %d ms", firstFrameMs & 0xFFFFFFFFL));
+        }
+
+        // Memory usage
+        refreshMemory();
+
+        // CPU usage
+        refreshCpu();
 
         // Show dropped frames panel only when > 0
         if (dropped > 0) {
@@ -173,6 +217,55 @@ public class DebugOverlayView extends FrameLayout {
                 tv.setTextColor(WARN_COLOR);
             }
             updatePanel("fatal", "Fatal: " + fatalError);
+        }
+    }
+
+    private void refreshMemory() {
+        // Native heap (V8 + Rust allocations)
+        long nativeHeapMB = Debug.getNativeHeapAllocatedSize() / (1024 * 1024);
+        // Java heap
+        Runtime rt = Runtime.getRuntime();
+        long javaHeapMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+        long totalMB = nativeHeapMB + javaHeapMB;
+        updatePanel("memory", String.format("Mem: %d MB (N:%d J:%d)", totalMB, nativeHeapMB, javaHeapMB));
+    }
+
+    private void refreshCpu() {
+        try {
+            int pid = Process.myPid();
+            BufferedReader reader = new BufferedReader(new FileReader("/proc/" + pid + "/stat"));
+            String line = reader.readLine();
+            reader.close();
+            if (line == null) return;
+
+            // Fields after the comm field (which may contain spaces and parentheses).
+            // Find the closing ')' to skip comm, then split the rest.
+            int commEnd = line.lastIndexOf(')');
+            if (commEnd < 0) return;
+            String[] fields = line.substring(commEnd + 2).trim().split("\\s+");
+            // fields[11] = utime (index 13 in full stat), fields[12] = stime (index 14)
+            if (fields.length < 13) return;
+            long utime = Long.parseLong(fields[11]);
+            long stime = Long.parseLong(fields[12]);
+            long cpuTime = utime + stime;
+
+            // Uptime in jiffies (clock ticks)
+            long uptimeMs = android.os.SystemClock.elapsedRealtime();
+
+            if (prevCpuTime >= 0 && prevUptime >= 0) {
+                long deltaCpu = cpuTime - prevCpuTime;
+                long deltaUptime = uptimeMs - prevUptime;
+                if (deltaUptime > 0) {
+                    // Convert jiffies to ms (assuming HZ=100, 1 jiffy = 10ms)
+                    float cpuPercent = (deltaCpu * 10.0f * 100.0f) / deltaUptime;
+                    cpuPercent = Math.min(cpuPercent, 999.9f);
+                    updatePanel("cpu", String.format("CPU: %.1f%%", cpuPercent));
+                }
+            }
+            prevCpuTime = cpuTime;
+            prevUptime = uptimeMs;
+        } catch (Exception e) {
+            // Silently ignore - CPU stats not available
         }
     }
 

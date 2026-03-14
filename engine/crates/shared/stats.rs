@@ -17,6 +17,9 @@ pub struct DebugStats {
     /// Set when the host thread is terminated (e.g., OOM, Timeout).
     /// Java layer can poll this to detect engine errors.
     pub fatal_error_code: AtomicU32,
+    /// Milliseconds from render thread start to first frame presentation.
+    /// Set once on the first swap_buffers; remains 0 until then.
+    pub first_frame_ms: AtomicU32,
 }
 
 impl DebugStats {
