@@ -87,7 +87,7 @@ pub struct UdpBindResult {
     pub family: String,
 }
 
-/// Bind a UDP socket to a local port.
+/// Bind a UDP socket to a local port (synchronous).
 ///
 /// # Arguments
 /// - `port`: Port to bind to (0 = system-assigned random port)
@@ -95,9 +95,9 @@ pub struct UdpBindResult {
 ///
 /// # Returns
 /// A `UdpBindResult` with the resource ID and bound port.
-#[op2(async(lazy), fast)]
+#[op2]
 #[serde]
-pub async fn op_udp_bind(
+pub fn op_udp_bind(
     state: Rc<RefCell<OpState>>,
     #[smi] port: u32,
     #[string] socket_type: String,
@@ -113,9 +113,14 @@ pub async fn op_udp_bind(
 
     debug!("UDP bind: {} (type={})", bind_addr, socket_type);
 
-    let socket = UdpSocket::bind(bind_addr)
-        .await
+    let std_socket = std::net::UdpSocket::bind(bind_addr)
         .map_err(|e| JsErrorBox::generic(format!("bind:fail {}", e)))?;
+
+    std_socket.set_nonblocking(true)
+        .map_err(|e| JsErrorBox::generic(format!("bind:fail set_nonblocking: {}", e)))?;
+
+    let socket = UdpSocket::from_std(std_socket)
+        .map_err(|e| JsErrorBox::generic(format!("bind:fail from_std: {}", e)))?;
 
     let local_addr = socket
         .local_addr()
@@ -158,6 +163,7 @@ pub async fn op_udp_connect(
         .map_err(|_| JsErrorBox::generic("UDPSocket not found"))?;
 
     let addr_str = format!("{}:{}", address, port);
+    debug!("UDP connect: rid={}, target={}", rid, addr_str);
     let sock_addr = resolve_first(&addr_str)
         .await
         .map_err(|e| JsErrorBox::generic(format!("connect:fail {}", e)))?;
@@ -168,6 +174,7 @@ pub async fn op_udp_connect(
         .await
         .map_err(|e| JsErrorBox::generic(format!("connect:fail {}", e)))?;
 
+    debug!("UDP connect: success, rid={}, addr={}", rid, sock_addr);
     Ok(())
 }
 
@@ -198,6 +205,7 @@ pub async fn op_udp_send(
 
     // Resolve target address
     let addr_str = format!("{}:{}", address, port);
+    debug!("UDP send: rid={}, target={}, broadcast={}", rid, addr_str, set_broadcast);
     let sock_addr = resolve_first(&addr_str)
         .await
         .map_err(|e| JsErrorBox::generic(format!("send:fail resolve error: {}", e)))?;
@@ -225,10 +233,13 @@ pub async fn op_udp_send(
         return Err(JsErrorBox::type_error("send:fail no data provided"));
     };
 
+    debug!("UDP send: {} bytes to {}", bytes.len(), sock_addr);
     socket
         .send_to(&bytes, sock_addr)
         .await
         .map_err(|e| JsErrorBox::generic(format!("send:fail {}", e)))?;
+
+    debug!("UDP send: success");
 
     // Reset broadcast after sending
     if set_broadcast {

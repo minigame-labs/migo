@@ -29,28 +29,23 @@ class UDPSocket {
         if (this._bound || this._closed) return -1;
 
         const bindPort = (port !== undefined && port !== null) ? port : 0;
-        let resultPort = -1;
 
-        (async () => {
-            try {
-                const result = await op_udp_bind(bindPort, this._type);
-                this._rid = result.rid;
-                this._bound = true;
-                resultPort = result.port;
+        try {
+            const result = op_udp_bind(bindPort, this._type);
+            this._rid = result.rid;
+            this._bound = true;
 
-                // Fire listening event
-                this._fireListening();
+            // Fire listening event
+            this._fireListening();
 
-                // Start the event polling loop
-                await this._pollEvents();
-            } catch (err) {
-                this._fireError(err.message || 'bind:fail unknown error');
-            }
-        })();
+            // Start the event polling loop in background
+            this._pollEvents();
 
-        // Return the requested port (or 0 for random).
-        // The actual port is available after the listening event.
-        return bindPort;
+            return result.port;
+        } catch (err) {
+            this._fireError(err.message || 'bind:fail unknown error');
+            return -1;
+        }
     }
 
     setTTL(ttl) {
@@ -67,11 +62,6 @@ class UDPSocket {
     }
 
     send(options = {}) {
-        if (!this._bound || this._closed) {
-            this._fireError('send:fail socket not bound');
-            return;
-        }
-
         const { address, port, message, offset, length, setBroadcast } = options;
 
         if (!address) {
@@ -98,6 +88,11 @@ class UDPSocket {
             if (!dataLength) dataLength = dataBuf.byteLength - dataOffset;
         } else {
             this._fireError('send:fail invalid message type');
+            return;
+        }
+
+        if (!this._bound || this._closed) {
+            this._fireError('send:fail socket not bound');
             return;
         }
 
