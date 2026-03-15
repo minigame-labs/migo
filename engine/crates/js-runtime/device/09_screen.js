@@ -5,6 +5,7 @@ import {
     op_set_device_orientation,
     op_start_capture_screen,
     op_stop_capture_screen,
+    op_set_enable_debug,
 } from "ext:core/ops";
 import { wrapAsync } from "ext:host_v8_base/02_async.js";
 
@@ -66,6 +67,25 @@ function setDeviceOrientation(options = {}) {
     }, options);
 }
 
+// ==================== Debug ====================
+
+function setEnableDebug(options = {}) {
+    const { enableDebug } = options;
+    if (typeof enableDebug !== 'boolean') {
+        var res = { errMsg: 'setEnableDebug:fail enableDebug is required and must be a boolean' };
+        if (typeof options.fail === 'function') {
+            queueMicrotask(function () { options.fail(res); });
+        }
+        if (typeof options.complete === 'function') {
+            queueMicrotask(function () { options.complete(res); });
+        }
+        return Promise.reject(res);
+    }
+    return wrapAsync('setEnableDebug', function () {
+        op_set_enable_debug(enableDebug);
+    }, options);
+}
+
 // ==================== User Capture Screen ====================
 
 let _captureScreenListener = null;
@@ -102,6 +122,7 @@ export {
     setScreenBrightness,
     setKeepScreenOn,
     setDeviceOrientation,
+    setEnableDebug,
     onUserCaptureScreen,
     offUserCaptureScreen,
     _internalTriggerUserCaptureScreen,

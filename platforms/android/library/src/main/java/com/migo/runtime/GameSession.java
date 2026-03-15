@@ -94,6 +94,7 @@ public final class GameSession implements Closeable {
 
     private DebugOverlayView debugOverlay;
     private boolean debugOverlayAttached = false;
+    private ConsoleLogView consoleLogView;
 
     // Callback
     private volatile GameSessionListener listener;
@@ -127,10 +128,11 @@ public final class GameSession implements Closeable {
         // Start Choreographer-driven VSync immediately
         this.vsyncScheduler.start();
 
-        // Create debug overlay if debug mode is enabled
+        // Create debug overlay and console log viewer if debug mode is enabled
         if (config.isDebugEnabled()) {
             this.debugOverlay = new DebugOverlayView(context, sessionId);
             this.debugOverlay.startMonitoring();
+            this.consoleLogView = new ConsoleLogView(context, sessionId);
         }
 
         // Register session for lifecycle callbacks from native
@@ -297,6 +299,10 @@ public final class GameSession implements Closeable {
                 debugOverlay.detachFromWindow();
                 debugOverlayAttached = false;
             }
+            if (consoleLogView != null) {
+                consoleLogView.stopPolling();
+                consoleLogView.detach();
+            }
             NativeMethods.onHide(sessionId);
         }
         GameSessionListener l = listener;
@@ -383,6 +389,9 @@ public final class GameSession implements Closeable {
         if (debugOverlay != null) {
             debugOverlay.stopMonitoring();
             debugOverlay.detachFromWindow();
+        }
+        if (consoleLogView != null) {
+            consoleLogView.detach();
         }
         audioFocusManager.stop();
 
@@ -513,6 +522,46 @@ public final class GameSession implements Closeable {
         });
     }
 
+    // ==================== Debug ====================
+
+    /**
+     * Enable or disable the debug overlay at runtime.
+     * <p>
+     * Must be called on the main thread.
+     *
+     * @param enabled true to show debug overlay, false to hide it
+     * @hide
+     */
+    public void setDebugEnabled(boolean enabled) {
+        synchronized (lock) {
+            if (destroyed) return;
+            if (enabled) {
+                if (debugOverlay == null) {
+                    RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+                    if (ctx == null) return;
+                    Context context = ctx.getActivity();
+                    if (context == null) return;
+                    debugOverlay = new DebugOverlayView(context, sessionId);
+                    debugOverlay.startMonitoring();
+                    consoleLogView = new ConsoleLogView(context, sessionId);
+                    tryAttachDebugOverlay();
+                }
+            } else {
+                if (debugOverlay != null) {
+                    debugOverlay.stopMonitoring();
+                    debugOverlay.detachFromWindow();
+                    debugOverlay = null;
+                    debugOverlayAttached = false;
+                }
+                if (consoleLogView != null) {
+                    consoleLogView.stopPolling();
+                    consoleLogView.detach();
+                    consoleLogView = null;
+                }
+            }
+        }
+    }
+
     // ==================== Helpers ====================
 
     private void tryAttachDebugOverlay() {
@@ -523,6 +572,9 @@ public final class GameSession implements Closeable {
         View decor = activity.getWindow().getDecorView();
         if (decor.getWindowToken() == null) return;
         debugOverlay.attachToWindow(decor);
+        if (consoleLogView != null) {
+            consoleLogView.attachButton(decor);
+        }
         debugOverlayAttached = true;
     }
 

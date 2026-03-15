@@ -181,6 +181,10 @@ impl ScreenService for AndroidScreen {
     fn stop_capture_screen(&self) -> Result<(), String> {
         jni::stop_capture_screen(self.host_id)
     }
+
+    fn set_enable_debug(&self, enabled: bool) -> Result<(), String> {
+        jni::set_enable_debug(self.host_id, enabled).map(|_| ())
+    }
 }
 
 // ==================== Device Motion ====================

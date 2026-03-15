@@ -986,3 +986,19 @@ pub(crate) extern "system" fn getDebugStats(
         Err(_) => std::ptr::null_mut(),
     }
 }
+
+// ==================== Console Logs ====================
+
+pub(crate) extern "system" fn getConsoleLogs<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    since_cursor: jlong,
+) -> jstring {
+    let json = shared::console_log::read_console_logs_json(host_id, since_cursor as u64)
+        .unwrap_or_else(|| r#"{"logs":[],"cursor":0}"#.to_string());
+    match env.new_string(&json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}

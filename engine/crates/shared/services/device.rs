@@ -65,6 +65,11 @@ pub trait ScreenService: Send + Sync {
     fn stop_capture_screen(&self) -> Result<(), String> {
         Err("offUserCaptureScreen:fail not supported".to_string())
     }
+
+    /// Set whether to enable debug mode at runtime.
+    fn set_enable_debug(&self, _enabled: bool) -> Result<(), String> {
+        Err("setEnableDebug:fail not supported".to_string())
+    }
 }
 
 // ==================== Device Motion ====================

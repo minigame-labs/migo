@@ -125,6 +125,19 @@ pub fn op_set_device_orientation(
     Err(JsErrorBox::generic("setDeviceOrientation:fail not supported"))
 }
 
+// ==================== Debug Ops ====================
+
+#[op2(fast)]
+pub fn op_set_enable_debug(state: &mut OpState, enabled: bool) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(screen) = services.screen() {
+            return screen.set_enable_debug(enabled).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("setEnableDebug:fail not supported"))
+}
+
 // ==================== Screen Capture Ops ====================
 
 #[op2(fast)]
@@ -410,6 +423,8 @@ deno_core::extension!(
         op_set_device_orientation,
         op_start_capture_screen,
         op_stop_capture_screen,
+        // Debug
+        op_set_enable_debug,
         // Device Motion
         op_start_device_motion,
         op_stop_device_motion,

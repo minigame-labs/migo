@@ -98,6 +98,7 @@ impl Drop for Host {
         self.io.shutdown();
         vsync::unregister_vsync_sender(self.id);
         shared::stats::unregister_stats(self.id);
+        shared::console_log::unregister_console_log(self.id);
 
         // Clear process-global caches to prevent stale state leaking into
         // the next session (host_id increments, but caches are static).
@@ -158,6 +159,11 @@ impl Host {
             device_services,
             raf_rx: Some(raf_rx.clone()),
         };
+
+        // ---- Console log buffer (debug only) ----
+        if init_options.debug_enabled() {
+            shared::console_log::register_console_log(id);
+        }
 
         let module_loader: Option<Rc<dyn ModuleLoader>> =
             Some(Rc::new(MyModuleLoader(FsModuleLoader)));

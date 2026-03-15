@@ -409,6 +409,17 @@ pub fn set_device_orientation(host_id: i32, value: &str) -> Result<i32, String> 
     })
 }
 
+// ==================== Debug ====================
+
+pub fn set_enable_debug(host_id: i32, enabled: bool) -> Result<i32, String> {
+    call_static_method(
+        "setEnableDebug",
+        ReturnType::Primitive(Primitive::Int),
+        |_env, val| Ok(val.i().unwrap_or(-1)),
+        &[jvalue { i: host_id }, jvalue { z: enabled as u8 }],
+    )
+}
+
 // ==================== Device Sensor ====================
 
 pub fn start_device_motion(host_id: i32, interval: &str) -> Result<(), String> {

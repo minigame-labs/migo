@@ -436,4 +436,21 @@ public final class NativeBridge {
      * @return byte array with stats, or null if session not found
      */
     public static native byte[] getDebugStats(int sessionId);
+
+    // ==================== Console Logs ====================
+
+    /**
+     * Get console log entries written since the given cursor.
+     * <p>
+     * Returns a JSON string:
+     * {@code {"logs":[{"l":level,"t":timestamp,"m":"message"},...], "cursor": N}}
+     * <p>
+     * Pass cursor=0 on the first call, then use the returned cursor value
+     * for subsequent calls to get only new entries.
+     *
+     * @param sessionId   The session ID
+     * @param sinceCursor Cursor from the previous call (0 for first call)
+     * @return JSON string with log entries, or null if session not found
+     */
+    public static native String getConsoleLogs(int sessionId, long sinceCursor);
 }

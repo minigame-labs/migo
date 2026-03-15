@@ -703,6 +703,22 @@ public final class NativeExports {
         return DisplayCompat.setDeviceOrientation(activity, value);
     }
 
+    // ==================== Debug ====================
+
+    /**
+     * Set whether debug mode is enabled at runtime.
+     *
+     * @param sessionId   The session ID
+     * @param enableDebug true to enable debug, false to disable
+     * @return 0 on success, -1 on failure
+     */
+    public static int setEnableDebug(int sessionId, boolean enableDebug) {
+        GameSession session = sSessions.get(sessionId);
+        if (session == null) return -1;
+        sMainHandler.post(() -> session.setDebugEnabled(enableDebug));
+        return 0;
+    }
+
     // ==================== UI Interaction ====================
 
     /**

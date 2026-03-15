@@ -8,7 +8,7 @@ use crate::android::jni::{
     onAudioInterruptionEnd, onAccelerometerChange, onCompassChange, onDeviceMotionChange,
     onDeviceOrientationChange, onGyroscopeChange, onHide, onModalResult, onActionSheetResult,
     onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting, onShow,
-    onRestart, onTouch, onVsync, getDebugStats, shutdown, updateSurface, version,
+    onRestart, onTouch, onVsync, getDebugStats, getConsoleLogs, shutdown, updateSurface, version,
     onRecorderEvent, onRecorderFrameData,
     onCameraEvent, onCameraFrameData,
     onUserCaptureScreen,
@@ -144,6 +144,11 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "getDebugStats".into(),
                 sig: "(I)[B".into(),
                 fn_ptr: getDebugStats as *mut c_void,
+            },
+            NativeMethod {
+                name: "getConsoleLogs".into(),
+                sig: "(IJ)Ljava/lang/String;".into(),
+                fn_ptr: getConsoleLogs as *mut c_void,
             },
             NativeMethod {
                 name: "onRecorderEvent".into(),
@@ -291,6 +296,8 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         // Screen capture
         ("startCaptureScreen", "(I)V"),
         ("stopCaptureScreen", "(I)V"),
+        // Debug
+        ("setEnableDebug", "(IZ)I"),
         // Device sensor
         ("startDeviceMotionListening", "(ILjava/lang/String;)V"),
         ("stopDeviceMotionListening", "(I)V"),
