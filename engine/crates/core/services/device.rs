@@ -5,7 +5,7 @@
 pub use shared::services::{
     AccelerometerService, AudioPlatformService, BatteryService, BluetoothService, CameraService,
     ClipboardService, CodecService, CompassService, DeviceMotionService, DeviceServices,
-    FileService, GyroscopeService, ImageApiService, InteractionService, KeyboardService,
-    LocationService, NetworkService, RecorderService, ScanCodeService, ScreenService,
-    SystemInfoService, VibrationService,
+    FileService, GameLogService, GyroscopeService, ImageApiService, InteractionService,
+    KeyboardService, LocationService, NetworkService, RecorderService, ScanCodeService,
+    ScreenService, SystemInfoService, VibrationService,
 };

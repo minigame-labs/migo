@@ -1110,6 +1110,12 @@ pub fn scan_code(host_id: i32, options_json: &str) -> Result<(), String> {
     call_void_with_string("scanCode", host_id, options_json)
 }
 
+// ==================== Game Log ====================
+
+pub fn game_log_report(host_id: i32, log_json: &str) -> Result<(), String> {
+    call_void_with_string("gameLogReport", host_id, log_json)
+}
+
 // ==================== Lifecycle Notification ====================
 
 /// Notify the Java layer that the game module has been loaded and is ready.

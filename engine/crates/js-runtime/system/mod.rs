@@ -248,6 +248,22 @@ pub fn op_get_app_authorization_setting(state: &mut OpState) -> Result<String, J
     Err(JsErrorBox::generic("getAppAuthorizeSetting:fail not supported"))
 }
 
+// ==================== Game Log ====================
+
+#[op2(fast)]
+pub fn op_game_log_report(
+    state: &mut OpState,
+    #[string] log_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(svc) = services.game_log() {
+            return svc.report_log(&log_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("gameLog.log:fail not supported"))
+}
+
 // ==================== Extension Definition ====================
 
 deno_core::extension!(
@@ -272,6 +288,7 @@ deno_core::extension!(
         op_get_system_settings,
         op_get_device_info,
         op_get_app_authorization_setting,
+        op_game_log_report,
     ],
     esm = [
         dir "system",
@@ -283,6 +300,7 @@ deno_core::extension!(
         "06_benchmark_level.js",
         "07_app_info.js",
         "08_authorize_setting.js",
+        "09_game_log.js",
     ]
 );
 

@@ -40,6 +40,7 @@ import * as deviceInfo from 'ext:host_v8_system/05_device_info.js';
 import * as benchmarkLevel from 'ext:host_v8_system/06_benchmark_level.js';
 import * as appInfo from 'ext:host_v8_system/07_app_info.js';
 import * as authorizeSetting from 'ext:host_v8_system/08_authorize_setting.js';
+import * as gameLog from 'ext:host_v8_system/09_game_log.js';
 import * as storageApi from 'ext:host_v8_storage/01_storage.js';
 import * as cameraApi from 'ext:host_v8_media/01_camera.js';
 import * as imageApi from 'ext:host_v8_media/02_image_api.js';
@@ -346,6 +347,9 @@ const WindowGlobalScope = {
 
     // Authorize Setting
     getAppAuthorizeSetting: core.propNonEnumerable(authorizeSetting.getAppAuthorizeSetting),
+
+    // Game Log
+    getGameLogManager: core.propNonEnumerable(gameLog.getGameLogManager),
 
     // Ad
     createBannerAd: core.propNonEnumerable(adApi.createBannerAd),

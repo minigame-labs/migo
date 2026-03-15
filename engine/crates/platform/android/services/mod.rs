@@ -7,9 +7,9 @@ use std::sync::Arc;
 use core::services::{
     AccelerometerService, AudioPlatformService, BatteryService, BluetoothService, CameraService,
     ClipboardService, CodecService, CompassService, DeviceMotionService, DeviceServices,
-    FileService, GyroscopeService, ImageApiService, InteractionService, KeyboardService,
-    LocationService, NetworkService, RecorderService, ScanCodeService, ScreenService,
-    SystemInfoService, VibrationService,
+    FileService, GameLogService, GyroscopeService, ImageApiService, InteractionService,
+    KeyboardService, LocationService, NetworkService, RecorderService, ScanCodeService,
+    ScreenService, SystemInfoService, VibrationService,
 };
 
 use crate::android::jni;
@@ -108,6 +108,10 @@ impl DeviceServices for AndroidDeviceServices {
 
     fn scan_code(&self) -> Option<Arc<dyn ScanCodeService>> {
         Some(Arc::new(AndroidScanCode { host_id: self.host_id }))
+    }
+
+    fn game_log(&self) -> Option<Arc<dyn GameLogService>> {
+        Some(Arc::new(AndroidGameLog { host_id: self.host_id }))
     }
 }
 
@@ -590,5 +594,17 @@ struct AndroidScanCode {
 impl ScanCodeService for AndroidScanCode {
     fn scan_code(&self, options_json: &str) -> Result<(), String> {
         jni::scan_code(self.host_id, options_json)
+    }
+}
+
+// ==================== Game Log ====================
+
+struct AndroidGameLog {
+    host_id: i32,
+}
+
+impl GameLogService for AndroidGameLog {
+    fn report_log(&self, log_json: &str) -> Result<(), String> {
+        jni::game_log_report(self.host_id, log_json)
     }
 }

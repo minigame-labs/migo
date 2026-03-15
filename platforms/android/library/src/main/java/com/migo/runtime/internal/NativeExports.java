@@ -25,6 +25,7 @@ import com.migo.runtime.internal.platform.ImageApiManager;
 import com.migo.runtime.internal.platform.LocationProvider;
 import com.migo.runtime.internal.platform.ScanCodeManager;
 import com.migo.runtime.internal.platform.ScreenCaptureObserver;
+import com.migo.runtime.internal.platform.GameLogManager;
 
 import com.migo.runtime.GameSession;
 
@@ -63,6 +64,7 @@ public final class NativeExports {
     private static final Object sBluetoothLock = new Object();
     private static final Object sImageApiLock = new Object();
     private static final Object sScanCodeLock = new Object();
+    private static final Object sGameLogLock = new Object();
 
     /** Per-session device sensor managers. */
     private static final ConcurrentHashMap<Integer, DeviceSensorManager> sSensorManagers =
@@ -1860,6 +1862,46 @@ public final class NativeExports {
         }
     }
 
+    // ==================== Game Log ====================
+
+    /** Per-session Game Log managers. */
+    private static final ConcurrentHashMap<Integer, GameLogManager> sGameLogManagers =
+            new ConcurrentHashMap<>();
+
+    private static GameLogManager getOrCreateGameLogManager(int sessionId) {
+        GameLogManager existing = sGameLogManagers.get(sessionId);
+        if (existing != null) return existing;
+        synchronized (sGameLogLock) {
+            existing = sGameLogManagers.get(sessionId);
+            if (existing != null) return existing;
+            GameLogManager mgr = new GameLogManager(sessionId);
+            sGameLogManagers.put(sessionId, mgr);
+            return mgr;
+        }
+    }
+
+    /**
+     * Get the GameLogManager for a session, allowing host apps to set a custom handler.
+     *
+     * @param sessionId the session ID
+     * @return the GameLogManager instance, or null if not yet created
+     */
+    public static GameLogManager getGameLogManager(int sessionId) {
+        return getOrCreateGameLogManager(sessionId);
+    }
+
+    public static void gameLogReport(int sessionId, String logJson) {
+        GameLogManager mgr = getOrCreateGameLogManager(sessionId);
+        mgr.reportLog(logJson);
+    }
+
+    public static void destroyGameLogManager(int sessionId) {
+        GameLogManager mgr = sGameLogManagers.remove(sessionId);
+        if (mgr != null) {
+            mgr.destroy();
+        }
+    }
+
     // ==================== Session Cleanup ====================
 
     /**
@@ -1878,6 +1920,7 @@ public final class NativeExports {
         destroyBluetoothManager(sessionId);
         destroyImageApiManager(sessionId);
         destroyScanCodeManager(sessionId);
+        destroyGameLogManager(sessionId);
         unregisterErrorCallback(sessionId);
     }
 

@@ -14,6 +14,7 @@ mod clipboard;
 mod codec;
 mod device;
 mod file;
+mod game_log;
 mod image_api;
 mod interaction;
 mod location;
@@ -30,6 +31,7 @@ pub use device::{
     ScreenService, VibrationService,
 };
 pub use file::FileService;
+pub use game_log::GameLogService;
 pub use image_api::ImageApiService;
 pub use interaction::InteractionService;
 pub use location::LocationService;
