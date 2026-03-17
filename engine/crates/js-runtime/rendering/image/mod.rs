@@ -2,7 +2,7 @@ use std::{cell::RefCell, path::Path, rc::Rc};
 
 use deno_core::{OpState, extension, op2};
 use deno_error::JsErrorBox;
-use tracing::error;
+use tracing::{debug, error};
 
 use shared::{
     error::{EngineError, EngineResult, ErrorCode},
@@ -79,7 +79,7 @@ async fn op_load_image_inner(
 
     // remove previous alias and possibly destroy old shared
     if let Some(to_destroy) = {
-        let mut c = cache::IMAGE_CACHE.lock().unwrap();
+        let mut c = cache::IMAGE_CACHE.lock();
         c.remove_previous_alias(image_id)
     } {
         let _ = canvas_ctx
@@ -90,7 +90,7 @@ async fn op_load_image_inner(
     }
 
     match {
-        let mut c = cache::IMAGE_CACHE.lock().unwrap();
+        let mut c = cache::IMAGE_CACHE.lock();
         c.begin_load(image_id, &src)
     } {
         cache::BeginLoadResult::AlreadyLoaded((shared_id, dims)) => Ok((shared_id, dims)),
@@ -100,7 +100,7 @@ async fn op_load_image_inner(
                 Ok(Ok((shared_id, dims))) => {
                     // IMPORTANT: bind alias for this caller image_id so destroy works even if JS does not replace IDs
                     {
-                        let mut c = cache::IMAGE_CACHE.lock().unwrap();
+                        let mut c = cache::IMAGE_CACHE.lock();
                         c.bind_alias_existing(image_id, &src, shared_id);
                     }
                     Ok((shared_id, dims))
@@ -127,7 +127,7 @@ async fn op_load_image_inner(
             .await;
 
             {
-                let mut c = cache::IMAGE_CACHE.lock().unwrap();
+                let mut c = cache::IMAGE_CACHE.lock();
                 match &res {
                     Ok((w, h)) => c.finish_load(image_id, &src, Ok((*w as usize, *h as usize))),
                     Err(e) => c.finish_load(
@@ -138,6 +138,14 @@ async fn op_load_image_inner(
                             None => format!("[{:?}] {}", e.code, e.msg),
                         }),
                     ),
+                }
+            }
+
+            // Evict RGBA data from IO cache after GPU upload to avoid CPU+GPU
+            // double memory occupancy. The GPU now owns the texture data.
+            if res.is_ok() {
+                if io::global_cache().remove(&src).is_some() {
+                    debug!("evicted IO cache after GPU upload: {}", src);
                 }
             }
 
@@ -164,7 +172,7 @@ pub async fn op_load_image(
 #[op2(fast)]
 pub fn op_destroy_image(state: &mut OpState, #[smi] image_id: u32) -> bool {
     let to_destroy = {
-        let mut c = cache::IMAGE_CACHE.lock().unwrap();
+        let mut c = cache::IMAGE_CACHE.lock();
         c.try_release_and_get_destroy_rid(image_id)
     };
 

@@ -264,11 +264,17 @@ fn parse_color_string(s: &str) -> Color {
 /// Per-canvas frame command buffer
 struct FrameBuffer {
     commands: Vec<Canvas2DCmd>,
-    /// Shadow state for deduplication
+    /// Shadow state for deduplication — avoids sending redundant commands
     fill_color: Option<Color>,
     stroke_color: Option<Color>,
     line_width: Option<f32>,
     global_alpha: Option<f32>,
+    line_cap: Option<u8>,
+    line_join: Option<u8>,
+    miter_limit: Option<f32>,
+    text_align: Option<TextAlign>,
+    text_baseline: Option<TextBaseline>,
+    font: Option<String>,
 }
 
 impl FrameBuffer {
@@ -279,6 +285,12 @@ impl FrameBuffer {
             stroke_color: None,
             line_width: None,
             global_alpha: None,
+            line_cap: None,
+            line_join: None,
+            miter_limit: None,
+            text_align: None,
+            text_baseline: None,
+            font: None,
         }
     }
 
@@ -288,6 +300,12 @@ impl FrameBuffer {
         self.stroke_color = None;
         self.line_width = None;
         self.global_alpha = None;
+        self.line_cap = None;
+        self.line_join = None;
+        self.miter_limit = None;
+        self.text_align = None;
+        self.text_baseline = None;
+        self.font = None;
     }
 
     #[inline]
@@ -320,6 +338,52 @@ impl FrameBuffer {
         if self.global_alpha != Some(alpha) {
             self.global_alpha = Some(alpha);
             self.commands.push(Canvas2DCmd::SetGlobalAlpha { alpha });
+        }
+    }
+
+    fn set_line_cap(&mut self, cap: u8) {
+        if self.line_cap != Some(cap) {
+            self.line_cap = Some(cap);
+            self.commands.push(Canvas2DCmd::SetLineCap { cap });
+        }
+    }
+
+    fn set_line_join(&mut self, join: u8) {
+        if self.line_join != Some(join) {
+            self.line_join = Some(join);
+            self.commands.push(Canvas2DCmd::SetLineJoin { join });
+        }
+    }
+
+    fn set_miter_limit(&mut self, limit: f32) {
+        if self.miter_limit != Some(limit) {
+            self.miter_limit = Some(limit);
+            self.commands.push(Canvas2DCmd::SetMiterLimit { limit });
+        }
+    }
+
+    fn set_text_align(&mut self, align: TextAlign) {
+        if self.text_align != Some(align) {
+            self.text_align = Some(align);
+            self.commands.push(Canvas2DCmd::SetTextAlign { align });
+        }
+    }
+
+    fn set_text_baseline(&mut self, baseline: TextBaseline) {
+        if self.text_baseline != Some(baseline) {
+            self.text_baseline = Some(baseline);
+            self.commands.push(Canvas2DCmd::SetTextBaseline { baseline });
+        }
+    }
+
+    fn set_font(&mut self, font: String) {
+        let changed = match &self.font {
+            Some(prev) => prev != &font,
+            None => true,
+        };
+        if changed {
+            self.font = Some(font.clone());
+            self.commands.push(Canvas2DCmd::SetFont { font });
         }
     }
 }
@@ -429,10 +493,17 @@ impl FrameCommandCollector {
             self.extra.get_mut().get_mut(&canvas_id)
         };
         if let Some(buf) = buf {
+            // Reset all shadow state — restore pops unknown state from the stack
             buf.fill_color = None;
             buf.stroke_color = None;
             buf.line_width = None;
             buf.global_alpha = None;
+            buf.line_cap = None;
+            buf.line_join = None;
+            buf.miter_limit = None;
+            buf.text_align = None;
+            buf.text_baseline = None;
+            buf.font = None;
             buf.commands.push(Canvas2DCmd::Restore);
         }
     }
@@ -460,6 +531,36 @@ impl FrameCommandCollector {
     #[inline]
     fn set_global_alpha(&self, canvas_id: u32, alpha: f32) {
         self.with_buffer(canvas_id, |buf| buf.set_global_alpha(alpha));
+    }
+
+    #[inline]
+    fn set_line_cap(&self, canvas_id: u32, cap: u8) {
+        self.with_buffer(canvas_id, |buf| buf.set_line_cap(cap));
+    }
+
+    #[inline]
+    fn set_line_join(&self, canvas_id: u32, join: u8) {
+        self.with_buffer(canvas_id, |buf| buf.set_line_join(join));
+    }
+
+    #[inline]
+    fn set_miter_limit(&self, canvas_id: u32, limit: f32) {
+        self.with_buffer(canvas_id, |buf| buf.set_miter_limit(limit));
+    }
+
+    #[inline]
+    fn set_text_align(&self, canvas_id: u32, align: TextAlign) {
+        self.with_buffer(canvas_id, |buf| buf.set_text_align(align));
+    }
+
+    #[inline]
+    fn set_text_baseline(&self, canvas_id: u32, baseline: TextBaseline) {
+        self.with_buffer(canvas_id, |buf| buf.set_text_baseline(baseline));
+    }
+
+    #[inline]
+    fn set_font(&self, canvas_id: u32, font: String) {
+        self.with_buffer(canvas_id, |buf| buf.set_font(font));
     }
 }
 
@@ -771,21 +872,21 @@ pub fn op_set_line_width(state: &mut OpState, #[smi] canvas_id: u32, width: f32)
 #[op2(fast)]
 pub fn op_set_line_cap(state: &mut OpState, #[smi] canvas_id: u32, #[smi] cap: u8) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-        collector.push(canvas_id, Canvas2DCmd::SetLineCap { cap });
+        collector.set_line_cap(canvas_id, cap);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_line_join(state: &mut OpState, #[smi] canvas_id: u32, #[smi] join: u8) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-        collector.push(canvas_id, Canvas2DCmd::SetLineJoin { join });
+        collector.set_line_join(canvas_id, join);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_miter_limit(state: &mut OpState, #[smi] canvas_id: u32, limit: f32) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-        collector.push(canvas_id, Canvas2DCmd::SetMiterLimit { limit });
+        collector.set_miter_limit(canvas_id, limit);
     }
 }
 
@@ -799,7 +900,7 @@ pub fn op_set_global_alpha(state: &mut OpState, #[smi] canvas_id: u32, alpha: f3
 #[op2(fast)]
 pub fn op_set_font(state: &mut OpState, #[smi] canvas_id: u32, #[string] font: String) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-        collector.push(canvas_id, Canvas2DCmd::SetFont { font });
+        collector.set_font(canvas_id, font);
     }
 }
 
@@ -814,7 +915,7 @@ pub fn op_set_text_align(state: &mut OpState, #[smi] canvas_id: u32, #[smi] alig
             4 => TextAlign::Center,
             _ => TextAlign::Start,
         };
-        collector.push(canvas_id, Canvas2DCmd::SetTextAlign { align });
+        collector.set_text_align(canvas_id, align);
     }
 }
 
@@ -830,7 +931,7 @@ pub fn op_set_text_baseline(state: &mut OpState, #[smi] canvas_id: u32, #[smi] b
             5 => TextBaseline::Bottom,
             _ => TextBaseline::Alphabetic,
         };
-        collector.push(canvas_id, Canvas2DCmd::SetTextBaseline { baseline });
+        collector.set_text_baseline(canvas_id, baseline);
     }
 }
 

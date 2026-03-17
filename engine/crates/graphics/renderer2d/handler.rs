@@ -36,10 +36,14 @@ impl Renderer2d {
             return Ok(false);
         }
 
-        // Handle GetImageData (synchronous response)
-        if let Canvas2DCmd::GetImageData { x: _, y: _, width, height, resp } = cmd {
+        // Handle GetImageData (synchronous response) - read pixels from framebuffer
+        if let Canvas2DCmd::GetImageData { x, y, width, height, resp } = cmd {
             cm.make_current_needed(canvas_id)?;
-            let data = vec![0u8; (width * height * 4) as usize];
+            // Flush pending 2D draw commands so the framebuffer is up to date
+            if let Ok(ctx) = cm.get_2d_context_mut(canvas_id) {
+                ctx.flush();
+            }
+            let data = cm.read_pixels(x, y, width, height);
             let _ = resp.send(Ok(data));
             return Ok(false);
         }
@@ -87,11 +91,26 @@ impl Renderer2d {
             Canvas2DCmd::SetTextAlign { align } => { context.set_text_align(align); Ok(false) }
             Canvas2DCmd::SetTextBaseline { baseline } => { context.set_text_baseline(baseline); Ok(false) }
             Canvas2DCmd::SetFont { font } => {
+                // Fast path: skip parsing if identical to last SetFont
+                if font == context.last_font_str {
+                    context.state.font_id = context.last_font_id;
+                    context.state.font_size = context.last_font_size;
+                    return Ok(false);
+                }
                 let (family, size, bold, italic) = context.font_manager.parse_font_string(&font);
                 let font_id = context.font_manager.get_font_id_with_style(&family, bold, italic)
                     .or_else(|| context.font_manager.get_default_font_id());
                 match font_id {
-                    Some(id) => { context.state.font_id = Some(id); context.state.font_size = size.unwrap_or(16.0); Ok(false) }
+                    Some(id) => {
+                        let sz = size.unwrap_or(16.0);
+                        context.state.font_id = Some(id);
+                        context.state.font_size = sz;
+                        // Cache for next call
+                        context.last_font_id = Some(id);
+                        context.last_font_size = sz;
+                        context.last_font_str = font;
+                        Ok(false)
+                    }
                     None => { shared::bail!(ErrorCode::NotFound, "font not found", font); }
                 }
             }

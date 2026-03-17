@@ -164,15 +164,22 @@ impl RenderThread {
                         }
 
                         RenderCommand::Canvas(canvas_cmd) => {
-                            // Track RecreateOnscreen to update has_surface.
+                            // Only mark dirty for commands that affect onscreen visual output.
                             let is_recreate = matches!(&canvas_cmd, shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen { .. });
+                            let affects_onscreen = match &canvas_cmd {
+                                shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen { .. } => true,
+                                shared::protocol::render_cmd::CanvasCmd::ResizeCanvas { id, .. } => *id == 1,
+                                _ => false,
+                            };
                             match canvas_handler.handle_command(cm, canvas_cmd) {
                                 Ok(()) => {
                                     if is_recreate {
                                         *has_surface = true;
                                         info!("RenderThread surface recreated");
                                     }
-                                    *dirty = true;
+                                    if affects_onscreen {
+                                        *dirty = true;
+                                    }
                                 }
                                 Err(e) => {
                                     error!("CanvasCmd failed: {}", e);
@@ -182,7 +189,8 @@ impl RenderThread {
 
                         RenderCommand::GL(gl_cmd) => match renderer_gl.handle_command(cm, gl, gl_cmd) {
                             Ok(was_render) => {
-                                if was_render {
+                                // Only trigger onscreen present if GL targets the onscreen canvas
+                                if was_render && cm.is_onscreen_bound() {
                                     *dirty = true;
                                 }
                             }
@@ -190,13 +198,16 @@ impl RenderThread {
                         },
                         RenderCommand::GLBatch { commands } => {
                             let cmd_count = commands.len();
-                            let mut batch_dirty = false;
+                            let mut batch_hit_onscreen = false;
                             let mut error_count: u32 = 0;
                             for gl_cmd in commands {
                                 match renderer_gl.handle_command(cm, gl, gl_cmd) {
                                     Ok(was_render) => {
-                                        if was_render {
-                                            batch_dirty = true;
+                                        // Check is_onscreen_bound per-command so we don't
+                                        // miss onscreen renders when the batch also targets
+                                        // offscreen canvases.
+                                        if was_render && cm.is_onscreen_bound() {
+                                            batch_hit_onscreen = true;
                                         }
                                     }
                                     Err(e) => {
@@ -211,7 +222,7 @@ impl RenderThread {
                             if error_count > 1 {
                                 warn!("GLBatch: {error_count}/{cmd_count} commands failed");
                             }
-                            if batch_dirty {
+                            if batch_hit_onscreen {
                                 *dirty = true;
                             }
                         }
@@ -220,7 +231,13 @@ impl RenderThread {
                             Ok(was_render) => {
                                 if was_render {
                                     cm.mark_2d_dirty(canvas_id);
-                                    *dirty = true;
+                                    // NOTE: dirty flag is NOT set here. Canvas2D commands
+                                    // may arrive mid-frame (e.g. _frameEnd() before
+                                    // measureText). Setting dirty here would cause the
+                                    // render thread to present a partial frame on the next
+                                    // VSync, producing visible flicker. Instead, the JS
+                                    // frame-end (op_frame_end_all) sends an explicit
+                                    // Invalidate to trigger the present.
                                 }
                             }
                             Err(e) => error!("Canvas2D failed: {}", e),
@@ -241,7 +258,12 @@ impl RenderThread {
                             }
                             if batch_dirty {
                                 cm.mark_2d_dirty(canvas_id);
-                                *dirty = true;
+                                // Set dirty for onscreen canvas so the next VSync presents.
+                                // Safe because mid-frame flushes (measureText, getImageData)
+                                // no longer send Canvas2DBatch — only frame-end does.
+                                if canvas_id == 1 {
+                                    *dirty = true;
+                                }
                             }
                         }
 
@@ -354,31 +376,38 @@ impl RenderThread {
                                                         last_frame_time: &mut Instant,
                                                         first_frame_recorded: &mut bool| {
                     // Present the completed frame (only if we have a valid surface).
-                    if *dirty && has_surface {
+                    let did_swap = if *dirty && has_surface {
                         if let Err(e) = cm.flush_dirty_2d_contexts() {
                             warn!("flush_dirty_2d_contexts failed: {}", e);
                         }
 
-                        if let Err(e) = cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
-                            warn!("swap_buffers_no_restore failed: {}", e);
-                        }
+                        let swap_ok = match cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
+                            Ok(()) => true,
+                            Err(e) => { warn!("swap_buffers_no_restore failed: {}", e); false }
+                        };
                         *dirty = false;
 
-                        // Record first frame time only after a real swap_buffers.
-                        if !*first_frame_recorded {
+                        // Record first frame time only after a successful swap_buffers.
+                        if swap_ok && !*first_frame_recorded {
                             *first_frame_recorded = true;
                             let first_ms = start_time.elapsed().as_millis() as u32;
                             debug_stats.first_frame_ms.store(first_ms, Ordering::Relaxed);
                         }
-                    }
+                        swap_ok
+                    } else {
+                        false
+                    };
 
-                    // FPS stats update.
+                    // FPS stats: only count frames where swap_buffers was actually
+                    // called so the metric reflects real GPU work, not tick rate.
                     let now = Instant::now();
-                    let frame_dur = now.duration_since(*last_frame_time);
-                    *last_frame_time = now;
-                    debug_stats.frame_time_us.store(frame_dur.as_micros() as u32, Ordering::Relaxed);
+                    if did_swap {
+                        let frame_dur = now.duration_since(*last_frame_time);
+                        *last_frame_time = now;
+                        debug_stats.frame_time_us.store(frame_dur.as_micros() as u32, Ordering::Relaxed);
 
-                    *frame_count += 1;
+                        *frame_count += 1;
+                    }
                     let elapsed = fps_timer.elapsed();
                     if elapsed >= Duration::from_millis(500) {
                         let measured_fps = *frame_count as f32 / elapsed.as_secs_f32();

@@ -219,19 +219,31 @@ impl FontManager {
         // Normalize family:
         let fam = normalize_family_key(family);
 
+        // Reuse a stack buffer for styled key lookups (avoids format! heap allocs).
+        let mut key_buf = String::with_capacity(64);
+
         // Try styled variants first.
         if bold && italic {
-            if let Some(id) = self.font_ids_by_key.get(&format!("{}-bold-italic", fam)) {
+            key_buf.clear();
+            key_buf.push_str(&fam);
+            key_buf.push_str("-bold-italic");
+            if let Some(id) = self.font_ids_by_key.get(&key_buf) {
                 return Some(*id);
             }
         }
         if bold {
-            if let Some(id) = self.font_ids_by_key.get(&format!("{}-bold", fam)) {
+            key_buf.clear();
+            key_buf.push_str(&fam);
+            key_buf.push_str("-bold");
+            if let Some(id) = self.font_ids_by_key.get(&key_buf) {
                 return Some(*id);
             }
         }
         if italic {
-            if let Some(id) = self.font_ids_by_key.get(&format!("{}-italic", fam)) {
+            key_buf.clear();
+            key_buf.push_str(&fam);
+            key_buf.push_str("-italic");
+            if let Some(id) = self.font_ids_by_key.get(&key_buf) {
                 return Some(*id);
             }
         }

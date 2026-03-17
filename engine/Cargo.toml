@@ -26,7 +26,7 @@ data-url = "=0.3.1"
 bytes = "1.4.0"
 glow = { version = "0.16", default-features = false }
 khronos-egl = { version = "6", features = ["dynamic"] }
-femtovg = { version = "0.19.3", features = ["image-loading"] }
+femtovg = { version = "0.19.3", default-features = false, features = ["textlayout"] }
 
 # Image decoding - only enable formats actually needed
 # Removing unused formats can save 500KB-1MB

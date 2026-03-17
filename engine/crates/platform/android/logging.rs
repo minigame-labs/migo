@@ -91,7 +91,7 @@ pub fn init_logging() {
         };
 
         Registry::default()
-            .with(LevelFilter::INFO)
+            .with(LevelFilter::DEBUG)
             .with(android_layer)
             .with(timing_layer)
             .init();
@@ -129,7 +129,7 @@ pub fn init_logging() {
     #[cfg(not(debug_assertions))]
     {
         Registry::default()
-            .with(LevelFilter::INFO)
+            .with(LevelFilter::DEBUG)
             .with(android_layer)
             .init();
     }

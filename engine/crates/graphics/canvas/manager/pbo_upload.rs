@@ -70,11 +70,15 @@ pub fn check_pbo_support(gl: &glow::Context) -> bool {
 /// 2. Initiates async DMA transfer from PBO to texture
 /// 3. The actual transfer happens asynchronously
 ///
+/// When a `PboPool` is provided, PBOs are reused from the pool to avoid
+/// GL object churn on frequent image loads.
+///
 /// Note: On ES 2.0, this falls back to synchronous upload
 pub fn upload_texture_with_pbo(
     gl: &glow::Context,
     image: &NormalizedImage,
     use_pbo: bool,
+    pool: Option<&mut PboPool>,
 ) -> EngineResult<PboUploadResult> {
     let start = std::time::Instant::now();
 
@@ -114,9 +118,9 @@ pub fn upload_texture_with_pbo(
         );
     }
 
-    if use_pbo && image.rgba.len() > 0 {
-        // PBO path - async upload
-        upload_with_pbo_internal(gl, tex, image)?;
+    if use_pbo && !image.rgba.is_empty() {
+        // Try pool-based PBO upload first, fall back to create-delete
+        upload_with_pbo_pooled(gl, tex, image, pool)?;
     } else {
         // Fallback - synchronous upload
         upload_sync_internal(gl, tex, image)?;
@@ -141,21 +145,29 @@ pub fn upload_texture_with_pbo(
     })
 }
 
-/// Internal: Upload using PBO
-fn upload_with_pbo_internal(
+/// Internal: Upload using PBO with optional pool reuse
+fn upload_with_pbo_pooled(
     gl: &glow::Context,
     tex: glow::NativeTexture,
     image: &NormalizedImage,
+    mut pool: Option<&mut PboPool>,
 ) -> EngineResult<()> {
-    unsafe {
-        // Create PBO
-        let pbo = gl.create_buffer().map_err(|e| {
-            ee(
-                ErrorCode::RenderBackendError,
-                format!("create_buffer (PBO) failed: {e:?}"),
-            )
-        })?;
+    let data_size = image.rgba.len();
 
+    // Try to acquire PBO from pool, otherwise create one
+    let pbo = match pool.as_mut().and_then(|p| p.acquire(gl, data_size)) {
+        Some(pbo) => pbo,
+        None => unsafe {
+            gl.create_buffer().map_err(|e| {
+                ee(
+                    ErrorCode::RenderBackendError,
+                    format!("create_buffer (PBO) failed: {e:?}"),
+                )
+            })?
+        },
+    };
+
+    unsafe {
         // Bind PBO as PIXEL_UNPACK_BUFFER
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pbo));
 
@@ -182,19 +194,22 @@ fn upload_with_pbo_internal(
 
         // Unbind PBO
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
-
-        // Delete PBO (the texture upload is queued, GPU will complete it)
-        // This is safe because GL will keep the buffer data until the transfer completes
-        gl.delete_buffer(pbo);
-
-        Ok(())
     }
+
+    // Return PBO to pool (pool handles "full" case by deleting), or delete directly
+    if let Some(p) = pool {
+        p.release(gl, pbo, data_size);
+    } else {
+        unsafe { gl.delete_buffer(pbo) };
+    }
+
+    Ok(())
 }
 
 /// Internal: Synchronous upload (fallback for ES 2.0)
 fn upload_sync_internal(
     gl: &glow::Context,
-    tex: glow::NativeTexture,
+    _tex: glow::NativeTexture,
     image: &NormalizedImage,
 ) -> EngineResult<()> {
     unsafe {

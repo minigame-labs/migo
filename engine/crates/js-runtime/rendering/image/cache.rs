@@ -1,6 +1,6 @@
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use tokio::sync::oneshot;
 
 pub struct SharedImageEntry {
@@ -160,7 +160,7 @@ pub static IMAGE_CACHE: Lazy<Mutex<ImageCache>> = Lazy::new(|| Mutex::new(ImageC
 /// Must be called during host shutdown to prevent stale entries from
 /// leaking into the next session (IMAGE_CACHE is process-global).
 pub fn clear_shared_image_cache() {
-    let mut c = IMAGE_CACHE.lock().unwrap();
+    let mut c = IMAGE_CACHE.lock();
     c.by_src.clear();
     c.alias_to_shared.clear();
     c.shared_to_src.clear();

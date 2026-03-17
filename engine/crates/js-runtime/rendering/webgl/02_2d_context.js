@@ -93,6 +93,9 @@ class CanvasRenderingContext2D {
         this._textAlign = 'start';
         this._textBaseline = 'alphabetic';
 
+        // Current transform matrix [a, b, c, d, e, f] for getTransform/transform
+        this._tm = [1, 0, 0, 1, 0, 0];
+
         // State stack for save/restore
         this._stateStack = [];
 
@@ -294,6 +297,7 @@ class CanvasRenderingContext2D {
             font: this._font,
             textAlign: this._textAlign,
             textBaseline: this._textBaseline,
+            tm: this._tm.slice(),
         });
         this._frameBegin();
         op_save(this._canvasId);
@@ -313,6 +317,7 @@ class CanvasRenderingContext2D {
                 _font: state.font,
                 _textAlign: state.textAlign,
                 _textBaseline: state.textBaseline,
+                _tm: state.tm,
             });
         }
         this._frameBegin();
@@ -323,37 +328,64 @@ class CanvasRenderingContext2D {
 
     translate(x, y) {
         this._frameBegin();
+        const m = this._tm;
+        m[4] += m[0] * x + m[2] * y;
+        m[5] += m[1] * x + m[3] * y;
         op_translate(this._canvasId, x, y);
     }
 
     rotate(angle) {
         this._frameBegin();
+        const cos = Math.cos(angle), sin = Math.sin(angle);
+        const m = this._tm;
+        const a = m[0], b = m[1], c = m[2], d = m[3];
+        m[0] = a * cos + c * sin;
+        m[1] = b * cos + d * sin;
+        m[2] = a * -sin + c * cos;
+        m[3] = b * -sin + d * cos;
         op_rotate(this._canvasId, angle);
     }
 
     scale(x, y) {
         this._frameBegin();
+        this._tm[0] *= x; this._tm[1] *= x;
+        this._tm[2] *= y; this._tm[3] *= y;
         op_scale(this._canvasId, x, y);
     }
 
     setTransform(a, b, c, d, e, f) {
         this._frameBegin();
+        this._tm[0] = a; this._tm[1] = b;
+        this._tm[2] = c; this._tm[3] = d;
+        this._tm[4] = e; this._tm[5] = f;
         op_set_transform(this._canvasId, a, b, c, d, e, f);
     }
 
     resetTransform() {
         this._frameBegin();
+        this._tm[0] = 1; this._tm[1] = 0;
+        this._tm[2] = 0; this._tm[3] = 1;
+        this._tm[4] = 0; this._tm[5] = 0;
         op_reset_transform(this._canvasId);
     }
 
     transform(a, b, c, d, e, f) {
-        // transform() multiplies current matrix; approximate with setTransform
+        // Multiply current matrix: CTM = CTM * [a b c d e f]
         this._frameBegin();
-        op_set_transform(this._canvasId, a, b, c, d, e, f);
+        const m = this._tm;
+        const a0 = m[0], b0 = m[1], c0 = m[2], d0 = m[3], e0 = m[4], f0 = m[5];
+        m[0] = a0 * a + c0 * b;
+        m[1] = b0 * a + d0 * b;
+        m[2] = a0 * c + c0 * d;
+        m[3] = b0 * c + d0 * d;
+        m[4] = a0 * e + c0 * f + e0;
+        m[5] = b0 * e + d0 * f + f0;
+        op_set_transform(this._canvasId, m[0], m[1], m[2], m[3], m[4], m[5]);
     }
 
     getTransform() {
-        return { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+        const m = this._tm;
+        return { a: m[0], b: m[1], c: m[2], d: m[3], e: m[4], f: m[5] };
     }
 
     // ==================== Image Methods ====================

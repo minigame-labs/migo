@@ -20,6 +20,7 @@ deno_core.workspace=true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "rt-multi-thread", "net"] }
 tracing = { workspace = true }
 shared = {path = "../shared"}
+io = { path = "../io", default-features = false }
 serde.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
@@ -32,5 +33,6 @@ glow.workspace = true
 bytemuck.workspace = true
 image = { workspace = true, optional = true }
 once_cell.workspace = true
+parking_lot = "0.12.4"
 tokio-tungstenite.workspace = true
 futures.workspace = true

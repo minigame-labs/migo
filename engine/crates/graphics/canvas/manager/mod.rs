@@ -52,6 +52,9 @@ pub(crate) struct CanvasManager {
     // Image registry
     image_registry: ImageRegistry,
 
+    /// Last eglSwapInterval value to avoid redundant driver calls per frame.
+    last_swap_interval: i32,
+
     // GL object registries
     pub(crate) programs: HashMap<ProgramId, ProgramMeta>,
     pub(crate) shaders: HashMap<ShaderId, ShaderMeta>,
@@ -111,6 +114,7 @@ impl CanvasManager {
             contexts_2d: HashMap::with_capacity(4),
             dirty_2d: HashSet::with_capacity(4),
             image_registry: ImageRegistry::new(),
+            last_swap_interval: -1, // force first eglSwapInterval call
             programs: HashMap::with_capacity(16),
             shaders: HashMap::with_capacity(32),
             buffers: HashMap::with_capacity(32),
@@ -174,44 +178,20 @@ impl CanvasManager {
         // but the game's JS code still expects canvas_id=1 to work.
         let mut had_2d_context = false;
 
-        if let Some(entry) = self.canvases.get_mut(&id) {
-            if matches!(entry.kind, SurfaceKind::Window(w) if w == window) && entry.info.is_onscreen
-            {
-                let pw = self
-                    .egl
-                    .query_surface(self.display, entry.ctx.surf, egl::WIDTH)
-                    .unwrap_or(0);
-                let ph = self
-                    .egl
-                    .query_surface(self.display, entry.ctx.surf, egl::HEIGHT)
-                    .unwrap_or(0);
-
-                let physical_w = (pw.max(1)) as u32;
-                let physical_h = (ph.max(1)) as u32;
-
-                // Calculate logical dimensions (CSS pixels) from physical pixels
-                let dpi = self.dpi.max(1.0);
-                let logical_w = (physical_w as f32 / dpi).round() as u32;
-                let logical_h = (physical_h as f32 / dpi).round() as u32;
-
-                entry.info.width = logical_w;
-                entry.info.height = logical_h;
-                entry.logical_width = logical_w;
-                entry.logical_height = logical_h;
-
-                if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-                    ctx2d
-                        .canvas
-                        .set_size(physical_w, physical_h, self.dpi.max(0.1));
-                }
-
-                self.make_current_needed(id)?;
-                return Ok(());
-            }
-
+        if let Some(_entry) = self.canvases.get(&id) {
+            // Always destroy and recreate the EGL surface, even when the same
+            // ANativeWindow handle is reused. On many Android drivers,
+            // eglQuerySurface returns the creation-time dimensions and does NOT
+            // reflect later window resizes (e.g. navigation bar hide/show).
+            // Reusing the old surface leads to buffer size mismatches that
+            // SurfaceFlinger rejects ("rejecting buffer"), causing flicker.
             had_2d_context = self.contexts_2d.contains_key(&id);
             self.destroy_onscreen_internal(id)?;
         }
+
+        // A newly created window surface may not inherit the previous swap
+        // interval state on all drivers, so force the next swap to reapply it.
+        self.last_swap_interval = -1;
 
         self.egl.bind_api(egl::OPENGL_ES_API).map_err(|e| {
             ee(
@@ -308,6 +288,7 @@ impl CanvasManager {
             let _ = self.egl.destroy_context(self.display, entry.ctx.ctx);
 
             self.bound = BoundContext::Resource;
+            self.last_swap_interval = -1;
         }
         Ok(())
     }
@@ -395,6 +376,11 @@ impl CanvasManager {
             })?;
         self.bound = BoundContext::Resource;
         Ok(())
+    }
+
+    /// Returns true if the currently bound context is the onscreen canvas (id=1).
+    pub(crate) fn is_onscreen_bound(&self) -> bool {
+        self.bound == BoundContext::Canvas(CanvasId::from(1u32))
     }
 
     pub(crate) fn make_current_needed(&mut self, id: CanvasId) -> EngineResult<()> {
@@ -540,6 +526,7 @@ impl CanvasManager {
         // create new surface
         let new_surf = match kind {
             SurfaceKind::Window(native_window) => {
+                self.last_swap_interval = -1;
                 egl_ops::create_window_surface(&self.egl, self.display, self.config, native_window)?
             }
             SurfaceKind::Pbuffer => {
@@ -617,9 +604,12 @@ impl CanvasManager {
             .get(&id)
             .ok_or_else(|| ee(ErrorCode::NotFound, format!("canvas not found: {id:?}")))?;
 
-        // Swap interval
+        // Only call eglSwapInterval when the value actually changes
         let interval = if wait_for_vsync { 1 } else { 0 };
-        let _ = self.egl.swap_interval(self.display, interval);
+        if interval != self.last_swap_interval {
+            let _ = self.egl.swap_interval(self.display, interval);
+            self.last_swap_interval = interval;
+        }
         self.egl
             .swap_buffers(self.display, entry.ctx.surf)
             .map_err(|e| {
@@ -637,6 +627,16 @@ impl CanvasManager {
             .get(&id)
             .ok_or_else(|| ee(ErrorCode::NotFound, format!("canvas not found: {id:?}")))?;
         Ok(entry.info.clone())
+    }
+
+    /// Return the logical (CSS-pixel) size of a canvas.
+    /// This is what JS `canvas.width/height` should report.
+    pub(crate) fn get_logical_size(&self, id: CanvasId) -> EngineResult<(u32, u32)> {
+        let entry = self
+            .canvases
+            .get(&id)
+            .ok_or_else(|| ee(ErrorCode::NotFound, format!("canvas not found: {id:?}")))?;
+        Ok((entry.logical_width, entry.logical_height))
     }
 
     // ==================== 2D Context Management ====================
@@ -670,6 +670,45 @@ impl CanvasManager {
 
     pub(crate) fn flush_dirty_2d_contexts(&mut self) -> EngineResult<()> {
         context_2d_impl::flush_dirty_2d_contexts(self)
+    }
+
+    /// Read pixel data from the current framebuffer via glReadPixels.
+    pub(crate) fn read_pixels(
+        &self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let len = (width * height * 4) as usize;
+        let mut buf = vec![0u8; len];
+        unsafe {
+            self.gl.read_pixels(
+                x,
+                y,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut buf)),
+            );
+        }
+        // glReadPixels returns rows in bottom-to-top order; flip to top-to-bottom
+        let row_bytes = (width * 4) as usize;
+        let row_count = height as usize;
+        for r in 0..row_count / 2 {
+            let top = r * row_bytes;
+            let bot = (row_count - 1 - r) * row_bytes;
+            // SAFETY: top and bot slices are non-overlapping (r < row_count - 1 - r)
+            unsafe {
+                std::ptr::swap_nonoverlapping(
+                    buf.as_mut_ptr().add(top),
+                    buf.as_mut_ptr().add(bot),
+                    row_bytes,
+                );
+            }
+        }
+        buf
     }
 
     // ==================== Image Management ====================

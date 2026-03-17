@@ -22,14 +22,21 @@ pub(super) fn init_femtovg_for_canvas(
         return Ok(());
     }
 
-    let (width, height) = {
+    // Use physical pixel dimensions for the femtovg backing store.
+    // CanvasInfo.width/height stores logical (CSS) pixels, so we must
+    // convert back to physical via DPI for set_size().
+    let (phys_w, phys_h) = {
         let canvas = cm.canvases.get(&canvas_id).ok_or_else(|| {
             ee(
                 ErrorCode::NotFound,
                 format!("canvas not found: id={}", canvas_id),
             )
         })?;
-        (canvas.info.width, canvas.info.height)
+        let dpi = cm.dpi.max(1.0);
+        (
+            (canvas.logical_width as f32 * dpi).round() as u32,
+            (canvas.logical_height as f32 * dpi).round() as u32,
+        )
     };
 
     let dpi = cm.dpi;
@@ -55,7 +62,7 @@ pub(super) fn init_femtovg_for_canvas(
         )
     })?;
 
-    fv_canvas.set_size(width, height, dpi);
+    fv_canvas.set_size(phys_w, phys_h, dpi);
     fv_canvas.scale(dpi, dpi);
 
     let font_manager = FontManager::new(&mut fv_canvas)?;

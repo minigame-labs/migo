@@ -67,7 +67,8 @@ pub struct Canvas2DState {
     pub text_baseline: TextBaseline,
 
     pub transform: Transform2D,
-    pub clip_path: Option<Path>,
+    /// Whether a clip region is active (managed via femtovg scissor).
+    pub has_clip: bool,
 }
 
 impl Default for Canvas2DState {
@@ -87,7 +88,7 @@ impl Default for Canvas2DState {
             text_baseline: TextBaseline::default(),
 
             transform: Transform2D::identity(),
-            clip_path: None,
+            has_clip: false,
         }
     }
 }
@@ -98,8 +99,18 @@ pub(crate) struct Canvas2DContext {
     pub state: Canvas2DState,
     pub stack: Vec<Canvas2DState>,
     pub current_path: Path,
+    has_current_point: bool,
+    /// Bounding box of current path (for clip scissor). Reset on begin_path.
+    path_min_x: f32,
+    path_min_y: f32,
+    path_max_x: f32,
+    path_max_y: f32,
     /// Reusable path for rectangle operations (avoids allocation per draw)
     rect_path: Path,
+    /// Cached last font string to skip re-parsing identical SetFont calls.
+    last_font_str: String,
+    last_font_id: Option<FontId>,
+    last_font_size: f32,
 }
 
 impl Canvas2DContext {
@@ -110,8 +121,33 @@ impl Canvas2DContext {
             state: Canvas2DState::default(),
             stack: Vec::with_capacity(8),
             current_path: Path::new(),
+            has_current_point: false,
+            path_min_x: f32::MAX,
+            path_min_y: f32::MAX,
+            path_max_x: f32::MIN,
+            path_max_y: f32::MIN,
             rect_path: Path::new(),
+            last_font_str: String::new(),
+            last_font_id: None,
+            last_font_size: 16.0,
         }
+    }
+
+    /// Expand path bounding box to include point (x, y).
+    #[inline]
+    fn extend_bounds(&mut self, x: f32, y: f32) {
+        if x < self.path_min_x { self.path_min_x = x; }
+        if y < self.path_min_y { self.path_min_y = y; }
+        if x > self.path_max_x { self.path_max_x = x; }
+        if y > self.path_max_y { self.path_max_y = y; }
+    }
+
+    #[inline]
+    fn reset_bounds(&mut self) {
+        self.path_min_x = f32::MAX;
+        self.path_min_y = f32::MAX;
+        self.path_max_x = f32::MIN;
+        self.path_max_y = f32::MIN;
     }
 
     /// Get a reusable path with a single rect, avoiding allocation
@@ -134,32 +170,101 @@ impl Canvas2DContext {
     }
 
     // ========== Path methods ==========
-    pub fn begin_path(&mut self) { self.current_path = Path::new(); }
+    pub fn begin_path(&mut self) {
+        self.current_path = Path::new();
+        self.has_current_point = false;
+        self.reset_bounds();
+    }
     pub fn close_path(&mut self) { self.current_path.close(); }
-    pub fn move_to(&mut self, x: f32, y: f32) { self.current_path.move_to(x, y); }
-    pub fn line_to(&mut self, x: f32, y: f32) { self.current_path.line_to(x, y); }
+    pub fn move_to(&mut self, x: f32, y: f32) {
+        self.current_path.move_to(x, y);
+        self.has_current_point = true;
+        self.extend_bounds(x, y);
+    }
+    pub fn line_to(&mut self, x: f32, y: f32) {
+        self.current_path.line_to(x, y);
+        self.has_current_point = true;
+        self.extend_bounds(x, y);
+    }
     pub fn quadratic_curve_to(&mut self, cpx: f32, cpy: f32, x: f32, y: f32) {
         self.current_path.quad_to(cpx, cpy, x, y);
+        self.has_current_point = true;
+        self.extend_bounds(cpx, cpy);
+        self.extend_bounds(x, y);
     }
     pub fn bezier_curve_to(&mut self, cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32) {
         self.current_path.bezier_to(cp1x, cp1y, cp2x, cp2y, x, y);
+        self.has_current_point = true;
+        self.extend_bounds(cp1x, cp1y);
+        self.extend_bounds(cp2x, cp2y);
+        self.extend_bounds(x, y);
     }
     pub fn arc(&mut self, x: f32, y: f32, radius: f32, start_angle: f32, end_angle: f32, ccw: bool) {
         let solidity = if ccw { femtovg::Solidity::Hole } else { femtovg::Solidity::Solid };
         self.current_path.arc(x, y, radius, start_angle, end_angle, solidity);
+        self.has_current_point = true;
+        // Conservative bounding box for arc
+        self.extend_bounds(x - radius, y - radius);
+        self.extend_bounds(x + radius, y + radius);
     }
     pub fn arc_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, radius: f32) {
         self.current_path.arc_to(x1, y1, x2, y2, radius);
+        self.has_current_point = true;
+        // Both control points ±radius in all directions for conservative bbox
+        self.extend_bounds(x1 - radius, y1 - radius);
+        self.extend_bounds(x1 + radius, y1 + radius);
+        self.extend_bounds(x2 - radius, y2 - radius);
+        self.extend_bounds(x2 + radius, y2 + radius);
     }
-    pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32) { self.current_path.rect(x, y, w, h); }
+    pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        self.current_path.rect(x, y, w, h);
+        self.has_current_point = true;
+        self.extend_bounds(x, y);
+        self.extend_bounds(x + w, y + h);
+    }
     pub fn ellipse(&mut self, x: f32, y: f32, rx: f32, ry: f32, rot: f32, sa: f32, ea: f32, ccw: bool) {
-        self.canvas.save();
-        self.canvas.translate(x, y);
-        self.canvas.rotate(rot);
-        self.canvas.scale(1.0, ry / rx.max(0.001));
-        let solidity = if ccw { femtovg::Solidity::Hole } else { femtovg::Solidity::Solid };
-        self.current_path.arc(0.0, 0.0, rx, sa, ea, solidity);
-        self.canvas.restore();
+        // Build the ellipse directly on current_path by computing transformed
+        // arc points on the CPU.  We cannot use canvas.save/translate/scale
+        // because the temporary canvas transform is restored before fill/stroke
+        // and Path stores raw vertices — the transform would be lost.
+        if rx <= 0.0 || ry <= 0.0 {
+            return;
+        }
+
+        let (cos_r, sin_r) = (rot.cos(), rot.sin());
+
+        // Determine sweep and step direction
+        let mut sweep = ea - sa;
+        if ccw {
+            if sweep > 0.0 { sweep -= std::f32::consts::TAU; }
+        } else if sweep < 0.0 {
+            sweep += std::f32::consts::TAU;
+        }
+
+        let max_radius = rx.max(ry).max(1.0);
+        // Keep segment arc length around 6px for smoother large ellipses.
+        let steps = ((sweep.abs() * max_radius) / 6.0).ceil().clamp(4.0, 256.0) as usize;
+        let dt = sweep / steps as f32;
+
+        for i in 0..=steps {
+            let t = sa + dt * i as f32;
+            // Point on the unit ellipse, then rotate + translate
+            let px = rx * t.cos();
+            let py = ry * t.sin();
+            let fx = x + px * cos_r - py * sin_r;
+            let fy = y + px * sin_r + py * cos_r;
+            self.extend_bounds(fx, fy);
+            if i == 0 {
+                if self.has_current_point {
+                    self.current_path.line_to(fx, fy);
+                } else {
+                    self.current_path.move_to(fx, fy);
+                }
+            } else {
+                self.current_path.line_to(fx, fy);
+            }
+        }
+        self.has_current_point = true;
     }
 
     // ========== Style setters ==========
@@ -183,14 +288,11 @@ impl Canvas2DContext {
 
     // ========== Drawing methods ==========
     pub fn fill(&mut self) {
-        if self.state.clip_path.is_some() { self.canvas.save(); }
         let paint = self.build_fill_paint();
         self.canvas.fill_path(&self.current_path, &paint);
-        if self.state.clip_path.is_some() { self.canvas.restore(); }
     }
 
     pub fn stroke(&mut self) {
-        if self.state.clip_path.is_some() { self.canvas.save(); }
         let stroke = Self::apply_global_alpha(self.state.stroke_style, self.state.global_alpha);
         let paint = Paint::color(stroke)
             .with_line_width(self.state.line_width)
@@ -198,10 +300,21 @@ impl Canvas2DContext {
             .with_line_join(match self.state.line_join { CanvasLineJoin::Miter => LineJoin::Miter, CanvasLineJoin::Round => LineJoin::Round, CanvasLineJoin::Bevel => LineJoin::Bevel })
             .with_miter_limit(self.state.miter_limit);
         self.canvas.stroke_path(&self.current_path, &paint);
-        if self.state.clip_path.is_some() { self.canvas.restore(); }
     }
 
-    pub fn clip(&mut self) { self.state.clip_path = Some(self.current_path.clone()); }
+    /// Apply the current path as a clip region using femtovg scissor.
+    /// Uses the tracked bounding box of the path — exact for rectangles,
+    /// conservative approximation for curves.
+    pub fn clip(&mut self) {
+        if self.path_min_x < self.path_max_x && self.path_min_y < self.path_max_y {
+            let x = self.path_min_x;
+            let y = self.path_min_y;
+            let w = self.path_max_x - self.path_min_x;
+            let h = self.path_max_y - self.path_min_y;
+            self.canvas.intersect_scissor(x, y, w, h);
+        }
+        self.state.has_clip = true;
+    }
 
     // ========== Rectangle methods ==========
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
@@ -229,10 +342,15 @@ impl Canvas2DContext {
 
     pub fn clear_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
         if w <= 0.0 || h <= 0.0 { return; }
-        self.canvas.save_with(|c| {
-            c.reset_transform();
-            c.clear_rect(x.max(0.0) as u32, y.max(0.0) as u32, w.max(0.0) as u32, h.max(0.0) as u32, Color::rgba(0, 0, 0, 0));
-        });
+        // Use DestinationOut composite with a fully-opaque fill to erase
+        // the rectangle.  This respects the current CTM and handles negative
+        // coordinates correctly, unlike the previous clear_rect(u32) approach.
+        self.canvas.save();
+        self.canvas.global_composite_operation(femtovg::CompositeOperation::DestinationOut);
+        self.rect_path = Path::new();
+        self.rect_path.rect(x, y, w, h);
+        self.canvas.fill_path(&self.rect_path, &Paint::color(Color::white()));
+        self.canvas.restore();
     }
 
     // ========== Transform methods ==========

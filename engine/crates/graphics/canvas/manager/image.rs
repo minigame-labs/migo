@@ -64,7 +64,12 @@ impl ImageRegistry {
         self.ensure_pbo_pool(gl);
 
         // Use PBO upload for better performance (async DMA transfer)
-        let result = pbo_upload::upload_texture_with_pbo(gl, &image, self.use_pbo)?;
+        let result = pbo_upload::upload_texture_with_pbo(
+            gl,
+            &image,
+            self.use_pbo,
+            self.pbo_pool.as_mut(),
+        )?;
 
         let info = ImageInfo::new(
             ImageFlags::empty(),
