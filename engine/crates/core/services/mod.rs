@@ -7,5 +7,5 @@ mod render;
 pub(crate) use audio::*;
 pub use device::*;
 pub(crate) use io::*;
-pub(crate) use render::*;
 pub use platform::*;
+pub(crate) use render::*;

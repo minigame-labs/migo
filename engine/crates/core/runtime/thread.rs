@@ -275,10 +275,7 @@ fn create_basic_runtime() -> Runtime {
 ///
 /// Returns `Some(EngineError)` if this is a recognized termination, `None` otherwise.
 #[cfg(feature = "v8-limits")]
-fn classify_termination_error(
-    host: &Host,
-    original: &EngineError,
-) -> Option<EngineError> {
+fn classify_termination_error(host: &Host, original: &EngineError) -> Option<EngineError> {
     // Check if this is a termination error (V8 sends "execution terminated")
     let is_termination = original.msg.contains("execution terminated")
         || original
@@ -303,16 +300,14 @@ fn classify_termination_error(
     if let Some(ref wd) = host.watchdog {
         if let Some(reason) = wd.state.termination_reason() {
             return Some(match reason {
-                TerminationReason::Timeout => {
-                    EngineError::new(ErrorCode::JsExecutionTimeout)
-                        .with_msg("JS execution exceeded watchdog timeout")
-                        .with_detail("watchdog detected unresponsive JS execution and terminated isolate")
-                }
-                TerminationReason::OutOfMemory => {
-                    EngineError::new(ErrorCode::OutOfMemory)
-                        .with_msg("V8 heap limit exceeded")
-                        .with_detail("watchdog OOM termination")
-                }
+                TerminationReason::Timeout => EngineError::new(ErrorCode::JsExecutionTimeout)
+                    .with_msg("JS execution exceeded watchdog timeout")
+                    .with_detail(
+                        "watchdog detected unresponsive JS execution and terminated isolate",
+                    ),
+                TerminationReason::OutOfMemory => EngineError::new(ErrorCode::OutOfMemory)
+                    .with_msg("V8 heap limit exceeded")
+                    .with_detail("watchdog OOM termination"),
             });
         }
     }

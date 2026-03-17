@@ -24,17 +24,16 @@ pub struct IIRFilterNode {
 }
 
 impl IIRFilterNode {
-    pub fn new(
-        id: AudioNodeId,
-        feedforward: Vec<f64>,
-        feedback: Vec<f64>,
-        channels: u32,
-    ) -> Self {
+    pub fn new(id: AudioNodeId, feedforward: Vec<f64>, feedback: Vec<f64>, channels: u32) -> Self {
         let ff_len = feedforward.len().max(1);
         let fb_len = feedback.len().max(1);
 
         // Normalize by a[0]
-        let a0 = if feedback.is_empty() { 1.0 } else { feedback[0] };
+        let a0 = if feedback.is_empty() {
+            1.0
+        } else {
+            feedback[0]
+        };
         let inv_a0 = if a0.abs() > 1e-20 { 1.0 / a0 } else { 1.0 };
 
         let norm_ff: Vec<f64> = feedforward.iter().map(|&v| v * inv_a0).collect();

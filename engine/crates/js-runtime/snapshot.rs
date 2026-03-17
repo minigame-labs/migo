@@ -30,7 +30,10 @@
 use deno_core::{Extension, ExtensionArguments};
 use shared::op_state::HostOpState;
 
-use crate::{audio, base, console, device, event, file, input, media, network, rendering, storage, url, utility, web, worker};
+use crate::{
+    audio, base, console, device, event, file, input, media, network, rendering, storage, url,
+    utility, web, worker,
+};
 
 /// Embedded snapshot bytes.
 ///
@@ -56,26 +59,24 @@ pub static SNAPSHOT_BYTES: Option<&'static [u8]> = None;
 pub fn lazy_extensions() -> Vec<Extension> {
     let runtime_ext = vec![super::runtime::lazy_init()];
 
-    vec![
-        base::host_v8_base::lazy_init(),
-    ]
-    .into_iter()
-    .chain(console::console_lazy_extensions())
-    .chain(event::event_lazy_extensions())
-    .chain(utility::utility_lazy_extensions())
-    .chain(device::device_lazy_extensions())
-    .chain(storage::storage_lazy_extensions())
-    .chain(input::touch_lazy_extensions())
-    .chain(file::file_lazy_extensions())
-    .chain(rendering::rendering_lazy_extensions())
-    .chain(web::web_lazy_extensions())
-    .chain(url::url_lazy_extensions())
-    .chain(network::network_lazy_extensions())
-    .chain(media::media_lazy_extensions())
-    .chain(audio::audio_lazy_extensions())
-    .chain(worker::worker_lazy_extensions())
-    .chain(runtime_ext)
-    .collect()
+    vec![base::host_v8_base::lazy_init()]
+        .into_iter()
+        .chain(console::console_lazy_extensions())
+        .chain(event::event_lazy_extensions())
+        .chain(utility::utility_lazy_extensions())
+        .chain(device::device_lazy_extensions())
+        .chain(storage::storage_lazy_extensions())
+        .chain(input::touch_lazy_extensions())
+        .chain(file::file_lazy_extensions())
+        .chain(rendering::rendering_lazy_extensions())
+        .chain(web::web_lazy_extensions())
+        .chain(url::url_lazy_extensions())
+        .chain(network::network_lazy_extensions())
+        .chain(media::media_lazy_extensions())
+        .chain(audio::audio_lazy_extensions())
+        .chain(worker::worker_lazy_extensions())
+        .chain(runtime_ext)
+        .collect()
 }
 
 /// Create [`ExtensionArguments`] with actual runtime state for all extensions.

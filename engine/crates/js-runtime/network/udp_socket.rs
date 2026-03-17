@@ -53,7 +53,11 @@ impl Resource for UdpSocketResource {
 
 /// Events returned by `op_udp_next_event` to JS.
 #[derive(Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum UdpEvent {
     /// Data received from a remote peer.
     #[serde(rename = "message")]
@@ -106,9 +110,13 @@ pub fn op_udp_bind(
     let is_v6 = socket_type == "udp6";
 
     let bind_addr: SocketAddr = if is_v6 {
-        format!("[::]:{}",port).parse().map_err(|e| JsErrorBox::generic(format!("bind:fail {}", e)))?
+        format!("[::]:{}", port)
+            .parse()
+            .map_err(|e| JsErrorBox::generic(format!("bind:fail {}", e)))?
     } else {
-        format!("0.0.0.0:{}", port).parse().map_err(|e| JsErrorBox::generic(format!("bind:fail {}", e)))?
+        format!("0.0.0.0:{}", port)
+            .parse()
+            .map_err(|e| JsErrorBox::generic(format!("bind:fail {}", e)))?
     };
 
     debug!("UDP bind: {} (type={})", bind_addr, socket_type);
@@ -116,7 +124,8 @@ pub fn op_udp_bind(
     let std_socket = std::net::UdpSocket::bind(bind_addr)
         .map_err(|e| JsErrorBox::generic(format!("bind:fail {}", e)))?;
 
-    std_socket.set_nonblocking(true)
+    std_socket
+        .set_nonblocking(true)
         .map_err(|e| JsErrorBox::generic(format!("bind:fail set_nonblocking: {}", e)))?;
 
     let socket = UdpSocket::from_std(std_socket)
@@ -205,7 +214,10 @@ pub async fn op_udp_send(
 
     // Resolve target address
     let addr_str = format!("{}:{}", address, port);
-    debug!("UDP send: rid={}, target={}, broadcast={}", rid, addr_str, set_broadcast);
+    debug!(
+        "UDP send: rid={}, target={}, broadcast={}",
+        rid, addr_str, set_broadcast
+    );
     let sock_addr = resolve_first(&addr_str)
         .await
         .map_err(|e| JsErrorBox::generic(format!("send:fail resolve error: {}", e)))?;
@@ -223,7 +235,11 @@ pub async fn op_udp_send(
         text.as_bytes().to_vec()
     } else if let Some(ref buf) = data_buf {
         let off = offset as usize;
-        let len = if length == 0 { buf.len().saturating_sub(off) } else { length as usize };
+        let len = if length == 0 {
+            buf.len().saturating_sub(off)
+        } else {
+            length as usize
+        };
         let end = (off + len).min(buf.len());
         if off >= buf.len() {
             return Err(JsErrorBox::generic("send:fail offset out of bounds"));

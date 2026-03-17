@@ -41,8 +41,8 @@ pub(crate) struct ShaderMeta {
     pub gl_handle: Option<NativeShader>,
     pub owner_canvas: Option<CanvasId>,
     #[allow(dead_code)]
-    pub shader_type: ShaderType,    // Vertex / Fragment (protocol enum)
-    pub gl_shader_type: u32,        // glow::VERTEX_SHADER / glow::FRAGMENT_SHADER
+    pub shader_type: ShaderType, // Vertex / Fragment (protocol enum)
+    pub gl_shader_type: u32, // glow::VERTEX_SHADER / glow::FRAGMENT_SHADER
     pub deleted: bool,
     pub source_len: usize, // cached for SHADER_SOURCE_LENGTH
 }
@@ -74,4 +74,3 @@ pub(super) struct CanvasEntry {
     pub kind: SurfaceKind,
     pub ctx: EglContextHandle,
 }
-

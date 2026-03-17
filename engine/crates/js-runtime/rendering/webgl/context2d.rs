@@ -7,7 +7,7 @@
 //! Sync operations (`op_create_context_2d`, `op_measure_text`, `op_get_image_data`)
 //! use `RenderCommand::Canvas2D` for synchronous request/response.
 
-use deno_core::{op2, OpState};
+use deno_core::{OpState, op2};
 use once_cell::sync::Lazy;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -372,7 +372,8 @@ impl FrameBuffer {
     fn set_text_baseline(&mut self, baseline: TextBaseline) {
         if self.text_baseline != Some(baseline) {
             self.text_baseline = Some(baseline);
-            self.commands.push(Canvas2DCmd::SetTextBaseline { baseline });
+            self.commands
+                .push(Canvas2DCmd::SetTextBaseline { baseline });
         }
     }
 
@@ -579,27 +580,74 @@ const OP_CREATE_CTX2D: &str = "canvas2d create context";
 #[op2(fast)]
 pub fn op_create_context_2d(state: &mut OpState, #[smi] canvas_id: u32) -> i32 {
     let ctx = state.borrow::<CanvasOpState>();
-    match send_render_with_resp_sync(ctx, OP_CREATE_CTX2D, |resp| RenderCommand::Canvas2D { canvas_id, cmd: Canvas2DCmd::CreateContext2D { resp } }) {
+    match send_render_with_resp_sync(ctx, OP_CREATE_CTX2D, |resp| RenderCommand::Canvas2D {
+        canvas_id,
+        cmd: Canvas2DCmd::CreateContext2D { resp },
+    }) {
         Ok(id) => id as i32,
-        Err(e) => { error!("{OP_CREATE_CTX2D} failed: {e}"); -1 }
+        Err(e) => {
+            error!("{OP_CREATE_CTX2D} failed: {e}");
+            -1
+        }
     }
 }
 
 const OP_MEASURE_TEXT: &str = "canvas2d measure_text";
-#[op2] #[serde] pub fn op_measure_text(state: &mut OpState, #[smi] canvas_id: u32, #[string] text: String) -> TextMetrics {
+#[op2]
+#[serde]
+pub fn op_measure_text(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[string] text: String,
+) -> TextMetrics {
     let ctx = state.borrow::<CanvasOpState>();
-    match send_render_with_resp_sync(ctx, OP_MEASURE_TEXT, |resp| RenderCommand::Canvas2D { canvas_id, cmd: Canvas2DCmd::MeasureText { text, resp } }) {
+    match send_render_with_resp_sync(ctx, OP_MEASURE_TEXT, |resp| RenderCommand::Canvas2D {
+        canvas_id,
+        cmd: Canvas2DCmd::MeasureText { text, resp },
+    }) {
         Ok(m) => m,
-        Err(e) => { error!("{OP_MEASURE_TEXT} failed: {e}"); TextMetrics { width: 0.0, actual_bounding_box_left: 0.0, actual_bounding_box_right: 0.0, actual_bounding_box_ascent: 0.0, actual_bounding_box_descent: 0.0, font_bounding_box_ascent: 0.0, font_bounding_box_descent: 0.0 } }
+        Err(e) => {
+            error!("{OP_MEASURE_TEXT} failed: {e}");
+            TextMetrics {
+                width: 0.0,
+                actual_bounding_box_left: 0.0,
+                actual_bounding_box_right: 0.0,
+                actual_bounding_box_ascent: 0.0,
+                actual_bounding_box_descent: 0.0,
+                font_bounding_box_ascent: 0.0,
+                font_bounding_box_descent: 0.0,
+            }
+        }
     }
 }
 
 const OP_GET_IMAGE_DATA: &str = "canvas2d get_image_data";
-#[op2] #[buffer] pub fn op_get_image_data(state: &mut OpState, #[smi] canvas_id: u32, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
+#[op2]
+#[buffer]
+pub fn op_get_image_data(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
     let ctx = state.borrow::<CanvasOpState>();
-    match send_render_with_resp_sync(ctx, OP_GET_IMAGE_DATA, |resp| RenderCommand::Canvas2D { canvas_id, cmd: Canvas2DCmd::GetImageData { x, y, width, height, resp } }) {
+    match send_render_with_resp_sync(ctx, OP_GET_IMAGE_DATA, |resp| RenderCommand::Canvas2D {
+        canvas_id,
+        cmd: Canvas2DCmd::GetImageData {
+            x,
+            y,
+            width,
+            height,
+            resp,
+        },
+    }) {
         Ok(d) => d,
-        Err(e) => { error!("{OP_GET_IMAGE_DATA} failed: {e}"); vec![] }
+        Err(e) => {
+            error!("{OP_GET_IMAGE_DATA} failed: {e}");
+            vec![]
+        }
     }
 }
 
@@ -627,10 +675,14 @@ pub fn op_frame_end(state: &mut OpState, #[smi] canvas_id: u32) {
     if let Some(cmds) = commands {
         if !cmds.is_empty() {
             let ctx = state.borrow::<CanvasOpState>();
-            trace!("op_frame_end: sending {} commands for canvas {}", cmds.len(), canvas_id);
+            trace!(
+                "op_frame_end: sending {} commands for canvas {}",
+                cmds.len(),
+                canvas_id
+            );
             if let Err(e) = ctx.tx.send(RenderCommand::Canvas2DBatch {
                 canvas_id,
-                commands: cmds
+                commands: cmds,
             }) {
                 error!("op_frame_end: send failed: {e}");
             }
@@ -650,7 +702,11 @@ pub fn op_frame_end_all(state: &mut OpState) {
 
     for (canvas_id, cmds) in pairs {
         let ctx = state.borrow::<CanvasOpState>();
-        trace!("op_frame_end_all: sending {} commands for canvas {}", cmds.len(), canvas_id);
+        trace!(
+            "op_frame_end_all: sending {} commands for canvas {}",
+            cmds.len(),
+            canvas_id
+        );
         if let Err(e) = ctx.tx.send(RenderCommand::Canvas2DBatch {
             canvas_id,
             commands: cmds,
@@ -721,8 +777,10 @@ pub fn op_line_to(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) {
 pub fn op_quadratic_curve_to(
     state: &mut OpState,
     #[smi] canvas_id: u32,
-    cpx: f32, cpy: f32,
-    x: f32, y: f32,
+    cpx: f32,
+    cpy: f32,
+    x: f32,
+    y: f32,
 ) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
         collector.push(canvas_id, Canvas2DCmd::QuadraticCurveTo { cpx, cpy, x, y });
@@ -733,12 +791,25 @@ pub fn op_quadratic_curve_to(
 pub fn op_bezier_curve_to(
     state: &mut OpState,
     #[smi] canvas_id: u32,
-    cp1x: f32, cp1y: f32,
-    cp2x: f32, cp2y: f32,
-    x: f32, y: f32,
+    cp1x: f32,
+    cp1y: f32,
+    cp2x: f32,
+    cp2y: f32,
+    x: f32,
+    y: f32,
 ) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-        collector.push(canvas_id, Canvas2DCmd::BezierCurveTo { cp1x, cp1y, cp2x, cp2y, x, y });
+        collector.push(
+            canvas_id,
+            Canvas2DCmd::BezierCurveTo {
+                cp1x,
+                cp1y,
+                cp2x,
+                cp2y,
+                x,
+                y,
+            },
+        );
     }
 }
 
@@ -746,15 +817,25 @@ pub fn op_bezier_curve_to(
 pub fn op_arc(
     state: &mut OpState,
     #[smi] canvas_id: u32,
-    x: f32, y: f32,
+    x: f32,
+    y: f32,
     radius: f32,
-    start_angle: f32, end_angle: f32,
+    start_angle: f32,
+    end_angle: f32,
     counterclockwise: bool,
 ) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-        collector.push(canvas_id, Canvas2DCmd::Arc {
-            x, y, radius, start_angle, end_angle, counterclockwise
-        });
+        collector.push(
+            canvas_id,
+            Canvas2DCmd::Arc {
+                x,
+                y,
+                radius,
+                start_angle,
+                end_angle,
+                counterclockwise,
+            },
+        );
     }
 }
 
@@ -762,12 +843,23 @@ pub fn op_arc(
 pub fn op_arc_to(
     state: &mut OpState,
     #[smi] canvas_id: u32,
-    x1: f32, y1: f32,
-    x2: f32, y2: f32,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
     radius: f32,
 ) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-        collector.push(canvas_id, Canvas2DCmd::ArcTo { x1, y1, x2, y2, radius });
+        collector.push(
+            canvas_id,
+            Canvas2DCmd::ArcTo {
+                x1,
+                y1,
+                x2,
+                y2,
+                radius,
+            },
+        );
     }
 }
 
@@ -783,16 +875,29 @@ pub fn op_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f3
 pub fn op_ellipse(
     state: &mut OpState,
     #[smi] canvas_id: u32,
-    x: f32, y: f32,
-    radius_x: f32, radius_y: f32,
+    x: f32,
+    y: f32,
+    radius_x: f32,
+    radius_y: f32,
     rotation: f32,
-    start_angle: f32, end_angle: f32,
+    start_angle: f32,
+    end_angle: f32,
     counterclockwise: bool,
 ) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-        collector.push(canvas_id, Canvas2DCmd::Ellipse {
-            x, y, radius_x, radius_y, rotation, start_angle, end_angle, counterclockwise
-        });
+        collector.push(
+            canvas_id,
+            Canvas2DCmd::Ellipse {
+                x,
+                y,
+                radius_x,
+                radius_y,
+                rotation,
+                start_angle,
+                end_angle,
+                counterclockwise,
+            },
+        );
     }
 }
 
@@ -824,11 +929,20 @@ pub fn op_fill_text(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     #[string] text: String,
-    x: f32, y: f32,
+    x: f32,
+    y: f32,
     max_width: f32,
 ) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-        collector.push(canvas_id, Canvas2DCmd::FillText { text, x, y, max_width });
+        collector.push(
+            canvas_id,
+            Canvas2DCmd::FillText {
+                text,
+                x,
+                y,
+                max_width,
+            },
+        );
     }
 }
 
@@ -837,11 +951,20 @@ pub fn op_stroke_text(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     #[string] text: String,
-    x: f32, y: f32,
+    x: f32,
+    y: f32,
     max_width: f32,
 ) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-        collector.push(canvas_id, Canvas2DCmd::StrokeText { text, x, y, max_width });
+        collector.push(
+            canvas_id,
+            Canvas2DCmd::StrokeText {
+                text,
+                x,
+                y,
+                max_width,
+            },
+        );
     }
 }
 
@@ -855,7 +978,11 @@ pub fn op_set_fill_style(state: &mut OpState, #[smi] canvas_id: u32, #[string] c
 }
 
 #[op2(fast)]
-pub fn op_set_stroke_style(state: &mut OpState, #[smi] canvas_id: u32, #[string] color_str: String) {
+pub fn op_set_stroke_style(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[string] color_str: String,
+) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
         let color = parse_color_string(&color_str);
         collector.set_stroke_color(canvas_id, color);
@@ -962,7 +1089,12 @@ pub fn op_scale(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) {
 pub fn op_set_transform(
     state: &mut OpState,
     #[smi] canvas_id: u32,
-    a: f32, b: f32, c: f32, d: f32, e: f32, f: f32,
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
 ) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
         collector.push(canvas_id, Canvas2DCmd::SetTransform { a, b, c, d, e, f });
@@ -976,22 +1108,35 @@ pub fn op_draw_image(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     #[smi] image_id: u32,
-    sx: f32, sy: f32, sw: f32, sh: f32,
-    dx: f32, dy: f32, dw: f32, dh: f32,
+    sx: f32,
+    sy: f32,
+    sw: f32,
+    sh: f32,
+    dx: f32,
+    dy: f32,
+    dw: f32,
+    dh: f32,
 ) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-        collector.push(canvas_id, Canvas2DCmd::DrawImage {
-            image_id, sx, sy, sw, sh, dx, dy, dw, dh
-        });
+        collector.push(
+            canvas_id,
+            Canvas2DCmd::DrawImage {
+                image_id,
+                sx,
+                sy,
+                sw,
+                sh,
+                dx,
+                dy,
+                dw,
+                dh,
+            },
+        );
     }
 }
 
 #[op2(fast)]
-pub fn op_draw_image_batch(
-    state: &mut OpState,
-    #[smi] canvas_id: u32,
-    #[buffer] data: &[u8],
-) {
+pub fn op_draw_image_batch(state: &mut OpState, #[smi] canvas_id: u32, #[buffer] data: &[u8]) {
     use shared::protocol::render_cmd::DrawImageEntry;
 
     const ENTRY_SIZE: usize = 9 * 4;

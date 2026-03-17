@@ -2,8 +2,11 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{onscreen_window_from_surface, CanvasHandler, CanvasManager, FontData, Renderer2d, RendererGL, global_fonts_mut};
-use crossbeam_channel::{bounded, select, tick, Receiver};
+use crate::{
+    CanvasHandler, CanvasManager, FontData, Renderer2d, RendererGL, global_fonts_mut,
+    onscreen_window_from_surface,
+};
+use crossbeam_channel::{Receiver, bounded, select, tick};
 use shared::protocol::render_cmd::RenderCommand;
 use shared::surface::SurfaceRef;
 use tokio::sync::mpsc::Sender as TokioSender;
@@ -32,7 +35,14 @@ impl RenderThread {
         initial_surface: Option<SurfaceRef>,
         dpi: f32,
     ) -> Self {
-        Self::spawn_with_capacity(raf_tx, vsync_rx, host_id, initial_surface, dpi, DEFAULT_RENDER_QUEUE_CAPACITY)
+        Self::spawn_with_capacity(
+            raf_tx,
+            vsync_rx,
+            host_id,
+            initial_surface,
+            dpi,
+            DEFAULT_RENDER_QUEUE_CAPACITY,
+        )
     }
 
     /// Spawn render thread with custom queue capacity.

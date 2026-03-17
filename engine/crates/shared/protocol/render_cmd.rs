@@ -81,7 +81,7 @@ pub enum RenderCommand {
         canvas_id: CanvasId,
         cmd: Canvas2DCmd,
     },
-    
+
     /// Batched Canvas2D commands (V2 - command batching)
     ///
     /// Contains all Canvas2D commands for a single frame, sent as one message.
@@ -90,7 +90,7 @@ pub enum RenderCommand {
         canvas_id: CanvasId,
         commands: Vec<Canvas2DCmd>,
     },
-    
+
     /// Invalidate signal for on-demand rendering mode
     ///
     /// When in on-demand mode, the render thread only renders when:
@@ -414,14 +414,59 @@ pub enum Canvas2DCmd {
     // ========== Path methods ==========
     BeginPath,
     ClosePath,
-    MoveTo { x: f32, y: f32 },
-    LineTo { x: f32, y: f32 },
-    QuadraticCurveTo { cpx: f32, cpy: f32, x: f32, y: f32 },
-    BezierCurveTo { cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32 },
-    Arc { x: f32, y: f32, radius: f32, start_angle: f32, end_angle: f32, counterclockwise: bool },
-    ArcTo { x1: f32, y1: f32, x2: f32, y2: f32, radius: f32 },
-    Rect { x: f32, y: f32, w: f32, h: f32 },
-    Ellipse { x: f32, y: f32, radius_x: f32, radius_y: f32, rotation: f32, start_angle: f32, end_angle: f32, counterclockwise: bool },
+    MoveTo {
+        x: f32,
+        y: f32,
+    },
+    LineTo {
+        x: f32,
+        y: f32,
+    },
+    QuadraticCurveTo {
+        cpx: f32,
+        cpy: f32,
+        x: f32,
+        y: f32,
+    },
+    BezierCurveTo {
+        cp1x: f32,
+        cp1y: f32,
+        cp2x: f32,
+        cp2y: f32,
+        x: f32,
+        y: f32,
+    },
+    Arc {
+        x: f32,
+        y: f32,
+        radius: f32,
+        start_angle: f32,
+        end_angle: f32,
+        counterclockwise: bool,
+    },
+    ArcTo {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        radius: f32,
+    },
+    Rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    Ellipse {
+        x: f32,
+        y: f32,
+        radius_x: f32,
+        radius_y: f32,
+        rotation: f32,
+        start_angle: f32,
+        end_angle: f32,
+        counterclockwise: bool,
+    },
 
     // ========== Drawing methods ==========
     Fill,
@@ -429,45 +474,126 @@ pub enum Canvas2DCmd {
     Clip,
 
     // ========== Rectangle methods ==========
-    FillRect { x: f32, y: f32, w: f32, h: f32 },
-    StrokeRect { x: f32, y: f32, w: f32, h: f32 },
-    ClearRect { x: f32, y: f32, w: f32, h: f32 },
+    FillRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    StrokeRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    ClearRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
 
     // ========== Text methods ==========
-    FillText { text: String, x: f32, y: f32, max_width: f32 },
-    StrokeText { text: String, x: f32, y: f32, max_width: f32 },
-    MeasureText { text: String, resp: RenderCmdResp<TextMetrics> },
+    FillText {
+        text: String,
+        x: f32,
+        y: f32,
+        max_width: f32,
+    },
+    StrokeText {
+        text: String,
+        x: f32,
+        y: f32,
+        max_width: f32,
+    },
+    MeasureText {
+        text: String,
+        resp: RenderCmdResp<TextMetrics>,
+    },
 
     // ========== Style setters ==========
-    SetFillStyle { color: Color },
-    SetStrokeStyle { color: Color },
-    SetLineWidth { width: f32 },
-    SetLineCap { cap: u8 },
-    SetLineJoin { join: u8 },
-    SetMiterLimit { limit: f32 },
-    SetGlobalAlpha { alpha: f32 },
-    SetFont { font: String },
-    SetTextAlign { align: TextAlign },
-    SetTextBaseline { baseline: TextBaseline },
+    SetFillStyle {
+        color: Color,
+    },
+    SetStrokeStyle {
+        color: Color,
+    },
+    SetLineWidth {
+        width: f32,
+    },
+    SetLineCap {
+        cap: u8,
+    },
+    SetLineJoin {
+        join: u8,
+    },
+    SetMiterLimit {
+        limit: f32,
+    },
+    SetGlobalAlpha {
+        alpha: f32,
+    },
+    SetFont {
+        font: String,
+    },
+    SetTextAlign {
+        align: TextAlign,
+    },
+    SetTextBaseline {
+        baseline: TextBaseline,
+    },
 
     // ========== State methods ==========
     Save,
     Restore,
 
     // ========== Transform methods ==========
-    SetTransform { a: f32, b: f32, c: f32, d: f32, e: f32, f: f32 },
+    SetTransform {
+        a: f32,
+        b: f32,
+        c: f32,
+        d: f32,
+        e: f32,
+        f: f32,
+    },
     ResetTransform,
-    Translate { x: f32, y: f32 },
-    Rotate { angle: f32 },
-    Scale { x: f32, y: f32 },
+    Translate {
+        x: f32,
+        y: f32,
+    },
+    Rotate {
+        angle: f32,
+    },
+    Scale {
+        x: f32,
+        y: f32,
+    },
 
     // ========== Image methods ==========
-    DrawImage { image_id: ImageId, sx: f32, sy: f32, sw: f32, sh: f32, dx: f32, dy: f32, dw: f32, dh: f32 },
-    GetImageData { x: i32, y: i32, width: u32, height: u32, resp: RenderCmdResp<Vec<u8>> },
+    DrawImage {
+        image_id: ImageId,
+        sx: f32,
+        sy: f32,
+        sw: f32,
+        sh: f32,
+        dx: f32,
+        dy: f32,
+        dw: f32,
+        dh: f32,
+    },
+    GetImageData {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        resp: RenderCmdResp<Vec<u8>>,
+    },
 
     /// Batch draw multiple images for better performance
     /// Each entry is (image_id, sx, sy, sw, sh, dx, dy, dw, dh)
-    DrawImageBatch { draws: Vec<DrawImageEntry> },
+    DrawImageBatch {
+        draws: Vec<DrawImageEntry>,
+    },
 }
 
 /// Single draw image entry for batch drawing

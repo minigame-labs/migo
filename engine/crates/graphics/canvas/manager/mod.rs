@@ -238,7 +238,7 @@ impl CanvasManager {
 
         let info = CanvasInfo {
             id,
-            width: logical_w,   // Return logical dimensions to JS
+            width: logical_w, // Return logical dimensions to JS
             height: logical_h,
             is_onscreen: true,
         };
@@ -673,13 +673,7 @@ impl CanvasManager {
     }
 
     /// Read pixel data from the current framebuffer via glReadPixels.
-    pub(crate) fn read_pixels(
-        &self,
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-    ) -> Vec<u8> {
+    pub(crate) fn read_pixels(&self, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
         let len = (width * height * 4) as usize;
         let mut buf = vec![0u8; len];
         unsafe {

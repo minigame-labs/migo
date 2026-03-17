@@ -8,7 +8,10 @@ use super::DecodedAudio;
 pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
     let cursor = Cursor::new(data);
     let reader = WavReader::new(cursor).map_err(|e| {
-        EngineError::from_detail(ErrorCode::InvalidArgument, format!("WAV decode error: {}", e))
+        EngineError::from_detail(
+            ErrorCode::InvalidArgument,
+            format!("WAV decode error: {}", e),
+        )
     })?;
 
     let spec = reader.spec();

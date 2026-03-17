@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
@@ -106,15 +106,30 @@ impl AudioOutput {
         let stream_error = Arc::new(AtomicBool::new(false));
 
         let stream = match config.sample_format() {
-            SampleFormat::F32 => {
-                build_stream_f32(&device, &config.into(), consumer, sync.clone(), low_watermark_samples, stream_error.clone())?
-            }
-            SampleFormat::I16 => {
-                build_stream_i16(&device, &config.into(), consumer, sync.clone(), low_watermark_samples, stream_error.clone())?
-            }
-            SampleFormat::U16 => {
-                build_stream_u16(&device, &config.into(), consumer, sync.clone(), low_watermark_samples, stream_error.clone())?
-            }
+            SampleFormat::F32 => build_stream_f32(
+                &device,
+                &config.into(),
+                consumer,
+                sync.clone(),
+                low_watermark_samples,
+                stream_error.clone(),
+            )?,
+            SampleFormat::I16 => build_stream_i16(
+                &device,
+                &config.into(),
+                consumer,
+                sync.clone(),
+                low_watermark_samples,
+                stream_error.clone(),
+            )?,
+            SampleFormat::U16 => build_stream_u16(
+                &device,
+                &config.into(),
+                consumer,
+                sync.clone(),
+                low_watermark_samples,
+                stream_error.clone(),
+            )?,
             format => {
                 return Err(EngineError::from_detail(
                     ErrorCode::Unsupported,
@@ -124,7 +139,10 @@ impl AudioOutput {
         };
 
         stream.play().map_err(|e| {
-            EngineError::from_detail(ErrorCode::Internal, format!("Failed to start audio stream: {}", e))
+            EngineError::from_detail(
+                ErrorCode::Internal,
+                format!("Failed to start audio stream: {}", e),
+            )
         })?;
 
         Ok(Self {
@@ -220,7 +238,10 @@ fn build_stream_f32(
             None,
         )
         .map_err(|e| {
-            EngineError::from_detail(ErrorCode::Internal, format!("Failed to build audio stream: {}", e))
+            EngineError::from_detail(
+                ErrorCode::Internal,
+                format!("Failed to build audio stream: {}", e),
+            )
         })?;
 
     Ok(stream)
@@ -274,7 +295,10 @@ fn build_stream_i16(
             None,
         )
         .map_err(|e| {
-            EngineError::from_detail(ErrorCode::Internal, format!("Failed to build audio stream: {}", e))
+            EngineError::from_detail(
+                ErrorCode::Internal,
+                format!("Failed to build audio stream: {}", e),
+            )
         })?;
 
     Ok(stream)
@@ -324,7 +348,10 @@ fn build_stream_u16(
             None,
         )
         .map_err(|e| {
-            EngineError::from_detail(ErrorCode::Internal, format!("Failed to build audio stream: {}", e))
+            EngineError::from_detail(
+                ErrorCode::Internal,
+                format!("Failed to build audio stream: {}", e),
+            )
         })?;
 
     Ok(stream)

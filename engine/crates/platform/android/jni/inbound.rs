@@ -139,12 +139,15 @@ pub(crate) extern "system" fn init(
     .unwrap_or(3); // Default to Warn (index 3 in new enum)
 
     let watchdog_enabled = super::get_bool(&mut env, "watchdogEnabled", &options).unwrap_or(true);
-    let watchdog_timeout_secs = super::get_i32(&mut env, "watchdogTimeoutSecs", &options).unwrap_or(10);
-    let code_signing_enabled = super::get_bool(&mut env, "codeSigningEnabled", &options).unwrap_or(true);
+    let watchdog_timeout_secs =
+        super::get_i32(&mut env, "watchdogTimeoutSecs", &options).unwrap_or(10);
+    let code_signing_enabled =
+        super::get_bool(&mut env, "codeSigningEnabled", &options).unwrap_or(true);
 
     // Read optional code signing public key (hex-encoded Ed25519, 64 chars).
     // Returns None if the field is null, empty, or not present.
-    let code_signing_pubkey = super::get_optional_string_field(&mut env, "codeSigningPubkey", &options);
+    let code_signing_pubkey =
+        super::get_optional_string_field(&mut env, "codeSigningPubkey", &options);
 
     let init_options = InitOptions::new()
         .with_pixel_ratio(display_density)
@@ -161,7 +164,10 @@ pub(crate) extern "system" fn init(
 
     info!(
         "init: density={}, target_fps={}, debug={}, log_level={:?}",
-        display_density, target_fps, debug_enabled, init_options.log_level()
+        display_density,
+        target_fps,
+        debug_enabled,
+        init_options.log_level()
     );
 
     let platform = Arc::new(AndroidPlatform::new());
@@ -304,11 +310,7 @@ pub(crate) extern "system" fn onTouch(
     // TouchPoint is repr(C) matching the Java-side packing.
     let mut points = [TouchPoint::default(); 10];
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            addr as *const TouchPoint,
-            points.as_mut_ptr(),
-            n,
-        );
+        std::ptr::copy_nonoverlapping(addr as *const TouchPoint, points.as_mut_ptr(), n);
     }
 
     let touch_type = match action {
@@ -377,10 +379,7 @@ pub(crate) extern "system" fn mod_main<'local>(
 
     info!("modMain: game_id={}, entry={}", game_id, entry);
 
-    match send_command_to_host(
-        host_id,
-        HostCommand::EvaluateModule { game_id, entry },
-    ) {
+    match send_command_to_host(host_id, HostCommand::EvaluateModule { game_id, entry }) {
         Ok(_) => 0,
         Err(e) => {
             error!("modMain failed: {}", e);
@@ -421,19 +420,11 @@ pub(crate) extern "system" fn onAudioInterruptionBegin(
     let _ = send_command_to_host(host_id, HostCommand::OnAudioInterruptionBegin);
 }
 
-pub(crate) extern "system" fn onAudioInterruptionEnd(
-    _env: JNIEnv,
-    _class: JClass,
-    host_id: jint,
-) {
+pub(crate) extern "system" fn onAudioInterruptionEnd(_env: JNIEnv, _class: JClass, host_id: jint) {
     let _ = send_command_to_host(host_id, HostCommand::OnAudioInterruptionEnd);
 }
 
-pub(crate) extern "system" fn onUserCaptureScreen(
-    _env: JNIEnv,
-    _class: JClass,
-    host_id: jint,
-) {
+pub(crate) extern "system" fn onUserCaptureScreen(_env: JNIEnv, _class: JClass, host_id: jint) {
     let _ = send_command_to_host(host_id, HostCommand::OnUserCaptureScreen);
 }
 
@@ -607,15 +598,14 @@ pub(crate) extern "system" fn onRecorderFrameData(
     frame_data: jni::sys::jbyteArray,
     is_last_frame: jni::sys::jboolean,
 ) {
-    let data = match env
-        .convert_byte_array(unsafe { jni::objects::JByteArray::from_raw(frame_data) })
-    {
-        Ok(v) => v,
-        Err(e) => {
-            error!("onRecorderFrameData: failed to read byte array: {:?}", e);
-            return;
-        }
-    };
+    let data =
+        match env.convert_byte_array(unsafe { jni::objects::JByteArray::from_raw(frame_data) }) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("onRecorderFrameData: failed to read byte array: {:?}", e);
+                return;
+            }
+        };
 
     let _ = send_command_to_host(
         host_id,
@@ -663,15 +653,14 @@ pub(crate) extern "system" fn onCameraFrameData(
     width: jint,
     height: jint,
 ) {
-    let data = match env
-        .convert_byte_array(unsafe { jni::objects::JByteArray::from_raw(frame_data) })
-    {
-        Ok(v) => v,
-        Err(e) => {
-            error!("onCameraFrameData: failed to read byte array: {:?}", e);
-            return;
-        }
-    };
+    let data =
+        match env.convert_byte_array(unsafe { jni::objects::JByteArray::from_raw(frame_data) }) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("onCameraFrameData: failed to read byte array: {:?}", e);
+                return;
+            }
+        };
 
     let _ = send_command_to_host(
         host_id,
@@ -714,9 +703,7 @@ pub(crate) extern "system" fn onBluetoothDeviceFound<'local>(
         .unwrap_or_else(|_| "[]".to_string());
     let _ = send_command_to_host(
         host_id,
-        HostCommand::OnBluetoothDeviceFound {
-            devices_json: json,
-        },
+        HostCommand::OnBluetoothDeviceFound { devices_json: json },
     );
 }
 
@@ -730,12 +717,7 @@ pub(crate) extern "system" fn onBeaconUpdate<'local>(
         .get_string(&beacons_json)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "[]".to_string());
-    let _ = send_command_to_host(
-        host_id,
-        HostCommand::OnBeaconUpdate {
-            beacons_json: json,
-        },
-    );
+    let _ = send_command_to_host(host_id, HostCommand::OnBeaconUpdate { beacons_json: json });
 }
 
 pub(crate) extern "system" fn onBeaconServiceChange(
@@ -766,10 +748,7 @@ pub(crate) extern "system" fn onKeyboardInput<'local>(
         .get_string(&value)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let _ = send_command_to_host(
-        host_id,
-        HostCommand::OnKeyboardInput { value: val },
-    );
+    let _ = send_command_to_host(host_id, HostCommand::OnKeyboardInput { value: val });
 }
 
 pub(crate) extern "system" fn onKeyboardConfirm<'local>(
@@ -782,10 +761,7 @@ pub(crate) extern "system" fn onKeyboardConfirm<'local>(
         .get_string(&value)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let _ = send_command_to_host(
-        host_id,
-        HostCommand::OnKeyboardConfirm { value: val },
-    );
+    let _ = send_command_to_host(host_id, HostCommand::OnKeyboardConfirm { value: val });
 }
 
 pub(crate) extern "system" fn onKeyboardComplete<'local>(
@@ -798,10 +774,7 @@ pub(crate) extern "system" fn onKeyboardComplete<'local>(
         .get_string(&value)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let _ = send_command_to_host(
-        host_id,
-        HostCommand::OnKeyboardComplete { value: val },
-    );
+    let _ = send_command_to_host(host_id, HostCommand::OnKeyboardComplete { value: val });
 }
 
 pub(crate) extern "system" fn onKeyboardHeightChange(
@@ -846,7 +819,11 @@ pub(crate) extern "system" fn onCompressImageResult<'local>(
         .get_string(&result_json)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
-    let escaped = json.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n").replace('\r', "\\r");
+    let escaped = json
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
     let cmd = HostCommand::EvalScript {
         source: format!("_internalOnCompressImageResult('{}');", escaped),
     };
@@ -935,7 +912,11 @@ pub(crate) extern "system" fn onScanCodeResult<'local>(
         .get_string(&result_json)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
-    let escaped = json.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n").replace('\r', "\\r");
+    let escaped = json
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
     let cmd = HostCommand::EvalScript {
         source: format!("_internalOnScanCodeResult('{}');", escaped),
     };

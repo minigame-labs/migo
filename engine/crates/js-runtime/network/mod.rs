@@ -1,9 +1,11 @@
 use deno_core::extension;
 
 use crate::network::fetch::{op_fetch, op_fetch_send, op_fetch_upload};
-use crate::network::tcp_socket::{op_tcp_connect, op_tcp_next_event, op_tcp_write, op_tcp_close};
-use crate::network::udp_socket::{op_udp_bind, op_udp_connect, op_udp_send, op_udp_set_ttl, op_udp_next_event, op_udp_close};
-use crate::network::websocket::{op_ws_create, op_ws_next_event, op_ws_send, op_ws_close};
+use crate::network::tcp_socket::{op_tcp_close, op_tcp_connect, op_tcp_next_event, op_tcp_write};
+use crate::network::udp_socket::{
+    op_udp_bind, op_udp_close, op_udp_connect, op_udp_next_event, op_udp_send, op_udp_set_ttl,
+};
+use crate::network::websocket::{op_ws_close, op_ws_create, op_ws_next_event, op_ws_send};
 
 mod fetch;
 mod tcp_socket;
@@ -50,7 +52,6 @@ extension!(host_v8_network,
     state.put::<Options>(options.options);
   },
 );
-
 
 pub(crate) fn network_extensions() -> Vec<deno_core::Extension> {
     vec![host_v8_network::init(Default::default())]

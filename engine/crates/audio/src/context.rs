@@ -4,9 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use shared::protocol::audio_cmd::{
-    AudioBufferId, AudioContextId, AudioContextState, AudioNodeId,
-};
+use shared::protocol::audio_cmd::{AudioBufferId, AudioContextId, AudioContextState, AudioNodeId};
 
 use crate::decoder::DecodedAudio;
 use crate::nodes::{
@@ -228,8 +226,7 @@ impl AudioContext {
     /// Create a gain node with JS-provided node_id
     pub fn create_gain(&mut self, node_id: AudioNodeId) {
         tracing::trace!("create_gain: node_id={}", node_id);
-        self.nodes
-            .insert(node_id, Box::new(GainNode::new(node_id)));
+        self.nodes.insert(node_id, Box::new(GainNode::new(node_id)));
         self.graph_dirty = true;
     }
 
@@ -291,7 +288,10 @@ impl AudioContext {
     ) -> bool {
         tracing::trace!(
             "start_source: node_id={}, when={}, offset={}, duration={:?}",
-            node_id, when, offset, duration
+            node_id,
+            when,
+            offset,
+            duration
         );
         let current_time = self.current_time();
         if let Some(node) = self.nodes.get_mut(&node_id) {
@@ -317,13 +317,7 @@ impl AudioContext {
         false
     }
 
-    pub fn set_loop(
-        &mut self,
-        node_id: AudioNodeId,
-        enabled: bool,
-        start: f64,
-        end: f64,
-    ) -> bool {
+    pub fn set_loop(&mut self, node_id: AudioNodeId, enabled: bool, start: f64, end: f64) -> bool {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             let any = node.as_any_mut();
             if let Some(source) = any.downcast_mut::<BufferSourceNode>() {
@@ -487,7 +481,10 @@ impl AudioContext {
     /// after all of its input sources, supporting arbitrary graph topologies
     /// like: source → filter → gain → destination.
     fn rebuild_processing_order(&mut self) {
-        tracing::trace!("rebuild_processing_order: connections={:?}", self.connections);
+        tracing::trace!(
+            "rebuild_processing_order: connections={:?}",
+            self.connections
+        );
         self.processing_order.clear();
 
         // Build adjacency list and in-degree count
@@ -577,8 +574,7 @@ impl AudioContext {
         }
 
         // Log every 100 calls
-        let counter =
-            PROCESS_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let counter = PROCESS_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let should_log = counter % 100 == 0;
 
         if should_log {
@@ -628,7 +624,13 @@ impl AudioContext {
                     &[] as &[f32]
                 };
 
-                let frames = node.process(input, &mut node_buf[..buffer_size], sample_rate, self.channels, current_time);
+                let frames = node.process(
+                    input,
+                    &mut node_buf[..buffer_size],
+                    sample_rate,
+                    self.channels,
+                    current_time,
+                );
 
                 if should_log && frames > 0 {
                     tracing::trace!(

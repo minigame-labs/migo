@@ -224,7 +224,12 @@ fn call_void_with_string(method_name: &str, host_id: i32, json: &str) -> Result<
                 class,
                 *method_id,
                 ReturnType::Primitive(Primitive::Void),
-                &[jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }],
+                &[
+                    jvalue { i: host_id },
+                    jvalue {
+                        l: jstr.as_raw() as *mut _,
+                    },
+                ],
             )
         };
 
@@ -316,7 +321,9 @@ pub fn vibrate_short(vibrate_type: &str) -> Result<i32, String> {
                 class,
                 *method_id,
                 ReturnType::Primitive(Primitive::Int),
-                &[jvalue { l: jstr.as_raw() as *mut _ }],
+                &[jvalue {
+                    l: jstr.as_raw() as *mut _,
+                }],
             )
         };
 
@@ -392,7 +399,12 @@ pub fn set_device_orientation(host_id: i32, value: &str) -> Result<i32, String> 
                 class,
                 *method_id,
                 ReturnType::Primitive(Primitive::Int),
-                &[jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }],
+                &[
+                    jvalue { i: host_id },
+                    jvalue {
+                        l: jstr.as_raw() as *mut _,
+                    },
+                ],
             )
         };
 
@@ -571,9 +583,15 @@ pub fn set_inner_audio_option(
         |_env, _| Ok(()),
         &[
             jvalue { i: host_id },
-            jvalue { z: mix_with_other as u8 },
-            jvalue { z: obey_mute_switch as u8 },
-            jvalue { z: speaker_on as u8 },
+            jvalue {
+                z: mix_with_other as u8,
+            },
+            jvalue {
+                z: obey_mute_switch as u8,
+            },
+            jvalue {
+                z: speaker_on as u8,
+            },
         ],
     )
 }
@@ -660,18 +678,23 @@ pub fn encode_gbk(data: &str) -> Result<Vec<u8>, String> {
                 class,
                 *method_id,
                 ReturnType::Array,
-                &[jvalue { l: j_data.as_raw() as *mut _ }],
+                &[jvalue {
+                    l: j_data.as_raw() as *mut _,
+                }],
             )
         };
 
         match result {
             Ok(val) => {
-                let obj = val.l().map_err(|e| format!("encodeGbk: expected object: {e}"))?;
+                let obj = val
+                    .l()
+                    .map_err(|e| format!("encodeGbk: expected object: {e}"))?;
                 if obj.is_null() {
                     return Err("GBK encode error".to_string());
                 }
                 let byte_array = jni::objects::JByteArray::from(obj);
-                let bytes = env.convert_byte_array(byte_array)
+                let bytes = env
+                    .convert_byte_array(byte_array)
                     .map_err(|e| format!("encodeGbk: failed to convert byte array: {e}"))?;
                 Ok(bytes)
             }
@@ -707,18 +730,23 @@ pub fn decode_gbk(data: &[u8]) -> Result<String, String> {
                 class,
                 *method_id,
                 ReturnType::Object,
-                &[jvalue { l: j_bytes.as_raw() as *mut _ }],
+                &[jvalue {
+                    l: j_bytes.as_raw() as *mut _,
+                }],
             )
         };
 
         match result {
             Ok(val) => {
-                let obj = val.l().map_err(|e| format!("decodeGbk: expected object: {e}"))?;
+                let obj = val
+                    .l()
+                    .map_err(|e| format!("decodeGbk: expected object: {e}"))?;
                 if obj.is_null() {
                     return Err("GBK decode error".to_string());
                 }
                 let j_str = jni::objects::JString::from(obj);
-                let s = env.get_string(&j_str)
+                let s = env
+                    .get_string(&j_str)
                     .map_err(|e| format!("decodeGbk: failed to get string: {e}"))?;
                 Ok(s.into())
             }
@@ -763,8 +791,12 @@ pub fn unzip_file(zip_path: &str, dest_dir: &str) -> Result<usize, String> {
                 *method_id,
                 ReturnType::Object,
                 &[
-                    jvalue { l: j_zip_path.as_raw() as *mut _ },
-                    jvalue { l: j_dest_dir.as_raw() as *mut _ },
+                    jvalue {
+                        l: j_zip_path.as_raw() as *mut _,
+                    },
+                    jvalue {
+                        l: j_dest_dir.as_raw() as *mut _,
+                    },
                 ],
             )
         };
@@ -817,7 +849,12 @@ pub fn set_clipboard_data(host_id: i32, data: &str) -> Result<(), String> {
                 class,
                 *method_id,
                 ReturnType::Primitive(Primitive::Int),
-                &[jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }],
+                &[
+                    jvalue { i: host_id },
+                    jvalue {
+                        l: jstr.as_raw() as *mut _,
+                    },
+                ],
             )
         };
 
@@ -880,7 +917,12 @@ fn call_json_method(method_name: &str, host_id: i32, options_json: &str) -> Resu
                 class,
                 *method_id,
                 ReturnType::Object,
-                &[jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }],
+                &[
+                    jvalue { i: host_id },
+                    jvalue {
+                        l: jstr.as_raw() as *mut _,
+                    },
+                ],
             )
         };
 
@@ -917,7 +959,12 @@ pub fn camera_destroy(host_id: i32, camera_id: u32) -> Result<(), String> {
         "cameraDestroy",
         ReturnType::Primitive(Primitive::Void),
         |_env, _| Ok(()),
-        &[jvalue { i: host_id }, jvalue { i: camera_id as i32 }],
+        &[
+            jvalue { i: host_id },
+            jvalue {
+                i: camera_id as i32,
+            },
+        ],
     )
 }
 
@@ -952,7 +999,12 @@ pub fn camera_listen_frame_change(host_id: i32, camera_id: u32) -> Result<(), St
         "cameraListenFrameChange",
         ReturnType::Primitive(Primitive::Void),
         |_env, _| Ok(()),
-        &[jvalue { i: host_id }, jvalue { i: camera_id as i32 }],
+        &[
+            jvalue { i: host_id },
+            jvalue {
+                i: camera_id as i32,
+            },
+        ],
     )
 }
 
@@ -963,7 +1015,12 @@ pub fn camera_close_frame_change(host_id: i32, camera_id: u32) -> Result<(), Str
         "cameraCloseFrameChange",
         ReturnType::Primitive(Primitive::Void),
         |_env, _| Ok(()),
-        &[jvalue { i: host_id }, jvalue { i: camera_id as i32 }],
+        &[
+            jvalue { i: host_id },
+            jvalue {
+                i: camera_id as i32,
+            },
+        ],
     )
 }
 
@@ -1159,7 +1216,12 @@ pub fn notify_exit(host_id: i32) -> Result<(), String> {
 /// **Thread safety:** This function uses `with_env` which attaches the calling
 /// thread to the JVM if not already attached.  Safe to call from any thread
 /// (host thread, watchdog thread, etc.).
-pub fn notify_error(host_id: i32, error_code: u16, message: &str, detail: &str) -> Result<(), String> {
+pub fn notify_error(
+    host_id: i32,
+    error_code: u16,
+    message: &str,
+    detail: &str,
+) -> Result<(), String> {
     with_env(|env| {
         // Defensively clear any pre-existing JNI exception state so that
         // string creation below doesn't fail due to a stale exception from
@@ -1179,10 +1241,12 @@ pub fn notify_error(host_id: i32, error_code: u16, message: &str, detail: &str) 
         // OOM-resilient string creation: if new_string fails (e.g., under
         // heavy memory pressure), fall back to empty strings so the error
         // code still reaches Java.
-        let j_msg = env.new_string(message)
+        let j_msg = env
+            .new_string(message)
             .or_else(|_| env.new_string(""))
             .map_err(|e| format!("Failed to create Java string for message: {e}"))?;
-        let j_detail = env.new_string(detail)
+        let j_detail = env
+            .new_string(detail)
             .or_else(|_| env.new_string(""))
             .map_err(|e| format!("Failed to create Java string for detail: {e}"))?;
 
@@ -1193,9 +1257,15 @@ pub fn notify_error(host_id: i32, error_code: u16, message: &str, detail: &str) 
                 ReturnType::Primitive(Primitive::Void),
                 &[
                     jvalue { i: host_id },
-                    jvalue { i: error_code as i32 },
-                    jvalue { l: j_msg.as_raw() as *mut _ },
-                    jvalue { l: j_detail.as_raw() as *mut _ },
+                    jvalue {
+                        i: error_code as i32,
+                    },
+                    jvalue {
+                        l: j_msg.as_raw() as *mut _,
+                    },
+                    jvalue {
+                        l: j_detail.as_raw() as *mut _,
+                    },
                 ],
             )
         };
@@ -1239,7 +1309,9 @@ pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError
                 class,
                 *method_id,
                 ReturnType::Object,
-                &[jvalue { l: j_data.as_raw() as *mut _ }],
+                &[jvalue {
+                    l: j_data.as_raw() as *mut _,
+                }],
             )
         };
 
@@ -1250,7 +1322,8 @@ pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError
                     return Err("BitmapFactory returned null".into());
                 }
                 let byte_array = jni::objects::JByteArray::from(obj);
-                let mut bytes = env.convert_byte_array(byte_array)
+                let mut bytes = env
+                    .convert_byte_array(byte_array)
                     .map_err(|e| format!("Failed to read result bytes: {e}"))?;
 
                 if bytes.len() < 8 {

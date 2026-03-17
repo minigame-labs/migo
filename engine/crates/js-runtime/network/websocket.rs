@@ -14,11 +14,11 @@ use deno_core::op2;
 use deno_error::JsErrorBox;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use http::header::HeaderName;
 use http::HeaderValue;
+use http::header::HeaderName;
 use serde::Serialize;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 
 type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -48,7 +48,11 @@ impl Resource for WebSocketResource {
 // ── Event types ──
 
 #[derive(Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum WsEvent {
     #[serde(rename = "message")]
     Message {
@@ -94,9 +98,7 @@ pub async fn op_ws_create(
     // Validate scheme
     let scheme = request.uri().scheme_str().unwrap_or("");
     if scheme != "ws" && scheme != "wss" {
-        return Err(JsErrorBox::type_error(
-            "URL scheme must be ws:// or wss://",
-        ));
+        return Err(JsErrorBox::type_error("URL scheme must be ws:// or wss://"));
     }
 
     // Add custom headers

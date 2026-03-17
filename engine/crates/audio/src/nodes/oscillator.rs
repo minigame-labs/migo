@@ -72,15 +72,15 @@ impl OscillatorNode {
     #[inline]
     fn generate_sample(osc_type: OscillatorType, phase: f64) -> f32 {
         match osc_type {
-            OscillatorType::Sine => {
-                (phase * std::f64::consts::TAU).sin() as f32
-            }
+            OscillatorType::Sine => (phase * std::f64::consts::TAU).sin() as f32,
             OscillatorType::Square => {
-                if phase < 0.5 { 1.0 } else { -1.0 }
+                if phase < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
             }
-            OscillatorType::Sawtooth => {
-                (2.0 * phase - 1.0) as f32
-            }
+            OscillatorType::Sawtooth => (2.0 * phase - 1.0) as f32,
             OscillatorType::Triangle => {
                 let v = 2.0 * phase;
                 if v < 1.0 {

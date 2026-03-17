@@ -59,7 +59,9 @@ pub fn op_vibrate_short(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(vibration) = services.vibration() {
-            return vibration.vibrate_short(&vibrate_type).map_err(JsErrorBox::generic);
+            return vibration
+                .vibrate_short(&vibrate_type)
+                .map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("vibrateShort:fail not supported"))
@@ -86,7 +88,9 @@ pub fn op_get_screen_brightness(state: &mut OpState) -> Result<f32, JsErrorBox> 
             return screen.get_brightness().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("getScreenBrightness:fail not supported"))
+    Err(JsErrorBox::generic(
+        "getScreenBrightness:fail not supported",
+    ))
 }
 
 #[op2(fast)]
@@ -97,7 +101,9 @@ pub fn op_set_screen_brightness(state: &mut OpState, value: f32) -> Result<(), J
             return screen.set_brightness(value).map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("setScreenBrightness:fail not supported"))
+    Err(JsErrorBox::generic(
+        "setScreenBrightness:fail not supported",
+    ))
 }
 
 #[op2(fast)]
@@ -105,7 +111,9 @@ pub fn op_set_keep_screen_on(state: &mut OpState, keep_on: bool) -> Result<(), J
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(screen) = services.screen() {
-            return screen.set_keep_screen_on(keep_on).map_err(JsErrorBox::generic);
+            return screen
+                .set_keep_screen_on(keep_on)
+                .map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("setKeepScreenOn:fail not supported"))
@@ -122,7 +130,9 @@ pub fn op_set_device_orientation(
             return screen.set_orientation(&value).map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("setDeviceOrientation:fail not supported"))
+    Err(JsErrorBox::generic(
+        "setDeviceOrientation:fail not supported",
+    ))
 }
 
 // ==================== Debug Ops ====================
@@ -132,7 +142,9 @@ pub fn op_set_enable_debug(state: &mut OpState, enabled: bool) -> Result<(), JsE
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(screen) = services.screen() {
-            return screen.set_enable_debug(enabled).map_err(JsErrorBox::generic);
+            return screen
+                .set_enable_debug(enabled)
+                .map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("setEnableDebug:fail not supported"))
@@ -148,7 +160,9 @@ pub fn op_start_capture_screen(state: &mut OpState) -> Result<(), JsErrorBox> {
             return screen.start_capture_screen().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("onUserCaptureScreen:fail not supported"))
+    Err(JsErrorBox::generic(
+        "onUserCaptureScreen:fail not supported",
+    ))
 }
 
 #[op2(fast)]
@@ -159,7 +173,9 @@ pub fn op_stop_capture_screen(state: &mut OpState) -> Result<(), JsErrorBox> {
             return screen.stop_capture_screen().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("offUserCaptureScreen:fail not supported"))
+    Err(JsErrorBox::generic(
+        "offUserCaptureScreen:fail not supported",
+    ))
 }
 
 // ==================== Device Motion Ops ====================
@@ -175,7 +191,9 @@ pub fn op_start_device_motion(
             return motion.start(&interval).map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("startDeviceMotionListening:fail not supported"))
+    Err(JsErrorBox::generic(
+        "startDeviceMotionListening:fail not supported",
+    ))
 }
 
 #[op2(fast)]
@@ -186,7 +204,9 @@ pub fn op_stop_device_motion(state: &mut OpState) -> Result<(), JsErrorBox> {
             return motion.stop().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("stopDeviceMotionListening:fail not supported"))
+    Err(JsErrorBox::generic(
+        "stopDeviceMotionListening:fail not supported",
+    ))
 }
 
 // ==================== Gyroscope Ops ====================
@@ -277,7 +297,9 @@ pub fn op_start_network_monitoring(state: &mut OpState) -> Result<(), JsErrorBox
             return network.start_monitoring().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("onNetworkStatusChange:fail not supported"))
+    Err(JsErrorBox::generic(
+        "onNetworkStatusChange:fail not supported",
+    ))
 }
 
 #[op2(fast)]
@@ -288,7 +310,9 @@ pub fn op_stop_network_monitoring(state: &mut OpState) -> Result<(), JsErrorBox>
             return network.stop_monitoring().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("offNetworkStatusChange:fail not supported"))
+    Err(JsErrorBox::generic(
+        "offNetworkStatusChange:fail not supported",
+    ))
 }
 
 #[op2]
@@ -343,10 +367,7 @@ pub fn op_hide_keyboard(state: &mut OpState) -> Result<(), JsErrorBox> {
 }
 
 #[op2(fast)]
-pub fn op_update_keyboard(
-    state: &mut OpState,
-    #[string] value: String,
-) -> Result<(), JsErrorBox> {
+pub fn op_update_keyboard(state: &mut OpState, #[string] value: String) -> Result<(), JsErrorBox> {
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(keyboard) = services.keyboard() {
@@ -366,7 +387,9 @@ pub fn op_get_location(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(location) = services.location() {
-            return location.get_location(&options_json).map_err(JsErrorBox::generic);
+            return location
+                .get_location(&options_json)
+                .map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("getLocation:fail not supported"))
@@ -380,7 +403,9 @@ pub fn op_get_fuzzy_location(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(location) = services.location() {
-            return location.get_fuzzy_location(&options_json).map_err(JsErrorBox::generic);
+            return location
+                .get_fuzzy_location(&options_json)
+                .map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("getFuzzyLocation:fail not supported"))
@@ -389,14 +414,13 @@ pub fn op_get_fuzzy_location(
 // ==================== Scan Code Ops ====================
 
 #[op2(fast)]
-pub fn op_scan_code(
-    state: &mut OpState,
-    #[string] options_json: String,
-) -> Result<(), JsErrorBox> {
+pub fn op_scan_code(state: &mut OpState, #[string] options_json: String) -> Result<(), JsErrorBox> {
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(scan_code) = services.scan_code() {
-            return scan_code.scan_code(&options_json).map_err(JsErrorBox::generic);
+            return scan_code
+                .scan_code(&options_json)
+                .map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("scanCode:fail not supported"))

@@ -1,7 +1,7 @@
 use std::mem;
 
 use bytemuck::allocation::cast_vec;
-use deno_core::{op2, JsBuffer, OpState};
+use deno_core::{JsBuffer, OpState, op2};
 use tracing::error;
 
 use shared::{
@@ -239,7 +239,14 @@ pub fn op_create_shader(state: &mut OpState, #[smi] ty: u32) -> i32 {
 pub fn op_shader_source(state: &mut OpState, #[smi] shader_id: u32, #[string] source: String) {
     // Large shader sources are flushed immediately to avoid holding them in the batch queue.
     let large = source.len() > 4096;
-    queue_gl_fire_and_forget(state, GLCmd::ShaderSource { shader_id, source, resp: None });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::ShaderSource {
+            shader_id,
+            source,
+            resp: None,
+        },
+    );
     if large {
         flush_gl_batch(state);
     }

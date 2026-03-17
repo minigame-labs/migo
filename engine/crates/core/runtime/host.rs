@@ -4,9 +4,11 @@ use deno_core::{FsModuleLoader, ModuleLoader};
 use tracing::{error, info};
 
 use shared::{
-    config::InitOptions, error::EngineResult,
+    config::InitOptions,
+    error::EngineResult,
     op_state::{HostOpState, RafRx},
-    protocol::host_cmd::HostCommand, surface::SurfaceRef,
+    protocol::host_cmd::HostCommand,
+    surface::SurfaceRef,
 };
 
 use crate::{
@@ -17,9 +19,9 @@ use crate::{
 use js_runtime::HostJsRuntime;
 
 #[cfg(feature = "v8-limits")]
-use js_runtime::V8LimitsConfig;
-#[cfg(feature = "v8-limits")]
 use crate::runtime::watchdog::{self, WatchdogConfig, WatchdogHandle};
+#[cfg(feature = "v8-limits")]
+use js_runtime::V8LimitsConfig;
 
 /// Wrapper around `Option<HostJsRuntime>` with `Deref`/`DerefMut`.
 ///
@@ -42,7 +44,10 @@ impl JsRuntimeSlot {
 
     /// Install a new runtime (after `take_and_drop`).
     fn set(&mut self, js: HostJsRuntime) {
-        debug_assert!(self.0.is_none(), "JsRuntimeSlot: replacing without dropping first");
+        debug_assert!(
+            self.0.is_none(),
+            "JsRuntimeSlot: replacing without dropping first"
+        );
         self.0 = Some(js);
     }
 }
@@ -50,13 +55,17 @@ impl JsRuntimeSlot {
 impl std::ops::Deref for JsRuntimeSlot {
     type Target = HostJsRuntime;
     fn deref(&self) -> &HostJsRuntime {
-        self.0.as_ref().expect("[BUG] JsRuntime accessed after drop")
+        self.0
+            .as_ref()
+            .expect("[BUG] JsRuntime accessed after drop")
     }
 }
 
 impl std::ops::DerefMut for JsRuntimeSlot {
     fn deref_mut(&mut self) -> &mut HostJsRuntime {
-        self.0.as_mut().expect("[BUG] JsRuntime accessed after drop")
+        self.0
+            .as_mut()
+            .expect("[BUG] JsRuntime accessed after drop")
     }
 }
 
@@ -207,10 +216,9 @@ impl Host {
         #[cfg(feature = "v8-limits")]
         let watchdog = if init_options.watchdog_enabled() {
             let isolate_handle = js.isolate_handle();
-            let config = WatchdogConfig::default()
-                .with_timeout(std::time::Duration::from_secs(
-                    init_options.watchdog_timeout_secs() as u64,
-                ));
+            let config = WatchdogConfig::default().with_timeout(std::time::Duration::from_secs(
+                init_options.watchdog_timeout_secs() as u64,
+            ));
             Some(watchdog::spawn_watchdog(isolate_handle, config, id as i32)?)
         } else {
             info!("[Host {}] ANR watchdog disabled via InitOptions", id);
@@ -269,8 +277,7 @@ impl Host {
                 // when UpdateSurface arrives with the new valid surface.
                 self.audio.resume();
 
-                self.js
-                    .exec_script("onshow", "_internalTriggerOnShow()")
+                self.js.exec_script("onshow", "_internalTriggerOnShow()")
             }
 
             HostCommand::OnHide => {
@@ -281,25 +288,18 @@ impl Host {
                 self.render.pause();
                 self.audio.pause();
 
-                self.js
-                    .exec_script("onhide", "_internalTriggerOnHide()")
+                self.js.exec_script("onhide", "_internalTriggerOnHide()")
             }
 
-            HostCommand::OnAudioInterruptionBegin => {
-                self.js
-                    .exec_script(
-                        "audio_interruption_begin",
-                        "_internalTriggerAudioInterruptionBegin()",
-                    )
-            }
+            HostCommand::OnAudioInterruptionBegin => self.js.exec_script(
+                "audio_interruption_begin",
+                "_internalTriggerAudioInterruptionBegin()",
+            ),
 
-            HostCommand::OnAudioInterruptionEnd => {
-                self.js
-                    .exec_script(
-                        "audio_interruption_end",
-                        "_internalTriggerAudioInterruptionEnd()",
-                    )
-            }
+            HostCommand::OnAudioInterruptionEnd => self.js.exec_script(
+                "audio_interruption_end",
+                "_internalTriggerAudioInterruptionEnd()",
+            ),
 
             HostCommand::OnTouch {
                 touch_type,
@@ -308,7 +308,8 @@ impl Host {
                 timestamp_ms,
             } => {
                 let count = (count as usize).min(points.len());
-                self.js.dispatch_touch(touch_type, &points[..count], timestamp_ms);
+                self.js
+                    .dispatch_touch(touch_type, &points[..count], timestamp_ms);
                 Ok(())
             }
 
@@ -326,11 +327,7 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnDeviceMotionChange {
-                alpha,
-                beta,
-                gamma,
-            } => {
+            HostCommand::OnDeviceMotionChange { alpha, beta, gamma } => {
                 self.js.dispatch_device_motion(alpha, beta, gamma);
                 Ok(())
             }
@@ -387,7 +384,8 @@ impl Host {
                 event_type,
                 json_payload,
             } => {
-                self.js.dispatch_camera_event(camera_id, &event_type, &json_payload);
+                self.js
+                    .dispatch_camera_event(camera_id, &event_type, &json_payload);
                 Ok(())
             }
 
@@ -397,7 +395,8 @@ impl Host {
                 width,
                 height,
             } => {
-                self.js.dispatch_camera_frame_data(camera_id, &data, width, height);
+                self.js
+                    .dispatch_camera_frame_data(camera_id, &data, width, height);
                 Ok(())
             }
 
@@ -443,7 +442,8 @@ impl Host {
                 available,
                 discovering,
             } => {
-                self.js.dispatch_bluetooth_adapter_state_change(available, discovering);
+                self.js
+                    .dispatch_bluetooth_adapter_state_change(available, discovering);
                 Ok(())
             }
 
@@ -461,7 +461,8 @@ impl Host {
                 available,
                 discovering,
             } => {
-                self.js.dispatch_beacon_service_change(available, discovering);
+                self.js
+                    .dispatch_beacon_service_change(available, discovering);
                 Ok(())
             }
 
@@ -470,13 +471,9 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnUserCaptureScreen => {
-                self.js
-                    .exec_script(
-                        "user_capture_screen",
-                        "_internalTriggerUserCaptureScreen()",
-                    )
-            }
+            HostCommand::OnUserCaptureScreen => self
+                .js
+                .exec_script("user_capture_screen", "_internalTriggerUserCaptureScreen()"),
 
             other => {
                 tracing::warn!("[Host {}] unhandled HostCommand: {:?}", self.id, other);
@@ -490,7 +487,9 @@ impl Host {
         self.last_game_id = Some(game_id.clone());
         self.last_entry = Some(entry.clone());
 
-        self.js.evaluate_module(game_id.clone(), entry.clone()).await?;
+        self.js
+            .evaluate_module(game_id.clone(), entry.clone())
+            .await?;
         let eval_ms = t_eval_start.elapsed().as_secs_f64() * 1000.0;
         info!(
             "[Host {}] evaluate_module('{}', '{}'): {:.1}ms",
@@ -599,10 +598,9 @@ impl Host {
         #[cfg(feature = "v8-limits")]
         if self.init_options.watchdog_enabled() {
             let isolate_handle = new_js.isolate_handle();
-            let config = WatchdogConfig::default()
-                .with_timeout(std::time::Duration::from_secs(
-                    self.init_options.watchdog_timeout_secs() as u64,
-                ));
+            let config = WatchdogConfig::default().with_timeout(std::time::Duration::from_secs(
+                self.init_options.watchdog_timeout_secs() as u64,
+            ));
             match watchdog::spawn_watchdog(isolate_handle, config, self.id as i32) {
                 Ok(handle) => new_watchdog = Some(handle),
                 Err(e) => {
@@ -634,7 +632,10 @@ impl Host {
         // so we must explicitly re-signal the surface to restore `has_surface`.
         // Without this, VSync frames are discarded and the RAF loop never fires.
         if let Err(e) = self.render.restore_surface() {
-            error!("[Host {}] on_restart: restore_surface failed: {}", self.id, e);
+            error!(
+                "[Host {}] on_restart: restore_surface failed: {}",
+                self.id, e
+            );
         }
         self.render.resume();
         self.audio.resume();

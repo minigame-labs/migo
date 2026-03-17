@@ -274,9 +274,7 @@ impl PboPool {
         }
 
         // Create a new PBO
-        unsafe {
-            gl.create_buffer().ok()
-        }
+        unsafe { gl.create_buffer().ok() }
     }
 
     /// Return a PBO to the pool

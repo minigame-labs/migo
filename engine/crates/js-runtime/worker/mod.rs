@@ -1,8 +1,4 @@
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use deno_core::{
     Extension, FsModuleLoader, JsRuntime, ModuleLoader, OpState, PollEventLoopOptions,
@@ -45,7 +41,6 @@ pub(crate) struct WorkerCtx {
     tx_errors: mpsc::UnboundedSender<String>,
     rx_from_main: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<WorkerMessage>>>,
 }
-
 
 // ---------------------------------------------------------------------------
 // Error
@@ -131,10 +126,7 @@ fn normalize_specifier<'a>(
     use std::borrow::Cow;
 
     let mut s: Cow<'a, str> = if *kind != deno_core::ResolutionKind::MainModule {
-        if specifier.starts_with("./")
-            || specifier.starts_with("../")
-            || specifier.contains(':')
-        {
+        if specifier.starts_with("./") || specifier.starts_with("../") || specifier.contains(':') {
             Cow::Borrowed(specifier)
         } else {
             Cow::Owned(format!("./{specifier}"))
@@ -148,9 +140,8 @@ fn normalize_specifier<'a>(
         None => (s.as_ref(), ""),
     };
 
-    let has_js_like_ext = path_part.ends_with(".js")
-        || path_part.ends_with(".mjs")
-        || path_part.ends_with(".cjs");
+    let has_js_like_ext =
+        path_part.ends_with(".js") || path_part.ends_with(".mjs") || path_part.ends_with(".cjs");
 
     if !has_js_like_ext {
         let new_path = format!("{path_part}.js{suffix_part}");
@@ -206,10 +197,8 @@ async fn op_worker_create(
         let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
         // Workers don't send audio commands in practice, but the type
         // system requires an AudioSender.  Use a no-op ThreadWakeup.
-        let audio_tx = shared::op_state::AudioSender::new(
-            audio_raw_tx,
-            shared::channel::ThreadWakeup::new(),
-        );
+        let audio_tx =
+            shared::op_state::AudioSender::new(audio_raw_tx, shared::channel::ThreadWakeup::new());
 
         let worker_state = HostOpState {
             id: host.id,
@@ -241,7 +230,10 @@ async fn op_worker_create(
     };
 
     // Spawn worker thread
-    info!("[Worker] spawning worker thread for script: {}", script_path);
+    info!(
+        "[Worker] spawning worker thread for script: {}",
+        script_path
+    );
     let join_handle = spawn_worker_thread(script_path, code_dir, worker_ctx, worker_host_state)?;
     info!("[Worker] worker thread spawned, storing handle");
 
@@ -280,7 +272,10 @@ fn op_worker_post_message(
         return Err(WorkerError::Message("Worker has been terminated".into()));
     }
 
-    info!("[Worker] main->worker postMessage: {} bytes", json_message.len());
+    info!(
+        "[Worker] main->worker postMessage: {} bytes",
+        json_message.len()
+    );
     handle
         .tx_to_worker
         .send(WorkerMessage::Message(json_message))
@@ -304,16 +299,17 @@ async fn op_worker_recv_message(
     info!("[Worker] main waiting for worker message...");
     let mut guard = rx.lock().await;
     let msg = guard.recv().await;
-    info!("[Worker] main received from worker: {:?}", msg.as_ref().map(|s| s.len()));
+    info!(
+        "[Worker] main received from worker: {:?}",
+        msg.as_ref().map(|s| s.len())
+    );
     Ok(msg)
 }
 
 /// Async op: wait for an error from the worker. Returns null when worker exits.
 #[op2(async(lazy), fast)]
 #[string]
-async fn op_worker_recv_error(
-    state: Rc<RefCell<OpState>>,
-) -> Result<Option<String>, WorkerError> {
+async fn op_worker_recv_error(state: Rc<RefCell<OpState>>) -> Result<Option<String>, WorkerError> {
     let rx = {
         let st = state.borrow();
         let handle = st
@@ -361,7 +357,10 @@ fn op_worker_inner_post_message(
         )));
     }
 
-    info!("[Worker] worker->main postMessage: {} bytes", json_message.len());
+    info!(
+        "[Worker] worker->main postMessage: {} bytes",
+        json_message.len()
+    );
     let ctx = state.borrow::<WorkerCtx>();
     ctx.tx_to_main
         .send(json_message)
@@ -457,10 +456,7 @@ pub fn worker_inner_extensions(ctx: WorkerCtx) -> Vec<Extension> {
 /// Includes all extensions needed by `98_global_scope_shared.js`:
 /// base, console, event, utility, file, rendering (webgl/image), web, url, network.
 /// This gives workers the same shared APIs as the main thread.
-pub fn create_worker_runtime_extensions(
-    ctx: WorkerCtx,
-    host_state: HostOpState,
-) -> Vec<Extension> {
+pub fn create_worker_runtime_extensions(ctx: WorkerCtx, host_state: HostOpState) -> Vec<Extension> {
     use crate::{
         audio, base, console, env, event, file, network, rendering, url, utility, web,
         worker_runtime,
@@ -542,29 +538,25 @@ fn spawn_worker_thread(
                         let cb_fired = Arc::clone(&oom_fired);
                         let cb_tx = tx_errors.clone();
 
-                        rt.add_near_heap_limit_callback(
-                            move |current_limit, _initial_limit| {
-                                let first = cb_fired
-                                    .compare_exchange(
-                                        false,
-                                        true,
-                                        std::sync::atomic::Ordering::SeqCst,
-                                        std::sync::atomic::Ordering::SeqCst,
-                                    )
-                                    .is_ok();
-                                if first {
-                                    warn!("[Worker] V8 heap limit reached, terminating");
-                                    oom_handle.terminate_execution();
-                                    let _ = cb_tx.send(
-                                        r#"{"message":"Worker terminated: V8 heap limit exceeded"}"#
-                                            .to_string(),
-                                    );
-                                }
-                                current_limit
-                                    .saturating_add(1024 * 1024)
-                                    .min(hard_cap)
-                            },
-                        );
+                        rt.add_near_heap_limit_callback(move |current_limit, _initial_limit| {
+                            let first = cb_fired
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                )
+                                .is_ok();
+                            if first {
+                                warn!("[Worker] V8 heap limit reached, terminating");
+                                oom_handle.terminate_execution();
+                                let _ = cb_tx.send(
+                                    r#"{"message":"Worker terminated: V8 heap limit exceeded"}"#
+                                        .to_string(),
+                                );
+                            }
+                            current_limit.saturating_add(1024 * 1024).min(hard_cap)
+                        });
                     }
 
                     // Resolve and load worker script
@@ -572,7 +564,10 @@ fn spawn_worker_thread(
                     let resolved = match resolve_path(&script_path, &code_path) {
                         Ok(r) => r,
                         Err(e) => {
-                            error!("[Worker] failed to resolve worker script '{}' in '{}': {}", script_path, code_dir, e);
+                            error!(
+                                "[Worker] failed to resolve worker script '{}' in '{}': {}",
+                                script_path, code_dir, e
+                            );
                             let _ = tx_errors.send(format!(
                                 r#"{{"message":"Failed to resolve worker script: {}"}}"#,
                                 e
@@ -609,10 +604,8 @@ fn spawn_worker_thread(
                     let poll = PollEventLoopOptions::default();
                     if let Err(e) = rt.run_event_loop(poll).await {
                         error!("[Worker] event loop error: {}", e);
-                        let _ = tx_errors.send(format!(
-                            r#"{{"message":"Worker event loop error: {}"}}"#,
-                            e
-                        ));
+                        let _ = tx_errors
+                            .send(format!(r#"{{"message":"Worker event loop error: {}"}}"#, e));
                     }
 
                     info!("[Worker] thread exiting cleanly");

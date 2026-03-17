@@ -13,9 +13,9 @@ use shared::{
     protocol::io_cmd::{FileId, FileStat, IOCmd, IOCmdResp, NormalizedImage, OpenFlag, WriteMode},
 };
 
-use crate::{fast_image_decoder, image_cache};
 #[cfg(feature = "zip-extract")]
 use crate::zip_extract;
+use crate::{fast_image_decoder, image_cache};
 
 pub struct IoCmdHandler {
     next_id: FileId,
@@ -296,7 +296,9 @@ impl IoCmdHandler {
 
                     // Seek to position if specified
                     if let Some(pos) = position {
-                        file.seek(SeekFrom::Start(pos)).await.map_err(Self::io_err)?;
+                        file.seek(SeekFrom::Start(pos))
+                            .await
+                            .map_err(Self::io_err)?;
                     }
 
                     // Read specified length or rest of file
@@ -395,20 +397,21 @@ impl IoCmdHandler {
                         let handle = tokio::task::spawn_blocking(move || {
                             // Check cache first
                             if let Some(cached) = image_cache::global_cache().get(&path_clone) {
-                                return (
-                                    path_clone,
-                                    Ok((cached.image.width, cached.image.height)),
-                                );
+                                return (path_clone, Ok((cached.image.width, cached.image.height)));
                             }
 
                             // Read and decode
                             match std::fs::read(&path_clone) {
                                 Ok(data) => {
-                                    match fast_image_decoder::decode_image_fast(&data, Some(&path_clone)) {
+                                    match fast_image_decoder::decode_image_fast(
+                                        &data,
+                                        Some(&path_clone),
+                                    ) {
                                         Ok(img) => {
                                             let dims = (img.width, img.height);
                                             // Cache the result
-                                            image_cache::global_cache().insert(path_clone.clone(), img);
+                                            image_cache::global_cache()
+                                                .insert(path_clone.clone(), img);
                                             (path_clone, Ok(dims))
                                         }
                                         Err(e) => (path_clone, Err(format!("{:?}", e))),
@@ -486,7 +489,9 @@ impl IoCmdHandler {
 
                     match zip_extract::extract_zip(&zip_path, &dest_dir, Some(progress_cb)) {
                         Ok(()) => Ok(file_count.load(std::sync::atomic::Ordering::Relaxed)),
-                        Err(e) => Err(EngineError::new(ErrorCode::IoError).with_detail(e.to_string())),
+                        Err(e) => {
+                            Err(EngineError::new(ErrorCode::IoError).with_detail(e.to_string()))
+                        }
                     }
                 });
 
@@ -544,7 +549,11 @@ impl IoCmdHandler {
                     let mut total: usize = 0;
                     let mut rd = fs::read_dir(&dir).await.map_err(Self::io_err)?;
                     while let Some(entry) = rd.next_entry().await.map_err(Self::io_err)? {
-                        total += entry.metadata().await.map(|m| m.len() as usize).unwrap_or(0);
+                        total += entry
+                            .metadata()
+                            .await
+                            .map(|m| m.len() as usize)
+                            .unwrap_or(0);
                     }
 
                     if total - existing_size + data.len() > max_total {

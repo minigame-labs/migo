@@ -71,11 +71,7 @@ impl ModuleLoader for MyModuleLoader {
         maybe_referrer: Option<&ModuleLoadReferrer>,
         options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
-        let resp = self.0.load(
-            module_specifier,
-            maybe_referrer,
-            options,
-        );
+        let resp = self.0.load(module_specifier, maybe_referrer, options);
 
         match resp {
             ModuleLoadResponse::Sync(result) => {

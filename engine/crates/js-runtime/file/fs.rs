@@ -86,34 +86,23 @@ fn get_vfs_sync(state: &OpState) -> Option<Arc<VirtualFS>> {
 /// All file paths MUST be virtual paths starting with /user, /cache, /code, or /tmp.
 /// This ensures game isolation and prevents unauthorized file access.
 #[inline]
-fn resolve_path_vfs(
-    vfs: Option<&VirtualFS>,
-    path: &str,
-    op: FileOp,
-) -> Result<String, IOError> {
+fn resolve_path_vfs(vfs: Option<&VirtualFS>, path: &str, op: FileOp) -> Result<String, IOError> {
     let vfs = vfs.ok_or_else(|| ioerr("File system not initialized"))?;
 
     vfs.resolve(path, op)
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(|e| match e {
-            VfsError::PathNotAllowed => {
-                ioerr(format!("Path not allowed: {}. Use /user, /cache, /code, or /tmp", path))
-            }
-            VfsError::PermissionDenied => {
-                ioerr(format!("Permission denied: {}", path))
-            }
-            VfsError::PathTraversal => {
-                ioerr(format!("Path traversal detected: {}", path))
-            }
-            VfsError::SymlinkEscape => {
-                ioerr(format!("Symlink resolves outside sandbox: {}", path))
-            }
+            VfsError::PathNotAllowed => ioerr(format!(
+                "Path not allowed: {}. Use /user, /cache, /code, or /tmp",
+                path
+            )),
+            VfsError::PermissionDenied => ioerr(format!("Permission denied: {}", path)),
+            VfsError::PathTraversal => ioerr(format!("Path traversal detected: {}", path)),
+            VfsError::SymlinkEscape => ioerr(format!("Symlink resolves outside sandbox: {}", path)),
             VfsError::SymlinkNotAllowed => {
                 ioerr(format!("Symlinks not allowed in this directory: {}", path))
             }
-            VfsError::InvalidPath => {
-                ioerr(format!("Invalid path: {}", path))
-            }
+            VfsError::InvalidPath => ioerr(format!("Invalid path: {}", path)),
         })
 }
 
@@ -836,10 +825,7 @@ pub async fn op_unzip(
     let (io_tx, vfs, file_svc) = {
         let st = state.borrow();
         let host = st.borrow::<HostOpState>();
-        let file_svc = host
-            .device_services
-            .as_ref()
-            .and_then(|s| s.file());
+        let file_svc = host.device_services.as_ref().and_then(|s| s.file());
         (host.io_tx.clone(), host.vfs.clone(), file_svc)
     };
 

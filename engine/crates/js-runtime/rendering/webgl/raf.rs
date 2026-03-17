@@ -16,9 +16,7 @@ pub enum RafError {
 /// Returns the frame timestamp in milliseconds. The pending future keeps the
 /// deno_core event loop alive, which eliminates the busy-loop problem.
 #[op2(async(lazy), fast)]
-pub(crate) async fn op_await_next_frame(
-    state: Rc<RefCell<OpState>>,
-) -> Result<f64, RafError> {
+pub(crate) async fn op_await_next_frame(state: Rc<RefCell<OpState>>) -> Result<f64, RafError> {
     let rx = {
         let st = state.borrow();
         st.borrow::<HostOpState>()

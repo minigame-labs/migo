@@ -26,10 +26,7 @@ pub fn op_camera_create(
 
 /// Destroy a camera instance and release all resources.
 #[op2(fast)]
-pub fn op_camera_destroy(
-    state: &mut OpState,
-    #[smi] camera_id: u32,
-) -> Result<(), JsErrorBox> {
+pub fn op_camera_destroy(state: &mut OpState, #[smi] camera_id: u32) -> Result<(), JsErrorBox> {
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(camera) = services.camera() {
@@ -65,7 +62,9 @@ pub fn op_camera_start_record(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(camera) = services.camera() {
-            return camera.start_record(options_json).map_err(JsErrorBox::generic);
+            return camera
+                .start_record(options_json)
+                .map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("camera.startRecord:fail not supported"))
@@ -81,7 +80,9 @@ pub fn op_camera_stop_record(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(camera) = services.camera() {
-            return camera.stop_record(options_json).map_err(JsErrorBox::generic);
+            return camera
+                .stop_record(options_json)
+                .map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("camera.stopRecord:fail not supported"))
@@ -112,10 +113,14 @@ pub fn op_camera_listen_frame_change(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(camera) = services.camera() {
-            return camera.listen_frame_change(camera_id).map_err(JsErrorBox::generic);
+            return camera
+                .listen_frame_change(camera_id)
+                .map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("camera.listenFrameChange:fail not supported"))
+    Err(JsErrorBox::generic(
+        "camera.listenFrameChange:fail not supported",
+    ))
 }
 
 /// Stop listening for camera frame changes.
@@ -127,10 +132,14 @@ pub fn op_camera_close_frame_change(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(camera) = services.camera() {
-            return camera.close_frame_change(camera_id).map_err(JsErrorBox::generic);
+            return camera
+                .close_frame_change(camera_id)
+                .map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("camera.closeFrameChange:fail not supported"))
+    Err(JsErrorBox::generic(
+        "camera.closeFrameChange:fail not supported",
+    ))
 }
 
 // ==================== Image API Ops ====================

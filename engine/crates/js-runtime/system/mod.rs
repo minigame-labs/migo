@@ -18,7 +18,9 @@ pub fn op_open_system_bluetooth_setting(state: &mut OpState) -> Result<(), JsErr
             return sys.open_bluetooth_settings().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("openSystemBluetoothSetting:fail not supported"))
+    Err(JsErrorBox::generic(
+        "openSystemBluetoothSetting:fail not supported",
+    ))
 }
 
 // ==================== Bluetooth Adapter ====================
@@ -34,7 +36,9 @@ pub fn op_open_bluetooth_adapter(
             return bt.open_adapter(&options_json).map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("openBluetoothAdapter:fail not supported"))
+    Err(JsErrorBox::generic(
+        "openBluetoothAdapter:fail not supported",
+    ))
 }
 
 #[op2(fast)]
@@ -45,7 +49,9 @@ pub fn op_close_bluetooth_adapter(state: &mut OpState) -> Result<(), JsErrorBox>
             return bt.close_adapter().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("closeBluetoothAdapter:fail not supported"))
+    Err(JsErrorBox::generic(
+        "closeBluetoothAdapter:fail not supported",
+    ))
 }
 
 #[op2]
@@ -57,7 +63,9 @@ pub fn op_get_bluetooth_adapter_state(state: &mut OpState) -> Result<String, JsE
             return bt.get_adapter_state().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("getBluetoothAdapterState:fail not supported"))
+    Err(JsErrorBox::generic(
+        "getBluetoothAdapterState:fail not supported",
+    ))
 }
 
 #[op2(fast)]
@@ -68,10 +76,14 @@ pub fn op_start_bluetooth_devices_discovery(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
-            return bt.start_devices_discovery(&options_json).map_err(JsErrorBox::generic);
+            return bt
+                .start_devices_discovery(&options_json)
+                .map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("startBluetoothDevicesDiscovery:fail not supported"))
+    Err(JsErrorBox::generic(
+        "startBluetoothDevicesDiscovery:fail not supported",
+    ))
 }
 
 #[op2(fast)]
@@ -82,7 +94,9 @@ pub fn op_stop_bluetooth_devices_discovery(state: &mut OpState) -> Result<(), Js
             return bt.stop_devices_discovery().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("stopBluetoothDevicesDiscovery:fail not supported"))
+    Err(JsErrorBox::generic(
+        "stopBluetoothDevicesDiscovery:fail not supported",
+    ))
 }
 
 #[op2]
@@ -94,7 +108,9 @@ pub fn op_get_bluetooth_devices(state: &mut OpState) -> Result<String, JsErrorBo
             return bt.get_devices().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("getBluetoothDevices:fail not supported"))
+    Err(JsErrorBox::generic(
+        "getBluetoothDevices:fail not supported",
+    ))
 }
 
 #[op2]
@@ -106,10 +122,14 @@ pub fn op_get_connected_bluetooth_devices(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
-            return bt.get_connected_devices(&options_json).map_err(JsErrorBox::generic);
+            return bt
+                .get_connected_devices(&options_json)
+                .map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("getConnectedBluetoothDevices:fail not supported"))
+    Err(JsErrorBox::generic(
+        "getConnectedBluetoothDevices:fail not supported",
+    ))
 }
 
 #[op2(fast)]
@@ -134,10 +154,14 @@ pub fn op_is_bluetooth_device_paired(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
-            return bt.is_device_paired(&options_json).map_err(JsErrorBox::generic);
+            return bt
+                .is_device_paired(&options_json)
+                .map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("isBluetoothDevicePaired:fail not supported"))
+    Err(JsErrorBox::generic(
+        "isBluetoothDevicePaired:fail not supported",
+    ))
 }
 
 // ==================== Beacon ====================
@@ -150,10 +174,14 @@ pub fn op_start_beacon_discovery(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
-            return bt.start_beacon_discovery(&options_json).map_err(JsErrorBox::generic);
+            return bt
+                .start_beacon_discovery(&options_json)
+                .map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("startBeaconDiscovery:fail not supported"))
+    Err(JsErrorBox::generic(
+        "startBeaconDiscovery:fail not supported",
+    ))
 }
 
 #[op2(fast)]
@@ -164,7 +192,9 @@ pub fn op_stop_beacon_discovery(state: &mut OpState) -> Result<(), JsErrorBox> {
             return bt.stop_beacon_discovery().map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("stopBeaconDiscovery:fail not supported"))
+    Err(JsErrorBox::generic(
+        "stopBeaconDiscovery:fail not supported",
+    ))
 }
 
 #[op2]
@@ -186,10 +216,14 @@ pub fn op_open_app_authorize_setting(state: &mut OpState) -> Result<(), JsErrorB
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(sys) = services.system_info() {
-            return sys.open_app_authorize_setting().map_err(JsErrorBox::generic);
+            return sys
+                .open_app_authorize_setting()
+                .map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("openAppAuthorizeSetting:fail not supported"))
+    Err(JsErrorBox::generic(
+        "openAppAuthorizeSetting:fail not supported",
+    ))
 }
 
 // ==================== Window Info ====================
@@ -242,10 +276,14 @@ pub fn op_get_app_authorization_setting(state: &mut OpState) -> Result<String, J
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(sys) = services.system_info() {
-            return sys.get_app_authorization_setting_json().map_err(JsErrorBox::generic);
+            return sys
+                .get_app_authorization_setting_json()
+                .map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic("getAppAuthorizeSetting:fail not supported"))
+    Err(JsErrorBox::generic(
+        "getAppAuthorizeSetting:fail not supported",
+    ))
 }
 
 // ==================== Game Log ====================

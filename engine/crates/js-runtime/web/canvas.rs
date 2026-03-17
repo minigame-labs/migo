@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, RecvTimeoutError};
-use deno_core::{op2, OpState};
+use crossbeam_channel::{RecvTimeoutError, bounded};
+use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
 use shared::{
     error::{EngineError, ErrorCode},
@@ -50,10 +50,7 @@ fn send_canvas_sync<T>(
 
     match resp_rx.recv_timeout(SYNC_TIMEOUT) {
         Ok(res) => res.map_err(js_err_from_engine),
-        Err(e) => Err(js_err_from_engine(from_crossbeam_recv_err(
-            e,
-            timeout_msg,
-        ))),
+        Err(e) => Err(js_err_from_engine(from_crossbeam_recv_err(e, timeout_msg))),
     }
 }
 

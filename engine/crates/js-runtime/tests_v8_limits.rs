@@ -8,8 +8,8 @@
 
 #[cfg(all(test, feature = "v8-limits"))]
 mod v8_limits_tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use deno_core::{JsRuntime, RuntimeOptions, v8};
 
@@ -75,7 +75,10 @@ mod v8_limits_tests {
         assert!(ok);
 
         let result = runtime.execute_script("after_terminate.js", "1 + 1");
-        assert!(result.is_ok(), "Isolate should be usable after cancellation");
+        assert!(
+            result.is_ok(),
+            "Isolate should be usable after cancellation"
+        );
 
         terminator.join().unwrap();
     }

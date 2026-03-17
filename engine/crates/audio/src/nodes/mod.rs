@@ -25,8 +25,8 @@ pub use dynamics_compressor::DynamicsCompressorNode;
 pub use gain::GainNode;
 pub use iir_filter::IIRFilterNode;
 pub use oscillator::{OscillatorNode, OscillatorType};
-pub use panner::{PannerNode, PanningModel, DistanceModel};
-pub use wave_shaper::{WaveShaperNode, OversampleType};
+pub use panner::{DistanceModel, PannerNode, PanningModel};
+pub use wave_shaper::{OversampleType, WaveShaperNode};
 
 use std::any::Any;
 

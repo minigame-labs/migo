@@ -15,10 +15,7 @@ use tracing::{debug, warn};
 /// Message from download task to audio thread
 pub enum StreamMsg {
     /// Audio format detected, can start playback
-    Ready {
-        sample_rate: u32,
-        channels: u32,
-    },
+    Ready { sample_rate: u32, channels: u32 },
     /// New decoded samples available
     Samples(Vec<f32>),
     /// Download/decode complete
@@ -112,14 +109,10 @@ async fn streaming_download_task(
     debug!("Starting streaming download: {}", url);
 
     let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!("HTTP request failed for {}: {}", url, e);
-            EngineError::from_detail(ErrorCode::IoError, format!("HTTP request failed: {}", e))
-        })?;
+    let response = client.get(&url).send().await.map_err(|e| {
+        tracing::error!("HTTP request failed for {}: {}", url, e);
+        EngineError::from_detail(ErrorCode::IoError, format!("HTTP request failed: {}", e))
+    })?;
 
     if !response.status().is_success() {
         tracing::error!("HTTP error for {}: {}", url, response.status());
@@ -154,11 +147,10 @@ async fn streaming_download_task(
             return Ok(());
         }
 
-        let chunk = chunk_result
-            .map_err(|e| {
-                tracing::error!("Stream chunk error: {}", e);
-                EngineError::from_detail(ErrorCode::IoError, format!("Stream error: {}", e))
-            })?;
+        let chunk = chunk_result.map_err(|e| {
+            tracing::error!("Stream chunk error: {}", e);
+            EngineError::from_detail(ErrorCode::IoError, format!("Stream error: {}", e))
+        })?;
 
         chunk_count += 1;
         let chunk_len = chunk.len();
@@ -166,17 +158,27 @@ async fn streaming_download_task(
         // Update progress
         let downloaded = state
             .bytes_downloaded
-            .fetch_add(chunk_len as u64, Ordering::Relaxed) + chunk_len as u64;
+            .fetch_add(chunk_len as u64, Ordering::Relaxed)
+            + chunk_len as u64;
 
         // Log progress every 10 chunks or every 100KB
         if chunk_count % 10 == 0 || chunk_count == 1 {
             let total = state.bytes_total.load(Ordering::Relaxed);
             if total > 0 {
                 let percent = (downloaded as f64 / total as f64 * 100.0) as u32;
-                tracing::trace!("Download progress: {}% ({}/{} bytes, {} chunks)",
-                    percent, downloaded, total, chunk_count);
+                tracing::trace!(
+                    "Download progress: {}% ({}/{} bytes, {} chunks)",
+                    percent,
+                    downloaded,
+                    total,
+                    chunk_count
+                );
             } else {
-                tracing::trace!("Download progress: {} bytes, {} chunks", downloaded, chunk_count);
+                tracing::trace!(
+                    "Download progress: {} bytes, {} chunks",
+                    downloaded,
+                    chunk_count
+                );
             }
         }
 
@@ -188,7 +190,11 @@ async fn streaming_download_task(
 
         // Send ready message once we have format info
         if !ready_sent && sample_rate > 0 && channels > 0 {
-            tracing::debug!("Stream format detected: {} Hz, {} channels", sample_rate, channels);
+            tracing::debug!(
+                "Stream format detected: {} Hz, {} channels",
+                sample_rate,
+                channels
+            );
             let _ = tx.send(StreamMsg::Ready {
                 sample_rate,
                 channels,
@@ -199,7 +205,11 @@ async fn streaming_download_task(
         // Send decoded samples
         if !new_samples.is_empty() {
             total_decoded_samples += new_samples.len();
-            tracing::trace!("Decoded {} samples (total: {})", new_samples.len(), total_decoded_samples);
+            tracing::trace!(
+                "Decoded {} samples (total: {})",
+                new_samples.len(),
+                total_decoded_samples
+            );
             let _ = tx.send(StreamMsg::Samples(new_samples));
         }
     }
@@ -216,8 +226,10 @@ async fn streaming_download_task(
     let _ = tx.send(StreamMsg::Done);
 
     let downloaded = state.bytes_downloaded.load(Ordering::Relaxed);
-    debug!("Streaming download complete: {} bytes, {} total samples decoded",
-        downloaded, total_decoded_samples);
+    debug!(
+        "Streaming download complete: {} bytes, {} total samples decoded",
+        downloaded, total_decoded_samples
+    );
     Ok(())
 }
 
@@ -285,11 +297,8 @@ impl Mp3StreamDecoder {
                     }
 
                     // Convert i16 to f32
-                    let frame_samples: Vec<f32> = frame
-                        .data
-                        .iter()
-                        .map(|&s| s as f32 / 32768.0)
-                        .collect();
+                    let frame_samples: Vec<f32> =
+                        frame.data.iter().map(|&s| s as f32 / 32768.0).collect();
 
                     // Resample if needed
                     let output_samples = if let Some(ref mut resampler) = self.resampler {

@@ -35,7 +35,10 @@ fn main() {
 
     let extensions = js_runtime::snapshot::lazy_extensions();
 
-    println!("Creating V8 snapshot with {} extensions...", extensions.len());
+    println!(
+        "Creating V8 snapshot with {} extensions...",
+        extensions.len()
+    );
     for ext in &extensions {
         println!("  - {}", ext.name);
     }

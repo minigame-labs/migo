@@ -70,8 +70,7 @@ impl Resource for HttpClientResource {
     }
 }
 
-impl HttpClientResource {
-}
+impl HttpClientResource {}
 
 type CancelableResponseResult = Result<Result<Response, AnyError>, Canceled>;
 
@@ -519,10 +518,7 @@ pub async fn op_fetch_send(
     })
 }
 
-pub fn create_http_client(
-    user_agent: &str,
-    enable_http2: bool,
-) -> Result<Client, AnyError> {
+pub fn create_http_client(user_agent: &str, enable_http2: bool) -> Result<Client, AnyError> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, user_agent.parse().unwrap());
     let mut builder = Client::builder()
@@ -608,8 +604,7 @@ pub async fn op_fetch_upload(
     }
 
     // Parse URL
-    let parsed_url =
-        Url::parse(&url).map_err(|_| JsErrorBox::type_error("Invalid URL"))?;
+    let parsed_url = Url::parse(&url).map_err(|_| JsErrorBox::type_error("Invalid URL"))?;
 
     debug!("Upload request: POST {}", parsed_url);
 
@@ -622,8 +617,8 @@ pub async fn op_fetch_upload(
     // Apply custom headers (skip Content-Type as reqwest sets it for multipart)
     let mut header_map = HeaderMap::new();
     for (key, value) in headers {
-        let hname = HeaderName::from_bytes(&key)
-            .map_err(|_| JsErrorBox::type_error("Invalid Header"))?;
+        let hname =
+            HeaderName::from_bytes(&key).map_err(|_| JsErrorBox::type_error("Invalid Header"))?;
         let hval = HeaderValue::from_bytes(&value)
             .map_err(|_| JsErrorBox::type_error("Invalid Header Value"))?;
         // Skip Content-Type and Content-Length for multipart (reqwest manages these)

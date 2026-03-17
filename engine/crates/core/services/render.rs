@@ -25,7 +25,13 @@ impl RenderService {
         surface: SurfaceRef,
         pixel_ratio: f32,
     ) -> Self {
-        let thread = RenderThread::spawn(raf_tx, vsync_rx, host_id, Some(surface.clone()), pixel_ratio);
+        let thread = RenderThread::spawn(
+            raf_tx,
+            vsync_rx,
+            host_id,
+            Some(surface.clone()),
+            pixel_ratio,
+        );
         Self { surface, thread }
     }
 

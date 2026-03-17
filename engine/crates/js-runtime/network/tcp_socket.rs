@@ -61,7 +61,11 @@ impl Resource for TcpSocketResource {
 ///
 /// The JS polling loop maps these to TCPSocket event callbacks.
 #[derive(Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum TcpEvent {
     /// Data received from the remote end.
     #[serde(rename = "message")]
@@ -118,7 +122,11 @@ pub async fn op_tcp_connect(
     #[smi] timeout_secs: u32,
 ) -> Result<TcpConnectResult, JsErrorBox> {
     let port = port as u16;
-    let timeout = if timeout_secs == 0 { 2 } else { timeout_secs.min(300) };
+    let timeout = if timeout_secs == 0 {
+        2
+    } else {
+        timeout_secs.min(300)
+    };
 
     debug!("TCP connect: {}:{} (timeout={}s)", address, port, timeout);
 
@@ -148,9 +156,7 @@ pub async fn op_tcp_connect(
     let local_addr = stream
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-    let remote_addr = stream
-        .peer_addr()
-        .unwrap_or(sock_addr);
+    let remote_addr = stream.peer_addr().unwrap_or(sock_addr);
 
     let (reader, writer) = tokio::io::split(stream);
 
@@ -164,7 +170,10 @@ pub async fn op_tcp_connect(
 
     let rid = state.borrow_mut().resource_table.add(resource);
 
-    debug!("TCP connected, rid={}, local={}, remote={}", rid, local_addr, remote_addr);
+    debug!(
+        "TCP connected, rid={}, local={}, remote={}",
+        rid, local_addr, remote_addr
+    );
 
     Ok(TcpConnectResult {
         rid,

@@ -248,7 +248,10 @@ mod tests {
     #[test]
     fn test_error_code_conversion_io() {
         assert_eq!(ErrorCode::try_from(100u16), Ok(ErrorCode::IoError));
-        assert_eq!(ErrorCode::try_from(101u16), Ok(ErrorCode::BadFileDescriptor));
+        assert_eq!(
+            ErrorCode::try_from(101u16),
+            Ok(ErrorCode::BadFileDescriptor)
+        );
     }
 
     #[test]

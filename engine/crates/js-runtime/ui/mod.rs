@@ -11,10 +11,7 @@ use shared::op_state::HostOpState;
 // ==================== Toast Ops ====================
 
 #[op2(fast)]
-pub fn op_show_toast(
-    state: &mut OpState,
-    #[string] json: String,
-) -> Result<(), JsErrorBox> {
+pub fn op_show_toast(state: &mut OpState, #[string] json: String) -> Result<(), JsErrorBox> {
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(interaction) = services.interaction() {
@@ -38,10 +35,7 @@ pub fn op_hide_toast(state: &mut OpState) -> Result<(), JsErrorBox> {
 // ==================== Modal Ops ====================
 
 #[op2(fast)]
-pub fn op_show_modal(
-    state: &mut OpState,
-    #[string] json: String,
-) -> Result<(), JsErrorBox> {
+pub fn op_show_modal(state: &mut OpState, #[string] json: String) -> Result<(), JsErrorBox> {
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(interaction) = services.interaction() {
@@ -54,10 +48,7 @@ pub fn op_show_modal(
 // ==================== Loading Ops ====================
 
 #[op2(fast)]
-pub fn op_show_loading(
-    state: &mut OpState,
-    #[string] json: String,
-) -> Result<(), JsErrorBox> {
+pub fn op_show_loading(state: &mut OpState, #[string] json: String) -> Result<(), JsErrorBox> {
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(interaction) = services.interaction() {
@@ -81,14 +72,13 @@ pub fn op_hide_loading(state: &mut OpState) -> Result<(), JsErrorBox> {
 // ==================== Action Sheet Ops ====================
 
 #[op2(fast)]
-pub fn op_show_action_sheet(
-    state: &mut OpState,
-    #[string] json: String,
-) -> Result<(), JsErrorBox> {
+pub fn op_show_action_sheet(state: &mut OpState, #[string] json: String) -> Result<(), JsErrorBox> {
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(interaction) = services.interaction() {
-            return interaction.show_action_sheet(&json).map_err(JsErrorBox::generic);
+            return interaction
+                .show_action_sheet(&json)
+                .map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("showActionSheet:fail not supported"))

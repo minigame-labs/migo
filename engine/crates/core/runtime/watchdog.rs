@@ -37,13 +37,13 @@
 //!
 //! All code in this module is gated behind `cfg(feature = "v8-limits")`.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use deno_core::v8;
 use shared::error::{EngineError, EngineResult, ErrorCode};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 /// How often the watchdog thread checks the heartbeat.
 /// Default: every 2 seconds (configurable via [`WatchdogConfig`]).
@@ -81,20 +81,20 @@ pub trait TelemetryReporter: Send + Sync {
     /// * `reason` - Why the isolate was terminated.
     /// * `elapsed_ms` - How many milliseconds elapsed since the last heartbeat.
     /// * `backtrace` - Best-effort backtrace (may be empty on release builds).
-    fn report_anr(
-        &self,
-        host_id: i32,
-        reason: TerminationReason,
-        elapsed_ms: u64,
-        backtrace: &str,
-    );
+    fn report_anr(&self, host_id: i32, reason: TerminationReason, elapsed_ms: u64, backtrace: &str);
 }
 
 /// No-op telemetry reporter (default).
 struct NoopReporter;
 
 impl TelemetryReporter for NoopReporter {
-    fn report_anr(&self, _host_id: i32, _reason: TerminationReason, _elapsed_ms: u64, _backtrace: &str) {
+    fn report_anr(
+        &self,
+        _host_id: i32,
+        _reason: TerminationReason,
+        _elapsed_ms: u64,
+        _backtrace: &str,
+    ) {
         // Intentionally empty - logging is handled by the watchdog loop itself.
     }
 }
@@ -413,16 +413,19 @@ fn watchdog_loop(
             // `classify_termination_error()` and issues a single notification
             // to Java, avoiding duplicate callbacks.  Telemetry is fired here
             // for analytics only (no user-facing side-effects).
-            config.telemetry.report_anr(
-                host_id,
-                TerminationReason::Timeout,
-                elapsed,
-                &backtrace,
-            );
+            config
+                .telemetry
+                .report_anr(host_id, TerminationReason::Timeout, elapsed, &backtrace);
 
             error!(
                 "[Host {}] Watchdog: ANR reported. elapsed={}ms, backtrace:\n{}",
-                host_id, elapsed, if backtrace.is_empty() { "(not available)" } else { &backtrace }
+                host_id,
+                elapsed,
+                if backtrace.is_empty() {
+                    "(not available)"
+                } else {
+                    &backtrace
+                }
             );
 
             break; // Exit after termination
@@ -477,7 +480,10 @@ mod tests {
         let state = WatchdogState::new();
         state.mark_terminated(TerminationReason::OutOfMemory);
         assert!(state.was_terminated());
-        assert_eq!(state.termination_reason(), Some(TerminationReason::OutOfMemory));
+        assert_eq!(
+            state.termination_reason(),
+            Some(TerminationReason::OutOfMemory)
+        );
     }
 
     #[test]
@@ -564,12 +570,20 @@ mod tests {
             count: AtomicU32,
         }
         impl TelemetryReporter for CountingReporter {
-            fn report_anr(&self, _host_id: i32, _reason: TerminationReason, _elapsed_ms: u64, _backtrace: &str) {
+            fn report_anr(
+                &self,
+                _host_id: i32,
+                _reason: TerminationReason,
+                _elapsed_ms: u64,
+                _backtrace: &str,
+            ) {
                 self.count.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        let reporter = Arc::new(CountingReporter { count: AtomicU32::new(0) });
+        let reporter = Arc::new(CountingReporter {
+            count: AtomicU32::new(0),
+        });
         reporter.report_anr(1, TerminationReason::Timeout, 12000, "");
         assert_eq!(reporter.count.load(Ordering::Relaxed), 1);
     }

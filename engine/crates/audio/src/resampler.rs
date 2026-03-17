@@ -40,7 +40,8 @@ impl StreamResampler {
         }
 
         let input_frames = input.len() / channels;
-        let output_frames = ((input_frames as u64 * self.output_rate as u64) / self.input_rate as u64) as usize;
+        let output_frames =
+            ((input_frames as u64 * self.output_rate as u64) / self.input_rate as u64) as usize;
 
         if output_frames == 0 {
             return Vec::new();
@@ -98,7 +99,10 @@ impl StreamResampler {
 }
 
 /// Resample audio to target sample rate if needed
-pub fn resample_if_needed(audio: DecodedAudio, target_sample_rate: u32) -> EngineResult<DecodedAudio> {
+pub fn resample_if_needed(
+    audio: DecodedAudio,
+    target_sample_rate: u32,
+) -> EngineResult<DecodedAudio> {
     // No resampling needed if rates match
     if audio.sample_rate == target_sample_rate {
         return Ok(audio);
@@ -131,7 +135,7 @@ pub fn resample_if_needed(audio: DecodedAudio, target_sample_rate: u32) -> Engin
         audio.sample_rate as usize,
         target_sample_rate as usize,
         chunk_size,
-        2,  // sub_chunks for quality
+        2, // sub_chunks for quality
         channels,
     )
     .map_err(|e| {
@@ -157,10 +161,7 @@ pub fn resample_if_needed(audio: DecodedAudio, target_sample_rate: u32) -> Engin
         let chunk_len = end - pos;
 
         // Prepare input chunk
-        let input_chunk: Vec<&[f32]> = input_channels
-            .iter()
-            .map(|ch| &ch[pos..end])
-            .collect();
+        let input_chunk: Vec<&[f32]> = input_channels.iter().map(|ch| &ch[pos..end]).collect();
 
         // Handle partial last chunk by padding with zeros
         let padded_input: Vec<Vec<f32>>;
@@ -180,10 +181,7 @@ pub fn resample_if_needed(audio: DecodedAudio, target_sample_rate: u32) -> Engin
 
         // Resample
         let output_chunk = resampler.process(&actual_input, None).map_err(|e| {
-            EngineError::from_detail(
-                ErrorCode::Internal,
-                format!("Resampling failed: {}", e),
-            )
+            EngineError::from_detail(ErrorCode::Internal, format!("Resampling failed: {}", e))
         })?;
 
         // Append output

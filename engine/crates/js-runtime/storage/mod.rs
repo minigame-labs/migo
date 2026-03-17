@@ -27,7 +27,10 @@ use deno_core::{Extension, JsBuffer, OpState, op2};
 use deno_error::JsErrorBox;
 use shared::error::EngineError;
 use shared::op_state::HostOpState;
-use shared::protocol::{self, io_cmd::{IOCmd, IOCmdResp}};
+use shared::protocol::{
+    self,
+    io_cmd::{IOCmd, IOCmdResp},
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Storage directory name under `app_files_dir`.
@@ -49,12 +52,18 @@ const MAX_TOTAL_SIZE: usize = LIMIT_SIZE_KB as usize * 1024;
 
 #[inline]
 fn storage_dir(state: &OpState) -> PathBuf {
-    state.borrow::<HostOpState>().app_files_dir.join(STORAGE_DIR)
+    state
+        .borrow::<HostOpState>()
+        .app_files_dir
+        .join(STORAGE_DIR)
 }
 
 #[inline]
 fn buffer_url_dir(state: &OpState) -> PathBuf {
-    state.borrow::<HostOpState>().app_cache_dir.join(BUFFER_URL_DIR)
+    state
+        .borrow::<HostOpState>()
+        .app_cache_dir
+        .join(BUFFER_URL_DIR)
 }
 
 /// Encode a storage key to a hex filename.
@@ -129,10 +138,7 @@ fn ensure_dir(dir: &std::path::Path) -> Result<(), JsErrorBox> {
 
 #[op2]
 #[string]
-pub fn op_storage_get(
-    state: &mut OpState,
-    #[string] key: &str,
-) -> Result<String, JsErrorBox> {
+pub fn op_storage_get(state: &mut OpState, #[string] key: &str) -> Result<String, JsErrorBox> {
     let path = storage_dir(state).join(key_to_hex(key));
     match fs::read_to_string(&path) {
         Ok(content) => Ok(content),
@@ -149,9 +155,7 @@ pub fn op_storage_set(
 ) -> Result<(), JsErrorBox> {
     let value_len = value.len();
     if value_len > MAX_VALUE_SIZE {
-        return Err(JsErrorBox::generic(
-            "setStorage:fail data exceeds max size",
-        ));
+        return Err(JsErrorBox::generic("setStorage:fail data exceeds max size"));
     }
 
     let dir = storage_dir(state);
@@ -161,9 +165,7 @@ pub fn op_storage_set(
     let target = dir.join(&hex_name);
 
     // Compute current total and the size of any existing value for this key.
-    let existing_size = fs::metadata(&target)
-        .map(|m| m.len() as usize)
-        .unwrap_or(0);
+    let existing_size = fs::metadata(&target).map(|m| m.len() as usize).unwrap_or(0);
 
     let mut total: usize = 0;
     if let Ok(entries) = fs::read_dir(&dir) {
@@ -178,16 +180,12 @@ pub fn op_storage_set(
         ));
     }
 
-    fs::write(&target, value)
-        .map_err(|e| JsErrorBox::generic(format!("setStorage:fail {e}")))?;
+    fs::write(&target, value).map_err(|e| JsErrorBox::generic(format!("setStorage:fail {e}")))?;
     Ok(())
 }
 
 #[op2(fast)]
-pub fn op_storage_remove(
-    state: &mut OpState,
-    #[string] key: &str,
-) -> Result<(), JsErrorBox> {
+pub fn op_storage_remove(state: &mut OpState, #[string] key: &str) -> Result<(), JsErrorBox> {
     let path = storage_dir(state).join(key_to_hex(key));
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
@@ -343,9 +341,7 @@ pub async fn op_storage_remove_async(
 }
 
 #[op2(async(lazy), fast)]
-pub async fn op_storage_clear_async(
-    state: Rc<RefCell<OpState>>,
-) -> Result<(), StorageError> {
+pub async fn op_storage_clear_async(state: Rc<RefCell<OpState>>) -> Result<(), StorageError> {
     let (dir, tx) = {
         let st = state.borrow();
         let hos = st.borrow::<HostOpState>();
@@ -362,9 +358,7 @@ pub async fn op_storage_clear_async(
 
 #[op2(async(lazy), fast)]
 #[string]
-pub async fn op_storage_info_async(
-    state: Rc<RefCell<OpState>>,
-) -> Result<String, StorageError> {
+pub async fn op_storage_info_async(state: Rc<RefCell<OpState>>) -> Result<String, StorageError> {
     let (dir, tx) = {
         let st = state.borrow();
         let hos = st.borrow::<HostOpState>();
@@ -409,10 +403,7 @@ pub fn op_create_buffer_url(
 }
 
 #[op2(fast)]
-pub fn op_revoke_buffer_url(
-    state: &mut OpState,
-    #[string] url: &str,
-) -> Result<(), JsErrorBox> {
+pub fn op_revoke_buffer_url(state: &mut OpState, #[string] url: &str) -> Result<(), JsErrorBox> {
     let dir = buffer_url_dir(state);
     let path = std::path::Path::new(url);
     // Only allow deleting files within the buffer URL directory.

@@ -5,7 +5,7 @@ use tracing::debug;
 /// Trigger a full V8 garbage collection cycle.
 ///
 /// Calls `v8::Isolate::low_memory_notification()` which performs a full GC
-/// including both young and old generation collections. 
+/// including both young and old generation collections.
 ///
 /// **Important**: This is a synchronous, stop-the-world operation. It should
 /// NOT be called every frame. Appropriate usage:

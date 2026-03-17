@@ -8,7 +8,10 @@ use super::DecodedAudio;
 pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
     let cursor = Cursor::new(data);
     let mut reader = OggStreamReader::new(cursor).map_err(|e| {
-        EngineError::from_detail(ErrorCode::InvalidArgument, format!("OGG decode error: {:?}", e))
+        EngineError::from_detail(
+            ErrorCode::InvalidArgument,
+            format!("OGG decode error: {:?}", e),
+        )
     })?;
 
     let sample_rate = reader.ident_hdr.audio_sample_rate;
@@ -16,9 +19,15 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
 
     let mut samples: Vec<f32> = Vec::new();
 
-    while let Some(packet) = reader.read_dec_packet_generic::<Vec<Vec<f32>>>().map_err(|e| {
-        EngineError::from_detail(ErrorCode::InvalidArgument, format!("OGG decode error: {:?}", e))
-    })? {
+    while let Some(packet) = reader
+        .read_dec_packet_generic::<Vec<Vec<f32>>>()
+        .map_err(|e| {
+            EngineError::from_detail(
+                ErrorCode::InvalidArgument,
+                format!("OGG decode error: {:?}", e),
+            )
+        })?
+    {
         // packet is Vec<Vec<f32>> - one Vec<f32> per channel
         // Interleave the channels
         if packet.is_empty() {

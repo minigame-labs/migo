@@ -1,14 +1,14 @@
 extern crate khronos_egl as egl;
 
-use femtovg::{renderer::OpenGl, Canvas as FvCanvas};
+use femtovg::{Canvas as FvCanvas, renderer::OpenGl};
 use shared::{
     error::{EngineResult, ErrorCode},
     protocol::render_cmd::CanvasId,
 };
 use std::{ffi::c_void, ptr};
 
-use super::types::ee;
 use super::CanvasManager;
+use super::types::ee;
 use crate::{BoundContext, Canvas2DContext, FontManager};
 
 /// Initialize femtovg for a canvas

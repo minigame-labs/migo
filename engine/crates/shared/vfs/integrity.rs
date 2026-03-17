@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{EngineError, EngineResult, ErrorCode};
 
@@ -219,11 +219,7 @@ impl IntegrityVerifier {
     ///
     /// Call this after [`verify_entry`] to ensure every file in the manifest
     /// matches its declared SHA256 hash.
-    pub fn verify_all_files(
-        &mut self,
-        code_dir: &Path,
-        manifest: &Manifest,
-    ) -> EngineResult<()> {
+    pub fn verify_all_files(&mut self, code_dir: &Path, manifest: &Manifest) -> EngineResult<()> {
         for (path, _) in &manifest.files {
             self.verify_file_hash(code_dir, path, &manifest.files)?;
         }
@@ -335,8 +331,9 @@ impl IntegrityVerifier {
 
 fn validate_manifest_relative_path(relative_path: &str) -> EngineResult<()> {
     if relative_path.is_empty() {
-        return Err(EngineError::new(ErrorCode::CodeIntegrityFailed)
-            .with_msg("manifest path is empty"));
+        return Err(
+            EngineError::new(ErrorCode::CodeIntegrityFailed).with_msg("manifest path is empty")
+        );
     }
     if relative_path.starts_with('/') || relative_path.starts_with('\\') {
         return Err(EngineError::new(ErrorCode::CodeIntegrityFailed)

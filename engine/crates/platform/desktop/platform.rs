@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use core::PlatformServices;
 use core::services::DeviceServices;
-use shared::config::InitOptions;
 use deno_core::Extension;
+use shared::config::InitOptions;
+use std::sync::Arc;
 
 pub struct DesktopPlatform;
 

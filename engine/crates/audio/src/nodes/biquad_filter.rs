@@ -156,7 +156,11 @@ impl BiquadFilterNode {
         let ft = self.filter_type;
 
         // Skip if nothing changed
-        if freq == self.last_freq && q == self.last_q && db_gain == self.last_gain && ft == self.last_type {
+        if freq == self.last_freq
+            && q == self.last_q
+            && db_gain == self.last_gain
+            && ft == self.last_type
+        {
             return;
         }
         self.last_freq = freq;
@@ -300,8 +304,7 @@ impl AudioNodeProcessor for BiquadFilterNode {
                 let state = &mut self.states[ch];
 
                 // Direct Form I
-                let y0 = b0 * x0 + b1 * state.x1 + b2 * state.x2
-                    - a1 * state.y1 - a2 * state.y2;
+                let y0 = b0 * x0 + b1 * state.x1 + b2 * state.x2 - a1 * state.y1 - a2 * state.y2;
 
                 state.x2 = state.x1;
                 state.x1 = x0;

@@ -19,7 +19,11 @@ impl std::fmt::Display for GamePathError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GamePathError::InvalidGameId(id) => {
-                write!(f, "Invalid game ID '{}': must be 1-64 alphanumeric, underscore or hyphen", id)
+                write!(
+                    f,
+                    "Invalid game ID '{}': must be 1-64 alphanumeric, underscore or hyphen",
+                    id
+                )
             }
             GamePathError::InvalidBaseDir => write!(f, "Invalid base directory"),
         }
@@ -274,10 +278,14 @@ mod tests {
     #[test]
     fn test_game_paths_creation() {
         let paths = GamePaths::new("/data/files", "/data/cache", "test-game").unwrap();
-        
+
         assert_eq!(paths.game_id(), "test-game");
         assert!(paths.code_dir().ends_with("migo/games/test-game/code"));
-        assert!(paths.user_data_dir().ends_with("migo/games/test-game/user_data"));
+        assert!(
+            paths
+                .user_data_dir()
+                .ends_with("migo/games/test-game/user_data")
+        );
         assert!(paths.cache_dir().ends_with("migo/games/test-game"));
         assert!(paths.temp_dir().ends_with("migo/games/test-game/tmp"));
     }

@@ -5,8 +5,8 @@
 //!
 //! Supports streaming playback - can start playing before full download completes.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use shared::protocol::audio_cmd::{InnerAudioEvent, InnerAudioEventType, InnerAudioId};
 use tokio::sync::mpsc::UnboundedReceiver;

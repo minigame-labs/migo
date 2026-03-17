@@ -285,8 +285,7 @@ impl BufferSourceNode {
             let src_base = src_frame * src_channels;
             let dst_base = frame_idx * dst_channels;
 
-            if src_base + copy_channels <= samples.len()
-                && dst_base + dst_channels <= output.len()
+            if src_base + copy_channels <= samples.len() && dst_base + dst_channels <= output.len()
             {
                 for ch in 0..copy_channels {
                     output[dst_base + ch] = samples[src_base + ch];
@@ -343,10 +342,7 @@ impl AudioNodeProcessor for BufferSourceNode {
     }
 
     fn output_channels(&self) -> u32 {
-        self.buffer
-            .as_ref()
-            .map(|b| b.channels)
-            .unwrap_or(2)
+        self.buffer.as_ref().map(|b| b.channels).unwrap_or(2)
     }
 
     fn get_param_mut(&mut self, name: &str) -> Option<&mut AudioParamTimeline> {

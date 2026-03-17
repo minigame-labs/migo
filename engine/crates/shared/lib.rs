@@ -40,9 +40,9 @@
 //! processing across specialized threads (main, render, audio, IO).
 
 pub mod channel;
-pub mod console_log;
 pub mod codec;
 pub mod config;
+pub mod console_log;
 pub mod device;
 pub mod error;
 pub mod op_state;

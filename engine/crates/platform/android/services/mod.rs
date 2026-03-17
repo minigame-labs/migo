@@ -27,7 +27,9 @@ impl AndroidDeviceServices {
 
 impl DeviceServices for AndroidDeviceServices {
     fn clipboard(&self) -> Option<Arc<dyn ClipboardService>> {
-        Some(Arc::new(AndroidClipboard { host_id: self.host_id }))
+        Some(Arc::new(AndroidClipboard {
+            host_id: self.host_id,
+        }))
     }
 
     fn battery(&self) -> Option<Arc<dyn BatteryService>> {
@@ -39,47 +41,69 @@ impl DeviceServices for AndroidDeviceServices {
     }
 
     fn screen(&self) -> Option<Arc<dyn ScreenService>> {
-        Some(Arc::new(AndroidScreen { host_id: self.host_id }))
+        Some(Arc::new(AndroidScreen {
+            host_id: self.host_id,
+        }))
     }
 
     fn device_motion(&self) -> Option<Arc<dyn DeviceMotionService>> {
-        Some(Arc::new(AndroidDeviceMotion { host_id: self.host_id }))
+        Some(Arc::new(AndroidDeviceMotion {
+            host_id: self.host_id,
+        }))
     }
 
     fn gyroscope(&self) -> Option<Arc<dyn GyroscopeService>> {
-        Some(Arc::new(AndroidGyroscope { host_id: self.host_id }))
+        Some(Arc::new(AndroidGyroscope {
+            host_id: self.host_id,
+        }))
     }
 
     fn compass(&self) -> Option<Arc<dyn CompassService>> {
-        Some(Arc::new(AndroidCompass { host_id: self.host_id }))
+        Some(Arc::new(AndroidCompass {
+            host_id: self.host_id,
+        }))
     }
 
     fn accelerometer(&self) -> Option<Arc<dyn AccelerometerService>> {
-        Some(Arc::new(AndroidAccelerometer { host_id: self.host_id }))
+        Some(Arc::new(AndroidAccelerometer {
+            host_id: self.host_id,
+        }))
     }
 
     fn network(&self) -> Option<Arc<dyn NetworkService>> {
-        Some(Arc::new(AndroidNetwork { host_id: self.host_id }))
+        Some(Arc::new(AndroidNetwork {
+            host_id: self.host_id,
+        }))
     }
 
     fn audio_platform(&self) -> Option<Arc<dyn AudioPlatformService>> {
-        Some(Arc::new(AndroidAudioPlatform { host_id: self.host_id }))
+        Some(Arc::new(AndroidAudioPlatform {
+            host_id: self.host_id,
+        }))
     }
 
     fn recorder(&self) -> Option<Arc<dyn RecorderService>> {
-        Some(Arc::new(AndroidRecorder { host_id: self.host_id }))
+        Some(Arc::new(AndroidRecorder {
+            host_id: self.host_id,
+        }))
     }
 
     fn camera(&self) -> Option<Arc<dyn CameraService>> {
-        Some(Arc::new(AndroidCamera { host_id: self.host_id }))
+        Some(Arc::new(AndroidCamera {
+            host_id: self.host_id,
+        }))
     }
 
     fn interaction(&self) -> Option<Arc<dyn InteractionService>> {
-        Some(Arc::new(AndroidInteraction { host_id: self.host_id }))
+        Some(Arc::new(AndroidInteraction {
+            host_id: self.host_id,
+        }))
     }
 
     fn system_info(&self) -> Option<Arc<dyn SystemInfoService>> {
-        Some(Arc::new(AndroidSystemInfo { host_id: self.host_id }))
+        Some(Arc::new(AndroidSystemInfo {
+            host_id: self.host_id,
+        }))
     }
 
     fn codec(&self) -> Option<Arc<dyn CodecService>> {
@@ -91,27 +115,39 @@ impl DeviceServices for AndroidDeviceServices {
     }
 
     fn bluetooth(&self) -> Option<Arc<dyn BluetoothService>> {
-        Some(Arc::new(AndroidBluetooth { host_id: self.host_id }))
+        Some(Arc::new(AndroidBluetooth {
+            host_id: self.host_id,
+        }))
     }
 
     fn keyboard(&self) -> Option<Arc<dyn KeyboardService>> {
-        Some(Arc::new(AndroidKeyboard { host_id: self.host_id }))
+        Some(Arc::new(AndroidKeyboard {
+            host_id: self.host_id,
+        }))
     }
 
     fn image_api(&self) -> Option<Arc<dyn ImageApiService>> {
-        Some(Arc::new(AndroidImageApi { host_id: self.host_id }))
+        Some(Arc::new(AndroidImageApi {
+            host_id: self.host_id,
+        }))
     }
 
     fn location(&self) -> Option<Arc<dyn LocationService>> {
-        Some(Arc::new(AndroidLocation { host_id: self.host_id }))
+        Some(Arc::new(AndroidLocation {
+            host_id: self.host_id,
+        }))
     }
 
     fn scan_code(&self) -> Option<Arc<dyn ScanCodeService>> {
-        Some(Arc::new(AndroidScanCode { host_id: self.host_id }))
+        Some(Arc::new(AndroidScanCode {
+            host_id: self.host_id,
+        }))
     }
 
     fn game_log(&self) -> Option<Arc<dyn GameLogService>> {
-        Some(Arc::new(AndroidGameLog { host_id: self.host_id }))
+        Some(Arc::new(AndroidGameLog {
+            host_id: self.host_id,
+        }))
     }
 }
 
@@ -425,7 +461,8 @@ impl SystemInfoService for AndroidSystemInfo {
 
     fn get_system_settings_json(&self) -> Result<String, String> {
         let settings = jni::get_system_settings()?;
-        deno_core::serde_json::to_string(&settings).map_err(|e| format!("getSystemSetting:fail {}", e))
+        deno_core::serde_json::to_string(&settings)
+            .map_err(|e| format!("getSystemSetting:fail {}", e))
     }
 
     fn get_device_info_json(&self) -> Result<String, String> {

@@ -162,20 +162,12 @@ pub enum HostCommand {
     /// Sent by the platform sensor listener at the requested interval.
     /// Values follow the W3C DeviceOrientation spec:
     /// alpha = rotation around Z (0-360), beta = X (-180..180), gamma = Y (-90..90).
-    OnDeviceMotionChange {
-        alpha: f64,
-        beta: f64,
-        gamma: f64,
-    },
+    OnDeviceMotionChange { alpha: f64, beta: f64, gamma: f64 },
 
     /// Gyroscope sensor data (angular velocity in rad/s).
     ///
     /// Sent by the platform gyroscope listener at the requested interval.
-    OnGyroscopeChange {
-        x: f64,
-        y: f64,
-        z: f64,
-    },
+    OnGyroscopeChange { x: f64, y: f64, z: f64 },
 
     /// Device screen orientation changed (portrait/landscape).
     ///

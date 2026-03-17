@@ -31,8 +31,8 @@ pub struct V8LimitsConfig {
 impl Default for V8LimitsConfig {
     fn default() -> Self {
         Self {
-            max_heap_size: 256 * 1024 * 1024,  // 256 MB
-            initial_heap_size: 0,                // V8 default
+            max_heap_size: 256 * 1024 * 1024, // 256 MB
+            initial_heap_size: 0,             // V8 default
         }
     }
 }
@@ -101,8 +101,11 @@ impl HostJsRuntime {
         let use_snapshot = snapshot_bytes.is_some();
 
         let exts = if use_snapshot {
-            tracing::info!("[Host {}] using V8 startup snapshot ({} bytes)", host_id,
-                snapshot_bytes.map(|b| b.len()).unwrap_or(0));
+            tracing::info!(
+                "[Host {}] using V8 startup snapshot ({} bytes)",
+                host_id,
+                snapshot_bytes.map(|b| b.len()).unwrap_or(0)
+            );
             crate::snapshot::lazy_extensions()
                 .into_iter()
                 .chain(extra_extensions)
@@ -154,7 +157,8 @@ impl HostJsRuntime {
             if let Err(e) = rt.lazy_init_extensions(ext_args) {
                 tracing::error!(
                     "[Host {}] failed to init extensions from snapshot: {}, falling back",
-                    host_id, e
+                    host_id,
+                    e
                 );
                 // NOTE: In a production scenario, we'd recreate without snapshot.
                 // For now, the error is logged and the runtime continues (ops
@@ -176,26 +180,22 @@ impl HostJsRuntime {
             let cb_handle = rt.v8_isolate().thread_safe_handle();
             let hard_cap = v8_limits.max_heap_size.saturating_add(8 * 1024 * 1024);
 
-            rt.add_near_heap_limit_callback(
-                move |current_limit, _initial_limit| {
-                    // Mark OOM once, then terminate execution. Keep a tiny
-                    // bounded headroom instead of unbounded growth.
-                    let first = cb_terminated
-                        .compare_exchange(
-                            false,
-                            true,
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                        )
-                        .is_ok();
-                    if first {
-                        cb_handle.terminate_execution();
-                    }
-                    current_limit
-                        .saturating_add(1024 * 1024)
-                        .min(hard_cap)
-                },
-            );
+            rt.add_near_heap_limit_callback(move |current_limit, _initial_limit| {
+                // Mark OOM once, then terminate execution. Keep a tiny
+                // bounded headroom instead of unbounded growth.
+                let first = cb_terminated
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok();
+                if first {
+                    cb_handle.terminate_execution();
+                }
+                current_limit.saturating_add(1024 * 1024).min(hard_cap)
+            });
 
             terminated
         };
@@ -224,10 +224,7 @@ impl HostJsRuntime {
                             (Some(v), None)
                         }
                         Err(e) => {
-                            tracing::error!(
-                                "[Host {}] code signing key invalid: {}",
-                                host_id, e
-                            );
+                            tracing::error!("[Host {}] code signing key invalid: {}", host_id, e);
                             (None, Some(e))
                         }
                     }
@@ -235,7 +232,9 @@ impl HostJsRuntime {
                 _ => {
                     let err = EngineError::new(ErrorCode::CodeSignatureInvalid)
                         .with_msg("code signing enabled but public key is missing")
-                        .with_detail("set InitOptions.code_signing_pubkey (hex Ed25519 public key)");
+                        .with_detail(
+                            "set InitOptions.code_signing_pubkey (hex Ed25519 public key)",
+                        );
                     tracing::error!("[Host {}] {}", host_id, err);
                     (None, Some(err))
                 }
@@ -268,14 +267,16 @@ impl HostJsRuntime {
     /// Check if the runtime was terminated due to OOM (near-heap-limit callback).
     #[cfg(feature = "v8-limits")]
     pub fn was_oom_terminated(&self) -> bool {
-        self.oom_terminated.load(std::sync::atomic::Ordering::SeqCst)
+        self.oom_terminated
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Reset OOM termination state. Called after `cancel_terminate_execution`
     /// during restart to allow the new runtime to operate normally.
     #[cfg(feature = "v8-limits")]
     pub fn reset_oom_state(&self) {
-        self.oom_terminated.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.oom_terminated
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Access HostOpState for mutation.
@@ -327,15 +328,21 @@ impl HostJsRuntime {
     }
 
     pub fn dispatch_inner_audio_event(&mut self, id: u32, event_type: &str, current_time: f64) {
-        self.bindings
-            .dispatch_inner_audio_event(&mut self.rt, self.host_id, id, event_type, current_time);
+        self.bindings.dispatch_inner_audio_event(
+            &mut self.rt,
+            self.host_id,
+            id,
+            event_type,
+            current_time,
+        );
     }
 
     // ---- Sensor event dispatch (zero-alloc, no JS parsing) ----
 
     #[inline]
     pub fn dispatch_device_motion(&mut self, alpha: f64, beta: f64, gamma: f64) {
-        self.bindings.dispatch_device_motion(&mut self.rt, alpha, beta, gamma);
+        self.bindings
+            .dispatch_device_motion(&mut self.rt, alpha, beta, gamma);
     }
 
     #[inline]
@@ -350,59 +357,87 @@ impl HostJsRuntime {
 
     #[inline]
     pub fn dispatch_compass(&mut self, direction: f64, accuracy: &str) {
-        self.bindings.dispatch_compass(&mut self.rt, direction, accuracy);
+        self.bindings
+            .dispatch_compass(&mut self.rt, direction, accuracy);
     }
 
     #[inline]
     pub fn dispatch_device_orientation(&mut self, value: &str) {
-        self.bindings.dispatch_device_orientation(&mut self.rt, value);
+        self.bindings
+            .dispatch_device_orientation(&mut self.rt, value);
     }
 
     #[inline]
     pub fn dispatch_network_status(&mut self, is_connected: bool, network_type: &str) {
-        self.bindings.dispatch_network_status(&mut self.rt, is_connected, network_type);
+        self.bindings
+            .dispatch_network_status(&mut self.rt, is_connected, network_type);
     }
 
     // ---- Recorder event dispatch ----
 
     pub fn dispatch_recorder_event(&mut self, event_type: &str, json_payload: &str) {
-        self.bindings.dispatch_recorder_event(&mut self.rt, self.host_id, event_type, json_payload);
+        self.bindings
+            .dispatch_recorder_event(&mut self.rt, self.host_id, event_type, json_payload);
     }
 
     pub fn dispatch_recorder_frame_data(&mut self, data: &[u8], is_last_frame: bool) {
-        self.bindings.dispatch_recorder_frame_data(&mut self.rt, self.host_id, data, is_last_frame);
+        self.bindings
+            .dispatch_recorder_frame_data(&mut self.rt, self.host_id, data, is_last_frame);
     }
 
     // ---- Camera event dispatch ----
 
     pub fn dispatch_camera_event(&mut self, camera_id: u32, event_type: &str, json_payload: &str) {
-        self.bindings.dispatch_camera_event(&mut self.rt, self.host_id, camera_id, event_type, json_payload);
+        self.bindings.dispatch_camera_event(
+            &mut self.rt,
+            self.host_id,
+            camera_id,
+            event_type,
+            json_payload,
+        );
     }
 
-    pub fn dispatch_camera_frame_data(&mut self, camera_id: u32, data: &[u8], width: u32, height: u32) {
-        self.bindings.dispatch_camera_frame_data(&mut self.rt, self.host_id, camera_id, data, width, height);
+    pub fn dispatch_camera_frame_data(
+        &mut self,
+        camera_id: u32,
+        data: &[u8],
+        width: u32,
+        height: u32,
+    ) {
+        self.bindings.dispatch_camera_frame_data(
+            &mut self.rt,
+            self.host_id,
+            camera_id,
+            data,
+            width,
+            height,
+        );
     }
 
     // ---- Bluetooth event dispatch ----
 
     #[inline]
     pub fn dispatch_bluetooth_adapter_state_change(&mut self, available: bool, discovering: bool) {
-        self.bindings.dispatch_bluetooth_adapter_state_change(&mut self.rt, available, discovering);
+        self.bindings
+            .dispatch_bluetooth_adapter_state_change(&mut self.rt, available, discovering);
     }
 
     #[inline]
     pub fn dispatch_bluetooth_device_found(&mut self, devices_json: &str) {
-        self.bindings.dispatch_bluetooth_device_found(&mut self.rt, devices_json);
+        self.bindings
+            .dispatch_bluetooth_device_found(&mut self.rt, devices_json);
     }
 
     #[inline]
     pub fn dispatch_beacon_update(&mut self, beacons_json: &str) {
-        self.bindings.dispatch_beacon_update(&mut self.rt, beacons_json);
+        self.bindings
+            .dispatch_beacon_update(&mut self.rt, beacons_json);
     }
 
     #[inline]
     pub fn dispatch_beacon_service_change(&mut self, available: bool, discovering: bool) {
-        self.bindings.dispatch_beacon_service_change(&mut self.rt, available, discovering);
+        self.bindings
+            .dispatch_beacon_service_change(&mut self.rt, available, discovering);
     }
 
     // ---- Memory warning dispatch ----
@@ -421,7 +456,8 @@ impl HostJsRuntime {
 
     #[inline]
     pub fn dispatch_keyboard_height_change(&mut self, height: f64) {
-        self.bindings.dispatch_keyboard_height_change(&mut self.rt, height);
+        self.bindings
+            .dispatch_keyboard_height_change(&mut self.rt, height);
     }
 
     #[inline]
@@ -431,17 +467,20 @@ impl HostJsRuntime {
 
     #[inline]
     pub fn dispatch_keyboard_complete(&mut self, value: &str) {
-        self.bindings.dispatch_keyboard_complete(&mut self.rt, value);
+        self.bindings
+            .dispatch_keyboard_complete(&mut self.rt, value);
     }
 
     #[inline]
     pub fn dispatch_key_down(&mut self, key: &str, code: &str, timestamp_ms: f64) {
-        self.bindings.dispatch_key_down(&mut self.rt, key, code, timestamp_ms);
+        self.bindings
+            .dispatch_key_down(&mut self.rt, key, code, timestamp_ms);
     }
 
     #[inline]
     pub fn dispatch_key_up(&mut self, key: &str, code: &str, timestamp_ms: f64) {
-        self.bindings.dispatch_key_up(&mut self.rt, key, code, timestamp_ms);
+        self.bindings
+            .dispatch_key_up(&mut self.rt, key, code, timestamp_ms);
     }
 
     // ---- Scripts / modules ----
@@ -508,27 +547,33 @@ impl HostJsRuntime {
             })?;
             tracing::info!(
                 "[Host {}] verifying code integrity for entry '{}'",
-                self.host_id, entry
+                self.host_id,
+                entry
             );
             let manifest = verifier.verify_entry(&code_dir, &entry).map_err(|e| {
                 tracing::error!(
                     "[Host {}] code integrity verification failed: {}",
-                    self.host_id, e
+                    self.host_id,
+                    e
                 );
                 e
             })?;
             // P1: Full-package verification — ensure every file listed in the
             // manifest matches its declared SHA256 hash, not just the entry.
-            verifier.verify_all_files(&code_dir, &manifest).map_err(|e| {
-                tracing::error!(
-                    "[Host {}] full package integrity verification failed: {}",
-                    self.host_id, e
-                );
-                e
-            })?;
+            verifier
+                .verify_all_files(&code_dir, &manifest)
+                .map_err(|e| {
+                    tracing::error!(
+                        "[Host {}] full package integrity verification failed: {}",
+                        self.host_id,
+                        e
+                    );
+                    e
+                })?;
             tracing::info!(
                 "[Host {}] code integrity verification passed ({} files)",
-                self.host_id, manifest.files.len()
+                self.host_id,
+                manifest.files.len()
             );
         }
 

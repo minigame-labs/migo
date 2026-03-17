@@ -5,7 +5,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::channel::ThreadWakeup;
-use crate::protocol::{audio_cmd::AudioCmd, host_cmd::HostCommand, io_cmd::IOCmd, render_cmd::RenderCommand};
+use crate::protocol::{
+    audio_cmd::AudioCmd, host_cmd::HostCommand, io_cmd::IOCmd, render_cmd::RenderCommand,
+};
 use crate::services::DeviceServices;
 use crate::vfs::{GamePaths, VirtualFS};
 
@@ -88,7 +90,10 @@ impl fmt::Debug for HostOpState {
             .field("code_dir", &self.code_dir)
             .field("game_paths", &self.game_paths)
             .field("vfs", &self.vfs)
-            .field("device_services", &self.device_services.as_ref().map(|_| "..."))
+            .field(
+                "device_services",
+                &self.device_services.as_ref().map(|_| "..."),
+            )
             .finish()
     }
 }

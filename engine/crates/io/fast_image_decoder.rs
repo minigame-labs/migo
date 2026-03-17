@@ -47,7 +47,9 @@ pub fn decode_image_fast(
                 // so the caller sees the real failure reason.
                 #[cfg(feature = "rust-image-decode")]
                 {
-                    tracing::warn!("platform decoder failed, falling back to Rust decoders: {_platform_err}");
+                    tracing::warn!(
+                        "platform decoder failed, falling back to Rust decoders: {_platform_err}"
+                    );
                 }
                 #[cfg(not(feature = "rust-image-decode"))]
                 {
@@ -110,11 +112,13 @@ fn decode_with_zune(data: &[u8]) -> Result<NormalizedImage, EngineError> {
     // Verify we got RGBA (4 bytes per pixel)
     let expected_len = (width * height * 4) as usize;
     if rgba.len() != expected_len {
-        return Err(EngineError::new(ErrorCode::ImageReadError).with_detail(format!(
-            "zune: expected {} bytes, got {}",
-            expected_len,
-            rgba.len()
-        )));
+        return Err(
+            EngineError::new(ErrorCode::ImageReadError).with_detail(format!(
+                "zune: expected {} bytes, got {}",
+                expected_len,
+                rgba.len()
+            )),
+        );
     }
 
     Ok(NormalizedImage {

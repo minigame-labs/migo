@@ -4,21 +4,16 @@ use jni::{JNIEnv, NativeMethod};
 use tracing::info;
 
 use crate::android::jni::{
-    JAVA_METHOD_CACHE, JavaMethodCache, init, mod_main, onAudioInterruptionBegin,
-    onAudioInterruptionEnd, onAccelerometerChange, onCompassChange, onDeviceMotionChange,
-    onDeviceOrientationChange, onGyroscopeChange, onHide, onModalResult, onActionSheetResult,
-    onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting, onShow,
-    onRestart, onTouch, onVsync, getDebugStats, getConsoleLogs, shutdown, updateSurface, version,
-    onRecorderEvent, onRecorderFrameData,
-    onCameraEvent, onCameraFrameData,
-    onUserCaptureScreen,
-    onBluetoothAdapterStateChange, onBluetoothDeviceFound,
-    onBeaconUpdate, onBeaconServiceChange,
-    onKeyboardInput, onKeyboardConfirm, onKeyboardComplete, onKeyboardHeightChange,
-    onCompressImageResult, onChooseImageResult, onChooseMessageFileResult,
-    onMemoryWarning,
-    onLocationResult, onFuzzyLocationResult,
-    onScanCodeResult,
+    JAVA_METHOD_CACHE, JavaMethodCache, getConsoleLogs, getDebugStats, init, mod_main,
+    onAccelerometerChange, onActionSheetResult, onAudioInterruptionBegin, onAudioInterruptionEnd,
+    onBeaconServiceChange, onBeaconUpdate, onBluetoothAdapterStateChange, onBluetoothDeviceFound,
+    onCameraEvent, onCameraFrameData, onChooseImageResult, onChooseMessageFileResult,
+    onCompassChange, onCompressImageResult, onDeviceMotionChange, onDeviceOrientationChange,
+    onFuzzyLocationResult, onGyroscopeChange, onHide, onKeyboardComplete, onKeyboardConfirm,
+    onKeyboardHeightChange, onKeyboardInput, onLocationResult, onMemoryWarning, onModalResult,
+    onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting,
+    onRecorderEvent, onRecorderFrameData, onRestart, onScanCodeResult, onShow, onTouch,
+    onUserCaptureScreen, onVsync, shutdown, updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -315,7 +310,10 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("getNetworkTypeJson", "(I)Ljava/lang/String;"),
         ("getLocalIPAddressJson", "()Ljava/lang/String;"),
         // File operations
-        ("unzipFile", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
+        (
+            "unzipFile",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        ),
         // Charset encoding (GBK via java.nio.charset)
         ("encodeGbk", "(Ljava/lang/String;)[B"),
         ("decodeGbk", "([B)Ljava/lang/String;"),
@@ -336,8 +334,14 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("cameraCreate", "(ILjava/lang/String;)Ljava/lang/String;"),
         ("cameraDestroy", "(II)V"),
         ("cameraTakePhoto", "(ILjava/lang/String;)Ljava/lang/String;"),
-        ("cameraStartRecord", "(ILjava/lang/String;)Ljava/lang/String;"),
-        ("cameraStopRecord", "(ILjava/lang/String;)Ljava/lang/String;"),
+        (
+            "cameraStartRecord",
+            "(ILjava/lang/String;)Ljava/lang/String;",
+        ),
+        (
+            "cameraStopRecord",
+            "(ILjava/lang/String;)Ljava/lang/String;",
+        ),
         ("cameraSetZoom", "(ILjava/lang/String;)Ljava/lang/String;"),
         ("cameraListenFrameChange", "(II)V"),
         ("cameraCloseFrameChange", "(II)V"),
@@ -348,7 +352,10 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("bluetoothStartDevicesDiscovery", "(ILjava/lang/String;)V"),
         ("bluetoothStopDevicesDiscovery", "(I)V"),
         ("bluetoothGetDevices", "(I)Ljava/lang/String;"),
-        ("bluetoothGetConnectedDevices", "(ILjava/lang/String;)Ljava/lang/String;"),
+        (
+            "bluetoothGetConnectedDevices",
+            "(ILjava/lang/String;)Ljava/lang/String;",
+        ),
         ("bluetoothMakePair", "(ILjava/lang/String;)V"),
         ("bluetoothIsDevicePaired", "(ILjava/lang/String;)V"),
         ("bluetoothStartBeaconDiscovery", "(ILjava/lang/String;)V"),

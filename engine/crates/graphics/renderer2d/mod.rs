@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use femtovg::{
-    renderer::OpenGl, Canvas as FvCanvas, Color, FontId, ImageId, LineCap, LineJoin, Paint, Path,
-    Transform2D,
+    Canvas as FvCanvas, Color, FontId, ImageId, LineCap, LineJoin, Paint, Path, Transform2D,
+    renderer::OpenGl,
 };
 use shared::protocol::color::Color as SharedColor;
 use shared::protocol::render_cmd::{TextAlign, TextBaseline, TextMetrics};
@@ -136,10 +136,18 @@ impl Canvas2DContext {
     /// Expand path bounding box to include point (x, y).
     #[inline]
     fn extend_bounds(&mut self, x: f32, y: f32) {
-        if x < self.path_min_x { self.path_min_x = x; }
-        if y < self.path_min_y { self.path_min_y = y; }
-        if x > self.path_max_x { self.path_max_x = x; }
-        if y > self.path_max_y { self.path_max_y = y; }
+        if x < self.path_min_x {
+            self.path_min_x = x;
+        }
+        if y < self.path_min_y {
+            self.path_min_y = y;
+        }
+        if x > self.path_max_x {
+            self.path_max_x = x;
+        }
+        if y > self.path_max_y {
+            self.path_max_y = y;
+        }
     }
 
     #[inline]
@@ -160,7 +168,9 @@ impl Canvas2DContext {
     }
 
     #[inline]
-    fn clamp01(x: f32) -> f32 { x.clamp(0.0, 1.0) }
+    fn clamp01(x: f32) -> f32 {
+        x.clamp(0.0, 1.0)
+    }
 
     #[inline]
     fn apply_global_alpha(mut c: Color, global_alpha: f32) -> Color {
@@ -175,7 +185,9 @@ impl Canvas2DContext {
         self.has_current_point = false;
         self.reset_bounds();
     }
-    pub fn close_path(&mut self) { self.current_path.close(); }
+    pub fn close_path(&mut self) {
+        self.current_path.close();
+    }
     pub fn move_to(&mut self, x: f32, y: f32) {
         self.current_path.move_to(x, y);
         self.has_current_point = true;
@@ -199,9 +211,22 @@ impl Canvas2DContext {
         self.extend_bounds(cp2x, cp2y);
         self.extend_bounds(x, y);
     }
-    pub fn arc(&mut self, x: f32, y: f32, radius: f32, start_angle: f32, end_angle: f32, ccw: bool) {
-        let solidity = if ccw { femtovg::Solidity::Hole } else { femtovg::Solidity::Solid };
-        self.current_path.arc(x, y, radius, start_angle, end_angle, solidity);
+    pub fn arc(
+        &mut self,
+        x: f32,
+        y: f32,
+        radius: f32,
+        start_angle: f32,
+        end_angle: f32,
+        ccw: bool,
+    ) {
+        let solidity = if ccw {
+            femtovg::Solidity::Hole
+        } else {
+            femtovg::Solidity::Solid
+        };
+        self.current_path
+            .arc(x, y, radius, start_angle, end_angle, solidity);
         self.has_current_point = true;
         // Conservative bounding box for arc
         self.extend_bounds(x - radius, y - radius);
@@ -222,7 +247,17 @@ impl Canvas2DContext {
         self.extend_bounds(x, y);
         self.extend_bounds(x + w, y + h);
     }
-    pub fn ellipse(&mut self, x: f32, y: f32, rx: f32, ry: f32, rot: f32, sa: f32, ea: f32, ccw: bool) {
+    pub fn ellipse(
+        &mut self,
+        x: f32,
+        y: f32,
+        rx: f32,
+        ry: f32,
+        rot: f32,
+        sa: f32,
+        ea: f32,
+        ccw: bool,
+    ) {
         // Build the ellipse directly on current_path by computing transformed
         // arc points on the CPU.  We cannot use canvas.save/translate/scale
         // because the temporary canvas transform is restored before fill/stroke
@@ -236,7 +271,9 @@ impl Canvas2DContext {
         // Determine sweep and step direction
         let mut sweep = ea - sa;
         if ccw {
-            if sweep > 0.0 { sweep -= std::f32::consts::TAU; }
+            if sweep > 0.0 {
+                sweep -= std::f32::consts::TAU;
+            }
         } else if sweep < 0.0 {
             sweep += std::f32::consts::TAU;
         }
@@ -268,23 +305,53 @@ impl Canvas2DContext {
     }
 
     // ========== Style setters ==========
-    pub fn set_fill_style_color(&mut self, color: SharedColor) { self.state.fill_style = FillStyleKind::Color(to_fv_color(color)); }
-    pub fn set_stroke_style_color(&mut self, color: SharedColor) { self.state.stroke_style = to_fv_color(color); }
-    pub fn set_line_width(&mut self, w: f32) { self.state.line_width = w.max(0.0); }
+    pub fn set_fill_style_color(&mut self, color: SharedColor) {
+        self.state.fill_style = FillStyleKind::Color(to_fv_color(color));
+    }
+    pub fn set_stroke_style_color(&mut self, color: SharedColor) {
+        self.state.stroke_style = to_fv_color(color);
+    }
+    pub fn set_line_width(&mut self, w: f32) {
+        self.state.line_width = w.max(0.0);
+    }
     pub fn set_line_cap(&mut self, cap: u8) {
-        self.state.line_cap = match cap { 1 => CanvasLineCap::Round, 2 => CanvasLineCap::Square, _ => CanvasLineCap::Butt };
+        self.state.line_cap = match cap {
+            1 => CanvasLineCap::Round,
+            2 => CanvasLineCap::Square,
+            _ => CanvasLineCap::Butt,
+        };
     }
     pub fn set_line_join(&mut self, join: u8) {
-        self.state.line_join = match join { 1 => CanvasLineJoin::Round, 2 => CanvasLineJoin::Bevel, _ => CanvasLineJoin::Miter };
+        self.state.line_join = match join {
+            1 => CanvasLineJoin::Round,
+            2 => CanvasLineJoin::Bevel,
+            _ => CanvasLineJoin::Miter,
+        };
     }
-    pub fn set_miter_limit(&mut self, limit: f32) { self.state.miter_limit = limit.max(0.0); }
-    pub fn set_global_alpha(&mut self, alpha: f32) { self.state.global_alpha = alpha.clamp(0.0, 1.0); }
-    pub fn set_text_align(&mut self, align: TextAlign) { self.state.text_align = align; }
-    pub fn set_text_baseline(&mut self, baseline: TextBaseline) { self.state.text_baseline = baseline; }
+    pub fn set_miter_limit(&mut self, limit: f32) {
+        self.state.miter_limit = limit.max(0.0);
+    }
+    pub fn set_global_alpha(&mut self, alpha: f32) {
+        self.state.global_alpha = alpha.clamp(0.0, 1.0);
+    }
+    pub fn set_text_align(&mut self, align: TextAlign) {
+        self.state.text_align = align;
+    }
+    pub fn set_text_baseline(&mut self, baseline: TextBaseline) {
+        self.state.text_baseline = baseline;
+    }
 
     // ========== State methods ==========
-    pub fn save(&mut self) { self.stack.push(self.state.clone()); self.canvas.save(); }
-    pub fn restore(&mut self) { if let Some(s) = self.stack.pop() { self.state = s; self.canvas.restore(); } }
+    pub fn save(&mut self) {
+        self.stack.push(self.state.clone());
+        self.canvas.save();
+    }
+    pub fn restore(&mut self) {
+        if let Some(s) = self.stack.pop() {
+            self.state = s;
+            self.canvas.restore();
+        }
+    }
 
     // ========== Drawing methods ==========
     pub fn fill(&mut self) {
@@ -296,8 +363,16 @@ impl Canvas2DContext {
         let stroke = Self::apply_global_alpha(self.state.stroke_style, self.state.global_alpha);
         let paint = Paint::color(stroke)
             .with_line_width(self.state.line_width)
-            .with_line_cap(match self.state.line_cap { CanvasLineCap::Butt => LineCap::Butt, CanvasLineCap::Round => LineCap::Round, CanvasLineCap::Square => LineCap::Square })
-            .with_line_join(match self.state.line_join { CanvasLineJoin::Miter => LineJoin::Miter, CanvasLineJoin::Round => LineJoin::Round, CanvasLineJoin::Bevel => LineJoin::Bevel })
+            .with_line_cap(match self.state.line_cap {
+                CanvasLineCap::Butt => LineCap::Butt,
+                CanvasLineCap::Round => LineCap::Round,
+                CanvasLineCap::Square => LineCap::Square,
+            })
+            .with_line_join(match self.state.line_join {
+                CanvasLineJoin::Miter => LineJoin::Miter,
+                CanvasLineJoin::Round => LineJoin::Round,
+                CanvasLineJoin::Bevel => LineJoin::Bevel,
+            })
             .with_miter_limit(self.state.miter_limit);
         self.canvas.stroke_path(&self.current_path, &paint);
     }
@@ -318,7 +393,9 @@ impl Canvas2DContext {
 
     // ========== Rectangle methods ==========
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        if w <= 0.0 || h <= 0.0 { return; }
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
         // Reuse rect_path to avoid allocation
         self.rect_path = Path::new();
         self.rect_path.rect(x, y, w, h);
@@ -327,29 +404,43 @@ impl Canvas2DContext {
     }
 
     pub fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        if w <= 0.0 || h <= 0.0 { return; }
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
         // Reuse rect_path to avoid allocation
         self.rect_path = Path::new();
         self.rect_path.rect(x, y, w, h);
         let stroke = Self::apply_global_alpha(self.state.stroke_style, self.state.global_alpha);
         let paint = Paint::color(stroke)
             .with_line_width(self.state.line_width)
-            .with_line_cap(match self.state.line_cap { CanvasLineCap::Butt => LineCap::Butt, CanvasLineCap::Round => LineCap::Round, CanvasLineCap::Square => LineCap::Square })
-            .with_line_join(match self.state.line_join { CanvasLineJoin::Miter => LineJoin::Miter, CanvasLineJoin::Round => LineJoin::Round, CanvasLineJoin::Bevel => LineJoin::Bevel })
+            .with_line_cap(match self.state.line_cap {
+                CanvasLineCap::Butt => LineCap::Butt,
+                CanvasLineCap::Round => LineCap::Round,
+                CanvasLineCap::Square => LineCap::Square,
+            })
+            .with_line_join(match self.state.line_join {
+                CanvasLineJoin::Miter => LineJoin::Miter,
+                CanvasLineJoin::Round => LineJoin::Round,
+                CanvasLineJoin::Bevel => LineJoin::Bevel,
+            })
             .with_miter_limit(self.state.miter_limit);
         self.canvas.stroke_path(&self.rect_path, &paint);
     }
 
     pub fn clear_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        if w <= 0.0 || h <= 0.0 { return; }
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
         // Use DestinationOut composite with a fully-opaque fill to erase
         // the rectangle.  This respects the current CTM and handles negative
         // coordinates correctly, unlike the previous clear_rect(u32) approach.
         self.canvas.save();
-        self.canvas.global_composite_operation(femtovg::CompositeOperation::DestinationOut);
+        self.canvas
+            .global_composite_operation(femtovg::CompositeOperation::DestinationOut);
         self.rect_path = Path::new();
         self.rect_path.rect(x, y, w, h);
-        self.canvas.fill_path(&self.rect_path, &Paint::color(Color::white()));
+        self.canvas
+            .fill_path(&self.rect_path, &Paint::color(Color::white()));
         self.canvas.restore();
     }
 
@@ -358,48 +449,83 @@ impl Canvas2DContext {
         self.state.transform = Transform2D::new(a, b, c, d, e, f);
         self.canvas.set_transform(&self.state.transform);
     }
-    pub fn reset_transform(&mut self) { self.state.transform = Transform2D::identity(); self.canvas.reset_transform(); }
+    pub fn reset_transform(&mut self) {
+        self.state.transform = Transform2D::identity();
+        self.canvas.reset_transform();
+    }
     pub fn translate(&mut self, x: f32, y: f32) {
         self.canvas.translate(x, y);
-        self.state.transform.premultiply(&Transform2D::new(1.0, 0.0, 0.0, 1.0, x, y));
+        self.state
+            .transform
+            .premultiply(&Transform2D::new(1.0, 0.0, 0.0, 1.0, x, y));
     }
     pub fn rotate(&mut self, angle: f32) {
         self.canvas.rotate(angle);
         let (cos, sin) = (angle.cos(), angle.sin());
-        self.state.transform.premultiply(&Transform2D::new(cos, sin, -sin, cos, 0.0, 0.0));
+        self.state
+            .transform
+            .premultiply(&Transform2D::new(cos, sin, -sin, cos, 0.0, 0.0));
     }
     pub fn scale(&mut self, x: f32, y: f32) {
         self.canvas.scale(x, y);
-        self.state.transform.premultiply(&Transform2D::new(x, 0.0, 0.0, y, 0.0, 0.0));
+        self.state
+            .transform
+            .premultiply(&Transform2D::new(x, 0.0, 0.0, y, 0.0, 0.0));
     }
 
     // ========== Text methods ==========
     pub fn fill_text(&mut self, text: &str, x: f32, y: f32, _max_width: f32) {
         let mut paint = self.build_fill_paint();
-        if let Some(font_id) = self.state.font_id { paint.set_font(&[font_id]); }
+        if let Some(font_id) = self.state.font_id {
+            paint.set_font(&[font_id]);
+        }
         paint.set_font_size(self.state.font_size);
-        paint.set_text_align(match self.state.text_align { TextAlign::Start | TextAlign::Left => femtovg::Align::Left, TextAlign::End | TextAlign::Right => femtovg::Align::Right, TextAlign::Center => femtovg::Align::Center });
-        paint.set_text_baseline(match self.state.text_baseline { TextBaseline::Top | TextBaseline::Hanging => femtovg::Baseline::Top, TextBaseline::Middle => femtovg::Baseline::Middle, TextBaseline::Alphabetic => femtovg::Baseline::Alphabetic, TextBaseline::Ideographic | TextBaseline::Bottom => femtovg::Baseline::Bottom });
+        paint.set_text_align(match self.state.text_align {
+            TextAlign::Start | TextAlign::Left => femtovg::Align::Left,
+            TextAlign::End | TextAlign::Right => femtovg::Align::Right,
+            TextAlign::Center => femtovg::Align::Center,
+        });
+        paint.set_text_baseline(match self.state.text_baseline {
+            TextBaseline::Top | TextBaseline::Hanging => femtovg::Baseline::Top,
+            TextBaseline::Middle => femtovg::Baseline::Middle,
+            TextBaseline::Alphabetic => femtovg::Baseline::Alphabetic,
+            TextBaseline::Ideographic | TextBaseline::Bottom => femtovg::Baseline::Bottom,
+        });
         let _ = self.canvas.fill_text(x, y, text, &paint);
     }
 
     pub fn stroke_text(&mut self, text: &str, x: f32, y: f32, _max_width: f32) {
         let stroke = Self::apply_global_alpha(self.state.stroke_style, self.state.global_alpha);
         let mut paint = Paint::color(stroke).with_line_width(self.state.line_width);
-        if let Some(font_id) = self.state.font_id { paint.set_font(&[font_id]); }
+        if let Some(font_id) = self.state.font_id {
+            paint.set_font(&[font_id]);
+        }
         paint.set_font_size(self.state.font_size);
-        paint.set_text_align(match self.state.text_align { TextAlign::Start | TextAlign::Left => femtovg::Align::Left, TextAlign::End | TextAlign::Right => femtovg::Align::Right, TextAlign::Center => femtovg::Align::Center });
-        paint.set_text_baseline(match self.state.text_baseline { TextBaseline::Top | TextBaseline::Hanging => femtovg::Baseline::Top, TextBaseline::Middle => femtovg::Baseline::Middle, TextBaseline::Alphabetic => femtovg::Baseline::Alphabetic, TextBaseline::Ideographic | TextBaseline::Bottom => femtovg::Baseline::Bottom });
+        paint.set_text_align(match self.state.text_align {
+            TextAlign::Start | TextAlign::Left => femtovg::Align::Left,
+            TextAlign::End | TextAlign::Right => femtovg::Align::Right,
+            TextAlign::Center => femtovg::Align::Center,
+        });
+        paint.set_text_baseline(match self.state.text_baseline {
+            TextBaseline::Top | TextBaseline::Hanging => femtovg::Baseline::Top,
+            TextBaseline::Middle => femtovg::Baseline::Middle,
+            TextBaseline::Alphabetic => femtovg::Baseline::Alphabetic,
+            TextBaseline::Ideographic | TextBaseline::Bottom => femtovg::Baseline::Bottom,
+        });
         let _ = self.canvas.fill_text(x, y, text, &paint);
     }
 
     pub fn measure_text(&mut self, text: &str) -> TextMetrics {
         let mut paint = self.build_fill_paint();
-        if let Some(font_id) = self.state.font_id { paint.set_font(&[font_id]); }
+        if let Some(font_id) = self.state.font_id {
+            paint.set_font(&[font_id]);
+        }
         paint.set_font_size(self.state.font_size);
 
         // Get actual font metrics (use methods, not fields)
-        let (ascender, descender) = self.canvas.measure_font(&paint)
+        let (ascender, descender) = self
+            .canvas
+            .measure_font(&paint)
             .map(|m| (m.ascender(), m.descender()))
             .unwrap_or((self.state.font_size * 0.8, self.state.font_size * -0.2));
 
@@ -413,39 +539,89 @@ impl Canvas2DContext {
                 font_bounding_box_ascent: ascender,
                 font_bounding_box_descent: -descender,
             },
-            Err(_) => TextMetrics { width: 0.0, actual_bounding_box_left: 0.0, actual_bounding_box_right: 0.0, actual_bounding_box_ascent: 0.0, actual_bounding_box_descent: 0.0, font_bounding_box_ascent: 0.0, font_bounding_box_descent: 0.0 },
+            Err(_) => TextMetrics {
+                width: 0.0,
+                actual_bounding_box_left: 0.0,
+                actual_bounding_box_right: 0.0,
+                actual_bounding_box_ascent: 0.0,
+                actual_bounding_box_descent: 0.0,
+                font_bounding_box_ascent: 0.0,
+                font_bounding_box_descent: 0.0,
+            },
         }
     }
 
     // ========== Image methods ==========
-    pub fn draw_image_rect(&mut self, image_id: ImageId, img_size: (f32, f32), sx: f32, sy: f32, sw: f32, sh: f32, dx: f32, dy: f32, dw: f32, dh: f32) {
+    pub fn draw_image_rect(
+        &mut self,
+        image_id: ImageId,
+        img_size: (f32, f32),
+        sx: f32,
+        sy: f32,
+        sw: f32,
+        sh: f32,
+        dx: f32,
+        dy: f32,
+        dw: f32,
+        dh: f32,
+    ) {
         let (img_w, img_h) = img_size;
         let (mut sx, mut sy, mut sw, mut sh) = (sx, sy, sw, sh);
-        if sw <= 0.0 { sw = img_w; }
-        if sh <= 0.0 { sh = img_h; }
-        if sx < 0.0 { sx = 0.0; }
-        if sy < 0.0 { sy = 0.0; }
-        if sx + sw > img_w { sw = (img_w - sx).max(0.0); }
-        if sy + sh > img_h { sh = (img_h - sy).max(0.0); }
-        if sw <= 0.0 || sh <= 0.0 { return; }
+        if sw <= 0.0 {
+            sw = img_w;
+        }
+        if sh <= 0.0 {
+            sh = img_h;
+        }
+        if sx < 0.0 {
+            sx = 0.0;
+        }
+        if sy < 0.0 {
+            sy = 0.0;
+        }
+        if sx + sw > img_w {
+            sw = (img_w - sx).max(0.0);
+        }
+        if sy + sh > img_h {
+            sh = (img_h - sy).max(0.0);
+        }
+        if sw <= 0.0 || sh <= 0.0 {
+            return;
+        }
         let (mut dw, mut dh) = (dw, dh);
-        if dw <= 0.0 { dw = sw; }
-        if dh <= 0.0 { dh = sh; }
-        if dw <= 0.0 || dh <= 0.0 { return; }
+        if dw <= 0.0 {
+            dw = sw;
+        }
+        if dh <= 0.0 {
+            dh = sh;
+        }
+        if dw <= 0.0 || dh <= 0.0 {
+            return;
+        }
         let (scale_x, scale_y) = (dw / sw, dh / sh);
         let ga = Self::clamp01(self.state.global_alpha);
-        let source_is_whole = sx == 0.0 && sy == 0.0 && (sw - img_w).abs() < f32::EPSILON && (sh - img_h).abs() < f32::EPSILON;
+        let source_is_whole = sx == 0.0
+            && sy == 0.0
+            && (sw - img_w).abs() < f32::EPSILON
+            && (sh - img_h).abs() < f32::EPSILON;
 
         // Reuse rect_path to avoid allocation per draw call
         self.rect_path = Path::new();
         self.rect_path.rect(dx, dy, dw, dh);
 
         if source_is_whole {
-            let paint = Paint::image(image_id, dx, dy, dw, dh, 0.0, ga).with_anti_alias(scale_x != 1.0 || scale_y != 1.0);
+            let paint = Paint::image(image_id, dx, dy, dw, dh, 0.0, ga)
+                .with_anti_alias(scale_x != 1.0 || scale_y != 1.0);
             self.canvas.fill_path(&self.rect_path, &paint);
         } else {
-            let (draw_x, draw_y, draw_w, draw_h) = (dx - sx * scale_x, dy - sy * scale_y, img_w * scale_x, img_h * scale_y);
-            let paint = Paint::image(image_id, draw_x, draw_y, draw_w, draw_h, 0.0, ga).with_anti_alias(scale_x != 1.0 || scale_y != 1.0);
+            let (draw_x, draw_y, draw_w, draw_h) = (
+                dx - sx * scale_x,
+                dy - sy * scale_y,
+                img_w * scale_x,
+                img_h * scale_y,
+            );
+            let paint = Paint::image(image_id, draw_x, draw_y, draw_w, draw_h, 0.0, ga)
+                .with_anti_alias(scale_x != 1.0 || scale_y != 1.0);
             self.canvas.fill_path(&self.rect_path, &paint);
         }
     }
@@ -454,10 +630,28 @@ impl Canvas2DContext {
         let ga = Self::clamp01(self.state.global_alpha);
         match &self.state.fill_style {
             FillStyleKind::Color(c) => Paint::color(Self::apply_global_alpha(*c, ga)),
-            FillStyleKind::Gradient { x0, y0, x1, y1, start_color, end_color } => Paint::linear_gradient(*x0, *y0, *x1, *y1, Self::apply_global_alpha(*start_color, ga), Self::apply_global_alpha(*end_color, ga)),
-            FillStyleKind::Pattern { image_id, .. } => Paint::image(*image_id, 0.0, 0.0, 1.0, 1.0, 0.0, ga),
+            FillStyleKind::Gradient {
+                x0,
+                y0,
+                x1,
+                y1,
+                start_color,
+                end_color,
+            } => Paint::linear_gradient(
+                *x0,
+                *y0,
+                *x1,
+                *y1,
+                Self::apply_global_alpha(*start_color, ga),
+                Self::apply_global_alpha(*end_color, ga),
+            ),
+            FillStyleKind::Pattern { image_id, .. } => {
+                Paint::image(*image_id, 0.0, 0.0, 1.0, 1.0, 0.0, ga)
+            }
         }
     }
 
-    pub fn flush(&mut self) { self.canvas.flush(); }
+    pub fn flush(&mut self) {
+        self.canvas.flush();
+    }
 }

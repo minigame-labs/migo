@@ -208,10 +208,7 @@ pub enum AudioCmd {
     },
 
     /// Set gain value (fire-and-forget)
-    SetGainValue {
-        node_id: AudioNodeId,
-        value: f32,
-    },
+    SetGainValue { node_id: AudioNodeId, value: f32 },
 
     // ==================== Graph ====================
     /// Connect two nodes
@@ -242,16 +239,10 @@ pub enum AudioCmd {
     },
 
     /// Start an OscillatorNode
-    StartOscillator {
-        node_id: AudioNodeId,
-        when: f64,
-    },
+    StartOscillator { node_id: AudioNodeId, when: f64 },
 
     /// Stop an OscillatorNode
-    StopOscillator {
-        node_id: AudioNodeId,
-        when: f64,
-    },
+    StopOscillator { node_id: AudioNodeId, when: f64 },
 
     /// Create a DelayNode (fire-and-forget)
     CreateDelay {
@@ -297,10 +288,7 @@ pub enum AudioCmd {
     },
 
     /// Set AnalyserNode fft_size (fire-and-forget)
-    SetAnalyserFftSize {
-        node_id: AudioNodeId,
-        fft_size: u32,
-    },
+    SetAnalyserFftSize { node_id: AudioNodeId, fft_size: u32 },
 
     /// Get AnalyserNode time domain data (byte)
     GetAnalyserByteTimeDomainData {
@@ -328,16 +316,10 @@ pub enum AudioCmd {
     },
 
     /// Set PannerNode panning model (fire-and-forget)
-    SetPanningModel {
-        node_id: AudioNodeId,
-        model: String,
-    },
+    SetPanningModel { node_id: AudioNodeId, model: String },
 
     /// Set PannerNode distance model (fire-and-forget)
-    SetDistanceModel {
-        node_id: AudioNodeId,
-        model: String,
-    },
+    SetDistanceModel { node_id: AudioNodeId, model: String },
 
     /// Set PannerNode scalar properties (fire-and-forget)
     SetPannerScalar {
@@ -367,16 +349,10 @@ pub enum AudioCmd {
     },
 
     /// Start a ConstantSourceNode
-    StartConstantSource {
-        node_id: AudioNodeId,
-        when: f64,
-    },
+    StartConstantSource { node_id: AudioNodeId, when: f64 },
 
     /// Stop a ConstantSourceNode
-    StopConstantSource {
-        node_id: AudioNodeId,
-        when: f64,
-    },
+    StopConstantSource { node_id: AudioNodeId, when: f64 },
 
     /// Create an IIRFilterNode (fire-and-forget)
     CreateIIRFilter {
@@ -483,9 +459,7 @@ pub enum AudioCmd {
 
     // ==================== MediaAudioPlayer ====================
     /// Create a MediaAudioPlayer
-    CreateMediaAudioPlayer {
-        id: u32,
-    },
+    CreateMediaAudioPlayer { id: u32 },
 
     /// Add an InnerAudioContext source to a MediaAudioPlayer
     MediaAudioPlayerAddSource {
@@ -500,19 +474,13 @@ pub enum AudioCmd {
     },
 
     /// Start a MediaAudioPlayer
-    MediaAudioPlayerStart {
-        player_id: u32,
-    },
+    MediaAudioPlayerStart { player_id: u32 },
 
     /// Stop a MediaAudioPlayer
-    MediaAudioPlayerStop {
-        player_id: u32,
-    },
+    MediaAudioPlayerStop { player_id: u32 },
 
     /// Destroy a MediaAudioPlayer
-    MediaAudioPlayerDestroy {
-        player_id: u32,
-    },
+    MediaAudioPlayerDestroy { player_id: u32 },
 
     // ==================== Lifecycle ====================
     /// Shutdown the audio thread
@@ -532,14 +500,10 @@ pub enum AudioCmd {
 
     // ==================== InnerAudioContext ====================
     /// Create an InnerAudioContext (JS provides id, fire-and-forget)
-    CreateInnerAudio {
-        id: InnerAudioId,
-    },
+    CreateInnerAudio { id: InnerAudioId },
 
     /// Destroy an InnerAudioContext
-    DestroyInnerAudio {
-        id: InnerAudioId,
-    },
+    DestroyInnerAudio { id: InnerAudioId },
 
     /// Load audio data into InnerAudioContext (full load mode)
     InnerAudioLoad {
@@ -556,31 +520,19 @@ pub enum AudioCmd {
     },
 
     /// Play InnerAudioContext
-    InnerAudioPlay {
-        id: InnerAudioId,
-    },
+    InnerAudioPlay { id: InnerAudioId },
 
     /// Pause InnerAudioContext
-    InnerAudioPause {
-        id: InnerAudioId,
-    },
+    InnerAudioPause { id: InnerAudioId },
 
     /// Stop InnerAudioContext
-    InnerAudioStop {
-        id: InnerAudioId,
-    },
+    InnerAudioStop { id: InnerAudioId },
 
     /// Seek InnerAudioContext to position (in seconds)
-    InnerAudioSeek {
-        id: InnerAudioId,
-        position: f64,
-    },
+    InnerAudioSeek { id: InnerAudioId, position: f64 },
 
     /// Set InnerAudioContext volume (0.0 - 1.0)
-    InnerAudioSetVolume {
-        id: InnerAudioId,
-        volume: f32,
-    },
+    InnerAudioSetVolume { id: InnerAudioId, volume: f32 },
 
     /// Set InnerAudioContext loop
     InnerAudioSetLoop {
@@ -589,16 +541,10 @@ pub enum AudioCmd {
     },
 
     /// Set InnerAudioContext playback rate (0.5 - 2.0)
-    InnerAudioSetPlaybackRate {
-        id: InnerAudioId,
-        rate: f32,
-    },
+    InnerAudioSetPlaybackRate { id: InnerAudioId, rate: f32 },
 
     /// Set InnerAudioContext autoplay
-    InnerAudioSetAutoplay {
-        id: InnerAudioId,
-        autoplay: bool,
-    },
+    InnerAudioSetAutoplay { id: InnerAudioId, autoplay: bool },
 
     /// Get InnerAudioContext current state
     InnerAudioGetState {

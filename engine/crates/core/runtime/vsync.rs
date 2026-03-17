@@ -34,11 +34,7 @@ pub fn unregister_vsync_sender(id: i32) {
 /// Send a VSync signal to the render thread for the given host_id.
 /// Called from the JNI Choreographer callback.
 pub fn send_vsync(id: i32, ts_ms: f64) {
-    if let Some(tx) = senders()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&id)
-    {
+    if let Some(tx) = senders().read().unwrap_or_else(|e| e.into_inner()).get(&id) {
         let _ = tx.try_send(ts_ms);
     }
 }

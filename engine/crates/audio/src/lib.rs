@@ -83,10 +83,10 @@ mod mixer;
 mod nodes;
 mod output;
 pub mod param;
+pub mod power_manager;
 mod resampler;
 pub mod streaming;
-pub mod power_manager;
 
 pub use audio_thread::*;
 pub use cache::GlobalAudioCache;
-pub use power_manager::{AudioPowerManager, AudioPowerState, AudioPowerConfig};
+pub use power_manager::{AudioPowerConfig, AudioPowerManager, AudioPowerState};

@@ -54,9 +54,7 @@ pub(super) fn op_decode_multi_formats(
         let host = state.borrow::<HostOpState>();
         if let Some(ref services) = host.device_services {
             if let Some(codec_svc) = services.codec() {
-                return codec_svc
-                    .decode_gbk(buf)
-                    .map_err(JsErrorBox::generic);
+                return codec_svc.decode_gbk(buf).map_err(JsErrorBox::generic);
             }
         }
     }

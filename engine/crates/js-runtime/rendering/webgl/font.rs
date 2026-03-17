@@ -1,14 +1,11 @@
 use std::sync::Arc;
 
-use deno_core::{op2, OpState};
+use deno_core::{OpState, op2};
 use tracing::{error, info};
 
 use shared::{
     op_state::{CanvasOpState, HostOpState},
-    protocol::{
-        render_cmd::RenderCommand,
-        send_render_with_resp_sync,
-    },
+    protocol::{render_cmd::RenderCommand, send_render_with_resp_sync},
 };
 
 const OP_LOAD_FONT: &str = "load_font";
@@ -61,12 +58,10 @@ pub(crate) fn op_load_font(state: &mut OpState, #[string] path: String) -> Strin
 
     // Send to render thread for registration.
     let ctx = state.borrow::<CanvasOpState>();
-    match send_render_with_resp_sync(ctx, OP_LOAD_FONT, |resp| {
-        RenderCommand::LoadFont {
-            key: key.clone(),
-            bytes: bytes.clone(),
-            resp,
-        }
+    match send_render_with_resp_sync(ctx, OP_LOAD_FONT, |resp| RenderCommand::LoadFont {
+        key: key.clone(),
+        bytes: bytes.clone(),
+        resp,
     }) {
         Ok(family) => {
             info!("op_load_font: loaded '{}' as '{}'", path, family);

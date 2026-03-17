@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use core::services::DeviceServices;
 use core::PlatformServices;
+use core::services::DeviceServices;
 use deno_core::Extension;
 use shared::config::InitOptions;
 use tracing::error;
@@ -28,7 +28,10 @@ impl PlatformServices for AndroidPlatform {
 
     fn notify_game_ready(&self, host_id: i32) {
         if let Err(e) = jni::notify_game_ready(host_id) {
-            error!("[Host {}] Failed to notify Java of game ready: {}", host_id, e);
+            error!(
+                "[Host {}] Failed to notify Java of game ready: {}",
+                host_id, e
+            );
         }
     }
 

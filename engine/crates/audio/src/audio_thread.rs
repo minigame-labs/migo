@@ -6,8 +6,8 @@ use std::time::Duration;
 use shared::channel::ThreadWakeup;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::audio_cmd::{
-    AudioBufferInfo, AudioCmd, AudioContextId, AudioContextState, AudioNodeId,
-    AudioResp, InnerAudioId, InnerAudioInfo, InnerAudioState,
+    AudioBufferInfo, AudioCmd, AudioContextId, AudioContextState, AudioNodeId, AudioResp,
+    InnerAudioId, InnerAudioInfo, InnerAudioState,
 };
 use shared::protocol::host_cmd::HostCommand;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -41,10 +41,9 @@ use crate::context::AudioContext;
 use crate::decoder;
 use crate::inner_audio::{InnerAudioPlayer, PlaybackState};
 use crate::nodes::{
-    AnalyserNode, BiquadFilterNode, BiquadFilterType, ChannelMergerNode,
-    ChannelSplitterNode, ConstantSourceNode, DelayNode, DynamicsCompressorNode,
-    IIRFilterNode, OscillatorNode, OscillatorType, OversampleType,
-    PannerNode, PanningModel, DistanceModel, WaveShaperNode,
+    AnalyserNode, BiquadFilterNode, BiquadFilterType, ChannelMergerNode, ChannelSplitterNode,
+    ConstantSourceNode, DelayNode, DistanceModel, DynamicsCompressorNode, IIRFilterNode,
+    OscillatorNode, OscillatorType, OversampleType, PannerNode, PanningModel, WaveShaperNode,
 };
 use crate::output::AudioOutput;
 use crate::power_manager::{AudioPowerConfig, AudioPowerManager, AudioPowerState};
@@ -189,7 +188,10 @@ impl AudioThread {
                 let output = match AudioOutput::new() {
                     Ok(out) => out,
                     Err(e) => {
-                        error!("AudioThread (lazy): failed to initialise audio output: {}", e);
+                        error!(
+                            "AudioThread (lazy): failed to initialise audio output: {}",
+                            e
+                        );
                         // Drain the channel so senders don't block/leak.
                         drop(rx);
                         return;
@@ -418,20 +420,21 @@ fn run_audio_thread(
                         // don't block audio processing on large files.
                         let tx = decode_tx.clone();
                         let sr = sample_rate;
-                        if let Err(e) = thread::Builder::new()
-                            .name("audio-decode".into())
-                            .spawn(move || {
-                                let result = decoder::decode(&data).and_then(
-                                    |decoded| resampler::resample_if_needed(decoded, sr),
-                                );
-                                // If the audio thread has already shut down the
-                                // receiver is dropped — that's fine, just exit.
-                                let _ = tx.send(DecodeResult::AudioBuffer {
-                                    ctx_id,
-                                    result,
-                                    resp,
-                                });
-                            })
+                        if let Err(e) =
+                            thread::Builder::new()
+                                .name("audio-decode".into())
+                                .spawn(move || {
+                                    let result = decoder::decode(&data).and_then(|decoded| {
+                                        resampler::resample_if_needed(decoded, sr)
+                                    });
+                                    // If the audio thread has already shut down the
+                                    // receiver is dropped — that's fine, just exit.
+                                    let _ = tx.send(DecodeResult::AudioBuffer {
+                                        ctx_id,
+                                        result,
+                                        resp,
+                                    });
+                                })
                         {
                             // spawn failed — resp was consumed by the closure
                             // which is now dropped, so the caller's oneshot
@@ -521,7 +524,11 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::Stop { node_id, when, resp } => {
+                AudioCmd::Stop {
+                    node_id,
+                    when,
+                    resp,
+                } => {
                     // Use index for O(1) context lookup
                     let found = node_index
                         .get_context(node_id)
@@ -548,8 +555,13 @@ fn run_audio_thread(
                     loop_start,
                     loop_end,
                 } => {
-                    tracing::trace!("SetLoop: node_id={}, enabled={}, start={}, end={}",
-                        node_id, loop_enabled, loop_start, loop_end);
+                    tracing::trace!(
+                        "SetLoop: node_id={}, enabled={}, start={}, end={}",
+                        node_id,
+                        loop_enabled,
+                        loop_start,
+                        loop_end
+                    );
                     // Use index for O(1) context lookup
                     let found = node_index
                         .get_context(node_id)
@@ -562,7 +574,11 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::SetPlaybackRate { node_id, rate, resp } => {
+                AudioCmd::SetPlaybackRate {
+                    node_id,
+                    rate,
+                    resp,
+                } => {
                     // Use index for O(1) context lookup
                     let found = node_index
                         .get_context(node_id)
@@ -643,7 +659,11 @@ fn run_audio_thread(
                     node_index.unregister(node_id);
                 }
 
-                AudioCmd::CreateDelay { ctx_id, node_id, max_delay_time } => {
+                AudioCmd::CreateDelay {
+                    ctx_id,
+                    node_id,
+                    max_delay_time,
+                } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
                         let sr = ctx.sample_rate();
                         let ch = ctx.channels();
@@ -660,7 +680,10 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::SetBiquadFilterType { node_id, filter_type } => {
+                AudioCmd::SetBiquadFilterType {
+                    node_id,
+                    filter_type,
+                } => {
                     if let Some(ctx_id) = node_index.get_context(node_id) {
                         if let Some(ctx) = contexts.get_mut(&ctx_id) {
                             ctx.with_node_typed::<BiquadFilterNode, _>(node_id, |filt| {
@@ -687,7 +710,10 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::SetWaveShaperOversample { node_id, oversample } => {
+                AudioCmd::SetWaveShaperOversample {
+                    node_id,
+                    oversample,
+                } => {
                     if let Some(ctx_id) = node_index.get_context(node_id) {
                         if let Some(ctx) = contexts.get_mut(&ctx_id) {
                             ctx.with_node_typed::<WaveShaperNode, _>(node_id, |ws| {
@@ -725,7 +751,9 @@ fn run_audio_thread(
                             })
                         });
                     match result {
-                        Some(data) => { let _ = resp.send(Ok(data)); }
+                        Some(data) => {
+                            let _ = resp.send(Ok(data));
+                        }
                         None => {
                             let _ = resp.send(Err(EngineError::from_detail(
                                 ErrorCode::NotFound,
@@ -745,7 +773,9 @@ fn run_audio_thread(
                             })
                         });
                     match result {
-                        Some(data) => { let _ = resp.send(Ok(data)); }
+                        Some(data) => {
+                            let _ = resp.send(Ok(data));
+                        }
                         None => {
                             let _ = resp.send(Err(EngineError::from_detail(
                                 ErrorCode::NotFound,
@@ -791,7 +821,11 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::SetPannerScalar { node_id, prop, value } => {
+                AudioCmd::SetPannerScalar {
+                    node_id,
+                    prop,
+                    value,
+                } => {
                     if let Some(ctx_id) = node_index.get_context(node_id) {
                         if let Some(ctx) = contexts.get_mut(&ctx_id) {
                             ctx.with_node_typed::<PannerNode, _>(node_id, |p| {
@@ -809,16 +843,27 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::CreateChannelMerger { ctx_id, node_id, number_of_inputs } => {
+                AudioCmd::CreateChannelMerger {
+                    ctx_id,
+                    node_id,
+                    number_of_inputs,
+                } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
                         ctx.add_node(Box::new(ChannelMergerNode::new(node_id, number_of_inputs)));
                         node_index.register(node_id, ctx_id);
                     }
                 }
 
-                AudioCmd::CreateChannelSplitter { ctx_id, node_id, number_of_outputs } => {
+                AudioCmd::CreateChannelSplitter {
+                    ctx_id,
+                    node_id,
+                    number_of_outputs,
+                } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
-                        ctx.add_node(Box::new(ChannelSplitterNode::new(node_id, number_of_outputs)));
+                        ctx.add_node(Box::new(ChannelSplitterNode::new(
+                            node_id,
+                            number_of_outputs,
+                        )));
                         node_index.register(node_id, ctx_id);
                     }
                 }
@@ -852,10 +897,20 @@ fn run_audio_thread(
                     node_index.unregister(node_id);
                 }
 
-                AudioCmd::CreateIIRFilter { ctx_id, node_id, feedforward, feedback } => {
+                AudioCmd::CreateIIRFilter {
+                    ctx_id,
+                    node_id,
+                    feedforward,
+                    feedback,
+                } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
                         let ch = ctx.channels();
-                        ctx.add_node(Box::new(IIRFilterNode::new(node_id, feedforward, feedback, ch)));
+                        ctx.add_node(Box::new(IIRFilterNode::new(
+                            node_id,
+                            feedforward,
+                            feedback,
+                            ch,
+                        )));
                         node_index.register(node_id, ctx_id);
                     }
                 }
@@ -892,16 +947,22 @@ fn run_audio_thread(
                 }
 
                 // ==================== Frequency Response & Analysis ====================
-                AudioCmd::GetFrequencyResponse { node_id, frequencies, resp } => {
+                AudioCmd::GetFrequencyResponse {
+                    node_id,
+                    frequencies,
+                    resp,
+                } => {
                     let result = node_index
                         .get_context(node_id)
                         .and_then(|ctx_id| contexts.get_mut(&ctx_id))
                         .and_then(|ctx| {
                             let sr = ctx.sample_rate() as f64;
                             // Try BiquadFilterNode first
-                            if let Some(r) = ctx.with_node_typed::<BiquadFilterNode, _>(node_id, |n| {
-                                n.get_frequency_response(sr, &frequencies)
-                            }) {
+                            if let Some(r) = ctx
+                                .with_node_typed::<BiquadFilterNode, _>(node_id, |n| {
+                                    n.get_frequency_response(sr, &frequencies)
+                                })
+                            {
                                 return Some(r);
                             }
                             // Try IIRFilterNode
@@ -910,7 +971,9 @@ fn run_audio_thread(
                             })
                         });
                     match result {
-                        Some(data) => { let _ = resp.send(Ok(data)); }
+                        Some(data) => {
+                            let _ = resp.send(Ok(data));
+                        }
                         None => {
                             let _ = resp.send(Err(EngineError::from_detail(
                                 ErrorCode::NotFound,
@@ -930,7 +993,9 @@ fn run_audio_thread(
                             })
                         });
                     match result {
-                        Some(val) => { let _ = resp.send(Ok(val)); }
+                        Some(val) => {
+                            let _ = resp.send(Ok(val));
+                        }
                         None => {
                             let _ = resp.send(Err(EngineError::from_detail(
                                 ErrorCode::NotFound,
@@ -950,7 +1015,9 @@ fn run_audio_thread(
                             })
                         });
                     match result {
-                        Some(data) => { let _ = resp.send(Ok(data)); }
+                        Some(data) => {
+                            let _ = resp.send(Ok(data));
+                        }
                         None => {
                             let _ = resp.send(Err(EngineError::from_detail(
                                 ErrorCode::NotFound,
@@ -970,7 +1037,9 @@ fn run_audio_thread(
                             })
                         });
                     match result {
-                        Some(data) => { let _ = resp.send(Ok(data)); }
+                        Some(data) => {
+                            let _ = resp.send(Ok(data));
+                        }
                         None => {
                             let _ = resp.send(Err(EngineError::from_detail(
                                 ErrorCode::NotFound,
@@ -981,7 +1050,12 @@ fn run_audio_thread(
                 }
 
                 // ==================== AudioParam Automation ====================
-                AudioCmd::AudioParamSetValueAtTime { node_id, param_name, value, time } => {
+                AudioCmd::AudioParamSetValueAtTime {
+                    node_id,
+                    param_name,
+                    value,
+                    time,
+                } => {
                     if let Some(ctx_id) = node_index.get_context(node_id) {
                         if let Some(ctx) = contexts.get_mut(&ctx_id) {
                             ctx.param_set_value_at_time(node_id, &param_name, value, time);
@@ -989,7 +1063,12 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::AudioParamLinearRamp { node_id, param_name, value, end_time } => {
+                AudioCmd::AudioParamLinearRamp {
+                    node_id,
+                    param_name,
+                    value,
+                    end_time,
+                } => {
                     if let Some(ctx_id) = node_index.get_context(node_id) {
                         if let Some(ctx) = contexts.get_mut(&ctx_id) {
                             ctx.param_linear_ramp(node_id, &param_name, value, end_time);
@@ -997,7 +1076,12 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::AudioParamExponentialRamp { node_id, param_name, value, end_time } => {
+                AudioCmd::AudioParamExponentialRamp {
+                    node_id,
+                    param_name,
+                    value,
+                    end_time,
+                } => {
                     if let Some(ctx_id) = node_index.get_context(node_id) {
                         if let Some(ctx) = contexts.get_mut(&ctx_id) {
                             ctx.param_exponential_ramp(node_id, &param_name, value, end_time);
@@ -1005,15 +1089,31 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::AudioParamSetTarget { node_id, param_name, target, start_time, time_constant } => {
+                AudioCmd::AudioParamSetTarget {
+                    node_id,
+                    param_name,
+                    target,
+                    start_time,
+                    time_constant,
+                } => {
                     if let Some(ctx_id) = node_index.get_context(node_id) {
                         if let Some(ctx) = contexts.get_mut(&ctx_id) {
-                            ctx.param_set_target(node_id, &param_name, target, start_time, time_constant);
+                            ctx.param_set_target(
+                                node_id,
+                                &param_name,
+                                target,
+                                start_time,
+                                time_constant,
+                            );
                         }
                     }
                 }
 
-                AudioCmd::AudioParamCancelScheduled { node_id, param_name, cancel_time } => {
+                AudioCmd::AudioParamCancelScheduled {
+                    node_id,
+                    param_name,
+                    cancel_time,
+                } => {
                     if let Some(ctx_id) = node_index.get_context(node_id) {
                         if let Some(ctx) = contexts.get_mut(&ctx_id) {
                             ctx.param_cancel_scheduled(node_id, &param_name, cancel_time);
@@ -1022,7 +1122,13 @@ fn run_audio_thread(
                 }
 
                 // ==================== Buffer Data Access ====================
-                AudioCmd::CreateBuffer { ctx_id, channels, length, sample_rate: buf_rate, resp } => {
+                AudioCmd::CreateBuffer {
+                    ctx_id,
+                    channels,
+                    length,
+                    sample_rate: buf_rate,
+                    resp,
+                } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
                         let id = ctx.create_empty_buffer(channels, length, buf_rate);
                         let _ = resp.send(Ok(AudioBufferInfo {
@@ -1040,7 +1146,12 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::GetChannelData { ctx_id, buffer_id, channel, resp } => {
+                AudioCmd::GetChannelData {
+                    ctx_id,
+                    buffer_id,
+                    channel,
+                    resp,
+                } => {
                     if let Some(ctx) = contexts.get(&ctx_id) {
                         if let Some(data) = ctx.get_channel_data(buffer_id, channel) {
                             let _ = resp.send(Ok(data));
@@ -1058,7 +1169,14 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::CopyToChannel { ctx_id, buffer_id, data, channel, start, resp } => {
+                AudioCmd::CopyToChannel {
+                    ctx_id,
+                    buffer_id,
+                    data,
+                    channel,
+                    start,
+                    resp,
+                } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
                         if ctx.copy_to_channel(buffer_id, &data, channel, start) {
                             let _ = resp.send(Ok(()));
@@ -1082,7 +1200,10 @@ fn run_audio_thread(
                     tracing::debug!("Created MediaAudioPlayer {}", id);
                 }
 
-                AudioCmd::MediaAudioPlayerAddSource { player_id, source_id } => {
+                AudioCmd::MediaAudioPlayerAddSource {
+                    player_id,
+                    source_id,
+                } => {
                     if let Some(sources) = media_players.get_mut(&player_id) {
                         if !sources.contains(&source_id) {
                             sources.push(source_id);
@@ -1090,7 +1211,10 @@ fn run_audio_thread(
                     }
                 }
 
-                AudioCmd::MediaAudioPlayerRemoveSource { player_id, source_id } => {
+                AudioCmd::MediaAudioPlayerRemoveSource {
+                    player_id,
+                    source_id,
+                } => {
                     if let Some(sources) = media_players.get_mut(&player_id) {
                         sources.retain(|&id| id != source_id);
                     }
@@ -1141,18 +1265,15 @@ fn run_audio_thread(
                         // don't block audio processing on large files.
                         let tx = decode_tx.clone();
                         let sr = sample_rate;
-                        if let Err(e) = thread::Builder::new()
-                            .name("audio-decode".into())
-                            .spawn(move || {
-                                let result = decoder::decode(&data).and_then(
-                                    |decoded| resampler::resample_if_needed(decoded, sr),
-                                );
-                                let _ = tx.send(DecodeResult::InnerAudio {
-                                    id,
-                                    result,
-                                    resp,
-                                });
-                            })
+                        if let Err(e) =
+                            thread::Builder::new()
+                                .name("audio-decode".into())
+                                .spawn(move || {
+                                    let result = decoder::decode(&data).and_then(|decoded| {
+                                        resampler::resample_if_needed(decoded, sr)
+                                    });
+                                    let _ = tx.send(DecodeResult::InnerAudio { id, result, resp });
+                                })
                         {
                             error!("Failed to spawn decode thread: {}", e);
                         }
@@ -1181,7 +1302,10 @@ fn run_audio_thread(
                             );
                             player.start_streaming(url, rx, state);
                             let _ = resp.send(Ok(()));
-                            tracing::debug!("Started streaming for InnerAudioContext {}: (cache miss)", id);
+                            tracing::debug!(
+                                "Started streaming for InnerAudioContext {}: (cache miss)",
+                                id
+                            );
                         }
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(
@@ -1219,7 +1343,11 @@ fn run_audio_thread(
                 }
 
                 AudioCmd::InnerAudioSeek { id, position } => {
-                    tracing::trace!("InnerAudioSeek command: id={}, position={:.2}s", id, position);
+                    tracing::trace!(
+                        "InnerAudioSeek command: id={}, position={:.2}s",
+                        id,
+                        position
+                    );
                     if let Some(player) = inner_players.get_mut(&id) {
                         player.shared.seek(position);
                     } else {
@@ -1286,7 +1414,11 @@ fn run_audio_thread(
         // -----------------------------------------------------------------
         while let Ok(result) = decode_rx.try_recv() {
             match result {
-                DecodeResult::AudioBuffer { ctx_id, result, resp } => {
+                DecodeResult::AudioBuffer {
+                    ctx_id,
+                    result,
+                    resp,
+                } => {
                     match result {
                         Ok(resampled) => {
                             if let Some(ctx) = contexts.get_mut(&ctx_id) {
@@ -1375,7 +1507,9 @@ fn run_audio_thread(
             for event in player.take_events() {
                 tracing::trace!(
                     "Pushing InnerAudio event: id={}, type={:?}, time={:.2}s",
-                    event.id, event.event_type, event.current_time
+                    event.id,
+                    event.event_type,
+                    event.current_time
                 );
                 let ev_id = event.id;
                 let ev_type = event.event_type;
@@ -1386,7 +1520,9 @@ fn run_audio_thread(
                 }) {
                     tracing::warn!(
                         "Failed to send audio event (id={}, type={:?}): {}",
-                        ev_id, ev_type, e
+                        ev_id,
+                        ev_type,
+                        e
                     );
                 }
             }

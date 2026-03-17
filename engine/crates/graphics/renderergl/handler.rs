@@ -53,29 +53,46 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::Clear { canvas_id, bit_field } => {
+            GLCmd::Clear {
+                canvas_id,
+                bit_field,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.clear(bit_field) };
                 Ok(true)
             }
 
-            GLCmd::ClearColor { canvas_id, r, g, b, a } => {
+            GLCmd::ClearColor {
+                canvas_id,
+                r,
+                g,
+                b,
+                a,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.clear_color(r, g, b, a) };
                 Ok(false)
             }
 
             // ---------- Program (stateful) ----------
-            GLCmd::UseProgram { canvas_id, program_id } => {
+            GLCmd::UseProgram {
+                canvas_id,
+                program_id,
+            } => {
                 cm.make_current_needed(canvas_id)?;
-                let meta = cm
-                    .programs
-                    .get(&program_id)
-                    .ok_or_else(|| ee(ErrorCode::NotFound, format!("program not found: {program_id:?}")))?;
+                let meta = cm.programs.get(&program_id).ok_or_else(|| {
+                    ee(
+                        ErrorCode::NotFound,
+                        format!("program not found: {program_id:?}"),
+                    )
+                })?;
                 cm.check_owner(meta.owner_canvas, canvas_id, "program")?;
 
                 if meta.deleted {
-                    shared::bail!(ErrorCode::InvalidOperation, "use_program on deleted program");
+                    shared::bail!(
+                        ErrorCode::InvalidOperation,
+                        "use_program on deleted program"
+                    );
                 }
 
                 if let Some(ph) = meta.gl_handle {
@@ -92,10 +109,12 @@ impl RendererGL {
                 resp,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                let meta = cm
-                    .programs
-                    .get(&program_id)
-                    .ok_or_else(|| ee(ErrorCode::NotFound, format!("program not found: {program_id:?}")))?;
+                let meta = cm.programs.get(&program_id).ok_or_else(|| {
+                    ee(
+                        ErrorCode::NotFound,
+                        format!("program not found: {program_id:?}"),
+                    )
+                })?;
                 if let Err(e) = cm.check_owner(meta.owner_canvas, canvas_id, "program") {
                     let _ = resp.send(Err(e));
                     return Ok(false);
@@ -134,13 +153,7 @@ impl RendererGL {
                 cm.make_current_needed(canvas_id)?;
                 trace!(
                     "VertexAttribPointer: canvas={:?}, index={}, size={}, type={}, norm={}, stride={}, offset={}",
-                    canvas_id,
-                    index,
-                    size,
-                    type_,
-                    normalized,
-                    stride,
-                    offset
+                    canvas_id, index, size, type_, normalized, stride, offset
                 );
                 unsafe {
                     gl.vertex_attrib_pointer_f32(index, size, type_, normalized, stride, offset);
@@ -155,10 +168,12 @@ impl RendererGL {
                 resp,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                let meta = cm
-                    .programs
-                    .get(&program_id)
-                    .ok_or_else(|| ee(ErrorCode::NotFound, format!("program not found: {program_id:?}")))?;
+                let meta = cm.programs.get(&program_id).ok_or_else(|| {
+                    ee(
+                        ErrorCode::NotFound,
+                        format!("program not found: {program_id:?}"),
+                    )
+                })?;
                 if let Err(e) = cm.check_owner(meta.owner_canvas, canvas_id, "program") {
                     let _ = resp.send(Err(e));
                     return Ok(false);
@@ -240,10 +255,9 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 let native = if let Some(id) = buffer {
-                    let meta = cm
-                        .buffers
-                        .get(&id)
-                        .ok_or_else(|| ee(ErrorCode::NotFound, format!("buffer not found: {id:?}")))?;
+                    let meta = cm.buffers.get(&id).ok_or_else(|| {
+                        ee(ErrorCode::NotFound, format!("buffer not found: {id:?}"))
+                    })?;
                     cm.check_owner(meta.owner_canvas, canvas_id, "buffer")?;
                     if meta.deleted {
                         shared::bail!(ErrorCode::InvalidOperation, "bind_buffer on deleted buffer");
@@ -311,10 +325,12 @@ impl RendererGL {
 
             GLCmd::LinkProgram { program_id, resp } => {
                 let _ = self.bind_for_contextless_gl(cm)?;
-                let meta = cm
-                    .programs
-                    .get(&program_id)
-                    .ok_or_else(|| ee(ErrorCode::NotFound, format!("program not found: {program_id:?}")))?;
+                let meta = cm.programs.get(&program_id).ok_or_else(|| {
+                    ee(
+                        ErrorCode::NotFound,
+                        format!("program not found: {program_id:?}"),
+                    )
+                })?;
                 if meta.deleted {
                     let _ = resp.send(Ok(false));
                     return Ok(false);
@@ -332,10 +348,17 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::GetProgramParameter { program_id, pname, resp } => {
+            GLCmd::GetProgramParameter {
+                program_id,
+                pname,
+                resp,
+            } => {
                 let _ = self.bind_for_contextless_gl(cm)?;
                 let Some(meta) = cm.programs.get(&program_id) else {
-                    let _ = resp.send(Err(ee(ErrorCode::NotFound, format!("program not found: {program_id:?}"))));
+                    let _ = resp.send(Err(ee(
+                        ErrorCode::NotFound,
+                        format!("program not found: {program_id:?}"),
+                    )));
                     return Ok(false);
                 };
 
@@ -351,7 +374,13 @@ impl RendererGL {
 
                 let v: i32 = unsafe {
                     match pname {
-                        glow::LINK_STATUS => if gl.get_program_link_status(ph) { 1 } else { 0 },
+                        glow::LINK_STATUS => {
+                            if gl.get_program_link_status(ph) {
+                                1
+                            } else {
+                                0
+                            }
+                        }
                         glow::INFO_LOG_LENGTH => gl.get_program_info_log(ph).len() as i32,
                         _ => gl.get_program_parameter_i32(ph, pname),
                     }
@@ -377,7 +406,10 @@ impl RendererGL {
                         let _ = resp.send(Ok(None));
                     }
                 } else {
-                    let _ = resp.send(Err(ee(ErrorCode::NotFound, format!("program not found: {program_id:?}"))));
+                    let _ = resp.send(Err(ee(
+                        ErrorCode::NotFound,
+                        format!("program not found: {program_id:?}"),
+                    )));
                 }
                 Ok(false)
             }
@@ -431,18 +463,28 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::ShaderSource { shader_id, source, resp } => {
+            GLCmd::ShaderSource {
+                shader_id,
+                source,
+                resp,
+            } => {
                 let _ = self.bind_for_contextless_gl(cm)?;
                 let Some(meta) = cm.shaders.get_mut(&shader_id) else {
                     if let Some(r) = resp {
-                        r.send(Err(ee(ErrorCode::NotFound, format!("shader not found: {shader_id:?}"))));
+                        r.send(Err(ee(
+                            ErrorCode::NotFound,
+                            format!("shader not found: {shader_id:?}"),
+                        )));
                     }
                     return Ok(false);
                 };
 
                 if meta.deleted {
                     if let Some(r) = resp {
-                        r.send(Err(ee(ErrorCode::InvalidOperation, "shader already deleted")));
+                        r.send(Err(ee(
+                            ErrorCode::InvalidOperation,
+                            "shader already deleted",
+                        )));
                     }
                     return Ok(false);
                 }
@@ -450,9 +492,14 @@ impl RendererGL {
                 if let Some(sh) = meta.gl_handle {
                     meta.source_len = source.len();
                     unsafe { gl.shader_source(sh, &source) };
-                    if let Some(r) = resp { r.send(Ok(())); }
+                    if let Some(r) = resp {
+                        r.send(Ok(()));
+                    }
                 } else if let Some(r) = resp {
-                    r.send(Err(ee(ErrorCode::InvalidOperation, "shader handle missing")));
+                    r.send(Err(ee(
+                        ErrorCode::InvalidOperation,
+                        "shader handle missing",
+                    )));
                 }
                 Ok(false)
             }
@@ -474,25 +521,39 @@ impl RendererGL {
                         let _ = resp.send(Ok(false));
                     }
                 } else {
-                    let _ = resp.send(Err(ee(ErrorCode::NotFound, format!("shader not found: {shader_id:?}"))));
+                    let _ = resp.send(Err(ee(
+                        ErrorCode::NotFound,
+                        format!("shader not found: {shader_id:?}"),
+                    )));
                 }
                 Ok(false)
             }
 
-            GLCmd::AttachShader { program_id, shader_id, resp } => {
+            GLCmd::AttachShader {
+                program_id,
+                shader_id,
+                resp,
+            } => {
                 let _ = self.bind_for_contextless_gl(cm)?;
-                let p = cm
-                    .programs
-                    .get(&program_id)
-                    .ok_or_else(|| ee(ErrorCode::NotFound, format!("program not found: {program_id:?}")))?;
-                let s = cm
-                    .shaders
-                    .get(&shader_id)
-                    .ok_or_else(|| ee(ErrorCode::NotFound, format!("shader not found: {shader_id:?}")))?;
+                let p = cm.programs.get(&program_id).ok_or_else(|| {
+                    ee(
+                        ErrorCode::NotFound,
+                        format!("program not found: {program_id:?}"),
+                    )
+                })?;
+                let s = cm.shaders.get(&shader_id).ok_or_else(|| {
+                    ee(
+                        ErrorCode::NotFound,
+                        format!("shader not found: {shader_id:?}"),
+                    )
+                })?;
 
                 if p.deleted || s.deleted {
                     if let Some(r) = resp {
-                        r.send(Err(ee(ErrorCode::InvalidOperation, "program/shader deleted")));
+                        r.send(Err(ee(
+                            ErrorCode::InvalidOperation,
+                            "program/shader deleted",
+                        )));
                     }
                     return Ok(false);
                 }
@@ -510,17 +571,29 @@ impl RendererGL {
 
                 if let (Some(ph), Some(sh)) = (p.gl_handle, s.gl_handle) {
                     unsafe { gl.attach_shader(ph, sh) };
-                    if let Some(r) = resp { r.send(Ok(())); }
+                    if let Some(r) = resp {
+                        r.send(Ok(()));
+                    }
                 } else if let Some(r) = resp {
-                    r.send(Err(ee(ErrorCode::InvalidOperation, "program/shader handle missing")));
+                    r.send(Err(ee(
+                        ErrorCode::InvalidOperation,
+                        "program/shader handle missing",
+                    )));
                 }
                 Ok(false)
             }
 
-            GLCmd::GetShaderParameter { shader_id, pname, resp } => {
+            GLCmd::GetShaderParameter {
+                shader_id,
+                pname,
+                resp,
+            } => {
                 let _ = self.bind_for_contextless_gl(cm)?;
                 let Some(meta) = cm.shaders.get(&shader_id) else {
-                    let _ = resp.send(Err(ee(ErrorCode::NotFound, format!("shader not found: {shader_id:?}"))));
+                    let _ = resp.send(Err(ee(
+                        ErrorCode::NotFound,
+                        format!("shader not found: {shader_id:?}"),
+                    )));
                     return Ok(false);
                 };
 
@@ -535,9 +608,21 @@ impl RendererGL {
                 };
 
                 let v: i32 = match pname {
-                    glow::COMPILE_STATUS => unsafe { if gl.get_shader_compile_status(sh) { 1 } else { 0 } },
+                    glow::COMPILE_STATUS => unsafe {
+                        if gl.get_shader_compile_status(sh) {
+                            1
+                        } else {
+                            0
+                        }
+                    },
                     glow::SHADER_TYPE => meta.gl_shader_type as i32,
-                    glow::DELETE_STATUS => if meta.deleted { 1 } else { 0 },
+                    glow::DELETE_STATUS => {
+                        if meta.deleted {
+                            1
+                        } else {
+                            0
+                        }
+                    }
                     glow::INFO_LOG_LENGTH => unsafe { gl.get_shader_info_log(sh).len() as i32 },
                     glow::SHADER_SOURCE_LENGTH => meta.source_len as i32,
 
@@ -570,7 +655,10 @@ impl RendererGL {
                         let _ = resp.send(Ok(None));
                     }
                 } else {
-                    let _ = resp.send(Err(ee(ErrorCode::NotFound, format!("shader not found: {shader_id:?}"))));
+                    let _ = resp.send(Err(ee(
+                        ErrorCode::NotFound,
+                        format!("shader not found: {shader_id:?}"),
+                    )));
                 }
                 Ok(false)
             }
@@ -617,7 +705,10 @@ impl RendererGL {
             }
 
             _ => {
-                shared::bail!(ErrorCode::NotImplemented, "GL command not covered by RendererGL");
+                shared::bail!(
+                    ErrorCode::NotImplemented,
+                    "GL command not covered by RendererGL"
+                );
             }
         }
     }

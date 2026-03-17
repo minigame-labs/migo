@@ -16,7 +16,11 @@ pub fn set_thread_host_id(id: i32) {
 }
 
 #[op2(fast)]
-pub fn op_console<'s>(scope: &mut v8::PinScope<'s, '_>, value: v8::Local<'s, v8::Value>, level: u8) {
+pub fn op_console<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+    level: u8,
+) {
     let msg = value
         .to_string(scope)
         .map(|s| s.to_rust_string_lossy(scope))

@@ -110,7 +110,10 @@ impl AudioService {
     }
 
     fn start_thread(&mut self) -> EngineResult<()> {
-        info!("AudioService: lazily starting audio thread ({} buffered cmds)", self.pending.len());
+        info!(
+            "AudioService: lazily starting audio thread ({} buffered cmds)",
+            self.pending.len()
+        );
 
         // Re-inject buffered commands into the channel so the thread sees
         // them when it starts consuming from `rx`.  This is safe because

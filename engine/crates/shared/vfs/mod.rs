@@ -209,7 +209,13 @@ impl VirtualFS {
         cache_dir: PathBuf,
         temp_dir: PathBuf,
     ) -> Self {
-        Self::with_policy(code_dir, user_data_dir, cache_dir, temp_dir, VfsPolicy::default())
+        Self::with_policy(
+            code_dir,
+            user_data_dir,
+            cache_dir,
+            temp_dir,
+            VfsPolicy::default(),
+        )
     }
 
     /// Full constructor with explicit policy.
@@ -222,10 +228,22 @@ impl VirtualFS {
     ) -> Self {
         let mut mappings = HashMap::new();
 
-        mappings.insert("/code", Self::make_mapping("/code", code_dir, FilePermissions::READ_ONLY));
-        mappings.insert("/user", Self::make_mapping("/user", user_data_dir, FilePermissions::READ_WRITE));
-        mappings.insert("/cache", Self::make_mapping("/cache", cache_dir, FilePermissions::READ_WRITE));
-        mappings.insert("/tmp", Self::make_mapping("/tmp", temp_dir, FilePermissions::READ_WRITE));
+        mappings.insert(
+            "/code",
+            Self::make_mapping("/code", code_dir, FilePermissions::READ_ONLY),
+        );
+        mappings.insert(
+            "/user",
+            Self::make_mapping("/user", user_data_dir, FilePermissions::READ_WRITE),
+        );
+        mappings.insert(
+            "/cache",
+            Self::make_mapping("/cache", cache_dir, FilePermissions::READ_WRITE),
+        );
+        mappings.insert(
+            "/tmp",
+            Self::make_mapping("/tmp", temp_dir, FilePermissions::READ_WRITE),
+        );
 
         Self { mappings, policy }
     }
@@ -237,8 +255,8 @@ impl VirtualFS {
         real_path: PathBuf,
         permissions: FilePermissions,
     ) -> PathMapping {
-        let canonical_base = std::fs::canonicalize(&real_path)
-            .unwrap_or_else(|_| normalize_path(&real_path));
+        let canonical_base =
+            std::fs::canonicalize(&real_path).unwrap_or_else(|_| normalize_path(&real_path));
         PathMapping {
             virtual_prefix: prefix,
             prefix_with_slash: format!("{}/", prefix),
@@ -327,7 +345,9 @@ impl VirtualFS {
 
     /// Get real path for a virtual directory (without permission check).
     pub fn get_real_path(&self, virtual_prefix: &str) -> Option<&Path> {
-        self.mappings.get(virtual_prefix).map(|m| m.real_path.as_path())
+        self.mappings
+            .get(virtual_prefix)
+            .map(|m| m.real_path.as_path())
     }
 
     /// Get the current policy.
@@ -380,11 +400,7 @@ impl VirtualFS {
     }
 
     /// Canonicalize an existing path and verify containment.
-    fn verify_existing_path(
-        &self,
-        path: &Path,
-        mapping: &PathMapping,
-    ) -> Result<(), VfsError> {
+    fn verify_existing_path(&self, path: &Path, mapping: &PathMapping) -> Result<(), VfsError> {
         let canonical = std::fs::canonicalize(path).map_err(|_| VfsError::InvalidPath)?;
         let base_canonical = self.canonical_base_fresh(mapping);
 
@@ -415,11 +431,7 @@ impl VirtualFS {
     ///    no in-sandbox symlink to exploit, so we accept.
     /// 3. **Ancestor is neither within nor above the base** — a symlink
     ///    somewhere in the chain redirects outside the expected tree.
-    fn verify_nonexistent_path(
-        &self,
-        path: &Path,
-        mapping: &PathMapping,
-    ) -> Result<(), VfsError> {
+    fn verify_nonexistent_path(&self, path: &Path, mapping: &PathMapping) -> Result<(), VfsError> {
         let mut current = path.to_path_buf();
         let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
 
@@ -510,11 +522,7 @@ impl VirtualFS {
     ///
     /// Uses `symlink_metadata` (lstat) which does **not** follow symlinks,
     /// so we can detect them.
-    fn check_no_symlinks_in_chain(
-        &self,
-        full_path: &Path,
-        base: &Path,
-    ) -> Result<(), VfsError> {
+    fn check_no_symlinks_in_chain(&self, full_path: &Path, base: &Path) -> Result<(), VfsError> {
         let relative = full_path
             .strip_prefix(base)
             .map_err(|_| VfsError::PathTraversal)?;
@@ -707,10 +715,7 @@ mod tests {
     fn test_traversal_deep_nested() {
         let vfs = test_vfs();
         // Try to escape by going deep then backing out
-        let result = vfs.resolve(
-            "/user/a/b/c/d/../../../../../../etc/passwd",
-            FileOp::Read,
-        );
+        let result = vfs.resolve("/user/a/b/c/d/../../../../../../etc/passwd", FileOp::Read);
         assert_eq!(result.unwrap_err(), VfsError::PathTraversal);
     }
 
