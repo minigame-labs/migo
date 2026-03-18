@@ -48,9 +48,27 @@ impl MyModuleLoader {
             let mut patched = code.into_owned();
             patched.push_str("\nexport default globalThis._lastDefinedModule;\n");
             source.code = ModuleSourceCode::String(patched.into());
+        } else if Self::is_cjs(&code) {
+            let patched = Self::wrap_cjs(code.into_owned());
+            source.code = ModuleSourceCode::String(patched.into());
         }
 
         Ok(source)
+    }
+
+    /// Detect CommonJS patterns: `require(`, `module.exports`, or `exports.`
+    #[inline]
+    fn is_cjs(code: &str) -> bool {
+        (code.contains("require(") || code.contains("module.exports") || code.contains("exports."))
+            && !code.contains("import ") && !code.contains("export ")
+    }
+
+    /// Wrap CJS source in an AMD `define` call so the existing shim handles it.
+    #[inline]
+    fn wrap_cjs(code: String) -> String {
+        format!(
+            "define([\"require\", \"exports\", \"module\"], function(require, exports, module) {{\n{code}\n}});\nexport default globalThis._lastDefinedModule;\n"
+        )
     }
 }
 

@@ -1,6 +1,13 @@
-use deno_core::{Extension, op2, v8};
+use deno_core::{Extension, OpState, op2, v8};
 use shared::op_state::HostOpState;
 use tracing::debug;
+
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+enum RequireError {
+    #[class(generic)]
+    #[error("{0}")]
+    Io(String),
+}
 
 /// Trigger a full V8 garbage collection cycle.
 ///
@@ -48,11 +55,78 @@ struct HeapStats {
     external_memory: usize,
 }
 
+/// Synchronously read a file as UTF-8 text, used by the JS `require()` shim.
+///
+/// Resolves `specifier` relative to `referrer_dir`. If `referrer_dir` is empty,
+/// falls back to `HostOpState::code_dir`.
+#[op2]
+#[serde]
+fn op_require_resolve_and_read(
+    state: &mut OpState,
+    #[string] specifier: String,
+    #[string] referrer_dir: String,
+) -> Result<RequireResult, RequireError> {
+    let base_dir = if referrer_dir.is_empty() {
+        let host = state.borrow::<HostOpState>();
+        host.code_dir
+            .clone()
+            .unwrap_or_default()
+    } else {
+        referrer_dir
+    };
+
+    // Resolve the specifier to an absolute path
+    let path = if specifier.starts_with('/') || specifier.contains(':') {
+        std::path::PathBuf::from(&specifier)
+    } else {
+        std::path::PathBuf::from(&base_dir).join(&specifier)
+    };
+
+    // Try with and without .js extension
+    let path = if path.exists() {
+        path
+    } else if !path.extension().map_or(false, |e| e == "js") {
+        let with_js = path.with_extension("js");
+        if with_js.exists() {
+            with_js
+        } else {
+            path
+        }
+    } else {
+        path
+    };
+
+    let abs_path = path.to_string_lossy().into_owned();
+
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        RequireError::Io(format!("require: cannot read {}: {}", abs_path, e))
+    })?;
+
+    let parent = path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    Ok(RequireResult {
+        code: content,
+        abs_path,
+        dir: parent,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct RequireResult {
+    code: String,
+    abs_path: String,
+    dir: String,
+}
+
 deno_core::extension!(
     host_v8_base,
     ops = [
         op_trigger_gc,
         op_get_heap_statistics,
+        op_require_resolve_and_read,
     ],
     esm = [
         dir "base",

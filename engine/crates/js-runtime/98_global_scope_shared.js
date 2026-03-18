@@ -17,6 +17,7 @@ import { core } from "ext:core/mod.js";
 
 const windowOrWorkerGlobalScope = {
     define: core.propNonEnumerable(amdshim.define),
+    require: core.propNonEnumerable(amdshim.require),
 
     console: core.propNonEnumerable(console.console),
 
