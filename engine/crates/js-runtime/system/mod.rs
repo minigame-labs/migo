@@ -339,6 +339,7 @@ deno_core::extension!(
         "07_app_info.js",
         "08_authorize_setting.js",
         "09_game_log.js",
+        "10_system_info.js",
     ]
 );
 
