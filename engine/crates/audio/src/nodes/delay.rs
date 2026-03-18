@@ -26,6 +26,16 @@ impl DelayNode {
     pub fn new(id: AudioNodeId, max_delay_time: f32, sample_rate: u32, channels: u32) -> Self {
         let max_delay = max_delay_time.max(0.001).min(179.0); // Web Audio spec max
         let buffer_size = (max_delay as f64 * sample_rate as f64) as usize * channels as usize;
+        let buffer_bytes = buffer_size * std::mem::size_of::<f32>();
+        if buffer_bytes > 5 * 1024 * 1024 {
+            tracing::warn!(
+                "DelayNode {}: large buffer allocation ({:.1} MB for {:.1}s delay). \
+                 Consider reducing maxDelayTime for mobile.",
+                id,
+                buffer_bytes as f64 / (1024.0 * 1024.0),
+                max_delay
+            );
+        }
         Self {
             id,
             delay_time: AudioParamTimeline::new(0.0, 0.0, max_delay),

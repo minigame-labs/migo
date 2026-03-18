@@ -60,6 +60,12 @@ pub struct PannerNode {
     cone_inner_angle: f64,
     cone_outer_angle: f64,
     cone_outer_gain: f64,
+    // Cached panning gains to avoid trig recalculation when position is static
+    cached_px: f64,
+    cached_py: f64,
+    cached_pz: f64,
+    cached_gain_l: f32,
+    cached_gain_r: f32,
 }
 
 impl PannerNode {
@@ -80,6 +86,11 @@ impl PannerNode {
             cone_inner_angle: 360.0,
             cone_outer_angle: 360.0,
             cone_outer_gain: 0.0,
+            cached_px: f64::NAN, // NaN forces first computation
+            cached_py: f64::NAN,
+            cached_pz: f64::NAN,
+            cached_gain_l: std::f32::consts::FRAC_1_SQRT_2,
+            cached_gain_r: std::f32::consts::FRAC_1_SQRT_2,
         }
     }
 
@@ -180,24 +191,34 @@ impl AudioNodeProcessor for PannerNode {
         let py = self.position_y.value() as f64;
         let pz = self.position_z.value() as f64;
 
-        // Listener at origin (simplified — will use AudioListener later)
-        let distance = (px * px + py * py + pz * pz).sqrt();
-        let distance_gain = self.compute_distance_gain(distance);
+        // Recompute gains only if position changed (skip expensive trig otherwise)
+        if px != self.cached_px || py != self.cached_py || pz != self.cached_pz {
+            self.cached_px = px;
+            self.cached_py = py;
+            self.cached_pz = pz;
 
-        // Equal-power panning based on azimuth (x position)
-        let azimuth = if distance > 0.0001 {
-            (px / distance).asin()
-        } else {
-            0.0
-        };
+            // Listener at origin (simplified — will use AudioListener later)
+            let distance = (px * px + py * py + pz * pz).sqrt();
+            let distance_gain = self.compute_distance_gain(distance);
 
-        // Map azimuth [-PI/2, PI/2] to pan [0, 1] where 0=left, 1=right
-        let pan = (azimuth / std::f64::consts::FRAC_PI_2 * 0.5 + 0.5).clamp(0.0, 1.0);
+            // Equal-power panning based on azimuth (x position)
+            let azimuth = if distance > 0.0001 {
+                (px / distance).asin()
+            } else {
+                0.0
+            };
 
-        // Equal-power panning
-        let angle = pan * std::f64::consts::FRAC_PI_2;
-        let gain_l = (angle.cos() * distance_gain) as f32;
-        let gain_r = (angle.sin() * distance_gain) as f32;
+            // Map azimuth [-PI/2, PI/2] to pan [0, 1] where 0=left, 1=right
+            let pan = (azimuth / std::f64::consts::FRAC_PI_2 * 0.5 + 0.5).clamp(0.0, 1.0);
+
+            // Equal-power panning
+            let angle = pan * std::f64::consts::FRAC_PI_2;
+            self.cached_gain_l = (angle.cos() * distance_gain) as f32;
+            self.cached_gain_r = (angle.sin() * distance_gain) as f32;
+        }
+
+        let gain_l = self.cached_gain_l;
+        let gain_r = self.cached_gain_r;
 
         let frames = len / ch;
         for frame in 0..frames {

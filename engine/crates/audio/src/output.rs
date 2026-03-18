@@ -60,7 +60,7 @@ impl AudioSync {
 
 /// Audio output handle
 pub struct AudioOutput {
-    _stream: Stream,
+    stream: Stream,
     producer: HeapProd<f32>,
     sample_rate: u32,
     channels: u32,
@@ -146,7 +146,7 @@ impl AudioOutput {
         })?;
 
         Ok(Self {
-            _stream: stream,
+            stream,
             producer,
             sample_rate,
             channels,
@@ -197,6 +197,21 @@ impl AudioOutput {
     #[inline]
     pub fn is_alive(&self) -> bool {
         !self.stream_error.load(Ordering::Acquire)
+    }
+
+    /// Pause the audio stream (stops the hardware callback).
+    /// Use when the app is backgrounded or no audio is playing to save power.
+    pub fn pause_stream(&self) {
+        if let Err(e) = self.stream.pause() {
+            tracing::warn!("Failed to pause audio stream: {}", e);
+        }
+    }
+
+    /// Resume the audio stream (restarts the hardware callback).
+    pub fn resume_stream(&self) {
+        if let Err(e) = self.stream.play() {
+            tracing::warn!("Failed to resume audio stream: {}", e);
+        }
     }
 }
 

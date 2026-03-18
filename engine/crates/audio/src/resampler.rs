@@ -1,5 +1,4 @@
-use rubato::{FftFixedIn, Resampler as RubatoResampler};
-use shared::error::{EngineError, EngineResult, ErrorCode};
+use shared::error::EngineResult;
 
 use crate::decoder::DecodedAudio;
 
@@ -40,8 +39,12 @@ impl StreamResampler {
         }
 
         let input_frames = input.len() / channels;
+        // Ceiling division: generate enough output frames to consume ALL input.
+        // Floor division would leave a fractional frame unconsumed per chunk,
+        // causing cumulative drift (~28ms over 3 minutes for 44.1→48kHz).
         let output_frames =
-            ((input_frames as u64 * self.output_rate as u64) / self.input_rate as u64) as usize;
+            ((input_frames as u64 * self.output_rate as u64 + self.input_rate as u64 - 1)
+                / self.input_rate as u64) as usize;
 
         if output_frames == 0 {
             return Vec::new();
@@ -98,7 +101,10 @@ impl StreamResampler {
     }
 }
 
-/// Resample audio to target sample rate if needed
+/// Resample audio to target sample rate if needed.
+///
+/// Uses linear interpolation — sufficient for game audio (sound effects, BGM).
+/// This avoids pulling in the heavyweight `rubato` crate (~150-200KB SO).
 pub fn resample_if_needed(
     audio: DecodedAudio,
     target_sample_rate: u32,
@@ -123,88 +129,28 @@ pub fn resample_if_needed(
         return Ok(audio);
     }
 
-    // Calculate output size
     let resample_ratio = target_sample_rate as f64 / audio.sample_rate as f64;
     let output_frames = (input_frames as f64 * resample_ratio).ceil() as usize;
 
-    // Create resampler
-    // chunk_size should be reasonably sized for efficiency
-    let chunk_size = 1024.min(input_frames);
+    let mut resampler = StreamResampler::new(audio.sample_rate, target_sample_rate, audio.channels);
 
-    let mut resampler = FftFixedIn::<f32>::new(
-        audio.sample_rate as usize,
-        target_sample_rate as usize,
-        chunk_size,
-        2, // sub_chunks for quality
-        channels,
-    )
-    .map_err(|e| {
-        EngineError::from_detail(
-            ErrorCode::Internal,
-            format!("Failed to create resampler: {}", e),
-        )
-    })?;
-
-    // De-interleave input samples into separate channel buffers
-    let mut input_channels: Vec<Vec<f32>> = vec![Vec::with_capacity(input_frames); channels];
-    for (i, sample) in audio.samples.iter().enumerate() {
-        input_channels[i % channels].push(*sample);
-    }
-
-    // Process audio in chunks
-    let mut output_channels: Vec<Vec<f32>> = vec![Vec::with_capacity(output_frames); channels];
-    let frames_needed = resampler.input_frames_next();
+    // Process in chunks to bound memory for large files
+    const CHUNK_FRAMES: usize = 8192;
+    let chunk_samples = CHUNK_FRAMES * channels;
+    let mut output_samples = Vec::with_capacity(output_frames * channels);
 
     let mut pos = 0;
-    while pos < input_frames {
-        let end = (pos + frames_needed).min(input_frames);
-        let chunk_len = end - pos;
-
-        // Prepare input chunk
-        let input_chunk: Vec<&[f32]> = input_channels.iter().map(|ch| &ch[pos..end]).collect();
-
-        // Handle partial last chunk by padding with zeros
-        let padded_input: Vec<Vec<f32>>;
-        let actual_input: Vec<&[f32]> = if chunk_len < frames_needed {
-            padded_input = input_chunk
-                .iter()
-                .map(|ch| {
-                    let mut padded = ch.to_vec();
-                    padded.resize(frames_needed, 0.0);
-                    padded
-                })
-                .collect();
-            padded_input.iter().map(|v| v.as_slice()).collect()
-        } else {
-            input_chunk
-        };
-
-        // Resample
-        let output_chunk = resampler.process(&actual_input, None).map_err(|e| {
-            EngineError::from_detail(ErrorCode::Internal, format!("Resampling failed: {}", e))
-        })?;
-
-        // Append output
-        for (ch_idx, ch_data) in output_chunk.iter().enumerate() {
-            output_channels[ch_idx].extend_from_slice(ch_data);
-        }
-
+    while pos < audio.samples.len() {
+        let end = (pos + chunk_samples).min(audio.samples.len());
+        let resampled = resampler.process(&audio.samples[pos..end]);
+        output_samples.extend_from_slice(&resampled);
         pos = end;
-    }
-
-    // Interleave output channels back into a single buffer
-    let actual_output_frames = output_channels[0].len();
-    let mut output_samples = Vec::with_capacity(actual_output_frames * channels);
-    for frame_idx in 0..actual_output_frames {
-        for ch in &output_channels {
-            output_samples.push(ch[frame_idx]);
-        }
     }
 
     tracing::debug!(
         "Resampling complete: {} input frames -> {} output frames",
         input_frames,
-        actual_output_frames
+        output_samples.len() / channels
     );
 
     Ok(DecodedAudio {

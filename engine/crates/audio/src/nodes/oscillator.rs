@@ -154,8 +154,8 @@ impl AudioNodeProcessor for OscillatorNode {
             }
 
             self.phase += phase_inc;
-            // Keep phase in [0, 1)
-            self.phase -= self.phase.floor();
+            // Keep phase in [0, 1) — fract() is a single op vs floor()+sub
+            self.phase = self.phase.fract();
         }
 
         frames

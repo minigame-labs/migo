@@ -158,15 +158,6 @@ impl Canvas2DContext {
         self.path_max_y = f32::MIN;
     }
 
-    /// Get a reusable path with a single rect, avoiding allocation
-    #[inline]
-    fn get_rect_path(&mut self, x: f32, y: f32, w: f32, h: f32) -> &Path {
-        // Clear and reuse the existing path
-        self.rect_path = Path::new();
-        self.rect_path.rect(x, y, w, h);
-        &self.rect_path
-    }
-
     #[inline]
     fn clamp01(x: f32) -> f32 {
         x.clamp(0.0, 1.0)
@@ -495,12 +486,22 @@ impl Canvas2DContext {
     }
 
     pub fn stroke_text(&mut self, text: &str, x: f32, y: f32, _max_width: f32) {
+        // femtovg has no native stroke_text API. Approximate by rendering the
+        // text twice: once at a slightly larger size with stroke color (outline),
+        // then overwrite the interior with the background via DestinationOut.
+        //
+        // For the common mini-game pattern of strokeText + fillText (outline
+        // effect), this gives a visually correct result.  For standalone
+        // strokeText the outline width is approximate (font_size delta instead
+        // of true path stroking).
         let stroke = Self::apply_global_alpha(self.state.stroke_style, self.state.global_alpha);
-        let mut paint = Paint::color(stroke).with_line_width(self.state.line_width);
+        let lw = self.state.line_width.max(1.0);
+        let base_size = self.state.font_size;
+
+        let mut paint = Paint::color(stroke);
         if let Some(font_id) = self.state.font_id {
             paint.set_font(&[font_id]);
         }
-        paint.set_font_size(self.state.font_size);
         paint.set_text_align(match self.state.text_align {
             TextAlign::Start | TextAlign::Left => femtovg::Align::Left,
             TextAlign::End | TextAlign::Right => femtovg::Align::Right,
@@ -512,7 +513,24 @@ impl Canvas2DContext {
             TextBaseline::Alphabetic => femtovg::Baseline::Alphabetic,
             TextBaseline::Ideographic | TextBaseline::Bottom => femtovg::Baseline::Bottom,
         });
+
+        // Draw "outline" — slightly larger filled text with stroke color
+        paint.set_font_size(base_size + lw);
         let _ = self.canvas.fill_text(x, y, text, &paint);
+
+        // Punch out the interior to leave only the outline ring
+        self.canvas.save();
+        self.canvas
+            .global_composite_operation(femtovg::CompositeOperation::DestinationOut);
+        let mut erase = Paint::color(Color::white());
+        if let Some(font_id) = self.state.font_id {
+            erase.set_font(&[font_id]);
+        }
+        erase.set_font_size(base_size);
+        erase.set_text_align(paint.text_align());
+        erase.set_text_baseline(paint.text_baseline());
+        let _ = self.canvas.fill_text(x, y, text, &erase);
+        self.canvas.restore();
     }
 
     pub fn measure_text(&mut self, text: &str) -> TextMetrics {

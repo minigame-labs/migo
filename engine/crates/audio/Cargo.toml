@@ -12,9 +12,6 @@ minimp3 = "0.5"      # MP3, MIT license
 lewton = "0.10"      # OGG Vorbis, MIT/Apache-2.0
 hound = "3.5"        # WAV, Apache-2.0
 
-# Resampler for sample rate conversion
-rubato = "0.15"      # High quality resampler, MIT license
-
 # Thread-safe audio buffer
 ringbuf = "0.4"
 
@@ -29,7 +26,10 @@ futures-util = "0.3"
 shared = { path = "../shared" }
 tracing = { workspace = true }
 
-# Android specific: use oboe backend + shared C++ STL
+# Android specific: use oboe backend + shared C++ STL.
+# V8 is built with use_custom_libcxx=false (system shared STL).
+# Both V8 and oboe share a single libc++_shared.so at runtime,
+# following Android NDK best practice (one STL per process).
 [target.'cfg(target_os = "android")'.dependencies.cpal]
 version = "0.15"
 features = ["oboe-shared-stdcxx"]

@@ -213,6 +213,14 @@ impl AudioParamTimeline {
         }
 
         let inv_sample_rate = 1.0 / sample_rate as f64;
+        let end_time = start_time + (buffer.len() as f64) * inv_sample_rate;
+
+        // Fast path: all events are in the future — fill with current value
+        if self.events.first().map_or(false, |e| e.time() > end_time) {
+            buffer.fill(self.current_value);
+            return;
+        }
+
         for (i, sample) in buffer.iter_mut().enumerate() {
             let t = start_time + i as f64 * inv_sample_rate;
             *sample = self.compute_value(t);

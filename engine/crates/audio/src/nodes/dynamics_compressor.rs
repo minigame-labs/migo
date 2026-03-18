@@ -124,8 +124,10 @@ impl AudioNodeProcessor for DynamicsCompressorNode {
                 self.envelope = release_coeff * self.envelope + (1.0 - release_coeff) * target;
             }
 
-            // Convert dB gain reduction to linear gain
-            let gain = 10.0f32.powf(-self.envelope / 20.0);
+            // Convert dB gain reduction to linear gain.
+            // 10^(-env/20) = e^(-env * ln10/20) — exp() is ~4x faster than powf() on ARM.
+            const LN10_OVER_20: f32 = std::f32::consts::LN_10 / 20.0;
+            let gain = (-self.envelope * LN10_OVER_20).exp();
 
             // Apply gain to all channels
             for ch in 0..channels {

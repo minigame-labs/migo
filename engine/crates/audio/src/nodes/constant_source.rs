@@ -82,10 +82,9 @@ impl AudioNodeProcessor for ConstantSourceNode {
         let value = self.offset.value();
         let channels = channels.max(1) as usize;
         let frames = output.len() / channels;
+        let len = frames * channels;
 
-        for i in 0..output.len().min(frames * channels) {
-            output[i] = value;
-        }
+        output[..len].fill(value);
 
         frames
     }

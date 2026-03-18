@@ -11,8 +11,10 @@ use super::{AudioNodeProcessor, AudioNodeType};
 /// State of an AudioBufferSourceNode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferSourceState {
-    /// Not yet started
+    /// Not yet started (start() not called)
     Pending,
+    /// start() called but `when` is in the future
+    Scheduled,
     /// Currently playing
     Playing,
     /// Finished playback
@@ -45,6 +47,9 @@ pub struct BufferSourceNode {
 
     // Context time when started (set when start() is called)
     start_time: Option<f64>,
+
+    // Scheduled stop time (None = no stop scheduled)
+    stop_when: Option<f64>,
 }
 
 impl BufferSourceNode {
@@ -63,6 +68,7 @@ impl BufferSourceNode {
             playback_rate: AudioParamTimeline::new(1.0, -3.4028235e38, 3.4028235e38),
             detune: AudioParamTimeline::new(0.0, -3.4028235e38, 3.4028235e38),
             start_time: None,
+            stop_when: None,
         }
     }
 
@@ -72,19 +78,32 @@ impl BufferSourceNode {
 
     pub fn start(&mut self, when: f64, offset: f64, duration: Option<f64>, current_time: f64) {
         if self.state != BufferSourceState::Pending {
-            return; // Can only start once
+            return; // Can only start once per W3C spec
         }
 
         self.start_when = when;
         self.start_offset = offset;
         self.duration = duration;
         self.position = offset;
-        self.start_time = Some(current_time.max(when));
-        self.state = BufferSourceState::Playing;
+
+        // If scheduled time is now or in the past, start immediately
+        if current_time >= when {
+            self.start_time = Some(current_time);
+            self.state = BufferSourceState::Playing;
+        } else {
+            // Schedule for future — will transition to Playing in process()
+            self.start_time = Some(when);
+            self.state = BufferSourceState::Scheduled;
+        }
     }
 
-    pub fn stop(&mut self, _when: f64) {
-        self.state = BufferSourceState::Finished;
+    pub fn stop(&mut self, when: f64) {
+        // Per W3C spec: stop at the given time, or immediately if when <= 0
+        if when <= 0.0 {
+            self.state = BufferSourceState::Finished;
+        } else {
+            self.stop_when = Some(when);
+        }
     }
 
     pub fn set_loop(&mut self, enabled: bool, start: f64, end: f64) {
@@ -327,8 +346,25 @@ impl AudioNodeProcessor for BufferSourceNode {
         output: &mut [f32],
         _sample_rate: u32,
         channels: u32,
-        _current_time: f64,
+        current_time: f64,
     ) -> usize {
+        // Check scheduled start: transition Scheduled → Playing when time arrives
+        if self.state == BufferSourceState::Scheduled {
+            if current_time >= self.start_when {
+                self.state = BufferSourceState::Playing;
+            } else {
+                return 0;
+            }
+        }
+
+        // Check scheduled stop
+        if let Some(stop_when) = self.stop_when {
+            if current_time >= stop_when {
+                self.state = BufferSourceState::Finished;
+                return 0;
+            }
+        }
+
         // Source node: ignore inputs, generate from buffer
         self.process_with_channels(output, channels)
     }

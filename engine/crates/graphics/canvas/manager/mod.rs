@@ -318,6 +318,11 @@ impl CanvasManager {
     }
 
     pub(crate) fn destroy_all(&mut self, gl: &glow::Context) {
+        // destroy_canvas refuses id=1 (onscreen), so handle it separately.
+        let onscreen_id = CanvasId::from(1u32);
+        if self.canvases.contains_key(&onscreen_id) {
+            let _ = self.destroy_onscreen_internal(onscreen_id);
+        }
         let ids: Vec<CanvasId> = self.canvases.keys().copied().collect();
         for id in ids {
             let _ = self.destroy_canvas(id);

@@ -233,8 +233,10 @@ build_platform() {
 
         local builtins_dir
         builtins_dir=$(dirname "$builtins")
-        export RUSTFLAGS="$orig_rustflags -L $builtins_dir -l static=clang_rt.builtins-aarch64-android"
-        print_info "Using arm64 clang builtins"
+        # --exclude-libs,ALL prevents re-exporting symbols from static libs
+        # (e.g. V8, ring), reducing .dynsym/.rela.dyn by ~430KB.
+        export RUSTFLAGS="$orig_rustflags -L $builtins_dir -l static=clang_rt.builtins-aarch64-android -C link-arg=-Wl,--exclude-libs,ALL"
+        print_info "Using arm64 clang builtins + --exclude-libs,ALL"
     fi
 
     # --------------------------------------------------------
@@ -268,7 +270,9 @@ build_platform() {
     fi
 
     # --------------------------------------------------------
-    # Copy libc++_shared.so (required by cpal/oboe)
+    # Copy libc++_shared.so (required by cpal/oboe shared STL)
+    # Note: cannot use static STL because V8's prebuilt librusty_v8.a
+    # already embeds static libc++ symbols — linking both causes duplicates.
     # --------------------------------------------------------
     local host_platform
     if ! host_platform=$(get_host_platform); then

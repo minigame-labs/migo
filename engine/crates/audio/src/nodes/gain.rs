@@ -9,6 +9,8 @@ use super::{AudioNodeProcessor, AudioNodeType};
 pub struct GainNode {
     id: AudioNodeId,
     gain: AudioParamTimeline,
+    /// Reusable buffer for per-sample automation values
+    automation_buf: Vec<f32>,
 }
 
 impl GainNode {
@@ -16,6 +18,7 @@ impl GainNode {
         Self {
             id,
             gain: AudioParamTimeline::new(1.0, -3.4028235e38, 3.4028235e38),
+            automation_buf: Vec::new(),
         }
     }
 
@@ -46,27 +49,51 @@ impl AudioNodeProcessor for GainNode {
         &mut self,
         inputs: &[f32],
         output: &mut [f32],
-        _sample_rate: u32,
+        sample_rate: u32,
         channels: u32,
-        _current_time: f64,
+        current_time: f64,
     ) -> usize {
         let len = inputs.len().min(output.len());
         if len == 0 {
             return 0;
         }
 
-        let gain = self.gain.value();
+        let ch = channels.max(1) as usize;
+        let frames = len / ch;
 
-        // Optimization: skip multiply if gain is 1.0
-        if (gain - 1.0).abs() < f32::EPSILON {
-            output[..len].copy_from_slice(&inputs[..len]);
+        if self.gain.has_automation() {
+            // Per-sample automation for zipper-free transitions
+            if self.automation_buf.len() < frames {
+                self.automation_buf.resize(frames, 0.0);
+            }
+            self.gain.compute_values(
+                current_time,
+                &mut self.automation_buf[..frames],
+                sample_rate,
+            );
+            for frame in 0..frames {
+                let g = self.automation_buf[frame];
+                for c in 0..ch {
+                    let idx = frame * ch + c;
+                    if idx < len {
+                        output[idx] = inputs[idx] * g;
+                    }
+                }
+            }
         } else {
-            for i in 0..len {
-                output[i] = inputs[i] * gain;
+            let gain = self.gain.value();
+
+            // Optimization: skip multiply if gain is 1.0
+            if (gain - 1.0).abs() < f32::EPSILON {
+                output[..len].copy_from_slice(&inputs[..len]);
+            } else {
+                for i in 0..len {
+                    output[i] = inputs[i] * gain;
+                }
             }
         }
 
-        len / channels.max(1) as usize
+        frames
     }
 
     fn get_param_mut(&mut self, name: &str) -> Option<&mut AudioParamTimeline> {

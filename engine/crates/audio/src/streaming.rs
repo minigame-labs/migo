@@ -73,7 +73,7 @@ static STREAM_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 fn get_stream_runtime() -> &'static tokio::runtime::Runtime {
     STREAM_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(1)
             .thread_name("audio-stream")
             .enable_all()
             .build()

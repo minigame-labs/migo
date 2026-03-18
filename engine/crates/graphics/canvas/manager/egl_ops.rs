@@ -44,40 +44,84 @@ pub(super) fn init_egl(egl_lib_path: &str) -> EngineResult<EglInitResult> {
         )
     })?;
 
-    let attrs = [
-        egl::RED_SIZE,
-        8,
-        egl::GREEN_SIZE,
-        8,
-        egl::BLUE_SIZE,
-        8,
-        egl::ALPHA_SIZE,
-        8,
-        egl::DEPTH_SIZE,
-        16,
-        egl::STENCIL_SIZE,
-        8,
-        egl::SURFACE_TYPE,
-        egl::WINDOW_BIT | egl::PBUFFER_BIT,
-        egl::RENDERABLE_TYPE,
-        egl::OPENGL_ES2_BIT,
-        egl::NONE,
+    // Try configs in preference order; fall back to simpler configs on
+    // devices that don't support the full RGBA8+D16+S8 combination.
+    let configs: &[&[egl::Int]] = &[
+        // Primary: RGBA8 + Depth16 + Stencil8
+        &[
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            8,
+            egl::DEPTH_SIZE,
+            16,
+            egl::STENCIL_SIZE,
+            8,
+            egl::SURFACE_TYPE,
+            egl::WINDOW_BIT | egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES2_BIT,
+            egl::NONE,
+        ],
+        // Fallback 1: Depth24 + Stencil8 (some drivers only offer D24S8 packed)
+        &[
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            8,
+            egl::DEPTH_SIZE,
+            24,
+            egl::STENCIL_SIZE,
+            8,
+            egl::SURFACE_TYPE,
+            egl::WINDOW_BIT | egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES2_BIT,
+            egl::NONE,
+        ],
+        // Fallback 2: no stencil (older/simpler GPUs)
+        &[
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            8,
+            egl::DEPTH_SIZE,
+            16,
+            egl::STENCIL_SIZE,
+            0,
+            egl::SURFACE_TYPE,
+            egl::WINDOW_BIT | egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES2_BIT,
+            egl::NONE,
+        ],
     ];
 
-    let config = egl
-        .choose_first_config(display, &attrs)
-        .map_err(|_| {
-            ee(
-                ErrorCode::RenderChooseConfigError,
-                "choose_config failed".to_string(),
-            )
-        })?
-        .ok_or_else(|| {
-            ee(
-                ErrorCode::RenderChooseConfigError,
-                "choose_config returned None".to_string(),
-            )
-        })?;
+    let mut config = None;
+    for attrs in configs {
+        if let Ok(Some(c)) = egl.choose_first_config(display, attrs) {
+            config = Some(c);
+            break;
+        }
+    }
+    let config = config.ok_or_else(|| {
+        ee(
+            ErrorCode::RenderChooseConfigError,
+            "all EGL config candidates failed",
+        )
+    })?;
 
     Ok(EglInitResult {
         egl,

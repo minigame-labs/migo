@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use shared::protocol::audio_cmd::{AudioBufferId, AudioContextId, AudioContextState, AudioNodeId};
 
@@ -25,9 +24,6 @@ pub struct AudioContext {
     sample_rate: u32,
     channels: u32,
 
-    // Timing
-    start_time: Instant,
-
     // Resources
     buffers: HashMap<AudioBufferId, Arc<DecodedAudio>>,
     next_buffer_id: AudioBufferId,
@@ -42,10 +38,16 @@ pub struct AudioContext {
     processing_order: Vec<AudioNodeId>,
     graph_dirty: bool,
 
+    // Pre-built reverse adjacency: dst_node → [src_nodes] for O(1) input lookup
+    input_adjacency: HashMap<AudioNodeId, Vec<AudioNodeId>>,
+
     // Processing buffers: per-node output buffers keyed by node ID
     node_buffers: HashMap<AudioNodeId, Vec<f32>>,
     // Scratch buffer for mixing multiple inputs
     mix_buffer: Vec<f32>,
+
+    // Frames processed for sample-accurate currentTime (W3C spec)
+    frames_processed: u64,
 }
 
 impl AudioContext {
@@ -68,15 +70,16 @@ impl AudioContext {
             state: AudioContextState::Running,
             sample_rate,
             channels,
-            start_time: Instant::now(),
             buffers: HashMap::with_capacity(Self::DEFAULT_BUFFER_CAPACITY),
             next_buffer_id: 1,
             nodes,
             connections: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
             processing_order: Vec::with_capacity(Self::DEFAULT_NODE_CAPACITY),
             graph_dirty: true,
+            input_adjacency: HashMap::with_capacity(Self::DEFAULT_NODE_CAPACITY),
             node_buffers: HashMap::with_capacity(Self::DEFAULT_NODE_CAPACITY),
             mix_buffer: Vec::new(),
+            frames_processed: 0,
         }
     }
 
@@ -96,9 +99,12 @@ impl AudioContext {
         self.channels
     }
 
-    /// Get the current time in seconds since context creation
+    /// Get the current time based on frames processed (W3C AudioContext spec).
+    ///
+    /// Unlike wall-clock time, this pauses when the context is suspended
+    /// and accurately tracks the audio output position.
     pub fn current_time(&self) -> f64 {
-        self.start_time.elapsed().as_secs_f64()
+        self.frames_processed as f64 / self.sample_rate.max(1) as f64
     }
 
     pub fn suspend(&mut self) {
@@ -117,7 +123,21 @@ impl AudioContext {
         self.nodes.clear();
         self.connections.clear();
         self.processing_order.clear();
+        self.input_adjacency.clear();
         self.node_buffers.clear();
+    }
+
+    /// Check if this context has any active source nodes (playing or scheduled).
+    ///
+    /// Used by the power manager to avoid keeping the audio thread at high
+    /// tick rate when a context is Running but has no audio to produce.
+    pub fn has_active_sources(&self) -> bool {
+        if self.state != AudioContextState::Running {
+            return false;
+        }
+        self.nodes
+            .values()
+            .any(|n| n.is_source() && !n.is_finished())
     }
 
     // ==================== Buffer Management ====================
@@ -475,17 +495,15 @@ impl AudioContext {
         }
     }
 
-    /// Rebuild the processing order using topological sort (Kahn's algorithm).
-    ///
-    /// This produces a valid processing order where every node is processed
-    /// after all of its input sources, supporting arbitrary graph topologies
-    /// like: source → filter → gain → destination.
+    /// Rebuild the processing order using topological sort (Kahn's algorithm)
+    /// and pre-build the input adjacency map for O(1) input lookup during processing.
     fn rebuild_processing_order(&mut self) {
         tracing::trace!(
             "rebuild_processing_order: connections={:?}",
             self.connections
         );
         self.processing_order.clear();
+        self.input_adjacency.clear();
 
         // Build adjacency list and in-degree count
         let mut in_degree: HashMap<AudioNodeId, usize> = HashMap::new();
@@ -497,11 +515,15 @@ impl AudioContext {
             adj.entry(node_id).or_default();
         }
 
-        // Count in-degrees from connections
+        // Count in-degrees from connections and build reverse adjacency (dst → [src])
         for conn in &self.connections {
             if self.nodes.contains_key(&conn.src) && self.nodes.contains_key(&conn.dst) {
                 *in_degree.entry(conn.dst).or_default() += 1;
                 adj.entry(conn.src).or_default().push(conn.dst);
+                self.input_adjacency
+                    .entry(conn.dst)
+                    .or_default()
+                    .push(conn.src);
             }
         }
 
@@ -545,17 +567,17 @@ impl AudioContext {
 
     // ==================== Processing ====================
 
-    /// Process audio and fill the output buffer.
+    /// Process audio and **add** to the output buffer.
     ///
     /// Uses topological sort to process nodes in dependency order.
     /// Each node receives its upstream mixed inputs and writes to its own buffer.
-    /// The destination node's output is copied to the final output.
+    /// The destination node's output is **added** (not copied) to the final output,
+    /// allowing multiple AudioContexts to be mixed together by the caller.
+    ///
+    /// The caller must zero the output buffer before the first context's process() call.
     pub fn process(&mut self, output: &mut [f32]) {
-        static PROCESS_LOG_COUNTER: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(0);
-
         if self.state != AudioContextState::Running {
-            output.fill(0.0);
+            // Don't touch output — other contexts may have already written to it
             return;
         }
 
@@ -573,31 +595,18 @@ impl AudioContext {
             self.mix_buffer.resize(buffer_size, 0.0);
         }
 
-        // Log every 100 calls
-        let counter = PROCESS_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let should_log = counter % 100 == 0;
+        // Process each node in topological order (index-based to avoid clone)
+        let order_len = self.processing_order.len();
+        for order_idx in 0..order_len {
+            let node_id = self.processing_order[order_idx];
 
-        if should_log {
-            tracing::trace!(
-                "process: order={:?}, nodes={}",
-                self.processing_order,
-                self.nodes.len()
-            );
-        }
-
-        // Clone processing order to avoid borrow issues
-        let order = self.processing_order.clone();
-
-        // Process each node in topological order
-        for &node_id in &order {
-            // First, gather mixed input from all upstream connections
+            // Gather mixed input from upstream using pre-built adjacency (O(inputs) not O(connections))
             self.mix_buffer[..buffer_size].fill(0.0);
             let mut has_input = false;
 
-            // Find all connections where dst == node_id, mix their src outputs
-            for conn in &self.connections {
-                if conn.dst == node_id {
-                    if let Some(src_buf) = self.node_buffers.get(&conn.src) {
+            if let Some(inputs) = self.input_adjacency.get(&node_id) {
+                for &src_id in inputs {
+                    if let Some(src_buf) = self.node_buffers.get(&src_id) {
                         let len = src_buf.len().min(buffer_size);
                         for i in 0..len {
                             self.mix_buffer[i] += src_buf[i];
@@ -624,31 +633,22 @@ impl AudioContext {
                     &[] as &[f32]
                 };
 
-                let frames = node.process(
+                node.process(
                     input,
                     &mut node_buf[..buffer_size],
                     sample_rate,
                     self.channels,
                     current_time,
                 );
-
-                if should_log && frames > 0 {
-                    tracing::trace!(
-                        "process: node {} ({:?}) wrote {} frames",
-                        node_id,
-                        node.node_type(),
-                        frames
-                    );
-                }
             }
         }
 
-        // Copy destination node's output to final output
+        // Add destination node's output to final output (additive for multi-context mixing)
         if let Some(dest_buf) = self.node_buffers.get(&DESTINATION_NODE_ID) {
             let len = dest_buf.len().min(buffer_size);
-            output[..len].copy_from_slice(&dest_buf[..len]);
-        } else {
-            output.fill(0.0);
+            for i in 0..len {
+                output[i] += dest_buf[i];
+            }
         }
 
         // Soft clip only if needed (check max amplitude first)
@@ -669,6 +669,10 @@ impl AudioContext {
                 }
             }
         }
+
+        // Track processed frames for sample-accurate currentTime
+        let frames = buffer_size / self.channels.max(1) as usize;
+        self.frames_processed += frames as u64;
 
         // Clean up finished source nodes
         let old_count = self.nodes.len();

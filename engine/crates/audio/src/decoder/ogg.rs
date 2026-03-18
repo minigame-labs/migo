@@ -17,7 +17,11 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
     let sample_rate = reader.ident_hdr.audio_sample_rate;
     let channels = reader.ident_hdr.audio_channels as u32;
 
-    let mut samples: Vec<f32> = Vec::new();
+    // Estimate capacity from file size to reduce reallocations.
+    // OGG Vorbis typical compression ratio is ~10:1 for stereo 44.1kHz,
+    // so decoded f32 samples ~ data.len() * 10 / 4 (bytes → f32).
+    let estimated_samples = data.len() * 2; // conservative: ~8:1 ratio
+    let mut samples: Vec<f32> = Vec::with_capacity(estimated_samples);
 
     while let Some(packet) = reader
         .read_dec_packet_generic::<Vec<Vec<f32>>>()
@@ -35,6 +39,7 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
         }
 
         let frame_count = packet[0].len();
+        samples.reserve(frame_count * packet.len());
         for i in 0..frame_count {
             for ch in &packet {
                 if i < ch.len() {

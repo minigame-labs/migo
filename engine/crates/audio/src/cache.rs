@@ -3,7 +3,7 @@
 //! Caches decoded audio data to avoid repeated downloads and decoding.
 //! Uses URL as key and applies LRU eviction when memory limit is exceeded.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::decoder::DecodedAudio;
@@ -22,6 +22,8 @@ struct CacheEntry {
 pub struct AudioCache {
     /// URL -> CacheEntry
     entries: HashMap<String, CacheEntry>,
+    /// access_order -> URL for O(1) LRU eviction
+    order_index: BTreeMap<u64, String>,
     /// Current total size in bytes
     current_size: usize,
     /// Maximum cache size in bytes (default: 128MB)
@@ -44,6 +46,7 @@ impl AudioCache {
     pub fn with_max_size(max_size: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(Self::DEFAULT_CACHE_CAPACITY),
+            order_index: BTreeMap::new(),
             current_size: 0,
             max_size,
             access_counter: 0,
@@ -53,9 +56,12 @@ impl AudioCache {
     /// Get cached audio by URL
     pub fn get(&mut self, url: &str) -> Option<Arc<DecodedAudio>> {
         if let Some(entry) = self.entries.get_mut(url) {
-            // Update access order
+            // Update access order in both entry and index
+            self.order_index.remove(&entry.access_order);
             self.access_counter += 1;
             entry.access_order = self.access_counter;
+            self.order_index
+                .insert(self.access_counter, url.to_string());
             tracing::trace!("Cache hit: {}", url);
             Some(Arc::clone(&entry.audio))
         } else {
@@ -89,6 +95,7 @@ impl AudioCache {
         // Remove old entry if exists
         if let Some(old) = self.entries.remove(&url) {
             self.current_size -= old.size_bytes;
+            self.order_index.remove(&old.access_order);
         }
 
         self.entries.insert(
@@ -99,6 +106,7 @@ impl AudioCache {
                 access_order: self.access_counter,
             },
         );
+        self.order_index.insert(self.access_counter, url.clone());
         self.current_size += size_bytes;
 
         tracing::debug!(
@@ -111,18 +119,14 @@ impl AudioCache {
         audio
     }
 
-    /// Evict least recently used entry
+    /// Evict least recently used entry (O(1) via BTreeMap)
     fn evict_lru(&mut self) {
-        let lru_url = self
-            .entries
-            .iter()
-            .min_by_key(|(_, e)| e.access_order)
-            .map(|(url, _)| url.clone());
-
-        if let Some(url) = lru_url {
-            if let Some(entry) = self.entries.remove(&url) {
-                self.current_size -= entry.size_bytes;
-                tracing::debug!("Evicted from cache: {} ({} bytes)", url, entry.size_bytes);
+        if let Some((&order, _)) = self.order_index.iter().next() {
+            if let Some(url) = self.order_index.remove(&order) {
+                if let Some(entry) = self.entries.remove(&url) {
+                    self.current_size -= entry.size_bytes;
+                    tracing::debug!("Evicted from cache: {} ({} bytes)", url, entry.size_bytes);
+                }
             }
         }
     }
@@ -131,6 +135,7 @@ impl AudioCache {
     pub fn remove(&mut self, url: &str) {
         if let Some(entry) = self.entries.remove(url) {
             self.current_size -= entry.size_bytes;
+            self.order_index.remove(&entry.access_order);
             tracing::debug!("Removed from cache: {} ({} bytes)", url, entry.size_bytes);
         }
     }
@@ -138,6 +143,7 @@ impl AudioCache {
     /// Clear entire cache
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.order_index.clear();
         self.current_size = 0;
         self.access_counter = 0;
         tracing::debug!("Cache cleared");

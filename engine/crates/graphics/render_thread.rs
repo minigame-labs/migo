@@ -119,6 +119,14 @@ impl RenderThread {
                 // E.g., frame_divisor=2 means deliver every 2nd VSync → ~30fps on 60Hz.
                 let mut frame_divisor: u32 = 1;
                 let mut vsync_count: u32 = 0;
+                // Auto-detected VSync frequency (updated from timestamps).
+                // Defaults to 60Hz; measured over 1-second windows to handle
+                // 90Hz, 120Hz, and variable-rate displays correctly.
+                let mut detected_vsync_hz: u32 = 60;
+                let mut vsync_hz_counter: u32 = 0;
+                let mut vsync_hz_timer = Instant::now();
+                // User-requested target FPS (used to recompute divisor on Hz change).
+                let mut target_fps: u32 = 60;
 
                 let mut canvas_handler = CanvasHandler::new();
                 let mut renderer_2d = Renderer2d::new();
@@ -148,7 +156,9 @@ impl RenderThread {
                                           paused: &mut bool,
                                           frame_divisor: &mut u32,
                                           has_vsync: bool,
-                                          has_surface: &mut bool|
+                                          has_surface: &mut bool,
+                                          detected_vsync_hz: u32,
+                                          target_fps: &mut u32|
                  -> LoopCtl {
                     match cmd {
                         RenderCommand::Shutdown => {
@@ -161,8 +171,11 @@ impl RenderThread {
                             let new_fps = new_fps.clamp(1, 60);
                             if has_vsync {
                                 // Choreographer mode: skip VSync signals to achieve target fps.
-                                *frame_divisor = (60 / new_fps).max(1);
-                                info!("RenderThread frame_divisor={} (target {}fps)", frame_divisor, new_fps);
+                                // Use auto-detected VSync frequency (not hardcoded 60Hz) to
+                                // handle 90/120Hz displays correctly.
+                                *frame_divisor = (detected_vsync_hz / new_fps).max(1);
+                                *target_fps = new_fps;
+                                info!("RenderThread frame_divisor={} (target {}fps, vsync {}Hz)", frame_divisor, new_fps, detected_vsync_hz);
                             } else if new_fps != *fps {
                                 // Software ticker mode: recreate ticker at new interval.
                                 *fps = new_fps;
@@ -364,10 +377,12 @@ impl RenderThread {
                                       dirty: &mut bool,
                                       paused: &mut bool,
                                       frame_divisor: &mut u32,
-                                      has_surface: &mut bool|
+                                      has_surface: &mut bool,
+                                      detected_vsync_hz: u32,
+                                      target_fps: &mut u32|
                  -> LoopCtl {
                     while let Ok(cmd) = cmd_rx.try_recv() {
-                        match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, ticker, dirty, paused, frame_divisor, has_vsync, has_surface) {
+                        match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, ticker, dirty, paused, frame_divisor, has_vsync, has_surface, detected_vsync_hz, target_fps) {
                             LoopCtl::Continue => {}
                             LoopCtl::Shutdown => return LoopCtl::Shutdown,
                         }
@@ -439,7 +454,7 @@ impl RenderThread {
                             // Frame timing: drain → swap → RAF signal.
 
                             // 1) Drain all pending commands from the previous frame.
-                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, &mut has_surface) {
+                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, &mut has_surface, detected_vsync_hz, &mut target_fps) {
                                 LoopCtl::Continue => {}
                                 LoopCtl::Shutdown => {
                                     shared::stats::unregister_stats(host_id);
@@ -459,6 +474,23 @@ impl RenderThread {
                                 continue;
                             }
 
+                            // Auto-detect VSync frequency from signal count per second.
+                            // This correctly handles 60/90/120Hz and variable-rate displays.
+                            vsync_hz_counter += 1;
+                            let hz_elapsed = vsync_hz_timer.elapsed();
+                            if hz_elapsed >= Duration::from_secs(1) {
+                                let measured = (vsync_hz_counter as f64 / hz_elapsed.as_secs_f64()).round() as u32;
+                                let new_hz = measured.clamp(30, 240);
+                                if new_hz != detected_vsync_hz {
+                                    detected_vsync_hz = new_hz;
+                                    // Recompute frame divisor for the updated rate.
+                                    frame_divisor = (detected_vsync_hz / target_fps).max(1);
+                                    info!("RenderThread: detected VSync {}Hz, frame_divisor={}", detected_vsync_hz, frame_divisor);
+                                }
+                                vsync_hz_counter = 0;
+                                vsync_hz_timer = Instant::now();
+                            }
+
                             // Frame divisor: skip frames to achieve target fps.
                             vsync_count += 1;
                             if vsync_count % frame_divisor != 0 {
@@ -466,7 +498,7 @@ impl RenderThread {
                             }
 
                             // 1) Drain all pending commands.
-                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, &mut has_surface) {
+                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, &mut has_surface, detected_vsync_hz, &mut target_fps) {
                                 LoopCtl::Continue => {}
                                 LoopCtl::Shutdown => {
                                     shared::stats::unregister_stats(host_id);
@@ -487,7 +519,7 @@ impl RenderThread {
                         recv(cmd_rx) -> msg => {
                             match msg {
                                 Ok(cmd) => {
-                                    match handle_one_cmd(cmd, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, has_vsync, &mut has_surface) {
+                                    match handle_one_cmd(cmd, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, has_vsync, &mut has_surface, detected_vsync_hz, &mut target_fps) {
                                         LoopCtl::Continue => {}
                                         LoopCtl::Shutdown => {
                                             shared::stats::unregister_stats(host_id);
@@ -495,7 +527,7 @@ impl RenderThread {
                                         }
                                     }
 
-                                    match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, &mut has_surface) {
+                                    match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, &mut has_surface, detected_vsync_hz, &mut target_fps) {
                                         LoopCtl::Continue => {}
                                         LoopCtl::Shutdown => {
                                             shared::stats::unregister_stats(host_id);
@@ -514,7 +546,7 @@ impl RenderThread {
                     }
                 }
             })
-            .unwrap();
+            .expect("failed to spawn Migo-RenderThread");
 
         Self {
             cmd_tx,

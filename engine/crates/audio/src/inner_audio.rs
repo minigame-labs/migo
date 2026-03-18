@@ -470,22 +470,16 @@ impl InnerAudioPlayer {
 
     /// Process incoming stream messages (call from audio thread loop)
     pub fn poll_stream(&mut self) {
-        // First, collect all messages to avoid borrow conflicts
-        let messages: Vec<StreamMsg> = {
-            let rx = match &mut self.stream_rx {
-                Some(rx) => rx,
-                None => return,
-            };
-
-            let mut msgs = Vec::new();
-            while let Ok(msg) = rx.try_recv() {
-                msgs.push(msg);
-            }
-            msgs
+        // Take the receiver out to split the borrow on self,
+        // allowing inline processing without a temporary Vec.
+        let mut rx = match self.stream_rx.take() {
+            Some(rx) => rx,
+            None => return,
         };
 
-        // Now process collected messages
-        for msg in messages {
+        let mut stream_ended = false;
+
+        while let Ok(msg) = rx.try_recv() {
             match msg {
                 StreamMsg::Ready {
                     sample_rate,
@@ -552,8 +546,8 @@ impl InnerAudioPlayer {
                 }
                 StreamMsg::Done => {
                     self.stream_complete = true;
-                    self.stream_rx = None;
                     self.stream_state = None;
+                    stream_ended = true;
                     let ch = self.shared.channels() as usize;
                     let sr = self.shared.sample_rate();
                     let duration = if ch > 0 && sr > 0 {
@@ -581,14 +575,21 @@ impl InnerAudioPlayer {
                             self.push_event(InnerAudioEventType::Play);
                         }
                     }
+                    break; // No more messages after Done
                 }
                 StreamMsg::Error(err) => {
                     tracing::error!("InnerAudioPlayer {} stream error: {}", self.id, err);
-                    self.stream_rx = None;
                     self.stream_state = None;
+                    stream_ended = true;
                     self.push_event(InnerAudioEventType::Error);
+                    break; // No more messages after Error
                 }
             }
+        }
+
+        // Put receiver back unless the stream has ended
+        if !stream_ended {
+            self.stream_rx = Some(rx);
         }
     }
 

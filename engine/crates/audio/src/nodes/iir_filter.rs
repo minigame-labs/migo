@@ -10,16 +10,21 @@ use super::{AudioNodeProcessor, AudioNodeType};
 ///   H(z) = (b0 + b1*z^-1 + ... + bM*z^-M) / (1 + a1*z^-1 + ... + aN*z^-N)
 ///
 /// Note: a0 is always 1 (normalized). The `feedback` array includes a0.
+///
+/// Uses circular buffers for history to avoid O(N) per-sample shifting.
 pub struct IIRFilterNode {
     id: AudioNodeId,
     /// Feedforward coefficients (numerator)
     feedforward: Vec<f64>,
     /// Feedback coefficients (denominator), a[0] is normalized to 1.0
     feedback: Vec<f64>,
-    /// Per-channel input delay line
+    /// Per-channel input circular buffer
     x_history: Vec<Vec<f64>>,
-    /// Per-channel output delay line
+    /// Per-channel output circular buffer
     y_history: Vec<Vec<f64>>,
+    /// Current write position in circular buffers (shared across channels)
+    x_write_pos: usize,
+    y_write_pos: usize,
     channels: u32,
 }
 
@@ -49,12 +54,14 @@ impl IIRFilterNode {
             feedback: norm_fb,
             x_history,
             y_history,
+            x_write_pos: 0,
+            y_write_pos: 0,
             channels,
         }
     }
 
-    /// Compute frequency response H(e^{jω}) for an array of frequencies.
-    /// H(z) = Σ(b[k]·z^{-k}) / Σ(a[k]·z^{-k})
+    /// Compute frequency response H(e^{jw}) for an array of frequencies.
+    /// H(z) = sum(b[k]*z^{-k}) / sum(a[k]*z^{-k})
     pub fn get_frequency_response(
         &self,
         sample_rate: f64,
@@ -67,7 +74,7 @@ impl IIRFilterNode {
         for &freq_hz in frequencies {
             let omega = std::f64::consts::TAU * freq_hz as f64 / sample_rate;
 
-            // Numerator: Σ b[k] · e^{-jkω}
+            // Numerator: sum b[k] * e^{-jkw}
             let mut num_re = 0.0;
             let mut num_im = 0.0;
             for (k, &bk) in self.feedforward.iter().enumerate() {
@@ -76,7 +83,7 @@ impl IIRFilterNode {
                 num_im -= bk * angle.sin();
             }
 
-            // Denominator: Σ a[k] · e^{-jkω}
+            // Denominator: sum a[k] * e^{-jkw}
             let mut den_re = 0.0;
             let mut den_im = 0.0;
             for (k, &ak) in self.feedback.iter().enumerate() {
@@ -144,38 +151,40 @@ impl AudioNodeProcessor for IIRFilterNode {
                 let idx = frame * channels + ch;
                 let x0 = inputs[idx] as f64;
 
-                // Shift input history
+                // Write input to circular buffer (O(1) instead of O(N) shift)
                 let xh = &mut self.x_history[ch];
-                for i in (1..ff_len).rev() {
-                    xh[i] = xh[i - 1];
-                }
                 if !xh.is_empty() {
-                    xh[0] = x0;
+                    let xpos = self.x_write_pos % ff_len;
+                    xh[xpos] = x0;
                 }
 
-                // Compute output: sum(b[i]*x[i]) - sum(a[i]*y[i]) for i>=1
+                // Compute output: sum(b[i]*x[n-i]) - sum(a[i]*y[n-i]) for i>=1
                 let mut y0 = 0.0;
                 for i in 0..ff_len {
-                    y0 += ff[i] * xh[i];
+                    // x[n-i] is at (write_pos - i) mod ff_len
+                    let ri = (self.x_write_pos + ff_len - i) % ff_len;
+                    y0 += ff[i] * xh[ri];
                 }
                 let yh = &self.y_history[ch];
                 for i in 1..fb_len {
-                    if i < yh.len() {
-                        y0 -= fb[i] * yh[i];
-                    }
+                    // y[n-i] is at (write_pos - i) mod fb_len
+                    let ri = (self.y_write_pos + fb_len - i) % fb_len;
+                    y0 -= fb[i] * yh[ri];
                 }
 
-                // Shift output history
+                // Write output to circular buffer
                 let yh = &mut self.y_history[ch];
-                for i in (1..fb_len).rev() {
-                    yh[i] = yh[i - 1];
-                }
                 if !yh.is_empty() {
-                    yh[0] = y0;
+                    let ypos = self.y_write_pos % fb_len;
+                    yh[ypos] = y0;
                 }
 
                 output[idx] = y0 as f32;
             }
+
+            // Advance circular buffer positions (shared across channels)
+            self.x_write_pos = self.x_write_pos.wrapping_add(1);
+            self.y_write_pos = self.y_write_pos.wrapping_add(1);
         }
 
         frames

@@ -7,7 +7,6 @@ use super::{AudioNodeProcessor, AudioNodeType};
 /// AnalyserNode: provides real-time frequency and time-domain analysis.
 ///
 /// Passes audio through unchanged while capturing samples for FFT analysis.
-/// Uses a simple DFT for now; can be upgraded to use `rustfft` for performance.
 pub struct AnalyserNode {
     id: AudioNodeId,
     fft_size: usize,
@@ -18,11 +17,17 @@ pub struct AnalyserNode {
     time_domain_buffer: Vec<f32>,
     write_pos: usize,
     channels: u32,
+    // --- Cached FFT workspace (avoids allocation per query) ---
+    fft_re: Vec<f64>,
+    fft_im: Vec<f64>,
+    /// Pre-computed Blackman window coefficients (recomputed on fft_size change)
+    window: Vec<f64>,
 }
 
 impl AnalyserNode {
     pub fn new(id: AudioNodeId, channels: u32) -> Self {
         let fft_size = 2048; // Default per spec
+        let window = Self::compute_blackman_window(fft_size);
         Self {
             id,
             fft_size,
@@ -32,6 +37,9 @@ impl AnalyserNode {
             time_domain_buffer: vec![0.0; fft_size],
             write_pos: 0,
             channels,
+            fft_re: vec![0.0; fft_size],
+            fft_im: vec![0.0; fft_size],
+            window,
         }
     }
 
@@ -42,6 +50,10 @@ impl AnalyserNode {
             self.fft_size = size;
             self.time_domain_buffer.resize(size, 0.0);
             self.write_pos = 0;
+            // Resize cached buffers and recompute window
+            self.fft_re.resize(size, 0.0);
+            self.fft_im.resize(size, 0.0);
+            self.window = Self::compute_blackman_window(size);
         }
     }
 
@@ -135,46 +147,53 @@ impl AnalyserNode {
         }
     }
 
-    /// Apply Blackman window to reduce spectral leakage.
-    fn blackman_window(data: &mut [f64]) {
-        let n = data.len();
-        let inv_n = 1.0 / (n - 1) as f64;
+    /// Pre-compute Blackman window coefficients (called once per fft_size change).
+    fn compute_blackman_window(n: usize) -> Vec<f64> {
+        let inv_n = 1.0 / (n - 1).max(1) as f64;
+        (0..n)
+            .map(|i| {
+                0.42 - 0.5 * (std::f64::consts::TAU * i as f64 * inv_n).cos()
+                    + 0.08 * (2.0 * std::f64::consts::TAU * i as f64 * inv_n).cos()
+            })
+            .collect()
+    }
+
+    /// Prepare windowed time-domain data into cached FFT buffers and run FFT.
+    fn run_fft(&mut self) {
+        let buf_len = self.time_domain_buffer.len();
+        let n = self.fft_size;
+
+        // Fill re[] with windowed time-domain data; zero im[]
         for i in 0..n {
-            let w = 0.42 - 0.5 * (std::f64::consts::TAU * i as f64 * inv_n).cos()
-                + 0.08 * (2.0 * std::f64::consts::TAU * i as f64 * inv_n).cos();
-            data[i] *= w;
+            let pos = (self.write_pos + i) % buf_len;
+            self.fft_re[i] = self.time_domain_buffer[pos] as f64 * self.window[i];
+            self.fft_im[i] = 0.0;
         }
+
+        Self::fft(&mut self.fft_re, &mut self.fft_im);
     }
 
     /// Get frequency domain data in bytes (0-255), mapped from dB scale.
-    pub fn get_byte_frequency_data(&self) -> Vec<u8> {
+    pub fn get_byte_frequency_data(&mut self) -> Vec<u8> {
         let freq_bins = self.fft_size / 2;
-        let buf_len = self.time_domain_buffer.len();
 
-        // Prepare windowed time-domain data
-        let mut re = vec![0.0f64; self.fft_size];
-        let mut im = vec![0.0f64; self.fft_size];
-        for i in 0..self.fft_size {
-            let pos = (self.write_pos + i) % buf_len;
-            re[i] = self.time_domain_buffer[pos] as f64;
-        }
-        Self::blackman_window(&mut re);
-
-        Self::fft(&mut re, &mut im);
+        self.run_fft();
 
         let mut result = vec![0u8; freq_bins];
         let min_db = self.min_decibels as f64;
         let max_db = self.max_decibels as f64;
         let range = max_db - min_db;
+        let inv_fft = 1.0 / self.fft_size as f64;
 
         for i in 0..freq_bins {
-            let magnitude = (re[i] * re[i] + im[i] * im[i]).sqrt() / self.fft_size as f64;
+            let magnitude = (self.fft_re[i] * self.fft_re[i] + self.fft_im[i] * self.fft_im[i])
+                .sqrt()
+                * inv_fft;
             let db = if magnitude > 1e-20 {
                 20.0 * magnitude.log10()
             } else {
                 min_db
             };
-            // Map [minDecibels, maxDecibels] → [0, 255]
             let normalized = ((db - min_db) / range).clamp(0.0, 1.0);
             result[i] = (normalized * 255.0) as u8;
         }
@@ -182,25 +201,19 @@ impl AnalyserNode {
     }
 
     /// Get frequency domain data as float dB values.
-    pub fn get_float_frequency_data(&self) -> Vec<f32> {
+    pub fn get_float_frequency_data(&mut self) -> Vec<f32> {
         let freq_bins = self.fft_size / 2;
-        let buf_len = self.time_domain_buffer.len();
 
-        let mut re = vec![0.0f64; self.fft_size];
-        let mut im = vec![0.0f64; self.fft_size];
-        for i in 0..self.fft_size {
-            let pos = (self.write_pos + i) % buf_len;
-            re[i] = self.time_domain_buffer[pos] as f64;
-        }
-        Self::blackman_window(&mut re);
-
-        Self::fft(&mut re, &mut im);
+        self.run_fft();
 
         let mut result = vec![0.0f32; freq_bins];
         let min_db = self.min_decibels as f64;
+        let inv_fft = 1.0 / self.fft_size as f64;
 
         for i in 0..freq_bins {
-            let magnitude = (re[i] * re[i] + im[i] * im[i]).sqrt() / self.fft_size as f64;
+            let magnitude = (self.fft_re[i] * self.fft_re[i] + self.fft_im[i] * self.fft_im[i])
+                .sqrt()
+                * inv_fft;
             let db = if magnitude > 1e-20 {
                 20.0 * magnitude.log10()
             } else {
