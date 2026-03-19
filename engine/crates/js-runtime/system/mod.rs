@@ -226,6 +226,67 @@ pub fn op_open_app_authorize_setting(state: &mut OpState) -> Result<(), JsErrorB
     ))
 }
 
+// ==================== Login ====================
+
+#[op2(fast)]
+pub fn op_login(state: &mut OpState, #[string] options_json: String) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(auth) = services.auth() {
+            return auth.login(&options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("login:fail not supported"))
+}
+
+#[op2(fast)]
+pub fn op_check_session(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(auth) = services.auth() {
+            return auth
+                .check_session(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("checkSession:fail not supported"))
+}
+
+#[op2(fast)]
+pub fn op_get_user_info(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(auth) = services.auth() {
+            return auth
+                .get_user_info(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("getUserInfo:fail not supported"))
+}
+
+#[op2(fast)]
+pub fn op_get_phone_number(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(auth) = services.auth() {
+            return auth
+                .get_phone_number(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("getPhoneNumber:fail not supported"))
+}
+
 // ==================== Window Info ====================
 
 #[op2]
@@ -322,6 +383,10 @@ deno_core::extension!(
         op_stop_beacon_discovery,
         op_get_beacons,
         op_open_app_authorize_setting,
+        op_login,
+        op_check_session,
+        op_get_user_info,
+        op_get_phone_number,
         op_get_window_info,
         op_get_system_settings,
         op_get_device_info,
@@ -340,6 +405,9 @@ deno_core::extension!(
         "08_authorize_setting.js",
         "09_game_log.js",
         "10_system_info.js",
+        "11_open_data_context.js",
+        "12_window_resize.js",
+        "13_login.js",
     ]
 );
 

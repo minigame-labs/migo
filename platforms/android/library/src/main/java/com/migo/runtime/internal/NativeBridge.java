@@ -58,9 +58,10 @@ public final class NativeBridge {
     /**
      * Notify that the session should show (resume rendering).
      *
-     * @param sessionId The session ID
+     * @param sessionId   The session ID
+     * @param optionsJson Launch/enter options JSON (scene/query/referrerInfo/shareTicket)
      */
-    public static native void onShow(int sessionId);
+    public static native void onShow(int sessionId, String optionsJson);
 
     /**
      * Notify that the session should hide (pause rendering).
@@ -418,6 +419,60 @@ public final class NativeBridge {
      * @param resultJson JSON-encoded result with scan data or error
      */
     public static native void onScanCodeResult(int sessionId, String resultJson);
+
+    // ==================== Auth Callbacks ====================
+
+    /**
+     * Callback when login operation completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with requestId/code or error
+     */
+    public static native void onLoginResult(int sessionId, String resultJson);
+
+    /**
+     * Callback when checkSession operation completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with requestId or error
+     */
+    public static native void onCheckSessionResult(int sessionId, String resultJson);
+
+    /**
+     * Callback when getUserInfo operation completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with requestId/userInfo or error
+     */
+    public static native void onGetUserInfoResult(int sessionId, String resultJson);
+
+    /**
+     * Callback when getPhoneNumber operation completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with requestId/code or error
+     */
+    public static native void onGetPhoneNumberResult(int sessionId, String resultJson);
+
+    // ==================== Subpackage Callbacks ====================
+
+    /**
+     * Callback for subpackage download progress.
+     * Called from the host app's download manager.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with requestId, progress, totalBytesWritten, totalBytesExpectedToWrite
+     */
+    public static native void onSubpackageProgress(int sessionId, String resultJson);
+
+    /**
+     * Callback when subpackage download completes (success or failure).
+     * Called from the host app's download manager.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with requestId (and optionally "error" on failure)
+     */
+    public static native void onSubpackageResult(int sessionId, String resultJson);
 
     // ==================== Debug Stats ====================
 

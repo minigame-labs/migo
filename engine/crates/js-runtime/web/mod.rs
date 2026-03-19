@@ -11,7 +11,7 @@ extension!(
     ops = [
         timers::op_now,
         timers::op_now_us,
-        canvas::op_create_canvas,
+        canvas::op_create_offscreen_canvas,
         canvas::op_get_canvas_info,
         canvas::op_resize_canvas,
         canvas::op_destroy_canvas,
@@ -27,10 +27,7 @@ extension!(
     state = |state| {
         let render_tx = state.borrow::<HostOpState>().render_tx.clone();
         state.put(StartTime::default());
-        state.put(CanvasOpState {
-            tx: render_tx,
-            has_onscreen: false,
-        });
+        state.put(CanvasOpState::new(render_tx));
     }
 );
 

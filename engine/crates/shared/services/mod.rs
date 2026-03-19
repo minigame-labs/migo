@@ -9,6 +9,7 @@
 //! - `Err("vibrateShort:fail not supported")` - Feature not supported
 //! - `Err("vibrateShort:fail system error")` - Runtime error
 
+mod auth;
 mod camera;
 mod clipboard;
 mod codec;
@@ -20,8 +21,10 @@ mod interaction;
 mod location;
 mod network;
 mod scan_code;
+mod subpackage;
 mod system_info;
 
+pub use auth::AuthService;
 pub use camera::CameraService;
 pub use clipboard::ClipboardService;
 pub use codec::CodecService;
@@ -37,4 +40,5 @@ pub use interaction::InteractionService;
 pub use location::LocationService;
 pub use network::NetworkService;
 pub use scan_code::ScanCodeService;
+pub use subpackage::SubpackageService;
 pub use system_info::SystemInfoService;

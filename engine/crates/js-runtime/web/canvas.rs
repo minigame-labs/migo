@@ -55,20 +55,13 @@ fn send_canvas_sync<T>(
 }
 
 #[op2(fast)]
-pub fn op_create_canvas(
+pub fn op_create_offscreen_canvas(
     state: &mut OpState,
     #[smi] width: u32,
     #[smi] height: u32,
 ) -> Result<u32, JsErrorBox> {
-    let ctx = state.borrow_mut::<CanvasOpState>();
+    let ctx = state.borrow::<CanvasOpState>();
 
-    // First canvas is onscreen canvas: id == 1
-    if !ctx.has_onscreen {
-        ctx.has_onscreen = true;
-        return Ok(1);
-    }
-
-    // Offscreen canvases are created on render thread.
     send_canvas_sync(
         ctx,
         |resp| {
@@ -78,7 +71,7 @@ pub fn op_create_canvas(
                 resp,
             })
         },
-        "create_canvas timed out",
+        "create_offscreen_canvas timed out",
     )
 }
 
@@ -118,11 +111,10 @@ pub fn op_resize_canvas(
 
 #[op2(fast)]
 pub fn op_destroy_canvas(state: &mut OpState, #[smi] rid: u32) -> Result<(), JsErrorBox> {
-    let ctx = state.borrow_mut::<CanvasOpState>();
+    let ctx = state.borrow::<CanvasOpState>();
 
     // Onscreen canvas (id=1) is not destroyed by render thread; just drop JS-side ownership.
     if rid == 1 {
-        ctx.has_onscreen = false;
         return Ok(());
     }
 

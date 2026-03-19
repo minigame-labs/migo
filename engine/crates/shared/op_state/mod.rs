@@ -101,12 +101,11 @@ impl fmt::Debug for HostOpState {
 #[derive(Debug, Clone)]
 pub struct CanvasOpState {
     pub tx: RenderTx,
-    pub has_onscreen: bool,
 }
 
 impl CanvasOpState {
     #[inline]
-    pub fn new(tx: RenderTx, has_onscreen: bool) -> Self {
-        Self { tx, has_onscreen }
+    pub fn new(tx: RenderTx) -> Self {
+        Self { tx }
     }
 }

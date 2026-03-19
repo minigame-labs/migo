@@ -104,7 +104,11 @@ pub enum HostCommand {
     /// Notify that the app has become visible/active.
     ///
     /// Triggers `migo.onShow` callbacks in the game.
-    OnShow,
+    ///
+    /// `options_json` should be a JSON object string with launch/enter params
+    /// (e.g. scene/query/referrerInfo/shareTicket). If absent or invalid, JS
+    /// will fall back to default launch options.
+    OnShow { options_json: Option<String> },
 
     /// Notify that the app has become hidden/inactive.
     ///

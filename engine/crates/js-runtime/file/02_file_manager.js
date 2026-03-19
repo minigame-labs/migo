@@ -97,6 +97,35 @@ function ensureFd(fd) {
   return n;
 }
 
+const SAVE_FILE_DIR = "/user";
+let _saveFileCounter = 0;
+
+function getPathExtension(path) {
+  if (typeof path !== "string" || path.length === 0) {
+    return "";
+  }
+  const slash = path.lastIndexOf("/");
+  const dot = path.lastIndexOf(".");
+  if (dot <= slash || dot === path.length - 1) {
+    return "";
+  }
+  return path.slice(dot);
+}
+
+function makeSavedFilePath(tempFilePath) {
+  const ts = Date.now().toString(36);
+  const seq = (++_saveFileCounter).toString(36);
+  const ext = getPathExtension(tempFilePath);
+  return `${SAVE_FILE_DIR}/saved_${ts}_${seq}${ext}`;
+}
+
+function resolveSavedFilePath(filePath, tempFilePath) {
+  if (typeof filePath === "string" && filePath.length > 0) {
+    return filePath;
+  }
+  return makeSavedFilePath(tempFilePath);
+}
+
 class BaseFileManager {
   //
   // access
@@ -480,8 +509,48 @@ class BaseFileManager {
   static readCompressedFile() { throw new IOError("readCompressedFile: not implemented"); }
   static readCompressedFileSync() { throw new IOError("readCompressedFileSync: not implemented"); }
   static readZipEntry() { throw new IOError("readZipEntry: not implemented"); }
-  static saveFile() { throw new IOError("saveFile: not implemented"); }
-  static saveFileSync() { throw new IOError("saveFileSync: not implemented"); }
+
+  static saveFile({ tempFilePath, filePath, success, fail, complete }) {
+    if (typeof tempFilePath !== "string" || tempFilePath.length === 0) {
+      const out = { errMsg: "saveFile:fail tempFilePath is required" };
+      fail?.(out);
+      complete?.(out);
+      return;
+    }
+
+    const savedFilePath = resolveSavedFilePath(filePath, tempFilePath);
+    const p = op_rename(tempFilePath, savedFilePath)
+      .catch(async () => {
+        await op_copy_file(tempFilePath, savedFilePath);
+        await op_unlink(tempFilePath);
+      })
+      .then(() => ({ savedFilePath }));
+
+    wrapAsync(p, "saveFile:ok", "saveFile", { success, fail, complete });
+  }
+
+  static saveFileSync({ tempFilePath, filePath }) {
+    if (typeof tempFilePath !== "string" || tempFilePath.length === 0) {
+      throw { errMsg: "saveFileSync:fail tempFilePath is required" };
+    }
+
+    return wrapSync(() => {
+      const savedFilePath = resolveSavedFilePath(filePath, tempFilePath);
+      try {
+        op_rename_sync(tempFilePath, savedFilePath);
+      } catch (_) {
+        op_copy_file_sync(tempFilePath, savedFilePath);
+        op_unlink_sync(tempFilePath);
+      }
+      return { savedFilePath };
+    }, "saveFileSync");
+  }
 }
 
-export { BaseFileManager };
+const fileSystemManager = BaseFileManager;
+
+function getFileSystemManager() {
+  return fileSystemManager;
+}
+
+export { BaseFileManager, getFileSystemManager };

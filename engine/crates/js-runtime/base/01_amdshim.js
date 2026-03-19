@@ -24,8 +24,8 @@ function define(name, deps, factory) {
     name = `__anon_${Date.now()}_${Math.random()}`;
   }
 
-  let exportsObj = {};
   let moduleObj = { exports: {} };
+  let exportsObj = moduleObj.exports;
 
   const resolved = (deps || []).map((dep) => {
     switch (dep) {
@@ -67,7 +67,7 @@ function require(name) {
   // 1. Check AMD module registry
   if (amdModules[name] !== undefined) return amdModules[name];
 
-  // 2. Check require cache (by absolute path, filled after first load)
+  // 2. Check require cache (by name)
   if (requireCache[name] !== undefined) return requireCache[name];
 
   // 3. Load from file system
@@ -77,29 +77,54 @@ function require(name) {
   // Check cache by absolute path (may differ from `name`)
   if (requireCache[absPath] !== undefined) return requireCache[absPath];
 
-  // Execute the module
+  // JSON files are returned as parsed objects (matches Node.js behavior)
+  if (absPath.endsWith(".json")) {
+    const parsed = JSON.parse(code);
+    requireCache[name] = parsed;
+    requireCache[absPath] = parsed;
+    return parsed;
+  }
+
+  // Set up module object; exports starts as the same reference (CJS invariant)
   const moduleObj = { exports: {} };
-  const exportsObj = moduleObj.exports;
+
+  // Pre-cache before execution to handle circular dependencies.
+  // If module B requires module A while A is still executing,
+  // B gets A's partially-filled exports object (Node.js behavior).
+  requireCache[name] = moduleObj.exports;
+  requireCache[absPath] = moduleObj.exports;
 
   _requireDirStack.push(dir);
   try {
-    // Check if it's an AMD module
+    // Check if the loaded code is an AMD module
     if (code.includes("define.amd") || code.includes("typeof define")) {
-      const fn = new Function("define", "require", "module", "exports", code);
-      fn(define, require, moduleObj, exportsObj);
+      // Save/restore _lastDefinedModule to handle nested define() calls
+      const prevDefined = globalThis._lastDefinedModule;
+      const exec = new Function("define", "require", "module", "exports",
+        code + "\n//# sourceURL=" + absPath);
+      exec(define, require, moduleObj, moduleObj.exports);
       const val = globalThis._lastDefinedModule;
+      globalThis._lastDefinedModule = prevDefined;
       requireCache[name] = val;
       requireCache[absPath] = val;
       return val;
     }
 
-    // Regular CJS module
-    const fn = new Function("require", "module", "exports", "__filename", "__dirname", code);
-    fn(require, moduleObj, exportsObj, absPath, dir);
+    // Regular CJS module - sourceURL enables meaningful stack traces
+    const exec = new Function("require", "module", "exports", "__filename", "__dirname",
+      code + "\n//# sourceURL=" + absPath);
+    exec(require, moduleObj, moduleObj.exports, absPath, dir);
+  } catch (e) {
+    // Remove from cache on error so the module can be retried
+    delete requireCache[name];
+    delete requireCache[absPath];
+    throw e;
   } finally {
     _requireDirStack.pop();
   }
 
+  // Update cache: module.exports may have been reassigned
+  // (e.g. `module.exports = MyClass`)
   const result = moduleObj.exports;
   requireCache[name] = result;
   requireCache[absPath] = result;

@@ -64,7 +64,7 @@ const worker = {
     downloadFile: download.downloadFile,
     env: envApi.env,
     getFileSystemManager() {
-        return fileManager.BaseFileManager;
+        return fileManager.getFileSystemManager();
     },
     request: request.request,
     uploadFile: upload.uploadFile,

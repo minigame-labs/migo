@@ -400,8 +400,21 @@ pub(crate) extern "system" fn shutdown<'local>(
     }
 }
 
-pub(crate) extern "system" fn onShow(_env: JNIEnv, _class: JClass, host_id: jint) {
-    let _ = send_command_to_host(host_id, HostCommand::OnShow);
+pub(crate) extern "system" fn onShow<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    options_json: JString<'local>,
+) {
+    let options_json = if options_json.is_null() {
+        None
+    } else {
+        env.get_string(&options_json)
+            .ok()
+            .map(|s| s.to_string_lossy().into_owned())
+    };
+
+    let _ = send_command_to_host(host_id, HostCommand::OnShow { options_json });
 }
 
 pub(crate) extern "system" fn onHide(_env: JNIEnv, _class: JClass, host_id: jint) {
@@ -919,6 +932,112 @@ pub(crate) extern "system" fn onScanCodeResult<'local>(
         .replace('\r', "\\r");
     let cmd = HostCommand::EvalScript {
         source: format!("_internalOnScanCodeResult('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
+// ==================== Auth Callbacks ====================
+
+pub(crate) extern "system" fn onLoginResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
+    let escaped = escape_for_js_string(&json);
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnLoginResult('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
+pub(crate) extern "system" fn onCheckSessionResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
+    let escaped = escape_for_js_string(&json);
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnCheckSessionResult('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
+pub(crate) extern "system" fn onGetUserInfoResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
+    let escaped = escape_for_js_string(&json);
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnGetUserInfoResult('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
+pub(crate) extern "system" fn onGetPhoneNumberResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
+    let escaped = escape_for_js_string(&json);
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnGetPhoneNumberResult('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
+// ==================== Subpackage Callbacks ====================
+
+pub(crate) extern "system" fn onSubpackageProgress<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"requestId":0}"#.to_string());
+    let escaped = escape_for_js_string(&json);
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnSubpackageProgress('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
+pub(crate) extern "system" fn onSubpackageResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"requestId":0,"error":"failed to read result"}"#.to_string());
+    let escaped = escape_for_js_string(&json);
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnSubpackageResult('{}');", escaped),
     };
     let _ = send_command_to_host(host_id, cmd);
 }

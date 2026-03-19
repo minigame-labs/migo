@@ -7,13 +7,15 @@ use crate::android::jni::{
     JAVA_METHOD_CACHE, JavaMethodCache, getConsoleLogs, getDebugStats, init, mod_main,
     onAccelerometerChange, onActionSheetResult, onAudioInterruptionBegin, onAudioInterruptionEnd,
     onBeaconServiceChange, onBeaconUpdate, onBluetoothAdapterStateChange, onBluetoothDeviceFound,
-    onCameraEvent, onCameraFrameData, onChooseImageResult, onChooseMessageFileResult,
-    onCompassChange, onCompressImageResult, onDeviceMotionChange, onDeviceOrientationChange,
-    onFuzzyLocationResult, onGyroscopeChange, onHide, onKeyboardComplete, onKeyboardConfirm,
-    onKeyboardHeightChange, onKeyboardInput, onLocationResult, onMemoryWarning, onModalResult,
+    onCameraEvent, onCameraFrameData, onCheckSessionResult, onChooseImageResult,
+    onChooseMessageFileResult, onCompassChange, onCompressImageResult, onDeviceMotionChange,
+    onDeviceOrientationChange, onFuzzyLocationResult, onGetPhoneNumberResult, onGetUserInfoResult,
+    onGyroscopeChange, onHide, onKeyboardComplete, onKeyboardConfirm, onKeyboardHeightChange,
+    onKeyboardInput, onLocationResult, onLoginResult, onMemoryWarning, onModalResult,
     onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting,
-    onRecorderEvent, onRecorderFrameData, onRestart, onScanCodeResult, onShow, onTouch,
-    onUserCaptureScreen, onVsync, shutdown, updateSurface, version,
+    onRecorderEvent, onRecorderFrameData, onRestart, onScanCodeResult, onShow,
+    onSubpackageProgress, onSubpackageResult, onTouch, onUserCaptureScreen, onVsync, shutdown,
+    updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -51,7 +53,7 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
             },
             NativeMethod {
                 name: "onShow".into(),
-                sig: "(I)V".into(),
+                sig: "(ILjava/lang/String;)V".into(),
                 fn_ptr: onShow as *mut c_void,
             },
             NativeMethod {
@@ -250,6 +252,38 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(ILjava/lang/String;)V".into(),
                 fn_ptr: onScanCodeResult as *mut c_void,
             },
+            // Auth callbacks
+            NativeMethod {
+                name: "onLoginResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onLoginResult as *mut c_void,
+            },
+            NativeMethod {
+                name: "onCheckSessionResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onCheckSessionResult as *mut c_void,
+            },
+            NativeMethod {
+                name: "onGetUserInfoResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onGetUserInfoResult as *mut c_void,
+            },
+            NativeMethod {
+                name: "onGetPhoneNumberResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onGetPhoneNumberResult as *mut c_void,
+            },
+            // Subpackage callbacks
+            NativeMethod {
+                name: "onSubpackageProgress".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onSubpackageProgress as *mut c_void,
+            },
+            NativeMethod {
+                name: "onSubpackageResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onSubpackageResult as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -379,6 +413,13 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("scanCode", "(ILjava/lang/String;)V"),
         // Game Log
         ("gameLogReport", "(ILjava/lang/String;)V"),
+        // Auth
+        ("authLogin", "(ILjava/lang/String;)V"),
+        ("authCheckSession", "(ILjava/lang/String;)V"),
+        ("authGetUserInfo", "(ILjava/lang/String;)V"),
+        ("authGetPhoneNumber", "(ILjava/lang/String;)V"),
+        // Subpackage
+        ("subpackageDownload", "(ILjava/lang/String;)V"),
         // Lifecycle callback
         ("onGameReady", "(I)V"),
         // Error notification callback

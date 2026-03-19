@@ -159,22 +159,11 @@ fn patch_amd(
         let mut patched = code.into_owned();
         patched.push_str("\nexport default globalThis._lastDefinedModule;\n");
         source.code = deno_core::ModuleSourceCode::String(patched.into());
-    } else if is_cjs(&code) {
-        let patched = wrap_cjs(code.into_owned());
+    } else if shared::cjs_compat::is_cjs(&code) {
+        let patched = shared::cjs_compat::wrap_cjs(&code);
         source.code = deno_core::ModuleSourceCode::String(patched.into());
     }
     Ok(source)
-}
-
-fn is_cjs(code: &str) -> bool {
-    (code.contains("require(") || code.contains("module.exports") || code.contains("exports."))
-        && !code.contains("import ") && !code.contains("export ")
-}
-
-fn wrap_cjs(code: String) -> String {
-    format!(
-        "define([\"require\", \"exports\", \"module\"], function(require, exports, module) {{\n{code}\n}});\nexport default globalThis._lastDefinedModule;\n"
-    )
 }
 
 // ---------------------------------------------------------------------------

@@ -5,11 +5,11 @@
 use std::sync::Arc;
 
 use core::services::{
-    AccelerometerService, AudioPlatformService, BatteryService, BluetoothService, CameraService,
-    ClipboardService, CodecService, CompassService, DeviceMotionService, DeviceServices,
-    FileService, GameLogService, GyroscopeService, ImageApiService, InteractionService,
-    KeyboardService, LocationService, NetworkService, RecorderService, ScanCodeService,
-    ScreenService, SystemInfoService, VibrationService,
+    AccelerometerService, AudioPlatformService, AuthService, BatteryService, BluetoothService,
+    CameraService, ClipboardService, CodecService, CompassService, DeviceMotionService,
+    DeviceServices, FileService, GameLogService, GyroscopeService, ImageApiService,
+    InteractionService, KeyboardService, LocationService, NetworkService, RecorderService,
+    ScanCodeService, ScreenService, SubpackageService, SystemInfoService, VibrationService,
 };
 
 use crate::android::jni;
@@ -146,6 +146,18 @@ impl DeviceServices for AndroidDeviceServices {
 
     fn game_log(&self) -> Option<Arc<dyn GameLogService>> {
         Some(Arc::new(AndroidGameLog {
+            host_id: self.host_id,
+        }))
+    }
+
+    fn auth(&self) -> Option<Arc<dyn AuthService>> {
+        Some(Arc::new(AndroidAuth {
+            host_id: self.host_id,
+        }))
+    }
+
+    fn subpackage(&self) -> Option<Arc<dyn SubpackageService>> {
+        Some(Arc::new(AndroidSubpackage {
             host_id: self.host_id,
         }))
     }
@@ -643,5 +655,41 @@ struct AndroidGameLog {
 impl GameLogService for AndroidGameLog {
     fn report_log(&self, log_json: &str) -> Result<(), String> {
         jni::game_log_report(self.host_id, log_json)
+    }
+}
+
+// ==================== Auth ====================
+
+struct AndroidAuth {
+    host_id: i32,
+}
+
+impl AuthService for AndroidAuth {
+    fn login(&self, options_json: &str) -> Result<(), String> {
+        jni::auth_login(self.host_id, options_json)
+    }
+
+    fn check_session(&self, options_json: &str) -> Result<(), String> {
+        jni::auth_check_session(self.host_id, options_json)
+    }
+
+    fn get_user_info(&self, options_json: &str) -> Result<(), String> {
+        jni::auth_get_user_info(self.host_id, options_json)
+    }
+
+    fn get_phone_number(&self, options_json: &str) -> Result<(), String> {
+        jni::auth_get_phone_number(self.host_id, options_json)
+    }
+}
+
+// ==================== Subpackage ====================
+
+struct AndroidSubpackage {
+    host_id: i32,
+}
+
+impl SubpackageService for AndroidSubpackage {
+    fn download_subpackage(&self, options_json: &str) -> Result<(), String> {
+        jni::subpackage_download(self.host_id, options_json)
     }
 }

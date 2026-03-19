@@ -1,7 +1,8 @@
 use std::{rc::Rc, sync::Arc, time::Instant};
 
+use deno_core::serde_json::Value;
 use deno_core::{FsModuleLoader, ModuleLoader};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use shared::{
     config::InitOptions,
@@ -267,7 +268,7 @@ impl Host {
 
             HostCommand::Restart => self.on_restart().await,
 
-            HostCommand::OnShow => {
+            HostCommand::OnShow { options_json } => {
                 // Resume audio thread before notifying JS so the game can
                 // immediately start playing audio in its onShow callback.
                 //
@@ -277,7 +278,30 @@ impl Host {
                 // when UpdateSurface arrives with the new valid surface.
                 self.audio.resume();
 
-                self.js.exec_script("onshow", "_internalTriggerOnShow()")
+                let script = if let Some(options_json) = options_json.as_deref() {
+                    let options_json = options_json.trim();
+                    if options_json.is_empty() {
+                        "_internalTriggerOnShow()".to_string()
+                    } else {
+                        match deno_core::serde_json::from_str::<Value>(options_json) {
+                            Ok(value) if value.is_object() => {
+                                format!("_internalTriggerOnShow({value})")
+                            }
+                            Ok(_) => "_internalTriggerOnShow()".to_string(),
+                            Err(e) => {
+                                warn!(
+                                    "[Host {}] invalid onShow options JSON, fallback to default: {}",
+                                    self.id, e
+                                );
+                                "_internalTriggerOnShow()".to_string()
+                            }
+                        }
+                    }
+                } else {
+                    "_internalTriggerOnShow()".to_string()
+                };
+
+                self.js.exec_script("onshow", &script)
             }
 
             HostCommand::OnHide => {
@@ -525,6 +549,9 @@ impl Host {
         // (e.g., normal orientation change), resume() is a no-op.
         if result.is_ok() {
             self.render.resume();
+            let _ = self
+                .js
+                .exec_script("window_resize", "_internalTriggerWindowResize()");
         }
 
         result

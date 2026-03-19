@@ -1,6 +1,7 @@
 import * as lifecycle from "ext:host_v8_lifecycle/02_restart_exit.js";
 import * as alert from "ext:host_v8_console/01_alert.js";
 import * as url from "ext:host_v8_url/03_url.js";
+import * as subpackage from 'ext:host_v8_base/04_subpackage.js';
 import * as location from "ext:host_v8_web/12_location.js";
 import * as performance from "ext:host_v8_web/12_performance.js";
 import * as raf from "ext:host_v8_webgl/03_raf.js";
@@ -42,6 +43,9 @@ import * as appInfo from 'ext:host_v8_system/07_app_info.js';
 import * as authorizeSetting from 'ext:host_v8_system/08_authorize_setting.js';
 import * as gameLog from 'ext:host_v8_system/09_game_log.js';
 import * as systemInfo from 'ext:host_v8_system/10_system_info.js';
+import * as openDataContext from 'ext:host_v8_system/11_open_data_context.js';
+import * as windowResize from 'ext:host_v8_system/12_window_resize.js';
+import * as loginApi from 'ext:host_v8_system/13_login.js';
 import * as storageApi from 'ext:host_v8_storage/01_storage.js';
 import * as cameraApi from 'ext:host_v8_media/01_camera.js';
 import * as imageApi from 'ext:host_v8_media/02_image_api.js';
@@ -60,6 +64,12 @@ const WindowGlobalScope = {
     requestAnimationFrame: core.propWritable(raf.requestAnimationFrame),
     cancelAnimationFrame: core.propWritable(raf.cancelAnimationFrame),
     setPreferredFramesPerSecond: core.propWritable(raf.setPreferredFramesPerSecond),
+
+    // Subpackage
+    loadSubpackage: core.propNonEnumerable(subpackage.loadSubpackage),
+    preDownloadSubpackage: core.propNonEnumerable(subpackage.preDownloadSubpackage),
+    _internalOnSubpackageProgress: core.propNonEnumerable(subpackage._internalOnSubpackageProgress),
+    _internalOnSubpackageResult: core.propNonEnumerable(subpackage._internalOnSubpackageResult),
 
     WebGLRenderingContext: core.propNonEnumerable(webgl.WebGLRenderingContext),
     WebGL2RenderingContext: core.propNonEnumerable(webgl.WebGL2RenderingContext),
@@ -331,6 +341,16 @@ const WindowGlobalScope = {
     openAppAuthorizeSetting: core.propNonEnumerable(authorize.openAppAuthorizeSetting),
     _internalOnOpenAppAuthorizeSettingFinished: core.propNonEnumerable(authorize._internalOnOpenAppAuthorizeSettingFinished),
 
+    // Login
+    login: core.propNonEnumerable(loginApi.login),
+    checkSession: core.propNonEnumerable(loginApi.checkSession),
+    getUserInfo: core.propNonEnumerable(loginApi.getUserInfo),
+    getPhoneNumber: core.propNonEnumerable(loginApi.getPhoneNumber),
+    _internalOnLoginResult: core.propNonEnumerable(loginApi._internalOnLoginResult),
+    _internalOnCheckSessionResult: core.propNonEnumerable(loginApi._internalOnCheckSessionResult),
+    _internalOnGetUserInfoResult: core.propNonEnumerable(loginApi._internalOnGetUserInfoResult),
+    _internalOnGetPhoneNumberResult: core.propNonEnumerable(loginApi._internalOnGetPhoneNumberResult),
+
     // Window Info
     getWindowInfo: core.propNonEnumerable(windowInfo.getWindowInfo),
 
@@ -353,6 +373,17 @@ const WindowGlobalScope = {
     getSystemInfo: core.propNonEnumerable(systemInfo.getSystemInfo),
     getSystemInfoSync: core.propNonEnumerable(systemInfo.getSystemInfoSync),
     getSystemInfoAsync: core.propNonEnumerable(systemInfo.getSystemInfoAsync),
+
+    // Open Data Context
+    onMessage: core.propNonEnumerable(openDataContext.onMessage),
+    offMessage: core.propNonEnumerable(openDataContext.offMessage),
+    getOpenDataContext: core.propNonEnumerable(openDataContext.getOpenDataContext),
+    getSharedCanvas: core.propNonEnumerable(openDataContext.getSharedCanvas),
+
+    // Window Resize
+    onWindowResize: core.propNonEnumerable(windowResize.onWindowResize),
+    offWindowResize: core.propNonEnumerable(windowResize.offWindowResize),
+    _internalTriggerWindowResize: core.propNonEnumerable(windowResize._internalTriggerWindowResize),
 
     // Game Log
     getGameLogManager: core.propNonEnumerable(gameLog.getGameLogManager),

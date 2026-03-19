@@ -8,7 +8,10 @@ import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
 
+import com.migo.runtime.callback.AuthHandler;
+import com.migo.runtime.callback.GameLogHandler;
 import com.migo.runtime.callback.GameSessionListener;
+import com.migo.runtime.callback.SubpackageHandler;
 import com.migo.runtime.internal.NativeExports;
 import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
@@ -88,6 +91,7 @@ public final class GameSession implements Closeable {
 
     private volatile boolean destroyed = false;
     private volatile boolean gameStarted = false;
+    private volatile boolean showDispatched = false;
 
     private final long creationNanos = System.nanoTime();
     private volatile long startupTimeMs = -1;
@@ -259,6 +263,9 @@ public final class GameSession implements Closeable {
                     "Entry point not found: " + entry.getAbsolutePath());
         }
 
+        // Ensure launch options are available before entry execution.
+        dispatchShowIfNeeded();
+
         // Native layer handles path generation from gameId
         int result = NativeMethods.modMain(sessionId, gameId, entryPoint);
         if (result != 0) {
@@ -303,7 +310,7 @@ public final class GameSession implements Closeable {
                 consoleLogView.stopPolling();
                 consoleLogView.detach();
             }
-            NativeMethods.onHide(sessionId);
+            dispatchHideIfNeeded();
         }
         GameSessionListener l = listener;
         if (l != null) {
@@ -324,7 +331,7 @@ public final class GameSession implements Closeable {
                     tryAttachDebugOverlay();
                 }
             }
-            NativeMethods.onShow(sessionId);
+            dispatchShowIfNeeded();
             // Re-request audio focus in case it was permanently lost (e.g.
             // after a phone call). This ensures onAudioInterruptionEnd fires.
             audioFocusManager.requestFocusIfNeeded();
@@ -467,6 +474,56 @@ public final class GameSession implements Closeable {
     // ==================== Callback ====================
 
     /**
+     * Set or clear the auth handler for this session.
+     * <p>
+     * This handler backs JS-side {@code wx.login()} and {@code wx.checkSession()}.
+     * Call this before {@link #startGame(String)} for best compatibility.
+     *
+     * @param handler host auth handler, or null to clear
+     */
+    public void setAuthHandler(AuthHandler handler) {
+        synchronized (lock) {
+            if (destroyed) return;
+            NativeExports.setAuthHandler(sessionId, handler);
+        }
+    }
+
+    /**
+     * Set or clear the game log handler for this session.
+     * <p>
+     * This handler receives game analytics data reported by JS.
+     * When no handler is set,
+     * log entries are written to Android logcat.
+     *
+     * @param handler host log handler, or null to revert to logcat default
+     */
+    public void setGameLogHandler(GameLogHandler handler) {
+        synchronized (lock) {
+            if (destroyed) return;
+            NativeExports.setGameLogHandler(sessionId, handler);
+        }
+    }
+
+    /**
+     * Set or clear the subpackage download handler for this session.
+     * <p>
+     * This handler backs JS-side {@code loadSubpackage()} and
+     * {@code preDownloadSubpackage()} when local files are not available.
+     * When no handler is set, download requests fail and {@code loadSubpackage()}
+     * falls back to executing local files if present.
+     * <p>
+     * Call this before {@link #startGame(String)} for best compatibility.
+     *
+     * @param handler host download handler, or null to clear
+     */
+    public void setSubpackageHandler(SubpackageHandler handler) {
+        synchronized (lock) {
+            if (destroyed) return;
+            NativeExports.setSubpackageHandler(sessionId, handler);
+        }
+    }
+
+    /**
      * Set the listener for session events.
      *
      * @param listener The listener, or null to remove
@@ -576,6 +633,20 @@ public final class GameSession implements Closeable {
             consoleLogView.attachButton(decor);
         }
         debugOverlayAttached = true;
+    }
+
+    private void dispatchShowIfNeeded() {
+        if (!showDispatched) {
+            NativeMethods.onShow(sessionId);
+            showDispatched = true;
+        }
+    }
+
+    private void dispatchHideIfNeeded() {
+        if (showDispatched) {
+            NativeMethods.onHide(sessionId);
+            showDispatched = false;
+        }
     }
 
     private void ensureNotDestroyed() {

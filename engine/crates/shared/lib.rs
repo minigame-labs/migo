@@ -40,6 +40,7 @@
 //! processing across specialized threads (main, render, audio, IO).
 
 pub mod channel;
+pub mod cjs_compat;
 pub mod codec;
 pub mod config;
 pub mod console_log;

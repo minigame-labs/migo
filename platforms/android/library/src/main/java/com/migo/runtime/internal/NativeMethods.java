@@ -1,11 +1,17 @@
 package com.migo.runtime.internal;
 
+import android.app.Activity;
+import android.content.Intent;
+import android.net.Uri;
 import android.view.Surface;
 
 import com.migo.runtime.RuntimeConfig;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+
+import org.json.JSONException;
+import org.json.JSONObject;
 
 /**
  * High-level wrapper around native JNI methods.
@@ -27,6 +33,17 @@ public final class NativeMethods {
      * Maximum number of simultaneous touch points supported.
      */
     private static final int MAX_TOUCH_POINTS = 10;
+
+    private static final int DEFAULT_LAUNCH_SCENE = 1001;
+
+    private static final String EXTRA_LAUNCH_OPTIONS_JSON = "migo_launch_options_json";
+    private static final String EXTRA_SCENE = "migo_scene";
+    private static final String EXTRA_QUERY = "migo_query";
+    private static final String EXTRA_QUERY_JSON = "migo_query_json";
+    private static final String EXTRA_SHARE_TICKET = "migo_share_ticket";
+    private static final String EXTRA_REFERRER_APP_ID = "migo_referrer_app_id";
+    private static final String EXTRA_REFERRER_CHAT_TYPE = "migo_referrer_chat_type";
+    private static final String EXTRA_REFERRER_EXTRA_DATA_JSON = "migo_referrer_extra_data";
 
     /**
      * Thread-local ByteBuffer for touch events to avoid allocation per event.
@@ -110,7 +127,181 @@ public final class NativeMethods {
      */
     public static void onShow(int sessionId) {
         if (sessionId >= 0) {
-            NativeBridge.onShow(sessionId);
+            NativeBridge.onShow(sessionId, buildLaunchOptionsJson(sessionId));
+        }
+    }
+
+    private static String buildLaunchOptionsJson(int sessionId) {
+        try {
+            RuntimeContext runtimeContext = RuntimeRegistry.get(sessionId);
+            Activity activity = runtimeContext != null ? runtimeContext.getActivity() : null;
+            Intent intent = activity != null ? activity.getIntent() : null;
+
+            JSONObject launchOptions = createDefaultLaunchOptions();
+            if (intent == null) {
+                return launchOptions.toString();
+            }
+
+            String launchOptionsJson = intent.getStringExtra(EXTRA_LAUNCH_OPTIONS_JSON);
+            if (launchOptionsJson != null && !launchOptionsJson.trim().isEmpty()) {
+                try {
+                    JSONObject parsed = new JSONObject(launchOptionsJson);
+                    return parsed.toString();
+                } catch (JSONException ignored) {
+                }
+            }
+
+            launchOptions.put("scene", readScene(intent));
+            launchOptions.put("query", readQuery(intent));
+            launchOptions.put("shareTicket", readStringExtra(intent, EXTRA_SHARE_TICKET));
+            launchOptions.put("referrerInfo", readReferrerInfo(intent));
+            return launchOptions.toString();
+        } catch (Exception ignored) {
+            return createDefaultLaunchOptions().toString();
+        }
+    }
+
+    private static JSONObject createDefaultLaunchOptions() {
+        JSONObject options = new JSONObject();
+        try {
+            options.put("scene", DEFAULT_LAUNCH_SCENE);
+            options.put("query", new JSONObject());
+            options.put("shareTicket", "");
+            JSONObject referrerInfo = new JSONObject();
+            referrerInfo.put("appId", "");
+            referrerInfo.put("extraData", new JSONObject());
+            referrerInfo.put("chatType", 0);
+            options.put("referrerInfo", referrerInfo);
+        } catch (JSONException ignored) {
+        }
+        return options;
+    }
+
+    private static int readScene(Intent intent) {
+        int numeric = intent.getIntExtra(EXTRA_SCENE, Integer.MIN_VALUE);
+        if (numeric != Integer.MIN_VALUE) {
+            return numeric;
+        }
+
+        String text = intent.getStringExtra(EXTRA_SCENE);
+        if (text != null) {
+            try {
+                return Integer.parseInt(text.trim());
+            } catch (NumberFormatException ignored) {
+            }
+        }
+
+        return DEFAULT_LAUNCH_SCENE;
+    }
+
+    private static JSONObject readQuery(Intent intent) {
+        JSONObject query = new JSONObject();
+
+        String queryJson = intent.getStringExtra(EXTRA_QUERY_JSON);
+        if (queryJson != null && !queryJson.trim().isEmpty()) {
+            try {
+                JSONObject parsed = new JSONObject(queryJson);
+                mergeJsonObject(query, parsed);
+            } catch (JSONException ignored) {
+            }
+        }
+
+        appendQueryString(query, intent.getStringExtra(EXTRA_QUERY));
+
+        Uri data = intent.getData();
+        if (data != null) {
+            appendQueryString(query, data.getQuery());
+        }
+
+        return query;
+    }
+
+    private static JSONObject readReferrerInfo(Intent intent) {
+        JSONObject referrerInfo = new JSONObject();
+        try {
+            referrerInfo.put("appId", readStringExtra(intent, EXTRA_REFERRER_APP_ID));
+
+            JSONObject extraData = new JSONObject();
+            String extraDataJson = intent.getStringExtra(EXTRA_REFERRER_EXTRA_DATA_JSON);
+            if (extraDataJson != null && !extraDataJson.trim().isEmpty()) {
+                try {
+                    JSONObject parsed = new JSONObject(extraDataJson);
+                    mergeJsonObject(extraData, parsed);
+                } catch (JSONException ignored) {
+                }
+            }
+            referrerInfo.put("extraData", extraData);
+
+            int chatType = intent.getIntExtra(EXTRA_REFERRER_CHAT_TYPE, Integer.MIN_VALUE);
+            if (chatType == Integer.MIN_VALUE) {
+                String chatTypeText = intent.getStringExtra(EXTRA_REFERRER_CHAT_TYPE);
+                if (chatTypeText != null) {
+                    try {
+                        chatType = Integer.parseInt(chatTypeText.trim());
+                    } catch (NumberFormatException ignored) {
+                        chatType = 0;
+                    }
+                } else {
+                    chatType = 0;
+                }
+            }
+            referrerInfo.put("chatType", chatType);
+        } catch (JSONException ignored) {
+        }
+
+        return referrerInfo;
+    }
+
+    private static String readStringExtra(Intent intent, String key) {
+        String value = intent.getStringExtra(key);
+        return value != null ? value : "";
+    }
+
+    private static void appendQueryString(JSONObject target, String rawQuery) {
+        if (rawQuery == null || rawQuery.isEmpty()) {
+            return;
+        }
+
+        String query = rawQuery.startsWith("?") ? rawQuery.substring(1) : rawQuery;
+        if (query.isEmpty()) {
+            return;
+        }
+
+        String[] pairs = query.split("&");
+        for (String pair : pairs) {
+            if (pair == null || pair.isEmpty()) {
+                continue;
+            }
+
+            int index = pair.indexOf('=');
+            String keyRaw = index >= 0 ? pair.substring(0, index) : pair;
+            String valueRaw = index >= 0 ? pair.substring(index + 1) : "";
+
+            String key = Uri.decode(keyRaw);
+            if (key == null || key.isEmpty()) {
+                continue;
+            }
+
+            String value = Uri.decode(valueRaw);
+            try {
+                target.put(key, value != null ? value : "");
+            } catch (JSONException ignored) {
+            }
+        }
+    }
+
+    private static void mergeJsonObject(JSONObject target, JSONObject source) {
+        if (target == null || source == null) {
+            return;
+        }
+
+        java.util.Iterator<String> keys = source.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            try {
+                target.put(key, source.opt(key));
+            } catch (JSONException ignored) {
+            }
         }
     }
 
@@ -614,6 +805,88 @@ public final class NativeMethods {
     public static void onScanCodeResult(int sessionId, String resultJson) {
         if (sessionId >= 0 && resultJson != null) {
             NativeBridge.onScanCodeResult(sessionId, resultJson);
+        }
+    }
+
+    // ==================== Auth Callbacks ====================
+
+    /**
+     * Callback for login result.
+     * Called from {@link com.migo.runtime.internal.NativeExports#authLogin(int, String)}.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON: {"requestId":N,"code":"..."} or {"requestId":N,"error":"reason"}
+     */
+    public static void onLoginResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onLoginResult(sessionId, resultJson);
+        }
+    }
+
+    /**
+     * Callback for checkSession result.
+     * Called from {@link com.migo.runtime.internal.NativeExports#authCheckSession(int, String)}.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON: {"requestId":N} or {"requestId":N,"error":"reason"}
+     */
+    public static void onCheckSessionResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onCheckSessionResult(sessionId, resultJson);
+        }
+    }
+
+    /**
+     * Callback for getUserInfo result.
+     * Called from {@link com.migo.runtime.internal.NativeExports#authGetUserInfo(int, String)}.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON: {"requestId":N,"userInfo":{...}} or {"requestId":N,"error":"reason"}
+     */
+    public static void onGetUserInfoResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onGetUserInfoResult(sessionId, resultJson);
+        }
+    }
+
+    /**
+     * Callback for getPhoneNumber result.
+     * Called from {@link com.migo.runtime.internal.NativeExports#authGetPhoneNumber(int, String)}.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON: {"requestId":N,"code":"..."} or {"requestId":N,"error":"reason"}
+     */
+    public static void onGetPhoneNumberResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onGetPhoneNumberResult(sessionId, resultJson);
+        }
+    }
+
+    // ==================== Subpackage Callbacks ====================
+
+    /**
+     * Callback for subpackage download progress.
+     * Called from the host app's download implementation.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON: {"requestId":N,"progress":50,"totalBytesWritten":1024,"totalBytesExpectedToWrite":2048}
+     */
+    public static void onSubpackageProgress(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onSubpackageProgress(sessionId, resultJson);
+        }
+    }
+
+    /**
+     * Callback when subpackage download completes.
+     * Called from the host app's download implementation.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON: {"requestId":N} on success, {"requestId":N,"error":"reason"} on failure
+     */
+    public static void onSubpackageResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onSubpackageResult(sessionId, resultJson);
         }
     }
 

@@ -25,7 +25,9 @@ import com.migo.runtime.internal.platform.ImageApiManager;
 import com.migo.runtime.internal.platform.LocationProvider;
 import com.migo.runtime.internal.platform.ScanCodeManager;
 import com.migo.runtime.internal.platform.ScreenCaptureObserver;
-import com.migo.runtime.internal.platform.GameLogManager;
+import com.migo.runtime.callback.AuthHandler;
+import com.migo.runtime.callback.GameLogHandler;
+import com.migo.runtime.callback.SubpackageHandler;
 
 import com.migo.runtime.GameSession;
 
@@ -64,7 +66,6 @@ public final class NativeExports {
     private static final Object sBluetoothLock = new Object();
     private static final Object sImageApiLock = new Object();
     private static final Object sScanCodeLock = new Object();
-    private static final Object sGameLogLock = new Object();
 
     /** Per-session device sensor managers. */
     private static final ConcurrentHashMap<Integer, DeviceSensorManager> sSensorManagers =
@@ -84,6 +85,18 @@ public final class NativeExports {
 
     /** Per-session GameSession references for lifecycle callbacks. */
     private static final ConcurrentHashMap<Integer, GameSession> sSessions =
+            new ConcurrentHashMap<>();
+
+    /** Per-session auth handlers set via GameSession API. */
+    private static final ConcurrentHashMap<Integer, AuthHandler> sAuthHandlers =
+            new ConcurrentHashMap<>();
+
+    /** Per-session game log handlers set via GameSession API. */
+    private static final ConcurrentHashMap<Integer, GameLogHandler> sGameLogHandlers =
+            new ConcurrentHashMap<>();
+
+    /** Per-session subpackage handlers set via GameSession API. */
+    private static final ConcurrentHashMap<Integer, SubpackageHandler> sSubpackageHandlers =
             new ConcurrentHashMap<>();
 
     /** Handler for dispatching callbacks to the main thread. */
@@ -1864,41 +1877,522 @@ public final class NativeExports {
 
     // ==================== Game Log ====================
 
-    /** Per-session Game Log managers. */
-    private static final ConcurrentHashMap<Integer, GameLogManager> sGameLogManagers =
-            new ConcurrentHashMap<>();
+    private static final String GAME_LOG_TAG = "MigoGameLog";
 
-    private static GameLogManager getOrCreateGameLogManager(int sessionId) {
-        GameLogManager existing = sGameLogManagers.get(sessionId);
-        if (existing != null) return existing;
-        synchronized (sGameLogLock) {
-            existing = sGameLogManagers.get(sessionId);
-            if (existing != null) return existing;
-            GameLogManager mgr = new GameLogManager(sessionId);
-            sGameLogManagers.put(sessionId, mgr);
-            return mgr;
+    /**
+     * Set or clear the game log handler for a session.
+     *
+     * @hide Called by {@link com.migo.runtime.GameSession#setGameLogHandler(GameLogHandler)}.
+     */
+    public static void setGameLogHandler(int sessionId, GameLogHandler handler) {
+        if (handler == null) {
+            sGameLogHandlers.remove(sessionId);
+        } else {
+            sGameLogHandlers.put(sessionId, handler);
+        }
+    }
+
+    public static void gameLogReport(int sessionId, String logJson) {
+        GameLogHandler h = sGameLogHandlers.get(sessionId);
+        if (h != null) {
+            h.onLog(logJson);
+        } else {
+            android.util.Log.d(GAME_LOG_TAG, "[session=" + sessionId + "] " + logJson);
+        }
+    }
+
+    private static void clearGameLogHandler(int sessionId) {
+        sGameLogHandlers.remove(sessionId);
+    }
+
+    // ==================== Auth ====================
+
+    /**
+     * Set or clear auth handler for a session.
+     *
+     * @hide Called by {@link com.migo.runtime.GameSession#setAuthHandler(AuthHandler)}.
+     */
+    public static void setAuthHandler(int sessionId, AuthHandler handler) {
+        if (handler == null) {
+            sAuthHandlers.remove(sessionId);
+        } else {
+            sAuthHandlers.put(sessionId, handler);
+        }
+    }
+
+    private static void clearAuthHandler(int sessionId) {
+        sAuthHandlers.remove(sessionId);
+    }
+
+    private static JSONObject parseAuthOptions(String optionsJson) {
+        if (optionsJson == null || optionsJson.isEmpty()) {
+            return new JSONObject();
+        }
+        try {
+            return new JSONObject(optionsJson);
+        } catch (Exception ignored) {
+            return new JSONObject();
+        }
+    }
+
+    private static int parseAuthRequestId(JSONObject options) {
+        return options != null ? options.optInt("requestId", 0) : 0;
+    }
+
+    private static int parseAuthTimeout(JSONObject options) {
+        return options != null ? options.optInt("timeout", 0) : 0;
+    }
+
+    private static boolean parseAuthBoolean(JSONObject options, String key, boolean defaultValue) {
+        return options != null ? options.optBoolean(key, defaultValue) : defaultValue;
+    }
+
+    private static String parseAuthLang(JSONObject options) {
+        String lang = options != null ? options.optString("lang", "en") : "en";
+        if ("zh_CN".equals(lang) || "zh_TW".equals(lang) || "en".equals(lang)) {
+            return lang;
+        }
+        return "en";
+    }
+
+    private static String normalizeAuthError(String reason) {
+        if (reason == null) {
+            return "unknown error";
+        }
+        String trimmed = reason.trim();
+        return trimmed.isEmpty() ? "unknown error" : trimmed;
+    }
+
+    private static void reportLoginSuccess(int sessionId, int requestId, String code) {
+        try {
+            JSONObject res = new JSONObject();
+            res.put("requestId", requestId);
+            res.put("code", code);
+            NativeMethods.onLoginResult(sessionId, res.toString());
+        } catch (JSONException ignored) {
+            NativeMethods.onLoginResult(sessionId,
+                    "{\"requestId\":" + requestId + ",\"error\":\"internal error\"}");
+        }
+    }
+
+    private static void reportLoginFail(int sessionId, int requestId, String reason) {
+        try {
+            JSONObject res = new JSONObject();
+            res.put("requestId", requestId);
+            res.put("error", normalizeAuthError(reason));
+            NativeMethods.onLoginResult(sessionId, res.toString());
+        } catch (JSONException ignored) {
+            NativeMethods.onLoginResult(sessionId,
+                    "{\"requestId\":" + requestId + ",\"error\":\"internal error\"}");
+        }
+    }
+
+    private static void reportCheckSessionSuccess(int sessionId, int requestId) {
+        NativeMethods.onCheckSessionResult(sessionId,
+                "{\"requestId\":" + requestId + "}");
+    }
+
+    private static void reportCheckSessionFail(int sessionId, int requestId, String reason) {
+        try {
+            JSONObject res = new JSONObject();
+            res.put("requestId", requestId);
+            res.put("error", normalizeAuthError(reason));
+            NativeMethods.onCheckSessionResult(sessionId, res.toString());
+        } catch (JSONException ignored) {
+            NativeMethods.onCheckSessionResult(sessionId,
+                    "{\"requestId\":" + requestId + ",\"error\":\"internal error\"}");
+        }
+    }
+
+    private static void reportGetUserInfoSuccess(
+            int sessionId,
+            int requestId,
+            AuthHandler.UserInfoResult payload,
+            boolean withCredentials,
+            String lang
+    ) {
+        try {
+            JSONObject res = new JSONObject();
+            res.put("requestId", requestId);
+
+            AuthHandler.UserInfoResult source = payload != null ? payload : new AuthHandler.UserInfoResult();
+            AuthHandler.UserInfo userInfo = source.userInfo != null ? source.userInfo : new AuthHandler.UserInfo();
+
+            JSONObject user = new JSONObject();
+            user.put("nickName", userInfo.nickName != null ? userInfo.nickName : "");
+            user.put("avatarUrl", userInfo.avatarUrl != null ? userInfo.avatarUrl : "");
+            user.put("gender", userInfo.gender);
+            user.put("country", userInfo.country != null ? userInfo.country : "");
+            user.put("province", userInfo.province != null ? userInfo.province : "");
+            user.put("city", userInfo.city != null ? userInfo.city : "");
+            user.put("language", userInfo.language != null ? userInfo.language : lang);
+            res.put("userInfo", user);
+
+            if (source.rawData != null && !source.rawData.isEmpty()) {
+                res.put("rawData", source.rawData);
+            }
+            if (source.signature != null && !source.signature.isEmpty()) {
+                res.put("signature", source.signature);
+            }
+            if (withCredentials) {
+                if (source.encryptedData != null && !source.encryptedData.isEmpty()) {
+                    res.put("encryptedData", source.encryptedData);
+                }
+                if (source.iv != null && !source.iv.isEmpty()) {
+                    res.put("iv", source.iv);
+                }
+            }
+            if (source.cloudID != null && !source.cloudID.isEmpty()) {
+                res.put("cloudID", source.cloudID);
+            }
+
+            NativeMethods.onGetUserInfoResult(sessionId, res.toString());
+        } catch (JSONException ignored) {
+            NativeMethods.onGetUserInfoResult(sessionId,
+                    "{\"requestId\":" + requestId + ",\"error\":\"internal error\"}");
+        }
+    }
+
+    private static void reportGetUserInfoFail(int sessionId, int requestId, String reason) {
+        try {
+            JSONObject res = new JSONObject();
+            res.put("requestId", requestId);
+            res.put("error", normalizeAuthError(reason));
+            NativeMethods.onGetUserInfoResult(sessionId, res.toString());
+        } catch (JSONException ignored) {
+            NativeMethods.onGetUserInfoResult(sessionId,
+                    "{\"requestId\":" + requestId + ",\"error\":\"internal error\"}");
+        }
+    }
+
+    private static void reportGetPhoneNumberSuccess(int sessionId, int requestId, String code) {
+        try {
+            JSONObject res = new JSONObject();
+            res.put("requestId", requestId);
+            res.put("code", code);
+            NativeMethods.onGetPhoneNumberResult(sessionId, res.toString());
+        } catch (JSONException ignored) {
+            NativeMethods.onGetPhoneNumberResult(sessionId,
+                    "{\"requestId\":" + requestId + ",\"error\":\"internal error\"}");
+        }
+    }
+
+    private static void reportGetPhoneNumberFail(int sessionId, int requestId, String reason, Integer errno) {
+        try {
+            JSONObject res = new JSONObject();
+            res.put("requestId", requestId);
+            res.put("error", normalizeAuthError(reason));
+            if (errno != null) {
+                res.put("errno", errno.intValue());
+            }
+            NativeMethods.onGetPhoneNumberResult(sessionId, res.toString());
+        } catch (JSONException ignored) {
+            NativeMethods.onGetPhoneNumberResult(sessionId,
+                    "{\"requestId\":" + requestId + ",\"error\":\"internal error\"}");
         }
     }
 
     /**
-     * Get the GameLogManager for a session, allowing host apps to set a custom handler.
+     * Trigger host-side login.
      *
-     * @param sessionId the session ID
-     * @return the GameLogManager instance, or null if not yet created
+     * @param sessionId   The session ID
+     * @param optionsJson JSON: {"requestId":N,"timeout":ms}
      */
-    public static GameLogManager getGameLogManager(int sessionId) {
-        return getOrCreateGameLogManager(sessionId);
+    public static void authLogin(int sessionId, String optionsJson) {
+        JSONObject options = parseAuthOptions(optionsJson);
+        int requestId = parseAuthRequestId(options);
+        int timeout = parseAuthTimeout(options);
+
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) {
+            clearAuthHandler(sessionId);
+            reportLoginFail(sessionId, requestId, "invalid session");
+            return;
+        }
+
+        AuthHandler handler = sAuthHandlers.get(sessionId);
+        if (handler == null) {
+            reportLoginFail(sessionId, requestId, "no auth handler");
+            return;
+        }
+
+        final java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        try {
+            handler.login(timeout, new AuthHandler.LoginCallback() {
+                @Override
+                public void onSuccess(String code) {
+                    if (!done.compareAndSet(false, true)) {
+                        return;
+                    }
+                    if (code == null || code.isEmpty()) {
+                        reportLoginFail(sessionId, requestId, "invalid code");
+                        return;
+                    }
+                    reportLoginSuccess(sessionId, requestId, code);
+                }
+
+                @Override
+                public void onFailure(String reason) {
+                    if (!done.compareAndSet(false, true)) {
+                        return;
+                    }
+                    reportLoginFail(sessionId, requestId, reason);
+                }
+            });
+        } catch (Exception e) {
+            if (done.compareAndSet(false, true)) {
+                reportLoginFail(sessionId, requestId,
+                        e.getMessage() != null ? e.getMessage() : "unknown error");
+            }
+        }
     }
 
-    public static void gameLogReport(int sessionId, String logJson) {
-        GameLogManager mgr = getOrCreateGameLogManager(sessionId);
-        mgr.reportLog(logJson);
+    /**
+     * Trigger host-side checkSession.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON: {"requestId":N}
+     */
+    public static void authCheckSession(int sessionId, String optionsJson) {
+        JSONObject options = parseAuthOptions(optionsJson);
+        int requestId = parseAuthRequestId(options);
+
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) {
+            clearAuthHandler(sessionId);
+            reportCheckSessionFail(sessionId, requestId, "invalid session");
+            return;
+        }
+
+        AuthHandler handler = sAuthHandlers.get(sessionId);
+        if (handler == null) {
+            reportCheckSessionFail(sessionId, requestId, "no auth handler");
+            return;
+        }
+
+        final java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        try {
+            handler.checkSession(new AuthHandler.CheckSessionCallback() {
+                @Override
+                public void onSuccess() {
+                    if (!done.compareAndSet(false, true)) {
+                        return;
+                    }
+                    reportCheckSessionSuccess(sessionId, requestId);
+                }
+
+                @Override
+                public void onFailure(String reason) {
+                    if (!done.compareAndSet(false, true)) {
+                        return;
+                    }
+                    reportCheckSessionFail(sessionId, requestId, reason);
+                }
+            });
+        } catch (Exception e) {
+            if (done.compareAndSet(false, true)) {
+                reportCheckSessionFail(sessionId, requestId,
+                        e.getMessage() != null ? e.getMessage() : "unknown error");
+            }
+        }
     }
 
-    public static void destroyGameLogManager(int sessionId) {
-        GameLogManager mgr = sGameLogManagers.remove(sessionId);
-        if (mgr != null) {
-            mgr.destroy();
+    /**
+     * Trigger host-side getUserInfo.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON: {"requestId":N,"withCredentials":bool,"lang":"en|zh_CN|zh_TW"}
+     */
+    public static void authGetUserInfo(int sessionId, String optionsJson) {
+        JSONObject options = parseAuthOptions(optionsJson);
+        int requestId = parseAuthRequestId(options);
+        boolean withCredentials = parseAuthBoolean(options, "withCredentials", false);
+        String lang = parseAuthLang(options);
+
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) {
+            clearAuthHandler(sessionId);
+            reportGetUserInfoFail(sessionId, requestId, "invalid session");
+            return;
+        }
+
+        AuthHandler handler = sAuthHandlers.get(sessionId);
+        if (handler == null) {
+            reportGetUserInfoFail(sessionId, requestId, "no auth handler");
+            return;
+        }
+
+        final java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        try {
+            handler.getUserInfo(withCredentials, lang, new AuthHandler.UserInfoCallback() {
+                @Override
+                public void onSuccess(AuthHandler.UserInfoResult result) {
+                    if (!done.compareAndSet(false, true)) {
+                        return;
+                    }
+                    reportGetUserInfoSuccess(sessionId, requestId, result, withCredentials, lang);
+                }
+
+                @Override
+                public void onFailure(String reason) {
+                    if (!done.compareAndSet(false, true)) {
+                        return;
+                    }
+                    reportGetUserInfoFail(sessionId, requestId, reason);
+                }
+            });
+        } catch (Exception e) {
+            if (done.compareAndSet(false, true)) {
+                reportGetUserInfoFail(sessionId, requestId,
+                        e.getMessage() != null ? e.getMessage() : "unknown error");
+            }
+        }
+    }
+
+    /**
+     * Trigger host-side getPhoneNumber.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON: {"requestId":N,"isRealtime":bool,"phoneNumberNoQuotaToast":bool}
+     */
+    public static void authGetPhoneNumber(int sessionId, String optionsJson) {
+        JSONObject options = parseAuthOptions(optionsJson);
+        int requestId = parseAuthRequestId(options);
+        boolean isRealtime = parseAuthBoolean(options, "isRealtime", false);
+        boolean phoneNumberNoQuotaToast = parseAuthBoolean(options, "phoneNumberNoQuotaToast", true);
+
+        RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+        if (ctx == null) {
+            clearAuthHandler(sessionId);
+            reportGetPhoneNumberFail(sessionId, requestId, "invalid session", null);
+            return;
+        }
+
+        AuthHandler handler = sAuthHandlers.get(sessionId);
+        if (handler == null) {
+            reportGetPhoneNumberFail(sessionId, requestId, "no auth handler", null);
+            return;
+        }
+
+        final java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        try {
+            handler.getPhoneNumber(isRealtime, phoneNumberNoQuotaToast, new AuthHandler.PhoneNumberCallback() {
+                @Override
+                public void onSuccess(String code) {
+                    if (!done.compareAndSet(false, true)) {
+                        return;
+                    }
+                    if (code == null || code.isEmpty()) {
+                        reportGetPhoneNumberFail(sessionId, requestId, "invalid code", null);
+                        return;
+                    }
+                    reportGetPhoneNumberSuccess(sessionId, requestId, code);
+                }
+
+                @Override
+                public void onFailure(String reason, Integer errno) {
+                    if (!done.compareAndSet(false, true)) {
+                        return;
+                    }
+                    reportGetPhoneNumberFail(sessionId, requestId, reason, errno);
+                }
+            });
+        } catch (Exception e) {
+            if (done.compareAndSet(false, true)) {
+                reportGetPhoneNumberFail(sessionId, requestId,
+                        e.getMessage() != null ? e.getMessage() : "unknown error", null);
+            }
+        }
+    }
+
+    // ==================== Subpackage ====================
+
+    /**
+     * Set or clear the subpackage download handler for a session.
+     *
+     * @hide Called by {@link com.migo.runtime.GameSession#setSubpackageHandler(SubpackageHandler)}.
+     */
+    public static void setSubpackageHandler(int sessionId, SubpackageHandler handler) {
+        if (handler == null) {
+            sSubpackageHandlers.remove(sessionId);
+        } else {
+            sSubpackageHandlers.put(sessionId, handler);
+        }
+    }
+
+    private static void clearSubpackageHandler(int sessionId) {
+        sSubpackageHandlers.remove(sessionId);
+    }
+
+    /**
+     * Trigger a subpackage download.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON: {"requestId":N,"name":"stage1","root":"subpackages/stage1"}
+     */
+    public static void subpackageDownload(int sessionId, String optionsJson) {
+        JSONObject options = parseAuthOptions(optionsJson);
+        int requestId = parseAuthRequestId(options);
+        String name = options.optString("name", "");
+        String root = options.optString("root", "");
+
+        SubpackageHandler handler = sSubpackageHandlers.get(sessionId);
+        if (handler == null) {
+            NativeMethods.onSubpackageResult(sessionId,
+                    "{\"requestId\":" + requestId + ",\"error\":\"no subpackage handler\"}");
+            return;
+        }
+
+        final java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        try {
+            handler.download(
+                    new SubpackageHandler.SubpackageRequest(name, root),
+                    new SubpackageHandler.DownloadCallback() {
+                        @Override
+                        public void onProgress(int progress, long totalBytesWritten, long totalBytesExpectedToWrite) {
+                            try {
+                                JSONObject res = new JSONObject();
+                                res.put("requestId", requestId);
+                                res.put("progress", progress);
+                                res.put("totalBytesWritten", totalBytesWritten);
+                                res.put("totalBytesExpectedToWrite", totalBytesExpectedToWrite);
+                                NativeMethods.onSubpackageProgress(sessionId, res.toString());
+                            } catch (JSONException ignored) {
+                            }
+                        }
+
+                        @Override
+                        public void onSuccess() {
+                            if (!done.compareAndSet(false, true)) return;
+                            NativeMethods.onSubpackageResult(sessionId,
+                                    "{\"requestId\":" + requestId + "}");
+                        }
+
+                        @Override
+                        public void onFailure(String reason) {
+                            if (!done.compareAndSet(false, true)) return;
+                            try {
+                                JSONObject res = new JSONObject();
+                                res.put("requestId", requestId);
+                                res.put("error", reason != null ? reason : "download failed");
+                                NativeMethods.onSubpackageResult(sessionId, res.toString());
+                            } catch (JSONException ignored) {
+                                NativeMethods.onSubpackageResult(sessionId,
+                                        "{\"requestId\":" + requestId + ",\"error\":\"download failed\"}");
+                            }
+                        }
+                    });
+        } catch (Exception e) {
+            if (done.compareAndSet(false, true)) {
+                NativeMethods.onSubpackageResult(sessionId,
+                        "{\"requestId\":" + requestId + ",\"error\":\""
+                                + (e.getMessage() != null ? e.getMessage() : "unknown error") + "\"}");
+            }
         }
     }
 
@@ -1920,7 +2414,9 @@ public final class NativeExports {
         destroyBluetoothManager(sessionId);
         destroyImageApiManager(sessionId);
         destroyScanCodeManager(sessionId);
-        destroyGameLogManager(sessionId);
+        clearGameLogHandler(sessionId);
+        clearAuthHandler(sessionId);
+        clearSubpackageHandler(sessionId);
         unregisterErrorCallback(sessionId);
     }
 

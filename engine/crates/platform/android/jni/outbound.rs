@@ -1132,6 +1132,12 @@ pub fn image_choose_image(host_id: i32, options_json: &str) -> Result<(), String
     call_void_with_string("imageChooseImage", host_id, options_json)
 }
 
+// ==================== Subpackage ====================
+
+pub fn subpackage_download(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("subpackageDownload", host_id, options_json)
+}
+
 // ==================== Keyboard ====================
 
 pub fn keyboard_show(host_id: i32, options_json: &str) -> Result<(), String> {
@@ -1171,6 +1177,24 @@ pub fn scan_code(host_id: i32, options_json: &str) -> Result<(), String> {
 
 pub fn game_log_report(host_id: i32, log_json: &str) -> Result<(), String> {
     call_void_with_string("gameLogReport", host_id, log_json)
+}
+
+// ==================== Auth ====================
+
+pub fn auth_login(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("authLogin", host_id, options_json)
+}
+
+pub fn auth_check_session(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("authCheckSession", host_id, options_json)
+}
+
+pub fn auth_get_user_info(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("authGetUserInfo", host_id, options_json)
+}
+
+pub fn auth_get_phone_number(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("authGetPhoneNumber", host_id, options_json)
 }
 
 // ==================== Lifecycle Notification ====================

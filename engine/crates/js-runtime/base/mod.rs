@@ -1,4 +1,4 @@
-use deno_core::{Extension, OpState, op2, v8};
+use deno_core::{op2, v8, Extension, OpState};
 use shared::op_state::HostOpState;
 use tracing::debug;
 
@@ -55,6 +55,51 @@ struct HeapStats {
     external_memory: usize,
 }
 
+/// Check whether `specifier` looks like an absolute filesystem path.
+///
+/// Matches Unix absolute paths (`/foo`) and Windows drive-letter paths (`C:\foo`).
+#[inline]
+fn is_absolute_path(specifier: &str) -> bool {
+    specifier.starts_with('/')
+        || (specifier.len() >= 3
+            && specifier.as_bytes()[0].is_ascii_alphabetic()
+            && specifier.as_bytes()[1] == b':'
+            && matches!(specifier.as_bytes()[2], b'/' | b'\\'))
+}
+
+/// Resolve `path` using the Node.js-style extension/index resolution order:
+///
+/// 1. exact path
+/// 2. path.js
+/// 3. path.json
+/// 4. path/index.js
+fn resolve_module_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    if path.is_file() {
+        return path;
+    }
+
+    // Try appending .js
+    if !path.extension().map_or(false, |e| e == "js" || e == "json") {
+        let with_js = path.with_extension("js");
+        if with_js.is_file() {
+            return with_js;
+        }
+        let with_json = path.with_extension("json");
+        if with_json.is_file() {
+            return with_json;
+        }
+    }
+
+    // Try path/index.js (directory as module)
+    let index_js = path.join("index.js");
+    if index_js.is_file() {
+        return index_js;
+    }
+
+    // Fall back to original (will produce a clear "not found" error)
+    path
+}
+
 /// Synchronously read a file as UTF-8 text, used by the JS `require()` shim.
 ///
 /// Resolves `specifier` relative to `referrer_dir`. If `referrer_dir` is empty,
@@ -68,39 +113,28 @@ fn op_require_resolve_and_read(
 ) -> Result<RequireResult, RequireError> {
     let base_dir = if referrer_dir.is_empty() {
         let host = state.borrow::<HostOpState>();
-        host.code_dir
-            .clone()
-            .unwrap_or_default()
+        host.code_dir.clone().unwrap_or_default()
     } else {
         referrer_dir
     };
 
     // Resolve the specifier to an absolute path
-    let path = if specifier.starts_with('/') || specifier.contains(':') {
+    let raw_path = if is_absolute_path(&specifier) {
         std::path::PathBuf::from(&specifier)
     } else {
         std::path::PathBuf::from(&base_dir).join(&specifier)
     };
 
-    // Try with and without .js extension
-    let path = if path.exists() {
-        path
-    } else if !path.extension().map_or(false, |e| e == "js") {
-        let with_js = path.with_extension("js");
-        if with_js.exists() {
-            with_js
-        } else {
-            path
-        }
-    } else {
-        path
-    };
+    // Apply extension/index resolution
+    let resolved = resolve_module_path(raw_path);
+
+    // Canonicalize to normalize symlinks, `..`, and produce a unique cache key.
+    let path = std::fs::canonicalize(&resolved).unwrap_or(resolved);
 
     let abs_path = path.to_string_lossy().into_owned();
 
-    let content = std::fs::read_to_string(&path).map_err(|e| {
-        RequireError::Io(format!("require: cannot read {}: {}", abs_path, e))
-    })?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| RequireError::Io(format!("require: cannot read {}: {}", abs_path, e)))?;
 
     let parent = path
         .parent()
@@ -121,18 +155,43 @@ struct RequireResult {
     dir: String,
 }
 
+/// Trigger a subpackage download via the platform service.
+///
+/// The JS layer resolves the subpackage name to a root path from game.json,
+/// then calls this op to initiate the download. The platform reports progress
+/// and completion asynchronously via EvalScript callbacks.
+#[op2(fast)]
+fn op_download_subpackage(
+    state: &mut OpState,
+    #[string] options_json: &str,
+) -> Result<(), deno_error::JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(svc) = services.subpackage() {
+            return svc
+                .download_subpackage(options_json)
+                .map_err(deno_error::JsErrorBox::generic);
+        }
+    }
+    Err(deno_error::JsErrorBox::generic(
+        "loadSubpackage:fail not supported",
+    ))
+}
+
 deno_core::extension!(
     host_v8_base,
     ops = [
         op_trigger_gc,
         op_get_heap_statistics,
         op_require_resolve_and_read,
+        op_download_subpackage,
     ],
     esm = [
         dir "base",
         "01_amdshim.js",
         "02_async.js",
         "03_gc.js",
+        "04_subpackage.js",
     ],
     options = {
         options: HostOpState,
