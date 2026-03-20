@@ -810,6 +810,112 @@ pub fn op_read_file_sync(
     .map_err(IOError::from)
 }
 
+//
+// read(fd) - fd-based read into buffer
+//
+#[op2(async(lazy))]
+#[serde]
+pub async fn op_read_fd(
+    state: Rc<RefCell<OpState>>,
+    #[smi] rid: FileId,
+    #[bigint] length: u64,
+    #[bigint] position: Option<u64>,
+) -> Result<ToJsBuffer, IOError> {
+    let tx = get_io_tx_async(state);
+
+    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ReadFd {
+        rid,
+        length,
+        position,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map(|data| data.into())
+    .map_err(IOError::from)
+}
+
+#[op2]
+#[serde]
+pub fn op_read_fd_sync(
+    state: &mut OpState,
+    #[smi] rid: FileId,
+    #[bigint] length: u64,
+    #[bigint] position: Option<u64>,
+) -> Result<ToJsBuffer, IOError> {
+    let tx = get_io_tx_sync(state);
+
+    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::ReadFd {
+        rid,
+        length,
+        position,
+        resp: IOCmdResp::Sync(resp_tx),
+    })
+    .map(|data| data.into())
+    .map_err(IOError::from)
+}
+
+//
+// readCompressedFile (path) - read brotli-compressed file
+//
+#[op2(async(lazy), fast)]
+#[serde]
+pub async fn op_read_compressed_file(
+    state: Rc<RefCell<OpState>>,
+    #[string] path: String,
+) -> Result<ToJsBuffer, IOError> {
+    let vfs = get_vfs_async(&state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
+    let tx = get_io_tx_async(state);
+
+    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ReadCompressedFile {
+        path: full_path,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map(|data| data.into())
+    .map_err(IOError::from)
+}
+
+#[op2]
+#[serde]
+pub fn op_read_compressed_file_sync(
+    state: &mut OpState,
+    #[string] path: String,
+) -> Result<ToJsBuffer, IOError> {
+    let vfs = get_vfs_sync(state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
+    let tx = get_io_tx_sync(state);
+
+    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::ReadCompressedFile {
+        path: full_path,
+        resp: IOCmdResp::Sync(resp_tx),
+    })
+    .map(|data| data.into())
+    .map_err(IOError::from)
+}
+
+// ============================ ReadZipEntry ============================
+
+#[op2(async(lazy), fast)]
+#[string]
+pub async fn op_read_zip_entry(
+    state: Rc<RefCell<OpState>>,
+    #[string] zip_path: String,
+    #[string] entries_json: String,
+) -> Result<String, IOError> {
+    let vfs = get_vfs_async(&state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &zip_path, FileOp::Read)?;
+    let tx = get_io_tx_async(state);
+
+    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ReadZipEntry {
+        zip_path: full_path,
+        entries_json,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map_err(IOError::from)
+}
+
 // ============================ Unzip ============================
 
 /// Unzip operation with platform service dispatch.

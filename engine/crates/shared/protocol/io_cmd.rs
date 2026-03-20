@@ -162,11 +162,29 @@ pub enum IOCmd {
         resp: IOCmdResp<usize>,
     },
 
+    ReadFd {
+        rid: FileId,
+        length: u64,
+        position: Option<u64>,
+        resp: IOCmdResp<Vec<u8>>,
+    },
+
     ReadFile {
         path: String,
         position: Option<u64>,
         length: Option<u64>,
         resp: IOCmdResp<Vec<u8>>,
+    },
+
+    ReadCompressedFile {
+        path: String,
+        resp: IOCmdResp<Vec<u8>>,
+    },
+
+    ReadZipEntry {
+        zip_path: String,
+        entries_json: String,
+        resp: IOCmdResp<String>,
     },
 
     /// Read an image from `path` and convert it into a normalized RGBA8 buffer.

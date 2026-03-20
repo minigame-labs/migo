@@ -279,6 +279,41 @@ impl IoCmdHandler {
                 Self::send_resp(resp, r);
             }
 
+            IOCmd::ReadFd {
+                rid,
+                length,
+                position,
+                resp,
+            } => {
+                let r: Result<Vec<u8>, EngineError> = (async {
+                    let file = self
+                        .files
+                        .get_mut(&rid)
+                        .ok_or_else(|| Self::code_err(ErrorCode::BadFileDescriptor))?;
+
+                    if let Some(pos) = position {
+                        file.seek(SeekFrom::Start(pos))
+                            .await
+                            .map_err(Self::io_err)?;
+                    }
+
+                    let mut buf = vec![0u8; length as usize];
+                    let mut total = 0;
+                    while total < buf.len() {
+                        match file.read(&mut buf[total..]).await {
+                            Ok(0) => break,
+                            Ok(n) => total += n,
+                            Err(e) => return Err(Self::io_err(e)),
+                        }
+                    }
+                    buf.truncate(total);
+                    Ok(buf)
+                })
+                .await;
+
+                Self::send_resp(resp, r);
+            }
+
             IOCmd::ReadFile {
                 path,
                 position,
@@ -325,6 +360,59 @@ impl IoCmdHandler {
                 .await;
 
                 Self::send_resp(resp, r);
+            }
+
+            IOCmd::ReadCompressedFile { path, resp } => {
+                let r: Result<Vec<u8>, EngineError> = (async {
+                    let compressed = fs::read(&path).await.map_err(Self::io_err)?;
+                    tokio::task::spawn_blocking(move || {
+                        let mut decompressed = Vec::new();
+                        let mut reader =
+                            brotli::Decompressor::new(compressed.as_slice(), 4096);
+                        std::io::Read::read_to_end(&mut reader, &mut decompressed)
+                            .map_err(|e| {
+                                EngineError::new(ErrorCode::IoError)
+                                    .with_detail(format!("brotli decompress failed: {}", e))
+                            })?;
+                        Ok(decompressed)
+                    })
+                    .await
+                    .map_err(|e| {
+                        EngineError::new(ErrorCode::IoError)
+                            .with_detail(format!("task join error: {}", e))
+                    })?
+                })
+                .await;
+
+                Self::send_resp(resp, r);
+            }
+
+            #[cfg(feature = "zip-extract")]
+            IOCmd::ReadZipEntry {
+                zip_path,
+                entries_json,
+                resp,
+            } => {
+                let r = match tokio::task::spawn_blocking(move || {
+                    Self::read_zip_entries(&zip_path, &entries_json)
+                })
+                .await
+                {
+                    Ok(inner) => inner,
+                    Err(e) => Err(EngineError::new(ErrorCode::IoError)
+                        .with_detail(format!("task join error: {}", e))),
+                };
+
+                Self::send_resp(resp, r);
+            }
+
+            #[cfg(not(feature = "zip-extract"))]
+            IOCmd::ReadZipEntry { resp, .. } => {
+                Self::send_resp(
+                    resp,
+                    Err(EngineError::new(ErrorCode::IoError)
+                        .with_msg("readZipEntry not available (zip feature disabled)")),
+                );
             }
 
             IOCmd::ReadImageRgba8 { path, resp } => {
@@ -896,5 +984,155 @@ impl IoCmdHandler {
                 .map(|(path, stat)| json!({ "path": path, "stat": stat }))
                 .collect(),
         ))
+    }
+
+    #[cfg(feature = "zip-extract")]
+    fn read_zip_entries(zip_path: &str, entries_json: &str) -> Result<String, EngineError> {
+        use deno_core::serde_json::{self, json};
+        use std::io::{BufReader, Read as _};
+
+        let file = std::fs::File::open(zip_path).map_err(Self::io_err)?;
+        let reader = BufReader::new(file);
+        let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
+            EngineError::new(ErrorCode::IoError).with_detail(format!("invalid zip: {}", e))
+        })?;
+
+        let req: serde_json::Value =
+            serde_json::from_str(entries_json).map_err(|e| {
+                EngineError::new(ErrorCode::InvalidArgument)
+                    .with_detail(format!("invalid entries_json: {}", e))
+            })?;
+
+        let global_encoding = req
+            .get("encoding")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let entries_val = req.get("entries");
+
+        // Collect which entries to read
+        let read_all = entries_val
+            .and_then(|v| v.as_str())
+            .map(|s| s == "all")
+            .unwrap_or(false);
+
+        let mut results = serde_json::Map::new();
+
+        if read_all {
+            for i in 0..archive.len() {
+                let mut entry = match archive.by_index(i) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                if entry.is_dir() {
+                    continue;
+                }
+                let name = entry.name().to_string();
+                let mut buf = Vec::with_capacity(entry.size() as usize);
+                match entry.read_to_end(&mut buf) {
+                    Ok(_) => {
+                        let data_val =
+                            Self::encode_zip_data(&buf, global_encoding.as_deref());
+                        results.insert(
+                            name,
+                            json!({ "data": data_val, "errMsg": "" }),
+                        );
+                    }
+                    Err(e) => {
+                        results.insert(
+                            name,
+                            json!({ "data": null, "errMsg": format!("read failed: {}", e) }),
+                        );
+                    }
+                }
+            }
+        } else if let Some(arr) = entries_val.and_then(|v| v.as_array()) {
+            for item in arr {
+                let path = match item.get("path").and_then(|v| v.as_str()) {
+                    Some(p) => p.to_string(),
+                    None => continue,
+                };
+                let encoding = item
+                    .get("encoding")
+                    .and_then(|v: &serde_json::Value| v.as_str())
+                    .or(global_encoding.as_deref());
+                let position = item.get("position").and_then(|v: &serde_json::Value| v.as_u64());
+                let length = item.get("length").and_then(|v: &serde_json::Value| v.as_u64());
+
+                match archive.by_name(&path) {
+                    Ok(mut entry) => {
+                        let mut buf = Vec::with_capacity(entry.size() as usize);
+                        match entry.read_to_end(&mut buf) {
+                            Ok(_) => {
+                                // Apply position/length slicing
+                                let start =
+                                    position.map(|p| p as usize).unwrap_or(0).min(buf.len());
+                                let end = length
+                                    .map(|l| (start + l as usize).min(buf.len()))
+                                    .unwrap_or(buf.len());
+                                let sliced = &buf[start..end];
+
+                                let data_val = Self::encode_zip_data(sliced, encoding);
+                                results.insert(
+                                    path,
+                                    json!({ "data": data_val, "errMsg": "" }),
+                                );
+                            }
+                            Err(e) => {
+                                results.insert(
+                                    path,
+                                    json!({ "data": null, "errMsg": format!("read failed: {}", e) }),
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        results.insert(
+                            path,
+                            json!({ "data": null, "errMsg": format!("entry not found: {}", e) }),
+                        );
+                    }
+                }
+            }
+        }
+
+        serde_json::to_string(&json!({ "entries": results })).map_err(|e| {
+            EngineError::new(ErrorCode::IoError)
+                .with_detail(format!("json serialize failed: {}", e))
+        })
+    }
+
+    #[cfg(feature = "zip-extract")]
+    fn encode_zip_data(data: &[u8], encoding: Option<&str>) -> deno_core::serde_json::Value {
+        use base64::Engine;
+        use deno_core::serde_json;
+        match encoding {
+            None => {
+                // Return base64-encoded since we can't return raw ArrayBuffer through JSON
+                serde_json::Value::String(
+                    base64::engine::general_purpose::STANDARD.encode(data),
+                )
+            }
+            Some(enc) => match enc {
+                "utf8" | "utf-8" => {
+                    serde_json::Value::String(String::from_utf8_lossy(data).into_owned())
+                }
+                "base64" => serde_json::Value::String(
+                    base64::engine::general_purpose::STANDARD.encode(data),
+                ),
+                "hex" => {
+                    let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
+                    serde_json::Value::String(hex)
+                }
+                "latin1" | "binary" => {
+                    let s: String = data.iter().map(|&b| b as char).collect();
+                    serde_json::Value::String(s)
+                }
+                "ascii" => {
+                    let s: String = data.iter().map(|&b| (b & 0x7F) as char).collect();
+                    serde_json::Value::String(s)
+                }
+                _ => serde_json::Value::String(String::from_utf8_lossy(data).into_owned()),
+            },
+        }
     }
 }
