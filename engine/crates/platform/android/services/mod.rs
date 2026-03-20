@@ -8,8 +8,9 @@ use core::services::{
     AccelerometerService, AudioPlatformService, AuthService, BatteryService, BluetoothService,
     CameraService, ClipboardService, CodecService, CompassService, DeviceMotionService,
     DeviceServices, FileService, GameLogService, GyroscopeService, ImageApiService,
-    InteractionService, KeyboardService, LocationService, NetworkService, RecorderService,
-    ScanCodeService, ScreenService, SubpackageService, SystemInfoService, VibrationService,
+    InteractionService, KeyboardService, LocationService, NavigateService, NetworkService,
+    PaymentService, RecorderService, ScanCodeService, ScreenService, ShareService,
+    SubpackageService, SystemInfoService, VibrationService,
 };
 
 use crate::android::jni;
@@ -158,6 +159,24 @@ impl DeviceServices for AndroidDeviceServices {
 
     fn subpackage(&self) -> Option<Arc<dyn SubpackageService>> {
         Some(Arc::new(AndroidSubpackage {
+            host_id: self.host_id,
+        }))
+    }
+
+    fn share(&self) -> Option<Arc<dyn ShareService>> {
+        Some(Arc::new(AndroidShare {
+            host_id: self.host_id,
+        }))
+    }
+
+    fn navigate(&self) -> Option<Arc<dyn NavigateService>> {
+        Some(Arc::new(AndroidNavigate {
+            host_id: self.host_id,
+        }))
+    }
+
+    fn payment(&self) -> Option<Arc<dyn PaymentService>> {
+        Some(Arc::new(AndroidPayment {
             host_id: self.host_id,
         }))
     }
@@ -484,6 +503,10 @@ impl SystemInfoService for AndroidSystemInfo {
     fn get_app_authorization_setting_json(&self) -> Result<String, String> {
         jni::get_app_authorization_setting_json()
     }
+
+    fn open_setting(&self, options_json: &str) -> Result<(), String> {
+        jni::open_setting(self.host_id, options_json)
+    }
 }
 
 // ==================== Bluetooth ====================
@@ -691,5 +714,53 @@ struct AndroidSubpackage {
 impl SubpackageService for AndroidSubpackage {
     fn download_subpackage(&self, options_json: &str) -> Result<(), String> {
         jni::subpackage_download(self.host_id, options_json)
+    }
+}
+
+// ==================== Share ====================
+
+struct AndroidShare {
+    host_id: i32,
+}
+
+impl ShareService for AndroidShare {
+    fn share_app_message(&self, options_json: &str) -> Result<(), String> {
+        jni::share_app_message(self.host_id, options_json)
+    }
+}
+
+// ==================== Navigate ====================
+
+struct AndroidNavigate {
+    host_id: i32,
+}
+
+impl NavigateService for AndroidNavigate {
+    fn navigate_to_mini_program(&self, options_json: &str) -> Result<(), String> {
+        jni::navigate_to_mini_program(self.host_id, options_json)
+    }
+
+    fn open_customer_service_conversation(&self, options_json: &str) -> Result<(), String> {
+        jni::open_customer_service_conversation(self.host_id, options_json)
+    }
+}
+
+// ==================== Payment ====================
+
+struct AndroidPayment {
+    host_id: i32,
+}
+
+impl PaymentService for AndroidPayment {
+    fn check_is_support_midas_payment(&self, options_json: &str) -> Result<String, String> {
+        jni::check_is_support_midas_payment(self.host_id, options_json)
+    }
+
+    fn request_midas_payment(&self, options_json: &str) -> Result<(), String> {
+        jni::request_midas_payment(self.host_id, options_json)
+    }
+
+    fn request_midas_payment_game_item(&self, options_json: &str) -> Result<(), String> {
+        jni::request_midas_payment_game_item(self.host_id, options_json)
     }
 }

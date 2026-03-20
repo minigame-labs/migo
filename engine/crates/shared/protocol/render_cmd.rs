@@ -533,6 +533,26 @@ pub enum Canvas2DCmd {
     SetGlobalAlpha {
         alpha: f32,
     },
+    SetCompositeOperation {
+        /// Encoded as u8: 0=source-over, 1=source-in, 2=source-out,
+        /// 3=source-atop, 4=destination-over, 5=destination-in,
+        /// 6=destination-out, 7=destination-atop, 8=lighter, 9=copy, 10=xor
+        op: u8,
+    },
+    SetLineDash {
+        /// Alternating dash/gap lengths. Empty = solid line.
+        segments: Vec<f32>,
+    },
+    SetLineDashOffset {
+        offset: f32,
+    },
+    SetFillStyleGradient {
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        stops: Vec<GradientStop>,
+    },
     SetFont {
         font: String,
     },
@@ -594,6 +614,13 @@ pub enum Canvas2DCmd {
     DrawImageBatch {
         draws: Vec<DrawImageEntry>,
     },
+}
+
+/// A single color stop for a linear/radial gradient.
+#[derive(Debug, Clone)]
+pub struct GradientStop {
+    pub offset: f32,
+    pub color: Color,
 }
 
 /// Single draw image entry for batch drawing

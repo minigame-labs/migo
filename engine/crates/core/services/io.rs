@@ -59,12 +59,18 @@ impl IoService {
         self.tx.clone()
     }
 
-    /// Best-effort shutdown: send the `Shutdown` command.
+    /// Best-effort shutdown: send `Shutdown` and abort the handler task.
     ///
-    /// The handler task will process it and exit.  If the tokio runtime
-    /// is already shutting down the task will be cancelled, and file
-    /// handles are cleaned up via their `Drop` impls.
+    /// The IO handler runs as a tokio task on the Host's **current-thread**
+    /// runtime.  We cannot synchronously wait for it here (that would
+    /// block the sole executor thread, preventing the task from being
+    /// polled).  Instead we send `Shutdown` (cooperative exit) and then
+    /// abort the task (forced cancellation).  File handles are cleaned
+    /// up via their `Drop` impls.
     pub(crate) fn shutdown(&mut self) {
         let _ = self.tx.send(IOCmd::Shutdown);
+        if let Some(handle) = self.handler_handle.take() {
+            handle.abort();
+        }
     }
 }

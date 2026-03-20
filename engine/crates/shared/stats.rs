@@ -20,6 +20,9 @@ pub struct DebugStats {
     /// Milliseconds from render thread start to first frame presentation.
     /// Set once on the first swap_buffers; remains 0 until then.
     pub first_frame_ms: AtomicU32,
+    /// Total number of HostCommand messages dropped due to queue overflow (cumulative).
+    /// Incremented by `send_command_to_host` when `try_send` returns `Full`.
+    pub command_drops: AtomicU32,
 }
 
 impl DebugStats {

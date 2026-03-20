@@ -60,6 +60,9 @@ pub struct Canvas2DState {
     pub line_join: CanvasLineJoin,
     pub miter_limit: f32,
     pub global_alpha: f32,
+    pub composite_op: femtovg::CompositeOperation,
+    pub line_dash: Vec<f32>,
+    pub line_dash_offset: f32,
 
     pub font_size: f32,
     pub font_id: Option<FontId>,
@@ -81,6 +84,9 @@ impl Default for Canvas2DState {
             line_join: CanvasLineJoin::Miter,
             miter_limit: 10.0,
             global_alpha: 1.0,
+            composite_op: femtovg::CompositeOperation::SourceOver,
+            line_dash: Vec::new(),
+            line_dash_offset: 0.0,
 
             font_size: 16.0,
             font_id: None,
@@ -324,6 +330,54 @@ impl Canvas2DContext {
     }
     pub fn set_global_alpha(&mut self, alpha: f32) {
         self.state.global_alpha = alpha.clamp(0.0, 1.0);
+    }
+    pub fn set_composite_operation(&mut self, op: u8) {
+        let comp = match op {
+            0 => femtovg::CompositeOperation::SourceOver,
+            1 => femtovg::CompositeOperation::SourceIn,
+            2 => femtovg::CompositeOperation::SourceOut,
+            3 => femtovg::CompositeOperation::Atop,
+            4 => femtovg::CompositeOperation::DestinationOver,
+            5 => femtovg::CompositeOperation::DestinationIn,
+            6 => femtovg::CompositeOperation::DestinationOut,
+            7 => femtovg::CompositeOperation::DestinationAtop,
+            8 => femtovg::CompositeOperation::Lighter,
+            9 => femtovg::CompositeOperation::Copy,
+            10 => femtovg::CompositeOperation::Xor,
+            _ => femtovg::CompositeOperation::SourceOver,
+        };
+        self.state.composite_op = comp;
+        self.canvas.global_composite_operation(comp);
+    }
+    pub fn set_line_dash(&mut self, segments: Vec<f32>) {
+        self.state.line_dash = segments;
+    }
+    pub fn set_line_dash_offset(&mut self, offset: f32) {
+        self.state.line_dash_offset = offset;
+    }
+    pub fn set_fill_style_gradient(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        stops: Vec<shared::protocol::render_cmd::GradientStop>,
+    ) {
+        // femtovg linear_gradient only supports two-stop gradients natively.
+        // Use the first and last stops; for multi-stop, a texture-based
+        // approach would be needed (future enhancement).
+        if stops.len() >= 2 {
+            let first = &stops[0];
+            let last = &stops[stops.len() - 1];
+            self.state.fill_style = FillStyleKind::Gradient {
+                x0,
+                y0,
+                x1,
+                y1,
+                start_color: to_fv_color(first.color),
+                end_color: to_fv_color(last.color),
+            };
+        }
     }
     pub fn set_text_align(&mut self, align: TextAlign) {
         self.state.text_align = align;

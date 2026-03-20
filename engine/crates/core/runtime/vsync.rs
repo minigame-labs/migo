@@ -35,6 +35,10 @@ pub fn unregister_vsync_sender(id: i32) {
 /// Called from the JNI Choreographer callback.
 pub fn send_vsync(id: i32, ts_ms: f64) {
     if let Some(tx) = senders().read().unwrap_or_else(|e| e.into_inner()).get(&id) {
-        let _ = tx.try_send(ts_ms);
+        if tx.try_send(ts_ms).is_err() {
+            if let Some(stats) = shared::stats::get_stats(id) {
+                stats.dropped_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 }

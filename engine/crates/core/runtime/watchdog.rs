@@ -587,4 +587,87 @@ mod tests {
         reporter.report_anr(1, TerminationReason::Timeout, 12000, "");
         assert_eq!(reporter.count.load(Ordering::Relaxed), 1);
     }
+
+    // -- P3-5: Extended watchdog tests --
+
+    #[test]
+    fn test_pause_prevents_termination_flag() {
+        let state = WatchdogState::new();
+        state.pause();
+        assert!(state.is_paused());
+        // While paused, the watchdog thread should not set terminated.
+        // Verify the flag stays clear.
+        assert!(!state.was_terminated());
+        assert!(state.termination_reason().is_none());
+    }
+
+    #[test]
+    fn test_resume_clears_pause() {
+        let state = WatchdogState::new();
+        state.pause();
+        state.resume();
+        assert!(!state.is_paused());
+    }
+
+    #[test]
+    fn test_tick_updates_heartbeat_monotonically() {
+        let state = WatchdogState::new();
+        let mut prev = state.heartbeat.load(Ordering::Acquire);
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(5));
+            state.tick();
+            let cur = state.heartbeat.load(Ordering::Acquire);
+            assert!(
+                cur >= prev,
+                "heartbeat must be monotonically non-decreasing"
+            );
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn test_extend_timeout_sets_and_clears() {
+        let state = WatchdogState::new();
+
+        // Initially no extension
+        assert_eq!(state.extended_deadline.load(Ordering::Acquire), 0);
+
+        // Extend by 60s — deadline should be in the future
+        state.extend_timeout(Duration::from_secs(60));
+        let deadline = state.extended_deadline.load(Ordering::Acquire);
+        assert!(deadline > 0);
+
+        // Clear
+        state.clear_timeout_extension();
+        assert_eq!(state.extended_deadline.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_terminated_stays_set_after_repeated_calls() {
+        let state = WatchdogState::new();
+        state.mark_terminated(TerminationReason::Timeout);
+        state.mark_terminated(TerminationReason::OutOfMemory);
+        // mark_terminated uses store — last writer wins.
+        // The important invariant is that was_terminated() stays true.
+        assert!(state.was_terminated());
+        assert_eq!(
+            state.termination_reason(),
+            Some(TerminationReason::OutOfMemory)
+        );
+    }
+
+    #[test]
+    fn test_reset_after_terminate_and_pause() {
+        let state = WatchdogState::new();
+        state.mark_terminated(TerminationReason::Timeout);
+        state.pause();
+        state.extend_timeout(Duration::from_secs(60));
+
+        state.reset();
+
+        assert!(!state.was_terminated());
+        assert!(!state.is_paused());
+        assert!(state.termination_reason().is_none());
+        assert_eq!(state.extended_deadline.load(Ordering::Acquire), 0);
+    }
 }

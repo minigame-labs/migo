@@ -408,7 +408,18 @@ impl RenderThread {
 
                         let swap_ok = match cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
                             Ok(()) => true,
-                            Err(e) => { warn!("swap_buffers_no_restore failed: {}", e); false }
+                            Err(e) => {
+                                warn!("swap_buffers_no_restore failed: {}", e);
+                                // Attempt automatic recovery from EGL context loss.
+                                if cm.is_context_lost() {
+                                    match cm.try_recover_context() {
+                                        Ok(true) => info!("EGL context recovered, resuming rendering"),
+                                        Ok(false) => warn!("EGL context recovery deferred (no window)"),
+                                        Err(re) => warn!("EGL context recovery failed: {}", re),
+                                    }
+                                }
+                                false
+                            }
                         };
                         *dirty = false;
 

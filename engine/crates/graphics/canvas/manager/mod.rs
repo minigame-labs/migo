@@ -55,6 +55,14 @@ pub(crate) struct CanvasManager {
     /// Last eglSwapInterval value to avoid redundant driver calls per frame.
     last_swap_interval: i32,
 
+    /// Set to true when EGL reports CONTEXT_LOST during swap_buffers.
+    /// The next `create_onscreen()` call will perform a full resource rebuild.
+    context_lost: bool,
+
+    /// Last window handle used by create_onscreen, preserved for context
+    /// loss recovery (re-create surface without waiting for UpdateSurface).
+    last_window: Option<usize>,
+
     // GL object registries
     pub(crate) programs: HashMap<ProgramId, ProgramMeta>,
     pub(crate) shaders: HashMap<ShaderId, ShaderMeta>,
@@ -115,6 +123,8 @@ impl CanvasManager {
             dirty_2d: HashSet::with_capacity(4),
             image_registry: ImageRegistry::new(),
             last_swap_interval: -1, // force first eglSwapInterval call
+            context_lost: false,
+            last_window: None,
             programs: HashMap::with_capacity(16),
             shaders: HashMap::with_capacity(32),
             buffers: HashMap::with_capacity(32),
@@ -171,6 +181,8 @@ impl CanvasManager {
 
     pub(crate) fn create_onscreen(&mut self, window: usize) -> EngineResult<()> {
         let id = CanvasId::from(1u32);
+        self.last_window = Some(window);
+        self.context_lost = false;
 
         // Track whether a 2D context existed before destruction, so we can
         // re-initialize it after the new EGL context is created. This is
@@ -291,6 +303,32 @@ impl CanvasManager {
             self.last_swap_interval = -1;
         }
         Ok(())
+    }
+
+    /// Returns true if EGL reported context loss.
+    /// The render thread should attempt recovery on the next frame.
+    #[inline]
+    pub(crate) fn is_context_lost(&self) -> bool {
+        self.context_lost
+    }
+
+    /// Attempt to recover from EGL context loss by re-creating the
+    /// onscreen surface using the last known window handle.
+    /// Returns Ok(true) if recovery succeeded, Ok(false) if no window
+    /// handle is available, or Err on failure.
+    pub(crate) fn try_recover_context(&mut self) -> EngineResult<bool> {
+        if !self.context_lost {
+            return Ok(false);
+        }
+        if let Some(window) = self.last_window {
+            tracing::info!("Attempting EGL context loss recovery");
+            self.create_onscreen(window)?;
+            tracing::info!("EGL context recovered successfully");
+            Ok(true)
+        } else {
+            tracing::warn!("Cannot recover EGL context: no window handle available");
+            Ok(false)
+        }
     }
 
     pub(crate) fn destroy_canvas(&mut self, id: CanvasId) -> EngineResult<()> {
@@ -618,6 +656,13 @@ impl CanvasManager {
         self.egl
             .swap_buffers(self.display, entry.ctx.surf)
             .map_err(|e| {
+                // Check if this is an EGL context loss (0x300E).
+                if let Some(egl_err) = self.egl.get_error() {
+                    if egl_err == egl::Error::ContextLost {
+                        tracing::warn!("EGL context lost detected during swap_buffers");
+                        self.context_lost = true;
+                    }
+                }
                 ee(
                     ErrorCode::RenderBackendError,
                     format!("eglSwapBuffers failed: {e:?}"),

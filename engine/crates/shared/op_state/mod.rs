@@ -79,6 +79,18 @@ pub struct HostOpState {
     pub device_services: Option<Arc<dyn DeviceServices>>,
     /// RAF frame signal receiver (set by Host::new, consumed by op_await_next_frame).
     pub raf_rx: Option<RafRx>,
+    /// Network security policy (domain whitelist, HTTPS enforcement).
+    pub network_policy: NetworkPolicy,
+}
+
+/// Network-level security policy, populated from InitOptions.extras.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkPolicy {
+    /// When non-empty, only these domains (and their subdomains) may be accessed.
+    /// An empty Vec means "allow all domains" (no whitelist).
+    pub domain_whitelist: Vec<String>,
+    /// When true, only HTTPS URLs are allowed for fetch/upload (HTTP rejected).
+    pub enforce_https: bool,
 }
 
 impl fmt::Debug for HostOpState {

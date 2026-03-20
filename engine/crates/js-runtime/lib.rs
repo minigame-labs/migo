@@ -100,7 +100,9 @@ mod input;
 mod lifecycle;
 mod media;
 mod network;
+mod payment;
 mod rendering;
+mod share;
 mod storage;
 mod system;
 mod ui;
@@ -194,6 +196,8 @@ pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
         .chain(media::media_extensions())
         .chain(audio::audio_extensions())
         .chain(worker::worker_extensions())
+        .chain(share::share_extensions())
+        .chain(payment::payment_extensions())
         .chain(ad::ad_extensions())
         .chain(runtime_extensions)
         .collect()

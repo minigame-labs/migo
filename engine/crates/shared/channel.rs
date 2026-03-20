@@ -38,7 +38,10 @@ impl ThreadWakeup {
     #[inline]
     pub fn notify(&self) {
         let (lock, cvar) = &*self.inner;
-        let mut signaled = lock.lock().unwrap();
+        // Recover from poisoned mutex — if the peer thread panicked while
+        // holding this lock we still want to deliver the wakeup signal
+        // rather than cascading the panic to this thread.
+        let mut signaled = lock.lock().unwrap_or_else(|e| e.into_inner());
         *signaled = true;
         cvar.notify_one();
     }
@@ -49,12 +52,16 @@ impl ThreadWakeup {
     /// should always proceed to check its work queue after waking.
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
         let (lock, cvar) = &*self.inner;
-        let mut signaled = lock.lock().unwrap();
+        // Recover from poisoned mutex rather than panicking — this prevents
+        // a panic in the audio thread from cascading to the host thread.
+        let mut signaled = lock.lock().unwrap_or_else(|e| e.into_inner());
         if *signaled {
             *signaled = false;
             return true;
         }
-        let result = cvar.wait_timeout(signaled, timeout).unwrap();
+        let result = cvar
+            .wait_timeout(signaled, timeout)
+            .unwrap_or_else(|e| e.into_inner());
         signaled = result.0;
         let was_signaled = *signaled;
         *signaled = false;

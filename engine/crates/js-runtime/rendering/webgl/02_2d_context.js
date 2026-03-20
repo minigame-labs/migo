@@ -58,6 +58,11 @@ import {
     // Image methods
     op_draw_image,
     op_draw_image_batch,
+    // Compositing + gradient + dash
+    op_set_composite_operation,
+    op_set_line_dash,
+    op_set_line_dash_offset,
+    op_set_fill_style_gradient,
 } from "ext:core/ops";
 
 // Line cap constants
@@ -71,6 +76,63 @@ const TEXT_BASELINE_MAP = {
     'top': 0, 'hanging': 1, 'middle': 2,
     'alphabetic': 3, 'ideographic': 4, 'bottom': 5,
 };
+
+// Composite operation names matching femtovg::CompositeOperation order.
+var _COMPOSITE_OPS = [
+    'source-over', 'source-in', 'source-out', 'source-atop',
+    'destination-over', 'destination-in', 'destination-out', 'destination-atop',
+    'lighter', 'copy', 'xor',
+];
+
+// Gradient object returned by createLinearGradient / createRadialGradient.
+// Collects color stops and sends them to the render thread when assigned
+// to fillStyle.
+class CanvasGradient {
+    constructor(type, canvasId, x0, y0, x1, y1, r1) {
+        this._type = type;
+        this._canvasId = canvasId;
+        this._x0 = x0;
+        this._y0 = y0;
+        this._x1 = x1;
+        this._y1 = y1;
+        this._r1 = r1;
+        this._stops = [];
+    }
+    addColorStop(offset, color) {
+        var parsed = _parseColorToRGBA(color);
+        this._stops.push({ offset: offset, r: parsed[0], g: parsed[1], b: parsed[2], a: parsed[3] });
+        this._stops.sort(function (a, b) { return a.offset - b.offset; });
+    }
+    // Called internally when this gradient is assigned to fillStyle.
+    _apply() {
+        if (this._stops.length < 2) return;
+        op_set_fill_style_gradient(
+            this._canvasId,
+            this._x0, this._y0, this._x1, this._y1,
+            JSON.stringify(this._stops)
+        );
+    }
+}
+
+// Minimal color string to [r,g,b,a] parser.
+function _parseColorToRGBA(color) {
+    if (typeof color !== 'string') return [0, 0, 0, 255];
+    color = color.trim();
+    // rgba(r,g,b,a) or rgb(r,g,b)
+    var m = color.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+))?\s*\)$/);
+    if (m) {
+        var a = m[4] !== undefined ? Math.round(parseFloat(m[4]) * 255) : 255;
+        return [parseInt(m[1]), parseInt(m[2]), parseInt(m[3]), a];
+    }
+    // #RRGGBB or #RGB
+    if (color[0] === '#') {
+        var hex = color.slice(1);
+        if (hex.length === 3) hex = hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2];
+        var n = parseInt(hex, 16);
+        return [(n >> 16) & 255, (n >> 8) & 255, n & 255, 255];
+    }
+    return [0, 0, 0, 255];
+}
 
 class CanvasRenderingContext2D {
     constructor(canvas) {
@@ -217,7 +279,11 @@ class CanvasRenderingContext2D {
     set fillStyle(value) {
         this._fillStyle = value;
         this._frameBegin();
-        op_set_fill_style(this._canvasId, String(value));
+        if (value instanceof CanvasGradient) {
+            value._apply();
+        } else {
+            op_set_fill_style(this._canvasId, String(value));
+        }
     }
 
     get strokeStyle() { return this._strokeStyle; }
@@ -298,6 +364,9 @@ class CanvasRenderingContext2D {
             textAlign: this._textAlign,
             textBaseline: this._textBaseline,
             tm: this._tm.slice(),
+            compositeOp: this._compositeOp,
+            lineDash: this._lineDash ? this._lineDash.slice() : null,
+            lineDashOffset: this._lineDashOffset,
         });
         this._frameBegin();
         op_save(this._canvasId);
@@ -318,6 +387,9 @@ class CanvasRenderingContext2D {
                 _textAlign: state.textAlign,
                 _textBaseline: state.textBaseline,
                 _tm: state.tm,
+                _compositeOp: state.compositeOp,
+                _lineDash: state.lineDash,
+                _lineDashOffset: state.lineDashOffset,
             });
         }
         this._frameBegin();
@@ -457,11 +529,18 @@ class CanvasRenderingContext2D {
         // Not implemented
     }
 
-    // ==================== Compositing (stubs) ====================
-    get globalCompositeOperation() { return "source-over"; }
-    set globalCompositeOperation(value) { }
+    // ==================== Compositing ====================
+    get globalCompositeOperation() { return this._compositeOp || 'source-over'; }
+    set globalCompositeOperation(value) {
+        var idx = _COMPOSITE_OPS.indexOf(value);
+        if (idx !== -1) {
+            this._compositeOp = value;
+            this._frameBegin();
+            op_set_composite_operation(this._canvasId, idx);
+        }
+    }
 
-    // ==================== Shadows (stubs) ====================
+    // ==================== Shadows (stubs -- no femtovg support) ====================
     get shadowBlur() { return 0; }
     set shadowBlur(value) { }
     get shadowColor() { return "rgba(0,0,0,0)"; }
@@ -471,16 +550,40 @@ class CanvasRenderingContext2D {
     get shadowOffsetY() { return 0; }
     set shadowOffsetY(value) { }
 
+    // ==================== Gradient ====================
+    createLinearGradient(x0, y0, x1, y1) {
+        return new CanvasGradient('linear', this._canvasId, x0, y0, x1, y1, 0);
+    }
+    createRadialGradient(x0, y0, r0, x1, y1, r1) {
+        // femtovg only supports linear gradients natively; radial falls back
+        // to a linear approximation using the center points.
+        return new CanvasGradient('radial', this._canvasId, x0, y0, x1, y1, r1);
+    }
+
+    // ==================== Line Dash ====================
+    // Note: femtovg does not support native line dash. The state is tracked
+    // so getLineDash/lineDashOffset return correct values, but stroke
+    // rendering will draw solid lines until a path-subdivision dash
+    // implementation is added.
+    setLineDash(segments) {
+        if (!Array.isArray(segments)) return;
+        this._lineDash = segments.slice();
+        this._frameBegin();
+        var buf = new Float32Array(segments);
+        op_set_line_dash(this._canvasId, new Uint8Array(buf.buffer));
+    }
+    getLineDash() { return this._lineDash ? this._lineDash.slice() : []; }
+    get lineDashOffset() { return this._lineDashOffset || 0; }
+    set lineDashOffset(value) {
+        this._lineDashOffset = +value || 0;
+        this._frameBegin();
+        op_set_line_dash_offset(this._canvasId, this._lineDashOffset);
+    }
+
     // ==================== Other stubs ====================
     isPointInPath() { return false; }
     isPointInStroke() { return false; }
-    createLinearGradient() { return {}; }
-    createRadialGradient() { return {}; }
     createPattern() { return {}; }
-    setLineDash() { }
-    getLineDash() { return []; }
-    get lineDashOffset() { return 0; }
-    set lineDashOffset(value) { }
 }
 
 // Frame-end callback registry.  Each module registers its own cleanup
@@ -499,4 +602,4 @@ globalThis.__migo_frame_end_hooks.push(() => {
     op_frame_end_all();
 });
 
-export { CanvasRenderingContext2D };
+export { CanvasRenderingContext2D, CanvasGradient };

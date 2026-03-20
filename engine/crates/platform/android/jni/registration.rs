@@ -12,10 +12,11 @@ use crate::android::jni::{
     onDeviceOrientationChange, onFuzzyLocationResult, onGetPhoneNumberResult, onGetUserInfoResult,
     onGyroscopeChange, onHide, onKeyboardComplete, onKeyboardConfirm, onKeyboardHeightChange,
     onKeyboardInput, onLocationResult, onLoginResult, onMemoryWarning, onModalResult,
-    onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSystemBluetoothSetting,
-    onRecorderEvent, onRecorderFrameData, onRestart, onScanCodeResult, onShow,
-    onSubpackageProgress, onSubpackageResult, onTouch, onUserCaptureScreen, onVsync, shutdown,
-    updateSurface, version,
+    onMidasPaymentGameItemResult, onMidasPaymentResult, onNavigateToMiniProgramResult,
+    onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSettingResult,
+    onOpenSystemBluetoothSetting, onRecorderEvent, onRecorderFrameData, onRestart,
+    onScanCodeResult, onShareAppMessageResult, onShow, onSubpackageProgress, onSubpackageResult,
+    onTouch, onUserCaptureScreen, onVsync, shutdown, updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -284,6 +285,35 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(ILjava/lang/String;)V".into(),
                 fn_ptr: onSubpackageResult as *mut c_void,
             },
+            // Setting callbacks
+            NativeMethod {
+                name: "onOpenSettingResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onOpenSettingResult as *mut c_void,
+            },
+            // Share callbacks
+            NativeMethod {
+                name: "onShareAppMessageResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onShareAppMessageResult as *mut c_void,
+            },
+            // Navigate callbacks
+            NativeMethod {
+                name: "onNavigateToMiniProgramResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onNavigateToMiniProgramResult as *mut c_void,
+            },
+            // Payment callbacks
+            NativeMethod {
+                name: "onMidasPaymentResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onMidasPaymentResult as *mut c_void,
+            },
+            NativeMethod {
+                name: "onMidasPaymentGameItemResult".into(),
+                sig: "(ILjava/lang/String;)V".into(),
+                fn_ptr: onMidasPaymentGameItemResult as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -420,6 +450,17 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("authGetPhoneNumber", "(ILjava/lang/String;)V"),
         // Subpackage
         ("subpackageDownload", "(ILjava/lang/String;)V"),
+        // Setting
+        ("openSetting", "(ILjava/lang/String;)V"),
+        // Share
+        ("shareAppMessage", "(ILjava/lang/String;)V"),
+        // Navigate
+        ("navigateToMiniProgram", "(ILjava/lang/String;)V"),
+        ("openCustomerServiceConversation", "(ILjava/lang/String;)V"),
+        // Payment
+        ("checkIsSupportMidasPayment", "(ILjava/lang/String;)Ljava/lang/String;"),
+        ("requestMidasPayment", "(ILjava/lang/String;)V"),
+        ("requestMidasPaymentGameItem", "(ILjava/lang/String;)V"),
         // Lifecycle callback
         ("onGameReady", "(I)V"),
         // Error notification callback

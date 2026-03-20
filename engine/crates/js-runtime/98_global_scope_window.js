@@ -29,6 +29,8 @@ import * as memory from 'ext:host_v8_device/11_memory.js';
 import * as locationApi from 'ext:host_v8_device/12_location.js';
 import * as scanCodeApi from 'ext:host_v8_device/13_scan_code.js';
 import * as interaction from 'ext:host_v8_ui/01_interaction.js';
+import * as buttonsApi from 'ext:host_v8_ui/02_buttons.js';
+import * as pageManagerApi from 'ext:host_v8_ui/03_page_manager.js';
 import * as envApi from 'ext:host_v8_env/00_env.js';
 import * as appLifecycle from 'ext:host_v8_lifecycle/01_lifecycle.js';
 import * as updateApp from 'ext:host_v8_update/01_update_app.js';
@@ -50,6 +52,11 @@ import * as storageApi from 'ext:host_v8_storage/01_storage.js';
 import * as cameraApi from 'ext:host_v8_media/01_camera.js';
 import * as imageApi from 'ext:host_v8_media/02_image_api.js';
 import * as workerApi from 'ext:host_v8_worker/01_worker.js';
+import * as settingApi from 'ext:host_v8_system/14_setting.js';
+import * as navigateApi from 'ext:host_v8_system/15_navigate.js';
+import * as shareApi from 'ext:host_v8_share/01_share.js';
+import * as paymentApi from 'ext:host_v8_payment/01_payment.js';
+import * as jssdkApi from 'ext:host_v8_system/16_jssdk.js';
 import * as adApi from 'ext:host_v8_ad/01_ad.js';
 import * as tcpSocket from 'ext:host_v8_network/08_tcp_socket.js';
 import * as udpSocket from 'ext:host_v8_network/09_udp_socket.js';
@@ -287,6 +294,14 @@ const WindowGlobalScope = {
     showActionSheet: core.propNonEnumerable(interaction.showActionSheet),
     _internalOnActionSheetResult: core.propNonEnumerable(interaction._internalOnActionSheetResult),
 
+    // UI Buttons
+    createUserInfoButton: core.propNonEnumerable(buttonsApi.createUserInfoButton),
+    createGameClubButton: core.propNonEnumerable(buttonsApi.createGameClubButton),
+    getMenuButtonBoundingClientRect: core.propNonEnumerable(buttonsApi.getMenuButtonBoundingClientRect),
+
+    // Page Manager
+    createPageManager: core.propNonEnumerable(pageManagerApi.createPageManager),
+
     // Env
     env: core.propNonEnumerable(envApi.env),
 
@@ -341,6 +356,18 @@ const WindowGlobalScope = {
     openAppAuthorizeSetting: core.propNonEnumerable(authorize.openAppAuthorizeSetting),
     _internalOnOpenAppAuthorizeSettingFinished: core.propNonEnumerable(authorize._internalOnOpenAppAuthorizeSettingFinished),
 
+    // Setting / Authorize (getSetting, authorize, openSetting)
+    getSetting: core.propNonEnumerable(settingApi.getSetting),
+    authorize: core.propNonEnumerable(settingApi.authorize),
+    openSetting: core.propNonEnumerable(settingApi.openSetting),
+    _internalOnOpenSettingResult: core.propNonEnumerable(settingApi._internalOnOpenSettingResult),
+    _internalUpdateAuthSetting: core.propNonEnumerable(settingApi._internalUpdateAuthSetting),
+
+    // Navigate / Customer Service
+    navigateToMiniProgram: core.propNonEnumerable(navigateApi.navigateToMiniProgram),
+    _internalOnNavigateToMiniProgramResult: core.propNonEnumerable(navigateApi._internalOnNavigateToMiniProgramResult),
+    openCustomerServiceConversation: core.propNonEnumerable(navigateApi.openCustomerServiceConversation),
+
     // Login
     login: core.propNonEnumerable(loginApi.login),
     checkSession: core.propNonEnumerable(loginApi.checkSession),
@@ -388,6 +415,15 @@ const WindowGlobalScope = {
     // Game Log
     getGameLogManager: core.propNonEnumerable(gameLog.getGameLogManager),
 
+    // Share
+    showShareMenu: core.propNonEnumerable(shareApi.showShareMenu),
+    updateShareMenu: core.propNonEnumerable(shareApi.updateShareMenu),
+    onShareAppMessage: core.propNonEnumerable(shareApi.onShareAppMessage),
+    offShareAppMessage: core.propNonEnumerable(shareApi.offShareAppMessage),
+    shareAppMessage: core.propNonEnumerable(shareApi.shareAppMessage),
+    _internalOnShareAppMessageResult: core.propNonEnumerable(shareApi._internalOnShareAppMessageResult),
+    _internalTriggerShareAppMessage: core.propNonEnumerable(shareApi._internalTriggerShareAppMessage),
+
     // Ad
     createBannerAd: core.propNonEnumerable(adApi.createBannerAd),
     createCustomAd: core.propNonEnumerable(adApi.createCustomAd),
@@ -396,6 +432,22 @@ const WindowGlobalScope = {
     createRewardedVideoAd: core.propNonEnumerable(adApi.createRewardedVideoAd),
     getDirectAdStatusSync: core.propNonEnumerable(adApi.getDirectAdStatusSync),
     getShowSplashAdStatus: core.propNonEnumerable(adApi.getShowSplashAdStatus),
+    createGameBanner: core.propNonEnumerable(adApi.createGameBanner),
+    createGameIcon: core.propNonEnumerable(adApi.createGameIcon),
+    createGamePortal: core.propNonEnumerable(adApi.createGamePortal),
+
+    // Payment
+    checkIsSupportMidasPayment: core.propNonEnumerable(paymentApi.checkIsSupportMidasPayment),
+    requestMidasPayment: core.propNonEnumerable(paymentApi.requestMidasPayment),
+    requestMidasPaymentGameItem: core.propNonEnumerable(paymentApi.requestMidasPaymentGameItem),
+    _internalOnMidasPaymentResult: core.propNonEnumerable(paymentApi._internalOnMidasPaymentResult),
+    _internalOnMidasPaymentGameItemResult: core.propNonEnumerable(paymentApi._internalOnMidasPaymentGameItemResult),
+
+    // JSSDK Lifecycle (config / ready / error)
+    config: core.propNonEnumerable(jssdkApi.config),
+    ready: core.propNonEnumerable(jssdkApi.ready),
+    error: core.propNonEnumerable(jssdkApi.error),
+    _internalTriggerJssdkError: core.propNonEnumerable(jssdkApi._internalTriggerJssdkError),
 
     // TCP Socket
     createTCPSocket: core.propNonEnumerable(tcpSocket.createTCPSocket),

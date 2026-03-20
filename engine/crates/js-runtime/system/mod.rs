@@ -209,6 +209,62 @@ pub fn op_get_beacons(state: &mut OpState) -> Result<String, JsErrorBox> {
     Err(JsErrorBox::generic("getBeacons:fail not supported"))
 }
 
+// ==================== Open Setting (Mode C) ====================
+
+#[op2(fast)]
+pub fn op_open_setting(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(sys) = services.system_info() {
+            return sys
+                .open_setting(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("openSetting:fail not supported"))
+}
+
+// ==================== Navigate (Mode C / A) ====================
+
+#[op2(fast)]
+pub fn op_navigate_to_mini_program(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(nav) = services.navigate() {
+            return nav
+                .navigate_to_mini_program(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "navigateToMiniProgram:fail not supported",
+    ))
+}
+
+#[op2(fast)]
+pub fn op_open_customer_service_conversation(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(nav) = services.navigate() {
+            return nav
+                .open_customer_service_conversation(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "openCustomerServiceConversation:fail not supported",
+    ))
+}
+
 // ==================== App Authorize Setting ====================
 
 #[op2(fast)]
@@ -392,6 +448,9 @@ deno_core::extension!(
         op_get_device_info,
         op_get_app_authorization_setting,
         op_game_log_report,
+        op_open_setting,
+        op_navigate_to_mini_program,
+        op_open_customer_service_conversation,
     ],
     esm = [
         dir "system",
@@ -408,6 +467,9 @@ deno_core::extension!(
         "11_open_data_context.js",
         "12_window_resize.js",
         "13_login.js",
+        "14_setting.js",
+        "15_navigate.js",
+        "16_jssdk.js",
     ]
 );
 

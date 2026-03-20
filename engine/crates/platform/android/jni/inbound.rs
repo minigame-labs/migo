@@ -1074,17 +1074,113 @@ pub(crate) extern "system" fn getDebugStats(
     let fatal_error = stats.fatal_error_code.load(Ordering::Relaxed);
     let first_frame_ms = stats.first_frame_ms.load(Ordering::Relaxed);
 
-    let mut buf = [0u8; 20];
+    let command_drops = stats.command_drops.load(Ordering::Relaxed);
+
+    let mut buf = [0u8; 24];
     buf[0..4].copy_from_slice(&fps_x10.to_le_bytes());
     buf[4..8].copy_from_slice(&frame_time_us.to_le_bytes());
     buf[8..12].copy_from_slice(&dropped.to_le_bytes());
     buf[12..16].copy_from_slice(&fatal_error.to_le_bytes());
     buf[16..20].copy_from_slice(&first_frame_ms.to_le_bytes());
+    buf[20..24].copy_from_slice(&command_drops.to_le_bytes());
 
     match env.byte_array_from_slice(&buf) {
         Ok(arr) => arr.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+// ==================== Setting (Mode C) ====================
+
+pub(crate) extern "system" fn onOpenSettingResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json: String = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
+    let escaped = escape_for_js_string(&json);
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnOpenSettingResult('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
+// ==================== Share (Mode C) ====================
+
+pub(crate) extern "system" fn onShareAppMessageResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json: String = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
+    let escaped = escape_for_js_string(&json);
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnShareAppMessageResult('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
+// ==================== Navigate (Mode C) ====================
+
+pub(crate) extern "system" fn onNavigateToMiniProgramResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json: String = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
+    let escaped = escape_for_js_string(&json);
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnNavigateToMiniProgramResult('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
+// ==================== Payment (Mode C) ====================
+
+pub(crate) extern "system" fn onMidasPaymentResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json: String = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
+    let escaped = escape_for_js_string(&json);
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnMidasPaymentResult('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
+}
+
+pub(crate) extern "system" fn onMidasPaymentGameItemResult<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    result_json: JString<'local>,
+) {
+    let json: String = env
+        .get_string(&result_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
+    let escaped = escape_for_js_string(&json);
+    let cmd = HostCommand::EvalScript {
+        source: format!("_internalOnMidasPaymentGameItemResult('{}');", escaped),
+    };
+    let _ = send_command_to_host(host_id, cmd);
 }
 
 // ==================== Console Logs ====================

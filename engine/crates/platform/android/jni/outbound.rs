@@ -1387,3 +1387,39 @@ pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError
 
     result.map_err(|e| EngineError::new(ErrorCode::ImageReadError).with_detail(e))
 }
+
+// ==================== Setting ====================
+
+pub fn open_setting(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("openSetting", host_id, options_json)
+}
+
+// ==================== Share ====================
+
+pub fn share_app_message(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("shareAppMessage", host_id, options_json)
+}
+
+// ==================== Navigate ====================
+
+pub fn navigate_to_mini_program(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("navigateToMiniProgram", host_id, options_json)
+}
+
+pub fn open_customer_service_conversation(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("openCustomerServiceConversation", host_id, options_json)
+}
+
+// ==================== Payment ====================
+
+pub fn check_is_support_midas_payment(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_json_method("checkIsSupportMidasPayment", host_id, options_json)
+}
+
+pub fn request_midas_payment(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("requestMidasPayment", host_id, options_json)
+}
+
+pub fn request_midas_payment_game_item(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("requestMidasPaymentGameItem", host_id, options_json)
+}

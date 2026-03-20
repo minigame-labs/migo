@@ -264,15 +264,19 @@ public class DebugOverlayView extends LinearLayout {
         int dropped     = buf.getInt(8);
         int fatalError  = data.length >= 16 ? buf.getInt(12) : 0;
         int firstFrameMs = data.length >= 20 ? buf.getInt(16) : 0;
+        int cmdDrops     = data.length >= 24 ? buf.getInt(20) : 0;
 
         float fps     = (fpsX10 & 0xFFFFFFFFL) / 10f;
         float frameMs = (frameTimeUs & 0xFFFFFFFFL) / 1000f;
 
-        // Row 1: FPS + frame time + dropped
+        // Row 1: FPS + frame time + dropped + command drops
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("%.1f FPS  %.1fms", fps, frameMs));
         if (dropped > 0) {
             sb.append(String.format("  D:%d", dropped & 0xFFFFFFFFL));
+        }
+        if (cmdDrops > 0) {
+            sb.append(String.format("  CD:%d", cmdDrops & 0xFFFFFFFFL));
         }
         rowFps.setText(sb.toString());
         rowFps.setTextColor(fps < 25 ? WARN_COLOR : TEXT_COLOR);

@@ -492,6 +492,167 @@ function getShowSplashAdStatus(obj = {}) {
   }
 }
 
+// ==================== GameBanner (createGameBanner) ====================
+// Same shape as BannerAd but uses the "game recommend" semantics.
+
+class GameBanner extends AdBase {
+  #style;
+  #adUnitId;
+  #visible = false;
+
+  constructor({ adUnitId, style }) {
+    super(["load", "error", "resize"]);
+    this.#adUnitId = adUnitId;
+    const s = style || {};
+    const w = Math.max(300, s.width || 300);
+    const h = s.height || Math.round(w * 0.35);
+    this.#style = {
+      left: s.left || 0,
+      top: s.top || 0,
+      width: w,
+      height: h,
+      realWidth: w,
+      realHeight: h,
+    };
+    this._scheduleLoad();
+  }
+
+  get style() { return this.#style; }
+
+  show() {
+    if (this._isDestroyed()) return Promise.reject(new Error("GameBanner already destroyed"));
+    this.#visible = true;
+    this._fire("resize", { width: this.#style.realWidth, height: this.#style.realHeight });
+    return Promise.resolve();
+  }
+
+  hide() { this.#visible = false; }
+
+  destroy() {
+    this.#visible = false;
+    this._markDestroyed();
+  }
+
+  onResize(listener) { this._on("resize", listener); }
+  offResize(listener) { this._off("resize", listener); }
+  onLoad(listener) { this._on("load", listener); }
+  offLoad(listener) { this._off("load", listener); }
+  onError(listener) { this._on("error", listener); }
+  offError(listener) { this._off("error", listener); }
+}
+
+function createGameBanner(obj) {
+  if (!obj || !obj.adUnitId) {
+    throw new Error("createGameBanner:fail missing adUnitId");
+  }
+  return new GameBanner(obj);
+}
+
+// ==================== GameIcon (createGameIcon) ====================
+
+class GameIcon extends AdBase {
+  #style;
+  #adUnitId;
+  #count;
+  #visible = false;
+
+  constructor({ adUnitId, count, style }) {
+    super(["load", "error", "resize"]);
+    this.#adUnitId = adUnitId;
+    this.#count = count || 1;
+    const s = style || {};
+    this.#style = {
+      left: s.left || 0,
+      top: s.top || 0,
+      width: s.width || 40,
+      height: s.height || 40,
+    };
+    this._scheduleLoad();
+  }
+
+  get style() { return this.#style; }
+  get count() { return this.#count; }
+
+  show() {
+    if (this._isDestroyed()) return Promise.reject(new Error("GameIcon already destroyed"));
+    this.#visible = true;
+    this._fire("resize", { width: this.#style.width, height: this.#style.height });
+    return Promise.resolve();
+  }
+
+  hide() { this.#visible = false; }
+
+  destroy() {
+    this.#visible = false;
+    this._markDestroyed();
+  }
+
+  onResize(listener) { this._on("resize", listener); }
+  offResize(listener) { this._off("resize", listener); }
+  onLoad(listener) { this._on("load", listener); }
+  offLoad(listener) { this._off("load", listener); }
+  onError(listener) { this._on("error", listener); }
+  offError(listener) { this._off("error", listener); }
+}
+
+function createGameIcon(obj) {
+  if (!obj || !obj.adUnitId) {
+    throw new Error("createGameIcon:fail missing adUnitId");
+  }
+  return new GameIcon(obj);
+}
+
+// ==================== GamePortal (createGamePortal) ====================
+// Similar to InterstitialAd: load -> show -> close.
+
+class GamePortal extends AdBase {
+  #adUnitId;
+
+  constructor({ adUnitId }) {
+    super(["load", "error", "close"]);
+    this.#adUnitId = adUnitId;
+    this._scheduleLoad();
+  }
+
+  load() {
+    if (this._isDestroyed()) return Promise.reject(new Error("GamePortal already destroyed"));
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        if (!this._isDestroyed()) {
+          this._fire("load");
+        }
+        resolve();
+      }, MOCK_LOAD_DELAY_MS);
+    });
+  }
+
+  show() {
+    if (this._isDestroyed()) return Promise.reject(new Error("GamePortal already destroyed"));
+    setTimeout(() => {
+      if (!this._isDestroyed()) {
+        this._fire("close");
+      }
+    }, MOCK_LOAD_DELAY_MS);
+    return Promise.resolve();
+  }
+
+  destroy() { this._markDestroyed(); }
+
+  onLoad(listener) { this._on("load", listener); }
+  offLoad(listener) { this._off("load", listener); }
+  onError(listener) { this._on("error", listener); }
+  offError(listener) { this._off("error", listener); }
+  onClose(listener) { this._on("close", listener); }
+  offClose(listener) { this._off("close", listener); }
+}
+
+function createGamePortal(obj) {
+  if (!obj || !obj.adUnitId) {
+    throw new Error("createGamePortal:fail missing adUnitId");
+  }
+  return new GamePortal(obj);
+}
+
 export {
   createBannerAd,
   createCustomAd,
@@ -500,4 +661,7 @@ export {
   createRewardedVideoAd,
   getDirectAdStatusSync,
   getShowSplashAdStatus,
+  createGameBanner,
+  createGameIcon,
+  createGamePortal,
 };

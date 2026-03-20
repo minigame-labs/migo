@@ -18,6 +18,8 @@ import {
   op_read_file, op_read_file_sync,
   op_read_zip_entry,
   op_unzip,
+  op_get_file_info, op_get_file_info_sync,
+  op_list_saved_files,
 } from "ext:core/ops";
 
 import { core, primordials } from "ext:core/mod.js";
@@ -45,11 +47,15 @@ function extractErrText(err) {
   }
 }
 
+function failObj(msg) {
+  return { errMsg: msg, message: msg };
+}
+
 function okObj(okMsg, payload) {
   // Always return an object with errMsg (miniapp style)
   if (payload == null) return { errMsg: okMsg };
   if (typeof payload === "object") {
-    if (payload.errMsg == null) payload.errMsg = okMsg;
+    if (payload.errMsg == null) return { ...payload, errMsg: okMsg };
     return payload;
   }
   return { errMsg: okMsg, result: payload };
@@ -64,7 +70,7 @@ function wrapAsync(promise, okMsg, failPrefix, { success, fail, complete }) {
     })
     .catch((err) => {
       const msg = `${failPrefix}:fail ${extractErrText(err)}`;
-      const out = { errMsg: msg };
+      const out = failObj(msg);
       fail?.(out);
       complete?.(out);
     });
@@ -74,13 +80,13 @@ function wrapSync(fn, failPrefix) {
   try {
     return fn();
   } catch (err) {
-    throw { errMsg: `${failPrefix}:fail ${extractErrText(err)}` };
+    throw failObj(`${failPrefix}:fail ${extractErrText(err)}`);
   }
 }
 
 function toUint8Array(data, offset = 0, length) {
-  if (typeof data === "string") {
-    return { data_str: data, data_buf: null };
+  if (typeof data === "string" || data instanceof String) {
+    return { data_str: String(data), data_buf: null };
   }
   if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
     const buf = data instanceof ArrayBuffer
@@ -99,6 +105,10 @@ function ensureFd(fd) {
   if (!Number.isFinite(n)) throw new IOError("invalid fd");
   return n;
 }
+
+// Pre-computed hex lookup table (avoids toString(16) + padStart per byte)
+const HEX_LUT = new Array(256);
+for (let i = 0; i < 256; i++) HEX_LUT[i] = (i < 16 ? "0" : "") + i.toString(16);
 
 const SAVE_FILE_DIR = "/user";
 let _saveFileCounter = 0;
@@ -139,17 +149,17 @@ class BaseFileManager {
 
   static accessSync(path_or_obj) {
     const path = typeof path_or_obj === "object" && path_or_obj !== null ? path_or_obj.path : path_or_obj;
-    return wrapSync(() => op_access_sync(path), "accessSync");
+    wrapSync(() => { op_access_sync(path); }, "accessSync");
   }
 
   //
   // writeFile / appendFile (path)
   //
-  static async writeFile({ filePath, data, encoding = "utf8", success, fail, complete }) {
+  static writeFile({ filePath, data, encoding = "utf8", success, fail, complete }) {
     BaseFileManager.#writeFileCommon({ filePath, data, encoding, append: false, success, fail, complete });
   }
 
-  static async appendFile({ filePath, data, encoding = "utf8", success, fail, complete }) {
+  static appendFile({ filePath, data, encoding = "utf8", success, fail, complete }) {
     BaseFileManager.#writeFileCommon({ filePath, data, encoding, append: true, success, fail, complete });
   }
 
@@ -193,7 +203,7 @@ class BaseFileManager {
       ({ data_buf, data_str } = toUint8Array(data));
     } catch (err) {
       const msg = `${append ? "appendFile" : "writeFile"}:fail ${extractErrText(err)}`;
-      const out = { errMsg: msg };
+      const out = failObj(msg);
       fail?.(out);
       complete?.(out);
       return;
@@ -222,7 +232,7 @@ class BaseFileManager {
   }
 
   static openSync({ filePath, flag = "r" }) {
-    return wrapSync(() => ({ fd: String(op_open_file_sync(filePath, flag)) }), "openSync");
+    return wrapSync(() => String(op_open_file_sync(filePath, flag)), "openSync");
   }
 
   static close({ fd, success, fail, complete }) {
@@ -279,7 +289,7 @@ class BaseFileManager {
   }
 
   static fstatSync({ fd }) {
-    return wrapSync(() => ({ stats: new Stats(op_fstat_sync(ensureFd(fd))) }), "fstatSync");
+    return wrapSync(() => new Stats(op_fstat_sync(ensureFd(fd))), "fstatSync");
   }
 
   static ftruncate({ fd, length = 0, success, fail, complete }) {
@@ -318,7 +328,7 @@ class BaseFileManager {
 
   static readdirSync(dirPath_or_obj) {
     const dirPath = typeof dirPath_or_obj === "object" && dirPath_or_obj !== null ? dirPath_or_obj.dirPath : dirPath_or_obj;
-    return wrapSync(() => ({ files: op_readdir_sync(dirPath) }), "readdirSync");
+    return wrapSync(() => op_readdir_sync(dirPath), "readdirSync");
   }
 
   //
@@ -358,8 +368,8 @@ class BaseFileManager {
   static stat({ path, recursive = false, success, fail, complete }) {
     wrapAsync(
       op_stat(path, !!recursive).then((stat) => {
-        if (!recursive) return new Stats(stat);
-        return stat.map((item) => new FileStats(item.path, item.stat));
+        if (!recursive) return { stats: new Stats(stat) };
+        return { stats: stat.map((item) => new FileStats(item.path, item.stat)) };
       }),
       "stat:ok",
       "stat",
@@ -375,10 +385,11 @@ class BaseFileManager {
       path = path_or_obj;
       recursive = recursive_arg ?? false;
     }
+    const rec = !!recursive;
     return wrapSync(() => {
-      const stat = op_stat_sync(path, !!recursive);
-      if (!recursive) return new Stats(stat);
-      return stat.map((item) => new FileStats(item.path, item.stat));
+      const raw = op_stat_sync(path, rec);
+      if (!rec) return new Stats(raw);
+      return raw.map((item) => new FileStats(item.path, item.stat));
     }, "statSync");
   }
 
@@ -426,7 +437,7 @@ class BaseFileManager {
       ({ data_buf, data_str } = toUint8Array(data, offset, length));
     } catch (err) {
       const msg = `write:fail ${extractErrText(err)}`;
-      const out = { errMsg: msg };
+      const out = failObj(msg);
       fail?.(out);
       complete?.(out);
       return;
@@ -458,8 +469,12 @@ class BaseFileManager {
   //
   static readFile({ filePath, encoding, position, length, success, fail, complete }) {
     // Convert position/length to BigInt for native op (or undefined)
-    const pos = typeof position === "number" && position >= 0 ? BigInt(position) : undefined;
-    const len = typeof length === "number" && length > 0 ? BigInt(length) : undefined;
+    const pos = typeof position === "number" && Number.isFinite(position) && position >= 0
+      ? BigInt(Math.trunc(position))
+      : undefined;
+    const len = typeof length === "number" && Number.isFinite(length) && length > 0
+      ? BigInt(Math.trunc(length))
+      : undefined;
 
     const p = op_read_file(filePath, pos, len).then((data) => {
       // data is Uint8Array from native (already sliced by position/length)
@@ -479,84 +494,100 @@ class BaseFileManager {
       position = position_arg;
       length = length_arg;
     }
-    // Convert position/length to BigInt for native op (or undefined)
-    const pos = typeof position === "number" && position >= 0 ? BigInt(position) : undefined;
-    const len = typeof length === "number" && length > 0 ? BigInt(length) : undefined;
+    const pos = typeof position === "number" && Number.isFinite(position) && position >= 0
+      ? BigInt(Math.trunc(position))
+      : undefined;
+    const len = typeof length === "number" && Number.isFinite(length) && length > 0
+      ? BigInt(Math.trunc(length))
+      : undefined;
 
     return wrapSync(() => {
-      const data = op_read_file_sync(filePath, pos, len);
-      return BaseFileManager.#decodeReadData(data, encoding);
+      const raw = op_read_file_sync(filePath, pos, len);
+      return BaseFileManager.#decodeReadResult(raw, encoding);
     }, "readFileSync");
   }
 
-  // Decode binary data based on encoding
-  // If encoding is undefined, return ArrayBuffer
-  // Otherwise decode to string with specified encoding
-  static #decodeReadData(data, encoding) {
-    const bytes = data;
-
-    // No encoding specified - return ArrayBuffer
-    if (encoding === undefined || encoding === null) {
-      return { data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
+  // Decode raw bytes to the target encoding.
+  // Returns the decoded value directly (ArrayBuffer if no encoding, string otherwise).
+  static #decodeReadResult(bytes, encoding) {
+    // WeChat-compatible: empty string means binary (ArrayBuffer).
+    if (encoding === undefined || encoding === null || encoding === "") {
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     }
+    return BaseFileManager.#decodeBytes(bytes, encoding);
+  }
 
-    // Decode based on encoding
+  // Async wrapper: returns { data: ... } for callback-style APIs.
+  static #decodeReadData(bytes, encoding) {
+    return { data: BaseFileManager.#decodeReadResult(bytes, encoding) };
+  }
+
+  // Convert Uint8Array -> string using the specified encoding.
+  // Uses chunked String.fromCharCode to avoid O(n^2) concatenation and stack overflow.
+  static #decodeBytes(bytes, encoding) {
     const enc = String(encoding).toLowerCase();
-    let result;
+    const len = bytes.length;
 
     switch (enc) {
       case "utf8":
       case "utf-8":
-        result = new TextDecoder("utf-8").decode(bytes);
-        break;
+        return new TextDecoder("utf-8").decode(bytes);
 
       case "utf16le":
       case "utf-16le":
       case "ucs2":
       case "ucs-2":
-        result = new TextDecoder("utf-16le").decode(bytes);
-        break;
+        return new TextDecoder("utf-16le").decode(bytes);
 
       case "latin1":
       case "binary":
-        // Latin1: each byte maps to a character (0x00-0xFF)
-        result = "";
-        for (let i = 0; i < bytes.length; i++) {
-          result += String.fromCharCode(bytes[i]);
-        }
-        break;
-
-      case "hex":
-        // Convert bytes to hex string
-        result = "";
-        for (let i = 0; i < bytes.length; i++) {
-          result += bytes[i].toString(16).padStart(2, "0");
-        }
-        break;
-
-      case "base64": {
-        // Convert bytes to base64 string (chunked to avoid stack overflow on large files)
-        let binary = "";
-        for (let i = 0; i < bytes.length; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        result = btoa(binary);
-        break;
-      }
+        return BaseFileManager.#bytesToStringChunked(bytes, len, false);
 
       case "ascii":
-        // ASCII: mask to 7-bit
-        result = "";
-        for (let i = 0; i < bytes.length; i++) {
-          result += String.fromCharCode(bytes[i] & 0x7F);
+        return BaseFileManager.#bytesToStringChunked(bytes, len, true);
+
+      case "hex": {
+        const parts = new Array(len);
+        for (let i = 0; i < len; i++) {
+          parts[i] = HEX_LUT[bytes[i]];
         }
-        break;
+        return parts.join("");
+      }
+
+      case "base64":
+        return btoa(BaseFileManager.#bytesToStringChunked(bytes, len, false));
 
       default:
         throw new IOError(`Unsupported encoding: ${encoding}`);
     }
+  }
 
-    return { data: result };
+  // Build string from bytes in 8 KB chunks to avoid call-stack overflow
+  // and O(n^2) string concatenation.
+  static #bytesToStringChunked(bytes, len, ascii) {
+    const CHUNK = 8192;
+    if (len <= CHUNK) {
+      return ascii
+        ? String.fromCharCode.apply(null, BaseFileManager.#maskAscii(bytes, 0, len))
+        : String.fromCharCode.apply(null, bytes);
+    }
+    const parts = [];
+    for (let i = 0; i < len; i += CHUNK) {
+      const end = i + CHUNK < len ? i + CHUNK : len;
+      const slice = bytes.subarray(i, end);
+      parts.push(
+        ascii
+          ? String.fromCharCode.apply(null, BaseFileManager.#maskAscii(slice, 0, slice.length))
+          : String.fromCharCode.apply(null, slice)
+      );
+    }
+    return parts.join("");
+  }
+
+  static #maskAscii(bytes, start, end) {
+    const out = new Uint8Array(end - start);
+    for (let i = start; i < end; i++) out[i - start] = bytes[i] & 0x7F;
+    return out;
   }
 
   //
@@ -577,23 +608,32 @@ class BaseFileManager {
   }
   static read({ fd, arrayBuffer, offset = 0, length = 0, position, success, fail, complete }) {
     const numFd = ensureFd(fd);
-    const readLen = length > 0 ? length : (arrayBuffer ? arrayBuffer.byteLength - offset : 0);
+    if (!arrayBuffer || !(arrayBuffer instanceof ArrayBuffer)) {
+      const out = failObj("read:fail arrayBuffer must be an ArrayBuffer instance");
+      fail?.(out); complete?.(out); return;
+    }
+    offset = Math.trunc(offset);
+    if (offset < 0 || offset >= arrayBuffer.byteLength) {
+      const out = failObj("read:fail invalid offset");
+      fail?.(out); complete?.(out); return;
+    }
+    const maxLen = arrayBuffer.byteLength - offset;
+    let readLen = length > 0 ? Math.min(Math.trunc(length), maxLen) : maxLen;
     if (readLen <= 0) {
-      const out = { errMsg: "read:fail invalid length" };
-      fail?.(out);
-      complete?.(out);
-      return;
+      const out = failObj("read:fail invalid length");
+      fail?.(out); complete?.(out); return;
     }
     let pos;
     if (typeof position === "number" && Number.isFinite(position) && position >= 0) {
-      pos = BigInt(position);
+      pos = BigInt(Math.trunc(position));
     }
 
     const p = op_read_fd(numFd, BigInt(readLen), pos).then((data) => {
       const src = new Uint8Array(data.buffer || data);
       const dst = new Uint8Array(arrayBuffer);
-      dst.set(src.subarray(0, Math.min(src.length, dst.length - offset)), offset);
-      return { bytesRead: src.length, arrayBuffer };
+      const bytesRead = Math.min(src.length, maxLen);
+      dst.set(src.subarray(0, bytesRead), offset);
+      return { bytesRead, arrayBuffer };
     });
 
     wrapAsync(p, "read:ok", "read", { success, fail, complete });
@@ -601,24 +641,33 @@ class BaseFileManager {
 
   static readSync({ fd, arrayBuffer, offset = 0, length = 0, position }) {
     const numFd = ensureFd(fd);
-    const readLen = length > 0 ? length : (arrayBuffer ? arrayBuffer.byteLength - offset : 0);
-    if (readLen <= 0) throw { errMsg: "readSync:fail invalid length" };
+    if (!arrayBuffer || !(arrayBuffer instanceof ArrayBuffer)) {
+      throw failObj("readSync:fail arrayBuffer must be an ArrayBuffer instance");
+    }
+    offset = Math.trunc(offset);
+    if (offset < 0 || offset >= arrayBuffer.byteLength) {
+      throw failObj("readSync:fail invalid offset");
+    }
+    const maxLen = arrayBuffer.byteLength - offset;
+    let readLen = length > 0 ? Math.min(Math.trunc(length), maxLen) : maxLen;
+    if (readLen <= 0) throw failObj("readSync:fail invalid length");
     let pos;
     if (typeof position === "number" && Number.isFinite(position) && position >= 0) {
-      pos = BigInt(position);
+      pos = BigInt(Math.trunc(position));
     }
 
     return wrapSync(() => {
       const data = op_read_fd_sync(numFd, BigInt(readLen), pos);
       const src = new Uint8Array(data.buffer || data);
       const dst = new Uint8Array(arrayBuffer);
-      dst.set(src.subarray(0, Math.min(src.length, dst.length - offset)), offset);
-      return { bytesRead: src.length, arrayBuffer };
+      const bytesRead = Math.min(src.length, maxLen);
+      dst.set(src.subarray(0, bytesRead), offset);
+      return { bytesRead, arrayBuffer };
     }, "readSync");
   }
   static readCompressedFile({ filePath, compressionAlgorithm, success, fail, complete }) {
     if (compressionAlgorithm !== "br") {
-      const out = { errMsg: "readCompressedFile:fail unsupported compressionAlgorithm" };
+      const out = failObj("readCompressedFile:fail unsupported compressionAlgorithm");
       fail?.(out);
       complete?.(out);
       return;
@@ -634,7 +683,7 @@ class BaseFileManager {
     const filePath = obj.filePath;
     const compressionAlgorithm = obj.compressionAlgorithm;
     if (compressionAlgorithm !== "br") {
-      throw { errMsg: "readCompressedFileSync:fail unsupported compressionAlgorithm" };
+      throw failObj("readCompressedFileSync:fail unsupported compressionAlgorithm");
     }
     return wrapSync(() => {
       const data = op_read_compressed_file_sync(filePath);
@@ -644,22 +693,29 @@ class BaseFileManager {
   }
   static readZipEntry({ filePath, encoding, entries, success, fail, complete }) {
     const entriesJson = JSON.stringify({ encoding, entries });
-    const p = op_read_zip_entry(filePath, entriesJson).then((resultJson) => {
-      const result = JSON.parse(resultJson);
+    // Pre-build path->encoding map to avoid O(nm) find per result entry.
+    let encodingMap;
+    if (!encoding && Array.isArray(entries)) {
+      encodingMap = new Map();
+      for (let i = 0; i < entries.length; i++) {
+        if (entries[i].encoding) encodingMap.set(entries[i].path, entries[i].encoding);
+      }
+    }
+    // op_read_zip_entry returns a V8 object directly via serde_v8 (no JSON.parse).
+    const p = op_read_zip_entry(filePath, entriesJson).then((result) => {
       // For entries without encoding, decode base64 back to ArrayBuffer
-      if (result.entries) {
+      if (result.entries && !encoding) {
         const keys = Object.keys(result.entries);
         for (let i = 0; i < keys.length; i++) {
           const item = result.entries[keys[i]];
-          if (item.data !== null && item.data !== undefined && !encoding) {
-            // Check per-entry encoding
-            const entryDef = Array.isArray(entries) && entries.find(e => e.path === keys[i]);
-            if (!entryDef || !entryDef.encoding) {
+          if (item.data !== null && item.data !== undefined) {
+            if (!encodingMap || !encodingMap.has(keys[i])) {
               // No encoding specified - data is base64, convert to ArrayBuffer
               const binary = atob(item.data);
-              const buf = new ArrayBuffer(binary.length);
+              const len = binary.length;
+              const buf = new ArrayBuffer(len);
               const view = new Uint8Array(buf);
-              for (let j = 0; j < binary.length; j++) {
+              for (let j = 0; j < len; j++) {
                 view[j] = binary.charCodeAt(j);
               }
               item.data = buf;
@@ -674,7 +730,7 @@ class BaseFileManager {
 
   static saveFile({ tempFilePath, filePath, success, fail, complete }) {
     if (typeof tempFilePath !== "string" || tempFilePath.length === 0) {
-      const out = { errMsg: "saveFile:fail tempFilePath is required" };
+      const out = failObj("saveFile:fail tempFilePath is required");
       fail?.(out);
       complete?.(out);
       return;
@@ -700,7 +756,7 @@ class BaseFileManager {
       filePath = filePath_arg;
     }
     if (typeof tempFilePath !== "string" || tempFilePath.length === 0) {
-      throw { errMsg: "saveFileSync:fail tempFilePath is required" };
+      throw failObj("saveFileSync:fail tempFilePath is required");
     }
 
     return wrapSync(() => {
@@ -711,8 +767,26 @@ class BaseFileManager {
         op_copy_file_sync(tempFilePath, savedFilePath);
         op_unlink_sync(tempFilePath);
       }
-      return { savedFilePath };
+      return savedFilePath;
     }, "saveFileSync");
+  }
+
+  //
+  // getFileInfo
+  //
+  static getFileInfo({ filePath, digestAlgorithm = "md5", success, fail, complete }) {
+    const p = op_get_file_info(filePath, digestAlgorithm)
+      .then(([size, digest]) => ({ size, digest }));
+    wrapAsync(p, "getFileInfo:ok", "getFileInfo", { success, fail, complete });
+  }
+
+  //
+  // getSavedFileList
+  //
+  static getSavedFileList({ success, fail, complete } = {}) {
+    const p = op_list_saved_files(SAVE_FILE_DIR, "saved_")
+      .then((fileList) => ({ fileList }));
+    wrapAsync(p, "getSavedFileList:ok", "getSavedFileList", { success: success, fail: fail, complete: complete });
   }
 }
 

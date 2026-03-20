@@ -492,6 +492,54 @@ public final class NativeBridge {
      */
     public static native byte[] getDebugStats(int sessionId);
 
+    // ==================== Setting Callback ====================
+
+    /**
+     * Callback with setting result after openSetting completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with authSetting, or error
+     */
+    public static native void onOpenSettingResult(int sessionId, String resultJson);
+
+    // ==================== Share Callback ====================
+
+    /**
+     * Callback with share result after shareAppMessage completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with result, or error
+     */
+    public static native void onShareAppMessageResult(int sessionId, String resultJson);
+
+    // ==================== Navigate Callback ====================
+
+    /**
+     * Callback with navigation result after navigateToMiniProgram completes.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with result, or error
+     */
+    public static native void onNavigateToMiniProgramResult(int sessionId, String resultJson);
+
+    // ==================== Payment Callbacks ====================
+
+    /**
+     * Callback with Midas payment result.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with result (include requestId), or error
+     */
+    public static native void onMidasPaymentResult(int sessionId, String resultJson);
+
+    /**
+     * Callback with Midas payment game item result.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with result (include requestId), or error
+     */
+    public static native void onMidasPaymentGameItemResult(int sessionId, String resultJson);
+
     // ==================== Console Logs ====================
 
     /**

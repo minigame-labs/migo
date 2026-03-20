@@ -52,6 +52,123 @@ use tracing::debug;
 
 use crate::network::Options;
 
+// ---------------------------------------------------------------------------
+// SSRF-preventing DNS resolver
+// ---------------------------------------------------------------------------
+
+/// Reject a URL whose host is an IP-literal pointing to a blocked range.
+///
+/// hyper-util skips the DNS resolver for IP-literal hosts, so the
+/// `SsrfCheckingResolver` below does NOT cover `http://127.0.0.1/...`.
+/// This function must be called **before** every `client.request()`
+/// / `client.post()` to close that gap.
+fn reject_blocked_ip_literal(url: &Url) -> Result<(), JsErrorBox> {
+    if let Some(host) = url.host_str() {
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addr_str = format!("{}:{}", host, port);
+        if let Ok(sock_addr) = addr_str.parse::<std::net::SocketAddr>() {
+            if super::address_filter::is_blocked_address(&sock_addr) {
+                return Err(JsErrorBox::generic(format!(
+                    "fetch: connection to {} is not allowed (private/loopback address)",
+                    sock_addr.ip()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check URL against the domain whitelist in NetworkPolicy.
+/// If the whitelist is empty, all domains are allowed.
+/// Matching supports exact match and subdomain match (e.g., "example.com"
+/// allows "api.example.com").
+fn check_domain_whitelist(url: &Url, state: &OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<shared::op_state::HostOpState>();
+    let wl = &host.network_policy.domain_whitelist;
+    if wl.is_empty() {
+        return Ok(());
+    }
+    if let Some(url_host) = url.host_str() {
+        for allowed in wl {
+            if url_host == allowed.as_str()
+                || url_host.ends_with(&format!(".{}", allowed))
+            {
+                return Ok(());
+            }
+        }
+        return Err(JsErrorBox::generic(format!(
+            "fetch: domain '{}' is not in the allowed list",
+            url_host
+        )));
+    }
+    Ok(())
+}
+
+/// Check HTTPS enforcement policy.
+fn check_https_policy(url: &Url, state: &OpState) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<shared::op_state::HostOpState>();
+    if host.network_policy.enforce_https && url.scheme() == "http" {
+        return Err(JsErrorBox::generic(
+            "fetch:fail HTTP is not allowed, use HTTPS",
+        ));
+    }
+    Ok(())
+}
+
+/// Headers that game JS must not inject — these can amplify SSRF,
+/// bypass reverse proxies, or leak internal routing information.
+fn is_blocked_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-proto"
+            | "x-original-url"
+            | "x-rewrite-url"
+            | "x-real-ip"
+            | "forwarded"
+            | "proxy-authorization"
+    )
+}
+
+/// Custom DNS resolver that checks ALL resolved addresses against the
+/// blocked-address list before returning them to reqwest.  This is injected
+/// into every `reqwest::Client` via `ClientBuilder::dns_resolver()`, so
+/// reqwest connects **only** to addresses we have verified — no separate
+/// pre-flight check needed, no double-resolution TOCTOU window.
+///
+/// Note: hyper-util bypasses the resolver for IP-literal hosts, so callers
+/// must also call `reject_blocked_ip_literal()` before sending requests.
+struct SsrfCheckingResolver;
+
+impl reqwest::dns::Resolve for SsrfCheckingResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str();
+            let addr_str = format!("{}:0", host);
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr_str)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .collect();
+
+            for addr in &addrs {
+                if super::address_filter::is_blocked_address(addr) {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "fetch: connection to {} is not allowed (private/loopback address)",
+                            addr.ip()
+                        ),
+                    )) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+
+            let addrs: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchReturn {
@@ -172,7 +289,9 @@ pub fn get_or_create_client_from_state(
             Ok(client.0.clone())
         } else {
             let options = state.borrow::<Options>();
-            let client = create_http_client(&options.user_agent, true)?;
+            let user_agent = options.user_agent.clone();
+            let policy = state.borrow::<shared::op_state::HostOpState>().network_policy.clone();
+            let client = create_http_client(&user_agent, true, &policy)?;
             state.put::<Http2Client>(Http2Client(client.clone()));
             Ok(client)
         }
@@ -181,7 +300,9 @@ pub fn get_or_create_client_from_state(
             Ok(client.0.clone())
         } else {
             let options = state.borrow::<Options>();
-            let client = create_http_client(&options.user_agent, false)?;
+            let user_agent = options.user_agent.clone();
+            let policy = state.borrow::<shared::op_state::HostOpState>().network_policy.clone();
+            let client = create_http_client(&user_agent, false, &policy)?;
             state.put::<Http1Client>(Http1Client(client.clone()));
             Ok(client)
         }
@@ -244,6 +365,11 @@ pub fn op_fetch(
                 return Err(JsErrorBox::type_error("Invalid URL"));
             }
 
+            // Security: SSRF + domain whitelist + HTTPS enforcement.
+            reject_blocked_ip_literal(&url)?;
+            check_domain_whitelist(&url, state)?;
+            check_https_policy(&url, state)?;
+
             let mut request = client
                 .request(method.clone(), url)
                 .timeout(Duration::from_millis(timeout as u64));
@@ -284,7 +410,10 @@ pub fn op_fetch(
                 let v = HeaderValue::from_bytes(&value)
                     .map_err(|_| JsErrorBox::type_error("Invalid Header Value"))?;
 
-                if (name != HOST || allow_host) && name != CONTENT_LENGTH {
+                if (name != HOST || allow_host)
+                    && name != CONTENT_LENGTH
+                    && !is_blocked_header(&name)
+                {
                     header_map.append(name, v);
                 }
             }
@@ -308,6 +437,8 @@ pub fn op_fetch(
             let cancel_handle_ = cancel_handle.clone();
 
             let fut = async move {
+                // DNS resolution and SSRF check happen inside
+                // SsrfCheckingResolver when reqwest opens the connection.
                 request
                     .send()
                     .or_cancel(cancel_handle_)
@@ -494,6 +625,19 @@ pub async fn op_fetch_send(
 
     let content_length = res.content_length();
     let remote_addr = res.remote_addr();
+
+    // SSRF prevention: check the *actual* resolved address after reqwest
+    // performed DNS resolution internally.  The pre-flight check in op_fetch
+    // only catches IP-literal URLs; this covers the domain-name path.
+    if let Some(addr) = remote_addr {
+        if super::address_filter::is_blocked_address(&addr) {
+            return Err(JsErrorBox::generic(format!(
+                "fetch: connection to {} is not allowed (private/loopback address)",
+                addr.ip()
+            )));
+        }
+    }
+
     let (remote_addr_ip, remote_addr_port) = if let Some(addr) = remote_addr {
         (Some(addr.ip().to_string()), Some(addr.port()))
     } else {
@@ -518,11 +662,74 @@ pub async fn op_fetch_send(
     })
 }
 
-pub fn create_http_client(user_agent: &str, enable_http2: bool) -> Result<Client, AnyError> {
+pub fn create_http_client(
+    user_agent: &str,
+    enable_http2: bool,
+    net_policy: &shared::op_state::NetworkPolicy,
+) -> Result<Client, AnyError> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, user_agent.parse().unwrap());
+
+    // Capture network policy for the redirect closure.
+    let whitelist = net_policy.domain_whitelist.clone();
+    let enforce_https = net_policy.enforce_https;
+
+    // Custom redirect policy: checks IP-block, domain whitelist, and HTTPS
+    // enforcement on every redirect target.  This prevents bypasses like
+    // "allowed.com → 302 → blocked.com" or "https → 302 → http".
+    let ssrf_redirect_policy = Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.stop();
+        }
+
+        // Extract URL data before consuming `attempt` (which takes ownership).
+        let scheme = attempt.url().scheme().to_string();
+        let host_str = attempt.url().host_str().map(|s| s.to_string());
+        let port = attempt.url().port_or_known_default().unwrap_or(443);
+
+        if let Some(ref host) = host_str {
+            // 1. Block redirect to private/loopback IP-literals
+            let addr_str = format!("{}:{}", host, port);
+            if let Ok(sock_addr) = addr_str.parse::<std::net::SocketAddr>() {
+                if super::address_filter::is_blocked_address(&sock_addr) {
+                    return attempt.error(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "fetch: redirect to {} is not allowed (private/loopback address)",
+                            sock_addr.ip()
+                        ),
+                    ));
+                }
+            }
+
+            // 2. Domain whitelist check on redirect target
+            if !whitelist.is_empty() {
+                let allowed = whitelist.iter().any(|d| {
+                    host.as_str() == d.as_str() || host.ends_with(&format!(".{}", d))
+                });
+                if !allowed {
+                    return attempt.error(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("fetch: redirect to '{}' is not in the allowed domain list", host),
+                    ));
+                }
+            }
+        }
+
+        // 3. HTTPS enforcement on redirect target
+        if enforce_https && scheme == "http" {
+            return attempt.error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fetch: redirect to HTTP is not allowed (HTTPS enforced)",
+            ));
+        }
+
+        attempt.follow()
+    });
+
     let mut builder = Client::builder()
-        .redirect(Policy::limited(10))
+        .dns_resolver(std::sync::Arc::new(SsrfCheckingResolver))
+        .redirect(ssrf_redirect_policy)
         .default_headers(headers)
         .pool_max_idle_per_host(5)
         .pool_idle_timeout(Duration::from_secs(90));
@@ -606,6 +813,14 @@ pub async fn op_fetch_upload(
     // Parse URL
     let parsed_url = Url::parse(&url).map_err(|_| JsErrorBox::type_error("Invalid URL"))?;
 
+    // Security: SSRF + domain whitelist + HTTPS enforcement.
+    reject_blocked_ip_literal(&parsed_url)?;
+    {
+        let st = state.borrow();
+        check_domain_whitelist(&parsed_url, &*st)?;
+        check_https_policy(&parsed_url, &*st)?;
+    }
+
     debug!("Upload request: POST {}", parsed_url);
 
     // Build request
@@ -614,15 +829,20 @@ pub async fn op_fetch_upload(
         .timeout(Duration::from_millis(timeout as u64))
         .multipart(form);
 
-    // Apply custom headers (skip Content-Type as reqwest sets it for multipart)
+    // Apply custom headers — same security filtering as op_fetch.
     let mut header_map = HeaderMap::new();
     for (key, value) in headers {
         let hname =
             HeaderName::from_bytes(&key).map_err(|_| JsErrorBox::type_error("Invalid Header"))?;
         let hval = HeaderValue::from_bytes(&value)
             .map_err(|_| JsErrorBox::type_error("Invalid Header Value"))?;
-        // Skip Content-Type and Content-Length for multipart (reqwest manages these)
-        if hname != http::header::CONTENT_TYPE && hname != CONTENT_LENGTH {
+        // Skip Content-Type and Content-Length (reqwest manages these for multipart),
+        // HOST (prevent host-header attacks), and proxy-related headers (SSRF hardening).
+        if hname != http::header::CONTENT_TYPE
+            && hname != CONTENT_LENGTH
+            && hname != HOST
+            && !is_blocked_header(&hname)
+        {
             header_map.append(hname, hval);
         }
     }

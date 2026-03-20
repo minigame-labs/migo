@@ -49,9 +49,14 @@ pub fn send_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), Str
 
     match sender.try_send(cmd) {
         Ok(()) => Ok(()),
-        Err(TrySendError::Full(_cmd)) => Err(format!(
-            "Failed to send command to host {host_id}: queue is full"
-        )),
+        Err(TrySendError::Full(_cmd)) => {
+            if let Some(stats) = shared::stats::get_stats(host_id) {
+                stats.command_drops.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(format!(
+                "Failed to send command to host {host_id}: queue is full"
+            ))
+        }
         Err(TrySendError::Closed(_cmd)) => {
             // host likely dead -> cleanup registry entry
             let _ = unregister_sender(host_id);

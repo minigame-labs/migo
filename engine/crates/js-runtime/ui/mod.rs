@@ -84,6 +84,23 @@ pub fn op_show_action_sheet(state: &mut OpState, #[string] json: String) -> Resu
     Err(JsErrorBox::generic("showActionSheet:fail not supported"))
 }
 
+// ==================== Menu Button Ops ====================
+
+#[op2]
+#[string]
+pub fn op_get_menu_button_rect(state: &mut OpState) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(sys_info) = services.system_info() {
+            return sys_info
+                .get_menu_button_bounding_client_rect_json()
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    // Fallback: default rect (same as trait default)
+    Ok(r#"{"width":87,"height":32,"top":4,"bottom":36,"left":278,"right":365}"#.to_string())
+}
+
 // ==================== Extension Definition ====================
 
 deno_core::extension!(
@@ -96,10 +113,13 @@ deno_core::extension!(
         op_show_loading,
         op_hide_loading,
         op_show_action_sheet,
+        op_get_menu_button_rect,
     ],
     esm = [
         dir "ui",
         "01_interaction.js",
+        "02_buttons.js",
+        "03_page_manager.js",
     ]
 );
 

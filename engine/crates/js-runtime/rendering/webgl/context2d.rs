@@ -341,6 +341,37 @@ impl FrameBuffer {
         }
     }
 
+    fn set_composite_operation(&mut self, op: u8) {
+        self.commands.push(Canvas2DCmd::SetCompositeOperation { op });
+    }
+
+    fn set_line_dash(&mut self, segments: Vec<f32>) {
+        self.commands.push(Canvas2DCmd::SetLineDash { segments });
+    }
+
+    fn set_line_dash_offset(&mut self, offset: f32) {
+        self.commands
+            .push(Canvas2DCmd::SetLineDashOffset { offset });
+    }
+
+    fn set_fill_style_gradient(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        stops: Vec<shared::protocol::render_cmd::GradientStop>,
+    ) {
+        self.fill_color = None; // invalidate solid-color cache
+        self.commands.push(Canvas2DCmd::SetFillStyleGradient {
+            x0,
+            y0,
+            x1,
+            y1,
+            stops,
+        });
+    }
+
     fn set_line_cap(&mut self, cap: u8) {
         if self.line_cap != Some(cap) {
             self.line_cap = Some(cap);
@@ -532,6 +563,36 @@ impl FrameCommandCollector {
     #[inline]
     fn set_global_alpha(&self, canvas_id: u32, alpha: f32) {
         self.with_buffer(canvas_id, |buf| buf.set_global_alpha(alpha));
+    }
+
+    #[inline]
+    fn set_composite_operation(&self, canvas_id: u32, op: u8) {
+        self.with_buffer(canvas_id, |buf| buf.set_composite_operation(op));
+    }
+
+    #[inline]
+    fn set_line_dash(&self, canvas_id: u32, segments: Vec<f32>) {
+        self.with_buffer(canvas_id, |buf| buf.set_line_dash(segments));
+    }
+
+    #[inline]
+    fn set_line_dash_offset(&self, canvas_id: u32, offset: f32) {
+        self.with_buffer(canvas_id, |buf| buf.set_line_dash_offset(offset));
+    }
+
+    #[inline]
+    fn set_fill_style_gradient(
+        &self,
+        canvas_id: u32,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        stops: Vec<shared::protocol::render_cmd::GradientStop>,
+    ) {
+        self.with_buffer(canvas_id, |buf| {
+            buf.set_fill_style_gradient(x0, y0, x1, y1, stops)
+        });
     }
 
     #[inline]
@@ -1022,6 +1083,92 @@ pub fn op_set_global_alpha(state: &mut OpState, #[smi] canvas_id: u32, alpha: f3
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
         collector.set_global_alpha(canvas_id, alpha);
     }
+}
+
+#[op2(fast)]
+pub fn op_set_composite_operation(state: &mut OpState, #[smi] canvas_id: u32, #[smi] op: u8) {
+    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+        collector.set_composite_operation(canvas_id, op);
+    }
+}
+
+#[op2(fast)]
+pub fn op_set_line_dash(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[buffer] segments: &[u8],
+) {
+    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+        // segments is a Float32Array transferred as raw bytes
+        let floats: Vec<f32> = segments
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        collector.set_line_dash(canvas_id, floats);
+    }
+}
+
+#[op2(fast)]
+pub fn op_set_line_dash_offset(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
+    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+        collector.set_line_dash_offset(canvas_id, offset);
+    }
+}
+
+#[op2(fast)]
+pub fn op_set_fill_style_gradient(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    #[string] stops_json: String,
+) {
+    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+        // Parse stops from JSON: [{"offset":0,"r":255,"g":0,"b":0,"a":255}, ...]
+        let stops = parse_gradient_stops(&stops_json);
+        collector.set_fill_style_gradient(canvas_id, x0, y0, x1, y1, stops);
+    }
+}
+
+fn parse_gradient_stops(json: &str) -> Vec<shared::protocol::render_cmd::GradientStop> {
+    // Minimal JSON array parser for gradient stops to avoid serde dependency.
+    // Format: [{"offset":0.0,"r":255,"g":0,"b":0,"a":255}, ...]
+    let mut stops = Vec::new();
+    // Simple approach: split by "},{" boundaries
+    let trimmed = json.trim().trim_start_matches('[').trim_end_matches(']');
+    if trimmed.is_empty() {
+        return stops;
+    }
+    for entry in trimmed.split("},{") {
+        let s = entry.trim().trim_start_matches('{').trim_end_matches('}');
+        let mut offset = 0.0f32;
+        let mut r = 0u8;
+        let mut g = 0u8;
+        let mut b = 0u8;
+        let mut a = 255u8;
+        for pair in s.split(',') {
+            let pair = pair.trim().trim_matches('"');
+            if let Some((key, val)) = pair.split_once(':') {
+                let key = key.trim().trim_matches('"');
+                let val = val.trim().trim_matches('"');
+                match key {
+                    "offset" => offset = val.parse().unwrap_or(0.0),
+                    "r" => r = val.parse().unwrap_or(0),
+                    "g" => g = val.parse().unwrap_or(0),
+                    "b" => b = val.parse().unwrap_or(0),
+                    "a" => a = val.parse().unwrap_or(255),
+                    _ => {}
+                }
+            }
+        }
+        stops.push(shared::protocol::render_cmd::GradientStop {
+            offset,
+            color: shared::protocol::color::Color::rgbai(r, g, b, a),
+        });
+    }
+    stops
 }
 
 #[op2(fast)]

@@ -101,6 +101,33 @@ pub async fn op_ws_create(
         return Err(JsErrorBox::type_error("URL scheme must be ws:// or wss://"));
     }
 
+    // SSRF prevention: resolve DNS, check ALL addresses, then connect
+    // to the verified address directly.  This eliminates the double-
+    // resolution TOCTOU window — we connect the TcpStream ourselves
+    // and hand it to the WebSocket handshake layer.
+    let connect_addr = if let Some(host) = request.uri().host() {
+        let port = request.uri().port_u16().unwrap_or(if scheme == "wss" { 443 } else { 80 });
+        let addr_str = format!("{}:{}", host, port);
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr_str)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("WebSocket DNS resolve failed: {}", e)))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(JsErrorBox::generic("WebSocket DNS resolve returned no addresses"));
+        }
+        for addr in &addrs {
+            if super::address_filter::is_blocked_address(addr) {
+                return Err(JsErrorBox::generic(format!(
+                    "WebSocket connection to {} is not allowed (private/loopback address)",
+                    addr.ip()
+                )));
+            }
+        }
+        addrs[0]
+    } else {
+        return Err(JsErrorBox::generic("WebSocket URL has no host"));
+    };
+
     // Add custom headers
     let req_headers = request.headers_mut();
     for (key, value) in &headers {
@@ -120,10 +147,19 @@ pub async fn op_ws_create(
         }
     }
 
-    // Connect
-    let (ws_stream, response) = tokio_tungstenite::connect_async(request)
+    // Connect TCP to the verified address (no second DNS resolution).
+    let tcp_stream = tokio::net::TcpStream::connect(connect_addr)
         .await
-        .map_err(|e| JsErrorBox::generic(format!("WebSocket connection failed: {}", e)))?;
+        .map_err(|e| JsErrorBox::generic(format!("WebSocket TCP connect failed: {}", e)))?;
+    let _ = tcp_stream.set_nodelay(true);
+
+    // Handshake over the pre-connected stream.
+    // client_async_tls_with_config handles TLS upgrade for wss:// using
+    // the hostname from the request URI for SNI — no second DNS lookup.
+    let (ws_stream, response) =
+        tokio_tungstenite::client_async_tls_with_config(request, tcp_stream, None, None)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("WebSocket handshake failed: {}", e)))?;
 
     let protocol = response
         .headers()

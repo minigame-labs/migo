@@ -120,12 +120,20 @@ pub struct VfsPolicy {
     ///
     /// Default: **true**.
     pub deny_symlinks_in_code_dir: bool,
+
+    /// When `true`, symlinks are also rejected in **writable** directories
+    /// (`/user`, `/cache`, `/tmp`).  Without this, a symlink planted in a
+    /// writable directory could escape the sandbox via read/write operations.
+    ///
+    /// Default: **true**.
+    pub deny_symlinks_in_writable_dirs: bool,
 }
 
 impl Default for VfsPolicy {
     fn default() -> Self {
         Self {
             deny_symlinks_in_code_dir: true,
+            deny_symlinks_in_writable_dirs: true,
         }
     }
 }
@@ -512,9 +520,18 @@ impl VirtualFS {
     }
 
     /// Whether symlinks should be rejected for this mapping.
+    ///
+    /// Symlinks are denied in read-only directories (controlled by
+    /// `deny_symlinks_in_code_dir`) **and** in writable directories
+    /// (controlled by `deny_symlinks_in_writable_dirs`).  Both default
+    /// to `true`, closing the sandbox escape via writable-dir symlinks.
     #[inline]
     fn should_deny_symlinks(&self, mapping: &PathMapping) -> bool {
-        self.policy.deny_symlinks_in_code_dir && !mapping.permissions.write
+        if mapping.permissions.write {
+            self.policy.deny_symlinks_in_writable_dirs
+        } else {
+            self.policy.deny_symlinks_in_code_dir
+        }
     }
 
     /// Walk every path component between `base` and `full_path` and reject
@@ -768,6 +785,7 @@ mod tests {
             PathBuf::from("/data/games/test/tmp"),
             VfsPolicy {
                 deny_symlinks_in_code_dir: false,
+                deny_symlinks_in_writable_dirs: false,
             },
         );
         assert!(!vfs.policy().deny_symlinks_in_code_dir);
@@ -890,10 +908,14 @@ mod tests {
             let _ = fs::remove_dir_all(&base);
         }
 
-        // -- Symlink within sandbox (should be OK) --
+        // -- Symlink within writable dir (denied by default policy) --
+        //
+        // Even if the symlink target is inside the sandbox, symlinks in
+        // writable directories are denied by default to prevent TOCTOU
+        // and sandbox-escape attacks.
 
         #[test]
-        fn test_symlink_within_sandbox_allowed() {
+        fn test_symlink_within_writable_dir_denied_by_default() {
             let base = make_test_dir("symlink_within_sandbox");
             let vfs = make_real_vfs(&base);
 
@@ -904,7 +926,31 @@ mod tests {
             let link = base.join("user").join("alias.txt");
             std::os::unix::fs::symlink(&real_file, &link).unwrap();
 
-            // Should be allowed (symlink stays within sandbox)
+            // Default policy now denies symlinks in writable dirs too
+            let result = vfs.resolve("/user/alias.txt", FileOp::Read);
+            assert_eq!(result.unwrap_err(), VfsError::SymlinkNotAllowed);
+
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        // -- Symlink within writable dir allowed when policy is relaxed --
+
+        #[test]
+        fn test_symlink_within_writable_dir_allowed_when_policy_off() {
+            let base = make_test_dir("symlink_writable_allowed");
+            let policy = VfsPolicy {
+                deny_symlinks_in_code_dir: true,
+                deny_symlinks_in_writable_dirs: false,
+            };
+            let vfs = make_real_vfs_with_policy(&base, policy);
+
+            let real_file = base.join("user").join("real.txt");
+            fs::write(&real_file, "hello").unwrap();
+
+            let link = base.join("user").join("alias.txt");
+            std::os::unix::fs::symlink(&real_file, &link).unwrap();
+
+            // With writable-dir symlinks allowed, this should pass
             let result = vfs.resolve("/user/alias.txt", FileOp::Read);
             assert!(result.is_ok());
 
@@ -938,6 +984,7 @@ mod tests {
             let base = make_test_dir("symlink_code_dir_allowed");
             let policy = VfsPolicy {
                 deny_symlinks_in_code_dir: false,
+                deny_symlinks_in_writable_dirs: false,
             };
             let vfs = make_real_vfs_with_policy(&base, policy);
 
@@ -1035,6 +1082,99 @@ mod tests {
 
             let result = vfs.resolve("/user/a/b/etc/passwd", FileOp::Read);
             assert_eq!(result.unwrap_err(), VfsError::SymlinkEscape);
+
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        // -- P3-2: Writable-dir symlink tests (validates P0-2 fix) --
+
+        #[test]
+        fn test_writable_dir_symlink_escape_outside() {
+            let base = make_test_dir("writable_symlink_outside");
+            let vfs = make_real_vfs(&base);
+
+            let outside = base.join("outside_target");
+            fs::create_dir_all(&outside).unwrap();
+            let link = base.join("user").join("escape_link");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+            let result = vfs.resolve("/user/escape_link/file.txt", FileOp::Write);
+            assert!(result.is_err(), "Symlink in writable dir to outside must be blocked");
+
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn test_writable_dir_symlink_to_system() {
+            let base = make_test_dir("writable_symlink_system");
+            let vfs = make_real_vfs(&base);
+
+            let link = base.join("cache").join("etc_link");
+            std::os::unix::fs::symlink("/etc", &link).unwrap();
+
+            let result = vfs.resolve("/cache/etc_link/passwd", FileOp::Read);
+            let err = result.unwrap_err();
+            assert!(
+                err == VfsError::SymlinkNotAllowed || err == VfsError::SymlinkEscape,
+                "expected SymlinkNotAllowed or SymlinkEscape, got {:?}", err
+            );
+
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn test_tmp_dir_symlink_blocked() {
+            let base = make_test_dir("tmp_symlink");
+            let vfs = make_real_vfs(&base);
+
+            let link = base.join("tmp").join("sneaky");
+            std::os::unix::fs::symlink("/", &link).unwrap();
+
+            let result = vfs.resolve("/tmp/sneaky/etc/shadow", FileOp::Read);
+            let err = result.unwrap_err();
+            assert!(
+                err == VfsError::SymlinkNotAllowed || err == VfsError::SymlinkEscape,
+                "expected rejection, got {:?}", err
+            );
+
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn test_canonicalize_containment_normal_file() {
+            let base = make_test_dir("canon_normal");
+            let vfs = make_real_vfs(&base);
+
+            let file = base.join("user").join("normal.txt");
+            fs::write(&file, "safe content").unwrap();
+
+            let result = vfs.resolve("/user/normal.txt", FileOp::Read);
+            assert!(result.is_ok());
+
+            let _ = fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn test_all_four_dirs_reject_symlinks_by_default() {
+            let base = make_test_dir("all_dirs_symlink");
+            let vfs = make_real_vfs(&base);
+
+            let outside = base.join("outside_all");
+            fs::create_dir_all(&outside).unwrap();
+
+            for dir_name in &["code", "user", "cache", "tmp"] {
+                let link = base.join(dir_name).join("link_out");
+                let _ = std::fs::remove_file(&link);
+                std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+                let vpath = format!("/{}/link_out/x.txt", dir_name);
+                let op = if *dir_name == "code" { FileOp::Read } else { FileOp::Write };
+                let result = vfs.resolve(&vpath, op);
+                assert!(
+                    result.is_err(),
+                    "Symlink escape in /{} should be blocked, but got Ok", dir_name
+                );
+            }
 
             let _ = fs::remove_dir_all(&base);
         }

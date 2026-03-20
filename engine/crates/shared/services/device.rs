@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use super::{
     AuthService, CameraService, ClipboardService, CodecService, FileService, GameLogService,
-    ImageApiService, InteractionService, LocationService, NetworkService, ScanCodeService,
-    SubpackageService, SystemInfoService,
+    ImageApiService, InteractionService, LocationService, NavigateService, NetworkService,
+    PaymentService, ScanCodeService, ShareService, SubpackageService, SystemInfoService,
 };
 
 // ==================== Battery ====================
@@ -400,6 +400,15 @@ pub trait DeviceServices: Send + Sync {
         None
     }
     fn subpackage(&self) -> Option<Arc<dyn SubpackageService>> {
+        None
+    }
+    fn share(&self) -> Option<Arc<dyn ShareService>> {
+        None
+    }
+    fn navigate(&self) -> Option<Arc<dyn NavigateService>> {
+        None
+    }
+    fn payment(&self) -> Option<Arc<dyn PaymentService>> {
         None
     }
 }

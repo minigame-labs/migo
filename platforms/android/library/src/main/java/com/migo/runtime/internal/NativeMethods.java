@@ -920,4 +920,72 @@ public final class NativeMethods {
             NativeBridge.onRecorderFrameData(sessionId, frameData, isLastFrame);
         }
     }
+
+    // ==================== Setting Callback ====================
+
+    /**
+     * Callback for openSetting result.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON with authSetting
+     */
+    public static void onOpenSettingResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onOpenSettingResult(sessionId, resultJson);
+        }
+    }
+
+    // ==================== Share Callback ====================
+
+    /**
+     * Callback for shareAppMessage result.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON result
+     */
+    public static void onShareAppMessageResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onShareAppMessageResult(sessionId, resultJson);
+        }
+    }
+
+    // ==================== Navigate Callback ====================
+
+    /**
+     * Callback for navigateToMiniProgram result.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON result
+     */
+    public static void onNavigateToMiniProgramResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onNavigateToMiniProgramResult(sessionId, resultJson);
+        }
+    }
+
+    // ==================== Payment Callbacks ====================
+
+    /**
+     * Callback for requestMidasPayment result.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON result (should include requestId)
+     */
+    public static void onMidasPaymentResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onMidasPaymentResult(sessionId, resultJson);
+        }
+    }
+
+    /**
+     * Callback for requestMidasPaymentGameItem result.
+     *
+     * @param sessionId  The session ID
+     * @param resultJson JSON result (should include requestId)
+     */
+    public static void onMidasPaymentGameItemResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onMidasPaymentGameItemResult(sessionId, resultJson);
+        }
+    }
 }

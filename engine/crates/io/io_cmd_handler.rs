@@ -10,7 +10,10 @@ use tracing::{debug, trace, warn};
 
 use shared::{
     error::{EngineError, ErrorCode, io_error_to_error_code},
-    protocol::io_cmd::{FileId, FileStat, IOCmd, IOCmdResp, NormalizedImage, OpenFlag, WriteMode},
+    protocol::io_cmd::{
+        FileId, FileStat, IOCmd, IOCmdResp, NormalizedImage, OpenFlag, SavedFileInfo, StatEntry,
+        StatResult, WriteMode, ZipEntryResult, MAX_READ_LENGTH,
+    },
 };
 
 #[cfg(feature = "zip-extract")]
@@ -169,12 +172,20 @@ impl IoCmdHandler {
                 Self::send_resp(resp, r);
             }
 
-            // Readdir returns ALL files recursively under dir_path (relative paths), sorted.
+            // Readdir returns direct children (file and directory names), sorted.
             IOCmd::Readdir { dir_path, resp } => {
-                let root = PathBuf::from(&dir_path);
-                let r = Self::read_dir_files_recursive(root)
-                    .await
-                    .map_err(Self::io_err);
+                let r: Result<Vec<String>, EngineError> = (async {
+                    let mut entries = Vec::new();
+                    let mut rd = fs::read_dir(&dir_path).await.map_err(Self::io_err)?;
+                    while let Some(entry) = rd.next_entry().await.map_err(Self::io_err)? {
+                        if let Some(name) = entry.file_name().to_str() {
+                            entries.push(name.to_string());
+                        }
+                    }
+                    entries.sort_unstable();
+                    Ok(entries)
+                })
+                .await;
                 Self::send_resp(resp, r);
             }
 
@@ -213,7 +224,7 @@ impl IoCmdHandler {
             } => {
                 let r = if !recursive {
                     match fs::metadata(&path).await {
-                        Ok(meta) => Ok(deno_core::serde_json::json!(Self::build_stat(meta))),
+                        Ok(meta) => Ok(StatResult::Single(Self::build_stat(meta))),
                         Err(e) => Err(Self::io_err(e)),
                     }
                 } else {
@@ -286,6 +297,11 @@ impl IoCmdHandler {
                 resp,
             } => {
                 let r: Result<Vec<u8>, EngineError> = (async {
+                    if length > MAX_READ_LENGTH {
+                        return Err(EngineError::new(ErrorCode::InvalidArgument)
+                            .with_detail(format!("read length {} exceeds limit {}", length, MAX_READ_LENGTH)));
+                    }
+
                     let file = self
                         .files
                         .get_mut(&rid)
@@ -321,8 +337,25 @@ impl IoCmdHandler {
                 resp,
             } => {
                 let r: Result<Vec<u8>, EngineError> = (async {
-                    // If no position/length, read entire file (fast path)
+                    if let Some(len) = length {
+                        if len > MAX_READ_LENGTH {
+                            return Err(EngineError::new(ErrorCode::InvalidArgument)
+                                .with_detail(format!("read length {} exceeds limit {}", len, MAX_READ_LENGTH)));
+                        }
+                    }
+
+                    // If no position/length, read entire file (fast path).
+                    // Check file size first to enforce the 100 MiB limit.
                     if position.is_none() && length.is_none() {
+                        let meta = fs::metadata(&path).await.map_err(Self::io_err)?;
+                        if meta.len() > MAX_READ_LENGTH {
+                            return Err(EngineError::new(ErrorCode::InvalidArgument)
+                                .with_detail(format!(
+                                    "file size {} exceeds limit {}",
+                                    meta.len(),
+                                    MAX_READ_LENGTH
+                                )));
+                        }
                         return fs::read(&path).await.map_err(Self::io_err);
                     }
 
@@ -362,29 +395,35 @@ impl IoCmdHandler {
                 Self::send_resp(resp, r);
             }
 
-            IOCmd::ReadCompressedFile { path, resp } => {
-                let r: Result<Vec<u8>, EngineError> = (async {
-                    let compressed = fs::read(&path).await.map_err(Self::io_err)?;
-                    tokio::task::spawn_blocking(move || {
-                        let mut decompressed = Vec::new();
-                        let mut reader =
-                            brotli::Decompressor::new(compressed.as_slice(), 4096);
-                        std::io::Read::read_to_end(&mut reader, &mut decompressed)
-                            .map_err(|e| {
-                                EngineError::new(ErrorCode::IoError)
-                                    .with_detail(format!("brotli decompress failed: {}", e))
-                            })?;
-                        Ok(decompressed)
-                    })
-                    .await
-                    .map_err(|e| {
-                        EngineError::new(ErrorCode::IoError)
-                            .with_detail(format!("task join error: {}", e))
-                    })?
-                })
-                .await;
+            // --- Heavy ops: spawned concurrently so the IO loop is not blocked ---
 
-                Self::send_resp(resp, r);
+            IOCmd::ReadCompressedFile { path, resp } => {
+                tokio::spawn(async move {
+                    let r: Result<Vec<u8>, EngineError> = async {
+                        let compressed = fs::read(&path).await.map_err(|e| {
+                            EngineError::new(io_error_to_error_code(&e))
+                                .with_detail(e.to_string())
+                        })?;
+                        tokio::task::spawn_blocking(move || {
+                            let mut decompressed = Vec::new();
+                            let mut reader =
+                                brotli::Decompressor::new(compressed.as_slice(), 4096);
+                            std::io::Read::read_to_end(&mut reader, &mut decompressed)
+                                .map_err(|e| {
+                                    EngineError::new(ErrorCode::IoError)
+                                        .with_detail(format!("brotli decompress failed: {}", e))
+                                })?;
+                            Ok(decompressed)
+                        })
+                        .await
+                        .map_err(|e| {
+                            EngineError::new(ErrorCode::IoError)
+                                .with_detail(format!("task join error: {}", e))
+                        })?
+                    }
+                    .await;
+                    resp.send(r);
+                });
             }
 
             #[cfg(feature = "zip-extract")]
@@ -393,17 +432,18 @@ impl IoCmdHandler {
                 entries_json,
                 resp,
             } => {
-                let r = match tokio::task::spawn_blocking(move || {
-                    Self::read_zip_entries(&zip_path, &entries_json)
-                })
-                .await
-                {
-                    Ok(inner) => inner,
-                    Err(e) => Err(EngineError::new(ErrorCode::IoError)
-                        .with_detail(format!("task join error: {}", e))),
-                };
-
-                Self::send_resp(resp, r);
+                tokio::spawn(async move {
+                    let r = match tokio::task::spawn_blocking(move || {
+                        IoCmdHandler::read_zip_entries(&zip_path, &entries_json)
+                    })
+                    .await
+                    {
+                        Ok(inner) => inner,
+                        Err(e) => Err(EngineError::new(ErrorCode::IoError)
+                            .with_detail(format!("task join error: {}", e))),
+                    };
+                    resp.send(r);
+                });
             }
 
             #[cfg(not(feature = "zip-extract"))]
@@ -415,120 +455,125 @@ impl IoCmdHandler {
                 );
             }
 
-            IOCmd::ReadImageRgba8 { path, resp } => {
-                let start = Instant::now();
+            IOCmd::GetFileInfo {
+                path,
+                algorithm,
+                resp,
+            } => {
+                tokio::spawn(async move {
+                    let r = tokio::task::spawn_blocking(move || {
+                        IoCmdHandler::get_file_info(&path, &algorithm)
+                    })
+                    .await
+                    .map_err(|e| {
+                        EngineError::new(ErrorCode::IoError)
+                            .with_detail(format!("task join error: {e}"))
+                    })
+                    .and_then(|inner| inner);
+                    resp.send(r);
+                });
+            }
 
-                // Check LRU cache first (Arc clone: O(1) ref-count increment)
+            IOCmd::ReadImageRgba8 { path, resp } => {
+                // Check LRU cache first (fast path avoids spawning)
                 if let Some(cached) = image_cache::global_cache().get(&path) {
-                    debug!(
-                        "ReadImageRgba8 cache hit: {} ({}x{}) in {:.2?}",
-                        path,
-                        cached.image.width,
-                        cached.image.height,
-                        start.elapsed()
-                    );
+                    debug!("ReadImageRgba8 cache hit: {}", path);
                     Self::send_resp(resp, Ok(cached.image));
                     return;
                 }
 
-                // Cache miss - read and decode
-                let path_clone = path.clone();
-                let task =
-                    tokio::task::spawn_blocking(move || -> Result<NormalizedImage, EngineError> {
-                        // Read file into memory
-                        let data = std::fs::read(&path_clone).map_err(|e| {
-                            EngineError::new(ErrorCode::ImageReadError)
-                                .with_detail(format!("failed to read file: {}", e))
-                        })?;
+                tokio::spawn(async move {
+                    let start = Instant::now();
+                    let path_clone = path.clone();
+                    let task = tokio::task::spawn_blocking(
+                        move || -> Result<NormalizedImage, EngineError> {
+                            let data = std::fs::read(&path_clone).map_err(|e| {
+                                EngineError::new(ErrorCode::ImageReadError)
+                                    .with_detail(format!("failed to read file: {}", e))
+                            })?;
+                            fast_image_decoder::decode_image_fast(&data, Some(&path_clone))
+                        },
+                    );
 
-                        // Use fast decoder with path hint for format detection
-                        fast_image_decoder::decode_image_fast(&data, Some(&path_clone))
-                    });
-
-                let r = match task.await {
-                    Ok(Ok(img)) => {
-                        // Cache the decoded image
-                        image_cache::global_cache().insert(path.clone(), img.clone());
-                        debug!(
-                            "ReadImageRgba8 decoded: {} ({}x{}) in {:.2?}",
-                            path,
-                            img.width,
-                            img.height,
-                            start.elapsed()
-                        );
-                        Ok(img)
-                    }
-                    Ok(Err(e)) => {
-                        warn!("ReadImageRgba8 decode error: {:?}", e);
-                        Err(e)
-                    }
-                    Err(join_err) => {
-                        warn!("ReadImageRgba8 spawn_blocking join error: {join_err}");
-                        Err(EngineError::new(ErrorCode::ImageReadError)
-                            .with_detail(format!("spawn_blocking join error: {join_err}")))
-                    }
-                };
-
-                trace!("ReadImageRgba8 total={:.2?}", start.elapsed());
-                Self::send_resp(resp, r);
+                    let r = match task.await {
+                        Ok(Ok(img)) => {
+                            image_cache::global_cache().insert(path.clone(), img.clone());
+                            debug!(
+                                "ReadImageRgba8 decoded: {} ({}x{}) in {:.2?}",
+                                path, img.width, img.height, start.elapsed()
+                            );
+                            Ok(img)
+                        }
+                        Ok(Err(e)) => {
+                            warn!("ReadImageRgba8 decode error: {:?}", e);
+                            Err(e)
+                        }
+                        Err(join_err) => {
+                            warn!("ReadImageRgba8 spawn_blocking join error: {join_err}");
+                            Err(EngineError::new(ErrorCode::ImageReadError)
+                                .with_detail(format!("spawn_blocking join error: {join_err}")))
+                        }
+                    };
+                    resp.send(r);
+                });
             }
 
             IOCmd::PreloadImages { paths, resp } => {
-                let start = Instant::now();
-                debug!("PreloadImages: {} images", paths.len());
+                tokio::spawn(async move {
+                    let start = Instant::now();
+                    debug!("PreloadImages: {} images", paths.len());
 
-                // Process all images in parallel using spawn_blocking for each
-                let handles: Vec<_> = paths
-                    .into_iter()
-                    .map(|path| {
-                        let path_clone = path.clone();
-                        let handle = tokio::task::spawn_blocking(move || {
-                            // Check cache first
-                            if let Some(cached) = image_cache::global_cache().get(&path_clone) {
-                                return (path_clone, Ok((cached.image.width, cached.image.height)));
-                            }
-
-                            // Read and decode
-                            match std::fs::read(&path_clone) {
-                                Ok(data) => {
-                                    match fast_image_decoder::decode_image_fast(
-                                        &data,
-                                        Some(&path_clone),
-                                    ) {
-                                        Ok(img) => {
-                                            let dims = (img.width, img.height);
-                                            // Cache the result
-                                            image_cache::global_cache()
-                                                .insert(path_clone.clone(), img);
-                                            (path_clone, Ok(dims))
-                                        }
-                                        Err(e) => (path_clone, Err(format!("{:?}", e))),
-                                    }
+                    let handles: Vec<_> = paths
+                        .into_iter()
+                        .map(|path| {
+                            let path_clone = path.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(cached) =
+                                    image_cache::global_cache().get(&path_clone)
+                                {
+                                    return (
+                                        path_clone,
+                                        Ok((cached.image.width, cached.image.height)),
+                                    );
                                 }
-                                Err(e) => (path_clone, Err(format!("read error: {}", e))),
-                            }
-                        });
-                        handle
-                    })
-                    .collect();
+                                match std::fs::read(&path_clone) {
+                                    Ok(data) => {
+                                        match fast_image_decoder::decode_image_fast(
+                                            &data,
+                                            Some(&path_clone),
+                                        ) {
+                                            Ok(img) => {
+                                                let dims = (img.width, img.height);
+                                                image_cache::global_cache()
+                                                    .insert(path_clone.clone(), img);
+                                                (path_clone, Ok(dims))
+                                            }
+                                            Err(e) => (path_clone, Err(format!("{:?}", e))),
+                                        }
+                                    }
+                                    Err(e) => (path_clone, Err(format!("read error: {}", e))),
+                                }
+                            })
+                        })
+                        .collect();
 
-                // Wait for all to complete
-                let mut results = Vec::with_capacity(handles.len());
-                for handle in handles {
-                    match handle.await {
-                        Ok(result) => results.push(result),
-                        Err(e) => {
-                            warn!("PreloadImages task join error: {}", e);
+                    let mut results = Vec::with_capacity(handles.len());
+                    for handle in handles {
+                        match handle.await {
+                            Ok(result) => results.push(result),
+                            Err(e) => {
+                                warn!("PreloadImages task join error: {}", e);
+                            }
                         }
                     }
-                }
 
-                debug!(
-                    "PreloadImages completed: {} images in {:.2?}",
-                    results.len(),
-                    start.elapsed()
-                );
-                Self::send_resp(resp, Ok(results));
+                    debug!(
+                        "PreloadImages completed: {} images in {:.2?}",
+                        results.len(),
+                        start.elapsed()
+                    );
+                    resp.send(Ok(results));
+                });
             }
 
             IOCmd::ClearImageCache { resp } => {
@@ -557,45 +602,50 @@ impl IoCmdHandler {
                 dest_dir,
                 resp,
             } => {
-                let start = Instant::now();
-                debug!("Unzip: {} -> {}", zip_path, dest_dir);
+                tokio::spawn(async move {
+                    let start = Instant::now();
+                    debug!("Unzip: {} -> {}", zip_path, dest_dir);
 
-                let zip_path_clone = zip_path.clone();
-                let dest_dir_clone = dest_dir.clone();
+                    let zip_path_clone = zip_path.clone();
+                    let dest_dir_clone = dest_dir.clone();
 
-                let task = tokio::task::spawn_blocking(move || {
-                    let zip_path = PathBuf::from(&zip_path_clone);
-                    let dest_dir = PathBuf::from(&dest_dir_clone);
+                    let task = tokio::task::spawn_blocking(move || {
+                        let zip_path = PathBuf::from(&zip_path_clone);
+                        let dest_dir = PathBuf::from(&dest_dir_clone);
 
-                    // Use Arc<AtomicUsize> for shared ownership with 'static lifetime
-                    let file_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                    let file_count_clone = file_count.clone();
+                        let file_count =
+                            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let file_count_clone = file_count.clone();
 
-                    let progress_cb = Box::new(move |_prog: f32, current: usize, _total: usize| {
-                        file_count_clone.store(current, std::sync::atomic::Ordering::Relaxed);
+                        let progress_cb =
+                            Box::new(move |_prog: f32, current: usize, _total: usize| {
+                                file_count_clone
+                                    .store(current, std::sync::atomic::Ordering::Relaxed);
+                            });
+
+                        match zip_extract::extract_zip(&zip_path, &dest_dir, Some(progress_cb)) {
+                            Ok(()) => {
+                                Ok(file_count.load(std::sync::atomic::Ordering::Relaxed))
+                            }
+                            Err(e) => Err(
+                                EngineError::new(ErrorCode::IoError).with_detail(e.to_string())
+                            ),
+                        }
                     });
 
-                    match zip_extract::extract_zip(&zip_path, &dest_dir, Some(progress_cb)) {
-                        Ok(()) => Ok(file_count.load(std::sync::atomic::Ordering::Relaxed)),
-                        Err(e) => {
-                            Err(EngineError::new(ErrorCode::IoError).with_detail(e.to_string()))
+                    let r = match task.await {
+                        Ok(result) => {
+                            debug!("Unzip completed in {:.2?}", start.elapsed());
+                            result
                         }
-                    }
+                        Err(join_err) => {
+                            warn!("Unzip spawn_blocking join error: {join_err}");
+                            Err(EngineError::new(ErrorCode::IoError)
+                                .with_detail(format!("spawn_blocking join error: {join_err}")))
+                        }
+                    };
+                    resp.send(r);
                 });
-
-                let r = match task.await {
-                    Ok(result) => {
-                        debug!("Unzip completed in {:.2?}", start.elapsed());
-                        result
-                    }
-                    Err(join_err) => {
-                        warn!("Unzip spawn_blocking join error: {join_err}");
-                        Err(EngineError::new(ErrorCode::IoError)
-                            .with_detail(format!("spawn_blocking join error: {join_err}")))
-                    }
-                };
-
-                Self::send_resp(resp, r);
             }
 
             #[cfg(not(feature = "zip-extract"))]
@@ -722,6 +772,52 @@ impl IoCmdHandler {
                 .await;
                 Self::send_resp(resp, r);
             }
+
+            IOCmd::ListSavedFiles {
+                dir,
+                prefix,
+                virtual_dir,
+                resp,
+            } => {
+                let r: Result<Vec<SavedFileInfo>, EngineError> = (async {
+                    let mut file_list = Vec::new();
+                    let mut rd = match fs::read_dir(&dir).await {
+                        Ok(rd) => rd,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(file_list);
+                        }
+                        Err(e) => return Err(Self::io_err(e)),
+                    };
+                    while let Some(entry) = rd.next_entry().await.map_err(Self::io_err)? {
+                        let name = match entry.file_name().to_str() {
+                            Some(n) => n.to_string(),
+                            None => continue,
+                        };
+                        if !name.starts_with(&prefix) {
+                            continue;
+                        }
+                        if let Ok(meta) = entry.metadata().await {
+                            if !meta.is_file() {
+                                continue;
+                            }
+                            let mtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            file_list.push(SavedFileInfo {
+                                file_path: format!("{}/{}", virtual_dir, name),
+                                size: meta.len(),
+                                create_time: mtime,
+                            });
+                        }
+                    }
+                    Ok(file_list)
+                })
+                .await;
+                Self::send_resp(resp, r);
+            }
         }
     }
 
@@ -746,6 +842,26 @@ impl IoCmdHandler {
             }
             OpenFlag::ReadAppendCreate => {
                 opts.read(true).append(true).create(true);
+            }
+            OpenFlag::AppendExclusive => {
+                opts.append(true).create_new(true);
+            }
+            OpenFlag::ReadAppendExclusive => {
+                opts.read(true).append(true).create_new(true);
+            }
+            OpenFlag::AppendSyncCreate => {
+                // 'as' – sync hint; treated as append+create (sync is implicit in our model)
+                opts.append(true).create(true);
+            }
+            OpenFlag::ReadAppendSyncCreate => {
+                // 'as+' – sync hint; treated as read+append+create
+                opts.read(true).append(true).create(true);
+            }
+            OpenFlag::WriteExclusive => {
+                opts.write(true).create_new(true);
+            }
+            OpenFlag::ReadWriteExclusive => {
+                opts.read(true).write(true).create_new(true);
             }
         }
 
@@ -904,54 +1020,19 @@ impl IoCmdHandler {
         out
     }
 
-    /// Async + iterative traversal (no recursion => no boxing).
-    /// Returns relative file paths under root, sorted.
-    async fn read_dir_files_recursive(root: PathBuf) -> Result<Vec<String>, std::io::Error> {
-        use std::collections::BTreeSet;
-
-        // Use BTreeSet for automatic sorting, avoiding O(n log n) sort at the end
-        let mut result: BTreeSet<String> = BTreeSet::new();
-        let mut stack: Vec<PathBuf> = vec![root.clone()];
-
-        while let Some(dir) = stack.pop() {
-            let mut rd = fs::read_dir(&dir).await?;
-
-            while let Some(entry) = rd.next_entry().await? {
-                let path = entry.path();
-                let ft = entry.file_type().await?;
-
-                if ft.is_dir() {
-                    stack.push(path);
-                } else if ft.is_file() {
-                    // Use into_owned() to avoid double allocation from to_string_lossy().to_string()
-                    let rel = path
-                        .strip_prefix(&root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .into_owned();
-                    result.insert(rel);
-                }
-            }
-        }
-
-        Ok(result.into_iter().collect())
-    }
-
-    /// Stat recursively for files under a directory; returns JSON array:
-    /// [{ "path": "...", "stat": {..} }, ...]
+    /// Stat recursively for files under a directory.
     async fn stat_dir_recursive(
         root: PathBuf,
-    ) -> Result<deno_core::serde_json::Value, EngineError> {
-        use deno_core::serde_json::{Value, json};
+    ) -> Result<StatResult, EngineError> {
         use std::collections::BTreeMap;
 
         let root_meta = fs::metadata(&root).await.map_err(Self::io_err)?;
         if root_meta.is_file() {
-            return Ok(json!(Self::build_stat(root_meta)));
+            return Ok(StatResult::Single(Self::build_stat(root_meta)));
         }
 
         // Use BTreeMap for automatic sorting by key, avoiding O(n log n) sort at the end
-        let mut out: BTreeMap<String, Value> = BTreeMap::new();
+        let mut out: BTreeMap<String, FileStat> = BTreeMap::new();
         let mut stack: Vec<PathBuf> = vec![root.clone()];
 
         while let Some(dir) = stack.pop() {
@@ -966,29 +1047,69 @@ impl IoCmdHandler {
                 } else if ft.is_file() {
                     let meta = entry.metadata().await.map_err(Self::io_err)?;
                     let stat = Self::build_stat(meta);
-                    // Use into_owned() to avoid double allocation
                     let rel = path
                         .strip_prefix(&root)
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .into_owned();
 
-                    out.insert(rel, json!(stat));
+                    out.insert(rel, stat);
                 }
             }
         }
 
         // BTreeMap iteration is already sorted by key
-        Ok(Value::Array(
+        Ok(StatResult::Recursive(
             out.into_iter()
-                .map(|(path, stat)| json!({ "path": path, "stat": stat }))
+                .map(|(path, stat)| StatEntry { path, stat })
                 .collect(),
         ))
     }
 
+    /// Compute file size + digest in a single pass (streaming, 8 KB buffer).
+    fn get_file_info(path: &str, algorithm: &str) -> Result<(u64, String), EngineError> {
+        use digest::Digest;
+        use std::io::Read;
+
+        let meta = std::fs::metadata(path).map_err(Self::io_err)?;
+        let size = meta.len();
+
+        let mut file = std::io::BufReader::new(std::fs::File::open(path).map_err(Self::io_err)?);
+        let mut buf = [0u8; 8192];
+
+        macro_rules! hash_loop {
+            ($hasher:expr) => {{
+                let mut h = $hasher;
+                loop {
+                    let n = file.read(&mut buf).map_err(Self::io_err)?;
+                    if n == 0 {
+                        break;
+                    }
+                    h.update(&buf[..n]);
+                }
+                hex::encode(h.finalize())
+            }};
+        }
+
+        let digest_hex = match algorithm {
+            "md5" => hash_loop!(md5::Md5::new()),
+            "sha1" => hash_loop!(sha1::Sha1::new()),
+            "sha256" => hash_loop!(sha2::Sha256::new()),
+            _ => {
+                return Err(EngineError::new(ErrorCode::InvalidArgument)
+                    .with_detail(format!("unsupported digestAlgorithm: {algorithm}")))
+            }
+        };
+
+        Ok((size, digest_hex))
+    }
+
     #[cfg(feature = "zip-extract")]
-    fn read_zip_entries(zip_path: &str, entries_json: &str) -> Result<String, EngineError> {
-        use deno_core::serde_json::{self, json};
+    fn read_zip_entries(
+        zip_path: &str,
+        entries_json: &str,
+    ) -> Result<Vec<ZipEntryResult>, EngineError> {
+        use deno_core::serde_json;
         use std::io::{BufReader, Read as _};
 
         let file = std::fs::File::open(zip_path).map_err(Self::io_err)?;
@@ -997,11 +1118,10 @@ impl IoCmdHandler {
             EngineError::new(ErrorCode::IoError).with_detail(format!("invalid zip: {}", e))
         })?;
 
-        let req: serde_json::Value =
-            serde_json::from_str(entries_json).map_err(|e| {
-                EngineError::new(ErrorCode::InvalidArgument)
-                    .with_detail(format!("invalid entries_json: {}", e))
-            })?;
+        let req: serde_json::Value = serde_json::from_str(entries_json).map_err(|e| {
+            EngineError::new(ErrorCode::InvalidArgument)
+                .with_detail(format!("invalid entries_json: {}", e))
+        })?;
 
         let global_encoding = req
             .get("encoding")
@@ -1009,13 +1129,12 @@ impl IoCmdHandler {
             .map(|s| s.to_string());
         let entries_val = req.get("entries");
 
-        // Collect which entries to read
         let read_all = entries_val
             .and_then(|v| v.as_str())
             .map(|s| s == "all")
             .unwrap_or(false);
 
-        let mut results = serde_json::Map::new();
+        let mut results = Vec::new();
 
         if read_all {
             for i in 0..archive.len() {
@@ -1030,18 +1149,19 @@ impl IoCmdHandler {
                 let mut buf = Vec::with_capacity(entry.size() as usize);
                 match entry.read_to_end(&mut buf) {
                     Ok(_) => {
-                        let data_val =
-                            Self::encode_zip_data(&buf, global_encoding.as_deref());
-                        results.insert(
-                            name,
-                            json!({ "data": data_val, "errMsg": "" }),
-                        );
+                        let data = Self::encode_zip_data(&buf, global_encoding.as_deref());
+                        results.push(ZipEntryResult {
+                            path: name,
+                            data: Some(data),
+                            err_msg: String::new(),
+                        });
                     }
                     Err(e) => {
-                        results.insert(
-                            name,
-                            json!({ "data": null, "errMsg": format!("read failed: {}", e) }),
-                        );
+                        results.push(ZipEntryResult {
+                            path: name,
+                            data: None,
+                            err_msg: format!("read failed: {}", e),
+                        });
                     }
                 }
             }
@@ -1055,7 +1175,8 @@ impl IoCmdHandler {
                     .get("encoding")
                     .and_then(|v: &serde_json::Value| v.as_str())
                     .or(global_encoding.as_deref());
-                let position = item.get("position").and_then(|v: &serde_json::Value| v.as_u64());
+                let position =
+                    item.get("position").and_then(|v: &serde_json::Value| v.as_u64());
                 let length = item.get("length").and_then(|v: &serde_json::Value| v.as_u64());
 
                 match archive.by_name(&path) {
@@ -1063,7 +1184,6 @@ impl IoCmdHandler {
                         let mut buf = Vec::with_capacity(entry.size() as usize);
                         match entry.read_to_end(&mut buf) {
                             Ok(_) => {
-                                // Apply position/length slicing
                                 let start =
                                     position.map(|p| p as usize).unwrap_or(0).min(buf.len());
                                 let end = length
@@ -1071,68 +1191,50 @@ impl IoCmdHandler {
                                     .unwrap_or(buf.len());
                                 let sliced = &buf[start..end];
 
-                                let data_val = Self::encode_zip_data(sliced, encoding);
-                                results.insert(
+                                let data = Self::encode_zip_data(sliced, encoding);
+                                results.push(ZipEntryResult {
                                     path,
-                                    json!({ "data": data_val, "errMsg": "" }),
-                                );
+                                    data: Some(data),
+                                    err_msg: String::new(),
+                                });
                             }
                             Err(e) => {
-                                results.insert(
+                                results.push(ZipEntryResult {
                                     path,
-                                    json!({ "data": null, "errMsg": format!("read failed: {}", e) }),
-                                );
+                                    data: None,
+                                    err_msg: format!("read failed: {}", e),
+                                });
                             }
                         }
                     }
                     Err(e) => {
-                        results.insert(
+                        results.push(ZipEntryResult {
                             path,
-                            json!({ "data": null, "errMsg": format!("entry not found: {}", e) }),
-                        );
+                            data: None,
+                            err_msg: format!("entry not found: {}", e),
+                        });
                     }
                 }
             }
         }
 
-        serde_json::to_string(&json!({ "entries": results })).map_err(|e| {
-            EngineError::new(ErrorCode::IoError)
-                .with_detail(format!("json serialize failed: {}", e))
-        })
+        Ok(results)
     }
 
     #[cfg(feature = "zip-extract")]
-    fn encode_zip_data(data: &[u8], encoding: Option<&str>) -> deno_core::serde_json::Value {
+    fn encode_zip_data(data: &[u8], encoding: Option<&str>) -> String {
         use base64::Engine;
-        use deno_core::serde_json;
         match encoding {
-            None => {
-                // Return base64-encoded since we can't return raw ArrayBuffer through JSON
-                serde_json::Value::String(
-                    base64::engine::general_purpose::STANDARD.encode(data),
-                )
+            // No encoding → binary, return base64 for transport
+            None => base64::engine::general_purpose::STANDARD.encode(data),
+            Some(enc) => {
+                // Delegate to codec for full encoding coverage (utf8, utf16le, ucs2, etc.)
+                match shared::codec::decode_bytes(data, enc) {
+                    Ok(s) => s,
+                    // If codec doesn't support it, fall back to base64
+                    Err(_) => base64::engine::general_purpose::STANDARD.encode(data),
+                }
             }
-            Some(enc) => match enc {
-                "utf8" | "utf-8" => {
-                    serde_json::Value::String(String::from_utf8_lossy(data).into_owned())
-                }
-                "base64" => serde_json::Value::String(
-                    base64::engine::general_purpose::STANDARD.encode(data),
-                ),
-                "hex" => {
-                    let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
-                    serde_json::Value::String(hex)
-                }
-                "latin1" | "binary" => {
-                    let s: String = data.iter().map(|&b| b as char).collect();
-                    serde_json::Value::String(s)
-                }
-                "ascii" => {
-                    let s: String = data.iter().map(|&b| (b & 0x7F) as char).collect();
-                    serde_json::Value::String(s)
-                }
-                _ => serde_json::Value::String(String::from_utf8_lossy(data).into_owned()),
-            },
         }
     }
 }

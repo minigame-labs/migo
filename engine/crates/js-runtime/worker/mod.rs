@@ -216,6 +216,7 @@ async fn op_worker_create(
             host_tx: host.host_tx.clone(),
             device_services: None,
             raf_rx: None,
+            network_policy: host.network_policy.clone(),
         };
 
         (code_dir, worker_state)

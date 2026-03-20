@@ -222,6 +222,28 @@ impl Renderer2d {
                 context.set_global_alpha(alpha);
                 Ok(false)
             }
+            Canvas2DCmd::SetCompositeOperation { op } => {
+                context.set_composite_operation(op);
+                Ok(false)
+            }
+            Canvas2DCmd::SetLineDash { segments } => {
+                context.set_line_dash(segments);
+                Ok(false)
+            }
+            Canvas2DCmd::SetLineDashOffset { offset } => {
+                context.set_line_dash_offset(offset);
+                Ok(false)
+            }
+            Canvas2DCmd::SetFillStyleGradient {
+                x0,
+                y0,
+                x1,
+                y1,
+                stops,
+            } => {
+                context.set_fill_style_gradient(x0, y0, x1, y1, stops);
+                Ok(false)
+            }
             Canvas2DCmd::SetTextAlign { align } => {
                 context.set_text_align(align);
                 Ok(false)

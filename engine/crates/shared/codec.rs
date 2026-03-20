@@ -18,17 +18,27 @@ enum Encoding {
 
 #[inline(always)]
 fn normalize_encoding(input: &str) -> Encoding {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "utf8" | "utf-8" => Encoding::Utf8,
-        "ucs2" | "ucs-2" => Encoding::Ucs2,
-        "utf16le" | "utf-16le" => Encoding::Utf16Le,
-        "ascii" => Encoding::Ascii,
-        "latin1" | "binary" => Encoding::Latin1,
-        "base64" => Encoding::Base64,
-        "hex" => Encoding::Hex,
+    let s = input.trim();
+    if s.eq_ignore_ascii_case("utf8") || s.eq_ignore_ascii_case("utf-8") {
+        Encoding::Utf8
+    } else if s.eq_ignore_ascii_case("ucs2") || s.eq_ignore_ascii_case("ucs-2") {
+        Encoding::Ucs2
+    } else if s.eq_ignore_ascii_case("utf16le") || s.eq_ignore_ascii_case("utf-16le") {
+        Encoding::Utf16Le
+    } else if s.eq_ignore_ascii_case("ascii") {
+        Encoding::Ascii
+    } else if s.eq_ignore_ascii_case("latin1") || s.eq_ignore_ascii_case("binary") {
+        Encoding::Latin1
+    } else if s.eq_ignore_ascii_case("base64") {
+        Encoding::Base64
+    } else if s.eq_ignore_ascii_case("hex") {
+        Encoding::Hex
+    } else {
         #[cfg(feature = "codec-gbk")]
-        "gbk" => Encoding::Gbk,
-        _ => Encoding::Unsupported,
+        if s.eq_ignore_ascii_case("gbk") {
+            return Encoding::Gbk;
+        }
+        Encoding::Unsupported
     }
 }
 

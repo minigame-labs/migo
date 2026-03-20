@@ -147,3 +147,112 @@ impl AudioPowerManager {
         self.state
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_state_is_active() {
+        let mgr = AudioPowerManager::new(AudioPowerConfig::default());
+        assert_eq!(mgr.state(), AudioPowerState::Active);
+        assert_eq!(mgr.wait_duration(), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn stays_active_while_playing() {
+        let mut mgr = AudioPowerManager::new(AudioPowerConfig::default());
+        for _ in 0..10 {
+            let s = mgr.update(true);
+            assert_eq!(s, AudioPowerState::Active);
+        }
+    }
+
+    #[test]
+    fn transitions_to_low_power_on_idle() {
+        let config = AudioPowerConfig {
+            idle_timeout: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let mut mgr = AudioPowerManager::new(config);
+
+        // First update with no activity — records timestamp, enters LowPower
+        mgr.update(false);
+        assert_eq!(mgr.state(), AudioPowerState::LowPower);
+        assert_eq!(mgr.wait_duration(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn transitions_to_sleep_after_idle_timeout() {
+        let config = AudioPowerConfig {
+            idle_timeout: Duration::from_millis(20),
+            ..Default::default()
+        };
+        let mut mgr = AudioPowerManager::new(config);
+
+        mgr.update(false); // Active -> LowPower
+        std::thread::sleep(Duration::from_millis(30));
+        mgr.update(false); // idle > 20ms -> Sleep
+        assert_eq!(mgr.state(), AudioPowerState::Sleep);
+        assert_eq!(mgr.wait_duration(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn returns_to_active_on_activity() {
+        let config = AudioPowerConfig {
+            idle_timeout: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let mut mgr = AudioPowerManager::new(config);
+
+        mgr.update(false);
+        std::thread::sleep(Duration::from_millis(20));
+        mgr.update(false);
+        assert_eq!(mgr.state(), AudioPowerState::Sleep);
+
+        // Activity resumes
+        mgr.update(true);
+        assert_eq!(mgr.state(), AudioPowerState::Active);
+        assert_eq!(mgr.wait_duration(), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn low_power_stays_until_timeout() {
+        let config = AudioPowerConfig {
+            idle_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let mut mgr = AudioPowerManager::new(config);
+
+        mgr.update(false); // -> LowPower
+                           // 50ms is well under the 200ms timeout
+        std::thread::sleep(Duration::from_millis(50));
+        mgr.update(false);
+        assert_eq!(mgr.state(), AudioPowerState::LowPower);
+    }
+
+    #[test]
+    fn config_defaults_are_sane() {
+        let config = AudioPowerConfig::default();
+        assert_eq!(config.idle_timeout, Duration::from_secs(3));
+        assert_eq!(config.active_tick, Duration::from_millis(5));
+        assert_eq!(config.low_power_tick, Duration::from_millis(50));
+        assert_eq!(config.sleep_tick, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn rapid_active_inactive_toggle() {
+        let config = AudioPowerConfig {
+            idle_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let mut mgr = AudioPowerManager::new(config);
+
+        // Rapid toggling should not reach Sleep
+        for _ in 0..20 {
+            mgr.update(false);
+            mgr.update(true);
+        }
+        assert_eq!(mgr.state(), AudioPowerState::Active);
+    }
+}

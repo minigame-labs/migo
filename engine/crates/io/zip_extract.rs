@@ -108,6 +108,20 @@ pub fn extract_zip(
         // Build output path
         let outpath = dest_dir.join(&file_name);
 
+        // Security: reject symlink entries to prevent sandbox escape.
+        // A malicious zip could contain symlinks pointing outside the
+        // extraction directory, which would bypass VFS containment.
+        if file.is_symlink() {
+            error!(
+                "extract_zip: symlink entry rejected: {}",
+                file_name
+            );
+            return Err(ZipError::PathTraversal(format!(
+                "symlink entry not allowed: {}",
+                file_name
+            )));
+        }
+
         // Security: check for path traversal
         // We need to handle the case where outpath doesn't exist yet
         let outpath_normalized = normalize_path(&outpath);
@@ -118,6 +132,40 @@ pub fn extract_zip(
                 outpath_normalized.display()
             );
             return Err(ZipError::PathTraversal(file_name));
+        }
+
+        // Security: verify that existing ancestor directories are not symlinks
+        // (prevents TOCTOU attacks where a symlink is created between entries).
+        if let Some(parent) = outpath_normalized.parent() {
+            if parent.exists() {
+                match std::fs::canonicalize(parent) {
+                    Ok(canonical_parent) => {
+                        if !canonical_parent.starts_with(&dest_canonical) {
+                            error!(
+                                "extract_zip: ancestor symlink escape detected: {} -> {}",
+                                parent.display(),
+                                canonical_parent.display()
+                            );
+                            return Err(ZipError::PathTraversal(format!(
+                                "ancestor directory escapes target via symlink: {}",
+                                file_name
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        // Fail-closed: if we cannot canonicalize the parent
+                        // directory we cannot verify containment, so reject.
+                        error!(
+                            "extract_zip: cannot canonicalize parent {}: {} — rejecting entry {}",
+                            parent.display(), e, file_name
+                        );
+                        return Err(ZipError::PathTraversal(format!(
+                            "cannot verify ancestor directory: {}",
+                            file_name
+                        )));
+                    }
+                }
+            }
         }
 
         if file.is_dir() {

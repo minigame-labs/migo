@@ -87,6 +87,7 @@ pub(crate) struct Host {
 
     platform: Arc<dyn PlatformServices>,
     init_options: InitOptions,
+    network_policy: shared::op_state::NetworkPolicy,
 
     last_game_id: Option<String>,
     last_entry: Option<String>,
@@ -155,6 +156,24 @@ impl Host {
 
         // ---- HostOpState for extensions ----
         let device_services = platform.create_device_services(id);
+        // Build network policy from InitOptions extras.
+        let network_policy = {
+            use shared::op_state::NetworkPolicy;
+            let mut policy = NetworkPolicy::default();
+            if let Some(wl) = init_options.extras().get("domain_whitelist") {
+                if let Some(arr) = wl.as_array() {
+                    policy.domain_whitelist = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                }
+            }
+            if let Some(v) = init_options.extras().get("enforce_https") {
+                policy.enforce_https = v.as_bool().unwrap_or(false);
+            }
+            policy
+        };
+
         let host_state = HostOpState {
             id,
             code_dir: None,
@@ -168,6 +187,7 @@ impl Host {
             host_tx: host_tx.clone(),
             device_services,
             raf_rx: Some(raf_rx.clone()),
+            network_policy: network_policy.clone(),
         };
 
         // ---- Console log buffer (debug only) ----
@@ -246,6 +266,7 @@ impl Host {
             host_tx,
             platform,
             init_options,
+            network_policy,
             last_game_id: None,
             last_entry: None,
             #[cfg(feature = "v8-limits")]
@@ -579,6 +600,7 @@ impl Host {
             host_tx: self.host_tx.clone(),
             device_services,
             raf_rx: Some(self.raf_rx.clone()),
+            network_policy: self.network_policy.clone(),
         };
 
         let module_loader: Option<Rc<dyn ModuleLoader>> =

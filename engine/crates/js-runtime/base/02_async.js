@@ -65,11 +65,15 @@ function promisify(apiName, executor) {
 // an async platform request and the result arrives later through a separate
 // `_internalOn*Result` callback.
 //
+// Supports concurrent requests via Map-based tracking (requestId per call).
+// settle() matches by parsed.requestId if present, otherwise settles the
+// oldest pending request (FIFO fallback for backward compatibility).
+//
 // Usage:
 //   const _loc = createDeferredApi('getLocation');
 //
 //   function getLocation(options = {}) {
-//       return _loc.invoke(options, function (opts) {
+//       return _loc.invoke(options, function (opts, requestId) {
 //           op_get_location(JSON.stringify({ type: opts.type || 'wgs84' }));
 //       });
 //   }
@@ -81,33 +85,78 @@ function promisify(apiName, executor) {
 // Both callback and Promise styles are supported:
 //   getLocation({ success(res) { ... } });        // callback
 //   const res = await getLocation({ type: 'gcj02' }); // promise
-function createDeferredApi(apiName) {
-    let _resolve = null;
-    let _reject = null;
-    let _success = null;
-    let _fail = null;
-    let _complete = null;
+// defaultTimeoutMs: auto-reject after this many ms if platform never settles.
+// Pass 0 to disable timeout.  Individual calls can override via opts._timeout.
+function createDeferredApi(apiName, defaultTimeoutMs) {
+    var _nextId = 1;
+    var _pending = new Map();
+    if (defaultTimeoutMs === undefined) defaultTimeoutMs = 30000;
 
-    function _clear() {
-        _resolve = _reject = _success = _fail = _complete = null;
+    function _settleEntry(entry, parsed) {
+        if (entry._timer) clearTimeout(entry._timer);
+        if (parsed.error) {
+            var res = { errMsg: parsed.error };
+            if (parsed.errCode !== undefined) res.errCode = parsed.errCode;
+            if (entry.fail) entry.fail(res);
+            if (entry.complete) entry.complete(res);
+            entry.reject(res);
+        } else {
+            var res = { errMsg: apiName + ':ok' };
+            var keys = Object.keys(parsed);
+            for (var i = 0; i < keys.length; i++) {
+                var k = keys[i];
+                if (k !== 'requestId') res[k] = parsed[k];
+            }
+            if (entry.success) entry.success(res);
+            if (entry.complete) entry.complete(res);
+            entry.resolve(res);
+        }
     }
 
     function invoke(options, executor) {
-        const { success, fail, complete } = options || {};
+        var opts = options || {};
+        var success = typeof opts.success === 'function' ? opts.success : null;
+        var fail = typeof opts.fail === 'function' ? opts.fail : null;
+        var complete = typeof opts.complete === 'function' ? opts.complete : null;
+        var requestId = _nextId++;
+
         return new Promise(function (resolve, reject) {
-            _resolve = resolve;
-            _reject = reject;
-            _success = typeof success === 'function' ? success : null;
-            _fail = typeof fail === 'function' ? fail : null;
-            _complete = typeof complete === 'function' ? complete : null;
+            var pendingEntry = {
+                resolve: resolve,
+                reject: reject,
+                success: success,
+                fail: fail,
+                complete: complete,
+                _timer: 0,
+            };
+            _pending.set(requestId, pendingEntry);
+
+            // Schedule auto-reject if the platform never settles.
+            var ms = (opts && typeof opts._timeout === 'number') ? opts._timeout : defaultTimeoutMs;
+            if (ms > 0) {
+                pendingEntry._timer = setTimeout(function () {
+                    var e = _pending.get(requestId);
+                    if (!e) return;
+                    _pending.delete(requestId);
+                    var res = { errMsg: apiName + ':fail timeout' };
+                    try { if (e.fail) e.fail(res); } catch (_) {}
+                    try { if (e.complete) e.complete(res); } catch (_) {}
+                    e.reject(res);
+                }, ms);
+            }
+
             try {
-                executor(options || {});
+                executor(opts, requestId);
             } catch (e) {
-                var res = { errMsg: apiName + ':fail ' + e.message };
-                _clear();
-                if (typeof fail === 'function') fail(res);
-                if (typeof complete === 'function') complete(res);
-                reject(res);
+                var entry = _pending.get(requestId);
+                if (entry) {
+                    _pending.delete(requestId);
+                    if (entry._timer) clearTimeout(entry._timer);
+                    var res = { errMsg: apiName + ':fail ' + e.message };
+                    if (fail) fail(res);
+                    if (complete) complete(res);
+                    reject(res);
+                }
             }
         });
     }
@@ -116,20 +165,29 @@ function createDeferredApi(apiName) {
         var parsed;
         try { parsed = JSON.parse(resultJson); } catch (e) { parsed = {}; }
 
-        var s = _success, f = _fail, c = _complete;
-        var resolve = _resolve, reject = _reject;
-        _clear();
+        // Try requestId-based lookup first.
+        var requestId = Number(parsed.requestId);
+        if (Number.isFinite(requestId)) {
+            var entry = _pending.get(requestId);
+            if (entry) {
+                _pending.delete(requestId);
+                _settleEntry(entry, parsed);
+            }
+            // requestId was present but entry not found -- the request was
+            // already settled (e.g. timed out).  Silently discard the stale
+            // callback to avoid mis-settling a different pending request.
+            return;
+        }
 
-        if (parsed.error) {
-            var res = { errMsg: parsed.error };
-            if (f) f(res);
-            if (c) c(res);
-            if (reject) reject(res);
-        } else {
-            var res = { errMsg: apiName + ':ok', ...parsed };
-            if (s) s(res);
-            if (c) c(res);
-            if (resolve) resolve(res);
+        // Fallback: settle the oldest pending request (FIFO).
+        // Only reached when the platform omits requestId entirely
+        // (legacy / backward-compat path).
+        var iter = _pending.keys();
+        var first = iter.next();
+        if (!first.done) {
+            var entry = _pending.get(first.value);
+            _pending.delete(first.value);
+            _settleEntry(entry, parsed);
         }
     }
 

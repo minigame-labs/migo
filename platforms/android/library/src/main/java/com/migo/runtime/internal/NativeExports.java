@@ -1547,6 +1547,23 @@ public final class NativeExports {
         }
     }
 
+    /**
+     * Extract the "requestId" field from a JSON string as a raw number string.
+     * Returns null if not present or not parseable.
+     */
+    private static String extractRequestId(String optionsJson) {
+        if (optionsJson == null) return null;
+        try {
+            org.json.JSONObject opts = new org.json.JSONObject(optionsJson);
+            if (opts.has("requestId")) {
+                return String.valueOf(opts.getInt("requestId"));
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+        return null;
+    }
+
     // ==================== Keyboard ====================
 
     /** Per-session Keyboard managers. */
@@ -2397,6 +2414,114 @@ public final class NativeExports {
     }
 
     // ==================== Session Cleanup ====================
+
+    // ==================== Setting ====================
+
+    /**
+     * Open the mini program setting page.
+     * The host should show a settings UI and call back via
+     * {@link NativeMethods#onOpenSettingResult(int, String)}.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON options
+     */
+    public static void openSetting(int sessionId, String optionsJson) {
+        // TODO: implement with a SettingManager when ready
+        // For now, call back immediately echoing requestId for correct Promise matching
+        String rid = extractRequestId(optionsJson);
+        NativeMethods.onOpenSettingResult(sessionId,
+                rid != null ? "{\"requestId\":" + rid + "}" : "{}");
+    }
+
+    // ==================== Share ====================
+
+    /**
+     * Trigger the native share flow.
+     * The host should show a share UI and call back via
+     * {@link NativeMethods#onShareAppMessageResult(int, String)}.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with title, imageUrl, query
+     */
+    public static void shareAppMessage(int sessionId, String optionsJson) {
+        // TODO: implement with a ShareManager when ready
+        String rid = extractRequestId(optionsJson);
+        NativeMethods.onShareAppMessageResult(sessionId,
+                rid != null ? "{\"requestId\":" + rid + "}" : "{}");
+    }
+
+    // ==================== Navigate ====================
+
+    /**
+     * Navigate to another mini program.
+     * The host should perform navigation and call back via
+     * {@link NativeMethods#onNavigateToMiniProgramResult(int, String)}.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with appId, path, extraData, envVersion
+     */
+    public static void navigateToMiniProgram(int sessionId, String optionsJson) {
+        // TODO: implement navigation when ready
+        String rid = extractRequestId(optionsJson);
+        NativeMethods.onNavigateToMiniProgramResult(sessionId,
+                rid != null ? "{\"requestId\":" + rid + "}" : "{}");
+    }
+
+    /**
+     * Open the customer service conversation.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with sessionFrom, showMessageCard, etc.
+     */
+    public static void openCustomerServiceConversation(int sessionId, String optionsJson) {
+        // TODO: implement customer service when ready
+    }
+
+    // ==================== Payment ====================
+
+    /**
+     * Check if the current environment supports Midas payment.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON options
+     * @return JSON string: {"data":{"allow_pay":true/false}}
+     */
+    public static String checkIsSupportMidasPayment(int sessionId, String optionsJson) {
+        // TODO: implement real payment check when ready
+        return "{\"data\":{\"allow_pay\":false}}";
+    }
+
+    /**
+     * Trigger Midas payment flow.
+     * The host should show payment UI and call back via
+     * {@link NativeMethods#onMidasPaymentResult(int, String)}.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with mode, env, offerId, currencyType, etc.
+     */
+    public static void requestMidasPayment(int sessionId, String optionsJson) {
+        // TODO: implement with a PaymentManager when ready
+        String rid = extractRequestId(optionsJson);
+        String ridField = rid != null ? "\"requestId\":" + rid + "," : "";
+        NativeMethods.onMidasPaymentResult(sessionId,
+                "{" + ridField + "\"error\":\"requestMidasPayment:fail not supported\",\"errCode\":-2}");
+    }
+
+    /**
+     * Trigger Midas payment for game items.
+     * The host should show payment UI and call back via
+     * {@link NativeMethods#onMidasPaymentGameItemResult(int, String)}.
+     *
+     * @param sessionId   The session ID
+     * @param optionsJson JSON with signData, paySig, signature
+     */
+    public static void requestMidasPaymentGameItem(int sessionId, String optionsJson) {
+        // TODO: implement with a PaymentManager when ready
+        String rid = extractRequestId(optionsJson);
+        String ridField = rid != null ? "\"requestId\":" + rid + "," : "";
+        NativeMethods.onMidasPaymentGameItemResult(sessionId,
+                "{" + ridField + "\"error\":\"requestMidasPaymentGameItem:fail not supported\",\"errCode\":-2}");
+    }
 
     /**
      * Destroy all per-session managers. Called from GameSession.close().

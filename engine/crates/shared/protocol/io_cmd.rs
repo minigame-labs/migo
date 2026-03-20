@@ -7,6 +7,10 @@ use crate::error::{EngineError, ErrorCode};
 
 pub type FileId = u32;
 
+/// Maximum bytes a single read op may request (100 MiB).
+/// Matches the platform API limit ("single file size up to 100M").
+pub const MAX_READ_LENGTH: u64 = 100 * 1024 * 1024;
+
 /// Protocol-wide IO result type.
 pub type IOResult<T> = Result<T, EngineError>;
 
@@ -53,6 +57,18 @@ pub enum OpenFlag {
     ReadWriteTruncateCreate,
     AppendCreate,
     ReadAppendCreate,
+    /// 'ax' – append, fail if path already exists
+    AppendExclusive,
+    /// 'ax+' – read+append, fail if path already exists
+    ReadAppendExclusive,
+    /// 'as' – append (sync I/O hint)
+    AppendSyncCreate,
+    /// 'as+' – read+append (sync I/O hint)
+    ReadAppendSyncCreate,
+    /// 'wx' – write+truncate, fail if path already exists
+    WriteExclusive,
+    /// 'wx+' – read+write+truncate, fail if path already exists
+    ReadWriteExclusive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +160,7 @@ pub enum IOCmd {
     Stat {
         path: String,
         recursive: bool,
-        resp: IOCmdResp<serde_json::Value>,
+        resp: IOCmdResp<StatResult>,
     },
 
     WriteFd {
@@ -184,7 +200,16 @@ pub enum IOCmd {
     ReadZipEntry {
         zip_path: String,
         entries_json: String,
-        resp: IOCmdResp<String>,
+        resp: IOCmdResp<Vec<ZipEntryResult>>,
+    },
+
+    /// Get file info: size + digest (md5/sha1/sha256).
+    /// Returns (size_bytes, digest_hex_string).
+    GetFileInfo {
+        path: String,
+        /// "md5", "sha1", or "sha256"
+        algorithm: String,
+        resp: IOCmdResp<(u64, String)>,
     },
 
     /// Read an image from `path` and convert it into a normalized RGBA8 buffer.
@@ -254,6 +279,15 @@ pub enum IOCmd {
         resp: IOCmdResp<String>,
     },
 
+    /// List saved files (prefix-filtered readdir + stat in one round trip).
+    ListSavedFiles {
+        dir: String,
+        prefix: String,
+        /// Virtual dir prefix for constructing paths visible to JS (e.g. "/user").
+        virtual_dir: String,
+        resp: IOCmdResp<Vec<SavedFileInfo>>,
+    },
+
     Shutdown,
 }
 
@@ -282,6 +316,42 @@ pub struct FileStat {
     pub mtime: u64,
     pub is_file: bool,
     pub is_directory: bool,
+}
+
+/// A single entry in the recursive stat result.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StatEntry {
+    pub path: String,
+    pub stat: FileStat,
+}
+
+/// Stat result — typed union for single-file vs recursive responses.
+/// `#[serde(untagged)]` ensures `Single` serializes as a flat object and
+/// `Recursive` serializes as an array, matching the existing JS expectations.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum StatResult {
+    Single(FileStat),
+    Recursive(Vec<StatEntry>),
+}
+
+/// Result for a single entry read from a zip archive.
+#[derive(Debug)]
+pub struct ZipEntryResult {
+    pub path: String,
+    /// Encoded string (text for entries with encoding, base64 for binary).
+    pub data: Option<String>,
+    pub err_msg: String,
+}
+
+/// Info about a saved file, returned by ListSavedFiles.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SavedFileInfo {
+    #[serde(rename = "filePath")]
+    pub file_path: String,
+    pub size: u64,
+    #[serde(rename = "createTime")]
+    pub create_time: u64,
 }
 
 /// A simple, protocol-friendly image representation.

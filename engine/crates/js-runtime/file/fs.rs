@@ -7,7 +7,7 @@ use shared::{
     op_state::HostOpState,
     protocol::{
         self,
-        io_cmd::{FileId, FileStat, IOCmd, IOCmdResp, OpenFlag, WriteMode},
+        io_cmd::{FileId, FileStat, IOCmd, IOCmdResp, OpenFlag, SavedFileInfo, StatResult, WriteMode},
     },
     vfs::{FileOp, VfsError, VirtualFS},
 };
@@ -115,6 +115,12 @@ fn parse_open_flag(flag: &str) -> Result<OpenFlag, IOError> {
         "w+" => Ok(OpenFlag::ReadWriteTruncateCreate),
         "a" => Ok(OpenFlag::AppendCreate),
         "a+" => Ok(OpenFlag::ReadAppendCreate),
+        "ax" => Ok(OpenFlag::AppendExclusive),
+        "ax+" => Ok(OpenFlag::ReadAppendExclusive),
+        "as" => Ok(OpenFlag::AppendSyncCreate),
+        "as+" => Ok(OpenFlag::ReadAppendSyncCreate),
+        "wx" => Ok(OpenFlag::WriteExclusive),
+        "wx+" => Ok(OpenFlag::ReadWriteExclusive),
         _ => Err(ioerr(format!("Invalid open flag: {flag}"))),
     }
 }
@@ -124,10 +130,17 @@ fn parse_open_flag(flag: &str) -> Result<OpenFlag, IOError> {
 fn open_flag_to_vfs_op(flag: &OpenFlag) -> FileOp {
     match flag {
         OpenFlag::Read => FileOp::Read,
-        OpenFlag::ReadWrite | OpenFlag::ReadWriteTruncateCreate | OpenFlag::ReadAppendCreate => {
-            FileOp::Write // Write includes read
-        }
-        OpenFlag::WriteTruncateCreate | OpenFlag::AppendCreate => FileOp::Create,
+        OpenFlag::ReadWrite
+        | OpenFlag::ReadWriteTruncateCreate
+        | OpenFlag::ReadAppendCreate
+        | OpenFlag::ReadAppendExclusive
+        | OpenFlag::ReadAppendSyncCreate
+        | OpenFlag::ReadWriteExclusive => FileOp::Write,
+        OpenFlag::WriteTruncateCreate
+        | OpenFlag::AppendCreate
+        | OpenFlag::AppendExclusive
+        | OpenFlag::AppendSyncCreate
+        | OpenFlag::WriteExclusive => FileOp::Create,
     }
 }
 
@@ -654,7 +667,7 @@ pub async fn op_stat(
     state: Rc<RefCell<OpState>>,
     #[string] path: String,
     recursive: bool,
-) -> Result<serde_json::Value, IOError> {
+) -> Result<StatResult, IOError> {
     let vfs = get_vfs_async(&state);
     let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
     let tx = get_io_tx_async(state);
@@ -674,7 +687,7 @@ pub fn op_stat_sync(
     state: &mut OpState,
     #[string] path: String,
     recursive: bool,
-) -> Result<serde_json::Value, IOError> {
+) -> Result<StatResult, IOError> {
     let vfs = get_vfs_sync(state);
     let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
     let tx = get_io_tx_sync(state);
@@ -897,23 +910,38 @@ pub fn op_read_compressed_file_sync(
 // ============================ ReadZipEntry ============================
 
 #[op2(async(lazy), fast)]
-#[string]
+#[serde]
 pub async fn op_read_zip_entry(
     state: Rc<RefCell<OpState>>,
     #[string] zip_path: String,
     #[string] entries_json: String,
-) -> Result<String, IOError> {
+) -> Result<serde_json::Value, IOError> {
     let vfs = get_vfs_async(&state);
     let full_path = resolve_path_vfs(vfs.as_deref(), &zip_path, FileOp::Read)?;
     let tx = get_io_tx_async(state);
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ReadZipEntry {
+    let results = protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ReadZipEntry {
         zip_path: full_path,
         entries_json,
         resp: IOCmdResp::Async(resp_tx),
     })
     .await
-    .map_err(IOError::from)
+    .map_err(IOError::from)?;
+
+    // Build serde_json::Value — serde_v8 serializes this directly to a V8 object
+    // (no JSON stringify/parse round-trip).
+    let mut entries_map = serde_json::Map::with_capacity(results.len());
+    for entry in results {
+        let data_val = match entry.data {
+            Some(s) => serde_json::Value::String(s),
+            None => serde_json::Value::Null,
+        };
+        entries_map.insert(
+            entry.path,
+            serde_json::json!({ "data": data_val, "errMsg": entry.err_msg }),
+        );
+    }
+    Ok(serde_json::json!({ "entries": entries_map }))
 }
 
 // ============================ Unzip ============================
@@ -957,5 +985,70 @@ pub async fn op_unzip(
     })
     .await
     .map(|_| ()) // Discard file count, JS doesn't need it
+    .map_err(IOError::from)
+}
+
+// ============================ GetFileInfo ============================
+
+#[op2(async(lazy), fast)]
+#[serde]
+pub async fn op_get_file_info(
+    state: Rc<RefCell<OpState>>,
+    #[string] path: String,
+    #[string] algorithm: String,
+) -> Result<(u64, String), IOError> {
+    let vfs = get_vfs_async(&state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
+    let tx = get_io_tx_async(state);
+
+    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::GetFileInfo {
+        path: full_path,
+        algorithm,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
+    .map_err(IOError::from)
+}
+
+#[op2]
+#[serde]
+pub fn op_get_file_info_sync(
+    state: &mut OpState,
+    #[string] path: String,
+    #[string] algorithm: String,
+) -> Result<(u64, String), IOError> {
+    let vfs = get_vfs_sync(state);
+    let full_path = resolve_path_vfs(vfs.as_deref(), &path, FileOp::Read)?;
+    let tx = get_io_tx_sync(state);
+
+    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::GetFileInfo {
+        path: full_path,
+        algorithm,
+        resp: IOCmdResp::Sync(resp_tx),
+    })
+    .map_err(IOError::from)
+}
+
+// ============================ ListSavedFiles ============================
+
+#[op2(async(lazy), fast)]
+#[serde]
+pub async fn op_list_saved_files(
+    state: Rc<RefCell<OpState>>,
+    #[string] dir: String,
+    #[string] prefix: String,
+) -> Result<Vec<SavedFileInfo>, IOError> {
+    let vfs = get_vfs_async(&state);
+    let full_dir = resolve_path_vfs(vfs.as_deref(), &dir, FileOp::Read)?;
+    let virtual_dir = dir;
+    let tx = get_io_tx_async(state);
+
+    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ListSavedFiles {
+        dir: full_dir,
+        prefix,
+        virtual_dir,
+        resp: IOCmdResp::Async(resp_tx),
+    })
+    .await
     .map_err(IOError::from)
 }
