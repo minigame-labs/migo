@@ -1106,6 +1106,54 @@ pub fn bluetooth_get_beacons(host_id: i32) -> Result<String, String> {
     call_bluetooth_json_no_args("bluetoothGetBeacons", host_id)
 }
 
+// ---- BLE GATT ----
+
+pub fn ble_create_connection(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("bleCreateConnection", host_id, options_json)
+}
+
+pub fn ble_close_connection(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("bleCloseConnection", host_id, options_json)
+}
+
+pub fn ble_get_device_services(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_json_method("bleGetDeviceServices", host_id, options_json)
+}
+
+pub fn ble_get_device_characteristics(
+    host_id: i32,
+    options_json: &str,
+) -> Result<String, String> {
+    call_json_method("bleGetDeviceCharacteristics", host_id, options_json)
+}
+
+pub fn ble_read_characteristic_value(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("bleReadCharacteristicValue", host_id, options_json)
+}
+
+pub fn ble_write_characteristic_value(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("bleWriteCharacteristicValue", host_id, options_json)
+}
+
+pub fn ble_notify_characteristic_value_change(
+    host_id: i32,
+    options_json: &str,
+) -> Result<(), String> {
+    call_void_with_string("bleNotifyCharacteristicValueChange", host_id, options_json)
+}
+
+pub fn ble_get_device_rssi(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_json_method("bleGetDeviceRSSI", host_id, options_json)
+}
+
+pub fn ble_set_mtu(host_id: i32, options_json: &str) -> Result<(), String> {
+    call_void_with_string("bleSetMTU", host_id, options_json)
+}
+
+pub fn ble_get_mtu(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_json_method("bleGetMTU", host_id, options_json)
+}
+
 // ==================== Image API ====================
 
 pub fn image_save_to_photos_album(host_id: i32, options_json: &str) -> Result<(), String> {

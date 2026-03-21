@@ -31,6 +31,15 @@ function showShareMenu(options) {
     }, options);
 }
 
+// ---- hideShareMenu ---------------------------------------------------------
+
+function hideShareMenu(options) {
+    return wrapAsync('hideShareMenu', function () {
+        _shareMenuConfig.menus = [];
+        return {};
+    }, options);
+}
+
 // ---- updateShareMenu -------------------------------------------------------
 
 function updateShareMenu(options) {
@@ -133,6 +142,7 @@ function _internalTriggerShareAppMessage() {
 
 export {
     showShareMenu,
+    hideShareMenu,
     updateShareMenu,
     onShareAppMessage,
     offShareAppMessage,

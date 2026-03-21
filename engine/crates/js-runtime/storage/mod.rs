@@ -164,23 +164,41 @@ pub fn op_storage_set(
     let hex_name = key_to_hex(key);
     let target = dir.join(&hex_name);
 
-    // Compute current total and the size of any existing value for this key.
-    let existing_size = fs::metadata(&target).map(|m| m.len() as usize).unwrap_or(0);
+    // Write to a temp file first, then atomically rename.  This prevents
+    // a TOCTOU window between the quota check and the final write.
+    let tmp_name = format!(".{}.tmp", &hex_name);
+    let tmp_path = dir.join(&tmp_name);
+    fs::write(&tmp_path, value)
+        .map_err(|e| JsErrorBox::generic(format!("setStorage:fail {e}")))?;
 
+    // Now compute total size (the temp file is included in the listing).
+    // Subtract the temp file and any pre-existing target from the total,
+    // then add the new value size to get the post-write total.
     let mut total: usize = 0;
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // Skip our temp file and the old target (we'll replace both).
+            if name_str == tmp_name || name_str == hex_name {
+                continue;
+            }
             total += entry.metadata().map(|m| m.len() as usize).unwrap_or(0);
         }
     }
+    total += value_len;
 
-    if total - existing_size + value_len > MAX_TOTAL_SIZE {
+    if total > MAX_TOTAL_SIZE {
+        // Quota exceeded — remove the temp file and report error.
+        let _ = fs::remove_file(&tmp_path);
         return Err(JsErrorBox::generic(
             "setStorage:fail storage limit exceeded",
         ));
     }
 
-    fs::write(&target, value).map_err(|e| JsErrorBox::generic(format!("setStorage:fail {e}")))?;
+    // Atomic rename: replaces old value if present.
+    fs::rename(&tmp_path, &target)
+        .map_err(|e| JsErrorBox::generic(format!("setStorage:fail {e}")))?;
     Ok(())
 }
 

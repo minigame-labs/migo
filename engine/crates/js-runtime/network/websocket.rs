@@ -156,9 +156,12 @@ pub async fn op_ws_create(
     // Handshake over the pre-connected stream.
     // client_async_tls_with_config handles TLS upgrade for wss:// using
     // the hostname from the request URI for SNI — no second DNS lookup.
+    let handshake_fut =
+        tokio_tungstenite::client_async_tls_with_config(request, tcp_stream, None, None);
     let (ws_stream, response) =
-        tokio_tungstenite::client_async_tls_with_config(request, tcp_stream, None, None)
+        tokio::time::timeout(std::time::Duration::from_secs(30), handshake_fut)
             .await
+            .map_err(|_| JsErrorBox::generic("WebSocket handshake timeout"))?
             .map_err(|e| JsErrorBox::generic(format!("WebSocket handshake failed: {}", e)))?;
 
     let protocol = response
@@ -284,8 +287,9 @@ pub async fn op_ws_send(
     };
 
     let mut tx = RcRef::map(&resource, |r| &r.tx).borrow_mut().await;
-    tx.send(message)
+    tokio::time::timeout(std::time::Duration::from_secs(10), tx.send(message))
         .await
+        .map_err(|_| JsErrorBox::generic("WebSocket send timeout"))?
         .map_err(|e| JsErrorBox::generic(format!("WebSocket send failed: {}", e)))
 }
 

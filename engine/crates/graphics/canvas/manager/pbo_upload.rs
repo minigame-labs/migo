@@ -244,8 +244,8 @@ pub struct PboPool {
 }
 
 impl PboPool {
-    /// Default pool size (number of PBOs to keep)
-    const DEFAULT_POOL_SIZE: usize = 4;
+    /// Default pool size (number of PBOs to keep).
+    pub const DEFAULT_POOL_SIZE: usize = 4;
 
     pub fn new(gl: &glow::Context, max_pool_size: usize) -> Self {
         let pbo_supported = check_pbo_support(gl);

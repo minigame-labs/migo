@@ -6,6 +6,7 @@ use tracing::info;
 use crate::android::jni::{
     JAVA_METHOD_CACHE, JavaMethodCache, getConsoleLogs, getDebugStats, init, mod_main,
     onAccelerometerChange, onActionSheetResult, onAudioInterruptionBegin, onAudioInterruptionEnd,
+    onBLECharacteristicValueChange, onBLEConnectionStateChange, onBLEMTUChange,
     onBeaconServiceChange, onBeaconUpdate, onBluetoothAdapterStateChange, onBluetoothDeviceFound,
     onCameraEvent, onCameraFrameData, onCheckSessionResult, onChooseImageResult,
     onChooseMessageFileResult, onCompassChange, onCompressImageResult, onDeviceMotionChange,
@@ -192,6 +193,22 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "onBeaconServiceChange".into(),
                 sig: "(IZZ)V".into(),
                 fn_ptr: onBeaconServiceChange as *mut c_void,
+            },
+            // BLE GATT callbacks
+            NativeMethod {
+                name: "onBLEConnectionStateChange".into(),
+                sig: "(ILjava/lang/String;Z)V".into(),
+                fn_ptr: onBLEConnectionStateChange as *mut c_void,
+            },
+            NativeMethod {
+                name: "onBLECharacteristicValueChange".into(),
+                sig: "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;[B)V".into(),
+                fn_ptr: onBLECharacteristicValueChange as *mut c_void,
+            },
+            NativeMethod {
+                name: "onBLEMTUChange".into(),
+                sig: "(ILjava/lang/String;I)V".into(),
+                fn_ptr: onBLEMTUChange as *mut c_void,
             },
             // Keyboard callbacks
             NativeMethod {
@@ -425,6 +442,29 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("bluetoothStartBeaconDiscovery", "(ILjava/lang/String;)V"),
         ("bluetoothStopBeaconDiscovery", "(I)V"),
         ("bluetoothGetBeacons", "(I)Ljava/lang/String;"),
+        // BLE GATT
+        ("bleCreateConnection", "(ILjava/lang/String;)V"),
+        ("bleCloseConnection", "(ILjava/lang/String;)V"),
+        (
+            "bleGetDeviceServices",
+            "(ILjava/lang/String;)Ljava/lang/String;",
+        ),
+        (
+            "bleGetDeviceCharacteristics",
+            "(ILjava/lang/String;)Ljava/lang/String;",
+        ),
+        ("bleReadCharacteristicValue", "(ILjava/lang/String;)V"),
+        ("bleWriteCharacteristicValue", "(ILjava/lang/String;)V"),
+        (
+            "bleNotifyCharacteristicValueChange",
+            "(ILjava/lang/String;)V",
+        ),
+        (
+            "bleGetDeviceRSSI",
+            "(ILjava/lang/String;)Ljava/lang/String;",
+        ),
+        ("bleSetMTU", "(ILjava/lang/String;)V"),
+        ("bleGetMTU", "(ILjava/lang/String;)Ljava/lang/String;"),
         // Keyboard
         ("keyboardShow", "(ILjava/lang/String;)V"),
         ("keyboardHide", "(I)V"),

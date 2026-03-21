@@ -470,12 +470,15 @@ function setInnerAudioOption(options = {}) {
 
   try {
     op_audio_set_inner_audio_option(mixWithOther, obeyMuteSwitch, speakerOn);
-    if (success) success();
+    const res = { errMsg: 'setInnerAudioOption:ok' };
+    if (success) success(res);
+    if (complete) complete(res);
+    return Promise.resolve(res);
   } catch (err) {
-    const errObj = { errMsg: err.message || String(err) };
-    if (fail) fail(errObj);
-  } finally {
-    if (complete) complete();
+    const res = { errMsg: 'setInnerAudioOption:fail ' + (err.message || String(err)) };
+    if (fail) fail(res);
+    if (complete) complete(res);
+    return Promise.reject(res);
   }
 }
 
@@ -484,12 +487,15 @@ function getAvailableAudioSources(options = {}) {
 
   try {
     const sources = op_audio_get_available_audio_sources();
-    if (success) success({ audioSources: sources });
+    const res = { errMsg: 'getAvailableAudioSources:ok', audioSources: sources };
+    if (success) success(res);
+    if (complete) complete(res);
+    return Promise.resolve(res);
   } catch (err) {
-    const errObj = { errMsg: err.message || String(err) };
-    if (fail) fail(errObj);
-  } finally {
-    if (complete) complete();
+    const res = { errMsg: 'getAvailableAudioSources:fail ' + (err.message || String(err)) };
+    if (fail) fail(res);
+    if (complete) complete(res);
+    return Promise.reject(res);
   }
 }
 

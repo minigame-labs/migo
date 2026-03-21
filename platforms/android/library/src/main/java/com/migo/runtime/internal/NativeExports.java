@@ -1721,6 +1721,68 @@ public final class NativeExports {
         return "{\"beacons\":[]}";
     }
 
+    // ---- BLE GATT ----
+
+    public static void bleCreateConnection(int sessionId, String optionsJson) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr == null) throw new RuntimeException("createBLEConnection:fail no bluetooth manager");
+        mgr.createBLEConnection(optionsJson);
+    }
+
+    public static void bleCloseConnection(int sessionId, String optionsJson) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr == null) throw new RuntimeException("closeBLEConnection:fail no bluetooth manager");
+        mgr.closeBLEConnection(optionsJson);
+    }
+
+    public static String bleGetDeviceServices(int sessionId, String optionsJson) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr == null) throw new RuntimeException("getBLEDeviceServices:fail no bluetooth manager");
+        return mgr.getBLEDeviceServices(optionsJson);
+    }
+
+    public static String bleGetDeviceCharacteristics(int sessionId, String optionsJson) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr == null) throw new RuntimeException("getBLEDeviceCharacteristics:fail no bluetooth manager");
+        return mgr.getBLEDeviceCharacteristics(optionsJson);
+    }
+
+    public static void bleReadCharacteristicValue(int sessionId, String optionsJson) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr == null) throw new RuntimeException("readBLECharacteristicValue:fail no bluetooth manager");
+        mgr.readBLECharacteristicValue(optionsJson);
+    }
+
+    public static void bleWriteCharacteristicValue(int sessionId, String optionsJson) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr == null) throw new RuntimeException("writeBLECharacteristicValue:fail no bluetooth manager");
+        mgr.writeBLECharacteristicValue(optionsJson);
+    }
+
+    public static void bleNotifyCharacteristicValueChange(int sessionId, String optionsJson) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr == null) throw new RuntimeException("notifyBLECharacteristicValueChange:fail no bluetooth manager");
+        mgr.notifyBLECharacteristicValueChange(optionsJson);
+    }
+
+    public static String bleGetDeviceRSSI(int sessionId, String optionsJson) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr == null) throw new RuntimeException("getBLEDeviceRSSI:fail no bluetooth manager");
+        return mgr.getBLEDeviceRSSI(optionsJson);
+    }
+
+    public static void bleSetMTU(int sessionId, String optionsJson) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr == null) throw new RuntimeException("setBLEMTU:fail no bluetooth manager");
+        mgr.setBLEMTU(optionsJson);
+    }
+
+    public static String bleGetMTU(int sessionId, String optionsJson) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr == null) throw new RuntimeException("getBLEMTU:fail no bluetooth manager");
+        return mgr.getBLEMTU(optionsJson);
+    }
+
     /**
      * Clean up Bluetooth resources for a session. Call on session shutdown.
      */

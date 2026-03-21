@@ -749,6 +749,83 @@ pub(crate) extern "system" fn onBeaconServiceChange(
     );
 }
 
+// ==================== BLE GATT Callbacks ====================
+
+pub(crate) extern "system" fn onBLEConnectionStateChange<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    device_id: JString<'local>,
+    connected: jni::sys::jboolean,
+) {
+    let dev: String = env
+        .get_string(&device_id)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnBLEConnectionStateChange {
+            device_id: dev,
+            connected: connected != 0,
+        },
+    );
+}
+
+pub(crate) extern "system" fn onBLECharacteristicValueChange<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    device_id: JString<'local>,
+    service_id: JString<'local>,
+    characteristic_id: JString<'local>,
+    value: jni::objects::JByteArray<'local>,
+) {
+    let dev: String = env
+        .get_string(&device_id)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let svc: String = env
+        .get_string(&service_id)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let chr: String = env
+        .get_string(&characteristic_id)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let val: Vec<u8> = env
+        .convert_byte_array(&value)
+        .unwrap_or_default();
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnBLECharacteristicValueChange {
+            device_id: dev,
+            service_id: svc,
+            characteristic_id: chr,
+            value: val,
+        },
+    );
+}
+
+pub(crate) extern "system" fn onBLEMTUChange<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    device_id: JString<'local>,
+    mtu: jint,
+) {
+    let dev: String = env
+        .get_string(&device_id)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnBLEMTUChange {
+            device_id: dev,
+            mtu: mtu as u32,
+        },
+    );
+}
+
 // ==================== Keyboard Callbacks ====================
 
 pub(crate) extern "system" fn onKeyboardInput<'local>(

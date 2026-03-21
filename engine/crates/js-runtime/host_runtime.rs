@@ -440,6 +440,37 @@ impl HostJsRuntime {
             .dispatch_beacon_service_change(&mut self.rt, available, discovering);
     }
 
+    // ---- BLE GATT event dispatch ----
+
+    #[inline]
+    pub fn dispatch_ble_connection_state_change(&mut self, device_id: &str, connected: bool) {
+        self.bindings
+            .dispatch_ble_connection_state_change(&mut self.rt, device_id, connected);
+    }
+
+    #[inline]
+    pub fn dispatch_ble_characteristic_value_change(
+        &mut self,
+        device_id: &str,
+        service_id: &str,
+        characteristic_id: &str,
+        value: &[u8],
+    ) {
+        self.bindings.dispatch_ble_characteristic_value_change(
+            &mut self.rt,
+            device_id,
+            service_id,
+            characteristic_id,
+            value,
+        );
+    }
+
+    #[inline]
+    pub fn dispatch_ble_mtu_change(&mut self, device_id: &str, mtu: u32) {
+        self.bindings
+            .dispatch_ble_mtu_change(&mut self.rt, device_id, mtu);
+    }
+
     // ---- Memory warning dispatch ----
 
     #[inline]

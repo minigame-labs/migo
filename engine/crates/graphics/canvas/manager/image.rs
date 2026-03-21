@@ -43,7 +43,7 @@ impl ImageRegistry {
     /// Initialize PBO pool (called once when GL context is available)
     fn ensure_pbo_pool(&mut self, gl: &glow::Context) {
         if self.pbo_pool.is_none() {
-            let pool = PboPool::new(gl, 4);
+            let pool = PboPool::new(gl, PboPool::DEFAULT_POOL_SIZE);
             self.use_pbo = pool.is_pbo_supported();
             self.pbo_pool = Some(pool);
             tracing::debug!("PBO upload initialized: enabled={}", self.use_pbo);

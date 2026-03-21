@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -12,7 +12,24 @@ use shared::protocol::audio_cmd::{
 };
 use shared::protocol::host_cmd::HostCommand;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// Best-effort thread join with a timeout.  Falls back to detaching the
+/// thread if it does not finish within `timeout`.
+fn join_with_timeout(handle: thread::JoinHandle<()>, timeout: Duration, label: &str) {
+    let caller = thread::current();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done2 = done.clone();
+    let _waiter = thread::spawn(move || {
+        let _ = handle.join();
+        done2.store(true, std::sync::atomic::Ordering::Release);
+        caller.unpark();
+    });
+    thread::park_timeout(timeout);
+    if !done.load(std::sync::atomic::Ordering::Acquire) {
+        warn!("{} did not shut down within {:?}, detaching", label, timeout);
+    }
+}
 
 use crate::decoder::DecodedAudio;
 
@@ -119,9 +136,9 @@ impl Drop for DecodePool {
         for _ in &self.workers {
             let _ = self.job_tx.send(PoolMsg::Shutdown);
         }
-        // Join (best-effort; don't block forever).
-        for h in self.workers.drain(..) {
-            let _ = h.join();
+        // Join with timeout — don't block forever.
+        for (i, h) in self.workers.drain(..).enumerate() {
+            join_with_timeout(h, Duration::from_secs(3), &format!("decode-worker-{}", i));
         }
     }
 }
@@ -358,7 +375,7 @@ impl AudioThread {
         let _ = self.tx.send(AudioCmd::Shutdown);
         self.wakeup.notify();
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            join_with_timeout(h, Duration::from_secs(3), "audio-thread");
         }
     }
 }
@@ -375,7 +392,7 @@ impl Drop for AudioThread {
         }
 
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            join_with_timeout(h, Duration::from_secs(3), "audio-thread");
         }
     }
 }

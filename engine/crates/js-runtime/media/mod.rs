@@ -267,6 +267,7 @@ deno_core::extension!(
         dir "media",
         "01_camera.js",
         "02_image_api.js",
+        "03_video_decoder.js",
     ],
 );
 

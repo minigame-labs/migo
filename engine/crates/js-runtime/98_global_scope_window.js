@@ -2,6 +2,7 @@ import * as lifecycle from "ext:host_v8_lifecycle/02_restart_exit.js";
 import * as alert from "ext:host_v8_console/01_alert.js";
 import * as url from "ext:host_v8_url/03_url.js";
 import * as subpackage from 'ext:host_v8_base/04_subpackage.js';
+import * as gcApi from 'ext:host_v8_base/03_gc.js';
 import * as location from "ext:host_v8_web/12_location.js";
 import * as performance from "ext:host_v8_web/12_performance.js";
 import * as raf from "ext:host_v8_webgl/03_raf.js";
@@ -60,6 +61,11 @@ import * as jssdkApi from 'ext:host_v8_system/16_jssdk.js';
 import * as adApi from 'ext:host_v8_ad/01_ad.js';
 import * as tcpSocket from 'ext:host_v8_network/08_tcp_socket.js';
 import * as udpSocket from 'ext:host_v8_network/09_udp_socket.js';
+import * as mouseApi from 'ext:host_v8_touch/03_mouse.js';
+import * as analyticsApi from 'ext:host_v8_system/17_analytics.js';
+import * as cryptoApi from 'ext:host_v8_system/18_crypto.js';
+import * as logManagerApi from 'ext:host_v8_system/19_log_manager.js';
+import * as videoDecoderApi from 'ext:host_v8_media/03_video_decoder.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -112,7 +118,7 @@ const WindowGlobalScope = {
     _internalTriggerKeyboardConfirm: core.propNonEnumerable(keyboard._internalTriggerKeyboardConfirm),
     _internalTriggerKeyboardComplete: core.propNonEnumerable(keyboard._internalTriggerKeyboardComplete),
 
-    // Keyboard (PC physical keys)
+    // Keyboard (PC physical keys - PC-only, dispatched via HostCommand)
     onKeyDown: core.propNonEnumerable(keyboard.onKeyDown),
     offKeyDown: core.propNonEnumerable(keyboard.offKeyDown),
     onKeyUp: core.propNonEnumerable(keyboard.onKeyUp),
@@ -351,6 +357,26 @@ const WindowGlobalScope = {
     offBeaconServiceChange: core.propNonEnumerable(bluetooth.offBeaconServiceChange),
     _internalTriggerBeaconUpdate: core.propNonEnumerable(bluetooth._internalTriggerBeaconUpdate),
     _internalTriggerBeaconServiceChange: core.propNonEnumerable(bluetooth._internalTriggerBeaconServiceChange),
+    // BLE GATT
+    createBLEConnection: core.propNonEnumerable(bluetooth.createBLEConnection),
+    closeBLEConnection: core.propNonEnumerable(bluetooth.closeBLEConnection),
+    getBLEDeviceServices: core.propNonEnumerable(bluetooth.getBLEDeviceServices),
+    getBLEDeviceCharacteristics: core.propNonEnumerable(bluetooth.getBLEDeviceCharacteristics),
+    readBLECharacteristicValue: core.propNonEnumerable(bluetooth.readBLECharacteristicValue),
+    writeBLECharacteristicValue: core.propNonEnumerable(bluetooth.writeBLECharacteristicValue),
+    notifyBLECharacteristicValueChange: core.propNonEnumerable(bluetooth.notifyBLECharacteristicValueChange),
+    getBLEDeviceRSSI: core.propNonEnumerable(bluetooth.getBLEDeviceRSSI),
+    setBLEMTU: core.propNonEnumerable(bluetooth.setBLEMTU),
+    getBLEMTU: core.propNonEnumerable(bluetooth.getBLEMTU),
+    onBLEConnectionStateChange: core.propNonEnumerable(bluetooth.onBLEConnectionStateChange),
+    offBLEConnectionStateChange: core.propNonEnumerable(bluetooth.offBLEConnectionStateChange),
+    onBLECharacteristicValueChange: core.propNonEnumerable(bluetooth.onBLECharacteristicValueChange),
+    offBLECharacteristicValueChange: core.propNonEnumerable(bluetooth.offBLECharacteristicValueChange),
+    onBLEMTUChange: core.propNonEnumerable(bluetooth.onBLEMTUChange),
+    offBLEMTUChange: core.propNonEnumerable(bluetooth.offBLEMTUChange),
+    _internalTriggerBLEConnectionStateChange: core.propNonEnumerable(bluetooth._internalTriggerBLEConnectionStateChange),
+    _internalTriggerBLECharacteristicValueChange: core.propNonEnumerable(bluetooth._internalTriggerBLECharacteristicValueChange),
+    _internalTriggerBLEMTUChange: core.propNonEnumerable(bluetooth._internalTriggerBLEMTUChange),
 
     // Authorize
     openAppAuthorizeSetting: core.propNonEnumerable(authorize.openAppAuthorizeSetting),
@@ -365,6 +391,7 @@ const WindowGlobalScope = {
 
     // Navigate / Customer Service
     navigateToMiniProgram: core.propNonEnumerable(navigateApi.navigateToMiniProgram),
+    navigateBackMiniProgram: core.propNonEnumerable(navigateApi.navigateBackMiniProgram),
     _internalOnNavigateToMiniProgramResult: core.propNonEnumerable(navigateApi._internalOnNavigateToMiniProgramResult),
     openCustomerServiceConversation: core.propNonEnumerable(navigateApi.openCustomerServiceConversation),
 
@@ -417,6 +444,7 @@ const WindowGlobalScope = {
 
     // Share
     showShareMenu: core.propNonEnumerable(shareApi.showShareMenu),
+    hideShareMenu: core.propNonEnumerable(shareApi.hideShareMenu),
     updateShareMenu: core.propNonEnumerable(shareApi.updateShareMenu),
     onShareAppMessage: core.propNonEnumerable(shareApi.onShareAppMessage),
     offShareAppMessage: core.propNonEnumerable(shareApi.offShareAppMessage),
@@ -424,7 +452,7 @@ const WindowGlobalScope = {
     _internalOnShareAppMessageResult: core.propNonEnumerable(shareApi._internalOnShareAppMessageResult),
     _internalTriggerShareAppMessage: core.propNonEnumerable(shareApi._internalTriggerShareAppMessage),
 
-    // Ad
+    // Ad (@mock - all ad types are simulated, no real ad SDK)
     createBannerAd: core.propNonEnumerable(adApi.createBannerAd),
     createCustomAd: core.propNonEnumerable(adApi.createCustomAd),
     createGridAd: core.propNonEnumerable(adApi.createGridAd),
@@ -454,6 +482,47 @@ const WindowGlobalScope = {
 
     // UDP Socket
     createUDPSocket: core.propNonEnumerable(udpSocket.createUDPSocket),
+
+    // GC / Memory
+    triggerGC: core.propNonEnumerable(gcApi.triggerGC),
+    getHeapStatistics: core.propNonEnumerable(gcApi.getHeapStatistics),
+
+    // Privacy (@stub - returns hardcoded values, host dispatch not wired)
+    getPrivacySetting: core.propNonEnumerable(settingApi.getPrivacySetting),
+    openPrivacyContract: core.propNonEnumerable(settingApi.openPrivacyContract),
+    onNeedPrivacyAuthorization: core.propNonEnumerable(settingApi.onNeedPrivacyAuthorization),
+    offNeedPrivacyAuthorization: core.propNonEnumerable(settingApi.offNeedPrivacyAuthorization),
+    _internalTriggerNeedPrivacyAuthorization: core.propNonEnumerable(settingApi._internalTriggerNeedPrivacyAuthorization),
+
+    // Analytics (@stub - all no-op, needs backend integration)
+    reportEvent: core.propNonEnumerable(analyticsApi.reportEvent),
+    reportMonitor: core.propNonEnumerable(analyticsApi.reportMonitor),
+    reportScene: core.propNonEnumerable(analyticsApi.reportScene),
+    reportPerformance: core.propNonEnumerable(analyticsApi.reportPerformance),
+
+    // UserCryptoManager (@stub - all methods fail with "not supported")
+    getUserCryptoManager: core.propNonEnumerable(cryptoApi.getUserCryptoManager),
+
+    // LogManager (functional) / RealtimeLogManager (@stub - all no-op)
+    getLogManager: core.propNonEnumerable(logManagerApi.getLogManager),
+    getRealtimeLogManager: core.propNonEnumerable(logManagerApi.getRealtimeLogManager),
+
+    // Mouse/Wheel events (PC-only, host dispatch not yet wired)
+    onMouseDown: core.propNonEnumerable(mouseApi.onMouseDown),
+    offMouseDown: core.propNonEnumerable(mouseApi.offMouseDown),
+    onMouseMove: core.propNonEnumerable(mouseApi.onMouseMove),
+    offMouseMove: core.propNonEnumerable(mouseApi.offMouseMove),
+    onMouseUp: core.propNonEnumerable(mouseApi.onMouseUp),
+    offMouseUp: core.propNonEnumerable(mouseApi.offMouseUp),
+    onWheel: core.propNonEnumerable(mouseApi.onWheel),
+    offWheel: core.propNonEnumerable(mouseApi.offWheel),
+    _internalTriggerMouseDown: core.propNonEnumerable(mouseApi._internalTriggerMouseDown),
+    _internalTriggerMouseMove: core.propNonEnumerable(mouseApi._internalTriggerMouseMove),
+    _internalTriggerMouseUp: core.propNonEnumerable(mouseApi._internalTriggerMouseUp),
+    _internalTriggerWheel: core.propNonEnumerable(mouseApi._internalTriggerWheel),
+
+    // VideoDecoder (@stub - all methods no-op, video not supported)
+    createVideoDecoder: core.propNonEnumerable(videoDecoderApi.createVideoDecoder),
 };
 
 export { WindowGlobalScope };

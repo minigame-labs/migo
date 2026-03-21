@@ -15,6 +15,14 @@ pub trait NavigateService: Send + Sync {
         Err("navigateToMiniProgram:fail not supported".to_string())
     }
 
+    /// Navigate back to the source mini program (Mode A, sync).
+    ///
+    /// JSON fields (input):
+    /// - `extraData`: object (optional, data to pass back)
+    fn navigate_back_mini_program(&self, _options_json: &str) -> Result<(), String> {
+        Err("navigateBackMiniProgram:fail not supported".to_string())
+    }
+
     /// Open the customer service conversation (Mode A, sync).
     ///
     /// JSON fields (input):

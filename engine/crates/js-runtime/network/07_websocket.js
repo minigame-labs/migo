@@ -253,21 +253,57 @@ function connectSocket(options = {}) {
 function sendSocketMessage(options = {}) {
     if (!_globalSocket || _globalSocket._closed) {
         const err = { errMsg: "sendSocketMessage:fail WebSocket is not connected" };
-        if (typeof options.fail === 'function') options.fail(err);
-        if (typeof options.complete === 'function') options.complete(err);
-        return;
+        if (typeof options.fail === 'function') queueMicrotask(() => options.fail(err));
+        if (typeof options.complete === 'function') queueMicrotask(() => options.complete(err));
+        return Promise.reject(err);
     }
-    _globalSocket.send(options);
+    const { data, success, fail, complete } = options;
+    let dataStr = undefined;
+    let dataBuf = undefined;
+    if (typeof data === 'string') {
+        dataStr = data;
+    } else if (data instanceof ArrayBuffer) {
+        dataBuf = new Uint8Array(data);
+    } else if (ArrayBuffer.isView(data)) {
+        dataBuf = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    } else {
+        const err = { errMsg: "sendSocketMessage:fail invalid data type" };
+        if (typeof fail === 'function') queueMicrotask(() => fail(err));
+        if (typeof complete === 'function') queueMicrotask(() => complete(err));
+        return Promise.reject(err);
+    }
+    return op_ws_send(_globalSocket._rid, dataStr, dataBuf).then(() => {
+        const res = { errMsg: "sendSocketMessage:ok" };
+        if (typeof success === 'function') success(res);
+        if (typeof complete === 'function') complete(res);
+        return res;
+    }).catch((err) => {
+        const res = { errMsg: "sendSocketMessage:fail " + err.message };
+        if (typeof fail === 'function') fail(res);
+        if (typeof complete === 'function') complete(res);
+        throw res;
+    });
 }
 
 function closeSocket(options = {}) {
     if (!_globalSocket || _globalSocket._closed) {
         const err = { errMsg: "closeSocket:fail WebSocket is not connected" };
-        if (typeof options.fail === 'function') options.fail(err);
-        if (typeof options.complete === 'function') options.complete(err);
-        return;
+        if (typeof options.fail === 'function') queueMicrotask(() => options.fail(err));
+        if (typeof options.complete === 'function') queueMicrotask(() => options.complete(err));
+        return Promise.reject(err);
     }
-    _globalSocket.close(options);
+    const { code = 1000, reason = "", success, fail, complete } = options;
+    return op_ws_close(_globalSocket._rid, code, reason).then(() => {
+        const res = { errMsg: "closeSocket:ok" };
+        if (typeof success === 'function') success(res);
+        if (typeof complete === 'function') complete(res);
+        return res;
+    }).catch((err) => {
+        const res = { errMsg: "closeSocket:fail " + err.message };
+        if (typeof fail === 'function') fail(res);
+        if (typeof complete === 'function') complete(res);
+        throw res;
+    });
 }
 
 function onSocketOpen(callback) {

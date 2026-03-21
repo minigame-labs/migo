@@ -3,7 +3,7 @@
 // navigateToMiniProgram: Mode C (async, host navigates, result via EvalScript).
 // openCustomerServiceConversation: Mode A (sync, host opens conversation).
 
-import { op_navigate_to_mini_program, op_open_customer_service_conversation } from "ext:core/ops";
+import { op_navigate_to_mini_program, op_navigate_back_mini_program, op_open_customer_service_conversation } from "ext:core/ops";
 import { wrapAsync, createDeferredApi } from "ext:host_v8_base/02_async.js";
 
 // ---- navigateToMiniProgram (Mode C) ----------------------------------------
@@ -29,6 +29,17 @@ function _internalOnNavigateToMiniProgramResult(resultJson) {
     _navigateApi.settle(resultJson);
 }
 
+// ---- navigateBackMiniProgram (Mode A) ----------------------------------------
+
+function navigateBackMiniProgram(options) {
+    return wrapAsync('navigateBackMiniProgram', function () {
+        var opts = options || {};
+        op_navigate_back_mini_program(JSON.stringify({
+            extraData: opts.extraData || {},
+        }));
+    }, options);
+}
+
 // ---- openCustomerServiceConversation (Mode A) ------------------------------
 
 function openCustomerServiceConversation(options) {
@@ -46,6 +57,7 @@ function openCustomerServiceConversation(options) {
 
 export {
     navigateToMiniProgram,
+    navigateBackMiniProgram,
     _internalOnNavigateToMiniProgramResult,
     openCustomerServiceConversation,
 };

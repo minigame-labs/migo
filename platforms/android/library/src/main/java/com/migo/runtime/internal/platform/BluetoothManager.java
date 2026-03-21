@@ -3,6 +3,12 @@ package com.migo.runtime.internal.platform;
 import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothGatt;
+import android.bluetooth.BluetoothGattCallback;
+import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattDescriptor;
+import android.bluetooth.BluetoothGattService;
+import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanFilter;
@@ -26,6 +32,7 @@ import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -45,6 +52,18 @@ public class BluetoothManager {
 
     /** Discovered devices keyed by address. */
     private final ConcurrentHashMap<String, JSONObject> discoveredDevices = new ConcurrentHashMap<>();
+
+    /** Active GATT connections keyed by device address. */
+    private final ConcurrentHashMap<String, BluetoothGatt> gattConnections = new ConcurrentHashMap<>();
+
+    /** Cached negotiated MTU per device. Updated by onMtuChanged callback. */
+    private final ConcurrentHashMap<String, Integer> negotiatedMtu = new ConcurrentHashMap<>();
+
+    /** Cached RSSI per device. Updated by onReadRemoteRssi callback. */
+    private final ConcurrentHashMap<String, Integer> cachedRssi = new ConcurrentHashMap<>();
+
+    /** Client Characteristic Configuration Descriptor UUID for enabling notifications. */
+    private static final UUID CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
     private BluetoothLeScanner leScanner;
     private ScanCallback leScanCallback;
@@ -87,6 +106,16 @@ public class BluetoothManager {
         stopDiscovery();
         unregisterAdapterStateReceiver();
         discoveredDevices.clear();
+        // Close all GATT connections when adapter is closed
+        for (BluetoothGatt gatt : gattConnections.values()) {
+            try {
+                gatt.disconnect();
+                gatt.close();
+            } catch (Exception ignored) {}
+        }
+        gattConnections.clear();
+        negotiatedMtu.clear();
+        cachedRssi.clear();
     }
 
     public String getAdapterState() {
@@ -344,6 +373,345 @@ public class BluetoothManager {
         return result.toString();
     }
 
+    // ==================== BLE GATT ====================
+
+    public void createBLEConnection(String optionsJson) {
+        if (adapter == null) {
+            throw new RuntimeException("createBLEConnection:fail adapter not available");
+        }
+        try {
+            JSONObject opts = new JSONObject(optionsJson);
+            String deviceId = opts.getString("deviceId");
+
+            if (gattConnections.containsKey(deviceId)) {
+                return; // already connected
+            }
+
+            BluetoothDevice device = adapter.getRemoteDevice(deviceId);
+            Activity activity = getActivity();
+            Context ctx = activity != null ? activity : null;
+            if (ctx == null) {
+                throw new RuntimeException("createBLEConnection:fail no context");
+            }
+
+            BluetoothGattCallback callback = new BluetoothGattCallback() {
+                @Override
+                public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+                    boolean connected = (newState == BluetoothProfile.STATE_CONNECTED);
+                    if (connected) {
+                        gattConnections.put(deviceId, gatt);
+                        gatt.discoverServices();
+                    } else {
+                        gattConnections.remove(deviceId);
+                        gatt.close();
+                    }
+                    NativeMethods.onBLEConnectionStateChange(sessionId, deviceId, connected);
+                }
+
+                @Override
+                public void onServicesDiscovered(BluetoothGatt gatt, int status) {
+                    // Services cached in the BluetoothGatt object, retrieved via getServices()
+                }
+
+                @Override
+                public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        byte[] value = characteristic.getValue();
+                        if (value == null) value = new byte[0];
+                        String serviceId = characteristic.getService().getUuid().toString();
+                        String charId = characteristic.getUuid().toString();
+                        NativeMethods.onBLECharacteristicValueChange(sessionId, deviceId, serviceId, charId, value);
+                    }
+                }
+
+                @Override
+                public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+                    byte[] value = characteristic.getValue();
+                    if (value == null) value = new byte[0];
+                    String serviceId = characteristic.getService().getUuid().toString();
+                    String charId = characteristic.getUuid().toString();
+                    NativeMethods.onBLECharacteristicValueChange(sessionId, deviceId, serviceId, charId, value);
+                }
+
+                @Override
+                public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        negotiatedMtu.put(deviceId, mtu);
+                        NativeMethods.onBLEMTUChange(sessionId, deviceId, mtu);
+                    }
+                }
+
+                @Override
+                public void onReadRemoteRssi(BluetoothGatt gatt, int rssi, int status) {
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        cachedRssi.put(deviceId, rssi);
+                    }
+                }
+            };
+
+            BluetoothGatt gatt;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                gatt = device.connectGatt(ctx, false, callback, BluetoothDevice.TRANSPORT_LE);
+            } else {
+                gatt = device.connectGatt(ctx, false, callback);
+            }
+            if (gatt == null) {
+                throw new RuntimeException("createBLEConnection:fail connect failed");
+            }
+        } catch (JSONException e) {
+            throw new RuntimeException("createBLEConnection:fail invalid options");
+        } catch (IllegalArgumentException e) {
+            throw new RuntimeException("createBLEConnection:fail invalid deviceId");
+        }
+    }
+
+    public void closeBLEConnection(String optionsJson) {
+        try {
+            JSONObject opts = new JSONObject(optionsJson);
+            String deviceId = opts.getString("deviceId");
+            BluetoothGatt gatt = gattConnections.remove(deviceId);
+            negotiatedMtu.remove(deviceId);
+            cachedRssi.remove(deviceId);
+            if (gatt != null) {
+                gatt.disconnect();
+                gatt.close();
+            }
+        } catch (JSONException e) {
+            throw new RuntimeException("closeBLEConnection:fail invalid options");
+        }
+    }
+
+    public String getBLEDeviceServices(String optionsJson) {
+        try {
+            JSONObject opts = new JSONObject(optionsJson);
+            String deviceId = opts.getString("deviceId");
+            BluetoothGatt gatt = gattConnections.get(deviceId);
+            if (gatt == null) {
+                throw new RuntimeException("getBLEDeviceServices:fail not connected");
+            }
+            List<BluetoothGattService> services = gatt.getServices();
+            JSONArray arr = new JSONArray();
+            for (BluetoothGattService svc : services) {
+                JSONObject svcJson = new JSONObject();
+                svcJson.put("uuid", svc.getUuid().toString());
+                svcJson.put("isPrimary", svc.getType() == BluetoothGattService.SERVICE_TYPE_PRIMARY);
+                arr.put(svcJson);
+            }
+            JSONObject result = new JSONObject();
+            result.put("services", arr);
+            return result.toString();
+        } catch (JSONException e) {
+            throw new RuntimeException("getBLEDeviceServices:fail invalid options");
+        }
+    }
+
+    public String getBLEDeviceCharacteristics(String optionsJson) {
+        try {
+            JSONObject opts = new JSONObject(optionsJson);
+            String deviceId = opts.getString("deviceId");
+            String serviceId = opts.getString("serviceId");
+            BluetoothGatt gatt = gattConnections.get(deviceId);
+            if (gatt == null) {
+                throw new RuntimeException("getBLEDeviceCharacteristics:fail not connected");
+            }
+            BluetoothGattService svc = gatt.getService(UUID.fromString(serviceId));
+            if (svc == null) {
+                throw new RuntimeException("getBLEDeviceCharacteristics:fail service not found");
+            }
+            JSONArray arr = new JSONArray();
+            for (BluetoothGattCharacteristic ch : svc.getCharacteristics()) {
+                JSONObject chJson = new JSONObject();
+                chJson.put("uuid", ch.getUuid().toString());
+                JSONObject props = new JSONObject();
+                int p = ch.getProperties();
+                props.put("read", (p & BluetoothGattCharacteristic.PROPERTY_READ) != 0);
+                props.put("write", (p & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0);
+                props.put("notify", (p & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0);
+                props.put("indicate", (p & BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0);
+                chJson.put("properties", props);
+                arr.put(chJson);
+            }
+            JSONObject result = new JSONObject();
+            result.put("characteristics", arr);
+            return result.toString();
+        } catch (JSONException e) {
+            throw new RuntimeException("getBLEDeviceCharacteristics:fail invalid options");
+        }
+    }
+
+    public void readBLECharacteristicValue(String optionsJson) {
+        try {
+            JSONObject opts = new JSONObject(optionsJson);
+            String deviceId = opts.getString("deviceId");
+            String serviceId = opts.getString("serviceId");
+            String characteristicId = opts.getString("characteristicId");
+            BluetoothGatt gatt = gattConnections.get(deviceId);
+            if (gatt == null) {
+                throw new RuntimeException("readBLECharacteristicValue:fail not connected");
+            }
+            BluetoothGattCharacteristic ch = findCharacteristic(gatt, serviceId, characteristicId);
+            if (ch == null) {
+                throw new RuntimeException("readBLECharacteristicValue:fail characteristic not found");
+            }
+            if (!gatt.readCharacteristic(ch)) {
+                throw new RuntimeException("readBLECharacteristicValue:fail read request failed");
+            }
+            // Result delivered asynchronously via onCharacteristicRead callback
+        } catch (JSONException e) {
+            throw new RuntimeException("readBLECharacteristicValue:fail invalid options");
+        }
+    }
+
+    public void writeBLECharacteristicValue(String optionsJson) {
+        try {
+            JSONObject opts = new JSONObject(optionsJson);
+            String deviceId = opts.getString("deviceId");
+            String serviceId = opts.getString("serviceId");
+            String characteristicId = opts.getString("characteristicId");
+            String valueHex = opts.optString("value", "");
+            BluetoothGatt gatt = gattConnections.get(deviceId);
+            if (gatt == null) {
+                throw new RuntimeException("writeBLECharacteristicValue:fail not connected");
+            }
+            BluetoothGattCharacteristic ch = findCharacteristic(gatt, serviceId, characteristicId);
+            if (ch == null) {
+                throw new RuntimeException("writeBLECharacteristicValue:fail characteristic not found");
+            }
+            byte[] value = hexToBytes(valueHex);
+            ch.setValue(value);
+            String writeType = opts.optString("writeType", "write");
+            if ("writeNoResponse".equals(writeType)) {
+                ch.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+            } else {
+                ch.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            }
+            if (!gatt.writeCharacteristic(ch)) {
+                throw new RuntimeException("writeBLECharacteristicValue:fail write request failed");
+            }
+        } catch (JSONException e) {
+            throw new RuntimeException("writeBLECharacteristicValue:fail invalid options");
+        }
+    }
+
+    public void notifyBLECharacteristicValueChange(String optionsJson) {
+        try {
+            JSONObject opts = new JSONObject(optionsJson);
+            String deviceId = opts.getString("deviceId");
+            String serviceId = opts.getString("serviceId");
+            String characteristicId = opts.getString("characteristicId");
+            boolean state = opts.optBoolean("state", true);
+            BluetoothGatt gatt = gattConnections.get(deviceId);
+            if (gatt == null) {
+                throw new RuntimeException("notifyBLECharacteristicValueChange:fail not connected");
+            }
+            BluetoothGattCharacteristic ch = findCharacteristic(gatt, serviceId, characteristicId);
+            if (ch == null) {
+                throw new RuntimeException("notifyBLECharacteristicValueChange:fail characteristic not found");
+            }
+            if (!gatt.setCharacteristicNotification(ch, state)) {
+                throw new RuntimeException("notifyBLECharacteristicValueChange:fail set notification failed");
+            }
+            // Write CCCD to enable/disable server-side notifications
+            BluetoothGattDescriptor cccd = ch.getDescriptor(CCCD_UUID);
+            if (cccd != null) {
+                if (state) {
+                    int props = ch.getProperties();
+                    if ((props & BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
+                        cccd.setValue(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE);
+                    } else {
+                        cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                    }
+                } else {
+                    cccd.setValue(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE);
+                }
+                gatt.writeDescriptor(cccd);
+            }
+        } catch (JSONException e) {
+            throw new RuntimeException("notifyBLECharacteristicValueChange:fail invalid options");
+        }
+    }
+
+    public String getBLEDeviceRSSI(String optionsJson) {
+        try {
+            JSONObject opts = new JSONObject(optionsJson);
+            String deviceId = opts.getString("deviceId");
+            BluetoothGatt gatt = gattConnections.get(deviceId);
+            if (gatt == null) {
+                throw new RuntimeException("getBLEDeviceRSSI:fail not connected");
+            }
+            // Trigger async RSSI read - result cached in onReadRemoteRssi
+            gatt.readRemoteRssi();
+            // Return last cached value (0 if never read before)
+            Integer rssi = cachedRssi.get(deviceId);
+            JSONObject result = new JSONObject();
+            result.put("RSSI", rssi != null ? rssi.intValue() : 0);
+            return result.toString();
+        } catch (JSONException e) {
+            throw new RuntimeException("getBLEDeviceRSSI:fail invalid options");
+        }
+    }
+
+    public void setBLEMTU(String optionsJson) {
+        try {
+            JSONObject opts = new JSONObject(optionsJson);
+            String deviceId = opts.getString("deviceId");
+            int mtu = opts.optInt("mtu", 23);
+            BluetoothGatt gatt = gattConnections.get(deviceId);
+            if (gatt == null) {
+                throw new RuntimeException("setBLEMTU:fail not connected");
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                if (!gatt.requestMtu(mtu)) {
+                    throw new RuntimeException("setBLEMTU:fail request failed");
+                }
+                // Result delivered via onMtuChanged callback
+            } else {
+                throw new RuntimeException("setBLEMTU:fail not supported on this API level");
+            }
+        } catch (JSONException e) {
+            throw new RuntimeException("setBLEMTU:fail invalid options");
+        }
+    }
+
+    public String getBLEMTU(String optionsJson) {
+        try {
+            JSONObject opts = new JSONObject(optionsJson);
+            String deviceId = opts.getString("deviceId");
+            // Return cached negotiated MTU, or BLE default (23) if not yet negotiated
+            Integer mtu = negotiatedMtu.get(deviceId);
+            JSONObject result = new JSONObject();
+            result.put("mtu", mtu != null ? mtu.intValue() : 23);
+            return result.toString();
+        } catch (JSONException e) {
+            throw new RuntimeException("getBLEMTU:fail invalid options");
+        }
+    }
+
+    private BluetoothGattCharacteristic findCharacteristic(
+            BluetoothGatt gatt, String serviceId, String characteristicId) {
+        BluetoothGattService svc = gatt.getService(UUID.fromString(serviceId));
+        if (svc == null) return null;
+        return svc.getCharacteristic(UUID.fromString(characteristicId));
+    }
+
+    private static byte[] hexToBytes(String hex) {
+        if (hex == null || hex.isEmpty()) return new byte[0];
+        int len = hex.length();
+        if (len % 2 != 0) {
+            throw new IllegalArgumentException("writeBLECharacteristicValue:fail value hex string has odd length");
+        }
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            int hi = Character.digit(hex.charAt(i), 16);
+            int lo = Character.digit(hex.charAt(i + 1), 16);
+            if (hi < 0 || lo < 0) {
+                throw new IllegalArgumentException("writeBLECharacteristicValue:fail value contains invalid hex character");
+            }
+            data[i / 2] = (byte) ((hi << 4) + lo);
+        }
+        return data;
+    }
+
     // ==================== Cleanup ====================
 
     public void destroy() {
@@ -351,6 +719,16 @@ public class BluetoothManager {
         stopBeaconDiscoveryInternal();
         beaconDiscovering = false;
         discoveredBeacons.clear();
+        // Close all GATT connections
+        for (BluetoothGatt gatt : gattConnections.values()) {
+            try {
+                gatt.disconnect();
+                gatt.close();
+            } catch (Exception ignored) {}
+        }
+        gattConnections.clear();
+        negotiatedMtu.clear();
+        cachedRssi.clear();
     }
 
     // ==================== Internal ====================

@@ -483,6 +483,35 @@ impl Host {
                 Ok(())
             }
 
+            HostCommand::OnBLEConnectionStateChange {
+                device_id,
+                connected,
+            } => {
+                self.js
+                    .dispatch_ble_connection_state_change(&device_id, connected);
+                Ok(())
+            }
+
+            HostCommand::OnBLECharacteristicValueChange {
+                device_id,
+                service_id,
+                characteristic_id,
+                value,
+            } => {
+                self.js.dispatch_ble_characteristic_value_change(
+                    &device_id,
+                    &service_id,
+                    &characteristic_id,
+                    &value,
+                );
+                Ok(())
+            }
+
+            HostCommand::OnBLEMTUChange { device_id, mtu } => {
+                self.js.dispatch_ble_mtu_change(&device_id, mtu);
+                Ok(())
+            }
+
             HostCommand::OnBluetoothAdapterStateChange {
                 available,
                 discovering,

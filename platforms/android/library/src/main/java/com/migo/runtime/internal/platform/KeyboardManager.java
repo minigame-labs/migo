@@ -17,6 +17,8 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 
+import java.lang.ref.WeakReference;
+
 import com.migo.runtime.internal.NativeMethods;
 
 import org.json.JSONException;
@@ -49,7 +51,7 @@ public class KeyboardManager {
     private static final int INPUT_BAR_MIN_HEIGHT_DP = 44;
 
     private final int sessionId;
-    private final Activity activity;
+    private final WeakReference<Activity> activityRef;
     private final Handler mainHandler;
 
     private EditText editText;
@@ -59,9 +61,13 @@ public class KeyboardManager {
 
     private ViewTreeObserver.OnGlobalLayoutListener layoutListener;
 
+    private Activity getActivity() {
+        return activityRef.get();
+    }
+
     public KeyboardManager(int sessionId, Activity activity) {
         this.sessionId = sessionId;
-        this.activity = activity;
+        this.activityRef = new WeakReference<>(activity);
         this.mainHandler = new Handler(Looper.getMainLooper());
     }
 
@@ -131,6 +137,7 @@ public class KeyboardManager {
         }
 
         ensureEditText();
+        if (editText == null) return;
 
         // Input type
         int inputType = mapInputType(keyboardType, multiple);
@@ -196,6 +203,8 @@ public class KeyboardManager {
     private void ensureEditText() {
         if (editText != null) return;
 
+        Activity activity = getActivity();
+        if (activity == null) return;
         editText = new EditText(activity);
         editText.setVisibility(View.GONE);
         editText.setBackgroundColor(0xFFFFFFFF);
@@ -277,6 +286,8 @@ public class KeyboardManager {
     private void startKeyboardHeightMonitoring() {
         stopKeyboardHeightMonitoring();
 
+        Activity activity = getActivity();
+        if (activity == null) return;
         View decorView = activity.getWindow().getDecorView();
         layoutListener = () -> {
             Rect r = new Rect();
@@ -305,8 +316,11 @@ public class KeyboardManager {
 
     private void stopKeyboardHeightMonitoring() {
         if (layoutListener != null) {
-            View decorView = activity.getWindow().getDecorView();
-            decorView.getViewTreeObserver().removeOnGlobalLayoutListener(layoutListener);
+            Activity activity = getActivity();
+            if (activity != null) {
+                View decorView = activity.getWindow().getDecorView();
+                decorView.getViewTreeObserver().removeOnGlobalLayoutListener(layoutListener);
+            }
             layoutListener = null;
             lastKeyboardHeight = 0;
         }
@@ -345,6 +359,8 @@ public class KeyboardManager {
     }
 
     private int dpToPx(int dp) {
+        Activity activity = getActivity();
+        if (activity == null) return dp;
         float density = activity.getResources().getDisplayMetrics().density;
         return Math.round(dp * density);
     }
@@ -370,6 +386,8 @@ public class KeyboardManager {
     // ==================== Helpers ====================
 
     private InputMethodManager getImm() {
+        Activity activity = getActivity();
+        if (activity == null) return null;
         return (InputMethodManager) activity.getSystemService(Activity.INPUT_METHOD_SERVICE);
     }
 

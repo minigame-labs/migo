@@ -79,7 +79,11 @@ fn reject_blocked_ip_literal(url: &Url) -> Result<(), JsErrorBox> {
 }
 
 /// Check URL against the domain whitelist in NetworkPolicy.
-/// If the whitelist is empty, all domains are allowed.
+///
+/// **Security note:** If the whitelist is empty, all domains are allowed
+/// (allow-all). The host app SHOULD populate `network_policy.domain_whitelist`
+/// with the game's server domains to restrict outbound network access.
+///
 /// Matching supports exact match and subdomain match (e.g., "example.com"
 /// allows "api.example.com").
 fn check_domain_whitelist(url: &Url, state: &OpState) -> Result<(), JsErrorBox> {

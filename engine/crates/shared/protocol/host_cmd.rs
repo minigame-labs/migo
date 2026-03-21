@@ -313,6 +313,40 @@ pub enum HostCommand {
         devices_json: String,
     },
 
+    /// BLE connection state changed (connected/disconnected).
+    ///
+    /// Triggers `migo.onBLEConnectionStateChange` callbacks.
+    OnBLEConnectionStateChange {
+        /// BLE device identifier.
+        device_id: String,
+        /// Whether the device is connected.
+        connected: bool,
+    },
+
+    /// BLE characteristic value changed (notification/indication received).
+    ///
+    /// Triggers `migo.onBLECharacteristicValueChange` callbacks.
+    OnBLECharacteristicValueChange {
+        /// BLE device identifier.
+        device_id: String,
+        /// GATT service UUID.
+        service_id: String,
+        /// GATT characteristic UUID.
+        characteristic_id: String,
+        /// Characteristic value bytes.
+        value: Vec<u8>,
+    },
+
+    /// BLE MTU changed after negotiation.
+    ///
+    /// Triggers `migo.onBLEMTUChange` callbacks.
+    OnBLEMTUChange {
+        /// BLE device identifier.
+        device_id: String,
+        /// New MTU value.
+        mtu: u32,
+    },
+
     /// Beacon devices updated during discovery.
     ///
     /// Triggers `migo.onBeaconUpdate` callbacks.

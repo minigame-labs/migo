@@ -322,6 +322,108 @@ pub trait BluetoothService: Send + Sync {
     fn get_beacons(&self) -> Result<String, String> {
         Err("getBeacons:fail not supported".to_string())
     }
+
+    // ==================== BLE GATT APIs ====================
+
+    /// Connect to a BLE peripheral device.
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string (device MAC address or identifier)
+    /// - `timeout`: number in ms (default 0, system default)
+    fn create_ble_connection(&self, _options_json: &str) -> Result<(), String> {
+        Err("createBLEConnection:fail not supported".into())
+    }
+
+    /// Disconnect from a BLE peripheral device.
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string
+    fn close_ble_connection(&self, _options_json: &str) -> Result<(), String> {
+        Err("closeBLEConnection:fail not supported".into())
+    }
+
+    /// Get all GATT services of a connected BLE device.
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string
+    ///
+    /// Returns JSON: `{"services": [{"uuid": "...", "isPrimary": true}]}`
+    fn get_ble_device_services(&self, _options_json: &str) -> Result<String, String> {
+        Err("getBLEDeviceServices:fail not supported".into())
+    }
+
+    /// Get all characteristics of a BLE GATT service.
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string
+    /// - `serviceId`: string (service UUID)
+    ///
+    /// Returns JSON: `{"characteristics": [{"uuid": "...", "properties": {...}}]}`
+    fn get_ble_device_characteristics(&self, _options_json: &str) -> Result<String, String> {
+        Err("getBLEDeviceCharacteristics:fail not supported".into())
+    }
+
+    /// Read a BLE characteristic value.
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string
+    /// - `serviceId`: string (service UUID)
+    /// - `characteristicId`: string (characteristic UUID)
+    fn read_ble_characteristic_value(&self, _options_json: &str) -> Result<(), String> {
+        Err("readBLECharacteristicValue:fail not supported".into())
+    }
+
+    /// Write a value to a BLE characteristic.
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string
+    /// - `serviceId`: string (service UUID)
+    /// - `characteristicId`: string (characteristic UUID)
+    /// - `value`: string (hex-encoded bytes, e.g. "0a1b2c")
+    /// - `writeType`: string ("write" or "writeNoResponse")
+    fn write_ble_characteristic_value(&self, _options_json: &str) -> Result<(), String> {
+        Err("writeBLECharacteristicValue:fail not supported".into())
+    }
+
+    /// Subscribe or unsubscribe to BLE characteristic value changes.
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string
+    /// - `serviceId`: string (service UUID)
+    /// - `characteristicId`: string (characteristic UUID)
+    /// - `state`: bool (true = subscribe, false = unsubscribe)
+    fn notify_ble_characteristic_value_change(&self, _options_json: &str) -> Result<(), String> {
+        Err("notifyBLECharacteristicValueChange:fail not supported".into())
+    }
+
+    /// Get the RSSI (signal strength) of a connected BLE device.
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string
+    ///
+    /// Returns JSON: `{"RSSI": -50}`
+    fn get_ble_device_rssi(&self, _options_json: &str) -> Result<String, String> {
+        Err("getBLEDeviceRSSI:fail not supported".into())
+    }
+
+    /// Set the MTU for a BLE connection.
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string
+    /// - `mtu`: number (22-512)
+    fn set_ble_mtu(&self, _options_json: &str) -> Result<(), String> {
+        Err("setBLEMTU:fail not supported".into())
+    }
+
+    /// Get the current MTU of a BLE connection.
+    ///
+    /// JSON fields:
+    /// - `deviceId`: string
+    ///
+    /// Returns JSON: `{"mtu": 23}`
+    fn get_ble_mtu(&self, _options_json: &str) -> Result<String, String> {
+        Err("getBLEMTU:fail not supported".into())
+    }
 }
 
 // ==================== Aggregated Device Services ====================

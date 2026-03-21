@@ -12,6 +12,16 @@ import {
     op_start_beacon_discovery,
     op_stop_beacon_discovery,
     op_get_beacons,
+    op_create_ble_connection,
+    op_close_ble_connection,
+    op_get_ble_device_services,
+    op_get_ble_device_characteristics,
+    op_read_ble_characteristic_value,
+    op_write_ble_characteristic_value,
+    op_notify_ble_characteristic_value_change,
+    op_get_ble_device_rssi,
+    op_set_ble_mtu,
+    op_get_ble_mtu,
 } from "ext:core/ops";
 import { wrapAsync } from "ext:host_v8_base/02_async.js";
 
@@ -262,6 +272,229 @@ function _internalTriggerBeaconServiceChange(available, discovering) {
     }
 }
 
+// ==================== BLE GATT Connection APIs ====================
+
+function createBLEConnection(options = {}) {
+    const { deviceId, timeout } = options;
+    return wrapAsync('createBLEConnection', function () {
+        op_create_ble_connection(JSON.stringify({
+            deviceId: deviceId || '',
+            timeout: timeout !== undefined ? timeout : 0,
+        }));
+    }, options);
+}
+
+function closeBLEConnection(options = {}) {
+    const { deviceId } = options;
+    return wrapAsync('closeBLEConnection', function () {
+        op_close_ble_connection(JSON.stringify({
+            deviceId: deviceId || '',
+        }));
+    }, options);
+}
+
+// ==================== BLE GATT Service/Characteristic APIs ====================
+
+function getBLEDeviceServices(options = {}) {
+    const { deviceId } = options;
+    return wrapAsync('getBLEDeviceServices', function () {
+        const json = op_get_ble_device_services(JSON.stringify({
+            deviceId: deviceId || '',
+        }));
+        return JSON.parse(json);
+    }, options);
+}
+
+function getBLEDeviceCharacteristics(options = {}) {
+    const { deviceId, serviceId } = options;
+    return wrapAsync('getBLEDeviceCharacteristics', function () {
+        const json = op_get_ble_device_characteristics(JSON.stringify({
+            deviceId: deviceId || '',
+            serviceId: serviceId || '',
+        }));
+        return JSON.parse(json);
+    }, options);
+}
+
+function readBLECharacteristicValue(options = {}) {
+    const { deviceId, serviceId, characteristicId } = options;
+    return wrapAsync('readBLECharacteristicValue', function () {
+        op_read_ble_characteristic_value(JSON.stringify({
+            deviceId: deviceId || '',
+            serviceId: serviceId || '',
+            characteristicId: characteristicId || '',
+        }));
+    }, options);
+}
+
+function _bufferToHex(buf) {
+    if (!buf) return '';
+    var bytes;
+    if (buf instanceof ArrayBuffer) {
+        bytes = new Uint8Array(buf);
+    } else if (ArrayBuffer.isView(buf)) {
+        bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    } else if (typeof buf === 'string') {
+        return buf; // already hex string
+    } else {
+        return '';
+    }
+    var hex = '';
+    for (var i = 0; i < bytes.length; i++) {
+        var b = bytes[i].toString(16);
+        hex += b.length < 2 ? '0' + b : b;
+    }
+    return hex;
+}
+
+function writeBLECharacteristicValue(options = {}) {
+    const { deviceId, serviceId, characteristicId, value, writeType } = options;
+    return wrapAsync('writeBLECharacteristicValue', function () {
+        op_write_ble_characteristic_value(JSON.stringify({
+            deviceId: deviceId || '',
+            serviceId: serviceId || '',
+            characteristicId: characteristicId || '',
+            value: _bufferToHex(value),
+            writeType: writeType || 'write',
+        }));
+    }, options);
+}
+
+function notifyBLECharacteristicValueChange(options = {}) {
+    const { deviceId, serviceId, characteristicId, state } = options;
+    return wrapAsync('notifyBLECharacteristicValueChange', function () {
+        op_notify_ble_characteristic_value_change(JSON.stringify({
+            deviceId: deviceId || '',
+            serviceId: serviceId || '',
+            characteristicId: characteristicId || '',
+            state: state !== undefined ? state : false,
+        }));
+    }, options);
+}
+
+// ==================== BLE RSSI / MTU APIs ====================
+
+function getBLEDeviceRSSI(options = {}) {
+    const { deviceId } = options;
+    return wrapAsync('getBLEDeviceRSSI', function () {
+        const json = op_get_ble_device_rssi(JSON.stringify({
+            deviceId: deviceId || '',
+        }));
+        return JSON.parse(json);
+    }, options);
+}
+
+function setBLEMTU(options = {}) {
+    const { deviceId, mtu } = options;
+    return wrapAsync('setBLEMTU', function () {
+        op_set_ble_mtu(JSON.stringify({
+            deviceId: deviceId || '',
+            mtu: mtu !== undefined ? mtu : 23,
+        }));
+    }, options);
+}
+
+function getBLEMTU(options = {}) {
+    const { deviceId } = options;
+    return wrapAsync('getBLEMTU', function () {
+        const json = op_get_ble_mtu(JSON.stringify({
+            deviceId: deviceId || '',
+        }));
+        return JSON.parse(json);
+    }, options);
+}
+
+// ==================== BLE GATT Event Listeners ====================
+
+const _bleConnectionStateChangeListeners = [];
+const _bleCharacteristicValueChangeListeners = [];
+const _bleMTUChangeListeners = [];
+
+function onBLEConnectionStateChange(listener) {
+    if (typeof listener === 'function') {
+        _bleConnectionStateChangeListeners.push(listener);
+    }
+}
+
+function offBLEConnectionStateChange(listener) {
+    if (typeof listener === 'function') {
+        const index = _bleConnectionStateChangeListeners.indexOf(listener);
+        if (index !== -1) {
+            _bleConnectionStateChangeListeners.splice(index, 1);
+        }
+    } else {
+        _bleConnectionStateChangeListeners.length = 0;
+    }
+}
+
+function onBLECharacteristicValueChange(listener) {
+    if (typeof listener === 'function') {
+        _bleCharacteristicValueChangeListeners.push(listener);
+    }
+}
+
+function offBLECharacteristicValueChange(listener) {
+    if (typeof listener === 'function') {
+        const index = _bleCharacteristicValueChangeListeners.indexOf(listener);
+        if (index !== -1) {
+            _bleCharacteristicValueChangeListeners.splice(index, 1);
+        }
+    } else {
+        _bleCharacteristicValueChangeListeners.length = 0;
+    }
+}
+
+function onBLEMTUChange(listener) {
+    if (typeof listener === 'function') {
+        _bleMTUChangeListeners.push(listener);
+    }
+}
+
+function offBLEMTUChange(listener) {
+    if (typeof listener === 'function') {
+        const index = _bleMTUChangeListeners.indexOf(listener);
+        if (index !== -1) {
+            _bleMTUChangeListeners.splice(index, 1);
+        }
+    } else {
+        _bleMTUChangeListeners.length = 0;
+    }
+}
+
+// ==================== BLE GATT Internal Trigger Functions ====================
+
+function _internalTriggerBLEConnectionStateChange(deviceId, connected) {
+    const data = { deviceId: deviceId, connected: connected };
+    for (let i = 0; i < _bleConnectionStateChangeListeners.length; i++) {
+        try { _bleConnectionStateChangeListeners[i](data); } catch (e) {
+            console.error('onBLEConnectionStateChange listener error:', e);
+        }
+    }
+}
+
+function _internalTriggerBLECharacteristicValueChange(deviceId, serviceId, characteristicId, value) {
+    const data = {
+        deviceId: deviceId,
+        serviceId: serviceId,
+        characteristicId: characteristicId,
+        value: value,
+    };
+    for (let i = 0; i < _bleCharacteristicValueChangeListeners.length; i++) {
+        try { _bleCharacteristicValueChangeListeners[i](data); } catch (e) {
+            console.error('onBLECharacteristicValueChange listener error:', e);
+        }
+    }
+}
+
+function _internalTriggerBLEMTUChange(deviceId, mtu) {
+    const data = { deviceId: deviceId, mtu: mtu };
+    for (let i = 0; i < _bleMTUChangeListeners.length; i++) {
+        try { _bleMTUChangeListeners[i](data); } catch (e) {
+            console.error('onBLEMTUChange listener error:', e);
+        }
+    }
+}
+
 export {
     // System bluetooth setting
     openSystemBluetoothSetting,
@@ -295,4 +528,25 @@ export {
     offBeaconServiceChange,
     _internalTriggerBeaconUpdate,
     _internalTriggerBeaconServiceChange,
+    // BLE GATT
+    createBLEConnection,
+    closeBLEConnection,
+    getBLEDeviceServices,
+    getBLEDeviceCharacteristics,
+    readBLECharacteristicValue,
+    writeBLECharacteristicValue,
+    notifyBLECharacteristicValueChange,
+    getBLEDeviceRSSI,
+    setBLEMTU,
+    getBLEMTU,
+    // BLE GATT events
+    onBLEConnectionStateChange,
+    offBLEConnectionStateChange,
+    onBLECharacteristicValueChange,
+    offBLECharacteristicValueChange,
+    onBLEMTUChange,
+    offBLEMTUChange,
+    _internalTriggerBLEConnectionStateChange,
+    _internalTriggerBLECharacteristicValueChange,
+    _internalTriggerBLEMTUChange,
 };

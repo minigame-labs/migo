@@ -27,6 +27,10 @@ pub(crate) struct JsBindings {
     bluetooth_device_found_fn: Option<v8::Global<v8::Function>>,
     beacon_update_fn: Option<v8::Global<v8::Function>>,
     beacon_service_change_fn: Option<v8::Global<v8::Function>>,
+    // BLE GATT event functions
+    ble_connection_state_change_fn: Option<v8::Global<v8::Function>>,
+    ble_characteristic_value_change_fn: Option<v8::Global<v8::Function>>,
+    ble_mtu_change_fn: Option<v8::Global<v8::Function>>,
     // Memory warning
     memory_warning_fn: Option<v8::Global<v8::Function>>,
     // Keyboard event functions
@@ -60,6 +64,9 @@ impl JsBindings {
             bluetooth_device_found_fn: None,
             beacon_update_fn: None,
             beacon_service_change_fn: None,
+            ble_connection_state_change_fn: None,
+            ble_characteristic_value_change_fn: None,
+            ble_mtu_change_fn: None,
             memory_warning_fn: None,
             keyboard_input_fn: None,
             keyboard_height_change_fn: None,
@@ -102,6 +109,9 @@ impl JsBindings {
             bt_device_found,
             beacon_update,
             beacon_svc_change,
+            ble_conn_state,
+            ble_char_value,
+            ble_mtu,
             mem_warning,
             kb_input,
             kb_height,
@@ -127,6 +137,9 @@ impl JsBindings {
                 get_global_fn(scope, global, "_internalTriggerBluetoothDeviceFound"),
                 get_global_fn(scope, global, "_internalTriggerBeaconUpdate"),
                 get_global_fn(scope, global, "_internalTriggerBeaconServiceChange"),
+                get_global_fn(scope, global, "_internalTriggerBLEConnectionStateChange"),
+                get_global_fn(scope, global, "_internalTriggerBLECharacteristicValueChange"),
+                get_global_fn(scope, global, "_internalTriggerBLEMTUChange"),
                 get_global_fn(scope, global, "_internalTriggerMemoryWarning"),
                 get_global_fn(scope, global, "_internalTriggerKeyboardInput"),
                 get_global_fn(scope, global, "_internalTriggerKeyboardHeightChange"),
@@ -153,6 +166,9 @@ impl JsBindings {
         self.bluetooth_device_found_fn = bt_device_found;
         self.beacon_update_fn = beacon_update;
         self.beacon_service_change_fn = beacon_svc_change;
+        self.ble_connection_state_change_fn = ble_conn_state;
+        self.ble_characteristic_value_change_fn = ble_char_value;
+        self.ble_mtu_change_fn = ble_mtu;
         self.memory_warning_fn = mem_warning;
         self.keyboard_input_fn = kb_input;
         self.keyboard_height_change_fn = kb_height;
@@ -518,6 +534,93 @@ impl JsBindings {
                 let args = [
                     v8::Boolean::new(scope, available).into(),
                     v8::Boolean::new(scope, discovering).into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    // ---- BLE GATT event dispatch ----
+
+    /// Dispatch BLE connection state change event.
+    pub(crate) fn dispatch_ble_connection_state_change(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        device_id: &str,
+        connected: bool,
+    ) {
+        if let Some(func_g) = self.ble_connection_state_change_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [
+                    v8::String::new(scope, device_id)
+                        .unwrap_or_else(|| v8::String::empty(scope))
+                        .into(),
+                    v8::Boolean::new(scope, connected).into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Dispatch BLE characteristic value change event.
+    pub(crate) fn dispatch_ble_characteristic_value_change(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        device_id: &str,
+        service_id: &str,
+        characteristic_id: &str,
+        value: &[u8],
+    ) {
+        if let Some(func_g) = self.ble_characteristic_value_change_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let ab = v8::ArrayBuffer::new(scope, value.len());
+                if !value.is_empty() {
+                    let backing = ab.get_backing_store();
+                    if let Some(ptr) = backing.data() {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                value.as_ptr(),
+                                ptr.as_ptr() as *mut u8,
+                                value.len(),
+                            );
+                        }
+                    }
+                }
+
+                let args = [
+                    v8::String::new(scope, device_id)
+                        .unwrap_or_else(|| v8::String::empty(scope))
+                        .into(),
+                    v8::String::new(scope, service_id)
+                        .unwrap_or_else(|| v8::String::empty(scope))
+                        .into(),
+                    v8::String::new(scope, characteristic_id)
+                        .unwrap_or_else(|| v8::String::empty(scope))
+                        .into(),
+                    ab.into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Dispatch BLE MTU change event.
+    pub(crate) fn dispatch_ble_mtu_change(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        device_id: &str,
+        mtu: u32,
+    ) {
+        if let Some(func_g) = self.ble_mtu_change_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [
+                    v8::String::new(scope, device_id)
+                        .unwrap_or_else(|| v8::String::empty(scope))
+                        .into(),
+                    v8::Integer::new(scope, mtu as i32).into(),
                 ];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);

@@ -310,6 +310,15 @@ public final class NativeBridge {
      */
     public static native void onBeaconServiceChange(int sessionId, boolean available, boolean discovering);
 
+    // ==================== BLE GATT Callbacks ====================
+
+    public static native void onBLEConnectionStateChange(int sessionId, String deviceId, boolean connected);
+
+    public static native void onBLECharacteristicValueChange(int sessionId, String deviceId,
+                                                              String serviceId, String characteristicId, byte[] value);
+
+    public static native void onBLEMTUChange(int sessionId, String deviceId, int mtu);
+
     // ==================== Keyboard Callbacks ====================
 
     /**

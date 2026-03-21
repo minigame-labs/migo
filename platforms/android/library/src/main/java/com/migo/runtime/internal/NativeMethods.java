@@ -651,6 +651,27 @@ public final class NativeMethods {
         }
     }
 
+    // ==================== BLE GATT Events ====================
+
+    public static void onBLEConnectionStateChange(int sessionId, String deviceId, boolean connected) {
+        if (sessionId >= 0 && deviceId != null) {
+            NativeBridge.onBLEConnectionStateChange(sessionId, deviceId, connected);
+        }
+    }
+
+    public static void onBLECharacteristicValueChange(int sessionId, String deviceId,
+                                                        String serviceId, String characteristicId, byte[] value) {
+        if (sessionId >= 0 && deviceId != null && serviceId != null && characteristicId != null) {
+            NativeBridge.onBLECharacteristicValueChange(sessionId, deviceId, serviceId, characteristicId, value != null ? value : new byte[0]);
+        }
+    }
+
+    public static void onBLEMTUChange(int sessionId, String deviceId, int mtu) {
+        if (sessionId >= 0 && deviceId != null) {
+            NativeBridge.onBLEMTUChange(sessionId, deviceId, mtu);
+        }
+    }
+
     // ==================== Screen Capture ====================
 
     /**

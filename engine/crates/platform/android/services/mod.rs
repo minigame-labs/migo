@@ -563,6 +563,48 @@ impl BluetoothService for AndroidBluetooth {
     fn get_beacons(&self) -> Result<String, String> {
         jni::bluetooth_get_beacons(self.host_id)
     }
+
+    // ---- BLE GATT ----
+
+    fn create_ble_connection(&self, options_json: &str) -> Result<(), String> {
+        jni::ble_create_connection(self.host_id, options_json)
+    }
+
+    fn close_ble_connection(&self, options_json: &str) -> Result<(), String> {
+        jni::ble_close_connection(self.host_id, options_json)
+    }
+
+    fn get_ble_device_services(&self, options_json: &str) -> Result<String, String> {
+        jni::ble_get_device_services(self.host_id, options_json)
+    }
+
+    fn get_ble_device_characteristics(&self, options_json: &str) -> Result<String, String> {
+        jni::ble_get_device_characteristics(self.host_id, options_json)
+    }
+
+    fn read_ble_characteristic_value(&self, options_json: &str) -> Result<(), String> {
+        jni::ble_read_characteristic_value(self.host_id, options_json)
+    }
+
+    fn write_ble_characteristic_value(&self, options_json: &str) -> Result<(), String> {
+        jni::ble_write_characteristic_value(self.host_id, options_json)
+    }
+
+    fn notify_ble_characteristic_value_change(&self, options_json: &str) -> Result<(), String> {
+        jni::ble_notify_characteristic_value_change(self.host_id, options_json)
+    }
+
+    fn get_ble_device_rssi(&self, options_json: &str) -> Result<String, String> {
+        jni::ble_get_device_rssi(self.host_id, options_json)
+    }
+
+    fn set_ble_mtu(&self, options_json: &str) -> Result<(), String> {
+        jni::ble_set_mtu(self.host_id, options_json)
+    }
+
+    fn get_ble_mtu(&self, options_json: &str) -> Result<String, String> {
+        jni::ble_get_mtu(self.host_id, options_json)
+    }
 }
 
 // ==================== Keyboard ====================

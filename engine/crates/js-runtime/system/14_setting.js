@@ -91,10 +91,60 @@ function _internalUpdateAuthSetting(scope, authorized) {
     }
 }
 
+// ---- Privacy APIs --------------------------------------------------------
+// @stub getPrivacySetting returns hardcoded { needAuthorization: false }.
+// @stub openPrivacyContract is a no-op.
+// @stub onNeedPrivacyAuthorization listener infra is ready but host-side
+//       dispatch (HostCommand or EvalScript) is not yet wired.
+
+function getPrivacySetting(options) {
+    return wrapAsync('getPrivacySetting', function () {
+        return { needAuthorization: false, privacyContractName: '' };
+    }, options);
+}
+
+function openPrivacyContract(options) {
+    return wrapAsync('openPrivacyContract', function () {}, options);
+}
+
+// ---- onNeedPrivacyAuthorization / offNeedPrivacyAuthorization (Mode D) ---
+
+var _privacyAuthListeners = [];
+
+function onNeedPrivacyAuthorization(listener) {
+    if (typeof listener === 'function') {
+        _privacyAuthListeners.push(listener);
+    }
+}
+
+function offNeedPrivacyAuthorization(listener) {
+    if (typeof listener === 'function') {
+        var index = _privacyAuthListeners.indexOf(listener);
+        if (index !== -1) {
+            _privacyAuthListeners.splice(index, 1);
+        }
+    } else {
+        _privacyAuthListeners.length = 0;
+    }
+}
+
+function _internalTriggerNeedPrivacyAuthorization(resolve) {
+    for (var i = 0; i < _privacyAuthListeners.length; i++) {
+        try { _privacyAuthListeners[i]({ resolve: resolve }); } catch (e) {
+            console.error('onNeedPrivacyAuthorization listener error:', e);
+        }
+    }
+}
+
 export {
     getSetting,
     authorize,
     openSetting,
     _internalOnOpenSettingResult,
     _internalUpdateAuthSetting,
+    getPrivacySetting,
+    openPrivacyContract,
+    onNeedPrivacyAuthorization,
+    offNeedPrivacyAuthorization,
+    _internalTriggerNeedPrivacyAuthorization,
 };

@@ -164,6 +164,188 @@ pub fn op_is_bluetooth_device_paired(
     ))
 }
 
+// ==================== BLE GATT ====================
+
+#[op2(fast)]
+pub fn op_create_ble_connection(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt
+                .create_ble_connection(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "createBLEConnection:fail not supported",
+    ))
+}
+
+#[op2(fast)]
+pub fn op_close_ble_connection(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt
+                .close_ble_connection(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "closeBLEConnection:fail not supported",
+    ))
+}
+
+#[op2]
+#[string]
+pub fn op_get_ble_device_services(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt
+                .get_ble_device_services(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "getBLEDeviceServices:fail not supported",
+    ))
+}
+
+#[op2]
+#[string]
+pub fn op_get_ble_device_characteristics(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt
+                .get_ble_device_characteristics(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "getBLEDeviceCharacteristics:fail not supported",
+    ))
+}
+
+#[op2(fast)]
+pub fn op_read_ble_characteristic_value(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt
+                .read_ble_characteristic_value(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "readBLECharacteristicValue:fail not supported",
+    ))
+}
+
+#[op2(fast)]
+pub fn op_write_ble_characteristic_value(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt
+                .write_ble_characteristic_value(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "writeBLECharacteristicValue:fail not supported",
+    ))
+}
+
+#[op2(fast)]
+pub fn op_notify_ble_characteristic_value_change(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt
+                .notify_ble_characteristic_value_change(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "notifyBLECharacteristicValueChange:fail not supported",
+    ))
+}
+
+#[op2]
+#[string]
+pub fn op_get_ble_device_rssi(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt
+                .get_ble_device_rssi(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "getBLEDeviceRSSI:fail not supported",
+    ))
+}
+
+#[op2(fast)]
+pub fn op_set_ble_mtu(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt
+                .set_ble_mtu(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("setBLEMTU:fail not supported"))
+}
+
+#[op2]
+#[string]
+pub fn op_get_ble_mtu(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(bt) = services.bluetooth() {
+            return bt
+                .get_ble_mtu(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("getBLEMTU:fail not supported"))
+}
+
 // ==================== Beacon ====================
 
 #[op2(fast)]
@@ -244,6 +426,24 @@ pub fn op_navigate_to_mini_program(
     }
     Err(JsErrorBox::generic(
         "navigateToMiniProgram:fail not supported",
+    ))
+}
+
+#[op2(fast)]
+pub fn op_navigate_back_mini_program(
+    state: &mut OpState,
+    #[string] options_json: String,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(nav) = services.navigate() {
+            return nav
+                .navigate_back_mini_program(&options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "navigateBackMiniProgram:fail not supported",
     ))
 }
 
@@ -435,6 +635,16 @@ deno_core::extension!(
         op_get_connected_bluetooth_devices,
         op_make_bluetooth_pair,
         op_is_bluetooth_device_paired,
+        op_create_ble_connection,
+        op_close_ble_connection,
+        op_get_ble_device_services,
+        op_get_ble_device_characteristics,
+        op_read_ble_characteristic_value,
+        op_write_ble_characteristic_value,
+        op_notify_ble_characteristic_value_change,
+        op_get_ble_device_rssi,
+        op_set_ble_mtu,
+        op_get_ble_mtu,
         op_start_beacon_discovery,
         op_stop_beacon_discovery,
         op_get_beacons,
@@ -450,6 +660,7 @@ deno_core::extension!(
         op_game_log_report,
         op_open_setting,
         op_navigate_to_mini_program,
+        op_navigate_back_mini_program,
         op_open_customer_service_conversation,
     ],
     esm = [
@@ -470,6 +681,9 @@ deno_core::extension!(
         "14_setting.js",
         "15_navigate.js",
         "16_jssdk.js",
+        "17_analytics.js",
+        "18_crypto.js",
+        "19_log_manager.js",
     ]
 );
 
