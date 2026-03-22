@@ -136,6 +136,28 @@ function _internalTriggerNeedPrivacyAuthorization(resolve) {
     }
 }
 
+// ---- requirePrivacyAuthorize (stub - resolves immediately) -----------------
+
+function requirePrivacyAuthorize(options) {
+    return wrapAsync('requirePrivacyAuthorize', function () {
+        return {};
+    }, options);
+}
+
+// ---- requestSubscribeMessage (stub - simulates all accepted) ---------------
+
+function requestSubscribeMessage(options) {
+    return wrapAsync('requestSubscribeMessage', function () {
+        var opts = options || {};
+        var tmplIds = opts.tmplIds || [];
+        var result = {};
+        for (var i = 0; i < tmplIds.length; i++) {
+            result[tmplIds[i]] = 'accept';
+        }
+        return result;
+    }, options);
+}
+
 export {
     getSetting,
     authorize,
@@ -147,4 +169,6 @@ export {
     onNeedPrivacyAuthorization,
     offNeedPrivacyAuthorization,
     _internalTriggerNeedPrivacyAuthorization,
+    requirePrivacyAuthorize,
+    requestSubscribeMessage,
 };

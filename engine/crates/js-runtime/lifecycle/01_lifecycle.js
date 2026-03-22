@@ -237,6 +237,44 @@ function _internalTriggerOnHide() {
     lifecycleManager._triggerHide();
 }
 
+// ---- onAddToFavorites / offAddToFavorites ----------------------------------
+
+const _addToFavoritesListeners = [];
+
+function onAddToFavorites(listener) {
+    if (typeof listener === "function") {
+        _addToFavoritesListeners.push(listener);
+    }
+}
+
+function offAddToFavorites(listener) {
+    if (typeof listener === "function") {
+        const index = _addToFavoritesListeners.indexOf(listener);
+        if (index !== -1) _addToFavoritesListeners.splice(index, 1);
+    } else {
+        _addToFavoritesListeners.length = 0;
+    }
+}
+
+// @stub - called by host when user triggers "add to favorites".
+// Returns aggregated data from registered listeners.
+function _internalTriggerAddToFavorites() {
+    var result = { title: '', imageUrl: '', query: '' };
+    for (var i = 0; i < _addToFavoritesListeners.length; i++) {
+        try {
+            var override = _addToFavoritesListeners[i]();
+            if (override && typeof override === 'object') {
+                if (typeof override.title === 'string') result.title = override.title;
+                if (typeof override.imageUrl === 'string') result.imageUrl = override.imageUrl;
+                if (typeof override.query === 'string') result.query = override.query;
+            }
+        } catch (e) {
+            console.error('onAddToFavorites listener error:', e);
+        }
+    }
+    return result;
+}
+
 export {
     onShow,
     onHide,
@@ -246,4 +284,7 @@ export {
     getEnterOptionsSync,
     _internalTriggerOnHide,
     _internalTriggerOnShow,
+    onAddToFavorites,
+    offAddToFavorites,
+    _internalTriggerAddToFavorites,
 };

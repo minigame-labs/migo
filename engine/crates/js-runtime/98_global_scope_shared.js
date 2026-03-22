@@ -24,6 +24,8 @@ const windowOrWorkerGlobalScope = {
     // Event
     onError: core.propWritable(event.onError),
     offError: core.propWritable(event.offError),
+    onUnhandledRejection: core.propWritable(event.onUnhandledRejection),
+    offUnhandledRejection: core.propWritable(event.offUnhandledRejection),
 
     // Timers
     setTimeout: core.propWritable(timers.setTimeout),

@@ -327,10 +327,49 @@ function _internalOnGetPhoneNumberResult(resultJson) {
     pending.complete(res);
 }
 
+// getUserProfile - deprecated but still used by some games.
+// Delegates to getUserInfo internally.
+function getUserProfile(options = {}) {
+    const opts = options && typeof options === "object" ? options : {};
+    const requestId = _nextId();
+    const success = typeof opts.success === "function" ? opts.success : noop;
+    const fail = typeof opts.fail === "function" ? opts.fail : noop;
+    const complete = typeof opts.complete === "function" ? opts.complete : noop;
+
+    const lang = _normalizeLang(opts.lang);
+    const desc = typeof opts.desc === "string" ? opts.desc : "";
+
+    return new Promise(function (resolve, reject) {
+        _pendingUserInfo.set(requestId, {
+            success: function (res) { success(res); resolve(res); },
+            fail: function (res) { fail(res); reject(res); },
+            complete,
+        });
+
+        try {
+            op_get_user_info(JSON.stringify({
+                requestId,
+                withCredentials: false,
+                lang,
+                desc,
+            }));
+        } catch (error) {
+            _pendingUserInfo.delete(requestId);
+            const res = { errMsg: 'getUserProfile:fail ' + _safeErrorMessage(error) };
+            queueMicrotask(function () {
+                fail(res);
+                complete(res);
+                reject(res);
+            });
+        }
+    });
+}
+
 export {
     login,
     checkSession,
     getUserInfo,
+    getUserProfile,
     getPhoneNumber,
     _internalOnLoginResult,
     _internalOnCheckSessionResult,

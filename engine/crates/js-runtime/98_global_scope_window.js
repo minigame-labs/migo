@@ -303,6 +303,7 @@ const WindowGlobalScope = {
     // UI Buttons
     createUserInfoButton: core.propNonEnumerable(buttonsApi.createUserInfoButton),
     createGameClubButton: core.propNonEnumerable(buttonsApi.createGameClubButton),
+    createFeedbackButton: core.propNonEnumerable(buttonsApi.createFeedbackButton),
     getMenuButtonBoundingClientRect: core.propNonEnumerable(buttonsApi.getMenuButtonBoundingClientRect),
 
     // Page Manager
@@ -320,10 +321,16 @@ const WindowGlobalScope = {
     getEnterOptionsSync: core.propNonEnumerable(appLifecycle.getEnterOptionsSync),
     _internalTriggerOnShow: core.propNonEnumerable(appLifecycle._internalTriggerOnShow),
     _internalTriggerOnHide: core.propNonEnumerable(appLifecycle._internalTriggerOnHide),
+    onAddToFavorites: core.propNonEnumerable(appLifecycle.onAddToFavorites),
+    offAddToFavorites: core.propNonEnumerable(appLifecycle.offAddToFavorites),
+    _internalTriggerAddToFavorites: core.propNonEnumerable(appLifecycle._internalTriggerAddToFavorites),
 
     // App Lifecycle (restart/exit)
     restartMiniProgram: core.propNonEnumerable(lifecycle.restartMiniProgram),
+    restartMiniProgramSync: core.propNonEnumerable(lifecycle.restartMiniProgramSync),
     exitMiniProgram: core.propNonEnumerable(lifecycle.exitMiniProgram),
+    exitApplication: core.propNonEnumerable(lifecycle.exitApplication),
+    saveAppToDesktop: core.propNonEnumerable(lifecycle.saveAppToDesktop),
 
     // Update
     updateApp: core.propNonEnumerable(updateApp.updateApp),
@@ -394,11 +401,13 @@ const WindowGlobalScope = {
     navigateBackMiniProgram: core.propNonEnumerable(navigateApi.navigateBackMiniProgram),
     _internalOnNavigateToMiniProgramResult: core.propNonEnumerable(navigateApi._internalOnNavigateToMiniProgramResult),
     openCustomerServiceConversation: core.propNonEnumerable(navigateApi.openCustomerServiceConversation),
+    openBusinessView: core.propNonEnumerable(navigateApi.openBusinessView),
 
     // Login
     login: core.propNonEnumerable(loginApi.login),
     checkSession: core.propNonEnumerable(loginApi.checkSession),
     getUserInfo: core.propNonEnumerable(loginApi.getUserInfo),
+    getUserProfile: core.propNonEnumerable(loginApi.getUserProfile),
     getPhoneNumber: core.propNonEnumerable(loginApi.getPhoneNumber),
     _internalOnLoginResult: core.propNonEnumerable(loginApi._internalOnLoginResult),
     _internalOnCheckSessionResult: core.propNonEnumerable(loginApi._internalOnCheckSessionResult),
@@ -419,6 +428,9 @@ const WindowGlobalScope = {
 
     // App Info
     getAppBaseInfo: core.propNonEnumerable(appInfo.getAppBaseInfo),
+    getAccountInfoSync: core.propNonEnumerable(appInfo.getAccountInfoSync),
+    checkIsAddedToMyMiniProgram: core.propNonEnumerable(appInfo.checkIsAddedToMyMiniProgram),
+    _internalSetAppId: core.propNonEnumerable(appInfo._internalSetAppId),
 
     // Authorize Setting
     getAppAuthorizeSetting: core.propNonEnumerable(authorizeSetting.getAppAuthorizeSetting),
@@ -433,6 +445,13 @@ const WindowGlobalScope = {
     offMessage: core.propNonEnumerable(openDataContext.offMessage),
     getOpenDataContext: core.propNonEnumerable(openDataContext.getOpenDataContext),
     getSharedCanvas: core.propNonEnumerable(openDataContext.getSharedCanvas),
+    getFriendCloudStorage: core.propNonEnumerable(openDataContext.getFriendCloudStorage),
+    setUserCloudStorage: core.propNonEnumerable(openDataContext.setUserCloudStorage),
+    removeUserCloudStorage: core.propNonEnumerable(openDataContext.removeUserCloudStorage),
+    modifyFriendInteractiveStorage: core.propNonEnumerable(openDataContext.modifyFriendInteractiveStorage),
+    getPotentialFriendList: core.propNonEnumerable(openDataContext.getPotentialFriendList),
+    getGameClubData: core.propNonEnumerable(openDataContext.getGameClubData),
+    getUserGameLabel: core.propNonEnumerable(openDataContext.getUserGameLabel),
 
     // Window Resize
     onWindowResize: core.propNonEnumerable(windowResize.onWindowResize),
@@ -451,6 +470,14 @@ const WindowGlobalScope = {
     shareAppMessage: core.propNonEnumerable(shareApi.shareAppMessage),
     _internalOnShareAppMessageResult: core.propNonEnumerable(shareApi._internalOnShareAppMessageResult),
     _internalTriggerShareAppMessage: core.propNonEnumerable(shareApi._internalTriggerShareAppMessage),
+    onShareTimeline: core.propNonEnumerable(shareApi.onShareTimeline),
+    offShareTimeline: core.propNonEnumerable(shareApi.offShareTimeline),
+    shareMessageToFriend: core.propNonEnumerable(shareApi.shareMessageToFriend),
+    onShareMessageToFriend: core.propNonEnumerable(shareApi.onShareMessageToFriend),
+    offShareMessageToFriend: core.propNonEnumerable(shareApi.offShareMessageToFriend),
+    _internalTriggerShareMessageToFriend: core.propNonEnumerable(shareApi._internalTriggerShareMessageToFriend),
+    setMessageToFriendQuery: core.propNonEnumerable(shareApi.setMessageToFriendQuery),
+    showShareImageMenu: core.propNonEnumerable(shareApi.showShareImageMenu),
 
     // Ad (@mock - all ad types are simulated, no real ad SDK)
     createBannerAd: core.propNonEnumerable(adApi.createBannerAd),
@@ -490,9 +517,11 @@ const WindowGlobalScope = {
     // Privacy (@stub - returns hardcoded values, host dispatch not wired)
     getPrivacySetting: core.propNonEnumerable(settingApi.getPrivacySetting),
     openPrivacyContract: core.propNonEnumerable(settingApi.openPrivacyContract),
+    requirePrivacyAuthorize: core.propNonEnumerable(settingApi.requirePrivacyAuthorize),
     onNeedPrivacyAuthorization: core.propNonEnumerable(settingApi.onNeedPrivacyAuthorization),
     offNeedPrivacyAuthorization: core.propNonEnumerable(settingApi.offNeedPrivacyAuthorization),
     _internalTriggerNeedPrivacyAuthorization: core.propNonEnumerable(settingApi._internalTriggerNeedPrivacyAuthorization),
+    requestSubscribeMessage: core.propNonEnumerable(settingApi.requestSubscribeMessage),
 
     // Analytics (@stub - all no-op, needs backend integration)
     reportEvent: core.propNonEnumerable(analyticsApi.reportEvent),

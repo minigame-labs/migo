@@ -150,4 +150,63 @@ function getMenuButtonBoundingClientRect() {
     }
 }
 
-export { createUserInfoButton, createGameClubButton, getMenuButtonBoundingClientRect };
+// ---- FeedbackButton (mock - same interface as UserInfoButton) --------------
+
+class FeedbackButton {
+    #style;
+    #type;
+    #text;
+    #image;
+    #visible = false;
+    #destroyed = false;
+    #tapListeners = [];
+
+    constructor(options) {
+        const opts = options || {};
+        this.#type = opts.type || 'text';
+        this.#text = opts.text || '';
+        this.#image = opts.image || '';
+        this.#style = Object.assign({
+            left: 0, top: 0, width: 0, height: 0,
+        }, opts.style || {});
+    }
+
+    get style() { return this.#style; }
+    get type() { return this.#type; }
+    get text() { return this.#text; }
+    get image() { return this.#image; }
+
+    show() { if (!this.#destroyed) this.#visible = true; }
+    hide() { if (!this.#destroyed) this.#visible = false; }
+    destroy() {
+        this.#destroyed = true;
+        this.#visible = false;
+        this.#tapListeners.length = 0;
+    }
+
+    onTap(listener) {
+        if (typeof listener === 'function' && !this.#destroyed) {
+            this.#tapListeners.push(listener);
+        }
+    }
+
+    offTap(listener) {
+        if (typeof listener === 'function') {
+            const idx = this.#tapListeners.indexOf(listener);
+            if (idx !== -1) this.#tapListeners.splice(idx, 1);
+        } else {
+            this.#tapListeners.length = 0;
+        }
+    }
+}
+
+function createFeedbackButton(options) {
+    return new FeedbackButton(options);
+}
+
+export {
+    createUserInfoButton,
+    createGameClubButton,
+    getMenuButtonBoundingClientRect,
+    createFeedbackButton,
+};

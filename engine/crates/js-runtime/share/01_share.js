@@ -121,6 +121,99 @@ function _internalOnShareAppMessageResult(resultJson) {
     _shareAppMessageApi.settle(resultJson);
 }
 
+// ---- onShareTimeline / offShareTimeline ------------------------------------
+
+const _shareTimelineListeners = [];
+
+function onShareTimeline(listener) {
+    if (typeof listener === 'function') {
+        _shareTimelineListeners.push(listener);
+    }
+}
+
+function offShareTimeline(listener) {
+    if (typeof listener === 'function') {
+        const index = _shareTimelineListeners.indexOf(listener);
+        if (index !== -1) _shareTimelineListeners.splice(index, 1);
+    } else {
+        _shareTimelineListeners.length = 0;
+    }
+}
+
+// ---- shareMessageToFriend (Mode A stub) ------------------------------------
+
+function shareMessageToFriend(options) {
+    return wrapAsync('shareMessageToFriend', function () {
+        var opts = options || {};
+        if (!opts.openId) throw new Error('openId is required');
+        op_share_app_message(JSON.stringify({
+            type: 'shareMessageToFriend',
+            openId: opts.openId,
+            title: opts.title || '',
+            imageUrl: opts.imageUrl || '',
+            imageUrlId: opts.imageUrlId || '',
+        }));
+    }, options);
+}
+
+// ---- onShareMessageToFriend / offShareMessageToFriend ----------------------
+
+const _shareToFriendListeners = [];
+
+function onShareMessageToFriend(listener) {
+    if (typeof listener === 'function') {
+        _shareToFriendListeners.push(listener);
+    }
+}
+
+function offShareMessageToFriend(listener) {
+    if (typeof listener === 'function') {
+        const index = _shareToFriendListeners.indexOf(listener);
+        if (index !== -1) _shareToFriendListeners.splice(index, 1);
+    } else {
+        _shareToFriendListeners.length = 0;
+    }
+}
+
+function _internalTriggerShareMessageToFriend(data) {
+    var parsed = data;
+    if (typeof data === 'string') {
+        try { parsed = JSON.parse(data); } catch (_) { parsed = {}; }
+    }
+    for (let i = 0; i < _shareToFriendListeners.length; i++) {
+        try { _shareToFriendListeners[i](parsed); } catch (e) {
+            console.error('onShareMessageToFriend listener error:', e);
+        }
+    }
+}
+
+// ---- setMessageToFriendQuery -----------------------------------------------
+
+let _messageToFriendQuery = '';
+
+function setMessageToFriendQuery(options) {
+    var opts = options || {};
+    if (typeof opts.query === 'string') {
+        _messageToFriendQuery = opts.query;
+    }
+}
+
+// ---- showShareImageMenu (Mode A stub) --------------------------------------
+
+function showShareImageMenu(options) {
+    return wrapAsync('showShareImageMenu', function () {
+        var opts = options || {};
+        op_share_app_message(JSON.stringify({
+            type: 'showShareImageMenu',
+            path: opts.path || '',
+            imageUrl: opts.imageUrl || '',
+            style: opts.style || '',
+            needShowEntrance: !!opts.needShowEntrance,
+            entrancePath: opts.entrancePath || '',
+        }));
+    }, options);
+}
+
 // ---- host-side trigger (called from Rust when user taps native share) ------
 
 function _internalTriggerShareAppMessage() {
@@ -149,4 +242,12 @@ export {
     shareAppMessage,
     _internalOnShareAppMessageResult,
     _internalTriggerShareAppMessage,
+    onShareTimeline,
+    offShareTimeline,
+    shareMessageToFriend,
+    onShareMessageToFriend,
+    offShareMessageToFriend,
+    _internalTriggerShareMessageToFriend,
+    setMessageToFriendQuery,
+    showShareImageMenu,
 };

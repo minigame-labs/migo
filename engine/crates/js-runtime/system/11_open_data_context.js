@@ -1,5 +1,6 @@
 import { createOffscreenCanvas, getMainCanvas } from "ext:host_v8_web/03_canvas.js";
 import { getWindowInfo } from "ext:host_v8_system/03_window_info.js";
+import { wrapAsync } from "ext:host_v8_base/02_async.js";
 
 const _messageListeners = [];
 
@@ -92,9 +93,62 @@ function getSharedCanvas() {
     return _createSharedCanvas("offscreenCanvas");
 }
 
+// ---- Cloud Storage stubs (open data context APIs) -------------------------
+// These APIs are standard but require server-side backend integration.
+// Stub implementations return empty data / succeed silently to prevent crashes.
+
+function getFriendCloudStorage(options) {
+    return wrapAsync('getFriendCloudStorage', function () {
+        return { data: [] };
+    }, options);
+}
+
+function setUserCloudStorage(options) {
+    return wrapAsync('setUserCloudStorage', function () {
+        return {};
+    }, options);
+}
+
+function removeUserCloudStorage(options) {
+    return wrapAsync('removeUserCloudStorage', function () {
+        return {};
+    }, options);
+}
+
+function modifyFriendInteractiveStorage(options) {
+    return wrapAsync('modifyFriendInteractiveStorage', function () {
+        return {};
+    }, options);
+}
+
+function getPotentialFriendList(options) {
+    return wrapAsync('getPotentialFriendList', function () {
+        return { list: [] };
+    }, options);
+}
+
+function getGameClubData(options) {
+    return wrapAsync('getGameClubData', function () {
+        return { data: [] };
+    }, options);
+}
+
+function getUserGameLabel(options) {
+    return wrapAsync('getUserGameLabel', function () {
+        return { label: '' };
+    }, options);
+}
+
 export {
     onMessage,
     offMessage,
     getOpenDataContext,
     getSharedCanvas,
+    getFriendCloudStorage,
+    setUserCloudStorage,
+    removeUserCloudStorage,
+    modifyFriendInteractiveStorage,
+    getPotentialFriendList,
+    getGameClubData,
+    getUserGameLabel,
 };

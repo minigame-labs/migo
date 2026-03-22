@@ -3,6 +3,7 @@ import { core, primordials } from "ext:core/mod.js";
 const { SafeSet, SafeSetIterator, SetPrototypeDelete } = primordials;
 
 const errorListeners = new SafeSet();
+const unhandledRejectionListeners = new SafeSet();
 
 function onError(listener) {
     if (typeof listener !== 'function') {
@@ -40,10 +41,46 @@ function formatErrorMessage(reason) {
     return String(reason);
 }
 
+function onUnhandledRejection(listener) {
+    if (typeof listener !== 'function') {
+        throw new TypeError('Listener must be a function');
+    }
+    unhandledRejectionListeners.add(listener);
+}
+
+function offUnhandledRejection(listener) {
+    if (listener === undefined) {
+        unhandledRejectionListeners.clear();
+        return;
+    }
+    if (typeof listener !== 'function') {
+        throw new TypeError('Listener must be a function');
+    }
+    SetPrototypeDelete(unhandledRejectionListeners, listener);
+}
+
 function processUnhandledPromiseRejection(promise, reason) {
     const message = formatErrorMessage(reason);
     console.error('Unhandled Promise Rejection:', message);
-    notifyErrorListeners(message);
+
+    // Notify onUnhandledRejection listeners with standard event shape
+    const listeners = new SafeSetIterator(unhandledRejectionListeners);
+    for (const listener of listeners) {
+        try {
+            listener({
+                reason: reason,
+                message: message,
+                promise: promise,
+            });
+        } catch (err) {
+            console.error('Error in unhandledRejection listener:', err);
+        }
+    }
+
+    // Also notify onError listeners if no dedicated rejection listeners exist
+    if (unhandledRejectionListeners.size === 0) {
+        notifyErrorListeners(message);
+    }
     return true;
 }
 
@@ -60,5 +97,7 @@ function initializeEventHandlers() {
 export {
     onError,
     offError,
+    onUnhandledRejection,
+    offUnhandledRejection,
     initializeEventHandlers,
 };
