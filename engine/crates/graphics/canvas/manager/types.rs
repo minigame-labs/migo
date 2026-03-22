@@ -1,6 +1,6 @@
 extern crate khronos_egl as egl;
 
-use glow::{NativeBuffer, NativeProgram, NativeShader};
+use glow::{NativeBuffer, NativeFramebuffer, NativeProgram, NativeRenderbuffer, NativeShader, NativeTexture};
 use shared::error::{EngineError, ErrorCode};
 use shared::protocol::render_cmd::{CanvasId, ProgramId, ShaderType};
 
@@ -50,6 +50,27 @@ pub(crate) struct ShaderMeta {
 #[derive(Debug)]
 pub(crate) struct BufferMeta {
     pub gl_handle: Option<NativeBuffer>,
+    pub owner_canvas: Option<CanvasId>,
+    pub deleted: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct TextureMeta {
+    pub gl_handle: Option<NativeTexture>,
+    pub owner_canvas: Option<CanvasId>,
+    pub deleted: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct FramebufferMeta {
+    pub gl_handle: Option<NativeFramebuffer>,
+    pub owner_canvas: Option<CanvasId>,
+    pub deleted: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct RenderbufferMeta {
+    pub gl_handle: Option<NativeRenderbuffer>,
     pub owner_canvas: Option<CanvasId>,
     pub deleted: bool,
 }

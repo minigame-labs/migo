@@ -27,6 +27,72 @@ import {
     op_uniform3f,
     op_uniform_matrix_3fv,
     op_gl_flush,
+    op_enable,
+    op_disable,
+    op_is_enabled,
+    op_get_parameter,
+    op_create_texture,
+    op_delete_texture,
+    op_bind_texture,
+    op_active_texture,
+    op_tex_image_2d,
+    op_tex_sub_image_2d,
+    op_tex_parameteri,
+    op_tex_parameterf,
+    op_generate_mipmap,
+    op_pixel_storei,
+    op_compressed_tex_image_2d,
+    op_compressed_tex_sub_image_2d,
+    op_buffer_sub_data,
+    op_disable_vertex_attrib_array,
+    op_clear_depth,
+    op_clear_stencil,
+    op_blend_func,
+    op_blend_func_separate,
+    op_blend_equation,
+    op_blend_equation_separate,
+    op_blend_color,
+    op_depth_func,
+    op_depth_mask,
+    op_depth_range,
+    op_stencil_func,
+    op_stencil_func_separate,
+    op_stencil_op,
+    op_stencil_op_separate,
+    op_stencil_mask,
+    op_stencil_mask_separate,
+    op_cull_face,
+    op_front_face,
+    op_color_mask,
+    op_scissor,
+    op_line_width,
+    op_polygon_offset,
+    op_uniform1i,
+    op_uniform1f,
+    op_uniform2f,
+    op_uniform4f,
+    op_uniform1iv,
+    op_uniform1fv,
+    op_uniform2iv,
+    op_uniform2fv,
+    op_uniform3iv,
+    op_uniform3fv,
+    op_uniform4iv,
+    op_uniform4fv,
+    op_uniform_matrix_2fv,
+    op_uniform_matrix_4fv,
+    op_create_framebuffer,
+    op_delete_framebuffer,
+    op_bind_framebuffer,
+    op_framebuffer_texture_2d,
+    op_framebuffer_renderbuffer,
+    op_check_framebuffer_status,
+    op_create_renderbuffer,
+    op_delete_renderbuffer,
+    op_bind_renderbuffer,
+    op_renderbuffer_storage,
+    op_read_pixels,
+    op_hint,
 } from "ext:core/ops";
 
 import { core, primordials } from "ext:core/mod.js";
@@ -39,6 +105,7 @@ const {
     TypedArrayPrototypeGetByteOffset,
     Uint8Array,
     Uint32Array,
+    Int32Array,
     Float32Array,
     DataViewPrototypeGetBuffer,
     DataViewPrototypeGetByteLength,
@@ -79,6 +146,18 @@ function toUnit32Array(input) {
     return toTypedArray(input, Uint32Array);
 }
 
+// Reinterpret Int32Array bits as Uint32Array without copying.
+// Needed because deno_core #[buffer(copy)] only accepts Vec<u32>;
+// Rust cast_vec then reinterprets the bits back to the target type.
+function toInt32AsUint32(input) {
+    const i32 = toTypedArray(input, Int32Array);
+    return new Uint32Array(i32.buffer, i32.byteOffset, i32.length);
+}
+
+function _loc(location) {
+    return location !== null && location !== undefined ? location.id : -1;
+}
+
 class WebglObject {
     constructor(id) {
         this._id = id;
@@ -94,6 +173,10 @@ class WebGLRenderingContext {
         this._canvas = canvas;
         this._options = options;
         this._canvasId = canvas._rid;
+        // Client-side monotonic ID counter for GL resources.
+        // IDs are assigned locally and sent to the render thread as
+        // fire-and-forget, eliminating sync round-trips on create*.
+        this._nextResourceId = 1;
         // Nested Map: programId -> Map(name -> location)
         // Allows O(1) per-program invalidation via .delete(programId).
         this._attribLocationCache = new Map();
@@ -153,7 +236,9 @@ class WebGLRenderingContext {
     }
 
     createProgram() {
-        return new WebglObject(op_create_program());
+        const id = this._nextResourceId++;
+        op_create_program(id);
+        return new WebglObject(id);
     }
 
     useProgram(program) {
@@ -162,12 +247,11 @@ class WebGLRenderingContext {
 
     linkProgram(program) {
         const programId = program?.id;
-        const ok = op_link_program(programId);
+        op_link_program(programId);
         if (programId !== undefined) {
             // Linking can change active attrib/uniform locations and link status.
             this._invalidateProgramCaches(programId);
         }
-        return ok;
     }
 
     getProgramParameter(program, pname) {
@@ -215,7 +299,9 @@ class WebGLRenderingContext {
     }
 
     createShader(type) {
-        return new WebglObject(op_create_shader(type));
+        const id = this._nextResourceId++;
+        op_create_shader(id, type);
+        return new WebglObject(id);
     }
 
     shaderSource(shader, src) {
@@ -223,7 +309,7 @@ class WebGLRenderingContext {
     }
 
     compileShader(shader) {
-        return op_compile_shader(shader?.id);
+        op_compile_shader(shader?.id);
     }
 
     getShaderParameter(shader, pname) {
@@ -307,7 +393,9 @@ class WebGLRenderingContext {
     }
 
     createBuffer() {
-        return new WebglObject(op_create_buffer());
+        const id = this._nextResourceId++;
+        op_create_buffer(id);
+        return new WebglObject(id);
     }
 
     bindBuffer(target, buffer) {
@@ -337,7 +425,7 @@ class WebGLRenderingContext {
             this._uniformLocationCache.set(programId, inner);
         }
         const id = op_get_uniform_location(this._canvasId, programId, name);
-        if (id === null || id === undefined) {
+        if (id < 0) {
             inner.set(name, null);
             return null;
         }
@@ -347,14 +435,244 @@ class WebGLRenderingContext {
     }
 
     uniform3f(location, x, y, z) {
-        op_uniform3f(this._canvasId, location?.id, x, y, z);
+        op_uniform3f(this._canvasId, _loc(location), x, y, z);
     }
 
     uniformMatrix3fv(location, transpose, value) {
         if (!(value instanceof Float32Array)) {
             throw new Error("Invalid data, must be a Float32Array");
         }
-        op_uniform_matrix_3fv(this._canvasId, location?.id, transpose, toUnit32Array(value));
+        op_uniform_matrix_3fv(this._canvasId, _loc(location), transpose, toUnit32Array(value));
+    }
+
+    // -- Phase 1A: GL State --
+
+    enable(cap) {
+        op_enable(this._canvasId, cap);
+    }
+
+    disable(cap) {
+        op_disable(this._canvasId, cap);
+    }
+
+    isEnabled(cap) {
+        return Boolean(op_is_enabled(this._canvasId, cap));
+    }
+
+    getParameter(pname) {
+        const json = op_get_parameter(this._canvasId, pname);
+        if (!json) return null;
+        try { return JSON.parse(json); } catch (_) { return null; }
+    }
+
+    getError() {
+        return 0;
+    }
+
+    getExtension(_name) {
+        return null;
+    }
+
+    // -- Phase 1B: Textures --
+
+    createTexture() {
+        const id = this._nextResourceId++;
+        op_create_texture(id);
+        return new WebglObject(id);
+    }
+
+    deleteTexture(texture) {
+        if (texture && texture.id !== undefined) op_delete_texture(texture.id);
+    }
+
+    bindTexture(target, texture) {
+        op_bind_texture(this._canvasId, target, texture ? texture.id : -1);
+    }
+
+    activeTexture(unit) {
+        op_active_texture(this._canvasId, unit);
+    }
+
+    texImage2D(target, level, internalformat, a4, a5, a6, a7, a8, a9) {
+        // 9-arg: (target, level, internalformat, width, height, border, format, type, pixels)
+        // 6-arg: (target, level, internalformat, format, type, source) -- not supported
+        if (a7 !== undefined) {
+            const data = a9 != null ? toUnit8Array(a9) : null;
+            op_tex_image_2d(this._canvasId, target, level, internalformat, a4, a5, a6, a7, a8, data);
+        } else {
+            // 6-argument form: treat a4 as format, a5 as type, a6 as source
+            // For mini-game runtime, this form is rarely used. Stub it.
+            console.warn('texImage2D 6-argument form not fully supported');
+        }
+    }
+
+    texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels) {
+        if (pixels == null) return;
+        const data = toUnit8Array(pixels);
+        op_tex_sub_image_2d(this._canvasId, target, level, xoffset, yoffset, width, height, format, type, data);
+    }
+
+    texParameteri(target, pname, param) {
+        op_tex_parameteri(this._canvasId, target, pname, param);
+    }
+
+    texParameterf(target, pname, param) {
+        op_tex_parameterf(this._canvasId, target, pname, param);
+    }
+
+    generateMipmap(target) {
+        op_generate_mipmap(this._canvasId, target);
+    }
+
+    pixelStorei(pname, param) {
+        op_pixel_storei(this._canvasId, pname, param);
+    }
+
+    compressedTexImage2D(target, level, internalformat, width, height, border, data) {
+        const u8 = toUnit8Array(data);
+        op_compressed_tex_image_2d(this._canvasId, target, level, internalformat, width, height, border, u8);
+    }
+
+    compressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, data) {
+        const u8 = toUnit8Array(data);
+        op_compressed_tex_sub_image_2d(this._canvasId, target, level, xoffset, yoffset, width, height, format, u8);
+    }
+
+    // -- Phase 1C: Buffer & Vertex Extensions --
+
+    bufferSubData(target, offset, data) {
+        const u8 = toUnit8Array(data);
+        op_buffer_sub_data(this._canvasId, target, offset, u8);
+    }
+
+    disableVertexAttribArray(index) {
+        op_disable_vertex_attrib_array(this._canvasId, index);
+    }
+
+    clearDepth(depth) {
+        op_clear_depth(this._canvasId, depth);
+    }
+
+    clearStencil(s) {
+        op_clear_stencil(this._canvasId, s);
+    }
+
+    // -- Phase 2A: Blend/Depth/Stencil/Cull State --
+
+    blendFunc(sfactor, dfactor) { op_blend_func(this._canvasId, sfactor, dfactor); }
+    blendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha) { op_blend_func_separate(this._canvasId, srcRGB, dstRGB, srcAlpha, dstAlpha); }
+    blendEquation(mode) { op_blend_equation(this._canvasId, mode); }
+    blendEquationSeparate(modeRGB, modeAlpha) { op_blend_equation_separate(this._canvasId, modeRGB, modeAlpha); }
+    blendColor(r, g, b, a) { op_blend_color(this._canvasId, r, g, b, a); }
+    depthFunc(func) { op_depth_func(this._canvasId, func); }
+    depthMask(flag) { op_depth_mask(this._canvasId, flag); }
+    depthRange(near, far) { op_depth_range(this._canvasId, near, far); }
+    stencilFunc(func, ref_, mask) { op_stencil_func(this._canvasId, func, ref_, mask); }
+    stencilFuncSeparate(face, func, ref_, mask) { op_stencil_func_separate(this._canvasId, face, func, ref_, mask); }
+    stencilOp(fail, zfail, zpass) { op_stencil_op(this._canvasId, fail, zfail, zpass); }
+    stencilOpSeparate(face, fail, zfail, zpass) { op_stencil_op_separate(this._canvasId, face, fail, zfail, zpass); }
+    stencilMask(mask) { op_stencil_mask(this._canvasId, mask); }
+    stencilMaskSeparate(face, mask) { op_stencil_mask_separate(this._canvasId, face, mask); }
+    cullFace(mode) { op_cull_face(this._canvasId, mode); }
+    frontFace(mode) { op_front_face(this._canvasId, mode); }
+    colorMask(r, g, b, a) { op_color_mask(this._canvasId, r, g, b, a); }
+    scissor(x, y, width, height) { op_scissor(this._canvasId, x, y, width, height); }
+    lineWidth(width) { op_line_width(this._canvasId, width); }
+    polygonOffset(factor, units) { op_polygon_offset(this._canvasId, factor, units); }
+
+    // -- Phase 2B: Uniform Variants --
+
+    uniform1i(location, x) {
+        op_uniform1i(this._canvasId, _loc(location), x);
+    }
+    uniform1f(location, x) {
+        op_uniform1f(this._canvasId, _loc(location), x);
+    }
+    uniform2f(location, x, y) {
+        op_uniform2f(this._canvasId, _loc(location), x, y);
+    }
+    uniform4f(location, x, y, z, w) {
+        op_uniform4f(this._canvasId, _loc(location), x, y, z, w);
+    }
+    uniform1iv(location, value) {
+        op_uniform1iv(this._canvasId, _loc(location), toInt32AsUint32(value));
+    }
+    uniform1fv(location, value) {
+        op_uniform1fv(this._canvasId, _loc(location), toUnit32Array(value));
+    }
+    uniform2iv(location, value) {
+        op_uniform2iv(this._canvasId, _loc(location), toInt32AsUint32(value));
+    }
+    uniform2fv(location, value) {
+        op_uniform2fv(this._canvasId, _loc(location), toUnit32Array(value));
+    }
+    uniform3iv(location, value) {
+        op_uniform3iv(this._canvasId, _loc(location), toInt32AsUint32(value));
+    }
+    uniform3fv(location, value) {
+        op_uniform3fv(this._canvasId, _loc(location), toUnit32Array(value));
+    }
+    uniform4iv(location, value) {
+        op_uniform4iv(this._canvasId, _loc(location), toInt32AsUint32(value));
+    }
+    uniform4fv(location, value) {
+        op_uniform4fv(this._canvasId, _loc(location), toUnit32Array(value));
+    }
+    uniformMatrix2fv(location, transpose, value) {
+        op_uniform_matrix_2fv(this._canvasId, _loc(location), transpose, toUnit32Array(value));
+    }
+    uniformMatrix4fv(location, transpose, value) {
+        op_uniform_matrix_4fv(this._canvasId, _loc(location), transpose, toUnit32Array(value));
+    }
+
+    // -- Phase 3A: Framebuffer/Renderbuffer --
+
+    createFramebuffer() {
+        const id = this._nextResourceId++;
+        op_create_framebuffer(id);
+        return new WebglObject(id);
+    }
+    deleteFramebuffer(fb) {
+        if (fb && fb.id !== undefined) op_delete_framebuffer(fb.id);
+    }
+    bindFramebuffer(target, fb) {
+        op_bind_framebuffer(this._canvasId, target, fb ? fb.id : -1);
+    }
+    framebufferTexture2D(target, attachment, textarget, texture, level) {
+        op_framebuffer_texture_2d(this._canvasId, target, attachment, textarget, texture ? texture.id : -1, level);
+    }
+    framebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer) {
+        op_framebuffer_renderbuffer(this._canvasId, target, attachment, renderbuffertarget, renderbuffer ? renderbuffer.id : -1);
+    }
+    checkFramebufferStatus(target) {
+        return op_check_framebuffer_status(this._canvasId, target);
+    }
+    createRenderbuffer() {
+        const id = this._nextResourceId++;
+        op_create_renderbuffer(id);
+        return new WebglObject(id);
+    }
+    deleteRenderbuffer(rb) {
+        if (rb && rb.id !== undefined) op_delete_renderbuffer(rb.id);
+    }
+    bindRenderbuffer(target, rb) {
+        op_bind_renderbuffer(this._canvasId, target, rb ? rb.id : -1);
+    }
+    renderbufferStorage(target, internalformat, width, height) {
+        op_renderbuffer_storage(this._canvasId, target, internalformat, width, height);
+    }
+
+    // -- Phase 3B: Misc --
+
+    readPixels(x, y, width, height, format, type, pixels) {
+        const data = op_read_pixels(this._canvasId, x, y, width, height, format, type);
+        if (data && pixels) {
+            const u8 = new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
+            u8.set(data.subarray(0, u8.length));
+        }
+    }
+    hint(target, mode) {
+        op_hint(this._canvasId, target, mode);
     }
 }
 
@@ -363,10 +681,6 @@ Object.assign(WebGLRenderingContext.prototype, WebglConstants);
 class WebGL2RenderingContext extends WebGLRenderingContext {
     constructor(canvas) {
         super(canvas);
-    }
-
-    bufferData(..._args) {
-        throw new Error("Not implemented");
     }
 }
 

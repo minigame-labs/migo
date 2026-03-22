@@ -8,7 +8,7 @@ use shared::{
     error::{EngineResult, ErrorCode},
     protocol::{
         io_cmd::NormalizedImage,
-        render_cmd::{BufferId, CanvasId, ProgramId, ShaderId},
+        render_cmd::{BufferId, CanvasId, FramebufferId, ProgramId, RenderbufferId, ShaderId, TextureId},
     },
 };
 use std::{
@@ -22,7 +22,7 @@ mod image;
 mod pbo_upload;
 mod types;
 
-pub(crate) use types::{BufferMeta, CanvasGLState, CanvasInfo, ProgramMeta, ShaderMeta, ee};
+pub(crate) use types::{BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta, ProgramMeta, RenderbufferMeta, ShaderMeta, TextureMeta, ee};
 use types::{CanvasEntry, EglContextHandle, SurfaceKind};
 
 use self::image::ImageRegistry;
@@ -67,6 +67,9 @@ pub(crate) struct CanvasManager {
     pub(crate) programs: HashMap<ProgramId, ProgramMeta>,
     pub(crate) shaders: HashMap<ShaderId, ShaderMeta>,
     pub(crate) buffers: HashMap<BufferId, BufferMeta>,
+    pub(crate) textures: HashMap<TextureId, TextureMeta>,
+    pub(crate) framebuffers: HashMap<FramebufferId, FramebufferMeta>,
+    pub(crate) renderbuffers: HashMap<RenderbufferId, RenderbufferMeta>,
     pub(crate) gl_state: HashMap<CanvasId, CanvasGLState>,
 }
 
@@ -128,6 +131,9 @@ impl CanvasManager {
             programs: HashMap::with_capacity(16),
             shaders: HashMap::with_capacity(32),
             buffers: HashMap::with_capacity(32),
+            textures: HashMap::with_capacity(64),
+            framebuffers: HashMap::with_capacity(8),
+            renderbuffers: HashMap::with_capacity(8),
             gl_state: HashMap::with_capacity(4),
         })
     }
@@ -383,6 +389,21 @@ impl CanvasManager {
             for (_id, b) in self.buffers.drain() {
                 if let Some(h) = b.gl_handle {
                     gl.delete_buffer(h);
+                }
+            }
+            for (_id, t) in self.textures.drain() {
+                if let Some(h) = t.gl_handle {
+                    gl.delete_texture(h);
+                }
+            }
+            for (_id, f) in self.framebuffers.drain() {
+                if let Some(h) = f.gl_handle {
+                    gl.delete_framebuffer(h);
+                }
+            }
+            for (_id, r) in self.renderbuffers.drain() {
+                if let Some(h) = r.gl_handle {
+                    gl.delete_renderbuffer(h);
                 }
             }
         }
