@@ -1,30 +1,43 @@
 import { op_open_app_authorize_setting } from "ext:core/ops";
 
-const noop = () => { };
+var _pendingAuthSetting = [];
 
-let onOpenAppAuthorizeSettingSuccess = noop;
-let onOpenAppAuthorizeSettingFail = noop;
-let onOpenAppAuthorizeSettingComplete = noop;
+function openAppAuthorizeSetting(options) {
+    var opts = options || {};
+    var success = typeof opts.success === 'function' ? opts.success : null;
+    var fail = typeof opts.fail === 'function' ? opts.fail : null;
+    var complete = typeof opts.complete === 'function' ? opts.complete : null;
 
-function openAppAuthorizeSetting({ success, fail, complete } = {}) {
-    onOpenAppAuthorizeSettingSuccess = success || noop;
-    onOpenAppAuthorizeSettingFail = fail || noop;
-    onOpenAppAuthorizeSettingComplete = complete || noop;
+    return new Promise(function (resolve, reject) {
+        _pendingAuthSetting.push({ success: success, fail: fail, complete: complete, resolve: resolve, reject: reject });
 
-    op_open_app_authorize_setting();
+        try {
+            op_open_app_authorize_setting();
+        } catch (e) {
+            _pendingAuthSetting.pop();
+            var res = { code: -1, message: 'openAppAuthorizeSetting:fail ' + e.message };
+            if (fail) fail(res);
+            if (complete) complete(res);
+            reject(res);
+        }
+    });
 }
 
 function _internalOnOpenAppAuthorizeSettingFinished(code) {
-    if (code >= 0) {
-        onOpenAppAuthorizeSettingSuccess({ "code": code, "message": "App authorization settings opened successfully" });
-    } else {
-        onOpenAppAuthorizeSettingFail({ "code": code, "message": "Failed to open app authorization settings" });
-    }
-    onOpenAppAuthorizeSettingComplete({ "code": code });
+    var pending = _pendingAuthSetting.shift();
+    if (!pending) return;
 
-    onOpenAppAuthorizeSettingSuccess = noop;
-    onOpenAppAuthorizeSettingFail = noop;
-    onOpenAppAuthorizeSettingComplete = noop;
+    if (code >= 0) {
+        var res = { code: code, message: "App authorization settings opened successfully" };
+        if (pending.success) pending.success(res);
+        if (pending.complete) pending.complete({ code: code });
+        pending.resolve(res);
+    } else {
+        var res = { code: code, message: "Failed to open app authorization settings" };
+        if (pending.fail) pending.fail(res);
+        if (pending.complete) pending.complete({ code: code });
+        pending.reject(res);
+    }
 }
 
-export { openAppAuthorizeSetting, _internalOnOpenAppAuthorizeSettingFinished }
+export { openAppAuthorizeSetting, _internalOnOpenAppAuthorizeSettingFinished };

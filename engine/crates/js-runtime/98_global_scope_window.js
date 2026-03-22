@@ -472,6 +472,7 @@ const WindowGlobalScope = {
     _internalTriggerShareAppMessage: core.propNonEnumerable(shareApi._internalTriggerShareAppMessage),
     onShareTimeline: core.propNonEnumerable(shareApi.onShareTimeline),
     offShareTimeline: core.propNonEnumerable(shareApi.offShareTimeline),
+    _internalTriggerShareTimeline: core.propNonEnumerable(shareApi._internalTriggerShareTimeline),
     shareMessageToFriend: core.propNonEnumerable(shareApi.shareMessageToFriend),
     onShareMessageToFriend: core.propNonEnumerable(shareApi.onShareMessageToFriend),
     offShareMessageToFriend: core.propNonEnumerable(shareApi.offShareMessageToFriend),

@@ -140,6 +140,25 @@ function offShareTimeline(listener) {
     }
 }
 
+// ---- host-side trigger (called from Rust when user taps native timeline share)
+
+function _internalTriggerShareTimeline() {
+    var shareData = { title: '', imageUrl: '', query: '' };
+    for (var i = 0; i < _shareTimelineListeners.length; i++) {
+        try {
+            var override = _shareTimelineListeners[i]();
+            if (override && typeof override === 'object') {
+                if (typeof override.title === 'string') shareData.title = override.title;
+                if (typeof override.imageUrl === 'string') shareData.imageUrl = override.imageUrl;
+                if (typeof override.query === 'string') shareData.query = override.query;
+            }
+        } catch (e) {
+            console.error('onShareTimeline listener error:', e);
+        }
+    }
+    return shareData;
+}
+
 // ---- shareMessageToFriend (Mode A stub) ------------------------------------
 
 function shareMessageToFriend(options) {
@@ -244,6 +263,7 @@ export {
     _internalTriggerShareAppMessage,
     onShareTimeline,
     offShareTimeline,
+    _internalTriggerShareTimeline,
     shareMessageToFriend,
     onShareMessageToFriend,
     offShareMessageToFriend,

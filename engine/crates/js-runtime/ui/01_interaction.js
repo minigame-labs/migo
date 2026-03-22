@@ -6,156 +6,136 @@ import {
     op_hide_loading,
     op_show_action_sheet,
 } from "ext:core/ops";
+import { wrapAsync } from "ext:host_v8_base/02_async.js";
 
-const noop = () => {};
+// ==================== Toast (Mode A) ====================
 
-// ==================== Toast ====================
-
-function showToast({ title = '', icon = 'success', duration = 1500, mask = false,
-                     success, fail, complete } = {}) {
-    try {
-        op_show_toast(JSON.stringify({ title, icon, duration, mask }));
-        const res = { errMsg: 'showToast:ok' };
-        (success || noop)(res);
-        (complete || noop)(res);
-    } catch (e) {
-        const res = { errMsg: 'showToast:fail ' + e.message };
-        (fail || noop)(res);
-        (complete || noop)(res);
-    }
-}
-
-function hideToast({ success, fail, complete } = {}) {
-    try {
-        op_hide_toast();
-        const res = { errMsg: 'hideToast:ok' };
-        (success || noop)(res);
-        (complete || noop)(res);
-    } catch (e) {
-        const res = { errMsg: 'hideToast:fail ' + e.message };
-        (fail || noop)(res);
-        (complete || noop)(res);
-    }
-}
-
-// ==================== Modal ====================
-
-let _modalSuccess = null;
-let _modalFail = null;
-let _modalComplete = null;
-
-function showModal({ title = '', content = '', showCancel = true,
-                     cancelText = '\u53d6\u6d88', confirmText = '\u786e\u5b9a',
-                     cancelColor = '#000000', confirmColor = '#576B95',
-                     success, fail, complete } = {}) {
-    _modalSuccess = success || noop;
-    _modalFail = fail || noop;
-    _modalComplete = complete || noop;
-
-    try {
-        op_show_modal(JSON.stringify({
-            title, content, showCancel, cancelText, confirmText,
-            cancelColor, confirmColor,
+function showToast(options) {
+    return wrapAsync('showToast', function () {
+        var opts = options || {};
+        op_show_toast(JSON.stringify({
+            title: opts.title || '',
+            icon: opts.icon || 'success',
+            duration: opts.duration !== undefined ? opts.duration : 1500,
+            mask: !!opts.mask,
         }));
-    } catch (e) {
-        const res = { errMsg: 'showModal:fail ' + e.message };
-        _modalFail(res);
-        _modalComplete(res);
-        _modalSuccess = null;
-        _modalFail = null;
-        _modalComplete = null;
-    }
+    }, options);
+}
+
+function hideToast(options) {
+    return wrapAsync('hideToast', function () {
+        op_hide_toast();
+    }, options);
+}
+
+// ==================== Modal (FIFO queue + Promise) ====================
+
+var _pendingModals = [];
+
+function showModal(options) {
+    var opts = options || {};
+    var success = typeof opts.success === 'function' ? opts.success : null;
+    var fail = typeof opts.fail === 'function' ? opts.fail : null;
+    var complete = typeof opts.complete === 'function' ? opts.complete : null;
+
+    return new Promise(function (resolve, reject) {
+        _pendingModals.push({ success: success, fail: fail, complete: complete, resolve: resolve, reject: reject });
+
+        try {
+            op_show_modal(JSON.stringify({
+                title: opts.title || '',
+                content: opts.content || '',
+                showCancel: opts.showCancel !== false,
+                cancelText: opts.cancelText || '\u53d6\u6d88',
+                confirmText: opts.confirmText || '\u786e\u5b9a',
+                cancelColor: opts.cancelColor || '#000000',
+                confirmColor: opts.confirmColor || '#576B95',
+            }));
+        } catch (e) {
+            _pendingModals.pop();
+            var res = { errMsg: 'showModal:fail ' + e.message };
+            if (fail) fail(res);
+            if (complete) complete(res);
+            reject(res);
+        }
+    });
 }
 
 function _internalOnModalResult(confirm, cancel) {
-    const res = {
+    var pending = _pendingModals.shift();
+    if (!pending) return;
+
+    var res = {
         confirm: !!confirm,
         cancel: !!cancel,
         errMsg: 'showModal:ok',
     };
-
-    const s = _modalSuccess;
-    const c = _modalComplete;
-    _modalSuccess = null;
-    _modalFail = null;
-    _modalComplete = null;
-
-    if (s) s(res);
-    if (c) c(res);
+    if (pending.success) pending.success(res);
+    if (pending.complete) pending.complete(res);
+    pending.resolve(res);
 }
 
-// ==================== Loading ====================
+// ==================== Loading (Mode A) ====================
 
-function showLoading({ title = '', mask = false, success, fail, complete } = {}) {
-    try {
-        op_show_loading(JSON.stringify({ title, mask }));
-        const res = { errMsg: 'showLoading:ok' };
-        (success || noop)(res);
-        (complete || noop)(res);
-    } catch (e) {
-        const res = { errMsg: 'showLoading:fail ' + e.message };
-        (fail || noop)(res);
-        (complete || noop)(res);
-    }
+function showLoading(options) {
+    return wrapAsync('showLoading', function () {
+        var opts = options || {};
+        op_show_loading(JSON.stringify({
+            title: opts.title || '',
+            mask: !!opts.mask,
+        }));
+    }, options);
 }
 
-function hideLoading({ success, fail, complete } = {}) {
-    try {
+function hideLoading(options) {
+    return wrapAsync('hideLoading', function () {
         op_hide_loading();
-        const res = { errMsg: 'hideLoading:ok' };
-        (success || noop)(res);
-        (complete || noop)(res);
-    } catch (e) {
-        const res = { errMsg: 'hideLoading:fail ' + e.message };
-        (fail || noop)(res);
-        (complete || noop)(res);
-    }
+    }, options);
 }
 
-// ==================== Action Sheet ====================
+// ==================== Action Sheet (FIFO queue + Promise) ====================
 
-let _actionSheetSuccess = null;
-let _actionSheetFail = null;
-let _actionSheetComplete = null;
+var _pendingActionSheets = [];
 
-function showActionSheet({ alertText = '', itemList = [], itemColor = '#000000',
-                           success, fail, complete } = {}) {
-    _actionSheetSuccess = success || noop;
-    _actionSheetFail = fail || noop;
-    _actionSheetComplete = complete || noop;
+function showActionSheet(options) {
+    var opts = options || {};
+    var success = typeof opts.success === 'function' ? opts.success : null;
+    var fail = typeof opts.fail === 'function' ? opts.fail : null;
+    var complete = typeof opts.complete === 'function' ? opts.complete : null;
 
-    try {
-        op_show_action_sheet(JSON.stringify({ alertText, itemList, itemColor }));
-    } catch (e) {
-        const res = { errMsg: 'showActionSheet:fail ' + e.message };
-        _actionSheetFail(res);
-        _actionSheetComplete(res);
-        _actionSheetSuccess = null;
-        _actionSheetFail = null;
-        _actionSheetComplete = null;
-    }
+    return new Promise(function (resolve, reject) {
+        _pendingActionSheets.push({ success: success, fail: fail, complete: complete, resolve: resolve, reject: reject });
+
+        try {
+            op_show_action_sheet(JSON.stringify({
+                alertText: opts.alertText || '',
+                itemList: opts.itemList || [],
+                itemColor: opts.itemColor || '#000000',
+            }));
+        } catch (e) {
+            _pendingActionSheets.pop();
+            var res = { errMsg: 'showActionSheet:fail ' + e.message };
+            if (fail) fail(res);
+            if (complete) complete(res);
+            reject(res);
+        }
+    });
 }
 
 function _internalOnActionSheetResult(tapIndex) {
+    var pending = _pendingActionSheets.shift();
+    if (!pending) return;
+
     if (tapIndex < 0) {
-        // User cancelled
-        const res = { errMsg: 'showActionSheet:fail cancel' };
-        const f = _actionSheetFail;
-        const c = _actionSheetComplete;
-        _actionSheetSuccess = null;
-        _actionSheetFail = null;
-        _actionSheetComplete = null;
-        if (f) f(res);
-        if (c) c(res);
+        var res = { errMsg: 'showActionSheet:fail cancel' };
+        if (pending.fail) pending.fail(res);
+        if (pending.complete) pending.complete(res);
+        pending.reject(res);
     } else {
-        const res = { tapIndex, errMsg: 'showActionSheet:ok' };
-        const s = _actionSheetSuccess;
-        const c = _actionSheetComplete;
-        _actionSheetSuccess = null;
-        _actionSheetFail = null;
-        _actionSheetComplete = null;
-        if (s) s(res);
-        if (c) c(res);
+        var res = { tapIndex: tapIndex, errMsg: 'showActionSheet:ok' };
+        if (pending.success) pending.success(res);
+        if (pending.complete) pending.complete(res);
+        pending.resolve(res);
     }
 }
 
