@@ -532,13 +532,13 @@ class BaseFileManager {
     switch (enc) {
       case "utf8":
       case "utf-8":
-        return new op_decode_multi_formats("utf-8").decode(bytes);
+        return op_decode_multi_formats(bytes, "utf-8");
 
       case "utf16le":
       case "utf-16le":
       case "ucs2":
       case "ucs-2":
-        return new op_decode_multi_formats("utf-16le").decode(bytes);
+        return op_decode_multi_formats(bytes, "utf-16le");
 
       case "latin1":
       case "binary":
