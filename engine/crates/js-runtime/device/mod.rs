@@ -476,6 +476,7 @@ deno_core::extension!(
         // Scan Code
         op_scan_code,
     ],
+    esm_entry_point = "ext:host_v8_device/99_global_scope.js",
     esm = [
         dir "device",
         "01_device_motion.js",

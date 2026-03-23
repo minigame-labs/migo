@@ -416,6 +416,7 @@ deno_core::extension!(
         op_worker_recv_error,
         op_worker_terminate,
     ],
+    esm_entry_point = "ext:host_v8_worker/99_global_scope.js",
     esm = [
         dir "worker",
         "01_worker.js",

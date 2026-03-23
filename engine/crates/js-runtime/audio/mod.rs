@@ -197,6 +197,7 @@ extension!(host_v8_audio,
         op_inner_audio_set_autoplay,
         op_inner_audio_get_state,
     ],
+    esm_entry_point = "ext:host_v8_audio/99_global_scope.js",
     esm = [
         dir "audio",
         "00_audio_param.js",

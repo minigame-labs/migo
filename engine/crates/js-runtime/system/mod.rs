@@ -663,6 +663,7 @@ deno_core::extension!(
         op_navigate_back_mini_program,
         op_open_customer_service_conversation,
     ],
+    esm_entry_point = "ext:host_v8_system/99_global_scope.js",
     esm = [
         dir "system",
         "01_bluetooth.js",

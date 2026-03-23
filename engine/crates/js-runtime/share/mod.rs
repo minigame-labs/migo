@@ -27,6 +27,7 @@ deno_core::extension!(
     host_v8_share,
     deps = [host_v8_base],
     ops = [op_share_app_message],
+    esm_entry_point = "ext:host_v8_share/99_global_scope.js",
     esm = [
         dir "share",
         "01_share.js",

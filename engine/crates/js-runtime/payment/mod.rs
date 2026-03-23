@@ -70,6 +70,7 @@ deno_core::extension!(
         op_request_midas_payment,
         op_request_midas_payment_game_item,
     ],
+    esm_entry_point = "ext:host_v8_payment/99_global_scope.js",
     esm = [
         dir "payment",
         "01_payment.js",

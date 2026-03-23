@@ -9,6 +9,7 @@ use deno_core::Extension;
 deno_core::extension!(
     host_v8_ad,
     deps = [host_v8_base],
+    esm_entry_point = "ext:host_v8_ad/99_global_scope.js",
     esm = [
         dir "ad",
         "01_ad.js",

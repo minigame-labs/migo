@@ -115,6 +115,7 @@ deno_core::extension!(
         op_show_action_sheet,
         op_get_menu_button_rect,
     ],
+    esm_entry_point = "ext:host_v8_ui/99_global_scope.js",
     esm = [
         dir "ui",
         "01_interaction.js",

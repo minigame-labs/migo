@@ -415,6 +415,7 @@ deno_core::extension!(
         op_video_set_property,
         op_video_destroy,
     ],
+    esm_entry_point = "ext:host_v8_media/99_global_scope.js",
     esm = [
         dir "media",
         "01_camera.js",
