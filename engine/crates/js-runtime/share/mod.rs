@@ -30,6 +30,7 @@ deno_core::extension!(
     esm = [
         dir "share",
         "01_share.js",
+        "99_global_scope.js",
     ],
 );
 

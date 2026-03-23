@@ -25,6 +25,7 @@ import com.migo.runtime.internal.platform.ImageApiManager;
 import com.migo.runtime.internal.platform.LocationProvider;
 import com.migo.runtime.internal.platform.ScanCodeManager;
 import com.migo.runtime.internal.platform.ScreenCaptureObserver;
+import com.migo.runtime.internal.platform.VideoManager;
 import com.migo.runtime.callback.AuthHandler;
 import com.migo.runtime.callback.GameLogHandler;
 import com.migo.runtime.callback.SubpackageHandler;
@@ -66,6 +67,7 @@ public final class NativeExports {
     private static final Object sBluetoothLock = new Object();
     private static final Object sImageApiLock = new Object();
     private static final Object sScanCodeLock = new Object();
+    private static final Object sVideoLock = new Object();
 
     /** Per-session device sensor managers. */
     private static final ConcurrentHashMap<Integer, DeviceSensorManager> sSensorManagers =
@@ -1954,6 +1956,92 @@ public final class NativeExports {
         }
     }
 
+    // ==================== Video ====================
+
+    /** Per-session Video managers. */
+    private static final ConcurrentHashMap<Integer, VideoManager> sVideoManagers =
+            new ConcurrentHashMap<>();
+
+    private static VideoManager getOrCreateVideoManager(int sessionId) {
+        VideoManager existing = sVideoManagers.get(sessionId);
+        if (existing != null) return existing;
+        synchronized (sVideoLock) {
+            existing = sVideoManagers.get(sessionId);
+            if (existing != null) return existing;
+            RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+            if (ctx == null) return null;
+            Activity activity = ctx.getActivity();
+            if (activity == null) return null;
+            VideoManager mgr = new VideoManager(sessionId, activity);
+            sVideoManagers.put(sessionId, mgr);
+            return mgr;
+        }
+    }
+
+    public static String videoCreate(int sessionId, String optionsJson) {
+        VideoManager mgr = getOrCreateVideoManager(sessionId);
+        if (mgr == null) throw new RuntimeException("videoCreate:fail no context");
+        return mgr.create(optionsJson);
+    }
+
+    public static void videoPlay(int sessionId, String videoIdStr) {
+        VideoManager mgr = getOrCreateVideoManager(sessionId);
+        if (mgr == null) return;
+        mgr.play(videoIdStr);
+    }
+
+    public static void videoPause(int sessionId, String videoIdStr) {
+        VideoManager mgr = getOrCreateVideoManager(sessionId);
+        if (mgr == null) return;
+        mgr.pause(videoIdStr);
+    }
+
+    public static void videoStop(int sessionId, String videoIdStr) {
+        VideoManager mgr = getOrCreateVideoManager(sessionId);
+        if (mgr == null) return;
+        mgr.stop(videoIdStr);
+    }
+
+    public static void videoSeek(int sessionId, String json) {
+        VideoManager mgr = getOrCreateVideoManager(sessionId);
+        if (mgr == null) return;
+        mgr.seek(json);
+    }
+
+    public static void videoRequestFullscreen(int sessionId, String json) {
+        VideoManager mgr = getOrCreateVideoManager(sessionId);
+        if (mgr == null) return;
+        mgr.requestFullscreen(json);
+    }
+
+    public static void videoExitFullscreen(int sessionId, String videoIdStr) {
+        VideoManager mgr = getOrCreateVideoManager(sessionId);
+        if (mgr == null) return;
+        mgr.exitFullscreen(videoIdStr);
+    }
+
+    public static void videoSetProperty(int sessionId, String json) {
+        VideoManager mgr = getOrCreateVideoManager(sessionId);
+        if (mgr == null) return;
+        mgr.setProperty(json);
+    }
+
+    public static void videoDestroy(int sessionId, String videoIdStr) {
+        VideoManager mgr = getOrCreateVideoManager(sessionId);
+        if (mgr == null) return;
+        mgr.destroyVideo(videoIdStr);
+    }
+
+    /**
+     * Clean up Video resources for a session. Call on session shutdown.
+     */
+    public static void destroyVideoManager(int sessionId) {
+        VideoManager mgr = sVideoManagers.remove(sessionId);
+        if (mgr != null) {
+            mgr.destroy();
+        }
+    }
+
     // ==================== Game Log ====================
 
     private static final String GAME_LOG_TAG = "MigoGameLog";
@@ -2601,6 +2689,7 @@ public final class NativeExports {
         destroyBluetoothManager(sessionId);
         destroyImageApiManager(sessionId);
         destroyScanCodeManager(sessionId);
+        destroyVideoManager(sessionId);
         clearGameLogHandler(sessionId);
         clearAuthHandler(sessionId);
         clearSubpackageHandler(sessionId);

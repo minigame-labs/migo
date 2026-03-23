@@ -185,6 +185,11 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
         var iter = _pending.keys();
         var first = iter.next();
         if (!first.done) {
+            console.warn(
+                'createDeferredApi(' + apiName + '): response has no requestId, ' +
+                'using FIFO fallback. Platform Manager should include requestId ' +
+                'in the result JSON to support concurrent requests correctly.'
+            );
             var entry = _pending.get(first.value);
             _pending.delete(first.value);
             _settleEntry(entry, parsed);

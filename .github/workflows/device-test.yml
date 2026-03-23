@@ -1,0 +1,229 @@
+name: Device Tests
+
+# Runs on a self-hosted runner with a connected Android device.
+# Triggered manually or on a schedule.
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "App package name to test"
+        required: true
+        default: "com.example.migo.demo"
+      duration:
+        description: "Metric collection duration (seconds)"
+        required: false
+        default: "60"
+      test_suite_path:
+        description: "Path to migo-test-suite (relative to runner home)"
+        required: false
+        default: "../migo-test-suite"
+      fail_on_warn:
+        description: "Treat warnings as failures"
+        type: boolean
+        default: false
+  # Optional: uncomment to run nightly
+  # schedule:
+  #   - cron: "0 3 * * *"  # 03:00 UTC daily
+
+jobs:
+  # ── Job 1: Build debug AAR + install on device ─────────────────────
+  prepare:
+    runs-on: [self-hosted, android-device]
+    timeout-minutes: 90
+    outputs:
+      package: ${{ steps.vars.outputs.package }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set variables
+        id: vars
+        run: |
+          echo "package=${{ github.event.inputs.package || 'com.example.migo.demo' }}" >> "$GITHUB_OUTPUT"
+          echo "duration=${{ github.event.inputs.duration || '60' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify adb connection
+        run: |
+          adb devices | grep -q 'device$' || { echo "ERROR: no device connected"; exit 1; }
+          echo "Device: $(adb shell getprop ro.product.model)"
+          echo "Android: $(adb shell getprop ro.build.version.release)"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine -> target
+          cache-on-failure: true
+
+      # Build steps are optional here — if the test app is already installed
+      # on the device, you can skip the build and go directly to testing.
+      # Uncomment below if you want CI to build and install:
+      #
+      # - name: Setup Java
+      #   uses: actions/setup-java@v4
+      #   with:
+      #     distribution: temurin
+      #     java-version: "17"
+      #
+      # - name: Setup Android SDK + NDK
+      #   run: |
+      #     sdkmanager "ndk;23.2.8568313"
+      #     echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
+      #     cargo install cargo-ndk --locked
+      #
+      # - name: Build debug AAR
+      #   run: bash scripts/build-aar.sh debug
+      #
+      # - name: Install test app
+      #   run: adb install -r path/to/test-app.apk
+
+  # ── Job 2: Performance metrics ──────────────────────────────────────
+  perf-test:
+    needs: prepare
+    runs-on: [self-hosted, android-device]
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Collect performance metrics
+        run: |
+          bash scripts/ci/collect_metrics.sh \
+            --type perf \
+            --package "${{ github.event.inputs.package || 'com.example.migo.demo' }}" \
+            --duration "${{ github.event.inputs.duration || '60' }}" \
+            --interval 2 \
+            --output ci/metrics/current_metrics.json
+
+      - name: Compare against perf baseline
+        run: |
+          bash scripts/ci/run_perf.sh \
+            --current ci/metrics/current_metrics.json \
+            --baseline ci/baselines/android_perf_default.json \
+            --summary-out reports/perf-compare-summary.json \
+            ${{ github.event.inputs.fail_on_warn == 'true' && '--fail-on-warn' || '' }}
+
+      - name: Upload perf results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results
+          path: |
+            ci/metrics/current_metrics.json
+            reports/perf-compare-summary.json
+
+  # ── Job 3: Power / resource metrics ────────────────────────────────
+  power-test:
+    needs: prepare
+    runs-on: [self-hosted, android-device]
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Collect power metrics
+        run: |
+          bash scripts/ci/collect_metrics.sh \
+            --type power \
+            --package "${{ github.event.inputs.package || 'com.example.migo.demo' }}" \
+            --duration "${{ github.event.inputs.duration || '60' }}" \
+            --interval 2 \
+            --output ci/metrics/current_power_metrics.json
+
+      - name: Compare against power baseline
+        run: |
+          bash scripts/ci/run_power.sh \
+            --current ci/metrics/current_power_metrics.json \
+            --baseline ci/baselines/android_power_default.json \
+            --summary-out reports/power-compare-summary.json \
+            ${{ github.event.inputs.fail_on_warn == 'true' && '--fail-on-warn' || '' }}
+
+      - name: Upload power results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: power-results
+          path: |
+            ci/metrics/current_power_metrics.json
+            reports/power-compare-summary.json
+
+  # ── Job 4: migo-test-suite API compatibility ────────────────────────
+  test-suite:
+    needs: prepare
+    runs-on: [self-hosted, android-device]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check test suite availability
+        id: suite
+        run: |
+          SUITE_PATH="${{ github.event.inputs.test_suite_path || '../migo-test-suite' }}"
+          if [ -d "$SUITE_PATH" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "path=$SUITE_PATH" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "WARNING: migo-test-suite not found at $SUITE_PATH"
+          fi
+
+      # The test suite must be run manually (or via its own runner script)
+      # and produce a report.json. This step assumes the report already exists
+      # or the suite has its own run mechanism.
+      - name: Run test suite
+        if: steps.suite.outputs.available == 'true'
+        run: |
+          SUITE_PATH="${{ steps.suite.outputs.path }}"
+          if [ -f "$SUITE_PATH/run.sh" ]; then
+            bash "$SUITE_PATH/run.sh" \
+              --package "${{ github.event.inputs.package || 'com.example.migo.demo' }}" \
+              --output "$SUITE_PATH/report.json" || true
+          else
+            echo "No run.sh found in test suite, expecting pre-existing report.json"
+          fi
+
+      - name: Validate test suite results
+        if: steps.suite.outputs.available == 'true'
+        run: |
+          SUITE_PATH="${{ steps.suite.outputs.path }}"
+          if [ -f "$SUITE_PATH/report.json" ]; then
+            python3 scripts/ci/check_migo_test_suite.py \
+              --report "$SUITE_PATH/report.json" \
+              --summary-out reports/test-suite-summary.json \
+              --gate
+          else
+            echo "WARNING: no report.json found, skipping validation"
+          fi
+
+      - name: Upload test suite results
+        if: always() && steps.suite.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-suite-results
+          path: |
+            reports/test-suite-summary.json
+          if-no-files-found: warn

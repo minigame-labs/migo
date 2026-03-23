@@ -17,13 +17,21 @@
 //! └──────────────┘                      └──────────────┘
 //! ```
 //!
-//! ## Command Categories
+//! ## Command Categories (37 variants)
 //!
-//! - **Module Loading**: `EvaluateModule`, `EvalScript`
-//! - **Lifecycle**: `Shutdown`, `OnShow`, `OnHide`
-//! - **Input**: `OnTouch`
-//! - **Rendering**: `UpdateSurface`
-//! - **Audio Events**: `InnerAudioEvent`
+//! - **Module Loading** (2): `EvaluateModule`, `EvalScript`
+//! - **Lifecycle** (4): `Restart`, `Shutdown`, `OnShow`, `OnHide`
+//! - **Audio** (3): `OnAudioInterruptionBegin`, `OnAudioInterruptionEnd`, `InnerAudioEvent`
+//! - **Rendering / Surface** (1): `UpdateSurface`
+//! - **Touch / Input** (1): `OnTouch`
+//! - **Sensor Events** (5): `OnDeviceMotionChange` .. `OnAccelerometerChange`
+//! - **Network** (1): `OnNetworkStatusChange`
+//! - **Recorder** (2): `RecorderEvent`, `RecorderFrameData`
+//! - **Camera** (2): `CameraEvent`, `CameraFrameData`
+//! - **Keyboard** (6): `OnKeyboardInput` .. `OnKeyUp`
+//! - **Bluetooth / BLE** (7): `OnBluetoothAdapterStateChange` .. `OnBeaconServiceChange`
+//! - **Video** (1): `OnVideoStateChange`
+//! - **System** (2): `OnMemoryWarning`, `OnUserCaptureScreen`
 
 use crate::surface::SurfaceRef;
 
@@ -31,6 +39,22 @@ use crate::surface::SurfaceRef;
 ///
 /// These commands drive the JavaScript runtime and coordinate between
 /// native subsystems (rendering, audio, input) and the JS game code.
+///
+/// # Variant Groups (37 variants total)
+///
+/// - **Module Loading** (2): `EvaluateModule`, `EvalScript`
+/// - **Lifecycle** (4): `Restart`, `Shutdown`, `OnShow`, `OnHide`
+/// - **Rendering / Surface** (1): `UpdateSurface`
+/// - **Touch / Input** (1): `OnTouch`
+/// - **Keyboard Events** (6): `OnKeyboardInput` .. `OnKeyUp`
+/// - **Sensor Events** (5): `OnDeviceMotionChange` .. `OnAccelerometerChange`
+/// - **Network** (1): `OnNetworkStatusChange`
+/// - **Audio Events** (3): `OnAudioInterruptionBegin`, `OnAudioInterruptionEnd`, `InnerAudioEvent`
+/// - **Recorder Events** (2): `RecorderEvent`, `RecorderFrameData`
+/// - **Camera Events** (2): `CameraEvent`, `CameraFrameData`
+/// - **Bluetooth / BLE Events** (7): `OnBluetoothAdapterStateChange` .. `OnBeaconServiceChange`
+/// - **Video Events** (1): `OnVideoStateChange`
+/// - **System Events** (2): `OnMemoryWarning`, `OnUserCaptureScreen`
 ///
 /// # Thread Safety
 ///
@@ -44,8 +68,8 @@ use crate::surface::SurfaceRef;
 ///
 /// // Start a game
 /// let cmd = HostCommand::EvaluateModule {
-///     dir: "/data/game".to_string(),
-///     entry: "main.js".to_string(),
+///     dir: “/data/game”.to_string(),
+///     entry: “main.js”.to_string(),
 /// };
 ///
 /// // Send touch event
@@ -59,6 +83,8 @@ use crate::surface::SurfaceRef;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum HostCommand {
+    // ---- Module Loading ----
+
     /// Evaluate an ES module with isolated VFS paths.
     ///
     /// This is the primary way to start a mini-game. The module is loaded
@@ -68,26 +94,29 @@ pub enum HostCommand {
     ///
     /// ```rust,ignore
     /// HostCommand::EvaluateModule {
-    ///     game_id: "my-puzzle-game".to_string(),
-    ///     entry: "game.js".to_string(),
+    ///     game_id: “my-puzzle-game”.to_string(),
+    ///     entry: “game.js”.to_string(),
     /// }
     /// ```
     EvaluateModule {
         /// Unique game identifier (1-64 alphanumeric, underscore, hyphen).
         /// Used to derive all game paths from base directories.
         game_id: String,
-        /// Entry point module filename (e.g., "main.js", "game.js").
+        /// Entry point module filename (e.g., “main.js”, “game.js”).
         entry: String,
     },
 
     /// Evaluate a JS snippet (non-module).
     ///
     /// Useful for debugging or dynamic code execution. The code runs
-    /// in the global scope, not as a module.
+    /// in the global scope, not as a module. Also used by Mode C async
+    /// APIs (EvalScript pattern) to deliver platform callback results.
     EvalScript {
         /// JavaScript source code to execute.
         source: String,
     },
+
+    // ---- Lifecycle Events ----
 
     /// Restart the current game runtime.
     ///
@@ -115,6 +144,8 @@ pub enum HostCommand {
     /// Triggers `migo.onHide` callbacks in the game.
     OnHide,
 
+    // ---- Audio Events ----
+
     /// Notify that audio playback has been interrupted.
     ///
     /// Triggered when the system takes audio focus (e.g., incoming call).
@@ -125,6 +156,20 @@ pub enum HostCommand {
     /// Triggered when the system returns audio focus.
     OnAudioInterruptionEnd,
 
+    /// InnerAudioContext event pushed from audio thread.
+    ///
+    /// Used to notify the JS layer of audio playback state changes.
+    InnerAudioEvent {
+        /// The InnerAudioContext instance ID.
+        id: u32,
+        /// Type of event (play, pause, ended, etc.).
+        event_type: InnerAudioEventType,
+        /// Current playback position in seconds.
+        current_time: f64,
+    },
+
+    // ---- Rendering / Surface ----
+
     /// Update the rendering surface (e.g., after orientation change).
     ///
     /// The render thread will recreate the EGL context with the new surface.
@@ -133,9 +178,11 @@ pub enum HostCommand {
         surface: SurfaceRef,
     },
 
+    // ---- Touch / Input ----
+
     /// Dispatch touch input events to the game.
     ///
-    /// Touch data is stored inline — fixed `[TouchPoint; 10]` array with a count.
+    /// Touch data is stored inline -- fixed `[TouchPoint; 10]` array with a count.
     /// No heap allocation, single memcpy from JNI DirectByteBuffer.
     OnTouch {
         /// Type of touch event (start, move, end, cancel).
@@ -149,17 +196,7 @@ pub enum HostCommand {
         timestamp_ms: i64,
     },
 
-    /// InnerAudioContext event pushed from audio thread.
-    ///
-    /// Used to notify the JS layer of audio playback state changes.
-    InnerAudioEvent {
-        /// The InnerAudioContext instance ID.
-        id: u32,
-        /// Type of event (play, pause, ended, etc.).
-        event_type: InnerAudioEventType,
-        /// Current playback position in seconds.
-        current_time: f64,
-    },
+    // ---- Sensor Events ----
 
     /// Device motion sensor data (rotation angles from TYPE_ROTATION_VECTOR).
     ///
@@ -177,7 +214,7 @@ pub enum HostCommand {
     ///
     /// Sent by the platform when the display orientation changes.
     OnDeviceOrientationChange {
-        /// One of: "portrait", "landscape", "landscapeReverse".
+        /// One of: “portrait”, “landscape”, “landscapeReverse”.
         value: String,
     },
 
@@ -187,7 +224,7 @@ pub enum HostCommand {
     OnCompassChange {
         /// Direction in degrees (0-360, 0 = north).
         direction: f64,
-        /// Accuracy string (Android: "high"/"medium"/"low"/"no-contact"/"unreliable").
+        /// Accuracy string (Android: “high”/”medium”/”low”/”no-contact”/”unreliable”).
         accuracy: String,
     },
 
@@ -203,19 +240,23 @@ pub enum HostCommand {
         z: f64,
     },
 
+    // ---- Network Events ----
+
     /// Network status changed.
     ///
     /// Sent by the platform network monitor when connectivity changes.
     OnNetworkStatusChange {
         /// Whether network is connected.
         is_connected: bool,
-        /// Network type: "wifi", "2g", "3g", "4g", "5g", "unknown", "none".
+        /// Network type: “wifi”, “2g”, “3g”, “4g”, “5g”, “unknown”, “none”.
         network_type: String,
     },
 
+    // ---- Recorder Events ----
+
     /// Recorder event pushed from platform (start, pause, resume, stop, error, interruption).
     RecorderEvent {
-        /// Event type string (e.g., "start", "stop", "error", "interruptionBegin").
+        /// Event type string (e.g., “start”, “stop”, “error”, “interruptionBegin”).
         event_type: String,
         /// JSON-encoded payload (e.g., stop result with tempFilePath/duration/fileSize).
         json_payload: String,
@@ -229,15 +270,31 @@ pub enum HostCommand {
         is_last_frame: bool,
     },
 
+    // ---- Camera Events ----
+
     /// Camera event pushed from platform (stop, authCancel, error, timeoutCallback).
     CameraEvent {
         /// JS-assigned camera instance ID.
         camera_id: u32,
-        /// Event type string (e.g., "stop", "authCancel", "error", "timeoutCallback").
+        /// Event type string (e.g., “stop”, “authCancel”, “error”, “timeoutCallback”).
         event_type: String,
         /// JSON-encoded payload.
         json_payload: String,
     },
+
+    /// Camera frame data pushed from platform (for onCameraFrame / listenFrameChange).
+    CameraFrameData {
+        /// JS-assigned camera instance ID.
+        camera_id: u32,
+        /// Raw pixel data (RGBA).
+        data: Vec<u8>,
+        /// Frame width in pixels.
+        width: u32,
+        /// Frame height in pixels.
+        height: u32,
+    },
+
+    // ---- Keyboard Events ----
 
     /// Keyboard input event (user typed text in soft keyboard).
     ///
@@ -294,6 +351,8 @@ pub enum HostCommand {
         /// Event timestamp in milliseconds.
         timestamp_ms: f64,
     },
+
+    // ---- Bluetooth / BLE Events ----
 
     /// Bluetooth adapter state changed (available/discovering).
     ///
@@ -365,6 +424,30 @@ pub enum HostCommand {
         discovering: bool,
     },
 
+    // ---- Video Events ----
+
+    /// Video player state change event.
+    ///
+    /// Uses a single variant with `event_type` to cover all video events:
+    /// "play", "pause", "ended", "timeupdate", "waiting", "progress",
+    /// "error", "fullscreenchange".
+    ///
+    /// Triggers the corresponding event listener on the Video instance
+    /// identified by `video_id`.
+    OnVideoStateChange {
+        /// The video player instance ID.
+        video_id: u32,
+        /// Event type: "play", "pause", "ended", "timeupdate", "waiting",
+        /// "progress", "error", "fullscreenchange".
+        event_type: String,
+        /// JSON-encoded event data (e.g. `{"currentTime":12.5}` for timeupdate,
+        /// `{"errMsg":"..."}` for error, `{"fullScreen":true,"direction":0}` for
+        /// fullscreenchange).
+        data: String,
+    },
+
+    // ---- System Events ----
+
     /// Memory warning from the system.
     ///
     /// Triggered when Android sends `onTrimMemory` or `onLowMemory`.
@@ -379,18 +462,6 @@ pub enum HostCommand {
     ///
     /// Triggers `migo.onUserCaptureScreen` callback in the game.
     OnUserCaptureScreen,
-
-    /// Camera frame data pushed from platform (for onCameraFrame / listenFrameChange).
-    CameraFrameData {
-        /// JS-assigned camera instance ID.
-        camera_id: u32,
-        /// Raw pixel data (RGBA).
-        data: Vec<u8>,
-        /// Frame width in pixels.
-        width: u32,
-        /// Frame height in pixels.
-        height: u32,
-    },
 }
 
 /// Event types for InnerAudioContext.

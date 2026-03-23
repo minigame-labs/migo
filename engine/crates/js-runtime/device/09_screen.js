@@ -17,52 +17,31 @@ function getScreenBrightness(options) {
 }
 
 function setScreenBrightness(options = {}) {
-    const { value } = options;
-    if (typeof value !== 'number') {
-        const res = { errMsg: 'setScreenBrightness:fail value is required and must be a number' };
-        if (typeof options.fail === 'function') {
-            queueMicrotask(function () { options.fail(res); });
-        }
-        if (typeof options.complete === 'function') {
-            queueMicrotask(function () { options.complete(res); });
-        }
-        return Promise.reject(res);
-    }
     return wrapAsync('setScreenBrightness', function () {
+        var value = options.value;
+        if (typeof value !== 'number') {
+            throw new Error('value is required and must be a number');
+        }
         op_set_screen_brightness(value);
     }, options);
 }
 
 function setKeepScreenOn(options = {}) {
-    const { keepScreenOn } = options;
-    if (typeof keepScreenOn !== 'boolean') {
-        const res = { errMsg: 'setKeepScreenOn:fail keepScreenOn is required and must be a boolean' };
-        if (typeof options.fail === 'function') {
-            queueMicrotask(function () { options.fail(res); });
-        }
-        if (typeof options.complete === 'function') {
-            queueMicrotask(function () { options.complete(res); });
-        }
-        return Promise.reject(res);
-    }
     return wrapAsync('setKeepScreenOn', function () {
+        var keepScreenOn = options.keepScreenOn;
+        if (typeof keepScreenOn !== 'boolean') {
+            throw new Error('keepScreenOn is required and must be a boolean');
+        }
         op_set_keep_screen_on(keepScreenOn);
     }, options);
 }
 
 function setDeviceOrientation(options = {}) {
-    const { value } = options;
-    if (value !== 'landscape' && value !== 'portrait') {
-        const res = { errMsg: 'setDeviceOrientation:fail value must be "landscape" or "portrait"' };
-        if (typeof options.fail === 'function') {
-            queueMicrotask(function () { options.fail(res); });
-        }
-        if (typeof options.complete === 'function') {
-            queueMicrotask(function () { options.complete(res); });
-        }
-        return Promise.reject(res);
-    }
     return wrapAsync('setDeviceOrientation', function () {
+        var value = options.value;
+        if (value !== 'landscape' && value !== 'portrait') {
+            throw new Error('value must be "landscape" or "portrait"');
+        }
         op_set_device_orientation(value);
     }, options);
 }
@@ -70,47 +49,45 @@ function setDeviceOrientation(options = {}) {
 // ==================== Debug ====================
 
 function setEnableDebug(options = {}) {
-    const { enableDebug } = options;
-    if (typeof enableDebug !== 'boolean') {
-        var res = { errMsg: 'setEnableDebug:fail enableDebug is required and must be a boolean' };
-        if (typeof options.fail === 'function') {
-            queueMicrotask(function () { options.fail(res); });
-        }
-        if (typeof options.complete === 'function') {
-            queueMicrotask(function () { options.complete(res); });
-        }
-        return Promise.reject(res);
-    }
     return wrapAsync('setEnableDebug', function () {
+        var enableDebug = options.enableDebug;
+        if (typeof enableDebug !== 'boolean') {
+            throw new Error('enableDebug is required and must be a boolean');
+        }
         op_set_enable_debug(enableDebug);
     }, options);
 }
 
 // ==================== User Capture Screen ====================
 
-let _captureScreenListener = null;
+var _captureScreenListeners = [];
 
 function onUserCaptureScreen(listener) {
     if (typeof listener === 'function') {
-        const hadListener = _captureScreenListener !== null;
-        _captureScreenListener = listener;
-        if (!hadListener) {
+        var hadListeners = _captureScreenListeners.length > 0;
+        _captureScreenListeners.push(listener);
+        if (!hadListeners) {
             try { op_start_capture_screen(); } catch (_) {}
         }
     }
 }
 
-function offUserCaptureScreen() {
-    if (_captureScreenListener !== null) {
-        _captureScreenListener = null;
+function offUserCaptureScreen(listener) {
+    if (typeof listener === 'function') {
+        var i = _captureScreenListeners.indexOf(listener);
+        if (i !== -1) _captureScreenListeners.splice(i, 1);
+    } else {
+        _captureScreenListeners.length = 0;
+    }
+    if (_captureScreenListeners.length === 0) {
         try { op_stop_capture_screen(); } catch (_) {}
     }
 }
 
 function _internalTriggerUserCaptureScreen() {
-    if (_captureScreenListener) {
+    for (var i = 0; i < _captureScreenListeners.length; i++) {
         try {
-            _captureScreenListener({});
+            _captureScreenListeners[i]({});
         } catch (e) {
             console.error('onUserCaptureScreen listener error:', e);
         }

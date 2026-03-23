@@ -10,7 +10,13 @@ pub(crate) fn get_optional_string_field(
     field_name: &str,
     obj: &JObject,
 ) -> Option<String> {
-    let val = env.get_field(obj, field_name, "Ljava/lang/String;").ok()?;
+    let val = match env.get_field(obj, field_name, "Ljava/lang/String;") {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = env.exception_clear();
+            return None;
+        }
+    };
     let jobj = val.l().ok()?;
     if jobj.is_null() {
         return None;
@@ -28,9 +34,13 @@ pub(crate) fn get_string_field(
     field_name: &str,
     obj: &JObject,
 ) -> Result<String, String> {
-    let val = env
-        .get_field(obj, field_name, "Ljava/lang/String;")
-        .map_err(|e| format!("Failed to get field '{field_name}': {e}"))?;
+    let val = match env.get_field(obj, field_name, "Ljava/lang/String;") {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = env.exception_clear();
+            return Err(format!("Failed to get field '{field_name}': {e}"));
+        }
+    };
 
     let jobj = val
         .l()
@@ -44,27 +54,39 @@ pub(crate) fn get_string_field(
 }
 
 pub(crate) fn get_f32(env: &mut JNIEnv, field_name: &str, obj: &JObject) -> Result<f32, String> {
-    let val = env
-        .get_field(obj, field_name, "F")
-        .map_err(|e| format!("Failed to get field '{field_name}': {e}"))?;
+    let val = match env.get_field(obj, field_name, "F") {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = env.exception_clear();
+            return Err(format!("Failed to get field '{field_name}': {e}"));
+        }
+    };
 
     val.f()
         .map_err(|e| format!("Failed to convert field '{field_name}' to f32: {e}"))
 }
 
 pub(crate) fn get_i32(env: &mut JNIEnv, field_name: &str, obj: &JObject) -> Result<i32, String> {
-    let val = env
-        .get_field(obj, field_name, "I")
-        .map_err(|e| format!("Failed to get field '{field_name}': {e}"))?;
+    let val = match env.get_field(obj, field_name, "I") {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = env.exception_clear();
+            return Err(format!("Failed to get field '{field_name}': {e}"));
+        }
+    };
 
     val.i()
         .map_err(|e| format!("Failed to convert field '{field_name}' to i32: {e}"))
 }
 
 pub(crate) fn get_bool(env: &mut JNIEnv, field_name: &str, obj: &JObject) -> Result<bool, String> {
-    let val = env
-        .get_field(obj, field_name, "Z")
-        .map_err(|e| format!("Failed to get field '{field_name}': {e}"))?;
+    let val = match env.get_field(obj, field_name, "Z") {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = env.exception_clear();
+            return Err(format!("Failed to get field '{field_name}': {e}"));
+        }
+    };
 
     val.z()
         .map_err(|e| format!("Failed to convert field '{field_name}' to bool: {e}"))
@@ -78,9 +100,13 @@ pub(crate) fn get_enum_ordinal(
     field_sig: &str,
     obj: &JObject,
 ) -> Result<i32, String> {
-    let val = env
-        .get_field(obj, field_name, field_sig)
-        .map_err(|e| format!("Failed to get enum field '{field_name}': {e}"))?;
+    let val = match env.get_field(obj, field_name, field_sig) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = env.exception_clear();
+            return Err(format!("Failed to get enum field '{field_name}': {e}"));
+        }
+    };
 
     let enum_obj = val
         .l()
@@ -90,9 +116,13 @@ pub(crate) fn get_enum_ordinal(
         return Ok(0); // Default to first enum value
     }
 
-    let ordinal = env
-        .call_method(&enum_obj, "ordinal", "()I", &[])
-        .map_err(|e| format!("Failed to call ordinal() on '{field_name}': {e}"))?;
+    let ordinal = match env.call_method(&enum_obj, "ordinal", "()I", &[]) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = env.exception_clear();
+            return Err(format!("Failed to call ordinal() on '{field_name}': {e}"));
+        }
+    };
 
     ordinal
         .i()

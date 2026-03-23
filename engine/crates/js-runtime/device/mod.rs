@@ -491,6 +491,7 @@ deno_core::extension!(
         "11_memory.js",
         "12_location.js",
         "13_scan_code.js",
+        "99_global_scope.js",
     ]
 );
 

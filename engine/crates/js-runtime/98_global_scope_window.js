@@ -1,3 +1,10 @@
+// Global scope for the main window (CORE APIs only).
+//
+// OPTIONAL API groups (sensors, media, connectivity, commerce, system-utils)
+// register their own globals via per-extension 99_global_scope.js files.
+// When a feature gate is disabled the extension is excluded from the chain
+// and its globals simply do not appear on globalThis.
+
 import * as lifecycle from "ext:host_v8_lifecycle/02_restart_exit.js";
 import * as alert from "ext:host_v8_console/01_alert.js";
 import * as url from "ext:host_v8_url/03_url.js";
@@ -11,61 +18,13 @@ import * as canvas from "ext:host_v8_web/03_canvas.js";
 import * as webgl from 'ext:host_v8_webgl/02_webgl_context.js';
 import * as touch from 'ext:host_v8_touch/01_touch.js';
 import * as keyboard from 'ext:host_v8_touch/02_keyboard.js';
-import * as audio from 'ext:host_v8_audio/01_audio_context.js';
-import * as innerAudio from 'ext:host_v8_audio/02_inner_audio_context.js';
-import * as audioInterruption from 'ext:host_v8_audio/03_audio_interruption.js';
-import * as mediaAudioPlayer from 'ext:host_v8_audio/04_media_audio_player.js';
-import * as recorderManager from 'ext:host_v8_audio/05_recorder_manager.js';
-import * as deviceMotion from 'ext:host_v8_device/01_device_motion.js';
-import * as gyroscope from 'ext:host_v8_device/02_gyroscope.js';
-import * as orientation from 'ext:host_v8_device/03_orientation.js';
-import * as compass from 'ext:host_v8_device/04_compass.js';
-import * as accelerometer from 'ext:host_v8_device/05_accelerometer.js';
-import * as battery from 'ext:host_v8_device/06_battery.js';
-import * as clipboard from 'ext:host_v8_device/07_clipboard.js';
-import * as vibrate from 'ext:host_v8_device/08_vibrate.js';
-import * as screen from 'ext:host_v8_device/09_screen.js';
-import * as network from 'ext:host_v8_device/10_network.js';
-import * as memory from 'ext:host_v8_device/11_memory.js';
-import * as locationApi from 'ext:host_v8_device/12_location.js';
-import * as scanCodeApi from 'ext:host_v8_device/13_scan_code.js';
-import * as interaction from 'ext:host_v8_ui/01_interaction.js';
-import * as buttonsApi from 'ext:host_v8_ui/02_buttons.js';
-import * as pageManagerApi from 'ext:host_v8_ui/03_page_manager.js';
 import * as envApi from 'ext:host_v8_env/00_env.js';
 import * as appLifecycle from 'ext:host_v8_lifecycle/01_lifecycle.js';
-import * as updateApp from 'ext:host_v8_update/01_update_app.js';
-import * as updateMgr from 'ext:host_v8_update/02_update_mgr.js';
-import * as bluetooth from 'ext:host_v8_system/01_bluetooth.js';
-import * as authorize from 'ext:host_v8_system/02_authorize.js';
-import * as windowInfo from 'ext:host_v8_system/03_window_info.js';
-import * as systemSetting from 'ext:host_v8_system/04_system_settings.js';
-import * as deviceInfo from 'ext:host_v8_system/05_device_info.js';
-import * as benchmarkLevel from 'ext:host_v8_system/06_benchmark_level.js';
-import * as appInfo from 'ext:host_v8_system/07_app_info.js';
-import * as authorizeSetting from 'ext:host_v8_system/08_authorize_setting.js';
-import * as gameLog from 'ext:host_v8_system/09_game_log.js';
-import * as systemInfo from 'ext:host_v8_system/10_system_info.js';
-import * as openDataContext from 'ext:host_v8_system/11_open_data_context.js';
-import * as windowResize from 'ext:host_v8_system/12_window_resize.js';
-import * as loginApi from 'ext:host_v8_system/13_login.js';
 import * as storageApi from 'ext:host_v8_storage/01_storage.js';
-import * as cameraApi from 'ext:host_v8_media/01_camera.js';
-import * as imageApi from 'ext:host_v8_media/02_image_api.js';
-import * as workerApi from 'ext:host_v8_worker/01_worker.js';
-import * as settingApi from 'ext:host_v8_system/14_setting.js';
-import * as navigateApi from 'ext:host_v8_system/15_navigate.js';
-import * as shareApi from 'ext:host_v8_share/01_share.js';
-import * as paymentApi from 'ext:host_v8_payment/01_payment.js';
-import * as jssdkApi from 'ext:host_v8_system/16_jssdk.js';
-import * as adApi from 'ext:host_v8_ad/01_ad.js';
 import * as tcpSocket from 'ext:host_v8_network/08_tcp_socket.js';
 import * as udpSocket from 'ext:host_v8_network/09_udp_socket.js';
 import * as mouseApi from 'ext:host_v8_touch/03_mouse.js';
-import * as analyticsApi from 'ext:host_v8_system/17_analytics.js';
-import * as cryptoApi from 'ext:host_v8_system/18_crypto.js';
-import * as logManagerApi from 'ext:host_v8_system/19_log_manager.js';
-import * as videoDecoderApi from 'ext:host_v8_media/03_video_decoder.js';
+import * as timersInternal from 'ext:host_v8_web/02_timers.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -118,7 +77,7 @@ const WindowGlobalScope = {
     _internalTriggerKeyboardConfirm: core.propNonEnumerable(keyboard._internalTriggerKeyboardConfirm),
     _internalTriggerKeyboardComplete: core.propNonEnumerable(keyboard._internalTriggerKeyboardComplete),
 
-    // Keyboard (PC physical keys - PC-only, dispatched via HostCommand)
+    // Keyboard (PC physical keys)
     onKeyDown: core.propNonEnumerable(keyboard.onKeyDown),
     offKeyDown: core.propNonEnumerable(keyboard.offKeyDown),
     onKeyUp: core.propNonEnumerable(keyboard.onKeyUp),
@@ -126,136 +85,9 @@ const WindowGlobalScope = {
     _internalTriggerKeyDown: core.propNonEnumerable(keyboard._internalTriggerKeyDown),
     _internalTriggerKeyUp: core.propNonEnumerable(keyboard._internalTriggerKeyUp),
 
-    // Audio (WebAudio API)
-    AudioContext: core.propNonEnumerable(audio.AudioContext),
-    AudioBuffer: core.propNonEnumerable(audio.AudioBuffer),
-    AudioNode: core.propNonEnumerable(audio.AudioNode),
-    AudioDestinationNode: core.propNonEnumerable(audio.AudioDestinationNode),
-    AudioBufferSourceNode: core.propNonEnumerable(audio.AudioBufferSourceNode),
-    GainNode: core.propNonEnumerable(audio.GainNode),
-    AudioParam: core.propNonEnumerable(audio.AudioParam),
-    OscillatorNode: core.propNonEnumerable(audio.OscillatorNode),
-    DelayNode: core.propNonEnumerable(audio.DelayNode),
-    BiquadFilterNode: core.propNonEnumerable(audio.BiquadFilterNode),
-    WaveShaperNode: core.propNonEnumerable(audio.WaveShaperNode),
-    AnalyserNode: core.propNonEnumerable(audio.AnalyserNode),
-    DynamicsCompressorNode: core.propNonEnumerable(audio.DynamicsCompressorNode),
-    PannerNode: core.propNonEnumerable(audio.PannerNode),
-    ChannelMergerNode: core.propNonEnumerable(audio.ChannelMergerNode),
-    ChannelSplitterNode: core.propNonEnumerable(audio.ChannelSplitterNode),
-    ConstantSourceNode: core.propNonEnumerable(audio.ConstantSourceNode),
-    IIRFilterNode: core.propNonEnumerable(audio.IIRFilterNode),
-    ScriptProcessorNode: core.propNonEnumerable(audio.ScriptProcessorNode),
-    PeriodicWave: core.propNonEnumerable(audio.PeriodicWave),
-    AudioListener: core.propNonEnumerable(audio.AudioListener),
-    createWebAudioContext: core.propNonEnumerable(audio.createWebAudioContext),
-
-    // InnerAudioContext
-    InnerAudioContext: core.propNonEnumerable(innerAudio.InnerAudioContext),
-    createInnerAudioContext: core.propNonEnumerable(innerAudio.createInnerAudioContext),
-    setInnerAudioOption: core.propNonEnumerable(innerAudio.setInnerAudioOption),
-    getAvailableAudioSources: core.propNonEnumerable(innerAudio.getAvailableAudioSources),
-    _internalEnqueueInnerAudioEvent: core.propNonEnumerable(innerAudio._internalEnqueueInnerAudioEvent),
-
-    // MediaAudioPlayer
-    MediaAudioPlayer: core.propNonEnumerable(mediaAudioPlayer.MediaAudioPlayer),
-    createMediaAudioPlayer: core.propNonEnumerable(mediaAudioPlayer.createMediaAudioPlayer),
-
-    // RecorderManager
-    getRecorderManager: core.propNonEnumerable(recorderManager.getRecorderManager),
-    _internalOnRecorderEvent: core.propNonEnumerable(recorderManager._internalOnRecorderEvent),
-    _internalOnRecorderFrameData: core.propNonEnumerable(recorderManager._internalOnRecorderFrameData),
-
-    // Audio Interruption
-    onAudioInterruptionBegin: core.propNonEnumerable(audioInterruption.onAudioInterruptionBegin),
-    offAudioInterruptionBegin: core.propNonEnumerable(audioInterruption.offAudioInterruptionBegin),
-    onAudioInterruptionEnd: core.propNonEnumerable(audioInterruption.onAudioInterruptionEnd),
-    offAudioInterruptionEnd: core.propNonEnumerable(audioInterruption.offAudioInterruptionEnd),
-    _internalTriggerAudioInterruptionBegin: core.propNonEnumerable(audioInterruption._internalTriggerAudioInterruptionBegin),
-    _internalTriggerAudioInterruptionEnd: core.propNonEnumerable(audioInterruption._internalTriggerAudioInterruptionEnd),
-
-    // Device Motion
-    onDeviceMotionChange: core.propNonEnumerable(deviceMotion.onDeviceMotionChange),
-    offDeviceMotionChange: core.propNonEnumerable(deviceMotion.offDeviceMotionChange),
-    _internalTriggerDeviceMotionChange: core.propNonEnumerable(deviceMotion._internalTriggerDeviceMotionChange),
-    startDeviceMotionListening: core.propNonEnumerable(deviceMotion.startDeviceMotionListening),
-    stopDeviceMotionListening: core.propNonEnumerable(deviceMotion.stopDeviceMotionListening),
-
-    // Gyroscope
-    onGyroscopeChange: core.propNonEnumerable(gyroscope.onGyroscopeChange),
-    offGyroscopeChange: core.propNonEnumerable(gyroscope.offGyroscopeChange),
-    _internalTriggerGyroscopeChange: core.propNonEnumerable(gyroscope._internalTriggerGyroscopeChange),
-    startGyroscope: core.propNonEnumerable(gyroscope.startGyroscope),
-    stopGyroscope: core.propNonEnumerable(gyroscope.stopGyroscope),
-
-    // Device Orientation
-    onDeviceOrientationChange: core.propNonEnumerable(orientation.onDeviceOrientationChange),
-    offDeviceOrientationChange: core.propNonEnumerable(orientation.offDeviceOrientationChange),
-    _internalTriggerDeviceOrientationChange: core.propNonEnumerable(orientation._internalTriggerDeviceOrientationChange),
-
-    // Compass
-    onCompassChange: core.propNonEnumerable(compass.onCompassChange),
-    offCompassChange: core.propNonEnumerable(compass.offCompassChange),
-    _internalTriggerCompassChange: core.propNonEnumerable(compass._internalTriggerCompassChange),
-    startCompass: core.propNonEnumerable(compass.startCompass),
-    stopCompass: core.propNonEnumerable(compass.stopCompass),
-
-    // Accelerometer
-    onAccelerometerChange: core.propNonEnumerable(accelerometer.onAccelerometerChange),
-    offAccelerometerChange: core.propNonEnumerable(accelerometer.offAccelerometerChange),
-    _internalTriggerAccelerometerChange: core.propNonEnumerable(accelerometer._internalTriggerAccelerometerChange),
-    startAccelerometer: core.propNonEnumerable(accelerometer.startAccelerometer),
-    stopAccelerometer: core.propNonEnumerable(accelerometer.stopAccelerometer),
-
-    // Battery
-    getBatteryInfo: core.propNonEnumerable(battery.getBatteryInfo),
-    getBatteryInfoSync: core.propNonEnumerable(battery.getBatteryInfoSync),
-
-    // Clipboard
-    setClipboardData: core.propNonEnumerable(clipboard.setClipboardData),
-    getClipboardData: core.propNonEnumerable(clipboard.getClipboardData),
-
-    // Vibration
-    vibrateShort: core.propNonEnumerable(vibrate.vibrateShort),
-    vibrateLong: core.propNonEnumerable(vibrate.vibrateLong),
-
-    // Screen
-    getScreenBrightness: core.propNonEnumerable(screen.getScreenBrightness),
-    setScreenBrightness: core.propNonEnumerable(screen.setScreenBrightness),
-    setKeepScreenOn: core.propNonEnumerable(screen.setKeepScreenOn),
-    setDeviceOrientation: core.propNonEnumerable(screen.setDeviceOrientation),
-    setEnableDebug: core.propNonEnumerable(screen.setEnableDebug),
-    onUserCaptureScreen: core.propNonEnumerable(screen.onUserCaptureScreen),
-    offUserCaptureScreen: core.propNonEnumerable(screen.offUserCaptureScreen),
-    _internalTriggerUserCaptureScreen: core.propNonEnumerable(screen._internalTriggerUserCaptureScreen),
-
     // Font
     loadFont: core.propNonEnumerable(fontApi.loadFont),
     getTextLineHeight: core.propNonEnumerable(fontApi.getTextLineHeight),
-
-    // Network
-    onNetworkStatusChange: core.propNonEnumerable(network.onNetworkStatusChange),
-    offNetworkStatusChange: core.propNonEnumerable(network.offNetworkStatusChange),
-    onNetworkWeakChange: core.propNonEnumerable(network.onNetworkWeakChange),
-    offNetworkWeakChange: core.propNonEnumerable(network.offNetworkWeakChange),
-    _internalTriggerNetworkStatusChange: core.propNonEnumerable(network._internalTriggerNetworkStatusChange),
-    getNetworkType: core.propNonEnumerable(network.getNetworkType),
-    getLocalIPAddress: core.propNonEnumerable(network.getLocalIPAddress),
-
-    // Memory
-    onMemoryWarning: core.propNonEnumerable(memory.onMemoryWarning),
-    offMemoryWarning: core.propNonEnumerable(memory.offMemoryWarning),
-    _internalTriggerMemoryWarning: core.propNonEnumerable(memory._internalTriggerMemoryWarning),
-
-    // Location
-    getLocation: core.propNonEnumerable(locationApi.getLocation),
-    getFuzzyLocation: core.propNonEnumerable(locationApi.getFuzzyLocation),
-    _internalOnLocationResult: core.propNonEnumerable(locationApi._internalOnLocationResult),
-    _internalOnFuzzyLocationResult: core.propNonEnumerable(locationApi._internalOnFuzzyLocationResult),
-
-    // Scan Code
-    scanCode: core.propNonEnumerable(scanCodeApi.scanCode),
-    _internalOnScanCodeResult: core.propNonEnumerable(scanCodeApi._internalOnScanCodeResult),
 
     // Storage
     setStorage: core.propNonEnumerable(storageApi.setStorage),
@@ -271,44 +103,6 @@ const WindowGlobalScope = {
     createBufferURL: core.propNonEnumerable(storageApi.createBufferURL),
     revokeBufferURL: core.propNonEnumerable(storageApi.revokeBufferURL),
 
-    // Camera
-    createCamera: core.propNonEnumerable(cameraApi.createCamera),
-    _internalOnCameraEvent: core.propNonEnumerable(cameraApi._internalOnCameraEvent),
-    _internalOnCameraFrameData: core.propNonEnumerable(cameraApi._internalOnCameraFrameData),
-
-    // Image API
-    saveImageToPhotosAlbum: core.propNonEnumerable(imageApi.saveImageToPhotosAlbum),
-    previewMedia: core.propNonEnumerable(imageApi.previewMedia),
-    previewImage: core.propNonEnumerable(imageApi.previewImage),
-    compressImage: core.propNonEnumerable(imageApi.compressImage),
-    _internalOnCompressImageResult: core.propNonEnumerable(imageApi._internalOnCompressImageResult),
-    chooseMessageFile: core.propNonEnumerable(imageApi.chooseMessageFile),
-    chooseImage: core.propNonEnumerable(imageApi.chooseImage),
-    _internalOnChooseMessageFileResult: core.propNonEnumerable(imageApi._internalOnChooseMessageFileResult),
-    _internalOnChooseImageResult: core.propNonEnumerable(imageApi._internalOnChooseImageResult),
-
-    // Worker
-    createWorker: core.propNonEnumerable(workerApi.createWorker),
-
-    // UI Interaction
-    showToast: core.propNonEnumerable(interaction.showToast),
-    hideToast: core.propNonEnumerable(interaction.hideToast),
-    showModal: core.propNonEnumerable(interaction.showModal),
-    _internalOnModalResult: core.propNonEnumerable(interaction._internalOnModalResult),
-    showLoading: core.propNonEnumerable(interaction.showLoading),
-    hideLoading: core.propNonEnumerable(interaction.hideLoading),
-    showActionSheet: core.propNonEnumerable(interaction.showActionSheet),
-    _internalOnActionSheetResult: core.propNonEnumerable(interaction._internalOnActionSheetResult),
-
-    // UI Buttons
-    createUserInfoButton: core.propNonEnumerable(buttonsApi.createUserInfoButton),
-    createGameClubButton: core.propNonEnumerable(buttonsApi.createGameClubButton),
-    createFeedbackButton: core.propNonEnumerable(buttonsApi.createFeedbackButton),
-    getMenuButtonBoundingClientRect: core.propNonEnumerable(buttonsApi.getMenuButtonBoundingClientRect),
-
-    // Page Manager
-    createPageManager: core.propNonEnumerable(pageManagerApi.createPageManager),
-
     // Env
     env: core.propNonEnumerable(envApi.env),
 
@@ -319,8 +113,14 @@ const WindowGlobalScope = {
     offHide: core.propNonEnumerable(appLifecycle.offHide),
     getLaunchOptionsSync: core.propNonEnumerable(appLifecycle.getLaunchOptionsSync),
     getEnterOptionsSync: core.propNonEnumerable(appLifecycle.getEnterOptionsSync),
-    _internalTriggerOnShow: core.propNonEnumerable(appLifecycle._internalTriggerOnShow),
-    _internalTriggerOnHide: core.propNonEnumerable(appLifecycle._internalTriggerOnHide),
+    _internalTriggerOnShow: core.propNonEnumerable(function (option) {
+        timersInternal._internalSetTimerBackgrounded(false);
+        appLifecycle._internalTriggerOnShow(option);
+    }),
+    _internalTriggerOnHide: core.propNonEnumerable(function () {
+        appLifecycle._internalTriggerOnHide();
+        timersInternal._internalSetTimerBackgrounded(true);
+    }),
     onAddToFavorites: core.propNonEnumerable(appLifecycle.onAddToFavorites),
     offAddToFavorites: core.propNonEnumerable(appLifecycle.offAddToFavorites),
     _internalTriggerAddToFavorites: core.propNonEnumerable(appLifecycle._internalTriggerAddToFavorites),
@@ -332,179 +132,6 @@ const WindowGlobalScope = {
     exitApplication: core.propNonEnumerable(lifecycle.exitApplication),
     saveAppToDesktop: core.propNonEnumerable(lifecycle.saveAppToDesktop),
 
-    // Update
-    updateApp: core.propNonEnumerable(updateApp.updateApp),
-    getUpdateManager: core.propNonEnumerable(updateMgr.getUpdateManager),
-
-    // Bluetooth
-    openSystemBluetoothSetting: core.propNonEnumerable(bluetooth.openSystemBluetoothSetting),
-    _internalOnOpenBluetoothSettingFinished: core.propNonEnumerable(bluetooth._internalOnOpenBluetoothSettingFinished),
-    openBluetoothAdapter: core.propNonEnumerable(bluetooth.openBluetoothAdapter),
-    closeBluetoothAdapter: core.propNonEnumerable(bluetooth.closeBluetoothAdapter),
-    getBluetoothAdapterState: core.propNonEnumerable(bluetooth.getBluetoothAdapterState),
-    startBluetoothDevicesDiscovery: core.propNonEnumerable(bluetooth.startBluetoothDevicesDiscovery),
-    stopBluetoothDevicesDiscovery: core.propNonEnumerable(bluetooth.stopBluetoothDevicesDiscovery),
-    getBluetoothDevices: core.propNonEnumerable(bluetooth.getBluetoothDevices),
-    getConnectedBluetoothDevices: core.propNonEnumerable(bluetooth.getConnectedBluetoothDevices),
-    makeBluetoothPair: core.propNonEnumerable(bluetooth.makeBluetoothPair),
-    isBluetoothDevicePaired: core.propNonEnumerable(bluetooth.isBluetoothDevicePaired),
-    onBluetoothAdapterStateChange: core.propNonEnumerable(bluetooth.onBluetoothAdapterStateChange),
-    offBluetoothAdapterStateChange: core.propNonEnumerable(bluetooth.offBluetoothAdapterStateChange),
-    onBluetoothDeviceFound: core.propNonEnumerable(bluetooth.onBluetoothDeviceFound),
-    offBluetoothDeviceFound: core.propNonEnumerable(bluetooth.offBluetoothDeviceFound),
-    _internalTriggerBluetoothAdapterStateChange: core.propNonEnumerable(bluetooth._internalTriggerBluetoothAdapterStateChange),
-    _internalTriggerBluetoothDeviceFound: core.propNonEnumerable(bluetooth._internalTriggerBluetoothDeviceFound),
-    // Beacon
-    startBeaconDiscovery: core.propNonEnumerable(bluetooth.startBeaconDiscovery),
-    stopBeaconDiscovery: core.propNonEnumerable(bluetooth.stopBeaconDiscovery),
-    getBeacons: core.propNonEnumerable(bluetooth.getBeacons),
-    onBeaconUpdate: core.propNonEnumerable(bluetooth.onBeaconUpdate),
-    offBeaconUpdate: core.propNonEnumerable(bluetooth.offBeaconUpdate),
-    onBeaconServiceChange: core.propNonEnumerable(bluetooth.onBeaconServiceChange),
-    offBeaconServiceChange: core.propNonEnumerable(bluetooth.offBeaconServiceChange),
-    _internalTriggerBeaconUpdate: core.propNonEnumerable(bluetooth._internalTriggerBeaconUpdate),
-    _internalTriggerBeaconServiceChange: core.propNonEnumerable(bluetooth._internalTriggerBeaconServiceChange),
-    // BLE GATT
-    createBLEConnection: core.propNonEnumerable(bluetooth.createBLEConnection),
-    closeBLEConnection: core.propNonEnumerable(bluetooth.closeBLEConnection),
-    getBLEDeviceServices: core.propNonEnumerable(bluetooth.getBLEDeviceServices),
-    getBLEDeviceCharacteristics: core.propNonEnumerable(bluetooth.getBLEDeviceCharacteristics),
-    readBLECharacteristicValue: core.propNonEnumerable(bluetooth.readBLECharacteristicValue),
-    writeBLECharacteristicValue: core.propNonEnumerable(bluetooth.writeBLECharacteristicValue),
-    notifyBLECharacteristicValueChange: core.propNonEnumerable(bluetooth.notifyBLECharacteristicValueChange),
-    getBLEDeviceRSSI: core.propNonEnumerable(bluetooth.getBLEDeviceRSSI),
-    setBLEMTU: core.propNonEnumerable(bluetooth.setBLEMTU),
-    getBLEMTU: core.propNonEnumerable(bluetooth.getBLEMTU),
-    onBLEConnectionStateChange: core.propNonEnumerable(bluetooth.onBLEConnectionStateChange),
-    offBLEConnectionStateChange: core.propNonEnumerable(bluetooth.offBLEConnectionStateChange),
-    onBLECharacteristicValueChange: core.propNonEnumerable(bluetooth.onBLECharacteristicValueChange),
-    offBLECharacteristicValueChange: core.propNonEnumerable(bluetooth.offBLECharacteristicValueChange),
-    onBLEMTUChange: core.propNonEnumerable(bluetooth.onBLEMTUChange),
-    offBLEMTUChange: core.propNonEnumerable(bluetooth.offBLEMTUChange),
-    _internalTriggerBLEConnectionStateChange: core.propNonEnumerable(bluetooth._internalTriggerBLEConnectionStateChange),
-    _internalTriggerBLECharacteristicValueChange: core.propNonEnumerable(bluetooth._internalTriggerBLECharacteristicValueChange),
-    _internalTriggerBLEMTUChange: core.propNonEnumerable(bluetooth._internalTriggerBLEMTUChange),
-
-    // Authorize
-    openAppAuthorizeSetting: core.propNonEnumerable(authorize.openAppAuthorizeSetting),
-    _internalOnOpenAppAuthorizeSettingFinished: core.propNonEnumerable(authorize._internalOnOpenAppAuthorizeSettingFinished),
-
-    // Setting / Authorize (getSetting, authorize, openSetting)
-    getSetting: core.propNonEnumerable(settingApi.getSetting),
-    authorize: core.propNonEnumerable(settingApi.authorize),
-    openSetting: core.propNonEnumerable(settingApi.openSetting),
-    _internalOnOpenSettingResult: core.propNonEnumerable(settingApi._internalOnOpenSettingResult),
-    _internalUpdateAuthSetting: core.propNonEnumerable(settingApi._internalUpdateAuthSetting),
-
-    // Navigate / Customer Service
-    navigateToMiniProgram: core.propNonEnumerable(navigateApi.navigateToMiniProgram),
-    navigateBackMiniProgram: core.propNonEnumerable(navigateApi.navigateBackMiniProgram),
-    _internalOnNavigateToMiniProgramResult: core.propNonEnumerable(navigateApi._internalOnNavigateToMiniProgramResult),
-    openCustomerServiceConversation: core.propNonEnumerable(navigateApi.openCustomerServiceConversation),
-    openBusinessView: core.propNonEnumerable(navigateApi.openBusinessView),
-
-    // Login
-    login: core.propNonEnumerable(loginApi.login),
-    checkSession: core.propNonEnumerable(loginApi.checkSession),
-    getUserInfo: core.propNonEnumerable(loginApi.getUserInfo),
-    getUserProfile: core.propNonEnumerable(loginApi.getUserProfile),
-    getPhoneNumber: core.propNonEnumerable(loginApi.getPhoneNumber),
-    _internalOnLoginResult: core.propNonEnumerable(loginApi._internalOnLoginResult),
-    _internalOnCheckSessionResult: core.propNonEnumerable(loginApi._internalOnCheckSessionResult),
-    _internalOnGetUserInfoResult: core.propNonEnumerable(loginApi._internalOnGetUserInfoResult),
-    _internalOnGetPhoneNumberResult: core.propNonEnumerable(loginApi._internalOnGetPhoneNumberResult),
-
-    // Window Info
-    getWindowInfo: core.propNonEnumerable(windowInfo.getWindowInfo),
-
-    // System Setting
-    getSystemSetting: core.propNonEnumerable(systemSetting.getSystemSetting),
-
-    // Device Info
-    getDeviceInfo: core.propNonEnumerable(deviceInfo.getDeviceInfo),
-
-    // Benchmark Level
-    getDeviceBenchmarkInfo: core.propNonEnumerable(benchmarkLevel.getDeviceBenchmarkInfo),
-
-    // App Info
-    getAppBaseInfo: core.propNonEnumerable(appInfo.getAppBaseInfo),
-    getAccountInfoSync: core.propNonEnumerable(appInfo.getAccountInfoSync),
-    checkIsAddedToMyMiniProgram: core.propNonEnumerable(appInfo.checkIsAddedToMyMiniProgram),
-    _internalSetAppId: core.propNonEnumerable(appInfo._internalSetAppId),
-
-    // Authorize Setting
-    getAppAuthorizeSetting: core.propNonEnumerable(authorizeSetting.getAppAuthorizeSetting),
-
-    // System Info (legacy combined API)
-    getSystemInfo: core.propNonEnumerable(systemInfo.getSystemInfo),
-    getSystemInfoSync: core.propNonEnumerable(systemInfo.getSystemInfoSync),
-    getSystemInfoAsync: core.propNonEnumerable(systemInfo.getSystemInfoAsync),
-
-    // Open Data Context
-    onMessage: core.propNonEnumerable(openDataContext.onMessage),
-    offMessage: core.propNonEnumerable(openDataContext.offMessage),
-    getOpenDataContext: core.propNonEnumerable(openDataContext.getOpenDataContext),
-    getSharedCanvas: core.propNonEnumerable(openDataContext.getSharedCanvas),
-    getFriendCloudStorage: core.propNonEnumerable(openDataContext.getFriendCloudStorage),
-    setUserCloudStorage: core.propNonEnumerable(openDataContext.setUserCloudStorage),
-    removeUserCloudStorage: core.propNonEnumerable(openDataContext.removeUserCloudStorage),
-    modifyFriendInteractiveStorage: core.propNonEnumerable(openDataContext.modifyFriendInteractiveStorage),
-    getPotentialFriendList: core.propNonEnumerable(openDataContext.getPotentialFriendList),
-    getGameClubData: core.propNonEnumerable(openDataContext.getGameClubData),
-    getUserGameLabel: core.propNonEnumerable(openDataContext.getUserGameLabel),
-
-    // Window Resize
-    onWindowResize: core.propNonEnumerable(windowResize.onWindowResize),
-    offWindowResize: core.propNonEnumerable(windowResize.offWindowResize),
-    _internalTriggerWindowResize: core.propNonEnumerable(windowResize._internalTriggerWindowResize),
-
-    // Game Log
-    getGameLogManager: core.propNonEnumerable(gameLog.getGameLogManager),
-
-    // Share
-    showShareMenu: core.propNonEnumerable(shareApi.showShareMenu),
-    hideShareMenu: core.propNonEnumerable(shareApi.hideShareMenu),
-    updateShareMenu: core.propNonEnumerable(shareApi.updateShareMenu),
-    onShareAppMessage: core.propNonEnumerable(shareApi.onShareAppMessage),
-    offShareAppMessage: core.propNonEnumerable(shareApi.offShareAppMessage),
-    shareAppMessage: core.propNonEnumerable(shareApi.shareAppMessage),
-    _internalOnShareAppMessageResult: core.propNonEnumerable(shareApi._internalOnShareAppMessageResult),
-    _internalTriggerShareAppMessage: core.propNonEnumerable(shareApi._internalTriggerShareAppMessage),
-    onShareTimeline: core.propNonEnumerable(shareApi.onShareTimeline),
-    offShareTimeline: core.propNonEnumerable(shareApi.offShareTimeline),
-    _internalTriggerShareTimeline: core.propNonEnumerable(shareApi._internalTriggerShareTimeline),
-    shareMessageToFriend: core.propNonEnumerable(shareApi.shareMessageToFriend),
-    onShareMessageToFriend: core.propNonEnumerable(shareApi.onShareMessageToFriend),
-    offShareMessageToFriend: core.propNonEnumerable(shareApi.offShareMessageToFriend),
-    _internalTriggerShareMessageToFriend: core.propNonEnumerable(shareApi._internalTriggerShareMessageToFriend),
-    setMessageToFriendQuery: core.propNonEnumerable(shareApi.setMessageToFriendQuery),
-    showShareImageMenu: core.propNonEnumerable(shareApi.showShareImageMenu),
-
-    // Ad (@mock - all ad types are simulated, no real ad SDK)
-    createBannerAd: core.propNonEnumerable(adApi.createBannerAd),
-    createCustomAd: core.propNonEnumerable(adApi.createCustomAd),
-    createGridAd: core.propNonEnumerable(adApi.createGridAd),
-    createInterstitialAd: core.propNonEnumerable(adApi.createInterstitialAd),
-    createRewardedVideoAd: core.propNonEnumerable(adApi.createRewardedVideoAd),
-    getDirectAdStatusSync: core.propNonEnumerable(adApi.getDirectAdStatusSync),
-    getShowSplashAdStatus: core.propNonEnumerable(adApi.getShowSplashAdStatus),
-    createGameBanner: core.propNonEnumerable(adApi.createGameBanner),
-    createGameIcon: core.propNonEnumerable(adApi.createGameIcon),
-    createGamePortal: core.propNonEnumerable(adApi.createGamePortal),
-
-    // Payment
-    checkIsSupportMidasPayment: core.propNonEnumerable(paymentApi.checkIsSupportMidasPayment),
-    requestMidasPayment: core.propNonEnumerable(paymentApi.requestMidasPayment),
-    requestMidasPaymentGameItem: core.propNonEnumerable(paymentApi.requestMidasPaymentGameItem),
-    _internalOnMidasPaymentResult: core.propNonEnumerable(paymentApi._internalOnMidasPaymentResult),
-    _internalOnMidasPaymentGameItemResult: core.propNonEnumerable(paymentApi._internalOnMidasPaymentGameItemResult),
-
-    // JSSDK Lifecycle (config / ready / error)
-    config: core.propNonEnumerable(jssdkApi.config),
-    ready: core.propNonEnumerable(jssdkApi.ready),
-    error: core.propNonEnumerable(jssdkApi.error),
-    _internalTriggerJssdkError: core.propNonEnumerable(jssdkApi._internalTriggerJssdkError),
-
     // TCP Socket
     createTCPSocket: core.propNonEnumerable(tcpSocket.createTCPSocket),
 
@@ -515,29 +142,7 @@ const WindowGlobalScope = {
     triggerGC: core.propNonEnumerable(gcApi.triggerGC),
     getHeapStatistics: core.propNonEnumerable(gcApi.getHeapStatistics),
 
-    // Privacy (@stub - returns hardcoded values, host dispatch not wired)
-    getPrivacySetting: core.propNonEnumerable(settingApi.getPrivacySetting),
-    openPrivacyContract: core.propNonEnumerable(settingApi.openPrivacyContract),
-    requirePrivacyAuthorize: core.propNonEnumerable(settingApi.requirePrivacyAuthorize),
-    onNeedPrivacyAuthorization: core.propNonEnumerable(settingApi.onNeedPrivacyAuthorization),
-    offNeedPrivacyAuthorization: core.propNonEnumerable(settingApi.offNeedPrivacyAuthorization),
-    _internalTriggerNeedPrivacyAuthorization: core.propNonEnumerable(settingApi._internalTriggerNeedPrivacyAuthorization),
-    requestSubscribeMessage: core.propNonEnumerable(settingApi.requestSubscribeMessage),
-
-    // Analytics (@stub - all no-op, needs backend integration)
-    reportEvent: core.propNonEnumerable(analyticsApi.reportEvent),
-    reportMonitor: core.propNonEnumerable(analyticsApi.reportMonitor),
-    reportScene: core.propNonEnumerable(analyticsApi.reportScene),
-    reportPerformance: core.propNonEnumerable(analyticsApi.reportPerformance),
-
-    // UserCryptoManager (@stub - all methods fail with "not supported")
-    getUserCryptoManager: core.propNonEnumerable(cryptoApi.getUserCryptoManager),
-
-    // LogManager (functional) / RealtimeLogManager (@stub - all no-op)
-    getLogManager: core.propNonEnumerable(logManagerApi.getLogManager),
-    getRealtimeLogManager: core.propNonEnumerable(logManagerApi.getRealtimeLogManager),
-
-    // Mouse/Wheel events (PC-only, host dispatch not yet wired)
+    // Mouse/Wheel events (PC-only)
     onMouseDown: core.propNonEnumerable(mouseApi.onMouseDown),
     offMouseDown: core.propNonEnumerable(mouseApi.offMouseDown),
     onMouseMove: core.propNonEnumerable(mouseApi.onMouseMove),
@@ -550,9 +155,6 @@ const WindowGlobalScope = {
     _internalTriggerMouseMove: core.propNonEnumerable(mouseApi._internalTriggerMouseMove),
     _internalTriggerMouseUp: core.propNonEnumerable(mouseApi._internalTriggerMouseUp),
     _internalTriggerWheel: core.propNonEnumerable(mouseApi._internalTriggerWheel),
-
-    // VideoDecoder (@stub - all methods no-op, video not supported)
-    createVideoDecoder: core.propNonEnumerable(videoDecoderApi.createVideoDecoder),
 };
 
 export { WindowGlobalScope };

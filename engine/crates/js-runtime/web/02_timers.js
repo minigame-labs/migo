@@ -9,6 +9,9 @@ const {
     setAsyncContext,
 } = core;
 
+var _backgrounded = false;
+var _deferredTimeoutCallbacks = [];
+
 function checkThis(thisArg) {
     if (thisArg !== null && thisArg !== undefined && thisArg !== globalThis) {
         throw new TypeError("Illegal invocation");
@@ -24,6 +27,10 @@ function setTimeout(callback, timeout = 0, ...args) {
         const oldContext = getAsyncContext();
         try {
             setAsyncContext(asyncContext);
+            if (_backgrounded) {
+                _deferredTimeoutCallbacks.push(() => ReflectApply(unboundCallback, globalThis, args));
+                return;
+            }
             ReflectApply(unboundCallback, globalThis, args);
         } finally {
             setAsyncContext(oldContext);
@@ -60,6 +67,7 @@ function setInterval(callback, timeout = 0, ...args) {
         const oldContext = getAsyncContext(asyncContext);
         try {
             setAsyncContext(asyncContext);
+            if (_backgrounded) return;
             ReflectApply(unboundCallback, globalThis, args);
         } finally {
             setAsyncContext(oldContext);
@@ -98,6 +106,17 @@ function refTimer(id) {
   core.refTimer(id);
 }
 
+function _internalSetTimerBackgrounded(value) {
+    _backgrounded = !!value;
+    if (!_backgrounded && _deferredTimeoutCallbacks.length > 0) {
+        var callbacks = _deferredTimeoutCallbacks;
+        _deferredTimeoutCallbacks = [];
+        for (var i = 0; i < callbacks.length; i++) {
+            try { callbacks[i](); } catch (_) {}
+        }
+    }
+}
+
 export {
     setTimeout,
     clearTimeout,
@@ -106,4 +125,5 @@ export {
     clearInterval,
     unrefTimer,
     refTimer,
+    _internalSetTimerBackgrounded,
 };

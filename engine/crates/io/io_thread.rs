@@ -6,23 +6,20 @@ use crate::io_cmd_handler::IoCmdHandler;
 
 /// Async IO command processing loop.
 ///
-/// Runs as a `tokio::spawn` task on the **Host runtime**, eliminating the need
-/// for a separate IO tokio runtime instance (P1-2: unified runtime).
+/// Runs on a **dedicated OS thread** with its own `current_thread` tokio
+/// runtime.  A separate thread is required because synchronous file ops
+/// (`readFileSync`, `mkdirSync`) block the Host thread via crossbeam — if
+/// the handler shared the Host's single-threaded runtime it could never be
+/// polled during a sync op, causing a guaranteed timeout.
 ///
-/// ## Why this is safe for the JS event loop
-///
-/// All heavy work is offloaded to tokio's blocking thread pool:
+/// All heavy work is offloaded to the runtime's blocking thread pool:
 /// - `tokio::fs::*` calls `spawn_blocking` internally
 /// - Image decode / zip extract use explicit `spawn_blocking`
 ///
-/// The handler itself only does lightweight dispatching: receive command →
-/// kick off async op → await result → send response.  Between each `.await`
-/// the executor polls other tasks (JS event loop, RAF, timers).
-///
 /// ## Backpressure
 ///
-/// The channel is unbounded (same as before).  The handler batches up to
-/// `MAX_BATCH` commands per wake to avoid one producer monopolising the loop.
+/// The channel is unbounded.  The handler batches up to `MAX_BATCH` commands
+/// per wake to avoid one producer monopolising the loop.
 pub async fn run_io_handler(mut rx: UnboundedReceiver<IOCmd>) {
     let mut handler = IoCmdHandler::new();
 

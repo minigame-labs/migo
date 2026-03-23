@@ -73,6 +73,7 @@ deno_core::extension!(
     esm = [
         dir "payment",
         "01_payment.js",
+        "99_global_scope.js",
     ],
 );
 

@@ -974,7 +974,7 @@ pub async fn op_unzip(
             .await
             .map_err(|e| IOError::Message(format!("unzip task join error: {e}")))?
             .map(|_| ())
-            .map_err(|e| IOError::Message(e));
+            .map_err(|e| IOError::Message(e.to_string()));
     }
 
     // Default: Rust zip crate via IO thread

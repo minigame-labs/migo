@@ -24,7 +24,7 @@ pub fn spawn_host_thread(
 ) -> EngineResult<HostId> {
     let id = registry::alloc_host_id();
 
-    let (host_tx, mut host_rx) = tokio::sync::mpsc::channel::<HostCommand>(256);
+    let (host_tx, mut host_rx) = tokio::sync::mpsc::channel::<HostCommand>(512);
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
 
     registry::register_sender(id, host_tx.clone());
@@ -68,9 +68,9 @@ pub fn spawn_host_thread(
                     let poll = PollEventLoopOptions::default();
                     let mut host = host;
 
-                    // Spawn IO handler as a cooperative task on the Host
-                    // runtime.  This eliminates the separate IO tokio runtime
-                    // (one fewer epoll fd, timer wheel, and blocking pool).
+                    // Spawn IO handler on a dedicated thread.  Sync file
+                    // ops (readFileSync, mkdirSync) block the Host thread
+                    // via crossbeam, so the IO handler must run independently.
                     host.io.spawn_handler();
 
                     // Heartbeat interval: run_event_loop may block indefinitely
@@ -231,6 +231,16 @@ pub fn spawn_host_thread(
                 );
             }
 
+            // NOTE: Shutdown-unregister race window
+            //
+            // Between the host thread exiting and this unregister call, JNI
+            // callbacks (onVsync, touch events, etc.) may still call
+            // `send_command_to_host(id, ...)`.  Those calls will get a
+            // "Cannot find host_id=N sender" error from the registry.
+            //
+            // This is benign: the host is already shutting down, so dropping
+            // late-arriving commands is the correct behavior.  The JNI callers
+            // already ignore send failures (they use `let _ = send_command_to_host(...)`).
             registry::unregister_sender(id);
         });
 

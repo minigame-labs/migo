@@ -129,6 +129,24 @@ pub struct VfsPolicy {
     pub deny_symlinks_in_writable_dirs: bool,
 }
 
+/// ## Symlink policy design
+///
+/// Both fields default to `true` (deny symlinks) because the VFS is a
+/// security sandbox: game code runs inside virtual directory mappings and
+/// must not escape to the host filesystem.
+///
+/// - **`deny_symlinks_in_code_dir = true`** prevents a malicious game package
+///   from shipping symlinks that point outside `/code`, which would let it
+///   read arbitrary host files at runtime.
+///
+/// - **`deny_symlinks_in_writable_dirs = true`** prevents a game from
+///   creating symlinks in `/user`, `/cache`, or `/tmp` that point outside
+///   the sandbox, which would let it read or write arbitrary host files.
+///
+/// Setting either to `false` weakens the sandbox and should only be done in
+/// trusted/development environments where symlink-based escape is acceptable.
+/// There is intentionally no single "allow all symlinks" toggle to force
+/// callers to opt in per-directory-class.
 impl Default for VfsPolicy {
     fn default() -> Self {
         Self {

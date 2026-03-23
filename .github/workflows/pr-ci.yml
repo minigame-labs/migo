@@ -6,8 +6,55 @@ on:
     branches:
       - master
 
+# Cancel in-progress runs for the same PR/branch
+concurrency:
+  group: pr-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-and-check:
+  # ── Job 1: Quality gates (fast, no NDK needed) ──────────────────────
+  quality-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine -> target
+          cache-on-failure: true
+
+      - name: Check Rust formatting
+        working-directory: engine
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy lints
+        working-directory: engine
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        working-directory: engine
+        run: cargo test --workspace --lib --doc
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Shell script syntax check
+        run: bash -n scripts/*.sh scripts/ci/*.sh
+
+      - name: Python script syntax check
+        run: python3 -m py_compile scripts/ci/compare_baseline.py scripts/ci/check_migo_test_suite.py
+
+  # ── Job 2: Android AAR build (depends on quality gate) ──────────────
+  build:
+    needs: quality-gate
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -29,8 +76,13 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
           targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine -> target
+          cache-on-failure: true
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
@@ -42,31 +94,22 @@ jobs:
           echo "$ANDROID_HOME/ndk/23.2.8568313/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
           cargo install cargo-ndk --locked
 
-      # ── P1: Quality gates (fail fast before expensive AAR build) ──
-
-      - name: Check Rust formatting
-        working-directory: engine
-        run: cargo fmt --all -- --check
-
-      - name: Run clippy lints
-        working-directory: engine
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Run Rust tests
-        working-directory: engine
-        run: cargo test --workspace --lib --doc
-        env:
-          RUST_BACKTRACE: 1
-
-      - name: Shell script syntax check
-        run: bash -n scripts/*.sh scripts/ci/*.sh
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('platforms/android/**/*.gradle*') }}
+          restore-keys: gradle-
 
       - name: Build Android AAR (debug)
         run: bash scripts/build-aar.sh debug
 
       - name: Analyze AAR size report
         run: |
-          python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-debug.aar > platforms/android/dist/size-report.txt || true
+          python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-debug.aar \
+            > platforms/android/dist/size-report.txt || true
 
       - name: Optional perf baseline compare
         run: |
@@ -87,4 +130,3 @@ jobs:
             platforms/android/dist/*
             reports/*.json
           if-no-files-found: warn
-

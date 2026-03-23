@@ -7,6 +7,7 @@ extension!(host_v8_update,
         dir "update",
         "01_update_app.js",
         "02_update_mgr.js",
+        "99_global_scope.js",
     ]
 );
 

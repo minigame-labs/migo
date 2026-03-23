@@ -7,12 +7,32 @@ edition = "2024"
 path = "lib.rs"
 
 [features]
-default = ["v8-limits", "code-signing"]
+default = ["v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system"]
 v8-limits = ["shared/v8-limits"]
 code-signing = ["shared/code-signing"]
 # Gate the image crate behind a feature flag — js-runtime does not use it directly.
 # Image decoding is handled by the `io` crate (which has its own `rust-image-decode` feature).
 rust-image-decode = ["dep:image"]
+
+# ---- API group feature gates (M25) ----
+#
+# Each feature controls whether the corresponding API domain's extension
+# modules (Rust ops + JS ESM files + global scope registration) are compiled
+# and included in the extension chain.  When a feature is disabled the
+# entire extension is excluded: no ops are registered, no JS files are
+# bundled, and the corresponding APIs do not appear on globalThis.
+#
+# Mapping to extensions:
+#   api-sensors      -> host_v8_device  (sensors, battery, clipboard, vibration, screen, network, location, scan)
+#   api-media        -> host_v8_media (camera, image_api, video) + host_v8_audio (WebAudio, InnerAudio, Recorder)
+#   api-connectivity -> host_v8_system  (bluetooth, auth, window/system/device info, login, settings, navigate, game_log)
+#   api-commerce     -> host_v8_share (share menu) + host_v8_payment (Midas payment)
+#   api-system       -> host_v8_ui (Toast/Modal/Loading/ActionSheet) + host_v8_update + host_v8_ad + host_v8_worker
+api-sensors = []
+api-media = []
+api-connectivity = []
+api-commerce = []
+api-system = []
 
 [dependencies]
 deno_core.workspace=true

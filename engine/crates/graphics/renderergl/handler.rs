@@ -33,6 +33,16 @@ impl RendererGL {
         cm.current_canvas_id()
     }
 
+    /// Process a single GL command.
+    ///
+    /// PERF: Per-command `make_current_needed` overhead.
+    /// Every per-canvas GL command calls `cm.make_current_needed(canvas_id)`.
+    /// In the common single-canvas case this is a cheap `BoundContext`
+    /// enum comparison (already O(1) short-circuit when the canvas is
+    /// already current).  In multi-canvas scenarios, consecutive commands
+    /// targeting the same canvas also short-circuit after the first call.
+    /// The only real EGL cost (`eglMakeCurrent`) is paid on actual canvas
+    /// switches, which are rare within a single batch.
     pub(crate) fn handle_command(
         &mut self,
         cm: &mut CanvasManager,

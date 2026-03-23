@@ -1,3 +1,5 @@
+use crate::protocol::error::ServiceError;
+
 /// Login/auth session service.
 ///
 /// Host side should manage real session state (not JS memory state), and report
@@ -38,22 +40,22 @@
 /// - fail: `{"requestId":N,"error":"reason","errno":123}` (errno optional)
 pub trait AuthService: Send + Sync {
     /// Trigger login and return code asynchronously.
-    fn login(&self, _options_json: &str) -> Result<(), String> {
-        Err("login:fail not supported".to_string())
+    fn login(&self, _options_json: &str) -> Result<(), ServiceError> {
+        Err(ServiceError::not_supported("login:fail not supported"))
     }
 
     /// Check current session validity asynchronously.
-    fn check_session(&self, _options_json: &str) -> Result<(), String> {
-        Err("checkSession:fail not supported".to_string())
+    fn check_session(&self, _options_json: &str) -> Result<(), ServiceError> {
+        Err(ServiceError::not_supported("checkSession:fail not supported"))
     }
 
     /// Get user info asynchronously.
-    fn get_user_info(&self, _options_json: &str) -> Result<(), String> {
-        Err("getUserInfo:fail not supported".to_string())
+    fn get_user_info(&self, _options_json: &str) -> Result<(), ServiceError> {
+        Err(ServiceError::not_supported("getUserInfo:fail not supported"))
     }
 
     /// Get phone number token asynchronously.
-    fn get_phone_number(&self, _options_json: &str) -> Result<(), String> {
-        Err("getPhoneNumber:fail not supported".to_string())
+    fn get_phone_number(&self, _options_json: &str) -> Result<(), ServiceError> {
+        Err(ServiceError::not_supported("getPhoneNumber:fail not supported"))
     }
 }

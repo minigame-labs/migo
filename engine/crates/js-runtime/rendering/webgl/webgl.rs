@@ -1,7 +1,7 @@
 use std::mem;
 
 use bytemuck::allocation::cast_vec;
-use deno_core::{JsBuffer, OpState, op2};
+use deno_core::{OpState, op2};
 use tracing::error;
 
 use shared::{
@@ -386,10 +386,13 @@ pub fn op_buffer_data(
     #[smi] canvas_id: u32,
     #[smi] target: u32,
     #[smi] size: i32,
-    #[buffer] data: Option<JsBuffer>,
+    // #[buffer(copy)] gives us an owned Vec<u8> directly, avoiding an
+    // intermediate JsBuffer wrapper + separate .to_vec() heap allocation.
+    // The copy itself is unavoidable: V8 owns the ArrayBuffer backing store
+    // and we must send owned data to the render thread.
+    #[buffer(copy)] data: Option<Vec<u8>>,
     #[smi] usage: u32,
 ) {
-    let data = data.map(|b| b.as_ref().to_vec());
     if data.is_none() && size <= 0 {
         error!("op_buffer_data: size must > 0 when data is None");
         return;
@@ -495,6 +498,22 @@ pub fn op_is_enabled(state: &mut OpState, #[smi] canvas_id: u32, #[smi] cap: u32
     .unwrap_or(0)
 }
 
+/// PERF: Architectural limitation -- this is a synchronous cross-thread call.
+/// `op_get_parameter` flushes the pending GL command batch, sends a
+/// `GetParameter` request to the render thread, and blocks the JS thread
+/// until the render thread processes it and responds.  This causes a full
+/// pipeline stall: JS cannot execute while waiting, and the render thread
+/// must drain its queue to reach this request.
+///
+/// Frequent calls (e.g. inside a draw loop) will significantly degrade
+/// frame rate.  Games should cache parameter values on the JS side
+/// when possible.
+///
+/// Note: `gl.getError()` is currently stubbed to always return 0 on the JS
+/// side (`02_webgl_context.js`), so it does not hit this path.  If a real
+/// implementation is ever needed, consider maintaining a last-error cache
+/// on the render thread updated by each GL call, and reading it via a
+/// lock-free atomic instead of a sync round-trip.
 #[op2]
 #[string]
 pub fn op_get_parameter(state: &mut OpState, #[smi] canvas_id: u32, #[smi] pname: u32) -> String {
@@ -541,15 +560,15 @@ pub fn op_tex_image_2d(
     #[smi] border: i32,
     #[smi] format: u32,
     #[smi] type_: u32,
-    #[buffer] data: Option<JsBuffer>,
+    // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
+    #[buffer(copy)] data: Option<Vec<u8>>,
 ) {
-    let data = data.map(|b| b.as_ref().to_vec());
     queue_gl_fire_and_forget(state, GLCmd::TexImage2D {
         canvas_id, target, level, internalformat, width, height, border, format, type_, data,
     });
 }
 
-#[op2]
+#[op2(fast)]
 pub fn op_tex_sub_image_2d(
     state: &mut OpState,
     #[smi] canvas_id: u32,
@@ -561,9 +580,9 @@ pub fn op_tex_sub_image_2d(
     #[smi] height: i32,
     #[smi] format: u32,
     #[smi] type_: u32,
-    #[buffer] data: JsBuffer,
+    // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
+    #[buffer(copy)] data: Vec<u8>,
 ) {
-    let data = data.as_ref().to_vec();
     queue_gl_fire_and_forget(state, GLCmd::TexSubImage2D {
         canvas_id, target, level, xoffset, yoffset, width, height, format, type_, data,
     });
@@ -589,7 +608,7 @@ pub fn op_pixel_storei(state: &mut OpState, #[smi] canvas_id: u32, #[smi] pname:
     queue_gl_fire_and_forget(state, GLCmd::PixelStorei { canvas_id, pname, param });
 }
 
-#[op2]
+#[op2(fast)]
 pub fn op_compressed_tex_image_2d(
     state: &mut OpState,
     #[smi] canvas_id: u32,
@@ -599,15 +618,15 @@ pub fn op_compressed_tex_image_2d(
     #[smi] width: i32,
     #[smi] height: i32,
     #[smi] border: i32,
-    #[buffer] data: JsBuffer,
+    // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
+    #[buffer(copy)] data: Vec<u8>,
 ) {
-    let data = data.as_ref().to_vec();
     queue_gl_fire_and_forget(state, GLCmd::CompressedTexImage2D {
         canvas_id, target, level, internalformat, width, height, border, data,
     });
 }
 
-#[op2]
+#[op2(fast)]
 pub fn op_compressed_tex_sub_image_2d(
     state: &mut OpState,
     #[smi] canvas_id: u32,
@@ -618,9 +637,9 @@ pub fn op_compressed_tex_sub_image_2d(
     #[smi] width: i32,
     #[smi] height: i32,
     #[smi] format: u32,
-    #[buffer] data: JsBuffer,
+    // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
+    #[buffer(copy)] data: Vec<u8>,
 ) {
-    let data = data.as_ref().to_vec();
     queue_gl_fire_and_forget(state, GLCmd::CompressedTexSubImage2D {
         canvas_id, target, level, xoffset, yoffset, width, height, format, data,
     });
@@ -630,15 +649,15 @@ pub fn op_compressed_tex_sub_image_2d(
 // Phase 1C: Buffer & Vertex Extensions
 // ---------------------------------------------------------------------------
 
-#[op2]
+#[op2(fast)]
 pub fn op_buffer_sub_data(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     #[smi] target: u32,
     #[smi] offset: i32,
-    #[buffer] data: JsBuffer,
+    // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
+    #[buffer(copy)] data: Vec<u8>,
 ) {
-    let data = data.as_ref().to_vec();
     queue_gl_fire_and_forget(state, GLCmd::BufferSubData { canvas_id, target, offset, data });
 }
 

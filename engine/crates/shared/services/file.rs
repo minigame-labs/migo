@@ -1,5 +1,7 @@
 //! File service trait for platform-specific file operations.
 
+use crate::protocol::error::ServiceError;
+
 /// Platform-specific file service for operations not available in pure Rust.
 ///
 /// Currently used for zip extraction:
@@ -8,5 +10,5 @@
 pub trait FileService: Send + Sync {
     /// Extract a zip file to the target directory.
     /// Returns the number of files extracted on success.
-    fn unzip(&self, zip_path: &str, dest_dir: &str) -> Result<usize, String>;
+    fn unzip(&self, zip_path: &str, dest_dir: &str) -> Result<usize, ServiceError>;
 }

@@ -111,6 +111,24 @@ async fn op_load_image_inner(
         }
 
         cache::BeginLoadResult::StartLoading => {
+            // NOTE: Double-allocation window.
+            // Between ReadImageRgba8 completing and the render thread's
+            // LoadImage consuming the RGBA buffer, both the IO cache and the
+            // `img` value hold copies of the decoded pixel data in CPU memory.
+            // For a 1024x1024 RGBA8 image this is ~4 MB duplicated.
+            //
+            // This is architecturally necessary because:
+            //  1. The IO layer decodes synchronously and caches the result
+            //     for potential re-use by other concurrent loaders (Join path).
+            //  2. The render thread owns the GL context and must receive the
+            //     pixel data to perform glTexImage2D.
+            //  3. The two threads (Host/IO and Render) cannot share a
+            //     zero-copy buffer without unsafe lifetime management that
+            //     would couple their lifecycles.
+            //
+            // Mitigation: we eagerly evict the IO cache entry immediately
+            // after GPU upload succeeds (see below), limiting the overlap
+            // window to the duration of the LoadImage render command.
             let img = send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::ReadImageRgba8 {
                 path: src.clone(),
                 resp: IOCmdResp::Async(resp_tx),

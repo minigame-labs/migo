@@ -1,0 +1,62 @@
+{
+  "_comment": "Performance baseline thresholds for Migo Android runtime. Metrics collected from DebugStats (Rust) and Java-side instrumentation. See CLAUDE.md section 11 for data sources.",
+  "version": 1,
+  "metrics": {
+    "fps": {
+      "description": "Frames per second (derived from DebugStats.fps_x10 / 10)",
+      "unit": "fps",
+      "direction": "higher_is_better",
+      "fail_below": 50.0,
+      "warn_below": 55.0
+    },
+    "frame_time_ms": {
+      "description": "Per-frame render time (derived from DebugStats.frame_time_us / 1000)",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "fail_above": 20.0,
+      "warn_above": 18.0
+    },
+    "startup_time_ms": {
+      "description": "Time from session creation to onGameReady callback (Java-side measurement)",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "fail_above": 5000,
+      "warn_above": 3000
+    },
+    "first_frame_ms": {
+      "description": "Time from render thread start to first swap_buffers (DebugStats.first_frame_ms)",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "fail_above": 3000,
+      "warn_above": 2000
+    },
+    "dropped_frames_pct": {
+      "description": "Percentage of RAF signals dropped (dropped_frames / total_frames * 100)",
+      "unit": "percent",
+      "direction": "lower_is_better",
+      "fail_above": 5.0,
+      "warn_above": 2.0
+    },
+    "command_drops": {
+      "description": "Total HostCommand messages dropped due to queue overflow (DebugStats.command_drops)",
+      "unit": "count",
+      "direction": "lower_is_better",
+      "fail_above": 10,
+      "warn_above": 1
+    },
+    "aar_size_mb": {
+      "description": "Release AAR file size",
+      "unit": "MB",
+      "direction": "lower_is_better",
+      "fail_above": 30.0,
+      "warn_above": 25.0
+    },
+    "so_arm64_size_mb": {
+      "description": "libmigo.so size for arm64-v8a",
+      "unit": "MB",
+      "direction": "lower_is_better",
+      "fail_above": 15.0,
+      "warn_above": 12.0
+    }
+  }
+}

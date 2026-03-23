@@ -12,6 +12,7 @@ deno_core::extension!(
     esm = [
         dir "ad",
         "01_ad.js",
+        "99_global_scope.js",
     ],
 );
 

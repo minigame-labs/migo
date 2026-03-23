@@ -514,6 +514,14 @@ impl HostJsRuntime {
             .dispatch_key_up(&mut self.rt, key, code, timestamp_ms);
     }
 
+    // ---- Video event dispatch ----
+
+    #[inline]
+    pub fn dispatch_video_event(&mut self, video_id: u32, event_type: &str, data: &str) {
+        self.bindings
+            .dispatch_video_event(&mut self.rt, video_id, event_type, data);
+    }
+
     // ---- Scripts / modules ----
 
     /// Execute a script without pumping the event loop.

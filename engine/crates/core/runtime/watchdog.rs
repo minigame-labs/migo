@@ -50,6 +50,13 @@ use tracing::{error, info, warn};
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Default ANR timeout: 10 seconds without a heartbeat.
+///
+/// WARNING: Values below 5 seconds may cause false ANR detections during heavy
+/// JS module loading / compilation phases, especially on low-end devices. The
+/// initial module evaluation can legitimately block the event loop for several
+/// seconds (V8 parsing + compilation + top-level execution). While the watchdog
+/// is paused during `evaluate_module`, the resume-to-first-heartbeat window
+/// still needs headroom. 10 seconds provides a safe margin; reduce with caution.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
@@ -128,6 +135,10 @@ impl Default for WatchdogConfig {
 
 impl WatchdogConfig {
     /// Create a new config with the given ANR timeout.
+    ///
+    /// Values below 5 seconds are not recommended -- they may trigger false
+    /// ANR detections during heavy JS module loading on low-end devices.
+    /// See [`DEFAULT_TIMEOUT`] for details.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -669,5 +680,144 @@ mod tests {
         assert!(!state.is_paused());
         assert!(state.termination_reason().is_none());
         assert_eq!(state.extended_deadline.load(Ordering::Acquire), 0);
+    }
+
+    // -- H17: Additional edge-case tests --
+
+    /// Verify that a very short timeout (< 5s) is accepted by the config builder.
+    /// The watchdog documentation warns against values below 5s due to false-positive
+    /// risk during module loading, but the API does not reject them.
+    #[test]
+    fn test_watchdog_minimum_timeout_accepted() {
+        let config = WatchdogConfig::default()
+            .with_timeout(Duration::from_secs(1))
+            .with_check_interval(Duration::from_millis(200));
+        assert_eq!(config.timeout, Duration::from_secs(1));
+        assert_eq!(config.check_interval, Duration::from_millis(200));
+        // The config should be usable even with aggressive values.
+        // In production, values < 5s risk false ANR detections during module
+        // loading, but the API intentionally allows it for testing scenarios.
+    }
+
+    /// After termination, reset() should clear the terminated flag and allow
+    /// the watchdog to be reused (e.g., after cancel_terminate_execution for restart).
+    #[test]
+    fn test_watchdog_reset_clears_terminated() {
+        let state = WatchdogState::new();
+
+        // Simulate OOM termination
+        state.mark_terminated(TerminationReason::OutOfMemory);
+        assert!(state.was_terminated());
+        assert_eq!(
+            state.termination_reason(),
+            Some(TerminationReason::OutOfMemory)
+        );
+
+        // Reset should fully clear the termination state
+        state.reset();
+        assert!(!state.was_terminated());
+        assert!(state.termination_reason().is_none());
+
+        // Should be re-usable: a new termination can be recorded
+        state.mark_terminated(TerminationReason::Timeout);
+        assert!(state.was_terminated());
+        assert_eq!(state.termination_reason(), Some(TerminationReason::Timeout));
+    }
+
+    /// Heartbeat updates during pause should be accepted, and the heartbeat
+    /// value should advance. When the watchdog resumes, the fresh heartbeat
+    /// prevents a spurious timeout detection.
+    #[test]
+    fn test_watchdog_heartbeat_after_pause() {
+        let state = WatchdogState::new();
+        state.pause();
+        assert!(state.is_paused());
+
+        let before = state.heartbeat.load(Ordering::Acquire);
+        std::thread::sleep(Duration::from_millis(10));
+        state.tick();
+        let after = state.heartbeat.load(Ordering::Acquire);
+        assert!(
+            after >= before,
+            "tick() should still advance heartbeat while paused (before={}, after={})",
+            before,
+            after,
+        );
+
+        // Resume refreshes heartbeat, so a subsequent check should see a recent value
+        state.resume();
+        assert!(!state.is_paused());
+        let resumed = state.heartbeat.load(Ordering::Acquire);
+        assert!(
+            resumed >= after,
+            "resume() should refresh heartbeat (after={}, resumed={})",
+            after,
+            resumed,
+        );
+    }
+
+    /// Basic concurrency test: tick from one thread while reading from another.
+    /// Verifies that the atomic operations do not panic or produce obviously
+    /// wrong values under contention.
+    #[test]
+    fn test_watchdog_concurrent_tick_and_reset() {
+        let state = Arc::new(WatchdogState::new());
+        let state2 = Arc::clone(&state);
+
+        // Spawn a thread that repeatedly ticks
+        let ticker = std::thread::spawn(move || {
+            for _ in 0..100 {
+                state2.tick();
+                std::thread::yield_now();
+            }
+        });
+
+        // Concurrently reset a few times and read state
+        for _ in 0..20 {
+            state.reset();
+            // These reads should never panic
+            let _ = state.was_terminated();
+            let _ = state.termination_reason();
+            let _ = state.is_paused();
+            let _ = state.heartbeat.load(Ordering::Acquire);
+            std::thread::yield_now();
+        }
+
+        ticker.join().expect("ticker thread should not panic");
+
+        // After all concurrent operations, state should be consistent:
+        // not terminated (last operation was reset or tick, neither sets terminated)
+        assert!(!state.was_terminated());
+    }
+
+    /// When both OOM and timeout are recorded (via successive mark_terminated calls),
+    /// the last writer wins. In the real watchdog, the OOM callback runs from V8's
+    /// near-heap-limit handler and can race with the watchdog timeout check.
+    /// We verify that OOM takes priority when it is written last.
+    #[test]
+    fn test_watchdog_oom_takes_priority_over_timeout() {
+        let state = WatchdogState::new();
+
+        // Simulate: watchdog detects timeout first, then OOM fires
+        state.mark_terminated(TerminationReason::Timeout);
+        assert_eq!(state.termination_reason(), Some(TerminationReason::Timeout));
+
+        // OOM overwrites (last writer wins)
+        state.mark_terminated(TerminationReason::OutOfMemory);
+        assert!(state.was_terminated());
+        assert_eq!(
+            state.termination_reason(),
+            Some(TerminationReason::OutOfMemory),
+        );
+
+        // Reverse order: OOM first, then timeout
+        state.reset();
+        state.mark_terminated(TerminationReason::OutOfMemory);
+        state.mark_terminated(TerminationReason::Timeout);
+        assert_eq!(
+            state.termination_reason(),
+            Some(TerminationReason::Timeout),
+            "last writer wins regardless of order",
+        );
     }
 }

@@ -3,43 +3,76 @@ use tracing::warn;
 
 use shared::protocol::host_cmd::{TouchPoint, TouchType};
 
-/// Cache of JS globals / context handles that Host frequently calls.
-/// Centralizes V8 scope handling to avoid borrow conflicts.
+/// Cache of V8 `Global<Function>` handles for JS callbacks that the host
+/// thread dispatches into frequently (touch, sensors, audio, etc.).
+///
+/// All callback fields (27 total) are `Option<v8::Global<v8::Function>>`.
+/// They are populated during `reload()` by looking up `_internal*` functions
+/// from the V8 global scope. A `None` value means the corresponding JS
+/// function was not found (e.g., the extension is not loaded or the game
+/// has not registered that API). Dispatch methods silently skip `None` fields.
+///
+/// ## Field groups
+///
+/// - **Touch / Input** (1): `enqueue_touch_event_fn`
+/// - **Audio** (1): `enqueue_inner_audio_event_fn`
+/// - **Recorder** (2): `recorder_event_fn`, `recorder_frame_fn`
+/// - **Camera** (2): `camera_event_fn`, `camera_frame_fn`
+/// - **Sensors** (6): device motion, gyroscope, accelerometer, compass, orientation, network
+/// - **Bluetooth / Beacon** (4): adapter state, device found, beacon update, beacon service
+/// - **BLE GATT** (3): connection state, characteristic value, MTU
+/// - **System** (1): `memory_warning_fn`
+/// - **Keyboard** (6): input, height, confirm, complete, key down, key up
+/// - **Video** (1): `video_event_fn`
 pub(crate) struct JsBindings {
     main_js_context: v8::Global<v8::Context>,
+
+    // ---- Touch / Input ----
     enqueue_touch_event_fn: Option<v8::Global<v8::Function>>,
+
+    // ---- Audio ----
     enqueue_inner_audio_event_fn: Option<v8::Global<v8::Function>>,
-    // Recorder event functions
+
+    // ---- Recorder ----
     recorder_event_fn: Option<v8::Global<v8::Function>>,
     recorder_frame_fn: Option<v8::Global<v8::Function>>,
-    // Camera event functions
+
+    // ---- Camera ----
     camera_event_fn: Option<v8::Global<v8::Function>>,
     camera_frame_fn: Option<v8::Global<v8::Function>>,
-    // Sensor event functions (cached for high-frequency dispatch without JS parsing)
+
+    // ---- Sensors (high-frequency; cached to avoid JS-side name lookup overhead) ----
     sensor_device_motion_fn: Option<v8::Global<v8::Function>>,
     sensor_gyroscope_fn: Option<v8::Global<v8::Function>>,
     sensor_accelerometer_fn: Option<v8::Global<v8::Function>>,
     sensor_compass_fn: Option<v8::Global<v8::Function>>,
     sensor_orientation_fn: Option<v8::Global<v8::Function>>,
     sensor_network_fn: Option<v8::Global<v8::Function>>,
-    // Bluetooth event functions
+
+    // ---- Bluetooth / Beacon ----
     bluetooth_adapter_state_change_fn: Option<v8::Global<v8::Function>>,
     bluetooth_device_found_fn: Option<v8::Global<v8::Function>>,
     beacon_update_fn: Option<v8::Global<v8::Function>>,
     beacon_service_change_fn: Option<v8::Global<v8::Function>>,
-    // BLE GATT event functions
+
+    // ---- BLE GATT ----
     ble_connection_state_change_fn: Option<v8::Global<v8::Function>>,
     ble_characteristic_value_change_fn: Option<v8::Global<v8::Function>>,
     ble_mtu_change_fn: Option<v8::Global<v8::Function>>,
-    // Memory warning
+
+    // ---- System ----
     memory_warning_fn: Option<v8::Global<v8::Function>>,
-    // Keyboard event functions
+
+    // ---- Keyboard (soft keyboard + physical key events) ----
     keyboard_input_fn: Option<v8::Global<v8::Function>>,
     keyboard_height_change_fn: Option<v8::Global<v8::Function>>,
     keyboard_confirm_fn: Option<v8::Global<v8::Function>>,
     keyboard_complete_fn: Option<v8::Global<v8::Function>>,
     key_down_fn: Option<v8::Global<v8::Function>>,
     key_up_fn: Option<v8::Global<v8::Function>>,
+
+    // ---- Video ----
+    video_event_fn: Option<v8::Global<v8::Function>>,
 }
 
 impl JsBindings {
@@ -74,6 +107,7 @@ impl JsBindings {
             keyboard_complete_fn: None,
             key_down_fn: None,
             key_up_fn: None,
+            video_event_fn: None,
         };
 
         this.reload(rt, host_id);
@@ -119,6 +153,7 @@ impl JsBindings {
             kb_complete,
             key_down,
             key_up,
+            video_event,
         ) = self.with_main_context(rt, |scope, _ctx, global| {
             (
                 get_global_fn(scope, global, "_internalEnqueueRawTouchEvent"),
@@ -147,6 +182,7 @@ impl JsBindings {
                 get_global_fn(scope, global, "_internalTriggerKeyboardComplete"),
                 get_global_fn(scope, global, "_internalTriggerKeyDown"),
                 get_global_fn(scope, global, "_internalTriggerKeyUp"),
+                get_global_fn(scope, global, "_internalTriggerVideoEvent"),
             )
         });
 
@@ -176,6 +212,7 @@ impl JsBindings {
         self.keyboard_complete_fn = kb_complete;
         self.key_down_fn = key_down;
         self.key_up_fn = key_up;
+        self.video_event_fn = video_event;
 
         if self.enqueue_touch_event_fn.is_none() {
             warn!("[Host {}] _internalEnqueueRawTouchEvent not found", host_id);
@@ -786,5 +823,33 @@ impl JsBindings {
             let func = v8::Local::new(scope, func_g);
             let _ = func.call(scope, global.into(), &args);
         });
+    }
+
+    // ---- Video event dispatch ----
+
+    /// Dispatch video player event to JS.
+    /// Args: (video_id: u32, event_type: &str, data: &str)
+    pub(crate) fn dispatch_video_event(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        video_id: u32,
+        event_type: &str,
+        data: &str,
+    ) {
+        if let Some(func_g) = self.video_event_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [
+                    v8::Integer::new(scope, video_id as i32).into(),
+                    v8::String::new(scope, event_type)
+                        .unwrap_or_else(|| v8::String::empty(scope))
+                        .into(),
+                    v8::String::new(scope, data)
+                        .unwrap_or_else(|| v8::String::empty(scope))
+                        .into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
     }
 }

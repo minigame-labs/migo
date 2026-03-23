@@ -494,7 +494,11 @@ impl FrameCommandCollector {
     /// Drain all active canvas buffers in a single pass. Returns (canvas_id, commands) pairs.
     /// Uses get_mut() throughout (zero-cost RefCell access via &mut self).
     pub fn frame_end_all(&mut self) -> Vec<(u32, Vec<Canvas2DCmd>)> {
-        let mut results = Vec::new();
+        // Pre-allocate for the expected canvas count: 1 primary + extras.
+        // Avoids a per-frame Vec::new() allocation in the common single-canvas
+        // case (capacity=1 is a single pointer-sized alloc, no realloc needed).
+        let extra_count = self.extra.get_mut().len();
+        let mut results = Vec::with_capacity(1 + extra_count);
         if self.primary_active.get() {
             let canvas_id = self.primary_id.get();
             let buf = self.primary.get_mut();

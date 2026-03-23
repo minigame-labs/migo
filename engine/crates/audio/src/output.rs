@@ -16,13 +16,40 @@ const RING_BUFFER_FRAMES: usize = 8192;
 /// 2048 frames at 48kHz = ~42ms
 const LOW_WATERMARK_FRAMES: usize = 2048;
 
-/// Lightweight signaling for callback-driven audio
-/// Uses atomic flag instead of Condvar for lower overhead
+/// Lightweight signaling for callback-driven audio.
+/// Uses atomic flag instead of Condvar for lower overhead.
+///
+/// # Atomic ordering model
+///
+/// The two atomics serve different synchronization purposes and intentionally
+/// use different memory orderings:
+///
+/// - **`needs_data`** (`Release` on store, `AcqRel` on swap): This flag
+///   establishes a happens-before relationship between the audio callback
+///   (producer of the signal) and the audio thread (consumer).  When the
+///   callback stores `true` with `Release`, all preceding ring buffer reads
+///   (pop_slice, occupied_len) are visible to the audio thread after it
+///   observes `true` via the `AcqRel` swap in `check_and_clear`.  This
+///   ensures the audio thread sees the correct buffer state before refilling.
+///
+/// - **`buffer_level`** (`Relaxed`): This is a best-effort hint used for
+///   monitoring and the `needs_data()` heuristic on `AudioOutput`.  It does
+///   not guard any shared data -- the ring buffer itself is lock-free and
+///   the producer/consumer halves are on separate threads.  A slightly stale
+///   value is harmless (worst case: one extra or one missed refill cycle).
+///   Using `Relaxed` avoids unnecessary memory fences on the hot audio
+///   callback path.
+///
+/// - **`stream_error`** (`Release` on store, `Acquire` on load): The error
+///   callback stores `true` with `Release` to ensure the error state is
+///   visible to the audio thread checking `is_alive()` with `Acquire`.
 #[derive(Clone)]
 pub struct AudioSync {
-    /// Flag indicating buffer needs data
+    /// Flag indicating buffer needs data.
+    /// Ordering: Release (store in callback) / AcqRel (swap in audio thread).
     needs_data: Arc<AtomicBool>,
-    /// Current buffer fill level (in samples)
+    /// Current buffer fill level (in samples).
+    /// Ordering: Relaxed -- advisory hint only, not used for synchronization.
     buffer_level: Arc<AtomicUsize>,
 }
 

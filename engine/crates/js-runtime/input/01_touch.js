@@ -24,7 +24,12 @@ function addListener(type, fn) {
 
 function removeListener(type, fn) {
   const set = TOUCH_LISTENERS[type];
-  if (set) set.delete(fn);
+  if (!set) return;
+  if (typeof fn === 'function') {
+    set.delete(fn);
+  } else {
+    set.clear();
+  }
 }
 
 export const onTouchStart = (fn) => addListener('start', fn);

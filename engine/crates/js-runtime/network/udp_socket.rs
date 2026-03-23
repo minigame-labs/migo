@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 
 use deno_core::AsyncRefCell;
 use deno_core::CancelHandle;
@@ -23,8 +24,12 @@ use deno_core::ResourceId;
 use deno_core::op2;
 use deno_error::JsErrorBox;
 use serde::Serialize;
+use shared::op_state::HostOpState;
 use tokio::net::UdpSocket;
 use tracing::debug;
+
+/// Delay inserted before each poll iteration when the app is backgrounded.
+const BACKGROUND_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 // -- Resource --
 
@@ -308,16 +313,26 @@ pub async fn op_udp_next_event(
     state: Rc<RefCell<OpState>>,
     #[smi] rid: ResourceId,
 ) -> Result<UdpEvent, JsErrorBox> {
-    let resource = state
-        .borrow()
-        .resource_table
-        .get::<UdpSocketResource>(rid)
-        .map_err(|_| JsErrorBox::generic("UDPSocket not found"))?;
+    let (resource, backgrounded) = {
+        let st = state.borrow();
+        let res = st
+            .resource_table
+            .get::<UdpSocketResource>(rid)
+            .map_err(|_| JsErrorBox::generic("UDPSocket not found"))?;
+        let bg = st.borrow::<HostOpState>().backgrounded.clone();
+        (res, bg)
+    };
 
     let cancel = RcRef::map(&resource, |r| &r.cancel);
     let local_addr = resource.local_addr;
 
     let event = async {
+        // Throttle polling when the app is in the background to save
+        // CPU and battery.
+        if backgrounded.load(Ordering::Relaxed) {
+            tokio::time::sleep(BACKGROUND_THROTTLE).await;
+        }
+
         let socket = RcRef::map(&resource, |r| &r.socket).borrow().await;
 
         // 4096 bytes max per UDP message

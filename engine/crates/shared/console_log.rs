@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use parking_lot::RwLock;
 
 const DEFAULT_CAPACITY: usize = 500;
 
@@ -86,6 +88,25 @@ impl ConsoleLogBuffer {
     }
 }
 
+/// Global per-session console log storage.
+///
+/// # Lock ordering (must be followed to prevent deadlocks)
+///
+/// **Outer lock**: `parking_lot::RwLock` on the `HashMap<session_id, Arc<Mutex<Buffer>>>`.
+///   - Acquired briefly to look up or insert/remove a session's buffer.
+///   - Read-locked for lookups (`get_console_log`, `push_console_log`).
+///   - Write-locked only for session registration/unregistration.
+///
+/// **Inner lock**: `std::sync::Mutex` on individual `ConsoleLogBuffer`.
+///   - Acquired after the outer RwLock is released (the `Arc` clone is taken
+///     under the read lock, then the RwLock is dropped before locking the Mutex).
+///   - Protects per-session buffer reads and writes.
+///
+/// The two locks are never held simultaneously: callers always clone the
+/// `Arc<Mutex<..>>` while holding the outer RwLock, release the RwLock, and
+/// only then lock the inner Mutex.  This makes deadlocks impossible as long as
+/// this ordering is preserved.  Do NOT lock the inner Mutex while holding the
+/// outer RwLock.
 static CONSOLE_LOGS: OnceLock<RwLock<HashMap<i32, Arc<Mutex<ConsoleLogBuffer>>>>> = OnceLock::new();
 
 fn log_map() -> &'static RwLock<HashMap<i32, Arc<Mutex<ConsoleLogBuffer>>>> {
@@ -94,26 +115,16 @@ fn log_map() -> &'static RwLock<HashMap<i32, Arc<Mutex<ConsoleLogBuffer>>>> {
 
 pub fn register_console_log(id: i32) -> Arc<Mutex<ConsoleLogBuffer>> {
     let buf = Arc::new(Mutex::new(ConsoleLogBuffer::new(DEFAULT_CAPACITY)));
-    log_map()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id, buf.clone());
+    log_map().write().insert(id, buf.clone());
     buf
 }
 
 pub fn unregister_console_log(id: i32) {
-    log_map()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&id);
+    log_map().write().remove(&id);
 }
 
 pub fn get_console_log(id: i32) -> Option<Arc<Mutex<ConsoleLogBuffer>>> {
-    log_map()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&id)
-        .cloned()
+    log_map().read().get(&id).cloned()
 }
 
 /// Push a console log entry for the given session.

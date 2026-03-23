@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 
 use deno_core::AsyncRefCell;
 use deno_core::CancelHandle;
@@ -17,9 +18,13 @@ use futures::{SinkExt, StreamExt};
 use http::HeaderValue;
 use http::header::HeaderName;
 use serde::Serialize;
+use shared::op_state::HostOpState;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
+
+/// Delay inserted before each poll iteration when the app is backgrounded.
+const BACKGROUND_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -206,17 +211,28 @@ pub async fn op_ws_next_event(
     state: Rc<RefCell<OpState>>,
     #[smi] rid: ResourceId,
 ) -> Result<WsEvent, JsErrorBox> {
-    let resource = state
-        .borrow()
-        .resource_table
-        .get::<WebSocketResource>(rid)
-        .map_err(|_| JsErrorBox::generic("WebSocket not found"))?;
+    let (resource, backgrounded) = {
+        let st = state.borrow();
+        let res = st
+            .resource_table
+            .get::<WebSocketResource>(rid)
+            .map_err(|_| JsErrorBox::generic("WebSocket not found"))?;
+        let bg = st.borrow::<HostOpState>().backgrounded.clone();
+        (res, bg)
+    };
 
     let cancel = RcRef::map(&resource, |r| &r.cancel);
 
     let event = async {
         let mut rx = RcRef::map(&resource, |r| &r.rx).borrow_mut().await;
         loop {
+            // Throttle polling when the app is in the background to save
+            // CPU and battery.  The delay is inserted *before* the read so
+            // the socket stays connected but data delivery is deferred.
+            if backgrounded.load(Ordering::Relaxed) {
+                tokio::time::sleep(BACKGROUND_THROTTLE).await;
+            }
+
             match rx.next().await {
                 Some(Ok(Message::Text(text))) => {
                     return Ok::<WsEvent, JsErrorBox>(WsEvent::Message {

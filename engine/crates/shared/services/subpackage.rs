@@ -1,3 +1,5 @@
+use crate::protocol::error::ServiceError;
+
 /// Subpackage download service.
 ///
 /// Handles downloading subpackages from the host app's CDN.
@@ -20,7 +22,7 @@ pub trait SubpackageService: Send + Sync {
     ///
     /// Called by both `loadSubpackage` and `preDownloadSubpackage`.
     /// The JS layer handles code execution after download completes.
-    fn download_subpackage(&self, _options_json: &str) -> Result<(), String> {
-        Err("loadSubpackage:fail not supported".to_string())
+    fn download_subpackage(&self, _options_json: &str) -> Result<(), ServiceError> {
+        Err(ServiceError::not_supported("loadSubpackage:fail not supported"))
     }
 }

@@ -476,20 +476,22 @@ function getShowSplashAdStatus(obj = {}) {
     code: 1,
     errMsg: "getShowSplashAdStatus:ok",
   };
-  try {
-    if (typeof obj.success === "function") {
-      obj.success(res);
+  queueMicrotask(() => {
+    try {
+      if (typeof obj.success === "function") {
+        obj.success(res);
+      }
+    } catch (e) {
+      console.error("getShowSplashAdStatus success callback error:", e);
     }
-  } catch (e) {
-    console.error("getShowSplashAdStatus success callback error:", e);
-  }
-  try {
-    if (typeof obj.complete === "function") {
-      obj.complete(res);
+    try {
+      if (typeof obj.complete === "function") {
+        obj.complete(res);
+      }
+    } catch (e) {
+      console.error("getShowSplashAdStatus complete callback error:", e);
     }
-  } catch (e) {
-    console.error("getShowSplashAdStatus complete callback error:", e);
-  }
+  });
 }
 
 // ==================== GameBanner (createGameBanner) ====================

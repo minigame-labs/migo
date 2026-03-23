@@ -17,6 +17,7 @@ use crate::{
 
 pub mod audio_cmd;
 pub mod color;
+pub mod error;
 pub mod host_cmd;
 pub mod io_cmd;
 pub mod render_cmd;

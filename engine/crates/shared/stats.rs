@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
 
 /// Runtime debug statistics collected by the render thread.
 ///
@@ -46,26 +48,16 @@ fn stats_map() -> &'static RwLock<HashMap<i32, Arc<DebugStats>>> {
 /// Register a new DebugStats for the given host_id. Returns the shared handle.
 pub fn register_stats(id: i32) -> Arc<DebugStats> {
     let stats = Arc::new(DebugStats::default());
-    stats_map()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id, stats.clone());
+    stats_map().write().insert(id, stats.clone());
     stats
 }
 
 /// Unregister stats for a host_id (cleanup on shutdown).
 pub fn unregister_stats(id: i32) {
-    stats_map()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&id);
+    stats_map().write().remove(&id);
 }
 
 /// Get the DebugStats for a host_id (used by JNI polling).
 pub fn get_stats(id: i32) -> Option<Arc<DebugStats>> {
-    stats_map()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&id)
-        .cloned()
+    stats_map().read().get(&id).cloned()
 }

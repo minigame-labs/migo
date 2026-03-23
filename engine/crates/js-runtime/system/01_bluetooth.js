@@ -78,6 +78,8 @@ function getBluetoothAdapterState(options = {}) {
 
 // ==================== Device Discovery APIs ====================
 
+var _discoveryTimer = null;
+
 function startBluetoothDevicesDiscovery(options = {}) {
     const { services, allowDuplicatesKey = false, interval = 0, powerLevel = 'medium' } = options;
     return wrapAsync('startBluetoothDevicesDiscovery', function () {
@@ -87,11 +89,23 @@ function startBluetoothDevicesDiscovery(options = {}) {
             interval,
             powerLevel,
         }));
+        // Auto-stop scanning after 30 seconds to prevent battery drain.
+        if (_discoveryTimer !== null) {
+            clearTimeout(_discoveryTimer);
+        }
+        _discoveryTimer = setTimeout(function () {
+            _discoveryTimer = null;
+            try { op_stop_bluetooth_devices_discovery(); } catch (_) {}
+        }, 30000);
     }, options);
 }
 
 function stopBluetoothDevicesDiscovery(options = {}) {
     return wrapAsync('stopBluetoothDevicesDiscovery', function () {
+        if (_discoveryTimer !== null) {
+            clearTimeout(_discoveryTimer);
+            _discoveryTimer = null;
+        }
         op_stop_bluetooth_devices_discovery();
     }, options);
 }

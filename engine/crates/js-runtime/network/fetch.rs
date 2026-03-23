@@ -48,9 +48,12 @@ use reqwest::Method;
 use reqwest::Response;
 use reqwest::redirect::Policy;
 use serde::Serialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::network::Options;
+
+/// Flag to emit a one-time warning when the domain whitelist is empty (allow-all).
+static EMPTY_WHITELIST_WARNED: std::sync::Once = std::sync::Once::new();
 
 // ---------------------------------------------------------------------------
 // SSRF-preventing DNS resolver
@@ -90,6 +93,12 @@ fn check_domain_whitelist(url: &Url, state: &OpState) -> Result<(), JsErrorBox> 
     let host = state.borrow::<shared::op_state::HostOpState>();
     let wl = &host.network_policy.domain_whitelist;
     if wl.is_empty() {
+        EMPTY_WHITELIST_WARNED.call_once(|| {
+            warn!(
+                "network_policy.domain_whitelist is empty — all domains are permitted. \
+                 Populate the whitelist with allowed server domains to restrict outbound access."
+            );
+        });
         return Ok(());
     }
     if let Some(url_host) = url.host_str() {

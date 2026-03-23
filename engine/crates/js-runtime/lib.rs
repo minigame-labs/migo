@@ -88,28 +88,53 @@
 
 use shared::op_state::HostOpState;
 
-mod ad;
-mod audio;
+// CORE modules (always compiled)
 mod base;
 mod console;
-mod device;
 mod env;
 mod event;
 mod file;
 mod input;
 mod lifecycle;
-mod media;
 mod network;
-mod payment;
 mod rendering;
-mod share;
 mod storage;
-mod system;
-mod ui;
-mod update;
 mod url;
 mod utility;
 mod web;
+
+// OPTIONAL modules (feature-gated)
+//
+// Each `api-*` feature controls whether the corresponding extension module
+// is compiled and included in the extension chain.  When a feature is
+// disabled the module (Rust ops + JS ESM files + global scope registration)
+// is excluded entirely, reducing binary size.
+//
+// Mapping:
+//   api-sensors      -> device   (sensors, battery, clipboard, vibration, screen, network, location, scan)
+//   api-media        -> media    (camera, image_api, video) + audio (WebAudio, InnerAudio, Recorder)
+//   api-connectivity -> system   (bluetooth, auth, system info, login, settings, navigate, game_log, etc.)
+//   api-commerce     -> share    (share menu) + payment (Midas payment)
+//   api-system       -> ui       (Toast/Modal/Loading) + update + ad + worker
+#[cfg(feature = "api-sensors")]
+mod device;
+#[cfg(feature = "api-media")]
+mod media;
+#[cfg(feature = "api-media")]
+mod audio;
+#[cfg(feature = "api-connectivity")]
+mod system;
+#[cfg(feature = "api-commerce")]
+mod share;
+#[cfg(feature = "api-commerce")]
+mod payment;
+#[cfg(feature = "api-system")]
+mod ui;
+#[cfg(feature = "api-system")]
+mod update;
+#[cfg(feature = "api-system")]
+mod ad;
+#[cfg(feature = "api-system")]
 pub(crate) mod worker;
 
 mod host_runtime;
@@ -160,45 +185,103 @@ deno_core::extension!(
 ///
 /// # Extension Order
 ///
-/// Extensions are chained in dependency order:
-/// 1. `base` - Core ops (must be first)
-/// 2. `console` - Depends on base
-/// 3. `utility` - Encoding utilities
-/// 4. `input` - Touch handling
-/// 5. `file` - File system
-/// 6. `rendering` - Canvas/WebGL
-/// 7. `web` - Timers, performance
-/// 8. `url` - URL parsing
-/// 9. `network` - Fetch API
-/// 10. `audio` - WebAudio/InnerAudio
-/// 11. `runtime` - Entry point script
+/// Extensions are chained in dependency order. All are currently loaded
+/// eagerly at runtime startup. The CORE / OPTIONAL annotations below
+/// indicate which extensions are required for every game vs. which could
+/// potentially be deferred or lazy-loaded in a future optimization pass.
+///
+/// CORE = required for basic game execution (JS env, rendering, input, timers).
+/// OPTIONAL = feature-specific; many games never use these APIs.
+///
+/// ```text
+///  #  Extension       Tag       Reason
+///  1  base            CORE      ops, async utils, subpackage loader
+///  2  console         CORE      console.log / warn / error
+///  3  event           CORE      EventTarget / EventEmitter
+///  4  utility         CORE      TextEncoder / TextDecoder
+///  5  device          OPTIONAL  sensors, battery, clipboard, vibration, screen, network, location, scan
+///  6  ui              OPTIONAL  Toast / Modal / Loading / ActionSheet / UserInfoButton
+///  7  system          OPTIONAL  bluetooth, auth, window/system/device info, login, settings, navigate
+///  8  env             CORE      environment variables
+///  9  lifecycle       CORE      onShow / onHide, restart / exit
+/// 10  update          OPTIONAL  update manager
+/// 11  storage         CORE      setStorage / getStorage (most games use local storage)
+/// 12  input           CORE      touch events, keyboard events
+/// 13  file            CORE      file system manager
+/// 14  rendering       CORE      Canvas / WebGL / Image / RAF / Font
+/// 15  web             CORE      setTimeout / setInterval / Performance / Location
+/// 16  url             CORE      URL / URLSearchParams
+/// 17  network         CORE      fetch / WebSocket / upload / download / TCP / UDP
+/// 18  media           OPTIONAL  Camera / ImageAPI
+/// 19  audio           OPTIONAL  WebAudio / InnerAudio / MediaAudioPlayer / RecorderManager
+/// 20  worker          OPTIONAL  Worker threads
+/// 21  share           OPTIONAL  share menu / shareAppMessage
+/// 22  payment         OPTIONAL  Midas payment
+/// 23  ad              OPTIONAL  BannerAd / RewardedVideoAd / InterstitialAd / etc.
+/// 24  runtime         CORE      global scope registration (98_global_scope_*.js + 99_main.js)
+/// ```
 pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
-    let runtime_extensions = vec![runtime::init()];
+    // Build extension list using a Vec so optional extensions can be
+    // conditionally appended based on feature flags.
+    let mut exts: Vec<deno_core::Extension> = Vec::new();
 
-    base::base_extensions(host)
-        .into_iter()
-        .chain(console::console_extensions())
-        .chain(event::event_extensions())
-        .chain(utility::utility_extensions())
-        .chain(device::device_extensions())
-        .chain(ui::ui_extensions())
-        .chain(system::system_extensions())
-        .chain(env::env_extensions())
-        .chain(lifecycle::lifecycle_extensions())
-        .chain(update::update_extensions())
-        .chain(storage::storage_extensions())
-        .chain(input::touch_extensions())
-        .chain(file::file_extensions())
-        .chain(rendering::rendering_extensions())
-        .chain(web::web_extensions())
-        .chain(url::url_extensions())
-        .chain(network::network_extensions())
-        .chain(media::media_extensions())
-        .chain(audio::audio_extensions())
-        .chain(worker::worker_extensions())
-        .chain(share::share_extensions())
-        .chain(payment::payment_extensions())
-        .chain(ad::ad_extensions())
-        .chain(runtime_extensions)
-        .collect()
+    // ---- CORE extensions (always loaded) ----
+    exts.extend(base::base_extensions(host));       // ops, async utils, subpackage loader
+    exts.extend(console::console_extensions());     // console.log / warn / error
+    exts.extend(event::event_extensions());         // EventTarget / EventEmitter
+    exts.extend(utility::utility_extensions());     // TextEncoder / TextDecoder
+
+    // ---- OPTIONAL: api-sensors ----
+    #[cfg(feature = "api-sensors")]
+    exts.extend(device::device_extensions());       // sensors, battery, clipboard, vibration, screen, network, location, scan
+
+    // ---- OPTIONAL: api-system ----
+    #[cfg(feature = "api-system")]
+    exts.extend(ui::ui_extensions());               // Toast / Modal / Loading / ActionSheet / UserInfoButton
+
+    // ---- OPTIONAL: api-connectivity ----
+    #[cfg(feature = "api-connectivity")]
+    exts.extend(system::system_extensions());       // bluetooth, auth, system info, login, settings, navigate
+
+    // ---- CORE (continued) ----
+    exts.extend(env::env_extensions());             // environment variables
+    exts.extend(lifecycle::lifecycle_extensions());  // onShow / onHide, restart / exit
+
+    // ---- OPTIONAL: api-system (continued) ----
+    #[cfg(feature = "api-system")]
+    exts.extend(update::update_extensions());       // update manager
+
+    // ---- CORE (continued) ----
+    exts.extend(storage::storage_extensions());     // setStorage / getStorage
+    exts.extend(input::touch_extensions());         // touch events, keyboard events
+    exts.extend(file::file_extensions());           // file system manager
+    exts.extend(rendering::rendering_extensions()); // Canvas / WebGL / Image / RAF / Font
+    exts.extend(web::web_extensions());             // setTimeout / setInterval / Performance
+    exts.extend(url::url_extensions());             // URL / URLSearchParams
+    exts.extend(network::network_extensions());     // fetch / WebSocket / upload / download / TCP / UDP
+
+    // ---- OPTIONAL: api-media ----
+    #[cfg(feature = "api-media")]
+    exts.extend(media::media_extensions());         // Camera / ImageAPI / Video
+    #[cfg(feature = "api-media")]
+    exts.extend(audio::audio_extensions());         // WebAudio / InnerAudio / Recorder
+
+    // ---- OPTIONAL: api-system (continued) ----
+    #[cfg(feature = "api-system")]
+    exts.extend(worker::worker_extensions());       // Worker threads
+
+    // ---- OPTIONAL: api-commerce ----
+    #[cfg(feature = "api-commerce")]
+    exts.extend(share::share_extensions());         // share menu / shareAppMessage
+    #[cfg(feature = "api-commerce")]
+    exts.extend(payment::payment_extensions());     // Midas payment
+
+    // ---- OPTIONAL: api-system (continued) ----
+    #[cfg(feature = "api-system")]
+    exts.extend(ad::ad_extensions());               // BannerAd / RewardedVideoAd / InterstitialAd / etc.
+
+    // ---- CORE: runtime (must be last) ----
+    exts.push(runtime::init());                     // global scope registration (98_global_scope_*.js + 99_main.js)
+
+    exts
 }

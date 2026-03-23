@@ -53,6 +53,9 @@ pub mod stats;
 pub mod surface;
 pub mod vfs;
 
+#[cfg(test)]
+pub mod test_support;
+
 /// Frequently used re-exports for convenient imports.
 ///
 /// # Example

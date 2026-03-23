@@ -1,5 +1,7 @@
 //! Game log reporting service.
 
+use crate::protocol::error::ServiceError;
+
 /// Game log reporting service for analytics.
 ///
 /// Receives merged log entries from JS and forwards them to the platform.
@@ -14,7 +16,7 @@ pub trait GameLogService: Send + Sync {
     /// - `key`: log tag/category string (default "default")
     /// - `value`: log content (any JSON-serializable value)
     /// - `commonInfo`: global info object at the time of reporting
-    fn report_log(&self, _log_json: &str) -> Result<(), String> {
-        Err("gameLog.log:fail not supported".to_string())
+    fn report_log(&self, _log_json: &str) -> Result<(), ServiceError> {
+        Err(ServiceError::not_supported("gameLog.log:fail not supported"))
     }
 }

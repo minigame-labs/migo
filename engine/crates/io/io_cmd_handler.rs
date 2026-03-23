@@ -22,7 +22,12 @@ use crate::{fast_image_decoder, image_cache};
 
 pub struct IoCmdHandler {
     next_id: FileId,
+    free_ids: Vec<FileId>,
     files: HashMap<FileId, fs::File>,
+    /// Cached total byte size per storage directory, avoiding O(n) re-scan
+    /// on every `StorageSet`.  Populated lazily on first write, then
+    /// maintained incrementally by Set / Remove / Clear operations.
+    storage_totals: HashMap<PathBuf, usize>,
 }
 
 impl IoCmdHandler {
@@ -30,15 +35,23 @@ impl IoCmdHandler {
     /// Most games use a small number of concurrent file handles.
     const INITIAL_FILE_CAPACITY: usize = 8;
 
+    /// Maximum number of concurrent image decode tasks for PreloadImages.
+    const MAX_CONCURRENT_IMAGE_DECODES: usize = 8;
+
     pub fn new() -> Self {
         Self {
             next_id: 3, // 0,1,2 reserved for stdio
+            free_ids: Vec::new(),
             files: HashMap::with_capacity(Self::INITIAL_FILE_CAPACITY),
+            storage_totals: HashMap::new(),
         }
     }
 
     #[inline]
     fn alloc_id(&mut self) -> Result<FileId, EngineError> {
+        if let Some(id) = self.free_ids.pop() {
+            return Ok(id);
+        }
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -66,6 +79,8 @@ impl IoCmdHandler {
 
     pub fn close_all(&mut self) {
         self.files.clear();
+        self.free_ids.clear();
+        self.storage_totals.clear();
     }
 
     pub async fn handle_cmd(&mut self, cmd: IOCmd) {
@@ -112,7 +127,9 @@ impl IoCmdHandler {
                 let r = self
                     .files
                     .remove(&rid)
-                    .map(|_| ())
+                    .map(|_| {
+                        self.free_ids.push(rid);
+                    })
                     .ok_or_else(|| Self::code_err(ErrorCode::BadFileDescriptor));
                 Self::send_resp(resp, r);
             }
@@ -397,6 +414,7 @@ impl IoCmdHandler {
 
             // --- Heavy ops: spawned concurrently so the IO loop is not blocked ---
 
+            #[cfg(feature = "compress-brotli")]
             IOCmd::ReadCompressedFile { path, resp } => {
                 tokio::spawn(async move {
                     let r: Result<Vec<u8>, EngineError> = async {
@@ -424,6 +442,12 @@ impl IoCmdHandler {
                     .await;
                     resp.send(r);
                 });
+            }
+
+            #[cfg(not(feature = "compress-brotli"))]
+            IOCmd::ReadCompressedFile { resp, .. } => {
+                resp.send(Err(EngineError::new(ErrorCode::IoError)
+                    .with_detail("brotli decompression not available (compress-brotli feature disabled)")));
             }
 
             #[cfg(feature = "zip-extract")]
@@ -521,55 +545,75 @@ impl IoCmdHandler {
             IOCmd::PreloadImages { paths, resp } => {
                 tokio::spawn(async move {
                     let start = Instant::now();
-                    debug!("PreloadImages: {} images", paths.len());
+                    let total = paths.len();
+                    debug!("PreloadImages: {} images", total);
 
-                    let handles: Vec<_> = paths
+                    // Separate cache hits from misses to avoid wasting
+                    // semaphore permits and blocking threads on lookups.
+                    let mut results = Vec::with_capacity(total);
+                    let mut decode_paths = Vec::new();
+                    {
+                        let mut cache = image_cache::global_cache();
+                        for path in paths {
+                            if let Some(cached) = cache.get(&path) {
+                                results.push((
+                                    path,
+                                    Ok((cached.image.width, cached.image.height)),
+                                ));
+                            } else {
+                                decode_paths.push(path);
+                            }
+                        }
+                    }
+
+                    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+                        IoCmdHandler::MAX_CONCURRENT_IMAGE_DECODES,
+                    ));
+
+                    let handles: Vec<_> = decode_paths
                         .into_iter()
                         .map(|path| {
-                            let path_clone = path.clone();
-                            tokio::task::spawn_blocking(move || {
-                                if let Some(cached) =
-                                    image_cache::global_cache().get(&path_clone)
-                                {
-                                    return (
-                                        path_clone,
-                                        Ok((cached.image.width, cached.image.height)),
-                                    );
-                                }
-                                match std::fs::read(&path_clone) {
-                                    Ok(data) => {
-                                        match fast_image_decoder::decode_image_fast(
-                                            &data,
-                                            Some(&path_clone),
-                                        ) {
-                                            Ok(img) => {
-                                                let dims = (img.width, img.height);
-                                                image_cache::global_cache()
-                                                    .insert(path_clone.clone(), img);
-                                                (path_clone, Ok(dims))
+                            let sem = semaphore.clone();
+                            tokio::spawn(async move {
+                                // safe: semaphore is never closed
+                                let _permit = sem.acquire().await.unwrap();
+                                tokio::task::spawn_blocking(move || {
+                                    match std::fs::read(&path) {
+                                        Ok(data) => {
+                                            match fast_image_decoder::decode_image_fast(
+                                                &data,
+                                                Some(&path),
+                                            ) {
+                                                Ok(img) => {
+                                                    let dims = (img.width, img.height);
+                                                    image_cache::global_cache()
+                                                        .insert(path.clone(), img);
+                                                    (path, Ok(dims))
+                                                }
+                                                Err(e) => (path, Err(format!("{:?}", e))),
                                             }
-                                            Err(e) => (path_clone, Err(format!("{:?}", e))),
                                         }
+                                        Err(e) => (path, Err(format!("read error: {}", e))),
                                     }
-                                    Err(e) => (path_clone, Err(format!("read error: {}", e))),
-                                }
+                                })
+                                .await
                             })
                         })
                         .collect();
 
-                    let mut results = Vec::with_capacity(handles.len());
                     for handle in handles {
                         match handle.await {
-                            Ok(result) => results.push(result),
-                            Err(e) => {
-                                warn!("PreloadImages task join error: {}", e);
+                            Ok(Ok(result)) => results.push(result),
+                            Ok(Err(e)) | Err(e) => {
+                                warn!("PreloadImages task error: {}", e);
                             }
                         }
                     }
 
                     debug!(
-                        "PreloadImages completed: {} images in {:.2?}",
+                        "PreloadImages completed: {}/{} images in {:.2?}",
                         results.len(),
+                        total,
                         start.elapsed()
                     );
                     resp.send(Ok(results));
@@ -683,23 +727,35 @@ impl IoCmdHandler {
                         .map(|m| m.len() as usize)
                         .unwrap_or(0);
 
-                    // Sum current total.
-                    let mut total: usize = 0;
-                    let mut rd = fs::read_dir(&dir).await.map_err(Self::io_err)?;
-                    while let Some(entry) = rd.next_entry().await.map_err(Self::io_err)? {
-                        total += entry
-                            .metadata()
-                            .await
-                            .map(|m| m.len() as usize)
-                            .unwrap_or(0);
-                    }
+                    // Use cached total if available, otherwise do a full scan
+                    // and cache the result for subsequent writes.
+                    let dir_key = PathBuf::from(&dir);
+                    let total = match self.storage_totals.get(&dir_key) {
+                        Some(&cached) => cached,
+                        None => {
+                            let mut sum: usize = 0;
+                            let mut rd = fs::read_dir(&dir).await.map_err(Self::io_err)?;
+                            while let Some(entry) = rd.next_entry().await.map_err(Self::io_err)? {
+                                sum += entry
+                                    .metadata()
+                                    .await
+                                    .map(|m| m.len() as usize)
+                                    .unwrap_or(0);
+                            }
+                            self.storage_totals.insert(dir_key.clone(), sum);
+                            sum
+                        }
+                    };
 
-                    if total - existing_size + data.len() > max_total {
+                    if total.saturating_sub(existing_size) + data.len() > max_total {
                         return Err(EngineError::new(ErrorCode::IoError)
                             .with_detail("setStorage:fail storage limit exceeded"));
                     }
 
                     fs::write(&path, &data).await.map_err(Self::io_err)?;
+
+                    let new_total = total.saturating_sub(existing_size) + data.len();
+                    self.storage_totals.insert(dir_key, new_total);
                     Ok(())
                 })
                 .await;
@@ -707,8 +763,30 @@ impl IoCmdHandler {
             }
 
             IOCmd::StorageRemove { path, resp } => {
+                // Only query file size when the cache is populated for this
+                // directory — avoids an extra syscall when it would be wasted.
+                let parent_key = PathBuf::from(&path);
+                let parent_key = parent_key.parent().map(|p| p.to_path_buf());
+                let need_size = parent_key
+                    .as_ref()
+                    .is_some_and(|k| self.storage_totals.contains_key(k));
+                let removed_size = if need_size {
+                    fs::metadata(&path)
+                        .await
+                        .map(|m| m.len() as usize)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 let r = match fs::remove_file(&path).await {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        if let (Some(key), true) = (parent_key, removed_size > 0) {
+                            if let Some(total) = self.storage_totals.get_mut(&key) {
+                                *total = total.saturating_sub(removed_size);
+                            }
+                        }
+                        Ok(())
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     Err(e) => Err(Self::io_err(e)),
                 };
@@ -726,6 +804,7 @@ impl IoCmdHandler {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(Self::io_err(e)),
                     }
+                    self.storage_totals.insert(PathBuf::from(&dir), 0);
                     Ok(())
                 })
                 .await;

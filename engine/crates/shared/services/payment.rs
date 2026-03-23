@@ -1,11 +1,13 @@
 //! Payment service traits for Midas payment operations.
 
+use crate::protocol::error::ServiceError;
+
 /// Payment service for in-app purchases.
 pub trait PaymentService: Send + Sync {
     /// Check if the current environment supports Midas payment (Mode B, sync).
     ///
     /// Returns JSON: `{"data":{"allow_pay":true/false}}`
-    fn check_is_support_midas_payment(&self, _options_json: &str) -> Result<String, String> {
+    fn check_is_support_midas_payment(&self, _options_json: &str) -> Result<String, ServiceError> {
         Ok(r#"{"data":{"allow_pay":false}}"#.to_string())
     }
 
@@ -22,8 +24,8 @@ pub trait PaymentService: Send + Sync {
     /// - `outTradeNo`: string
     ///
     /// Result delivered via `onMidasPaymentResult` callback.
-    fn request_midas_payment(&self, _options_json: &str) -> Result<(), String> {
-        Err("requestMidasPayment:fail not supported".to_string())
+    fn request_midas_payment(&self, _options_json: &str) -> Result<(), ServiceError> {
+        Err(ServiceError::not_supported("requestMidasPayment:fail not supported"))
     }
 
     /// Trigger Midas payment for game items (Mode C, async).
@@ -34,7 +36,7 @@ pub trait PaymentService: Send + Sync {
     /// - `signature`: string
     ///
     /// Result delivered via `onMidasPaymentGameItemResult` callback.
-    fn request_midas_payment_game_item(&self, _options_json: &str) -> Result<(), String> {
-        Err("requestMidasPaymentGameItem:fail not supported".to_string())
+    fn request_midas_payment_game_item(&self, _options_json: &str) -> Result<(), ServiceError> {
+        Err(ServiceError::not_supported("requestMidasPaymentGameItem:fail not supported"))
     }
 }

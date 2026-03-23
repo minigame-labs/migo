@@ -684,6 +684,7 @@ deno_core::extension!(
         "17_analytics.js",
         "18_crypto.js",
         "19_log_manager.js",
+        "99_global_scope.js",
     ]
 );
 

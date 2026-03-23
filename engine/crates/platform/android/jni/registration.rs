@@ -17,7 +17,7 @@ use crate::android::jni::{
     onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSettingResult,
     onOpenSystemBluetoothSetting, onRecorderEvent, onRecorderFrameData, onRestart,
     onScanCodeResult, onShareAppMessageResult, onShow, onSubpackageProgress, onSubpackageResult,
-    onTouch, onUserCaptureScreen, onVsync, shutdown, updateSurface, version,
+    onTouch, onUserCaptureScreen, onVideoEvent, onVsync, shutdown, updateSurface, version,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -331,6 +331,12 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 sig: "(ILjava/lang/String;)V".into(),
                 fn_ptr: onMidasPaymentGameItemResult as *mut c_void,
             },
+            // Video callback
+            NativeMethod {
+                name: "onVideoEvent".into(),
+                sig: "(IILjava/lang/String;Ljava/lang/String;)V".into(),
+                fn_ptr: onVideoEvent as *mut c_void,
+            },
         ],
     )
     .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
@@ -501,6 +507,16 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("checkIsSupportMidasPayment", "(ILjava/lang/String;)Ljava/lang/String;"),
         ("requestMidasPayment", "(ILjava/lang/String;)V"),
         ("requestMidasPaymentGameItem", "(ILjava/lang/String;)V"),
+        // Video
+        ("videoCreate", "(ILjava/lang/String;)Ljava/lang/String;"),
+        ("videoPlay", "(ILjava/lang/String;)V"),
+        ("videoPause", "(ILjava/lang/String;)V"),
+        ("videoStop", "(ILjava/lang/String;)V"),
+        ("videoSeek", "(ILjava/lang/String;)V"),
+        ("videoRequestFullscreen", "(ILjava/lang/String;)V"),
+        ("videoExitFullscreen", "(ILjava/lang/String;)V"),
+        ("videoSetProperty", "(ILjava/lang/String;)V"),
+        ("videoDestroy", "(ILjava/lang/String;)V"),
         // Lifecycle callback
         ("onGameReady", "(I)V"),
         // Error notification callback

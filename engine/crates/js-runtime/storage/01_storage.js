@@ -71,6 +71,8 @@ function clearStorageSync() {
     op_storage_clear();
 }
 
+// Returns { keys: string[], currentSize: number, limitSize: number }.
+// The op returns a JSON string with this exact shape, so no remapping is needed.
 function getStorageInfoSync() {
     return JSON.parse(op_storage_info());
 }

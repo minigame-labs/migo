@@ -1471,3 +1471,41 @@ pub fn request_midas_payment(host_id: i32, options_json: &str) -> Result<(), Str
 pub fn request_midas_payment_game_item(host_id: i32, options_json: &str) -> Result<(), String> {
     call_void_with_string("requestMidasPaymentGameItem", host_id, options_json)
 }
+
+// ==================== Video ====================
+
+pub fn video_create(host_id: i32, options_json: &str) -> Result<String, String> {
+    call_json_method("videoCreate", host_id, options_json)
+}
+
+pub fn video_play(host_id: i32, video_id: u32) -> Result<(), String> {
+    call_void_with_string("videoPlay", host_id, &video_id.to_string())
+}
+
+pub fn video_pause(host_id: i32, video_id: u32) -> Result<(), String> {
+    call_void_with_string("videoPause", host_id, &video_id.to_string())
+}
+
+pub fn video_stop(host_id: i32, video_id: u32) -> Result<(), String> {
+    call_void_with_string("videoStop", host_id, &video_id.to_string())
+}
+
+pub fn video_seek(host_id: i32, video_id: u32, position: f64) -> Result<(), String> {
+    call_void_with_string("videoSeek", host_id, &format!("{{\"videoId\":{},\"position\":{}}}", video_id, position))
+}
+
+pub fn video_request_fullscreen(host_id: i32, video_id: u32, direction: i32) -> Result<(), String> {
+    call_void_with_string("videoRequestFullscreen", host_id, &format!("{{\"videoId\":{},\"direction\":{}}}", video_id, direction))
+}
+
+pub fn video_exit_fullscreen(host_id: i32, video_id: u32) -> Result<(), String> {
+    call_void_with_string("videoExitFullscreen", host_id, &video_id.to_string())
+}
+
+pub fn video_set_property(host_id: i32, video_id: u32, property_json: &str) -> Result<(), String> {
+    call_void_with_string("videoSetProperty", host_id, &format!("{{\"videoId\":{},\"properties\":{}}}", video_id, property_json))
+}
+
+pub fn video_destroy(host_id: i32, video_id: u32) -> Result<(), String> {
+    call_void_with_string("videoDestroy", host_id, &video_id.to_string())
+}

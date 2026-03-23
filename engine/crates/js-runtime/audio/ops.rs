@@ -49,6 +49,13 @@ impl From<EngineError> for AudioError {
     }
 }
 
+impl From<shared::protocol::error::ServiceError> for AudioError {
+    #[inline]
+    fn from(e: shared::protocol::error::ServiceError) -> Self {
+        AudioError::Message(e.message)
+    }
+}
+
 #[inline]
 fn audio_err(msg: impl Into<String>) -> AudioError {
     AudioError::Message(msg.into())

@@ -1,4 +1,11 @@
-use std::{rc::Rc, sync::Arc, time::Instant};
+use std::{
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 use deno_core::serde_json::Value;
 use deno_core::{FsModuleLoader, ModuleLoader};
@@ -92,6 +99,10 @@ pub(crate) struct Host {
     last_game_id: Option<String>,
     last_entry: Option<String>,
 
+    /// Shared flag: `true` while the app is backgrounded (OnHide).
+    /// Network polling ops check this to throttle CPU usage.
+    backgrounded: Arc<AtomicBool>,
+
     /// Watchdog handle for JS execution timeout detection.
     /// Present only when `v8-limits` feature is enabled.
     #[cfg(feature = "v8-limits")]
@@ -136,7 +147,7 @@ impl Host {
         let raf_rx: RafRx = Arc::new(tokio::sync::Mutex::new(raf_rx_raw));
 
         // ---- VSync channel (Choreographer JNI → render thread) ----
-        let (vsync_tx, vsync_rx) = crossbeam_channel::bounded::<f64>(1);
+        let (vsync_tx, vsync_rx) = crossbeam_channel::bounded::<f64>(2);
         vsync::register_vsync_sender(id, vsync_tx);
 
         // ---- Services ----
@@ -174,6 +185,8 @@ impl Host {
             policy
         };
 
+        let backgrounded = Arc::new(AtomicBool::new(false));
+
         let host_state = HostOpState {
             id,
             code_dir: None,
@@ -188,6 +201,7 @@ impl Host {
             device_services,
             raf_rx: Some(raf_rx.clone()),
             network_policy: network_policy.clone(),
+            backgrounded: backgrounded.clone(),
         };
 
         // ---- Console log buffer (debug only) ----
@@ -269,6 +283,7 @@ impl Host {
             network_policy,
             last_game_id: None,
             last_entry: None,
+            backgrounded,
             #[cfg(feature = "v8-limits")]
             watchdog,
         })
@@ -290,6 +305,9 @@ impl Host {
             HostCommand::Restart => self.on_restart().await,
 
             HostCommand::OnShow { options_json } => {
+                // Mark foreground so network polling ops resume normal rate.
+                self.backgrounded.store(false, Ordering::Relaxed);
+
                 // Resume audio thread before notifying JS so the game can
                 // immediately start playing audio in its onShow callback.
                 //
@@ -306,7 +324,16 @@ impl Host {
                     } else {
                         match deno_core::serde_json::from_str::<Value>(options_json) {
                             Ok(value) if value.is_object() => {
-                                format!("_internalTriggerOnShow({value})")
+                                // Serialize back through serde_json::to_string and pass
+                                // via JSON.parse() with proper JS string escaping.
+                                // Using Display on serde_json::Value is *mostly* JS-safe,
+                                // but edge cases exist (U+2028/U+2029 are valid JSON but
+                                // act as line terminators in JS source). Going through
+                                // JSON.parse(escaped_string) is universally safe.
+                                let json_str = deno_core::serde_json::to_string(&value)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                let escaped = escape_for_js_string(&json_str);
+                                format!("_internalTriggerOnShow(JSON.parse('{}'))", escaped)
                             }
                             Ok(_) => "_internalTriggerOnShow()".to_string(),
                             Err(e) => {
@@ -326,6 +353,9 @@ impl Host {
             }
 
             HostCommand::OnHide => {
+                // Mark backgrounded so network polling ops throttle their rate.
+                self.backgrounded.store(true, Ordering::Relaxed);
+
                 // Pause render and audio threads to save resources while backgrounded.
                 // The render thread stops its RAF ticker (no more frames).
                 // The audio thread stops processing (no audio output).
@@ -549,6 +579,16 @@ impl Host {
                 .js
                 .exec_script("user_capture_screen", "_internalTriggerUserCaptureScreen()"),
 
+            HostCommand::OnVideoStateChange {
+                video_id,
+                event_type,
+                data,
+            } => {
+                self.js
+                    .dispatch_video_event(video_id, &event_type, &data);
+                Ok(())
+            }
+
             other => {
                 tracing::warn!("[Host {}] unhandled HostCommand: {:?}", self.id, other);
                 Ok(())
@@ -570,6 +610,13 @@ impl Host {
             self.id, game_id, entry, eval_ms,
         );
 
+        // TIMING NOTE: notify_game_ready fires here, after JS module evaluation
+        // completes but BEFORE the first frame is rendered. The render thread has
+        // not yet received a RAF tick or called swap_buffers at this point.
+        // Perceived startup time (what the user sees) is typically 16-50ms longer
+        // than the value reported by game_ready, because it takes at least one
+        // vsync interval for the render thread to produce and present the first
+        // frame. See DebugStats.first_frame_ms for the render-side measurement.
         self.platform.notify_game_ready(self.id);
 
         // NOTE: Do NOT call run_event_loop() here. The op-based RAF
@@ -630,6 +677,7 @@ impl Host {
             device_services,
             raf_rx: Some(self.raf_rx.clone()),
             network_policy: self.network_policy.clone(),
+            backgrounded: self.backgrounded.clone(),
         };
 
         let module_loader: Option<Rc<dyn ModuleLoader>> =
@@ -709,6 +757,16 @@ impl Host {
         // But restart doesn't go through UpdateSurface (the surface is unchanged),
         // so we must explicitly re-signal the surface to restore `has_surface`.
         // Without this, VSync frames are discarded and the RAF loop never fires.
+        //
+        // Synchronization note: `restore_surface()` delegates to
+        // `update_surface()` which sends a `RenderCommand::Canvas(RecreateOnscreen)`
+        // through the crossbeam command channel and waits for the render thread's
+        // response (bounded channel recv with timeout). The render thread processes
+        // this command, sets its local `has_surface = true`, and sends back the
+        // result. This request-response exchange over the command channel provides
+        // the necessary cross-thread synchronization -- the host thread does not
+        // proceed to `resume()` until the render thread has acknowledged the
+        // surface restoration.
         if let Err(e) = self.render.restore_surface() {
             error!(
                 "[Host {}] on_restart: restore_surface failed: {}",
@@ -720,4 +778,27 @@ impl Host {
 
         Ok(())
     }
+}
+
+/// Escape a string for safe interpolation into a JS single-quoted string literal.
+///
+/// Handles all characters that could break out of the string or inject code.
+/// Mirrors the escaping function in `platform/android/jni/inbound.rs`.
+fn escape_for_js_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(c),
+        }
+    }
+    out
 }

@@ -116,7 +116,21 @@ impl DecodePool {
             let sr = sample_rate;
             let handle = thread::Builder::new()
                 .name(format!("audio-decode-{}", i))
-                .spawn(move || decode_worker(rx, tx, sr, wake))
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        decode_worker(rx, tx, sr, wake);
+                    }));
+                    if let Err(panic_info) = result {
+                        let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "Unknown panic".to_string()
+                        };
+                        tracing::error!("[audio-decode-{}] PANIC: {}", i, msg);
+                    }
+                })
                 .expect("failed to spawn decode worker");
             workers.push(handle);
         }
@@ -262,6 +276,7 @@ impl AudioThread {
         let handle = thread::Builder::new()
             .name("Migo-AudioThread".into())
             .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Initialize audio output
                 let output = match AudioOutput::new() {
                     Ok(out) => {
@@ -281,6 +296,17 @@ impl AudioThread {
                 run_audio_thread(rx, output, host_tx, wakeup_for_thread);
 
                 info!("AudioThread stopped");
+                })); // end catch_unwind
+                if let Err(panic_info) = result {
+                    let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+                    error!("[AudioThread] PANIC: {}", msg);
+                }
             })
             .map_err(|e| {
                 EngineError::from_detail(
@@ -337,6 +363,7 @@ impl AudioThread {
         let handle = thread::Builder::new()
             .name("Migo-AudioThread".into())
             .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let output = match AudioOutput::new() {
                     Ok(out) => out,
                     Err(e) => {
@@ -353,6 +380,17 @@ impl AudioThread {
                 info!("AudioThread (lazy) started");
                 run_audio_thread(rx, output, host_tx, wakeup_for_thread);
                 info!("AudioThread (lazy) stopped");
+                })); // end catch_unwind
+                if let Err(panic_info) = result {
+                    let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+                    error!("[AudioThread lazy] PANIC: {}", msg);
+                }
             })
             .map_err(|e| {
                 EngineError::from_detail(

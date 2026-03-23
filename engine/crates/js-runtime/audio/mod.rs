@@ -223,6 +223,7 @@ extension!(host_v8_audio,
         "03_audio_interruption.js",
         "04_media_audio_player.js",
         "05_recorder_manager.js",
+        "99_global_scope.js",
     ],
 );
 

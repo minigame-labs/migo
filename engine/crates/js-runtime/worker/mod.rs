@@ -217,6 +217,7 @@ async fn op_worker_create(
             device_services: None,
             raf_rx: None,
             network_policy: host.network_policy.clone(),
+            backgrounded: host.backgrounded.clone(),
         };
 
         (code_dir, worker_state)
@@ -418,6 +419,7 @@ deno_core::extension!(
     esm = [
         dir "worker",
         "01_worker.js",
+        "99_global_scope.js",
     ],
 );
 
@@ -462,27 +464,30 @@ pub fn worker_inner_extensions(ctx: WorkerCtx) -> Vec<Extension> {
 /// This gives workers the same shared APIs as the main thread.
 pub fn create_worker_runtime_extensions(ctx: WorkerCtx, host_state: HostOpState) -> Vec<Extension> {
     use crate::{
-        audio, base, console, env, event, file, network, rendering, url, utility, web,
+        base, console, env, event, file, network, rendering, url, utility, web,
         worker_runtime,
     };
 
-    let runtime_exts = vec![worker_runtime::init()];
+    let mut exts: Vec<Extension> = Vec::new();
 
-    base::base_extensions(host_state)
-        .into_iter()
-        .chain(console::console_extensions())
-        .chain(event::event_extensions())
-        .chain(utility::utility_extensions())
-        .chain(file::file_extensions())
-        .chain(rendering::rendering_extensions())
-        .chain(web::web_extensions())
-        .chain(url::url_extensions())
-        .chain(network::network_extensions())
-        .chain(audio::audio_extensions())
-        .chain(env::env_extensions())
-        .chain(worker_inner_extensions(ctx))
-        .chain(runtime_exts)
-        .collect()
+    exts.extend(base::base_extensions(host_state));
+    exts.extend(console::console_extensions());
+    exts.extend(event::event_extensions());
+    exts.extend(utility::utility_extensions());
+    exts.extend(file::file_extensions());
+    exts.extend(rendering::rendering_extensions());
+    exts.extend(web::web_extensions());
+    exts.extend(url::url_extensions());
+    exts.extend(network::network_extensions());
+
+    #[cfg(feature = "api-media")]
+    exts.extend(crate::audio::audio_extensions());
+
+    exts.extend(env::env_extensions());
+    exts.extend(worker_inner_extensions(ctx));
+    exts.push(worker_runtime::init());
+
+    exts
 }
 
 // ---------------------------------------------------------------------------

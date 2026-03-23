@@ -909,11 +909,7 @@ pub(crate) extern "system" fn onCompressImageResult<'local>(
         .get_string(&result_json)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
-    let escaped = json
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r");
+    let escaped = escape_for_js_string(&json);
     let cmd = HostCommand::EvalScript {
         source: format!("_internalOnCompressImageResult('{}');", escaped),
     };
@@ -1002,11 +998,7 @@ pub(crate) extern "system" fn onScanCodeResult<'local>(
         .get_string(&result_json)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| r#"{"error":"failed to read result"}"#.to_string());
-    let escaped = json
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r");
+    let escaped = escape_for_js_string(&json);
     let cmd = HostCommand::EvalScript {
         source: format!("_internalOnScanCodeResult('{}');", escaped),
     };
@@ -1260,6 +1252,29 @@ pub(crate) extern "system" fn onMidasPaymentGameItemResult<'local>(
     let _ = send_command_to_host(host_id, cmd);
 }
 
+// ==================== Video Callbacks ====================
+
+pub(crate) extern "system" fn onVideoEvent<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host_id: jint,
+    video_id: jint,
+    event_type: JString<'local>,
+    data_json: JString<'local>,
+) {
+    let evt: String = env.get_string(&event_type)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let data: String = env.get_string(&data_json)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "{}".to_string());
+    let _ = send_command_to_host(host_id, HostCommand::OnVideoStateChange {
+        video_id: video_id as u32,
+        event_type: evt,
+        data,
+    });
+}
+
 // ==================== Console Logs ====================
 
 pub(crate) extern "system" fn getConsoleLogs<'local>(
@@ -1273,5 +1288,82 @@ pub(crate) extern "system" fn getConsoleLogs<'local>(
     match env.new_string(&json) {
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::escape_for_js_string;
+
+    #[test]
+    fn test_escape_basic() {
+        assert_eq!(escape_for_js_string("hello"), "hello");
+    }
+
+    #[test]
+    fn test_escape_single_quote() {
+        assert_eq!(escape_for_js_string("it's"), "it\\'s");
+    }
+
+    #[test]
+    fn test_escape_backslash() {
+        assert_eq!(escape_for_js_string("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn test_escape_newline() {
+        assert_eq!(escape_for_js_string("a\nb"), "a\\nb");
+    }
+
+    #[test]
+    fn test_escape_carriage_return() {
+        assert_eq!(escape_for_js_string("a\rb"), "a\\rb");
+    }
+
+    #[test]
+    fn test_escape_backtick() {
+        assert_eq!(escape_for_js_string("a`b"), "a\\`b");
+    }
+
+    #[test]
+    fn test_escape_dollar() {
+        assert_eq!(escape_for_js_string("$var"), "\\$var");
+    }
+
+    #[test]
+    fn test_escape_null() {
+        assert_eq!(escape_for_js_string("a\0b"), "a\\0b");
+    }
+
+    #[test]
+    fn test_escape_line_separator() {
+        assert_eq!(escape_for_js_string("a\u{2028}b"), "a\\u2028b");
+    }
+
+    #[test]
+    fn test_escape_paragraph_separator() {
+        assert_eq!(escape_for_js_string("a\u{2029}b"), "a\\u2029b");
+    }
+
+    #[test]
+    fn test_escape_combined() {
+        assert_eq!(
+            escape_for_js_string("it's a `$100` note\n"),
+            "it\\'s a \\`\\$100\\` note\\n"
+        );
+    }
+
+    #[test]
+    fn test_escape_empty_string() {
+        assert_eq!(escape_for_js_string(""), "");
+    }
+
+    #[test]
+    fn test_escape_only_special_chars() {
+        assert_eq!(escape_for_js_string("\\'\n\r"), "\\\\\\'\\n\\r");
     }
 }

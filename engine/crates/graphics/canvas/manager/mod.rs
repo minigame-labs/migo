@@ -53,6 +53,11 @@ pub(crate) struct CanvasManager {
     image_registry: ImageRegistry,
 
     /// Last eglSwapInterval value to avoid redundant driver calls per frame.
+    /// Initialized to -1 (sentinel) so the first swap forces an actual EGL call.
+    /// Reset to -1 whenever the EGL surface is destroyed/recreated, because the
+    /// new surface may not inherit the previous interval on all drivers.
+    /// The sole eglSwapInterval call site is in `swap_buffers_no_restore()`,
+    /// guarded by `interval != self.last_swap_interval`.
     last_swap_interval: i32,
 
     /// Set to true when EGL reports CONTEXT_LOST during swap_buffers.

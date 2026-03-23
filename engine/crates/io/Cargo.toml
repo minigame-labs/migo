@@ -7,9 +7,10 @@ edition = "2024"
 path = "lib.rs"
 
 [features]
-default = ["zip-extract", "rust-image-decode"]
+default = ["zip-extract", "rust-image-decode", "compress-brotli"]
 zip-extract = ["dep:zip"]
 rust-image-decode = ["dep:image", "dep:zune-image", "dep:zune-core"]
+compress-brotli = ["dep:brotli"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -39,8 +40,8 @@ sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 
-# Brotli decompression for readCompressedFile API
-brotli = "7"
+# Brotli decompression for readCompressedFile API — optional, behind "compress-brotli" feature
+brotli = { version = "7", optional = true }
 
 # Zip extraction — optional, disable default features to exclude bzip2/zstd/aes/lzma/xz/zopfli
 # Only enable deflate (most common) to save ~200-400KB of compression codecs

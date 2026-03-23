@@ -5,9 +5,11 @@
 //!
 //! # Error Convention
 //!
-//! Methods return `Err("apiName:fail reason")`
-//! - `Err("vibrateShort:fail not supported")` - Feature not supported
-//! - `Err("vibrateShort:fail system error")` - Runtime error
+//! Methods return `Result<T, ServiceError>` where `ServiceError` carries a
+//! typed error code and a human-readable message:
+//! - `Err(ServiceError::not_supported("vibrateShort:fail not supported"))` - Feature not supported
+//! - `Err(ServiceError::system("vibrateShort:fail system error"))` - Runtime error
+//! - `Err(ServiceError::invalid_param("vibrateShort:fail invalid type"))` - Bad input
 
 mod auth;
 mod camera;
@@ -26,15 +28,17 @@ mod scan_code;
 mod share;
 mod subpackage;
 mod system_info;
+mod video;
 
 pub use auth::AuthService;
 pub use camera::CameraService;
 pub use clipboard::ClipboardService;
 pub use codec::CodecService;
 pub use device::{
-    AccelerometerService, AudioPlatformService, BatteryService, BluetoothService, CompassService,
-    DeviceMotionService, DeviceServices, GyroscopeService, KeyboardService, RecorderService,
-    ScreenService, VibrationService,
+    AccelerometerService, AudioPlatformService, BatteryService, BluetoothService, CommerceServices,
+    CompassService, ConnectivityServices, DeviceMotionService, DeviceServices, GyroscopeService,
+    KeyboardService, MediaServices, RecorderService, ScreenService, SensorServices,
+    SystemUtilServices, VibrationService,
 };
 pub use file::FileService;
 pub use game_log::GameLogService;
@@ -48,3 +52,6 @@ pub use scan_code::ScanCodeService;
 pub use share::ShareService;
 pub use subpackage::SubpackageService;
 pub use system_info::SystemInfoService;
+pub use video::VideoService;
+
+pub use crate::protocol::error::{ServiceError, ServiceErrorCode};

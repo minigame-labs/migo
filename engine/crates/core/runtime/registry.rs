@@ -1,12 +1,14 @@
 use std::{
     collections::HashMap,
     sync::{
-        OnceLock, RwLock,
+        OnceLock,
         atomic::{AtomicI32, Ordering},
     },
 };
 
+use parking_lot::RwLock;
 use tokio::sync::mpsc::{Sender, error::TrySendError};
+use tracing::{debug, warn};
 
 use shared::protocol::host_cmd::HostCommand;
 
@@ -28,24 +30,30 @@ pub(crate) fn alloc_host_id() -> HostId {
 /// Register sender for a host.
 /// Returns the previous sender if existed (should normally be None).
 pub(crate) fn register_sender(id: HostId, tx: Sender<HostCommand>) -> Option<Sender<HostCommand>> {
-    let mut map = host_senders().write().unwrap_or_else(|e| e.into_inner());
+    let mut map = host_senders().write();
     map.insert(id, tx)
 }
 
 /// Unregister sender for a host.
 /// Returns removed sender if existed.
 pub(crate) fn unregister_sender(id: HostId) -> Option<Sender<HostCommand>> {
-    let mut map = host_senders().write().unwrap_or_else(|e| e.into_inner());
+    let mut map = host_senders().write();
     map.remove(&id)
 }
 
 pub fn send_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), String> {
     // Clone sender and drop lock before sending (lower contention / avoids lock hazards).
     let sender = {
-        let map = host_senders().read().unwrap_or_else(|e| e.into_inner());
+        let map = host_senders().read();
         map.get(&host_id).cloned()
     }
-    .ok_or_else(|| format!("Cannot find host_id={host_id} sender"))?;
+    .ok_or_else(|| {
+        // Use debug level: this commonly happens during shutdown when JNI callbacks
+        // (onVsync, touch, etc.) race with host thread exit + unregister.  Those
+        // late arrivals are harmless and expected, so avoid noisy error logs.
+        debug!("send_command_to_host: host_id={host_id} not found (likely already shut down)");
+        format!("Cannot find host_id={host_id} sender")
+    })?;
 
     match sender.try_send(cmd) {
         Ok(()) => Ok(()),
@@ -53,6 +61,7 @@ pub fn send_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), Str
             if let Some(stats) = shared::stats::get_stats(host_id) {
                 stats.command_drops.fetch_add(1, Ordering::Relaxed);
             }
+            warn!("Host {} command queue full, dropping command", host_id);
             Err(format!(
                 "Failed to send command to host {host_id}: queue is full"
             ))

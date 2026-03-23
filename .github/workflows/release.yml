@@ -9,7 +9,46 @@ permissions:
   contents: write
 
 jobs:
+  # ── Job 1: Quality gate (same as PR CI, ensures tag is clean) ───────
+  quality-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine -> target
+          cache-on-failure: true
+
+      - name: Check Rust formatting
+        working-directory: engine
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy lints
+        working-directory: engine
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        working-directory: engine
+        run: cargo test --workspace --lib --doc
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Shell script syntax check
+        run: bash -n scripts/*.sh scripts/ci/*.sh
+
+  # ── Job 2: Release AAR build ────────────────────────────────────────
   release-android:
+    needs: quality-gate
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -33,6 +72,12 @@ jobs:
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine -> target
+          cache-on-failure: true
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
@@ -43,13 +88,38 @@ jobs:
           echo "$ANDROID_HOME/ndk/23.2.8568313/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
           cargo install cargo-ndk --locked
 
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('platforms/android/**/*.gradle*') }}
+          restore-keys: gradle-
+
       - name: Build Android AAR (release)
         run: bash scripts/build-aar.sh release
+
+      - name: Analyze AAR size report
+        run: |
+          python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-release.aar \
+            > platforms/android/dist/size-report.txt || true
 
       - name: Generate checksums
         run: |
           cd platforms/android/dist
           sha256sum * > SHA256SUMS.txt
+
+      - name: Write version metadata
+        run: |
+          cat > platforms/android/dist/version.json <<VEOF
+          {
+            "tag": "${{ github.ref_name }}",
+            "sha": "${{ github.sha }}",
+            "type": "release",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          VEOF
 
       - name: Optional power baseline compare
         run: |
@@ -69,4 +139,3 @@ jobs:
             platforms/android/dist/*
             reports/*.json
           generate_release_notes: true
-

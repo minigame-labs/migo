@@ -59,6 +59,7 @@ impl RenderThread {
         let handle = std::thread::Builder::new()
             .name("Migo-RenderThread".into())
             .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Both Android and non-Android use the same EGL library name.
                 const EGL_LIB: &str = "libEGL.so";
 
@@ -138,6 +139,16 @@ impl RenderThread {
                 let mut fps_timer = Instant::now();
                 let mut last_frame_time = Instant::now();
                 let mut first_frame_recorded = false;
+
+                // Deferred EGL context recovery flag. Set to true when
+                // swap_buffers detects context loss (EGL_CONTEXT_LOST).
+                // Recovery is deferred to the top of the next frame iteration
+                // instead of running inline during present, because
+                // try_recover_context() performs a full EGL surface+context
+                // teardown and recreate, which is too expensive to run in the
+                // time-critical swap path where it delays the RAF signal and
+                // can cause cascading frame drops.
+                let mut needs_context_recovery = false;
 
                 enum LoopCtl {
                     Continue,
@@ -399,7 +410,8 @@ impl RenderThread {
                                                         frame_count: &mut u32,
                                                         fps_timer: &mut Instant,
                                                         last_frame_time: &mut Instant,
-                                                        first_frame_recorded: &mut bool| {
+                                                        first_frame_recorded: &mut bool,
+                                                        needs_recovery: &mut bool| {
                     // Present the completed frame (only if we have a valid surface).
                     let did_swap = if *dirty && has_surface {
                         if let Err(e) = cm.flush_dirty_2d_contexts() {
@@ -410,13 +422,15 @@ impl RenderThread {
                             Ok(()) => true,
                             Err(e) => {
                                 warn!("swap_buffers_no_restore failed: {}", e);
-                                // Attempt automatic recovery from EGL context loss.
+                                // On EGL context loss, defer recovery to the top of the
+                                // next frame iteration rather than recovering inline.
+                                // Rationale: try_recover_context() tears down and
+                                // recreates the entire EGL surface+context, which is
+                                // expensive and would delay the RAF signal in the
+                                // time-critical swap path, risking cascading frame drops.
                                 if cm.is_context_lost() {
-                                    match cm.try_recover_context() {
-                                        Ok(true) => info!("EGL context recovered, resuming rendering"),
-                                        Ok(false) => warn!("EGL context recovery deferred (no window)"),
-                                        Err(re) => warn!("EGL context recovery failed: {}", re),
-                                    }
+                                    *needs_recovery = true;
+                                    warn!("EGL context lost, recovery deferred to next frame");
                                 }
                                 false
                             }
@@ -459,6 +473,19 @@ impl RenderThread {
                 };
 
                 loop {
+                    // --- Deferred EGL context recovery ---
+                    // Performed at the top of the frame loop where it is less
+                    // timing-critical than inside the swap path. This avoids
+                    // blocking the RAF signal with a full EGL teardown+recreate.
+                    if needs_context_recovery {
+                        needs_context_recovery = false;
+                        match cm.try_recover_context() {
+                            Ok(true) => info!("EGL context recovered at frame top, resuming rendering"),
+                            Ok(false) => warn!("EGL context recovery deferred (no window handle)"),
+                            Err(re) => warn!("EGL context recovery failed: {}", re),
+                        }
+                    }
+
                     select! {
                         recv(ticker) -> _ => {
                             // Software ticker path (non-Android fallback).
@@ -475,7 +502,7 @@ impl RenderThread {
 
                             // 2) Present frame and signal RAF.
                             let ts = start_time.elapsed().as_secs_f64() * 1000.0;
-                            present_frame_and_signal_raf(&mut cm, &mut dirty, has_surface, ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded);
+                            present_frame_and_signal_raf(&mut cm, &mut dirty, has_surface, ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
                         }
 
                         recv(vsync) -> _msg => {
@@ -487,19 +514,24 @@ impl RenderThread {
 
                             // Auto-detect VSync frequency from signal count per second.
                             // This correctly handles 60/90/120Hz and variable-rate displays.
+                            // Optimization: only call Instant::elapsed() every 60 VSync
+                            // signals (~1s at 60Hz) to avoid the syscall overhead on every
+                            // frame. The counter still increments every VSync for accuracy.
                             vsync_hz_counter += 1;
-                            let hz_elapsed = vsync_hz_timer.elapsed();
-                            if hz_elapsed >= Duration::from_secs(1) {
-                                let measured = (vsync_hz_counter as f64 / hz_elapsed.as_secs_f64()).round() as u32;
-                                let new_hz = measured.clamp(30, 240);
-                                if new_hz != detected_vsync_hz {
-                                    detected_vsync_hz = new_hz;
-                                    // Recompute frame divisor for the updated rate.
-                                    frame_divisor = (detected_vsync_hz / target_fps).max(1);
-                                    info!("RenderThread: detected VSync {}Hz, frame_divisor={}", detected_vsync_hz, frame_divisor);
+                            if vsync_hz_counter >= 60 {
+                                let hz_elapsed = vsync_hz_timer.elapsed();
+                                if hz_elapsed >= Duration::from_secs(1) {
+                                    let measured = (vsync_hz_counter as f64 / hz_elapsed.as_secs_f64()).round() as u32;
+                                    let new_hz = measured.clamp(30, 240);
+                                    if new_hz != detected_vsync_hz {
+                                        detected_vsync_hz = new_hz;
+                                        // Recompute frame divisor for the updated rate.
+                                        frame_divisor = (detected_vsync_hz / target_fps).max(1);
+                                        info!("RenderThread: detected VSync {}Hz, frame_divisor={}", detected_vsync_hz, frame_divisor);
+                                    }
+                                    vsync_hz_counter = 0;
+                                    vsync_hz_timer = Instant::now();
                                 }
-                                vsync_hz_counter = 0;
-                                vsync_hz_timer = Instant::now();
                             }
 
                             // Frame divisor: skip frames to achieve target fps.
@@ -524,7 +556,7 @@ impl RenderThread {
                             // absolute hardware timestamp causes broken animation calculations
                             // (huge first-frame delta, incorrect absolute positions).
                             let ts = start_time.elapsed().as_secs_f64() * 1000.0;
-                            present_frame_and_signal_raf(&mut cm, &mut dirty, has_surface, ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded);
+                            present_frame_and_signal_raf(&mut cm, &mut dirty, has_surface, ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
                         }
 
                         recv(cmd_rx) -> msg => {
@@ -555,6 +587,24 @@ impl RenderThread {
                             }
                         }
                     }
+                }
+                })); // end catch_unwind
+                if let Err(panic_info) = result {
+                    let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+                    error!("[RenderThread host={}] PANIC: {}", host_id, msg);
+                    if let Some(stats) = shared::stats::get_stats(host_id) {
+                        stats.fatal_error_code.store(
+                            shared::error::ErrorCode::Internal.as_u16() as u32,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    shared::stats::unregister_stats(host_id);
                 }
             })
             .expect("failed to spawn Migo-RenderThread");

@@ -1,0 +1,62 @@
+{
+  "_comment": "Power/resource baseline thresholds for Migo Android runtime. Metrics collected from Java-side instrumentation (Debug.getNativeHeapAllocatedSize, /proc/self/stat, BatteryManager). See CLAUDE.md section 11.1.",
+  "version": 1,
+  "metrics": {
+    "cpu_avg_pct": {
+      "description": "Average CPU usage during steady-state gameplay (from /proc/self/stat sampling)",
+      "unit": "percent",
+      "direction": "lower_is_better",
+      "fail_above": 40.0,
+      "warn_above": 30.0
+    },
+    "cpu_peak_pct": {
+      "description": "Peak CPU usage observed during test run",
+      "unit": "percent",
+      "direction": "lower_is_better",
+      "fail_above": 80.0,
+      "warn_above": 60.0
+    },
+    "memory_native_mb": {
+      "description": "Native heap allocation (Debug.getNativeHeapAllocatedSize) at steady state",
+      "unit": "MB",
+      "direction": "lower_is_better",
+      "fail_above": 256.0,
+      "warn_above": 192.0
+    },
+    "memory_java_mb": {
+      "description": "Java heap usage (Runtime.totalMemory - freeMemory) at steady state",
+      "unit": "MB",
+      "direction": "lower_is_better",
+      "fail_above": 128.0,
+      "warn_above": 96.0
+    },
+    "memory_total_mb": {
+      "description": "Total process memory (native + Java) at steady state",
+      "unit": "MB",
+      "direction": "lower_is_better",
+      "fail_above": 350.0,
+      "warn_above": 260.0
+    },
+    "battery_drain_pct_per_hour": {
+      "description": "Estimated battery drain rate during active gameplay",
+      "unit": "percent_per_hour",
+      "direction": "lower_is_better",
+      "fail_above": 15.0,
+      "warn_above": 10.0
+    },
+    "audio_idle_cpu_pct": {
+      "description": "CPU usage when audio thread is in Sleep/LowPower state (validates power state machine)",
+      "unit": "percent",
+      "direction": "lower_is_better",
+      "fail_above": 5.0,
+      "warn_above": 2.0
+    },
+    "thermal_throttle_events": {
+      "description": "Number of thermal throttling events observed during test",
+      "unit": "count",
+      "direction": "lower_is_better",
+      "fail_above": 3,
+      "warn_above": 1
+    }
+  }
+}

@@ -90,6 +90,12 @@ impl RenderService {
     /// In the normal OnHide→UpdateSurface flow, `RecreateOnscreen` restores it.
     /// For restart (where the surface hasn't changed), call this before `resume()`
     /// to restore `has_surface = true` so VSync frames are no longer discarded.
+    ///
+    /// This delegates to [`update_surface`](Self::update_surface), which sends a
+    /// `RecreateOnscreen` command through the crossbeam channel and blocks until
+    /// the render thread acknowledges (with a timeout). The command channel
+    /// provides the cross-thread synchronization: the caller will not return
+    /// until the render thread has processed the command and set `has_surface`.
     pub(crate) fn restore_surface(&mut self) -> EngineResult<()> {
         self.update_surface(self.surface.clone())
     }

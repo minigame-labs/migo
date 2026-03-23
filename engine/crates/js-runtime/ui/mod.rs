@@ -120,6 +120,7 @@ deno_core::extension!(
         "01_interaction.js",
         "02_buttons.js",
         "03_page_manager.js",
+        "99_global_scope.js",
     ]
 );
 

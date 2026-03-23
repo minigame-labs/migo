@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -81,6 +82,10 @@ pub struct HostOpState {
     pub raf_rx: Option<RafRx>,
     /// Network security policy (domain whitelist, HTTPS enforcement).
     pub network_policy: NetworkPolicy,
+    /// When `true`, the app is in the background (OnHide received).
+    /// Async polling loops (WebSocket, TCP, UDP) check this flag and
+    /// throttle their iteration rate to reduce CPU/battery usage.
+    pub backgrounded: Arc<AtomicBool>,
 }
 
 /// Network-level security policy, populated from InitOptions.extras.

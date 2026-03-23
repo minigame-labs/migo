@@ -1,4 +1,4 @@
-//! Media service ops (Camera) and ESM modules.
+//! Media service ops (Camera, Image API, Video) and ESM modules.
 
 use deno_core::{Extension, OpState, op2};
 use deno_error::JsErrorBox;
@@ -242,6 +242,149 @@ pub fn op_choose_image(
     Err(JsErrorBox::generic("chooseImage:fail not supported"))
 }
 
+// ==================== Video Ops ====================
+
+/// Create a video player instance with platform-specific implementation.
+/// Options are passed as JSON string for extensibility.
+/// Returns JSON: `{"videoId": <id>}` on success.
+#[op2]
+#[string]
+pub fn op_video_create(
+    state: &mut OpState,
+    #[string] options_json: &str,
+) -> Result<String, JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(video) = services.video() {
+            return video.create(options_json).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("createVideo:fail not supported"))
+}
+
+/// Start or resume video playback.
+#[op2(fast)]
+pub fn op_video_play(state: &mut OpState, #[smi] video_id: u32) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(video) = services.video() {
+            return video.play(video_id).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("video.play:fail not supported"))
+}
+
+/// Pause video playback.
+#[op2(fast)]
+pub fn op_video_pause(state: &mut OpState, #[smi] video_id: u32) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(video) = services.video() {
+            return video.pause(video_id).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("video.pause:fail not supported"))
+}
+
+/// Stop video playback and reset to beginning.
+#[op2(fast)]
+pub fn op_video_stop(state: &mut OpState, #[smi] video_id: u32) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(video) = services.video() {
+            return video.stop(video_id).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("video.stop:fail not supported"))
+}
+
+/// Seek to a specific position in seconds.
+#[op2(fast)]
+pub fn op_video_seek(
+    state: &mut OpState,
+    #[smi] video_id: u32,
+    position: f64,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(video) = services.video() {
+            return video.seek(video_id, position).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("video.seek:fail not supported"))
+}
+
+/// Enter fullscreen mode.
+#[op2(fast)]
+pub fn op_video_request_fullscreen(
+    state: &mut OpState,
+    #[smi] video_id: u32,
+    direction: i32,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(video) = services.video() {
+            return video
+                .request_fullscreen(video_id, direction)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "video.requestFullScreen:fail not supported",
+    ))
+}
+
+/// Exit fullscreen mode.
+#[op2(fast)]
+pub fn op_video_exit_fullscreen(
+    state: &mut OpState,
+    #[smi] video_id: u32,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(video) = services.video() {
+            return video
+                .exit_fullscreen(video_id)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "video.exitFullScreen:fail not supported",
+    ))
+}
+
+/// Set a video property (JSON-encoded key-value pair).
+#[op2(fast)]
+pub fn op_video_set_property(
+    state: &mut OpState,
+    #[smi] video_id: u32,
+    #[string] options_json: &str,
+) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(video) = services.video() {
+            return video
+                .set_property(video_id, options_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(
+        "video.setProperty:fail not supported",
+    ))
+}
+
+/// Destroy a video player instance and release all resources.
+#[op2(fast)]
+pub fn op_video_destroy(state: &mut OpState, #[smi] video_id: u32) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(video) = services.video() {
+            return video.destroy(video_id).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("video.destroy:fail not supported"))
+}
+
 // ==================== Extension Definition ====================
 
 deno_core::extension!(
@@ -262,12 +405,23 @@ deno_core::extension!(
         op_compress_image,
         op_choose_message_file,
         op_choose_image,
+        op_video_create,
+        op_video_play,
+        op_video_pause,
+        op_video_stop,
+        op_video_seek,
+        op_video_request_fullscreen,
+        op_video_exit_fullscreen,
+        op_video_set_property,
+        op_video_destroy,
     ],
     esm = [
         dir "media",
         "01_camera.js",
         "02_image_api.js",
         "03_video_decoder.js",
+        "04_video.js",
+        "99_global_scope.js",
     ],
 );
 
