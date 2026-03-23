@@ -131,7 +131,7 @@ impl CanvasManager {
             resource,
             bound: BoundContext::Resource,
             canvases: HashMap::with_capacity(4),
-            next_canvas_id: AtomicU32::new(1),
+            next_canvas_id: AtomicU32::new(2), // 1 is reserved for onscreen
             contexts_2d: HashMap::with_capacity(4),
             dirty_2d: HashSet::with_capacity(4),
             image_registry: ImageRegistry::new(),
@@ -197,6 +197,19 @@ impl CanvasManager {
 
     pub(crate) fn create_onscreen(&mut self, window: usize) -> EngineResult<()> {
         let id = CanvasId::from(1u32);
+
+        // If the same native window is already active as the onscreen canvas,
+        // skip the destroy-recreate cycle. This avoids "already connected"
+        // (EGL_BAD_ALLOC) errors that occur on some Android drivers where
+        // eglDestroySurface does not synchronously disconnect the buffer queue
+        // producer. Common trigger: init() provides initial_surface, then
+        // updateSurface() is called with the same Surface shortly after.
+        if let Some(entry) = self.canvases.get(&id) {
+            if matches!(entry.kind, SurfaceKind::Window(w) if w == window) {
+                return Ok(());
+            }
+        }
+
         self.last_window = Some(window);
         self.context_lost = false;
 
@@ -207,12 +220,12 @@ impl CanvasManager {
         let mut had_2d_context = false;
 
         if let Some(_entry) = self.canvases.get(&id) {
-            // Always destroy and recreate the EGL surface, even when the same
-            // ANativeWindow handle is reused. On many Android drivers,
-            // eglQuerySurface returns the creation-time dimensions and does NOT
-            // reflect later window resizes (e.g. navigation bar hide/show).
-            // Reusing the old surface leads to buffer size mismatches that
-            // SurfaceFlinger rejects ("rejecting buffer"), causing flicker.
+            // Destroy and recreate the EGL surface when the ANativeWindow
+            // changed. On many Android drivers, eglQuerySurface returns the
+            // creation-time dimensions and does NOT reflect later window
+            // resizes (e.g. navigation bar hide/show). Reusing the old
+            // surface leads to buffer size mismatches that SurfaceFlinger
+            // rejects ("rejecting buffer"), causing flicker.
             had_2d_context = self.contexts_2d.contains_key(&id);
             self.destroy_onscreen_internal(id)?;
         }

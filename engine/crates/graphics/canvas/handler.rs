@@ -1,4 +1,7 @@
-use shared::{error::EngineResult, protocol::render_cmd::CanvasCmd};
+use shared::{
+    error::{EngineError, EngineResult, ErrorCode},
+    protocol::render_cmd::CanvasCmd,
+};
 
 use crate::{CanvasManager, onscreen_window_from_surface};
 
@@ -9,6 +12,11 @@ impl CanvasHandler {
         CanvasHandler
     }
 
+    /// Handle a canvas command, returning the outcome to the render thread.
+    ///
+    /// For `RecreateOnscreen`, the result is propagated so the render thread
+    /// can correctly track `has_surface`. Other commands communicate their
+    /// results through the `resp` channel and always return `Ok` here.
     pub(crate) fn handle_command(
         &mut self,
         cm: &mut CanvasManager,
@@ -35,7 +43,19 @@ impl CanvasHandler {
                     cm.create_onscreen(win)?;
                     Ok(())
                 })();
+                // Send the result to the host thread (via resp channel) AND
+                // propagate success/failure to the render thread so it can
+                // correctly update has_surface. Previously this always returned
+                // Ok(()), causing the render thread to set has_surface = true
+                // even when eglCreateWindowSurface failed.
+                let succeeded = res.is_ok();
                 let _ = resp.send(res);
+                if !succeeded {
+                    return Err(EngineError::from_detail(
+                        ErrorCode::RenderBackendError,
+                        "RecreateOnscreen failed",
+                    ));
+                }
             }
 
             CanvasCmd::ResizeCanvas { id, w, h } => {
