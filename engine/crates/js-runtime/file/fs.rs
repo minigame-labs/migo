@@ -7,7 +7,9 @@ use shared::{
     op_state::HostOpState,
     protocol::{
         self,
-        io_cmd::{FileId, FileStat, IOCmd, IOCmdResp, OpenFlag, SavedFileInfo, StatResult, WriteMode},
+        io_cmd::{
+            FileId, FileStat, IOCmd, IOCmdResp, OpenFlag, SavedFileInfo, StatResult, WriteMode,
+        },
     },
     vfs::{FileOp, VfsError, VirtualFS},
 };
@@ -83,13 +85,24 @@ fn get_vfs_sync(state: &OpState) -> Option<Arc<VirtualFS>> {
 
 /// Resolve a path using VFS.
 ///
-/// All file paths MUST be virtual paths starting with /user, /cache, /code, or /tmp.
-/// This ensures game isolation and prevents unauthorized file access.
+/// Virtual paths must start with /user, /cache, /code, or /tmp.
+/// Relative paths (not starting with '/') are treated as relative to the
+/// game code directory (/code/), matching the target platform's readFile
+/// semantics where relative paths resolve against the game package root.
 #[inline]
 fn resolve_path_vfs(vfs: Option<&VirtualFS>, path: &str, op: FileOp) -> Result<String, IOError> {
     let vfs = vfs.ok_or_else(|| ioerr("File system not initialized"))?;
 
-    vfs.resolve(path, op)
+    // Platform compat: relative paths map to /code/ (game package directory)
+    let resolved;
+    let virtual_path = if !path.starts_with('/') {
+        resolved = format!("/code/{}", path);
+        &resolved
+    } else {
+        path
+    };
+
+    vfs.resolve(virtual_path, op)
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(|e| match e {
             VfsError::PathNotAllowed => ioerr(format!(

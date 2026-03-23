@@ -8,7 +8,9 @@ use shared::{
     error::{EngineResult, ErrorCode},
     protocol::{
         io_cmd::NormalizedImage,
-        render_cmd::{BufferId, CanvasId, FramebufferId, ProgramId, RenderbufferId, ShaderId, TextureId},
+        render_cmd::{
+            BufferId, CanvasId, FramebufferId, ProgramId, RenderbufferId, ShaderId, TextureId,
+        },
     },
 };
 use std::{
@@ -22,7 +24,10 @@ mod image;
 mod pbo_upload;
 mod types;
 
-pub(crate) use types::{BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta, ProgramMeta, RenderbufferMeta, ShaderMeta, TextureMeta, ee};
+pub(crate) use types::{
+    BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta, ProgramMeta, RenderbufferMeta,
+    ShaderMeta, TextureMeta, ee,
+};
 use types::{CanvasEntry, EglContextHandle, SurfaceKind};
 
 use self::image::ImageRegistry;
@@ -299,7 +304,17 @@ impl CanvasManager {
 
     fn destroy_onscreen_internal(&mut self, id: CanvasId) -> EngineResult<()> {
         if let Some(entry) = self.canvases.remove(&id) {
-            let _ = self.egl.make_current(self.display, None, None, None);
+            // Switch to the resource (pbuffer) context so the ANativeWindow is
+            // properly disconnected before we destroy the onscreen surface.
+            // Using (None, None, None) only unbinds the EGL context but does NOT
+            // release the native window connection, causing BadAlloc on the next
+            // eglCreateWindowSurface call.
+            let _ = self.egl.make_current(
+                self.display,
+                Some(self.resource.surf),
+                Some(self.resource.surf),
+                Some(self.resource.ctx),
+            );
 
             self.contexts_2d.remove(&id);
             self.dirty_2d.remove(&id);
