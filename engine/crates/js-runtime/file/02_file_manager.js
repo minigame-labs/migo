@@ -20,6 +20,7 @@ import {
   op_unzip,
   op_get_file_info, op_get_file_info_sync,
   op_list_saved_files,
+  op_decode_multi_formats
 } from "ext:core/ops";
 
 import { core, primordials } from "ext:core/mod.js";
@@ -531,13 +532,13 @@ class BaseFileManager {
     switch (enc) {
       case "utf8":
       case "utf-8":
-        return new TextDecoder("utf-8").decode(bytes);
+        return new op_decode_multi_formats("utf-8").decode(bytes);
 
       case "utf16le":
       case "utf-16le":
       case "ucs2":
       case "ucs-2":
-        return new TextDecoder("utf-16le").decode(bytes);
+        return new op_decode_multi_formats("utf-16le").decode(bytes);
 
       case "latin1":
       case "binary":
