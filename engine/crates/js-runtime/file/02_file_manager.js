@@ -24,6 +24,7 @@ import {
 } from "ext:core/ops";
 
 import { core, primordials } from "ext:core/mod.js";
+import { wrapAsync } from "ext:host_v8_base/02_async.js";
 import { FileStats, Stats } from "./02_file_stats.js";
 
 const { Error } = primordials;
@@ -36,52 +37,12 @@ class IOError extends Error {
 }
 core.registerErrorClass("IOError", IOError);
 
-function extractErrText(err) {
-  if (err == null) return "unknown error";
-  if (typeof err === "string") return err;
-  if (typeof err?.errMsg === "string") return err.errMsg;
-  if (typeof err?.message === "string") return err.message;
-  try {
-    return String(err);
-  } catch {
-    return "unknown error";
-  }
-}
-
-function failObj(msg) {
-  return { errMsg: msg, message: msg };
-}
-
-function okObj(okMsg, payload) {
-  // Always return an object with errMsg (miniapp style)
-  if (payload == null) return { errMsg: okMsg };
-  if (typeof payload === "object") {
-    if (payload.errMsg == null) return { ...payload, errMsg: okMsg };
-    return payload;
-  }
-  return { errMsg: okMsg, result: payload };
-}
-
-function wrapAsync(promise, okMsg, failPrefix, { success, fail, complete }) {
-  Promise.resolve(promise)
-    .then((payload) => {
-      const out = okObj(okMsg, payload);
-      success?.(out);
-      complete?.(out);
-    })
-    .catch((err) => {
-      const msg = `${failPrefix}:fail ${extractErrText(err)}`;
-      const out = failObj(msg);
-      fail?.(out);
-      complete?.(out);
-    });
-}
-
 function wrapSync(fn, failPrefix) {
   try {
     return fn();
   } catch (err) {
-    throw failObj(`${failPrefix}:fail ${extractErrText(err)}`);
+    const msg = err?.message || String(err);
+    throw { errMsg: `${failPrefix}:fail ${msg}`, message: `${failPrefix}:fail ${msg}` };
   }
 }
 
@@ -144,8 +105,8 @@ class BaseFileManager {
   //
   // access
   //
-  static access({ path, success, fail, complete }) {
-    wrapAsync(op_access(path).then(() => undefined), "access:ok", "access", { success, fail, complete });
+  static access(options) {
+    return wrapAsync('access', () => op_access(options.path), options);
   }
 
   static accessSync(path_or_obj) {
@@ -156,12 +117,12 @@ class BaseFileManager {
   //
   // writeFile / appendFile (path)
   //
-  static writeFile({ filePath, data, encoding = "utf8", success, fail, complete }) {
-    BaseFileManager.#writeFileCommon({ filePath, data, encoding, append: false, success, fail, complete });
+  static writeFile(options) {
+    return BaseFileManager.#writeFileCommon(options, false);
   }
 
-  static appendFile({ filePath, data, encoding = "utf8", success, fail, complete }) {
-    BaseFileManager.#writeFileCommon({ filePath, data, encoding, append: true, success, fail, complete });
+  static appendFile(options) {
+    return BaseFileManager.#writeFileCommon(options, true);
   }
 
   static writeFileSync(filePath_or_obj, data_arg, encoding_arg) {
@@ -198,46 +159,34 @@ class BaseFileManager {
     }, "appendFileSync");
   }
 
-  static #writeFileCommon({ filePath, data, encoding, append, success, fail, complete }) {
-    let data_buf, data_str;
-    try {
-      ({ data_buf, data_str } = toUint8Array(data));
-    } catch (err) {
-      const msg = `${append ? "appendFile" : "writeFile"}:fail ${extractErrText(err)}`;
-      const out = failObj(msg);
-      fail?.(out);
-      complete?.(out);
-      return;
-    }
-
+  static #writeFileCommon(options, append) {
     const prefix = append ? "appendFile" : "writeFile";
-    const p = op_write_or_append_file(filePath, data_buf, data_str, encoding, append)
-      .then((ok) => {
-        if (!ok) throw new IOError("unknown error");
-        return undefined;
-      });
-
-    wrapAsync(p, `${prefix}:ok`, prefix, { success, fail, complete });
+    return wrapAsync(prefix, () => {
+      const { data_buf, data_str } = toUint8Array(options.data);
+      const encoding = options.encoding || "utf8";
+      return op_write_or_append_file(options.filePath, data_buf, data_str, encoding, append)
+        .then((ok) => {
+          if (!ok) throw new IOError("unknown error");
+        });
+    }, options);
   }
 
   //
   // open / close
   //
-  static open({ filePath, flag = "r", success, fail, complete }) {
-    wrapAsync(
-      op_open_file(filePath, flag).then((fd) => ({ fd: String(fd) })),
-      "open:ok",
-      "open",
-      { success, fail, complete }
-    );
+  static open(options) {
+    const flag = options.flag || "r";
+    return wrapAsync('open', () => {
+      return op_open_file(options.filePath, flag).then((fd) => ({ fd: String(fd) }));
+    }, options);
   }
 
   static openSync({ filePath, flag = "r" }) {
     return wrapSync(() => String(op_open_file_sync(filePath, flag)), "openSync");
   }
 
-  static close({ fd, success, fail, complete }) {
-    wrapAsync(op_close_file(ensureFd(fd)), "close:ok", "close", { success, fail, complete });
+  static close(options) {
+    return wrapAsync('close', () => op_close_file(ensureFd(options.fd)), options);
   }
 
   static closeSync({ fd }) {
@@ -247,8 +196,8 @@ class BaseFileManager {
   //
   // copy / rename
   //
-  static copyFile({ srcPath, destPath, success, fail, complete }) {
-    wrapAsync(op_copy_file(srcPath, destPath), "copyFile:ok", "copyFile", { success, fail, complete });
+  static copyFile(options) {
+    return wrapAsync('copyFile', () => op_copy_file(options.srcPath, options.destPath), options);
   }
 
   static copyFileSync(srcPath_or_obj, destPath_arg) {
@@ -262,8 +211,8 @@ class BaseFileManager {
     wrapSync(() => op_copy_file_sync(srcPath, destPath), "copyFileSync");
   }
 
-  static rename({ oldPath, newPath, success, fail, complete }) {
-    wrapAsync(op_rename(oldPath, newPath), "rename:ok", "rename", { success, fail, complete });
+  static rename(options) {
+    return wrapAsync('rename', () => op_rename(options.oldPath, options.newPath), options);
   }
 
   static renameSync(oldPath_or_obj, newPath_arg) {
@@ -280,22 +229,19 @@ class BaseFileManager {
   //
   // fstat / ftruncate
   //
-  static fstat({ fd, success, fail, complete }) {
-    wrapAsync(
-      op_fstat(ensureFd(fd)).then((stat) => ({ stats: new Stats(stat) })),
-      "fstat:ok",
-      "fstat",
-      { success, fail, complete }
-    );
+  static fstat(options) {
+    return wrapAsync('fstat', () => {
+      return op_fstat(ensureFd(options.fd)).then((stat) => ({ stats: new Stats(stat) }));
+    }, options);
   }
 
   static fstatSync({ fd }) {
     return wrapSync(() => new Stats(op_fstat_sync(ensureFd(fd))), "fstatSync");
   }
 
-  static ftruncate({ fd, length = 0, success, fail, complete }) {
-    const len = Number(length) || 0;
-    wrapAsync(op_ftruncate(ensureFd(fd), len), "ftruncate:ok", "ftruncate", { success, fail, complete });
+  static ftruncate(options) {
+    const len = Number(options.length) || 0;
+    return wrapAsync('ftruncate', () => op_ftruncate(ensureFd(options.fd), len), options);
   }
 
   static ftruncateSync({ fd, length = 0 }) {
@@ -306,8 +252,8 @@ class BaseFileManager {
   //
   // mkdir / readdir
   //
-  static mkdir({ dirPath, recursive = false, success, fail, complete }) {
-    wrapAsync(op_mkdir(dirPath, !!recursive), "mkdir:ok", "mkdir", { success, fail, complete });
+  static mkdir(options) {
+    return wrapAsync('mkdir', () => op_mkdir(options.dirPath, !!options.recursive), options);
   }
 
   static mkdirSync(dirPath_or_obj, recursive_arg) {
@@ -321,10 +267,10 @@ class BaseFileManager {
     wrapSync(() => op_mkdir_sync(dirPath, !!recursive), "mkdirSync");
   }
 
-  static readdir({ dirPath, success, fail, complete }) {
-    wrapAsync(op_readdir(dirPath).then((files) => ({ files })), "readdir:ok", "readdir", {
-      success, fail, complete,
-    });
+  static readdir(options) {
+    return wrapAsync('readdir', () => {
+      return op_readdir(options.dirPath).then((files) => ({ files }));
+    }, options);
   }
 
   static readdirSync(dirPath_or_obj) {
@@ -335,12 +281,12 @@ class BaseFileManager {
   //
   // unlink / removeSavedFile / rmdir
   //
-  static removeSavedFile({ filePath, success, fail, complete }) {
-    wrapAsync(op_unlink(filePath), "removeSavedFile:ok", "removeSavedFile", { success, fail, complete });
+  static removeSavedFile(options) {
+    return wrapAsync('removeSavedFile', () => op_unlink(options.filePath), options);
   }
 
-  static unlink({ filePath, success, fail, complete }) {
-    wrapAsync(op_unlink(filePath), "unlink:ok", "unlink", { success, fail, complete });
+  static unlink(options) {
+    return wrapAsync('unlink', () => op_unlink(options.filePath), options);
   }
 
   static unlinkSync(filePath_or_obj) {
@@ -348,8 +294,8 @@ class BaseFileManager {
     return wrapSync(() => op_unlink_sync(filePath), "unlinkSync");
   }
 
-  static rmdir({ dirPath, recursive = false, success, fail, complete }) {
-    wrapAsync(op_rmdir(dirPath, !!recursive), "rmdir:ok", "rmdir", { success, fail, complete });
+  static rmdir(options) {
+    return wrapAsync('rmdir', () => op_rmdir(options.dirPath, !!options.recursive), options);
   }
 
   static rmdirSync(dirPath_or_obj, recursive_arg) {
@@ -366,16 +312,14 @@ class BaseFileManager {
   //
   // stat
   //
-  static stat({ path, recursive = false, success, fail, complete }) {
-    wrapAsync(
-      op_stat(path, !!recursive).then((stat) => {
+  static stat(options) {
+    const recursive = !!options.recursive;
+    return wrapAsync('stat', () => {
+      return op_stat(options.path, recursive).then((stat) => {
         if (!recursive) return { stats: new Stats(stat) };
         return { stats: stat.map((item) => new FileStats(item.path, item.stat)) };
-      }),
-      "stat:ok",
-      "stat",
-      { success, fail, complete }
-    );
+      });
+    }, options);
   }
 
   static statSync(path_or_obj, recursive_arg) {
@@ -397,19 +341,17 @@ class BaseFileManager {
   //
   // truncate (path) - ensure close always
   //
-  static truncate({ filePath, length = 0, success, fail, complete }) {
-    const len = Number(length) || 0;
-
-    const p = op_open_file(filePath, "r+").then(async (fd) => {
-      try {
-        await op_ftruncate(fd, len);
-      } finally {
-        try { await op_close_file(fd); } catch (_) { }
-      }
-      return undefined;
-    });
-
-    wrapAsync(p, "truncate:ok", "truncate", { success, fail, complete });
+  static truncate(options) {
+    const len = Number(options.length) || 0;
+    return wrapAsync('truncate', () => {
+      return op_open_file(options.filePath, "r+").then(async (fd) => {
+        try {
+          await op_ftruncate(fd, len);
+        } finally {
+          try { await op_close_file(fd); } catch (_) { }
+        }
+      });
+    }, options);
   }
 
   static truncateSync({ filePath, length = 0 }) {
@@ -431,26 +373,15 @@ class BaseFileManager {
   //
   // write(fd)
   //
-  static write({ fd, data, offset = 0, length, encoding = "utf8", position, success, fail, complete }) {
-    let data_buf, data_str;
-
-    try {
-      ({ data_buf, data_str } = toUint8Array(data, offset, length));
-    } catch (err) {
-      const msg = `write:fail ${extractErrText(err)}`;
-      const out = failObj(msg);
-      fail?.(out);
-      complete?.(out);
-      return;
-    }
-
-    let pos = position;
-    if (typeof pos !== "number" || !Number.isFinite(pos)) pos = undefined;
-
-    const p = op_write_file(ensureFd(fd), data_buf, data_str, encoding, pos)
-      .then((bytesWritten) => ({ bytesWritten }));
-
-    wrapAsync(p, "write:ok", "write", { success, fail, complete });
+  static write(options) {
+    return wrapAsync('write', () => {
+      const { data_buf, data_str } = toUint8Array(options.data, options.offset || 0, options.length);
+      const encoding = options.encoding || "utf8";
+      let pos = options.position;
+      if (typeof pos !== "number" || !Number.isFinite(pos)) pos = undefined;
+      return op_write_file(ensureFd(options.fd), data_buf, data_str, encoding, pos)
+        .then((bytesWritten) => ({ bytesWritten }));
+    }, options);
   }
 
   static writeSync({ fd, data, offset = 0, length, encoding = "utf8", position }) {
@@ -468,21 +399,20 @@ class BaseFileManager {
   //
   // readFile (path)
   //
-  static readFile({ filePath, encoding, position, length, success, fail, complete }) {
-    // Convert position/length to BigInt for native op (or undefined)
-    const pos = typeof position === "number" && Number.isFinite(position) && position >= 0
-      ? BigInt(Math.trunc(position))
+  static readFile(options) {
+    const encoding = options.encoding;
+    const pos = typeof options.position === "number" && Number.isFinite(options.position) && options.position >= 0
+      ? BigInt(Math.trunc(options.position))
       : undefined;
-    const len = typeof length === "number" && Number.isFinite(length) && length > 0
-      ? BigInt(Math.trunc(length))
+    const len = typeof options.length === "number" && Number.isFinite(options.length) && options.length > 0
+      ? BigInt(Math.trunc(options.length))
       : undefined;
 
-    const p = op_read_file(filePath, pos, len).then((data) => {
-      // data is Uint8Array from native (already sliced by position/length)
-      return BaseFileManager.#decodeReadData(data, encoding);
-    });
-
-    wrapAsync(p, "readFile:ok", "readFile", { success, fail, complete });
+    return wrapAsync('readFile', () => {
+      return op_read_file(options.filePath, pos, len).then((data) => {
+        return BaseFileManager.#decodeReadData(data, encoding);
+      });
+    }, options);
   }
 
   static readFileSync(filePath_or_obj, encoding_arg, position_arg, length_arg) {
@@ -508,23 +438,17 @@ class BaseFileManager {
     }, "readFileSync");
   }
 
-  // Decode raw bytes to the target encoding.
-  // Returns the decoded value directly (ArrayBuffer if no encoding, string otherwise).
   static #decodeReadResult(bytes, encoding) {
-    // WeChat-compatible: empty string means binary (ArrayBuffer).
     if (encoding === undefined || encoding === null || encoding === "") {
       return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     }
     return BaseFileManager.#decodeBytes(bytes, encoding);
   }
 
-  // Async wrapper: returns { data: ... } for callback-style APIs.
   static #decodeReadData(bytes, encoding) {
     return { data: BaseFileManager.#decodeReadResult(bytes, encoding) };
   }
 
-  // Convert Uint8Array -> string using the specified encoding.
-  // Uses chunked String.fromCharCode to avoid O(n^2) concatenation and stack overflow.
   static #decodeBytes(bytes, encoding) {
     const enc = String(encoding).toLowerCase();
     const len = bytes.length;
@@ -563,8 +487,6 @@ class BaseFileManager {
     }
   }
 
-  // Build string from bytes in 8 KB chunks to avoid call-stack overflow
-  // and O(n^2) string concatenation.
   static #bytesToStringChunked(bytes, len, ascii) {
     const CHUNK = 8192;
     if (len <= CHUNK) {
@@ -592,66 +514,58 @@ class BaseFileManager {
   }
 
   //
-  // placeholders
+  // unzip
   //
-  /**
-   * Extract a zip file to target directory.
-   * Default implementation uses IOCmd::Unzip (Rust zip crate on IO thread).
-   * Platforms can override this (e.g. Android uses java.util.zip via JNI).
-   */
-  static unzip({ zipFilePath, targetPath, success, fail, complete }) {
-    wrapAsync(
-      op_unzip(zipFilePath, targetPath),
-      "unzip:ok",
-      "unzip",
-      { success, fail, complete }
-    );
+  static unzip(options) {
+    return wrapAsync('unzip', () => op_unzip(options.zipFilePath, options.targetPath), options);
   }
-  static read({ fd, arrayBuffer, offset = 0, length = 0, position, success, fail, complete }) {
-    const numFd = ensureFd(fd);
-    if (!arrayBuffer || !(arrayBuffer instanceof ArrayBuffer)) {
-      const out = failObj("read:fail arrayBuffer must be an ArrayBuffer instance");
-      fail?.(out); complete?.(out); return;
-    }
-    offset = Math.trunc(offset);
-    if (offset < 0 || offset >= arrayBuffer.byteLength) {
-      const out = failObj("read:fail invalid offset");
-      fail?.(out); complete?.(out); return;
-    }
-    const maxLen = arrayBuffer.byteLength - offset;
-    let readLen = length > 0 ? Math.min(Math.trunc(length), maxLen) : maxLen;
-    if (readLen <= 0) {
-      const out = failObj("read:fail invalid length");
-      fail?.(out); complete?.(out); return;
-    }
-    let pos;
-    if (typeof position === "number" && Number.isFinite(position) && position >= 0) {
-      pos = BigInt(Math.trunc(position));
-    }
 
-    const p = op_read_fd(numFd, BigInt(readLen), pos).then((data) => {
-      const src = new Uint8Array(data.buffer || data);
-      const dst = new Uint8Array(arrayBuffer);
-      const bytesRead = Math.min(src.length, maxLen);
-      dst.set(src.subarray(0, bytesRead), offset);
-      return { bytesRead, arrayBuffer };
-    });
+  //
+  // read(fd)
+  //
+  static read(options) {
+    return wrapAsync('read', () => {
+      const numFd = ensureFd(options.fd);
+      const arrayBuffer = options.arrayBuffer;
+      if (!arrayBuffer || !(arrayBuffer instanceof ArrayBuffer)) {
+        throw new IOError("arrayBuffer must be an ArrayBuffer instance");
+      }
+      let offset = Math.trunc(options.offset || 0);
+      if (offset < 0 || offset >= arrayBuffer.byteLength) {
+        throw new IOError("invalid offset");
+      }
+      const maxLen = arrayBuffer.byteLength - offset;
+      const length = options.length || 0;
+      let readLen = length > 0 ? Math.min(Math.trunc(length), maxLen) : maxLen;
+      if (readLen <= 0) throw new IOError("invalid length");
 
-    wrapAsync(p, "read:ok", "read", { success, fail, complete });
+      let pos;
+      if (typeof options.position === "number" && Number.isFinite(options.position) && options.position >= 0) {
+        pos = BigInt(Math.trunc(options.position));
+      }
+
+      return op_read_fd(numFd, BigInt(readLen), pos).then((data) => {
+        const src = new Uint8Array(data.buffer || data);
+        const dst = new Uint8Array(arrayBuffer);
+        const bytesRead = Math.min(src.length, maxLen);
+        dst.set(src.subarray(0, bytesRead), offset);
+        return { bytesRead, arrayBuffer };
+      });
+    }, options);
   }
 
   static readSync({ fd, arrayBuffer, offset = 0, length = 0, position }) {
     const numFd = ensureFd(fd);
     if (!arrayBuffer || !(arrayBuffer instanceof ArrayBuffer)) {
-      throw failObj("readSync:fail arrayBuffer must be an ArrayBuffer instance");
+      throw new IOError("readSync: arrayBuffer must be an ArrayBuffer instance");
     }
     offset = Math.trunc(offset);
     if (offset < 0 || offset >= arrayBuffer.byteLength) {
-      throw failObj("readSync:fail invalid offset");
+      throw new IOError("readSync: invalid offset");
     }
     const maxLen = arrayBuffer.byteLength - offset;
     let readLen = length > 0 ? Math.min(Math.trunc(length), maxLen) : maxLen;
-    if (readLen <= 0) throw failObj("readSync:fail invalid length");
+    if (readLen <= 0) throw new IOError("readSync: invalid length");
     let pos;
     if (typeof position === "number" && Number.isFinite(position) && position >= 0) {
       pos = BigInt(Math.trunc(position));
@@ -666,25 +580,27 @@ class BaseFileManager {
       return { bytesRead, arrayBuffer };
     }, "readSync");
   }
-  static readCompressedFile({ filePath, compressionAlgorithm, success, fail, complete }) {
-    if (compressionAlgorithm !== "br") {
-      const out = failObj("readCompressedFile:fail unsupported compressionAlgorithm");
-      fail?.(out);
-      complete?.(out);
-      return;
-    }
-    const p = op_read_compressed_file(filePath).then((data) => {
-      const bytes = new Uint8Array(data.buffer || data);
-      return { data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
-    });
-    wrapAsync(p, "readCompressedFile:ok", "readCompressedFile", { success, fail, complete });
+
+  //
+  // readCompressedFile
+  //
+  static readCompressedFile(options) {
+    return wrapAsync('readCompressedFile', () => {
+      if (options.compressionAlgorithm !== "br") {
+        throw new IOError("unsupported compressionAlgorithm");
+      }
+      return op_read_compressed_file(options.filePath).then((data) => {
+        const bytes = new Uint8Array(data.buffer || data);
+        return { data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
+      });
+    }, options);
   }
 
   static readCompressedFileSync(obj) {
     const filePath = obj.filePath;
     const compressionAlgorithm = obj.compressionAlgorithm;
     if (compressionAlgorithm !== "br") {
-      throw failObj("readCompressedFileSync:fail unsupported compressionAlgorithm");
+      throw new IOError("readCompressedFileSync: unsupported compressionAlgorithm");
     }
     return wrapSync(() => {
       const data = op_read_compressed_file_sync(filePath);
@@ -692,9 +608,14 @@ class BaseFileManager {
       return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     }, "readCompressedFileSync");
   }
-  static readZipEntry({ filePath, encoding, entries, success, fail, complete }) {
+
+  //
+  // readZipEntry
+  //
+  static readZipEntry(options) {
+    const encoding = options.encoding;
+    const entries = options.entries;
     const entriesJson = JSON.stringify({ encoding, entries });
-    // Pre-build path->encoding map to avoid O(nm) find per result entry.
     let encodingMap;
     if (!encoding && Array.isArray(entries)) {
       encodingMap = new Map();
@@ -702,50 +623,48 @@ class BaseFileManager {
         if (entries[i].encoding) encodingMap.set(entries[i].path, entries[i].encoding);
       }
     }
-    // op_read_zip_entry returns a V8 object directly via serde_v8 (no JSON.parse).
-    const p = op_read_zip_entry(filePath, entriesJson).then((result) => {
-      // For entries without encoding, decode base64 back to ArrayBuffer
-      if (result.entries && !encoding) {
-        const keys = Object.keys(result.entries);
-        for (let i = 0; i < keys.length; i++) {
-          const item = result.entries[keys[i]];
-          if (item.data !== null && item.data !== undefined) {
-            if (!encodingMap || !encodingMap.has(keys[i])) {
-              // No encoding specified - data is base64, convert to ArrayBuffer
-              const binary = atob(item.data);
-              const len = binary.length;
-              const buf = new ArrayBuffer(len);
-              const view = new Uint8Array(buf);
-              for (let j = 0; j < len; j++) {
-                view[j] = binary.charCodeAt(j);
+    return wrapAsync('readZipEntry', () => {
+      return op_read_zip_entry(options.filePath, entriesJson).then((result) => {
+        if (result.entries && !encoding) {
+          const keys = Object.keys(result.entries);
+          for (let i = 0; i < keys.length; i++) {
+            const item = result.entries[keys[i]];
+            if (item.data !== null && item.data !== undefined) {
+              if (!encodingMap || !encodingMap.has(keys[i])) {
+                const binary = atob(item.data);
+                const len = binary.length;
+                const buf = new ArrayBuffer(len);
+                const view = new Uint8Array(buf);
+                for (let j = 0; j < len; j++) {
+                  view[j] = binary.charCodeAt(j);
+                }
+                item.data = buf;
               }
-              item.data = buf;
             }
           }
         }
-      }
-      return result;
-    });
-    wrapAsync(p, "readZipEntry:ok", "readZipEntry", { success, fail, complete });
+        return result;
+      });
+    }, options);
   }
 
-  static saveFile({ tempFilePath, filePath, success, fail, complete }) {
-    if (typeof tempFilePath !== "string" || tempFilePath.length === 0) {
-      const out = failObj("saveFile:fail tempFilePath is required");
-      fail?.(out);
-      complete?.(out);
-      return;
-    }
-
-    const savedFilePath = resolveSavedFilePath(filePath, tempFilePath);
-    const p = op_rename(tempFilePath, savedFilePath)
-      .catch(async () => {
-        await op_copy_file(tempFilePath, savedFilePath);
-        await op_unlink(tempFilePath);
-      })
-      .then(() => ({ savedFilePath }));
-
-    wrapAsync(p, "saveFile:ok", "saveFile", { success, fail, complete });
+  //
+  // saveFile
+  //
+  static saveFile(options) {
+    return wrapAsync('saveFile', () => {
+      const tempFilePath = options.tempFilePath;
+      if (typeof tempFilePath !== "string" || tempFilePath.length === 0) {
+        throw new IOError("tempFilePath is required");
+      }
+      const savedFilePath = resolveSavedFilePath(options.filePath, tempFilePath);
+      return op_rename(tempFilePath, savedFilePath)
+        .catch(async () => {
+          await op_copy_file(tempFilePath, savedFilePath);
+          await op_unlink(tempFilePath);
+        })
+        .then(() => ({ savedFilePath }));
+    }, options);
   }
 
   static saveFileSync(tempFilePath_or_obj, filePath_arg) {
@@ -757,7 +676,7 @@ class BaseFileManager {
       filePath = filePath_arg;
     }
     if (typeof tempFilePath !== "string" || tempFilePath.length === 0) {
-      throw failObj("saveFileSync:fail tempFilePath is required");
+      throw new IOError("saveFileSync: tempFilePath is required");
     }
 
     return wrapSync(() => {
@@ -775,19 +694,21 @@ class BaseFileManager {
   //
   // getFileInfo
   //
-  static getFileInfo({ filePath, digestAlgorithm = "md5", success, fail, complete }) {
-    const p = op_get_file_info(filePath, digestAlgorithm)
-      .then(([size, digest]) => ({ size, digest }));
-    wrapAsync(p, "getFileInfo:ok", "getFileInfo", { success, fail, complete });
+  static getFileInfo(options) {
+    return wrapAsync('getFileInfo', () => {
+      return op_get_file_info(options.filePath, options.digestAlgorithm || "md5")
+        .then(([size, digest]) => ({ size, digest }));
+    }, options);
   }
 
   //
   // getSavedFileList
   //
-  static getSavedFileList({ success, fail, complete } = {}) {
-    const p = op_list_saved_files(SAVE_FILE_DIR, "saved_")
-      .then((fileList) => ({ fileList }));
-    wrapAsync(p, "getSavedFileList:ok", "getSavedFileList", { success: success, fail: fail, complete: complete });
+  static getSavedFileList(options) {
+    return wrapAsync('getSavedFileList', () => {
+      return op_list_saved_files(SAVE_FILE_DIR, "saved_")
+        .then((fileList) => ({ fileList }));
+    }, options || {});
   }
 }
 
