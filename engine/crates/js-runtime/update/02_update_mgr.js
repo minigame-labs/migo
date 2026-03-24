@@ -106,4 +106,32 @@ function getUpdateManager() {
     return updateManagerInstance;
 }
 
-export { getUpdateManager, UpdateManager };
+function checkUpdate(options = {}) {
+    const { success, fail, complete } = options;
+    try {
+        const result = {
+            hasUpdate: false,
+            errMsg: 'checkUpdate:ok',
+        };
+        if (typeof success === 'function') {
+            success(result);
+        }
+        if (typeof complete === 'function') {
+            complete(result);
+        }
+        return Promise.resolve(result);
+    } catch (error) {
+        const errorResult = {
+            errMsg: 'checkUpdate:fail ' + error.message,
+        };
+        if (typeof fail === 'function') {
+            fail(errorResult);
+        }
+        if (typeof complete === 'function') {
+            complete(errorResult);
+        }
+        return Promise.reject(errorResult);
+    }
+}
+
+export { getUpdateManager, UpdateManager, checkUpdate };

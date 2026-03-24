@@ -641,20 +641,28 @@ impl HostJsRuntime {
             t_mod_loaded.duration_since(t_eval).as_secs_f64() * 1000.0,
         );
 
-        let evaluation = self.rt.mod_evaluate(module_id);
-        tokio::select! {
-            result = evaluation => {
-                if let Err(e) = result {
-                    return Err(EngineError::new(ErrorCode::ModuleLoadError)
-                        .with_msg("load main es module")
-                        .with_detail(e.to_string()));
+        // Keep pumping the event loop until module evaluation actually resolves.
+        //
+        // `run_event_loop()` may return early while module evaluation is still pending
+        // (for example with top-level await waiting on later callbacks). Returning on
+        // the first `run_event_loop()` completion would leave the module half-initialized.
+        let mut evaluation = std::pin::pin!(self.rt.mod_evaluate(module_id));
+        loop {
+            tokio::select! {
+                result = &mut evaluation => {
+                    if let Err(e) = result {
+                        return Err(EngineError::new(ErrorCode::ModuleLoadError)
+                            .with_msg("load main es module")
+                            .with_detail(e.to_string()));
+                    }
+                    break;
                 }
-            }
-            result = self.rt.run_event_loop(PollEventLoopOptions::default()) => {
-                if let Err(e) = result {
-                    return Err(EngineError::new(ErrorCode::JsException)
-                        .with_msg("event loop error during module evaluation")
-                        .with_detail(e.to_string()));
+                result = self.rt.run_event_loop(PollEventLoopOptions::default()) => {
+                    if let Err(e) = result {
+                        return Err(EngineError::new(ErrorCode::JsException)
+                            .with_msg("event loop error during module evaluation")
+                            .with_detail(e.to_string()));
+                    }
                 }
             }
         }

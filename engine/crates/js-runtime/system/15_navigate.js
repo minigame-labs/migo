@@ -63,10 +63,35 @@ function openBusinessView(options) {
     }, options);
 }
 
+// ---- checkScene / navigateToScene (compat) ---------------------------------
+
+function checkScene(options) {
+    return wrapAsync('checkScene', function () {
+        return {
+            isExist: false,
+        };
+    }, options);
+}
+
+function navigateToScene(options) {
+    return wrapAsync('navigateToScene', function () {
+        return {};
+    }, options);
+}
+
+function openPage(options) {
+    return wrapAsync('openPage', function () {
+        return {};
+    }, options);
+}
+
 export {
     navigateToMiniProgram,
     navigateBackMiniProgram,
     _internalOnNavigateToMiniProgramResult,
     openCustomerServiceConversation,
     openBusinessView,
+    checkScene,
+    navigateToScene,
+    openPage,
 };

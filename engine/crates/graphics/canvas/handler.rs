@@ -40,20 +40,17 @@ impl CanvasHandler {
             CanvasCmd::RecreateOnscreen { surface, resp } => {
                 let res = (|| -> EngineResult<()> {
                     let win = onscreen_window_from_surface(surface.as_ref())?;
-                    cm.create_onscreen(win)?;
+                    let size = surface.size();
+                    cm.create_onscreen(win, Some(size))?;
                     Ok(())
                 })();
-                // Send the result to the host thread (via resp channel) AND
-                // propagate success/failure to the render thread so it can
-                // correctly update has_surface. Previously this always returned
-                // Ok(()), causing the render thread to set has_surface = true
-                // even when eglCreateWindowSurface failed.
-                let succeeded = res.is_ok();
+                // Propagate to both host (via resp) and render thread (via return).
+                let err_detail = res.as_ref().err().map(|e| e.to_string());
                 let _ = resp.send(res);
-                if !succeeded {
+                if let Some(detail) = err_detail {
                     return Err(EngineError::from_detail(
                         ErrorCode::RenderBackendError,
-                        "RecreateOnscreen failed",
+                        detail,
                     ));
                 }
             }

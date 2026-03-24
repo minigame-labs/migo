@@ -83,6 +83,11 @@ public class GameActivity extends Activity {
                     "gameId" 
                 );
 
+                // 3.1 可选：注册宿主回调（建议在 startGame 前）
+                // session.setAuthHandler(authHandler);
+                // session.setGameLogHandler(gameLogHandler);
+                // session.setSubpackageHandler(subpackageHandler);
+
                 // 3. 启动游戏
                 session.startGame("game.js");
             }

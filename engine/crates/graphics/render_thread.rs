@@ -77,7 +77,7 @@ impl RenderThread {
                 if let Some(surface) = initial_surface {
                     match onscreen_window_from_surface(surface.as_ref()) {
                         Ok(win) => {
-                            if let Err(e) = cm.create_onscreen(win) {
+                            if let Err(e) = cm.create_onscreen(win, None) {
                                 error!("create_onscreen failed: {}", e);
                             }
                         }

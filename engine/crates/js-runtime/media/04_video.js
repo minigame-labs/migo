@@ -418,8 +418,279 @@ function _internalTriggerVideoEvent(videoId, eventType, dataJson) {
     }
 }
 
+function _emitSnapshot(listeners, payload) {
+    if (!listeners || listeners.length === 0) return;
+    var snapshot = listeners.slice();
+    for (var i = 0; i < snapshot.length; i++) {
+        try {
+            snapshot[i](payload);
+        } catch (e) {
+            console.error('Live callback error:', e);
+        }
+    }
+}
+
+function _finishWithCallbacks(apiName, options, successPayload) {
+    var payload = successPayload || {};
+    payload.errMsg = apiName + ':ok';
+    if (options && typeof options.success === 'function') {
+        try { options.success(payload); } catch (e) {
+            console.error(apiName + ' success callback error:', e);
+        }
+    }
+    if (options && typeof options.complete === 'function') {
+        try { options.complete(payload); } catch (e) {
+            console.error(apiName + ' complete callback error:', e);
+        }
+    }
+    return Promise.resolve(payload);
+}
+
+class LivePlayerContext {
+    #destroyed = false;
+    #playing = false;
+    #muted = false;
+    #volumeTimer = null;
+    #listeners = {
+        statechange: [],
+        audiovolume: [],
+    };
+
+    constructor(options) {
+        if (options && typeof options === 'object') {
+            Object.assign(this, options);
+        }
+    }
+
+    onStateChange(listener) {
+        if (typeof listener === 'function') this.#listeners.statechange.push(listener);
+    }
+
+    offStateChange(listener) {
+        if (typeof listener === 'function') {
+            var i = this.#listeners.statechange.indexOf(listener);
+            if (i !== -1) this.#listeners.statechange.splice(i, 1);
+        } else {
+            this.#listeners.statechange.length = 0;
+        }
+    }
+
+    onAudioVolumeNotify(listener) {
+        if (typeof listener === 'function') this.#listeners.audiovolume.push(listener);
+    }
+
+    offAudioVolumeNotify(listener) {
+        if (typeof listener === 'function') {
+            var i = this.#listeners.audiovolume.indexOf(listener);
+            if (i !== -1) this.#listeners.audiovolume.splice(i, 1);
+        } else {
+            this.#listeners.audiovolume.length = 0;
+        }
+    }
+
+    play(options) {
+        if (this.#destroyed) return Promise.reject(new Error('livePlayer.play:fail destroyed'));
+        this.#playing = true;
+        this.#startVolumeTicker();
+        _emitSnapshot(this.#listeners.statechange, { code: 2004, message: 'play' });
+        return _finishWithCallbacks('livePlayer.play', options, {});
+    }
+
+    stop(options) {
+        if (this.#destroyed) return Promise.reject(new Error('livePlayer.stop:fail destroyed'));
+        this.#playing = false;
+        this.#stopVolumeTicker();
+        _emitSnapshot(this.#listeners.statechange, { code: 2006, message: 'stop' });
+        return _finishWithCallbacks('livePlayer.stop', options, {});
+    }
+
+    pause(options) {
+        if (this.#destroyed) return Promise.reject(new Error('livePlayer.pause:fail destroyed'));
+        this.#playing = false;
+        this.#stopVolumeTicker();
+        _emitSnapshot(this.#listeners.statechange, { code: 2007, message: 'pause' });
+        return _finishWithCallbacks('livePlayer.pause', options, {});
+    }
+
+    resume(options) {
+        return this.play(options);
+    }
+
+    mute(options) {
+        if (this.#destroyed) return Promise.reject(new Error('livePlayer.mute:fail destroyed'));
+        this.#muted = !this.#muted;
+        _emitSnapshot(this.#listeners.audiovolume, { volume: this.#muted ? 0 : 100 });
+        return _finishWithCallbacks('livePlayer.mute', options, {});
+    }
+
+    destroy() {
+        this.#destroyed = true;
+        this.#playing = false;
+        this.#stopVolumeTicker();
+        this.#listeners.statechange.length = 0;
+        this.#listeners.audiovolume.length = 0;
+        return Promise.resolve();
+    }
+
+    #startVolumeTicker() {
+        this.#stopVolumeTicker();
+        this.#volumeTimer = setInterval(() => {
+            if (!this.#playing || this.#destroyed) return;
+            _emitSnapshot(this.#listeners.audiovolume, { volume: this.#muted ? 0 : 100 });
+        }, 300);
+    }
+
+    #stopVolumeTicker() {
+        if (this.#volumeTimer) {
+            clearInterval(this.#volumeTimer);
+            this.#volumeTimer = null;
+        }
+    }
+}
+
+class LivePusherContext {
+    #destroyed = false;
+    #started = false;
+    #bgmTimer = null;
+    #bgmProgress = 0;
+    #listeners = {
+        statechange: [],
+        error: [],
+        netstatus: [],
+        bgmstart: [],
+        bgmcomplete: [],
+        bgmprogress: [],
+    };
+
+    constructor(options) {
+        if (options && typeof options === 'object') {
+            Object.assign(this, options);
+        }
+    }
+
+    onStateChange(listener) {
+        if (typeof listener === 'function') this.#listeners.statechange.push(listener);
+    }
+
+    onError(listener) {
+        if (typeof listener === 'function') this.#listeners.error.push(listener);
+    }
+
+    onNetStatus(listener) {
+        if (typeof listener === 'function') this.#listeners.netstatus.push(listener);
+    }
+
+    onBGMStart(listener) {
+        if (typeof listener === 'function') this.#listeners.bgmstart.push(listener);
+    }
+
+    onBGMComplete(listener) {
+        if (typeof listener === 'function') this.#listeners.bgmcomplete.push(listener);
+    }
+
+    onBGMProgress(listener) {
+        if (typeof listener === 'function') this.#listeners.bgmprogress.push(listener);
+    }
+
+    start(options) {
+        if (this.#destroyed) return Promise.reject(new Error('livePusher.start:fail destroyed'));
+        this.#started = true;
+        _emitSnapshot(this.#listeners.statechange, { code: 1001, message: 'start' });
+        return _finishWithCallbacks('livePusher.start', options, {});
+    }
+
+    stop(options) {
+        if (this.#destroyed) return Promise.reject(new Error('livePusher.stop:fail destroyed'));
+        this.#started = false;
+        _emitSnapshot(this.#listeners.statechange, { code: 1006, message: 'stop' });
+        return _finishWithCallbacks('livePusher.stop', options, {});
+    }
+
+    pause(options) {
+        if (this.#destroyed) return Promise.reject(new Error('livePusher.pause:fail destroyed'));
+        _emitSnapshot(this.#listeners.statechange, { code: 1007, message: 'pause' });
+        return _finishWithCallbacks('livePusher.pause', options, {});
+    }
+
+    resume(options) {
+        if (this.#destroyed) return Promise.reject(new Error('livePusher.resume:fail destroyed'));
+        _emitSnapshot(this.#listeners.statechange, { code: 1008, message: 'resume' });
+        return _finishWithCallbacks('livePusher.resume', options, {});
+    }
+
+    playBGM(url) {
+        if (this.#destroyed) return;
+        this.#bgmProgress = 0;
+        _emitSnapshot(this.#listeners.bgmstart, { url: typeof url === 'string' ? url : '' });
+        this.#startBgmTicker();
+    }
+
+    pauseBGM() {
+        if (this.#destroyed) return;
+        this.#stopBgmTicker();
+    }
+
+    resumeBGM() {
+        if (this.#destroyed) return;
+        this.#startBgmTicker();
+    }
+
+    stopBGM() {
+        if (this.#destroyed) return;
+        this.#stopBgmTicker();
+        _emitSnapshot(this.#listeners.bgmcomplete, { reason: 'stop' });
+    }
+
+    setBGMVolume(_volume) {}
+
+    setMICVolume(_volume) {}
+
+    destroy() {
+        this.#destroyed = true;
+        this.#started = false;
+        this.#stopBgmTicker();
+        this.#listeners.statechange.length = 0;
+        this.#listeners.error.length = 0;
+        this.#listeners.netstatus.length = 0;
+        this.#listeners.bgmstart.length = 0;
+        this.#listeners.bgmcomplete.length = 0;
+        this.#listeners.bgmprogress.length = 0;
+        return Promise.resolve();
+    }
+
+    #startBgmTicker() {
+        this.#stopBgmTicker();
+        this.#bgmTimer = setInterval(() => {
+            if (this.#destroyed) return;
+            this.#bgmProgress += 1000;
+            _emitSnapshot(this.#listeners.bgmprogress, { progress: this.#bgmProgress });
+            if (this.#bgmProgress >= 3000) {
+                this.#stopBgmTicker();
+                _emitSnapshot(this.#listeners.bgmcomplete, { reason: 'complete' });
+            }
+        }, 500);
+    }
+
+    #stopBgmTicker() {
+        if (this.#bgmTimer) {
+            clearInterval(this.#bgmTimer);
+            this.#bgmTimer = null;
+        }
+    }
+}
+
+function createLivePlayer(options) {
+    return new LivePlayerContext(options || {});
+}
+
+function createLivePusher(options) {
+    return new LivePusherContext(options || {});
+}
+
 export {
     Video,
     createVideo,
     _internalTriggerVideoEvent,
+    createLivePlayer,
+    createLivePusher,
 };

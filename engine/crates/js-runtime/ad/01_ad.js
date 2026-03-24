@@ -4,6 +4,57 @@
 const MOCK_LOAD_DELAY_MS = 100;
 const MOCK_REWARDED_VIDEO_DURATION_MS = 500;
 
+const _directAdStatus = {
+  isInMask: false,
+  isInDirectGameAd: false,
+};
+
+const _directAdStatusListeners = [];
+
+function _notifyDirectAdStatus(status) {
+  for (let i = 0; i < _directAdStatusListeners.length; i++) {
+    try {
+      _directAdStatusListeners[i](status);
+    } catch (e) {
+      console.error("onDirectAdStatusChange listener error:", e);
+    }
+  }
+}
+
+function onDirectAdStatusChange(listener) {
+  if (typeof listener !== "function") return;
+  _directAdStatusListeners.push(listener);
+  queueMicrotask(() => {
+    try {
+      listener(getDirectAdStatusSync());
+    } catch (e) {
+      console.error("onDirectAdStatusChange listener error:", e);
+    }
+  });
+}
+
+function offDirectAdStatusChange(listener) {
+  if (typeof listener === "function") {
+    const idx = _directAdStatusListeners.indexOf(listener);
+    if (idx !== -1) {
+      _directAdStatusListeners.splice(idx, 1);
+    }
+  } else {
+    _directAdStatusListeners.length = 0;
+  }
+}
+
+function _internalTriggerDirectAdStatusChange(status) {
+  if (!status || typeof status !== "object") return;
+  if (status.isInMask !== undefined) {
+    _directAdStatus.isInMask = !!status.isInMask;
+  }
+  if (status.isInDirectGameAd !== undefined) {
+    _directAdStatus.isInDirectGameAd = !!status.isInDirectGameAd;
+  }
+  _notifyDirectAdStatus(getDirectAdStatusSync());
+}
+
 // ==================== AdBase (shared listener pattern) ====================
 
 class AdBase {
@@ -465,8 +516,8 @@ function createRewardedVideoAd(obj) {
 
 function getDirectAdStatusSync() {
   return {
-    isInMask: false,
-    isInDirectGameAd: false,
+    isInMask: _directAdStatus.isInMask,
+    isInDirectGameAd: _directAdStatus.isInDirectGameAd,
   };
 }
 
@@ -662,6 +713,9 @@ export {
   createInterstitialAd,
   createRewardedVideoAd,
   getDirectAdStatusSync,
+  onDirectAdStatusChange,
+  offDirectAdStatusChange,
+  _internalTriggerDirectAdStatusChange,
   getShowSplashAdStatus,
   createGameBanner,
   createGameIcon,

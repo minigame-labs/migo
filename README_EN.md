@@ -83,6 +83,11 @@ public class GameActivity extends Activity {
                     "gameId"
                 );
 
+                // 3.1 Optional: register host handlers before startGame
+                // session.setAuthHandler(authHandler);
+                // session.setGameLogHandler(gameLogHandler);
+                // session.setSubpackageHandler(subpackageHandler);
+
                 // 3. Start game
                 session.startGame("game.js");
             }

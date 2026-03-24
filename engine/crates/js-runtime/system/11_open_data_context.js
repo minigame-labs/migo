@@ -93,6 +93,10 @@ function getSharedCanvas() {
     return _createSharedCanvas("offscreenCanvas");
 }
 
+function postMessage(message) {
+    getOpenDataContext().postMessage(message);
+}
+
 // ---- Cloud Storage stubs (open data context APIs) -------------------------
 // These APIs are standard but require server-side backend integration.
 // Stub implementations return empty data / succeed silently to prevent crashes.
@@ -142,6 +146,7 @@ function getUserGameLabel(options) {
 export {
     onMessage,
     offMessage,
+    postMessage,
     getOpenDataContext,
     getSharedCanvas,
     getFriendCloudStorage,

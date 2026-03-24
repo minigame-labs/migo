@@ -42,9 +42,6 @@ import java.io.File;
  * // Start the game from its code directory
  * session.startGame("game.js");  // Uses paths.getCodeDir()
  *
- * // Or start from custom directory
- * session.startGame("/custom/path", "game.js");
- *
  * // Handle touch events
  * surfaceView.setOnTouchListener((v, event) -> {
  *     session.dispatchTouchEvent(event);

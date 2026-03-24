@@ -158,6 +158,102 @@ function requestSubscribeMessage(options) {
     }, options);
 }
 
+// ---- requestSubscribeSystemMessage ------------------------------------------
+
+function _buildAcceptMap(values) {
+    var result = {};
+    if (!Array.isArray(values)) return result;
+    for (var i = 0; i < values.length; i++) {
+        var key = values[i];
+        if (typeof key === 'string' && key.length > 0) {
+            result[key] = 'accept';
+        }
+    }
+    return result;
+}
+
+function requestSubscribeSystemMessage(options) {
+    return wrapAsync('requestSubscribeSystemMessage', function () {
+        var opts = options || {};
+        return _buildAcceptMap(opts.msgTypeList || []);
+    }, options);
+}
+
+function requestSubscribeWhatsNew(options) {
+    return wrapAsync('requestSubscribeWhatsNew', function () {
+        return {
+            confirm: true,
+            status: 'accept',
+        };
+    }, options);
+}
+
+function getWhatsNewSubscriptionsSetting(options) {
+    return wrapAsync('getWhatsNewSubscriptionsSetting', function () {
+        return {
+            status: 2,
+            mainSwitch: true,
+            itemSettings: {
+                SYS_MSG_TYPE_WHATS_NEW: 'accept',
+            },
+        };
+    }, options);
+}
+
+function authPrivateMessage(options) {
+    return wrapAsync('authPrivateMessage', function () {
+        return {
+            valid: true,
+        };
+    }, options);
+}
+
+function subscribeAppMsg(options) {
+    return wrapAsync('subscribeAppMsg', function () {
+        var opts = options || {};
+        var result = _buildAcceptMap(opts.tmplIds || []);
+        if (typeof opts.subscribe === 'function') {
+            try {
+                opts.subscribe(result);
+            } catch (e) {
+                console.error('subscribeAppMsg callback error:', e);
+            }
+        }
+        return result;
+    }, options);
+}
+
+function checkUserLocation(options) {
+    return wrapAsync('checkUserLocation', function () {
+        var allowed = !!_authSetting['scope.userLocation'];
+        return {
+            authSetting: {
+                'scope.userLocation': allowed,
+            },
+            hasLocationPer: allowed,
+        };
+    }, options);
+}
+
+function getWritePhotosAlbum(options) {
+    return wrapAsync('getWritePhotosAlbum', function () {
+        _authSetting['scope.writePhotosAlbum'] = true;
+        return {};
+    }, options);
+}
+
+function checkWritePhotosAlbum(options) {
+    return wrapAsync('checkWritePhotosAlbum', function () {
+        var allowed = !!_authSetting['scope.writePhotosAlbum'];
+        return {
+            authSetting: {
+                'scope.writePhotosAlbum': allowed,
+            },
+            hascheckWritePhotosAlbum: allowed,
+        };
+    }, options);
+}
+
 export {
     getSetting,
     authorize,
@@ -171,4 +267,12 @@ export {
     _internalTriggerNeedPrivacyAuthorization,
     requirePrivacyAuthorize,
     requestSubscribeMessage,
+    requestSubscribeSystemMessage,
+    requestSubscribeWhatsNew,
+    getWhatsNewSubscriptionsSetting,
+    authPrivateMessage,
+    subscribeAppMsg,
+    checkUserLocation,
+    getWritePhotosAlbum,
+    checkWritePhotosAlbum,
 };

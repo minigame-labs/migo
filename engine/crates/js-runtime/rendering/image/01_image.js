@@ -24,7 +24,7 @@ class Image {
 
         this._onload = null;
         this._onerror = null;
-        this._listeners = { load: [], error: [] };
+        this.#listeners = { load: [], error: [] };
 
         this._loaded = false;
         this._error = null;
@@ -74,23 +74,27 @@ class Image {
         this._onerror = typeof fn === "function" ? fn : null;
     }
 
+    #listeners;
+
     addEventListener(type, fn) {
         if (typeof fn !== "function") return;
-        const list = this._listeners[type];
+        const list = this.#listeners[type];
         if (list && list.indexOf(fn) === -1) list.push(fn);
     }
 
     removeEventListener(type, fn) {
-        const list = this._listeners[type];
+        const list = this.#listeners[type];
         if (!list) return;
         const i = list.indexOf(fn);
         if (i !== -1) list.splice(i, 1);
     }
 
-    _fireListeners(type, arg) {
-        const list = this._listeners[type];
-        for (let i = 0; i < list.length; i++) {
-            try { list[i](arg); } catch (_) {}
+    #fireListeners(type, arg) {
+        const list = this.#listeners[type];
+        if (!list) return;
+        const snapshot = list.slice();
+        for (let i = 0; i < snapshot.length; i++) {
+            try { snapshot[i](arg); } catch (_) {}
         }
     }
 
@@ -108,7 +112,7 @@ class Image {
             const err = new TypeError("Image.src is empty");
             this._error = err;
             this._onerror && this._onerror(err);
-            this._fireListeners('error', err);
+            this.#fireListeners('error', err);
             return;
         }
 
@@ -129,7 +133,7 @@ class Image {
                 this._error = null;
 
                 this._onload && this._onload();
-                this._fireListeners('load', undefined);
+                this.#fireListeners('load', undefined);
             })
             .catch((err) => {
                 if (seq !== this._load_seq) return;
@@ -139,7 +143,7 @@ class Image {
                 this._error = err;
 
                 this._onerror && this._onerror(err);
-                this._fireListeners('error', err);
+                this.#fireListeners('error', err);
             });
     }
 }

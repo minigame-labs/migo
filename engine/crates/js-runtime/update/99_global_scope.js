@@ -10,4 +10,5 @@ ObjectDefineProperties(globalThis, {
     // Update
     updateApp: core.propNonEnumerable(updateApp.updateApp),
     getUpdateManager: core.propNonEnumerable(updateMgr.getUpdateManager),
+    checkUpdate: core.propNonEnumerable(updateMgr.checkUpdate),
 });

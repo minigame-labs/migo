@@ -92,6 +92,8 @@ pub(super) struct CanvasEntry {
     pub info: CanvasInfo,
     pub logical_width: u32,
     pub logical_height: u32,
+    pub physical_width: u32,
+    pub physical_height: u32,
     pub kind: SurfaceKind,
     pub ctx: EglContextHandle,
 }

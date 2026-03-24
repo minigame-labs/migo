@@ -557,15 +557,15 @@ class BaseFileManager {
   static readSync({ fd, arrayBuffer, offset = 0, length = 0, position }) {
     const numFd = ensureFd(fd);
     if (!arrayBuffer || !(arrayBuffer instanceof ArrayBuffer)) {
-      throw new IOError("readSync: arrayBuffer must be an ArrayBuffer instance");
+      throw new IOError("arrayBuffer must be an ArrayBuffer instance");
     }
     offset = Math.trunc(offset);
     if (offset < 0 || offset >= arrayBuffer.byteLength) {
-      throw new IOError("readSync: invalid offset");
+      throw new IOError("invalid offset");
     }
     const maxLen = arrayBuffer.byteLength - offset;
     let readLen = length > 0 ? Math.min(Math.trunc(length), maxLen) : maxLen;
-    if (readLen <= 0) throw new IOError("readSync: invalid length");
+    if (readLen <= 0) throw new IOError("invalid length");
     let pos;
     if (typeof position === "number" && Number.isFinite(position) && position >= 0) {
       pos = BigInt(Math.trunc(position));
@@ -600,7 +600,7 @@ class BaseFileManager {
     const filePath = obj.filePath;
     const compressionAlgorithm = obj.compressionAlgorithm;
     if (compressionAlgorithm !== "br") {
-      throw new IOError("readCompressedFileSync: unsupported compressionAlgorithm");
+      throw new IOError("unsupported compressionAlgorithm");
     }
     return wrapSync(() => {
       const data = op_read_compressed_file_sync(filePath);
@@ -676,7 +676,7 @@ class BaseFileManager {
       filePath = filePath_arg;
     }
     if (typeof tempFilePath !== "string" || tempFilePath.length === 0) {
-      throw new IOError("saveFileSync: tempFilePath is required");
+      throw new IOError("tempFilePath is required");
     }
 
     return wrapSync(() => {

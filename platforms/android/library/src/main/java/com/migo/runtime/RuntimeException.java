@@ -7,7 +7,7 @@ package com.migo.runtime;
  *
  * <pre>{@code
  * try {
- *     session.startGame(codeDir, "game.js");
+ *     session.startGame("game.js");
  * } catch (RuntimeException e) {
  *     if (e.getErrorCode() == ErrorCode.ERR_CODE_DIR_NOT_FOUND) {
  *         // Handle missing code directory

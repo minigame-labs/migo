@@ -187,6 +187,8 @@ impl CanvasManager {
                 info,
                 logical_width: logical_w,
                 logical_height: logical_h,
+                physical_width: physical_w,
+                physical_height: physical_h,
                 kind: SurfaceKind::Pbuffer,
                 ctx: EglContextHandle { ctx, surf },
             },
@@ -195,18 +197,30 @@ impl CanvasManager {
         Ok(id)
     }
 
-    pub(crate) fn create_onscreen(&mut self, window: usize) -> EngineResult<()> {
+    /// Create or recreate the onscreen canvas (id=1).
+    ///
+    /// `surface_size`: expected physical dimensions from the SurfaceRef.
+    /// When provided, skip the destroy-recreate cycle if the same native
+    /// window is already active AND its dimensions match. This avoids
+    /// "already connected" (EGL_BAD_ALLOC) errors on some Android drivers
+    /// while still handling surface resizes (e.g. status bar hide/show).
+    /// Pass `None` for initial creation and context recovery.
+    pub(crate) fn create_onscreen(
+        &mut self,
+        window: usize,
+        surface_size: Option<(u32, u32)>,
+    ) -> EngineResult<()> {
         let id = CanvasId::from(1u32);
 
-        // If the same native window is already active as the onscreen canvas,
-        // skip the destroy-recreate cycle. This avoids "already connected"
-        // (EGL_BAD_ALLOC) errors that occur on some Android drivers where
-        // eglDestroySurface does not synchronously disconnect the buffer queue
-        // producer. Common trigger: init() provides initial_surface, then
-        // updateSurface() is called with the same Surface shortly after.
-        if let Some(entry) = self.canvases.get(&id) {
-            if matches!(entry.kind, SurfaceKind::Window(w) if w == window) {
-                return Ok(());
+        // Same native window + same physical dimensions → skip destroy-recreate.
+        if let Some((exp_w, exp_h)) = surface_size {
+            if let Some(entry) = self.canvases.get(&id) {
+                if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
+                    && entry.physical_width == exp_w
+                    && entry.physical_height == exp_h
+                {
+                    return Ok(());
+                }
             }
         }
 
@@ -291,6 +305,8 @@ impl CanvasManager {
                 kind: SurfaceKind::Window(window),
                 logical_width: logical_w,
                 logical_height: logical_h,
+                physical_width: physical_w,
+                physical_height: physical_h,
                 ctx: EglContextHandle { ctx, surf },
             },
         );
@@ -361,7 +377,7 @@ impl CanvasManager {
         }
         if let Some(window) = self.last_window {
             tracing::info!("Attempting EGL context loss recovery");
-            self.create_onscreen(window)?;
+            self.create_onscreen(window, None)?;
             tracing::info!("EGL context recovered successfully");
             Ok(true)
         } else {

@@ -163,6 +163,36 @@ if (result.isSuccess()) {
 }
 ```
 
+### 注册宿主回调 Handler（Auth / GameLog / Subpackage）
+
+在最新 API 中，`GameSession` 支持三类宿主回调。建议在 `startGame()` 前注册。
+
+```java
+session.setAuthHandler(new AuthHandler() {
+    @Override
+    public void login(int timeoutMs, LoginCallback callback) {
+        callback.onFailure("not implemented");
+    }
+
+    @Override
+    public void checkSession(CheckSessionCallback callback) {
+        callback.onFailure("not implemented");
+    }
+});
+
+session.setGameLogHandler(logJson -> {
+    Log.i("GameLog", logJson);
+});
+
+session.setSubpackageHandler((request, callback) -> {
+    callback.onFailure("download not implemented");
+});
+```
+
+- `setAuthHandler(AuthHandler)`：处理 `wx.login` / `wx.checkSession` / `wx.getUserInfo` / `wx.getPhoneNumber`
+- `setGameLogHandler(GameLogHandler)`：接收小游戏上报日志（JSON 字符串）
+- `setSubpackageHandler(SubpackageHandler)`：处理 `loadSubpackage` / `preDownloadSubpackage` 的下载过程
+
 ## 文件系统隔离
 
 每个游戏都有独立的沙箱化目录，通过 `GamePaths` 管理：
@@ -287,12 +317,15 @@ String message = ErrorCode.getMessage(code);
 | 方法 | 描述 |
 |------|------|
 | `getInstance()` | 获取单例实例 |
-| `createSession(Activity, Surface, RuntimeConfig)` | 创建游戏会话 |
-| `createSessionSafe(...)` | 无异常版本 |
+| `createSession(Activity, Surface, RuntimeConfig, String gameId)` | 创建游戏会话（Activity 绑定） |
+| `createSession(Context, Surface, RuntimeConfig, String gameId)` | 创建游戏会话（无 Activity 绑定） |
+| `createSessionSafe(Activity, Surface, RuntimeConfig, String gameId)` | 无异常版本 |
 | `getVersion()` | 获取 SDK 版本 |
 | `getNativeVersion()` | 获取原生引擎版本 |
 | `isNativeLoaded()` | 检查原生库是否加载 |
 | `isDeviceSupported()` | 检查设备兼容性 |
+| `getActiveSessionCount()` | 获取当前活跃会话数 |
+| `getMinSdkVersion()` | 获取最低支持 API 等级 |
 
 ### GameSession
 
@@ -300,12 +333,18 @@ String message = ErrorCode.getMessage(code);
 
 | 方法 | 描述 |
 |------|------|
-| `startGame(codeDir, entryPoint)` | 启动游戏 |
-| `startGameSafe(...)` | 无异常版本 |
+| `startGame(String entryPoint)` | 启动游戏（从 `paths.getCodeDir()`） |
+| `startGameSafe(String entryPoint)` | 无异常版本 |
 | `pause()` | 暂停游戏 |
 | `resume()` | 恢复游戏 |
+| `restart()` | 重启游戏 |
 | `updateSurface(Surface)` | 更新渲染表面 |
 | `dispatchTouchEvent(MotionEvent)` | 处理触摸输入 |
+| `dispatchMemoryWarning(int)` | 转发内存告警 |
+| `setListener(GameSessionListener)` | 注册统一会话事件回调 |
+| `setAuthHandler(AuthHandler)` | 注册鉴权回调 |
+| `setGameLogHandler(GameLogHandler)` | 注册游戏日志回调 |
+| `setSubpackageHandler(SubpackageHandler)` | 注册分包下载回调 |
 | `close()` / `destroy()` | 释放资源 |
 | `isValid()` | 检查会话是否有效 |
 | `isGameStarted()` | 检查游戏是否已启动 |

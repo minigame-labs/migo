@@ -151,17 +151,48 @@ session.setListener(new GameSessionListener() {
 
 ```java
 MigoRuntime.Result<GameSession> result = MigoRuntime.getInstance()
-    .createSessionSafe(activity, surface, config);
+    .createSessionSafe(activity, surface, config, "my-game-id");
 
 if (result.isSuccess()) {
     session = result.getValue();
-    session.startGame(codeDir, "game.js");
+    session.startGame("game.js");  // uses paths.getCodeDir()
 } else {
     int errorCode = result.getErrorCode();
     String message = result.getErrorMessage();
     Log.e(TAG, "Failed to create session: " + ErrorCode.getMessage(errorCode));
 }
 ```
+
+### Register Host Handlers (Auth / GameLog / Subpackage)
+
+In the latest API, `GameSession` supports three host callback handlers.
+Register them before `startGame()` whenever possible.
+
+```java
+session.setAuthHandler(new AuthHandler() {
+    @Override
+    public void login(int timeoutMs, LoginCallback callback) {
+        callback.onFailure("not implemented");
+    }
+
+    @Override
+    public void checkSession(CheckSessionCallback callback) {
+        callback.onFailure("not implemented");
+    }
+});
+
+session.setGameLogHandler(logJson -> {
+    Log.i("GameLog", logJson);
+});
+
+session.setSubpackageHandler((request, callback) -> {
+    callback.onFailure("download not implemented");
+});
+```
+
+- `setAuthHandler(AuthHandler)`: backs `wx.login` / `wx.checkSession` / `wx.getUserInfo` / `wx.getPhoneNumber`
+- `setGameLogHandler(GameLogHandler)`: receives game-reported logs (JSON string)
+- `setSubpackageHandler(SubpackageHandler)`: handles `loadSubpackage` / `preDownloadSubpackage` downloads
 
 ## Configuration Options
 
@@ -210,12 +241,15 @@ The main entry point (singleton):
 | Method | Description |
 |--------|-------------|
 | `getInstance()` | Get the singleton instance |
-| `createSession(Activity, Surface, RuntimeConfig)` | Create a new game session |
-| `createSessionSafe(...)` | Non-throwing version |
+| `createSession(Activity, Surface, RuntimeConfig, String gameId)` | Create a game session (Activity-bound) |
+| `createSession(Context, Surface, RuntimeConfig, String gameId)` | Create a game session (without Activity binding) |
+| `createSessionSafe(Activity, Surface, RuntimeConfig, String gameId)` | Non-throwing version |
 | `getVersion()` | Get SDK version |
 | `getNativeVersion()` | Get native engine version |
 | `isNativeLoaded()` | Check if native library loaded |
 | `isDeviceSupported()` | Check device compatibility |
+| `getActiveSessionCount()` | Get active session count |
+| `getMinSdkVersion()` | Get minimum supported API level |
 
 ### GameSession
 
@@ -223,12 +257,18 @@ Represents an active game session (implements `Closeable`):
 
 | Method | Description |
 |--------|-------------|
-| `startGame(codeDir, entryPoint)` | Start a game |
-| `startGameSafe(...)` | Non-throwing version |
+| `startGame(String entryPoint)` | Start game (from `paths.getCodeDir()`) |
+| `startGameSafe(String entryPoint)` | Non-throwing version |
 | `pause()` | Pause the game |
 | `resume()` | Resume the game |
+| `restart()` | Restart the game |
 | `updateSurface(Surface)` | Update rendering surface |
 | `dispatchTouchEvent(MotionEvent)` | Handle touch input |
+| `dispatchMemoryWarning(int)` | Forward memory pressure signal |
+| `setListener(GameSessionListener)` | Register unified session listener |
+| `setAuthHandler(AuthHandler)` | Register auth handler |
+| `setGameLogHandler(GameLogHandler)` | Register game log handler |
+| `setSubpackageHandler(SubpackageHandler)` | Register subpackage download handler |
 | `close()` / `destroy()` | Release resources |
 | `isValid()` | Check if session is valid |
 | `isGameStarted()` | Check if game started |

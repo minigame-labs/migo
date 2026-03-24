@@ -109,8 +109,12 @@ const WindowGlobalScope = {
     // App Lifecycle (show/hide)
     onShow: core.propNonEnumerable(appLifecycle.onShow),
     onHide: core.propNonEnumerable(appLifecycle.onHide),
+    onAppShow: core.propNonEnumerable(appLifecycle.onShow),
+    onAppHide: core.propNonEnumerable(appLifecycle.onHide),
     offShow: core.propNonEnumerable(appLifecycle.offShow),
     offHide: core.propNonEnumerable(appLifecycle.offHide),
+    offAppShow: core.propNonEnumerable(appLifecycle.offShow),
+    offAppHide: core.propNonEnumerable(appLifecycle.offHide),
     getLaunchOptionsSync: core.propNonEnumerable(appLifecycle.getLaunchOptionsSync),
     getEnterOptionsSync: core.propNonEnumerable(appLifecycle.getEnterOptionsSync),
     _internalTriggerOnShow: core.propNonEnumerable(function (option) {

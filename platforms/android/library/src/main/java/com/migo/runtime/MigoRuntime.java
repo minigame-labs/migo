@@ -48,11 +48,13 @@ import com.migo.runtime.internal.platform.DisplayCompat;
  *                 session = runtime.createSession(
  *                     GameActivity.this,
  *                     holder.getSurface(),
- *                     config
+ *                     config,
+ *                     "my-game-id"
  *                 );
  *
  *                 // Start the game
- *                 session.startGame("/path/to/game", "game.js");
+ *                 // Place game code into: session.getPaths().getCodeDir()
+ *                 session.startGame("game.js");
  *             }
  *
  *             @Override

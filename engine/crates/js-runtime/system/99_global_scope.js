@@ -83,6 +83,14 @@ ObjectDefineProperties(globalThis, {
     openSetting: core.propNonEnumerable(settingApi.openSetting),
     _internalOnOpenSettingResult: core.propNonEnumerable(settingApi._internalOnOpenSettingResult),
     _internalUpdateAuthSetting: core.propNonEnumerable(settingApi._internalUpdateAuthSetting),
+    requestSubscribeSystemMessage: core.propNonEnumerable(settingApi.requestSubscribeSystemMessage),
+    requestSubscribeWhatsNew: core.propNonEnumerable(settingApi.requestSubscribeWhatsNew),
+    getWhatsNewSubscriptionsSetting: core.propNonEnumerable(settingApi.getWhatsNewSubscriptionsSetting),
+    authPrivateMessage: core.propNonEnumerable(settingApi.authPrivateMessage),
+    subscribeAppMsg: core.propNonEnumerable(settingApi.subscribeAppMsg),
+    checkUserLocation: core.propNonEnumerable(settingApi.checkUserLocation),
+    getWritePhotosAlbum: core.propNonEnumerable(settingApi.getWritePhotosAlbum),
+    checkWritePhotosAlbum: core.propNonEnumerable(settingApi.checkWritePhotosAlbum),
 
     // Navigate / Customer Service
     navigateToMiniProgram: core.propNonEnumerable(navigateApi.navigateToMiniProgram),
@@ -90,6 +98,9 @@ ObjectDefineProperties(globalThis, {
     _internalOnNavigateToMiniProgramResult: core.propNonEnumerable(navigateApi._internalOnNavigateToMiniProgramResult),
     openCustomerServiceConversation: core.propNonEnumerable(navigateApi.openCustomerServiceConversation),
     openBusinessView: core.propNonEnumerable(navigateApi.openBusinessView),
+    checkScene: core.propNonEnumerable(navigateApi.checkScene),
+    navigateToScene: core.propNonEnumerable(navigateApi.navigateToScene),
+    openPage: core.propNonEnumerable(navigateApi.openPage),
 
     // Login
     login: core.propNonEnumerable(loginApi.login),
@@ -118,6 +129,11 @@ ObjectDefineProperties(globalThis, {
     getAppBaseInfo: core.propNonEnumerable(appInfo.getAppBaseInfo),
     getAccountInfoSync: core.propNonEnumerable(appInfo.getAccountInfoSync),
     checkIsAddedToMyMiniProgram: core.propNonEnumerable(appInfo.checkIsAddedToMyMiniProgram),
+    isColorSignExistSync: core.propNonEnumerable(appInfo.isColorSignExistSync),
+    addColorSign: core.propNonEnumerable(appInfo.addColorSign),
+    addRecentColorSign: core.propNonEnumerable(appInfo.addRecentColorSign),
+    fetchSecondFloorIconOptionSync: core.propNonEnumerable(appInfo.fetchSecondFloorIconOptionSync),
+    updateSecondFloorChannel: core.propNonEnumerable(appInfo.updateSecondFloorChannel),
     _internalSetAppId: core.propNonEnumerable(appInfo._internalSetAppId),
 
     // Authorize Setting
@@ -131,6 +147,7 @@ ObjectDefineProperties(globalThis, {
     // Open Data Context
     onMessage: core.propNonEnumerable(openDataContext.onMessage),
     offMessage: core.propNonEnumerable(openDataContext.offMessage),
+    postMessage: core.propNonEnumerable(openDataContext.postMessage),
     getOpenDataContext: core.propNonEnumerable(openDataContext.getOpenDataContext),
     getSharedCanvas: core.propNonEnumerable(openDataContext.getSharedCanvas),
     getFriendCloudStorage: core.propNonEnumerable(openDataContext.getFriendCloudStorage),
