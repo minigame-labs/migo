@@ -1,8 +1,15 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use deno_core::{OpState, op2};
 use shared::op_state::HostOpState;
 use shared::protocol::render_cmd::RenderCommand;
+
+static RAF_WAIT_LOGGED: AtomicBool = AtomicBool::new(false);
+static RAF_RECV_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
 pub enum RafError {
@@ -36,18 +43,37 @@ pub enum RafError {
 /// so the Mutex acquisition is uncontested and effectively free.
 #[op2(async(lazy), fast)]
 pub(crate) async fn op_await_next_frame(state: Rc<RefCell<OpState>>) -> Result<f64, RafError> {
-    let rx = {
+    let (rx, host_id) = {
         let st = state.borrow();
-        st.borrow::<HostOpState>()
-            .raf_rx
-            .clone()
-            .ok_or_else(|| RafError::Message("RAF receiver not initialized".into()))?
+        let host_state = st.borrow::<HostOpState>();
+        (
+            host_state
+                .raf_rx
+                .clone()
+                .ok_or_else(|| RafError::Message("RAF receiver not initialized".into()))?,
+            host_state.id,
+        )
     };
+
+    if !RAF_WAIT_LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!("op_await_next_frame first call: host={}", host_id);
+    }
+
     let mut guard = rx.lock().await;
-    guard
+    let ts = guard
         .recv()
         .await
-        .ok_or_else(|| RafError::Message("RAF channel closed".into()))
+        .ok_or_else(|| RafError::Message("RAF channel closed".into()))?;
+
+    if !RAF_RECV_LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "op_await_next_frame first frame received: host={}, ts_ms={:.3}",
+            host_id,
+            ts
+        );
+    }
+
+    Ok(ts)
 }
 
 /// Sync op to set the preferred frame rate (1–60 fps).

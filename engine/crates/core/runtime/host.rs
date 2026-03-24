@@ -637,6 +637,12 @@ impl Host {
     }
 
     fn on_update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
+        let (w, h) = surface.size();
+        info!(
+            "[Host {}] on_update_surface: requested={}x{}",
+            self.id, w, h
+        );
+
         let result = self.render.update_surface(surface);
 
         // Resume the render thread after the surface is successfully recreated.
@@ -649,6 +655,9 @@ impl Host {
             let _ = self
                 .js
                 .exec_script("window_resize", "_internalTriggerWindowResize()");
+            info!("[Host {}] on_update_surface completed", self.id);
+        } else if let Err(ref e) = result {
+            warn!("[Host {}] on_update_surface failed: {}", self.id, e);
         }
 
         result

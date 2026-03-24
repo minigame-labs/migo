@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crossbeam_channel::{RecvTimeoutError, bounded};
+use tracing::{info, warn};
 
 use graphics::RenderThread;
 
@@ -42,6 +43,11 @@ impl RenderService {
 
     /// Update onscreen surface and request backend recreate.
     pub(crate) fn update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
+        let surface_size = surface.size();
+        info!(
+            "RenderService::update_surface begin: requested={}x{}",
+            surface_size.0, surface_size.1
+        );
         self.surface = surface.clone();
 
         let (tx, rx) = bounded::<Result<(), EngineError>>(1);
@@ -57,20 +63,46 @@ impl RenderService {
         })?;
 
         match rx.recv_timeout(Self::RECREATE_ONSCREEN_TIMEOUT) {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                info!(
+                    "RenderService::update_surface ok: requested={}x{}",
+                    surface_size.0, surface_size.1
+                );
+                Ok(())
+            }
 
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                warn!(
+                    "RenderService::update_surface backend error: requested={}x{}, err={}",
+                    surface_size.0, surface_size.1, e
+                );
+                Err(e)
+            }
 
-            Err(RecvTimeoutError::Timeout) => Err(EngineError::new(ErrorCode::Timeout)
-                .with_msg("recreate onscreen: timed out")
-                .with_detail(format!(
-                    "timed out after {}ms",
+            Err(RecvTimeoutError::Timeout) => {
+                warn!(
+                    "RenderService::update_surface timeout: requested={}x{}, waited={}ms",
+                    surface_size.0,
+                    surface_size.1,
                     Self::RECREATE_ONSCREEN_TIMEOUT.as_millis()
-                ))),
+                );
+                Err(EngineError::new(ErrorCode::Timeout)
+                    .with_msg("recreate onscreen: timed out")
+                    .with_detail(format!(
+                        "timed out after {}ms",
+                        Self::RECREATE_ONSCREEN_TIMEOUT.as_millis()
+                    )))
+            }
 
-            Err(e) => Err(EngineError::new(ErrorCode::Cancelled)
-                .with_msg("recreate onscreen: recv failed")
-                .with_detail(format!("{e:?}"))),
+            Err(e) => {
+                warn!(
+                    "RenderService::update_surface recv failed: requested={}x{}, err={:?}",
+                    surface_size.0, surface_size.1, e
+                );
+                Err(EngineError::new(ErrorCode::Cancelled)
+                    .with_msg("recreate onscreen: recv failed")
+                    .with_detail(format!("{e:?}")))
+            }
         }
     }
 

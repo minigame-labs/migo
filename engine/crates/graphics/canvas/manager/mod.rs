@@ -210,6 +210,20 @@ impl CanvasManager {
         window: usize,
         surface_size: Option<(u32, u32)>,
     ) -> EngineResult<()> {
+        if let Some((exp_w, exp_h)) = surface_size {
+            tracing::info!(
+                "CanvasManager::create_onscreen begin: window=0x{:x}, expected={}x{}",
+                window,
+                exp_w,
+                exp_h
+            );
+        } else {
+            tracing::info!(
+                "CanvasManager::create_onscreen begin: window=0x{:x}, expected=<none>",
+                window
+            );
+        }
+
         let id = CanvasId::from(1u32);
 
         // Same native window + same physical dimensions → skip destroy-recreate.
@@ -219,6 +233,11 @@ impl CanvasManager {
                     && entry.physical_width == exp_w
                     && entry.physical_height == exp_h
                 {
+                    tracing::info!(
+                        "CanvasManager::create_onscreen skip recreate: window unchanged and size matched {}x{}",
+                        exp_w,
+                        exp_h
+                    );
                     return Ok(());
                 }
             }
@@ -286,6 +305,19 @@ impl CanvasManager {
         let physical_w = (pw.max(1)) as u32;
         let physical_h = (ph.max(1)) as u32;
 
+        if let Some((exp_w, exp_h)) = surface_size {
+            if exp_w != physical_w || exp_h != physical_h {
+                tracing::warn!(
+                    "CanvasManager::create_onscreen size mismatch: expected={}x{}, egl_surface={}x{}, window=0x{:x}",
+                    exp_w,
+                    exp_h,
+                    physical_w,
+                    physical_h,
+                    window
+                );
+            }
+        }
+
         // Calculate logical dimensions (CSS pixels) from physical pixels
         let dpi = self.dpi.max(1.0);
         let logical_w = (physical_w as f32 / dpi).round() as u32;
@@ -327,6 +359,16 @@ impl CanvasManager {
         if had_2d_context && !self.contexts_2d.contains_key(&id) {
             context_2d_impl::init_femtovg_for_canvas(self, id)?;
         }
+
+        tracing::info!(
+            "CanvasManager::create_onscreen ready: window=0x{:x}, egl_surface={}x{}, logical={}x{}, dpi={:.3}",
+            window,
+            physical_w,
+            physical_h,
+            logical_w,
+            logical_h,
+            self.dpi
+        );
 
         Ok(())
     }

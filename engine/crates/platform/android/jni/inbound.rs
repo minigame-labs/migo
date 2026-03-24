@@ -414,10 +414,21 @@ pub(crate) extern "system" fn onShow<'local>(
             .map(|s| s.to_string_lossy().into_owned())
     };
 
+    if let Some(json) = options_json.as_ref() {
+        info!(
+            "Host {} onShow received (options_json_bytes={})",
+            host_id,
+            json.len()
+        );
+    } else {
+        info!("Host {} onShow received (options_json=<none>)", host_id);
+    }
+
     let _ = send_command_to_host(host_id, HostCommand::OnShow { options_json });
 }
 
 pub(crate) extern "system" fn onHide(_env: JNIEnv, _class: JClass, host_id: jint) {
+    info!("Host {} onHide received", host_id);
     let _ = send_command_to_host(host_id, HostCommand::OnHide);
 }
 
@@ -792,9 +803,7 @@ pub(crate) extern "system" fn onBLECharacteristicValueChange<'local>(
         .get_string(&characteristic_id)
         .map(|s| s.into())
         .unwrap_or_default();
-    let val: Vec<u8> = env
-        .convert_byte_array(&value)
-        .unwrap_or_default();
+    let val: Vec<u8> = env.convert_byte_array(&value).unwrap_or_default();
     let _ = send_command_to_host(
         host_id,
         HostCommand::OnBLECharacteristicValueChange {
@@ -1262,17 +1271,22 @@ pub(crate) extern "system" fn onVideoEvent<'local>(
     event_type: JString<'local>,
     data_json: JString<'local>,
 ) {
-    let evt: String = env.get_string(&event_type)
+    let evt: String = env
+        .get_string(&event_type)
         .map(|s| s.into())
         .unwrap_or_default();
-    let data: String = env.get_string(&data_json)
+    let data: String = env
+        .get_string(&data_json)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "{}".to_string());
-    let _ = send_command_to_host(host_id, HostCommand::OnVideoStateChange {
-        video_id: video_id as u32,
-        event_type: evt,
-        data,
-    });
+    let _ = send_command_to_host(
+        host_id,
+        HostCommand::OnVideoStateChange {
+            video_id: video_id as u32,
+            event_type: evt,
+            data,
+        },
+    );
 }
 
 // ==================== Console Logs ====================

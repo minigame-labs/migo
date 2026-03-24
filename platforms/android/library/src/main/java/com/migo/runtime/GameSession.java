@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
@@ -75,6 +76,8 @@ import java.io.File;
  * @since 1.0.0
  */
 public final class GameSession implements Closeable {
+
+    private static final String TAG = "GameSession";
 
     private final int sessionId;
     private final String gameId;
@@ -362,6 +365,7 @@ public final class GameSession implements Closeable {
         }
         synchronized (lock) {
             if (destroyed) return;
+            Log.i(TAG, "updateSurface: session=" + sessionId + ", valid=" + surface.isValid());
             NativeMethods.updateSurface(sessionId, surface);
 
             // Auto-attach debug overlay as a WindowManager panel on first surface update.

@@ -38,16 +38,27 @@ impl CanvasHandler {
             }
 
             CanvasCmd::RecreateOnscreen { surface, resp } => {
+                let requested_size = surface.size();
+                tracing::info!(
+                    "CanvasCmd::RecreateOnscreen: requested={}x{}",
+                    requested_size.0,
+                    requested_size.1
+                );
                 let res = (|| -> EngineResult<()> {
                     let win = onscreen_window_from_surface(surface.as_ref())?;
-                    let size = surface.size();
-                    cm.create_onscreen(win, Some(size))?;
+                    cm.create_onscreen(win, Some(requested_size))?;
                     Ok(())
                 })();
                 // Propagate to both host (via resp) and render thread (via return).
                 let err_detail = res.as_ref().err().map(|e| e.to_string());
                 let _ = resp.send(res);
                 if let Some(detail) = err_detail {
+                    tracing::warn!(
+                        "CanvasCmd::RecreateOnscreen failed: requested={}x{}, err={}",
+                        requested_size.0,
+                        requested_size.1,
+                        detail
+                    );
                     return Err(EngineError::from_detail(
                         ErrorCode::RenderBackendError,
                         detail,

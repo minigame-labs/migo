@@ -6,6 +6,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.res.Configuration;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -53,6 +54,8 @@ import com.migo.runtime.callback.GameSessionListener;
  */
 public class MigoGameActivity extends Activity
         implements SurfaceHolder.Callback, ComponentCallbacks2 {
+
+    private static final String TAG = "MigoGameActivity";
 
     /** Intent extra key for game ID. */
     public static final String EXTRA_GAME_ID = "migo_game_id";
@@ -155,6 +158,7 @@ public class MigoGameActivity extends Activity
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
+        Log.i(TAG, "surfaceCreated: frame=" + holder.getSurfaceFrame());
         if (session != null && session.isValid()) {
             session.updateSurface(holder.getSurface());
         } else {
@@ -164,6 +168,7 @@ public class MigoGameActivity extends Activity
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        Log.i(TAG, "surfaceChanged: format=" + format + ", size=" + width + "x" + height);
         if (session != null && session.isValid()) {
             session.updateSurface(holder.getSurface());
         }
@@ -171,6 +176,7 @@ public class MigoGameActivity extends Activity
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
+        Log.i(TAG, "surfaceDestroyed");
         // Do NOT destroy the session. Surface is destroyed on onStop but
         // Activity is still alive. Cleanup happens in onDestroy.
     }
@@ -180,6 +186,7 @@ public class MigoGameActivity extends Activity
     @Override
     protected void onPause() {
         super.onPause();
+        Log.i(TAG, "onPause");
         if (session != null && session.isValid()) {
             session.pause();
         }
@@ -188,6 +195,7 @@ public class MigoGameActivity extends Activity
     @Override
     protected void onResume() {
         super.onResume();
+        Log.i(TAG, "onResume");
         if (session != null && session.isValid()) {
             session.resume();
         }
@@ -247,10 +255,12 @@ public class MigoGameActivity extends Activity
     // ==================== Private ====================
 
     private void initializeGame(SurfaceHolder holder) {
+        Log.i(TAG, "initializeGame: gameId=" + gameId + ", entry=" + entryPoint);
         MigoRuntime.Result<GameSession> result = MigoRuntime.getInstance()
                 .createSessionSafe(this, holder.getSurface(), config, gameId);
 
         if (result.isFailure()) {
+            Log.e(TAG, "initializeGame failed: code=" + result.getErrorCode() + ", msg=" + result.getErrorMessage());
             finish();
             return;
         }
@@ -265,6 +275,7 @@ public class MigoGameActivity extends Activity
 
         // Start the game
         int startResult = session.startGameSafe(entryPoint);
+        Log.i(TAG, "startGameSafe result=" + startResult);
         if (startResult != ErrorCode.SUCCESS) {
             finish();
         }
