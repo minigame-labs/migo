@@ -202,4 +202,78 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
     return { invoke: invoke, settle: settle };
 }
 
-export { wrapAsync, promisify, createDeferredApi };
+// Factory for event listener groups (on/off/trigger pattern).
+//
+// Standardizes the on/off semantics used across 20+ modules:
+//   - on(fn)         adds a listener
+//   - off(fn)        removes that specific listener
+//   - off()          removes all listeners
+//   - trigger(data)  calls each listener, catching errors
+//
+// Usage:
+//   const grp = createListenerGroup('onAccelerometerChange');
+//   export const { on: onAccelerometerChange, off: offAccelerometerChange } = grp;
+//   function _internalTrigger(x, y, z) { grp.trigger({ x, y, z }); }
+//
+// Pass unique=true to dedupe listeners (DOM-style addEventListener semantics).
+function createListenerGroup(errorLabel, unique) {
+    var _listeners = [];
+    if (unique === undefined) unique = false;
+    return {
+        on: function (listener) {
+            if (typeof listener !== 'function') return;
+            if (unique && _listeners.indexOf(listener) !== -1) return;
+            _listeners.push(listener);
+        },
+        off: function (listener) {
+            if (typeof listener === 'function') {
+                var i = _listeners.indexOf(listener);
+                if (i !== -1) _listeners.splice(i, 1);
+            } else {
+                _listeners.length = 0;
+            }
+        },
+        trigger: function (data, thisArg) {
+            for (var i = 0; i < _listeners.length; i++) {
+                try {
+                    if (thisArg !== undefined) {
+                        _listeners[i].call(thisArg, data);
+                    } else {
+                        _listeners[i](data);
+                    }
+                } catch (e) {
+                    console.error(errorLabel + ' listener error:', e);
+                }
+            }
+        },
+        snapshot: function () {
+            return _listeners.slice();
+        },
+        size: function () {
+            return _listeners.length;
+        },
+    };
+}
+
+// Create a lightweight callback event object with optional extra fields.
+//
+// Usage:
+//   createCallbackEvent('load', image)
+//   createCallbackEvent('error', image, { error: err })
+function createCallbackEvent(type, target, detail) {
+    var ev = {
+        type: type,
+        target: target,
+        currentTarget: target,
+        timeStamp: Date.now(),
+    };
+    if (detail && typeof detail === 'object') {
+        var keys = Object.keys(detail);
+        for (var i = 0; i < keys.length; i++) {
+            ev[keys[i]] = detail[keys[i]];
+        }
+    }
+    return ev;
+}
+
+export { wrapAsync, promisify, createDeferredApi, createListenerGroup, createCallbackEvent };

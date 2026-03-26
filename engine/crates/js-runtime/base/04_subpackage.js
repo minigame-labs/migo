@@ -1,5 +1,6 @@
 import { op_download_subpackage } from "ext:core/ops";
 import { require as amdRequire } from "ext:host_v8_base/01_amdshim.js";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 const noop = () => {};
 
@@ -154,22 +155,15 @@ const _pendingTasks = new Map();
 
 class SubpackageTask {
     constructor() {
-        this._progressListeners = [];
+        this._progressListeners = createListenerGroup("subpackage progress");
     }
 
     onProgressUpdate(listener) {
-        if (typeof listener === "function") {
-            this._progressListeners.push(listener);
-        }
+        this._progressListeners.on(listener);
     }
 
     _triggerProgress(progress, totalBytesWritten, totalBytesExpectedToWrite) {
-        const payload = { progress, totalBytesWritten, totalBytesExpectedToWrite };
-        for (const listener of this._progressListeners) {
-            try { listener(payload); } catch (err) {
-                console.error("subpackage progress listener error:", err);
-            }
-        }
+        this._progressListeners.trigger({ progress, totalBytesWritten, totalBytesExpectedToWrite });
     }
 }
 

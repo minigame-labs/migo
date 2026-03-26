@@ -1,3 +1,5 @@
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+
 function createDefaultLaunchOptions() {
     return {
         scene: 1001,
@@ -74,9 +76,8 @@ function deepCloneOptions(opts) {
 
 class AppLifecycleManager {
     constructor() {
-        this.onShowListeners = [];
-        this.onHideListeners = [];
-        this.onErrorListeners = [];
+        this.onShowListeners = createListenerGroup('onShow');
+        this.onHideListeners = createListenerGroup('onHide');
         this.isVisible = false;
         // Cold launch params -- set once on first onShow, never overwritten
         this.launchOptions = null;
@@ -124,37 +125,19 @@ class AppLifecycleManager {
     }
 
     onShow(listener) {
-        if (typeof listener === "function") {
-            this.onShowListeners.push(listener);
-        }
+        this.onShowListeners.on(listener);
     }
 
     onHide(listener) {
-        if (typeof listener === "function") {
-            this.onHideListeners.push(listener);
-        }
+        this.onHideListeners.on(listener);
     }
 
     offShow(listener) {
-        if (typeof listener === "function") {
-            const index = this.onShowListeners.indexOf(listener);
-            if (index !== -1) {
-                this.onShowListeners.splice(index, 1);
-            }
-        } else {
-            this.onShowListeners.length = 0;
-        }
+        this.onShowListeners.off(listener);
     }
 
     offHide(listener) {
-        if (typeof listener === "function") {
-            const index = this.onHideListeners.indexOf(listener);
-            if (index !== -1) {
-                this.onHideListeners.splice(index, 1);
-            }
-        } else {
-            this.onHideListeners.length = 0;
-        }
+        this.onHideListeners.off(listener);
     }
 
     _triggerShow(options) {
@@ -173,25 +156,12 @@ class AppLifecycleManager {
 
         // Pass a separate clone to listeners so they cannot mutate internal state
         const listenerOptions = deepCloneOptions(normalized);
-        this.onShowListeners.forEach(listener => {
-            try {
-                listener(listenerOptions);
-            } catch (error) {
-                console.error("onShow listener error:", error);
-            }
-        });
+        this.onShowListeners.trigger(listenerOptions);
     }
 
     _triggerHide() {
         this.isVisible = false;
-
-        this.onHideListeners.forEach(listener => {
-            try {
-                listener();
-            } catch (error) {
-                console.error("onHide listener error:", error);
-            }
-        });
+        this.onHideListeners.trigger();
     }
 
     getLaunchOptionsSync() {
@@ -239,30 +209,24 @@ function _internalTriggerOnHide() {
 
 // ---- onAddToFavorites / offAddToFavorites ----------------------------------
 
-const _addToFavoritesListeners = [];
+const _addToFavoritesListeners = createListenerGroup('onAddToFavorites');
 
 function onAddToFavorites(listener) {
-    if (typeof listener === "function") {
-        _addToFavoritesListeners.push(listener);
-    }
+    _addToFavoritesListeners.on(listener);
 }
 
 function offAddToFavorites(listener) {
-    if (typeof listener === "function") {
-        const index = _addToFavoritesListeners.indexOf(listener);
-        if (index !== -1) _addToFavoritesListeners.splice(index, 1);
-    } else {
-        _addToFavoritesListeners.length = 0;
-    }
+    _addToFavoritesListeners.off(listener);
 }
 
 // @stub - called by host when user triggers "add to favorites".
 // Returns aggregated data from registered listeners.
 function _internalTriggerAddToFavorites() {
     var result = { title: '', imageUrl: '', query: '' };
-    for (var i = 0; i < _addToFavoritesListeners.length; i++) {
+    var listeners = _addToFavoritesListeners.snapshot();
+    for (var i = 0; i < listeners.length; i++) {
         try {
-            var override = _addToFavoritesListeners[i]();
+            var override = listeners[i]();
             if (override && typeof override === 'object') {
                 if (typeof override.title === 'string') result.title = override.title;
                 if (typeof override.imageUrl === 'string') result.imageUrl = override.imageUrl;

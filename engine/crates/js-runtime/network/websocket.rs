@@ -23,8 +23,7 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 
-/// Delay inserted before each poll iteration when the app is backgrounded.
-const BACKGROUND_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
+use super::common::BACKGROUND_THROTTLE;
 
 type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 

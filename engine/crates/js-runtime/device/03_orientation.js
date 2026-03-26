@@ -1,31 +1,17 @@
-const _listeners = [];
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+
+const _listeners = createListenerGroup('onDeviceOrientationChange');
 
 function onDeviceOrientationChange(listener) {
-    if (typeof listener === 'function') {
-        _listeners.push(listener);
-    }
+    _listeners.on(listener);
 }
 
 function offDeviceOrientationChange(listener) {
-    if (typeof listener === 'function') {
-        const index = _listeners.indexOf(listener);
-        if (index !== -1) {
-            _listeners.splice(index, 1);
-        }
-    } else {
-        _listeners.length = 0;
-    }
+    _listeners.off(listener);
 }
 
 function _internalTriggerDeviceOrientationChange(value) {
-    const data = { value };
-    for (let i = 0; i < _listeners.length; i++) {
-        try {
-            _listeners[i](data);
-        } catch (e) {
-            console.error('onDeviceOrientationChange listener error:', e);
-        }
-    }
+    _listeners.trigger({ value });
 }
 
 export {

@@ -1,34 +1,13 @@
 import { op_start_compass, op_stop_compass } from "ext:core/ops";
-import { wrapAsync } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
-const _listeners = [];
+const _grp = createListenerGroup('onCompassChange');
 
-function onCompassChange(listener) {
-    if (typeof listener === 'function') {
-        _listeners.push(listener);
-    }
-}
-
-function offCompassChange(listener) {
-    if (listener === undefined) {
-        _listeners.length = 0;
-        return;
-    }
-    const idx = _listeners.indexOf(listener);
-    if (idx !== -1) {
-        _listeners.splice(idx, 1);
-    }
-}
+function onCompassChange(listener) { _grp.on(listener); }
+function offCompassChange(listener) { _grp.off(listener); }
 
 function _internalTriggerCompassChange(direction, accuracy) {
-    const data = { direction: direction, accuracy: accuracy };
-    for (let i = 0; i < _listeners.length; i++) {
-        try {
-            _listeners[i](data);
-        } catch (e) {
-            console.error('onCompassChange listener error:', e);
-        }
-    }
+    _grp.trigger({ direction: direction, accuracy: accuracy });
 }
 
 function startCompass(options = {}) {

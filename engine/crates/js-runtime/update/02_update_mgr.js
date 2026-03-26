@@ -1,8 +1,10 @@
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+
 class UpdateManager {
     constructor() {
-        this.checkForUpdateListeners = [];
-        this.updateReadyListeners = [];
-        this.updateFailedListeners = [];
+        this.checkForUpdateListeners = createListenerGroup('UpdateManager onCheckForUpdate');
+        this.updateReadyListeners = createListenerGroup('UpdateManager onUpdateReady');
+        this.updateFailedListeners = createListenerGroup('UpdateManager onUpdateFailed');
         this.hasUpdate = false;
         this.isReady = false;
         
@@ -12,21 +14,15 @@ class UpdateManager {
     }
     
     onCheckForUpdate(listener) {
-        if (typeof listener === 'function') {
-            this.checkForUpdateListeners.push(listener);
-        }
+        this.checkForUpdateListeners.on(listener);
     }
     
     onUpdateReady(listener) {
-        if (typeof listener === 'function') {
-            this.updateReadyListeners.push(listener);
-        }
+        this.updateReadyListeners.on(listener);
     }
     
     onUpdateFailed(listener) {
-        if (typeof listener === 'function') {
-            this.updateFailedListeners.push(listener);
-        }
+        this.updateFailedListeners.on(listener);
     }
     
     applyUpdate() {
@@ -50,13 +46,7 @@ class UpdateManager {
         const hasUpdate = Math.random() < 0.3;
         this.hasUpdate = hasUpdate;
         
-        this.checkForUpdateListeners.forEach(listener => {
-            try {
-                listener({ hasUpdate });
-            } catch (error) {
-                console.error('UpdateManager onCheckForUpdate listener error:', error);
-            }
-        });
+        this.checkForUpdateListeners.trigger({ hasUpdate });
         
         if (hasUpdate) {
             this._simulateDownload();
@@ -75,23 +65,11 @@ class UpdateManager {
                 this.isReady = true;
                 console.log('UpdateManager: Update download completed');
                 
-                this.updateReadyListeners.forEach(listener => {
-                    try {
-                        listener();
-                    } catch (error) {
-                        console.error('UpdateManager onUpdateReady listener error:', error);
-                    }
-                });
+                this.updateReadyListeners.trigger();
             } else {
                 console.log('UpdateManager: Update download failed');
-                
-                this.updateFailedListeners.forEach(listener => {
-                    try {
-                        listener();
-                    } catch (error) {
-                        console.error('UpdateManager onUpdateFailed listener error:', error);
-                    }
-                });
+
+                this.updateFailedListeners.trigger();
             }
         }, downloadTime);
     }

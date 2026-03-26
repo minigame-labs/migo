@@ -1,6 +1,8 @@
 // Ad APIs - compatible mock implementation
 // All ad types simulate successful load/show flow with proper event callbacks.
 
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+
 const MOCK_LOAD_DELAY_MS = 100;
 const MOCK_REWARDED_VIDEO_DURATION_MS = 500;
 
@@ -9,21 +11,15 @@ const _directAdStatus = {
   isInDirectGameAd: false,
 };
 
-const _directAdStatusListeners = [];
+const _directAdStatusListeners = createListenerGroup("onDirectAdStatusChange");
 
 function _notifyDirectAdStatus(status) {
-  for (let i = 0; i < _directAdStatusListeners.length; i++) {
-    try {
-      _directAdStatusListeners[i](status);
-    } catch (e) {
-      console.error("onDirectAdStatusChange listener error:", e);
-    }
-  }
+  _directAdStatusListeners.trigger(status);
 }
 
 function onDirectAdStatusChange(listener) {
   if (typeof listener !== "function") return;
-  _directAdStatusListeners.push(listener);
+  _directAdStatusListeners.on(listener);
   queueMicrotask(() => {
     try {
       listener(getDirectAdStatusSync());
@@ -34,14 +30,7 @@ function onDirectAdStatusChange(listener) {
 }
 
 function offDirectAdStatusChange(listener) {
-  if (typeof listener === "function") {
-    const idx = _directAdStatusListeners.indexOf(listener);
-    if (idx !== -1) {
-      _directAdStatusListeners.splice(idx, 1);
-    }
-  } else {
-    _directAdStatusListeners.length = 0;
-  }
+  _directAdStatusListeners.off(listener);
 }
 
 function _internalTriggerDirectAdStatusChange(status) {
@@ -63,40 +52,27 @@ class AdBase {
 
   constructor(eventTypes) {
     for (const type of eventTypes) {
-      this.#listeners[type] = [];
+      this.#listeners[type] = createListenerGroup(`Ad ${type}`);
     }
   }
 
   _on(type, listener) {
     if (this.#destroyed) return;
-    if (typeof listener === "function") {
-      this.#listeners[type].push(listener);
-    }
+    const group = this.#listeners[type];
+    if (!group) return;
+    group.on(listener);
   }
 
   _off(type, listener) {
-    if (!this.#listeners[type]) return;
-    if (typeof listener === "function") {
-      const idx = this.#listeners[type].indexOf(listener);
-      if (idx !== -1) {
-        this.#listeners[type].splice(idx, 1);
-      }
-    } else {
-      this.#listeners[type].length = 0;
-    }
+    const group = this.#listeners[type];
+    if (!group) return;
+    group.off(listener);
   }
 
   _fire(type, arg) {
-    const list = this.#listeners[type];
-    if (!list || list.length === 0) return;
-    const snapshot = list.slice();
-    for (const fn of snapshot) {
-      try {
-        fn(arg);
-      } catch (e) {
-        console.error(`Ad ${type} listener error:`, e);
-      }
-    }
+    const group = this.#listeners[type];
+    if (!group) return;
+    group.trigger(arg);
   }
 
   _isDestroyed() {
@@ -106,7 +82,7 @@ class AdBase {
   _markDestroyed() {
     this.#destroyed = true;
     for (const type in this.#listeners) {
-      this.#listeners[type].length = 0;
+      this.#listeners[type].off();
     }
   }
 

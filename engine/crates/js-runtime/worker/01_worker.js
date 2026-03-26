@@ -3,12 +3,13 @@ import { op_worker_create,
     op_worker_recv_message,
     op_worker_recv_error,
     op_worker_terminate } from "ext:core/ops";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 let currentWorker = null;
 class WorkerInstance {
-    #messageListeners = [];
-    #errorListeners = [];
-    #processKilledListeners = [];
+    #messageListeners = createListenerGroup("[Main-Worker] onMessage");
+    #errorListeners = createListenerGroup("Worker onError");
+    #processKilledListeners = createListenerGroup("Worker onProcessKilled");
     #terminated = false;
     #ready = false;
     #pendingMessages = [];
@@ -40,19 +41,14 @@ class WorkerInstance {
             this.#pumpErrors();
             this.#pumpMessages();
         } catch (e) {
-            const listeners = this.#errorListeners;
-            for (let i = 0; i < listeners.length; i++) {
-                try {
-                    listeners[i]({ error: e });
-                } catch (_) {}
-            }
+            this.#errorListeners.trigger({ error: e });
             // Clean up on creation failure
             currentWorker = null;
         }
     }
 
     async #pumpMessages() {
-        console.log("[Main-Worker] pumpMessages started, listeners:", this.#messageListeners.length);
+        console.log("[Main-Worker] pumpMessages started, listeners:", this.#messageListeners.size());
         while (!this.#terminated) {
             let json;
             try {
@@ -66,7 +62,7 @@ class WorkerInstance {
                 break;
             }
 
-            console.log("[Main-Worker] received from worker:", json.length, "bytes, listeners:", this.#messageListeners.length);
+            console.log("[Main-Worker] received from worker:", json.length, "bytes, listeners:", this.#messageListeners.size());
 
             let message;
             try {
@@ -75,14 +71,7 @@ class WorkerInstance {
                 message = json;
             }
 
-            const listeners = this.#messageListeners;
-            for (let i = 0; i < listeners.length; i++) {
-                try {
-                    listeners[i]({ message });
-                } catch (e) {
-                    console.error("[Main-Worker] onMessage listener error:", e);
-                }
-            }
+            this.#messageListeners.trigger({ message });
         }
     }
 
@@ -103,14 +92,7 @@ class WorkerInstance {
                 error = { message: json };
             }
 
-            const listeners = this.#errorListeners;
-            for (let i = 0; i < listeners.length; i++) {
-                try {
-                    listeners[i]({ error });
-                } catch (e) {
-                    console.error("Worker onError listener error:", e);
-                }
-            }
+            this.#errorListeners.trigger({ error });
         }
     }
 
@@ -137,21 +119,21 @@ class WorkerInstance {
         if (typeof listener !== "function") {
             throw new TypeError("listener must be a function");
         }
-        this.#messageListeners.push(listener);
+        this.#messageListeners.on(listener);
     }
 
     onError(listener) {
         if (typeof listener !== "function") {
             throw new TypeError("listener must be a function");
         }
-        this.#errorListeners.push(listener);
+        this.#errorListeners.on(listener);
     }
 
     onProcessKilled(listener) {
         if (typeof listener !== "function") {
             throw new TypeError("listener must be a function");
         }
-        this.#processKilledListeners.push(listener);
+        this.#processKilledListeners.on(listener);
     }
 
     terminate() {

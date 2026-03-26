@@ -18,6 +18,8 @@ import {
     op_draw_arrays,
     op_draw_elements,
     op_get_attrib_location,
+    op_get_active_attrib,
+    op_get_active_uniform,
     op_enable_vertex_attrib_array,
     op_vertex_attrib_pointer,
     op_create_buffer,
@@ -36,7 +38,9 @@ import {
     op_bind_texture,
     op_active_texture,
     op_tex_image_2d,
+    op_tex_image_2d_from_image,
     op_tex_sub_image_2d,
+    op_tex_sub_image_2d_from_image,
     op_tex_parameteri,
     op_tex_parameterf,
     op_generate_mipmap,
@@ -154,6 +158,42 @@ function toInt32AsUint32(input) {
     return new Uint32Array(i32.buffer, i32.byteOffset, i32.length);
 }
 
+function sourceToRawRgba(source) {
+    if (!source || typeof source !== "object") return null;
+
+    const width = source.width | 0;
+    const height = source.height | 0;
+    if (width <= 0 || height <= 0) return null;
+
+    if (source.data && (isTypedArray(source.data) || isDataView(source.data) || isArrayBuffer(source.data))) {
+        return {
+            width,
+            height,
+            data: toUnit8Array(source.data),
+        };
+    }
+
+    if (typeof source.getContext === "function") {
+        try {
+            const ctx2d = source.getContext("2d");
+            if (ctx2d && typeof ctx2d.getImageData === "function") {
+                const imgData = ctx2d.getImageData(0, 0, width, height);
+                if (imgData && imgData.data) {
+                    return {
+                        width,
+                        height,
+                        data: toUnit8Array(imgData.data),
+                    };
+                }
+            }
+        } catch (_) {
+            // fall through to unsupported warning
+        }
+    }
+
+    return null;
+}
+
 function _loc(location) {
     return location !== null && location !== undefined ? location.id : -1;
 }
@@ -207,11 +247,11 @@ class WebGLRenderingContext {
     }
 
     get drawingBufferWidth() {
-        throw new Error("drawingBufferWidth not supported");
+        return this._canvas ? this._canvas.width : 0;
     }
 
     get drawingBufferHeight() {
-        throw new Error("drawingBufferHeight not supported");
+        return this._canvas ? this._canvas.height : 0;
     }
 
     set unpackColorSpace(value) {
@@ -376,6 +416,22 @@ class WebGLRenderingContext {
         return location;
     }
 
+    getActiveAttrib(program, index) {
+        const programId = program?.id;
+        if (programId === undefined) return null;
+        const json = op_get_active_attrib(this._canvasId, programId, index >>> 0);
+        if (!json) return null;
+        try { return JSON.parse(json); } catch (_) { return null; }
+    }
+
+    getActiveUniform(program, index) {
+        const programId = program?.id;
+        if (programId === undefined) return null;
+        const json = op_get_active_uniform(this._canvasId, programId, index >>> 0);
+        if (!json) return null;
+        try { return JSON.parse(json); } catch (_) { return null; }
+    }
+
     enableVertexAttribArray(index) {
         return op_enable_vertex_attrib_array(this._canvasId, index);
     }
@@ -495,21 +551,83 @@ class WebGLRenderingContext {
 
     texImage2D(target, level, internalformat, a4, a5, a6, a7, a8, a9) {
         // 9-arg: (target, level, internalformat, width, height, border, format, type, pixels)
-        // 6-arg: (target, level, internalformat, format, type, source) -- not supported
+        // 6-arg: (target, level, internalformat, format, type, source)
         if (a7 !== undefined) {
             const data = a9 != null ? toUnit8Array(a9) : null;
             op_tex_image_2d(this._canvasId, target, level, internalformat, a4, a5, a6, a7, a8, data);
         } else {
-            // 6-argument form: treat a4 as format, a5 as type, a6 as source
-            // For mini-game runtime, this form is rarely used. Stub it.
-            console.warn('texImage2D 6-argument form not fully supported');
+            const source = a6;
+            const imageId = source && typeof source.rid === "number" ? source.rid : null;
+            if (imageId != null) {
+                op_tex_image_2d_from_image(this._canvasId, target, level, internalformat, a4, a5, imageId);
+            } else {
+                const raw = sourceToRawRgba(source);
+                if (raw) {
+                    op_tex_image_2d(
+                        this._canvasId,
+                        target,
+                        level,
+                        internalformat,
+                        raw.width,
+                        raw.height,
+                        0,
+                        a4,
+                        a5,
+                        raw.data,
+                    );
+                    return;
+                }
+                const kind = source && source.constructor ? source.constructor.name : typeof source;
+                console.warn(`texImage2D 6-argument form unsupported source: ${kind}`);
+            }
         }
     }
 
     texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels) {
-        if (pixels == null) return;
-        const data = toUnit8Array(pixels);
-        op_tex_sub_image_2d(this._canvasId, target, level, xoffset, yoffset, width, height, format, type, data);
+        // 9-arg: (..., width, height, format, type, pixels)
+        if (pixels !== undefined) {
+            if (pixels == null) return;
+            const data = toUnit8Array(pixels);
+            op_tex_sub_image_2d(this._canvasId, target, level, xoffset, yoffset, width, height, format, type, data);
+            return;
+        }
+
+        // 7-arg: (..., format, type, source)
+        const source = format;
+        const sourceFormat = width;
+        const sourceType = height;
+        const imageId = source && typeof source.rid === "number" ? source.rid : null;
+        if (imageId != null) {
+            op_tex_sub_image_2d_from_image(
+                this._canvasId,
+                target,
+                level,
+                xoffset,
+                yoffset,
+                sourceFormat,
+                sourceType,
+                imageId,
+            );
+        } else {
+            const raw = sourceToRawRgba(source);
+            if (raw) {
+                op_tex_sub_image_2d(
+                    this._canvasId,
+                    target,
+                    level,
+                    xoffset,
+                    yoffset,
+                    raw.width,
+                    raw.height,
+                    sourceFormat,
+                    sourceType,
+                    raw.data,
+                );
+                return;
+            }
+            const kind = source && source.constructor ? source.constructor.name : typeof source;
+            console.warn(`texSubImage2D 7-argument form unsupported source: ${kind}`);
+        }
     }
 
     texParameteri(target, pname, param) {
@@ -525,7 +643,11 @@ class WebGLRenderingContext {
     }
 
     pixelStorei(pname, param) {
-        op_pixel_storei(this._canvasId, pname, param);
+        let value;
+        if (param === true) value = 1;
+        else if (param === false) value = 0;
+        else value = Number(param) | 0;
+        op_pixel_storei(this._canvasId, pname, value);
     }
 
     compressedTexImage2D(target, level, internalformat, width, height, border, data) {

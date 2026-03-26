@@ -6,6 +6,7 @@ import { core } from "ext:core/mod.js";
 import {
     op_tcp_connect, op_tcp_next_event, op_tcp_write, op_tcp_close,
 } from "ext:core/ops";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // -- TCPSocket class --
 
@@ -17,11 +18,11 @@ class TCPSocket {
         this._connected = false;
 
         // Per-instance event listeners
-        this._connectListeners = [];
-        this._closeListeners = [];
-        this._errorListeners = [];
-        this._messageListeners = [];
-        this._bindWifiListeners = [];
+        this._connectListeners = createListenerGroup('TCPSocket onConnect');
+        this._closeListeners = createListenerGroup('TCPSocket onClose');
+        this._errorListeners = createListenerGroup('TCPSocket onError');
+        this._messageListeners = createListenerGroup('TCPSocket onMessage');
+        this._bindWifiListeners = createListenerGroup('TCPSocket onBindWifi');
     }
 
     // -- Control methods --
@@ -107,104 +108,61 @@ class TCPSocket {
     // -- Event listener methods --
 
     onConnect(listener) {
-        if (typeof listener === 'function') this._connectListeners.push(listener);
+        this._connectListeners.on(listener);
     }
 
     offConnect(listener) {
-        if (typeof listener === 'function') {
-            const i = this._connectListeners.indexOf(listener);
-            if (i !== -1) this._connectListeners.splice(i, 1);
-        } else {
-            this._connectListeners.length = 0;
-        }
+        this._connectListeners.off(listener);
     }
 
     onClose(listener) {
-        if (typeof listener === 'function') this._closeListeners.push(listener);
+        this._closeListeners.on(listener);
     }
 
     offClose(listener) {
-        if (typeof listener === 'function') {
-            const i = this._closeListeners.indexOf(listener);
-            if (i !== -1) this._closeListeners.splice(i, 1);
-        } else {
-            this._closeListeners.length = 0;
-        }
+        this._closeListeners.off(listener);
     }
 
     onError(listener) {
-        if (typeof listener === 'function') this._errorListeners.push(listener);
+        this._errorListeners.on(listener);
     }
 
     offError(listener) {
-        if (typeof listener === 'function') {
-            const i = this._errorListeners.indexOf(listener);
-            if (i !== -1) this._errorListeners.splice(i, 1);
-        } else {
-            this._errorListeners.length = 0;
-        }
+        this._errorListeners.off(listener);
     }
 
     onMessage(listener) {
-        if (typeof listener === 'function') this._messageListeners.push(listener);
+        this._messageListeners.on(listener);
     }
 
     offMessage(listener) {
-        if (typeof listener === 'function') {
-            const i = this._messageListeners.indexOf(listener);
-            if (i !== -1) this._messageListeners.splice(i, 1);
-        } else {
-            this._messageListeners.length = 0;
-        }
+        this._messageListeners.off(listener);
     }
 
     onBindWifi(listener) {
-        if (typeof listener === 'function') this._bindWifiListeners.push(listener);
+        this._bindWifiListeners.on(listener);
     }
 
     offBindWifi(listener) {
-        if (typeof listener === 'function') {
-            const i = this._bindWifiListeners.indexOf(listener);
-            if (i !== -1) this._bindWifiListeners.splice(i, 1);
-        } else {
-            this._bindWifiListeners.length = 0;
-        }
+        this._bindWifiListeners.off(listener);
     }
 
     // -- Internal event dispatch --
 
     _fireConnect(res) {
-        for (let i = 0; i < this._connectListeners.length; i++) {
-            try { this._connectListeners[i](res); } catch (e) {
-                console.error('TCPSocket onConnect listener error:', e);
-            }
-        }
+        this._connectListeners.trigger(res);
     }
 
     _fireClose() {
-        for (let i = 0; i < this._closeListeners.length; i++) {
-            try { this._closeListeners[i](); } catch (e) {
-                console.error('TCPSocket onClose listener error:', e);
-            }
-        }
+        this._closeListeners.trigger();
     }
 
     _fireError(errMsg) {
-        const res = { errMsg };
-        for (let i = 0; i < this._errorListeners.length; i++) {
-            try { this._errorListeners[i](res); } catch (e) {
-                console.error('TCPSocket onError listener error:', e);
-            }
-        }
+        this._errorListeners.trigger({ errMsg });
     }
 
     _fireMessage(message, remoteInfo, localInfo) {
-        const res = { message, remoteInfo, localInfo };
-        for (let i = 0; i < this._messageListeners.length; i++) {
-            try { this._messageListeners[i](res); } catch (e) {
-                console.error('TCPSocket onMessage listener error:', e);
-            }
-        }
+        this._messageListeners.trigger({ message, remoteInfo, localInfo });
     }
 
     _doClose() {

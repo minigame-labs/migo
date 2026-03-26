@@ -1,10 +1,11 @@
 import { primordials } from "ext:core/mod.js";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 const { TypeError } = primordials;
 
 class NetworkTask {
     constructor(terminator) {
         this._aborted = false;
-        this._headersReceivedListeners = [];
+        this._headersReceivedListeners = createListenerGroup('Error in headers received');
         this._terminator = terminator;
     }
 
@@ -14,7 +15,7 @@ class NetworkTask {
         }
         this._aborted = true;
         this._terminator?.abort();
-        this._headersReceivedListeners = [];
+        this._headersReceivedListeners.off();
         this._onCleanup();
     }
 
@@ -28,34 +29,19 @@ class NetworkTask {
         if (this._aborted) {
             return;
         }
-        this._headersReceivedListeners.push(listener);
+        this._headersReceivedListeners.on(listener);
     }
 
     offHeadersReceived(listener) {
-        if (listener === undefined) {
-            this._headersReceivedListeners = [];
-            return;
-        }
-        if (typeof listener !== 'function') {
-            return;
-        }
-        const index = this._headersReceivedListeners.indexOf(listener);
-        if (index !== -1) {
-            this._headersReceivedListeners.splice(index, 1);
-        }
+        if (listener !== undefined && typeof listener !== 'function') return;
+        this._headersReceivedListeners.off(listener);
     }
 
     _triggerHeadersReceived(headers) {
         if (this._aborted) {
             return;
         }
-        for (const listener of this._headersReceivedListeners) {
-            try {
-                listener(headers);
-            } catch (error) {
-                console.error('Error in headers received listener:', error);
-            }
-        }
+        this._headersReceivedListeners.trigger(headers);
     }
 
     toJSON() {

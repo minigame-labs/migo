@@ -8,6 +8,7 @@ use crate::network::udp_socket::{
 use crate::network::websocket::{op_ws_close, op_ws_create, op_ws_next_event, op_ws_send};
 
 mod address_filter;
+mod common;
 mod fetch;
 mod tcp_socket;
 mod udp_socket;

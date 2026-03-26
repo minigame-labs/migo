@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 use shared::{
     config::InitOptions,
     error::EngineResult,
+    js_escape::escape_for_js_string,
     op_state::{HostOpState, RafRx},
     protocol::host_cmd::HostCommand,
     surface::SurfaceRef,
@@ -789,25 +790,3 @@ impl Host {
     }
 }
 
-/// Escape a string for safe interpolation into a JS single-quoted string literal.
-///
-/// Handles all characters that could break out of the string or inject code.
-/// Mirrors the escaping function in `platform/android/jni/inbound.rs`.
-fn escape_for_js_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 16);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\0' => out.push_str("\\0"),
-            '`' => out.push_str("\\`"),
-            '$' => out.push_str("\\$"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            _ => out.push(c),
-        }
-    }
-    out
-}

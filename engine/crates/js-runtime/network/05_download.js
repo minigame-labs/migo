@@ -1,6 +1,7 @@
 import { core, primordials } from "ext:core/mod.js";
 import { Header } from "ext:host_v8_network/01_header.js";
 import { NetworkTask } from "ext:host_v8_network/03_task.js";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 import {
     DownloadResponse, DownloadErrorResponse, Exception, abortedNetworkError,
 } from "ext:host_v8_network/02_response.js";
@@ -16,11 +17,11 @@ const { TypeError } = primordials;
 class DownloadTask extends NetworkTask {
     constructor(terminator) {
         super(terminator);
-        this._progressListeners = [];
+        this._progressListeners = createListenerGroup('Error in progress');
     }
 
     _onCleanup() {
-        this._progressListeners = [];
+        this._progressListeners.off();
     }
 
     onProgressUpdate(listener) {
@@ -30,35 +31,19 @@ class DownloadTask extends NetworkTask {
         if (this._aborted) {
             return;
         }
-        this._progressListeners.push(listener);
+        this._progressListeners.on(listener);
     }
 
     offProgressUpdate(listener) {
-        if (listener === undefined) {
-            this._progressListeners = [];
-            return;
-        }
-        if (typeof listener !== 'function') {
-            return;
-        }
-        const index = this._progressListeners.indexOf(listener);
-        if (index !== -1) {
-            this._progressListeners.splice(index, 1);
-        }
+        if (listener !== undefined && typeof listener !== 'function') return;
+        this._progressListeners.off(listener);
     }
 
     _triggerProgress(progress, totalBytesWritten, totalBytesExpectedToWrite) {
         if (this._aborted) {
             return;
         }
-        const data = { progress, totalBytesWritten, totalBytesExpectedToWrite };
-        for (const listener of this._progressListeners) {
-            try {
-                listener(data);
-            } catch (error) {
-                console.error('Error in progress listener:', error);
-            }
-        }
+        this._progressListeners.trigger({ progress, totalBytesWritten, totalBytesExpectedToWrite });
     }
 }
 

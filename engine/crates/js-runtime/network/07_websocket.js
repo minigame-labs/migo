@@ -2,6 +2,7 @@ import { core } from "ext:core/mod.js";
 import {
     op_ws_create, op_ws_next_event, op_ws_send, op_ws_close,
 } from "ext:core/ops";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // -- SocketTask --
 
@@ -9,10 +10,10 @@ class SocketTask {
     constructor(rid) {
         this._rid = rid;
         this._closed = false;
-        this._openListeners = [];
-        this._messageListeners = [];
-        this._errorListeners = [];
-        this._closeListeners = [];
+        this._openListeners = createListenerGroup('SocketTask onOpen');
+        this._messageListeners = createListenerGroup('SocketTask onMessage');
+        this._errorListeners = createListenerGroup('SocketTask onError');
+        this._closeListeners = createListenerGroup('SocketTask onClose');
     }
 
     send(options = {}) {
@@ -72,47 +73,39 @@ class SocketTask {
     }
 
     onOpen(callback) {
-        if (typeof callback === 'function') this._openListeners.push(callback);
+        this._openListeners.on(callback);
     }
 
     onMessage(callback) {
-        if (typeof callback === 'function') this._messageListeners.push(callback);
+        this._messageListeners.on(callback);
     }
 
     onError(callback) {
-        if (typeof callback === 'function') this._errorListeners.push(callback);
+        this._errorListeners.on(callback);
     }
 
     onClose(callback) {
-        if (typeof callback === 'function') this._closeListeners.push(callback);
+        this._closeListeners.on(callback);
     }
 
     // -- Internal event dispatch --
 
     _fireOpen(header) {
-        for (const cb of this._openListeners) {
-            try { cb({ header }); } catch (e) { console.error('SocketTask onOpen error:', e); }
-        }
+        this._openListeners.trigger({ header });
     }
 
     _fireMessage(data) {
-        for (const cb of this._messageListeners) {
-            try { cb({ data }); } catch (e) { console.error('SocketTask onMessage error:', e); }
-        }
+        this._messageListeners.trigger({ data });
     }
 
     _fireError(errMsg) {
-        for (const cb of this._errorListeners) {
-            try { cb({ errMsg }); } catch (e) { console.error('SocketTask onError error:', e); }
-        }
+        this._errorListeners.trigger({ errMsg });
     }
 
     _fireClose(code, reason) {
         this._closed = true;
         core.tryClose(this._rid);
-        for (const cb of this._closeListeners) {
-            try { cb({ code, reason }); } catch (e) { console.error('SocketTask onClose error:', e); }
-        }
+        this._closeListeners.trigger({ code, reason });
     }
 }
 
@@ -155,10 +148,10 @@ async function _pollEvents(task) {
 // -- Global socket state --
 
 let _globalSocket = null;
-const _globalOpenListeners = [];
-const _globalMessageListeners = [];
-const _globalErrorListeners = [];
-const _globalCloseListeners = [];
+const _globalOpenListeners = createListenerGroup('onSocketOpen');
+const _globalMessageListeners = createListenerGroup('onSocketMessage');
+const _globalErrorListeners = createListenerGroup('onSocketError');
+const _globalCloseListeners = createListenerGroup('onSocketClose');
 
 // -- connectSocket --
 
@@ -194,24 +187,16 @@ function connectSocket(options = {}) {
 
     // Bridge global listeners to this task
     task.onOpen((res) => {
-        for (const cb of _globalOpenListeners) {
-            try { cb(res); } catch (e) { console.error(e); }
-        }
+        _globalOpenListeners.trigger(res);
     });
     task.onMessage((res) => {
-        for (const cb of _globalMessageListeners) {
-            try { cb(res); } catch (e) { console.error(e); }
-        }
+        _globalMessageListeners.trigger(res);
     });
     task.onError((res) => {
-        for (const cb of _globalErrorListeners) {
-            try { cb(res); } catch (e) { console.error(e); }
-        }
+        _globalErrorListeners.trigger(res);
     });
     task.onClose((res) => {
-        for (const cb of _globalCloseListeners) {
-            try { cb(res); } catch (e) { console.error(e); }
-        }
+        _globalCloseListeners.trigger(res);
         if (_globalSocket === task) {
             _globalSocket = null;
         }
@@ -307,55 +292,35 @@ function closeSocket(options = {}) {
 }
 
 function onSocketOpen(callback) {
-    if (typeof callback === 'function') _globalOpenListeners.push(callback);
+    _globalOpenListeners.on(callback);
 }
 
 function offSocketOpen(callback) {
-    if (callback === undefined) {
-        _globalOpenListeners.length = 0;
-        return;
-    }
-    const idx = _globalOpenListeners.indexOf(callback);
-    if (idx !== -1) _globalOpenListeners.splice(idx, 1);
+    _globalOpenListeners.off(callback);
 }
 
 function onSocketMessage(callback) {
-    if (typeof callback === 'function') _globalMessageListeners.push(callback);
+    _globalMessageListeners.on(callback);
 }
 
 function offSocketMessage(callback) {
-    if (callback === undefined) {
-        _globalMessageListeners.length = 0;
-        return;
-    }
-    const idx = _globalMessageListeners.indexOf(callback);
-    if (idx !== -1) _globalMessageListeners.splice(idx, 1);
+    _globalMessageListeners.off(callback);
 }
 
 function onSocketError(callback) {
-    if (typeof callback === 'function') _globalErrorListeners.push(callback);
+    _globalErrorListeners.on(callback);
 }
 
 function offSocketError(callback) {
-    if (callback === undefined) {
-        _globalErrorListeners.length = 0;
-        return;
-    }
-    const idx = _globalErrorListeners.indexOf(callback);
-    if (idx !== -1) _globalErrorListeners.splice(idx, 1);
+    _globalErrorListeners.off(callback);
 }
 
 function onSocketClose(callback) {
-    if (typeof callback === 'function') _globalCloseListeners.push(callback);
+    _globalCloseListeners.on(callback);
 }
 
 function offSocketClose(callback) {
-    if (callback === undefined) {
-        _globalCloseListeners.length = 0;
-        return;
-    }
-    const idx = _globalCloseListeners.indexOf(callback);
-    if (idx !== -1) _globalCloseListeners.splice(idx, 1);
+    _globalCloseListeners.off(callback);
 }
 
 export {

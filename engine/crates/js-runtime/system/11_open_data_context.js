@@ -1,8 +1,8 @@
 import { createOffscreenCanvas, getMainCanvas } from "ext:host_v8_web/03_canvas.js";
 import { getWindowInfo } from "ext:host_v8_system/03_window_info.js";
-import { wrapAsync } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
-const _messageListeners = [];
+const _messageListeners = createListenerGroup("onMessage");
 
 let _sharedCanvas = null;
 let _openDataContext = null;
@@ -39,28 +39,15 @@ function _createSharedCanvas(mode) {
 }
 
 function _dispatchMessage(message) {
-    for (let i = 0; i < _messageListeners.length; i++) {
-        try {
-            _messageListeners[i](message);
-        } catch (e) {
-            console.error("onMessage listener error:", e);
-        }
-    }
+    _messageListeners.trigger(message);
 }
 
 function onMessage(callback) {
-    if (typeof callback === "function") {
-        _messageListeners.push(callback);
-    }
+    _messageListeners.on(callback);
 }
 
 function offMessage(callback) {
-    if (typeof callback === "function") {
-        const i = _messageListeners.indexOf(callback);
-        if (i !== -1) _messageListeners.splice(i, 1);
-    } else {
-        _messageListeners.length = 0;
-    }
+    _messageListeners.off(callback);
 }
 
 class OpenDataContext {

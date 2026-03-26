@@ -17,6 +17,20 @@ fn to_native_uniform_location(location: Option<u32>) -> Option<NativeUniformLoca
     location.map(NativeUniformLocation)
 }
 
+#[inline]
+fn logical_to_physical_i32(cm: &CanvasManager, v: i32) -> i32 {
+    if v >= 0 {
+        cm.logical_to_physical_1d(v as u32) as i32
+    } else {
+        let mag = if v == i32::MIN {
+            i32::MAX as u32
+        } else {
+            v.unsigned_abs()
+        };
+        -(cm.logical_to_physical_1d(mag) as i32)
+    }
+}
+
 pub(crate) struct RendererGL;
 
 impl RendererGL {
@@ -59,7 +73,11 @@ impl RendererGL {
                 height,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.viewport(x, y, width as i32, height as i32) };
+                let px = logical_to_physical_i32(cm, x);
+                let py = logical_to_physical_i32(cm, y);
+                let pw = cm.logical_to_physical_1d(width) as i32;
+                let ph = cm.logical_to_physical_1d(height) as i32;
+                unsafe { gl.viewport(px, py, pw, ph) };
                 Ok(false)
             }
 
@@ -138,6 +156,76 @@ impl RendererGL {
                     unsafe {
                         let loc = gl.get_attrib_location(ph, &name);
                         let _ = resp.send(Ok(loc));
+                    }
+                } else {
+                    let _ = resp.send(Ok(None));
+                }
+                Ok(false)
+            }
+
+            GLCmd::GetActiveAttrib {
+                canvas_id,
+                program_id,
+                index,
+                resp,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                let meta = cm.programs.get(&program_id).ok_or_else(|| {
+                    ee(
+                        ErrorCode::NotFound,
+                        format!("program not found: {program_id:?}"),
+                    )
+                })?;
+                if let Err(e) = cm.check_owner(meta.owner_canvas, canvas_id, "program") {
+                    let _ = resp.send(Err(e));
+                    return Ok(false);
+                }
+                if meta.deleted {
+                    let _ = resp.send(Ok(None));
+                    return Ok(false);
+                }
+
+                if let Some(ph) = meta.gl_handle {
+                    unsafe {
+                        let info = gl
+                            .get_active_attribute(ph, index)
+                            .map(|it| (it.name, it.size, it.atype));
+                        let _ = resp.send(Ok(info));
+                    }
+                } else {
+                    let _ = resp.send(Ok(None));
+                }
+                Ok(false)
+            }
+
+            GLCmd::GetActiveUniform {
+                canvas_id,
+                program_id,
+                index,
+                resp,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                let meta = cm.programs.get(&program_id).ok_or_else(|| {
+                    ee(
+                        ErrorCode::NotFound,
+                        format!("program not found: {program_id:?}"),
+                    )
+                })?;
+                if let Err(e) = cm.check_owner(meta.owner_canvas, canvas_id, "program") {
+                    let _ = resp.send(Err(e));
+                    return Ok(false);
+                }
+                if meta.deleted {
+                    let _ = resp.send(Ok(None));
+                    return Ok(false);
+                }
+
+                if let Some(ph) = meta.gl_handle {
+                    unsafe {
+                        let info = gl
+                            .get_active_uniform(ph, index)
+                            .map(|it| (it.name, it.size, it.utype));
+                        let _ = resp.send(Ok(info));
                     }
                 } else {
                     let _ = resp.send(Ok(None));
@@ -418,7 +506,10 @@ impl RendererGL {
             }
 
             // Shader
-            GLCmd::CreateShader { client_id, shader_type } => {
+            GLCmd::CreateShader {
+                client_id,
+                shader_type,
+            } => {
                 let _ = self.bind_for_contextless_gl(cm)?;
                 let owner = Self::current_owner_canvas(cm);
 
@@ -686,35 +777,57 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::IsEnabled { canvas_id, cap, resp } => {
+            GLCmd::IsEnabled {
+                canvas_id,
+                cap,
+                resp,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 let val = unsafe { gl.is_enabled(cap) };
                 let _ = resp.send(Ok(val));
                 Ok(false)
             }
 
-            GLCmd::GetParameter { canvas_id, pname, resp } => {
+            GLCmd::GetParameter {
+                canvas_id,
+                pname,
+                resp,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 let json = unsafe {
                     match pname {
                         // String params: VENDOR / RENDERER / VERSION / SHADING_LANGUAGE_VERSION
-                        glow::VENDOR | glow::RENDERER | glow::VERSION
+                        glow::VENDOR
+                        | glow::RENDERER
+                        | glow::VERSION
                         | glow::SHADING_LANGUAGE_VERSION => {
                             let val = gl.get_parameter_string(pname);
                             format!("\"{}\"", val)
                         }
                         // Boolean params
-                        glow::DEPTH_WRITEMASK | glow::SAMPLE_COVERAGE_INVERT
-                        | glow::DITHER | glow::BLEND | glow::CULL_FACE
-                        | glow::DEPTH_TEST | glow::POLYGON_OFFSET_FILL
-                        | glow::SAMPLE_ALPHA_TO_COVERAGE | glow::SAMPLE_COVERAGE
-                        | glow::SCISSOR_TEST | glow::STENCIL_TEST => {
+                        glow::DEPTH_WRITEMASK
+                        | glow::SAMPLE_COVERAGE_INVERT
+                        | glow::DITHER
+                        | glow::BLEND
+                        | glow::CULL_FACE
+                        | glow::DEPTH_TEST
+                        | glow::POLYGON_OFFSET_FILL
+                        | glow::SAMPLE_ALPHA_TO_COVERAGE
+                        | glow::SAMPLE_COVERAGE
+                        | glow::SCISSOR_TEST
+                        | glow::STENCIL_TEST => {
                             let val = gl.get_parameter_i32(pname) != 0;
-                            if val { "true".to_string() } else { "false".to_string() }
+                            if val {
+                                "true".to_string()
+                            } else {
+                                "false".to_string()
+                            }
                         }
                         // Float params
-                        glow::DEPTH_CLEAR_VALUE | glow::LINE_WIDTH
-                        | glow::POLYGON_OFFSET_FACTOR | glow::POLYGON_OFFSET_UNITS
+                        glow::DEPTH_CLEAR_VALUE
+                        | glow::LINE_WIDTH
+                        | glow::POLYGON_OFFSET_FACTOR
+                        | glow::POLYGON_OFFSET_UNITS
                         | glow::SAMPLE_COVERAGE_VALUE => {
                             let val = gl.get_parameter_f32(pname);
                             format!("{}", val)
@@ -735,11 +848,17 @@ impl RendererGL {
                         glow::COLOR_WRITEMASK => {
                             let mut buf = [0i32; 4];
                             gl.get_parameter_i32_slice(pname, &mut buf);
-                            format!("[{},{},{},{}]",
-                                buf[0] != 0, buf[1] != 0, buf[2] != 0, buf[3] != 0)
+                            format!(
+                                "[{},{},{},{}]",
+                                buf[0] != 0,
+                                buf[1] != 0,
+                                buf[2] != 0,
+                                buf[3] != 0
+                            )
                         }
                         // Float32Array[2] params
-                        glow::DEPTH_RANGE | glow::ALIASED_LINE_WIDTH_RANGE
+                        glow::DEPTH_RANGE
+                        | glow::ALIASED_LINE_WIDTH_RANGE
                         | glow::ALIASED_POINT_SIZE_RANGE => {
                             let mut buf = [0f32; 2];
                             gl.get_parameter_f32_slice(pname, &mut buf);
@@ -763,11 +882,18 @@ impl RendererGL {
                 unsafe {
                     match gl.create_texture() {
                         Ok(tex) => {
-                            cm.textures.insert(client_id, crate::canvas::TextureMeta {
-                                gl_handle: Some(tex), owner_canvas: owner, deleted: false,
-                            });
+                            cm.textures.insert(
+                                client_id,
+                                crate::canvas::TextureMeta {
+                                    gl_handle: Some(tex),
+                                    owner_canvas: owner,
+                                    deleted: false,
+                                },
+                            );
                         }
-                        Err(e) => tracing::error!("gl.create_texture failed for id {client_id}: {e:?}"),
+                        Err(e) => {
+                            tracing::error!("gl.create_texture failed for id {client_id}: {e:?}")
+                        }
                     }
                 }
                 Ok(false)
@@ -783,14 +909,21 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::BindTexture { canvas_id, target, texture } => {
+            GLCmd::BindTexture {
+                canvas_id,
+                target,
+                texture,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 let native = if let Some(id) = texture {
                     let meta = cm.textures.get(&id).ok_or_else(|| {
                         ee(ErrorCode::NotFound, format!("texture not found: {id:?}"))
                     })?;
                     if meta.deleted {
-                        shared::bail!(ErrorCode::InvalidOperation, "bind_texture on deleted texture");
+                        shared::bail!(
+                            ErrorCode::InvalidOperation,
+                            "bind_texture on deleted texture"
+                        );
                     }
                     meta.gl_handle
                 } else {
@@ -807,14 +940,28 @@ impl RendererGL {
             }
 
             GLCmd::TexImage2D {
-                canvas_id, target, level, internalformat, width, height,
-                border, format, type_, data,
+                canvas_id,
+                target,
+                level,
+                internalformat,
+                width,
+                height,
+                border,
+                format,
+                type_,
+                data,
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe {
                     gl.tex_image_2d(
-                        target, level, internalformat, width, height,
-                        border, format, type_,
+                        target,
+                        level,
+                        internalformat,
+                        width,
+                        height,
+                        border,
+                        format,
+                        type_,
                         glow::PixelUnpackData::Slice(data.as_deref()),
                     );
                 }
@@ -822,26 +969,51 @@ impl RendererGL {
             }
 
             GLCmd::TexSubImage2D {
-                canvas_id, target, level, xoffset, yoffset, width, height,
-                format, type_, data,
+                canvas_id,
+                target,
+                level,
+                xoffset,
+                yoffset,
+                width,
+                height,
+                format,
+                type_,
+                data,
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe {
                     gl.tex_sub_image_2d(
-                        target, level, xoffset, yoffset, width, height,
-                        format, type_, glow::PixelUnpackData::Slice(Some(&data)),
+                        target,
+                        level,
+                        xoffset,
+                        yoffset,
+                        width,
+                        height,
+                        format,
+                        type_,
+                        glow::PixelUnpackData::Slice(Some(&data)),
                     );
                 }
                 Ok(false)
             }
 
-            GLCmd::TexParameteri { canvas_id, target, pname, param } => {
+            GLCmd::TexParameteri {
+                canvas_id,
+                target,
+                pname,
+                param,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.tex_parameter_i32(target, pname, param) };
                 Ok(false)
             }
 
-            GLCmd::TexParameterf { canvas_id, target, pname, param } => {
+            GLCmd::TexParameterf {
+                canvas_id,
+                target,
+                pname,
+                param,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.tex_parameter_f32(target, pname, param) };
                 Ok(false)
@@ -853,32 +1025,63 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::PixelStorei { canvas_id, pname, param } => {
+            GLCmd::PixelStorei {
+                canvas_id,
+                pname,
+                param,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.pixel_store_i32(pname, param) };
                 Ok(false)
             }
 
             GLCmd::CompressedTexImage2D {
-                canvas_id, target, level, internalformat, width, height, border, data,
+                canvas_id,
+                target,
+                level,
+                internalformat,
+                width,
+                height,
+                border,
+                data,
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe {
                     gl.compressed_tex_image_2d(
-                        target, level, internalformat as i32, width, height, border,
-                        data.len() as i32, &data,
+                        target,
+                        level,
+                        internalformat as i32,
+                        width,
+                        height,
+                        border,
+                        data.len() as i32,
+                        &data,
                     );
                 }
                 Ok(false)
             }
 
             GLCmd::CompressedTexSubImage2D {
-                canvas_id, target, level, xoffset, yoffset, width, height, format, data,
+                canvas_id,
+                target,
+                level,
+                xoffset,
+                yoffset,
+                width,
+                height,
+                format,
+                data,
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe {
                     gl.compressed_tex_sub_image_2d(
-                        target, level, xoffset, yoffset, width, height, format,
+                        target,
+                        level,
+                        xoffset,
+                        yoffset,
+                        width,
+                        height,
+                        format,
                         glow::CompressedPixelUnpackData::Slice(&data),
                     );
                 }
@@ -886,7 +1089,12 @@ impl RendererGL {
             }
 
             // ========== Phase 1C: Buffer & Vertex Extensions ==========
-            GLCmd::BufferSubData { canvas_id, target, offset, data } => {
+            GLCmd::BufferSubData {
+                canvas_id,
+                target,
+                offset,
+                data,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.buffer_sub_data_u8_slice(target, offset, &data) };
                 Ok(false)
@@ -911,13 +1119,23 @@ impl RendererGL {
             }
 
             // ========== Phase 2A: Blend/Depth/Stencil/Cull ==========
-            GLCmd::BlendFunc { canvas_id, sfactor, dfactor } => {
+            GLCmd::BlendFunc {
+                canvas_id,
+                sfactor,
+                dfactor,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.blend_func(sfactor, dfactor) };
                 Ok(false)
             }
 
-            GLCmd::BlendFuncSeparate { canvas_id, src_rgb, dst_rgb, src_alpha, dst_alpha } => {
+            GLCmd::BlendFuncSeparate {
+                canvas_id,
+                src_rgb,
+                dst_rgb,
+                src_alpha,
+                dst_alpha,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.blend_func_separate(src_rgb, dst_rgb, src_alpha, dst_alpha) };
                 Ok(false)
@@ -929,13 +1147,23 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::BlendEquationSeparate { canvas_id, mode_rgb, mode_alpha } => {
+            GLCmd::BlendEquationSeparate {
+                canvas_id,
+                mode_rgb,
+                mode_alpha,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.blend_equation_separate(mode_rgb, mode_alpha) };
                 Ok(false)
             }
 
-            GLCmd::BlendColor { canvas_id, r, g, b, a } => {
+            GLCmd::BlendColor {
+                canvas_id,
+                r,
+                g,
+                b,
+                a,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.blend_color(r, g, b, a) };
                 Ok(false)
@@ -953,31 +1181,57 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::DepthRange { canvas_id, near, far } => {
+            GLCmd::DepthRange {
+                canvas_id,
+                near,
+                far,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.depth_range_f32(near, far) };
                 Ok(false)
             }
 
-            GLCmd::StencilFunc { canvas_id, func, ref_, mask } => {
+            GLCmd::StencilFunc {
+                canvas_id,
+                func,
+                ref_,
+                mask,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.stencil_func(func, ref_, mask) };
                 Ok(false)
             }
 
-            GLCmd::StencilFuncSeparate { canvas_id, face, func, ref_, mask } => {
+            GLCmd::StencilFuncSeparate {
+                canvas_id,
+                face,
+                func,
+                ref_,
+                mask,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.stencil_func_separate(face, func, ref_, mask) };
                 Ok(false)
             }
 
-            GLCmd::StencilOp { canvas_id, fail, zfail, zpass } => {
+            GLCmd::StencilOp {
+                canvas_id,
+                fail,
+                zfail,
+                zpass,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.stencil_op(fail, zfail, zpass) };
                 Ok(false)
             }
 
-            GLCmd::StencilOpSeparate { canvas_id, face, fail, zfail, zpass } => {
+            GLCmd::StencilOpSeparate {
+                canvas_id,
+                face,
+                fail,
+                zfail,
+                zpass,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.stencil_op_separate(face, fail, zfail, zpass) };
                 Ok(false)
@@ -989,7 +1243,11 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::StencilMaskSeparate { canvas_id, face, mask } => {
+            GLCmd::StencilMaskSeparate {
+                canvas_id,
+                face,
+                mask,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.stencil_mask_separate(face, mask) };
                 Ok(false)
@@ -1007,15 +1265,31 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::ColorMask { canvas_id, r, g, b, a } => {
+            GLCmd::ColorMask {
+                canvas_id,
+                r,
+                g,
+                b,
+                a,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.color_mask(r, g, b, a) };
                 Ok(false)
             }
 
-            GLCmd::Scissor { canvas_id, x, y, width, height } => {
+            GLCmd::Scissor {
+                canvas_id,
+                x,
+                y,
+                width,
+                height,
+            } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.scissor(x, y, width, height) };
+                let px = logical_to_physical_i32(cm, x);
+                let py = logical_to_physical_i32(cm, y);
+                let pw = logical_to_physical_i32(cm, width);
+                let ph = logical_to_physical_i32(cm, height);
+                unsafe { gl.scissor(px, py, pw, ph) };
                 Ok(false)
             }
 
@@ -1025,100 +1299,188 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::PolygonOffset { canvas_id, factor, units } => {
+            GLCmd::PolygonOffset {
+                canvas_id,
+                factor,
+                units,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.polygon_offset(factor, units) };
                 Ok(false)
             }
 
             // ========== Phase 2B: Uniform Variants ==========
-            GLCmd::Uniform1i { canvas_id, location, x } => {
+            GLCmd::Uniform1i {
+                canvas_id,
+                location,
+                x,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.uniform_1_i32(to_native_uniform_location(location).as_ref(), x) };
                 Ok(false)
             }
 
-            GLCmd::Uniform1f { canvas_id, location, x } => {
+            GLCmd::Uniform1f {
+                canvas_id,
+                location,
+                x,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.uniform_1_f32(to_native_uniform_location(location).as_ref(), x) };
                 Ok(false)
             }
 
-            GLCmd::Uniform2f { canvas_id, location, x, y } => {
+            GLCmd::Uniform2f {
+                canvas_id,
+                location,
+                x,
+                y,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.uniform_2_f32(to_native_uniform_location(location).as_ref(), x, y) };
                 Ok(false)
             }
 
-            GLCmd::Uniform4f { canvas_id, location, x, y, z, w } => {
+            GLCmd::Uniform4f {
+                canvas_id,
+                location,
+                x,
+                y,
+                z,
+                w,
+            } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.uniform_4_f32(to_native_uniform_location(location).as_ref(), x, y, z, w) };
+                unsafe {
+                    gl.uniform_4_f32(to_native_uniform_location(location).as_ref(), x, y, z, w)
+                };
                 Ok(false)
             }
 
-            GLCmd::Uniform1iv { canvas_id, location, value } => {
+            GLCmd::Uniform1iv {
+                canvas_id,
+                location,
+                value,
+            } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.uniform_1_i32_slice(to_native_uniform_location(location).as_ref(), &value) };
+                unsafe {
+                    gl.uniform_1_i32_slice(to_native_uniform_location(location).as_ref(), &value)
+                };
                 Ok(false)
             }
 
-            GLCmd::Uniform1fv { canvas_id, location, value } => {
+            GLCmd::Uniform1fv {
+                canvas_id,
+                location,
+                value,
+            } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.uniform_1_f32_slice(to_native_uniform_location(location).as_ref(), &value) };
+                unsafe {
+                    gl.uniform_1_f32_slice(to_native_uniform_location(location).as_ref(), &value)
+                };
                 Ok(false)
             }
 
-            GLCmd::Uniform2iv { canvas_id, location, value } => {
+            GLCmd::Uniform2iv {
+                canvas_id,
+                location,
+                value,
+            } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.uniform_2_i32_slice(to_native_uniform_location(location).as_ref(), &value) };
+                unsafe {
+                    gl.uniform_2_i32_slice(to_native_uniform_location(location).as_ref(), &value)
+                };
                 Ok(false)
             }
 
-            GLCmd::Uniform2fv { canvas_id, location, value } => {
+            GLCmd::Uniform2fv {
+                canvas_id,
+                location,
+                value,
+            } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.uniform_2_f32_slice(to_native_uniform_location(location).as_ref(), &value) };
+                unsafe {
+                    gl.uniform_2_f32_slice(to_native_uniform_location(location).as_ref(), &value)
+                };
                 Ok(false)
             }
 
-            GLCmd::Uniform3iv { canvas_id, location, value } => {
+            GLCmd::Uniform3iv {
+                canvas_id,
+                location,
+                value,
+            } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.uniform_3_i32_slice(to_native_uniform_location(location).as_ref(), &value) };
+                unsafe {
+                    gl.uniform_3_i32_slice(to_native_uniform_location(location).as_ref(), &value)
+                };
                 Ok(false)
             }
 
-            GLCmd::Uniform3fv { canvas_id, location, value } => {
+            GLCmd::Uniform3fv {
+                canvas_id,
+                location,
+                value,
+            } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.uniform_3_f32_slice(to_native_uniform_location(location).as_ref(), &value) };
+                unsafe {
+                    gl.uniform_3_f32_slice(to_native_uniform_location(location).as_ref(), &value)
+                };
                 Ok(false)
             }
 
-            GLCmd::Uniform4iv { canvas_id, location, value } => {
+            GLCmd::Uniform4iv {
+                canvas_id,
+                location,
+                value,
+            } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.uniform_4_i32_slice(to_native_uniform_location(location).as_ref(), &value) };
+                unsafe {
+                    gl.uniform_4_i32_slice(to_native_uniform_location(location).as_ref(), &value)
+                };
                 Ok(false)
             }
 
-            GLCmd::Uniform4fv { canvas_id, location, value } => {
+            GLCmd::Uniform4fv {
+                canvas_id,
+                location,
+                value,
+            } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.uniform_4_f32_slice(to_native_uniform_location(location).as_ref(), &value) };
+                unsafe {
+                    gl.uniform_4_f32_slice(to_native_uniform_location(location).as_ref(), &value)
+                };
                 Ok(false)
             }
 
-            GLCmd::UniformMatrix2fv { canvas_id, location, transpose, value } => {
+            GLCmd::UniformMatrix2fv {
+                canvas_id,
+                location,
+                transpose,
+                value,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe {
                     gl.uniform_matrix_2_f32_slice(
-                        to_native_uniform_location(location).as_ref(), transpose, &value,
+                        to_native_uniform_location(location).as_ref(),
+                        transpose,
+                        &value,
                     )
                 };
                 Ok(false)
             }
 
-            GLCmd::UniformMatrix4fv { canvas_id, location, transpose, value } => {
+            GLCmd::UniformMatrix4fv {
+                canvas_id,
+                location,
+                transpose,
+                value,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe {
                     gl.uniform_matrix_4_f32_slice(
-                        to_native_uniform_location(location).as_ref(), transpose, &value,
+                        to_native_uniform_location(location).as_ref(),
+                        transpose,
+                        &value,
                     )
                 };
                 Ok(false)
@@ -1131,11 +1493,18 @@ impl RendererGL {
                 unsafe {
                     match gl.create_framebuffer() {
                         Ok(fb) => {
-                            cm.framebuffers.insert(client_id, crate::canvas::FramebufferMeta {
-                                gl_handle: Some(fb), owner_canvas: owner, deleted: false,
-                            });
+                            cm.framebuffers.insert(
+                                client_id,
+                                crate::canvas::FramebufferMeta {
+                                    gl_handle: Some(fb),
+                                    owner_canvas: owner,
+                                    deleted: false,
+                                },
+                            );
                         }
-                        Err(e) => tracing::error!("gl.create_framebuffer failed for id {client_id}: {e:?}"),
+                        Err(e) => tracing::error!(
+                            "gl.create_framebuffer failed for id {client_id}: {e:?}"
+                        ),
                     }
                 }
                 Ok(false)
@@ -1151,14 +1520,24 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::BindFramebuffer { canvas_id, target, framebuffer } => {
+            GLCmd::BindFramebuffer {
+                canvas_id,
+                target,
+                framebuffer,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 let native = if let Some(id) = framebuffer {
                     let meta = cm.framebuffers.get(&id).ok_or_else(|| {
-                        ee(ErrorCode::NotFound, format!("framebuffer not found: {id:?}"))
+                        ee(
+                            ErrorCode::NotFound,
+                            format!("framebuffer not found: {id:?}"),
+                        )
                     })?;
                     if meta.deleted {
-                        shared::bail!(ErrorCode::InvalidOperation, "bind_framebuffer on deleted framebuffer");
+                        shared::bail!(
+                            ErrorCode::InvalidOperation,
+                            "bind_framebuffer on deleted framebuffer"
+                        );
                     }
                     meta.gl_handle
                 } else {
@@ -1169,7 +1548,12 @@ impl RendererGL {
             }
 
             GLCmd::FramebufferTexture2D {
-                canvas_id, target, attachment, textarget, texture, level,
+                canvas_id,
+                target,
+                attachment,
+                textarget,
+                texture,
+                level,
             } => {
                 cm.make_current_needed(canvas_id)?;
                 let tex_handle = if let Some(id) = texture {
@@ -1177,36 +1561,57 @@ impl RendererGL {
                         ee(ErrorCode::NotFound, format!("texture not found: {id:?}"))
                     })?;
                     if meta.deleted {
-                        shared::bail!(ErrorCode::InvalidOperation, "framebufferTexture2D on deleted texture");
+                        shared::bail!(
+                            ErrorCode::InvalidOperation,
+                            "framebufferTexture2D on deleted texture"
+                        );
                     }
                     meta.gl_handle
                 } else {
                     None
                 };
-                unsafe { gl.framebuffer_texture_2d(target, attachment, textarget, tex_handle, level) };
+                unsafe {
+                    gl.framebuffer_texture_2d(target, attachment, textarget, tex_handle, level)
+                };
                 Ok(false)
             }
 
             GLCmd::FramebufferRenderbuffer {
-                canvas_id, target, attachment, renderbuffertarget, renderbuffer,
+                canvas_id,
+                target,
+                attachment,
+                renderbuffertarget,
+                renderbuffer,
             } => {
                 cm.make_current_needed(canvas_id)?;
                 let rb_handle = if let Some(id) = renderbuffer {
                     let meta = cm.renderbuffers.get(&id).ok_or_else(|| {
-                        ee(ErrorCode::NotFound, format!("renderbuffer not found: {id:?}"))
+                        ee(
+                            ErrorCode::NotFound,
+                            format!("renderbuffer not found: {id:?}"),
+                        )
                     })?;
                     if meta.deleted {
-                        shared::bail!(ErrorCode::InvalidOperation, "framebufferRenderbuffer on deleted renderbuffer");
+                        shared::bail!(
+                            ErrorCode::InvalidOperation,
+                            "framebufferRenderbuffer on deleted renderbuffer"
+                        );
                     }
                     meta.gl_handle
                 } else {
                     None
                 };
-                unsafe { gl.framebuffer_renderbuffer(target, attachment, renderbuffertarget, rb_handle) };
+                unsafe {
+                    gl.framebuffer_renderbuffer(target, attachment, renderbuffertarget, rb_handle)
+                };
                 Ok(false)
             }
 
-            GLCmd::CheckFramebufferStatus { canvas_id, target, resp } => {
+            GLCmd::CheckFramebufferStatus {
+                canvas_id,
+                target,
+                resp,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 let status = unsafe { gl.check_framebuffer_status(target) };
                 let _ = resp.send(Ok(status));
@@ -1219,11 +1624,18 @@ impl RendererGL {
                 unsafe {
                     match gl.create_renderbuffer() {
                         Ok(rb) => {
-                            cm.renderbuffers.insert(client_id, crate::canvas::RenderbufferMeta {
-                                gl_handle: Some(rb), owner_canvas: owner, deleted: false,
-                            });
+                            cm.renderbuffers.insert(
+                                client_id,
+                                crate::canvas::RenderbufferMeta {
+                                    gl_handle: Some(rb),
+                                    owner_canvas: owner,
+                                    deleted: false,
+                                },
+                            );
                         }
-                        Err(e) => tracing::error!("gl.create_renderbuffer failed for id {client_id}: {e:?}"),
+                        Err(e) => tracing::error!(
+                            "gl.create_renderbuffer failed for id {client_id}: {e:?}"
+                        ),
                     }
                 }
                 Ok(false)
@@ -1239,14 +1651,24 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::BindRenderbuffer { canvas_id, target, renderbuffer } => {
+            GLCmd::BindRenderbuffer {
+                canvas_id,
+                target,
+                renderbuffer,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 let native = if let Some(id) = renderbuffer {
                     let meta = cm.renderbuffers.get(&id).ok_or_else(|| {
-                        ee(ErrorCode::NotFound, format!("renderbuffer not found: {id:?}"))
+                        ee(
+                            ErrorCode::NotFound,
+                            format!("renderbuffer not found: {id:?}"),
+                        )
                     })?;
                     if meta.deleted {
-                        shared::bail!(ErrorCode::InvalidOperation, "bind_renderbuffer on deleted renderbuffer");
+                        shared::bail!(
+                            ErrorCode::InvalidOperation,
+                            "bind_renderbuffer on deleted renderbuffer"
+                        );
                     }
                     meta.gl_handle
                 } else {
@@ -1256,14 +1678,29 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::RenderbufferStorage { canvas_id, target, internalformat, width, height } => {
+            GLCmd::RenderbufferStorage {
+                canvas_id,
+                target,
+                internalformat,
+                width,
+                height,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.renderbuffer_storage(target, internalformat, width, height) };
                 Ok(false)
             }
 
             // ========== Phase 3B: Misc ==========
-            GLCmd::ReadPixels { canvas_id, x, y, width, height, format, type_, resp } => {
+            GLCmd::ReadPixels {
+                canvas_id,
+                x,
+                y,
+                width,
+                height,
+                format,
+                type_,
+                resp,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 // Calculate buffer size: width * height * bytes_per_pixel
                 // bpp depends on both format (component count) and type (bytes per component)
@@ -1286,7 +1723,12 @@ impl RendererGL {
                 let mut buf = vec![0u8; byte_size];
                 unsafe {
                     gl.read_pixels(
-                        x, y, width, height, format, type_,
+                        x,
+                        y,
+                        width,
+                        height,
+                        format,
+                        type_,
                         glow::PixelPackData::Slice(Some(&mut buf)),
                     );
                 }
@@ -1294,7 +1736,11 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::Hint { canvas_id, target, mode } => {
+            GLCmd::Hint {
+                canvas_id,
+                target,
+                mode,
+            } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.hint(target, mode) };
                 Ok(false)

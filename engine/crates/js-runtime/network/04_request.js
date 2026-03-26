@@ -2,6 +2,7 @@ import { core, primordials } from "ext:core/mod.js";
 import { Header } from "ext:host_v8_network/01_header.js";
 import { NetworkTask } from "ext:host_v8_network/03_task.js";
 import { ReadableStream } from "ext:host_v8_web/06_stream.js";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 import {
     abortedNetworkError, Response, ErrorResponse,
     nullBodyStatus, Exception,
@@ -22,11 +23,11 @@ const NO_BODY_METHODS = new Set(["GET", "HEAD", "TRACE", "CONNECT"]);
 class RequestTask extends NetworkTask {
     constructor(terminator) {
         super(terminator);
-        this._chunkReceivedListeners = [];
+        this._chunkReceivedListeners = createListenerGroup('Error in chunk received');
     }
 
     _onCleanup() {
-        this._chunkReceivedListeners = [];
+        this._chunkReceivedListeners.off();
     }
 
     onChunkReceived(listener) {
@@ -36,34 +37,19 @@ class RequestTask extends NetworkTask {
         if (this._aborted) {
             return;
         }
-        this._chunkReceivedListeners.push(listener);
+        this._chunkReceivedListeners.on(listener);
     }
 
     offChunkReceived(listener) {
-        if (listener === undefined) {
-            this._chunkReceivedListeners = [];
-            return;
-        }
-        if (typeof listener !== 'function') {
-            return;
-        }
-        const index = this._chunkReceivedListeners.indexOf(listener);
-        if (index !== -1) {
-            this._chunkReceivedListeners.splice(index, 1);
-        }
+        if (listener !== undefined && typeof listener !== 'function') return;
+        this._chunkReceivedListeners.off(listener);
     }
 
     _triggerChunkReceived(chunk) {
         if (this._aborted) {
             return;
         }
-        for (const listener of this._chunkReceivedListeners) {
-            try {
-                listener(chunk);
-            } catch (error) {
-                console.error('Error in chunk received listener:', error);
-            }
-        }
+        this._chunkReceivedListeners.trigger(chunk);
     }
 }
 

@@ -1,32 +1,20 @@
 // ==================== Memory Warning Event Listeners ====================
 
-const _memoryWarningListeners = [];
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+
+const _memoryWarningListeners = createListenerGroup('onMemoryWarning');
 
 function onMemoryWarning(listener) {
-    if (typeof listener === 'function') {
-        _memoryWarningListeners.push(listener);
-    }
+    _memoryWarningListeners.on(listener);
 }
 
 function offMemoryWarning(listener) {
-    if (typeof listener === 'function') {
-        const index = _memoryWarningListeners.indexOf(listener);
-        if (index !== -1) {
-            _memoryWarningListeners.splice(index, 1);
-        }
-    } else {
-        _memoryWarningListeners.length = 0;
-    }
+    _memoryWarningListeners.off(listener);
 }
 
 // Called from Rust JsBindings dispatch
 function _internalTriggerMemoryWarning(level) {
-    const data = { level };
-    for (let i = 0; i < _memoryWarningListeners.length; i++) {
-        try { _memoryWarningListeners[i](data); } catch (e) {
-            console.error('onMemoryWarning listener error:', e);
-        }
-    }
+    _memoryWarningListeners.trigger({ level });
 }
 
 export {

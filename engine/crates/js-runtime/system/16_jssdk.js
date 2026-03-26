@@ -5,10 +5,12 @@
 // - ready(cb): if already configured, fires immediately; otherwise queues.
 // - error(cb): registers global error listener; fires on config failure.
 
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+
 let _configured = false;
 let _configData = null;
 const _readyQueue = [];
-const _errorListeners = [];
+const _errorListeners = createListenerGroup('error callback');
 
 function config(options) {
     const opts = options || {};
@@ -36,18 +38,13 @@ function ready(callback) {
 }
 
 function error(callback) {
-    if (typeof callback !== 'function') return;
-    _errorListeners.push(callback);
+    _errorListeners.on(callback);
 }
 
 // Host can call this to signal a config-level error.
 function _internalTriggerJssdkError(errMsg) {
     const res = { errMsg: errMsg || 'config:fail' };
-    for (let i = 0; i < _errorListeners.length; i++) {
-        try { _errorListeners[i](res); } catch (e) {
-            console.error('error callback error:', e);
-        }
-    }
+    _errorListeners.trigger(res);
 }
 
 export { config, ready, error, _internalTriggerJssdkError };

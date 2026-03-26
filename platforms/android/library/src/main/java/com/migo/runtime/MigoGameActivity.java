@@ -14,6 +14,7 @@ import android.view.View;
 import android.widget.FrameLayout;
 
 import com.migo.runtime.callback.GameSessionListener;
+import com.migo.runtime.internal.platform.DisplayCompat;
 
 /**
  * Ready-to-use Activity for running a game with zero boilerplate.
@@ -131,6 +132,8 @@ public class MigoGameActivity extends Activity
             return;
         }
 
+        applyStartupOrientation();
+
         // Create surface view
         FrameLayout root = new FrameLayout(this);
         surfaceView = new SurfaceView(this);
@@ -221,7 +224,9 @@ public class MigoGameActivity extends Activity
     }
 
     @Override
-    public void onConfigurationChanged(Configuration newConfig) {}
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+    }
 
     @Override
     public void onLowMemory() {
@@ -279,5 +284,15 @@ public class MigoGameActivity extends Activity
         if (startResult != ErrorCode.SUCCESS) {
             finish();
         }
+    }
+
+    private void applyStartupOrientation() {
+        String orientation = config != null ? config.getStartupOrientation() : null;
+        if (orientation == null) {
+            return;
+        }
+
+        int result = DisplayCompat.setDeviceOrientation(this, orientation);
+        Log.i(TAG, "applyStartupOrientation: " + orientation + ", result=" + result);
     }
 }

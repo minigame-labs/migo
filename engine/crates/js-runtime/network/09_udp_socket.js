@@ -6,6 +6,7 @@ import {
     op_udp_bind, op_udp_connect, op_udp_send,
     op_udp_set_ttl, op_udp_next_event, op_udp_close,
 } from "ext:core/ops";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // -- UDPSocket class --
 
@@ -17,10 +18,10 @@ class UDPSocket {
         this._closed = false;
 
         // Per-instance event listeners
-        this._closeListeners = [];
-        this._errorListeners = [];
-        this._listeningListeners = [];
-        this._messageListeners = [];
+        this._closeListeners = createListenerGroup('UDPSocket onClose');
+        this._errorListeners = createListenerGroup('UDPSocket onError');
+        this._listeningListeners = createListenerGroup('UDPSocket onListening');
+        this._messageListeners = createListenerGroup('UDPSocket onMessage');
     }
 
     // -- Control methods --
@@ -140,91 +141,53 @@ class UDPSocket {
     // -- Event listener methods --
 
     onClose(listener) {
-        if (typeof listener === 'function') this._closeListeners.push(listener);
+        this._closeListeners.on(listener);
     }
 
     offClose(listener) {
-        if (typeof listener === 'function') {
-            const i = this._closeListeners.indexOf(listener);
-            if (i !== -1) this._closeListeners.splice(i, 1);
-        } else {
-            this._closeListeners.length = 0;
-        }
+        this._closeListeners.off(listener);
     }
 
     onError(listener) {
-        if (typeof listener === 'function') this._errorListeners.push(listener);
+        this._errorListeners.on(listener);
     }
 
     offError(listener) {
-        if (typeof listener === 'function') {
-            const i = this._errorListeners.indexOf(listener);
-            if (i !== -1) this._errorListeners.splice(i, 1);
-        } else {
-            this._errorListeners.length = 0;
-        }
+        this._errorListeners.off(listener);
     }
 
     onListening(listener) {
-        if (typeof listener === 'function') this._listeningListeners.push(listener);
+        this._listeningListeners.on(listener);
     }
 
     offListening(listener) {
-        if (typeof listener === 'function') {
-            const i = this._listeningListeners.indexOf(listener);
-            if (i !== -1) this._listeningListeners.splice(i, 1);
-        } else {
-            this._listeningListeners.length = 0;
-        }
+        this._listeningListeners.off(listener);
     }
 
     onMessage(listener) {
-        if (typeof listener === 'function') this._messageListeners.push(listener);
+        this._messageListeners.on(listener);
     }
 
     offMessage(listener) {
-        if (typeof listener === 'function') {
-            const i = this._messageListeners.indexOf(listener);
-            if (i !== -1) this._messageListeners.splice(i, 1);
-        } else {
-            this._messageListeners.length = 0;
-        }
+        this._messageListeners.off(listener);
     }
 
     // -- Internal event dispatch --
 
     _fireListening() {
-        for (let i = 0; i < this._listeningListeners.length; i++) {
-            try { this._listeningListeners[i](); } catch (e) {
-                console.error('UDPSocket onListening listener error:', e);
-            }
-        }
+        this._listeningListeners.trigger();
     }
 
     _fireClose() {
-        for (let i = 0; i < this._closeListeners.length; i++) {
-            try { this._closeListeners[i](); } catch (e) {
-                console.error('UDPSocket onClose listener error:', e);
-            }
-        }
+        this._closeListeners.trigger();
     }
 
     _fireError(errMsg) {
-        const res = { errMsg };
-        for (let i = 0; i < this._errorListeners.length; i++) {
-            try { this._errorListeners[i](res); } catch (e) {
-                console.error('UDPSocket onError listener error:', e);
-            }
-        }
+        this._errorListeners.trigger({ errMsg });
     }
 
     _fireMessage(message, remoteInfo, localInfo) {
-        const res = { message, remoteInfo, localInfo };
-        for (let i = 0; i < this._messageListeners.length; i++) {
-            try { this._messageListeners[i](res); } catch (e) {
-                console.error('UDPSocket onMessage listener error:', e);
-            }
-        }
+        this._messageListeners.trigger({ message, remoteInfo, localInfo });
     }
 
     _doClose() {

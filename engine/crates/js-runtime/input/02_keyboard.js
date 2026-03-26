@@ -1,182 +1,98 @@
 import { op_show_keyboard, op_hide_keyboard, op_update_keyboard } from "ext:core/ops";
-import { wrapAsync } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // ==================== Soft keyboard event listeners ====================
 
-const _inputListeners = [];
-const _heightChangeListeners = [];
-const _confirmListeners = [];
-const _completeListeners = [];
+const _inputListeners = createListenerGroup('onKeyboardInput');
+const _heightChangeListeners = createListenerGroup('onKeyboardHeightChange');
+const _confirmListeners = createListenerGroup('onKeyboardConfirm');
+const _completeListeners = createListenerGroup('onKeyboardComplete');
 
 // ---- onKeyboardInput / offKeyboardInput ----
 
 function onKeyboardInput(listener) {
-    if (typeof listener === 'function') {
-        _inputListeners.push(listener);
-    }
+    _inputListeners.on(listener);
 }
 
 function offKeyboardInput(listener) {
-    if (typeof listener === 'function') {
-        const index = _inputListeners.indexOf(listener);
-        if (index !== -1) {
-            _inputListeners.splice(index, 1);
-        }
-    } else {
-        _inputListeners.length = 0;
-    }
+    _inputListeners.off(listener);
 }
 
 // ---- onKeyboardHeightChange / offKeyboardHeightChange ----
 
 function onKeyboardHeightChange(listener) {
-    if (typeof listener === 'function') {
-        _heightChangeListeners.push(listener);
-    }
+    _heightChangeListeners.on(listener);
 }
 
 function offKeyboardHeightChange(listener) {
-    if (typeof listener === 'function') {
-        const index = _heightChangeListeners.indexOf(listener);
-        if (index !== -1) {
-            _heightChangeListeners.splice(index, 1);
-        }
-    } else {
-        _heightChangeListeners.length = 0;
-    }
+    _heightChangeListeners.off(listener);
 }
 
 // ---- onKeyboardConfirm / offKeyboardConfirm ----
 
 function onKeyboardConfirm(listener) {
-    if (typeof listener === 'function') {
-        _confirmListeners.push(listener);
-    }
+    _confirmListeners.on(listener);
 }
 
 function offKeyboardConfirm(listener) {
-    if (typeof listener === 'function') {
-        const index = _confirmListeners.indexOf(listener);
-        if (index !== -1) {
-            _confirmListeners.splice(index, 1);
-        }
-    } else {
-        _confirmListeners.length = 0;
-    }
+    _confirmListeners.off(listener);
 }
 
 // ---- onKeyboardComplete / offKeyboardComplete ----
 
 function onKeyboardComplete(listener) {
-    if (typeof listener === 'function') {
-        _completeListeners.push(listener);
-    }
+    _completeListeners.on(listener);
 }
 
 function offKeyboardComplete(listener) {
-    if (typeof listener === 'function') {
-        const index = _completeListeners.indexOf(listener);
-        if (index !== -1) {
-            _completeListeners.splice(index, 1);
-        }
-    } else {
-        _completeListeners.length = 0;
-    }
+    _completeListeners.off(listener);
 }
 
 // ==================== Internal trigger functions (called from native) ====================
 
 function _internalTriggerKeyboardInput(value) {
-    const data = { value };
-    for (let i = 0; i < _inputListeners.length; i++) {
-        try { _inputListeners[i](data); } catch (e) {
-            console.error('onKeyboardInput listener error:', e);
-        }
-    }
+    _inputListeners.trigger({ value });
 }
 
 function _internalTriggerKeyboardHeightChange(height) {
-    const data = { height };
-    for (let i = 0; i < _heightChangeListeners.length; i++) {
-        try { _heightChangeListeners[i](data); } catch (e) {
-            console.error('onKeyboardHeightChange listener error:', e);
-        }
-    }
+    _heightChangeListeners.trigger({ height });
 }
 
 function _internalTriggerKeyboardConfirm(value) {
-    const data = { value };
-    for (let i = 0; i < _confirmListeners.length; i++) {
-        try { _confirmListeners[i](data); } catch (e) {
-            console.error('onKeyboardConfirm listener error:', e);
-        }
-    }
+    _confirmListeners.trigger({ value });
 }
 
 function _internalTriggerKeyboardComplete(value) {
-    const data = { value };
-    for (let i = 0; i < _completeListeners.length; i++) {
-        try { _completeListeners[i](data); } catch (e) {
-            console.error('onKeyboardComplete listener error:', e);
-        }
-    }
+    _completeListeners.trigger({ value });
 }
 
 // ==================== PC keyboard event listeners ====================
 
-const _keyDownListeners = [];
-const _keyUpListeners = [];
+const _keyDownListeners = createListenerGroup('onKeyDown');
+const _keyUpListeners = createListenerGroup('onKeyUp');
 
 function onKeyDown(listener) {
-    if (typeof listener === 'function') {
-        _keyDownListeners.push(listener);
-    }
+    _keyDownListeners.on(listener);
 }
 
 function offKeyDown(listener) {
-    if (typeof listener === 'function') {
-        const index = _keyDownListeners.indexOf(listener);
-        if (index !== -1) {
-            _keyDownListeners.splice(index, 1);
-        }
-    } else {
-        _keyDownListeners.length = 0;
-    }
+    _keyDownListeners.off(listener);
 }
 
 function onKeyUp(listener) {
-    if (typeof listener === 'function') {
-        _keyUpListeners.push(listener);
-    }
+    _keyUpListeners.on(listener);
 }
 
 function offKeyUp(listener) {
-    if (typeof listener === 'function') {
-        const index = _keyUpListeners.indexOf(listener);
-        if (index !== -1) {
-            _keyUpListeners.splice(index, 1);
-        }
-    } else {
-        _keyUpListeners.length = 0;
-    }
+    _keyUpListeners.off(listener);
 }
 
 function _internalTriggerKeyDown(key, code, timeStamp) {
-    const data = { key, code, timeStamp };
-    for (let i = 0; i < _keyDownListeners.length; i++) {
-        try { _keyDownListeners[i](data); } catch (e) {
-            console.error('onKeyDown listener error:', e);
-        }
-    }
+    _keyDownListeners.trigger({ key, code, timeStamp });
 }
 
 function _internalTriggerKeyUp(key, code, timeStamp) {
-    const data = { key, code, timeStamp };
-    for (let i = 0; i < _keyUpListeners.length; i++) {
-        try { _keyUpListeners[i](data); } catch (e) {
-            console.error('onKeyUp listener error:', e);
-        }
-    }
+    _keyUpListeners.trigger({ key, code, timeStamp });
 }
 
 // ==================== Async control APIs ====================

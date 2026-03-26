@@ -1,6 +1,7 @@
 import { getWindowInfo } from "ext:host_v8_system/03_window_info.js";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
-const _resizeListeners = [];
+const _resize = createListenerGroup("onWindowResize");
 let _lastWidth = -1;
 let _lastHeight = -1;
 
@@ -14,19 +15,17 @@ function _readWindowSize() {
 
 function onWindowResize(listener) {
     if (typeof listener === "function") {
-        _resizeListeners.push(listener);
+        _resize.on(listener);
+        try {
+            listener(_readWindowSize());
+        } catch (e) {
+            console.error("onWindowResize listener error:", e);
+        }
     }
 }
 
 function offWindowResize(listener) {
-    if (typeof listener === "function") {
-        const idx = _resizeListeners.indexOf(listener);
-        if (idx !== -1) {
-            _resizeListeners.splice(idx, 1);
-        }
-    } else {
-        _resizeListeners.length = 0;
-    }
+    _resize.off(listener);
 }
 
 function _internalTriggerWindowResize() {
@@ -44,13 +43,7 @@ function _internalTriggerWindowResize() {
     _lastWidth = data.windowWidth;
     _lastHeight = data.windowHeight;
 
-    for (let i = 0; i < _resizeListeners.length; i++) {
-        try {
-            _resizeListeners[i](data);
-        } catch (e) {
-            console.error("onWindowResize listener error:", e);
-        }
-    }
+    _resize.trigger(data);
 }
 
 export {

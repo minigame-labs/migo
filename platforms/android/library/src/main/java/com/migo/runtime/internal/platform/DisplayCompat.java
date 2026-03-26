@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.pm.ActivityInfo;
 import android.graphics.Point;
 import android.os.Build;
+import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.view.Display;
 import android.view.View;
@@ -342,7 +343,7 @@ public final class DisplayCompat {
         }
 
         try {
-            activity.runOnUiThread(new Runnable() {
+            Runnable applyOrientation = new Runnable() {
                 @Override
                 public void run() {
                     try {
@@ -350,7 +351,13 @@ public final class DisplayCompat {
                     } catch (Exception ignored) {
                     }
                 }
-            });
+            };
+
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                applyOrientation.run();
+            } else {
+                activity.runOnUiThread(applyOrientation);
+            }
             return 0;
         } catch (Exception e) {
             return -1;

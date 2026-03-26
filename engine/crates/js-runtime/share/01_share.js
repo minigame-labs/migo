@@ -7,7 +7,7 @@
 //   - shareAppMessage delegates to the host via _internalOnShareRequest if present
 
 import { op_share_app_message } from "ext:core/ops";
-import { wrapAsync, createDeferredApi } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createDeferredApi, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // ---- share menu state ------------------------------------------------------
 
@@ -66,23 +66,14 @@ function updateShareMenu(options) {
 
 // ---- onShareAppMessage / offShareAppMessage --------------------------------
 
-const _shareListeners = [];
+const _shareListeners = createListenerGroup('onShareAppMessage');
 
 function onShareAppMessage(listener) {
-    if (typeof listener === 'function') {
-        _shareListeners.push(listener);
-    }
+    _shareListeners.on(listener);
 }
 
 function offShareAppMessage(listener) {
-    if (typeof listener === 'function') {
-        const index = _shareListeners.indexOf(listener);
-        if (index !== -1) {
-            _shareListeners.splice(index, 1);
-        }
-    } else {
-        _shareListeners.length = 0;
-    }
+    _shareListeners.off(listener);
 }
 
 // ---- shareAppMessage (Mode C - host op) ------------------------------------
@@ -100,9 +91,10 @@ function shareAppMessage(options) {
         };
 
         // Invoke registered listeners to allow the game to customise share data
-        for (let i = 0; i < _shareListeners.length; i++) {
+        const listeners = _shareListeners.snapshot();
+        for (let i = 0; i < listeners.length; i++) {
             try {
-                const override = _shareListeners[i](shareData);
+                const override = listeners[i](shareData);
                 if (override && typeof override === 'object') {
                     if (typeof override.title === 'string') shareData.title = override.title;
                     if (typeof override.imageUrl === 'string') shareData.imageUrl = override.imageUrl;
@@ -123,30 +115,24 @@ function _internalOnShareAppMessageResult(resultJson) {
 
 // ---- onShareTimeline / offShareTimeline ------------------------------------
 
-const _shareTimelineListeners = [];
+const _shareTimelineListeners = createListenerGroup('onShareTimeline');
 
 function onShareTimeline(listener) {
-    if (typeof listener === 'function') {
-        _shareTimelineListeners.push(listener);
-    }
+    _shareTimelineListeners.on(listener);
 }
 
 function offShareTimeline(listener) {
-    if (typeof listener === 'function') {
-        const index = _shareTimelineListeners.indexOf(listener);
-        if (index !== -1) _shareTimelineListeners.splice(index, 1);
-    } else {
-        _shareTimelineListeners.length = 0;
-    }
+    _shareTimelineListeners.off(listener);
 }
 
 // ---- host-side trigger (called from Rust when user taps native timeline share)
 
 function _internalTriggerShareTimeline() {
     var shareData = { title: '', imageUrl: '', query: '' };
-    for (var i = 0; i < _shareTimelineListeners.length; i++) {
+    var listeners = _shareTimelineListeners.snapshot();
+    for (var i = 0; i < listeners.length; i++) {
         try {
-            var override = _shareTimelineListeners[i]();
+            var override = listeners[i]();
             if (override && typeof override === 'object') {
                 if (typeof override.title === 'string') shareData.title = override.title;
                 if (typeof override.imageUrl === 'string') shareData.imageUrl = override.imageUrl;
@@ -177,21 +163,14 @@ function shareMessageToFriend(options) {
 
 // ---- onShareMessageToFriend / offShareMessageToFriend ----------------------
 
-const _shareToFriendListeners = [];
+const _shareToFriendListeners = createListenerGroup('onShareMessageToFriend');
 
 function onShareMessageToFriend(listener) {
-    if (typeof listener === 'function') {
-        _shareToFriendListeners.push(listener);
-    }
+    _shareToFriendListeners.on(listener);
 }
 
 function offShareMessageToFriend(listener) {
-    if (typeof listener === 'function') {
-        const index = _shareToFriendListeners.indexOf(listener);
-        if (index !== -1) _shareToFriendListeners.splice(index, 1);
-    } else {
-        _shareToFriendListeners.length = 0;
-    }
+    _shareToFriendListeners.off(listener);
 }
 
 function _internalTriggerShareMessageToFriend(data) {
@@ -199,11 +178,7 @@ function _internalTriggerShareMessageToFriend(data) {
     if (typeof data === 'string') {
         try { parsed = JSON.parse(data); } catch (_) { parsed = {}; }
     }
-    for (let i = 0; i < _shareToFriendListeners.length; i++) {
-        try { _shareToFriendListeners[i](parsed); } catch (e) {
-            console.error('onShareMessageToFriend listener error:', e);
-        }
-    }
+    _shareToFriendListeners.trigger(parsed);
 }
 
 // ---- setMessageToFriendQuery -----------------------------------------------
@@ -237,9 +212,10 @@ function showShareImageMenu(options) {
 
 function _internalTriggerShareAppMessage() {
     let shareData = { title: '', imageUrl: '', query: '' };
-    for (let i = 0; i < _shareListeners.length; i++) {
+    const listeners = _shareListeners.snapshot();
+    for (let i = 0; i < listeners.length; i++) {
         try {
-            const override = _shareListeners[i]();
+            const override = listeners[i]();
             if (override && typeof override === 'object') {
                 if (typeof override.title === 'string') shareData.title = override.title;
                 if (typeof override.imageUrl === 'string') shareData.imageUrl = override.imageUrl;

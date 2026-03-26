@@ -5,7 +5,7 @@
 // can be shown; falls back to returning current state if no host op available.
 
 import { op_open_setting } from "ext:core/ops";
-import { wrapAsync, createDeferredApi } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createDeferredApi, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // ---- authorisation state (scope -> boolean) --------------------------------
 
@@ -109,31 +109,18 @@ function openPrivacyContract(options) {
 
 // ---- onNeedPrivacyAuthorization / offNeedPrivacyAuthorization (Mode D) ---
 
-var _privacyAuthListeners = [];
+var _privacyAuthListeners = createListenerGroup('onNeedPrivacyAuthorization');
 
 function onNeedPrivacyAuthorization(listener) {
-    if (typeof listener === 'function') {
-        _privacyAuthListeners.push(listener);
-    }
+    _privacyAuthListeners.on(listener);
 }
 
 function offNeedPrivacyAuthorization(listener) {
-    if (typeof listener === 'function') {
-        var index = _privacyAuthListeners.indexOf(listener);
-        if (index !== -1) {
-            _privacyAuthListeners.splice(index, 1);
-        }
-    } else {
-        _privacyAuthListeners.length = 0;
-    }
+    _privacyAuthListeners.off(listener);
 }
 
 function _internalTriggerNeedPrivacyAuthorization(resolve) {
-    for (var i = 0; i < _privacyAuthListeners.length; i++) {
-        try { _privacyAuthListeners[i]({ resolve: resolve }); } catch (e) {
-            console.error('onNeedPrivacyAuthorization listener error:', e);
-        }
-    }
+    _privacyAuthListeners.trigger({ resolve: resolve });
 }
 
 // ---- requirePrivacyAuthorize (stub - resolves immediately) -----------------

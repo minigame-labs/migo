@@ -3,6 +3,8 @@
 // Minimal mock: load() resolves immediately, show/hide/destroy are no-ops,
 // on/off implement a basic event emitter so the game code does not crash.
 
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+
 class PageManager {
     #listeners = {};
     #destroyed = false;
@@ -46,32 +48,21 @@ class PageManager {
 
     on(event, listener) {
         if (typeof event !== 'string' || typeof listener !== 'function') return;
-        if (!this.#listeners[event]) this.#listeners[event] = [];
-        this.#listeners[event].push(listener);
+        if (!this.#listeners[event]) this.#listeners[event] = createListenerGroup('PageManager ' + event);
+        this.#listeners[event].on(listener);
     }
 
     off(event, listener) {
         if (typeof event !== 'string') return;
-        const list = this.#listeners[event];
-        if (!list) return;
-        if (typeof listener === 'function') {
-            const idx = list.indexOf(listener);
-            if (idx !== -1) list.splice(idx, 1);
-        } else {
-            // off('show') without listener -> remove all for that event
-            this.#listeners[event] = [];
-        }
+        const group = this.#listeners[event];
+        if (!group) return;
+        group.off(listener);
     }
 
     _fire(event, data) {
-        const list = this.#listeners[event];
-        if (!list || list.length === 0) return;
-        const snapshot = list.slice();
-        for (let i = 0; i < snapshot.length; i++) {
-            try { snapshot[i](data); } catch (e) {
-                console.error('PageManager ' + event + ' listener error:', e);
-            }
-        }
+        const group = this.#listeners[event];
+        if (!group) return;
+        group.trigger(data);
     }
 }
 

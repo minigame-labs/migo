@@ -5,6 +5,7 @@ import {
   op_recorder_resume,
   op_recorder_stop,
 } from "ext:core/ops";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // Singleton instance
 let _instance = null;
@@ -18,14 +19,14 @@ let _instance = null;
 class RecorderManager {
   // Multi-listener arrays for all event types
   #listeners = {
-    start: [],
-    pause: [],
-    resume: [],
-    stop: [],
-    frameRecorded: [],
-    error: [],
-    interruptionBegin: [],
-    interruptionEnd: [],
+    start: createListenerGroup("RecorderManager start"),
+    pause: createListenerGroup("RecorderManager pause"),
+    resume: createListenerGroup("RecorderManager resume"),
+    stop: createListenerGroup("RecorderManager stop"),
+    frameRecorded: createListenerGroup("RecorderManager frameRecorded"),
+    error: createListenerGroup("RecorderManager error"),
+    interruptionBegin: createListenerGroup("RecorderManager interruptionBegin"),
+    interruptionEnd: createListenerGroup("RecorderManager interruptionEnd"),
   };
 
   constructor() {
@@ -100,17 +101,17 @@ class RecorderManager {
 
   /** Called when recording starts. */
   onStart(fn) {
-    if (typeof fn === "function") this.#listeners.start.push(fn);
+    this.#listeners.start.on(fn);
   }
 
   /** Called when recording is paused. */
   onPause(fn) {
-    if (typeof fn === "function") this.#listeners.pause.push(fn);
+    this.#listeners.pause.on(fn);
   }
 
   /** Called when recording resumes after pause. */
   onResume(fn) {
-    if (typeof fn === "function") this.#listeners.resume.push(fn);
+    this.#listeners.resume.on(fn);
   }
 
   /**
@@ -118,7 +119,7 @@ class RecorderManager {
    * Callback receives: { tempFilePath: string, duration: number, fileSize: number }
    */
   onStop(fn) {
-    if (typeof fn === "function") this.#listeners.stop.push(fn);
+    this.#listeners.stop.on(fn);
   }
 
   /**
@@ -126,7 +127,7 @@ class RecorderManager {
    * Callback receives: { frameBuffer: ArrayBuffer, isLastFrame: boolean }
    */
   onFrameRecorded(fn) {
-    if (typeof fn === "function") this.#listeners.frameRecorded.push(fn);
+    this.#listeners.frameRecorded.on(fn);
   }
 
   /**
@@ -134,17 +135,17 @@ class RecorderManager {
    * Callback receives: { errMsg: string }
    */
   onError(fn) {
-    if (typeof fn === "function") this.#listeners.error.push(fn);
+    this.#listeners.error.on(fn);
   }
 
   /** Called when recording is interrupted (e.g., incoming call). */
   onInterruptionBegin(fn) {
-    if (typeof fn === "function") this.#listeners.interruptionBegin.push(fn);
+    this.#listeners.interruptionBegin.on(fn);
   }
 
   /** Called when recording interruption ends. */
   onInterruptionEnd(fn) {
-    if (typeof fn === "function") this.#listeners.interruptionEnd.push(fn);
+    this.#listeners.interruptionEnd.on(fn);
   }
 
   // ==================== Listener Removal ====================
@@ -185,28 +186,16 @@ class RecorderManager {
 
   /** Remove a specific listener, or all listeners for the type if fn is omitted. */
   #removeListener(type, fn) {
-    const list = this.#listeners[type];
-    if (!list) return;
-    if (!fn) {
-      list.length = 0;
-    } else {
-      const idx = list.indexOf(fn);
-      if (idx !== -1) list.splice(idx, 1);
-    }
+    const group = this.#listeners[type];
+    if (!group) return;
+    group.off(fn);
   }
 
   /** Fire all listeners for the given event type. */
   #fireListeners(type, arg) {
-    const list = this.#listeners[type];
-    if (!list || list.length === 0) return;
-    const snapshot = list.slice();
-    for (const fn of snapshot) {
-      try {
-        fn(arg);
-      } catch (e) {
-        console.error("RecorderManager callback error:", e);
-      }
-    }
+    const group = this.#listeners[type];
+    if (!group) return;
+    group.trigger(arg);
   }
 
   /**

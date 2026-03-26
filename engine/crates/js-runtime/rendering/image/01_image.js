@@ -7,8 +7,20 @@ import {
     op_clear_image_cache,
     op_get_image_cache_stats
 } from "ext:core/ops";
+import { createCallbackEvent, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 const { SafeFinalizationRegistry } = primordials;
+
+function _errorText(err) {
+    if (err == null) return String(err);
+    const t = typeof err;
+    if (t === "string" || t === "number" || t === "boolean") return String(err);
+    const name = typeof err.name === "string" ? err.name : "Error";
+    const message = typeof err.message === "string" ? err.message : "";
+    const stack = typeof err.stack === "string" ? err.stack : "";
+    const base = message ? `${name}: ${message}` : name;
+    return stack ? `${base}\n${stack}` : base;
+}
 
 const registry = new SafeFinalizationRegistry((rid) => {
     try {
@@ -21,10 +33,16 @@ class Image {
         this._src = "";
         this.width = 0;
         this.height = 0;
+        this.naturalWidth = 0;
+        this.naturalHeight = 0;
+        this.complete = false;
 
         this._onload = null;
         this._onerror = null;
-        this.#listeners = { load: [], error: [] };
+        this.#listeners = {
+            load: createListenerGroup('Image load', true),
+            error: createListenerGroup('Image error', true),
+        };
 
         this._loaded = false;
         this._error = null;
@@ -77,25 +95,21 @@ class Image {
     #listeners;
 
     addEventListener(type, fn) {
-        if (typeof fn !== "function") return;
-        const list = this.#listeners[type];
-        if (list && list.indexOf(fn) === -1) list.push(fn);
+        const group = this.#listeners[type];
+        if (!group) return;
+        group.on(fn);
     }
 
     removeEventListener(type, fn) {
-        const list = this.#listeners[type];
-        if (!list) return;
-        const i = list.indexOf(fn);
-        if (i !== -1) list.splice(i, 1);
+        const group = this.#listeners[type];
+        if (!group) return;
+        group.off(fn);
     }
 
     #fireListeners(type, arg) {
-        const list = this.#listeners[type];
-        if (!list) return;
-        const snapshot = list.slice();
-        for (let i = 0; i < snapshot.length; i++) {
-            try { snapshot[i](arg); } catch (_) {}
-        }
+        const group = this.#listeners[type];
+        if (!group) return;
+        group.trigger(arg, this);
     }
 
     _startLoad(url) {
@@ -106,13 +120,18 @@ class Image {
         this._error = null;
         this.width = 0;
         this.height = 0;
+        this.naturalWidth = 0;
+        this.naturalHeight = 0;
+        this.complete = false;
 
         // Empty src: treat as error (browsers treat as a request to current document; for your runtime we error)
         if (!url) {
             const err = new TypeError("Image.src is empty");
             this._error = err;
-            this._onerror && this._onerror(err);
-            this.#fireListeners('error', err);
+            this.complete = false;
+            const ev = createCallbackEvent("error", this, { error: err });
+            this._onerror && this._onerror.call(this, ev);
+            this.#fireListeners('error', ev);
             return;
         }
 
@@ -128,12 +147,24 @@ class Image {
                 this._shared_img_id = sharedId;
                 this.width = w;
                 this.height = h;
+                this.naturalWidth = w;
+                this.naturalHeight = h;
 
                 this._loaded = true;
                 this._error = null;
+                this.complete = true;
+                const ev = createCallbackEvent("load", this);
 
-                this._onload && this._onload();
-                this.#fireListeners('load', undefined);
+                if (this._onload) {
+                    try {
+                        this._onload.call(this, ev);
+                    } catch (e) {
+                        try {
+                            console.error(`Image onload error: ${_errorText(e)}`);
+                        } catch (_) {}
+                    }
+                }
+                this.#fireListeners('load', ev);
             })
             .catch((err) => {
                 if (seq !== this._load_seq) return;
@@ -141,9 +172,19 @@ class Image {
                 this._shared_img_id = this._rid; // fall back
                 this._loaded = false;
                 this._error = err;
+                this.complete = false;
+                const ev = createCallbackEvent("error", this, { error: err });
 
-                this._onerror && this._onerror(err);
-                this.#fireListeners('error', err);
+                if (this._onerror) {
+                    try {
+                        this._onerror.call(this, ev);
+                    } catch (e) {
+                        try {
+                            console.error(`Image onerror error: ${_errorText(e)}`);
+                        } catch (_) {}
+                    }
+                }
+                this.#fireListeners('error', ev);
             });
     }
 }

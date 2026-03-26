@@ -5,6 +5,7 @@
 // immediately with stub user info so the auth flow is not blocked.
 
 import { op_get_menu_button_rect } from "ext:core/ops";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // ---- UserInfoButton --------------------------------------------------------
 
@@ -15,7 +16,7 @@ class UserInfoButton {
     #image;
     #visible = false;
     #destroyed = false;
-    #tapListeners = [];
+    #tapListeners = createListenerGroup('UserInfoButton onTap');
 
     constructor(options) {
         const opts = options || {};
@@ -46,22 +47,17 @@ class UserInfoButton {
     destroy() {
         this.#destroyed = true;
         this.#visible = false;
-        this.#tapListeners.length = 0;
+        this.#tapListeners.off();
     }
 
     onTap(listener) {
         if (typeof listener === 'function' && !this.#destroyed) {
-            this.#tapListeners.push(listener);
+            this.#tapListeners.on(listener);
         }
     }
 
     offTap(listener) {
-        if (typeof listener === 'function') {
-            const idx = this.#tapListeners.indexOf(listener);
-            if (idx !== -1) this.#tapListeners.splice(idx, 1);
-        } else {
-            this.#tapListeners.length = 0;
-        }
+        this.#tapListeners.off(listener);
     }
 
     // Called from host when the user taps the button area.
@@ -92,12 +88,7 @@ class UserInfoButton {
             encryptedData: parsed.encryptedData || '',
             iv: parsed.iv || '',
         };
-        const listeners = this.#tapListeners.slice();
-        for (let i = 0; i < listeners.length; i++) {
-            try { listeners[i](res); } catch (e) {
-                console.error('UserInfoButton onTap listener error:', e);
-            }
-        }
+        this.#tapListeners.trigger(res);
     }
 }
 
@@ -159,7 +150,7 @@ class FeedbackButton {
     #image;
     #visible = false;
     #destroyed = false;
-    #tapListeners = [];
+    #tapListeners = createListenerGroup('FeedbackButton onTap');
 
     constructor(options) {
         const opts = options || {};
@@ -181,22 +172,17 @@ class FeedbackButton {
     destroy() {
         this.#destroyed = true;
         this.#visible = false;
-        this.#tapListeners.length = 0;
+        this.#tapListeners.off();
     }
 
     onTap(listener) {
         if (typeof listener === 'function' && !this.#destroyed) {
-            this.#tapListeners.push(listener);
+            this.#tapListeners.on(listener);
         }
     }
 
     offTap(listener) {
-        if (typeof listener === 'function') {
-            const idx = this.#tapListeners.indexOf(listener);
-            if (idx !== -1) this.#tapListeners.splice(idx, 1);
-        } else {
-            this.#tapListeners.length = 0;
-        }
+        this.#tapListeners.off(listener);
     }
 }
 

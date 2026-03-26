@@ -7,7 +7,7 @@ import {
     op_stop_capture_screen,
     op_set_enable_debug,
 } from "ext:core/ops";
-import { wrapAsync } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 function getScreenBrightness(options) {
     return wrapAsync('getScreenBrightness', function () {
@@ -60,12 +60,12 @@ function setEnableDebug(options = {}) {
 
 // ==================== User Capture Screen ====================
 
-var _captureScreenListeners = [];
+var _captureScreenListeners = createListenerGroup('onUserCaptureScreen');
 
 function onUserCaptureScreen(listener) {
     if (typeof listener === 'function') {
-        var hadListeners = _captureScreenListeners.length > 0;
-        _captureScreenListeners.push(listener);
+        var hadListeners = _captureScreenListeners.size() > 0;
+        _captureScreenListeners.on(listener);
         if (!hadListeners) {
             try { op_start_capture_screen(); } catch (_) {}
         }
@@ -73,25 +73,14 @@ function onUserCaptureScreen(listener) {
 }
 
 function offUserCaptureScreen(listener) {
-    if (typeof listener === 'function') {
-        var i = _captureScreenListeners.indexOf(listener);
-        if (i !== -1) _captureScreenListeners.splice(i, 1);
-    } else {
-        _captureScreenListeners.length = 0;
-    }
-    if (_captureScreenListeners.length === 0) {
+    _captureScreenListeners.off(listener);
+    if (_captureScreenListeners.size() === 0) {
         try { op_stop_capture_screen(); } catch (_) {}
     }
 }
 
 function _internalTriggerUserCaptureScreen() {
-    for (var i = 0; i < _captureScreenListeners.length; i++) {
-        try {
-            _captureScreenListeners[i]({});
-        } catch (e) {
-            console.error('onUserCaptureScreen listener error:', e);
-        }
-    }
+    _captureScreenListeners.trigger({});
 }
 
 export {

@@ -9,7 +9,7 @@ import {
     op_video_set_property,
     op_video_destroy,
 } from "ext:core/ops";
-import { wrapAsync } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // Video instance registry: videoId -> Video
 var _videos = new Map();
@@ -39,14 +39,14 @@ class Video {
 
     // Multi-listener arrays for event callbacks
     #listeners = {
-        play: [],
-        pause: [],
-        ended: [],
-        timeupdate: [],
-        error: [],
-        waiting: [],
-        progress: [],
-        fullscreenchange: [],
+        play: createListenerGroup('Video play'),
+        pause: createListenerGroup('Video pause'),
+        ended: createListenerGroup('Video ended'),
+        timeupdate: createListenerGroup('Video timeupdate'),
+        error: createListenerGroup('Video error'),
+        waiting: createListenerGroup('Video waiting'),
+        progress: createListenerGroup('Video progress'),
+        fullscreenchange: createListenerGroup('Video fullscreenchange'),
     };
 
     constructor(id, options) {
@@ -176,56 +176,56 @@ class Video {
     // ==================== Event Listeners ====================
 
     onPlay(callback) {
-        if (typeof callback === 'function') this.#listeners.play.push(callback);
+        this.#listeners.play.on(callback);
     }
     offPlay(callback) {
         this.#removeListener('play', callback);
     }
 
     onPause(callback) {
-        if (typeof callback === 'function') this.#listeners.pause.push(callback);
+        this.#listeners.pause.on(callback);
     }
     offPause(callback) {
         this.#removeListener('pause', callback);
     }
 
     onEnded(callback) {
-        if (typeof callback === 'function') this.#listeners.ended.push(callback);
+        this.#listeners.ended.on(callback);
     }
     offEnded(callback) {
         this.#removeListener('ended', callback);
     }
 
     onTimeUpdate(callback) {
-        if (typeof callback === 'function') this.#listeners.timeupdate.push(callback);
+        this.#listeners.timeupdate.on(callback);
     }
     offTimeUpdate(callback) {
         this.#removeListener('timeupdate', callback);
     }
 
     onError(callback) {
-        if (typeof callback === 'function') this.#listeners.error.push(callback);
+        this.#listeners.error.on(callback);
     }
     offError(callback) {
         this.#removeListener('error', callback);
     }
 
     onWaiting(callback) {
-        if (typeof callback === 'function') this.#listeners.waiting.push(callback);
+        this.#listeners.waiting.on(callback);
     }
     offWaiting(callback) {
         this.#removeListener('waiting', callback);
     }
 
     onProgress(callback) {
-        if (typeof callback === 'function') this.#listeners.progress.push(callback);
+        this.#listeners.progress.on(callback);
     }
     offProgress(callback) {
         this.#removeListener('progress', callback);
     }
 
     onFullScreenChange(callback) {
-        if (typeof callback === 'function') this.#listeners.fullscreenchange.push(callback);
+        this.#listeners.fullscreenchange.on(callback);
     }
     offFullScreenChange(callback) {
         this.#removeListener('fullscreenchange', callback);
@@ -249,7 +249,7 @@ class Video {
 
         // Clear all listeners
         for (var key of Object.keys(this.#listeners)) {
-            this.#listeners[key].length = 0;
+            this.#listeners[key].off();
         }
     }
 
@@ -257,28 +257,16 @@ class Video {
 
     /** Remove a listener for the given event type. */
     #removeListener(type, callback) {
-        var list = this.#listeners[type];
-        if (!list) return;
-        if (typeof callback === 'function') {
-            var i = list.indexOf(callback);
-            if (i !== -1) list.splice(i, 1);
-        } else {
-            list.length = 0;
-        }
+        var group = this.#listeners[type];
+        if (!group) return;
+        group.off(callback);
     }
 
     /** Fire all listeners for the given event type. */
     #fireListeners(type, arg) {
-        var list = this.#listeners[type];
-        if (!list || list.length === 0) return;
-        var snapshot = list.slice();
-        for (var i = 0; i < snapshot.length; i++) {
-            try {
-                snapshot[i](arg);
-            } catch (e) {
-                console.error('Video callback error:', e);
-            }
-        }
+        var group = this.#listeners[type];
+        if (!group) return;
+        group.trigger(arg);
     }
 
     /** Sync a single property to native. */
@@ -419,7 +407,12 @@ function _internalTriggerVideoEvent(videoId, eventType, dataJson) {
 }
 
 function _emitSnapshot(listeners, payload) {
-    if (!listeners || listeners.length === 0) return;
+    if (!listeners) return;
+    if (typeof listeners.trigger === 'function') {
+        listeners.trigger(payload);
+        return;
+    }
+    if (listeners.length === 0) return;
     var snapshot = listeners.slice();
     for (var i = 0; i < snapshot.length; i++) {
         try {
@@ -452,8 +445,8 @@ class LivePlayerContext {
     #muted = false;
     #volumeTimer = null;
     #listeners = {
-        statechange: [],
-        audiovolume: [],
+        statechange: createListenerGroup('LivePlayerContext statechange'),
+        audiovolume: createListenerGroup('LivePlayerContext audiovolume'),
     };
 
     constructor(options) {
@@ -463,29 +456,19 @@ class LivePlayerContext {
     }
 
     onStateChange(listener) {
-        if (typeof listener === 'function') this.#listeners.statechange.push(listener);
+        this.#listeners.statechange.on(listener);
     }
 
     offStateChange(listener) {
-        if (typeof listener === 'function') {
-            var i = this.#listeners.statechange.indexOf(listener);
-            if (i !== -1) this.#listeners.statechange.splice(i, 1);
-        } else {
-            this.#listeners.statechange.length = 0;
-        }
+        this.#listeners.statechange.off(listener);
     }
 
     onAudioVolumeNotify(listener) {
-        if (typeof listener === 'function') this.#listeners.audiovolume.push(listener);
+        this.#listeners.audiovolume.on(listener);
     }
 
     offAudioVolumeNotify(listener) {
-        if (typeof listener === 'function') {
-            var i = this.#listeners.audiovolume.indexOf(listener);
-            if (i !== -1) this.#listeners.audiovolume.splice(i, 1);
-        } else {
-            this.#listeners.audiovolume.length = 0;
-        }
+        this.#listeners.audiovolume.off(listener);
     }
 
     play(options) {
@@ -527,8 +510,8 @@ class LivePlayerContext {
         this.#destroyed = true;
         this.#playing = false;
         this.#stopVolumeTicker();
-        this.#listeners.statechange.length = 0;
-        this.#listeners.audiovolume.length = 0;
+        this.#listeners.statechange.off();
+        this.#listeners.audiovolume.off();
         return Promise.resolve();
     }
 
@@ -554,12 +537,12 @@ class LivePusherContext {
     #bgmTimer = null;
     #bgmProgress = 0;
     #listeners = {
-        statechange: [],
-        error: [],
-        netstatus: [],
-        bgmstart: [],
-        bgmcomplete: [],
-        bgmprogress: [],
+        statechange: createListenerGroup('LivePusherContext statechange'),
+        error: createListenerGroup('LivePusherContext error'),
+        netstatus: createListenerGroup('LivePusherContext netstatus'),
+        bgmstart: createListenerGroup('LivePusherContext bgmstart'),
+        bgmcomplete: createListenerGroup('LivePusherContext bgmcomplete'),
+        bgmprogress: createListenerGroup('LivePusherContext bgmprogress'),
     };
 
     constructor(options) {
@@ -569,27 +552,27 @@ class LivePusherContext {
     }
 
     onStateChange(listener) {
-        if (typeof listener === 'function') this.#listeners.statechange.push(listener);
+        this.#listeners.statechange.on(listener);
     }
 
     onError(listener) {
-        if (typeof listener === 'function') this.#listeners.error.push(listener);
+        this.#listeners.error.on(listener);
     }
 
     onNetStatus(listener) {
-        if (typeof listener === 'function') this.#listeners.netstatus.push(listener);
+        this.#listeners.netstatus.on(listener);
     }
 
     onBGMStart(listener) {
-        if (typeof listener === 'function') this.#listeners.bgmstart.push(listener);
+        this.#listeners.bgmstart.on(listener);
     }
 
     onBGMComplete(listener) {
-        if (typeof listener === 'function') this.#listeners.bgmcomplete.push(listener);
+        this.#listeners.bgmcomplete.on(listener);
     }
 
     onBGMProgress(listener) {
-        if (typeof listener === 'function') this.#listeners.bgmprogress.push(listener);
+        this.#listeners.bgmprogress.on(listener);
     }
 
     start(options) {
@@ -649,12 +632,12 @@ class LivePusherContext {
         this.#destroyed = true;
         this.#started = false;
         this.#stopBgmTicker();
-        this.#listeners.statechange.length = 0;
-        this.#listeners.error.length = 0;
-        this.#listeners.netstatus.length = 0;
-        this.#listeners.bgmstart.length = 0;
-        this.#listeners.bgmcomplete.length = 0;
-        this.#listeners.bgmprogress.length = 0;
+        this.#listeners.statechange.off();
+        this.#listeners.error.off();
+        this.#listeners.netstatus.off();
+        this.#listeners.bgmstart.off();
+        this.#listeners.bgmcomplete.off();
+        this.#listeners.bgmprogress.off();
         return Promise.resolve();
     }
 

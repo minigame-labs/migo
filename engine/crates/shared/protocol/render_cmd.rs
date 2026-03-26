@@ -313,6 +313,20 @@ pub enum GLCmd {
         resp: RenderCmdResp<Option<u32>>,
     },
 
+    GetActiveAttrib {
+        canvas_id: CanvasId,
+        program_id: ProgramId,
+        index: u32,
+        resp: RenderCmdResp<Option<(String, i32, u32)>>,
+    },
+
+    GetActiveUniform {
+        canvas_id: CanvasId,
+        program_id: ProgramId,
+        index: u32,
+        resp: RenderCmdResp<Option<(String, i32, u32)>>,
+    },
+
     EnableVertexAttribArray {
         canvas_id: CanvasId,
         index: u32,
@@ -370,16 +384,41 @@ pub enum GLCmd {
     },
 
     // ========== Phase 1A: GL State ==========
-    Enable { canvas_id: CanvasId, cap: u32 },
-    Disable { canvas_id: CanvasId, cap: u32 },
-    IsEnabled { canvas_id: CanvasId, cap: u32, resp: RenderCmdResp<bool> },
-    GetParameter { canvas_id: CanvasId, pname: u32, resp: RenderCmdResp<String> },
+    Enable {
+        canvas_id: CanvasId,
+        cap: u32,
+    },
+    Disable {
+        canvas_id: CanvasId,
+        cap: u32,
+    },
+    IsEnabled {
+        canvas_id: CanvasId,
+        cap: u32,
+        resp: RenderCmdResp<bool>,
+    },
+    GetParameter {
+        canvas_id: CanvasId,
+        pname: u32,
+        resp: RenderCmdResp<String>,
+    },
 
     // ========== Phase 1B: Textures ==========
-    CreateTexture { client_id: TextureId },
-    DeleteTexture { texture_id: TextureId },
-    BindTexture { canvas_id: CanvasId, target: u32, texture: Option<TextureId> },
-    ActiveTexture { canvas_id: CanvasId, unit: u32 },
+    CreateTexture {
+        client_id: TextureId,
+    },
+    DeleteTexture {
+        texture_id: TextureId,
+    },
+    BindTexture {
+        canvas_id: CanvasId,
+        target: u32,
+        texture: Option<TextureId>,
+    },
+    ActiveTexture {
+        canvas_id: CanvasId,
+        unit: u32,
+    },
     TexImage2D {
         canvas_id: CanvasId,
         target: u32,
@@ -404,10 +443,27 @@ pub enum GLCmd {
         type_: u32,
         data: Vec<u8>,
     },
-    TexParameteri { canvas_id: CanvasId, target: u32, pname: u32, param: i32 },
-    TexParameterf { canvas_id: CanvasId, target: u32, pname: u32, param: f32 },
-    GenerateMipmap { canvas_id: CanvasId, target: u32 },
-    PixelStorei { canvas_id: CanvasId, pname: u32, param: i32 },
+    TexParameteri {
+        canvas_id: CanvasId,
+        target: u32,
+        pname: u32,
+        param: i32,
+    },
+    TexParameterf {
+        canvas_id: CanvasId,
+        target: u32,
+        pname: u32,
+        param: f32,
+    },
+    GenerateMipmap {
+        canvas_id: CanvasId,
+        target: u32,
+    },
+    PixelStorei {
+        canvas_id: CanvasId,
+        pname: u32,
+        param: i32,
+    },
     CompressedTexImage2D {
         canvas_id: CanvasId,
         target: u32,
@@ -437,59 +493,256 @@ pub enum GLCmd {
         offset: i32,
         data: Vec<u8>,
     },
-    DisableVertexAttribArray { canvas_id: CanvasId, index: u32 },
-    ClearDepth { canvas_id: CanvasId, depth: f32 },
-    ClearStencil { canvas_id: CanvasId, s: i32 },
+    DisableVertexAttribArray {
+        canvas_id: CanvasId,
+        index: u32,
+    },
+    ClearDepth {
+        canvas_id: CanvasId,
+        depth: f32,
+    },
+    ClearStencil {
+        canvas_id: CanvasId,
+        s: i32,
+    },
 
     // ========== Phase 2A: Blend/Depth/Stencil/Cull State ==========
-    BlendFunc { canvas_id: CanvasId, sfactor: u32, dfactor: u32 },
-    BlendFuncSeparate { canvas_id: CanvasId, src_rgb: u32, dst_rgb: u32, src_alpha: u32, dst_alpha: u32 },
-    BlendEquation { canvas_id: CanvasId, mode: u32 },
-    BlendEquationSeparate { canvas_id: CanvasId, mode_rgb: u32, mode_alpha: u32 },
-    BlendColor { canvas_id: CanvasId, r: f32, g: f32, b: f32, a: f32 },
-    DepthFunc { canvas_id: CanvasId, func: u32 },
-    DepthMask { canvas_id: CanvasId, flag: bool },
-    DepthRange { canvas_id: CanvasId, near: f32, far: f32 },
-    StencilFunc { canvas_id: CanvasId, func: u32, ref_: i32, mask: u32 },
-    StencilFuncSeparate { canvas_id: CanvasId, face: u32, func: u32, ref_: i32, mask: u32 },
-    StencilOp { canvas_id: CanvasId, fail: u32, zfail: u32, zpass: u32 },
-    StencilOpSeparate { canvas_id: CanvasId, face: u32, fail: u32, zfail: u32, zpass: u32 },
-    StencilMask { canvas_id: CanvasId, mask: u32 },
-    StencilMaskSeparate { canvas_id: CanvasId, face: u32, mask: u32 },
-    CullFace { canvas_id: CanvasId, mode: u32 },
-    FrontFace { canvas_id: CanvasId, mode: u32 },
-    ColorMask { canvas_id: CanvasId, r: bool, g: bool, b: bool, a: bool },
-    Scissor { canvas_id: CanvasId, x: i32, y: i32, width: i32, height: i32 },
-    LineWidth { canvas_id: CanvasId, width: f32 },
-    PolygonOffset { canvas_id: CanvasId, factor: f32, units: f32 },
+    BlendFunc {
+        canvas_id: CanvasId,
+        sfactor: u32,
+        dfactor: u32,
+    },
+    BlendFuncSeparate {
+        canvas_id: CanvasId,
+        src_rgb: u32,
+        dst_rgb: u32,
+        src_alpha: u32,
+        dst_alpha: u32,
+    },
+    BlendEquation {
+        canvas_id: CanvasId,
+        mode: u32,
+    },
+    BlendEquationSeparate {
+        canvas_id: CanvasId,
+        mode_rgb: u32,
+        mode_alpha: u32,
+    },
+    BlendColor {
+        canvas_id: CanvasId,
+        r: f32,
+        g: f32,
+        b: f32,
+        a: f32,
+    },
+    DepthFunc {
+        canvas_id: CanvasId,
+        func: u32,
+    },
+    DepthMask {
+        canvas_id: CanvasId,
+        flag: bool,
+    },
+    DepthRange {
+        canvas_id: CanvasId,
+        near: f32,
+        far: f32,
+    },
+    StencilFunc {
+        canvas_id: CanvasId,
+        func: u32,
+        ref_: i32,
+        mask: u32,
+    },
+    StencilFuncSeparate {
+        canvas_id: CanvasId,
+        face: u32,
+        func: u32,
+        ref_: i32,
+        mask: u32,
+    },
+    StencilOp {
+        canvas_id: CanvasId,
+        fail: u32,
+        zfail: u32,
+        zpass: u32,
+    },
+    StencilOpSeparate {
+        canvas_id: CanvasId,
+        face: u32,
+        fail: u32,
+        zfail: u32,
+        zpass: u32,
+    },
+    StencilMask {
+        canvas_id: CanvasId,
+        mask: u32,
+    },
+    StencilMaskSeparate {
+        canvas_id: CanvasId,
+        face: u32,
+        mask: u32,
+    },
+    CullFace {
+        canvas_id: CanvasId,
+        mode: u32,
+    },
+    FrontFace {
+        canvas_id: CanvasId,
+        mode: u32,
+    },
+    ColorMask {
+        canvas_id: CanvasId,
+        r: bool,
+        g: bool,
+        b: bool,
+        a: bool,
+    },
+    Scissor {
+        canvas_id: CanvasId,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    LineWidth {
+        canvas_id: CanvasId,
+        width: f32,
+    },
+    PolygonOffset {
+        canvas_id: CanvasId,
+        factor: f32,
+        units: f32,
+    },
 
     // ========== Phase 2B: Uniform Variants ==========
-    Uniform1i { canvas_id: CanvasId, location: Option<u32>, x: i32 },
-    Uniform1f { canvas_id: CanvasId, location: Option<u32>, x: f32 },
-    Uniform2f { canvas_id: CanvasId, location: Option<u32>, x: f32, y: f32 },
-    Uniform4f { canvas_id: CanvasId, location: Option<u32>, x: f32, y: f32, z: f32, w: f32 },
-    Uniform1iv { canvas_id: CanvasId, location: Option<u32>, value: Vec<i32> },
-    Uniform1fv { canvas_id: CanvasId, location: Option<u32>, value: Vec<f32> },
-    Uniform2iv { canvas_id: CanvasId, location: Option<u32>, value: Vec<i32> },
-    Uniform2fv { canvas_id: CanvasId, location: Option<u32>, value: Vec<f32> },
-    Uniform3iv { canvas_id: CanvasId, location: Option<u32>, value: Vec<i32> },
-    Uniform3fv { canvas_id: CanvasId, location: Option<u32>, value: Vec<f32> },
-    Uniform4iv { canvas_id: CanvasId, location: Option<u32>, value: Vec<i32> },
-    Uniform4fv { canvas_id: CanvasId, location: Option<u32>, value: Vec<f32> },
-    UniformMatrix2fv { canvas_id: CanvasId, location: Option<u32>, transpose: bool, value: Vec<f32> },
-    UniformMatrix4fv { canvas_id: CanvasId, location: Option<u32>, transpose: bool, value: Vec<f32> },
+    Uniform1i {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        x: i32,
+    },
+    Uniform1f {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        x: f32,
+    },
+    Uniform2f {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        x: f32,
+        y: f32,
+    },
+    Uniform4f {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        x: f32,
+        y: f32,
+        z: f32,
+        w: f32,
+    },
+    Uniform1iv {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        value: Vec<i32>,
+    },
+    Uniform1fv {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        value: Vec<f32>,
+    },
+    Uniform2iv {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        value: Vec<i32>,
+    },
+    Uniform2fv {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        value: Vec<f32>,
+    },
+    Uniform3iv {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        value: Vec<i32>,
+    },
+    Uniform3fv {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        value: Vec<f32>,
+    },
+    Uniform4iv {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        value: Vec<i32>,
+    },
+    Uniform4fv {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        value: Vec<f32>,
+    },
+    UniformMatrix2fv {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        transpose: bool,
+        value: Vec<f32>,
+    },
+    UniformMatrix4fv {
+        canvas_id: CanvasId,
+        location: Option<u32>,
+        transpose: bool,
+        value: Vec<f32>,
+    },
 
     // ========== Phase 3A: Framebuffer/Renderbuffer ==========
-    CreateFramebuffer { client_id: FramebufferId },
-    DeleteFramebuffer { framebuffer_id: FramebufferId },
-    BindFramebuffer { canvas_id: CanvasId, target: u32, framebuffer: Option<FramebufferId> },
-    FramebufferTexture2D { canvas_id: CanvasId, target: u32, attachment: u32, textarget: u32, texture: Option<TextureId>, level: i32 },
-    FramebufferRenderbuffer { canvas_id: CanvasId, target: u32, attachment: u32, renderbuffertarget: u32, renderbuffer: Option<RenderbufferId> },
-    CheckFramebufferStatus { canvas_id: CanvasId, target: u32, resp: RenderCmdResp<u32> },
-    CreateRenderbuffer { client_id: RenderbufferId },
-    DeleteRenderbuffer { renderbuffer_id: RenderbufferId },
-    BindRenderbuffer { canvas_id: CanvasId, target: u32, renderbuffer: Option<RenderbufferId> },
-    RenderbufferStorage { canvas_id: CanvasId, target: u32, internalformat: u32, width: i32, height: i32 },
+    CreateFramebuffer {
+        client_id: FramebufferId,
+    },
+    DeleteFramebuffer {
+        framebuffer_id: FramebufferId,
+    },
+    BindFramebuffer {
+        canvas_id: CanvasId,
+        target: u32,
+        framebuffer: Option<FramebufferId>,
+    },
+    FramebufferTexture2D {
+        canvas_id: CanvasId,
+        target: u32,
+        attachment: u32,
+        textarget: u32,
+        texture: Option<TextureId>,
+        level: i32,
+    },
+    FramebufferRenderbuffer {
+        canvas_id: CanvasId,
+        target: u32,
+        attachment: u32,
+        renderbuffertarget: u32,
+        renderbuffer: Option<RenderbufferId>,
+    },
+    CheckFramebufferStatus {
+        canvas_id: CanvasId,
+        target: u32,
+        resp: RenderCmdResp<u32>,
+    },
+    CreateRenderbuffer {
+        client_id: RenderbufferId,
+    },
+    DeleteRenderbuffer {
+        renderbuffer_id: RenderbufferId,
+    },
+    BindRenderbuffer {
+        canvas_id: CanvasId,
+        target: u32,
+        renderbuffer: Option<RenderbufferId>,
+    },
+    RenderbufferStorage {
+        canvas_id: CanvasId,
+        target: u32,
+        internalformat: u32,
+        width: i32,
+        height: i32,
+    },
 
     // ========== Phase 3B: Misc ==========
     ReadPixels {
@@ -502,7 +755,11 @@ pub enum GLCmd {
         type_: u32,
         resp: RenderCmdResp<Vec<u8>>,
     },
-    Hint { canvas_id: CanvasId, target: u32, mode: u32 },
+    Hint {
+        canvas_id: CanvasId,
+        target: u32,
+        mode: u32,
+    },
 }
 
 /// Text horizontal alignment for fillText/strokeText.

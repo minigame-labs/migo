@@ -46,6 +46,7 @@ pub mod config;
 pub mod console_log;
 pub mod device;
 pub mod error;
+pub mod js_escape;
 pub mod op_state;
 pub mod protocol;
 pub mod services;

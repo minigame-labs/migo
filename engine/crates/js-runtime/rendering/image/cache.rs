@@ -151,6 +151,15 @@ impl ImageCache {
         // not tracked as shared -> destroy caller id directly
         Some(image_id)
     }
+
+    pub fn source_for_image_id(&self, image_id: u32) -> Option<String> {
+        let shared_id = self
+            .alias_to_shared
+            .get(&image_id)
+            .copied()
+            .unwrap_or(image_id);
+        self.shared_to_src.get(&shared_id).cloned()
+    }
 }
 
 pub static IMAGE_CACHE: Lazy<Mutex<ImageCache>> = Lazy::new(|| Mutex::new(ImageCache::new()));

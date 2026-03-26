@@ -4,15 +4,15 @@ import {
     op_get_network_type,
     op_get_local_ip_address,
 } from "ext:core/ops";
-import { wrapAsync } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
-const _listeners = [];
-const _weakNetListeners = [];
+const _listeners = createListenerGroup('onNetworkStatusChange');
+const _weakNetListeners = createListenerGroup('onNetworkWeakChange');
 let _isMonitoring = false;
 let _lastWeakNet = false;
 
 function _updateMonitoring() {
-    const shouldMonitor = _listeners.length > 0 || _weakNetListeners.length > 0;
+    const shouldMonitor = _listeners.size() > 0 || _weakNetListeners.size() > 0;
     if (shouldMonitor && !_isMonitoring) {
         try {
             op_start_network_monitoring();
@@ -39,58 +39,37 @@ function _updateMonitoring() {
 
 function onNetworkStatusChange(listener) {
     if (typeof listener === 'function') {
-        _listeners.push(listener);
+        _listeners.on(listener);
         _updateMonitoring();
     }
 }
 
 function offNetworkStatusChange(listener) {
-    if (listener === undefined) {
-        _listeners.length = 0;
-    } else {
-        const idx = _listeners.indexOf(listener);
-        if (idx !== -1) {
-            _listeners.splice(idx, 1);
-        }
-    }
+    _listeners.off(listener);
     _updateMonitoring();
 }
 
 function onNetworkWeakChange(listener) {
     if (typeof listener === 'function') {
-        _weakNetListeners.push(listener);
+        _weakNetListeners.on(listener);
         _updateMonitoring();
     }
 }
 
 function offNetworkWeakChange(listener) {
-    if (listener === undefined) {
-        _weakNetListeners.length = 0;
-    } else {
-        const idx = _weakNetListeners.indexOf(listener);
-        if (idx !== -1) {
-            _weakNetListeners.splice(idx, 1);
-        }
-    }
+    _weakNetListeners.off(listener);
     _updateMonitoring();
 }
 
 function _internalTriggerNetworkStatusChange(isConnected, networkType) {
     // 1. Trigger standard network status change listeners
-    if (_listeners.length > 0) {
-        const data = { isConnected: isConnected, networkType: networkType };
-        for (let i = 0; i < _listeners.length; i++) {
-            try {
-                _listeners[i](data);
-            } catch (e) {
-                console.error('onNetworkStatusChange listener error:', e);
-            }
-        }
+    if (_listeners.size() > 0) {
+        _listeners.trigger({ isConnected: isConnected, networkType: networkType });
     }
 
     // 2. Trigger weak network change listeners
     // We fetch the latest status to get weakNet field which is not passed in the event arguments
-    if (_weakNetListeners.length > 0 || _isMonitoring) { 
+    if (_weakNetListeners.size() > 0 || _isMonitoring) {
         try {
             const res = JSON.parse(op_get_network_type());
             // Ensure we handle potential error response structure if op fails silently or returns error obj
@@ -100,18 +79,12 @@ function _internalTriggerNetworkStatusChange(isConnected, networkType) {
                 if (currentWeakNet !== _lastWeakNet) {
                     _lastWeakNet = currentWeakNet;
                     
-                    if (_weakNetListeners.length > 0) {
-                        const weakData = { 
+                    if (_weakNetListeners.size() > 0) {
+                        const weakData = {
                             weakNet: currentWeakNet, 
                             networkType: res.networkType 
                         };
-                        for (let i = 0; i < _weakNetListeners.length; i++) {
-                            try {
-                                _weakNetListeners[i](weakData);
-                            } catch (e) {
-                                console.error('onNetworkWeakChange listener error:', e);
-                            }
-                        }
+                        _weakNetListeners.trigger(weakData);
                     }
                 }
             }

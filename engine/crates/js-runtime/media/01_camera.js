@@ -9,7 +9,7 @@ import {
   op_camera_listen_frame_change,
   op_camera_close_frame_change,
 } from "ext:core/ops";
-import { wrapAsync } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // Camera instance registry: cameraId -> Camera
 const _cameras = new Map();
@@ -30,10 +30,10 @@ class Camera {
 
   // Multi-listener arrays for event callbacks
   #listeners = {
-    cameraFrame: [],
-    stop: [],
-    authCancel: [],
-    error: [],
+    cameraFrame: createListenerGroup("Camera cameraFrame"),
+    stop: createListenerGroup("Camera stop"),
+    authCancel: createListenerGroup("Camera authCancel"),
+    error: createListenerGroup("Camera error"),
   };
 
   constructor(id) {
@@ -75,9 +75,7 @@ class Camera {
    * @param {Function} callback - Receives {data: ArrayBuffer, width: number, height: number}
    */
   onCameraFrame(callback) {
-    if (typeof callback === "function") {
-      this.#listeners.cameraFrame.push(callback);
-    }
+    this.#listeners.cameraFrame.on(callback);
   }
 
   /**
@@ -85,9 +83,7 @@ class Camera {
    * @param {Function} callback
    */
   onStop(callback) {
-    if (typeof callback === "function") {
-      this.#listeners.stop.push(callback);
-    }
+    this.#listeners.stop.on(callback);
   }
 
   /**
@@ -95,9 +91,7 @@ class Camera {
    * @param {Function} callback
    */
   onAuthCancel(callback) {
-    if (typeof callback === "function") {
-      this.#listeners.authCancel.push(callback);
-    }
+    this.#listeners.authCancel.on(callback);
   }
 
   // ==================== Photo Capture ====================
@@ -180,7 +174,7 @@ class Camera {
 
     // Clear all listeners
     for (const key of Object.keys(this.#listeners)) {
-      this.#listeners[key].length = 0;
+      this.#listeners[key].off();
     }
   }
 
@@ -188,16 +182,9 @@ class Camera {
 
   /** Fire all listeners for the given event type. */
   #fireListeners(type, arg) {
-    const list = this.#listeners[type];
-    if (!list || list.length === 0) return;
-    const snapshot = list.slice();
-    for (const fn of snapshot) {
-      try {
-        fn(arg);
-      } catch (e) {
-        console.error("Camera callback error:", e);
-      }
-    }
+    const group = this.#listeners[type];
+    if (!group) return;
+    group.trigger(arg);
   }
 
   /**

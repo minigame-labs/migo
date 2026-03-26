@@ -66,6 +66,7 @@ public final class RuntimeConfig {
 
     // Display settings
     private final boolean immersiveMode;
+    private final String startupOrientation;
 
     // Safety settings
     private final boolean watchdogEnabled;
@@ -82,6 +83,7 @@ public final class RuntimeConfig {
         this.debugEnabled = builder.debugEnabled;
         this.logLevel = builder.logLevel;
         this.immersiveMode = builder.immersiveMode;
+        this.startupOrientation = builder.startupOrientation;
         this.watchdogEnabled = builder.watchdogEnabled;
         this.watchdogTimeoutSecs = builder.watchdogTimeoutSecs;
         this.codeSigningEnabled = builder.codeSigningEnabled;
@@ -114,6 +116,13 @@ public final class RuntimeConfig {
     /** Check whether full-screen immersive mode is enabled */
     public boolean isImmersiveMode() { return immersiveMode; }
 
+    /**
+     * Get preferred startup orientation.
+     *
+     * @return "landscape", "portrait", or null
+     */
+    public String getStartupOrientation() { return startupOrientation; }
+
     /** Check whether ANR watchdog is enabled */
     public boolean isWatchdogEnabled() { return watchdogEnabled; }
 
@@ -139,6 +148,7 @@ public final class RuntimeConfig {
                 ", targetFps=" + targetFps +
                 ", debugEnabled=" + debugEnabled +
                 ", logLevel=" + logLevel +
+                ", startupOrientation='" + startupOrientation + '\'' +
                 ", watchdogEnabled=" + watchdogEnabled +
                 ", watchdogTimeoutSecs=" + watchdogTimeoutSecs +
                 ", codeSigningEnabled=" + codeSigningEnabled +
@@ -166,6 +176,7 @@ public final class RuntimeConfig {
 
         // Display
         private boolean immersiveMode = true;
+        private String startupOrientation = null;
 
         // Safety
         private boolean watchdogEnabled = true;
@@ -237,6 +248,24 @@ public final class RuntimeConfig {
          */
         public Builder setTargetFps(int fps) {
             this.targetFps = Math.max(30, Math.min(120, fps));
+            return this;
+        }
+
+        /**
+         * Set preferred startup orientation.
+         *
+         * @param orientation "landscape", "portrait", or null
+         * @return this builder
+         */
+        public Builder setStartupOrientation(String orientation) {
+            if (orientation == null || orientation.isEmpty()) {
+                this.startupOrientation = null;
+            } else if ("landscape".equals(orientation) || "portrait".equals(orientation)) {
+                this.startupOrientation = orientation;
+            } else {
+                throw new IllegalArgumentException(
+                        "startupOrientation must be \"landscape\" or \"portrait\"");
+            }
             return this;
         }
 

@@ -3,37 +3,67 @@
 use deno_core::{Extension, OpState, op2};
 use deno_error::JsErrorBox;
 use shared::op_state::HostOpState;
+use shared::protocol::error::ServiceError;
+use shared::services::{CameraService, ImageApiService, VideoService};
+
+/// Look up the camera service and call `f` on it.
+fn with_camera<F, T>(state: &mut OpState, err_msg: &'static str, f: F) -> Result<T, JsErrorBox>
+where
+    F: FnOnce(&dyn CameraService) -> Result<T, ServiceError>,
+{
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(svc) = services.camera() {
+            return f(svc.as_ref()).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(err_msg))
+}
+
+/// Look up the image API service and call `f` on it.
+fn with_image_api<F, T>(state: &mut OpState, err_msg: &'static str, f: F) -> Result<T, JsErrorBox>
+where
+    F: FnOnce(&dyn ImageApiService) -> Result<T, ServiceError>,
+{
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(svc) = services.image_api() {
+            return f(svc.as_ref()).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(err_msg))
+}
+
+/// Look up the video service and call `f` on it.
+fn with_video<F, T>(state: &mut OpState, err_msg: &'static str, f: F) -> Result<T, JsErrorBox>
+where
+    F: FnOnce(&dyn VideoService) -> Result<T, ServiceError>,
+{
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(svc) = services.video() {
+            return f(svc.as_ref()).map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic(err_msg))
+}
 
 // ==================== Camera Ops ====================
 
-/// Create a camera instance with platform-specific implementation.
-/// Options are passed as JSON string for extensibility.
-/// Returns JSON: `{"cameraId": <id>}` on success.
+/// Create a camera instance. Returns JSON: `{"cameraId": <id>}`.
 #[op2]
 #[string]
 pub fn op_camera_create(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(camera) = services.camera() {
-            return camera.create(options_json).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("createCamera:fail not supported"))
+    with_camera(state, "createCamera:fail not supported", |c| c.create(options_json))
 }
 
 /// Destroy a camera instance and release all resources.
 #[op2(fast)]
 pub fn op_camera_destroy(state: &mut OpState, #[smi] camera_id: u32) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(camera) = services.camera() {
-            return camera.destroy(camera_id).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("camera.destroy:fail not supported"))
+    with_camera(state, "camera.destroy:fail not supported", |c| c.destroy(camera_id))
 }
 
 /// Take a photo. Options as JSON, returns JSON with tempImagePath.
@@ -43,13 +73,7 @@ pub fn op_camera_take_photo(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(camera) = services.camera() {
-            return camera.take_photo(options_json).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("camera.takePhoto:fail not supported"))
+    with_camera(state, "camera.takePhoto:fail not supported", |c| c.take_photo(options_json))
 }
 
 /// Start video recording. Options as JSON.
@@ -59,15 +83,7 @@ pub fn op_camera_start_record(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(camera) = services.camera() {
-            return camera
-                .start_record(options_json)
-                .map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("camera.startRecord:fail not supported"))
+    with_camera(state, "camera.startRecord:fail not supported", |c| c.start_record(options_json))
 }
 
 /// Stop video recording. Returns JSON with tempThumbPath, tempVideoPath.
@@ -77,15 +93,7 @@ pub fn op_camera_stop_record(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(camera) = services.camera() {
-            return camera
-                .stop_record(options_json)
-                .map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("camera.stopRecord:fail not supported"))
+    with_camera(state, "camera.stopRecord:fail not supported", |c| c.stop_record(options_json))
 }
 
 /// Set camera zoom level. Returns JSON with actual zoom applied.
@@ -95,13 +103,7 @@ pub fn op_camera_set_zoom(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(camera) = services.camera() {
-            return camera.set_zoom(options_json).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("camera.setZoom:fail not supported"))
+    with_camera(state, "camera.setZoom:fail not supported", |c| c.set_zoom(options_json))
 }
 
 /// Start listening for camera frame changes (high-frequency streaming).
@@ -110,17 +112,7 @@ pub fn op_camera_listen_frame_change(
     state: &mut OpState,
     #[smi] camera_id: u32,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(camera) = services.camera() {
-            return camera
-                .listen_frame_change(camera_id)
-                .map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic(
-        "camera.listenFrameChange:fail not supported",
-    ))
+    with_camera(state, "camera.listenFrameChange:fail not supported", |c| c.listen_frame_change(camera_id))
 }
 
 /// Stop listening for camera frame changes.
@@ -129,17 +121,7 @@ pub fn op_camera_close_frame_change(
     state: &mut OpState,
     #[smi] camera_id: u32,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(camera) = services.camera() {
-            return camera
-                .close_frame_change(camera_id)
-                .map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic(
-        "camera.closeFrameChange:fail not supported",
-    ))
+    with_camera(state, "camera.closeFrameChange:fail not supported", |c| c.close_frame_change(camera_id))
 }
 
 // ==================== Image API Ops ====================
@@ -150,17 +132,7 @@ pub fn op_save_image_to_photos_album(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(svc) = services.image_api() {
-            return svc
-                .save_image_to_photos_album(options_json)
-                .map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic(
-        "saveImageToPhotosAlbum:fail not supported",
-    ))
+    with_image_api(state, "saveImageToPhotosAlbum:fail not supported", |svc| svc.save_image_to_photos_album(options_json))
 }
 
 /// Preview images and videos.
@@ -169,13 +141,7 @@ pub fn op_preview_media(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(svc) = services.image_api() {
-            return svc.preview_media(options_json).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("previewMedia:fail not supported"))
+    with_image_api(state, "previewMedia:fail not supported", |svc| svc.preview_media(options_json))
 }
 
 /// Preview images fullscreen.
@@ -184,13 +150,7 @@ pub fn op_preview_image(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(svc) = services.image_api() {
-            return svc.preview_image(options_json).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("previewImage:fail not supported"))
+    with_image_api(state, "previewImage:fail not supported", |svc| svc.preview_image(options_json))
 }
 
 /// Compress image (async, result via callback).
@@ -199,15 +159,7 @@ pub fn op_compress_image(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(svc) = services.image_api() {
-            return svc
-                .compress_image(options_json)
-                .map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("compressImage:fail not supported"))
+    with_image_api(state, "compressImage:fail not supported", |svc| svc.compress_image(options_json))
 }
 
 /// Choose files from client session (async, result via callback).
@@ -216,15 +168,7 @@ pub fn op_choose_message_file(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(svc) = services.image_api() {
-            return svc
-                .choose_message_file(options_json)
-                .map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("chooseMessageFile:fail not supported"))
+    with_image_api(state, "chooseMessageFile:fail not supported", |svc| svc.choose_message_file(options_json))
 }
 
 /// Choose images from album or camera (async, result via callback).
@@ -233,69 +177,37 @@ pub fn op_choose_image(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(svc) = services.image_api() {
-            return svc.choose_image(options_json).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("chooseImage:fail not supported"))
+    with_image_api(state, "chooseImage:fail not supported", |svc| svc.choose_image(options_json))
 }
 
 // ==================== Video Ops ====================
 
-/// Create a video player instance with platform-specific implementation.
-/// Options are passed as JSON string for extensibility.
-/// Returns JSON: `{"videoId": <id>}` on success.
+/// Create a video player instance. Returns JSON: `{"videoId": <id>}`.
 #[op2]
 #[string]
 pub fn op_video_create(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(video) = services.video() {
-            return video.create(options_json).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("createVideo:fail not supported"))
+    with_video(state, "createVideo:fail not supported", |v| v.create(options_json))
 }
 
 /// Start or resume video playback.
 #[op2(fast)]
 pub fn op_video_play(state: &mut OpState, #[smi] video_id: u32) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(video) = services.video() {
-            return video.play(video_id).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("video.play:fail not supported"))
+    with_video(state, "video.play:fail not supported", |v| v.play(video_id))
 }
 
 /// Pause video playback.
 #[op2(fast)]
 pub fn op_video_pause(state: &mut OpState, #[smi] video_id: u32) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(video) = services.video() {
-            return video.pause(video_id).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("video.pause:fail not supported"))
+    with_video(state, "video.pause:fail not supported", |v| v.pause(video_id))
 }
 
 /// Stop video playback and reset to beginning.
 #[op2(fast)]
 pub fn op_video_stop(state: &mut OpState, #[smi] video_id: u32) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(video) = services.video() {
-            return video.stop(video_id).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("video.stop:fail not supported"))
+    with_video(state, "video.stop:fail not supported", |v| v.stop(video_id))
 }
 
 /// Seek to a specific position in seconds.
@@ -305,13 +217,7 @@ pub fn op_video_seek(
     #[smi] video_id: u32,
     position: f64,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(video) = services.video() {
-            return video.seek(video_id, position).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("video.seek:fail not supported"))
+    with_video(state, "video.seek:fail not supported", |v| v.seek(video_id, position))
 }
 
 /// Enter fullscreen mode.
@@ -321,17 +227,7 @@ pub fn op_video_request_fullscreen(
     #[smi] video_id: u32,
     direction: i32,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(video) = services.video() {
-            return video
-                .request_fullscreen(video_id, direction)
-                .map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic(
-        "video.requestFullScreen:fail not supported",
-    ))
+    with_video(state, "video.requestFullScreen:fail not supported", |v| v.request_fullscreen(video_id, direction))
 }
 
 /// Exit fullscreen mode.
@@ -340,17 +236,7 @@ pub fn op_video_exit_fullscreen(
     state: &mut OpState,
     #[smi] video_id: u32,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(video) = services.video() {
-            return video
-                .exit_fullscreen(video_id)
-                .map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic(
-        "video.exitFullScreen:fail not supported",
-    ))
+    with_video(state, "video.exitFullScreen:fail not supported", |v| v.exit_fullscreen(video_id))
 }
 
 /// Set a video property (JSON-encoded key-value pair).
@@ -360,29 +246,13 @@ pub fn op_video_set_property(
     #[smi] video_id: u32,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(video) = services.video() {
-            return video
-                .set_property(video_id, options_json)
-                .map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic(
-        "video.setProperty:fail not supported",
-    ))
+    with_video(state, "video.setProperty:fail not supported", |v| v.set_property(video_id, options_json))
 }
 
 /// Destroy a video player instance and release all resources.
 #[op2(fast)]
 pub fn op_video_destroy(state: &mut OpState, #[smi] video_id: u32) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(video) = services.video() {
-            return video.destroy(video_id).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("video.destroy:fail not supported"))
+    with_video(state, "video.destroy:fail not supported", |v| v.destroy(video_id))
 }
 
 // ==================== Extension Definition ====================

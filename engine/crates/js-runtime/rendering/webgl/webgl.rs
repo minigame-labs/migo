@@ -1,8 +1,10 @@
 use std::mem;
 
 use bytemuck::allocation::cast_vec;
-use deno_core::{OpState, op2};
-use tracing::error;
+use deno_core::{op2, OpState};
+use tracing::{error, warn};
+
+use crate::rendering::image::cache::IMAGE_CACHE;
 
 use shared::{
     error::EngineError,
@@ -83,6 +85,41 @@ fn send_gl_sync_with_flush<T>(
     flush_gl_batch(state);
     let ctx = state.borrow::<CanvasOpState>();
     send_gl_with_resp_sync(ctx, build)
+}
+
+#[inline]
+fn load_cached_image_rgba(image_id: u32) -> Option<(i32, i32, Vec<u8>)> {
+    let src = {
+        let c = IMAGE_CACHE.lock();
+        c.source_for_image_id(image_id)
+    }?;
+
+    let cached = {
+        let mut cache = io::global_cache();
+        cache.get(&src)
+    }?;
+
+    Some((
+        cached.image.width as i32,
+        cached.image.height as i32,
+        cached.image.rgba.as_ref().clone(),
+    ))
+}
+
+#[inline]
+fn escape_json_string(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+    for ch in input.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 #[op2(fast)]
@@ -199,7 +236,13 @@ pub fn op_create_shader(state: &mut OpState, #[smi] client_id: u32, #[smi] ty: u
             return;
         }
     };
-    queue_gl_fire_and_forget(state, GLCmd::CreateShader { client_id, shader_type });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CreateShader {
+            client_id,
+            shader_type,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -324,6 +367,66 @@ pub fn op_get_attrib_location(
     .unwrap_or(-1)
 }
 
+#[op2]
+#[string]
+pub fn op_get_active_attrib(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] program_id: u32,
+    #[smi] index: u32,
+) -> String {
+    let info = send_gl_sync_with_flush(state, |resp| {
+        RenderCommand::GL(GLCmd::GetActiveAttrib {
+            canvas_id,
+            program_id,
+            index,
+            resp,
+        })
+    })
+    .ok()
+    .flatten();
+
+    if let Some((name, size, type_)) = info {
+        let escaped_name = escape_json_string(&name);
+        return format!(
+            "{{\"name\":\"{}\",\"size\":{},\"type\":{}}}",
+            escaped_name, size, type_
+        );
+    }
+
+    String::new()
+}
+
+#[op2]
+#[string]
+pub fn op_get_active_uniform(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] program_id: u32,
+    #[smi] index: u32,
+) -> String {
+    let info = send_gl_sync_with_flush(state, |resp| {
+        RenderCommand::GL(GLCmd::GetActiveUniform {
+            canvas_id,
+            program_id,
+            index,
+            resp,
+        })
+    })
+    .ok()
+    .flatten();
+
+    if let Some((name, size, type_)) = info {
+        let escaped_name = escape_json_string(&name);
+        return format!(
+            "{{\"name\":\"{}\",\"size\":{},\"type\":{}}}",
+            escaped_name, size, type_
+        );
+    }
+
+    String::new()
+}
+
 #[op2(fast)]
 pub fn op_enable_vertex_attrib_array(
     state: &mut OpState,
@@ -440,7 +543,11 @@ pub fn op_uniform3f(
     y: f32,
     z: f32,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     queue_gl_fire_and_forget(
         state,
         GLCmd::Uniform3f {
@@ -461,7 +568,11 @@ pub fn op_uniform_matrix_3fv(
     transpose: bool,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     let value: Vec<f32> = cast_vec(value);
 
     queue_gl_fire_and_forget(
@@ -492,7 +603,11 @@ pub fn op_disable(state: &mut OpState, #[smi] canvas_id: u32, #[smi] cap: u32) {
 #[op2(fast)]
 pub fn op_is_enabled(state: &mut OpState, #[smi] canvas_id: u32, #[smi] cap: u32) -> u32 {
     send_gl_sync_with_flush(state, |resp| {
-        RenderCommand::GL(GLCmd::IsEnabled { canvas_id, cap, resp })
+        RenderCommand::GL(GLCmd::IsEnabled {
+            canvas_id,
+            cap,
+            resp,
+        })
     })
     .map(|v| if v { 1 } else { 0 })
     .unwrap_or(0)
@@ -518,7 +633,11 @@ pub fn op_is_enabled(state: &mut OpState, #[smi] canvas_id: u32, #[smi] cap: u32
 #[string]
 pub fn op_get_parameter(state: &mut OpState, #[smi] canvas_id: u32, #[smi] pname: u32) -> String {
     send_gl_sync_with_flush(state, |resp| {
-        RenderCommand::GL(GLCmd::GetParameter { canvas_id, pname, resp })
+        RenderCommand::GL(GLCmd::GetParameter {
+            canvas_id,
+            pname,
+            resp,
+        })
     })
     .unwrap_or_default()
 }
@@ -538,9 +657,25 @@ pub fn op_delete_texture(state: &mut OpState, #[smi] texture_id: u32) {
 }
 
 #[op2(fast)]
-pub fn op_bind_texture(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32, texture: i32) {
-    let texture = if texture < 0 { None } else { Some(texture as u32) };
-    queue_gl_fire_and_forget(state, GLCmd::BindTexture { canvas_id, target, texture });
+pub fn op_bind_texture(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    texture: i32,
+) {
+    let texture = if texture < 0 {
+        None
+    } else {
+        Some(texture as u32)
+    };
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BindTexture {
+            canvas_id,
+            target,
+            texture,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -563,9 +698,57 @@ pub fn op_tex_image_2d(
     // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
     #[buffer(copy)] data: Option<Vec<u8>>,
 ) {
-    queue_gl_fire_and_forget(state, GLCmd::TexImage2D {
-        canvas_id, target, level, internalformat, width, height, border, format, type_, data,
-    });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexImage2D {
+            canvas_id,
+            target,
+            level,
+            internalformat,
+            width,
+            height,
+            border,
+            format,
+            type_,
+            data,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_tex_image_2d_from_image(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] level: i32,
+    #[smi] internalformat: i32,
+    #[smi] format: u32,
+    #[smi] type_: u32,
+    #[smi] image_id: u32,
+) {
+    let Some((width, height, data)) = load_cached_image_rgba(image_id) else {
+        warn!(
+            "op_tex_image_2d_from_image cache miss: image_id={}",
+            image_id
+        );
+        return;
+    };
+
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexImage2D {
+            canvas_id,
+            target,
+            level,
+            internalformat,
+            width,
+            height,
+            border: 0,
+            format,
+            type_,
+            data: Some(data),
+        },
+    );
 }
 
 #[op2(fast)]
@@ -583,19 +766,96 @@ pub fn op_tex_sub_image_2d(
     // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
     #[buffer(copy)] data: Vec<u8>,
 ) {
-    queue_gl_fire_and_forget(state, GLCmd::TexSubImage2D {
-        canvas_id, target, level, xoffset, yoffset, width, height, format, type_, data,
-    });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexSubImage2D {
+            canvas_id,
+            target,
+            level,
+            xoffset,
+            yoffset,
+            width,
+            height,
+            format,
+            type_,
+            data,
+        },
+    );
 }
 
 #[op2(fast)]
-pub fn op_tex_parameteri(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32, #[smi] pname: u32, #[smi] param: i32) {
-    queue_gl_fire_and_forget(state, GLCmd::TexParameteri { canvas_id, target, pname, param });
+pub fn op_tex_sub_image_2d_from_image(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] level: i32,
+    #[smi] xoffset: i32,
+    #[smi] yoffset: i32,
+    #[smi] format: u32,
+    #[smi] type_: u32,
+    #[smi] image_id: u32,
+) {
+    let Some((width, height, data)) = load_cached_image_rgba(image_id) else {
+        warn!(
+            "op_tex_sub_image_2d_from_image cache miss: image_id={}",
+            image_id
+        );
+        return;
+    };
+
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexSubImage2D {
+            canvas_id,
+            target,
+            level,
+            xoffset,
+            yoffset,
+            width,
+            height,
+            format,
+            type_,
+            data,
+        },
+    );
 }
 
 #[op2(fast)]
-pub fn op_tex_parameterf(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32, #[smi] pname: u32, param: f32) {
-    queue_gl_fire_and_forget(state, GLCmd::TexParameterf { canvas_id, target, pname, param });
+pub fn op_tex_parameteri(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] pname: u32,
+    #[smi] param: i32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexParameteri {
+            canvas_id,
+            target,
+            pname,
+            param,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_tex_parameterf(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] pname: u32,
+    param: f32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexParameterf {
+            canvas_id,
+            target,
+            pname,
+            param,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -604,8 +864,20 @@ pub fn op_generate_mipmap(state: &mut OpState, #[smi] canvas_id: u32, #[smi] tar
 }
 
 #[op2(fast)]
-pub fn op_pixel_storei(state: &mut OpState, #[smi] canvas_id: u32, #[smi] pname: u32, #[smi] param: i32) {
-    queue_gl_fire_and_forget(state, GLCmd::PixelStorei { canvas_id, pname, param });
+pub fn op_pixel_storei(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] pname: u32,
+    #[smi] param: i32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::PixelStorei {
+            canvas_id,
+            pname,
+            param,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -621,9 +893,19 @@ pub fn op_compressed_tex_image_2d(
     // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
     #[buffer(copy)] data: Vec<u8>,
 ) {
-    queue_gl_fire_and_forget(state, GLCmd::CompressedTexImage2D {
-        canvas_id, target, level, internalformat, width, height, border, data,
-    });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CompressedTexImage2D {
+            canvas_id,
+            target,
+            level,
+            internalformat,
+            width,
+            height,
+            border,
+            data,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -640,9 +922,20 @@ pub fn op_compressed_tex_sub_image_2d(
     // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
     #[buffer(copy)] data: Vec<u8>,
 ) {
-    queue_gl_fire_and_forget(state, GLCmd::CompressedTexSubImage2D {
-        canvas_id, target, level, xoffset, yoffset, width, height, format, data,
-    });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CompressedTexSubImage2D {
+            canvas_id,
+            target,
+            level,
+            xoffset,
+            yoffset,
+            width,
+            height,
+            format,
+            data,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -658,11 +951,23 @@ pub fn op_buffer_sub_data(
     // #[buffer(copy)] -> owned Vec<u8>; avoids intermediate JsBuffer + .to_vec().
     #[buffer(copy)] data: Vec<u8>,
 ) {
-    queue_gl_fire_and_forget(state, GLCmd::BufferSubData { canvas_id, target, offset, data });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BufferSubData {
+            canvas_id,
+            target,
+            offset,
+            data,
+        },
+    );
 }
 
 #[op2(fast)]
-pub fn op_disable_vertex_attrib_array(state: &mut OpState, #[smi] canvas_id: u32, #[smi] index: u32) {
+pub fn op_disable_vertex_attrib_array(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] index: u32,
+) {
     queue_gl_fire_and_forget(state, GLCmd::DisableVertexAttribArray { canvas_id, index });
 }
 
@@ -681,8 +986,20 @@ pub fn op_clear_stencil(state: &mut OpState, #[smi] canvas_id: u32, #[smi] s: i3
 // ---------------------------------------------------------------------------
 
 #[op2(fast)]
-pub fn op_blend_func(state: &mut OpState, #[smi] canvas_id: u32, #[smi] sfactor: u32, #[smi] dfactor: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::BlendFunc { canvas_id, sfactor, dfactor });
+pub fn op_blend_func(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] sfactor: u32,
+    #[smi] dfactor: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BlendFunc {
+            canvas_id,
+            sfactor,
+            dfactor,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -694,9 +1011,16 @@ pub fn op_blend_func_separate(
     #[smi] src_alpha: u32,
     #[smi] dst_alpha: u32,
 ) {
-    queue_gl_fire_and_forget(state, GLCmd::BlendFuncSeparate {
-        canvas_id, src_rgb, dst_rgb, src_alpha, dst_alpha,
-    });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BlendFuncSeparate {
+            canvas_id,
+            src_rgb,
+            dst_rgb,
+            src_alpha,
+            dst_alpha,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -705,13 +1029,34 @@ pub fn op_blend_equation(state: &mut OpState, #[smi] canvas_id: u32, #[smi] mode
 }
 
 #[op2(fast)]
-pub fn op_blend_equation_separate(state: &mut OpState, #[smi] canvas_id: u32, #[smi] mode_rgb: u32, #[smi] mode_alpha: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::BlendEquationSeparate { canvas_id, mode_rgb, mode_alpha });
+pub fn op_blend_equation_separate(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] mode_rgb: u32,
+    #[smi] mode_alpha: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BlendEquationSeparate {
+            canvas_id,
+            mode_rgb,
+            mode_alpha,
+        },
+    );
 }
 
 #[op2(fast)]
 pub fn op_blend_color(state: &mut OpState, #[smi] canvas_id: u32, r: f32, g: f32, b: f32, a: f32) {
-    queue_gl_fire_and_forget(state, GLCmd::BlendColor { canvas_id, r, g, b, a });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BlendColor {
+            canvas_id,
+            r,
+            g,
+            b,
+            a,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -726,12 +1071,33 @@ pub fn op_depth_mask(state: &mut OpState, #[smi] canvas_id: u32, flag: bool) {
 
 #[op2(fast)]
 pub fn op_depth_range(state: &mut OpState, #[smi] canvas_id: u32, near: f32, far: f32) {
-    queue_gl_fire_and_forget(state, GLCmd::DepthRange { canvas_id, near, far });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::DepthRange {
+            canvas_id,
+            near,
+            far,
+        },
+    );
 }
 
 #[op2(fast)]
-pub fn op_stencil_func(state: &mut OpState, #[smi] canvas_id: u32, #[smi] func: u32, #[smi] ref_: i32, #[smi] mask: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::StencilFunc { canvas_id, func, ref_, mask });
+pub fn op_stencil_func(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] func: u32,
+    #[smi] ref_: i32,
+    #[smi] mask: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::StencilFunc {
+            canvas_id,
+            func,
+            ref_,
+            mask,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -743,14 +1109,35 @@ pub fn op_stencil_func_separate(
     #[smi] ref_: i32,
     #[smi] mask: u32,
 ) {
-    queue_gl_fire_and_forget(state, GLCmd::StencilFuncSeparate {
-        canvas_id, face, func, ref_, mask,
-    });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::StencilFuncSeparate {
+            canvas_id,
+            face,
+            func,
+            ref_,
+            mask,
+        },
+    );
 }
 
 #[op2(fast)]
-pub fn op_stencil_op(state: &mut OpState, #[smi] canvas_id: u32, #[smi] fail: u32, #[smi] zfail: u32, #[smi] zpass: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::StencilOp { canvas_id, fail, zfail, zpass });
+pub fn op_stencil_op(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] fail: u32,
+    #[smi] zfail: u32,
+    #[smi] zpass: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::StencilOp {
+            canvas_id,
+            fail,
+            zfail,
+            zpass,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -762,9 +1149,16 @@ pub fn op_stencil_op_separate(
     #[smi] zfail: u32,
     #[smi] zpass: u32,
 ) {
-    queue_gl_fire_and_forget(state, GLCmd::StencilOpSeparate {
-        canvas_id, face, fail, zfail, zpass,
-    });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::StencilOpSeparate {
+            canvas_id,
+            face,
+            fail,
+            zfail,
+            zpass,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -773,8 +1167,20 @@ pub fn op_stencil_mask(state: &mut OpState, #[smi] canvas_id: u32, #[smi] mask: 
 }
 
 #[op2(fast)]
-pub fn op_stencil_mask_separate(state: &mut OpState, #[smi] canvas_id: u32, #[smi] face: u32, #[smi] mask: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::StencilMaskSeparate { canvas_id, face, mask });
+pub fn op_stencil_mask_separate(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] face: u32,
+    #[smi] mask: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::StencilMaskSeparate {
+            canvas_id,
+            face,
+            mask,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -788,13 +1194,45 @@ pub fn op_front_face(state: &mut OpState, #[smi] canvas_id: u32, #[smi] mode: u3
 }
 
 #[op2(fast)]
-pub fn op_color_mask(state: &mut OpState, #[smi] canvas_id: u32, r: bool, g: bool, b: bool, a: bool) {
-    queue_gl_fire_and_forget(state, GLCmd::ColorMask { canvas_id, r, g, b, a });
+pub fn op_color_mask(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    r: bool,
+    g: bool,
+    b: bool,
+    a: bool,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::ColorMask {
+            canvas_id,
+            r,
+            g,
+            b,
+            a,
+        },
+    );
 }
 
 #[op2(fast)]
-pub fn op_scissor(state: &mut OpState, #[smi] canvas_id: u32, #[smi] x: i32, #[smi] y: i32, #[smi] width: i32, #[smi] height: i32) {
-    queue_gl_fire_and_forget(state, GLCmd::Scissor { canvas_id, x, y, width, height });
+pub fn op_scissor(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] x: i32,
+    #[smi] y: i32,
+    #[smi] width: i32,
+    #[smi] height: i32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Scissor {
+            canvas_id,
+            x,
+            y,
+            width,
+            height,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -804,7 +1242,14 @@ pub fn op_line_width(state: &mut OpState, #[smi] canvas_id: u32, width: f32) {
 
 #[op2(fast)]
 pub fn op_polygon_offset(state: &mut OpState, #[smi] canvas_id: u32, factor: f32, units: f32) {
-    queue_gl_fire_and_forget(state, GLCmd::PolygonOffset { canvas_id, factor, units });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::PolygonOffset {
+            canvas_id,
+            factor,
+            units,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -813,26 +1258,82 @@ pub fn op_polygon_offset(state: &mut OpState, #[smi] canvas_id: u32, factor: f32
 
 #[op2(fast)]
 pub fn op_uniform1i(state: &mut OpState, #[smi] canvas_id: u32, location: i32, #[smi] x: i32) {
-    let location = if location < 0 { None } else { Some(location as u32) };
-    queue_gl_fire_and_forget(state, GLCmd::Uniform1i { canvas_id, location, x });
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform1i {
+            canvas_id,
+            location,
+            x,
+        },
+    );
 }
 
 #[op2(fast)]
 pub fn op_uniform1f(state: &mut OpState, #[smi] canvas_id: u32, location: i32, x: f32) {
-    let location = if location < 0 { None } else { Some(location as u32) };
-    queue_gl_fire_and_forget(state, GLCmd::Uniform1f { canvas_id, location, x });
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform1f {
+            canvas_id,
+            location,
+            x,
+        },
+    );
 }
 
 #[op2(fast)]
 pub fn op_uniform2f(state: &mut OpState, #[smi] canvas_id: u32, location: i32, x: f32, y: f32) {
-    let location = if location < 0 { None } else { Some(location as u32) };
-    queue_gl_fire_and_forget(state, GLCmd::Uniform2f { canvas_id, location, x, y });
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform2f {
+            canvas_id,
+            location,
+            x,
+            y,
+        },
+    );
 }
 
 #[op2(fast)]
-pub fn op_uniform4f(state: &mut OpState, #[smi] canvas_id: u32, location: i32, x: f32, y: f32, z: f32, w: f32) {
-    let location = if location < 0 { None } else { Some(location as u32) };
-    queue_gl_fire_and_forget(state, GLCmd::Uniform4f { canvas_id, location, x, y, z, w });
+pub fn op_uniform4f(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    location: i32,
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+) {
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform4f {
+            canvas_id,
+            location,
+            x,
+            y,
+            z,
+            w,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -842,9 +1343,20 @@ pub fn op_uniform1iv(
     location: i32,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     let value: Vec<i32> = cast_vec(value);
-    queue_gl_fire_and_forget(state, GLCmd::Uniform1iv { canvas_id, location, value });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform1iv {
+            canvas_id,
+            location,
+            value,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -854,9 +1366,20 @@ pub fn op_uniform1fv(
     location: i32,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     let value: Vec<f32> = cast_vec(value);
-    queue_gl_fire_and_forget(state, GLCmd::Uniform1fv { canvas_id, location, value });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform1fv {
+            canvas_id,
+            location,
+            value,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -866,9 +1389,20 @@ pub fn op_uniform2iv(
     location: i32,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     let value: Vec<i32> = cast_vec(value);
-    queue_gl_fire_and_forget(state, GLCmd::Uniform2iv { canvas_id, location, value });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform2iv {
+            canvas_id,
+            location,
+            value,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -878,9 +1412,20 @@ pub fn op_uniform2fv(
     location: i32,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     let value: Vec<f32> = cast_vec(value);
-    queue_gl_fire_and_forget(state, GLCmd::Uniform2fv { canvas_id, location, value });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform2fv {
+            canvas_id,
+            location,
+            value,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -890,9 +1435,20 @@ pub fn op_uniform3iv(
     location: i32,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     let value: Vec<i32> = cast_vec(value);
-    queue_gl_fire_and_forget(state, GLCmd::Uniform3iv { canvas_id, location, value });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform3iv {
+            canvas_id,
+            location,
+            value,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -902,9 +1458,20 @@ pub fn op_uniform3fv(
     location: i32,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     let value: Vec<f32> = cast_vec(value);
-    queue_gl_fire_and_forget(state, GLCmd::Uniform3fv { canvas_id, location, value });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform3fv {
+            canvas_id,
+            location,
+            value,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -914,9 +1481,20 @@ pub fn op_uniform4iv(
     location: i32,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     let value: Vec<i32> = cast_vec(value);
-    queue_gl_fire_and_forget(state, GLCmd::Uniform4iv { canvas_id, location, value });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform4iv {
+            canvas_id,
+            location,
+            value,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -926,9 +1504,20 @@ pub fn op_uniform4fv(
     location: i32,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     let value: Vec<f32> = cast_vec(value);
-    queue_gl_fire_and_forget(state, GLCmd::Uniform4fv { canvas_id, location, value });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Uniform4fv {
+            canvas_id,
+            location,
+            value,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -939,11 +1528,21 @@ pub fn op_uniform_matrix_2fv(
     transpose: bool,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     let value: Vec<f32> = cast_vec(value);
-    queue_gl_fire_and_forget(state, GLCmd::UniformMatrix2fv {
-        canvas_id, location, transpose, value,
-    });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::UniformMatrix2fv {
+            canvas_id,
+            location,
+            transpose,
+            value,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -954,11 +1553,21 @@ pub fn op_uniform_matrix_4fv(
     transpose: bool,
     #[buffer(copy)] value: Vec<u32>,
 ) {
-    let location = if location < 0 { None } else { Some(location as u32) };
+    let location = if location < 0 {
+        None
+    } else {
+        Some(location as u32)
+    };
     let value: Vec<f32> = cast_vec(value);
-    queue_gl_fire_and_forget(state, GLCmd::UniformMatrix4fv {
-        canvas_id, location, transpose, value,
-    });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::UniformMatrix4fv {
+            canvas_id,
+            location,
+            transpose,
+            value,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -976,9 +1585,25 @@ pub fn op_delete_framebuffer(state: &mut OpState, #[smi] framebuffer_id: u32) {
 }
 
 #[op2(fast)]
-pub fn op_bind_framebuffer(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32, framebuffer: i32) {
-    let framebuffer = if framebuffer < 0 { None } else { Some(framebuffer as u32) };
-    queue_gl_fire_and_forget(state, GLCmd::BindFramebuffer { canvas_id, target, framebuffer });
+pub fn op_bind_framebuffer(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    framebuffer: i32,
+) {
+    let framebuffer = if framebuffer < 0 {
+        None
+    } else {
+        Some(framebuffer as u32)
+    };
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BindFramebuffer {
+            canvas_id,
+            target,
+            framebuffer,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -991,10 +1616,22 @@ pub fn op_framebuffer_texture_2d(
     texture: i32,
     #[smi] level: i32,
 ) {
-    let texture = if texture < 0 { None } else { Some(texture as u32) };
-    queue_gl_fire_and_forget(state, GLCmd::FramebufferTexture2D {
-        canvas_id, target, attachment, textarget, texture, level,
-    });
+    let texture = if texture < 0 {
+        None
+    } else {
+        Some(texture as u32)
+    };
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::FramebufferTexture2D {
+            canvas_id,
+            target,
+            attachment,
+            textarget,
+            texture,
+            level,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -1006,16 +1643,35 @@ pub fn op_framebuffer_renderbuffer(
     #[smi] renderbuffertarget: u32,
     renderbuffer: i32,
 ) {
-    let renderbuffer = if renderbuffer < 0 { None } else { Some(renderbuffer as u32) };
-    queue_gl_fire_and_forget(state, GLCmd::FramebufferRenderbuffer {
-        canvas_id, target, attachment, renderbuffertarget, renderbuffer,
-    });
+    let renderbuffer = if renderbuffer < 0 {
+        None
+    } else {
+        Some(renderbuffer as u32)
+    };
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::FramebufferRenderbuffer {
+            canvas_id,
+            target,
+            attachment,
+            renderbuffertarget,
+            renderbuffer,
+        },
+    );
 }
 
 #[op2(fast)]
-pub fn op_check_framebuffer_status(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32) -> u32 {
+pub fn op_check_framebuffer_status(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+) -> u32 {
     send_gl_sync_with_flush(state, |resp| {
-        RenderCommand::GL(GLCmd::CheckFramebufferStatus { canvas_id, target, resp })
+        RenderCommand::GL(GLCmd::CheckFramebufferStatus {
+            canvas_id,
+            target,
+            resp,
+        })
     })
     .unwrap_or(0)
 }
@@ -1031,9 +1687,25 @@ pub fn op_delete_renderbuffer(state: &mut OpState, #[smi] renderbuffer_id: u32) 
 }
 
 #[op2(fast)]
-pub fn op_bind_renderbuffer(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32, renderbuffer: i32) {
-    let renderbuffer = if renderbuffer < 0 { None } else { Some(renderbuffer as u32) };
-    queue_gl_fire_and_forget(state, GLCmd::BindRenderbuffer { canvas_id, target, renderbuffer });
+pub fn op_bind_renderbuffer(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    renderbuffer: i32,
+) {
+    let renderbuffer = if renderbuffer < 0 {
+        None
+    } else {
+        Some(renderbuffer as u32)
+    };
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BindRenderbuffer {
+            canvas_id,
+            target,
+            renderbuffer,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -1045,9 +1717,16 @@ pub fn op_renderbuffer_storage(
     #[smi] width: i32,
     #[smi] height: i32,
 ) {
-    queue_gl_fire_and_forget(state, GLCmd::RenderbufferStorage {
-        canvas_id, target, internalformat, width, height,
-    });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::RenderbufferStorage {
+            canvas_id,
+            target,
+            internalformat,
+            width,
+            height,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,12 +1746,28 @@ pub fn op_read_pixels(
     #[smi] type_: u32,
 ) -> Vec<u8> {
     send_gl_sync_with_flush(state, |resp| {
-        RenderCommand::GL(GLCmd::ReadPixels { canvas_id, x, y, width, height, format, type_, resp })
+        RenderCommand::GL(GLCmd::ReadPixels {
+            canvas_id,
+            x,
+            y,
+            width,
+            height,
+            format,
+            type_,
+            resp,
+        })
     })
     .unwrap_or_default()
 }
 
 #[op2(fast)]
 pub fn op_hint(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32, #[smi] mode: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::Hint { canvas_id, target, mode });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::Hint {
+            canvas_id,
+            target,
+            mode,
+        },
+    );
 }

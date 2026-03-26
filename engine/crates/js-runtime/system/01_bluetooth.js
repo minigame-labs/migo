@@ -23,7 +23,7 @@ import {
     op_set_ble_mtu,
     op_get_ble_mtu,
 } from "ext:core/ops";
-import { wrapAsync } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // ==================== System Bluetooth Setting ====================
 
@@ -145,61 +145,33 @@ function isBluetoothDevicePaired(options = {}) {
 
 // ==================== Bluetooth Event Listeners ====================
 
-const _adapterStateChangeListeners = [];
-const _deviceFoundListeners = [];
+const _adapterStateChangeListeners = createListenerGroup('onBluetoothAdapterStateChange');
+const _deviceFoundListeners = createListenerGroup('onBluetoothDeviceFound');
 
 function onBluetoothAdapterStateChange(listener) {
-    if (typeof listener === 'function') {
-        _adapterStateChangeListeners.push(listener);
-    }
+    _adapterStateChangeListeners.on(listener);
 }
 
 function offBluetoothAdapterStateChange(listener) {
-    if (typeof listener === 'function') {
-        const index = _adapterStateChangeListeners.indexOf(listener);
-        if (index !== -1) {
-            _adapterStateChangeListeners.splice(index, 1);
-        }
-    } else {
-        _adapterStateChangeListeners.length = 0;
-    }
+    _adapterStateChangeListeners.off(listener);
 }
 
 function onBluetoothDeviceFound(listener) {
-    if (typeof listener === 'function') {
-        _deviceFoundListeners.push(listener);
-    }
+    _deviceFoundListeners.on(listener);
 }
 
 function offBluetoothDeviceFound(listener) {
-    if (typeof listener === 'function') {
-        const index = _deviceFoundListeners.indexOf(listener);
-        if (index !== -1) {
-            _deviceFoundListeners.splice(index, 1);
-        }
-    } else {
-        _deviceFoundListeners.length = 0;
-    }
+    _deviceFoundListeners.off(listener);
 }
 
 // ==================== Internal Trigger Functions ====================
 
 function _internalTriggerBluetoothAdapterStateChange(available, discovering) {
-    const data = { available, discovering };
-    for (let i = 0; i < _adapterStateChangeListeners.length; i++) {
-        try { _adapterStateChangeListeners[i](data); } catch (e) {
-            console.error('onBluetoothAdapterStateChange listener error:', e);
-        }
-    }
+    _adapterStateChangeListeners.trigger({ available, discovering });
 }
 
 function _internalTriggerBluetoothDeviceFound(devicesJson) {
-    const data = { devices: JSON.parse(devicesJson) };
-    for (let i = 0; i < _deviceFoundListeners.length; i++) {
-        try { _deviceFoundListeners[i](data); } catch (e) {
-            console.error('onBluetoothDeviceFound listener error:', e);
-        }
-    }
+    _deviceFoundListeners.trigger({ devices: JSON.parse(devicesJson) });
 }
 
 // ==================== Beacon APIs ====================
@@ -229,61 +201,33 @@ function getBeacons(options = {}) {
 
 // ==================== Beacon Event Listeners ====================
 
-const _beaconUpdateListeners = [];
-const _beaconServiceChangeListeners = [];
+const _beaconUpdateListeners = createListenerGroup('onBeaconUpdate');
+const _beaconServiceChangeListeners = createListenerGroup('onBeaconServiceChange');
 
 function onBeaconUpdate(listener) {
-    if (typeof listener === 'function') {
-        _beaconUpdateListeners.push(listener);
-    }
+    _beaconUpdateListeners.on(listener);
 }
 
 function offBeaconUpdate(listener) {
-    if (typeof listener === 'function') {
-        const index = _beaconUpdateListeners.indexOf(listener);
-        if (index !== -1) {
-            _beaconUpdateListeners.splice(index, 1);
-        }
-    } else {
-        _beaconUpdateListeners.length = 0;
-    }
+    _beaconUpdateListeners.off(listener);
 }
 
 function onBeaconServiceChange(listener) {
-    if (typeof listener === 'function') {
-        _beaconServiceChangeListeners.push(listener);
-    }
+    _beaconServiceChangeListeners.on(listener);
 }
 
 function offBeaconServiceChange(listener) {
-    if (typeof listener === 'function') {
-        const index = _beaconServiceChangeListeners.indexOf(listener);
-        if (index !== -1) {
-            _beaconServiceChangeListeners.splice(index, 1);
-        }
-    } else {
-        _beaconServiceChangeListeners.length = 0;
-    }
+    _beaconServiceChangeListeners.off(listener);
 }
 
 // ==================== Beacon Internal Trigger Functions ====================
 
 function _internalTriggerBeaconUpdate(beaconsJson) {
-    const data = { beacons: JSON.parse(beaconsJson) };
-    for (let i = 0; i < _beaconUpdateListeners.length; i++) {
-        try { _beaconUpdateListeners[i](data); } catch (e) {
-            console.error('onBeaconUpdate listener error:', e);
-        }
-    }
+    _beaconUpdateListeners.trigger({ beacons: JSON.parse(beaconsJson) });
 }
 
 function _internalTriggerBeaconServiceChange(available, discovering) {
-    const data = { available, discovering };
-    for (let i = 0; i < _beaconServiceChangeListeners.length; i++) {
-        try { _beaconServiceChangeListeners[i](data); } catch (e) {
-            console.error('onBeaconServiceChange listener error:', e);
-        }
-    }
+    _beaconServiceChangeListeners.trigger({ available, discovering });
 }
 
 // ==================== BLE GATT Connection APIs ====================
@@ -420,93 +364,51 @@ function getBLEMTU(options = {}) {
 
 // ==================== BLE GATT Event Listeners ====================
 
-const _bleConnectionStateChangeListeners = [];
-const _bleCharacteristicValueChangeListeners = [];
-const _bleMTUChangeListeners = [];
+const _bleConnectionStateChangeListeners = createListenerGroup('onBLEConnectionStateChange');
+const _bleCharacteristicValueChangeListeners = createListenerGroup('onBLECharacteristicValueChange');
+const _bleMTUChangeListeners = createListenerGroup('onBLEMTUChange');
 
 function onBLEConnectionStateChange(listener) {
-    if (typeof listener === 'function') {
-        _bleConnectionStateChangeListeners.push(listener);
-    }
+    _bleConnectionStateChangeListeners.on(listener);
 }
 
 function offBLEConnectionStateChange(listener) {
-    if (typeof listener === 'function') {
-        const index = _bleConnectionStateChangeListeners.indexOf(listener);
-        if (index !== -1) {
-            _bleConnectionStateChangeListeners.splice(index, 1);
-        }
-    } else {
-        _bleConnectionStateChangeListeners.length = 0;
-    }
+    _bleConnectionStateChangeListeners.off(listener);
 }
 
 function onBLECharacteristicValueChange(listener) {
-    if (typeof listener === 'function') {
-        _bleCharacteristicValueChangeListeners.push(listener);
-    }
+    _bleCharacteristicValueChangeListeners.on(listener);
 }
 
 function offBLECharacteristicValueChange(listener) {
-    if (typeof listener === 'function') {
-        const index = _bleCharacteristicValueChangeListeners.indexOf(listener);
-        if (index !== -1) {
-            _bleCharacteristicValueChangeListeners.splice(index, 1);
-        }
-    } else {
-        _bleCharacteristicValueChangeListeners.length = 0;
-    }
+    _bleCharacteristicValueChangeListeners.off(listener);
 }
 
 function onBLEMTUChange(listener) {
-    if (typeof listener === 'function') {
-        _bleMTUChangeListeners.push(listener);
-    }
+    _bleMTUChangeListeners.on(listener);
 }
 
 function offBLEMTUChange(listener) {
-    if (typeof listener === 'function') {
-        const index = _bleMTUChangeListeners.indexOf(listener);
-        if (index !== -1) {
-            _bleMTUChangeListeners.splice(index, 1);
-        }
-    } else {
-        _bleMTUChangeListeners.length = 0;
-    }
+    _bleMTUChangeListeners.off(listener);
 }
 
 // ==================== BLE GATT Internal Trigger Functions ====================
 
 function _internalTriggerBLEConnectionStateChange(deviceId, connected) {
-    const data = { deviceId: deviceId, connected: connected };
-    for (let i = 0; i < _bleConnectionStateChangeListeners.length; i++) {
-        try { _bleConnectionStateChangeListeners[i](data); } catch (e) {
-            console.error('onBLEConnectionStateChange listener error:', e);
-        }
-    }
+    _bleConnectionStateChangeListeners.trigger({ deviceId: deviceId, connected: connected });
 }
 
 function _internalTriggerBLECharacteristicValueChange(deviceId, serviceId, characteristicId, value) {
-    const data = {
+    _bleCharacteristicValueChangeListeners.trigger({
         deviceId: deviceId,
         serviceId: serviceId,
         characteristicId: characteristicId,
         value: value,
-    };
-    for (let i = 0; i < _bleCharacteristicValueChangeListeners.length; i++) {
-        try { _bleCharacteristicValueChangeListeners[i](data); } catch (e) {
-            console.error('onBLECharacteristicValueChange listener error:', e);
-        }
-    }
+    });
 }
 
 function _internalTriggerBLEMTUChange(deviceId, mtu) {
-    const data = { deviceId: deviceId, mtu: mtu };
-    for (let i = 0; i < _bleMTUChangeListeners.length; i++) {
-        try { _bleMTUChangeListeners[i](data); } catch (e) {
-            console.error('onBLEMTUChange listener error:', e);
-        }
-    }
+    _bleMTUChangeListeners.trigger({ deviceId: deviceId, mtu: mtu });
 }
 
 export {

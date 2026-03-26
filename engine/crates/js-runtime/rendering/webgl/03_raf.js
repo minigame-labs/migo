@@ -7,6 +7,18 @@ let __nextRafId = 0;
 let __raf_callbacks = Object.create(null);
 let __rafLoopRunning = false;
 
+function _rafErr(err) {
+    if (err == null) return String(err);
+    if (typeof err === "string" || typeof err === "number" || typeof err === "boolean") {
+        return String(err);
+    }
+    const name = typeof err.name === "string" ? err.name : "Error";
+    const message = typeof err.message === "string" ? err.message : "";
+    const stack = typeof err.stack === "string" ? err.stack : "";
+    const base = message ? `${name}: ${message}` : name;
+    return stack ? `${base}\n${stack}` : base;
+}
+
 const requestAnimationFrame = (cb) => {
     const id = ++__nextRafId;
     __raf_callbacks[id] = cb;
@@ -48,7 +60,7 @@ async function _startRafLoop() {
                     try {
                         callbacks[ids[i]](ts);
                     } catch (e) {
-                        console.error('RAF callback error:', e);
+                        console.error(`RAF callback error: ${_rafErr(e)}`);
                     }
                 }
             }
@@ -63,7 +75,7 @@ async function _startRafLoop() {
             }
         }
     } catch (e) {
-        console.error('RAF loop terminated:', e);
+        console.error(`RAF loop terminated: ${_rafErr(e)}`);
     }
     __rafLoopRunning = false;
 }

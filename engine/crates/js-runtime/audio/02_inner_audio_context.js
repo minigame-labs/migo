@@ -14,6 +14,7 @@ import {
   op_audio_set_inner_audio_option,
   op_audio_get_available_audio_sources,
 } from "ext:core/ops";
+import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // ID counter for InnerAudioContext instances
 let nextInnerAudioId = 1;
@@ -92,16 +93,16 @@ class InnerAudioContext {
 
   // Event listener arrays (multi-listener support)
   #listeners = {
-    canplay: [],
-    play: [],
-    pause: [],
-    stop: [],
-    ended: [],
-    timeUpdate: [],
-    error: [],
-    waiting: [],
-    seeking: [],
-    seeked: [],
+    canplay: createListenerGroup("InnerAudioContext canplay"),
+    play: createListenerGroup("InnerAudioContext play"),
+    pause: createListenerGroup("InnerAudioContext pause"),
+    stop: createListenerGroup("InnerAudioContext stop"),
+    ended: createListenerGroup("InnerAudioContext ended"),
+    timeUpdate: createListenerGroup("InnerAudioContext timeUpdate"),
+    error: createListenerGroup("InnerAudioContext error"),
+    waiting: createListenerGroup("InnerAudioContext waiting"),
+    seeking: createListenerGroup("InnerAudioContext seeking"),
+    seeked: createListenerGroup("InnerAudioContext seeked"),
   };
 
   // Loading state
@@ -167,17 +168,9 @@ class InnerAudioContext {
   }
 
   #fireListeners(type, arg) {
-    const list = this.#listeners[type];
-    if (!list || list.length === 0) return;
-    // Iterate over a snapshot to be safe against mid-iteration removal
-    const snapshot = list.slice();
-    for (const fn of snapshot) {
-      try {
-        fn(arg);
-      } catch (e) {
-        console.error("InnerAudioContext callback error:", e);
-      }
-    }
+    const group = this.#listeners[type];
+    if (!group) return;
+    group.trigger(arg);
   }
 
   // ==================== Properties ====================
@@ -332,7 +325,7 @@ class InnerAudioContext {
     this.#destroyed = true;
     // Clear all listeners
     for (const key in this.#listeners) {
-      this.#listeners[key].length = 0;
+      this.#listeners[key].off();
     }
     unregisterContext(this);
     op_inner_audio_destroy(this.#id);
@@ -341,43 +334,43 @@ class InnerAudioContext {
   // ==================== Event Listeners (multi-listener) ====================
 
   onCanplay(fn) {
-    if (typeof fn === "function") this.#listeners.canplay.push(fn);
+    this.#listeners.canplay.on(fn);
   }
 
   onPlay(fn) {
-    if (typeof fn === "function") this.#listeners.play.push(fn);
+    this.#listeners.play.on(fn);
   }
 
   onPause(fn) {
-    if (typeof fn === "function") this.#listeners.pause.push(fn);
+    this.#listeners.pause.on(fn);
   }
 
   onStop(fn) {
-    if (typeof fn === "function") this.#listeners.stop.push(fn);
+    this.#listeners.stop.on(fn);
   }
 
   onEnded(fn) {
-    if (typeof fn === "function") this.#listeners.ended.push(fn);
+    this.#listeners.ended.on(fn);
   }
 
   onTimeUpdate(fn) {
-    if (typeof fn === "function") this.#listeners.timeUpdate.push(fn);
+    this.#listeners.timeUpdate.on(fn);
   }
 
   onError(fn) {
-    if (typeof fn === "function") this.#listeners.error.push(fn);
+    this.#listeners.error.on(fn);
   }
 
   onWaiting(fn) {
-    if (typeof fn === "function") this.#listeners.waiting.push(fn);
+    this.#listeners.waiting.on(fn);
   }
 
   onSeeking(fn) {
-    if (typeof fn === "function") this.#listeners.seeking.push(fn);
+    this.#listeners.seeking.on(fn);
   }
 
   onSeeked(fn) {
-    if (typeof fn === "function") this.#listeners.seeked.push(fn);
+    this.#listeners.seeked.on(fn);
   }
 
   offCanplay(fn) {
@@ -422,15 +415,9 @@ class InnerAudioContext {
 
   /** Remove a specific listener, or all listeners if fn is omitted */
   #removeListener(type, fn) {
-    const list = this.#listeners[type];
-    if (!list) return;
-    if (!fn) {
-      // No argument: remove all listeners for this event type
-      list.length = 0;
-    } else {
-      const idx = list.indexOf(fn);
-      if (idx !== -1) list.splice(idx, 1);
-    }
+    const group = this.#listeners[type];
+    if (!group) return;
+    group.off(fn);
   }
 
   // ==================== Internal Methods ====================
