@@ -1,4 +1,4 @@
-use deno_core::{op2, v8, Extension, OpState};
+use deno_core::{op2, serde_json, v8, Extension, OpState};
 use shared::op_state::HostOpState;
 use tracing::debug;
 
@@ -155,9 +155,34 @@ struct RequireResult {
     dir: String,
 }
 
+/// Returns subpackage definitions as a JSON array, e.g. `[["name","root"],...]`.
+/// Returns "[]" if no subpackages are configured.
+#[op2]
+#[string]
+fn op_get_sub_packages(state: &mut OpState) -> String {
+    let host = state.borrow::<HostOpState>();
+    if host.sub_packages.is_empty() {
+        return "[]".to_string();
+    }
+    let arr: Vec<serde_json::Value> = host
+        .sub_packages
+        .iter()
+        .map(|(name, root)| serde_json::json!({"name": name, "root": root}))
+        .collect();
+    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Returns the workers directory path, or empty string if not configured.
+#[op2]
+#[string]
+fn op_get_workers_path(state: &mut OpState) -> String {
+    let host = state.borrow::<HostOpState>();
+    host.workers_path.clone().unwrap_or_default()
+}
+
 /// Trigger a subpackage download via the platform service.
 ///
-/// The JS layer resolves the subpackage name to a root path from game.json,
+/// The JS layer resolves the subpackage name to a root path from RuntimeConfig,
 /// then calls this op to initiate the download. The platform reports progress
 /// and completion asynchronously via EvalScript callbacks.
 #[op2(fast)]
@@ -184,6 +209,8 @@ deno_core::extension!(
         op_trigger_gc,
         op_get_heap_statistics,
         op_require_resolve_and_read,
+        op_get_sub_packages,
+        op_get_workers_path,
         op_download_subpackage,
     ],
     esm = [

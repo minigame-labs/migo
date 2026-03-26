@@ -4,19 +4,19 @@
 // Requires platform-level crypto key management to be functional.
 // getUserCryptoManager() returns a stub instance.
 
+import { wrapAsync } from "ext:host_v8_base/02_async.js";
+
 class UserCryptoManager {
     getLatestUserKey(options) {
-        var opts = options || {};
-        var res = { errMsg: 'getLatestUserKey:fail not supported' };
-        if (typeof opts.fail === 'function') queueMicrotask(function () { opts.fail(res); });
-        if (typeof opts.complete === 'function') queueMicrotask(function () { opts.complete(res); });
+        return wrapAsync('getLatestUserKey', function () {
+            throw new Error('not supported');
+        }, options);
     }
 
     getRandomValues(options) {
-        var opts = options || {};
-        var res = { errMsg: 'getRandomValues:fail not supported' };
-        if (typeof opts.fail === 'function') queueMicrotask(function () { opts.fail(res); });
-        if (typeof opts.complete === 'function') queueMicrotask(function () { opts.complete(res); });
+        return wrapAsync('getRandomValues', function () {
+            throw new Error('not supported');
+        }, options);
     }
 }
 

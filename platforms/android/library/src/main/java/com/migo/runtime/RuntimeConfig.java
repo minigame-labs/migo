@@ -2,6 +2,10 @@ package com.migo.runtime;
 
 import android.content.Context;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
 /**
  * Configuration for initializing the Migo Runtime.
  * <p>
@@ -74,6 +78,12 @@ public final class RuntimeConfig {
     private final boolean codeSigningEnabled;
     private final String codeSigningPubkey;
 
+    // Game config
+    private final List<String[]> subPackages;
+    private final String workersPath;
+    // Internal: serialized subPackages for JNI field access
+    private final String subPackagesJson;
+
     private RuntimeConfig(Builder builder) {
         this.cacheDir = builder.cacheDir;
         this.filesDir = builder.filesDir;
@@ -88,6 +98,9 @@ public final class RuntimeConfig {
         this.watchdogTimeoutSecs = builder.watchdogTimeoutSecs;
         this.codeSigningEnabled = builder.codeSigningEnabled;
         this.codeSigningPubkey = builder.codeSigningPubkey;
+        this.subPackages = Collections.unmodifiableList(new ArrayList<>(builder.subPackages));
+        this.workersPath = builder.workersPath;
+        this.subPackagesJson = buildSubPackagesJson(this.subPackages);
     }
 
     // ==================== Getters ====================
@@ -135,6 +148,17 @@ public final class RuntimeConfig {
     /** Get hex Ed25519 public key used by code signing verification (nullable) */
     public String getCodeSigningPubkey() { return codeSigningPubkey; }
 
+    /**
+     * Get the subpackage definitions.
+     * Each entry is a {@code String[2]} of {@code {name, root}}.
+     *
+     * @return Unmodifiable list of subpackage definitions (may be empty)
+     */
+    public List<String[]> getSubPackages() { return subPackages; }
+
+    /** Get the workers directory path (nullable). */
+    public String getWorkersPath() { return workersPath; }
+
     // ==================== JNI field access ====================
 
     /** @hide */
@@ -153,6 +177,29 @@ public final class RuntimeConfig {
                 ", watchdogTimeoutSecs=" + watchdogTimeoutSecs +
                 ", codeSigningEnabled=" + codeSigningEnabled +
                 '}';
+    }
+
+    /**
+     * Serialize subpackages to JSON for JNI transfer.
+     * Returns null if the list is empty.
+     */
+    private static String buildSubPackagesJson(List<String[]> list) {
+        if (list == null || list.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < list.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append("{\"name\":\"");
+            sb.append(escapeJsonString(list.get(i)[0]));
+            sb.append("\",\"root\":\"");
+            sb.append(escapeJsonString(list.get(i)[1]));
+            sb.append("\"}");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static String escapeJsonString(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     // ==================== Builder ====================
@@ -183,6 +230,10 @@ public final class RuntimeConfig {
         private int watchdogTimeoutSecs = 10;
         private boolean codeSigningEnabled = true;
         private String codeSigningPubkey = null;
+
+        // Game config
+        private final List<String[]> subPackages = new ArrayList<>();
+        private String workersPath = null;
 
         /**
          * Create a new builder with required context.
@@ -351,6 +402,42 @@ public final class RuntimeConfig {
                 String trimmed = pubkeyHex.trim();
                 this.codeSigningPubkey = trimmed.isEmpty() ? null : trimmed;
             }
+            return this;
+        }
+
+        /**
+         * Add a subpackage definition.
+         * <p>
+         * Example:
+         * <pre>{@code
+         * builder.addSubPackage("stage1", "subpackages/stage1")
+         *        .addSubPackage("stage2", "subpackages/stage2");
+         * }</pre>
+         *
+         * @param name Subpackage name (e.g., "stage1")
+         * @param root Root directory relative to code directory (e.g., "subpackages/stage1")
+         * @return this builder
+         * @throws IllegalArgumentException if name or root is null or empty
+         */
+        public Builder addSubPackage(String name, String root) {
+            if (name == null || name.trim().isEmpty()) {
+                throw new IllegalArgumentException("subpackage name cannot be null or empty");
+            }
+            if (root == null || root.trim().isEmpty()) {
+                throw new IllegalArgumentException("subpackage root cannot be null or empty");
+            }
+            this.subPackages.add(new String[]{name.trim(), root.trim()});
+            return this;
+        }
+
+        /**
+         * Set the workers directory path.
+         *
+         * @param path Workers directory path relative to code directory, or null
+         * @return this builder
+         */
+        public Builder setWorkersPath(String path) {
+            this.workersPath = path;
             return this;
         }
 

@@ -80,6 +80,10 @@ pub struct HostOpState {
     pub device_services: Option<Arc<dyn DeviceServices>>,
     /// RAF frame signal receiver (set by Host::new, consumed by op_await_next_frame).
     pub raf_rx: Option<RafRx>,
+    /// Subpackage definitions: (name, root) pairs from RuntimeConfig.
+    pub sub_packages: Vec<(String, String)>,
+    /// Workers directory path from RuntimeConfig.
+    pub workers_path: Option<String>,
     /// Network security policy (domain whitelist, HTTPS enforcement).
     pub network_policy: NetworkPolicy,
     /// When `true`, the app is in the background (OnHide received).

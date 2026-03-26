@@ -28,7 +28,7 @@
     public *;
 }
 
--keep public class com.migo.runtime.MigoRuntime$BuildInfo {
+-keep public class com.migo.runtime.BuildInfo {
     public *;
 }
 

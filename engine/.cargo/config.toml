@@ -38,6 +38,16 @@ rustflags = [
 
   # Disable unwind tables (not needed with panic=abort)
   "-C", "force-unwind-tables=no",
+
+  # Only link truly needed shared libraries
+  "-C", "link-arg=-Wl,--as-needed",
+
+  # Read-only relocations (security hardening)
+  "-C", "link-arg=-Wl,-z,relro",
+  "-C", "link-arg=-Wl,-z,now",
+
+  # Version script: only export JNI symbols, hide everything else
+  "-C", "link-arg=-Wl,--version-script=version.script",
 ]
 
 # -----------------------------------------------------------------------------
@@ -57,6 +67,16 @@ rustflags = [
   "-C", "embed-bitcode=no",
   "-C", "force-frame-pointers=no",
   "-C", "force-unwind-tables=no",
+
+  # Only link truly needed shared libraries
+  "-C", "link-arg=-Wl,--as-needed",
+
+  # Read-only relocations (security hardening)
+  "-C", "link-arg=-Wl,-z,relro",
+  "-C", "link-arg=-Wl,-z,now",
+
+  # Version script: only export JNI symbols, hide everything else
+  "-C", "link-arg=-Wl,--version-script=version.script",
 ]
 
 # -----------------------------------------------------------------------------
@@ -76,6 +96,16 @@ rustflags = [
   "-C", "embed-bitcode=no",
   "-C", "force-frame-pointers=no",
   "-C", "force-unwind-tables=no",
+
+  # Only link truly needed shared libraries
+  "-C", "link-arg=-Wl,--as-needed",
+
+  # Read-only relocations (security hardening)
+  "-C", "link-arg=-Wl,-z,relro",
+  "-C", "link-arg=-Wl,-z,now",
+
+  # Version script: only export JNI symbols, hide everything else
+  "-C", "link-arg=-Wl,--version-script=version.script",
 ]
 
 # -----------------------------------------------------------------------------

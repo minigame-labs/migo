@@ -216,6 +216,8 @@ async fn op_worker_create(
             host_tx: host.host_tx.clone(),
             device_services: None,
             raf_rx: None,
+            sub_packages: host.sub_packages.clone(),
+            workers_path: host.workers_path.clone(),
             network_policy: host.network_policy.clone(),
             backgrounded: host.backgrounded.clone(),
         };

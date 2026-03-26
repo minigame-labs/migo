@@ -8,6 +8,7 @@ use crate::rendering::image::cache::IMAGE_CACHE;
 
 use shared::{
     error::EngineError,
+    js_escape::escape_for_json_string,
     op_state::CanvasOpState,
     protocol::{
         render_cmd::{GLCmd, RenderCmdResp, RenderCommand, ShaderType},
@@ -104,22 +105,6 @@ fn load_cached_image_rgba(image_id: u32) -> Option<(i32, i32, Vec<u8>)> {
         cached.image.height as i32,
         cached.image.rgba.as_ref().clone(),
     ))
-}
-
-#[inline]
-fn escape_json_string(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() + 8);
-    for ch in input.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out
 }
 
 #[op2(fast)]
@@ -387,7 +372,7 @@ pub fn op_get_active_attrib(
     .flatten();
 
     if let Some((name, size, type_)) = info {
-        let escaped_name = escape_json_string(&name);
+        let escaped_name = escape_for_json_string(&name);
         return format!(
             "{{\"name\":\"{}\",\"size\":{},\"type\":{}}}",
             escaped_name, size, type_
@@ -417,7 +402,7 @@ pub fn op_get_active_uniform(
     .flatten();
 
     if let Some((name, size, type_)) = info {
-        let escaped_name = escape_json_string(&name);
+        let escaped_name = escape_for_json_string(&name);
         return format!(
             "{{\"name\":\"{}\",\"size\":{},\"type\":{}}}",
             escaped_name, size, type_

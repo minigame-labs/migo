@@ -19,12 +19,12 @@ function _warnOnce() {
 
 function reportEvent(eventId, data) {
     _warnOnce();
-    // no-op stub per spec - returns undefined
+    return wrapAsync('reportEvent', function () {}, {});
 }
 
 function reportMonitor(name, value) {
     _warnOnce();
-    // no-op stub per spec - returns undefined
+    return wrapAsync('reportMonitor', function () {}, {});
 }
 
 function reportScene(sceneId, options) {
@@ -34,7 +34,7 @@ function reportScene(sceneId, options) {
 
 function reportPerformance(id, value, dimensions) {
     _warnOnce();
-    // no-op stub - returns undefined
+    return wrapAsync('reportPerformance', function () {}, {});
 }
 
 export { reportEvent, reportMonitor, reportScene, reportPerformance };

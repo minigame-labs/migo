@@ -406,39 +406,6 @@ function _internalTriggerVideoEvent(videoId, eventType, dataJson) {
     }
 }
 
-function _emitSnapshot(listeners, payload) {
-    if (!listeners) return;
-    if (typeof listeners.trigger === 'function') {
-        listeners.trigger(payload);
-        return;
-    }
-    if (listeners.length === 0) return;
-    var snapshot = listeners.slice();
-    for (var i = 0; i < snapshot.length; i++) {
-        try {
-            snapshot[i](payload);
-        } catch (e) {
-            console.error('Live callback error:', e);
-        }
-    }
-}
-
-function _finishWithCallbacks(apiName, options, successPayload) {
-    var payload = successPayload || {};
-    payload.errMsg = apiName + ':ok';
-    if (options && typeof options.success === 'function') {
-        try { options.success(payload); } catch (e) {
-            console.error(apiName + ' success callback error:', e);
-        }
-    }
-    if (options && typeof options.complete === 'function') {
-        try { options.complete(payload); } catch (e) {
-            console.error(apiName + ' complete callback error:', e);
-        }
-    }
-    return Promise.resolve(payload);
-}
-
 class LivePlayerContext {
     #destroyed = false;
     #playing = false;
@@ -472,27 +439,30 @@ class LivePlayerContext {
     }
 
     play(options) {
-        if (this.#destroyed) return Promise.reject(new Error('livePlayer.play:fail destroyed'));
-        this.#playing = true;
-        this.#startVolumeTicker();
-        _emitSnapshot(this.#listeners.statechange, { code: 2004, message: 'play' });
-        return _finishWithCallbacks('livePlayer.play', options, {});
+        return wrapAsync('livePlayer.play', () => {
+            if (this.#destroyed) throw new Error('destroyed');
+            this.#playing = true;
+            this.#startVolumeTicker();
+            this.#listeners.statechange.trigger({ code: 2004, message: 'play' });
+        }, options);
     }
 
     stop(options) {
-        if (this.#destroyed) return Promise.reject(new Error('livePlayer.stop:fail destroyed'));
-        this.#playing = false;
-        this.#stopVolumeTicker();
-        _emitSnapshot(this.#listeners.statechange, { code: 2006, message: 'stop' });
-        return _finishWithCallbacks('livePlayer.stop', options, {});
+        return wrapAsync('livePlayer.stop', () => {
+            if (this.#destroyed) throw new Error('destroyed');
+            this.#playing = false;
+            this.#stopVolumeTicker();
+            this.#listeners.statechange.trigger({ code: 2006, message: 'stop' });
+        }, options);
     }
 
     pause(options) {
-        if (this.#destroyed) return Promise.reject(new Error('livePlayer.pause:fail destroyed'));
-        this.#playing = false;
-        this.#stopVolumeTicker();
-        _emitSnapshot(this.#listeners.statechange, { code: 2007, message: 'pause' });
-        return _finishWithCallbacks('livePlayer.pause', options, {});
+        return wrapAsync('livePlayer.pause', () => {
+            if (this.#destroyed) throw new Error('destroyed');
+            this.#playing = false;
+            this.#stopVolumeTicker();
+            this.#listeners.statechange.trigger({ code: 2007, message: 'pause' });
+        }, options);
     }
 
     resume(options) {
@@ -500,10 +470,11 @@ class LivePlayerContext {
     }
 
     mute(options) {
-        if (this.#destroyed) return Promise.reject(new Error('livePlayer.mute:fail destroyed'));
-        this.#muted = !this.#muted;
-        _emitSnapshot(this.#listeners.audiovolume, { volume: this.#muted ? 0 : 100 });
-        return _finishWithCallbacks('livePlayer.mute', options, {});
+        return wrapAsync('livePlayer.mute', () => {
+            if (this.#destroyed) throw new Error('destroyed');
+            this.#muted = !this.#muted;
+            this.#listeners.audiovolume.trigger({ volume: this.#muted ? 0 : 100 });
+        }, options);
     }
 
     destroy() {
@@ -519,7 +490,7 @@ class LivePlayerContext {
         this.#stopVolumeTicker();
         this.#volumeTimer = setInterval(() => {
             if (!this.#playing || this.#destroyed) return;
-            _emitSnapshot(this.#listeners.audiovolume, { volume: this.#muted ? 0 : 100 });
+            this.#listeners.audiovolume.trigger({ volume: this.#muted ? 0 : 100 });
         }, 300);
     }
 
@@ -576,35 +547,39 @@ class LivePusherContext {
     }
 
     start(options) {
-        if (this.#destroyed) return Promise.reject(new Error('livePusher.start:fail destroyed'));
-        this.#started = true;
-        _emitSnapshot(this.#listeners.statechange, { code: 1001, message: 'start' });
-        return _finishWithCallbacks('livePusher.start', options, {});
+        return wrapAsync('livePusher.start', () => {
+            if (this.#destroyed) throw new Error('destroyed');
+            this.#started = true;
+            this.#listeners.statechange.trigger({ code: 1001, message: 'start' });
+        }, options);
     }
 
     stop(options) {
-        if (this.#destroyed) return Promise.reject(new Error('livePusher.stop:fail destroyed'));
-        this.#started = false;
-        _emitSnapshot(this.#listeners.statechange, { code: 1006, message: 'stop' });
-        return _finishWithCallbacks('livePusher.stop', options, {});
+        return wrapAsync('livePusher.stop', () => {
+            if (this.#destroyed) throw new Error('destroyed');
+            this.#started = false;
+            this.#listeners.statechange.trigger({ code: 1006, message: 'stop' });
+        }, options);
     }
 
     pause(options) {
-        if (this.#destroyed) return Promise.reject(new Error('livePusher.pause:fail destroyed'));
-        _emitSnapshot(this.#listeners.statechange, { code: 1007, message: 'pause' });
-        return _finishWithCallbacks('livePusher.pause', options, {});
+        return wrapAsync('livePusher.pause', () => {
+            if (this.#destroyed) throw new Error('destroyed');
+            this.#listeners.statechange.trigger({ code: 1007, message: 'pause' });
+        }, options);
     }
 
     resume(options) {
-        if (this.#destroyed) return Promise.reject(new Error('livePusher.resume:fail destroyed'));
-        _emitSnapshot(this.#listeners.statechange, { code: 1008, message: 'resume' });
-        return _finishWithCallbacks('livePusher.resume', options, {});
+        return wrapAsync('livePusher.resume', () => {
+            if (this.#destroyed) throw new Error('destroyed');
+            this.#listeners.statechange.trigger({ code: 1008, message: 'resume' });
+        }, options);
     }
 
     playBGM(url) {
         if (this.#destroyed) return;
         this.#bgmProgress = 0;
-        _emitSnapshot(this.#listeners.bgmstart, { url: typeof url === 'string' ? url : '' });
+        this.#listeners.bgmstart.trigger({ url: typeof url === 'string' ? url : '' });
         this.#startBgmTicker();
     }
 
@@ -621,7 +596,7 @@ class LivePusherContext {
     stopBGM() {
         if (this.#destroyed) return;
         this.#stopBgmTicker();
-        _emitSnapshot(this.#listeners.bgmcomplete, { reason: 'stop' });
+        this.#listeners.bgmcomplete.trigger({ reason: 'stop' });
     }
 
     setBGMVolume(_volume) {}
@@ -646,10 +621,10 @@ class LivePusherContext {
         this.#bgmTimer = setInterval(() => {
             if (this.#destroyed) return;
             this.#bgmProgress += 1000;
-            _emitSnapshot(this.#listeners.bgmprogress, { progress: this.#bgmProgress });
+            this.#listeners.bgmprogress.trigger({ progress: this.#bgmProgress });
             if (this.#bgmProgress >= 3000) {
                 this.#stopBgmTicker();
-                _emitSnapshot(this.#listeners.bgmcomplete, { reason: 'complete' });
+                this.#listeners.bgmcomplete.trigger({ reason: 'complete' });
             }
         }, 500);
     }

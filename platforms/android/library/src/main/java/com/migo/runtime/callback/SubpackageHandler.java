@@ -34,7 +34,7 @@ public interface SubpackageHandler {
 
     /** Describes which subpackage to download. */
     final class SubpackageRequest {
-        /** Subpackage name as defined in game.json. */
+        /** Subpackage name as provided via RuntimeConfig. */
         public final String name;
         /** Normalized root path relative to code dir (e.g. "subpackages/stage1"). */
         public final String root;

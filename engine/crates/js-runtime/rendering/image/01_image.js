@@ -7,20 +7,9 @@ import {
     op_clear_image_cache,
     op_get_image_cache_stats
 } from "ext:core/ops";
-import { createCallbackEvent, createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { createCallbackEvent, createListenerGroup, errorToString } from "ext:host_v8_base/02_async.js";
 
 const { SafeFinalizationRegistry } = primordials;
-
-function _errorText(err) {
-    if (err == null) return String(err);
-    const t = typeof err;
-    if (t === "string" || t === "number" || t === "boolean") return String(err);
-    const name = typeof err.name === "string" ? err.name : "Error";
-    const message = typeof err.message === "string" ? err.message : "";
-    const stack = typeof err.stack === "string" ? err.stack : "";
-    const base = message ? `${name}: ${message}` : name;
-    return stack ? `${base}\n${stack}` : base;
-}
 
 const registry = new SafeFinalizationRegistry((rid) => {
     try {
@@ -160,7 +149,7 @@ class Image {
                         this._onload.call(this, ev);
                     } catch (e) {
                         try {
-                            console.error(`Image onload error: ${_errorText(e)}`);
+                            console.error(`Image onload error: ${errorToString(e)}`);
                         } catch (_) {}
                     }
                 }
@@ -180,7 +169,7 @@ class Image {
                         this._onerror.call(this, ev);
                     } catch (e) {
                         try {
-                            console.error(`Image onerror error: ${_errorText(e)}`);
+                            console.error(`Image onerror error: ${errorToString(e)}`);
                         } catch (_) {}
                     }
                 }

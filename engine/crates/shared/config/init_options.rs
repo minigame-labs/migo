@@ -117,6 +117,12 @@ pub struct InitOptions {
     /// Ed25519 public key for code signing verification (hex-encoded, 64 chars).
     /// Used only when `code_signing_enabled` is true.
     code_signing_pubkey: Option<String>,
+    /// Subpackage definitions: list of (name, root) pairs.
+    /// Provided by the host app via RuntimeConfig.
+    sub_packages: Vec<(String, String)>,
+    /// Workers directory path relative to code directory.
+    /// Provided by the host app via RuntimeConfig.
+    workers_path: Option<String>,
     /// Platform-specific or experimental options.
     extras: Extras,
 }
@@ -137,6 +143,8 @@ impl Default for InitOptions {
             watchdog_timeout_secs: 10,
             code_signing_enabled: true,
             code_signing_pubkey: None,
+            sub_packages: Vec::new(),
+            workers_path: None,
             extras: Extras::new(),
         }
     }
@@ -247,6 +255,18 @@ impl InitOptions {
     #[inline]
     pub fn code_signing_pubkey(&self) -> Option<&str> {
         self.code_signing_pubkey.as_deref()
+    }
+
+    /// Returns the subpackage definitions as (name, root) pairs.
+    #[inline]
+    pub fn sub_packages(&self) -> &[(String, String)] {
+        &self.sub_packages
+    }
+
+    /// Returns the injected workers path, if any.
+    #[inline]
+    pub fn workers_path(&self) -> Option<&str> {
+        self.workers_path.as_deref()
     }
 
     /// Returns a reference to the extras map.
@@ -416,6 +436,20 @@ impl InitOptions {
     #[must_use]
     pub fn with_code_signing_pubkey(mut self, pubkey: Option<String>) -> Self {
         self.code_signing_pubkey = pubkey;
+        self
+    }
+
+    /// Sets the subpackage definitions (builder pattern).
+    #[must_use]
+    pub fn with_sub_packages(mut self, packages: Vec<(String, String)>) -> Self {
+        self.sub_packages = packages;
+        self
+    }
+
+    /// Sets the workers path (builder pattern).
+    #[must_use]
+    pub fn with_workers_path(mut self, path: Option<String>) -> Self {
+        self.workers_path = path;
         self
     }
 

@@ -276,4 +276,16 @@ function createCallbackEvent(type, target, detail) {
     return ev;
 }
 
-export { wrapAsync, promisify, createDeferredApi, createListenerGroup, createCallbackEvent };
+// Format an error value into a human-readable string (safe for any thrown value).
+function errorToString(err) {
+    if (err == null) return String(err);
+    var t = typeof err;
+    if (t === 'string' || t === 'number' || t === 'boolean') return String(err);
+    var name = typeof err.name === 'string' ? err.name : 'Error';
+    var message = typeof err.message === 'string' ? err.message : '';
+    var stack = typeof err.stack === 'string' ? err.stack : '';
+    var base = message ? name + ': ' + message : name;
+    return stack ? base + '\n' + stack : base;
+}
+
+export { wrapAsync, promisify, createDeferredApi, createListenerGroup, createCallbackEvent, errorToString };

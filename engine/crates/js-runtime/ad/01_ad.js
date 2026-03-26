@@ -128,7 +128,7 @@ class BannerAd extends AdBase {
 
   show() {
     if (this._isDestroyed()) {
-      return Promise.reject(new Error("BannerAd already destroyed"));
+      return Promise.reject({ errMsg: "createBannerAd:fail already destroyed" });
     }
     this.#visible = true;
     this._fire("resize", {
@@ -193,7 +193,7 @@ class CustomAd extends AdBase {
 
   show() {
     if (this._isDestroyed()) {
-      return Promise.reject(new Error("CustomAd already destroyed"));
+      return Promise.reject({ errMsg: "createCustomAd:fail already destroyed" });
     }
     this.#visible = true;
     if (this.#adIntervals && this.#adIntervals >= 30 && !this.#refreshTimer) {
@@ -208,7 +208,7 @@ class CustomAd extends AdBase {
 
   hide() {
     if (this._isDestroyed()) {
-      return Promise.reject(new Error("CustomAd already destroyed"));
+      return Promise.reject({ errMsg: "createCustomAd:fail already destroyed" });
     }
     if (this.#visible) {
       this.#visible = false;
@@ -286,7 +286,7 @@ class GridAd extends AdBase {
 
   show() {
     if (this._isDestroyed()) {
-      return Promise.reject(new Error("GridAd already destroyed"));
+      return Promise.reject({ errMsg: "createGridAd:fail already destroyed" });
     }
     this.#visible = true;
     this._fire("resize", {
@@ -338,7 +338,7 @@ class InterstitialAd extends AdBase {
 
   load() {
     if (this._isDestroyed()) {
-      return Promise.reject(new Error("InterstitialAd already destroyed"));
+      return Promise.reject({ errMsg: "createInterstitialAd:fail already destroyed" });
     }
     return new Promise((resolve) => {
       setTimeout(() => {
@@ -353,7 +353,7 @@ class InterstitialAd extends AdBase {
 
   show() {
     if (this._isDestroyed()) {
-      return Promise.reject(new Error("InterstitialAd already destroyed"));
+      return Promise.reject({ errMsg: "createInterstitialAd:fail already destroyed" });
     }
     this.#loaded = false;
     // Mock: auto-close after a short delay
@@ -393,7 +393,7 @@ class RewardedVideoAd extends AdBase {
 
   load() {
     if (this._isDestroyed()) {
-      return Promise.reject(new Error("RewardedVideoAd already destroyed"));
+      return Promise.reject({ errMsg: "createRewardedVideoAd:fail already destroyed" });
     }
     return new Promise((resolve) => {
       setTimeout(() => {
@@ -408,7 +408,7 @@ class RewardedVideoAd extends AdBase {
 
   show() {
     if (this._isDestroyed()) {
-      return Promise.reject(new Error("RewardedVideoAd already destroyed"));
+      return Promise.reject({ errMsg: "createRewardedVideoAd:fail already destroyed" });
     }
     this.#loaded = false;
     // Mock: simulate video watched to completion, then fire close
@@ -437,44 +437,44 @@ class RewardedVideoAd extends AdBase {
 
 function createBannerAd(obj) {
   if (!obj || !obj.adUnitId) {
-    throw new Error("createBannerAd:fail missing adUnitId");
+    throw { errMsg: "createBannerAd:fail missing adUnitId" };
   }
   if (!obj.style) {
-    throw new Error("createBannerAd:fail missing style");
+    throw { errMsg: "createBannerAd:fail missing style" };
   }
   return new BannerAd(obj);
 }
 
 function createCustomAd(obj) {
   if (!obj || !obj.adUnitId) {
-    throw new Error("createCustomAd:fail missing adUnitId");
+    throw { errMsg: "createCustomAd:fail missing adUnitId" };
   }
   if (!obj.style) {
-    throw new Error("createCustomAd:fail missing style");
+    throw { errMsg: "createCustomAd:fail missing style" };
   }
   return new CustomAd(obj);
 }
 
 function createGridAd(obj) {
   if (!obj || !obj.adUnitId) {
-    throw new Error("createGridAd:fail missing adUnitId");
+    throw { errMsg: "createGridAd:fail missing adUnitId" };
   }
   if (!obj.style) {
-    throw new Error("createGridAd:fail missing style");
+    throw { errMsg: "createGridAd:fail missing style" };
   }
   return new GridAd(obj);
 }
 
 function createInterstitialAd(obj) {
   if (!obj || !obj.adUnitId) {
-    throw new Error("createInterstitialAd:fail missing adUnitId");
+    throw { errMsg: "createInterstitialAd:fail missing adUnitId" };
   }
   return new InterstitialAd(obj);
 }
 
 function createRewardedVideoAd(obj) {
   if (!obj || !obj.adUnitId) {
-    throw new Error("createRewardedVideoAd:fail missing adUnitId");
+    throw { errMsg: "createRewardedVideoAd:fail missing adUnitId" };
   }
   // Singleton by adUnitId unless multiton is enabled
   if (!obj.multiton) {
@@ -549,7 +549,7 @@ class GameBanner extends AdBase {
   get style() { return this.#style; }
 
   show() {
-    if (this._isDestroyed()) return Promise.reject(new Error("GameBanner already destroyed"));
+    if (this._isDestroyed()) return Promise.reject({ errMsg: "createGameBanner:fail already destroyed" });
     this.#visible = true;
     this._fire("resize", { width: this.#style.realWidth, height: this.#style.realHeight });
     return Promise.resolve();
@@ -572,7 +572,7 @@ class GameBanner extends AdBase {
 
 function createGameBanner(obj) {
   if (!obj || !obj.adUnitId) {
-    throw new Error("createGameBanner:fail missing adUnitId");
+    throw { errMsg: "createGameBanner:fail missing adUnitId" };
   }
   return new GameBanner(obj);
 }
@@ -603,7 +603,7 @@ class GameIcon extends AdBase {
   get count() { return this.#count; }
 
   show() {
-    if (this._isDestroyed()) return Promise.reject(new Error("GameIcon already destroyed"));
+    if (this._isDestroyed()) return Promise.reject({ errMsg: "createGameIcon:fail already destroyed" });
     this.#visible = true;
     this._fire("resize", { width: this.#style.width, height: this.#style.height });
     return Promise.resolve();
@@ -626,7 +626,7 @@ class GameIcon extends AdBase {
 
 function createGameIcon(obj) {
   if (!obj || !obj.adUnitId) {
-    throw new Error("createGameIcon:fail missing adUnitId");
+    throw { errMsg: "createGameIcon:fail missing adUnitId" };
   }
   return new GameIcon(obj);
 }
@@ -644,7 +644,7 @@ class GamePortal extends AdBase {
   }
 
   load() {
-    if (this._isDestroyed()) return Promise.reject(new Error("GamePortal already destroyed"));
+    if (this._isDestroyed()) return Promise.reject({ errMsg: "createGamePortal:fail already destroyed" });
     return new Promise((resolve) => {
       setTimeout(() => {
         if (!this._isDestroyed()) {
@@ -656,7 +656,7 @@ class GamePortal extends AdBase {
   }
 
   show() {
-    if (this._isDestroyed()) return Promise.reject(new Error("GamePortal already destroyed"));
+    if (this._isDestroyed()) return Promise.reject({ errMsg: "createGamePortal:fail already destroyed" });
     setTimeout(() => {
       if (!this._isDestroyed()) {
         this._fire("close");
@@ -677,7 +677,7 @@ class GamePortal extends AdBase {
 
 function createGamePortal(obj) {
   if (!obj || !obj.adUnitId) {
-    throw new Error("createGamePortal:fail missing adUnitId");
+    throw { errMsg: "createGamePortal:fail missing adUnitId" };
   }
   return new GamePortal(obj);
 }

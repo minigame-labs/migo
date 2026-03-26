@@ -201,7 +201,7 @@ class Camera {
         this.#fireListeners("authCancel");
         break;
       case "error": {
-        let errObj = { errMsg: "Unknown error" };
+        let errObj = { errMsg: "camera.error:fail unknown error" };
         try {
           errObj = JSON.parse(jsonPayload);
         } catch (_) {}

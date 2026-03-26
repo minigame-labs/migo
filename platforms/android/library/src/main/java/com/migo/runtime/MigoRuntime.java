@@ -353,20 +353,6 @@ public final class MigoRuntime {
     // ==================== Inner Classes ====================
 
     /**
-     * Build information constants.
-     */
-    public static final class BuildInfo {
-        /** SDK version string */
-        public static final String VERSION = "1.0.0";
-        /** Build timestamp */
-        public static final String BUILD_TIME = "2024-01-01T00:00:00Z";
-        /** Git commit hash */
-        public static final String COMMIT = "unknown";
-
-        private BuildInfo() {}
-    }
-
-    /**
      * Result wrapper for non-throwing operations.
      *
      * @param <T> The success value type

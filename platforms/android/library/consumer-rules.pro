@@ -82,7 +82,7 @@
 
 # Keep public API classes (apps may use reflection)
 -keep public class com.migo.runtime.MigoRuntime { public *; }
--keep public class com.migo.runtime.MigoRuntime$BuildInfo { public *; }
+-keep public class com.migo.runtime.BuildInfo { public *; }
 -keep public class com.migo.runtime.MigoRuntime$Result { public *; }
 -keep public class com.migo.runtime.GameSession { public *; }
 -keep public class com.migo.runtime.ErrorCode { public *; }

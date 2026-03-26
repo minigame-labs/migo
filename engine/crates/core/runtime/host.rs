@@ -201,6 +201,8 @@ impl Host {
             host_tx: host_tx.clone(),
             device_services,
             raf_rx: Some(raf_rx.clone()),
+            sub_packages: init_options.sub_packages().to_vec(),
+            workers_path: init_options.workers_path().map(|s| s.to_string()),
             network_policy: network_policy.clone(),
             backgrounded: backgrounded.clone(),
         };
@@ -686,6 +688,8 @@ impl Host {
             host_tx: self.host_tx.clone(),
             device_services,
             raf_rx: Some(self.raf_rx.clone()),
+            sub_packages: self.init_options.sub_packages().to_vec(),
+            workers_path: self.init_options.workers_path().map(|s| s.to_string()),
             network_policy: self.network_policy.clone(),
             backgrounded: self.backgrounded.clone(),
         };

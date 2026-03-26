@@ -1,10 +1,10 @@
-import { op_download_subpackage } from "ext:core/ops";
+import { op_download_subpackage, op_get_sub_packages, op_get_workers_path } from "ext:core/ops";
 import { require as amdRequire } from "ext:host_v8_base/01_amdshim.js";
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 const noop = () => {};
 
-// ---- game.json config cache ----
+// ---- RuntimeConfig subpackage cache ----
 
 const _subpackageByName = new Map();
 const _subpackageByRoot = new Map();
@@ -45,46 +45,43 @@ function _isNotFoundError(err) {
         || text.includes("no such file");
 }
 
-function _loadGameConfig() {
+function _loadRuntimeConfig() {
     if (_configLoaded) return;
     _configLoaded = true;
 
-    let cfg;
-    try { cfg = amdRequire("game.json"); } catch (_) { return; }
+    // Load subpackages from RuntimeConfig
+    try {
+        const json = op_get_sub_packages();
+        if (json && json !== '[]') {
+            const list = JSON.parse(json);
+            for (let i = 0; i < list.length; i++) {
+                const item = list[i];
+                if (!item || typeof item !== "object") continue;
+                const root = _normalizeRoot(item.root || "");
+                if (!root) continue;
+                const name = typeof item.name === "string" && item.name.trim().length > 0
+                    ? item.name.trim()
+                    : _deriveNameFromRoot(root);
+                if (!name) continue;
+                const record = { name, root };
+                _subpackageByName.set(name, record);
+                _subpackageByRoot.set(root, record);
+            }
+        }
+    } catch (_) {}
 
-    const subPackages = Array.isArray(cfg?.subPackages)
-        ? cfg.subPackages
-        : (Array.isArray(cfg?.subpackages) ? cfg.subpackages : []);
-
-    for (const item of subPackages) {
-        if (!item || typeof item !== "object") continue;
-
-        const root = _normalizeRoot(item.root || item.name || "");
-        if (!root) continue;
-
-        const name = typeof item.name === "string" && item.name.trim().length > 0
-            ? item.name.trim()
-            : _deriveNameFromRoot(root);
-        if (!name) continue;
-
-        const record = { name, root };
-        _subpackageByName.set(name, record);
-        _subpackageByRoot.set(root, record);
-    }
-
-    // Parse workers config
-    const workers = cfg && cfg.workers;
-    if (typeof workers === "string") {
-        const r = _normalizeRoot(workers);
-        if (r) _workersRoot = r;
-    } else if (workers && typeof workers === "object" && typeof workers.path === "string") {
-        const r = _normalizeRoot(workers.path);
-        if (r) _workersRoot = r;
-    }
+    // Load workers path from RuntimeConfig
+    try {
+        const path = op_get_workers_path();
+        if (path) {
+            const r = _normalizeRoot(path);
+            if (r) _workersRoot = r;
+        }
+    } catch (_) {}
 }
 
 function _resolveSubpackage(options) {
-    _loadGameConfig();
+    _loadRuntimeConfig();
 
     const rawName = typeof options.name === "string"
         ? options.name
@@ -104,12 +101,7 @@ function _resolveSubpackage(options) {
     const byRoot = _subpackageByRoot.get(normalized);
     if (byRoot) return { ...byRoot, fromConfig: true };
 
-    // Fallback: not in config, derive root from name
-    const root = normalized.startsWith("subpackages/")
-        ? normalized
-        : `subpackages/${normalized}`;
-    const name = _deriveNameFromRoot(root) || requested;
-    return { name, root, fromConfig: false };
+    throw new Error(`subpackage not configured: ${requested}`);
 }
 
 // ---- entry point execution ----
@@ -349,7 +341,7 @@ function preDownloadSubpackage(options = {}) {
         : "normal";
 
     if (packageType === "workers") {
-        _loadGameConfig();
+        _loadRuntimeConfig();
         if (!_workersRoot) {
             const task = new SubpackageTask();
             const fail = typeof options.fail === "function" ? options.fail : noop;
@@ -392,7 +384,7 @@ function preDownloadSubpackage(options = {}) {
         return task;
     }
 
-    // preDownloadSubpackage only allows subpackages defined in game.json
+    // preDownloadSubpackage only allows subpackages defined in RuntimeConfig
     if (!pkg.fromConfig) {
         const task = new SubpackageTask();
         const fail = typeof options.fail === "function" ? options.fail : noop;

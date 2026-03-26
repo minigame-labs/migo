@@ -44,10 +44,6 @@ impl RenderService {
     /// Update onscreen surface and request backend recreate.
     pub(crate) fn update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
         let surface_size = surface.size();
-        info!(
-            "RenderService::update_surface begin: requested={}x{}",
-            surface_size.0, surface_size.1
-        );
         self.surface = surface.clone();
 
         let (tx, rx) = bounded::<Result<(), EngineError>>(1);
