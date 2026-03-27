@@ -17,18 +17,11 @@ fn to_native_uniform_location(location: Option<u32>) -> Option<NativeUniformLoca
     location.map(NativeUniformLocation)
 }
 
+/// Identity after logical/physical coordinate unification.
+/// Kept as a wrapper so the Scissor call site reads clearly.
 #[inline]
-fn logical_to_physical_i32(cm: &CanvasManager, v: i32) -> i32 {
-    if v >= 0 {
-        cm.logical_to_physical_1d(v as u32) as i32
-    } else {
-        let mag = if v == i32::MIN {
-            i32::MAX as u32
-        } else {
-            v.unsigned_abs()
-        };
-        -(cm.logical_to_physical_1d(mag) as i32)
-    }
+fn logical_to_physical_i32(_cm: &CanvasManager, v: i32) -> i32 {
+    v
 }
 
 pub(crate) struct RendererGL;
