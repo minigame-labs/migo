@@ -8,7 +8,7 @@ edition = "2024"
 cpal = "0.15"
 
 # Decoders - lightweight combination
-minimp3 = "0.5"      # MP3, MIT license
+minimp3 = "0.6"      # MP3, MIT license
 lewton = "0.10"      # OGG Vorbis, MIT/Apache-2.0
 hound = "3.5"        # WAV, Apache-2.0
 

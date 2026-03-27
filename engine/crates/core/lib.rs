@@ -68,7 +68,7 @@
 //! })?;
 //!
 //! // 3. Forward platform events
-//! send_command_to_host(host_id, HostCommand::OnTouch { ... })?;
+//! send_command_to_host(host_id, HostCommand::OnTouch(Box::new(...)))?;
 //!
 //! // 4. Shutdown when done
 //! shutdown_host(host_id)?;

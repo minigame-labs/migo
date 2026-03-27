@@ -8,7 +8,7 @@
 //! use `RenderCommand::Canvas2D` for synchronous request/response.
 
 use deno_core::{OpState, op2};
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use tracing::{error, trace};
@@ -26,7 +26,7 @@ use shared::{
 // Color parsing
 // ============================================================================
 
-static NAMED_COLORS: Lazy<HashMap<&'static str, Color>> = Lazy::new(|| {
+static NAMED_COLORS: LazyLock<HashMap<&'static str, Color>> = LazyLock::new(|| {
     [
         ("aliceblue", Color::rgb(240, 248, 255)),
         ("antiquewhite", Color::rgb(250, 235, 215)),

@@ -509,14 +509,14 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("requestMidasPaymentGameItem", "(ILjava/lang/String;)V"),
         // Video
         ("videoCreate", "(ILjava/lang/String;)Ljava/lang/String;"),
-        ("videoPlay", "(ILjava/lang/String;)V"),
-        ("videoPause", "(ILjava/lang/String;)V"),
-        ("videoStop", "(ILjava/lang/String;)V"),
+        ("videoPlay", "(II)V"),
+        ("videoPause", "(II)V"),
+        ("videoStop", "(II)V"),
         ("videoSeek", "(ILjava/lang/String;)V"),
         ("videoRequestFullscreen", "(ILjava/lang/String;)V"),
-        ("videoExitFullscreen", "(ILjava/lang/String;)V"),
+        ("videoExitFullscreen", "(II)V"),
         ("videoSetProperty", "(ILjava/lang/String;)V"),
-        ("videoDestroy", "(ILjava/lang/String;)V"),
+        ("videoDestroy", "(II)V"),
         // Lifecycle callback
         ("onGameReady", "(I)V"),
         // Error notification callback

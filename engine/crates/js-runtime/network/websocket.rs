@@ -235,7 +235,7 @@ pub async fn op_ws_next_event(
             match rx.next().await {
                 Some(Ok(Message::Text(text))) => {
                     return Ok::<WsEvent, JsErrorBox>(WsEvent::Message {
-                        data_str: Some(text),
+                        data_str: Some(text.to_string()),
                         data_bin: None,
                         is_binary: false,
                     });
@@ -243,7 +243,7 @@ pub async fn op_ws_next_event(
                 Some(Ok(Message::Binary(data))) => {
                     return Ok(WsEvent::Message {
                         data_str: None,
-                        data_bin: Some(data),
+                        data_bin: Some(data.to_vec()),
                         is_binary: true,
                     });
                 }
@@ -294,9 +294,9 @@ pub async fn op_ws_send(
         .map_err(|_| JsErrorBox::generic("WebSocket not found"))?;
 
     let message = if let Some(text) = data_str {
-        Message::Text(text)
+        Message::Text(text.into())
     } else if let Some(buf) = data_buf {
-        Message::Binary(buf.to_vec())
+        Message::Binary(buf.to_vec().into())
     } else {
         return Err(JsErrorBox::type_error("No data provided"));
     };

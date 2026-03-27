@@ -1,8 +1,9 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-use shared::js_escape::escape_for_js_string;
+use shared::js_escape::build_eval_script;
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +23,26 @@ fn parse_sub_packages(json: Option<String>) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Convert a JNI string to `Cow<'static, str>`.
+/// Returns a borrowed `&'static str` for known constant values,
+/// avoiding heap allocation in the common case.
+fn jni_string_to_cow(
+    env: &mut JNIEnv,
+    jstr: &JString,
+    known: &[&'static str],
+) -> Cow<'static, str> {
+    let s: String = env
+        .get_string(jstr)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for &k in known {
+        if s == k {
+            return Cow::Borrowed(k);
+        }
+    }
+    Cow::Owned(s)
+}
+
 // ---------------------------------------------------------------------------
 // Helper: forward a JSON result string from JNI to JS via EvalScript.
 // Used by all "Mode C" callbacks that receive a JSON result from Java and
@@ -39,9 +60,8 @@ fn forward_json_result_to_js(
         .get_string(result_json)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| fallback_json.to_string());
-    let escaped = escape_for_js_string(&json);
     let cmd = HostCommand::EvalScript {
-        source: format!("{}('{}');", js_callback, escaped),
+        source: build_eval_script(js_callback, &json),
     };
     let _ = send_command_to_host(host_id, cmd);
 }
@@ -75,7 +95,9 @@ use jni::{JNIEnv, JavaVM};
 use tracing::{error, info};
 
 use core::{send_command_to_host, shutdown_host, spawn_host_thread};
-use shared::protocol::host_cmd::{HostCommand, TouchPoint, TouchType};
+use shared::protocol::host_cmd::{
+    BleCharacteristicData, HostCommand, TouchData, TouchPoint, TouchType,
+};
 use shared::surface::SurfaceRef;
 
 use shared::config::InitOptions;
@@ -372,12 +394,12 @@ pub(crate) extern "system" fn onTouch(
         _ => TouchType::Move,
     };
 
-    let cmd = HostCommand::OnTouch {
+    let cmd = HostCommand::OnTouch(Box::new(TouchData {
         touch_type,
         count: n as u8,
         points,
         timestamp_ms: time as i64,
-    };
+    }));
 
     let _ = send_command_to_host(host_id, cmd);
 }
@@ -572,10 +594,8 @@ pub(crate) extern "system" fn onDeviceOrientationChange<'local>(
     host_id: jint,
     value: JString<'local>,
 ) {
-    let val = env
-        .get_string(&value)
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    static KNOWN: &[&str] = &["portrait", "landscape", "landscapeReverse"];
+    let val = jni_string_to_cow(&mut env, &value, KNOWN);
     let _ = send_command_to_host(
         host_id,
         HostCommand::OnDeviceOrientationChange { value: val },
@@ -589,10 +609,8 @@ pub(crate) extern "system" fn onCompassChange<'local>(
     direction: jdouble,
     accuracy: JString<'local>,
 ) {
-    let acc = env
-        .get_string(&accuracy)
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "unknown".to_string());
+    static KNOWN: &[&str] = &["high", "medium", "low", "no-contact", "unreliable"];
+    let acc = jni_string_to_cow(&mut env, &accuracy, KNOWN);
     let _ = send_command_to_host(
         host_id,
         HostCommand::OnCompassChange {
@@ -627,15 +645,13 @@ pub(crate) extern "system" fn onNetworkStatusChange<'local>(
     is_connected: jni::sys::jboolean,
     network_type: JString<'local>,
 ) {
-    let net_type = env
-        .get_string(&network_type)
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "none".to_string());
+    static KNOWN: &[&str] = &["wifi", "2g", "3g", "4g", "5g", "unknown", "none"];
+    let net = jni_string_to_cow(&mut env, &network_type, KNOWN);
     let _ = send_command_to_host(
         host_id,
         HostCommand::OnNetworkStatusChange {
             is_connected: is_connected != 0,
-            network_type: net_type,
+            network_type: net,
         },
     );
 }
@@ -857,12 +873,12 @@ pub(crate) extern "system" fn onBLECharacteristicValueChange<'local>(
     let val: Vec<u8> = env.convert_byte_array(&value).unwrap_or_default();
     let _ = send_command_to_host(
         host_id,
-        HostCommand::OnBLECharacteristicValueChange {
+        HostCommand::OnBLECharacteristicValueChange(Box::new(BleCharacteristicData {
             device_id: dev,
             service_id: svc,
             characteristic_id: chr,
             value: val,
-        },
+        })),
     );
 }
 

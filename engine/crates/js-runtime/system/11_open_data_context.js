@@ -16,11 +16,12 @@ function _createSharedCanvas(mode) {
         canvas = createOffscreenCanvas(1, 1);
         try {
             const info = getWindowInfo();
+            const dpr = info && info.pixelRatio ? info.pixelRatio : 1;
             if (info && info.windowWidth > 0) {
-                canvas.width = info.windowWidth;
+                canvas.width = Math.round(info.windowWidth * dpr);
             }
             if (info && info.windowHeight > 0) {
-                canvas.height = info.windowHeight;
+                canvas.height = Math.round(info.windowHeight * dpr);
             }
         } catch (_) {
             // Ignore dimension sync failure; canvas remains usable.

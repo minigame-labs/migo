@@ -1984,22 +1984,22 @@ public final class NativeExports {
         return mgr.create(optionsJson);
     }
 
-    public static void videoPlay(int sessionId, String videoIdStr) {
+    public static void videoPlay(int sessionId, int videoId) {
         VideoManager mgr = getOrCreateVideoManager(sessionId);
         if (mgr == null) return;
-        mgr.play(videoIdStr);
+        mgr.play(videoId);
     }
 
-    public static void videoPause(int sessionId, String videoIdStr) {
+    public static void videoPause(int sessionId, int videoId) {
         VideoManager mgr = getOrCreateVideoManager(sessionId);
         if (mgr == null) return;
-        mgr.pause(videoIdStr);
+        mgr.pause(videoId);
     }
 
-    public static void videoStop(int sessionId, String videoIdStr) {
+    public static void videoStop(int sessionId, int videoId) {
         VideoManager mgr = getOrCreateVideoManager(sessionId);
         if (mgr == null) return;
-        mgr.stop(videoIdStr);
+        mgr.stop(videoId);
     }
 
     public static void videoSeek(int sessionId, String json) {
@@ -2014,10 +2014,10 @@ public final class NativeExports {
         mgr.requestFullscreen(json);
     }
 
-    public static void videoExitFullscreen(int sessionId, String videoIdStr) {
+    public static void videoExitFullscreen(int sessionId, int videoId) {
         VideoManager mgr = getOrCreateVideoManager(sessionId);
         if (mgr == null) return;
-        mgr.exitFullscreen(videoIdStr);
+        mgr.exitFullscreen(videoId);
     }
 
     public static void videoSetProperty(int sessionId, String json) {
@@ -2026,10 +2026,10 @@ public final class NativeExports {
         mgr.setProperty(json);
     }
 
-    public static void videoDestroy(int sessionId, String videoIdStr) {
+    public static void videoDestroy(int sessionId, int videoId) {
         VideoManager mgr = getOrCreateVideoManager(sessionId);
         if (mgr == null) return;
-        mgr.destroyVideo(videoIdStr);
+        mgr.destroyVideo(videoId);
     }
 
     /**

@@ -25,6 +25,12 @@ pub struct DebugStats {
     /// Total number of HostCommand messages dropped due to queue overflow (cumulative).
     /// Incremented by `send_command_to_host` when `try_send` returns `Full`.
     pub command_drops: AtomicU32,
+    /// High-water mark of the audio command queue depth (peak pending items).
+    /// Currently a placeholder — wiring to actual sender is deferred.
+    pub audio_queue_hwm: AtomicU32,
+    /// High-water mark of the IO command queue depth (peak pending items).
+    /// Currently a placeholder — wiring to actual sender is deferred.
+    pub io_queue_hwm: AtomicU32,
 }
 
 impl DebugStats {

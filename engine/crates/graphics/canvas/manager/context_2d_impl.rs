@@ -1,14 +1,14 @@
 extern crate khronos_egl as egl;
 
-use femtovg::{Canvas as FvCanvas, renderer::OpenGl};
+use femtovg::{renderer::OpenGl, Canvas as FvCanvas};
 use shared::{
     error::{EngineResult, ErrorCode},
     protocol::render_cmd::CanvasId,
 };
 use std::{ffi::c_void, ptr};
 
-use super::CanvasManager;
 use super::types::ee;
+use super::CanvasManager;
 use crate::{BoundContext, Canvas2DContext, FontManager};
 
 /// Initialize femtovg for a canvas
@@ -22,9 +22,7 @@ pub(super) fn init_femtovg_for_canvas(
         return Ok(());
     }
 
-    // Use physical pixel dimensions for the femtovg backing store.
-    // CanvasInfo.width/height stores logical (CSS) pixels, so we must
-    // convert back to physical via DPI for set_size().
+    // Canvas dimensions are in physical (buffer) pixels — no DPR conversion needed.
     let (phys_w, phys_h) = {
         let canvas = cm.canvases.get(&canvas_id).ok_or_else(|| {
             ee(
@@ -32,14 +30,8 @@ pub(super) fn init_femtovg_for_canvas(
                 format!("canvas not found: id={}", canvas_id),
             )
         })?;
-        let dpi = cm.dpi.max(1.0);
-        (
-            (canvas.logical_width as f32 * dpi).round() as u32,
-            (canvas.logical_height as f32 * dpi).round() as u32,
-        )
+        (canvas.physical_width, canvas.physical_height)
     };
-
-    let dpi = cm.dpi;
 
     let get_proc = |s: &str| -> *const c_void {
         cm.egl
@@ -62,8 +54,10 @@ pub(super) fn init_femtovg_for_canvas(
         )
     })?;
 
-    fv_canvas.set_size(phys_w, phys_h, dpi);
-    fv_canvas.scale(dpi, dpi);
+    // dpi = 1.0: Canvas2D coordinates are in buffer pixels (no DPR scaling),
+    // matching browser semantics where ctx.fillRect(0,0,100,100) fills
+    // exactly 100x100 pixels of the canvas buffer.
+    fv_canvas.set_size(phys_w, phys_h, 1.0);
 
     let font_manager = FontManager::new(&mut fv_canvas)?;
     let ctx2d = Canvas2DContext::new(fv_canvas, font_manager);

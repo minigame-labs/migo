@@ -33,7 +33,44 @@
 //! - **Video** (1): `OnVideoStateChange`
 //! - **System** (2): `OnMemoryWarning`, `OnUserCaptureScreen`
 
+use std::borrow::Cow;
+
 use crate::surface::SurfaceRef;
+
+/// Touch event payload, boxed inside `HostCommand::OnTouch`.
+///
+/// Contains a fixed `[TouchPoint; 10]` array with a count field.
+/// Single memcpy from JNI DirectByteBuffer, then boxed to keep the
+/// `HostCommand` enum small on the channel.
+#[derive(Debug)]
+pub struct TouchData {
+    /// Type of touch event (start, move, end, cancel).
+    pub touch_type: TouchType,
+    /// Number of valid touch points in the `points` array.
+    pub count: u8,
+    /// Fixed inline array of touch points (max 10 simultaneous).
+    /// Only `points[..count]` are valid.
+    pub points: [TouchPoint; 10],
+    /// Event timestamp in milliseconds (from system boot or epoch).
+    pub timestamp_ms: i64,
+}
+
+/// BLE characteristic value change payload, boxed inside
+/// `HostCommand::OnBLECharacteristicValueChange`.
+///
+/// Contains three String UUIDs plus a variable-length byte buffer,
+/// boxed to keep the `HostCommand` enum small on the channel.
+#[derive(Debug)]
+pub struct BleCharacteristicData {
+    /// BLE device identifier.
+    pub device_id: String,
+    /// GATT service UUID.
+    pub service_id: String,
+    /// GATT characteristic UUID.
+    pub characteristic_id: String,
+    /// Characteristic value bytes.
+    pub value: Vec<u8>,
+}
 
 /// Commands sent to the host runtime thread.
 ///
@@ -73,12 +110,12 @@ use crate::surface::SurfaceRef;
 /// };
 ///
 /// // Send touch event
-/// let cmd = HostCommand::OnTouch {
+/// let cmd = HostCommand::OnTouch(Box::new(TouchData {
 ///     touch_type: TouchType::Start,
 ///     count: 1,
 ///     points: Default::default(), // filled via ptr::copy_nonoverlapping
 ///     timestamp_ms: 1234567890,
-/// };
+/// }));
 /// ```
 #[non_exhaustive]
 #[derive(Debug)]
@@ -182,19 +219,9 @@ pub enum HostCommand {
 
     /// Dispatch touch input events to the game.
     ///
-    /// Touch data is stored inline -- fixed `[TouchPoint; 10]` array with a count.
-    /// No heap allocation, single memcpy from JNI DirectByteBuffer.
-    OnTouch {
-        /// Type of touch event (start, move, end, cancel).
-        touch_type: TouchType,
-        /// Number of valid touch points in the `points` array.
-        count: u8,
-        /// Fixed inline array of touch points (max 10 simultaneous).
-        /// Only `points[..count]` are valid.
-        points: [TouchPoint; 10],
-        /// Event timestamp in milliseconds (from system boot or epoch).
-        timestamp_ms: i64,
-    },
+    /// Boxed to keep the `HostCommand` enum small (~56-64 bytes instead of ~216).
+    /// Every `try_send()` on the 512-slot channel copies the full enum size.
+    OnTouch(Box<TouchData>),
 
     // ---- Sensor Events ----
 
@@ -215,7 +242,7 @@ pub enum HostCommand {
     /// Sent by the platform when the display orientation changes.
     OnDeviceOrientationChange {
         /// One of: “portrait”, “landscape”, “landscapeReverse”.
-        value: String,
+        value: Cow<'static, str>,
     },
 
     /// Compass data (direction and accuracy).
@@ -225,7 +252,7 @@ pub enum HostCommand {
         /// Direction in degrees (0-360, 0 = north).
         direction: f64,
         /// Accuracy string (Android: “high”/”medium”/”low”/”no-contact”/”unreliable”).
-        accuracy: String,
+        accuracy: Cow<'static, str>,
     },
 
     /// Accelerometer data (acceleration in m/s^2).
@@ -249,7 +276,7 @@ pub enum HostCommand {
         /// Whether network is connected.
         is_connected: bool,
         /// Network type: “wifi”, “2g”, “3g”, “4g”, “5g”, “unknown”, “none”.
-        network_type: String,
+        network_type: Cow<'static, str>,
     },
 
     // ---- Recorder Events ----
@@ -384,17 +411,9 @@ pub enum HostCommand {
 
     /// BLE characteristic value changed (notification/indication received).
     ///
+    /// Boxed to keep the `HostCommand` enum small (~56-64 bytes instead of ~216).
     /// Triggers `migo.onBLECharacteristicValueChange` callbacks.
-    OnBLECharacteristicValueChange {
-        /// BLE device identifier.
-        device_id: String,
-        /// GATT service UUID.
-        service_id: String,
-        /// GATT characteristic UUID.
-        characteristic_id: String,
-        /// Characteristic value bytes.
-        value: Vec<u8>,
-    },
+    OnBLECharacteristicValueChange(Box<BleCharacteristicData>),
 
     /// BLE MTU changed after negotiation.
     ///
@@ -463,6 +482,13 @@ pub enum HostCommand {
     /// Triggers `migo.onUserCaptureScreen` callback in the game.
     OnUserCaptureScreen,
 }
+
+// Guard against future regressions — if a new variant re-inflates the enum,
+// this assertion will fail at compile time.
+const _: () = assert!(
+    core::mem::size_of::<HostCommand>() <= 64,
+    "HostCommand grew past 64 bytes; check for unboxed large variants"
+);
 
 /// Event types for InnerAudioContext.
 ///

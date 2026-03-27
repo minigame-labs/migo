@@ -246,6 +246,41 @@ fn call_void_with_string(method_name: &str, host_id: i32, json: &str) -> Result<
     })
 }
 
+/// Call a NativeExports static method with signature `(II)V`.
+/// Avoids the String allocation needed by `call_void_with_string` when
+/// the second argument is just an integer.
+fn call_void_with_int(method_name: &str, host_id: i32, value: i32) -> Result<(), String> {
+    with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports class cache not initialized")?;
+        let method_id = cache
+            .get_method_id(method_name)
+            .ok_or("Method ID not found")?;
+        let class = cache.class();
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Primitive(Primitive::Void),
+                &[jvalue { i: host_id }, jvalue { i: value }],
+            )
+        };
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    env.exception_describe().ok();
+                    env.exception_clear().ok();
+                }
+                Err(format!("Failed to call method '{method_name}': {e}"))
+            }
+        }
+    })
+}
+
 pub fn show_toast(host_id: i32, json: &str) -> Result<(), String> {
     call_void_with_string("showToast", host_id, json)
 }
@@ -1479,15 +1514,15 @@ pub fn video_create(host_id: i32, options_json: &str) -> Result<String, String> 
 }
 
 pub fn video_play(host_id: i32, video_id: u32) -> Result<(), String> {
-    call_void_with_string("videoPlay", host_id, &video_id.to_string())
+    call_void_with_int("videoPlay", host_id, video_id as i32)
 }
 
 pub fn video_pause(host_id: i32, video_id: u32) -> Result<(), String> {
-    call_void_with_string("videoPause", host_id, &video_id.to_string())
+    call_void_with_int("videoPause", host_id, video_id as i32)
 }
 
 pub fn video_stop(host_id: i32, video_id: u32) -> Result<(), String> {
-    call_void_with_string("videoStop", host_id, &video_id.to_string())
+    call_void_with_int("videoStop", host_id, video_id as i32)
 }
 
 pub fn video_seek(host_id: i32, video_id: u32, position: f64) -> Result<(), String> {
@@ -1499,7 +1534,7 @@ pub fn video_request_fullscreen(host_id: i32, video_id: u32, direction: i32) -> 
 }
 
 pub fn video_exit_fullscreen(host_id: i32, video_id: u32) -> Result<(), String> {
-    call_void_with_string("videoExitFullscreen", host_id, &video_id.to_string())
+    call_void_with_int("videoExitFullscreen", host_id, video_id as i32)
 }
 
 pub fn video_set_property(host_id: i32, video_id: u32, property_json: &str) -> Result<(), String> {
@@ -1507,5 +1542,5 @@ pub fn video_set_property(host_id: i32, video_id: u32, property_json: &str) -> R
 }
 
 pub fn video_destroy(host_id: i32, video_id: u32) -> Result<(), String> {
-    call_void_with_string("videoDestroy", host_id, &video_id.to_string())
+    call_void_with_int("videoDestroy", host_id, video_id as i32)
 }

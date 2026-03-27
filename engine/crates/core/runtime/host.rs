@@ -379,15 +379,10 @@ impl Host {
                 "_internalTriggerAudioInterruptionEnd()",
             ),
 
-            HostCommand::OnTouch {
-                touch_type,
-                count,
-                points,
-                timestamp_ms,
-            } => {
-                let count = (count as usize).min(points.len());
+            HostCommand::OnTouch(touch) => {
+                let count = (touch.count as usize).min(touch.points.len());
                 self.js
-                    .dispatch_touch(touch_type, &points[..count], timestamp_ms);
+                    .dispatch_touch(touch.touch_type, &touch.points[..count], touch.timestamp_ms);
                 Ok(())
             }
 
@@ -525,17 +520,12 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnBLECharacteristicValueChange {
-                device_id,
-                service_id,
-                characteristic_id,
-                value,
-            } => {
+            HostCommand::OnBLECharacteristicValueChange(ble) => {
                 self.js.dispatch_ble_characteristic_value_change(
-                    &device_id,
-                    &service_id,
-                    &characteristic_id,
-                    &value,
+                    &ble.device_id,
+                    &ble.service_id,
+                    &ble.characteristic_id,
+                    &ble.value,
                 );
                 Ok(())
             }

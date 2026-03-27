@@ -40,6 +40,38 @@ pub fn escape_for_js_string(s: &str) -> String {
     out
 }
 
+/// Build a complete `callbackName('escaped_json');` JS source string in a
+/// single allocation.
+///
+/// This combines the work of `escape_for_js_string` + `format!` into one pass,
+/// eliminating the intermediate escaped String allocation. The escape rules are
+/// identical to `escape_for_js_string`.
+///
+/// Pre-calculates capacity: `callback_name.len() + json.len() + 5 + 16`
+/// where 5 covers the `('');` overhead and 16 is headroom for escape sequences.
+pub fn build_eval_script(callback_name: &str, json: &str) -> String {
+    // 5 = len("('');") , 16 = escape headroom
+    let mut out = String::with_capacity(callback_name.len() + json.len() + 5 + 16);
+    out.push_str(callback_name);
+    out.push_str("('");
+    for c in json.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(c),
+        }
+    }
+    out.push_str("');");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +142,49 @@ mod tests {
     #[test]
     fn all_special_chars() {
         assert_eq!(escape_for_js_string("\\'\n\r"), "\\\\\\'\\n\\r");
+    }
+
+    // ---- build_eval_script tests ----
+
+    #[test]
+    fn build_eval_script_plain_json() {
+        assert_eq!(
+            build_eval_script("_internalOnResult", r#"{"ok":true}"#),
+            r#"_internalOnResult('{"ok":true}');"#
+        );
+    }
+
+    #[test]
+    fn build_eval_script_json_with_single_quotes() {
+        assert_eq!(
+            build_eval_script("_internalOnResult", r#"{"msg":"it's done"}"#),
+            r#"_internalOnResult('{"msg":"it\'s done"}');"#
+        );
+    }
+
+    #[test]
+    fn build_eval_script_empty_json() {
+        assert_eq!(
+            build_eval_script("_internalOnResult", ""),
+            "_internalOnResult('');",
+        );
+    }
+
+    #[test]
+    fn build_eval_script_matches_escape_plus_format() {
+        // Verify that build_eval_script produces identical output to the
+        // two-step escape_for_js_string + format! approach.
+        let json = r#"{"path":"C:\\Users\\test","note":"line1\nline2"}"#;
+        let callback = "_internalOnChooseImageResult";
+        let expected = format!("{}('{}');", callback, escape_for_js_string(json));
+        assert_eq!(build_eval_script(callback, json), expected);
+    }
+
+    #[test]
+    fn build_eval_script_all_special_chars() {
+        let json = "\\'\n\r\0`$\u{2028}\u{2029}";
+        let callback = "_cb";
+        let expected = format!("{}('{}');", callback, escape_for_js_string(json));
+        assert_eq!(build_eval_script(callback, json), expected);
     }
 }

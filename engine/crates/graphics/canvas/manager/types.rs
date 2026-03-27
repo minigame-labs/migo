@@ -1,6 +1,8 @@
 extern crate khronos_egl as egl;
 
-use glow::{NativeBuffer, NativeFramebuffer, NativeProgram, NativeRenderbuffer, NativeShader, NativeTexture};
+use glow::{
+    NativeBuffer, NativeFramebuffer, NativeProgram, NativeRenderbuffer, NativeShader, NativeTexture,
+};
 use shared::error::{EngineError, ErrorCode};
 use shared::protocol::render_cmd::{CanvasId, ProgramId, ShaderType};
 
@@ -90,8 +92,6 @@ pub(super) enum SurfaceKind {
 #[derive(Clone)]
 pub(super) struct CanvasEntry {
     pub info: CanvasInfo,
-    pub logical_width: u32,
-    pub logical_height: u32,
     pub physical_width: u32,
     pub physical_height: u32,
     pub kind: SurfaceKind,

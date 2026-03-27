@@ -4,7 +4,7 @@
 //! Uses a size-based eviction policy to control memory usage.
 
 use lru::LruCache;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use parking_lot::Mutex;
 use shared::protocol::io_cmd::NormalizedImage;
 use std::num::NonZeroUsize;
@@ -155,7 +155,7 @@ impl Default for ImageCache {
 }
 
 /// Global image cache instance.
-static GLOBAL_CACHE: Lazy<Mutex<ImageCache>> = Lazy::new(|| Mutex::new(ImageCache::new()));
+static GLOBAL_CACHE: LazyLock<Mutex<ImageCache>> = LazyLock::new(|| Mutex::new(ImageCache::new()));
 
 /// Get reference to global cache.
 pub fn global_cache() -> parking_lot::MutexGuard<'static, ImageCache> {

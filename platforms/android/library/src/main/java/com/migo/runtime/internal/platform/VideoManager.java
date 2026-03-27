@@ -55,18 +55,18 @@ public class VideoManager {
         }
     }
 
-    public void play(String videoIdStr) {
-        VideoPlayer p = getPlayer(videoIdStr);
+    public void play(int videoId) {
+        VideoPlayer p = players.get(videoId);
         if (p != null) mainHandler.post(() -> p.play());
     }
 
-    public void pause(String videoIdStr) {
-        VideoPlayer p = getPlayer(videoIdStr);
+    public void pause(int videoId) {
+        VideoPlayer p = players.get(videoId);
         if (p != null) mainHandler.post(() -> p.pause());
     }
 
-    public void stop(String videoIdStr) {
-        VideoPlayer p = getPlayer(videoIdStr);
+    public void stop(int videoId) {
+        VideoPlayer p = players.get(videoId);
         if (p != null) mainHandler.post(() -> p.stop());
     }
 
@@ -90,11 +90,8 @@ public class VideoManager {
         } catch (Exception ignored) {}
     }
 
-    public void exitFullscreen(String videoIdStr) {
-        try {
-            int videoId = Integer.parseInt(videoIdStr);
-            NativeMethods.onVideoEvent(sessionId, videoId, "fullscreenchange", "{\"fullScreen\":false}");
-        } catch (Exception ignored) {}
+    public void exitFullscreen(int videoId) {
+        NativeMethods.onVideoEvent(sessionId, videoId, "fullscreenchange", "{\"fullScreen\":false}");
     }
 
     public void setProperty(String json) {
@@ -109,12 +106,9 @@ public class VideoManager {
         } catch (Exception ignored) {}
     }
 
-    public void destroyVideo(String videoIdStr) {
-        try {
-            int videoId = Integer.parseInt(videoIdStr);
-            VideoPlayer p = players.remove(videoId);
-            if (p != null) mainHandler.post(() -> p.release());
-        } catch (Exception ignored) {}
+    public void destroyVideo(int videoId) {
+        VideoPlayer p = players.remove(videoId);
+        if (p != null) mainHandler.post(() -> p.release());
     }
 
     public void destroy() {
@@ -122,14 +116,6 @@ public class VideoManager {
             mainHandler.post(() -> p.release());
         }
         players.clear();
-    }
-
-    private VideoPlayer getPlayer(String videoIdStr) {
-        try {
-            return players.get(Integer.parseInt(videoIdStr));
-        } catch (Exception e) {
-            return null;
-        }
     }
 
     // Inner class: per-video-instance state

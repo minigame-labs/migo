@@ -25,8 +25,8 @@ mod pbo_upload;
 mod types;
 
 pub(crate) use types::{
-    BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta, ProgramMeta, RenderbufferMeta,
-    ShaderMeta, TextureMeta, ee,
+    ee, BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta, ProgramMeta, RenderbufferMeta,
+    ShaderMeta, TextureMeta,
 };
 use types::{CanvasEntry, EglContextHandle, SurfaceKind};
 
@@ -155,14 +155,16 @@ impl CanvasManager {
 
     // ==================== Canvas Lifecycle ====================
 
+    /// Create an offscreen (pbuffer) canvas.
+    ///
+    /// `w` and `h` are in **physical (buffer) pixels** — the same unit JS
+    /// `canvas.width`/`canvas.height` uses, matching browser semantics.
     pub(crate) fn create_offscreen(
         &mut self,
-        logical_w: u32,
-        logical_h: u32,
+        w: u32,
+        h: u32,
     ) -> EngineResult<CanvasId> {
         let id = self.new_canvas_id();
-
-        let (physical_w, physical_h) = self.logical_to_physical_2d(logical_w, logical_h);
 
         let share = Some(self.resource.ctx);
         let (ctx, surf) = egl_ops::create_pbuffer_context(
@@ -170,14 +172,14 @@ impl CanvasManager {
             self.display,
             self.config,
             share,
-            physical_w,
-            physical_h,
+            w,
+            h,
         )?;
 
         let info = CanvasInfo {
             id,
-            width: physical_w,
-            height: physical_h,
+            width: w,
+            height: h,
             is_onscreen: false,
         };
 
@@ -185,10 +187,8 @@ impl CanvasManager {
             id,
             CanvasEntry {
                 info,
-                logical_width: logical_w,
-                logical_height: logical_h,
-                physical_width: physical_w,
-                physical_height: physical_h,
+                physical_width: w,
+                physical_height: h,
                 kind: SurfaceKind::Pbuffer,
                 ctx: EglContextHandle { ctx, surf },
             },
@@ -318,15 +318,26 @@ impl CanvasManager {
             }
         }
 
-        // Calculate logical dimensions (CSS pixels) from physical pixels
-        let dpi = self.dpi.max(1.0);
-        let logical_w = (physical_w as f32 / dpi).round() as u32;
-        let logical_h = (physical_h as f32 / dpi).round() as u32;
+        if let Some((exp_w, exp_h)) = surface_size {
+            if exp_w != physical_w || exp_h != physical_h {
+                tracing::warn!(
+                    "CanvasManager::create_onscreen size mismatch: expected={}x{}, egl_surface={}x{}, window=0x{:x}",
+                    exp_w,
+                    exp_h,
+                    physical_w,
+                    physical_h,
+                    window
+                );
+            }
+        }
 
+        // JS canvas.width/height report physical (buffer) pixels — matching
+        // browser semantics.  Games that want crisp rendering multiply by
+        // devicePixelRatio themselves; the engine must NOT scale again.
         let info = CanvasInfo {
             id,
-            width: logical_w, // Return logical dimensions to JS
-            height: logical_h,
+            width: physical_w,
+            height: physical_h,
             is_onscreen: true,
         };
 
@@ -335,8 +346,6 @@ impl CanvasManager {
             CanvasEntry {
                 info,
                 kind: SurfaceKind::Window(window),
-                logical_width: logical_w,
-                logical_height: logical_h,
                 physical_width: physical_w,
                 physical_height: physical_h,
                 ctx: EglContextHandle { ctx, surf },
@@ -347,9 +356,8 @@ impl CanvasManager {
         self.make_current_needed(id)?;
 
         if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-            ctx2d
-                .canvas
-                .set_size(physical_w, physical_h, self.dpi.max(0.1));
+            // dpi = 1.0: Canvas2D coordinates are in buffer pixels (no DPR scaling)
+            ctx2d.canvas.set_size(physical_w, physical_h, 1.0);
         }
 
         // Re-initialize the femtovg 2D context if one existed before the old
@@ -359,16 +367,6 @@ impl CanvasManager {
         if had_2d_context && !self.contexts_2d.contains_key(&id) {
             context_2d_impl::init_femtovg_for_canvas(self, id)?;
         }
-
-        tracing::info!(
-            "CanvasManager::create_onscreen ready: window=0x{:x}, egl_surface={}x{}, logical={}x{}, dpi={:.3}",
-            window,
-            physical_w,
-            physical_h,
-            logical_w,
-            logical_h,
-            self.dpi
-        );
 
         Ok(())
     }
@@ -608,13 +606,17 @@ impl CanvasManager {
 
     // ==================== Canvas Operations ====================
 
+    /// Resize a canvas buffer.
+    ///
+    /// `w` and `h` are in **physical (buffer) pixels** — the same unit JS
+    /// `canvas.width`/`canvas.height` uses.  No DPR scaling is applied.
     pub(crate) fn resize_canvas(
         &mut self,
         id: CanvasId,
         w: Option<u32>,
         h: Option<u32>,
     ) -> EngineResult<()> {
-        let (old_lw, old_lh, old_pw, old_ph, kind, ctx_handle, old_surf) = {
+        let (old_w, old_h, kind, ctx_handle, old_surf) = {
             let entry = self.canvases.get(&id).ok_or_else(|| {
                 ee(
                     ErrorCode::NotFound,
@@ -623,34 +625,18 @@ impl CanvasManager {
             })?;
 
             (
-                entry.logical_width,
-                entry.logical_height,
-                entry.info.width,
-                entry.info.height,
+                entry.physical_width,
+                entry.physical_height,
                 entry.kind,
                 entry.ctx.ctx,
                 entry.ctx.surf,
             )
         };
 
-        let new_lw = w.unwrap_or(old_lw);
-        let new_lh = h.unwrap_or(old_lh);
+        let new_w = w.unwrap_or(old_w);
+        let new_h = h.unwrap_or(old_h);
 
-        if new_lw == old_lw && new_lh == old_lh {
-            return Ok(());
-        }
-
-        let (new_pw, new_ph) = self.logical_to_physical_2d(new_lw, new_lh);
-
-        if new_pw == old_pw && new_ph == old_ph {
-            let entry = self.canvases.get_mut(&id).ok_or_else(|| {
-                ee(
-                    ErrorCode::NotFound,
-                    format!("resize_canvas: canvas not found after check: {id:?}"),
-                )
-            })?;
-            entry.logical_width = new_lw;
-            entry.logical_height = new_lh;
+        if new_w == old_w && new_h == old_h {
             return Ok(());
         }
 
@@ -687,9 +673,9 @@ impl CanvasManager {
             SurfaceKind::Pbuffer => {
                 let pbuf_attribs = [
                     egl::WIDTH as i32,
-                    new_pw as i32,
+                    new_w as i32,
                     egl::HEIGHT as i32,
-                    new_ph as i32,
+                    new_h as i32,
                     egl::NONE as i32,
                 ];
                 self.egl
@@ -728,17 +714,17 @@ impl CanvasManager {
                 )
             })?;
 
-            entry.logical_width = new_lw;
-            entry.logical_height = new_lh;
+            entry.physical_width = new_w;
+            entry.physical_height = new_h;
 
             entry.ctx.surf = new_surf;
-            // Store logical pixels in info (returned to JS), not physical pixels
-            entry.info.width = new_lw;
-            entry.info.height = new_lh;
+            entry.info.width = new_w;
+            entry.info.height = new_h;
         }
 
         if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-            ctx2d.canvas.set_size(new_pw, new_ph, self.dpi.max(0.1));
+            // dpi = 1.0: Canvas2D coordinates are in buffer pixels (no DPR scaling)
+            ctx2d.canvas.set_size(new_w, new_h, 1.0);
         }
 
         if !was_current {
@@ -791,14 +777,15 @@ impl CanvasManager {
         Ok(entry.info.clone())
     }
 
-    /// Return the logical (CSS-pixel) size of a canvas.
-    /// This is what JS `canvas.width/height` should report.
-    pub(crate) fn get_logical_size(&self, id: CanvasId) -> EngineResult<(u32, u32)> {
+    /// Return the buffer-pixel size of a canvas.
+    /// This is what JS `canvas.width`/`canvas.height` reports (physical pixels,
+    /// matching browser semantics).
+    pub(crate) fn get_canvas_size(&self, id: CanvasId) -> EngineResult<(u32, u32)> {
         let entry = self
             .canvases
             .get(&id)
             .ok_or_else(|| ee(ErrorCode::NotFound, format!("canvas not found: {id:?}")))?;
-        Ok((entry.logical_width, entry.logical_height))
+        Ok((entry.physical_width, entry.physical_height))
     }
 
     // ==================== 2D Context Management ====================
@@ -967,20 +954,4 @@ impl CanvasManager {
         ))
     }
 
-    // ==================== Coordinate Conversion ====================
-
-    #[inline]
-    pub(crate) fn logical_to_physical_1d(&self, v: u32) -> u32 {
-        let dpi = self.dpi.max(0.1);
-        let pv = ((v as f32) * dpi).round() as u32;
-        pv.max(1)
-    }
-
-    #[inline]
-    pub(crate) fn logical_to_physical_2d(&self, w: u32, h: u32) -> (u32, u32) {
-        (
-            self.logical_to_physical_1d(w),
-            self.logical_to_physical_1d(h),
-        )
-    }
 }

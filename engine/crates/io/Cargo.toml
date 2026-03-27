@@ -27,9 +27,6 @@ zune-core = { workspace = true, optional = true }
 # LRU cache for decoded images
 lru = { workspace = true }
 
-# Lazy static for global cache
-once_cell = { workspace = true }
-
 # Base64 encoding for readZipEntry binary data
 base64 = "0.22"
 
@@ -44,5 +41,8 @@ hex = "0.4"
 brotli = { version = "7", optional = true }
 
 # Zip extraction — optional, disable default features to exclude bzip2/zstd/aes/lzma/xz/zopfli
-# Only enable deflate (most common) to save ~200-400KB of compression codecs
+# Only enable deflate (most common) to save ~200-400KB of compression codecs.
+# NOTE: zip 2.x "deflate" feature pulls zopfli (compression encoder) even though we only
+# decompress. The "deflate-flate2" feature alone doesn't activate flate2 in zip 2.4.x
+# (upstream bug). Revisit when zip 3.x ships a decompression-only feature.
 zip = { version = "2.2", optional = true, default-features = false, features = ["deflate"] }

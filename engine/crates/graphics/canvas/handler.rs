@@ -85,7 +85,7 @@ impl CanvasHandler {
             }
 
             CanvasCmd::GetInfo { id, resp } => {
-                let size = cm.get_logical_size(id);
+                let size = cm.get_canvas_size(id);
                 let _ = resp.send(size);
             }
 

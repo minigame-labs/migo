@@ -73,11 +73,9 @@ impl RendererGL {
                 height,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                let px = logical_to_physical_i32(cm, x);
-                let py = logical_to_physical_i32(cm, y);
-                let pw = cm.logical_to_physical_1d(width) as i32;
-                let ph = cm.logical_to_physical_1d(height) as i32;
-                unsafe { gl.viewport(px, py, pw, ph) };
+                // Values are in physical (buffer) pixels — no DPR scaling needed,
+                // matching browser WebGL semantics.
+                unsafe { gl.viewport(x, y, width as i32, height as i32) };
                 Ok(false)
             }
 

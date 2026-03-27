@@ -1,4 +1,4 @@
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use tokio::sync::oneshot;
@@ -162,7 +162,7 @@ impl ImageCache {
     }
 }
 
-pub static IMAGE_CACHE: Lazy<Mutex<ImageCache>> = Lazy::new(|| Mutex::new(ImageCache::new()));
+pub static IMAGE_CACHE: LazyLock<Mutex<ImageCache>> = LazyLock::new(|| Mutex::new(ImageCache::new()));
 
 /// Clear all shared image tracking state.
 ///

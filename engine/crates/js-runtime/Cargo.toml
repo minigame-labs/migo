@@ -52,7 +52,6 @@ deno_error.workspace = true
 glow.workspace = true
 bytemuck.workspace = true
 image = { workspace = true, optional = true }
-once_cell.workspace = true
 parking_lot = "0.12.4"
 tokio-tungstenite.workspace = true
 futures.workspace = true

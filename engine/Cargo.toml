@@ -20,7 +20,7 @@ reqwest = { version = "=0.12.4", default-features = false, features = ["rustls-t
 # Note: reqwest "rustls-tls" bundles webpki-roots (~100KB Mozilla root cert list), NOT native OS roots.
 # reqwest 0.12.4 does not offer a "rustls-tls-native-roots" feature (unlike tokio-tungstenite below).
 # For websocket we use the OS cert store via rustls-tls-native-roots to avoid double-bundling.
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 thiserror = "2.0.12"
 http = "1.0"
 data-url = "=0.3.1"
@@ -44,8 +44,6 @@ image = { version = "=0.25.8", default-features = false, features = [
 # zune-image: unified fast image decoder with SIMD, handles JPEG/PNG/BMP/etc
 zune-image = { version = "0.5", default-features = false, features = ["jpeg", "png", "bmp", "simd"] }
 zune-core = { version = "0.5", default-features = false, features = ["std"] }
-
-once_cell = "1.21.3"
 
 # LRU cache for decoded images (0.16 to align with femtovg's dep)
 lru = "0.16"
