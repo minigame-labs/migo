@@ -30,14 +30,20 @@
 use deno_core::{Extension, ExtensionArguments};
 use shared::op_state::HostOpState;
 
-use crate::{base, console, event, file, input, network, rendering, storage, url, utility, web};
+use crate::{base, console, env, event, file, input, lifecycle, network, rendering, storage, url, utility, web};
 
 #[cfg(feature = "api-sensors")]
 use crate::device;
+#[cfg(feature = "api-system")]
+use crate::{ui, update, ad};
+#[cfg(feature = "api-connectivity")]
+use crate::system;
 #[cfg(feature = "api-media")]
 use crate::{audio, media};
 #[cfg(feature = "api-system")]
 use crate::worker;
+#[cfg(feature = "api-commerce")]
+use crate::{share, payment};
 
 /// Embedded snapshot bytes.
 ///
@@ -59,21 +65,37 @@ pub static SNAPSHOT_BYTES: Option<&'static [u8]> = None;
 /// state callbacks deferred).
 ///
 /// Used for both snapshot creation and snapshot-based runtime startup.
-/// The order MUST match [`extension_args()`].
+/// The order MUST match [`extension_args()`] and [`super::main_extensions()`].
 pub fn lazy_extensions() -> Vec<Extension> {
     let mut exts: Vec<Extension> = Vec::new();
 
-    // CORE
+    // ---- CORE extensions (always loaded) ----
     exts.push(base::host_v8_base::lazy_init());
     exts.extend(console::console_lazy_extensions());
     exts.extend(event::event_lazy_extensions());
     exts.extend(utility::utility_lazy_extensions());
 
-    // OPTIONAL: api-sensors
+    // ---- OPTIONAL: api-sensors ----
     #[cfg(feature = "api-sensors")]
     exts.extend(device::device_lazy_extensions());
 
-    // CORE (continued)
+    // ---- OPTIONAL: api-system ----
+    #[cfg(feature = "api-system")]
+    exts.push(ui::host_v8_ui::lazy_init());
+
+    // ---- OPTIONAL: api-connectivity ----
+    #[cfg(feature = "api-connectivity")]
+    exts.push(system::host_v8_system::lazy_init());
+
+    // ---- CORE (continued) ----
+    exts.push(env::host_v8_env::lazy_init());
+    exts.push(lifecycle::host_v8_lifecycle::lazy_init());
+
+    // ---- OPTIONAL: api-system (continued) ----
+    #[cfg(feature = "api-system")]
+    exts.push(update::host_v8_update::lazy_init());
+
+    // ---- CORE (continued) ----
     exts.extend(storage::storage_lazy_extensions());
     exts.extend(input::touch_lazy_extensions());
     exts.extend(file::file_lazy_extensions());
@@ -82,17 +104,27 @@ pub fn lazy_extensions() -> Vec<Extension> {
     exts.extend(url::url_lazy_extensions());
     exts.extend(network::network_lazy_extensions());
 
-    // OPTIONAL: api-media
+    // ---- OPTIONAL: api-media ----
     #[cfg(feature = "api-media")]
     exts.extend(media::media_lazy_extensions());
     #[cfg(feature = "api-media")]
     exts.extend(audio::audio_lazy_extensions());
 
-    // OPTIONAL: api-system
+    // ---- OPTIONAL: api-system (continued) ----
     #[cfg(feature = "api-system")]
     exts.extend(worker::worker_lazy_extensions());
 
-    // CORE: runtime (must be last)
+    // ---- OPTIONAL: api-commerce ----
+    #[cfg(feature = "api-commerce")]
+    exts.push(share::host_v8_share::lazy_init());
+    #[cfg(feature = "api-commerce")]
+    exts.push(payment::host_v8_payment::lazy_init());
+
+    // ---- OPTIONAL: api-system (continued) ----
+    #[cfg(feature = "api-system")]
+    exts.push(ad::host_v8_ad::lazy_init());
+
+    // ---- CORE: runtime (must be last) ----
     exts.push(super::runtime::lazy_init());
 
     exts
@@ -105,17 +137,33 @@ pub fn lazy_extensions() -> Vec<Extension> {
 pub fn extension_args(host: HostOpState) -> Vec<ExtensionArguments> {
     let mut args: Vec<ExtensionArguments> = Vec::new();
 
-    // CORE
+    // ---- CORE extensions (always loaded) ----
     args.push(base::host_v8_base::args(host));
     args.push(console::host_v8_console::args());
     args.push(event::host_v8_event::args());
     args.push(utility::host_v8_utility::args());
 
-    // OPTIONAL: api-sensors
+    // ---- OPTIONAL: api-sensors ----
     #[cfg(feature = "api-sensors")]
     args.push(device::host_v8_device::args());
 
-    // CORE (continued)
+    // ---- OPTIONAL: api-system ----
+    #[cfg(feature = "api-system")]
+    args.push(ui::host_v8_ui::args());
+
+    // ---- OPTIONAL: api-connectivity ----
+    #[cfg(feature = "api-connectivity")]
+    args.push(system::host_v8_system::args());
+
+    // ---- CORE (continued) ----
+    args.push(env::host_v8_env::args());
+    args.push(lifecycle::host_v8_lifecycle::args());
+
+    // ---- OPTIONAL: api-system (continued) ----
+    #[cfg(feature = "api-system")]
+    args.push(update::host_v8_update::args());
+
+    // ---- CORE (continued) ----
     args.push(storage::host_v8_storage::args());
     args.push(input::host_v8_touch::args());
     args.push(file::host_v8_file::args());
@@ -125,17 +173,27 @@ pub fn extension_args(host: HostOpState) -> Vec<ExtensionArguments> {
     args.push(url::host_v8_url::args());
     args.push(network::network_extension_args());
 
-    // OPTIONAL: api-media
+    // ---- OPTIONAL: api-media ----
     #[cfg(feature = "api-media")]
     args.push(media::host_v8_media::args());
     #[cfg(feature = "api-media")]
     args.push(audio::host_v8_audio::args());
 
-    // OPTIONAL: api-system
+    // ---- OPTIONAL: api-system (continued) ----
     #[cfg(feature = "api-system")]
     args.push(worker::host_v8_worker::args());
 
-    // CORE: runtime (must be last)
+    // ---- OPTIONAL: api-commerce ----
+    #[cfg(feature = "api-commerce")]
+    args.push(share::host_v8_share::args());
+    #[cfg(feature = "api-commerce")]
+    args.push(payment::host_v8_payment::args());
+
+    // ---- OPTIONAL: api-system (continued) ----
+    #[cfg(feature = "api-system")]
+    args.push(ad::host_v8_ad::args());
+
+    // ---- CORE: runtime (must be last) ----
     args.push(super::runtime::args());
 
     args

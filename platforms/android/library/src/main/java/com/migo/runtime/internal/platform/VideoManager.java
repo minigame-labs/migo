@@ -14,6 +14,7 @@ import com.migo.runtime.internal.NativeMethods;
 
 import org.json.JSONObject;
 
+import java.lang.ref.WeakReference;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -27,14 +28,18 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class VideoManager {
     private final int sessionId;
-    private final Activity activity;
+    private final WeakReference<Activity> activityRef;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Map<Integer, VideoPlayer> players = new ConcurrentHashMap<>();
     private final AtomicInteger nextVideoId = new AtomicInteger(1);
 
     public VideoManager(int sessionId, Activity activity) {
         this.sessionId = sessionId;
-        this.activity = activity;
+        this.activityRef = new WeakReference<>(activity);
+    }
+
+    private Activity getActivity() {
+        return activityRef.get();
     }
 
     public String create(String optionsJson) {
@@ -47,7 +52,10 @@ public class VideoManager {
             players.put(videoId, player);
 
             // Create TextureView on UI thread
-            mainHandler.post(() -> player.createView(activity));
+            Activity activity = getActivity();
+            if (activity != null) {
+                mainHandler.post(() -> player.createView(activity));
+            }
 
             return "{\"videoId\":" + videoId + "}";
         } catch (Exception e) {

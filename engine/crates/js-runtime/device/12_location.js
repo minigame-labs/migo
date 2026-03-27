@@ -5,8 +5,9 @@ const _locationApi = createDeferredApi('getLocation');
 const _fuzzyLocationApi = createDeferredApi('getFuzzyLocation');
 
 function getLocation(options = {}) {
-    return _locationApi.invoke(options, function (opts) {
+    return _locationApi.invoke(options, function (opts, requestId) {
         op_get_location(JSON.stringify({
+            requestId: requestId,
             type: opts.type || 'wgs84',
             altitude: !!opts.altitude,
             isHighAccuracy: !!opts.isHighAccuracy,
@@ -20,8 +21,9 @@ function _internalOnLocationResult(resultJson) {
 }
 
 function getFuzzyLocation(options = {}) {
-    return _fuzzyLocationApi.invoke(options, function (opts) {
+    return _fuzzyLocationApi.invoke(options, function (opts, requestId) {
         op_get_fuzzy_location(JSON.stringify({
+            requestId: requestId,
             type: opts.type || 'wgs84',
         }));
     });

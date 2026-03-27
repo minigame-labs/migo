@@ -6,6 +6,7 @@ import android.database.ContentObserver;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
@@ -133,11 +134,23 @@ public final class ScreenCaptureObserver {
     private boolean isScreenshotUri(Uri uri) {
         Cursor cursor = null;
         try {
-            // Sort by DATE_ADDED DESC and limit to 1 to get the most recent image
-            String sortOrder = MediaStore.Images.Media.DATE_ADDED + " DESC LIMIT 1";
-            cursor = contentResolver.query(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    PROJECTION, null, null, sortOrder);
+            // Query the most recent image. On API 26+ use Bundle-based query
+            // arguments for proper LIMIT support; on older APIs use the LIMIT
+            // trick appended to the sort order string.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Bundle queryArgs = new Bundle();
+                queryArgs.putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER,
+                        MediaStore.Images.Media.DATE_ADDED + " DESC");
+                queryArgs.putInt(ContentResolver.QUERY_ARG_LIMIT, 1);
+                cursor = contentResolver.query(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        PROJECTION, queryArgs, null);
+            } else {
+                String sortOrder = MediaStore.Images.Media.DATE_ADDED + " DESC LIMIT 1";
+                cursor = contentResolver.query(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        PROJECTION, null, null, sortOrder);
+            }
             if (cursor != null && cursor.moveToFirst()) {
                 // Verify the image was added recently (within the last few seconds)
                 int dateIdx = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED);

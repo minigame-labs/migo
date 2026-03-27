@@ -120,7 +120,9 @@ impl Drop for Host {
         self.audio.shutdown();
         self.io.shutdown();
         vsync::unregister_vsync_sender(self.id);
-        shared::stats::unregister_stats(self.id);
+        // NOTE: stats lifecycle is owned by the render thread — it registers
+        // on entry and unregisters on all exit paths (Shutdown, channel close,
+        // panic). Do not call unregister_stats here to avoid a double-free.
         shared::console_log::unregister_console_log(self.id);
 
         // Clear process-global caches to prevent stale state leaking into
@@ -164,7 +166,7 @@ impl Host {
             id,
             surface,
             init_options.pixel_ratio(),
-        );
+        )?;
 
         // ---- HostOpState for extensions ----
         let device_services = platform.create_device_services(id);

@@ -1,4 +1,4 @@
-use jni::{AttachGuard, JNIEnv, JavaVM};
+use jni::{JNIEnv, JavaVM};
 use std::{cell::RefCell, sync::OnceLock};
 
 use crate::android::jni::{cache::JavaMethodCache, register_java_exports, register_native_exports};
@@ -6,7 +6,10 @@ use crate::android::jni::{cache::JavaMethodCache, register_java_exports, registe
 static JVM: OnceLock<JavaVM> = OnceLock::new();
 
 thread_local! {
-    static THREAD_CTX: RefCell<Option<AttachGuard<'static>>> = RefCell::new(None);
+    // Daemon-attached JNIEnv: unlike AttachGuard, does not call
+    // DetachCurrentThread on drop, avoiding JVM bookkeeping overhead
+    // for transient threads (e.g. Tokio blocking pool).
+    static THREAD_CTX: RefCell<Option<JNIEnv<'static>>> = RefCell::new(None);
 }
 
 pub(crate) static JAVA_METHOD_CACHE: OnceLock<JavaMethodCache> = OnceLock::new();
@@ -48,8 +51,11 @@ where
             .get()
             .ok_or_else(|| E::from("JVM not initialized".to_string()))?;
 
+        // Use daemon attachment: daemon-attached threads don't prevent JVM
+        // shutdown and have less overhead for transient threads (no
+        // DetachCurrentThread on Drop, which avoids JVM bookkeeping).
         let mut new_guard = jvm
-            .attach_current_thread()
+            .attach_current_thread_as_daemon()
             .map_err(|e| E::from(format!("Failed to attach thread: {:?}", e)))?;
 
         let r = f(&mut new_guard);

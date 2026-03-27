@@ -60,11 +60,12 @@ function previewImage(options = {}) {
 const _compressImageApi = createDeferredApi('compressImage');
 
 function compressImage(options = {}) {
-    return _compressImageApi.invoke(options, function (opts) {
+    return _compressImageApi.invoke(options, function (opts, requestId) {
         if (!opts.src) {
             throw new Error('src is required');
         }
         op_compress_image(JSON.stringify({
+            requestId: requestId,
             src: opts.src,
             quality: opts.quality !== undefined ? opts.quality : 80,
             compressedWidth: opts.compressedWidth !== undefined ? opts.compressedWidth : 0,
@@ -82,11 +83,12 @@ function _internalOnCompressImageResult(resultJson) {
 const _chooseMessageFileApi = createDeferredApi('chooseMessageFile');
 
 function chooseMessageFile(options = {}) {
-    return _chooseMessageFileApi.invoke(options, function (opts) {
+    return _chooseMessageFileApi.invoke(options, function (opts, requestId) {
         if (opts.count === undefined) {
             throw new Error('count is required');
         }
         op_choose_message_file(JSON.stringify({
+            requestId: requestId,
             count: opts.count,
             type: opts.type !== undefined ? opts.type : 'all',
             extension: opts.extension !== undefined ? opts.extension : [],
@@ -103,8 +105,9 @@ function _internalOnChooseMessageFileResult(resultJson) {
 const _chooseImageApi = createDeferredApi('chooseImage');
 
 function chooseImage(options = {}) {
-    return _chooseImageApi.invoke(options, function (opts) {
+    return _chooseImageApi.invoke(options, function (opts, requestId) {
         op_choose_image(JSON.stringify({
+            requestId: requestId,
             count: opts.count !== undefined ? opts.count : 9,
             sizeType: opts.sizeType !== undefined ? opts.sizeType : ['original', 'compressed'],
             sourceType: opts.sourceType !== undefined ? opts.sourceType : ['album', 'camera'],

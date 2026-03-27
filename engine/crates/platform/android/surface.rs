@@ -26,8 +26,8 @@ unsafe extern "C" {
         surface: jobject,
     ) -> *mut ANativeWindow;
 
-    pub(crate) fn ANativeWindow_getHeight(window_ptr: usize) -> u32;
-    pub(crate) fn ANativeWindow_getWidth(window_ptr: usize) -> u32;
+    pub(crate) fn ANativeWindow_getHeight(window: *mut ANativeWindow) -> i32;
+    pub(crate) fn ANativeWindow_getWidth(window: *mut ANativeWindow) -> i32;
 }
 
 /// Android Surface wrapper:

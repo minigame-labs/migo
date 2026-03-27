@@ -25,15 +25,15 @@ impl RenderService {
         host_id: i32,
         surface: SurfaceRef,
         pixel_ratio: f32,
-    ) -> Self {
+    ) -> EngineResult<Self> {
         let thread = RenderThread::spawn(
             raf_tx,
             vsync_rx,
             host_id,
             Some(surface.clone()),
             pixel_ratio,
-        );
-        Self { surface, thread }
+        )?;
+        Ok(Self { surface, thread })
     }
 
     #[inline]

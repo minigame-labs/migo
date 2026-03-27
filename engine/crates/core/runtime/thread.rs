@@ -24,6 +24,9 @@ pub fn spawn_host_thread(
 ) -> EngineResult<HostId> {
     let id = registry::alloc_host_id();
 
+    // 512: sized to accommodate burst touch/vsync events at 120Hz without
+    // dropping, while bounding memory. `send_command_to_host` uses `try_send`
+    // and drops commands when full.
     let (host_tx, mut host_rx) = tokio::sync::mpsc::channel::<HostCommand>(512);
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
 
@@ -59,7 +62,19 @@ pub fn spawn_host_thread(
                     // receiver dropped -> caller likely already returned; still proceed to run loop.
                 }
 
-                let runtime = create_basic_runtime();
+                let runtime = match create_basic_runtime() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        error!("[Host {}] failed to create tokio runtime: {}", id, e);
+                        platform_for_error.notify_error(
+                            id,
+                            e.code.as_u16(),
+                            &e.msg,
+                            e.detail.as_deref().unwrap_or(""),
+                        );
+                        return;
+                    }
+                };
 
                 // Keep a reference to platform_for_error for use in the event loop
                 let platform_ref = &platform_for_error;
@@ -263,7 +278,7 @@ pub fn spawn_host_thread(
     Ok(id)
 }
 
-fn create_basic_runtime() -> Runtime {
+fn create_basic_runtime() -> EngineResult<Runtime> {
     let (event_interval, global_queue_interval, max_io_events_per_tick) = (61, 31, 1024);
 
     Builder::new_current_thread()
@@ -277,7 +292,12 @@ fn create_basic_runtime() -> Runtime {
         // independent tokio runtimes.
         .max_blocking_threads(8)
         .build()
-        .unwrap()
+        .map_err(|e| {
+            EngineError::from_detail(
+                ErrorCode::Internal,
+                format!("failed to create tokio runtime: {}", e),
+            )
+        })
 }
 
 /// Classify a V8 "execution terminated" error into a more specific error code

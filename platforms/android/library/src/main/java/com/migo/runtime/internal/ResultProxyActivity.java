@@ -5,6 +5,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
 
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
 /**
  * A transparent proxy Activity that handles {@code startActivityForResult} internally,
  * so the host Activity does not need to override {@code onActivityResult}.
@@ -20,8 +23,11 @@ public class ResultProxyActivity extends Activity {
         void onResult(int requestCode, int resultCode, Intent data);
     }
 
-    private static volatile PendingRequest sPending;
+    private static final ConcurrentHashMap<Integer, PendingRequest> sPendingRequests =
+            new ConcurrentHashMap<>();
+    private static final AtomicInteger sRequestCodeCounter = new AtomicInteger(10000);
 
+    private int assignedRequestCode = -1;
     private boolean launched = false;
 
     private static final class PendingRequest {
@@ -42,13 +48,15 @@ public class ResultProxyActivity extends Activity {
      *
      * @param context       A Context (typically an Activity) used to start this proxy
      * @param targetIntent  The Intent to forward to {@code startActivityForResult}
-     * @param requestCode   The request code
+     * @param requestCode   The request code (used for callback identification only)
      * @param callback      Receives the result when the target Activity finishes
      */
     public static void launch(Context context, Intent targetIntent, int requestCode,
                               ResultCallback callback) {
-        sPending = new PendingRequest(targetIntent, requestCode, callback);
+        int uniqueCode = sRequestCodeCounter.getAndIncrement();
+        sPendingRequests.put(uniqueCode, new PendingRequest(targetIntent, requestCode, callback));
         Intent proxy = new Intent(context, ResultProxyActivity.class);
+        proxy.putExtra("_proxy_request_code", uniqueCode);
         if (!(context instanceof Activity)) {
             proxy.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         }
@@ -60,7 +68,9 @@ public class ResultProxyActivity extends Activity {
         super.onCreate(savedInstanceState);
         overridePendingTransition(0, 0);
 
-        PendingRequest req = sPending;
+        assignedRequestCode = getIntent().getIntExtra("_proxy_request_code", -1);
+        PendingRequest req = assignedRequestCode >= 0
+                ? sPendingRequests.get(assignedRequestCode) : null;
         if (req == null) {
             // Process was killed and recreated — static state lost, nothing to do
             finish();
@@ -76,8 +86,8 @@ public class ResultProxyActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
 
-        PendingRequest req = sPending;
-        sPending = null;
+        PendingRequest req = assignedRequestCode >= 0
+                ? sPendingRequests.remove(assignedRequestCode) : null;
 
         if (req != null && req.callback != null) {
             req.callback.onResult(requestCode, resultCode, data);
@@ -93,7 +103,9 @@ public class ResultProxyActivity extends Activity {
         // If destroyed without receiving a result (e.g. user pressed back on this activity
         // before the target launched), clean up pending state
         if (!isFinishing() || !launched) {
-            sPending = null;
+            if (assignedRequestCode >= 0) {
+                sPendingRequests.remove(assignedRequestCode);
+            }
         }
     }
 }

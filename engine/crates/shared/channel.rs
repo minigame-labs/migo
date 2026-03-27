@@ -48,8 +48,9 @@ impl ThreadWakeup {
 
     /// Wait for a signal or timeout.
     ///
-    /// Returns `true` in all cases (signaled or timed out) — the caller
-    /// should always proceed to check its work queue after waking.
+    /// Returns `true` if the wakeup was signaled (via [`notify`]), `false`
+    /// if the timeout elapsed without a signal.  Callers can use this to
+    /// distinguish an explicit wakeup from a periodic timer expiry.
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
         let (lock, cvar) = &*self.inner;
         // Recover from poisoned mutex rather than panicking — this prevents
@@ -65,7 +66,8 @@ impl ThreadWakeup {
         signaled = result.0;
         let was_signaled = *signaled;
         *signaled = false;
-        was_signaled || result.1.timed_out()
+        // Return true only when actually signaled; false on timeout.
+        was_signaled
     }
 }
 

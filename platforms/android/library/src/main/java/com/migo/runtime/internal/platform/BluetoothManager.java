@@ -562,6 +562,7 @@ public class BluetoothManager {
         }
     }
 
+    @SuppressWarnings("deprecation")
     public void writeBLECharacteristicValue(String optionsJson) {
         try {
             JSONObject opts = new JSONObject(optionsJson);
@@ -578,14 +579,20 @@ public class BluetoothManager {
                 throw new RuntimeException("writeBLECharacteristicValue:fail characteristic not found");
             }
             byte[] value = hexToBytes(valueHex);
-            ch.setValue(value);
             String writeType = opts.optString("writeType", "write");
-            if ("writeNoResponse".equals(writeType)) {
-                ch.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+            int writeTypeInt = "writeNoResponse".equals(writeType)
+                    ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    : BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
+            boolean ok;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                int result = gatt.writeCharacteristic(ch, value, writeTypeInt);
+                ok = (result == BluetoothGatt.GATT_SUCCESS); // BluetoothStatusCodes.SUCCESS == 0
             } else {
-                ch.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+                ch.setValue(value);
+                ch.setWriteType(writeTypeInt);
+                ok = gatt.writeCharacteristic(ch);
             }
-            if (!gatt.writeCharacteristic(ch)) {
+            if (!ok) {
                 throw new RuntimeException("writeBLECharacteristicValue:fail write request failed");
             }
         } catch (JSONException e) {
@@ -593,6 +600,7 @@ public class BluetoothManager {
         }
     }
 
+    @SuppressWarnings("deprecation")
     public void notifyBLECharacteristicValueChange(String optionsJson) {
         try {
             JSONObject opts = new JSONObject(optionsJson);
@@ -614,17 +622,23 @@ public class BluetoothManager {
             // Write CCCD to enable/disable server-side notifications
             BluetoothGattDescriptor cccd = ch.getDescriptor(CCCD_UUID);
             if (cccd != null) {
+                byte[] descriptorValue;
                 if (state) {
                     int props = ch.getProperties();
                     if ((props & BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
-                        cccd.setValue(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE);
+                        descriptorValue = BluetoothGattDescriptor.ENABLE_INDICATION_VALUE;
                     } else {
-                        cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                        descriptorValue = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE;
                     }
                 } else {
-                    cccd.setValue(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE);
+                    descriptorValue = BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE;
                 }
-                gatt.writeDescriptor(cccd);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeDescriptor(cccd, descriptorValue);
+                } else {
+                    cccd.setValue(descriptorValue);
+                    gatt.writeDescriptor(cccd);
+                }
             }
         } catch (JSONException e) {
             throw new RuntimeException("notifyBLECharacteristicValueChange:fail invalid options");

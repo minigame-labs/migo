@@ -70,15 +70,29 @@ impl IoService {
         self.tx.clone()
     }
 
-    /// Cooperative shutdown: send `Shutdown` so the handler exits its loop.
+    /// Cooperative shutdown: send `Shutdown` and join with a timeout.
     ///
     /// The IO thread will process any remaining commands, call `close_all()`,
-    /// and exit naturally.  We don't join here to avoid blocking the caller.
-    /// File handles are cleaned up via their `Drop` impls.
+    /// and exit naturally.  We join with a 2-second timeout to ensure a clean
+    /// shutdown without blocking the caller indefinitely.
     pub(crate) fn shutdown(&mut self) {
         let _ = self.tx.send(IOCmd::Shutdown);
-        // Drop the join handle — the thread will exit on its own after
-        // processing the Shutdown command.
-        self.handler_handle.take();
+        if let Some(handle) = self.handler_handle.take() {
+            // Park on the IO thread for up to 2 seconds. This mirrors the
+            // pattern used by the audio and render thread shutdown paths,
+            // ensuring pending IO ops have time to complete gracefully.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!("IO thread did not exit within 2s, detaching");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
     }
 }

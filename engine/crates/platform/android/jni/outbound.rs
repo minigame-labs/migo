@@ -24,6 +24,10 @@ where
     F: FnOnce(&mut JNIEnv, jni::objects::JValueOwned) -> Result<R, String>,
 {
     with_env(|env| {
+        // Clear any pre-existing JNI exception so a stale exception from a
+        // prior call does not cause cascading failures (see notify_error).
+        let _ = env.exception_clear();
+
         let cache = JAVA_METHOD_CACHE
             .get()
             .ok_or("NativeExports class cache not initialized")?;
@@ -97,6 +101,8 @@ pub fn get_window_info(host_id: i32) -> Result<WindowInfo, String> {
 
             let mut screen_top =
                 i32::from_ne_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) as f32;
+
+            // bytes[28..36]: reserved (2 x i32), skipped
 
             let mut safe_area_left =
                 i32::from_ne_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]) as f32;

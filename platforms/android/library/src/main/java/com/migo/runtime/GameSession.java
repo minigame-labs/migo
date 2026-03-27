@@ -264,7 +264,9 @@ public final class GameSession implements Closeable {
         }
 
         // Ensure launch options are available before entry execution.
-        dispatchShowIfNeeded();
+        synchronized (lock) {
+            dispatchShowIfNeeded();
+        }
 
         // Native layer handles path generation from gameId
         int result = NativeMethods.modMain(sessionId, gameId, entryPoint);

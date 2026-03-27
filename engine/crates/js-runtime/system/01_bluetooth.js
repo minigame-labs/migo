@@ -23,35 +23,20 @@ import {
     op_set_ble_mtu,
     op_get_ble_mtu,
 } from "ext:core/ops";
-import { wrapAsync, createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { wrapAsync, createDeferredApi, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 // ==================== System Bluetooth Setting ====================
 
-const noop = () => { };
+const _openBluetoothSettingApi = createDeferredApi('openBluetoothAdapterSetting');
 
-let onOpenBluetoothSettingSuccess = noop;
-let onOpenBluetoothSettingFail = noop;
-let onOpenBluetoothSettingComplete = noop;
-
-function openSystemBluetoothSetting({ success, fail, complete } = {}) {
-    onOpenBluetoothSettingSuccess = success || noop;
-    onOpenBluetoothSettingFail = fail || noop;
-    onOpenBluetoothSettingComplete = complete || noop;
-
-    op_open_system_bluetooth_setting();
+function openSystemBluetoothSetting(options = {}) {
+    return _openBluetoothSettingApi.invoke(options, function (opts, requestId) {
+        op_open_system_bluetooth_setting();
+    });
 }
 
-function _internalOnOpenBluetoothSettingFinished(code) {
-    if (code >= 0) {
-        onOpenBluetoothSettingSuccess({ "code": code, "message": "Bluetooth settings opened successfully" });
-    } else {
-        onOpenBluetoothSettingFail({ "code": code, "message": "Failed to open Bluetooth settings" });
-    }
-    onOpenBluetoothSettingComplete({ "code": code });
-
-    onOpenBluetoothSettingSuccess = noop;
-    onOpenBluetoothSettingFail = noop;
-    onOpenBluetoothSettingComplete = noop;
+function _internalOnOpenBluetoothSettingResult(resultJson) {
+    _openBluetoothSettingApi.settle(resultJson);
 }
 
 // ==================== Bluetooth Adapter APIs ====================
@@ -171,7 +156,11 @@ function _internalTriggerBluetoothAdapterStateChange(available, discovering) {
 }
 
 function _internalTriggerBluetoothDeviceFound(devicesJson) {
-    _deviceFoundListeners.trigger({ devices: JSON.parse(devicesJson) });
+    try {
+        _deviceFoundListeners.trigger({ devices: JSON.parse(devicesJson) });
+    } catch (e) {
+        console.error('Failed to parse bluetooth device data:', e);
+    }
 }
 
 // ==================== Beacon APIs ====================
@@ -223,7 +212,11 @@ function offBeaconServiceChange(listener) {
 // ==================== Beacon Internal Trigger Functions ====================
 
 function _internalTriggerBeaconUpdate(beaconsJson) {
-    _beaconUpdateListeners.trigger({ beacons: JSON.parse(beaconsJson) });
+    try {
+        _beaconUpdateListeners.trigger({ beacons: JSON.parse(beaconsJson) });
+    } catch (e) {
+        console.error('Failed to parse beacon data:', e);
+    }
 }
 
 function _internalTriggerBeaconServiceChange(available, discovering) {
@@ -414,7 +407,7 @@ function _internalTriggerBLEMTUChange(deviceId, mtu) {
 export {
     // System bluetooth setting
     openSystemBluetoothSetting,
-    _internalOnOpenBluetoothSettingFinished,
+    _internalOnOpenBluetoothSettingResult,
     // Bluetooth adapter
     openBluetoothAdapter,
     closeBluetoothAdapter,

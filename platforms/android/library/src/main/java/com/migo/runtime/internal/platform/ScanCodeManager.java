@@ -14,6 +14,7 @@ import com.migo.runtime.internal.ResultProxyActivity;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.lang.ref.WeakReference;
 import java.util.List;
 
 /**
@@ -32,13 +33,17 @@ public final class ScanCodeManager {
     private static final int REQUEST_SCAN_CODE = 9001;
 
     private final int sessionId;
-    private final Activity activity;
+    private final WeakReference<Activity> activityRef;
     private final Handler mainHandler;
 
     public ScanCodeManager(int sessionId, Activity activity) {
         this.sessionId = sessionId;
-        this.activity = activity;
+        this.activityRef = new WeakReference<>(activity);
         this.mainHandler = new Handler(Looper.getMainLooper());
+    }
+
+    private Activity getActivity() {
+        return activityRef.get();
     }
 
     /**
@@ -62,6 +67,11 @@ public final class ScanCodeManager {
                 }
 
                 // Check if any app can handle the scan intent
+                Activity activity = getActivity();
+                if (activity == null) {
+                    sendError("scanCode:fail activity is gone");
+                    return;
+                }
                 PackageManager pm = activity.getPackageManager();
                 List<ResolveInfo> resolveInfos = pm.queryIntentActivities(intent, 0);
                 if (resolveInfos == null || resolveInfos.isEmpty()) {

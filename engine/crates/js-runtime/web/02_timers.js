@@ -64,7 +64,7 @@ function setInterval(callback, timeout = 0, ...args) {
     const unboundCallback = callback;
     const asyncContext = getAsyncContext();
     callback = () => {
-        const oldContext = getAsyncContext(asyncContext);
+        const oldContext = getAsyncContext();
         try {
             setAsyncContext(asyncContext);
             if (_backgrounded) return;
@@ -112,7 +112,7 @@ function _internalSetTimerBackgrounded(value) {
         var callbacks = _deferredTimeoutCallbacks;
         _deferredTimeoutCallbacks = [];
         for (var i = 0; i < callbacks.length; i++) {
-            try { callbacks[i](); } catch (_) {}
+            try { callbacks[i](); } catch (e) { console.error('Deferred timer callback error:', e); }
         }
     }
 }

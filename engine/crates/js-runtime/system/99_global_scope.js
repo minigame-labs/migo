@@ -26,7 +26,7 @@ const { ObjectDefineProperties } = primordials;
 ObjectDefineProperties(globalThis, {
     // Bluetooth
     openSystemBluetoothSetting: core.propNonEnumerable(bluetooth.openSystemBluetoothSetting),
-    _internalOnOpenBluetoothSettingFinished: core.propNonEnumerable(bluetooth._internalOnOpenBluetoothSettingFinished),
+    _internalOnOpenBluetoothSettingResult: core.propNonEnumerable(bluetooth._internalOnOpenBluetoothSettingResult),
     openBluetoothAdapter: core.propNonEnumerable(bluetooth.openBluetoothAdapter),
     closeBluetoothAdapter: core.propNonEnumerable(bluetooth.closeBluetoothAdapter),
     getBluetoothAdapterState: core.propNonEnumerable(bluetooth.getBluetoothAdapterState),

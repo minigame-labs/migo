@@ -2,7 +2,6 @@ import { primordials } from "ext:core/mod.js";
 import { windowOrWorkerGlobalScope } from "ext:runtime/98_global_scope_shared.js";
 import { WindowGlobalScope } from "ext:runtime/98_global_scope_window.js";
 import { initializeEventHandlers } from "ext:host_v8_event/01_event.js";
-import { getWindowInfo } from "ext:host_v8_system/03_window_info.js";
 
 const { ObjectDefineProperties, ObjectDefineProperty, ObjectFreeze } = primordials;
 
@@ -22,7 +21,12 @@ const _windowMetricsCache = {
 
 function _readWindowMetrics() {
     try {
-        const info = getWindowInfo();
+        // getWindowInfo is provided by host_v8_system (api-connectivity feature).
+        // When the feature is disabled it will not exist on globalThis, so we
+        // guard the call and fall back to the last cached values.
+        var _getWinInfo = globalThis.getWindowInfo;
+        if (typeof _getWinInfo !== 'function') return _windowMetricsCache;
+        const info = _getWinInfo();
         _windowMetricsCache.windowWidth = info.windowWidth || 0;
         _windowMetricsCache.windowHeight = info.windowHeight || 0;
         _windowMetricsCache.screenWidth = info.screenWidth || _windowMetricsCache.windowWidth;

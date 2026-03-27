@@ -591,7 +591,8 @@ pub struct TouchPoint {
 
 // Compile-time layout checks to prevent accidental ABI mismatch.
 // These ensure the struct matches the Java/native side exactly.
-const _: [(); 20] = [(); core::mem::size_of::<TouchPoint>()];
+// Must match Java's TOUCH_POINT_SIZE = 20 bytes.
+const _: () = assert!(std::mem::size_of::<TouchPoint>() == 20);
 const _: [(); 4] = [(); core::mem::align_of::<TouchPoint>()];
 
 /// Type of touch event.

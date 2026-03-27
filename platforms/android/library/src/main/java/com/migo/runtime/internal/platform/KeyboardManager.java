@@ -172,7 +172,7 @@ public class KeyboardManager {
 
         InputMethodManager imm = getImm();
         if (imm != null) {
-            imm.showSoftInput(editText, InputMethodManager.SHOW_FORCED);
+            imm.showSoftInput(editText, InputMethodManager.SHOW_IMPLICIT);
         }
 
         startKeyboardHeightMonitoring();

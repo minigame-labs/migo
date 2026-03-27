@@ -28,6 +28,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -48,7 +49,7 @@ public class ImageApiManager {
     private static final int REQUEST_CHOOSE_FILE = 9003;
 
     private final int sessionId;
-    private final Activity activity;
+    private final WeakReference<Activity> activityRef;
     private final Handler mainHandler;
 
     // Pending chooseImage state
@@ -58,8 +59,12 @@ public class ImageApiManager {
 
     public ImageApiManager(int sessionId, Activity activity) {
         this.sessionId = sessionId;
-        this.activity = activity;
+        this.activityRef = new WeakReference<>(activity);
         this.mainHandler = new Handler(Looper.getMainLooper());
+    }
+
+    private Activity getActivity() {
+        return activityRef.get();
     }
 
     // ==================== saveImageToPhotosAlbum ====================
@@ -97,6 +102,10 @@ public class ImageApiManager {
                 extension = mimeType.contains("png") ? ".png" : ".jpg";
             }
 
+            Activity activity = getActivity();
+            if (activity == null) {
+                throw new RuntimeException("saveImageToPhotosAlbum:fail activity is gone");
+            }
             ContentResolver resolver = activity.getContentResolver();
             ContentValues values = new ContentValues();
             values.put(MediaStore.Images.Media.DISPLAY_NAME, "IMG_" + System.currentTimeMillis() + extension);
@@ -166,6 +175,10 @@ public class ImageApiManager {
             Intent intent = new Intent(Intent.ACTION_VIEW);
             intent.setDataAndType(uri, mime);
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            Activity activity = getActivity();
+            if (activity == null) {
+                throw new RuntimeException("previewMedia:fail activity is gone");
+            }
             activity.startActivity(intent);
         } catch (RuntimeException e) {
             throw e;
@@ -201,6 +214,10 @@ public class ImageApiManager {
             Intent intent = new Intent(Intent.ACTION_VIEW);
             intent.setDataAndType(uri, "image/*");
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            Activity activity = getActivity();
+            if (activity == null) {
+                throw new RuntimeException("previewImage:fail activity is gone");
+            }
             activity.startActivity(intent);
         } catch (RuntimeException e) {
             throw e;
@@ -353,6 +370,11 @@ public class ImageApiManager {
                     intent.addCategory(Intent.CATEGORY_OPENABLE);
                     if (count > 1) {
                         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                    }
+                    Activity activity = getActivity();
+                    if (activity == null) {
+                        sendChooseMessageFileError("chooseMessageFile:fail activity is gone");
+                        return;
                     }
                     ResultProxyActivity.launch(activity,
                             Intent.createChooser(intent, "Choose File"),
@@ -582,6 +604,8 @@ public class ImageApiManager {
      */
     private JSONObject resolveFileInfo(Uri uri) {
         try {
+            Activity activity = getActivity();
+            if (activity == null) return null;
             ContentResolver resolver = activity.getContentResolver();
             String name = "unknown";
             long size = 0;
@@ -644,6 +668,11 @@ public class ImageApiManager {
         if (count > 1) {
             intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
         }
+        Activity activity = getActivity();
+        if (activity == null) {
+            sendChooseImageError("chooseImage:fail activity is gone");
+            return;
+        }
         ResultProxyActivity.launch(activity,
                 Intent.createChooser(intent, "Choose Image"),
                 REQUEST_CHOOSE_IMAGE, this::onActivityResult);
@@ -651,6 +680,11 @@ public class ImageApiManager {
 
     private void launchCameraCapture() {
         Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+        Activity activity = getActivity();
+        if (activity == null) {
+            sendChooseImageError("chooseImage:fail activity is gone");
+            return;
+        }
         if (intent.resolveActivity(activity.getPackageManager()) == null) {
             sendChooseImageError("chooseImage:fail no camera app");
             return;
@@ -682,6 +716,10 @@ public class ImageApiManager {
     // ========================================================================
 
     private File createTempFile(String prefix, String extension) throws IOException {
+        Activity activity = getActivity();
+        if (activity == null) {
+            throw new IOException("activity is gone");
+        }
         File cacheDir = new File(activity.getCacheDir(), "image_api");
         if (!cacheDir.exists()) {
             cacheDir.mkdirs();
@@ -695,6 +733,8 @@ public class ImageApiManager {
     private String copyUriToTemp(Uri uri, String prefix, String ext) {
         try {
             File tempFile = createTempFile(prefix, ext);
+            Activity activity = getActivity();
+            if (activity == null) return null;
             try (InputStream in = activity.getContentResolver().openInputStream(uri);
                  FileOutputStream out = new FileOutputStream(tempFile)) {
                 if (in == null) return null;
@@ -727,10 +767,13 @@ public class ImageApiManager {
     /**
      * Get a URI for a local file that is safe to pass to external apps.
      * On API 24+, file:// URIs cause FileUriExposedException, so we use
-     * MediaStore to obtain a content:// URI instead.
+     * MediaStore to obtain a content:// URI instead. Returns null if
+     * the content URI cannot be created on API 24+.
      */
     private Uri getFileUri(File file) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            Activity activity = getActivity();
+            if (activity == null) return null;
             try {
                 ContentValues values = new ContentValues();
                 values.put(MediaStore.Images.Media.DATA, file.getAbsolutePath());
@@ -741,10 +784,11 @@ public class ImageApiManager {
                     return uri;
                 }
             } catch (Exception e) {
-                Log.w(TAG, "getFileUri: MediaStore insert failed, falling back to file URI", e);
+                Log.w(TAG, "getFileUri: MediaStore insert failed", e);
             }
-            // Fallback: wrap in try-catch at the call site
-            return Uri.fromFile(file);
+            // Do NOT fall back to Uri.fromFile on API 24+ as it causes
+            // FileUriExposedException. Return null and let caller handle.
+            return null;
         }
         return Uri.fromFile(file);
     }

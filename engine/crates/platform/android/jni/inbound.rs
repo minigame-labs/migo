@@ -154,12 +154,17 @@ pub(crate) extern "system" fn init(
         return -1;
     }
 
-    let (w, h) = unsafe {
+    let (raw_w, raw_h) = unsafe {
         (
-            ANativeWindow_getWidth(window as usize),
-            ANativeWindow_getHeight(window as usize),
+            ANativeWindow_getWidth(window),
+            ANativeWindow_getHeight(window),
         )
     };
+    if raw_w <= 0 || raw_h <= 0 {
+        error!("init failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}", raw_w, raw_h);
+        return -1;
+    }
+    let (w, h) = (raw_w as u32, raw_h as u32);
 
     // Read required fields from RuntimeConfig
     let cache_dir = match super::get_string_field(&mut env, "cacheDir", &options) {
@@ -281,12 +286,17 @@ pub(crate) extern "system" fn updateSurface<'local>(
         return;
     }
 
-    let (w, h) = unsafe {
+    let (raw_w, raw_h) = unsafe {
         (
-            ANativeWindow_getWidth(window as usize),
-            ANativeWindow_getHeight(window as usize),
+            ANativeWindow_getWidth(window),
+            ANativeWindow_getHeight(window),
         )
     };
+    if raw_w <= 0 || raw_h <= 0 {
+        error!("updateSurface failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}", raw_w, raw_h);
+        return;
+    }
+    let (w, h) = (raw_w as u32, raw_h as u32);
 
     let android_surface = match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) } {
         Ok(s) => s,
@@ -317,8 +327,23 @@ pub(crate) extern "system" fn onOpenSystemBluetoothSetting<'local>(
     host_id: jint,
     enabled: jint,
 ) {
+    let json = if enabled >= 0 {
+        format!(
+            r#"{{"errMsg":"openBluetoothAdapterSetting:ok","code":{}}}"#,
+            enabled
+        )
+    } else {
+        format!(
+            r#"{{"errMsg":"openBluetoothAdapterSetting:fail","code":{}}}"#,
+            enabled
+        )
+    };
+    let escaped = json.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
     let cmd = HostCommand::EvalScript {
-        source: format!("_internalOnOpenBluetoothSettingFinished({});", enabled),
+        source: format!("_internalOnOpenBluetoothSettingResult('{}');", escaped),
     };
     let _ = send_command_to_host(host_id, cmd);
 }

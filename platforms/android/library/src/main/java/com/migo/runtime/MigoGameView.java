@@ -44,7 +44,7 @@ import com.migo.runtime.callback.GameSessionListener;
 public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback {
 
     private SurfaceView surfaceView;
-    private GameSession session;
+    private volatile GameSession session;
     private RuntimeConfig config;
     private GameSessionListener gameListener;
     private String pendingGameId;

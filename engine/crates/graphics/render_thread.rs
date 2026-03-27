@@ -7,6 +7,7 @@ use crate::{
     onscreen_window_from_surface,
 };
 use crossbeam_channel::{Receiver, bounded, select, tick};
+use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::render_cmd::RenderCommand;
 use shared::surface::SurfaceRef;
 use tokio::sync::mpsc::Sender as TokioSender;
@@ -34,7 +35,7 @@ impl RenderThread {
         host_id: i32,
         initial_surface: Option<SurfaceRef>,
         dpi: f32,
-    ) -> Self {
+    ) -> EngineResult<Self> {
         Self::spawn_with_capacity(
             raf_tx,
             vsync_rx,
@@ -53,7 +54,7 @@ impl RenderThread {
         initial_surface: Option<SurfaceRef>,
         dpi: f32,
         queue_capacity: usize,
-    ) -> Self {
+    ) -> EngineResult<Self> {
         let (cmd_tx, cmd_rx) = bounded::<RenderCommand>(queue_capacity);
 
         let handle = std::thread::Builder::new()
@@ -607,12 +608,17 @@ impl RenderThread {
                     shared::stats::unregister_stats(host_id);
                 }
             })
-            .expect("failed to spawn Migo-RenderThread");
+            .map_err(|e| {
+                EngineError::from_detail(
+                    ErrorCode::IoError,
+                    format!("failed to spawn render thread: {}", e),
+                )
+            })?;
 
-        Self {
+        Ok(Self {
             cmd_tx,
             handle: Some(handle),
-        }
+        })
     }
 
     pub fn sender(&self) -> crossbeam_channel::Sender<RenderCommand> {

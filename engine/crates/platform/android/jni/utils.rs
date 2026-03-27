@@ -46,6 +46,10 @@ pub(crate) fn get_string_field(
         .l()
         .map_err(|e| format!("Field '{field_name}' is not an object: {e}"))?;
 
+    if jobj.is_null() {
+        return Err(format!("Field '{}' is null", field_name));
+    }
+
     let jstr = JString::from(jobj);
 
     env.get_string(&jstr)
