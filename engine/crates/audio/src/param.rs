@@ -16,6 +16,7 @@ enum AutomationEvent {
         time_constant: f64,
     },
     /// Cancel all scheduled events after a specific time
+    #[allow(dead_code)]
     CancelScheduled { cancel_time: f64 },
 }
 

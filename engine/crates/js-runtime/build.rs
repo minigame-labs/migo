@@ -13,6 +13,7 @@ fn main() {
     // Re-run if the snapshot file is added, removed, or regenerated.
     println!("cargo:rerun-if-changed=SNAPSHOT.bin");
 
+    let profile = std::env::var("PROFILE").unwrap_or_default();
     let snapshot_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("SNAPSHOT.bin");
     if snapshot_path.exists() {
         println!("cargo:rustc-cfg=migo_has_snapshot");
@@ -22,7 +23,7 @@ fn main() {
                 .map(|m| m.len())
                 .unwrap_or(0)
         );
-    } else {
+    } else if profile == "release" {
         println!("cargo:warning=No V8 snapshot found — release builds will fail to compile");
     }
 }

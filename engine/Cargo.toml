@@ -17,17 +17,18 @@ tokio = { version = "1.46.1", default-features = false }
 futures = "0.3.31"
 serde = { version = "1.0.219", features = ["rc"] }
 reqwest = { version = "=0.12.4", default-features = false, features = ["rustls-tls", "stream", "http2", "multipart"] }
-# Note: reqwest "rustls-tls" bundles webpki-roots (~100KB Mozilla root cert list), NOT native OS roots.
-# reqwest 0.12.4 does not offer a "rustls-tls-native-roots" feature (unlike tokio-tungstenite below).
-# For websocket we use the OS cert store via rustls-tls-native-roots to avoid double-bundling.
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+# Note: reqwest "rustls-tls" already bundles webpki-roots (~100KB Mozilla root cert list).
+# On Android, native root-store discovery may fail in some environments, causing
+# WebSocket TLS handshake errors such as "no native root CA certificates found".
+# Use webpki roots for tokio-tungstenite as well for deterministic behavior.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 thiserror = "2.0.12"
 http = "1.0"
 data-url = "=0.3.1"
 bytes = "1.4.0"
-glow = { version = "0.16", default-features = false }
+glow = { version = "0.17", default-features = false }
 khronos-egl = { version = "6", features = ["dynamic"] }
-femtovg = { version = "0.19.3", default-features = false, features = ["textlayout"] }
+femtovg = { version = "0.22", default-features = false, features = ["textlayout"] }
 
 # Image decoding - only enable formats actually needed
 # Removing unused formats can save 500KB-1MB

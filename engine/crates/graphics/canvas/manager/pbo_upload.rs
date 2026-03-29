@@ -18,6 +18,7 @@ use tracing::{debug, trace, warn};
 use super::types::ee;
 
 /// Configuration for PBO uploads
+#[allow(dead_code)]
 pub struct PboConfig {
     /// Enable PBO usage (requires ES 3.0+)
     pub enabled: bool,
@@ -120,7 +121,7 @@ pub fn upload_texture_with_pbo(
 
     if use_pbo && !image.rgba.is_empty() {
         // Try pool-based PBO upload first, fall back to create-delete
-        upload_with_pbo_pooled(gl, tex, image, pool)?;
+        upload_with_pbo_pooled(gl, image, pool)?;
     } else {
         // Fallback - synchronous upload
         upload_sync_internal(gl, tex, image)?;
@@ -148,7 +149,6 @@ pub fn upload_texture_with_pbo(
 /// Internal: Upload using PBO with optional pool reuse
 fn upload_with_pbo_pooled(
     gl: &glow::Context,
-    tex: glow::NativeTexture,
     image: &NormalizedImage,
     mut pool: Option<&mut PboPool>,
 ) -> EngineResult<()> {

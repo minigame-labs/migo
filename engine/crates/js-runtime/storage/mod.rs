@@ -31,7 +31,6 @@ use shared::protocol::{
     self,
     io_cmd::{IOCmd, IOCmdResp},
 };
-use tokio::sync::mpsc::UnboundedSender;
 
 /// Storage directory name under `app_files_dir`.
 const STORAGE_DIR: &str = "kv_storage";
@@ -276,13 +275,6 @@ impl From<EngineError> for StorageError {
             None => StorageError::Message(e.msg.to_string()),
         }
     }
-}
-
-/// Get IO channel from async op state.
-#[inline]
-fn get_io_tx_async(state: Rc<RefCell<OpState>>) -> UnboundedSender<IOCmd> {
-    let st = state.borrow();
-    st.borrow::<HostOpState>().io_tx.clone()
 }
 
 #[op2(async(lazy), fast)]

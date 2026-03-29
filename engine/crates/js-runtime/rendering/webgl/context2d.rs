@@ -7,17 +7,21 @@
 //! Sync operations (`op_create_context_2d`, `op_measure_text`, `op_get_image_data`)
 //! use `RenderCommand::Canvas2D` for synchronous request/response.
 
-use deno_core::{OpState, op2};
-use std::sync::LazyLock;
+use crossbeam_channel::{SendTimeoutError, TrySendError};
+use deno_core::{op2, OpState};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::time::Duration;
 use tracing::{error, trace};
 
 use shared::{
     op_state::CanvasOpState,
     protocol::{
         color::Color,
-        render_cmd::{Canvas2DCmd, RenderCommand, TextAlign, TextBaseline, TextMetrics},
+        render_cmd::{
+            Canvas2DCmd, GradientType, RenderCommand, TextAlign, TextBaseline, TextMetrics,
+        },
         send_render_with_resp_sync,
     },
 };
@@ -342,7 +346,8 @@ impl FrameBuffer {
     }
 
     fn set_composite_operation(&mut self, op: u8) {
-        self.commands.push(Canvas2DCmd::SetCompositeOperation { op });
+        self.commands
+            .push(Canvas2DCmd::SetCompositeOperation { op });
     }
 
     fn set_line_dash(&mut self, segments: Vec<f32>) {
@@ -354,20 +359,78 @@ impl FrameBuffer {
             .push(Canvas2DCmd::SetLineDashOffset { offset });
     }
 
+    fn set_shadow_blur(&mut self, blur: f32) {
+        self.commands.push(Canvas2DCmd::SetShadowBlur { blur });
+    }
+    fn set_shadow_color(&mut self, color: Color) {
+        self.commands.push(Canvas2DCmd::SetShadowColor { color });
+    }
+    fn set_shadow_offset_x(&mut self, offset: f32) {
+        self.commands.push(Canvas2DCmd::SetShadowOffsetX { offset });
+    }
+    fn set_shadow_offset_y(&mut self, offset: f32) {
+        self.commands.push(Canvas2DCmd::SetShadowOffsetY { offset });
+    }
+
     fn set_fill_style_gradient(
         &mut self,
+        gradient_type: GradientType,
         x0: f32,
         y0: f32,
+        r0: f32,
         x1: f32,
         y1: f32,
+        r1: f32,
         stops: Vec<shared::protocol::render_cmd::GradientStop>,
     ) {
         self.fill_color = None; // invalidate solid-color cache
         self.commands.push(Canvas2DCmd::SetFillStyleGradient {
+            gradient_type,
             x0,
             y0,
+            r0,
             x1,
             y1,
+            r1,
+            stops,
+        });
+    }
+
+    fn set_fill_style_pattern(&mut self, image_id: u32, repeat_x: bool, repeat_y: bool) {
+        self.fill_color = None;
+        self.commands
+            .push(Canvas2DCmd::SetFillStylePattern { image_id, repeat_x, repeat_y });
+    }
+
+    fn set_stroke_style_pattern(&mut self, image_id: u32, repeat_x: bool, repeat_y: bool) {
+        self.stroke_color = None;
+        self.commands.push(Canvas2DCmd::SetStrokeStylePattern {
+            image_id,
+            repeat_x,
+            repeat_y,
+        });
+    }
+
+    fn set_stroke_style_gradient(
+        &mut self,
+        gradient_type: GradientType,
+        x0: f32,
+        y0: f32,
+        r0: f32,
+        x1: f32,
+        y1: f32,
+        r1: f32,
+        stops: Vec<shared::protocol::render_cmd::GradientStop>,
+    ) {
+        self.stroke_color = None; // invalidate solid-color cache
+        self.commands.push(Canvas2DCmd::SetStrokeStyleGradient {
+            gradient_type,
+            x0,
+            y0,
+            r0,
+            x1,
+            y1,
+            r1,
             stops,
         });
     }
@@ -585,17 +648,73 @@ impl FrameCommandCollector {
     }
 
     #[inline]
+    fn set_shadow_blur(&self, canvas_id: u32, blur: f32) {
+        self.with_buffer(canvas_id, |buf| buf.set_shadow_blur(blur));
+    }
+    #[inline]
+    fn set_shadow_color(&self, canvas_id: u32, color: Color) {
+        self.with_buffer(canvas_id, |buf| buf.set_shadow_color(color));
+    }
+    #[inline]
+    fn set_shadow_offset_x(&self, canvas_id: u32, offset: f32) {
+        self.with_buffer(canvas_id, |buf| buf.set_shadow_offset_x(offset));
+    }
+    #[inline]
+    fn set_shadow_offset_y(&self, canvas_id: u32, offset: f32) {
+        self.with_buffer(canvas_id, |buf| buf.set_shadow_offset_y(offset));
+    }
+
+    #[inline]
     fn set_fill_style_gradient(
         &self,
         canvas_id: u32,
+        gradient_type: GradientType,
         x0: f32,
         y0: f32,
+        r0: f32,
         x1: f32,
         y1: f32,
+        r1: f32,
         stops: Vec<shared::protocol::render_cmd::GradientStop>,
     ) {
         self.with_buffer(canvas_id, |buf| {
-            buf.set_fill_style_gradient(x0, y0, x1, y1, stops)
+            buf.set_fill_style_gradient(gradient_type, x0, y0, r0, x1, y1, r1, stops)
+        });
+    }
+
+    #[inline]
+    fn set_fill_style_pattern(&self, canvas_id: u32, image_id: u32, repeat_x: bool, repeat_y: bool) {
+        self.with_buffer(canvas_id, |buf| buf.set_fill_style_pattern(image_id, repeat_x, repeat_y));
+    }
+
+    #[inline]
+    fn set_stroke_style_pattern(
+        &self,
+        canvas_id: u32,
+        image_id: u32,
+        repeat_x: bool,
+        repeat_y: bool,
+    ) {
+        self.with_buffer(canvas_id, |buf| {
+            buf.set_stroke_style_pattern(image_id, repeat_x, repeat_y)
+        });
+    }
+
+    #[inline]
+    fn set_stroke_style_gradient(
+        &self,
+        canvas_id: u32,
+        gradient_type: GradientType,
+        x0: f32,
+        y0: f32,
+        r0: f32,
+        x1: f32,
+        y1: f32,
+        r1: f32,
+        stops: Vec<shared::protocol::render_cmd::GradientStop>,
+    ) {
+        self.with_buffer(canvas_id, |buf| {
+            buf.set_stroke_style_gradient(gradient_type, x0, y0, r0, x1, y1, r1, stops)
         });
     }
 
@@ -657,6 +776,84 @@ pub fn op_create_context_2d(state: &mut OpState, #[smi] canvas_id: u32) -> i32 {
     }
 }
 
+/// Flush any pending batched Canvas2D commands for `canvas_id` to the render
+/// thread before issuing a synchronous operation (measureText, getImageData).
+///
+/// Game frameworks (e.g. Cocos Creator) render text to an offscreen canvas with
+/// fillText (batched), then immediately read pixels via texImage2D → getImageData
+/// (sync).  Without this flush the render thread has no buffered commands and
+/// returns stale / empty pixel data.
+fn flush_pending_commands(state: &mut OpState, canvas_id: u32) {
+    let pending = if let Some(collector) = state.try_borrow_mut::<FrameCommandCollector>() {
+        collector.with_buffer(canvas_id, |buf| {
+            if buf.commands.is_empty() {
+                None
+            } else {
+                Some(std::mem::take(&mut buf.commands))
+            }
+        })
+    } else {
+        None
+    };
+
+    let Some(cmds) = pending else {
+        return;
+    };
+
+    let batch_cmd = RenderCommand::Canvas2DBatch {
+        canvas_id,
+        commands: cmds,
+    };
+
+    enum FlushSendError {
+        Timeout(RenderCommand),
+        Disconnected,
+    }
+
+    let send_result = {
+        let ctx = state.borrow::<CanvasOpState>();
+        match ctx.tx.try_send(batch_cmd) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(cmd)) => ctx
+                .tx
+                .send_timeout(cmd, Duration::from_millis(8))
+                .map_err(|e| match e {
+                    SendTimeoutError::Timeout(cmd) => FlushSendError::Timeout(cmd),
+                    SendTimeoutError::Disconnected(_) => FlushSendError::Disconnected,
+                }),
+            Err(TrySendError::Disconnected(_)) => Err(FlushSendError::Disconnected),
+        }
+    };
+
+    match send_result {
+        Ok(()) => {}
+        Err(FlushSendError::Timeout(RenderCommand::Canvas2DBatch {
+            mut commands,
+            ..
+        })) => {
+            if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+                collector.with_buffer(canvas_id, |buf| {
+                    if buf.commands.is_empty() {
+                        buf.commands = commands;
+                    } else {
+                        commands.append(&mut buf.commands);
+                        buf.commands = commands;
+                    }
+                });
+            }
+            error!(
+                "flush_pending_commands: timed out while flushing; commands re-queued"
+            );
+        }
+        Err(FlushSendError::Timeout(_)) => {
+            error!("flush_pending_commands: timeout sending unknown command batch");
+        }
+        Err(FlushSendError::Disconnected) => {
+            error!("flush_pending_commands: render thread disconnected");
+        }
+    }
+}
+
 const OP_MEASURE_TEXT: &str = "canvas2d measure_text";
 #[op2]
 #[serde]
@@ -665,6 +862,8 @@ pub fn op_measure_text(
     #[smi] canvas_id: u32,
     #[string] text: String,
 ) -> TextMetrics {
+    // Flush pending commands so the render thread has the latest font state.
+    flush_pending_commands(state, canvas_id);
     let ctx = state.borrow::<CanvasOpState>();
     match send_render_with_resp_sync(ctx, OP_MEASURE_TEXT, |resp| RenderCommand::Canvas2D {
         canvas_id,
@@ -697,6 +896,8 @@ pub fn op_get_image_data(
     width: u32,
     height: u32,
 ) -> Vec<u8> {
+    // Flush pending draw commands so the framebuffer contains up-to-date content.
+    flush_pending_commands(state, canvas_id);
     let ctx = state.borrow::<CanvasOpState>();
     match send_render_with_resp_sync(ctx, OP_GET_IMAGE_DATA, |resp| RenderCommand::Canvas2D {
         canvas_id,
@@ -1097,11 +1298,7 @@ pub fn op_set_composite_operation(state: &mut OpState, #[smi] canvas_id: u32, #[
 }
 
 #[op2(fast)]
-pub fn op_set_line_dash(
-    state: &mut OpState,
-    #[smi] canvas_id: u32,
-    #[buffer] segments: &[u8],
-) {
+pub fn op_set_line_dash(state: &mut OpState, #[smi] canvas_id: u32, #[buffer] segments: &[u8]) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
         // segments is a Float32Array transferred as raw bytes
         let floats: Vec<f32> = segments
@@ -1120,19 +1317,94 @@ pub fn op_set_line_dash_offset(state: &mut OpState, #[smi] canvas_id: u32, offse
 }
 
 #[op2(fast)]
+pub fn op_set_shadow_blur(state: &mut OpState, #[smi] canvas_id: u32, blur: f32) {
+    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+        collector.set_shadow_blur(canvas_id, blur);
+    }
+}
+
+#[op2(fast)]
+pub fn op_set_shadow_color(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[string] color_str: String,
+) {
+    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+        let color = parse_color_string(&color_str);
+        collector.set_shadow_color(canvas_id, color);
+    }
+}
+
+#[op2(fast)]
+pub fn op_set_shadow_offset_x(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
+    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+        collector.set_shadow_offset_x(canvas_id, offset);
+    }
+}
+
+#[op2(fast)]
+pub fn op_set_shadow_offset_y(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
+    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+        collector.set_shadow_offset_y(canvas_id, offset);
+    }
+}
+
+#[op2(fast)]
 pub fn op_set_fill_style_gradient(
     state: &mut OpState,
     #[smi] canvas_id: u32,
+    #[smi] gradient_type: u8,
     x0: f32,
     y0: f32,
+    r0: f32,
     x1: f32,
     y1: f32,
+    r1: f32,
     #[string] stops_json: String,
 ) {
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
         // Parse stops from JSON: [{"offset":0,"r":255,"g":0,"b":0,"a":255}, ...]
         let stops = parse_gradient_stops(&stops_json);
-        collector.set_fill_style_gradient(canvas_id, x0, y0, x1, y1, stops);
+        let gradient_type = match gradient_type {
+            1 => GradientType::Radial,
+            2 => GradientType::Conic,
+            _ => GradientType::Linear,
+        };
+        collector.set_fill_style_gradient(canvas_id, gradient_type, x0, y0, r0, x1, y1, r1, stops);
+    }
+}
+
+#[op2(fast)]
+pub fn op_set_stroke_style_gradient(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] gradient_type: u8,
+    x0: f32,
+    y0: f32,
+    r0: f32,
+    x1: f32,
+    y1: f32,
+    r1: f32,
+    #[string] stops_json: String,
+) {
+    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+        let stops = parse_gradient_stops(&stops_json);
+        let gradient_type = match gradient_type {
+            1 => GradientType::Radial,
+            2 => GradientType::Conic,
+            _ => GradientType::Linear,
+        };
+        collector.set_stroke_style_gradient(
+            canvas_id,
+            gradient_type,
+            x0,
+            y0,
+            r0,
+            x1,
+            y1,
+            r1,
+            stops,
+        );
     }
 }
 
@@ -1173,6 +1445,32 @@ fn parse_gradient_stops(json: &str) -> Vec<shared::protocol::render_cmd::Gradien
         });
     }
     stops
+}
+
+#[op2(fast)]
+pub fn op_set_fill_style_pattern(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] image_id: u32,
+    repeat_x: bool,
+    repeat_y: bool,
+) {
+    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+        collector.set_fill_style_pattern(canvas_id, image_id, repeat_x, repeat_y);
+    }
+}
+
+#[op2(fast)]
+pub fn op_set_stroke_style_pattern(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] image_id: u32,
+    repeat_x: bool,
+    repeat_y: bool,
+) {
+    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+        collector.set_stroke_style_pattern(canvas_id, image_id, repeat_x, repeat_y);
+    }
 }
 
 #[op2(fast)]
@@ -1323,5 +1621,84 @@ pub fn op_draw_image_batch(state: &mut OpState, #[smi] canvas_id: u32, #[buffer]
 
     if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
         collector.push(canvas_id, Canvas2DCmd::DrawImageBatch { draws });
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::protocol::color::Color as SharedColor;
+    use shared::protocol::render_cmd::GradientStop;
+
+    #[test]
+    fn stroke_pattern_pushes_stroke_pattern_command() {
+        let mut buf = FrameBuffer::new();
+        buf.set_stroke_style_pattern(42, true, false);
+
+        assert!(matches!(
+            buf.commands.last(),
+            Some(Canvas2DCmd::SetStrokeStylePattern {
+                image_id: 42,
+                repeat_x: true,
+                repeat_y: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn stroke_pattern_invalidates_stroke_color_cache() {
+        let mut buf = FrameBuffer::new();
+        let color = SharedColor::rgb(12, 34, 56);
+
+        buf.set_stroke_color(color);
+        buf.set_stroke_style_pattern(7, false, true);
+        buf.set_stroke_color(color);
+
+        let stroke_style_count = buf
+            .commands
+            .iter()
+            .filter(|cmd| matches!(cmd, Canvas2DCmd::SetStrokeStyle { color: c } if *c == color))
+            .count();
+
+        assert_eq!(stroke_style_count, 2);
+    }
+
+    #[test]
+    fn conic_gradient_command_preserves_start_angle_in_x1() {
+        let mut buf = FrameBuffer::new();
+        let start_angle = 1.25f32;
+
+        buf.set_fill_style_gradient(
+            GradientType::Conic,
+            100.0,
+            200.0,
+            0.0,
+            start_angle,
+            0.0,
+            0.0,
+            vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: SharedColor::rgb(255, 0, 0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: SharedColor::rgb(0, 0, 255),
+                },
+            ],
+        );
+
+        let Some(Canvas2DCmd::SetFillStyleGradient {
+            gradient_type,
+            x1,
+            ..
+        }) = buf.commands.last()
+        else {
+            panic!("expected SetFillStyleGradient command");
+        };
+
+        assert_eq!(*gradient_type, GradientType::Conic);
+        assert!((*x1 - start_angle).abs() < f32::EPSILON);
     }
 }

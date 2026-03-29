@@ -51,6 +51,7 @@ pub enum AudioNodeType {
     IIRFilter,
     Panner,
     WaveShaper,
+    #[allow(dead_code)]
     ScriptProcessor,
 }
 
@@ -100,6 +101,7 @@ pub trait AudioNodeProcessor: Send + 'static {
     }
 
     /// Get the number of output channels
+    #[allow(dead_code)]
     fn output_channels(&self) -> u32 {
         2 // Default stereo
     }

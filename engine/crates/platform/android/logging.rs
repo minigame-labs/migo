@@ -1,30 +1,93 @@
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
+use shared::config::LogLevel;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{Registry, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Registry};
+
+/// Stores the active log level as a `LevelFilter` discriminant.
+/// Updated via `update_log_level()`; read on every tracing event.
+static ACTIVE_LEVEL: AtomicU8 = AtomicU8::new(0); // 0 = OFF initially
 
 static LOG_INIT: OnceLock<()> = OnceLock::new();
 
+fn level_filter_to_u8(f: LevelFilter) -> u8 {
+    match f {
+        LevelFilter::OFF => 0,
+        LevelFilter::ERROR => 1,
+        LevelFilter::WARN => 2,
+        LevelFilter::INFO => 3,
+        LevelFilter::DEBUG => 4,
+        LevelFilter::TRACE => 5,
+    }
+}
+
+fn u8_to_level_filter(v: u8) -> LevelFilter {
+    match v {
+        0 => LevelFilter::OFF,
+        1 => LevelFilter::ERROR,
+        2 => LevelFilter::WARN,
+        3 => LevelFilter::INFO,
+        4 => LevelFilter::DEBUG,
+        _ => LevelFilter::TRACE,
+    }
+}
+
+fn log_level_to_filter(level: LogLevel) -> LevelFilter {
+    match level {
+        LogLevel::Trace => LevelFilter::TRACE,
+        LogLevel::Debug => LevelFilter::DEBUG,
+        LogLevel::Info => LevelFilter::INFO,
+        LogLevel::Warn => LevelFilter::WARN,
+        LogLevel::Error => LevelFilter::ERROR,
+        LogLevel::Off => LevelFilter::OFF,
+    }
+}
+
+fn load_active_filter() -> LevelFilter {
+    u8_to_level_filter(ACTIVE_LEVEL.load(Ordering::Relaxed))
+}
+
+/// Update the active log level at runtime.
+///
+/// Called when a new session is created with RuntimeConfig.
+pub fn update_log_level(level: LogLevel) {
+    let filter = log_level_to_filter(level);
+    ACTIVE_LEVEL.store(level_filter_to_u8(filter), Ordering::Relaxed);
+}
+
 /// Initialize tracing subscriber for Android (logcat).
 /// Safe to call multiple times; it will only initialize once.
+///
+/// Sets the default log level based on build type:
+/// - debug builds: DEBUG
+/// - release builds: WARN
 pub fn init_logging() {
     if LOG_INIT.set(()).is_err() {
-        // Already initialized
         return;
     }
+
+    #[cfg(debug_assertions)]
+    let default_level = LevelFilter::DEBUG;
+    #[cfg(not(debug_assertions))]
+    let default_level = LevelFilter::WARN;
+
+    ACTIVE_LEVEL.store(level_filter_to_u8(default_level), Ordering::Relaxed);
 
     // Android logcat layer.
     let android_layer =
         tracing_android::layer("[migo]").expect("failed to create tracing_android layer");
 
+    // Dynamic filter layer that reads the atomic level on each event.
+    let dynamic_filter = DynamicLevelFilter;
+
     #[cfg(debug_assertions)]
     {
-        // Optional timing layer for spans in debug builds.
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
         use std::time::Instant;
 
-        use tracing::{Id, Subscriber, field::Visit};
+        use tracing::{field::Visit, Id, Subscriber};
         use tracing_subscriber::layer::{Context, Layer};
         use tracing_subscriber::registry::LookupSpan;
 
@@ -90,15 +153,15 @@ pub fn init_logging() {
             spans: Arc::new(Mutex::new(HashMap::new())),
         };
 
+        // TRACE allows all events through; DynamicLevelFilter does the actual filtering.
         Registry::default()
-            .with(LevelFilter::DEBUG)
+            .with(LevelFilter::TRACE)
+            .with(dynamic_filter)
             .with(android_layer)
             .with(timing_layer)
             .init();
 
         // Install panic hook for better crash logs in debug builds.
-        // Note: We use Backtrace::force_capture() which captures backtrace regardless of
-        // RUST_BACKTRACE env var, so no need to set it (which would be unsafe in multi-threaded context).
         std::panic::set_hook(Box::new(|info| {
             use std::backtrace::Backtrace;
 
@@ -129,8 +192,22 @@ pub fn init_logging() {
     #[cfg(not(debug_assertions))]
     {
         Registry::default()
-            .with(LevelFilter::DEBUG)
+            .with(LevelFilter::TRACE)
+            .with(dynamic_filter)
             .with(android_layer)
             .init();
+    }
+}
+
+/// A layer that filters events based on the global atomic log level.
+struct DynamicLevelFilter;
+
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for DynamicLevelFilter {
+    fn enabled(
+        &self,
+        meta: &tracing::Metadata<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        meta.level() <= &load_active_filter()
     }
 }

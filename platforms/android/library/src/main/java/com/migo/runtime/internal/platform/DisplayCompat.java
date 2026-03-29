@@ -2,12 +2,14 @@ package com.migo.runtime.internal.platform;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.res.Configuration;
 import android.content.pm.ActivityInfo;
 import android.graphics.Point;
 import android.os.Build;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.view.Display;
+import android.view.Surface;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowInsets;
@@ -129,6 +131,44 @@ public final class DisplayCompat {
         int rotation = getRotation(activity);
         return rotation == android.view.Surface.ROTATION_90 
             || rotation == android.view.Surface.ROTATION_270;
+    }
+
+    /**
+     * Map current activity/configuration state to device orientation event value.
+     *
+     * @param activity      The activity
+     * @param configuration Current configuration (nullable)
+     * @return "portrait", "landscape", or "landscapeReverse"
+     */
+    public static String mapDeviceOrientationValue(Activity activity, Configuration configuration) {
+        if (activity == null) {
+            return "portrait";
+        }
+
+        int orientation = configuration != null
+                ? configuration.orientation
+                : Configuration.ORIENTATION_UNDEFINED;
+
+        if (orientation == Configuration.ORIENTATION_LANDSCAPE) {
+            int rotation = getRotation(activity);
+            if (rotation == Surface.ROTATION_270) {
+                return "landscapeReverse";
+            }
+            return "landscape";
+        }
+
+        if (orientation == Configuration.ORIENTATION_PORTRAIT) {
+            return "portrait";
+        }
+
+        int rotation = getRotation(activity);
+        if (rotation == Surface.ROTATION_90) {
+            return "landscape";
+        }
+        if (rotation == Surface.ROTATION_270) {
+            return "landscapeReverse";
+        }
+        return "portrait";
     }
 
     // ==================== Status Bar ====================

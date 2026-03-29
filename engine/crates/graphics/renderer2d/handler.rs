@@ -9,6 +9,98 @@ use tracing::trace;
 
 pub(crate) struct Renderer2d;
 
+fn apply_pattern_style(
+    cm: &mut CanvasManager,
+    canvas_id: shared::protocol::render_cmd::CanvasId,
+    image_id: u32,
+    repeat_x: bool,
+    repeat_y: bool,
+    stroke: bool,
+) -> EngineResult<()> {
+    let mut flags = femtovg::ImageFlags::empty();
+    if repeat_x {
+        flags |= femtovg::ImageFlags::REPEAT_X;
+    }
+    if repeat_y {
+        flags |= femtovg::ImageFlags::REPEAT_Y;
+    }
+
+    if let Some((fv_id, native_tex, info)) = cm.get_owned_fv_image(image_id, canvas_id) {
+        let (w, h) = (info.width() as f32, info.height() as f32);
+
+        // Skip re-registration when repeat flags already match
+        if info.flags() == flags {
+            let ctx = cm.get_2d_context_mut(canvas_id)?;
+            if stroke {
+                ctx.set_stroke_style_pattern(fv_id, repeat_x, repeat_y, w, h);
+            } else {
+                ctx.set_fill_style_pattern(fv_id, repeat_x, repeat_y, w, h);
+            }
+            return Ok(());
+        }
+
+        let new_info = femtovg::ImageInfo::new(flags, info.width(), info.height(), info.format());
+        let ctx = cm.get_2d_context_mut(canvas_id)?;
+        ctx.canvas.delete_image(fv_id);
+        match ctx.canvas.create_image_from_native_texture(native_tex, new_info) {
+            Ok(new_fv_id) => {
+                if stroke {
+                    ctx.set_stroke_style_pattern(new_fv_id, repeat_x, repeat_y, w, h);
+                } else {
+                    ctx.set_fill_style_pattern(new_fv_id, repeat_x, repeat_y, w, h);
+                }
+                cm.fv_images_mut()
+                    .entry(image_id)
+                    .or_insert_with(HashMap::new)
+                    .insert(canvas_id, (new_fv_id, native_tex, new_info));
+            }
+            Err(_) => {
+                // Re-register without repeat flags so the image entry is not lost
+                if let Ok(fallback_id) = ctx.canvas.create_image_from_native_texture(native_tex, info)
+                {
+                    if stroke {
+                        ctx.set_stroke_style_pattern(fallback_id, false, false, w, h);
+                    } else {
+                        ctx.set_fill_style_pattern(fallback_id, false, false, w, h);
+                    }
+                    cm.fv_images_mut()
+                        .entry(image_id)
+                        .or_insert_with(HashMap::new)
+                        .insert(canvas_id, (fallback_id, native_tex, info));
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(res) = cm.get_shared_fv_image(image_id) {
+        let new_info = femtovg::ImageInfo::new(flags, res.2.width(), res.2.height(), res.2.format());
+        let (w, h) = (res.2.width() as f32, res.2.height() as f32);
+        let ctx = cm.get_2d_context_mut(canvas_id)?;
+        match ctx.canvas.create_image_from_native_texture(res.1, new_info) {
+            Ok(new_id) => {
+                if stroke {
+                    ctx.set_stroke_style_pattern(new_id, repeat_x, repeat_y, w, h);
+                } else {
+                    ctx.set_fill_style_pattern(new_id, repeat_x, repeat_y, w, h);
+                }
+                cm.fv_images_mut()
+                    .entry(image_id)
+                    .or_insert_with(HashMap::new)
+                    .insert(canvas_id, (new_id, res.1, new_info));
+            }
+            Err(e) => {
+                return Err(EngineError::from_detail(
+                    ErrorCode::Render2DResourceError,
+                    format!("pattern image register failed: {:?}", e),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl Renderer2d {
     pub(crate) fn new() -> Self {
         Self
@@ -30,6 +122,7 @@ impl Renderer2d {
         // Handle MeasureText (synchronous response)
         if let Canvas2DCmd::MeasureText { text, resp } = cmd {
             cm.make_current_needed(canvas_id)?;
+            let _gl_scope = cm.begin_canvas2d_gl_scope();
             let context = cm.get_2d_context_mut(canvas_id)?;
             let metrics = context.measure_text(&text);
             let _ = resp.send(Ok(metrics));
@@ -46,6 +139,7 @@ impl Renderer2d {
         } = cmd
         {
             cm.make_current_needed(canvas_id)?;
+            let _gl_scope = cm.begin_canvas2d_gl_scope();
             // Flush pending 2D draw commands so the framebuffer is up to date
             if let Ok(ctx) = cm.get_2d_context_mut(canvas_id) {
                 ctx.flush();
@@ -55,7 +149,13 @@ impl Renderer2d {
             return Ok(false);
         }
 
+        let needs_gl_reset = matches!(
+            &cmd,
+            Canvas2DCmd::FillText { .. } | Canvas2DCmd::StrokeText { .. }
+        );
+
         cm.make_current_needed(canvas_id)?;
+        let _gl_scope = needs_gl_reset.then(|| cm.begin_canvas2d_gl_scope());
         let context = cm.get_2d_context_mut(canvas_id)?;
 
         match cmd {
@@ -234,14 +334,62 @@ impl Renderer2d {
                 context.set_line_dash_offset(offset);
                 Ok(false)
             }
+            Canvas2DCmd::SetShadowBlur { blur } => {
+                context.set_shadow_blur(blur);
+                Ok(false)
+            }
+            Canvas2DCmd::SetShadowColor { color } => {
+                context.set_shadow_color(color);
+                Ok(false)
+            }
+            Canvas2DCmd::SetShadowOffsetX { offset } => {
+                context.set_shadow_offset_x(offset);
+                Ok(false)
+            }
+            Canvas2DCmd::SetShadowOffsetY { offset } => {
+                context.set_shadow_offset_y(offset);
+                Ok(false)
+            }
             Canvas2DCmd::SetFillStyleGradient {
+                gradient_type,
                 x0,
                 y0,
+                r0,
                 x1,
                 y1,
+                r1,
                 stops,
             } => {
-                context.set_fill_style_gradient(x0, y0, x1, y1, stops);
+                context.set_fill_style_gradient(gradient_type, x0, y0, r0, x1, y1, r1, stops);
+                Ok(false)
+            }
+            Canvas2DCmd::SetStrokeStyleGradient {
+                gradient_type,
+                x0,
+                y0,
+                r0,
+                x1,
+                y1,
+                r1,
+                stops,
+            } => {
+                context.set_stroke_style_gradient(gradient_type, x0, y0, r0, x1, y1, r1, stops);
+                Ok(false)
+            }
+            Canvas2DCmd::SetFillStylePattern {
+                image_id,
+                repeat_x,
+                repeat_y,
+            } => {
+                apply_pattern_style(cm, canvas_id, image_id, repeat_x, repeat_y, false)?;
+                Ok(false)
+            }
+            Canvas2DCmd::SetStrokeStylePattern {
+                image_id,
+                repeat_x,
+                repeat_y,
+            } => {
+                apply_pattern_style(cm, canvas_id, image_id, repeat_x, repeat_y, true)?;
                 Ok(false)
             }
             Canvas2DCmd::SetTextAlign { align } => {

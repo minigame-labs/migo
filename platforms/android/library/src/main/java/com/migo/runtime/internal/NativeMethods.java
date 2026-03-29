@@ -111,10 +111,12 @@ public final class NativeMethods {
      *
      * @param sessionId The session ID
      * @param surface   New Surface object
+     * @param width     Surface buffer width in physical pixels
+     * @param height    Surface buffer height in physical pixels
      */
-    public static void updateSurface(int sessionId, Surface surface) {
+    public static void updateSurface(int sessionId, Surface surface, int width, int height) {
         if (sessionId >= 0 && surface != null) {
-            NativeBridge.updateSurface(sessionId, surface);
+            NativeBridge.updateSurface(sessionId, surface, width, height);
         }
     }
 

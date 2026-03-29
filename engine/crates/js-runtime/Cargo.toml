@@ -54,4 +54,8 @@ bytemuck.workspace = true
 image = { workspace = true, optional = true }
 parking_lot = "0.12.4"
 tokio-tungstenite.workspace = true
+# Ensure rustls 0.23 has a concrete crypto provider selected for WebSocket TLS.
+# tokio-tungstenite enables rustls with default-features = false; without ring/
+# aws-lc-rs, runtime handshake panics on provider auto-detection.
+rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12"] }
 futures.workspace = true

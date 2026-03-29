@@ -362,13 +362,25 @@ public final class GameSession implements Closeable {
      * @param surface The new Surface object
      */
     public void updateSurface(Surface surface) {
+        updateSurface(surface, -1, -1);
+    }
+
+    /**
+     * Update the rendering surface with explicit buffer dimensions.
+     *
+     * @param surface The new Surface object
+     * @param width   Surface buffer width in physical pixels
+     * @param height  Surface buffer height in physical pixels
+     */
+    public void updateSurface(Surface surface, int width, int height) {
         if (surface == null) {
             throw new RuntimeException(ErrorCode.ERR_INVALID_SURFACE);
         }
         synchronized (lock) {
             if (destroyed) return;
-            Log.i(TAG, "updateSurface: session=" + sessionId + ", valid=" + surface.isValid());
-            NativeMethods.updateSurface(sessionId, surface);
+            Log.i(TAG, "updateSurface: session=" + sessionId + ", valid=" + surface.isValid()
+                    + ", size=" + width + "x" + height);
+            NativeMethods.updateSurface(sessionId, surface, width, height);
 
             // Auto-attach debug overlay as a WindowManager panel on first surface update.
             // At this point the Activity window is guaranteed to have a valid token.

@@ -5,15 +5,20 @@ import android.app.Application;
 import android.content.ComponentCallbacks2;
 import android.content.Context;
 import android.content.res.Configuration;
+import android.graphics.Rect;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
-import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
 
+import com.migo.runtime.ErrorCode;
 import com.migo.runtime.callback.GameSessionListener;
+import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.platform.DisplayCompat;
+import com.migo.runtime.internal.platform.OrientationWaitHelper;
 
 /**
  * Self-contained game view that manages the full game lifecycle internally.
@@ -43,13 +48,19 @@ import com.migo.runtime.callback.GameSessionListener;
  */
 public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback {
 
+    private static final String TAG = "MigoGameView";
+
     private SurfaceView surfaceView;
     private volatile GameSession session;
     private RuntimeConfig config;
     private GameSessionListener gameListener;
+    private SessionCreatedListener sessionCreatedListener;
     private String pendingGameId;
     private String pendingEntryPoint;
     private boolean surfaceReady = false;
+    private final OrientationWaitHelper orientationHelper = new OrientationWaitHelper(TAG);
+    private String appliedStartupOrientation;
+    private String lastOrientationEventValue;
     private Activity boundActivity;
     private Application.ActivityLifecycleCallbacks lifecycleCallbacks;
     private ComponentCallbacks2 memoryCallback;
@@ -90,6 +101,19 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
     }
 
     /**
+     * Set a callback that fires when GameSession is created.
+     *
+     * This callback runs before startGame, so host handlers can be registered
+     * without polling.
+     */
+    public void setSessionCreatedListener(SessionCreatedListener listener) {
+        this.sessionCreatedListener = listener;
+        if (listener != null && session != null && session.isValid()) {
+            listener.onSessionCreated(session);
+        }
+    }
+
+    /**
      * Load and start a game.
      * <p>
      * If the surface is not ready yet, the game will start automatically
@@ -101,9 +125,14 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
     public void loadGame(String gameId, String entryPoint) {
         this.pendingGameId = gameId;
         this.pendingEntryPoint = entryPoint;
+        orientationHelper.reset();
+        this.appliedStartupOrientation = null;
+        this.lastOrientationEventValue = null;
 
         if (surfaceReady) {
-            startSession();
+            SurfaceHolder holder = surfaceView.getHolder();
+            Rect frame = holder.getSurfaceFrame();
+            tryStartSessionOrDefer(holder, frame.width(), frame.height());
         }
     }
 
@@ -122,22 +151,29 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
     public void surfaceCreated(SurfaceHolder holder) {
         surfaceReady = true;
         if (session != null && session.isValid()) {
-            session.updateSurface(holder.getSurface());
+            orientationHelper.cancel();
+            Rect frame = holder.getSurfaceFrame();
+            session.updateSurface(holder.getSurface(), frame.width(), frame.height());
         } else if (pendingGameId != null) {
-            startSession();
+            Rect frame = holder.getSurfaceFrame();
+            tryStartSessionOrDefer(holder, frame.width(), frame.height());
         }
     }
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         if (session != null && session.isValid()) {
-            session.updateSurface(holder.getSurface());
+            orientationHelper.cancel();
+            session.updateSurface(holder.getSurface(), width, height);
+        } else if (pendingGameId != null) {
+            tryStartSessionOrDefer(holder, width, height);
         }
     }
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         surfaceReady = false;
+        orientationHelper.cancel();
         // Do NOT close the session. The surface is recreated when the view
         // becomes visible again. Session cleanup happens in onDetachedFromWindow.
     }
@@ -166,37 +202,96 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
     @Override
     protected void onDetachedFromWindow() {
         unregisterLifecycleCallbacks();
+        orientationHelper.cancel();
         destroySession();
         super.onDetachedFromWindow();
     }
 
     // ==================== Private ====================
 
-    private void startSession() {
-        if (session != null || pendingGameId == null) return;
-
-        MigoRuntime runtime = MigoRuntime.getInstance();
-        if (!runtime.isNativeLoaded()) return;
-
-        RuntimeConfig cfg = config;
-        if (cfg == null) {
-            cfg = new RuntimeConfig.Builder(getContext()).build();
+    private void tryStartSessionOrDefer(SurfaceHolder holder, int width, int height) {
+        if (session != null || pendingGameId == null) {
+            return;
         }
 
-        Activity activity = findActivity(getContext());
+        RuntimeConfig cfg = ensureConfig();
+        Activity activity = resolveActivity();
+        applyStartupOrientationIfNeeded(cfg, activity);
+
+        if (orientationHelper.getTargetOrientation() != null
+                && !orientationHelper.surfaceMatches(width, height)) {
+            orientationHelper.defer(holder, h -> {
+                if (session != null || pendingGameId == null) return;
+                startSession(h, ensureConfig(), resolveActivity());
+            });
+            return;
+        }
+
+        orientationHelper.cancel();
+        startSession(holder, cfg, activity);
+    }
+
+    private void startSession(SurfaceHolder holder, RuntimeConfig cfg, Activity activity) {
+        if (session != null || pendingGameId == null) {
+            return;
+        }
+
+        MigoRuntime runtime = MigoRuntime.getInstance();
+        if (!runtime.isNativeLoaded()) {
+            return;
+        }
+
+        if (activity == null) {
+            notifySessionError(
+                    ErrorCode.ERR_INVALID_ACTIVITY,
+                    ErrorCode.getMessage(ErrorCode.ERR_INVALID_ACTIVITY),
+                    false
+            );
+            return;
+        }
+
+        MigoRuntime.Result<GameSession> result = runtime.createSessionSafe(
+                activity,
+                holder.getSurface(),
+                cfg,
+                pendingGameId
+        );
+
+        if (result.isFailure()) {
+            notifySessionError(
+                    result.getErrorCode(),
+                    "createSession failed: " + result.getErrorMessage(),
+                    false
+            );
+            return;
+        }
+
+        session = result.getValue();
+
+        if (sessionCreatedListener != null) {
+            try {
+                sessionCreatedListener.onSessionCreated(session);
+            } catch (Throwable t) {
+                Log.e(TAG, "sessionCreatedListener error", t);
+            }
+        }
+
         if (activity != null) {
-            session = runtime.createSession(activity,
-                    surfaceView.getHolder().getSurface(), cfg, pendingGameId);
+            lastOrientationEventValue = DisplayCompat.mapDeviceOrientationValue(activity,
+                    activity.getResources().getConfiguration());
         } else {
-            session = runtime.createSession(getContext(),
-                    surfaceView.getHolder().getSurface(), cfg, pendingGameId);
+            lastOrientationEventValue = null;
         }
 
         if (gameListener != null) {
             session.setListener(gameListener);
         }
 
-        session.startGame(pendingEntryPoint);
+        int startResult = session.startGameSafe(pendingEntryPoint);
+        if (startResult != ErrorCode.SUCCESS) {
+            notifySessionError(startResult, ErrorCode.getMessage(startResult), false);
+            destroySession();
+        }
     }
 
     private void destroySession() {
@@ -204,6 +299,8 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
             session.close();
             session = null;
         }
+        orientationHelper.cancel();
+        lastOrientationEventValue = null;
     }
 
     private void registerLifecycleCallbacks(Activity activity) {
@@ -240,7 +337,15 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
             }
 
             @Override
-            public void onConfigurationChanged(Configuration newConfig) {}
+            public void onConfigurationChanged(Configuration newConfig) {
+                if (session != null && session.isValid() && boundActivity != null) {
+                    String value = DisplayCompat.mapDeviceOrientationValue(boundActivity, newConfig);
+                    if (!value.equals(lastOrientationEventValue)) {
+                        lastOrientationEventValue = value;
+                        NativeMethods.onDeviceOrientationChange(session.getSessionId(), value);
+                    }
+                }
+            }
 
             @Override
             public void onLowMemory() {
@@ -274,6 +379,44 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
         return null;
     }
 
+    private RuntimeConfig ensureConfig() {
+        if (config == null) {
+            config = new RuntimeConfig.Builder(getContext()).build();
+        }
+        return config;
+    }
+
+    private Activity resolveActivity() {
+        Activity activity = boundActivity;
+        if (activity != null) {
+            return activity;
+        }
+        return findActivity(getContext());
+    }
+
+    private void applyStartupOrientationIfNeeded(RuntimeConfig cfg, Activity activity) {
+        String orientation = cfg != null ? cfg.getStartupOrientation() : null;
+
+        if (orientation == null || activity == null) {
+            orientationHelper.setTargetOrientation(null);
+            return;
+        }
+
+        orientationHelper.setTargetOrientation(orientation);
+
+        if (!orientation.equals(appliedStartupOrientation)) {
+            DisplayCompat.setDeviceOrientation(activity, orientation);
+            appliedStartupOrientation = orientation;
+        }
+    }
+
+    private void notifySessionError(int errorCode, String message, boolean recoverable) {
+        Log.e(TAG, "session error: code=" + errorCode + ", message=" + message);
+        if (gameListener != null) {
+            gameListener.onError(errorCode, message, recoverable);
+        }
+    }
+
     /**
      * Minimal implementation of ActivityLifecycleCallbacks with no-op defaults.
      */
@@ -286,5 +429,12 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
         @Override public void onActivityStopped(Activity a) {}
         @Override public void onActivitySaveInstanceState(Activity a, Bundle s) {}
         @Override public void onActivityDestroyed(Activity a) {}
+    }
+
+    /**
+     * Callback invoked when MigoGameView has created a GameSession.
+     */
+    public interface SessionCreatedListener {
+        void onSessionCreated(GameSession session);
     }
 }

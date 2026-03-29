@@ -223,6 +223,7 @@ pub enum GLCmd {
 
     // Program
     CreateProgram {
+        canvas_id: CanvasId,
         client_id: ProgramId,
     },
 
@@ -252,6 +253,7 @@ pub enum GLCmd {
 
     // Shader
     CreateShader {
+        canvas_id: CanvasId,
         client_id: ShaderId,
         shader_type: ShaderType,
     },
@@ -344,6 +346,7 @@ pub enum GLCmd {
 
     // Buffers
     CreateBuffer {
+        canvas_id: CanvasId,
         client_id: BufferId,
     },
 
@@ -405,6 +408,7 @@ pub enum GLCmd {
 
     // ========== Phase 1B: Textures ==========
     CreateTexture {
+        canvas_id: CanvasId,
         client_id: TextureId,
     },
     DeleteTexture {
@@ -695,6 +699,7 @@ pub enum GLCmd {
 
     // ========== Phase 3A: Framebuffer/Renderbuffer ==========
     CreateFramebuffer {
+        canvas_id: CanvasId,
         client_id: FramebufferId,
     },
     DeleteFramebuffer {
@@ -726,6 +731,7 @@ pub enum GLCmd {
         resp: RenderCmdResp<u32>,
     },
     CreateRenderbuffer {
+        canvas_id: CanvasId,
         client_id: RenderbufferId,
     },
     DeleteRenderbuffer {
@@ -795,6 +801,13 @@ pub struct TextMetrics {
     pub actual_bounding_box_descent: f32,
     pub font_bounding_box_ascent: f32,
     pub font_bounding_box_descent: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GradientType {
+    Linear,
+    Radial,
+    Conic,
 }
 
 #[non_exhaustive]
@@ -939,12 +952,47 @@ pub enum Canvas2DCmd {
     SetLineDashOffset {
         offset: f32,
     },
+    SetShadowBlur {
+        blur: f32,
+    },
+    SetShadowColor {
+        color: Color,
+    },
+    SetShadowOffsetX {
+        offset: f32,
+    },
+    SetShadowOffsetY {
+        offset: f32,
+    },
     SetFillStyleGradient {
+        gradient_type: GradientType,
         x0: f32,
         y0: f32,
+        r0: f32,
         x1: f32,
         y1: f32,
+        r1: f32,
         stops: Vec<GradientStop>,
+    },
+    SetStrokeStyleGradient {
+        gradient_type: GradientType,
+        x0: f32,
+        y0: f32,
+        r0: f32,
+        x1: f32,
+        y1: f32,
+        r1: f32,
+        stops: Vec<GradientStop>,
+    },
+    SetFillStylePattern {
+        image_id: ImageId,
+        repeat_x: bool,
+        repeat_y: bool,
+    },
+    SetStrokeStylePattern {
+        image_id: ImageId,
+        repeat_x: bool,
+        repeat_y: bool,
     },
     SetFont {
         font: String,

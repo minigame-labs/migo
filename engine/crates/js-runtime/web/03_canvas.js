@@ -43,7 +43,6 @@ class Canvas {
     get clientHeight() {
         return op_get_canvas_info(this._rid)[1];
     }
-
     getContext(contextType, options) {
         if (this._context) { return this._context; }
         if (contextType === 'webgl2') {

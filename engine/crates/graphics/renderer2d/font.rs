@@ -1,6 +1,6 @@
-use femtovg::{Canvas as FvCanvas, FontId, renderer::OpenGl};
+use femtovg::{renderer::OpenGl, Canvas as FvCanvas, FontId};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     sync::{Arc, OnceLock, RwLock},
 };
@@ -60,69 +60,91 @@ static GLOBAL_FONTS: OnceLock<RwLock<GlobalFontStore>> = OnceLock::new();
 /// Initialize/load the global font store once.
 ///
 /// Strategy:
-/// - Prefer CJK-capable NotoSansSC-Regular as default if present.
-/// - Otherwise use Roboto-Regular.
-/// - Load common mappings and ignore missing files.
+/// - Keep a minimal built-in set (sans-serif + CJK fallback + optional serif/monospace).
+/// - Prefer sans-serif as default (closer to Canvas/Arial behavior).
+/// - Prefer SC-specific CJK faces before generic TTC fallback.
 fn init_global_fonts() -> GlobalFontStore {
     let mut store = GlobalFontStore::new();
 
-    // (path, key)
-    // Keys are "logical family keys" used by Canvas/CSS-ish parsing.
-    let font_mappings: [(&str, &str); 9] = [
-        ("/system/fonts/Roboto-Regular.ttf", "sans-serif"),
-        ("/system/fonts/Roboto-Bold.ttf", "sans-serif-bold"),
-        ("/system/fonts/Roboto-Italic.ttf", "sans-serif-italic"),
-        (
-            "/system/fonts/Roboto-BoldItalic.ttf",
-            "sans-serif-bold-italic",
-        ),
-        ("/system/fonts/NotoSansSC-Bold.ttf", "sans-serif-sc-bold"),
-        ("/system/fonts/NotoSansSC-Light.ttf", "sans-serif-sc-light"),
-        ("/system/fonts/RobotoMono-Regular.ttf", "monospace"),
-        ("/system/fonts/NotoSans-Regular.ttf", "noto-sans"),
-        ("/system/fonts/NotoSerif-Regular.ttf", "serif"),
-    ];
-
-    // Also attempt to load a good default CJK font (Regular).
-    let cjk_default_candidates = [
-        ("/system/fonts/NotoSansSC-Regular.ttf", "sans-serif-sc"),
-        ("/system/fonts/NotoSansCJK-Regular.ttc", "sans-serif-cjk"),
-        ("/system/fonts/NotoSansCJKsc-Regular.otf", "sans-serif-cjk"),
-    ];
-
-    // 1) Load CJK default candidates first (so we can prefer them as default).
-    for (path, key) in cjk_default_candidates {
-        if let Ok(bytes) = fs::read(path) {
-            let data = FontData {
-                name: key.to_string(),
-                bytes: Arc::new(bytes),
-            };
-            store.insert(key, data);
-            // Prefer first successful candidate as default.
-            store.set_default_key(key);
-            info!("Loaded system font (default): {} as {}", path, key);
-            break;
-        }
-    }
-
-    // 2) Load normal mappings.
-    for (path, key) in font_mappings {
-        match fs::read(path) {
-            Ok(bytes) => {
-                let data = FontData {
-                    name: key.to_string(),
-                    bytes: Arc::new(bytes),
-                };
-                store.insert(key, data);
-                info!("Loaded system font: {} as {}", path, key);
-            }
-            Err(e) => {
-                debug!("Font file not found/readable: {} ({})", path, e);
+    fn load_first_existing(store: &mut GlobalFontStore, key: &str, candidates: &[&str]) -> bool {
+        for path in candidates {
+            match fs::read(path) {
+                Ok(bytes) => {
+                    let data = FontData {
+                        name: key.to_string(),
+                        bytes: Arc::new(bytes),
+                    };
+                    store.insert(key, data);
+                    info!("Loaded system font: {} as {}", path, key);
+                    return true;
+                }
+                Err(e) => {
+                    debug!("Font file not found/readable: {} ({})", path, e);
+                }
             }
         }
+        false
     }
 
-    // 3) Ensure we have *some* default.
+    // Load only essential defaults to reduce startup overhead.
+    // Extra fonts should come from dynamic loadFont() when needed.
+    let loaded_sans = load_first_existing(
+        &mut store,
+        "sans-serif",
+        &[
+            "/system/fonts/Roboto-Regular.ttf",
+            "/system/fonts/NotoSans-Regular.ttf",
+            "/system/fonts/DroidSans.ttf",
+        ],
+    );
+
+    let loaded_sc = load_first_existing(
+        &mut store,
+        "sans-serif-sc",
+        &[
+            "/system/fonts/NotoSansSC-Regular.ttf",
+            "/system/fonts/NotoSansSC-Regular.otf",
+            "/system/fonts/NotoSansCJKsc-Regular.otf",
+        ],
+    );
+
+    if !loaded_sc {
+        // Last-resort CJK fallback; TTC face 0 may not always be SC.
+        let _ = load_first_existing(
+            &mut store,
+            "sans-serif-cjk",
+            &[
+                "/system/fonts/NotoSansCJK-Regular.ttc",
+                "/system/fonts/DroidSansFallback.ttf",
+            ],
+        );
+    }
+
+    let _ = load_first_existing(
+        &mut store,
+        "serif",
+        &["/system/fonts/NotoSerif-Regular.ttf"],
+    );
+
+    let _ = load_first_existing(
+        &mut store,
+        "monospace",
+        &[
+            "/system/fonts/RobotoMono-Regular.ttf",
+            "/system/fonts/DroidSansMono.ttf",
+        ],
+    );
+
+    // Ensure we have *some* default.
+    // Prefer sans-serif to match Canvas/Arial expectations.
+    if loaded_sans {
+        store.set_default_key("sans-serif");
+    } else if store.get("sans-serif-sc").is_some() {
+        store.set_default_key("sans-serif-sc");
+    } else if store.get("sans-serif-cjk").is_some() {
+        store.set_default_key("sans-serif-cjk");
+    }
+
     if store.default_data().is_none() {
         if store.get("sans-serif").is_some() {
             store.set_default_key("sans-serif");
@@ -172,7 +194,39 @@ impl FontManager {
         let store = global_fonts();
 
         let mut font_ids_by_key = HashMap::new();
-        for (key, data) in store.iter() {
+
+        // Register fonts in deterministic priority order so fallback is stable.
+        const PRIORITY_KEYS: [&str; 5] = [
+            "sans-serif",
+            "sans-serif-sc",
+            "sans-serif-cjk",
+            "serif",
+            "monospace",
+        ];
+
+        let mut register_order = Vec::new();
+        let mut seen = HashSet::new();
+
+        for key in PRIORITY_KEYS {
+            if store.get(key).is_some() {
+                register_order.push(key.to_string());
+                seen.insert(key.to_string());
+            }
+        }
+
+        let mut extras: Vec<String> = store
+            .iter()
+            .map(|(k, _)| k.clone())
+            .filter(|k| !seen.contains(k))
+            .collect();
+        extras.sort_unstable();
+        register_order.extend(extras);
+
+        for key in register_order {
+            let Some(data) = store.get(&key) else {
+                continue;
+            };
+
             match canvas.add_font_mem(&data.bytes) {
                 Ok(fid) => {
                     font_ids_by_key.insert(key.clone(), fid);
@@ -184,10 +238,17 @@ impl FontManager {
             }
         }
 
-        let default_font_id = store
-            .default_data()
-            .and_then(|d| font_ids_by_key.get(&d.name).copied())
-            .or_else(|| font_ids_by_key.get("sans-serif").copied())
+        let default_font_id = font_ids_by_key
+            .get("sans-serif")
+            .copied()
+            .or_else(|| {
+                store
+                    .default_data()
+                    .and_then(|d| font_ids_by_key.get(&d.name).copied())
+            })
+            .or_else(|| font_ids_by_key.get("sans-serif-sc").copied())
+            .or_else(|| font_ids_by_key.get("sans-serif-cjk").copied())
+            .or_else(|| font_ids_by_key.get("serif").copied())
             .or_else(|| font_ids_by_key.values().next().copied());
 
         if default_font_id.is_none() {
@@ -214,7 +275,7 @@ impl FontManager {
     ///   * "sans-serif" -> "sans-serif"
     ///   * "serif"      -> "serif"
     ///   * "monospace"  -> "monospace"
-    /// - Fallback to CJK-capable default key if present (global default), then "sans-serif", then any.
+    /// - Fallback order: sans-serif -> explicit CJK -> global default -> any.
     pub(crate) fn resolve_font_id(&self, family: &str, bold: bool, italic: bool) -> Option<FontId> {
         // Normalize family:
         let fam = normalize_family_key(family);
@@ -256,23 +317,27 @@ impl FontManager {
         // If requested family is sans-serif, also try our CJK sans-serif default key if present.
         // This helps when font string uses only "sans-serif" but text contains CJK.
         if fam == "sans-serif" {
-            // global default key might be "sans-serif-sc" or similar.
+            // Prefer explicit SC/CJK fallbacks for Chinese text.
+            if let Some(id) = self.font_ids_by_key.get("sans-serif-sc") {
+                return Some(*id);
+            }
+            if let Some(id) = self.font_ids_by_key.get("sans-serif-cjk") {
+                return Some(*id);
+            }
             let default_key = &global_fonts().default_key;
             if let Some(id) = self.font_ids_by_key.get(default_key) {
                 return Some(*id);
             }
-            // or try explicit sc
-            if let Some(id) = self.font_ids_by_key.get("sans-serif-sc") {
-                return Some(*id);
-            }
         }
 
-        // Fallback: global default, then "sans-serif", then any.
+        // Fallback: sans-serif first, then explicit CJK, then global default.
         let default_key = &global_fonts().default_key;
         self.font_ids_by_key
-            .get(default_key)
+            .get("sans-serif")
             .copied()
-            .or_else(|| self.font_ids_by_key.get("sans-serif").copied())
+            .or_else(|| self.font_ids_by_key.get("sans-serif-sc").copied())
+            .or_else(|| self.font_ids_by_key.get("sans-serif-cjk").copied())
+            .or_else(|| self.font_ids_by_key.get(default_key).copied())
             .or_else(|| self.default_font_id)
     }
 
@@ -395,6 +460,8 @@ fn normalize_family_key(family: &str) -> String {
     }
 
     match f.as_str() {
+        "arial" | "arialmt" | "arial-boldmt" | "arial-bold" | "helvetica" | "helvetica-bold"
+        | "helvetica neue" => "sans-serif".to_string(),
         "sans" | "sans serif" | "sans-serif" => "sans-serif".to_string(),
         "serif" => "serif".to_string(),
         "mono" | "monospace" => "monospace".to_string(),

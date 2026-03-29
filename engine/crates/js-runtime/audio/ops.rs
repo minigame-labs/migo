@@ -1,4 +1,4 @@
-use deno_core::{JsBuffer, OpState, op2};
+use deno_core::{op2, JsBuffer, OpState};
 use shared::{
     error::{EngineError, ErrorCode},
     op_state::{AudioSender, HostOpState},
@@ -6,6 +6,7 @@ use shared::{
         AudioBufferId, AudioBufferInfo, AudioCmd, AudioContextId, AudioNodeId, InnerAudioId,
         InnerAudioInfo, InnerAudioState,
     },
+    vfs::{FileOp, VirtualFS},
 };
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
 use tokio::sync::oneshot;
@@ -1270,9 +1271,40 @@ fn is_http_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
 }
 
-/// Resolve a relative path against code_dir
+/// Normalize local audio source path variants.
+///
+/// - `wxfile://usr/...` -> `/user/...`
+/// - `wxfile:///...` -> `/...`
+#[inline]
+fn normalize_local_src(src: &str) -> String {
+    if let Some(rest) = src.strip_prefix("wxfile://") {
+        if let Some(stripped) = rest.strip_prefix("usr/") {
+            return format!("/user/{stripped}");
+        }
+        if let Some(stripped) = rest.strip_prefix("/usr/") {
+            return format!("/user/{stripped}");
+        }
+        if rest.starts_with('/') {
+            return rest.to_string();
+        }
+        return format!("/{rest}");
+    }
+
+    src.to_string()
+}
+
+/// Resolve a local path against code_dir for non-VFS paths.
 #[inline]
 fn resolve_path(code_dir: Option<&str>, path: &str) -> String {
+    if path == "/code" {
+        return code_dir.unwrap_or_default().to_string();
+    }
+    if let Some(stripped) = path.strip_prefix("/code/") {
+        let mut full = PathBuf::from(code_dir.unwrap_or_default());
+        full.push(stripped);
+        return full.to_string_lossy().into_owned();
+    }
+
     let p = PathBuf::from(path);
     if p.is_absolute() {
         return path.to_string();
@@ -1285,6 +1317,53 @@ fn resolve_path(code_dir: Option<&str>, path: &str) -> String {
         }
         _ => path.to_string(),
     }
+}
+
+#[inline]
+fn resolve_local_src(
+    code_dir: Option<&str>,
+    vfs: Option<&VirtualFS>,
+    src: &str,
+) -> Result<String, AudioError> {
+    let normalized = normalize_local_src(src);
+
+    if let Some(vfs) = vfs {
+        if !normalized.starts_with('/') {
+            let vpath = format!("/code/{normalized}");
+            return vfs
+                .resolve(&vpath, FileOp::Read)
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(|e| {
+                    audio_err(format!(
+                        "Failed to resolve audio path '{}' (vpath='{}'): {}",
+                        src, vpath, e
+                    ))
+                });
+        }
+
+        let is_virtual = normalized == "/code"
+            || normalized.starts_with("/code/")
+            || normalized == "/user"
+            || normalized.starts_with("/user/")
+            || normalized == "/cache"
+            || normalized.starts_with("/cache/")
+            || normalized == "/tmp"
+            || normalized.starts_with("/tmp/");
+
+        if is_virtual {
+            return vfs
+                .resolve(&normalized, FileOp::Read)
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(|e| {
+                    audio_err(format!(
+                        "Failed to resolve audio path '{}' (normalized='{}'): {}",
+                        src, normalized, e
+                    ))
+                });
+        }
+    }
+
+    Ok(resolve_path(code_dir, &normalized))
 }
 
 /// Load audio from URL or local path
@@ -1314,19 +1393,30 @@ pub async fn op_inner_audio_load_url(
             .map_err(AudioError::from)
     } else {
         // Local file - resolve path and read file
-        let (tx, code_dir) = {
+        let (tx, code_dir, vfs) = {
             let st = state.borrow();
             let host = st.borrow::<HostOpState>();
-            (host.audio_tx.clone(), host.code_dir.clone())
+            (
+                host.audio_tx.clone(),
+                host.code_dir.clone(),
+                host.vfs.clone(),
+            )
         };
 
-        let full_path = resolve_path(code_dir.as_deref(), &src);
-        tracing::debug!("Loading local audio file: {}", full_path);
+        let full_path = resolve_local_src(code_dir.as_deref(), vfs.as_deref(), &src)?;
+        tracing::debug!(
+            "Loading local audio file: src={}, resolved={}",
+            src,
+            full_path
+        );
 
         // Read file asynchronously
-        let data = tokio::fs::read(&full_path)
-            .await
-            .map_err(|e| audio_err(&format!("Failed to read audio file '{}': {}", full_path, e)))?;
+        let data = tokio::fs::read(&full_path).await.map_err(|e| {
+            audio_err(format!(
+                "Failed to read audio file (src='{}', resolved='{}'): {}",
+                src, full_path, e
+            ))
+        })?;
 
         let (resp_tx, resp_rx) = oneshot::channel();
 
@@ -1457,4 +1547,90 @@ pub async fn op_inner_audio_get_state(
         .await
         .map_err(|_| audio_err("Response channel closed"))?
         .map_err(AudioError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_local_src, resolve_path};
+    use shared::vfs::VirtualFS;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}_{}", prefix, nanos))
+    }
+
+    #[test]
+    fn resolve_path_maps_code_virtual_prefix() {
+        let code_dir = make_temp_dir("migo_audio_code");
+        fs::create_dir_all(code_dir.join("audio")).unwrap();
+
+        let resolved = resolve_path(code_dir.to_str(), "/code/audio/bgm.mp3");
+        let expected = code_dir.join("audio/bgm.mp3");
+
+        assert_eq!(PathBuf::from(resolved), expected);
+
+        let _ = fs::remove_dir_all(code_dir);
+    }
+
+    #[test]
+    fn resolve_local_src_maps_user_virtual_path_with_vfs() {
+        let base = make_temp_dir("migo_audio_vfs");
+        let code = base.join("code");
+        let user = base.join("user");
+        let cache = base.join("cache");
+        let tmp = base.join("tmp");
+
+        fs::create_dir_all(&code).unwrap();
+        fs::create_dir_all(user.join("gamecaches/audio")).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&tmp).unwrap();
+
+        let target = user.join("gamecaches/audio/bgm.mp3");
+        fs::write(&target, b"audio-bytes").unwrap();
+
+        let vfs = VirtualFS::new(code.clone(), user.clone(), cache, tmp);
+        let resolved =
+            resolve_local_src(code.to_str(), Some(&vfs), "/user/gamecaches/audio/bgm.mp3").unwrap();
+
+        assert_eq!(PathBuf::from(resolved), target);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn resolve_local_src_normalizes_wxfile_usr_prefix() {
+        let base = make_temp_dir("migo_audio_wxfile");
+        let code = base.join("code");
+        let user = base.join("user");
+        let cache = base.join("cache");
+        let tmp = base.join("tmp");
+
+        fs::create_dir_all(&code).unwrap();
+        fs::create_dir_all(user.join("gamecaches/audio")).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&tmp).unwrap();
+
+        let target = user.join("gamecaches/audio/effect.mp3");
+        fs::write(&target, b"audio-bytes").unwrap();
+
+        let vfs = VirtualFS::new(code.clone(), user.clone(), cache, tmp);
+        let resolved = resolve_local_src(
+            code.to_str(),
+            Some(&vfs),
+            "wxfile://usr/gamecaches/audio/effect.mp3",
+        )
+        .unwrap();
+
+        assert_eq!(PathBuf::from(resolved), target);
+
+        let _ = fs::remove_dir_all(base);
+    }
 }

@@ -29,6 +29,7 @@ import {
     op_uniform3f,
     op_uniform_matrix_3fv,
     op_gl_flush,
+    op_alloc_gl_resource_id,
     op_enable,
     op_disable,
     op_is_enabled,
@@ -198,6 +199,14 @@ function _loc(location) {
     return location !== null && location !== undefined ? location.id : -1;
 }
 
+function nextResourceId() {
+    const id = op_alloc_gl_resource_id();
+    if (id <= 0) {
+        throw new Error("Failed to allocate WebGL resource id");
+    }
+    return id;
+}
+
 class WebglObject {
     constructor(id) {
         this._id = id;
@@ -213,10 +222,7 @@ class WebGLRenderingContext {
         this._canvas = canvas;
         this._options = options;
         this._canvasId = canvas._rid;
-        // Client-side monotonic ID counter for GL resources.
-        // IDs are assigned locally and sent to the render thread as
-        // fire-and-forget, eliminating sync round-trips on create*.
-        this._nextResourceId = 1;
+        // Resource IDs are allocated from a runtime-global counter in Rust.
         // Nested Map: programId -> Map(name -> location)
         // Allows O(1) per-program invalidation via .delete(programId).
         this._attribLocationCache = new Map();
@@ -276,8 +282,8 @@ class WebGLRenderingContext {
     }
 
     createProgram() {
-        const id = this._nextResourceId++;
-        op_create_program(id);
+        const id = nextResourceId();
+        op_create_program(this._canvasId, id);
         return new WebglObject(id);
     }
 
@@ -339,8 +345,8 @@ class WebGLRenderingContext {
     }
 
     createShader(type) {
-        const id = this._nextResourceId++;
-        op_create_shader(id, type);
+        const id = nextResourceId();
+        op_create_shader(this._canvasId, id, type);
         return new WebglObject(id);
     }
 
@@ -449,8 +455,8 @@ class WebGLRenderingContext {
     }
 
     createBuffer() {
-        const id = this._nextResourceId++;
-        op_create_buffer(id);
+        const id = nextResourceId();
+        op_create_buffer(this._canvasId, id);
         return new WebglObject(id);
     }
 
@@ -532,8 +538,8 @@ class WebGLRenderingContext {
     // -- Phase 1B: Textures --
 
     createTexture() {
-        const id = this._nextResourceId++;
-        op_create_texture(id);
+        const id = nextResourceId();
+        op_create_texture(this._canvasId, id);
         return new WebglObject(id);
     }
 
@@ -750,8 +756,8 @@ class WebGLRenderingContext {
     // -- Phase 3A: Framebuffer/Renderbuffer --
 
     createFramebuffer() {
-        const id = this._nextResourceId++;
-        op_create_framebuffer(id);
+        const id = nextResourceId();
+        op_create_framebuffer(this._canvasId, id);
         return new WebglObject(id);
     }
     deleteFramebuffer(fb) {
@@ -770,8 +776,8 @@ class WebGLRenderingContext {
         return op_check_framebuffer_status(this._canvasId, target);
     }
     createRenderbuffer() {
-        const id = this._nextResourceId++;
-        op_create_renderbuffer(id);
+        const id = nextResourceId();
+        op_create_renderbuffer(this._canvasId, id);
         return new WebglObject(id);
     }
     deleteRenderbuffer(rb) {

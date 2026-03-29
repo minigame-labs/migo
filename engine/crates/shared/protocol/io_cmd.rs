@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use deno_core::{serde_json, v8};
+use deno_core::v8;
 use tokio::sync::oneshot;
 
 use crate::error::{EngineError, ErrorCode};

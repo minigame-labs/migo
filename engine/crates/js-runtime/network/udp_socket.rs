@@ -80,6 +80,7 @@ pub enum UdpEvent {
     Error { err_msg: String },
     /// The socket has been closed.
     #[serde(rename = "close")]
+    #[allow(dead_code)]
     Close,
 }
 
@@ -372,4 +373,3 @@ pub fn op_udp_close(state: &mut OpState, #[smi] rid: ResourceId) -> Result<(), J
     resource.close();
     Ok(())
 }
-

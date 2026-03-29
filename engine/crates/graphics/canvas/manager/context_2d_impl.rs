@@ -1,6 +1,7 @@
 extern crate khronos_egl as egl;
 
 use femtovg::{renderer::OpenGl, Canvas as FvCanvas};
+use glow::HasContext;
 use shared::{
     error::{EngineResult, ErrorCode},
     protocol::render_cmd::CanvasId,
@@ -65,6 +66,67 @@ pub(super) fn init_femtovg_for_canvas(
     Ok(())
 }
 
+pub(crate) struct Canvas2DGlState {
+    active_texture: i32,
+    unpack_pbo: Option<<glow::Context as glow::HasContext>::Buffer>,
+    pack_pbo: Option<<glow::Context as glow::HasContext>::Buffer>,
+    unpack_alignment: i32,
+    pack_alignment: i32,
+}
+
+pub(crate) struct Canvas2DGlScopeGuard {
+    gl: *const glow::Context,
+    state: Option<Canvas2DGlState>,
+}
+
+impl Drop for Canvas2DGlScopeGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            let gl = unsafe { &*self.gl };
+            unsafe {
+                gl.active_texture(state.active_texture as u32);
+                gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, state.unpack_pbo);
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, state.pack_pbo);
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, state.unpack_alignment);
+                gl.pixel_store_i32(glow::PACK_ALIGNMENT, state.pack_alignment);
+            }
+        }
+    }
+}
+
+/// Save current GL state and set a safe baseline for femtovg text atlas upload.
+///
+/// femtovg's glyph atlas upload (`GlTexture::update`) calls `bind_texture` and
+/// `tex_sub_image_2d` without resetting active texture unit or
+/// PIXEL_UNPACK_BUFFER binding. If WebGL left those states dirty, uploads may
+/// read from wrong source or bind to a wrong unit, causing garbled text.
+pub(super) fn begin_canvas2d_gl_scope(gl: &glow::Context) -> Canvas2DGlScopeGuard {
+    unsafe {
+        let active_texture = gl.get_parameter_i32(glow::ACTIVE_TEXTURE);
+        let unpack_pbo = gl.get_parameter_buffer(glow::PIXEL_UNPACK_BUFFER_BINDING);
+        let pack_pbo = gl.get_parameter_buffer(glow::PIXEL_PACK_BUFFER_BINDING);
+        let unpack_alignment = gl.get_parameter_i32(glow::UNPACK_ALIGNMENT);
+        let pack_alignment = gl.get_parameter_i32(glow::PACK_ALIGNMENT);
+
+        gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
+        gl.active_texture(glow::TEXTURE0);
+
+        Canvas2DGlScopeGuard {
+            gl: gl as *const glow::Context,
+            state: Some(Canvas2DGlState {
+                active_texture,
+                unpack_pbo,
+                pack_pbo,
+                unpack_alignment,
+                pack_alignment,
+            }),
+        }
+    }
+}
+
 /// Flush all dirty 2D contexts
 pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<()> {
     let saved = cm.bound;
@@ -75,6 +137,7 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<()
             continue;
         }
         cm.make_current_needed(id)?;
+        let _gl_scope = begin_canvas2d_gl_scope(&cm.gl);
         if let Some(ctx) = cm.contexts_2d.get_mut(&id) {
             ctx.flush();
         }

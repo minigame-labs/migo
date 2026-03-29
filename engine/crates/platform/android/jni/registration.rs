@@ -4,20 +4,20 @@ use jni::{JNIEnv, NativeMethod};
 use tracing::info;
 
 use crate::android::jni::{
-    JAVA_METHOD_CACHE, JavaMethodCache, getConsoleLogs, getDebugStats, init, mod_main,
-    onAccelerometerChange, onActionSheetResult, onAudioInterruptionBegin, onAudioInterruptionEnd,
-    onBLECharacteristicValueChange, onBLEConnectionStateChange, onBLEMTUChange,
-    onBeaconServiceChange, onBeaconUpdate, onBluetoothAdapterStateChange, onBluetoothDeviceFound,
-    onCameraEvent, onCameraFrameData, onCheckSessionResult, onChooseImageResult,
-    onChooseMessageFileResult, onCompassChange, onCompressImageResult, onDeviceMotionChange,
-    onDeviceOrientationChange, onFuzzyLocationResult, onGetPhoneNumberResult, onGetUserInfoResult,
-    onGyroscopeChange, onHide, onKeyboardComplete, onKeyboardConfirm, onKeyboardHeightChange,
-    onKeyboardInput, onLocationResult, onLoginResult, onMemoryWarning, onModalResult,
-    onMidasPaymentGameItemResult, onMidasPaymentResult, onNavigateToMiniProgramResult,
-    onNetworkStatusChange, onOpenAppAuthorizeSetting, onOpenSettingResult,
-    onOpenSystemBluetoothSetting, onRecorderEvent, onRecorderFrameData, onRestart,
-    onScanCodeResult, onShareAppMessageResult, onShow, onSubpackageProgress, onSubpackageResult,
-    onTouch, onUserCaptureScreen, onVideoEvent, onVsync, shutdown, updateSurface, version,
+    getConsoleLogs, getDebugStats, init, mod_main, onAccelerometerChange, onActionSheetResult,
+    onAudioInterruptionBegin, onAudioInterruptionEnd, onBLECharacteristicValueChange,
+    onBLEConnectionStateChange, onBLEMTUChange, onBeaconServiceChange, onBeaconUpdate,
+    onBluetoothAdapterStateChange, onBluetoothDeviceFound, onCameraEvent, onCameraFrameData,
+    onCheckSessionResult, onChooseImageResult, onChooseMessageFileResult, onCompassChange,
+    onCompressImageResult, onDeviceMotionChange, onDeviceOrientationChange, onFuzzyLocationResult,
+    onGetPhoneNumberResult, onGetUserInfoResult, onGyroscopeChange, onHide, onKeyboardComplete,
+    onKeyboardConfirm, onKeyboardHeightChange, onKeyboardInput, onLocationResult, onLoginResult,
+    onMemoryWarning, onMidasPaymentGameItemResult, onMidasPaymentResult, onModalResult,
+    onNavigateToMiniProgramResult, onNetworkStatusChange, onOpenAppAuthorizeSetting,
+    onOpenSettingResult, onOpenSystemBluetoothSetting, onRecorderEvent, onRecorderFrameData,
+    onRestart, onScanCodeResult, onShareAppMessageResult, onShow, onSubpackageProgress,
+    onSubpackageResult, onTouch, onUserCaptureScreen, onVideoEvent, onVsync, shutdown,
+    updateSurface, version, JavaMethodCache, JAVA_METHOD_CACHE,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -80,7 +80,7 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
             },
             NativeMethod {
                 name: "updateSurface".into(),
-                sig: "(ILjava/lang/Object;)V".into(),
+                sig: "(ILjava/lang/Object;II)V".into(),
                 fn_ptr: updateSurface as *mut c_void,
             },
             NativeMethod {
@@ -504,7 +504,10 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("navigateToMiniProgram", "(ILjava/lang/String;)V"),
         ("openCustomerServiceConversation", "(ILjava/lang/String;)V"),
         // Payment
-        ("checkIsSupportMidasPayment", "(ILjava/lang/String;)Ljava/lang/String;"),
+        (
+            "checkIsSupportMidasPayment",
+            "(ILjava/lang/String;)Ljava/lang/String;",
+        ),
         ("requestMidasPayment", "(ILjava/lang/String;)V"),
         ("requestMidasPaymentGameItem", "(ILjava/lang/String;)V"),
         // Video

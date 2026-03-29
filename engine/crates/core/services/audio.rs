@@ -6,7 +6,7 @@ use shared::op_state::AudioSender;
 use shared::protocol::audio_cmd::AudioCmd;
 use shared::protocol::host_cmd::HostCommand;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tracing::{error, info};
+use tracing::info;
 
 /// Lazy audio service — the actual `AudioThread` is not spawned until the
 /// first real audio command arrives.

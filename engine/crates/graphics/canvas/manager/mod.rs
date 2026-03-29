@@ -19,6 +19,7 @@ use std::{
 };
 
 mod context_2d_impl;
+pub(crate) mod drawing_buffer;
 mod egl_ops;
 mod image;
 mod pbo_upload;
@@ -39,6 +40,7 @@ pub(crate) struct CanvasManager {
     display: egl::Display,
     config: egl::Config,
 
+    #[allow(dead_code)]
     pub(super) dpi: f32,
 
     resource: EglContextHandle,
@@ -159,22 +161,12 @@ impl CanvasManager {
     ///
     /// `w` and `h` are in **physical (buffer) pixels** — the same unit JS
     /// `canvas.width`/`canvas.height` uses, matching browser semantics.
-    pub(crate) fn create_offscreen(
-        &mut self,
-        w: u32,
-        h: u32,
-    ) -> EngineResult<CanvasId> {
+    pub(crate) fn create_offscreen(&mut self, w: u32, h: u32) -> EngineResult<CanvasId> {
         let id = self.new_canvas_id();
 
         let share = Some(self.resource.ctx);
-        let (ctx, surf) = egl_ops::create_pbuffer_context(
-            &self.egl,
-            self.display,
-            self.config,
-            share,
-            w,
-            h,
-        )?;
+        let (ctx, surf) =
+            egl_ops::create_pbuffer_context(&self.egl, self.display, self.config, share, w, h)?;
 
         let info = CanvasInfo {
             id,
@@ -191,6 +183,7 @@ impl CanvasManager {
                 physical_height: h,
                 kind: SurfaceKind::Pbuffer,
                 ctx: EglContextHandle { ctx, surf },
+                drawing_buffer: None,
             },
         );
 
@@ -292,44 +285,37 @@ impl CanvasManager {
                 )
             })?;
 
-        // query physical size
-        let pw = self
+        // Query EGL for diagnostics only. Some Android stacks report a rotated
+        // size here (e.g. 1080x2340 while the Java SurfaceHolder reports
+        // 2340x1080). For onscreen we trust the size from updateSurface when
+        // provided, because JS canvas metrics and viewport logic must align with
+        // SurfaceHolder dimensions.
+        let queried_w = self
             .egl
             .query_surface(self.display, surf, egl::WIDTH)
-            .unwrap_or(0);
-        let ph = self
+            .unwrap_or(0)
+            .max(1) as u32;
+        let queried_h = self
             .egl
             .query_surface(self.display, surf, egl::HEIGHT)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(1) as u32;
 
-        let physical_w = (pw.max(1)) as u32;
-        let physical_h = (ph.max(1)) as u32;
-
-        if let Some((exp_w, exp_h)) = surface_size {
-            if exp_w != physical_w || exp_h != physical_h {
+        let (physical_w, physical_h) = if let Some((exp_w, exp_h)) = surface_size {
+            if exp_w != queried_w || exp_h != queried_h {
                 tracing::warn!(
-                    "CanvasManager::create_onscreen size mismatch: expected={}x{}, egl_surface={}x{}, window=0x{:x}",
+                    "CanvasManager::create_onscreen size mismatch: expected={}x{}, egl_surface={}x{}, window=0x{:x}; using expected size",
                     exp_w,
                     exp_h,
-                    physical_w,
-                    physical_h,
+                    queried_w,
+                    queried_h,
                     window
                 );
             }
-        }
-
-        if let Some((exp_w, exp_h)) = surface_size {
-            if exp_w != physical_w || exp_h != physical_h {
-                tracing::warn!(
-                    "CanvasManager::create_onscreen size mismatch: expected={}x{}, egl_surface={}x{}, window=0x{:x}",
-                    exp_w,
-                    exp_h,
-                    physical_w,
-                    physical_h,
-                    window
-                );
-            }
-        }
+            (exp_w.max(1), exp_h.max(1))
+        } else {
+            (queried_w, queried_h)
+        };
 
         // JS canvas.width/height report physical (buffer) pixels — matching
         // browser semantics.  Games that want crisp rendering multiply by
@@ -349,11 +335,39 @@ impl CanvasManager {
                 physical_width: physical_w,
                 physical_height: physical_h,
                 ctx: EglContextHandle { ctx, surf },
+                drawing_buffer: None, // initialized below after make_current
             },
         );
 
-        // Make current so gl loader can work immediately if desired
+        // Make current so GL calls work.
         self.make_current_needed(id)?;
+
+        // Create the DrawingBuffer (intermediate FBO) for the onscreen canvas.
+        // WebGL renders to this FBO; it gets blitted to the window surface on swap.
+        match drawing_buffer::create(&self.gl, physical_w, physical_h) {
+            Ok(db) => {
+                if let Some(entry) = self.canvases.get_mut(&id) {
+                    entry.drawing_buffer = Some(db);
+                }
+            }
+            Err(e) => {
+                tracing::error!("DrawingBuffer creation failed, rendering direct to surface: {e}");
+                // Fallback: render directly to window surface (legacy behavior).
+            }
+        }
+
+        // Reset default viewport/state for the newly created onscreen context.
+        // Context recreation invalidates old GL state tracking.
+        unsafe {
+            self.gl.viewport(0, 0, physical_w as i32, physical_h as i32);
+        }
+        self.gl_state.insert(
+            id,
+            CanvasGLState {
+                current_program: None,
+                viewport: Some((0, 0, physical_w as i32, physical_h as i32)),
+            },
+        );
 
         if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
             // dpi = 1.0: Canvas2D coordinates are in buffer pixels (no DPR scaling)
@@ -372,12 +386,20 @@ impl CanvasManager {
     }
 
     fn destroy_onscreen_internal(&mut self, id: CanvasId) -> EngineResult<()> {
-        if let Some(entry) = self.canvases.remove(&id) {
+        if let Some(mut entry) = self.canvases.remove(&id) {
+            // Destroy DrawingBuffer while the EGL context is still current.
+            if let Some(db) = entry.drawing_buffer.take() {
+                let _ = self.egl.make_current(
+                    self.display,
+                    Some(entry.ctx.surf),
+                    Some(entry.ctx.surf),
+                    Some(entry.ctx.ctx),
+                );
+                drawing_buffer::destroy(&self.gl, db);
+            }
+
             // Switch to the resource (pbuffer) context so the ANativeWindow is
             // properly disconnected before we destroy the onscreen surface.
-            // Using (None, None, None) only unbinds the EGL context but does NOT
-            // release the native window connection, causing BadAlloc on the next
-            // eglCreateWindowSurface call.
             let _ = self.egl.make_current(
                 self.display,
                 Some(self.resource.surf),
@@ -387,8 +409,7 @@ impl CanvasManager {
 
             self.contexts_2d.remove(&id);
             self.dirty_2d.remove(&id);
-            // Clear per-canvas femtovg image registrations so they get
-            // lazily re-registered in the new femtovg canvas on next DrawImage.
+            self.gl_state.remove(&id);
             self.image_registry.remove_canvas_images(id);
 
             let _ = self.egl.destroy_surface(self.display, entry.ctx.surf);
@@ -536,6 +557,18 @@ impl CanvasManager {
         self.bound == BoundContext::Canvas(CanvasId::from(1u32))
     }
 
+    /// Returns the DrawingBuffer FBO for the given canvas, or None (= real FBO 0)
+    /// if the canvas has no DrawingBuffer (offscreen canvases).
+    pub(crate) fn get_drawing_buffer_fbo(
+        &self,
+        canvas_id: CanvasId,
+    ) -> Option<glow::NativeFramebuffer> {
+        self.canvases
+            .get(&canvas_id)
+            .and_then(|entry| entry.drawing_buffer.as_ref())
+            .map(|db| db.fbo)
+    }
+
     pub(crate) fn make_current_needed(&mut self, id: CanvasId) -> EngineResult<()> {
         if self.bound == BoundContext::Canvas(id) {
             return Ok(());
@@ -559,6 +592,17 @@ impl CanvasManager {
                 )
             })?;
         self.bound = BoundContext::Canvas(id);
+
+        // After EGL context switch to the onscreen canvas, bind the
+        // DrawingBuffer FBO so GL commands target it instead of the
+        // window surface (FBO 0).  This is the Chromium DrawingBuffer
+        // pattern: WebGL's "default framebuffer" is actually our FBO.
+        if let Some(db) = entry.drawing_buffer.as_ref() {
+            unsafe {
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
+            }
+        }
+
         Ok(())
     }
 
@@ -640,6 +684,35 @@ impl CanvasManager {
             return Ok(());
         }
 
+        // Window surfaces: the EGL surface is controlled by Android SurfaceView.
+        // Resize only the DrawingBuffer so canvas.width/height reflects what JS
+        // set, and WebGL renders at that resolution. The blit in swap_buffers
+        // scales to the actual surface dimensions.
+        if matches!(kind, SurfaceKind::Window(_)) {
+            self.make_current_needed(id)?;
+            if let Some(entry) = self.canvases.get_mut(&id) {
+                if let Some(ref mut db) = entry.drawing_buffer {
+                    drawing_buffer::resize(&self.gl, db, new_w, new_h)?;
+                }
+                entry.info.width = new_w;
+                entry.info.height = new_h;
+            }
+
+            if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
+                // dpi = 1.0: Canvas2D coordinates are in buffer pixels (no DPR scaling)
+                ctx2d.canvas.set_size(new_w, new_h, 1.0);
+            }
+
+            // WebGL default framebuffer viewport resets after drawing buffer resize.
+            unsafe {
+                self.gl.viewport(0, 0, new_w as i32, new_h as i32);
+            }
+            self.gl_state.entry(id).or_default().viewport =
+                Some((0, 0, new_w as i32, new_h as i32));
+
+            return Ok(());
+        }
+
         let saved_bound = self.bound;
         let was_current = matches!(saved_bound, BoundContext::Canvas(cur) if cur == id);
 
@@ -706,6 +779,11 @@ impl CanvasManager {
             self.bound = BoundContext::Canvas(id);
         }
 
+        // Keep canvas metrics aligned with JS-requested dimensions. On some
+        // devices EGL surface queries may return rotated values for window
+        // surfaces, which breaks viewport/layout logic in games.
+        let (actual_w, actual_h) = (new_w, new_h);
+
         {
             let entry = self.canvases.get_mut(&id).ok_or_else(|| {
                 ee(
@@ -714,17 +792,17 @@ impl CanvasManager {
                 )
             })?;
 
-            entry.physical_width = new_w;
-            entry.physical_height = new_h;
+            entry.physical_width = actual_w;
+            entry.physical_height = actual_h;
 
             entry.ctx.surf = new_surf;
-            entry.info.width = new_w;
-            entry.info.height = new_h;
+            entry.info.width = actual_w;
+            entry.info.height = actual_h;
         }
 
         if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
             // dpi = 1.0: Canvas2D coordinates are in buffer pixels (no DPR scaling)
-            ctx2d.canvas.set_size(new_w, new_h, 1.0);
+            ctx2d.canvas.set_size(actual_w, actual_h, 1.0);
         }
 
         if !was_current {
@@ -745,6 +823,16 @@ impl CanvasManager {
             .get(&id)
             .ok_or_else(|| ee(ErrorCode::NotFound, format!("canvas not found: {id:?}")))?;
 
+        // Blit DrawingBuffer to the real window surface before swap.
+        if let Some(ref db) = entry.drawing_buffer {
+            drawing_buffer::blit_to_surface(
+                &self.gl,
+                db,
+                entry.physical_width,
+                entry.physical_height,
+            );
+        }
+
         // Only call eglSwapInterval when the value actually changes
         let interval = if wait_for_vsync { 1 } else { 0 };
         if interval != self.last_swap_interval {
@@ -754,7 +842,6 @@ impl CanvasManager {
         self.egl
             .swap_buffers(self.display, entry.ctx.surf)
             .map_err(|e| {
-                // Check if this is an EGL context loss (0x300E).
                 if let Some(egl_err) = self.egl.get_error() {
                     if egl_err == egl::Error::ContextLost {
                         tracing::warn!("EGL context lost detected during swap_buffers");
@@ -766,9 +853,23 @@ impl CanvasManager {
                     format!("eglSwapBuffers failed: {e:?}"),
                 )
             })?;
+
+        // Re-bind the DrawingBuffer FBO after swap so the next frame's GL
+        // commands target it instead of the window surface.
+        if let Some(ref db) = self
+            .canvases
+            .get(&id)
+            .and_then(|e| e.drawing_buffer.as_ref())
+        {
+            unsafe {
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
+            }
+        }
+
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_info(&self, id: CanvasId) -> EngineResult<CanvasInfo> {
         let entry = self
             .canvases
@@ -780,12 +881,18 @@ impl CanvasManager {
     /// Return the buffer-pixel size of a canvas.
     /// This is what JS `canvas.width`/`canvas.height` reports (physical pixels,
     /// matching browser semantics).
+    /// For the onscreen canvas with a DrawingBuffer, returns the DrawingBuffer
+    /// dimensions (which may differ from the EGL surface dimensions).
     pub(crate) fn get_canvas_size(&self, id: CanvasId) -> EngineResult<(u32, u32)> {
         let entry = self
             .canvases
             .get(&id)
             .ok_or_else(|| ee(ErrorCode::NotFound, format!("canvas not found: {id:?}")))?;
-        Ok((entry.physical_width, entry.physical_height))
+        if let Some(ref db) = entry.drawing_buffer {
+            Ok((db.width, db.height))
+        } else {
+            Ok((entry.physical_width, entry.physical_height))
+        }
     }
 
     // ==================== 2D Context Management ====================
@@ -815,6 +922,16 @@ impl CanvasManager {
 
     pub(crate) fn mark_2d_dirty(&mut self, canvas_id: CanvasId) {
         self.dirty_2d.insert(canvas_id);
+    }
+
+    pub(crate) fn pending_dirty_2d_count(&self) -> usize {
+        self.dirty_2d.len()
+    }
+
+    /// Save current GL state and set a safe baseline for Canvas2D / femtovg
+    /// text atlas uploads.
+    pub(crate) fn begin_canvas2d_gl_scope(&self) -> context_2d_impl::Canvas2DGlScopeGuard {
+        context_2d_impl::begin_canvas2d_gl_scope(&self.gl)
     }
 
     pub(crate) fn flush_dirty_2d_contexts(&mut self) -> EngineResult<()> {
@@ -953,5 +1070,4 @@ impl CanvasManager {
             format!("{what} belongs to another WebGL context (owner={owner:?}, canvas={canvas:?})"),
         ))
     }
-
 }

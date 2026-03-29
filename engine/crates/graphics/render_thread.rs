@@ -3,10 +3,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    CanvasHandler, CanvasManager, FontData, Renderer2d, RendererGL, global_fonts_mut,
-    onscreen_window_from_surface,
+    global_fonts_mut, onscreen_window_from_surface, CanvasHandler, CanvasManager, FontData,
+    Renderer2d, RendererGL,
 };
-use crossbeam_channel::{Receiver, bounded, select, tick};
+use crossbeam_channel::{bounded, select, tick, Receiver};
+use glow::HasContext;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::render_cmd::RenderCommand;
 use shared::surface::SurfaceRef;
@@ -235,6 +236,7 @@ impl RenderThread {
                             let cmd_count = commands.len();
                             let mut batch_hit_onscreen = false;
                             let mut error_count: u32 = 0;
+
                             for gl_cmd in commands {
                                 match renderer_gl.handle_command(cm, gl, gl_cmd) {
                                     Ok(was_render) => {
@@ -415,9 +417,27 @@ impl RenderThread {
                                                         needs_recovery: &mut bool| {
                     // Present the completed frame (only if we have a valid surface).
                     let did_swap = if *dirty && has_surface {
+                        let onscreen_id = shared::protocol::render_cmd::CanvasId::from(1u32);
+                        let (canvas_w, canvas_h) = cm.get_canvas_size(onscreen_id).unwrap_or((0, 0));
+                        let tracked_viewport = cm
+                            .gl_state
+                            .get(&onscreen_id)
+                            .and_then(|s| s.viewport)
+                            .unwrap_or((0, 0, canvas_w as i32, canvas_h as i32));
                         if let Err(e) = cm.flush_dirty_2d_contexts() {
                             warn!("flush_dirty_2d_contexts failed: {}", e);
                         }
+                        // Canvas2D flush (femtovg) can mutate GL viewport. Restore WebGL
+                        // viewport from tracked WebGL state so subsequent frames keep
+                        // consistent semantics even if flush changed GL state.
+                        unsafe {
+                            gl.viewport(
+                                tracked_viewport.0,
+                                tracked_viewport.1,
+                                tracked_viewport.2,
+                                tracked_viewport.3,
+                            )
+                        };
 
                         let swap_ok = match cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
                             Ok(()) => true,

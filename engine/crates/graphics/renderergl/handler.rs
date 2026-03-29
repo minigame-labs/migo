@@ -1,7 +1,7 @@
 use glow::{HasContext, NativeUniformLocation};
 use shared::{
     error::{EngineError, EngineResult, ErrorCode},
-    protocol::render_cmd::{CanvasId, FramebufferId, GLCmd, RenderbufferId, ShaderType, TextureId},
+    protocol::render_cmd::{CanvasId, GLCmd, ShaderType},
 };
 use tracing::trace;
 
@@ -24,11 +24,20 @@ fn logical_to_physical_i32(_cm: &CanvasManager, v: i32) -> i32 {
     v
 }
 
-pub(crate) struct RendererGL;
+pub(crate) struct RendererGL {}
 
 impl RendererGL {
     pub(crate) fn new() -> Self {
-        Self
+        Self {}
+    }
+
+    fn maybe_log_draw_state(
+        &mut self,
+        _gl: &glow::Context,
+        _canvas_id: CanvasId,
+        _mode: u32,
+        _count: i32,
+    ) {
     }
 
     #[inline]
@@ -69,6 +78,8 @@ impl RendererGL {
                 // Values are in physical (buffer) pixels — no DPR scaling needed,
                 // matching browser WebGL semantics.
                 unsafe { gl.viewport(x, y, width as i32, height as i32) };
+                cm.gl_state.entry(canvas_id).or_default().viewport =
+                    Some((x, y, width as i32, height as i32));
                 Ok(false)
             }
 
@@ -320,6 +331,7 @@ impl RendererGL {
                 count,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                self.maybe_log_draw_state(gl, canvas_id, mode, count);
                 unsafe { gl.draw_arrays(mode, first, count) };
                 Ok(true)
             }
@@ -332,6 +344,7 @@ impl RendererGL {
                 offset,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                self.maybe_log_draw_state(gl, canvas_id, mode, count);
                 unsafe { gl.draw_elements(mode, count, index_type, offset) };
                 Ok(true)
             }
@@ -383,8 +396,11 @@ impl RendererGL {
 
             // ---------- Context-less-ish calls (need some current context) ----------
             // Program
-            GLCmd::CreateProgram { client_id } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
+            GLCmd::CreateProgram {
+                canvas_id,
+                client_id,
+            } => {
+                cm.make_current_needed(canvas_id)?;
                 let owner = Self::current_owner_canvas(cm);
 
                 unsafe {
@@ -498,10 +514,11 @@ impl RendererGL {
 
             // Shader
             GLCmd::CreateShader {
+                canvas_id,
                 client_id,
                 shader_type,
             } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
+                cm.make_current_needed(canvas_id)?;
                 let owner = Self::current_owner_canvas(cm);
 
                 let gl_ty = match shader_type {
@@ -731,8 +748,11 @@ impl RendererGL {
             }
 
             // Buffers
-            GLCmd::CreateBuffer { client_id } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
+            GLCmd::CreateBuffer {
+                canvas_id,
+                client_id,
+            } => {
+                cm.make_current_needed(canvas_id)?;
                 let owner = Self::current_owner_canvas(cm);
 
                 unsafe {
@@ -867,8 +887,11 @@ impl RendererGL {
             }
 
             // ========== Phase 1B: Textures ==========
-            GLCmd::CreateTexture { client_id } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
+            GLCmd::CreateTexture {
+                canvas_id,
+                client_id,
+            } => {
+                cm.make_current_needed(canvas_id)?;
                 let owner = Self::current_owner_canvas(cm);
                 unsafe {
                     match gl.create_texture() {
@@ -1478,8 +1501,11 @@ impl RendererGL {
             }
 
             // ========== Phase 3A: Framebuffer/Renderbuffer ==========
-            GLCmd::CreateFramebuffer { client_id } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
+            GLCmd::CreateFramebuffer {
+                canvas_id,
+                client_id,
+            } => {
+                cm.make_current_needed(canvas_id)?;
                 let owner = Self::current_owner_canvas(cm);
                 unsafe {
                     match gl.create_framebuffer() {
@@ -1532,7 +1558,8 @@ impl RendererGL {
                     }
                     meta.gl_handle
                 } else {
-                    None
+                    // "Default framebuffer" — redirect to DrawingBuffer if present.
+                    cm.get_drawing_buffer_fbo(canvas_id)
                 };
                 unsafe { gl.bind_framebuffer(target, native) };
                 Ok(false)
@@ -1609,8 +1636,11 @@ impl RendererGL {
                 Ok(false)
             }
 
-            GLCmd::CreateRenderbuffer { client_id } => {
-                let _ = self.bind_for_contextless_gl(cm)?;
+            GLCmd::CreateRenderbuffer {
+                canvas_id,
+                client_id,
+            } => {
+                cm.make_current_needed(canvas_id)?;
                 let owner = Self::current_owner_canvas(cm);
                 unsafe {
                     match gl.create_renderbuffer() {

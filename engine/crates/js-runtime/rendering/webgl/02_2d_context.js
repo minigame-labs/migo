@@ -63,6 +63,13 @@ import {
     op_set_line_dash,
     op_set_line_dash_offset,
     op_set_fill_style_gradient,
+    op_set_stroke_style_gradient,
+    op_set_fill_style_pattern,
+    op_set_stroke_style_pattern,
+    op_set_shadow_blur,
+    op_set_shadow_color,
+    op_set_shadow_offset_x,
+    op_set_shadow_offset_y,
 } from "ext:core/ops";
 
 // Line cap constants
@@ -78,7 +85,7 @@ const TEXT_BASELINE_MAP = {
 };
 
 // Composite operation names matching femtovg::CompositeOperation order.
-var _COMPOSITE_OPS = [
+const _COMPOSITE_OPS = [
     'source-over', 'source-in', 'source-out', 'source-atop',
     'destination-over', 'destination-in', 'destination-out', 'destination-atop',
     'lighter', 'copy', 'xor',
@@ -88,19 +95,27 @@ var _COMPOSITE_OPS = [
 // Collects color stops and sends them to the render thread when assigned
 // to fillStyle.
 class CanvasGradient {
-    constructor(type, canvasId, x0, y0, x1, y1, r1) {
+    constructor(type, canvasId, x0, y0, r0, x1, y1, r1) {
         this._type = type;
         this._canvasId = canvasId;
         this._x0 = x0;
         this._y0 = y0;
+        this._r0 = r0;
         this._x1 = x1;
         this._y1 = y1;
         this._r1 = r1;
         this._stops = [];
     }
     addColorStop(offset, color) {
+        var off = Number(offset);
+        if (!Number.isFinite(off) || off < 0 || off > 1) {
+            throw new RangeError("Failed to execute 'addColorStop': offset must be between 0 and 1");
+        }
+        if (typeof color !== 'string') {
+            throw new TypeError("Failed to execute 'addColorStop': color must be a string");
+        }
         var parsed = _parseColorToRGBA(color);
-        this._stops.push({ offset: offset, r: parsed[0], g: parsed[1], b: parsed[2], a: parsed[3] });
+        this._stops.push({ offset: off, r: parsed[0], g: parsed[1], b: parsed[2], a: parsed[3] });
         this._stops.sort(function (a, b) { return a.offset - b.offset; });
     }
     // Called internally when this gradient is assigned to fillStyle.
@@ -108,11 +123,122 @@ class CanvasGradient {
         if (this._stops.length < 2) return;
         op_set_fill_style_gradient(
             this._canvasId,
-            this._x0, this._y0, this._x1, this._y1,
+            this._type === 'radial' ? 1 : this._type === 'conic' ? 2 : 0,
+            this._x0, this._y0, this._r0,
+            this._x1, this._y1, this._r1,
+            JSON.stringify(this._stops)
+        );
+    }
+    // Called internally when this gradient is assigned to strokeStyle.
+    _applyStroke() {
+        if (this._stops.length < 2) return;
+        op_set_stroke_style_gradient(
+            this._canvasId,
+            this._type === 'radial' ? 1 : this._type === 'conic' ? 2 : 0,
+            this._x0, this._y0, this._r0,
+            this._x1, this._y1, this._r1,
             JSON.stringify(this._stops)
         );
     }
 }
+
+class CanvasPattern {
+    constructor(canvasId, imageRid, repetition) {
+        this._canvasId = canvasId;
+        this._imageRid = imageRid;
+        var rep = repetition == null ? 'repeat' : String(repetition);
+        if (rep !== 'repeat' && rep !== 'repeat-x' && rep !== 'repeat-y' && rep !== 'no-repeat') {
+            throw new TypeError("Failed to execute 'createPattern': invalid repetition value");
+        }
+        this._repeatX = rep === 'repeat' || rep === 'repeat-x';
+        this._repeatY = rep === 'repeat' || rep === 'repeat-y';
+    }
+    _applyFill() {
+        op_set_fill_style_pattern(this._canvasId, this._imageRid, this._repeatX, this._repeatY);
+    }
+    _applyStroke() {
+        op_set_stroke_style_pattern(this._canvasId, this._imageRid, this._repeatX, this._repeatY);
+    }
+}
+
+// Full CSS named color table, synced with Rust NAMED_COLORS. Values are [r,g,b,a].
+const _NAMED_COLORS = {
+    'transparent': [0,0,0,0],
+    'aliceblue': [240,248,255,255], 'antiquewhite': [250,235,215,255],
+    'aqua': [0,255,255,255], 'aquamarine': [127,255,212,255],
+    'azure': [240,255,255,255], 'beige': [245,245,220,255],
+    'bisque': [255,228,196,255], 'black': [0,0,0,255],
+    'blanchedalmond': [255,235,205,255], 'blue': [0,0,255,255],
+    'blueviolet': [138,43,226,255], 'brown': [165,42,42,255],
+    'burlywood': [222,184,135,255], 'cadetblue': [95,158,160,255],
+    'chartreuse': [127,255,0,255], 'chocolate': [210,105,30,255],
+    'coral': [255,127,80,255], 'cornflowerblue': [100,149,237,255],
+    'cornsilk': [255,248,220,255], 'crimson': [220,20,60,255],
+    'cyan': [0,255,255,255], 'darkblue': [0,0,139,255],
+    'darkcyan': [0,139,139,255], 'darkgoldenrod': [184,134,11,255],
+    'darkgray': [169,169,169,255], 'darkgreen': [0,100,0,255],
+    'darkgrey': [169,169,169,255], 'darkkhaki': [189,183,107,255],
+    'darkmagenta': [139,0,139,255], 'darkolivegreen': [85,107,47,255],
+    'darkorange': [255,140,0,255], 'darkorchid': [153,50,204,255],
+    'darkred': [139,0,0,255], 'darksalmon': [233,150,122,255],
+    'darkseagreen': [143,188,143,255], 'darkslateblue': [72,61,139,255],
+    'darkslategray': [47,79,79,255], 'darkslategrey': [47,79,79,255],
+    'darkturquoise': [0,206,209,255], 'darkviolet': [148,0,211,255],
+    'deeppink': [255,20,147,255], 'deepskyblue': [0,191,255,255],
+    'dimgray': [105,105,105,255], 'dimgrey': [105,105,105,255],
+    'dodgerblue': [30,144,255,255], 'firebrick': [178,34,34,255],
+    'floralwhite': [255,250,240,255], 'forestgreen': [34,139,34,255],
+    'fuchsia': [255,0,255,255], 'gainsboro': [220,220,220,255],
+    'ghostwhite': [248,248,255,255], 'gold': [255,215,0,255],
+    'goldenrod': [218,165,32,255], 'gray': [128,128,128,255],
+    'green': [0,128,0,255], 'greenyellow': [173,255,47,255],
+    'grey': [128,128,128,255], 'honeydew': [240,255,240,255],
+    'hotpink': [255,105,180,255], 'indianred': [205,92,92,255],
+    'indigo': [75,0,130,255], 'ivory': [255,255,240,255],
+    'khaki': [240,230,140,255], 'lavender': [230,230,250,255],
+    'lavenderblush': [255,240,245,255], 'lawngreen': [124,252,0,255],
+    'lemonchiffon': [255,250,205,255], 'lightblue': [173,216,230,255],
+    'lightcoral': [240,128,128,255], 'lightcyan': [224,255,255,255],
+    'lightgoldenrodyellow': [250,250,210,255], 'lightgray': [211,211,211,255],
+    'lightgreen': [144,238,144,255], 'lightgrey': [211,211,211,255],
+    'lightpink': [255,182,193,255], 'lightsalmon': [255,160,122,255],
+    'lightseagreen': [32,178,170,255], 'lightskyblue': [135,206,250,255],
+    'lightslategray': [119,136,153,255], 'lightslategrey': [119,136,153,255],
+    'lightsteelblue': [176,196,222,255], 'lightyellow': [255,255,224,255],
+    'lime': [0,255,0,255], 'limegreen': [50,205,50,255],
+    'linen': [250,240,230,255], 'magenta': [255,0,255,255],
+    'maroon': [128,0,0,255], 'mediumaquamarine': [102,205,170,255],
+    'mediumblue': [0,0,205,255], 'mediumorchid': [186,85,211,255],
+    'mediumpurple': [147,112,219,255], 'mediumseagreen': [60,179,113,255],
+    'mediumslateblue': [123,104,238,255], 'mediumspringgreen': [0,250,154,255],
+    'mediumturquoise': [72,209,204,255], 'mediumvioletred': [199,21,133,255],
+    'midnightblue': [25,25,112,255], 'mintcream': [245,255,250,255],
+    'mistyrose': [255,228,225,255], 'moccasin': [255,228,181,255],
+    'navajowhite': [255,222,173,255], 'navy': [0,0,128,255],
+    'oldlace': [253,245,230,255], 'olive': [128,128,0,255],
+    'olivedrab': [107,142,35,255], 'orange': [255,165,0,255],
+    'orangered': [255,69,0,255], 'orchid': [218,112,214,255],
+    'palegoldenrod': [238,232,170,255], 'palegreen': [152,251,152,255],
+    'paleturquoise': [175,238,238,255], 'palevioletred': [219,112,147,255],
+    'papayawhip': [255,239,213,255], 'peachpuff': [255,218,185,255],
+    'peru': [205,133,63,255], 'pink': [255,192,203,255],
+    'plum': [221,160,221,255], 'powderblue': [176,224,230,255],
+    'purple': [128,0,128,255], 'rebeccapurple': [102,51,153,255],
+    'red': [255,0,0,255], 'rosybrown': [188,143,143,255],
+    'royalblue': [65,105,225,255], 'saddlebrown': [139,69,19,255],
+    'salmon': [250,128,114,255], 'sandybrown': [244,164,96,255],
+    'seagreen': [46,139,87,255], 'seashell': [255,245,238,255],
+    'sienna': [160,82,45,255], 'silver': [192,192,192,255],
+    'skyblue': [135,206,235,255], 'slateblue': [106,90,205,255],
+    'slategray': [112,128,144,255], 'slategrey': [112,128,144,255],
+    'snow': [255,250,250,255], 'springgreen': [0,255,127,255],
+    'steelblue': [70,130,180,255], 'tan': [210,180,140,255],
+    'teal': [0,128,128,255], 'thistle': [216,191,216,255],
+    'tomato': [255,99,71,255], 'turquoise': [64,224,208,255],
+    'violet': [238,130,238,255], 'wheat': [245,222,179,255],
+    'white': [255,255,255,255], 'whitesmoke': [245,245,245,255],
+    'yellow': [255,255,0,255], 'yellowgreen': [154,205,50,255],
+};
 
 // Minimal color string to [r,g,b,a] parser.
 function _parseColorToRGBA(color) {
@@ -124,13 +250,18 @@ function _parseColorToRGBA(color) {
         var a = m[4] !== undefined ? Math.round(parseFloat(m[4]) * 255) : 255;
         return [parseInt(m[1]), parseInt(m[2]), parseInt(m[3]), a];
     }
-    // #RRGGBB or #RGB
+    // #RRGGBB, #RGB, #RRGGBBAA, #RGBA
     if (color[0] === '#') {
         var hex = color.slice(1);
         if (hex.length === 3) hex = hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2];
-        var n = parseInt(hex, 16);
-        return [(n >> 16) & 255, (n >> 8) & 255, n & 255, 255];
+        if (hex.length === 4) hex = hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2]+hex[3]+hex[3];
+        var n = parseInt(hex.substring(0, 6), 16);
+        var alpha = hex.length === 8 ? parseInt(hex.substring(6, 8), 16) : 255;
+        return [(n >> 16) & 255, (n >> 8) & 255, n & 255, alpha];
     }
+    // Named colors
+    var named = _NAMED_COLORS[color.toLowerCase()];
+    if (named) return named.slice();
     return [0, 0, 0, 255];
 }
 
@@ -281,6 +412,8 @@ class CanvasRenderingContext2D {
         this._frameBegin();
         if (value instanceof CanvasGradient) {
             value._apply();
+        } else if (value instanceof CanvasPattern) {
+            value._applyFill();
         } else {
             op_set_fill_style(this._canvasId, String(value));
         }
@@ -290,7 +423,13 @@ class CanvasRenderingContext2D {
     set strokeStyle(value) {
         this._strokeStyle = value;
         this._frameBegin();
-        op_set_stroke_style(this._canvasId, String(value));
+        if (value instanceof CanvasGradient) {
+            value._applyStroke();
+        } else if (value instanceof CanvasPattern) {
+            value._applyStroke();
+        } else {
+            op_set_stroke_style(this._canvasId, String(value));
+        }
     }
 
     get lineWidth() { return this._lineWidth; }
@@ -367,6 +506,10 @@ class CanvasRenderingContext2D {
             compositeOp: this._compositeOp,
             lineDash: this._lineDash ? this._lineDash.slice() : null,
             lineDashOffset: this._lineDashOffset,
+            shadowBlur: this._shadowBlur,
+            shadowColor: this._shadowColor,
+            shadowOffsetX: this._shadowOffsetX,
+            shadowOffsetY: this._shadowOffsetY,
         });
         this._frameBegin();
         op_save(this._canvasId);
@@ -390,6 +533,10 @@ class CanvasRenderingContext2D {
                 _compositeOp: state.compositeOp,
                 _lineDash: state.lineDash,
                 _lineDashOffset: state.lineDashOffset,
+                _shadowBlur: state.shadowBlur,
+                _shadowColor: state.shadowColor,
+                _shadowOffsetX: state.shadowOffsetX,
+                _shadowOffsetY: state.shadowOffsetY,
             });
         }
         this._frameBegin();
@@ -540,24 +687,41 @@ class CanvasRenderingContext2D {
         }
     }
 
-    // ==================== Shadows (stubs -- no femtovg support) ====================
-    get shadowBlur() { return 0; }
-    set shadowBlur(value) { }
-    get shadowColor() { return "rgba(0,0,0,0)"; }
-    set shadowColor(value) { }
-    get shadowOffsetX() { return 0; }
-    set shadowOffsetX(value) { }
-    get shadowOffsetY() { return 0; }
-    set shadowOffsetY(value) { }
+    // ==================== Shadows ====================
+    get shadowBlur() { return this._shadowBlur || 0; }
+    set shadowBlur(value) {
+        this._shadowBlur = +value || 0;
+        this._frameBegin();
+        op_set_shadow_blur(this._canvasId, this._shadowBlur);
+    }
+    get shadowColor() { return this._shadowColor || 'rgba(0,0,0,0)'; }
+    set shadowColor(value) {
+        this._shadowColor = value;
+        this._frameBegin();
+        op_set_shadow_color(this._canvasId, String(value));
+    }
+    get shadowOffsetX() { return this._shadowOffsetX || 0; }
+    set shadowOffsetX(value) {
+        this._shadowOffsetX = +value || 0;
+        this._frameBegin();
+        op_set_shadow_offset_x(this._canvasId, this._shadowOffsetX);
+    }
+    get shadowOffsetY() { return this._shadowOffsetY || 0; }
+    set shadowOffsetY(value) {
+        this._shadowOffsetY = +value || 0;
+        this._frameBegin();
+        op_set_shadow_offset_y(this._canvasId, this._shadowOffsetY);
+    }
 
     // ==================== Gradient ====================
     createLinearGradient(x0, y0, x1, y1) {
-        return new CanvasGradient('linear', this._canvasId, x0, y0, x1, y1, 0);
+        return new CanvasGradient('linear', this._canvasId, x0, y0, 0, x1, y1, 0);
     }
     createRadialGradient(x0, y0, r0, x1, y1, r1) {
-        // femtovg only supports linear gradients natively; radial falls back
-        // to a linear approximation using the center points.
-        return new CanvasGradient('radial', this._canvasId, x0, y0, x1, y1, r1);
+        return new CanvasGradient('radial', this._canvasId, x0, y0, r0, x1, y1, r1);
+    }
+    createConicGradient(startAngle, cx, cy) {
+        return new CanvasGradient('conic', this._canvasId, cx, cy, 0, startAngle, 0, 0);
     }
 
     // ==================== Line Dash ====================
@@ -583,7 +747,10 @@ class CanvasRenderingContext2D {
     // ==================== Other stubs ====================
     isPointInPath() { return false; }
     isPointInStroke() { return false; }
-    createPattern() { return {}; }
+    createPattern(image, repetition) {
+        if (!image || !image.loaded) return null;
+        return new CanvasPattern(this._canvasId, image.rid, repetition);
+    }
 }
 
 // Frame-end callback registry.  Each module registers its own cleanup

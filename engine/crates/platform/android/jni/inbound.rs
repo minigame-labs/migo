@@ -17,7 +17,10 @@ fn parse_sub_packages(json: Option<String>) -> Vec<(String, String)> {
         _ => return Vec::new(),
     };
     #[derive(serde::Deserialize)]
-    struct Entry { name: String, root: String }
+    struct Entry {
+        name: String,
+        root: String,
+    }
     deno_core::serde_json::from_str::<Vec<Entry>>(&json)
         .map(|v| v.into_iter().map(|e| (e.name, e.root)).collect())
         .unwrap_or_default()
@@ -70,7 +73,11 @@ fn forward_json_result_to_js(
 /// result to JS via `forward_json_result_to_js`.
 macro_rules! jni_json_callback {
     ($fn_name:ident, $js_callback:literal) => {
-        jni_json_callback!($fn_name, $js_callback, r#"{"error":"failed to read result"}"#);
+        jni_json_callback!(
+            $fn_name,
+            $js_callback,
+            r#"{"error":"failed to read result"}"#
+        );
     };
     ($fn_name:ident, $js_callback:literal, $fallback:expr) => {
         pub(crate) extern "system" fn $fn_name<'local>(
@@ -79,13 +86,7 @@ macro_rules! jni_json_callback {
             host_id: jint,
             result_json: JString<'local>,
         ) {
-            forward_json_result_to_js(
-                &mut env,
-                host_id,
-                &result_json,
-                $js_callback,
-                $fallback,
-            );
+            forward_json_result_to_js(&mut env, host_id, &result_json, $js_callback, $fallback);
         }
     };
 }
@@ -107,7 +108,7 @@ use crate::android::logging;
 use crate::android::platform::AndroidPlatform;
 use crate::android::surface::{
     ANativeWindow_fromSurface, ANativeWindow_getHeight, ANativeWindow_getWidth,
-    AndroidSurfaceWrapper,
+    ANativeWindow_setBuffersGeometry, AndroidSurfaceWrapper,
 };
 
 #[unsafe(no_mangle)]
@@ -161,10 +162,25 @@ pub(crate) extern "system" fn init(
         )
     };
     if raw_w <= 0 || raw_h <= 0 {
-        error!("init failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}", raw_w, raw_h);
+        error!(
+            "init failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}",
+            raw_w, raw_h
+        );
         return -1;
     }
     let (w, h) = (raw_w as u32, raw_h as u32);
+
+    // Normalize native window buffer geometry to the observed dimensions.
+    // This helps avoid stale rotated geometry during startup transitions.
+    let set_geo_rc = unsafe { ANativeWindow_setBuffersGeometry(window, raw_w, raw_h, 0) };
+    if set_geo_rc != 0 {
+        tracing::warn!(
+            "init: ANativeWindow_setBuffersGeometry({}x{}) failed: {}",
+            raw_w,
+            raw_h,
+            set_geo_rc
+        );
+    }
 
     // Read required fields from RuntimeConfig
     let cache_dir = match super::get_string_field(&mut env, "cacheDir", &options) {
@@ -219,11 +235,14 @@ pub(crate) extern "system" fn init(
         super::get_optional_string_field(&mut env, "codeSigningPubkey", &options);
 
     // Read optional game config fields
-    let sub_packages = parse_sub_packages(
-        super::get_optional_string_field(&mut env, "subPackagesJson", &options),
-    );
-    let workers_path =
-        super::get_optional_string_field(&mut env, "workersPath", &options);
+    let sub_packages = parse_sub_packages(super::get_optional_string_field(
+        &mut env,
+        "subPackagesJson",
+        &options,
+    ));
+    let workers_path = super::get_optional_string_field(&mut env, "workersPath", &options);
+
+    let log_level = shared::config::LogLevel::from(log_level_ordinal);
 
     let init_options = InitOptions::new()
         .with_pixel_ratio(display_density)
@@ -232,13 +251,16 @@ pub(crate) extern "system" fn init(
         .with_code_cache_dir(PathBuf::from(code_cache_dir))
         .with_target_fps(target_fps)
         .with_debug_enabled(debug_enabled)
-        .with_log_level(shared::config::LogLevel::from(log_level_ordinal))
+        .with_log_level(log_level)
         .with_watchdog_enabled(watchdog_enabled)
         .with_watchdog_timeout_secs(watchdog_timeout_secs)
         .with_code_signing_enabled(code_signing_enabled)
         .with_code_signing_pubkey(code_signing_pubkey)
         .with_sub_packages(sub_packages)
         .with_workers_path(workers_path);
+
+    // Apply RuntimeConfig log level to the tracing subscriber.
+    logging::update_log_level(log_level);
 
     info!(
         "init: density={}, target_fps={}, debug={}, log_level={:?}",
@@ -276,6 +298,8 @@ pub(crate) extern "system" fn updateSurface<'local>(
     _class: JClass<'local>,
     host_id: jint,
     surface: JObject<'local>,
+    width: jint,
+    height: jint,
 ) {
     // NOTE: ANativeWindow_fromSurface creates a new ANativeWindow reference.
     let raw_surface = surface.into_raw();
@@ -293,10 +317,40 @@ pub(crate) extern "system" fn updateSurface<'local>(
         )
     };
     if raw_w <= 0 || raw_h <= 0 {
-        error!("updateSurface failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}", raw_w, raw_h);
+        error!(
+            "updateSurface failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}",
+            raw_w, raw_h
+        );
         return;
     }
-    let (w, h) = (raw_w as u32, raw_h as u32);
+
+    let mut w = raw_w as u32;
+    let mut h = raw_h as u32;
+    if width > 0 && height > 0 {
+        let provided_w = width as u32;
+        let provided_h = height as u32;
+        if provided_w != w || provided_h != h {
+            tracing::warn!(
+                "updateSurface size mismatch: provided={}x{}, native={}x{}; using provided size",
+                provided_w,
+                provided_h,
+                w,
+                h
+            );
+        }
+        w = provided_w;
+        h = provided_h;
+    }
+
+    let set_geo_rc = unsafe { ANativeWindow_setBuffersGeometry(window, w as i32, h as i32, 0) };
+    if set_geo_rc != 0 {
+        tracing::warn!(
+            "updateSurface: ANativeWindow_setBuffersGeometry({}x{}) failed: {}",
+            w,
+            h,
+            set_geo_rc
+        );
+    }
 
     let android_surface = match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) } {
         Ok(s) => s,
@@ -338,7 +392,8 @@ pub(crate) extern "system" fn onOpenSystemBluetoothSetting<'local>(
             enabled
         )
     };
-    let escaped = json.replace('\\', "\\\\")
+    let escaped = json
+        .replace('\\', "\\\\")
         .replace('\'', "\\'")
         .replace('\n', "\\n")
         .replace('\r', "\\r");
@@ -1002,7 +1057,10 @@ pub(crate) extern "system" fn onMemoryWarning(
 
 jni_json_callback!(onCompressImageResult, "_internalOnCompressImageResult");
 jni_json_callback!(onChooseImageResult, "_internalOnChooseImageResult");
-jni_json_callback!(onChooseMessageFileResult, "_internalOnChooseMessageFileResult");
+jni_json_callback!(
+    onChooseMessageFileResult,
+    "_internalOnChooseMessageFileResult"
+);
 
 // ==================== Location Callbacks ====================
 
@@ -1022,8 +1080,16 @@ jni_json_callback!(onGetPhoneNumberResult, "_internalOnGetPhoneNumberResult");
 
 // ==================== Subpackage Callbacks ====================
 
-jni_json_callback!(onSubpackageProgress, "_internalOnSubpackageProgress", r#"{"requestId":0}"#);
-jni_json_callback!(onSubpackageResult, "_internalOnSubpackageResult", r#"{"requestId":0,"error":"failed to read result"}"#);
+jni_json_callback!(
+    onSubpackageProgress,
+    "_internalOnSubpackageProgress",
+    r#"{"requestId":0}"#
+);
+jni_json_callback!(
+    onSubpackageResult,
+    "_internalOnSubpackageResult",
+    r#"{"requestId":0,"error":"failed to read result"}"#
+);
 
 // ==================== VSync (Choreographer) ====================
 
@@ -1083,12 +1149,18 @@ jni_json_callback!(onShareAppMessageResult, "_internalOnShareAppMessageResult");
 
 // ==================== Navigate (Mode C) ====================
 
-jni_json_callback!(onNavigateToMiniProgramResult, "_internalOnNavigateToMiniProgramResult");
+jni_json_callback!(
+    onNavigateToMiniProgramResult,
+    "_internalOnNavigateToMiniProgramResult"
+);
 
 // ==================== Payment (Mode C) ====================
 
 jni_json_callback!(onMidasPaymentResult, "_internalOnMidasPaymentResult");
-jni_json_callback!(onMidasPaymentGameItemResult, "_internalOnMidasPaymentGameItemResult");
+jni_json_callback!(
+    onMidasPaymentGameItemResult,
+    "_internalOnMidasPaymentGameItemResult"
+);
 
 // ==================== Video Callbacks ====================
 
@@ -1133,4 +1205,3 @@ pub(crate) extern "system" fn getConsoleLogs<'local>(
         Err(_) => std::ptr::null_mut(),
     }
 }
-

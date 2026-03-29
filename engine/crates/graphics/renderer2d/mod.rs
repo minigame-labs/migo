@@ -1,11 +1,13 @@
 #![allow(dead_code)]
 
 use femtovg::{
-    Canvas as FvCanvas, Color, FontId, ImageId, LineCap, LineJoin, Paint, Path, Transform2D,
-    renderer::OpenGl,
+    renderer::OpenGl, Canvas as FvCanvas, Color, FontId, ImageId, LineCap, LineJoin, Paint, Path,
+    Transform2D,
 };
 use shared::protocol::color::Color as SharedColor;
-use shared::protocol::render_cmd::{TextAlign, TextBaseline, TextMetrics};
+use shared::protocol::render_cmd::{
+    GradientStop, GradientType, TextAlign, TextBaseline, TextMetrics,
+};
 
 /// Convert a shared protocol `Color` to femtovg's `Color`.
 #[inline]
@@ -36,25 +38,40 @@ pub enum CanvasLineJoin {
 #[derive(Clone)]
 pub enum FillStyleKind {
     Color(Color),
-    Gradient {
+    LinearGradient {
         x0: f32,
         y0: f32,
         x1: f32,
         y1: f32,
-        start_color: Color,
-        end_color: Color,
+        stops: Vec<(f32, Color)>,
+    },
+    RadialGradient {
+        x0: f32,
+        y0: f32,
+        r0: f32,
+        x1: f32,
+        y1: f32,
+        r1: f32,
+        stops: Vec<(f32, Color)>,
+    },
+    ConicGradient {
+        cx: f32,
+        cy: f32,
+        stops: Vec<(f32, Color)>,
     },
     Pattern {
         image_id: ImageId,
         repeat_x: bool,
         repeat_y: bool,
+        width: f32,
+        height: f32,
     },
 }
 
 #[derive(Clone)]
 pub struct Canvas2DState {
     pub fill_style: FillStyleKind,
-    pub stroke_style: Color,
+    pub stroke_style: FillStyleKind,
     pub line_width: f32,
     pub line_cap: CanvasLineCap,
     pub line_join: CanvasLineJoin,
@@ -72,13 +89,18 @@ pub struct Canvas2DState {
     pub transform: Transform2D,
     /// Whether a clip region is active (managed via femtovg scissor).
     pub has_clip: bool,
+
+    pub shadow_blur: f32,
+    pub shadow_color: Color,
+    pub shadow_offset_x: f32,
+    pub shadow_offset_y: f32,
 }
 
 impl Default for Canvas2DState {
     fn default() -> Self {
         Self {
             fill_style: FillStyleKind::Color(Color::rgb(0, 0, 0)),
-            stroke_style: Color::rgb(0, 0, 0),
+            stroke_style: FillStyleKind::Color(Color::rgb(0, 0, 0)),
             line_width: 1.0,
             line_cap: CanvasLineCap::Butt,
             line_join: CanvasLineJoin::Miter,
@@ -95,6 +117,11 @@ impl Default for Canvas2DState {
 
             transform: Transform2D::identity(),
             has_clip: false,
+
+            shadow_blur: 0.0,
+            shadow_color: Color::rgba(0, 0, 0, 0),
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 0.0,
         }
     }
 }
@@ -174,6 +201,23 @@ impl Canvas2DContext {
         let ga = Self::clamp01(global_alpha);
         c.a = (Self::clamp01(c.a) * ga).clamp(0.0, 1.0);
         c
+    }
+
+    fn rotate_conic_stops(mut stops: Vec<(f32, Color)>, start_angle: f32) -> Vec<(f32, Color)> {
+        if stops.is_empty() {
+            return stops;
+        }
+
+        let shift = (start_angle / std::f32::consts::TAU).rem_euclid(1.0);
+        if shift.abs() <= f32::EPSILON {
+            return stops;
+        }
+
+        for (offset, _) in &mut stops {
+            *offset = (*offset + shift).rem_euclid(1.0);
+        }
+        stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+        stops
     }
 
     // ========== Path methods ==========
@@ -306,7 +350,7 @@ impl Canvas2DContext {
         self.state.fill_style = FillStyleKind::Color(to_fv_color(color));
     }
     pub fn set_stroke_style_color(&mut self, color: SharedColor) {
-        self.state.stroke_style = to_fv_color(color);
+        self.state.stroke_style = FillStyleKind::Color(to_fv_color(color));
     }
     pub fn set_line_width(&mut self, w: f32) {
         self.state.line_width = w.max(0.0);
@@ -355,30 +399,155 @@ impl Canvas2DContext {
     pub fn set_line_dash_offset(&mut self, offset: f32) {
         self.state.line_dash_offset = offset;
     }
+    pub fn set_shadow_blur(&mut self, blur: f32) {
+        self.state.shadow_blur = blur.max(0.0);
+    }
+    pub fn set_shadow_color(&mut self, color: SharedColor) {
+        self.state.shadow_color = to_fv_color(color);
+    }
+    pub fn set_shadow_offset_x(&mut self, offset: f32) {
+        self.state.shadow_offset_x = offset;
+    }
+    pub fn set_shadow_offset_y(&mut self, offset: f32) {
+        self.state.shadow_offset_y = offset;
+    }
     pub fn set_fill_style_gradient(
         &mut self,
+        gradient_type: GradientType,
         x0: f32,
         y0: f32,
+        r0: f32,
         x1: f32,
         y1: f32,
-        stops: Vec<shared::protocol::render_cmd::GradientStop>,
+        r1: f32,
+        stops: Vec<GradientStop>,
     ) {
-        // femtovg linear_gradient only supports two-stop gradients natively.
-        // Use the first and last stops; for multi-stop, a texture-based
-        // approach would be needed (future enhancement).
-        if stops.len() >= 2 {
-            let first = &stops[0];
-            let last = &stops[stops.len() - 1];
-            self.state.fill_style = FillStyleKind::Gradient {
+        if stops.is_empty() {
+            return;
+        }
+
+        let mut stop_pairs: Vec<(f32, Color)> = stops
+            .into_iter()
+            .map(|s| (s.offset.clamp(0.0, 1.0), to_fv_color(s.color)))
+            .collect();
+
+        stop_pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        if stop_pairs.len() == 1 {
+            self.state.fill_style = FillStyleKind::Color(stop_pairs[0].1);
+            return;
+        }
+
+        self.state.fill_style = match gradient_type {
+            GradientType::Linear => FillStyleKind::LinearGradient {
                 x0,
                 y0,
                 x1,
                 y1,
-                start_color: to_fv_color(first.color),
-                end_color: to_fv_color(last.color),
-            };
-        }
+                stops: stop_pairs,
+            },
+            GradientType::Radial => FillStyleKind::RadialGradient {
+                x0,
+                y0,
+                r0,
+                x1,
+                y1,
+                r1,
+                stops: stop_pairs,
+            },
+            GradientType::Conic => FillStyleKind::ConicGradient {
+                cx: x0,
+                cy: y0,
+                stops: Self::rotate_conic_stops(stop_pairs, x1),
+            },
+        };
     }
+    pub fn set_stroke_style_gradient(
+        &mut self,
+        gradient_type: GradientType,
+        x0: f32,
+        y0: f32,
+        r0: f32,
+        x1: f32,
+        y1: f32,
+        r1: f32,
+        stops: Vec<GradientStop>,
+    ) {
+        if stops.is_empty() {
+            return;
+        }
+
+        let mut stop_pairs: Vec<(f32, Color)> = stops
+            .into_iter()
+            .map(|s| (s.offset.clamp(0.0, 1.0), to_fv_color(s.color)))
+            .collect();
+
+        stop_pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        if stop_pairs.len() == 1 {
+            self.state.stroke_style = FillStyleKind::Color(stop_pairs[0].1);
+            return;
+        }
+
+        self.state.stroke_style = match gradient_type {
+            GradientType::Linear => FillStyleKind::LinearGradient {
+                x0,
+                y0,
+                x1,
+                y1,
+                stops: stop_pairs,
+            },
+            GradientType::Radial => FillStyleKind::RadialGradient {
+                x0,
+                y0,
+                r0,
+                x1,
+                y1,
+                r1,
+                stops: stop_pairs,
+            },
+            GradientType::Conic => FillStyleKind::ConicGradient {
+                cx: x0,
+                cy: y0,
+                stops: Self::rotate_conic_stops(stop_pairs, x1),
+            },
+        };
+    }
+
+    pub fn set_fill_style_pattern(
+        &mut self,
+        image_id: ImageId,
+        repeat_x: bool,
+        repeat_y: bool,
+        width: f32,
+        height: f32,
+    ) {
+        self.state.fill_style = FillStyleKind::Pattern {
+            image_id,
+            repeat_x,
+            repeat_y,
+            width,
+            height,
+        };
+    }
+
+    pub fn set_stroke_style_pattern(
+        &mut self,
+        image_id: ImageId,
+        repeat_x: bool,
+        repeat_y: bool,
+        width: f32,
+        height: f32,
+    ) {
+        self.state.stroke_style = FillStyleKind::Pattern {
+            image_id,
+            repeat_x,
+            repeat_y,
+            width,
+            height,
+        };
+    }
+
     pub fn set_text_align(&mut self, align: TextAlign) {
         self.state.text_align = align;
     }
@@ -400,25 +569,14 @@ impl Canvas2DContext {
 
     // ========== Drawing methods ==========
     pub fn fill(&mut self) {
+        self.draw_path_shadow_fill();
         let paint = self.build_fill_paint();
         self.canvas.fill_path(&self.current_path, &paint);
     }
 
     pub fn stroke(&mut self) {
-        let stroke = Self::apply_global_alpha(self.state.stroke_style, self.state.global_alpha);
-        let paint = Paint::color(stroke)
-            .with_line_width(self.state.line_width)
-            .with_line_cap(match self.state.line_cap {
-                CanvasLineCap::Butt => LineCap::Butt,
-                CanvasLineCap::Round => LineCap::Round,
-                CanvasLineCap::Square => LineCap::Square,
-            })
-            .with_line_join(match self.state.line_join {
-                CanvasLineJoin::Miter => LineJoin::Miter,
-                CanvasLineJoin::Round => LineJoin::Round,
-                CanvasLineJoin::Bevel => LineJoin::Bevel,
-            })
-            .with_miter_limit(self.state.miter_limit);
+        self.draw_path_shadow_stroke();
+        let paint = self.build_stroke_paint();
         self.canvas.stroke_path(&self.current_path, &paint);
     }
 
@@ -436,27 +594,17 @@ impl Canvas2DContext {
         self.state.has_clip = true;
     }
 
-    // ========== Rectangle methods ==========
-    pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        if w <= 0.0 || h <= 0.0 {
-            return;
-        }
-        // Reuse rect_path to avoid allocation
-        self.rect_path = Path::new();
-        self.rect_path.rect(x, y, w, h);
-        let paint = self.build_fill_paint();
-        self.canvas.fill_path(&self.rect_path, &paint);
+    // ========== Shadow helper ==========
+    fn has_shadow(&self) -> bool {
+        self.state.shadow_color.a > 0.0
     }
 
-    pub fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        if w <= 0.0 || h <= 0.0 {
-            return;
-        }
-        // Reuse rect_path to avoid allocation
-        self.rect_path = Path::new();
-        self.rect_path.rect(x, y, w, h);
-        let stroke = Self::apply_global_alpha(self.state.stroke_style, self.state.global_alpha);
-        let paint = Paint::color(stroke)
+    fn shadow_color_with_alpha(&self) -> Color {
+        Self::apply_global_alpha(self.state.shadow_color, self.state.global_alpha)
+    }
+
+    fn build_shadow_stroke_paint(&self) -> Paint {
+        Paint::color(self.shadow_color_with_alpha())
             .with_line_width(self.state.line_width)
             .with_line_cap(match self.state.line_cap {
                 CanvasLineCap::Butt => LineCap::Butt,
@@ -468,7 +616,94 @@ impl Canvas2DContext {
                 CanvasLineJoin::Round => LineJoin::Round,
                 CanvasLineJoin::Bevel => LineJoin::Bevel,
             })
-            .with_miter_limit(self.state.miter_limit);
+            .with_miter_limit(self.state.miter_limit)
+    }
+
+    fn draw_rect_shadow(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        if !self.has_shadow() {
+            return;
+        }
+        let blur = self.state.shadow_blur;
+        let ox = self.state.shadow_offset_x;
+        let oy = self.state.shadow_offset_y;
+        let sc = self.shadow_color_with_alpha();
+
+        if blur <= f32::EPSILON {
+            self.rect_path = Path::new();
+            self.rect_path.rect(x + ox, y + oy, w, h);
+            self.canvas.fill_path(&self.rect_path, &Paint::color(sc));
+            return;
+        }
+
+        let feather = blur * 2.0;
+        let spread = blur;
+        let paint = Paint::box_gradient(
+            x + ox - spread,
+            y + oy - spread,
+            w + spread * 2.0,
+            h + spread * 2.0,
+            0.0,
+            feather,
+            sc,
+            Color::rgba(0, 0, 0, 0),
+        );
+        let margin = blur * 3.0;
+        self.rect_path = Path::new();
+        self.rect_path.rect(
+            x + ox - spread - margin,
+            y + oy - spread - margin,
+            w + (spread + margin) * 2.0,
+            h + (spread + margin) * 2.0,
+        );
+        self.canvas.fill_path(&self.rect_path, &paint);
+    }
+
+    fn draw_path_shadow_fill(&mut self) {
+        if !self.has_shadow() {
+            return;
+        }
+        self.canvas.save();
+        self.canvas
+            .translate(self.state.shadow_offset_x, self.state.shadow_offset_y);
+        let shadow_paint = Paint::color(self.shadow_color_with_alpha());
+        self.canvas.fill_path(&self.current_path, &shadow_paint);
+        self.canvas.restore();
+    }
+
+    fn draw_path_shadow_stroke(&mut self) {
+        if !self.has_shadow() {
+            return;
+        }
+        self.canvas.save();
+        self.canvas
+            .translate(self.state.shadow_offset_x, self.state.shadow_offset_y);
+        let shadow_paint = self.build_shadow_stroke_paint();
+        self.canvas.stroke_path(&self.current_path, &shadow_paint);
+        self.canvas.restore();
+    }
+
+    // ========== Rectangle methods ==========
+    pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        self.draw_rect_shadow(x, y, w, h);
+        // Reuse rect_path to avoid allocation
+        self.rect_path = Path::new();
+        self.rect_path.rect(x, y, w, h);
+        let paint = self.build_fill_paint();
+        self.canvas.fill_path(&self.rect_path, &paint);
+    }
+
+    pub fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        self.draw_rect_shadow(x, y, w, h);
+        // Reuse rect_path to avoid allocation
+        self.rect_path = Path::new();
+        self.rect_path.rect(x, y, w, h);
+        let paint = self.build_stroke_paint();
         self.canvas.stroke_path(&self.rect_path, &paint);
     }
 
@@ -520,6 +755,31 @@ impl Canvas2DContext {
 
     // ========== Text methods ==========
     pub fn fill_text(&mut self, text: &str, x: f32, y: f32, _max_width: f32) {
+        if self.has_shadow() {
+            let mut shadow_paint = Paint::color(self.shadow_color_with_alpha());
+            if let Some(font_id) = self.state.font_id {
+                shadow_paint.set_font(&[font_id]);
+            }
+            shadow_paint.set_font_size(self.state.font_size);
+            shadow_paint.set_text_align(match self.state.text_align {
+                TextAlign::Start | TextAlign::Left => femtovg::Align::Left,
+                TextAlign::End | TextAlign::Right => femtovg::Align::Right,
+                TextAlign::Center => femtovg::Align::Center,
+            });
+            shadow_paint.set_text_baseline(match self.state.text_baseline {
+                TextBaseline::Top | TextBaseline::Hanging => femtovg::Baseline::Top,
+                TextBaseline::Middle => femtovg::Baseline::Middle,
+                TextBaseline::Alphabetic => femtovg::Baseline::Alphabetic,
+                TextBaseline::Ideographic | TextBaseline::Bottom => femtovg::Baseline::Bottom,
+            });
+            let _ = self.canvas.fill_text(
+                x + self.state.shadow_offset_x,
+                y + self.state.shadow_offset_y,
+                text,
+                &shadow_paint,
+            );
+        }
+
         let mut paint = self.build_fill_paint();
         if let Some(font_id) = self.state.font_id {
             paint.set_font(&[font_id]);
@@ -540,22 +800,36 @@ impl Canvas2DContext {
     }
 
     pub fn stroke_text(&mut self, text: &str, x: f32, y: f32, _max_width: f32) {
-        // femtovg has no native stroke_text API. Approximate by rendering the
-        // text twice: once at a slightly larger size with stroke color (outline),
-        // then overwrite the interior with the background via DestinationOut.
-        //
-        // For the common mini-game pattern of strokeText + fillText (outline
-        // effect), this gives a visually correct result.  For standalone
-        // strokeText the outline width is approximate (font_size delta instead
-        // of true path stroking).
-        let stroke = Self::apply_global_alpha(self.state.stroke_style, self.state.global_alpha);
-        let lw = self.state.line_width.max(1.0);
-        let base_size = self.state.font_size;
+        if self.has_shadow() {
+            let mut shadow_paint = self.build_shadow_stroke_paint();
+            if let Some(font_id) = self.state.font_id {
+                shadow_paint.set_font(&[font_id]);
+            }
+            shadow_paint.set_font_size(self.state.font_size);
+            shadow_paint.set_text_align(match self.state.text_align {
+                TextAlign::Start | TextAlign::Left => femtovg::Align::Left,
+                TextAlign::End | TextAlign::Right => femtovg::Align::Right,
+                TextAlign::Center => femtovg::Align::Center,
+            });
+            shadow_paint.set_text_baseline(match self.state.text_baseline {
+                TextBaseline::Top | TextBaseline::Hanging => femtovg::Baseline::Top,
+                TextBaseline::Middle => femtovg::Baseline::Middle,
+                TextBaseline::Alphabetic => femtovg::Baseline::Alphabetic,
+                TextBaseline::Ideographic | TextBaseline::Bottom => femtovg::Baseline::Bottom,
+            });
+            let _ = self.canvas.stroke_text(
+                x + self.state.shadow_offset_x,
+                y + self.state.shadow_offset_y,
+                text,
+                &shadow_paint,
+            );
+        }
 
-        let mut paint = Paint::color(stroke);
+        let mut paint = self.build_stroke_paint();
         if let Some(font_id) = self.state.font_id {
             paint.set_font(&[font_id]);
         }
+        paint.set_font_size(self.state.font_size);
         paint.set_text_align(match self.state.text_align {
             TextAlign::Start | TextAlign::Left => femtovg::Align::Left,
             TextAlign::End | TextAlign::Right => femtovg::Align::Right,
@@ -567,24 +841,7 @@ impl Canvas2DContext {
             TextBaseline::Alphabetic => femtovg::Baseline::Alphabetic,
             TextBaseline::Ideographic | TextBaseline::Bottom => femtovg::Baseline::Bottom,
         });
-
-        // Draw "outline" — slightly larger filled text with stroke color
-        paint.set_font_size(base_size + lw);
-        let _ = self.canvas.fill_text(x, y, text, &paint);
-
-        // Punch out the interior to leave only the outline ring
-        self.canvas.save();
-        self.canvas
-            .global_composite_operation(femtovg::CompositeOperation::DestinationOut);
-        let mut erase = Paint::color(Color::white());
-        if let Some(font_id) = self.state.font_id {
-            erase.set_font(&[font_id]);
-        }
-        erase.set_font_size(base_size);
-        erase.set_text_align(paint.text_align());
-        erase.set_text_baseline(paint.text_baseline());
-        let _ = self.canvas.fill_text(x, y, text, &erase);
-        self.canvas.restore();
+        let _ = self.canvas.stroke_text(x, y, text, &paint);
     }
 
     pub fn measure_text(&mut self, text: &str) -> TextMetrics {
@@ -670,6 +927,9 @@ impl Canvas2DContext {
         if dw <= 0.0 || dh <= 0.0 {
             return;
         }
+
+        self.draw_rect_shadow(dx, dy, dw, dh);
+
         let (scale_x, scale_y) = (dw / sw, dh / sh);
         let ga = Self::clamp01(self.state.global_alpha);
         let source_is_whole = sx == 0.0
@@ -702,28 +962,169 @@ impl Canvas2DContext {
         let ga = Self::clamp01(self.state.global_alpha);
         match &self.state.fill_style {
             FillStyleKind::Color(c) => Paint::color(Self::apply_global_alpha(*c, ga)),
-            FillStyleKind::Gradient {
+            FillStyleKind::LinearGradient {
                 x0,
                 y0,
                 x1,
                 y1,
-                start_color,
-                end_color,
-            } => Paint::linear_gradient(
+                stops,
+            } => Paint::linear_gradient_stops(
                 *x0,
                 *y0,
                 *x1,
                 *y1,
-                Self::apply_global_alpha(*start_color, ga),
-                Self::apply_global_alpha(*end_color, ga),
+                stops
+                    .iter()
+                    .copied()
+                    .map(|(offset, color)| (offset, Self::apply_global_alpha(color, ga))),
             ),
-            FillStyleKind::Pattern { image_id, .. } => {
-                Paint::image(*image_id, 0.0, 0.0, 1.0, 1.0, 0.0, ga)
+            FillStyleKind::RadialGradient {
+                x0,
+                y0,
+                r0,
+                x1,
+                y1,
+                r1,
+                stops,
+            } => {
+                let center =
+                    if (*x0 - *x1).abs() <= f32::EPSILON && (*y0 - *y1).abs() <= f32::EPSILON {
+                        (*x0, *y0)
+                    } else {
+                        (*x1, *y1)
+                    };
+                Paint::radial_gradient_stops(
+                    center.0,
+                    center.1,
+                    (*r0).max(0.0),
+                    (*r1).max(0.0),
+                    stops
+                        .iter()
+                        .copied()
+                        .map(|(offset, color)| (offset, Self::apply_global_alpha(color, ga))),
+                )
+            }
+            FillStyleKind::ConicGradient { cx, cy, stops } => {
+                Paint::conic_gradient_stops(
+                    *cx,
+                    *cy,
+                    stops
+                        .iter()
+                        .copied()
+                        .map(|(offset, color)| (offset, Self::apply_global_alpha(color, ga))),
+                )
+            }
+            FillStyleKind::Pattern { image_id, width, height, .. } => {
+                Paint::image(*image_id, 0.0, 0.0, *width, *height, 0.0, ga)
             }
         }
     }
 
+    fn build_stroke_paint(&self) -> Paint {
+        let ga = Self::clamp01(self.state.global_alpha);
+        let base = match &self.state.stroke_style {
+            FillStyleKind::Color(c) => Paint::color(Self::apply_global_alpha(*c, ga)),
+            FillStyleKind::LinearGradient {
+                x0,
+                y0,
+                x1,
+                y1,
+                stops,
+            } => Paint::linear_gradient_stops(
+                *x0,
+                *y0,
+                *x1,
+                *y1,
+                stops
+                    .iter()
+                    .copied()
+                    .map(|(offset, color)| (offset, Self::apply_global_alpha(color, ga))),
+            ),
+            FillStyleKind::RadialGradient {
+                x0,
+                y0,
+                r0,
+                x1,
+                y1,
+                r1,
+                stops,
+            } => {
+                let center =
+                    if (*x0 - *x1).abs() <= f32::EPSILON && (*y0 - *y1).abs() <= f32::EPSILON {
+                        (*x0, *y0)
+                    } else {
+                        (*x1, *y1)
+                    };
+                Paint::radial_gradient_stops(
+                    center.0,
+                    center.1,
+                    (*r0).max(0.0),
+                    (*r1).max(0.0),
+                    stops
+                        .iter()
+                        .copied()
+                        .map(|(offset, color)| (offset, Self::apply_global_alpha(color, ga))),
+                )
+            }
+            FillStyleKind::ConicGradient { cx, cy, stops } => Paint::conic_gradient_stops(
+                *cx,
+                *cy,
+                stops
+                    .iter()
+                    .copied()
+                    .map(|(offset, color)| (offset, Self::apply_global_alpha(color, ga))),
+            ),
+            FillStyleKind::Pattern { image_id, width, height, .. } => {
+                Paint::image(*image_id, 0.0, 0.0, *width, *height, 0.0, ga)
+            }
+        };
+        base.with_line_width(self.state.line_width)
+            .with_line_cap(match self.state.line_cap {
+                CanvasLineCap::Butt => LineCap::Butt,
+                CanvasLineCap::Round => LineCap::Round,
+                CanvasLineCap::Square => LineCap::Square,
+            })
+            .with_line_join(match self.state.line_join {
+                CanvasLineJoin::Miter => LineJoin::Miter,
+                CanvasLineJoin::Round => LineJoin::Round,
+                CanvasLineJoin::Bevel => LineJoin::Bevel,
+            })
+            .with_miter_limit(self.state.miter_limit)
+    }
+
     pub fn flush(&mut self) {
         self.canvas.flush();
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotate_conic_stops_applies_start_angle_shift() {
+        let stops = vec![
+            (0.0, Color::rgb(255, 0, 0)),
+            (0.5, Color::rgb(0, 0, 255)),
+        ];
+
+        let rotated = Canvas2DContext::rotate_conic_stops(stops, std::f32::consts::FRAC_PI_2);
+
+        assert!((rotated[0].0 - 0.25).abs() < 1e-6);
+        assert!((rotated[1].0 - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rotate_conic_stops_wraps_and_keeps_sorted_order() {
+        let stops = vec![
+            (0.8, Color::rgb(255, 0, 0)),
+            (0.2, Color::rgb(0, 255, 0)),
+        ];
+
+        let rotated = Canvas2DContext::rotate_conic_stops(stops, std::f32::consts::PI);
+
+        assert!((rotated[0].0 - 0.3).abs() < 1e-6);
+        assert!((rotated[1].0 - 0.7).abs() < 1e-6);
     }
 }

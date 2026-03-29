@@ -3,8 +3,8 @@ use crate::protocol::error::ServiceError;
 /// Subpackage download service.
 ///
 /// Handles downloading subpackages from the host app's CDN.
-/// The JS layer resolves subpackage names to root paths via `game.json`,
-/// then delegates the actual download to the platform.
+/// The JS layer resolves subpackage names to root paths from injected
+/// runtime config metadata, then delegates the actual download to the platform.
 ///
 /// JSON fields passed to both methods:
 /// - `requestId`: number -- unique ID for correlating progress/result callbacks
@@ -23,6 +23,8 @@ pub trait SubpackageService: Send + Sync {
     /// Called by both `loadSubpackage` and `preDownloadSubpackage`.
     /// The JS layer handles code execution after download completes.
     fn download_subpackage(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("loadSubpackage:fail not supported"))
+        Err(ServiceError::not_supported(
+            "loadSubpackage:fail not supported",
+        ))
     }
 }

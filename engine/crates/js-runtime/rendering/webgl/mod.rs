@@ -22,6 +22,7 @@ extension!(host_v8_webgl,
         op_await_next_frame,
         op_set_preferred_fps,
 
+        op_alloc_gl_resource_id,
         op_create_program,
         op_use_program,
         op_link_program,
@@ -185,7 +186,14 @@ extension!(host_v8_webgl,
         op_set_composite_operation,
         op_set_line_dash,
         op_set_line_dash_offset,
+        op_set_shadow_blur,
+        op_set_shadow_color,
+        op_set_shadow_offset_x,
+        op_set_shadow_offset_y,
         op_set_fill_style_gradient,
+        op_set_stroke_style_gradient,
+        op_set_fill_style_pattern,
+        op_set_stroke_style_pattern,
         op_set_font,
         op_set_text_align,
         op_set_text_baseline,
@@ -220,6 +228,7 @@ extension!(host_v8_webgl,
     state = |state| {
         state.put(FrameCommandCollector::new());
         state.put(GlBatchCollector::new());
+        state.put(GlResourceIdAllocator::new());
     }
 );
 

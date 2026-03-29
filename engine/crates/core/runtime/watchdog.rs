@@ -37,8 +37,8 @@
 //!
 //! All code in this module is gated behind `cfg(feature = "v8-limits")`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use deno_core::v8;
@@ -145,12 +145,14 @@ impl WatchdogConfig {
     }
 
     /// Set the check interval.
+    #[allow(dead_code)]
     pub fn with_check_interval(mut self, interval: Duration) -> Self {
         self.check_interval = interval;
         self
     }
 
     /// Set a custom telemetry reporter.
+    #[allow(dead_code)]
     pub fn with_telemetry(mut self, reporter: Arc<dyn TelemetryReporter>) -> Self {
         self.telemetry = reporter;
         self
@@ -226,6 +228,7 @@ impl WatchdogState {
 
     /// Check if the isolate was terminated by the watchdog or OOM callback.
     #[inline]
+    #[allow(dead_code)]
     pub fn was_terminated(&self) -> bool {
         self.terminated.load(Ordering::SeqCst)
     }
@@ -240,6 +243,7 @@ impl WatchdogState {
     }
 
     /// Reset termination state (used after `cancel_terminate_execution` for restart).
+    #[allow(dead_code)]
     pub fn reset(&self) {
         self.terminated.store(false, Ordering::SeqCst);
         self.termination_reason.store(0, Ordering::SeqCst);
@@ -258,6 +262,7 @@ impl WatchdogState {
     ///
     /// **Important:** Always call [`resume()`] when done.
     #[inline]
+    #[allow(dead_code)]
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
     }
@@ -266,6 +271,7 @@ impl WatchdogState {
     ///
     /// Also refreshes the heartbeat so the elapsed-time counter resets.
     #[inline]
+    #[allow(dead_code)]
     pub fn resume(&self) {
         self.heartbeat.store(self.mono_millis(), Ordering::Release);
         self.paused.store(false, Ordering::Release);
@@ -273,6 +279,7 @@ impl WatchdogState {
 
     /// Whether the watchdog is currently paused.
     #[inline]
+    #[allow(dead_code)]
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
     }
@@ -287,6 +294,7 @@ impl WatchdogState {
     ///
     /// # Arguments
     /// * `extra` - How much additional time to allow beyond the current moment.
+    #[allow(dead_code)]
     pub fn extend_timeout(&self, extra: Duration) {
         let deadline = self.mono_millis() + extra.as_millis() as u64;
         self.extended_deadline.store(deadline, Ordering::Release);
@@ -295,6 +303,7 @@ impl WatchdogState {
     /// Clear any temporary timeout extension.
     ///
     /// Also refreshes the heartbeat.
+    #[allow(dead_code)]
     pub fn clear_timeout_extension(&self) {
         self.extended_deadline.store(0, Ordering::Release);
         self.heartbeat.store(self.mono_millis(), Ordering::Release);

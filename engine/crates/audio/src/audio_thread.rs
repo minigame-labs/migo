@@ -11,7 +11,7 @@ use shared::protocol::audio_cmd::{
     InnerAudioId, InnerAudioInfo, InnerAudioState,
 };
 use shared::protocol::host_cmd::HostCommand;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{error, info, warn};
 
 /// Best-effort thread join with a timeout.  Falls back to detaching the
@@ -27,7 +27,10 @@ fn join_with_timeout(handle: thread::JoinHandle<()>, timeout: Duration, label: &
     });
     thread::park_timeout(timeout);
     if !done.load(std::sync::atomic::Ordering::Acquire) {
-        warn!("{} did not shut down within {:?}, detaching", label, timeout);
+        warn!(
+            "{} did not shut down within {:?}, detaching",
+            label, timeout
+        );
     }
 }
 
@@ -204,7 +207,6 @@ fn decode_worker(
 
 use crate::cache::GlobalAudioCache;
 use crate::context::AudioContext;
-use crate::decoder;
 use crate::inner_audio::{InnerAudioPlayer, PlaybackState};
 use crate::nodes::{
     AnalyserNode, BiquadFilterNode, BiquadFilterType, ChannelMergerNode, ChannelSplitterNode,
@@ -213,7 +215,6 @@ use crate::nodes::{
 };
 use crate::output::AudioOutput;
 use crate::power_manager::{AudioPowerConfig, AudioPowerManager, AudioPowerState};
-use crate::resampler;
 use crate::streaming::{self, StreamingState};
 
 /// Reverse lookup from node_id to context_id for O(1) access.
@@ -277,25 +278,25 @@ impl AudioThread {
             .name("Migo-AudioThread".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Initialize audio output
-                let output = match AudioOutput::new() {
-                    Ok(out) => {
-                        let _ = init_tx.send(InitResult::Ok(thread::current().id()));
-                        out
-                    }
-                    Err(e) => {
-                        error!("Failed to initialize audio output: {}", e);
-                        let _ = init_tx.send(InitResult::Err(e.to_string()));
-                        return;
-                    }
-                };
+                    // Initialize audio output
+                    let output = match AudioOutput::new() {
+                        Ok(out) => {
+                            let _ = init_tx.send(InitResult::Ok(thread::current().id()));
+                            out
+                        }
+                        Err(e) => {
+                            error!("Failed to initialize audio output: {}", e);
+                            let _ = init_tx.send(InitResult::Err(e.to_string()));
+                            return;
+                        }
+                    };
 
-                info!("AudioThread started");
+                    info!("AudioThread started");
 
-                // Run the audio thread loop with power management
-                run_audio_thread(rx, output, host_tx, wakeup_for_thread);
+                    // Run the audio thread loop with power management
+                    run_audio_thread(rx, output, host_tx, wakeup_for_thread);
 
-                info!("AudioThread stopped");
+                    info!("AudioThread stopped");
                 })); // end catch_unwind
                 if let Err(panic_info) = result {
                     let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
@@ -364,22 +365,22 @@ impl AudioThread {
             .name("Migo-AudioThread".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let output = match AudioOutput::new() {
-                    Ok(out) => out,
-                    Err(e) => {
-                        error!(
-                            "AudioThread (lazy): failed to initialise audio output: {}",
-                            e
-                        );
-                        // Drain the channel so senders don't block/leak.
-                        drop(rx);
-                        return;
-                    }
-                };
+                    let output = match AudioOutput::new() {
+                        Ok(out) => out,
+                        Err(e) => {
+                            error!(
+                                "AudioThread (lazy): failed to initialise audio output: {}",
+                                e
+                            );
+                            // Drain the channel so senders don't block/leak.
+                            drop(rx);
+                            return;
+                        }
+                    };
 
-                info!("AudioThread (lazy) started");
-                run_audio_thread(rx, output, host_tx, wakeup_for_thread);
-                info!("AudioThread (lazy) stopped");
+                    info!("AudioThread (lazy) started");
+                    run_audio_thread(rx, output, host_tx, wakeup_for_thread);
+                    info!("AudioThread (lazy) stopped");
                 })); // end catch_unwind
                 if let Err(panic_info) = result {
                     let msg = if let Some(s) = panic_info.downcast_ref::<String>() {

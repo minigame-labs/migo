@@ -12,6 +12,7 @@ pub struct AnalyserNode {
     fft_size: usize,
     min_decibels: f32,
     max_decibels: f32,
+    #[allow(dead_code)]
     smoothing_time_constant: f32,
     /// Circular time-domain buffer (mono, downmixed from input)
     time_domain_buffer: Vec<f32>,
@@ -57,14 +58,17 @@ impl AnalyserNode {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_min_decibels(&mut self, v: f32) {
         self.min_decibels = v;
     }
 
+    #[allow(dead_code)]
     pub fn set_max_decibels(&mut self, v: f32) {
         self.max_decibels = v;
     }
 
+    #[allow(dead_code)]
     pub fn set_smoothing_time_constant(&mut self, v: f32) {
         self.smoothing_time_constant = v.clamp(0.0, 1.0);
     }

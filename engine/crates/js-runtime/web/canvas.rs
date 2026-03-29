@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use crossbeam_channel::{RecvTimeoutError, bounded};
-use deno_core::{OpState, op2};
+use crossbeam_channel::{bounded, RecvTimeoutError};
+use deno_core::{op2, OpState};
 use deno_error::JsErrorBox;
 use shared::{
     error::{EngineError, ErrorCode},

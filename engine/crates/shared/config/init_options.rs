@@ -23,27 +23,30 @@ use deno_core::serde_json::{Map, Value};
 pub type Extras = Map<String, Value>;
 
 /// Log level for the engine.
+///
+/// Ordinals match Java `RuntimeConfig.LogLevel` enum exactly:
+/// TRACE(0), DEBUG(1), INFO(2), WARN(3), ERROR(4), OFF(5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i32)]
 pub enum LogLevel {
-    None = 0,
-    Error = 1,
+    Trace = 0,
+    Debug = 1,
+    Info = 2,
     #[default]
-    Warn = 2,
-    Info = 3,
-    Debug = 4,
-    Verbose = 5,
+    Warn = 3,
+    Error = 4,
+    Off = 5,
 }
 
 impl From<i32> for LogLevel {
     fn from(value: i32) -> Self {
         match value {
-            0 => LogLevel::None,
-            1 => LogLevel::Error,
-            2 => LogLevel::Warn,
-            3 => LogLevel::Info,
-            4 => LogLevel::Debug,
-            5 => LogLevel::Verbose,
+            0 => LogLevel::Trace,
+            1 => LogLevel::Debug,
+            2 => LogLevel::Info,
+            3 => LogLevel::Warn,
+            4 => LogLevel::Error,
+            5 => LogLevel::Off,
             _ => LogLevel::Warn,
         }
     }

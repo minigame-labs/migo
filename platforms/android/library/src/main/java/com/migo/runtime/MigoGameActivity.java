@@ -7,14 +7,18 @@ import android.content.Intent;
 import android.content.res.Configuration;
 import android.os.Bundle;
 import android.util.Log;
-import android.view.Gravity;
+import android.graphics.Rect;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
-import android.view.View;
 import android.widget.FrameLayout;
 
 import com.migo.runtime.callback.GameSessionListener;
+import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.platform.DisplayCompat;
+import com.migo.runtime.internal.platform.OrientationWaitHelper;
+
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Ready-to-use Activity for running a game with zero boilerplate.
@@ -62,12 +66,16 @@ public class MigoGameActivity extends Activity
     public static final String EXTRA_GAME_ID = "migo_game_id";
     /** Intent extra key for entry point file name. */
     public static final String EXTRA_ENTRY_POINT = "migo_entry_point";
+    /** Internal extra key for pending RuntimeConfig token. */
+    public static final String EXTRA_CONFIG_TOKEN = "migo_config_token";
 
-    private static RuntimeConfig sPendingConfig;
-    private static final Object sConfigLock = new Object();
+    private static final ConcurrentHashMap<String, RuntimeConfig> sPendingConfigs =
+            new ConcurrentHashMap<>();
 
     private GameSession session;
     private SurfaceView surfaceView;
+    private final OrientationWaitHelper orientationHelper = new OrientationWaitHelper(TAG);
+    private String lastOrientationEventValue;
     private String gameId;
     private String entryPoint;
     private RuntimeConfig config;
@@ -93,16 +101,53 @@ public class MigoGameActivity extends Activity
      */
     public static void launch(Context context, String gameId, String entryPoint,
                               RuntimeConfig config) {
-        synchronized (sConfigLock) {
-            sPendingConfig = config;
-        }
-        Intent intent = new Intent(context, MigoGameActivity.class);
+        Intent intent = buildLaunchIntent(
+                context,
+                MigoGameActivity.class,
+                gameId,
+                entryPoint,
+                config
+        );
+        context.startActivity(intent);
+    }
+
+    /**
+     * Build a launch intent for MigoGameActivity (or subclasses).
+     *
+     * Subclasses can use this to launch themselves without relying on reflection.
+     */
+    protected static Intent buildLaunchIntent(
+            Context context,
+            Class<? extends MigoGameActivity> activityClass,
+            String gameId,
+            String entryPoint,
+            RuntimeConfig config
+    ) {
+        Intent intent = new Intent(context, activityClass);
         intent.putExtra(EXTRA_GAME_ID, gameId);
         intent.putExtra(EXTRA_ENTRY_POINT, entryPoint);
+
+        if (config != null) {
+            String token = UUID.randomUUID().toString();
+            sPendingConfigs.put(token, config);
+            intent.putExtra(EXTRA_CONFIG_TOKEN, token);
+        }
+
         if (!(context instanceof Activity)) {
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         }
-        context.startActivity(intent);
+        return intent;
+    }
+
+    private static RuntimeConfig consumePendingConfig(Intent intent) {
+        if (intent == null) {
+            return null;
+        }
+        String token = intent.getStringExtra(EXTRA_CONFIG_TOKEN);
+        if (token == null || token.isEmpty()) {
+            return null;
+        }
+        return sPendingConfigs.remove(token);
     }
 
     @Override
@@ -110,16 +155,12 @@ public class MigoGameActivity extends Activity
         super.onCreate(savedInstanceState);
 
         // Extract launch parameters
+        config = consumePendingConfig(getIntent());
         gameId = getIntent().getStringExtra(EXTRA_GAME_ID);
         entryPoint = getIntent().getStringExtra(EXTRA_ENTRY_POINT);
         if (gameId == null || entryPoint == null) {
             finish();
             return;
-        }
-
-        synchronized (sConfigLock) {
-            config = sPendingConfig;
-            sPendingConfig = null;
         }
         if (config == null) {
             config = new RuntimeConfig.Builder(this).build();
@@ -163,7 +204,18 @@ public class MigoGameActivity extends Activity
     public void surfaceCreated(SurfaceHolder holder) {
         Log.i(TAG, "surfaceCreated: frame=" + holder.getSurfaceFrame());
         if (session != null && session.isValid()) {
-            session.updateSurface(holder.getSurface());
+            orientationHelper.cancel();
+            Rect frame = holder.getSurfaceFrame();
+            session.updateSurface(holder.getSurface(), frame.width(), frame.height());
+        } else if (orientationHelper.getTargetOrientation() != null) {
+            Rect frame = holder.getSurfaceFrame();
+            if (orientationHelper.surfaceMatches(frame.width(), frame.height())) {
+                initializeGame(holder);
+            } else {
+                Log.i(TAG, "surfaceCreated: deferring init until surface matches "
+                        + orientationHelper.getTargetOrientation());
+                orientationHelper.defer(holder, this::initializeGame);
+            }
         } else {
             initializeGame(holder);
         }
@@ -173,13 +225,23 @@ public class MigoGameActivity extends Activity
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         Log.i(TAG, "surfaceChanged: format=" + format + ", size=" + width + "x" + height);
         if (session != null && session.isValid()) {
-            session.updateSurface(holder.getSurface());
+            orientationHelper.cancel();
+            session.updateSurface(holder.getSurface(), width, height);
+        } else {
+            SurfaceHolder pending = orientationHelper.consumePending();
+            if (pending != null && orientationHelper.surfaceMatches(width, height)) {
+                Log.i(TAG, "surfaceChanged: surface matches, initializing game");
+                initializeGame(pending);
+            } else if (pending != null) {
+                orientationHelper.defer(pending, this::initializeGame);
+            }
         }
     }
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         Log.i(TAG, "surfaceDestroyed");
+        orientationHelper.cancel();
         // Do NOT destroy the session. Surface is destroyed on onStop but
         // Activity is still alive. Cleanup happens in onDestroy.
     }
@@ -206,6 +268,7 @@ public class MigoGameActivity extends Activity
 
     @Override
     protected void onDestroy() {
+        orientationHelper.cancel();
         unregisterComponentCallbacks(this);
         if (session != null) {
             session.close();
@@ -226,6 +289,13 @@ public class MigoGameActivity extends Activity
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
+        if (session != null && session.isValid()) {
+            String value = DisplayCompat.mapDeviceOrientationValue(this, newConfig);
+            if (!value.equals(lastOrientationEventValue)) {
+                lastOrientationEventValue = value;
+                NativeMethods.onDeviceOrientationChange(session.getSessionId(), value);
+            }
+        }
     }
 
     @Override
@@ -257,9 +327,19 @@ public class MigoGameActivity extends Activity
         return session;
     }
 
+    /**
+     * Called immediately after session creation and before startGame.
+     *
+     * Override this to register host handlers that should be available before
+     * game code starts running.
+     */
+    protected void onSessionCreated(GameSession session) {
+    }
+
     // ==================== Private ====================
 
     private void initializeGame(SurfaceHolder holder) {
+        orientationHelper.cancel();
         Log.i(TAG, "initializeGame: gameId=" + gameId + ", entry=" + entryPoint);
         MigoRuntime.Result<GameSession> result = MigoRuntime.getInstance()
                 .createSessionSafe(this, holder.getSurface(), config, gameId);
@@ -271,6 +351,18 @@ public class MigoGameActivity extends Activity
         }
 
         session = result.getValue();
+        lastOrientationEventValue = DisplayCompat.mapDeviceOrientationValue(
+                this,
+                getResources().getConfiguration()
+        );
+
+        try {
+            onSessionCreated(session);
+        } catch (Throwable t) {
+            Log.e(TAG, "onSessionCreated failed", t);
+            finish();
+            return;
+        }
 
         // Set up listener
         GameSessionListener listener = onCreateGameListener();
@@ -289,9 +381,11 @@ public class MigoGameActivity extends Activity
     private void applyStartupOrientation() {
         String orientation = config != null ? config.getStartupOrientation() : null;
         if (orientation == null) {
+            orientationHelper.setTargetOrientation(null);
             return;
         }
 
+        orientationHelper.setTargetOrientation(orientation);
         int result = DisplayCompat.setDeviceOrientation(this, orientation);
         Log.i(TAG, "applyStartupOrientation: " + orientation + ", result=" + result);
     }

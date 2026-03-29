@@ -47,6 +47,53 @@ impl GlBatchCollector {
     }
 }
 
+pub(crate) struct GlResourceIdAllocator {
+    next_id: u32,
+}
+
+impl GlResourceIdAllocator {
+    pub(crate) fn new() -> Self {
+        Self { next_id: 1 }
+    }
+
+    fn alloc(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
+        id
+    }
+
+    #[cfg(test)]
+    fn with_next_for_test(next_id: u32) -> Self {
+        Self {
+            next_id: if next_id == 0 { 1 } else { next_id },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GlResourceIdAllocator;
+
+    #[test]
+    fn allocates_monotonic_non_zero_ids() {
+        let mut alloc = GlResourceIdAllocator::new();
+        assert_eq!(alloc.alloc(), 1);
+        assert_eq!(alloc.alloc(), 2);
+        assert_eq!(alloc.alloc(), 3);
+    }
+
+    #[test]
+    fn wraps_without_returning_zero() {
+        let mut alloc = GlResourceIdAllocator::with_next_for_test(u32::MAX);
+        assert_eq!(alloc.alloc(), u32::MAX);
+        assert_eq!(alloc.alloc(), 1);
+        assert_ne!(alloc.alloc(), 0);
+    }
+}
+
 #[inline]
 fn send_gl_batch_now(state: &mut OpState, commands: Vec<GLCmd>) {
     if commands.is_empty() {
@@ -108,6 +155,15 @@ fn load_cached_image_rgba(image_id: u32) -> Option<(i32, i32, Vec<u8>)> {
 }
 
 #[op2(fast)]
+pub fn op_alloc_gl_resource_id(state: &mut OpState) -> u32 {
+    let Some(alloc) = state.try_borrow_mut::<GlResourceIdAllocator>() else {
+        error!("GlResourceIdAllocator missing in op state");
+        return 0;
+    };
+    alloc.alloc()
+}
+
+#[op2(fast)]
 pub fn op_gl_flush(state: &mut OpState) {
     flush_gl_batch(state);
 }
@@ -159,8 +215,14 @@ pub fn op_clear(state: &mut OpState, #[smi] canvas_id: u32, #[smi] bit_field: u3
 }
 
 #[op2(fast)]
-pub fn op_create_program(state: &mut OpState, #[smi] client_id: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::CreateProgram { client_id });
+pub fn op_create_program(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CreateProgram {
+            canvas_id,
+            client_id,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -212,7 +274,12 @@ pub fn op_delete_program(state: &mut OpState, #[smi] program_id: u32) {
 }
 
 #[op2(fast)]
-pub fn op_create_shader(state: &mut OpState, #[smi] client_id: u32, #[smi] ty: u32) {
+pub fn op_create_shader(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] client_id: u32,
+    #[smi] ty: u32,
+) {
     let shader_type = match ty {
         glow::VERTEX_SHADER => ShaderType::Vertex,
         glow::FRAGMENT_SHADER => ShaderType::Fragment,
@@ -224,6 +291,7 @@ pub fn op_create_shader(state: &mut OpState, #[smi] client_id: u32, #[smi] ty: u
     queue_gl_fire_and_forget(
         state,
         GLCmd::CreateShader {
+            canvas_id,
             client_id,
             shader_type,
         },
@@ -447,8 +515,14 @@ pub fn op_vertex_attrib_pointer(
 }
 
 #[op2(fast)]
-pub fn op_create_buffer(state: &mut OpState, #[smi] client_id: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::CreateBuffer { client_id });
+pub fn op_create_buffer(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CreateBuffer {
+            canvas_id,
+            client_id,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -632,8 +706,14 @@ pub fn op_get_parameter(state: &mut OpState, #[smi] canvas_id: u32, #[smi] pname
 // ---------------------------------------------------------------------------
 
 #[op2(fast)]
-pub fn op_create_texture(state: &mut OpState, #[smi] client_id: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::CreateTexture { client_id });
+pub fn op_create_texture(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CreateTexture {
+            canvas_id,
+            client_id,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -1560,8 +1640,14 @@ pub fn op_uniform_matrix_4fv(
 // ---------------------------------------------------------------------------
 
 #[op2(fast)]
-pub fn op_create_framebuffer(state: &mut OpState, #[smi] client_id: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::CreateFramebuffer { client_id });
+pub fn op_create_framebuffer(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CreateFramebuffer {
+            canvas_id,
+            client_id,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -1662,8 +1748,14 @@ pub fn op_check_framebuffer_status(
 }
 
 #[op2(fast)]
-pub fn op_create_renderbuffer(state: &mut OpState, #[smi] client_id: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::CreateRenderbuffer { client_id });
+pub fn op_create_renderbuffer(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CreateRenderbuffer {
+            canvas_id,
+            client_id,
+        },
+    );
 }
 
 #[op2(fast)]

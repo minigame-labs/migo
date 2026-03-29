@@ -17,10 +17,12 @@ pub(crate) struct CanvasInfo {
     pub id: CanvasId,
     pub width: u32,
     pub height: u32,
+    #[allow(dead_code)]
     pub is_onscreen: bool,
 }
 
 impl CanvasInfo {
+    #[allow(dead_code)]
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
@@ -29,6 +31,7 @@ impl CanvasInfo {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CanvasGLState {
     pub current_program: Option<ProgramId>,
+    pub viewport: Option<(i32, i32, i32, i32)>,
 }
 
 #[derive(Debug)]
@@ -59,6 +62,7 @@ pub(crate) struct BufferMeta {
 #[derive(Debug)]
 pub(crate) struct TextureMeta {
     pub gl_handle: Option<NativeTexture>,
+    #[allow(dead_code)]
     pub owner_canvas: Option<CanvasId>,
     pub deleted: bool,
 }
@@ -66,6 +70,7 @@ pub(crate) struct TextureMeta {
 #[derive(Debug)]
 pub(crate) struct FramebufferMeta {
     pub gl_handle: Option<NativeFramebuffer>,
+    #[allow(dead_code)]
     pub owner_canvas: Option<CanvasId>,
     pub deleted: bool,
 }
@@ -73,6 +78,7 @@ pub(crate) struct FramebufferMeta {
 #[derive(Debug)]
 pub(crate) struct RenderbufferMeta {
     pub gl_handle: Option<NativeRenderbuffer>,
+    #[allow(dead_code)]
     pub owner_canvas: Option<CanvasId>,
     pub deleted: bool,
 }
@@ -89,11 +95,13 @@ pub(super) enum SurfaceKind {
     Pbuffer,
 }
 
-#[derive(Clone)]
 pub(super) struct CanvasEntry {
     pub info: CanvasInfo,
+    /// Actual EGL surface dimensions (physical pixels).
     pub physical_width: u32,
     pub physical_height: u32,
     pub kind: SurfaceKind,
     pub ctx: EglContextHandle,
+    /// DrawingBuffer for the onscreen canvas. None for offscreen pbuffer canvases.
+    pub drawing_buffer: Option<super::drawing_buffer::DrawingBuffer>,
 }

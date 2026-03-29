@@ -50,8 +50,10 @@ public final class NativeBridge {
      *
      * @param sessionId The session ID
      * @param surface   New Android Surface object
+     * @param width     Surface buffer width in physical pixels
+     * @param height    Surface buffer height in physical pixels
      */
-    public static native void updateSurface(int sessionId, Object surface);
+    public static native void updateSurface(int sessionId, Object surface, int width, int height);
 
     // ==================== Lifecycle Events ====================
 

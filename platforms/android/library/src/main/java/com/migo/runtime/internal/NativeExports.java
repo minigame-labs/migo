@@ -1566,6 +1566,11 @@ public final class NativeExports {
         return null;
     }
 
+    private static String buildDeferredErrorResult(String requestId, String errMsg, int errCode) {
+        String ridField = requestId != null ? "\"requestId\":" + requestId + "," : "";
+        return "{" + ridField + "\"error\":\"" + errMsg + "\",\"errCode\":" + errCode + "}";
+    }
+
     // ==================== Keyboard ====================
 
     /** Per-session Keyboard managers. */
@@ -2577,10 +2582,9 @@ public final class NativeExports {
      */
     public static void openSetting(int sessionId, String optionsJson) {
         // TODO: implement with a SettingManager when ready
-        // For now, call back immediately echoing requestId for correct Promise matching
         String rid = extractRequestId(optionsJson);
         NativeMethods.onOpenSettingResult(sessionId,
-                rid != null ? "{\"requestId\":" + rid + "}" : "{}");
+                buildDeferredErrorResult(rid, "openSetting:fail not supported", -2));
     }
 
     // ==================== Share ====================
@@ -2597,7 +2601,7 @@ public final class NativeExports {
         // TODO: implement with a ShareManager when ready
         String rid = extractRequestId(optionsJson);
         NativeMethods.onShareAppMessageResult(sessionId,
-                rid != null ? "{\"requestId\":" + rid + "}" : "{}");
+                buildDeferredErrorResult(rid, "shareAppMessage:fail not supported", -2));
     }
 
     // ==================== Navigate ====================
@@ -2614,7 +2618,7 @@ public final class NativeExports {
         // TODO: implement navigation when ready
         String rid = extractRequestId(optionsJson);
         NativeMethods.onNavigateToMiniProgramResult(sessionId,
-                rid != null ? "{\"requestId\":" + rid + "}" : "{}");
+                buildDeferredErrorResult(rid, "navigateToMiniProgram:fail not supported", -2));
     }
 
     /**
@@ -2625,6 +2629,7 @@ public final class NativeExports {
      */
     public static void openCustomerServiceConversation(int sessionId, String optionsJson) {
         // TODO: implement customer service when ready
+        throw new RuntimeException("openCustomerServiceConversation:fail not supported");
     }
 
     // ==================== Payment ====================
@@ -2652,9 +2657,8 @@ public final class NativeExports {
     public static void requestMidasPayment(int sessionId, String optionsJson) {
         // TODO: implement with a PaymentManager when ready
         String rid = extractRequestId(optionsJson);
-        String ridField = rid != null ? "\"requestId\":" + rid + "," : "";
         NativeMethods.onMidasPaymentResult(sessionId,
-                "{" + ridField + "\"error\":\"requestMidasPayment:fail not supported\",\"errCode\":-2}");
+                buildDeferredErrorResult(rid, "requestMidasPayment:fail not supported", -2));
     }
 
     /**
@@ -2668,9 +2672,8 @@ public final class NativeExports {
     public static void requestMidasPaymentGameItem(int sessionId, String optionsJson) {
         // TODO: implement with a PaymentManager when ready
         String rid = extractRequestId(optionsJson);
-        String ridField = rid != null ? "\"requestId\":" + rid + "," : "";
         NativeMethods.onMidasPaymentGameItemResult(sessionId,
-                "{" + ridField + "\"error\":\"requestMidasPaymentGameItem:fail not supported\",\"errCode\":-2}");
+                buildDeferredErrorResult(rid, "requestMidasPaymentGameItem:fail not supported", -2));
     }
 
     /**
