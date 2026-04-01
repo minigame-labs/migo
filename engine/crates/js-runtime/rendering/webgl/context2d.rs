@@ -7,12 +7,10 @@
 //! Sync operations (`op_create_context_2d`, `op_measure_text`, `op_get_image_data`)
 //! use `RenderCommand::Canvas2D` for synchronous request/response.
 
-use crossbeam_channel::{SendTimeoutError, TrySendError};
 use deno_core::{op2, OpState};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::time::Duration;
 use tracing::{error, trace};
 
 use shared::{
@@ -279,6 +277,11 @@ struct FrameBuffer {
     text_align: Option<TextAlign>,
     text_baseline: Option<TextBaseline>,
     font: Option<String>,
+    /// Pending same-texture draw batch (auto-merge consecutive drawImage calls).
+    pending_batch_image: u32,
+    pending_batch: Vec<shared::protocol::render_cmd::DrawImageEntry>,
+    /// Bounding box of all draw commands this frame (pixel coords: x, y, w, h).
+    dirty_rect: Option<(f32, f32, f32, f32)>,
 }
 
 impl FrameBuffer {
@@ -295,6 +298,9 @@ impl FrameBuffer {
             text_align: None,
             text_baseline: None,
             font: None,
+            pending_batch_image: 0,
+            pending_batch: Vec::new(),
+            dirty_rect: None,
         }
     }
 
@@ -310,11 +316,101 @@ impl FrameBuffer {
         self.text_align = None;
         self.text_baseline = None;
         self.font = None;
+        self.pending_batch.clear();
+        self.pending_batch_image = 0;
+        self.dirty_rect = None;
+    }
+
+    /// Expand the dirty bounding box to include the given rectangle.
+    #[inline]
+    fn mark_dirty(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        self.dirty_rect = Some(match self.dirty_rect {
+            Some((ox, oy, ow, oh)) => {
+                let nx = ox.min(x);
+                let ny = oy.min(y);
+                let nx2 = (ox + ow).max(x + w);
+                let ny2 = (oy + oh).max(y + h);
+                (nx, ny, nx2 - nx, ny2 - ny)
+            }
+            None => (x, y, w, h),
+        });
+    }
+
+    /// Flush any pending same-texture draw batch into the command list.
+    #[inline]
+    fn flush_pending_batch(&mut self) {
+        if self.pending_batch.is_empty() {
+            return;
+        }
+        if self.pending_batch.len() == 1 {
+            // Single draw — keep as individual DrawImage (no batch overhead)
+            let d = self.pending_batch[0];
+            self.commands.push(Canvas2DCmd::DrawImage {
+                image_id: d.image_id,
+                sx: d.sx, sy: d.sy, sw: d.sw, sh: d.sh,
+                dx: d.dx, dy: d.dy, dw: d.dw, dh: d.dh,
+            });
+        } else {
+            let draws = std::mem::take(&mut self.pending_batch);
+            self.commands.push(Canvas2DCmd::DrawImageBatch { draws });
+        }
+        self.pending_batch.clear();
+        self.pending_batch_image = 0;
     }
 
     #[inline]
     fn push(&mut self, cmd: Canvas2DCmd) {
+        // Auto-merge consecutive same-image DrawImage calls into DrawImageBatch.
+        if let Canvas2DCmd::DrawImage { image_id, sx, sy, sw, sh, dx, dy, dw, dh } = cmd {
+            self.mark_dirty(dx, dy, dw, dh);
+            if !self.pending_batch.is_empty() && self.pending_batch_image != image_id {
+                self.flush_pending_batch();
+            }
+            self.pending_batch_image = image_id;
+            self.pending_batch.push(shared::protocol::render_cmd::DrawImageEntry {
+                image_id, sx, sy, sw, sh, dx, dy, dw, dh,
+            });
+            return;
+        }
+        // Track dirty region for draw commands before flushing pending batch.
+        self.mark_dirty_for_cmd(&cmd);
+        // Non-DrawImage command: flush any pending batch first
+        self.flush_pending_batch();
         self.commands.push(cmd);
+    }
+
+    /// Mark dirty region based on a Canvas2D command's bounding box.
+    /// For rect-based commands, use the exact rect. For path-based draw
+    /// commands (Fill, Stroke, etc.), use a sentinel that forces full-canvas
+    /// dirty (the actual bounds are not cheaply available on the JS side).
+    #[inline]
+    fn mark_dirty_for_cmd(&mut self, cmd: &Canvas2DCmd) {
+        match cmd {
+            Canvas2DCmd::FillRect { x, y, w, h }
+            | Canvas2DCmd::StrokeRect { x, y, w, h }
+            | Canvas2DCmd::ClearRect { x, y, w, h } => {
+                self.mark_dirty(*x, *y, *w, *h);
+            }
+            Canvas2DCmd::FillText { x, y, .. }
+            | Canvas2DCmd::StrokeText { x, y, .. } => {
+                // Text bounds are not known on the JS side; mark a generous
+                // region. The exact metrics would require a round-trip to
+                // the render thread which is not worth the cost. Use a
+                // large sentinel that will effectively become full-canvas.
+                self.mark_dirty(*x, *y, f32::MAX / 2.0, f32::MAX / 2.0);
+            }
+            Canvas2DCmd::Fill | Canvas2DCmd::Stroke | Canvas2DCmd::Clip => {
+                // Path-based commands: exact bounds unknown, mark full-canvas.
+                self.mark_dirty(0.0, 0.0, f32::MAX / 2.0, f32::MAX / 2.0);
+            }
+            Canvas2DCmd::DrawImageBatch { draws } => {
+                for d in draws {
+                    self.mark_dirty(d.dx, d.dy, d.dw, d.dh);
+                }
+            }
+            // Style setters, state, transforms, path building -- not draws.
+            _ => {}
+        }
     }
 
     fn set_fill_color(&mut self, color: Color) {
@@ -537,26 +633,35 @@ impl FrameCommandCollector {
         self.with_buffer(canvas_id, |buf| buf.clear());
     }
 
-    pub fn frame_end(&mut self, canvas_id: u32) -> Option<Vec<Canvas2DCmd>> {
+    pub fn frame_end(
+        &mut self,
+        canvas_id: u32,
+    ) -> Option<(Vec<Canvas2DCmd>, Option<(f32, f32, f32, f32)>)> {
         // &mut self: use get_mut() on RefCells (zero-cost, no runtime borrow check).
         let buf = if self.primary_active.get() && self.primary_id.get() == canvas_id {
             self.primary.get_mut()
         } else {
             self.extra.get_mut().get_mut(&canvas_id)?
         };
+        // Flush any pending same-texture batch before extracting
+        buf.flush_pending_batch();
         if buf.commands.is_empty() {
             return None;
         }
         self.total_commands += buf.commands.len() as u64;
         self.total_frames += 1;
         let commands = std::mem::take(&mut buf.commands);
+        let dirty_rect = buf.dirty_rect.take();
         buf.clear();
-        Some(commands)
+        Some((commands, dirty_rect))
     }
 
-    /// Drain all active canvas buffers in a single pass. Returns (canvas_id, commands) pairs.
+    /// Drain all active canvas buffers in a single pass.
+    /// Returns (canvas_id, commands, dirty_rect) tuples.
     /// Uses get_mut() throughout (zero-cost RefCell access via &mut self).
-    pub fn frame_end_all(&mut self) -> Vec<(u32, Vec<Canvas2DCmd>)> {
+    pub fn frame_end_all(
+        &mut self,
+    ) -> Vec<(u32, Vec<Canvas2DCmd>, Option<(f32, f32, f32, f32)>)> {
         // Pre-allocate for the expected canvas count: 1 primary + extras.
         // Avoids a per-frame Vec::new() allocation in the common single-canvas
         // case (capacity=1 is a single pointer-sized alloc, no realloc needed).
@@ -565,18 +670,22 @@ impl FrameCommandCollector {
         if self.primary_active.get() {
             let canvas_id = self.primary_id.get();
             let buf = self.primary.get_mut();
+            buf.flush_pending_batch();
             if !buf.commands.is_empty() {
                 self.total_commands += buf.commands.len() as u64;
                 self.total_frames += 1;
-                results.push((canvas_id, std::mem::take(&mut buf.commands)));
+                let dirty_rect = buf.dirty_rect.take();
+                results.push((canvas_id, std::mem::take(&mut buf.commands), dirty_rect));
                 buf.clear();
             }
         }
         for (&canvas_id, buf) in self.extra.get_mut().iter_mut() {
+            buf.flush_pending_batch();
             if !buf.commands.is_empty() {
                 self.total_commands += buf.commands.len() as u64;
                 self.total_frames += 1;
-                results.push((canvas_id, std::mem::take(&mut buf.commands)));
+                let dirty_rect = buf.dirty_rect.take();
+                results.push((canvas_id, std::mem::take(&mut buf.commands), dirty_rect));
                 buf.clear();
             }
         }
@@ -803,54 +912,12 @@ fn flush_pending_commands(state: &mut OpState, canvas_id: u32) {
     let batch_cmd = RenderCommand::Canvas2DBatch {
         canvas_id,
         commands: cmds,
+        dirty_rect: None, // mid-frame flush: dirty_rect tracked in full frame_end
     };
 
-    enum FlushSendError {
-        Timeout(RenderCommand),
-        Disconnected,
-    }
-
-    let send_result = {
-        let ctx = state.borrow::<CanvasOpState>();
-        match ctx.tx.try_send(batch_cmd) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(cmd)) => ctx
-                .tx
-                .send_timeout(cmd, Duration::from_millis(8))
-                .map_err(|e| match e {
-                    SendTimeoutError::Timeout(cmd) => FlushSendError::Timeout(cmd),
-                    SendTimeoutError::Disconnected(_) => FlushSendError::Disconnected,
-                }),
-            Err(TrySendError::Disconnected(_)) => Err(FlushSendError::Disconnected),
-        }
-    };
-
-    match send_result {
-        Ok(()) => {}
-        Err(FlushSendError::Timeout(RenderCommand::Canvas2DBatch {
-            mut commands,
-            ..
-        })) => {
-            if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
-                collector.with_buffer(canvas_id, |buf| {
-                    if buf.commands.is_empty() {
-                        buf.commands = commands;
-                    } else {
-                        commands.append(&mut buf.commands);
-                        buf.commands = commands;
-                    }
-                });
-            }
-            error!(
-                "flush_pending_commands: timed out while flushing; commands re-queued"
-            );
-        }
-        Err(FlushSendError::Timeout(_)) => {
-            error!("flush_pending_commands: timeout sending unknown command batch");
-        }
-        Err(FlushSendError::Disconnected) => {
-            error!("flush_pending_commands: render thread disconnected");
-        }
+    let ctx = state.borrow::<CanvasOpState>();
+    if let Err(e) = ctx.tx.send(batch_cmd) {
+        error!("flush_pending_commands: render thread disconnected: {e}");
     }
 }
 
@@ -930,7 +997,7 @@ pub fn op_frame_begin(state: &mut OpState, #[smi] canvas_id: u32) {
 
 #[op2(fast)]
 pub fn op_frame_end(state: &mut OpState, #[smi] canvas_id: u32) {
-    let commands = {
+    let result = {
         if let Some(collector) = state.try_borrow_mut::<FrameCommandCollector>() {
             collector.frame_end(canvas_id)
         } else {
@@ -938,7 +1005,7 @@ pub fn op_frame_end(state: &mut OpState, #[smi] canvas_id: u32) {
         }
     };
 
-    if let Some(cmds) = commands {
+    if let Some((cmds, dirty_rect)) = result {
         if !cmds.is_empty() {
             let ctx = state.borrow::<CanvasOpState>();
             trace!(
@@ -949,6 +1016,7 @@ pub fn op_frame_end(state: &mut OpState, #[smi] canvas_id: u32) {
             if let Err(e) = ctx.tx.send(RenderCommand::Canvas2DBatch {
                 canvas_id,
                 commands: cmds,
+                dirty_rect,
             }) {
                 error!("op_frame_end: send failed: {e}");
             }
@@ -958,7 +1026,7 @@ pub fn op_frame_end(state: &mut OpState, #[smi] canvas_id: u32) {
 
 #[op2(fast)]
 pub fn op_frame_end_all(state: &mut OpState) {
-    let pairs = {
+    let triples = {
         if let Some(collector) = state.try_borrow_mut::<FrameCommandCollector>() {
             collector.frame_end_all()
         } else {
@@ -966,7 +1034,7 @@ pub fn op_frame_end_all(state: &mut OpState) {
         }
     };
 
-    for (canvas_id, cmds) in pairs {
+    for (canvas_id, cmds, dirty_rect) in triples {
         let ctx = state.borrow::<CanvasOpState>();
         trace!(
             "op_frame_end_all: sending {} commands for canvas {}",
@@ -976,6 +1044,7 @@ pub fn op_frame_end_all(state: &mut OpState) {
         if let Err(e) = ctx.tx.send(RenderCommand::Canvas2DBatch {
             canvas_id,
             commands: cmds,
+            dirty_rect,
         }) {
             error!("op_frame_end_all: send failed: {e}");
         }

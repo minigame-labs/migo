@@ -65,7 +65,7 @@ static EMPTY_WHITELIST_WARNED: std::sync::Once = std::sync::Once::new();
 /// `SsrfCheckingResolver` below does NOT cover `http://127.0.0.1/...`.
 /// This function must be called **before** every `client.request()`
 /// / `client.post()` to close that gap.
-fn reject_blocked_ip_literal(url: &Url) -> Result<(), JsErrorBox> {
+pub(super) fn reject_blocked_ip_literal(url: &Url) -> Result<(), JsErrorBox> {
     if let Some(host) = url.host_str() {
         let port = url.port_or_known_default().unwrap_or(443);
         let addr_str = format!("{}:{}", host, port);
@@ -89,7 +89,7 @@ fn reject_blocked_ip_literal(url: &Url) -> Result<(), JsErrorBox> {
 ///
 /// Matching supports exact match and subdomain match (e.g., "example.com"
 /// allows "api.example.com").
-fn check_domain_whitelist(url: &Url, state: &OpState) -> Result<(), JsErrorBox> {
+pub(super) fn check_domain_whitelist(url: &Url, state: &OpState) -> Result<(), JsErrorBox> {
     let host = state.borrow::<shared::op_state::HostOpState>();
     let wl = &host.network_policy.domain_whitelist;
     if wl.is_empty() {
@@ -118,7 +118,7 @@ fn check_domain_whitelist(url: &Url, state: &OpState) -> Result<(), JsErrorBox> 
 }
 
 /// Check HTTPS enforcement policy.
-fn check_https_policy(url: &Url, state: &OpState) -> Result<(), JsErrorBox> {
+pub(super) fn check_https_policy(url: &Url, state: &OpState) -> Result<(), JsErrorBox> {
     let host = state.borrow::<shared::op_state::HostOpState>();
     if host.network_policy.enforce_https && url.scheme() == "http" {
         return Err(JsErrorBox::generic(
@@ -743,14 +743,24 @@ pub fn create_http_client(
     let mut builder = Client::builder()
         .dns_resolver(std::sync::Arc::new(SsrfCheckingResolver))
         .redirect(ssrf_redirect_policy)
-        .default_headers(headers)
-        .pool_max_idle_per_host(5)
-        .pool_idle_timeout(Duration::from_secs(90));
+        .default_headers(headers);
 
     if enable_http2 {
-        builder = builder.http2_adaptive_window(true);
+        // HTTP/2 multiplexes many streams over a single TCP connection, so we
+        // need fewer idle connections but want to keep them alive longer.
+        builder = builder
+            .pool_max_idle_per_host(3)
+            .pool_idle_timeout(Duration::from_secs(120))
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_timeout(Duration::from_secs(10));
     } else {
-        builder = builder.http1_only();
+        // HTTP/1.1 needs more idle connections since each handles one
+        // request at a time. Shorter idle timeout to free resources.
+        builder = builder
+            .pool_max_idle_per_host(6)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .http1_only();
     }
 
     builder.build().map_err(|e| e.into())

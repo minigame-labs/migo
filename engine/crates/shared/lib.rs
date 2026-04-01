@@ -41,6 +41,9 @@
 
 pub mod channel;
 pub mod cjs_compat;
+// Note: ring_buffer is compiled but consumed only by graphics/render_thread
+// when DeviceTier::TierA is selected.  TierB continues using crossbeam.
+pub mod ring_buffer;
 pub mod codec;
 pub mod config;
 pub mod console_log;
@@ -50,8 +53,11 @@ pub mod js_escape;
 pub mod op_state;
 pub mod protocol;
 pub mod services;
+pub mod raf_signal;
+pub mod render_command_sender;
 pub mod stats;
 pub mod surface;
+pub mod thread_priority;
 pub mod vfs;
 
 #[cfg(test)]

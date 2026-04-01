@@ -214,8 +214,15 @@ pub enum IOCmd {
 
     /// Read an image from `path` and convert it into a normalized RGBA8 buffer.
     /// Payload is (width, height, rgba_bytes).
+    ///
+    /// If `target_width` / `target_height` are set, the decoded image will be
+    /// resized to fit within the target dimensions (preserving aspect ratio).
+    /// This avoids decoding a 4096x4096 image at full resolution when only
+    /// a 512x512 version is needed.
     ReadImageRgba8 {
         path: String,
+        target_width: Option<u32>,
+        target_height: Option<u32>,
         resp: IOCmdResp<NormalizedImage>,
     },
 

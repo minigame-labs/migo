@@ -53,6 +53,9 @@ impl IoService {
         let handle = std::thread::Builder::new()
             .name("Migo-IO".into())
             .spawn(move || {
+                shared::thread_priority::set_current_thread_priority(
+                    shared::thread_priority::Priority::Background,
+                );
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .max_blocking_threads(4)

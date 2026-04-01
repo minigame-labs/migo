@@ -31,6 +31,11 @@ pub fn init_jni_env(jvm: JavaVM) -> Result<(), String> {
 
 /// Run a closure with a thread-attached JNIEnv and allow error propagation.
 ///
+/// Every invocation pushes a JNI local-reference frame so that all Java
+/// objects created inside `f` are freed when the closure returns.  Without
+/// this, daemon-attached threads (which never "return from a native method")
+/// would leak every local reference, eventually exhausting the Java heap.
+///
 /// # Errors
 /// Returns an error if:
 /// - JVM is not initialized (call `init_jni_env` first)
@@ -44,7 +49,7 @@ where
     THREAD_CTX.with(|cell| {
         // If already attached on this thread, reuse it.
         if let Some(guard) = cell.borrow_mut().as_mut() {
-            return f(guard);
+            return invoke_in_local_frame(guard, f);
         }
 
         let jvm = JVM
@@ -58,11 +63,49 @@ where
             .attach_current_thread_as_daemon()
             .map_err(|e| E::from(format!("Failed to attach thread: {:?}", e)))?;
 
-        let r = f(&mut new_guard);
+        let r = invoke_in_local_frame(&mut new_guard, f);
 
         // Cache guard for next call on this thread.
         cell.borrow_mut().replace(new_guard);
 
         r
     })
+}
+
+/// Push a JNI local-reference frame, run `f`, then pop the frame.
+///
+/// All JNI local references created inside `f` are freed when the frame
+/// is popped, regardless of whether `f` succeeds or fails.
+///
+/// # Safety
+/// Callers must not return JNI local references (JObject, JByteArray, …)
+/// from `f` — they become invalid after `pop_local_frame`.  All existing
+/// call-sites return Rust-owned types (String, Vec<u8>, NormalizedImage, …)
+/// so this is satisfied.
+fn invoke_in_local_frame<F, R, E>(env: &mut JNIEnv, f: F) -> Result<R, E>
+where
+    F: FnOnce(&mut JNIEnv) -> Result<R, E>,
+    E: From<String>,
+{
+    // 16 slots is enough for typical outbound calls (5-10 JNI refs each).
+    // The JVM will auto-expand if more are needed.
+    env.push_local_frame(16)
+        .map_err(|e| E::from(format!("PushLocalFrame failed: {e}")))?;
+
+    let r = f(env);
+
+    // Safety: no JNI local reference escapes `f` — all callers return
+    // Rust-owned types.  Passing JObject::null() means nothing is
+    // promoted to the outer frame.
+    //
+    // If pop_local_frame fails (e.g. pending exception from `f`),
+    // clear the exception so it doesn't leak into subsequent JNI calls.
+    if let Err(e) = unsafe { env.pop_local_frame(&jni::objects::JObject::null()) } {
+        if env.exception_check().unwrap_or(false) {
+            env.exception_clear().ok();
+        }
+        return Err(E::from(format!("PopLocalFrame failed: {e}")));
+    }
+
+    r
 }

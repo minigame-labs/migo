@@ -1,3 +1,4 @@
+use bytemuck;
 use deno_core::{op2, JsBuffer, OpState};
 use shared::{
     error::{EngineError, ErrorCode},
@@ -177,7 +178,7 @@ pub async fn op_audio_decode_audio_data(
 
     tx.send(AudioCmd::DecodeAudioData {
         ctx_id,
-        data: data.to_vec(),
+        data: std::sync::Arc::new(data.to_vec()),
         resp: resp_tx,
     })
     .map_err(|_| audio_err("Audio thread disconnected"))?;
@@ -901,9 +902,54 @@ pub async fn op_audio_get_channel_data(
         .map_err(|_| audio_err("Response channel closed"))?
         .map_err(AudioError::from)?;
 
-    // Convert Vec<f32> to Vec<u8> (raw bytes for Float32Array)
-    let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-    Ok(bytes)
+    // Zero-copy reinterpret Vec<f32> as Vec<u8> via bytemuck.
+    // This avoids an O(n) per-float collect and eliminates a heap allocation.
+    Ok(bytemuck::cast_vec(data))
+}
+
+/// Get all channel data in one round-trip as a flat `Uint8Array`.
+///
+/// Layout: `[u32_le ch_count | u32_le frames_per_ch | ch0 f32s | ch1 f32s | ...]`
+///
+/// The 8-byte header carries metadata; the rest is raw LE f32 samples.
+/// JS slices by stride: `Float32Array(buf, 8 + ch * frames * 4, frames)`.
+///
+/// `#[buffer]` ensures the result arrives as a real `Uint8Array` in JS
+/// (not a JSON-serialized number array), preserving `.buffer` / `.byteOffset`.
+#[op2(async(lazy),fast)]
+#[buffer]
+pub async fn op_audio_get_all_channel_data(
+    state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
+    #[smi] buffer_id: AudioBufferId,
+) -> Result<Vec<u8>, AudioError> {
+    let tx = get_audio_tx(state);
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(AudioCmd::GetAllChannelData {
+        ctx_id,
+        buffer_id,
+        resp: resp_tx,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))?;
+
+    let channels = resp_rx
+        .await
+        .map_err(|_| audio_err("Response channel closed"))?
+        .map_err(AudioError::from)?;
+
+    let ch_count = channels.len() as u32;
+    let frames_per_ch = channels.first().map_or(0, |c| c.len()) as u32;
+
+    // 8-byte header + all channel f32 samples.
+    let total_floats: usize = channels.iter().map(|c| c.len()).sum();
+    let mut buf = Vec::with_capacity(8 + total_floats * 4);
+    buf.extend_from_slice(&ch_count.to_le_bytes());
+    buf.extend_from_slice(&frames_per_ch.to_le_bytes());
+    for ch in channels {
+        buf.extend_from_slice(bytemuck::cast_slice(&ch));
+    }
+    Ok(buf)
 }
 
 /// Copy data to a buffer channel (sync write to native buffer)

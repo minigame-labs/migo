@@ -1413,9 +1413,20 @@ pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError
             .ok_or("decodeImageRgba method not found")?;
         let class = cache.class();
 
-        let j_data = env
-            .byte_array_from_slice(data)
-            .map_err(|e| format!("Failed to create byte array: {e}"))?;
+        // Clear any stale pending exception before JNI allocation.
+        if env.exception_check().unwrap_or(false) {
+            env.exception_clear().ok();
+        }
+
+        let j_data = env.byte_array_from_slice(data).map_err(|e| {
+            // byte_array_from_slice calls NewByteArray which can throw
+            // OutOfMemoryError.  Clear it so ART doesn't abort on the
+            // next JNI call.
+            if env.exception_check().unwrap_or(false) {
+                env.exception_clear().ok();
+            }
+            format!("Failed to create byte array ({}B): {e}", data.len())
+        })?;
 
         let result = unsafe {
             env.call_static_method_unchecked(

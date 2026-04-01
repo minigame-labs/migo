@@ -1,12 +1,138 @@
-use std::{collections::HashMap, io::SeekFrom, ops::Range, path::PathBuf};
+use std::{
+    collections::HashMap,
+    io::SeekFrom,
+    ops::Range,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        OnceLock,
+    },
+};
 
 use deno_core::v8::{BackingStore, SharedRef};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::Semaphore,
     time::Instant,
 };
 use tracing::{debug, trace, warn};
+
+/// Maximum number of concurrent image decode tasks across all callers
+/// (ReadImageRgba8, PreloadImages, etc.).
+const MAX_CONCURRENT_IMAGE_DECODES: usize = 3;
+
+/// Global semaphore shared by all image-decode call sites so that
+/// ReadImageRgba8 and PreloadImages compete for the same pool of permits.
+fn image_decode_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| Semaphore::new(MAX_CONCURRENT_IMAGE_DECODES))
+}
+
+// ---------------------------------------------------------------------------
+// IO byte-budget: limits peak native-heap usage of heavy tasks (decode,
+// extract) without touching the global IO command channel.
+// ---------------------------------------------------------------------------
+
+/// Default budget: 48 MB.  With semaphore=3, three concurrent 4K RGBA decodes
+/// (3840x2160x4 = 33 MB each) will exceed this and trigger backpressure.
+/// This is intentional — the budget prevents native heap exhaustion on
+/// low-RAM devices while the semaphore limits concurrency.
+const DEFAULT_IO_BUDGET_BYTES: usize = 48 * 1024 * 1024;
+
+/// Tracks aggregate bytes consumed by in-flight heavy IO tasks (image decode,
+/// zip extract).  Light commands (file open/close/stat) do **not** go through
+/// the budget — they use the existing unbounded IO channel directly.
+struct IoBudget {
+    active_bytes: AtomicUsize,
+    max_bytes: usize,
+    notify: tokio::sync::Notify,
+}
+
+impl IoBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            active_bytes: AtomicUsize::new(0),
+            max_bytes,
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Reserve `bytes` from the budget.
+    ///
+    /// - If `bytes` fits within remaining budget, succeeds immediately.
+    /// - If budget is temporarily full, waits up to 200 ms per retry.
+    /// - If `bytes > max_bytes` (oversized image), waits until **all**
+    ///   other tasks finish (`active_bytes == 0`), then admits exactly
+    ///   one oversized task.  This prevents infinite-wait deadlock.
+    async fn acquire(&self, bytes: usize) -> IoBudgetGuard<'_> {
+        loop {
+            let current = self.active_bytes.load(Ordering::Acquire);
+            // Normal case: fits within remaining budget.
+            // Oversized case: bytes > max_bytes, admit only when nothing
+            // else is active (exclusive access).
+            let can_proceed = if bytes <= self.max_bytes {
+                current.checked_add(bytes).map_or(false, |sum| sum <= self.max_bytes)
+            } else {
+                current == 0
+            };
+            if can_proceed {
+                if self
+                    .active_bytes
+                    .compare_exchange_weak(
+                        current,
+                        current + bytes,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return IoBudgetGuard {
+                        budget: self,
+                        bytes,
+                    };
+                }
+                // CAS failed — retry immediately
+                continue;
+            }
+            // Over budget — wait for a release notification (with timeout)
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                self.notify.notified(),
+            )
+            .await
+            .ok();
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        self.active_bytes.fetch_sub(bytes, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Current usage for debug overlay / metrics.
+    #[allow(dead_code)]
+    fn active_bytes(&self) -> usize {
+        self.active_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// RAII guard that releases budget bytes on drop.
+struct IoBudgetGuard<'a> {
+    budget: &'a IoBudget,
+    bytes: usize,
+}
+
+impl Drop for IoBudgetGuard<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+fn io_budget() -> &'static IoBudget {
+    static BUDGET: OnceLock<IoBudget> = OnceLock::new();
+    BUDGET.get_or_init(|| IoBudget::new(DEFAULT_IO_BUDGET_BYTES))
+}
 
 use shared::{
     error::{EngineError, ErrorCode, io_error_to_error_code},
@@ -34,9 +160,6 @@ impl IoCmdHandler {
     /// Initial capacity for the file handle map.
     /// Most games use a small number of concurrent file handles.
     const INITIAL_FILE_CAPACITY: usize = 8;
-
-    /// Maximum number of concurrent image decode tasks for PreloadImages.
-    const MAX_CONCURRENT_IMAGE_DECODES: usize = 8;
 
     pub fn new() -> Self {
         Self {
@@ -498,16 +621,39 @@ impl IoCmdHandler {
                 });
             }
 
-            IOCmd::ReadImageRgba8 { path, resp } => {
-                // Check LRU cache first (fast path avoids spawning)
-                if let Some(cached) = image_cache::global_cache().get(&path) {
-                    debug!("ReadImageRgba8 cache hit: {}", path);
-                    Self::send_resp(resp, Ok(cached.image));
-                    return;
+            IOCmd::ReadImageRgba8 { path, target_width, target_height, resp } => {
+                // Resize requires BOTH dimensions.  Treat partial as no-resize
+                // to avoid asymmetric cache/decode behavior.
+                let has_resize = target_width.is_some() && target_height.is_some();
+                // LRU cache fast path (full-resolution decodes only).
+                if !has_resize {
+                    if let Some(cached) = image_cache::global_cache().get(&path) {
+                        debug!("ReadImageRgba8 cache hit: {}", path);
+                        Self::send_resp(resp, Ok(cached.image));
+                        return;
+                    }
                 }
 
                 tokio::spawn(async move {
                     let start = Instant::now();
+
+                    // Acquire budget BEFORE reading file and before semaphore,
+                    // so we don't hold data+permit while waiting for budget.
+                    // Use file metadata for a quick size estimate: compressed
+                    // file size * 16 approximates RGBA decoded size for typical
+                    // PNG/JPEG.  Header probe refines this after read.
+                    let pre_estimate = std::fs::metadata(&path)
+                        .map(|m| {
+                            // compressed * 16, clamped to [16KB, 256MB]
+                            (m.len() as usize).saturating_mul(16).clamp(16 * 1024, 256 * 1024 * 1024)
+                        })
+                        .unwrap_or(2048 * 2048 * 4);
+                    let _budget = io_budget().acquire(pre_estimate).await;
+
+                    // Limit concurrent decodes to prevent Java Heap OOM on Android.
+                    // safe: semaphore is never closed
+                    let _permit = image_decode_semaphore().acquire().await.unwrap();
+
                     let path_clone = path.clone();
                     let task = tokio::task::spawn_blocking(
                         move || -> Result<NormalizedImage, EngineError> {
@@ -515,13 +661,26 @@ impl IoCmdHandler {
                                 EngineError::new(ErrorCode::ImageReadError)
                                     .with_detail(format!("failed to read file: {}", e))
                             })?;
-                            fast_image_decoder::decode_image_fast(&data, Some(&path_clone))
+                            let mut img = fast_image_decoder::decode_image_fast(&data, Some(&path_clone))?;
+                            // Resize only when BOTH target dimensions are specified.
+                            if has_resize {
+                                let tw = target_width.unwrap();
+                                let th = target_height.unwrap();
+                                if img.width > tw || img.height > th {
+                                    img = fast_image_decoder::resize_image(img, tw, th);
+                                }
+                            }
+                            Ok(img)
                         },
                     );
 
                     let r = match task.await {
                         Ok(Ok(img)) => {
-                            image_cache::global_cache().insert(path.clone(), img.clone());
+                            // Only cache full-resolution decodes; scaled variants
+                            // are cached by the host under a dimension-suffixed key.
+                            if !has_resize {
+                                image_cache::global_cache().insert(path.clone(), img.clone());
+                            }
                             debug!(
                                 "ReadImageRgba8 decoded: {} ({}x{}) in {:.2?}",
                                 path, img.width, img.height, start.elapsed()
@@ -566,34 +725,33 @@ impl IoCmdHandler {
                         }
                     }
 
-                    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
-                        IoCmdHandler::MAX_CONCURRENT_IMAGE_DECODES,
-                    ));
-
                     let handles: Vec<_> = decode_paths
                         .into_iter()
                         .map(|path| {
-                            let sem = semaphore.clone();
                             tokio::spawn(async move {
+                                // Budget first: estimate from file metadata.
+                                let pre_estimate = std::fs::metadata(&path)
+                                    .map(|m| (m.len() as usize).saturating_mul(16).clamp(16 * 1024, 256 * 1024 * 1024))
+                                    .unwrap_or(2048 * 2048 * 4);
+                                let _budget = io_budget().acquire(pre_estimate).await;
                                 // safe: semaphore is never closed
-                                let _permit = sem.acquire().await.unwrap();
+                                let _permit = image_decode_semaphore().acquire().await.unwrap();
                                 tokio::task::spawn_blocking(move || {
-                                    match std::fs::read(&path) {
-                                        Ok(data) => {
-                                            match fast_image_decoder::decode_image_fast(
-                                                &data,
-                                                Some(&path),
-                                            ) {
-                                                Ok(img) => {
-                                                    let dims = (img.width, img.height);
-                                                    image_cache::global_cache()
-                                                        .insert(path.clone(), img);
-                                                    (path, Ok(dims))
-                                                }
-                                                Err(e) => (path, Err(format!("{:?}", e))),
-                                            }
+                                    let data = match std::fs::read(&path) {
+                                        Ok(d) => d,
+                                        Err(e) => return (path, Err(format!("read error: {}", e))),
+                                    };
+                                    match fast_image_decoder::decode_image_fast(
+                                        &data,
+                                        Some(&path),
+                                    ) {
+                                        Ok(img) => {
+                                            let dims = (img.width, img.height);
+                                            image_cache::global_cache()
+                                                .insert(path.clone(), img);
+                                            (path, Ok(dims))
                                         }
-                                        Err(e) => (path, Err(format!("read error: {}", e))),
+                                        Err(e) => (path, Err(format!("{:?}", e))),
                                     }
                                 })
                                 .await

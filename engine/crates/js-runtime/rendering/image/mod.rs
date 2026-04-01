@@ -1,6 +1,6 @@
 use std::{cell::RefCell, path::Path, rc::Rc};
 
-use deno_core::{OpState, extension, op2};
+use deno_core::{extension, op2, OpState};
 use deno_error::JsErrorBox;
 use tracing::{error, info, warn};
 
@@ -107,6 +107,8 @@ async fn op_load_image_inner(
     state: Rc<RefCell<OpState>>,
     image_id: u32,
     src: String,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
 ) -> EngineResult<(u32, (usize, usize))> {
     let (io_tx, code_dir, vfs) = {
         let op = state.borrow();
@@ -128,11 +130,7 @@ async fn op_load_image_inner(
     };
 
     let src = resolve_local_src(&code_dir, vfs.as_deref(), &src)?;
-    info!(
-        "op_load_image begin: image_id={}, src={}",
-        image_id,
-        src
-    );
+    info!("op_load_image begin: image_id={}, src={}", image_id, src);
 
     // remove previous alias and possibly destroy old shared
     if let Some(to_destroy) = {
@@ -146,18 +144,22 @@ async fn op_load_image_inner(
             }));
     }
 
+    // For scaled decode, suffix the cache key so that different target
+    // resolutions of the same source are cached separately, while still
+    // participating in alias tracking and texImage2D lookups.
+    let cache_key = match (target_width, target_height) {
+        (Some(tw), Some(th)) => format!("{}:{}x{}", src, tw, th),
+        _ => src.clone(),
+    };
+
     match {
         let mut c = cache::IMAGE_CACHE.lock();
-        c.begin_load(image_id, &src)
+        c.begin_load(image_id, &cache_key)
     } {
         cache::BeginLoadResult::AlreadyLoaded((shared_id, dims)) => {
             info!(
                 "op_load_image cache hit: image_id={}, shared_id={}, src={}, dims={}x{}",
-                image_id,
-                shared_id,
-                src,
-                dims.0,
-                dims.1
+                image_id, shared_id, src, dims.0, dims.1
             );
             Ok((shared_id, dims))
         }
@@ -165,15 +167,14 @@ async fn op_load_image_inner(
         cache::BeginLoadResult::Join(rx) => {
             info!(
                 "op_load_image join pending load: image_id={}, src={}",
-                image_id,
-                src
+                image_id, src
             );
             match rx.await {
                 Ok(Ok((shared_id, dims))) => {
                     // IMPORTANT: bind alias for this caller image_id so destroy works even if JS does not replace IDs
                     {
                         let mut c = cache::IMAGE_CACHE.lock();
-                        c.bind_alias_existing(image_id, &src, shared_id);
+                        c.bind_alias_existing(image_id, &cache_key, shared_id);
                     }
                     info!(
                         "op_load_image join resolved: image_id={}, shared_id={}, src={}, dims={}x{}",
@@ -188,17 +189,14 @@ async fn op_load_image_inner(
                 Ok(Err(msg)) => {
                     warn!(
                         "op_load_image join failed: image_id={}, src={}, err={}",
-                        image_id,
-                        src,
-                        msg
+                        image_id, src, msg
                     );
                     shared::bail!(ErrorCode::ImageReadError, "cache join failed", msg)
                 }
                 Err(_) => {
                     warn!(
                         "op_load_image join canceled: image_id={}, src={}",
-                        image_id,
-                        src
+                        image_id, src
                     );
                     shared::bail!(ErrorCode::Cancelled, "wait canceled")
                 }
@@ -206,56 +204,54 @@ async fn op_load_image_inner(
         }
 
         cache::BeginLoadResult::StartLoading => {
+            // Allocate an independent shared ID for the GPU texture.
+            // This must NOT be the caller's image_id — see cache.rs docs.
+            let shared_id = cache::alloc_shared_id();
+            // Register the alias now so that a concurrent op_destroy_image
+            // resolves to the correct shared_id during the upload window.
+            {
+                let mut c = cache::IMAGE_CACHE.lock();
+                c.register_inflight_alias(image_id, shared_id);
+            }
             info!(
-                "op_load_image start loader: image_id={}, src={}",
-                image_id,
-                src
+                "op_load_image start loader: image_id={}, shared_id={}, src={}",
+                image_id, shared_id, src
             );
-            // NOTE: Double-allocation window.
-            // Between ReadImageRgba8 completing and the render thread's
-            // LoadImage consuming the RGBA buffer, both the IO cache and the
-            // `img` value hold copies of the decoded pixel data in CPU memory.
-            // For a 1024x1024 RGBA8 image this is ~4 MB duplicated.
-            //
-            // This is architecturally necessary because:
-            //  1. The IO layer decodes synchronously and caches the result
-            //     for potential re-use by other concurrent loaders (Join path).
-            //  2. The render thread owns the GL context and must receive the
-            //     pixel data to perform glTexImage2D.
-            //  3. The two threads (Host/IO and Render) cannot share a
-            //     zero-copy buffer without unsafe lifetime management that
-            //     would couple their lifecycles.
-            //
-            // Mitigation: we eagerly evict the IO cache entry immediately
-            // after GPU upload succeeds (see below), limiting the overlap
-            // window to the duration of the LoadImage render command.
+
             let img = match send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::ReadImageRgba8 {
                 path: src.clone(),
+                target_width,
+                target_height,
                 resp: IOCmdResp::Async(resp_tx),
             })
             .await
             {
                 Ok(img) => img,
                 Err(e) => {
-                    // IMPORTANT: begin_load() inserted this src into loading_map.
-                    // If we return early here, joiners on the same src will wait forever.
-                    // Always resolve loading_map on error.
                     let msg = engine_err_to_text(&e);
                     warn!(
                         "op_load_image io decode failed: image_id={}, src={}, err={}",
-                        image_id,
-                        src,
-                        msg
+                        image_id, src, msg
                     );
                     let mut c = cache::IMAGE_CACHE.lock();
-                    c.finish_load(image_id, &src, Err(msg));
+                    c.finish_load(image_id, shared_id, &cache_key, Err(msg));
                     return Err(e);
                 }
             };
 
+            // For scaled decodes, store under the dimension-suffixed
+            // cache_key so texImage2D(image) can find the RGBA via
+            // source_for_image_id.  Full-resolution decodes are already
+            // cached by the IO handler under the raw path — skip the
+            // redundant insert here.
+            if target_width.is_some() && target_height.is_some() {
+                io::global_cache().insert(cache_key.clone(), img.clone());
+            }
+
+            // Upload texture under shared_id (not caller image_id).
             let res = send_render_with_resp_async(&canvas_ctx, OP_LOAD_IMAGE, |resp| {
                 RenderCommand::Canvas(CanvasCmd::LoadImage {
-                    image_id,
+                    image_id: shared_id,
                     image: img,
                     resp,
                 })
@@ -265,25 +261,29 @@ async fn op_load_image_inner(
             {
                 let mut c = cache::IMAGE_CACHE.lock();
                 match &res {
-                    Ok((w, h)) => c.finish_load(image_id, &src, Ok((*w as usize, *h as usize))),
-                    Err(e) => c.finish_load(image_id, &src, Err(engine_err_to_text(e))),
+                    Ok((w, h)) => c.finish_load(
+                        image_id,
+                        shared_id,
+                        &cache_key,
+                        Ok((*w as usize, *h as usize)),
+                    ),
+                    Err(e) => {
+                        c.finish_load(image_id, shared_id, &cache_key, Err(engine_err_to_text(e)))
+                    }
                 }
             }
-
-            // Keep decoded RGBA in IO cache for WebGL texImage2D/texSubImage2D
-            // source-image uploads, which may need synchronous pixel access
-            // after Image onload has fired.
 
             match res {
                 Ok((w, h)) => {
                     info!(
-                        "op_load_image loader resolved: image_id={}, src={}, dims={}x{}",
+                        "op_load_image loader resolved: image_id={}, shared_id={}, src={}, dims={}x{}",
                         image_id,
+                        shared_id,
                         src,
                         w,
                         h
                     );
-                    Ok((image_id, (w as usize, h as usize)))
+                    Ok((shared_id, (w as usize, h as usize)))
                 }
                 Err(e) => {
                     warn!(
@@ -305,8 +305,20 @@ pub async fn op_load_image(
     state: Rc<RefCell<OpState>>,
     #[smi] image_id: u32,
     #[string] src: String,
+    #[smi] target_width: u32,
+    #[smi] target_height: u32,
 ) -> Result<(u32, (usize, usize)), JsErrorBox> {
-    op_load_image_inner(state, image_id, src)
+    let tw = if target_width > 0 {
+        Some(target_width)
+    } else {
+        None
+    };
+    let th = if target_height > 0 {
+        Some(target_height)
+    } else {
+        None
+    };
+    op_load_image_inner(state, image_id, src, tw, th)
         .await
         .map_err(js_err_from_engine)
 }

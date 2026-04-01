@@ -1,6 +1,7 @@
 use deno_core::extension;
 
 use crate::network::fetch::{op_fetch, op_fetch_send, op_fetch_upload};
+use crate::network::prefetch::{op_prefetch_assets, op_prefetch_dns};
 use crate::network::tcp_socket::{op_tcp_close, op_tcp_connect, op_tcp_next_event, op_tcp_write};
 use crate::network::udp_socket::{
     op_udp_bind, op_udp_close, op_udp_connect, op_udp_next_event, op_udp_send, op_udp_set_ttl,
@@ -9,7 +10,9 @@ use crate::network::websocket::{op_ws_close, op_ws_create, op_ws_next_event, op_
 
 mod address_filter;
 mod common;
+pub(crate) mod dns_cache;
 mod fetch;
+mod prefetch;
 mod tcp_socket;
 mod udp_socket;
 mod websocket;
@@ -31,6 +34,7 @@ extension!(host_v8_network,
   deps = [host_v8_console, host_v8_web, host_v8_base],
   ops = [
     op_fetch, op_fetch_send, op_fetch_upload,
+    op_prefetch_dns, op_prefetch_assets,
     op_ws_create, op_ws_next_event, op_ws_send, op_ws_close,
     op_tcp_connect, op_tcp_next_event, op_tcp_write, op_tcp_close,
     op_udp_bind, op_udp_connect, op_udp_send, op_udp_set_ttl, op_udp_next_event, op_udp_close,
@@ -46,6 +50,7 @@ extension!(host_v8_network,
      "07_websocket.js",
      "08_tcp_socket.js",
      "09_udp_socket.js",
+     "10_prefetch.js",
   ],
   options = {
     options: Options,

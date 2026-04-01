@@ -2,7 +2,7 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use deno_core::{
     Extension, FsModuleLoader, JsRuntime, ModuleLoader, OpState, PollEventLoopOptions,
-    RuntimeOptions, op2, resolve_path, v8,
+    RuntimeOptions, SharedArrayBufferStore, op2, resolve_path, v8,
 };
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -21,6 +21,8 @@ const MAX_WORKER_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) enum WorkerMessage {
     /// A postMessage payload (JSON-serialized string).
     Message(String),
+    /// A binary transfer (zero-copy ArrayBuffer ownership transfer).
+    Binary(Vec<u8>),
     /// Terminate the worker.
     Terminate,
 }
@@ -186,6 +188,14 @@ async fn op_worker_create(
         }
     }
 
+    // Get the SharedArrayBufferStore from the main runtime (if set)
+    let sab_store = {
+        let st = state.borrow();
+        st.try_borrow::<SharedArrayBufferStore>()
+            .cloned()
+            .unwrap_or_default()
+    };
+
     // Read code_dir and clone a minimal HostOpState for the worker
     let (code_dir, worker_host_state) = {
         let st = state.borrow();
@@ -195,7 +205,7 @@ async fn op_worker_create(
         })?;
 
         // Create dummy channels for services the worker does not use
-        let (render_tx, _render_rx) = crossbeam_channel::bounded(1);
+        let (render_tx, _render_rx) = shared::render_command_sender::CommandSender::new();
         let (io_tx, _io_rx) = mpsc::unbounded_channel();
         let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
         // Workers don't send audio commands in practice, but the type
@@ -241,7 +251,7 @@ async fn op_worker_create(
         "[Worker] spawning worker thread for script: {}",
         script_path
     );
-    let join_handle = spawn_worker_thread(script_path, code_dir, worker_ctx, worker_host_state)?;
+    let join_handle = spawn_worker_thread(script_path, code_dir, worker_ctx, worker_host_state, sab_store)?;
     info!("[Worker] worker thread spawned, storing handle");
 
     // Store handle in main OpState
@@ -346,6 +356,39 @@ fn op_worker_terminate(state: &mut OpState) -> Result<(), WorkerError> {
     Ok(())
 }
 
+/// Send binary data from the main thread to the worker.
+///
+/// NOTE: This currently copies the buffer (deno_core limitation — true zero-copy
+/// transfer requires V8 ArrayBuffer::Detach + BackingStore sharing which is not
+/// yet wired). The JS-side ArrayBuffer is NOT detached/neutered.
+/// Still faster than JSON-serializing large typed arrays.
+#[op2(fast)]
+fn op_worker_transfer_buffer(
+    state: &mut OpState,
+    #[buffer(copy)] data: Vec<u8>,
+) -> Result<(), WorkerError> {
+    if data.len() > MAX_WORKER_MESSAGE_BYTES {
+        return Err(WorkerError::Message(format!(
+            "Transfer buffer too large: {} bytes (max {} bytes)",
+            data.len(),
+            MAX_WORKER_MESSAGE_BYTES
+        )));
+    }
+
+    let handle = state
+        .try_borrow::<WorkerHandle>()
+        .ok_or_else(|| WorkerError::Message("No active worker".into()))?;
+
+    if handle.terminated {
+        return Err(WorkerError::Message("Worker has been terminated".into()));
+    }
+
+    handle
+        .tx_to_worker
+        .send(WorkerMessage::Binary(data))
+        .map_err(|_| WorkerError::Message("Worker channel closed".into()))
+}
+
 // ---------------------------------------------------------------------------
 // Worker-thread ops (registered in `host_v8_worker_inner`)
 // ---------------------------------------------------------------------------
@@ -393,6 +436,17 @@ async fn op_worker_inner_recv_message(
             info!("[Worker] worker received from main: {} bytes", json.len());
             Ok(Some(json))
         }
+        Some(WorkerMessage::Binary(data)) => {
+            // Encode binary as JSON with base64 payload so JS can reconstruct
+            info!("[Worker] worker received binary: {} bytes", data.len());
+            use deno_core::serde_json;
+            let encoded = deno_core::serde_json::json!({
+                "__binary": true,
+                "base64": base64_encode(&data),
+                "byteLength": data.len()
+            });
+            Ok(Some(encoded.to_string()))
+        }
         Some(WorkerMessage::Terminate) => {
             info!("[Worker] worker received Terminate signal");
             Ok(None)
@@ -405,6 +459,35 @@ async fn op_worker_inner_recv_message(
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Simple base64 encoder (no external dependency).
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Extension declarations
 // ---------------------------------------------------------------------------
 
@@ -414,6 +497,7 @@ deno_core::extension!(
     ops = [
         op_worker_create,
         op_worker_post_message,
+        op_worker_transfer_buffer,
         op_worker_recv_message,
         op_worker_recv_error,
         op_worker_terminate,
@@ -502,6 +586,7 @@ fn spawn_worker_thread(
     code_dir: String,
     ctx: WorkerCtx,
     host_state: HostOpState,
+    sab_store: SharedArrayBufferStore,
 ) -> Result<std::thread::JoinHandle<()>, WorkerError> {
     let tx_errors = ctx.tx_errors.clone();
 
@@ -538,6 +623,7 @@ fn spawn_worker_thread(
                         module_loader,
                         extensions: exts,
                         create_params,
+                        shared_array_buffer_store: Some(sab_store),
                         ..Default::default()
                     });
                     info!("[Worker] JsRuntime created successfully");

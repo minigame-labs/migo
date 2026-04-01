@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crossbeam_channel::Sender;
 use tokio::sync::oneshot;
 
@@ -92,6 +94,10 @@ pub enum RenderCommand {
     Canvas2DBatch {
         canvas_id: CanvasId,
         commands: Vec<Canvas2DCmd>,
+        /// Bounding box of all draw commands in this batch (pixel coords: x, y, w, h).
+        /// `None` means either no draw commands, or a mid-frame flush where tracking
+        /// is deferred to the final frame_end.
+        dirty_rect: Option<(f32, f32, f32, f32)>,
     },
 
     /// Invalidate signal for on-demand rendering mode
@@ -433,7 +439,7 @@ pub enum GLCmd {
         border: i32,
         format: u32,
         type_: u32,
-        data: Option<Vec<u8>>,
+        data: Option<Arc<Vec<u8>>>,
     },
     TexSubImage2D {
         canvas_id: CanvasId,
@@ -445,7 +451,7 @@ pub enum GLCmd {
         height: i32,
         format: u32,
         type_: u32,
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
     },
     TexParameteri {
         canvas_id: CanvasId,

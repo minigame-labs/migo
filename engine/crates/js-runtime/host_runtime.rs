@@ -52,6 +52,8 @@ pub struct HostJsRuntime {
     host_id: i32,
     rt: JsRuntime,
     bindings: JsBindings,
+    /// Shared SAB store for transferring SharedArrayBuffers between main and workers.
+    pub(crate) sab_store: deno_core::SharedArrayBufferStore,
     /// Shared termination state for OOM callback + watchdog integration.
     /// Only present when `v8-limits` feature is enabled.
     #[cfg(feature = "v8-limits")]
@@ -83,6 +85,7 @@ impl HostJsRuntime {
         host_state: HostOpState,
         extra_extensions: Vec<Extension>,
         module_loader: Option<Rc<dyn ModuleLoader>>,
+        extension_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>>,
         #[cfg(feature = "v8-limits")] v8_limits: V8LimitsConfig,
         #[cfg(feature = "code-signing")] code_signing_enabled: bool,
         #[cfg(feature = "code-signing")] code_signing_pubkey: Option<&str>,
@@ -137,11 +140,15 @@ impl HostJsRuntime {
         let create_params: Option<v8::CreateParams> = None;
 
         let t_rt_start = Instant::now();
+        let sab_store = deno_core::SharedArrayBufferStore::default();
+
         let mut rt = JsRuntime::new(RuntimeOptions {
             module_loader,
             extensions: exts,
             create_params,
             startup_snapshot: snapshot_bytes,
+            extension_code_cache,
+            shared_array_buffer_store: Some(sab_store.clone()),
             ..Default::default()
         });
         let t_rt_created = Instant::now();
@@ -244,10 +251,14 @@ impl HostJsRuntime {
             (None, None)
         };
 
+        // Store SAB store in OpState so workers can share it
+        rt.op_state().borrow_mut().put(sab_store.clone());
+
         Self {
             host_id,
             rt,
             bindings,
+            sab_store,
             #[cfg(feature = "v8-limits")]
             oom_terminated,
             #[cfg(feature = "code-signing")]

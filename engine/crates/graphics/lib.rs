@@ -34,10 +34,22 @@
 //! - [`renderer2d`]: Canvas 2D rendering via femtovg
 //! - [`renderergl`]: WebGL command handler via glow
 
+#[cfg(target_os = "android")]
+pub(crate) mod ahb;
+pub mod atlas;
 mod canvas;
+pub mod compressed_upload;
+pub mod device_caps;
+pub mod dirty_region;
 mod render_thread;
 mod renderer2d;
 mod renderergl;
+pub(crate) mod shader_cache;
+pub mod texture_import;
+pub mod upload_thread;
+
+pub mod gpu_canvas2d;
+pub mod webgpu;
 
 pub(crate) use canvas::*;
 pub use render_thread::*;

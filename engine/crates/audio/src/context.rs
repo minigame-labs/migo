@@ -176,6 +176,11 @@ impl AudioContext {
         id
     }
 
+    /// Number of channels in a buffer (0 if not found).
+    pub fn buffer_channels(&self, buffer_id: AudioBufferId) -> Option<u32> {
+        self.buffers.get(&buffer_id).map(|b| b.channels)
+    }
+
     /// Get raw channel data from a buffer
     pub fn get_channel_data(&self, buffer_id: AudioBufferId, channel: u32) -> Option<Vec<f32>> {
         let buffer = self.buffers.get(&buffer_id)?;

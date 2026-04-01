@@ -20,11 +20,12 @@ impl RenderService {
     pub(crate) const RECREATE_ONSCREEN_TIMEOUT: Duration = Duration::from_millis(500);
 
     pub(crate) fn new(
-        raf_tx: tokio::sync::mpsc::Sender<f64>,
+        raf_tx: shared::raf_signal::RafSender,
         vsync_rx: Option<crossbeam_channel::Receiver<f64>>,
         host_id: i32,
         surface: SurfaceRef,
         pixel_ratio: f32,
+        app_cache_dir: Option<std::path::PathBuf>,
     ) -> EngineResult<Self> {
         let thread = RenderThread::spawn(
             raf_tx,
@@ -32,12 +33,13 @@ impl RenderService {
             host_id,
             Some(surface.clone()),
             pixel_ratio,
+            app_cache_dir,
         )?;
         Ok(Self { surface, thread })
     }
 
     #[inline]
-    pub(crate) fn sender(&self) -> crossbeam_channel::Sender<RenderCommand> {
+    pub(crate) fn sender(&self) -> shared::render_command_sender::CommandSender {
         self.thread.sender()
     }
 

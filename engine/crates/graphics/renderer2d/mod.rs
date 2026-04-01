@@ -17,6 +17,7 @@ fn to_fv_color(c: SharedColor) -> Color {
 
 mod font;
 mod handler;
+pub(crate) mod sprite_batch;
 
 pub(crate) use font::*;
 pub(crate) use handler::*;

@@ -231,16 +231,20 @@ fn upload_sync_internal(
     }
 }
 
-/// Reusable PBO pool for frequent uploads
+/// Reusable PBO pool for frequent uploads.
 ///
-/// This reduces allocation overhead for games that frequently load/unload textures
+/// This reduces allocation overhead for games that frequently load/unload textures.
+/// Each returned PBO carries a fence sync so that on Adreno GPUs (and others)
+/// we do not re-use a PBO whose previous DMA transfer has not completed.
 pub struct PboPool {
-    /// Available PBOs sorted by size
-    available: Vec<(glow::NativeBuffer, usize)>,
+    /// Available PBOs: (buffer, capacity, optional fence from last upload).
+    available: Vec<(glow::NativeBuffer, usize, Option<glow::NativeFence>)>,
     /// Maximum pool size
     max_pool_size: usize,
     /// PBO support flag
     pbo_supported: bool,
+    /// Whether GL fence sync is available (ES 3.0+, same as PBO).
+    fence_supported: bool,
 }
 
 impl PboPool {
@@ -249,10 +253,13 @@ impl PboPool {
 
     pub fn new(gl: &glow::Context, max_pool_size: usize) -> Self {
         let pbo_supported = check_pbo_support(gl);
+        // Fence sync requires the same ES 3.0 context as PBOs.
+        let fence_supported = pbo_supported;
         Self {
             available: Vec::with_capacity(max_pool_size),
             max_pool_size: max_pool_size.max(1).min(Self::DEFAULT_POOL_SIZE * 2),
             pbo_supported,
+            fence_supported,
         }
     }
 
@@ -261,30 +268,56 @@ impl PboPool {
         self.pbo_supported
     }
 
-    /// Get a PBO of at least the specified size
+    /// Get a PBO of at least the specified size.
+    ///
+    /// If the PBO carries a fence from a previous upload, waits (with a short
+    /// timeout) for the DMA transfer to complete before returning it.  This
+    /// prevents GPU stalls on Adreno and similar drivers where reusing a PBO
+    /// whose transfer is still in flight causes the driver to block.
     pub fn acquire(&mut self, gl: &glow::Context, size: usize) -> Option<glow::NativeBuffer> {
         if !self.pbo_supported {
             return None;
         }
 
-        // Find a suitable PBO from the pool
-        if let Some(idx) = self.available.iter().position(|(_, s)| *s >= size) {
-            let (pbo, _) = self.available.remove(idx);
+        // Find a suitable PBO from the pool.
+        if let Some(idx) = self.available.iter().position(|(_, s, _)| *s >= size) {
+            let (pbo, _, fence) = self.available.remove(idx);
+            // Wait for previous DMA to finish before reusing the buffer.
+            if let Some(f) = fence {
+                let status = unsafe {
+                    // 5 ms timeout — generous enough for any reasonable DMA.
+                    gl.client_wait_sync(f, glow::SYNC_FLUSH_COMMANDS_BIT, 5_000_000)
+                };
+                unsafe { gl.delete_sync(f) };
+                if status == glow::TIMEOUT_EXPIRED || status == glow::WAIT_FAILED {
+                    // DMA still in flight or driver error — discard this PBO
+                    // and create a fresh one to avoid a GPU stall.
+                    warn!("PBO fence wait failed (status=0x{:X}), discarding PBO", status);
+                    unsafe { gl.delete_buffer(pbo) };
+                    return unsafe { gl.create_buffer().ok() };
+                }
+            }
             return Some(pbo);
         }
 
-        // Create a new PBO
+        // Create a new PBO.
         unsafe { gl.create_buffer().ok() }
     }
 
-    /// Return a PBO to the pool
+    /// Return a PBO to the pool, inserting a fence so the next `acquire`
+    /// can wait for the in-flight DMA to complete.
     pub fn release(&mut self, gl: &glow::Context, pbo: glow::NativeBuffer, size: usize) {
         if self.available.len() < self.max_pool_size {
-            self.available.push((pbo, size));
-            // Sort by size for better allocation
-            self.available.sort_by_key(|(_, s)| *s);
+            let fence = if self.fence_supported {
+                unsafe { gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0).ok() }
+            } else {
+                None
+            };
+            self.available.push((pbo, size, fence));
+            // Sort by size for better allocation.
+            self.available.sort_by_key(|(_, s, _)| *s);
         } else {
-            // Pool full, delete the PBO
+            // Pool full, delete the PBO.
             unsafe {
                 gl.delete_buffer(pbo);
             }
@@ -293,8 +326,11 @@ impl PboPool {
 
     /// Clear the pool
     pub fn clear(&mut self, gl: &glow::Context) {
-        for (pbo, _) in self.available.drain(..) {
+        for (pbo, _, fence) in self.available.drain(..) {
             unsafe {
+                if let Some(f) = fence {
+                    gl.delete_sync(f);
+                }
                 gl.delete_buffer(pbo);
             }
         }
@@ -310,6 +346,74 @@ impl Drop for PboPool {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// AHardwareBuffer import path (API 26+, TierA)
+// ---------------------------------------------------------------------------
+
+/// Upload a decoded image using the best available path for the device tier.
+///
+/// - **TierA + API 26+**: AHardwareBuffer → EGLImage → GL texture (zero `glTexImage2D`).
+/// - **TierA / TierB**: PBO async upload (current path).
+/// - **ES 2.0 fallback**: synchronous `glTexImage2D`.
+///
+/// `egl_display_ptr` is the raw `EGLDisplay` pointer, needed only for AHB import.
+/// Pass `std::ptr::null()` if AHB is not available.
+pub fn upload_texture_tiered(
+    gl: &glow::Context,
+    image: &NormalizedImage,
+    use_pbo: bool,
+    pool: Option<&mut PboPool>,
+    device_caps: &crate::device_caps::DeviceCapabilities,
+    egl_display_ptr: *const std::ffi::c_void,
+) -> EngineResult<PboUploadResult> {
+    // AHB path: decode RGBA → AHardwareBuffer → EGLImage → GL texture.
+    #[cfg(target_os = "android")]
+    if device_caps.ahb_available && !egl_display_ptr.is_null() {
+        match try_ahb_upload(gl, image, egl_display_ptr) {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                debug!("AHB upload failed, falling back to PBO: {e}");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    let _ = (device_caps, egl_display_ptr); // suppress unused warnings
+
+    // Fallback: PBO or synchronous upload.
+    upload_texture_with_pbo(gl, image, use_pbo, pool)
+}
+
+#[cfg(target_os = "android")]
+fn try_ahb_upload(
+    gl: &glow::Context,
+    image: &NormalizedImage,
+    egl_display_ptr: *const std::ffi::c_void,
+) -> Result<PboUploadResult, String> {
+    use crate::ahb::OwnedAHardwareBuffer;
+
+    let ahb = OwnedAHardwareBuffer::allocate(image.width, image.height)?;
+    ahb.write_rgba(&image.rgba)?;
+
+    let result = unsafe {
+        crate::texture_import::import_ahb_as_texture(
+            gl,
+            ahb.as_ptr() as *const std::ffi::c_void,
+            egl_display_ptr,
+            image.width,
+            image.height,
+        )
+    }
+    .map_err(|e| format!("{e}"))?;
+
+    Ok(PboUploadResult {
+        texture: result.texture,
+        width: result.width,
+        height: result.height,
+    })
+    // ahb dropped here → AHardwareBuffer_release (EGLImage holds its own ref)
 }
 
 #[cfg(test)]

@@ -59,13 +59,30 @@ impl ImageRegistry {
         gl: &glow::Context,
         image_id: u32,
         image: NormalizedImage,
+        device_caps: &crate::device_caps::DeviceCapabilities,
+        egl_display_ptr: *const std::ffi::c_void,
     ) -> EngineResult<(u32, u32)> {
         // Initialize PBO pool on first use
         self.ensure_pbo_pool(gl);
 
-        // Use PBO upload for better performance (async DMA transfer)
-        let result =
-            pbo_upload::upload_texture_with_pbo(gl, &image, self.use_pbo, self.pbo_pool.as_mut())?;
+        // NOTE: Do NOT delete an existing texture for image_id here.
+        // Multiple Image aliases may reference the same shared_id.
+        // Deletion must only happen through the refcount=0 path in
+        // IMAGE_CACHE (remove_previous_alias -> DestroyImage ->
+        // destroy_shared_fv_image).
+
+        // Use the best available upload path for this device tier:
+        // TierA + API 26+: AHB → EGLImage (zero glTexImage2D).
+        // TierA / TierB: PBO async upload.
+        // ES 2.0: synchronous fallback.
+        let result = pbo_upload::upload_texture_tiered(
+            gl,
+            &image,
+            self.use_pbo,
+            self.pbo_pool.as_mut(),
+            device_caps,
+            egl_display_ptr,
+        )?;
 
         let info = ImageInfo::new(
             ImageFlags::empty(),
@@ -106,6 +123,16 @@ impl ImageRegistry {
         Ok(())
     }
 
+    /// Register a pre-uploaded texture (e.g. from the upload thread).
+    pub fn register_shared_texture(
+        &mut self,
+        image_id: u32,
+        texture: glow::NativeTexture,
+        info: ImageInfo,
+    ) {
+        self.shared_fv_images.insert(image_id, (texture, info));
+    }
+
     pub fn get_shared_fv_image(
         &self,
         image_id: u32,
@@ -124,6 +151,16 @@ impl ImageRegistry {
             .get(&image_id)
             .and_then(|m| m.get(&canvas_id))
             .cloned()
+    }
+
+    /// Initialize PBO pool (public entry for CanvasManager).
+    pub fn ensure_pbo_pool_public(&mut self, gl: &glow::Context) {
+        self.ensure_pbo_pool(gl);
+    }
+
+    /// Mutable access to the PBO pool for WebGL texture uploads.
+    pub fn pbo_pool_mut(&mut self) -> Option<&mut PboPool> {
+        self.pbo_pool.as_mut()
     }
 
     /// Remove all per-canvas images for a specific canvas

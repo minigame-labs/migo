@@ -6,21 +6,24 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::channel::ThreadWakeup;
-use crate::protocol::{
-    audio_cmd::AudioCmd, host_cmd::HostCommand, io_cmd::IOCmd, render_cmd::RenderCommand,
-};
+use crate::protocol::{audio_cmd::AudioCmd, host_cmd::HostCommand, io_cmd::IOCmd};
 use crate::services::DeviceServices;
 use crate::vfs::{GamePaths, VirtualFS};
 
 /// Host-side operational state shared across runtime layers.
-pub type RenderTx = crossbeam_channel::Sender<RenderCommand>;
+pub type RenderTx = crate::render_command_sender::CommandSender;
 pub type IoTx = UnboundedSender<IOCmd>;
 pub type AudioTx = AudioSender;
 pub type HostTx = tokio::sync::mpsc::Sender<HostCommand>;
 
 /// Receiver for RAF (requestAnimationFrame) frame signals from the render thread.
-/// Wrapped in Arc<Mutex> so the async op can lock and recv without borrowing OpState.
-pub type RafRx = Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<f64>>>;
+///
+/// On Android: backed by eventfd (low-latency epoll wake).
+/// Other platforms: backed by tokio mpsc channel.
+///
+/// The concrete type is `graphics::raf_signal::RafReceiver` which handles
+/// both variants internally.  Wrapped in Arc for restart survival.
+pub type RafRx = Arc<crate::raf_signal::RafReceiver>;
 
 /// A wrapper around `UnboundedSender<AudioCmd>` that automatically notifies
 /// the audio thread's [`ThreadWakeup`] on every send.

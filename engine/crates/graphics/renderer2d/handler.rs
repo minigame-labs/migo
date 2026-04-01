@@ -7,7 +7,11 @@ use shared::{
 };
 use tracing::trace;
 
-pub(crate) struct Renderer2d;
+use super::sprite_batch::SpriteBatcher;
+
+pub(crate) struct Renderer2d {
+    sprite_batcher: SpriteBatcher,
+}
 
 fn apply_pattern_style(
     cm: &mut CanvasManager,
@@ -103,7 +107,9 @@ fn apply_pattern_style(
 
 impl Renderer2d {
     pub(crate) fn new() -> Self {
-        Self
+        Self {
+            sprite_batcher: SpriteBatcher::new(),
+        }
     }
 
     pub(crate) fn handle_command(
@@ -514,39 +520,88 @@ impl Renderer2d {
                 Ok(true)
             }
 
-            // Batch image drawing for better performance
+            // Batch image drawing — try direct-GL SpriteBatcher for same-texture
+            // batches when Canvas2D state is simple (identity transform, SourceOver).
+            // Falls back to per-draw femtovg path otherwise.
             Canvas2DCmd::DrawImageBatch { draws } => {
                 if draws.is_empty() {
                     return Ok(false);
                 }
 
-                // Process all draws, ensuring images are ready
-                for draw in &draws {
-                    // Ensure image is available in canvas
-                    if cm.get_owned_fv_image(draw.image_id, canvas_id).is_none() {
-                        if let Some(res) = cm.get_shared_fv_image(draw.image_id) {
-                            let ctx = cm.get_2d_context_mut(canvas_id)?;
-                            let new_id = ctx
-                                .canvas
-                                .create_image_from_native_texture(res.1, res.2)
-                                .map_err(|e| {
-                                    EngineError::from_detail(
-                                        ErrorCode::Render2DResourceError,
-                                        format!("{:?}", e),
-                                    )
-                                })?;
-                            cm.fv_images_mut()
-                                .entry(draw.image_id)
-                                .or_insert_with(HashMap::new)
-                                .insert(canvas_id, (new_id, res.1, res.2));
+                // Check if all draws share the same image_id (common for auto-merged batches)
+                let first_id = draws[0].image_id;
+                let all_same = draws.iter().all(|d| d.image_id == first_id);
+
+                // Try direct-GL fast path: same texture + identity transform + SourceOver
+                if all_same && draws.len() >= 2 {
+                    let ctx = cm.get_2d_context_mut(canvas_id)?;
+                    let is_identity = ctx.state.transform == femtovg::Transform2D::identity();
+                    let is_source_over = ctx.state.composite_op == femtovg::CompositeOperation::SourceOver;
+                    let no_shadow = ctx.state.shadow_blur <= 0.0;
+                    let alpha = ctx.state.global_alpha;
+
+                    if is_identity && is_source_over && no_shadow {
+                        // Resolve the shared native texture
+                        let native_tex = cm.get_owned_fv_image(first_id, canvas_id)
+                            .map(|(_, tex, info)| (tex, info))
+                            .or_else(|| cm.get_shared_fv_image(first_id).map(|(_, tex, info)| (tex, info)));
+
+                        if let Some((texture, info)) = native_tex {
+                            let img_w = info.width() as f32;
+                            let img_h = info.height() as f32;
+
+                            // Build sprite tuples
+                            let sprites: Vec<_> = draws.iter().map(|d| {
+                                (d.sx, d.sy, d.sw, d.sh, d.dx, d.dy, d.dw, d.dh, img_w, img_h)
+                            }).collect();
+
+                            let (vp_w, vp_h) = cm.get_canvas_size(canvas_id)
+                                .unwrap_or((800, 600));
+
+                            // Flush femtovg before direct GL calls
+                            cm.get_2d_context_mut(canvas_id)?.canvas.flush();
+
+                            self.sprite_batcher.draw_batch(
+                                cm.gl(),
+                                texture,
+                                &sprites,
+                                vp_w as f32,
+                                vp_h as f32,
+                                alpha,
+                            );
+                            return Ok(true);
                         }
                     }
                 }
 
-                // Now draw all images
+                // Fallback: per-draw femtovg path (handles transforms, compositing, shadows)
                 for draw in draws {
-                    if let Some((fv_id, _, info)) = cm.get_owned_fv_image(draw.image_id, canvas_id)
-                    {
+                    let img = match cm.get_owned_fv_image(draw.image_id, canvas_id) {
+                        Some(owned) => Some(owned),
+                        None => {
+                            if let Some(res) = cm.get_shared_fv_image(draw.image_id) {
+                                let ctx = cm.get_2d_context_mut(canvas_id)?;
+                                let new_id = ctx
+                                    .canvas
+                                    .create_image_from_native_texture(res.1, res.2)
+                                    .map_err(|e| {
+                                        EngineError::from_detail(
+                                            ErrorCode::Render2DResourceError,
+                                            format!("{:?}", e),
+                                        )
+                                    })?;
+                                let entry = (new_id, res.1, res.2);
+                                cm.fv_images_mut()
+                                    .entry(draw.image_id)
+                                    .or_insert_with(HashMap::new)
+                                    .insert(canvas_id, entry);
+                                Some(entry)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    if let Some((fv_id, _, info)) = img {
                         let (w, h) = (info.width() as f32, info.height() as f32);
                         cm.get_2d_context_mut(canvas_id)?.draw_image_rect(
                             fv_id,

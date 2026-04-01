@@ -271,6 +271,10 @@ pub(crate) fn destroy(gl: &glow::Context, db: DrawingBuffer) {
 ///
 /// Uses `glBlitFramebuffer` (ES 3.0). `surface_w`/`surface_h` are the actual
 /// EGL window surface dimensions (the blit destination).
+///
+/// If the DrawingBuffer FBO has become incomplete (e.g. the game's WebGL code
+/// modified its attachments), this function re-attaches the original textures
+/// before retrying the blit.
 #[inline]
 pub(crate) fn blit_to_surface(
     gl: &glow::Context,
@@ -295,9 +299,42 @@ pub(crate) fn blit_to_surface(
                 surface_w,
                 surface_h
             );
-            // Fallback: bind entire FRAMEBUFFER to FBO 0 and return (no blit).
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             return;
+        }
+
+        // Check READ framebuffer completeness before blit.  Game WebGL code
+        // can accidentally modify the DrawingBuffer FBO attachments (e.g.
+        // framebufferTexture2D on "null" framebuffer), making it incomplete.
+        let status = gl.check_framebuffer_status(glow::READ_FRAMEBUFFER);
+        if status != glow::FRAMEBUFFER_COMPLETE {
+            // Try to heal: re-attach original color + depth/stencil.
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(db.color_tex),
+                0,
+            );
+            gl.framebuffer_renderbuffer(
+                glow::FRAMEBUFFER,
+                glow::DEPTH_STENCIL_ATTACHMENT,
+                glow::RENDERBUFFER,
+                Some(db.depth_stencil_rb),
+            );
+            let healed = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            if healed != glow::FRAMEBUFFER_COMPLETE {
+                tracing::warn!(
+                    "DrawingBuffer blit: FBO incomplete (0x{status:X}), re-attach failed (0x{healed:X})"
+                );
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                return;
+            }
+            tracing::debug!("DrawingBuffer blit: FBO healed after re-attach");
+            // Re-bind for blit.
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(db.fbo));
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
         }
 
         gl.blit_framebuffer(

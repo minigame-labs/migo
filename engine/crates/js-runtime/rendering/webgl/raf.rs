@@ -59,8 +59,7 @@ pub(crate) async fn op_await_next_frame(state: Rc<RefCell<OpState>>) -> Result<f
         tracing::info!("op_await_next_frame first call: host={}", host_id);
     }
 
-    let mut guard = rx.lock().await;
-    let ts = guard
+    let ts = rx
         .recv()
         .await
         .ok_or_else(|| RafError::Message("RAF channel closed".into()))?;

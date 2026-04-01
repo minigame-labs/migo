@@ -1,4 +1,5 @@
 use std::mem;
+use std::sync::Arc;
 
 use bytemuck::allocation::cast_vec;
 use deno_core::{op2, OpState};
@@ -136,7 +137,7 @@ fn send_gl_sync_with_flush<T>(
 }
 
 #[inline]
-fn load_cached_image_rgba(image_id: u32) -> Option<(i32, i32, Vec<u8>)> {
+fn load_cached_image_rgba(image_id: u32) -> Option<(i32, i32, Arc<Vec<u8>>)> {
     let src = {
         let c = IMAGE_CACHE.lock();
         c.source_for_image_id(image_id)
@@ -150,7 +151,7 @@ fn load_cached_image_rgba(image_id: u32) -> Option<(i32, i32, Vec<u8>)> {
     Some((
         cached.image.width as i32,
         cached.image.height as i32,
-        cached.image.rgba.as_ref().clone(),
+        Arc::clone(&cached.image.rgba),
     ))
 }
 
@@ -775,7 +776,7 @@ pub fn op_tex_image_2d(
             border,
             format,
             type_,
-            data,
+            data: data.map(Arc::new),
         },
     );
 }
@@ -843,7 +844,7 @@ pub fn op_tex_sub_image_2d(
             height,
             format,
             type_,
-            data,
+            data: Arc::new(data),
         },
     );
 }

@@ -65,7 +65,7 @@ enum DecodeResult {
 enum DecodeJob {
     AudioBuffer {
         ctx_id: AudioContextId,
-        data: Vec<u8>,
+        data: std::sync::Arc<Vec<u8>>,
         resp: AudioResp<AudioBufferInfo>,
     },
     InnerAudio {
@@ -277,6 +277,11 @@ impl AudioThread {
         let handle = thread::Builder::new()
             .name("Migo-AudioThread".into())
             .spawn(move || {
+                // Audio thread uses Oboe's SCHED_FIFO for the callback thread;
+                // the management thread itself gets Background priority.
+                shared::thread_priority::set_current_thread_priority(
+                    shared::thread_priority::Priority::Background,
+                );
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // Initialize audio output
                     let output = match AudioOutput::new() {
@@ -364,6 +369,9 @@ impl AudioThread {
         let handle = thread::Builder::new()
             .name("Migo-AudioThread".into())
             .spawn(move || {
+                shared::thread_priority::set_current_thread_priority(
+                    shared::thread_priority::Priority::Background,
+                );
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let output = match AudioOutput::new() {
                         Ok(out) => out,
@@ -516,9 +524,19 @@ fn run_audio_thread(
 
     loop {
         // -----------------------------------------------------------------
-        // 1. Drain all pending commands (non-blocking)
+        // 1. Drain pending commands (non-blocking, rate-limited).
+        //    Cap at 256 commands per iteration to prevent mixing starvation
+        //    when JS fires rapid bursts (automation, game SFX).  Remaining
+        //    commands are picked up on the next iteration (~5ms in Active).
         // -----------------------------------------------------------------
-        while let Ok(cmd) = rx.try_recv() {
+        const MAX_CMD_DRAIN: usize = 256;
+        let mut cmd_count = 0usize;
+        while cmd_count < MAX_CMD_DRAIN {
+            let cmd = match rx.try_recv() {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            cmd_count += 1;
             match cmd {
                 AudioCmd::Shutdown => {
                     return;
@@ -1336,6 +1354,45 @@ fn run_audio_thread(
                             let _ = resp.send(Err(EngineError::from_detail(
                                 ErrorCode::NotFound,
                                 format!("Buffer {} channel {} not found", buffer_id, channel),
+                            )));
+                        }
+                    } else {
+                        let _ = resp.send(Err(EngineError::from_detail(
+                            ErrorCode::NotFound,
+                            format!("AudioContext {} not found", ctx_id),
+                        )));
+                    }
+                }
+
+                AudioCmd::GetAllChannelData {
+                    ctx_id,
+                    buffer_id,
+                    resp,
+                } => {
+                    if let Some(ctx) = contexts.get(&ctx_id) {
+                        let Some(ch_count) = ctx.buffer_channels(buffer_id) else {
+                            let _ = resp.send(Err(EngineError::from_detail(
+                                ErrorCode::NotFound,
+                                format!("Buffer {} not found in context {}", buffer_id, ctx_id),
+                            )));
+                            continue;
+                        };
+                        let mut channels = Vec::with_capacity(ch_count as usize);
+                        let mut ok = true;
+                        for ch in 0..ch_count {
+                            if let Some(data) = ctx.get_channel_data(buffer_id, ch) {
+                                channels.push(data);
+                            } else {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            let _ = resp.send(Ok(channels));
+                        } else {
+                            let _ = resp.send(Err(EngineError::from_detail(
+                                ErrorCode::NotFound,
+                                format!("Buffer {} channel data incomplete", buffer_id),
                             )));
                         }
                     } else {

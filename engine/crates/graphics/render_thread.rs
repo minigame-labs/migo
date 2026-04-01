@@ -3,69 +3,52 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    global_fonts_mut, onscreen_window_from_surface, CanvasHandler, CanvasManager, FontData,
-    Renderer2d, RendererGL,
+    dirty_region, global_fonts_mut, onscreen_window_from_surface, CanvasHandler, CanvasManager,
+    FontData, Renderer2d, RendererGL,
 };
-use crossbeam_channel::{bounded, select, tick, Receiver};
+use crossbeam_channel::{select, tick, Receiver};
 use glow::HasContext;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::render_cmd::RenderCommand;
+use shared::render_command_sender::CommandSender;
 use shared::surface::SurfaceRef;
-use tokio::sync::mpsc::Sender as TokioSender;
 use tracing::{error, info, warn};
 
-/// Default render command queue capacity.
-/// Higher capacity reduces the chance of dropped frames under heavy load,
-/// but uses more memory. 512 provides good balance for most games.
-const DEFAULT_RENDER_QUEUE_CAPACITY: usize = 512;
+use shared::raf_signal::RafSender;
 
 pub struct RenderThread {
-    cmd_tx: crossbeam_channel::Sender<RenderCommand>,
+    cmd_tx: CommandSender,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl RenderThread {
-    /// Spawn render thread with default queue capacity.
+    /// Spawn render thread.
     ///
-    /// * `raf_tx` — tokio mpsc sender for frame timestamps (render → JS async op)
+    /// * `raf_tx` — frame timestamp sender (render → JS async op).
+    ///   On Android this is eventfd-backed; on other platforms, tokio mpsc.
     /// * `vsync_rx` — optional crossbeam receiver for Choreographer VSync signals
     /// * `host_id` — host identifier for debug stats registry
     pub fn spawn(
-        raf_tx: TokioSender<f64>,
+        raf_tx: RafSender,
         vsync_rx: Option<Receiver<f64>>,
         host_id: i32,
         initial_surface: Option<SurfaceRef>,
         dpi: f32,
+        app_cache_dir: Option<std::path::PathBuf>,
     ) -> EngineResult<Self> {
-        Self::spawn_with_capacity(
-            raf_tx,
-            vsync_rx,
-            host_id,
-            initial_surface,
-            dpi,
-            DEFAULT_RENDER_QUEUE_CAPACITY,
-        )
-    }
-
-    /// Spawn render thread with custom queue capacity.
-    pub fn spawn_with_capacity(
-        raf_tx: TokioSender<f64>,
-        vsync_rx: Option<Receiver<f64>>,
-        host_id: i32,
-        initial_surface: Option<SurfaceRef>,
-        dpi: f32,
-        queue_capacity: usize,
-    ) -> EngineResult<Self> {
-        let (cmd_tx, cmd_rx) = bounded::<RenderCommand>(queue_capacity);
+        let (cmd_tx, cmd_rx) = CommandSender::new();
 
         let handle = std::thread::Builder::new()
             .name("Migo-RenderThread".into())
             .spawn(move || {
+                shared::thread_priority::set_current_thread_priority(
+                    shared::thread_priority::Priority::Display,
+                );
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Both Android and non-Android use the same EGL library name.
                 const EGL_LIB: &str = "libEGL.so";
 
-                let mut cm = match CanvasManager::new_with_resource(EGL_LIB, dpi) {
+                let mut cm = match CanvasManager::new_with_resource(EGL_LIB, dpi, app_cache_dir.as_deref()) {
                     Ok(c) => c,
                     Err(e) => {
                         error!("CanvasManager init failed: {}", e);
@@ -281,8 +264,35 @@ impl RenderThread {
                         },
 
                         // V2: Batched commands - process all commands in a single frame
-                        RenderCommand::Canvas2DBatch { canvas_id, commands } => {
+                        RenderCommand::Canvas2DBatch { canvas_id, commands, dirty_rect } => {
                             let mut batch_dirty = false;
+                            // Apply scissor if dirty region covers less than 50% of canvas.
+                            let scissor_applied = if let Some((dx, dy, dw, dh)) = dirty_rect {
+                                if let Ok((cw, ch)) = cm.get_canvas_size(canvas_id) {
+                                    let cw = cw as i32;
+                                    let ch = ch as i32;
+                                    let region = dirty_region::DirtyRegion {
+                                        x: dx.floor() as i32,
+                                        // GL scissor Y is bottom-up; convert from top-down.
+                                        y: (ch - (dy + dh).ceil() as i32).max(0),
+                                        width: dw.ceil() as i32,
+                                        height: dh.ceil() as i32,
+                                    };
+                                    dirty_region::apply_scissor(gl, &region, cw, ch);
+                                    // Hint driver to discard unchanged tiles (saves bandwidth
+                                    // on tiled GPUs like Adreno/Mali).
+                                    dirty_region::invalidate_outside_dirty(gl, &region, cw, ch);
+                                    // Stage damage rect for eglSetDamageRegionKHR (before swap).
+                                    cm.pending_damage_rect = Some([
+                                        region.x, region.y, region.width, region.height,
+                                    ]);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
                             for cmd in commands {
                                 match renderer_2d.handle_command(cm, canvas_id, cmd) {
                                     Ok(was_render) => {
@@ -292,6 +302,10 @@ impl RenderThread {
                                     }
                                     Err(e) => error!("Canvas2DBatch cmd failed: {}", e),
                                 }
+                            }
+                            // Clear scissor after batch if we applied one.
+                            if scissor_applied {
+                                dirty_region::clear_scissor(gl);
                             }
                             if batch_dirty {
                                 cm.mark_2d_dirty(canvas_id);
@@ -395,10 +409,18 @@ impl RenderThread {
                                       detected_vsync_hz: u32,
                                       target_fps: &mut u32|
                  -> LoopCtl {
-                    while let Ok(cmd) = cmd_rx.try_recv() {
-                        match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, ticker, dirty, paused, frame_divisor, has_vsync, has_surface, detected_vsync_hz, target_fps) {
-                            LoopCtl::Continue => {}
-                            LoopCtl::Shutdown => return LoopCtl::Shutdown,
+                    // Drain pending commands from the channel.
+                    // Limit per drain to prevent frame-time spikes (~2-3 ms on ARM SoC).
+                    const MAX_DRAIN: usize = 512;
+                    for _ in 0..MAX_DRAIN {
+                        match cmd_rx.try_recv() {
+                            Ok(cmd) => {
+                                match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, ticker, dirty, paused, frame_divisor, has_vsync, has_surface, detected_vsync_hz, target_fps) {
+                                    LoopCtl::Continue => {}
+                                    LoopCtl::Shutdown => return LoopCtl::Shutdown,
+                                }
+                            }
+                            Err(_) => break,
                         }
                     }
                     LoopCtl::Continue
@@ -415,6 +437,20 @@ impl RenderThread {
                                                         last_frame_time: &mut Instant,
                                                         first_frame_recorded: &mut bool,
                                                         needs_recovery: &mut bool| {
+                    // Drain completed texture uploads from the upload thread
+                    // and register them in the image registry for rendering.
+                    cm.drain_upload_completed();
+                    // Clear stale damage rect from the previous frame.
+                    cm.pending_damage_rect = None;
+
+                    // Signal RAF BEFORE swap so JS can prepare the next frame
+                    // while the GPU waits for VSync.  Must be unconditional —
+                    // JS may call requestAnimationFrame without drawing (dirty=false)
+                    // and still needs the next timestamp to keep the loop alive.
+                    if !raf_tx.signal(ts) {
+                        debug_stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                    }
+
                     // Present the completed frame (only if we have a valid surface).
                     let did_swap = if *dirty && has_surface {
                         let onscreen_id = shared::protocol::render_cmd::CanvasId::from(1u32);
@@ -427,9 +463,6 @@ impl RenderThread {
                         if let Err(e) = cm.flush_dirty_2d_contexts() {
                             warn!("flush_dirty_2d_contexts failed: {}", e);
                         }
-                        // Canvas2D flush (femtovg) can mutate GL viewport. Restore WebGL
-                        // viewport from tracked WebGL state so subsequent frames keep
-                        // consistent semantics even if flush changed GL state.
                         unsafe {
                             gl.viewport(
                                 tracked_viewport.0,
@@ -443,12 +476,6 @@ impl RenderThread {
                             Ok(()) => true,
                             Err(e) => {
                                 warn!("swap_buffers_no_restore failed: {}", e);
-                                // On EGL context loss, defer recovery to the top of the
-                                // next frame iteration rather than recovering inline.
-                                // Rationale: try_recover_context() tears down and
-                                // recreates the entire EGL surface+context, which is
-                                // expensive and would delay the RAF signal in the
-                                // time-critical swap path, risking cascading frame drops.
                                 if cm.is_context_lost() {
                                     *needs_recovery = true;
                                     warn!("EGL context lost, recovery deferred to next frame");
@@ -458,7 +485,6 @@ impl RenderThread {
                         };
                         *dirty = false;
 
-                        // Record first frame time only after a successful swap_buffers.
                         if swap_ok && !*first_frame_recorded {
                             *first_frame_recorded = true;
                             let first_ms = start_time.elapsed().as_millis() as u32;
@@ -469,14 +495,12 @@ impl RenderThread {
                         false
                     };
 
-                    // FPS stats: only count frames where swap_buffers was actually
-                    // called so the metric reflects real GPU work, not tick rate.
+                    // FPS stats.
                     let now = Instant::now();
                     if did_swap {
                         let frame_dur = now.duration_since(*last_frame_time);
                         *last_frame_time = now;
                         debug_stats.frame_time_us.store(frame_dur.as_micros() as u32, Ordering::Relaxed);
-
                         *frame_count += 1;
                     }
                     let elapsed = fps_timer.elapsed();
@@ -485,11 +509,6 @@ impl RenderThread {
                         debug_stats.fps_x10.store((measured_fps * 10.0) as u32, Ordering::Relaxed);
                         *frame_count = 0;
                         *fps_timer = now;
-                    }
-
-                    // Send RAF timestamp to JS async op (non-blocking).
-                    if let Err(_e) = raf_tx.try_send(ts) {
-                        debug_stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
                     }
                 };
 
@@ -590,7 +609,7 @@ impl RenderThread {
                                             return;
                                         }
                                     }
-
+                                    // Drain remaining pending commands.
                                     match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut ticker, &mut dirty, &mut paused, &mut frame_divisor, &mut has_surface, detected_vsync_hz, &mut target_fps) {
                                         LoopCtl::Continue => {}
                                         LoopCtl::Shutdown => {
@@ -600,7 +619,7 @@ impl RenderThread {
                                     }
                                 }
                                 Err(_) => {
-                                    info!("cmd_rx closed, exiting RenderThread");
+                                    info!("Command channel closed, exiting RenderThread");
                                     cm.destroy_all(&gl);
                                     shared::stats::unregister_stats(host_id);
                                     return;
@@ -641,7 +660,7 @@ impl RenderThread {
         })
     }
 
-    pub fn sender(&self) -> crossbeam_channel::Sender<RenderCommand> {
+    pub fn sender(&self) -> CommandSender {
         self.cmd_tx.clone()
     }
 

@@ -8,7 +8,7 @@ use std::{
 };
 
 use deno_core::serde_json::Value;
-use deno_core::{FsModuleLoader, ModuleLoader};
+use deno_core::ModuleLoader;
 use tracing::{error, info, warn};
 
 use shared::{
@@ -21,7 +21,7 @@ use shared::{
 };
 
 use crate::{
-    runtime::{HostId, loader::MyModuleLoader, vsync},
+    runtime::{HostId, code_cache, loader::MyModuleLoader, vsync},
     services::{AudioService, IoService, PlatformServices, RenderService},
 };
 
@@ -145,9 +145,10 @@ impl Host {
         // ---- Startup timing instrumentation ----
         let t_start = Instant::now();
 
-        // ---- RAF channel (render thread → JS async op) ----
-        let (raf_tx, raf_rx_raw) = tokio::sync::mpsc::channel::<f64>(2);
-        let raf_rx: RafRx = Arc::new(tokio::sync::Mutex::new(raf_rx_raw));
+        // ---- RAF signal (render thread → JS async op) ----
+        // On Android: eventfd (low-latency epoll wake).
+        // Other platforms: tokio mpsc channel (unchanged behavior).
+        let (raf_tx, raf_rx) = shared::raf_signal::create_raf_pair();
 
         // ---- VSync channel (Choreographer JNI → render thread) ----
         let (vsync_tx, vsync_rx) = crossbeam_channel::bounded::<f64>(2);
@@ -166,6 +167,7 @@ impl Host {
             id,
             surface,
             init_options.pixel_ratio(),
+            Some(init_options.cache_dir().to_path_buf()),
         )?;
 
         // ---- HostOpState for extensions ----
@@ -214,8 +216,14 @@ impl Host {
             shared::console_log::register_console_log(id);
         }
 
+        // ---- Code cache (V8 bytecode persistence) ----
+        let shared_cache = code_cache::create_code_cache(init_options.cache_dir());
+
         let module_loader: Option<Rc<dyn ModuleLoader>> =
-            Some(Rc::new(MyModuleLoader(FsModuleLoader)));
+            Some(Rc::new(MyModuleLoader::new(Some(shared_cache.clone()))));
+
+        let ext_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>> =
+            Some(code_cache::ExtCodeCacheAdapter::new(shared_cache));
 
         // ---- Extensions ----
         let extra_ext = platform.extensions(&init_options);
@@ -238,6 +246,7 @@ impl Host {
             host_state,
             extra_ext,
             module_loader,
+            ext_code_cache,
             #[cfg(feature = "v8-limits")]
             v8_limits,
             #[cfg(feature = "code-signing")]
@@ -686,8 +695,14 @@ impl Host {
             backgrounded: self.backgrounded.clone(),
         };
 
+        // ---- Code cache (V8 bytecode persistence) ----
+        let shared_cache = code_cache::create_code_cache(self.init_options.cache_dir());
+
         let module_loader: Option<Rc<dyn ModuleLoader>> =
-            Some(Rc::new(MyModuleLoader(FsModuleLoader)));
+            Some(Rc::new(MyModuleLoader::new(Some(shared_cache.clone()))));
+
+        let ext_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>> =
+            Some(code_cache::ExtCodeCacheAdapter::new(shared_cache));
 
         let extra_ext = self.platform.extensions(&self.init_options);
 
@@ -716,6 +731,7 @@ impl Host {
             host_state,
             extra_ext,
             module_loader,
+            ext_code_cache,
             #[cfg(feature = "v8-limits")]
             v8_limits,
             #[cfg(feature = "code-signing")]

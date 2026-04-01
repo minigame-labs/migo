@@ -49,6 +49,26 @@ impl RendererGL {
         cm.current_canvas_id()
     }
 
+    /// Look up the vertex and fragment shader sources for a program's
+    /// attached shaders.  Used as cache key for shader binary caching.
+    fn get_program_shader_sources(
+        cm: &CanvasManager,
+        meta: &crate::canvas::ProgramMeta,
+    ) -> (Option<String>, Option<String>) {
+        let mut vertex_src = None;
+        let mut fragment_src = None;
+        for sid in &meta.attached_shaders {
+            if let Some(smeta) = cm.shaders.get(sid) {
+                if smeta.gl_shader_type == glow::VERTEX_SHADER {
+                    vertex_src = smeta.source.clone();
+                } else if smeta.gl_shader_type == glow::FRAGMENT_SHADER {
+                    fragment_src = smeta.source.clone();
+                }
+            }
+        }
+        (vertex_src, fragment_src)
+    }
+
     /// Process a single GL command.
     ///
     /// PERF: Per-command `make_current_needed` overhead.
@@ -356,6 +376,7 @@ impl RendererGL {
                 buffer,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                // Validate resource BEFORE dedup check — errors must not be swallowed.
                 let native = if let Some(id) = buffer {
                     let meta = cm.buffers.get(&id).ok_or_else(|| {
                         ee(ErrorCode::NotFound, format!("buffer not found: {id:?}"))
@@ -368,6 +389,21 @@ impl RendererGL {
                 } else {
                     None
                 };
+                // State deduplication — skip GL call if already bound.
+                // Updated AFTER validation so invalid binds never pollute state.
+                let buf_key = buffer.unwrap_or(0);
+                let state = cm.gl_state.entry(canvas_id).or_default();
+                if target == glow::ARRAY_BUFFER {
+                    if state.bound_array_buffer == Some(Some(buf_key)) {
+                        return Ok(false);
+                    }
+                    state.bound_array_buffer = Some(Some(buf_key));
+                } else if target == glow::ELEMENT_ARRAY_BUFFER {
+                    if state.bound_element_array_buffer == Some(Some(buf_key)) {
+                        return Ok(false);
+                    }
+                    state.bound_element_array_buffer = Some(Some(buf_key));
+                }
                 unsafe { gl.bind_buffer(target, native) };
                 Ok(false)
             }
@@ -406,12 +442,17 @@ impl RendererGL {
                 unsafe {
                     match gl.create_program() {
                         Ok(p) => {
+                            // Hint that we may retrieve the binary later for caching.
+                            // Without this, many drivers (notably Mali) return empty
+                            // from glGetProgramBinary.
+                            cm.set_program_binary_hint(p);
                             cm.programs.insert(
                                 client_id,
                                 crate::canvas::ProgramMeta {
                                     gl_handle: Some(p),
                                     owner_canvas: owner,
                                     deleted: false,
+                                    attached_shaders: Vec::new(),
                                 },
                             );
                         }
@@ -428,7 +469,35 @@ impl RendererGL {
                 if let Some(meta) = cm.programs.get(&program_id) {
                     if !meta.deleted {
                         if let Some(ph) = meta.gl_handle {
-                            unsafe { gl.link_program(ph) };
+                            // Try shader cache: load pre-compiled binary to skip link.
+                            let (vsrc, fsrc) = Self::get_program_shader_sources(cm, meta);
+                            let cache_hit = match (&cm.shader_cache, &vsrc, &fsrc) {
+                                (Some(cache), Some(vs), Some(fs)) => {
+                                    match cache.load(vs, fs) {
+                                        Some((format, buffer)) => {
+                                            let prog_binary = glow::ProgramBinary { format, buffer };
+                                            unsafe { gl.program_binary(ph, &prog_binary) };
+                                            unsafe { gl.get_program_link_status(ph) }
+                                        }
+                                        None => false,
+                                    }
+                                }
+                                _ => false,
+                            };
+
+                            if !cache_hit {
+                                unsafe { gl.link_program(ph) };
+
+                                // Save to cache on successful link (best-effort).
+                                let link_ok = unsafe { gl.get_program_link_status(ph) };
+                                if link_ok {
+                                    if let (Some(cache), Some(vs), Some(fs)) =
+                                        (&cm.shader_cache, &vsrc, &fsrc)
+                                    {
+                                        cache.save(gl, ph, vs, fs);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -504,6 +573,15 @@ impl RendererGL {
             GLCmd::DeleteProgram { program_id } => {
                 let _ = self.bind_for_contextless_gl(cm)?;
                 if let Some(mut meta) = cm.programs.remove(&program_id) {
+                    // Invalidate dedup state: if this program was current, clear it
+                    // so the next UseProgram with the same ID isn't skipped.
+                    if let Some(owner) = meta.owner_canvas {
+                        if let Some(state) = cm.gl_state.get_mut(&owner) {
+                            if state.current_program == Some(program_id) {
+                                state.current_program = None;
+                            }
+                        }
+                    }
                     meta.deleted = true;
                     if let Some(ph) = meta.gl_handle {
                         unsafe { gl.delete_program(ph) };
@@ -538,6 +616,7 @@ impl RendererGL {
                                     gl_shader_type: gl_ty,
                                     deleted: false,
                                     source_len: 0,
+                                    source: None,
                                 },
                             );
                         }
@@ -577,6 +656,7 @@ impl RendererGL {
 
                 if let Some(sh) = meta.gl_handle {
                     meta.source_len = source.len();
+                    meta.source = Some(source.clone());
                     unsafe { gl.shader_source(sh, &source) };
                     if let Some(r) = resp {
                         r.send(Ok(()));
@@ -644,6 +724,12 @@ impl RendererGL {
 
                 if let (Some(ph), Some(sh)) = (p.gl_handle, s.gl_handle) {
                     unsafe { gl.attach_shader(ph, sh) };
+                    // Track attachment for shader cache key lookup at link time.
+                    if let Some(pm) = cm.programs.get_mut(&program_id) {
+                        if !pm.attached_shaders.contains(&shader_id) {
+                            pm.attached_shaders.push(shader_id);
+                        }
+                    }
                     if let Some(r) = resp {
                         r.send(Ok(()));
                     }
@@ -916,6 +1002,13 @@ impl RendererGL {
             GLCmd::DeleteTexture { texture_id } => {
                 let _ = self.bind_for_contextless_gl(cm)?;
                 if let Some(meta) = cm.textures.remove(&texture_id) {
+                    // Invalidate dedup state: per GL spec, deleting a texture
+                    // implicitly unbinds it from all units.  Clear matching
+                    // entries so the next BindTexture with the same ID isn't
+                    // incorrectly deduped.
+                    for state in cm.gl_state.values_mut() {
+                        state.bound_texture_2d.retain(|_, tid| *tid != Some(texture_id));
+                    }
                     if let Some(h) = meta.gl_handle {
                         unsafe { gl.delete_texture(h) };
                     }
@@ -929,6 +1022,7 @@ impl RendererGL {
                 texture,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                // Validate resource BEFORE dedup — errors must not be swallowed.
                 let native = if let Some(id) = texture {
                     let meta = cm.textures.get(&id).ok_or_else(|| {
                         ee(ErrorCode::NotFound, format!("texture not found: {id:?}"))
@@ -943,12 +1037,28 @@ impl RendererGL {
                 } else {
                     None
                 };
+                // Per-unit state deduplication for TEXTURE_2D.
+                // Updated AFTER validation so invalid binds never pollute state.
+                if target == glow::TEXTURE_2D {
+                    let tex_key = texture.unwrap_or(0);
+                    let state = cm.gl_state.entry(canvas_id).or_default();
+                    let unit = state.active_texture_unit.unwrap_or(glow::TEXTURE0);
+                    if state.bound_texture_2d.get(&unit) == Some(&Some(tex_key)) {
+                        return Ok(false);
+                    }
+                    state.bound_texture_2d.insert(unit, Some(tex_key));
+                }
                 unsafe { gl.bind_texture(target, native) };
                 Ok(false)
             }
 
             GLCmd::ActiveTexture { canvas_id, unit } => {
                 cm.make_current_needed(canvas_id)?;
+                let state = cm.gl_state.entry(canvas_id).or_default();
+                if state.active_texture_unit == Some(unit) {
+                    return Ok(false);
+                }
+                state.active_texture_unit = Some(unit);
                 unsafe { gl.active_texture(unit) };
                 Ok(false)
             }
@@ -966,6 +1076,20 @@ impl RendererGL {
                 data,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                let slice = data.as_deref().map(|v| v.as_slice());
+                // Use PBO for large uploads (> 64 KB) to avoid GPU pipeline stalls.
+                if let Some(bytes) = slice {
+                    if bytes.len() > 65536 {
+                        if let Some(pool) = cm.pbo_pool_mut() {
+                            if pool.is_pbo_supported() {
+                                return Self::tex_image_2d_pbo(
+                                    cm, gl, target, level, internalformat, width, height, border,
+                                    format, type_, bytes,
+                                );
+                            }
+                        }
+                    }
+                }
                 unsafe {
                     gl.tex_image_2d(
                         target,
@@ -976,7 +1100,7 @@ impl RendererGL {
                         border,
                         format,
                         type_,
-                        glow::PixelUnpackData::Slice(data.as_deref()),
+                        glow::PixelUnpackData::Slice(slice),
                     );
                 }
                 Ok(false)
@@ -995,6 +1119,18 @@ impl RendererGL {
                 data,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                let bytes: &[u8] = &data;
+                // Use PBO for large sub-image uploads (> 64 KB).
+                if bytes.len() > 65536 {
+                    if let Some(pool) = cm.pbo_pool_mut() {
+                        if pool.is_pbo_supported() {
+                            return Self::tex_sub_image_2d_pbo(
+                                cm, gl, target, level, xoffset, yoffset, width, height,
+                                format, type_, bytes,
+                            );
+                        }
+                    }
+                }
                 unsafe {
                     gl.tex_sub_image_2d(
                         target,
@@ -1005,7 +1141,7 @@ impl RendererGL {
                         height,
                         format,
                         type_,
-                        glow::PixelUnpackData::Slice(Some(&data)),
+                        glow::PixelUnpackData::Slice(Some(bytes)),
                     );
                 }
                 Ok(false)
@@ -1574,6 +1710,13 @@ impl RendererGL {
                 level,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                // WebGL spec: modifying the default framebuffer is INVALID_OPERATION.
+                if cm.is_drawing_buffer_bound(canvas_id, gl, target) {
+                    shared::bail!(
+                        ErrorCode::InvalidOperation,
+                        "framebufferTexture2D on default framebuffer"
+                    );
+                }
                 let tex_handle = if let Some(id) = texture {
                     let meta = cm.textures.get(&id).ok_or_else(|| {
                         ee(ErrorCode::NotFound, format!("texture not found: {id:?}"))
@@ -1602,6 +1745,13 @@ impl RendererGL {
                 renderbuffer,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                // WebGL spec: modifying the default framebuffer is INVALID_OPERATION.
+                if cm.is_drawing_buffer_bound(canvas_id, gl, target) {
+                    shared::bail!(
+                        ErrorCode::InvalidOperation,
+                        "framebufferRenderbuffer on default framebuffer"
+                    );
+                }
                 let rb_handle = if let Some(id) = renderbuffer {
                     let meta = cm.renderbuffers.get(&id).ok_or_else(|| {
                         ee(
@@ -1774,5 +1924,73 @@ impl RendererGL {
                 );
             }
         }
+    }
+
+    /// Upload texture data via PBO for async DMA transfer.
+    fn tex_image_2d_pbo(
+        cm: &mut CanvasManager,
+        gl: &glow::Context,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        width: i32,
+        height: i32,
+        border: i32,
+        format: u32,
+        type_: u32,
+        data: &[u8],
+    ) -> EngineResult<bool> {
+        let pool = cm.pbo_pool_mut().ok_or_else(|| {
+            ee(ErrorCode::RenderBackendError, "PBO pool not available")
+        })?;
+        let pbo = pool.acquire(gl, data.len()).ok_or_else(|| {
+            ee(ErrorCode::RenderBackendError, "PBO acquire failed")
+        })?;
+        unsafe {
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pbo));
+            gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, data, glow::STREAM_DRAW);
+            gl.tex_image_2d(
+                target, level, internalformat, width, height, border,
+                format, type_, glow::PixelUnpackData::BufferOffset(0),
+            );
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+        }
+        let pool = cm.pbo_pool_mut().unwrap();
+        pool.release(gl, pbo, data.len());
+        Ok(false)
+    }
+
+    /// Upload sub-image data via PBO for async DMA transfer.
+    fn tex_sub_image_2d_pbo(
+        cm: &mut CanvasManager,
+        gl: &glow::Context,
+        target: u32,
+        level: i32,
+        xoffset: i32,
+        yoffset: i32,
+        width: i32,
+        height: i32,
+        format: u32,
+        type_: u32,
+        data: &[u8],
+    ) -> EngineResult<bool> {
+        let pool = cm.pbo_pool_mut().ok_or_else(|| {
+            ee(ErrorCode::RenderBackendError, "PBO pool not available")
+        })?;
+        let pbo = pool.acquire(gl, data.len()).ok_or_else(|| {
+            ee(ErrorCode::RenderBackendError, "PBO acquire failed")
+        })?;
+        unsafe {
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pbo));
+            gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, data, glow::STREAM_DRAW);
+            gl.tex_sub_image_2d(
+                target, level, xoffset, yoffset, width, height,
+                format, type_, glow::PixelUnpackData::BufferOffset(0),
+            );
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+        }
+        let pool = cm.pbo_pool_mut().unwrap();
+        pool.release(gl, pbo, data.len());
+        Ok(false)
     }
 }

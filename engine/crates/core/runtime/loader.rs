@@ -2,12 +2,38 @@ use std::{borrow::Cow, future::Future, pin::Pin};
 
 use deno_core::{
     FsModuleLoader, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader,
-    ModuleSource, ModuleSourceCode, ModuleSpecifier, ResolutionKind, error::ModuleLoaderError,
+    ModuleSource, ModuleSourceCode, ModuleSpecifier, ResolutionKind, SourceCodeCacheInfo,
+    error::ModuleLoaderError,
 };
 
-pub(crate) struct MyModuleLoader(pub(crate) FsModuleLoader);
+use super::code_cache::SharedCodeCache;
+
+pub(crate) struct MyModuleLoader {
+    inner: FsModuleLoader,
+    code_cache: Option<SharedCodeCache>,
+}
 
 impl MyModuleLoader {
+    pub fn new(code_cache: Option<SharedCodeCache>) -> Self {
+        Self {
+            inner: FsModuleLoader,
+            code_cache,
+        }
+    }
+}
+
+impl MyModuleLoader {
+    /// Attach code cache info to a loaded module source.
+    fn attach_code_cache(
+        cache: &SharedCodeCache,
+        mut source: ModuleSource,
+    ) -> ModuleSource {
+        let hash = cache.compute_hash(source.code.as_bytes());
+        let data = cache.get(hash).map(Cow::Owned);
+        source.code_cache = Some(SourceCodeCacheInfo { hash, data });
+        source
+    }
+
     #[inline]
     fn normalize_specifier<'a>(&self, specifier: &'a str, kind: &ResolutionKind) -> Cow<'a, str> {
         let mut s: Cow<'a, str> = if *kind != ResolutionKind::MainModule {
@@ -65,7 +91,7 @@ impl ModuleLoader for MyModuleLoader {
         kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
         let spec = self.normalize_specifier(specifier, &kind);
-        self.0.resolve(spec.as_ref(), referrer, kind)
+        self.inner.resolve(spec.as_ref(), referrer, kind)
     }
 
     fn load(
@@ -74,17 +100,27 @@ impl ModuleLoader for MyModuleLoader {
         maybe_referrer: Option<&ModuleLoadReferrer>,
         options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
-        let resp = self.0.load(module_specifier, maybe_referrer, options);
+        let resp = self.inner.load(module_specifier, maybe_referrer, options);
+        let cache = self.code_cache.clone();
 
         match resp {
             ModuleLoadResponse::Sync(result) => {
-                ModuleLoadResponse::Sync(result.and_then(Self::patch_amd))
+                ModuleLoadResponse::Sync(result.and_then(Self::patch_amd).map(|source| {
+                    match &cache {
+                        Some(c) => Self::attach_code_cache(c, source),
+                        None => source,
+                    }
+                }))
             }
 
             ModuleLoadResponse::Async(fut) => {
                 let fut = async move {
                     let source = fut.await?;
-                    Self::patch_amd(source)
+                    let source = Self::patch_amd(source)?;
+                    Ok(match &cache {
+                        Some(c) => Self::attach_code_cache(c, source),
+                        None => source,
+                    })
                 };
                 ModuleLoadResponse::Async(Box::pin(fut))
             }
@@ -98,7 +134,7 @@ impl ModuleLoader for MyModuleLoader {
         maybe_content: Option<String>,
         options: ModuleLoadOptions,
     ) -> Pin<Box<dyn Future<Output = Result<(), ModuleLoaderError>>>> {
-        self.0
+        self.inner
             .prepare_load(module_specifier, maybe_referrer, maybe_content, options)
     }
 
@@ -106,10 +142,18 @@ impl ModuleLoader for MyModuleLoader {
 
     fn code_cache_ready(
         &self,
-        module_specifier: ModuleSpecifier,
+        _module_specifier: ModuleSpecifier,
         hash: u64,
         code_cache: &[u8],
     ) -> Pin<Box<dyn Future<Output = ()>>> {
-        self.0.code_cache_ready(module_specifier, hash, code_cache)
+        if let Some(cache) = &self.code_cache {
+            cache.set(hash, code_cache);
+        }
+        Box::pin(std::future::ready(()))
+    }
+
+    fn purge_and_prevent_code_cache(&self, _module_specifier: &str) {
+        // No per-specifier tracking; stale entries are evicted by hash mismatch
+        // or LRU eviction.
     }
 }

@@ -6,6 +6,7 @@ import {
   op_audio_create_gain,
   op_audio_create_buffer,
   op_audio_get_channel_data,
+  op_audio_get_all_channel_data,
   op_audio_create_oscillator,
   op_audio_create_delay,
   op_audio_create_biquad_filter,
@@ -95,11 +96,17 @@ class BaseAudioContext {
         new Uint8Array(audioData)
       );
 
-      // Eagerly fetch all channel data so getChannelData() can be synchronous
+      // Fetch all channel data in one round-trip (eliminates per-channel await).
+      // Layout: [u32le chCount | u32le framesPerCh | ch0 f32s | ch1 f32s ...]
+      const flat = await op_audio_get_all_channel_data(this.#nativeId, info.id);
+      const hdr = new DataView(flat.buffer, flat.byteOffset, 8);
+      const chCount = hdr.getUint32(0, true);
+      const framesPerCh = hdr.getUint32(4, true);
+      const dataOffset = flat.byteOffset + 8;
+      const bytesPerCh = framesPerCh * 4;
       const channelData = [];
-      for (let ch = 0; ch < info.channels; ch++) {
-        const bytes = await op_audio_get_channel_data(this.#nativeId, info.id, ch);
-        channelData.push(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4));
+      for (let ch = 0; ch < chCount; ch++) {
+        channelData.push(new Float32Array(flat.buffer, dataOffset + ch * bytesPerCh, framesPerCh));
       }
 
       const buffer = new AudioBuffer(info.id, this.#nativeId, info, channelData);

@@ -99,11 +99,26 @@ impl CanvasHandler {
                 image,
                 resp,
             } => {
-                let res = cm.load_shared_fv_image(image_id, image);
-                let _ = resp.send(res);
+                // Try async upload thread first.  The response is deferred
+                // until drain_upload_completed() confirms the GPU fence has
+                // signaled and the texture is registered — this prevents
+                // drawImage from hitting "shared image not found" during
+                // the upload gap.
+                match cm.submit_async_upload(image_id, &image, resp) {
+                    Ok(()) => {
+                        // Async path accepted — resp will be sent when
+                        // the fence signals in drain_upload_completed().
+                    }
+                    Err(resp) => {
+                        // Upload thread unavailable — sync upload fallback.
+                        let res = cm.load_shared_fv_image(image_id, image);
+                        let _ = resp.send(res);
+                    }
+                }
             }
 
             CanvasCmd::DestroyImage { image_id } => {
+                cm.cancel_pending_load(image_id);
                 let _ = cm.destroy_shared_fv_image(image_id);
             }
 

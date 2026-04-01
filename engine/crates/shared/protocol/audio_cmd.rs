@@ -143,10 +143,12 @@ pub enum AudioCmd {
     },
 
     // ==================== Buffer ====================
-    /// Decode audio data into an AudioBuffer
+    /// Decode audio data into an AudioBuffer.
+    /// Data is Arc-wrapped to avoid copying the entire compressed file
+    /// from the JS thread to the audio/decode thread.
     DecodeAudioData {
         ctx_id: AudioContextId,
-        data: Vec<u8>,
+        data: std::sync::Arc<Vec<u8>>,
         resp: AudioResp<AudioBufferInfo>,
     },
 
@@ -439,12 +441,19 @@ pub enum AudioCmd {
         resp: AudioResp<AudioBufferInfo>,
     },
 
-    /// Get channel data from a buffer
+    /// Get channel data from a buffer (single channel)
     GetChannelData {
         ctx_id: AudioContextId,
         buffer_id: AudioBufferId,
         channel: u32,
         resp: AudioResp<Vec<f32>>,
+    },
+
+    /// Get all channel data in one round-trip (eliminates per-channel await).
+    GetAllChannelData {
+        ctx_id: AudioContextId,
+        buffer_id: AudioBufferId,
+        resp: AudioResp<Vec<Vec<f32>>>,
     },
 
     /// Copy data to a buffer channel

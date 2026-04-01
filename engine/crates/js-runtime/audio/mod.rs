@@ -37,6 +37,7 @@ use crate::audio::ops::{
     op_audio_decode_audio_data,
     op_audio_disconnect,
     op_audio_get_available_audio_sources,
+    op_audio_get_all_channel_data,
     op_audio_get_channel_data,
     // Frequency response & analysis ops
     op_audio_get_frequency_response,
@@ -125,6 +126,7 @@ extension!(host_v8_audio,
         op_audio_param_cancel_scheduled,
         // AudioBuffer data access ops
         op_audio_create_buffer,
+        op_audio_get_all_channel_data,
         op_audio_get_channel_data,
         op_audio_copy_to_channel,
         // Phase 2: OscillatorNode ops

@@ -18,13 +18,20 @@ const registry = new SafeFinalizationRegistry((rid) => {
 });
 
 class Image {
-    constructor() {
+    constructor(width, height) {
         this._src = "";
         this.width = 0;
         this.height = 0;
         this.naturalWidth = 0;
         this.naturalHeight = 0;
         this.complete = false;
+
+        // Target decode dimensions: when set via constructor, the decoder
+        // will resize the image to fit within these bounds (preserving
+        // aspect ratio). This avoids decoding a 4096x4096 atlas at full
+        // resolution when only a 512x512 version is needed.
+        this._targetWidth = (typeof width === 'number' && width > 0) ? (width | 0) : 0;
+        this._targetHeight = (typeof height === 'number' && height > 0) ? (height | 0) : 0;
 
         this._onload = null;
         this._onerror = null;
@@ -124,7 +131,7 @@ class Image {
             return;
         }
 
-        op_load_image(this._rid, url)
+        op_load_image(this._rid, url, this._targetWidth, this._targetHeight)
             .then((dim) => {
                 // out-of-order: ignore if a newer src has been set
                 if (seq !== this._load_seq) return;
@@ -178,7 +185,7 @@ class Image {
     }
 }
 
-const createImage = () => new Image();
+const createImage = (width, height) => new Image(width, height);
 
 /**
  * ImagePreloader - Preload multiple images in parallel for better performance

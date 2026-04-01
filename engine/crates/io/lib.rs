@@ -2,10 +2,13 @@ mod fast_image_decoder;
 mod image_cache;
 mod io_cmd_handler;
 mod io_thread;
+pub mod ktx2;
 #[cfg(feature = "zip-extract")]
 mod zip_extract;
 
-pub use fast_image_decoder::{decode_image_fast, register_platform_decoder};
+pub use fast_image_decoder::{
+    CompressedImageInfo, decode_image_fast, detect_compressed_format, register_platform_decoder,
+};
 pub use image_cache::{CacheStats, CachedImage, ImageCache, global_cache};
 pub use io_thread::run_io_handler;
 #[cfg(feature = "zip-extract")]

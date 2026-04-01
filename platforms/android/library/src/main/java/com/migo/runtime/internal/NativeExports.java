@@ -256,10 +256,10 @@ public final class NativeExports {
      * Decode image bytes to RGBA using Android's BitmapFactory.
      * Returns [width_le32, height_le32, RGBA_bytes...] or null on failure.
      *
-     * <p>ARGB_8888 internal pixel format is 0xAARRGGBB. On little-endian devices
-     * (all Android), {@code copyPixelsToBuffer} writes bytes as B,G,R,A per pixel.
-     * We perform an in-place BGRA→RGBA swizzle before returning so the caller
-     * always receives true RGBA byte order.
+     * <p>ARGB_8888 (backed by Skia kRGBA_8888) stores bytes as R,G,B,A from low
+     * to high address on little-endian devices (all Android).
+     * {@code copyPixelsToBuffer} writes these bytes in memory order, so the
+     * output is already in RGBA byte order — no swizzle needed.
      *
      * @param imageData Raw image file bytes (JPEG, PNG, BMP, etc.)
      * @return Packed byte array: 8-byte header (width + height as little-endian int32) + RGBA pixels, or null
@@ -267,48 +267,67 @@ public final class NativeExports {
     public static byte[] decodeImageRgba(byte[] imageData) {
         if (imageData == null || imageData.length == 0) return null;
 
-        BitmapFactory.Options opts = new BitmapFactory.Options();
-        opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
-        // Decode as non-premultiplied so RGB channels are unmodified.
-        // The GL pipeline handles alpha blending; premultiplied data
-        // would corrupt colours when used with straight-alpha blending.
-        opts.inPremultiplied = false;
-
-        Bitmap bitmap = BitmapFactory.decodeByteArray(imageData, 0, imageData.length, opts);
-        if (bitmap == null) return null;
-
-        // Ensure ARGB_8888 config for consistent pixel format
-        if (bitmap.getConfig() != Bitmap.Config.ARGB_8888) {
-            Bitmap converted = bitmap.copy(Bitmap.Config.ARGB_8888, false);
-            bitmap.recycle();
-            if (converted == null) return null;
-            bitmap = converted;
+        // Fail fast when Java heap has less than 32 MB headroom.
+        // Each decode needs ~2x(w*h*4) temporarily (Bitmap + output buffer),
+        // attempting it under memory pressure just triggers GC storms or OOM.
+        Runtime rt = Runtime.getRuntime();
+        long used = rt.totalMemory() - rt.freeMemory();
+        long free = rt.maxMemory() - used;
+        if (free < 32L * 1024 * 1024) {
+            return null;
         }
 
-        int w = bitmap.getWidth();
-        int h = bitmap.getHeight();
-        long pixelCountLong = (long) w * (long) h;
-        if (pixelCountLong > Integer.MAX_VALUE / 4) {
+        Bitmap bitmap = null;
+        try {
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            // Decode as non-premultiplied so RGB channels are unmodified.
+            // The GL pipeline handles alpha blending; premultiplied data
+            // would corrupt colours when used with straight-alpha blending.
+            opts.inPremultiplied = false;
+
+            bitmap = BitmapFactory.decodeByteArray(imageData, 0, imageData.length, opts);
+            if (bitmap == null) return null;
+
+            // Ensure ARGB_8888 config for consistent pixel format
+            if (bitmap.getConfig() != Bitmap.Config.ARGB_8888) {
+                Bitmap converted = bitmap.copy(Bitmap.Config.ARGB_8888, false);
+                bitmap.recycle();
+                bitmap = converted;
+                if (bitmap == null) return null;
+            }
+
+            int w = bitmap.getWidth();
+            int h = bitmap.getHeight();
+            long pixelCountLong = (long) w * (long) h;
+            if (pixelCountLong > Integer.MAX_VALUE / 4) {
+                bitmap.recycle();
+                return null;  // Image too large
+            }
+            int pixelCount = (int) pixelCountLong;
+
+            // Single allocation: 8-byte header + pixel data (eliminates the
+            // previous redundant pixelBuf allocation).
+            ByteBuffer buf = ByteBuffer.allocate(8 + pixelCount * 4);
+            buf.order(ByteOrder.LITTLE_ENDIAN);
+            buf.putInt(w);
+            buf.putInt(h);
+
+            // copyPixelsToBuffer writes raw pixel bytes in native memory order.
+            // Android's ARGB_8888 (backed by Skia kRGBA_8888) stores bytes as
+            // R, G, B, A from low to high address — already RGBA byte order.
+            // No swizzle needed.
+            bitmap.copyPixelsToBuffer(buf);
             bitmap.recycle();
-            return null;  // Image too large
+            bitmap = null;
+
+            return buf.array();
+        } catch (OutOfMemoryError e) {
+            if (bitmap != null && !bitmap.isRecycled()) {
+                bitmap.recycle();
+            }
+            return null;
         }
-        int pixelCount = (int) pixelCountLong;
-
-        // Single allocation: 8-byte header + pixel data (eliminates the
-        // previous redundant pixelBuf allocation).
-        ByteBuffer buf = ByteBuffer.allocate(8 + pixelCount * 4);
-        buf.order(ByteOrder.LITTLE_ENDIAN);
-        buf.putInt(w);
-        buf.putInt(h);
-
-        // copyPixelsToBuffer writes raw pixel bytes in native memory order.
-        // Android's ARGB_8888 (backed by Skia kRGBA_8888) stores bytes as
-        // R, G, B, A from low to high address — already RGBA byte order.
-        // No swizzle needed.
-        bitmap.copyPixelsToBuffer(buf);
-        bitmap.recycle();
-
-        return buf.array();
     }
 
     // ==================== File System ====================
