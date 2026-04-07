@@ -19,7 +19,6 @@ import java.util.List;
  *     .build();
  * }</pre>
  *
- * @since 1.0.0
  */
 public final class RuntimeConfig {
 

@@ -3,6 +3,7 @@ package com.migo.runtime;
 import android.app.Activity;
 import android.content.Context;
 import android.os.Build;
+import android.util.Log;
 import android.view.Surface;
 
 import com.migo.runtime.internal.AppContext;
@@ -10,6 +11,7 @@ import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.RuntimeContext;
 import com.migo.runtime.internal.RuntimeRegistry;
+import com.migo.runtime.internal.ThreadCheck;
 import com.migo.runtime.internal.platform.DisplayCompat;
 
 /**
@@ -109,15 +111,18 @@ import com.migo.runtime.internal.platform.DisplayCompat;
  * <p>
  * This class is thread-safe. All public methods can be called from any thread.
  *
- * @since 1.0.0
  */
 public final class MigoRuntime {
+
+    /** Java SDK version. Must match native engine version (major.minor). */
+    public static final String SDK_VERSION = "0.1.0";
 
     private static final Object LOCK = new Object();
     private static volatile MigoRuntime sInstance;
 
     private volatile boolean nativeLoaded = false;
     private String nativeVersion = "unknown";
+    private volatile Throwable nativeLoadError;
 
     /**
      * Get the singleton instance of MigoRuntime.
@@ -143,9 +148,14 @@ public final class MigoRuntime {
             if (nativeVersion == null) {
                 nativeVersion = "unknown";
             }
+            if (!nativeVersion.equals(SDK_VERSION)) {
+                Log.w("MigoRuntime", "SDK/native version mismatch: SDK=" + SDK_VERSION + " native=" + nativeVersion);
+            }
         } catch (UnsatisfiedLinkError e) {
             nativeLoaded = false;
             nativeVersion = "load_failed";
+            nativeLoadError = e;
+            Log.e("MigoRuntime", "Failed to load native library: " + e.getMessage());
         }
     }
 
@@ -179,6 +189,16 @@ public final class MigoRuntime {
     }
 
     /**
+     * Returns the error that prevented native library loading, or null if loaded successfully.
+     * Useful for diagnosing integration issues (wrong ABI, missing .so, etc.)
+     *
+     * @return The load error, or null if the native library loaded successfully
+     */
+    public Throwable getNativeLoadError() {
+        return nativeLoadError;
+    }
+
+    /**
      * Get the minimum supported Android API level.
      *
      * @return Minimum API level (21 = Android 5.0)
@@ -204,6 +224,7 @@ public final class MigoRuntime {
      * @throws RuntimeException if creation fails or gameId is invalid
      */
     public GameSession createSession(Activity activity, Surface surface, RuntimeConfig config, String gameId) {
+        ThreadCheck.ensureMainThread();
         validateCreateSession(activity, surface, config);
         validateGameId(gameId);
 
@@ -258,7 +279,8 @@ public final class MigoRuntime {
         validateGameId(gameId);
 
         if (!nativeLoaded) {
-            throw new RuntimeException(ErrorCode.ERR_NATIVE_LOAD_FAILED);
+            throw new MigoException(ErrorCode.ERR_NATIVE_LOAD_FAILED,
+                    "Native library not loaded", nativeLoadError);
         }
 
         // Initialize app context
@@ -292,8 +314,11 @@ public final class MigoRuntime {
      * @return Result containing either the session or an error code
      */
     public Result<GameSession> createSessionSafe(Activity activity, Surface surface, RuntimeConfig config, String gameId) {
+        ThreadCheck.ensureMainThread();
         try {
             return Result.success(createSession(activity, surface, config, gameId));
+        } catch (MigoException e) {
+            return Result.failure(e.getErrorCode(), e.getMessage());
         } catch (RuntimeException e) {
             return Result.failure(e.getErrorCode(), e.getMessage());
         } catch (Exception e) {
@@ -334,7 +359,8 @@ public final class MigoRuntime {
             throw new RuntimeException(ErrorCode.ERR_INVALID_CONFIG);
         }
         if (!nativeLoaded) {
-            throw new RuntimeException(ErrorCode.ERR_NATIVE_LOAD_FAILED);
+            throw new MigoException(ErrorCode.ERR_NATIVE_LOAD_FAILED,
+                    "Native library not loaded", nativeLoadError);
         }
     }
 

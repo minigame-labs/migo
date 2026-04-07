@@ -91,7 +91,7 @@ pub struct BleCharacteristicData {
 /// - **Camera Events** (2): `CameraEvent`, `CameraFrameData`
 /// - **Bluetooth / BLE Events** (7): `OnBluetoothAdapterStateChange` .. `OnBeaconServiceChange`
 /// - **Video Events** (1): `OnVideoStateChange`
-/// - **System Events** (2): `OnMemoryWarning`, `OnUserCaptureScreen`
+/// - **System Events** (3): `OnMemoryWarning`, `OnUserCaptureScreen`, `OnThermalStatusChanged`
 ///
 /// # Thread Safety
 ///
@@ -471,6 +471,23 @@ pub enum HostCommand {
     ///
     /// Triggers `migo.onUserCaptureScreen` callback in the game.
     OnUserCaptureScreen,
+
+    /// Thermal status changed (ADPF, API 29+).
+    /// Level 0=none, 1=light, 2=moderate, 3=severe, 4=critical, 5=emergency, 6=shutdown.
+    OnThermalStatusChanged { status: i32 },
+
+    // ---- Display Configuration ----
+    /// Display refresh period in nanoseconds (e.g., 16666667 for 60Hz, 8333333 for 120Hz).
+    /// Sent once at session start and when display mode changes.
+    SetDisplayRefreshRate { period_nanos: i64 },
+
+    // ---- Host Message Channel ----
+    /// Message from game JS to host app via migo.sendToHost(type, payload).
+    ///
+    /// `json` is a `{"type":"...","payload":"..."}` envelope.
+    /// The host thread forwards this to `PlatformServices::notify_host_message`,
+    /// which calls `NativeExports.onHostMessage` via JNI outbound.
+    SendToHost { json: String },
 }
 
 // Guard against future regressions — if a new variant re-inflates the enum,

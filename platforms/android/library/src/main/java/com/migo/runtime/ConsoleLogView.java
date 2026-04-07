@@ -42,7 +42,6 @@ import java.util.Locale;
  * <p>
  * Polls the native ring buffer periodically to display console.log output.
  *
- * @since 2.1.0
  */
 public class ConsoleLogView {
 

@@ -240,6 +240,16 @@ public final class NativeBridge {
      */
     public static native void onVsync(int sessionId, long frameTimeNanos);
 
+    /**
+     * Notify the native render thread of the display refresh period.
+     * Called once at session start and when the display refresh rate changes.
+     *
+     * @param sessionId          The session ID
+     * @param refreshPeriodNanos Display refresh period in nanoseconds
+     *                           (e.g., 16666667 for 60Hz, 8333333 for 120Hz)
+     */
+    public static native void setDisplayRefreshRate(int sessionId, long refreshPeriodNanos);
+
     // ==================== Recorder Callbacks ====================
 
     /**
@@ -383,6 +393,17 @@ public final class NativeBridge {
      *                  5 = RUNNING_MODERATE, 10 = RUNNING_LOW, 15 = RUNNING_CRITICAL
      */
     public static native void onMemoryWarning(int sessionId, int level);
+
+    // ==================== ADPF Thermal ====================
+
+    /**
+     * Notify that the device thermal status has changed (ADPF, API 29+).
+     *
+     * @param sessionId The session ID
+     * @param status    Thermal status level: 0=none, 1=light, 2=moderate,
+     *                  3=severe, 4=critical, 5=emergency, 6=shutdown
+     */
+    public static native void onThermalStatusChanged(int sessionId, int status);
 
     // ==================== Image API Callbacks ====================
 
@@ -569,6 +590,19 @@ public final class NativeBridge {
      * @param dataJson  JSON-encoded event data
      */
     public static native void onVideoEvent(int sessionId, int videoId, String eventType, String dataJson);
+
+    // ==================== Script Execution ====================
+
+    /**
+     * Execute a JavaScript snippet in the game's V8 runtime.
+     * <p>
+     * The script is evaluated asynchronously on the host thread.
+     *
+     * @param sessionId The session ID
+     * @param script    JavaScript source code to evaluate
+     * @return 0 on success, -1 on failure
+     */
+    public static native int executeScript(int sessionId, String script);
 
     // ==================== Console Logs ====================
 

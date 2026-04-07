@@ -5,7 +5,6 @@ package com.migo.runtime;
  * <p>
  * All error codes are negative integers. Success is indicated by code 0.
  *
- * @since 1.0.0
  */
 public final class ErrorCode {
 
@@ -24,6 +23,10 @@ public final class ErrorCode {
     public static final int ERR_INVALID_CONFIG = -1002;
     /** Native library failed to load */
     public static final int ERR_NATIVE_LOAD_FAILED = -1003;
+    /** Game ID or entry point is missing or invalid */
+    public static final int ERR_INVALID_GAME_ID = -1004;
+    /** Device does not meet the requirements to run the engine */
+    public static final int ERR_NOT_SUPPORTED = -1005;
 
     // ==================== Runtime Errors (-2xxx) ====================
     /** Session has been destroyed */
@@ -83,6 +86,8 @@ public final class ErrorCode {
             case ERR_INVALID_SURFACE: return "Invalid surface";
             case ERR_INVALID_CONFIG: return "Invalid configuration";
             case ERR_NATIVE_LOAD_FAILED: return "Native library load failed";
+            case ERR_INVALID_GAME_ID: return "Invalid game ID or entry point";
+            case ERR_NOT_SUPPORTED: return "Device not supported";
             case ERR_SESSION_DESTROYED: return "Session destroyed";
             case ERR_CODE_DIR_NOT_FOUND: return "Code directory not found";
             case ERR_ENTRY_NOT_FOUND: return "Entry point not found";
@@ -107,5 +112,22 @@ public final class ErrorCode {
      */
     public static boolean isSuccess(int code) {
         return code == SUCCESS;
+    }
+
+    /**
+     * Whether an error code represents a recoverable condition.
+     * Recoverable errors allow the session to continue running.
+     * Non-recoverable errors require the session to be restarted or destroyed.
+     *
+     * @param code The error code
+     * @return true if the error is recoverable
+     */
+    public static boolean isRecoverable(int code) {
+        switch (code) {
+            case NATIVE_JS_EXECUTION_TIMEOUT:  // watchdog can restart JS isolate
+                return true;
+            default:
+                return false;
+        }
     }
 }

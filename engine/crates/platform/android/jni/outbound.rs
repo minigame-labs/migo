@@ -14,6 +14,24 @@ use shared::{
 
 use crate::android::jni::{JAVA_METHOD_CACHE, with_env};
 
+// Binary protocol convention: all integer fields are little-endian (LE).
+// Java side must use ByteBuffer.order(ByteOrder.LITTLE_ENDIAN).
+// See also: shared/stats.rs (same convention).
+
+/// Threshold for logging slow JNI calls (potential ANR risk).
+/// Android triggers ANR after 5 seconds; we warn well before that.
+const SLOW_JNI_CALL_SECS: u64 = 3;
+
+/// Clear any pending JNI exception, logging it if present.
+#[inline]
+fn clear_jni_exception(env: &mut JNIEnv, context: &str) {
+    if env.exception_check().unwrap_or(false) {
+        env.exception_describe().ok();
+        tracing::error!("JNI exception in {context}");
+        env.exception_clear().ok();
+    }
+}
+
 fn call_static_method<R, F>(
     method_name: &str,
     ret: ReturnType,
@@ -26,7 +44,7 @@ where
     with_env(|env| {
         // Clear any pre-existing JNI exception so a stale exception from a
         // prior call does not cause cascading failures (see notify_error).
-        let _ = env.exception_clear();
+        clear_jni_exception(env, method_name);
 
         let cache = JAVA_METHOD_CACHE
             .get()
@@ -38,38 +56,100 @@ where
 
         let class = cache.class();
 
+        let start = std::time::Instant::now();
         let result = unsafe { env.call_static_method_unchecked(class, *method_id, ret, args) };
+        let elapsed = start.elapsed();
+        if elapsed.as_secs() >= SLOW_JNI_CALL_SECS {
+            tracing::warn!(
+                "Slow JNI call '{}': {:.1}s (potential ANR risk)",
+                method_name,
+                elapsed.as_secs_f64()
+            );
+        }
 
         match result {
             Ok(val) => handle(env, val),
             Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
+                clear_jni_exception(env, method_name);
                 Err(format!("Failed to call method '{method_name}': {e}"))
             }
         }
     })
 }
 
-pub fn open_bluetooth_settings(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "openSystemBluetoothSetting",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
+/// Internal helper for void JNI calls with pre-constructed arguments.
+/// Takes `&mut JNIEnv` directly to avoid nested `with_env` calls.
+fn call_void_impl(env: &mut JNIEnv, method_name: &str, args: &[jvalue]) -> Result<(), String> {
+    clear_jni_exception(env, method_name);
+
+    let cache = JAVA_METHOD_CACHE
+        .get()
+        .ok_or("NativeExports class cache not initialized")?;
+    let method_id = cache.get_method_id(method_name).ok_or("Method ID not found")?;
+    let class = cache.class();
+
+    let start = std::time::Instant::now();
+    let result = unsafe {
+        env.call_static_method_unchecked(
+            class,
+            *method_id,
+            ReturnType::Primitive(Primitive::Void),
+            args,
+        )
+    };
+    let elapsed = start.elapsed();
+    if elapsed.as_secs() >= SLOW_JNI_CALL_SECS {
+        tracing::warn!(
+            "Slow JNI call '{}': {:.1}s (potential ANR risk)",
+            method_name,
+            elapsed.as_secs_f64()
+        );
+    }
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            clear_jni_exception(env, method_name);
+            Err(format!("Failed to call method '{method_name}': {e}"))
+        }
+    }
 }
 
-pub fn open_app_authorize_setting(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "openAppAuthorizeSetting",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
+/// Generate a void JNI call with only host_id parameter.
+macro_rules! jni_void {
+    ($fn_name:ident, $method:expr) => {
+        pub fn $fn_name(host_id: i32) -> Result<(), String> {
+            call_static_method(
+                $method,
+                ReturnType::Primitive(Primitive::Void),
+                |_env, _| Ok(()),
+                &[jvalue { i: host_id }],
+            )
+        }
+    };
 }
+
+/// Generate a void JNI call with host_id + JSON string parameter.
+macro_rules! jni_void_json {
+    ($fn_name:ident, $method:expr) => {
+        pub fn $fn_name(host_id: i32, options_json: &str) -> Result<(), String> {
+            call_void_with_string($method, host_id, options_json)
+        }
+    };
+}
+
+/// Generate a JNI call that returns JSON string, with host_id + JSON string parameter.
+macro_rules! jni_json {
+    ($fn_name:ident, $method:expr) => {
+        pub fn $fn_name(host_id: i32, options_json: &str) -> Result<String, String> {
+            call_json_method($method, host_id, options_json)
+        }
+    };
+}
+
+jni_void!(open_bluetooth_settings, "openSystemBluetoothSetting");
+
+jni_void!(open_app_authorize_setting, "openAppAuthorizeSetting");
 
 pub fn get_window_info(host_id: i32) -> Result<WindowInfo, String> {
     call_static_method(
@@ -86,32 +166,32 @@ pub fn get_window_info(host_id: i32) -> Result<WindowInfo, String> {
             }
 
             let mut window_width =
-                i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32;
+                i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32;
             let mut window_height =
-                i32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as f32;
+                i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as f32;
             let mut screen_width =
-                i32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as f32;
+                i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as f32;
             let mut screen_height =
-                i32::from_ne_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as f32;
+                i32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as f32;
             let mut status_bar_height =
-                i32::from_ne_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as f32;
+                i32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as f32;
 
-            let pixel_ratio_int = i32::from_ne_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+            let pixel_ratio_int = i32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
             let pixel_ratio = pixel_ratio_int as f32 / 1000.0;
 
             let mut screen_top =
-                i32::from_ne_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) as f32;
+                i32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) as f32;
 
             // bytes[28..36]: reserved (2 x i32), skipped
 
             let mut safe_area_left =
-                i32::from_ne_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]) as f32;
+                i32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]) as f32;
             let mut safe_area_top =
-                i32::from_ne_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as f32;
+                i32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as f32;
             let mut safe_area_right =
-                i32::from_ne_bytes([bytes[44], bytes[45], bytes[46], bytes[47]]) as f32;
+                i32::from_le_bytes([bytes[44], bytes[45], bytes[46], bytes[47]]) as f32;
             let mut safe_area_bottom =
-                i32::from_ne_bytes([bytes[48], bytes[49], bytes[50], bytes[51]]) as f32;
+                i32::from_le_bytes([bytes[48], bytes[49], bytes[50], bytes[51]]) as f32;
 
             if pixel_ratio != 0.0 && (pixel_ratio - 1.0).abs() > f32::EPSILON {
                 window_width /= pixel_ratio;
@@ -213,42 +293,12 @@ pub fn get_app_authorization_setting_json() -> Result<String, String> {
 /// Call a void Java static method with signature (int, String).
 fn call_void_with_string(method_name: &str, host_id: i32, json: &str) -> Result<(), String> {
     with_env(|env| {
-        let cache = JAVA_METHOD_CACHE
-            .get()
-            .ok_or("NativeExports class cache not initialized")?;
-        let method_id = cache
-            .get_method_id(method_name)
-            .ok_or("Method ID not found")?;
-        let class = cache.class();
-
         let jstr = env
             .new_string(json)
             .map_err(|e| format!("Failed to create Java string: {e}"))?;
-
-        let result = unsafe {
-            env.call_static_method_unchecked(
-                class,
-                *method_id,
-                ReturnType::Primitive(Primitive::Void),
-                &[
-                    jvalue { i: host_id },
-                    jvalue {
-                        l: jstr.as_raw() as *mut _,
-                    },
-                ],
-            )
-        };
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
-                Err(format!("Failed to call method '{method_name}': {e}"))
-            }
-        }
+        // Keep jstr alive until after the call so the local ref remains valid.
+        let args = [jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }];
+        call_void_impl(env, method_name, &args)
     })
 }
 
@@ -257,69 +307,16 @@ fn call_void_with_string(method_name: &str, host_id: i32, json: &str) -> Result<
 /// the second argument is just an integer.
 fn call_void_with_int(method_name: &str, host_id: i32, value: i32) -> Result<(), String> {
     with_env(|env| {
-        let cache = JAVA_METHOD_CACHE
-            .get()
-            .ok_or("NativeExports class cache not initialized")?;
-        let method_id = cache
-            .get_method_id(method_name)
-            .ok_or("Method ID not found")?;
-        let class = cache.class();
-
-        let result = unsafe {
-            env.call_static_method_unchecked(
-                class,
-                *method_id,
-                ReturnType::Primitive(Primitive::Void),
-                &[jvalue { i: host_id }, jvalue { i: value }],
-            )
-        };
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
-                Err(format!("Failed to call method '{method_name}': {e}"))
-            }
-        }
+        call_void_impl(env, method_name, &[jvalue { i: host_id }, jvalue { i: value }])
     })
 }
 
-pub fn show_toast(host_id: i32, json: &str) -> Result<(), String> {
-    call_void_with_string("showToast", host_id, json)
-}
-
-pub fn hide_toast(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "hideToast",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
-
-pub fn show_modal(host_id: i32, json: &str) -> Result<(), String> {
-    call_void_with_string("showModal", host_id, json)
-}
-
-pub fn show_loading(host_id: i32, json: &str) -> Result<(), String> {
-    call_void_with_string("showLoading", host_id, json)
-}
-
-pub fn hide_loading(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "hideLoading",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
-
-pub fn show_action_sheet(host_id: i32, json: &str) -> Result<(), String> {
-    call_void_with_string("showActionSheet", host_id, json)
-}
+jni_void_json!(show_toast, "showToast");
+jni_void!(hide_toast, "hideToast");
+jni_void_json!(show_modal, "showModal");
+jni_void_json!(show_loading, "showLoading");
+jni_void!(hide_loading, "hideLoading");
+jni_void_json!(show_action_sheet, "showActionSheet");
 
 // ==================== Battery ====================
 
@@ -371,10 +368,7 @@ pub fn vibrate_short(vibrate_type: &str) -> Result<i32, String> {
         match result {
             Ok(val) => Ok(val.i().unwrap_or(-1)),
             Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
+                clear_jni_exception(env, "vibrateShort");
                 Err(format!("Failed to call vibrateShort: {e}"))
             }
         }
@@ -452,10 +446,7 @@ pub fn set_device_orientation(host_id: i32, value: &str) -> Result<i32, String> 
         match result {
             Ok(val) => Ok(val.i().unwrap_or(-1)),
             Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
+                clear_jni_exception(env, "setDeviceOrientation");
                 Err(format!("Failed to call setDeviceOrientation: {e}"))
             }
         }
@@ -475,106 +466,30 @@ pub fn set_enable_debug(host_id: i32, enabled: bool) -> Result<i32, String> {
 
 // ==================== Device Sensor ====================
 
-pub fn start_device_motion(host_id: i32, interval: &str) -> Result<(), String> {
-    call_void_with_string("startDeviceMotionListening", host_id, interval)
-}
-
-pub fn stop_device_motion(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "stopDeviceMotionListening",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
-
-pub fn start_gyroscope(host_id: i32, interval: &str) -> Result<(), String> {
-    call_void_with_string("startGyroscope", host_id, interval)
-}
-
-pub fn stop_gyroscope(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "stopGyroscope",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+jni_void_json!(start_device_motion, "startDeviceMotionListening");
+jni_void!(stop_device_motion, "stopDeviceMotionListening");
+jni_void_json!(start_gyroscope, "startGyroscope");
+jni_void!(stop_gyroscope, "stopGyroscope");
 
 // ==================== Compass ====================
 
-pub fn start_compass(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "startCompass",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
-
-pub fn stop_compass(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "stopCompass",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+jni_void!(start_compass, "startCompass");
+jni_void!(stop_compass, "stopCompass");
 
 // ==================== Accelerometer ====================
 
-pub fn start_accelerometer(host_id: i32, interval: &str) -> Result<(), String> {
-    call_void_with_string("startAccelerometer", host_id, interval)
-}
-
-pub fn stop_accelerometer(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "stopAccelerometer",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+jni_void_json!(start_accelerometer, "startAccelerometer");
+jni_void!(stop_accelerometer, "stopAccelerometer");
 
 // ==================== Screen Capture ====================
 
-pub fn start_capture_screen(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "startCaptureScreen",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
-
-pub fn stop_capture_screen(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "stopCaptureScreen",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+jni_void!(start_capture_screen, "startCaptureScreen");
+jni_void!(stop_capture_screen, "stopCaptureScreen");
 
 // ==================== Network ====================
 
-pub fn start_network_monitoring(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "startNetworkMonitoring",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
-
-pub fn stop_network_monitoring(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "stopNetworkMonitoring",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+jni_void!(start_network_monitoring, "startNetworkMonitoring");
+jni_void!(stop_network_monitoring, "stopNetworkMonitoring");
 
 pub fn get_network_type_json(host_id: i32) -> Result<String, String> {
     call_static_method(
@@ -659,42 +574,16 @@ pub fn get_available_audio_sources(host_id: i32) -> Result<String, String> {
 
 /// Start recording with options JSON.
 /// Calls Java: NativeExports.recorderStart(hostId, optionsJson)
-pub fn recorder_start(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("recorderStart", host_id, options_json)
-}
+jni_void_json!(recorder_start, "recorderStart");
 
-/// Pause recording.
-/// Calls Java: NativeExports.recorderPause(hostId)
-pub fn recorder_pause(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "recorderPause",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+/// Pause recording. Calls Java: NativeExports.recorderPause(hostId)
+jni_void!(recorder_pause, "recorderPause");
 
-/// Resume recording.
-/// Calls Java: NativeExports.recorderResume(hostId)
-pub fn recorder_resume(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "recorderResume",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+/// Resume recording. Calls Java: NativeExports.recorderResume(hostId)
+jni_void!(recorder_resume, "recorderResume");
 
-/// Stop recording.
-/// Calls Java: NativeExports.recorderStop(hostId)
-pub fn recorder_stop(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "recorderStop",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+/// Stop recording. Calls Java: NativeExports.recorderStop(hostId)
+jni_void!(recorder_stop, "recorderStop");
 
 // ==================== Charset Encoding (GBK) ====================
 
@@ -740,10 +629,7 @@ pub fn encode_gbk(data: &str) -> Result<Vec<u8>, String> {
                 Ok(bytes)
             }
             Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
+                clear_jni_exception(env, "encodeGbk");
                 Err(format!("encodeGbk failed: {e}"))
             }
         }
@@ -792,10 +678,7 @@ pub fn decode_gbk(data: &[u8]) -> Result<String, String> {
                 Ok(s.into())
             }
             Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
+                clear_jni_exception(env, "decodeGbk");
                 Err(format!("decodeGbk failed: {e}"))
             }
         }
@@ -859,10 +742,7 @@ pub fn unzip_file(zip_path: &str, dest_dir: &str) -> Result<usize, String> {
                 }
             }
             Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
+                clear_jni_exception(env, "unzipFile");
                 Err(format!("Failed to call unzipFile: {e}"))
             }
         }
@@ -909,10 +789,7 @@ pub fn set_clipboard_data(host_id: i32, data: &str) -> Result<(), String> {
                 }
             }
             Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
+                clear_jni_exception(env, "setClipboardData");
                 Err(format!("Failed to call setClipboardData: {e}"))
             }
         }
@@ -941,6 +818,8 @@ pub fn get_clipboard_data(host_id: i32) -> Result<String, String> {
 /// Used by camera, image, location, and any other API that takes options JSON and returns a JSON result.
 fn call_json_method(method_name: &str, host_id: i32, options_json: &str) -> Result<String, String> {
     with_env(|env| {
+        clear_jni_exception(env, method_name);
+
         let cache = JAVA_METHOD_CACHE
             .get()
             .ok_or("NativeExports class cache not initialized")?;
@@ -953,6 +832,7 @@ fn call_json_method(method_name: &str, host_id: i32, options_json: &str) -> Resu
             .new_string(options_json)
             .map_err(|e| format!("Failed to create Java string: {e}"))?;
 
+        let start = std::time::Instant::now();
         let result = unsafe {
             env.call_static_method_unchecked(
                 class,
@@ -966,6 +846,14 @@ fn call_json_method(method_name: &str, host_id: i32, options_json: &str) -> Resu
                 ],
             )
         };
+        let elapsed = start.elapsed();
+        if elapsed.as_secs() >= SLOW_JNI_CALL_SECS {
+            tracing::warn!(
+                "Slow JNI call '{}': {:.1}s (potential ANR risk)",
+                method_name,
+                elapsed.as_secs_f64()
+            );
+        }
 
         match result {
             Ok(val) => {
@@ -977,10 +865,7 @@ fn call_json_method(method_name: &str, host_id: i32, options_json: &str) -> Resu
                 Ok(json_str)
             }
             Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
+                clear_jni_exception(env, method_name);
                 Err(format!("Failed to call method '{method_name}': {e}"))
             }
         }
@@ -989,9 +874,7 @@ fn call_json_method(method_name: &str, host_id: i32, options_json: &str) -> Resu
 
 /// Create a camera instance.
 /// Calls Java: NativeExports.cameraCreate(hostId, optionsJson) -> String
-pub fn camera_create(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("cameraCreate", host_id, options_json)
-}
+jni_json!(camera_create, "cameraCreate");
 
 /// Destroy a camera instance.
 /// Calls Java: NativeExports.cameraDestroy(hostId, cameraId)
@@ -1009,29 +892,17 @@ pub fn camera_destroy(host_id: i32, camera_id: u32) -> Result<(), String> {
     )
 }
 
-/// Take a photo.
-/// Calls Java: NativeExports.cameraTakePhoto(hostId, optionsJson) -> String
-pub fn camera_take_photo(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("cameraTakePhoto", host_id, options_json)
-}
+/// Take a photo. Calls Java: NativeExports.cameraTakePhoto(hostId, optionsJson) -> String
+jni_json!(camera_take_photo, "cameraTakePhoto");
 
-/// Start video recording.
-/// Calls Java: NativeExports.cameraStartRecord(hostId, optionsJson) -> String
-pub fn camera_start_record(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("cameraStartRecord", host_id, options_json)
-}
+/// Start video recording. Calls Java: NativeExports.cameraStartRecord(hostId, optionsJson) -> String
+jni_json!(camera_start_record, "cameraStartRecord");
 
-/// Stop video recording.
-/// Calls Java: NativeExports.cameraStopRecord(hostId, optionsJson) -> String
-pub fn camera_stop_record(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("cameraStopRecord", host_id, options_json)
-}
+/// Stop video recording. Calls Java: NativeExports.cameraStopRecord(hostId, optionsJson) -> String
+jni_json!(camera_stop_record, "cameraStopRecord");
 
-/// Set camera zoom level.
-/// Calls Java: NativeExports.cameraSetZoom(hostId, optionsJson) -> String
-pub fn camera_set_zoom(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("cameraSetZoom", host_id, options_json)
-}
+/// Set camera zoom level. Calls Java: NativeExports.cameraSetZoom(hostId, optionsJson) -> String
+jni_json!(camera_set_zoom, "cameraSetZoom");
 
 /// Start listening for camera frame changes.
 /// Calls Java: NativeExports.cameraListenFrameChange(hostId, cameraId)
@@ -1084,64 +955,25 @@ fn call_bluetooth_json_no_args(method_name: &str, host_id: i32) -> Result<String
     )
 }
 
-pub fn bluetooth_open_adapter(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("bluetoothOpenAdapter", host_id, options_json)
-}
-
-pub fn bluetooth_close_adapter(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "bluetoothCloseAdapter",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+jni_void_json!(bluetooth_open_adapter, "bluetoothOpenAdapter");
+jni_void!(bluetooth_close_adapter, "bluetoothCloseAdapter");
 
 pub fn bluetooth_get_adapter_state(host_id: i32) -> Result<String, String> {
     call_bluetooth_json_no_args("bluetoothGetAdapterState", host_id)
 }
 
-pub fn bluetooth_start_devices_discovery(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("bluetoothStartDevicesDiscovery", host_id, options_json)
-}
-
-pub fn bluetooth_stop_devices_discovery(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "bluetoothStopDevicesDiscovery",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+jni_void_json!(bluetooth_start_devices_discovery, "bluetoothStartDevicesDiscovery");
+jni_void!(bluetooth_stop_devices_discovery, "bluetoothStopDevicesDiscovery");
 
 pub fn bluetooth_get_devices(host_id: i32) -> Result<String, String> {
     call_bluetooth_json_no_args("bluetoothGetDevices", host_id)
 }
 
-pub fn bluetooth_get_connected_devices(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("bluetoothGetConnectedDevices", host_id, options_json)
-}
-
-pub fn bluetooth_make_pair(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("bluetoothMakePair", host_id, options_json)
-}
-
-pub fn bluetooth_is_device_paired(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("bluetoothIsDevicePaired", host_id, options_json)
-}
-
-pub fn bluetooth_start_beacon_discovery(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("bluetoothStartBeaconDiscovery", host_id, options_json)
-}
-
-pub fn bluetooth_stop_beacon_discovery(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "bluetoothStopBeaconDiscovery",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+jni_json!(bluetooth_get_connected_devices, "bluetoothGetConnectedDevices");
+jni_void_json!(bluetooth_make_pair, "bluetoothMakePair");
+jni_void_json!(bluetooth_is_device_paired, "bluetoothIsDevicePaired");
+jni_void_json!(bluetooth_start_beacon_discovery, "bluetoothStartBeaconDiscovery");
+jni_void!(bluetooth_stop_beacon_discovery, "bluetoothStopBeaconDiscovery");
 
 pub fn bluetooth_get_beacons(host_id: i32) -> Result<String, String> {
     call_bluetooth_json_no_args("bluetoothGetBeacons", host_id)
@@ -1149,173 +981,73 @@ pub fn bluetooth_get_beacons(host_id: i32) -> Result<String, String> {
 
 // ---- BLE GATT ----
 
-pub fn ble_create_connection(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("bleCreateConnection", host_id, options_json)
-}
-
-pub fn ble_close_connection(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("bleCloseConnection", host_id, options_json)
-}
-
-pub fn ble_get_device_services(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("bleGetDeviceServices", host_id, options_json)
-}
-
-pub fn ble_get_device_characteristics(
-    host_id: i32,
-    options_json: &str,
-) -> Result<String, String> {
-    call_json_method("bleGetDeviceCharacteristics", host_id, options_json)
-}
-
-pub fn ble_read_characteristic_value(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("bleReadCharacteristicValue", host_id, options_json)
-}
-
-pub fn ble_write_characteristic_value(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("bleWriteCharacteristicValue", host_id, options_json)
-}
-
-pub fn ble_notify_characteristic_value_change(
-    host_id: i32,
-    options_json: &str,
-) -> Result<(), String> {
-    call_void_with_string("bleNotifyCharacteristicValueChange", host_id, options_json)
-}
-
-pub fn ble_get_device_rssi(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("bleGetDeviceRSSI", host_id, options_json)
-}
-
-pub fn ble_set_mtu(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("bleSetMTU", host_id, options_json)
-}
-
-pub fn ble_get_mtu(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("bleGetMTU", host_id, options_json)
-}
+jni_void_json!(ble_create_connection, "bleCreateConnection");
+jni_void_json!(ble_close_connection, "bleCloseConnection");
+jni_json!(ble_get_device_services, "bleGetDeviceServices");
+jni_json!(ble_get_device_characteristics, "bleGetDeviceCharacteristics");
+jni_void_json!(ble_read_characteristic_value, "bleReadCharacteristicValue");
+jni_void_json!(ble_write_characteristic_value, "bleWriteCharacteristicValue");
+jni_void_json!(ble_notify_characteristic_value_change, "bleNotifyCharacteristicValueChange");
+jni_json!(ble_get_device_rssi, "bleGetDeviceRSSI");
+jni_void_json!(ble_set_mtu, "bleSetMTU");
+jni_json!(ble_get_mtu, "bleGetMTU");
 
 // ==================== Image API ====================
 
-pub fn image_save_to_photos_album(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("imageSaveToPhotosAlbum", host_id, options_json)
-}
-
-pub fn image_preview_media(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("imagePreviewMedia", host_id, options_json)
-}
-
-pub fn image_preview_image(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("imagePreviewImage", host_id, options_json)
-}
-
-pub fn image_compress(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("imageCompress", host_id, options_json)
-}
-
-pub fn image_choose_message_file(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("imageChooseMessageFile", host_id, options_json)
-}
-
-pub fn image_choose_image(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("imageChooseImage", host_id, options_json)
-}
+jni_void_json!(image_save_to_photos_album, "imageSaveToPhotosAlbum");
+jni_void_json!(image_preview_media, "imagePreviewMedia");
+jni_void_json!(image_preview_image, "imagePreviewImage");
+jni_void_json!(image_compress, "imageCompress");
+jni_void_json!(image_choose_message_file, "imageChooseMessageFile");
+jni_void_json!(image_choose_image, "imageChooseImage");
 
 // ==================== Subpackage ====================
 
-pub fn subpackage_download(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("subpackageDownload", host_id, options_json)
-}
+jni_void_json!(subpackage_download, "subpackageDownload");
 
 // ==================== Keyboard ====================
 
-pub fn keyboard_show(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("keyboardShow", host_id, options_json)
-}
-
-pub fn keyboard_hide(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "keyboardHide",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
-
-pub fn keyboard_update(host_id: i32, value: &str) -> Result<(), String> {
-    call_void_with_string("keyboardUpdate", host_id, value)
-}
+jni_void_json!(keyboard_show, "keyboardShow");
+jni_void!(keyboard_hide, "keyboardHide");
+jni_void_json!(keyboard_update, "keyboardUpdate");
 
 // ==================== Location ====================
 
-pub fn get_location(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("getLocation", host_id, options_json)
-}
-
-pub fn get_fuzzy_location(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("getFuzzyLocation", host_id, options_json)
-}
+jni_void_json!(get_location, "getLocation");
+jni_void_json!(get_fuzzy_location, "getFuzzyLocation");
 
 // ==================== Scan Code ====================
 
-pub fn scan_code(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("scanCode", host_id, options_json)
-}
+jni_void_json!(scan_code, "scanCode");
 
 // ==================== Game Log ====================
 
-pub fn game_log_report(host_id: i32, log_json: &str) -> Result<(), String> {
-    call_void_with_string("gameLogReport", host_id, log_json)
-}
+jni_void_json!(game_log_report, "gameLogReport");
 
 // ==================== Auth ====================
 
-pub fn auth_login(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("authLogin", host_id, options_json)
-}
-
-pub fn auth_check_session(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("authCheckSession", host_id, options_json)
-}
-
-pub fn auth_get_user_info(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("authGetUserInfo", host_id, options_json)
-}
-
-pub fn auth_get_phone_number(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("authGetPhoneNumber", host_id, options_json)
-}
+jni_void_json!(auth_login, "authLogin");
+jni_void_json!(auth_check_session, "authCheckSession");
+jni_void_json!(auth_get_user_info, "authGetUserInfo");
+jni_void_json!(auth_get_phone_number, "authGetPhoneNumber");
 
 // ==================== Lifecycle Notification ====================
 
 /// Notify the Java layer that the game module has been loaded and is ready.
-///
-/// Calls `NativeExports.onGameReady(hostId)` so Java can measure startup time
-/// and notify the host app.
-pub fn notify_game_ready(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "onGameReady",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+/// Calls `NativeExports.onGameReady(hostId)` so Java can measure startup time.
+jni_void!(notify_game_ready, "onGameReady");
 
 // ==================== Error Notification ====================
 
 /// Notify the Java layer that the host is exiting normally.
-///
 /// Calls `NativeExports.onExit(hostId)` so Java can finish the Activity.
-/// Used when JS calls `exitMiniProgram()` — Java didn't initiate the
-/// shutdown and needs to be told.
-pub fn notify_exit(host_id: i32) -> Result<(), String> {
-    call_static_method(
-        "onExit",
-        ReturnType::Primitive(Primitive::Void),
-        |_env, _| Ok(()),
-        &[jvalue { i: host_id }],
-    )
-}
+/// Used when JS calls `exitMiniProgram()`.
+jni_void!(notify_exit, "onExit");
+
+/// Deliver a JS-to-host message to the Java layer.
+/// Calls `NativeExports.onHostMessage(hostId, json)` where `json` is a
+/// `{"type":"...","payload":"..."}` envelope built by the `op_send_to_host` op.
+jni_void_json!(notify_host_message, "onHostMessage");
 
 /// Notify the Java layer about a fatal engine error.
 ///
@@ -1339,9 +1071,7 @@ pub fn notify_error(
         // Defensively clear any pre-existing JNI exception state so that
         // string creation below doesn't fail due to a stale exception from
         // a prior JNI call (e.g., during OOM or crash paths).
-        if env.exception_check().unwrap_or(false) {
-            env.exception_clear().ok();
-        }
+        clear_jni_exception(env, "notify_error (pre-call)");
 
         let cache = JAVA_METHOD_CACHE
             .get()
@@ -1386,10 +1116,7 @@ pub fn notify_error(
         match result {
             Ok(_) => Ok(()),
             Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
+                clear_jni_exception(env, "onError");
                 Err(format!("Failed to call onError: {e}"))
             }
         }
@@ -1414,17 +1141,13 @@ pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError
         let class = cache.class();
 
         // Clear any stale pending exception before JNI allocation.
-        if env.exception_check().unwrap_or(false) {
-            env.exception_clear().ok();
-        }
+        clear_jni_exception(env, "decode_image_rgba_jni (pre-call)");
 
         let j_data = env.byte_array_from_slice(data).map_err(|e| {
             // byte_array_from_slice calls NewByteArray which can throw
             // OutOfMemoryError.  Clear it so ART doesn't abort on the
             // next JNI call.
-            if env.exception_check().unwrap_or(false) {
-                env.exception_clear().ok();
-            }
+            clear_jni_exception(env, "decode_image_rgba_jni (byte_array_from_slice)");
             format!("Failed to create byte array ({}B): {e}", data.len())
         })?;
 
@@ -1476,10 +1199,7 @@ pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError
                 })
             }
             Err(e) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_describe().ok();
-                    env.exception_clear().ok();
-                }
+                clear_jni_exception(env, "decodeImageRgba");
                 Err(format!("BitmapFactory JNI call failed: {e}"))
             }
         }
@@ -1490,45 +1210,26 @@ pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError
 
 // ==================== Setting ====================
 
-pub fn open_setting(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("openSetting", host_id, options_json)
-}
+jni_void_json!(open_setting, "openSetting");
 
 // ==================== Share ====================
 
-pub fn share_app_message(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("shareAppMessage", host_id, options_json)
-}
+jni_void_json!(share_app_message, "shareAppMessage");
 
 // ==================== Navigate ====================
 
-pub fn navigate_to_mini_program(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("navigateToMiniProgram", host_id, options_json)
-}
-
-pub fn open_customer_service_conversation(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("openCustomerServiceConversation", host_id, options_json)
-}
+jni_void_json!(navigate_to_mini_program, "navigateToMiniProgram");
+jni_void_json!(open_customer_service_conversation, "openCustomerServiceConversation");
 
 // ==================== Payment ====================
 
-pub fn check_is_support_midas_payment(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("checkIsSupportMidasPayment", host_id, options_json)
-}
-
-pub fn request_midas_payment(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("requestMidasPayment", host_id, options_json)
-}
-
-pub fn request_midas_payment_game_item(host_id: i32, options_json: &str) -> Result<(), String> {
-    call_void_with_string("requestMidasPaymentGameItem", host_id, options_json)
-}
+jni_json!(check_is_support_midas_payment, "checkIsSupportMidasPayment");
+jni_void_json!(request_midas_payment, "requestMidasPayment");
+jni_void_json!(request_midas_payment_game_item, "requestMidasPaymentGameItem");
 
 // ==================== Video ====================
 
-pub fn video_create(host_id: i32, options_json: &str) -> Result<String, String> {
-    call_json_method("videoCreate", host_id, options_json)
-}
+jni_json!(video_create, "videoCreate");
 
 pub fn video_play(host_id: i32, video_id: u32) -> Result<(), String> {
     call_void_with_int("videoPlay", host_id, video_id as i32)

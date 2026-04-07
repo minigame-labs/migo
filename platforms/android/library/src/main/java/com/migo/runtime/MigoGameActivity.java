@@ -49,13 +49,12 @@ import java.util.concurrent.ConcurrentHashMap;
  *         return new GameSessionListener() {
  *             @Override public void onGameReady() { ... }
  *             @Override public void onGameExit(int code) { finish(); }
- *             @Override public void onError(int code, String msg, boolean recoverable) { ... }
+ *             @Override public void onError(MigoException ex) { ... }
  *         };
  *     }
  * }
  * }</pre>
  *
- * @since 2.0.0
  */
 public class MigoGameActivity extends Activity
         implements SurfaceHolder.Callback, ComponentCallbacks2 {
@@ -70,6 +69,8 @@ public class MigoGameActivity extends Activity
     public static final String EXTRA_CONFIG_TOKEN = "migo_config_token";
 
     private static final ConcurrentHashMap<String, RuntimeConfig> sPendingConfigs =
+            new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Long> sPendingConfigTimes =
             new ConcurrentHashMap<>();
 
     private GameSession session;
@@ -128,8 +129,19 @@ public class MigoGameActivity extends Activity
         intent.putExtra(EXTRA_ENTRY_POINT, entryPoint);
 
         if (config != null) {
+            // Clean up stale config tokens older than 30 seconds (e.g. Activity never started)
+            long now = System.currentTimeMillis();
+            sPendingConfigTimes.entrySet().removeIf(e -> {
+                if (now - e.getValue() > 30_000) {
+                    sPendingConfigs.remove(e.getKey());
+                    return true;
+                }
+                return false;
+            });
+
             String token = UUID.randomUUID().toString();
             sPendingConfigs.put(token, config);
+            sPendingConfigTimes.put(token, now);
             intent.putExtra(EXTRA_CONFIG_TOKEN, token);
         }
 
@@ -147,6 +159,7 @@ public class MigoGameActivity extends Activity
         if (token == null || token.isEmpty()) {
             return null;
         }
+        sPendingConfigTimes.remove(token);
         return sPendingConfigs.remove(token);
     }
 
@@ -159,7 +172,7 @@ public class MigoGameActivity extends Activity
         gameId = getIntent().getStringExtra(EXTRA_GAME_ID);
         entryPoint = getIntent().getStringExtra(EXTRA_ENTRY_POINT);
         if (gameId == null || entryPoint == null) {
-            finish();
+            onLaunchFailed(ErrorCode.ERR_INVALID_GAME_ID, "Missing gameId or entryPoint");
             return;
         }
         if (config == null) {
@@ -169,7 +182,7 @@ public class MigoGameActivity extends Activity
         // Check runtime support
         MigoRuntime runtime = MigoRuntime.getInstance();
         if (!runtime.isDeviceSupported()) {
-            finish();
+            onLaunchFailed(ErrorCode.ERR_NOT_SUPPORTED, "Device not supported");
             return;
         }
 
@@ -311,6 +324,18 @@ public class MigoGameActivity extends Activity
     // ==================== Hooks for subclasses ====================
 
     /**
+     * Called when game launch fails. Override to show an error UI or report the failure.
+     * Default implementation logs and finishes the activity.
+     *
+     * @param errorCode error code from {@link ErrorCode}
+     * @param message   human-readable error description
+     */
+    protected void onLaunchFailed(int errorCode, String message) {
+        Log.e(TAG, "Launch failed: [" + errorCode + "] " + message);
+        finish();
+    }
+
+    /**
      * Override to provide a custom game session listener.
      * <p>
      * Called during game initialization. Return null for no listener.
@@ -349,7 +374,7 @@ public class MigoGameActivity extends Activity
 
         if (result.isFailure()) {
             Log.e(TAG, "initializeGame failed: code=" + result.getErrorCode() + ", msg=" + result.getErrorMessage());
-            finish();
+            onLaunchFailed(result.getErrorCode(), result.getErrorMessage());
             return;
         }
 
@@ -363,7 +388,7 @@ public class MigoGameActivity extends Activity
             onSessionCreated(session);
         } catch (Throwable t) {
             Log.e(TAG, "onSessionCreated failed", t);
-            finish();
+            onLaunchFailed(ErrorCode.ERR_INIT_FAILED, "onSessionCreated threw: " + t.getMessage());
             return;
         }
 
@@ -377,7 +402,7 @@ public class MigoGameActivity extends Activity
         int startResult = session.startGameSafe(entryPoint);
         Log.i(TAG, "startGameSafe result=" + startResult);
         if (startResult != ErrorCode.SUCCESS) {
-            finish();
+            onLaunchFailed(startResult, ErrorCode.getMessage(startResult));
         }
     }
 

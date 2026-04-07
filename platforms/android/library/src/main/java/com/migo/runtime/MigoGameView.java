@@ -15,8 +15,10 @@ import android.view.ViewGroup;
 import android.widget.FrameLayout;
 
 import com.migo.runtime.ErrorCode;
+import com.migo.runtime.MigoException;
 import com.migo.runtime.callback.GameSessionListener;
 import com.migo.runtime.internal.NativeMethods;
+import com.migo.runtime.internal.ThreadCheck;
 import com.migo.runtime.internal.platform.DisplayCompat;
 import com.migo.runtime.internal.platform.OrientationWaitHelper;
 
@@ -44,7 +46,6 @@ import com.migo.runtime.internal.platform.OrientationWaitHelper;
  * gameView.loadGame("my-game", "game.js");
  * }</pre>
  *
- * @since 2.0.0
  */
 public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback {
 
@@ -195,6 +196,7 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
 
     @Override
     protected void onAttachedToWindow() {
+        ThreadCheck.ensureMainThread();
         super.onAttachedToWindow();
         boundActivity = findActivity(getContext());
         if (boundActivity != null) {
@@ -204,6 +206,7 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
 
     @Override
     protected void onDetachedFromWindow() {
+        ThreadCheck.ensureMainThread();
         unregisterLifecycleCallbacks();
         orientationHelper.cancel();
         destroySession();
@@ -416,7 +419,7 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
     private void notifySessionError(int errorCode, String message, boolean recoverable) {
         Log.e(TAG, "session error: code=" + errorCode + ", message=" + message);
         if (gameListener != null) {
-            gameListener.onError(errorCode, message, recoverable);
+            gameListener.onError(new MigoException(errorCode, message, null, recoverable));
         }
     }
 

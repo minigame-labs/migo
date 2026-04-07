@@ -157,6 +157,13 @@ pub enum RenderCommand {
     SurfaceDestroyed,
 }
 
+// Guard against future regressions — if a new variant re-inflates the enum,
+// this assertion will fail at compile time.
+const _: () = assert!(
+    core::mem::size_of::<RenderCommand>() <= 128,
+    "RenderCommand grew past 128 bytes; check for unboxed large variants"
+);
+
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum CanvasCmd {

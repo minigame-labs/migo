@@ -14,7 +14,6 @@ import java.util.regex.Pattern;
  *   <li>{@code /tmp} → Temporary files - cleared on session end</li>
  * </ul>
  *
- * @since 1.0.0
  */
 public final class GamePaths {
 

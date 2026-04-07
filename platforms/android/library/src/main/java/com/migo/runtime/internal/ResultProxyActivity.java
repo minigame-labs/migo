@@ -25,7 +25,11 @@ public class ResultProxyActivity extends Activity {
 
     private static final ConcurrentHashMap<Integer, PendingRequest> sPendingRequests =
             new ConcurrentHashMap<>();
-    private static final AtomicInteger sRequestCodeCounter = new AtomicInteger(10000);
+    private static final AtomicInteger sNextRequestCode = new AtomicInteger(0);
+
+    private static int nextRequestCode() {
+        return 10000 + (sNextRequestCode.getAndIncrement() % 55000);
+    }
 
     private int assignedRequestCode = -1;
     private boolean launched = false;
@@ -34,6 +38,7 @@ public class ResultProxyActivity extends Activity {
         final Intent intent;
         final int requestCode;
         final ResultCallback callback;
+        final long createdAt = System.currentTimeMillis();
 
         PendingRequest(Intent intent, int requestCode, ResultCallback callback) {
             this.intent = intent;
@@ -53,7 +58,11 @@ public class ResultProxyActivity extends Activity {
      */
     public static void launch(Context context, Intent targetIntent, int requestCode,
                               ResultCallback callback) {
-        int uniqueCode = sRequestCodeCounter.getAndIncrement();
+        // Clean up stale requests older than 60 seconds
+        long now = System.currentTimeMillis();
+        sPendingRequests.entrySet().removeIf(e -> now - e.getValue().createdAt > 60_000);
+
+        int uniqueCode = nextRequestCode();
         sPendingRequests.put(uniqueCode, new PendingRequest(targetIntent, requestCode, callback));
         Intent proxy = new Intent(context, ResultProxyActivity.class);
         proxy.putExtra("_proxy_request_code", uniqueCode);
@@ -100,11 +109,12 @@ public class ResultProxyActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        // If destroyed without receiving a result (e.g. user pressed back on this activity
-        // before the target launched), clean up pending state
-        if (!isFinishing() || !launched) {
-            if (assignedRequestCode >= 0) {
-                sPendingRequests.remove(assignedRequestCode);
+        // If destroyed without receiving a result (e.g. target Activity crashed, user pressed
+        // back before the target launched), deliver a cancellation result and clean up
+        if (assignedRequestCode >= 0) {
+            PendingRequest req = sPendingRequests.remove(assignedRequestCode);
+            if (req != null && req.callback != null) {
+                req.callback.onResult(req.requestCode, Activity.RESULT_CANCELED, null);
             }
         }
     }

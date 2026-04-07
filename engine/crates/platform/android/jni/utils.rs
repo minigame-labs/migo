@@ -25,7 +25,7 @@ pub(crate) fn get_optional_string_field(
     let s = env
         .get_string(&jstr)
         .ok()
-        .map(|s| s.to_string_lossy().into_owned())?;
+        .map(|s| s.into())?;
     if s.is_empty() { None } else { Some(s) }
 }
 
@@ -54,7 +54,7 @@ pub(crate) fn get_string_field(
 
     env.get_string(&jstr)
         .map_err(|e| format!("Failed to convert '{field_name}' to Rust String: {e}"))
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(|s| s.into())
 }
 
 pub(crate) fn get_f32(env: &mut JNIEnv, field_name: &str, obj: &JObject) -> Result<f32, String> {

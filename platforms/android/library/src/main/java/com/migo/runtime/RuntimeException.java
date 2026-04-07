@@ -16,7 +16,6 @@ package com.migo.runtime;
  * }
  * }</pre>
  *
- * @since 1.0.0
  */
 public class RuntimeException extends java.lang.RuntimeException {
 

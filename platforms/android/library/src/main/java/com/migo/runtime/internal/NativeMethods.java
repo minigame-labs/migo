@@ -715,6 +715,37 @@ public final class NativeMethods {
         }
     }
 
+    // ==================== ADPF Thermal ====================
+
+    /**
+     * Notify that the device thermal status has changed (ADPF, API 29+).
+     *
+     * @param sessionId The session ID
+     * @param status    Thermal status level: 0=none, 1=light, 2=moderate,
+     *                  3=severe, 4=critical, 5=emergency, 6=shutdown
+     */
+    public static void onThermalStatusChanged(int sessionId, int status) {
+        if (sessionId >= 0) {
+            NativeBridge.onThermalStatusChanged(sessionId, status);
+        }
+    }
+
+    // ==================== Display Configuration ====================
+
+    /**
+     * Notify the native render thread of the display refresh period.
+     * Should be called once at session start and when the display refresh rate changes.
+     *
+     * @param sessionId          The session ID
+     * @param refreshPeriodNanos Display refresh period in nanoseconds
+     *                           (e.g., 16666667 for 60Hz, 8333333 for 120Hz)
+     */
+    public static void setDisplayRefreshRate(int sessionId, long refreshPeriodNanos) {
+        if (sessionId >= 0) {
+            NativeBridge.setDisplayRefreshRate(sessionId, refreshPeriodNanos);
+        }
+    }
+
     // ==================== Keyboard Callbacks ====================
 
     /**
@@ -1042,6 +1073,22 @@ public final class NativeMethods {
     public static void onMidasPaymentGameItemResult(int sessionId, String resultJson) {
         if (sessionId >= 0 && resultJson != null) {
             NativeBridge.onMidasPaymentGameItemResult(sessionId, resultJson);
+        }
+    }
+
+    // ==================== Script Execution ====================
+
+    /**
+     * Execute a JavaScript snippet in the game's V8 runtime.
+     * <p>
+     * The script is evaluated asynchronously on the host thread.
+     *
+     * @param sessionId The session ID
+     * @param script    JavaScript source code to evaluate
+     */
+    public static void executeScript(int sessionId, String script) {
+        if (sessionId >= 0 && script != null && !script.isEmpty()) {
+            NativeBridge.executeScript(sessionId, script);
         }
     }
 }

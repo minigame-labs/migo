@@ -32,9 +32,11 @@ import java.nio.ByteOrder;
  * Uses a separate {@link WindowManager} panel so it is always rendered above
  * the game SurfaceView, regardless of Z-order or elevation.
  *
- * @since 1.0.0
  */
 public class DebugOverlayView extends LinearLayout {
+
+    private static final int STATS_MAGIC      = 0x4D47; // 'M' 'G'
+    private static final int STATS_HEADER_LEN = 4;      // 2 magic + 2 version
 
     private static final int BG_COLOR      = 0xCC1B1B1B; // 80% dark
     private static final int TEXT_COLOR     = 0xFFE0E0E0; // Grey 300
@@ -141,6 +143,8 @@ public class DebugOverlayView extends LinearLayout {
     public void detachFromWindow() {
         if (!attached) return;
         attached = false;
+        stopMonitoring();
+        handler.removeCallbacksAndMessages(null);
         try {
             wm.removeViewImmediate(this);
         } catch (Exception ignored) {
@@ -258,25 +262,31 @@ public class DebugOverlayView extends LinearLayout {
 
     private void refreshStats() {
         byte[] data = NativeBridge.getDebugStats(sessionId);
-        if (data == null || data.length < 12) return;
+        if (data == null || data.length < STATS_HEADER_LEN + 12) return;
 
         ByteBuffer buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
-        int fpsX10      = buf.getInt(0);
-        int frameTimeUs = buf.getInt(4);
-        int dropped     = buf.getInt(8);
-        int fatalError  = data.length >= 16 ? buf.getInt(12) : 0;
-        int firstFrameMs = data.length >= 20 ? buf.getInt(16) : 0;
-        int cmdDrops     = data.length >= 24 ? buf.getInt(20) : 0;
-        int rafLatencyUs = data.length >= 28 ? buf.getInt(24) : 0;
-        int swapBlockUs = data.length >= 32 ? buf.getInt(28) : 0;
-        int uploadQueueDepth = data.length >= 36 ? buf.getInt(32) : 0;
-        int glyphAtlasMiss = data.length >= 40 ? buf.getInt(36) : 0;
-        // Render optimization metrics (appended at byte 40+).
-        int partialDamageFrames = data.length >= 44 ? buf.getInt(40) : 0;
-        int fullSurfaceFrames   = data.length >= 48 ? buf.getInt(44) : 0;
-        int damageAreaKpx       = data.length >= 52 ? buf.getInt(48) : 0;
-        int uploadFrameReject   = data.length >= 56 ? buf.getInt(52) : 0;
-        int droppedUploadRecov  = data.length >= 60 ? buf.getInt(56) : 0;
+
+        // Validate magic header to detect Rust/Java protocol mismatch.
+        int magic = buf.getShort(0) & 0xFFFF;
+        if (magic != STATS_MAGIC) return;
+
+        int h = STATS_HEADER_LEN; // payload starts at byte 4
+        int fpsX10      = buf.getInt(h + 0);
+        int frameTimeUs = buf.getInt(h + 4);
+        int dropped     = buf.getInt(h + 8);
+        int fatalError  = data.length >= h + 16 ? buf.getInt(h + 12) : 0;
+        int firstFrameMs = data.length >= h + 20 ? buf.getInt(h + 16) : 0;
+        int cmdDrops     = data.length >= h + 24 ? buf.getInt(h + 20) : 0;
+        int rafLatencyUs = data.length >= h + 28 ? buf.getInt(h + 24) : 0;
+        int swapBlockUs = data.length >= h + 32 ? buf.getInt(h + 28) : 0;
+        int uploadQueueDepth = data.length >= h + 36 ? buf.getInt(h + 32) : 0;
+        int glyphAtlasMiss = data.length >= h + 40 ? buf.getInt(h + 36) : 0;
+        // Render optimization metrics (appended at payload byte 40+).
+        int partialDamageFrames = data.length >= h + 44 ? buf.getInt(h + 40) : 0;
+        int fullSurfaceFrames   = data.length >= h + 48 ? buf.getInt(h + 44) : 0;
+        int damageAreaKpx       = data.length >= h + 52 ? buf.getInt(h + 48) : 0;
+        int uploadFrameReject   = data.length >= h + 56 ? buf.getInt(h + 52) : 0;
+        int droppedUploadRecov  = data.length >= h + 60 ? buf.getInt(h + 56) : 0;
 
         float fps     = (fpsX10 & 0xFFFFFFFFL) / 10f;
         float frameMs = (frameTimeUs & 0xFFFFFFFFL) / 1000f;

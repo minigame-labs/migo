@@ -61,4 +61,17 @@ pub trait PlatformServices: Send + Sync {
     fn notify_error(&self, _host_id: i32, _error_code: u16, _message: &str, _detail: &str) {
         // Default: no-op. Override on platforms with JNI / native callbacks.
     }
+
+    /// Deliver a JS-to-host message to the host application.
+    ///
+    /// Called when game JS calls `migo.sendToHost(type, payload)`.
+    /// `json` is a `{"type":"...","payload":"..."}` envelope.
+    ///
+    /// On Android, this calls `NativeExports.onHostMessage(hostId, json)` via JNI,
+    /// which dispatches to the `GameSession.MessageHandler` on the main thread.
+    ///
+    /// Default implementation is a no-op.
+    fn notify_host_message(&self, _host_id: i32, _json: &str) {
+        // Default: no-op.
+    }
 }

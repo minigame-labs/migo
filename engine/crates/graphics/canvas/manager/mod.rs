@@ -92,6 +92,11 @@ pub(crate) struct CanvasManager {
     /// Used when creating shared contexts (offscreen canvas, upload thread).
     gles_major: u32,
 
+    /// Preserved EGL context from the last destroyed onscreen canvas.
+    /// Reused on the next `create_onscreen()` to avoid losing GL state
+    /// (textures, shaders, buffers) across Android surface destroy/recreate cycles.
+    preserved_ctx: Option<egl::Context>,
+
     /// Set to true when a game reads pixels from the onscreen default framebuffer
     /// (readPixels on canvas_id=1 with default FBO bound). Once set, DrawingBuffer
     /// bypass is permanently disabled so the DrawingBuffer preserves content across
@@ -270,6 +275,7 @@ impl CanvasManager {
             gl_state: HashMap::with_capacity(4),
             device_caps,
             gles_major,
+            preserved_ctx: None,
             needs_default_fbo_readback: false,
             upload_server,
             upload_thread,
@@ -408,20 +414,24 @@ impl CanvasManager {
         let surf = egl_ops::create_window_surface(&self.egl, self.display, self.config, window)?;
 
         let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION as i32, self.gles_major as i32, egl::NONE as i32];
-        let ctx = self
-            .egl
-            .create_context(
-                self.display,
-                self.config,
-                Some(self.resource.ctx),
-                &ctx_attribs,
-            )
-            .map_err(|e| {
-                ee(
-                    ErrorCode::RenderBackendError,
-                    format!("eglCreateContext(onscreen) failed: {e:?}"),
+        let ctx = if let Some(preserved) = self.preserved_ctx.take() {
+            tracing::info!("Reusing preserved EGL context for onscreen canvas {id}");
+            preserved
+        } else {
+            self.egl
+                .create_context(
+                    self.display,
+                    self.config,
+                    Some(self.resource.ctx),
+                    &ctx_attribs,
                 )
-            })?;
+                .map_err(|e| {
+                    ee(
+                        ErrorCode::RenderBackendError,
+                        format!("eglCreateContext(onscreen) failed: {e:?}"),
+                    )
+                })?
+        };
 
         // Query EGL for diagnostics only. Some Android stacks report a rotated
         // size here (e.g. 1080x2340 while the Java SurfaceHolder reports
@@ -554,7 +564,14 @@ impl CanvasManager {
             self.image_registry.remove_canvas_images(id);
 
             let _ = self.egl.destroy_surface(self.display, entry.ctx.surf);
-            let _ = self.egl.destroy_context(self.display, entry.ctx.ctx);
+            // Preserve the context for reuse on the next create_onscreen().
+            // This avoids losing GL state (textures, shaders) across
+            // Android surface destroy/recreate cycles (pause/resume).
+            if let Some(old_ctx) = self.preserved_ctx.replace(entry.ctx.ctx) {
+                // If there was already a preserved context (shouldn't happen normally),
+                // destroy the older one to avoid leaking.
+                let _ = self.egl.destroy_context(self.display, old_ctx);
+            }
 
             self.bound = BoundContext::Resource;
             self.last_swap_interval = -1;
@@ -1732,6 +1749,14 @@ impl CanvasManager {
             ErrorCode::InvalidOperation,
             format!("{what} belongs to another WebGL context (owner={owner:?}, canvas={canvas:?})"),
         ))
+    }
+}
+
+impl Drop for CanvasManager {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.preserved_ctx.take() {
+            let _ = self.egl.destroy_context(self.display, ctx);
+        }
     }
 }
 

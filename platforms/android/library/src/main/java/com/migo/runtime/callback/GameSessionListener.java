@@ -1,6 +1,6 @@
 package com.migo.runtime.callback;
 
-import com.migo.runtime.ErrorCode;
+import com.migo.runtime.MigoException;
 
 /**
  * Unified listener for game session events.
@@ -12,7 +12,7 @@ import com.migo.runtime.ErrorCode;
  * <ul>
  *   <li>{@link #onGameReady()} — game finished loading</li>
  *   <li>{@link #onGameExit(int)} — game exited</li>
- *   <li>{@link #onError(int, String, boolean)} — runtime error</li>
+ *   <li>{@link #onError(MigoException)} — runtime error</li>
  * </ul>
  * <p>
  * All other methods have default (no-op) implementations and are optional.
@@ -30,9 +30,9 @@ import com.migo.runtime.ErrorCode;
  *     }
  *
  *     @Override
- *     public void onError(int errorCode, String message, boolean recoverable) {
- *         if (!recoverable) {
- *             showErrorDialog(message);
+ *     public void onError(MigoException exception) {
+ *         if (!exception.isRecoverable()) {
+ *             showErrorDialog(exception.getMessage());
  *         }
  *     }
  * });
@@ -40,7 +40,6 @@ import com.migo.runtime.ErrorCode;
  *
  * All callbacks are invoked on the main thread.
  *
- * @since 2.0.0
  */
 public interface GameSessionListener {
 
@@ -59,13 +58,12 @@ public interface GameSessionListener {
     void onGameExit(int exitCode);
 
     /**
-     * Called when a runtime error occurs.
+     * Called when the game session encounters an error.
+     * Called on the main thread.
      *
-     * @param errorCode   Error code from {@link ErrorCode}
-     * @param message     Human-readable error message
-     * @param recoverable true if the runtime can continue after this error
+     * @param exception structured error with code, message, cause, and recoverability
      */
-    void onError(int errorCode, String message, boolean recoverable);
+    void onError(MigoException exception);
 
     // ==================== Loading (optional) ====================
 

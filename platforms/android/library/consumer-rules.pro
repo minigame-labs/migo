@@ -87,10 +87,15 @@
 -keep public class com.migo.runtime.GameSession { public *; }
 -keep public class com.migo.runtime.ErrorCode { public *; }
 -keep public class com.migo.runtime.RuntimeException { public *; }
+-keep public class com.migo.runtime.MigoException { *; }
 -keep public class com.migo.runtime.RuntimeConfig$Builder { public *; }
 
 # Keep callback interface
 -keep interface com.migo.runtime.callback.GameSessionListener { *; }
+
+# Keep new public lifecycle API
+-keep public class com.migo.runtime.SessionState { *; }
+-keep public interface com.migo.runtime.OnStateChangeListener { *; }
 
 # Keep new public API classes
 -keep public class com.migo.runtime.MigoGameView { public *; }
@@ -98,3 +103,6 @@
 
 # Keep ResultProxyActivity - started via Intent
 -keep class com.migo.runtime.internal.ResultProxyActivity { *; }
+
+# Keep PerformanceSnapshot - public API for performance monitoring
+-keep public class com.migo.runtime.PerformanceSnapshot { *; }

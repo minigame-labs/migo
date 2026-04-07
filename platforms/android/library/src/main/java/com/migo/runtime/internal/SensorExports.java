@@ -1,0 +1,145 @@
+package com.migo.runtime.internal;
+
+import android.app.Activity;
+import android.content.Context;
+
+import com.migo.runtime.internal.platform.DeviceSensorManager;
+import com.migo.runtime.internal.platform.ScreenCaptureObserver;
+
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Domain class for per-session sensor and screen capture manager delegation.
+ *
+ * @hide
+ */
+public final class SensorExports {
+
+    private SensorExports() {}
+
+    private static final Object sSensorLock = new Object();
+    private static final Object sCaptureLock = new Object();
+
+    private static final ConcurrentHashMap<Integer, DeviceSensorManager> sSensorManagers =
+            new ConcurrentHashMap<>();
+
+    private static final ConcurrentHashMap<Integer, ScreenCaptureObserver> sCaptureObservers =
+            new ConcurrentHashMap<>();
+
+    private static DeviceSensorManager getOrCreateSensorManager(int sessionId) {
+        DeviceSensorManager existing = sSensorManagers.get(sessionId);
+        if (existing != null) return existing;
+        synchronized (sSensorLock) {
+            existing = sSensorManagers.get(sessionId);
+            if (existing != null) return existing;
+            RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+            if (ctx == null) return null;
+            Activity activity = ctx.getActivity();
+            if (activity == null) return null;
+            DeviceSensorManager mgr = new DeviceSensorManager(sessionId, activity);
+            sSensorManagers.put(sessionId, mgr);
+            return mgr;
+        }
+    }
+
+    public static void startDeviceMotionListening(int sessionId, String interval) {
+        DeviceSensorManager mgr = getOrCreateSensorManager(sessionId);
+        if (mgr != null) {
+            mgr.startDeviceMotionListening(interval);
+        }
+    }
+
+    public static void stopDeviceMotionListening(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.stopDeviceMotionListening();
+        }
+    }
+
+    public static void startGyroscope(int sessionId, String interval) {
+        DeviceSensorManager mgr = getOrCreateSensorManager(sessionId);
+        if (mgr != null) {
+            mgr.startGyroscope(interval);
+        }
+    }
+
+    public static void stopGyroscope(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.stopGyroscope();
+        }
+    }
+
+    public static void startCompass(int sessionId) {
+        DeviceSensorManager mgr = getOrCreateSensorManager(sessionId);
+        if (mgr != null) {
+            mgr.startCompass();
+        }
+    }
+
+    public static void stopCompass(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.stopCompass();
+        }
+    }
+
+    public static void startAccelerometer(int sessionId, String interval) {
+        DeviceSensorManager mgr = getOrCreateSensorManager(sessionId);
+        if (mgr != null) {
+            mgr.startAccelerometer(interval);
+        }
+    }
+
+    public static void stopAccelerometer(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.stopAccelerometer();
+        }
+    }
+
+    public static void destroySensorManager(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.remove(sessionId);
+        if (mgr != null) {
+            mgr.destroy();
+        }
+    }
+
+    public static void startCaptureScreen(int sessionId) {
+        ScreenCaptureObserver observer = sCaptureObservers.get(sessionId);
+        if (observer == null) {
+            synchronized (sCaptureLock) {
+                observer = sCaptureObservers.get(sessionId);
+                if (observer == null) {
+                    RuntimeContext ctx = RuntimeRegistry.get(sessionId);
+                    if (ctx == null) return;
+                    Activity activity = ctx.getActivity();
+                    Context appCtx = activity != null ? activity : AppContext.getOrNull();
+                    if (appCtx == null) return;
+                    observer = new ScreenCaptureObserver(sessionId, appCtx);
+                    sCaptureObservers.put(sessionId, observer);
+                }
+            }
+        }
+        observer.start();
+    }
+
+    public static void stopCaptureScreen(int sessionId) {
+        ScreenCaptureObserver observer = sCaptureObservers.get(sessionId);
+        if (observer != null) {
+            observer.stop();
+        }
+    }
+
+    public static void destroyCaptureObserver(int sessionId) {
+        ScreenCaptureObserver observer = sCaptureObservers.remove(sessionId);
+        if (observer != null) {
+            observer.destroy();
+        }
+    }
+
+    public static void destroyAll(int sessionId) {
+        destroySensorManager(sessionId);
+        destroyCaptureObserver(sessionId);
+    }
+}

@@ -18,12 +18,14 @@ import com.migo.runtime.internal.NativeBridge;
 import com.migo.runtime.internal.NativeMethods;
 import com.migo.runtime.internal.RuntimeContext;
 import com.migo.runtime.internal.RuntimeRegistry;
+import com.migo.runtime.internal.ThreadCheck;
 import com.migo.runtime.internal.TouchEventHandler;
 import com.migo.runtime.internal.VsyncScheduler;
 import com.migo.runtime.internal.platform.AudioFocusManager;
 
 import java.io.Closeable;
 import java.io.File;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Represents an active game session.
@@ -73,7 +75,6 @@ import java.io.File;
  * <p>
  * This class is thread-safe. Methods can be called from any thread.
  *
- * @since 1.0.0
  */
 public final class GameSession implements Closeable {
 
@@ -89,8 +90,7 @@ public final class GameSession implements Closeable {
     private final Handler mainHandler;
     private final Object lock = new Object();
 
-    private volatile boolean destroyed = false;
-    private volatile boolean gameStarted = false;
+    private final AtomicReference<SessionState> state = new AtomicReference<>(SessionState.CREATED);
     private volatile boolean showDispatched = false;
     private volatile boolean hasLiveSurface = true;
 
@@ -101,8 +101,10 @@ public final class GameSession implements Closeable {
     private boolean debugOverlayAttached = false;
     private ConsoleLogView consoleLogView;
 
-    // Callback
+    // Callbacks
     private volatile GameSessionListener listener;
+    private volatile OnStateChangeListener stateChangeListener;
+    private volatile MessageHandler messageHandler;
 
     /**
      * Create a new game session.
@@ -123,6 +125,14 @@ public final class GameSession implements Closeable {
         this.audioFocusManager = new AudioFocusManager(sessionId, context);
         this.vsyncScheduler = new VsyncScheduler(sessionId);
         this.mainHandler = new Handler(Looper.getMainLooper());
+
+        // Configure frame skip to match targetFps against the display refresh rate
+        float displayRefreshRate = 60f;
+        if (context instanceof Activity) {
+            displayRefreshRate = ((Activity) context).getWindowManager()
+                    .getDefaultDisplay().getRefreshRate();
+        }
+        this.vsyncScheduler.setTargetFps(config.getTargetFps(), displayRefreshRate);
 
         // Ensure game directories exist
         this.paths.ensureDirectories();
@@ -200,7 +210,7 @@ public final class GameSession implements Closeable {
      * @return true if the session is valid
      */
     public boolean isValid() {
-        return !destroyed;
+        return state.get() != SessionState.DESTROYED;
     }
 
     /**
@@ -209,7 +219,24 @@ public final class GameSession implements Closeable {
      * @return true if startGame() has been called successfully
      */
     public boolean isGameStarted() {
-        return gameStarted;
+        SessionState s = state.get();
+        return s == SessionState.RUNNING || s == SessionState.PAUSED;
+    }
+
+    /**
+     * Returns the current lifecycle state of this session.
+     */
+    public SessionState getState() {
+        return state.get();
+    }
+
+    /**
+     * Set a listener to observe lifecycle state changes.
+     * Callbacks are delivered on the main thread.
+     * Pass null to remove the listener.
+     */
+    public void setOnStateChangeListener(OnStateChangeListener listener) {
+        this.stateChangeListener = listener;
     }
 
     /**
@@ -223,6 +250,43 @@ public final class GameSession implements Closeable {
      */
     public DebugOverlayView getDebugOverlay() {
         return debugOverlay;
+    }
+
+    /**
+     * Returns a snapshot of current engine performance metrics.
+     * Returns null if the session is not running or stats are unavailable.
+     * <p>
+     * This method polls the native engine and parses the binary stats protocol.
+     * Safe to call from any thread, but avoid calling more than once per second
+     * to minimize overhead.
+     */
+    public PerformanceSnapshot getPerformanceSnapshot() {
+        if (state.get() == SessionState.DESTROYED) return null;
+        byte[] data = NativeBridge.getDebugStats(sessionId);
+        if (data == null) return null;
+
+        // Parse binary protocol: 4-byte header (magic + version) + payload
+        // See engine/crates/shared/stats.rs for layout
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(data).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        if (data.length < 16) return null;  // need at least header + 3 fields
+
+        int magic = buf.getShort(0) & 0xFFFF;
+        if (magic != 0x4D47) return null;  // 'M','G' stats protocol magic
+
+        int h = 4;  // header offset
+        int fpsX10 = buf.getInt(h);
+        int frameTimeUs = buf.getInt(h + 4);
+        int dropped = buf.getInt(h + 8);
+        int firstFrameMs = data.length >= h + 20 ? buf.getInt(h + 16) : 0;
+        int cmdDrops = data.length >= h + 24 ? buf.getInt(h + 20) : 0;
+
+        return new PerformanceSnapshot(
+            (fpsX10 & 0xFFFFFFFFL) / 10f,
+            (frameTimeUs & 0xFFFFFFFFL) / 1000f,
+            dropped,
+            firstFrameMs,
+            cmdDrops
+        );
     }
 
     // ==================== Game Control ====================
@@ -247,6 +311,7 @@ public final class GameSession implements Closeable {
      * @throws RuntimeException if the session is destroyed or game fails to start
      */
     public void startGame(String entryPoint) {
+        ThreadCheck.ensureMainThread();
         ensureNotDestroyed();
 
         if (entryPoint == null || entryPoint.isEmpty()) {
@@ -277,7 +342,9 @@ public final class GameSession implements Closeable {
             throw new RuntimeException(ErrorCode.ERR_JS_EXECUTION, "Native modMain returned " + result);
         }
 
-        gameStarted = true;
+        SessionState prev = state.getAndSet(SessionState.RUNNING);
+        Log.d("MigoSession", "Session " + sessionId + " state: " + prev + " -> RUNNING");
+        notifyStateChange(prev, SessionState.RUNNING);
     }
 
     /**
@@ -297,14 +364,65 @@ public final class GameSession implements Closeable {
         }
     }
 
+    // ==================== Host <-> JS Communication ====================
+
+    /**
+     * Handler for messages sent from game JavaScript to the host app.
+     */
+    public interface MessageHandler {
+        /**
+         * Called when the game sends a message to the host.
+         * Called on the main thread.
+         *
+         * @param type    message type identifier
+         * @param payload JSON string payload (may be null)
+         */
+        void onMessage(String type, String payload);
+    }
+
+    /**
+     * Execute JavaScript code in the game's V8 runtime.
+     * <p>
+     * The script is evaluated asynchronously on the host thread. This method
+     * returns immediately. The script runs in the global scope of the game.
+     * <p>
+     * Example: {@code session.evaluateJavaScript("console.log('hello from host')");}
+     * <p>
+     * To receive data back from JS, register a custom handler via
+     * {@link #setMessageHandler} and have JS call {@code migo.sendToHost(type, payload)}.
+     *
+     * @param script JavaScript source code to evaluate
+     * @throws IllegalStateException if the session is destroyed
+     */
+    public void evaluateJavaScript(String script) {
+        ensureNotDestroyed();
+        if (script == null || script.isEmpty()) return;
+        NativeMethods.executeScript(sessionId, script);
+    }
+
+    /**
+     * Set a handler to receive messages from the game JavaScript.
+     * <p>
+     * In the game JS, call {@code migo.sendToHost(type, payload)} to send messages.
+     * Pass null to remove the handler.
+     *
+     * @param handler The handler to receive messages, or null to remove
+     */
+    public void setMessageHandler(MessageHandler handler) {
+        this.messageHandler = handler;
+        NativeExports.registerMessageHandler(sessionId, handler);
+    }
+
     // ==================== Lifecycle ====================
 
     /**
      * Pause the game (call when activity goes to background).
      */
     public void pause() {
+        ThreadCheck.ensureMainThread();
         synchronized (lock) {
-            if (destroyed) return;
+            if (state.get() == SessionState.DESTROYED) return;
+            transitionState(SessionState.RUNNING, SessionState.PAUSED);
             vsyncScheduler.stop();
             if (debugOverlay != null) {
                 debugOverlay.stopMonitoring();
@@ -327,8 +445,10 @@ public final class GameSession implements Closeable {
      * Resume the game (call when activity comes to foreground).
      */
     public void resume() {
+        ThreadCheck.ensureMainThread();
         synchronized (lock) {
-            if (destroyed) return;
+            if (state.get() == SessionState.DESTROYED) return;
+            transitionState(SessionState.PAUSED, SessionState.RUNNING);
             vsyncScheduler.setSurfaceReady(hasLiveSurface);
             vsyncScheduler.start();
             if (debugOverlay != null) {
@@ -353,7 +473,7 @@ public final class GameSession implements Closeable {
      */
     public void restart() {
         synchronized (lock) {
-            if (destroyed) return;
+            if (state.get() == SessionState.DESTROYED) return;
             NativeMethods.onRestart(sessionId);
         }
     }
@@ -366,6 +486,7 @@ public final class GameSession implements Closeable {
      * @param surface The new Surface object
      */
     public void updateSurface(Surface surface) {
+        ThreadCheck.ensureMainThread();
         updateSurface(surface, -1, -1);
     }
 
@@ -377,11 +498,12 @@ public final class GameSession implements Closeable {
      * @param height  Surface buffer height in physical pixels
      */
     public void updateSurface(Surface surface, int width, int height) {
+        ThreadCheck.ensureMainThread();
         if (surface == null) {
             throw new RuntimeException(ErrorCode.ERR_INVALID_SURFACE);
         }
         synchronized (lock) {
-            if (destroyed) return;
+            if (state.get() == SessionState.DESTROYED) return;
             Log.i(TAG, "updateSurface: session=" + sessionId + ", valid=" + surface.isValid()
                     + ", size=" + width + "x" + height);
             hasLiveSurface = surface.isValid();
@@ -400,8 +522,9 @@ public final class GameSession implements Closeable {
      * Notify the session that the current rendering surface has been destroyed.
      */
     public void onSurfaceDestroyed() {
+        ThreadCheck.ensureMainThread();
         synchronized (lock) {
-            if (destroyed) return;
+            if (state.get() == SessionState.DESTROYED) return;
             hasLiveSurface = false;
             vsyncScheduler.setSurfaceReady(false);
             NativeMethods.onSurfaceDestroyed(sessionId);
@@ -418,12 +541,16 @@ public final class GameSession implements Closeable {
      */
     @Override
     public void close() {
+        ThreadCheck.ensureMainThread();
+        SessionState prev;
         synchronized (lock) {
-            if (destroyed) {
+            prev = state.getAndSet(SessionState.DESTROYED);
+            if (prev == SessionState.DESTROYED) {
                 return;
             }
-            destroyed = true;
+            Log.d("MigoSession", "Session " + sessionId + " state: " + prev + " -> DESTROYED");
         }
+        notifyStateChange(prev, SessionState.DESTROYED);
 
         vsyncScheduler.setSurfaceReady(false);
         vsyncScheduler.stop();
@@ -440,7 +567,7 @@ public final class GameSession implements Closeable {
         NativeExports.destroyAllManagers(sessionId);
         NativeExports.unregisterSession(sessionId);
 
-        NativeMethods.shutdown(sessionId);
+        runWithTimeout("shutdown", () -> NativeMethods.shutdown(sessionId), 4000);
         RuntimeRegistry.unregister(sessionId);
 
         // Clean up temporary files
@@ -483,7 +610,7 @@ public final class GameSession implements Closeable {
      */
     public void dispatchMemoryWarning(int level) {
         synchronized (lock) {
-            if (destroyed) return;
+            if (state.get() == SessionState.DESTROYED) return;
             NativeMethods.onMemoryWarning(sessionId, level);
         }
     }
@@ -499,7 +626,7 @@ public final class GameSession implements Closeable {
     public boolean dispatchTouchEvent(MotionEvent event) {
         if (event == null) return false;
         synchronized (lock) {
-            if (destroyed) return false;
+            if (state.get() == SessionState.DESTROYED) return false;
             touchHandler.dispatch(sessionId, event);
             return true;
         }
@@ -517,7 +644,7 @@ public final class GameSession implements Closeable {
      */
     public void setAuthHandler(AuthHandler handler) {
         synchronized (lock) {
-            if (destroyed) return;
+            if (state.get() == SessionState.DESTROYED) return;
             NativeExports.setAuthHandler(sessionId, handler);
         }
     }
@@ -533,7 +660,7 @@ public final class GameSession implements Closeable {
      */
     public void setGameLogHandler(GameLogHandler handler) {
         synchronized (lock) {
-            if (destroyed) return;
+            if (state.get() == SessionState.DESTROYED) return;
             NativeExports.setGameLogHandler(sessionId, handler);
         }
     }
@@ -552,7 +679,7 @@ public final class GameSession implements Closeable {
      */
     public void setSubpackageHandler(SubpackageHandler handler) {
         synchronized (lock) {
-            if (destroyed) return;
+            if (state.get() == SessionState.DESTROYED) return;
             NativeExports.setSubpackageHandler(sessionId, handler);
         }
     }
@@ -583,7 +710,7 @@ public final class GameSession implements Closeable {
         if (l == null) return;
         mainHandler.post(() -> {
             GameSessionListener l2 = listener;
-            if (l2 != null && !destroyed) {
+            if (l2 != null && state.get() != SessionState.DESTROYED) {
                 l2.onGameReady();
             }
         });
@@ -605,10 +732,11 @@ public final class GameSession implements Closeable {
     void notifyError(int errorCode, String message, boolean recoverable) {
         GameSessionListener l = listener;
         if (l == null) return;
+        MigoException ex = new MigoException(errorCode, message, null, recoverable);
         mainHandler.post(() -> {
             GameSessionListener l2 = listener;
             if (l2 != null) {
-                l2.onError(errorCode, message, recoverable);
+                l2.onError(ex);
             }
         });
     }
@@ -625,7 +753,7 @@ public final class GameSession implements Closeable {
      */
     public void setDebugEnabled(boolean enabled) {
         synchronized (lock) {
-            if (destroyed) return;
+            if (state.get() == SessionState.DESTROYED) return;
             if (enabled) {
                 if (debugOverlay == null) {
                     RuntimeContext ctx = RuntimeRegistry.get(sessionId);
@@ -654,6 +782,33 @@ public final class GameSession implements Closeable {
     }
 
     // ==================== Helpers ====================
+
+    /**
+     * Run a native call with a timeout to prevent ANR.
+     * If the call doesn't complete within the timeout, log a warning and continue.
+     * The background thread is allowed to finish on its own — the main thread is
+     * unblocked after {@code timeoutMs} regardless.
+     */
+    private void runWithTimeout(String operationName, Runnable nativeCall, long timeoutMs) {
+        Thread worker = new Thread(() -> {
+            try {
+                nativeCall.run();
+            } catch (Exception e) {
+                Log.e("MigoSession", operationName + " failed: " + e.getMessage());
+            }
+        }, "migo-" + operationName);
+        worker.start();
+        try {
+            worker.join(timeoutMs);
+            if (worker.isAlive()) {
+                Log.w("MigoSession", operationName + " timed out after " + timeoutMs
+                        + "ms (potential ANR avoided)");
+                // Do not interrupt — let it finish in background, but don't block main thread
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
 
     private void tryAttachDebugOverlay() {
         RuntimeContext ctx = RuntimeRegistry.get(sessionId);
@@ -684,8 +839,29 @@ public final class GameSession implements Closeable {
     }
 
     private void ensureNotDestroyed() {
-        if (destroyed) {
+        if (state.get() == SessionState.DESTROYED) {
             throw new RuntimeException(ErrorCode.ERR_SESSION_DESTROYED);
+        }
+    }
+
+    private boolean transitionState(SessionState expected, SessionState next) {
+        boolean ok = state.compareAndSet(expected, next);
+        if (ok) {
+            Log.d("MigoSession", "Session " + sessionId + " state: " + expected + " -> " + next);
+            notifyStateChange(expected, next);
+        }
+        return ok;
+    }
+
+    private void notifyStateChange(SessionState oldState, SessionState newState) {
+        OnStateChangeListener l = stateChangeListener;
+        if (l != null) {
+            mainHandler.post(() -> {
+                OnStateChangeListener l2 = stateChangeListener;
+                if (l2 != null) {
+                    l2.onStateChanged(this, oldState, newState);
+                }
+            });
         }
     }
 
@@ -694,8 +870,7 @@ public final class GameSession implements Closeable {
         return "GameSession{" +
                 "sessionId=" + sessionId +
                 ", gameId='" + gameId + '\'' +
-                ", destroyed=" + destroyed +
-                ", gameStarted=" + gameStarted +
+                ", state=" + state.get() +
                 '}';
     }
 }

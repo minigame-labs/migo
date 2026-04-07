@@ -4,7 +4,7 @@ use jni::{JNIEnv, NativeMethod};
 use tracing::info;
 
 use crate::android::jni::{
-    getConsoleLogs, getDebugStats, init, mod_main, onAccelerometerChange, onActionSheetResult,
+    executeScript, getConsoleLogs, getDebugStats, init, mod_main, onAccelerometerChange, onActionSheetResult,
     onAudioInterruptionBegin, onAudioInterruptionEnd, onBLECharacteristicValueChange,
     onBLEConnectionStateChange, onBLEMTUChange, onBeaconServiceChange, onBeaconUpdate,
     onBluetoothAdapterStateChange, onBluetoothDeviceFound, onCameraEvent, onCameraFrameData,
@@ -16,8 +16,9 @@ use crate::android::jni::{
     onNavigateToMiniProgramResult, onNetworkStatusChange, onOpenAppAuthorizeSetting,
     onOpenSettingResult, onOpenSystemBluetoothSetting, onRecorderEvent, onRecorderFrameData,
     onRestart, onScanCodeResult, onShareAppMessageResult, onShow, onSubpackageProgress,
-    onSubpackageResult, onSurfaceDestroyed, onTouch, onUserCaptureScreen, onVideoEvent, onVsync,
-    shutdown, updateSurface, version, JavaMethodCache, JAVA_METHOD_CACHE,
+    onSubpackageResult, onSurfaceDestroyed, onThermalStatusChanged, onTouch, onUserCaptureScreen,
+    onVideoEvent, onVsync, setDisplayRefreshRate, shutdown, updateSurface, version,
+    JavaMethodCache, JAVA_METHOD_CACHE,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -100,6 +101,12 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 fn_ptr: mod_main as *mut c_void,
             },
             NativeMethod {
+                name: "executeScript".into(),
+                // (sessionId, script) -> int
+                sig: "(ILjava/lang/String;)I".into(),
+                fn_ptr: executeScript as *mut c_void,
+            },
+            NativeMethod {
                 name: "onModalResult".into(),
                 sig: "(III)V".into(),
                 fn_ptr: onModalResult as *mut c_void,
@@ -143,6 +150,11 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "onVsync".into(),
                 sig: "(IJ)V".into(),
                 fn_ptr: onVsync as *mut c_void,
+            },
+            NativeMethod {
+                name: "setDisplayRefreshRate".into(),
+                sig: "(IJ)V".into(),
+                fn_ptr: setDisplayRefreshRate as *mut c_void,
             },
             NativeMethod {
                 name: "getDebugStats".into(),
@@ -241,6 +253,12 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "onMemoryWarning".into(),
                 sig: "(II)V".into(),
                 fn_ptr: onMemoryWarning as *mut c_void,
+            },
+            // ADPF thermal callback
+            NativeMethod {
+                name: "onThermalStatusChanged".into(),
+                sig: "(II)V".into(),
+                fn_ptr: onThermalStatusChanged as *mut c_void,
             },
             // Image API callbacks
             NativeMethod {
@@ -532,6 +550,9 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("onError", "(IILjava/lang/String;Ljava/lang/String;)V"),
         // Exit callback
         ("onExit", "(I)V"),
+        // Host message channel callback
+        // onHostMessage(hostId, json)
+        ("onHostMessage", "(ILjava/lang/String;)V"),
     ];
 
     let global_class = env

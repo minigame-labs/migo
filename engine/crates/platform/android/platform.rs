@@ -49,4 +49,13 @@ impl PlatformServices for AndroidPlatform {
             );
         }
     }
+
+    fn notify_host_message(&self, host_id: i32, json: &str) {
+        if let Err(e) = jni::notify_host_message(host_id, json) {
+            error!(
+                "[Host {}] Failed to deliver host message to Java: {}",
+                host_id, e
+            );
+        }
+    }
 }

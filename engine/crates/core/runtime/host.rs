@@ -616,6 +616,13 @@ impl Host {
             }
 
             HostCommand::OnMemoryWarning { level } => {
+                // Android ComponentCallbacks2 trim memory levels.
+                match level {
+                    5 => tracing::info!("Memory pressure: RUNNING_MODERATE"),
+                    10 => tracing::warn!("Memory pressure: RUNNING_LOW"),
+                    15 => tracing::warn!("Memory pressure: RUNNING_CRITICAL"),
+                    _ => tracing::debug!("Memory warning level {level}"),
+                }
                 self.js.dispatch_memory_warning(level);
                 Ok(())
             }
@@ -624,6 +631,19 @@ impl Host {
                 .js
                 .exec_script("user_capture_screen", "_internalTriggerUserCaptureScreen()"),
 
+            // Android ADPF thermal status (PowerManager.THERMAL_STATUS_*).
+            HostCommand::OnThermalStatusChanged { status } => {
+                match status {
+                    0 => tracing::debug!("Thermal: NONE"),
+                    1 => tracing::info!("Thermal: LIGHT"),
+                    2 => tracing::warn!("Thermal: MODERATE"),
+                    3 | 4 => tracing::warn!("Thermal: SEVERE/CRITICAL ({status})"),
+                    5 | 6 => tracing::error!("Thermal: EMERGENCY/SHUTDOWN ({status})"),
+                    _ => tracing::debug!("Thermal: unknown ({status})"),
+                }
+                Ok(())
+            }
+
             HostCommand::OnVideoStateChange {
                 video_id,
                 event_type,
@@ -631,6 +651,25 @@ impl Host {
             } => {
                 self.js
                     .dispatch_video_event(video_id, &event_type, &data);
+                Ok(())
+            }
+
+            HostCommand::SetDisplayRefreshRate { period_nanos } => {
+                let hz = if period_nanos > 0 {
+                    1_000_000_000.0 / period_nanos as f64
+                } else {
+                    60.0
+                };
+                tracing::info!(
+                    "Display refresh rate: {:.1}Hz (period={}ns)",
+                    hz,
+                    period_nanos
+                );
+                Ok(())
+            }
+
+            HostCommand::SendToHost { json } => {
+                self.platform.notify_host_message(self.id, &json);
                 Ok(())
             }
 

@@ -24,26 +24,36 @@ pub struct RenderMetricsSnapshot {
 }
 
 impl RenderMetricsSnapshot {
-    pub const BYTE_LEN: usize = 60; // 40 + 5*4
+    /// Magic bytes: 'M' 'G' (0x4D47) — identifies this as a Migo stats packet.
+    pub const MAGIC: u16 = 0x4D47;
+    /// Protocol version. Increment when field layout changes.
+    pub const VERSION: u16 = 2;
+    /// 4-byte header (2 magic + 2 version) + 60 bytes payload = 64.
+    pub const HEADER_LEN: usize = 4;
+    pub const PAYLOAD_LEN: usize = 60;
+    pub const BYTE_LEN: usize = Self::HEADER_LEN + Self::PAYLOAD_LEN; // 64
 
     pub fn as_le_bytes(&self) -> [u8; Self::BYTE_LEN] {
         let mut bytes = [0u8; Self::BYTE_LEN];
-        bytes[0..4].copy_from_slice(&self.fps_x10.to_le_bytes());
-        bytes[4..8].copy_from_slice(&self.frame_time_us.to_le_bytes());
-        bytes[8..12].copy_from_slice(&self.dropped_frames.to_le_bytes());
-        bytes[12..16].copy_from_slice(&self.fatal_error_code.to_le_bytes());
-        bytes[16..20].copy_from_slice(&self.first_frame_ms.to_le_bytes());
-        bytes[20..24].copy_from_slice(&self.command_drops.to_le_bytes());
-        bytes[24..28].copy_from_slice(&self.raf_latency_us.to_le_bytes());
-        bytes[28..32].copy_from_slice(&self.swap_block_us.to_le_bytes());
-        bytes[32..36].copy_from_slice(&self.upload_queue_depth.to_le_bytes());
-        bytes[36..40].copy_from_slice(&self.glyph_atlas_miss.to_le_bytes());
-        // New fields — appended at tail for backward compat.
-        bytes[40..44].copy_from_slice(&self.partial_damage_frames.to_le_bytes());
-        bytes[44..48].copy_from_slice(&self.full_surface_frames.to_le_bytes());
-        bytes[48..52].copy_from_slice(&self.damage_area_k_pixels.to_le_bytes());
-        bytes[52..56].copy_from_slice(&self.upload_frame_rejections.to_le_bytes());
-        bytes[56..60].copy_from_slice(&self.dropped_upload_recoveries.to_le_bytes());
+        // Header
+        bytes[0..2].copy_from_slice(&Self::MAGIC.to_le_bytes());
+        bytes[2..4].copy_from_slice(&Self::VERSION.to_le_bytes());
+        // Payload (offsets shifted by HEADER_LEN = 4)
+        bytes[4..8].copy_from_slice(&self.fps_x10.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.frame_time_us.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.dropped_frames.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.fatal_error_code.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.first_frame_ms.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.command_drops.to_le_bytes());
+        bytes[28..32].copy_from_slice(&self.raf_latency_us.to_le_bytes());
+        bytes[32..36].copy_from_slice(&self.swap_block_us.to_le_bytes());
+        bytes[36..40].copy_from_slice(&self.upload_queue_depth.to_le_bytes());
+        bytes[40..44].copy_from_slice(&self.glyph_atlas_miss.to_le_bytes());
+        bytes[44..48].copy_from_slice(&self.partial_damage_frames.to_le_bytes());
+        bytes[48..52].copy_from_slice(&self.full_surface_frames.to_le_bytes());
+        bytes[52..56].copy_from_slice(&self.damage_area_k_pixels.to_le_bytes());
+        bytes[56..60].copy_from_slice(&self.upload_frame_rejections.to_le_bytes());
+        bytes[60..64].copy_from_slice(&self.dropped_upload_recoveries.to_le_bytes());
         bytes
     }
 }
@@ -171,19 +181,26 @@ mod tests {
 
         let bytes = stats.snapshot();
 
-        // Original 40 bytes still at same offsets.
+        // Total length is now 64 (4 header + 60 payload).
         assert_eq!(bytes.len(), RenderMetricsSnapshot::BYTE_LEN);
-        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 600);
-        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 16_600);
-        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 320);
-        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 3);
-        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 777);
-        assert_eq!(u32::from_le_bytes(bytes[28..32].try_into().unwrap()), 888);
-        assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 9);
-        assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 10);
-        // New fields default to 0 at offsets 40-59.
-        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 0);
+        assert_eq!(RenderMetricsSnapshot::BYTE_LEN, 64);
+
+        // Header: magic 'MG' (0x4D47) at [0..2], version 2 at [2..4].
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), RenderMetricsSnapshot::MAGIC);
+        assert_eq!(u16::from_le_bytes(bytes[2..4].try_into().unwrap()), RenderMetricsSnapshot::VERSION);
+
+        // Payload fields — all offsets shifted by +4 (HEADER_LEN).
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 600);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 16_600);
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 320);
+        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(bytes[28..32].try_into().unwrap()), 777);
+        assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 888);
+        assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 9);
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 10);
+        // Render optimization fields default to 0 at offsets 44-63.
         assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(bytes[48..52].try_into().unwrap()), 0);
     }
 
     #[test]
@@ -197,11 +214,12 @@ mod tests {
 
         let bytes = stats.snapshot();
 
-        assert_eq!(bytes.len(), 60);
-        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 42);
-        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 7);
-        assert_eq!(u32::from_le_bytes(bytes[48..52].try_into().unwrap()), 1500);
-        assert_eq!(u32::from_le_bytes(bytes[52..56].try_into().unwrap()), 3);
-        assert_eq!(u32::from_le_bytes(bytes[56..60].try_into().unwrap()), 1);
+        assert_eq!(bytes.len(), 64);
+        // Payload offsets shifted by +4 (HEADER_LEN).
+        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 42);
+        assert_eq!(u32::from_le_bytes(bytes[48..52].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(bytes[52..56].try_into().unwrap()), 1500);
+        assert_eq!(u32::from_le_bytes(bytes[56..60].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(bytes[60..64].try_into().unwrap()), 1);
     }
 }
