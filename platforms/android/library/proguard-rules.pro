@@ -76,12 +76,15 @@
 }
 
 # ============================================================================
-# Callback Interfaces
+# Callback Interfaces (set by host app, invoked from native/internal code)
 # ============================================================================
 
--keep interface com.migo.runtime.callback.GameSessionListener {
-    *;
-}
+-keep interface com.migo.runtime.callback.GameSessionListener { *; }
+-keep interface com.migo.runtime.callback.AuthHandler { *; }
+-keep interface com.migo.runtime.callback.AuthHandler$* { *; }
+-keep interface com.migo.runtime.callback.SubpackageHandler { *; }
+-keep class com.migo.runtime.callback.SubpackageHandler$* { *; }
+-keep interface com.migo.runtime.callback.GameLogHandler { *; }
 
 # ============================================================================
 # Internal Classes (Required by JNI)
@@ -114,9 +117,21 @@
 }
 
 # Keep ResultProxyActivity - started via Intent
--keep class com.migo.runtime.internal.ResultProxyActivity {
-    *;
-}
+-keep class com.migo.runtime.internal.ResultProxyActivity { *; }
+
+# Domain Exports - called from native code via cached method IDs
+-keep class com.migo.runtime.internal.BluetoothExports { *; }
+-keep class com.migo.runtime.internal.InputExports { *; }
+-keep class com.migo.runtime.internal.MediaExports { *; }
+-keep class com.migo.runtime.internal.NetworkExports { *; }
+-keep class com.migo.runtime.internal.SensorExports { *; }
+
+# Internal utilities referenced from JNI or NativeExports
+-keep class com.migo.runtime.internal.ThreadCheck { *; }
+-keep class com.migo.runtime.internal.VsyncScheduler { *; }
+
+# Platform managers - instantiated by *Exports, some accessed via JNI
+-keep class com.migo.runtime.internal.platform.** { *; }
 
 # Keep MigoGameView - public API
 -keep public class com.migo.runtime.MigoGameView {

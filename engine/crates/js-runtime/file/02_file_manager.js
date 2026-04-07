@@ -76,7 +76,6 @@ const SAVE_FILE_DIR = "/user";
 let _saveFileCounter = 0;
 const SAVED_FILE_REGISTRY = `${SAVE_FILE_DIR}/.migo_saved_files.json`;
 const _trackedSavedFilePaths = new Set();
-const _utf8Decoder = new TextDecoder();
 let _savedRegistryOp = Promise.resolve();
 
 function getPathExtension(path) {
@@ -128,7 +127,7 @@ function shouldTrackSavedFilePath(path) {
 
 function decodeUtf8Bytes(data) {
   const bytes = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data);
-  return _utf8Decoder.decode(bytes);
+  return op_decode_multi_formats(bytes, 'utf8');
 }
 
 async function loadSavedFileRegistry() {

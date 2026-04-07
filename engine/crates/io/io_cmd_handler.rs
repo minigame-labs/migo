@@ -1851,6 +1851,7 @@ impl IoCmdHandler {
         Ok(out)
     }
 
+    #[allow(dead_code)] // used only with compress-brotli feature
     fn read_to_end_limited<R: std::io::Read>(
         reader: &mut R,
         max_len: u64,

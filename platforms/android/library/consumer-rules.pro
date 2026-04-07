@@ -105,3 +105,36 @@
 
 # Keep PerformanceSnapshot - public API for performance monitoring
 -keep public class com.migo.runtime.PerformanceSnapshot { *; }
+
+# ============================================================================
+# Callback Interfaces (set by host app, invoked from native/internal code)
+# ============================================================================
+
+-keep interface com.migo.runtime.callback.AuthHandler { *; }
+-keep interface com.migo.runtime.callback.AuthHandler$* { *; }
+-keep interface com.migo.runtime.callback.SubpackageHandler { *; }
+-keep class com.migo.runtime.callback.SubpackageHandler$* { *; }
+-keep interface com.migo.runtime.callback.GameLogHandler { *; }
+
+# ============================================================================
+# Domain Exports (called from native code via cached method IDs)
+# ============================================================================
+
+-keep class com.migo.runtime.internal.BluetoothExports { *; }
+-keep class com.migo.runtime.internal.InputExports { *; }
+-keep class com.migo.runtime.internal.MediaExports { *; }
+-keep class com.migo.runtime.internal.NetworkExports { *; }
+-keep class com.migo.runtime.internal.SensorExports { *; }
+
+# ============================================================================
+# Internal Utilities (referenced from JNI or NativeExports)
+# ============================================================================
+
+-keep class com.migo.runtime.internal.ThreadCheck { *; }
+-keep class com.migo.runtime.internal.VsyncScheduler { *; }
+
+# ============================================================================
+# Platform Managers (instantiated by *Exports classes, accessed via reflection)
+# ============================================================================
+
+-keep class com.migo.runtime.internal.platform.** { *; }
