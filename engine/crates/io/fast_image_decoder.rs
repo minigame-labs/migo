@@ -88,6 +88,7 @@ pub fn detect_compressed_format(data: &[u8]) -> Option<CompressedImageInfo> {
 ///
 /// This is cheap (~microseconds) and used by the IO byte budget to reserve
 /// the right amount before committing to a full decode.
+#[allow(dead_code)]
 pub fn estimate_decoded_size(data: &[u8]) -> usize {
     const FALLBACK: usize = 2048 * 2048 * 4; // 16 MB
     const MAX_ESTIMATE: usize = 256 * 1024 * 1024; // 256 MB cap
@@ -104,6 +105,7 @@ pub fn estimate_decoded_size(data: &[u8]) -> usize {
 }
 
 /// Try to read image dimensions from the file header.
+#[allow(dead_code)]
 fn probe_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     // KTX2: compressed texture container -- width/height in header.
     if ktx2::is_ktx2(data) {

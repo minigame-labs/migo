@@ -55,6 +55,13 @@ public final class NativeBridge {
      */
     public static native void updateSurface(int sessionId, Object surface, int width, int height);
 
+    /**
+     * Notify that the current rendering surface has been destroyed.
+     *
+     * @param sessionId The session ID
+     */
+    public static native void onSurfaceDestroyed(int sessionId);
+
     // ==================== Lifecycle Events ====================
 
     /**

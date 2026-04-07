@@ -15,8 +15,10 @@ fn to_fv_color(c: SharedColor) -> Color {
     Color::rgbaf(c.r, c.g, c.b, c.a)
 }
 
+pub(crate) mod display_list;
 mod font;
-mod handler;
+pub(crate) mod handler;
+mod layer_cache;
 pub(crate) mod sprite_batch;
 
 pub(crate) use font::*;
@@ -84,6 +86,7 @@ pub struct Canvas2DState {
 
     pub font_size: f32,
     pub font_id: Option<FontId>,
+    pub font_cache_key: String,
     pub text_align: TextAlign,
     pub text_baseline: TextBaseline,
 
@@ -113,6 +116,7 @@ impl Default for Canvas2DState {
 
             font_size: 16.0,
             font_id: None,
+            font_cache_key: "16:default:normal:normal".to_string(),
             text_align: TextAlign::default(),
             text_baseline: TextBaseline::default(),
 
@@ -145,6 +149,7 @@ pub(crate) struct Canvas2DContext {
     last_font_str: String,
     last_font_id: Option<FontId>,
     last_font_size: f32,
+    last_font_cache_key: String,
 }
 
 impl Canvas2DContext {
@@ -164,6 +169,7 @@ impl Canvas2DContext {
             last_font_str: String::new(),
             last_font_id: None,
             last_font_size: 16.0,
+            last_font_cache_key: String::new(),
         }
     }
 
@@ -1005,19 +1011,20 @@ impl Canvas2DContext {
                         .map(|(offset, color)| (offset, Self::apply_global_alpha(color, ga))),
                 )
             }
-            FillStyleKind::ConicGradient { cx, cy, stops } => {
-                Paint::conic_gradient_stops(
-                    *cx,
-                    *cy,
-                    stops
-                        .iter()
-                        .copied()
-                        .map(|(offset, color)| (offset, Self::apply_global_alpha(color, ga))),
-                )
-            }
-            FillStyleKind::Pattern { image_id, width, height, .. } => {
-                Paint::image(*image_id, 0.0, 0.0, *width, *height, 0.0, ga)
-            }
+            FillStyleKind::ConicGradient { cx, cy, stops } => Paint::conic_gradient_stops(
+                *cx,
+                *cy,
+                stops
+                    .iter()
+                    .copied()
+                    .map(|(offset, color)| (offset, Self::apply_global_alpha(color, ga))),
+            ),
+            FillStyleKind::Pattern {
+                image_id,
+                width,
+                height,
+                ..
+            } => Paint::image(*image_id, 0.0, 0.0, *width, *height, 0.0, ga),
         }
     }
 
@@ -1075,9 +1082,12 @@ impl Canvas2DContext {
                     .copied()
                     .map(|(offset, color)| (offset, Self::apply_global_alpha(color, ga))),
             ),
-            FillStyleKind::Pattern { image_id, width, height, .. } => {
-                Paint::image(*image_id, 0.0, 0.0, *width, *height, 0.0, ga)
-            }
+            FillStyleKind::Pattern {
+                image_id,
+                width,
+                height,
+                ..
+            } => Paint::image(*image_id, 0.0, 0.0, *width, *height, 0.0, ga),
         };
         base.with_line_width(self.state.line_width)
             .with_line_cap(match self.state.line_cap {
@@ -1098,17 +1108,13 @@ impl Canvas2DContext {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn rotate_conic_stops_applies_start_angle_shift() {
-        let stops = vec![
-            (0.0, Color::rgb(255, 0, 0)),
-            (0.5, Color::rgb(0, 0, 255)),
-        ];
+        let stops = vec![(0.0, Color::rgb(255, 0, 0)), (0.5, Color::rgb(0, 0, 255))];
 
         let rotated = Canvas2DContext::rotate_conic_stops(stops, std::f32::consts::FRAC_PI_2);
 
@@ -1118,10 +1124,7 @@ mod tests {
 
     #[test]
     fn rotate_conic_stops_wraps_and_keeps_sorted_order() {
-        let stops = vec![
-            (0.8, Color::rgb(255, 0, 0)),
-            (0.2, Color::rgb(0, 255, 0)),
-        ];
+        let stops = vec![(0.8, Color::rgb(255, 0, 0)), (0.2, Color::rgb(0, 255, 0))];
 
         let rotated = Canvas2DContext::rotate_conic_stops(stops, std::f32::consts::PI);
 

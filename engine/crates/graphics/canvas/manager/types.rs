@@ -32,10 +32,27 @@ impl CanvasInfo {
 
 /// Tracked WebGL state per canvas for deduplication of redundant GL calls.
 ///
+/// Scissor test state for damage tracking.
+///
+/// GL allows `glScissor()` to be called at any time (even when the test is
+/// disabled); the rect is retained and takes effect when the test is enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScissorState {
+    /// `GL_SCISSOR_TEST` is disabled — scissor rect has no effect.
+    Disabled,
+    /// `GL_SCISSOR_TEST` is enabled with a known rect (set by explicit `glScissor`).
+    Enabled { x: i32, y: i32, width: i32, height: i32 },
+    /// `GL_SCISSOR_TEST` is enabled but no explicit `glScissor()` has been
+    /// called yet.  The real GL initial scissor box is the full drawable —
+    /// we don't know its size here, so damage must fall back to viewport
+    /// (conservative, never under-reports).
+    EnabledUnknownRect,
+}
+
 /// When a setter call matches the already-tracked value, the actual GL call
 /// is skipped.  State is only updated AFTER resource validation succeeds,
 /// so errors never pollute the tracked state.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct CanvasGLState {
     pub current_program: Option<ProgramId>,
     pub viewport: Option<(i32, i32, i32, i32)>,
@@ -47,6 +64,39 @@ pub(crate) struct CanvasGLState {
     pub bound_element_array_buffer: Option<Option<u32>>,
     /// Active texture unit.
     pub active_texture_unit: Option<u32>,
+    /// True when the DRAW_FRAMEBUFFER binding is the default framebuffer
+    /// (= drawing buffer / onscreen surface).  False when a user FBO is bound.
+    /// Used by damage tracking: only draws to the default FB affect onscreen damage.
+    /// Defaults to true (initial GL state is the default framebuffer).
+    pub draws_to_default_fbo: bool,
+    /// Scissor test state for damage tracking.
+    pub scissor: ScissorState,
+    /// Last rect set via explicit `glScissor()`, retained across enable/disable
+    /// cycles.  `None` means no explicit `glScissor` has been called yet.
+    pub last_scissor_rect: Option<(i32, i32, i32, i32)>,
+    /// Current glColorMask state (r, g, b, a).
+    /// Used by damage tracking: if all four are false, glClear with
+    /// COLOR_BUFFER_BIT doesn't actually modify visible color.
+    /// Defaults to (true, true, true, true) per GL initial state.
+    pub color_mask: (bool, bool, bool, bool),
+}
+
+impl Default for CanvasGLState {
+    fn default() -> Self {
+        Self {
+            current_program: None,
+            viewport: None,
+            bound_texture_2d: HashMap::new(),
+            bound_array_buffer: None,
+            bound_element_array_buffer: None,
+            active_texture_unit: None,
+            // Initial GL state: default framebuffer is bound.
+            draws_to_default_fbo: true,
+            scissor: ScissorState::Disabled,
+            last_scissor_rect: None,
+            color_mask: (true, true, true, true),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -128,10 +178,14 @@ pub(super) struct CanvasEntry {
     /// DrawingBuffer blit is skipped.  Currently enabled when there is
     /// exactly one canvas (the onscreen one) with a DrawingBuffer.
     ///
-    /// **Limitation:** `preserveDrawingBuffer` and `readPixels`/`toDataURL`
-    /// on the default framebuffer are not yet gated — those features are
-    /// uncommon in mini-game workloads.  Future phases should add runtime
-    /// detection and disable bypass when needed.
+    /// When bypass is active, the window surface content becomes undefined
+    /// after `eglSwapBuffers` (per EGL spec). To handle games that read from
+    /// the default framebuffer, `CanvasManager::signal_default_fbo_readback()`
+    /// permanently disables bypass when such a readback is detected. This
+    /// re-routes rendering through the DrawingBuffer which preserves content.
+    ///
+    /// Detection points: `ReadPixels` on the onscreen default FBO (GL handler)
+    /// and `GetImageData` on canvas_id=1 (Canvas2D handler).
     ///
     /// Set by `CanvasManager::evaluate_bypass()` after canvas lifecycle events.
     pub bypass_drawing_buffer: bool,

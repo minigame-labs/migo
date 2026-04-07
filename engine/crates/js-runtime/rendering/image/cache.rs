@@ -15,6 +15,29 @@ pub fn alloc_shared_id() -> u32 {
     NEXT_SHARED_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Structured cache key: `(canonical_src, mount_generation)`.
+///
+/// Using a tuple avoids delimiter collision that string concatenation
+/// would introduce (`:` is a legal path character on Linux).  An optional
+/// resize suffix is encoded in `canonical_src` as `"path\0WxH"` (null byte
+/// is illegal in filesystem paths so cannot collide).
+pub type ImageCacheKey = (String, u64);
+
+/// Build a cache key from a resolved path, optional resize dimensions,
+/// and mount generation.
+pub fn make_cache_key(
+    src: &str,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+    mount_generation: u64,
+) -> ImageCacheKey {
+    let canonical = match (target_width, target_height) {
+        (Some(tw), Some(th)) => format!("{}\0{}x{}", src, tw, th),
+        _ => src.to_string(),
+    };
+    (canonical, mount_generation)
+}
+
 pub struct SharedImageEntry {
     pub shared_image_id: u32,
     pub refs: usize,
@@ -22,15 +45,19 @@ pub struct SharedImageEntry {
 }
 
 pub struct ImageCache {
-    // keyed by canonical src
-    by_src: HashMap<String, SharedImageEntry>,
+    // keyed by (canonical src, mount generation)
+    by_src: HashMap<ImageCacheKey, SharedImageEntry>,
     // alias (caller image_id) -> shared_image_id
     alias_to_shared: HashMap<u32, u32>,
-    // shared_image_id -> src
-    shared_to_src: HashMap<u32, String>,
+    // shared_image_id -> cache key
+    shared_to_key: HashMap<u32, ImageCacheKey>,
 
-    // in-flight loads: src -> list of waiters
-    loading_map: HashMap<String, Vec<oneshot::Sender<Result<(u32, (usize, usize)), String>>>>,
+    // in-flight loads: key -> list of waiters
+    loading_map:
+        HashMap<ImageCacheKey, Vec<oneshot::Sender<Result<(u32, (usize, usize)), String>>>>,
+    // image ids waiting on an in-flight load; used to prevent destroy-before-
+    // completion from resurrecting aliases and refcounts.
+    pending_alias_to_key: HashMap<u32, ImageCacheKey>,
 }
 
 pub enum BeginLoadResult {
@@ -44,8 +71,9 @@ impl ImageCache {
         Self {
             by_src: HashMap::new(),
             alias_to_shared: HashMap::new(),
-            shared_to_src: HashMap::new(),
+            shared_to_key: HashMap::new(),
             loading_map: HashMap::new(),
+            pending_alias_to_key: HashMap::new(),
         }
     }
 
@@ -53,43 +81,45 @@ impl ImageCache {
     /// Returns Some(shared_id) if refs dropped to 0 -> caller should destroy that shared_id.
     pub fn remove_previous_alias(&mut self, image_id: u32) -> Option<u32> {
         if let Some(shared_id) = self.alias_to_shared.remove(&image_id) {
-            if let Some(src) = self.shared_to_src.get(&shared_id).cloned() {
-                if let Some(entry) = self.by_src.get_mut(&src) {
+            if let Some(key) = self.shared_to_key.get(&shared_id).cloned() {
+                if let Some(entry) = self.by_src.get_mut(&key) {
                     entry.refs = entry.refs.saturating_sub(1);
                     if entry.refs == 0 {
-                        self.by_src.remove(&src);
-                        self.shared_to_src.remove(&shared_id);
+                        self.by_src.remove(&key);
+                        self.shared_to_key.remove(&shared_id);
                         return Some(shared_id);
                     }
                 }
             }
         }
+        self.pending_alias_to_key.remove(&image_id);
         None
     }
 
-    pub fn begin_load(&mut self, image_id: u32, src: &str) -> BeginLoadResult {
+    pub fn begin_load(&mut self, image_id: u32, key: &ImageCacheKey) -> BeginLoadResult {
         // already loaded
-        if let Some(entry) = self.by_src.get_mut(src) {
+        if let Some(entry) = self.by_src.get_mut(key) {
             entry.refs = entry.refs.saturating_add(1);
             let shared_id = entry.shared_image_id;
 
             self.alias_to_shared.insert(image_id, shared_id);
-            self.shared_to_src
+            self.shared_to_key
                 .entry(shared_id)
-                .or_insert_with(|| src.to_string());
+                .or_insert_with(|| key.clone());
 
             return BeginLoadResult::AlreadyLoaded((shared_id, entry.dims));
         }
 
         // loading in progress
-        if self.loading_map.contains_key(src) {
+        if self.loading_map.contains_key(key) {
             let (tx, rx) = oneshot::channel();
-            self.loading_map.get_mut(src).unwrap().push(tx);
+            self.loading_map.get_mut(key).unwrap().push(tx);
+            self.pending_alias_to_key.insert(image_id, key.clone());
             return BeginLoadResult::Join(rx);
         }
 
         // become loader
-        self.loading_map.insert(src.to_string(), Vec::new());
+        self.loading_map.insert(key.clone(), Vec::new());
         BeginLoadResult::StartLoading
     }
 
@@ -105,14 +135,18 @@ impl ImageCache {
 
     /// Called by *joiners* after they got (shared_id, dims), to ensure alias/ref is correct
     /// even if JS does not replace image_id.
-    pub fn bind_alias_existing(&mut self, image_id: u32, src: &str, shared_id: u32) {
-        if let Some(entry) = self.by_src.get_mut(src) {
+    pub fn bind_alias_existing(&mut self, image_id: u32, key: &ImageCacheKey, shared_id: u32) {
+        match self.pending_alias_to_key.remove(&image_id) {
+            Some(pending_key) if &pending_key == key => {}
+            _ => return,
+        }
+        if let Some(entry) = self.by_src.get_mut(key) {
             // entry should exist already
             entry.refs = entry.refs.saturating_add(1);
             self.alias_to_shared.insert(image_id, shared_id);
-            self.shared_to_src
+            self.shared_to_key
                 .entry(shared_id)
-                .or_insert_with(|| src.to_string());
+                .or_insert_with(|| key.clone());
         }
     }
 
@@ -127,65 +161,100 @@ impl ImageCache {
         &mut self,
         loader_image_id: u32,
         shared_id: u32,
-        src: &str,
+        key: &ImageCacheKey,
         res: Result<(usize, usize), String>,
-    ) {
-        let waiters = self.loading_map.remove(src).unwrap_or_default();
+    ) -> Option<u32> {
+        let Some(waiters) = self.loading_map.remove(key) else {
+            return None;
+        };
 
         match res {
             Ok(dims) => {
+                let loader_alive =
+                    self.alias_to_shared.get(&loader_image_id).copied() == Some(shared_id);
+                let pending_refs = self
+                    .pending_alias_to_key
+                    .values()
+                    .filter(|pending| *pending == key)
+                    .count();
+                if !loader_alive && pending_refs == 0 {
+                    return Some(shared_id);
+                }
                 self.by_src.insert(
-                    src.to_string(),
+                    key.clone(),
                     SharedImageEntry {
                         shared_image_id: shared_id,
-                        refs: 1,
+                        refs: usize::from(loader_alive),
                         dims,
                     },
                 );
-                self.alias_to_shared.insert(loader_image_id, shared_id);
-                self.shared_to_src.insert(shared_id, src.to_string());
+                if loader_alive {
+                    self.alias_to_shared.insert(loader_image_id, shared_id);
+                }
+                self.shared_to_key.insert(shared_id, key.clone());
 
                 for tx in waiters {
                     let _ = tx.send(Ok((shared_id, dims)));
                 }
+                None
             }
             Err(msg) => {
                 for tx in waiters {
                     let _ = tx.send(Err(msg.clone()));
                 }
+                None
             }
         }
     }
 
     /// destroy: dec refs; return Some(shared_id) if should actually destroy underlying shared resource
     pub fn try_release_and_get_destroy_rid(&mut self, image_id: u32) -> Option<u32> {
+        self.pending_alias_to_key.remove(&image_id);
+        let had_alias = self.alias_to_shared.contains_key(&image_id);
         let shared_id = self.alias_to_shared.remove(&image_id).unwrap_or(image_id);
 
-        if let Some(src) = self.shared_to_src.get(&shared_id).cloned() {
-            if let Some(entry) = self.by_src.get_mut(&src) {
+        if let Some(key) = self.shared_to_key.get(&shared_id).cloned() {
+            if let Some(entry) = self.by_src.get_mut(&key) {
                 if entry.refs > 0 {
                     entry.refs -= 1;
                 }
                 if entry.refs == 0 {
-                    self.by_src.remove(&src);
-                    self.shared_to_src.remove(&shared_id);
+                    self.by_src.remove(&key);
+                    self.shared_to_key.remove(&shared_id);
                     return Some(shared_id);
                 }
                 return None;
             }
         }
 
-        // not tracked as shared -> destroy caller id directly
-        Some(image_id)
+        if had_alias {
+            Some(shared_id)
+        } else {
+            // not tracked as shared -> destroy caller id directly
+            Some(image_id)
+        }
     }
 
+    /// Get the source path for an image ID (for texImage2D RGBA lookup).
     pub fn source_for_image_id(&self, image_id: u32) -> Option<String> {
         let shared_id = self
             .alias_to_shared
             .get(&image_id)
             .copied()
             .unwrap_or(image_id);
-        self.shared_to_src.get(&shared_id).cloned()
+        self.shared_to_key
+            .get(&shared_id)
+            .map(|(path, _)| path.clone())
+    }
+
+    /// Get the full cache key `(path, generation)` for an image ID.
+    pub fn cache_key_for_image_id(&self, image_id: u32) -> Option<ImageCacheKey> {
+        let shared_id = self
+            .alias_to_shared
+            .get(&image_id)
+            .copied()
+            .unwrap_or(image_id);
+        self.shared_to_key.get(&shared_id).cloned()
     }
 }
 
@@ -196,11 +265,24 @@ pub static IMAGE_CACHE: LazyLock<Mutex<ImageCache>> =
 ///
 /// Must be called during host shutdown to prevent stale entries from
 /// leaking into the next session (IMAGE_CACHE is process-global).
-pub fn clear_shared_image_cache() {
-    NEXT_SHARED_ID.store(0x4000_0000, Ordering::Relaxed);
+pub fn drain_shared_image_cache() -> Vec<u32> {
+    use std::collections::HashSet;
     let mut c = IMAGE_CACHE.lock();
+    let mut seen = HashSet::new();
+    let mut shared_ids: Vec<u32> = Vec::new();
+    for id in c.by_src.values().map(|e| e.shared_image_id).chain(c.alias_to_shared.values().copied()) {
+        if seen.insert(id) {
+            shared_ids.push(id);
+        }
+    }
     c.by_src.clear();
     c.alias_to_shared.clear();
-    c.shared_to_src.clear();
+    c.shared_to_key.clear();
     c.loading_map.clear();
+    c.pending_alias_to_key.clear();
+    shared_ids
+}
+
+pub fn clear_shared_image_cache() {
+    let _ = drain_shared_image_cache();
 }

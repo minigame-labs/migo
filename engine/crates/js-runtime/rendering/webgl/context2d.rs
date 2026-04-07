@@ -1,17 +1,17 @@
 //! Canvas 2D Context - Command Batching Implementation
 //!
-//! All draw commands within a RAF frame are batched via [`FrameCommandCollector`]
-//! and sent as a single `Canvas2DBatch` message to the render thread, reducing
-//! IPC overhead to one message per canvas per frame.
+//! Canvas 2D Context ops.
+//!
+//! Draw commands are collected by `UnifiedFrameCollector` (see `frame_collector.rs`)
+//! and sent as a single interleaved `FramePacket` per frame.
 //!
 //! Sync operations (`op_create_context_2d`, `op_measure_text`, `op_get_image_data`)
 //! use `RenderCommand::Canvas2D` for synchronous request/response.
 
 use deno_core::{op2, OpState};
-use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use tracing::{error, trace};
+use tracing::error;
 
 use shared::{
     op_state::CanvasOpState,
@@ -260,611 +260,6 @@ fn parse_color_string(s: &str) -> Color {
 }
 
 // ============================================================================
-// Frame command collector (batches draw commands per frame)
-// ============================================================================
-
-/// Per-canvas frame command buffer
-struct FrameBuffer {
-    commands: Vec<Canvas2DCmd>,
-    /// Shadow state for deduplication — avoids sending redundant commands
-    fill_color: Option<Color>,
-    stroke_color: Option<Color>,
-    line_width: Option<f32>,
-    global_alpha: Option<f32>,
-    line_cap: Option<u8>,
-    line_join: Option<u8>,
-    miter_limit: Option<f32>,
-    text_align: Option<TextAlign>,
-    text_baseline: Option<TextBaseline>,
-    font: Option<String>,
-    /// Pending same-texture draw batch (auto-merge consecutive drawImage calls).
-    pending_batch_image: u32,
-    pending_batch: Vec<shared::protocol::render_cmd::DrawImageEntry>,
-    /// Bounding box of all draw commands this frame (pixel coords: x, y, w, h).
-    dirty_rect: Option<(f32, f32, f32, f32)>,
-}
-
-impl FrameBuffer {
-    fn new() -> Self {
-        Self {
-            commands: Vec::with_capacity(256),
-            fill_color: None,
-            stroke_color: None,
-            line_width: None,
-            global_alpha: None,
-            line_cap: None,
-            line_join: None,
-            miter_limit: None,
-            text_align: None,
-            text_baseline: None,
-            font: None,
-            pending_batch_image: 0,
-            pending_batch: Vec::new(),
-            dirty_rect: None,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.commands.clear();
-        self.fill_color = None;
-        self.stroke_color = None;
-        self.line_width = None;
-        self.global_alpha = None;
-        self.line_cap = None;
-        self.line_join = None;
-        self.miter_limit = None;
-        self.text_align = None;
-        self.text_baseline = None;
-        self.font = None;
-        self.pending_batch.clear();
-        self.pending_batch_image = 0;
-        self.dirty_rect = None;
-    }
-
-    /// Expand the dirty bounding box to include the given rectangle.
-    #[inline]
-    fn mark_dirty(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        self.dirty_rect = Some(match self.dirty_rect {
-            Some((ox, oy, ow, oh)) => {
-                let nx = ox.min(x);
-                let ny = oy.min(y);
-                let nx2 = (ox + ow).max(x + w);
-                let ny2 = (oy + oh).max(y + h);
-                (nx, ny, nx2 - nx, ny2 - ny)
-            }
-            None => (x, y, w, h),
-        });
-    }
-
-    /// Flush any pending same-texture draw batch into the command list.
-    #[inline]
-    fn flush_pending_batch(&mut self) {
-        if self.pending_batch.is_empty() {
-            return;
-        }
-        if self.pending_batch.len() == 1 {
-            // Single draw — keep as individual DrawImage (no batch overhead)
-            let d = self.pending_batch[0];
-            self.commands.push(Canvas2DCmd::DrawImage {
-                image_id: d.image_id,
-                sx: d.sx, sy: d.sy, sw: d.sw, sh: d.sh,
-                dx: d.dx, dy: d.dy, dw: d.dw, dh: d.dh,
-            });
-        } else {
-            let draws = std::mem::take(&mut self.pending_batch);
-            self.commands.push(Canvas2DCmd::DrawImageBatch { draws });
-        }
-        self.pending_batch.clear();
-        self.pending_batch_image = 0;
-    }
-
-    #[inline]
-    fn push(&mut self, cmd: Canvas2DCmd) {
-        // Auto-merge consecutive same-image DrawImage calls into DrawImageBatch.
-        if let Canvas2DCmd::DrawImage { image_id, sx, sy, sw, sh, dx, dy, dw, dh } = cmd {
-            self.mark_dirty(dx, dy, dw, dh);
-            if !self.pending_batch.is_empty() && self.pending_batch_image != image_id {
-                self.flush_pending_batch();
-            }
-            self.pending_batch_image = image_id;
-            self.pending_batch.push(shared::protocol::render_cmd::DrawImageEntry {
-                image_id, sx, sy, sw, sh, dx, dy, dw, dh,
-            });
-            return;
-        }
-        // Track dirty region for draw commands before flushing pending batch.
-        self.mark_dirty_for_cmd(&cmd);
-        // Non-DrawImage command: flush any pending batch first
-        self.flush_pending_batch();
-        self.commands.push(cmd);
-    }
-
-    /// Mark dirty region based on a Canvas2D command's bounding box.
-    /// For rect-based commands, use the exact rect. For path-based draw
-    /// commands (Fill, Stroke, etc.), use a sentinel that forces full-canvas
-    /// dirty (the actual bounds are not cheaply available on the JS side).
-    #[inline]
-    fn mark_dirty_for_cmd(&mut self, cmd: &Canvas2DCmd) {
-        match cmd {
-            Canvas2DCmd::FillRect { x, y, w, h }
-            | Canvas2DCmd::StrokeRect { x, y, w, h }
-            | Canvas2DCmd::ClearRect { x, y, w, h } => {
-                self.mark_dirty(*x, *y, *w, *h);
-            }
-            Canvas2DCmd::FillText { x, y, .. }
-            | Canvas2DCmd::StrokeText { x, y, .. } => {
-                // Text bounds are not known on the JS side; mark a generous
-                // region. The exact metrics would require a round-trip to
-                // the render thread which is not worth the cost. Use a
-                // large sentinel that will effectively become full-canvas.
-                self.mark_dirty(*x, *y, f32::MAX / 2.0, f32::MAX / 2.0);
-            }
-            Canvas2DCmd::Fill | Canvas2DCmd::Stroke | Canvas2DCmd::Clip => {
-                // Path-based commands: exact bounds unknown, mark full-canvas.
-                self.mark_dirty(0.0, 0.0, f32::MAX / 2.0, f32::MAX / 2.0);
-            }
-            Canvas2DCmd::DrawImageBatch { draws } => {
-                for d in draws {
-                    self.mark_dirty(d.dx, d.dy, d.dw, d.dh);
-                }
-            }
-            // Style setters, state, transforms, path building -- not draws.
-            _ => {}
-        }
-    }
-
-    fn set_fill_color(&mut self, color: Color) {
-        if self.fill_color != Some(color) {
-            self.fill_color = Some(color);
-            self.commands.push(Canvas2DCmd::SetFillStyle { color });
-        }
-    }
-
-    fn set_stroke_color(&mut self, color: Color) {
-        if self.stroke_color != Some(color) {
-            self.stroke_color = Some(color);
-            self.commands.push(Canvas2DCmd::SetStrokeStyle { color });
-        }
-    }
-
-    fn set_line_width(&mut self, width: f32) {
-        if self.line_width != Some(width) {
-            self.line_width = Some(width);
-            self.commands.push(Canvas2DCmd::SetLineWidth { width });
-        }
-    }
-
-    fn set_global_alpha(&mut self, alpha: f32) {
-        if self.global_alpha != Some(alpha) {
-            self.global_alpha = Some(alpha);
-            self.commands.push(Canvas2DCmd::SetGlobalAlpha { alpha });
-        }
-    }
-
-    fn set_composite_operation(&mut self, op: u8) {
-        self.commands
-            .push(Canvas2DCmd::SetCompositeOperation { op });
-    }
-
-    fn set_line_dash(&mut self, segments: Vec<f32>) {
-        self.commands.push(Canvas2DCmd::SetLineDash { segments });
-    }
-
-    fn set_line_dash_offset(&mut self, offset: f32) {
-        self.commands
-            .push(Canvas2DCmd::SetLineDashOffset { offset });
-    }
-
-    fn set_shadow_blur(&mut self, blur: f32) {
-        self.commands.push(Canvas2DCmd::SetShadowBlur { blur });
-    }
-    fn set_shadow_color(&mut self, color: Color) {
-        self.commands.push(Canvas2DCmd::SetShadowColor { color });
-    }
-    fn set_shadow_offset_x(&mut self, offset: f32) {
-        self.commands.push(Canvas2DCmd::SetShadowOffsetX { offset });
-    }
-    fn set_shadow_offset_y(&mut self, offset: f32) {
-        self.commands.push(Canvas2DCmd::SetShadowOffsetY { offset });
-    }
-
-    fn set_fill_style_gradient(
-        &mut self,
-        gradient_type: GradientType,
-        x0: f32,
-        y0: f32,
-        r0: f32,
-        x1: f32,
-        y1: f32,
-        r1: f32,
-        stops: Vec<shared::protocol::render_cmd::GradientStop>,
-    ) {
-        self.fill_color = None; // invalidate solid-color cache
-        self.commands.push(Canvas2DCmd::SetFillStyleGradient {
-            gradient_type,
-            x0,
-            y0,
-            r0,
-            x1,
-            y1,
-            r1,
-            stops,
-        });
-    }
-
-    fn set_fill_style_pattern(&mut self, image_id: u32, repeat_x: bool, repeat_y: bool) {
-        self.fill_color = None;
-        self.commands
-            .push(Canvas2DCmd::SetFillStylePattern { image_id, repeat_x, repeat_y });
-    }
-
-    fn set_stroke_style_pattern(&mut self, image_id: u32, repeat_x: bool, repeat_y: bool) {
-        self.stroke_color = None;
-        self.commands.push(Canvas2DCmd::SetStrokeStylePattern {
-            image_id,
-            repeat_x,
-            repeat_y,
-        });
-    }
-
-    fn set_stroke_style_gradient(
-        &mut self,
-        gradient_type: GradientType,
-        x0: f32,
-        y0: f32,
-        r0: f32,
-        x1: f32,
-        y1: f32,
-        r1: f32,
-        stops: Vec<shared::protocol::render_cmd::GradientStop>,
-    ) {
-        self.stroke_color = None; // invalidate solid-color cache
-        self.commands.push(Canvas2DCmd::SetStrokeStyleGradient {
-            gradient_type,
-            x0,
-            y0,
-            r0,
-            x1,
-            y1,
-            r1,
-            stops,
-        });
-    }
-
-    fn set_line_cap(&mut self, cap: u8) {
-        if self.line_cap != Some(cap) {
-            self.line_cap = Some(cap);
-            self.commands.push(Canvas2DCmd::SetLineCap { cap });
-        }
-    }
-
-    fn set_line_join(&mut self, join: u8) {
-        if self.line_join != Some(join) {
-            self.line_join = Some(join);
-            self.commands.push(Canvas2DCmd::SetLineJoin { join });
-        }
-    }
-
-    fn set_miter_limit(&mut self, limit: f32) {
-        if self.miter_limit != Some(limit) {
-            self.miter_limit = Some(limit);
-            self.commands.push(Canvas2DCmd::SetMiterLimit { limit });
-        }
-    }
-
-    fn set_text_align(&mut self, align: TextAlign) {
-        if self.text_align != Some(align) {
-            self.text_align = Some(align);
-            self.commands.push(Canvas2DCmd::SetTextAlign { align });
-        }
-    }
-
-    fn set_text_baseline(&mut self, baseline: TextBaseline) {
-        if self.text_baseline != Some(baseline) {
-            self.text_baseline = Some(baseline);
-            self.commands
-                .push(Canvas2DCmd::SetTextBaseline { baseline });
-        }
-    }
-
-    fn set_font(&mut self, font: String) {
-        let changed = match &self.font {
-            Some(prev) => prev != &font,
-            None => true,
-        };
-        if changed {
-            self.font = Some(font.clone());
-            self.commands.push(Canvas2DCmd::SetFont { font });
-        }
-    }
-}
-
-/// Frame command collector stored in OpState.
-///
-/// Manages command buffers for multiple canvases within a single frame.
-/// Optimized for the common single-canvas case: the first canvas used is
-/// stored directly in `primary` (single `u32` comparison, no HashMap).
-/// Additional canvases fall back to the `extra` HashMap.
-pub struct FrameCommandCollector {
-    /// Canvas ID occupying the primary slot (valid when `primary_active` is true).
-    primary_id: Cell<u32>,
-    /// Whether the primary slot has been claimed.
-    primary_active: Cell<bool>,
-    /// Fast-path buffer for the primary (usually only) canvas.
-    primary: RefCell<FrameBuffer>,
-    /// Overflow buffers for additional canvases (rare in practice).
-    extra: RefCell<HashMap<u32, FrameBuffer>>,
-    total_commands: u64,
-    total_frames: u64,
-}
-
-impl FrameCommandCollector {
-    pub fn new() -> Self {
-        Self {
-            primary_id: Cell::new(0),
-            primary_active: Cell::new(false),
-            primary: RefCell::new(FrameBuffer::new()),
-            extra: RefCell::new(HashMap::new()),
-            total_commands: 0,
-            total_frames: 0,
-        }
-    }
-
-    /// Execute a closure with the mutable buffer for `canvas_id`, creating it if needed.
-    /// Fast path: single u32 comparison for the primary canvas (no hash, no HashMap lookup).
-    #[inline]
-    fn with_buffer<R>(&self, canvas_id: u32, f: impl FnOnce(&mut FrameBuffer) -> R) -> R {
-        if self.primary_active.get() {
-            if self.primary_id.get() == canvas_id {
-                return f(&mut self.primary.borrow_mut());
-            }
-        } else {
-            self.primary_id.set(canvas_id);
-            self.primary_active.set(true);
-            return f(&mut self.primary.borrow_mut());
-        }
-        // Slow path: multi-canvas fallback
-        let mut extra = self.extra.borrow_mut();
-        let buf = extra.entry(canvas_id).or_insert_with(FrameBuffer::new);
-        f(buf)
-    }
-
-    pub fn frame_begin(&self, canvas_id: u32) {
-        self.with_buffer(canvas_id, |buf| buf.clear());
-    }
-
-    pub fn frame_end(
-        &mut self,
-        canvas_id: u32,
-    ) -> Option<(Vec<Canvas2DCmd>, Option<(f32, f32, f32, f32)>)> {
-        // &mut self: use get_mut() on RefCells (zero-cost, no runtime borrow check).
-        let buf = if self.primary_active.get() && self.primary_id.get() == canvas_id {
-            self.primary.get_mut()
-        } else {
-            self.extra.get_mut().get_mut(&canvas_id)?
-        };
-        // Flush any pending same-texture batch before extracting
-        buf.flush_pending_batch();
-        if buf.commands.is_empty() {
-            return None;
-        }
-        self.total_commands += buf.commands.len() as u64;
-        self.total_frames += 1;
-        let commands = std::mem::take(&mut buf.commands);
-        let dirty_rect = buf.dirty_rect.take();
-        buf.clear();
-        Some((commands, dirty_rect))
-    }
-
-    /// Drain all active canvas buffers in a single pass.
-    /// Returns (canvas_id, commands, dirty_rect) tuples.
-    /// Uses get_mut() throughout (zero-cost RefCell access via &mut self).
-    pub fn frame_end_all(
-        &mut self,
-    ) -> Vec<(u32, Vec<Canvas2DCmd>, Option<(f32, f32, f32, f32)>)> {
-        // Pre-allocate for the expected canvas count: 1 primary + extras.
-        // Avoids a per-frame Vec::new() allocation in the common single-canvas
-        // case (capacity=1 is a single pointer-sized alloc, no realloc needed).
-        let extra_count = self.extra.get_mut().len();
-        let mut results = Vec::with_capacity(1 + extra_count);
-        if self.primary_active.get() {
-            let canvas_id = self.primary_id.get();
-            let buf = self.primary.get_mut();
-            buf.flush_pending_batch();
-            if !buf.commands.is_empty() {
-                self.total_commands += buf.commands.len() as u64;
-                self.total_frames += 1;
-                let dirty_rect = buf.dirty_rect.take();
-                results.push((canvas_id, std::mem::take(&mut buf.commands), dirty_rect));
-                buf.clear();
-            }
-        }
-        for (&canvas_id, buf) in self.extra.get_mut().iter_mut() {
-            buf.flush_pending_batch();
-            if !buf.commands.is_empty() {
-                self.total_commands += buf.commands.len() as u64;
-                self.total_frames += 1;
-                let dirty_rect = buf.dirty_rect.take();
-                results.push((canvas_id, std::mem::take(&mut buf.commands), dirty_rect));
-                buf.clear();
-            }
-        }
-        results
-    }
-
-    /// Reset dedup state and push Restore for an existing buffer (no-create).
-    /// Uses get_mut() throughout (zero-cost RefCell access via &mut self).
-    pub fn restore(&mut self, canvas_id: u32) {
-        let buf = if self.primary_active.get() && self.primary_id.get() == canvas_id {
-            Some(self.primary.get_mut())
-        } else {
-            self.extra.get_mut().get_mut(&canvas_id)
-        };
-        if let Some(buf) = buf {
-            // Reset all shadow state — restore pops unknown state from the stack
-            buf.fill_color = None;
-            buf.stroke_color = None;
-            buf.line_width = None;
-            buf.global_alpha = None;
-            buf.line_cap = None;
-            buf.line_join = None;
-            buf.miter_limit = None;
-            buf.text_align = None;
-            buf.text_baseline = None;
-            buf.font = None;
-            buf.commands.push(Canvas2DCmd::Restore);
-        }
-    }
-
-    #[inline]
-    fn push(&self, canvas_id: u32, cmd: Canvas2DCmd) {
-        self.with_buffer(canvas_id, |buf| buf.push(cmd));
-    }
-
-    #[inline]
-    fn set_fill_color(&self, canvas_id: u32, color: Color) {
-        self.with_buffer(canvas_id, |buf| buf.set_fill_color(color));
-    }
-
-    #[inline]
-    fn set_stroke_color(&self, canvas_id: u32, color: Color) {
-        self.with_buffer(canvas_id, |buf| buf.set_stroke_color(color));
-    }
-
-    #[inline]
-    fn set_line_width(&self, canvas_id: u32, width: f32) {
-        self.with_buffer(canvas_id, |buf| buf.set_line_width(width));
-    }
-
-    #[inline]
-    fn set_global_alpha(&self, canvas_id: u32, alpha: f32) {
-        self.with_buffer(canvas_id, |buf| buf.set_global_alpha(alpha));
-    }
-
-    #[inline]
-    fn set_composite_operation(&self, canvas_id: u32, op: u8) {
-        self.with_buffer(canvas_id, |buf| buf.set_composite_operation(op));
-    }
-
-    #[inline]
-    fn set_line_dash(&self, canvas_id: u32, segments: Vec<f32>) {
-        self.with_buffer(canvas_id, |buf| buf.set_line_dash(segments));
-    }
-
-    #[inline]
-    fn set_line_dash_offset(&self, canvas_id: u32, offset: f32) {
-        self.with_buffer(canvas_id, |buf| buf.set_line_dash_offset(offset));
-    }
-
-    #[inline]
-    fn set_shadow_blur(&self, canvas_id: u32, blur: f32) {
-        self.with_buffer(canvas_id, |buf| buf.set_shadow_blur(blur));
-    }
-    #[inline]
-    fn set_shadow_color(&self, canvas_id: u32, color: Color) {
-        self.with_buffer(canvas_id, |buf| buf.set_shadow_color(color));
-    }
-    #[inline]
-    fn set_shadow_offset_x(&self, canvas_id: u32, offset: f32) {
-        self.with_buffer(canvas_id, |buf| buf.set_shadow_offset_x(offset));
-    }
-    #[inline]
-    fn set_shadow_offset_y(&self, canvas_id: u32, offset: f32) {
-        self.with_buffer(canvas_id, |buf| buf.set_shadow_offset_y(offset));
-    }
-
-    #[inline]
-    fn set_fill_style_gradient(
-        &self,
-        canvas_id: u32,
-        gradient_type: GradientType,
-        x0: f32,
-        y0: f32,
-        r0: f32,
-        x1: f32,
-        y1: f32,
-        r1: f32,
-        stops: Vec<shared::protocol::render_cmd::GradientStop>,
-    ) {
-        self.with_buffer(canvas_id, |buf| {
-            buf.set_fill_style_gradient(gradient_type, x0, y0, r0, x1, y1, r1, stops)
-        });
-    }
-
-    #[inline]
-    fn set_fill_style_pattern(&self, canvas_id: u32, image_id: u32, repeat_x: bool, repeat_y: bool) {
-        self.with_buffer(canvas_id, |buf| buf.set_fill_style_pattern(image_id, repeat_x, repeat_y));
-    }
-
-    #[inline]
-    fn set_stroke_style_pattern(
-        &self,
-        canvas_id: u32,
-        image_id: u32,
-        repeat_x: bool,
-        repeat_y: bool,
-    ) {
-        self.with_buffer(canvas_id, |buf| {
-            buf.set_stroke_style_pattern(image_id, repeat_x, repeat_y)
-        });
-    }
-
-    #[inline]
-    fn set_stroke_style_gradient(
-        &self,
-        canvas_id: u32,
-        gradient_type: GradientType,
-        x0: f32,
-        y0: f32,
-        r0: f32,
-        x1: f32,
-        y1: f32,
-        r1: f32,
-        stops: Vec<shared::protocol::render_cmd::GradientStop>,
-    ) {
-        self.with_buffer(canvas_id, |buf| {
-            buf.set_stroke_style_gradient(gradient_type, x0, y0, r0, x1, y1, r1, stops)
-        });
-    }
-
-    #[inline]
-    fn set_line_cap(&self, canvas_id: u32, cap: u8) {
-        self.with_buffer(canvas_id, |buf| buf.set_line_cap(cap));
-    }
-
-    #[inline]
-    fn set_line_join(&self, canvas_id: u32, join: u8) {
-        self.with_buffer(canvas_id, |buf| buf.set_line_join(join));
-    }
-
-    #[inline]
-    fn set_miter_limit(&self, canvas_id: u32, limit: f32) {
-        self.with_buffer(canvas_id, |buf| buf.set_miter_limit(limit));
-    }
-
-    #[inline]
-    fn set_text_align(&self, canvas_id: u32, align: TextAlign) {
-        self.with_buffer(canvas_id, |buf| buf.set_text_align(align));
-    }
-
-    #[inline]
-    fn set_text_baseline(&self, canvas_id: u32, baseline: TextBaseline) {
-        self.with_buffer(canvas_id, |buf| buf.set_text_baseline(baseline));
-    }
-
-    #[inline]
-    fn set_font(&self, canvas_id: u32, font: String) {
-        self.with_buffer(canvas_id, |buf| buf.set_font(font));
-    }
-}
-
-impl Default for FrameCommandCollector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ============================================================================
 // Sync operations (request/response via RenderCommand::Canvas2D)
 // ============================================================================
 
@@ -885,40 +280,12 @@ pub fn op_create_context_2d(state: &mut OpState, #[smi] canvas_id: u32) -> i32 {
     }
 }
 
-/// Flush any pending batched Canvas2D commands for `canvas_id` to the render
-/// thread before issuing a synchronous operation (measureText, getImageData).
-///
-/// Game frameworks (e.g. Cocos Creator) render text to an offscreen canvas with
-/// fillText (batched), then immediately read pixels via texImage2D → getImageData
-/// (sync).  Without this flush the render thread has no buffered commands and
-/// returns stale / empty pixel data.
-fn flush_pending_commands(state: &mut OpState, canvas_id: u32) {
-    let pending = if let Some(collector) = state.try_borrow_mut::<FrameCommandCollector>() {
-        collector.with_buffer(canvas_id, |buf| {
-            if buf.commands.is_empty() {
-                None
-            } else {
-                Some(std::mem::take(&mut buf.commands))
-            }
-        })
-    } else {
-        None
-    };
+fn flush_pending_commands_for_state_sync(state: &mut OpState, _canvas_id: u32) {
+    crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
+}
 
-    let Some(cmds) = pending else {
-        return;
-    };
-
-    let batch_cmd = RenderCommand::Canvas2DBatch {
-        canvas_id,
-        commands: cmds,
-        dirty_rect: None, // mid-frame flush: dirty_rect tracked in full frame_end
-    };
-
-    let ctx = state.borrow::<CanvasOpState>();
-    if let Err(e) = ctx.tx.send(batch_cmd) {
-        error!("flush_pending_commands: render thread disconnected: {e}");
-    }
+fn flush_pending_commands_for_readback_sync(state: &mut OpState, _canvas_id: u32) {
+    crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
 }
 
 const OP_MEASURE_TEXT: &str = "canvas2d measure_text";
@@ -930,7 +297,7 @@ pub fn op_measure_text(
     #[string] text: String,
 ) -> TextMetrics {
     // Flush pending commands so the render thread has the latest font state.
-    flush_pending_commands(state, canvas_id);
+    flush_pending_commands_for_state_sync(state, canvas_id);
     let ctx = state.borrow::<CanvasOpState>();
     match send_render_with_resp_sync(ctx, OP_MEASURE_TEXT, |resp| RenderCommand::Canvas2D {
         canvas_id,
@@ -963,8 +330,8 @@ pub fn op_get_image_data(
     width: u32,
     height: u32,
 ) -> Vec<u8> {
-    // Flush pending draw commands so the framebuffer contains up-to-date content.
-    flush_pending_commands(state, canvas_id);
+    // Flush only dirty Canvas2D work before sync readback.
+    flush_pending_commands_for_readback_sync(state, canvas_id);
     let ctx = state.borrow::<CanvasOpState>();
     match send_render_with_resp_sync(ctx, OP_GET_IMAGE_DATA, |resp| RenderCommand::Canvas2D {
         canvas_id,
@@ -990,65 +357,46 @@ pub fn op_get_image_data(
 
 #[op2(fast)]
 pub fn op_frame_begin(state: &mut OpState, #[smi] canvas_id: u32) {
-    if let Some(collector) = state.try_borrow_mut::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.frame_begin(canvas_id);
     }
 }
 
-#[op2(fast)]
-pub fn op_frame_end(state: &mut OpState, #[smi] canvas_id: u32) {
-    let result = {
-        if let Some(collector) = state.try_borrow_mut::<FrameCommandCollector>() {
-            collector.frame_end(canvas_id)
+/// Build and send one interleaved FramePacket from all accumulated
+/// Canvas2D + GL segments, with Materialize barriers at 2D->GL transitions.
+fn do_frame_end_unified(state: &mut OpState) {
+    let packet = {
+        if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+            collector.build_frame_packet(true)
         } else {
             None
         }
     };
 
-    if let Some((cmds, dirty_rect)) = result {
-        if !cmds.is_empty() {
-            let ctx = state.borrow::<CanvasOpState>();
-            trace!(
-                "op_frame_end: sending {} commands for canvas {}",
-                cmds.len(),
-                canvas_id
-            );
-            if let Err(e) = ctx.tx.send(RenderCommand::Canvas2DBatch {
-                canvas_id,
-                commands: cmds,
-                dirty_rect,
-            }) {
-                error!("op_frame_end: send failed: {e}");
-            }
+    if let Some(packet) = packet {
+        let ctx = state.borrow::<CanvasOpState>();
+        if let Err(e) = ctx.tx.send(RenderCommand::FramePacket(packet)) {
+            error!("frame_end_unified: send failed: {e}");
         }
     }
 }
 
+/// Per-canvas frame-end. Delegates to the unified frame-end path.
+#[op2(fast)]
+pub fn op_frame_end(state: &mut OpState, #[smi] _canvas_id: u32) {
+    do_frame_end_unified(state);
+}
+
+/// Unified frame-end: primary frame-end path called from the RAF loop.
+#[op2(fast)]
+pub fn op_frame_end_unified(state: &mut OpState) {
+    do_frame_end_unified(state);
+}
+
+/// Legacy frame-end for Canvas2D only. Delegates to the unified path.
 #[op2(fast)]
 pub fn op_frame_end_all(state: &mut OpState) {
-    let triples = {
-        if let Some(collector) = state.try_borrow_mut::<FrameCommandCollector>() {
-            collector.frame_end_all()
-        } else {
-            return;
-        }
-    };
-
-    for (canvas_id, cmds, dirty_rect) in triples {
-        let ctx = state.borrow::<CanvasOpState>();
-        trace!(
-            "op_frame_end_all: sending {} commands for canvas {}",
-            cmds.len(),
-            canvas_id
-        );
-        if let Err(e) = ctx.tx.send(RenderCommand::Canvas2DBatch {
-            canvas_id,
-            commands: cmds,
-            dirty_rect,
-        }) {
-            error!("op_frame_end_all: send failed: {e}");
-        }
-    }
+    do_frame_end_unified(state);
 }
 
 #[op2(fast)]
@@ -1067,7 +415,7 @@ macro_rules! batched_op {
     ($fn_name:ident, $cmd:expr) => {
         #[op2(fast)]
         pub fn $fn_name(state: &mut OpState, #[smi] canvas_id: u32) {
-            if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+            if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
                 collector.push(canvas_id, $cmd);
             }
         }
@@ -1086,7 +434,7 @@ batched_op!(op_save, Canvas2DCmd::Save);
 
 #[op2(fast)]
 pub fn op_restore(state: &mut OpState, #[smi] canvas_id: u32) {
-    if let Some(collector) = state.try_borrow_mut::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.restore(canvas_id);
     }
 }
@@ -1096,14 +444,14 @@ batched_op!(op_reset_transform, Canvas2DCmd::ResetTransform);
 
 #[op2(fast)]
 pub fn op_move_to(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::MoveTo { x, y });
     }
 }
 
 #[op2(fast)]
 pub fn op_line_to(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::LineTo { x, y });
     }
 }
@@ -1117,7 +465,7 @@ pub fn op_quadratic_curve_to(
     x: f32,
     y: f32,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::QuadraticCurveTo { cpx, cpy, x, y });
     }
 }
@@ -1133,7 +481,7 @@ pub fn op_bezier_curve_to(
     x: f32,
     y: f32,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(
             canvas_id,
             Canvas2DCmd::BezierCurveTo {
@@ -1159,7 +507,7 @@ pub fn op_arc(
     end_angle: f32,
     counterclockwise: bool,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(
             canvas_id,
             Canvas2DCmd::Arc {
@@ -1184,7 +532,7 @@ pub fn op_arc_to(
     y2: f32,
     radius: f32,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(
             canvas_id,
             Canvas2DCmd::ArcTo {
@@ -1200,7 +548,7 @@ pub fn op_arc_to(
 
 #[op2(fast)]
 pub fn op_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::Rect { x, y, w, h });
     }
 }
@@ -1219,7 +567,7 @@ pub fn op_ellipse(
     end_angle: f32,
     counterclockwise: bool,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(
             canvas_id,
             Canvas2DCmd::Ellipse {
@@ -1239,21 +587,21 @@ pub fn op_ellipse(
 // Rectangle operations
 #[op2(fast)]
 pub fn op_fill_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::FillRect { x, y, w, h });
     }
 }
 
 #[op2(fast)]
 pub fn op_stroke_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::StrokeRect { x, y, w, h });
     }
 }
 
 #[op2(fast)]
 pub fn op_clear_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::ClearRect { x, y, w, h });
     }
 }
@@ -1268,7 +616,7 @@ pub fn op_fill_text(
     y: f32,
     max_width: f32,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(
             canvas_id,
             Canvas2DCmd::FillText {
@@ -1290,7 +638,7 @@ pub fn op_stroke_text(
     y: f32,
     max_width: f32,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(
             canvas_id,
             Canvas2DCmd::StrokeText {
@@ -1306,7 +654,7 @@ pub fn op_stroke_text(
 // Style operations (with deduplication)
 #[op2(fast)]
 pub fn op_set_fill_style(state: &mut OpState, #[smi] canvas_id: u32, #[string] color_str: String) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         let color = parse_color_string(&color_str);
         collector.set_fill_color(canvas_id, color);
     }
@@ -1318,7 +666,7 @@ pub fn op_set_stroke_style(
     #[smi] canvas_id: u32,
     #[string] color_str: String,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         let color = parse_color_string(&color_str);
         collector.set_stroke_color(canvas_id, color);
     }
@@ -1326,49 +674,49 @@ pub fn op_set_stroke_style(
 
 #[op2(fast)]
 pub fn op_set_line_width(state: &mut OpState, #[smi] canvas_id: u32, width: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_line_width(canvas_id, width);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_line_cap(state: &mut OpState, #[smi] canvas_id: u32, #[smi] cap: u8) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_line_cap(canvas_id, cap);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_line_join(state: &mut OpState, #[smi] canvas_id: u32, #[smi] join: u8) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_line_join(canvas_id, join);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_miter_limit(state: &mut OpState, #[smi] canvas_id: u32, limit: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_miter_limit(canvas_id, limit);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_global_alpha(state: &mut OpState, #[smi] canvas_id: u32, alpha: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_global_alpha(canvas_id, alpha);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_composite_operation(state: &mut OpState, #[smi] canvas_id: u32, #[smi] op: u8) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_composite_operation(canvas_id, op);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_line_dash(state: &mut OpState, #[smi] canvas_id: u32, #[buffer] segments: &[u8]) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         // segments is a Float32Array transferred as raw bytes
         let floats: Vec<f32> = segments
             .chunks_exact(4)
@@ -1380,14 +728,14 @@ pub fn op_set_line_dash(state: &mut OpState, #[smi] canvas_id: u32, #[buffer] se
 
 #[op2(fast)]
 pub fn op_set_line_dash_offset(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_line_dash_offset(canvas_id, offset);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_shadow_blur(state: &mut OpState, #[smi] canvas_id: u32, blur: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_shadow_blur(canvas_id, blur);
     }
 }
@@ -1398,7 +746,7 @@ pub fn op_set_shadow_color(
     #[smi] canvas_id: u32,
     #[string] color_str: String,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         let color = parse_color_string(&color_str);
         collector.set_shadow_color(canvas_id, color);
     }
@@ -1406,14 +754,14 @@ pub fn op_set_shadow_color(
 
 #[op2(fast)]
 pub fn op_set_shadow_offset_x(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_shadow_offset_x(canvas_id, offset);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_shadow_offset_y(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_shadow_offset_y(canvas_id, offset);
     }
 }
@@ -1431,7 +779,7 @@ pub fn op_set_fill_style_gradient(
     r1: f32,
     #[string] stops_json: String,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         // Parse stops from JSON: [{"offset":0,"r":255,"g":0,"b":0,"a":255}, ...]
         let stops = parse_gradient_stops(&stops_json);
         let gradient_type = match gradient_type {
@@ -1456,7 +804,7 @@ pub fn op_set_stroke_style_gradient(
     r1: f32,
     #[string] stops_json: String,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         let stops = parse_gradient_stops(&stops_json);
         let gradient_type = match gradient_type {
             1 => GradientType::Radial,
@@ -1524,7 +872,7 @@ pub fn op_set_fill_style_pattern(
     repeat_x: bool,
     repeat_y: bool,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_fill_style_pattern(canvas_id, image_id, repeat_x, repeat_y);
     }
 }
@@ -1537,21 +885,21 @@ pub fn op_set_stroke_style_pattern(
     repeat_x: bool,
     repeat_y: bool,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_stroke_style_pattern(canvas_id, image_id, repeat_x, repeat_y);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_font(state: &mut OpState, #[smi] canvas_id: u32, #[string] font: String) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.set_font(canvas_id, font);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_text_align(state: &mut OpState, #[smi] canvas_id: u32, #[smi] align: u8) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         let align = match align {
             0 => TextAlign::Start,
             1 => TextAlign::End,
@@ -1566,7 +914,7 @@ pub fn op_set_text_align(state: &mut OpState, #[smi] canvas_id: u32, #[smi] alig
 
 #[op2(fast)]
 pub fn op_set_text_baseline(state: &mut OpState, #[smi] canvas_id: u32, #[smi] baseline: u8) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         let baseline = match baseline {
             0 => TextBaseline::Top,
             1 => TextBaseline::Hanging,
@@ -1583,21 +931,21 @@ pub fn op_set_text_baseline(state: &mut OpState, #[smi] canvas_id: u32, #[smi] b
 // Transform operations
 #[op2(fast)]
 pub fn op_translate(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::Translate { x, y });
     }
 }
 
 #[op2(fast)]
 pub fn op_rotate(state: &mut OpState, #[smi] canvas_id: u32, angle: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::Rotate { angle });
     }
 }
 
 #[op2(fast)]
 pub fn op_scale(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::Scale { x, y });
     }
 }
@@ -1614,7 +962,7 @@ pub fn op_set_transform(
     e: f32,
     f: f32,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::SetTransform { a, b, c, d, e, f });
     }
 }
@@ -1635,7 +983,7 @@ pub fn op_draw_image(
     dw: f32,
     dh: f32,
 ) {
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(
             canvas_id,
             Canvas2DCmd::DrawImage {
@@ -1688,86 +1036,9 @@ pub fn op_draw_image_batch(state: &mut OpState, #[smi] canvas_id: u32, #[buffer]
         });
     }
 
-    if let Some(collector) = state.try_borrow::<FrameCommandCollector>() {
+    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
         collector.push(canvas_id, Canvas2DCmd::DrawImageBatch { draws });
     }
 }
 
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use shared::protocol::color::Color as SharedColor;
-    use shared::protocol::render_cmd::GradientStop;
-
-    #[test]
-    fn stroke_pattern_pushes_stroke_pattern_command() {
-        let mut buf = FrameBuffer::new();
-        buf.set_stroke_style_pattern(42, true, false);
-
-        assert!(matches!(
-            buf.commands.last(),
-            Some(Canvas2DCmd::SetStrokeStylePattern {
-                image_id: 42,
-                repeat_x: true,
-                repeat_y: false,
-            })
-        ));
-    }
-
-    #[test]
-    fn stroke_pattern_invalidates_stroke_color_cache() {
-        let mut buf = FrameBuffer::new();
-        let color = SharedColor::rgb(12, 34, 56);
-
-        buf.set_stroke_color(color);
-        buf.set_stroke_style_pattern(7, false, true);
-        buf.set_stroke_color(color);
-
-        let stroke_style_count = buf
-            .commands
-            .iter()
-            .filter(|cmd| matches!(cmd, Canvas2DCmd::SetStrokeStyle { color: c } if *c == color))
-            .count();
-
-        assert_eq!(stroke_style_count, 2);
-    }
-
-    #[test]
-    fn conic_gradient_command_preserves_start_angle_in_x1() {
-        let mut buf = FrameBuffer::new();
-        let start_angle = 1.25f32;
-
-        buf.set_fill_style_gradient(
-            GradientType::Conic,
-            100.0,
-            200.0,
-            0.0,
-            start_angle,
-            0.0,
-            0.0,
-            vec![
-                GradientStop {
-                    offset: 0.0,
-                    color: SharedColor::rgb(255, 0, 0),
-                },
-                GradientStop {
-                    offset: 1.0,
-                    color: SharedColor::rgb(0, 0, 255),
-                },
-            ],
-        );
-
-        let Some(Canvas2DCmd::SetFillStyleGradient {
-            gradient_type,
-            x1,
-            ..
-        }) = buf.commands.last()
-        else {
-            panic!("expected SetFillStyleGradient command");
-        };
-
-        assert_eq!(*gradient_type, GradientType::Conic);
-        assert!((*x1 - start_angle).abs() < f32::EPSILON);
-    }
-}
+// Tests for the unified frame collector are in frame_collector.rs.

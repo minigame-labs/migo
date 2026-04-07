@@ -2,6 +2,7 @@ pub type HostId = i32;
 
 pub(crate) mod code_cache;
 mod host;
+#[allow(dead_code)]
 pub(crate) mod isolate_pool;
 mod loader;
 

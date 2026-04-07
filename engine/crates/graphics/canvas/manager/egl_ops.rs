@@ -11,6 +11,8 @@ pub(super) struct EglInitResult {
     pub egl: egl::DynamicInstance<EGL1_4>,
     pub display: egl::Display,
     pub config: egl::Config,
+    /// The GLES version actually negotiated (3 = ES 3.0+, 2 = ES 2.0 fallback).
+    pub gles_major: u32,
 }
 
 /// Initialize EGL with the given library path
@@ -44,75 +46,51 @@ pub(super) fn init_egl(egl_lib_path: &str) -> EngineResult<EglInitResult> {
         )
     })?;
 
-    // Try configs in preference order; fall back to simpler configs on
-    // devices that don't support the full RGBA8+D16+S8 combination.
-    let configs: &[&[egl::Int]] = &[
-        // Primary: RGBA8 + Depth16 + Stencil8
-        &[
-            egl::RED_SIZE,
-            8,
-            egl::GREEN_SIZE,
-            8,
-            egl::BLUE_SIZE,
-            8,
-            egl::ALPHA_SIZE,
-            8,
-            egl::DEPTH_SIZE,
-            16,
-            egl::STENCIL_SIZE,
-            8,
-            egl::SURFACE_TYPE,
-            egl::WINDOW_BIT | egl::PBUFFER_BIT,
-            egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES2_BIT,
-            egl::NONE,
-        ],
-        // Fallback 1: Depth24 + Stencil8 (some drivers only offer D24S8 packed)
-        &[
-            egl::RED_SIZE,
-            8,
-            egl::GREEN_SIZE,
-            8,
-            egl::BLUE_SIZE,
-            8,
-            egl::ALPHA_SIZE,
-            8,
-            egl::DEPTH_SIZE,
-            24,
-            egl::STENCIL_SIZE,
-            8,
-            egl::SURFACE_TYPE,
-            egl::WINDOW_BIT | egl::PBUFFER_BIT,
-            egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES2_BIT,
-            egl::NONE,
-        ],
-        // Fallback 2: no stencil (older/simpler GPUs)
-        &[
-            egl::RED_SIZE,
-            8,
-            egl::GREEN_SIZE,
-            8,
-            egl::BLUE_SIZE,
-            8,
-            egl::ALPHA_SIZE,
-            8,
-            egl::DEPTH_SIZE,
-            16,
-            egl::STENCIL_SIZE,
-            0,
-            egl::SURFACE_TYPE,
-            egl::WINDOW_BIT | egl::PBUFFER_BIT,
-            egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES2_BIT,
-            egl::NONE,
-        ],
+    // EGL_OPENGL_ES3_BIT_KHR — request configs that support ES 3.0.
+    // Defined by EGL_KHR_create_context, widely available on Android 5.0+.
+    const OPENGL_ES3_BIT: egl::Int = 0x0040;
+
+    // Try ES 3.0-capable configs first, then fall back to ES 2.0.
+    // Within each GLES level, try depth/stencil variants in preference order.
+    struct ConfigCandidate {
+        depth: egl::Int,
+        stencil: egl::Int,
+        renderable: egl::Int,
+        gles_major: u32,
+    }
+
+    let candidates = [
+        // ES 3.0 — primary: D16+S8
+        ConfigCandidate { depth: 16, stencil: 8, renderable: OPENGL_ES3_BIT, gles_major: 3 },
+        // ES 3.0 — fallback: D24+S8 (some drivers only offer D24S8 packed)
+        ConfigCandidate { depth: 24, stencil: 8, renderable: OPENGL_ES3_BIT, gles_major: 3 },
+        // ES 3.0 — fallback: D16 no stencil
+        ConfigCandidate { depth: 16, stencil: 0, renderable: OPENGL_ES3_BIT, gles_major: 3 },
+        // ES 2.0 — primary: D16+S8
+        ConfigCandidate { depth: 16, stencil: 8, renderable: egl::OPENGL_ES2_BIT, gles_major: 2 },
+        // ES 2.0 — fallback: D24+S8
+        ConfigCandidate { depth: 24, stencil: 8, renderable: egl::OPENGL_ES2_BIT, gles_major: 2 },
+        // ES 2.0 — fallback: D16 no stencil
+        ConfigCandidate { depth: 16, stencil: 0, renderable: egl::OPENGL_ES2_BIT, gles_major: 2 },
     ];
 
     let mut config = None;
-    for attrs in configs {
-        if let Ok(Some(c)) = egl.choose_first_config(display, attrs) {
-            config = Some(c);
+    let mut gles_major = 2u32;
+    for c in &candidates {
+        let attrs = [
+            egl::RED_SIZE, 8,
+            egl::GREEN_SIZE, 8,
+            egl::BLUE_SIZE, 8,
+            egl::ALPHA_SIZE, 8,
+            egl::DEPTH_SIZE, c.depth,
+            egl::STENCIL_SIZE, c.stencil,
+            egl::SURFACE_TYPE, egl::WINDOW_BIT | egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE, c.renderable,
+            egl::NONE,
+        ];
+        if let Ok(Some(cfg)) = egl.choose_first_config(display, &attrs) {
+            config = Some(cfg);
+            gles_major = c.gles_major;
             break;
         }
     }
@@ -123,14 +101,20 @@ pub(super) fn init_egl(egl_lib_path: &str) -> EngineResult<EglInitResult> {
         )
     })?;
 
+    tracing::info!("EGL config selected: GLES {gles_major}.0");
+
     Ok(EglInitResult {
         egl,
         display,
         config,
+        gles_major,
     })
 }
 
-/// Create a pbuffer context with optional share context
+/// Create a pbuffer context with optional share context.
+///
+/// `gles_major` should match the version negotiated by `init_egl` so all
+/// contexts in the share group use the same GLES level.
 pub(super) fn create_pbuffer_context(
     egl: &egl::DynamicInstance<EGL1_4>,
     display: egl::Display,
@@ -138,8 +122,9 @@ pub(super) fn create_pbuffer_context(
     share: Option<egl::Context>,
     width: u32,
     height: u32,
+    gles_major: u32,
 ) -> EngineResult<(egl::Context, egl::Surface)> {
-    let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION as i32, 2, egl::NONE as i32];
+    let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION as i32, gles_major as i32, egl::NONE as i32];
 
     egl.bind_api(egl::OPENGL_ES_API).map_err(|e| {
         ee(

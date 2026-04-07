@@ -104,6 +104,8 @@ pub enum IOCmd {
     Open {
         path: String,
         flag: OpenFlag,
+        cleanup_path: Option<String>,
+        synthetic_stat: Option<FileStat>,
         resp: IOCmdResp<FileId>,
     },
 
@@ -194,12 +196,14 @@ pub enum IOCmd {
 
     ReadCompressedFile {
         path: String,
+        pack_data: Option<Vec<u8>>,
         resp: IOCmdResp<Vec<u8>>,
     },
 
     ReadZipEntry {
         zip_path: String,
         entries_json: String,
+        pack_data: Option<Vec<u8>>,
         resp: IOCmdResp<Vec<ZipEntryResult>>,
     },
 
@@ -209,6 +213,9 @@ pub enum IOCmd {
         path: String,
         /// "md5", "sha1", or "sha256"
         algorithm: String,
+        /// Pre-read bytes for pack-backed sources.  When `Some`, the handler
+        /// computes the digest from these bytes instead of reading from `path`.
+        pack_data: Option<Vec<u8>>,
         resp: IOCmdResp<(u64, String)>,
     },
 
@@ -223,18 +230,39 @@ pub enum IOCmd {
         path: String,
         target_width: Option<u32>,
         target_height: Option<u32>,
-        resp: IOCmdResp<NormalizedImage>,
+        /// Mount generation for cache identity.
+        cache_generation: u64,
+        /// Pre-read bytes for pack-backed sources.
+        pack_data: Option<Vec<u8>>,
+        /// Per-game cache dir for derived texture cache. None = no derived caching.
+        game_cache_dir: Option<String>,
+        /// GPU compressed texture capabilities snapshot (session-level, not global).
+        gpu_caps: crate::device::gpu_caps::GpuCapsSnapshot,
+        /// Mount table for companion file lookup (pack-backed variant resolution).
+        mount_table: Option<std::sync::Arc<crate::vfs::MountTable>>,
+        resp: IOCmdResp<DecodedImage>,
     },
 
     /// Preload multiple images in parallel.
     /// Returns a list of results (path, Ok((width, height)) or Err(error_message)).
     PreloadImages {
-        paths: Vec<String>,
+        /// Each entry is `(path, mount_generation, optional_pack_data)`.  Per-path generation
+        /// ensures /code paths use their mount generation while /user|/cache|/tmp
+        /// paths use 0, without batch-level conflation.
+        entries: Vec<(String, u64, Option<Vec<u8>>)>,
+        /// Per-game cache dir for derived texture cache. None = no derived caching.
+        game_cache_dir: Option<String>,
+        /// GPU compressed texture capabilities snapshot (session-level, not global).
+        gpu_caps: crate::device::gpu_caps::GpuCapsSnapshot,
+        /// Mount table for companion file lookup (pack-backed variant resolution).
+        mount_table: Option<std::sync::Arc<crate::vfs::MountTable>>,
         resp: IOCmdResp<Vec<(String, Result<(u32, u32), String>)>>,
     },
 
     /// Clear the image cache (useful for memory management)
     ClearImageCache {
+        /// Per-game cache dir to clear derived texture cache.
+        game_cache_dir: Option<String>,
         resp: IOCmdResp<()>,
     },
 
@@ -249,6 +277,18 @@ pub enum IOCmd {
         zip_path: String,
         dest_dir: String,
         resp: IOCmdResp<usize>,
+    },
+
+    /// Ingest a zip archive into a `.mpkg` package file.
+    ///
+    /// This replaces the old "extract to directory" flow: the zip is
+    /// converted to the runtime-native package format in a single pass.
+    IngestZipToPackage {
+        zip_path: String,
+        pkg_path: String,
+        package_name: String,
+        package_version: String,
+        resp: IOCmdResp<()>,
     },
 
     // ── Storage (KV) ──────────────────────────────────────────────
@@ -379,26 +419,77 @@ impl NormalizedImage {
             rgba: Arc::new(rgba),
         }
     }
+}
 
-    #[inline]
-    pub fn expected_len(&self) -> usize {
-        (self.width as usize)
-            .saturating_mul(self.height as usize)
-            .saturating_mul(4)
-    }
+/// GPU-ready compressed texture data (e.g., ETC2/ASTC from KTX2).
+/// Bypasses RGBA decode entirely — uploaded via `glCompressedTexImage2D`.
+#[derive(Debug, Clone)]
+pub struct CompressedImage {
+    pub width: u32,
+    pub height: u32,
+    /// Vulkan format code from the KTX2 header (e.g. 147=ETC2_RGB).
+    pub vk_format: u32,
+    /// Raw compressed block data for level 0.
+    pub data: Arc<Vec<u8>>,
+}
 
-    #[inline]
-    pub fn validate(&self) -> Result<(), EngineError> {
-        if self.rgba.len() == self.expected_len() {
-            Ok(())
-        } else {
-            Err(
-                EngineError::new(ErrorCode::InvalidImageBuffer).with_detail(format!(
-                    "rgba len mismatch: got={}, expected={}",
-                    self.rgba.len(),
-                    self.expected_len()
-                )),
-            )
+/// Decoded image: either RGBA pixels or GPU-compressed blocks.
+#[derive(Debug, Clone)]
+pub enum DecodedImage {
+    Rgba(NormalizedImage),
+    Compressed(CompressedImage),
+}
+
+/// Image load priority for scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImagePriority {
+    /// Startup-critical or scene-critical — upload immediately.
+    Critical = 0,
+    /// Normal interactive use — standard upload path.
+    Normal = 1,
+    /// Background preload — defer if upload budget is busy.
+    Background = 2,
+}
+
+impl Default for ImagePriority {
+    fn default() -> Self { Self::Normal }
+}
+
+impl DecodedImage {
+    pub fn width(&self) -> u32 {
+        match self {
+            Self::Rgba(img) => img.width,
+            Self::Compressed(img) => img.width,
         }
     }
+    pub fn height(&self) -> u32 {
+        match self {
+            Self::Rgba(img) => img.height,
+            Self::Compressed(img) => img.height,
+        }
+    }
+}
+
+/// Known image variant extensions for companion file lookup and cache keying.
+pub const VARIANT_EXTENSIONS: &[&str] = &["ktx2", "png", "jpg", "jpeg", "webp"];
+
+/// Extract the extensionless stem path: `parent/stem` (no trailing extension).
+/// E.g. `/data/tex.png` -> `/data/tex`, `/data/tex` -> `/data/tex`.
+pub fn path_stem(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    p.parent()
+        .map(|parent| {
+            let stem_name = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_else(|| p.file_name().and_then(|s| s.to_str()).unwrap_or(""));
+            parent.join(stem_name).to_string_lossy().into_owned()
+        })
+        .unwrap_or_else(|| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .or_else(|| p.file_name().and_then(|s| s.to_str()))
+                .unwrap_or(path)
+                .to_string()
+        })
 }

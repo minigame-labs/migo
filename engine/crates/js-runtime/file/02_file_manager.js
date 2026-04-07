@@ -74,6 +74,10 @@ for (let i = 0; i < 256; i++) HEX_LUT[i] = (i < 16 ? "0" : "") + i.toString(16);
 
 const SAVE_FILE_DIR = "/user";
 let _saveFileCounter = 0;
+const SAVED_FILE_REGISTRY = `${SAVE_FILE_DIR}/.migo_saved_files.json`;
+const _trackedSavedFilePaths = new Set();
+const _utf8Decoder = new TextDecoder();
+let _savedRegistryOp = Promise.resolve();
 
 function getPathExtension(path) {
   if (typeof path !== "string" || path.length === 0) {
@@ -96,9 +100,98 @@ function makeSavedFilePath(tempFilePath) {
 
 function resolveSavedFilePath(filePath, tempFilePath) {
   if (typeof filePath === "string" && filePath.length > 0) {
-    return filePath;
+    if (filePath !== SAVE_FILE_DIR && filePath !== SAVED_FILE_REGISTRY && filePath.startsWith(`${SAVE_FILE_DIR}/`)) {
+      return filePath;
+    }
+    throw new IOError("filePath must be a file path under /user");
   }
   return makeSavedFilePath(tempFilePath);
+}
+
+function queueSavedRegistryOp(op) {
+  const run = _savedRegistryOp.then(op, op);
+  _savedRegistryOp = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+function rememberSavedFilePath(path) {
+  if (typeof path === "string" && path.startsWith(`${SAVE_FILE_DIR}/`)) {
+    _trackedSavedFilePaths.add(path);
+  }
+}
+
+function shouldTrackSavedFilePath(path) {
+  if (typeof path !== "string") return false;
+  if (!path.startsWith(`${SAVE_FILE_DIR}/`)) return false;
+  return !/^\/user\/saved_[^/]+$/.test(path);
+}
+
+function decodeUtf8Bytes(data) {
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data);
+  return _utf8Decoder.decode(bytes);
+}
+
+async function loadSavedFileRegistry() {
+  try {
+    const raw = await op_read_file(SAVED_FILE_REGISTRY, undefined, undefined);
+    return Array.from(new Set(
+      decodeUtf8Bytes(raw)
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0)
+    ));
+  } catch (_) {
+    return [];
+  }
+}
+
+function loadSavedFileRegistrySync() {
+  try {
+    const raw = op_read_file_sync(SAVED_FILE_REGISTRY, undefined, undefined);
+    return Array.from(new Set(
+      decodeUtf8Bytes(raw)
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0)
+    ));
+  } catch (_) {
+    return [];
+  }
+}
+
+async function persistSavedFileRegistry(paths) {
+  await op_write_or_append_file(SAVED_FILE_REGISTRY, null, `${paths.join("\n")}\n`, "utf8", false);
+}
+
+function persistSavedFileRegistrySync(paths) {
+  op_write_or_append_file_sync(SAVED_FILE_REGISTRY, null, `${paths.join("\n")}\n`, "utf8", false);
+}
+
+async function trackSavedFilePath(path) {
+  rememberSavedFilePath(path);
+  if (!shouldTrackSavedFilePath(path)) return;
+  await queueSavedRegistryOp(async () => {
+    const current = await loadSavedFileRegistry();
+    if (!current.includes(path)) {
+      await op_write_or_append_file(SAVED_FILE_REGISTRY, null, `${path}\n`, "utf8", true);
+    }
+  });
+}
+
+function trackSavedFilePathSync(path) {
+  rememberSavedFilePath(path);
+  if (!shouldTrackSavedFilePath(path)) return;
+  op_write_or_append_file_sync(SAVED_FILE_REGISTRY, null, `${path}\n`, "utf8", true);
+}
+
+async function untrackSavedFilePath(path) {
+  _trackedSavedFilePaths.delete(path);
+  if (!shouldTrackSavedFilePath(path)) return;
+  await queueSavedRegistryOp(async () => {
+    const current = await loadSavedFileRegistry();
+    const next = current.filter((p) => p !== path);
+    await persistSavedFileRegistry(next);
+  });
 }
 
 class BaseFileManager {
@@ -106,12 +199,20 @@ class BaseFileManager {
   // access
   //
   static access(options) {
-    return wrapAsync('access', () => op_access(options.path), options);
+    return wrapAsync('access', () => {
+      return op_access(options.path).then((ok) => {
+        if (!ok) throw new IOError("No such file or directory");
+      });
+    }, options);
   }
 
   static accessSync(path_or_obj) {
     const path = typeof path_or_obj === "object" && path_or_obj !== null ? path_or_obj.path : path_or_obj;
-    wrapSync(() => { op_access_sync(path); }, "accessSync");
+    wrapSync(() => {
+      if (!op_access_sync(path)) {
+        throw new IOError("No such file or directory");
+      }
+    }, "accessSync");
   }
 
   //
@@ -282,7 +383,15 @@ class BaseFileManager {
   // unlink / removeSavedFile / rmdir
   //
   static removeSavedFile(options) {
-    return wrapAsync('removeSavedFile', () => op_unlink(options.filePath), options);
+    return wrapAsync('removeSavedFile', () => {
+      return op_unlink(options.filePath).then(async () => {
+        try {
+          await untrackSavedFilePath(options.filePath);
+        } catch (_) {
+          // Registry cleanup is best-effort; file deletion already succeeded.
+        }
+      });
+    }, options);
   }
 
   static unlink(options) {
@@ -317,6 +426,9 @@ class BaseFileManager {
     return wrapAsync('stat', () => {
       return op_stat(options.path, recursive).then((stat) => {
         if (!recursive) return { stats: new Stats(stat) };
+        if (!Array.isArray(stat)) {
+          return { stats: [new FileStats(options.path, stat)] };
+        }
         return { stats: stat.map((item) => new FileStats(item.path, item.stat)) };
       });
     }, options);
@@ -334,6 +446,7 @@ class BaseFileManager {
     return wrapSync(() => {
       const raw = op_stat_sync(path, rec);
       if (!rec) return new Stats(raw);
+      if (!Array.isArray(raw)) return [new FileStats(path, raw)];
       return raw.map((item) => new FileStats(item.path, item.stat));
     }, "statSync");
   }
@@ -404,7 +517,7 @@ class BaseFileManager {
     const pos = typeof options.position === "number" && Number.isFinite(options.position) && options.position >= 0
       ? BigInt(Math.trunc(options.position))
       : undefined;
-    const len = typeof options.length === "number" && Number.isFinite(options.length) && options.length > 0
+    const len = typeof options.length === "number" && Number.isFinite(options.length) && options.length >= 0
       ? BigInt(Math.trunc(options.length))
       : undefined;
 
@@ -428,7 +541,7 @@ class BaseFileManager {
     const pos = typeof position === "number" && Number.isFinite(position) && position >= 0
       ? BigInt(Math.trunc(position))
       : undefined;
-    const len = typeof length === "number" && Number.isFinite(length) && length > 0
+    const len = typeof length === "number" && Number.isFinite(length) && length >= 0
       ? BigInt(Math.trunc(length))
       : undefined;
 
@@ -536,8 +649,9 @@ class BaseFileManager {
       }
       const maxLen = arrayBuffer.byteLength - offset;
       const length = options.length || 0;
-      let readLen = length > 0 ? Math.min(Math.trunc(length), maxLen) : maxLen;
-      if (readLen <= 0) throw new IOError("invalid length");
+      const hasLength = typeof options.length === "number" && Number.isFinite(options.length);
+      let readLen = hasLength ? Math.min(Math.max(0, Math.trunc(options.length)), maxLen) : maxLen;
+      if (readLen < 0) throw new IOError("invalid length");
 
       let pos;
       if (typeof options.position === "number" && Number.isFinite(options.position) && options.position >= 0) {
@@ -564,8 +678,9 @@ class BaseFileManager {
       throw new IOError("invalid offset");
     }
     const maxLen = arrayBuffer.byteLength - offset;
-    let readLen = length > 0 ? Math.min(Math.trunc(length), maxLen) : maxLen;
-    if (readLen <= 0) throw new IOError("invalid length");
+    const hasLength = typeof length === "number" && Number.isFinite(length);
+    let readLen = hasLength ? Math.min(Math.max(0, Math.trunc(length)), maxLen) : maxLen;
+    if (readLen < 0) throw new IOError("invalid length");
     let pos;
     if (typeof position === "number" && Number.isFinite(position) && position >= 0) {
       pos = BigInt(Math.trunc(position));
@@ -663,7 +778,11 @@ class BaseFileManager {
           await op_copy_file(tempFilePath, savedFilePath);
           await op_unlink(tempFilePath);
         })
-        .then(() => ({ savedFilePath }));
+        .then(() => {
+          return trackSavedFilePath(savedFilePath).catch(() => undefined);
+        }).then(() => {
+          return { savedFilePath };
+        });
     }, options);
   }
 
@@ -687,6 +806,11 @@ class BaseFileManager {
         op_copy_file_sync(tempFilePath, savedFilePath);
         op_unlink_sync(tempFilePath);
       }
+      try {
+        trackSavedFilePathSync(savedFilePath);
+      } catch (_) {
+        // Registry update is best-effort; save already succeeded.
+      }
       return savedFilePath;
     }, "saveFileSync");
   }
@@ -707,7 +831,25 @@ class BaseFileManager {
   static getSavedFileList(options) {
     return wrapAsync('getSavedFileList', () => {
       return op_list_saved_files(SAVE_FILE_DIR, "saved_")
-        .then((fileList) => ({ fileList }));
+        .then(async (fileList) => {
+          const seen = new Set(fileList.map((item) => item.filePath));
+          const extras = [];
+          const persisted = await loadSavedFileRegistry();
+          for (const filePath of persisted) {
+            rememberSavedFilePath(filePath);
+          }
+          for (const filePath of _trackedSavedFilePaths) {
+            if (seen.has(filePath)) continue;
+            try {
+              const [size] = await op_get_file_info(filePath, "md5");
+              const stat = await op_stat(filePath, false);
+              extras.push({ filePath, size, createTime: stat.mtime || 0 });
+            } catch (_) {
+              // Ignore deleted or inaccessible saved paths.
+            }
+          }
+          return { fileList: fileList.concat(extras) };
+        });
     }, options || {});
   }
 }

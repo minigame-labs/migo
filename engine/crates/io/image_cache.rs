@@ -2,6 +2,10 @@
 //!
 //! Caches decoded RGBA image data to avoid re-decoding frequently used images.
 //! Uses a size-based eviction policy to control memory usage.
+//!
+//! Keys are `(path, mount_generation)` tuples so that hot-update / subpackage
+//! replacement invalidates stale entries even when the filesystem path is
+//! unchanged.
 
 use lru::LruCache;
 use std::sync::LazyLock;
@@ -14,6 +18,12 @@ const DEFAULT_MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Default maximum number of cached entries
 const DEFAULT_MAX_ENTRIES: usize = 256;
+
+/// Structured cache key: (real_path, mount_generation).
+///
+/// Using a tuple avoids delimiter collision that string concatenation
+/// would introduce (`:` is a legal path character on Linux).
+pub type ImageCacheKey = (String, u64);
 
 /// Cached image entry with reference counting.
 #[derive(Clone)]
@@ -51,9 +61,9 @@ impl CacheStats {
     }
 }
 
-/// LRU cache for decoded images.
+/// LRU cache for decoded images, keyed by `(path, mount_generation)`.
 pub struct ImageCache {
-    cache: LruCache<String, CachedImage>,
+    cache: LruCache<ImageCacheKey, CachedImage>,
     current_size: usize,
     max_size: usize,
     hits: u64,
@@ -79,8 +89,8 @@ impl ImageCache {
     }
 
     /// Get an image from cache.
-    pub fn get(&mut self, path: &str) -> Option<CachedImage> {
-        match self.cache.get(path) {
+    pub fn get(&mut self, key: &ImageCacheKey) -> Option<CachedImage> {
+        match self.cache.get(key) {
             Some(cached) => {
                 self.hits += 1;
                 Some(cached.clone())
@@ -93,7 +103,7 @@ impl ImageCache {
     }
 
     /// Insert an image into cache.
-    pub fn insert(&mut self, path: String, image: NormalizedImage) {
+    pub fn insert(&mut self, key: ImageCacheKey, image: NormalizedImage) {
         let cached = CachedImage::new(image);
         let new_size = cached.size_bytes;
 
@@ -110,18 +120,10 @@ impl ImageCache {
         }
 
         // Insert and update size (handle potential replacement)
-        if let Some(old) = self.cache.push(path, cached) {
+        if let Some(old) = self.cache.push(key, cached) {
             self.current_size = self.current_size.saturating_sub(old.1.size_bytes);
         }
         self.current_size += new_size;
-    }
-
-    /// Remove an image from cache.
-    pub fn remove(&mut self, path: &str) -> Option<CachedImage> {
-        self.cache.pop(path).map(|cached| {
-            self.current_size = self.current_size.saturating_sub(cached.size_bytes);
-            cached
-        })
     }
 
     /// Clear the entire cache.
@@ -140,11 +142,6 @@ impl ImageCache {
             hits: self.hits,
             misses: self.misses,
         }
-    }
-
-    /// Check if a path is cached.
-    pub fn contains(&self, path: &str) -> bool {
-        self.cache.contains(path)
     }
 }
 

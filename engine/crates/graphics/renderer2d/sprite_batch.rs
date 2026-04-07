@@ -118,13 +118,11 @@ impl SpriteBatcher {
             let y1 = 1.0 - (dy + dh) * 2.0 / viewport_h;
 
             // Triangle 1: top-left, top-right, bottom-left
-            self.vertices.extend_from_slice(&[
-                x0, y0, u0, v0, x1, y0, u1, v0, x0, y1, u0, v1,
-            ]);
+            self.vertices
+                .extend_from_slice(&[x0, y0, u0, v0, x1, y0, u1, v0, x0, y1, u0, v1]);
             // Triangle 2: top-right, bottom-right, bottom-left
-            self.vertices.extend_from_slice(&[
-                x1, y0, u1, v0, x1, y1, u1, v1, x0, y1, u0, v1,
-            ]);
+            self.vertices
+                .extend_from_slice(&[x1, y0, u1, v0, x1, y1, u1, v1, x0, y1, u0, v1]);
         }
 
         unsafe {

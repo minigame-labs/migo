@@ -120,6 +120,17 @@ public final class NativeMethods {
         }
     }
 
+    /**
+     * Notify native code that the rendering surface was destroyed.
+     *
+     * @param sessionId The session ID
+     */
+    public static void onSurfaceDestroyed(int sessionId) {
+        if (sessionId >= 0) {
+            NativeBridge.onSurfaceDestroyed(sessionId);
+        }
+    }
+
     // ==================== Lifecycle Events ====================
 
     /**

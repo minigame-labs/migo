@@ -56,6 +56,7 @@ public class DebugOverlayView extends LinearLayout {
     // Row TextViews
     private final TextView rowFps;
     private final TextView rowTiming;
+    private final TextView rowRender;
     private final TextView rowMem;
     private final TextView rowCpu;
     private TextView rowFatal;
@@ -98,6 +99,7 @@ public class DebugOverlayView extends LinearLayout {
         setBackground(bg);
 
         rowFps    = createRow("-- FPS  --ms");
+        rowRender = createRow("RAF: --  Swap: --  UQ: --  GM: --");
         rowCpu    = createRow("CPU: --");
         rowMem    = createRow("Mem: --");
         rowTiming = createRow("Start: --  1st: --");
@@ -265,9 +267,21 @@ public class DebugOverlayView extends LinearLayout {
         int fatalError  = data.length >= 16 ? buf.getInt(12) : 0;
         int firstFrameMs = data.length >= 20 ? buf.getInt(16) : 0;
         int cmdDrops     = data.length >= 24 ? buf.getInt(20) : 0;
+        int rafLatencyUs = data.length >= 28 ? buf.getInt(24) : 0;
+        int swapBlockUs = data.length >= 32 ? buf.getInt(28) : 0;
+        int uploadQueueDepth = data.length >= 36 ? buf.getInt(32) : 0;
+        int glyphAtlasMiss = data.length >= 40 ? buf.getInt(36) : 0;
+        // Render optimization metrics (appended at byte 40+).
+        int partialDamageFrames = data.length >= 44 ? buf.getInt(40) : 0;
+        int fullSurfaceFrames   = data.length >= 48 ? buf.getInt(44) : 0;
+        int damageAreaKpx       = data.length >= 52 ? buf.getInt(48) : 0;
+        int uploadFrameReject   = data.length >= 56 ? buf.getInt(52) : 0;
+        int droppedUploadRecov  = data.length >= 60 ? buf.getInt(56) : 0;
 
         float fps     = (fpsX10 & 0xFFFFFFFFL) / 10f;
         float frameMs = (frameTimeUs & 0xFFFFFFFFL) / 1000f;
+        float rafLatencyMs = (rafLatencyUs & 0xFFFFFFFFL) / 1000f;
+        float swapBlockMs = (swapBlockUs & 0xFFFFFFFFL) / 1000f;
 
         // Row 1: FPS + frame time + dropped + command drops
         StringBuilder sb = new StringBuilder();
@@ -280,6 +294,29 @@ public class DebugOverlayView extends LinearLayout {
         }
         rowFps.setText(sb.toString());
         rowFps.setTextColor(fps < 25 ? WARN_COLOR : TEXT_COLOR);
+
+        // Row 2: rendering latency + damage/upload optimization counters
+        long totalDmgFrames = (partialDamageFrames & 0xFFFFFFFFL) + (fullSurfaceFrames & 0xFFFFFFFFL);
+        String dmgInfo = totalDmgFrames > 0
+                ? String.format("  P:%d F:%d %dkpx",
+                    partialDamageFrames & 0xFFFFFFFFL,
+                    fullSurfaceFrames & 0xFFFFFFFFL,
+                    damageAreaKpx & 0xFFFFFFFFL)
+                : "";
+        String uploadInfo = (uploadFrameReject > 0 || droppedUploadRecov > 0)
+                ? String.format("  UR:%d DR:%d",
+                    uploadFrameReject & 0xFFFFFFFFL,
+                    droppedUploadRecov & 0xFFFFFFFFL)
+                : "";
+        rowRender.setText(String.format(
+                "RAF: %.1fms  Swap: %.1fms  UQ: %d  GM: %d%s%s",
+                rafLatencyMs,
+                swapBlockMs,
+                uploadQueueDepth & 0xFFFFFFFFL,
+                glyphAtlasMiss & 0xFFFFFFFFL,
+                dmgInfo,
+                uploadInfo));
+        rowRender.setTextColor((rafLatencyUs > 0 || swapBlockUs > 0) ? LABEL_COLOR : TEXT_COLOR);
 
         // First render (one-shot)
         if (!firstRenderShown && firstFrameMs > 0) {

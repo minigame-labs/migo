@@ -26,13 +26,15 @@ pub fn unregister_vsync_sender(id: i32) {
     senders().write().remove(&id);
 }
 
-/// Send a VSync signal to the render thread for the given host_id.
+/// Send the Choreographer frame timestamp to the render thread for the given host_id.
 /// Called from the JNI Choreographer callback.
-pub fn send_vsync(id: i32, ts_ms: f64) {
+pub fn send_vsync(id: i32, frame_time_ms: f64) {
     if let Some(tx) = senders().read().get(&id) {
-        if tx.try_send(ts_ms).is_err() {
+        if tx.try_send(frame_time_ms).is_err() {
             if let Some(stats) = shared::stats::get_stats(id) {
-                stats.dropped_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .dropped_frames
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }

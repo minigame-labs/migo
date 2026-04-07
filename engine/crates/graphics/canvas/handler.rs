@@ -3,7 +3,7 @@ use shared::{
     protocol::render_cmd::CanvasCmd,
 };
 
-use crate::{CanvasManager, onscreen_window_from_surface};
+use crate::{onscreen_window_from_surface, CanvasManager};
 
 pub(crate) struct CanvasHandler;
 
@@ -80,7 +80,7 @@ impl CanvasHandler {
                 wait_for_vsync,
                 resp,
             } => {
-                let res = cm.swap_buffers_no_restore(id, wait_for_vsync);
+                let res = cm.swap_buffers_no_restore(id, wait_for_vsync).map(|_| ());
                 let _ = resp.send(res);
             }
 
@@ -97,22 +97,31 @@ impl CanvasHandler {
             CanvasCmd::LoadImage {
                 image_id,
                 image,
+                priority,
                 resp,
             } => {
-                // Try async upload thread first.  The response is deferred
-                // until drain_upload_completed() confirms the GPU fence has
-                // signaled and the texture is registered — this prevents
-                // drawImage from hitting "shared image not found" during
-                // the upload gap.
-                match cm.submit_async_upload(image_id, &image, resp) {
-                    Ok(()) => {
-                        // Async path accepted — resp will be sent when
-                        // the fence signals in drain_upload_completed().
-                    }
-                    Err(resp) => {
-                        // Upload thread unavailable — sync upload fallback.
-                        let res = cm.load_shared_fv_image(image_id, image);
+                use shared::protocol::io_cmd::{DecodedImage, ImagePriority};
+                match image {
+                    DecodedImage::Compressed(compressed) => {
+                        // GPU-direct compressed upload — always sync (fast, no PBO needed).
+                        let res = cm.load_compressed_image(image_id, &compressed);
                         let _ = resp.send(res);
+                    }
+                    DecodedImage::Rgba(rgba_image) => {
+                        // For Critical priority: always sync upload (don't defer).
+                        // For Normal/Background: try async upload thread, fall back to sync.
+                        if priority == ImagePriority::Critical {
+                            let res = cm.load_shared_fv_image(image_id, rgba_image);
+                            let _ = resp.send(res);
+                        } else {
+                            match cm.submit_async_upload(image_id, &rgba_image, resp) {
+                                Ok(()) => {}
+                                Err(resp) => {
+                                    let res = cm.load_shared_fv_image(image_id, rgba_image);
+                                    let _ = resp.send(res);
+                                }
+                            }
+                        }
                     }
                 }
             }

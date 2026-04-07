@@ -1,4 +1,4 @@
-use std::{cell::RefCell, path::Path, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
 use deno_core::{extension, op2, OpState};
 use deno_error::JsErrorBox;
@@ -36,11 +36,83 @@ fn engine_err_to_text(e: &EngineError) -> String {
     }
 }
 
+/// Resolved image source: real path + version identity (for cache keying).
+struct ResolvedSrc {
+    path: String,
+    /// Source version for cache invalidation.
+    /// For mount-backed: mount source_mounted_at.
+    /// For mutable filesystem paths: derived from file mtime+size.
+    source_version: u64,
+    /// Pre-read bytes for pack-backed sources.
+    pack_data: Option<Vec<u8>>,
+}
+
+use shared::protocol::io_cmd::{VARIANT_EXTENSIONS, path_stem};
+
+/// Compute a cache/version token for a filesystem-backed image source and all
+/// of its known sibling variants.  Uses metadata only (mtime + size) — never
+/// reads file content — so it is safe to call on the event loop thread.
+fn variant_source_version_token(
+    path: &str,
+    virtual_src: Option<&str>,
+    mount_table: Option<&shared::vfs::MountTable>,
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    let stem = path_stem(path);
+    let virtual_stem = virtual_src.map(path_stem);
+
+    let mut candidates: Vec<(String, Option<String>)> = Vec::with_capacity(VARIANT_EXTENSIONS.len() + 1);
+    candidates.push((path.to_string(), virtual_src.map(|s| s.to_string())));
+    for ext in VARIANT_EXTENSIONS {
+        let candidate = format!("{}.{}", stem, ext);
+        if candidate != path {
+            let virtual_candidate = virtual_stem.as_ref().map(|vstem| format!("{}.{}", vstem, ext));
+            candidates.push((candidate, virtual_candidate));
+        }
+    }
+
+    for (candidate, virtual_candidate) in candidates {
+        candidate.hash(&mut h);
+        // Metadata-only versioning: (exists, size, mtime).
+        // Never reads file content — keeps this function cheap enough for
+        // the event loop thread.
+        match std::fs::metadata(&candidate) {
+            Ok(meta) => {
+                1u8.hash(&mut h);
+                meta.len().hash(&mut h);
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                mtime.hash(&mut h);
+            }
+            Err(_) => {
+                0u8.hash(&mut h);
+            }
+        }
+        if let (Some(mt), Some(virtual_candidate)) = (mount_table, virtual_candidate) {
+            virtual_candidate.hash(&mut h);
+            if let Some(resolved) = mt.resolve_code_path(&virtual_candidate) {
+                1u8.hash(&mut h);
+                resolved.source_mounted_at.hash(&mut h);
+            } else {
+                0u8.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
 fn resolve_local_src(
-    code_dir: &str,
     vfs: Option<&shared::vfs::VirtualFS>,
+    mount_table: Option<&shared::vfs::MountTable>,
     src: &str,
-) -> EngineResult<String> {
+) -> EngineResult<ResolvedSrc> {
     shared::ensure!(
         !(src.starts_with("http://") || src.starts_with("https://")),
         ErrorCode::Unsupported,
@@ -48,32 +120,66 @@ fn resolve_local_src(
         src
     );
 
-    if let Some(vfs) = vfs {
-        if !src.starts_with('/') {
-            let vpath = format!("/code/{}", src);
-            return vfs
-                .resolve(&vpath, FileOp::Read)
-                .map(|p| p.to_string_lossy().into_owned())
-                .map_err(|e| {
-                    EngineError::new(ErrorCode::PermissionDenied)
-                        .with_msg("image path resolve failed")
-                        .with_detail(format!("src={}, vpath={}, err={}", src, vpath, e))
-                });
+    // Relative path → normalize to /code/{src} and fall into the /code branch.
+    // This ensures "a.png" and "/code/a.png" always take the same path.
+    let owned_vpath;
+    let effective_src = if !src.starts_with('/') {
+        owned_vpath = format!("/code/{}", src);
+        owned_vpath.as_str()
+    } else {
+        src
+    };
+
+    // /code paths → resolve through mount table (preferred) or VFS fallback.
+    if effective_src == "/code" || effective_src.starts_with("/code/") {
+        if let Some(mt) = mount_table {
+            let resolved = mt.resolve_code_path(effective_src).ok_or_else(|| {
+                EngineError::new(ErrorCode::PermissionDenied)
+                    .with_msg("image path resolve failed")
+                    .with_detail(format!("src={}, mount resolve_code_path returned None", src))
+            })?;
+            match resolved.real_path {
+                Some(real) => {
+                    let real_str = real.to_string_lossy().into_owned();
+                    return Ok(ResolvedSrc {
+                        source_version: variant_source_version_token(&real_str, Some(effective_src), mount_table),
+                        path: real_str,
+                        pack_data: None,
+                    });
+                }
+                None => {
+                    // Pack-backed: read bytes from mount table directly.
+                    let relative = effective_src.strip_prefix("/code/").unwrap_or("");
+                    let max_len = shared::protocol::io_cmd::MAX_READ_LENGTH;
+                    if let Some(size) = mt.entry_size(relative) {
+                        if size > max_len {
+                            return Err(EngineError::new(ErrorCode::IoError)
+                                .with_msg("pack image too large")
+                                .with_detail(format!("src={}, size={}, limit={}", src, size, max_len)));
+                        }
+                    }
+                    let data = mt.read_range_limited(relative, 0, None, max_len).map_err(|e| {
+                        EngineError::new(ErrorCode::IoError)
+                            .with_msg("pack image read failed")
+                            .with_detail(format!("src={}, err={}", src, e))
+                    })?;
+                    return Ok(ResolvedSrc {
+                        path: effective_src.to_string(),
+                        source_version: resolved.source_mounted_at,
+                        pack_data: Some(data),
+                    });
+                }
+            }
         }
-
-        let is_virtual = src == "/code"
-            || src.starts_with("/code/")
-            || src == "/user"
-            || src.starts_with("/user/")
-            || src == "/cache"
-            || src.starts_with("/cache/")
-            || src == "/tmp"
-            || src.starts_with("/tmp/");
-
-        if is_virtual {
+        // Fallback: no mount table, use VFS + file-version token.
+        if let Some(vfs) = vfs {
             return vfs
-                .resolve(src, FileOp::Read)
-                .map(|p| p.to_string_lossy().into_owned())
+                .resolve(effective_src, FileOp::Read)
+                .map(|p| {
+                    let path_str = p.to_string_lossy().into_owned();
+                    let ver = variant_source_version_token(&path_str, Some(effective_src), mount_table);
+                    ResolvedSrc { path: path_str, source_version: ver, pack_data: None }
+                })
                 .map_err(|e| {
                     EngineError::new(ErrorCode::PermissionDenied)
                         .with_msg("image path resolve failed")
@@ -82,11 +188,38 @@ fn resolve_local_src(
         }
     }
 
-    if Path::new(src).is_absolute() {
-        return Ok(src.to_string());
+    // /user, /cache, /tmp: mutable paths, use file-version token.
+    let is_other_virtual = effective_src == "/user"
+        || effective_src.starts_with("/user/")
+        || effective_src == "/cache"
+        || effective_src.starts_with("/cache/")
+        || effective_src == "/tmp"
+        || effective_src.starts_with("/tmp/");
+
+    if is_other_virtual {
+        if let Some(vfs) = vfs {
+            return vfs
+                .resolve(effective_src, FileOp::Read)
+                .map(|p| {
+                    let path_str = p.to_string_lossy().into_owned();
+                    let ver = variant_source_version_token(&path_str, None, mount_table);
+                    ResolvedSrc { path: path_str, source_version: ver, pack_data: None }
+                })
+                .map_err(|e| {
+                    EngineError::new(ErrorCode::PermissionDenied)
+                        .with_msg("image path resolve failed")
+                        .with_detail(format!("src={}, err={}", src, e))
+                });
+        }
     }
 
-    Ok(Path::new(code_dir).join(src).to_string_lossy().into_owned())
+    // Non-virtual absolute path: BLOCKED.
+    Err(EngineError::new(ErrorCode::PermissionDenied)
+        .with_msg("image path not allowed")
+        .with_detail(format!(
+            "src={}: absolute host paths are not permitted; use /code, /user, /cache, or /tmp",
+            src
+        )))
 }
 
 #[op2(fast)]
@@ -110,26 +243,24 @@ async fn op_load_image_inner(
     target_width: Option<u32>,
     target_height: Option<u32>,
 ) -> EngineResult<(u32, (usize, usize))> {
-    let (io_tx, code_dir, vfs) = {
+    let (io_tx, vfs, mount_table, game_cache_dir, gpu_caps) = {
         let op = state.borrow();
         let host = op.borrow::<HostOpState>();
-        (host.io_tx.clone(), host.code_dir.clone(), host.vfs.clone())
+        let gcd = host.game_paths.as_ref()
+            .map(|gp| gp.cache_dir().to_string_lossy().into_owned());
+        (host.io_tx.clone(), host.vfs.clone(), host.mount_table.clone(), gcd, host.gpu_caps.snapshot())
     };
-
-    let code_dir = code_dir.unwrap_or_default();
-    shared::ensure!(
-        !code_dir.is_empty(),
-        ErrorCode::InvalidArgument,
-        "code_dir not available",
-        src.clone()
-    );
 
     let canvas_ctx: CanvasOpState = {
         let op = state.borrow();
         op.borrow::<CanvasOpState>().clone()
     };
 
-    let src = resolve_local_src(&code_dir, vfs.as_deref(), &src)?;
+    // Resolve path + generation atomically from a single mount table read.
+    let resolved = resolve_local_src(vfs.as_deref(), mount_table.as_deref(), &src)?;
+    let src = resolved.path;
+    let mount_generation = resolved.source_version;
+    let pack_data = resolved.pack_data;
     info!("op_load_image begin: image_id={}, src={}", image_id, src);
 
     // remove previous alias and possibly destroy old shared
@@ -144,13 +275,8 @@ async fn op_load_image_inner(
             }));
     }
 
-    // For scaled decode, suffix the cache key so that different target
-    // resolutions of the same source are cached separately, while still
-    // participating in alias tracking and texImage2D lookups.
-    let cache_key = match (target_width, target_height) {
-        (Some(tw), Some(th)) => format!("{}:{}x{}", src, tw, th),
-        _ => src.clone(),
-    };
+    // Structured cache key: (path\0WxH, generation) — no delimiter collision.
+    let cache_key = cache::make_cache_key(&src, target_width, target_height, mount_generation);
 
     match {
         let mut c = cache::IMAGE_CACHE.lock();
@@ -222,6 +348,11 @@ async fn op_load_image_inner(
                 path: src.clone(),
                 target_width,
                 target_height,
+                cache_generation: mount_generation,
+                pack_data: pack_data.clone(),
+                game_cache_dir: game_cache_dir.clone(),
+                gpu_caps,
+                mount_table: mount_table.clone(),
                 resp: IOCmdResp::Async(resp_tx),
             })
             .await
@@ -234,18 +365,17 @@ async fn op_load_image_inner(
                         image_id, src, msg
                     );
                     let mut c = cache::IMAGE_CACHE.lock();
-                    c.finish_load(image_id, shared_id, &cache_key, Err(msg));
+                    let _ = c.finish_load(image_id, shared_id, &cache_key, Err(msg));
                     return Err(e);
                 }
             };
 
-            // For scaled decodes, store under the dimension-suffixed
-            // cache_key so texImage2D(image) can find the RGBA via
-            // source_for_image_id.  Full-resolution decodes are already
-            // cached by the IO handler under the raw path — skip the
-            // redundant insert here.
+            // For scaled RGBA decodes, store in IO cache.
+            // Compressed images skip the IO cache (fast to re-read).
             if target_width.is_some() && target_height.is_some() {
-                io::global_cache().insert(cache_key.clone(), img.clone());
+                if let shared::protocol::io_cmd::DecodedImage::Rgba(ref rgba) = img {
+                    io::global_cache().insert(cache_key.clone(), rgba.clone());
+                }
             }
 
             // Upload texture under shared_id (not caller image_id).
@@ -253,12 +383,13 @@ async fn op_load_image_inner(
                 RenderCommand::Canvas(CanvasCmd::LoadImage {
                     image_id: shared_id,
                     image: img,
+                    priority: shared::protocol::io_cmd::ImagePriority::Normal,
                     resp,
                 })
             })
             .await;
 
-            {
+            let maybe_destroy = {
                 let mut c = cache::IMAGE_CACHE.lock();
                 match &res {
                     Ok((w, h)) => c.finish_load(
@@ -271,6 +402,14 @@ async fn op_load_image_inner(
                         c.finish_load(image_id, shared_id, &cache_key, Err(engine_err_to_text(e)))
                     }
                 }
+            };
+
+            if let Some(to_destroy) = maybe_destroy {
+                let _ = canvas_ctx
+                    .tx
+                    .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
+                        image_id: to_destroy,
+                    }));
             }
 
             match res {
@@ -347,53 +486,88 @@ pub async fn op_preload_images(
     state: Rc<RefCell<OpState>>,
     #[serde] paths: Vec<String>,
 ) -> Result<Vec<(String, bool, u32, u32, String)>, JsErrorBox> {
-    let (io_tx, code_dir, vfs) = {
+    let (io_tx, vfs, mount_table, game_cache_dir, gpu_caps) = {
         let op = state.borrow();
         let host = op.borrow::<HostOpState>();
-        (host.io_tx.clone(), host.code_dir.clone(), host.vfs.clone())
+        let gcd = host.game_paths.as_ref()
+            .map(|gp| gp.cache_dir().to_string_lossy().into_owned());
+        (host.io_tx.clone(), host.vfs.clone(), host.mount_table.clone(), gcd, host.gpu_caps.snapshot())
     };
 
-    let code_dir = code_dir.unwrap_or_default();
-    if code_dir.is_empty() {
-        return Err(JsErrorBox::generic("code_dir not available"));
+    // Resolve all paths atomically (path + generation per resolve call).
+    // Rejected paths become error entries; never sent to IO thread.
+    let mut io_entries: Vec<(String, u64, Option<Vec<u8>>)> = Vec::with_capacity(paths.len());
+    let mut early_errors: Vec<(usize, String)> = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        match resolve_local_src(vfs.as_deref(), mount_table.as_deref(), p) {
+            Ok(resolved) => io_entries.push((resolved.path, resolved.source_version, resolved.pack_data)),
+            Err(e) => {
+                early_errors.push((i, engine_err_to_text(&e)));
+                io_entries.push((String::new(), 0, None)); // placeholder
+            }
+        }
     }
 
-    // Resolve all paths
-    let resolved_paths: Vec<String> = paths
+    // Filter out failed entries, keeping per-path generation.
+    let io_entries_filtered: Vec<(String, u64, Option<Vec<u8>>)> = io_entries
         .iter()
-        .map(|p| resolve_local_src(&code_dir, vfs.as_deref(), p).unwrap_or_else(|_| p.clone()))
+        .enumerate()
+        .filter(|(i, _)| !early_errors.iter().any(|(ei, _)| ei == i))
+        .map(|(_, entry)| entry.clone())
         .collect();
 
-    // Send preload command to IO thread
-    let results = send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::PreloadImages {
-        paths: resolved_paths.clone(),
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(js_err_from_engine)?;
-
-    // Convert results to JS-friendly format
-    let output: Vec<(String, bool, u32, u32, String)> = results
-        .into_iter()
-        .map(|(path, result)| match result {
-            Ok((w, h)) => (path, true, w, h, String::new()),
-            Err(msg) => (path, false, 0, 0, msg),
+    // Send only successfully resolved entries to IO thread.
+    let io_results = if !io_entries_filtered.is_empty() {
+        send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::PreloadImages {
+            entries: io_entries_filtered,
+            game_cache_dir: game_cache_dir.clone(),
+            gpu_caps,
+            mount_table: mount_table.clone(),
+            resp: IOCmdResp::Async(resp_tx),
         })
-        .collect();
+        .await
+        .map_err(js_err_from_engine)?
+    } else {
+        Vec::new()
+    };
+
+    // Merge IO results with early errors into the output, preserving
+    // original order matching the input `paths`.
+    let mut io_iter = io_results.into_iter();
+    let mut output: Vec<(String, bool, u32, u32, String)> = Vec::with_capacity(paths.len());
+    for (i, original_path) in paths.iter().enumerate() {
+        if let Some(err_entry) = early_errors.iter().find(|(ei, _)| *ei == i) {
+            output.push((original_path.clone(), false, 0, 0, err_entry.1.clone()));
+        } else if let Some((_, result)) = io_iter.next() {
+            match result {
+                Ok((w, h)) => output.push((original_path.clone(), true, w, h, String::new())),
+                Err(msg) => output.push((original_path.clone(), false, 0, 0, msg)),
+            }
+        }
+    }
 
     Ok(output)
 }
 
-/// Clear the image cache
+/// Clear all image caches: JS shared cache + IO in-memory cache + derived disk cache.
 #[op2(async(lazy), fast)]
 pub async fn op_clear_image_cache(state: Rc<RefCell<OpState>>) -> Result<(), JsErrorBox> {
-    let io_tx = {
+    // 1. Destroy live shared GPU textures, then clear JS-side shared cache.
+    let (io_tx, gcd, render_tx) = {
         let op = state.borrow();
         let host = op.borrow::<HostOpState>();
-        host.io_tx.clone()
+        let dir = host.game_paths.as_ref()
+            .map(|gp| gp.cache_dir().to_string_lossy().into_owned());
+        (host.io_tx.clone(), dir, host.render_tx.clone())
     };
 
+    for shared_id in cache::drain_shared_image_cache() {
+        let _ = render_tx.send(RenderCommand::Canvas(CanvasCmd::DestroyImage { image_id: shared_id }));
+    }
+
+    // 2. Clear IO in-memory cache + derived disk cache via IO thread.
     send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::ClearImageCache {
+        game_cache_dir: gcd,
         resp: IOCmdResp::Async(resp_tx),
     })
     .await
@@ -442,4 +616,73 @@ pub(super) fn image_extensions() -> Vec<deno_core::Extension> {
 
 pub(super) fn image_lazy_extensions() -> Vec<deno_core::Extension> {
     vec![host_v8_image::lazy_init()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::variant_source_version_token;
+
+    #[test]
+    fn companion_appearing_invalidates_variant_token() {
+        let dir = std::env::temp_dir().join("migo_image_variant_token");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let png = dir.join("tex.png");
+        let ktx2 = dir.join("tex.ktx2");
+        std::fs::write(&png, b"png-v1").unwrap();
+
+        // v1: only PNG exists.
+        let v1 = variant_source_version_token(png.to_str().unwrap(), None, None);
+        // v2: KTX2 companion appears (different file set = different token).
+        std::fs::write(&ktx2, b"ktx2-v1").unwrap();
+        let v2 = variant_source_version_token(png.to_str().unwrap(), None, None);
+
+        assert_ne!(v1, v2, "adding a companion must change the version token");
+
+        // v3: KTX2 companion removed.
+        std::fs::remove_file(&ktx2).unwrap();
+        let v3 = variant_source_version_token(png.to_str().unwrap(), None, None);
+        assert_eq!(v1, v3, "removing companion should restore original token");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn companion_size_change_invalidates_variant_token() {
+        let dir = std::env::temp_dir().join("migo_image_variant_token_size");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let png = dir.join("tex.png");
+        let ktx2 = dir.join("tex.ktx2");
+        std::fs::write(&png, b"png-v1").unwrap();
+        std::fs::write(&ktx2, b"ktx2-v1").unwrap();
+        let v1 = variant_source_version_token(png.to_str().unwrap(), None, None);
+
+        // Write different-size content to companion.
+        std::fs::write(&ktx2, b"ktx2-v2-much-larger-content").unwrap();
+        let v2 = variant_source_version_token(png.to_str().unwrap(), None, None);
+
+        assert_ne!(v1, v2, "companion size change must invalidate token");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extensionless_primary_size_change_invalidates_token() {
+        let dir = std::env::temp_dir().join("migo_image_variant_token_extless");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let raw = dir.join("tex");
+        std::fs::write(&raw, b"raw-v1-short").unwrap();
+        let v1 = variant_source_version_token(raw.to_str().unwrap(), None, None);
+        // Write different-size content.
+        std::fs::write(&raw, b"raw-v2-much-longer-content-here").unwrap();
+        let v2 = variant_source_version_token(raw.to_str().unwrap(), None, None);
+
+        assert_ne!(v1, v2, "primary size change must invalidate token");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

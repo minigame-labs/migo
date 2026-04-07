@@ -10,11 +10,11 @@
 //! │                           JS Thread                                  │
 //! │                                                                      │
 //! │   RAF → ctx.fillRect() → ctx.drawImage() → ... → RAF ends          │
-//! │         FrameCommandCollector batches all commands per frame         │
+//! │         UnifiedFrameCollector batches all commands per frame         │
 //! │                                            │                         │
 //! └────────────────────────────────────────────┼─────────────────────────┘
 //!                                              │
-//!                            Canvas2DBatch (single IPC per frame)
+//!                            FramePacket (single IPC per frame)
 //!                                              │
 //!                                              ▼
 //! ┌─────────────────────────────────────────────────────────────────────┐
@@ -39,20 +39,30 @@ pub(crate) mod ahb;
 pub mod atlas;
 mod canvas;
 pub mod compressed_upload;
+pub(crate) mod damage_effect;
 pub mod device_caps;
+pub mod device_profile;
 pub mod dirty_region;
+pub mod frame_scheduler;
+mod legacy_frame_bridge;
+mod render_server;
 mod render_thread;
 mod renderer2d;
 mod renderergl;
 pub(crate) mod shader_cache;
+pub mod surface_system;
 pub mod texture_import;
+pub(crate) mod upload_server;
 pub mod upload_thread;
 
 pub mod gpu_canvas2d;
 pub mod webgpu;
 
 pub(crate) use canvas::*;
+pub(crate) use legacy_frame_bridge::LegacyFrameBridge;
+pub use render_server::RenderServer;
 pub use render_thread::*;
+pub use surface_system::{SurfaceLifecycleState, SurfaceSystem};
 
 pub(crate) use renderer2d::*;
 pub(crate) use renderergl::*;
@@ -98,4 +108,116 @@ pub(crate) fn onscreen_window_from_surface(surface: &dyn Surface) -> EngineResul
             );
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn defers_jobs_when_budget_is_exhausted() {
+    upload_server::assert_defers_jobs_when_budget_is_exhausted();
+}
+
+#[cfg(test)]
+#[test]
+fn bridge_flushes_pending_ops_without_packet_level_present_boundary() {
+    legacy_frame_bridge::assert_bridge_flushes_pending_ops_without_packet_level_present_boundary();
+}
+
+#[cfg(test)]
+#[test]
+fn hits_60fps_on_90hz_without_jittering_to_45fps() {
+    frame_scheduler::assert_hits_60fps_on_90hz_without_jittering_to_45fps();
+}
+
+#[cfg(test)]
+#[test]
+fn session_relative_time_starts_from_first_vsync() {
+    frame_scheduler::assert_session_relative_time_starts_from_first_vsync();
+}
+
+#[cfg(test)]
+#[test]
+fn does_not_present_when_surface_is_not_ready() {
+    frame_scheduler::assert_does_not_present_when_surface_is_not_ready();
+}
+
+/// WebGL-only FramePacket via for_gl_batch triggers should_present
+/// when the GL batch handler reports onscreen activity (returns true).
+#[cfg(test)]
+#[test]
+fn gl_only_packet_triggers_present_when_batch_hits_onscreen() {
+    use shared::protocol::render_cmd::GlBatchPayload;
+    use shared::FramePacket;
+
+    let packet = FramePacket::for_gl_batch(0, 0.0, Vec::new());
+
+    // Simulate: the GL batch handler returns true (hit onscreen).
+    let mut hit_count = 0u32;
+    let should_present = render_thread::execute_frame_packet_with_present_tracking(
+        packet,
+        &mut hit_count,
+        |_state, _payload| -> bool {
+            panic!("should not receive canvas batch in GL-only packet");
+        },
+        |state, _payload| -> bool {
+            *state += 1;
+            true // simulate onscreen GL rendering
+        },
+    );
+
+    assert!(should_present);
+    assert_eq!(hit_count, 1);
+}
+
+/// WebGL-only FramePacket that doesn't hit onscreen does NOT trigger present.
+#[cfg(test)]
+#[test]
+fn gl_only_packet_no_present_when_batch_is_offscreen() {
+    use shared::FramePacket;
+
+    let packet = FramePacket::for_gl_batch(0, 0.0, Vec::new());
+
+    let should_present = render_thread::execute_frame_packet_with_present_tracking(
+        packet,
+        &mut (),
+        |_, _| -> bool { panic!("no canvas batch expected") },
+        |_, _| -> bool { false }, // offscreen GL only
+    );
+
+    assert!(!should_present);
+}
+
+/// Mixed packet (Canvas2D + GL) via builder — both batches contribute to present.
+#[cfg(test)]
+#[test]
+fn mixed_canvas2d_and_gl_packet_unions_present_signals() {
+    use shared::protocol::render_cmd::{Canvas2DCmd, CanvasBatchPayload, GlBatchPayload};
+    use shared::{FrameOp, FramePacketBuilder};
+
+    let packet = FramePacketBuilder::new(0, 0.0)
+        .push(FrameOp::BeginFrame)
+        .push(FrameOp::CanvasBatch(CanvasBatchPayload {
+            canvas_id: 1,
+            commands: vec![Canvas2DCmd::Save],
+            present: true,
+            dirty_rect: None,
+        }))
+        .push(FrameOp::GlBatch(GlBatchPayload {
+            commands: Vec::new(),
+        }))
+        .finish();
+
+    let should_present = render_thread::execute_frame_packet_with_present_tracking(
+        packet,
+        &mut (0u32, 0u32),
+        |state, _| -> bool {
+            state.0 += 1;
+            true // Canvas2D hit onscreen
+        },
+        |state, _| -> bool {
+            state.1 += 1;
+            true // GL hit onscreen
+        },
+    );
+
+    assert!(should_present);
 }

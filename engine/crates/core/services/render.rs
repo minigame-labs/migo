@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-use crossbeam_channel::{RecvTimeoutError, bounded};
+use crossbeam_channel::{bounded, RecvTimeoutError};
 use tracing::{info, warn};
 
-use graphics::RenderThread;
+use graphics::{RenderThread, SurfaceSystem};
 
 use shared::{
     error::{EngineError, EngineResult, ErrorCode},
@@ -12,8 +12,28 @@ use shared::{
 };
 
 pub(crate) struct RenderService {
-    surface: SurfaceRef,
+    surface: Option<SurfaceRef>,
+    surface_system: SurfaceSystem,
     thread: RenderThread,
+}
+
+fn surface_for_restore(surface: Option<SurfaceRef>) -> EngineResult<SurfaceRef> {
+    surface.ok_or_else(|| {
+        EngineError::new(ErrorCode::InvalidOperation)
+            .with_msg("restore surface: no live surface available")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::surface_for_restore;
+
+    #[test]
+    fn restore_surface_requires_live_surface() {
+        let err = surface_for_restore(None).unwrap_err();
+        assert_eq!(err.code, shared::error::ErrorCode::InvalidOperation);
+        assert_eq!(err.msg, "restore surface: no live surface available");
+    }
 }
 
 impl RenderService {
@@ -26,6 +46,7 @@ impl RenderService {
         surface: SurfaceRef,
         pixel_ratio: f32,
         app_cache_dir: Option<std::path::PathBuf>,
+        gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
     ) -> EngineResult<Self> {
         let thread = RenderThread::spawn(
             raf_tx,
@@ -34,8 +55,15 @@ impl RenderService {
             Some(surface.clone()),
             pixel_ratio,
             app_cache_dir,
+            gpu_caps,
         )?;
-        Ok(Self { surface, thread })
+        let mut surface_system = SurfaceSystem::new();
+        surface_system.on_surface_available(surface.size());
+        Ok(Self {
+            surface: Some(surface),
+            surface_system,
+            thread,
+        })
     }
 
     #[inline]
@@ -46,11 +74,10 @@ impl RenderService {
     /// Update onscreen surface and request backend recreate.
     pub(crate) fn update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
         let surface_size = surface.size();
-        self.surface = surface.clone();
 
         let (tx, rx) = bounded::<Result<(), EngineError>>(1);
         let cmd = RenderCommand::Canvas(CanvasCmd::RecreateOnscreen {
-            surface,
+            surface: surface.clone(),
             resp: RenderCmdResp::Sync(tx),
         });
 
@@ -62,6 +89,8 @@ impl RenderService {
 
         match rx.recv_timeout(Self::RECREATE_ONSCREEN_TIMEOUT) {
             Ok(Ok(())) => {
+                self.surface = Some(surface);
+                self.surface_system.on_surface_available(surface_size);
                 info!(
                     "RenderService::update_surface ok: requested={}x{}",
                     surface_size.0, surface_size.1
@@ -105,32 +134,38 @@ impl RenderService {
     }
 
     /// Pause rendering (stop RAF ticker and frame presentation).
-    pub(crate) fn pause(&self) {
+    pub(crate) fn pause(&mut self) {
+        self.surface_system.on_pause();
         let _ = self.sender().send(RenderCommand::Pause);
     }
 
+    /// Record surface loss and clear any stale surface handle.
+    pub(crate) fn on_surface_destroyed(&mut self) {
+        self.surface = None;
+        self.surface_system.on_surface_destroyed();
+        let _ = self.sender().send(RenderCommand::SurfaceDestroyed);
+    }
+
     /// Resume rendering (restart RAF ticker and frame presentation).
-    pub(crate) fn resume(&self) {
+    pub(crate) fn resume(&mut self) {
+        self.surface_system.on_resume();
         let _ = self.sender().send(RenderCommand::Resume);
     }
 
-    /// Re-signal the current surface to the render thread.
+    /// Re-signal the current live surface to the render thread.
     ///
-    /// During `Pause`, the render thread sets `has_surface = false`.
-    /// In the normal OnHide→UpdateSurface flow, `RecreateOnscreen` restores it.
-    /// For restart (where the surface hasn't changed), call this before `resume()`
-    /// to restore `has_surface = true` so VSync frames are no longer discarded.
-    ///
-    /// This delegates to [`update_surface`](Self::update_surface), which sends a
-    /// `RecreateOnscreen` command through the crossbeam channel and blocks until
-    /// the render thread acknowledges (with a timeout). The command channel
-    /// provides the cross-thread synchronization: the caller will not return
-    /// until the render thread has processed the command and set `has_surface`.
+    /// This is only valid if the session still retains a live `SurfaceRef`.
+    /// After `on_surface_destroyed()`, the handle is cleared and callers must
+    /// wait for a fresh `update_surface()` instead of reusing a stale surface.
     pub(crate) fn restore_surface(&mut self) -> EngineResult<()> {
-        self.update_surface(self.surface.clone())
+        self.update_surface(surface_for_restore(self.surface.clone())?)
     }
 
     pub(crate) fn shutdown(&mut self) {
         self.thread.shutdown();
+    }
+
+    pub(crate) fn shutdown_detached(&mut self) {
+        self.thread.shutdown_detached();
     }
 }

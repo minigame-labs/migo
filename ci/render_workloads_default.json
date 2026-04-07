@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "path_resolution": {
+    "workload_paths": "relative_to_manifest_dir"
+  },
+  "devices": [
+    {
+      "tier": "api23-low",
+      "min_sdk": 23,
+      "performance_class": "low",
+      "refresh_class": "60hz",
+      "workloads": [
+        "cocos-webgl-gameplay",
+        "odc-canvas2d-ui",
+        "startup-loader",
+        "resize-orientation"
+      ]
+    },
+    {
+      "tier": "mid-60hz",
+      "min_sdk": 23,
+      "performance_class": "mid",
+      "refresh_class": "60hz",
+      "workloads": [
+        "cocos-webgl-gameplay",
+        "odc-canvas2d-ui",
+        "startup-loader",
+        "resize-orientation"
+      ]
+    },
+    {
+      "tier": "high-refresh",
+      "min_sdk": 23,
+      "performance_class": "high",
+      "refresh_class": "high-refresh",
+      "workloads": [
+        "cocos-webgl-gameplay",
+        "odc-canvas2d-ui",
+        "startup-loader",
+        "resize-orientation"
+      ]
+    }
+  ],
+  "workloads": [
+    {
+      "id": "cocos-webgl-gameplay",
+      "path": "../games/雷霆战机/game.js",
+      "entry": "game.js",
+      "tags": ["webgl", "gameplay", "texture-upload"]
+    },
+    {
+      "id": "odc-canvas2d-ui",
+      "path": "../games/雷霆战机/openDataContext/index.js",
+      "entry": "index.js",
+      "tags": ["canvas2d", "text", "shared-canvas"]
+    },
+    {
+      "id": "startup-loader",
+      "path": "../games/雷霆战机/first-screen.e4668.js",
+      "entry": "first-screen.e4668.js",
+      "tags": ["startup", "webgl", "texture-upload"]
+    },
+    {
+      "id": "resize-orientation",
+      "path": "../games/hxddd/main.js",
+      "entry": "main.js",
+      "tags": ["resize", "orientation", "dpr"]
+    }
+  ]
+}

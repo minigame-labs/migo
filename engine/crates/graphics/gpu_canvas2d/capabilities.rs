@@ -30,15 +30,13 @@ pub fn detect_tier(gl: &glow::Context) -> GpuCanvas2DTier {
         }
 
         // Verify compute shader support via work group count
-        let max_compute_work_group =
-            gl.get_parameter_i32(glow::MAX_COMPUTE_WORK_GROUP_COUNT);
+        let max_compute_work_group = gl.get_parameter_i32(glow::MAX_COMPUTE_WORK_GROUP_COUNT);
         if max_compute_work_group <= 0 {
             return GpuCanvas2DTier::Unsupported;
         }
 
         // Check SSBO support (need at least 4 bindings for our two-pass setup)
-        let max_ssbo =
-            gl.get_parameter_i32(glow::MAX_SHADER_STORAGE_BUFFER_BINDINGS);
+        let max_ssbo = gl.get_parameter_i32(glow::MAX_SHADER_STORAGE_BUFFER_BINDINGS);
         if max_ssbo >= 4 {
             GpuCanvas2DTier::ComputeWithSsbo
         } else {

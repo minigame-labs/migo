@@ -19,7 +19,7 @@
 
 use std::sync::Mutex;
 
-use deno_core::{Extension, JsRuntime, ModuleLoader, RuntimeOptions};
+use deno_core::{Extension, JsRuntime, RuntimeOptions};
 
 /// A prewarmed JsRuntime ready to be consumed by a game session.
 pub(crate) struct PrewarmedRuntime {

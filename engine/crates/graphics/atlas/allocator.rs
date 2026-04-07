@@ -102,7 +102,9 @@ impl AtlasAllocator {
 
         // 1. Try to fit into an existing shelf on an existing page.
         for (page_idx, page) in self.pages.iter_mut().enumerate() {
-            if let Some(region) = try_fit_in_page(page, self.atlas_size, page_idx as u32, w, h, pw, ph) {
+            if let Some(region) =
+                try_fit_in_page(page, self.atlas_size, page_idx as u32, w, h, pw, ph)
+            {
                 return Some(region);
             }
         }

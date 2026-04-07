@@ -1,4 +1,3 @@
-use std::mem;
 use std::sync::Arc;
 
 use bytemuck::allocation::cast_vec;
@@ -16,37 +15,6 @@ use shared::{
         send_gl_with_resp_sync,
     },
 };
-
-/// Initial capacity for the per-frame GL command buffer.  Most frames
-/// issue 100-500 GL commands; 256 avoids early re-allocations while
-/// keeping memory usage modest.
-const GL_BATCH_INITIAL_CAPACITY: usize = 256;
-
-pub(crate) struct GlBatchCollector {
-    commands: Vec<GLCmd>,
-}
-
-impl GlBatchCollector {
-    pub(crate) fn new() -> Self {
-        Self {
-            commands: Vec::with_capacity(GL_BATCH_INITIAL_CAPACITY),
-        }
-    }
-
-    /// Push a command into the per-frame buffer.  Commands are never
-    /// auto-flushed; they accumulate until `op_gl_flush()` at frame end.
-    /// This reduces cross-thread channel sends from ~5-15 per frame to 1.
-    fn push(&mut self, cmd: GLCmd) {
-        self.commands.push(cmd);
-    }
-
-    /// Drain all pending commands. Preserves the allocated capacity.
-    fn take_all(&mut self) -> Vec<GLCmd> {
-        let mut batch = Vec::new();
-        mem::swap(&mut self.commands, &mut batch);
-        batch
-    }
-}
 
 pub(crate) struct GlResourceIdAllocator {
     next_id: u32,
@@ -96,34 +64,12 @@ mod tests {
 }
 
 #[inline]
-fn send_gl_batch_now(state: &mut OpState, commands: Vec<GLCmd>) {
-    if commands.is_empty() {
-        return;
-    }
-    let ctx = state.borrow::<CanvasOpState>();
-    if let Err(e) = ctx.tx.send(RenderCommand::GLBatch { commands }) {
-        error!("send_gl_batch failed: {e}");
-    }
-}
-
-#[inline]
 fn queue_gl_fire_and_forget(state: &mut OpState, cmd: GLCmd) {
-    let Some(collector) = state.try_borrow_mut::<GlBatchCollector>() else {
-        error!("GlBatchCollector missing in op state");
+    let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() else {
+        error!("UnifiedFrameCollector missing in op state");
         return;
     };
-    collector.push(cmd);
-}
-
-fn flush_gl_batch(state: &mut OpState) {
-    let commands = {
-        let Some(collector) = state.try_borrow_mut::<GlBatchCollector>() else {
-            error!("GlBatchCollector missing in op state");
-            return;
-        };
-        collector.take_all()
-    };
-    send_gl_batch_now(state, commands);
+    collector.push_gl(cmd);
 }
 
 #[inline]
@@ -131,21 +77,21 @@ fn send_gl_sync_with_flush<T>(
     state: &mut OpState,
     build: impl FnOnce(RenderCmdResp<T>) -> RenderCommand,
 ) -> Result<T, EngineError> {
-    flush_gl_batch(state);
+    crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
     let ctx = state.borrow::<CanvasOpState>();
     send_gl_with_resp_sync(ctx, build)
 }
 
 #[inline]
 fn load_cached_image_rgba(image_id: u32) -> Option<(i32, i32, Arc<Vec<u8>>)> {
-    let src = {
+    let key = {
         let c = IMAGE_CACHE.lock();
-        c.source_for_image_id(image_id)
+        c.cache_key_for_image_id(image_id)
     }?;
 
     let cached = {
         let mut cache = io::global_cache();
-        cache.get(&src)
+        cache.get(&key)
     }?;
 
     Some((
@@ -166,7 +112,7 @@ pub fn op_alloc_gl_resource_id(state: &mut OpState) -> u32 {
 
 #[op2(fast)]
 pub fn op_gl_flush(state: &mut OpState) {
-    flush_gl_batch(state);
+    crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
 }
 
 #[op2(fast)]

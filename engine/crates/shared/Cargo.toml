@@ -10,11 +10,14 @@ path = "lib.rs"
 default = ["v8-limits", "code-signing"]
 codec-gbk = ["dep:encoding_rs"]
 v8-limits = []
-code-signing = ["dep:sha2", "dep:ed25519-dalek"]
+code-signing = ["dep:ed25519-dalek"]
 
 [dependencies]
 base64 = "0.22.1"
 hex = "0.4.3"
+digest = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
 tokio  = { workspace = true }
 bytemuck.workspace = true
 encoding_rs = { version = "0.8.35", optional = true }
@@ -24,9 +27,10 @@ crossbeam-channel.workspace = true
 parking_lot.workspace = true
 tracing = { workspace = true }
 raw-window-handle = { workspace = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.10" }
 ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
+crc32fast = "1"
+zstd = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"
-

@@ -61,8 +61,34 @@ pub enum WorkerError {
 
 /// Lightweight module loader for the worker thread.
 /// Mirrors `MyModuleLoader` from `core::runtime::loader` — auto-adds `.js`,
-/// patches AMD `define` modules.
-struct WorkerModuleLoader(FsModuleLoader);
+/// patches AMD `define` modules, and enforces the `/code` sandbox via
+/// the mount table (same security boundary as the main thread loader).
+struct WorkerModuleLoader {
+    inner: FsModuleLoader,
+    mount_table: Option<Arc<shared::vfs::MountTable>>,
+}
+
+impl WorkerModuleLoader {
+    /// Validate that a resolved module URL is within the /code sandbox.
+    fn validate_sandbox(
+        &self,
+        url: &deno_core::ModuleSpecifier,
+    ) -> Result<(), deno_core::error::ModuleLoaderError> {
+        let Some(mt) = self.mount_table.as_ref() else {
+            return Ok(());
+        };
+        let Ok(path) = url.to_file_path() else {
+            return Ok(());
+        };
+        if mt.is_allowed_path(&path) {
+            return Ok(());
+        }
+        Err(deno_core::error::ModuleLoaderError::generic(format!(
+            "Worker module import blocked: path escapes /code sandbox: {}",
+            path.display()
+        )))
+    }
+}
 
 impl deno_core::ModuleLoader for WorkerModuleLoader {
     fn resolve(
@@ -72,7 +98,9 @@ impl deno_core::ModuleLoader for WorkerModuleLoader {
         kind: deno_core::ResolutionKind,
     ) -> Result<deno_core::ModuleSpecifier, deno_core::error::ModuleLoaderError> {
         let spec = normalize_specifier(specifier, &kind);
-        self.0.resolve(spec.as_ref(), referrer, kind)
+        let url = self.inner.resolve(spec.as_ref(), referrer, kind)?;
+        self.validate_sandbox(&url)?;
+        Ok(url)
     }
 
     fn load(
@@ -81,7 +109,11 @@ impl deno_core::ModuleLoader for WorkerModuleLoader {
         maybe_referrer: Option<&deno_core::ModuleLoadReferrer>,
         options: deno_core::ModuleLoadOptions,
     ) -> deno_core::ModuleLoadResponse {
-        let resp = self.0.load(module_specifier, maybe_referrer, options);
+        // Defense in depth: validate on load too.
+        if let Err(e) = self.validate_sandbox(module_specifier) {
+            return deno_core::ModuleLoadResponse::Sync(Err(e));
+        }
+        let resp = self.inner.load(module_specifier, maybe_referrer, options);
         match resp {
             deno_core::ModuleLoadResponse::Sync(result) => {
                 deno_core::ModuleLoadResponse::Sync(result.and_then(patch_amd))
@@ -105,7 +137,7 @@ impl deno_core::ModuleLoader for WorkerModuleLoader {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), deno_core::error::ModuleLoaderError>>>,
     > {
-        self.0
+        self.inner
             .prepare_load(module_specifier, maybe_referrer, maybe_content, options)
     }
 
@@ -117,7 +149,7 @@ impl deno_core::ModuleLoader for WorkerModuleLoader {
         hash: u64,
         code_cache: &[u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
-        self.0.code_cache_ready(module_specifier, hash, code_cache)
+        self.inner.code_cache_ready(module_specifier, hash, code_cache)
     }
 }
 
@@ -220,6 +252,7 @@ async fn op_worker_create(
             code_dir: host.code_dir.clone(),
             game_paths: host.game_paths.clone(),
             vfs: host.vfs.clone(),
+            mount_table: host.mount_table.clone(),
             render_tx,
             io_tx,
             audio_tx,
@@ -230,6 +263,8 @@ async fn op_worker_create(
             workers_path: host.workers_path.clone(),
             network_policy: host.network_policy.clone(),
             backgrounded: host.backgrounded.clone(),
+            code_signing_enabled: host.code_signing_enabled,
+            gpu_caps: host.gpu_caps.clone(),
         };
 
         (code_dir, worker_state)
@@ -439,7 +474,6 @@ async fn op_worker_inner_recv_message(
         Some(WorkerMessage::Binary(data)) => {
             // Encode binary as JSON with base64 payload so JS can reconstruct
             info!("[Worker] worker received binary: {} bytes", data.len());
-            use deno_core::serde_json;
             let encoded = deno_core::serde_json::json!({
                 "__binary": true,
                 "base64": base64_encode(&data),
@@ -605,10 +639,14 @@ fn spawn_worker_thread(
                     .expect("Failed to create worker tokio runtime");
 
                 runtime.block_on(async move {
+                    let worker_mount_table = host_state.mount_table.clone();
                     let exts = create_worker_runtime_extensions(ctx, host_state);
 
                     let module_loader: Option<Rc<dyn ModuleLoader>> =
-                        Some(Rc::new(WorkerModuleLoader(FsModuleLoader)));
+                        Some(Rc::new(WorkerModuleLoader {
+                            inner: FsModuleLoader,
+                            mount_table: worker_mount_table,
+                        }));
 
                     // Apply the same V8 heap limits as the main thread to prevent
                     // worker code from OOM-ing the entire process.

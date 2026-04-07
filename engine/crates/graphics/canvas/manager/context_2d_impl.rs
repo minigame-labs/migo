@@ -128,10 +128,11 @@ pub(super) fn begin_canvas2d_gl_scope(gl: &glow::Context) -> Canvas2DGlScopeGuar
 }
 
 /// Flush all dirty 2D contexts
-pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<()> {
+pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<Vec<CanvasId>> {
     let saved = cm.bound;
 
     let dirty_ids: Vec<CanvasId> = cm.dirty_2d.drain().collect();
+    let mut flushed_ids = Vec::with_capacity(dirty_ids.len());
     for id in dirty_ids {
         if !cm.contexts_2d.contains_key(&id) {
             continue;
@@ -140,6 +141,7 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<()
         let _gl_scope = begin_canvas2d_gl_scope(&cm.gl);
         if let Some(ctx) = cm.contexts_2d.get_mut(&id) {
             ctx.flush();
+            flushed_ids.push(id);
         }
     }
 
@@ -153,5 +155,5 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<()
             }
         }
     }
-    Ok(())
+    Ok(flushed_ids)
 }

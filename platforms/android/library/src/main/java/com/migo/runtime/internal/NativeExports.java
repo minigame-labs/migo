@@ -2558,10 +2558,17 @@ public final class NativeExports {
                         }
 
                         @Override
-                        public void onSuccess() {
+                        public void onSuccess(String zipPath) {
                             if (!done.compareAndSet(false, true)) return;
-                            NativeMethods.onSubpackageResult(sessionId,
-                                    "{\"requestId\":" + requestId + "}");
+                            try {
+                                JSONObject res = new JSONObject();
+                                res.put("requestId", requestId);
+                                res.put("zipPath", zipPath != null ? zipPath : "");
+                                NativeMethods.onSubpackageResult(sessionId, res.toString());
+                            } catch (JSONException ignored) {
+                                NativeMethods.onSubpackageResult(sessionId,
+                                        "{\"requestId\":" + requestId + ",\"error\":\"json error\"}");
+                            }
                         }
 
                         @Override
@@ -2580,9 +2587,15 @@ public final class NativeExports {
                     });
         } catch (Exception e) {
             if (done.compareAndSet(false, true)) {
-                NativeMethods.onSubpackageResult(sessionId,
-                        "{\"requestId\":" + requestId + ",\"error\":\""
-                                + (e.getMessage() != null ? e.getMessage() : "unknown error") + "\"}");
+                try {
+                    JSONObject res = new JSONObject();
+                    res.put("requestId", requestId);
+                    res.put("error", e.getMessage() != null ? e.getMessage() : "unknown error");
+                    NativeMethods.onSubpackageResult(sessionId, res.toString());
+                } catch (JSONException ignored) {
+                    NativeMethods.onSubpackageResult(sessionId,
+                            "{\"requestId\":" + requestId + ",\"error\":\"unknown error\"}");
+                }
             }
         }
     }

@@ -5,6 +5,8 @@
 
 use glow::HasContext;
 
+use crate::device_profile::DeviceRenderProfile;
+
 /// Runtime-detected device capabilities.
 #[derive(Debug, Clone)]
 pub struct DeviceCapabilities {
@@ -17,6 +19,14 @@ pub struct DeviceCapabilities {
     pub has_compute: bool,
     /// `AHardwareBuffer` available (Android API 26+).
     pub ahb_available: bool,
+    /// `EGL_EXT_buffer_age` — can query `EGL_BUFFER_AGE_KHR` on the surface
+    /// to determine how many swaps ago the current back buffer was presented.
+    pub has_buffer_age: bool,
+    /// `EGL_KHR_partial_update` — can call `eglSetDamageRegionKHR` to tell
+    /// the compositor which region changed before swap.
+    pub has_partial_update: bool,
+    /// Runtime-detected support for compressed texture formats (ETC2/ASTC).
+    pub compressed_format_support: crate::compressed_upload::CompressedFormatSupport,
 }
 
 /// Coarse device classification that gates optimisation paths.
@@ -35,14 +45,25 @@ impl DeviceCapabilities {
     /// Pass an empty string if unavailable — AHB detection will fall back to
     /// GL extension check only.
     ///
+    /// `negotiated_gles_major` is the GLES version actually requested in the
+    /// EGL context attributes (from `EglInitResult::gles_major`). Features are
+    /// clamped to this level: even if `GL_VERSION` reports a higher version,
+    /// a context created with ES 2.0 may not expose ES 3.0 entry points on
+    /// all drivers.
+    ///
     /// Must be called with a valid GL context current on the calling thread.
-    pub fn detect(gl: &glow::Context, egl_extensions: &str) -> Self {
+    pub fn detect(gl: &glow::Context, egl_extensions: &str, negotiated_gles_major: u32, gpu_caps: &shared::device::gpu_caps::GpuCaps) -> Self {
         let version_str = unsafe { gl.get_parameter_string(glow::VERSION) };
-        let gles_version = parse_gles_version(&version_str);
+        let detected = parse_gles_version(&version_str);
+        // Use the minimum of detected and negotiated — belt-and-suspenders.
+        let gles_version = if negotiated_gles_major >= 3 {
+            detected
+        } else {
+            (detected.0.min(negotiated_gles_major), detected.1)
+        };
 
         let gl_extensions = unsafe { gl.get_parameter_string(glow::EXTENSIONS) };
-        let has_pbo =
-            gles_version >= (3, 0) || gl_extensions.contains("GL_NV_pixel_buffer_object");
+        let has_pbo = gles_version >= (3, 0) || gl_extensions.contains("GL_NV_pixel_buffer_object");
         let has_fence_sync = gles_version >= (3, 0);
         let has_compute = gles_version >= (3, 1);
 
@@ -55,12 +76,26 @@ impl DeviceCapabilities {
             && gl_extensions.contains("GL_OES_EGL_image")
             && egl_extensions.contains("EGL_ANDROID_image_native_buffer");
 
+        // EGL_EXT_buffer_age: query surface for back buffer age.
+        // EGL_KHR_partial_update: set damage region before swap.
+        // These are independent capabilities — partial_update implies buffer_age
+        // per the KHR spec (it includes the buffer age query), but EXT_buffer_age
+        // can exist without partial_update.
+        let has_buffer_age = egl_extensions.contains("EGL_EXT_buffer_age")
+            || egl_extensions.contains("EGL_KHR_partial_update");
+        let has_partial_update = egl_extensions.contains("EGL_KHR_partial_update");
+
+        let compressed_format_support = crate::compressed_upload::CompressedFormatSupport::detect(gl, gpu_caps);
+
         Self {
             gles_version,
             has_pbo,
             has_fence_sync,
             has_compute,
             ahb_available,
+            has_buffer_age,
+            has_partial_update,
+            compressed_format_support,
         }
     }
 
@@ -70,6 +105,10 @@ impl DeviceCapabilities {
         } else {
             DeviceTier::TierB
         }
+    }
+
+    pub fn render_profile(&self, api_level: u32) -> DeviceRenderProfile {
+        DeviceRenderProfile::from_detected_device(self, api_level)
     }
 }
 
@@ -92,7 +131,7 @@ fn parse_gles_version(version: &str) -> (u32, u32) {
 
 /// Returns the Android API level at runtime, or 0 on non-Android.
 #[cfg(target_os = "android")]
-fn android_api_level() -> u32 {
+pub(crate) fn android_api_level() -> u32 {
     // android_get_device_api_level() is available in all NDK API levels.
     unsafe extern "C" {
         fn android_get_device_api_level() -> i32;
@@ -102,7 +141,7 @@ fn android_api_level() -> u32 {
 }
 
 #[cfg(not(target_os = "android"))]
-fn android_api_level() -> u32 {
+pub(crate) fn android_api_level() -> u32 {
     0
 }
 

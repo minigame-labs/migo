@@ -5,6 +5,10 @@ use shared::{
 };
 use tracing::trace;
 
+use crate::damage_effect::DamageEffect;
+use crate::ScissorState;
+#[cfg(test)]
+use crate::CanvasGLState;
 use crate::CanvasManager;
 
 #[inline]
@@ -69,6 +73,40 @@ impl RendererGL {
         (vertex_src, fragment_src)
     }
 
+    /// Compute the DamageEffect for a draw call (drawArrays/drawElements).
+    /// Uses viewport ∩ scissor when scissor is enabled.
+    fn damage_for_draw(cm: &CanvasManager, canvas_id: CanvasId) -> DamageEffect {
+        let onscreen = CanvasId::from(1u32);
+        if canvas_id != onscreen {
+            return DamageEffect::NoDamage;
+        }
+        let state = match cm.gl_state.get(&canvas_id) {
+            Some(s) => s,
+            None => return DamageEffect::FullSurface,
+        };
+        draw_damage_effect(state.draws_to_default_fbo, state.viewport, state.scissor)
+    }
+
+    /// Compute the DamageEffect for a glClear call.
+    /// Only color buffer clears produce visible damage. Depth/stencil-only
+    /// clears are invisible to the compositor and return NoDamage.
+    fn damage_for_clear(cm: &CanvasManager, canvas_id: CanvasId, bit_field: u32) -> DamageEffect {
+        let onscreen = CanvasId::from(1u32);
+        let state = cm.gl_state.get(&canvas_id);
+        let is_onscreen_default_fbo = if canvas_id != onscreen {
+            false
+        } else {
+            state.map_or(true, |s| s.draws_to_default_fbo)
+        };
+        let scissor = state.map_or(
+            ScissorState::Disabled,
+            |s| s.scissor,
+        );
+        let color_mask = state.map_or((true, true, true, true), |s| s.color_mask);
+
+        clear_damage_effect(bit_field, is_onscreen_default_fbo, scissor, color_mask)
+    }
+
     /// Process a single GL command.
     ///
     /// PERF: Per-command `make_current_needed` overhead.
@@ -84,7 +122,7 @@ impl RendererGL {
         cm: &mut CanvasManager,
         gl: &glow::Context,
         cmd: GLCmd,
-    ) -> EngineResult<bool> {
+    ) -> EngineResult<DamageEffect> {
         match cmd {
             // ---------- Per-canvas stateful calls ----------
             GLCmd::Viewport {
@@ -100,7 +138,7 @@ impl RendererGL {
                 unsafe { gl.viewport(x, y, width as i32, height as i32) };
                 cm.gl_state.entry(canvas_id).or_default().viewport =
                     Some((x, y, width as i32, height as i32));
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Clear {
@@ -109,7 +147,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.clear(bit_field) };
-                Ok(true)
+                Ok(Self::damage_for_clear(cm, canvas_id, bit_field))
             }
 
             GLCmd::ClearColor {
@@ -121,7 +159,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.clear_color(r, g, b, a) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             // ---------- Program (stateful) ----------
@@ -149,7 +187,7 @@ impl RendererGL {
                     unsafe { gl.use_program(Some(ph)) };
                     cm.gl_state.entry(canvas_id).or_default().current_program = Some(program_id);
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::GetAttribLocation {
@@ -167,11 +205,11 @@ impl RendererGL {
                 })?;
                 if let Err(e) = cm.check_owner(meta.owner_canvas, canvas_id, "program") {
                     let _ = resp.send(Err(e));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
                 if meta.deleted {
                     let _ = resp.send(Ok(None));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
 
                 if let Some(ph) = meta.gl_handle {
@@ -182,7 +220,7 @@ impl RendererGL {
                 } else {
                     let _ = resp.send(Ok(None));
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::GetActiveAttrib {
@@ -200,11 +238,11 @@ impl RendererGL {
                 })?;
                 if let Err(e) = cm.check_owner(meta.owner_canvas, canvas_id, "program") {
                     let _ = resp.send(Err(e));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
                 if meta.deleted {
                     let _ = resp.send(Ok(None));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
 
                 if let Some(ph) = meta.gl_handle {
@@ -217,7 +255,7 @@ impl RendererGL {
                 } else {
                     let _ = resp.send(Ok(None));
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::GetActiveUniform {
@@ -235,11 +273,11 @@ impl RendererGL {
                 })?;
                 if let Err(e) = cm.check_owner(meta.owner_canvas, canvas_id, "program") {
                     let _ = resp.send(Err(e));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
                 if meta.deleted {
                     let _ = resp.send(Ok(None));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
 
                 if let Some(ph) = meta.gl_handle {
@@ -252,13 +290,13 @@ impl RendererGL {
                 } else {
                     let _ = resp.send(Ok(None));
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::EnableVertexAttribArray { canvas_id, index } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.enable_vertex_attrib_array(index) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::VertexAttribPointer {
@@ -278,7 +316,7 @@ impl RendererGL {
                 unsafe {
                     gl.vertex_attrib_pointer_f32(index, size, type_, normalized, stride, offset);
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::GetUniformLocation {
@@ -296,11 +334,11 @@ impl RendererGL {
                 })?;
                 if let Err(e) = cm.check_owner(meta.owner_canvas, canvas_id, "program") {
                     let _ = resp.send(Err(e));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
                 if meta.deleted {
                     let _ = resp.send(Ok(None));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
 
                 if let Some(ph) = meta.gl_handle {
@@ -312,7 +350,7 @@ impl RendererGL {
                 } else {
                     let _ = resp.send(Ok(None));
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform3f {
@@ -324,7 +362,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.uniform_3_f32(to_native_uniform_location(location).as_ref(), x, y, z) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::UniformMatrix3fv {
@@ -341,7 +379,7 @@ impl RendererGL {
                         &value,
                     )
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DrawArrays {
@@ -353,7 +391,7 @@ impl RendererGL {
                 cm.make_current_needed(canvas_id)?;
                 self.maybe_log_draw_state(gl, canvas_id, mode, count);
                 unsafe { gl.draw_arrays(mode, first, count) };
-                Ok(true)
+                Ok(Self::damage_for_draw(cm, canvas_id))
             }
 
             GLCmd::DrawElements {
@@ -366,7 +404,7 @@ impl RendererGL {
                 cm.make_current_needed(canvas_id)?;
                 self.maybe_log_draw_state(gl, canvas_id, mode, count);
                 unsafe { gl.draw_elements(mode, count, index_type, offset) };
-                Ok(true)
+                Ok(Self::damage_for_draw(cm, canvas_id))
             }
 
             // ---------- Buffers (stateful) ----------
@@ -395,17 +433,17 @@ impl RendererGL {
                 let state = cm.gl_state.entry(canvas_id).or_default();
                 if target == glow::ARRAY_BUFFER {
                     if state.bound_array_buffer == Some(Some(buf_key)) {
-                        return Ok(false);
+                        return Ok(DamageEffect::NoDamage);
                     }
                     state.bound_array_buffer = Some(Some(buf_key));
                 } else if target == glow::ELEMENT_ARRAY_BUFFER {
                     if state.bound_element_array_buffer == Some(Some(buf_key)) {
-                        return Ok(false);
+                        return Ok(DamageEffect::NoDamage);
                     }
                     state.bound_element_array_buffer = Some(Some(buf_key));
                 }
                 unsafe { gl.bind_buffer(target, native) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::BufferData {
@@ -427,7 +465,7 @@ impl RendererGL {
                         gl.buffer_data_size(target, size, usage);
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             // ---------- Context-less-ish calls (need some current context) ----------
@@ -461,7 +499,7 @@ impl RendererGL {
                         }
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::LinkProgram { program_id } => {
@@ -472,16 +510,14 @@ impl RendererGL {
                             // Try shader cache: load pre-compiled binary to skip link.
                             let (vsrc, fsrc) = Self::get_program_shader_sources(cm, meta);
                             let cache_hit = match (&cm.shader_cache, &vsrc, &fsrc) {
-                                (Some(cache), Some(vs), Some(fs)) => {
-                                    match cache.load(vs, fs) {
-                                        Some((format, buffer)) => {
-                                            let prog_binary = glow::ProgramBinary { format, buffer };
-                                            unsafe { gl.program_binary(ph, &prog_binary) };
-                                            unsafe { gl.get_program_link_status(ph) }
-                                        }
-                                        None => false,
+                                (Some(cache), Some(vs), Some(fs)) => match cache.load(vs, fs) {
+                                    Some((format, buffer)) => {
+                                        let prog_binary = glow::ProgramBinary { format, buffer };
+                                        unsafe { gl.program_binary(ph, &prog_binary) };
+                                        unsafe { gl.get_program_link_status(ph) }
                                     }
-                                }
+                                    None => false,
+                                },
                                 _ => false,
                             };
 
@@ -501,7 +537,7 @@ impl RendererGL {
                         }
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::GetProgramParameter {
@@ -515,17 +551,17 @@ impl RendererGL {
                         ErrorCode::NotFound,
                         format!("program not found: {program_id:?}"),
                     )));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 };
 
                 if meta.deleted {
                     let _ = resp.send(Ok(0));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
 
                 let Some(ph) = meta.gl_handle else {
                     let _ = resp.send(Ok(0));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 };
 
                 let v: i32 = unsafe {
@@ -543,7 +579,7 @@ impl RendererGL {
                 };
 
                 let _ = resp.send(Ok(v));
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::GetProgramInfoLog { program_id, resp } => {
@@ -551,7 +587,7 @@ impl RendererGL {
                 if let Some(meta) = cm.programs.get(&program_id) {
                     if meta.deleted {
                         let _ = resp.send(Ok(None));
-                        return Ok(false);
+                        return Ok(DamageEffect::NoDamage);
                     }
                     if let Some(ph) = meta.gl_handle {
                         unsafe {
@@ -567,7 +603,7 @@ impl RendererGL {
                         format!("program not found: {program_id:?}"),
                     )));
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DeleteProgram { program_id } => {
@@ -587,7 +623,7 @@ impl RendererGL {
                         unsafe { gl.delete_program(ph) };
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             // Shader
@@ -625,7 +661,7 @@ impl RendererGL {
                         }
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::ShaderSource {
@@ -641,7 +677,7 @@ impl RendererGL {
                             format!("shader not found: {shader_id:?}"),
                         )));
                     }
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 };
 
                 if meta.deleted {
@@ -651,7 +687,7 @@ impl RendererGL {
                             "shader already deleted",
                         )));
                     }
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
 
                 if let Some(sh) = meta.gl_handle {
@@ -667,7 +703,7 @@ impl RendererGL {
                         "shader handle missing",
                     )));
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::CompileShader { shader_id } => {
@@ -679,7 +715,7 @@ impl RendererGL {
                         }
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::AttachShader {
@@ -708,7 +744,7 @@ impl RendererGL {
                             "program/shader deleted",
                         )));
                     }
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
 
                 // WebGL-ish: must belong to same owner canvas
@@ -719,7 +755,7 @@ impl RendererGL {
                             "attach shader across different contexts",
                         )));
                     }
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
 
                 if let (Some(ph), Some(sh)) = (p.gl_handle, s.gl_handle) {
@@ -739,7 +775,7 @@ impl RendererGL {
                         "program/shader handle missing",
                     )));
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::GetShaderParameter {
@@ -753,17 +789,17 @@ impl RendererGL {
                         ErrorCode::NotFound,
                         format!("shader not found: {shader_id:?}"),
                     )));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 };
 
                 if meta.deleted {
                     let _ = resp.send(Ok(0));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
 
                 let Some(sh) = meta.gl_handle else {
                     let _ = resp.send(Ok(0));
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 };
 
                 let v: i32 = match pname {
@@ -790,12 +826,12 @@ impl RendererGL {
                             ErrorCode::InvalidArgument,
                             format!("GetShaderParameter: unsupported pname=0x{pname:04x}"),
                         )));
-                        return Ok(false);
+                        return Ok(DamageEffect::NoDamage);
                     }
                 };
 
                 let _ = resp.send(Ok(v));
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::GetShaderInfoLog { shader_id, resp } => {
@@ -803,7 +839,7 @@ impl RendererGL {
                 if let Some(meta) = cm.shaders.get(&shader_id) {
                     if meta.deleted {
                         let _ = resp.send(Ok(None));
-                        return Ok(false);
+                        return Ok(DamageEffect::NoDamage);
                     }
                     if let Some(sh) = meta.gl_handle {
                         unsafe {
@@ -819,7 +855,7 @@ impl RendererGL {
                         format!("shader not found: {shader_id:?}"),
                     )));
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DeleteShader { shader_id } => {
@@ -830,7 +866,7 @@ impl RendererGL {
                         unsafe { gl.delete_shader(sh) };
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             // Buffers
@@ -858,20 +894,33 @@ impl RendererGL {
                         }
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             // ========== Phase 1A: GL State ==========
             GLCmd::Enable { canvas_id, cap } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.enable(cap) };
-                Ok(false)
+                if cap == glow::SCISSOR_TEST {
+                    let s = cm.gl_state.entry(canvas_id).or_default();
+                    s.scissor = match s.last_scissor_rect {
+                        Some((x, y, w, h)) => ScissorState::Enabled {
+                            x, y, width: w, height: h,
+                        },
+                        None => ScissorState::EnabledUnknownRect,
+                    };
+                }
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Disable { canvas_id, cap } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.disable(cap) };
-                Ok(false)
+                if cap == glow::SCISSOR_TEST {
+                    cm.gl_state.entry(canvas_id).or_default().scissor =
+                        ScissorState::Disabled;
+                }
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::IsEnabled {
@@ -882,7 +931,7 @@ impl RendererGL {
                 cm.make_current_needed(canvas_id)?;
                 let val = unsafe { gl.is_enabled(cap) };
                 let _ = resp.send(Ok(val));
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::GetParameter {
@@ -969,7 +1018,7 @@ impl RendererGL {
                     }
                 };
                 let _ = resp.send(Ok(json));
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             // ========== Phase 1B: Textures ==========
@@ -996,7 +1045,7 @@ impl RendererGL {
                         }
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DeleteTexture { texture_id } => {
@@ -1007,13 +1056,15 @@ impl RendererGL {
                     // entries so the next BindTexture with the same ID isn't
                     // incorrectly deduped.
                     for state in cm.gl_state.values_mut() {
-                        state.bound_texture_2d.retain(|_, tid| *tid != Some(texture_id));
+                        state
+                            .bound_texture_2d
+                            .retain(|_, tid| *tid != Some(texture_id));
                     }
                     if let Some(h) = meta.gl_handle {
                         unsafe { gl.delete_texture(h) };
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::BindTexture {
@@ -1044,23 +1095,23 @@ impl RendererGL {
                     let state = cm.gl_state.entry(canvas_id).or_default();
                     let unit = state.active_texture_unit.unwrap_or(glow::TEXTURE0);
                     if state.bound_texture_2d.get(&unit) == Some(&Some(tex_key)) {
-                        return Ok(false);
+                        return Ok(DamageEffect::NoDamage);
                     }
                     state.bound_texture_2d.insert(unit, Some(tex_key));
                 }
                 unsafe { gl.bind_texture(target, native) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::ActiveTexture { canvas_id, unit } => {
                 cm.make_current_needed(canvas_id)?;
                 let state = cm.gl_state.entry(canvas_id).or_default();
                 if state.active_texture_unit == Some(unit) {
-                    return Ok(false);
+                    return Ok(DamageEffect::NoDamage);
                 }
                 state.active_texture_unit = Some(unit);
                 unsafe { gl.active_texture(unit) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::TexImage2D {
@@ -1083,8 +1134,17 @@ impl RendererGL {
                         if let Some(pool) = cm.pbo_pool_mut() {
                             if pool.is_pbo_supported() {
                                 return Self::tex_image_2d_pbo(
-                                    cm, gl, target, level, internalformat, width, height, border,
-                                    format, type_, bytes,
+                                    cm,
+                                    gl,
+                                    target,
+                                    level,
+                                    internalformat,
+                                    width,
+                                    height,
+                                    border,
+                                    format,
+                                    type_,
+                                    bytes,
                                 );
                             }
                         }
@@ -1103,7 +1163,7 @@ impl RendererGL {
                         glow::PixelUnpackData::Slice(slice),
                     );
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::TexSubImage2D {
@@ -1125,8 +1185,8 @@ impl RendererGL {
                     if let Some(pool) = cm.pbo_pool_mut() {
                         if pool.is_pbo_supported() {
                             return Self::tex_sub_image_2d_pbo(
-                                cm, gl, target, level, xoffset, yoffset, width, height,
-                                format, type_, bytes,
+                                cm, gl, target, level, xoffset, yoffset, width, height, format,
+                                type_, bytes,
                             );
                         }
                     }
@@ -1144,7 +1204,7 @@ impl RendererGL {
                         glow::PixelUnpackData::Slice(Some(bytes)),
                     );
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::TexParameteri {
@@ -1155,7 +1215,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.tex_parameter_i32(target, pname, param) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::TexParameterf {
@@ -1166,13 +1226,13 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.tex_parameter_f32(target, pname, param) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::GenerateMipmap { canvas_id, target } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.generate_mipmap(target) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::PixelStorei {
@@ -1182,7 +1242,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.pixel_store_i32(pname, param) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::CompressedTexImage2D {
@@ -1208,7 +1268,7 @@ impl RendererGL {
                         &data,
                     );
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::CompressedTexSubImage2D {
@@ -1235,7 +1295,7 @@ impl RendererGL {
                         glow::CompressedPixelUnpackData::Slice(&data),
                     );
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             // ========== Phase 1C: Buffer & Vertex Extensions ==========
@@ -1247,25 +1307,25 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.buffer_sub_data_u8_slice(target, offset, &data) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DisableVertexAttribArray { canvas_id, index } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.disable_vertex_attrib_array(index) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::ClearDepth { canvas_id, depth } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.clear_depth_f32(depth) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::ClearStencil { canvas_id, s } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.clear_stencil(s) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             // ========== Phase 2A: Blend/Depth/Stencil/Cull ==========
@@ -1276,7 +1336,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.blend_func(sfactor, dfactor) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::BlendFuncSeparate {
@@ -1288,13 +1348,13 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.blend_func_separate(src_rgb, dst_rgb, src_alpha, dst_alpha) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::BlendEquation { canvas_id, mode } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.blend_equation(mode) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::BlendEquationSeparate {
@@ -1304,7 +1364,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.blend_equation_separate(mode_rgb, mode_alpha) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::BlendColor {
@@ -1316,19 +1376,19 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.blend_color(r, g, b, a) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DepthFunc { canvas_id, func } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.depth_func(func) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DepthMask { canvas_id, flag } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.depth_mask(flag) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DepthRange {
@@ -1338,7 +1398,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.depth_range_f32(near, far) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::StencilFunc {
@@ -1349,7 +1409,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.stencil_func(func, ref_, mask) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::StencilFuncSeparate {
@@ -1361,7 +1421,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.stencil_func_separate(face, func, ref_, mask) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::StencilOp {
@@ -1372,7 +1432,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.stencil_op(fail, zfail, zpass) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::StencilOpSeparate {
@@ -1384,13 +1444,13 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.stencil_op_separate(face, fail, zfail, zpass) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::StencilMask { canvas_id, mask } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.stencil_mask(mask) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::StencilMaskSeparate {
@@ -1400,19 +1460,19 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.stencil_mask_separate(face, mask) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::CullFace { canvas_id, mode } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.cull_face(mode) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::FrontFace { canvas_id, mode } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.front_face(mode) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::ColorMask {
@@ -1424,7 +1484,8 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.color_mask(r, g, b, a) };
-                Ok(false)
+                cm.gl_state.entry(canvas_id).or_default().color_mask = (r, g, b, a);
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Scissor {
@@ -1440,13 +1501,22 @@ impl RendererGL {
                 let pw = logical_to_physical_i32(cm, width);
                 let ph = logical_to_physical_i32(cm, height);
                 unsafe { gl.scissor(px, py, pw, ph) };
-                Ok(false)
+                let s = cm.gl_state.entry(canvas_id).or_default();
+                s.last_scissor_rect = Some((px, py, pw, ph));
+                // If scissor test is currently enabled (known or unknown rect),
+                // promote to Enabled with the explicit rect.
+                if !matches!(s.scissor, ScissorState::Disabled) {
+                    s.scissor = ScissorState::Enabled {
+                        x: px, y: py, width: pw, height: ph,
+                    };
+                }
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::LineWidth { canvas_id, width } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.line_width(width) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::PolygonOffset {
@@ -1456,7 +1526,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.polygon_offset(factor, units) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             // ========== Phase 2B: Uniform Variants ==========
@@ -1467,7 +1537,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.uniform_1_i32(to_native_uniform_location(location).as_ref(), x) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform1f {
@@ -1477,7 +1547,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.uniform_1_f32(to_native_uniform_location(location).as_ref(), x) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform2f {
@@ -1488,7 +1558,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.uniform_2_f32(to_native_uniform_location(location).as_ref(), x, y) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform4f {
@@ -1503,7 +1573,7 @@ impl RendererGL {
                 unsafe {
                     gl.uniform_4_f32(to_native_uniform_location(location).as_ref(), x, y, z, w)
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform1iv {
@@ -1515,7 +1585,7 @@ impl RendererGL {
                 unsafe {
                     gl.uniform_1_i32_slice(to_native_uniform_location(location).as_ref(), &value)
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform1fv {
@@ -1527,7 +1597,7 @@ impl RendererGL {
                 unsafe {
                     gl.uniform_1_f32_slice(to_native_uniform_location(location).as_ref(), &value)
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform2iv {
@@ -1539,7 +1609,7 @@ impl RendererGL {
                 unsafe {
                     gl.uniform_2_i32_slice(to_native_uniform_location(location).as_ref(), &value)
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform2fv {
@@ -1551,7 +1621,7 @@ impl RendererGL {
                 unsafe {
                     gl.uniform_2_f32_slice(to_native_uniform_location(location).as_ref(), &value)
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform3iv {
@@ -1563,7 +1633,7 @@ impl RendererGL {
                 unsafe {
                     gl.uniform_3_i32_slice(to_native_uniform_location(location).as_ref(), &value)
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform3fv {
@@ -1575,7 +1645,7 @@ impl RendererGL {
                 unsafe {
                     gl.uniform_3_f32_slice(to_native_uniform_location(location).as_ref(), &value)
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform4iv {
@@ -1587,7 +1657,7 @@ impl RendererGL {
                 unsafe {
                     gl.uniform_4_i32_slice(to_native_uniform_location(location).as_ref(), &value)
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Uniform4fv {
@@ -1599,7 +1669,7 @@ impl RendererGL {
                 unsafe {
                     gl.uniform_4_f32_slice(to_native_uniform_location(location).as_ref(), &value)
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::UniformMatrix2fv {
@@ -1616,7 +1686,7 @@ impl RendererGL {
                         &value,
                     )
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::UniformMatrix4fv {
@@ -1633,7 +1703,7 @@ impl RendererGL {
                         &value,
                     )
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             // ========== Phase 3A: Framebuffer/Renderbuffer ==========
@@ -1660,7 +1730,7 @@ impl RendererGL {
                         ),
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DeleteFramebuffer { framebuffer_id } => {
@@ -1670,7 +1740,7 @@ impl RendererGL {
                         unsafe { gl.delete_framebuffer(h) };
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::BindFramebuffer {
@@ -1679,6 +1749,7 @@ impl RendererGL {
                 framebuffer,
             } => {
                 cm.make_current_needed(canvas_id)?;
+                let is_default = framebuffer.is_none();
                 let native = if let Some(id) = framebuffer {
                     let meta = cm.framebuffers.get(&id).ok_or_else(|| {
                         ee(
@@ -1698,7 +1769,12 @@ impl RendererGL {
                     cm.get_drawing_buffer_fbo(canvas_id)
                 };
                 unsafe { gl.bind_framebuffer(target, native) };
-                Ok(false)
+                // Track whether the draw target is the default framebuffer.
+                // FRAMEBUFFER and DRAW_FRAMEBUFFER both affect the draw binding.
+                if target == glow::FRAMEBUFFER || target == glow::DRAW_FRAMEBUFFER {
+                    cm.gl_state.entry(canvas_id).or_default().draws_to_default_fbo = is_default;
+                }
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::FramebufferTexture2D {
@@ -1734,7 +1810,7 @@ impl RendererGL {
                 unsafe {
                     gl.framebuffer_texture_2d(target, attachment, textarget, tex_handle, level)
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::FramebufferRenderbuffer {
@@ -1772,7 +1848,7 @@ impl RendererGL {
                 unsafe {
                     gl.framebuffer_renderbuffer(target, attachment, renderbuffertarget, rb_handle)
                 };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::CheckFramebufferStatus {
@@ -1783,7 +1859,7 @@ impl RendererGL {
                 cm.make_current_needed(canvas_id)?;
                 let status = unsafe { gl.check_framebuffer_status(target) };
                 let _ = resp.send(Ok(status));
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::CreateRenderbuffer {
@@ -1809,7 +1885,7 @@ impl RendererGL {
                         ),
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DeleteRenderbuffer { renderbuffer_id } => {
@@ -1819,7 +1895,7 @@ impl RendererGL {
                         unsafe { gl.delete_renderbuffer(h) };
                     }
                 }
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::BindRenderbuffer {
@@ -1846,7 +1922,7 @@ impl RendererGL {
                     None
                 };
                 unsafe { gl.bind_renderbuffer(target, native) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::RenderbufferStorage {
@@ -1858,7 +1934,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.renderbuffer_storage(target, internalformat, width, height) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             // ========== Phase 3B: Misc ==========
@@ -1873,6 +1949,22 @@ impl RendererGL {
                 resp,
             } => {
                 cm.make_current_needed(canvas_id)?;
+
+                // Detect readback from the onscreen default framebuffer.
+                // When bypass is active, the default FBO is the window surface
+                // whose contents become undefined after eglSwapBuffers.
+                // Signal the manager to disable bypass so the DrawingBuffer
+                // preserves content across swaps.
+                let onscreen_id = shared::protocol::render_cmd::CanvasId::from(1u32);
+                if canvas_id == onscreen_id {
+                    let is_default = cm
+                        .gl_state
+                        .get(&canvas_id)
+                        .map_or(true, |s| s.draws_to_default_fbo);
+                    if is_default {
+                        cm.signal_default_fbo_readback();
+                    }
+                }
                 // Calculate buffer size: width * height * bytes_per_pixel
                 // bpp depends on both format (component count) and type (bytes per component)
                 let components: i32 = match format {
@@ -1904,7 +1996,7 @@ impl RendererGL {
                     );
                 }
                 let _ = resp.send(Ok(buf));
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::Hint {
@@ -1914,7 +2006,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.hint(target, mode) };
-                Ok(false)
+                Ok(DamageEffect::NoDamage)
             }
 
             _ => {
@@ -1939,25 +2031,32 @@ impl RendererGL {
         format: u32,
         type_: u32,
         data: &[u8],
-    ) -> EngineResult<bool> {
-        let pool = cm.pbo_pool_mut().ok_or_else(|| {
-            ee(ErrorCode::RenderBackendError, "PBO pool not available")
-        })?;
-        let pbo = pool.acquire(gl, data.len()).ok_or_else(|| {
-            ee(ErrorCode::RenderBackendError, "PBO acquire failed")
-        })?;
+    ) -> EngineResult<DamageEffect> {
+        let pool = cm
+            .pbo_pool_mut()
+            .ok_or_else(|| ee(ErrorCode::RenderBackendError, "PBO pool not available"))?;
+        let pbo = pool
+            .acquire(gl, data.len())
+            .ok_or_else(|| ee(ErrorCode::RenderBackendError, "PBO acquire failed"))?;
         unsafe {
             gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pbo));
             gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, data, glow::STREAM_DRAW);
             gl.tex_image_2d(
-                target, level, internalformat, width, height, border,
-                format, type_, glow::PixelUnpackData::BufferOffset(0),
+                target,
+                level,
+                internalformat,
+                width,
+                height,
+                border,
+                format,
+                type_,
+                glow::PixelUnpackData::BufferOffset(0),
             );
             gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
         }
         let pool = cm.pbo_pool_mut().unwrap();
         pool.release(gl, pbo, data.len());
-        Ok(false)
+        Ok(DamageEffect::NoDamage)
     }
 
     /// Upload sub-image data via PBO for async DMA transfer.
@@ -1973,24 +2072,351 @@ impl RendererGL {
         format: u32,
         type_: u32,
         data: &[u8],
-    ) -> EngineResult<bool> {
-        let pool = cm.pbo_pool_mut().ok_or_else(|| {
-            ee(ErrorCode::RenderBackendError, "PBO pool not available")
-        })?;
-        let pbo = pool.acquire(gl, data.len()).ok_or_else(|| {
-            ee(ErrorCode::RenderBackendError, "PBO acquire failed")
-        })?;
+    ) -> EngineResult<DamageEffect> {
+        let pool = cm
+            .pbo_pool_mut()
+            .ok_or_else(|| ee(ErrorCode::RenderBackendError, "PBO pool not available"))?;
+        let pbo = pool
+            .acquire(gl, data.len())
+            .ok_or_else(|| ee(ErrorCode::RenderBackendError, "PBO acquire failed"))?;
         unsafe {
             gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pbo));
             gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, data, glow::STREAM_DRAW);
             gl.tex_sub_image_2d(
-                target, level, xoffset, yoffset, width, height,
-                format, type_, glow::PixelUnpackData::BufferOffset(0),
+                target,
+                level,
+                xoffset,
+                yoffset,
+                width,
+                height,
+                format,
+                type_,
+                glow::PixelUnpackData::BufferOffset(0),
             );
             gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
         }
         let pool = cm.pbo_pool_mut().unwrap();
         pool.release(gl, pbo, data.len());
-        Ok(false)
+        Ok(DamageEffect::NoDamage)
+    }
+}
+
+/// Pure-logic draw damage classification, extracted for testability.
+/// Uses `viewport ∩ scissor` when scissor test is enabled.
+pub(crate) fn draw_damage_effect(
+    draws_to_default_fbo: bool,
+    viewport: Option<(i32, i32, i32, i32)>,
+    scissor: ScissorState,
+) -> DamageEffect {
+    if !draws_to_default_fbo {
+        return DamageEffect::NoDamage;
+    }
+    let vp = match viewport {
+        Some(v) => v,
+        None => return DamageEffect::FullSurface,
+    };
+    let bounds = match scissor {
+        ScissorState::Enabled { x, y, width, height } => {
+            match crate::damage_effect::intersect_rects(vp, (x, y, width, height)) {
+                Some(isect) => isect,
+                None => return DamageEffect::NoDamage,
+            }
+        }
+        // Unknown rect: the real GL scissor box is the full drawable.
+        // Fall back to viewport — conservative, never under-reports.
+        ScissorState::EnabledUnknownRect | ScissorState::Disabled => vp,
+    };
+    DamageEffect::OnscreenRect {
+        x: bounds.0,
+        y: bounds.1,
+        width: bounds.2,
+        height: bounds.3,
+    }
+}
+
+pub(crate) fn clear_damage_effect(
+    bit_field: u32,
+    is_onscreen_default_fbo: bool,
+    scissor: ScissorState,
+    color_mask: (bool, bool, bool, bool),
+) -> DamageEffect {
+    if bit_field & glow::COLOR_BUFFER_BIT == 0 {
+        return DamageEffect::NoDamage;
+    }
+    let (r, g, b, a) = color_mask;
+    if !r && !g && !b && !a {
+        return DamageEffect::NoDamage;
+    }
+    if !is_onscreen_default_fbo {
+        return DamageEffect::NoDamage;
+    }
+    match scissor {
+        ScissorState::Enabled { x, y, width, height } => DamageEffect::OnscreenRect {
+            x,
+            y,
+            width,
+            height,
+        },
+        // Unknown rect or disabled: can't bound the clear.
+        ScissorState::EnabledUnknownRect | ScissorState::Disabled => DamageEffect::FullSurface,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COLOR: u32 = glow::COLOR_BUFFER_BIT;
+    const DEPTH: u32 = glow::DEPTH_BUFFER_BIT;
+    const STENCIL: u32 = glow::STENCIL_BUFFER_BIT;
+    const ALL_ON: (bool, bool, bool, bool) = (true, true, true, true);
+    const ALL_OFF: (bool, bool, bool, bool) = (false, false, false, false);
+    const OFF: ScissorState = ScissorState::Disabled;
+
+    fn on(x: i32, y: i32, w: i32, h: i32) -> ScissorState {
+        ScissorState::Enabled { x, y, width: w, height: h }
+    }
+
+    // ---- clear_damage_effect tests ----
+
+    #[test]
+    fn color_clear_with_scissor_produces_onscreen_rect() {
+        assert_eq!(
+            clear_damage_effect(COLOR, true, on(10, 20, 100, 50), ALL_ON),
+            DamageEffect::OnscreenRect { x: 10, y: 20, width: 100, height: 50 }
+        );
+    }
+
+    #[test]
+    fn color_clear_without_scissor_produces_full_surface() {
+        assert_eq!(clear_damage_effect(COLOR, true, OFF, ALL_ON), DamageEffect::FullSurface);
+    }
+
+    #[test]
+    fn depth_only_clear_produces_no_damage() {
+        assert_eq!(clear_damage_effect(DEPTH, true, OFF, ALL_ON), DamageEffect::NoDamage);
+    }
+
+    #[test]
+    fn stencil_only_clear_produces_no_damage() {
+        assert_eq!(clear_damage_effect(STENCIL, true, OFF, ALL_ON), DamageEffect::NoDamage);
+    }
+
+    #[test]
+    fn depth_stencil_clear_produces_no_damage() {
+        assert_eq!(clear_damage_effect(DEPTH | STENCIL, true, OFF, ALL_ON), DamageEffect::NoDamage);
+    }
+
+    #[test]
+    fn color_depth_clear_uses_color_logic() {
+        assert_eq!(
+            clear_damage_effect(COLOR | DEPTH, true, on(5, 5, 200, 200), ALL_ON),
+            DamageEffect::OnscreenRect { x: 5, y: 5, width: 200, height: 200 }
+        );
+        assert_eq!(clear_damage_effect(COLOR | DEPTH, true, OFF, ALL_ON), DamageEffect::FullSurface);
+    }
+
+    #[test]
+    fn depth_clear_on_user_fbo_is_no_damage() {
+        assert_eq!(clear_damage_effect(DEPTH, false, OFF, ALL_ON), DamageEffect::NoDamage);
+    }
+
+    #[test]
+    fn color_clear_on_user_fbo_is_no_damage() {
+        assert_eq!(clear_damage_effect(COLOR, false, OFF, ALL_ON), DamageEffect::NoDamage);
+    }
+
+    #[test]
+    fn depth_only_with_scissor_still_no_damage() {
+        assert_eq!(clear_damage_effect(DEPTH, true, on(0, 0, 100, 100), ALL_ON), DamageEffect::NoDamage);
+    }
+
+    #[test]
+    fn color_clear_with_all_mask_off_is_no_damage() {
+        assert_eq!(clear_damage_effect(COLOR, true, OFF, ALL_OFF), DamageEffect::NoDamage);
+    }
+
+    #[test]
+    fn color_clear_with_partial_mask_and_scissor_produces_onscreen_rect() {
+        let partial = (true, false, false, false);
+        assert_eq!(
+            clear_damage_effect(COLOR, true, on(10, 20, 100, 50), partial),
+            DamageEffect::OnscreenRect { x: 10, y: 20, width: 100, height: 50 }
+        );
+    }
+
+    #[test]
+    fn color_depth_clear_with_all_mask_off_is_no_damage() {
+        assert_eq!(clear_damage_effect(COLOR | DEPTH, true, OFF, ALL_OFF), DamageEffect::NoDamage);
+    }
+
+    #[test]
+    fn color_depth_clear_with_active_mask_uses_color_logic() {
+        let partial = (false, true, false, false);
+        assert_eq!(
+            clear_damage_effect(COLOR | DEPTH, true, on(0, 0, 50, 50), partial),
+            DamageEffect::OnscreenRect { x: 0, y: 0, width: 50, height: 50 }
+        );
+        assert_eq!(clear_damage_effect(COLOR | DEPTH, true, OFF, partial), DamageEffect::FullSurface);
+    }
+
+    #[test]
+    fn alpha_only_mask_still_counts_as_visible_damage() {
+        let alpha_only = (false, false, false, true);
+        assert_eq!(clear_damage_effect(COLOR, true, OFF, alpha_only), DamageEffect::FullSurface);
+    }
+
+    // ---- draw_damage_effect tests ----
+
+    #[test]
+    fn draw_viewport_only_produces_onscreen_rect() {
+        assert_eq!(
+            draw_damage_effect(true, Some((0, 0, 800, 600)), OFF),
+            DamageEffect::OnscreenRect { x: 0, y: 0, width: 800, height: 600 }
+        );
+    }
+
+    #[test]
+    fn draw_viewport_intersect_scissor_produces_tighter_rect() {
+        assert_eq!(
+            draw_damage_effect(true, Some((0, 0, 1080, 1920)), on(100, 200, 300, 400)),
+            DamageEffect::OnscreenRect { x: 100, y: 200, width: 300, height: 400 }
+        );
+    }
+
+    #[test]
+    fn draw_viewport_scissor_partial_overlap() {
+        assert_eq!(
+            draw_damage_effect(true, Some((0, 0, 500, 500)), on(300, 300, 500, 500)),
+            DamageEffect::OnscreenRect { x: 300, y: 300, width: 200, height: 200 }
+        );
+    }
+
+    #[test]
+    fn draw_empty_intersection_produces_no_damage() {
+        assert_eq!(
+            draw_damage_effect(true, Some((0, 0, 100, 100)), on(200, 200, 100, 100)),
+            DamageEffect::NoDamage
+        );
+    }
+
+    #[test]
+    fn draw_user_fbo_produces_no_damage() {
+        assert_eq!(draw_damage_effect(false, Some((0, 0, 800, 600)), OFF), DamageEffect::NoDamage);
+    }
+
+    #[test]
+    fn draw_no_viewport_produces_full_surface() {
+        assert_eq!(draw_damage_effect(true, None, OFF), DamageEffect::FullSurface);
+    }
+
+    // ---- ScissorState transition tests ----
+
+    #[test]
+    fn default_scissor_state_is_disabled() {
+        let state = CanvasGLState::default();
+        assert_eq!(state.scissor, ScissorState::Disabled);
+        assert_eq!(state.last_scissor_rect, None);
+    }
+
+    /// Scissor(rect) then Enable(SCISSOR_TEST): draw uses viewport ∩ rect.
+    #[test]
+    fn scissor_then_enable_uses_intersection() {
+        let mut state = CanvasGLState::default();
+        state.viewport = Some((0, 0, 1080, 1920));
+
+        // glScissor(100, 200, 300, 400)
+        state.last_scissor_rect = Some((100, 200, 300, 400));
+        // glEnable(SCISSOR_TEST) — has an explicit rect
+        state.scissor = ScissorState::Enabled { x: 100, y: 200, width: 300, height: 400 };
+
+        assert_eq!(
+            draw_damage_effect(true, state.viewport, state.scissor),
+            DamageEffect::OnscreenRect { x: 100, y: 200, width: 300, height: 400 }
+        );
+    }
+
+    /// Enable(SCISSOR_TEST) then Scissor(rect): draw uses viewport ∩ rect
+    /// after the explicit Scissor call.
+    #[test]
+    fn enable_then_scissor_uses_intersection() {
+        let mut state = CanvasGLState::default();
+        state.viewport = Some((0, 0, 1080, 1920));
+
+        // glEnable(SCISSOR_TEST) — no prior glScissor → EnabledUnknownRect
+        state.scissor = ScissorState::EnabledUnknownRect;
+
+        // Before explicit glScissor: falls back to viewport (conservative).
+        assert_eq!(
+            draw_damage_effect(true, state.viewport, state.scissor),
+            DamageEffect::OnscreenRect { x: 0, y: 0, width: 1080, height: 1920 }
+        );
+
+        // glScissor(50, 50, 200, 200) — promotes to Enabled with known rect.
+        state.last_scissor_rect = Some((50, 50, 200, 200));
+        state.scissor = ScissorState::Enabled { x: 50, y: 50, width: 200, height: 200 };
+
+        assert_eq!(
+            draw_damage_effect(true, state.viewport, state.scissor),
+            DamageEffect::OnscreenRect { x: 50, y: 50, width: 200, height: 200 }
+        );
+    }
+
+    /// Disable(SCISSOR_TEST): draw goes back to viewport-only.
+    #[test]
+    fn disable_reverts_to_viewport_only() {
+        let mut state = CanvasGLState::default();
+        state.viewport = Some((0, 0, 1080, 1920));
+        state.last_scissor_rect = Some((100, 200, 300, 400));
+        state.scissor = ScissorState::Enabled { x: 100, y: 200, width: 300, height: 400 };
+
+        // glDisable(SCISSOR_TEST)
+        state.scissor = ScissorState::Disabled;
+
+        assert_eq!(
+            draw_damage_effect(true, state.viewport, state.scissor),
+            DamageEffect::OnscreenRect { x: 0, y: 0, width: 1080, height: 1920 }
+        );
+    }
+
+    /// Enable(SCISSOR_TEST) before any Scissor(...) does NOT produce NoDamage.
+    /// This is the exact blocker scenario: the draw IS visible but the
+    /// initial scissor box is the full drawable, not a zero rect.
+    #[test]
+    fn enable_without_prior_scissor_falls_back_to_viewport() {
+        // glEnable(SCISSOR_TEST) with no prior glScissor → EnabledUnknownRect.
+        assert_eq!(
+            draw_damage_effect(true, Some((0, 0, 800, 600)), ScissorState::EnabledUnknownRect),
+            DamageEffect::OnscreenRect { x: 0, y: 0, width: 800, height: 600 }
+        );
+    }
+
+    /// Clear with EnabledUnknownRect falls back to FullSurface (conservative).
+    #[test]
+    fn clear_with_unknown_scissor_rect_is_full_surface() {
+        assert_eq!(
+            clear_damage_effect(COLOR, true, ScissorState::EnabledUnknownRect, ALL_ON),
+            DamageEffect::FullSurface
+        );
+    }
+
+    /// After explicit Scissor, re-enable uses the known rect (retained).
+    #[test]
+    fn re_enable_after_disable_uses_retained_rect() {
+        let mut state = CanvasGLState::default();
+        state.viewport = Some((0, 0, 1080, 1920));
+
+        // glScissor(100, 100, 200, 200) + Enable + Disable
+        state.last_scissor_rect = Some((100, 100, 200, 200));
+        state.scissor = ScissorState::Disabled;
+
+        // glEnable(SCISSOR_TEST) again — last_scissor_rect is retained
+        let (x, y, w, h) = state.last_scissor_rect.unwrap();
+        state.scissor = ScissorState::Enabled { x, y, width: w, height: h };
+
+        assert_eq!(
+            draw_damage_effect(true, state.viewport, state.scissor),
+            DamageEffect::OnscreenRect { x: 100, y: 100, width: 200, height: 200 }
+        );
     }
 }

@@ -12,7 +12,7 @@ import {
     // Frame lifecycle
     op_frame_begin,
     op_frame_end,
-    op_frame_end_all,
+    op_frame_end_unified,
     // Path methods
     op_begin_path,
     op_close_path,
@@ -753,9 +753,9 @@ class CanvasRenderingContext2D {
     }
 }
 
-// Frame-end callback registry.  Each module registers its own cleanup
-// function instead of overwriting a global.  This avoids load-order
-// dependencies between 2D and WebGL modules.
+// Frame-end callback registry. The unified frame-end op builds a single
+// interleaved FramePacket from both Canvas2D and GL segments, with
+// Materialize barriers at 2D->GL transitions.
 if (!globalThis.__migo_frame_end_hooks) {
     globalThis.__migo_frame_end_hooks = [];
     globalThis.__migo_frame_end_all = () => {
@@ -766,7 +766,7 @@ if (!globalThis.__migo_frame_end_hooks) {
     };
 }
 globalThis.__migo_frame_end_hooks.push(() => {
-    op_frame_end_all();
+    op_frame_end_unified();
 });
 
 export { CanvasRenderingContext2D, CanvasGradient };

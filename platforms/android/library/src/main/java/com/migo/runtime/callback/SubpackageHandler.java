@@ -22,10 +22,12 @@ package com.migo.runtime.callback;
 public interface SubpackageHandler {
 
     /**
-     * Download a subpackage to the game's code directory.
+     * Download a subpackage zip file.
      * <p>
-     * The host should download the subpackage and extract it to
-     * {@code GamePaths.getCodeDir() + "/" + request.root}.
+     * The host should download the subpackage as a zip file to a temporary
+     * location, then call {@code callback.onSuccess(zipPath)}.  The runtime
+     * will ingest the zip into a .mpkg package, validate it, and mount it
+     * atomically.  The host does NOT need to extract the zip.
      *
      * @param request  subpackage info (name and root path)
      * @param callback download progress and completion callback
@@ -55,8 +57,17 @@ public interface SubpackageHandler {
          */
         void onProgress(int progress, long totalBytesWritten, long totalBytesExpectedToWrite);
 
-        /** Called when download and extraction completes successfully. */
-        void onSuccess();
+        /**
+         * Called when download completes successfully.
+         * <p>
+         * The host downloads the subpackage as a zip file to a temporary
+         * location and provides the path here.  The runtime ingests it into
+         * a .mpkg package, validates, and mounts it atomically.
+         * The host does NOT need to extract the zip.
+         *
+         * @param zipPath absolute path to the downloaded zip file
+         */
+        void onSuccess(String zipPath);
 
         /**
          * Called when download fails.

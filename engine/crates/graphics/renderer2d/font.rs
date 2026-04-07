@@ -8,6 +8,11 @@ use tracing::{debug, info, warn};
 
 use shared::error::{EngineError, EngineResult, ErrorCode};
 
+#[path = "text_layout_cache.rs"]
+pub(crate) mod text_layout_cache;
+
+pub(crate) use text_layout_cache::{CachedTextLayout, TextLayoutCache, TextLayoutKey};
+
 #[inline]
 fn ee(code: ErrorCode, detail: impl Into<String>) -> EngineError {
     EngineError::from_detail(code, detail)
@@ -35,6 +40,7 @@ impl GlobalFontStore {
 
     pub(crate) fn insert(&mut self, key: &str, data: FontData) {
         self.fonts_by_key.insert(key.to_string(), data);
+        invalidate_text_layout_cache();
     }
 
     fn set_default_key(&mut self, key: &str) {
@@ -56,6 +62,38 @@ impl GlobalFontStore {
 
 /// Singleton global font store (behind RwLock for dynamic font loading).
 static GLOBAL_FONTS: OnceLock<RwLock<GlobalFontStore>> = OnceLock::new();
+static TEXT_LAYOUT_CACHE: OnceLock<RwLock<TextLayoutCache>> = OnceLock::new();
+
+fn layout_cache() -> &'static RwLock<TextLayoutCache> {
+    TEXT_LAYOUT_CACHE.get_or_init(|| RwLock::new(TextLayoutCache::new()))
+}
+
+pub(crate) fn invalidate_text_layout_cache() {
+    layout_cache().write().unwrap().clear();
+}
+
+pub(crate) fn lookup_text_layout(key: &TextLayoutKey) -> Option<CachedTextLayout> {
+    layout_cache().read().unwrap().get(key).cloned()
+}
+
+pub(crate) fn store_text_layout(key: TextLayoutKey, layout: CachedTextLayout) {
+    layout_cache().write().unwrap().insert(key, layout);
+}
+
+pub(crate) fn text_layout_font_key(
+    family: &str,
+    bold: bool,
+    italic: bool,
+    font_size: f32,
+) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        font_size,
+        normalize_family_key(family),
+        if bold { "bold" } else { "normal" },
+        if italic { "italic" } else { "normal" }
+    )
+}
 
 /// Initialize/load the global font store once.
 ///
@@ -419,6 +457,7 @@ impl FontManager {
         match canvas.add_font_mem(&data.bytes) {
             Ok(fid) => {
                 self.font_ids_by_key.insert(key.to_string(), fid);
+                invalidate_text_layout_cache();
                 debug!("Registered dynamic font '{}' as FontId {:?}", key, fid);
                 Some(fid)
             }
@@ -568,4 +607,39 @@ fn parse_family_list(tokens: &[String]) -> Vec<String> {
     }
 
     families
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_layout_font_key_uses_stable_effective_descriptor() {
+        let a = text_layout_font_key("sans-serif", false, false, 16.0);
+        let b = text_layout_font_key("sans-serif", false, false, 16.0);
+        let c = text_layout_font_key("serif", false, false, 16.0);
+        let d = text_layout_font_key("sans-serif", true, false, 16.0);
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn invalidating_text_layout_cache_clears_cached_entries() {
+        let key = TextLayoutKey::new("hello", "16px Sans", 200.0);
+        store_text_layout(
+            key.clone(),
+            CachedTextLayout {
+                width: 42.0,
+                height: 18.0,
+            },
+        );
+
+        assert!(lookup_text_layout(&key).is_some());
+
+        invalidate_text_layout_cache();
+
+        assert!(lookup_text_layout(&key).is_none());
+    }
 }

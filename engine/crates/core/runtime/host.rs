@@ -17,6 +17,7 @@ use shared::{
     js_escape::escape_for_js_string,
     op_state::{HostOpState, RafRx},
     protocol::host_cmd::HostCommand,
+    protocol::render_cmd::{CanvasCmd, RenderCommand},
     surface::SurfaceRef,
 };
 
@@ -104,6 +105,10 @@ pub(crate) struct Host {
     /// Network polling ops check this to throttle CPU usage.
     backgrounded: Arc<AtomicBool>,
 
+    /// Per-session GPU caps shared with the render thread.
+    /// Survives JS runtime restarts (same GL context).
+    gpu_caps: Arc<shared::device::gpu_caps::GpuCaps>,
+
     /// Watchdog handle for JS execution timeout detection.
     /// Present only when `v8-limits` feature is enabled.
     #[cfg(feature = "v8-limits")]
@@ -161,14 +166,35 @@ impl Host {
         // AudioService is lazy — no thread spawned until the first
         // real audio command.  Saves ~80 ms on cold start.
         let audio = AudioService::new(host_tx.clone());
-        let render = RenderService::new(
+        let gpu_caps = shared::device::gpu_caps::GpuCaps::new();
+        let mut render = RenderService::new(
             raf_tx,
             Some(vsync_rx),
             id,
             surface,
             init_options.pixel_ratio(),
             Some(init_options.cache_dir().to_path_buf()),
+            gpu_caps.clone(),
         )?;
+
+        // Block until the render thread has completed GL init and
+        // populated GPU compressed-format caps.  Prevents early image
+        // loads from seeing all-false caps.  Typically < 50 ms.
+        match gpu_caps.wait_ready(std::time::Duration::from_secs(2)) {
+            shared::device::gpu_caps::GpuCapsReadyState::Ready => {}
+            shared::device::gpu_caps::GpuCapsReadyState::Failed(detail) => {
+                render.shutdown_detached();
+                vsync::unregister_vsync_sender(id);
+                return Err(shared::error::EngineError::new(shared::error::ErrorCode::Render2DInitError)
+                    .with_detail(detail));
+            }
+            shared::device::gpu_caps::GpuCapsReadyState::Timeout => {
+                render.shutdown_detached();
+                vsync::unregister_vsync_sender(id);
+                return Err(shared::error::EngineError::new(shared::error::ErrorCode::Timeout)
+                    .with_detail("render thread did not publish GPU caps within 2 seconds"));
+            }
+        }
 
         // ---- HostOpState for extensions ----
         let device_services = platform.create_device_services(id);
@@ -195,8 +221,9 @@ impl Host {
         let host_state = HostOpState {
             id,
             code_dir: None,
-            game_paths: None, // Set when evaluating a module
-            vfs: None,        // Set when evaluating a module
+            game_paths: None,    // Set when evaluating a module
+            vfs: None,           // Set when evaluating a module
+            mount_table: None,   // Set when evaluating a module
             app_cache_dir: init_options.cache_dir().to_path_buf(),
             app_files_dir: init_options.files_dir().to_path_buf(),
             render_tx: render.sender(),
@@ -209,6 +236,11 @@ impl Host {
             workers_path: init_options.workers_path().map(|s| s.to_string()),
             network_policy: network_policy.clone(),
             backgrounded: backgrounded.clone(),
+            #[cfg(feature = "code-signing")]
+            code_signing_enabled: init_options.code_signing_enabled(),
+            #[cfg(not(feature = "code-signing"))]
+            code_signing_enabled: false,
+            gpu_caps: gpu_caps.clone(),
         };
 
         // ---- Console log buffer (debug only) ----
@@ -219,8 +251,11 @@ impl Host {
         // ---- Code cache (V8 bytecode persistence) ----
         let shared_cache = code_cache::create_code_cache(init_options.cache_dir());
 
+        // SharedMountTableRef: created here, shared with the module loader
+        // and HostJsRuntime. evaluate_module() populates it later.
+        let loader_mount_ref: js_runtime::SharedMountTableRef = Rc::new(std::cell::RefCell::new(None));
         let module_loader: Option<Rc<dyn ModuleLoader>> =
-            Some(Rc::new(MyModuleLoader::new(Some(shared_cache.clone()))));
+            Some(Rc::new(MyModuleLoader::new(Some(shared_cache.clone()), loader_mount_ref.clone())));
 
         let ext_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>> =
             Some(code_cache::ExtCodeCacheAdapter::new(shared_cache));
@@ -247,6 +282,7 @@ impl Host {
             extra_ext,
             module_loader,
             ext_code_cache,
+            loader_mount_ref,
             #[cfg(feature = "v8-limits")]
             v8_limits,
             #[cfg(feature = "code-signing")]
@@ -298,6 +334,7 @@ impl Host {
             last_game_id: None,
             last_entry: None,
             backgrounded,
+            gpu_caps,
             #[cfg(feature = "v8-limits")]
             watchdog,
         })
@@ -398,6 +435,10 @@ impl Host {
             }
 
             HostCommand::UpdateSurface { surface } => self.on_update_surface(surface),
+            HostCommand::SurfaceDestroyed => {
+                self.render.on_surface_destroyed();
+                Ok(())
+            }
 
             HostCommand::Shutdown => Ok(()),
 
@@ -681,6 +722,7 @@ impl Host {
             code_dir: None,
             game_paths: None,
             vfs: None,
+            mount_table: None,
             app_cache_dir: cache_dir,
             app_files_dir: files_dir,
             render_tx: self.render.sender(),
@@ -693,21 +735,35 @@ impl Host {
             workers_path: self.init_options.workers_path().map(|s| s.to_string()),
             network_policy: self.network_policy.clone(),
             backgrounded: self.backgrounded.clone(),
+            #[cfg(feature = "code-signing")]
+            code_signing_enabled: self.init_options.code_signing_enabled(),
+            #[cfg(not(feature = "code-signing"))]
+            code_signing_enabled: false,
+            gpu_caps: self.gpu_caps.clone(),
         };
 
         // ---- Code cache (V8 bytecode persistence) ----
         let shared_cache = code_cache::create_code_cache(self.init_options.cache_dir());
 
+        let loader_mount_ref: js_runtime::SharedMountTableRef = Rc::new(std::cell::RefCell::new(None));
         let module_loader: Option<Rc<dyn ModuleLoader>> =
-            Some(Rc::new(MyModuleLoader::new(Some(shared_cache.clone()))));
+            Some(Rc::new(MyModuleLoader::new(Some(shared_cache.clone()), loader_mount_ref.clone())));
 
         let ext_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>> =
             Some(code_cache::ExtCodeCacheAdapter::new(shared_cache));
 
         let extra_ext = self.platform.extensions(&self.init_options);
 
-        // Clear process-global caches before recreating runtime.
-        js_runtime::clear_shared_image_cache();
+        // drain_shared_image_cache() returns shared IDs and clears the JS-side
+        // bookkeeping (process-global).  We must send DestroyImage for each ID
+        // *before* clearing the IO cache — otherwise the render thread holds
+        // orphaned GPU textures that no one will ever release.
+        for shared_id in js_runtime::drain_shared_image_cache() {
+            let _ = self
+                .render
+                .sender()
+                .send(RenderCommand::Canvas(CanvasCmd::DestroyImage { image_id: shared_id }));
+        }
         io::global_cache().clear();
 
         // Drop the old watchdog before dropping the runtime.
@@ -732,6 +788,7 @@ impl Host {
             extra_ext,
             module_loader,
             ext_code_cache,
+            loader_mount_ref,
             #[cfg(feature = "v8-limits")]
             v8_limits,
             #[cfg(feature = "code-signing")]
@@ -766,29 +823,21 @@ impl Host {
             self.watchdog = new_watchdog;
         }
 
-        // If we have a last evaluated module, reload it
-        if let (Some(game_id), Some(entry)) = (self.last_game_id.take(), self.last_entry.take()) {
-            self.on_evaluate_module(game_id, entry).await?;
-        }
+        // If we have a last evaluated module, reload it. Even if re-evaluation
+        // fails, resume render/audio below so the session doesn't stay paused.
+        let reload_result = if let (Some(game_id), Some(entry)) = (self.last_game_id.clone(), self.last_entry.clone()) {
+            self.on_evaluate_module(game_id, entry).await
+        } else {
+            Ok(())
+        };
 
         // Resume render and audio so the new runtime can start producing frames.
         //
-        // Pause sets `has_surface = false` on the render thread (designed for
-        // the OnHide flow where the Android surface is destroyed). In the normal
-        // OnHide→OnShow→UpdateSurface flow, `RecreateOnscreen` restores it.
-        // But restart doesn't go through UpdateSurface (the surface is unchanged),
-        // so we must explicitly re-signal the surface to restore `has_surface`.
-        // Without this, VSync frames are discarded and the RAF loop never fires.
-        //
-        // Synchronization note: `restore_surface()` delegates to
-        // `update_surface()` which sends a `RenderCommand::Canvas(RecreateOnscreen)`
-        // through the crossbeam command channel and waits for the render thread's
-        // response (bounded channel recv with timeout). The render thread processes
-        // this command, sets its local `has_surface = true`, and sends back the
-        // result. This request-response exchange over the command channel provides
-        // the necessary cross-thread synchronization -- the host thread does not
-        // proceed to `resume()` until the render thread has acknowledged the
-        // surface restoration.
+        // If the Android surface survived restart, explicitly re-signal that live
+        // surface before resume so the render thread can present again without
+        // waiting for a fresh surface callback. If the surface was already
+        // destroyed, `restore_surface()` now fails instead of reusing a stale
+        // handle, and the later UpdateSurface path will restore presentation.
         if let Err(e) = self.render.restore_surface() {
             error!(
                 "[Host {}] on_restart: restore_surface failed: {}",
@@ -798,7 +847,6 @@ impl Host {
         self.render.resume();
         self.audio.resume();
 
-        Ok(())
+        reload_result
     }
 }
-

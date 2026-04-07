@@ -43,11 +43,11 @@ impl CompressedFormat {
     /// Try to map a Vulkan format code (from KTX2 header) to a CompressedFormat.
     pub fn from_vk_format(vk_format: u32) -> Option<Self> {
         match vk_format {
-            147 => Some(Self::Etc2Rgb),   // VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK
-            151 => Some(Self::Etc2Rgba),  // VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK
-            157 => Some(Self::Astc4x4),   // VK_FORMAT_ASTC_4x4_UNORM_BLOCK
-            163 => Some(Self::Astc6x6),   // VK_FORMAT_ASTC_6x6_UNORM_BLOCK
-            169 => Some(Self::Astc8x8),   // VK_FORMAT_ASTC_8x8_UNORM_BLOCK
+            147 => Some(Self::Etc2Rgb),  // VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK
+            151 => Some(Self::Etc2Rgba), // VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK
+            157 => Some(Self::Astc4x4),  // VK_FORMAT_ASTC_4x4_UNORM_BLOCK
+            163 => Some(Self::Astc6x6),  // VK_FORMAT_ASTC_6x6_UNORM_BLOCK
+            169 => Some(Self::Astc8x8),  // VK_FORMAT_ASTC_8x8_UNORM_BLOCK
             _ => None,
         }
     }
@@ -87,16 +87,22 @@ pub struct CompressedFormatSupport {
     pub astc: bool,
 }
 
+// GPU format support globals are in shared::device::gpu_caps for cross-crate access.
+
 impl CompressedFormatSupport {
     /// Detect compressed format support from the current GL context.
     /// Call once during initialization and cache the result.
-    pub fn detect(gl: &glow::Context) -> Self {
+    /// Sets the per-session `GpuCaps` (shared via `Arc` with the host thread).
+    pub fn detect(gl: &glow::Context, gpu_caps: &shared::device::gpu_caps::GpuCaps) -> Self {
         let version = unsafe { gl.get_parameter_string(glow::VERSION) };
         let etc2 = version.contains("OpenGL ES 3.") || version.contains("OpenGL ES 4.");
 
         let extensions = unsafe { gl.get_parameter_string(glow::EXTENSIONS) };
         let astc = extensions.contains("GL_KHR_texture_compression_astc_ldr")
             || extensions.contains("GL_KHR_texture_compression_astc_hdr");
+
+        // Set session-level caps so IO/JS threads see them via snapshot().
+        gpu_caps.set(etc2, astc);
 
         Self { etc2, astc }
     }

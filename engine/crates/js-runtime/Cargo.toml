@@ -40,7 +40,7 @@ deno_core.workspace=true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "rt-multi-thread", "net"] }
 tracing = { workspace = true }
 shared = {path = "../shared"}
-io = { path = "../io", default-features = false }
+io = { path = "../io", default-features = false, features = ["zip-extract"] }
 serde.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true

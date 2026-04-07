@@ -242,6 +242,9 @@ public class MigoGameActivity extends Activity
     public void surfaceDestroyed(SurfaceHolder holder) {
         Log.i(TAG, "surfaceDestroyed");
         orientationHelper.cancel();
+        if (session != null && session.isValid()) {
+            session.onSurfaceDestroyed();
+        }
         // Do NOT destroy the session. Surface is destroyed on onStop but
         // Activity is still alive. Cleanup happens in onDestroy.
     }

@@ -19,6 +19,7 @@ pub struct ShaderCache {
     cache_dir: PathBuf,
     /// Fingerprint of the current GL driver (GL_RENDERER + GL_VERSION).
     /// When this changes (e.g. system update), all cached binaries are invalid.
+    #[allow(dead_code)]
     driver_key: String,
     /// `true` if `GL_NUM_PROGRAM_BINARY_FORMATS > 0`.
     supported: bool,

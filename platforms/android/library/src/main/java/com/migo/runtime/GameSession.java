@@ -92,6 +92,7 @@ public final class GameSession implements Closeable {
     private volatile boolean destroyed = false;
     private volatile boolean gameStarted = false;
     private volatile boolean showDispatched = false;
+    private volatile boolean hasLiveSurface = true;
 
     private final long creationNanos = System.nanoTime();
     private volatile long startupTimeMs = -1;
@@ -129,7 +130,9 @@ public final class GameSession implements Closeable {
         // Start listening for audio focus changes
         this.audioFocusManager.start();
 
-        // Start Choreographer-driven VSync immediately
+        this.vsyncScheduler.setSurfaceReady(hasLiveSurface);
+
+        // Start Choreographer-driven VSync immediately for the current live surface
         this.vsyncScheduler.start();
 
         // Create debug overlay and console log viewer if debug mode is enabled
@@ -326,6 +329,7 @@ public final class GameSession implements Closeable {
     public void resume() {
         synchronized (lock) {
             if (destroyed) return;
+            vsyncScheduler.setSurfaceReady(hasLiveSurface);
             vsyncScheduler.start();
             if (debugOverlay != null) {
                 debugOverlay.startMonitoring();
@@ -380,13 +384,27 @@ public final class GameSession implements Closeable {
             if (destroyed) return;
             Log.i(TAG, "updateSurface: session=" + sessionId + ", valid=" + surface.isValid()
                     + ", size=" + width + "x" + height);
+            hasLiveSurface = surface.isValid();
             NativeMethods.updateSurface(sessionId, surface, width, height);
+            vsyncScheduler.setSurfaceReady(hasLiveSurface);
 
             // Auto-attach debug overlay as a WindowManager panel on first surface update.
             // At this point the Activity window is guaranteed to have a valid token.
             if (debugOverlay != null && !debugOverlayAttached) {
                 tryAttachDebugOverlay();
             }
+        }
+    }
+
+    /**
+     * Notify the session that the current rendering surface has been destroyed.
+     */
+    public void onSurfaceDestroyed() {
+        synchronized (lock) {
+            if (destroyed) return;
+            hasLiveSurface = false;
+            vsyncScheduler.setSurfaceReady(false);
+            NativeMethods.onSurfaceDestroyed(sessionId);
         }
     }
 
@@ -407,6 +425,7 @@ public final class GameSession implements Closeable {
             destroyed = true;
         }
 
+        vsyncScheduler.setSurfaceReady(false);
         vsyncScheduler.stop();
         if (debugOverlay != null) {
             debugOverlay.stopMonitoring();

@@ -1,4 +1,4 @@
-use std::{path::PathBuf, rc::Rc, sync::Arc, time::Instant};
+use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 
 use deno_core::{
     Extension, JsRuntime, ModuleLoader, PollEventLoopOptions, RuntimeOptions, resolve_path, v8,
@@ -8,8 +8,12 @@ use shared::{
     error::{EngineError, EngineResult, ErrorCode},
     op_state::HostOpState,
     protocol::host_cmd::{TouchPoint, TouchType},
-    vfs::{GamePaths, VirtualFS},
+    vfs::{GamePaths, MountTable, VirtualFS},
 };
+
+/// Shared reference to the mount table, injected into the module loader.
+/// The loader holds a clone and checks it on every resolve/load.
+pub type SharedMountTableRef = Rc<RefCell<Option<Arc<MountTable>>>>;
 
 #[cfg(feature = "code-signing")]
 use shared::vfs::integrity::IntegrityVerifier;
@@ -53,7 +57,11 @@ pub struct HostJsRuntime {
     rt: JsRuntime,
     bindings: JsBindings,
     /// Shared SAB store for transferring SharedArrayBuffers between main and workers.
+    #[allow(dead_code)]
     pub(crate) sab_store: deno_core::SharedArrayBufferStore,
+    /// Shared mount table reference — the module loader holds a clone.
+    /// Updated in evaluate_module() so the loader can enforce sandbox.
+    loader_mount_ref: SharedMountTableRef,
     /// Shared termination state for OOM callback + watchdog integration.
     /// Only present when `v8-limits` feature is enabled.
     #[cfg(feature = "v8-limits")]
@@ -86,6 +94,7 @@ impl HostJsRuntime {
         extra_extensions: Vec<Extension>,
         module_loader: Option<Rc<dyn ModuleLoader>>,
         extension_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>>,
+        loader_mount_ref: SharedMountTableRef,
         #[cfg(feature = "v8-limits")] v8_limits: V8LimitsConfig,
         #[cfg(feature = "code-signing")] code_signing_enabled: bool,
         #[cfg(feature = "code-signing")] code_signing_pubkey: Option<&str>,
@@ -259,6 +268,7 @@ impl HostJsRuntime {
             rt,
             bindings,
             sab_store,
+            loader_mount_ref,
             #[cfg(feature = "v8-limits")]
             oom_terminated,
             #[cfg(feature = "code-signing")]
@@ -307,6 +317,13 @@ impl HostJsRuntime {
     /// Set the VirtualFS for sandboxed file access.
     pub fn set_vfs(&mut self, vfs: Option<Arc<VirtualFS>>) {
         self.update_host_op_state(|s| s.vfs = vfs);
+    }
+
+    /// Set the MountTable for `/code` path resolution.
+    /// Also injects it into the module loader for sandbox enforcement.
+    pub fn set_mount_table(&mut self, mt: Option<Arc<MountTable>>) {
+        *self.loader_mount_ref.borrow_mut() = mt.clone();
+        self.update_host_op_state(|s| s.mount_table = mt);
     }
 
     /// Set the GamePaths for the current game.
@@ -627,9 +644,26 @@ impl HostJsRuntime {
             );
         }
 
-        // Store paths and VFS in op state
+        // Create MountTable for /code path resolution.
+        let mount_table = Arc::new(MountTable::new(code_dir.clone()));
+
+        // Restore previously installed subpackages from the per-game manifest.
+        // This makes preDownloadSubpackage results survive across sessions.
+        // Skipped when code signing is enabled (downloaded packages lack signatures).
+        #[cfg(feature = "code-signing")]
+        let cs_enabled = self.code_signing_enabled;
+        #[cfg(not(feature = "code-signing"))]
+        let cs_enabled = false;
+        shared::vfs::mount::restore_installed_packages(
+            &mount_table,
+            game_paths.cache_dir(),
+            cs_enabled,
+        );
+
+        // Store paths, VFS, and mount table in op state.
         self.set_game_paths(Some(game_paths));
         self.set_vfs(Some(Arc::new(vfs)));
+        self.set_mount_table(Some(mount_table));
         self.set_code_dir(Some(code_dir_str));
 
         // Resolve and load module

@@ -18,9 +18,15 @@ use crate::{
 pub mod audio_cmd;
 pub mod color;
 pub mod error;
+pub mod frame_packet;
 pub mod host_cmd;
 pub mod io_cmd;
 pub mod render_cmd;
+
+pub use self::{
+    frame_packet::{FrameOp, FramePacket, FramePacketBuilder},
+    render_cmd::{CanvasBatchPayload, DirtyRect, GlBatchPayload},
+};
 
 use self::{
     io_cmd::IOCmd,

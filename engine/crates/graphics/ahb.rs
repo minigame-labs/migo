@@ -57,10 +57,7 @@ unsafe extern "C" {
         buffer: *mut AHardwareBuffer,
         fence: *mut i32, // NULL = synchronous
     ) -> i32;
-    fn AHardwareBuffer_describe(
-        buffer: *const AHardwareBuffer,
-        out_desc: *mut AHardwareBufferDesc,
-    );
+    fn AHardwareBuffer_describe(buffer: *const AHardwareBuffer, out_desc: *mut AHardwareBufferDesc);
 
     fn android_get_device_api_level() -> i32;
 }

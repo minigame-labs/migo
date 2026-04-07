@@ -24,6 +24,7 @@ Cargo.lock
 logs/
 
 .claude/
+.worktrees/
 
 # Environment
 .env
@@ -50,3 +51,5 @@ local.properties
 *.tmp
 *.temp
 AI_PROJECT_OVERVIEW.md
+
+docs/superpowers

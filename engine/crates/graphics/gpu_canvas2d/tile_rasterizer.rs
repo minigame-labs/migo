@@ -68,10 +68,8 @@ impl TileRasterizer {
         }
 
         unsafe {
-            self.coverage_program =
-                compile_compute(gl, super::shaders::TILE_COVERAGE_SHADER);
-            self.composite_program =
-                compile_compute(gl, super::shaders::TILE_COMPOSITE_SHADER);
+            self.coverage_program = compile_compute(gl, super::shaders::TILE_COVERAGE_SHADER);
+            self.composite_program = compile_compute(gl, super::shaders::TILE_COMPOSITE_SHADER);
             self.path_ssbo = gl.create_buffer().ok();
             self.coverage_ssbo = gl.create_buffer().ok();
         }
@@ -120,10 +118,7 @@ impl TileRasterizer {
 /// # Safety
 ///
 /// Caller must ensure a valid GL context is current on this thread.
-unsafe fn compile_compute(
-    gl: &glow::Context,
-    source: &str,
-) -> Option<glow::Program> {
+unsafe fn compile_compute(gl: &glow::Context, source: &str) -> Option<glow::Program> {
     let shader = unsafe { gl.create_shader(glow::COMPUTE_SHADER).ok()? };
 
     unsafe {

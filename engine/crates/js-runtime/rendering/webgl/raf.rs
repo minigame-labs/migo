@@ -75,13 +75,12 @@ pub(crate) async fn op_await_next_frame(state: Rc<RefCell<OpState>>) -> Result<f
     Ok(ts)
 }
 
-/// Sync op to set the preferred frame rate (1–60 fps).
+/// Sync op to set the preferred frame rate (1-120 fps).
 ///
 /// On Choreographer: adjusts the frame divisor (skip VSync signals).
 /// On software ticker: recreates the ticker at the new interval.
 #[op2(fast)]
 pub(crate) fn op_set_preferred_fps(state: &mut OpState, #[smi] fps: u32) {
-    let fps = fps.clamp(1, 60);
     let tx = state.borrow::<HostOpState>().render_tx.clone();
-    let _ = tx.send(RenderCommand::FrameRate(fps));
+    let _ = tx.send(RenderCommand::FrameRate(fps.clamp(1, 120)));
 }

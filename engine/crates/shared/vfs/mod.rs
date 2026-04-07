@@ -36,8 +36,14 @@
 pub mod game_paths;
 #[cfg(feature = "code-signing")]
 pub mod integrity;
+pub mod mount;
+pub mod package;
 
 pub use game_paths::{GamePathError, GamePathStrings, GamePaths, validate_game_id};
+pub use mount::{DirSource, MountBackend, MountTable, ResolvedCode, StagingArea};
+pub use package::{
+    PackSource, PackageError, PackageIdentity, PackageReader, PackageWriter,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -594,7 +600,7 @@ pub struct VirtualPaths {
 ///
 /// This intentionally does **not** follow symlinks.  It is used as a fast
 /// first-pass check before the more expensive `canonicalize` call.
-fn normalize_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
 
     for component in path.components() {
@@ -608,6 +614,143 @@ fn normalize_path(path: &Path) -> PathBuf {
     }
 
     components.iter().collect()
+}
+
+// ---------------------------------------------------------------------------
+// Shared security helpers (used by both VirtualFS and MountTable)
+// ---------------------------------------------------------------------------
+
+/// Verify that a resolved real path is contained within `base_dir` by
+/// canonicalizing (resolving symlinks) and re-checking `starts_with`.
+///
+/// If `deny_symlinks` is true, every component between `base_dir` and the
+/// resolved path is checked via `symlink_metadata` (lstat) and rejected if
+/// it is a symbolic link.
+///
+/// For paths that don't exist yet, the closest existing ancestor is
+/// canonicalized and the remaining tail is projected, matching the
+/// [`VirtualFS`] non-existent-path verification logic.
+pub(crate) fn verify_path_containment(
+    real_path: &Path,
+    base_dir: &Path,
+    deny_symlinks: bool,
+) -> Result<(), VfsError> {
+    let normalized = normalize_path(real_path);
+    let norm_base = normalize_path(base_dir);
+
+    // Fast textual reject.
+    if !normalized.starts_with(&norm_base) {
+        return Err(VfsError::PathTraversal);
+    }
+
+    // If the path *is* the base itself, textual check suffices.
+    if normalized == norm_base {
+        return Ok(());
+    }
+
+    if normalized.exists() {
+        // ---- Path exists: full canonicalize ----
+        let canonical = std::fs::canonicalize(&normalized).map_err(|_| VfsError::InvalidPath)?;
+        let canonical_base = canonical_base_for(base_dir);
+        if !canonical.starts_with(&canonical_base) {
+            return Err(VfsError::SymlinkEscape);
+        }
+        if deny_symlinks {
+            check_no_symlinks_in_chain(&normalized, base_dir)?;
+        }
+    } else {
+        // ---- Path doesn't exist yet: walk to closest ancestor ----
+        verify_nonexistent_containment(&normalized, base_dir, deny_symlinks)?;
+    }
+
+    Ok(())
+}
+
+/// Canonicalize `base_dir` if it exists, else normalize textually.
+fn canonical_base_for(base_dir: &Path) -> PathBuf {
+    if base_dir.exists() {
+        std::fs::canonicalize(base_dir).unwrap_or_else(|_| normalize_path(base_dir))
+    } else {
+        normalize_path(base_dir)
+    }
+}
+
+/// Verify a non-existent path by walking up to the closest existing
+/// ancestor, canonicalizing it, and projecting the remaining tail.
+fn verify_nonexistent_containment(
+    path: &Path,
+    base_dir: &Path,
+    deny_symlinks: bool,
+) -> Result<(), VfsError> {
+    let mut current = path.to_path_buf();
+    let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
+
+    loop {
+        if current.exists() {
+            break;
+        }
+        match current.file_name() {
+            Some(name) => {
+                missing_tail.push(name.to_os_string());
+                current = match current.parent() {
+                    Some(p) => p.to_path_buf(),
+                    None => return Ok(()),
+                };
+            }
+            None => return Ok(()),
+        }
+    }
+
+    let canonical_ancestor =
+        std::fs::canonicalize(&current).map_err(|_| VfsError::InvalidPath)?;
+    let canonical_base = canonical_base_for(base_dir);
+
+    if canonical_ancestor.starts_with(&canonical_base) {
+        let mut projected = canonical_ancestor;
+        for component in missing_tail.iter().rev() {
+            projected.push(component);
+        }
+        let projected_normalized = normalize_path(&projected);
+        if !projected_normalized.starts_with(&canonical_base) {
+            return Err(VfsError::PathTraversal);
+        }
+        if deny_symlinks {
+            check_no_symlinks_in_chain(&current, base_dir)?;
+        }
+        return Ok(());
+    }
+
+    // Walk went past base — base doesn't exist yet.
+    let norm_base = normalize_path(base_dir);
+    if norm_base.starts_with(&current) {
+        return Ok(());
+    }
+
+    Err(VfsError::SymlinkEscape)
+}
+
+/// Walk every component between `base` and `full_path`, reject if any is
+/// a symbolic link.  Uses `symlink_metadata` (lstat).
+pub(crate) fn check_no_symlinks_in_chain(
+    full_path: &Path,
+    base: &Path,
+) -> Result<(), VfsError> {
+    let relative = full_path
+        .strip_prefix(base)
+        .map_err(|_| VfsError::PathTraversal)?;
+
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        if current.exists() {
+            let meta =
+                std::fs::symlink_metadata(&current).map_err(|_| VfsError::InvalidPath)?;
+            if meta.file_type().is_symlink() {
+                return Err(VfsError::SymlinkNotAllowed);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ===========================================================================

@@ -15,5 +15,5 @@
 //! JS: GPUCommandEncoder -> Rust: wgpu::CommandEncoder
 //! ```
 
-pub mod types;
 pub mod adapter;
+pub mod types;

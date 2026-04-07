@@ -174,6 +174,9 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
     public void surfaceDestroyed(SurfaceHolder holder) {
         surfaceReady = false;
         orientationHelper.cancel();
+        if (session != null && session.isValid()) {
+            session.onSurfaceDestroyed();
+        }
         // Do NOT close the session. The surface is recreated when the view
         // becomes visible again. Session cleanup happens in onDetachedFromWindow.
     }

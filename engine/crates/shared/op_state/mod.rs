@@ -8,7 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::channel::ThreadWakeup;
 use crate::protocol::{audio_cmd::AudioCmd, host_cmd::HostCommand, io_cmd::IOCmd};
 use crate::services::DeviceServices;
-use crate::vfs::{GamePaths, VirtualFS};
+use crate::vfs::{GamePaths, MountTable, VirtualFS};
 
 /// Host-side operational state shared across runtime layers.
 pub type RenderTx = crate::render_command_sender::CommandSender;
@@ -75,6 +75,8 @@ pub struct HostOpState {
     pub game_paths: Option<Arc<GamePaths>>,
     /// Virtual file system for path sandboxing (set after EvaluateModule).
     pub vfs: Option<Arc<VirtualFS>>,
+    /// Mount table for `/code` path resolution (set after EvaluateModule).
+    pub mount_table: Option<Arc<MountTable>>,
     pub render_tx: RenderTx,
     pub io_tx: IoTx,
     pub audio_tx: AudioTx,
@@ -93,6 +95,13 @@ pub struct HostOpState {
     /// Async polling loops (WebSocket, TCP, UDP) check this flag and
     /// throttle their iteration rate to reduce CPU/battery usage.
     pub backgrounded: Arc<AtomicBool>,
+    /// Whether code signing enforcement is enabled for this runtime.
+    pub code_signing_enabled: bool,
+    /// Per-session GPU compressed texture format support.
+    /// Shared with the render thread via `Arc`; render thread calls
+    /// `set()` after GL context init.  JS ops take a `snapshot()` and
+    /// pass it through `IOCmd` so the IO thread never reads globals.
+    pub gpu_caps: Arc<crate::device::gpu_caps::GpuCaps>,
 }
 
 /// Network-level security policy, populated from InitOptions.extras.
@@ -114,6 +123,7 @@ impl fmt::Debug for HostOpState {
             .field("code_dir", &self.code_dir)
             .field("game_paths", &self.game_paths)
             .field("vfs", &self.vfs)
+            .field("mount_table", &self.mount_table.as_ref().map(|_| "..."))
             .field(
                 "device_services",
                 &self.device_services.as_ref().map(|_| "..."),

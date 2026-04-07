@@ -121,7 +121,6 @@ pub struct BleCharacteristicData {
 #[derive(Debug)]
 pub enum HostCommand {
     // ---- Module Loading ----
-
     /// Evaluate an ES module with isolated VFS paths.
     ///
     /// This is the primary way to start a mini-game. The module is loaded
@@ -154,7 +153,6 @@ pub enum HostCommand {
     },
 
     // ---- Lifecycle Events ----
-
     /// Restart the current game runtime.
     ///
     /// Re-initializes the JS runtime and re-loads the last evaluated module
@@ -182,7 +180,6 @@ pub enum HostCommand {
     OnHide,
 
     // ---- Audio Events ----
-
     /// Notify that audio playback has been interrupted.
     ///
     /// Triggered when the system takes audio focus (e.g., incoming call).
@@ -206,7 +203,6 @@ pub enum HostCommand {
     },
 
     // ---- Rendering / Surface ----
-
     /// Update the rendering surface (e.g., after orientation change).
     ///
     /// The render thread will recreate the EGL context with the new surface.
@@ -215,8 +211,10 @@ pub enum HostCommand {
         surface: SurfaceRef,
     },
 
-    // ---- Touch / Input ----
+    /// Notify that the current rendering surface has been destroyed.
+    SurfaceDestroyed,
 
+    // ---- Touch / Input ----
     /// Dispatch touch input events to the game.
     ///
     /// Boxed to keep the `HostCommand` enum small (~56-64 bytes instead of ~216).
@@ -224,7 +222,6 @@ pub enum HostCommand {
     OnTouch(Box<TouchData>),
 
     // ---- Sensor Events ----
-
     /// Device motion sensor data (rotation angles from TYPE_ROTATION_VECTOR).
     ///
     /// Sent by the platform sensor listener at the requested interval.
@@ -268,7 +265,6 @@ pub enum HostCommand {
     },
 
     // ---- Network Events ----
-
     /// Network status changed.
     ///
     /// Sent by the platform network monitor when connectivity changes.
@@ -280,7 +276,6 @@ pub enum HostCommand {
     },
 
     // ---- Recorder Events ----
-
     /// Recorder event pushed from platform (start, pause, resume, stop, error, interruption).
     RecorderEvent {
         /// Event type string (e.g., “start”, “stop”, “error”, “interruptionBegin”).
@@ -298,7 +293,6 @@ pub enum HostCommand {
     },
 
     // ---- Camera Events ----
-
     /// Camera event pushed from platform (stop, authCancel, error, timeoutCallback).
     CameraEvent {
         /// JS-assigned camera instance ID.
@@ -322,7 +316,6 @@ pub enum HostCommand {
     },
 
     // ---- Keyboard Events ----
-
     /// Keyboard input event (user typed text in soft keyboard).
     ///
     /// Triggers `migo.onKeyboardInput` callbacks.
@@ -380,7 +373,6 @@ pub enum HostCommand {
     },
 
     // ---- Bluetooth / BLE Events ----
-
     /// Bluetooth adapter state changed (available/discovering).
     ///
     /// Triggers `migo.onBluetoothAdapterStateChange` callbacks.
@@ -444,7 +436,6 @@ pub enum HostCommand {
     },
 
     // ---- Video Events ----
-
     /// Video player state change event.
     ///
     /// Uses a single variant with `event_type` to cover all video events:
@@ -466,7 +457,6 @@ pub enum HostCommand {
     },
 
     // ---- System Events ----
-
     /// Memory warning from the system.
     ///
     /// Triggered when Android sends `onTrimMemory` or `onLowMemory`.

@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "thresholds": {
+    "avg_fps_min_delta": -2.0,
+    "p95_ms_max_delta": 3.0,
+    "first_frame_ms_max_delta": 30.0,
+    "full_surface_frames_max_delta": 50.0,
+    "upload_frame_rejections_max_delta": 20.0
+  },
+  "results": [
+    {
+      "device": "api23-low",
+      "workload": "cocos-webgl-gameplay",
+      "stats": {"avg_fps": 55.0, "p95_ms": 24.0, "first_frame_ms": 520.0, "full_surface_frames": 900.0, "upload_frame_rejections": 0.0}
+    },
+    {
+      "device": "api23-low",
+      "workload": "odc-canvas2d-ui",
+      "stats": {"avg_fps": 57.0, "p95_ms": 21.0, "first_frame_ms": 410.0, "full_surface_frames": 850.0, "upload_frame_rejections": 0.0}
+    },
+    {
+      "device": "api23-low",
+      "workload": "startup-loader",
+      "stats": {"avg_fps": 54.0, "p95_ms": 25.0, "first_frame_ms": 780.0, "full_surface_frames": 500.0, "upload_frame_rejections": 0.0}
+    },
+    {
+      "device": "api23-low",
+      "workload": "resize-orientation",
+      "stats": {"avg_fps": 56.0, "p95_ms": 23.0, "first_frame_ms": 460.0, "full_surface_frames": 800.0, "upload_frame_rejections": 0.0}
+    },
+    {
+      "device": "mid-60hz",
+      "workload": "cocos-webgl-gameplay",
+      "stats": {"avg_fps": 58.0, "p95_ms": 22.0, "first_frame_ms": 430.0, "full_surface_frames": 200.0, "upload_frame_rejections": 5.0}
+    },
+    {
+      "device": "mid-60hz",
+      "workload": "odc-canvas2d-ui",
+      "stats": {"avg_fps": 59.0, "p95_ms": 19.0, "first_frame_ms": 360.0, "full_surface_frames": 50.0, "upload_frame_rejections": 2.0}
+    },
+    {
+      "device": "mid-60hz",
+      "workload": "startup-loader",
+      "stats": {"avg_fps": 57.0, "p95_ms": 23.0, "first_frame_ms": 640.0, "full_surface_frames": 300.0, "upload_frame_rejections": 8.0}
+    },
+    {
+      "device": "mid-60hz",
+      "workload": "resize-orientation",
+      "stats": {"avg_fps": 58.0, "p95_ms": 21.0, "first_frame_ms": 390.0, "full_surface_frames": 150.0, "upload_frame_rejections": 3.0}
+    },
+    {
+      "device": "high-refresh",
+      "workload": "cocos-webgl-gameplay",
+      "stats": {"avg_fps": 88.0, "p95_ms": 14.0, "first_frame_ms": 320.0, "full_surface_frames": 100.0, "upload_frame_rejections": 2.0}
+    },
+    {
+      "device": "high-refresh",
+      "workload": "odc-canvas2d-ui",
+      "stats": {"avg_fps": 92.0, "p95_ms": 12.0, "first_frame_ms": 280.0, "full_surface_frames": 30.0, "upload_frame_rejections": 1.0}
+    },
+    {
+      "device": "high-refresh",
+      "workload": "startup-loader",
+      "stats": {"avg_fps": 84.0, "p95_ms": 16.0, "first_frame_ms": 510.0, "full_surface_frames": 200.0, "upload_frame_rejections": 4.0}
+    },
+    {
+      "device": "high-refresh",
+      "workload": "resize-orientation",
+      "stats": {"avg_fps": 90.0, "p95_ms": 13.0, "first_frame_ms": 300.0, "full_surface_frames": 80.0, "upload_frame_rejections": 1.0}
+    }
+  ]
+}

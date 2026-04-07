@@ -1,6 +1,7 @@
 use deno_core::extension;
 
 mod context2d;
+pub(crate) mod frame_collector;
 mod font;
 mod raf;
 mod webgl;
@@ -9,8 +10,6 @@ use context2d::*;
 use font::*;
 use raf::*;
 use webgl::*;
-
-pub use context2d::FrameCommandCollector;
 
 extension!(host_v8_webgl,
     deps = [host_v8_console, host_v8_base],
@@ -147,6 +146,7 @@ extension!(host_v8_webgl,
         op_frame_begin,
         op_frame_end,
         op_frame_end_all,
+        op_frame_end_unified,
         op_invalidate,
 
         // Path methods
@@ -226,9 +226,8 @@ extension!(host_v8_webgl,
         "04_font.js",
     ],
     state = |state| {
-        state.put(FrameCommandCollector::new());
-        state.put(GlBatchCollector::new());
         state.put(GlResourceIdAllocator::new());
+        state.put(frame_collector::UnifiedFrameCollector::new());
     }
 );
 

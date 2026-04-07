@@ -70,7 +70,7 @@ async function _startRafLoop() {
 }
 
 const setPreferredFramesPerSecond = (fps) => {
-    op_set_preferred_fps(Math.max(1, Math.min(60, fps | 0)));
+    op_set_preferred_fps(Math.max(1, Math.min(120, fps | 0)));
 };
 
 export { requestAnimationFrame, cancelAnimationFrame, setPreferredFramesPerSecond };

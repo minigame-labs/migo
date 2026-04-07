@@ -292,7 +292,10 @@ impl PboPool {
                 if status == glow::TIMEOUT_EXPIRED || status == glow::WAIT_FAILED {
                     // DMA still in flight or driver error — discard this PBO
                     // and create a fresh one to avoid a GPU stall.
-                    warn!("PBO fence wait failed (status=0x{:X}), discarding PBO", status);
+                    warn!(
+                        "PBO fence wait failed (status=0x{:X}), discarding PBO",
+                        status
+                    );
                     unsafe { gl.delete_buffer(pbo) };
                     return unsafe { gl.create_buffer().ok() };
                 }

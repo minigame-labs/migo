@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 pub use crate::protocol::color::Color;
 
 use crate::error::{EngineError, ErrorCode};
-use crate::protocol::io_cmd::NormalizedImage;
+use crate::protocol::FramePacket;
 use crate::surface::SurfaceRef;
 
 pub type CanvasId = u32;
@@ -21,6 +21,27 @@ pub type Context2DId = u32;
 
 /// Protocol-wide Render result type.
 pub type RenderResult<T> = Result<T, EngineError>;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DirtyRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Debug)]
+pub struct CanvasBatchPayload {
+    pub canvas_id: CanvasId,
+    pub commands: Vec<Canvas2DCmd>,
+    pub present: bool,
+    pub dirty_rect: Option<DirtyRect>,
+}
+
+#[derive(Debug)]
+pub struct GlBatchPayload {
+    pub commands: Vec<GLCmd>,
+}
 
 pub type SyncResp<T> = Sender<RenderResult<T>>;
 
@@ -73,13 +94,12 @@ impl<T> RenderCmdResp<T> {
 pub enum RenderCommand {
     FrameRate(u32),
     Shutdown,
+    FramePacket(FramePacket),
 
     Canvas(CanvasCmd),
     GL(GLCmd),
     /// Batched WebGL commands executed in-order by render thread.
-    GLBatch {
-        commands: Vec<GLCmd>,
-    },
+    GLBatch(GlBatchPayload),
 
     /// Single Canvas2D command (V1 - immediate mode)
     Canvas2D {
@@ -91,14 +111,7 @@ pub enum RenderCommand {
     ///
     /// Contains all Canvas2D commands for a single frame, sent as one message.
     /// This significantly reduces IPC overhead compared to sending each command individually.
-    Canvas2DBatch {
-        canvas_id: CanvasId,
-        commands: Vec<Canvas2DCmd>,
-        /// Bounding box of all draw commands in this batch (pixel coords: x, y, w, h).
-        /// `None` means either no draw commands, or a mid-frame flush where tracking
-        /// is deferred to the final frame_end.
-        dirty_rect: Option<(f32, f32, f32, f32)>,
-    },
+    Canvas2DBatch(CanvasBatchPayload),
 
     /// Invalidate signal for on-demand rendering mode
     ///
@@ -136,6 +149,12 @@ pub enum RenderCommand {
     ///
     /// Used when the app returns to foreground.
     Resume,
+
+    /// Mark the current onscreen surface as destroyed.
+    ///
+    /// The render thread keeps running and can still accept a later
+    /// `RecreateOnscreen`, but must stop presenting until then.
+    SurfaceDestroyed,
 }
 
 #[non_exhaustive]
@@ -184,11 +203,12 @@ pub enum CanvasCmd {
         resp: RenderCmdResp<ImageId>,
     },
 
-    /// Load an RGBA8 image (width/height + raw bytes).
+    /// Load an image (RGBA8 or compressed) for GPU upload.
     /// The render thread owns the GPU resource.
     LoadImage {
         image_id: ImageId,
-        image: NormalizedImage,
+        image: super::io_cmd::DecodedImage,
+        priority: super::io_cmd::ImagePriority,
         resp: RenderCmdResp<(u32, u32)>, // (width, height)
     },
 

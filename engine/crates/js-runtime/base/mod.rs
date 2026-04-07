@@ -2,6 +2,32 @@ use deno_core::{op2, serde_json, v8, Extension, OpState};
 use shared::op_state::HostOpState;
 use tracing::debug;
 
+/// Derive a collision-free filesystem-safe key from a package name.
+/// Uses percent-encoding: every byte that isn't [a-zA-Z0-9._-] is
+/// encoded as %XX.  Validates length, traversal, and control chars.
+fn safe_package_key(name: &str) -> Result<String, String> {
+    let trimmed = name.trim_matches('/');
+    if trimmed.is_empty() || trimmed.len() > 256 {
+        return Err(format!("invalid name: empty or too long ({})", name.len()));
+    }
+    if trimmed.contains("..") || trimmed.bytes().any(|b| b < 0x20) {
+        return Err(format!("invalid characters in name: {name}"));
+    }
+    let mut key = String::with_capacity(trimmed.len());
+    for b in trimmed.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'-' | b'_' => {
+                key.push(b as char);
+            }
+            _ => {
+                key.push('%');
+                key.push_str(&format!("{:02X}", b));
+            }
+        }
+    }
+    Ok(key)
+}
+
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
 enum RequireError {
     #[class(generic)]
@@ -73,26 +99,51 @@ fn is_absolute_path(specifier: &str) -> bool {
 /// 2. path.js
 /// 3. path.json
 /// 4. path/index.js
-fn resolve_module_path(path: std::path::PathBuf) -> std::path::PathBuf {
-    if path.is_file() {
+///
+/// Checks both filesystem AND MountTable (for pack-backed overlays where
+/// files don't exist on disk but are accessible via the mount).
+fn resolve_module_path(
+    path: std::path::PathBuf,
+    mount_table: Option<&shared::vfs::MountTable>,
+    code_dir: &str,
+) -> std::path::PathBuf {
+    let code_path = std::path::Path::new(code_dir);
+
+    // Helper: check if a candidate path exists on filesystem OR in mount table.
+    let exists = |p: &std::path::Path| -> bool {
+        if p.is_file() {
+            return true;
+        }
+        // Check mount table for pack-backed entries.
+        if let Some(mt) = mount_table {
+            if let Ok(rel) = p.strip_prefix(code_path) {
+                if let Some(rel_str) = rel.to_str() {
+                    return mt.is_file(rel_str);
+                }
+            }
+        }
+        false
+    };
+
+    if exists(&path) {
         return path;
     }
 
     // Try appending .js
     if !path.extension().map_or(false, |e| e == "js" || e == "json") {
         let with_js = path.with_extension("js");
-        if with_js.is_file() {
+        if exists(&with_js) {
             return with_js;
         }
         let with_json = path.with_extension("json");
-        if with_json.is_file() {
+        if exists(&with_json) {
             return with_json;
         }
     }
 
     // Try path/index.js (directory as module)
     let index_js = path.join("index.js");
-    if index_js.is_file() {
+    if exists(&index_js) {
         return index_js;
     }
 
@@ -111,41 +162,117 @@ fn op_require_resolve_and_read(
     #[string] specifier: String,
     #[string] referrer_dir: String,
 ) -> Result<RequireResult, RequireError> {
+    let host = state.borrow::<HostOpState>();
+    let mount_table = host.mount_table.clone();
+    let code_dir = host.code_dir.clone().unwrap_or_default();
+    drop(host);
+
     let base_dir = if referrer_dir.is_empty() {
-        let host = state.borrow::<HostOpState>();
-        host.code_dir.clone().unwrap_or_default()
+        code_dir.clone()
     } else {
         referrer_dir
     };
 
-    // Resolve the specifier to an absolute path
-    let raw_path = if is_absolute_path(&specifier) {
-        std::path::PathBuf::from(&specifier)
-    } else {
-        std::path::PathBuf::from(&base_dir).join(&specifier)
-    };
+    // Reject absolute paths — they must go through /code resolution.
+    if is_absolute_path(&specifier) {
+        return Err(RequireError::Io(format!(
+            "require: absolute path not allowed: {specifier}"
+        )));
+    }
 
-    // Apply extension/index resolution
-    let resolved = resolve_module_path(raw_path);
+    let raw_path = std::path::PathBuf::from(&base_dir).join(&specifier);
+    let resolved = resolve_module_path(raw_path, mount_table.as_deref(), &code_dir);
 
-    // Canonicalize to normalize symlinks, `..`, and produce a unique cache key.
+    // Compute a normalized relative path for the canonical module key.
+    // This ensures ./foo and ./a/../foo produce the same cache key.
+    let code_path = std::path::Path::new(&code_dir);
+    let normalized_relative = resolved.strip_prefix(code_path)
+        .ok()
+        .and_then(|r| r.to_str())
+        .map(|s| {
+            // Normalize .. and . textually.
+            let mut parts: Vec<&str> = Vec::new();
+            for c in s.split('/') {
+                match c {
+                    "" | "." => {}
+                    ".." => { parts.pop(); }
+                    c => parts.push(c),
+                }
+            }
+            parts.join("/")
+        });
+
+    if let (Some(mt), Some(rel)) = (&mount_table, &normalized_relative) {
+        // Use resolve() as the single source of truth for overlay shadow semantics.
+        // resolve() returns:
+        //   Some(real_path=Some) → file on disk (dir-backed overlay or base)
+        //   Some(real_path=None) → file in pack-backed overlay
+        //   None + overlay matches → shadow: file missing in overlay, don't fall to base
+        //   None + no overlay → path not in any overlay, may fall to base filesystem
+        let resolved_info = mt.resolve(rel);
+        let overlay_claims_subtree = mt.has_overlay_for(rel);
+
+        match &resolved_info {
+            Some(info) => {
+                // MountTable found the file. Read it.
+                match mt.read(rel) {
+                    Ok(bytes) => {
+                        let content = String::from_utf8(bytes).map_err(|e| {
+                            RequireError::Io(format!("require: not UTF-8: {e}"))
+                        })?;
+                        let is_pack = info.real_path.is_none();
+                        let abs_path = if is_pack {
+                            // Per-source mounted_at: only changes when THIS source
+                            // is replaced, not when other overlays change.
+                            format!("{}#s{}", code_path.join(rel).display(), info.source_mounted_at)
+                        } else {
+                            code_path.join(rel).to_string_lossy().into_owned()
+                        };
+                        let parent = code_path.join(rel).parent()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        return Ok(RequireResult { code: content, abs_path, dir: parent });
+                    }
+                    Err(e) => {
+                        return Err(RequireError::Io(format!(
+                            "require: resolved but read failed: {rel}: {e}"
+                        )));
+                    }
+                }
+            }
+            None if overlay_claims_subtree => {
+                // An overlay covers this subtree but the file doesn't exist in it.
+                // Shadow: do NOT fall through to base.
+                return Err(RequireError::Io(format!(
+                    "require: module not found (shadowed by overlay): {rel}"
+                )));
+            }
+            None => {
+                // No overlay covers this path. Fall through to base filesystem.
+            }
+        }
+    }
+
+    // Fallback: base filesystem read (only for paths NOT shadowed by an overlay).
     let path = std::fs::canonicalize(&resolved).unwrap_or(resolved);
 
-    let abs_path = path.to_string_lossy().into_owned();
+    // Sandbox: reject paths outside code_dir.
+    if !code_dir.is_empty() {
+        if !path.starts_with(code_path) {
+            return Err(RequireError::Io(format!(
+                "require: path escapes /code sandbox: {}", path.display()
+            )));
+        }
+    }
 
+    let abs_path = path.to_string_lossy().into_owned();
     let content = std::fs::read_to_string(&path)
         .map_err(|e| RequireError::Io(format!("require: cannot read {}: {}", abs_path, e)))?;
-
-    let parent = path
-        .parent()
+    let parent = path.parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    Ok(RequireResult {
-        code: content,
-        abs_path,
-        dir: parent,
-    })
+    Ok(RequireResult { code: content, abs_path, dir: parent })
 }
 
 #[derive(serde::Serialize)]
@@ -203,6 +330,237 @@ fn op_download_subpackage(
     ))
 }
 
+/// Install a subpackage from a downloaded zip file.
+///
+/// This is the new package-native install path:
+/// 1. Ingest zip → .mpkg (in staging area under cache dir)
+/// 2. Validate the package (full checksum verification)
+/// 3. Atomic rename to final package location
+/// 4. Mount as overlay in the MountTable
+///
+/// Called by JS after a successful subpackage download provides the zip path.
+/// Returns a JSON string with the package identity on success.
+#[op2(async(lazy), fast)]
+#[string]
+async fn op_install_subpackage(
+    state: std::rc::Rc<std::cell::RefCell<OpState>>,
+    #[string] options_json: String,
+) -> Result<String, deno_error::JsErrorBox> {
+    use shared::vfs::mount::StagingArea;
+
+    #[derive(serde::Deserialize)]
+    struct InstallOptions {
+        #[serde(rename = "zipPath")]
+        zip_path: String,
+        name: String,
+        root: String,
+        #[serde(default)]
+        version: String,
+        /// When true (preDownloadSubpackage), manifest write failure is a hard
+        /// error — the caller expects durable installation.  When false
+        /// (loadSubpackage), manifest failure is a warning since the package
+        /// is live for the current session.
+        #[serde(default)]
+        ensure_persistent: bool,
+    }
+
+    let opts: InstallOptions = serde_json::from_str(&options_json)
+        .map_err(|e| deno_error::JsErrorBox::generic(format!("invalid install options: {e}")))?;
+
+    let pkg_key = safe_package_key(&opts.name)
+        .map_err(|e| deno_error::JsErrorBox::generic(
+            format!("installSubpackage:fail {e}")
+        ))?;
+
+    // Validate root: must be a valid relative path prefix for mount overlay.
+    // Reject empty, absolute, traversal, control chars.
+    {
+        let root = opts.root.trim_matches('/');
+        if root.is_empty() {
+            return Err(deno_error::JsErrorBox::generic(
+                "installSubpackage:fail root is empty"
+            ));
+        }
+        if root.contains("..") || root.contains('\\') || root.bytes().any(|b| b < 0x20) {
+            return Err(deno_error::JsErrorBox::generic(
+                format!("installSubpackage:fail invalid root: {}", opts.root)
+            ));
+        }
+    }
+
+    let (mount_table, game_cache_dir) = {
+        let st = state.borrow();
+        let host = st.borrow::<HostOpState>();
+
+        // Code-signing gate: downloaded subpackages have no Ed25519 signature.
+        // When code signing is enforced, reject dynamic installs.  Code-tree
+        // subpackages are covered by the base package signing.
+        if host.code_signing_enabled {
+            return Err(deno_error::JsErrorBox::generic(
+                "installSubpackage:fail code signing is enabled; \
+                 dynamic subpackage download is not allowed"
+            ));
+        }
+
+        let mt = host.mount_table.clone().ok_or_else(|| {
+            deno_error::JsErrorBox::generic("installSubpackage:fail mount table not initialized")
+        })?;
+        let gcd = host.game_paths.as_ref()
+            .map(|gp| gp.cache_dir().to_path_buf())
+            .ok_or_else(|| {
+                deno_error::JsErrorBox::generic("installSubpackage:fail game paths not initialized")
+            })?;
+        (mt, gcd)
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        use shared::vfs::mount::{PackageManifest, package_store_dir};
+
+        let store = package_store_dir(&game_cache_dir);
+
+        // 1. Create staging area under per-game cache.
+        let staging = StagingArea::create(&game_cache_dir, &pkg_key)
+            .map_err(|e| format!("staging create failed: {e}"))?;
+
+        // 2. Ingest zip → .mpkg in staging.
+        let pkg_filename = format!("{}.mpkg", pkg_key);
+        let staged_pkg_path = staging.dir().join(&pkg_filename);
+        let version = if opts.version.is_empty() { "1.0".to_string() } else { opts.version };
+
+        io::ingest_zip_to_package(
+            std::path::Path::new(&opts.zip_path),
+            &staged_pkg_path,
+            &pkg_key,
+            &version,
+        )
+        .map_err(|e| format!("ingest failed: {e}"))?;
+
+        // 3. Atomic install: validate → rename → mount overlay.
+        let final_pkg_path = store.join(&pkg_filename);
+        let identity = staging
+            .install_package(
+                &mount_table,
+                &pkg_filename,
+                &final_pkg_path,
+                &opts.root,
+                &pkg_key,
+                &version,
+            )
+            .map_err(|e| format!("install failed: {e}"))?;
+
+        // 4. Write manifest (per-game persistence).
+        let mut manifest = PackageManifest::load(&store);
+        manifest.record(pkg_key, opts.root, identity.version.clone());
+        if let Err(e) = manifest.save(&store) {
+            if opts.ensure_persistent {
+                // preDownloadSubpackage: caller expects durable install.
+                // Package is live for current session but won't survive restart.
+                // Report failure so JS knows predownload didn't fully succeed.
+                return Err(format!("manifest write failed (not durably installed): {e}"));
+            }
+            // loadSubpackage: package is live, manifest loss is non-fatal.
+            tracing::warn!("subpackage manifest write failed (package still live): {e}");
+        }
+
+        Ok(serde_json::json!({
+            "name": identity.name,
+            "version": identity.version,
+            "checksum": identity.checksum,
+        })
+        .to_string())
+    })
+    .await
+    .map_err(|e| deno_error::JsErrorBox::generic(format!("install task error: {e}")))?
+    .map_err(deno_error::JsErrorBox::generic)?;
+
+    Ok(result)
+}
+
+/// Get the current MountTable generation counter.
+#[op2(fast)]
+#[bigint]
+fn op_get_mount_generation(state: &mut OpState) -> u64 {
+    let host = state.borrow::<HostOpState>();
+    host.mount_table.as_ref().map(|mt| mt.generation()).unwrap_or(0)
+}
+
+/// Get the identity of the overlay covering a subpackage root.
+/// Returns a stable per-subpackage token (e.g. "subpackage:stage1") that
+/// changes only when that specific subpackage is replaced.  Returns empty
+/// string if the path is served by the base code tree.
+#[op2]
+#[string]
+fn op_get_subpackage_identity(
+    state: &mut OpState,
+    #[string] root: &str,
+) -> String {
+    let host = state.borrow::<HostOpState>();
+    match &host.mount_table {
+        Some(mt) => mt.overlay_identity_for(root),
+        None => String::new(),
+    }
+}
+
+/// Check if a subpackage is durably installed in the per-game package store.
+///
+/// Checks manifest.json for an entry where BOTH the package key matches
+/// the name AND the prefix matches the root, AND the .mpkg file exists.
+/// This prevents false positives from stale or mismatched manifest entries.
+#[op2(fast)]
+fn op_is_subpackage_persisted(
+    state: &mut OpState,
+    #[string] name: &str,
+    #[string] root: &str,
+) -> bool {
+    let host = state.borrow::<HostOpState>();
+    let Some(game_paths) = &host.game_paths else { return false; };
+    let store = shared::vfs::mount::package_store_dir(game_paths.cache_dir());
+    let manifest = shared::vfs::mount::PackageManifest::load(&store);
+
+    // Derive the same package key that install would use.
+    let pkg_key = match safe_package_key(name) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+
+    // Look up by derived key.
+    if let Some(entry) = manifest.packages.get(&pkg_key) {
+        if entry.prefix == root {
+            let pkg_path = store.join(format!("{pkg_key}.mpkg"));
+            return pkg_path.exists();
+        }
+    }
+    false
+}
+
+/// Check if a subpackage is already available locally.
+///
+/// Returns true if the subpackage content is accessible via MountTable
+/// (either as an installed .mpkg overlay or as files in the base code tree).
+/// Used by JS to skip download when the subpackage is already present.
+#[op2(fast)]
+fn op_is_subpackage_installed(
+    state: &mut OpState,
+    #[string] root: &str,
+) -> bool {
+    let host = state.borrow::<HostOpState>();
+    let Some(mt) = &host.mount_table else { return false; };
+
+    // Check if any entry point candidate exists in the mount view.
+    let candidates = [
+        format!("{root}/game.js"),
+        format!("{root}/index.js"),
+        format!("{root}/main.js"),
+    ];
+    for candidate in &candidates {
+        if mt.exists(candidate) || mt.exists_or_is_dir(candidate) {
+            return true;
+        }
+    }
+    // Also check if the root itself is a visible directory with content.
+    !mt.list_dir(root).is_empty()
+}
+
 deno_core::extension!(
     host_v8_base,
     ops = [
@@ -212,6 +570,11 @@ deno_core::extension!(
         op_get_sub_packages,
         op_get_workers_path,
         op_download_subpackage,
+        op_install_subpackage,
+        op_get_mount_generation,
+        op_get_subpackage_identity,
+        op_is_subpackage_persisted,
+        op_is_subpackage_installed,
     ],
     esm = [
         dir "base",

@@ -1,4 +1,4 @@
-import { op_download_subpackage, op_get_sub_packages, op_get_workers_path } from "ext:core/ops";
+import { op_download_subpackage, op_install_subpackage, op_is_subpackage_installed, op_is_subpackage_persisted, op_get_mount_generation, op_get_subpackage_identity, op_get_sub_packages, op_get_workers_path } from "ext:core/ops";
 import { require as amdRequire } from "ext:host_v8_base/01_amdshim.js";
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
@@ -42,7 +42,9 @@ function _isNotFoundError(err) {
     const text = _errorText(err).toLowerCase();
     return text.includes("cannot find module")
         || text.includes("cannot read")
-        || text.includes("no such file");
+        || text.includes("no such file")
+        || text.includes("not found")
+        || text.includes("shadowed by overlay");
 }
 
 function _loadRuntimeConfig() {
@@ -106,7 +108,9 @@ function _resolveSubpackage(options) {
 
 // ---- entry point execution ----
 
-const _loadedSubpackages = new Set();
+// Maps subpackageKey -> mount generation at load time.
+// If mount generation changes (package replaced), the entry is re-executed.
+const _loadedSubpackages = new Map();
 
 function _buildEntrypoints(pkg) {
     const list = [];
@@ -224,9 +228,23 @@ function _localFallback(requestId) {
 // Throws if entry exists but has a runtime error.
 function _tryLocalExecute(pkg) {
     const key = _subpackageKey(pkg);
-    if (_loadedSubpackages.has(key)) return true;
+    // Per-subpackage identity: only changes when THIS subpackage is replaced.
+    // Does NOT change when other subpackages are installed/replaced.
+    let identity;
+    try {
+        identity = pkg.root ? op_get_subpackage_identity(pkg.root) : '';
+    } catch (_) {
+        identity = '';
+    }
+    const token = identity || 'base';
+
+    // Already loaded with same identity -- skip re-execution.
+    if (_loadedSubpackages.has(key) && _loadedSubpackages.get(key) === token) {
+        return true;
+    }
+
     if (pkg.name === "__GAME__") {
-        _loadedSubpackages.add(key);
+        _loadedSubpackages.set(key, token);
         return true;
     }
 
@@ -234,14 +252,14 @@ function _tryLocalExecute(pkg) {
     for (const entry of candidates) {
         try {
             amdRequire(entry);
-            _loadedSubpackages.add(key);
+            _loadedSubpackages.set(key, token);
             return true;
         } catch (err) {
             if (_isNotFoundError(err)) continue;
-            throw err; // entry exists but has a runtime error
+            throw err;
         }
     }
-    return false; // not found locally
+    return false;
 }
 
 function _startDownload(apiName, options, pkg, executeAfter) {
@@ -258,20 +276,31 @@ function _startDownload(apiName, options, pkg, executeAfter) {
         complete: typeof options.complete === "function" ? options.complete : noop,
     });
 
-    // Fast path: if loading and entry file is already on disk, skip download.
-    // preDownloadSubpackage (executeAfter=false) always asks the platform,
-    // since we cannot check file existence without executing.
+    // Fast path: check if subpackage is already available locally.
+    // This covers: already loaded, installed .mpkg overlay, or code tree content.
     if (executeAfter) {
+        // loadSubpackage: try to execute directly.
         try {
             if (_tryLocalExecute(pkg)) {
-                // Already loaded -- report success asynchronously
                 queueMicrotask(() => _localFallback(requestId));
                 return task;
             }
         } catch (e) {
-            // Entry found but runtime error -- report failure asynchronously
             queueMicrotask(() => _settle(requestId, _errorText(e)));
             return task;
+        }
+    } else {
+        // preDownloadSubpackage: check if DURABLY installed (survives restart).
+        // Must not use mount-only check -- a session-mounted but non-persisted
+        // package would give a false "predownload success".
+        // Pass both name and root for precise manifest key matching.
+        try {
+            if (pkg.name && pkg.root && op_is_subpackage_persisted(pkg.name, pkg.root)) {
+                queueMicrotask(() => _settle(requestId, null));
+                return task;
+            }
+        } catch (_) {
+            // Check failed, proceed to download.
         }
     }
 
@@ -311,7 +340,37 @@ function _internalOnSubpackageProgress(resultJson) {
 function _internalOnSubpackageResult(resultJson) {
     let data;
     try { data = JSON.parse(resultJson); } catch (_) { return; }
-    _settle(data.requestId, data.error || null);
+
+    if (data.error) {
+        _settle(data.requestId, data.error);
+        return;
+    }
+
+    // Package-native install: ingest zip, validate, mount as overlay.
+    if (!data.zipPath) {
+        _settle(data.requestId, 'missing zipPath in download result');
+        return;
+    }
+
+    const pending = _pendingTasks.get(data.requestId);
+    if (!pending) return;
+
+    const installOpts = JSON.stringify({
+        zipPath: data.zipPath,
+        name: pending.pkg.name || '',
+        root: pending.pkg.root || '',
+        version: data.version || '1.0',
+        ensure_persistent: !pending.executeAfter,
+    });
+
+    (async () => {
+        try {
+            await op_install_subpackage(installOpts);
+            _settle(data.requestId, null);
+        } catch (e) {
+            _settle(data.requestId, 'install failed: ' + (e.message || e));
+        }
+    })();
 }
 
 // ---- public API ----

@@ -375,6 +375,10 @@ pub(crate) extern "system" fn updateSurface<'local>(
     info!("Host {} updated surface: {}x{}", host_id, w, h);
 }
 
+pub(crate) extern "system" fn onSurfaceDestroyed(_env: JNIEnv, _class: JClass, host_id: jint) {
+    let _ = send_command_to_host(host_id, HostCommand::SurfaceDestroyed);
+}
+
 pub(crate) extern "system" fn onOpenSystemBluetoothSetting<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -1099,8 +1103,8 @@ pub(crate) extern "system" fn onVsync(
     host_id: jint,
     frame_time_nanos: jlong,
 ) {
-    let ts_ms = frame_time_nanos as f64 / 1_000_000.0;
-    core::send_vsync(host_id, ts_ms);
+    let frame_time_ms = frame_time_nanos as f64 / 1_000_000.0;
+    core::send_vsync(host_id, frame_time_ms);
 }
 
 // ==================== Debug Stats ====================
@@ -1110,28 +1114,12 @@ pub(crate) extern "system" fn getDebugStats(
     _class: JClass,
     host_id: jint,
 ) -> jni::sys::jbyteArray {
-    use std::sync::atomic::Ordering;
-
     let stats = match shared::stats::get_stats(host_id) {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
 
-    let fps_x10 = stats.fps_x10.load(Ordering::Relaxed);
-    let frame_time_us = stats.frame_time_us.load(Ordering::Relaxed);
-    let dropped = stats.dropped_frames.load(Ordering::Relaxed);
-    let fatal_error = stats.fatal_error_code.load(Ordering::Relaxed);
-    let first_frame_ms = stats.first_frame_ms.load(Ordering::Relaxed);
-
-    let command_drops = stats.command_drops.load(Ordering::Relaxed);
-
-    let mut buf = [0u8; 24];
-    buf[0..4].copy_from_slice(&fps_x10.to_le_bytes());
-    buf[4..8].copy_from_slice(&frame_time_us.to_le_bytes());
-    buf[8..12].copy_from_slice(&dropped.to_le_bytes());
-    buf[12..16].copy_from_slice(&fatal_error.to_le_bytes());
-    buf[16..20].copy_from_slice(&first_frame_ms.to_le_bytes());
-    buf[20..24].copy_from_slice(&command_drops.to_le_bytes());
+    let buf = stats.snapshot();
 
     match env.byte_array_from_slice(&buf) {
         Ok(arr) => arr.into_raw(),
@@ -1193,7 +1181,7 @@ pub(crate) extern "system" fn onVideoEvent<'local>(
 // ==================== Console Logs ====================
 
 pub(crate) extern "system" fn getConsoleLogs<'local>(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     host_id: jint,
     since_cursor: jlong,

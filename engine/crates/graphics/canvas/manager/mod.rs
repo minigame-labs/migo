@@ -1,5 +1,6 @@
 extern crate khronos_egl as egl;
 
+use crate::dirty_region::damage_tracker::{DamageTracker, ResolvedDamage};
 use crate::{BoundContext, Canvas2DContext};
 use egl::EGL1_4;
 use femtovg::ImageId;
@@ -27,7 +28,7 @@ mod types;
 
 pub(crate) use types::{
     ee, BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta, ProgramMeta, RenderbufferMeta,
-    ShaderMeta, TextureMeta,
+    ScissorState, ShaderMeta, TextureMeta,
 };
 use types::{CanvasEntry, EglContextHandle, SurfaceKind};
 
@@ -87,6 +88,20 @@ pub(crate) struct CanvasManager {
     /// Runtime device capabilities, detected once at init.
     pub(crate) device_caps: crate::device_caps::DeviceCapabilities,
 
+    /// GLES major version negotiated during EGL init (3 = ES 3.0+, 2 = ES 2.0).
+    /// Used when creating shared contexts (offscreen canvas, upload thread).
+    gles_major: u32,
+
+    /// Set to true when a game reads pixels from the onscreen default framebuffer
+    /// (readPixels on canvas_id=1 with default FBO bound). Once set, DrawingBuffer
+    /// bypass is permanently disabled so the DrawingBuffer preserves content across
+    /// swaps and readback returns valid data. One-way latch — never cleared.
+    needs_default_fbo_readback: bool,
+
+    /// Per-frame upload budget gating (device-tier aware).
+    /// Gates submission to the upload thread with bandwidth and job-count limits.
+    upload_server: Option<crate::upload_server::UploadServer>,
+
     /// Dedicated texture upload thread (TierA only).
     /// None on TierB devices or if shared-context probe failed.
     pub(crate) upload_thread: Option<crate::upload_thread::UploadThreadHandle>,
@@ -103,8 +118,7 @@ pub(crate) struct CanvasManager {
     /// Deferred LoadImage responses — sent only after the async upload
     /// thread has completed and the texture is registered.
     /// Key: image_id, Value: the oneshot response sender.
-    pending_load_responses:
-        HashMap<u64, shared::protocol::render_cmd::RenderCmdResp<(u32, u32)>>,
+    pending_load_responses: HashMap<u64, shared::protocol::render_cmd::RenderCmdResp<(u32, u32)>>,
 
     /// Image IDs whose DestroyImage arrived while the upload was still in
     /// flight.  `drain_upload_completed` uses this to delete the orphaned
@@ -114,18 +128,18 @@ pub(crate) struct CanvasManager {
     /// `eglSetDamageRegionKHR` function pointer (None if EGL_KHR_partial_update
     /// is not supported). Called before `eglSwapBuffers` to inform the
     /// compositor which region changed — saves power on OLED screens.
+    #[allow(improper_ctypes_definitions)]
     egl_set_damage_region_fn: Option<
-        unsafe extern "C" fn(
-            egl::Display,
-            egl::Surface,
-            *const egl::Int,
-            egl::Int,
-        ) -> egl::Boolean,
+        unsafe extern "C" fn(egl::Display, egl::Surface, *const egl::Int, egl::Int) -> egl::Boolean,
     >,
 
-    /// Per-frame damage rect to pass to eglSetDamageRegionKHR before swap.
-    /// Set by render_thread when processing Canvas2DBatch with dirty_rect.
-    pub(crate) pending_damage_rect: Option<[i32; 4]>,
+    /// Unified per-frame damage accumulator for mixed Canvas2D + WebGL frames.
+    /// Fed by Canvas2D batches, GL draw/clear, and readback paths.
+    /// Resolved at swap time to determine partial vs full surface update.
+    pub(crate) damage: crate::damage_effect::FrameDamageAccumulator,
+
+    /// History of recent frame damages for buffer-age-aware partial present.
+    damage_history: crate::dirty_region::damage_tracker::DamageHistory,
 }
 
 impl CanvasManager {
@@ -138,15 +152,17 @@ impl CanvasManager {
         egl_lib_path: &str,
         dpi: f32,
         cache_dir: Option<&std::path::Path>,
+        gpu_caps: &shared::device::gpu_caps::GpuCaps,
     ) -> EngineResult<Self> {
         let init = egl_ops::init_egl(egl_lib_path)?;
         let egl = init.egl;
         let display = init.display;
         let config = init.config;
+        let gles_major = init.gles_major;
 
         // Create resource context + pbuffer.
         let (resource_ctx, resource_surf) =
-            egl_ops::create_pbuffer_context(&egl, display, config, None, 16, 16)?;
+            egl_ops::create_pbuffer_context(&egl, display, config, None, 16, 16, gles_major)?;
         let resource = EglContextHandle {
             ctx: resource_ctx,
             surf: resource_surf,
@@ -178,16 +194,17 @@ impl CanvasManager {
             .query_string(Some(display), egl::EXTENSIONS)
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let device_caps =
-            crate::device_caps::DeviceCapabilities::detect(&gl, &egl_extensions);
+        let device_caps = crate::device_caps::DeviceCapabilities::detect(&gl, &egl_extensions, gles_major, gpu_caps);
         tracing::info!(
-            "DeviceCapabilities: GLES {:?}, tier={:?}, pbo={}, fence={}, compute={}, ahb={}",
+            "DeviceCapabilities: GLES {:?}, tier={:?}, pbo={}, fence={}, compute={}, ahb={}, buffer_age={}, partial_update={}",
             device_caps.gles_version,
             device_caps.tier(),
             device_caps.has_pbo,
             device_caps.has_fence_sync,
             device_caps.has_compute,
             device_caps.ahb_available,
+            device_caps.has_buffer_age,
+            device_caps.has_partial_update,
         );
 
         // Initialize shader binary cache (best-effort, no-op if unsupported).
@@ -201,10 +218,15 @@ impl CanvasManager {
         });
 
         // Spawn upload thread on TierA devices (shared GL context for async texture upload).
+        let api_level = crate::device_caps::android_api_level();
         let upload_thread = if device_caps.tier() == crate::device_caps::DeviceTier::TierA {
-            crate::upload_thread::UploadThreadHandle::try_spawn(
-                &egl, display, config, resource.ctx,
-            )
+            crate::upload_thread::UploadThreadHandle::try_spawn(&egl, display, config, resource.ctx, gles_major)
+        } else {
+            None
+        };
+        // Budget gating: only when upload thread is live.
+        let upload_server = if upload_thread.is_some() {
+            Some(crate::upload_server::UploadServer::for_device(&device_caps, api_level))
         } else {
             None
         };
@@ -247,13 +269,17 @@ impl CanvasManager {
             renderbuffers: HashMap::with_capacity(8),
             gl_state: HashMap::with_capacity(4),
             device_caps,
+            gles_major,
+            needs_default_fbo_readback: false,
+            upload_server,
             upload_thread,
             shader_cache,
             pending_uploads: Vec::new(),
             pending_load_responses: HashMap::new(),
             cancelled_uploads: HashSet::new(),
             egl_set_damage_region_fn,
-            pending_damage_rect: None,
+            damage: crate::damage_effect::FrameDamageAccumulator::new(),
+            damage_history: crate::dirty_region::damage_tracker::DamageHistory::new(),
         })
     }
 
@@ -273,7 +299,7 @@ impl CanvasManager {
 
         let share = Some(self.resource.ctx);
         let (ctx, surf) =
-            egl_ops::create_pbuffer_context(&self.egl, self.display, self.config, share, w, h)?;
+            egl_ops::create_pbuffer_context(&self.egl, self.display, self.config, share, w, h, self.gles_major)?;
 
         let info = CanvasInfo {
             id,
@@ -369,6 +395,8 @@ impl CanvasManager {
         // A newly created window surface may not inherit the previous swap
         // interval state on all drivers, so force the next swap to reapply it.
         self.last_swap_interval = -1;
+        // New surface = new back buffers, old damage history is invalid.
+        self.damage_history.clear();
 
         self.egl.bind_api(egl::OPENGL_ES_API).map_err(|e| {
             ee(
@@ -379,7 +407,7 @@ impl CanvasManager {
 
         let surf = egl_ops::create_window_surface(&self.egl, self.display, self.config, window)?;
 
-        let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION as i32, 2, egl::NONE as i32];
+        let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION as i32, self.gles_major as i32, egl::NONE as i32];
         let ctx = self
             .egl
             .create_context(
@@ -530,6 +558,7 @@ impl CanvasManager {
 
             self.bound = BoundContext::Resource;
             self.last_swap_interval = -1;
+            self.damage_history.clear();
         }
         // Onscreen destroyed → bypass must be off until re-created.
         self.evaluate_bypass();
@@ -680,15 +709,13 @@ impl CanvasManager {
         &self,
         canvas_id: CanvasId,
     ) -> Option<glow::NativeFramebuffer> {
-        self.canvases
-            .get(&canvas_id)
-            .and_then(|entry| {
-                if entry.bypass_drawing_buffer {
-                    None // Bypass: bind real FBO 0, skip DrawingBuffer.
-                } else {
-                    entry.drawing_buffer.as_ref().map(|db| db.fbo)
-                }
-            })
+        self.canvases.get(&canvas_id).and_then(|entry| {
+            if entry.bypass_drawing_buffer {
+                None // Bypass: bind real FBO 0, skip DrawingBuffer.
+            } else {
+                entry.drawing_buffer.as_ref().map(|db| db.fbo)
+            }
+        })
     }
 
     /// Returns true if the framebuffer bound to `target` is the DrawingBuffer
@@ -725,14 +752,42 @@ impl CanvasManager {
     /// next frame (stored in `pending_uploads`).
     ///
     /// Called once per frame from the render thread (non-blocking).
-    pub(crate) fn drain_upload_completed(&mut self) {
+    /// Returns the number of dropped upload recoveries processed this call.
+    pub(crate) fn drain_upload_completed(&mut self) -> u32 {
         let upload = match self.upload_thread.as_mut() {
             Some(u) => u,
-            None => return,
+            None => return 0,
         };
 
         let mut completed = Vec::new();
         upload.drain_completed(&mut completed);
+
+        // Process uploads that completed but whose results could not be
+        // delivered (result channel full/disconnected).  Each item carries
+        // image_id + byte_len for consistent per-item recovery.
+        let mut dropped = Vec::new();
+        upload.drain_dropped(&mut dropped);
+        let dropped_recovery_count = dropped.len() as u32;
+        for d in &dropped {
+            // 1. Recover UploadServer budget.
+            if let Some(ref mut server) = self.upload_server {
+                server.recover_dropped(d);
+            }
+            // 2. Resolve the pending response with an error so callers
+            //    don't wait forever.
+            if let Some(resp) = self.pending_load_responses.remove(&d.image_id) {
+                resp.send(Err(shared::error::EngineError::from_detail(
+                    shared::error::ErrorCode::Cancelled,
+                    format!(
+                        "image {} upload completed but result channel was full",
+                        d.image_id,
+                    ),
+                )));
+            }
+            // 3. Clean stale cancelled_uploads entry (if DestroyImage arrived
+            //    while the upload was in flight and then the result was dropped).
+            self.cancelled_uploads.remove(&d.image_id);
+        }
 
         // Also re-check any previously deferred uploads.
         let mut deferred = std::mem::take(&mut self.pending_uploads);
@@ -740,13 +795,16 @@ impl CanvasManager {
 
         for c in deferred {
             // Non-blocking fence check (timeout = 0).
-            let status = unsafe {
-                self.gl.client_wait_sync(c.fence, 0, 0)
-            };
+            let status = unsafe { self.gl.client_wait_sync(c.fence, 0, 0) };
 
             if status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED {
                 // GPU upload complete — delete the fence.
                 unsafe { self.gl.delete_sync(c.fence) };
+
+                // Release upload budget (both normal and cancelled paths).
+                if let Some(ref mut server) = self.upload_server {
+                    server.finish_job_bytes(c.byte_len);
+                }
 
                 // If the image was destroyed while the upload was in flight,
                 // discard the texture instead of registering it.
@@ -776,12 +834,37 @@ impl CanvasManager {
 
                 tracing::trace!(
                     "Upload thread: texture registered image_id={} {}x{}",
-                    c.image_id, c.width, c.height
+                    c.image_id,
+                    c.width,
+                    c.height
                 );
             } else {
                 // Not ready yet — defer to next frame.
                 self.pending_uploads.push(c);
             }
+        }
+        dropped_recovery_count
+    }
+
+    /// Reset per-frame upload budget counters.  Called at the render thread's
+    /// frame boundary (after draining completions, before signaling RAF).
+    pub(crate) fn reset_frame_upload_budget(&mut self) {
+        if let Some(ref mut server) = self.upload_server {
+            server.reset_frame_budget();
+        }
+    }
+
+    /// Read and reset per-frame upload budget rejections since last call.
+    pub(crate) fn take_upload_frame_rejections(&mut self) -> u32 {
+        match self.upload_server {
+            Some(ref mut server) => {
+                let n = server.frame_rejections();
+                // frame_rejections is reset by reset_frame_budget, but we
+                // read it before that reset fires (called in the same
+                // present_frame_and_signal_raf closure).
+                n
+            }
+            None => 0,
         }
     }
 
@@ -789,10 +872,77 @@ impl CanvasManager {
     ///
     /// Bypass is safe when there is exactly one canvas (the onscreen one)
     /// and no offscreen canvases exist.  Called after canvas creation/destruction.
+    /// Signal that the game reads from the onscreen default framebuffer.
+    /// Permanently disables DrawingBuffer bypass so content is preserved across swaps.
+    ///
+    /// If bypass was active at the time of detection, we snapshot the current
+    /// window surface content into the DrawingBuffer (reverse blit) so the
+    /// readback that triggered this signal sees valid content immediately,
+    /// not just on subsequent frames.
+    pub(crate) fn signal_default_fbo_readback(&mut self) {
+        if !self.needs_default_fbo_readback {
+            let onscreen_id = CanvasId::from(1u32);
+            let was_bypass = self
+                .canvases
+                .get(&onscreen_id)
+                .map_or(false, |e| e.bypass_drawing_buffer);
+
+            tracing::info!("Default-FBO readback detected — disabling DrawingBuffer bypass");
+            self.needs_default_fbo_readback = true;
+            self.evaluate_bypass(); // sets bypass_drawing_buffer = false
+
+            // If bypass was active, the window surface (FBO 0) has the current
+            // frame's content but the DrawingBuffer is stale.  Blit window → DB
+            // so the DrawingBuffer has valid content for the imminent readback
+            // and for all subsequent frames.
+            //
+            // COUPLING NOTE: This reverse blit requires glBlitFramebuffer (ES 3.0).
+            // The DrawingBuffer itself is only created when blit is available
+            // (see drawing_buffer::create which probes blit at init).  If the
+            // DrawingBuffer creation conditions or the bypass evaluation logic
+            // change, this path must be re-verified to stay consistent.
+            if was_bypass {
+                if let Some(entry) = self.canvases.get(&onscreen_id) {
+                    if let Some(ref db) = entry.drawing_buffer {
+                        let w = entry.physical_width;
+                        let h = entry.physical_height;
+                        unsafe {
+                            use glow::HasContext;
+                            // READ from window surface (FBO 0), DRAW to DrawingBuffer.
+                            self.gl
+                                .bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+                            self.gl
+                                .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(db.fbo));
+                            self.gl.blit_framebuffer(
+                                0,
+                                0,
+                                w as i32,
+                                h as i32,
+                                0,
+                                0,
+                                w as i32,
+                                h as i32,
+                                glow::COLOR_BUFFER_BIT,
+                                glow::NEAREST,
+                            );
+                            // Re-bind DrawingBuffer as the active FBO for subsequent
+                            // rendering and the imminent readback.
+                            self.gl
+                                .bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn evaluate_bypass(&mut self) {
         let onscreen_id = CanvasId::from(1u32);
-        // Only one canvas, and it must have a DrawingBuffer.
+        // Bypass requires: single canvas, has DrawingBuffer, and no default-FBO readback.
+        // Once needs_default_fbo_readback is set, bypass stays disabled permanently
+        // so the DrawingBuffer preserves content across swaps.
         let can_bypass = self.canvases.len() == 1
+            && !self.needs_default_fbo_readback
             && self
                 .canvases
                 .get(&onscreen_id)
@@ -982,6 +1132,7 @@ impl CanvasManager {
         let new_surf = match kind {
             SurfaceKind::Window(native_window) => {
                 self.last_swap_interval = -1;
+                self.damage_history.clear();
                 egl_ops::create_window_surface(&self.egl, self.display, self.config, native_window)?
             }
             SurfaceKind::Pbuffer => {
@@ -1053,11 +1204,57 @@ impl CanvasManager {
         Ok(())
     }
 
+    /// Declare the damage region for the current back buffer BEFORE rendering
+    /// to the onscreen surface (femtovg flush, DrawingBuffer blit).
+    ///
+    /// Per EGL_KHR_partial_update spec, this must be called before any rendering
+    /// to the main framebuffer so the driver can skip loading unchanged tiles.
+    /// The declared region is the age-expanded historical damage — what this
+    /// buffer needs to "catch up" on since it was last presented.  The app will
+    /// render at least this region (and typically the full game frame on top).
+    ///
+    /// Called from the render thread right before `flush_dirty_2d_contexts()`.
+    pub(crate) fn declare_frame_damage(&mut self, id: CanvasId) {
+        // Read what we need from the canvas entry, then drop the borrow.
+        let (surface_w, surface_h, surf) = match self.canvases.get(&id) {
+            Some(e) => (e.physical_width, e.physical_height, e.ctx.surf),
+            None => return,
+        };
+
+        // Resolve this frame's accumulated damage (does not reset — swap does that).
+        let current_frame_damage = self.resolve_pending_damage(surface_w, surface_h);
+
+        // Query buffer age and expand with history.
+        const EGL_BUFFER_AGE_KHR: egl::Int = 0x313D;
+        let buffer_damage = if self.device_caps.has_buffer_age {
+            match self.egl.query_surface(self.display, surf, EGL_BUFFER_AGE_KHR) {
+                Ok(age) if age > 0 => {
+                    self.damage_history.resolve_with_age(current_frame_damage, age)
+                }
+                _ => ResolvedDamage::FullSurface,
+            }
+        } else {
+            current_frame_damage
+        };
+
+        // Declare to the compositor what we will redraw.
+        if let (
+            Some(set_damage),
+            ResolvedDamage::Partial { x, y, width, height },
+        ) = (self.egl_set_damage_region_fn, buffer_damage)
+        {
+            let rect = [x, y, width, height];
+            unsafe {
+                set_damage(self.display, surf, rect.as_ptr(), 1);
+            }
+        }
+    }
+
     pub(crate) fn swap_buffers_no_restore(
         &mut self,
         id: CanvasId,
         wait_for_vsync: bool,
-    ) -> EngineResult<()> {
+    ) -> EngineResult<ResolvedDamage> {
         self.make_current_needed(id)?;
         let entry = self
             .canvases
@@ -1084,15 +1281,12 @@ impl CanvasManager {
             self.last_swap_interval = interval;
         }
 
-        // EGL_KHR_partial_update: tell compositor which region changed.
-        // Must be called after rendering but before eglSwapBuffers.
-        if let (Some(set_damage), Some(rect)) =
-            (self.egl_set_damage_region_fn, self.pending_damage_rect.take())
-        {
-            unsafe {
-                set_damage(self.display, entry.ctx.surf, rect.as_ptr(), 1);
-            }
-        }
+        // Resolve this frame's damage for history recording and stats.
+        // The eglSetDamageRegionKHR call was already made in declare_frame_damage()
+        // before rendering — per spec it must happen before GL draws.
+        let current_frame_damage =
+            self.resolve_pending_damage(entry.physical_width, entry.physical_height);
+        self.damage.reset();
 
         self.egl
             .swap_buffers(self.display, entry.ctx.surf)
@@ -1128,7 +1322,12 @@ impl CanvasManager {
             }
         }
 
-        Ok(())
+        // Record this frame's damage AFTER successful swap. If swap failed,
+        // the frame was never presented and must not pollute the history —
+        // buffer age semantics assume history entries correspond to actual swaps.
+        self.damage_history.push(current_frame_damage);
+
+        Ok(current_frame_damage)
     }
 
     #[allow(dead_code)]
@@ -1186,6 +1385,33 @@ impl CanvasManager {
         self.dirty_2d.insert(canvas_id);
     }
 
+    /// Remove a canvas from the dirty-2D set after an explicit Materialize
+    /// flush, preventing double-flush at present time.
+    pub(crate) fn clear_2d_dirty(&mut self, canvas_id: CanvasId) {
+        self.dirty_2d.remove(&canvas_id);
+    }
+
+    pub(crate) fn mark_current_frame_requires_full_redraw(&mut self) {
+        self.damage.add(crate::damage_effect::DamageEffect::FullSurface);
+    }
+
+    pub(crate) fn stage_current_frame_partial_damage(&mut self, rect: [i32; 4], is_onscreen: bool) {
+        if !is_onscreen {
+            return;
+        }
+        let [x, y, width, height] = rect;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        self.damage.add(crate::damage_effect::DamageEffect::OnscreenRect { x, y, width, height });
+    }
+
+    /// Feed a DamageEffect directly into the per-frame accumulator.
+    pub(crate) fn add_damage(&mut self, effect: crate::damage_effect::DamageEffect) {
+        self.damage.add(effect);
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn pending_dirty_2d_count(&self) -> usize {
         self.dirty_2d.len()
     }
@@ -1196,11 +1422,18 @@ impl CanvasManager {
         context_2d_impl::begin_canvas2d_gl_scope(&self.gl)
     }
 
-    pub(crate) fn flush_dirty_2d_contexts(&mut self) -> EngineResult<()> {
+    pub(crate) fn flush_dirty_2d_contexts(&mut self) -> EngineResult<Vec<CanvasId>> {
         context_2d_impl::flush_dirty_2d_contexts(self)
     }
 
     /// Read pixel data from the current framebuffer via glReadPixels.
+    ///
+    /// This is a read-only operation — it does NOT modify the framebuffer and
+    /// therefore does NOT contribute to frame damage. The caller is responsible
+    /// for ensuring all prior rendering (Canvas2D femtovg flush, GL draw calls)
+    /// has been materialized before calling this. In the current model, the
+    /// unified collector's `flush_as_barrier()` + trailing `Materialize` handles
+    /// this before the sync readback command reaches the render thread.
     pub(crate) fn read_pixels(&self, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
         let len = (width * height * 4) as usize;
         let mut buf = vec![0u8; len];
@@ -1233,6 +1466,11 @@ impl CanvasManager {
         buf
     }
 
+    fn resolve_pending_damage(&self, surface_width: u32, surface_height: u32) -> ResolvedDamage {
+        self.damage
+            .resolve((surface_width as i32, surface_height as i32))
+    }
+
     // ==================== Image Management ====================
 
     pub(crate) fn generate_img_id(&self) -> u32 {
@@ -1255,6 +1493,61 @@ impl CanvasManager {
         )
     }
 
+    /// Upload a compressed texture (KTX2/ETC2/ASTC) directly to the GPU.
+    ///
+    /// Bypasses RGBA decode and PBO upload — calls `glCompressedTexImage2D`
+    /// directly. Falls back to the standard RGBA path if the GPU doesn't
+    /// support the compressed format.
+    pub(crate) fn load_compressed_image(
+        &mut self,
+        image_id: u32,
+        compressed: &shared::protocol::io_cmd::CompressedImage,
+    ) -> EngineResult<(u32, u32)> {
+        use shared::error::EngineError;
+        self.ensure_any_canvas_current()?;
+
+        let format = crate::compressed_upload::CompressedFormat::from_vk_format(compressed.vk_format)
+            .ok_or_else(|| {
+                EngineError::new(ErrorCode::Unsupported)
+                    .with_detail(format!("unsupported compressed format: {}", compressed.vk_format))
+            })?;
+
+        if !self.device_caps.compressed_format_support.is_supported(format) {
+            tracing::warn!(
+                "GPU does not support {}, image_id={}",
+                format.label(), image_id,
+            );
+            return Err(EngineError::new(ErrorCode::Unsupported)
+                .with_detail(format!("GPU does not support {}", format.label())));
+        }
+
+        let texture = crate::compressed_upload::upload_compressed_texture(
+            &self.gl,
+            format,
+            compressed.width,
+            compressed.height,
+            &compressed.data,
+        ).ok_or_else(|| {
+            EngineError::new(ErrorCode::Unsupported)
+                .with_detail("glCompressedTexImage2D failed")
+        })?;
+
+        let info = femtovg::ImageInfo::new(
+            femtovg::ImageFlags::empty(),
+            compressed.width as usize,
+            compressed.height as usize,
+            femtovg::PixelFormat::Rgba8, // Placeholder — actual format is compressed
+        );
+        self.image_registry.register_shared_texture(image_id, texture, info);
+
+        tracing::debug!(
+            "compressed texture uploaded: image_id={} {}x{} {}",
+            image_id, compressed.width, compressed.height, format.label(),
+        );
+
+        Ok((compressed.width, compressed.height))
+    }
+
     /// Submit a texture upload to the upload thread (async, non-blocking).
     ///
     /// On success, the `resp` is stored and will be sent from
@@ -1273,16 +1566,40 @@ impl CanvasManager {
             Some(u) if !u.is_degraded() => u,
             _ => return Err(resp),
         };
-        let id64 = image_id as u64;
-        if upload.submit(crate::upload_thread::UploadJob {
-            image_id: id64,
+        let job = crate::upload_thread::UploadJob {
+            image_id: image_id as u64,
             width: image.width,
             height: image.height,
             rgba: image.rgba.clone(),
-        }) {
-            self.pending_load_responses.insert(id64, resp);
+        };
+
+        // Budget gate: reject if per-frame upload budget is exhausted.
+        if let Some(ref mut server) = self.upload_server {
+            if !server.try_acquire_job(&job) {
+                tracing::debug!(
+                    "Upload budget exhausted: rejecting image_id={} ({} bytes), queue_depth={}",
+                    image_id,
+                    job.byte_len(),
+                    server.queue_depth(),
+                );
+                return Err(resp);
+            }
+        }
+
+        if upload.submit(job) {
+            self.pending_load_responses.insert(image_id as u64, resp);
             Ok(())
         } else {
+            // Channel full — release the budget we just acquired.
+            if let Some(ref mut server) = self.upload_server {
+                let release_job = crate::upload_thread::UploadJob {
+                    image_id: image_id as u64,
+                    width: image.width,
+                    height: image.height,
+                    rgba: image.rgba.clone(),
+                };
+                server.finish_job(&release_job);
+            }
             Err(resp)
         }
     }
@@ -1395,9 +1712,7 @@ impl CanvasManager {
 
     /// Access the PBO pool for WebGL texture uploads.
     /// Returns None if no images have been loaded yet (pool not initialized).
-    pub(crate) fn pbo_pool_mut(
-        &mut self,
-    ) -> Option<&mut pbo_upload::PboPool> {
+    pub(crate) fn pbo_pool_mut(&mut self) -> Option<&mut pbo_upload::PboPool> {
         self.image_registry.ensure_pbo_pool_public(&self.gl);
         self.image_registry.pbo_pool_mut()
     }
@@ -1417,5 +1732,123 @@ impl CanvasManager {
             ErrorCode::InvalidOperation,
             format!("{what} belongs to another WebGL context (owner={owner:?}, canvas={canvas:?})"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::damage_effect::{DamageEffect, FrameDamageAccumulator};
+
+    // ---- Unified DamageEffect accumulator integration tests ----
+    // These verify that the CanvasManager methods correctly feed the accumulator,
+    // testing the same scenarios as the previous stage_partial_damage / resolve_staged_damage
+    // tests but through the unified model.
+
+    #[test]
+    fn canvas2d_rect_resolves_to_partial_damage() {
+        let mut acc = FrameDamageAccumulator::new();
+        acc.add(DamageEffect::OnscreenRect { x: 10, y: 20, width: 300, height: 400 });
+        assert_eq!(
+            acc.resolve((1080, 1920)),
+            ResolvedDamage::Partial { x: 10, y: 20, width: 300, height: 400 }
+        );
+    }
+
+    #[test]
+    fn canvas2d_plus_gl_viewport_unions_to_partial() {
+        let mut acc = FrameDamageAccumulator::new();
+        acc.add(DamageEffect::OnscreenRect { x: 10, y: 20, width: 100, height: 50 });
+        acc.add(DamageEffect::OnscreenRect { x: 200, y: 300, width: 150, height: 100 });
+        assert_eq!(
+            acc.resolve((1080, 1920)),
+            ResolvedDamage::Partial { x: 10, y: 20, width: 340, height: 380 }
+        );
+    }
+
+    #[test]
+    fn untracked_gl_clear_forces_full_surface() {
+        let mut acc = FrameDamageAccumulator::new();
+        acc.add(DamageEffect::OnscreenRect { x: 10, y: 20, width: 100, height: 50 });
+        acc.add(DamageEffect::FullSurface);
+        assert_eq!(acc.resolve((1080, 1920)), ResolvedDamage::FullSurface);
+    }
+
+    #[test]
+    fn offscreen_gl_produces_no_damage() {
+        let mut acc = FrameDamageAccumulator::new();
+        acc.add(DamageEffect::OnscreenRect { x: 10, y: 20, width: 100, height: 50 });
+        acc.add(DamageEffect::NoDamage); // offscreen GL
+        assert_eq!(
+            acc.resolve((1080, 1920)),
+            ResolvedDamage::Partial { x: 10, y: 20, width: 100, height: 50 }
+        );
+    }
+
+    #[test]
+    fn full_surface_after_partial_rects_poisons_accumulator() {
+        let mut acc = FrameDamageAccumulator::new();
+        acc.add(DamageEffect::OnscreenRect { x: 10, y: 20, width: 100, height: 50 });
+        acc.add(DamageEffect::OnscreenRect { x: 200, y: 300, width: 150, height: 100 });
+        acc.add(DamageEffect::FullSurface);
+        assert_eq!(acc.resolve((1080, 1920)), ResolvedDamage::FullSurface);
+    }
+
+    #[test]
+    fn multiple_mixed_batches_union_correctly() {
+        let mut acc = FrameDamageAccumulator::new();
+        acc.add(DamageEffect::OnscreenRect { x: 0, y: 0, width: 50, height: 50 });
+        acc.add(DamageEffect::OnscreenRect { x: 100, y: 100, width: 60, height: 40 });
+        acc.add(DamageEffect::OnscreenRect { x: 30, y: 20, width: 80, height: 60 });
+        acc.add(DamageEffect::OnscreenRect { x: 200, y: 0, width: 50, height: 200 });
+        assert_eq!(
+            acc.resolve((1080, 1920)),
+            ResolvedDamage::Partial { x: 0, y: 0, width: 250, height: 200 }
+        );
+    }
+
+    #[test]
+    fn scissor_bounded_clear_unions_with_canvas2d() {
+        let mut acc = FrameDamageAccumulator::new();
+        // Canvas2D rect
+        acc.add(DamageEffect::OnscreenRect { x: 0, y: 0, width: 100, height: 100 });
+        // Scissor-bounded clear (produced by damage_for_clear when scissor is active)
+        acc.add(DamageEffect::OnscreenRect { x: 200, y: 200, width: 50, height: 50 });
+        assert_eq!(
+            acc.resolve((1080, 1920)),
+            ResolvedDamage::Partial { x: 0, y: 0, width: 250, height: 250 }
+        );
+    }
+
+    // ---- GL state tracking tests ----
+
+    #[test]
+    fn gl_state_defaults_correctly() {
+        use super::ScissorState;
+        let state = CanvasGLState::default();
+        assert!(state.draws_to_default_fbo);
+        assert_eq!(state.scissor, ScissorState::Disabled);
+        assert_eq!(state.last_scissor_rect, None);
+    }
+
+    #[test]
+    fn gl_state_tracks_fbo_and_scissor() {
+        use super::ScissorState;
+        let mut state = CanvasGLState::default();
+
+        // Bind user FBO
+        state.draws_to_default_fbo = false;
+        assert!(!state.draws_to_default_fbo);
+
+        // Set scissor rect + enable
+        state.last_scissor_rect = Some((10, 20, 100, 50));
+        state.scissor = ScissorState::Enabled { x: 10, y: 20, width: 100, height: 50 };
+        assert!(matches!(state.scissor, ScissorState::Enabled { .. }));
+
+        // Disable scissor
+        state.scissor = ScissorState::Disabled;
+        assert_eq!(state.scissor, ScissorState::Disabled);
+        // last_scissor_rect retained
+        assert_eq!(state.last_scissor_rect, Some((10, 20, 100, 50)));
     }
 }

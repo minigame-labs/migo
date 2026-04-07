@@ -7,12 +7,21 @@
 //! shared EGL context (probed at init).  TierB devices skip this entirely
 //! and upload on the render thread as before.
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use glow::HasContext;
-use shared::error::ErrorCode;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// A single upload that completed on the upload thread but whose result
+/// could not be delivered to the render thread (channel full or disconnected).
+/// Sent per-item through a dedicated channel so CanvasManager can recover
+/// both the UploadServer budget and the pending_load_response atomically.
+#[derive(Debug)]
+pub struct DroppedUpload {
+    pub image_id: u64,
+    pub byte_len: usize,
+}
 
 /// A texture upload job sent from IO/render to the upload thread.
 pub struct UploadJob {
@@ -24,6 +33,12 @@ pub struct UploadJob {
     pub rgba: Arc<Vec<u8>>,
 }
 
+impl UploadJob {
+    pub fn byte_len(&self) -> usize {
+        self.rgba.len()
+    }
+}
+
 /// A completed upload, ready for the render thread to consume.
 pub struct CompletedUpload {
     pub image_id: u64,
@@ -33,6 +48,8 @@ pub struct CompletedUpload {
     /// GL fence inserted after the upload.  The render thread must
     /// `glClientWaitSync` before sampling this texture.
     pub fence: glow::NativeFence,
+    /// Original RGBA byte count, used by UploadServer to release budget.
+    pub byte_len: usize,
 }
 
 // Safety: CompletedUpload is created on the upload thread (shared GL context)
@@ -46,6 +63,10 @@ pub struct UploadThreadHandle {
     job_tx: Sender<UploadJob>,
     result_rx: Receiver<CompletedUpload>,
     consecutive_failures: Arc<AtomicU32>,
+    /// Per-item notifications for uploads that completed but whose results
+    /// could not be delivered.  Carries image_id + byte_len for each,
+    /// enabling CanvasManager to recover budget and resolve pending responses.
+    dropped_rx: Receiver<DroppedUpload>,
     degraded: bool,
     _handle: std::thread::JoinHandle<()>,
 }
@@ -72,11 +93,12 @@ impl UploadThreadHandle {
         display: khronos_egl::Display,
         config: khronos_egl::Config,
         share_ctx: khronos_egl::Context,
+        gles_major: u32,
     ) -> Option<Self> {
-        // Create shared context + 1x1 pbuffer for make_current.
+        // Create shared context matching the render context's GLES version.
         let ctx_attribs = [
             khronos_egl::CONTEXT_CLIENT_VERSION as i32,
-            2,
+            gles_major as i32,
             khronos_egl::NONE as i32,
         ];
 
@@ -104,6 +126,11 @@ impl UploadThreadHandle {
         let (result_tx, result_rx) = bounded::<CompletedUpload>(JOB_QUEUE_CAPACITY);
         let consecutive_failures = Arc::new(AtomicU32::new(0));
         let failures_clone = consecutive_failures.clone();
+        // Unbounded: DroppedUpload is 16 bytes, and the number of items is
+        // bounded in practice by the UploadServer in-flight budget.  Using
+        // unbounded eliminates the possibility of dropped_tx.send() failing,
+        // which would silently leak budget + pending_load_responses.
+        let (dropped_tx, dropped_rx) = unbounded::<DroppedUpload>();
 
         // We need raw pointers to pass to the thread because EGL types are
         // not Send.  The upload thread will reconstruct EGL/GL wrappers.
@@ -126,6 +153,7 @@ impl UploadThreadHandle {
                     job_rx,
                     result_tx,
                     failures_clone,
+                    dropped_tx,
                 );
             })
             .map_err(|e| warn!("Upload thread: spawn failed: {e}"))
@@ -137,12 +165,13 @@ impl UploadThreadHandle {
             job_tx,
             result_rx,
             consecutive_failures,
+            dropped_rx,
             degraded: false,
             _handle: handle,
         })
     }
 
-    /// Submit an upload job.  Returns false if the thread has degraded.
+    /// Submit an upload job. Returns false if the thread is degraded or the queue is full.
     pub fn submit(&self, job: UploadJob) -> bool {
         if self.degraded {
             return false;
@@ -158,6 +187,16 @@ impl UploadThreadHandle {
         }
     }
 
+    /// Drain per-item notifications for uploads that completed but whose
+    /// results could not be delivered (channel full/disconnected).
+    /// Each item carries `image_id` + `byte_len` so the caller can recover
+    /// both the UploadServer budget and the pending_load_response.
+    pub fn drain_dropped(&self, out: &mut Vec<DroppedUpload>) {
+        while let Ok(item) = self.dropped_rx.try_recv() {
+            out.push(item);
+        }
+    }
+
     /// Check if the upload thread has permanently degraded.
     pub fn is_degraded(&self) -> bool {
         self.degraded
@@ -170,13 +209,14 @@ impl UploadThreadHandle {
 // ---------------------------------------------------------------------------
 
 fn upload_thread_main(
-    egl_lib_path: &str,
+    _egl_lib_path: &str,
     display_raw: usize,
     ctx_raw: usize,
     pbuf_raw: usize,
     job_rx: Receiver<UploadJob>,
     result_tx: Sender<CompletedUpload>,
     failures: Arc<AtomicU32>,
+    dropped_tx: Sender<DroppedUpload>,
 ) {
     // Reconstruct EGL instance on this thread.
     let egl = match unsafe { khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required() }
@@ -225,6 +265,14 @@ fn upload_thread_main(
                         "Upload thread: result channel unavailable, deleting texture for image_id={}",
                         c.image_id
                     );
+                    // Notify CanvasManager per-item so it can recover the
+                    // UploadServer budget AND resolve the pending response.
+                    // send() on an unbounded channel only fails if disconnected
+                    // (engine shutting down), in which case budget recovery is moot.
+                    let _ = dropped_tx.send(DroppedUpload {
+                        image_id: c.image_id,
+                        byte_len: c.byte_len,
+                    });
                     unsafe {
                         gl.delete_texture(c.texture);
                         gl.delete_sync(c.fence);
@@ -332,6 +380,90 @@ fn do_upload(gl: &glow::Context, job: &UploadJob) -> Result<CompletedUpload, Str
             width: job.width,
             height: job.height,
             fence,
+            byte_len: job.byte_len(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies that the dropped upload channel delivers consistent per-item
+    /// data — no torn reads, no lost image_ids, no byte_len mismatch.
+    /// This is the contract that CanvasManager relies on to recover budget
+    /// AND resolve pending responses.
+    #[test]
+    fn dropped_channel_delivers_consistent_per_item_notifications() {
+        let (tx, rx) = unbounded::<DroppedUpload>();
+
+        // Simulate upload thread sending two dropped completions.
+        tx.send(DroppedUpload {
+            image_id: 42,
+            byte_len: 4096,
+        })
+        .unwrap();
+        tx.send(DroppedUpload {
+            image_id: 99,
+            byte_len: 1024,
+        })
+        .unwrap();
+
+        // Simulate CanvasManager draining (same as drain_dropped).
+        let mut items = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            items.push(item);
+        }
+
+        // Each item carries exactly the data for one dropped upload.
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].image_id, 42);
+        assert_eq!(items[0].byte_len, 4096);
+        assert_eq!(items[1].image_id, 99);
+        assert_eq!(items[1].byte_len, 1024);
+    }
+
+    /// drain_dropped returns nothing when the channel is empty.
+    #[test]
+    fn drain_dropped_returns_empty_when_no_drops() {
+        let (_tx, rx) = unbounded::<DroppedUpload>();
+        let mut items = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            items.push(item);
+        }
+        assert!(items.is_empty());
+    }
+
+    /// The dropped channel must never lose items even when many uploads are
+    /// dropped without the render thread draining.  This covers the scenario
+    /// where both result_tx and a bounded dropped_tx would be full.
+    /// With an unbounded dropped channel, all items must arrive.
+    #[test]
+    fn dropped_channel_never_loses_items_under_backpressure() {
+        use crossbeam_channel::unbounded;
+
+        let (tx, rx) = unbounded::<DroppedUpload>();
+
+        // Simulate 64 dropped uploads accumulating without any drain.
+        // (More than JOB_QUEUE_CAPACITY * 2, which would overflow two
+        // bounded-16 channels.)
+        for i in 0..64u64 {
+            tx.send(DroppedUpload {
+                image_id: i,
+                byte_len: 1024,
+            })
+            .unwrap(); // unbounded send is infallible (non-disconnected)
+        }
+
+        let mut items = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            items.push(item);
+        }
+
+        assert_eq!(items.len(), 64);
+        for (i, item) in items.iter().enumerate() {
+            assert_eq!(item.image_id, i as u64);
+            assert_eq!(item.byte_len, 1024);
+        }
     }
 }

@@ -28,7 +28,6 @@ import {
     op_get_uniform_location,
     op_uniform3f,
     op_uniform_matrix_3fv,
-    op_gl_flush,
     op_alloc_gl_resource_id,
     op_enable,
     op_disable,
@@ -812,21 +811,8 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
     }
 }
 
-// Register GL batch flush into the frame-end hook registry.
-// Uses the same __migo_frame_end_hooks array as 02_2d_context.js,
-// making the system load-order independent.
-if (!globalThis.__migo_frame_end_hooks) {
-    globalThis.__migo_frame_end_hooks = [];
-    globalThis.__migo_frame_end_all = () => {
-        const hooks = globalThis.__migo_frame_end_hooks;
-        for (let i = 0; i < hooks.length; i++) {
-            hooks[i]();
-        }
-    };
-}
-globalThis.__migo_frame_end_hooks.push(() => {
-    op_gl_flush();
-});
+// GL batch flush is now handled by the unified frame-end hook in
+// 02_2d_context.js (op_frame_end_unified). No separate GL hook needed.
 
 export {
     WebGLRenderingContext,

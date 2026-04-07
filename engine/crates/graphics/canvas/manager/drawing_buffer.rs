@@ -362,33 +362,37 @@ pub(crate) fn blit_to_surface(
 
 /// Restore a texture binding from a raw GL integer (0 = unbind).
 unsafe fn restore_texture_binding(gl: &glow::Context, prev: u32) {
-    let handle = if prev == 0 {
-        None
-    } else {
-        Some(glow::NativeTexture(std::num::NonZeroU32::new_unchecked(
-            prev,
-        )))
-    };
-    gl.bind_texture(glow::TEXTURE_2D, handle);
+    unsafe {
+        let handle = if prev == 0 {
+            None
+        } else {
+            Some(glow::NativeTexture(std::num::NonZeroU32::new_unchecked(
+                prev,
+            )))
+        };
+        gl.bind_texture(glow::TEXTURE_2D, handle);
+    }
 }
 
 /// Restore a renderbuffer binding from a raw GL integer (0 = unbind).
 unsafe fn restore_renderbuffer_binding(gl: &glow::Context, prev: u32) {
-    let handle = if prev == 0 {
-        None
-    } else {
-        Some(glow::NativeRenderbuffer(
-            std::num::NonZeroU32::new_unchecked(prev),
-        ))
-    };
-    gl.bind_renderbuffer(glow::RENDERBUFFER, handle);
+    unsafe {
+        let handle = if prev == 0 {
+            None
+        } else {
+            Some(glow::NativeRenderbuffer(
+                std::num::NonZeroU32::new_unchecked(prev),
+            ))
+        };
+        gl.bind_renderbuffer(glow::RENDERBUFFER, handle);
+    }
 }
 
 /// Drain pending GL errors without risking an infinite loop on broken drivers.
 #[inline]
 unsafe fn clear_gl_errors(gl: &glow::Context) {
     for _ in 0..16 {
-        if gl.get_error() == glow::NO_ERROR {
+        if unsafe { gl.get_error() } == glow::NO_ERROR {
             break;
         }
     }

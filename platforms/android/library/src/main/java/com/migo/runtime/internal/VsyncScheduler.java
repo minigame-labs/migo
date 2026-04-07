@@ -15,6 +15,8 @@ public final class VsyncScheduler implements Choreographer.FrameCallback {
 
     private final int sessionId;
     private volatile boolean running = false;
+    private volatile boolean surfaceReady = true;
+    private boolean callbackPosted = false;
 
     public VsyncScheduler(int sessionId) {
         this.sessionId = sessionId;
@@ -26,7 +28,7 @@ public final class VsyncScheduler implements Choreographer.FrameCallback {
     public void start() {
         if (!running) {
             running = true;
-            Choreographer.getInstance().postFrameCallback(this);
+            scheduleIfNeeded();
         }
     }
 
@@ -35,14 +37,39 @@ public final class VsyncScheduler implements Choreographer.FrameCallback {
      */
     public void stop() {
         running = false;
-        Choreographer.getInstance().removeFrameCallback(this);
+        unschedule();
+    }
+
+    public void setSurfaceReady(boolean surfaceReady) {
+        this.surfaceReady = surfaceReady;
+        if (surfaceReady) {
+            scheduleIfNeeded();
+        } else {
+            unschedule();
+        }
     }
 
     @Override
     public void doFrame(long frameTimeNanos) {
-        if (!running) return;
+        callbackPosted = false;
+        if (!running || !surfaceReady) return;
         NativeBridge.onVsync(sessionId, frameTimeNanos);
-        // Re-post for next frame.
+        scheduleIfNeeded();
+    }
+
+    private void scheduleIfNeeded() {
+        if (!running || !surfaceReady || callbackPosted) {
+            return;
+        }
+        callbackPosted = true;
         Choreographer.getInstance().postFrameCallback(this);
+    }
+
+    private void unschedule() {
+        if (!callbackPosted) {
+            return;
+        }
+        callbackPosted = false;
+        Choreographer.getInstance().removeFrameCallback(this);
     }
 }

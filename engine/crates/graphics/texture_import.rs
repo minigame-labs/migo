@@ -33,8 +33,7 @@ const EGL_TRUE: i32 = 1;
 
 // --- Function pointer types ---
 
-type EglGetNativeClientBufferANDROID =
-    unsafe extern "C" fn(buffer: *const c_void) -> *const c_void;
+type EglGetNativeClientBufferANDROID = unsafe extern "C" fn(buffer: *const c_void) -> *const c_void;
 type EglCreateImageKHR = unsafe extern "C" fn(
     dpy: *const c_void,
     ctx: *const c_void,
@@ -43,8 +42,7 @@ type EglCreateImageKHR = unsafe extern "C" fn(
     attrib_list: *const i32,
 ) -> *const c_void;
 type EglDestroyImageKHR = unsafe extern "C" fn(dpy: *const c_void, image: *const c_void) -> u32;
-type GlEGLImageTargetTexture2DOES =
-    unsafe extern "C" fn(target: u32, image: *const c_void);
+type GlEGLImageTargetTexture2DOES = unsafe extern "C" fn(target: u32, image: *const c_void);
 
 struct ImportFns {
     get_native_client_buffer: EglGetNativeClientBufferANDROID,
@@ -80,9 +78,7 @@ fn resolve_import_fns(
 }
 
 /// Lazily resolve and cache import function pointers.
-pub fn ensure_import_fns(
-    egl_get_proc: &dyn Fn(&str) -> Option<unsafe extern "C" fn()>,
-) -> bool {
+pub fn ensure_import_fns(egl_get_proc: &dyn Fn(&str) -> Option<unsafe extern "C" fn()>) -> bool {
     IMPORT_FNS
         .get_or_init(|| resolve_import_fns(egl_get_proc))
         .is_some()
@@ -100,6 +96,7 @@ pub fn ensure_import_fns(
 /// - `ahb_ptr` must be a valid AHardwareBuffer pointer.
 /// - `egl_display` must be the current EGL display.
 /// - A GL context must be current on the calling thread.
+#[allow(unsafe_op_in_unsafe_fn)]
 pub unsafe fn import_ahb_as_texture(
     gl: &glow::Context,
     ahb_ptr: *const c_void,
@@ -107,20 +104,18 @@ pub unsafe fn import_ahb_as_texture(
     width: u32,
     height: u32,
 ) -> EngineResult<AhbTextureResult> {
-    let fns = IMPORT_FNS
-        .get()
-        .and_then(|o| o.as_ref())
-        .ok_or_else(|| {
-            shared::error::EngineError::new(ErrorCode::RenderBackendError)
-                .with_detail("AHB import functions not resolved".to_string())
-        })?;
+    let fns = IMPORT_FNS.get().and_then(|o| o.as_ref()).ok_or_else(|| {
+        shared::error::EngineError::new(ErrorCode::RenderBackendError)
+            .with_detail("AHB import functions not resolved".to_string())
+    })?;
 
     // AHardwareBuffer → EGLClientBuffer
     let client_buffer = (fns.get_native_client_buffer)(ahb_ptr);
     if client_buffer.is_null() {
-        return Err(shared::error::EngineError::new(ErrorCode::RenderBackendError).with_detail(
-            "eglGetNativeClientBufferANDROID returned null".to_string(),
-        ));
+        return Err(
+            shared::error::EngineError::new(ErrorCode::RenderBackendError)
+                .with_detail("eglGetNativeClientBufferANDROID returned null".to_string()),
+        );
     }
 
     // EGLClientBuffer → EGLImage
@@ -133,17 +128,17 @@ pub unsafe fn import_ahb_as_texture(
         attrs.as_ptr(),
     );
     if egl_image.is_null() {
-        return Err(shared::error::EngineError::new(ErrorCode::RenderBackendError).with_detail(
-            "eglCreateImageKHR failed for AHB".to_string(),
-        ));
+        return Err(
+            shared::error::EngineError::new(ErrorCode::RenderBackendError)
+                .with_detail("eglCreateImageKHR failed for AHB".to_string()),
+        );
     }
 
     // Create GL texture and bind EGLImage
     let tex = gl.create_texture().map_err(|e| {
         (fns.destroy_image)(egl_display, egl_image);
-        shared::error::EngineError::new(ErrorCode::RenderBackendError).with_detail(
-            format!("create_texture failed: {e}"),
-        )
+        shared::error::EngineError::new(ErrorCode::RenderBackendError)
+            .with_detail(format!("create_texture failed: {e}"))
     })?;
 
     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
@@ -178,11 +173,11 @@ pub unsafe fn import_ahb_as_texture(
 
     if gl_err != glow::NO_ERROR {
         gl.delete_texture(tex);
-        return Err(shared::error::EngineError::new(ErrorCode::RenderBackendError).with_detail(
-            format!(
+        return Err(
+            shared::error::EngineError::new(ErrorCode::RenderBackendError).with_detail(format!(
                 "glEGLImageTargetTexture2DOES failed: gl_error=0x{gl_err:X}"
-            ),
-        ));
+            )),
+        );
     }
 
     gl.bind_texture(glow::TEXTURE_2D, None);

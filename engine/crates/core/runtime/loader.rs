@@ -1,4 +1,4 @@
-use std::{borrow::Cow, future::Future, pin::Pin};
+use std::{borrow::Cow, cell::RefCell, future::Future, pin::Pin, rc::Rc, sync::Arc};
 
 use deno_core::{
     FsModuleLoader, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader,
@@ -6,18 +6,31 @@ use deno_core::{
     error::ModuleLoaderError,
 };
 
+use shared::vfs::MountTable;
+
 use super::code_cache::SharedCodeCache;
+
+/// Shared reference to the mount table, updated after `evaluate_module`
+/// creates it. The module loader holds a clone and checks it on every
+/// resolve/load for sandbox enforcement.
+pub(crate) type SharedMountTableRef = Rc<RefCell<Option<Arc<MountTable>>>>;
 
 pub(crate) struct MyModuleLoader {
     inner: FsModuleLoader,
     code_cache: Option<SharedCodeCache>,
+    /// Set after evaluate_module creates the mount table.
+    mount_table: SharedMountTableRef,
 }
 
 impl MyModuleLoader {
-    pub fn new(code_cache: Option<SharedCodeCache>) -> Self {
+    pub fn new(
+        code_cache: Option<SharedCodeCache>,
+        mount_table: SharedMountTableRef,
+    ) -> Self {
         Self {
             inner: FsModuleLoader,
             code_cache,
+            mount_table,
         }
     }
 }
@@ -81,6 +94,119 @@ impl MyModuleLoader {
 
         Ok(source)
     }
+
+    /// Validate that a resolved module URL is within the /code sandbox.
+    ///
+    /// Returns `Ok(())` if the path is allowed, or an error if it escapes
+    /// the mount boundaries.
+    fn validate_sandbox(&self, url: &ModuleSpecifier) -> Result<(), ModuleLoaderError> {
+        let mt_ref = self.mount_table.borrow();
+        let Some(mt) = mt_ref.as_ref() else {
+            // Mount table not yet set (before evaluate_module) — allow.
+            // In practice, no game modules are loaded before evaluate_module.
+            return Ok(());
+        };
+
+        let Ok(path) = url.to_file_path() else {
+            // Not a file:// URL (e.g., built-in modules) — allow.
+            return Ok(());
+        };
+
+        if mt.is_allowed_path(&path) {
+            return Ok(());
+        }
+
+        Err(ModuleLoaderError::generic(format!(
+            "Module import blocked: path escapes /code sandbox: {}",
+            path.display()
+        )))
+    }
+}
+
+impl MyModuleLoader {
+    fn synthetic_pack_path(
+        code_dir: &std::path::Path,
+        generation: u64,
+        relative: &std::path::Path,
+    ) -> std::path::PathBuf {
+        code_dir.join(".pack_gen").join(generation.to_string()).join(relative)
+    }
+
+    /// Try loading a module from the mount table (pack backend support).
+    ///
+    /// Returns `Some(ModuleSource)` if the file was read from a pack-backed
+    /// mount (where `real_path()` returns `None`).  Returns `None` if the
+    /// path is filesystem-backed or the mount table isn't available, allowing
+    /// fallback to `FsModuleLoader`.
+    fn try_load_from_mount(
+        &self,
+        url: &ModuleSpecifier,
+    ) -> Option<Result<ModuleSource, ModuleLoaderError>> {
+        let mt_ref = self.mount_table.borrow();
+        let mt = mt_ref.as_ref()?;
+
+        let file_path = url.to_file_path().ok()?;
+        // Use code_dir() (always available) instead of base_dir() (None
+        // when base is pack-backed).
+        let code_dir = mt.code_dir();
+        let relative = if let Ok(synthetic_rel) = file_path.strip_prefix(code_dir.join(".pack_gen")) {
+            let mut comps = synthetic_rel.components();
+            let _generation_dir = comps.next()?;
+            let mut path = std::path::PathBuf::new();
+            for comp in comps {
+                path.push(comp.as_os_str());
+            }
+            path
+        } else {
+            file_path.strip_prefix(&code_dir).ok()?.to_path_buf()
+        };
+        let relative_str = relative.to_str()?;
+
+        // Check if this path resolves through a pack backend.
+        let resolved = match mt.resolve(relative_str) {
+            Some(resolved) => resolved,
+            None if mt.has_overlay_for(relative_str) => {
+                return Some(Err(ModuleLoaderError::generic(format!(
+                    "Module import blocked by mounted overlay shadow: {}",
+                    relative_str,
+                ))));
+            }
+            None => return None,
+        };
+        if resolved.real_path.is_some() {
+            // Filesystem-backed: let FsModuleLoader handle it.
+            return None;
+        }
+
+        // Pack-backed: read bytes from mount table.
+        let bytes = match mt.read(relative_str) {
+            Ok(b) => b,
+            Err(e) => {
+                return Some(Err(ModuleLoaderError::generic(format!(
+                    "Failed to read module from package: {}: {}",
+                    relative_str, e
+                ))));
+            }
+        };
+
+        let code = match String::from_utf8(bytes) {
+            Ok(code) => code,
+            Err(e) => {
+                return Some(Err(ModuleLoaderError::generic(format!(
+                    "Module source is not valid UTF-8: {}",
+                    e,
+                ))));
+            }
+        };
+        let source = ModuleSource::new(
+            deno_core::ModuleType::JavaScript,
+            ModuleSourceCode::String(code.into()),
+            url,
+            None,
+        );
+
+        Some(Ok(source))
+    }
 }
 
 impl ModuleLoader for MyModuleLoader {
@@ -91,7 +217,41 @@ impl ModuleLoader for MyModuleLoader {
         kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
         let spec = self.normalize_specifier(specifier, &kind);
-        self.inner.resolve(spec.as_ref(), referrer, kind)
+        let mut url = self.inner.resolve(spec.as_ref(), referrer, kind)?;
+
+        if let Some(mt) = self.mount_table.borrow().as_ref() {
+            if let Ok(file_path) = url.to_file_path() {
+                let code_dir = mt.code_dir();
+                if let Ok(relative) = file_path.strip_prefix(&code_dir) {
+                    if let Some(relative_str) = relative.to_str() {
+                        match mt.resolve(relative_str) {
+                            Some(resolved) => {
+                                if let Some(real_path) = resolved.real_path {
+                                    url = ModuleSpecifier::from_file_path(real_path)
+                                        .map_err(|_| ModuleLoaderError::generic("failed to remap module path"))?;
+                                } else {
+                                    let synthetic = Self::synthetic_pack_path(&code_dir, resolved.mount_generation, relative);
+                                    url = ModuleSpecifier::from_file_path(synthetic)
+                                        .map_err(|_| ModuleLoaderError::generic("failed to synthesize pack module path"))?;
+                                }
+                            }
+                            None if mt.has_overlay_for(relative_str) => {
+                                return Err(ModuleLoaderError::generic(format!(
+                                    "Module import blocked by mounted overlay shadow: {}",
+                                    relative_str,
+                                )));
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sandbox enforcement: resolved path must be within mount boundaries.
+        self.validate_sandbox(&url)?;
+
+        Ok(url)
     }
 
     fn load(
@@ -100,6 +260,26 @@ impl ModuleLoader for MyModuleLoader {
         maybe_referrer: Option<&ModuleLoadReferrer>,
         options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
+        // Defense in depth: validate sandbox on load too.
+        if let Err(e) = self.validate_sandbox(module_specifier) {
+            return ModuleLoadResponse::Sync(Err(e));
+        }
+
+        // Try pack backend first.  If the module is in a package file,
+        // read it directly without touching the filesystem.
+        if let Some(result) = self.try_load_from_mount(module_specifier) {
+            let cache = self.code_cache.clone();
+            return ModuleLoadResponse::Sync(
+                result
+                    .and_then(Self::patch_amd)
+                    .map(|source| match &cache {
+                        Some(c) => Self::attach_code_cache(c, source),
+                        None => source,
+                    }),
+            );
+        }
+
+        // Filesystem fallback (directory-backed mounts).
         let resp = self.inner.load(module_specifier, maybe_referrer, options);
         let cache = self.code_cache.clone();
 

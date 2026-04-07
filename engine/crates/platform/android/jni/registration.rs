@@ -16,8 +16,8 @@ use crate::android::jni::{
     onNavigateToMiniProgramResult, onNetworkStatusChange, onOpenAppAuthorizeSetting,
     onOpenSettingResult, onOpenSystemBluetoothSetting, onRecorderEvent, onRecorderFrameData,
     onRestart, onScanCodeResult, onShareAppMessageResult, onShow, onSubpackageProgress,
-    onSubpackageResult, onTouch, onUserCaptureScreen, onVideoEvent, onVsync, shutdown,
-    updateSurface, version, JavaMethodCache, JAVA_METHOD_CACHE,
+    onSubpackageResult, onSurfaceDestroyed, onTouch, onUserCaptureScreen, onVideoEvent, onVsync,
+    shutdown, updateSurface, version, JavaMethodCache, JAVA_METHOD_CACHE,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -82,6 +82,11 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "updateSurface".into(),
                 sig: "(ILjava/lang/Object;II)V".into(),
                 fn_ptr: updateSurface as *mut c_void,
+            },
+            NativeMethod {
+                name: "onSurfaceDestroyed".into(),
+                sig: "(I)V".into(),
+                fn_ptr: onSurfaceDestroyed as *mut c_void,
             },
             NativeMethod {
                 name: "onTouchEvent".into(),

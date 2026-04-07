@@ -1446,7 +1446,7 @@ pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError
                     return Err("BitmapFactory returned null".into());
                 }
                 let byte_array = jni::objects::JByteArray::from(obj);
-                let mut bytes = env
+                let bytes = env
                     .convert_byte_array(byte_array)
                     .map_err(|e| format!("Failed to read result bytes: {e}"))?;
 
