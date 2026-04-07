@@ -5,136 +5,18 @@
 # They ensure that critical classes are not obfuscated or removed.
 
 # ============================================================================
-# Native Methods
+# Keep EVERYTHING in the SDK package tree
 # ============================================================================
+# The SDK is small (~50 classes) and every class is reachable via JNI,
+# callbacks, or public API. Fine-grained rules cause hard-to-debug
+# ClassNotFoundException in release builds when new classes/interfaces
+# are added. A single broad rule is safer and simpler.
+
+-keep class com.migo.runtime.** { *; }
+-keep interface com.migo.runtime.** { *; }
+-keep enum com.migo.runtime.** { *; }
 
 # Keep all classes with native methods (JNI requirement)
 -keepclasseswithmembers class * {
     native <methods>;
 }
-
-# Keep NativeBridge - contains native method declarations
--keep class com.migo.runtime.internal.NativeBridge {
-    native <methods>;
-    static { *; }
-}
-
-# ============================================================================
-# JNI Callbacks (Rust -> Java)
-# ============================================================================
-
-# Keep NativeExports - ALL methods are called from native code via cached method IDs
-# WARNING: Do not rename or remove ANY methods!
--keep class com.migo.runtime.internal.NativeExports {
-    *;
-}
-
-# Keep internal classes accessed from native code or NativeExports
--keep class com.migo.runtime.internal.NativeMethods {
-    *;
-}
-
--keep class com.migo.runtime.internal.RuntimeRegistry {
-    *;
-}
-
--keep class com.migo.runtime.internal.RuntimeContext {
-    *;
-}
-
--keep class com.migo.runtime.internal.AppContext {
-    *;
-}
-
-# ============================================================================
-# RuntimeConfig (JNI Field Access)
-# ============================================================================
-
-# Keep RuntimeConfig - fields and methods are accessed via JNI reflection
--keep class com.migo.runtime.RuntimeConfig {
-    <fields>;
-    <methods>;
-}
-
-# Keep DebugOverlayView - may be used by host apps
--keep public class com.migo.runtime.DebugOverlayView {
-    public *;
-}
-
-# Keep GamePaths - used by host apps
--keep public class com.migo.runtime.GamePaths {
-    public *;
-}
-
-# Keep LogLevel enum - ordinal() is called from native code
--keep class com.migo.runtime.RuntimeConfig$LogLevel {
-    *;
-}
-
-# Keep RenderBackend enum
--keep class com.migo.runtime.RuntimeConfig$RenderBackend {
-    *;
-}
-
-# ============================================================================
-# Public API
-# ============================================================================
-
-# Keep public API classes (apps may use reflection)
--keep public class com.migo.runtime.MigoRuntime { public *; }
--keep public class com.migo.runtime.BuildInfo { public *; }
--keep public class com.migo.runtime.MigoRuntime$Result { public *; }
--keep public class com.migo.runtime.GameSession { public *; }
--keep public class com.migo.runtime.ErrorCode { public *; }
--keep public class com.migo.runtime.MigoException { *; }
--keep public class com.migo.runtime.RuntimeConfig$Builder { public *; }
-
-# Keep callback interface
--keep interface com.migo.runtime.callback.GameSessionListener { *; }
-
-# Keep new public lifecycle API
--keep public class com.migo.runtime.SessionState { *; }
--keep public interface com.migo.runtime.OnStateChangeListener { *; }
-
-# Keep new public API classes
--keep public class com.migo.runtime.MigoGameView { public *; }
--keep public class com.migo.runtime.MigoGameActivity { public *; protected *; }
-
-# Keep ResultProxyActivity - started via Intent
--keep class com.migo.runtime.internal.ResultProxyActivity { *; }
-
-# Keep PerformanceSnapshot - public API for performance monitoring
--keep public class com.migo.runtime.PerformanceSnapshot { *; }
-
-# ============================================================================
-# Callback Interfaces (set by host app, invoked from native/internal code)
-# ============================================================================
-
--keep interface com.migo.runtime.callback.AuthHandler { *; }
--keep interface com.migo.runtime.callback.AuthHandler$* { *; }
--keep interface com.migo.runtime.callback.SubpackageHandler { *; }
--keep class com.migo.runtime.callback.SubpackageHandler$* { *; }
--keep interface com.migo.runtime.callback.GameLogHandler { *; }
-
-# ============================================================================
-# Domain Exports (called from native code via cached method IDs)
-# ============================================================================
-
--keep class com.migo.runtime.internal.BluetoothExports { *; }
--keep class com.migo.runtime.internal.InputExports { *; }
--keep class com.migo.runtime.internal.MediaExports { *; }
--keep class com.migo.runtime.internal.NetworkExports { *; }
--keep class com.migo.runtime.internal.SensorExports { *; }
-
-# ============================================================================
-# Internal Utilities (referenced from JNI or NativeExports)
-# ============================================================================
-
--keep class com.migo.runtime.internal.ThreadCheck { *; }
--keep class com.migo.runtime.internal.VsyncScheduler { *; }
-
-# ============================================================================
-# Platform Managers (instantiated by *Exports classes, accessed via reflection)
-# ============================================================================
-
--keep class com.migo.runtime.internal.platform.** { *; }
