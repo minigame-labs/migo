@@ -594,7 +594,7 @@ pub(crate) extern "system" fn onShow<'local>(
     options_json: JString<'local>,
 ) {
     jni_safe!("onShow", {
-        let options_json = if options_json.is_null() {
+        let options_json: Option<String> = if options_json.is_null() {
             None
         } else {
             env.get_string(&options_json)

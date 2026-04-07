@@ -22,7 +22,7 @@ pub(crate) fn get_optional_string_field(
         return None;
     }
     let jstr = JString::from(jobj);
-    let s = env
+    let s: String = env
         .get_string(&jstr)
         .ok()
         .map(|s| s.into())?;

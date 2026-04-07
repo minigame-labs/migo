@@ -1,5 +1,5 @@
 /// Extract a human-readable message from a `catch_unwind` panic payload.
-fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = e.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = e.downcast_ref::<String>() {
@@ -44,4 +44,3 @@ macro_rules! jni_safe {
 }
 
 pub(crate) use jni_safe;
-pub(crate) use panic_message;
