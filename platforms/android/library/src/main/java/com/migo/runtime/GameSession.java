@@ -308,27 +308,28 @@ public final class GameSession implements Closeable {
      * </ul>
      *
      * @param entryPoint Entry point file (e.g., "game.js", "main.js")
-     * @throws RuntimeException if the session is destroyed or game fails to start
+     * @throws MigoException if the session is destroyed or game fails to start
      */
     public void startGame(String entryPoint) {
         ThreadCheck.ensureMainThread();
         ensureNotDestroyed();
 
         if (entryPoint == null || entryPoint.isEmpty()) {
-            throw new RuntimeException(ErrorCode.ERR_ENTRY_NOT_FOUND, "entryPoint is null or empty");
+            throw new MigoException(ErrorCode.ERR_ENTRY_NOT_FOUND,
+                    ErrorCode.getMessage(ErrorCode.ERR_ENTRY_NOT_FOUND) + ": entryPoint is null or empty");
         }
 
         // Optional: Validate code directory and entry point exist (for better error messages)
         File codeDir = paths.getCodeDir();
         if (!codeDir.exists() || !codeDir.isDirectory()) {
-            throw new RuntimeException(ErrorCode.ERR_CODE_DIR_NOT_FOUND,
-                    "Code directory not found: " + codeDir.getAbsolutePath());
+            throw new MigoException(ErrorCode.ERR_CODE_DIR_NOT_FOUND,
+                    ErrorCode.getMessage(ErrorCode.ERR_CODE_DIR_NOT_FOUND) + ": Code directory not found: " + codeDir.getAbsolutePath());
         }
 
         File entry = new File(codeDir, entryPoint);
         if (!entry.exists() || !entry.isFile()) {
-            throw new RuntimeException(ErrorCode.ERR_ENTRY_NOT_FOUND,
-                    "Entry point not found: " + entry.getAbsolutePath());
+            throw new MigoException(ErrorCode.ERR_ENTRY_NOT_FOUND,
+                    ErrorCode.getMessage(ErrorCode.ERR_ENTRY_NOT_FOUND) + ": Entry point not found: " + entry.getAbsolutePath());
         }
 
         // Ensure launch options are available before entry execution.
@@ -339,7 +340,8 @@ public final class GameSession implements Closeable {
         // Native layer handles path generation from gameId
         int result = NativeMethods.modMain(sessionId, gameId, entryPoint);
         if (result != 0) {
-            throw new RuntimeException(ErrorCode.ERR_JS_EXECUTION, "Native modMain returned " + result);
+            throw new MigoException(ErrorCode.ERR_JS_EXECUTION,
+                    ErrorCode.getMessage(ErrorCode.ERR_JS_EXECUTION) + ": Native modMain returned " + result);
         }
 
         SessionState prev = state.getAndSet(SessionState.RUNNING);
@@ -357,7 +359,7 @@ public final class GameSession implements Closeable {
         try {
             startGame(entryPoint);
             return ErrorCode.SUCCESS;
-        } catch (RuntimeException e) {
+        } catch (MigoException e) {
             return e.getErrorCode();
         } catch (Exception e) {
             return ErrorCode.ERR_JS_EXECUTION;
@@ -500,7 +502,8 @@ public final class GameSession implements Closeable {
     public void updateSurface(Surface surface, int width, int height) {
         ThreadCheck.ensureMainThread();
         if (surface == null) {
-            throw new RuntimeException(ErrorCode.ERR_INVALID_SURFACE);
+            throw new MigoException(ErrorCode.ERR_INVALID_SURFACE,
+                    ErrorCode.getMessage(ErrorCode.ERR_INVALID_SURFACE));
         }
         synchronized (lock) {
             if (state.get() == SessionState.DESTROYED) return;
@@ -840,7 +843,8 @@ public final class GameSession implements Closeable {
 
     private void ensureNotDestroyed() {
         if (state.get() == SessionState.DESTROYED) {
-            throw new RuntimeException(ErrorCode.ERR_SESSION_DESTROYED);
+            throw new MigoException(ErrorCode.ERR_SESSION_DESTROYED,
+                    ErrorCode.getMessage(ErrorCode.ERR_SESSION_DESTROYED));
         }
     }
 

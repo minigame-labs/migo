@@ -86,7 +86,6 @@
 -keep public class com.migo.runtime.MigoRuntime$Result { public *; }
 -keep public class com.migo.runtime.GameSession { public *; }
 -keep public class com.migo.runtime.ErrorCode { public *; }
--keep public class com.migo.runtime.RuntimeException { public *; }
 -keep public class com.migo.runtime.MigoException { *; }
 -keep public class com.migo.runtime.RuntimeConfig$Builder { public *; }
 

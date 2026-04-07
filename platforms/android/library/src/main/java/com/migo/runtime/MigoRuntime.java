@@ -221,7 +221,7 @@ public final class MigoRuntime {
      * @param config   Runtime configuration
      * @param gameId   Unique game identifier (alphanumeric, underscore, hyphen, 1-64 chars)
      * @return A new GameSession
-     * @throws RuntimeException if creation fails or gameId is invalid
+     * @throws MigoException if creation fails or gameId is invalid
      */
     public GameSession createSession(Activity activity, Surface surface, RuntimeConfig config, String gameId) {
         ThreadCheck.ensureMainThread();
@@ -239,8 +239,8 @@ public final class MigoRuntime {
         // Create native session
         int sessionId = NativeMethods.init(surface, config);
         if (sessionId < 0) {
-            throw new RuntimeException(ErrorCode.ERR_INIT_FAILED,
-                    "Native init returned " + sessionId);
+            throw new MigoException(ErrorCode.ERR_INIT_FAILED,
+                    ErrorCode.getMessage(ErrorCode.ERR_INIT_FAILED) + ": Native init returned " + sessionId);
         }
 
         // Create Java session wrapper with gameId
@@ -264,17 +264,20 @@ public final class MigoRuntime {
      * @param config  Runtime configuration
      * @param gameId  Unique game identifier (alphanumeric, underscore, hyphen, 1-64 chars)
      * @return A new GameSession
-     * @throws RuntimeException if creation fails or gameId is invalid
+     * @throws MigoException if creation fails or gameId is invalid
      */
     public GameSession createSession(Context context, Surface surface, RuntimeConfig config, String gameId) {
         if (context == null) {
-            throw new RuntimeException(ErrorCode.ERR_INVALID_CONFIG, "context is null");
+            throw new MigoException(ErrorCode.ERR_INVALID_CONFIG,
+                    ErrorCode.getMessage(ErrorCode.ERR_INVALID_CONFIG) + ": context is null");
         }
         if (surface == null) {
-            throw new RuntimeException(ErrorCode.ERR_INVALID_SURFACE);
+            throw new MigoException(ErrorCode.ERR_INVALID_SURFACE,
+                    ErrorCode.getMessage(ErrorCode.ERR_INVALID_SURFACE));
         }
         if (config == null) {
-            throw new RuntimeException(ErrorCode.ERR_INVALID_CONFIG);
+            throw new MigoException(ErrorCode.ERR_INVALID_CONFIG,
+                    ErrorCode.getMessage(ErrorCode.ERR_INVALID_CONFIG));
         }
         validateGameId(gameId);
 
@@ -289,8 +292,8 @@ public final class MigoRuntime {
         // Create native session
         int sessionId = NativeMethods.init(surface, config);
         if (sessionId < 0) {
-            throw new RuntimeException(ErrorCode.ERR_INIT_FAILED,
-                    "Native init returned " + sessionId);
+            throw new MigoException(ErrorCode.ERR_INIT_FAILED,
+                    ErrorCode.getMessage(ErrorCode.ERR_INIT_FAILED) + ": Native init returned " + sessionId);
         }
 
         // Create Java session wrapper with gameId
@@ -318,8 +321,6 @@ public final class MigoRuntime {
         try {
             return Result.success(createSession(activity, surface, config, gameId));
         } catch (MigoException e) {
-            return Result.failure(e.getErrorCode(), e.getMessage());
-        } catch (RuntimeException e) {
             return Result.failure(e.getErrorCode(), e.getMessage());
         } catch (Exception e) {
             return Result.failure(ErrorCode.ERR_INIT_FAILED, e.getMessage());
@@ -350,13 +351,16 @@ public final class MigoRuntime {
 
     private void validateCreateSession(Activity activity, Surface surface, RuntimeConfig config) {
         if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
-            throw new RuntimeException(ErrorCode.ERR_INVALID_ACTIVITY);
+            throw new MigoException(ErrorCode.ERR_INVALID_ACTIVITY,
+                    ErrorCode.getMessage(ErrorCode.ERR_INVALID_ACTIVITY));
         }
         if (surface == null) {
-            throw new RuntimeException(ErrorCode.ERR_INVALID_SURFACE);
+            throw new MigoException(ErrorCode.ERR_INVALID_SURFACE,
+                    ErrorCode.getMessage(ErrorCode.ERR_INVALID_SURFACE));
         }
         if (config == null) {
-            throw new RuntimeException(ErrorCode.ERR_INVALID_CONFIG);
+            throw new MigoException(ErrorCode.ERR_INVALID_CONFIG,
+                    ErrorCode.getMessage(ErrorCode.ERR_INVALID_CONFIG));
         }
         if (!nativeLoaded) {
             throw new MigoException(ErrorCode.ERR_NATIVE_LOAD_FAILED,
@@ -366,8 +370,8 @@ public final class MigoRuntime {
 
     private void validateGameId(String gameId) {
         if (!GamePaths.isValidGameId(gameId)) {
-            throw new RuntimeException(ErrorCode.ERR_INVALID_CONFIG,
-                    "Invalid gameId: must be 1-64 alphanumeric characters, underscore or hyphen");
+            throw new MigoException(ErrorCode.ERR_INVALID_CONFIG,
+                    ErrorCode.getMessage(ErrorCode.ERR_INVALID_CONFIG) + ": Invalid gameId: must be 1-64 alphanumeric characters, underscore or hyphen");
         }
     }
 
@@ -430,7 +434,7 @@ public final class MigoRuntime {
         /** Get value or throw if failed */
         public T getOrThrow() {
             if (isFailure()) {
-                throw new RuntimeException(errorCode, errorMessage);
+                throw new MigoException(errorCode, errorMessage);
             }
             return value;
         }

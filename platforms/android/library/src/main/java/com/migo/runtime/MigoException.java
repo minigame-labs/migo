@@ -17,7 +17,7 @@ package com.migo.runtime;
  * }</pre>
  *
  */
-public class MigoException extends RuntimeException {
+public class MigoException extends java.lang.RuntimeException {
     private final int errorCode;
     private final boolean recoverable;
 

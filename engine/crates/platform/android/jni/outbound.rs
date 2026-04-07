@@ -572,17 +572,17 @@ pub fn get_available_audio_sources(host_id: i32) -> Result<String, String> {
 
 // ==================== Recorder ====================
 
-/// Start recording with options JSON.
-/// Calls Java: NativeExports.recorderStart(hostId, optionsJson)
+// Start recording with options JSON.
+// Calls Java: NativeExports.recorderStart(hostId, optionsJson)
 jni_void_json!(recorder_start, "recorderStart");
 
-/// Pause recording. Calls Java: NativeExports.recorderPause(hostId)
+// Pause recording. Calls Java: NativeExports.recorderPause(hostId)
 jni_void!(recorder_pause, "recorderPause");
 
-/// Resume recording. Calls Java: NativeExports.recorderResume(hostId)
+// Resume recording. Calls Java: NativeExports.recorderResume(hostId)
 jni_void!(recorder_resume, "recorderResume");
 
-/// Stop recording. Calls Java: NativeExports.recorderStop(hostId)
+// Stop recording. Calls Java: NativeExports.recorderStop(hostId)
 jni_void!(recorder_stop, "recorderStop");
 
 // ==================== Charset Encoding (GBK) ====================
@@ -872,8 +872,8 @@ fn call_json_method(method_name: &str, host_id: i32, options_json: &str) -> Resu
     })
 }
 
-/// Create a camera instance.
-/// Calls Java: NativeExports.cameraCreate(hostId, optionsJson) -> String
+// Create a camera instance.
+// Calls Java: NativeExports.cameraCreate(hostId, optionsJson) -> String
 jni_json!(camera_create, "cameraCreate");
 
 /// Destroy a camera instance.
@@ -892,16 +892,16 @@ pub fn camera_destroy(host_id: i32, camera_id: u32) -> Result<(), String> {
     )
 }
 
-/// Take a photo. Calls Java: NativeExports.cameraTakePhoto(hostId, optionsJson) -> String
+// Take a photo. Calls Java: NativeExports.cameraTakePhoto(hostId, optionsJson) -> String
 jni_json!(camera_take_photo, "cameraTakePhoto");
 
-/// Start video recording. Calls Java: NativeExports.cameraStartRecord(hostId, optionsJson) -> String
+// Start video recording. Calls Java: NativeExports.cameraStartRecord(hostId, optionsJson) -> String
 jni_json!(camera_start_record, "cameraStartRecord");
 
-/// Stop video recording. Calls Java: NativeExports.cameraStopRecord(hostId, optionsJson) -> String
+// Stop video recording. Calls Java: NativeExports.cameraStopRecord(hostId, optionsJson) -> String
 jni_json!(camera_stop_record, "cameraStopRecord");
 
-/// Set camera zoom level. Calls Java: NativeExports.cameraSetZoom(hostId, optionsJson) -> String
+// Set camera zoom level. Calls Java: NativeExports.cameraSetZoom(hostId, optionsJson) -> String
 jni_json!(camera_set_zoom, "cameraSetZoom");
 
 /// Start listening for camera frame changes.
@@ -1033,20 +1033,20 @@ jni_void_json!(auth_get_phone_number, "authGetPhoneNumber");
 
 // ==================== Lifecycle Notification ====================
 
-/// Notify the Java layer that the game module has been loaded and is ready.
-/// Calls `NativeExports.onGameReady(hostId)` so Java can measure startup time.
+// Notify the Java layer that the game module has been loaded and is ready.
+// Calls `NativeExports.onGameReady(hostId)` so Java can measure startup time.
 jni_void!(notify_game_ready, "onGameReady");
 
 // ==================== Error Notification ====================
 
-/// Notify the Java layer that the host is exiting normally.
-/// Calls `NativeExports.onExit(hostId)` so Java can finish the Activity.
-/// Used when JS calls `exitMiniProgram()`.
+// Notify the Java layer that the host is exiting normally.
+// Calls `NativeExports.onExit(hostId)` so Java can finish the Activity.
+// Used when JS calls `exitMiniProgram()`.
 jni_void!(notify_exit, "onExit");
 
-/// Deliver a JS-to-host message to the Java layer.
-/// Calls `NativeExports.onHostMessage(hostId, json)` where `json` is a
-/// `{"type":"...","payload":"..."}` envelope built by the `op_send_to_host` op.
+// Deliver a JS-to-host message to the Java layer.
+// Calls `NativeExports.onHostMessage(hostId, json)` where `json` is a
+// `{"type":"...","payload":"..."}` envelope built by the `op_send_to_host` op.
 jni_void_json!(notify_host_message, "onHostMessage");
 
 /// Notify the Java layer about a fatal engine error.

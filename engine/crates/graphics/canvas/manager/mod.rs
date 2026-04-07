@@ -1,6 +1,6 @@
 extern crate khronos_egl as egl;
 
-use crate::dirty_region::damage_tracker::{DamageTracker, ResolvedDamage};
+use crate::dirty_region::damage_tracker::ResolvedDamage;
 use crate::{BoundContext, Canvas2DContext};
 use egl::EGL1_4;
 use femtovg::ImageId;
@@ -716,6 +716,7 @@ impl CanvasManager {
     }
 
     /// Returns true if the currently bound context is the onscreen canvas (id=1).
+    #[allow(dead_code)]
     pub(crate) fn is_onscreen_bound(&self) -> bool {
         self.bound == BoundContext::Canvas(CanvasId::from(1u32))
     }
@@ -1408,10 +1409,12 @@ impl CanvasManager {
         self.dirty_2d.remove(&canvas_id);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn mark_current_frame_requires_full_redraw(&mut self) {
         self.damage.add(crate::damage_effect::DamageEffect::FullSurface);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn stage_current_frame_partial_damage(&mut self, rect: [i32; 4], is_onscreen: bool) {
         if !is_onscreen {
             return;

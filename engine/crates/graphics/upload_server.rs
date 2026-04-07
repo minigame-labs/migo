@@ -44,10 +44,12 @@ impl UploadBudget {
         self.bytes_left = (self.bytes_left + bytes).min(self.max_bytes);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn jobs_left(&self) -> usize {
         self.jobs_left
     }
 
+    #[allow(dead_code)]
     pub(crate) fn bytes_left(&self) -> usize {
         self.bytes_left
     }
@@ -74,6 +76,7 @@ impl FrameBudget {
         }
     }
 
+    #[allow(dead_code)]
     fn try_acquire(&mut self, bytes: usize) -> bool {
         if self.jobs_left == 0 || bytes > self.bytes_left {
             return false;
@@ -101,6 +104,7 @@ pub(crate) struct UploadServer {
 }
 
 impl UploadServer {
+    #[allow(dead_code)]
     pub(crate) fn new(max_jobs: usize, max_bytes: usize) -> Self {
         Self {
             queue_depth: 0,
@@ -129,6 +133,7 @@ impl UploadServer {
         self.queue_depth
     }
 
+    #[allow(dead_code)]
     pub(crate) fn budget(&self) -> &UploadBudget {
         &self.budget
     }

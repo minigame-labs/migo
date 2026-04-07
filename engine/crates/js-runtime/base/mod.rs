@@ -165,7 +165,7 @@ fn op_require_resolve_and_read(
     let host = state.borrow::<HostOpState>();
     let mount_table = host.mount_table.clone();
     let code_dir = host.code_dir.clone().unwrap_or_default();
-    drop(host);
+    let _ = host;
 
     let base_dir = if referrer_dir.is_empty() {
         code_dir.clone()

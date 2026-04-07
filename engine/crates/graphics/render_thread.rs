@@ -3,7 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    damage_effect::{DamageEffect, FrameDamageAccumulator},
+    damage_effect::DamageEffect,
     dirty_region,
     frame_scheduler::FrameScheduler,
     global_fonts_mut, onscreen_window_from_surface,

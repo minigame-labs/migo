@@ -236,6 +236,7 @@ impl ImageCache {
     }
 
     /// Get the source path for an image ID (for texImage2D RGBA lookup).
+    #[allow(dead_code)]
     pub fn source_for_image_id(&self, image_id: u32) -> Option<String> {
         let shared_id = self
             .alias_to_shared

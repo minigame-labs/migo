@@ -78,17 +78,20 @@ impl FrameDamageAccumulator {
     }
 
     /// Whether any damage has been recorded (rect or full).
+    #[allow(dead_code)]
     pub(crate) fn has_damage(&self) -> bool {
         self.rect.is_some() || self.force_full
     }
 
     /// Read the accumulated rect (for staging into CanvasManager's
     /// pending_damage_rect during the transition period).
+    #[allow(dead_code)]
     pub(crate) fn accumulated_rect(&self) -> Option<[i32; 4]> {
         self.rect
     }
 
     /// Whether FullSurface has been triggered.
+    #[allow(dead_code)]
     pub(crate) fn is_full_surface(&self) -> bool {
         self.force_full
     }
