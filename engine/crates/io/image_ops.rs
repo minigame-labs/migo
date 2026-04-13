@@ -1106,11 +1106,17 @@ mod tests {
     use shared::{
         device::gpu_caps::GpuCapsSnapshot,
         protocol::io_cmd::NormalizedImage,
-        vfs::{DirectorySource, MountTable, PackSource, PackageWriter},
+        vfs::{DirSource, MountTable, PackSource},
     };
+    use shared::vfs::package::PackageWriter;
     use tokio::sync::Notify;
 
-    use super::{preload_images, read_image_rgba8};
+    use super::{
+        preload_images, read_image_rgba8, ImageSource,
+        run_image_job_with_scheduler, worker_image_source, read_image_source,
+        mounted_variant_source_version_token,
+        TEST_SCHEDULER_RUNS, TEST_PRELOAD_CACHE_HOOK, TEST_PRELOAD_DECODE_STARTED,
+    };
     use crate::scheduler::IoScheduler;
 
     fn scheduler_run_count() -> usize {
@@ -1149,7 +1155,7 @@ mod tests {
         writer.finish("test", "1.0").unwrap();
     }
 
-    fn tiny_png() -> [u8; 69] {
+    fn tiny_png() -> [u8; 70] {
         [
             137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
             8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207,
@@ -1433,11 +1439,11 @@ mod tests {
         std::fs::write(v2.join("tex.png"), b"dir-v2-longer").unwrap();
 
         let mount_table = MountTable::new(dir.clone());
-        mount_table.swap_base(Arc::new(DirectorySource::new(v1.clone())));
+        mount_table.swap_base(Arc::new(DirSource::new(v1.clone())));
         let resolved_v1 = mount_table.resolve_code_path("/code/tex.png").unwrap();
         let generation_v1 = resolved_v1.source_mounted_at;
 
-        mount_table.swap_base(Arc::new(DirectorySource::new(v2.clone())));
+        mount_table.swap_base(Arc::new(DirSource::new(v2.clone())));
 
         let worker_source = worker_image_source(
             "/code/tex.png",
@@ -1472,7 +1478,7 @@ mod tests {
         std::fs::write(base.join("tex.png"), b"dir-v1").unwrap();
 
         let mount_table = MountTable::new(dir.clone());
-        mount_table.swap_base(Arc::new(DirectorySource::new(base.clone())));
+        mount_table.swap_base(Arc::new(DirSource::new(base.clone())));
         let resolved = mount_table.resolve_code_path("/code/tex.png").unwrap();
         let requested_generation = mounted_variant_source_version_token(
             resolved.real_path.as_ref().unwrap(),
@@ -1506,7 +1512,7 @@ mod tests {
         std::fs::write(base.join("tex.png"), b"dir-v1").unwrap();
 
         let mount_table = MountTable::new(dir.clone());
-        mount_table.swap_base(Arc::new(DirectorySource::new(base.clone())));
+        mount_table.swap_base(Arc::new(DirSource::new(base.clone())));
         let resolved = mount_table.resolve_code_path("/code/tex.png").unwrap();
         let requested_generation = mounted_variant_source_version_token(
             resolved.real_path.as_ref().unwrap(),
@@ -1549,7 +1555,7 @@ mod tests {
         std::fs::write(v2.join("tex.png"), tiny_png()).unwrap();
 
         let mount_table = Arc::new(MountTable::new(dir.clone()));
-        mount_table.swap_base(Arc::new(DirectorySource::new(v1.clone())));
+        mount_table.swap_base(Arc::new(DirSource::new(v1.clone())));
         let resolved = mount_table.resolve_code_path("/code/tex.png").unwrap();
         let old_generation = mounted_variant_source_version_token(
             resolved.real_path.as_ref().unwrap(),
@@ -1563,7 +1569,7 @@ mod tests {
             NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]),
         );
 
-        mount_table.swap_base(Arc::new(DirectorySource::new(v2.clone())));
+        mount_table.swap_base(Arc::new(DirSource::new(v2.clone())));
         std::fs::write(v2.join("tex.ktx2"), b"changed-companion").unwrap();
 
         let result = runtime.block_on(read_image_rgba8(
@@ -1607,7 +1613,7 @@ mod tests {
         std::fs::write(v2.join("tex.png"), tiny_png()).unwrap();
 
         let mount_table = Arc::new(MountTable::new(dir.clone()));
-        mount_table.swap_base(Arc::new(DirectorySource::new(v1.clone())));
+        mount_table.swap_base(Arc::new(DirSource::new(v1.clone())));
         let resolved = mount_table.resolve_code_path("/code/tex.png").unwrap();
         let old_generation = mounted_variant_source_version_token(
             resolved.real_path.as_ref().unwrap(),
@@ -1621,7 +1627,7 @@ mod tests {
             NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]),
         );
 
-        mount_table.swap_base(Arc::new(DirectorySource::new(v2.clone())));
+        mount_table.swap_base(Arc::new(DirSource::new(v2.clone())));
         std::fs::write(v2.join("tex.ktx2"), b"changed-companion").unwrap();
 
         let results = runtime.block_on(preload_images(
@@ -1663,7 +1669,7 @@ mod tests {
         std::fs::write(v2.join("tex.png"), tiny_png()).unwrap();
 
         let mount_table = Arc::new(MountTable::new(dir.clone()));
-        mount_table.swap_base(Arc::new(DirectorySource::new(v1.clone())));
+        mount_table.swap_base(Arc::new(DirSource::new(v1.clone())));
         let resolved = mount_table.resolve_code_path("/code/tex.png").unwrap();
         let old_generation = mounted_variant_source_version_token(
             resolved.real_path.as_ref().unwrap(),
@@ -1695,7 +1701,7 @@ mod tests {
             ));
 
             classified.notified().await;
-            mount_table.swap_base(Arc::new(DirectorySource::new(v2.clone())));
+            mount_table.swap_base(Arc::new(DirSource::new(v2.clone())));
             std::fs::write(v2.join("tex.ktx2"), b"changed-companion").unwrap();
             resume.notify_waiters();
 

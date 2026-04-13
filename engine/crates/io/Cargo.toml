@@ -13,7 +13,7 @@ rust-image-decode = ["dep:image", "dep:zune-image", "dep:zune-core"]
 compress-brotli = ["dep:brotli"]
 
 [dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 shared = { path = "../shared" }
 deno_core.workspace = true

@@ -339,6 +339,18 @@ impl HostJsRuntime {
         (host.app_files_dir.clone(), host.app_cache_dir.clone())
     }
 
+    /// Close the IO scheduler's domain, rejecting all in-flight and future IO.
+    /// Call before dropping the runtime during restart to prevent stale async
+    /// tasks from executing against an orphaned domain.
+    pub fn close_io_scheduler(&self) {
+        let op_state_rc = self.rt.op_state();
+        let op_state = op_state_rc.borrow();
+        op_state
+            .borrow::<crate::io_state::IoSchedulerState>()
+            .0
+            .close();
+    }
+
     pub fn reload_bindings(&mut self) {
         self.bindings.reload(&mut self.rt, self.host_id);
     }

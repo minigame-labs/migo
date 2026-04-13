@@ -11,11 +11,14 @@ pub enum RequestKind {
     Async,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PriorityClass {
-    ForegroundBlocking,
-    ForegroundAsync,
+    /// Lowest priority: unzip, ingest, preloading, warming.
     Background,
+    /// Runtime on-demand async loading.
+    ForegroundAsync,
+    /// Sync APIs and startup-critical loads blocking current execution.
+    ForegroundBlocking,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,11 +80,63 @@ pub enum IoRequest {
     },
 }
 
+impl IoRequest {
+    pub fn priority(&self) -> PriorityClass {
+        match self {
+            IoRequest::ReadFile { priority, .. }
+            | IoRequest::GetFileInfo { priority, .. }
+            | IoRequest::DecodeImage { priority, .. }
+            | IoRequest::Unzip { priority, .. }
+            | IoRequest::PackageIngest { priority, .. }
+            | IoRequest::StorageGet { priority, .. }
+            | IoRequest::StorageMutate { priority, .. }
+            | IoRequest::StorageInfo { priority, .. } => *priority,
+        }
+    }
+}
+
 impl From<RequestKind> for PriorityClass {
     fn from(kind: RequestKind) -> Self {
         match kind {
             RequestKind::Sync => PriorityClass::ForegroundBlocking,
             RequestKind::Async => PriorityClass::ForegroundAsync,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_request_priority_extracts_correct_class() {
+        let read = IoRequest::ReadFile {
+            backend: BackendKind::Pack,
+            request: RequestKind::Sync,
+            priority: PriorityClass::ForegroundBlocking,
+            spec: ReadSpec::Whole,
+            estimated_bytes: 0,
+        };
+        assert_eq!(read.priority(), PriorityClass::ForegroundBlocking);
+
+        let unzip = IoRequest::Unzip {
+            backend: BackendKind::Archive,
+            priority: PriorityClass::Background,
+            compressed_bytes: 0,
+        };
+        assert_eq!(unzip.priority(), PriorityClass::Background);
+
+        let storage = IoRequest::StorageMutate {
+            request: RequestKind::Async,
+            priority: PriorityClass::ForegroundAsync,
+        };
+        assert_eq!(storage.priority(), PriorityClass::ForegroundAsync);
+    }
+
+    #[test]
+    fn priority_class_ordering() {
+        assert!(PriorityClass::ForegroundBlocking > PriorityClass::ForegroundAsync);
+        assert!(PriorityClass::ForegroundAsync > PriorityClass::Background);
+        assert!(PriorityClass::ForegroundBlocking > PriorityClass::Background);
     }
 }

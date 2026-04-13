@@ -828,6 +828,11 @@ impl Host {
         #[cfg(feature = "v8-limits")]
         let v8_limits = V8LimitsConfig::from_max_memory_mb(self.init_options.max_memory_mb());
 
+        // Close the IO scheduler before dropping the runtime.  This ensures
+        // in-flight async IO tasks are rejected immediately rather than racing
+        // with the new session's scheduler after the old runtime is gone.
+        self.js.close_io_scheduler();
+
         // CRITICAL: Drop the old JsRuntime BEFORE creating the new one.
         // Two v8 isolates on the same thread during drop cleanup causes
         // "Cannot create a handle without a HandleScope" crash — the old

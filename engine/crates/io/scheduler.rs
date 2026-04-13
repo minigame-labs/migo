@@ -128,8 +128,9 @@ impl IoScheduler {
             RouteDecision::Delegated(pool) => {
                 self.metrics.delegated_runs.fetch_add(1, Ordering::Relaxed);
                 let started_at = Instant::now();
+                let priority = req.priority();
                 let domain = Arc::clone(&self.domain);
-                let result = self.pools.run(pool, move || {
+                let result = self.pools.run(pool, priority, move || {
                     #[cfg(test)]
                     run_worker_start_test_hook();
 
@@ -177,28 +178,25 @@ impl IoScheduler {
             }
             RouteDecision::Delegated(pool) => {
                 self.metrics.delegated_runs.fetch_add(1, Ordering::Relaxed);
-                let pools = self.pools.clone();
+                let priority = req.priority();
                 let domain = Arc::clone(&self.domain);
-                match tokio::task::spawn_blocking(move || {
-                    pools.run(pool, move || {
-                        #[cfg(test)]
-                        run_worker_start_test_hook();
+                let rx = self.pools.submit_async(pool, priority, move || {
+                    #[cfg(test)]
+                    run_worker_start_test_hook();
 
-                        if domain.is_closed() {
-                            return Err(PoolError::Closed);
-                        }
-                        Ok(job())
-                    })
-                })
-                .await
-                {
+                    if domain.is_closed() {
+                        return Err(PoolError::Closed);
+                    }
+                    Ok(job())
+                })?;
+                match rx.await {
                     Ok(Ok(Ok(value))) => Ok(value),
                     Ok(Ok(Err(err))) => {
                         self.metrics.rejected_runs.fetch_add(1, Ordering::Relaxed);
                         Err(err)
                     }
-                    Ok(Err(err)) => Err(err),
-                    Err(err) => std::panic::resume_unwind(err.into_panic()),
+                    Ok(Err(payload)) => std::panic::resume_unwind(payload),
+                    Err(_) => Err(PoolError::Closed),
                 }
             }
         }
@@ -649,5 +647,55 @@ mod tests {
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("<non-string panic>");
         assert_eq!(message, "pack worker panic");
+    }
+
+    #[test]
+    fn run_async_completes_without_tokio_blocking_threads() {
+        let scheduler = IoScheduler::new(201);
+        let req = IoRequest::ReadFile {
+            backend: BackendKind::Pack,
+            request: RequestKind::Async,
+            priority: PriorityClass::ForegroundAsync,
+            spec: ReadSpec::Whole,
+            estimated_bytes: 64,
+        };
+
+        // Build a multi-thread runtime with exactly 1 blocking thread.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Saturate the one blocking thread with a long-running task.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        runtime.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _ = release_rx.recv(); // hold the blocking thread forever
+            });
+        });
+        // Let the blocking task start.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // If run_async still uses spawn_blocking, this will time out because
+        // the blocking pool is exhausted. With oneshot-based submit_async it
+        // completes immediately via the dedicated worker pool thread.
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                scheduler.run_async(req, || 42usize),
+            )
+            .await
+        });
+
+        // Release the blocked thread.
+        let _ = release_tx.send(());
+
+        assert!(
+            result.is_ok(),
+            "run_async timed out — still using spawn_blocking?"
+        );
+        assert_eq!(result.unwrap().unwrap(), 42);
     }
 }
