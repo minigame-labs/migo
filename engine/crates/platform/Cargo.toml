@@ -31,7 +31,7 @@ deno_core = { workspace = true }
 raw-window-handle = { workspace = true }
 
 # On non-Android platforms, enable Rust-native implementations:
-# - zip-extract: IOCmd::Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)
+# - zip-extract: Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)
 # - codec-gbk: GBK encoding via `encoding_rs` crate (Android uses java.nio.charset via JNI)
 [target.'cfg(not(target_os = "android"))'.dependencies]
 io = { path = "../io", features = ["zip-extract", "rust-image-decode"] }

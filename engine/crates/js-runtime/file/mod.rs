@@ -14,7 +14,7 @@ use crate::file::fs::{
 mod fs;
 
 extension!(host_v8_file,
-    deps = [host_v8_console, host_v8_base],
+    deps = [host_v8_console, host_v8_base, host_v8_io_state],
     ops = [
         op_access,
         op_access_sync,

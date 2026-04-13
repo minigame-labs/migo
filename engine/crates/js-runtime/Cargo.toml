@@ -59,3 +59,6 @@ tokio-tungstenite.workspace = true
 # aws-lc-rs, runtime handshake panics on provider auto-detection.
 rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12"] }
 futures.workspace = true
+
+[dev-dependencies]
+zip = { version = "2.2", default-features = false, features = ["deflate"] }

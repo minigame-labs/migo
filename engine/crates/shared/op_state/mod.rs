@@ -6,13 +6,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::channel::ThreadWakeup;
-use crate::protocol::{audio_cmd::AudioCmd, host_cmd::HostCommand, io_cmd::IOCmd};
+use crate::protocol::{audio_cmd::AudioCmd, host_cmd::HostCommand};
 use crate::services::DeviceServices;
 use crate::vfs::{GamePaths, MountTable, VirtualFS};
 
 /// Host-side operational state shared across runtime layers.
 pub type RenderTx = crate::render_command_sender::CommandSender;
-pub type IoTx = UnboundedSender<IOCmd>;
 pub type AudioTx = AudioSender;
 pub type HostTx = tokio::sync::mpsc::Sender<HostCommand>;
 
@@ -62,6 +61,7 @@ impl fmt::Debug for AudioSender {
     }
 }
 
+
 #[derive(Clone)]
 pub struct HostOpState {
     pub id: i32,
@@ -78,7 +78,6 @@ pub struct HostOpState {
     /// Mount table for `/code` path resolution (set after EvaluateModule).
     pub mount_table: Option<Arc<MountTable>>,
     pub render_tx: RenderTx,
-    pub io_tx: IoTx,
     pub audio_tx: AudioTx,
     pub host_tx: HostTx,
     /// Platform device services (clipboard, sensors, etc.)
@@ -100,7 +99,7 @@ pub struct HostOpState {
     /// Per-session GPU compressed texture format support.
     /// Shared with the render thread via `Arc`; render thread calls
     /// `set()` after GL context init.  JS ops take a `snapshot()` and
-    /// pass it through `IOCmd` so the IO thread never reads globals.
+    /// pass it to image decode functions.
     pub gpu_caps: Arc<crate::device::gpu_caps::GpuCaps>,
 }
 

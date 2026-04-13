@@ -2,6 +2,7 @@ import { primordials } from "ext:core/mod.js";
 import { windowOrWorkerGlobalScope } from "ext:runtime/98_global_scope_shared.js";
 import { WindowGlobalScope } from "ext:runtime/98_global_scope_window.js";
 import { initializeEventHandlers } from "ext:host_v8_event/01_event.js";
+import { _perf, _perfEnable, _perfDisable } from "ext:host_v8_base/05_perf.js";
 
 const { ObjectDefineProperties, ObjectDefineProperty, ObjectFreeze } = primordials;
 
@@ -122,3 +123,12 @@ ObjectDefineProperty(globalThis, "_CCSettings", {
 
 // Initialize event handlers
 initializeEventHandlers();
+
+// Perf profiler: only accessible via evaluateJavaScript from host app.
+// Not enumerable, not visible to game code via migo.* or globalThis iteration.
+Object.defineProperty(globalThis, '_perf', {
+    value: Object.freeze({ enable: _perfEnable, disable: _perfDisable }),
+    configurable: false,
+    enumerable: false,
+    writable: false,
+});

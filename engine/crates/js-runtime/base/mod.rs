@@ -1,6 +1,93 @@
-use deno_core::{op2, serde_json, v8, Extension, OpState};
+use std::{path::PathBuf, sync::Arc};
+
+use deno_core::{Extension, OpState, op2, serde_json, v8};
 use shared::op_state::HostOpState;
 use tracing::debug;
+
+use crate::io_state::IoSchedulerState;
+
+struct InstallSubpackageRequest {
+    zip_path: String,
+    pkg_key: String,
+    root: String,
+    version: String,
+    ensure_persistent: bool,
+}
+
+fn install_subpackage_blocking(
+    mount_table: Arc<shared::vfs::MountTable>,
+    game_cache_dir: PathBuf,
+    request: InstallSubpackageRequest,
+) -> Result<String, String> {
+    use shared::vfs::mount::{PackageManifest, StagingArea, package_store_dir};
+
+    let store = package_store_dir(&game_cache_dir);
+
+    let staging = StagingArea::create(&game_cache_dir, &request.pkg_key)
+        .map_err(|e| format!("staging create failed: {e}"))?;
+
+    let pkg_filename = format!("{}.mpkg", request.pkg_key);
+    let staged_pkg_path = staging.dir().join(&pkg_filename);
+
+    io::ingest_zip_to_package(
+        PathBuf::from(&request.zip_path).as_path(),
+        &staged_pkg_path,
+        &request.pkg_key,
+        &request.version,
+    )
+    .map_err(|e| format!("ingest failed: {e}"))?;
+
+    let final_pkg_path = store.join(&pkg_filename);
+    let identity = staging
+        .install_package(
+            &mount_table,
+            &pkg_filename,
+            &final_pkg_path,
+            &request.root,
+            &request.pkg_key,
+            &request.version,
+        )
+        .map_err(|e| format!("install failed: {e}"))?;
+
+    let mut manifest = PackageManifest::load(&store);
+    manifest.record(request.pkg_key, request.root, identity.version.clone());
+    if let Err(e) = manifest.save(&store) {
+        if request.ensure_persistent {
+            return Err(format!(
+                "manifest write failed (not durably installed): {e}"
+            ));
+        }
+        tracing::warn!("subpackage manifest write failed (package still live): {e}");
+    }
+
+    Ok(serde_json::json!({
+        "name": identity.name,
+        "version": identity.version,
+        "checksum": identity.checksum,
+    })
+    .to_string())
+}
+
+async fn install_subpackage_with_scheduler(
+    scheduler: Arc<io::scheduler::IoScheduler>,
+    mount_table: Arc<shared::vfs::MountTable>,
+    game_cache_dir: PathBuf,
+    request: InstallSubpackageRequest,
+) -> Result<String, String> {
+    let compressed_bytes = std::fs::metadata(&request.zip_path)
+        .map(|meta| meta.len() as usize)
+        .unwrap_or(0);
+    scheduler
+        .run_async(
+            io::task::IoRequest::PackageIngest {
+                priority: io::task::PriorityClass::Background,
+                compressed_bytes,
+            },
+            move || install_subpackage_blocking(mount_table, game_cache_dir, request),
+        )
+        .await
+        .map_err(|_| "subpackage install worker pool closed".to_string())?
+}
 
 /// Derive a collision-free filesystem-safe key from a package name.
 /// Uses percent-encoding: every byte that isn't [a-zA-Z0-9._-] is
@@ -186,7 +273,8 @@ fn op_require_resolve_and_read(
     // Compute a normalized relative path for the canonical module key.
     // This ensures ./foo and ./a/../foo produce the same cache key.
     let code_path = std::path::Path::new(&code_dir);
-    let normalized_relative = resolved.strip_prefix(code_path)
+    let normalized_relative = resolved
+        .strip_prefix(code_path)
         .ok()
         .and_then(|r| r.to_str())
         .map(|s| {
@@ -195,7 +283,9 @@ fn op_require_resolve_and_read(
             for c in s.split('/') {
                 match c {
                     "" | "." => {}
-                    ".." => { parts.pop(); }
+                    ".." => {
+                        parts.pop();
+                    }
                     c => parts.push(c),
                 }
             }
@@ -217,21 +307,30 @@ fn op_require_resolve_and_read(
                 // MountTable found the file. Read it.
                 match mt.read(rel) {
                     Ok(bytes) => {
-                        let content = String::from_utf8(bytes).map_err(|e| {
-                            RequireError::Io(format!("require: not UTF-8: {e}"))
-                        })?;
+                        let content = String::from_utf8(bytes)
+                            .map_err(|e| RequireError::Io(format!("require: not UTF-8: {e}")))?;
                         let is_pack = info.real_path.is_none();
                         let abs_path = if is_pack {
                             // Per-source mounted_at: only changes when THIS source
                             // is replaced, not when other overlays change.
-                            format!("{}#s{}", code_path.join(rel).display(), info.source_mounted_at)
+                            format!(
+                                "{}#s{}",
+                                code_path.join(rel).display(),
+                                info.source_mounted_at
+                            )
                         } else {
                             code_path.join(rel).to_string_lossy().into_owned()
                         };
-                        let parent = code_path.join(rel).parent()
+                        let parent = code_path
+                            .join(rel)
+                            .parent()
                             .map(|p| p.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        return Ok(RequireResult { code: content, abs_path, dir: parent });
+                        return Ok(RequireResult {
+                            code: content,
+                            abs_path,
+                            dir: parent,
+                        });
                     }
                     Err(e) => {
                         return Err(RequireError::Io(format!(
@@ -260,7 +359,8 @@ fn op_require_resolve_and_read(
     if !code_dir.is_empty() {
         if !path.starts_with(code_path) {
             return Err(RequireError::Io(format!(
-                "require: path escapes /code sandbox: {}", path.display()
+                "require: path escapes /code sandbox: {}",
+                path.display()
             )));
         }
     }
@@ -268,11 +368,16 @@ fn op_require_resolve_and_read(
     let abs_path = path.to_string_lossy().into_owned();
     let content = std::fs::read_to_string(&path)
         .map_err(|e| RequireError::Io(format!("require: cannot read {}: {}", abs_path, e)))?;
-    let parent = path.parent()
+    let parent = path
+        .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    Ok(RequireResult { code: content, abs_path, dir: parent })
+    Ok(RequireResult {
+        code: content,
+        abs_path,
+        dir: parent,
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -330,6 +435,132 @@ fn op_download_subpackage(
     ))
 }
 
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use io::{
+        scheduler::IoScheduler,
+        task::{IoRequest, PriorityClass},
+    };
+    use shared::vfs::mount::MountTable;
+
+    use super::{
+        InstallSubpackageRequest, install_subpackage_blocking, install_subpackage_with_scheduler,
+    };
+
+    fn make_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("migo_base_subpkg_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn create_test_zip(dir: &std::path::Path) -> std::path::PathBuf {
+        let zip_path = dir.join("input.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("main.js", options).unwrap();
+        zip.write_all(b"console.log('subpackage')").unwrap();
+        zip.finish().unwrap();
+        zip_path
+    }
+
+    #[test]
+    fn subpackage_install_uses_scheduler_ingest_path() {
+        let dir = make_test_dir("scheduler_ingest");
+        let code_dir = dir.join("code");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&code_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let zip_path = create_test_zip(&dir);
+        let mount_table = Arc::new(MountTable::new(code_dir));
+        let scheduler = Arc::new(IoScheduler::new(37));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime
+            .block_on(install_subpackage_with_scheduler(
+                Arc::clone(&scheduler),
+                Arc::clone(&mount_table),
+                cache_dir.clone(),
+                InstallSubpackageRequest {
+                    zip_path: zip_path.to_string_lossy().into_owned(),
+                    pkg_key: "stage1".to_string(),
+                    root: "subpackages/stage1".to_string(),
+                    version: "1.0".to_string(),
+                    ensure_persistent: false,
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(
+            mount_table.read("subpackages/stage1/main.js").unwrap(),
+            b"console.log('subpackage')"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subpackage_install_finalize_work_stays_on_archive_worker() {
+        let dir = make_test_dir("scheduler_finalize");
+        let code_dir = dir.join("code");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&code_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let zip_path = create_test_zip(&dir);
+        let mount_table = Arc::new(MountTable::new(code_dir));
+        let scheduler = Arc::new(IoScheduler::new(47));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let worker_name = runtime
+            .block_on(scheduler.run_async(
+                IoRequest::PackageIngest {
+                    priority: PriorityClass::Background,
+                    compressed_bytes: 0,
+                },
+                {
+                    let mount_table = Arc::clone(&mount_table);
+                    let cache_dir = cache_dir.clone();
+                    let request = InstallSubpackageRequest {
+                        zip_path: zip_path.to_string_lossy().into_owned(),
+                        pkg_key: "stage2".to_string(),
+                        root: "subpackages/stage2".to_string(),
+                        version: "1.0".to_string(),
+                        ensure_persistent: false,
+                    };
+                    move || {
+                        install_subpackage_blocking(mount_table, cache_dir, request).unwrap();
+                        std::thread::current()
+                            .name()
+                            .unwrap_or("unnamed")
+                            .to_string()
+                    }
+                },
+            ))
+            .unwrap();
+
+        assert!(worker_name.contains("io-archive-host-47"));
+        assert_eq!(
+            mount_table.read("subpackages/stage2/main.js").unwrap(),
+            b"console.log('subpackage')"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Install a subpackage from a downloaded zip file.
 ///
 /// This is the new package-native install path:
@@ -346,8 +577,6 @@ async fn op_install_subpackage(
     state: std::rc::Rc<std::cell::RefCell<OpState>>,
     #[string] options_json: String,
 ) -> Result<String, deno_error::JsErrorBox> {
-    use shared::vfs::mount::StagingArea;
-
     #[derive(serde::Deserialize)]
     struct InstallOptions {
         #[serde(rename = "zipPath")]
@@ -368,9 +597,7 @@ async fn op_install_subpackage(
         .map_err(|e| deno_error::JsErrorBox::generic(format!("invalid install options: {e}")))?;
 
     let pkg_key = safe_package_key(&opts.name)
-        .map_err(|e| deno_error::JsErrorBox::generic(
-            format!("installSubpackage:fail {e}")
-        ))?;
+        .map_err(|e| deno_error::JsErrorBox::generic(format!("installSubpackage:fail {e}")))?;
 
     // Validate root: must be a valid relative path prefix for mount overlay.
     // Reject empty, absolute, traversal, control chars.
@@ -378,17 +605,18 @@ async fn op_install_subpackage(
         let root = opts.root.trim_matches('/');
         if root.is_empty() {
             return Err(deno_error::JsErrorBox::generic(
-                "installSubpackage:fail root is empty"
+                "installSubpackage:fail root is empty",
             ));
         }
         if root.contains("..") || root.contains('\\') || root.bytes().any(|b| b < 0x20) {
-            return Err(deno_error::JsErrorBox::generic(
-                format!("installSubpackage:fail invalid root: {}", opts.root)
-            ));
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "installSubpackage:fail invalid root: {}",
+                opts.root
+            )));
         }
     }
 
-    let (mount_table, game_cache_dir) = {
+    let (scheduler, mount_table, game_cache_dir) = {
         let st = state.borrow();
         let host = st.borrow::<HostOpState>();
 
@@ -398,79 +626,42 @@ async fn op_install_subpackage(
         if host.code_signing_enabled {
             return Err(deno_error::JsErrorBox::generic(
                 "installSubpackage:fail code signing is enabled; \
-                 dynamic subpackage download is not allowed"
+                 dynamic subpackage download is not allowed",
             ));
         }
 
         let mt = host.mount_table.clone().ok_or_else(|| {
             deno_error::JsErrorBox::generic("installSubpackage:fail mount table not initialized")
         })?;
-        let gcd = host.game_paths.as_ref()
+        let gcd = host
+            .game_paths
+            .as_ref()
             .map(|gp| gp.cache_dir().to_path_buf())
             .ok_or_else(|| {
                 deno_error::JsErrorBox::generic("installSubpackage:fail game paths not initialized")
             })?;
-        (mt, gcd)
+        (st.borrow::<IoSchedulerState>().0.clone(), mt, gcd)
     };
 
-    let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        use shared::vfs::mount::{PackageManifest, package_store_dir};
+    let version = if opts.version.is_empty() {
+        "1.0".to_string()
+    } else {
+        opts.version
+    };
 
-        let store = package_store_dir(&game_cache_dir);
-
-        // 1. Create staging area under per-game cache.
-        let staging = StagingArea::create(&game_cache_dir, &pkg_key)
-            .map_err(|e| format!("staging create failed: {e}"))?;
-
-        // 2. Ingest zip → .mpkg in staging.
-        let pkg_filename = format!("{}.mpkg", pkg_key);
-        let staged_pkg_path = staging.dir().join(&pkg_filename);
-        let version = if opts.version.is_empty() { "1.0".to_string() } else { opts.version };
-
-        io::ingest_zip_to_package(
-            std::path::Path::new(&opts.zip_path),
-            &staged_pkg_path,
-            &pkg_key,
-            &version,
-        )
-        .map_err(|e| format!("ingest failed: {e}"))?;
-
-        // 3. Atomic install: validate → rename → mount overlay.
-        let final_pkg_path = store.join(&pkg_filename);
-        let identity = staging
-            .install_package(
-                &mount_table,
-                &pkg_filename,
-                &final_pkg_path,
-                &opts.root,
-                &pkg_key,
-                &version,
-            )
-            .map_err(|e| format!("install failed: {e}"))?;
-
-        // 4. Write manifest (per-game persistence).
-        let mut manifest = PackageManifest::load(&store);
-        manifest.record(pkg_key, opts.root, identity.version.clone());
-        if let Err(e) = manifest.save(&store) {
-            if opts.ensure_persistent {
-                // preDownloadSubpackage: caller expects durable install.
-                // Package is live for current session but won't survive restart.
-                // Report failure so JS knows predownload didn't fully succeed.
-                return Err(format!("manifest write failed (not durably installed): {e}"));
-            }
-            // loadSubpackage: package is live, manifest loss is non-fatal.
-            tracing::warn!("subpackage manifest write failed (package still live): {e}");
-        }
-
-        Ok(serde_json::json!({
-            "name": identity.name,
-            "version": identity.version,
-            "checksum": identity.checksum,
-        })
-        .to_string())
-    })
+    let result = install_subpackage_with_scheduler(
+        scheduler,
+        mount_table,
+        game_cache_dir,
+        InstallSubpackageRequest {
+            zip_path: opts.zip_path,
+            pkg_key,
+            root: opts.root,
+            version,
+            ensure_persistent: opts.ensure_persistent,
+        },
+    )
     .await
-    .map_err(|e| deno_error::JsErrorBox::generic(format!("install task error: {e}")))?
     .map_err(deno_error::JsErrorBox::generic)?;
 
     Ok(result)
@@ -481,7 +672,10 @@ async fn op_install_subpackage(
 #[bigint]
 fn op_get_mount_generation(state: &mut OpState) -> u64 {
     let host = state.borrow::<HostOpState>();
-    host.mount_table.as_ref().map(|mt| mt.generation()).unwrap_or(0)
+    host.mount_table
+        .as_ref()
+        .map(|mt| mt.generation())
+        .unwrap_or(0)
 }
 
 /// Get the identity of the overlay covering a subpackage root.
@@ -490,10 +684,7 @@ fn op_get_mount_generation(state: &mut OpState) -> u64 {
 /// string if the path is served by the base code tree.
 #[op2]
 #[string]
-fn op_get_subpackage_identity(
-    state: &mut OpState,
-    #[string] root: &str,
-) -> String {
+fn op_get_subpackage_identity(state: &mut OpState, #[string] root: &str) -> String {
     let host = state.borrow::<HostOpState>();
     match &host.mount_table {
         Some(mt) => mt.overlay_identity_for(root),
@@ -513,7 +704,9 @@ fn op_is_subpackage_persisted(
     #[string] root: &str,
 ) -> bool {
     let host = state.borrow::<HostOpState>();
-    let Some(game_paths) = &host.game_paths else { return false; };
+    let Some(game_paths) = &host.game_paths else {
+        return false;
+    };
     let store = shared::vfs::mount::package_store_dir(game_paths.cache_dir());
     let manifest = shared::vfs::mount::PackageManifest::load(&store);
 
@@ -539,12 +732,11 @@ fn op_is_subpackage_persisted(
 /// (either as an installed .mpkg overlay or as files in the base code tree).
 /// Used by JS to skip download when the subpackage is already present.
 #[op2(fast)]
-fn op_is_subpackage_installed(
-    state: &mut OpState,
-    #[string] root: &str,
-) -> bool {
+fn op_is_subpackage_installed(state: &mut OpState, #[string] root: &str) -> bool {
     let host = state.borrow::<HostOpState>();
-    let Some(mt) = &host.mount_table else { return false; };
+    let Some(mt) = &host.mount_table else {
+        return false;
+    };
 
     // Check if any entry point candidate exists in the mount view.
     let candidates = [
@@ -582,6 +774,7 @@ deno_core::extension!(
         "02_async.js",
         "03_gc.js",
         "04_subpackage.js",
+        "05_perf.js",
     ],
     options = {
         options: HostOpState,

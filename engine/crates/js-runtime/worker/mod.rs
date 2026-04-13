@@ -149,7 +149,8 @@ impl deno_core::ModuleLoader for WorkerModuleLoader {
         hash: u64,
         code_cache: &[u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
-        self.inner.code_cache_ready(module_specifier, hash, code_cache)
+        self.inner
+            .code_cache_ready(module_specifier, hash, code_cache)
     }
 }
 
@@ -238,7 +239,6 @@ async fn op_worker_create(
 
         // Create dummy channels for services the worker does not use
         let (render_tx, _render_rx) = shared::render_command_sender::CommandSender::new();
-        let (io_tx, _io_rx) = mpsc::unbounded_channel();
         let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
         // Workers don't send audio commands in practice, but the type
         // system requires an AudioSender.  Use a no-op ThreadWakeup.
@@ -254,7 +254,6 @@ async fn op_worker_create(
             vfs: host.vfs.clone(),
             mount_table: host.mount_table.clone(),
             render_tx,
-            io_tx,
             audio_tx,
             host_tx: host.host_tx.clone(),
             device_services: None,
@@ -286,7 +285,13 @@ async fn op_worker_create(
         "[Worker] spawning worker thread for script: {}",
         script_path
     );
-    let join_handle = spawn_worker_thread(script_path, code_dir, worker_ctx, worker_host_state, sab_store)?;
+    let join_handle = spawn_worker_thread(
+        script_path,
+        code_dir,
+        worker_ctx,
+        worker_host_state,
+        sab_store,
+    )?;
     info!("[Worker] worker thread spawned, storing handle");
 
     // Store handle in main OpState
@@ -585,13 +590,14 @@ pub fn worker_inner_extensions(ctx: WorkerCtx) -> Vec<Extension> {
 /// This gives workers the same shared APIs as the main thread.
 pub fn create_worker_runtime_extensions(ctx: WorkerCtx, host_state: HostOpState) -> Vec<Extension> {
     use crate::{
-        base, console, env, event, file, network, rendering, url, utility, web,
+        base, console, env, event, file, io_state, network, rendering, url, utility, web,
         worker_runtime,
     };
 
     let mut exts: Vec<Extension> = Vec::new();
 
     exts.extend(base::base_extensions(host_state));
+    exts.extend(io_state::io_state_extensions());
     exts.extend(console::console_extensions());
     exts.extend(event::event_extensions());
     exts.extend(utility::utility_extensions());

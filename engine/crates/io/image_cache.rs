@@ -8,10 +8,10 @@
 //! unchanged.
 
 use lru::LruCache;
-use std::sync::LazyLock;
 use parking_lot::Mutex;
 use shared::protocol::io_cmd::NormalizedImage;
 use std::num::NonZeroUsize;
+use std::sync::LazyLock;
 
 /// Default maximum cache size: 64 MB
 const DEFAULT_MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -100,6 +100,11 @@ impl ImageCache {
                 None
             }
         }
+    }
+
+    /// Check whether an image key is currently cached without affecting hit/miss stats.
+    pub fn contains(&self, key: &ImageCacheKey) -> bool {
+        self.cache.contains(key)
     }
 
     /// Insert an image into cache.

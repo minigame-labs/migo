@@ -24,8 +24,6 @@ const cancelAnimationFrame = (id) => {
 
 async function _startRafLoop() {
     try {
-        // Consecutive frames with zero RAF callbacks before we stop the loop.
-        // The loop restarts on the next requestAnimationFrame() call.
         let idleFrames = 0;
         const MAX_IDLE_FRAMES = 3;
 
@@ -38,8 +36,6 @@ async function _startRafLoop() {
             let shouldStop = false;
 
             if (ids.length === 0) {
-                // No callbacks registered -- stop loop after a grace period
-                // to avoid restart churn if a callback is re-registered next frame.
                 if (++idleFrames >= MAX_IDLE_FRAMES) {
                     shouldStop = true;
                 }
@@ -49,13 +45,17 @@ async function _startRafLoop() {
                     try {
                         callbacks[ids[i]](ts);
                     } catch (e) {
-                        console.error(`RAF callback error: ${errorToString(e)}`);
+                        console.error('RAF callback error: ' + errorToString(e));
                     }
+                }
+
+                if (globalThis.__migo_frame_end_all) {
+                    globalThis.__migo_frame_end_all();
                 }
             }
 
-            // Flush all batched canvas commands at end of frame.
-            if (globalThis.__migo_frame_end_all) {
+            // Flush outside profiling block for idle frames
+            if (ids.length === 0 && globalThis.__migo_frame_end_all) {
                 globalThis.__migo_frame_end_all();
             }
 

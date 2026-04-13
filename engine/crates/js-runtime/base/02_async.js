@@ -7,13 +7,29 @@
 // - Always returns a Promise (supports both callback and await patterns).
 // - On success: calls success(res), complete(res), resolves with res.
 // - On failure: calls fail(res), complete(res), rejects with res.
+import { _perf } from "ext:host_v8_base/05_perf.js";
+
 function wrapAsync(apiName, fn, options) {
     const { success, fail, complete } = options || {};
+    const profiling = _perf.enabled;
+    const t0 = profiling ? performance.now() : 0;
     try {
         const result = fn();
+        if (profiling) {
+            const syncElapsed = performance.now() - t0;
+            if (syncElapsed >= _perf.syncMs) {
+                console.warn('[MigoPerf][Sync] ' + apiName + ': ' + syncElapsed.toFixed(1) + 'ms');
+            }
+        }
         const p = (result instanceof Promise) ? result : Promise.resolve(result);
         return p.then(
             function (value) {
+                if (profiling) {
+                    const totalElapsed = performance.now() - t0;
+                    if (totalElapsed >= _perf.asyncMs) {
+                        console.warn('[MigoPerf][Async] ' + apiName + ': ' + totalElapsed.toFixed(0) + 'ms');
+                    }
+                }
                 const res = (typeof value === 'object' && value !== null)
                     ? { errMsg: apiName + ':ok', ...value }
                     : { errMsg: apiName + ':ok' };
@@ -22,6 +38,12 @@ function wrapAsync(apiName, fn, options) {
                 return res;
             },
             function (e) {
+                if (profiling) {
+                    const totalElapsed = performance.now() - t0;
+                    if (totalElapsed >= _perf.asyncMs) {
+                        console.warn('[MigoPerf][Async] ' + apiName + ' (fail): ' + totalElapsed.toFixed(0) + 'ms');
+                    }
+                }
                 const res = { errMsg: apiName + ':fail ' + (e.message || String(e)) };
                 if (typeof fail === 'function') fail(res);
                 if (typeof complete === 'function') complete(res);
@@ -97,6 +119,12 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
 
     function _settleEntry(entry, parsed) {
         if (entry._timer) clearTimeout(entry._timer);
+        if (entry._t0) {
+            var elapsed = performance.now() - entry._t0;
+            if (elapsed >= _perf.deferredMs) {
+                console.warn('[MigoPerf][Deferred] ' + apiName + ': ' + elapsed.toFixed(0) + 'ms');
+            }
+        }
         if (parsed.error) {
             var res = { errMsg: parsed.error };
             if (parsed.errCode !== undefined) res.errCode = parsed.errCode;
@@ -131,6 +159,7 @@ function createDeferredApi(apiName, defaultTimeoutMs) {
                 fail: fail,
                 complete: complete,
                 _timer: 0,
+                _t0: _perf.enabled ? performance.now() : 0,
             };
             _pending.set(requestId, pendingEntry);
 

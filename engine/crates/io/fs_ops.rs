@@ -1,0 +1,1529 @@
+//! Synchronous file-system operations.
+//!
+//! Each function uses blocking `std::fs` calls.  Called directly on
+//! the V8 thread (for sync ops) or via `tokio::spawn_blocking`
+//! (for async ops).
+
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    time::Instant,
+};
+
+#[cfg(feature = "zip-extract")]
+use shared::protocol::io_cmd::ZipEntryResult;
+use shared::{
+    error::{EngineError, ErrorCode, io_error_to_error_code},
+    protocol::io_cmd::{
+        FileId, FileStat, MAX_READ_LENGTH, OpenFlag, SavedFileInfo, StatEntry, StatResult,
+        WriteMode,
+    },
+    vfs::MountTable,
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn io_err(e: std::io::Error) -> EngineError {
+    let detail = e.to_string();
+    let code = io_error_to_error_code(&e);
+    EngineError::new(code).with_detail(detail)
+}
+
+#[inline]
+fn code_err(code: ErrorCode) -> EngineError {
+    EngineError::new(code)
+}
+
+#[inline]
+fn trace_fs_edge(op: &str, target: &str, started_at: Instant, detail: &str) {
+    tracing::info!(
+        "[IOTrace] {} {}us target={} {}",
+        op,
+        started_at.elapsed().as_micros(),
+        target,
+        detail
+    );
+}
+
+#[inline]
+fn build_stat(meta: std::fs::Metadata) -> FileStat {
+    let mode = get_mode(&meta);
+    let size = meta.len();
+
+    let atime = meta
+        .accessed()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    FileStat {
+        mode,
+        size,
+        atime,
+        mtime,
+        is_file: meta.is_file(),
+        is_directory: meta.is_dir(),
+    }
+}
+
+#[inline]
+fn get_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.mode()
+    }
+    #[cfg(not(unix))]
+    {
+        if meta.permissions().readonly() {
+            0o444
+        } else {
+            0o666
+        }
+    }
+}
+
+/// Read from a `std::io::Read` with an upper bound on total bytes.
+fn read_to_end_limited<R: Read>(
+    reader: &mut R,
+    max_len: u64,
+    context: &str,
+) -> Result<Vec<u8>, EngineError> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf).map_err(io_err)?;
+        if n == 0 {
+            break;
+        }
+        let next_len = out.len().saturating_add(n);
+        if next_len as u64 > max_len {
+            return Err(EngineError::new(ErrorCode::InvalidArgument)
+                .with_detail(format!("{context} exceeds limit {}", max_len)));
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
+}
+
+/// Read from a zip entry with position/length support.
+fn read_zip_entry_limited<R: Read>(
+    reader: &mut R,
+    total_size: u64,
+    position: Option<u64>,
+    length: Option<u64>,
+) -> Result<Vec<u8>, EngineError> {
+    let start = position.unwrap_or(0).min(total_size);
+    if let Some(len) = length {
+        if len > MAX_READ_LENGTH {
+            return Err(
+                EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
+                    "read length {} exceeds limit {}",
+                    len, MAX_READ_LENGTH
+                )),
+            );
+        }
+    }
+    let effective = length.unwrap_or_else(|| total_size.saturating_sub(start));
+    if effective > MAX_READ_LENGTH {
+        return Err(
+            EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
+                "zip entry size {} exceeds limit {}",
+                effective, MAX_READ_LENGTH
+            )),
+        );
+    }
+
+    let mut skipped = 0u64;
+    let mut scratch = [0u8; 8192];
+    while skipped < start {
+        let want = (start - skipped).min(scratch.len() as u64) as usize;
+        let n = reader.read(&mut scratch[..want]).map_err(io_err)?;
+        if n == 0 {
+            break;
+        }
+        skipped += n as u64;
+    }
+
+    let mut out = Vec::new();
+    while (out.len() as u64) < effective {
+        let want = (effective - out.len() as u64).min(scratch.len() as u64) as usize;
+        let n = reader.read(&mut scratch[..want]).map_err(io_err)?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&scratch[..n]);
+    }
+    Ok(out)
+}
+
+/// Compute a digest hex string from in-memory bytes.
+fn compute_digest(data: &[u8], algorithm: &str) -> Result<String, EngineError> {
+    use digest::Digest;
+    match algorithm {
+        "md5" => Ok(hex::encode(md5::Md5::digest(data))),
+        "sha1" => Ok(hex::encode(sha1::Sha1::digest(data))),
+        "sha256" => Ok(hex::encode(sha2::Sha256::digest(data))),
+        _ => Err(EngineError::new(ErrorCode::InvalidArgument)
+            .with_detail(format!("unsupported digestAlgorithm: {algorithm}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FileTable: manages open file descriptors
+// ---------------------------------------------------------------------------
+
+/// Manages open file descriptors with ID allocation, temporary file cleanup,
+/// and optional synthetic stat data.
+pub struct FileTable {
+    next_id: FileId,
+    free_ids: Vec<FileId>,
+    files: HashMap<FileId, std::fs::File>,
+    temp_files: HashMap<FileId, PathBuf>,
+    synthetic_stats: HashMap<FileId, FileStat>,
+}
+
+impl FileTable {
+    /// Initial capacity for the file handle map.
+    const INITIAL_FILE_CAPACITY: usize = 8;
+
+    pub fn new() -> Self {
+        Self {
+            next_id: 3, // 0,1,2 reserved for stdio
+            free_ids: Vec::new(),
+            files: HashMap::with_capacity(Self::INITIAL_FILE_CAPACITY),
+            temp_files: HashMap::new(),
+            synthetic_stats: HashMap::new(),
+        }
+    }
+
+    fn alloc_id(&mut self) -> Result<FileId, EngineError> {
+        if let Some(id) = self.free_ids.pop() {
+            return Ok(id);
+        }
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| EngineError::new(ErrorCode::ExceedMaxConcurrentFdLimit))?;
+        Ok(id)
+    }
+
+    /// Open a file and return a file descriptor ID.
+    pub fn open(
+        &mut self,
+        path: &str,
+        flag: OpenFlag,
+        cleanup_path: Option<PathBuf>,
+        synthetic_stat: Option<FileStat>,
+    ) -> Result<FileId, EngineError> {
+        let mut opts = std::fs::OpenOptions::new();
+
+        match flag {
+            OpenFlag::Read => {
+                opts.read(true);
+            }
+            OpenFlag::ReadWrite => {
+                opts.read(true).write(true);
+            }
+            OpenFlag::WriteTruncateCreate => {
+                opts.write(true).create(true).truncate(true);
+            }
+            OpenFlag::ReadWriteTruncateCreate => {
+                opts.read(true).write(true).create(true).truncate(true);
+            }
+            OpenFlag::AppendCreate => {
+                opts.append(true).create(true);
+            }
+            OpenFlag::ReadAppendCreate => {
+                opts.read(true).append(true).create(true);
+            }
+            OpenFlag::AppendExclusive => {
+                opts.append(true).create_new(true);
+            }
+            OpenFlag::ReadAppendExclusive => {
+                opts.read(true).append(true).create_new(true);
+            }
+            OpenFlag::AppendSyncCreate => {
+                // 'as' - sync hint; treated as append+create
+                opts.append(true).create(true);
+            }
+            OpenFlag::ReadAppendSyncCreate => {
+                // 'as+' - sync hint; treated as read+append+create
+                opts.read(true).append(true).create(true);
+            }
+            OpenFlag::WriteExclusive => {
+                opts.write(true).create_new(true);
+            }
+            OpenFlag::ReadWriteExclusive => {
+                opts.read(true).write(true).create_new(true);
+            }
+        }
+
+        let file = opts.open(path).map_err(io_err)?;
+        let id = self.alloc_id()?;
+        self.files.insert(id, file);
+        if let Some(path) = cleanup_path {
+            self.temp_files.insert(id, path);
+        }
+        if let Some(stat) = synthetic_stat {
+            self.synthetic_stats.insert(id, stat);
+        }
+        Ok(id)
+    }
+
+    fn close_with_cleanup_inner(&mut self, id: FileId) -> Result<Option<PathBuf>, EngineError> {
+        self.files
+            .remove(&id)
+            .map(|file| {
+                drop(file);
+                let cleanup_path = self.temp_files.remove(&id);
+                if let Some(path) = cleanup_path.as_ref() {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.synthetic_stats.remove(&id);
+                self.free_ids.push(id);
+                cleanup_path
+            })
+            .ok_or_else(|| code_err(ErrorCode::BadFileDescriptor))
+    }
+
+    /// Close a file descriptor. Removes temp files and returns the ID to the pool.
+    pub fn close(&mut self, id: FileId) -> Result<(), EngineError> {
+        self.close_with_cleanup_inner(id).map(|_| ())
+    }
+
+    pub fn close_with_cleanup(&mut self, id: FileId) -> Result<Option<PathBuf>, EngineError> {
+        self.close_with_cleanup_inner(id)
+    }
+
+    /// Read up to `len` bytes from a file descriptor, optionally seeking first.
+    pub fn read(
+        &mut self,
+        id: FileId,
+        len: u64,
+        position: Option<u64>,
+    ) -> Result<Vec<u8>, EngineError> {
+        if len > MAX_READ_LENGTH {
+            return Err(
+                EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
+                    "read length {} exceeds limit {}",
+                    len, MAX_READ_LENGTH
+                )),
+            );
+        }
+
+        let file = self
+            .files
+            .get_mut(&id)
+            .ok_or_else(|| code_err(ErrorCode::BadFileDescriptor))?;
+
+        if let Some(pos) = position {
+            file.seek(SeekFrom::Start(pos)).map_err(io_err)?;
+        }
+
+        let mut buf = vec![0u8; len as usize];
+        let mut total = 0;
+        while total < buf.len() {
+            match file.read(&mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) => return Err(io_err(e)),
+            }
+        }
+        buf.truncate(total);
+        Ok(buf)
+    }
+
+    /// Write data to a file descriptor, optionally seeking first.
+    pub fn write(
+        &mut self,
+        id: FileId,
+        data: &[u8],
+        position: Option<u64>,
+    ) -> Result<usize, EngineError> {
+        let file = self
+            .files
+            .get_mut(&id)
+            .ok_or_else(|| code_err(ErrorCode::BadFileDescriptor))?;
+
+        if let Some(pos) = position {
+            file.seek(SeekFrom::Start(pos)).map_err(io_err)?;
+        }
+
+        file.write_all(data).map_err(io_err)?;
+        Ok(data.len())
+    }
+
+    /// Get file stat for a file descriptor (synthetic stat if available).
+    pub fn fstat(&self, id: FileId) -> Result<FileStat, EngineError> {
+        match self.synthetic_stats.get(&id) {
+            Some(stat) => Ok(stat.clone()),
+            None => match self.files.get(&id) {
+                Some(file) => {
+                    let meta = file.metadata().map_err(io_err)?;
+                    Ok(build_stat(meta))
+                }
+                None => Err(code_err(ErrorCode::BadFileDescriptor)),
+            },
+        }
+    }
+
+    /// Truncate (or extend) a file descriptor to the given length.
+    pub fn ftruncate(&mut self, id: FileId, len: u64) -> Result<(), EngineError> {
+        let file = self
+            .files
+            .get_mut(&id)
+            .ok_or_else(|| code_err(ErrorCode::BadFileDescriptor))?;
+
+        file.set_len(len).map_err(io_err)?;
+
+        // Best-effort move cursor to end.
+        let _ = file.seek(SeekFrom::End(0));
+        Ok(())
+    }
+
+    /// Close all open file descriptors and clean up temp files.
+    pub fn close_all(&mut self) {
+        self.files.clear();
+        for (_, path) in self.temp_files.drain() {
+            let _ = std::fs::remove_file(path);
+        }
+        self.synthetic_stats.clear();
+        self.free_ids.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free functions: file stat / meta (9)
+// ---------------------------------------------------------------------------
+
+/// Check whether a path is accessible and return basic metadata.
+/// Returns `(is_file, is_dir, size)`.
+pub fn access(path: &str) -> Result<(bool, bool, u64), EngineError> {
+    let m = std::fs::metadata(path).map_err(io_err)?;
+    Ok((m.is_file(), m.is_dir(), m.len()))
+}
+
+/// Get file/directory stat. If `recursive` is true and the path is a
+/// directory, returns stats for all files beneath it.
+pub fn stat(path: &str, recursive: bool) -> Result<StatResult, EngineError> {
+    if !recursive {
+        let meta = std::fs::metadata(path).map_err(io_err)?;
+        return Ok(StatResult::Single(build_stat(meta)));
+    }
+    stat_dir_recursive(PathBuf::from(path))
+}
+
+/// Recursive directory stat (sync version).
+fn stat_dir_recursive(root: PathBuf) -> Result<StatResult, EngineError> {
+    let root_meta = std::fs::metadata(&root).map_err(io_err)?;
+    if root_meta.is_file() {
+        return Ok(StatResult::Single(build_stat(root_meta)));
+    }
+
+    // BTreeMap for automatic sorting by key.
+    let mut out: BTreeMap<String, FileStat> = BTreeMap::new();
+    let mut stack: Vec<PathBuf> = vec![root.clone()];
+
+    while let Some(dir) = stack.pop() {
+        let rd = std::fs::read_dir(&dir).map_err(io_err)?;
+
+        for entry_result in rd {
+            let entry = entry_result.map_err(io_err)?;
+            let path = entry.path();
+            let ft = entry.file_type().map_err(io_err)?;
+
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                let meta = entry.metadata().map_err(io_err)?;
+                let stat = build_stat(meta);
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.insert(rel, stat);
+            }
+        }
+    }
+
+    // BTreeMap iteration is already sorted by key.
+    Ok(StatResult::Recursive(
+        out.into_iter()
+            .map(|(path, stat)| StatEntry { path, stat })
+            .collect(),
+    ))
+}
+
+/// Create a directory (optionally recursive).
+pub fn mkdir(dir_path: &str, recursive: bool) -> Result<(), EngineError> {
+    if recursive {
+        std::fs::create_dir_all(dir_path).map_err(io_err)
+    } else {
+        std::fs::create_dir(dir_path).map_err(io_err)
+    }
+}
+
+/// List direct children of a directory, sorted.
+pub fn readdir(dir_path: &str) -> Result<Vec<String>, EngineError> {
+    let mut entries = Vec::new();
+    let rd = std::fs::read_dir(dir_path).map_err(io_err)?;
+    for entry_result in rd {
+        let entry = entry_result.map_err(io_err)?;
+        if let Some(name) = entry.file_name().to_str() {
+            entries.push(name.to_string());
+        }
+    }
+    entries.sort_unstable();
+    Ok(entries)
+}
+
+/// Rename (move) a file or directory.
+pub fn rename(old_path: &str, new_path: &str) -> Result<(), EngineError> {
+    std::fs::rename(old_path, new_path).map_err(io_err)
+}
+
+/// Remove a directory (optionally recursive).
+pub fn rmdir(dir_path: &str, recursive: bool) -> Result<(), EngineError> {
+    if recursive {
+        std::fs::remove_dir_all(dir_path).map_err(io_err)
+    } else {
+        std::fs::remove_dir(dir_path).map_err(io_err)
+    }
+}
+
+/// Copy a file.
+pub fn copy(src_path: &str, dest_path: &str) -> Result<(), EngineError> {
+    let started_at = Instant::now();
+    let result = std::fs::copy(src_path, dest_path)
+        .map(|_| ())
+        .map_err(io_err);
+    match &result {
+        Ok(()) => trace_fs_edge("copy", dest_path, started_at, &format!("src={src_path}")),
+        Err(err) => trace_fs_edge(
+            "copy",
+            dest_path,
+            started_at,
+            &format!("src={src_path} err={err}"),
+        ),
+    }
+    result
+}
+
+pub fn copy_mount_entry_to_path(
+    mount_table: &MountTable,
+    relative_path: &str,
+    dest_path: &Path,
+) -> Result<(), EngineError> {
+    let started_at = Instant::now();
+    let result = match mount_table.copy_to_path(relative_path, dest_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dest_path)
+                .map_err(io_err)?;
+            let mut writer = std::io::BufWriter::new(file);
+            mount_table
+                .copy_to_writer(relative_path, &mut writer)
+                .map_err(io_err)?;
+            writer.flush().map_err(io_err)
+        }
+        Err(err) => Err(io_err(err)),
+    };
+    let target = dest_path.to_string_lossy();
+    match &result {
+        Ok(()) => trace_fs_edge(
+            "copy_mount_entry",
+            &target,
+            started_at,
+            &format!("entry={relative_path}"),
+        ),
+        Err(err) => trace_fs_edge(
+            "copy_mount_entry",
+            &target,
+            started_at,
+            &format!("entry={relative_path} err={err}"),
+        ),
+    }
+    result
+}
+
+pub fn materialize_mount_entry_to_temp(
+    mount_table: &MountTable,
+    relative_path: &str,
+    suffix: &str,
+) -> Result<PathBuf, EngineError> {
+    let started_at = Instant::now();
+    let mut dir = mount_table.code_dir();
+    let parent = dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    dir = parent.join(".migo-pack-materialized");
+    std::fs::create_dir_all(&dir).map_err(io_err)?;
+
+    for _ in 0..32 {
+        let mut path = dir.clone();
+        path.push(format!(
+            "pack_{}_{}{}",
+            std::process::id(),
+            next_temp_id(),
+            suffix
+        ));
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(io_err(err)),
+        };
+        drop(file);
+
+        match copy_mount_entry_to_path(mount_table, relative_path, &path) {
+            Ok(()) => {
+                trace_fs_edge(
+                    "materialize_mount_entry",
+                    &path.to_string_lossy(),
+                    started_at,
+                    &format!("entry={relative_path} suffix={suffix}"),
+                );
+                return Ok(path);
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&path);
+                trace_fs_edge(
+                    "materialize_mount_entry",
+                    &path.to_string_lossy(),
+                    started_at,
+                    &format!("entry={relative_path} suffix={suffix} err={err}"),
+                );
+                return Err(err);
+            }
+        }
+    }
+
+    Err(EngineError::new(ErrorCode::IoError)
+        .with_detail("failed to allocate unique temp file for pack materialization"))
+}
+
+fn next_temp_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// File reads (5)
+// ---------------------------------------------------------------------------
+
+/// Read a file (or a range within it). Enforces MAX_READ_LENGTH.
+pub fn read_file(
+    path: &str,
+    position: Option<u64>,
+    length: Option<u64>,
+) -> Result<Vec<u8>, EngineError> {
+    let started_at = Instant::now();
+    if let Some(len) = length {
+        if len > MAX_READ_LENGTH {
+            return Err(
+                EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
+                    "read length {} exceeds limit {}",
+                    len, MAX_READ_LENGTH
+                )),
+            );
+        }
+    }
+
+    let mut file = std::fs::File::open(path).map_err(io_err)?;
+
+    // When length is not specified, check that the remaining bytes from
+    // position to EOF don't exceed the limit.
+    if length.is_none() {
+        let meta = file.metadata().map_err(io_err)?;
+        let file_len = meta.len();
+        let remaining = file_len.saturating_sub(position.unwrap_or(0));
+        if remaining > MAX_READ_LENGTH {
+            return Err(
+                EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
+                    "remaining file size {} exceeds limit {}",
+                    remaining, MAX_READ_LENGTH
+                )),
+            );
+        }
+    }
+
+    // Seek to position if specified.
+    if let Some(pos) = position {
+        file.seek(SeekFrom::Start(pos)).map_err(io_err)?;
+    }
+
+    // Read specified length or rest of file.
+    let data = if let Some(len) = length {
+        let mut buf = vec![0u8; len as usize];
+        let mut total = 0;
+        while total < buf.len() {
+            match file.read(&mut buf[total..]) {
+                Ok(0) => break, // EOF
+                Ok(n) => total += n,
+                Err(e) => return Err(io_err(e)),
+            }
+        }
+        buf.truncate(total);
+        buf
+    } else {
+        read_file_to_end_limited(&mut file, MAX_READ_LENGTH)?
+    };
+
+    trace_fs_edge(
+        "read_file",
+        path,
+        started_at,
+        &format!(
+            "size={}B position={:?} length={:?}",
+            data.len(),
+            position,
+            length
+        ),
+    );
+    Ok(data)
+}
+
+/// Read the rest of an open file up to `max_len` bytes.
+fn read_file_to_end_limited(
+    file: &mut std::fs::File,
+    max_len: u64,
+) -> Result<Vec<u8>, EngineError> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf).map_err(io_err)?;
+        if n == 0 {
+            break;
+        }
+        let next_len = out.len().saturating_add(n);
+        if next_len as u64 > max_len {
+            return Err(EngineError::new(ErrorCode::InvalidArgument)
+                .with_detail(format!("remaining file size exceeds limit {}", max_len)));
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
+}
+
+/// Read and decompress a Brotli-compressed file.
+///
+/// If `pack_data` is `Some`, decompresses from the provided in-memory bytes
+/// instead of reading from `path`.
+#[cfg(feature = "compress-brotli")]
+pub fn read_compressed_file(
+    path: &str,
+    pack_data: Option<Vec<u8>>,
+) -> Result<Vec<u8>, EngineError> {
+    let source: Box<dyn Read> = match pack_data {
+        Some(data) => Box::new(std::io::Cursor::new(data)),
+        None => Box::new(std::io::BufReader::new(
+            std::fs::File::open(path).map_err(io_err)?,
+        )),
+    };
+    let mut reader = brotli::Decompressor::new(source, 4096);
+    read_to_end_limited(&mut reader, MAX_READ_LENGTH, "brotli output size")
+}
+
+/// Stub when Brotli feature is disabled.
+#[cfg(not(feature = "compress-brotli"))]
+pub fn read_compressed_file(
+    _path: &str,
+    _pack_data: Option<Vec<u8>>,
+) -> Result<Vec<u8>, EngineError> {
+    Err(EngineError::new(ErrorCode::IoError)
+        .with_detail("brotli decompression not available (compress-brotli feature disabled)"))
+}
+
+/// Read entries from a zip archive, returning per-entry results.
+///
+/// If `pack_data` is `Some`, reads from the provided in-memory bytes
+/// instead of the file at `zip_path`.
+#[cfg(feature = "zip-extract")]
+pub fn read_zip_entry(
+    zip_path: &str,
+    entries_json: &str,
+    pack_data: Option<Vec<u8>>,
+) -> Result<Vec<ZipEntryResult>, EngineError> {
+    match pack_data {
+        Some(data) => read_zip_entries_from_reader(std::io::Cursor::new(data), entries_json),
+        None => {
+            let file = std::fs::File::open(zip_path).map_err(io_err)?;
+            read_zip_entries_from_reader(std::io::BufReader::new(file), entries_json)
+        }
+    }
+}
+
+/// Stub when zip-extract feature is disabled.
+#[cfg(not(feature = "zip-extract"))]
+pub fn read_zip_entry(
+    _zip_path: &str,
+    _entries_json: &str,
+    _pack_data: Option<Vec<u8>>,
+) -> Result<Vec<shared::protocol::io_cmd::ZipEntryResult>, EngineError> {
+    Err(EngineError::new(ErrorCode::IoError)
+        .with_detail("readZipEntry not available (zip feature disabled)"))
+}
+
+#[cfg(feature = "zip-extract")]
+fn read_zip_entries_from_reader<R: Read + std::io::Seek>(
+    reader: R,
+    entries_json: &str,
+) -> Result<Vec<ZipEntryResult>, EngineError> {
+    use deno_core::serde_json;
+
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
+        EngineError::new(ErrorCode::IoError).with_detail(format!("invalid zip: {}", e))
+    })?;
+
+    let req: serde_json::Value = serde_json::from_str(entries_json).map_err(|e| {
+        EngineError::new(ErrorCode::InvalidArgument)
+            .with_detail(format!("invalid entries_json: {}", e))
+    })?;
+
+    let global_encoding = req
+        .get("encoding")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let entries_val = req.get("entries");
+
+    let read_all = entries_val
+        .and_then(|v| v.as_str())
+        .map(|s| s == "all")
+        .unwrap_or(false);
+
+    let mut results = Vec::new();
+
+    if read_all {
+        for i in 0..archive.len() {
+            let mut entry = match archive.by_index(i) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if entry.is_dir() {
+                continue;
+            }
+            let name = entry.name().to_string();
+            let entry_size = entry.size();
+            match read_zip_entry_limited(&mut entry, entry_size, None, None) {
+                Ok(buf) => {
+                    let data = encode_zip_data(&buf, global_encoding.as_deref());
+                    results.push(ZipEntryResult {
+                        path: name,
+                        data: Some(data),
+                        err_msg: String::new(),
+                    });
+                }
+                Err(e) => {
+                    results.push(ZipEntryResult {
+                        path: name,
+                        data: None,
+                        err_msg: e.to_string(),
+                    });
+                }
+            }
+        }
+    } else if let Some(arr) = entries_val.and_then(|v| v.as_array()) {
+        for item in arr {
+            let path = match item.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => continue,
+            };
+            let encoding = item
+                .get("encoding")
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .or(global_encoding.as_deref());
+            let position = item
+                .get("position")
+                .and_then(|v: &serde_json::Value| v.as_u64());
+            let length = item
+                .get("length")
+                .and_then(|v: &serde_json::Value| v.as_u64());
+
+            match archive.by_name(&path) {
+                Ok(mut entry) => {
+                    let entry_size = entry.size();
+                    match read_zip_entry_limited(&mut entry, entry_size, position, length) {
+                        Ok(buf) => {
+                            let data = encode_zip_data(&buf, encoding);
+                            results.push(ZipEntryResult {
+                                path,
+                                data: Some(data),
+                                err_msg: String::new(),
+                            });
+                        }
+                        Err(e) => {
+                            results.push(ZipEntryResult {
+                                path,
+                                data: None,
+                                err_msg: e.to_string(),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    results.push(ZipEntryResult {
+                        path,
+                        data: None,
+                        err_msg: format!("entry not found: {}", e),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+#[cfg(feature = "zip-extract")]
+fn encode_zip_data(data: &[u8], encoding: Option<&str>) -> String {
+    use base64::Engine;
+    match encoding {
+        // No encoding -> binary, return base64 for transport
+        None => base64::engine::general_purpose::STANDARD.encode(data),
+        Some(enc) => {
+            // Delegate to codec for full encoding coverage (utf8, utf16le, ucs2, etc.)
+            match shared::codec::decode_bytes(data, enc) {
+                Ok(s) => s,
+                // If codec doesn't support it, fall back to base64
+                Err(_) => base64::engine::general_purpose::STANDARD.encode(data),
+            }
+        }
+    }
+}
+
+/// List saved files (prefix-filtered readdir + stat).
+pub fn list_saved_files(
+    dir: &str,
+    prefix: &str,
+    virtual_dir: &str,
+) -> Result<Vec<SavedFileInfo>, EngineError> {
+    let mut file_list = Vec::new();
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(file_list);
+        }
+        Err(e) => return Err(io_err(e)),
+    };
+    for entry_result in rd {
+        let entry = entry_result.map_err(io_err)?;
+        let name = match entry.file_name().to_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            file_list.push(SavedFileInfo {
+                file_path: format!("{}/{}", virtual_dir, name),
+                size: meta.len(),
+                create_time: mtime,
+            });
+        }
+    }
+    Ok(file_list)
+}
+
+// ---------------------------------------------------------------------------
+// File writes (5)
+// ---------------------------------------------------------------------------
+
+/// Write data to a file (overwrite or append).
+pub fn write_file(path: &str, data: &[u8], mode: WriteMode) -> Result<bool, EngineError> {
+    match mode {
+        WriteMode::Overwrite => std::fs::write(path, data).map(|_| true).map_err(io_err),
+        WriteMode::Append => {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(io_err)?;
+            file.write_all(data).map(|_| true).map_err(io_err)
+        }
+    }
+}
+
+/// Write from a byte slice (placeholder for V8 SharedRef path).
+///
+/// In the current IO-channel model, `WriteShared` copies bytes out of V8
+/// BackingStore before crossing the thread boundary.  For direct-call mode
+/// the caller will have already performed the copy, so this function just
+/// delegates to `write_file`.
+pub fn write_shared(path: &str, data: &[u8], mode: WriteMode) -> Result<bool, EngineError> {
+    write_file(path, data, mode)
+}
+
+/// Delete a file.
+pub fn unlink(file_path: &str) -> Result<(), EngineError> {
+    std::fs::remove_file(file_path).map_err(io_err)
+}
+
+// ---------------------------------------------------------------------------
+// File hash (1)
+// ---------------------------------------------------------------------------
+
+/// Compute file size + digest in a single pass (streaming, 8 KB buffer).
+///
+/// If `pack_data` is `Some`, computes from the provided bytes instead of
+/// reading from `path`.
+pub fn get_file_info(
+    path: &str,
+    algorithm: &str,
+    pack_data: Option<Vec<u8>>,
+) -> Result<(u64, String), EngineError> {
+    if let Some(data) = pack_data {
+        let digest_hex = compute_digest(&data, algorithm)?;
+        return Ok((data.len() as u64, digest_hex));
+    }
+
+    use digest::Digest;
+
+    let meta = std::fs::metadata(path).map_err(io_err)?;
+    let size = meta.len();
+
+    // For small files, read all at once.
+    if size <= 4 * 1024 * 1024 {
+        let data = std::fs::read(path).map_err(io_err)?;
+        let digest_hex = compute_digest(&data, algorithm)?;
+        return Ok((size, digest_hex));
+    }
+
+    // For large files, stream to avoid loading everything into memory.
+    let mut file = std::io::BufReader::new(std::fs::File::open(path).map_err(io_err)?);
+    let mut buf = [0u8; 8192];
+
+    macro_rules! hash_loop {
+        ($hasher:expr) => {{
+            let mut h = $hasher;
+            loop {
+                let n = file.read(&mut buf).map_err(io_err)?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+            }
+            hex::encode(h.finalize())
+        }};
+    }
+
+    let digest_hex = match algorithm {
+        "md5" => hash_loop!(md5::Md5::new()),
+        "sha1" => hash_loop!(sha1::Sha1::new()),
+        "sha256" => hash_loop!(sha2::Sha256::new()),
+        _ => {
+            return Err(EngineError::new(ErrorCode::InvalidArgument)
+                .with_detail(format!("unsupported digestAlgorithm: {algorithm}")));
+        }
+    };
+
+    Ok((size, digest_hex))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::{self, Write as _},
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use shared::vfs::{MountBackend, MountTable};
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("migo_fsops_{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[derive(Debug)]
+    struct WriterOnlyBackend {
+        data: Vec<u8>,
+        writer_calls: Arc<AtomicUsize>,
+    }
+
+    impl MountBackend for WriterOnlyBackend {
+        fn read(&self, _relative_path: &str) -> io::Result<Vec<u8>> {
+            Ok(self.data.clone())
+        }
+
+        fn exists(&self, _relative_path: &str) -> bool {
+            true
+        }
+
+        fn real_path(&self, _relative_path: &str) -> Option<PathBuf> {
+            None
+        }
+
+        fn root_dir(&self) -> Option<&Path> {
+            None
+        }
+
+        fn copy_to_writer(
+            &self,
+            _relative_path: &str,
+            writer: &mut dyn io::Write,
+        ) -> io::Result<()> {
+            self.writer_calls.fetch_add(1, Ordering::SeqCst);
+            writer.write_all(&self.data)
+        }
+
+        fn is_file(&self, relative_path: &str) -> bool {
+            relative_path == "overlay.txt"
+        }
+    }
+
+    #[test]
+    fn copy_mount_entry_to_path_falls_back_to_writer_when_path_copy_is_unsupported() {
+        let dir = tmp_dir("mount_copy_fallback");
+        let base = dir.join("base");
+        let dest = dir.join("dest.txt");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mount_table = MountTable::new(base);
+        let writer_calls = Arc::new(AtomicUsize::new(0));
+        assert!(mount_table.mount_overlay(
+            "overlay".to_string(),
+            String::new(),
+            Arc::new(WriterOnlyBackend {
+                data: b"from-writer".to_vec(),
+                writer_calls: Arc::clone(&writer_calls),
+            }),
+        ));
+
+        copy_mount_entry_to_path(&mount_table, "overlay.txt", &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"from-writer");
+        assert_eq!(writer_calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_table_open_close() {
+        let dir = tmp_dir("ft_open_close");
+        let path = dir.join("test.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let mut ft = FileTable::new();
+        let id = ft
+            .open(path.to_str().unwrap(), OpenFlag::Read, None, None)
+            .unwrap();
+        assert!(id >= 3);
+
+        let stat = ft.fstat(id).unwrap();
+        assert!(stat.is_file);
+        assert_eq!(stat.size, 5);
+
+        ft.close(id).unwrap();
+        assert!(ft.close(id).is_err()); // double close
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_table_read_write() {
+        let dir = tmp_dir("ft_rw");
+        let path = dir.join("rw.txt");
+
+        let mut ft = FileTable::new();
+        let wid = ft
+            .open(
+                path.to_str().unwrap(),
+                OpenFlag::WriteTruncateCreate,
+                None,
+                None,
+            )
+            .unwrap();
+        ft.write(wid, b"abcdef", None).unwrap();
+        ft.close(wid).unwrap();
+
+        let rid = ft
+            .open(path.to_str().unwrap(), OpenFlag::Read, None, None)
+            .unwrap();
+        let data = ft.read(rid, 6, None).unwrap();
+        assert_eq!(&data, b"abcdef");
+
+        // partial read with position
+        let data2 = ft.read(rid, 3, Some(2)).unwrap();
+        assert_eq!(&data2, b"cde");
+
+        ft.close(rid).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_table_ftruncate() {
+        let dir = tmp_dir("ft_trunc");
+        let path = dir.join("trunc.txt");
+        std::fs::write(&path, b"0123456789").unwrap();
+
+        let mut ft = FileTable::new();
+        let id = ft
+            .open(path.to_str().unwrap(), OpenFlag::ReadWrite, None, None)
+            .unwrap();
+        ft.ftruncate(id, 5).unwrap();
+        let stat = ft.fstat(id).unwrap();
+        assert_eq!(stat.size, 5);
+        ft.close(id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_table_temp_cleanup() {
+        let dir = tmp_dir("ft_temp");
+        let path = dir.join("temp.txt");
+        std::fs::write(&path, b"temp").unwrap();
+        assert!(path.exists());
+
+        let mut ft = FileTable::new();
+        let id = ft
+            .open(
+                path.to_str().unwrap(),
+                OpenFlag::Read,
+                Some(path.clone()),
+                None,
+            )
+            .unwrap();
+        ft.close(id).unwrap();
+        assert!(!path.exists()); // temp file removed on close
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn access_existing_file() {
+        let dir = tmp_dir("access_file");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, b"x").unwrap();
+
+        let (is_file, is_dir, size) = access(path.to_str().unwrap()).unwrap();
+        assert!(is_file);
+        assert!(!is_dir);
+        assert_eq!(size, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn access_missing_file() {
+        assert!(access("/nonexistent_path_fsops_test").is_err());
+    }
+
+    #[test]
+    fn stat_single_file() {
+        let dir = tmp_dir("stat_single");
+        let path = dir.join("s.txt");
+        std::fs::write(&path, b"stat").unwrap();
+
+        let result = stat(path.to_str().unwrap(), false).unwrap();
+        match result {
+            StatResult::Single(s) => {
+                assert!(s.is_file);
+                assert_eq!(s.size, 4);
+            }
+            _ => panic!("expected Single"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stat_recursive() {
+        let dir = tmp_dir("stat_rec");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join("a.txt"), b"aa").unwrap();
+        std::fs::write(sub.join("b.txt"), b"bbb").unwrap();
+
+        let result = stat(dir.to_str().unwrap(), true).unwrap();
+        match result {
+            StatResult::Recursive(entries) => {
+                assert_eq!(entries.len(), 2);
+                // sorted: a.txt before sub/b.txt
+                assert_eq!(entries[0].path, "a.txt");
+                assert!(entries[1].path.contains("b.txt"));
+            }
+            _ => panic!("expected Recursive"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readdir_sorted() {
+        let dir = tmp_dir("readdir_sorted");
+        std::fs::write(dir.join("c.txt"), b"").unwrap();
+        std::fs::write(dir.join("a.txt"), b"").unwrap();
+        std::fs::write(dir.join("b.txt"), b"").unwrap();
+
+        let entries = readdir(dir.to_str().unwrap()).unwrap();
+        assert_eq!(entries, vec!["a.txt", "b.txt", "c.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mkdir_and_rmdir() {
+        let dir = tmp_dir("mkdir_rm");
+        let nested = dir.join("a/b/c");
+
+        mkdir(nested.to_str().unwrap(), true).unwrap();
+        assert!(nested.is_dir());
+
+        rmdir(dir.join("a").to_str().unwrap(), true).unwrap();
+        assert!(!dir.join("a").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_file() {
+        let dir = tmp_dir("rename_f");
+        let src = dir.join("old.txt");
+        let dst = dir.join("new.txt");
+        std::fs::write(&src, b"data").unwrap();
+
+        rename(src.to_str().unwrap(), dst.to_str().unwrap()).unwrap();
+        assert!(!src.exists());
+        assert!(dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_file() {
+        let dir = tmp_dir("copy_f");
+        let src = dir.join("src.txt");
+        let dst = dir.join("dst.txt");
+        std::fs::write(&src, b"copy_me").unwrap();
+
+        copy(src.to_str().unwrap(), dst.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"copy_me");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_basic() {
+        let dir = tmp_dir("rf_basic");
+        let path = dir.join("r.txt");
+        std::fs::write(&path, b"0123456789").unwrap();
+
+        // Full read
+        let data = read_file(path.to_str().unwrap(), None, None).unwrap();
+        assert_eq!(&data, b"0123456789");
+
+        // Partial read with position + length
+        let data2 = read_file(path.to_str().unwrap(), Some(3), Some(4)).unwrap();
+        assert_eq!(&data2, b"3456");
+
+        // Read from position to end
+        let data3 = read_file(path.to_str().unwrap(), Some(7), None).unwrap();
+        assert_eq!(&data3, b"789");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_overwrite_and_append() {
+        let dir = tmp_dir("wf_modes");
+        let path = dir.join("w.txt");
+
+        write_file(path.to_str().unwrap(), b"hello", WriteMode::Overwrite).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+
+        write_file(path.to_str().unwrap(), b" world", WriteMode::Append).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
+
+        write_file(path.to_str().unwrap(), b"new", WriteMode::Overwrite).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unlink_file() {
+        let dir = tmp_dir("unlink_f");
+        let path = dir.join("del.txt");
+        std::fs::write(&path, b"bye").unwrap();
+
+        unlink(path.to_str().unwrap()).unwrap();
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_file_info_md5() {
+        let dir = tmp_dir("fi_md5");
+        let path = dir.join("hash.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let (size, digest) = get_file_info(path.to_str().unwrap(), "md5", None).unwrap();
+        assert_eq!(size, 5);
+        assert_eq!(digest, "5d41402abc4b2a76b9719d911017c592");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_file_info_from_pack_data() {
+        let (size, digest) =
+            get_file_info("unused_path", "sha256", Some(b"test".to_vec())).unwrap();
+        assert_eq!(size, 4);
+        assert_eq!(
+            digest,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+    }
+
+    #[test]
+    fn get_file_info_unsupported_algo() {
+        let dir = tmp_dir("fi_unsup");
+        let path = dir.join("algo.txt");
+        std::fs::write(&path, b"x").unwrap();
+
+        let err = get_file_info(path.to_str().unwrap(), "crc32", None).unwrap_err();
+        assert!(err.to_string().contains("unsupported"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_saved_files_filters_prefix() {
+        let dir = tmp_dir("lsf");
+        std::fs::write(dir.join("game_save1.dat"), b"a").unwrap();
+        std::fs::write(dir.join("game_save2.dat"), b"bb").unwrap();
+        std::fs::write(dir.join("other.dat"), b"ccc").unwrap();
+        std::fs::create_dir(dir.join("game_subdir")).unwrap();
+
+        let files = list_saved_files(dir.to_str().unwrap(), "game_save", "/user").unwrap();
+        assert_eq!(files.len(), 2);
+        for f in &files {
+            assert!(f.file_path.starts_with("/user/game_save"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_saved_files_missing_dir() {
+        let files = list_saved_files("/nonexistent_lsf_dir", "", "/virtual").unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn read_to_end_limited_rejects_oversized() {
+        let mut reader = std::io::Cursor::new(vec![1u8; 16]);
+        let err = read_to_end_limited(&mut reader, 8, "test size").unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn read_zip_entry_limited_respects_remaining() {
+        let mut reader = std::io::Cursor::new(vec![7u8; 32]);
+        let err =
+            read_zip_entry_limited(&mut reader, MAX_READ_LENGTH + 16, Some(4), None).unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"));
+
+        let mut ok_reader = std::io::Cursor::new(vec![9u8; 16]);
+        let data = read_zip_entry_limited(&mut ok_reader, 16, Some(8), None).unwrap();
+        assert_eq!(data, vec![9u8; 8]);
+    }
+
+    #[test]
+    fn read_zip_entry_limited_rejects_explicit_oversized_length() {
+        let mut reader = std::io::Cursor::new(vec![0u8; 8]);
+        let err =
+            read_zip_entry_limited(&mut reader, 8, Some(0), Some(MAX_READ_LENGTH + 1)).unwrap_err();
+        assert!(err.to_string().contains("read length"));
+    }
+
+    #[test]
+    fn file_table_close_all() {
+        let dir = tmp_dir("ft_close_all");
+        let p1 = dir.join("a.txt");
+        let p2 = dir.join("b.txt");
+        std::fs::write(&p1, b"1").unwrap();
+        std::fs::write(&p2, b"2").unwrap();
+
+        let mut ft = FileTable::new();
+        let id1 = ft
+            .open(p1.to_str().unwrap(), OpenFlag::Read, None, None)
+            .unwrap();
+        let _id2 = ft
+            .open(p2.to_str().unwrap(), OpenFlag::Read, None, None)
+            .unwrap();
+        ft.close_all();
+
+        // After close_all, nothing should be accessible.
+        assert!(ft.fstat(id1).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_table_synthetic_stat() {
+        let dir = tmp_dir("ft_synth");
+        let path = dir.join("syn.txt");
+        std::fs::write(&path, b"x").unwrap();
+
+        let synth = FileStat {
+            mode: 0o777,
+            size: 999,
+            atime: 100,
+            mtime: 200,
+            is_file: true,
+            is_directory: false,
+        };
+
+        let mut ft = FileTable::new();
+        let id = ft
+            .open(
+                path.to_str().unwrap(),
+                OpenFlag::Read,
+                None,
+                Some(synth.clone()),
+            )
+            .unwrap();
+
+        // Should return synthetic stat, not real.
+        let s = ft.fstat(id).unwrap();
+        assert_eq!(s.size, 999);
+        assert_eq!(s.mtime, 200);
+
+        ft.close(id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

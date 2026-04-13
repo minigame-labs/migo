@@ -8,9 +8,27 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tracing::{debug, error, trace, warn};
 use zip::ZipArchive;
+
+use crate::{
+    pools::PoolError,
+    scheduler::IoScheduler,
+    task::{BackendKind, IoRequest, PriorityClass},
+};
+
+fn unzip_request_for(zip_path: &Path) -> IoRequest {
+    let compressed_bytes = std::fs::metadata(zip_path)
+        .map(|meta| meta.len() as usize)
+        .unwrap_or(0);
+    IoRequest::Unzip {
+        backend: BackendKind::Archive,
+        priority: PriorityClass::Background,
+        compressed_bytes,
+    }
+}
 
 /// Error type for zip operations
 #[derive(Debug)]
@@ -50,6 +68,14 @@ impl From<io::Error> for ZipError {
 impl From<zip::result::ZipError> for ZipError {
     fn from(e: zip::result::ZipError) -> Self {
         ZipError::InvalidArchive(e.to_string())
+    }
+}
+
+impl From<PoolError> for ZipError {
+    fn from(err: PoolError) -> Self {
+        match err {
+            PoolError::Closed => ZipError::Io(io::Error::other("IO worker pool closed")),
+        }
     }
 }
 
@@ -112,10 +138,7 @@ pub fn extract_zip(
         // A malicious zip could contain symlinks pointing outside the
         // extraction directory, which would bypass VFS containment.
         if file.is_symlink() {
-            error!(
-                "extract_zip: symlink entry rejected: {}",
-                file_name
-            );
+            error!("extract_zip: symlink entry rejected: {}", file_name);
             return Err(ZipError::PathTraversal(format!(
                 "symlink entry not allowed: {}",
                 file_name
@@ -157,7 +180,9 @@ pub fn extract_zip(
                         // directory we cannot verify containment, so reject.
                         error!(
                             "extract_zip: cannot canonicalize parent {}: {} — rejecting entry {}",
-                            parent.display(), e, file_name
+                            parent.display(),
+                            e,
+                            file_name
                         );
                         return Err(ZipError::PathTraversal(format!(
                             "cannot verify ancestor directory: {}",
@@ -238,27 +263,44 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// Extract zip file asynchronously (runs in a blocking thread pool).
 ///
 /// This is the preferred method for use with async runtimes.
-pub async fn extract_zip_async(
+pub async fn extract_zip_with_scheduler(
+    scheduler: Arc<IoScheduler>,
     zip_path: PathBuf,
     dest_dir: PathBuf,
     progress_tx: Option<tokio::sync::mpsc::Sender<(f32, usize, usize)>>,
 ) -> Result<(), ZipError> {
-    tokio::task::spawn_blocking(move || {
-        let progress: Option<ProgressCallback> = progress_tx.map(|tx| {
-            Box::new(move |prog: f32, current: usize, total: usize| {
-                let _ = tx.blocking_send((prog, current, total));
-            }) as ProgressCallback
-        });
+    let request = unzip_request_for(&zip_path);
 
-        extract_zip(&zip_path, &dest_dir, progress)
-    })
-    .await
-    .map_err(|e| ZipError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?
+    scheduler
+        .run_async(request, move || {
+            let progress: Option<ProgressCallback> = progress_tx.map(|tx| {
+                Box::new(move |prog: f32, current: usize, total: usize| {
+                    let _ = tx.blocking_send((prog, current, total));
+                }) as ProgressCallback
+            });
+
+            extract_zip(&zip_path, &dest_dir, progress)
+        })
+        .await
+        .map_err(ZipError::from)?
+}
+
+pub async fn extract_zip_async(
+    scheduler: Arc<IoScheduler>,
+    zip_path: PathBuf,
+    dest_dir: PathBuf,
+    progress_tx: Option<tokio::sync::mpsc::Sender<(f32, usize, usize)>>,
+) -> Result<(), ZipError> {
+    extract_zip_with_scheduler(scheduler, zip_path, dest_dir, progress_tx).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use crate::scheduler::IoScheduler;
 
     #[test]
     fn test_normalize_path() {
@@ -279,5 +321,97 @@ mod tests {
         // The normalized path should NOT start with /tmp/dest
         let dest_canonical = dest.to_path_buf(); // Simplified for test
         assert!(!normalized.starts_with(&dest_canonical));
+    }
+
+    #[test]
+    fn unzip_requests_use_archive_pool() {
+        let dir =
+            std::env::temp_dir().join(format!("migo_zip_extract_scheduler_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let zip_path = dir.join("input.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("hello.txt", options).unwrap();
+        zip.write_all(b"hello archive").unwrap();
+        zip.finish().unwrap();
+
+        let dest_dir = dir.join("out");
+        let scheduler = Arc::new(IoScheduler::new(31));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime
+            .block_on(extract_zip_with_scheduler(
+                Arc::clone(&scheduler),
+                zip_path.clone(),
+                dest_dir.clone(),
+                None,
+            ))
+            .unwrap();
+
+        assert_eq!(scheduler.pools().spawned_pool_count(), 1);
+        assert_eq!(
+            std::fs::read(dest_dir.join("hello.txt")).unwrap(),
+            b"hello archive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unzip_requests_default_to_background_priority() {
+        let request = unzip_request_for(Path::new("/tmp/archive.zip"));
+        match request {
+            IoRequest::Unzip { priority, .. } => {
+                assert_eq!(priority, PriorityClass::Background);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_zip_async_uses_provided_scheduler() {
+        let dir =
+            std::env::temp_dir().join(format!("migo_zip_extract_async_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let zip_path = dir.join("input.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("hello.txt", options).unwrap();
+        zip.write_all(b"hello archive async").unwrap();
+        zip.finish().unwrap();
+
+        let dest_dir = dir.join("out");
+        let scheduler = Arc::new(IoScheduler::new(43));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime
+            .block_on(extract_zip_async(
+                Arc::clone(&scheduler),
+                zip_path.clone(),
+                dest_dir.clone(),
+                None,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(dest_dir.join("hello.txt")).unwrap(),
+            b"hello archive async"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

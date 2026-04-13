@@ -4,10 +4,35 @@
 //! and converted to the runtime-native package format for mounted access.
 
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use shared::protocol::io_cmd::MAX_READ_LENGTH;
 use shared::vfs::package::{PackageError, PackageIdentity, PackageWriter};
+
+use crate::{
+    pools::PoolError,
+    scheduler::IoScheduler,
+    task::{IoRequest, PriorityClass},
+};
+
+fn package_ingest_request_for(zip_path: &Path) -> IoRequest {
+    let compressed_bytes = std::fs::metadata(zip_path)
+        .map(|meta| meta.len() as usize)
+        .unwrap_or(0);
+    IoRequest::PackageIngest {
+        priority: PriorityClass::Background,
+        compressed_bytes,
+    }
+}
+
+impl From<PoolError> for PackageError {
+    fn from(err: PoolError) -> Self {
+        match err {
+            PoolError::Closed => PackageError::Io(std::io::Error::other("IO worker pool closed")),
+        }
+    }
+}
 
 /// Convert a zip archive into a `.mpkg` package file (zstd-chunked).
 ///
@@ -93,6 +118,22 @@ pub fn ingest_zip_to_package(
     Ok(identity)
 }
 
+pub async fn ingest_zip_to_package_with_scheduler(
+    scheduler: Arc<IoScheduler>,
+    zip_path: PathBuf,
+    pkg_path: PathBuf,
+    package_name: String,
+    package_version: String,
+) -> Result<PackageIdentity, PackageError> {
+    let request = package_ingest_request_for(&zip_path);
+
+    scheduler
+        .run_async(request, move || {
+            ingest_zip_to_package(&zip_path, &pkg_path, &package_name, &package_version)
+        })
+        .await
+        .map_err(PackageError::from)?
+}
 
 #[cfg(test)]
 mod tests {
@@ -133,13 +174,7 @@ mod tests {
         let zip_path = create_test_zip(&dir);
         let pkg_path = dir.join("output.mpkg");
 
-        let identity = ingest_zip_to_package(
-            &zip_path,
-            &pkg_path,
-            "test-game",
-            "1.0.0",
-        )
-        .unwrap();
+        let identity = ingest_zip_to_package(&zip_path, &pkg_path, "test-game", "1.0.0").unwrap();
 
         assert_eq!(identity.name, "test-game");
         assert_eq!(identity.version, "1.0.0");
@@ -166,13 +201,7 @@ mod tests {
         let zip_path = create_test_zip(&dir);
         let pkg_path = dir.join("output.mpkg");
 
-        let _identity = ingest_zip_to_package(
-            &zip_path,
-            &pkg_path,
-            "test-game",
-            "1.0.0",
-        )
-        .unwrap();
+        let _identity = ingest_zip_to_package(&zip_path, &pkg_path, "test-game", "1.0.0").unwrap();
 
         let reader =
             shared::vfs::package::PackageReader::open(&pkg_path, "test-game", "1.0.0").unwrap();
@@ -191,9 +220,19 @@ mod tests {
     }
 
     #[test]
+    fn package_ingest_requests_default_to_background_priority() {
+        let request = package_ingest_request_for(Path::new("/tmp/archive.zip"));
+        match request {
+            IoRequest::PackageIngest { priority, .. } => {
+                assert_eq!(priority, PriorityClass::Background);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
     fn ingest_full_install_flow() {
         use shared::vfs::mount::{MountTable, StagingArea};
-        use shared::vfs::MountBackend;
 
         let dir = make_test_dir("ingest_install");
         let code_dir = dir.join("code");
@@ -285,7 +324,14 @@ mod tests {
             let staged_pkg = staging.dir().join(pkg_filename);
             ingest_zip_to_package(&zip_v1, &staged_pkg, "stage1", "1.0").unwrap();
             staging
-                .install_package(&mt, pkg_filename, &final_pkg_path, "sub/stage1", "stage1", "1.0")
+                .install_package(
+                    &mt,
+                    pkg_filename,
+                    &final_pkg_path,
+                    "sub/stage1",
+                    "stage1",
+                    "1.0",
+                )
                 .unwrap();
         }
 
@@ -301,7 +347,14 @@ mod tests {
             let staged_pkg = staging.dir().join(pkg_filename);
             ingest_zip_to_package(&zip_v2, &staged_pkg, "stage1", "2.0").unwrap();
             staging
-                .install_package(&mt, pkg_filename, &final_pkg_path, "sub/stage1", "stage1", "2.0")
+                .install_package(
+                    &mt,
+                    pkg_filename,
+                    &final_pkg_path,
+                    "sub/stage1",
+                    "stage1",
+                    "2.0",
+                )
                 .unwrap();
         }
 
@@ -309,7 +362,10 @@ mod tests {
         let data = mt.read("sub/stage1/game.js").unwrap();
         assert_eq!(data, b"// version 2");
         assert!(mt.exists("sub/stage1/new_asset.png"));
-        assert!(mt.generation() > gen_v1, "generation must increase after replace");
+        assert!(
+            mt.generation() > gen_v1,
+            "generation must increase after replace"
+        );
 
         // Base still accessible.
         std::fs::write(code_dir.join("base.js"), "// base").unwrap();
@@ -349,7 +405,14 @@ mod tests {
             let staged_pkg = staging.dir().join(pkg_filename);
             ingest_zip_to_package(&zip_v1, &staged_pkg, "stage1", "1.0").unwrap();
             staging
-                .install_package(&mt, pkg_filename, &final_pkg_path, "sub/stage1", "stage1", "1.0")
+                .install_package(
+                    &mt,
+                    pkg_filename,
+                    &final_pkg_path,
+                    "sub/stage1",
+                    "stage1",
+                    "1.0",
+                )
                 .unwrap();
         }
 
@@ -380,7 +443,9 @@ mod tests {
 
     #[test]
     fn manifest_restore_across_sessions() {
-        use shared::vfs::mount::{MountTable, StagingArea, PackageManifest, package_store_dir, restore_installed_packages};
+        use shared::vfs::mount::{
+            MountTable, PackageManifest, StagingArea, package_store_dir, restore_installed_packages,
+        };
 
         let dir = make_test_dir("manifest_restore");
         let code_dir = dir.join("code");
@@ -397,7 +462,16 @@ mod tests {
             let staging = StagingArea::create(&game_cache_dir, "stage1").unwrap();
             let staged_pkg = staging.dir().join("stage1.mpkg");
             ingest_zip_to_package(&zip_path, &staged_pkg, "stage1", "1.0").unwrap();
-            staging.install_package(&mt, "stage1.mpkg", &store.join("stage1.mpkg"), "subpackages/stage1", "stage1", "1.0").unwrap();
+            staging
+                .install_package(
+                    &mt,
+                    "stage1.mpkg",
+                    &store.join("stage1.mpkg"),
+                    "subpackages/stage1",
+                    "stage1",
+                    "1.0",
+                )
+                .unwrap();
 
             // Write manifest.
             let mut manifest = PackageManifest::load(&store);
@@ -405,7 +479,10 @@ mod tests {
             manifest.save(&store).unwrap();
 
             // Verify readable in session 1.
-            assert_eq!(mt.read("subpackages/stage1/main.js").unwrap(), b"console.log('hello')");
+            assert_eq!(
+                mt.read("subpackages/stage1/main.js").unwrap(),
+                b"console.log('hello')"
+            );
         }
         // Session 1 ends — MountTable dropped.
 
@@ -419,7 +496,10 @@ mod tests {
             restore_installed_packages(&mt, &game_cache_dir, false);
 
             // Now the subpackage is visible again!
-            assert_eq!(mt.read("subpackages/stage1/main.js").unwrap(), b"console.log('hello')");
+            assert_eq!(
+                mt.read("subpackages/stage1/main.js").unwrap(),
+                b"console.log('hello')"
+            );
             assert!(mt.exists("subpackages/stage1/lib/utils.js"));
         }
 
@@ -442,7 +522,10 @@ mod tests {
 
         // No overlay, no package store — but the base DirSource covers it.
         assert!(mt.exists("subpackages/stage1/game.js"));
-        assert_eq!(mt.read("subpackages/stage1/game.js").unwrap(), b"// stage1 game");
+        assert_eq!(
+            mt.read("subpackages/stage1/game.js").unwrap(),
+            b"// stage1 game"
+        );
 
         // loadSubpackage's _tryLocalExecute would call amdRequire which
         // calls op_require_resolve_and_read which goes through MountTable.
@@ -453,7 +536,7 @@ mod tests {
 
     #[test]
     fn predownload_then_load_no_redownload() {
-        use shared::vfs::mount::{MountTable, StagingArea, PackageManifest, package_store_dir, restore_installed_packages};
+        use shared::vfs::mount::{MountTable, PackageManifest, StagingArea, package_store_dir};
 
         let dir = make_test_dir("predownload");
         let code_dir = dir.join("code");
@@ -469,7 +552,16 @@ mod tests {
             let staging = StagingArea::create(&game_cache_dir, "stage1").unwrap();
             let staged_pkg = staging.dir().join("stage1.mpkg");
             ingest_zip_to_package(&zip_path, &staged_pkg, "stage1", "1.0").unwrap();
-            staging.install_package(&mt, "stage1.mpkg", &store.join("stage1.mpkg"), "subpackages/stage1", "stage1", "1.0").unwrap();
+            staging
+                .install_package(
+                    &mt,
+                    "stage1.mpkg",
+                    &store.join("stage1.mpkg"),
+                    "subpackages/stage1",
+                    "stage1",
+                    "1.0",
+                )
+                .unwrap();
 
             let mut manifest = PackageManifest::load(&store);
             manifest.record("stage1".into(), "subpackages/stage1".into(), "1.0".into());
@@ -479,7 +571,10 @@ mod tests {
         // loadSubpackage: should find it already mounted, no download needed.
         // (In the real JS flow, _tryLocalExecute would succeed here.)
         assert!(mt.exists("subpackages/stage1/main.js"));
-        assert_eq!(mt.read("subpackages/stage1/main.js").unwrap(), b"console.log('hello')");
+        assert_eq!(
+            mt.read("subpackages/stage1/main.js").unwrap(),
+            b"console.log('hello')"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

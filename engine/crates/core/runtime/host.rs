@@ -7,8 +7,8 @@ use std::{
     time::Instant,
 };
 
-use deno_core::serde_json::Value;
 use deno_core::ModuleLoader;
+use deno_core::serde_json::Value;
 use tracing::{error, info, warn};
 
 use shared::{
@@ -23,7 +23,7 @@ use shared::{
 
 use crate::{
     runtime::{HostId, code_cache, loader::MyModuleLoader, vsync},
-    services::{AudioService, IoService, PlatformServices, RenderService},
+    services::{AudioService, PlatformServices, RenderService},
 };
 
 use js_runtime::HostJsRuntime;
@@ -82,7 +82,6 @@ impl std::ops::DerefMut for JsRuntimeSlot {
 pub(crate) struct Host {
     pub(crate) id: HostId,
 
-    pub(crate) io: IoService,
     pub(crate) audio: AudioService,
     pub(crate) render: RenderService,
 
@@ -121,9 +120,15 @@ impl Drop for Host {
             "[Host {}] dropping host, shutting down services...",
             self.id
         );
+        let js_drop_started = Instant::now();
+        self.js.take_and_drop();
+        info!(
+            "[Host {}] JsRuntime drop during shutdown: {:.1}ms",
+            self.id,
+            js_drop_started.elapsed().as_secs_f64() * 1000.0
+        );
         self.render.shutdown();
         self.audio.shutdown();
-        self.io.shutdown();
         vsync::unregister_vsync_sender(self.id);
         // NOTE: stats lifecycle is owned by the render thread — it registers
         // on entry and unregisters on all exit paths (Shutdown, channel close,
@@ -160,9 +165,6 @@ impl Host {
         vsync::register_vsync_sender(id, vsync_tx);
 
         // ---- Services ----
-        // IoService only creates the channel here; the handler task
-        // is spawned later inside `runtime.block_on()` by `spawn_handler()`.
-        let io = IoService::new();
         // AudioService is lazy — no thread spawned until the first
         // real audio command.  Saves ~80 ms on cold start.
         let audio = AudioService::new(host_tx.clone());
@@ -185,14 +187,18 @@ impl Host {
             shared::device::gpu_caps::GpuCapsReadyState::Failed(detail) => {
                 render.shutdown_detached();
                 vsync::unregister_vsync_sender(id);
-                return Err(shared::error::EngineError::new(shared::error::ErrorCode::Render2DInitError)
-                    .with_detail(detail));
+                return Err(shared::error::EngineError::new(
+                    shared::error::ErrorCode::Render2DInitError,
+                )
+                .with_detail(detail));
             }
             shared::device::gpu_caps::GpuCapsReadyState::Timeout => {
                 render.shutdown_detached();
                 vsync::unregister_vsync_sender(id);
-                return Err(shared::error::EngineError::new(shared::error::ErrorCode::Timeout)
-                    .with_detail("render thread did not publish GPU caps within 2 seconds"));
+                return Err(
+                    shared::error::EngineError::new(shared::error::ErrorCode::Timeout)
+                        .with_detail("render thread did not publish GPU caps within 2 seconds"),
+                );
             }
         }
 
@@ -221,13 +227,12 @@ impl Host {
         let host_state = HostOpState {
             id,
             code_dir: None,
-            game_paths: None,    // Set when evaluating a module
-            vfs: None,           // Set when evaluating a module
-            mount_table: None,   // Set when evaluating a module
+            game_paths: None,  // Set when evaluating a module
+            vfs: None,         // Set when evaluating a module
+            mount_table: None, // Set when evaluating a module
             app_cache_dir: init_options.cache_dir().to_path_buf(),
             app_files_dir: init_options.files_dir().to_path_buf(),
             render_tx: render.sender(),
-            io_tx: io.sender(),
             audio_tx: audio.sender(),
             host_tx: host_tx.clone(),
             device_services,
@@ -253,9 +258,12 @@ impl Host {
 
         // SharedMountTableRef: created here, shared with the module loader
         // and HostJsRuntime. evaluate_module() populates it later.
-        let loader_mount_ref: js_runtime::SharedMountTableRef = Rc::new(std::cell::RefCell::new(None));
-        let module_loader: Option<Rc<dyn ModuleLoader>> =
-            Some(Rc::new(MyModuleLoader::new(Some(shared_cache.clone()), loader_mount_ref.clone())));
+        let loader_mount_ref: js_runtime::SharedMountTableRef =
+            Rc::new(std::cell::RefCell::new(None));
+        let module_loader: Option<Rc<dyn ModuleLoader>> = Some(Rc::new(MyModuleLoader::new(
+            Some(shared_cache.clone()),
+            loader_mount_ref.clone(),
+        )));
 
         let ext_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>> =
             Some(code_cache::ExtCodeCacheAdapter::new(shared_cache));
@@ -265,7 +273,7 @@ impl Host {
 
         let t_services = Instant::now();
         info!(
-            "[Host {}] services init: {:.1}ms (render + IO + audio channels)",
+            "[Host {}] services init: {:.1}ms (render + audio channels)",
             id,
             t_services.duration_since(t_start).as_secs_f64() * 1000.0
         );
@@ -323,7 +331,6 @@ impl Host {
         Ok(Self {
             id,
             render,
-            io,
             audio,
             js: JsRuntimeSlot::new(js),
             raf_rx,
@@ -429,8 +436,11 @@ impl Host {
 
             HostCommand::OnTouch(touch) => {
                 let count = (touch.count as usize).min(touch.points.len());
-                self.js
-                    .dispatch_touch(touch.touch_type, &touch.points[..count], touch.timestamp_ms);
+                self.js.dispatch_touch(
+                    touch.touch_type,
+                    &touch.points[..count],
+                    touch.timestamp_ms,
+                );
                 Ok(())
             }
 
@@ -649,8 +659,7 @@ impl Host {
                 event_type,
                 data,
             } => {
-                self.js
-                    .dispatch_video_event(video_id, &event_type, &data);
+                self.js.dispatch_video_event(video_id, &event_type, &data);
                 Ok(())
             }
 
@@ -765,7 +774,6 @@ impl Host {
             app_cache_dir: cache_dir,
             app_files_dir: files_dir,
             render_tx: self.render.sender(),
-            io_tx: self.io.sender(),
             audio_tx: self.audio.sender(),
             host_tx: self.host_tx.clone(),
             device_services,
@@ -784,9 +792,12 @@ impl Host {
         // ---- Code cache (V8 bytecode persistence) ----
         let shared_cache = code_cache::create_code_cache(self.init_options.cache_dir());
 
-        let loader_mount_ref: js_runtime::SharedMountTableRef = Rc::new(std::cell::RefCell::new(None));
-        let module_loader: Option<Rc<dyn ModuleLoader>> =
-            Some(Rc::new(MyModuleLoader::new(Some(shared_cache.clone()), loader_mount_ref.clone())));
+        let loader_mount_ref: js_runtime::SharedMountTableRef =
+            Rc::new(std::cell::RefCell::new(None));
+        let module_loader: Option<Rc<dyn ModuleLoader>> = Some(Rc::new(MyModuleLoader::new(
+            Some(shared_cache.clone()),
+            loader_mount_ref.clone(),
+        )));
 
         let ext_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>> =
             Some(code_cache::ExtCodeCacheAdapter::new(shared_cache));
@@ -801,7 +812,9 @@ impl Host {
             let _ = self
                 .render
                 .sender()
-                .send(RenderCommand::Canvas(CanvasCmd::DestroyImage { image_id: shared_id }));
+                .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
+                    image_id: shared_id,
+                }));
         }
         io::global_cache().clear();
 
@@ -820,7 +833,13 @@ impl Host {
         // "Cannot create a handle without a HandleScope" crash — the old
         // isolate's cleanup handler can't create a HandleScope when v8's
         // thread-local state was modified by the new isolate's initialization.
+        let js_drop_started = Instant::now();
         self.js.take_and_drop();
+        info!(
+            "[Host {}] JsRuntime drop during restart: {:.1}ms",
+            self.id,
+            js_drop_started.elapsed().as_secs_f64() * 1000.0
+        );
         let mut new_js = HostJsRuntime::new(
             self.id as i32,
             host_state,
@@ -864,7 +883,9 @@ impl Host {
 
         // If we have a last evaluated module, reload it. Even if re-evaluation
         // fails, resume render/audio below so the session doesn't stay paused.
-        let reload_result = if let (Some(game_id), Some(entry)) = (self.last_game_id.clone(), self.last_entry.clone()) {
+        let reload_result = if let (Some(game_id), Some(entry)) =
+            (self.last_game_id.clone(), self.last_entry.clone())
+        {
             self.on_evaluate_module(game_id, entry).await
         } else {
             Ok(())

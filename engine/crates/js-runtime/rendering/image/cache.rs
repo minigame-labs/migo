@@ -1,8 +1,10 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::oneshot;
+
+pub type LoadResult = Result<(ImageCacheKey, u32, (usize, usize)), String>;
 
 /// Independent counter for shared image IDs.
 /// Starts from a high range to reduce collision risk with caller image IDs
@@ -53,8 +55,7 @@ pub struct ImageCache {
     shared_to_key: HashMap<u32, ImageCacheKey>,
 
     // in-flight loads: key -> list of waiters
-    loading_map:
-        HashMap<ImageCacheKey, Vec<oneshot::Sender<Result<(u32, (usize, usize)), String>>>>,
+    loading_map: HashMap<ImageCacheKey, Vec<oneshot::Sender<LoadResult>>>,
     // image ids waiting on an in-flight load; used to prevent destroy-before-
     // completion from resurrecting aliases and refcounts.
     pending_alias_to_key: HashMap<u32, ImageCacheKey>,
@@ -62,7 +63,7 @@ pub struct ImageCache {
 
 pub enum BeginLoadResult {
     AlreadyLoaded((u32, (usize, usize))),
-    Join(oneshot::Receiver<Result<(u32, (usize, usize)), String>>),
+    Join(oneshot::Receiver<LoadResult>),
     StartLoading,
 }
 
@@ -135,18 +136,26 @@ impl ImageCache {
 
     /// Called by *joiners* after they got (shared_id, dims), to ensure alias/ref is correct
     /// even if JS does not replace image_id.
-    pub fn bind_alias_existing(&mut self, image_id: u32, key: &ImageCacheKey, shared_id: u32) {
-        match self.pending_alias_to_key.remove(&image_id) {
-            Some(pending_key) if &pending_key == key => {}
+    pub fn bind_alias_existing(
+        &mut self,
+        image_id: u32,
+        requested_key: &ImageCacheKey,
+        actual_key: &ImageCacheKey,
+        shared_id: u32,
+    ) {
+        match self.pending_alias_to_key.get(&image_id) {
+            Some(pending_key) if pending_key == requested_key => {
+                self.pending_alias_to_key.remove(&image_id);
+            }
             _ => return,
         }
-        if let Some(entry) = self.by_src.get_mut(key) {
+        if let Some(entry) = self.by_src.get_mut(actual_key) {
             // entry should exist already
             entry.refs = entry.refs.saturating_add(1);
             self.alias_to_shared.insert(image_id, shared_id);
             self.shared_to_key
                 .entry(shared_id)
-                .or_insert_with(|| key.clone());
+                .or_insert_with(|| actual_key.clone());
         }
     }
 
@@ -161,10 +170,11 @@ impl ImageCache {
         &mut self,
         loader_image_id: u32,
         shared_id: u32,
-        key: &ImageCacheKey,
+        requested_key: &ImageCacheKey,
+        actual_key: &ImageCacheKey,
         res: Result<(usize, usize), String>,
     ) -> Option<u32> {
-        let Some(waiters) = self.loading_map.remove(key) else {
+        let Some(waiters) = self.loading_map.remove(requested_key) else {
             return None;
         };
 
@@ -175,13 +185,37 @@ impl ImageCache {
                 let pending_refs = self
                     .pending_alias_to_key
                     .values()
-                    .filter(|pending| *pending == key)
+                    .filter(|pending| *pending == requested_key)
                     .count();
                 if !loader_alive && pending_refs == 0 {
                     return Some(shared_id);
                 }
+
+                if let Some(existing) = self.by_src.get_mut(actual_key) {
+                    let existing_shared_id = existing.shared_image_id;
+                    if loader_alive {
+                        existing.refs = existing.refs.saturating_add(1);
+                        self.alias_to_shared
+                            .insert(loader_image_id, existing_shared_id);
+                    }
+                    self.shared_to_key
+                        .insert(existing_shared_id, actual_key.clone());
+
+                    for tx in waiters {
+                        let _ =
+                            tx.send(Ok((actual_key.clone(), existing_shared_id, existing.dims)));
+                    }
+
+                    return if existing_shared_id == shared_id {
+                        None
+                    } else {
+                        self.shared_to_key.remove(&shared_id);
+                        Some(shared_id)
+                    };
+                }
+
                 self.by_src.insert(
-                    key.clone(),
+                    actual_key.clone(),
                     SharedImageEntry {
                         shared_image_id: shared_id,
                         refs: usize::from(loader_alive),
@@ -191,14 +225,20 @@ impl ImageCache {
                 if loader_alive {
                     self.alias_to_shared.insert(loader_image_id, shared_id);
                 }
-                self.shared_to_key.insert(shared_id, key.clone());
+                self.shared_to_key.insert(shared_id, actual_key.clone());
 
                 for tx in waiters {
-                    let _ = tx.send(Ok((shared_id, dims)));
+                    let _ = tx.send(Ok((actual_key.clone(), shared_id, dims)));
                 }
                 None
             }
             Err(msg) => {
+                if self.alias_to_shared.get(&loader_image_id).copied() == Some(shared_id) {
+                    self.alias_to_shared.remove(&loader_image_id);
+                }
+                self.shared_to_key.remove(&shared_id);
+                self.pending_alias_to_key
+                    .retain(|_, pending| pending != requested_key);
                 for tx in waiters {
                     let _ = tx.send(Err(msg.clone()));
                 }
@@ -271,7 +311,12 @@ pub fn drain_shared_image_cache() -> Vec<u32> {
     let mut c = IMAGE_CACHE.lock();
     let mut seen = HashSet::new();
     let mut shared_ids: Vec<u32> = Vec::new();
-    for id in c.by_src.values().map(|e| e.shared_image_id).chain(c.alias_to_shared.values().copied()) {
+    for id in c
+        .by_src
+        .values()
+        .map(|e| e.shared_image_id)
+        .chain(c.alias_to_shared.values().copied())
+    {
         if seen.insert(id) {
             shared_ids.push(id);
         }
@@ -286,4 +331,96 @@ pub fn drain_shared_image_cache() -> Vec<u32> {
 
 pub fn clear_shared_image_cache() {
     let _ = drain_shared_image_cache();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ImageCache, ImageCacheKey};
+
+    #[test]
+    fn finish_load_merges_converging_actual_keys_without_losing_refs() {
+        let mut cache = ImageCache::new();
+        let requested_a: ImageCacheKey = ("/code/a.png".into(), 10);
+        let requested_b: ImageCacheKey = ("/code/b.png".into(), 11);
+        let actual: ImageCacheKey = ("/code/shared.png".into(), 20);
+
+        assert!(matches!(
+            cache.begin_load(1, &requested_a),
+            super::BeginLoadResult::StartLoading
+        ));
+        assert!(matches!(
+            cache.begin_load(2, &requested_b),
+            super::BeginLoadResult::StartLoading
+        ));
+        cache.register_inflight_alias(1, 100);
+        cache.register_inflight_alias(2, 200);
+
+        assert_eq!(
+            cache.finish_load(1, 100, &requested_a, &actual, Ok((64, 64))),
+            None
+        );
+        assert_eq!(
+            cache.finish_load(2, 200, &requested_b, &actual, Ok((64, 64))),
+            Some(200)
+        );
+
+        let entry = cache
+            .by_src
+            .get(&actual)
+            .expect("merged entry should exist");
+        assert_eq!(entry.shared_image_id, 100);
+        assert_eq!(entry.refs, 2);
+        assert_eq!(cache.alias_to_shared.get(&1), Some(&100));
+        assert_eq!(cache.alias_to_shared.get(&2), Some(&100));
+        assert_eq!(cache.shared_to_key.get(&100), Some(&actual));
+        assert!(!cache.shared_to_key.contains_key(&200));
+    }
+
+    #[test]
+    fn bind_alias_existing_ignores_stale_waiters_for_replaced_loads() {
+        let mut cache = ImageCache::new();
+        let requested_a: ImageCacheKey = ("/code/a.png".into(), 10);
+        let requested_b: ImageCacheKey = ("/code/b.png".into(), 11);
+        let actual_a: ImageCacheKey = ("/code/a.png".into(), 20);
+
+        cache.begin_load(7, &requested_a);
+        let _ = cache.begin_load(7, &requested_b);
+        cache.pending_alias_to_key.insert(7, requested_b.clone());
+        cache.by_src.insert(
+            actual_a.clone(),
+            super::SharedImageEntry {
+                shared_image_id: 100,
+                refs: 1,
+                dims: (32, 32),
+            },
+        );
+
+        cache.bind_alias_existing(7, &requested_a, &actual_a, 100);
+
+        assert_eq!(cache.alias_to_shared.get(&7), None);
+        assert_eq!(cache.pending_alias_to_key.get(&7), Some(&requested_b));
+        assert_eq!(cache.by_src.get(&actual_a).unwrap().refs, 1);
+    }
+
+    #[test]
+    fn finish_load_error_clears_loader_and_waiter_bookkeeping() {
+        let mut cache = ImageCache::new();
+        let requested: ImageCacheKey = ("/code/a.png".into(), 10);
+
+        assert!(matches!(
+            cache.begin_load(1, &requested),
+            super::BeginLoadResult::StartLoading
+        ));
+        let _ = cache.begin_load(2, &requested);
+        cache.register_inflight_alias(1, 100);
+
+        assert_eq!(
+            cache.finish_load(1, 100, &requested, &requested, Err("boom".into())),
+            None
+        );
+
+        assert!(!cache.alias_to_shared.contains_key(&1));
+        assert!(!cache.pending_alias_to_key.contains_key(&2));
+        assert!(!cache.loading_map.contains_key(&requested));
+    }
 }

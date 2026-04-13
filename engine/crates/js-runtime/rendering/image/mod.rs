@@ -1,6 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use deno_core::{extension, op2, OpState};
+use deno_core::{OpState, extension, op2};
 use deno_error::JsErrorBox;
 use tracing::{error, info, warn};
 
@@ -8,12 +8,13 @@ use shared::{
     error::{EngineError, EngineResult, ErrorCode},
     op_state::{CanvasOpState, HostOpState},
     protocol::{
-        io_cmd::{IOCmd, IOCmdResp},
         render_cmd::{CanvasCmd, RenderCommand},
-        send_fs_with_resp_async, send_render_with_resp_async, send_render_with_resp_sync,
+        send_render_with_resp_async, send_render_with_resp_sync,
     },
     vfs::FileOp,
 };
+
+use crate::io_state::IoSchedulerState;
 
 pub(crate) mod cache;
 
@@ -43,8 +44,7 @@ struct ResolvedSrc {
     /// For mount-backed: mount source_mounted_at.
     /// For mutable filesystem paths: derived from file mtime+size.
     source_version: u64,
-    /// Pre-read bytes for pack-backed sources.
-    pack_data: Option<Vec<u8>>,
+    source: io::image_ops::ImageSource,
 }
 
 use shared::protocol::io_cmd::{VARIANT_EXTENSIONS, path_stem};
@@ -64,12 +64,15 @@ fn variant_source_version_token(
     let stem = path_stem(path);
     let virtual_stem = virtual_src.map(path_stem);
 
-    let mut candidates: Vec<(String, Option<String>)> = Vec::with_capacity(VARIANT_EXTENSIONS.len() + 1);
+    let mut candidates: Vec<(String, Option<String>)> =
+        Vec::with_capacity(VARIANT_EXTENSIONS.len() + 1);
     candidates.push((path.to_string(), virtual_src.map(|s| s.to_string())));
     for ext in VARIANT_EXTENSIONS {
         let candidate = format!("{}.{}", stem, ext);
         if candidate != path {
-            let virtual_candidate = virtual_stem.as_ref().map(|vstem| format!("{}.{}", vstem, ext));
+            let virtual_candidate = virtual_stem
+                .as_ref()
+                .map(|vstem| format!("{}.{}", vstem, ext));
             candidates.push((candidate, virtual_candidate));
         }
     }
@@ -108,6 +111,15 @@ fn variant_source_version_token(
     h.finish()
 }
 
+fn resized_rgba_io_cache_key(
+    src: &str,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+    source_generation: u64,
+) -> cache::ImageCacheKey {
+    cache::make_cache_key(src, target_width, target_height, source_generation)
+}
+
 fn resolve_local_src(
     vfs: Option<&shared::vfs::VirtualFS>,
     mount_table: Option<&shared::vfs::MountTable>,
@@ -136,37 +148,49 @@ fn resolve_local_src(
             let resolved = mt.resolve_code_path(effective_src).ok_or_else(|| {
                 EngineError::new(ErrorCode::PermissionDenied)
                     .with_msg("image path resolve failed")
-                    .with_detail(format!("src={}, mount resolve_code_path returned None", src))
+                    .with_detail(format!(
+                        "src={}, mount resolve_code_path returned None",
+                        src
+                    ))
             })?;
             match resolved.real_path {
                 Some(real) => {
-                    let real_str = real.to_string_lossy().into_owned();
+                    let relative = effective_src.strip_prefix("/code/").unwrap_or("");
                     return Ok(ResolvedSrc {
-                        source_version: variant_source_version_token(&real_str, Some(effective_src), mount_table),
-                        path: real_str,
-                        pack_data: None,
+                        source_version: variant_source_version_token(
+                            &real.to_string_lossy(),
+                            Some(effective_src),
+                            mount_table,
+                        ),
+                        path: effective_src.to_string(),
+                        source: io::image_ops::ImageSource::MountCode {
+                            virtual_path: effective_src.to_string(),
+                            relative_path: relative.to_string(),
+                        },
                     });
                 }
                 None => {
-                    // Pack-backed: read bytes from mount table directly.
+                    // Pack-backed: carry the relative path so the image worker
+                    // pool performs the package read instead of the host thread.
                     let relative = effective_src.strip_prefix("/code/").unwrap_or("");
                     let max_len = shared::protocol::io_cmd::MAX_READ_LENGTH;
                     if let Some(size) = mt.entry_size(relative) {
                         if size > max_len {
                             return Err(EngineError::new(ErrorCode::IoError)
                                 .with_msg("pack image too large")
-                                .with_detail(format!("src={}, size={}, limit={}", src, size, max_len)));
+                                .with_detail(format!(
+                                    "src={}, size={}, limit={}",
+                                    src, size, max_len
+                                )));
                         }
                     }
-                    let data = mt.read_range_limited(relative, 0, None, max_len).map_err(|e| {
-                        EngineError::new(ErrorCode::IoError)
-                            .with_msg("pack image read failed")
-                            .with_detail(format!("src={}, err={}", src, e))
-                    })?;
                     return Ok(ResolvedSrc {
                         path: effective_src.to_string(),
                         source_version: resolved.source_mounted_at,
-                        pack_data: Some(data),
+                        source: io::image_ops::ImageSource::MountCode {
+                            virtual_path: effective_src.to_string(),
+                            relative_path: relative.to_string(),
+                        },
                     });
                 }
             }
@@ -177,8 +201,13 @@ fn resolve_local_src(
                 .resolve(effective_src, FileOp::Read)
                 .map(|p| {
                     let path_str = p.to_string_lossy().into_owned();
-                    let ver = variant_source_version_token(&path_str, Some(effective_src), mount_table);
-                    ResolvedSrc { path: path_str, source_version: ver, pack_data: None }
+                    let ver =
+                        variant_source_version_token(&path_str, Some(effective_src), mount_table);
+                    ResolvedSrc {
+                        path: path_str,
+                        source_version: ver,
+                        source: io::image_ops::ImageSource::Filesystem,
+                    }
                 })
                 .map_err(|e| {
                     EngineError::new(ErrorCode::PermissionDenied)
@@ -203,7 +232,11 @@ fn resolve_local_src(
                 .map(|p| {
                     let path_str = p.to_string_lossy().into_owned();
                     let ver = variant_source_version_token(&path_str, None, mount_table);
-                    ResolvedSrc { path: path_str, source_version: ver, pack_data: None }
+                    ResolvedSrc {
+                        path: path_str,
+                        source_version: ver,
+                        source: io::image_ops::ImageSource::Filesystem,
+                    }
                 })
                 .map_err(|e| {
                     EngineError::new(ErrorCode::PermissionDenied)
@@ -243,12 +276,20 @@ async fn op_load_image_inner(
     target_width: Option<u32>,
     target_height: Option<u32>,
 ) -> EngineResult<(u32, (usize, usize))> {
-    let (io_tx, vfs, mount_table, game_cache_dir, gpu_caps) = {
+    let (scheduler, vfs, mount_table, game_cache_dir, gpu_caps) = {
         let op = state.borrow();
         let host = op.borrow::<HostOpState>();
-        let gcd = host.game_paths.as_ref()
+        let gcd = host
+            .game_paths
+            .as_ref()
             .map(|gp| gp.cache_dir().to_string_lossy().into_owned());
-        (host.io_tx.clone(), host.vfs.clone(), host.mount_table.clone(), gcd, host.gpu_caps.snapshot())
+        (
+            op.borrow::<IoSchedulerState>().0.clone(),
+            host.vfs.clone(),
+            host.mount_table.clone(),
+            gcd,
+            host.gpu_caps.snapshot(),
+        )
     };
 
     let canvas_ctx: CanvasOpState = {
@@ -260,7 +301,7 @@ async fn op_load_image_inner(
     let resolved = resolve_local_src(vfs.as_deref(), mount_table.as_deref(), &src)?;
     let src = resolved.path;
     let mount_generation = resolved.source_version;
-    let pack_data = resolved.pack_data;
+    let image_source = resolved.source;
     info!("op_load_image begin: image_id={}, src={}", image_id, src);
 
     // remove previous alias and possibly destroy old shared
@@ -296,19 +337,15 @@ async fn op_load_image_inner(
                 image_id, src
             );
             match rx.await {
-                Ok(Ok((shared_id, dims))) => {
+                Ok(Ok((actual_cache_key, shared_id, dims))) => {
                     // IMPORTANT: bind alias for this caller image_id so destroy works even if JS does not replace IDs
                     {
                         let mut c = cache::IMAGE_CACHE.lock();
-                        c.bind_alias_existing(image_id, &cache_key, shared_id);
+                        c.bind_alias_existing(image_id, &cache_key, &actual_cache_key, shared_id);
                     }
                     info!(
                         "op_load_image join resolved: image_id={}, shared_id={}, src={}, dims={}x{}",
-                        image_id,
-                        shared_id,
-                        src,
-                        dims.0,
-                        dims.1
+                        image_id, shared_id, src, dims.0, dims.1
                     );
                     Ok((shared_id, dims))
                 }
@@ -344,20 +381,20 @@ async fn op_load_image_inner(
                 image_id, shared_id, src
             );
 
-            let img = match send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::ReadImageRgba8 {
-                path: src.clone(),
+            let decoded = match io::image_ops::read_image_rgba8(
+                scheduler,
+                src.clone(),
                 target_width,
                 target_height,
-                cache_generation: mount_generation,
-                pack_data: pack_data.clone(),
-                game_cache_dir: game_cache_dir.clone(),
+                mount_generation,
+                image_source.clone(),
+                game_cache_dir.clone(),
                 gpu_caps,
-                mount_table: mount_table.clone(),
-                resp: IOCmdResp::Async(resp_tx),
-            })
+                mount_table.clone(),
+            )
             .await
             {
-                Ok(img) => img,
+                Ok(decoded) => decoded,
                 Err(e) => {
                     let msg = engine_err_to_text(&e);
                     warn!(
@@ -365,16 +402,24 @@ async fn op_load_image_inner(
                         image_id, src, msg
                     );
                     let mut c = cache::IMAGE_CACHE.lock();
-                    let _ = c.finish_load(image_id, shared_id, &cache_key, Err(msg));
+                    let _ = c.finish_load(image_id, shared_id, &cache_key, &cache_key, Err(msg));
                     return Err(e);
                 }
             };
+
+            let actual_cache_key = resized_rgba_io_cache_key(
+                &src,
+                target_width,
+                target_height,
+                decoded.source_generation,
+            );
+            let img = decoded.image;
 
             // For scaled RGBA decodes, store in IO cache.
             // Compressed images skip the IO cache (fast to re-read).
             if target_width.is_some() && target_height.is_some() {
                 if let shared::protocol::io_cmd::DecodedImage::Rgba(ref rgba) = img {
-                    io::global_cache().insert(cache_key.clone(), rgba.clone());
+                    io::global_cache().insert(actual_cache_key.clone(), rgba.clone());
                 }
             }
 
@@ -396,11 +441,16 @@ async fn op_load_image_inner(
                         image_id,
                         shared_id,
                         &cache_key,
+                        &actual_cache_key,
                         Ok((*w as usize, *h as usize)),
                     ),
-                    Err(e) => {
-                        c.finish_load(image_id, shared_id, &cache_key, Err(engine_err_to_text(e)))
-                    }
+                    Err(e) => c.finish_load(
+                        image_id,
+                        shared_id,
+                        &cache_key,
+                        &actual_cache_key,
+                        Err(engine_err_to_text(e)),
+                    ),
                 }
             };
 
@@ -416,11 +466,7 @@ async fn op_load_image_inner(
                 Ok((w, h)) => {
                     info!(
                         "op_load_image loader resolved: image_id={}, shared_id={}, src={}, dims={}x{}",
-                        image_id,
-                        shared_id,
-                        src,
-                        w,
-                        h
+                        image_id, shared_id, src, w, h
                     );
                     Ok((shared_id, (w as usize, h as usize)))
                 }
@@ -486,52 +532,62 @@ pub async fn op_preload_images(
     state: Rc<RefCell<OpState>>,
     #[serde] paths: Vec<String>,
 ) -> Result<Vec<(String, bool, u32, u32, String)>, JsErrorBox> {
-    let (io_tx, vfs, mount_table, game_cache_dir, gpu_caps) = {
+    let (scheduler, vfs, mount_table, game_cache_dir, gpu_caps) = {
         let op = state.borrow();
         let host = op.borrow::<HostOpState>();
-        let gcd = host.game_paths.as_ref()
+        let gcd = host
+            .game_paths
+            .as_ref()
             .map(|gp| gp.cache_dir().to_string_lossy().into_owned());
-        (host.io_tx.clone(), host.vfs.clone(), host.mount_table.clone(), gcd, host.gpu_caps.snapshot())
+        (
+            op.borrow::<IoSchedulerState>().0.clone(),
+            host.vfs.clone(),
+            host.mount_table.clone(),
+            gcd,
+            host.gpu_caps.snapshot(),
+        )
     };
 
     // Resolve all paths atomically (path + generation per resolve call).
-    // Rejected paths become error entries; never sent to IO thread.
-    let mut io_entries: Vec<(String, u64, Option<Vec<u8>>)> = Vec::with_capacity(paths.len());
+    // Rejected paths become error entries; never sent to decode.
+    let mut io_entries: Vec<(String, u64, io::image_ops::ImageSource)> =
+        Vec::with_capacity(paths.len());
     let mut early_errors: Vec<(usize, String)> = Vec::new();
     for (i, p) in paths.iter().enumerate() {
         match resolve_local_src(vfs.as_deref(), mount_table.as_deref(), p) {
-            Ok(resolved) => io_entries.push((resolved.path, resolved.source_version, resolved.pack_data)),
+            Ok(resolved) => {
+                io_entries.push((resolved.path, resolved.source_version, resolved.source))
+            }
             Err(e) => {
                 early_errors.push((i, engine_err_to_text(&e)));
-                io_entries.push((String::new(), 0, None)); // placeholder
+                io_entries.push((String::new(), 0, io::image_ops::ImageSource::Filesystem)); // placeholder
             }
         }
     }
 
     // Filter out failed entries, keeping per-path generation.
-    let io_entries_filtered: Vec<(String, u64, Option<Vec<u8>>)> = io_entries
+    let io_entries_filtered: Vec<(String, u64, io::image_ops::ImageSource)> = io_entries
         .iter()
         .enumerate()
         .filter(|(i, _)| !early_errors.iter().any(|(ei, _)| ei == i))
         .map(|(_, entry)| entry.clone())
         .collect();
 
-    // Send only successfully resolved entries to IO thread.
+    // Decode successfully resolved entries via the image scheduler pool.
     let io_results = if !io_entries_filtered.is_empty() {
-        send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::PreloadImages {
-            entries: io_entries_filtered,
-            game_cache_dir: game_cache_dir.clone(),
+        io::image_ops::preload_images(
+            scheduler,
+            io_entries_filtered,
+            game_cache_dir.clone(),
             gpu_caps,
-            mount_table: mount_table.clone(),
-            resp: IOCmdResp::Async(resp_tx),
-        })
+            mount_table.clone(),
+        )
         .await
-        .map_err(js_err_from_engine)?
     } else {
         Vec::new()
     };
 
-    // Merge IO results with early errors into the output, preserving
+    // Merge results with early errors into the output, preserving
     // original order matching the input `paths`.
     let mut io_iter = io_results.into_iter();
     let mut output: Vec<(String, bool, u32, u32, String)> = Vec::with_capacity(paths.len());
@@ -550,51 +606,37 @@ pub async fn op_preload_images(
 }
 
 /// Clear all image caches: JS shared cache + IO in-memory cache + derived disk cache.
-#[op2(async(lazy), fast)]
-pub async fn op_clear_image_cache(state: Rc<RefCell<OpState>>) -> Result<(), JsErrorBox> {
+#[op2(fast)]
+pub fn op_clear_image_cache(state: &mut OpState) -> Result<(), JsErrorBox> {
     // 1. Destroy live shared GPU textures, then clear JS-side shared cache.
-    let (io_tx, gcd, render_tx) = {
-        let op = state.borrow();
-        let host = op.borrow::<HostOpState>();
-        let dir = host.game_paths.as_ref()
-            .map(|gp| gp.cache_dir().to_string_lossy().into_owned());
-        (host.io_tx.clone(), dir, host.render_tx.clone())
+    let gcd = {
+        let host = state.borrow::<HostOpState>();
+        host.game_paths
+            .as_ref()
+            .map(|gp| gp.cache_dir().to_string_lossy().into_owned())
     };
+    let render_tx = state.borrow::<HostOpState>().render_tx.clone();
 
     for shared_id in cache::drain_shared_image_cache() {
-        let _ = render_tx.send(RenderCommand::Canvas(CanvasCmd::DestroyImage { image_id: shared_id }));
+        let _ = render_tx.send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
+            image_id: shared_id,
+        }));
     }
 
-    // 2. Clear IO in-memory cache + derived disk cache via IO thread.
-    send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::ClearImageCache {
-        game_cache_dir: gcd,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(js_err_from_engine)
+    // 2. Clear IO in-memory cache + derived disk cache directly.
+    io::image_ops::clear_image_cache(gcd.as_deref());
+    Ok(())
 }
 
 /// Get image cache statistics
-#[op2(async(lazy), fast)]
+#[op2]
 #[serde]
-pub async fn op_get_image_cache_stats(
-    state: Rc<RefCell<OpState>>,
-) -> Result<shared::protocol::io_cmd::ImageCacheStats, JsErrorBox> {
-    let io_tx = {
-        let op = state.borrow();
-        let host = op.borrow::<HostOpState>();
-        host.io_tx.clone()
-    };
-
-    send_fs_with_resp_async(&io_tx, |resp_tx| IOCmd::GetImageCacheStats {
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(js_err_from_engine)
+pub fn op_get_image_cache_stats(_state: &mut OpState) -> shared::protocol::io_cmd::ImageCacheStats {
+    io::image_ops::get_image_cache_stats()
 }
 
 extension!(host_v8_image,
-    deps = [host_v8_console, host_v8_base, host_v8_file],
+    deps = [host_v8_console, host_v8_base, host_v8_file, host_v8_io_state],
     ops = [
         op_create_image,
         op_load_image,
@@ -620,7 +662,7 @@ pub(super) fn image_lazy_extensions() -> Vec<deno_core::Extension> {
 
 #[cfg(test)]
 mod tests {
-    use super::variant_source_version_token;
+    use super::{resized_rgba_io_cache_key, variant_source_version_token};
 
     #[test]
     fn companion_appearing_invalidates_variant_token() {
@@ -684,5 +726,14 @@ mod tests {
 
         assert_ne!(v1, v2, "primary size change must invalidate token");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resized_rgba_cache_key_uses_decoded_source_generation() {
+        let stale = resized_rgba_io_cache_key("/code/tex.png", Some(64), Some(64), 10);
+        let refreshed = resized_rgba_io_cache_key("/code/tex.png", Some(64), Some(64), 20);
+
+        assert_ne!(stale, refreshed);
+        assert_eq!(refreshed.1, 20);
     }
 }

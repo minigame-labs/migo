@@ -35,6 +35,10 @@ const MAX_CACHE_SIZE: u64 = 32 * 1024 * 1024;
 pub(crate) struct DiskCodeCache {
     cache_dir: PathBuf,
     v8_version: &'static str,
+    /// Incrementally tracked total size of .bin files in the cache directory.
+    /// Initialized with a single scan at construction, then maintained on
+    /// each write/eviction to avoid O(N) scans per `set()`.
+    current_size: std::cell::Cell<u64>,
 }
 
 impl DiskCodeCache {
@@ -45,8 +49,11 @@ impl DiskCodeCache {
         let cache = Self {
             cache_dir,
             v8_version,
+            current_size: std::cell::Cell::new(0),
         };
         cache.ensure_dir_and_check_version();
+        // Initial scan to populate current_size.
+        cache.current_size.set(cache.scan_total_size());
         cache
     }
 
@@ -92,7 +99,12 @@ impl DiskCodeCache {
             return;
         }
         let path = self.hash_path(hash);
+        // Account for replacing an existing file.
+        let old_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if fs::write(&path, data).is_ok() {
+            let new_size = data.len() as u64;
+            let cur = self.current_size.get();
+            self.current_size.set(cur.saturating_sub(old_size) + new_size);
             self.evict_if_needed();
         }
     }
@@ -100,14 +112,40 @@ impl DiskCodeCache {
     /// Clear the entire cache directory.
     pub fn clear_all(&self) {
         let _ = fs::remove_dir_all(&self.cache_dir);
+        self.current_size.set(0);
     }
 
     fn hash_path(&self, hash: u64) -> PathBuf {
         self.cache_dir.join(format!("{:016x}.bin", hash))
     }
 
+    /// Scan the cache directory and return the total size of .bin files.
+    fn scan_total_size(&self) -> u64 {
+        let entries = match fs::read_dir(&self.cache_dir) {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+        let mut total: u64 = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+                continue;
+            }
+            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+        total
+    }
+
     /// Evict oldest cache files if total size exceeds MAX_CACHE_SIZE.
+    ///
+    /// O(1) check in the common case (under limit). Only does a full
+    /// directory scan + sort when eviction is actually needed.
     fn evict_if_needed(&self) {
+        if self.current_size.get() <= MAX_CACHE_SIZE {
+            return;
+        }
+
+        // Over limit — do a full scan to get accurate sizes + mtimes for LRU eviction.
         let entries = match fs::read_dir(&self.cache_dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -130,6 +168,8 @@ impl DiskCodeCache {
         }
 
         if total_size <= MAX_CACHE_SIZE {
+            // Incremental tracker drifted — correct it.
+            self.current_size.set(total_size);
             return;
         }
 
@@ -144,6 +184,9 @@ impl DiskCodeCache {
                 total_size = total_size.saturating_sub(*size);
             }
         }
+
+        // Update tracker to post-eviction total.
+        self.current_size.set(total_size);
     }
 }
 

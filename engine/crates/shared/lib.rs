@@ -33,7 +33,7 @@
 //!
 //! - `HostCommand`: Commands sent to the JS runtime thread
 //! - `RenderCommand`: Graphics/rendering operations
-//! - `IOCmd`: File system and network I/O operations
+//! - `io_cmd`: File system and image I/O type definitions
 //! - `AudioCmd`: Audio playback and processing commands
 //!
 //! Each command type flows through dedicated channels, enabling concurrent
@@ -92,6 +92,5 @@ pub use surface::{SafeArea, Surface, SurfaceRef, WindowInfo};
 pub use protocol::{
     frame_packet::{FrameOp, FramePacket, FramePacketBuilder},
     host_cmd::HostCommand,
-    io_cmd::{IOCmd, IOCmdResp},
     render_cmd::RenderCommand,
 };

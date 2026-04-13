@@ -37,6 +37,7 @@ const WindowGlobalScope = {
     cancelAnimationFrame: core.propWritable(raf.cancelAnimationFrame),
     setPreferredFramesPerSecond: core.propWritable(raf.setPreferredFramesPerSecond),
 
+
     // Subpackage
     loadSubpackage: core.propNonEnumerable(subpackage.loadSubpackage),
     preDownloadSubpackage: core.propNonEnumerable(subpackage.preDownloadSubpackage),

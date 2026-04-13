@@ -4,9 +4,9 @@
 //! thread via `Arc`.  The render thread calls `set()` after GL context
 //! init; IO/JS threads read via `snapshot()`.
 //!
-//! `GpuCapsSnapshot` is a plain `Copy` struct carried by `IOCmd` so
-//! that decode decisions use the caps that were current when the
-//! request was dispatched — no global state involved.
+//! `GpuCapsSnapshot` is a plain `Copy` struct passed to image decode
+//! functions so that decode decisions use the caps that were current
+//! when the request was dispatched.
 //!
 //! `wait_ready()` blocks until the render thread has completed GL init
 //! and called `set()`.  `Host::new()` calls this to ensure caps are
@@ -137,7 +137,7 @@ impl GpuCaps {
         }
     }
 
-    /// Take an immutable point-in-time snapshot for threading through IOCmd.
+    /// Take an immutable point-in-time snapshot for passing to image decode functions.
     pub fn snapshot(&self) -> GpuCapsSnapshot {
         GpuCapsSnapshot {
             etc2: self.etc2.load(Ordering::Acquire),
@@ -148,9 +148,8 @@ impl GpuCaps {
 
 /// Immutable point-in-time copy of GPU caps.
 ///
-/// Carried by `IOCmd` so decode decisions use the caps that were
-/// current when the request was dispatched — no global reads at
-/// decode time.
+/// Passed to image decode functions so decode decisions use the caps
+/// that were current when the request was dispatched.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GpuCapsSnapshot {
     pub etc2: bool,

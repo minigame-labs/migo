@@ -95,6 +95,7 @@ mod env;
 mod event;
 mod file;
 mod input;
+mod io_state;
 mod lifecycle;
 mod network;
 mod rendering;
@@ -116,24 +117,24 @@ mod web;
 //   api-connectivity -> system   (bluetooth, auth, system info, login, settings, navigate, game_log, etc.)
 //   api-commerce     -> share    (share menu) + payment (Midas payment)
 //   api-system       -> ui       (Toast/Modal/Loading) + update + ad + worker
+#[cfg(feature = "api-system")]
+mod ad;
+#[cfg(feature = "api-media")]
+mod audio;
 #[cfg(feature = "api-sensors")]
 mod device;
 #[cfg(feature = "api-media")]
 mod media;
-#[cfg(feature = "api-media")]
-mod audio;
-#[cfg(feature = "api-connectivity")]
-mod system;
-#[cfg(feature = "api-commerce")]
-mod share;
 #[cfg(feature = "api-commerce")]
 mod payment;
+#[cfg(feature = "api-commerce")]
+mod share;
+#[cfg(feature = "api-connectivity")]
+mod system;
 #[cfg(feature = "api-system")]
 mod ui;
 #[cfg(feature = "api-system")]
 mod update;
-#[cfg(feature = "api-system")]
-mod ad;
 #[cfg(feature = "api-system")]
 pub(crate) mod worker;
 
@@ -227,62 +228,63 @@ pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
     let mut exts: Vec<deno_core::Extension> = Vec::new();
 
     // ---- CORE extensions (always loaded) ----
-    exts.extend(base::base_extensions(host));       // ops, async utils, subpackage loader
-    exts.extend(console::console_extensions());     // console.log / warn / error
-    exts.extend(event::event_extensions());         // EventTarget / EventEmitter
-    exts.extend(utility::utility_extensions());     // TextEncoder / TextDecoder
+    exts.extend(base::base_extensions(host)); // ops, async utils, subpackage loader
+    exts.extend(io_state::io_state_extensions()); // shared IO scheduler state
+    exts.extend(console::console_extensions()); // console.log / warn / error
+    exts.extend(event::event_extensions()); // EventTarget / EventEmitter
+    exts.extend(utility::utility_extensions()); // TextEncoder / TextDecoder
 
     // ---- OPTIONAL: api-sensors ----
     #[cfg(feature = "api-sensors")]
-    exts.extend(device::device_extensions());       // sensors, battery, clipboard, vibration, screen, network, location, scan
+    exts.extend(device::device_extensions()); // sensors, battery, clipboard, vibration, screen, network, location, scan
 
     // ---- OPTIONAL: api-system ----
     #[cfg(feature = "api-system")]
-    exts.extend(ui::ui_extensions());               // Toast / Modal / Loading / ActionSheet / UserInfoButton
+    exts.extend(ui::ui_extensions()); // Toast / Modal / Loading / ActionSheet / UserInfoButton
 
     // ---- OPTIONAL: api-connectivity ----
     #[cfg(feature = "api-connectivity")]
-    exts.extend(system::system_extensions());       // bluetooth, auth, system info, login, settings, navigate
+    exts.extend(system::system_extensions()); // bluetooth, auth, system info, login, settings, navigate
 
     // ---- CORE (continued) ----
-    exts.extend(env::env_extensions());             // environment variables
-    exts.extend(lifecycle::lifecycle_extensions());  // onShow / onHide, restart / exit
+    exts.extend(env::env_extensions()); // environment variables
+    exts.extend(lifecycle::lifecycle_extensions()); // onShow / onHide, restart / exit
 
     // ---- OPTIONAL: api-system (continued) ----
     #[cfg(feature = "api-system")]
-    exts.extend(update::update_extensions());       // update manager
+    exts.extend(update::update_extensions()); // update manager
 
     // ---- CORE (continued) ----
-    exts.extend(storage::storage_extensions());     // setStorage / getStorage
-    exts.extend(input::touch_extensions());         // touch events, keyboard events
-    exts.extend(file::file_extensions());           // file system manager
+    exts.extend(storage::storage_extensions()); // setStorage / getStorage
+    exts.extend(input::touch_extensions()); // touch events, keyboard events
+    exts.extend(file::file_extensions()); // file system manager
     exts.extend(rendering::rendering_extensions()); // Canvas / WebGL / Image / RAF / Font
-    exts.extend(web::web_extensions());             // setTimeout / setInterval / Performance
-    exts.extend(url::url_extensions());             // URL / URLSearchParams
-    exts.extend(network::network_extensions());     // fetch / WebSocket / upload / download / TCP / UDP
+    exts.extend(web::web_extensions()); // setTimeout / setInterval / Performance
+    exts.extend(url::url_extensions()); // URL / URLSearchParams
+    exts.extend(network::network_extensions()); // fetch / WebSocket / upload / download / TCP / UDP
 
     // ---- OPTIONAL: api-media ----
     #[cfg(feature = "api-media")]
-    exts.extend(media::media_extensions());         // Camera / ImageAPI / Video
+    exts.extend(media::media_extensions()); // Camera / ImageAPI / Video
     #[cfg(feature = "api-media")]
-    exts.extend(audio::audio_extensions());         // WebAudio / InnerAudio / Recorder
+    exts.extend(audio::audio_extensions()); // WebAudio / InnerAudio / Recorder
 
     // ---- OPTIONAL: api-system (continued) ----
     #[cfg(feature = "api-system")]
-    exts.extend(worker::worker_extensions());       // Worker threads
+    exts.extend(worker::worker_extensions()); // Worker threads
 
     // ---- OPTIONAL: api-commerce ----
     #[cfg(feature = "api-commerce")]
-    exts.extend(share::share_extensions());         // share menu / shareAppMessage
+    exts.extend(share::share_extensions()); // share menu / shareAppMessage
     #[cfg(feature = "api-commerce")]
-    exts.extend(payment::payment_extensions());     // Midas payment
+    exts.extend(payment::payment_extensions()); // Midas payment
 
     // ---- OPTIONAL: api-system (continued) ----
     #[cfg(feature = "api-system")]
-    exts.extend(ad::ad_extensions());               // BannerAd / RewardedVideoAd / InterstitialAd / etc.
+    exts.extend(ad::ad_extensions()); // BannerAd / RewardedVideoAd / InterstitialAd / etc.
 
     // ---- CORE: runtime (must be last) ----
-    exts.push(runtime::init());                     // global scope registration (98_global_scope_*.js + 99_main.js)
+    exts.push(runtime::init()); // global scope registration (98_global_scope_*.js + 99_main.js)
 
     exts
 }

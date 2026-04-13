@@ -79,14 +79,22 @@ pub fn spawn_host_thread(
                 // Keep a reference to platform_for_error for use in the event loop
                 let platform_ref = &platform_for_error;
 
+                // Pre-warm the blocking thread pool to avoid cold-start
+                // latency on the first real spawn_blocking call.
+                // Creates 4 threads eagerly (covers most concurrent IO).
+                runtime.block_on(async {
+                    let mut handles = Vec::with_capacity(4);
+                    for _ in 0..4 {
+                        handles.push(tokio::task::spawn_blocking(|| {}));
+                    }
+                    for h in handles {
+                        let _ = h.await;
+                    }
+                });
+
                 runtime.block_on(async move {
                     let poll = PollEventLoopOptions::default();
                     let mut host = host;
-
-                    // Spawn IO handler on a dedicated thread.  Sync file
-                    // ops (readFileSync, mkdirSync) block the Host thread
-                    // via crossbeam, so the IO handler must run independently.
-                    host.io.spawn_handler();
 
                     // Heartbeat interval: run_event_loop may block indefinitely
                     // when long-lived async ops are pending (e.g., the RAF
@@ -287,10 +295,9 @@ fn create_basic_runtime() -> EngineResult<Runtime> {
         .event_interval(event_interval)
         .global_queue_interval(global_queue_interval)
         .max_io_events_per_tick(max_io_events_per_tick)
-        // JS (timer ops, module loading) and IO (file system, image decode,
-        // zip extract) blocking work that was previously split across two
-        // independent tokio runtimes.
-        .max_blocking_threads(8)
+        // All blocking work (file IO, image decode, zip extract) runs on
+        // this runtime's blocking pool via spawn_blocking.
+        .max_blocking_threads(32)
         .build()
         .map_err(|e| {
             EngineError::from_detail(

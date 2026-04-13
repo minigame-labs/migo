@@ -3,9 +3,9 @@ use std::{
     time::Duration,
 };
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
 use tokio::{
-    sync::{mpsc::UnboundedSender, oneshot},
+    sync::oneshot,
     time::timeout,
 };
 use tracing::error;
@@ -28,14 +28,9 @@ pub use self::{
     render_cmd::{CanvasBatchPayload, DirtyRect, GlBatchPayload},
 };
 
-use self::{
-    io_cmd::IOCmd,
-    render_cmd::{GLCmd, RenderCmdResp, RenderCommand},
-};
+use self::render_cmd::{GLCmd, RenderCmdResp, RenderCommand};
 
 const OP_GL: &str = "gl command";
-const OP_FS_SYNC: &str = "fs sync command";
-const OP_FS_ASYNC: &str = "fs async command";
 
 /// Default timeout: 10 seconds.
 static COMMAND_TIMEOUT_MS: AtomicU64 = AtomicU64::new(10_000);
@@ -171,44 +166,3 @@ pub async fn send_gl_with_resp_async<T>(
     send_render_with_resp_async(ctx, OP_GL, build).await
 }
 
-/// Async FS command with oneshot response + timeout.
-pub async fn send_fs_with_resp_async<T>(
-    tx: &UnboundedSender<IOCmd>,
-    build: impl FnOnce(oneshot::Sender<Result<T, EngineError>>) -> IOCmd,
-) -> Result<T, EngineError> {
-    let (resp_tx, resp_rx) = oneshot::channel();
-
-    if let Err(e) = tx.send(build(resp_tx)) {
-        error!("{OP_FS_ASYNC} send failed: {e}");
-        return Err(send_err(OP_FS_ASYNC, e));
-    }
-
-    let to = command_timeout();
-    match timeout(to, resp_rx).await {
-        Ok(Ok(Ok(v))) => Ok(v),
-        Ok(Ok(Err(e))) => Err(e),
-        Ok(Err(_canceled)) => {
-            error!("{OP_FS_ASYNC} failed: response channel canceled");
-            Err(canceled_err(OP_FS_ASYNC))
-        }
-        Err(_elapsed) => {
-            error!("{OP_FS_ASYNC} timed out (timeout={to:?})");
-            Err(timeout_err(OP_FS_ASYNC, to))
-        }
-    }
-}
-
-/// Sync FS command with crossbeam response + timeout.
-pub fn send_fs_with_resp_sync<T>(
-    tx: &UnboundedSender<IOCmd>,
-    build: impl FnOnce(Sender<Result<T, EngineError>>) -> IOCmd,
-) -> Result<T, EngineError> {
-    let (resp_tx, resp_rx) = bounded(1);
-
-    if let Err(e) = tx.send(build(resp_tx)) {
-        error!("{OP_FS_SYNC} send failed: {e}");
-        return Err(send_err(OP_FS_SYNC, e));
-    }
-
-    recv_timeout(&resp_rx, OP_FS_SYNC)
-}

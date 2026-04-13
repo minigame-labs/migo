@@ -1,19 +1,22 @@
-use std::{cell::RefCell, io::Write as _, path::PathBuf, rc::Rc, sync::{Arc, atomic::{AtomicU64, Ordering}}};
+use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 
 use deno_core::{JsBuffer, OpState, ToJsBuffer, op2, serde_json, v8};
+use io::fs_ops;
 use shared::{
     codec,
     error::{EngineError, ErrorCode},
     op_state::HostOpState,
-    protocol::{
-        self,
-        io_cmd::{
-            FileId, FileStat, IOCmd, IOCmdResp, OpenFlag, SavedFileInfo, StatResult, WriteMode,
-        },
-    },
+    protocol::io_cmd::{FileId, FileStat, OpenFlag, SavedFileInfo, StatResult, WriteMode},
     vfs::{FileOp, VfsError, VirtualFS},
 };
-use tokio::sync::mpsc::UnboundedSender;
+
+use crate::io_state::IoSchedulerState;
+use io::{
+    domain::DomainError,
+    pools::PoolError,
+    scheduler::IoScheduler,
+    task::{BackendKind, IoRequest, PriorityClass, ReadSpec, RequestKind},
+};
 
 const MAX_MATERIALIZE_LENGTH: u64 = 512 * 1024 * 1024;
 
@@ -60,22 +63,95 @@ fn ioerr(msg: impl Into<String>) -> IOError {
     IOError::Message(msg.into())
 }
 
-/// Get IO channel from async op state.
 #[inline]
-fn get_io_tx_async(state: Rc<RefCell<OpState>>) -> UnboundedSender<IOCmd> {
-    let st = state.borrow();
-    st.borrow::<HostOpState>().io_tx.clone()
+fn trace_file_edge(op: &str, target: &str, started_at: Instant, detail: &str) {
+    tracing::info!(
+        "[IOTrace] {} {}us target={} {}",
+        op,
+        started_at.elapsed().as_micros(),
+        target,
+        detail
+    );
 }
 
-/// Get IO channel from sync op state.
 #[inline]
-fn get_io_tx_sync(state: &OpState) -> &UnboundedSender<IOCmd> {
-    &state.borrow::<HostOpState>().io_tx
+fn get_scheduler(state: &OpState) -> Arc<IoScheduler> {
+    state.borrow::<IoSchedulerState>().0.clone()
+}
+
+#[inline]
+fn domain_err(err: DomainError) -> IOError {
+    match err {
+        DomainError::Closed => ioerr("IO domain closed"),
+        DomainError::Io(err) => IOError::from(err),
+    }
+}
+
+#[inline]
+fn pool_err(err: PoolError) -> IOError {
+    match err {
+        PoolError::Closed => ioerr("IO worker pool closed"),
+    }
+}
+
+#[inline]
+fn read_request(backend: BackendKind, request: RequestKind, length: Option<u64>) -> IoRequest {
+    let estimated_bytes = length.unwrap_or(shared::protocol::io_cmd::MAX_READ_LENGTH) as usize;
+    let spec = match length {
+        Some(length) => ReadSpec::Range {
+            position: 0,
+            length: length as usize,
+        },
+        None => ReadSpec::Whole,
+    };
+
+    IoRequest::ReadFile {
+        backend,
+        request,
+        priority: match request {
+            RequestKind::Sync => PriorityClass::ForegroundBlocking,
+            RequestKind::Async => PriorityClass::ForegroundAsync,
+        },
+        spec,
+        estimated_bytes,
+    }
+}
+
+#[inline]
+fn copy_request(backend: BackendKind, request: RequestKind) -> IoRequest {
+    IoRequest::ReadFile {
+        backend,
+        request,
+        priority: match request {
+            RequestKind::Sync => PriorityClass::ForegroundBlocking,
+            RequestKind::Async => PriorityClass::ForegroundAsync,
+        },
+        spec: ReadSpec::Whole,
+        estimated_bytes: shared::protocol::io_cmd::MAX_READ_LENGTH as usize,
+    }
+}
+
+async fn copy_pack_file_async(
+    scheduler: Arc<IoScheduler>,
+    mount_table: Arc<shared::vfs::MountTable>,
+    relative_path: String,
+    dest_path: PathBuf,
+) -> Result<(), IOError> {
+    let request = copy_request(BackendKind::Pack, RequestKind::Async);
+    scheduler
+        .run_async(request, move || {
+            fs_ops::copy_mount_entry_to_path(&mount_table, &relative_path, &dest_path)
+        })
+        .await
+        .map_err(pool_err)?
+        .map_err(IOError::from)
 }
 
 /// Get VFS + MountTable from async op state.
 #[inline]
-fn get_vfs_async(state: &Rc<RefCell<OpState>>) -> (Option<Arc<VirtualFS>>, Option<Arc<shared::vfs::MountTable>>) {
+fn get_vfs_async(
+    state: &Rc<RefCell<OpState>>,
+) -> (Option<Arc<VirtualFS>>, Option<Arc<shared::vfs::MountTable>>) {
     let st = state.borrow();
     let host = st.borrow::<HostOpState>();
     (host.vfs.clone(), host.mount_table.clone())
@@ -129,12 +205,16 @@ fn resolve_path_vfs(
             return Err(ioerr(format!("Permission denied: {}", path)));
         }
         if let Some(mt) = mount_table {
-            let res = mt.resolve_code_path(virtual_path).ok_or_else(|| {
-                ioerr(format!("Path resolution failed: {}", path))
-            })?;
+            let res = mt
+                .resolve_code_path(virtual_path)
+                .ok_or_else(|| ioerr(format!("Path resolution failed: {}", path)))?;
             return match res.real_path {
-                Some(real) => Ok(ResolvedPath::Filesystem(real.to_string_lossy().into_owned())),
-                None => Ok(ResolvedPath::Pack { virtual_path: virtual_path.to_string() }),
+                Some(real) => Ok(ResolvedPath::Filesystem(
+                    real.to_string_lossy().into_owned(),
+                )),
+                None => Ok(ResolvedPath::Pack {
+                    virtual_path: virtual_path.to_string(),
+                }),
             };
         }
         // Fallback to VFS for /code if no mount table.
@@ -190,7 +270,10 @@ fn read_pack_bytes(
     let max_len = shared::protocol::io_cmd::MAX_READ_LENGTH;
     if let Some(size) = mt.entry_size(relative) {
         if size > max_len {
-            return Err(ioerr(format!("file size {} exceeds limit {}", size, max_len)));
+            return Err(ioerr(format!(
+                "file size {} exceeds limit {}",
+                size, max_len
+            )));
         }
     }
     mt.read_range_limited(relative, 0, None, max_len)
@@ -202,8 +285,6 @@ fn materialize_pack_to_temp(
     virtual_path: &str,
     suffix: &str,
 ) -> Result<String, IOError> {
-    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(1);
-
     let mt = mount_table.ok_or_else(|| ioerr("mount table not initialized"))?;
     let relative = code_relative(virtual_path);
     if let Some(size) = mt.entry_size(relative) {
@@ -214,33 +295,46 @@ fn materialize_pack_to_temp(
             )));
         }
     }
-    let mut dir = mt.code_dir();
-    let parent = dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(std::env::temp_dir);
-    dir = parent.join(".migo-pack-materialized");
-    std::fs::create_dir_all(&dir).map_err(|e| ioerr(format!("temp dir create failed: {e}")))?;
+    fs_ops::materialize_mount_entry_to_temp(mt, relative, suffix)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(IOError::from)
+}
 
-    for _ in 0..32 {
-        let mut path = PathBuf::from(&dir);
-        let id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
-        path.push(format!("pack_{}_{}{}", std::process::id(), id, suffix));
-        let file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(ioerr(format!("temp file create failed: {e}"))),
-        };
-        let mut writer = std::io::BufWriter::new(file);
-        if let Err(e) = mt.copy_to_writer(relative, &mut writer) {
-            let _ = std::fs::remove_file(&path);
-            return Err(ioerr(format!("pack materialize failed: {e}")));
+fn materialize_pack_to_temp_checked(
+    scheduler: &IoScheduler,
+    mount_table: Option<&shared::vfs::MountTable>,
+    virtual_path: &str,
+    suffix: &str,
+) -> Result<String, IOError> {
+    scheduler.ensure_open().map_err(pool_err)?;
+    materialize_pack_to_temp(mount_table, virtual_path, suffix)
+}
+
+async fn materialize_pack_to_temp_async(
+    scheduler: Arc<IoScheduler>,
+    mount_table: Arc<shared::vfs::MountTable>,
+    virtual_path: String,
+    suffix: &'static str,
+) -> Result<String, IOError> {
+    let relative = code_relative(&virtual_path).to_string();
+    if let Some(size) = mount_table.entry_size(&relative) {
+        if size > MAX_MATERIALIZE_LENGTH {
+            return Err(ioerr(format!(
+                "file size {} exceeds materialize limit {}",
+                size, MAX_MATERIALIZE_LENGTH,
+            )));
         }
-        if let Err(e) = writer.flush() {
-            let _ = std::fs::remove_file(&path);
-            return Err(ioerr(format!("temp flush failed: {e}")));
-        }
-        return Ok(path.to_string_lossy().into_owned());
     }
 
-    Err(ioerr("failed to allocate unique temp file for pack materialization"))
+    let request = copy_request(BackendKind::Pack, RequestKind::Async);
+    scheduler
+        .run_async(request, move || {
+            fs_ops::materialize_mount_entry_to_temp(&mount_table, &relative, suffix)
+        })
+        .await
+        .map_err(pool_err)?
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(IOError::from)
 }
 
 /// Construct a StatResult for a pack-backed /code path.
@@ -277,9 +371,14 @@ fn pack_stat(
             // - Sorted by path (BTreeMap)
             use std::collections::BTreeMap;
             let mut out: BTreeMap<String, FileStat> = BTreeMap::new();
-            let mut stack: Vec<(String, String)> = children.iter()
+            let mut stack: Vec<(String, String)> = children
+                .iter()
                 .map(|name| {
-                    let full = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+                    let full = if rel.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{rel}/{name}")
+                    };
                     (name.clone(), full)
                 })
                 .collect();
@@ -287,14 +386,17 @@ fn pack_stat(
                 if mt.is_file(&full_path) {
                     // File entry — add to output.
                     let size = mt.entry_size(&full_path).unwrap_or(0);
-                    out.insert(rel_name, FileStat {
-                        mode: 0o444,
-                        size,
-                        atime: 0,
-                        mtime: 0,
-                        is_file: true,
-                        is_directory: false,
-                    });
+                    out.insert(
+                        rel_name,
+                        FileStat {
+                            mode: 0o444,
+                            size,
+                            atime: 0,
+                            mtime: 0,
+                            is_file: true,
+                            is_directory: false,
+                        },
+                    );
                 } else {
                     // Directory — recurse but don't add to output.
                     for child in mt.list_dir(&full_path) {
@@ -321,7 +423,10 @@ fn pack_stat(
     }
 
     // Not found — return error matching filesystem stat behavior.
-    Err(ioerr(format!("No such file or directory: {}", virtual_path)))
+    Err(ioerr(format!(
+        "No such file or directory: {}",
+        virtual_path
+    )))
 }
 
 // pack_get_file_info removed — pack getFileInfo now routes through IO thread
@@ -374,6 +479,28 @@ fn mode_from_append(append: bool) -> WriteMode {
     }
 }
 
+/// Copy a byte range out of a V8 BackingStore safely.
+fn copy_backing_store_bytes(
+    store: &v8::SharedRef<v8::BackingStore>,
+    range: std::ops::Range<usize>,
+) -> Result<Vec<u8>, IOError> {
+    let nn = store
+        .data()
+        .ok_or_else(|| ioerr("ArrayBuffer data is null"))?;
+    let total = store.byte_length();
+    if range.start > range.end || range.end > total {
+        return Err(ioerr(format!(
+            "invalid range: {:?}, total={}",
+            range, total
+        )));
+    }
+    let len = range.end - range.start;
+    let ptr = nn.as_ptr() as *const u8;
+    // SAFETY: bounds validated by byte_length.
+    let slice = unsafe { std::slice::from_raw_parts(ptr.add(range.start), len) };
+    Ok(slice.to_vec())
+}
+
 /// Prepare write data:
 /// - If `data_buf` exists: returns (store, range)
 /// - Else if `data_str` exists: encodes to Vec<u8>
@@ -413,7 +540,8 @@ pub async fn op_access(
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
         ResolvedPath::Pack { virtual_path } => {
             // Pack-backed: check existence via mount table.
-            Ok(mt.as_deref()
+            Ok(mt
+                .as_deref()
                 .map(|m| {
                     let rel = code_relative(&virtual_path);
                     m.exists_or_is_dir(rel)
@@ -421,14 +549,18 @@ pub async fn op_access(
                 .unwrap_or(false))
         }
         ResolvedPath::Filesystem(full_path) => {
-            let tx = get_io_tx_async(state);
-            protocol::send_fs_with_resp_async(&tx, |resp_tx| IOCmd::Access {
-                path: full_path,
-                resp: IOCmdResp::Async(resp_tx),
+            let vpath = path.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let t0 = std::time::Instant::now();
+                let r = fs_ops::access(&full_path);
+                let disk_us = t0.elapsed().as_micros();
+                tracing::info!("[IOTrace] access {}us path={}", disk_us, vpath);
+                r
             })
             .await
-            .map(|(is_file, is_dir, _size)| is_file || is_dir)
-            .map_err(IOError::from)
+            .map_err(|e| ioerr(format!("task join error: {e}")))?
+            .map_err(IOError::from)?;
+            Ok(result.0 || result.1)
         }
     }
 }
@@ -437,23 +569,16 @@ pub async fn op_access(
 pub fn op_access_sync(state: &mut OpState, #[string] path: String) -> Result<bool, IOError> {
     let (vfs, mt) = get_vfs_sync(state);
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
-        ResolvedPath::Pack { virtual_path } => {
-            Ok(mt.as_deref()
-                .map(|m| {
-                    let rel = code_relative(&virtual_path);
-                    m.exists_or_is_dir(rel)
-                })
-                .unwrap_or(false))
-        }
-        ResolvedPath::Filesystem(full_path) => {
-            let tx = get_io_tx_sync(state);
-            protocol::send_fs_with_resp_sync(tx, |resp_tx| IOCmd::Access {
-                path: full_path,
-                resp: IOCmdResp::Sync(resp_tx),
+        ResolvedPath::Pack { virtual_path } => Ok(mt
+            .as_deref()
+            .map(|m| {
+                let rel = code_relative(&virtual_path);
+                m.exists_or_is_dir(rel)
             })
+            .unwrap_or(false)),
+        ResolvedPath::Filesystem(full_path) => fs_ops::access(&full_path)
             .map(|(is_file, is_dir, _size)| is_file || is_dir)
-            .map_err(IOError::from)
-        }
+            .map_err(IOError::from),
     }
 }
 
@@ -470,35 +595,28 @@ pub async fn op_write_or_append_file(
     append: bool,
 ) -> Result<bool, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
-    let full_path = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Write)?)?;
-    let tx: UnboundedSender<IOCmd> = get_io_tx_async(state);
+    let full_path = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &path,
+        FileOp::Write,
+    )?)?;
     let mode = mode_from_append(append);
     let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
 
-    if let Some((store, range)) = buf_opt {
-        let r = protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::WriteShared {
-            path: full_path,
-            store,
-            range,
-            mode,
-            resp: IOCmdResp::Async(resp_tx),
-        })
-        .await;
-        return r.map_err(IOError::from);
-    }
+    // Extract bytes from SharedRef before spawn_blocking (SharedRef is not Send).
+    let bytes: Vec<u8> = if let Some((store, range)) = buf_opt {
+        copy_backing_store_bytes(&store, range)?
+    } else if let Some(data) = data_opt {
+        data
+    } else {
+        return Err(ioerr("No data provided"));
+    };
 
-    if let Some(data) = data_opt {
-        let r = protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Write {
-            path: full_path,
-            data,
-            mode,
-            resp: IOCmdResp::Async(resp_tx),
-        })
-        .await;
-        return r.map_err(IOError::from);
-    }
-
-    Err(ioerr("No data provided"))
+    tokio::task::spawn_blocking(move || fs_ops::write_file(&full_path, &bytes, mode))
+        .await
+        .map_err(|e| ioerr(format!("task join error: {e}")))?
+        .map_err(IOError::from)
 }
 
 #[op2]
@@ -511,33 +629,25 @@ pub fn op_write_or_append_file_sync(
     append: bool,
 ) -> Result<bool, IOError> {
     let (vfs, mt) = get_vfs_sync(state);
-    let full_path = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Write)?)?;
-    let tx = get_io_tx_sync(state);
+    let full_path = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &path,
+        FileOp::Write,
+    )?)?;
     let mode = mode_from_append(append);
     let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
 
-    if let Some((store, range)) = buf_opt {
-        let r = protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::WriteShared {
-            path: full_path,
-            store,
-            range,
-            mode,
-            resp: IOCmdResp::Sync(resp_tx),
-        });
-        return r.map_err(IOError::from);
-    }
+    // Extract bytes from SharedRef (for consistency, though sync ops run on V8 thread).
+    let bytes: Vec<u8> = if let Some((store, range)) = buf_opt {
+        copy_backing_store_bytes(&store, range)?
+    } else if let Some(data) = data_opt {
+        data
+    } else {
+        return Err(ioerr("No data provided"));
+    };
 
-    if let Some(data) = data_opt {
-        let r = protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Write {
-            path: full_path,
-            data,
-            mode,
-            resp: IOCmdResp::Sync(resp_tx),
-        });
-        return r.map_err(IOError::from);
-    }
-
-    Err(ioerr("No data provided"))
+    fs_ops::write_file(&full_path, &bytes, mode).map_err(IOError::from)
 }
 
 //
@@ -550,38 +660,60 @@ pub async fn op_open_file(
     #[string] flag: String,
 ) -> Result<u32, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     let open_flag = parse_open_flag(&flag)?;
     let vfs_op = open_flag_to_vfs_op(&open_flag);
-    let (full_path, cleanup_path, synthetic_stat) = match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, vfs_op)? {
-        ResolvedPath::Filesystem(p) => (p, None, None),
-        ResolvedPath::Pack { virtual_path } => {
-            if open_flag != OpenFlag::Read {
-                return Err(ioerr(format!("pack-backed open only supports read mode: {}", virtual_path)));
+    let (full_path, cleanup_path, synthetic_stat) =
+        match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, vfs_op)? {
+            ResolvedPath::Filesystem(p) => (p, None, None),
+            ResolvedPath::Pack { virtual_path } => {
+                if open_flag != OpenFlag::Read {
+                    return Err(ioerr(format!(
+                        "pack-backed open only supports read mode: {}",
+                        virtual_path
+                    )));
+                }
+                let mount_table = mt
+                    .clone()
+                    .ok_or_else(|| ioerr("mount table not initialized"))?;
+                let temp_path = materialize_pack_to_temp_async(
+                    Arc::clone(&scheduler),
+                    mount_table,
+                    virtual_path.clone(),
+                    ".open",
+                )
+                .await?;
+                let stat = match pack_stat(mt.as_deref(), &virtual_path, false)? {
+                    StatResult::Single(stat) => stat,
+                    StatResult::Recursive(_) => unreachable!(),
+                };
+                (temp_path.clone(), Some(temp_path), Some(stat))
             }
-            let temp_path = materialize_pack_to_temp(mt.as_deref(), &virtual_path, ".open")?;
-            let stat = match pack_stat(mt.as_deref(), &virtual_path, false)? {
-                StatResult::Single(stat) => stat,
-                StatResult::Recursive(_) => unreachable!(),
-            };
-            (temp_path.clone(), Some(temp_path), Some(stat))
-        }
-    };
-    let tx = get_io_tx_async(state);
+        };
+    let domain = scheduler.domain();
     let cleanup_on_error = cleanup_path.clone();
+    let cleanup_path_for_open = cleanup_path.map(PathBuf::from);
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Open {
-        path: full_path,
-        flag: open_flag,
-        cleanup_path,
-        synthetic_stat,
-        resp: IOCmdResp::Async(resp_tx),
+    tokio::task::spawn_blocking(move || {
+        domain.open_file(
+            PathBuf::from(full_path).as_path(),
+            open_flag,
+            cleanup_path_for_open,
+            synthetic_stat,
+        )
     })
     .await
+    .map_err(|e| ioerr(format!("task join error: {e}")))?
     .map_err(|e| {
         if let Some(path) = cleanup_on_error {
-            let _ = std::fs::remove_file(path);
+            scheduler
+                .domain()
+                .remove_temp_file(std::path::Path::new(&path));
         }
-        IOError::from(e)
+        domain_err(e)
     })
 }
 
@@ -591,62 +723,76 @@ pub fn op_open_file_sync(
     #[string] path: String,
     #[string] flag: String,
 ) -> Result<u32, IOError> {
+    let started_at = Instant::now();
     let (vfs, mt) = get_vfs_sync(state);
+    let scheduler = get_scheduler(state);
     let open_flag = parse_open_flag(&flag)?;
     let vfs_op = open_flag_to_vfs_op(&open_flag);
-    let (full_path, cleanup_path, synthetic_stat) = match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, vfs_op)? {
-        ResolvedPath::Filesystem(p) => (p, None, None),
-        ResolvedPath::Pack { virtual_path } => {
-            if open_flag != OpenFlag::Read {
-                return Err(ioerr(format!("pack-backed open only supports read mode: {}", virtual_path)));
+    let (full_path, cleanup_path, synthetic_stat) =
+        match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, vfs_op)? {
+            ResolvedPath::Filesystem(p) => (p, None, None),
+            ResolvedPath::Pack { virtual_path } => {
+                if open_flag != OpenFlag::Read {
+                    return Err(ioerr(format!(
+                        "pack-backed open only supports read mode: {}",
+                        virtual_path
+                    )));
+                }
+                let temp_path = materialize_pack_to_temp_checked(
+                    &scheduler,
+                    mt.as_deref(),
+                    &virtual_path,
+                    ".open",
+                )?;
+                let stat = match pack_stat(mt.as_deref(), &virtual_path, false)? {
+                    StatResult::Single(stat) => stat,
+                    StatResult::Recursive(_) => unreachable!(),
+                };
+                (temp_path.clone(), Some(temp_path), Some(stat))
             }
-            let temp_path = materialize_pack_to_temp(mt.as_deref(), &virtual_path, ".open")?;
-            let stat = match pack_stat(mt.as_deref(), &virtual_path, false)? {
-                StatResult::Single(stat) => stat,
-                StatResult::Recursive(_) => unreachable!(),
-            };
-            (temp_path.clone(), Some(temp_path), Some(stat))
-        }
-    };
-    let tx = get_io_tx_sync(state);
+        };
+    let domain = scheduler.domain();
     let cleanup_on_error = cleanup_path.clone();
+    let cleanup_path_for_open = cleanup_path.map(PathBuf::from);
 
-    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Open {
-        path: full_path,
-        flag: open_flag,
-        cleanup_path,
-        synthetic_stat,
-        resp: IOCmdResp::Sync(resp_tx),
-    })
-    .map_err(|e| {
-        if let Some(path) = cleanup_on_error {
-            let _ = std::fs::remove_file(path);
-        }
-        IOError::from(e)
-    })
+    let result = domain
+        .open_file(
+            PathBuf::from(full_path).as_path(),
+            open_flag,
+            cleanup_path_for_open,
+            synthetic_stat,
+        )
+        .map_err(|e| {
+            if let Some(path) = cleanup_on_error {
+                domain.remove_temp_file(std::path::Path::new(&path));
+            }
+            domain_err(e)
+        });
+
+    match &result {
+        Ok(rid) => trace_file_edge("open_sync", &path, started_at, &format!("rid={rid}")),
+        Err(err) => trace_file_edge("open_sync", &path, started_at, &format!("err={err}")),
+    }
+
+    result
 }
 
 #[op2(async(lazy), fast)]
 pub async fn op_close_file(state: Rc<RefCell<OpState>>, #[smi] rid: FileId) -> Result<(), IOError> {
-    let tx = get_io_tx_async(state);
+    let domain = {
+        let st = state.borrow();
+        get_scheduler(&st).domain()
+    };
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Close {
-        rid,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(IOError::from)
+    domain.close_file(rid).map_err(domain_err)
 }
 
 #[op2(fast)]
 pub fn op_close_file_sync(state: &mut OpState, #[smi] rid: FileId) -> Result<(), IOError> {
-    let tx = get_io_tx_sync(state);
-
-    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Close {
-        rid,
-        resp: IOCmdResp::Sync(resp_tx),
-    })
-    .map_err(IOError::from)
+    get_scheduler(state)
+        .domain()
+        .close_file(rid)
+        .map_err(domain_err)
 }
 
 //
@@ -659,25 +805,31 @@ pub async fn op_copy_file(
     #[string] dest_path: String,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     let src_resolved = resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &src_path, FileOp::Read)?;
-    let dest_full = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &dest_path, FileOp::Create)?)?;
-    let tx = get_io_tx_async(state);
+    let dest_full = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &dest_path,
+        FileOp::Create,
+    )?)?;
 
     match src_resolved {
         ResolvedPath::Filesystem(src_full) => {
-            protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Copy {
-                src_path: src_full,
-                dest_path: dest_full,
-                resp: IOCmdResp::Async(resp_tx),
-            })
-            .await
-            .map_err(IOError::from)
+            tokio::task::spawn_blocking(move || fs_ops::copy(&src_full, &dest_full))
+                .await
+                .map_err(|e| ioerr(format!("task join error: {e}")))?
+                .map_err(IOError::from)
         }
         ResolvedPath::Pack { virtual_path } => {
-            let m = mt.as_deref().ok_or_else(|| ioerr("mount table not initialized"))?;
-            let rel = code_relative(&virtual_path);
-            m.copy_to_path(rel, std::path::Path::new(&dest_full))
-                .map_err(|e| ioerr(format!("pack copy failed: {e}")))
+            let mount_table = mt
+                .clone()
+                .ok_or_else(|| ioerr("mount table not initialized"))?;
+            let rel = code_relative(&virtual_path).to_string();
+            copy_pack_file_async(scheduler, mount_table, rel, PathBuf::from(dest_full)).await
         }
     }
 }
@@ -690,23 +842,24 @@ pub fn op_copy_file_sync(
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
     let src_resolved = resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &src_path, FileOp::Read)?;
-    let dest_full = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &dest_path, FileOp::Create)?)?;
-    let tx = get_io_tx_sync(state);
+    let dest_full = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &dest_path,
+        FileOp::Create,
+    )?)?;
 
     match src_resolved {
         ResolvedPath::Filesystem(src_full) => {
-            protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Copy {
-                src_path: src_full,
-                dest_path: dest_full,
-                resp: IOCmdResp::Sync(resp_tx),
-            })
-            .map_err(IOError::from)
+            fs_ops::copy(&src_full, &dest_full).map_err(IOError::from)
         }
         ResolvedPath::Pack { virtual_path } => {
-            let m = mt.as_deref().ok_or_else(|| ioerr("mount table not initialized"))?;
+            let m = mt
+                .as_deref()
+                .ok_or_else(|| ioerr("mount table not initialized"))?;
             let rel = code_relative(&virtual_path);
-            m.copy_to_path(rel, std::path::Path::new(&dest_full))
-                .map_err(|e| ioerr(format!("pack copy failed: {e}")))
+            fs_ops::copy_mount_entry_to_path(m, rel, std::path::Path::new(&dest_full))
+                .map_err(IOError::from)
         }
     }
 }
@@ -720,26 +873,18 @@ pub async fn op_fstat(
     state: Rc<RefCell<OpState>>,
     #[smi] rid: FileId,
 ) -> Result<FileStat, IOError> {
-    let tx = get_io_tx_async(state);
+    let domain = {
+        let st = state.borrow();
+        get_scheduler(&st).domain()
+    };
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Fstat {
-        rid,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(IOError::from)
+    domain.fstat(rid).map_err(domain_err)
 }
 
 #[op2]
 #[serde]
 pub fn op_fstat_sync(state: &mut OpState, #[smi] rid: FileId) -> Result<FileStat, IOError> {
-    let tx = get_io_tx_sync(state);
-
-    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Fstat {
-        rid,
-        resp: IOCmdResp::Sync(resp_tx),
-    })
-    .map_err(IOError::from)
+    get_scheduler(state).domain().fstat(rid).map_err(domain_err)
 }
 
 #[op2(async(lazy), fast)]
@@ -748,15 +893,12 @@ pub async fn op_ftruncate(
     #[smi] rid: FileId,
     #[smi] len: u64,
 ) -> Result<(), IOError> {
-    let tx = get_io_tx_async(state);
+    let domain = {
+        let st = state.borrow();
+        get_scheduler(&st).domain()
+    };
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Ftruncate {
-        rid,
-        len,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(IOError::from)
+    domain.ftruncate(rid, len).map_err(domain_err)
 }
 
 #[op2(fast)]
@@ -765,14 +907,10 @@ pub fn op_ftruncate_sync(
     #[smi] rid: FileId,
     #[smi] len: u64,
 ) -> Result<(), IOError> {
-    let tx = get_io_tx_sync(state);
-
-    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Ftruncate {
-        rid,
-        len,
-        resp: IOCmdResp::Sync(resp_tx),
-    })
-    .map_err(IOError::from)
+    get_scheduler(state)
+        .domain()
+        .ftruncate(rid, len)
+        .map_err(domain_err)
 }
 
 //
@@ -785,16 +923,17 @@ pub async fn op_mkdir(
     recursive: bool,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_async(&state);
-    let full_path = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &dir_path, FileOp::Create)?)?;
-    let tx = get_io_tx_async(state);
+    let full_path = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &dir_path,
+        FileOp::Create,
+    )?)?;
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Mkdir {
-        dir_path: full_path,
-        recursive,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(IOError::from)
+    tokio::task::spawn_blocking(move || fs_ops::mkdir(&full_path, recursive))
+        .await
+        .map_err(|e| ioerr(format!("task join error: {e}")))?
+        .map_err(IOError::from)
 }
 
 #[op2(fast)]
@@ -804,15 +943,14 @@ pub fn op_mkdir_sync(
     recursive: bool,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
-    let full_path = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &dir_path, FileOp::Create)?)?;
-    let tx = get_io_tx_sync(state);
+    let full_path = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &dir_path,
+        FileOp::Create,
+    )?)?;
 
-    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Mkdir {
-        dir_path: full_path,
-        recursive,
-        resp: IOCmdResp::Sync(resp_tx),
-    })
-    .map_err(IOError::from)
+    fs_ops::mkdir(&full_path, recursive).map_err(IOError::from)
 }
 
 #[op2(async(lazy), fast)]
@@ -824,10 +962,15 @@ pub async fn op_readdir(
     let (vfs, mt) = get_vfs_async(&state);
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &dir_path, FileOp::Read)? {
         ResolvedPath::Pack { virtual_path } => {
-            let m = mt.as_deref().ok_or_else(|| ioerr("mount table not initialized"))?;
+            let m = mt
+                .as_deref()
+                .ok_or_else(|| ioerr("mount table not initialized"))?;
             let rel = code_relative(&virtual_path);
             if !m.exists_or_is_dir(rel) {
-                return Err(ioerr(format!("No such file or directory: {}", virtual_path)));
+                return Err(ioerr(format!(
+                    "No such file or directory: {}",
+                    virtual_path
+                )));
             }
             if m.is_file(rel) {
                 return Err(ioerr(format!("Not a directory: {}", virtual_path)));
@@ -835,13 +978,10 @@ pub async fn op_readdir(
             Ok(m.list_dir(rel))
         }
         ResolvedPath::Filesystem(full_path) => {
-            let tx = get_io_tx_async(state);
-            protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Readdir {
-                dir_path: full_path,
-                resp: IOCmdResp::Async(resp_tx),
-            })
-            .await
-            .map_err(IOError::from)
+            tokio::task::spawn_blocking(move || fs_ops::readdir(&full_path))
+                .await
+                .map_err(|e| ioerr(format!("task join error: {e}")))?
+                .map_err(IOError::from)
         }
     }
 }
@@ -855,24 +995,22 @@ pub fn op_readdir_sync(
     let (vfs, mt) = get_vfs_sync(state);
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &dir_path, FileOp::Read)? {
         ResolvedPath::Pack { virtual_path } => {
-            let m = mt.as_deref().ok_or_else(|| ioerr("mount table not initialized"))?;
+            let m = mt
+                .as_deref()
+                .ok_or_else(|| ioerr("mount table not initialized"))?;
             let rel = code_relative(&virtual_path);
             if !m.exists_or_is_dir(rel) {
-                return Err(ioerr(format!("No such file or directory: {}", virtual_path)));
+                return Err(ioerr(format!(
+                    "No such file or directory: {}",
+                    virtual_path
+                )));
             }
             if m.is_file(rel) {
                 return Err(ioerr(format!("Not a directory: {}", virtual_path)));
             }
             Ok(m.list_dir(rel))
         }
-        ResolvedPath::Filesystem(full_path) => {
-            let tx = get_io_tx_sync(state);
-            protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Readdir {
-                dir_path: full_path,
-                resp: IOCmdResp::Sync(resp_tx),
-            })
-            .map_err(IOError::from)
-        }
+        ResolvedPath::Filesystem(full_path) => fs_ops::readdir(&full_path).map_err(IOError::from),
     }
 }
 
@@ -885,28 +1023,30 @@ pub async fn op_unlink(
     #[string] file_path: String,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_async(&state);
-    let full_path = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &file_path, FileOp::Delete)?)?;
-    let tx = get_io_tx_async(state);
+    let full_path = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &file_path,
+        FileOp::Delete,
+    )?)?;
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Unlink {
-        file_path: full_path,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(IOError::from)
+    tokio::task::spawn_blocking(move || fs_ops::unlink(&full_path))
+        .await
+        .map_err(|e| ioerr(format!("task join error: {e}")))?
+        .map_err(IOError::from)
 }
 
 #[op2(fast)]
 pub fn op_unlink_sync(state: &mut OpState, #[string] file_path: String) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
-    let full_path = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &file_path, FileOp::Delete)?)?;
-    let tx = get_io_tx_sync(state);
+    let full_path = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &file_path,
+        FileOp::Delete,
+    )?)?;
 
-    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Unlink {
-        file_path: full_path,
-        resp: IOCmdResp::Sync(resp_tx),
-    })
-    .map_err(IOError::from)
+    fs_ops::unlink(&full_path).map_err(IOError::from)
 }
 
 #[op2(async(lazy), fast)]
@@ -917,17 +1057,23 @@ pub async fn op_rename(
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_async(&state);
     // Rename needs delete on source and create on destination
-    let old_full = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &old_path, FileOp::Delete)?)?;
-    let new_full = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &new_path, FileOp::Create)?)?;
-    let tx = get_io_tx_async(state);
+    let old_full = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &old_path,
+        FileOp::Delete,
+    )?)?;
+    let new_full = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &new_path,
+        FileOp::Create,
+    )?)?;
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Rename {
-        old_path: old_full,
-        new_path: new_full,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(IOError::from)
+    tokio::task::spawn_blocking(move || fs_ops::rename(&old_full, &new_full))
+        .await
+        .map_err(|e| ioerr(format!("task join error: {e}")))?
+        .map_err(IOError::from)
 }
 
 #[op2(fast)]
@@ -937,16 +1083,20 @@ pub fn op_rename_sync(
     #[string] new_path: String,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
-    let old_full = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &old_path, FileOp::Delete)?)?;
-    let new_full = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &new_path, FileOp::Create)?)?;
-    let tx = get_io_tx_sync(state);
+    let old_full = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &old_path,
+        FileOp::Delete,
+    )?)?;
+    let new_full = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &new_path,
+        FileOp::Create,
+    )?)?;
 
-    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Rename {
-        old_path: old_full,
-        new_path: new_full,
-        resp: IOCmdResp::Sync(resp_tx),
-    })
-    .map_err(IOError::from)
+    fs_ops::rename(&old_full, &new_full).map_err(IOError::from)
 }
 
 #[op2(async(lazy), fast)]
@@ -956,16 +1106,17 @@ pub async fn op_rmdir(
     recursive: bool,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_async(&state);
-    let full_path = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &dir_path, FileOp::Delete)?)?;
-    let tx = get_io_tx_async(state);
+    let full_path = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &dir_path,
+        FileOp::Delete,
+    )?)?;
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Rmdir {
-        dir_path: full_path,
-        recursive,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(IOError::from)
+    tokio::task::spawn_blocking(move || fs_ops::rmdir(&full_path, recursive))
+        .await
+        .map_err(|e| ioerr(format!("task join error: {e}")))?
+        .map_err(IOError::from)
 }
 
 #[op2(fast)]
@@ -975,15 +1126,14 @@ pub fn op_rmdir_sync(
     recursive: bool,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
-    let full_path = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &dir_path, FileOp::Delete)?)?;
-    let tx = get_io_tx_sync(state);
+    let full_path = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &dir_path,
+        FileOp::Delete,
+    )?)?;
 
-    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Rmdir {
-        dir_path: full_path,
-        recursive,
-        resp: IOCmdResp::Sync(resp_tx),
-    })
-    .map_err(IOError::from)
+    fs_ops::rmdir(&full_path, recursive).map_err(IOError::from)
 }
 
 //
@@ -998,18 +1148,12 @@ pub async fn op_stat(
 ) -> Result<StatResult, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
-        ResolvedPath::Pack { virtual_path } => {
-            pack_stat(mt.as_deref(), &virtual_path, recursive)
-        }
+        ResolvedPath::Pack { virtual_path } => pack_stat(mt.as_deref(), &virtual_path, recursive),
         ResolvedPath::Filesystem(full_path) => {
-            let tx = get_io_tx_async(state);
-            protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::Stat {
-                path: full_path,
-                recursive,
-                resp: IOCmdResp::Async(resp_tx),
-            })
-            .await
-            .map_err(IOError::from)
+            tokio::task::spawn_blocking(move || fs_ops::stat(&full_path, recursive))
+                .await
+                .map_err(|e| ioerr(format!("task join error: {e}")))?
+                .map_err(IOError::from)
         }
     }
 }
@@ -1023,17 +1167,9 @@ pub fn op_stat_sync(
 ) -> Result<StatResult, IOError> {
     let (vfs, mt) = get_vfs_sync(state);
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
-        ResolvedPath::Pack { virtual_path } => {
-            pack_stat(mt.as_deref(), &virtual_path, recursive)
-        }
+        ResolvedPath::Pack { virtual_path } => pack_stat(mt.as_deref(), &virtual_path, recursive),
         ResolvedPath::Filesystem(full_path) => {
-            let tx = get_io_tx_sync(state);
-            protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::Stat {
-                path: full_path,
-                recursive,
-                resp: IOCmdResp::Sync(resp_tx),
-            })
-            .map_err(IOError::from)
+            fs_ops::stat(&full_path, recursive).map_err(IOError::from)
         }
     }
 }
@@ -1051,31 +1187,25 @@ pub async fn op_write_file(
     #[string] encoding: Option<String>,
     #[bigint] position: Option<u64>,
 ) -> Result<usize, IOError> {
-    let tx = get_io_tx_async(state);
+    let domain = {
+        let st = state.borrow();
+        get_scheduler(&st).domain()
+    };
     let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
 
-    let r = if let Some((store, range)) = buf_opt {
-        protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::WriteFdShared {
-            rid,
-            store,
-            range,
-            position,
-            resp: IOCmdResp::Async(resp_tx),
-        })
-        .await
+    // Extract bytes from SharedRef before spawn_blocking (SharedRef is not Send).
+    let bytes: Vec<u8> = if let Some((store, range)) = buf_opt {
+        copy_backing_store_bytes(&store, range)?
     } else if let Some(data) = data_opt {
-        protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::WriteFd {
-            rid,
-            data,
-            position,
-            resp: IOCmdResp::Async(resp_tx),
-        })
-        .await
+        data
     } else {
         return Err(ioerr("No data provided"));
     };
 
-    r.map_err(IOError::from)
+    tokio::task::spawn_blocking(move || domain.write_file(rid, &bytes, position))
+        .await
+        .map_err(|e| ioerr(format!("task join error: {e}")))?
+        .map_err(domain_err)
 }
 
 #[op2]
@@ -1088,29 +1218,19 @@ pub fn op_write_file_sync(
     #[string] encoding: Option<String>,
     #[bigint] position: Option<u64>,
 ) -> Result<usize, IOError> {
-    let tx = get_io_tx_sync(state);
+    let domain = get_scheduler(state).domain();
     let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
 
-    let r = if let Some((store, range)) = buf_opt {
-        protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::WriteFdShared {
-            rid,
-            store,
-            range,
-            position,
-            resp: IOCmdResp::Sync(resp_tx),
-        })
+    // Extract bytes from SharedRef (for consistency).
+    let bytes: Vec<u8> = if let Some((store, range)) = buf_opt {
+        copy_backing_store_bytes(&store, range)?
     } else if let Some(data) = data_opt {
-        protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::WriteFd {
-            rid,
-            data,
-            position,
-            resp: IOCmdResp::Sync(resp_tx),
-        })
+        data
     } else {
         return Err(ioerr("No data provided"));
     };
 
-    r.map_err(IOError::from)
+    domain.write_file(rid, &bytes, position).map_err(domain_err)
 }
 
 //
@@ -1125,16 +1245,24 @@ pub async fn op_read_file(
     #[bigint] length: Option<u64>,
 ) -> Result<ToJsBuffer, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
+    let request_kind = RequestKind::Async;
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
         ResolvedPath::Pack { virtual_path } => {
-            let mt = mt.as_deref().ok_or_else(|| ioerr("mount table not initialized"))?;
-            let rel = code_relative(&virtual_path);
+            let mount_table = mt
+                .clone()
+                .ok_or_else(|| ioerr("mount table not initialized"))?;
+            let rel = code_relative(&virtual_path).to_string();
             let max_len = shared::protocol::io_cmd::MAX_READ_LENGTH;
             // Reject if explicit length > MAX_READ_LENGTH.
             if let Some(len) = length {
                 if len > max_len {
                     return Err(ioerr(format!(
-                        "read length {} exceeds limit {}", len, max_len,
+                        "read length {} exceeds limit {}",
+                        len, max_len,
                     )));
                 }
             }
@@ -1143,30 +1271,48 @@ pub async fn op_read_file(
             // unbounded reads from oversized pack entries regardless of
             // whether position is specified.
             if length.is_none() {
-                if let Some(entry_sz) = mt.entry_size(rel) {
+                if let Some(entry_sz) = mount_table.entry_size(&rel) {
                     let effective = entry_sz.saturating_sub(position.unwrap_or(0));
                     if effective > max_len {
                         return Err(ioerr(format!(
-                            "file size {} exceeds limit {}", effective, max_len,
+                            "file size {} exceeds limit {}",
+                            effective, max_len,
                         )));
                     }
                 }
             }
-            let data = mt.read_range_limited(rel, position.unwrap_or(0), length, max_len)
+            let request = read_request(BackendKind::Pack, request_kind, length);
+            let data = scheduler
+                .run_async(request, move || {
+                    mount_table.read_range_limited(&rel, position.unwrap_or(0), length, max_len)
+                })
+                .await
+                .map_err(pool_err)?
                 .map_err(|e| ioerr(format!("pack read failed: {e}")))?;
             Ok(data.into())
         }
         ResolvedPath::Filesystem(full_path) => {
-            let tx = get_io_tx_async(state);
-            protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ReadFile {
-                path: full_path,
-                position,
-                length,
-                resp: IOCmdResp::Async(resp_tx),
-            })
-            .await
-            .map(|data| data.into())
-            .map_err(IOError::from)
+            let vpath = path.clone();
+            let request = read_request(BackendKind::Filesystem, request_kind, length);
+            let data = scheduler
+                .run_async(request, move || {
+                    let t0 = std::time::Instant::now();
+                    let r = fs_ops::read_file(&full_path, position, length);
+                    let disk_us = t0.elapsed().as_micros();
+                    if let Ok(ref d) = r {
+                        tracing::info!(
+                            "[IOTrace] read {}us size={}B path={}",
+                            disk_us,
+                            d.len(),
+                            vpath
+                        );
+                    }
+                    r
+                })
+                .await
+                .map_err(pool_err)?
+                .map_err(IOError::from)?;
+            Ok(data.into())
         }
     }
 }
@@ -1179,50 +1325,69 @@ pub fn op_read_file_sync(
     #[bigint] position: Option<u64>,
     #[bigint] length: Option<u64>,
 ) -> Result<ToJsBuffer, IOError> {
+    let started_at = Instant::now();
     let (vfs, mt) = get_vfs_sync(state);
-    match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
-        ResolvedPath::Pack { virtual_path } => {
-            let mt = mt.as_deref().ok_or_else(|| ioerr("mount table not initialized"))?;
-            let rel = code_relative(&virtual_path);
-            let max_len = shared::protocol::io_cmd::MAX_READ_LENGTH;
-            // Reject if explicit length > MAX_READ_LENGTH.
-            if let Some(len) = length {
-                if len > max_len {
-                    return Err(ioerr(format!(
-                        "read length {} exceeds limit {}", len, max_len,
-                    )));
-                }
-            }
-            // When length is not specified, check the effective read size
-            // (entry_size - position) against the limit.  This prevents
-            // unbounded reads from oversized pack entries regardless of
-            // whether position is specified.
-            if length.is_none() {
-                if let Some(entry_sz) = mt.entry_size(rel) {
-                    let effective = entry_sz.saturating_sub(position.unwrap_or(0));
-                    if effective > max_len {
+    let scheduler = get_scheduler(state);
+    let request_kind = RequestKind::Sync;
+    let result: Result<ToJsBuffer, IOError> =
+        match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
+            ResolvedPath::Pack { virtual_path } => {
+                let mount_table = mt
+                    .clone()
+                    .ok_or_else(|| ioerr("mount table not initialized"))?;
+                let rel = code_relative(&virtual_path).to_string();
+                let max_len = shared::protocol::io_cmd::MAX_READ_LENGTH;
+                // Reject if explicit length > MAX_READ_LENGTH.
+                if let Some(len) = length {
+                    if len > max_len {
                         return Err(ioerr(format!(
-                            "file size {} exceeds limit {}", effective, max_len,
+                            "read length {} exceeds limit {}",
+                            len, max_len,
                         )));
                     }
                 }
+                // When length is not specified, check the effective read size
+                // (entry_size - position) against the limit.  This prevents
+                // unbounded reads from oversized pack entries regardless of
+                // whether position is specified.
+                if length.is_none() {
+                    if let Some(entry_sz) = mount_table.entry_size(&rel) {
+                        let effective = entry_sz.saturating_sub(position.unwrap_or(0));
+                        if effective > max_len {
+                            return Err(ioerr(format!(
+                                "file size {} exceeds limit {}",
+                                effective, max_len,
+                            )));
+                        }
+                    }
+                }
+                let request = read_request(BackendKind::Pack, request_kind, length);
+                let data = scheduler
+                    .run_sync(&request, move || {
+                        mount_table.read_range_limited(&rel, position.unwrap_or(0), length, max_len)
+                    })
+                    .map_err(pool_err)?
+                    .map_err(|e| ioerr(format!("pack read failed: {e}")))?;
+                Ok(data.into())
             }
-            let data = mt.read_range_limited(rel, position.unwrap_or(0), length, max_len)
-                .map_err(|e| ioerr(format!("pack read failed: {e}")))?;
-            Ok(data.into())
-        }
-        ResolvedPath::Filesystem(full_path) => {
-            let tx = get_io_tx_sync(state);
-            protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::ReadFile {
-                path: full_path,
-                position,
-                length,
-                resp: IOCmdResp::Sync(resp_tx),
-            })
-            .map(|data| data.into())
-            .map_err(IOError::from)
-        }
+            ResolvedPath::Filesystem(full_path) => {
+                let request = read_request(BackendKind::Filesystem, request_kind, length);
+                let data = scheduler
+                    .run_sync(&request, move || {
+                        fs_ops::read_file(&full_path, position, length)
+                    })
+                    .map_err(pool_err)?
+                    .map_err(IOError::from)?;
+                Ok(data.into())
+            }
+        };
+
+    match &result {
+        Ok(_) => trace_file_edge("read_file_sync", &path, started_at, "ok"),
+        Err(err) => trace_file_edge("read_file_sync", &path, started_at, &format!("err={err}")),
     }
+
+    result
 }
 
 //
@@ -1236,17 +1401,19 @@ pub async fn op_read_fd(
     #[bigint] length: u64,
     #[bigint] position: Option<u64>,
 ) -> Result<ToJsBuffer, IOError> {
-    let tx = get_io_tx_async(state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
+    let domain = scheduler.domain();
+    let request = read_request(BackendKind::Filesystem, RequestKind::Async, Some(length));
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ReadFd {
-        rid,
-        length,
-        position,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map(|data| data.into())
-    .map_err(IOError::from)
+    scheduler
+        .run_async(request, move || domain.read_file(rid, length, position))
+        .await
+        .map_err(pool_err)?
+        .map(|data| data.into())
+        .map_err(domain_err)
 }
 
 #[op2]
@@ -1257,16 +1424,24 @@ pub fn op_read_fd_sync(
     #[bigint] length: u64,
     #[bigint] position: Option<u64>,
 ) -> Result<ToJsBuffer, IOError> {
-    let tx = get_io_tx_sync(state);
+    let started_at = Instant::now();
+    let scheduler = get_scheduler(state);
+    let domain = scheduler.domain();
+    let request = read_request(BackendKind::Filesystem, RequestKind::Sync, Some(length));
 
-    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::ReadFd {
-        rid,
-        length,
-        position,
-        resp: IOCmdResp::Sync(resp_tx),
-    })
-    .map(|data| data.into())
-    .map_err(IOError::from)
+    let target = format!("rid={rid}");
+    let result: Result<ToJsBuffer, IOError> = scheduler
+        .run_sync(&request, move || domain.read_file(rid, length, position))
+        .map_err(pool_err)?
+        .map(|data| data.into())
+        .map_err(domain_err);
+
+    match &result {
+        Ok(_) => trace_file_edge("read_fd_sync", &target, started_at, "ok"),
+        Err(err) => trace_file_edge("read_fd_sync", &target, started_at, &format!("err={err}")),
+    }
+
+    result
 }
 
 //
@@ -1279,23 +1454,20 @@ pub async fn op_read_compressed_file(
     #[string] path: String,
 ) -> Result<ToJsBuffer, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
-    let (full_path, pack_data) = match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
-        ResolvedPath::Filesystem(p) => (p, None),
-        ResolvedPath::Pack { virtual_path } => {
-            let data = read_pack_bytes(mt.as_deref(), &virtual_path)?;
-            (virtual_path, Some(data))
-        }
-    };
-    let tx = get_io_tx_async(state);
+    let (full_path, pack_data) =
+        match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
+            ResolvedPath::Filesystem(p) => (p, None),
+            ResolvedPath::Pack { virtual_path } => {
+                let data = read_pack_bytes(mt.as_deref(), &virtual_path)?;
+                (virtual_path, Some(data))
+            }
+        };
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ReadCompressedFile {
-        path: full_path,
-        pack_data,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map(|data| data.into())
-    .map_err(IOError::from)
+    tokio::task::spawn_blocking(move || fs_ops::read_compressed_file(&full_path, pack_data))
+        .await
+        .map_err(|e| ioerr(format!("task join error: {e}")))?
+        .map(|data| data.into())
+        .map_err(IOError::from)
 }
 
 #[op2]
@@ -1305,22 +1477,18 @@ pub fn op_read_compressed_file_sync(
     #[string] path: String,
 ) -> Result<ToJsBuffer, IOError> {
     let (vfs, mt) = get_vfs_sync(state);
-    let (full_path, pack_data) = match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
-        ResolvedPath::Filesystem(p) => (p, None),
-        ResolvedPath::Pack { virtual_path } => {
-            let data = read_pack_bytes(mt.as_deref(), &virtual_path)?;
-            (virtual_path, Some(data))
-        }
-    };
-    let tx = get_io_tx_sync(state);
+    let (full_path, pack_data) =
+        match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
+            ResolvedPath::Filesystem(p) => (p, None),
+            ResolvedPath::Pack { virtual_path } => {
+                let data = read_pack_bytes(mt.as_deref(), &virtual_path)?;
+                (virtual_path, Some(data))
+            }
+        };
 
-    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::ReadCompressedFile {
-        path: full_path,
-        pack_data,
-        resp: IOCmdResp::Sync(resp_tx),
-    })
-    .map(|data| data.into())
-    .map_err(IOError::from)
+    fs_ops::read_compressed_file(&full_path, pack_data)
+        .map(|data| data.into())
+        .map_err(IOError::from)
 }
 
 // ============================ ReadZipEntry ============================
@@ -1333,27 +1501,45 @@ pub async fn op_read_zip_entry(
     #[string] entries_json: String,
 ) -> Result<serde_json::Value, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
-    let (full_path, pack_data, cleanup_path) = match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &zip_path, FileOp::Read)? {
-        ResolvedPath::Filesystem(p) => (p, None, None),
-        ResolvedPath::Pack { virtual_path } => {
-            let temp_path = materialize_pack_to_temp(mt.as_deref(), &virtual_path, ".zip")?;
-            (temp_path.clone(), None, Some(temp_path))
-        }
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
     };
-    let tx = get_io_tx_async(state);
+    let (full_path, pack_data, cleanup_path) =
+        match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &zip_path, FileOp::Read)? {
+            ResolvedPath::Filesystem(p) => (p, None, None),
+            ResolvedPath::Pack { virtual_path } => {
+                let mount_table = mt
+                    .clone()
+                    .ok_or_else(|| ioerr("mount table not initialized"))?;
+                let temp_path = materialize_pack_to_temp_async(
+                    Arc::clone(&scheduler),
+                    mount_table,
+                    virtual_path,
+                    ".zip",
+                )
+                .await?;
+                scheduler
+                    .domain()
+                    .register_temp_file(PathBuf::from(temp_path.clone()));
+                (temp_path.clone(), None, Some(temp_path))
+            }
+        };
 
-    let results = protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ReadZipEntry {
-        zip_path: full_path,
-        entries_json,
-        pack_data,
-        resp: IOCmdResp::Async(resp_tx),
-    }).await;
+    let results = tokio::task::spawn_blocking(move || {
+        fs_ops::read_zip_entry(&full_path, &entries_json, pack_data)
+    })
+    .await;
 
     if let Some(path) = &cleanup_path {
-        let _ = std::fs::remove_file(path);
+        scheduler
+            .domain()
+            .remove_temp_file(std::path::Path::new(path));
     }
 
-    let results = results.map_err(IOError::from)?;
+    let results = results
+        .map_err(|e| ioerr(format!("task join error: {e}")))?
+        .map_err(IOError::from)?;
 
     // Build serde_json::Value — serde_v8 serializes this directly to a V8 object
     // (no JSON stringify/parse round-trip).
@@ -1376,56 +1562,93 @@ pub async fn op_read_zip_entry(
 /// Unzip operation with platform service dispatch.
 ///
 /// If the platform provides a `FileService` (e.g. Android's JNI `java.util.zip`),
-/// uses that. Otherwise falls back to `IOCmd::Unzip` (Rust `zip` crate on IO thread).
+/// uses that. Otherwise falls back to Rust `zip` crate via the archive scheduler pool.
 #[op2(async(lazy), fast)]
 pub async fn op_unzip(
     state: Rc<RefCell<OpState>>,
     #[string] zip_file_path: String,
     #[string] target_path: String,
 ) -> Result<(), IOError> {
-    let (io_tx, vfs, mt, file_svc) = {
+    let (vfs, mt, file_svc) = {
         let st = state.borrow();
         let host = st.borrow::<HostOpState>();
         let file_svc = host.device_services.as_ref().and_then(|s| s.file());
-        (host.io_tx.clone(), host.vfs.clone(), host.mount_table.clone(), file_svc)
+        (host.vfs.clone(), host.mount_table.clone(), file_svc)
+    };
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
     };
 
-    let (full_zip_path, cleanup_path) = match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &zip_file_path, FileOp::Read)? {
-        ResolvedPath::Filesystem(p) => (p, None),
-        ResolvedPath::Pack { virtual_path } => {
-            let temp_path = materialize_pack_to_temp(mt.as_deref(), &virtual_path, ".unzip")?;
-            (temp_path.clone(), Some(temp_path))
-        }
-    };
-    let full_dest_dir = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &target_path, FileOp::Write)?)?;
+    let (full_zip_path, cleanup_path) =
+        match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &zip_file_path, FileOp::Read)? {
+            ResolvedPath::Filesystem(p) => (p, None),
+            ResolvedPath::Pack { virtual_path } => {
+                let mount_table = mt
+                    .clone()
+                    .ok_or_else(|| ioerr("mount table not initialized"))?;
+                let temp_path = materialize_pack_to_temp_async(
+                    Arc::clone(&scheduler),
+                    mount_table,
+                    virtual_path,
+                    ".unzip",
+                )
+                .await?;
+                scheduler
+                    .domain()
+                    .register_temp_file(PathBuf::from(temp_path.clone()));
+                (temp_path.clone(), Some(temp_path))
+            }
+        };
+    let full_dest_dir = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &target_path,
+        FileOp::Write,
+    )?)?;
 
     // Platform-specific unzip (e.g. Android JNI)
     if let Some(svc) = file_svc {
         let zip = full_zip_path.clone();
         let dest = full_dest_dir.clone();
-        let result = tokio::task::spawn_blocking(move || svc.unzip(&zip, &dest))
+        let compressed_bytes = std::fs::metadata(&zip)
+            .map(|meta| meta.len() as usize)
+            .unwrap_or(0);
+        let result = scheduler
+            .run_async(
+                IoRequest::Unzip {
+                    backend: BackendKind::Archive,
+                    priority: PriorityClass::Background,
+                    compressed_bytes,
+                },
+                move || svc.unzip(&zip, &dest),
+            )
             .await
-            .map_err(|e| IOError::Message(format!("unzip task join error: {e}")))?
+            .map_err(pool_err)?
             .map(|_| ())
             .map_err(|e| IOError::Message(e.to_string()));
         if let Some(path) = cleanup_path {
-            let _ = std::fs::remove_file(path);
+            scheduler
+                .domain()
+                .remove_temp_file(std::path::Path::new(&path));
         }
         return result;
     }
 
-    // Default: Rust zip crate via IO thread
-    let result = protocol::send_fs_with_resp_async(&io_tx, move |resp_tx| IOCmd::Unzip {
-        zip_path: full_zip_path,
-        dest_dir: full_dest_dir,
-        resp: IOCmdResp::Async(resp_tx),
-    })
+    let result = io::extract_zip_with_scheduler(
+        Arc::clone(&scheduler),
+        PathBuf::from(&full_zip_path),
+        PathBuf::from(&full_dest_dir),
+        None,
+    )
     .await
-    .map(|_| ()) // Discard file count, JS doesn't need it
-    .map_err(IOError::from);
+    .map(|_| ())
+    .map_err(|e| IOError::from(EngineError::new(ErrorCode::IoError).with_detail(e.to_string())));
 
     if let Some(path) = cleanup_path {
-        let _ = std::fs::remove_file(path);
+        scheduler
+            .domain()
+            .remove_temp_file(std::path::Path::new(&path));
     }
     result
 }
@@ -1440,25 +1663,24 @@ pub async fn op_get_file_info(
     #[string] algorithm: String,
 ) -> Result<(u64, String), IOError> {
     let (vfs, mt) = get_vfs_async(&state);
-    let (full_path, pack_data) = match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
-        ResolvedPath::Pack { virtual_path } => {
-            let m = mt.as_deref().ok_or_else(|| ioerr("mount table not initialized"))?;
-            let rel = code_relative(&virtual_path);
-            return m
-                .get_file_info(rel, &algorithm)
-                .map_err(|e| ioerr(format!("pack getFileInfo failed: {e}")));
-        }
-        ResolvedPath::Filesystem(fp) => (fp, None),
-    };
-    let tx = get_io_tx_async(state);
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::GetFileInfo {
-        path: full_path,
-        algorithm,
-        pack_data,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(IOError::from)
+    let (full_path, pack_data) =
+        match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
+            ResolvedPath::Pack { virtual_path } => {
+                let m = mt
+                    .as_deref()
+                    .ok_or_else(|| ioerr("mount table not initialized"))?;
+                let rel = code_relative(&virtual_path);
+                return m
+                    .get_file_info(rel, &algorithm)
+                    .map_err(|e| ioerr(format!("pack getFileInfo failed: {e}")));
+            }
+            ResolvedPath::Filesystem(fp) => (fp, None),
+        };
+
+    tokio::task::spawn_blocking(move || fs_ops::get_file_info(&full_path, &algorithm, pack_data))
+        .await
+        .map_err(|e| ioerr(format!("task join error: {e}")))?
+        .map_err(IOError::from)
 }
 
 #[op2]
@@ -1469,24 +1691,21 @@ pub fn op_get_file_info_sync(
     #[string] algorithm: String,
 ) -> Result<(u64, String), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
-    let (full_path, pack_data) = match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
-        ResolvedPath::Pack { virtual_path } => {
-            let m = mt.as_deref().ok_or_else(|| ioerr("mount table not initialized"))?;
-            let rel = code_relative(&virtual_path);
-            return m
-                .get_file_info(rel, &algorithm)
-                .map_err(|e| ioerr(format!("pack getFileInfo failed: {e}")));
-        }
-        ResolvedPath::Filesystem(fp) => (fp, None),
-    };
-    let tx = get_io_tx_sync(state);
-    protocol::send_fs_with_resp_sync(tx, move |resp_tx| IOCmd::GetFileInfo {
-        path: full_path,
-        algorithm,
-        pack_data,
-        resp: IOCmdResp::Sync(resp_tx),
-    })
-    .map_err(IOError::from)
+    let (full_path, pack_data) =
+        match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
+            ResolvedPath::Pack { virtual_path } => {
+                let m = mt
+                    .as_deref()
+                    .ok_or_else(|| ioerr("mount table not initialized"))?;
+                let rel = code_relative(&virtual_path);
+                return m
+                    .get_file_info(rel, &algorithm)
+                    .map_err(|e| ioerr(format!("pack getFileInfo failed: {e}")));
+            }
+            ResolvedPath::Filesystem(fp) => (fp, None),
+        };
+
+    fs_ops::get_file_info(&full_path, &algorithm, pack_data).map_err(IOError::from)
 }
 
 // ============================ ListSavedFiles ============================
@@ -1499,16 +1718,187 @@ pub async fn op_list_saved_files(
     #[string] prefix: String,
 ) -> Result<Vec<SavedFileInfo>, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
-    let full_dir = require_fs_path(resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &dir, FileOp::Read)?)?;
+    let full_dir = require_fs_path(resolve_path_vfs(
+        vfs.as_deref(),
+        mt.as_deref(),
+        &dir,
+        FileOp::Read,
+    )?)?;
     let virtual_dir = dir;
-    let tx = get_io_tx_async(state);
 
-    protocol::send_fs_with_resp_async(&tx, move |resp_tx| IOCmd::ListSavedFiles {
-        dir: full_dir,
-        prefix,
-        virtual_dir,
-        resp: IOCmdResp::Async(resp_tx),
-    })
-    .await
-    .map_err(IOError::from)
+    tokio::task::spawn_blocking(move || fs_ops::list_saved_files(&full_dir, &prefix, &virtual_dir))
+        .await
+        .map_err(|e| ioerr(format!("task join error: {e}")))?
+        .map_err(IOError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use ::io::scheduler::IoScheduler;
+    use shared::vfs::{MountBackend, MountTable};
+
+    use super::{
+        copy_pack_file_async, materialize_pack_to_temp_async, materialize_pack_to_temp_checked,
+    };
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("migo_js_file_{label}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[derive(Debug)]
+    struct TrackingBackend {
+        data: Vec<u8>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MountBackend for TrackingBackend {
+        fn read(&self, _relative_path: &str) -> io::Result<Vec<u8>> {
+            Ok(self.data.clone())
+        }
+
+        fn exists(&self, _relative_path: &str) -> bool {
+            true
+        }
+
+        fn real_path(&self, _relative_path: &str) -> Option<PathBuf> {
+            None
+        }
+
+        fn root_dir(&self) -> Option<&Path> {
+            None
+        }
+
+        fn copy_to_writer(
+            &self,
+            _relative_path: &str,
+            writer: &mut dyn io::Write,
+        ) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            writer.write_all(&self.data)
+        }
+
+        fn is_file(&self, relative_path: &str) -> bool {
+            relative_path == "copy.txt"
+        }
+    }
+
+    #[test]
+    fn async_pack_copy_uses_scheduler_worker_path() {
+        let scheduler = Arc::new(IoScheduler::new(19));
+        let dir = temp_dir("pack_copy_async");
+        let base = dir.join("base");
+        let dest = dir.join("dest.txt");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mount_table = Arc::new(MountTable::new(base));
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(mount_table.mount_overlay(
+            "overlay".to_string(),
+            String::new(),
+            Arc::new(TrackingBackend {
+                data: b"pack-copy".to_vec(),
+                calls: Arc::clone(&calls),
+            }),
+        ));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(copy_pack_file_async(
+                Arc::clone(&scheduler),
+                Arc::clone(&mount_table),
+                "copy.txt".to_string(),
+                dest.clone(),
+            ))
+            .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"pack-copy");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn async_pack_materialization_uses_scheduler_worker_path() {
+        let scheduler = Arc::new(IoScheduler::new(23));
+        let dir = temp_dir("pack_materialize_async");
+        let base = dir.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mount_table = Arc::new(MountTable::new(base));
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(mount_table.mount_overlay(
+            "overlay".to_string(),
+            String::new(),
+            Arc::new(TrackingBackend {
+                data: b"pack-materialized".to_vec(),
+                calls: Arc::clone(&calls),
+            }),
+        ));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let materialized = runtime
+            .block_on(materialize_pack_to_temp_async(
+                Arc::clone(&scheduler),
+                Arc::clone(&mount_table),
+                "/code/copy.txt".to_string(),
+                ".materialized",
+            ))
+            .unwrap();
+
+        assert_eq!(std::fs::read(&materialized).unwrap(), b"pack-materialized");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(&materialized);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_pack_materialization_skips_copy_when_scheduler_is_closed() {
+        let scheduler = IoScheduler::new(29);
+        scheduler.close();
+
+        let dir = temp_dir("pack_materialize_sync_closed");
+        let base = dir.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mount_table = MountTable::new(base);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(mount_table.mount_overlay(
+            "overlay".to_string(),
+            String::new(),
+            Arc::new(TrackingBackend {
+                data: b"pack-materialized".to_vec(),
+                calls: Arc::clone(&calls),
+            }),
+        ));
+
+        let result = materialize_pack_to_temp_checked(
+            &scheduler,
+            Some(&mount_table),
+            "/code/copy.txt",
+            ".materialized",
+        );
+
+        assert!(
+            matches!(result, Err(super::IOError::Message(msg)) if msg == "IO worker pool closed")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

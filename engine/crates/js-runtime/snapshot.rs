@@ -30,20 +30,23 @@
 use deno_core::{Extension, ExtensionArguments};
 use shared::op_state::HostOpState;
 
-use crate::{base, console, env, event, file, input, lifecycle, network, rendering, storage, url, utility, web};
+use crate::{
+    base, console, env, event, file, input, io_state, lifecycle, network, rendering, storage, url,
+    utility, web,
+};
 
 #[cfg(feature = "api-sensors")]
 use crate::device;
-#[cfg(feature = "api-system")]
-use crate::{ui, update, ad};
 #[cfg(feature = "api-connectivity")]
 use crate::system;
-#[cfg(feature = "api-media")]
-use crate::{audio, media};
 #[cfg(feature = "api-system")]
 use crate::worker;
+#[cfg(feature = "api-system")]
+use crate::{ad, ui, update};
+#[cfg(feature = "api-media")]
+use crate::{audio, media};
 #[cfg(feature = "api-commerce")]
-use crate::{share, payment};
+use crate::{payment, share};
 
 /// Embedded snapshot bytes.
 ///
@@ -71,6 +74,7 @@ pub fn lazy_extensions() -> Vec<Extension> {
 
     // ---- CORE extensions (always loaded) ----
     exts.push(base::host_v8_base::lazy_init());
+    exts.push(io_state::host_v8_io_state::lazy_init());
     exts.extend(console::console_lazy_extensions());
     exts.extend(event::event_lazy_extensions());
     exts.extend(utility::utility_lazy_extensions());
@@ -139,6 +143,7 @@ pub fn extension_args(host: HostOpState) -> Vec<ExtensionArguments> {
 
     // ---- CORE extensions (always loaded) ----
     args.push(base::host_v8_base::args(host));
+    args.push(io_state::host_v8_io_state::args());
     args.push(console::host_v8_console::args());
     args.push(event::host_v8_event::args());
     args.push(utility::host_v8_utility::args());
@@ -197,4 +202,63 @@ pub fn extension_args(host: HostOpState) -> Vec<ExtensionArguments> {
     args.push(super::runtime::args());
 
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc, sync::atomic::AtomicBool};
+
+    use shared::{
+        channel::ThreadWakeup,
+        device::gpu_caps::GpuCaps,
+        op_state::{AudioSender, HostOpState, NetworkPolicy},
+        render_command_sender::CommandSender,
+    };
+    use tokio::sync::mpsc;
+
+    fn test_host_state() -> HostOpState {
+        let (render_tx, _render_rx) = CommandSender::new();
+        let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
+        let (host_tx, _host_rx) = mpsc::channel(1);
+
+        HostOpState {
+            id: 1,
+            app_cache_dir: PathBuf::from("/tmp/cache"),
+            app_files_dir: PathBuf::from("/tmp/files"),
+            code_dir: None,
+            game_paths: None,
+            vfs: None,
+            mount_table: None,
+            render_tx,
+            audio_tx: AudioSender::new(audio_raw_tx, ThreadWakeup::new()),
+            host_tx,
+            device_services: None,
+            raf_rx: None,
+            sub_packages: Vec::new(),
+            workers_path: None,
+            network_policy: NetworkPolicy::default(),
+            backgrounded: Arc::new(AtomicBool::new(false)),
+            code_signing_enabled: false,
+            gpu_caps: GpuCaps::new(),
+        }
+    }
+
+    #[test]
+    fn snapshot_extensions_match_main_runtime_order() {
+        let main_names: Vec<_> = crate::main_extensions(test_host_state())
+            .into_iter()
+            .map(|ext| ext.name)
+            .collect();
+        let lazy_names: Vec<_> = super::lazy_extensions()
+            .into_iter()
+            .map(|ext| ext.name)
+            .collect();
+        let arg_names: Vec<_> = super::extension_args(test_host_state())
+            .into_iter()
+            .map(|arg| arg.name)
+            .collect();
+
+        assert_eq!(lazy_names, main_names);
+        assert_eq!(arg_names, main_names);
+    }
 }

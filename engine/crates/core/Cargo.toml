@@ -28,7 +28,7 @@ deno_core = { workspace = true }
 parking_lot = { workspace = true }
 
 # On non-Android platforms, enable Rust-native implementations:
-# - zip-extract: IOCmd::Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)
+# - zip-extract: Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)
 # - codec-gbk: GBK encoding via `encoding_rs` crate (Android uses java.nio.charset via JNI)
 # - rust-image-decode: image/zune-image decoders (Android uses BitmapFactory via JNI)
 [target.'cfg(not(target_os = "android"))'.dependencies]

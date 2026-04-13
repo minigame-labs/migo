@@ -1513,6 +1513,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "zip",
 ]
 
 [[package]]
