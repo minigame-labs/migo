@@ -5,9 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use shared::error::{EngineError, ErrorCode, io_error_to_error_code};
+use shared::error::{EngineError, ErrorCode};
 
 use crate::{
+    fs_ops::io_err,
     pools::PoolError,
     scheduler::IoScheduler,
     task::{IoRequest, PriorityClass, RequestKind},
@@ -18,34 +19,15 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn io_err(e: std::io::Error) -> EngineError {
-    let detail = e.to_string();
-    let code = io_error_to_error_code(&e);
-    EngineError::new(code).with_detail(detail)
-}
-
-#[inline]
 fn pool_err(err: PoolError) -> EngineError {
-    match err {
-        PoolError::Closed => {
-            EngineError::new(ErrorCode::IoError).with_detail("IO worker pool closed")
-        }
-    }
-}
-
-#[inline]
-fn storage_priority(request: RequestKind) -> PriorityClass {
-    match request {
-        RequestKind::Sync => PriorityClass::ForegroundBlocking,
-        RequestKind::Async => PriorityClass::ForegroundAsync,
-    }
+    EngineError::from(err)
 }
 
 #[inline]
 fn storage_get_request(request: RequestKind, estimated_bytes: usize) -> IoRequest {
     IoRequest::StorageGet {
         request,
-        priority: storage_priority(request),
+        priority: PriorityClass::from(request),
         estimated_bytes,
     }
 }
@@ -54,7 +36,7 @@ fn storage_get_request(request: RequestKind, estimated_bytes: usize) -> IoReques
 fn storage_mutate_request(request: RequestKind) -> IoRequest {
     IoRequest::StorageMutate {
         request,
-        priority: storage_priority(request),
+        priority: PriorityClass::from(request),
     }
 }
 
@@ -62,7 +44,7 @@ fn storage_mutate_request(request: RequestKind) -> IoRequest {
 fn storage_info_request(request: RequestKind) -> IoRequest {
     IoRequest::StorageInfo {
         request,
-        priority: storage_priority(request),
+        priority: PriorityClass::from(request),
     }
 }
 

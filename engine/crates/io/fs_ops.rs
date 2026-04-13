@@ -27,7 +27,7 @@ use shared::{
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn io_err(e: std::io::Error) -> EngineError {
+pub(crate) fn io_err(e: std::io::Error) -> EngineError {
     let detail = e.to_string();
     let code = io_error_to_error_code(&e);
     EngineError::new(code).with_detail(detail)
@@ -96,6 +96,7 @@ fn get_mode(meta: &std::fs::Metadata) -> u32 {
 }
 
 /// Read from a `std::io::Read` with an upper bound on total bytes.
+#[cfg(feature = "compress-brotli")]
 fn read_to_end_limited<R: Read>(
     reader: &mut R,
     max_len: u64,
@@ -1444,6 +1445,7 @@ mod tests {
         assert!(files.is_empty());
     }
 
+    #[cfg(feature = "compress-brotli")]
     #[test]
     fn read_to_end_limited_rejects_oversized() {
         let mut reader = std::io::Cursor::new(vec![1u8; 16]);

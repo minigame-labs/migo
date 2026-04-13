@@ -77,14 +77,11 @@ pub enum IoRequest {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IoResult {
-    ReadFile { bytes_read: usize },
-    GetFileInfo { size: u64 },
-    DecodeImage { width: u32, height: u32 },
-    Unzip { extracted_entries: usize },
-    PackageIngest { packaged_entries: usize },
-    StorageGet { bytes_read: usize },
-    StorageMutate,
-    StorageInfo { bytes_read: usize },
+impl From<RequestKind> for PriorityClass {
+    fn from(kind: RequestKind) -> Self {
+        match kind {
+            RequestKind::Sync => PriorityClass::ForegroundBlocking,
+            RequestKind::Async => PriorityClass::ForegroundAsync,
+        }
+    }
 }

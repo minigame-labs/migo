@@ -135,11 +135,7 @@ fn io_budget() -> &'static IoBudget {
 }
 
 fn pool_err(err: PoolError) -> EngineError {
-    match err {
-        PoolError::Closed => EngineError::new(ErrorCode::IoError)
-            .with_msg("image worker pool closed")
-            .with_detail("image scheduler pool rejected job"),
-    }
+    EngineError::from(err)
 }
 
 fn mounted_variant_source_version_token(

@@ -5,7 +5,9 @@
 //! On Android, a platform-native decoder (BitmapFactory via JNI) can be
 //! registered at init time via `register_platform_decoder()`.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
+#[cfg(feature = "rust-image-decode")]
+use std::sync::Arc;
 
 use shared::{
     error::{EngineError, ErrorCode},

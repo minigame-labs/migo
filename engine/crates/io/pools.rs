@@ -5,6 +5,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use shared::error::{EngineError, ErrorCode};
 
 use crate::task::PoolKind;
 
@@ -13,6 +14,24 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolError {
     Closed,
+}
+
+impl fmt::Display for PoolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PoolError::Closed => f.write_str("IO worker pool closed"),
+        }
+    }
+}
+
+impl From<PoolError> for EngineError {
+    fn from(err: PoolError) -> Self {
+        match err {
+            PoolError::Closed => {
+                EngineError::new(ErrorCode::IoError).with_detail("IO worker pool closed")
+            }
+        }
+    }
 }
 
 pub struct JobHandle<T> {
@@ -153,38 +172,6 @@ impl IoPools {
             image: Arc::new(LazyWorkerPool::new(host_id, "image")),
             archive: Arc::new(LazyWorkerPool::new(host_id, "archive")),
         }
-    }
-
-    pub fn submit_fs<T, F>(&self, job: F) -> Result<JobHandle<T>, PoolError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        self.fs.get().submit(job)
-    }
-
-    pub fn submit_pack<T, F>(&self, job: F) -> Result<JobHandle<T>, PoolError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        self.pack.get().submit(job)
-    }
-
-    pub fn submit_image<T, F>(&self, job: F) -> Result<JobHandle<T>, PoolError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        self.image.get().submit(job)
-    }
-
-    pub fn submit_archive<T, F>(&self, job: F) -> Result<JobHandle<T>, PoolError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        self.archive.get().submit(job)
     }
 
     pub fn run<T, F>(&self, pool: PoolKind, job: F) -> Result<T, PoolError>

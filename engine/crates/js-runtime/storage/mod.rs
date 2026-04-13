@@ -26,10 +26,7 @@ use std::sync::{Arc, Mutex};
 use deno_core::{Extension, JsBuffer, OpState, op2};
 use deno_error::JsErrorBox;
 use io::storage_ops;
-use io::{
-    pools::PoolError,
-    task::{IoRequest, PriorityClass, RequestKind},
-};
+use io::task::{IoRequest, PriorityClass, RequestKind};
 use shared::error::EngineError;
 use shared::op_state::HostOpState;
 
@@ -79,18 +76,8 @@ fn get_scheduler(state: &OpState) -> Arc<io::scheduler::IoScheduler> {
 }
 
 #[inline]
-fn pool_err(err: PoolError) -> StorageError {
-    match err {
-        PoolError::Closed => StorageError::Message("IO worker pool closed".into()),
-    }
-}
-
-#[inline]
-fn storage_priority(request: RequestKind) -> PriorityClass {
-    match request {
-        RequestKind::Sync => PriorityClass::ForegroundBlocking,
-        RequestKind::Async => PriorityClass::ForegroundAsync,
-    }
+fn pool_err(err: io::pools::PoolError) -> StorageError {
+    StorageError::Message(err.to_string())
 }
 
 /// Encode a storage key to a hex filename.
@@ -280,7 +267,7 @@ pub async fn op_storage_set_async(
         .run_async(
             IoRequest::StorageMutate {
                 request: RequestKind::Async,
-                priority: storage_priority(RequestKind::Async),
+                priority: PriorityClass::from(RequestKind::Async),
             },
             move || {
                 let mut totals = totals_arc
@@ -315,7 +302,7 @@ pub async fn op_storage_remove_async(
         .run_async(
             IoRequest::StorageMutate {
                 request: RequestKind::Async,
-                priority: storage_priority(RequestKind::Async),
+                priority: PriorityClass::from(RequestKind::Async),
             },
             move || {
                 let mut totals = totals_arc
@@ -345,7 +332,7 @@ pub async fn op_storage_clear_async(state: Rc<RefCell<OpState>>) -> Result<(), S
         .run_async(
             IoRequest::StorageMutate {
                 request: RequestKind::Async,
-                priority: storage_priority(RequestKind::Async),
+                priority: PriorityClass::from(RequestKind::Async),
             },
             move || {
                 let mut totals = totals_arc
@@ -377,7 +364,7 @@ pub async fn op_storage_info_async(state: Rc<RefCell<OpState>>) -> Result<String
         .run_async(
             IoRequest::StorageInfo {
                 request: RequestKind::Async,
-                priority: storage_priority(RequestKind::Async),
+                priority: PriorityClass::from(RequestKind::Async),
             },
             move || storage_ops::storage_info(&dir, limit).map_err(StorageError::from),
         )

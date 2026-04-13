@@ -108,10 +108,7 @@ fn read_request(backend: BackendKind, request: RequestKind, length: Option<u64>)
     IoRequest::ReadFile {
         backend,
         request,
-        priority: match request {
-            RequestKind::Sync => PriorityClass::ForegroundBlocking,
-            RequestKind::Async => PriorityClass::ForegroundAsync,
-        },
+        priority: PriorityClass::from(request),
         spec,
         estimated_bytes,
     }
@@ -122,10 +119,7 @@ fn copy_request(backend: BackendKind, request: RequestKind) -> IoRequest {
     IoRequest::ReadFile {
         backend,
         request,
-        priority: match request {
-            RequestKind::Sync => PriorityClass::ForegroundBlocking,
-            RequestKind::Async => PriorityClass::ForegroundAsync,
-        },
+        priority: PriorityClass::from(request),
         spec: ReadSpec::Whole,
         estimated_bytes: shared::protocol::io_cmd::MAX_READ_LENGTH as usize,
     }

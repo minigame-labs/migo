@@ -142,7 +142,7 @@ impl IoScheduler {
                 self.metrics
                     .sync_wait_micros
                     .fetch_add(wait_micros, Ordering::Relaxed);
-                tracing::info!(
+                tracing::debug!(
                     "[IOScheduler {}] sync wait pool={:?} elapsed_us={}",
                     self.host_id,
                     pool,
