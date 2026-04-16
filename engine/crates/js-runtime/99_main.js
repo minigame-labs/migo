@@ -11,6 +11,7 @@ ObjectDefineProperties(globalThis, WindowGlobalScope);
 
 globalThis.GameGlobal = globalThis;
 globalThis.migo = globalThis;
+globalThis.global = globalThis;
 
 const _windowMetricsCache = {
     windowWidth: 0,
@@ -73,16 +74,6 @@ ObjectDefineProperty(_screen, "availHeight", {
     get() { return _readWindowMetrics().windowHeight; },
 });
 ObjectFreeze(_screen);
-
-try {
-    ObjectDefineProperty(globalThis, "window", {
-        configurable: true,
-        enumerable: true,
-        value: globalThis,
-    });
-} catch (_) {
-    // ignore if window is already fixed by runtime
-}
 
 _defineGlobalGetter("innerWidth", function () { return _readWindowMetrics().windowWidth; });
 _defineGlobalGetter("innerHeight", function () { return _readWindowMetrics().windowHeight; });

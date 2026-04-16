@@ -45,43 +45,68 @@ struct PriorityChannelInner<T> {
     closed: bool,
 }
 
+struct PriorityChannelShared<T> {
+    state: StdMutex<PriorityChannelInner<T>>,
+    condvar: Condvar,
+    sender_count: std::sync::atomic::AtomicUsize,
+}
+
 pub(crate) struct PrioritySender<T> {
-    inner: Arc<(StdMutex<PriorityChannelInner<T>>, Condvar)>,
+    shared: Arc<PriorityChannelShared<T>>,
 }
 
 impl<T> Clone for PrioritySender<T> {
     fn clone(&self) -> Self {
+        self.shared
+            .sender_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
-            inner: Arc::clone(&self.inner),
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<T> Drop for PrioritySender<T> {
+    fn drop(&mut self) {
+        if self
+            .shared
+            .sender_count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            // Last sender dropped — close the channel.
+            let mut state = self.shared.state.lock().unwrap();
+            state.closed = true;
+            self.shared.condvar.notify_all();
         }
     }
 }
 
 pub(crate) struct PriorityReceiver<T> {
-    inner: Arc<(StdMutex<PriorityChannelInner<T>>, Condvar)>,
+    shared: Arc<PriorityChannelShared<T>>,
 }
 
 pub(crate) fn priority_channel<T>() -> (PrioritySender<T>, PriorityReceiver<T>) {
-    let inner = Arc::new((
-        StdMutex::new(PriorityChannelInner {
+    let shared = Arc::new(PriorityChannelShared {
+        state: StdMutex::new(PriorityChannelInner {
             heap: BinaryHeap::new(),
             next_seq: 0,
             closed: false,
         }),
-        Condvar::new(),
-    ));
+        condvar: Condvar::new(),
+        sender_count: std::sync::atomic::AtomicUsize::new(1),
+    });
     (
         PrioritySender {
-            inner: Arc::clone(&inner),
+            shared: Arc::clone(&shared),
         },
-        PriorityReceiver { inner },
+        PriorityReceiver { shared },
     )
 }
 
 impl<T> PrioritySender<T> {
     pub fn send(&self, priority: PriorityClass, value: T) -> Result<(), PoolError> {
-        let (lock, condvar) = &*self.inner;
-        let mut state = lock.lock().unwrap();
+        let mut state = self.shared.state.lock().unwrap();
         if state.closed {
             return Err(PoolError::Closed);
         }
@@ -92,22 +117,20 @@ impl<T> PrioritySender<T> {
             value,
             seq,
         });
-        condvar.notify_one();
+        self.shared.condvar.notify_one();
         Ok(())
     }
 
     pub fn close(&self) {
-        let (lock, condvar) = &*self.inner;
-        let mut state = lock.lock().unwrap();
+        let mut state = self.shared.state.lock().unwrap();
         state.closed = true;
-        condvar.notify_all();
+        self.shared.condvar.notify_all();
     }
 }
 
 impl<T> PriorityReceiver<T> {
     pub fn recv(&self) -> Result<T, PoolError> {
-        let (lock, condvar) = &*self.inner;
-        let mut state = lock.lock().unwrap();
+        let mut state = self.shared.state.lock().unwrap();
         loop {
             if let Some(entry) = state.heap.pop() {
                 return Ok(entry.value);
@@ -115,16 +138,7 @@ impl<T> PriorityReceiver<T> {
             if state.closed {
                 return Err(PoolError::Closed);
             }
-            state = condvar.wait(state).unwrap();
-        }
-    }
-}
-
-impl<T> Drop for PrioritySender<T> {
-    fn drop(&mut self) {
-        // Only close if this is the last sender
-        if Arc::strong_count(&self.inner) <= 2 {
-            self.close();
+            state = self.shared.condvar.wait(state).unwrap();
         }
     }
 }
@@ -326,6 +340,15 @@ impl IoPools {
         }
     }
 
+    fn get_pool(&self, pool: PoolKind) -> &WorkerPool {
+        match pool {
+            PoolKind::Fs => self.fs.get(),
+            PoolKind::Pack => self.pack.get(),
+            PoolKind::Image => self.image.get(),
+            PoolKind::Archive => self.archive.get(),
+        }
+    }
+
     pub fn run<T, F>(
         &self,
         pool: PoolKind,
@@ -336,12 +359,7 @@ impl IoPools {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        match pool {
-            PoolKind::Fs => self.fs.get().run(priority, job),
-            PoolKind::Pack => self.pack.get().run(priority, job),
-            PoolKind::Image => self.image.get().run(priority, job),
-            PoolKind::Archive => self.archive.get().run(priority, job),
-        }
+        self.get_pool(pool).run(priority, job)
     }
 
     pub fn submit_async<T, F>(
@@ -354,12 +372,7 @@ impl IoPools {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        match pool {
-            PoolKind::Fs => self.fs.get().submit_async(priority, job),
-            PoolKind::Pack => self.pack.get().submit_async(priority, job),
-            PoolKind::Image => self.image.get().submit_async(priority, job),
-            PoolKind::Archive => self.archive.get().submit_async(priority, job),
-        }
+        self.get_pool(pool).submit_async(priority, job)
     }
 
     #[cfg(test)]

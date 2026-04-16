@@ -61,7 +61,16 @@ function define(name, deps, factory) {
   globalThis._lastDefinedModule = final;
 }
 
-define.amd = true;
+// NOTE: do NOT set define.amd = true here.
+// On wx-android, the platform-provided define() does NOT have .amd set.
+// Setting define.amd = true causes UMD modules inside browserify/webpack
+// bundles (e.g. tslib) to mistakenly take the AMD path, registering into
+// the global AMD registry instead of populating module.exports. This leaves
+// the bundle's internal require() with an empty exports object.
+//
+// The amdshim's own AMD detection (line ~101) uses source-code string
+// matching (code.includes("define.amd")), not a runtime check, so this
+// removal does not affect amdshim's module loading logic.
 
 function require(name) {
   // 1. Check AMD module registry
@@ -128,6 +137,7 @@ function require(name) {
   const result = moduleObj.exports;
   requireCache[name] = result;
   requireCache[absPath] = result;
+
   return result;
 }
 
