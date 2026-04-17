@@ -1004,11 +1004,13 @@ dependencies = [
 name = "graphics"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "crossbeam-channel",
  "glow",
  "khronos-egl",
  "libc",
  "libloading",
+ "lru",
  "parking_lot",
  "png 0.17.16",
  "raw-window-handle",
@@ -1458,6 +1460,7 @@ checksum = "0b0b36cbb4e6704f12f5b5d7b01dac593982c6550859ebd5a66fb15c9ea27fd5"
 name = "js-runtime"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytemuck",
  "bytes",
  "crossbeam-channel",
@@ -1470,6 +1473,7 @@ dependencies = [
  "image",
  "io",
  "parking_lot",
+ "percent-encoding",
  "reqwest",
  "rustls 0.23.37",
  "serde",

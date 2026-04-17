@@ -17,6 +17,7 @@ use shared::{
 use crate::io_state::IoSchedulerState;
 
 pub(crate) mod cache;
+mod inline_src;
 
 const OP_CREATE_IMAGE: &str = "canvas create image";
 const OP_LOAD_IMAGE: &str = "canvas load image";
@@ -125,12 +126,11 @@ fn resolve_local_src(
     mount_table: Option<&shared::vfs::MountTable>,
     src: &str,
 ) -> EngineResult<ResolvedSrc> {
-    shared::ensure!(
-        !(src.starts_with("http://") || src.starts_with("https://")),
-        ErrorCode::Unsupported,
-        "http image not supported yet",
-        src
-    );
+    // Note: `http(s)://` and `data:` URLs are NOT rejected here any
+    // more.  They're handled earlier in `op_load_image_inner` through
+    // the dedicated inline-source path; this helper only resolves
+    // local/VFS paths (the `/code`, `/user`, `/cache`, `/tmp` roots
+    // listed below).
 
     // Relative path → normalize to /code/{src} and fall into the /code branch.
     // This ensures "a.png" and "/code/a.png" always take the same path.
@@ -297,6 +297,34 @@ async fn op_load_image_inner(
         op.borrow::<CanvasOpState>().clone()
     };
 
+    // `data:` and `http(s)://` scheme short-circuits.  Both feed raw
+    // bytes into the same GPU upload path as local files; they just
+    // skip the VFS / mount-table resolution below and use scheme
+    // prefixes as the cache key so repeated `img.src = "data:..."`
+    // assignments re-use the already-uploaded shared texture.
+    if src.starts_with("data:") {
+        return load_image_from_inline_bytes(
+            state.clone(),
+            canvas_ctx,
+            image_id,
+            src,
+            target_width,
+            target_height,
+        )
+        .await;
+    }
+    if src.starts_with("http://") || src.starts_with("https://") {
+        return load_image_from_http(
+            state.clone(),
+            canvas_ctx,
+            image_id,
+            src,
+            target_width,
+            target_height,
+        )
+        .await;
+    }
+
     // Resolve path + generation atomically from a single mount table read.
     let resolved = resolve_local_src(vfs.as_deref(), mount_table.as_deref(), &src)?;
     let src = resolved.path;
@@ -419,7 +447,8 @@ async fn op_load_image_inner(
             // Compressed images skip the IO cache (fast to re-read).
             if target_width.is_some() && target_height.is_some() {
                 if let shared::protocol::io_cmd::DecodedImage::Rgba(ref rgba) = img {
-                    io::global_cache().insert(actual_cache_key.clone(), rgba.clone());
+                    io::global_cache()
+                        .insert(cache::to_io_cache_key(&actual_cache_key), rgba.clone());
                 }
             }
 
@@ -480,6 +509,217 @@ async fn op_load_image_inner(
                     Err(e)
                 }
             }
+        }
+    }
+}
+
+/// Common upload path for inline-bytes loaders (`data:` / `http(s)://`).
+///
+/// Identical in shape to the local-file flow (begin_load → shared_id →
+/// LoadImage → finish_load), but decode is performed inline on the host
+/// instead of routed through `read_image_rgba8`.
+async fn upload_inline_image(
+    canvas_ctx: CanvasOpState,
+    image_id: u32,
+    cache_key: cache::ImageCacheKey,
+    img: shared::protocol::io_cmd::NormalizedImage,
+    src_label: &str,
+) -> EngineResult<(u32, (usize, usize))> {
+    let shared_id = cache::alloc_shared_id();
+    {
+        let mut c = cache::IMAGE_CACHE.lock();
+        c.register_inflight_alias(image_id, shared_id);
+    }
+    let w = img.width as i32;
+    let h = img.height as i32;
+    let decoded = shared::protocol::io_cmd::DecodedImage::Rgba(img);
+
+    let res = send_render_with_resp_async(&canvas_ctx, OP_LOAD_IMAGE, |resp| {
+        RenderCommand::Canvas(CanvasCmd::LoadImage {
+            image_id: shared_id,
+            image: decoded,
+            priority: shared::protocol::io_cmd::ImagePriority::Normal,
+            resp,
+        })
+    })
+    .await;
+
+    let maybe_destroy = {
+        let mut c = cache::IMAGE_CACHE.lock();
+        match &res {
+            Ok((actual_w, actual_h)) => c.finish_load(
+                image_id,
+                shared_id,
+                &cache_key,
+                &cache_key,
+                Ok((*actual_w as usize, *actual_h as usize)),
+            ),
+            Err(e) => c.finish_load(
+                image_id,
+                shared_id,
+                &cache_key,
+                &cache_key,
+                Err(engine_err_to_text(e)),
+            ),
+        }
+    };
+
+    if let Some(to_destroy) = maybe_destroy {
+        let _ = canvas_ctx
+            .tx
+            .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
+                image_id: to_destroy,
+            }));
+    }
+
+    match res {
+        Ok((rw, rh)) => {
+            info!(
+                "op_load_image inline uploaded: image_id={}, shared_id={}, src={}, dims={}x{}",
+                image_id, shared_id, src_label, rw, rh
+            );
+            Ok((shared_id, (rw as usize, rh as usize)))
+        }
+        Err(e) => {
+            warn!(
+                "op_load_image inline upload failed: image_id={}, src={}, err={}",
+                image_id,
+                src_label,
+                engine_err_to_text(&e)
+            );
+            // Surface width/height for debugging even on failure.
+            let _ = (w, h);
+            Err(e)
+        }
+    }
+}
+
+async fn load_image_from_inline_bytes(
+    _state: Rc<RefCell<OpState>>,
+    canvas_ctx: CanvasOpState,
+    image_id: u32,
+    src: String,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+) -> EngineResult<(u32, (usize, usize))> {
+    info!(
+        "op_load_image data-url: image_id={}, len={}",
+        image_id,
+        src.len()
+    );
+    let payload = inline_src::parse_data_url(&src)?;
+    let hint = if payload.mime.is_empty() {
+        None
+    } else {
+        Some(payload.mime.as_str())
+    };
+    let img = inline_src::decode_inline_bytes(&payload.bytes, hint, target_width, target_height)?;
+
+    // Key the dedup table by the full data URL so two Image objects
+    // assigned the same `data:` string share a GPU texture.  Data
+    // URLs are immutable by definition → generation = 0.
+    let cache_key = cache::make_cache_key(&src, target_width, target_height, 0);
+
+    // Replace any prior alias (mirrors the local-file flow).
+    if let Some(to_destroy) = {
+        let mut c = cache::IMAGE_CACHE.lock();
+        c.remove_previous_alias(image_id)
+    } {
+        let _ = canvas_ctx
+            .tx
+            .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
+                image_id: to_destroy,
+            }));
+    }
+
+    let label = format!("data:[{}b]", payload.bytes.len());
+    match {
+        let mut c = cache::IMAGE_CACHE.lock();
+        c.begin_load(image_id, &cache_key)
+    } {
+        cache::BeginLoadResult::AlreadyLoaded((shared_id, dims)) => Ok((shared_id, dims)),
+        cache::BeginLoadResult::Join(rx) => match rx.await {
+            Ok(Ok((actual_key, shared_id, dims))) => {
+                let mut c = cache::IMAGE_CACHE.lock();
+                c.bind_alias_existing(image_id, &cache_key, &actual_key, shared_id);
+                Ok((shared_id, dims))
+            }
+            Ok(Err(msg)) => {
+                shared::bail!(ErrorCode::ImageReadError, "data url join failed", msg)
+            }
+            Err(_) => shared::bail!(ErrorCode::Cancelled, "data url wait canceled"),
+        },
+        cache::BeginLoadResult::StartLoading => {
+            upload_inline_image(canvas_ctx, image_id, cache_key, img, &label).await
+        }
+    }
+}
+
+async fn load_image_from_http(
+    state: Rc<RefCell<OpState>>,
+    canvas_ctx: CanvasOpState,
+    image_id: u32,
+    src: String,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+) -> EngineResult<(u32, (usize, usize))> {
+    info!("op_load_image http: image_id={}, url={}", image_id, src);
+
+    // Reuse an in-flight fetch for the same URL+size if another Image
+    // already kicked one off.  Generation is 0 because we assume the
+    // URL itself encodes any cache-busting query string the caller
+    // needs (matching browser `Image.src` semantics).
+    let cache_key = cache::make_cache_key(&src, target_width, target_height, 0);
+
+    if let Some(to_destroy) = {
+        let mut c = cache::IMAGE_CACHE.lock();
+        c.remove_previous_alias(image_id)
+    } {
+        let _ = canvas_ctx
+            .tx
+            .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
+                image_id: to_destroy,
+            }));
+    }
+
+    let start = match {
+        let mut c = cache::IMAGE_CACHE.lock();
+        c.begin_load(image_id, &cache_key)
+    } {
+        cache::BeginLoadResult::AlreadyLoaded((shared_id, dims)) => return Ok((shared_id, dims)),
+        cache::BeginLoadResult::Join(rx) => {
+            return match rx.await {
+                Ok(Ok((actual_key, shared_id, dims))) => {
+                    let mut c = cache::IMAGE_CACHE.lock();
+                    c.bind_alias_existing(image_id, &cache_key, &actual_key, shared_id);
+                    Ok((shared_id, dims))
+                }
+                Ok(Err(msg)) => shared::bail!(ErrorCode::ImageReadError, "http join failed", msg),
+                Err(_) => shared::bail!(ErrorCode::Cancelled, "http wait canceled"),
+            };
+        }
+        cache::BeginLoadResult::StartLoading => (),
+    };
+    let _ = start;
+
+    // Active fetch + decode.  Any failure must still call finish_load
+    // so joiners unblock (mirrors the local-file error path).
+    let result = async {
+        let bytes = inline_src::fetch_http_image(state, &src).await?;
+        inline_src::decode_inline_bytes(&bytes, None, target_width, target_height)
+    }
+    .await;
+
+    match result {
+        Ok(img) => upload_inline_image(canvas_ctx, image_id, cache_key, img, &src).await,
+        Err(e) => {
+            let msg = engine_err_to_text(&e);
+            // Finish the load with error so any pending joiners unblock.
+            // Shared id doesn't exist yet; use a dummy (0) that will be
+            // discarded along with the error result.
+            let mut c = cache::IMAGE_CACHE.lock();
+            let _ = c.finish_load(image_id, 0, &cache_key, &cache_key, Err(msg));
+            Err(e)
         }
     }
 }

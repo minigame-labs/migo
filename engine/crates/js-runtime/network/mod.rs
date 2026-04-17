@@ -11,7 +11,7 @@ use crate::network::websocket::{op_ws_close, op_ws_create, op_ws_next_event, op_
 mod address_filter;
 mod common;
 pub(crate) mod dns_cache;
-mod fetch;
+pub(crate) mod fetch;
 mod prefetch;
 mod tcp_socket;
 mod udp_socket;

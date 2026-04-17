@@ -27,6 +27,14 @@ pub type ImageCacheKey = (String, u64);
 
 /// Build a cache key from a resolved path, optional resize dimensions,
 /// and mount generation.
+///
+/// Internally the resize dimensions are folded into the path with a
+/// NUL-delimited suffix (`"{src}\0{tw}x{th}"`) so the js-runtime-side
+/// alias table can key on a single `(String, u64)` per logical
+/// (path, size) pair.  For boundary lookups into the decoded-RGBA
+/// `io::global_cache` (which uses a native `(path, gen, tw, th)` tuple),
+/// use [`to_io_cache_key`] to decompose the suffix back into its
+/// dimension fields.
 pub fn make_cache_key(
     src: &str,
     target_width: Option<u32>,
@@ -38,6 +46,22 @@ pub fn make_cache_key(
         _ => src.to_string(),
     };
     (canonical, mount_generation)
+}
+
+/// Convert a js-runtime-side `ImageCacheKey` (mangled-suffix form) into
+/// the native 4-tuple used by `io::global_cache`.  Unmangled keys
+/// (no NUL delimiter) map to the `(path, gen, 0, 0)` full-resolution
+/// slot that [`io::image_cache::full_res_key`] produces.
+pub fn to_io_cache_key(key: &ImageCacheKey) -> io::image_cache::ImageCacheKey {
+    let (canonical, generation) = key;
+    if let Some((path, dims)) = canonical.split_once('\0') {
+        if let Some((tw_s, th_s)) = dims.split_once('x') {
+            if let (Ok(tw), Ok(th)) = (tw_s.parse::<u32>(), th_s.parse::<u32>()) {
+                return (path.to_string(), *generation, tw, th);
+            }
+        }
+    }
+    (canonical.clone(), *generation, 0, 0)
 }
 
 pub struct SharedImageEntry {

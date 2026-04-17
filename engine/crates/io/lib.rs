@@ -3,7 +3,7 @@ pub mod derived_cache;
 pub mod domain;
 mod fast_image_decoder;
 pub mod fs_ops;
-mod image_cache;
+pub mod image_cache;
 pub mod image_ops;
 pub mod ktx2;
 #[cfg(feature = "zip-extract")]
@@ -17,6 +17,7 @@ mod zip_extract;
 
 pub use fast_image_decoder::{
     CompressedImageInfo, decode_image_fast, detect_compressed_format, register_platform_decoder,
+    resize_image,
 };
 pub use image_cache::{CacheStats, CachedImage, ImageCache, global_cache};
 #[cfg(feature = "zip-extract")]

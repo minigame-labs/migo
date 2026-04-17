@@ -102,6 +102,20 @@ fn execute_canvas_batch(
     let mut batch_dirty = false;
     let is_onscreen = canvas_id == shared::protocol::render_cmd::CanvasId::from(1u32);
 
+    // Lazy Skia context reset: if a WebGL batch has mutated GL state
+    // since Skia's last `GrDirectContext::reset()`, we need to tell
+    // Skia its cached state is stale before drawing anything.  We do
+    // this once at batch entry rather than eagerly at every
+    // `Materialize` — pure-Canvas2D frames now pay zero reset cost.
+    if cm.skia_needs_reset {
+        if cm.make_current_needed(canvas_id).is_ok() {
+            if let Ok(ctx) = cm.get_2d_context_mut(canvas_id) {
+                ctx.reset_gl_state();
+            }
+        }
+        cm.skia_needs_reset = false;
+    }
+
     // Layer 2 scissor trust gate: if Canvas2D state has non-identity
     // transform or active shadow, the JS-side dirty hint may underestimate
     // the actual draw area. Discard it to prevent scissor from clipping.
@@ -211,7 +225,22 @@ fn execute_gl_batch(
         warn!("GLBatch: {error_count}/{cmd_count} commands failed");
     }
 
+    // WebGL commands touched GL state; Skia's cached tracking is now
+    // stale.  The NEXT Canvas2D batch (if any) will lazily call
+    // `reset_gl_state()` on its 2D context before drawing.  Pure
+    // WebGL frames never pay this cost.
+    if !commands_was_empty(cmd_count) {
+        cm.skia_needs_reset = true;
+    }
+
     batch_hit_onscreen
+}
+
+/// Helper: treat an empty GL batch as non-state-mutating so we don't
+/// invalidate Skia's cache for a no-op.
+#[inline]
+fn commands_was_empty(n: usize) -> bool {
+    n == 0
 }
 
 /// Execute a FramePacket using caller-provided callbacks for each batch type.
@@ -273,13 +302,13 @@ fn execute_frame_packet(
             FrameOp::BeginFrame | FrameOp::Present => {}
             FrameOp::Materialize { canvas_id } => {
                 // Flush Skia so subsequent GL ops see Canvas2D results.
-                // Also clear dirty_2d to prevent double-flush at present time.
+                // NB: we intentionally do *not* call `reset_gl_state()`
+                // here — it's wasted work if no WebGL batch follows.
+                // Instead, `execute_gl_batch` marks the context dirty
+                // and the *next* `execute_canvas_batch` resets lazily.
                 if cm.make_current_needed(canvas_id).is_ok() {
                     if let Ok(ctx) = cm.get_2d_context_mut(canvas_id) {
                         ctx.flush_and_submit();
-                        // Tell Skia to drop its cached GL tracking so the
-                        // following WebGL batch starts from a clean slate.
-                        ctx.reset_gl_state();
                     }
                     renderer_2d.clear_dirty_layer(canvas_id);
                     cm.clear_2d_dirty(canvas_id);
@@ -997,7 +1026,7 @@ impl RenderThread {
                             use shared::protocol::render_cmd::{TextAlign, TextBaseline};
                             let attrs = TextAttrs {
                                 size: font_size,
-                                families: vec![font_family, "sans-serif".into()],
+                                families: std::sync::Arc::new(vec![font_family, "sans-serif".into()]),
                                 weight: if bold { 700 } else { 400 },
                                 italic,
                                 align: TextAlign::Start,

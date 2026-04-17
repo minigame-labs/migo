@@ -303,7 +303,7 @@ fn measure_text_tracks_characters() {
     with_text_env(|text| {
         let attrs = graphics::backend::gl::state::TextAttrs {
             size: 20.0,
-            families: vec!["test-noto".into(), "sans-serif".into()],
+            families: std::sync::Arc::new(vec!["test-noto".into(), "sans-serif".into()]),
             weight: 400,
             italic: false,
             align: TextAlign::Start,

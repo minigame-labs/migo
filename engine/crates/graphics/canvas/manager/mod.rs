@@ -95,6 +95,17 @@ pub(crate) struct CanvasManager {
     pub(crate) samplers: HashMap<shared::protocol::render_cmd::SamplerId, SamplerMeta>,
     pub(crate) syncs: HashMap<shared::protocol::render_cmd::SyncId, SyncMeta>,
 
+    /// `true` when WebGL or another external code path has mutated GL
+    /// state since Skia's last `GrDirectContext::reset()`.  Consulted
+    /// by the Canvas2D batch entry in `render_thread::execute_canvas_batch`:
+    /// when set, the current 2D context calls `reset_gl_state()` once
+    /// before any Skia draw and clears the flag.
+    ///
+    /// Moved out of per-canvas state because GL state is global to the
+    /// EGL context — every Canvas2DContext in the share-group is
+    /// equally affected by a WebGL state change.
+    pub(crate) skia_needs_reset: bool,
+
     /// Runtime device capabilities, detected once at init.
     pub(crate) device_caps: crate::device_caps::DeviceCapabilities,
 
@@ -286,6 +297,7 @@ impl CanvasManager {
             vaos: HashMap::with_capacity(16),
             samplers: HashMap::with_capacity(8),
             syncs: HashMap::with_capacity(4),
+            skia_needs_reset: false,
             device_caps,
             gles_major,
             preserved_ctx: None,

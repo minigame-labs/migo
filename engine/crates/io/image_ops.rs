@@ -263,10 +263,15 @@ async fn cached_preload_result_with_scheduler(
     gpu_caps: GpuCapsSnapshot,
     mount_table: Option<Arc<MountTable>>,
 ) -> PreloadResult {
-    let key = match current_image_cache_key(&path, generation, &source, mount_table.as_deref()) {
+    let pg_key = match current_image_cache_key(&path, generation, &source, mount_table.as_deref())
+    {
         Ok(key) => key,
         Err(err) => return (path, Err(format!("{:?}", err))),
     };
+    // Preloads only hydrate the full-resolution variant; resized
+    // slots are populated lazily on first `drawImage` with explicit
+    // dimensions.
+    let key = image_cache::full_res_key(pg_key.0, pg_key.1);
     let cached = {
         let mut cache = image_cache::global_cache();
         cache.get(&key)
@@ -450,12 +455,20 @@ fn estimate_image_source_size(
     }
 }
 
+/// Path + generation half of the full [`image_cache::ImageCacheKey`].
+///
+/// Decoders pair this with the caller's requested `(target_w, target_h)`
+/// to build the final cache key.  Kept as a 2-tuple at the cancellation
+/// path so a single cancel invalidates every resized variant of the
+/// same source path.
+type PathGenKey = (String, u64);
+
 fn current_image_cache_key(
     path: &str,
     expected_generation: u64,
     source: &ImageSource,
     mount_table: Option<&MountTable>,
-) -> Result<image_cache::ImageCacheKey, EngineError> {
+) -> Result<PathGenKey, EngineError> {
     match source {
         ImageSource::Filesystem => Ok((path.to_string(), expected_generation)),
         ImageSource::MountCode { .. } | ImageSource::Pack { .. } => {
@@ -464,6 +477,21 @@ fn current_image_cache_key(
             Ok((worker_source.cache_path, worker_source.source_generation))
         }
     }
+}
+
+/// Compose the full 4-tuple LRU key from a `PathGenKey` and an optional
+/// resize request.  `target_w == 0 || target_h == 0` is normalised to
+/// the "full resolution" sentinel so callers can pass the same value
+/// for both branches without special-casing.
+#[inline]
+fn compose_lru_key(
+    pg: &PathGenKey,
+    target_w: Option<u32>,
+    target_h: Option<u32>,
+) -> image_cache::ImageCacheKey {
+    let tw = target_w.unwrap_or(0);
+    let th = target_h.unwrap_or(0);
+    (pg.0.clone(), pg.1, tw, th)
 }
 
 // ---------------------------------------------------------------------------
@@ -491,31 +519,33 @@ pub async fn read_image_rgba8(
     mount_table: Option<Arc<MountTable>>,
 ) -> Result<ReadImageResult, EngineError> {
     let has_resize = target_width.is_some() && target_height.is_some();
-    let io_cache_key =
+    let pg_key =
         current_image_cache_key(&path, cache_generation, &source, mount_table.as_deref())?;
-
-    // LRU cache fast path (full-resolution decodes only).
-    if !has_resize {
-        if let Some(cached) = image_cache::global_cache().get(&io_cache_key) {
-            debug!(
-                "read_image_rgba8 cache hit: {} g{}",
-                io_cache_key.0, io_cache_key.1
-            );
-            let cached_image = cached.image;
-            let encoded_bytes = cached_image.rgba.len();
-            return run_image_job_with_scheduler(
-                scheduler,
-                encoded_bytes,
-                true,
-                source,
-                move || ReadImageResult {
-                    cache_path: io_cache_key.0,
-                    image: DecodedImage::Rgba(cached_image),
-                    source_generation: io_cache_key.1,
-                },
-            )
-            .await;
-        }
+    // LRU cache fast path: full-resolution hits as before, and
+    // pre-resized variants get their own cache slot keyed by
+    // `(path, gen, target_w, target_h)` so scroll-list games that
+    // repeatedly draw the same sprite at the same resized dimensions
+    // no longer re-decode every frame.
+    let io_cache_key = compose_lru_key(&pg_key, target_width, target_height);
+    if let Some(cached) = image_cache::global_cache().get(&io_cache_key) {
+        debug!(
+            "read_image_rgba8 cache hit: {} g{} resize={}x{}",
+            io_cache_key.0, io_cache_key.1, io_cache_key.2, io_cache_key.3
+        );
+        let cached_image = cached.image;
+        let encoded_bytes = cached_image.rgba.len();
+        return run_image_job_with_scheduler(
+            scheduler,
+            encoded_bytes,
+            true,
+            source,
+            move || ReadImageResult {
+                cache_path: io_cache_key.0,
+                image: DecodedImage::Rgba(cached_image),
+                source_generation: io_cache_key.1,
+            },
+        )
+        .await;
     }
 
     let start = tokio::time::Instant::now();
@@ -594,13 +624,22 @@ pub async fn read_image_rgba8(
 
     match task.await.and_then(|result| result) {
         Ok(decoded) => {
-            if !has_resize {
-                if let DecodedImage::Rgba(ref rgba_img) = decoded.image {
-                    image_cache::global_cache().insert(
-                        (decoded.cache_path.clone(), decoded.source_generation),
-                        rgba_img.clone(),
-                    );
-                }
+            // Insert the decoded image into the LRU — for both full-res
+            // decodes (target_* == None) and pre-resized variants, so
+            // subsequent draws with matching dimensions skip both the
+            // decode and the resize pipeline.  Non-RGBA (GPU-compressed)
+            // variants aren't cached because they can't be served back
+            // to a caller that asked for a different `target_*` pair.
+            if let DecodedImage::Rgba(ref rgba_img) = decoded.image {
+                image_cache::global_cache().insert(
+                    (
+                        decoded.cache_path.clone(),
+                        decoded.source_generation,
+                        target_width.unwrap_or(0),
+                        target_height.unwrap_or(0),
+                    ),
+                    rgba_img.clone(),
+                );
             }
             debug!(
                 "read_image_rgba8: {} ({}x{}) {:?} in {:.2?}",
@@ -682,7 +721,7 @@ async fn decode_preload_result_with_scheduler(
                         let dims = (cached.width(), cached.height());
                         if let DecodedImage::Rgba(ref rgba) = cached {
                             image_cache::global_cache().insert(
-                                (path.clone(), worker_source.source_generation),
+                                image_cache::full_res_key(path.clone(), worker_source.source_generation),
                                 rgba.clone(),
                             );
                         }
@@ -698,7 +737,7 @@ async fn decode_preload_result_with_scheduler(
                 let dims = (decoded.width(), decoded.height());
                 if let DecodedImage::Rgba(ref rgba) = decoded {
                     image_cache::global_cache().insert(
-                        (path.clone(), worker_source.source_generation),
+                        image_cache::full_res_key(path.clone(), worker_source.source_generation),
                         rgba.clone(),
                     );
                 }
@@ -734,9 +773,15 @@ pub async fn preload_images(
     {
         let cache = image_cache::global_cache();
         for (i, (path, generation, source)) in entries.into_iter().enumerate() {
-            let key =
-                match current_image_cache_key(&path, generation, &source, mount_table.as_deref()) {
-                    Ok(key) => key,
+            let key = match current_image_cache_key(
+                &path,
+                generation,
+                &source,
+                mount_table.as_deref(),
+            )
+            .map(|pg| image_cache::full_res_key(pg.0, pg.1))
+            {
+                Ok(key) => key,
                     Err(_) => {
                         handles.push((
                             i,
@@ -1203,7 +1248,7 @@ mod tests {
 
         reset_scheduler_run_count();
         crate::image_cache::global_cache().clear();
-        crate::image_cache::global_cache().insert((path.clone(), cache_generation), cached.clone());
+        crate::image_cache::global_cache().insert(crate::image_cache::full_res_key(path.clone(), cache_generation), cached.clone());
 
         let result = runtime.block_on(read_image_rgba8(
             Arc::clone(&scheduler),
@@ -1260,7 +1305,7 @@ mod tests {
         reset_scheduler_run_count();
         crate::image_cache::global_cache().clear();
         crate::image_cache::global_cache().insert(
-            (cached_path.clone(), 1),
+            crate::image_cache::full_res_key(cached_path.clone(), 1),
             NormalizedImage::new(2, 2, vec![255; 2 * 2 * 4]),
         );
 
@@ -1311,7 +1356,7 @@ mod tests {
 
         reset_scheduler_run_count();
         crate::image_cache::global_cache().clear();
-        crate::image_cache::global_cache().insert((path.clone(), cache_generation), cached);
+        crate::image_cache::global_cache().insert(crate::image_cache::full_res_key(path.clone(), cache_generation), cached);
 
         let results = runtime.block_on(preload_images(
             Arc::clone(&scheduler),
@@ -1356,7 +1401,7 @@ mod tests {
         reset_scheduler_run_count();
         crate::image_cache::global_cache().clear();
         crate::image_cache::global_cache().insert(
-            (path.clone(), cache_generation),
+            crate::image_cache::full_res_key(path.clone(), cache_generation),
             NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]),
         );
 
@@ -1565,7 +1610,7 @@ mod tests {
 
         crate::image_cache::global_cache().clear();
         crate::image_cache::global_cache().insert(
-            ("/code/tex.png".to_string(), old_generation),
+            crate::image_cache::full_res_key("/code/tex.png".to_string(), old_generation),
             NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]),
         );
 
@@ -1623,7 +1668,7 @@ mod tests {
 
         crate::image_cache::global_cache().clear();
         crate::image_cache::global_cache().insert(
-            ("/code/tex.png".to_string(), old_generation),
+            crate::image_cache::full_res_key("/code/tex.png".to_string(), old_generation),
             NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]),
         );
 
@@ -1679,7 +1724,7 @@ mod tests {
 
         crate::image_cache::global_cache().clear();
         crate::image_cache::global_cache().insert(
-            ("/code/tex.png".to_string(), old_generation),
+            crate::image_cache::full_res_key("/code/tex.png".to_string(), old_generation),
             NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]),
         );
 

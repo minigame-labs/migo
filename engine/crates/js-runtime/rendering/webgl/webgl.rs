@@ -91,7 +91,7 @@ fn load_cached_image_rgba(image_id: u32) -> Option<(i32, i32, Arc<Vec<u8>>)> {
 
     let cached = {
         let mut cache = io::global_cache();
-        cache.get(&key)
+        cache.get(&crate::rendering::image::cache::to_io_cache_key(&key))
     }?;
 
     Some((

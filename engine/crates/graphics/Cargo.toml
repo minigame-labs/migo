@@ -21,6 +21,8 @@ shared = { path = "../shared" }
 
 libloading = { version = "^0.8" }
 parking_lot = "0.12.4"
+bytemuck = { workspace = true }
+lru = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"

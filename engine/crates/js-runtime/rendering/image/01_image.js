@@ -188,6 +188,138 @@ class Image {
 const createImage = (width, height) => new Image(width, height);
 
 /**
+ * ImageBitmap - a loaded, decoded image tied to a GPU texture.
+ *
+ * Browser parity:
+ *   - usable anywhere an Image/HTMLCanvasElement can be passed
+ *     (drawImage, texImage2D, texSubImage2D)
+ *   - exposes `width` / `height` for the final drawn size
+ *   - `close()` releases the GPU texture deterministically;
+ *     finalization-registry is a safety net in case JS drops the
+ *     ref without calling close().
+ *
+ * Internally this reuses the same `_shared_img_id` alias mechanism
+ * as Image so the Rust-side upload pool dedupes across identical
+ * `(src, resizeW, resizeH)` keys -- e.g. a scroll list that builds
+ * 200 ImageBitmaps from one loaded Image at a fixed thumbnail size
+ * ends up sharing a single GPU texture.
+ */
+class ImageBitmap {
+    constructor(rid, sharedId, width, height) {
+        this._rid = rid;
+        this._shared_img_id = sharedId;
+        this.width = width;
+        this.height = height;
+        this._closed = false;
+        this._finalize_token = {};
+        registry.register(this, this._rid, this._finalize_token);
+    }
+
+    get rid() {
+        return this._closed ? 0 : (this._shared_img_id ?? this._rid);
+    }
+
+    close() {
+        if (this._closed) return;
+        this._closed = true;
+        try { op_destroy_image(this._rid); } catch (_) { }
+        registry.unregister(this._finalize_token);
+        this.width = 0;
+        this.height = 0;
+    }
+}
+
+/**
+ * createImageBitmap(source[, options])
+ * createImageBitmap(source, sx, sy, sw, sh[, options])
+ *
+ * Returns a Promise that resolves to an `ImageBitmap`.  The MVP
+ * scope is:
+ *
+ * 1. `source` is an `Image` (or another `ImageBitmap`) produced by
+ *    this runtime.  Blob/ArrayBuffer/ImageData inputs are not yet
+ *    supported; call sites in cocos-style games overwhelmingly
+ *    pass an Image.
+ * 2. Optional `resizeWidth` / `resizeHeight` produce a bitmap at
+ *    the requested dimensions.  This replays the source's `src`
+ *    through `op_load_image` with target dims, which hits the
+ *    `(path, gen, tw, th)` LRU slot added in the image-cache
+ *    refactor -- so repeated calls with the same target dims are
+ *    O(1) after the first decode.
+ * 3. The 5-argument (sx, sy, sw, sh) sub-rect form is accepted
+ *    syntactically but behaves as a full-image bitmap for now.
+ *    Sub-rect extraction is planned with a host-side crop op.
+ */
+async function createImageBitmap(source, ...args) {
+    if (source == null || typeof source !== 'object') {
+        throw new TypeError('createImageBitmap: invalid source');
+    }
+
+    // Parse optional args.  See WHATWG spec Step 1-2.
+    let opts = null;
+    if (args.length === 1 && args[0] && typeof args[0] === 'object') {
+        opts = args[0];
+    } else if (args.length >= 5) {
+        // (sx, sy, sw, sh[, options])
+        if (args[4] && typeof args[4] === 'object') opts = args[4];
+    }
+
+    // Await source readiness.  Images that have already settled
+    // (loaded or errored) resolve synchronously through the
+    // listener-group trigger-on-late-subscribe semantics.
+    if ('complete' in source && !source.complete && !source._error) {
+        await new Promise((resolve, reject) => {
+            const onLoad = () => { cleanup(); resolve(); };
+            const onErr = (ev) => { cleanup(); reject(ev && ev.error ? ev.error : new Error('image load failed')); };
+            const cleanup = () => {
+                try { source.removeEventListener('load', onLoad); } catch (_) { }
+                try { source.removeEventListener('error', onErr); } catch (_) { }
+            };
+            try { source.addEventListener('load', onLoad); } catch (_) { }
+            try { source.addEventListener('error', onErr); } catch (_) { }
+        });
+    }
+    if (source._error) {
+        throw source._error;
+    }
+
+    const sharedId = source._shared_img_id ?? source.rid;
+    if (!sharedId) {
+        throw new TypeError('createImageBitmap: source has no backing texture');
+    }
+
+    const rw = (opts && opts.resizeWidth | 0) || 0;
+    const rh = (opts && opts.resizeHeight | 0) || 0;
+    const wantsResize = rw > 0 && rh > 0 && (rw !== source.width || rh !== source.height);
+
+    // Fast path: no resize requested -> share the source's texture
+    // via a fresh alias id.  The Rust cache treats this as an
+    // alias-only `op_load_image` (same src+dims hits
+    // BeginLoadResult::AlreadyLoaded) and bumps the refcount so
+    // bitmap.close() decrements independently of the source Image.
+    if (!wantsResize) {
+        if (!source._src) {
+            // No src => can't re-alias via cache; still return a
+            // bitmap sharing the id directly.  close() will decref
+            // the shared texture; caller accepts this trade-off.
+            return new ImageBitmap(sharedId, sharedId, source.width, source.height);
+        }
+        const rid2 = op_create_image();
+        const dim = await op_load_image(rid2, source._src, 0, 0);
+        return new ImageBitmap(rid2, dim[0], dim[1][0], dim[1][1]);
+    }
+
+    // Resize path: replay src with target dims.  Same cache
+    // machinery handles dedup and eviction.
+    if (!source._src) {
+        throw new Error('createImageBitmap: resize requires a source with src');
+    }
+    const rid2 = op_create_image();
+    const dim = await op_load_image(rid2, source._src, rw, rh);
+    return new ImageBitmap(rid2, dim[0], dim[1][0], dim[1][1]);
+}
+
+/**
  * ImagePreloader - Preload multiple images in parallel for better performance
  *
  * Usage:
@@ -286,4 +418,4 @@ const ImageCache = {
     }
 };
 
-export { createImage, ImagePreloader, ImageCache };
+export { createImage, ImagePreloader, ImageCache, ImageBitmap, createImageBitmap };

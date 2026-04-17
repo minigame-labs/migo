@@ -30,6 +30,8 @@
 //! [spec]: https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-state
 //! [spec-defaults]: https://html.spec.whatwg.org/multipage/canvas.html#reset-the-rendering-context-to-its-default-state
 
+use std::sync::Arc;
+
 use shared::protocol::color::Color;
 use shared::protocol::render_cmd::{GradientStop, GradientType, TextAlign, TextBaseline};
 use skia_safe::{BlendMode, PaintCap, PaintJoin};
@@ -47,7 +49,7 @@ pub enum StyleKind {
         y0: f32,
         x1: f32,
         y1: f32,
-        stops: Vec<GradientStop>,
+        stops: Arc<Vec<GradientStop>>,
     },
     RadialGradient {
         x0: f32,
@@ -56,13 +58,13 @@ pub enum StyleKind {
         x1: f32,
         y1: f32,
         r1: f32,
-        stops: Vec<GradientStop>,
+        stops: Arc<Vec<GradientStop>>,
     },
     ConicGradient {
         cx: f32,
         cy: f32,
         start_angle: f32,
-        stops: Vec<GradientStop>,
+        stops: Arc<Vec<GradientStop>>,
     },
     Pattern {
         image_id: u32,
@@ -85,6 +87,7 @@ impl StyleKind {
         _r1: f32,
         stops: Vec<GradientStop>,
     ) -> Self {
+        let stops = Arc::new(stops);
         match kind {
             GradientType::Linear => StyleKind::LinearGradient {
                 x0,
@@ -105,7 +108,7 @@ impl StyleKind {
             GradientType::Conic => StyleKind::ConicGradient {
                 cx: x0,
                 cy: y0,
-                start_angle: x1, // JS encodes start angle in x1 for conic
+                start_angle: x1,
                 stops,
             },
         }
@@ -164,7 +167,7 @@ pub struct TextAttrs {
     /// `font-size` in CSS px.
     pub size: f32,
     /// Parsed family list, head-first (e.g. `["Helvetica", "sans-serif"]`).
-    pub families: Vec<String>,
+    pub families: Arc<Vec<String>>,
     /// CSS `font-weight`, 1..=1000 (400 = normal, 700 = bold).
     pub weight: u16,
     /// CSS `font-style: italic | oblique`.
@@ -179,7 +182,7 @@ impl Default for TextAttrs {
     fn default() -> Self {
         Self {
             size: 10.0,
-            families: vec!["sans-serif".to_string()],
+            families: Arc::new(vec!["sans-serif".to_string()]),
             weight: 400,
             italic: false,
             align: TextAlign::Start,
@@ -199,7 +202,7 @@ pub struct Canvas2DState {
     pub line_join: PaintJoin,
     pub miter_limit: f32,
 
-    pub line_dash: Vec<f32>,
+    pub line_dash: Arc<Vec<f32>>,
     pub line_dash_offset: f32,
 
     pub global_alpha: f32,
@@ -228,7 +231,7 @@ impl Default for Canvas2DState {
             line_join: PaintJoin::Miter,
             miter_limit: 10.0,
 
-            line_dash: Vec::new(),
+            line_dash: Arc::new(Vec::new()),
             line_dash_offset: 0.0,
 
             global_alpha: 1.0,
@@ -349,7 +352,7 @@ mod tests {
 
         // Text
         assert_eq!(s.text.size, 10.0);
-        assert_eq!(s.text.families, vec!["sans-serif".to_string()]);
+        assert_eq!(&*s.text.families, &vec!["sans-serif".to_string()]);
         assert_eq!(s.text.weight, 400);
         assert!(!s.text.italic);
         assert!(matches!(s.text.align, TextAlign::Start));
@@ -370,7 +373,7 @@ mod tests {
             y0: 0.0,
             x1: 100.0,
             y1: 0.0,
-            stops: vec![],
+            stops: std::sync::Arc::new(vec![]),
         };
         assert!(s.fill_needs_shader());
 
@@ -552,6 +555,72 @@ mod tests {
         // One more should silently drop (returns false).
         assert!(!stack.push(&state));
         assert_eq!(stack.depth(), MAX_STATE_STACK_DEPTH);
+    }
+
+    #[test]
+    fn save_shares_heap_with_live_state() {
+        // Regression: `Canvas2DState::clone` (called by `StateStack::push`)
+        // must NOT deep-copy line_dash / text.families / gradient stops —
+        // they live in `Arc<Vec<_>>` specifically so every `ctx.save()`
+        // costs a refcount bump rather than the old per-sprite heap copy.
+        let mut state = Canvas2DState::default();
+        state.line_dash = std::sync::Arc::new(vec![4.0, 2.0, 1.0, 2.0]);
+        state.text = TextAttrs {
+            size: 12.0,
+            families: std::sync::Arc::new(vec![
+                "Helvetica".into(),
+                "Arial".into(),
+                "sans-serif".into(),
+            ]),
+            weight: 400,
+            italic: false,
+            align: TextAlign::Start,
+            baseline: TextBaseline::Alphabetic,
+        };
+
+        let mut stack = StateStack::new();
+        assert!(stack.push(&state));
+
+        // After push, the stack holds one `Arc` clone of each heap vec.
+        assert_eq!(std::sync::Arc::strong_count(&state.line_dash), 2);
+        assert_eq!(std::sync::Arc::strong_count(&state.text.families), 2);
+    }
+
+    #[test]
+    fn gradient_stops_are_shared_across_save_snapshots() {
+        // A fill style with a gradient is saved/restored thousands of
+        // times per frame in particle systems; the Arc'd stop list
+        // means we never clone its N colour stops.
+        let mut state = Canvas2DState::default();
+        let stops_vec = vec![
+            GradientStop { offset: 0.0, color: Color::black() },
+            GradientStop { offset: 1.0, color: Color::white() },
+        ];
+        state.fill = StyleKind::from_gradient(
+            GradientType::Linear, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, stops_vec,
+        );
+        // Walk the Arc through a `push` + `pop` and check the refcount
+        // observed from the *inside* of the enum never exceeded 2.
+        let mut stack = StateStack::new();
+        stack.push(&state);
+        if let StyleKind::LinearGradient { stops, .. } = &state.fill {
+            assert_eq!(std::sync::Arc::strong_count(stops), 2);
+        } else {
+            panic!("wrong kind");
+        }
+        let mut popped = Canvas2DState::default();
+        stack.pop(&mut popped);
+        // `state.fill` still holds its Arc; `popped.fill` holds another
+        // Arc clone from the snapshot; total count = 2.
+        if let (
+            StyleKind::LinearGradient { stops: a, .. },
+            StyleKind::LinearGradient { stops: b, .. },
+        ) = (&state.fill, &popped.fill)
+        {
+            assert!(std::sync::Arc::ptr_eq(a, b), "save must keep the same Arc");
+        } else {
+            panic!("wrong kind after pop");
+        }
     }
 
     #[test]

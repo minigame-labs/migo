@@ -97,7 +97,7 @@ mod file;
 mod input;
 mod io_state;
 mod lifecycle;
-mod network;
+pub(crate) mod network;
 mod rendering;
 mod storage;
 mod url;

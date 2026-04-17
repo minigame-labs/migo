@@ -295,7 +295,7 @@ mod tests {
         s.miter_limit = 3.5;
         s.line_cap = skia_safe::PaintCap::Round;
         s.line_join = skia_safe::PaintJoin::Bevel;
-        s.line_dash = vec![4.0, 2.0];
+        s.line_dash = std::sync::Arc::new(vec![4.0, 2.0]);
         s.line_dash_offset = 1.0;
 
         let p = build_stroke_paint(&s, &NullPatternResolver);
@@ -311,7 +311,7 @@ mod tests {
     fn build_stroke_paint_no_dash_when_empty() {
         let mut s = Canvas2DState::default();
         s.stroke = StyleKind::Color(ProtocolColor::black());
-        s.line_dash = Vec::new();
+        s.line_dash = std::sync::Arc::new(Vec::new());
         let p = build_stroke_paint(&s, &NullPatternResolver);
         assert!(p.path_effect().is_none());
     }
@@ -330,10 +330,10 @@ mod tests {
             y0: 0.0,
             x1: 1.0,
             y1: 0.0,
-            stops: vec![GradientStop {
+            stops: std::sync::Arc::new(vec![GradientStop {
                 offset: 0.5,
                 color: ProtocolColor::black(),
-            }],
+            }]),
         };
         assert!(build_shader(&s, 1.0, &NullPatternResolver).is_none());
     }
@@ -345,7 +345,7 @@ mod tests {
             y0: 0.0,
             x1: 1.0,
             y1: 0.0,
-            stops: vec![
+            stops: std::sync::Arc::new(vec![
                 GradientStop {
                     offset: 0.0,
                     color: ProtocolColor::rgb(255, 0, 0),
@@ -354,7 +354,7 @@ mod tests {
                     offset: 1.0,
                     color: ProtocolColor::rgb(0, 0, 255),
                 },
-            ],
+            ]),
         };
         assert!(build_shader(&s, 1.0, &NullPatternResolver).is_some());
     }

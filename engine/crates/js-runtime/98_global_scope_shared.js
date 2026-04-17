@@ -71,6 +71,12 @@ const windowOrWorkerGlobalScope = {
     // Image
     createImage: core.propNonEnumerable(image.createImage),
     createImageData: core.propNonEnumerable(imageData.createImageData),
+    // Browser parity: ImageBitmap constructor + createImageBitmap()
+    // factory.  The factory is the canonical entry point; exposing
+    // the class too lets small-game code do `instanceof ImageBitmap`
+    // for polyfill detection without relying on prototype probing.
+    ImageBitmap: core.propNonEnumerable(image.ImageBitmap),
+    createImageBitmap: core.propNonEnumerable(image.createImageBitmap),
 
     // GC / Memory
     triggerGC: core.propNonEnumerable(gc.triggerGC),

@@ -19,11 +19,32 @@ const DEFAULT_MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Default maximum number of cached entries
 const DEFAULT_MAX_ENTRIES: usize = 256;
 
-/// Structured cache key: (real_path, mount_generation).
+/// Structured cache key: `(real_path, mount_generation, target_w, target_h)`.
 ///
-/// Using a tuple avoids delimiter collision that string concatenation
-/// would introduce (`:` is a legal path character on Linux).
-pub type ImageCacheKey = (String, u64);
+/// `target_w = target_h = 0` means "full resolution" — the path most
+/// Canvas `drawImage` hits.  Non-zero targets correspond to
+/// `createImageBitmap` / `drawImage(…, dw, dh)` paths that request a
+/// specific pre-resize, so those get their own cache slots instead of
+/// hammering the decode+resize pipeline each frame.
+pub type ImageCacheKey = (String, u64, u32, u32);
+
+/// Convenience constructor for the common full-resolution key.
+#[inline]
+pub fn full_res_key(path: String, generation: u64) -> ImageCacheKey {
+    (path, generation, 0, 0)
+}
+
+/// Convenience: key for a specific pre-resized variant.  `target_w` or
+/// `target_h` == 0 is normalised to 0 to match the "full res" sentinel.
+#[inline]
+pub fn resized_key(
+    path: String,
+    generation: u64,
+    target_w: u32,
+    target_h: u32,
+) -> ImageCacheKey {
+    (path, generation, target_w, target_h)
+}
 
 /// Cached image entry with reference counting.
 #[derive(Clone)]
@@ -162,4 +183,61 @@ static GLOBAL_CACHE: LazyLock<Mutex<ImageCache>> = LazyLock::new(|| Mutex::new(I
 /// Get reference to global cache.
 pub fn global_cache() -> parking_lot::MutexGuard<'static, ImageCache> {
     GLOBAL_CACHE.lock()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::protocol::io_cmd::NormalizedImage;
+    use std::sync::Arc;
+
+    fn rgba(width: u32, height: u32) -> NormalizedImage {
+        NormalizedImage {
+            width,
+            height,
+            rgba: Arc::new(vec![0u8; (width * height * 4) as usize]),
+        }
+    }
+
+    #[test]
+    fn full_res_and_resized_keys_do_not_collide() {
+        // Regression: the same source path at full-res vs a specific
+        // pre-resized dimension used to share a cache slot (resizes
+        // were never cached at all), forcing the decoder to re-run
+        // every frame.  With the 4-tuple key, each variant gets its
+        // own slot and survives across draws.
+        let mut cache = ImageCache::with_limits(16, 16 * 1024 * 1024);
+        let full = full_res_key("/code/sprite.png".into(), 3);
+        let r128 = resized_key("/code/sprite.png".into(), 3, 128, 128);
+        let r64 = resized_key("/code/sprite.png".into(), 3, 64, 64);
+
+        cache.insert(full.clone(), rgba(256, 256));
+        cache.insert(r128.clone(), rgba(128, 128));
+        cache.insert(r64.clone(), rgba(64, 64));
+
+        assert_eq!(cache.get(&full).unwrap().image.width, 256);
+        assert_eq!(cache.get(&r128).unwrap().image.width, 128);
+        assert_eq!(cache.get(&r64).unwrap().image.width, 64);
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 3);
+        assert!(stats.hits >= 3);
+    }
+
+    #[test]
+    fn generation_bump_evicts_all_sizes() {
+        // A mount-generation bump (asset hot-reload) must invalidate
+        // every variant of the path, which is naturally handled by
+        // keying on generation: gen=9 entries simply never collide
+        // with gen=10 lookups.
+        let mut cache = ImageCache::with_limits(16, 16 * 1024 * 1024);
+        cache.insert(full_res_key("/code/t.png".into(), 9), rgba(32, 32));
+        cache.insert(resized_key("/code/t.png".into(), 9, 16, 16), rgba(16, 16));
+
+        assert!(cache
+            .get(&full_res_key("/code/t.png".into(), 10))
+            .is_none());
+        assert!(cache
+            .get(&resized_key("/code/t.png".into(), 10, 16, 16))
+            .is_none());
+    }
 }

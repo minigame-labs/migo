@@ -557,8 +557,41 @@ class WebGLRenderingContext {
         return 0;
     }
 
-    getExtension(_name) {
+    getExtension(name) {
+        // Our GL backend IS GLES 3.0, so every "extension" that maps
+        // to core GLES3 features we can satisfy by wiring the core
+        // ops behind the OES_/ANGLE_/etc alias the WebGL 1 games
+        // expect.  Cocos Creator 2.x in particular queries
+        // `OES_vertex_array_object` and falls back to a per-draw
+        // `vertexAttribPointer` storm when the extension is absent
+        // -- exposing it here cuts the storm to one bind per
+        // material at the cost of 3 one-line wrappers.
+        if (name === 'OES_vertex_array_object') {
+            return this._oesVertexArrayObject ||
+                (this._oesVertexArrayObject = this._buildOesVertexArrayObject());
+        }
         return null;
+    }
+
+    _buildOesVertexArrayObject() {
+        const ctx = this;
+        return {
+            VERTEX_ARRAY_BINDING_OES: 0x85B5,
+            createVertexArrayOES() {
+                const id = nextResourceId();
+                op_create_vertex_array(ctx._canvasId, id);
+                return { _id: id, _kind: 'vao' };
+            },
+            deleteVertexArrayOES(vao) {
+                if (vao && vao._id) op_delete_vertex_array(vao._id);
+            },
+            isVertexArrayOES(vao) {
+                return !!(vao && typeof vao._id === 'number' && vao._kind === 'vao');
+            },
+            bindVertexArrayOES(vao) {
+                op_bind_vertex_array(ctx._canvasId, vao ? vao._id : 0);
+            },
+        };
     }
 
     // -- Phase 1B: Textures --

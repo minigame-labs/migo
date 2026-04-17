@@ -272,7 +272,7 @@ impl Canvas2DRenderer {
                 if d.len() % 2 == 1 {
                     d.extend_from_slice(&d.clone());
                 }
-                self.state.line_dash = d;
+                self.state.line_dash = std::sync::Arc::new(d);
                 false
             }
             SetLineDashOffset { offset } => {

@@ -38,7 +38,60 @@ pub struct TextContext {
     font_collection: FontCollection,
     provider: TypefaceFontProvider,
     fallback_family: String,
+    /// LRU cache of `measureText` results keyed by
+    /// `(text, attrs_fingerprint)`.  `measureText` is the hottest
+    /// call in Canvas2D UI code (label auto-sizing, wrap detection,
+    /// hit-testing) — a mid-tier inventory screen issues hundreds
+    /// of measurements per frame.  Skia paragraph shaping via
+    /// HarfBuzz + ICU costs ~50-150 us each; the cache reduces
+    /// steady-state cost to a hash lookup.
+    ///
+    /// `RefCell` because `measure_text` is conceptually a read
+    /// against an immutable `TextContext`; interior mutability
+    /// keeps call sites ergonomic without forcing `&mut self`
+    /// through the renderer.
+    measure_cache: core::cell::RefCell<lru::LruCache<TextMeasureKey, TextMetrics>>,
 }
+
+/// Fingerprint of the state that determines the shaped-text metrics.
+///
+/// Excludes fill/stroke paint (measurement is paint-independent) and
+/// `maxWidth` (applied as a post-layout horizontal scale, not during
+/// shaping -- see `paint_text`).
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct TextMeasureKey {
+    text: String,
+    size_bits: u32,
+    families_hash: u64,
+    weight: u16,
+    italic: bool,
+}
+
+impl TextMeasureKey {
+    fn new(text: &str, attrs: &TextAttrs) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for f in attrs.families.iter() {
+            f.hash(&mut hasher);
+        }
+        Self {
+            text: text.to_string(),
+            // `f32` isn't Hash/Eq by itself; bit-cast to preserve
+            // exact equality (including for NaN, which never hits
+            // this path because we clamp to 0 earlier).
+            size_bits: attrs.size.to_bits(),
+            families_hash: hasher.finish(),
+            weight: attrs.weight,
+            italic: attrs.italic,
+        }
+    }
+}
+
+/// Capacity of the `measureText` cache.  Each entry is ~40 bytes plus
+/// the text string.  256 entries at a typical label length of 32 UTF-8
+/// bytes ≈ 18 KB steady-state -- negligible, and absorbs a full screen
+/// of distinct labels plus history.
+const MEASURE_CACHE_CAP: usize = 256;
 
 impl Default for TextContext {
     fn default() -> Self {
@@ -66,11 +119,23 @@ impl TextContext {
         fc.set_asset_font_manager(Some(provider.clone().into()));
         fc.set_default_font_manager(FontMgr::default(), None);
 
+        let cache_cap = std::num::NonZeroUsize::new(MEASURE_CACHE_CAP)
+            .expect("MEASURE_CACHE_CAP must be > 0");
+
         Self {
             font_collection: fc,
             provider,
             fallback_family: "sans-serif".to_string(),
+            measure_cache: core::cell::RefCell::new(lru::LruCache::new(cache_cap)),
         }
+    }
+
+    /// Drop every cached measurement.  Must be called whenever a new
+    /// typeface is registered — the same font family can resolve to a
+    /// different typeface afterwards, which subtly shifts per-glyph
+    /// advances even at identical font size.
+    fn invalidate_measure_cache(&self) {
+        self.measure_cache.borrow_mut().clear();
     }
 
     /// Register a typeface under the CSS family name `family`.
@@ -87,6 +152,9 @@ impl TextContext {
         // Re-sync the asset manager so the collection sees the new family.
         self.font_collection
             .set_asset_font_manager(Some(self.provider.clone().into()));
+        // A new typeface may change how existing families resolve --
+        // flush the measure cache to avoid serving stale metrics.
+        self.invalidate_measure_cache();
         true
     }
 
@@ -97,6 +165,7 @@ impl TextContext {
         self.provider.register_typeface(tf.clone(), None);
         self.font_collection
             .set_asset_font_manager(Some(self.provider.clone().into()));
+        self.invalidate_measure_cache();
         Some(tf)
     }
 
@@ -171,7 +240,17 @@ impl TextContext {
 
     /// Canvas2D `measureText` — computes a [`TextMetrics`] for `text`
     /// using the current `TextAttrs`.  No painting happens.
+    ///
+    /// Hot path: results are cached in an LRU keyed on the fingerprint
+    /// returned by [`TextMeasureKey::new`].  Identical repeated
+    /// measurements (typical in auto-sizing UI code) collapse to a
+    /// hash lookup instead of re-running HarfBuzz shaping.
     pub fn measure_text(&self, text: &str, attrs: &TextAttrs) -> TextMetrics {
+        let key = TextMeasureKey::new(text, attrs);
+        if let Some(cached) = self.measure_cache.borrow_mut().get(&key) {
+            return cached.clone();
+        }
+
         let mut paragraph = self.build_paragraph(text, attrs, None);
         paragraph.layout(f32::INFINITY);
 
@@ -185,7 +264,7 @@ impl TextContext {
         // baselines, em_height_*) can be added on-demand without breaking
         // the wire format.
         let _ = ideo_baseline;
-        TextMetrics {
+        let metrics = TextMetrics {
             width,
             actual_bounding_box_left: 0.0,
             actual_bounding_box_right: width,
@@ -193,7 +272,9 @@ impl TextContext {
             font_bounding_box_descent: (height - alpha_baseline).max(0.0),
             actual_bounding_box_ascent: alpha_baseline,
             actual_bounding_box_descent: (height - alpha_baseline).max(0.0),
-        }
+        };
+        self.measure_cache.borrow_mut().put(key, metrics.clone());
+        metrics
     }
 
     fn build_paragraph(
@@ -263,7 +344,7 @@ mod tests {
     fn test_attrs(size: f32) -> TextAttrs {
         TextAttrs {
             size,
-            families: vec!["test-noto".to_string(), "sans-serif".to_string()],
+            families: std::sync::Arc::new(vec!["test-noto".to_string(), "sans-serif".to_string()]),
             weight: 400,
             italic: false,
             align: TextAlign::Start,
@@ -315,6 +396,59 @@ mod tests {
         assert!(m.font_bounding_box_ascent > 0.0);
         assert!(m.font_bounding_box_descent >= 0.0);
         assert!(m.actual_bounding_box_right > 0.0);
+    }
+
+    #[test]
+    fn measure_text_cache_returns_bitwise_identical_results() {
+        // The LRU must not perturb the result: a cached lookup has
+        // to be indistinguishable from a fresh shaping pass.  This
+        // catches accidental floating-point drift, field truncation,
+        // or key collisions.
+        let mut ctx = TextContext::new();
+        assert!(ctx.register_family("test-noto", NOTO_SANS));
+        let attrs = test_attrs(18.5);
+        let first = ctx.measure_text("Hello, world", &attrs);
+        let second = ctx.measure_text("Hello, world", &attrs);
+        assert_eq!(first.width.to_bits(), second.width.to_bits());
+        assert_eq!(
+            first.font_bounding_box_ascent.to_bits(),
+            second.font_bounding_box_ascent.to_bits()
+        );
+        assert_eq!(
+            first.actual_bounding_box_right.to_bits(),
+            second.actual_bounding_box_right.to_bits()
+        );
+    }
+
+    #[test]
+    fn measure_text_cache_keys_on_size_and_family() {
+        // Different size / family must NOT share a cache slot,
+        // otherwise the metrics returned after the first distinct
+        // measurement would be completely wrong.
+        let mut ctx = TextContext::new();
+        assert!(ctx.register_family("test-noto", NOTO_SANS));
+        let small = ctx.measure_text("test", &test_attrs(12.0));
+        let large = ctx.measure_text("test", &test_attrs(48.0));
+        assert!(
+            large.width > small.width * 3.5,
+            "cache confused sizes: small.w={}, large.w={}",
+            small.width,
+            large.width
+        );
+    }
+
+    #[test]
+    fn register_family_invalidates_measure_cache() {
+        // After registering a new typeface under an existing
+        // family name, previously cached metrics may be wrong.
+        let mut ctx = TextContext::new();
+        assert!(ctx.register_family("test-noto", NOTO_SANS));
+        // Warm the cache.
+        let _ = ctx.measure_text("hello", &test_attrs(16.0));
+        assert!(!ctx.measure_cache.borrow().is_empty());
+        // Registering another typeface must drop the cache.
+        assert!(ctx.register_family("test-noto", NOTO_SANS));
+        assert!(ctx.measure_cache.borrow().is_empty());
     }
 
     #[test]

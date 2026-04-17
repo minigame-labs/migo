@@ -43,6 +43,8 @@ shared = {path = "../shared"}
 io = { path = "../io", default-features = false, features = ["zip-extract"] }
 serde.workspace = true
 reqwest.workspace = true
+base64 = "0.22"
+percent-encoding = "2.3"
 thiserror.workspace = true
 http.workspace = true
 data-url.workspace = true
