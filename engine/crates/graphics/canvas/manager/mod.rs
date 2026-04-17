@@ -28,6 +28,7 @@ mod types;
 
 pub(crate) use types::{
     ee, BlendEquation, BlendFactors, BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta,
+    VertexAttribPointerFp,
     ProgramMeta, RenderbufferMeta, SamplerMeta, ScissorState, ShaderMeta, SyncMeta, TextureMeta,
     VaoMeta, MAX_UNIFORM_CACHE,
 };
@@ -95,16 +96,10 @@ pub(crate) struct CanvasManager {
     pub(crate) samplers: HashMap<shared::protocol::render_cmd::SamplerId, SamplerMeta>,
     pub(crate) syncs: HashMap<shared::protocol::render_cmd::SyncId, SyncMeta>,
 
-    /// `true` when WebGL or another external code path has mutated GL
-    /// state since Skia's last `GrDirectContext::reset()`.  Consulted
-    /// by the Canvas2D batch entry in `render_thread::execute_canvas_batch`:
-    /// when set, the current 2D context calls `reset_gl_state()` once
-    /// before any Skia draw and clears the flag.
-    ///
-    /// Moved out of per-canvas state because GL state is global to the
-    /// EGL context — every Canvas2DContext in the share-group is
-    /// equally affected by a WebGL state change.
-    pub(crate) skia_needs_reset: bool,
+    // NOTE: WebGL → Canvas2D invalidation is now tracked per-context
+    // via `Canvas2DContext::skia_state_stale` (see backend/gl/surface.rs).
+    // The old manager-global `skia_needs_reset` flag was removed after
+    // it was observed to over-/mis-invalidate in multi-canvas scenes.
 
     /// Runtime device capabilities, detected once at init.
     pub(crate) device_caps: crate::device_caps::DeviceCapabilities,
@@ -297,7 +292,6 @@ impl CanvasManager {
             vaos: HashMap::with_capacity(16),
             samplers: HashMap::with_capacity(8),
             syncs: HashMap::with_capacity(4),
-            skia_needs_reset: false,
             device_caps,
             gles_major,
             preserved_ctx: None,
@@ -1433,14 +1427,17 @@ impl CanvasManager {
     pub(crate) fn split_2d_and_images(
         &mut self,
         canvas_id: CanvasId,
-    ) -> EngineResult<(&mut Canvas2DContext, &crate::backend::gl::image_store::ImageStore)> {
+    ) -> EngineResult<(
+        &mut Canvas2DContext,
+        &mut crate::backend::gl::image_store::ImageStore,
+    )> {
         let ctx = self.contexts_2d.get_mut(&canvas_id).ok_or_else(|| {
             ee(
                 ErrorCode::NotFound,
                 format!("2d context not found: canvas_id={canvas_id:?}"),
             )
         })?;
-        Ok((ctx, self.image_registry.store()))
+        Ok((ctx, self.image_registry.store_mut()))
     }
 
     /// Iterate over all 2D contexts mutably (for font registration, etc.).
@@ -1489,8 +1486,33 @@ impl CanvasManager {
 
     /// Save current GL state and set a safe baseline for Canvas2D / Skia
     /// text atlas uploads.
-    pub(crate) fn begin_canvas2d_gl_scope(&self) -> context_2d_impl::Canvas2DGlScopeGuard {
-        context_2d_impl::begin_canvas2d_gl_scope(&self.gl)
+    /// Mark every live 2D context's Skia cache as stale.  Called
+    /// once per WebGL batch to signal "external code just mutated
+    /// raw GL state, your tracked cache is no longer accurate."
+    /// The per-context `reset_gl_state_if_stale()` picks this up
+    /// lazily on the next Skia draw.
+    pub(crate) fn mark_all_2d_contexts_stale(&mut self) {
+        for ctx in self.contexts_2d.values_mut() {
+            ctx.mark_state_stale();
+        }
+    }
+
+    /// Begin a Skia-side GL scope for `canvas_id`.  Restores the 5
+    /// raw-GL bindings Skia requires (active-tex, PBO, alignment) on
+    /// drop and invalidates the per-canvas dedup shadow so WebGL
+    /// can't serve stale cached state.  Canonical entry point for
+    /// the Materialize / Present boundary.
+    pub(crate) fn begin_canvas2d_gl_scope_for(
+        &mut self,
+        canvas_id: CanvasId,
+    ) -> context_2d_impl::Canvas2DGlScopeGuard {
+        let gl_ptr: *const glow::Context = &self.gl;
+        let shadow = self.gl_state.entry(canvas_id).or_default() as *mut _;
+        // SAFETY: `self.gl` is never mutated; `gl_state` is borrowed
+        // only through this pointer until the guard drops.  The
+        // guard drops before any other method returns a borrow of
+        // `self`.
+        unsafe { context_2d_impl::begin_canvas2d_gl_scope(&*gl_ptr, Some(&mut *shadow)) }
     }
 
     pub(crate) fn flush_dirty_2d_contexts(&mut self) -> EngineResult<Vec<CanvasId>> {

@@ -33,7 +33,9 @@
 use std::sync::Arc;
 
 use shared::protocol::color::Color;
-use shared::protocol::render_cmd::{GradientStop, GradientType, TextAlign, TextBaseline};
+use shared::protocol::render_cmd::{
+    GradientStop, GradientType, TextAlign, TextBaseline, TextDirection,
+};
 use skia_safe::{BlendMode, PaintCap, PaintJoin};
 
 /// Fill (or stroke) style referenced by a [`Canvas2DState`].
@@ -174,11 +176,14 @@ pub struct TextAttrs {
     pub italic: bool,
     pub align: TextAlign,
     pub baseline: TextBaseline,
+    /// BiDi reorder direction.  Defaults to `Inherit`, which the text
+    /// pipeline resolves to `Ltr` (the engine has no parent box).
+    pub direction: TextDirection,
 }
 
 impl Default for TextAttrs {
     /// Canvas 2D default: `10px sans-serif`, `start` align, `alphabetic`
-    /// baseline, normal weight, upright.
+    /// baseline, normal weight, upright, inherit direction.
     fn default() -> Self {
         Self {
             size: 10.0,
@@ -187,6 +192,7 @@ impl Default for TextAttrs {
             italic: false,
             align: TextAlign::Start,
             baseline: TextBaseline::Alphabetic,
+            direction: TextDirection::Inherit,
         }
     }
 }
@@ -214,6 +220,16 @@ pub struct Canvas2DState {
     pub antialias: bool,
     /// Image-smoothing (bilinear) flag — affects `drawImage` when scaling.
     pub image_smoothing: bool,
+    /// `true` once a transform op (`rotate` / non-uniform `scale` /
+    /// `setTransform` / non-axis-aligned matrix) has moved the CTM
+    /// away from identity-or-translation.  Used by the damage
+    /// classifier: only axis-aligned transforms allow the tight
+    /// `OnscreenRect` damage fast path.  `Translate` alone does
+    /// NOT flip this flag — it just offsets the damage rect.
+    ///
+    /// Scoped per save-restore frame so a temporary `ctx.rotate()`
+    /// inside a `save/restore` doesn't poison subsequent frames.
+    pub ctm_non_axis_aligned: bool,
 }
 
 impl Default for Canvas2DState {
@@ -241,6 +257,7 @@ impl Default for Canvas2DState {
             text: TextAttrs::default(),
             antialias: true,
             image_smoothing: true,
+            ctm_non_axis_aligned: false,
         }
     }
 }
@@ -263,18 +280,38 @@ impl Canvas2DState {
 
 /// Save/restore stack for [`Canvas2DState`].
 ///
-/// The Canvas 2D spec caps the "drawing state stack" depth at a "reasonable
-/// limit" — we use 32, the same value Chrome picked to balance push cost
-/// against legitimate nested drawing (e.g. Cocos nested `save()` chains).
-/// Beyond that, further `save()` calls still *record* (so `restore()` pops
-/// correctly) but no additional memory is allocated for the snapshots; the
-/// handler additionally forwards the `save()` / `restore()` to `SkCanvas`
-/// which handles CTM and clip.
-pub const MAX_STATE_STACK_DEPTH: usize = 32;
-
+/// The WHATWG Canvas 2D spec requires `save()` and `restore()` to be
+/// perfectly symmetric — every `save()` MUST snapshot *all* drawing
+/// state, and the matching `restore()` MUST pop it.  We used to cap
+/// the stack at 32 entries "for allocator pressure", but that silently
+/// desynchronised our logical state from the `SkCanvas` CTM/clip
+/// stack: past depth 32, `save()` dropped the snapshot yet still
+/// called `canvas.save()`; the matching `restore()` saw an empty
+/// local stack, skipped `canvas.restore()`, and **leaked a CTM/clip
+/// frame forever**.  The fix is to let the stack grow unbounded;
+/// `Vec`'s natural amortised growth is cheap compared to a single
+/// `SkPaint` draw, and pathological scripts that save a million
+/// times have worse problems than a 32-byte `Vec` entry.
+///
+/// `Arc` sharing inside [`Canvas2DState`] (line_dash, families,
+/// gradient stops) keeps each snapshot to ~200 bytes of genuinely
+/// owned data.
+///
+/// **Future refinement note (P3-2 persistent blocks)** — a more
+/// aggressive design would split `Canvas2DState` into orthogonal
+/// sub-blocks (`transform/clip`, `stroke/dash`, `fill`, `text`,
+/// `shadow`) and wrap each in its own `Arc`, so a `save()` becomes
+/// `N` pointer clones instead of a ~200-byte struct copy.  That
+/// refactor is intentionally deferred until profiling shows
+/// `clone` is a hotspot: the current `Vec<Canvas2DState>` already
+/// costs only 4 × f32 of true-own copy per push because every
+/// heap-backed field is `Arc<_>`.  If you pick it up, keep the
+/// `save()` → mutate → `restore()` round-trip allocation-free on
+/// the common no-mutate-then-restore path that games emit 10s of
+/// thousands of times per frame (sprite batches).
 #[derive(Debug, Default)]
 pub struct StateStack {
-    /// Saved state snapshots, LIFO.  `len() ≤ MAX_STATE_STACK_DEPTH`.
+    /// Saved state snapshots, LIFO.  Unbounded — see type doc.
     saved: Vec<Canvas2DState>,
 }
 
@@ -292,19 +329,11 @@ impl StateStack {
         self.saved.len()
     }
 
-    /// Push a snapshot of `state`.
-    ///
-    /// Returns `true` if the snapshot was recorded, `false` if the stack
-    /// was at its depth limit and the save was dropped (the handler should
-    /// still call `SkCanvas::save()` in both cases to keep the CTM/clip
-    /// stack in sync — the stack depth mismatch is the *whole point* of
-    /// the shallow limit: we rely on Skia's internal stack being deeper).
-    pub fn push(&mut self, state: &Canvas2DState) -> bool {
-        if self.saved.len() >= MAX_STATE_STACK_DEPTH {
-            return false;
-        }
+    /// Push a snapshot of `state`.  Always succeeds — the stack has
+    /// no artificial cap because an asymmetric `save()` / `restore()`
+    /// pair would desync us from `SkCanvas`.
+    pub fn push(&mut self, state: &Canvas2DState) {
         self.saved.push(state.clone());
-        true
     }
 
     /// Pop the most recent snapshot into `state`.
@@ -511,7 +540,7 @@ mod tests {
         let mut stack = StateStack::new();
         let mut state = Canvas2DState::default();
 
-        assert!(stack.push(&state));
+        stack.push(&state);
         assert_eq!(stack.depth(), 1);
 
         // Mutate
@@ -543,18 +572,54 @@ mod tests {
     }
 
     #[test]
-    fn stack_caps_depth_and_signals_overflow() {
+    fn stack_grows_unbounded_and_pops_symmetrically() {
+        // Regression for the WHATWG save/restore symmetry bug: the old
+        // code capped depth at 32, causing silently-dropped snapshots
+        // past that limit and a permanent CTM/clip desync against
+        // `SkCanvas`.  This test deliberately pushes well past 32 and
+        // asserts that *every* pop returns the matching snapshot.
         let mut stack = StateStack::new();
-        let state = Canvas2DState::default();
+        let base = Canvas2DState::default();
+        let mut state = base.clone();
 
-        for _ in 0..MAX_STATE_STACK_DEPTH {
-            assert!(stack.push(&state));
+        // Push a hundred distinct snapshots, each mutating `line_width`
+        // so we can verify stack identity on pop.
+        const N: usize = 128;
+        for i in 0..N {
+            state.line_width = i as f32 + 1.0;
+            stack.push(&state);
         }
-        assert_eq!(stack.depth(), MAX_STATE_STACK_DEPTH);
+        assert_eq!(stack.depth(), N);
 
-        // One more should silently drop (returns false).
-        assert!(!stack.push(&state));
-        assert_eq!(stack.depth(), MAX_STATE_STACK_DEPTH);
+        // Pop in reverse and check each restored line_width.
+        for i in (0..N).rev() {
+            assert!(stack.pop(&mut state), "pop {} must succeed", i);
+            assert_eq!(state.line_width, i as f32 + 1.0);
+        }
+        assert_eq!(stack.depth(), 0);
+        // A final pop must report underflow (Canvas 2D spec says
+        // `restore()` on an empty stack is a silent no-op).
+        assert!(!stack.pop(&mut state));
+    }
+
+    #[test]
+    fn stack_push_is_symmetric_under_deep_nesting() {
+        // Verifies: for N consecutive pushes followed by N pops, the
+        // state returned at each pop exactly matches the snapshot
+        // captured at the corresponding push — no dropped frames.
+        let mut stack = StateStack::new();
+        let mut state = Canvas2DState::default();
+        let mut expected: Vec<f32> = Vec::new();
+        for i in 0..200 {
+            state.line_width = (i as f32) * 0.5;
+            expected.push(state.line_width);
+            stack.push(&state);
+        }
+        while let Some(expect) = expected.pop() {
+            assert!(stack.pop(&mut state));
+            assert_eq!(state.line_width, expect);
+        }
+        assert_eq!(stack.depth(), 0);
     }
 
     #[test]
@@ -576,10 +641,11 @@ mod tests {
             italic: false,
             align: TextAlign::Start,
             baseline: TextBaseline::Alphabetic,
+            direction: TextDirection::Inherit,
         };
 
         let mut stack = StateStack::new();
-        assert!(stack.push(&state));
+        stack.push(&state);
 
         // After push, the stack holds one `Arc` clone of each heap vec.
         assert_eq!(std::sync::Arc::strong_count(&state.line_dash), 2);

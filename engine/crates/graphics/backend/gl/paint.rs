@@ -11,8 +11,7 @@
 use super::color::{to_sk_color4f, to_sk_color4f_modulated};
 use super::state::{Canvas2DState, StyleKind};
 use skia_safe::{
-    gradient_shader, image_filters, path_effect::PathEffect, BlendMode, Color,
-    Paint, Point, Shader, TileMode,
+    gradient_shader, BlendMode, Color, Paint, Point, Shader, TileMode,
 };
 use shared::protocol::render_cmd::GradientStop;
 
@@ -175,13 +174,24 @@ pub fn apply_shadow_to_paint(paint: &mut Paint, state: &Canvas2DState) {
     }
     let sigma = state.shadow.blur * 0.5;
     let color = to_sk_color4f_modulated(state.shadow.color, state.global_alpha).to_color();
-    if let Some(filter) = image_filters::drop_shadow(
-        (state.shadow.offset_x, state.shadow.offset_y),
-        (sigma, sigma),
-        color,
-        None, // color space
-        None, // input filter
-        None, // crop rect
+    // Shared filter pool: drop-shadow reuse is very high because
+    // games set the same shadow on every label / button-container
+    // for a whole screen.  `get_or_build_drop_shadow` hands back a
+    // refcounted clone, no allocation on cache hit.
+    if let Some(filter) = super::effect_cache::get_or_build_drop_shadow(
+        // `skia_safe::Color` is a `#[repr(transparent)]` newtype
+        // over `SkColor` (aka ARGB u32).  Transmuting through the
+        // `native_transmutable!` machinery is idiomatic in skia-safe.
+        // Easier: rebuild the u32 from the alpha/red/green/blue
+        // channels the Color struct exposes.
+        (color.a() as u32) << 24
+            | (color.r() as u32) << 16
+            | (color.g() as u32) << 8
+            | (color.b() as u32),
+        sigma,
+        sigma,
+        state.shadow.offset_x,
+        state.shadow.offset_y,
     ) {
         paint.set_image_filter(filter);
     }
@@ -250,7 +260,7 @@ pub fn build_stroke_paint<R: PatternResolver>(
 
     if !state.line_dash.is_empty() {
         if let Some(effect) =
-            PathEffect::dash(&state.line_dash, state.line_dash_offset)
+            super::effect_cache::get_or_build_dash(&state.line_dash, state.line_dash_offset)
         {
             paint.set_path_effect(effect);
         }

@@ -48,6 +48,7 @@ pub mod device_profile;
 pub mod dirty_region;
 pub mod frame_scheduler;
 mod legacy_frame_bridge;
+pub mod render_diagnostics;
 mod render_server;
 mod render_thread;
 mod renderergl;

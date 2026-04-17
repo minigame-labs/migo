@@ -1005,16 +1005,64 @@ pub enum TextBaseline {
     Bottom,
 }
 
+/// Canvas 2D `direction` drawing state.  Controls bidirectional text
+/// reordering and the resolution of `textAlign=start`/`end`.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum TextDirection {
+    /// CSS `direction: inherit` — falls back to LTR at the context
+    /// level since the engine has no parent element to inherit from.
+    #[default]
+    Inherit,
+    /// Left-to-right: Latin, CJK, most scripts.
+    Ltr,
+    /// Right-to-left: Arabic, Hebrew.
+    Rtl,
+}
+
 /// Result of measureText operation.
+///
+/// Serialised with camelCase field names so JS consumers receive the
+/// exact property shape Canvas 2D specifies (`actualBoundingBoxLeft`,
+/// `fontBoundingBoxAscent`, etc.), while Rust code continues to use
+/// idiomatic snake_case.
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TextMetrics {
+    /// Advance width of the run, in CSS pixels (Canvas 2D spec: the
+    /// "width of a line of text that wraps".)
     pub width: f32,
+    /// Distance from `x` anchor to the left edge of the tight glyph
+    /// bounding box.
     pub actual_bounding_box_left: f32,
+    /// Distance from `x` anchor to the right edge of the tight glyph
+    /// bounding box.
     pub actual_bounding_box_right: f32,
+    /// Distance from `y` anchor (baseline) to the top of the tight
+    /// glyph bounding box.
     pub actual_bounding_box_ascent: f32,
+    /// Distance from `y` anchor (baseline) to the bottom of the tight
+    /// glyph bounding box.
     pub actual_bounding_box_descent: f32,
+    /// Distance from `y` anchor to the top of the font's em box.
     pub font_bounding_box_ascent: f32,
+    /// Distance from `y` anchor to the bottom of the font's em box.
     pub font_bounding_box_descent: f32,
+    /// Distance from `y` anchor to the top of the em-height above the
+    /// baseline (equivalent to `ascent` in CSS line-box).
+    pub em_height_ascent: f32,
+    /// Distance from `y` anchor to the bottom of the em-height below
+    /// the baseline.
+    pub em_height_descent: f32,
+    /// Distance from `y` anchor to the hanging baseline (used for
+    /// Devanagari / similar scripts).
+    pub hanging_baseline: f32,
+    /// Distance from `y` anchor to the alphabetic baseline — always
+    /// zero because that's where the `y` anchor sits by definition,
+    /// exposed for spec parity.
+    pub alphabetic_baseline: f32,
+    /// Distance from `y` anchor to the ideographic baseline (used for
+    /// CJK metrics).
+    pub ideographic_baseline: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1216,6 +1264,11 @@ pub enum Canvas2DCmd {
     },
     SetTextBaseline {
         baseline: TextBaseline,
+    },
+    /// `ctx.direction = "ltr" | "rtl" | "inherit"` — controls BiDi
+    /// reordering and how `textAlign=start`/`end` resolve.
+    SetTextDirection {
+        direction: TextDirection,
     },
 
     // ========== State methods ==========

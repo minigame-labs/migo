@@ -64,10 +64,18 @@ pub struct StoredImage {
 /// Shared image registry.  Lives on the render thread — not `Send` because
 /// `glow::Context` is `!Send` on most platforms and adjacent bookkeeping
 /// would cross that boundary.
+///
+/// `sk_image_cache` memoises the `backend_textures::make_gl` +
+/// `borrow_texture_from` pair.  Each produced `SkImage` is bound to a
+/// specific `DirectContext`, so the key is `(image_id,
+/// DirectContextId.id())`; a second canvas (different DirectContext)
+/// will lazily populate its own entry on first draw.  `SkImage` is
+/// an `RCHandle`, so cloning it on cache hit is a refcount bump.
 #[derive(Default)]
 pub struct ImageStore {
     entries: HashMap<u32, StoredImage>,
     next_id: AtomicU32,
+    sk_image_cache: HashMap<(u32, u32), SkImage>,
 }
 
 impl ImageStore {
@@ -75,6 +83,7 @@ impl ImageStore {
         Self {
             entries: HashMap::with_capacity(32),
             next_id: AtomicU32::new(1),
+            sk_image_cache: HashMap::with_capacity(32),
         }
     }
 
@@ -88,6 +97,19 @@ impl ImageStore {
     }
 
     pub fn remove(&mut self, image_id: u32) -> Option<StoredImage> {
+        // Evict every SkImage wrapper that pointed at this image id
+        // so a future insert with the same id doesn't accidentally
+        // resolve to a stale backend texture.  HashMap iteration
+        // requires a Vec detour because we're mutating in place.
+        let stale_keys: Vec<(u32, u32)> = self
+            .sk_image_cache
+            .keys()
+            .filter(|(id, _)| *id == image_id)
+            .copied()
+            .collect();
+        for k in stale_keys {
+            self.sk_image_cache.remove(&k);
+        }
         self.entries.remove(&image_id)
     }
 
@@ -99,9 +121,14 @@ impl ImageStore {
         self.entries.iter()
     }
 
-    /// Wrap an existing GL texture into an `SkImage` owned by `gr_ctx`.
+    /// Wrap an existing GL texture into an `SkImage` owned by `gr_ctx`,
+    /// bypassing the wrapper cache.  Kept for diagnostic use and tests;
+    /// production code should use [`Self::resolve_cached_or_wrap`] so
+    /// repeated `drawImage` of the same texture reuses the `SkImage`
+    /// handle and skips the `backend_textures::make_gl` +
+    /// `borrow_texture_from` pair.
     ///
-    /// The returned image borrows the texture — it does NOT own it, and
+    /// The returned image borrows the texture -- it does NOT own it, and
     /// the caller must keep the underlying GL texture alive for the
     /// lifetime of the image (release on `DestroyImage`).
     pub fn resolve_as_sk_image(
@@ -134,6 +161,44 @@ impl ImageStore {
             entry.info.alpha_type,
             None,
         )
+    }
+
+    /// Fetch the `SkImage` wrapper for `image_id` against `gr_ctx`,
+    /// building + caching it on first use.  Repeated calls at the
+    /// same `(image_id, gr_ctx)` pair hand back a refcounted clone
+    /// of the prior wrapper without touching the Ganesh backend
+    /// texture machinery -- the performance-critical case for games
+    /// that call `drawImage(sameSprite, ...)` hundreds of times per
+    /// frame.
+    ///
+    /// Returns `None` when the `image_id` isn't in the store or the
+    /// Ganesh wrap fails (OOM / driver issue).  Cache entries are
+    /// scoped by `DirectContext::id()` so two Canvas2DContexts can
+    /// independently cache their own wrappers without collisions.
+    pub fn resolve_cached_or_wrap(
+        &mut self,
+        ctx_tag: u32,
+        gr_ctx: &mut gpu::DirectContext,
+        image_id: u32,
+    ) -> Option<SkImage> {
+        let key = (image_id, ctx_tag);
+        if let Some(hit) = self.sk_image_cache.get(&key) {
+            crate::render_diagnostics::hit_sk_image_wrapper();
+            return Some(hit.clone());
+        }
+        crate::render_diagnostics::miss_sk_image_wrapper();
+        let entry = self.entries.get(&image_id)?.clone();
+        let wrapped = Self::resolve_as_sk_image(gr_ctx, &entry)?;
+        self.sk_image_cache.insert(key, wrapped.clone());
+        Some(wrapped)
+    }
+
+    /// Drop every SkImage wrapper whose DirectContext has been torn
+    /// down.  Called from `Canvas2DContext::Drop` / manager shutdown
+    /// so stale wrappers don't dangle past their backing GrContext.
+    #[allow(dead_code)]
+    pub fn purge_wrappers_for_context(&mut self, ctx_id: u32) {
+        self.sk_image_cache.retain(|(_, c), _| *c != ctx_id);
     }
 }
 
@@ -193,6 +258,72 @@ mod tests {
         assert!(s.remove(id).is_some());
         assert!(s.remove(id).is_none());
         assert!(s.get(id).is_none());
+    }
+
+    #[test]
+    fn remove_evicts_sk_image_cache_entries_for_that_id() {
+        // Regression: re-inserting the same image id with a fresh
+        // backing GL texture must NOT serve a stale SkImage wrapper
+        // from before the first remove().  Without the eviction in
+        // `ImageStore::remove`, a `drawImage` after the re-insert
+        // would render the old texture content.
+        let mut s = ImageStore::new();
+        let id = s.generate_id();
+        s.insert(
+            id,
+            StoredImage {
+                gl_texture: 1,
+                info: GpuImageInfo::rgba8_unpremul(4, 4),
+            },
+        );
+        // Populate the cache directly (can't call resolve_cached_or_wrap
+        // without a live DirectContext in pure-Rust tests).
+        // The key shape is what ::remove invalidates by.
+        s.sk_image_cache.insert(
+            (id, 0xAAAA_AAAA),
+            // Invalid placeholder SkImage - this test only checks
+            // the map eviction semantics, never touches the image.
+            // We drop the entry via `remove`; the placeholder is
+            // immediately forgotten.
+            {
+                // A trivial 1x1 raster SkImage works as a placeholder.
+                let info = skia_safe::ImageInfo::new(
+                    (1, 1),
+                    ColorType::RGBA8888,
+                    AlphaType::Premul,
+                    None,
+                );
+                let mut surf = skia_safe::surfaces::raster(&info, None, None).unwrap();
+                surf.image_snapshot()
+            },
+        );
+        assert_eq!(s.sk_image_cache.len(), 1);
+        let _ = s.remove(id);
+        assert_eq!(s.sk_image_cache.len(), 0, "remove must drop wrappers");
+    }
+
+    #[test]
+    fn purge_wrappers_for_context_is_scoped() {
+        // Build a two-context shape: ctx_tag A has two images, ctx B
+        // has one.  Purging A's wrappers leaves B's untouched.
+        let mut s = ImageStore::new();
+        let info = skia_safe::ImageInfo::new(
+            (1, 1),
+            ColorType::RGBA8888,
+            AlphaType::Premul,
+            None,
+        );
+        let mut mk_img = || {
+            skia_safe::surfaces::raster(&info, None, None)
+                .unwrap()
+                .image_snapshot()
+        };
+        s.sk_image_cache.insert((1, 100), mk_img());
+        s.sk_image_cache.insert((2, 100), mk_img());
+        s.sk_image_cache.insert((3, 200), mk_img());
+        s.purge_wrappers_for_context(100);
+        assert_eq!(s.sk_image_cache.len(), 1);
+        assert!(s.sk_image_cache.contains_key(&(3, 200)));
     }
 
     #[test]

@@ -748,6 +748,178 @@ pub async fn op_load_image(
         .map_err(js_err_from_engine)
 }
 
+/// `createImageBitmap(source, sx, sy, sw, sh[, {resizeWidth, resizeHeight}])`
+/// backend.  Decodes the source through the normal
+/// `read_image_rgba8` pipeline (which hits the LRU when available),
+/// crops the RGBA to the requested sub-rect (filling out-of-bounds
+/// regions with transparent black per the WHATWG spec), optionally
+/// resizes to the caller's `(rw, rh)`, then uploads as a fresh
+/// texture registered under a new shared id.
+#[op2(async(lazy), fast)]
+#[serde]
+#[allow(clippy::too_many_arguments)]
+pub async fn op_load_image_subrect(
+    state: Rc<RefCell<OpState>>,
+    #[smi] image_id: u32,
+    #[string] src: String,
+    sx: i32,
+    sy: i32,
+    #[smi] sw: u32,
+    #[smi] sh: u32,
+    #[smi] resize_w: u32,
+    #[smi] resize_h: u32,
+) -> Result<(u32, (usize, usize)), JsErrorBox> {
+    op_load_image_subrect_inner(state, image_id, src, sx, sy, sw, sh, resize_w, resize_h)
+        .await
+        .map_err(js_err_from_engine)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn op_load_image_subrect_inner(
+    state: Rc<RefCell<OpState>>,
+    image_id: u32,
+    src: String,
+    sx: i32,
+    sy: i32,
+    sw: u32,
+    sh: u32,
+    resize_w: u32,
+    resize_h: u32,
+) -> EngineResult<(u32, (usize, usize))> {
+    use shared::protocol::io_cmd::DecodedImage;
+
+    if sw == 0 || sh == 0 {
+        shared::bail!(ErrorCode::InvalidOperation, "createImageBitmap sub-rect has zero width/height");
+    }
+
+    // Pull decoder / VFS / mount table handles in one borrow.
+    let (scheduler, vfs, mount_table, game_cache_dir, gpu_caps, canvas_ctx) = {
+        let op = state.borrow();
+        let host = op.borrow::<HostOpState>();
+        let gcd = host
+            .game_paths
+            .as_ref()
+            .map(|gp| gp.cache_dir().to_string_lossy().into_owned());
+        (
+            op.borrow::<IoSchedulerState>().0.clone(),
+            host.vfs.clone(),
+            host.mount_table.clone(),
+            gcd,
+            host.gpu_caps.snapshot(),
+            op.borrow::<CanvasOpState>().clone(),
+        )
+    };
+
+    // Sub-rect uses only local file / mount-backed sources for now;
+    // data: / http(s) handling can be layered on later by mirroring
+    // `op_load_image_inner`'s short-circuit branches.
+    let resolved = resolve_local_src(vfs.as_deref(), mount_table.as_deref(), &src)?;
+    let real_src = resolved.path;
+    let mount_generation = resolved.source_version;
+    let image_source = resolved.source;
+
+    // Decode the full-resolution image (LRU-hit when warm).
+    let decoded = io::image_ops::read_image_rgba8(
+        scheduler,
+        real_src.clone(),
+        None,
+        None,
+        mount_generation,
+        image_source,
+        game_cache_dir,
+        gpu_caps,
+        mount_table,
+    )
+    .await?;
+
+    // Crop + resize.  `crop_image` handles out-of-bounds sx/sy/sw/sh
+    // per the WHATWG spec (transparent-black fill); `resize_image`
+    // is aspect-preserving and returns the input when no down-scale
+    // is needed.  Non-RGBA variants (KTX2 compressed etc.) fall
+    // back to an InvalidOperation — crop isn't well-defined for
+    // block-compressed textures without decompressing first, and
+    // we don't want to silently do the expensive path.
+    let rgba = match decoded.image {
+        DecodedImage::Rgba(r) => r,
+        DecodedImage::Compressed(_) => shared::bail!(
+            ErrorCode::InvalidOperation,
+            "createImageBitmap sub-rect does not support GPU-compressed sources yet"
+        ),
+    };
+    let cropped = io::crop_image(rgba, sx, sy, sw, sh);
+    let final_img = if resize_w > 0 && resize_h > 0
+        && (resize_w != cropped.width || resize_h != cropped.height)
+    {
+        io::resize_image(cropped, resize_w, resize_h)
+    } else {
+        cropped
+    };
+    let final_w = final_img.width as usize;
+    let final_h = final_img.height as usize;
+
+    // Allocate a fresh shared id and upload.  We reuse the standard
+    // alias-registration dance so `op_destroy_image(image_id)` on
+    // the JS-side bitmap refcount-decrements the texture correctly.
+    let shared_id = cache::alloc_shared_id();
+    {
+        let mut c = cache::IMAGE_CACHE.lock();
+        c.register_inflight_alias(image_id, shared_id);
+    }
+
+    let send_res = send_render_with_resp_async(&canvas_ctx, OP_LOAD_IMAGE, |resp| {
+        RenderCommand::Canvas(CanvasCmd::LoadImage {
+            image_id: shared_id,
+            image: DecodedImage::Rgba(final_img),
+            priority: shared::protocol::io_cmd::ImagePriority::Normal,
+            resp,
+        })
+    })
+    .await;
+
+    // Build a synthetic cache key so `finish_load` bookkeeping is
+    // consistent; we don't want other Image loads with the same
+    // `src` to collide with this bitmap's per-call sub-rect.  The
+    // key fingerprint includes sx/sy/sw/sh/resize.
+    let cache_key: cache::ImageCacheKey = (
+        format!(
+            "{}\0subrect={}x{}+{}+{}@{}x{}",
+            real_src, sw, sh, sx, sy, resize_w, resize_h
+        ),
+        mount_generation,
+    );
+
+    let maybe_destroy = {
+        let mut c = cache::IMAGE_CACHE.lock();
+        match &send_res {
+            Ok((w, h)) => c.finish_load(
+                image_id,
+                shared_id,
+                &cache_key,
+                &cache_key,
+                Ok((*w as usize, *h as usize)),
+            ),
+            Err(e) => c.finish_load(
+                image_id,
+                shared_id,
+                &cache_key,
+                &cache_key,
+                Err(engine_err_to_text(e)),
+            ),
+        }
+    };
+    if let Some(to_destroy) = maybe_destroy {
+        let _ = canvas_ctx
+            .tx
+            .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
+                image_id: to_destroy,
+            }));
+    }
+
+    let (rw, rh) = send_res?;
+    let _ = (final_w, final_h); // `rw/rh` from render thread is authoritative
+    Ok((shared_id, (rw as usize, rh as usize)))
+}
+
 #[op2(fast)]
 pub fn op_destroy_image(state: &mut OpState, #[smi] image_id: u32) -> bool {
     let to_destroy = {
@@ -880,6 +1052,7 @@ extension!(host_v8_image,
     ops = [
         op_create_image,
         op_load_image,
+        op_load_image_subrect,
         op_destroy_image,
         op_preload_images,
         op_clear_image_cache,

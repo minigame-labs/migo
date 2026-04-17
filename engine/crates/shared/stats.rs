@@ -104,6 +104,42 @@ pub struct DebugStats {
     pub upload_frame_rejections: AtomicU32,
     /// Cumulative dropped upload recoveries.
     pub dropped_upload_recoveries: AtomicU32,
+
+    // ---- P11 render diagnostics (not in fixed snapshot) ----
+    // These counters are NOT serialised into `RenderMetricsSnapshot`
+    // to keep the existing Java ByteBuffer layout stable.  They're
+    // exposed through a separate debug API (see
+    // `engine/crates/graphics/render_diagnostics.rs`).  Bumping the
+    // snapshot version to add them can happen in a later commit
+    // once the Android consumer is updated in lock-step.
+
+    /// Cumulative WebGL / Canvas2D draw calls dispatched.
+    /// Canvas2D draws are counted once per paint op; WebGL draws are
+    /// counted at each `glDrawArrays{Instanced}` /
+    /// `glDrawElements{Instanced}` dispatch.
+    pub draw_calls: AtomicU32,
+    /// Cumulative GL state change calls issued (post-dedup).  A
+    /// high ratio of `state_changes / draw_calls` indicates the
+    /// game is thrashing state between draws; a very low one means
+    /// the dedup is catching most redundancy.
+    pub state_changes: AtomicU32,
+    /// Cumulative bytes uploaded via PBO / direct `glTexSubImage2D`
+    /// calls this frame.  Resets to 0 at each `Present`.
+    pub texture_upload_bytes: AtomicU32,
+    /// Cumulative measureText cache hits.  Paired with
+    /// `measure_text_misses` gives the hit rate.
+    pub measure_text_hits: AtomicU32,
+    pub measure_text_misses: AtomicU32,
+    /// Cumulative Skia shape-cache hits (SkTextBlob path cache).
+    pub shape_cache_hits: AtomicU32,
+    pub shape_cache_misses: AtomicU32,
+    /// Cumulative Skia SkImage wrapper cache hits.
+    pub sk_image_wrapper_hits: AtomicU32,
+    pub sk_image_wrapper_misses: AtomicU32,
+    /// Cumulative `GrDirectContext::reset()` calls (lazy reset
+    /// path).  A fast-rising counter indicates frequent WebGL↔
+    /// Canvas2D boundary crossings.
+    pub skia_context_resets: AtomicU32,
 }
 
 impl DebugStats {

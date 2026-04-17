@@ -350,7 +350,10 @@ impl RendererGL {
 
             GLCmd::EnableVertexAttribArray { canvas_id, index } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.enable_vertex_attrib_array(index) };
+                let state = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_enable_vertex_attrib(state, index) {
+                    unsafe { gl.enable_vertex_attrib_array(index) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -364,12 +367,19 @@ impl RendererGL {
                 offset,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                trace!(
-                    "VertexAttribPointer: canvas={:?}, index={}, size={}, type={}, norm={}, stride={}, offset={}",
-                    canvas_id, index, size, type_, normalized, stride, offset
-                );
-                unsafe {
-                    gl.vertex_attrib_pointer_f32(index, size, type_, normalized, stride, offset);
+                let state = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_vertex_attrib_pointer(
+                    state, index, size, type_, normalized, stride, offset,
+                ) {
+                    trace!(
+                        "VertexAttribPointer: canvas={:?}, index={}, size={}, type={}, norm={}, stride={}, offset={}",
+                        canvas_id, index, size, type_, normalized, stride, offset
+                    );
+                    unsafe {
+                        gl.vertex_attrib_pointer_f32(
+                            index, size, type_, normalized, stride, offset,
+                        );
+                    }
                 }
                 Ok(DamageEffect::NoDamage)
             }
@@ -455,6 +465,7 @@ impl RendererGL {
                 cm.make_current_needed(canvas_id)?;
                 self.maybe_log_draw_state(gl, canvas_id, mode, count);
                 unsafe { gl.draw_arrays(mode, first, count) };
+                crate::render_diagnostics::bump_draw_call();
                 Ok(Self::damage_for_draw(cm, canvas_id))
             }
 
@@ -468,6 +479,7 @@ impl RendererGL {
                 cm.make_current_needed(canvas_id)?;
                 self.maybe_log_draw_state(gl, canvas_id, mode, count);
                 unsafe { gl.draw_elements(mode, count, index_type, offset) };
+                crate::render_diagnostics::bump_draw_call();
                 Ok(Self::damage_for_draw(cm, canvas_id))
             }
 
@@ -1387,7 +1399,10 @@ impl RendererGL {
 
             GLCmd::DisableVertexAttribArray { canvas_id, index } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.disable_vertex_attrib_array(index) };
+                let state = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_disable_vertex_attrib(state, index) {
+                    unsafe { gl.disable_vertex_attrib_array(index) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1582,8 +1597,10 @@ impl RendererGL {
                 a,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.color_mask(r, g, b, a) };
-                cm.gl_state.entry(canvas_id).or_default().color_mask = (r, g, b, a);
+                let state = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_color_mask(state, r, g, b, a) {
+                    unsafe { gl.color_mask(r, g, b, a) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1949,7 +1966,22 @@ impl RendererGL {
                     // "Default framebuffer" — redirect to DrawingBuffer if present.
                     cm.get_drawing_buffer_fbo(canvas_id)
                 };
-                unsafe { gl.bind_framebuffer(target, native) };
+                // Dedup: skip the driver call if the same FBO is
+                // already bound on this target.  Cocos Creator 2.x
+                // issues `bindFramebuffer(FRAMEBUFFER, 0)` + the
+                // real FBO bind every frame which is classic
+                // "already-there" redundancy.
+                let state = cm.gl_state.entry(canvas_id).or_default();
+                // Shadow value: native `None` = default FBO (0 or
+                // DrawingBuffer), native `Some(h)` = custom FBO.
+                // We key the shadow on the user-facing framebuffer
+                // id (framebuffer.map(Into::into)) rather than the
+                // native handle so shadow survives FBO handle
+                // recycling and multi-target semantics.
+                let shadow_val = framebuffer.map(|id| u32::from(id));
+                if st::update_bind_framebuffer(state, target, shadow_val) {
+                    unsafe { gl.bind_framebuffer(target, native) };
+                }
                 // Track whether the draw target is the default framebuffer.
                 // FRAMEBUFFER and DRAW_FRAMEBUFFER both affect the draw binding.
                 if target == glow::FRAMEBUFFER || target == glow::DRAW_FRAMEBUFFER {
@@ -2102,7 +2134,11 @@ impl RendererGL {
                 } else {
                     None
                 };
-                unsafe { gl.bind_renderbuffer(target, native) };
+                let state = cm.gl_state.entry(canvas_id).or_default();
+                let shadow_val = renderbuffer.map(|id| u32::from(id));
+                if st::update_bind_renderbuffer(state, shadow_val) {
+                    unsafe { gl.bind_renderbuffer(target, native) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -2236,7 +2272,10 @@ impl RendererGL {
                 divisor,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.vertex_attrib_divisor(index, divisor) };
+                let state = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_vertex_attrib_divisor(state, index, divisor) {
+                    unsafe { gl.vertex_attrib_divisor(index, divisor) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
             GLCmd::DrawArraysInstanced {
@@ -2248,6 +2287,7 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.draw_arrays_instanced(mode, first, count, instance_count) };
+                crate::render_diagnostics::bump_draw_call();
                 Ok(Self::damage_for_draw(cm, canvas_id))
             }
             GLCmd::DrawElementsInstanced {
@@ -2262,6 +2302,7 @@ impl RendererGL {
                 unsafe {
                     gl.draw_elements_instanced(mode, count, index_type, offset, instance_count)
                 };
+                crate::render_diagnostics::bump_draw_call();
                 Ok(Self::damage_for_draw(cm, canvas_id))
             }
 

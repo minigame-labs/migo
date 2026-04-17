@@ -371,9 +371,8 @@ impl Canvas2DRenderer {
                 };
                 false
             }
-            SetFont { font: _ } => {
-                // Full CSS-font parsing lives in Phase 5 (text stack).  For
-                // now we keep the default `TextAttrs` so calls don't crash.
+            SetFont { font } => {
+                apply_parsed_font(&mut self.state, font);
                 false
             }
             SetTextAlign { align } => {
@@ -382,6 +381,10 @@ impl Canvas2DRenderer {
             }
             SetTextBaseline { baseline } => {
                 self.state.text.baseline = *baseline;
+                false
+            }
+            SetTextDirection { direction } => {
+                self.state.text.direction = *direction;
                 false
             }
 
@@ -404,23 +407,43 @@ impl Canvas2DRenderer {
 
             // ---- CTM mutators -------------------------------------
             SetTransform { a, b, c, d, e, f } => {
+                // A 2x3 matrix is "axis-aligned + translation" when
+                // the shear terms `b` and `c` are both zero.  Rotate
+                // / skew / non-uniform scale set at least one; pure
+                // translate or uniform scale keep both at zero.
+                let axis_aligned = b.abs() < 1e-6 && c.abs() < 1e-6;
+                self.state.ctm_non_axis_aligned |= !axis_aligned;
                 let m = Matrix::new_all(*a, *c, *e, *b, *d, *f, 0.0, 0.0, 1.0);
                 canvas.set_matrix(&skia_safe::M44::from(m));
                 false
             }
             ResetTransform => {
+                // Reset clears the flag — we're back to identity.
+                self.state.ctm_non_axis_aligned = false;
                 canvas.reset_matrix();
                 false
             }
             Translate { x, y } => {
+                // Translation never makes the CTM non-axis-aligned.
                 canvas.translate((*x, *y));
                 false
             }
             Rotate { angle } => {
+                // Any non-zero rotation is non-axis-aligned for
+                // damage purposes.  We don't special-case k*90deg
+                // rotations because the transform composes with
+                // previous mutations opaquely.
+                if angle.abs() > 1e-6 {
+                    self.state.ctm_non_axis_aligned = true;
+                }
                 canvas.rotate(angle.to_degrees(), None);
                 false
             }
             Scale { x, y } => {
+                // Pure uniform axis-aligned scale (positive, any
+                // magnitude) keeps axis alignment.  Reflection (x<0
+                // or y<0) flips axis but stays aligned.
+                let _ = (x, y);
                 canvas.scale((*x, *y));
                 false
             }
@@ -510,4 +533,56 @@ fn _force_use_imports() {
     let _ = TextAlign::Start;
     let _ = TextBaseline::Alphabetic;
     let _ = GradientType::Linear;
+}
+
+/// Apply a CSS `font` shorthand to a Canvas2D state.
+///
+/// Extracted so both the dispatch path and unit tests exercise the
+/// identical code: the test seam ensures `SetFont` can never regress
+/// to the previous "silently ignored" behaviour.  An unparseable
+/// shorthand leaves `state.text` untouched, matching Blink's "invalid
+/// font assignment is a no-op" policy.
+pub(crate) fn apply_parsed_font(state: &mut Canvas2DState, font: &str) {
+    if let Some(parsed) = super::font_parse::parse_font_shorthand(font) {
+        state.text.size = parsed.size_px;
+        state.text.weight = parsed.weight;
+        state.text.italic = parsed.italic;
+        state.text.families = std::sync::Arc::new(parsed.families);
+    }
+}
+
+#[cfg(test)]
+mod set_font_tests {
+    use super::*;
+
+    #[test]
+    fn apply_parsed_font_updates_size_and_family() {
+        let mut state = Canvas2DState::default();
+        apply_parsed_font(&mut state, "italic bold 24px 'Noto Sans CJK SC', sans-serif");
+        assert_eq!(state.text.size, 24.0);
+        assert_eq!(state.text.weight, 700);
+        assert!(state.text.italic);
+        assert_eq!(
+            &*state.text.families,
+            &vec!["Noto Sans CJK SC".to_string(), "sans-serif".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_parsed_font_preserves_state_on_invalid_input() {
+        let mut state = Canvas2DState::default();
+        let before = state.text.clone();
+        // No size token → invalid per CSS; must be silent no-op.
+        apply_parsed_font(&mut state, "bold serif");
+        assert_eq!(state.text, before);
+    }
+
+    #[test]
+    fn apply_parsed_font_handles_pt_units() {
+        let mut state = Canvas2DState::default();
+        apply_parsed_font(&mut state, "12pt Helvetica");
+        // 12pt == 16px at 96dpi
+        assert!((state.text.size - 16.0).abs() < 1e-3);
+        assert_eq!(&*state.text.families, &vec!["Helvetica".to_string()]);
+    }
 }

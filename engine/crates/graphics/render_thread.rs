@@ -102,18 +102,17 @@ fn execute_canvas_batch(
     let mut batch_dirty = false;
     let is_onscreen = canvas_id == shared::protocol::render_cmd::CanvasId::from(1u32);
 
-    // Lazy Skia context reset: if a WebGL batch has mutated GL state
-    // since Skia's last `GrDirectContext::reset()`, we need to tell
-    // Skia its cached state is stale before drawing anything.  We do
-    // this once at batch entry rather than eagerly at every
-    // `Materialize` — pure-Canvas2D frames now pay zero reset cost.
-    if cm.skia_needs_reset {
-        if cm.make_current_needed(canvas_id).is_ok() {
-            if let Ok(ctx) = cm.get_2d_context_mut(canvas_id) {
-                ctx.reset_gl_state();
-            }
+    // Lazy per-context Skia reset.  `skia_state_stale` is flipped
+    // by `execute_gl_batch` whenever WebGL mutates GL state; on the
+    // *next* Canvas2D batch for this canvas we issue exactly one
+    // `GrDirectContext::reset()` and clear the flag.  Pure-Canvas2D
+    // frames pay zero resets; cross-canvas WebGL→Canvas2D boundaries
+    // only invalidate the affected context instead of the old
+    // manager-global flag's broadcast invalidation.
+    if cm.make_current_needed(canvas_id).is_ok() {
+        if let Ok(ctx) = cm.get_2d_context_mut(canvas_id) {
+            ctx.reset_gl_state_if_stale();
         }
-        cm.skia_needs_reset = false;
     }
 
     // Layer 2 scissor trust gate: if Canvas2D state has non-identity
@@ -225,12 +224,15 @@ fn execute_gl_batch(
         warn!("GLBatch: {error_count}/{cmd_count} commands failed");
     }
 
-    // WebGL commands touched GL state; Skia's cached tracking is now
-    // stale.  The NEXT Canvas2D batch (if any) will lazily call
-    // `reset_gl_state()` on its 2D context before drawing.  Pure
-    // WebGL frames never pay this cost.
+    // WebGL commands touched raw GL state; every Canvas2DContext's
+    // Skia-side cache is now potentially stale.  Mark each one so
+    // the NEXT Canvas2D batch for that canvas lazily issues exactly
+    // one `GrDirectContext::reset()`.  Per-context rather than
+    // manager-global: each context owns its own GrDirectContext, so
+    // one WebGL canvas mutating state shouldn't clear the flag for
+    // another canvas that still has a stale cache.
     if !commands_was_empty(cmd_count) {
-        cm.skia_needs_reset = true;
+        cm.mark_all_2d_contexts_stale();
     }
 
     batch_hit_onscreen
@@ -301,17 +303,26 @@ fn execute_frame_packet(
         match op {
             FrameOp::BeginFrame | FrameOp::Present => {}
             FrameOp::Materialize { canvas_id } => {
-                // Flush Skia so subsequent GL ops see Canvas2D results.
-                // NB: we intentionally do *not* call `reset_gl_state()`
-                // here — it's wasted work if no WebGL batch follows.
-                // Instead, `execute_gl_batch` marks the context dirty
-                // and the *next* `execute_canvas_batch` resets lazily.
+                // Canvas2D → WebGL boundary.  We MUST:
+                //   1. Flush Skia so subsequent GL ops see the pixels.
+                //   2. Snapshot/restore the 5 raw-GL bindings Skia
+                //      relies on (active-tex, PBO, alignment) via a
+                //      `Canvas2DGlScopeGuard`; on drop it also
+                //      invalidates the per-canvas dedup shadow so
+                //      any value Skia changed under our feet won't
+                //      be served from cache next WebGL draw.
+                //   3. *Not* eagerly call `reset_gl_state()` — the
+                //      per-context `skia_state_stale` flag picks
+                //      that up lazily the next time Skia draws.
                 if cm.make_current_needed(canvas_id).is_ok() {
+                    let _gl_scope = cm.begin_canvas2d_gl_scope_for(canvas_id);
                     if let Ok(ctx) = cm.get_2d_context_mut(canvas_id) {
                         ctx.flush_and_submit();
                     }
                     renderer_2d.clear_dirty_layer(canvas_id);
                     cm.clear_2d_dirty(canvas_id);
+                    // `_gl_scope` drops here → raw-GL state restored,
+                    // dedup shadow invalidated.
                 }
             }
             FrameOp::CanvasBatch(payload) => {
@@ -1023,7 +1034,7 @@ impl RenderThread {
 
                         RenderCommand::GetTextLineHeight { font_family, font_size, bold, italic, resp } => {
                             use crate::backend::gl::state::TextAttrs;
-                            use shared::protocol::render_cmd::{TextAlign, TextBaseline};
+                            use shared::protocol::render_cmd::{TextAlign, TextBaseline, TextDirection};
                             let attrs = TextAttrs {
                                 size: font_size,
                                 families: std::sync::Arc::new(vec![font_family, "sans-serif".into()]),
@@ -1031,6 +1042,7 @@ impl RenderThread {
                                 italic,
                                 align: TextAlign::Start,
                                 baseline: TextBaseline::Alphabetic,
+                                direction: TextDirection::Inherit,
                             };
                             // Empty-string layout still reports line metrics.
                             let m = renderer_2d.text.measure_text(" ", &attrs);

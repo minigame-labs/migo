@@ -86,6 +86,11 @@ pub(crate) struct Canvas2DGlState {
 pub(crate) struct Canvas2DGlScopeGuard {
     gl: *const glow::Context,
     state: Option<Canvas2DGlState>,
+    /// Optional shadow-state pointer.  When present, the guard
+    /// invalidates the dedup shadow on drop so the next WebGL call
+    /// re-issues rather than trusting stale values that Skia has
+    /// since mutated outside our handlers.
+    gl_shadow: *mut super::types::CanvasGLState,
 }
 
 impl Drop for Canvas2DGlScopeGuard {
@@ -99,13 +104,49 @@ impl Drop for Canvas2DGlScopeGuard {
                 gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, state.unpack_alignment);
                 gl.pixel_store_i32(glow::PACK_ALIGNMENT, state.pack_alignment);
             }
+            // After Skia has drawn and we've restored the 5 saved
+            // raw-GL bindings, the WebGL dedup shadow still holds
+            // whatever it thought before Skia ran.  Skia may have
+            // bound different programs, VAOs, FBOs, scissor,
+            // stencil, blend equations, textures on other units,
+            // etc., none of which went through our handler, so
+            // the shadow is stale for every slot except the 5 we
+            // explicitly restored.  Wipe everything defensively;
+            // the next WebGL draw pays one rebind per state it
+            // actually uses, which is cheap compared to a silent
+            // wrong-buffer paint.
+            if !self.gl_shadow.is_null() {
+                let shadow = unsafe { &mut *self.gl_shadow };
+                shadow.invalidate_after_external_gl_use();
+                // `active_texture`, `unpack_alignment`,
+                // `pack_alignment`, `unpack_pbo`, `pack_pbo` are
+                // back to the snapshot values — reflect that in
+                // the shadow so the *next* setter for these five
+                // doesn't trigger a redundant raw GL call.
+                shadow.active_texture_unit = Some(state.active_texture as u32);
+                shadow.unpack_alignment = Some(state.unpack_alignment);
+                shadow.pack_alignment = Some(state.pack_alignment);
+                // The PIXEL_(UN)PACK_BUFFER binding does NOT live
+                // in CanvasGLState at all — WebGL 2 code that
+                // manipulates it goes through the raw handler
+                // directly.  We only re-synthesise the state that
+                // the shadow actually tracks.
+            }
         }
     }
 }
 
 /// Save + reset GL state for a Skia text-atlas / image-upload sequence.
 /// Returns a guard that restores the WebGL-visible state on drop.
-pub(super) fn begin_canvas2d_gl_scope(gl: &glow::Context) -> Canvas2DGlScopeGuard {
+///
+/// `gl_shadow` is optional: when `Some`, the guard invalidates and
+/// re-syncs the dedup shadow on drop so the next WebGL call can't
+/// be fooled by Skia's under-the-hood state mutations.  Pass `None`
+/// only from test helpers that don't own a shadow.
+pub(super) fn begin_canvas2d_gl_scope(
+    gl: &glow::Context,
+    gl_shadow: Option<&mut super::types::CanvasGLState>,
+) -> Canvas2DGlScopeGuard {
     unsafe {
         let active_texture = gl.get_parameter_i32(glow::ACTIVE_TEXTURE);
         let unpack_pbo = gl.get_parameter_buffer(glow::PIXEL_UNPACK_BUFFER_BINDING);
@@ -128,6 +169,9 @@ pub(super) fn begin_canvas2d_gl_scope(gl: &glow::Context) -> Canvas2DGlScopeGuar
                 unpack_alignment,
                 pack_alignment,
             }),
+            gl_shadow: gl_shadow
+                .map(|s| s as *mut _)
+                .unwrap_or(std::ptr::null_mut()),
         }
     }
 }
@@ -148,7 +192,22 @@ pub(super) fn flush_dirty_2d_contexts(cm: &mut CanvasManager) -> EngineResult<Ve
             continue;
         }
         cm.make_current_needed(id)?;
-        let _gl_scope = begin_canvas2d_gl_scope(&cm.gl);
+        // Borrow gymnastics: `begin_canvas2d_gl_scope` needs both the
+        // GL context (borrowed &cm.gl) and mutable access to the
+        // per-canvas dedup shadow.  Take them through a single
+        // `split_gl_and_shadow_for` helper that re-borrows disjoint
+        // fields of `cm` so the borrow checker accepts the call.
+        let (gl_ref, shadow_ref) = {
+            let cm_mut: &mut CanvasManager = cm;
+            (
+                &cm_mut.gl as *const _,
+                cm_mut.gl_state.entry(id).or_default() as *mut _,
+            )
+        };
+        // SAFETY: both pointers come from distinct fields of `cm`
+        // that are not mutated for the duration of this block.  The
+        // guard drops before `cm` is touched again.
+        let _gl_scope = unsafe { begin_canvas2d_gl_scope(&*gl_ref, Some(&mut *shadow_ref)) };
         if let Some(ctx) = cm.contexts_2d.get_mut(&id) {
             ctx.flush_and_submit();
             // Drop Skia's internal GL-state tracking so subsequent WebGL

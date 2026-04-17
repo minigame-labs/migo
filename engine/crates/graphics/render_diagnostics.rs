@@ -1,0 +1,203 @@
+//! Render-thread diagnostic counter sink.
+//!
+//! A thin wrapper over [`shared::stats::DebugStats`] that lets hot
+//! paths bump counters without threading the stats handle through
+//! every call site.  Idiomatic use:
+//!
+//! ```ignore
+//! // Once, at render thread start:
+//! render_diagnostics::install(stats_arc);
+//!
+//! // Anywhere on the render thread:
+//! render_diagnostics::bump_draw_call();
+//! render_diagnostics::add_upload_bytes(bytes as u32);
+//! ```
+//!
+//! All bump helpers are `#[inline]` and compile to a single atomic
+//! `fetch_add`; they're safe to call from any thread but the
+//! intended caller is the render thread.
+//!
+//! When no sink has been installed (typically in unit tests that
+//! don't spin up the full stats pipeline), every bump is a no-op —
+//! hot code doesn't need a guard.
+
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
+
+use shared::stats::DebugStats;
+
+/// Global sink pointer.  Set once at render-thread startup; never
+/// cleared except in unit tests via [`uninstall_for_tests`].  Using
+/// a raw pointer in an `AtomicPtr` (rather than `OnceLock<Arc<_>>`)
+/// keeps the read path branchless: a single atomic load + null check.
+static SINK: AtomicPtr<DebugStats> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Install `stats` as the diagnostic sink.  Subsequent bump helpers
+/// will drive that instance.  Calling `install` twice replaces the
+/// prior sink and leaks the previous `Arc` — acceptable because the
+/// sink is installed exactly once per host lifecycle.
+pub fn install(stats: Arc<DebugStats>) {
+    // Leak the Arc; the pointer lives for the rest of the process.
+    // The alternative — juggling Arc via `Arc::into_raw` and
+    // `Arc::from_raw` on every read — would force every bump to
+    // temporarily reconstitute an Arc and increment its refcount.
+    let raw = Arc::into_raw(stats) as *mut DebugStats;
+    let prev = SINK.swap(raw, Ordering::Release);
+    // Don't leak the previous `Arc` on reinstall; reclaim it.
+    if !prev.is_null() {
+        // SAFETY: prev was produced by an earlier `Arc::into_raw`
+        // call; we hold the only strong reference to it once the
+        // SINK slot has been swapped.
+        unsafe { drop(Arc::from_raw(prev)) };
+    }
+}
+
+/// Test-only helper: drop the sink so successive tests start with
+/// a clean slate.
+#[cfg(test)]
+pub fn uninstall_for_tests() {
+    let prev = SINK.swap(std::ptr::null_mut(), Ordering::Release);
+    if !prev.is_null() {
+        unsafe { drop(Arc::from_raw(prev)) };
+    }
+}
+
+#[inline]
+fn with_sink(f: impl FnOnce(&DebugStats)) {
+    let p = SINK.load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: any non-null value in SINK was produced by
+        // `Arc::into_raw` and is kept alive by the leaked refcount.
+        let stats = unsafe { &*p };
+        f(stats);
+    }
+}
+
+// ---- Canvas2D / WebGL draw counters ---------------------------------
+
+#[inline]
+pub fn bump_draw_call() {
+    with_sink(|s| {
+        s.draw_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn bump_state_change() {
+    with_sink(|s| {
+        s.state_changes.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn add_upload_bytes(bytes: u32) {
+    with_sink(|s| {
+        s.texture_upload_bytes.fetch_add(bytes, Ordering::Relaxed);
+    });
+}
+
+// ---- Cache hit / miss bumps -----------------------------------------
+
+#[inline]
+pub fn hit_measure_cache() {
+    with_sink(|s| {
+        s.measure_text_hits.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn miss_measure_cache() {
+    with_sink(|s| {
+        s.measure_text_misses.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn hit_shape_cache() {
+    with_sink(|s| {
+        s.shape_cache_hits.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn miss_shape_cache() {
+    with_sink(|s| {
+        s.shape_cache_misses.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn hit_sk_image_wrapper() {
+    with_sink(|s| {
+        s.sk_image_wrapper_hits.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn miss_sk_image_wrapper() {
+    with_sink(|s| {
+        s.sk_image_wrapper_misses.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn bump_skia_context_reset() {
+    with_sink(|s| {
+        s.skia_context_resets.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    /// Global guard serialising tests that mutate the process-wide
+    /// `SINK`.  Cargo runs tests in parallel by default and every
+    /// test in this module installs or uninstalls the singleton, so
+    /// without serialisation one test's `uninstall` would race
+    /// another's `bump_*`.
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn bumps_are_noop_without_sink() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        uninstall_for_tests();
+        bump_draw_call();
+        add_upload_bytes(1024);
+        hit_measure_cache();
+    }
+
+    #[test]
+    fn bumps_route_to_installed_sink() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        uninstall_for_tests();
+        let stats = Arc::new(DebugStats::default());
+        install(stats.clone());
+        bump_draw_call();
+        bump_draw_call();
+        add_upload_bytes(42);
+        hit_measure_cache();
+        miss_measure_cache();
+        assert_eq!(stats.draw_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.texture_upload_bytes.load(Ordering::Relaxed), 42);
+        assert_eq!(stats.measure_text_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.measure_text_misses.load(Ordering::Relaxed), 1);
+        uninstall_for_tests();
+    }
+
+    #[test]
+    fn reinstall_reclaims_previous_sink() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        uninstall_for_tests();
+        let a = Arc::new(DebugStats::default());
+        install(a.clone());
+        let b = Arc::new(DebugStats::default());
+        install(b.clone());
+        bump_draw_call();
+        assert_eq!(a.draw_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(b.draw_calls.load(Ordering::Relaxed), 1);
+        uninstall_for_tests();
+    }
+}

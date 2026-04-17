@@ -122,6 +122,12 @@ impl ImageRegistry {
         &self.store
     }
 
+    /// Mutable variant of [`Self::store`] for call sites that need to
+    /// populate/update the SkImage wrapper cache (per-DirectContext).
+    pub fn store_mut(&mut self) -> &mut ImageStore {
+        &mut self.store
+    }
+
     /// Initialize the PBO pool (public entry for CanvasManager).
     pub fn ensure_pbo_pool_public(&mut self, gl: &glow::Context) {
         self.ensure_pbo_pool(gl);

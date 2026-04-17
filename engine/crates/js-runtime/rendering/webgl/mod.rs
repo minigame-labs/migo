@@ -7,6 +7,8 @@ mod raf;
 mod webgl;
 
 use context2d::*;
+pub mod error_state;
+use error_state::{op_webgl_get_context_attributes, op_webgl_get_error};
 use font::*;
 use raf::*;
 use webgl::*;
@@ -22,6 +24,8 @@ extension!(host_v8_webgl,
         op_set_preferred_fps,
 
         op_alloc_gl_resource_id,
+        op_webgl_get_error,
+        op_webgl_get_context_attributes,
         op_create_program,
         op_use_program,
         op_link_program,
@@ -197,6 +201,7 @@ extension!(host_v8_webgl,
         op_set_font,
         op_set_text_align,
         op_set_text_baseline,
+        op_set_text_direction,
 
         // State methods
         op_save,
@@ -254,6 +259,7 @@ extension!(host_v8_webgl,
     state = |state| {
         state.put(GlResourceIdAllocator::new());
         state.put(frame_collector::UnifiedFrameCollector::new());
+        state.put(error_state::WebGLErrorState::default());
     }
 );
 

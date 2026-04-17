@@ -1,6 +1,6 @@
 extern crate khronos_egl as egl;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use glow::{
     NativeBuffer, NativeFence, NativeFramebuffer, NativeProgram, NativeRenderbuffer,
@@ -161,6 +161,45 @@ pub(crate) struct CanvasGLState {
     /// Per-program uniform value cache.  Keys are `glGetUniformLocation`
     /// values (u32, stored as the location-index returned to JS).
     pub uniform_cache: HashMap<(ProgramId, u32), Box<[u8]>>,
+
+    // ---- P11-state-tracker expansion ----------------------------------
+    /// Currently bound FBO id for each GL binding target.  Keys are
+    /// `glow::FRAMEBUFFER`, `glow::DRAW_FRAMEBUFFER`,
+    /// `glow::READ_FRAMEBUFFER`.  Value `None` means "default FBO
+    /// (0)"; value `Some(None)` means "no shadow yet, must re-issue".
+    pub bound_framebuffer: HashMap<u32, Option<u32>>,
+    /// Last-bound renderbuffer id (glBindRenderbuffer only has one
+    /// target, RENDERBUFFER).
+    pub bound_renderbuffer: Option<Option<u32>>,
+    /// Which vertex-attribute array indices are enabled.  Keyed by
+    /// attribute index (0..=MAX_VERTEX_ATTRIBS-1); presence = enabled.
+    pub enabled_vertex_attribs: HashSet<u32>,
+    /// Shadow for `glVertexAttribPointer`: keyed by (index), value is
+    /// a fingerprint of (size, type, normalized, stride, offset) so a
+    /// repeat call with identical layout skips the driver round-trip.
+    /// Used by Cocos Creator 2.x's WebGL 1 path without
+    /// OES_vertex_array_object — the hottest driver call in that
+    /// pipeline when games draw thousands of sprites per frame.
+    pub vertex_attrib_pointer_fp: HashMap<u32, VertexAttribPointerFp>,
+    /// `glVertexAttribDivisor(index, divisor)` shadow.  ANGLE / WebGL 2
+    /// games instancing sprites update this per attribute.
+    pub vertex_attrib_divisor: HashMap<u32, u32>,
+}
+
+/// Fingerprint of the arguments to `glVertexAttribPointer`.  Kept
+/// small and `Eq` so equality check inside `update_vertex_attrib_pointer`
+/// is just a 16-byte comparison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VertexAttribPointerFp {
+    pub size: i32,
+    pub type_: u32,
+    pub normalized: bool,
+    pub stride: i32,
+    pub offset: i32,
+    /// VAO this pointer belongs to (0 = default VAO).  Necessary
+    /// because VAOs capture vertex attrib state — a repeat call
+    /// after `bindVertexArray` change must NOT be deduped.
+    pub vao: u32,
 }
 
 impl Default for CanvasGLState {
@@ -194,7 +233,91 @@ impl Default for CanvasGLState {
             pack_alignment: None,
             bound_vao: None,
             uniform_cache: HashMap::new(),
+            bound_framebuffer: HashMap::new(),
+            bound_renderbuffer: None,
+            enabled_vertex_attribs: HashSet::new(),
+            vertex_attrib_pointer_fp: HashMap::new(),
+            vertex_attrib_divisor: HashMap::new(),
         }
+    }
+}
+
+impl CanvasGLState {
+    /// Forget every piece of shadow state that external code (Skia's
+    /// text-atlas upload, DrawingBuffer blit, any non-WebGL GL caller)
+    /// might have mutated during its batch.  The next WebGL call MUST
+    /// re-issue rather than trust stale shadow.
+    ///
+    /// Rationale: Skia's draw pipeline binds programs / VAOs / FBOs /
+    /// blend state / scissor / stencil / viewport / textures without
+    /// going through our handlers — the same machinery backing the
+    /// dedup decisions in `state_tracker.rs`.  If we kept the shadow
+    /// as-is, the next Cocos-style WebGL frame might issue a
+    /// `bindBuffer(ARRAY_BUFFER, 42)` that matches the last-known
+    /// shadow (pre-Skia) and get silently skipped — painting with
+    /// whatever buffer Skia left bound.  Bugs from this class are
+    /// subtle and hard to reproduce, so the safer move is to wipe the
+    /// shadow and pay one extra rebind per affected state next frame.
+    ///
+    /// We intentionally preserve `draws_to_default_fbo` because the
+    /// render-thread caller restores the default FBO binding itself
+    /// around Skia batches — leaving the flag intact is consistent
+    /// with that external invariant.  If that assumption ever breaks,
+    /// set the flag here too.
+    /// Invalidate the dedup shadow back to "unknown".  See
+    /// [`Self::invalidate_after_external_gl_use`] for rationale.
+    ///
+    /// This base impl only clears the P11-expansion fields; the main
+    /// `invalidate_after_external_gl_use` (below) invokes it after
+    /// clearing the older fields.
+    fn invalidate_p11_shadow(&mut self) {
+        self.bound_framebuffer.clear();
+        self.bound_renderbuffer = None;
+        self.enabled_vertex_attribs.clear();
+        self.vertex_attrib_pointer_fp.clear();
+        self.vertex_attrib_divisor.clear();
+    }
+
+    pub fn invalidate_after_external_gl_use(&mut self) {
+        self.current_program = None;
+        self.viewport = None;
+        self.bound_texture_2d.clear();
+        self.bound_array_buffer = None;
+        self.bound_element_array_buffer = None;
+        self.active_texture_unit = None;
+        // Scissor: Skia typically leaves it disabled after its draw
+        // batch completes.  Reset to the conservative "don't know
+        // the rect" enabled state so the next `glScissor` call
+        // re-issues; damage tracking falls back to viewport, which
+        // over-reports but never under-reports.
+        self.scissor = ScissorState::EnabledUnknownRect;
+        self.last_scissor_rect = None;
+        // Colour-mask defaults to "all channels writable" on the GL
+        // initial state — but Skia may have changed it mid-batch.
+        // Returning to the conservative known-nothing sentinel forces
+        // the next `glColorMask` call to re-issue.
+        self.color_mask = (true, true, true, true);
+        self.enabled_caps.clear();
+        self.disabled_caps.clear();
+        self.blend_factors = None;
+        self.blend_equation = None;
+        self.blend_color = None;
+        self.depth_func = None;
+        self.depth_mask = None;
+        self.depth_range = None;
+        self.cull_face = None;
+        self.front_face = None;
+        self.line_width = None;
+        self.polygon_offset = None;
+        self.unpack_alignment = None;
+        self.pack_alignment = None;
+        self.bound_vao = None;
+        // `uniform_cache` survives because uniforms are scoped to a
+        // program, and the program itself is re-bound on the next GL
+        // draw.  Clearing it would only save memory, not correctness.
+        self.uniform_cache.clear();
+        // Clear the P11 dedup fields too.
+        self.invalidate_p11_shadow();
     }
 }
 

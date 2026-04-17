@@ -139,14 +139,62 @@ enum CurrentKind {
 pub(crate) struct UnifiedFrameCollector {
     segments: Vec<FrameSegment>,
     current: CurrentKind,
+    /// Rough byte count of all commands pushed since the last flush.
+    /// Incremented in `push_canvas2d` / `push_gl` and zeroed when
+    /// `build_frame_packet_inner` consumes the segments.  See
+    /// [`AUTO_FLUSH_SOFT_BUDGET_BYTES`] for the flush policy.
+    pending_bytes: usize,
 }
+
+/// Soft cap on the approximate byte-size of pending commands in the
+/// collector.  When a single-frame batch crosses this threshold, call
+/// sites should invoke [`UnifiedFrameCollector::flush_as_barrier`]
+/// to hand the accumulated work off to the render thread rather than
+/// keeping it stacked in JS-side memory.
+///
+/// Chromium's `CanvasResourceProvider::auto_flush` drives its backlog
+/// cutoff from per-recording pinned-image byte budgets, not command
+/// counts: a few MB of `bufferData` pinned by a single call can
+/// outweigh thousands of tiny `fillRect`s.  We mirror that model by
+/// tracking bytes rather than just segment count.
+///
+/// 4 MB is a conservative starting point — large enough to cover
+/// typical small-game frames (hundreds of draws, kilobytes of
+/// uniforms) without waking the render thread mid-frame for every
+/// workload, small enough that a runaway `bufferData(4_MB_mesh)` or a
+/// gigantic DrawImageBatch can't pin the JS heap unbounded while the
+/// render thread is blocked.
+pub(crate) const AUTO_FLUSH_SOFT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
 impl UnifiedFrameCollector {
     pub(crate) fn new() -> Self {
         Self {
             segments: Vec::new(),
             current: CurrentKind::None,
+            pending_bytes: 0,
         }
+    }
+
+    /// Rough upper bound on the bytes currently retained by pending
+    /// commands.  Counted per-push using `std::mem::size_of` plus a
+    /// conservative per-variant overhead: we overshoot slightly on
+    /// small scalar commands and undercount when a variant owns a
+    /// long-lived heap buffer (a future refinement could inspect the
+    /// `Vec` capacities), so the value is a *heuristic* for flush
+    /// decisions — never load-bearing for correctness.
+    #[inline]
+    pub(crate) fn approx_pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
+    /// `true` when the accumulated batch has grown past the soft
+    /// budget — call sites that reach a frame boundary should treat
+    /// this as a hint to flush a barrier instead of continuing to
+    /// accumulate.  Purely advisory: skipping the flush can't break
+    /// correctness, only degrade memory / latency.
+    #[inline]
+    pub(crate) fn should_auto_flush(&self) -> bool {
+        self.pending_bytes >= AUTO_FLUSH_SOFT_BUDGET_BYTES
     }
 
     pub(crate) fn push_canvas2d(&mut self, canvas_id: u32, cmd: Canvas2DCmd) {
@@ -160,6 +208,14 @@ impl UnifiedFrameCollector {
                 }));
             self.current = CurrentKind::Canvas2D(canvas_id);
         }
+        // Accumulate bytes before move: the enum size bounds the
+        // stack size we'll hand to the render thread.  Heap-owned
+        // payloads (long-form text, large image batches) are
+        // approximated by the enum's base size; a more expensive
+        // walk is avoided on the hot path.
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(std::mem::size_of::<Canvas2DCmd>());
         if let Some(FrameSegment::Canvas2D(seg)) = self.segments.last_mut() {
             seg.mark_dirty_for_cmd(&cmd);
             seg.commands.push(cmd);
@@ -173,6 +229,9 @@ impl UnifiedFrameCollector {
             }));
             self.current = CurrentKind::GL;
         }
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(std::mem::size_of::<GLCmd>());
         if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
             seg.commands.push(cmd);
         }
@@ -194,6 +253,7 @@ impl UnifiedFrameCollector {
 
         let segments = std::mem::take(&mut self.segments);
         self.current = CurrentKind::None;
+        self.pending_bytes = 0;
 
         let mut builder =
             shared::FramePacketBuilder::new(0, 0.0).push(FrameOp::BeginFrame);
@@ -590,6 +650,39 @@ mod tests {
         c.push_canvas2d(1, Canvas2DCmd::Save);
         let _ = c.build_frame_packet(true);
         assert!(c.build_frame_packet(true).is_none());
+    }
+
+    #[test]
+    fn approx_bytes_grows_monotonically_until_flush() {
+        let mut c = UnifiedFrameCollector::new();
+        assert_eq!(c.approx_pending_bytes(), 0);
+        c.push_canvas2d(1, Canvas2DCmd::Save);
+        let after_one = c.approx_pending_bytes();
+        assert!(after_one > 0, "after one push should be non-zero");
+        c.push_gl(GLCmd::Clear { canvas_id: 1, bit_field: 0x4000 });
+        assert!(c.approx_pending_bytes() > after_one, "second push must add");
+        // A barrier flush drains the counter back to zero.
+        let _ = c.flush_as_barrier();
+        assert_eq!(c.approx_pending_bytes(), 0, "flush must reset bytes");
+    }
+
+    #[test]
+    fn should_auto_flush_trips_only_past_budget() {
+        let mut c = UnifiedFrameCollector::new();
+        assert!(!c.should_auto_flush());
+        // Pushing a handful of small commands must stay below budget.
+        for _ in 0..8 {
+            c.push_canvas2d(1, Canvas2DCmd::Save);
+        }
+        assert!(
+            !c.should_auto_flush(),
+            "small frames must not trip the auto-flush signal"
+        );
+        // Manually push the counter past the threshold to verify
+        // the predicate fires without allocating megabytes in the
+        // test.
+        c.pending_bytes = AUTO_FLUSH_SOFT_BUDGET_BYTES + 1;
+        assert!(c.should_auto_flush());
     }
 
     #[test]

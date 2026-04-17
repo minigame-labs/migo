@@ -54,7 +54,8 @@ fn apply_env(
 /// `Canvas2DRenderer::state.text` directly.  This helper keeps that local
 /// to tests so production code never reaches into private state.
 fn set_font(ctx: &mut Canvas2DRenderer, size: f32) {
-    ctx.state.text.families = vec!["test-noto".into(), "sans-serif".into()];
+    ctx.state.text.families =
+        std::sync::Arc::new(vec!["test-noto".into(), "sans-serif".into()]);
     ctx.state.text.size = size;
 }
 
@@ -308,6 +309,7 @@ fn measure_text_tracks_characters() {
             italic: false,
             align: TextAlign::Start,
             baseline: TextBaseline::Alphabetic,
+            direction: shared::protocol::render_cmd::TextDirection::Inherit,
         };
         let short = text.measure_text("i", &attrs);
         let long = text.measure_text("Lorem ipsum dolor sit amet", &attrs);

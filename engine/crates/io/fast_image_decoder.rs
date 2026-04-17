@@ -290,6 +290,64 @@ fn decode_with_image_crate(data: &[u8]) -> Result<NormalizedImage, EngineError> 
 /// aspect ratio. Uses bilinear filtering via the `image` crate.
 ///
 /// If the image is already within the target dimensions, returns it unchanged.
+/// Crop `img` to the pixel rectangle `(sx, sy, sw, sh)`, with
+/// WHATWG ImageBitmap out-of-bounds semantics: regions that fall
+/// outside the source image are filled with transparent black
+/// (`rgba(0, 0, 0, 0)`).
+///
+/// Returns a fresh `NormalizedImage` sized `sw x sh`.  When the
+/// clipped region covers the whole source and has identical
+/// dimensions, the input is returned unchanged (no allocation).
+///
+/// Unlike [`resize_image`] this does not depend on the optional
+/// `rust-image-decode` feature — crop is a pure CPU operation on
+/// the RGBA buffer we always hold.
+pub fn crop_image(
+    img: NormalizedImage,
+    sx: i32,
+    sy: i32,
+    sw: u32,
+    sh: u32,
+) -> NormalizedImage {
+    // Fast path: no-op crop.
+    if sx == 0 && sy == 0 && sw == img.width && sh == img.height {
+        return img;
+    }
+    let out_w = sw as i32;
+    let out_h = sh as i32;
+    let mut out = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+
+    // Compute intersection of destination rect with source image.
+    let src_w = img.width as i32;
+    let src_h = img.height as i32;
+    let intersect_x0 = sx.max(0);
+    let intersect_y0 = sy.max(0);
+    let intersect_x1 = (sx + out_w).min(src_w);
+    let intersect_y1 = (sy + out_h).min(src_h);
+    if intersect_x1 > intersect_x0 && intersect_y1 > intersect_y0 {
+        let row_bytes_src = (src_w as usize) * 4;
+        let row_bytes_dst = (out_w as usize) * 4;
+        for y in intersect_y0..intersect_y1 {
+            let src_row_start = (y as usize) * row_bytes_src
+                + (intersect_x0 as usize) * 4;
+            let src_row_end = (y as usize) * row_bytes_src
+                + (intersect_x1 as usize) * 4;
+            let dst_y = (y - sy) as usize;
+            let dst_x = (intersect_x0 - sx) as usize;
+            let dst_start = dst_y * row_bytes_dst + dst_x * 4;
+            let copy_len = src_row_end - src_row_start;
+            out[dst_start..dst_start + copy_len]
+                .copy_from_slice(&img.rgba[src_row_start..src_row_end]);
+        }
+    }
+
+    NormalizedImage {
+        width: sw,
+        height: sh,
+        rgba: std::sync::Arc::new(out),
+    }
+}
+
 #[cfg(feature = "rust-image-decode")]
 pub fn resize_image(img: NormalizedImage, target_w: u32, target_h: u32) -> NormalizedImage {
     if img.width <= target_w && img.height <= target_h {
@@ -340,4 +398,81 @@ pub fn resize_image(img: NormalizedImage, target_w: u32, target_h: u32) -> Norma
 #[cfg(not(feature = "rust-image-decode"))]
 pub fn resize_image(img: NormalizedImage, _target_w: u32, _target_h: u32) -> NormalizedImage {
     img
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn checkerboard(w: u32, h: u32) -> NormalizedImage {
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let on = (x + y) % 2 == 0;
+                rgba[i] = if on { 255 } else { 0 };
+                rgba[i + 1] = if on { 255 } else { 0 };
+                rgba[i + 2] = if on { 255 } else { 0 };
+                rgba[i + 3] = 255;
+            }
+        }
+        NormalizedImage {
+            width: w,
+            height: h,
+            rgba: Arc::new(rgba),
+        }
+    }
+
+    #[test]
+    fn crop_identity_returns_input() {
+        let img = checkerboard(4, 4);
+        let out = crop_image(img.clone(), 0, 0, 4, 4);
+        assert_eq!(out.width, 4);
+        assert_eq!(out.height, 4);
+        assert_eq!(&*out.rgba, &*img.rgba);
+    }
+
+    #[test]
+    fn crop_center_region_extracts_pixels_correctly() {
+        // Source is a 4x4 checkerboard starting "on" at (0,0).
+        // Extract the 2x2 from (1,1) — should start "on" at (1,1)
+        // because (x+y) = 2, even.
+        let img = checkerboard(4, 4);
+        let out = crop_image(img, 1, 1, 2, 2);
+        assert_eq!(out.width, 2);
+        assert_eq!(out.height, 2);
+        // Top-left pixel of output = source(1,1): on.
+        assert_eq!(out.rgba[0], 255);
+        // (0,1) of output = source(1,2): off.
+        let row1_off = (1 * 2 * 4) as usize;
+        assert_eq!(out.rgba[row1_off + 0], 0);
+    }
+
+    #[test]
+    fn crop_entirely_out_of_bounds_returns_transparent_black() {
+        let img = checkerboard(4, 4);
+        let out = crop_image(img, 10, 10, 3, 3);
+        assert_eq!(out.width, 3);
+        assert_eq!(out.height, 3);
+        assert!(out.rgba.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn crop_partially_out_of_bounds_fills_missing_with_transparent_black() {
+        // Source 4x4, extract 6x6 starting at (-1, -1).  The 5x5 region
+        // from (0,0) to (4,4) should be the source checker; the rim
+        // is zeroed.
+        let img = checkerboard(4, 4);
+        let out = crop_image(img, -1, -1, 6, 6);
+        assert_eq!(out.width, 6);
+        assert_eq!(out.height, 6);
+        // Top-left corner (output pixel (0,0) maps to source(-1,-1)
+        // which is out of bounds) should be zero.
+        assert_eq!(&out.rgba[0..4], &[0, 0, 0, 0]);
+        // Output pixel (1,1) maps to source(0,0): on, so RGBA =
+        // (255,255,255,255).
+        let idx = (1 * 6 + 1) * 4;
+        assert_eq!(&out.rgba[idx..idx + 4], &[255, 255, 255, 255]);
+    }
 }

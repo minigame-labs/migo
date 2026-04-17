@@ -46,6 +46,7 @@ import {
     op_set_font,
     op_set_text_align,
     op_set_text_baseline,
+    op_set_text_direction,
     // State methods
     op_save,
     op_restore,
@@ -83,6 +84,10 @@ const TEXT_BASELINE_MAP = {
     'top': 0, 'hanging': 1, 'middle': 2,
     'alphabetic': 3, 'ideographic': 4, 'bottom': 5,
 };
+// Text direction constants - match protocol::TextDirection order.
+// Canvas 2D spec accepts "inherit" | "ltr" | "rtl"; unknown values
+// are treated as "inherit" (browser-compatible no-op).
+const TEXT_DIRECTION_MAP = { 'inherit': 0, 'ltr': 1, 'rtl': 2 };
 
 // Composite operation names indexed to stable u8 opcodes consumed by the
 // Rust render thread.  The first 11 entries preserve the legacy numbering
@@ -495,6 +500,13 @@ class CanvasRenderingContext2D {
         this._textBaseline = value;
         this._frameBegin();
         op_set_text_baseline(this._canvasId, TEXT_BASELINE_MAP[value] ?? 3);
+    }
+
+    get direction() { return this._direction || 'inherit'; }
+    set direction(value) {
+        this._direction = value;
+        this._frameBegin();
+        op_set_text_direction(this._canvasId, TEXT_DIRECTION_MAP[value] ?? 0);
     }
 
     // ==================== State Methods ====================

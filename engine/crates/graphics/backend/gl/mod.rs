@@ -18,6 +18,8 @@
 pub mod blend_mode;
 pub mod canvas;
 pub mod color;
+pub mod effect_cache;
+pub mod font_parse;
 pub mod image_store;
 pub mod paint;
 pub mod path;

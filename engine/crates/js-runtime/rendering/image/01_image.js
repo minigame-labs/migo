@@ -2,6 +2,7 @@ import { primordials } from "ext:core/mod.js";
 import {
     op_create_image,
     op_load_image,
+    op_load_image_subrect,
     op_destroy_image,
     op_preload_images,
     op_clear_image_cache,
@@ -255,13 +256,23 @@ async function createImageBitmap(source, ...args) {
         throw new TypeError('createImageBitmap: invalid source');
     }
 
-    // Parse optional args.  See WHATWG spec Step 1-2.
+    // Parse positional args per WHATWG:
+    //   createImageBitmap(source[, options])
+    //   createImageBitmap(source, sx, sy, sw, sh[, options])
     let opts = null;
+    let subrect = null;  // { sx, sy, sw, sh } or null
     if (args.length === 1 && args[0] && typeof args[0] === 'object') {
         opts = args[0];
-    } else if (args.length >= 5) {
-        // (sx, sy, sw, sh[, options])
-        if (args[4] && typeof args[4] === 'object') opts = args[4];
+    } else if (args.length >= 4) {
+        subrect = {
+            sx: args[0] | 0,
+            sy: args[1] | 0,
+            sw: args[2] | 0,
+            sh: args[3] | 0,
+        };
+        if (args.length >= 5 && args[4] && typeof args[4] === 'object') {
+            opts = args[4];
+        }
     }
 
     // Await source readiness.  Images that have already settled
@@ -290,6 +301,33 @@ async function createImageBitmap(source, ...args) {
 
     const rw = (opts && opts.resizeWidth | 0) || 0;
     const rh = (opts && opts.resizeHeight | 0) || 0;
+
+    // Sub-rect path: delegate to a dedicated op that crops the
+    // decoded RGBA on the Rust side and uploads as a new texture.
+    // This is the only mode that handles out-of-bounds sx/sy/sw/sh
+    // with the spec-mandated transparent-black fill.
+    if (subrect && (subrect.sw > 0 && subrect.sh > 0)) {
+        if (!source._src) {
+            throw new Error(
+                'createImageBitmap: sub-rect requires a source with src'
+            );
+        }
+        const rid2 = op_create_image();
+        const final_w = rw > 0 ? rw : subrect.sw;
+        const final_h = rh > 0 ? rh : subrect.sh;
+        const dim = await op_load_image_subrect(
+            rid2,
+            source._src,
+            subrect.sx,
+            subrect.sy,
+            subrect.sw,
+            subrect.sh,
+            final_w,
+            final_h,
+        );
+        return new ImageBitmap(rid2, dim[0], dim[1][0], dim[1][1]);
+    }
+
     const wantsResize = rw > 0 && rh > 0 && (rw !== source.width || rh !== source.height);
 
     // Fast path: no resize requested -> share the source's texture

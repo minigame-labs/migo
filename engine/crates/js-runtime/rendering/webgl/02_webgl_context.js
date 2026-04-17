@@ -29,6 +29,8 @@ import {
     op_uniform3f,
     op_uniform_matrix_3fv,
     op_alloc_gl_resource_id,
+    op_webgl_get_error,
+    op_webgl_get_context_attributes,
     op_enable,
     op_disable,
     op_is_enabled,
@@ -554,7 +556,28 @@ class WebGLRenderingContext {
     }
 
     getError() {
-        return 0;
+        // Drain one entry from the host-side per-context WebGL
+        // error queue.  Returns `NO_ERROR (0)` when empty.  Any
+        // validator op that detects an illegal enum / value /
+        // operation earlier in the pipeline will have pushed the
+        // matching code, so games using `getError()` for defensive
+        // shader/resource checks observe real failures now instead
+        // of the previous always-zero stub.  Matches WebGL 1.0
+        // spec s5.14.3 and Firefox's WebGLContextGL::GetError
+        // two-level queue (JS-side validation errors surface before
+        // any driver-level error, which keeps reported codes stable
+        // across GL drivers).
+        return op_webgl_get_error(this._canvasId);
+    }
+
+    getContextAttributes() {
+        // Returns the actual negotiated context attributes.  The
+        // returned object is a fresh snapshot per spec, so JS
+        // callers can mutate their copy without affecting future
+        // calls.  Never returns `null` -- context-lost reporting is
+        // not yet wired (see op_webgl_is_context_lost when it
+        // lands).
+        return op_webgl_get_context_attributes(this._canvasId);
     }
 
     getExtension(name) {

@@ -26,6 +26,7 @@ zune-core = { workspace = true, optional = true }
 
 # LRU cache for decoded images
 lru = { workspace = true }
+memmap2 = "0.9"
 
 # Base64 encoding for readZipEntry binary data
 base64 = "0.22"

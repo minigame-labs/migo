@@ -314,6 +314,11 @@ pub fn op_measure_text(
                 actual_bounding_box_descent: 0.0,
                 font_bounding_box_ascent: 0.0,
                 font_bounding_box_descent: 0.0,
+                em_height_ascent: 0.0,
+                em_height_descent: 0.0,
+                hanging_baseline: 0.0,
+                alphabetic_baseline: 0.0,
+                ideographic_baseline: 0.0,
             }
         }
     }
@@ -925,6 +930,31 @@ pub fn op_set_text_baseline(state: &mut OpState, #[smi] canvas_id: u32, #[smi] b
             _ => TextBaseline::Alphabetic,
         };
         collector.set_text_baseline(canvas_id, baseline);
+    }
+}
+
+/// Canvas 2D `ctx.direction = "ltr" | "rtl" | "inherit"`.  Maps the
+/// JS string through a compact u8 so the op signature stays in the
+/// fast-call lane; unknown values fall back to `Inherit`, matching
+/// browser behaviour of ignoring unsupported directions.
+#[op2(fast)]
+pub fn op_set_text_direction(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] direction: u8,
+) {
+    if let Some(collector) = state
+        .try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
+        let direction = match direction {
+            1 => shared::protocol::render_cmd::TextDirection::Ltr,
+            2 => shared::protocol::render_cmd::TextDirection::Rtl,
+            _ => shared::protocol::render_cmd::TextDirection::Inherit,
+        };
+        collector.push(
+            canvas_id,
+            Canvas2DCmd::SetTextDirection { direction },
+        );
     }
 }
 
