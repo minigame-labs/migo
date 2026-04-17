@@ -1,46 +1,42 @@
-use femtovg::{ImageFlags, ImageId, ImageInfo};
+//! Per-manager image registry: texture uploads + lifetime tracking.
+//!
+//! This is a thin wrapper around
+//! [`crate::backend::gl::image_store::ImageStore`] that plugs into the
+//! manager-level upload pipeline (PBO async, AHB, compressed).  It owns
+//! *only* raw GL textures; `SkImage`s are constructed on demand by
+//! callers that have access to a `GrDirectContext`.
+//!
+//! The femtovg-era per-canvas replica bookkeeping
+//! (`fv_images: HashMap<image_id, HashMap<CanvasId, …>>`) has been
+//! removed: Skia can wrap a shared texture into a context-specific
+//! `SkImage` without copying, so per-canvas replicas were busywork.
+
 use glow::HasContext;
 use shared::{
     error::EngineResult,
     protocol::{io_cmd::NormalizedImage, render_cmd::CanvasId},
 };
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicU32, Ordering},
-};
+
+use crate::backend::gl::image_store::{GpuImageInfo, ImageStore, StoredImage};
 
 use super::pbo_upload::{self, PboPool};
-use crate::Canvas2DContext;
 
-/// Image registry for managing shared and per-canvas images
 pub(super) struct ImageRegistry {
-    /// shared femtovg images: image_id -> (texture, info)
-    shared_fv_images: HashMap<u32, (glow::NativeTexture, ImageInfo)>,
-    /// per-canvas owned image replicas: image_id -> canvas_id -> (fv ImageId, native_tex, info)
-    pub fv_images: HashMap<u32, HashMap<CanvasId, (ImageId, glow::NativeTexture, ImageInfo)>>,
-    next_image_id: AtomicU32,
-    /// PBO pool for async texture uploads
+    store: ImageStore,
     pbo_pool: Option<PboPool>,
-    /// Whether PBO upload is enabled
     use_pbo: bool,
 }
 
 impl ImageRegistry {
-    /// Default capacity for image maps.
-    /// Most games load a moderate number of images.
-    const DEFAULT_IMAGE_CAPACITY: usize = 32;
-
     pub fn new() -> Self {
         Self {
-            shared_fv_images: HashMap::with_capacity(Self::DEFAULT_IMAGE_CAPACITY),
-            fv_images: HashMap::with_capacity(Self::DEFAULT_IMAGE_CAPACITY),
-            next_image_id: AtomicU32::new(1),
-            pbo_pool: None, // Will be initialized on first upload
-            use_pbo: true,  // Enable by default, will auto-detect support
+            store: ImageStore::new(),
+            pbo_pool: None,
+            use_pbo: true,
         }
     }
 
-    /// Initialize PBO pool (called once when GL context is available)
+    /// Initialize PBO pool on first use (once a GL context is current).
     fn ensure_pbo_pool(&mut self, gl: &glow::Context) {
         if self.pbo_pool.is_none() {
             let pool = PboPool::new(gl, PboPool::DEFAULT_POOL_SIZE);
@@ -51,10 +47,10 @@ impl ImageRegistry {
     }
 
     pub fn generate_img_id(&self) -> u32 {
-        self.next_image_id.fetch_add(1, Ordering::Relaxed)
+        self.store.generate_id()
     }
 
-    pub fn load_shared_fv_image(
+    pub fn load_shared_image(
         &mut self,
         gl: &glow::Context,
         image_id: u32,
@@ -62,19 +58,8 @@ impl ImageRegistry {
         device_caps: &crate::device_caps::DeviceCapabilities,
         egl_display_ptr: *const std::ffi::c_void,
     ) -> EngineResult<(u32, u32)> {
-        // Initialize PBO pool on first use
         self.ensure_pbo_pool(gl);
 
-        // NOTE: Do NOT delete an existing texture for image_id here.
-        // Multiple Image aliases may reference the same shared_id.
-        // Deletion must only happen through the refcount=0 path in
-        // IMAGE_CACHE (remove_previous_alias -> DestroyImage ->
-        // destroy_shared_fv_image).
-
-        // Use the best available upload path for this device tier:
-        // TierA + API 26+: AHB → EGLImage (zero glTexImage2D).
-        // TierA / TierB: PBO async upload.
-        // ES 2.0: synchronous fallback.
         let result = pbo_upload::upload_texture_tiered(
             gl,
             &image,
@@ -84,76 +69,60 @@ impl ImageRegistry {
             egl_display_ptr,
         )?;
 
-        let info = ImageInfo::new(
-            ImageFlags::empty(),
-            result.width as usize,
-            result.height as usize,
-            femtovg::PixelFormat::Rgba8,
+        self.store.insert(
+            image_id,
+            StoredImage {
+                gl_texture: result.texture.0.get(),
+                info: GpuImageInfo::rgba8_unpremul(result.width, result.height),
+            },
         );
-
-        self.shared_fv_images
-            .insert(image_id, (result.texture, info));
         Ok((result.width, result.height))
     }
 
-    pub fn destroy_shared_fv_image<F>(
+    /// Destroy a shared image — deletes its GL texture (if present) and
+    /// removes it from the registry.
+    pub fn destroy_shared_image(
         &mut self,
         gl: &glow::Context,
         image_id: u32,
-        mut make_current: F,
-        contexts_2d: &mut HashMap<CanvasId, Canvas2DContext>,
-    ) -> EngineResult<()>
-    where
-        F: FnMut(CanvasId) -> EngineResult<()>,
-    {
-        if let Some(per_canvas) = self.fv_images.remove(&image_id) {
-            for (canvas_id, (fv_id, _native_tex, _info)) in per_canvas {
-                make_current(canvas_id)?;
-
-                if let Some(ctx2d) = contexts_2d.get_mut(&canvas_id) {
-                    ctx2d.canvas.delete_image(fv_id)
-                }
+    ) -> EngineResult<()> {
+        if let Some(entry) = self.store.remove(image_id) {
+            // SAFETY: we just removed the entry so no other live reference
+            // to this texture exists in the registry.  Raw GL deletion.
+            if let Some(tex) = glow::NativeTexture::try_from_raw(entry.gl_texture) {
+                unsafe { gl.delete_texture(tex) };
             }
         }
-
-        if let Some((tex, _info)) = self.shared_fv_images.remove(&image_id) {
-            unsafe { gl.delete_texture(tex) };
-        }
-
         Ok(())
     }
 
-    /// Register a pre-uploaded texture (e.g. from the upload thread).
+    /// Register a pre-uploaded texture (invoked by the upload thread).
     pub fn register_shared_texture(
         &mut self,
         image_id: u32,
         texture: glow::NativeTexture,
-        info: ImageInfo,
+        info: GpuImageInfo,
     ) {
-        self.shared_fv_images.insert(image_id, (texture, info));
+        self.store.insert(
+            image_id,
+            StoredImage {
+                gl_texture: texture.0.get(),
+                info,
+            },
+        );
     }
 
-    pub fn get_shared_fv_image(
-        &self,
-        image_id: u32,
-    ) -> Option<(u32, glow::NativeTexture, ImageInfo)> {
-        self.shared_fv_images
-            .get(&image_id)
-            .map(|(t, info)| (image_id, *t, *info))
+    pub fn get_shared_texture(&self, image_id: u32) -> Option<StoredImage> {
+        self.store.get(image_id).copied()
     }
 
-    pub fn get_owned_fv_image(
-        &self,
-        image_id: u32,
-        canvas_id: CanvasId,
-    ) -> Option<(ImageId, glow::NativeTexture, ImageInfo)> {
-        self.fv_images
-            .get(&image_id)
-            .and_then(|m| m.get(&canvas_id))
-            .cloned()
+    /// Expose the underlying store for code paths (e.g. Skia image
+    /// resolution) that need the full entry plus a `GrDirectContext`.
+    pub fn store(&self) -> &ImageStore {
+        &self.store
     }
 
-    /// Initialize PBO pool (public entry for CanvasManager).
+    /// Initialize the PBO pool (public entry for CanvasManager).
     pub fn ensure_pbo_pool_public(&mut self, gl: &glow::Context) {
         self.ensure_pbo_pool(gl);
     }
@@ -163,23 +132,37 @@ impl ImageRegistry {
         self.pbo_pool.as_mut()
     }
 
-    /// Remove all per-canvas images for a specific canvas
-    pub fn remove_canvas_images(&mut self, canvas_id: CanvasId) {
-        for (_img_id, per) in self.fv_images.iter_mut() {
-            per.remove(&canvas_id);
-        }
-    }
+    /// No-op: Skia-era registry keeps no per-canvas state.  Kept for
+    /// source-compatibility with older call sites (which will be deleted
+    /// once the transition is complete).
+    pub fn remove_canvas_images(&mut self, _canvas_id: CanvasId) {}
 
-    /// Cleanup all images
+    /// Destroy all registered textures.  Called on manager shutdown.
     pub fn destroy_all(&mut self, gl: &glow::Context) {
-        for (_id, (tex, _info)) in self.shared_fv_images.drain() {
-            unsafe { gl.delete_texture(tex) };
+        // Snapshot ids first so we can mutate the store inside the loop.
+        let ids: Vec<u32> = self.store.iter().map(|(k, _)| *k).collect();
+        for id in ids {
+            if let Some(entry) = self.store.remove(id) {
+                if let Some(tex) = glow::NativeTexture::try_from_raw(entry.gl_texture) {
+                    unsafe { gl.delete_texture(tex) };
+                }
+            }
         }
-        self.fv_images.clear();
-
-        // Clear PBO pool
         if let Some(ref mut pool) = self.pbo_pool {
             pool.clear(gl);
         }
+    }
+}
+
+/// Extension-method compatibility: glow's `NativeTexture` does not have a
+/// `try_from_raw` in 0.17, so we roll one here.  The texture was created
+/// by `glGenTextures`, so any non-zero `u32` round-trips safely.
+trait NativeTextureFromRaw {
+    fn try_from_raw(raw: u32) -> Option<glow::NativeTexture>;
+}
+impl NativeTextureFromRaw for glow::NativeTexture {
+    #[inline]
+    fn try_from_raw(raw: u32) -> Option<glow::NativeTexture> {
+        std::num::NonZeroU32::new(raw).map(glow::NativeTexture)
     }
 }

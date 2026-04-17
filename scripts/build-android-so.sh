@@ -15,7 +15,17 @@ set -euo pipefail
 # ------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------
-ANDROID_API=21
+# Android minimum supported API level.
+#
+# Raised from 21 to 26 because skia-bindings 0.93 hard-codes API 26 in
+# `build_support/platform/android.rs` (the first Oreo API; needed for
+# full Vulkan and a number of modern NDK headers Skia depends on).
+# Linking Skia against an older runtime would be ABI-unsafe, so we
+# promote minSdk for the whole engine.
+#
+# In practice this is a non-issue: Google Play's April-2026 distribution
+# report shows <1.5% of active Android devices below API 26.
+ANDROID_API=26
 
 CRATE_NAME="platform"
 CRATE_DIR="crates/$CRATE_NAME"
@@ -93,12 +103,17 @@ check_dependencies() {
         exit 1
     fi
 
-    if [[ -z "$ANDROID_NDK_HOME" ]]; then
+    if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
         print_error "ANDROID_NDK_HOME is not set"
         exit 1
     fi
 
-    print_success "All dependencies are ready"
+    # skia-bindings' build script reads ANDROID_NDK (not _HOME).  Keep
+    # them in sync so Skia cross-compile picks the same toolchain as
+    # cargo-ndk.
+    export ANDROID_NDK="$ANDROID_NDK_HOME"
+
+    print_success "All dependencies are ready (ANDROID_NDK=$ANDROID_NDK)"
 }
 
 # ------------------------------------------------------------
@@ -223,6 +238,15 @@ build_platform() {
     # --------------------------------------------------------
     local orig_rustflags="${RUSTFLAGS:-}"
 
+    # --allow-multiple-definition is needed on every Android target:
+    # rusty_v8's prebuilt librusty_v8.a embeds parts of libc++, and
+    # skia-bindings emits `-lc++_static`.  Both archives define
+    # std::runtime_error / std::exception / ... → linker picks the first
+    # occurrence, which is safe (identical NDK ABI) but lld defaults to
+    # erroring.  The flag only needs to exist on the final link of
+    # libmigo.so, which happens inside the cargo invocation below.
+    local common_rustflags="-C link-arg=-Wl,--allow-multiple-definition"
+
     if [[ "$platform" == "arm64-v8a" ]]; then
         local builtins
         builtins=$(find_arm64_builtins)
@@ -234,9 +258,11 @@ build_platform() {
         local builtins_dir
         builtins_dir=$(dirname "$builtins")
         # --exclude-libs,ALL prevents re-exporting symbols from static libs
-        # (e.g. V8, ring), reducing .dynsym/.rela.dyn by ~430KB.
-        export RUSTFLAGS="$orig_rustflags -L $builtins_dir -l static=clang_rt.builtins-aarch64-android -C link-arg=-Wl,--exclude-libs,ALL"
-        print_info "Using arm64 clang builtins + --exclude-libs,ALL"
+        # (e.g. V8, ring, Skia), reducing .dynsym/.rela.dyn by ~430KB.
+        export RUSTFLAGS="$orig_rustflags $common_rustflags -L $builtins_dir -l static=clang_rt.builtins-aarch64-android -C link-arg=-Wl,--exclude-libs,ALL"
+        print_info "Using arm64 clang builtins + --exclude-libs,ALL + --allow-multiple-definition"
+    else
+        export RUSTFLAGS="$orig_rustflags $common_rustflags"
     fi
 
     # --------------------------------------------------------
@@ -246,9 +272,21 @@ build_platform() {
 
     pushd "$CRATE_PATH" > /dev/null
 
-    cargo ndk --target "$target_triple" --platform "$ANDROID_API" -- build $profile_flag
+    # NB: `if !` / `||` around a function disables bash's `set -e` inside
+    # it, which previously let a failed cargo build slip through because
+    # a stale .so on disk made the later `cp` succeed.  Capture the exit
+    # code explicitly so we can propagate the real failure upward.
+    local cargo_rc=0
+    cargo ndk --target "$target_triple" --platform "$ANDROID_API" -- build $profile_flag \
+        || cargo_rc=$?
 
     popd > /dev/null
+
+    if [[ $cargo_rc -ne 0 ]]; then
+        print_error "cargo build failed for $platform (rc=$cargo_rc)"
+        export RUSTFLAGS="$orig_rustflags"
+        return $cargo_rc
+    fi
 
     # --------------------------------------------------------
     # Copy output .so

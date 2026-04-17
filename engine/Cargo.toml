@@ -28,7 +28,17 @@ data-url = "=0.3.1"
 bytes = "1.4.0"
 glow = { version = "0.17", default-features = false }
 khronos-egl = { version = "6", features = ["dynamic"] }
-femtovg = { version = "0.22", default-features = false, features = ["textlayout"] }
+
+# Skia 2D renderer (Ganesh GL backend + SkParagraph text)
+#   Features:
+#     gl + egl: OpenGL ES + EGL context (required on Android)
+#     textlayout: SkParagraph / SkShaper / HarfBuzz / ICU (browser-grade text)
+#     binary-cache: download prebuilt skia for host builds (fast dev loop)
+#     embed-icudtl: bundle icudtl.dat (~10MB) into the binary to avoid runtime load
+#   Host-only note: `binary-cache` downloads from GitHub on first build; CI
+#   caches $CARGO_HOME/registry and skia-bindings build outputs to amortize.
+#   Android cross-compile: see scripts/build-skia-android.sh (Phase 6).
+skia-safe = { version = "0.93", default-features = false, features = ["gl", "egl", "textlayout", "binary-cache", "embed-icudtl", "embed-freetype"] }
 
 # Image decoding - only enable formats actually needed
 # Removing unused formats can save 500KB-1MB

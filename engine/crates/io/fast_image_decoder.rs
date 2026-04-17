@@ -304,15 +304,28 @@ pub fn resize_image(img: NormalizedImage, target_w: u32, target_h: u32) -> Norma
     let new_w = ((img.width as f64 * scale).round() as u32).max(1);
     let new_h = ((img.height as f64 * scale).round() as u32).max(1);
 
-    let src = image::RgbaImage::from_raw(img.width, img.height, img.rgba.as_ref().clone());
-    let Some(src) = src else {
-        tracing::warn!(
-            "resize_image: invalid buffer size {}x{} ({} bytes)",
-            img.width,
-            img.height,
-            img.rgba.len()
-        );
-        return img;
+    // Hand the RGBA bytes to `image` without copying when possible.
+    //
+    // `Arc::try_unwrap` succeeds when we are the sole owner — the
+    // common path: the image came straight from the decoder and
+    // hasn't been handed out of the pipeline yet.  When the Arc has
+    // outstanding refs (cache hit, shared source) we fall back to
+    // `.to_vec()` which is the minimum-necessary copy.
+    let w = img.width;
+    let h = img.height;
+    let raw: Vec<u8> = Arc::try_unwrap(img.rgba).unwrap_or_else(|arc| (*arc).clone());
+    let src = match image::RgbaImage::from_raw(w, h, raw) {
+        Some(s) => s,
+        None => {
+            tracing::warn!("resize_image: invalid buffer size {w}x{h}");
+            // We consumed `img.rgba` above; rebuild a sentinel image
+            // rather than returning the now-empty `img`.
+            return NormalizedImage {
+                width: w,
+                height: h,
+                rgba: Arc::new(Vec::new()),
+            };
+        }
     };
 
     let resized = image::imageops::resize(&src, new_w, new_h, image::imageops::FilterType::Triangle);

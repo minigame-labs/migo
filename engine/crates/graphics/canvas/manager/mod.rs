@@ -1,9 +1,9 @@
 extern crate khronos_egl as egl;
 
+use crate::backend::gl::surface::Canvas2DContext;
 use crate::dirty_region::damage_tracker::ResolvedDamage;
-use crate::{BoundContext, Canvas2DContext};
+use crate::BoundContext;
 use egl::EGL1_4;
-use femtovg::ImageId;
 use glow::HasContext;
 use shared::{
     error::{EngineResult, ErrorCode},
@@ -27,8 +27,9 @@ mod pbo_upload;
 mod types;
 
 pub(crate) use types::{
-    ee, BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta, ProgramMeta, RenderbufferMeta,
-    ScissorState, ShaderMeta, TextureMeta,
+    ee, BlendEquation, BlendFactors, BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta,
+    ProgramMeta, RenderbufferMeta, SamplerMeta, ScissorState, ShaderMeta, SyncMeta, TextureMeta,
+    VaoMeta, MAX_UNIFORM_CACHE,
 };
 use types::{CanvasEntry, EglContextHandle, SurfaceKind};
 
@@ -84,6 +85,15 @@ pub(crate) struct CanvasManager {
     pub(crate) framebuffers: HashMap<FramebufferId, FramebufferMeta>,
     pub(crate) renderbuffers: HashMap<RenderbufferId, RenderbufferMeta>,
     pub(crate) gl_state: HashMap<CanvasId, CanvasGLState>,
+
+    // WebGL 2 registries.  Kept separate from the WebGL 1 set because
+    // lookup paths are distinct (VAOs are bound by the state tracker,
+    // samplers are per-texture-unit, sync handles are polled from
+    // synchronous reply ops).  The dispatchers in renderergl own the
+    // actual GL calls; manager just holds the handle tables.
+    pub(crate) vaos: HashMap<shared::protocol::render_cmd::VaoId, VaoMeta>,
+    pub(crate) samplers: HashMap<shared::protocol::render_cmd::SamplerId, SamplerMeta>,
+    pub(crate) syncs: HashMap<shared::protocol::render_cmd::SyncId, SyncMeta>,
 
     /// Runtime device capabilities, detected once at init.
     pub(crate) device_caps: crate::device_caps::DeviceCapabilities,
@@ -273,6 +283,9 @@ impl CanvasManager {
             framebuffers: HashMap::with_capacity(8),
             renderbuffers: HashMap::with_capacity(8),
             gl_state: HashMap::with_capacity(4),
+            vaos: HashMap::with_capacity(16),
+            samplers: HashMap::with_capacity(8),
+            syncs: HashMap::with_capacity(4),
             device_caps,
             gles_major,
             preserved_ctx: None,
@@ -520,17 +533,21 @@ impl CanvasManager {
             },
         );
 
+        // Resize any pre-existing Skia surface against the new DrawingBuffer
+        // / FBO dimensions.  If the onscreen 2D context was torn down by the
+        // destroy path above, re-initialise it here so JS targeting
+        // canvas_id=1 keeps working through an Android surface recreate.
+        let new_fbo = self
+            .canvases
+            .get(&id)
+            .and_then(|e| e.drawing_buffer.as_ref())
+            .map(|db| db.fbo.0.get())
+            .unwrap_or(0);
         if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-            // dpi = 1.0: Canvas2D coordinates are in buffer pixels (no DPR scaling)
-            ctx2d.canvas.set_size(physical_w, physical_h, 1.0);
+            ctx2d.resize(new_fbo, physical_w, physical_h);
         }
-
-        // Re-initialize the femtovg 2D context if one existed before the old
-        // onscreen was destroyed. This happens on Android resume where the
-        // surface is a different native window but the game's JS code still
-        // expects canvas_id=1's 2D context to work.
         if had_2d_context && !self.contexts_2d.contains_key(&id) {
-            context_2d_impl::init_femtovg_for_canvas(self, id)?;
+            context_2d_impl::init_skia_for_canvas(self, id)?;
         }
 
         Ok(())
@@ -835,11 +852,9 @@ impl CanvasManager {
                     continue;
                 }
 
-                let info = femtovg::ImageInfo::new(
-                    femtovg::ImageFlags::empty(),
-                    c.width as usize,
-                    c.height as usize,
-                    femtovg::PixelFormat::Rgba8,
+                let info = crate::backend::gl::image_store::GpuImageInfo::rgba8_unpremul(
+                    c.width,
+                    c.height,
                 );
                 self.image_registry
                     .register_shared_texture(c.image_id as u32, c.texture, info);
@@ -1107,9 +1122,14 @@ impl CanvasManager {
                 entry.info.height = new_h;
             }
 
+            let new_fbo = self
+                .canvases
+                .get(&id)
+                .and_then(|e| e.drawing_buffer.as_ref())
+                .map(|db| db.fbo.0.get())
+                .unwrap_or(0);
             if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-                // dpi = 1.0: Canvas2D coordinates are in buffer pixels (no DPR scaling)
-                ctx2d.canvas.set_size(new_w, new_h, 1.0);
+                ctx2d.resize(new_fbo, new_w, new_h);
             }
 
             // WebGL default framebuffer viewport resets after drawing buffer resize.
@@ -1210,9 +1230,9 @@ impl CanvasManager {
             entry.info.height = actual_h;
         }
 
+        // Offscreen pbuffer: Skia renders into FBO 0 directly.
         if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-            // dpi = 1.0: Canvas2D coordinates are in buffer pixels (no DPR scaling)
-            ctx2d.canvas.set_size(actual_w, actual_h, 1.0);
+            ctx2d.resize(0, actual_w, actual_h);
         }
 
         if !was_current {
@@ -1223,7 +1243,7 @@ impl CanvasManager {
     }
 
     /// Declare the damage region for the current back buffer BEFORE rendering
-    /// to the onscreen surface (femtovg flush, DrawingBuffer blit).
+    /// to the onscreen surface (Skia flush_and_submit, DrawingBuffer blit).
     ///
     /// Per EGL_KHR_partial_update spec, this must be called before any rendering
     /// to the main framebuffer so the driver can skip loading unchanged tiles.
@@ -1376,8 +1396,8 @@ impl CanvasManager {
 
     // ==================== 2D Context Management ====================
 
-    pub(crate) fn init_femtovg_for_canvas(&mut self, canvas_id: CanvasId) -> EngineResult<()> {
-        context_2d_impl::init_femtovg_for_canvas(self, canvas_id)
+    pub(crate) fn init_skia_for_canvas(&mut self, canvas_id: CanvasId) -> EngineResult<()> {
+        context_2d_impl::init_skia_for_canvas(self, canvas_id)
     }
 
     pub(crate) fn get_2d_context_mut(
@@ -1390,6 +1410,25 @@ impl CanvasManager {
                 format!("2d context not found: canvas_id={canvas_id:?}"),
             )
         })
+    }
+
+    /// Split-borrow accessor: returns `(&mut 2d_ctx, &ImageStore)` so a
+    /// single `drawImage` dispatch can wrap a stored GL texture into an
+    /// `SkImage` (needs `&mut GrDirectContext`, owned by 2d_ctx) while
+    /// also looking up the texture metadata (needs `&ImageStore`).
+    ///
+    /// Returns `NotFound` if the canvas has no 2D context yet.
+    pub(crate) fn split_2d_and_images(
+        &mut self,
+        canvas_id: CanvasId,
+    ) -> EngineResult<(&mut Canvas2DContext, &crate::backend::gl::image_store::ImageStore)> {
+        let ctx = self.contexts_2d.get_mut(&canvas_id).ok_or_else(|| {
+            ee(
+                ErrorCode::NotFound,
+                format!("2d context not found: canvas_id={canvas_id:?}"),
+            )
+        })?;
+        Ok((ctx, self.image_registry.store()))
     }
 
     /// Iterate over all 2D contexts mutably (for font registration, etc.).
@@ -1436,7 +1475,7 @@ impl CanvasManager {
         self.dirty_2d.len()
     }
 
-    /// Save current GL state and set a safe baseline for Canvas2D / femtovg
+    /// Save current GL state and set a safe baseline for Canvas2D / Skia
     /// text atlas uploads.
     pub(crate) fn begin_canvas2d_gl_scope(&self) -> context_2d_impl::Canvas2DGlScopeGuard {
         context_2d_impl::begin_canvas2d_gl_scope(&self.gl)
@@ -1450,7 +1489,7 @@ impl CanvasManager {
     ///
     /// This is a read-only operation — it does NOT modify the framebuffer and
     /// therefore does NOT contribute to frame damage. The caller is responsible
-    /// for ensuring all prior rendering (Canvas2D femtovg flush, GL draw calls)
+    /// for ensuring all prior rendering (Canvas2D Skia flush, GL draw calls)
     /// has been materialized before calling this. In the current model, the
     /// unified collector's `flush_as_barrier()` + trailing `Materialize` handles
     /// this before the sync readback command reaches the render thread.
@@ -1497,14 +1536,14 @@ impl CanvasManager {
         self.image_registry.generate_img_id()
     }
 
-    pub(crate) fn load_shared_fv_image(
+    pub(crate) fn load_shared_image(
         &mut self,
         image_id: u32,
         image: NormalizedImage,
     ) -> EngineResult<(u32, u32)> {
         self.ensure_any_canvas_current()?;
         let display_ptr = self.display.as_ptr() as *const std::ffi::c_void;
-        self.image_registry.load_shared_fv_image(
+        self.image_registry.load_shared_image(
             &self.gl,
             image_id,
             image,
@@ -1552,11 +1591,9 @@ impl CanvasManager {
                 .with_detail("glCompressedTexImage2D failed")
         })?;
 
-        let info = femtovg::ImageInfo::new(
-            femtovg::ImageFlags::empty(),
-            compressed.width as usize,
-            compressed.height as usize,
-            femtovg::PixelFormat::Rgba8, // Placeholder — actual format is compressed
+        let info = crate::backend::gl::image_store::GpuImageInfo::rgba8_unpremul(
+            compressed.width,
+            compressed.height,
         );
         self.image_registry.register_shared_texture(image_id, texture, info);
 
@@ -1663,72 +1700,23 @@ impl CanvasManager {
         }
     }
 
-    pub(crate) fn destroy_shared_fv_image(&mut self, image_id: u32) -> EngineResult<()> {
+    pub(crate) fn destroy_shared_image(&mut self, image_id: u32) -> EngineResult<()> {
         self.ensure_any_canvas_current()?;
-
-        // We need to split borrow here
-        let gl = &self.gl;
-        let display = self.display;
-        let egl = &self.egl;
-        let canvases = &self.canvases;
-        let bound = &mut self.bound;
-
-        self.image_registry.destroy_shared_fv_image(
-            gl,
-            image_id,
-            |canvas_id| {
-                // Inline make_current logic to avoid borrow issues
-                if *bound == BoundContext::Canvas(canvas_id) {
-                    return Ok(());
-                }
-                let entry = canvases.get(&canvas_id).ok_or_else(|| {
-                    ee(
-                        ErrorCode::NotFound,
-                        format!("canvas not found: {canvas_id:?}"),
-                    )
-                })?;
-
-                egl.make_current(
-                    display,
-                    Some(entry.ctx.surf),
-                    Some(entry.ctx.surf),
-                    Some(entry.ctx.ctx),
-                )
-                .map_err(|e| {
-                    ee(
-                        ErrorCode::RenderBackendError,
-                        format!("eglMakeCurrent(canvas) failed: {e:?}"),
-                    )
-                })?;
-                *bound = BoundContext::Canvas(canvas_id);
-                Ok(())
-            },
-            &mut self.contexts_2d,
-        )
+        self.image_registry.destroy_shared_image(&self.gl, image_id)
     }
 
-    pub(crate) fn get_shared_fv_image(
+    /// Look up an image by id.  Returns the raw GL texture + dimensions +
+    /// colour/alpha metadata.  Callers that want a Skia `SkImage` wrap
+    /// the texture via `ImageStore::resolve_as_sk_image` using their
+    /// canvas's `GrDirectContext`.
+    pub(crate) fn get_shared_image(
         &self,
         image_id: u32,
-    ) -> Option<(u32, glow::NativeTexture, femtovg::ImageInfo)> {
-        self.image_registry.get_shared_fv_image(image_id)
+    ) -> Option<crate::backend::gl::image_store::StoredImage> {
+        self.image_registry.get_shared_texture(image_id)
     }
 
-    pub(crate) fn get_owned_fv_image(
-        &self,
-        image_id: u32,
-        canvas_id: CanvasId,
-    ) -> Option<(ImageId, glow::NativeTexture, femtovg::ImageInfo)> {
-        self.image_registry.get_owned_fv_image(image_id, canvas_id)
-    }
 
-    /// Access to fv_images for external mutation
-    pub(crate) fn fv_images_mut(
-        &mut self,
-    ) -> &mut HashMap<u32, HashMap<CanvasId, (ImageId, glow::NativeTexture, femtovg::ImageInfo)>>
-    {
-        &mut self.image_registry.fv_images
-    }
 
     /// Access the PBO pool for WebGL texture uploads.
     /// Returns None if no images have been loaded yet (pool not initialized).

@@ -252,9 +252,16 @@ fn upload_thread_main(
 
     info!("Upload thread: GL context ready");
 
+    // Thread-local PBO ring — see `UploadPboPool` for the rationale.
+    // Lives for the entire lifetime of the upload thread so PBO buffers
+    // can be reused across successive uploads instead of being created
+    // and destroyed per job (which on Mali/Adreno drivers costs a full
+    // GPU memory allocator round-trip for every image).
+    let mut pbo_pool = UploadPboPool::new();
+
     // Process jobs until channel closes.
     while let Ok(job) = job_rx.recv() {
-        match do_upload(&gl, &job) {
+        match do_upload(&gl, &job, &mut pbo_pool) {
             Ok(completed) => {
                 failures.store(0, Ordering::Relaxed);
                 if let Err(e) = result_tx.try_send(completed) {
@@ -297,8 +304,58 @@ fn upload_thread_main(
     info!("Upload thread: exited");
 }
 
+/// Ring-buffer of PBOs kept live on the upload thread so that each
+/// `do_upload` can reuse one instead of paying a `glGenBuffers` +
+/// `glDeleteBuffers` round-trip per image.  PBO reuse is race-free here
+/// because uploads are sequential within this thread and the
+/// `glBufferData(STREAM_DRAW)` call that precedes every `glTexImage2D`
+/// effectively orphans the previous contents on every driver we target
+/// (Mali / Adreno / PowerVR).
+struct UploadPboPool {
+    /// `(buffer, capacity_bytes)`.  Kept small (≤ 4) to bound memory;
+    /// typical mobile games upload in bursts of 2-3 concurrent textures
+    /// which is enough to saturate DMA even without a larger ring.
+    entries: Vec<(glow::NativeBuffer, usize)>,
+}
+
+impl UploadPboPool {
+    const MAX_ENTRIES: usize = 4;
+
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(Self::MAX_ENTRIES),
+        }
+    }
+
+    /// Acquire a PBO with capacity ≥ `need`.  If none matches, a fresh
+    /// buffer is returned (and enters the pool on `release`).
+    ///
+    /// # Safety
+    /// A GL context must be current.
+    unsafe fn acquire(&mut self, gl: &glow::Context, need: usize) -> Result<glow::NativeBuffer, String> {
+        if let Some(idx) = self.entries.iter().position(|(_, cap)| *cap >= need) {
+            let (buf, _) = self.entries.remove(idx);
+            return Ok(buf);
+        }
+        gl.create_buffer().map_err(|e| format!("create_buffer(PBO): {e}"))
+    }
+
+    /// Return a PBO to the pool.  Drops the buffer if the pool is full.
+    unsafe fn release(&mut self, gl: &glow::Context, buf: glow::NativeBuffer, capacity: usize) {
+        if self.entries.len() < Self::MAX_ENTRIES {
+            self.entries.push((buf, capacity));
+        } else {
+            gl.delete_buffer(buf);
+        }
+    }
+}
+
 /// Perform a single texture upload on the shared GL context.
-fn do_upload(gl: &glow::Context, job: &UploadJob) -> Result<CompletedUpload, String> {
+fn do_upload(
+    gl: &glow::Context,
+    job: &UploadJob,
+    pbo_pool: &mut UploadPboPool,
+) -> Result<CompletedUpload, String> {
     unsafe {
         let tex = gl
             .create_texture()
@@ -326,11 +383,15 @@ fn do_upload(gl: &glow::Context, job: &UploadJob) -> Result<CompletedUpload, Str
             glow::CLAMP_TO_EDGE as i32,
         );
 
-        // Upload RGBA data via PBO for async DMA.
-        let pbo = gl
-            .create_buffer()
-            .map_err(|e| format!("create_buffer(PBO): {e}"))?;
+        // Upload RGBA data via PBO for async DMA.  `pbo_pool` hands us
+        // a reusable buffer (with matching or larger capacity) so we
+        // don't pay a glGenBuffers round-trip per image.
+        let need = job.rgba.len();
+        let pbo = pbo_pool.acquire(gl, need)?;
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pbo));
+        // `STREAM_DRAW` with a full-buffer replacement orphans the
+        // driver-side storage (per spec §6.2), so reuse is safe even
+        // though the previous DMA may not have completed on the GPU.
         gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, &job.rgba, glow::STREAM_DRAW);
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
 
@@ -347,7 +408,10 @@ fn do_upload(gl: &glow::Context, job: &UploadJob) -> Result<CompletedUpload, Str
         );
 
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
-        gl.delete_buffer(pbo);
+        // Record the capacity the *driver* now considers the PBO to
+        // have (== `need`, since we reallocated with STREAM_DRAW) so
+        // the next acquire can reuse this one for any smaller payload.
+        pbo_pool.release(gl, pbo, need);
 
         // Insert fence so the render thread knows when the upload is complete.
         let fence = gl

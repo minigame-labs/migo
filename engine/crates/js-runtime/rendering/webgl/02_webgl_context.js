@@ -97,6 +97,33 @@ import {
     op_renderbuffer_storage,
     op_read_pixels,
     op_hint,
+
+    // WebGL 2.0 additions
+    op_create_vertex_array,
+    op_delete_vertex_array,
+    op_bind_vertex_array,
+    op_vertex_attrib_divisor,
+    op_draw_arrays_instanced,
+    op_draw_elements_instanced,
+    op_get_uniform_block_index,
+    op_uniform_block_binding,
+    op_bind_buffer_base,
+    op_bind_buffer_range,
+    op_tex_storage_2d,
+    op_blit_framebuffer,
+    op_invalidate_framebuffer,
+    op_renderbuffer_storage_multisample,
+    op_create_sampler,
+    op_delete_sampler,
+    op_bind_sampler,
+    op_sampler_parameteri,
+    op_sampler_parameterf,
+    op_fence_sync,
+    op_delete_sync,
+    op_client_wait_sync,
+    op_draw_buffers,
+    op_read_buffer,
+    op_alloc_gl_resource_id as op_alloc_gl_resource_id_webgl2,
 } from "ext:core/ops";
 
 import { core, primordials } from "ext:core/mod.js";
@@ -805,9 +832,134 @@ class WebGLRenderingContext {
 
 Object.assign(WebGLRenderingContext.prototype, WebglConstants);
 
+/**
+ * WebGL 2.0 facade.  Extends `WebGLRenderingContext` with the ES 3.0
+ * additions backed by the handler in
+ * engine/crates/graphics/renderergl/handler.rs and the op wrappers in
+ * engine/crates/js-runtime/rendering/webgl/webgl.rs.
+ *
+ * Minimum footprint: VAO, instancing, UBO, sampler objects, sync
+ * objects, immutable texture storage, BlitFramebuffer,
+ * InvalidateFramebuffer, MSAA renderbuffers, and multiple draw/read
+ * buffers.  More advanced features (Transform Feedback, Query Objects,
+ * texImage3D, compressedTexSubImage3D, ...) will be added on demand as
+ * real-world games request them -- they all share the same GLCmd + op
+ * + handler layer as the items above.
+ */
 class WebGL2RenderingContext extends WebGLRenderingContext {
     constructor(canvas) {
         super(canvas);
+    }
+
+    // ---- Vertex Array Objects ----------------------------------
+    createVertexArray() {
+        const id = op_alloc_gl_resource_id_webgl2();
+        op_create_vertex_array(this._canvasId, id);
+        return { _id: id, _kind: 'vao' };
+    }
+    deleteVertexArray(vao) {
+        if (vao && vao._id) op_delete_vertex_array(vao._id);
+    }
+    bindVertexArray(vao) {
+        op_bind_vertex_array(this._canvasId, vao ? vao._id : 0);
+    }
+
+    // ---- Instanced drawing -------------------------------------
+    vertexAttribDivisor(index, divisor) {
+        op_vertex_attrib_divisor(this._canvasId, index, divisor);
+    }
+    drawArraysInstanced(mode, first, count, instanceCount) {
+        op_draw_arrays_instanced(this._canvasId, mode, first, count, instanceCount);
+    }
+    drawElementsInstanced(mode, count, type, offset, instanceCount) {
+        op_draw_elements_instanced(this._canvasId, mode, count, type, offset, instanceCount);
+    }
+
+    // ---- Uniform Buffer Objects --------------------------------
+    getUniformBlockIndex(program, name) {
+        return op_get_uniform_block_index(program._id, name);
+    }
+    uniformBlockBinding(program, uniformBlockIndex, uniformBlockBinding) {
+        op_uniform_block_binding(program._id, uniformBlockIndex, uniformBlockBinding);
+    }
+    bindBufferBase(target, index, buffer) {
+        op_bind_buffer_base(this._canvasId, target, index, buffer ? buffer._id : 0);
+    }
+    bindBufferRange(target, index, buffer, offset, size) {
+        op_bind_buffer_range(this._canvasId, target, index, buffer ? buffer._id : 0, offset, size);
+    }
+
+    // ---- Immutable texture storage ------------------------------
+    texStorage2D(target, levels, internalformat, width, height) {
+        op_tex_storage_2d(this._canvasId, target, levels, internalformat, width, height);
+    }
+
+    // ---- Framebuffer ops ---------------------------------------
+    blitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter) {
+        op_blit_framebuffer(this._canvasId, srcX0, srcY0, srcX1, srcY1,
+                             dstX0, dstY0, dstX1, dstY1, mask, filter);
+    }
+    invalidateFramebuffer(target, attachments) {
+        // WebGL spec accepts a sequence<GLenum>; normalise to Uint32Array
+        // for the op boundary.
+        const buf = attachments instanceof Uint32Array
+            ? attachments
+            : new Uint32Array(attachments || []);
+        op_invalidate_framebuffer(this._canvasId, target, buf);
+    }
+    renderbufferStorageMultisample(target, samples, internalformat, width, height) {
+        op_renderbuffer_storage_multisample(this._canvasId, target, samples,
+                                            internalformat, width, height);
+    }
+
+    // ---- Sampler objects ---------------------------------------
+    createSampler() {
+        const id = op_alloc_gl_resource_id_webgl2();
+        op_create_sampler(this._canvasId, id);
+        return { _id: id, _kind: 'sampler' };
+    }
+    deleteSampler(sampler) {
+        if (sampler && sampler._id) op_delete_sampler(sampler._id);
+    }
+    bindSampler(unit, sampler) {
+        op_bind_sampler(this._canvasId, unit, sampler ? sampler._id : 0);
+    }
+    samplerParameteri(sampler, pname, param) {
+        if (sampler && sampler._id) op_sampler_parameteri(sampler._id, pname, param);
+    }
+    samplerParameterf(sampler, pname, param) {
+        if (sampler && sampler._id) op_sampler_parameterf(sampler._id, pname, param);
+    }
+
+    // ---- Fence syncs -------------------------------------------
+    fenceSync(condition, flags) {
+        const id = op_alloc_gl_resource_id_webgl2();
+        op_fence_sync(this._canvasId, id, condition, flags);
+        return { _id: id, _kind: 'sync' };
+    }
+    deleteSync(sync) {
+        if (sync && sync._id) op_delete_sync(sync._id);
+    }
+    /**
+     * clientWaitSync(sync, flags, timeout) -- WebGL spec says timeout is
+     * an Int64.  JS numbers max out at 2^53, which is larger than GLES'
+     * effective timeout range so a `number` is safe here.  Pass `0` to
+     * poll without blocking.
+     */
+    clientWaitSync(sync, flags, timeout) {
+        if (!sync || !sync._id) return 0x911D; // WAIT_FAILED
+        return op_client_wait_sync(sync._id, flags, Number(timeout) || 0);
+    }
+
+    // ---- Draw / read buffer selection --------------------------
+    drawBuffers(buffers) {
+        const buf = buffers instanceof Uint32Array
+            ? buffers
+            : new Uint32Array(buffers || []);
+        op_draw_buffers(this._canvasId, buf);
+    }
+    readBuffer(src) {
+        op_read_buffer(this._canvasId, src);
     }
 }
 

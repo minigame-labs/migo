@@ -5,6 +5,7 @@ use shared::{
 };
 use tracing::trace;
 
+use crate::backend::gl::state_tracker as st;
 use crate::damage_effect::DamageEffect;
 use crate::ScissorState;
 #[cfg(test)]
@@ -184,8 +185,10 @@ impl RendererGL {
                 }
 
                 if let Some(ph) = meta.gl_handle {
-                    unsafe { gl.use_program(Some(ph)) };
-                    cm.gl_state.entry(canvas_id).or_default().current_program = Some(program_id);
+                    let entry = cm.gl_state.entry(canvas_id).or_default();
+                    if st::update_use_program(entry, program_id) {
+                        unsafe { gl.use_program(Some(ph)) };
+                    }
                 }
                 Ok(DamageEffect::NoDamage)
             }
@@ -900,7 +903,14 @@ impl RendererGL {
             // ========== Phase 1A: GL State ==========
             GLCmd::Enable { canvas_id, cap } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.enable(cap) };
+                // Issue the GL call only if this cap was not already known-enabled.
+                // Scissor state still needs updating on the first real Enable so
+                // the damage tracker sees a valid ScissorState::Enabled.
+                let should_issue =
+                    st::update_enable(cm.gl_state.entry(canvas_id).or_default(), cap);
+                if should_issue {
+                    unsafe { gl.enable(cap) };
+                }
                 if cap == glow::SCISSOR_TEST {
                     let s = cm.gl_state.entry(canvas_id).or_default();
                     s.scissor = match s.last_scissor_rect {
@@ -915,7 +925,11 @@ impl RendererGL {
 
             GLCmd::Disable { canvas_id, cap } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.disable(cap) };
+                let should_issue =
+                    st::update_disable(cm.gl_state.entry(canvas_id).or_default(), cap);
+                if should_issue {
+                    unsafe { gl.disable(cap) };
+                }
                 if cap == glow::SCISSOR_TEST {
                     cm.gl_state.entry(canvas_id).or_default().scissor =
                         ScissorState::Disabled;
@@ -1105,12 +1119,12 @@ impl RendererGL {
 
             GLCmd::ActiveTexture { canvas_id, unit } => {
                 cm.make_current_needed(canvas_id)?;
-                let state = cm.gl_state.entry(canvas_id).or_default();
-                if state.active_texture_unit == Some(unit) {
-                    return Ok(DamageEffect::NoDamage);
+                if st::update_active_texture(
+                    cm.gl_state.entry(canvas_id).or_default(),
+                    unit,
+                ) {
+                    unsafe { gl.active_texture(unit) };
                 }
-                state.active_texture_unit = Some(unit);
-                unsafe { gl.active_texture(unit) };
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1335,7 +1349,13 @@ impl RendererGL {
                 dfactor,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.blend_func(sfactor, dfactor) };
+                if st::update_blend_func(
+                    cm.gl_state.entry(canvas_id).or_default(),
+                    sfactor,
+                    dfactor,
+                ) {
+                    unsafe { gl.blend_func(sfactor, dfactor) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1347,13 +1367,23 @@ impl RendererGL {
                 dst_alpha,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.blend_func_separate(src_rgb, dst_rgb, src_alpha, dst_alpha) };
+                if st::update_blend_func_separate(
+                    cm.gl_state.entry(canvas_id).or_default(),
+                    src_rgb,
+                    dst_rgb,
+                    src_alpha,
+                    dst_alpha,
+                ) {
+                    unsafe { gl.blend_func_separate(src_rgb, dst_rgb, src_alpha, dst_alpha) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::BlendEquation { canvas_id, mode } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.blend_equation(mode) };
+                if st::update_blend_equation(cm.gl_state.entry(canvas_id).or_default(), mode) {
+                    unsafe { gl.blend_equation(mode) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1381,13 +1411,17 @@ impl RendererGL {
 
             GLCmd::DepthFunc { canvas_id, func } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.depth_func(func) };
+                if st::update_depth_func(cm.gl_state.entry(canvas_id).or_default(), func) {
+                    unsafe { gl.depth_func(func) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::DepthMask { canvas_id, flag } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.depth_mask(flag) };
+                if st::update_depth_mask(cm.gl_state.entry(canvas_id).or_default(), flag) {
+                    unsafe { gl.depth_mask(flag) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1465,13 +1499,17 @@ impl RendererGL {
 
             GLCmd::CullFace { canvas_id, mode } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.cull_face(mode) };
+                if st::update_cull_face(cm.gl_state.entry(canvas_id).or_default(), mode) {
+                    unsafe { gl.cull_face(mode) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::FrontFace { canvas_id, mode } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.front_face(mode) };
+                if st::update_front_face(cm.gl_state.entry(canvas_id).or_default(), mode) {
+                    unsafe { gl.front_face(mode) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1515,7 +1553,9 @@ impl RendererGL {
 
             GLCmd::LineWidth { canvas_id, width } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.line_width(width) };
+                if st::update_line_width(cm.gl_state.entry(canvas_id).or_default(), width) {
+                    unsafe { gl.line_width(width) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -2006,6 +2046,340 @@ impl RendererGL {
             } => {
                 cm.make_current_needed(canvas_id)?;
                 unsafe { gl.hint(target, mode) };
+                Ok(DamageEffect::NoDamage)
+            }
+
+            // ================================================================
+            // WebGL 2.0 / GLES 3.0 commands.
+            //
+            // The state tracker added in Phase 8 layers on top of this; for
+            // now each command is a thin translation into `glow` with the
+            // same `make_current_needed` discipline as the WebGL 1 path.
+            // ================================================================
+            GLCmd::CreateVertexArray {
+                canvas_id,
+                client_id,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                let handle = unsafe { gl.create_vertex_array() }.ok();
+                cm.vaos.insert(
+                    client_id,
+                    crate::canvas::VaoMeta {
+                        gl_handle: handle,
+                        owner_canvas: Some(canvas_id),
+                        deleted: false,
+                    },
+                );
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::DeleteVertexArray { vao } => {
+                if let Some(meta) = cm.vaos.get_mut(&vao) {
+                    if let Some(h) = meta.gl_handle.take() {
+                        unsafe { gl.delete_vertex_array(h) };
+                    }
+                    meta.deleted = true;
+                }
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::BindVertexArray { canvas_id, vao } => {
+                cm.make_current_needed(canvas_id)?;
+                let handle = vao.and_then(|id| cm.vaos.get(&id).and_then(|m| m.gl_handle));
+                if st::update_bind_vertex_array(cm.gl_state.entry(canvas_id).or_default(), vao) {
+                    unsafe { gl.bind_vertex_array(handle) };
+                }
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::VertexAttribDivisor {
+                canvas_id,
+                index,
+                divisor,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                unsafe { gl.vertex_attrib_divisor(index, divisor) };
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::DrawArraysInstanced {
+                canvas_id,
+                mode,
+                first,
+                count,
+                instance_count,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                unsafe { gl.draw_arrays_instanced(mode, first, count, instance_count) };
+                Ok(Self::damage_for_draw(cm, canvas_id))
+            }
+            GLCmd::DrawElementsInstanced {
+                canvas_id,
+                mode,
+                count,
+                index_type,
+                offset,
+                instance_count,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                unsafe {
+                    gl.draw_elements_instanced(mode, count, index_type, offset, instance_count)
+                };
+                Ok(Self::damage_for_draw(cm, canvas_id))
+            }
+
+            GLCmd::GetUniformBlockIndex {
+                program_id,
+                name,
+                resp,
+            } => {
+                let _ = self.bind_for_contextless_gl(cm)?;
+                let meta = cm.programs.get(&program_id).ok_or_else(|| {
+                    ee(ErrorCode::NotFound, format!("program not found: {program_id}"))
+                })?;
+                let handle = meta.gl_handle.ok_or_else(|| {
+                    ee(ErrorCode::InvalidOperation, "program has no GL handle")
+                })?;
+                let idx = unsafe { gl.get_uniform_block_index(handle, &name) }
+                    .unwrap_or(u32::MAX);
+                resp.ok(idx);
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::UniformBlockBinding {
+                program_id,
+                uniform_block_index,
+                uniform_block_binding,
+            } => {
+                let _ = self.bind_for_contextless_gl(cm)?;
+                let meta = cm.programs.get(&program_id).ok_or_else(|| {
+                    ee(ErrorCode::NotFound, format!("program not found: {program_id}"))
+                })?;
+                if let Some(handle) = meta.gl_handle {
+                    unsafe {
+                        gl.uniform_block_binding(
+                            handle,
+                            uniform_block_index,
+                            uniform_block_binding,
+                        )
+                    };
+                }
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::BindBufferBase {
+                canvas_id,
+                target,
+                index,
+                buffer,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                let handle = buffer.and_then(|id| cm.buffers.get(&id).and_then(|m| m.gl_handle));
+                unsafe { gl.bind_buffer_base(target, index, handle) };
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::BindBufferRange {
+                canvas_id,
+                target,
+                index,
+                buffer,
+                offset,
+                size,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                let handle = buffer.and_then(|id| cm.buffers.get(&id).and_then(|m| m.gl_handle));
+                unsafe { gl.bind_buffer_range(target, index, handle, offset, size) };
+                Ok(DamageEffect::NoDamage)
+            }
+
+            GLCmd::TexStorage2D {
+                canvas_id,
+                target,
+                levels,
+                internal_format,
+                width,
+                height,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                unsafe {
+                    gl.tex_storage_2d(target, levels, internal_format, width, height);
+                }
+                Ok(DamageEffect::NoDamage)
+            }
+
+            GLCmd::BlitFramebuffer {
+                canvas_id,
+                src_x0,
+                src_y0,
+                src_x1,
+                src_y1,
+                dst_x0,
+                dst_y0,
+                dst_x1,
+                dst_y1,
+                mask,
+                filter,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                unsafe {
+                    gl.blit_framebuffer(
+                        src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask,
+                        filter,
+                    );
+                }
+                // Conservative: any blit touching the onscreen framebuffer
+                // counts as full-surface damage.  Phase 8 can look at the
+                // currently-bound FBO to refine this.
+                Ok(Self::damage_for_draw(cm, canvas_id))
+            }
+            GLCmd::InvalidateFramebuffer {
+                canvas_id,
+                target,
+                attachments,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                unsafe { gl.invalidate_framebuffer(target, &attachments) };
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::RenderbufferStorageMultisample {
+                canvas_id,
+                target,
+                samples,
+                internal_format,
+                width,
+                height,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                unsafe {
+                    gl.renderbuffer_storage_multisample(
+                        target,
+                        samples,
+                        internal_format,
+                        width,
+                        height,
+                    )
+                };
+                Ok(DamageEffect::NoDamage)
+            }
+
+            GLCmd::CreateSampler {
+                canvas_id,
+                client_id,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                let handle = unsafe { gl.create_sampler() }.ok();
+                cm.samplers.insert(
+                    client_id,
+                    crate::canvas::SamplerMeta {
+                        gl_handle: handle,
+                        owner_canvas: Some(canvas_id),
+                        deleted: false,
+                    },
+                );
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::DeleteSampler { sampler } => {
+                if let Some(meta) = cm.samplers.get_mut(&sampler) {
+                    if let Some(h) = meta.gl_handle.take() {
+                        unsafe { gl.delete_sampler(h) };
+                    }
+                    meta.deleted = true;
+                }
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::BindSampler {
+                canvas_id,
+                unit,
+                sampler,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                let handle =
+                    sampler.and_then(|id| cm.samplers.get(&id).and_then(|m| m.gl_handle));
+                unsafe { gl.bind_sampler(unit, handle) };
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::SamplerParameteri {
+                sampler,
+                pname,
+                param,
+            } => {
+                let _ = self.bind_for_contextless_gl(cm)?;
+                if let Some(h) = cm.samplers.get(&sampler).and_then(|m| m.gl_handle) {
+                    unsafe { gl.sampler_parameter_i32(h, pname, param) };
+                }
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::SamplerParameterf {
+                sampler,
+                pname,
+                param,
+            } => {
+                let _ = self.bind_for_contextless_gl(cm)?;
+                if let Some(h) = cm.samplers.get(&sampler).and_then(|m| m.gl_handle) {
+                    unsafe { gl.sampler_parameter_f32(h, pname, param) };
+                }
+                Ok(DamageEffect::NoDamage)
+            }
+
+            GLCmd::FenceSync {
+                canvas_id,
+                client_id,
+                condition,
+                flags,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                let handle = unsafe { gl.fence_sync(condition, flags) }.ok();
+                cm.syncs.insert(
+                    client_id,
+                    crate::canvas::SyncMeta {
+                        gl_handle: handle,
+                        owner_canvas: Some(canvas_id),
+                        deleted: false,
+                    },
+                );
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::DeleteSync { sync } => {
+                if let Some(meta) = cm.syncs.get_mut(&sync) {
+                    if let Some(h) = meta.gl_handle.take() {
+                        unsafe { gl.delete_sync(h) };
+                    }
+                    meta.deleted = true;
+                }
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::ClientWaitSync {
+                sync,
+                flags,
+                timeout_ns,
+                resp,
+            } => {
+                // clientWaitSync must run on the owning context; rebind if
+                // we're not already there.
+                let meta = cm.syncs.get(&sync).cloned();
+                let status: u32 = if let Some(meta) = meta {
+                    if let Some(owner) = meta.owner_canvas {
+                        cm.make_current_needed(owner)?;
+                    } else {
+                        let _ = self.bind_for_contextless_gl(cm)?;
+                    }
+                    if let Some(h) = meta.gl_handle {
+                        unsafe { gl.client_wait_sync(h, flags, timeout_ns as i32) }
+                    } else {
+                        glow::WAIT_FAILED
+                    }
+                } else {
+                    glow::WAIT_FAILED
+                };
+                resp.ok(status);
+                Ok(DamageEffect::NoDamage)
+            }
+
+            GLCmd::DrawBuffers {
+                canvas_id,
+                buffers,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                unsafe { gl.draw_buffers(&buffers) };
+                Ok(DamageEffect::NoDamage)
+            }
+            GLCmd::ReadBuffer { canvas_id, src } => {
+                cm.make_current_needed(canvas_id)?;
+                unsafe { gl.read_buffer(src) };
                 Ok(DamageEffect::NoDamage)
             }
 

@@ -3,7 +3,8 @@ extern crate khronos_egl as egl;
 use std::collections::HashMap;
 
 use glow::{
-    NativeBuffer, NativeFramebuffer, NativeProgram, NativeRenderbuffer, NativeShader, NativeTexture,
+    NativeBuffer, NativeFence, NativeFramebuffer, NativeProgram, NativeRenderbuffer,
+    NativeSampler, NativeShader, NativeTexture, NativeVertexArray,
 };
 use shared::error::{EngineError, ErrorCode};
 use shared::protocol::render_cmd::{CanvasId, ProgramId, ShaderId, ShaderType};
@@ -49,6 +50,58 @@ pub(crate) enum ScissorState {
     EnabledUnknownRect,
 }
 
+/// `(src_factor, dst_factor)` for glBlendFunc-style pairs.  Stored per
+/// channel (colour vs alpha) to support `glBlendFuncSeparate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlendFactors {
+    pub src_rgb: u32,
+    pub dst_rgb: u32,
+    pub src_alpha: u32,
+    pub dst_alpha: u32,
+}
+
+impl Default for BlendFactors {
+    fn default() -> Self {
+        // GL initial values: SRC = 1, DST = 0 for all channels.
+        Self {
+            src_rgb: 1,
+            dst_rgb: 0,
+            src_alpha: 1,
+            dst_alpha: 0,
+        }
+    }
+}
+
+/// `(mode_rgb, mode_alpha)` for glBlendEquation / glBlendEquationSeparate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlendEquation {
+    pub mode_rgb: u32,
+    pub mode_alpha: u32,
+}
+
+impl Default for BlendEquation {
+    fn default() -> Self {
+        // GL_FUNC_ADD = 0x8006 — GL's initial mode.
+        Self {
+            mode_rgb: 0x8006,
+            mode_alpha: 0x8006,
+        }
+    }
+}
+
+/// Tracks the last value written to a given uniform `(program_id, location)`.
+///
+/// We compare raw bytes: two `glUniform4f` calls with the same three f32
+/// values produce identical byte streams, so bytewise equality is both
+/// necessary and sufficient to dedup a redundant upload.
+///
+/// Cache is bounded per-program to avoid unbounded growth when a game
+/// spams glGetUniformLocation for hundreds of unique names; once a
+/// program has more than [`MAX_UNIFORM_CACHE`] entries we drop the
+/// oldest on insert.  Redundant uploads for evicted locations simply
+/// fall back to the non-dedup path, never wrong.
+pub(crate) const MAX_UNIFORM_CACHE: usize = 256;
+
 /// When a setter call matches the already-tracked value, the actual GL call
 /// is skipped.  State is only updated AFTER resource validation succeeds,
 /// so errors never pollute the tracked state.
@@ -79,6 +132,35 @@ pub(crate) struct CanvasGLState {
     /// COLOR_BUFFER_BIT doesn't actually modify visible color.
     /// Defaults to (true, true, true, true) per GL initial state.
     pub color_mask: (bool, bool, bool, bool),
+
+    // ---- Extended dedup state (Phase 8) --------------------------------
+    //
+    // Everything below defaults to the initial GL ES 3.0 state per spec.
+    // The state tracker uses these as cheap "already in this configuration"
+    // checks before issuing the matching GL call.
+    /// `glEnable(cap)` set.  Presence ⇒ enabled.  Absence ⇒ we don't know yet.
+    pub enabled_caps: std::collections::HashSet<u32>,
+    /// `glDisable(cap)` set — separated from `enabled_caps` so we can
+    /// distinguish "known-disabled" from "never touched" (latter returns
+    /// None from the lookup, forcing a real GL query to populate).
+    pub disabled_caps: std::collections::HashSet<u32>,
+    pub blend_factors: Option<BlendFactors>,
+    pub blend_equation: Option<BlendEquation>,
+    pub blend_color: Option<(f32, f32, f32, f32)>,
+    pub depth_func: Option<u32>,
+    pub depth_mask: Option<bool>,
+    pub depth_range: Option<(f32, f32)>,
+    pub cull_face: Option<u32>,
+    pub front_face: Option<u32>,
+    pub line_width: Option<f32>,
+    pub polygon_offset: Option<(f32, f32)>,
+    pub unpack_alignment: Option<i32>,
+    pub pack_alignment: Option<i32>,
+    /// Currently bound VAO (`None` = default vao 0).
+    pub bound_vao: Option<u32>,
+    /// Per-program uniform value cache.  Keys are `glGetUniformLocation`
+    /// values (u32, stored as the location-index returned to JS).
+    pub uniform_cache: HashMap<(ProgramId, u32), Box<[u8]>>,
 }
 
 impl Default for CanvasGLState {
@@ -95,6 +177,23 @@ impl Default for CanvasGLState {
             scissor: ScissorState::Disabled,
             last_scissor_rect: None,
             color_mask: (true, true, true, true),
+
+            enabled_caps: std::collections::HashSet::new(),
+            disabled_caps: std::collections::HashSet::new(),
+            blend_factors: None,
+            blend_equation: None,
+            blend_color: None,
+            depth_func: None,
+            depth_mask: None,
+            depth_range: None,
+            cull_face: None,
+            front_face: None,
+            line_width: None,
+            polygon_offset: None,
+            unpack_alignment: None,
+            pack_alignment: None,
+            bound_vao: None,
+            uniform_cache: HashMap::new(),
         }
     }
 }
@@ -149,6 +248,35 @@ pub(crate) struct FramebufferMeta {
 pub(crate) struct RenderbufferMeta {
     pub gl_handle: Option<NativeRenderbuffer>,
     #[allow(dead_code)]
+    pub owner_canvas: Option<CanvasId>,
+    pub deleted: bool,
+}
+
+/// WebGL 2 Vertex Array Object.  The owner canvas is tracked so that
+/// destroying a canvas also sweeps its VAOs — VAOs are not shared in
+/// the EGL share-group model WebGL uses.
+#[derive(Clone, Debug)]
+pub(crate) struct VaoMeta {
+    pub gl_handle: Option<NativeVertexArray>,
+    #[allow(dead_code)]
+    pub owner_canvas: Option<CanvasId>,
+    pub deleted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SamplerMeta {
+    pub gl_handle: Option<NativeSampler>,
+    #[allow(dead_code)]
+    pub owner_canvas: Option<CanvasId>,
+    pub deleted: bool,
+}
+
+/// Fence sync.  Unlike other GL objects, these are owned by a specific
+/// GL context (no sharing across contexts); we note the owner canvas so
+/// `ClientWaitSync` can rebind before polling.
+#[derive(Clone, Debug)]
+pub(crate) struct SyncMeta {
+    pub gl_handle: Option<NativeFence>,
     pub owner_canvas: Option<CanvasId>,
     pub deleted: bool,
 }

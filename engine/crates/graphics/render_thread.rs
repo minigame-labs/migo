@@ -3,13 +3,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
+    canvas2d_dispatcher::Renderer2d,
     damage_effect::DamageEffect,
     dirty_region,
     frame_scheduler::FrameScheduler,
-    global_fonts_mut, onscreen_window_from_surface,
+    onscreen_window_from_surface,
     render_server::RenderServer,
     surface_system::SurfaceSystem,
-    CanvasHandler, CanvasManager, FontData, Renderer2d, RendererGL,
+    CanvasHandler, CanvasManager, RendererGL,
 };
 use crossbeam_channel::{select, tick, Receiver};
 use glow::HasContext;
@@ -92,8 +93,8 @@ fn execute_canvas_batch(
     renderer_2d: &mut Renderer2d,
     payload: CanvasBatchPayload,
 ) -> bool {
+    use crate::canvas2d_dispatcher::classify_draw_damage;
     use crate::damage_effect::DamageEffect;
-    use crate::renderer2d::handler::classify_draw_damage;
 
     let canvas_id = payload.canvas_id;
     let commands = payload.commands;
@@ -105,10 +106,10 @@ fn execute_canvas_batch(
     // transform or active shadow, the JS-side dirty hint may underestimate
     // the actual draw area. Discard it to prevent scissor from clipping.
     let dirty_rect = {
-        use crate::renderer2d::handler::state_allows_partial;
+        use crate::canvas2d_dispatcher::state_allows_partial;
         let state_safe = cm
             .get_2d_context_mut(canvas_id)
-            .map(|ctx| state_allows_partial(&ctx.state))
+            .map(|ctx| state_allows_partial(&ctx.renderer.state))
             .unwrap_or(true); // no context yet → no draws → hint is fine
         if state_safe {
             payload.dirty_rect
@@ -147,7 +148,7 @@ fn execute_canvas_batch(
         // this is the authoritative damage source, not the JS-side hint.
         let damage = if is_onscreen {
             cm.get_2d_context_mut(canvas_id)
-                .map(|ctx| classify_draw_damage(&cmd, &ctx.state))
+                .map(|ctx| classify_draw_damage(&cmd, &ctx.renderer.state))
                 .unwrap_or(DamageEffect::NoDamage)
         } else {
             DamageEffect::NoDamage
@@ -271,11 +272,14 @@ fn execute_frame_packet(
         match op {
             FrameOp::BeginFrame | FrameOp::Present => {}
             FrameOp::Materialize { canvas_id } => {
-                // Flush femtovg so subsequent GL ops see Canvas2D results.
+                // Flush Skia so subsequent GL ops see Canvas2D results.
                 // Also clear dirty_2d to prevent double-flush at present time.
                 if cm.make_current_needed(canvas_id).is_ok() {
                     if let Ok(ctx) = cm.get_2d_context_mut(canvas_id) {
-                        ctx.flush();
+                        ctx.flush_and_submit();
+                        // Tell Skia to drop its cached GL tracking so the
+                        // following WebGL batch starts from a clean slate.
+                        ctx.reset_gl_state();
                     }
                     renderer_2d.clear_dirty_layer(canvas_id);
                     cm.clear_2d_dirty(canvas_id);
@@ -976,42 +980,36 @@ impl RenderThread {
                         }
 
                         RenderCommand::LoadFont { key, bytes, resp } => {
-                            // 1) Insert into global font store.
-                            let data = FontData {
-                                name: key.clone(),
-                                bytes,
-                            };
-                            global_fonts_mut().insert(&key, data.clone());
-
-                            // 2) Register in all existing canvas FontManagers.
-                            for (_cid, ctx2d) in cm.contexts_2d_iter_mut() {
-                                ctx2d.font_manager.register_font(&mut ctx2d.canvas, &key, &data);
+                            // Single shared TextContext owns all custom
+                            // typefaces; Skia's TypefaceFontProvider resolves
+                            // family lookups for every canvas on the fly.
+                            if renderer_2d.text.register_family(&key, &bytes) {
+                                info!("RenderThread: loaded font '{}' ({} bytes)", key, bytes.len());
+                                resp.ok(key);
+                            } else {
+                                warn!("RenderThread: failed to parse font '{}' ({} bytes)", key, bytes.len());
+                                resp.err_msg(format!("font '{key}' rejected: invalid typeface data"));
                             }
-
-                            info!("RenderThread: loaded font '{}'", key);
-                            resp.ok(key);
                         }
 
                         RenderCommand::GetTextLineHeight { font_family, font_size, bold, italic, resp } => {
-                            // Find any 2D context to measure with.
-                            let result: f32 = if let Some((_cid, ctx2d)) = cm.contexts_2d_iter_mut().next() {
-                                // Resolve font id for the requested family/style.
-                                let font_id = ctx2d.font_manager.resolve_font_id(&font_family, bold, italic)
-                                    .or_else(|| ctx2d.font_manager.default_font_id());
-
-                                if let Some(fid) = font_id {
-                                    let mut paint = femtovg::Paint::color(femtovg::Color::black());
-                                    paint.set_font(&[fid]);
-                                    paint.set_font_size(font_size);
-                                    match ctx2d.canvas.measure_font(&paint) {
-                                        Ok(fm) => fm.ascender() - fm.descender(),
-                                        Err(_) => font_size * 1.2,
-                                    }
-                                } else {
-                                    font_size * 1.2
-                                }
+                            use crate::backend::gl::state::TextAttrs;
+                            use shared::protocol::render_cmd::{TextAlign, TextBaseline};
+                            let attrs = TextAttrs {
+                                size: font_size,
+                                families: vec![font_family, "sans-serif".into()],
+                                weight: if bold { 700 } else { 400 },
+                                italic,
+                                align: TextAlign::Start,
+                                baseline: TextBaseline::Alphabetic,
+                            };
+                            // Empty-string layout still reports line metrics.
+                            let m = renderer_2d.text.measure_text(" ", &attrs);
+                            let line_height = m.font_bounding_box_ascent
+                                + m.font_bounding_box_descent;
+                            let result = if line_height > 0.0 {
+                                line_height
                             } else {
-                                // No canvas available, use common approximation.
                                 font_size * 1.2
                             };
                             resp.ok(result);
@@ -1097,7 +1095,7 @@ impl RenderThread {
                             .and_then(|s| s.viewport)
                             .unwrap_or((0, 0, canvas_w as i32, canvas_h as i32));
                         // Declare damage region BEFORE any onscreen rendering
-                        // (femtovg flush, DrawingBuffer blit). Per EGL_KHR_partial_update
+                        // (Skia flush_and_submit, DrawingBuffer blit). Per EGL_KHR_partial_update
                         // spec, the declaration must precede GL draws to the main
                         // framebuffer so the driver can skip loading unchanged tiles.
                         cm.declare_frame_damage(onscreen_id);

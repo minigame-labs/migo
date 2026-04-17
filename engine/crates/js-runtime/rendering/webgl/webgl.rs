@@ -1795,3 +1795,358 @@ pub fn op_hint(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32, #
         },
     );
 }
+
+// ---------------------------------------------------------------------------
+// WebGL 2.0 / GLES 3.0 additions
+//
+// Each op mirrors a single entry in GLCmd (see shared/protocol/render_cmd.rs).
+// Fire-and-forget ops route through `queue_gl_fire_and_forget` so the
+// UnifiedFrameCollector can batch them into the frame packet.  Sync ops
+// (getUniformBlockIndex, clientWaitSync) call `send_gl_sync_with_flush`
+// so any pending batch is materialised before the reply is waited on.
+// ---------------------------------------------------------------------------
+
+#[op2(fast)]
+pub fn op_create_vertex_array(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CreateVertexArray { canvas_id, client_id },
+    );
+}
+
+#[op2(fast)]
+pub fn op_delete_vertex_array(state: &mut OpState, #[smi] vao: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::DeleteVertexArray { vao });
+}
+
+#[op2(fast)]
+pub fn op_bind_vertex_array(state: &mut OpState, #[smi] canvas_id: u32, #[smi] vao: u32) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BindVertexArray {
+            canvas_id,
+            vao: if vao == 0 { None } else { Some(vao) },
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_vertex_attrib_divisor(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] index: u32,
+    #[smi] divisor: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::VertexAttribDivisor {
+            canvas_id,
+            index,
+            divisor,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_draw_arrays_instanced(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] mode: u32,
+    #[smi] first: i32,
+    #[smi] count: i32,
+    #[smi] instance_count: i32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::DrawArraysInstanced {
+            canvas_id,
+            mode,
+            first,
+            count,
+            instance_count,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_draw_elements_instanced(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] mode: u32,
+    #[smi] count: i32,
+    #[smi] index_type: u32,
+    #[smi] offset: i32,
+    #[smi] instance_count: i32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::DrawElementsInstanced {
+            canvas_id,
+            mode,
+            count,
+            index_type,
+            offset,
+            instance_count,
+        },
+    );
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_get_uniform_block_index(
+    state: &mut OpState,
+    #[smi] program_id: u32,
+    #[string] name: String,
+) -> u32 {
+    send_gl_sync_with_flush(state, |resp| {
+        RenderCommand::GL(GLCmd::GetUniformBlockIndex { program_id, name, resp })
+    })
+    .unwrap_or(u32::MAX)
+}
+
+#[op2(fast)]
+pub fn op_uniform_block_binding(
+    state: &mut OpState,
+    #[smi] program_id: u32,
+    #[smi] uniform_block_index: u32,
+    #[smi] uniform_block_binding: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::UniformBlockBinding {
+            program_id,
+            uniform_block_index,
+            uniform_block_binding,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_bind_buffer_base(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] index: u32,
+    #[smi] buffer: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BindBufferBase {
+            canvas_id,
+            target,
+            index,
+            buffer: if buffer == 0 { None } else { Some(buffer) },
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_bind_buffer_range(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] index: u32,
+    #[smi] buffer: u32,
+    #[smi] offset: i32,
+    #[smi] size: i32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BindBufferRange {
+            canvas_id,
+            target,
+            index,
+            buffer: if buffer == 0 { None } else { Some(buffer) },
+            offset,
+            size,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_tex_storage_2d(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] levels: i32,
+    #[smi] internal_format: u32,
+    #[smi] width: i32,
+    #[smi] height: i32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexStorage2D {
+            canvas_id,
+            target,
+            levels,
+            internal_format,
+            width,
+            height,
+        },
+    );
+}
+
+#[op2(fast)]
+#[allow(clippy::too_many_arguments)]
+pub fn op_blit_framebuffer(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] src_x0: i32,
+    #[smi] src_y0: i32,
+    #[smi] src_x1: i32,
+    #[smi] src_y1: i32,
+    #[smi] dst_x0: i32,
+    #[smi] dst_y0: i32,
+    #[smi] dst_x1: i32,
+    #[smi] dst_y1: i32,
+    #[smi] mask: u32,
+    #[smi] filter: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BlitFramebuffer {
+            canvas_id,
+            src_x0,
+            src_y0,
+            src_x1,
+            src_y1,
+            dst_x0,
+            dst_y0,
+            dst_x1,
+            dst_y1,
+            mask,
+            filter,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_invalidate_framebuffer(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    // JS passes a `Uint32Array` directly.  `#[buffer(copy)]` copies the
+    // element view, yielding an owned Vec without bytemuck gymnastics.
+    #[buffer(copy)] attachments: Vec<u32>,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::InvalidateFramebuffer {
+            canvas_id,
+            target,
+            attachments,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_renderbuffer_storage_multisample(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] samples: i32,
+    #[smi] internal_format: u32,
+    #[smi] width: i32,
+    #[smi] height: i32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::RenderbufferStorageMultisample {
+            canvas_id,
+            target,
+            samples,
+            internal_format,
+            width,
+            height,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_create_sampler(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::CreateSampler { canvas_id, client_id });
+}
+
+#[op2(fast)]
+pub fn op_delete_sampler(state: &mut OpState, #[smi] sampler: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::DeleteSampler { sampler });
+}
+
+#[op2(fast)]
+pub fn op_bind_sampler(state: &mut OpState, #[smi] canvas_id: u32, #[smi] unit: u32, #[smi] sampler: u32) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BindSampler {
+            canvas_id,
+            unit,
+            sampler: if sampler == 0 { None } else { Some(sampler) },
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_sampler_parameteri(state: &mut OpState, #[smi] sampler: u32, #[smi] pname: u32, #[smi] param: i32) {
+    queue_gl_fire_and_forget(state, GLCmd::SamplerParameteri { sampler, pname, param });
+}
+
+#[op2(fast)]
+pub fn op_sampler_parameterf(state: &mut OpState, #[smi] sampler: u32, #[smi] pname: u32, param: f32) {
+    queue_gl_fire_and_forget(state, GLCmd::SamplerParameterf { sampler, pname, param });
+}
+
+#[op2(fast)]
+pub fn op_fence_sync(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32, #[smi] condition: u32, #[smi] flags: u32) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::FenceSync {
+            canvas_id,
+            client_id,
+            condition,
+            flags,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_delete_sync(state: &mut OpState, #[smi] sync: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::DeleteSync { sync });
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_client_wait_sync(
+    state: &mut OpState,
+    #[smi] sync: u32,
+    #[smi] flags: u32,
+    timeout_ns: f64,
+) -> u32 {
+    let timeout_ns = if timeout_ns.is_finite() && timeout_ns >= 0.0 {
+        timeout_ns as u64
+    } else {
+        0
+    };
+    send_gl_sync_with_flush(state, |resp| {
+        RenderCommand::GL(GLCmd::ClientWaitSync {
+            sync,
+            flags,
+            timeout_ns,
+            resp,
+        })
+    })
+    // WAIT_FAILED = 0x911D per GLES 3.0 spec.
+    .unwrap_or(0x911D)
+}
+
+#[op2(fast)]
+pub fn op_draw_buffers(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[buffer(copy)] buffers: Vec<u32>,
+) {
+    queue_gl_fire_and_forget(state, GLCmd::DrawBuffers { canvas_id, buffers });
+}
+
+#[op2(fast)]
+pub fn op_read_buffer(state: &mut OpState, #[smi] canvas_id: u32, #[smi] src: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::ReadBuffer { canvas_id, src });
+}

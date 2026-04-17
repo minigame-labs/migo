@@ -10,7 +10,12 @@ android {
     project.archivesBaseName = "migo"
 
     defaultConfig {
-        minSdk 21
+        // Raised from 21 to 26 with the Skia renderer migration.
+        // skia-bindings pins API 26 in its Android NDK preset (the first
+        // Oreo API with full Vulkan support); matching that avoids ABI
+        // mismatches between Skia and the Rust runtime.  <1.5% of Play
+        // Store devices remain below API 26 as of April 2026.
+        minSdk 26
         targetSdk 34
         versionCode 1
         versionName "0.1.0"

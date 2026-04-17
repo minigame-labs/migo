@@ -18,6 +18,15 @@ pub type TextureId = u32;
 pub type FramebufferId = u32;
 pub type RenderbufferId = u32;
 pub type Context2DId = u32;
+/// WebGL 2 Vertex Array Object id.  Also used by WebGL 1 games that opt
+/// into the `OES_vertex_array_object` extension — the underlying engine
+/// resource is the same.
+pub type VaoId = u32;
+/// WebGL 2 Sampler Object id (decouples filtering / wrap from the texture).
+pub type SamplerId = u32;
+/// WebGL 2 Fence Sync object.  Opaque handle into the render thread's
+/// `GLSyncRegistry`; the JS side never sees the underlying `GLsync`.
+pub type SyncId = u32;
 
 /// Protocol-wide Render result type.
 pub type RenderResult<T> = Result<T, EngineError>;
@@ -799,6 +808,178 @@ pub enum GLCmd {
         target: u32,
         mode: u32,
     },
+
+    // ========================================================================
+    // WebGL 2.0 additions (GLES 3.0 backed).
+    //
+    // The protocol keeps WebGL 1 and 2 commands in the same enum so the
+    // render-thread state tracker only has to look at one dispatch table.
+    // WebGL 1 games that opt into extensions (`OES_vertex_array_object`,
+    // `ANGLE_instanced_arrays`) end up emitting the same variants.
+    // ========================================================================
+
+    /// `createVertexArray()` — allocate a VAO.  The client-chosen id is
+    /// passed down (matching how buffers/textures are allocated) so the
+    /// op is fire-and-forget.
+    CreateVertexArray {
+        canvas_id: CanvasId,
+        client_id: VaoId,
+    },
+    DeleteVertexArray {
+        vao: VaoId,
+    },
+    /// `bindVertexArray(vao)` — passing `None` rebinds the default VAO.
+    BindVertexArray {
+        canvas_id: CanvasId,
+        vao: Option<VaoId>,
+    },
+
+    // Instanced drawing — native in WebGL 2, extension-backed in WebGL 1.
+    VertexAttribDivisor {
+        canvas_id: CanvasId,
+        index: u32,
+        divisor: u32,
+    },
+    DrawArraysInstanced {
+        canvas_id: CanvasId,
+        mode: u32,
+        first: i32,
+        count: i32,
+        instance_count: i32,
+    },
+    DrawElementsInstanced {
+        canvas_id: CanvasId,
+        mode: u32,
+        count: i32,
+        index_type: u32,
+        offset: i32,
+        instance_count: i32,
+    },
+
+    // Uniform Buffer Objects.
+    /// `getUniformBlockIndex(program, name)` — replies with the block index
+    /// (or `u32::MAX` for `GL_INVALID_INDEX`).
+    GetUniformBlockIndex {
+        program_id: ProgramId,
+        name: String,
+        resp: RenderCmdResp<u32>,
+    },
+    UniformBlockBinding {
+        program_id: ProgramId,
+        uniform_block_index: u32,
+        uniform_block_binding: u32,
+    },
+    BindBufferBase {
+        canvas_id: CanvasId,
+        target: u32,
+        index: u32,
+        buffer: Option<BufferId>,
+    },
+    BindBufferRange {
+        canvas_id: CanvasId,
+        target: u32,
+        index: u32,
+        buffer: Option<BufferId>,
+        offset: i32,
+        size: i32,
+    },
+
+    // Immutable texture storage (faster than `texImage2D` chains).
+    TexStorage2D {
+        canvas_id: CanvasId,
+        target: u32,
+        levels: i32,
+        internal_format: u32,
+        width: i32,
+        height: i32,
+    },
+
+    // Framebuffer ops.
+    /// `blitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter)`.
+    BlitFramebuffer {
+        canvas_id: CanvasId,
+        src_x0: i32,
+        src_y0: i32,
+        src_x1: i32,
+        src_y1: i32,
+        dst_x0: i32,
+        dst_y0: i32,
+        dst_x1: i32,
+        dst_y1: i32,
+        mask: u32,
+        filter: u32,
+    },
+    /// `invalidateFramebuffer(target, attachments)` — tells the tiled GPU
+    /// it can drop the contents of the listed attachments without writeback.
+    InvalidateFramebuffer {
+        canvas_id: CanvasId,
+        target: u32,
+        attachments: Vec<u32>,
+    },
+    RenderbufferStorageMultisample {
+        canvas_id: CanvasId,
+        target: u32,
+        samples: i32,
+        internal_format: u32,
+        width: i32,
+        height: i32,
+    },
+
+    // Sampler objects.
+    CreateSampler {
+        canvas_id: CanvasId,
+        client_id: SamplerId,
+    },
+    DeleteSampler {
+        sampler: SamplerId,
+    },
+    BindSampler {
+        canvas_id: CanvasId,
+        unit: u32,
+        sampler: Option<SamplerId>,
+    },
+    SamplerParameteri {
+        sampler: SamplerId,
+        pname: u32,
+        param: i32,
+    },
+    SamplerParameterf {
+        sampler: SamplerId,
+        pname: u32,
+        param: f32,
+    },
+
+    // Sync objects — used for non-blocking readPixels / transfer-complete
+    // probing.  The engine assigns a SyncId; the Rust side owns the raw
+    // GLsync handle and never exposes it to JS.
+    FenceSync {
+        canvas_id: CanvasId,
+        client_id: SyncId,
+        condition: u32,
+        flags: u32,
+    },
+    DeleteSync {
+        sync: SyncId,
+    },
+    /// `clientWaitSync(sync, flags, timeout_ns)` — returns one of the
+    /// `GL_ALREADY_SIGNALED`, `GL_CONDITION_SATISFIED`, `GL_TIMEOUT_EXPIRED`,
+    /// or `GL_WAIT_FAILED` enums.
+    ClientWaitSync {
+        sync: SyncId,
+        flags: u32,
+        timeout_ns: u64,
+        resp: RenderCmdResp<u32>,
+    },
+
+    // Draw-buffer selection (FBO multiple-render-targets).
+    DrawBuffers {
+        canvas_id: CanvasId,
+        buffers: Vec<u32>,
+    },
+    ReadBuffer {
+        canvas_id: CanvasId,
+        src: u32,
+    },
 }
 
 /// Text horizontal alignment for fillText/strokeText.
@@ -1091,7 +1272,7 @@ pub enum Canvas2DCmd {
 }
 
 /// A single color stop for a linear/radial gradient.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GradientStop {
     pub offset: f32,
     pub color: Color,

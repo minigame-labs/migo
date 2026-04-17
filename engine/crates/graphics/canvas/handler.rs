@@ -111,13 +111,13 @@ impl CanvasHandler {
                         // For Critical priority: always sync upload (don't defer).
                         // For Normal/Background: try async upload thread, fall back to sync.
                         if priority == ImagePriority::Critical {
-                            let res = cm.load_shared_fv_image(image_id, rgba_image);
+                            let res = cm.load_shared_image(image_id, rgba_image);
                             let _ = resp.send(res);
                         } else {
                             match cm.submit_async_upload(image_id, &rgba_image, resp) {
                                 Ok(()) => {}
                                 Err(resp) => {
-                                    let res = cm.load_shared_fv_image(image_id, rgba_image);
+                                    let res = cm.load_shared_image(image_id, rgba_image);
                                     let _ = resp.send(res);
                                 }
                             }
@@ -128,7 +128,7 @@ impl CanvasHandler {
 
             CanvasCmd::DestroyImage { image_id } => {
                 cm.cancel_pending_load(image_id);
-                let _ = cm.destroy_shared_fv_image(image_id);
+                let _ = cm.destroy_shared_image(image_id);
             }
 
             _ => {}

@@ -3,11 +3,18 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
+# Host (x86_64-unknown-linux-gnu) — used by `cargo test` and dev builds
+# -----------------------------------------------------------------------------
+# Adds ~/.local/lib to the linker search path so rust-lld can find
+# libfontconfig / libfreetype / libEGL via symlinks created by
+# scripts/dev-setup-skia.sh.  On CI hosts with the corresponding -dev
+# packages installed, this directory is simply empty and harmless.
+# -----------------------------------------------------------------------------
 # ARM64 (aarch64) - Most modern Android devices
 # -----------------------------------------------------------------------------
 [target.aarch64-linux-android]
 ar = "aarch64-linux-android-ar"
-linker = "aarch64-linux-android23-clang"
+linker = "aarch64-linux-android26-clang"
 rustflags = [
   # Basic strip (equivalent to -s)
   "-C", "link-arg=-s",
@@ -15,8 +22,17 @@ rustflags = [
   # Garbage collection of unused sections
   "-C", "link-arg=-Wl,--gc-sections",
   
-  # Static link C++ stdlib to avoid runtime dependency issues
-  "-C", "link-arg=-static-libstdc++",
+  # Dynamically link libc++ (libc++_shared.so is shipped in jniLibs).
+  # Skia-bindings and rusty_v8 both embed parts of the C++ runtime;
+  # `-static-libstdc++` triggers duplicate-symbol errors for several
+  # std::* classes (`runtime_error`, `exception`, `locale::id`, ...).
+  # The dynamic path matches scripts/build-android-so.sh copying
+  # libc++_shared.so into jniLibs/.
+  #
+  # Tolerate the handful of std::* symbols that are defined in both
+  # V8's and Skia's archives; the linker picks the first definition,
+  # which is safe because all archives use the same NDK libc++ ABI.
+  "-C", "link-arg=-Wl,--allow-multiple-definition",
   
   # Use LLD linker for better optimization (if available)
   "-C", "link-arg=-fuse-ld=lld",
@@ -55,11 +71,11 @@ rustflags = [
 # -----------------------------------------------------------------------------
 [target.x86_64-linux-android]
 ar = "x86_64-linux-android-ar"
-linker = "x86_64-linux-android23-clang"
+linker = "x86_64-linux-android26-clang"
 rustflags = [
   "-C", "link-arg=-s",
   "-C", "link-arg=-Wl,--gc-sections",
-  "-C", "link-arg=-static-libstdc++",
+  "-C", "link-arg=-Wl,--allow-multiple-definition",
   "-C", "link-arg=-fuse-ld=lld",
   "-C", "link-arg=-Wl,--icf=all",
   "-C", "link-arg=-Wl,--hash-style=gnu",
@@ -84,11 +100,11 @@ rustflags = [
 # -----------------------------------------------------------------------------
 [target.armv7-linux-androideabi]
 ar = "arm-linux-androideabi-ar"
-linker = "armv7a-linux-androideabi23-clang"
+linker = "armv7a-linux-androideabi26-clang"
 rustflags = [
   "-C", "link-arg=-s",
   "-C", "link-arg=-Wl,--gc-sections",
-  "-C", "link-arg=-static-libstdc++",
+  "-C", "link-arg=-Wl,--allow-multiple-definition",
   "-C", "link-arg=-fuse-ld=lld",
   "-C", "link-arg=-Wl,--icf=all",
   "-C", "link-arg=-Wl,--hash-style=gnu",
@@ -132,3 +148,23 @@ rustflags = [
 # CARGO_PROFILE_RELEASE_LTO = "fat"
 # CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1"
 # CARGO_PROFILE_RELEASE_OPT_LEVEL = "z"
+
+# ---- Skia GN build arguments ----------------------------------------------
+# Disable fontconfig on Linux (we ship SkFontMgr_Android on device and a
+# TypefaceFontProvider with bundled fonts for headless tests). This avoids
+# the system libfontconfig-dev dependency.
+SKIA_GN_ARGS = "skia_use_fontconfig=false skia_enable_fontmgr_fontconfig=false"
+
+# On WSL / Ubuntu hosts, Skia's C++20 consteval usage in src/base/SkTime.cpp
+# does not compile with clang-12 against the GCC-13 libstdc++ shipped by
+# Ubuntu 24.04 (see Skia bug 353527181).  Force a newer clang explicitly;
+# the Android NDK still uses its own bundled clang for cross-compile.
+# These defaults are overridden by environment variables if set.
+CC = "clang-18"
+CXX = "clang++-18"
+
+# Khronos EGL/GL/GLES headers for Skia's GL EGL interface are expected in the
+# environment via CPATH.  On WSL / minimal Ubuntu hosts without root access,
+# run `scripts/dev-setup-skia.sh` once to fetch them to ~/.local/skia-headers
+# and to export CPATH.  On machines with `libegl1-mesa-dev` installed, no
+# extra setup is required.

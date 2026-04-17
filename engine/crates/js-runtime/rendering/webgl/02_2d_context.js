@@ -84,11 +84,20 @@ const TEXT_BASELINE_MAP = {
     'alphabetic': 3, 'ideographic': 4, 'bottom': 5,
 };
 
-// Composite operation names matching femtovg::CompositeOperation order.
+// Composite operation names indexed to stable u8 opcodes consumed by the
+// Rust render thread.  The first 11 entries preserve the legacy numbering
+// (so pre-existing bytecode keeps the same behaviour); entries 11..25 are
+// the advanced / non-separable modes added with the Skia migration.
+// See engine/crates/graphics/backend/gl/blend_mode.rs for the canonical
+// table.
 const _COMPOSITE_OPS = [
     'source-over', 'source-in', 'source-out', 'source-atop',
     'destination-over', 'destination-in', 'destination-out', 'destination-atop',
     'lighter', 'copy', 'xor',
+    'multiply', 'screen', 'overlay', 'darken', 'lighten',
+    'color-dodge', 'color-burn', 'hard-light', 'soft-light',
+    'difference', 'exclusion',
+    'hue', 'saturation', 'color', 'luminosity',
 ];
 
 // Gradient object returned by createLinearGradient / createRadialGradient.
@@ -725,10 +734,9 @@ class CanvasRenderingContext2D {
     }
 
     // ==================== Line Dash ====================
-    // Note: femtovg does not support native line dash. The state is tracked
-    // so getLineDash/lineDashOffset return correct values, but stroke
-    // rendering will draw solid lines until a path-subdivision dash
-    // implementation is added.
+    // Handled by the Rust render thread via Skia's `SkPathEffect::dash`
+    // (see engine/crates/graphics/backend/gl/paint.rs).  Odd-length dash
+    // arrays are doubled on the render side, matching the Canvas 2D spec.
     setLineDash(segments) {
         if (!Array.isArray(segments)) return;
         this._lineDash = segments.slice();
