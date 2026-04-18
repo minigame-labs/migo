@@ -270,6 +270,33 @@ build_platform() {
     # --------------------------------------------------------
     print_info "Building $platform ($target_triple) [$build_type]"
 
+    # Trim the bundled SQLite amalgamation to just the KV surface we
+    # need. libsqlite3-sys's build.rs already injects a default set
+    # of -DSQLITE_ENABLE_* (FTS3/FTS5/RTREE/JSON1/COLUMN_METADATA/…)
+    # that the Rust API relies on; we can't override those without
+    # forking. Everything below is a pure *subtraction* on top of
+    # that default — each flag has to be confirmed non-conflicting
+    # with the ENABLE_* set or the build fails at compile.
+    #
+    # `SQLITE_DQS=0` rejects MySQL-style double-quoted string
+    # literals (forces "foo" to mean identifier, not string), the
+    # modern recommended default.
+    # `SQLITE_LIKE_DOESNT_MATCH_BLOBS` tightens LIKE semantics and
+    # removes one corner-case code path we never use.
+    local sqlite_omit_flags=(
+        -DSQLITE_OMIT_LOAD_EXTENSION   # we never call .load_extension
+        -DSQLITE_OMIT_DEPRECATED
+        -DSQLITE_OMIT_AUTHORIZATION
+        -DSQLITE_OMIT_SHARED_CACHE     # we use one Connection per session
+        -DSQLITE_DQS=0
+        -DSQLITE_DEFAULT_MEMSTATUS=0   # skip internal memory accounting
+        -DSQLITE_LIKE_DOESNT_MATCH_BLOBS
+        -DSQLITE_MAX_EXPR_DEPTH=0      # disables the parser's depth limiter
+    )
+    # libsqlite3-sys reads this env var and passes it straight to the
+    # amalgamation compile.  Space-separated, no quoting needed.
+    export LIBSQLITE3_FLAGS="${sqlite_omit_flags[*]}"
+
     pushd "$CRATE_PATH" > /dev/null
 
     # NB: `if !` / `||` around a function disables bash's `set -e` inside

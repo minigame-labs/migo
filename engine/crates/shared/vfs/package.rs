@@ -291,6 +291,134 @@ impl<W: Write + Seek> PackageWriter<W> {
         })
     }
 
+    /// Streaming variant of [`Self::add_entry`].
+    ///
+    /// Reads the entry in chunks of at most `chunk_size` bytes and
+    /// writes each compressed chunk immediately, so the peak memory
+    /// footprint per entry is bounded by the chunk size (default
+    /// 64 KiB) instead of the uncompressed entry size. Use this when
+    /// the producer is itself a streaming source (zip entry, HTTP
+    /// response body) so the ingest path never materialises a 20 MiB
+    /// file as a 20 MiB `Vec<u8>`.
+    ///
+    /// `max_entry_bytes` caps the total bytes this call will accept;
+    /// an entry exceeding the cap returns `InvalidData` mid-stream
+    /// and the writer is marked poisoned — any previously-emitted
+    /// chunks in this call have already been flushed to the output
+    /// stream but the index will not mention this entry, so the
+    /// resulting package is truncated garbage and must be discarded.
+    /// Callers that want atomic-abort semantics should wrap the
+    /// writer in a tmp-file + rename (which [`ingest_zip_to_package`]
+    /// already does).
+    ///
+    /// CRC-32 is computed incrementally over the streamed bytes so
+    /// we don't need to buffer the full entry for integrity.
+    pub fn add_entry_streaming<R: std::io::Read>(
+        &mut self,
+        path: &str,
+        mut reader: R,
+        max_entry_bytes: u64,
+    ) -> Result<(), PackageError> {
+        if self.poisoned {
+            return Err(PackageError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                "writer poisoned: a previous write failed",
+            )));
+        }
+
+        let normalized = validate_entry_path(path)?;
+        if self.seen_paths.contains(&normalized) {
+            return Err(PackageError::InvalidEntryPath(format!(
+                "duplicate entry: {normalized}"
+            )));
+        }
+        let new_prefix = format!("{normalized}/");
+        for existing in &self.seen_paths {
+            if existing.starts_with(&new_prefix) {
+                return Err(PackageError::InvalidEntryPath(format!(
+                    "prefix conflict: '{normalized}' conflicts with '{existing}'"
+                )));
+            }
+            let existing_prefix = format!("{existing}/");
+            if normalized.starts_with(&existing_prefix) {
+                return Err(PackageError::InvalidEntryPath(format!(
+                    "prefix conflict: '{normalized}' conflicts with '{existing}'"
+                )));
+            }
+        }
+
+        let cs = self.chunk_size as usize;
+        let first_chunk = self.chunks.len() as u32;
+        let mut hasher = crc32fast::Hasher::new();
+        let mut total_bytes: u64 = 0;
+        let mut chunk_buf: Vec<u8> = Vec::with_capacity(cs);
+
+        loop {
+            // Fill `chunk_buf` up to `cs` bytes or until EOF.
+            chunk_buf.clear();
+            let mut remaining = cs;
+            while remaining > 0 {
+                // Read into a small stack buffer then extend the
+                // chunk. Going via a small stack buffer keeps the
+                // peak allocator footprint at `cs` + O(1) instead
+                // of doubling the chunk buffer's capacity.
+                let mut tmp = [0u8; 8192];
+                let want = tmp.len().min(remaining);
+                let n = reader.read(&mut tmp[..want]).map_err(PackageError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                chunk_buf.extend_from_slice(&tmp[..n]);
+                remaining -= n;
+            }
+            if chunk_buf.is_empty() {
+                break; // EOF
+            }
+
+            total_bytes = total_bytes.saturating_add(chunk_buf.len() as u64);
+            if total_bytes > max_entry_bytes {
+                self.poisoned = true;
+                return Err(PackageError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "streaming entry '{}' exceeds max_entry_bytes limit {}",
+                        normalized, max_entry_bytes
+                    ),
+                )));
+            }
+            hasher.update(&chunk_buf);
+
+            let raw_size = chunk_buf.len() as u32;
+            let compressed = zstd::bulk::compress(&chunk_buf, ZSTD_LEVEL).map_err(|e| {
+                PackageError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("zstd compress: {e}"),
+                ))
+            })?;
+            if let Err(e) = self.writer.write_all(&compressed) {
+                self.poisoned = true;
+                return Err(PackageError::Io(e));
+            }
+            self.chunks.push(ChunkEntry {
+                data_offset: self.data_pos,
+                compressed_size: compressed.len() as u32,
+                raw_size,
+            });
+            self.data_pos += compressed.len() as u64;
+        }
+
+        let chunk_count = self.chunks.len() as u32 - first_chunk;
+        self.seen_paths.insert(normalized.clone());
+        self.entries.push(EntryMeta {
+            path: normalized,
+            raw_size: total_bytes,
+            crc32: hasher.finalize(),
+            first_chunk,
+            chunk_count,
+        });
+        Ok(())
+    }
+
     /// Add a file entry, splitting into zstd-compressed chunks.
     pub fn add_entry(
         &mut self,
@@ -885,6 +1013,91 @@ mod tests {
         }
         let r = PackageReader::open(&p, "test", "1.0").unwrap();
         assert_eq!(r.read_entry("big.bin").unwrap(), content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Contract test for [`PackageWriter::add_entry_streaming`]:
+    /// result must be **byte-identical** to the non-streaming
+    /// `add_entry` path given the same input bytes.
+    #[test]
+    fn streaming_add_matches_buffered_add_bit_for_bit() {
+        let dir = make_test_dir("stream_vs_buffered");
+        let p_stream = dir.join("stream.mpkg");
+        let p_buffer = dir.join("buffer.mpkg");
+
+        // ~140 KB -> crosses default 64 KiB chunk boundary at least once.
+        let content: Vec<u8> = (0..140_000u32)
+            .map(|i| i.wrapping_mul(2654435761) as u8)
+            .collect();
+
+        {
+            let f = std::fs::File::create(&p_stream).unwrap();
+            let mut w = PackageWriter::new(io::BufWriter::new(f)).unwrap();
+            // Wrap in a Cursor so the reader has an owned source.
+            let src = std::io::Cursor::new(content.clone());
+            w.add_entry_streaming("big.bin", src, u64::MAX).unwrap();
+            w.finish("test", "1.0").unwrap();
+        }
+        {
+            let f = std::fs::File::create(&p_buffer).unwrap();
+            let mut w = PackageWriter::new(io::BufWriter::new(f)).unwrap();
+            w.add_entry("big.bin", &content).unwrap();
+            w.finish("test", "1.0").unwrap();
+        }
+
+        let r_stream = PackageReader::open(&p_stream, "test", "1.0").unwrap();
+        let r_buffer = PackageReader::open(&p_buffer, "test", "1.0").unwrap();
+        let s_bytes = r_stream.read_entry("big.bin").unwrap();
+        let b_bytes = r_buffer.read_entry("big.bin").unwrap();
+        assert_eq!(s_bytes, content, "streaming entry content mismatch");
+        assert_eq!(b_bytes, content, "buffered entry content mismatch");
+        assert_eq!(s_bytes, b_bytes, "streaming vs buffered differ");
+
+        // Bonus: exercise cross-chunk random access on the streamed
+        // package to prove the chunk index is well-formed.
+        let middle = r_stream
+            .read_range("big.bin", 60_000, Some(40_000))
+            .unwrap();
+        assert_eq!(middle, &content[60_000..100_000]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn streaming_add_rejects_oversized_entry_midstream() {
+        let dir = make_test_dir("stream_limit");
+        let p = dir.join("test.mpkg");
+        let content: Vec<u8> = vec![0xAA; 130_000];
+
+        let f = std::fs::File::create(&p).unwrap();
+        let mut w = PackageWriter::new(io::BufWriter::new(f)).unwrap();
+        let src = std::io::Cursor::new(content);
+        let err = w
+            .add_entry_streaming("big.bin", src, 64_000)
+            .expect_err("must reject once past the cap");
+        // Must be an IO/InvalidData-flavoured error.
+        assert!(
+            matches!(err, PackageError::Io(_)),
+            "wrong error variant: {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn streaming_add_empty_source_writes_zero_byte_entry() {
+        let dir = make_test_dir("stream_empty");
+        let p = dir.join("test.mpkg");
+        {
+            let f = std::fs::File::create(&p).unwrap();
+            let mut w = PackageWriter::new(io::BufWriter::new(f)).unwrap();
+            let src: &[u8] = &[];
+            w.add_entry_streaming("empty.bin", src, u64::MAX).unwrap();
+            w.finish("test", "1.0").unwrap();
+        }
+        let r = PackageReader::open(&p, "test", "1.0").unwrap();
+        let bytes = r.read_entry("empty.bin").unwrap();
+        assert!(bytes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

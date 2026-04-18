@@ -351,10 +351,29 @@ impl Canvas2DContext {
     /// Resize after a surface change (window resize / orientation).  We
     /// rebuild the backing `SkSurface` because the FBO dimensions and
     /// possibly the underlying attachment handle changed.
-    pub fn resize(&mut self, fbo_id: u32, width: u32, height: u32) -> bool {
+    ///
+    /// `image_store` is a hole for purging the SkImage wrapper cache
+    /// this context previously populated.  The wrappers are bound to
+    /// the *old* `GrDirectContext`; once we swap in a new one they're
+    /// stale — continuing to hand them out would produce undefined
+    /// rendering on the next `drawImage` / pattern lookup.  To avoid
+    /// the GrContext-identity trap we also allocate a fresh `ctx_tag`,
+    /// so any wrapper entry the purge missed (e.g. re-entrant callers)
+    /// becomes unreachable via the new cache key.
+    pub fn resize(
+        &mut self,
+        fbo_id: u32,
+        width: u32,
+        height: u32,
+        image_store: &mut ImageStore,
+    ) -> bool {
         let Some(new_self) = Self::new(fbo_id, width, height, self.kind) else {
             return false;
         };
+        // Drop every SkImage wrapper this context produced: they hold
+        // a `GrDirectContext` pointer that's about to be dropped, and
+        // reusing them post-swap is undefined behaviour inside Skia.
+        image_store.purge_wrappers_for_context(self.ctx_tag);
         // Preserve the state-machine state so JS-side style / transform
         // persist across a resize.  Path + CTM + clip are canvas-local
         // and must reset (matches browser behaviour: writing to
@@ -364,6 +383,10 @@ impl Canvas2DContext {
         self.fbo_id = fbo_id;
         self.width = width;
         self.height = height;
+        // Fresh ctx_tag: guarantees the next `resolve_cached_or_wrap`
+        // call cannot collide with any residual wrapper from the
+        // previous GrDirectContext.
+        self.ctx_tag = new_self.ctx_tag;
         self.renderer.reset();
         true
     }

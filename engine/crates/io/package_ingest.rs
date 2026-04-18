@@ -71,6 +71,10 @@ pub fn ingest_zip_to_package(
                 continue;
             }
 
+            // Reject up-front on the advertised (uncompressed) size;
+            // the streaming reader below also enforces it, but a
+            // cheap header-time check lets us fail fast without
+            // paying the inflate cost of a 100 MiB entry.
             let entry_size = entry.size();
             if entry_size > MAX_READ_LENGTH {
                 return Err(PackageError::Io(std::io::Error::new(
@@ -79,24 +83,12 @@ pub fn ingest_zip_to_package(
                 )));
             }
 
-            let mut data = Vec::new();
-            let mut buf = [0u8; 8192];
-            loop {
-                let n = entry.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                let next_len = data.len().saturating_add(n);
-                if next_len as u64 > MAX_READ_LENGTH {
-                    return Err(PackageError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("zip entry '{}' exceeds limit {}", name, MAX_READ_LENGTH),
-                    )));
-                }
-                data.extend_from_slice(&buf[..n]);
-            }
-
-            writer.add_entry(&name, &data)?;
+            // Streaming add: the zip `entry` is itself a `Read`
+            // source, so we never materialise the uncompressed
+            // bytes as a single `Vec<u8>`. Peak memory per entry
+            // is bounded by the package writer's chunk size
+            // (default 64 KiB).
+            writer.add_entry_streaming(&name, &mut entry, MAX_READ_LENGTH)?;
         }
 
         writer.finish(package_name, package_version)

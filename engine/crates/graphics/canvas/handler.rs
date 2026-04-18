@@ -107,9 +107,35 @@ impl CanvasHandler {
                         let res = cm.load_compressed_image(image_id, &compressed);
                         let _ = resp.send(res);
                     }
+                    DecodedImage::HardwareBuffer(ahb_image) => {
+                        // Zero-copy: the decoder wrote directly into
+                        // this AHB; we hand it to EGLImage without
+                        // another memcpy. `load_ahb_image` itself
+                        // contains the fallback to a CPU round-trip
+                        // when the device lacks AHB support.
+                        //
+                        // Priority is effectively "always critical"
+                        // because the AHB path is already the
+                        // lowest-latency option we have — async
+                        // upload via PBO can't beat a direct
+                        // `glEGLImageTargetTexture2DOES`.
+                        let _ = priority;
+                        let res = cm.load_ahb_image(image_id, ahb_image);
+                        let _ = resp.send(res);
+                    }
                     DecodedImage::Rgba(rgba_image) => {
                         // For Critical priority: always sync upload (don't defer).
-                        // For Normal/Background: try async upload thread, fall back to sync.
+                        // For Normal/Background: try async upload thread.
+                        // On budget rejection (healthy upload thread,
+                        // temporary squeeze) the request is deferred
+                        // to next frame instead of falling back to a
+                        // synchronous `glTexImage2D` on the render
+                        // thread -- the sync path was the exact
+                        // frame spike the async thread was meant to
+                        // avoid.  The sync fallback is reserved for
+                        // permanent degradation (no upload thread,
+                        // or upload thread reported unrecoverable
+                        // failure) where waiting can't help.
                         if priority == ImagePriority::Critical {
                             let res = cm.load_shared_image(image_id, rgba_image);
                             let _ = resp.send(res);
@@ -117,8 +143,27 @@ impl CanvasHandler {
                             match cm.submit_async_upload(image_id, &rgba_image, resp) {
                                 Ok(()) => {}
                                 Err(resp) => {
-                                    let res = cm.load_shared_image(image_id, rgba_image);
-                                    let _ = resp.send(res);
+                                    if cm.upload_thread_healthy() {
+                                        // Budget squeeze: queue for retry.
+                                        // If the deferred queue is
+                                        // already full (pathological
+                                        // burst), last-resort sync.
+                                        match cm.defer_upload(
+                                            image_id,
+                                            rgba_image.clone(),
+                                            resp,
+                                        ) {
+                                            Ok(()) => {}
+                                            Err((img, resp)) => {
+                                                let res = cm.load_shared_image(image_id, img);
+                                                let _ = resp.send(res);
+                                            }
+                                        }
+                                    } else {
+                                        // Upload thread degraded -- sync fallback.
+                                        let res = cm.load_shared_image(image_id, rgba_image);
+                                        let _ = resp.send(res);
+                                    }
                                 }
                             }
                         }

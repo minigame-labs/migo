@@ -220,16 +220,103 @@ pub struct Canvas2DState {
     pub antialias: bool,
     /// Image-smoothing (bilinear) flag — affects `drawImage` when scaling.
     pub image_smoothing: bool,
-    /// `true` once a transform op (`rotate` / non-uniform `scale` /
-    /// `setTransform` / non-axis-aligned matrix) has moved the CTM
-    /// away from identity-or-translation.  Used by the damage
-    /// classifier: only axis-aligned transforms allow the tight
-    /// `OnscreenRect` damage fast path.  `Translate` alone does
-    /// NOT flip this flag — it just offsets the damage rect.
+    /// Current transformation matrix stored as the SVG-style 2x3
+    /// affine `[a, b, c, d, e, f]`:
     ///
-    /// Scoped per save-restore frame so a temporary `ctx.rotate()`
-    /// inside a `save/restore` doesn't poison subsequent frames.
-    pub ctm_non_axis_aligned: bool,
+    /// ```text
+    ///   | a  c  e |
+    ///   | b  d  f |   ( third row = [0, 0, 1] implicit )
+    ///   | 0  0  1 |
+    /// ```
+    ///
+    /// Maintained in parallel with `SkCanvas`'s own CTM so the
+    /// damage classifier (`canvas2d_dispatcher::classify_draw_damage`)
+    /// can transform rectangles from object space to device space
+    /// WITHOUT cracking open the Skia canvas handle.  Values are
+    /// kept in sync by the transform handlers in `canvas.rs`; any
+    /// divergence is a bug.
+    ///
+    /// `ctm_is_axis_aligned()` replaces the previous sticky
+    /// `ctm_non_axis_aligned` boolean so `setTransform(1,0,0,1,0,0)`
+    /// after a `rotate()` correctly re-enables the partial-damage
+    /// fast path.
+    pub ctm: [f32; 6],
+}
+
+/// Identity matrix constant.
+pub const CTM_IDENTITY: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+impl Canvas2DState {
+    /// Axis-aligned CTM shear test — `b` and `c` (the off-diagonal
+    /// components) must both be zero for a rect's bounding box to
+    /// remain a rect after transform.  Uses a small epsilon so
+    /// floating-point drift in long transform chains doesn't
+    /// accidentally lose the fast path.
+    #[inline]
+    pub fn ctm_is_axis_aligned(&self) -> bool {
+        const EPS: f32 = 1e-6;
+        self.ctm[1].abs() < EPS && self.ctm[2].abs() < EPS
+    }
+
+    /// Pre-multiply the CTM by a 2x3 affine: `self.ctm = self.ctm * m`.
+    /// All Canvas 2D transform ops (`translate` / `rotate` / `scale`)
+    /// are post-concatenations in matrix terms — they apply to points
+    /// before the existing CTM — which is the same as pre-multiplying
+    /// the CTM by the op's matrix.
+    #[inline]
+    pub fn ctm_concat(&mut self, m: [f32; 6]) {
+        let [a, b, c, d, e, f] = self.ctm;
+        let [a2, b2, c2, d2, e2, f2] = m;
+        self.ctm = [
+            a * a2 + c * b2,
+            b * a2 + d * b2,
+            a * c2 + c * d2,
+            b * c2 + d * d2,
+            a * e2 + c * f2 + e,
+            b * e2 + d * f2 + f,
+        ];
+    }
+
+    /// Replace the CTM wholesale — semantics of `ctx.setTransform`.
+    #[inline]
+    pub fn ctm_set(&mut self, m: [f32; 6]) {
+        self.ctm = m;
+    }
+
+    /// Reset to identity — `ctx.resetTransform()` / `save`-less
+    /// `setTransform(1,0,0,1,0,0)`.
+    #[inline]
+    pub fn ctm_reset(&mut self) {
+        self.ctm = CTM_IDENTITY;
+    }
+
+    /// Transform an axis-aligned object-space rect into device-space
+    /// bounding box.  Caller MUST verify `ctm_is_axis_aligned()` first
+    /// — sheared / rotated matrices produce a parallelogram whose
+    /// bbox is strictly larger than naive per-corner min/max.
+    ///
+    /// Handles negative scale (reflection) correctly by taking min/max
+    /// after transform rather than assuming top-left.
+    ///
+    /// Returns `None` if any corner is non-finite (NaN / Inf CTM).
+    #[inline]
+    pub fn map_axis_aligned_rect(&self, x: f32, y: f32, w: f32, h: f32) -> Option<(f32, f32, f32, f32)> {
+        debug_assert!(
+            self.ctm_is_axis_aligned(),
+            "map_axis_aligned_rect called on non-axis-aligned CTM"
+        );
+        let [a, _, _, d, e, f] = self.ctm;
+        let x0 = a * x + e;
+        let y0 = d * y + f;
+        let x1 = a * (x + w) + e;
+        let y1 = d * (y + h) + f;
+        let (lx, rx) = (x0.min(x1), x0.max(x1));
+        let (ty, by) = (y0.min(y1), y0.max(y1));
+        if !(lx.is_finite() && rx.is_finite() && ty.is_finite() && by.is_finite()) {
+            return None;
+        }
+        Some((lx, ty, rx - lx, by - ty))
+    }
 }
 
 impl Default for Canvas2DState {
@@ -257,7 +344,7 @@ impl Default for Canvas2DState {
             text: TextAttrs::default(),
             antialias: true,
             image_smoothing: true,
-            ctm_non_axis_aligned: false,
+            ctm: CTM_IDENTITY,
         }
     }
 }
@@ -687,6 +774,70 @@ mod tests {
         } else {
             panic!("wrong kind after pop");
         }
+    }
+
+    // ---- P3-2 latent-COW evidence -----------------------------------
+
+    #[test]
+    fn deep_save_scales_heap_cost_by_arc_refcount_only() {
+        // Pin the P3-2 claim in the StateStack doc comment: for
+        // a 1000-deep save stack with identical state, the
+        // heap-backed Arc<Vec<_>> fields are SHARED, not deep-
+        // copied.  We observe this as `Arc::strong_count` growing
+        // linearly with depth — which means each push cost ONE
+        // refcount bump (atomic inc) rather than N bytes of vec
+        // cloning.  A future persistent-data-structure rewrite
+        // would turn every clone into O(1) cost; this test
+        // proves the *current* design is already within a small
+        // constant factor of that ideal, so the rewrite is
+        // correctly deferred.
+        let mut state = Canvas2DState::default();
+        state.line_dash = std::sync::Arc::new(vec![4.0, 2.0, 1.0, 2.0]);
+        state.text = TextAttrs {
+            size: 12.0,
+            families: std::sync::Arc::new(vec![
+                "Helvetica".into(),
+                "Arial".into(),
+                "sans-serif".into(),
+            ]),
+            weight: 400,
+            italic: false,
+            align: TextAlign::Start,
+            baseline: TextBaseline::Alphabetic,
+            direction: TextDirection::Inherit,
+        };
+
+        let mut stack = StateStack::new();
+        let depth = 1000;
+        for _ in 0..depth {
+            stack.push(&state);
+        }
+        // 1 live + `depth` snapshots on the stack, all sharing
+        // the same Arc.  The original Arc in `state` itself is
+        // the +1 at the end — total = 1 + depth.
+        assert_eq!(
+            std::sync::Arc::strong_count(&state.line_dash),
+            depth + 1,
+        );
+        assert_eq!(
+            std::sync::Arc::strong_count(&state.text.families),
+            depth + 1,
+        );
+
+        // Popping half the stack must drop the Arc refcount by
+        // exactly that many (LIFO, no orphaning).
+        let mut scratch = state.clone();
+        // `scratch.clone()` bumped the Arc by 2 more; back it out.
+        drop(scratch.line_dash.clone()); drop(scratch);
+        let scratch = &mut state.clone();
+        for _ in 0..(depth / 2) {
+            assert!(stack.pop(scratch));
+        }
+        // After popping half, refcount = state_arc + remaining_snapshots + scratch_arc.
+        assert_eq!(
+            std::sync::Arc::strong_count(&state.line_dash),
+            (depth / 2) + 1 + 1,
+        );
     }
 
     #[test]

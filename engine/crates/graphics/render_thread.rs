@@ -15,7 +15,7 @@ use crate::{
 use crossbeam_channel::{select, tick, Receiver};
 use glow::HasContext;
 use shared::error::{EngineError, EngineResult, ErrorCode};
-use shared::protocol::render_cmd::{CanvasBatchPayload, GlBatchPayload, RenderCommand};
+use shared::protocol::render_cmd::{CanvasBatchPayload, CanvasId, GlBatchPayload, RenderCommand};
 use shared::render_command_sender::CommandSender;
 use shared::surface::SurfaceRef;
 use shared::{FrameOp, FramePacket};
@@ -202,8 +202,17 @@ fn execute_gl_batch(
     let cmd_count = commands.len();
     let mut batch_hit_onscreen = false;
     let mut error_count: u32 = 0;
+    // Collect which canvases this batch touched.  We tally up
+    // *before* dispatch (cheap borrow via `&cmd`) so we can scope
+    // stale-marking to just the affected contexts and avoid the
+    // old "broadcast to every live Canvas2DContext" overkill.
+    let mut touched_canvases: std::collections::HashSet<CanvasId> =
+        std::collections::HashSet::new();
 
     for gl_cmd in commands {
+        if let Some(cid) = gl_cmd.touches_canvas() {
+            touched_canvases.insert(cid);
+        }
         match renderer_gl.handle_command(cm, gl, gl_cmd) {
             Ok(effect) => {
                 if !matches!(effect, DamageEffect::NoDamage) {
@@ -224,15 +233,18 @@ fn execute_gl_batch(
         warn!("GLBatch: {error_count}/{cmd_count} commands failed");
     }
 
-    // WebGL commands touched raw GL state; every Canvas2DContext's
-    // Skia-side cache is now potentially stale.  Mark each one so
-    // the NEXT Canvas2D batch for that canvas lazily issues exactly
-    // one `GrDirectContext::reset()`.  Per-context rather than
-    // manager-global: each context owns its own GrDirectContext, so
-    // one WebGL canvas mutating state shouldn't clear the flag for
-    // another canvas that still has a stale cache.
-    if !commands_was_empty(cmd_count) {
-        cm.mark_all_2d_contexts_stale();
+    // Scoped stale marking: WebGL commands touched GL state; each
+    // affected Canvas2DContext's Skia-side cache is now potentially
+    // stale, and the next 2D draw on THAT canvas issues exactly one
+    // `GrDirectContext::reset()`.  Two-canvas scenes no longer get
+    // cross-invalidated just because one canvas ran a WebGL batch.
+    //
+    // If `touched_canvases` is empty but the batch had commands, it
+    // means every command was a resource-context op (CreateShader,
+    // LinkProgram, etc.) that doesn't bind any per-canvas state —
+    // no Canvas2DContext needs invalidation.
+    for cid in touched_canvases {
+        cm.mark_2d_context_stale(cid);
     }
 
     batch_hit_onscreen
@@ -1118,6 +1130,13 @@ impl RenderThread {
                     }
                     // Reset per-frame upload budget for the new frame.
                     cm.reset_frame_upload_budget();
+                    // Retry uploads that the previous frame's budget
+                    // rejected.  Draining before the frame's fresh
+                    // draw commands means the backlog claims budget
+                    // first; the budget is monotonic within a frame,
+                    // so a rejection stops the loop and the rest
+                    // waits for the next frame's window.
+                    cm.try_drain_deferred_uploads();
                     // Signal RAF BEFORE swap so JS can prepare the next frame
                     // while the GPU waits for VSync.  Must be unconditional —
                     // JS may call requestAnimationFrame without drawing (dirty=false)
@@ -1296,6 +1315,29 @@ impl RenderThread {
                                             shared::stats::unregister_stats(host_id);
                                             return;
                                         }
+                                    }
+                                    // Eager upload drain: LoadImage ops
+                                    // submit work to the upload thread
+                                    // immediately, but `drain_upload_
+                                    // completed` used to run only at
+                                    // the next VSync tick.  With a
+                                    // 60 Hz refresh that's up to 16 ms
+                                    // between "fence signalled" and
+                                    // "Image.onload fires in JS".
+                                    // Running a non-blocking drain here
+                                    // -- right after the JS-facing
+                                    // command batch -- drops the median
+                                    // latency to sub-millisecond on
+                                    // mobile tiled GPUs that coalesce
+                                    // the upload+fence pair quickly.
+                                    // The drain is a bounded cost: it
+                                    // only does `glClientWaitSync(...,
+                                    // timeout=0)` per pending entry,
+                                    // returning immediately whether the
+                                    // fence is ready or not.
+                                    let dropped_recoveries = cm.drain_upload_completed();
+                                    if dropped_recoveries > 0 {
+                                        debug_stats.dropped_upload_recoveries.fetch_add(dropped_recoveries, Ordering::Relaxed);
                                     }
                                 }
                                 Err(_) => {

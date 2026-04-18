@@ -129,16 +129,24 @@ pub(crate) fn classify_draw_damage(
         return DamageEffect::FullSurface;
     }
 
+    // All rect-producing commands operate in OBJECT SPACE coords;
+    // the damage region must be the DEVICE SPACE bounding box, so
+    // every fast-path branch routes through `rect_damage_in_space`
+    // which applies `state.ctm` before floor/ceil.
     match cmd {
-        FillRect { x, y, w, h } | ClearRect { x, y, w, h } => rect_damage(*x, *y, *w, *h),
+        FillRect { x, y, w, h } | ClearRect { x, y, w, h } => {
+            rect_damage_in_space(state, *x, *y, *w, *h)
+        }
         StrokeRect { x, y, w, h } => {
-            // Expand by half the stroke width in every direction;
-            // `lineJoin=miter` with a high `miterLimit` could extend
-            // beyond this, so we also fall back to full surface when
-            // that combination is active (enforced in
-            // `state_allows_partial`).
+            // Canvas 2D `strokeRect` paints a 1-lineWidth band
+            // centered on the rect perimeter.  Expand the OBJECT
+            // SPACE rect by half the line width, then map through
+            // the CTM.  (The object-space expansion is correct
+            // because `lineWidth` is in user-space coords — see
+            // the Canvas 2D spec on lineWidth units.)
             let half = state.line_width * 0.5;
-            rect_damage(
+            rect_damage_in_space(
+                state,
                 *x - half,
                 *y - half,
                 *w + state.line_width,
@@ -151,20 +159,50 @@ pub(crate) fn classify_draw_damage(
             dw,
             dh,
             ..
-        } => rect_damage(*dx, *dy, *dw, *dh),
+        } => rect_damage_in_space(state, *dx, *dy, *dw, *dh),
         DrawImageBatch { draws } => {
-            // Union of all sub-rects.  Avoid allocating; fold into a
-            // pair of (min, max) pairs.
+            // Union the sub-rects in OBJECT SPACE first, then CTM
+            // the single union rect once.  This produces the same
+            // device-space bbox as CTM-ing each sub-rect and
+            // unioning (true because CTM is axis-aligned in this
+            // branch; state_allows_partial gated that).
+            //
+            // Each entry MUST be normalised to `(l <= r, t <= b)`
+            // before unioning: Canvas 2D allows negative dw/dh
+            // (flips the image), and a naive `min/max` of un-
+            // normalised corners loses non-overlapping regions —
+            // e.g. one entry at x=[50,100] + another at x=[0,10]
+            // would produce a bbox of [0,50], silently dropping
+            // the [50,100] paint.
             let mut acc: Option<(f32, f32, f32, f32)> = None;
             for d in draws.iter() {
-                let (l, t, r, b) = (d.dx, d.dy, d.dx + d.dw, d.dy + d.dh);
+                // Skip obviously degenerate / non-finite entries
+                // so they can't poison the accumulator with NaN.
+                if !(d.dx.is_finite() && d.dy.is_finite()
+                    && d.dw.is_finite() && d.dh.is_finite())
+                {
+                    continue;
+                }
+                let (l, r) = if d.dw < 0.0 {
+                    (d.dx + d.dw, d.dx)
+                } else {
+                    (d.dx, d.dx + d.dw)
+                };
+                let (t, b) = if d.dh < 0.0 {
+                    (d.dy + d.dh, d.dy)
+                } else {
+                    (d.dy, d.dy + d.dh)
+                };
+                if !(r > l && b > t) {
+                    continue; // zero-area entry paints nothing
+                }
                 acc = Some(match acc {
                     Some((l0, t0, r0, b0)) => (l0.min(l), t0.min(t), r0.max(r), b0.max(b)),
                     None => (l, t, r, b),
                 });
             }
             match acc {
-                Some((l, t, r, b)) => rect_damage(l, t, r - l, b - t),
+                Some((l, t, r, b)) => rect_damage_in_space(state, l, t, r - l, b - t),
                 None => DamageEffect::NoDamage,
             }
         }
@@ -176,19 +214,53 @@ pub(crate) fn classify_draw_damage(
     }
 }
 
-/// Convert a floating-point rectangle into the integer-pixel
-/// `OnscreenRect` damage effect.  Applies `.floor()` / `.ceil()`
-/// outward expansion so we never report a tighter rect than what
-/// actually gets painted.
+/// Transform an object-space rect through the current CTM, then
+/// snap outward to pixel bounds for the damage region.
+///
+/// Must only be called when `state_allows_partial(state)` is true:
+/// callers rely on that gate to ensure `ctm_is_axis_aligned()`
+/// holds, without which the per-corner min/max below under-reports
+/// the actual paint coverage.
 #[inline]
-fn rect_damage(x: f32, y: f32, w: f32, h: f32) -> DamageEffect {
-    if !(w > 0.0 && h > 0.0 && x.is_finite() && y.is_finite()) {
+fn rect_damage_in_space(
+    state: &crate::backend::gl::state::Canvas2DState,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) -> DamageEffect {
+    // Reject non-finite coords / dimensions up front; any NaN or
+    // infinity at this stage would propagate into the device-space
+    // bbox and corrupt the compositor's dirty rects.
+    if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) {
         return DamageEffect::NoDamage;
     }
-    let left = x.floor() as i32;
-    let top = y.floor() as i32;
-    let right = (x + w).ceil() as i32;
-    let bottom = (y + h).ceil() as i32;
+    // Canvas 2D spec: negative width/height paint LEFT/UP from the
+    // origin (see fillRect / drawImage spec).  Normalise into the
+    // canonical `(x, y, |w|, |h|)` box so the damage classifier
+    // correctly reports the covered region — a naive `w > 0 && h > 0`
+    // guard would report NoDamage for `fillRect(10, 10, -5, -5)` and
+    // leave those pixels ghosted on next compositor pass.
+    let (x, w) = if w < 0.0 { (x + w, -w) } else { (x, w) };
+    let (y, h) = if h < 0.0 { (y + h, -h) } else { (y, h) };
+    // Degenerate zero-area rect paints nothing — genuine NoDamage.
+    if w <= 0.0 || h <= 0.0 {
+        return DamageEffect::NoDamage;
+    }
+    // Map to device space.  `map_axis_aligned_rect` debug-asserts
+    // the shear predicate; the `state_allows_partial` gate guards
+    // it in release builds.
+    let Some((mx, my, mw, mh)) = state.map_axis_aligned_rect(x, y, w, h) else {
+        return DamageEffect::FullSurface;
+    };
+    // Post-transform dimensions can still end up negative when the
+    // CTM embeds a reflection (e.g. `scale(-1, 1)`).  Fall back to
+    // min/max rather than `.floor()/.ceil()` assuming canonical
+    // layout, since the latter would produce an empty rect.
+    let left = mx.min(mx + mw).floor() as i32;
+    let top = my.min(my + mh).floor() as i32;
+    let right = mx.max(mx + mw).ceil() as i32;
+    let bottom = my.max(my + mh).ceil() as i32;
     DamageEffect::OnscreenRect {
         x: left,
         y: top,
@@ -235,9 +307,13 @@ pub(crate) fn state_allows_partial(state: &crate::backend::gl::state::Canvas2DSt
     // Non-axis-aligned CTM (rotation, skew, off-diagonal
     // `setTransform`) can project a rectangle to arbitrary coverage,
     // so the classifier can't bound the damage tightly.  Pure
-    // translation and uniform axis-aligned scale are fine — they
-    // only shift/resize the rect we already compute.
-    if state.ctm_non_axis_aligned {
+    // translation and axis-aligned scale (including negative /
+    // reflection) are fine — they keep the bounding box a bbox.
+    //
+    // Derived from the live CTM every call, so `setTransform(1,0,0,1,0,0)`
+    // after a `rotate()` correctly re-enables the fast path (the
+    // previous implementation's sticky boolean left it stuck on).
+    if !state.ctm_is_axis_aligned() {
         return false;
     }
     true
@@ -284,8 +360,24 @@ mod partial_damage_tests {
     #[test]
     fn rotated_ctm_disables_partial() {
         let mut s = base();
-        s.ctm_non_axis_aligned = true;
+        // 45-degree rotation: ctm = [cos, sin, -sin, cos, 0, 0].
+        let (sin45, cos45) = (0.7071068_f32, 0.7071068_f32);
+        s.ctm = [cos45, sin45, -sin45, cos45, 0.0, 0.0];
         assert!(!state_allows_partial(&s));
+    }
+
+    #[test]
+    fn setTransform_back_to_identity_re_enables_partial() {
+        // Regression: the old `ctm_non_axis_aligned` was sticky,
+        // so `rotate()` then `setTransform(1,0,0,1,0,0)` left the
+        // flag permanently stuck on.  Now derived from the live
+        // matrix so a `setTransform` back to an axis-aligned
+        // matrix restores the fast path.
+        let mut s = base();
+        s.ctm = [0.7071068, 0.7071068, -0.7071068, 0.7071068, 0.0, 0.0];
+        assert!(!state_allows_partial(&s));
+        s.ctm_set([1.0, 0.0, 0.0, 1.0, 100.0, 50.0]);
+        assert!(state_allows_partial(&s));
     }
 
     #[test]
@@ -395,5 +487,314 @@ mod partial_damage_tests {
                 height: 32
             }
         );
+    }
+
+    // ---- CTM mapping regression tests (P0-1) ------------------------
+    //
+    // Bug: damage classifier used to return object-space rects,
+    // ignoring the current transform.  `translate(100,100)` then
+    // `fillRect(10,10,50,50)` SHOULD paint at device (110,110)-
+    // (160,160), but the classifier reported (10,10)-(60,60) — so
+    // the compositor repainted the wrong tile, and the moved rect
+    // either flickered or ghosted.
+    //
+    // These tests pin the corrected behaviour: every partial-damage
+    // branch now maps through `state.ctm` before floor/ceil.
+
+    fn fill_rect_cmd(x: f32, y: f32, w: f32, h: f32) -> Canvas2DCmd {
+        Canvas2DCmd::FillRect { x, y, w, h }
+    }
+
+    fn expect_rect(d: DamageEffect, x: i32, y: i32, w: i32, h: i32) {
+        assert_eq!(
+            d,
+            DamageEffect::OnscreenRect {
+                x,
+                y,
+                width: w,
+                height: h,
+            }
+        );
+    }
+
+    #[test]
+    fn translate_shifts_damage_rect() {
+        let mut s = base();
+        // translate(100, 100)
+        s.ctm_concat([1.0, 0.0, 0.0, 1.0, 100.0, 100.0]);
+        expect_rect(
+            classify_draw_damage(&fill_rect_cmd(10.0, 20.0, 50.0, 30.0), &s),
+            110, 120, 50, 30,
+        );
+    }
+
+    #[test]
+    fn scale_expands_damage_rect() {
+        let mut s = base();
+        // scale(2, 3)
+        s.ctm_concat([2.0, 0.0, 0.0, 3.0, 0.0, 0.0]);
+        expect_rect(
+            classify_draw_damage(&fill_rect_cmd(5.0, 10.0, 20.0, 10.0), &s),
+            10, 30, 40, 30,
+        );
+    }
+
+    #[test]
+    fn translate_then_scale_composes() {
+        let mut s = base();
+        s.ctm_concat([1.0, 0.0, 0.0, 1.0, 7.0, 11.0]); // translate(7, 11)
+        s.ctm_concat([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]); // scale(2, 2)
+        // Canvas 2D semantics: transforms accumulate left-to-right,
+        // so subsequent paints are first scaled, then translated.
+        // rect(0, 0, 10, 10) → scaled to (0,0,20,20) → translated
+        // by (7, 11) → (7, 11, 20, 20).
+        expect_rect(
+            classify_draw_damage(&fill_rect_cmd(0.0, 0.0, 10.0, 10.0), &s),
+            7, 11, 20, 20,
+        );
+    }
+
+    #[test]
+    fn setTransform_replaces_not_concatenates() {
+        let mut s = base();
+        s.ctm_concat([1.0, 0.0, 0.0, 1.0, 50.0, 50.0]); // translate
+        s.ctm_set([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]); // setTransform replaces
+        // The earlier translate must NOT leak into the result.
+        expect_rect(
+            classify_draw_damage(&fill_rect_cmd(0.0, 0.0, 10.0, 10.0), &s),
+            0, 0, 20, 20,
+        );
+    }
+
+    #[test]
+    fn reset_transform_clears_ctm() {
+        let mut s = base();
+        s.ctm_concat([2.0, 0.0, 0.0, 2.0, 100.0, 100.0]);
+        s.ctm_reset();
+        expect_rect(
+            classify_draw_damage(&fill_rect_cmd(0.0, 0.0, 10.0, 10.0), &s),
+            0, 0, 10, 10,
+        );
+    }
+
+    #[test]
+    fn negative_scale_reflection_stays_axis_aligned() {
+        // scale(-1, 1) mirrors horizontally — the bbox still ends
+        // up a rect, just flipped.  `map_axis_aligned_rect` has
+        // to use min/max after transform for this to work.
+        let mut s = base();
+        s.ctm_concat([-1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        expect_rect(
+            classify_draw_damage(&fill_rect_cmd(10.0, 20.0, 50.0, 30.0), &s),
+            -60, 20, 50, 30,
+        );
+    }
+
+    #[test]
+    fn stroke_rect_with_translate_expands_then_translates() {
+        let mut s = base();
+        s.line_width = 4.0;
+        s.ctm_concat([1.0, 0.0, 0.0, 1.0, 100.0, 100.0]);
+        // Object-space expansion by half line width → (8, 8, 24, 24),
+        // then translate by (100, 100) → (108, 108, 24, 24).
+        expect_rect(
+            classify_draw_damage(
+                &Canvas2DCmd::StrokeRect {
+                    x: 10.0,
+                    y: 10.0,
+                    w: 20.0,
+                    h: 20.0,
+                },
+                &s,
+            ),
+            108, 108, 24, 24,
+        );
+    }
+
+    #[test]
+    fn draw_image_with_scale_expands_dst_rect() {
+        let mut s = base();
+        s.ctm_concat([2.0, 0.0, 0.0, 2.0, 10.0, 10.0]);
+        let cmd = Canvas2DCmd::DrawImage {
+            image_id: 1,
+            sx: 0.0,
+            sy: 0.0,
+            sw: 32.0,
+            sh: 32.0,
+            dx: 5.0,
+            dy: 5.0,
+            dw: 20.0,
+            dh: 20.0,
+        };
+        // dst (5,5,20,20) → scale(2) → (10,10,40,40) → translate(10,10)
+        //   → (20,20,40,40).
+        expect_rect(classify_draw_damage(&cmd, &s), 20, 20, 40, 40);
+    }
+
+    #[test]
+    fn rotated_ctm_falls_back_to_full_surface() {
+        let mut s = base();
+        s.ctm = [0.7071068, 0.7071068, -0.7071068, 0.7071068, 0.0, 0.0];
+        assert_eq!(
+            classify_draw_damage(&fill_rect_cmd(0.0, 0.0, 10.0, 10.0), &s),
+            DamageEffect::FullSurface,
+        );
+    }
+
+    #[test]
+    fn non_finite_ctm_falls_back_to_full_surface() {
+        // Pathological CTM (e.g. post-matrix-inverse numerical
+        // failure) must not produce NaN damage rects.
+        let mut s = base();
+        s.ctm = [f32::NAN, 0.0, 0.0, 1.0, 0.0, 0.0];
+        assert_eq!(
+            classify_draw_damage(&fill_rect_cmd(0.0, 0.0, 10.0, 10.0), &s),
+            DamageEffect::FullSurface,
+        );
+    }
+
+    // ---- negative-dimension normalisation (P1-4) --------------------
+    //
+    // Canvas 2D allows negative width/height, which the spec defines
+    // as painting left/up from the origin.  Prior to this commit the
+    // damage classifier returned `NoDamage` for those commands and
+    // left the "flipped" pixels ghosted on next compositor pass.
+
+    #[test]
+    fn fill_rect_negative_width_normalises_to_canonical_box() {
+        // `fillRect(10, 10, -5, -5)` paints the box (5, 5) — (10, 10).
+        let cmd = fill_rect_cmd(10.0, 10.0, -5.0, -5.0);
+        expect_rect(classify_draw_damage(&cmd, &base()), 5, 5, 5, 5);
+    }
+
+    #[test]
+    fn draw_image_negative_dst_flip_damages_canonical_box() {
+        // `drawImage(img, 0,0,32,32, 100, 100, -50, -50)` flips the
+        // image and paints (50, 50) — (100, 100).
+        let cmd = Canvas2DCmd::DrawImage {
+            image_id: 1,
+            sx: 0.0,
+            sy: 0.0,
+            sw: 32.0,
+            sh: 32.0,
+            dx: 100.0,
+            dy: 100.0,
+            dw: -50.0,
+            dh: -50.0,
+        };
+        expect_rect(classify_draw_damage(&cmd, &base()), 50, 50, 50, 50);
+    }
+
+    #[test]
+    fn nan_rect_dimensions_fall_back_to_no_damage() {
+        // Defence against JS passing `Number.NaN` through setters.
+        // The old guard was just `w > 0 && h > 0` which evaluated
+        // to false for NaN (OK) but also false for negative w — the
+        // latter was a false NoDamage.  New guard checks finiteness
+        // explicitly and normalises negatives.
+        let cmd = fill_rect_cmd(0.0, 0.0, f32::NAN, 10.0);
+        assert_eq!(
+            classify_draw_damage(&cmd, &base()),
+            DamageEffect::NoDamage,
+        );
+    }
+
+    #[test]
+    fn zero_area_rect_paints_nothing() {
+        // `fillRect(x, y, 0, 10)` is well-formed but paints no
+        // pixels — damage should stay empty, not turn into a
+        // 0-wide rectangle that the compositor still processes.
+        let cmd = fill_rect_cmd(10.0, 10.0, 0.0, 10.0);
+        assert_eq!(
+            classify_draw_damage(&cmd, &base()),
+            DamageEffect::NoDamage,
+        );
+    }
+
+    #[test]
+    fn draw_image_batch_with_disjoint_negative_flips_preserves_union() {
+        // Regression: union previously mis-handled flipped entries.
+        // Entry A paints [50, 100] (via dw=-50 from dx=100).
+        // Entry B paints [0, 10].  True union bbox is [0, 100].
+        let cmd = Canvas2DCmd::DrawImageBatch {
+            draws: vec![
+                shared::protocol::render_cmd::DrawImageEntry {
+                    image_id: 1, sx: 0.0, sy: 0.0, sw: 10.0, sh: 10.0,
+                    dx: 100.0, dy: 10.0, dw: -50.0, dh: 10.0,
+                },
+                shared::protocol::render_cmd::DrawImageEntry {
+                    image_id: 1, sx: 0.0, sy: 0.0, sw: 10.0, sh: 10.0,
+                    dx: 0.0, dy: 10.0, dw: 10.0, dh: 10.0,
+                },
+            ],
+        };
+        expect_rect(classify_draw_damage(&cmd, &base()), 0, 10, 100, 10);
+    }
+
+    #[test]
+    fn draw_image_batch_skips_non_finite_entries() {
+        // One NaN entry must not poison the accumulator; the other
+        // entry still contributes a legitimate rect.
+        let cmd = Canvas2DCmd::DrawImageBatch {
+            draws: vec![
+                shared::protocol::render_cmd::DrawImageEntry {
+                    image_id: 1, sx: 0.0, sy: 0.0, sw: 10.0, sh: 10.0,
+                    dx: f32::NAN, dy: 0.0, dw: 10.0, dh: 10.0,
+                },
+                shared::protocol::render_cmd::DrawImageEntry {
+                    image_id: 1, sx: 0.0, sy: 0.0, sw: 10.0, sh: 10.0,
+                    dx: 0.0, dy: 0.0, dw: 10.0, dh: 10.0,
+                },
+            ],
+        };
+        expect_rect(classify_draw_damage(&cmd, &base()), 0, 0, 10, 10);
+    }
+
+    #[test]
+    fn reflection_ctm_keeps_device_rect_positive() {
+        // `scale(-1, -1)` with `fillRect(10, 20, 50, 30)` paints
+        // (-60, -50)-(-10, -20).  After normalisation the damage
+        // must be the positive-extent bbox (-60, -50, 50, 30).
+        let mut s = base();
+        s.ctm_concat([-1.0, 0.0, 0.0, -1.0, 0.0, 0.0]);
+        expect_rect(
+            classify_draw_damage(&fill_rect_cmd(10.0, 20.0, 50.0, 30.0), &s),
+            -60, -50, 50, 30,
+        );
+    }
+
+    #[test]
+    fn draw_image_batch_unions_then_transforms() {
+        let mut s = base();
+        s.ctm_concat([1.0, 0.0, 0.0, 1.0, 100.0, 100.0]);
+        let cmd = Canvas2DCmd::DrawImageBatch {
+            draws: vec![
+                shared::protocol::render_cmd::DrawImageEntry {
+                    image_id: 1,
+                    sx: 0.0,
+                    sy: 0.0,
+                    sw: 10.0,
+                    sh: 10.0,
+                    dx: 0.0,
+                    dy: 0.0,
+                    dw: 10.0,
+                    dh: 10.0,
+                },
+                shared::protocol::render_cmd::DrawImageEntry {
+                    image_id: 1,
+                    sx: 0.0,
+                    sy: 0.0,
+                    sw: 10.0,
+                    sh: 10.0,
+                    dx: 20.0,
+                    dy: 20.0,
+                    dw: 10.0,
+                    dh: 10.0,
+                },
+            ],
+        };
+        // Object-space union: (0,0)-(30,30) = (0,0,30,30).
+        // After translate(100,100): (100,100,30,30).
+        expect_rect(classify_draw_damage(&cmd, &s), 100, 100, 30, 30);
     }
 }

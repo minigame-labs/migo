@@ -521,15 +521,22 @@ fn try_ahb_upload(
     image: &NormalizedImage,
     egl_display_ptr: *const std::ffi::c_void,
 ) -> Result<PboUploadResult, String> {
-    use crate::ahb::OwnedAHardwareBuffer;
+    use shared::protocol::ahb::{AhbDesc, OwnedAhb, write_rgba_into_ahb};
 
-    let ahb = OwnedAHardwareBuffer::allocate(image.width, image.height)?;
-    ahb.write_rgba(&image.rgba)?;
+    // Legacy RGBA path: allocate an AHB here and memcpy the RGBA
+    // payload in. Kept so `upload_texture_tiered` still has a useful
+    // AHB fallback for non-Android decoders or cached-RGBA hits.  The
+    // zero-memcpy path — decoder writes straight into AHB — lives in
+    // [`upload_ahb_image`]; `CanvasCmd::LoadImage` routes to it when
+    // the caller has a [`DecodedImage::HardwareBuffer`] already.
+    let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled(image.width, image.height))
+        .map_err(|e| format!("AHB allocate: {e}"))?;
+    write_rgba_into_ahb(&ahb, &image.rgba).map_err(|e| format!("AHB write: {e}"))?;
 
     let result = unsafe {
         crate::texture_import::import_ahb_as_texture(
             gl,
-            ahb.as_ptr() as *const std::ffi::c_void,
+            ahb.raw(),
             egl_display_ptr,
             image.width,
             image.height,

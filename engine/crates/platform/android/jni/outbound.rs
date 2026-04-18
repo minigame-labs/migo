@@ -1208,6 +1208,95 @@ pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError
     result.map_err(|e| EngineError::new(ErrorCode::ImageReadError).with_detail(e))
 }
 
+/// Zero-memcpy image decode path.
+///
+/// Calls `NativeExports.decodeImageAhb(byte[]) -> byte[]`. The Java
+/// side decodes into a hardware-backed bitmap and returns a packed
+/// 16-byte header `[ahb_ptr_i64_le, width_u32_le, height_u32_le]`.
+/// A zero pointer means "decode failed or AHB path unavailable; caller
+/// must fall back to [`decode_image_rgba_jni`]".
+///
+/// On success the returned [`AhbImage`] owns **one strong refcount**
+/// on the AHB; Java has already done its own `_acquire` so the
+/// pointer is safe to use until the returned [`OwnedAhb`] drops.
+pub fn decode_image_ahb_jni(
+    data: &[u8],
+) -> Result<shared::protocol::io_cmd::AhbImage, EngineError> {
+    use shared::protocol::ahb::{AhbDesc, OwnedAhb};
+    use shared::protocol::io_cmd::AhbImage;
+
+    let result: Result<AhbImage, String> = with_env(|env| {
+        let cache = JAVA_METHOD_CACHE
+            .get()
+            .ok_or("NativeExports cache not initialized")?;
+        let method_id = cache
+            .get_method_id("decodeImageAhb")
+            .ok_or("decodeImageAhb method not found")?;
+        let class = cache.class();
+
+        clear_jni_exception(env, "decode_image_ahb_jni (pre-call)");
+
+        let j_data = env.byte_array_from_slice(data).map_err(|e| {
+            clear_jni_exception(env, "decode_image_ahb_jni (byte_array_from_slice)");
+            format!("Failed to create byte array ({}B): {e}", data.len())
+        })?;
+
+        let call_result = unsafe {
+            env.call_static_method_unchecked(
+                class,
+                *method_id,
+                ReturnType::Object,
+                &[jvalue {
+                    l: j_data.as_raw() as *mut _,
+                }],
+            )
+        };
+
+        match call_result {
+            Ok(val) => {
+                let obj = val.l().map_err(|e| format!("expected object: {e}"))?;
+                if obj.is_null() {
+                    return Err("decodeImageAhb returned null".into());
+                }
+                let byte_array = jni::objects::JByteArray::from(obj);
+                let bytes = env
+                    .convert_byte_array(byte_array)
+                    .map_err(|e| format!("Failed to read AHB header: {e}"))?;
+
+                if bytes.len() != 16 {
+                    return Err(format!(
+                        "decodeImageAhb header size mismatch: got {}, want 16",
+                        bytes.len()
+                    ));
+                }
+                let ahb_ptr = i64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                    bytes[4], bytes[5], bytes[6], bytes[7],
+                ]);
+                let width = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+                let height = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+
+                if ahb_ptr == 0 {
+                    return Err("decodeImageAhb: null AHB pointer (fallback path)".into());
+                }
+
+                // Adopt the Java-bumped refcount. Descriptor width
+                // and height come straight from the decoder.
+                let desc = AhbDesc::rgba_sampled(width, height);
+                let ahb = OwnedAhb::from_raw_acquire(ahb_ptr as *mut std::ffi::c_void, desc)
+                    .map_err(|e| format!("AHB adopt: {e}"))?;
+                Ok(AhbImage::new(width, height, ahb))
+            }
+            Err(e) => {
+                clear_jni_exception(env, "decodeImageAhb");
+                Err(format!("decodeImageAhb call failed: {e}"))
+            }
+        }
+    });
+
+    result.map_err(|e| EngineError::new(ErrorCode::ImageReadError).with_detail(e))
+}
+
 // ==================== Setting ====================
 
 jni_void_json!(open_setting, "openSetting");

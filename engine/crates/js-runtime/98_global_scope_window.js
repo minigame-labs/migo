@@ -25,6 +25,7 @@ import * as tcpSocket from 'ext:host_v8_network/08_tcp_socket.js';
 import * as udpSocket from 'ext:host_v8_network/09_udp_socket.js';
 import * as mouseApi from 'ext:host_v8_touch/03_mouse.js';
 import * as timersInternal from 'ext:host_v8_web/02_timers.js';
+import * as imageApi from 'ext:host_v8_image/01_image.js';
 
 import { core } from "ext:core/mod.js";
 
@@ -37,6 +38,12 @@ const WindowGlobalScope = {
     cancelAnimationFrame: core.propWritable(raf.cancelAnimationFrame),
     setPreferredFramesPerSecond: core.propWritable(raf.setPreferredFramesPerSecond),
 
+
+    // Image prefetch -- ahead-of-time decode + upload, bypasses the
+    // later `new Image()` -> `src =` round trip for assets the game
+    // knows it's about to draw (splash screens, scene transitions).
+    // Returns a Promise<Array<{path, success, width, height, error}>>.
+    prefetchImage: core.propNonEnumerable(imageApi.prefetchImage),
 
     // Subpackage
     loadSubpackage: core.propNonEnumerable(subpackage.loadSubpackage),

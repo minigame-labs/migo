@@ -15,6 +15,7 @@ use crate::{
     op_state::CanvasOpState,
 };
 
+pub mod ahb;
 pub mod audio_cmd;
 pub mod color;
 pub mod error;

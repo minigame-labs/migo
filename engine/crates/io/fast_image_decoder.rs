@@ -11,14 +11,29 @@ use std::sync::Arc;
 
 use shared::{
     error::{EngineError, ErrorCode},
-    protocol::io_cmd::NormalizedImage,
+    protocol::io_cmd::{AhbImage, NormalizedImage},
 };
 
 use crate::ktx2;
 
-/// External decoder hook (e.g., Android BitmapFactory via JNI).
-/// Platform code calls `register_platform_decoder()` at init time.
+/// External RGBA decoder hook (legacy). Platform code calls
+/// `register_platform_decoder()` at init time; kept for compatibility
+/// and as the fallback when the AHB hook fails or isn't registered.
 static PLATFORM_DECODER: OnceLock<fn(&[u8]) -> Result<NormalizedImage, EngineError>> =
+    OnceLock::new();
+
+/// Zero-copy AHB decoder hook. Android's `NativeExports.decodeImageAhb`
+/// hands back an `AHardwareBuffer*`; the Rust side wraps it as an
+/// [`AhbImage`] and the renderer imports it via `eglCreateImageKHR`
+/// without touching CPU pixel bytes.
+///
+/// When this hook is registered **and** succeeds, [`decode_image_fast`]
+/// returns the AHB variant; callers who need RGBA call `into_rgba()`
+/// explicitly.  The hook may fail on a per-image basis (e.g. decoder
+/// OOM, AHB alloc refused by driver); on failure we transparently
+/// retry via [`PLATFORM_DECODER`] so the caller sees either a valid
+/// image or a single error, never a silent downgrade.
+static PLATFORM_AHB_DECODER: OnceLock<fn(&[u8]) -> Result<AhbImage, EngineError>> =
     OnceLock::new();
 
 pub fn register_platform_decoder(f: fn(&[u8]) -> Result<NormalizedImage, EngineError>) {
@@ -26,6 +41,14 @@ pub fn register_platform_decoder(f: fn(&[u8]) -> Result<NormalizedImage, EngineE
         tracing::info!("platform image decoder registered");
     } else {
         tracing::warn!("platform image decoder already registered, ignoring");
+    }
+}
+
+pub fn register_platform_ahb_decoder(f: fn(&[u8]) -> Result<AhbImage, EngineError>) {
+    if PLATFORM_AHB_DECODER.set(f).is_ok() {
+        tracing::info!("platform AHB image decoder registered");
+    } else {
+        tracing::warn!("platform AHB image decoder already registered, ignoring");
     }
 }
 
@@ -213,6 +236,42 @@ pub fn decode_image_fast(
         .with_detail("no image decoder available (all decoders failed or not registered)"))
 }
 
+/// Decode to the best available representation: prefers the AHB
+/// zero-copy path when registered (Android API 28+ via
+/// [`register_platform_ahb_decoder`]), otherwise falls through to
+/// [`decode_image_fast`] and wraps the result as
+/// [`shared::protocol::io_cmd::DecodedImage::Rgba`].
+///
+/// Callers that know they'll need CPU-side RGBA (e.g. `getImageData`,
+/// resize, crop) can still call [`decode_image_fast`] directly to
+/// skip the AHB-to-RGBA downgrade round-trip; everyone else should
+/// prefer this entry so fast GPU-side uploads happen automatically
+/// when supported.
+pub fn decode_image_to_any(
+    data: &[u8],
+    path_hint: Option<&str>,
+) -> Result<shared::protocol::io_cmd::DecodedImage, EngineError> {
+    use shared::protocol::io_cmd::DecodedImage;
+
+    if let Some(ahb_decoder) = PLATFORM_AHB_DECODER.get() {
+        match ahb_decoder(data) {
+            Ok(ahb) => return Ok(DecodedImage::HardwareBuffer(ahb)),
+            Err(e) => {
+                // AHB decode failed (OOM, AHB alloc refused, API<30,
+                // etc.). Bump the observability counter and fall
+                // through — the caller still gets a valid image via
+                // the RGBA path.
+                shared::stats::io_metrics_global()
+                    .decoder_fallback_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!("AHB decode failed, falling back to RGBA: {e:?}");
+            }
+        }
+    }
+
+    decode_image_fast(data, path_hint).map(DecodedImage::Rgba)
+}
+
 /// Decode using zune-image (fast, SIMD-optimized).
 #[cfg(feature = "rust-image-decode")]
 fn decode_with_zune(data: &[u8]) -> Result<NormalizedImage, EngineError> {
@@ -290,6 +349,11 @@ fn decode_with_image_crate(data: &[u8]) -> Result<NormalizedImage, EngineError> 
 /// aspect ratio. Uses bilinear filtering via the `image` crate.
 ///
 /// If the image is already within the target dimensions, returns it unchanged.
+/// Upper bound on a cropped RGBA buffer (128 MiB). Matches the soft
+/// image byte budget; callers get a structured error instead of an
+/// OOM abort when a game passes in a pathological `(sw, sh)`.
+pub const MAX_SUBRECT_BYTES: usize = 128 * 1024 * 1024;
+
 /// Crop `img` to the pixel rectangle `(sx, sy, sw, sh)`, with
 /// WHATWG ImageBitmap out-of-bounds semantics: regions that fall
 /// outside the source image are filled with transparent black
@@ -298,6 +362,13 @@ fn decode_with_image_crate(data: &[u8]) -> Result<NormalizedImage, EngineError> 
 /// Returns a fresh `NormalizedImage` sized `sw x sh`.  When the
 /// clipped region covers the whole source and has identical
 /// dimensions, the input is returned unchanged (no allocation).
+///
+/// # Errors
+/// * `InvalidArgument` when `sw > i32::MAX`, `sh > i32::MAX`, or
+///   `sw * sh * 4` would overflow `usize`. The `i32::MAX` guard
+///   prevents a `u32 -> i32` negative wrap downstream.
+/// * `OutOfMemory` when the required buffer exceeds
+///   [`MAX_SUBRECT_BYTES`].
 ///
 /// Unlike [`resize_image`] this does not depend on the optional
 /// `rust-image-decode` feature — crop is a pure CPU operation on
@@ -308,22 +379,49 @@ pub fn crop_image(
     sy: i32,
     sw: u32,
     sh: u32,
-) -> NormalizedImage {
+) -> Result<NormalizedImage, EngineError> {
+    // Guard against u32 -> i32 wrap: later math casts `sw as i32`,
+    // which silently produces a negative number for sw > i32::MAX.
+    if sw > i32::MAX as u32 || sh > i32::MAX as u32 {
+        return Err(EngineError::new(ErrorCode::InvalidArgument)
+            .with_detail(format!("crop: size {}x{} exceeds i32::MAX", sw, sh)));
+    }
+
     // Fast path: no-op crop.
     if sx == 0 && sy == 0 && sw == img.width && sh == img.height {
-        return img;
+        return Ok(img);
     }
+
+    // Checked allocation size. `sw`, `sh` are at most i32::MAX here,
+    // so these multiplications only overflow usize on 32-bit targets.
+    let pixels = (sw as usize).checked_mul(sh as usize).ok_or_else(|| {
+        EngineError::new(ErrorCode::InvalidArgument)
+            .with_detail(format!("crop: {}*{} pixel count overflows usize", sw, sh))
+    })?;
+    let bytes = pixels.checked_mul(4).ok_or_else(|| {
+        EngineError::new(ErrorCode::InvalidArgument)
+            .with_detail(format!("crop: {} pixels * 4 bytes overflows usize", pixels))
+    })?;
+    if bytes > MAX_SUBRECT_BYTES {
+        return Err(EngineError::new(ErrorCode::OutOfMemory).with_detail(format!(
+            "crop: {}x{} ({} bytes) exceeds MAX_SUBRECT_BYTES={}",
+            sw, sh, bytes, MAX_SUBRECT_BYTES
+        )));
+    }
+
     let out_w = sw as i32;
     let out_h = sh as i32;
-    let mut out = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+    let mut out = vec![0u8; bytes];
 
     // Compute intersection of destination rect with source image.
     let src_w = img.width as i32;
     let src_h = img.height as i32;
     let intersect_x0 = sx.max(0);
     let intersect_y0 = sy.max(0);
-    let intersect_x1 = (sx + out_w).min(src_w);
-    let intersect_y1 = (sy + out_h).min(src_h);
+    // Use saturating arithmetic for sx+out_w so very large (but valid)
+    // sx values don't wrap past i32::MAX before `.min(src_w)` clamps.
+    let intersect_x1 = sx.saturating_add(out_w).min(src_w);
+    let intersect_y1 = sy.saturating_add(out_h).min(src_h);
     if intersect_x1 > intersect_x0 && intersect_y1 > intersect_y0 {
         let row_bytes_src = (src_w as usize) * 4;
         let row_bytes_dst = (out_w as usize) * 4;
@@ -341,11 +439,11 @@ pub fn crop_image(
         }
     }
 
-    NormalizedImage {
+    Ok(NormalizedImage {
         width: sw,
         height: sh,
         rgba: std::sync::Arc::new(out),
-    }
+    })
 }
 
 #[cfg(feature = "rust-image-decode")]
@@ -427,7 +525,7 @@ mod crop_tests {
     #[test]
     fn crop_identity_returns_input() {
         let img = checkerboard(4, 4);
-        let out = crop_image(img.clone(), 0, 0, 4, 4);
+        let out = crop_image(img.clone(), 0, 0, 4, 4).expect("identity crop");
         assert_eq!(out.width, 4);
         assert_eq!(out.height, 4);
         assert_eq!(&*out.rgba, &*img.rgba);
@@ -439,7 +537,7 @@ mod crop_tests {
         // Extract the 2x2 from (1,1) — should start "on" at (1,1)
         // because (x+y) = 2, even.
         let img = checkerboard(4, 4);
-        let out = crop_image(img, 1, 1, 2, 2);
+        let out = crop_image(img, 1, 1, 2, 2).expect("center crop");
         assert_eq!(out.width, 2);
         assert_eq!(out.height, 2);
         // Top-left pixel of output = source(1,1): on.
@@ -452,7 +550,7 @@ mod crop_tests {
     #[test]
     fn crop_entirely_out_of_bounds_returns_transparent_black() {
         let img = checkerboard(4, 4);
-        let out = crop_image(img, 10, 10, 3, 3);
+        let out = crop_image(img, 10, 10, 3, 3).expect("oob crop");
         assert_eq!(out.width, 3);
         assert_eq!(out.height, 3);
         assert!(out.rgba.iter().all(|&b| b == 0));
@@ -464,7 +562,7 @@ mod crop_tests {
         // from (0,0) to (4,4) should be the source checker; the rim
         // is zeroed.
         let img = checkerboard(4, 4);
-        let out = crop_image(img, -1, -1, 6, 6);
+        let out = crop_image(img, -1, -1, 6, 6).expect("partial oob crop");
         assert_eq!(out.width, 6);
         assert_eq!(out.height, 6);
         // Top-left corner (output pixel (0,0) maps to source(-1,-1)
@@ -474,5 +572,121 @@ mod crop_tests {
         // (255,255,255,255).
         let idx = (1 * 6 + 1) * 4;
         assert_eq!(&out.rgba[idx..idx + 4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn crop_rejects_size_above_i32_max() {
+        // `sw as i32` would wrap to a negative value downstream; we
+        // must reject before that.  Use 1-pixel tall so the pixel
+        // count itself doesn't overflow first.
+        let img = checkerboard(4, 4);
+        let err = crop_image(img, 0, 0, (i32::MAX as u32) + 1, 1)
+            .expect_err("i32::MAX+1 must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn crop_rejects_pixel_count_overflow() {
+        // On 64-bit targets usize is 64-bit so `sw * sh` only overflows
+        // above ~4 billion × ~4 billion; we already reject those via
+        // the i32::MAX guard.  On 32-bit targets usize is 32-bit and
+        // `(0x1_0000 * 0x1_0000)` overflows. Either way the caller
+        // must see an error, not a panic.
+        let img = checkerboard(4, 4);
+        // 65536 x 65536 x 4 = 16 GiB; exceeds MAX_SUBRECT_BYTES on
+        // every target, so this also validates the size-cap path.
+        let err = crop_image(img, 0, 0, 65_536, 65_536)
+            .expect_err("huge crop must be rejected");
+        assert!(
+            matches!(err.code, ErrorCode::InvalidArgument | ErrorCode::OutOfMemory),
+            "unexpected code: {:?}",
+            err.code
+        );
+    }
+
+    #[test]
+    fn crop_rejects_above_max_subrect_bytes() {
+        // 8192 x 8192 x 4 = 256 MiB > MAX_SUBRECT_BYTES (128 MiB).
+        let img = checkerboard(4, 4);
+        let err = crop_image(img, 0, 0, 8192, 8192)
+            .expect_err("> MAX_SUBRECT_BYTES must be rejected");
+        assert_eq!(err.code, ErrorCode::OutOfMemory);
+    }
+
+    #[test]
+    fn crop_at_max_subrect_bytes_succeeds() {
+        // Largest allowed output: 128 MiB / 4 = 32 Mpx.
+        // 8192 x 4096 x 4 = 128 MiB exactly. The source is tiny so
+        // everything is out-of-bounds (transparent black), but the
+        // allocation must succeed.
+        let img = checkerboard(4, 4);
+        let out = crop_image(img, 100, 100, 8192, 4096).expect("exact cap ok");
+        assert_eq!(out.width, 8192);
+        assert_eq!(out.height, 4096);
+    }
+
+    // ---- boundary-extension edges (P2-1) ----------------------------
+
+    #[test]
+    fn crop_extending_past_right_edge_copies_intersection_only() {
+        // Source 4x4, request (sx=2, sy=0, sw=4, sh=2) — i.e. 4
+        // columns wide starting at x=2.  Only x=[2,4) intersects
+        // the source; the last 2 columns must be transparent
+        // black, not wrapped or garbage.
+        let img = checkerboard(4, 4);
+        let out = crop_image(img, 2, 0, 4, 2).expect("rightward crop");
+        assert_eq!(out.width, 4);
+        assert_eq!(out.height, 2);
+        // Output (2, 0) = source (4, 0) = OOB = zero.
+        let idx = (0 * 4 + 2) * 4;
+        assert_eq!(&out.rgba[idx..idx + 4], &[0, 0, 0, 0]);
+        // Output (0, 0) = source (2, 0) = on (checker).
+        assert_eq!(&out.rgba[0..4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn crop_extending_past_bottom_edge_copies_intersection_only() {
+        // Source 4x4, request (sx=0, sy=3, sw=2, sh=4) — only the
+        // last row of source overlaps.  Remaining 3 rows must be
+        // transparent black (alpha=0), which is distinct from the
+        // checker's "off" pixels (alpha=255 opaque black).
+        let img = checkerboard(4, 4);
+        let out = crop_image(img, 0, 3, 2, 4).expect("downward crop");
+        assert_eq!(out.width, 2);
+        assert_eq!(out.height, 4);
+        // Output (0, 0) = source (0, 3) — checker "off" (x+y odd):
+        // RGB=0 but alpha=255.  Proves the copy took the real row.
+        assert_eq!(&out.rgba[0..4], &[0, 0, 0, 255]);
+        // Output (1, 0) = source (1, 3) — checker "on" (x+y even).
+        assert_eq!(&out.rgba[4..8], &[255, 255, 255, 255]);
+        // Output (0, 1) = source (0, 4) = OOB.  Must be fully
+        // transparent black; alpha=0 here distinguishes it from
+        // the "off" pixels above.
+        let idx = (1 * 2 + 0) * 4;
+        assert_eq!(&out.rgba[idx..idx + 4], &[0, 0, 0, 0]);
+        // All of rows 1..4 are OOB — every byte must be zero.
+        for y in 1..4 {
+            for x in 0..2 {
+                let i = ((y * 2 + x) * 4) as usize;
+                assert_eq!(
+                    &out.rgba[i..i + 4],
+                    &[0, 0, 0, 0],
+                    "OOB pixel at ({}, {}) not transparent",
+                    x, y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crop_one_pixel_intersection_at_max_sx() {
+        // sx = i32::MAX - 1 is a pathological-but-legal JS input;
+        // saturating_add must keep us from wrapping to negative
+        // before the src-bounds clamp.  Result is fully OOB.
+        let img = checkerboard(4, 4);
+        let out = crop_image(img, i32::MAX - 1, 0, 2, 2).expect("no panic on near-max sx");
+        assert_eq!(out.width, 2);
+        assert_eq!(out.height, 2);
+        assert!(out.rgba.iter().all(|&b| b == 0));
     }
 }

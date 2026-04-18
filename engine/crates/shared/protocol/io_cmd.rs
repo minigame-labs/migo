@@ -131,11 +131,110 @@ pub struct CompressedImage {
     pub data: Arc<Vec<u8>>,
 }
 
-/// Decoded image: either RGBA pixels or GPU-compressed blocks.
+/// Decoded image — one of three on-device representations:
+///
+/// * **`Rgba`** — host-allocated RGBA8 buffer. Compatible everywhere.
+///   Used for legacy/dev paths and as the fall-through for the
+///   `getImageData` / `readPixels` round-trip that needs CPU pixels.
+/// * **`Compressed`** — GPU-native block-compressed payload (e.g.
+///   ETC2 / ASTC unpacked from a KTX2 container). Uploaded directly
+///   via `glCompressedTexImage2D`, never decompressed on the CPU.
+/// * **`HardwareBuffer`** — Android `AHardwareBuffer`. The decoder
+///   wrote pixels straight into a GPU-importable buffer; uploaded
+///   via `eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID, …)` →
+///   `glEGLImageTargetTexture2DOES`, no CPU bytes touched. The
+///   refcount is held inside [`crate::protocol::ahb::OwnedAhb`].
+///
+/// `Clone` is cheap on every variant: `Rgba` clones an `Arc<Vec<u8>>`,
+/// `Compressed` clones an `Arc<Vec<u8>>`, `HardwareBuffer` clones an
+/// `Arc<AhbBox>` (one `_acquire` on Android).
 #[derive(Debug, Clone)]
 pub enum DecodedImage {
     Rgba(NormalizedImage),
     Compressed(CompressedImage),
+    HardwareBuffer(AhbImage),
+}
+
+/// AHB-backed decoded image. The buffer width/height come from the
+/// AHB descriptor, but they're cached at the wrapper level so
+/// downstream code doesn't need to re-`describe` the AHB on every
+/// access.
+#[derive(Debug, Clone)]
+pub struct AhbImage {
+    /// Logical image dimensions (≤ stride). Mirror what the JS
+    /// `Image.naturalWidth` / `naturalHeight` should report.
+    pub width: u32,
+    pub height: u32,
+    /// Owns the underlying `AHardwareBuffer*` (Android) or the mock
+    /// pixel buffer (other targets). Refcounted; `clone` is cheap.
+    pub ahb: crate::protocol::ahb::OwnedAhb,
+}
+
+impl AhbImage {
+    /// Build an `AhbImage`. The caller must ensure the AHB
+    /// descriptor's `width`/`height` match the logical image
+    /// dimensions; we assert in debug.
+    #[inline]
+    pub fn new(width: u32, height: u32, ahb: crate::protocol::ahb::OwnedAhb) -> Self {
+        debug_assert_eq!(ahb.desc().width, width, "AhbImage width mismatch");
+        debug_assert_eq!(ahb.desc().height, height, "AhbImage height mismatch");
+        Self { width, height, ahb }
+    }
+}
+
+impl DecodedImage {
+    /// Logical image width across all variants.
+    #[inline]
+    pub fn width(&self) -> u32 {
+        match self {
+            DecodedImage::Rgba(r) => r.width,
+            DecodedImage::Compressed(c) => c.width,
+            DecodedImage::HardwareBuffer(h) => h.width,
+        }
+    }
+
+    /// Logical image height across all variants.
+    #[inline]
+    pub fn height(&self) -> u32 {
+        match self {
+            DecodedImage::Rgba(r) => r.height,
+            DecodedImage::Compressed(c) => c.height,
+            DecodedImage::HardwareBuffer(h) => h.height,
+        }
+    }
+
+    /// True for the AHB variant. Hot path predicates that branch on
+    /// "do I need to memcpy this through CPU?" use this instead of
+    /// pattern-matching to keep the call site short.
+    #[inline]
+    pub fn is_hardware_buffer(&self) -> bool {
+        matches!(self, DecodedImage::HardwareBuffer(_))
+    }
+
+    /// Convert this image into a plain RGBA `NormalizedImage` if it
+    /// isn't already one. The AHB variant locks the buffer for CPU
+    /// read and copies the pixels out — used by `getImageData` /
+    /// `readPixels` paths that genuinely need CPU bytes. Compressed
+    /// images return `Err(NotImplemented)` because GPU-block decode
+    /// belongs to the renderer, not this protocol layer.
+    pub fn into_rgba(self) -> Result<NormalizedImage, crate::error::EngineError> {
+        match self {
+            DecodedImage::Rgba(r) => Ok(r),
+            DecodedImage::HardwareBuffer(AhbImage { width, height, ahb }) => {
+                let rgba = crate::protocol::ahb::read_rgba_from_ahb(&ahb).map_err(|e| {
+                    crate::error::EngineError::new(crate::error::ErrorCode::IoError)
+                        .with_msg("DecodedImage::into_rgba: AHB read failed")
+                        .with_detail(e.to_string())
+                })?;
+                Ok(NormalizedImage::new(width, height, rgba))
+            }
+            DecodedImage::Compressed(_) => Err(crate::error::EngineError::new(
+                crate::error::ErrorCode::Unsupported,
+            )
+            .with_msg("DecodedImage::into_rgba: GPU-compressed source")
+            .with_detail("decompress on the renderer or pass through GL_OES_compressed_*")),
+        }
+    }
 }
 
 /// Image load priority for scheduling.
@@ -151,21 +250,6 @@ pub enum ImagePriority {
 
 impl Default for ImagePriority {
     fn default() -> Self { Self::Normal }
-}
-
-impl DecodedImage {
-    pub fn width(&self) -> u32 {
-        match self {
-            Self::Rgba(img) => img.width,
-            Self::Compressed(img) => img.width,
-        }
-    }
-    pub fn height(&self) -> u32 {
-        match self {
-            Self::Rgba(img) => img.height,
-            Self::Compressed(img) => img.height,
-        }
-    }
 }
 
 /// Known image variant extensions for companion file lookup and cache keying.
@@ -190,4 +274,83 @@ pub fn path_stem(path: &str) -> String {
                 .unwrap_or(path)
                 .to_string()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ahb::{
+        AhbDesc, OwnedAhb, write_rgba_into_ahb,
+    };
+
+    fn checker_2x2() -> Vec<u8> {
+        // 2x2 RGBA, alternating opaque red / opaque blue.
+        vec![
+            255, 0, 0, 255, 0, 0, 255, 255,
+            0, 0, 255, 255, 255, 0, 0, 255,
+        ]
+    }
+
+    #[test]
+    fn into_rgba_passes_rgba_through_unchanged() {
+        let pixels = checker_2x2();
+        let img = DecodedImage::Rgba(NormalizedImage::new(2, 2, pixels.clone()));
+        let r = img.into_rgba().expect("rgba passthrough");
+        assert_eq!(*r.rgba, pixels);
+        assert_eq!(r.width, 2);
+        assert_eq!(r.height, 2);
+    }
+
+    #[test]
+    fn into_rgba_downgrades_hardware_buffer_with_identical_pixels() {
+        // The downgrade is the M2.6 contract: every byte that the
+        // decoder wrote into the AHB must come back out of `into_rgba`
+        // unchanged, regardless of the driver's row stride padding.
+        let pixels = checker_2x2();
+        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled(2, 2)).expect("alloc");
+        write_rgba_into_ahb(&ahb, &pixels).expect("write");
+        let img = DecodedImage::HardwareBuffer(AhbImage::new(2, 2, ahb));
+
+        let r = img.into_rgba().expect("ahb downgrade");
+        assert_eq!(*r.rgba, pixels);
+        assert_eq!(r.width, 2);
+        assert_eq!(r.height, 2);
+    }
+
+    #[test]
+    fn into_rgba_rejects_compressed() {
+        let img = DecodedImage::Compressed(CompressedImage {
+            width: 4,
+            height: 4,
+            vk_format: 147,
+            data: std::sync::Arc::new(vec![0u8; 32]),
+        });
+        let err = img.into_rgba().expect_err("compressed cannot downgrade");
+        assert_eq!(err.code, crate::error::ErrorCode::Unsupported);
+    }
+
+    #[test]
+    fn width_height_consistent_across_variants() {
+        // The `width()` / `height()` accessors must report the
+        // *logical* image dims, not the driver's padded stride.
+        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled(7, 5)).unwrap();
+        let img = DecodedImage::HardwareBuffer(AhbImage::new(7, 5, ahb));
+        assert_eq!(img.width(), 7);
+        assert_eq!(img.height(), 5);
+        assert!(img.is_hardware_buffer());
+    }
+
+    #[test]
+    fn cloning_decoded_image_does_not_copy_pixels() {
+        let pixels = checker_2x2();
+        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled(2, 2)).unwrap();
+        write_rgba_into_ahb(&ahb, &pixels).unwrap();
+        let img = DecodedImage::HardwareBuffer(AhbImage::new(2, 2, ahb));
+
+        let img2 = img.clone();
+        // Both clones see the same logical pixels.
+        let a = img.into_rgba().unwrap();
+        let b = img2.into_rgba().unwrap();
+        assert_eq!(*a.rgba, *b.rgba);
+    }
 }

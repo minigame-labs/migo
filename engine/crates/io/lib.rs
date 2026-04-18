@@ -1,5 +1,8 @@
+pub mod atomic_write;
 pub mod cost;
+pub mod count_min_sketch;
 pub mod derived_cache;
+pub mod kv_store;
 pub mod domain;
 mod fast_image_decoder;
 pub mod fs_ops;
@@ -17,8 +20,9 @@ pub mod task;
 mod zip_extract;
 
 pub use fast_image_decoder::{
-    CompressedImageInfo, crop_image, decode_image_fast, detect_compressed_format,
-    register_platform_decoder, resize_image,
+    CompressedImageInfo, crop_image, decode_image_fast, decode_image_to_any,
+    detect_compressed_format, register_platform_ahb_decoder, register_platform_decoder,
+    resize_image,
 };
 pub use image_cache::{CacheStats, CachedImage, ImageCache, global_cache};
 #[cfg(feature = "zip-extract")]

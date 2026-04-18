@@ -599,12 +599,21 @@ pub async fn read_image_rgba8(
                     derived_cache::load_derived(std::path::Path::new(cache_dir), &cache_key)
                 {
                     tracing::debug!("derived cache hit: {}", path_for_decode);
+                    shared::stats::io_metrics_global()
+                        .derived_cache_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(ReadImageResult {
                         cache_path: worker_source.cache_path,
                         image: cached,
                         source_generation: worker_source.source_generation,
                     });
                 }
+                // Missed -- the decoder will run below. Counted
+                // here rather than in the decode branch so cache
+                // stats reflect "we consulted the cache" exactly.
+                shared::stats::io_metrics_global()
+                    .derived_cache_misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
 
             let result = decode_selected_variant(variant, has_resize, target_width, target_height)?;
@@ -649,6 +658,7 @@ pub async fn read_image_rgba8(
                 match &decoded.image {
                     DecodedImage::Rgba(_) => "RGBA",
                     DecodedImage::Compressed(_) => "compressed",
+                    DecodedImage::HardwareBuffer(_) => "AHB",
                 },
                 start.elapsed()
             );
@@ -729,10 +739,18 @@ async fn decode_preload_result_with_scheduler(
                     }
                 }
 
-                let decoded = match decode_selected_variant(variant, false, None, None) {
-                    Ok(v) => v,
-                    Err(e) => return (path, Err(format!("{:?}", e))),
-                };
+                // Prefetch is explicitly a pre-warm of the RGBA LRU
+                // + the on-disk derived cache, so force the RGBA path
+                // here even on Android where the draw-time decoder
+                // would happily return an AHB.  AHBs can't be
+                // cached (no persistable representation, GPU-memory
+                // pressure) and without caching, prefetch would do
+                // decode work that `Image.src =` then repeats.
+                let decoded =
+                    match decode_selected_variant_rgba_only(variant, false, None, None) {
+                        Ok(v) => v,
+                        Err(e) => return (path, Err(format!("{:?}", e))),
+                    };
 
                 let dims = (decoded.width(), decoded.height());
                 if let DecodedImage::Rgba(ref rgba) = decoded {
@@ -1138,7 +1156,49 @@ fn decode_selected_variant(
         VariantDecision::DecodeRgba {
             data, path_hint, ..
         } => {
-            let img = decode_rgba(&data, &path_hint, has_resize, target_width, target_height)?;
+            // Resize forces the RGBA path: `resize_image` operates on
+            // CPU pixels, so asking for an AHB here would just trigger
+            // a download-then-resize-then-reupload shuffle.  Leave the
+            // AHB fast path to the common (non-resize) case.
+            if has_resize {
+                let img = decode_rgba(
+                    &data,
+                    &path_hint,
+                    has_resize,
+                    target_width,
+                    target_height,
+                )?;
+                return Ok(DecodedImage::Rgba(img));
+            }
+            // Happy path: let the decoder pick the best representation.
+            // On Android API 28+ this lands in an AHB, giving the
+            // renderer a zero-memcpy EGLImage import.  On everything
+            // else it transparently falls back to RGBA.
+            crate::fast_image_decoder::decode_image_to_any(&data, Some(&path_hint))
+        }
+    }
+}
+
+/// Prefetch-only variant: refuses the AHB fast path and always
+/// returns RGBA so the caller can warm the LRU + on-disk derived
+/// cache. `decode_image_fast` is called unconditionally — the
+/// platform decoder (BitmapFactory on Android) already handles its
+/// own fallbacks.
+fn decode_selected_variant_rgba_only(
+    variant: VariantDecision,
+    has_resize: bool,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+) -> Result<DecodedImage, EngineError> {
+    match variant {
+        VariantDecision::Compressed(img) | VariantDecision::CompressedFromCompanion(img) => {
+            Ok(DecodedImage::Compressed(img))
+        }
+        VariantDecision::DecodeRgba {
+            data, path_hint, ..
+        } => {
+            let img =
+                decode_rgba(&data, &path_hint, has_resize, target_width, target_height)?;
             Ok(DecodedImage::Rgba(img))
         }
     }
@@ -1269,9 +1329,7 @@ mod tests {
                 assert_eq!(image.width, 1);
                 assert_eq!(image.height, 1);
             }
-            shared::protocol::io_cmd::DecodedImage::Compressed(_) => {
-                panic!("expected cached RGBA image")
-            }
+            other => panic!("expected cached RGBA image, got {:?}", other),
         }
         assert_eq!(scheduler_run_count(), 1);
         assert_eq!(scheduler.pools().spawned_pool_count(), 0);

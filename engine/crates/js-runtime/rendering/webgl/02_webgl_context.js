@@ -31,6 +31,7 @@ import {
     op_alloc_gl_resource_id,
     op_webgl_get_error,
     op_webgl_get_context_attributes,
+    op_webgl_record_attributes,
     op_enable,
     op_disable,
     op_is_enabled,
@@ -248,7 +249,7 @@ class WebglObject {
 class WebGLRenderingContext {
     constructor(canvas, options) {
         this._canvas = canvas;
-        this._options = options;
+        this._options = options || {};
         this._canvasId = canvas._rid;
         // Resource IDs are allocated from a runtime-global counter in Rust.
         // Nested Map: programId -> Map(name -> location)
@@ -258,6 +259,33 @@ class WebGLRenderingContext {
         this._programParameterCache = new Map();
         // shaderId -> Map(pname -> value)
         this._shaderParameterCache = new Map();
+
+        // Record the negotiated attributes so `getContextAttributes()`
+        // returns real values instead of bare spec defaults.  We do
+        // not actually negotiate (backend is fixed RGBA8 + depth24 +
+        // stencil8); the stored values are the flags the caller
+        // requested, with missing properties defaulted per WebGL
+        // 1.0 s5.2.1.
+        const opts = this._options;
+        const powerPref =
+            opts.powerPreference === "high-performance"
+                ? 1
+                : opts.powerPreference === "low-power"
+                ? 2
+                : 0;
+        op_webgl_record_attributes(
+            this._canvasId,
+            opts.alpha !== false, // default true
+            opts.antialias !== false, // default true
+            opts.depth !== false, // default true
+            opts.stencil === true, // default false
+            opts.premultipliedAlpha !== false, // default true
+            opts.preserveDrawingBuffer === true, // default false
+            powerPref,
+            opts.failIfMajorPerformanceCaveat === true,
+            opts.desynchronized === true,
+            opts.xrCompatible === true,
+        );
     }
 
     /** Invalidate all cached locations/params for a given program. O(1). */
@@ -593,7 +621,53 @@ class WebGLRenderingContext {
             return this._oesVertexArrayObject ||
                 (this._oesVertexArrayObject = this._buildOesVertexArrayObject());
         }
+        // Instanced drawing: the ops are already the WebGL2 variants
+        // (ES 3.0 core), so we alias the ANGLE_/EXT_ spellings to the
+        // same bindings.  Cocos Creator 2.x's particle system and
+        // any sprite-batcher that uses instance IDs will go from
+        // N draw calls per frame to 1 -- the single largest
+        // draw-call reduction available for WebGL 1 content on this
+        // runtime.
+        if (name === 'ANGLE_instanced_arrays' ||
+            name === 'EXT_instanced_arrays' ||
+            name === 'WEBGL_instanced_arrays') {
+            return this._angleInstancedArrays ||
+                (this._angleInstancedArrays = this._buildAngleInstancedArrays());
+        }
         return null;
+    }
+
+    getSupportedExtensions() {
+        // Mirror the subset `getExtension` actually honours so
+        // engines that probe the list before requesting (three.js,
+        // pixi.js in some configurations) see the expected set.
+        return [
+            'OES_vertex_array_object',
+            'ANGLE_instanced_arrays',
+            'EXT_instanced_arrays',
+            'WEBGL_instanced_arrays',
+        ];
+    }
+
+    _buildAngleInstancedArrays() {
+        const ctx = this;
+        return {
+            // Published enum from the ANGLE_instanced_arrays spec.
+            VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE: 0x88FE,
+            drawArraysInstancedANGLE(mode, first, count, primcount) {
+                op_draw_arrays_instanced(
+                    ctx._canvasId, mode, first, count, primcount,
+                );
+            },
+            drawElementsInstancedANGLE(mode, count, type, offset, primcount) {
+                op_draw_elements_instanced(
+                    ctx._canvasId, mode, count, type, offset, primcount,
+                );
+            },
+            vertexAttribDivisorANGLE(index, divisor) {
+                op_vertex_attrib_divisor(ctx._canvasId, index, divisor);
+            },
+        };
     }
 
     _buildOesVertexArrayObject() {

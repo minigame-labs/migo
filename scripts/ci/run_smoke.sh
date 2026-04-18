@@ -24,4 +24,11 @@ echo "=== Smoke: Rust unit tests ==="
 (cd engine && cargo test --workspace --lib --doc)
 echo "    OK"
 
+echo "=== Smoke: Android feature gate ==="
+# Fails the build if the Rust image decoders leak into the Android
+# feature graph. ALLOW_SKIP=1 downgrades missing rustup targets to
+# a skip (developer machines); CI should always have the target.
+bash scripts/ci/check_android_feature_gate.sh aarch64-linux-android
+echo "    OK"
+
 echo "=== All smoke checks passed ==="

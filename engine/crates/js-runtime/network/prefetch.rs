@@ -159,18 +159,12 @@ pub async fn op_prefetch_assets(
                 Ok(u) => u,
                 Err(_) => continue, // skip invalid URLs
             };
-            // Only prefetch http/https
-            if url.scheme() != "http" && url.scheme() != "https" {
-                continue;
-            }
-            // Apply SSRF + domain whitelist + HTTPS enforcement
-            if super::fetch::reject_blocked_ip_literal(&url).is_err() {
-                continue;
-            }
-            if super::fetch::check_domain_whitelist(&url, &st).is_err() {
-                continue;
-            }
-            if super::fetch::check_https_policy(&url, &st).is_err() {
+            // Single gate call replaces the three-way SSRF + whitelist
+            // + HTTPS check.  Any rule failure -> quietly skip (this
+            // is a best-effort prefetch, errors must not leak out).
+            if super::gate::enforce_from_state(&url, &st, super::gate::GateKind::Prefetch)
+                .is_err()
+            {
                 continue;
             }
             valid_urls.push(url);

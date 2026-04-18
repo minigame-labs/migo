@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 
 use super::common::BACKGROUND_THROTTLE;
+use super::gate::{GateKind, enforce_from_state};
 
 type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -94,16 +95,23 @@ pub async fn op_ws_create(
 
     debug!("WebSocket connect: {}", url);
 
-    // Build request
+    // Parse once and run the shared network-policy gate BEFORE we
+    // do anything network-visible (DNS, TLS, TCP connect). The gate
+    // covers scheme whitelist, IP-literal block, domain whitelist,
+    // and HTTPS enforcement (wss required when enforce_https=true).
+    let parsed = deno_core::url::Url::parse(&url)
+        .map_err(|e| JsErrorBox::type_error(format!("Invalid WebSocket URL: {}", e)))?;
+    {
+        let st = state.borrow();
+        enforce_from_state(&parsed, &st, GateKind::WebSocket)?;
+    }
+
+    // Build request (post-gate; `into_client_request` only re-validates
+    // the URL shape, not the policy).
     let mut request = url
         .into_client_request()
         .map_err(|e| JsErrorBox::generic(format!("Invalid WebSocket URL: {}", e)))?;
-
-    // Validate scheme
     let scheme = request.uri().scheme_str().unwrap_or("");
-    if scheme != "ws" && scheme != "wss" {
-        return Err(JsErrorBox::type_error("URL scheme must be ws:// or wss://"));
-    }
 
     // SSRF prevention: resolve DNS, check ALL addresses, then connect
     // to the verified address directly.  This eliminates the double-

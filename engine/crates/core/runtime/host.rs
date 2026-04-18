@@ -627,11 +627,26 @@ impl Host {
 
             HostCommand::OnMemoryWarning { level } => {
                 // Android ComponentCallbacks2 trim memory levels.
+                // Release a proportional slice of the image cache
+                // *before* dispatching to JS so the game's
+                // `onMemoryWarning` handler sees a fresher
+                // `getPerformance().memory` reading and doesn't
+                // panic-free anything we already freed.
+                let trim = io::image_cache::TrimLevel::from_android(level);
+                let freed = io::image_cache::global_cache().trim(trim);
                 match level {
-                    5 => tracing::info!("Memory pressure: RUNNING_MODERATE"),
-                    10 => tracing::warn!("Memory pressure: RUNNING_LOW"),
-                    15 => tracing::warn!("Memory pressure: RUNNING_CRITICAL"),
-                    _ => tracing::debug!("Memory warning level {level}"),
+                    5 => tracing::info!(
+                        "Memory pressure: RUNNING_MODERATE (image cache freed {freed}B)"
+                    ),
+                    10 => tracing::warn!(
+                        "Memory pressure: RUNNING_LOW (image cache freed {freed}B)"
+                    ),
+                    15 => tracing::warn!(
+                        "Memory pressure: RUNNING_CRITICAL (image cache freed {freed}B)"
+                    ),
+                    _ => tracing::debug!(
+                        "Memory warning level {level} (image cache freed {freed}B)"
+                    ),
                 }
                 self.js.dispatch_memory_warning(level);
                 Ok(())

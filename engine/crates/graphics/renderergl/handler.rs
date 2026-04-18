@@ -186,11 +186,17 @@ impl RendererGL {
                 height,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                // Values are in physical (buffer) pixels — no DPR scaling needed,
-                // matching browser WebGL semantics.
-                unsafe { gl.viewport(x, y, width as i32, height as i32) };
-                cm.gl_state.entry(canvas_id).or_default().viewport =
-                    Some((x, y, width as i32, height as i32));
+                // Dedup against the shadow state: many engines set
+                // the same viewport every frame (or even every draw
+                // if a sub-system is over-cautious).  The GL call is
+                // not free — it's one of the handful of driver round
+                // trips that can't be batched with anything else.
+                // Values are in physical (buffer) pixels — no DPR
+                // scaling, matching browser WebGL semantics.
+                let entry = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_viewport(entry, x, y, width as i32, height as i32) {
+                    unsafe { gl.viewport(x, y, width as i32, height as i32) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1328,7 +1334,10 @@ impl RendererGL {
                 param,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.pixel_store_i32(pname, param) };
+                let entry = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_pixel_store_i32(entry, pname, param) {
+                    unsafe { gl.pixel_store_i32(pname, param) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1469,7 +1478,10 @@ impl RendererGL {
                 mode_alpha,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.blend_equation_separate(mode_rgb, mode_alpha) };
+                let entry = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_blend_equation_separate(entry, mode_rgb, mode_alpha) {
+                    unsafe { gl.blend_equation_separate(mode_rgb, mode_alpha) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1507,7 +1519,10 @@ impl RendererGL {
                 far,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.depth_range_f32(near, far) };
+                let entry = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_depth_range(entry, near, far) {
+                    unsafe { gl.depth_range_f32(near, far) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1518,7 +1533,10 @@ impl RendererGL {
                 mask,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.stencil_func(func, ref_, mask) };
+                let entry = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_stencil_func(entry, glow::FRONT_AND_BACK, func, ref_, mask) {
+                    unsafe { gl.stencil_func(func, ref_, mask) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1530,7 +1548,10 @@ impl RendererGL {
                 mask,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.stencil_func_separate(face, func, ref_, mask) };
+                let entry = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_stencil_func(entry, face, func, ref_, mask) {
+                    unsafe { gl.stencil_func_separate(face, func, ref_, mask) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1541,7 +1562,10 @@ impl RendererGL {
                 zpass,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.stencil_op(fail, zfail, zpass) };
+                let entry = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_stencil_op(entry, glow::FRONT_AND_BACK, fail, zfail, zpass) {
+                    unsafe { gl.stencil_op(fail, zfail, zpass) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1553,13 +1577,19 @@ impl RendererGL {
                 zpass,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.stencil_op_separate(face, fail, zfail, zpass) };
+                let entry = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_stencil_op(entry, face, fail, zfail, zpass) {
+                    unsafe { gl.stencil_op_separate(face, fail, zfail, zpass) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
             GLCmd::StencilMask { canvas_id, mask } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.stencil_mask(mask) };
+                let entry = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_stencil_mask(entry, glow::FRONT_AND_BACK, mask) {
+                    unsafe { gl.stencil_mask(mask) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 
@@ -1569,7 +1599,10 @@ impl RendererGL {
                 mask,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                unsafe { gl.stencil_mask_separate(face, mask) };
+                let entry = cm.gl_state.entry(canvas_id).or_default();
+                if st::update_stencil_mask(entry, face, mask) {
+                    unsafe { gl.stencil_mask_separate(face, mask) };
+                }
                 Ok(DamageEffect::NoDamage)
             }
 

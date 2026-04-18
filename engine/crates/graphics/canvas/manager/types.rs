@@ -174,21 +174,69 @@ pub(crate) struct CanvasGLState {
     /// Which vertex-attribute array indices are enabled.  Keyed by
     /// attribute index (0..=MAX_VERTEX_ATTRIBS-1); presence = enabled.
     pub enabled_vertex_attribs: HashSet<u32>,
-    /// Shadow for `glVertexAttribPointer`: keyed by (index), value is
-    /// a fingerprint of (size, type, normalized, stride, offset) so a
-    /// repeat call with identical layout skips the driver round-trip.
-    /// Used by Cocos Creator 2.x's WebGL 1 path without
-    /// OES_vertex_array_object — the hottest driver call in that
-    /// pipeline when games draw thousands of sprites per frame.
-    pub vertex_attrib_pointer_fp: HashMap<u32, VertexAttribPointerFp>,
+    /// Shadow for `glVertexAttribPointer`: keyed by `(vao, index)`,
+    /// value is a fingerprint of (size, type, normalized, stride,
+    /// offset, array_buffer).  A repeat call with identical
+    /// fingerprint against the same `(vao, index)` slot skips the
+    /// driver round-trip — the hottest driver call in Cocos Creator
+    /// 2.x's no-OES_VAO code path when games draw thousands of
+    /// sprites per frame.
+    ///
+    /// Keyed on `(vao, index)` (not just `index`) because VAOs scope
+    /// their own vertex attrib state: ping-ponging between VAO A and
+    /// VAO B on the same `index` would otherwise make each switch's
+    /// shadow overwrite the previous, losing dedup benefits for the
+    /// other VAO.
+    pub vertex_attrib_pointer_fp: HashMap<(u32, u32), VertexAttribPointerFp>,
     /// `glVertexAttribDivisor(index, divisor)` shadow.  ANGLE / WebGL 2
     /// games instancing sprites update this per attribute.
     pub vertex_attrib_divisor: HashMap<u32, u32>,
+
+    // ---- Stencil state shadows (P14) ----------------------------------
+    //
+    // UI systems with many stencil-masked layers repeat these calls every
+    // frame; each is a driver round-trip.  Per-face variants use the same
+    // fingerprint applied to both FRONT and BACK faces, so a single
+    // `StencilFp` variant covers `StencilFunc` / `StencilFuncSeparate` /
+    // `StencilOp` / `StencilOpSeparate` / `StencilMask` /
+    // `StencilMaskSeparate`.
+    /// `(func, ref, mask)` per cull face.  Key = FRONT / BACK.
+    pub stencil_func: HashMap<u32, (u32, i32, u32)>,
+    /// `(sfail, dpfail, dppass)` per cull face.
+    pub stencil_op: HashMap<u32, (u32, u32, u32)>,
+    /// Write-mask per cull face.
+    pub stencil_mask: HashMap<u32, u32>,
+
+    // ---- Pixel-storei shadows (P14) -----------------------------------
+    //
+    // Games typically set these once per texture upload.  Most engines
+    // flip `UNPACK_FLIP_Y_WEBGL` and `UNPACK_PREMULTIPLY_ALPHA_WEBGL`
+    // pairs back-to-back across many draws with identical values.
+    /// `pname → param` shadow, enumerated across the subset of
+    /// parameters WebGL / GL ES exposes.  A future expansion can
+    /// move specific pnames out into typed fields (e.g.
+    /// `unpack_alignment`) where stricter typing helps — but
+    /// the open-coded HashMap reliably dedups ANY `pixelStorei`
+    /// pname without per-pname wiring.
+    pub pixel_store_i32: HashMap<u32, i32>,
 }
 
-/// Fingerprint of the arguments to `glVertexAttribPointer`.  Kept
-/// small and `Eq` so equality check inside `update_vertex_attrib_pointer`
-/// is just a 16-byte comparison.
+/// Fingerprint of the arguments to `glVertexAttribPointer`.
+///
+/// WebGL 1.0 §5.14.10 and OpenGL ES 3.0 §2.9.5 both specify that
+/// `vertexAttribPointer` *captures* the currently bound
+/// `ARRAY_BUFFER` as the buffer source for that attribute.  Two
+/// calls with identical (size, type, normalized, stride, offset)
+/// against different bound buffers are NOT equivalent and MUST
+/// re-issue to the driver — otherwise the second draw paints from
+/// the wrong vertex buffer, a class of bug that's nearly
+/// impossible to reproduce outside of real game content.
+///
+/// That's why `array_buffer` is part of the fingerprint.  Keyed
+/// per-(vao, index) so the tracker maintains one entry per
+/// logical attribute slot; the `array_buffer` component inside
+/// the fingerprint differentiates same-index-same-layout-
+/// different-buffer calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VertexAttribPointerFp {
     pub size: i32,
@@ -200,6 +248,12 @@ pub struct VertexAttribPointerFp {
     /// because VAOs capture vertex attrib state — a repeat call
     /// after `bindVertexArray` change must NOT be deduped.
     pub vao: u32,
+    /// `ARRAY_BUFFER` binding captured at the time of the
+    /// `vertexAttribPointer` call.  `None` = no buffer bound
+    /// (the attribute points at client-side memory, which WebGL
+    /// rejects anyway) or the tracker hasn't observed a bind yet
+    /// (force re-issue to establish shadow).
+    pub array_buffer: Option<u32>,
 }
 
 impl Default for CanvasGLState {
@@ -238,6 +292,10 @@ impl Default for CanvasGLState {
             enabled_vertex_attribs: HashSet::new(),
             vertex_attrib_pointer_fp: HashMap::new(),
             vertex_attrib_divisor: HashMap::new(),
+            stencil_func: HashMap::new(),
+            stencil_op: HashMap::new(),
+            stencil_mask: HashMap::new(),
+            pixel_store_i32: HashMap::new(),
         }
     }
 }
@@ -276,6 +334,16 @@ impl CanvasGLState {
         self.enabled_vertex_attribs.clear();
         self.vertex_attrib_pointer_fp.clear();
         self.vertex_attrib_divisor.clear();
+        // P14 shadows: Skia does not touch stencil state (Ganesh GL
+        // backend leaves stencil disabled by default) or pixelStorei
+        // (those are upload-path knobs not used during draw).
+        // Still, clearing them on the boundary matches the behaviour
+        // of every other tracked slot and keeps the "after boundary,
+        // next call MUST re-issue" contract uniform.
+        self.stencil_func.clear();
+        self.stencil_op.clear();
+        self.stencil_mask.clear();
+        self.pixel_store_i32.clear();
     }
 
     pub fn invalidate_after_external_gl_use(&mut self) {
@@ -312,10 +380,16 @@ impl CanvasGLState {
         self.unpack_alignment = None;
         self.pack_alignment = None;
         self.bound_vao = None;
-        // `uniform_cache` survives because uniforms are scoped to a
-        // program, and the program itself is re-bound on the next GL
-        // draw.  Clearing it would only save memory, not correctness.
-        self.uniform_cache.clear();
+        // `uniform_cache` intentionally survives: uniforms are scoped
+        // to a program, not to the shared GL context.  Skia's
+        // rendering on the same canvas touches its own shader
+        // programs — never the WebGL programs our cache keys are
+        // attached to — so the dedup table remains accurate across
+        // the boundary.  Clearing it here would force every frame
+        // to re-issue `glUniform*` calls the app already deduped,
+        // which is the dominant GL op category in shader-heavy
+        // workloads.  Regression pinned by `uniform_cache_survives_
+        // external_gl_use` in `state_tracker.rs`.
         // Clear the P11 dedup fields too.
         self.invalidate_p11_shadow();
     }

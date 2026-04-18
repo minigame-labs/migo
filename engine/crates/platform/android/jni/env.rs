@@ -26,6 +26,16 @@ pub fn init_jni_env(jvm: JavaVM) -> Result<(), String> {
         crate::android::jni::outbound::decode_image_rgba_jni(data)
     });
 
+    // Register the zero-copy AHB decoder (API 28+ writes directly
+    // into an AHardwareBuffer; on API 26/27 falls back to BitmapFactory
+    // + Bitmap.copy(Config.HARDWARE); Rust imports via EGLImage).
+    // `decode_image_to_any` picks this path preferentially and
+    // transparently falls back to `PLATFORM_DECODER` per-image if AHB
+    // decode fails (e.g. vendor driver quirk).
+    io::register_platform_ahb_decoder(|data| {
+        crate::android::jni::outbound::decode_image_ahb_jni(data)
+    });
+
     Ok(())
 }
 

@@ -1344,3 +1344,497 @@ pub struct DrawImageEntry {
     pub dw: f32,
     pub dh: f32,
 }
+
+// ---------------------------------------------------------------------------
+// Approximate deep-size accounting (for frame-collector budgeting)
+// ---------------------------------------------------------------------------
+//
+// `size_of::<Cmd>()` alone misses every `Vec<u8>` / `String` / `Arc<Vec<u8>>`
+// payload carried by the variant.  The frame collector's 4MB soft budget
+// used to tick up by the enum-wrapper size per push, which for a single
+// `bufferData(8MB mesh)` reported ~200 bytes instead of 8MB — so auto-flush
+// never fired and the JS heap could grow unbounded.  Chromium's
+// `CanvasResourceProvider::EstimatedSizeInBytes` walks recorded ops and
+// their pinned resources for the same reason: only pessimistic byte
+// estimates give a useful backpressure signal.
+//
+// The methods below return:
+//     size_of::<Self>()  +  sum of heap-owned storage on the live variant
+//
+// Heap storage uses `capacity()` (not `len()`) because growth-over-shrink
+// inside the collector doesn't release bytes, and the ring-vec the
+// collector holds retains original capacities.
+
+impl GLCmd {
+    /// Return the canvas this command targets, if any.  Resource-context
+    /// commands (shader/program create/delete/link, contextless metadata
+    /// queries) return `None`; they don't dirty any per-canvas Skia
+    /// cache and therefore don't need to mark any `Canvas2DContext`
+    /// stale after the WebGL batch completes.
+    ///
+    /// Used by the render thread's `execute_gl_batch` to narrow down
+    /// which `Canvas2DContext::skia_state_stale` flags to flip, in
+    /// place of the previous over-conservative broadcast to every
+    /// live 2D context.
+    pub fn touches_canvas(&self) -> Option<CanvasId> {
+        // Exhaustive over every variant that carries a `canvas_id`
+        // field — enumerated so the render thread's per-context
+        // stale marking picks up EVERY state-mutating command, not
+        // just the hot ones.  Variants without `canvas_id`
+        // (resource-context ops like `CreateShader`/`LinkProgram`
+        // that don't touch per-canvas GL binding state) return
+        // `None`; those can't dirty a Canvas2DContext's Skia
+        // tracking on their own.
+        //
+        // Any new GLCmd variant with a `canvas_id` field MUST be
+        // added here — otherwise `execute_gl_batch`'s scoped stale
+        // marking silently fails to flip the right flag, and the
+        // subsequent Canvas2D draw would trust stale Skia state.
+        match self {
+            GLCmd::Viewport { canvas_id, .. }
+            | GLCmd::Clear { canvas_id, .. }
+            | GLCmd::ClearColor { canvas_id, .. }
+            | GLCmd::ClearDepth { canvas_id, .. }
+            | GLCmd::ClearStencil { canvas_id, .. }
+            | GLCmd::CreateProgram { canvas_id, .. }
+            | GLCmd::CreateShader { canvas_id, .. }
+            | GLCmd::UseProgram { canvas_id, .. }
+            | GLCmd::DrawArrays { canvas_id, .. }
+            | GLCmd::DrawElements { canvas_id, .. }
+            | GLCmd::GetAttribLocation { canvas_id, .. }
+            | GLCmd::GetActiveAttrib { canvas_id, .. }
+            | GLCmd::GetActiveUniform { canvas_id, .. }
+            | GLCmd::EnableVertexAttribArray { canvas_id, .. }
+            | GLCmd::DisableVertexAttribArray { canvas_id, .. }
+            | GLCmd::VertexAttribPointer { canvas_id, .. }
+            | GLCmd::VertexAttribDivisor { canvas_id, .. }
+            | GLCmd::CreateBuffer { canvas_id, .. }
+            | GLCmd::BindBuffer { canvas_id, .. }
+            | GLCmd::BufferData { canvas_id, .. }
+            | GLCmd::BufferSubData { canvas_id, .. }
+            | GLCmd::GetUniformLocation { canvas_id, .. }
+            | GLCmd::Enable { canvas_id, .. }
+            | GLCmd::Disable { canvas_id, .. }
+            | GLCmd::IsEnabled { canvas_id, .. }
+            | GLCmd::ActiveTexture { canvas_id, .. }
+            | GLCmd::CreateTexture { canvas_id, .. }
+            | GLCmd::BindTexture { canvas_id, .. }
+            | GLCmd::TexParameteri { canvas_id, .. }
+            | GLCmd::TexParameterf { canvas_id, .. }
+            | GLCmd::GenerateMipmap { canvas_id, .. }
+            | GLCmd::PixelStorei { canvas_id, .. }
+            | GLCmd::BlendFunc { canvas_id, .. }
+            | GLCmd::BlendFuncSeparate { canvas_id, .. }
+            | GLCmd::BlendEquation { canvas_id, .. }
+            | GLCmd::BlendEquationSeparate { canvas_id, .. }
+            | GLCmd::BlendColor { canvas_id, .. }
+            | GLCmd::DepthFunc { canvas_id, .. }
+            | GLCmd::DepthMask { canvas_id, .. }
+            | GLCmd::DepthRange { canvas_id, .. }
+            | GLCmd::CullFace { canvas_id, .. }
+            | GLCmd::FrontFace { canvas_id, .. }
+            | GLCmd::LineWidth { canvas_id, .. }
+            | GLCmd::PolygonOffset { canvas_id, .. }
+            | GLCmd::StencilFunc { canvas_id, .. }
+            | GLCmd::StencilFuncSeparate { canvas_id, .. }
+            | GLCmd::StencilOp { canvas_id, .. }
+            | GLCmd::StencilOpSeparate { canvas_id, .. }
+            | GLCmd::StencilMask { canvas_id, .. }
+            | GLCmd::StencilMaskSeparate { canvas_id, .. }
+            | GLCmd::ColorMask { canvas_id, .. }
+            | GLCmd::Scissor { canvas_id, .. }
+            | GLCmd::Hint { canvas_id, .. }
+            | GLCmd::CreateFramebuffer { canvas_id, .. }
+            | GLCmd::BindFramebuffer { canvas_id, .. }
+            | GLCmd::CheckFramebufferStatus { canvas_id, .. }
+            | GLCmd::FramebufferRenderbuffer { canvas_id, .. }
+            | GLCmd::CreateRenderbuffer { canvas_id, .. }
+            | GLCmd::BindRenderbuffer { canvas_id, .. }
+            | GLCmd::RenderbufferStorage { canvas_id, .. }
+            | GLCmd::RenderbufferStorageMultisample { canvas_id, .. }
+            | GLCmd::ReadPixels { canvas_id, .. }
+            | GLCmd::GetParameter { canvas_id, .. }
+            | GLCmd::BlitFramebuffer { canvas_id, .. }
+            | GLCmd::InvalidateFramebuffer { canvas_id, .. }
+            | GLCmd::CreateSampler { canvas_id, .. }
+            | GLCmd::BindSampler { canvas_id, .. }
+            | GLCmd::CreateVertexArray { canvas_id, .. }
+            | GLCmd::BindVertexArray { canvas_id, .. }
+            | GLCmd::DrawArraysInstanced { canvas_id, .. }
+            | GLCmd::DrawElementsInstanced { canvas_id, .. }
+            | GLCmd::BindBufferBase { canvas_id, .. }
+            | GLCmd::BindBufferRange { canvas_id, .. }
+            | GLCmd::DrawBuffers { canvas_id, .. }
+            | GLCmd::ReadBuffer { canvas_id, .. }
+            | GLCmd::FenceSync { canvas_id, .. } => Some(*canvas_id),
+
+            // Everything else — resource-context commands (shader
+            // create/source/compile/link, program create/attach/
+            // link/delete, buffer/texture/sampler/vao/fbo/rbo
+            // delete, uniform calls routed via `UseProgram`'s
+            // canvas_id above, etc.) doesn't bind any per-canvas
+            // GL state that a Canvas2DContext cares about.  The
+            // `#[non_exhaustive]` fall-through also catches any
+            // future variant that forgets to add its canvas_id
+            // here — conservative behaviour is "don't mark
+            // anything stale"; a real state leak will surface as
+            // a render-time bug and force us to add the variant.
+            _ => None,
+        }
+    }
+
+    /// Best-effort upper bound on the bytes this command retains, including
+    /// heap-owned payload.  Callers use it as a soft signal to decide when
+    /// to flush a barrier; accuracy within ~1 KB is fine.
+    #[allow(clippy::too_many_lines)]
+    pub fn approx_deep_size_bytes(&self) -> usize {
+        let base = std::mem::size_of::<GLCmd>();
+        base + match self {
+            // Shader source strings (string pool per program).
+            GLCmd::ShaderSource { source, .. } => source.capacity(),
+
+            // Name strings carried to the render thread for lookup.
+            // `GetUniformLocation` / `GetAttribLocation` / `GetUniformBlockIndex`
+            // carry a `name: String`; `GetActiveAttrib` / `GetActiveUniform`
+            // only have an index and return the name in the response,
+            // so they have no outbound string payload.
+            GLCmd::GetUniformLocation { name, .. }
+            | GLCmd::GetAttribLocation { name, .. }
+            | GLCmd::GetUniformBlockIndex { name, .. } => name.capacity(),
+
+            // Buffer uploads — the dominant budget item for 3D games.
+            // `BufferData.data` is optional (spec allows passing
+            // `null` to reserve without upload).
+            GLCmd::BufferData { data, .. } => data.as_ref().map_or(0, |v| v.capacity()),
+            GLCmd::BufferSubData { data, .. } => data.capacity(),
+
+            // Texture uploads (RGBA or compressed block).  `TexImage2D`
+            // is optional data (reservation vs upload); `TexSubImage2D`
+            // is always `Arc<Vec<u8>>` with a concrete payload.
+            GLCmd::TexImage2D { data, .. } => {
+                data.as_ref().map_or(0, |arc| arc.capacity())
+            }
+            GLCmd::TexSubImage2D { data, .. } => data.capacity(),
+            GLCmd::CompressedTexImage2D { data, .. } => data.capacity(),
+            GLCmd::CompressedTexSubImage2D { data, .. } => data.capacity(),
+
+            // Uniform array uploads — scalar per element, but a
+            // `uniform4fv(bones[100])` is 400 floats = 1.6 KB.
+            GLCmd::Uniform1iv { value, .. }
+            | GLCmd::Uniform2iv { value, .. }
+            | GLCmd::Uniform3iv { value, .. }
+            | GLCmd::Uniform4iv { value, .. } => value.capacity() * std::mem::size_of::<i32>(),
+            GLCmd::Uniform1fv { value, .. }
+            | GLCmd::Uniform2fv { value, .. }
+            | GLCmd::Uniform3fv { value, .. }
+            | GLCmd::Uniform4fv { value, .. }
+            | GLCmd::UniformMatrix2fv { value, .. }
+            | GLCmd::UniformMatrix3fv { value, .. }
+            | GLCmd::UniformMatrix4fv { value, .. } => {
+                value.capacity() * std::mem::size_of::<f32>()
+            }
+
+            // WebGL 2 framebuffer metadata arrays.
+            GLCmd::InvalidateFramebuffer { attachments, .. } => {
+                attachments.capacity() * std::mem::size_of::<u32>()
+            }
+            GLCmd::DrawBuffers { buffers, .. } => {
+                buffers.capacity() * std::mem::size_of::<u32>()
+            }
+
+            // All other variants are pure scalars / Copy payloads — the
+            // enum stack size already accounts for them.
+            _ => 0,
+        }
+    }
+}
+
+impl Canvas2DCmd {
+    /// See [`GLCmd::approx_deep_size_bytes`].  Canvas 2D variants own
+    /// text strings and image-batch vectors; everything else is
+    /// inline-scalar.
+    #[allow(clippy::too_many_lines)]
+    pub fn approx_deep_size_bytes(&self) -> usize {
+        let base = std::mem::size_of::<Canvas2DCmd>();
+        base + match self {
+            Canvas2DCmd::FillText { text, .. }
+            | Canvas2DCmd::StrokeText { text, .. }
+            | Canvas2DCmd::MeasureText { text, .. } => text.capacity(),
+            Canvas2DCmd::SetFont { font, .. } => font.capacity(),
+            Canvas2DCmd::SetLineDash { segments } => {
+                segments.capacity() * std::mem::size_of::<f32>()
+            }
+            Canvas2DCmd::SetFillStyleGradient { stops, .. }
+            | Canvas2DCmd::SetStrokeStyleGradient { stops, .. } => {
+                stops.capacity() * std::mem::size_of::<GradientStop>()
+            }
+            Canvas2DCmd::DrawImageBatch { draws } => {
+                draws.capacity() * std::mem::size_of::<DrawImageEntry>()
+            }
+            // Everything else is Copy / scalar-only.
+            _ => 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod approx_size_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn scalar_variant_reports_just_enum_size() {
+        let cmd = Canvas2DCmd::Save;
+        assert_eq!(
+            cmd.approx_deep_size_bytes(),
+            std::mem::size_of::<Canvas2DCmd>(),
+        );
+    }
+
+    #[test]
+    fn fill_text_includes_string_capacity() {
+        let mut s = String::with_capacity(1024);
+        s.push_str("hello");
+        let cmd = Canvas2DCmd::FillText {
+            text: s,
+            x: 0.0,
+            y: 0.0,
+            max_width: 0.0,
+        };
+        let size = cmd.approx_deep_size_bytes();
+        assert!(
+            size >= std::mem::size_of::<Canvas2DCmd>() + 1024,
+            "got {size}, expected >= enum_size + 1024"
+        );
+    }
+
+    #[test]
+    fn buffer_data_covers_heap_bytes() {
+        let data = vec![0u8; 8 * 1024 * 1024]; // 8 MB mesh
+        let size_hint = data.len() as i32;
+        let cmd = GLCmd::BufferData {
+            canvas_id: CanvasId::from(1u32),
+            target: 0x8892,
+            size: size_hint,
+            data: Some(data),
+            usage: 0x88E4,
+        };
+        let size = cmd.approx_deep_size_bytes();
+        // Must include the full 8 MB payload, not just the enum shell.
+        assert!(
+            size >= 8 * 1024 * 1024,
+            "BufferData(8MB) reported only {size} bytes — budget will under-count"
+        );
+    }
+
+    #[test]
+    fn buffer_data_with_none_reports_only_enum() {
+        // Spec-legal `bufferData(target, size, usage)` reserves
+        // without upload — data is None.
+        let cmd = GLCmd::BufferData {
+            canvas_id: CanvasId::from(1u32),
+            target: 0x8892,
+            size: 1024,
+            data: None,
+            usage: 0x88E4,
+        };
+        assert_eq!(cmd.approx_deep_size_bytes(), std::mem::size_of::<GLCmd>());
+    }
+
+    #[test]
+    fn tex_image_2d_with_none_data_reports_only_enum() {
+        let cmd = GLCmd::TexImage2D {
+            canvas_id: CanvasId::from(1u32),
+            target: 0x0DE1,
+            level: 0,
+            internalformat: 0x1908,
+            width: 0,
+            height: 0,
+            border: 0,
+            format: 0x1908,
+            type_: 0x1401,
+            data: None,
+        };
+        assert_eq!(cmd.approx_deep_size_bytes(), std::mem::size_of::<GLCmd>());
+    }
+
+    #[test]
+    fn tex_sub_image_2d_counts_arc_payload() {
+        let data = Arc::new(vec![0u8; 256 * 1024]);
+        let cmd = GLCmd::TexSubImage2D {
+            canvas_id: CanvasId::from(1u32),
+            target: 0x0DE1,
+            level: 0,
+            xoffset: 0,
+            yoffset: 0,
+            width: 256,
+            height: 256,
+            format: 0x1908,
+            type_: 0x1401,
+            data,
+        };
+        assert!(cmd.approx_deep_size_bytes() >= 256 * 1024);
+    }
+
+    #[test]
+    fn compressed_tex_image_2d_counts_vec_capacity() {
+        let cmd = GLCmd::CompressedTexImage2D {
+            canvas_id: CanvasId::from(1u32),
+            target: 0x0DE1,
+            level: 0,
+            internalformat: 0x8D64,
+            width: 128,
+            height: 128,
+            border: 0,
+            data: vec![0u8; 64 * 1024],
+        };
+        assert!(cmd.approx_deep_size_bytes() >= 64 * 1024);
+    }
+
+    #[test]
+    fn uniform_matrix_4fv_counts_f32_slice() {
+        // 3 matrices of 16 floats each = 48 floats = 192 bytes.
+        let value = vec![0.0f32; 48];
+        let cmd = GLCmd::UniformMatrix4fv {
+            canvas_id: CanvasId::from(1u32),
+            location: Some(0),
+            transpose: false,
+            value,
+        };
+        let size = cmd.approx_deep_size_bytes();
+        assert!(size >= std::mem::size_of::<GLCmd>() + 48 * 4);
+    }
+
+    #[test]
+    fn draw_image_batch_counts_entry_slots() {
+        let draws: Vec<DrawImageEntry> = (0..100)
+            .map(|_| DrawImageEntry {
+                image_id: 1,
+                sx: 0.0,
+                sy: 0.0,
+                sw: 1.0,
+                sh: 1.0,
+                dx: 0.0,
+                dy: 0.0,
+                dw: 1.0,
+                dh: 1.0,
+            })
+            .collect();
+        let expected = 100 * std::mem::size_of::<DrawImageEntry>();
+        let cmd = Canvas2DCmd::DrawImageBatch { draws };
+        assert!(cmd.approx_deep_size_bytes() >= expected);
+    }
+
+    // ---- touches_canvas (P1-2 stale marking) --------------------
+
+    #[test]
+    fn touches_canvas_returns_canvas_for_state_mutating_ops() {
+        let cid = CanvasId::from(42u32);
+        let cmd = GLCmd::UseProgram {
+            canvas_id: cid,
+            program_id: 1u32,
+        };
+        assert_eq!(cmd.touches_canvas(), Some(cid));
+
+        let cmd = GLCmd::BindBuffer {
+            canvas_id: cid,
+            target: 0x8892,
+            buffer: None,
+        };
+        assert_eq!(cmd.touches_canvas(), Some(cid));
+
+        let cmd = GLCmd::DrawArrays {
+            canvas_id: cid,
+            mode: 0x0004,
+            first: 0,
+            count: 3,
+        };
+        assert_eq!(cmd.touches_canvas(), Some(cid));
+    }
+
+    #[test]
+    fn touches_canvas_returns_none_for_resource_context_ops() {
+        // `LinkProgram` / `CompileShader` / `AttachShader` run on
+        // the resource EGL context and don't carry a canvas_id —
+        // they can't bind per-canvas state, so no Canvas2DContext
+        // needs invalidation.  The `execute_gl_batch` scoped stale-
+        // marking relies on these returning None to skip the
+        // broadcast overhead.
+        let cmd = GLCmd::LinkProgram { program_id: 1u32 };
+        assert_eq!(cmd.touches_canvas(), None);
+
+        let cmd = GLCmd::CompileShader { shader_id: 1u32 };
+        assert_eq!(cmd.touches_canvas(), None);
+    }
+
+    #[test]
+    fn batch_with_two_canvases_collects_both_for_scoped_stale() {
+        // Simulates `execute_gl_batch`'s collection loop: a mixed
+        // batch touching two canvases MUST report both so neither
+        // context's Skia cache gets left trusting stale state.
+        let a = CanvasId::from(1u32);
+        let b = CanvasId::from(2u32);
+        let commands = vec![
+            GLCmd::UseProgram {
+                canvas_id: a,
+                program_id: 1u32,
+            },
+            GLCmd::BindBuffer {
+                canvas_id: a,
+                target: 0x8892,
+                buffer: None,
+            },
+            GLCmd::UseProgram {
+                canvas_id: b,
+                program_id: 2u32,
+            },
+            GLCmd::LinkProgram { program_id: 1u32 }, // no canvas_id
+        ];
+        let mut touched: std::collections::HashSet<CanvasId> =
+            std::collections::HashSet::new();
+        for cmd in &commands {
+            if let Some(c) = cmd.touches_canvas() {
+                touched.insert(c);
+            }
+        }
+        assert_eq!(touched.len(), 2, "expected two distinct canvases");
+        assert!(touched.contains(&a));
+        assert!(touched.contains(&b));
+    }
+
+    #[test]
+    fn batch_of_pure_resource_ops_touches_no_canvas() {
+        // When a GL batch consists solely of resource-context ops,
+        // no Canvas2DContext should be marked stale.
+        let commands = vec![
+            GLCmd::LinkProgram { program_id: 1u32 },
+            GLCmd::CompileShader { shader_id: 2u32 },
+            GLCmd::DeleteProgram { program_id: 3u32 },
+        ];
+        let mut touched: std::collections::HashSet<CanvasId> =
+            std::collections::HashSet::new();
+        for cmd in &commands {
+            if let Some(c) = cmd.touches_canvas() {
+                touched.insert(c);
+            }
+        }
+        assert!(touched.is_empty());
+    }
+
+    #[test]
+    fn touches_canvas_distinguishes_per_canvas_state() {
+        let a = CanvasId::from(1u32);
+        let b = CanvasId::from(2u32);
+        let ca = GLCmd::ActiveTexture {
+            canvas_id: a,
+            unit: 0,
+        };
+        let cb = GLCmd::ActiveTexture {
+            canvas_id: b,
+            unit: 0,
+        };
+        assert_eq!(ca.touches_canvas(), Some(a));
+        assert_eq!(cb.touches_canvas(), Some(b));
+        assert_ne!(ca.touches_canvas(), cb.touches_canvas());
+    }
+}

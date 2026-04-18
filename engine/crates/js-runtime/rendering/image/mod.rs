@@ -522,17 +522,23 @@ async fn upload_inline_image(
     canvas_ctx: CanvasOpState,
     image_id: u32,
     cache_key: cache::ImageCacheKey,
-    img: shared::protocol::io_cmd::NormalizedImage,
+    decoded: shared::protocol::io_cmd::DecodedImage,
     src_label: &str,
 ) -> EngineResult<(u32, (usize, usize))> {
+    use shared::protocol::io_cmd::DecodedImage;
     let shared_id = cache::alloc_shared_id();
     {
         let mut c = cache::IMAGE_CACHE.lock();
         c.register_inflight_alias(image_id, shared_id);
     }
-    let w = img.width as i32;
-    let h = img.height as i32;
-    let decoded = shared::protocol::io_cmd::DecodedImage::Rgba(img);
+    // Extract dimensions for the error-path logging below; both
+    // variants can report their own width/height without needing
+    // a CPU-side copy.
+    let (w, h) = match &decoded {
+        DecodedImage::Rgba(img) => (img.width as i32, img.height as i32),
+        DecodedImage::HardwareBuffer(ahb) => (ahb.width as i32, ahb.height as i32),
+        DecodedImage::Compressed(c) => (c.width as i32, c.height as i32),
+    };
 
     let res = send_render_with_resp_async(&canvas_ctx, OP_LOAD_IMAGE, |resp| {
         RenderCommand::Canvas(CanvasCmd::LoadImage {
@@ -613,7 +619,20 @@ async fn load_image_from_inline_bytes(
     } else {
         Some(payload.mime.as_str())
     };
-    let img = inline_src::decode_inline_bytes(&payload.bytes, hint, target_width, target_height)?;
+    // Prefer the platform-optimised path (AHB zero-copy on Android
+    // API >= 26) when the caller didn't ask for a resize.  AHB
+    // buffers are opaque GPU handles, so the resize case still has
+    // to go through the RGBA decoder.
+    let decoded = match (target_width, target_height) {
+        (Some(tw), Some(th)) if tw > 0 && th > 0 => {
+            shared::protocol::io_cmd::DecodedImage::Rgba(
+                inline_src::decode_inline_bytes(
+                    &payload.bytes, hint, Some(tw), Some(th),
+                )?,
+            )
+        }
+        _ => inline_src::decode_inline_bytes_any(&payload.bytes, hint)?,
+    };
 
     // Key the dedup table by the full data URL so two Image objects
     // assigned the same `data:` string share a GPU texture.  Data
@@ -650,7 +669,7 @@ async fn load_image_from_inline_bytes(
             Err(_) => shared::bail!(ErrorCode::Cancelled, "data url wait canceled"),
         },
         cache::BeginLoadResult::StartLoading => {
-            upload_inline_image(canvas_ctx, image_id, cache_key, img, &label).await
+            upload_inline_image(canvas_ctx, image_id, cache_key, decoded, &label).await
         }
     }
 }
@@ -703,15 +722,26 @@ async fn load_image_from_http(
     let _ = start;
 
     // Active fetch + decode.  Any failure must still call finish_load
-    // so joiners unblock (mirrors the local-file error path).
-    let result = async {
+    // so joiners unblock (mirrors the local-file error path).  AHB
+    // fast path activates when no resize is requested; resize forces
+    // the RGBA route because Hardware Buffers are opaque.
+    let result: EngineResult<shared::protocol::io_cmd::DecodedImage> = async {
         let bytes = inline_src::fetch_http_image(state, &src).await?;
-        inline_src::decode_inline_bytes(&bytes, None, target_width, target_height)
+        match (target_width, target_height) {
+            (Some(tw), Some(th)) if tw > 0 && th > 0 => Ok(
+                shared::protocol::io_cmd::DecodedImage::Rgba(
+                    inline_src::decode_inline_bytes(&bytes, None, Some(tw), Some(th))?,
+                ),
+            ),
+            _ => inline_src::decode_inline_bytes_any(&bytes, None),
+        }
     }
     .await;
 
     match result {
-        Ok(img) => upload_inline_image(canvas_ctx, image_id, cache_key, img, &src).await,
+        Ok(decoded) => {
+            upload_inline_image(canvas_ctx, image_id, cache_key, decoded, &src).await
+        }
         Err(e) => {
             let msg = engine_err_to_text(&e);
             // Finish the load with error so any pending joiners unblock.
@@ -818,6 +848,63 @@ async fn op_load_image_subrect_inner(
     let mount_generation = resolved.source_version;
     let image_source = resolved.source;
 
+    // Subrect alias key: same `src` with a `\0subrect=...` suffix so
+    // repeated `createImageBitmap(img, sx, sy, sw, sh[, opts])` calls
+    // with identical arguments share a single GPU texture instead of
+    // re-decoding + re-cropping + re-uploading every time.
+    //
+    // A tile-map that extracts 64 tiles from one atlas (common for
+    // platformers) pays the decode + crop + upload cost ONCE across
+    // the whole game session instead of once per `createImageBitmap`
+    // call.  The alias is refcounted like any other `Image` / bitmap,
+    // so a bitmap.close() decrements the texture independently.
+    let cache_key: cache::ImageCacheKey = (
+        format!(
+            "{}\0subrect={}x{}+{}+{}@{}x{}",
+            real_src, sw, sh, sx, sy, resize_w, resize_h
+        ),
+        mount_generation,
+    );
+
+    // Clear any prior alias this `image_id` held before claiming a
+    // new subrect slot — matches the local-file flow's semantic
+    // where reassigning `img.src` drops the previous texture.
+    if let Some(to_destroy) = {
+        let mut c = cache::IMAGE_CACHE.lock();
+        c.remove_previous_alias(image_id)
+    } {
+        let _ = canvas_ctx
+            .tx
+            .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
+                image_id: to_destroy,
+            }));
+    }
+
+    // Cache-hit fast path: second+ call with identical args returns
+    // the previously uploaded texture's shared id.  In-flight path
+    // awaits the first caller's finish_load so N simultaneous
+    // identical subrect requests do the decode+upload once.
+    match {
+        let mut c = cache::IMAGE_CACHE.lock();
+        c.begin_load(image_id, &cache_key)
+    } {
+        cache::BeginLoadResult::AlreadyLoaded((shared_id, dims)) => return Ok((shared_id, dims)),
+        cache::BeginLoadResult::Join(rx) => {
+            return match rx.await {
+                Ok(Ok((actual_key, shared_id, dims))) => {
+                    let mut c = cache::IMAGE_CACHE.lock();
+                    c.bind_alias_existing(image_id, &cache_key, &actual_key, shared_id);
+                    Ok((shared_id, dims))
+                }
+                Ok(Err(msg)) => {
+                    shared::bail!(ErrorCode::ImageReadError, "subrect join failed", msg)
+                }
+                Err(_) => shared::bail!(ErrorCode::Cancelled, "subrect wait canceled"),
+            };
+        }
+        cache::BeginLoadResult::StartLoading => {}
+    }
+
     // Decode the full-resolution image (LRU-hit when warm).
     let decoded = io::image_ops::read_image_rgba8(
         scheduler,
@@ -841,12 +928,19 @@ async fn op_load_image_subrect_inner(
     // we don't want to silently do the expensive path.
     let rgba = match decoded.image {
         DecodedImage::Rgba(r) => r,
+        DecodedImage::HardwareBuffer(_) => {
+            // For sub-rect crop we need CPU-side pixels.  AHB-backed
+            // sources are downgraded via `into_rgba` (a single
+            // CPU-side memcpy through the AHB lock); the result is
+            // identical to the native RGBA path from there on.
+            decoded.image.into_rgba()?
+        }
         DecodedImage::Compressed(_) => shared::bail!(
             ErrorCode::InvalidOperation,
             "createImageBitmap sub-rect does not support GPU-compressed sources yet"
         ),
     };
-    let cropped = io::crop_image(rgba, sx, sy, sw, sh);
+    let cropped = io::crop_image(rgba, sx, sy, sw, sh)?;
     let final_img = if resize_w > 0 && resize_h > 0
         && (resize_w != cropped.width || resize_h != cropped.height)
     {
@@ -876,17 +970,8 @@ async fn op_load_image_subrect_inner(
     })
     .await;
 
-    // Build a synthetic cache key so `finish_load` bookkeeping is
-    // consistent; we don't want other Image loads with the same
-    // `src` to collide with this bitmap's per-call sub-rect.  The
-    // key fingerprint includes sx/sy/sw/sh/resize.
-    let cache_key: cache::ImageCacheKey = (
-        format!(
-            "{}\0subrect={}x{}+{}+{}@{}x{}",
-            real_src, sw, sh, sx, sy, resize_w, resize_h
-        ),
-        mount_generation,
-    );
+    // `cache_key` was already computed at function entry; `finish_load`
+    // uses it to settle any waiters that joined our StartLoading.
 
     let maybe_destroy = {
         let mut c = cache::IMAGE_CACHE.lock();

@@ -62,6 +62,26 @@ pub fn uninstall_for_tests() {
     }
 }
 
+/// Crate-wide mutex that serialises every test which installs a
+/// diagnostic sink AND every test whose production code path bumps
+/// a metric via [`render_diagnostics`].  Without this, parallel
+/// tests cross-contaminate: e.g. `paint.rs`'s shadow test bumps the
+/// `shadow_filter_misses` counter on a sink installed by
+/// `effect_cache.rs`'s metric test, throwing off delta assertions.
+///
+/// Lightweight to take — only a handful of tests need it — and it
+/// forces deterministic serial execution for the short set.
+#[cfg(test)]
+pub static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Convenience: acquire [`TEST_GUARD`] and return the guard,
+/// recovering from poison so a previously-panicked test doesn't
+/// cascade-poison later runs.
+#[cfg(test)]
+pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[inline]
 fn with_sink(f: impl FnOnce(&DebugStats)) {
     let p = SINK.load(Ordering::Acquire);
@@ -147,22 +167,56 @@ pub fn bump_skia_context_reset() {
     });
 }
 
+#[inline]
+pub fn hit_shadow_filter_cache() {
+    with_sink(|s| {
+        s.shadow_filter_hits.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn miss_shadow_filter_cache() {
+    with_sink(|s| {
+        s.shadow_filter_misses.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn hit_dash_effect_cache() {
+    with_sink(|s| {
+        s.dash_effect_hits.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn miss_dash_effect_cache() {
+    with_sink(|s| {
+        s.dash_effect_misses.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn hit_gradient_cache() {
+    with_sink(|s| {
+        s.gradient_hits.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn miss_gradient_cache() {
+    with_sink(|s| {
+        s.gradient_misses.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
-    use std::sync::Mutex;
-
-    /// Global guard serialising tests that mutate the process-wide
-    /// `SINK`.  Cargo runs tests in parallel by default and every
-    /// test in this module installs or uninstalls the singleton, so
-    /// without serialisation one test's `uninstall` would race
-    /// another's `bump_*`.
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
     fn bumps_are_noop_without_sink() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_guard();
         uninstall_for_tests();
         bump_draw_call();
         add_upload_bytes(1024);
@@ -171,7 +225,7 @@ mod tests {
 
     #[test]
     fn bumps_route_to_installed_sink() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_guard();
         uninstall_for_tests();
         let stats = Arc::new(DebugStats::default());
         install(stats.clone());
@@ -189,7 +243,7 @@ mod tests {
 
     #[test]
     fn reinstall_reclaims_previous_sink() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_guard();
         uninstall_for_tests();
         let a = Arc::new(DebugStats::default());
         install(a.clone());

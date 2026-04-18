@@ -423,6 +423,13 @@ macro_rules! batched_op {
             if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
                 collector.push(canvas_id, $cmd);
             }
+            // Soft byte-budget backpressure — mirror of the GL
+            // queue helper.  Canvas2D variants like `fillText`
+            // with large strings or `DrawImageBatch` with many
+            // sub-rects can individually push the batch past
+            // 4 MB, and we want to cut a barrier there rather
+            // than let the JS heap balloon.
+            crate::rendering::webgl::webgl::maybe_auto_flush(state);
         }
     };
 }

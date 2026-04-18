@@ -326,6 +326,42 @@ mod tests {
         assert!(s.sk_image_cache.contains_key(&(3, 200)));
     }
 
+    /// Simulate the `Canvas2DContext::resize` flow: a wrapper keyed
+    /// on `(image_id, ctx_tag_old)` must no longer match lookups
+    /// after we rotate `ctx_tag_old → ctx_tag_new` and purge the
+    /// old tag.  Without the purge, a bug in the `(image_id, tag)`
+    /// match would silently serve a wrapper bound to a destroyed
+    /// `GrDirectContext`; this test locks the invariant.
+    #[test]
+    fn purge_then_new_ctx_tag_isolates_pre_resize_wrappers() {
+        let mut s = ImageStore::new();
+        let info = skia_safe::ImageInfo::new(
+            (1, 1),
+            ColorType::RGBA8888,
+            AlphaType::Premul,
+            None,
+        );
+        let mut mk_img = || {
+            skia_safe::surfaces::raster(&info, None, None)
+                .unwrap()
+                .image_snapshot()
+        };
+        // Pre-resize: ctx_tag = 42 uses image_id = 7.
+        s.sk_image_cache.insert((7, 42), mk_img());
+        assert!(s.sk_image_cache.contains_key(&(7, 42)));
+
+        // Resize flow: purge old tag, then install new tag's wrapper.
+        s.purge_wrappers_for_context(42);
+        assert!(s.sk_image_cache.is_empty());
+
+        s.sk_image_cache.insert((7, 43), mk_img());
+        // Old key is gone; new key is reachable.  A re-resize
+        // (42 → 43 → 44) can continue the pattern without ever
+        // colliding with stale wrappers.
+        assert!(!s.sk_image_cache.contains_key(&(7, 42)));
+        assert!(s.sk_image_cache.contains_key(&(7, 43)));
+    }
+
     #[test]
     fn rgba8_unpremul_factory_has_expected_fields() {
         let info = GpuImageInfo::rgba8_unpremul(10, 20);

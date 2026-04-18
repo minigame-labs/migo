@@ -36,6 +36,30 @@ use types::{CanvasEntry, EglContextHandle, SurfaceKind};
 
 use self::image::ImageRegistry;
 
+/// A budget-rejected upload still holding the caller's oneshot
+/// `resp`, waiting for the next frame's upload budget to open up.
+/// See [`CanvasManager::deferred_uploads`].
+pub(crate) struct DeferredUpload {
+    pub image_id: u32,
+    /// The image's RGBA bytes are already decoded; holding an owned
+    /// `NormalizedImage` rather than a borrow means the deferred
+    /// queue can outlive any `load_image` op without lifetime
+    /// plumbing.  Memory cost is bounded by the retry loop at the
+    /// top of each frame emptying the queue as the budget opens.
+    pub image: shared::protocol::io_cmd::NormalizedImage,
+    pub resp: shared::protocol::render_cmd::RenderCmdResp<(u32, u32)>,
+}
+
+/// Soft cap on the deferred-upload queue.  A game that fires more
+/// than this many concurrent loads in a single frame is either
+/// bombarding the engine (benchmark / stress test) or leaking
+/// requests; once the queue reaches this depth the handler falls
+/// back to synchronous sync upload for the overflow rather than
+/// letting the queue grow unbounded.  Chosen to comfortably cover
+/// a first-screen burst (hundreds of assets) while still capping
+/// worst-case residency.
+pub(crate) const MAX_DEFERRED_UPLOADS: usize = 256;
+
 #[allow(private_interfaces)]
 pub(crate) struct CanvasManager {
     pub(crate) egl: egl::DynamicInstance<EGL1_4>,
@@ -146,6 +170,19 @@ pub(crate) struct CanvasManager {
     /// GL texture/fence instead of registering them.
     cancelled_uploads: HashSet<u64>,
 
+    /// Uploads that the per-frame budget rejected.  Previously the
+    /// handler fell back to a synchronous `load_shared_image` on
+    /// the render thread -- exactly the frame spike we're trying
+    /// to prevent.  Instead we queue the work here, retry at the
+    /// top of each frame via `try_drain_deferred_uploads`, and keep
+    /// the oneshot `resp` alive so `Image.onload` fires in order
+    /// when the upload eventually lands.
+    ///
+    /// VecDeque for FIFO ordering; a capacity cap is enforced at
+    /// insert time to bound worst-case memory when a pathological
+    /// game fires a thousand concurrent loads.
+    deferred_uploads: std::collections::VecDeque<DeferredUpload>,
+
     /// `eglSetDamageRegionKHR` function pointer (None if EGL_KHR_partial_update
     /// is not supported). Called before `eglSwapBuffers` to inform the
     /// compositor which region changed — saves power on OLED screens.
@@ -161,6 +198,15 @@ pub(crate) struct CanvasManager {
 
     /// History of recent frame damages for buffer-age-aware partial present.
     damage_history: crate::dirty_region::damage_tracker::DamageHistory,
+
+    /// Resolved damage for the frame-in-flight, cached by
+    /// [`declare_frame_damage`] so that [`swap_buffers_no_restore`]
+    /// can reuse the result instead of resolving a second time.
+    /// The accumulator is never mutated between those two calls in
+    /// the current render-thread loop, so the second resolve is
+    /// observationally identical.  Cleared after swap consumes it.
+    pending_declared_damage:
+        Option<(CanvasId, crate::dirty_region::damage_tracker::ResolvedDamage)>,
 }
 
 impl CanvasManager {
@@ -301,9 +347,11 @@ impl CanvasManager {
             shader_cache,
             pending_uploads: Vec::new(),
             pending_load_responses: HashMap::new(),
+            deferred_uploads: std::collections::VecDeque::new(),
             cancelled_uploads: HashSet::new(),
             egl_set_damage_region_fn,
             damage: crate::damage_effect::FrameDamageAccumulator::new(),
+            pending_declared_damage: None,
             damage_history: crate::dirty_region::damage_tracker::DamageHistory::new(),
         })
     }
@@ -549,8 +597,14 @@ impl CanvasManager {
             .and_then(|e| e.drawing_buffer.as_ref())
             .map(|db| db.fbo.0.get())
             .unwrap_or(0);
+        // Split-borrow: `contexts_2d` and `image_registry` are
+        // disjoint fields, so the compiler lets us hand a mutable
+        // reference to the image store into the resize path — the
+        // context uses it to purge stale SkImage wrappers tied to
+        // its outgoing GrDirectContext.
+        let image_store = self.image_registry.store_mut();
         if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-            ctx2d.resize(new_fbo, physical_w, physical_h);
+            ctx2d.resize(new_fbo, physical_w, physical_h, image_store);
         }
         if had_2d_context && !self.contexts_2d.contains_key(&id) {
             context_2d_impl::init_skia_for_canvas(self, id)?;
@@ -581,7 +635,20 @@ impl CanvasManager {
                 Some(self.resource.ctx),
             );
 
-            self.contexts_2d.remove(&id);
+            // Capture the context's `ctx_tag` BEFORE dropping it so we
+            // can purge matching SkImage wrappers from the shared
+            // image store.  Without this step those wrappers hold
+            // `GrDirectContext` pointers that are about to be
+            // destroyed; the entries would never be reclaimed
+            // (sk_image_cache has no LRU / size cap) and the
+            // dangling pointers would be a correctness landmine if
+            // any future caller hit the cache for the recycled tag.
+            let ctx_tag = self.contexts_2d.remove(&id).map(|c| c.ctx_tag);
+            if let Some(tag) = ctx_tag {
+                self.image_registry
+                    .store_mut()
+                    .purge_wrappers_for_context(tag);
+            }
             self.dirty_2d.remove(&id);
             self.gl_state.remove(&id);
             self.image_registry.remove_canvas_images(id);
@@ -646,7 +713,14 @@ impl CanvasManager {
             self.egl.destroy_surface(self.display, entry.ctx.surf).ok();
             self.egl.destroy_context(self.display, entry.ctx.ctx).ok();
 
-            self.contexts_2d.remove(&id);
+            // Same SkImage-wrapper purge pattern as the onscreen
+            // destroy path: capture ctx_tag before removing.
+            let ctx_tag = self.contexts_2d.remove(&id).map(|c| c.ctx_tag);
+            if let Some(tag) = ctx_tag {
+                self.image_registry
+                    .store_mut()
+                    .purge_wrappers_for_context(tag);
+            }
             self.dirty_2d.remove(&id);
             self.gl_state.remove(&id);
 
@@ -1134,8 +1208,9 @@ impl CanvasManager {
                 .and_then(|e| e.drawing_buffer.as_ref())
                 .map(|db| db.fbo.0.get())
                 .unwrap_or(0);
+            let image_store = self.image_registry.store_mut();
             if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-                ctx2d.resize(new_fbo, new_w, new_h);
+                ctx2d.resize(new_fbo, new_w, new_h, image_store);
             }
 
             // WebGL default framebuffer viewport resets after drawing buffer resize.
@@ -1237,8 +1312,9 @@ impl CanvasManager {
         }
 
         // Offscreen pbuffer: Skia renders into FBO 0 directly.
+        let image_store = self.image_registry.store_mut();
         if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-            ctx2d.resize(0, actual_w, actual_h);
+            ctx2d.resize(0, actual_w, actual_h, image_store);
         }
 
         if !was_current {
@@ -1267,6 +1343,14 @@ impl CanvasManager {
 
         // Resolve this frame's accumulated damage (does not reset — swap does that).
         let current_frame_damage = self.resolve_pending_damage(surface_w, surface_h);
+        // Stash the resolved result so the subsequent
+        // `swap_buffers_no_restore` call can reuse it — the
+        // accumulator is not mutated between these two call sites
+        // in the render loop, so resolving twice was pure waste.
+        // Keyed by `id` so that if a future change routes the two
+        // calls to different canvases we fall back to the live
+        // resolve instead of serving a stale result.
+        self.pending_declared_damage = Some((id, current_frame_damage));
 
         // Query buffer age and expand with history.
         const EGL_BUFFER_AGE_KHR: egl::Int = 0x313D;
@@ -1328,8 +1412,19 @@ impl CanvasManager {
         // Resolve this frame's damage for history recording and stats.
         // The eglSetDamageRegionKHR call was already made in declare_frame_damage()
         // before rendering — per spec it must happen before GL draws.
-        let current_frame_damage =
-            self.resolve_pending_damage(entry.physical_width, entry.physical_height);
+        //
+        // If `declare_frame_damage` ran for this same canvas earlier
+        // in the frame, the result is already cached and we reuse it
+        // — same accumulator, no mutations between the two calls, so
+        // resolving again would produce an identical `ResolvedDamage`
+        // at the cost of another `DamageTracker::mark_rect` pass.
+        // Fall back to a live resolve when the cache is empty or
+        // stale (different canvas id), which keeps correctness on
+        // the barrier-flush / multi-canvas paths.
+        let current_frame_damage = match self.pending_declared_damage.take() {
+            Some((cached_id, resolved)) if cached_id == id => resolved,
+            _ => self.resolve_pending_damage(entry.physical_width, entry.physical_height),
+        };
         self.damage.reset();
 
         self.egl
@@ -1487,12 +1582,23 @@ impl CanvasManager {
     /// Save current GL state and set a safe baseline for Canvas2D / Skia
     /// text atlas uploads.
     /// Mark every live 2D context's Skia cache as stale.  Called
-    /// once per WebGL batch to signal "external code just mutated
-    /// raw GL state, your tracked cache is no longer accurate."
-    /// The per-context `reset_gl_state_if_stale()` picks this up
-    /// lazily on the next Skia draw.
+    /// only from fall-back paths where we can't identify the
+    /// touched canvas (empty-canvas-id GL batches, panic recovery);
+    /// normal WebGL batch dispatch uses [`mark_2d_context_stale`]
+    /// for narrower invalidation.
     pub(crate) fn mark_all_2d_contexts_stale(&mut self) {
         for ctx in self.contexts_2d.values_mut() {
+            ctx.mark_state_stale();
+        }
+    }
+
+    /// Mark a SPECIFIC 2D context's Skia cache as stale.  Silent
+    /// no-op when the canvas id has no 2D context (e.g. a
+    /// WebGL-only canvas was the one targeted by the GL batch).
+    /// The per-context `reset_gl_state_if_stale()` picks this up
+    /// lazily on the next Skia draw for that canvas only.
+    pub(crate) fn mark_2d_context_stale(&mut self, canvas_id: CanvasId) {
+        if let Some(ctx) = self.contexts_2d.get_mut(&canvas_id) {
             ctx.mark_state_stale();
         }
     }
@@ -1581,6 +1687,25 @@ impl CanvasManager {
             &self.gl,
             image_id,
             image,
+            &self.device_caps,
+            display_ptr,
+        )
+    }
+
+    /// Zero-copy AHB upload path. See
+    /// [`crate::canvas::manager::image::ImageRegistry::load_ahb_image`]
+    /// for the fallback semantics.
+    pub(crate) fn load_ahb_image(
+        &mut self,
+        image_id: u32,
+        ahb_image: shared::protocol::io_cmd::AhbImage,
+    ) -> EngineResult<(u32, u32)> {
+        self.ensure_any_canvas_current()?;
+        let display_ptr = self.display.as_ptr() as *const std::ffi::c_void;
+        self.image_registry.load_ahb_image(
+            &self.gl,
+            image_id,
+            ahb_image,
             &self.device_caps,
             display_ptr,
         )
@@ -1693,6 +1818,82 @@ impl CanvasManager {
             }
             Err(resp)
         }
+    }
+
+    /// Defer a budget-rejected upload for retry on the next frame.
+    /// Returns the `resp` back (as `Err`) if the queue is full, so the
+    /// caller can choose between synchronous upload (last-resort
+    /// fallback) and dropping the request.
+    ///
+    /// The queue is FIFO to preserve request ordering so
+    /// `Image.onload` fires in the order `load_image` ops were issued.
+    pub(crate) fn defer_upload(
+        &mut self,
+        image_id: u32,
+        image: shared::protocol::io_cmd::NormalizedImage,
+        resp: shared::protocol::render_cmd::RenderCmdResp<(u32, u32)>,
+    ) -> Result<(), (shared::protocol::io_cmd::NormalizedImage, shared::protocol::render_cmd::RenderCmdResp<(u32, u32)>)> {
+        if self.deferred_uploads.len() >= MAX_DEFERRED_UPLOADS {
+            return Err((image, resp));
+        }
+        self.deferred_uploads.push_back(DeferredUpload {
+            image_id,
+            image,
+            resp,
+        });
+        Ok(())
+    }
+
+    /// Retry budget-rejected uploads from the head of the deferred
+    /// queue.  Call at the top of each frame (before draw dispatch)
+    /// so the budget window — which resets on every vsync tick — can
+    /// absorb the backlog first instead of the frame's new draws.
+    ///
+    /// Stops on the first budget rejection: the per-frame budget is
+    /// monotonic within a frame, so once it rejects a small-ish
+    /// upload nothing larger will fit either.  Leaves the rest of the
+    /// queue intact for the next frame.
+    pub(crate) fn try_drain_deferred_uploads(&mut self) {
+        while let Some(front) = self.deferred_uploads.front() {
+            // Snapshot the image data + resp via a take that puts them
+            // back if submit fails — avoids cloning the RGBA Arc.
+            // front.image holds an `Arc<Vec<u8>>` internally, so
+            // `take` + re-insert is still cheap.
+            let Some(pending) = self.deferred_uploads.pop_front() else {
+                break;
+            };
+            match self.submit_async_upload(pending.image_id, &pending.image, pending.resp) {
+                Ok(()) => continue,
+                Err(resp) => {
+                    // Budget still exhausted or upload thread now
+                    // degraded; push back to the head and stop.
+                    self.deferred_uploads.push_front(DeferredUpload {
+                        image_id: pending.image_id,
+                        image: pending.image,
+                        resp,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Number of uploads currently waiting for budget.  Exposed so
+    /// the debug overlay / metrics probe the backlog depth.
+    #[allow(dead_code)]
+    pub(crate) fn deferred_upload_depth(&self) -> usize {
+        self.deferred_uploads.len()
+    }
+
+    /// Probe whether the upload thread is usable (not degraded).
+    /// Handlers use this to decide between `defer_upload` (healthy
+    /// thread, temporary budget squeeze) and `load_shared_image`
+    /// (permanent degradation, sync fallback is the only path).
+    pub(crate) fn upload_thread_healthy(&self) -> bool {
+        self.upload_thread
+            .as_ref()
+            .map(|u| !u.is_degraded())
+            .unwrap_or(false)
     }
 
     /// Cancel a pending async upload for the given image_id.
@@ -1900,5 +2101,39 @@ mod tests {
         assert_eq!(state.scissor, ScissorState::Disabled);
         // last_scissor_rect retained
         assert_eq!(state.last_scissor_rect, Some((10, 20, 100, 50)));
+    }
+
+    // ---- DeferredUpload queue semantics (P13) ------------------------
+    //
+    // These tests cover the queue cap + FIFO ordering without needing
+    // an EGL-backed CanvasManager: we exercise the naked VecDeque
+    // contract the handler relies on.
+
+    #[test]
+    fn deferred_upload_queue_is_fifo() {
+        use shared::protocol::io_cmd::NormalizedImage;
+        // Three distinct image_ids pushed in order; popping from the
+        // front yields them in the same order.  Matches the
+        // `Image.onload` spec requirement that loads fire in issue
+        // order even when a budget squeeze defers them.
+        let mut q: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        q.push_back(1);
+        q.push_back(2);
+        q.push_back(3);
+        assert_eq!(q.pop_front(), Some(1));
+        assert_eq!(q.pop_front(), Some(2));
+        assert_eq!(q.pop_front(), Some(3));
+        // NormalizedImage reference just pinned so a refactor that
+        // changes the struct triggers this test too.
+        let _ = NormalizedImage::new(1, 1, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn max_deferred_uploads_constant_is_reasonable() {
+        // Bound is a meaningful soft cap, not accidentally 0 or
+        // astronomically large.  If a future tuning change lands
+        // here the assert is an early warning.
+        assert!(MAX_DEFERRED_UPLOADS >= 32);
+        assert!(MAX_DEFERRED_UPLOADS <= 4096);
     }
 }

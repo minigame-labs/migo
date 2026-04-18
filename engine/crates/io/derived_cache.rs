@@ -9,7 +9,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use shared::protocol::io_cmd::{CompressedImage, DecodedImage, NormalizedImage};
@@ -102,7 +101,6 @@ const DERIVED_MAGIC: [u8; 4] = *b"MDRV";
 const DERIVED_VERSION: u8 = 3; // Bumped from 2 to include variant_kind in the key/header.
 const KIND_RGBA: u8 = 0;
 const KIND_COMPRESSED: u8 = 1;
-static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn derived_cache_dir(game_cache_dir: &Path) -> PathBuf {
     game_cache_dir.join("derived")
@@ -112,19 +110,40 @@ pub fn derived_cache_dir(game_cache_dir: &Path) -> PathBuf {
 /// Prevents a poisoned/oversized file from consuming all memory.
 const MAX_DERIVED_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
+/// Files larger than this threshold are read via mmap instead of
+/// `std::fs::read`.  Rationale: the tail of the distribution
+/// (high-res textures, pre-composited atlases) pays two full
+/// payload copies on the old path — one for the disk buffer and
+/// one for `Arc<Vec<u8>>` — and the first is avoidable with mmap.
+/// For small entries the mmap syscall pair is pure overhead, so
+/// we stay on `fs::read` up to 1 MiB.
+const MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
+
 pub fn load_derived(game_cache_dir: &Path, key: &DerivedKey) -> Option<DecodedImage> {
     let dir = derived_cache_dir(game_cache_dir);
     let path = dir.join(format!("{}.bin", key.hash()));
 
     // Check file size BEFORE reading to prevent large-file poisoning.
     let meta = std::fs::metadata(&path).ok()?;
-    if meta.len() > MAX_DERIVED_FILE_SIZE {
+    let size = meta.len();
+    if size > MAX_DERIVED_FILE_SIZE {
         let _ = std::fs::remove_file(&path);
         return None;
     }
 
-    let data = std::fs::read(&path).ok()?;
-    match parse_derived_entry(&data, key) {
+    // Two read paths — both produce `&[u8]` for the shared parser.
+    // The mmap path avoids the intermediate `Vec<u8>` the kernel
+    // would otherwise copy into; the payload copy inside
+    // `parse_derived_entry` still happens but costs one allocation
+    // instead of two at the peak.
+    let parsed = if size > MMAP_THRESHOLD_BYTES {
+        let mapped = crate::mmap_reader::mmap_file_bytes(&path).ok()?;
+        parse_derived_entry(mapped.as_slice(), key)
+    } else {
+        let data = std::fs::read(&path).ok()?;
+        parse_derived_entry(&data, key)
+    };
+    match parsed {
         Some(img) => Some(img),
         None => {
             let _ = std::fs::remove_file(&path);
@@ -139,34 +158,18 @@ pub fn save_derived(game_cache_dir: &Path, key: &DerivedKey, image: &DecodedImag
         return;
     }
     let final_path = dir.join(format!("{}.bin", key.hash()));
-    let tmp_path = dir.join(format!(
-        "{}.tmp.{}",
-        key.hash(),
-        NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed)
-    ));
 
     let mut buf = Vec::with_capacity(256);
     if serialize_derived_entry(&mut buf, key, image).is_err() {
         return;
     }
 
-    // Atomic write: tmp file → flush → rename to final path.
-    // Readers never see a half-written file.
-    match std::fs::File::create(&tmp_path).and_then(|mut f| {
-        use std::io::Write;
-        f.write_all(&buf)?;
-        f.flush()?;
-        Ok(())
-    }) {
-        Ok(()) => {
-            if std::fs::rename(&tmp_path, &final_path).is_err() {
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-        }
-        Err(_) => {
-            let _ = std::fs::remove_file(&tmp_path);
-        }
-    }
+    // Crash-safe: tmp file → write_all → sync_all → rename → dir fsync.
+    // Readers never see a half-written file, and a power loss between
+    // the rename and the next game session still leaves a valid entry
+    // on disk.  Failures are swallowed — the derived cache is an
+    // optimisation, not a correctness dependency.
+    let _ = crate::atomic_write::atomic_write(&final_path, &buf);
 }
 
 fn parse_derived_entry(data: &[u8], expected_key: &DerivedKey) -> Option<DecodedImage> {
@@ -254,6 +257,17 @@ fn serialize_derived_entry(
             buf.write_all(&(img.rgba.len() as u32).to_le_bytes())?;
             buf.write_all(&img.rgba)?;
         }
+        DecodedImage::HardwareBuffer(_) => {
+            // AHB-backed images are GPU resources owned by the
+            // graphics process; they have no portable on-disk
+            // representation. Skip the derived-cache write — the
+            // image is already "warm" in the sense that the next
+            // load can re-decode straight into a new AHB.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "derived_cache: HardwareBuffer variant not persistable",
+            ));
+        }
         DecodedImage::Compressed(img) => {
             buf.write_all(&[KIND_COMPRESSED])?;
             buf.write_all(&img.width.to_le_bytes())?;
@@ -329,6 +343,84 @@ mod tests {
             target_height: 0,
         };
         assert!(load_derived(&dir, &key).is_none());
+    }
+
+    // ---- mmap read path (P3-1) --------------------------------
+
+    #[test]
+    fn roundtrip_rgba_above_mmap_threshold_uses_mmap_path() {
+        // A payload just past the 1 MiB threshold forces the
+        // mmap branch in `load_derived`.  The byte-for-byte
+        // equality of the RGBA payload proves the mmap slice
+        // handed to `parse_derived_entry` matches what
+        // `std::fs::read` would have produced — i.e. the
+        // two paths are observationally identical.
+        let dir = tmp("rt_rgba_mmap");
+        let key = DerivedKey {
+            asset_path: "big.png".into(),
+            source_generation: 7,
+            gpu_format: 0,
+            variant_kind: 0,
+            target_width: 0,
+            target_height: 0,
+        };
+        // 520x520x4 = 1.06 MiB > MMAP_THRESHOLD_BYTES (1 MiB).
+        let w = 520u32;
+        let h = 520u32;
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        // Non-trivial pattern so a wrong-slice bug would surface.
+        for (i, b) in rgba.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+        let img = DecodedImage::Rgba(NormalizedImage::new(w, h, rgba.clone()));
+        save_derived(&dir, &key, &img);
+
+        let loaded = load_derived(&dir, &key).expect("hit via mmap path");
+        match loaded {
+            DecodedImage::Rgba(n) => {
+                assert_eq!(n.width, w);
+                assert_eq!(n.height, h);
+                assert_eq!(&*n.rgba, &rgba);
+            }
+            _ => panic!("expected Rgba variant"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mmap_path_rejects_corrupted_large_file_and_cleans_up() {
+        // Same corruption scenario as `bad_rgba_length_rejected`
+        // but over the mmap threshold.  Both paths must reject
+        // invalid payloads and delete the poisoned file.
+        let dir = tmp("mmap_corrupt");
+        let key = DerivedKey {
+            asset_path: "big.png".into(),
+            source_generation: 9,
+            gpu_format: 0,
+            variant_kind: 0,
+            target_width: 0,
+            target_height: 0,
+        };
+        let w = 600u32;
+        let h = 600u32;
+        let rgba = vec![0xCCu8; (w * h * 4) as usize];
+        let img = DecodedImage::Rgba(NormalizedImage::new(w, h, rgba));
+        save_derived(&dir, &key, &img);
+
+        let path = derived_cache_dir(&dir).join(format!("{}.bin", key.hash()));
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > MMAP_THRESHOLD_BYTES,
+            "test setup must put file over mmap threshold"
+        );
+        // Truncate to invalidate the embedded payload length.
+        let mut data = std::fs::read(&path).unwrap();
+        data.truncate(data.len() - 100);
+        std::fs::write(&path, &data).unwrap();
+
+        assert!(load_derived(&dir, &key).is_none());
+        assert!(!path.exists(), "poisoned file must be cleaned up");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -438,16 +530,19 @@ mod tests {
         let img = DecodedImage::Rgba(NormalizedImage::new(2, 2, vec![0xFF; 16]));
         save_derived(&dir, &key, &img);
 
-        // Final file exists, no .tmp leftover.
+        // Final file exists, no .tmp / .atomic.tmp leftover.
         let final_path = derived_cache_dir(&dir).join(format!("{}.bin", key.hash()));
         assert!(final_path.exists());
         let leftovers: Vec<_> = std::fs::read_dir(derived_cache_dir(&dir))
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(&format!("{}.tmp", key.hash())))
+            .filter(|name| {
+                name.starts_with(&format!("{}.tmp", key.hash()))
+                    || name.ends_with(".atomic.tmp")
+            })
             .collect();
-        assert!(leftovers.is_empty());
+        assert!(leftovers.is_empty(), "stale tmp: {:?}", leftovers);
 
         // Content is valid.
         assert!(load_derived(&dir, &key).is_some());

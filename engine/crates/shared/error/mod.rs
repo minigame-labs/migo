@@ -94,6 +94,21 @@ pub struct EngineError {
     /// Optional detailed information for debugging.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Raw OS errno when the error originated from a syscall.
+    /// Negative on Unix (standard `errno * -1` convention used by
+    /// most JS ecosystems). Absent for pure logic errors.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub errno: Option<i32>,
+    /// Target path the operation was acting on, when meaningful
+    /// (e.g. `readFile`, `stat`, `unlink`). Absent for errors that
+    /// aren't path-bound (network, V8, decoder).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub path: Option<String>,
+    /// The operation name that failed (e.g. "read_file", "stat",
+    /// "rename"). Analogous to Node.js' `error.syscall`. Absent
+    /// when not applicable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub op: Option<&'static str>,
 }
 
 impl EngineError {
@@ -115,7 +130,36 @@ impl EngineError {
             code,
             msg: Cow::Borrowed(code.default_message()),
             detail: None,
+            errno: None,
+            path: None,
+            op: None,
         }
+    }
+
+    /// Attach the raw OS errno (from `io::Error::raw_os_error`) so
+    /// the JS layer can match on POSIX-style codes like `-ENOENT`
+    /// without parsing message strings.
+    #[inline]
+    pub fn with_errno(mut self, errno: i32) -> Self {
+        self.errno = Some(errno);
+        self
+    }
+
+    /// Record the path the failing operation was acting on. Used
+    /// by `readFile`, `stat`, `rename`, etc.; skipped when the
+    /// error isn't path-bound.
+    #[inline]
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Record the operation name that failed. Analogous to
+    /// `error.syscall` in Node.js (e.g. "open", "stat", "rename").
+    #[inline]
+    pub fn with_op(mut self, op: &'static str) -> Self {
+        self.op = Some(op);
+        self
     }
 
     /// Sets a custom message, replacing the default.
@@ -193,7 +237,16 @@ pub type EngineResult<T> = Result<T, EngineError>;
 impl From<std::io::Error> for EngineError {
     fn from(e: std::io::Error) -> Self {
         let code = io_error_to_error_code(&e);
-        EngineError::new(code).with_detail(e.to_string())
+        // Node.js convention: negative errno in the JS surface
+        // (`err.errno === -2` for ENOENT, not 2). We mirror that so
+        // game code written against the Node/WX `err.errno` shape
+        // ports cleanly.
+        let errno = e.raw_os_error().map(|n| -n);
+        let err = EngineError::new(code).with_detail(e.to_string());
+        match errno {
+            Some(n) => err.with_errno(n),
+            None => err,
+        }
     }
 }
 

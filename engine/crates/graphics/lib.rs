@@ -34,8 +34,6 @@
 //!   `backend::gl` (Skia Ganesh on GL ES 3.0) is implemented.
 //! - [`renderergl`]: WebGL 1.0 / 2.0 command handler (glow-backed).
 
-#[cfg(target_os = "android")]
-pub(crate) mod ahb;
 pub mod atlas;
 #[doc(hidden)]
 pub mod backend;

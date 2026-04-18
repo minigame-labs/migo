@@ -1332,3 +1332,63 @@ pub(crate) extern "system" fn getConsoleLogs<'local>(
         }
     })
 }
+
+// ==================== AHardwareBuffer native helpers ====================
+
+/// NDK declarations for the subset of AHB ABI we need on the inbound
+/// side. Kept separate from `shared::protocol::ahb::sys` so this
+/// module can compile stand-alone; the duplicate `extern` declaration
+/// is deduplicated by the linker (the symbol comes from `libandroid`).
+#[cfg(target_os = "android")]
+unsafe extern "C" {
+    /// Native accessor for Java `HardwareBuffer` — NDK API 26+.
+    /// Returns a **borrowed** pointer valid for the lifetime of the
+    /// Java wrapper; callers that need independent ownership must
+    /// call `AHardwareBuffer_acquire` themselves.
+    fn AHardwareBuffer_fromHardwareBuffer(
+        env: *mut jni::sys::JNIEnv,
+        hardware_buffer_obj: jni::sys::jobject,
+    ) -> *mut std::ffi::c_void;
+}
+
+/// Called by `NativeBridge.nativeAhbPointerFromHardwareBuffer`.
+///
+/// Returns the native `AHardwareBuffer*` as `jlong`. On any failure
+/// (null input, NDK error, unexpected JNI state) returns `0`, which
+/// [`NativeExports.decodeImageAhb`] treats as "no AHB handle, fall
+/// back to the RGBA byte[] path".
+///
+/// No refcount change happens here: `AHardwareBuffer_fromHardwareBuffer`
+/// returns a borrowed pointer valid as long as the Java wrapper is
+/// live. The companion [`nativeAhbAcquire`] is the explicit refcount
+/// bump the caller uses before handing the pointer off to Rust.
+#[cfg(target_os = "android")]
+pub(crate) extern "system" fn nativeAhbPointerFromHardwareBuffer<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    hb: JObject<'local>,
+) -> jni::sys::jlong {
+    jni_safe!("nativeAhbPointerFromHardwareBuffer", 0, {
+        if hb.is_null() {
+            return 0;
+        }
+        // SAFETY: `hb` is a non-null reference to a Java
+        // HardwareBuffer passed by the VM. The NDK function accepts
+        // a `JNIEnv*` + `jobject`; both come directly from the
+        // caller's frame.
+        let ptr = unsafe { AHardwareBuffer_fromHardwareBuffer(env.get_raw(), hb.as_raw()) };
+        ptr as jni::sys::jlong
+    })
+}
+
+// Non-Android stub. Inbound registrations reference the name on
+// every target; the stub keeps the linker happy on desktop dev
+// builds where there is no real AHB subsystem.
+#[cfg(not(target_os = "android"))]
+pub(crate) extern "system" fn nativeAhbPointerFromHardwareBuffer<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _hb: JObject<'local>,
+) -> jni::sys::jlong {
+    0
+}

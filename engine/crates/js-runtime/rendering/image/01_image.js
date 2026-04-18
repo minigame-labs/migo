@@ -264,12 +264,24 @@ async function createImageBitmap(source, ...args) {
     if (args.length === 1 && args[0] && typeof args[0] === 'object') {
         opts = args[0];
     } else if (args.length >= 4) {
-        subrect = {
-            sx: args[0] | 0,
-            sy: args[1] | 0,
-            sw: args[2] | 0,
-            sh: args[3] | 0,
-        };
+        // WHATWG HTML spec `createImageBitmap(source, sx, sy, sw, sh[, options])`:
+        //   - If sw or sh is zero: reject with InvalidStateError.
+        //   - If sw is negative: let sx = sx + sw; sw = -sw. (same for sh)
+        // `| 0` coerces each arg to a signed 32-bit integer which
+        // preserves the sign so the negative-normalisation below
+        // produces the canonical (sx, sw >= 0) box.
+        let sx = args[0] | 0;
+        let sy = args[1] | 0;
+        let sw = args[2] | 0;
+        let sh = args[3] | 0;
+        if (sw === 0 || sh === 0) {
+            throw new RangeError(
+                'createImageBitmap: sw and sh must be non-zero'
+            );
+        }
+        if (sw < 0) { sx += sw; sw = -sw; }
+        if (sh < 0) { sy += sh; sh = -sh; }
+        subrect = { sx, sy, sw, sh };
         if (args.length >= 5 && args[4] && typeof args[4] === 'object') {
             opts = args[4];
         }
@@ -306,7 +318,9 @@ async function createImageBitmap(source, ...args) {
     // decoded RGBA on the Rust side and uploads as a new texture.
     // This is the only mode that handles out-of-bounds sx/sy/sw/sh
     // with the spec-mandated transparent-black fill.
-    if (subrect && (subrect.sw > 0 && subrect.sh > 0)) {
+    // After the parsing block above `subrect.sw`/`subrect.sh` are
+    // guaranteed positive; sw === 0 | sh === 0 already threw.
+    if (subrect) {
         if (!source._src) {
             throw new Error(
                 'createImageBitmap: sub-rect requires a source with src'
@@ -456,4 +470,40 @@ const ImageCache = {
     }
 };
 
-export { createImage, ImagePreloader, ImageCache, ImageBitmap, createImageBitmap };
+// ------------------------------------------------------------------
+// Global prefetch helper
+// ------------------------------------------------------------------
+//
+// Exposed as `migo.prefetchImage(urls)`. Decodes one or more images
+// ahead of time so a subsequent `Image.src = path` or `drawImage`
+// can complete without re-running decode.  Under the hood this just
+// forwards to a process-singleton ImagePreloader: the decode path
+// and cache semantics are identical, so callers that want the full
+// PreloadResult can reuse the results array.
+//
+// Accepts either a single string or an array. Always resolves to an
+// array so callers don't have to branch.
+const _prefetchImageSharedPreloader = new ImagePreloader();
+
+function prefetchImage(urls) {
+    if (urls == null) return Promise.resolve([]);
+    if (typeof urls === 'string') {
+        return _prefetchImageSharedPreloader.preload([urls]);
+    }
+    if (Array.isArray(urls)) {
+        // Filter non-strings defensively -- op_preload_images would
+        // otherwise reject the whole batch on first bad entry.
+        const clean = urls.filter(u => typeof u === 'string' && u.length > 0);
+        return _prefetchImageSharedPreloader.preload(clean);
+    }
+    return Promise.resolve([]);
+}
+
+export {
+    createImage,
+    ImagePreloader,
+    ImageCache,
+    ImageBitmap,
+    createImageBitmap,
+    prefetchImage,
+};

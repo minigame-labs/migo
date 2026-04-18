@@ -22,6 +22,8 @@
 
 use std::collections::HashSet;
 
+use glow::{self};
+
 use crate::canvas::{BlendEquation, BlendFactors, CanvasGLState, MAX_UNIFORM_CACHE};
 use shared::protocol::render_cmd::{BufferId, ProgramId, VaoId};
 
@@ -156,6 +158,30 @@ pub fn update_bind_texture_2d(state: &mut CanvasGLState, tex: Option<u32>) -> bo
 }
 
 // ============================================================================
+// Viewport
+// ============================================================================
+
+/// Update the viewport fingerprint, returning `true` iff the driver
+/// call must be issued.  Viewport is set on every frame by many
+/// engines (often with the same values) — without dedup we pay an
+/// unconditional GL round-trip per frame per canvas.
+#[inline]
+pub fn update_viewport(
+    state: &mut CanvasGLState,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> bool {
+    let new = (x, y, width, height);
+    if state.viewport == Some(new) {
+        return false;
+    }
+    state.viewport = Some(new);
+    true
+}
+
+// ============================================================================
 // Blend state
 // ============================================================================
 
@@ -238,6 +264,100 @@ pub fn update_depth_range(state: &mut CanvasGLState, near: f32, far: f32) -> boo
         return false;
     }
     state.depth_range = Some(new);
+    true
+}
+
+// ============================================================================
+// Stencil state
+// ============================================================================
+
+/// Stencil-state dedup:  same (func, ref, mask) against the same face
+/// is a no-op on the driver but a real round-trip without this.
+/// `face` is `glow::FRONT`, `glow::BACK`, or `glow::FRONT_AND_BACK`;
+/// we track per-face separately for the `_separate` calls and
+/// duplicate the write when `FRONT_AND_BACK` is the face.
+#[inline]
+pub fn update_stencil_func(
+    state: &mut CanvasGLState,
+    face: u32,
+    func: u32,
+    ref_: i32,
+    mask: u32,
+) -> bool {
+    let fp = (func, ref_, mask);
+    let same = |k: u32| state.stencil_func.get(&k) == Some(&fp);
+    if face == glow::FRONT_AND_BACK {
+        if same(glow::FRONT) && same(glow::BACK) {
+            return false;
+        }
+        state.stencil_func.insert(glow::FRONT, fp);
+        state.stencil_func.insert(glow::BACK, fp);
+    } else {
+        if same(face) {
+            return false;
+        }
+        state.stencil_func.insert(face, fp);
+    }
+    true
+}
+
+#[inline]
+pub fn update_stencil_op(
+    state: &mut CanvasGLState,
+    face: u32,
+    sfail: u32,
+    dpfail: u32,
+    dppass: u32,
+) -> bool {
+    let fp = (sfail, dpfail, dppass);
+    let same = |k: u32| state.stencil_op.get(&k) == Some(&fp);
+    if face == glow::FRONT_AND_BACK {
+        if same(glow::FRONT) && same(glow::BACK) {
+            return false;
+        }
+        state.stencil_op.insert(glow::FRONT, fp);
+        state.stencil_op.insert(glow::BACK, fp);
+    } else {
+        if same(face) {
+            return false;
+        }
+        state.stencil_op.insert(face, fp);
+    }
+    true
+}
+
+#[inline]
+pub fn update_stencil_mask(state: &mut CanvasGLState, face: u32, mask: u32) -> bool {
+    let same = |k: u32| state.stencil_mask.get(&k) == Some(&mask);
+    if face == glow::FRONT_AND_BACK {
+        if same(glow::FRONT) && same(glow::BACK) {
+            return false;
+        }
+        state.stencil_mask.insert(glow::FRONT, mask);
+        state.stencil_mask.insert(glow::BACK, mask);
+    } else {
+        if same(face) {
+            return false;
+        }
+        state.stencil_mask.insert(face, mask);
+    }
+    true
+}
+
+// ============================================================================
+// Pixel-storei
+// ============================================================================
+
+/// Many engines call `pixelStorei` repeatedly with identical `(pname,
+/// param)` tuples between texture uploads.  A single HashMap keyed by
+/// `pname` covers every pname the driver accepts; unknown pnames fall
+/// back to "update and issue" every call (same as before).
+#[inline]
+pub fn update_pixel_store_i32(state: &mut CanvasGLState, pname: u32, param: i32) -> bool {
+    if state.pixel_store_i32.get(&pname) == Some(&param) {
+        return false;
+    }
+    state.pixel_store_i32.insert(pname, param);
     true
 }
 
@@ -397,16 +517,17 @@ pub fn update_disable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> bo
 ///
 /// WebGL's most-called non-draw call: Cocos Creator 2.x issues it 8+
 /// times per sprite in the no-VAO code path.  Fingerprints the full
-/// argument tuple (plus bound VAO) and skips the driver call when
-/// the tuple matches the previous one for the same `(vao, index)`.
+/// argument tuple PLUS the bound VAO PLUS the bound `ARRAY_BUFFER`
+/// and skips the driver call only when every dimension matches the
+/// previously cached entry for `(index)` (scoped by VAO + buffer in
+/// the fingerprint).
 ///
-/// CAVEAT: the pointer also captures the currently-bound
-/// `ARRAY_BUFFER`, so the caller must ensure the array buffer
-/// binding is consistent before reaching this helper.  In practice
-/// the WebGL handler always issues `bindBuffer(ARRAY_BUFFER, …)`
-/// immediately before, so this is fine — but future refactors that
-/// split the two MUST include the array-buffer id in the
-/// fingerprint.
+/// Why `array_buffer` is in the fingerprint: WebGL 1.0 §5.14.10 and
+/// GLES 3.0 §2.9.5 both say `vertexAttribPointer` captures the
+/// currently bound `ARRAY_BUFFER` as the buffer source.  Skipping
+/// a call just because `(size,type,...)` repeat — ignoring that
+/// the current buffer is different — paints the next draw from the
+/// WRONG vertex stream.  Static review caught this as a P0 bug.
 pub fn update_vertex_attrib_pointer(
     state: &mut CanvasGLState,
     index: u32,
@@ -416,18 +537,27 @@ pub fn update_vertex_attrib_pointer(
     stride: i32,
     offset: i32,
 ) -> bool {
+    let vao = state.bound_vao.unwrap_or(0);
     let fp = crate::canvas::VertexAttribPointerFp {
         size,
         type_,
         normalized,
         stride,
         offset,
-        vao: state.bound_vao.unwrap_or(0),
+        vao,
+        // The inner `Option<u32>` of `bound_array_buffer` is
+        // `None` when no buffer has ever been bound (tracker
+        // never saw a call) vs `Some(None)` for "known: no
+        // buffer".  Both cases collapse to `None` here — we
+        // conservatively force re-issue in the "never observed"
+        // state by tracking None explicitly in the fingerprint.
+        array_buffer: state.bound_array_buffer.and_then(|b| b),
     };
-    if state.vertex_attrib_pointer_fp.get(&index) == Some(&fp) {
+    let key = (vao, index);
+    if state.vertex_attrib_pointer_fp.get(&key) == Some(&fp) {
         return false;
     }
-    state.vertex_attrib_pointer_fp.insert(index, fp);
+    state.vertex_attrib_pointer_fp.insert(key, fp);
     true
 }
 
@@ -828,10 +958,99 @@ mod tests {
         // forget the VAO key, sprite batches switching VAOs silently
         // lose their vertex layout.
         let mut s = fresh_state();
+        // Bind an ARRAY_BUFFER so the fingerprint has a concrete
+        // buffer component — otherwise the two calls below also
+        // differ in `array_buffer`, which would hide the VAO bug
+        // behind the new buffer fingerprint.
+        s.bound_array_buffer = Some(Some(99));
         assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
         s.bound_vao = Some(2);
         assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
         assert!(!update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
+    }
+
+    // ---- ARRAY_BUFFER fingerprint (P0-3 regression) -----------------
+    //
+    // WebGL spec: `vertexAttribPointer` captures the currently-bound
+    // `ARRAY_BUFFER`.  Two calls with identical (size, type, stride,
+    // offset) but different bound buffers must both reach the driver
+    // — otherwise the next draw reads from the wrong vertex stream
+    // and the game paints corrupted geometry.
+    //
+    // These tests pin the fingerprint down so nobody accidentally
+    // drops `array_buffer` again.
+
+    #[test]
+    fn vertex_attrib_pointer_reissues_when_array_buffer_changes() {
+        let mut s = fresh_state();
+        // Establish baseline with buffer A.
+        s.bound_array_buffer = Some(Some(42));
+        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
+        // Switch ARRAY_BUFFER to buffer B — same layout args, but
+        // a different buffer must force the driver call.
+        s.bound_array_buffer = Some(Some(43));
+        assert!(
+            update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0),
+            "switching ARRAY_BUFFER with identical pointer args MUST re-issue"
+        );
+        // Same buffer, same args — NOW the dedup should fire.
+        assert!(!update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
+    }
+
+    #[test]
+    fn vertex_attrib_pointer_reissues_when_buffer_goes_back_and_forth() {
+        // Real Cocos 2.x workload: ping-pong between two VBOs
+        // (positions vs. UVs) on the same attribute index across
+        // sprite batches.  Each ping-pong must re-issue even
+        // though the layout tuple is identical.
+        let mut s = fresh_state();
+        s.bound_array_buffer = Some(Some(1));
+        assert!(update_vertex_attrib_pointer(&mut s, 0, 2, glow::FLOAT, false, 8, 0));
+        s.bound_array_buffer = Some(Some(2));
+        assert!(update_vertex_attrib_pointer(&mut s, 0, 2, glow::FLOAT, false, 8, 0));
+        s.bound_array_buffer = Some(Some(1));
+        assert!(update_vertex_attrib_pointer(&mut s, 0, 2, glow::FLOAT, false, 8, 0));
+        s.bound_array_buffer = Some(Some(1));
+        assert!(!update_vertex_attrib_pointer(&mut s, 0, 2, glow::FLOAT, false, 8, 0));
+    }
+
+    #[test]
+    fn vertex_attrib_pointer_keys_by_vao_scope_across_buffer_switches() {
+        // Four distinct (VAO, ARRAY_BUFFER) combinations.  VAOs get
+        // independent slots in the shadow; the `array_buffer`
+        // component inside the fingerprint forces re-issue whenever
+        // the bound buffer changes.  Re-visiting a *prior* buffer
+        // on the same (VAO, index) re-issues — we don't retain
+        // per-(VAO, index, buffer) history because Cocos-style
+        // workloads overwhelmingly set the buffer once per VAO
+        // scope and keep it, and the storage cost of retaining N
+        // buffers per slot would dwarf the saved calls.
+        //
+        // Cross-VAO isolation IS preserved: switching to VAO=2 and
+        // back to VAO=1 with the originally-bound buffer DOES
+        // dedup, because VAO=1's slot was never touched while
+        // VAO=2 was active.
+        let mut s = fresh_state();
+        s.bound_vao = Some(1);
+        s.bound_array_buffer = Some(Some(10));
+        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 16, 0));
+        // Same VAO, different buffer → overwrites VAO 1's slot.
+        s.bound_array_buffer = Some(Some(11));
+        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 16, 0));
+        // Switch to VAO 2, buffer 10.
+        s.bound_vao = Some(2);
+        s.bound_array_buffer = Some(Some(10));
+        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 16, 0));
+        // Switch back to VAO 1 WITHOUT touching its slot — the
+        // previous (vao=1, buffer=11) fp is still cached, so
+        // re-applying with buffer=11 dedups.
+        s.bound_vao = Some(1);
+        s.bound_array_buffer = Some(Some(11));
+        assert!(!update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 16, 0));
+        // But buffer=10 on VAO 1 was overwritten by the earlier
+        // buffer=11 set, so it must re-issue now.
+        s.bound_array_buffer = Some(Some(10));
+        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 16, 0));
     }
 
     #[test]
@@ -841,6 +1060,202 @@ mod tests {
         assert!(!update_vertex_attrib_divisor(&mut s, 0, 1));
         assert!(update_vertex_attrib_divisor(&mut s, 0, 0));
         assert!(update_vertex_attrib_divisor(&mut s, 1, 1));
+    }
+
+    #[test]
+    fn stencil_func_dedup_per_face() {
+        let mut s = fresh_state();
+        assert!(update_stencil_func(
+            &mut s,
+            glow::FRONT,
+            glow::EQUAL,
+            0,
+            0xFF
+        ));
+        assert!(!update_stencil_func(
+            &mut s,
+            glow::FRONT,
+            glow::EQUAL,
+            0,
+            0xFF
+        ));
+        // BACK face has no fingerprint yet — must re-issue.
+        assert!(update_stencil_func(
+            &mut s,
+            glow::BACK,
+            glow::EQUAL,
+            0,
+            0xFF
+        ));
+        // FRONT_AND_BACK dedups only when BOTH faces already match.
+        assert!(!update_stencil_func(
+            &mut s,
+            glow::FRONT_AND_BACK,
+            glow::EQUAL,
+            0,
+            0xFF
+        ));
+    }
+
+    #[test]
+    fn stencil_op_front_and_back_dedup() {
+        let mut s = fresh_state();
+        assert!(update_stencil_op(
+            &mut s,
+            glow::FRONT_AND_BACK,
+            glow::KEEP,
+            glow::KEEP,
+            glow::REPLACE
+        ));
+        // Identical FRONT_AND_BACK dedups.
+        assert!(!update_stencil_op(
+            &mut s,
+            glow::FRONT_AND_BACK,
+            glow::KEEP,
+            glow::KEEP,
+            glow::REPLACE
+        ));
+        // Single-face with identical fp dedups too.
+        assert!(!update_stencil_op(
+            &mut s,
+            glow::FRONT,
+            glow::KEEP,
+            glow::KEEP,
+            glow::REPLACE
+        ));
+    }
+
+    #[test]
+    fn stencil_mask_separate_front_back_tracked_independently() {
+        let mut s = fresh_state();
+        assert!(update_stencil_mask(&mut s, glow::FRONT, 0x0F));
+        assert!(!update_stencil_mask(&mut s, glow::FRONT, 0x0F));
+        assert!(update_stencil_mask(&mut s, glow::BACK, 0x0F));
+        // FRONT_AND_BACK with matching values on both — dedups.
+        assert!(!update_stencil_mask(&mut s, glow::FRONT_AND_BACK, 0x0F));
+        // FRONT_AND_BACK with a new value — re-issues.
+        assert!(update_stencil_mask(&mut s, glow::FRONT_AND_BACK, 0xF0));
+    }
+
+    #[test]
+    fn pixel_store_i32_dedups_per_pname() {
+        let mut s = fresh_state();
+        assert!(update_pixel_store_i32(
+            &mut s,
+            glow::UNPACK_ALIGNMENT,
+            4
+        ));
+        assert!(!update_pixel_store_i32(
+            &mut s,
+            glow::UNPACK_ALIGNMENT,
+            4
+        ));
+        assert!(update_pixel_store_i32(
+            &mut s,
+            glow::UNPACK_ALIGNMENT,
+            1
+        ));
+        // Different pname does not collide.
+        assert!(update_pixel_store_i32(
+            &mut s,
+            glow::PACK_ALIGNMENT,
+            1
+        ));
+    }
+
+    #[test]
+    fn depth_range_dedups_and_reissues_after_external() {
+        let mut s = fresh_state();
+        assert!(update_depth_range(&mut s, 0.0, 1.0));
+        assert!(!update_depth_range(&mut s, 0.0, 1.0));
+        assert!(update_depth_range(&mut s, 0.1, 0.9));
+        s.invalidate_after_external_gl_use();
+        assert!(update_depth_range(&mut s, 0.1, 0.9));
+    }
+
+    #[test]
+    fn stencil_state_is_cleared_on_external_gl_use() {
+        let mut s = fresh_state();
+        let _ = update_stencil_func(&mut s, glow::FRONT, glow::EQUAL, 0, 0xFF);
+        let _ = update_stencil_op(&mut s, glow::FRONT, glow::KEEP, glow::KEEP, glow::REPLACE);
+        let _ = update_stencil_mask(&mut s, glow::FRONT, 0xFF);
+        let _ = update_pixel_store_i32(&mut s, glow::UNPACK_ALIGNMENT, 4);
+        s.invalidate_after_external_gl_use();
+        // All four families re-issue on next call.
+        assert!(update_stencil_func(&mut s, glow::FRONT, glow::EQUAL, 0, 0xFF));
+        assert!(update_stencil_op(
+            &mut s,
+            glow::FRONT,
+            glow::KEEP,
+            glow::KEEP,
+            glow::REPLACE
+        ));
+        assert!(update_stencil_mask(&mut s, glow::FRONT, 0xFF));
+        assert!(update_pixel_store_i32(&mut s, glow::UNPACK_ALIGNMENT, 4));
+    }
+
+    #[test]
+    fn viewport_dedups_identical_values() {
+        let mut s = fresh_state();
+        assert!(
+            update_viewport(&mut s, 0, 0, 800, 600),
+            "first call with unknown previous state must issue"
+        );
+        assert!(
+            !update_viewport(&mut s, 0, 0, 800, 600),
+            "identical viewport must dedup"
+        );
+        assert!(
+            update_viewport(&mut s, 0, 0, 1024, 600),
+            "width change must re-issue"
+        );
+        assert!(
+            update_viewport(&mut s, 10, 0, 1024, 600),
+            "origin change must re-issue"
+        );
+    }
+
+    #[test]
+    fn viewport_reissues_after_external_gl_use() {
+        let mut s = fresh_state();
+        let _ = update_viewport(&mut s, 0, 0, 800, 600);
+        s.invalidate_after_external_gl_use();
+        // After the Skia boundary, viewport may have been mutated
+        // by Ganesh; the shadow is cleared so the next call
+        // re-issues.
+        assert!(update_viewport(&mut s, 0, 0, 800, 600));
+    }
+
+    #[test]
+    fn invalidate_after_external_gl_use_preserves_uniform_cache() {
+        // Regression from the 2026-04 rendering review: an earlier
+        // revision called `self.uniform_cache.clear()` inside
+        // `invalidate_after_external_gl_use`, contradicting the doc
+        // comment and nuking the entire uniform dedup table every
+        // Skia ↔ WebGL boundary crossing.  Uniforms live on GL
+        // program objects, not on the shared context state Skia
+        // touches, so the cache MUST survive.
+        //
+        // If this test ever fails, profile the next production
+        // frame before re-adding the clear — it will re-issue every
+        // `glUniform*` call the app already deduped, which is the
+        // single dominant GL op category on shader-heavy workloads.
+        let mut s = fresh_state();
+        let prog: ProgramId = 7;
+        let loc: u32 = 3;
+        let bytes = [1u8, 2, 3, 4];
+        assert!(update_uniform(&mut s, prog, loc, &bytes));
+        // Second call with identical bytes — dedup must fire.
+        assert!(!update_uniform(&mut s, prog, loc, &bytes));
+
+        s.invalidate_after_external_gl_use();
+
+        // After invalidation the uniform dedup entry MUST remain,
+        // so the next identical call still dedups.
+        assert!(
+            !update_uniform(&mut s, prog, loc, &bytes),
+            "uniform_cache was wiped by invalidate_after_external_gl_use"
+        );
     }
 
     #[test]

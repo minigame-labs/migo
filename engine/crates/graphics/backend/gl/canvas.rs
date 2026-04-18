@@ -406,44 +406,47 @@ impl Canvas2DRenderer {
             }
 
             // ---- CTM mutators -------------------------------------
+            //
+            // Every branch below does TWO things:
+            //   1. Update our shadow `state.ctm` so the damage
+            //      classifier and partial-damage gate see the same
+            //      transform Skia does.
+            //   2. Forward the operation to `SkCanvas` for the
+            //      actual drawing transform.
+            //
+            // The shadow and SkCanvas MUST stay in sync; save/restore
+            // handles this naturally via `Canvas2DState::clone`.
             SetTransform { a, b, c, d, e, f } => {
-                // A 2x3 matrix is "axis-aligned + translation" when
-                // the shear terms `b` and `c` are both zero.  Rotate
-                // / skew / non-uniform scale set at least one; pure
-                // translate or uniform scale keep both at zero.
-                let axis_aligned = b.abs() < 1e-6 && c.abs() < 1e-6;
-                self.state.ctm_non_axis_aligned |= !axis_aligned;
+                self.state.ctm_set([*a, *b, *c, *d, *e, *f]);
                 let m = Matrix::new_all(*a, *c, *e, *b, *d, *f, 0.0, 0.0, 1.0);
                 canvas.set_matrix(&skia_safe::M44::from(m));
                 false
             }
             ResetTransform => {
-                // Reset clears the flag — we're back to identity.
-                self.state.ctm_non_axis_aligned = false;
+                self.state.ctm_reset();
                 canvas.reset_matrix();
                 false
             }
             Translate { x, y } => {
-                // Translation never makes the CTM non-axis-aligned.
+                // Translate matrix is [1, 0, 0, 1, tx, ty].
+                self.state.ctm_concat([1.0, 0.0, 0.0, 1.0, *x, *y]);
                 canvas.translate((*x, *y));
                 false
             }
             Rotate { angle } => {
-                // Any non-zero rotation is non-axis-aligned for
-                // damage purposes.  We don't special-case k*90deg
-                // rotations because the transform composes with
-                // previous mutations opaquely.
-                if angle.abs() > 1e-6 {
-                    self.state.ctm_non_axis_aligned = true;
-                }
+                // Rotate matrix is [cos, sin, -sin, cos, 0, 0]; the
+                // exact shear values are what the axis-aligned test
+                // relies on, so we compute them once here.
+                let (s, c_) = (angle.sin(), angle.cos());
+                self.state.ctm_concat([c_, s, -s, c_, 0.0, 0.0]);
                 canvas.rotate(angle.to_degrees(), None);
                 false
             }
             Scale { x, y } => {
-                // Pure uniform axis-aligned scale (positive, any
-                // magnitude) keeps axis alignment.  Reflection (x<0
-                // or y<0) flips axis but stays aligned.
-                let _ = (x, y);
+                // Scale matrix is [sx, 0, 0, sy, 0, 0]; uniform or
+                // mirrored scales keep shear terms at zero so
+                // `ctm_is_axis_aligned()` stays true.
+                self.state.ctm_concat([*x, 0.0, 0.0, *y, 0.0, 0.0]);
                 canvas.scale((*x, *y));
                 false
             }

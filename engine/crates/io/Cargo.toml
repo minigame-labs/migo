@@ -47,3 +47,14 @@ brotli = { version = "7", optional = true }
 # decompress. The "deflate-flate2" feature alone doesn't activate flate2 in zip 2.4.x
 # (upstream bug). Revisit when zip 3.x ships a decompression-only feature.
 zip = { version = "2.2", optional = true, default-features = false, features = ["deflate"] }
+
+# SQLite for KV storage. `bundled` statically links a vendored amalgamation
+# so we don't depend on the platform's libsqlite (Android version drift,
+# Google Play surface area, etc.). Default features are disabled to shrink
+# the amalgamation — we only need the core KV surface (blob/TEXT + prepared
+# statements). Further size trimming happens via the `LIBSQLITE3_FLAGS` env
+# variable set by `scripts/build-android-so.sh`.
+rusqlite = { version = "0.32", default-features = false, features = ["bundled", "blob"] }
+
+[dev-dependencies]
+tempfile = "3"

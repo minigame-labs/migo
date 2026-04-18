@@ -25,6 +25,9 @@ import com.migo.runtime.GameSession;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.ImageDecoder;
+import android.hardware.HardwareBuffer;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -306,6 +309,133 @@ public final class NativeExports {
                 bitmap.recycle();
             }
             return null;
+        }
+    }
+
+    /**
+     * Decode image bytes into a GPU-importable {@link HardwareBuffer}
+     * ("AHB"), returning a native pointer the Rust engine imports
+     * directly via {@code eglCreateImageKHR} -- the zero-memcpy path.
+     *
+     * <p><b>Availability:</b> API <b>30+</b> only. The zero-copy
+     * bridge requires {@link Bitmap#getHardwareBuffer()} (added in
+     * API 30) to expose the underlying AHB to JNI. On API 26/27/28/29
+     * this method returns {@code null} immediately so the caller
+     * falls back to {@link #decodeImageRgba} without decoding twice.
+     *
+     * <p>On API 30+ the decode strategy is {@code ImageDecoder} with
+     * {@code ALLOCATOR_HARDWARE}: the JPEG/PNG decoder writes
+     * straight into an HWB-backed Bitmap, skipping the intermediate
+     * RGBA heap allocation that {@link #decodeImageRgba} uses.
+     *
+     * <p>The returned array layout is a fixed 16-byte header:
+     * <pre>
+     *   bytes [0..8)   AHardwareBuffer* as little-endian int64
+     *   bytes [8..12)  width  (little-endian uint32)
+     *   bytes [12..16) height (little-endian uint32)
+     * </pre>
+     * {@code null} signals "give up, fall back to
+     * {@link #decodeImageRgba}".
+     *
+     * <p><b>Refcount contract:</b> on success, the native accessor
+     * returns a borrowed pointer; the Rust
+     * {@code OwnedAhb::from_raw_acquire} wrapper bumps its own
+     * strong reference immediately. This method then closes the
+     * Java-side {@link HardwareBuffer} wrapper in {@code finally},
+     * so the AHB survives on Rust's refcount alone. Net effect:
+     * Rust owns one strong refcount; Java owns zero.
+     */
+    public static byte[] decodeImageAhb(byte[] imageData) {
+        if (imageData == null || imageData.length == 0) return null;
+
+        // Quick-reject on API < 30 *before* we touch any class that
+        // only exists on newer SDKs.  This matters beyond just
+        // "wasting work":  ART's verifier is allowed to refuse to
+        // load a method whose bytecode references classes missing
+        // from the running platform's framework. By gating on
+        // `Build.VERSION.SDK_INT` here and delegating all work that
+        // needs {@link ImageDecoder} / {@link HardwareBuffer} to a
+        // separate inner class, we guarantee API 26-29 devices never
+        // trigger that lazy class-load.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return null;
+        }
+
+        // Fail fast under memory pressure -- same rationale as
+        // decodeImageRgba above.
+        Runtime rt = Runtime.getRuntime();
+        long used = rt.totalMemory() - rt.freeMemory();
+        long free = rt.maxMemory() - used;
+        if (free < 32L * 1024 * 1024) {
+            return null;
+        }
+
+        // Hand off to the API-30+ helper. The JVM only loads
+        // `AhbDecoder` when this line executes, which never happens
+        // on older devices thanks to the guard above.
+        return AhbDecoder.decode(imageData);
+    }
+
+    /**
+     * API-30+ decode path for {@link #decodeImageAhb}, factored out
+     * so older devices never load the class. Accessing
+     * {@link ImageDecoder} / {@link HardwareBuffer} from within
+     * this type is safe because the outer method guarantees we
+     * only reach here on API 30+.
+     *
+     * <p><b>Do not add {@code @RequiresApi}</b> — the project
+     * forbids AndroidX dependencies ({@code build.gradle} declares
+     * "zero dependencies"). Version gating is enforced by the
+     * runtime check in the caller.
+     */
+    private static final class AhbDecoder {
+        static byte[] decode(byte[] imageData) {
+            Bitmap bitmap = null;
+            HardwareBuffer hb = null;
+            try {
+                ImageDecoder.Source src = ImageDecoder.createSource(
+                        ByteBuffer.wrap(imageData));
+                bitmap = ImageDecoder.decodeBitmap(src, (decoder, info, source) -> {
+                    decoder.setAllocator(ImageDecoder.ALLOCATOR_HARDWARE);
+                    // Don't premultiply -- matches decodeImageRgba above.
+                    decoder.setUnpremultipliedRequired(true);
+                });
+                if (bitmap == null) return null;
+
+                int w = bitmap.getWidth();
+                int h = bitmap.getHeight();
+
+                hb = bitmap.getHardwareBuffer();
+                if (hb == null) {
+                    // Decoder didn't honour the HARDWARE allocator
+                    // (driver quirk, small image, etc.). Fallback.
+                    return null;
+                }
+                long ahbPtr = NativeBridge.nativeAhbPointerFromHardwareBuffer(hb);
+                if (ahbPtr == 0L) {
+                    return null;
+                }
+
+                ByteBuffer buf = ByteBuffer.allocate(16);
+                buf.order(ByteOrder.LITTLE_ENDIAN);
+                buf.putLong(ahbPtr);
+                buf.putInt(w);
+                buf.putInt(h);
+                return buf.array();
+            } catch (Exception | OutOfMemoryError e) {
+                return null;
+            } finally {
+                // Close the Java wrapper first so its ref is
+                // released before recycle(); the Rust side already
+                // holds an independent strong ref via
+                // AHardwareBuffer_acquire.
+                if (hb != null) {
+                    try { hb.close(); } catch (Throwable ignored) {}
+                }
+                if (bitmap != null && !bitmap.isRecycled()) {
+                    bitmap.recycle();
+                }
+            }
         }
     }
 

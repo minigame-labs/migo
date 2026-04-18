@@ -149,6 +149,13 @@ impl IoScheduler {
                     pool,
                     wait_micros
                 );
+                // Observability: bump the process-global slow-IO
+                // counter when wall-clock crosses 100 ms. Uses the
+                // IO scheduler's measurement because it includes
+                // both pool queue wait + the job itself, which is
+                // the latency the JS caller actually sees.
+                shared::stats::io_metrics_global()
+                    .record_if_slow(wait_micros / 1000);
                 match result {
                     Ok(Ok(value)) => Ok(value),
                     Ok(Err(err)) => {

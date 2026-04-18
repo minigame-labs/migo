@@ -10,10 +10,7 @@
 
 use super::color::{to_sk_color4f, to_sk_color4f_modulated};
 use super::state::{Canvas2DState, StyleKind};
-use skia_safe::{
-    gradient_shader, BlendMode, Color, Paint, Point, Shader, TileMode,
-};
-use shared::protocol::render_cmd::GradientStop;
+use skia_safe::{BlendMode, Paint, Shader};
 
 /// Build a Skia `Shader` from the fill/stroke `StyleKind`, if any.
 ///
@@ -36,7 +33,9 @@ where
             x1,
             y1,
             stops,
-        } => build_linear_gradient(*x0, *y0, *x1, *y1, stops, global_alpha),
+        } => super::effect_cache::get_or_build_linear_gradient(
+            *x0, *y0, *x1, *y1, stops, global_alpha,
+        ),
         StyleKind::RadialGradient {
             x0,
             y0,
@@ -45,13 +44,17 @@ where
             y1,
             r1,
             stops,
-        } => build_radial_gradient(*x0, *y0, *r0, *x1, *y1, *r1, stops, global_alpha),
+        } => super::effect_cache::get_or_build_radial_gradient(
+            *x0, *y0, *r0, *x1, *y1, *r1, stops, global_alpha,
+        ),
         StyleKind::ConicGradient {
             cx,
             cy,
             start_angle,
             stops,
-        } => build_conic_gradient(*cx, *cy, *start_angle, stops, global_alpha),
+        } => super::effect_cache::get_or_build_conic_gradient(
+            *cx, *cy, *start_angle, stops, global_alpha,
+        ),
         StyleKind::Pattern {
             image_id,
             repeat_x,
@@ -82,84 +85,9 @@ impl PatternResolver for NullPatternResolver {
     }
 }
 
-fn stops_to_colors_positions(
-    stops: &[GradientStop],
-    global_alpha: f32,
-) -> Option<(Vec<Color>, Vec<f32>)> {
-    if stops.len() < 2 {
-        return None;
-    }
-    let colors = stops
-        .iter()
-        .map(|s| to_sk_color4f_modulated(s.color, global_alpha).to_color())
-        .collect::<Vec<_>>();
-    let positions = stops.iter().map(|s| s.offset.clamp(0.0, 1.0)).collect();
-    Some((colors, positions))
-}
-
-fn build_linear_gradient(
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-    stops: &[GradientStop],
-    global_alpha: f32,
-) -> Option<Shader> {
-    let (colors, positions) = stops_to_colors_positions(stops, global_alpha)?;
-    gradient_shader::linear(
-        (Point::new(x0, y0), Point::new(x1, y1)),
-        gradient_shader::GradientShaderColors::Colors(&colors),
-        Some(&positions[..]),
-        TileMode::Clamp,
-        None,
-        None,
-    )
-}
-
-fn build_radial_gradient(
-    x0: f32,
-    y0: f32,
-    r0: f32,
-    x1: f32,
-    y1: f32,
-    r1: f32,
-    stops: &[GradientStop],
-    global_alpha: f32,
-) -> Option<Shader> {
-    let (colors, positions) = stops_to_colors_positions(stops, global_alpha)?;
-    gradient_shader::two_point_conical(
-        Point::new(x0, y0),
-        r0,
-        Point::new(x1, y1),
-        r1,
-        gradient_shader::GradientShaderColors::Colors(&colors),
-        Some(&positions[..]),
-        TileMode::Clamp,
-        None,
-        None,
-    )
-}
-
-fn build_conic_gradient(
-    cx: f32,
-    cy: f32,
-    start_angle_rad: f32,
-    stops: &[GradientStop],
-    global_alpha: f32,
-) -> Option<Shader> {
-    let (colors, positions) = stops_to_colors_positions(stops, global_alpha)?;
-    let start_deg = start_angle_rad.to_degrees();
-    let end_deg = start_deg + 360.0;
-    gradient_shader::sweep(
-        Point::new(cx, cy),
-        gradient_shader::GradientShaderColors::Colors(&colors),
-        Some(&positions[..]),
-        TileMode::Clamp,
-        Some((start_deg, end_deg)),
-        None,
-        None,
-    )
-}
+// Gradient builders live in `super::effect_cache` so their shader
+// outputs are memoised across `build_shader` calls.  See
+// `effect_cache::get_or_build_linear_gradient` and siblings.
 
 /// If a visible shadow is present in `state`, install a drop-shadow
 /// `ImageFilter` on `paint`.
@@ -215,6 +143,7 @@ pub fn build_fill_paint<R: PatternResolver>(
         _ => {
             if let Some(shader) = build_shader(&state.fill, state.global_alpha, resolver) {
                 paint.set_shader(shader);
+                apply_style_alpha(&mut paint, &state.fill, state.global_alpha);
             } else {
                 paint.set_color4f(
                     to_sk_color4f(shared::protocol::color::Color::transparent()),
@@ -225,6 +154,24 @@ pub fn build_fill_paint<R: PatternResolver>(
     }
     apply_shadow_to_paint(&mut paint, state);
     paint
+}
+
+/// Apply `globalAlpha` on a paint whose colour comes from a shader.
+///
+/// Gradient stops already bake `globalAlpha` into their per-stop
+/// colours via [`to_sk_color4f_modulated`] — applying paint.alpha on
+/// top would double-modulate.  Pattern shaders, however, sample
+/// through an image and have no such opportunity; without this hook
+/// `fillStyle = ctx.createPattern(...)` used to render at full
+/// opacity regardless of `ctx.globalAlpha`, a silent spec deviation
+/// caught by the 2026-04 rendering review.
+#[inline]
+fn apply_style_alpha(paint: &mut Paint, kind: &StyleKind, global_alpha: f32) {
+    if matches!(kind, StyleKind::Pattern { .. }) {
+        // SkPaint's alpha multiplies the shader output, exactly what
+        // Canvas 2D globalAlpha demands for pattern fills/strokes.
+        paint.set_alpha_f(global_alpha);
+    }
 }
 
 /// Build a `Paint` preset for the Canvas2D *stroke* side.
@@ -249,6 +196,7 @@ pub fn build_stroke_paint<R: PatternResolver>(
         _ => {
             if let Some(shader) = build_shader(&state.stroke, state.global_alpha, resolver) {
                 paint.set_shader(shader);
+                apply_style_alpha(&mut paint, &state.stroke, state.global_alpha);
             } else {
                 paint.set_color4f(
                     to_sk_color4f(shared::protocol::color::Color::transparent()),
@@ -286,6 +234,8 @@ mod tests {
     use super::super::state::{Canvas2DState, Shadow, StyleKind};
     use super::*;
     use shared::protocol::color::Color as ProtocolColor;
+    use shared::protocol::render_cmd::GradientStop;
+    use skia_safe::Color;
 
     #[test]
     fn build_fill_paint_uses_color_when_style_is_flat() {
@@ -299,6 +249,11 @@ mod tests {
 
     #[test]
     fn build_stroke_paint_carries_line_attributes() {
+        // Routes through `effect_cache::get_or_build_dash` which
+        // bumps a global metric counter; hold the crate-wide test
+        // guard so concurrent tests in effect_cache don't see this
+        // bump on their installed sink.
+        let _g = crate::render_diagnostics::test_guard();
         let mut s = Canvas2DState::default();
         s.stroke = StyleKind::Color(ProtocolColor::black());
         s.line_width = 5.0;
@@ -379,6 +334,99 @@ mod tests {
         assert!(build_shader(&s, 1.0, &NullPatternResolver).is_none());
     }
 
+    /// Test-only PatternResolver that returns a transparent-black
+    /// 1x1 shader so we can observe the paint's alpha channel
+    /// without needing a real image.
+    struct StubPatternResolver;
+    impl PatternResolver for StubPatternResolver {
+        fn resolve_pattern(
+            &self,
+            _image_id: u32,
+            _repeat_x: bool,
+            _repeat_y: bool,
+            _global_alpha: f32,
+        ) -> Option<Shader> {
+            // Solid-colour shader backs the pattern path; its colour
+            // doesn't matter for the alpha assertion below — we
+            // only care that paint.alpha_f() reflects globalAlpha.
+            Some(skia_safe::shaders::color(Color::WHITE))
+        }
+    }
+
+    #[test]
+    fn pattern_fill_applies_global_alpha_to_paint() {
+        // Regression: `SkiaPatternResolver::resolve_pattern` drops
+        // `global_alpha` on the floor (`let _ = global_alpha`); the
+        // paint side is now responsible for folding globalAlpha in
+        // via `set_alpha_f`.  Without this, `fillStyle =
+        // ctx.createPattern(img, 'repeat')` paints at full opacity
+        // regardless of `ctx.globalAlpha = 0.4` — a silent spec
+        // deviation.
+        let mut s = Canvas2DState::default();
+        s.fill = StyleKind::Pattern {
+            image_id: 42,
+            repeat_x: true,
+            repeat_y: true,
+        };
+        s.global_alpha = 0.4;
+        let p = build_fill_paint(&s, &StubPatternResolver);
+        assert!(p.shader().is_some(), "pattern shader must be installed");
+        // Skia stores alpha as u8 0..=255; 0.4 * 255 ~= 102.
+        let alpha = p.alpha();
+        assert!(
+            alpha >= 100 && alpha <= 105,
+            "expected alpha ~= 102 for globalAlpha=0.4; got {alpha}"
+        );
+    }
+
+    #[test]
+    fn pattern_stroke_applies_global_alpha_to_paint() {
+        let mut s = Canvas2DState::default();
+        s.stroke = StyleKind::Pattern {
+            image_id: 42,
+            repeat_x: false,
+            repeat_y: false,
+        };
+        s.global_alpha = 0.25;
+        let p = build_stroke_paint(&s, &StubPatternResolver);
+        assert!(p.shader().is_some());
+        let alpha = p.alpha();
+        assert!(
+            alpha >= 60 && alpha <= 68,
+            "expected alpha ~= 64 for globalAlpha=0.25; got {alpha}"
+        );
+    }
+
+    #[test]
+    fn gradient_fill_does_not_apply_paint_alpha_double() {
+        // Gradient stops bake globalAlpha into their per-stop colours
+        // via `to_sk_color4f_modulated`; applying paint.alpha on top
+        // would double-modulate.  This test pins the non-pattern
+        // branch's invariant: paint.alpha stays at the default for
+        // gradient fills.
+        let mut s = Canvas2DState::default();
+        s.fill = StyleKind::LinearGradient {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 1.0,
+            y1: 0.0,
+            stops: std::sync::Arc::new(vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: ProtocolColor::rgb(255, 0, 0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: ProtocolColor::rgb(0, 0, 255),
+                },
+            ]),
+        };
+        s.global_alpha = 0.4;
+        let p = build_fill_paint(&s, &NullPatternResolver);
+        assert!(p.shader().is_some());
+        assert_eq!(p.alpha(), 255, "paint.alpha should be default for gradient");
+    }
+
     #[test]
     fn clear_paint_uses_blend_mode_clear() {
         let p = build_clear_paint();
@@ -387,6 +435,10 @@ mod tests {
 
     #[test]
     fn fill_paint_carries_shadow_filter_when_visible() {
+        // Routes through `effect_cache::get_or_build_drop_shadow`
+        // which bumps a global metric counter; hold the crate-wide
+        // guard so effect_cache's metric tests don't see this bump.
+        let _g = crate::render_diagnostics::test_guard();
         let mut s = Canvas2DState::default();
         s.shadow = Shadow {
             blur: 4.0,

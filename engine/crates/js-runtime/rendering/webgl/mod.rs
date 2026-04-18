@@ -8,7 +8,9 @@ mod webgl;
 
 use context2d::*;
 pub mod error_state;
-use error_state::{op_webgl_get_context_attributes, op_webgl_get_error};
+use error_state::{
+    op_webgl_get_context_attributes, op_webgl_get_error, op_webgl_record_attributes,
+};
 use font::*;
 use raf::*;
 use webgl::*;
@@ -26,6 +28,7 @@ extension!(host_v8_webgl,
         op_alloc_gl_resource_id,
         op_webgl_get_error,
         op_webgl_get_context_attributes,
+        op_webgl_record_attributes,
         op_create_program,
         op_use_program,
         op_link_program,

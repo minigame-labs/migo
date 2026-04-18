@@ -620,4 +620,22 @@ public final class NativeBridge {
      * @return JSON string with log entries, or null if session not found
      */
     public static native String getConsoleLogs(int sessionId, long sinceCursor);
+
+    // ==================== AHardwareBuffer helpers ====================
+
+    /**
+     * Extract the native {@code AHardwareBuffer*} backing a Java
+     * {@link android.hardware.HardwareBuffer} and return it as a
+     * {@code long} (pointer value). Used by the zero-copy image
+     * decode path so Rust can import the buffer via
+     * {@code eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID, …)} without
+     * shuttling pixel bytes through JNI.
+     * <p>
+     * Returns 0 if the handle is null or the underlying AHB can't be
+     * obtained (the NDK's {@code AHardwareBuffer_fromHardwareBuffer}
+     * has no documented failure mode, but we defensively clamp any
+     * anomaly to zero so the Rust side knows to fall back).
+     */
+    public static native long nativeAhbPointerFromHardwareBuffer(
+            android.hardware.HardwareBuffer hb);
 }

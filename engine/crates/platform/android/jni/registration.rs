@@ -4,7 +4,8 @@ use jni::{JNIEnv, NativeMethod};
 use tracing::info;
 
 use crate::android::jni::{
-    executeScript, getConsoleLogs, getDebugStats, init, mod_main, onAccelerometerChange, onActionSheetResult,
+    executeScript, getConsoleLogs, getDebugStats, init, mod_main,
+    nativeAhbPointerFromHardwareBuffer, onAccelerometerChange, onActionSheetResult,
     onAudioInterruptionBegin, onAudioInterruptionEnd, onBLECharacteristicValueChange,
     onBLEConnectionStateChange, onBLEMTUChange, onBeaconServiceChange, onBeaconUpdate,
     onBluetoothAdapterStateChange, onBluetoothDeviceFound, onCameraEvent, onCameraFrameData,
@@ -165,6 +166,14 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "getConsoleLogs".into(),
                 sig: "(IJ)Ljava/lang/String;".into(),
                 fn_ptr: getConsoleLogs as *mut c_void,
+            },
+            // AHardwareBuffer helper used by `NativeExports.decodeImageAhb`
+            // to hand a native AHB pointer to Rust without copying
+            // pixel bytes through a Java `byte[]`.
+            NativeMethod {
+                name: "nativeAhbPointerFromHardwareBuffer".into(),
+                sig: "(Landroid/hardware/HardwareBuffer;)J".into(),
+                fn_ptr: nativeAhbPointerFromHardwareBuffer as *mut c_void,
             },
             NativeMethod {
                 name: "onRecorderEvent".into(),
@@ -427,7 +436,17 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         // Charset encoding (GBK via java.nio.charset)
         ("encodeGbk", "(Ljava/lang/String;)[B"),
         ("decodeGbk", "([B)Ljava/lang/String;"),
-        // Image decoding (BitmapFactory)
+        // Image decoding (BitmapFactory / ImageDecoder).
+        // `decodeImageAhb` returns a packed 16-byte header:
+        //   [ahb_ptr_i64_le][width_u32_le][height_u32_le]
+        // The AHB refcount has been incremented once for the Rust
+        // side; `AHardwareBuffer_release` is the caller's
+        // responsibility (via `OwnedAhb` Drop). A zero pointer means
+        // "decode failed, fall back to legacy byte[] path".
+        ("decodeImageAhb", "([B)[B"),
+        // Legacy: RGBA `byte[]` — kept until the zero-copy path is
+        // exercised on all target devices and we trust AHB import
+        // across vendor drivers.
         ("decodeImageRgba", "([B)[B"),
         // Clipboard
         ("setClipboardData", "(ILjava/lang/String;)I"),

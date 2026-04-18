@@ -1,43 +1,42 @@
 //! Key-value storage ops and buffer URL management.
 //!
-//! Provides persistent key-value storage backed by the local file system,
-//! with per-key files stored under `{app_files_dir}/kv_storage/`.
+//! Backed by an embedded WAL-mode SQLite database opened lazily per
+//! session at `{app_files_dir}/kv_storage/storage.db`.  The on-disk
+//! layout (a single `storage.db`) is a full replacement of the
+//! previous `file-per-key` hex-named layout — see
+//! [`io::storage_ops`] and [`io::kv_store`] for the rationale and
+//! schema.
 //!
 //! ## Limits
 //!
-//! - Single key: 1 MB
+//! - Single value: 1 MB
 //! - Total storage: 10 MB
 //!
-//! ## File Layout
-//!
-//! ```text
-//! {app_files_dir}/kv_storage/
-//!     {hex_encoded_key}.dat   <- type-tagged JSON value
-//! {app_cache_dir}/buffer_urls/
-//!     {timestamp_hex}         <- raw binary blob
-//! ```
+//! The quota is enforced inside the SQLite transaction via
+//! `SELECT SUM(size)`, which is O(n) but n is bounded to a few
+//! thousand small-game keys in practice; the extra read is
+//! dominated by the single write fsync cost anyway.
 
 use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use deno_core::{Extension, JsBuffer, OpState, op2};
 use deno_error::JsErrorBox;
-use io::storage_ops;
+use io::storage_ops::{self, StorageInfo};
 use io::task::{IoRequest, PriorityClass, RequestKind};
 use shared::error::EngineError;
 use shared::op_state::HostOpState;
 
 use crate::io_state::IoSchedulerState;
 
-/// Shared per-session storage totals cache, stored in OpState.
-/// Avoids O(n) directory scans on every `setStorage` after the first write.
-#[derive(Clone)]
-struct StorageTotalsState(Arc<Mutex<storage_ops::StorageTotals>>);
-
 /// Storage directory name under `app_files_dir`.
+///
+/// The SQLite file itself lives at `{STORAGE_DIR}/storage.db`; the
+/// directory layer is kept so per-game cleanup tools that `rm -rf`
+/// the folder keep working.
 const STORAGE_DIR: &str = "kv_storage";
 
 /// Buffer URL directory name under `app_cache_dir`.
@@ -50,7 +49,7 @@ const MAX_VALUE_SIZE: usize = 1024 * 1024;
 const LIMIT_SIZE_KB: u32 = 10240;
 
 /// Maximum total storage size in bytes.
-const MAX_TOTAL_SIZE: usize = LIMIT_SIZE_KB as usize * 1024;
+const MAX_TOTAL_BYTES: u64 = LIMIT_SIZE_KB as u64 * 1024;
 
 // ==================== Path Helpers ====================
 
@@ -80,22 +79,6 @@ fn pool_err(err: io::pools::PoolError) -> StorageError {
     StorageError::Message(err.to_string())
 }
 
-/// Encode a storage key to a hex filename.
-///
-/// This avoids issues with special characters, path separators, and
-/// filesystem-reserved names across platforms.
-fn key_to_hex(key: &str) -> String {
-    let bytes = key.as_bytes();
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        // Manual hex encoding — avoids `format!` overhead per byte.
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        hex.push(HEX[(b >> 4) as usize] as char);
-        hex.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    hex
-}
-
 fn ensure_dir(dir: &std::path::Path) -> Result<(), JsErrorBox> {
     if !dir.exists() {
         fs::create_dir_all(dir)
@@ -104,17 +87,62 @@ fn ensure_dir(dir: &std::path::Path) -> Result<(), JsErrorBox> {
     Ok(())
 }
 
-// ==================== Storage Ops ====================
+/// Convert an engine-layer error to the JS-visible message. Keeps
+/// the user-facing string equivalent to the old ops so existing
+/// error-match code in games keeps working.
+fn js_err(e: EngineError) -> JsErrorBox {
+    match &e.detail {
+        Some(d) => JsErrorBox::generic(d.clone()),
+        None => JsErrorBox::generic(e.msg.to_string()),
+    }
+}
+
+/// Serialize [`StorageInfo`] into the JSON shape the JS wrapper
+/// expects: `{ keys: [...], currentSize: <KB>, limitSize: <KB> }`.
+/// Sizes are reported in KiB (ceil), mirroring the legacy format.
+fn info_to_json(info: &StorageInfo) -> String {
+    // Ceil to KiB so a 1-byte value reports currentSize=1.
+    let current_kib = (info.current_bytes + 1023) / 1024;
+    let limit_kib = (info.limit_bytes + 1023) / 1024;
+    let mut keys = String::with_capacity(info.keys.len() * 16);
+    for (i, k) in info.keys.iter().enumerate() {
+        if i > 0 {
+            keys.push(',');
+        }
+        keys.push('"');
+        // Reuse the serde_json encoder via manual escape — we avoid
+        // pulling in serde_json for this tiny use, but still handle
+        // the JSON metacharacters that can appear in user keys.
+        for c in k.chars() {
+            match c {
+                '"' => keys.push_str("\\\""),
+                '\\' => keys.push_str("\\\\"),
+                '\n' => keys.push_str("\\n"),
+                '\r' => keys.push_str("\\r"),
+                '\t' => keys.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    keys.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => keys.push(c),
+            }
+        }
+        keys.push('"');
+    }
+    format!(r#"{{"keys":[{keys}],"currentSize":{current_kib},"limitSize":{limit_kib}}}"#)
+}
+
+// ==================== Sync Storage Ops ====================
 
 #[op2]
 #[string]
 pub fn op_storage_get(state: &mut OpState, #[string] key: &str) -> Result<String, JsErrorBox> {
-    let path = storage_dir(state).join(key_to_hex(key));
-    storage_ops::storage_get_sync_with_scheduler(
-        get_scheduler(state),
-        path.to_string_lossy().into_owned(),
-    )
-    .map_err(|e| JsErrorBox::generic(format!("getStorage:fail {e}")))
+    let scheduler = get_scheduler(state);
+    let dir = storage_dir(state);
+    // Missing key maps to "" so the JS-side `deserialize("")` contract
+    // (return empty string) keeps working without a wire-format change.
+    storage_ops::storage_get_sync_with_scheduler(scheduler, dir, key.to_string(), MAX_TOTAL_BYTES)
+        .map(|opt| opt.unwrap_or_default())
+        .map_err(js_err)
 }
 
 #[op2(fast)]
@@ -123,76 +151,44 @@ pub fn op_storage_set(
     #[string] key: &str,
     #[string] value: &str,
 ) -> Result<(), JsErrorBox> {
-    let value_len = value.len();
-    if value_len > MAX_VALUE_SIZE {
+    if value.len() > MAX_VALUE_SIZE {
         return Err(JsErrorBox::generic("setStorage:fail data exceeds max size"));
     }
-
-    let dir = storage_dir(state);
-    let totals_arc = state.borrow::<StorageTotalsState>().0.clone();
     let scheduler = get_scheduler(state);
-
-    let dir_str = dir.to_string_lossy().into_owned();
-    let path = dir.join(key_to_hex(key));
-    let path_str = path.to_string_lossy().into_owned();
-
+    let dir = storage_dir(state);
     storage_ops::storage_set_sync_with_scheduler(
         scheduler,
-        dir_str,
-        path_str,
+        dir,
+        key.to_string(),
         value.to_string(),
-        MAX_TOTAL_SIZE,
-        totals_arc,
+        MAX_TOTAL_BYTES,
     )
-    .map_err(|e| match &e.detail {
-        Some(d) => JsErrorBox::generic(d.clone()),
-        None => JsErrorBox::generic(e.msg.to_string()),
-    })
+    .map_err(js_err)
 }
 
 #[op2(fast)]
 pub fn op_storage_remove(state: &mut OpState, #[string] key: &str) -> Result<(), JsErrorBox> {
-    let path = storage_dir(state).join(key_to_hex(key));
-    let totals_arc = state.borrow::<StorageTotalsState>().0.clone();
     let scheduler = get_scheduler(state);
-    let path_str = path.to_string_lossy().into_owned();
-
-    storage_ops::storage_remove_sync_with_scheduler(scheduler, path_str, totals_arc).map_err(|e| {
-        match &e.detail {
-            Some(d) => JsErrorBox::generic(d.clone()),
-            None => JsErrorBox::generic(e.msg.to_string()),
-        }
-    })
+    let dir = storage_dir(state);
+    storage_ops::storage_remove_sync_with_scheduler(scheduler, dir, key.to_string(), MAX_TOTAL_BYTES)
+        .map_err(js_err)
 }
 
 #[op2(fast)]
 pub fn op_storage_clear(state: &mut OpState) -> Result<(), JsErrorBox> {
-    let dir = storage_dir(state);
-    let totals_arc = state.borrow::<StorageTotalsState>().0.clone();
     let scheduler = get_scheduler(state);
-    let dir_str = dir.to_string_lossy().into_owned();
-
-    storage_ops::storage_clear_sync_with_scheduler(scheduler, dir_str, totals_arc).map_err(|e| {
-        match &e.detail {
-            Some(d) => JsErrorBox::generic(d.clone()),
-            None => JsErrorBox::generic(e.msg.to_string()),
-        }
-    })
+    let dir = storage_dir(state);
+    storage_ops::storage_clear_sync_with_scheduler(scheduler, dir, MAX_TOTAL_BYTES).map_err(js_err)
 }
 
 #[op2]
 #[string]
 pub fn op_storage_info(state: &mut OpState) -> Result<String, JsErrorBox> {
+    let scheduler = get_scheduler(state);
     let dir = storage_dir(state);
-    storage_ops::storage_info_sync_with_scheduler(
-        get_scheduler(state),
-        dir.to_string_lossy().into_owned(),
-        LIMIT_SIZE_KB,
-    )
-    .map_err(|e| match &e.detail {
-        Some(d) => JsErrorBox::generic(d.clone()),
-        None => JsErrorBox::generic(e.msg.to_string()),
-    })
+    let info = storage_ops::storage_info_sync_with_scheduler(scheduler, dir, MAX_TOTAL_BYTES)
+        .map_err(js_err)?;
+    Ok(info_to_json(&info))
 }
 
 // ==================== Async Storage Ops ====================
@@ -214,26 +210,42 @@ impl From<EngineError> for StorageError {
     }
 }
 
+/// Route a blocking KvStore call through the IoScheduler as an async
+/// task. All four mutate-style async ops share this shape, so folding
+/// the boilerplate into one helper keeps the call sites obvious.
+async fn run_mutate_async<F>(state: Rc<RefCell<OpState>>, f: F) -> Result<(), StorageError>
+where
+    F: FnOnce(&std::path::Path) -> Result<(), EngineError> + Send + 'static,
+{
+    let (scheduler, dir) = {
+        let st = state.borrow();
+        (get_scheduler(&st), storage_dir(&st))
+    };
+    scheduler
+        .run_async(
+            IoRequest::StorageMutate {
+                request: RequestKind::Async,
+                priority: PriorityClass::from(RequestKind::Async),
+            },
+            move || f(&dir).map_err(StorageError::from),
+        )
+        .await
+        .map_err(pool_err)?
+}
+
 #[op2(async(lazy), fast)]
 #[string]
 pub async fn op_storage_get_async(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
 ) -> Result<String, StorageError> {
-    let (scheduler, path) = {
+    let (scheduler, dir) = {
         let st = state.borrow();
-        let hos = st.borrow::<HostOpState>();
-        (
-            get_scheduler(&st),
-            hos.app_files_dir
-                .join(STORAGE_DIR)
-                .join(key_to_hex(&key))
-                .to_string_lossy()
-                .into_owned(),
-        )
+        (get_scheduler(&st), storage_dir(&st))
     };
-    storage_ops::storage_get_with_scheduler(scheduler, path, RequestKind::Async)
+    storage_ops::storage_get_with_scheduler(scheduler, dir, key, MAX_TOTAL_BYTES, RequestKind::Async)
         .await
+        .map(|opt| opt.unwrap_or_default())
         .map_err(StorageError::from)
 }
 
@@ -248,37 +260,10 @@ pub async fn op_storage_set_async(
             "setStorage:fail data exceeds max size".into(),
         ));
     }
-
-    let (scheduler, dir, path, totals_arc) = {
-        let st = state.borrow();
-        let hos = st.borrow::<HostOpState>();
-        let dir = hos.app_files_dir.join(STORAGE_DIR);
-        let path = dir.join(key_to_hex(&key));
-        let totals_arc = st.borrow::<StorageTotalsState>().0.clone();
-        (
-            get_scheduler(&st),
-            dir.to_string_lossy().into_owned(),
-            path.to_string_lossy().into_owned(),
-            totals_arc,
-        )
-    };
-    let max_total = MAX_TOTAL_SIZE;
-    scheduler
-        .run_async(
-            IoRequest::StorageMutate {
-                request: RequestKind::Async,
-                priority: PriorityClass::from(RequestKind::Async),
-            },
-            move || {
-                let mut totals = totals_arc
-                    .lock()
-                    .map_err(|e| StorageError::Message(format!("lock error: {e}")))?;
-                storage_ops::storage_set(&dir, &path, &value, max_total, Some(&mut totals))
-                    .map_err(StorageError::from)
-            },
-        )
-        .await
-        .map_err(pool_err)?
+    run_mutate_async(state, move |dir| {
+        storage_ops::storage_set(dir, &key, &value, MAX_TOTAL_BYTES)
+    })
+    .await
 }
 
 #[op2(async(lazy), fast)]
@@ -286,63 +271,18 @@ pub async fn op_storage_remove_async(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
 ) -> Result<(), StorageError> {
-    let (scheduler, path, totals_arc) = {
-        let st = state.borrow();
-        let hos = st.borrow::<HostOpState>();
-        let path = hos
-            .app_files_dir
-            .join(STORAGE_DIR)
-            .join(key_to_hex(&key))
-            .to_string_lossy()
-            .into_owned();
-        let totals_arc = st.borrow::<StorageTotalsState>().0.clone();
-        (get_scheduler(&st), path, totals_arc)
-    };
-    scheduler
-        .run_async(
-            IoRequest::StorageMutate {
-                request: RequestKind::Async,
-                priority: PriorityClass::from(RequestKind::Async),
-            },
-            move || {
-                let mut totals = totals_arc
-                    .lock()
-                    .map_err(|e| StorageError::Message(format!("lock error: {e}")))?;
-                storage_ops::storage_remove(&path, Some(&mut totals)).map_err(StorageError::from)
-            },
-        )
-        .await
-        .map_err(pool_err)?
+    run_mutate_async(state, move |dir| {
+        storage_ops::storage_remove(dir, &key, MAX_TOTAL_BYTES)
+    })
+    .await
 }
 
 #[op2(async(lazy), fast)]
 pub async fn op_storage_clear_async(state: Rc<RefCell<OpState>>) -> Result<(), StorageError> {
-    let (scheduler, dir, totals_arc) = {
-        let st = state.borrow();
-        let hos = st.borrow::<HostOpState>();
-        let dir = hos
-            .app_files_dir
-            .join(STORAGE_DIR)
-            .to_string_lossy()
-            .into_owned();
-        let totals_arc = st.borrow::<StorageTotalsState>().0.clone();
-        (get_scheduler(&st), dir, totals_arc)
-    };
-    scheduler
-        .run_async(
-            IoRequest::StorageMutate {
-                request: RequestKind::Async,
-                priority: PriorityClass::from(RequestKind::Async),
-            },
-            move || {
-                let mut totals = totals_arc
-                    .lock()
-                    .map_err(|e| StorageError::Message(format!("lock error: {e}")))?;
-                storage_ops::storage_clear(&dir, Some(&mut totals)).map_err(StorageError::from)
-            },
-        )
-        .await
-        .map_err(pool_err)?
+    run_mutate_async(state, move |dir| {
+        storage_ops::storage_clear(dir, MAX_TOTAL_BYTES)
+    })
+    .await
 }
 
 #[op2(async(lazy), fast)]
@@ -350,26 +290,19 @@ pub async fn op_storage_clear_async(state: Rc<RefCell<OpState>>) -> Result<(), S
 pub async fn op_storage_info_async(state: Rc<RefCell<OpState>>) -> Result<String, StorageError> {
     let (scheduler, dir) = {
         let st = state.borrow();
-        let hos = st.borrow::<HostOpState>();
-        (
-            get_scheduler(&st),
-            hos.app_files_dir
-                .join(STORAGE_DIR)
-                .to_string_lossy()
-                .into_owned(),
-        )
+        (get_scheduler(&st), storage_dir(&st))
     };
-    let limit = LIMIT_SIZE_KB;
-    scheduler
+    let info = scheduler
         .run_async(
             IoRequest::StorageInfo {
                 request: RequestKind::Async,
                 priority: PriorityClass::from(RequestKind::Async),
             },
-            move || storage_ops::storage_info(&dir, limit).map_err(StorageError::from),
+            move || storage_ops::storage_info(&dir, MAX_TOTAL_BYTES).map_err(StorageError::from),
         )
         .await
-        .map_err(pool_err)?
+        .map_err(pool_err)??;
+    Ok(info_to_json(&info))
 }
 
 // ==================== Buffer URL Ops ====================
@@ -434,11 +367,6 @@ deno_core::extension!(
         dir "storage",
         "01_storage.js",
     ],
-    state = |state| {
-        state.put::<StorageTotalsState>(StorageTotalsState(
-            Arc::new(Mutex::new(storage_ops::StorageTotals::new())),
-        ));
-    },
 );
 
 pub fn storage_extensions() -> Vec<Extension> {

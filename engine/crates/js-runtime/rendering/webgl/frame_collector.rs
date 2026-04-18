@@ -183,6 +183,11 @@ impl UnifiedFrameCollector {
     /// `Vec` capacities), so the value is a *heuristic* for flush
     /// decisions — never load-bearing for correctness.
     #[inline]
+    /// `#[allow(dead_code)]`: only exercised by tests today, but
+    /// exposed as public-in-crate so the debug overlay / future
+    /// profiling hooks can read the live byte budget without
+    /// poking `self.pending_bytes` directly.
+    #[allow(dead_code)]
     pub(crate) fn approx_pending_bytes(&self) -> usize {
         self.pending_bytes
     }
@@ -208,14 +213,15 @@ impl UnifiedFrameCollector {
                 }));
             self.current = CurrentKind::Canvas2D(canvas_id);
         }
-        // Accumulate bytes before move: the enum size bounds the
-        // stack size we'll hand to the render thread.  Heap-owned
-        // payloads (long-form text, large image batches) are
-        // approximated by the enum's base size; a more expensive
-        // walk is avoided on the hot path.
+        // Walk the full deep size (enum base + heap payload) so the
+        // budget reflects reality.  The previous implementation
+        // only added `size_of::<Canvas2DCmd>()`, missing text
+        // strings, line dash vectors, gradient stops, and
+        // DrawImageBatch slot arrays — a single `fillText` with a
+        // 1 KB user string reported ~150 B instead of 1.15 KB.
         self.pending_bytes = self
             .pending_bytes
-            .saturating_add(std::mem::size_of::<Canvas2DCmd>());
+            .saturating_add(cmd.approx_deep_size_bytes());
         if let Some(FrameSegment::Canvas2D(seg)) = self.segments.last_mut() {
             seg.mark_dirty_for_cmd(&cmd);
             seg.commands.push(cmd);
@@ -229,9 +235,14 @@ impl UnifiedFrameCollector {
             }));
             self.current = CurrentKind::GL;
         }
+        // Deep size walk — see the Canvas2D counterpart.  This is
+        // especially critical for `BufferData(Vec<u8>)` /
+        // `TexImage2D(Arc<Vec<u8>>)` / `ShaderSource(String)`, the
+        // three GL variants most likely to single-handedly blow
+        // the budget.
         self.pending_bytes = self
             .pending_bytes
-            .saturating_add(std::mem::size_of::<GLCmd>());
+            .saturating_add(cmd.approx_deep_size_bytes());
         if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
             seg.commands.push(cmd);
         }
@@ -248,6 +259,18 @@ impl UnifiedFrameCollector {
         materialize_trailing: bool,
     ) -> Option<shared::FramePacket> {
         if self.segments.is_empty() {
+            // Defence in depth: if a prior `push_*` incremented
+            // `pending_bytes` but a bug prevented the segment
+            // from landing in `segments`, the early return here
+            // would otherwise leave a stale counter that tricks
+            // `should_auto_flush` into firing forever.  Practical
+            // reachability is zero (every push creates a segment
+            // before incrementing the counter) but the invariant
+            // ("segments empty ⇒ pending_bytes == 0") is cheap to
+            // enforce and makes the flush protocol easier to
+            // audit.
+            self.pending_bytes = 0;
+            self.current = CurrentKind::None;
             return None;
         }
 
@@ -659,11 +682,147 @@ mod tests {
         c.push_canvas2d(1, Canvas2DCmd::Save);
         let after_one = c.approx_pending_bytes();
         assert!(after_one > 0, "after one push should be non-zero");
-        c.push_gl(GLCmd::Clear { canvas_id: 1, bit_field: 0x4000 });
+        c.push_gl(GLCmd::Clear { canvas_id: 1u32.into(), bit_field: 0x4000 });
         assert!(c.approx_pending_bytes() > after_one, "second push must add");
         // A barrier flush drains the counter back to zero.
         let _ = c.flush_as_barrier();
         assert_eq!(c.approx_pending_bytes(), 0, "flush must reset bytes");
+    }
+
+    // ---- Deep-size budgeting regression (P0-2) ----------------------
+    //
+    // Old impl added `size_of::<Cmd>()` only, so a single
+    // `bufferData(8MB)` pushed ~200 B into pending_bytes and
+    // `should_auto_flush()` never tripped.  These tests pin the
+    // correct behaviour: payload heap bytes must contribute to the
+    // budget within a factor of 2 of the true payload size.
+
+    #[test]
+    fn single_large_buffer_data_trips_auto_flush() {
+        let mut c = UnifiedFrameCollector::new();
+        let data = vec![0u8; 8 * 1024 * 1024]; // 8 MB mesh
+        c.push_gl(GLCmd::BufferData {
+            canvas_id: 1u32.into(),
+            target: 0x8892,
+            size: data.len() as i32,
+            data: Some(data),
+            usage: 0x88E4,
+        });
+        assert!(
+            c.approx_pending_bytes() >= 8 * 1024 * 1024,
+            "8MB bufferData under-accounted: {}",
+            c.approx_pending_bytes(),
+        );
+        assert!(
+            c.should_auto_flush(),
+            "8MB single push must trip the 4MB soft budget"
+        );
+    }
+
+    #[test]
+    fn many_small_shader_sources_sum_near_their_total_payload() {
+        // Regression for "count pages, not ops": 1000 shader
+        // sources of ~4 KB each — assert the budget reflects the
+        // aggregate text bytes, not just the enum wrappers.
+        let mut c = UnifiedFrameCollector::new();
+        for i in 0..1000u32 {
+            let mut source = String::with_capacity(5000);
+            source.push_str(&format!("// sh{}\n", i));
+            source.push_str(&"x".repeat(4000));
+            c.push_gl(GLCmd::ShaderSource {
+                shader_id: (i + 1).into(),
+                source,
+                resp: None,
+            });
+        }
+        let bytes = c.approx_pending_bytes();
+        let lower = 1000 * 4000; // at least the text body per source
+        assert!(
+            bytes >= lower,
+            "1000 sources should account for >={lower} bytes; got {bytes}",
+        );
+        assert!(
+            c.should_auto_flush(),
+            "{bytes} bytes must trip 4MB auto-flush",
+        );
+    }
+
+    #[test]
+    fn draw_image_batch_capacity_changes_reflect_in_budget() {
+        let mut c1 = UnifiedFrameCollector::new();
+        c1.push_canvas2d(
+            1,
+            Canvas2DCmd::DrawImageBatch {
+                draws: vec![entry(); 10],
+            },
+        );
+        let small = c1.approx_pending_bytes();
+
+        let mut c2 = UnifiedFrameCollector::new();
+        c2.push_canvas2d(
+            1,
+            Canvas2DCmd::DrawImageBatch {
+                draws: vec![entry(); 1000],
+            },
+        );
+        let large = c2.approx_pending_bytes();
+
+        assert!(
+            large > small + 900 * std::mem::size_of::<shared::protocol::render_cmd::DrawImageEntry>(),
+            "1000-entry batch ({}b) should far exceed 10-entry batch ({}b)",
+            large,
+            small,
+        );
+    }
+
+    fn entry() -> shared::protocol::render_cmd::DrawImageEntry {
+        shared::protocol::render_cmd::DrawImageEntry {
+            image_id: 1,
+            sx: 0.0,
+            sy: 0.0,
+            sw: 1.0,
+            sh: 1.0,
+            dx: 0.0,
+            dy: 0.0,
+            dw: 1.0,
+            dh: 1.0,
+        }
+    }
+
+    #[test]
+    fn empty_flush_does_not_leak_pending_bytes() {
+        // Regression: `build_frame_packet_inner` early-returned
+        // when segments was empty WITHOUT resetting the bytes
+        // counter.  A bug that bumps `pending_bytes` without
+        // landing a segment would then make `should_auto_flush`
+        // stick on "true" forever.  The unconditional reset on
+        // the empty path pins the invariant:
+        //   segments.is_empty() ⇒ pending_bytes == 0.
+        let mut c = UnifiedFrameCollector::new();
+        c.pending_bytes = 7777;
+        assert!(c.build_frame_packet(true).is_none());
+        assert_eq!(c.approx_pending_bytes(), 0);
+        assert!(!c.should_auto_flush());
+    }
+
+    #[test]
+    fn flush_as_barrier_then_build_frame_packet_keeps_counter_zero() {
+        // Successive flushes must repeatedly land at zero.  The
+        // old path would occasionally double-reset via two
+        // codepaths that both wrote to `pending_bytes`; this
+        // test pins the idempotence.
+        let mut c = UnifiedFrameCollector::new();
+        c.push_canvas2d(1, Canvas2DCmd::Save);
+        c.push_gl(GLCmd::Clear { canvas_id: 1u32.into(), bit_field: 0x4000 });
+        let _ = c.flush_as_barrier();
+        assert_eq!(c.approx_pending_bytes(), 0);
+
+        c.push_canvas2d(1, Canvas2DCmd::Save);
+        let _ = c.build_frame_packet(true);
+        assert_eq!(c.approx_pending_bytes(), 0);
+
+        assert!(c.build_frame_packet(true).is_none());
+        assert_eq!(c.approx_pending_bytes(), 0);
     }
 
     #[test]

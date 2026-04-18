@@ -70,6 +70,33 @@ fn queue_gl_fire_and_forget(state: &mut OpState, cmd: GLCmd) {
         return;
     };
     collector.push_gl(cmd);
+    // Soft byte-budget backpressure: when a single push has pushed
+    // the accumulated batch past the 4 MB threshold (typically a
+    // `bufferData` / `texImage2D` with a fat payload), cut the
+    // barrier here so we don't hold tens of MB of heap on the JS
+    // thread while waiting for a frame boundary.  Mirrors
+    // Chromium's `CanvasResourceProvider::auto_flush` which uses
+    // its own byte estimate to decide when to forcibly commit.
+    maybe_auto_flush(state);
+}
+
+/// Inspect the frame collector; flush a non-presenting barrier if
+/// the pending-bytes estimate has crossed
+/// [`crate::rendering::webgl::frame_collector::AUTO_FLUSH_SOFT_BUDGET_BYTES`].
+///
+/// Kept separate so other push entry points (Canvas2D ops, future
+/// side-channel payload paths) share the same trigger.
+#[inline]
+pub(crate) fn maybe_auto_flush(state: &mut OpState) {
+    // Peek in a separate borrow scope so `flush_unified_barrier`
+    // can re-acquire the collector mutably.
+    let over_budget = state
+        .try_borrow::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+        .map(|c| c.should_auto_flush())
+        .unwrap_or(false);
+    if over_budget {
+        crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
+    }
 }
 
 #[inline]
@@ -447,6 +474,16 @@ pub fn op_vertex_attrib_pointer(
     #[smi] stride: i32,
     #[smi] offset: i32,
 ) {
+    // Host-side validation: bad enum / out-of-range arguments push
+    // a WebGL error into the per-context queue and the call is
+    // NOT forwarded to the render thread.  Matches how
+    // Firefox/Chromium reject invalid `vertexAttribPointer` args
+    // before they reach the driver.
+    if !crate::rendering::webgl::error_state::validate_vertex_attrib_pointer(
+        state, canvas_id, size, type_, stride, offset,
+    ) {
+        return;
+    }
     queue_gl_fire_and_forget(
         state,
         GLCmd::VertexAttribPointer {
@@ -474,6 +511,19 @@ pub fn op_create_buffer(state: &mut OpState, #[smi] canvas_id: u32, #[smi] clien
 
 #[op2(fast)]
 pub fn op_bind_buffer(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32, buffer: i32) {
+    // Host-side target-enum validation — the render thread's
+    // `BindBuffer` dispatcher silently ignores unknown targets,
+    // which hides real bugs; surface them via `getError()`
+    // instead.  ARRAY_BUFFER / ELEMENT_ARRAY_BUFFER always legal;
+    // WebGL 2 targets (UNIFORM_BUFFER etc.) are legal too but
+    // only usefully bound on a WebGL 2 context — the op doesn't
+    // know its own context version here, so we allow all legal
+    // GL ES 3.0 targets and rely on the render thread to reject
+    // the ones that don't apply.
+    if !crate::rendering::webgl::error_state::validate_bind_buffer_target(state, canvas_id, target)
+    {
+        return;
+    }
     let buffer = if buffer < 0 {
         None
     } else {
@@ -1235,6 +1285,12 @@ pub fn op_scissor(
     #[smi] width: i32,
     #[smi] height: i32,
 ) {
+    // WebGL spec: negative width/height → INVALID_VALUE.
+    if !crate::rendering::webgl::error_state::validate_viewport_like(
+        state, canvas_id, width, height,
+    ) {
+        return;
+    }
     queue_gl_fire_and_forget(
         state,
         GLCmd::Scissor {

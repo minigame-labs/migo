@@ -12,6 +12,7 @@ mod address_filter;
 mod common;
 pub(crate) mod dns_cache;
 pub(crate) mod fetch;
+pub(crate) mod gate;
 mod prefetch;
 mod tcp_socket;
 mod udp_socket;

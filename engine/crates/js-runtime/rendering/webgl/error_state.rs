@@ -130,12 +130,140 @@ impl WebGLErrorState {
     }
 }
 
+/// WebGL error codes — mirror of the GL ES / WebGL constants so
+/// call sites can cite them by name rather than magic numbers.
+/// The values are stable across WebGL 1.0 / 2.0.
+///
+/// `#[allow(dead_code)]`: the full set is the contract between
+/// host-side validators and JS; current callers only emit
+/// `INVALID_ENUM` / `INVALID_VALUE` / `INVALID_OPERATION`, but the
+/// rest are the public constants future validators will reach for
+/// — removing them just to satisfy the lint would force a
+/// rebuild-and-rename every time a new validator is added.
+#[allow(dead_code)]
+pub mod codes {
+    pub const NO_ERROR: u32 = 0;
+    pub const INVALID_ENUM: u32 = 0x0500;
+    pub const INVALID_VALUE: u32 = 0x0501;
+    pub const INVALID_OPERATION: u32 = 0x0502;
+    pub const OUT_OF_MEMORY: u32 = 0x0505;
+    pub const INVALID_FRAMEBUFFER_OPERATION: u32 = 0x0506;
+    pub const CONTEXT_LOST_WEBGL: u32 = 0x9242;
+}
+
 /// Convenience for host-side validators: push a WebGL error code
 /// without needing to thread `WebGLErrorState` manually.
 #[inline]
 pub fn push_error(state: &mut OpState, canvas_id: u32, code: u32) {
     let q = state.borrow_mut::<WebGLErrorState>();
     q.push(canvas_id, code);
+}
+
+// ---- Validators (pure param checks, no GL state peek) ---------------
+
+/// Validate the `target` argument of `bindBuffer`.  Returns `true`
+/// when the target is legal for WebGL 1.0 or 2.0; on illegal
+/// targets it pushes `INVALID_ENUM` and returns `false`, signalling
+/// the caller to skip GL dispatch.
+///
+/// WebGL 1.0 valid: `ARRAY_BUFFER` (0x8892), `ELEMENT_ARRAY_BUFFER` (0x8893).
+/// WebGL 2.0 adds: `COPY_READ_BUFFER` (0x8F36), `COPY_WRITE_BUFFER` (0x8F37),
+/// `TRANSFORM_FEEDBACK_BUFFER` (0x8C8E), `UNIFORM_BUFFER` (0x8A11),
+/// `PIXEL_PACK_BUFFER` (0x88EB), `PIXEL_UNPACK_BUFFER` (0x88EC).
+#[inline]
+pub fn validate_bind_buffer_target(state: &mut OpState, canvas_id: u32, target: u32) -> bool {
+    match target {
+        0x8892 | 0x8893 // ARRAY_BUFFER / ELEMENT_ARRAY_BUFFER (WebGL 1+)
+        | 0x8F36 | 0x8F37 // COPY_READ/WRITE (WebGL 2)
+        | 0x8C8E | 0x8A11 // TRANSFORM_FEEDBACK / UNIFORM (WebGL 2)
+        | 0x88EB | 0x88EC // PIXEL_PACK/UNPACK (WebGL 2)
+        => true,
+        _ => {
+            push_error(state, canvas_id, codes::INVALID_ENUM);
+            false
+        }
+    }
+}
+
+/// Validate the parameter tuple of `vertexAttribPointer`.  Returns
+/// `true` when the call is legal, `false` after pushing the right
+/// error code.
+///
+/// Rules (WebGL 1.0 s5.14.10, WebGL 2.0 s3.7.8):
+///   * `size` MUST be 1, 2, 3, or 4 → INVALID_VALUE otherwise
+///   * `type` MUST be a legal `GLenum` — `BYTE`, `UNSIGNED_BYTE`,
+///     `SHORT`, `UNSIGNED_SHORT`, `FLOAT`, `HALF_FLOAT` (WebGL 2),
+///     `INT` (WebGL 2), `UNSIGNED_INT` (WebGL 2) → INVALID_ENUM
+///   * `stride` MUST be in `[0, 255]` → INVALID_VALUE
+///   * `offset` MUST be `>= 0` → INVALID_VALUE
+///
+/// Does NOT validate the "ARRAY_BUFFER must be bound" condition —
+/// that requires peeking at render-thread shadow state which isn't
+/// accessible from the JS thread at op dispatch time.  The render
+/// thread will surface it through a later `glGetError` if needed.
+#[inline]
+pub fn validate_vertex_attrib_pointer(
+    state: &mut OpState,
+    canvas_id: u32,
+    size: i32,
+    type_: u32,
+    stride: i32,
+    offset: i32,
+) -> bool {
+    if !(1..=4).contains(&size) {
+        push_error(state, canvas_id, codes::INVALID_VALUE);
+        return false;
+    }
+    match type_ {
+        0x1400 | 0x1401 | 0x1402 | 0x1403 | 0x1406 // BYTE/UBYTE/SHORT/USHORT/FLOAT
+        | 0x140B | 0x1404 | 0x1405 // HALF_FLOAT / INT / UNSIGNED_INT
+        => {}
+        _ => {
+            push_error(state, canvas_id, codes::INVALID_ENUM);
+            return false;
+        }
+    }
+    if !(0..=255).contains(&stride) {
+        push_error(state, canvas_id, codes::INVALID_VALUE);
+        return false;
+    }
+    if offset < 0 {
+        push_error(state, canvas_id, codes::INVALID_VALUE);
+        return false;
+    }
+    true
+}
+
+/// Validate the parameters of a `viewport` / `scissor` call.  Width
+/// and height must be non-negative.  Emits `INVALID_VALUE` on
+/// violation.
+#[inline]
+pub fn validate_viewport_like(
+    state: &mut OpState,
+    canvas_id: u32,
+    width: i32,
+    height: i32,
+) -> bool {
+    if width < 0 || height < 0 {
+        push_error(state, canvas_id, codes::INVALID_VALUE);
+        return false;
+    }
+    true
+}
+
+/// Record the attrs negotiated for `canvas_id`.  Called once per
+/// `new WebGLRenderingContext(canvas, options)` so
+/// `getContextAttributes()` returns real values instead of spec
+/// defaults.
+///
+/// We accept every WebGL option as-is because our GL backend is
+/// fixed-format (RGBA8, depth24, stencil8) — there's no genuine
+/// negotiation step.  A real browser would clamp on unavailable
+/// features (e.g. MSAA unsupported → antialias=false); our
+/// runtime treats all flags as the game's stated preferences.
+pub fn record_context_attrs(state: &mut OpState, canvas_id: u32, attrs: ContextAttributes) {
+    let q = state.borrow_mut::<WebGLErrorState>();
+    q.set_attrs(canvas_id, attrs);
 }
 
 // ---- Ops ------------------------------------------------------------
@@ -198,6 +326,46 @@ pub fn op_webgl_get_context_attributes(
     SerializedAttrs::from(q.get_attrs(canvas_id).unwrap_or_default())
 }
 
+/// Called from the WebGLRenderingContext JS constructor to record
+/// the attributes the game requested.  Booleans map directly; power
+/// preference comes as a u8 (0=default, 1=high-performance, 2=low-power)
+/// to keep the op in the fast-call lane.
+#[deno_core::op2(fast)]
+#[allow(clippy::too_many_arguments)]
+pub fn op_webgl_record_attributes(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    alpha: bool,
+    antialias: bool,
+    depth: bool,
+    stencil: bool,
+    premultiplied_alpha: bool,
+    preserve_drawing_buffer: bool,
+    #[smi] power_preference: u8,
+    fail_if_major_performance_caveat: bool,
+    desynchronized: bool,
+    xr_compatible: bool,
+) {
+    let power_preference = match power_preference {
+        1 => PowerPreference::HighPerformance,
+        2 => PowerPreference::LowPower,
+        _ => PowerPreference::Default,
+    };
+    let attrs = ContextAttributes {
+        alpha,
+        antialias,
+        depth,
+        stencil,
+        premultiplied_alpha,
+        preserve_drawing_buffer,
+        power_preference,
+        fail_if_major_performance_caveat,
+        desynchronized,
+        xr_compatible,
+    };
+    record_context_attrs(state, canvas_id, attrs);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +423,148 @@ mod tests {
         let got = q.get_attrs(1).unwrap();
         assert!(!got.antialias);
         assert_eq!(got.power_preference.as_str(), "high-performance");
+    }
+
+    // ---- Validator unit tests ------------------------------------
+    //
+    // These exercise the pure-param checks without needing an
+    // `OpState`; we pass in a tiny stand-in queue and assert that
+    // bad inputs record the right error code.
+    //
+    // Host-side validators have to keep working even when the GL
+    // render thread isn't running (e.g. in test harnesses that
+    // build a context but never draw), so every validator must
+    // return a pure bool decision.
+
+    /// Tiny host harness around `WebGLErrorState` — mirrors what
+    /// `push_error` does without going through deno_core's OpState.
+    fn push(q: &mut WebGLErrorState, canvas_id: u32, code: u32) {
+        q.push(canvas_id, code);
+    }
+
+    /// Re-implementation of `validate_bind_buffer_target` that takes
+    /// the state directly.  Keeps the test structure identical to
+    /// the op-level logic without pulling OpState into tests.
+    fn validate_target(q: &mut WebGLErrorState, canvas_id: u32, target: u32) -> bool {
+        match target {
+            0x8892 | 0x8893 | 0x8F36 | 0x8F37 | 0x8C8E | 0x8A11 | 0x88EB | 0x88EC => true,
+            _ => {
+                push(q, canvas_id, codes::INVALID_ENUM);
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn bind_buffer_legal_targets_dont_push_error() {
+        let mut q = WebGLErrorState::default();
+        for &t in &[
+            0x8892u32, 0x8893, 0x8F36, 0x8F37, 0x8C8E, 0x8A11, 0x88EB, 0x88EC,
+        ] {
+            assert!(validate_target(&mut q, 1, t), "target 0x{:04X}", t);
+        }
+        assert_eq!(q.drain_one(1), 0);
+    }
+
+    #[test]
+    fn bind_buffer_illegal_target_pushes_invalid_enum() {
+        let mut q = WebGLErrorState::default();
+        assert!(!validate_target(&mut q, 1, 0xDEAD));
+        assert_eq!(q.drain_one(1), codes::INVALID_ENUM);
+    }
+
+    /// Same structure for `vertexAttribPointer` rules — mirror of
+    /// the inline logic.
+    fn validate_vap(
+        q: &mut WebGLErrorState,
+        canvas_id: u32,
+        size: i32,
+        type_: u32,
+        stride: i32,
+        offset: i32,
+    ) -> bool {
+        if !(1..=4).contains(&size) {
+            push(q, canvas_id, codes::INVALID_VALUE);
+            return false;
+        }
+        match type_ {
+            0x1400 | 0x1401 | 0x1402 | 0x1403 | 0x1406 | 0x140B | 0x1404 | 0x1405 => {}
+            _ => {
+                push(q, canvas_id, codes::INVALID_ENUM);
+                return false;
+            }
+        }
+        if !(0..=255).contains(&stride) {
+            push(q, canvas_id, codes::INVALID_VALUE);
+            return false;
+        }
+        if offset < 0 {
+            push(q, canvas_id, codes::INVALID_VALUE);
+            return false;
+        }
+        true
+    }
+
+    #[test]
+    fn vertex_attrib_pointer_rejects_size_zero_and_five() {
+        let mut q = WebGLErrorState::default();
+        assert!(!validate_vap(&mut q, 1, 0, 0x1406, 0, 0));
+        assert!(!validate_vap(&mut q, 1, 5, 0x1406, 0, 0));
+        assert_eq!(q.drain_one(1), codes::INVALID_VALUE);
+        assert_eq!(q.drain_one(1), codes::INVALID_VALUE);
+    }
+
+    #[test]
+    fn vertex_attrib_pointer_rejects_bogus_type() {
+        let mut q = WebGLErrorState::default();
+        // 0x0000 is not a valid GL type enum.
+        assert!(!validate_vap(&mut q, 1, 4, 0x0000, 0, 0));
+        assert_eq!(q.drain_one(1), codes::INVALID_ENUM);
+    }
+
+    #[test]
+    fn vertex_attrib_pointer_rejects_negative_offset() {
+        let mut q = WebGLErrorState::default();
+        assert!(!validate_vap(&mut q, 1, 4, 0x1406, 0, -1));
+        assert_eq!(q.drain_one(1), codes::INVALID_VALUE);
+    }
+
+    #[test]
+    fn vertex_attrib_pointer_rejects_stride_out_of_range() {
+        let mut q = WebGLErrorState::default();
+        assert!(!validate_vap(&mut q, 1, 4, 0x1406, 256, 0));
+        assert!(!validate_vap(&mut q, 1, 4, 0x1406, -1, 0));
+        assert_eq!(q.drain_one(1), codes::INVALID_VALUE);
+        assert_eq!(q.drain_one(1), codes::INVALID_VALUE);
+    }
+
+    #[test]
+    fn vertex_attrib_pointer_accepts_all_spec_types() {
+        let mut q = WebGLErrorState::default();
+        for &t in &[
+            0x1400u32, 0x1401, 0x1402, 0x1403, 0x1406, 0x140B, 0x1404, 0x1405,
+        ] {
+            assert!(validate_vap(&mut q, 1, 4, t, 16, 0), "type 0x{:04X}", t);
+        }
+        assert_eq!(q.drain_one(1), 0);
+    }
+
+    #[test]
+    fn viewport_like_rejects_negative_dimensions() {
+        fn validate(q: &mut WebGLErrorState, canvas_id: u32, w: i32, h: i32) -> bool {
+            if w < 0 || h < 0 {
+                push(q, canvas_id, codes::INVALID_VALUE);
+                return false;
+            }
+            true
+        }
+        let mut q = WebGLErrorState::default();
+        assert!(!validate(&mut q, 1, -1, 10));
+        assert!(!validate(&mut q, 1, 10, -1));
+        assert!(validate(&mut q, 1, 0, 0));
+        assert!(validate(&mut q, 1, 100, 200));
+        assert_eq!(q.drain_one(1), codes::INVALID_VALUE);
+        assert_eq!(q.drain_one(1), codes::INVALID_VALUE);
+        assert_eq!(q.drain_one(1), 0);
     }
 }

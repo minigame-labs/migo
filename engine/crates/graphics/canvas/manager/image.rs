@@ -14,7 +14,10 @@
 use glow::HasContext;
 use shared::{
     error::EngineResult,
-    protocol::{io_cmd::NormalizedImage, render_cmd::CanvasId},
+    protocol::{
+        io_cmd::{AhbImage, NormalizedImage},
+        render_cmd::CanvasId,
+    },
 };
 
 use crate::backend::gl::image_store::{GpuImageInfo, ImageStore, StoredImage};
@@ -25,6 +28,13 @@ pub(super) struct ImageRegistry {
     store: ImageStore,
     pbo_pool: Option<PboPool>,
     use_pbo: bool,
+    /// AHB owners kept alive while their derived GL texture is in
+    /// the store.  Dropped on `destroy_shared_image`.  Android only
+    /// — the zero-copy path only fires there; off-Android we run a
+    /// mock AHB that downgrades to RGBA before upload, so nothing
+    /// to retain.
+    #[cfg(target_os = "android")]
+    alive_ahbs: std::collections::HashMap<u32, shared::protocol::ahb::OwnedAhb>,
 }
 
 impl ImageRegistry {
@@ -33,6 +43,8 @@ impl ImageRegistry {
             store: ImageStore::new(),
             pbo_pool: None,
             use_pbo: true,
+            #[cfg(target_os = "android")]
+            alive_ahbs: std::collections::HashMap::new(),
         }
     }
 
@@ -79,6 +91,96 @@ impl ImageRegistry {
         Ok((result.width, result.height))
     }
 
+    /// Zero-copy upload: the decoder already wrote into an AHB, so
+    /// there is no CPU-side RGBA `Vec` to stage. We hand the AHB
+    /// straight to `eglCreateImageKHR` → `glEGLImageTargetTexture2DOES`.
+    ///
+    /// Falls back to [`Self::load_shared_image`] in two cases:
+    ///   1. Device doesn't advertise AHB+`GL_OES_EGL_image` support
+    ///      (shouldn't happen on API 26+ Android, but we don't trust
+    ///      vendor drivers blindly).
+    ///   2. EGL display pointer is null — e.g. test harness, headless
+    ///      renderer.
+    ///
+    /// Both fallbacks go through `into_rgba()` which locks the AHB
+    /// for CPU read and copies once into a plain `NormalizedImage`.
+    /// The penalty is identical to the pre-M2 path, so a driver
+    /// without AHB import is no worse off than before.
+    pub fn load_ahb_image(
+        &mut self,
+        gl: &glow::Context,
+        image_id: u32,
+        ahb_image: AhbImage,
+        device_caps: &crate::device_caps::DeviceCapabilities,
+        egl_display_ptr: *const std::ffi::c_void,
+    ) -> EngineResult<(u32, u32)> {
+        // Guard conditions: if the device lacks AHB support or we
+        // have no display, downgrade and re-enter the legacy path.
+        if !device_caps.ahb_available || egl_display_ptr.is_null() {
+            let rgba = shared::protocol::io_cmd::DecodedImage::HardwareBuffer(ahb_image)
+                .into_rgba()?;
+            return self.load_shared_image(gl, image_id, rgba, device_caps, egl_display_ptr);
+        }
+
+        // Zero-copy GPU import. The `OwnedAhb` held by `AhbImage`
+        // lives on a refcount; `texture_import` creates its own
+        // EGLImage ref while we retain the Rust-side owner, so the
+        // AHB stays alive until Drop.
+        #[cfg(target_os = "android")]
+        {
+            let result = unsafe {
+                crate::texture_import::import_ahb_as_texture(
+                    gl,
+                    ahb_image.ahb.raw(),
+                    egl_display_ptr,
+                    ahb_image.width,
+                    ahb_image.height,
+                )
+            }
+            .map_err(|e| {
+                shared::error::EngineError::new(shared::error::ErrorCode::IoError)
+                    .with_msg("AHB EGLImage import failed")
+                    .with_detail(e.to_string())
+            })?;
+
+            self.store.insert(
+                image_id,
+                StoredImage {
+                    gl_texture: result.texture.0.get(),
+                    info: GpuImageInfo::rgba8_unpremul(result.width, result.height),
+                },
+            );
+            // Keep the AHB alive for at least as long as the GL
+            // texture lifetime. `import_ahb_as_texture` already
+            // stores an eglImage handle inside the driver, but the
+            // underlying AHB must not be released while that EGLImage
+            // exists.  Stash the owner here; destruction path drops
+            // it when the image_id is evicted.
+            self.retain_ahb_for(image_id, ahb_image.ahb);
+            Ok((result.width, result.height))
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            // Non-Android hosts do not have a real EGL/AHB import path;
+            // the AHB is a mock `Vec<u8>` that we downgrade to CPU
+            // RGBA just like the fallback above.
+            let rgba = shared::protocol::io_cmd::DecodedImage::HardwareBuffer(ahb_image)
+                .into_rgba()?;
+            self.load_shared_image(gl, image_id, rgba, device_caps, egl_display_ptr)
+        }
+    }
+
+    /// Hold a reference to an AHB keyed by image_id so it isn't
+    /// released while the GL texture derived from it is live. The
+    /// EGLImage inside the driver keeps its own handle to the AHB,
+    /// but from the Rust side we must guarantee the `OwnedAhb`
+    /// wrapper doesn't drop first — which would decrement the Rust
+    /// refcount and potentially release the buffer.
+    #[cfg(target_os = "android")]
+    fn retain_ahb_for(&mut self, image_id: u32, ahb: shared::protocol::ahb::OwnedAhb) {
+        self.alive_ahbs.insert(image_id, ahb);
+    }
+
     /// Destroy a shared image — deletes its GL texture (if present) and
     /// removes it from the registry.
     pub fn destroy_shared_image(
@@ -92,6 +194,13 @@ impl ImageRegistry {
             if let Some(tex) = glow::NativeTexture::try_from_raw(entry.gl_texture) {
                 unsafe { gl.delete_texture(tex) };
             }
+        }
+        // Drop any retained AHB owner for this image_id. The EGLImage
+        // held by the driver was torn down with the GL texture above,
+        // so releasing our `OwnedAhb` here is the last refcount.
+        #[cfg(target_os = "android")]
+        {
+            self.alive_ahbs.remove(&image_id);
         }
         Ok(())
     }

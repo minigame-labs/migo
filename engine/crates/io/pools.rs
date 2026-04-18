@@ -189,33 +189,74 @@ pub struct WorkerPool {
 struct WorkerPoolInner {
     name: String,
     tx: Mutex<Option<PrioritySender<Job>>>,
-    worker: Mutex<Option<thread::JoinHandle<()>>>,
+    workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    thread_count: usize,
 }
 
 impl WorkerPool {
+    /// Single-threaded pool.  Kept as the default because most pool
+    /// kinds (fs / pack / archive) aren't CPU-bound and don't benefit
+    /// from fan-out — one worker keeps ordering predictable and
+    /// serialises bursts against the shared pack/VFS layer.
     pub fn new(host_id: i32, label: &'static str) -> Self {
+        Self::with_threads(host_id, label, 1)
+    }
+
+    /// Multi-threaded pool.  Use for CPU-heavy work that is safe to
+    /// run concurrently (image decode + upload staging).  Threads
+    /// share one [`PrioritySender`]/[`PriorityReceiver`] pair; since
+    /// `PriorityReceiver::recv` serialises on the heap's internal
+    /// mutex, the N workers dequeue atomically — no duplicate
+    /// delivery, no cross-worker coordination needed from callers.
+    ///
+    /// `thread_count` is clamped to `≥ 1`; `with_threads(h, l, 0)` is
+    /// treated as `with_threads(h, l, 1)` rather than panicking.
+    pub fn with_threads(host_id: i32, label: &'static str, thread_count: usize) -> Self {
+        let n = thread_count.max(1);
         let name = format!("io-{label}-host-{host_id}");
         let (tx, rx) = priority_channel::<Job>();
-        let worker = thread::Builder::new()
-            .name(name.clone())
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    job();
-                }
-            })
-            .expect("failed to spawn IO worker pool thread");
+        let rx = Arc::new(rx);
+
+        let mut workers = Vec::with_capacity(n);
+        for worker_idx in 0..n {
+            // When there's only one thread keep the legacy name so
+            // telemetry / log greps keep matching (existing tests
+            // assert on "io-{label}-host-{id}"). Multi-thread pools
+            // get a -{idx} suffix so logs can tell threads apart.
+            let thread_name = if n == 1 {
+                name.clone()
+            } else {
+                format!("{name}-{worker_idx}")
+            };
+            let rx_clone = Arc::clone(&rx);
+            let handle = thread::Builder::new()
+                .name(thread_name)
+                .spawn(move || {
+                    while let Ok(job) = rx_clone.recv() {
+                        job();
+                    }
+                })
+                .expect("failed to spawn IO worker pool thread");
+            workers.push(handle);
+        }
 
         Self {
             inner: Arc::new(WorkerPoolInner {
                 name,
                 tx: Mutex::new(Some(tx)),
-                worker: Mutex::new(Some(worker)),
+                workers: Mutex::new(workers),
+                thread_count: n,
             }),
         }
     }
 
     pub fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    /// Actual thread count this pool was configured with.
+    pub fn thread_count(&self) -> usize {
+        self.inner.thread_count
     }
 
     pub fn submit<T, F>(
@@ -276,12 +317,23 @@ impl WorkerPool {
 
 impl Drop for WorkerPoolInner {
     fn drop(&mut self) {
+        // Close the channel first so every worker's recv() returns
+        // Err(Closed) and the outer loop exits.  Joining before the
+        // close would deadlock: the worker would be parked in
+        // `condvar.wait`.
         if let Some(tx) = self.tx.lock().take() {
             tx.close();
         }
-        if let Some(worker) = self.worker.lock().take() {
-            if worker.thread().id() != thread::current().id() {
-                let _ = worker.join();
+        // Collect the handles out of the Mutex so we can join
+        // without holding any lock a worker might need. Skip the
+        // handle for the current thread — self-join would hang, and
+        // the common case that triggers it is an outer pool owner
+        // being dropped from inside a job closure.
+        let handles: Vec<_> = std::mem::take(&mut *self.workers.lock());
+        let current_id = thread::current().id();
+        for h in handles {
+            if h.thread().id() != current_id {
+                let _ = h.join();
             }
         }
     }
@@ -299,27 +351,54 @@ impl fmt::Debug for WorkerPool {
 struct LazyWorkerPool {
     host_id: i32,
     label: &'static str,
+    thread_count: usize,
     pool: OnceLock<WorkerPool>,
 }
 
 impl LazyWorkerPool {
     fn new(host_id: i32, label: &'static str) -> Self {
+        Self::with_threads(host_id, label, 1)
+    }
+
+    fn with_threads(host_id: i32, label: &'static str, thread_count: usize) -> Self {
         Self {
             host_id,
             label,
+            thread_count: thread_count.max(1),
             pool: OnceLock::new(),
         }
     }
 
     fn get(&self) -> &WorkerPool {
         self.pool
-            .get_or_init(|| WorkerPool::new(self.host_id, self.label))
+            .get_or_init(|| WorkerPool::with_threads(self.host_id, self.label, self.thread_count))
     }
 
     #[cfg(test)]
     fn is_spawned(&self) -> bool {
         self.pool.get().is_some()
     }
+}
+
+/// Pick a sensible parallelism level for the image decode pool.
+/// Two threads is a floor so even single-core emulators benefit
+/// marginally from overlapping the JNI hop with a second decode;
+/// past four threads the contention against host+render+audio
+/// threads outweighs the JNI throughput gain on mobile.
+///
+/// The `num_cpus` crate isn't a workspace dependency; the std-only
+/// alternative [`std::thread::available_parallelism`] returns the
+/// same answer for our needs (after the OS accounts for the
+/// process cgroup limits Android applies).
+fn default_image_thread_count() -> usize {
+    let cpu_hint = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    // Reserve one core for the host thread and one for the render
+    // thread; cap at 4 because two extra concurrent JNI
+    // `AttachCurrentThread` calls already saturate the BitmapFactory
+    // Java-heap pressure on mid-tier devices.
+    cpu_hint.saturating_sub(2).clamp(2, 4)
 }
 
 #[derive(Debug, Clone)]
@@ -335,7 +414,18 @@ impl IoPools {
         Self {
             fs: Arc::new(LazyWorkerPool::new(host_id, "fs")),
             pack: Arc::new(LazyWorkerPool::new(host_id, "pack")),
-            image: Arc::new(LazyWorkerPool::new(host_id, "image")),
+            // Image decode is CPU-bound (JPEG IDCT, PNG inflate) and
+            // trivially parallel across distinct input buffers — the
+            // pool fans out so a cold-start screen of 20 images
+            // doesn't serialise behind a single BitmapFactory
+            // invocation. Kept lazy: spawning only happens on the
+            // first `get()`, so sessions that never draw an image
+            // pay zero.
+            image: Arc::new(LazyWorkerPool::with_threads(
+                host_id,
+                "image",
+                default_image_thread_count(),
+            )),
             archive: Arc::new(LazyWorkerPool::new(host_id, "archive")),
         }
     }
@@ -576,6 +666,86 @@ mod tests {
 
         assert_eq!(message, Some("pool boom"));
         assert_eq!(pools.run(PoolKind::Pack, PriorityClass::ForegroundBlocking, || 7usize).unwrap(), 7);
+    }
+
+    #[test]
+    fn with_threads_zero_is_clamped_to_one() {
+        let pool = crate::pools::WorkerPool::with_threads(200, "zero-clamp", 0);
+        assert_eq!(pool.thread_count(), 1);
+        // Must still accept jobs.
+        let result = pool.run(PriorityClass::ForegroundAsync, || 42i32).unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn multi_threaded_pool_runs_jobs_concurrently() {
+        use std::time::{Duration, Instant};
+
+        // Three workers + three blocking jobs whose total wall-clock
+        // time would be ~300 ms if serialised. Parallel execution
+        // puts them below ~150 ms. Generous headroom on the ceiling
+        // so CI with noisy neighbours doesn't flake.
+        let pool = crate::pools::WorkerPool::with_threads(300, "parallel", 3);
+        assert_eq!(pool.thread_count(), 3);
+
+        let start = Instant::now();
+        let h1 = pool
+            .submit(PriorityClass::ForegroundAsync, || {
+                std::thread::sleep(Duration::from_millis(100));
+            })
+            .unwrap();
+        let h2 = pool
+            .submit(PriorityClass::ForegroundAsync, || {
+                std::thread::sleep(Duration::from_millis(100));
+            })
+            .unwrap();
+        let h3 = pool
+            .submit(PriorityClass::ForegroundAsync, || {
+                std::thread::sleep(Duration::from_millis(100));
+            })
+            .unwrap();
+        h1.join().unwrap();
+        h2.join().unwrap();
+        h3.join().unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "3 parallel 100ms jobs took {:?}, expected <250ms",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn multi_threaded_workers_consume_each_job_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = crate::pools::WorkerPool::with_threads(301, "exactly-once", 4);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let c = Arc::clone(&counter);
+            handles.push(
+                pool.submit(PriorityClass::ForegroundAsync, move || {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap(),
+            );
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            64,
+            "each job must run once, not more, not less"
+        );
+    }
+
+    #[test]
+    fn default_image_thread_count_is_within_safe_bounds() {
+        let n = super::default_image_thread_count();
+        assert!(n >= 2, "floor of 2 threads");
+        assert!(n <= 4, "ceiling of 4 threads");
     }
 
     #[test]

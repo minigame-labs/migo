@@ -48,85 +48,19 @@ use reqwest::Method;
 use reqwest::Response;
 use reqwest::redirect::Policy;
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::network::Options;
-
-/// Flag to emit a one-time warning when the domain whitelist is empty (allow-all).
-static EMPTY_WHITELIST_WARNED: std::sync::Once = std::sync::Once::new();
 
 // ---------------------------------------------------------------------------
 // SSRF-preventing DNS resolver
 // ---------------------------------------------------------------------------
-
-/// Reject a URL whose host is an IP-literal pointing to a blocked range.
-///
-/// hyper-util skips the DNS resolver for IP-literal hosts, so the
-/// `SsrfCheckingResolver` below does NOT cover `http://127.0.0.1/...`.
-/// This function must be called **before** every `client.request()`
-/// / `client.post()` to close that gap.
-pub(super) fn reject_blocked_ip_literal(url: &Url) -> Result<(), JsErrorBox> {
-    if let Some(host) = url.host_str() {
-        let port = url.port_or_known_default().unwrap_or(443);
-        let addr_str = format!("{}:{}", host, port);
-        if let Ok(sock_addr) = addr_str.parse::<std::net::SocketAddr>() {
-            if super::address_filter::is_blocked_address(&sock_addr) {
-                return Err(JsErrorBox::generic(format!(
-                    "fetch: connection to {} is not allowed (private/loopback address)",
-                    sock_addr.ip()
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Check URL against the domain whitelist in NetworkPolicy.
-///
-/// **Security note:** If the whitelist is empty, all domains are allowed
-/// (allow-all). The host app SHOULD populate `network_policy.domain_whitelist`
-/// with the game's server domains to restrict outbound network access.
-///
-/// Matching supports exact match and subdomain match (e.g., "example.com"
-/// allows "api.example.com").
-pub(super) fn check_domain_whitelist(url: &Url, state: &OpState) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<shared::op_state::HostOpState>();
-    let wl = &host.network_policy.domain_whitelist;
-    if wl.is_empty() {
-        EMPTY_WHITELIST_WARNED.call_once(|| {
-            warn!(
-                "network_policy.domain_whitelist is empty — all domains are permitted. \
-                 Populate the whitelist with allowed server domains to restrict outbound access."
-            );
-        });
-        return Ok(());
-    }
-    if let Some(url_host) = url.host_str() {
-        for allowed in wl {
-            if url_host == allowed.as_str()
-                || url_host.ends_with(&format!(".{}", allowed))
-            {
-                return Ok(());
-            }
-        }
-        return Err(JsErrorBox::generic(format!(
-            "fetch: domain '{}' is not in the allowed list",
-            url_host
-        )));
-    }
-    Ok(())
-}
-
-/// Check HTTPS enforcement policy.
-pub(super) fn check_https_policy(url: &Url, state: &OpState) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<shared::op_state::HostOpState>();
-    if host.network_policy.enforce_https && url.scheme() == "http" {
-        return Err(JsErrorBox::generic(
-            "fetch:fail HTTP is not allowed, use HTTPS",
-        ));
-    }
-    Ok(())
-}
+//
+// All per-URL policy enforcement lives in `super::gate`. This module
+// owns only (a) the reqwest `Client` pool + its TLS / redirect
+// plumbing, and (b) the `SsrfCheckingResolver` below which catches
+// DNS-name hosts at connect time. IP-literal hosts bypass the
+// resolver, so the gate MUST be called before any `client.request()`.
 
 /// Headers that game JS must not inject — these can amplify SSRF,
 /// bypass reverse proxies, or leak internal routing information.
@@ -379,9 +313,11 @@ pub fn op_fetch(
             }
 
             // Security: SSRF + domain whitelist + HTTPS enforcement.
-            reject_blocked_ip_literal(&url)?;
-            check_domain_whitelist(&url, state)?;
-            check_https_policy(&url, state)?;
+            // All URL-based ops go through the shared gate so a
+            // single-line addition there (e.g. new `NetworkPolicy`
+            // field) applies to fetch/image/websocket/prefetch at
+            // once; individual ops can't accidentally skip a rule.
+            super::gate::enforce_from_state(&url, state, super::gate::GateKind::Fetch)?;
 
             let mut request = client
                 .request(method.clone(), url)
@@ -683,61 +619,49 @@ pub fn create_http_client(
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, user_agent.parse().unwrap());
 
-    // Capture network policy for the redirect closure.
-    let whitelist = net_policy.domain_whitelist.clone();
-    let enforce_https = net_policy.enforce_https;
+    // Capture network policy for the redirect closure.  `Policy`
+    // builds a boxed `Fn` internally, so we must move a *clone* of
+    // the policy into the closure rather than borrowing from
+    // `net_policy`.
+    let redirect_policy = net_policy.clone();
 
-    // Custom redirect policy: checks IP-block, domain whitelist, and HTTPS
-    // enforcement on every redirect target.  This prevents bypasses like
-    // "allowed.com → 302 → blocked.com" or "https → 302 → http".
+    // Custom redirect policy: runs the shared gate on every redirect
+    // target so `allowed.com -> 302 -> blocked.com` and
+    // `https -> 302 -> http` are both rejected.  Centralising here
+    // means redirect enforcement never drifts from the initial-URL
+    // enforcement.
     let ssrf_redirect_policy = Policy::custom(move |attempt| {
         if attempt.previous().len() >= 10 {
             return attempt.stop();
         }
-
-        // Extract URL data before consuming `attempt` (which takes ownership).
-        let scheme = attempt.url().scheme().to_string();
-        let host_str = attempt.url().host_str().map(|s| s.to_string());
-        let port = attempt.url().port_or_known_default().unwrap_or(443);
-
-        if let Some(ref host) = host_str {
-            // 1. Block redirect to private/loopback IP-literals
-            let addr_str = format!("{}:{}", host, port);
-            if let Ok(sock_addr) = addr_str.parse::<std::net::SocketAddr>() {
-                if super::address_filter::is_blocked_address(&sock_addr) {
-                    return attempt.error(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!(
-                            "fetch: redirect to {} is not allowed (private/loopback address)",
-                            sock_addr.ip()
-                        ),
-                    ));
-                }
-            }
-
-            // 2. Domain whitelist check on redirect target
-            if !whitelist.is_empty() {
-                let allowed = whitelist.iter().any(|d| {
-                    host.as_str() == d.as_str() || host.ends_with(&format!(".{}", d))
-                });
-                if !allowed {
-                    return attempt.error(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!("fetch: redirect to '{}' is not in the allowed domain list", host),
-                    ));
-                }
-            }
-        }
-
-        // 3. HTTPS enforcement on redirect target
-        if enforce_https && scheme == "http" {
-            return attempt.error(std::io::Error::new(
+        match super::gate::evaluate_policy(
+            attempt.url(),
+            &redirect_policy,
+            super::gate::GateKind::FetchRedirect,
+        ) {
+            Ok(()) => attempt.follow(),
+            Err(reject) => attempt.error(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "fetch: redirect to HTTP is not allowed (HTTPS enforced)",
-            ));
+                // Reuse the gate's own message formatting so CLI
+                // diagnostics read identically whether the rule
+                // fires on the initial URL or a redirect hop.
+                format!(
+                    "fetch: redirect rejected: {}",
+                    match &reject {
+                        super::gate::GateReject::BlockedAddress { display } =>
+                            format!("connection to {display} is not allowed (private/loopback address)"),
+                        super::gate::GateReject::NotWhitelisted { host } =>
+                            format!("'{host}' is not in the allowed domain list"),
+                        super::gate::GateReject::HttpsRequired =>
+                            "HTTPS required (enforce_https=true)".to_string(),
+                        super::gate::GateReject::UnsupportedScheme { scheme } =>
+                            format!("scheme '{scheme}' is not allowed"),
+                        super::gate::GateReject::MissingHost =>
+                            "URL has no host".to_string(),
+                    }
+                ),
+            )),
         }
-
-        attempt.follow()
     });
 
     let mut builder = Client::builder()
@@ -836,12 +760,11 @@ pub async fn op_fetch_upload(
     // Parse URL
     let parsed_url = Url::parse(&url).map_err(|_| JsErrorBox::type_error("Invalid URL"))?;
 
-    // Security: SSRF + domain whitelist + HTTPS enforcement.
-    reject_blocked_ip_literal(&parsed_url)?;
+    // Security: SSRF + domain whitelist + HTTPS enforcement via the
+    // shared gate. See `op_fetch` for rationale.
     {
         let st = state.borrow();
-        check_domain_whitelist(&parsed_url, &*st)?;
-        check_https_policy(&parsed_url, &*st)?;
+        super::gate::enforce_from_state(&parsed_url, &*st, super::gate::GateKind::FetchUpload)?;
     }
 
     debug!("Upload request: POST {}", parsed_url);
