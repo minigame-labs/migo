@@ -70,6 +70,13 @@ pub(crate) enum GateKind {
     /// enforcement downgrades to "wss required" when
     /// `enforce_https == true`.
     WebSocket,
+    /// `createTCPSocket().connect(host, port)`. Raw TCP has no URL;
+    /// enforcement runs the shared domain whitelist and
+    /// IP-literal address filter against the host argument.
+    TcpSocket,
+    /// `createUDPSocket().send(host, port, …)` and `.connect(...)`.
+    /// Same rule set as `TcpSocket`.
+    UdpSocket,
 }
 
 /// Ways a gate check can fail. Kept narrow so call sites can decide
@@ -124,6 +131,8 @@ fn kind_prefix(kind: GateKind) -> &'static str {
         GateKind::Prefetch => "prefetch",
         GateKind::ImageInlineSrc => "Image.src",
         GateKind::WebSocket => "WebSocket",
+        GateKind::TcpSocket => "TCPSocket",
+        GateKind::UdpSocket => "UDPSocket",
     }
 }
 
@@ -146,6 +155,11 @@ fn scheme_allowed(kind: GateKind, scheme: &str) -> bool {
             "http" | "https",
         ) => true,
         (GateKind::WebSocket, "ws" | "wss") => true,
+        // Raw TCP/UDP use the synthetic `tcp://` / `udp://` scheme
+        // produced by [`enforce_host_from_state`]; no other kind is
+        // allowed to feed those schemes in.
+        (GateKind::TcpSocket, "tcp") => true,
+        (GateKind::UdpSocket, "udp") => true,
         _ => false,
     }
 }
@@ -209,7 +223,10 @@ pub(crate) fn evaluate_policy(
 
     // 5. HTTPS enforcement. For HTTP kinds, reject `http://`.
     //    For WebSocket, reject `ws://` (the TLS-free form) when
-    //    `enforce_https` is on — same security meaning.
+    //    `enforce_https` is on — same security meaning. Raw TCP/UDP
+    //    are unaffected: the "enforce_https" knob is about transport
+    //    security for HTTP-flavoured traffic, and raw sockets have
+    //    no native TLS analogue.
     if policy.enforce_https {
         let http_like = matches!(
             kind,
@@ -227,6 +244,50 @@ pub(crate) fn evaluate_policy(
     }
 
     Ok(())
+}
+
+/// Enforce the network policy for a host/port pair that wasn't
+/// derived from a URL (raw TCP/UDP connect / send).
+///
+/// Construct a synthetic `tcp://host:port/` or `udp://host:port/`
+/// URL so the existing URL-based [`evaluate_policy`] runs unchanged
+/// (scheme whitelist → IP literal block → domain whitelist). Raw
+/// sockets therefore share **exactly** the same allow/deny set as
+/// `fetch` and `WebSocket`, closing the bypass the report flagged
+/// where `createTCPSocket().connect("evil.example")` ignored the
+/// domain whitelist.
+pub(crate) fn enforce_host_from_state(
+    host: &str,
+    port: u16,
+    state: &OpState,
+    kind: GateKind,
+) -> Result<(), JsErrorBox> {
+    let scheme = match kind {
+        GateKind::TcpSocket => "tcp",
+        GateKind::UdpSocket => "udp",
+        _ => {
+            return Err(JsErrorBox::generic(
+                "enforce_host_from_state called with a non-raw-socket kind",
+            ));
+        }
+    };
+    // `Url::parse` needs a bracketed IPv6 literal; fall back to a
+    // pre-bracketed form when the caller passed a literal IPv6.
+    let host_for_url = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let synthetic = format!("{scheme}://{host_for_url}:{port}/");
+    let url = Url::parse(&synthetic).map_err(|e| {
+        JsErrorBox::generic(format!(
+            "{}:fail invalid host '{}': {}",
+            kind_prefix(kind),
+            host,
+            e
+        ))
+    })?;
+    enforce_from_state(&url, state, kind)
 }
 
 /// Enforce the policy using the runtime's `HostOpState`.
@@ -274,6 +335,14 @@ pub(crate) fn enforce_from_state(
                 | GateKind::FetchRedirect
                 | GateKind::FetchUpload
                 | GateKind::Prefetch => {}
+                GateKind::TcpSocket | GateKind::UdpSocket => {
+                    // Fold into the ws bucket for now: both are raw
+                    // transport rejects and the binary snapshot
+                    // protocol has no dedicated slot yet. The
+                    // per-kind prefix in the error message keeps
+                    // incident triage unambiguous.
+                    metrics.ws_policy_rejects.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Err(JsErrorBox::generic(reject.to_message(kind)))
         }
@@ -299,7 +368,11 @@ mod tests {
 
     #[test]
     fn fetch_rejects_ws_scheme() {
-        let r = evaluate_policy(&u("ws://example.com/"), &policy(&[], false), GateKind::Fetch);
+        let r = evaluate_policy(
+            &u("ws://example.com/"),
+            &policy(&[], false),
+            GateKind::Fetch,
+        );
         assert!(matches!(r, Err(GateReject::UnsupportedScheme { .. })));
     }
 
@@ -326,11 +399,20 @@ mod tests {
     #[test]
     fn fetch_accepts_http_and_https() {
         assert!(
-            evaluate_policy(&u("http://example.com/"), &policy(&[], false), GateKind::Fetch).is_ok()
+            evaluate_policy(
+                &u("http://example.com/"),
+                &policy(&[], false),
+                GateKind::Fetch
+            )
+            .is_ok()
         );
         assert!(
-            evaluate_policy(&u("https://example.com/"), &policy(&[], false), GateKind::Fetch)
-                .is_ok()
+            evaluate_policy(
+                &u("https://example.com/"),
+                &policy(&[], false),
+                GateKind::Fetch
+            )
+            .is_ok()
         );
     }
 

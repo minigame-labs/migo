@@ -77,9 +77,8 @@ impl RafReceiver {
                     let mut guard = async_fd.readable().await.ok()?;
 
                     let mut buf = [0u8; 8];
-                    let ret = unsafe {
-                        libc::read(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, 8)
-                    };
+                    let ret =
+                        unsafe { libc::read(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, 8) };
                     guard.clear_ready();
 
                     if ret == 8 {

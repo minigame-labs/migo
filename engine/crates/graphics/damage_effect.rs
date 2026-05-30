@@ -5,7 +5,8 @@
 //! `FrameDamageAccumulator` which unions rects and tracks FullSurface
 //! escalation.  At swap time, the accumulator resolves to `ResolvedDamage`.
 
-use crate::dirty_region::damage_tracker::{DamageTracker, ResolvedDamage};
+use crate::dirty_region::damage_tracker::{DamageTracker, MAX_DAMAGE_RECTS, ResolvedDamage};
+use smallvec::SmallVec;
 
 /// The damage produced by a single rendering operation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -13,8 +14,13 @@ pub(crate) enum DamageEffect {
     /// No visible output (state-only command, offscreen write, etc.).
     NoDamage,
     /// Bounded onscreen write with a known pixel rect.
-    OnscreenRect { x: i32, y: i32, width: i32, height: i32 },
-    /// Unbounded or un-trackable onscreen write — forces full surface redraw.
+    OnscreenRect {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    /// Unbounded or un-trackable onscreen write - forces full surface redraw.
     FullSurface,
 }
 
@@ -23,19 +29,26 @@ pub(crate) enum DamageEffect {
 ///
 /// Rules:
 /// - `NoDamage` is ignored.
-/// - `OnscreenRect` rects are unioned into a single bounding box.
-/// - Any `FullSurface` poisons the frame — resolution always returns `FullSurface`.
-/// - Once poisoned, subsequent rects are still accepted (no-op) to avoid
-///   short-circuiting callers, but they don't affect the outcome.
+/// - `OnscreenRect` rects are kept discrete up to
+///   [`MAX_DAMAGE_RECTS`] (currently 4).  Past that the accumulator
+///   collapses them to a single AABB so the per-frame cost stays
+///   bounded.  Multi-rect resolution is exposed to callers that can
+///   benefit from it via [`Self::resolve_rects`]; legacy callers
+///   using [`Self::resolve`] still see a single AABB.
+/// - Any `FullSurface` poisons the frame - resolution always
+///   returns `FullSurface`.
+/// - Once poisoned, subsequent rects are still accepted (no-op) to
+///   avoid short-circuiting callers, but they don't affect the
+///   outcome.
 pub(crate) struct FrameDamageAccumulator {
-    rect: Option<[i32; 4]>,
+    rects: SmallVec<[[i32; 4]; MAX_DAMAGE_RECTS]>,
     force_full: bool,
 }
 
 impl FrameDamageAccumulator {
     pub(crate) fn new() -> Self {
         Self {
-            rect: None,
+            rects: SmallVec::new(),
             force_full: false,
         }
     }
@@ -44,20 +57,38 @@ impl FrameDamageAccumulator {
     pub(crate) fn add(&mut self, effect: DamageEffect) {
         match effect {
             DamageEffect::NoDamage => {}
-            DamageEffect::OnscreenRect { x, y, width, height } => {
+            DamageEffect::OnscreenRect {
+                x,
+                y,
+                width,
+                height,
+            } => {
                 if width <= 0 || height <= 0 {
                     return;
                 }
-                self.rect = Some(match self.rect {
-                    Some([cx, cy, cw, ch]) => {
-                        let left = cx.min(x);
-                        let top = cy.min(y);
-                        let right = (cx + cw).max(x + width);
-                        let bottom = (cy + ch).max(y + height);
-                        [left, top, right - left, bottom - top]
-                    }
-                    None => [x, y, width, height],
-                });
+                if self.rects.len() < MAX_DAMAGE_RECTS {
+                    self.rects.push([x, y, width, height]);
+                    return;
+                }
+                // Past the cap: collapse the list + new rect into
+                // a single AABB.  Subsequent additions will keep
+                // hitting this branch (because `rects.len()` is
+                // now 1 but the `<` check doesn't kick in - wait,
+                // it would; let's preserve overflow as sticky by
+                // directly unioning into the single slot rather
+                // than re-appending).  Re-check after collapse.
+                let mut left = x;
+                let mut top = y;
+                let mut right = x + width;
+                let mut bottom = y + height;
+                for r in &self.rects {
+                    left = left.min(r[0]);
+                    top = top.min(r[1]);
+                    right = right.max(r[0] + r[2]);
+                    bottom = bottom.max(r[1] + r[3]);
+                }
+                self.rects.clear();
+                self.rects.push([left, top, right - left, bottom - top]);
             }
             DamageEffect::FullSurface => {
                 self.force_full = true;
@@ -65,11 +96,15 @@ impl FrameDamageAccumulator {
         }
     }
 
-    /// Resolve accumulated damage for the given surface dimensions.
+    /// Resolve accumulated damage for the given surface dimensions
+    /// as a single bounding-box [`ResolvedDamage`].  Used by the
+    /// swap path / stats; callers that want per-rect granularity
+    /// (partial-update driver call) should use
+    /// [`Self::resolve_rects`].
     pub(crate) fn resolve(&self, surface_size: (i32, i32)) -> ResolvedDamage {
         let mut tracker = DamageTracker::new(surface_size);
-        if let Some([x, y, w, h]) = self.rect {
-            tracker.mark_rect((x, y, w, h));
+        for r in &self.rects {
+            tracker.mark_rect((r[0], r[1], r[2], r[3]));
         }
         if self.force_full {
             tracker.mark_requires_full_redraw();
@@ -77,17 +112,49 @@ impl FrameDamageAccumulator {
         tracker.resolve()
     }
 
+    /// Resolve accumulated damage to up to [`MAX_DAMAGE_RECTS`]
+    /// discrete rects (clipped to `surface_size`).  Returns `None`
+    /// when the frame requires a full redraw; otherwise a
+    /// non-empty list.
+    pub(crate) fn resolve_rects(
+        &self,
+        surface_size: (i32, i32),
+    ) -> Option<SmallVec<[(i32, i32, i32, i32); MAX_DAMAGE_RECTS]>> {
+        let mut tracker = DamageTracker::new(surface_size);
+        for r in &self.rects {
+            tracker.mark_rect((r[0], r[1], r[2], r[3]));
+        }
+        if self.force_full {
+            tracker.mark_requires_full_redraw();
+        }
+        tracker.resolve_rects()
+    }
+
     /// Whether any damage has been recorded (rect or full).
     #[allow(dead_code)]
     pub(crate) fn has_damage(&self) -> bool {
-        self.rect.is_some() || self.force_full
+        !self.rects.is_empty() || self.force_full
     }
 
-    /// Read the accumulated rect (for staging into CanvasManager's
-    /// pending_damage_rect during the transition period).
+    /// Read the accumulated bounding rect (for staging into
+    /// `CanvasManager::pending_damage_rect` during the transition
+    /// period).  Returns `None` when no rects are recorded.
     #[allow(dead_code)]
     pub(crate) fn accumulated_rect(&self) -> Option<[i32; 4]> {
-        self.rect
+        if self.rects.is_empty() {
+            return None;
+        }
+        let mut left = self.rects[0][0];
+        let mut top = self.rects[0][1];
+        let mut right = left + self.rects[0][2];
+        let mut bottom = top + self.rects[0][3];
+        for r in self.rects.iter().skip(1) {
+            left = left.min(r[0]);
+            top = top.min(r[1]);
+            right = right.max(r[0] + r[2]);
+            bottom = bottom.max(r[1] + r[3]);
+        }
+        Some([left, top, right - left, bottom - top])
     }
 
     /// Whether FullSurface has been triggered.
@@ -98,7 +165,7 @@ impl FrameDamageAccumulator {
 
     /// Reset for next frame.
     pub(crate) fn reset(&mut self) {
-        self.rect = None;
+        self.rects.clear();
         self.force_full = false;
     }
 }

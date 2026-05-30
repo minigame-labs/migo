@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -61,7 +61,6 @@ impl fmt::Debug for AudioSender {
     }
 }
 
-
 #[derive(Clone)]
 pub struct HostOpState {
     pub id: i32,
@@ -78,6 +77,13 @@ pub struct HostOpState {
     /// Mount table for `/code` path resolution (set after EvaluateModule).
     pub mount_table: Option<Arc<MountTable>>,
     pub render_tx: RenderTx,
+    /// F-2: optional shared-measurer handle, cloned at startup
+    /// from `RenderThread::text_measurer()`.  Forwarded into
+    /// `CanvasOpState::with_text_measurer` so JS-side
+    /// `op_measure_text_flat` can measure without a cross-thread
+    /// round-trip.  `None` in test harnesses that wire
+    /// `HostOpState` manually.
+    pub text_measurer: Option<crate::text_measurer::SharedTextMeasurer>,
     pub audio_tx: AudioTx,
     pub host_tx: HostTx,
     /// Platform device services (clipboard, sensors, etc.)
@@ -94,6 +100,16 @@ pub struct HostOpState {
     /// Async polling loops (WebSocket, TCP, UDP) check this flag and
     /// throttle their iteration rate to reduce CPU/battery usage.
     pub backgrounded: Arc<AtomicBool>,
+    /// True after the first WebGL context is constructed in this runtime.
+    ///
+    /// Image decode policy uses this to choose the industrial fast path:
+    /// Canvas2D-only games may keep AHB / compressed GPU-native images for
+    /// zero-copy `drawImage`, while WebGL games need `Image` objects to retain
+    /// CPU RGBA backing because `texImage2D(image)` is synchronous and uploads
+    /// into the caller's currently-bound texture.  The flag is monotonic per
+    /// runtime, matching browsers where WebGL-capable pages keep decoded image
+    /// pixels available for texture uploads.
+    pub webgl_context_created: Arc<AtomicBool>,
     /// Whether code signing enforcement is enabled for this runtime.
     pub code_signing_enabled: bool,
     /// Per-session GPU compressed texture format support.
@@ -131,14 +147,54 @@ impl fmt::Debug for HostOpState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CanvasOpState {
     pub tx: RenderTx,
+    /// F-2: optional shared-measurer handle.  When present, JS
+    /// ops (`op_measure_text_flat`, `op_get_text_line_height`)
+    /// call the trait directly and skip the `RenderCommand::
+    /// Canvas2D { MeasureText }` round-trip entirely.  The
+    /// graphics crate registers the handle during render-thread
+    /// bring-up via `RenderThread::text_measurer()`; host
+    /// runtimes that use the engine headlessly (tests, tooling)
+    /// can leave this `None` and the ops fall back to the
+    /// cross-thread sync-op path.
+    pub text_measurer: Option<crate::text_measurer::SharedTextMeasurer>,
+}
+
+impl std::fmt::Debug for CanvasOpState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanvasOpState")
+            .field("tx", &self.tx)
+            .field(
+                "text_measurer",
+                &self
+                    .text_measurer
+                    .as_ref()
+                    .map(|_| "Some(<dyn TextMeasurer>)"),
+            )
+            .finish()
+    }
 }
 
 impl CanvasOpState {
     #[inline]
     pub fn new(tx: RenderTx) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            text_measurer: None,
+        }
+    }
+
+    /// Attach a `TextMeasurer` after construction.  Called by the
+    /// host runtime wiring layer once the render thread has
+    /// published its shared handle.
+    #[inline]
+    pub fn with_text_measurer(
+        mut self,
+        measurer: crate::text_measurer::SharedTextMeasurer,
+    ) -> Self {
+        self.text_measurer = Some(measurer);
+        self
     }
 }

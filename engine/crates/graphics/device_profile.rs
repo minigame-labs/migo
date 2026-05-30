@@ -57,7 +57,10 @@ mod tests {
             ahb_available: false,
             has_buffer_age: false,
             has_partial_update: false,
-            compressed_format_support: crate::compressed_upload::CompressedFormatSupport { etc2: false, astc: false },
+            compressed_format_support: crate::compressed_upload::CompressedFormatSupport {
+                etc2: false,
+                astc: false,
+            },
         };
 
         let profile = DeviceRenderProfile::from_caps(&caps, 23, DeviceTier::TierB);
@@ -75,7 +78,10 @@ mod tests {
             ahb_available: false,
             has_buffer_age: false,
             has_partial_update: false,
-            compressed_format_support: crate::compressed_upload::CompressedFormatSupport { etc2: true, astc: false },
+            compressed_format_support: crate::compressed_upload::CompressedFormatSupport {
+                etc2: true,
+                astc: false,
+            },
         };
 
         let profile = DeviceRenderProfile::from_caps(&caps, 24, DeviceTier::TierA);
@@ -96,7 +102,10 @@ mod tests {
             ahb_available: false,
             has_buffer_age: false,
             has_partial_update: false,
-            compressed_format_support: crate::compressed_upload::CompressedFormatSupport { etc2: false, astc: false },
+            compressed_format_support: crate::compressed_upload::CompressedFormatSupport {
+                etc2: false,
+                astc: false,
+            },
         };
 
         assert_eq!(caps.tier(), DeviceTier::TierB);

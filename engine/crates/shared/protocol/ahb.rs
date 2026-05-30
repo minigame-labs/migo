@@ -3,9 +3,11 @@
 //! instead of a `Vec<u8>`".
 //!
 //! On Android (NDK API 26+) `OwnedAhb` is a thin RAII wrapper over
-//! `AHardwareBuffer*`: `allocate` / `from_raw_acquire` bumps the
-//! refcount and `Drop` releases it. The pointer is opaque to safe
-//! Rust; consumers (graphics' `eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID, ahb)`,
+//! `AHardwareBuffer*`: `allocate` creates a fresh owned handle,
+//! `from_raw_acquire` adopts a borrowed raw pointer by bumping the
+//! refcount, `from_raw_owned` adopts an already-owned raw pointer,
+//! and `Drop` releases it. The pointer is opaque to safe Rust;
+//! consumers (graphics' `eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID, ahb)`,
 //! Java's `Bitmap.wrapHardwareBuffer`) reach in via [`OwnedAhb::raw`]
 //! and trust the RAII to outlive their borrow.
 //!
@@ -102,7 +104,8 @@ mod sys {
             rect: *const ARect,
             out_addr: *mut *mut c_void,
         ) -> c_int;
-        pub fn AHardwareBuffer_unlock(buffer: *mut AHardwareBuffer, out_fence: *mut c_int) -> c_int;
+        pub fn AHardwareBuffer_unlock(buffer: *mut AHardwareBuffer, out_fence: *mut c_int)
+        -> c_int;
     }
 }
 
@@ -200,7 +203,8 @@ pub enum AhbError {
     UnlockFailed { status: i32 },
     /// Operation requires Android; called on a non-Android build.
     NotAndroid,
-    /// Caller passed a null pointer to `from_raw_acquire`.
+    /// Caller passed a null pointer to `from_raw_acquire` /
+    /// `from_raw_owned`.
     NullHandle,
     /// CPU lock requested with usage flags that exclude both
     /// `CPU_READ_*` and `CPU_WRITE_*`.
@@ -274,8 +278,7 @@ mod imp {
                 rfu1: 0,
             };
             let mut out = ptr::null_mut();
-            let status =
-                unsafe { sys::AHardwareBuffer_allocate(&c_desc, &mut out) };
+            let status = unsafe { sys::AHardwareBuffer_allocate(&c_desc, &mut out) };
             if status != 0 || out.is_null() {
                 return Err(AhbError::AllocateFailed { status });
             }
@@ -302,10 +305,7 @@ mod imp {
         /// when Java passed `Bitmap.getHardwareBuffer()` back through
         /// JNI as a `jlong` — the Java side held a reference, so we
         /// `_acquire` to gain our own.
-        pub fn from_raw_acquire(
-            ptr: *mut c_void,
-            desc: AhbDesc,
-        ) -> Result<Self, AhbError> {
+        pub fn from_raw_acquire(ptr: *mut c_void, desc: AhbDesc) -> Result<Self, AhbError> {
             if ptr.is_null() {
                 return Err(AhbError::NullHandle);
             }
@@ -313,6 +313,25 @@ mod imp {
             unsafe { sys::AHardwareBuffer_acquire(ahb) };
             Ok(Self {
                 inner: Arc::new(AhbBox { ptr: ahb }),
+                desc,
+            })
+        }
+
+        /// Adopt an externally-allocated AHB pointer that already
+        /// owns one strong refcount.
+        ///
+        /// This is the transfer-ownership counterpart to
+        /// [`Self::from_raw_acquire`]: use it when the producer has
+        /// already called `AHardwareBuffer_acquire` (or equivalent)
+        /// before handing the pointer across an FFI boundary.
+        pub fn from_raw_owned(ptr: *mut c_void, desc: AhbDesc) -> Result<Self, AhbError> {
+            if ptr.is_null() {
+                return Err(AhbError::NullHandle);
+            }
+            Ok(Self {
+                inner: Arc::new(AhbBox {
+                    ptr: ptr as *mut sys::AHardwareBuffer,
+                }),
                 desc,
             })
         }
@@ -359,7 +378,7 @@ mod imp {
                 sys::AHardwareBuffer_lock(
                     self.inner.ptr,
                     usage.bits(),
-                    -1,        // no input fence
+                    -1,          // no input fence
                     ptr::null(), // entire buffer
                     &mut addr,
                 )
@@ -467,10 +486,12 @@ mod imp {
             })
         }
 
-        pub fn from_raw_acquire(
-            _ptr: *mut c_void,
-            _desc: AhbDesc,
-        ) -> Result<Self, AhbError> {
+        pub fn from_raw_acquire(_ptr: *mut c_void, _desc: AhbDesc) -> Result<Self, AhbError> {
+            // The mock has no notion of an external pointer to adopt.
+            Err(AhbError::NotAndroid)
+        }
+
+        pub fn from_raw_owned(_ptr: *mut c_void, _desc: AhbDesc) -> Result<Self, AhbError> {
             // The mock has no notion of an external pointer to adopt.
             Err(AhbError::NotAndroid)
         }
@@ -604,8 +625,7 @@ mod tests {
 
     #[test]
     fn allocate_returns_handle_with_described_dims() {
-        let ahb =
-            OwnedAhb::allocate(AhbDesc::rgba_sampled(64, 32)).expect("alloc");
+        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled(64, 32)).expect("alloc");
         let d = ahb.desc();
         assert_eq!(d.width, 64);
         assert_eq!(d.height, 32);
@@ -655,6 +675,17 @@ mod tests {
         // On non-Android the mock always returns NotAndroid; on
         // Android the same call with a null pointer must error too.
         let r = OwnedAhb::from_raw_acquire(std::ptr::null_mut(), AhbDesc::rgba_sampled(1, 1));
+        assert!(matches!(
+            r,
+            Err(AhbError::NullHandle) | Err(AhbError::NotAndroid)
+        ));
+    }
+
+    #[test]
+    fn from_raw_owned_rejects_null_on_android() {
+        // Mirrors the transfer-ownership path used by the Android
+        // Java bridge after it acquires its own native refcount.
+        let r = OwnedAhb::from_raw_owned(std::ptr::null_mut(), AhbDesc::rgba_sampled(1, 1));
         assert!(matches!(
             r,
             Err(AhbError::NullHandle) | Err(AhbError::NotAndroid)

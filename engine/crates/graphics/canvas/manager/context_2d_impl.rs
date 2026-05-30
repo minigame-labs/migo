@@ -16,10 +16,10 @@ use shared::{
     protocol::render_cmd::CanvasId,
 };
 
-use super::types::ee;
 use super::CanvasManager;
-use crate::backend::gl::surface::{Canvas2DContext, FboKind};
+use super::types::ee;
 use crate::BoundContext;
+use crate::backend::gl::surface::{Canvas2DContext, FboKind};
 
 /// Initialise a Skia-backed Canvas2D context for `canvas_id`.
 ///
@@ -48,13 +48,13 @@ pub(super) fn init_skia_for_canvas(
             )
         })?;
         match &entry.drawing_buffer {
-            Some(db) => (
-                db.fbo.0.get(),
-                db.width,
-                db.height,
-                FboKind::DrawingBuffer,
+            Some(db) => (db.fbo.0.get(), db.width, db.height, FboKind::DrawingBuffer),
+            None => (
+                0,
+                entry.physical_width,
+                entry.physical_height,
+                FboKind::DefaultFb,
             ),
-            None => (0, entry.physical_width, entry.physical_height, FboKind::DefaultFb),
         }
     };
 
@@ -65,6 +65,13 @@ pub(super) fn init_skia_for_canvas(
         )
     })?;
     cm.contexts_2d.insert(canvas_id, ctx);
+    // Aggregate Skia cache stays pinned at the budget constant
+    // regardless of context count: rebalance every live context's
+    // per-instance cap now that the denominator just changed.
+    let live = cm.contexts_2d.len();
+    for ctx in cm.contexts_2d.values_mut() {
+        ctx.rebalance_resource_cache(live);
+    }
     Ok(())
 }
 

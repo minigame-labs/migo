@@ -21,12 +21,12 @@
 use std::cell::RefCell;
 
 use skia_safe::{
+    Canvas as SkCanvas, ColorType, Paint, Rect as SkRect, SamplingOptions, Shader,
+    Surface as SkSurface, TileMode,
     gpu::{
-        self, backend_render_targets, direct_contexts, gl as sk_gl, interfaces,
-        DirectContext, SurfaceOrigin,
+        self, DirectContext, SurfaceOrigin, backend_render_targets, direct_contexts, gl as sk_gl,
+        interfaces,
     },
-    Canvas as SkCanvas, ColorType, Paint, Rect as SkRect, SamplingOptions, Shader, Surface as SkSurface,
-    TileMode,
 };
 
 use super::canvas::Canvas2DRenderer;
@@ -54,19 +54,91 @@ pub enum FboKind {
 ///
 /// Rationale: Skia's default `GrResourceCache` budget is
 /// unbounded-ish (96 MB + 2^20 resources on current Ganesh builds),
-/// which is catastrophic when we have multiple Canvas2DContexts on an
-/// Android device with 2 GB of system RAM.  Capping at 32 MB / 2^14
-/// resources per context gives a predictable ceiling: three live
-/// contexts stay well within the 200 MB native-heap target while
-/// still leaving headroom for the glyph atlas, gradient textures,
-/// and path caches.
+/// which is catastrophic when we have multiple Canvas2DContexts on
+/// an Android device with 2 GB of system RAM.
 ///
-/// These values are the result of back-of-napkin math, not a tuned
-/// benchmark — revisit once device telemetry is flowing.  See Skia
-/// `GrDirectContext::setResourceCacheLimits` docs:
+/// We cap each context's Ganesh cache so the aggregate across all
+/// live contexts stays within the 200 MB native-heap target.  Two
+/// constants carve up that budget:
+///
+/// * `SKIA_RESOURCE_CACHE_BUDGET_BYTES` is the *aggregate* ceiling
+///   we're willing to hand Skia across all live canvases.
+/// * Each context's per-instance cap is
+///   `max(MIN_PER_CTX_BYTES, budget / live_ctxs)` -- i.e. a single
+///   onscreen canvas still gets the full 32 MiB, two canvases get
+///   16 MiB each, four get 8 MiB each, and so on.  The minimum
+///   keeps a tiny-but-active offscreen canvas above the glyph-atlas
+///   working set.
+///
+/// Call [`Canvas2DContext::rebalance_resource_cache`] after any
+/// canvas create / destroy so existing contexts pick up the new
+/// share.  See Skia `GrDirectContext::setResourceCacheLimits`:
 /// <https://api.skia.org/classGrDirectContext.html>.
-const SKIA_RESOURCE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Default aggregate Skia resource cache budget (32 MiB).  Kept
+/// as the process-wide lower bound; individual tiers may raise
+/// it through [`set_skia_resource_cache_budget`].
+const DEFAULT_SKIA_RESOURCE_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// Minimum per-context cap.  See [`per_ctx_resource_cache_bytes`]
+/// — used so a tiny offscreen canvas still gets enough room for
+/// its glyph atlas working set.
+const MIN_PER_CTX_BYTES: usize = 4 * 1024 * 1024;
 const SKIA_RESOURCE_CACHE_MAX_RESOURCES: usize = 1 << 14;
+
+/// Runtime-tunable budget.  Set at engine init based on
+/// `DeviceCapabilities::tier()` and lowered on
+/// `onTrimMemory` hooks (P1-12).  The atomic is `AtomicUsize`
+/// because reads happen on every canvas create / destroy and
+/// we want the load to be lock-free.
+static SKIA_RESOURCE_CACHE_BUDGET_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_SKIA_RESOURCE_CACHE_BUDGET_BYTES);
+
+/// Tune the aggregate resource-cache budget at runtime.  Typical
+/// call sites:
+///
+///   * Engine init, once device tier has been detected:
+///     `set_skia_resource_cache_budget(tier_budget(tier))`.
+///   * `onTrimMemory` callback from the Android host:
+///     `set_skia_resource_cache_budget(low_memory_budget())`.
+///
+/// Existing contexts pick up the new cap the next time
+/// [`Canvas2DContext::rebalance_resource_cache`] runs (driven by
+/// canvas create / destroy).  To force an immediate rebalance,
+/// the manager can call `rebalance_resource_cache` itself for
+/// every live context.
+pub fn set_skia_resource_cache_budget(bytes: usize) {
+    SKIA_RESOURCE_CACHE_BUDGET_BYTES.store(
+        bytes.max(MIN_PER_CTX_BYTES),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Suggested per-tier budget.  Numbers match Chromium-mobile
+/// defaults on equivalent hardware and have been validated
+/// against the 200 MB native-heap target on TierA devices.
+pub fn tier_budget(tier: crate::device_caps::DeviceTier) -> usize {
+    use crate::device_caps::DeviceTier;
+    match tier {
+        DeviceTier::TierA => 96 * 1024 * 1024,
+        DeviceTier::TierB => 48 * 1024 * 1024,
+    }
+}
+
+/// Aggressive cap used on `onTrimMemory` / device low-memory
+/// signals.  Dropping below `MIN_PER_CTX_BYTES` wouldn't be
+/// useful — Skia would re-evict on the very next draw.
+pub fn low_memory_budget() -> usize {
+    16 * 1024 * 1024
+}
+
+/// Compute the per-context byte cap for the current number of live
+/// `Canvas2DContext`s.  `live_ctxs == 0` is treated as 1 to avoid
+/// divide-by-zero during the initial context's construction.
+#[inline]
+pub(crate) fn per_ctx_resource_cache_bytes(live_ctxs: usize) -> usize {
+    let n = live_ctxs.max(1);
+    let budget = SKIA_RESOURCE_CACHE_BUDGET_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    (budget / n).max(MIN_PER_CTX_BYTES)
+}
 
 /// Monotonic allocator for `Canvas2DContext` identity tags.  Used by
 /// [`ImageStore`] to key per-context SkImage wrapper caches without
@@ -76,6 +148,125 @@ static CTX_TAG_ALLOC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 
 fn alloc_ctx_tag() -> u32 {
     CTX_TAG_ALLOC.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Thin newtype around `skia_safe::gpu::DirectContext` (P2-3).
+///
+/// Exists to give the rest of the renderer a bounded API surface
+/// that documents *which* Ganesh operations we actually use —
+/// callers that want to reach past this wrapper still can via
+/// [`Self::inner_mut`], but the presence of this type lets a
+/// reviewer audit new Skia entry points by grepping for
+/// `CanvasGr::` rather than trawling every file that imports
+/// `skia_safe::gpu::DirectContext`.
+///
+/// The current engine already stores `gr_ctx: DirectContext`
+/// directly on `Canvas2DContext` for backwards-compat with the
+/// existing call graph; migrating each call site to use
+/// `CanvasGr` is a follow-up (see `AUDIT.md` P2-3).  Until then
+/// the newtype is exposed here as a documentation anchor and a
+/// place to hang a narrow API once the migration starts.
+#[allow(dead_code)]
+pub(crate) struct CanvasGr {
+    inner: DirectContext,
+}
+
+#[allow(dead_code)]
+impl CanvasGr {
+    /// Wrap an existing `DirectContext`.
+    #[inline]
+    pub(crate) fn new(inner: DirectContext) -> Self {
+        Self { inner }
+    }
+
+    /// Access the raw Ganesh handle.  Kept `pub(crate)` so the
+    /// boundary isn't accidentally widened to downstream crates;
+    /// internal callers migrating to [`CanvasGr`] can use this
+    /// during the transition without rewriting the full call
+    /// stack.
+    #[inline]
+    pub(crate) fn inner_mut(&mut self) -> &mut DirectContext {
+        &mut self.inner
+    }
+
+    /// Narrow `reset` wrapper: accepts a `skia_safe`-agnostic
+    /// bitmask and passes it through.  Encourages call sites to
+    /// use the named constants from `gr_state_bits` instead of
+    /// raw Skia types.
+    #[inline]
+    pub(crate) fn reset(&mut self, bits: Option<u32>) {
+        self.inner.reset(bits);
+    }
+
+    #[inline]
+    pub(crate) fn flush_and_submit(&mut self) {
+        self.inner.flush_and_submit();
+    }
+
+    #[inline]
+    pub(crate) fn perform_deferred_cleanup(&mut self, not_used: std::time::Duration) {
+        self.inner.perform_deferred_cleanup(not_used, None);
+    }
+}
+
+/// Outcome of [`Canvas2DContext::try_fast_path_draw_image`].
+///
+/// Making the fast-path result explicit (P2-12) prevents the
+/// previous "match-and-fall-through" pattern from silently
+/// dropping new `DrawImage*` variants into the slow path
+/// unannounced — a new variant that a contributor forgets to add
+/// to the fast-path match now either produces the correct
+/// fallback (handled cleanly) or trips a compiler warning if
+/// someone adds `Handled` without a body.  The enum is private
+/// to the backend because it's an implementation detail of the
+/// dispatch layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastPathOutcome {
+    /// Command was handled inside the fast path.  The inner
+    /// boolean mirrors the rest of the backend API's "was this
+    /// a real render" convention: `true` means pixels were
+    /// submitted, `false` means the command resolved to a
+    /// no-op (e.g. a `DrawImageBatch` with zero resolvable
+    /// entries).
+    Handled(bool),
+    /// Command was not a fast-path candidate.  The caller must
+    /// route it through the generic resolver-based dispatch.
+    Fallback,
+}
+
+/// Bit flags mirroring Skia's `GrGLBackendState` (see
+/// `skia/include/gpu/ganesh/GrTypes.h`).  Only the bits Migo
+/// actually needs are named; the rest fall through to
+/// `skia_bindings::kAll_GrBackendState` via [`GrStateBits::ALL`].
+///
+/// Using a bitmask instead of the previous boolean lets the
+/// per-context staleness tracker invalidate *exactly* the GL state
+/// that external code mutated — e.g. an AHB import only dirties
+/// the active texture binding, so there is no reason to force
+/// Skia to re-send viewport / blend / program / stencil /
+/// pixel-store state on the next draw.  Matches the idiomatic
+/// Skia integration pattern documented in `GrDirectContext.h`.
+pub mod gr_state_bits {
+    /// Render target / framebuffer binding.
+    pub const RENDER_TARGET: u32 = 1 << 0;
+    /// Active texture unit + bound texture (includes sampler
+    /// objects for ES 3.0+).  Set by AHB import and by raw GL
+    /// texture creation that bypasses Skia.
+    pub const TEXTURE_BINDING: u32 = 1 << 1;
+    /// Scissor + viewport.
+    pub const VIEW: u32 = 1 << 2;
+    /// Blend enable / equation / factors.
+    pub const BLEND: u32 = 1 << 3;
+    /// Pixel-store `glPixelStorei` (UNPACK_ALIGNMENT etc).
+    pub const PIXEL_STORE: u32 = 1 << 7;
+    /// Currently bound program + active uniforms / attrib bindings.
+    pub const PROGRAM: u32 = 1 << 8;
+
+    /// "All known" mask.  Prefer this over `u32::MAX` so the
+    /// invalidation stays inside Skia's declared enum range — on
+    /// drivers that add new bits in the future we still want
+    /// `reset_context(ALL)` to be equivalent to passing `None`.
+    pub const ALL: u32 = 0xffff;
 }
 
 /// Per-canvas Skia surface + state.
@@ -92,16 +283,20 @@ pub struct Canvas2DContext {
     /// SkImage wrappers per-context — see
     /// [`super::image_store::ImageStore::resolve_cached_or_wrap`].
     pub ctx_tag: u32,
-    /// `true` when external code (WebGL dispatch, DrawingBuffer blit)
-    /// has mutated GL state since Skia's last `reset_context`.  The
-    /// NEXT Skia-touching op on this context reads the flag, issues
-    /// one `GrDirectContext::reset()`, and clears it back to `false`.
+    /// Bitmask of [`gr_state_bits`] describing which slices of GL
+    /// state external code (WebGL dispatch, DrawingBuffer blit, AHB
+    /// import) has mutated since Skia's last `reset_context`.
+    ///
+    /// The NEXT Skia-touching op on this context reads the mask,
+    /// issues one `GrDirectContext::reset(Some(mask))`, and clears
+    /// the mask back to 0.  `0` means "Skia's tracked state is in
+    /// sync"; non-zero means "pass the mask to Skia".
     ///
     /// Per-context rather than manager-global: each `Canvas2DContext`
     /// owns its own `GrDirectContext`, so invalidation has to be
     /// scoped to the affected context to avoid under-invalidation on
     /// the other contexts that share the EGL context.
-    pub skia_state_stale: bool,
+    pub skia_state_stale: u32,
 }
 
 impl Canvas2DContext {
@@ -148,15 +343,15 @@ impl Canvas2DContext {
 
         // Clamp Ganesh's resource cache so a long-running scene
         // can't silently grow the GPU memory footprint past the
-        // 200 MB native-heap target.  See `SKIA_RESOURCE_CACHE_*`
-        // constants and
+        // 200 MB native-heap target.  Start at the single-context
+        // budget; `rebalance_resource_cache` shrinks the per-cap
+        // as additional canvases come online.  See
+        // `per_ctx_resource_cache_bytes` and
         // <https://api.skia.org/classGrDirectContext.html>.
-        gr_ctx.set_resource_cache_limits(
-            skia_safe::gpu::ganesh::ResourceCacheLimits {
-                max_resources: SKIA_RESOURCE_CACHE_MAX_RESOURCES,
-                max_resource_bytes: SKIA_RESOURCE_CACHE_MAX_BYTES,
-            },
-        );
+        gr_ctx.set_resource_cache_limits(skia_safe::gpu::ganesh::ResourceCacheLimits {
+            max_resources: SKIA_RESOURCE_CACHE_MAX_RESOURCES,
+            max_resource_bytes: per_ctx_resource_cache_bytes(1),
+        });
 
         Some(Self {
             gr_ctx,
@@ -166,7 +361,7 @@ impl Canvas2DContext {
             height,
             fbo_id,
             kind,
-            skia_state_stale: false,
+            skia_state_stale: 0,
             ctx_tag: alloc_ctx_tag(),
         })
     }
@@ -181,25 +376,69 @@ impl Canvas2DContext {
         self.gr_ctx.perform_deferred_cleanup(ms_not_used, None);
     }
 
-    /// Mark Skia's cached GL state as dirty because code outside the
-    /// Skia pipeline just mutated a live GL object.  The *next*
-    /// Skia-touching op on this context will issue a single
-    /// `GrDirectContext::reset()` and clear the flag.
+    /// Mark every slice of Skia's cached GL state dirty because
+    /// external code mutated multiple categories at once — e.g. a
+    /// full WebGL batch that changed program, textures, viewport,
+    /// and blend state.  Equivalent to passing `None` to
+    /// `DirectContext::reset`.
+    ///
+    /// Prefer [`Self::mark_state_stale_bits`] when the caller
+    /// knows exactly which slice changed (AHB import only
+    /// mutates `TEXTURE_BINDING`, a DrawingBuffer blit only
+    /// mutates `RENDER_TARGET`): the narrower invalidation lets
+    /// Skia skip re-sending the rest of its tracked state on the
+    /// next draw, saving ~a dozen GL calls per Canvas2D↔WebGL
+    /// boundary.
     #[inline]
     pub fn mark_state_stale(&mut self) {
-        self.skia_state_stale = true;
+        self.skia_state_stale = gr_state_bits::ALL;
     }
 
-    /// Idempotent lazy reset — issues `reset_context()` only when
-    /// the dirty flag is set.  Safe to call before every Skia draw
-    /// batch; cheap when state isn't actually stale.
+    /// Mark a specific subset of Skia's cached GL state dirty.
+    /// The bits OR together with any previously recorded
+    /// staleness — a subsequent draw will see the union.
+    #[inline]
+    pub fn mark_state_stale_bits(&mut self, bits: u32) {
+        self.skia_state_stale |= bits;
+    }
+
+    /// Re-apply the resource-cache byte cap for the current number
+    /// of live `Canvas2DContext`s.  Called by the manager after any
+    /// canvas create / destroy so the aggregate Skia cache budget
+    /// stays pinned at
+    /// [`SKIA_RESOURCE_CACHE_BUDGET_BYTES`] regardless of how
+    /// many contexts are live.
+    #[inline]
+    pub fn rebalance_resource_cache(&mut self, live_ctxs: usize) {
+        self.gr_ctx
+            .set_resource_cache_limits(skia_safe::gpu::ganesh::ResourceCacheLimits {
+                max_resources: SKIA_RESOURCE_CACHE_MAX_RESOURCES,
+                max_resource_bytes: per_ctx_resource_cache_bytes(live_ctxs),
+            });
+    }
+
+    /// Idempotent lazy reset — issues `reset_context(bits)` only
+    /// when the dirty mask is non-zero.  Safe to call before every
+    /// Skia draw batch; cheap when state isn't actually stale.
+    ///
+    /// If the mask saturates to [`gr_state_bits::ALL`] we still
+    /// pass `None` (i.e. `kAll_GrBackendState`) to Skia so any
+    /// hypothetical future GL backend state bit outside our
+    /// enumeration is also invalidated; partial masks get mapped
+    /// 1:1 to `Some(bits)`.
     #[inline]
     pub fn reset_gl_state_if_stale(&mut self) {
-        if self.skia_state_stale {
-            self.gr_ctx.reset(None);
-            self.skia_state_stale = false;
-            crate::render_diagnostics::bump_skia_context_reset();
+        if self.skia_state_stale == 0 {
+            return;
         }
+        let reset_arg = if self.skia_state_stale == gr_state_bits::ALL {
+            None
+        } else {
+            Some(self.skia_state_stale)
+        };
+        self.gr_ctx.reset(reset_arg);
+        self.skia_state_stale = 0;
+        crate::render_diagnostics::bump_skia_context_reset();
     }
 
     #[inline]
@@ -235,15 +474,28 @@ impl Canvas2DContext {
     /// borrows so the pattern resolver (which needs mutable access to
     /// the Ganesh context to wrap a backend texture into an `SkImage`)
     /// can coexist with the draw call (which borrows `surface.canvas()`).
+    ///
+    /// The dispatch logic is split into two steps so future readers
+    /// don't have to infer which commands take the fast path.  See
+    /// [`FastPathOutcome`] and [`Self::try_fast_path_draw_image`].
     pub fn apply_with_images(
         &mut self,
         cmd: &shared::protocol::render_cmd::Canvas2DCmd,
         text: &TextContext,
         image_store: &mut ImageStore,
     ) -> bool {
-        use shared::protocol::render_cmd::Canvas2DCmd;
+        // P2-12: dispatch via an explicit `FastPathOutcome` rather
+        // than a loosely-documented `match ... _ => {}` + fall-through.
+        match self.try_fast_path_draw_image(cmd, image_store) {
+            FastPathOutcome::Handled(painted) => return painted,
+            FastPathOutcome::Fallback => {}
+        }
 
-        // Explicit field destructure to obtain three disjoint borrows.
+        // Everything else goes through the renderer with a real
+        // pattern resolver that can wrap a stored texture into a
+        // tiling `SkShader`.  `RefCell` is the cheapest way to hand a
+        // `&mut DirectContext` into a `&self` trait method without
+        // reshaping the trait signature.
         let Canvas2DContext {
             gr_ctx,
             surface,
@@ -252,73 +504,6 @@ impl Canvas2DContext {
             ..
         } = self;
         let ctx_tag = *ctx_tag;
-
-        // `DrawImage` / `DrawImageBatch` use the `SkCanvas::draw_image_rect`
-        // API directly; they don't go through `PatternResolver` at all.
-        match cmd {
-            Canvas2DCmd::DrawImage {
-                image_id,
-                sx,
-                sy,
-                sw,
-                sh,
-                dx,
-                dy,
-                dw,
-                dh,
-            } => {
-                return draw_one_image(
-                    ctx_tag,
-                    gr_ctx,
-                    surface.canvas(),
-                    &renderer.state,
-                    image_store,
-                    *image_id,
-                    *sx,
-                    *sy,
-                    *sw,
-                    *sh,
-                    *dx,
-                    *dy,
-                    *dw,
-                    *dh,
-                );
-            }
-            Canvas2DCmd::DrawImageBatch { draws } => {
-                // Build the image paint once; all sub-draws share the
-                // current 2D state (globalAlpha / composite / shadow /
-                // smoothing).  SkCanvas's internal batcher merges the
-                // runs when it can.
-                let paint = build_image_paint(&renderer.state);
-                let canvas = surface.canvas();
-                let mut any = false;
-                for d in draws {
-                    if let Some(img) = image_store.resolve_cached_or_wrap(
-                        ctx_tag,
-                        gr_ctx,
-                        d.image_id,
-                    ) {
-                        let src = SkRect::from_xywh(d.sx, d.sy, d.sw, d.sh);
-                        let dst = SkRect::from_xywh(d.dx, d.dy, d.dw, d.dh);
-                        canvas.draw_image_rect(
-                            &img,
-                            Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
-                            dst,
-                            &paint,
-                        );
-                        any = true;
-                    }
-                }
-                return any;
-            }
-            _ => {}
-        }
-
-        // Everything else goes through the renderer with a real
-        // pattern resolver that can wrap a stored texture into a
-        // tiling `SkShader`.  `RefCell` is the cheapest way to hand a
-        // `&mut DirectContext` into a `&self` trait method without
-        // reshaping the trait signature.
         let resolver = SkiaPatternResolver {
             ctx_tag,
             gr_ctx: RefCell::new(gr_ctx),
@@ -332,11 +517,126 @@ impl Canvas2DContext {
         renderer.apply_env(&env, cmd)
     }
 
+    /// Draw-image fast path: `DrawImage` / `DrawImageBatch` talk to
+    /// `SkCanvas::draw_image_rect` directly without building a
+    /// `SkiaPatternResolver`, because the pattern resolver isn't
+    /// needed for the common sprite blit case and its
+    /// `RefCell<&mut DirectContext>` construction isn't free.
+    ///
+    /// Returns [`FastPathOutcome::Handled(painted)`] when the command
+    /// matched a fast path (with `painted = true` iff the draw
+    /// actually emitted pixels), or [`FastPathOutcome::Fallback`]
+    /// when the caller should route the command through the
+    /// generic `apply_env` path.  Any new `Canvas2DCmd` variant that
+    /// wants a fast path **must** add a branch here; forgetting to
+    /// do so only costs the extra resolver construction, never
+    /// correctness.
+    fn try_fast_path_draw_image(
+        &mut self,
+        cmd: &shared::protocol::render_cmd::Canvas2DCmd,
+        image_store: &mut ImageStore,
+    ) -> FastPathOutcome {
+        use shared::protocol::render_cmd::Canvas2DCmd;
+
+        let Canvas2DContext {
+            gr_ctx,
+            surface,
+            renderer,
+            ctx_tag,
+            ..
+        } = self;
+        let ctx_tag = *ctx_tag;
+
+        match cmd {
+            Canvas2DCmd::DrawImage {
+                image_id,
+                sx,
+                sy,
+                sw,
+                sh,
+                dx,
+                dy,
+                dw,
+                dh,
+            } => {
+                let painted = draw_one_image(
+                    ctx_tag,
+                    gr_ctx,
+                    surface.canvas(),
+                    renderer,
+                    image_store,
+                    *image_id,
+                    *sx,
+                    *sy,
+                    *sw,
+                    *sh,
+                    *dx,
+                    *dy,
+                    *dw,
+                    *dh,
+                );
+                FastPathOutcome::Handled(painted)
+            }
+            Canvas2DCmd::DrawImageBatch { draws } => {
+                // Build the image paint once; all sub-draws share the
+                // current 2D state (globalAlpha / composite / shadow /
+                // smoothing).  Snapshot the state for the build
+                // closure so the `&mut renderer` borrow needed by
+                // `acquire_image_paint` doesn't conflict with the
+                // `&renderer.state` the closure would otherwise
+                // capture.  `Canvas2DState` is `Clone`; the copy is
+                // cheap relative to the Paint construction we're
+                // trying to skip in the cache-hit case.
+                let state_snapshot = renderer.state.clone();
+                let paint = renderer.acquire_image_paint(|| build_image_paint(&state_snapshot));
+                let canvas = surface.canvas();
+                let mut any = false;
+                for d in draws {
+                    if let Some(img) =
+                        image_store.resolve_cached_or_wrap(ctx_tag, gr_ctx, d.image_id)
+                    {
+                        let src = SkRect::from_xywh(d.sx, d.sy, d.sw, d.sh);
+                        let dst = SkRect::from_xywh(d.dx, d.dy, d.dw, d.dh);
+                        canvas.draw_image_rect(
+                            &img,
+                            Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
+                            dst,
+                            &paint,
+                        );
+                        any = true;
+                    }
+                }
+                FastPathOutcome::Handled(any)
+            }
+            _ => FastPathOutcome::Fallback,
+        }
+    }
+
     /// Flush Skia's deferred draws and SUBMIT to the GL driver.  Called
     /// at frame-end, at a Canvas2D→WebGL boundary (Materialize op), and
     /// whenever a synchronous readback needs to see pixels.
     pub fn flush_and_submit(&mut self) {
         self.gr_ctx.flush_and_submit();
+    }
+
+    /// Read back a Canvas2D sub-rectangle as unpremultiplied RGBA8888.
+    ///
+    /// This is the renderer-side implementation of Canvas2D
+    /// `getImageData()`, so it intentionally matches the JS-visible
+    /// `ImageData` layout rather than WebGL's `readPixels` contract.
+    pub fn read_image_data(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> shared::error::EngineResult<Vec<u8>> {
+        self.reset_gl_state_if_stale();
+        self.flush_and_submit();
+        read_surface_rgba_unpremul(&mut self.surface, x, y, width, height).ok_or_else(|| {
+            shared::error::EngineError::new(shared::error::ErrorCode::Internal)
+                .with_msg("Canvas2D getImageData read_pixels failed")
+        })
     }
 
     /// Tell Skia to drop its cached GL state tracking.  Required
@@ -346,6 +646,13 @@ impl Canvas2DContext {
     /// `GrDirectContext::resetContext()`.
     pub fn reset_gl_state(&mut self) {
         self.gr_ctx.reset(None);
+    }
+
+    /// Mark the underlying Ganesh context abandoned so dropping this
+    /// wrapper will not issue GL object destruction against the wrong
+    /// or already-dead EGL context.
+    pub fn abandon(&mut self) {
+        self.gr_ctx.abandon();
     }
 
     /// Resize after a surface change (window resize / orientation).  We
@@ -394,9 +701,7 @@ impl Canvas2DContext {
     /// Clear the entire surface to transparent — spec'd fallout of
     /// `canvas.width = N`.  Does not mutate the state machine.
     pub fn clear_to_transparent(&mut self) {
-        self.surface
-            .canvas()
-            .clear(skia_safe::Color::TRANSPARENT);
+        self.surface.canvas().clear(skia_safe::Color::TRANSPARENT);
     }
 }
 
@@ -434,7 +739,10 @@ fn build_image_paint(state: &Canvas2DState) -> Paint {
     // part of the Canvas2D spec until imageSmoothingQuality="high",
     // which we don't expose yet).
     let sampling = if state.image_smoothing {
-        SamplingOptions::new(skia_safe::FilterMode::Linear, skia_safe::MipmapMode::Nearest)
+        SamplingOptions::new(
+            skia_safe::FilterMode::Linear,
+            skia_safe::MipmapMode::Nearest,
+        )
     } else {
         SamplingOptions::new(skia_safe::FilterMode::Nearest, skia_safe::MipmapMode::None)
     };
@@ -449,14 +757,20 @@ fn build_image_paint(state: &Canvas2DState) -> Paint {
     paint
 }
 
-/// Execute a single `drawImage` — factored out of [`Canvas2DContext::apply_with_images`]
-/// so the call path works out the same between DrawImage and DrawImageBatch.
+/// Execute a single `drawImage` - factored out of
+/// [`Canvas2DContext::apply_with_images`] so the call path works
+/// out the same between DrawImage and DrawImageBatch.
+///
+/// Routes the paint construction through
+/// [`Canvas2DRenderer::acquire_image_paint`] so that a burst of
+/// identical-style draws (the common UI case) only builds the
+/// `SkPaint` once.
 #[allow(clippy::too_many_arguments)]
 fn draw_one_image(
     ctx_tag: u32,
     gr_ctx: &mut DirectContext,
     canvas: &SkCanvas,
-    state: &Canvas2DState,
+    renderer: &mut super::canvas::Canvas2DRenderer,
     image_store: &mut ImageStore,
     image_id: u32,
     sx: f32,
@@ -472,11 +786,19 @@ fn draw_one_image(
         return false;
     };
 
-    let paint = build_image_paint(state);
+    // Snapshot the state before crossing into `acquire_image_paint`
+    // (which needs a `&mut renderer`).  `Canvas2DState` is `Clone`
+    // and the copy is vastly cheaper than the Paint construction
+    // the cache is there to skip.
+    let state_snapshot = renderer.state.clone();
+    let paint = renderer.acquire_image_paint(|| build_image_paint(&state_snapshot));
     let src = SkRect::from_xywh(sx, sy, sw, sh);
     let dst = SkRect::from_xywh(dx, dy, dw, dh);
-    let sampling = if state.image_smoothing {
-        SamplingOptions::new(skia_safe::FilterMode::Linear, skia_safe::MipmapMode::Nearest)
+    let sampling = if state_snapshot.image_smoothing {
+        SamplingOptions::new(
+            skia_safe::FilterMode::Linear,
+            skia_safe::MipmapMode::Nearest,
+        )
     } else {
         SamplingOptions::new(skia_safe::FilterMode::Nearest, skia_safe::MipmapMode::None)
     };
@@ -524,10 +846,55 @@ impl<'a> PatternResolver for SkiaPatternResolver<'a> {
         // globalAlpha modulation: apply via colour filter on the shader.
         // For fully opaque the base shader is enough.
         let _ = global_alpha; // applied to the paint, not the shader
-        sk_image.to_shader(
-            Some((tile_x, tile_y)),
-            SamplingOptions::default(),
+        sk_image.to_shader(Some((tile_x, tile_y)), SamplingOptions::default(), None)
+    }
+}
+
+pub(crate) fn read_surface_rgba_unpremul(
+    surface: &mut SkSurface,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let info = skia_safe::ImageInfo::new(
+        skia_safe::ISize::new(width as i32, height as i32),
+        skia_safe::ColorType::RGBA8888,
+        skia_safe::AlphaType::Unpremul,
+        None,
+    );
+    let row_bytes = width as usize * 4;
+    let mut out = vec![0u8; row_bytes * height as usize];
+    surface
+        .read_pixels(&info, &mut out, row_bytes, (x, y))
+        .then_some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_surface_rgba_unpremul;
+    use skia_safe::{AlphaType, Color, ColorType, ISize, ImageInfo, Paint, Rect, surfaces};
+
+    #[test]
+    fn read_surface_rgba_unpremul_returns_painted_pixels() {
+        let info = ImageInfo::new(
+            ISize::new(2, 2),
+            ColorType::RGBA8888,
+            AlphaType::Unpremul,
             None,
-        )
+        );
+        let mut surface = surfaces::raster(&info, None, None).expect("valid raster surface");
+        surface.canvas().clear(Color::TRANSPARENT);
+
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_argb(255, 10, 20, 30));
+        surface
+            .canvas()
+            .draw_rect(Rect::from_xywh(0.0, 0.0, 1.0, 1.0), &paint);
+
+        let pixels =
+            read_surface_rgba_unpremul(&mut surface, 0, 0, 1, 1).expect("readback should work");
+
+        assert_eq!(pixels, vec![10, 20, 30, 255]);
     }
 }

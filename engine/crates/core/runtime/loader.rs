@@ -23,10 +23,7 @@ pub(crate) struct MyModuleLoader {
 }
 
 impl MyModuleLoader {
-    pub fn new(
-        code_cache: Option<SharedCodeCache>,
-        mount_table: SharedMountTableRef,
-    ) -> Self {
+    pub fn new(code_cache: Option<SharedCodeCache>, mount_table: SharedMountTableRef) -> Self {
         Self {
             inner: FsModuleLoader,
             code_cache,
@@ -37,10 +34,7 @@ impl MyModuleLoader {
 
 impl MyModuleLoader {
     /// Attach code cache info to a loaded module source.
-    fn attach_code_cache(
-        cache: &SharedCodeCache,
-        mut source: ModuleSource,
-    ) -> ModuleSource {
+    fn attach_code_cache(cache: &SharedCodeCache, mut source: ModuleSource) -> ModuleSource {
         let hash = cache.compute_hash(source.code.as_bytes());
         let data = cache.get(hash).map(Cow::Owned);
         source.code_cache = Some(SourceCodeCacheInfo { hash, data });
@@ -129,7 +123,10 @@ impl MyModuleLoader {
         generation: u64,
         relative: &std::path::Path,
     ) -> std::path::PathBuf {
-        code_dir.join(".pack_gen").join(generation.to_string()).join(relative)
+        code_dir
+            .join(".pack_gen")
+            .join(generation.to_string())
+            .join(relative)
     }
 
     /// Try loading a module from the mount table (pack backend support).
@@ -149,7 +146,8 @@ impl MyModuleLoader {
         // Use code_dir() (always available) instead of base_dir() (None
         // when base is pack-backed).
         let code_dir = mt.code_dir();
-        let relative = if let Ok(synthetic_rel) = file_path.strip_prefix(code_dir.join(".pack_gen")) {
+        let relative = if let Ok(synthetic_rel) = file_path.strip_prefix(code_dir.join(".pack_gen"))
+        {
             let mut comps = synthetic_rel.components();
             let _generation_dir = comps.next()?;
             let mut path = std::path::PathBuf::new();
@@ -227,12 +225,26 @@ impl ModuleLoader for MyModuleLoader {
                         match mt.resolve(relative_str) {
                             Some(resolved) => {
                                 if let Some(real_path) = resolved.real_path {
-                                    url = ModuleSpecifier::from_file_path(real_path)
-                                        .map_err(|_| ModuleLoaderError::generic("failed to remap module path"))?;
+                                    url = ModuleSpecifier::from_file_path(real_path).map_err(
+                                        |_| {
+                                            ModuleLoaderError::generic(
+                                                "failed to remap module path",
+                                            )
+                                        },
+                                    )?;
                                 } else {
-                                    let synthetic = Self::synthetic_pack_path(&code_dir, resolved.mount_generation, relative);
-                                    url = ModuleSpecifier::from_file_path(synthetic)
-                                        .map_err(|_| ModuleLoaderError::generic("failed to synthesize pack module path"))?;
+                                    let synthetic = Self::synthetic_pack_path(
+                                        &code_dir,
+                                        resolved.mount_generation,
+                                        relative,
+                                    );
+                                    url = ModuleSpecifier::from_file_path(synthetic).map_err(
+                                        |_| {
+                                            ModuleLoaderError::generic(
+                                                "failed to synthesize pack module path",
+                                            )
+                                        },
+                                    )?;
                                 }
                             }
                             None if mt.has_overlay_for(relative_str) => {
@@ -269,14 +281,12 @@ impl ModuleLoader for MyModuleLoader {
         // read it directly without touching the filesystem.
         if let Some(result) = self.try_load_from_mount(module_specifier) {
             let cache = self.code_cache.clone();
-            return ModuleLoadResponse::Sync(
-                result
-                    .and_then(Self::patch_amd)
-                    .map(|source| match &cache {
-                        Some(c) => Self::attach_code_cache(c, source),
-                        None => source,
-                    }),
-            );
+            return ModuleLoadResponse::Sync(result.and_then(Self::patch_amd).map(|source| {
+                match &cache {
+                    Some(c) => Self::attach_code_cache(c, source),
+                    None => source,
+                }
+            }));
         }
 
         // Filesystem fallback (directory-backed mounts).
@@ -284,14 +294,12 @@ impl ModuleLoader for MyModuleLoader {
         let cache = self.code_cache.clone();
 
         match resp {
-            ModuleLoadResponse::Sync(result) => {
-                ModuleLoadResponse::Sync(result.and_then(Self::patch_amd).map(|source| {
-                    match &cache {
-                        Some(c) => Self::attach_code_cache(c, source),
-                        None => source,
-                    }
-                }))
-            }
+            ModuleLoadResponse::Sync(result) => ModuleLoadResponse::Sync(
+                result.and_then(Self::patch_amd).map(|source| match &cache {
+                    Some(c) => Self::attach_code_cache(c, source),
+                    None => source,
+                }),
+            ),
 
             ModuleLoadResponse::Async(fut) => {
                 let fut = async move {

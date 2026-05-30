@@ -6,10 +6,21 @@
 //!
 //! Storage: `{game_cache_dir}/derived/{sha256_hex}.bin`
 //! Each file embeds the full key metadata in the header for verification.
+//!
+//! # Directory-level quota (P2)
+//!
+//! The single-file cap (`MAX_DERIVED_FILE_SIZE`) bounds one entry, but
+//! without a directory-level quota the cache grows without bound
+//! across sessions. [`prune_derived_cache`] enforces a total-bytes
+//! budget by evicting least-recently-*accessed* files first. `atime`
+//! is approximated by touching `mtime` on every successful
+//! [`load_derived`]; this is portable (no `utimensat` dependency) and
+//! close enough for LRU purposes.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use shared::protocol::io_cmd::{CompressedImage, DecodedImage, NormalizedImage};
 
@@ -119,6 +130,17 @@ const MAX_DERIVED_FILE_SIZE: u64 = 256 * 1024 * 1024;
 /// we stay on `fs::read` up to 1 MiB.
 const MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 
+/// Default directory-wide budget for derived cache. Chosen so the
+/// cache comfortably holds a full session's warm textures but never
+/// crowds out user data / subpackage storage on a 8 GiB device.
+pub const DEFAULT_DERIVED_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Per-pass soft cap on how many files [`prune_derived_cache`] may
+/// inspect. The cache rarely grows past a few thousand files; capping
+/// the scan prevents a pathological directory (e.g. corruption) from
+/// blocking a session-start prune for minutes.
+const PRUNE_MAX_FILES_SCANNED: usize = 32 * 1024;
+
 pub fn load_derived(game_cache_dir: &Path, key: &DerivedKey) -> Option<DecodedImage> {
     let dir = derived_cache_dir(game_cache_dir);
     let path = dir.join(format!("{}.bin", key.hash()));
@@ -144,10 +166,35 @@ pub fn load_derived(game_cache_dir: &Path, key: &DerivedKey) -> Option<DecodedIm
         parse_derived_entry(&data, key)
     };
     match parsed {
-        Some(img) => Some(img),
+        Some(img) => {
+            // Approximate LRU: successful reads bump mtime so the
+            // next prune pass keeps hot entries. We rely on mtime
+            // because Android's noatime-mounted cache dir never
+            // updates atime, so `utimensat(..)` with UTIME_NOW on
+            // the mtime half is the only portable signal.
+            touch_file_mtime(&path);
+            Some(img)
+        }
         None => {
             let _ = std::fs::remove_file(&path);
             None
+        }
+    }
+}
+
+fn touch_file_mtime(path: &Path) {
+    // Opening O_RDWR would break in a read-only mount; `File::open`
+    // then `set_len(len)` with `seek=0` is a portable no-op write
+    // that bumps mtime on any Unix filesystem Android cares about.
+    // Swallow all failures — mtime touch is a hint, not correctness.
+    use std::fs::OpenOptions;
+    if let Ok(f) = OpenOptions::new().append(true).open(path) {
+        // Re-opening for append + immediately dropping is enough on
+        // Linux to bump ctime, but we need mtime — so we explicitly
+        // call `set_len` to the existing length, which is a write of
+        // zero bytes and always updates mtime.
+        if let Ok(meta) = f.metadata() {
+            let _ = f.set_len(meta.len());
         }
     }
 }
@@ -278,6 +325,93 @@ fn serialize_derived_entry(
         }
     }
     Ok(())
+}
+
+/// Summary of a prune pass for logging / tests.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PruneReport {
+    pub files_kept: usize,
+    pub files_removed: usize,
+    pub bytes_kept: u64,
+    pub bytes_removed: u64,
+    pub scan_capped: bool,
+}
+
+/// Enforce a directory-wide byte budget on the derived cache by
+/// evicting least-recently-modified files (proxying LRU as explained
+/// in the module-level doc) until the total is under `budget_bytes`.
+///
+/// Safe to call repeatedly: it re-reads the directory each time. The
+/// runtime is expected to invoke this at session-start with
+/// [`DEFAULT_DERIVED_CACHE_MAX_BYTES`] as a background task.
+///
+/// Returns a [`PruneReport`] suitable for structured logging.
+pub fn prune_derived_cache(game_cache_dir: &Path, budget_bytes: u64) -> PruneReport {
+    let dir = derived_cache_dir(game_cache_dir);
+    let read_dir = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => return PruneReport::default(), // dir doesn't exist yet
+    };
+
+    // Collect (mtime, size, path). Any entry whose metadata we can't
+    // read is skipped rather than deleted — that's a transient FS
+    // hiccup, not a cache poison.
+    let mut scanned = 0usize;
+    let mut scan_capped = false;
+    let mut entries: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    for entry in read_dir.flatten() {
+        scanned += 1;
+        if scanned > PRUNE_MAX_FILES_SCANNED {
+            scan_capped = true;
+            break;
+        }
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        entries.push((mtime, meta.len(), path));
+    }
+
+    let total: u64 = entries.iter().map(|(_, sz, _)| *sz).sum();
+    if total <= budget_bytes {
+        return PruneReport {
+            files_kept: entries.len(),
+            files_removed: 0,
+            bytes_kept: total,
+            bytes_removed: 0,
+            scan_capped,
+        };
+    }
+
+    // Sort oldest-first so the LRU tail is evicted first.
+    entries.sort_by_key(|(mtime, _, _)| *mtime);
+
+    let mut running = total;
+    let mut bytes_removed = 0u64;
+    let mut files_removed = 0usize;
+    for (_, sz, path) in &entries {
+        if running <= budget_bytes {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            running = running.saturating_sub(*sz);
+            bytes_removed = bytes_removed.saturating_add(*sz);
+            files_removed += 1;
+        }
+    }
+
+    PruneReport {
+        files_kept: entries.len().saturating_sub(files_removed),
+        files_removed,
+        bytes_kept: running,
+        bytes_removed,
+        scan_capped,
+    }
 }
 
 #[cfg(test)]
@@ -538,8 +672,7 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|name| {
-                name.starts_with(&format!("{}.tmp", key.hash()))
-                    || name.ends_with(".atomic.tmp")
+                name.starts_with(&format!("{}.tmp", key.hash())) || name.ends_with(".atomic.tmp")
             })
             .collect();
         assert!(leftovers.is_empty(), "stale tmp: {:?}", leftovers);
@@ -568,6 +701,41 @@ mod tests {
             target_height: 0,
         };
         assert_ne!(k1.hash(), k2.hash());
+    }
+
+    #[test]
+    fn prune_respects_budget_and_preserves_newer_files() {
+        let dir = tmp("prune_budget");
+        let cache_dir = derived_cache_dir(&dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // Write files with a short sleep between them so each entry
+        // has a strictly greater mtime than the previous. Sleep is
+        // 20 ms which is well above every filesystem's mtime
+        // resolution the runtime will ship on (ext4, f2fs, tmpfs).
+        for i in 0..6u32 {
+            let path = cache_dir.join(format!("f_{i:02}.bin"));
+            std::fs::write(&path, vec![0u8; 1024]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let report = prune_derived_cache(&dir, 3 * 1024);
+        assert!(report.bytes_kept <= 3 * 1024);
+        assert!(report.files_removed >= 3);
+        // Oldest files removed first.
+        assert!(!cache_dir.join("f_00.bin").exists());
+        assert!(cache_dir.join("f_05.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_noop_when_under_budget() {
+        let dir = tmp("prune_noop");
+        let cache_dir = derived_cache_dir(&dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("a.bin"), vec![0u8; 128]).unwrap();
+        let report = prune_derived_cache(&dir, 1024);
+        assert_eq!(report.files_removed, 0);
+        assert!(cache_dir.join("a.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

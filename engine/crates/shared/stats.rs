@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -30,23 +30,40 @@ pub struct RenderMetricsSnapshot {
     pub slow_io_count_100ms: u32,
     pub image_cache_admissions_rejected: u32,
     pub image_cache_trim_bytes: u32,
+    // ---- render queue / collector / cache observability (v4) ----
+    pub render_queue_len: u32,
+    pub collector_pending_bytes: u32,
+    pub webgl_error_overflow: u32,
+    pub sk_image_wrappers: u32,
+    pub deferred_uploads: u32,
+    // ---- Canvas2D zero-readback fast path (v5) ----
+    pub canvas2d_snapshots_taken: u32,
+    pub canvas2d_snapshot_fallbacks: u32,
+    pub canvas2d_snapshot_uploads: u32,
+    pub canvas2d_snapshot_forced_readbacks: u32,
 }
 
 impl RenderMetricsSnapshot {
-    /// Magic bytes: 'M' 'G' (0x4D47) — identifies this as a Migo stats packet.
+    /// Magic bytes: 'M' 'G' (0x4D47) - identifies this as a Migo stats packet.
     pub const MAGIC: u16 = 0x4D47;
     /// Protocol version. Increment when field layout changes.
     ///
-    /// * v1 — initial render metrics
-    /// * v2 — render optimisation counters appended (offsets 44-63)
-    /// * v3 — IO subsystem counters appended (offsets 64-95). Java
-    ///   readers follow the existing "if data.length >= N" pattern;
-    ///   older readers ignore the tail without breaking.
-    pub const VERSION: u16 = 3;
-    /// 4-byte header (2 magic + 2 version) + 92 bytes payload = 96.
+    /// * v1 - initial render metrics
+    /// * v2 - render optimisation counters appended (offsets 44-63)
+    /// * v3 - IO subsystem counters appended (offsets 64-95).
+    /// * v4 - render queue / collector / cache observability
+    ///   counters appended (offsets 96-115).  Adds five fields:
+    ///   render_queue_len, collector_pending_bytes,
+    ///   webgl_error_overflow, sk_image_wrappers, deferred_uploads.
+    /// * v5 - Canvas2D zero-readback snapshot counters appended
+    ///   (offsets 116-131).  Adds four fields:
+    ///   canvas2d_snapshots_taken, canvas2d_snapshot_fallbacks,
+    ///   canvas2d_snapshot_uploads, canvas2d_snapshot_forced_readbacks.
+    pub const VERSION: u16 = 5;
+    /// 4-byte header (2 magic + 2 version) + 128 bytes payload = 132.
     pub const HEADER_LEN: usize = 4;
-    pub const PAYLOAD_LEN: usize = 92;
-    pub const BYTE_LEN: usize = Self::HEADER_LEN + Self::PAYLOAD_LEN; // 96
+    pub const PAYLOAD_LEN: usize = 128;
+    pub const BYTE_LEN: usize = Self::HEADER_LEN + Self::PAYLOAD_LEN; // 132
 
     pub fn as_le_bytes(&self) -> [u8; Self::BYTE_LEN] {
         let mut bytes = [0u8; Self::BYTE_LEN];
@@ -78,6 +95,17 @@ impl RenderMetricsSnapshot {
         bytes[84..88].copy_from_slice(&self.slow_io_count_100ms.to_le_bytes());
         bytes[88..92].copy_from_slice(&self.image_cache_admissions_rejected.to_le_bytes());
         bytes[92..96].copy_from_slice(&self.image_cache_trim_bytes.to_le_bytes());
+        // ---- v4 appended: queue / collector / cache observability ----
+        bytes[96..100].copy_from_slice(&self.render_queue_len.to_le_bytes());
+        bytes[100..104].copy_from_slice(&self.collector_pending_bytes.to_le_bytes());
+        bytes[104..108].copy_from_slice(&self.webgl_error_overflow.to_le_bytes());
+        bytes[108..112].copy_from_slice(&self.sk_image_wrappers.to_le_bytes());
+        bytes[112..116].copy_from_slice(&self.deferred_uploads.to_le_bytes());
+        // ---- v5 appended: Canvas2D snapshot fast-path counters ----
+        bytes[116..120].copy_from_slice(&self.canvas2d_snapshots_taken.to_le_bytes());
+        bytes[120..124].copy_from_slice(&self.canvas2d_snapshot_fallbacks.to_le_bytes());
+        bytes[124..128].copy_from_slice(&self.canvas2d_snapshot_uploads.to_le_bytes());
+        bytes[128..132].copy_from_slice(&self.canvas2d_snapshot_forced_readbacks.to_le_bytes());
         bytes
     }
 }
@@ -136,7 +164,6 @@ pub struct DebugStats {
     // `engine/crates/graphics/render_diagnostics.rs`).  Bumping the
     // snapshot version to add them can happen in a later commit
     // once the Android consumer is updated in lock-step.
-
     /// Cumulative WebGL / Canvas2D draw calls dispatched.
     /// Canvas2D draws are counted once per paint op; WebGL draws are
     /// counted at each `glDrawArrays{Instanced}` /
@@ -176,13 +203,94 @@ pub struct DebugStats {
     /// per-frame gradient rebuilds that should be hoisted JS-side.
     pub gradient_hits: AtomicU32,
     pub gradient_misses: AtomicU32,
+    /// Cumulative hits on the process-global text texture cache
+    /// (`shared::text_texture_cache`).  A hit means a fillText whose
+    /// `(text, font, size, color, ...)` tuple was already rendered
+    /// earlier in this process — the cached GL texture was reused
+    /// via `TexImage2DFromTextCache`, skipping the entire offscreen
+    /// Canvas2D + snapshot + blit pipeline.  Repeat-shop-open hit
+    /// rates above ~80% are the design target.
+    pub text_cache_hits: AtomicU32,
+    pub text_cache_misses: AtomicU32,
+    /// Current resident size in bytes (RGBA8 textures).  Gauge, not
+    /// counter — written on insert/eviction/trim.
+    pub text_cache_bytes: AtomicU32,
+    /// Current live entry count.  Gauge.
+    pub text_cache_entries: AtomicU32,
     /// Cumulative `GrDirectContext::reset()` calls (lazy reset
     /// path).  A fast-rising counter indicates frequent WebGL↔
     /// Canvas2D boundary crossings.
     pub skia_context_resets: AtomicU32,
 
-    // ---- IO subsystem counters (M5.1, surface at payload v3) ----
+    // ---- Canvas2D zero-readback fast path (cocos text rendering) ----
+    //
+    // `canvas2d_snapshots_taken` rises when `getImageData` successfully
+    // captured a GPU snapshot; `canvas2d_snapshot_fallbacks` rises when
+    // the snapshot path returned 0 and JS dropped to the legacy CPU
+    // readback (GLES 2 device, FBO incomplete, oversized region, etc.).
+    // `canvas2d_snapshot_uploads` rises every time a snapshot was
+    // consumed by `texImage2D`.  In the steady-state cocos pattern we
+    // expect taken ≈ uploads ≫ fallbacks; if uploads ≪ taken the
+    // game is reading bytes (or `_force_readback`-ing) instead of
+    // routing into WebGL, and the snapshot work is wasted overhead.
+    pub canvas2d_snapshots_taken: AtomicU32,
+    pub canvas2d_snapshot_fallbacks: AtomicU32,
+    pub canvas2d_snapshot_uploads: AtomicU32,
+    /// Cumulative `migo._force_readback(imageData)` calls.  A non-
+    /// zero value indicates a game on the slow path even after the
+    /// snapshot optimisation; investigate before assuming the perf
+    /// win is universal.
+    pub canvas2d_snapshot_forced_readbacks: AtomicU32,
 
+    // ---- Render-thread error feedback (P1-1 / P2-10) ----
+    //
+    // These counters replace the previous `error!()`-and-lose
+    // model: every render-thread-side failure that historically
+    // was only visible in logcat now bumps a structured counter
+    // the Java overlay / JS inspector can poll.  Writes are cheap
+    // (`Relaxed` Add) and reads are lock-free.
+    //
+    // Not included in `RenderMetricsSnapshot` wire format yet to
+    // keep the Java ByteBuffer layout stable; surfaced via
+    // `render_diagnostics` for the debug overlay.
+    /// Cumulative `Canvas2DBatch` / single `Canvas2D` command
+    /// failures after routing through the dispatcher.  A
+    /// fast-rising counter indicates Skia surface loss, AHB
+    /// fallback chain exhaustion, or protocol-level regressions.
+    pub canvas2d_cmd_errors: AtomicU32,
+    /// Cumulative `GLBatch` / single `GL` command failures.
+    pub gl_cmd_errors: AtomicU32,
+    /// Cumulative `CanvasCmd` (create/destroy/recreate/resize)
+    /// failures.
+    pub canvas_cmd_errors: AtomicU32,
+    /// Cumulative `swap_buffers_no_restore` failures (excludes
+    /// the `EGL_CONTEXT_LOST` path, which is counted separately).
+    pub swap_failures: AtomicU32,
+    /// Cumulative `EGL_CONTEXT_LOST` detections.  The next frame
+    /// runs `try_recover_context`, and each recovery attempt —
+    /// successful or not — also bumps `context_recoveries`.
+    pub context_lost_events: AtomicU32,
+    pub context_recoveries: AtomicU32,
+    /// Current consecutive-RAF-drop streak.  `dropped_frames` is
+    /// monotonic; this is the count of drops *in a row*.  Reset
+    /// to 0 when RAF dispatch succeeds.  Used by the RAF
+    /// backpressure detector (P2-10): at ≥ 3 consecutive drops
+    /// the render thread emits a `RenderEvent::RafBackpressure`.
+    pub raf_drop_streak: AtomicU32,
+    /// Cumulative times the RAF backpressure threshold was
+    /// crossed; lets operators tell a one-shot network hiccup
+    /// from sustained producer saturation.
+    pub raf_backpressure_events: AtomicU32,
+
+    /// Cumulative times the render thread hit the drain CPU
+    /// budget (MAX_DRAIN_US) and broke out with commands still
+    /// pending.  A rising counter means the render thread is
+    /// consistently starved of time to clear its backlog —
+    /// combine with `render_queue_len` to confirm backlog vs
+    /// steady-state.  See `render_thread::drain_cmds`.
+    pub drain_budget_exhausted: AtomicU32,
+
+    // ---- IO subsystem counters (M5.1, surface at payload v3) ----
     /// Count of Android image decodes that fell back from the AHB
     /// zero-copy path to the RGBA `byte[]` path. Non-zero on API
     /// < 30 (no `Bitmap.getHardwareBuffer`) and on driver-specific
@@ -217,6 +325,33 @@ pub struct DebugStats {
     /// Bytes released from the image cache in response to
     /// `onTrimMemory`-driven trim calls. Cumulative.
     pub image_cache_trim_bytes: AtomicU32,
+
+    // ---- Queue / collector / cache observability (v4) ----
+    /// Current render command channel backlog (instantaneous).
+    /// Sampled by the render thread once per frame; the Java debug
+    /// overlay surfaces it as "render queue: N / cap" so a command
+    /// storm is visible before it turns into a stall.
+    pub render_queue_len: AtomicU32,
+
+    /// Current count of `SkImage` wrapper entries held by
+    /// `ImageStore::sk_image_cache`.  Dividing by the number of
+    /// live `Canvas2DContext`s gives the wrapper multiplication
+    /// factor incurred by per-context Skia caches; collapses to the
+    /// wrapper count itself once `GrDirectContext` is shared.
+    pub sk_image_wrappers: AtomicU32,
+
+    /// Current count of uploads waiting for the next frame's
+    /// budget to open up (see `CanvasManager::deferred_uploads`).
+    /// A rising number means the per-frame upload budget is
+    /// undersized for the current workload.
+    pub deferred_uploads: AtomicU32,
+    // Note: `collector_pending_bytes` and `webgl_error_overflow`
+    // are intentionally absent from this struct because their
+    // producers (JS-runtime frame collector, WebGL error state)
+    // live in crates that don't have a `DebugStats` handle in
+    // scope.  They're published to process-global atomics
+    // (`set_collector_pending_bytes`, `bump_webgl_error_overflow`)
+    // and pulled into the snapshot at serialisation time.
 }
 
 impl DebugStats {
@@ -244,7 +379,13 @@ impl DebugStats {
             dropped_frames: self.dropped_frames.load(Ordering::Relaxed),
             fatal_error_code: self.fatal_error_code.load(Ordering::Relaxed),
             first_frame_ms: self.first_frame_ms.load(Ordering::Relaxed),
-            command_drops: self.command_drops.load(Ordering::Relaxed),
+            // `command_drops` aggregates per-session slot + the
+            // process-global `CommandSender` overflow counter so
+            // the Java overlay shows any dropped command, not just
+            // those recorded via `send_command_to_host`.
+            command_drops: self.command_drops.load(Ordering::Relaxed).saturating_add(
+                crate::render_command_sender::send_overflow_total().min(u32::MAX as u64) as u32,
+            ),
             raf_latency_us: self.raf_latency_us.load(Ordering::Relaxed),
             swap_block_us: self.swap_block_us.load(Ordering::Relaxed),
             upload_queue_depth: self.upload_queue_depth.load(Ordering::Relaxed),
@@ -264,9 +405,83 @@ impl DebugStats {
                 .image_cache_admissions_rejected
                 .load(Ordering::Relaxed),
             image_cache_trim_bytes: io.image_cache_trim_bytes.load(Ordering::Relaxed),
+            render_queue_len: self.render_queue_len.load(Ordering::Relaxed),
+            // Both counters are process-global (js-runtime doesn't
+            // depend on graphics' render_diagnostics sink), so we
+            // pull them directly at snapshot time.  The session
+            // DebugStats field is kept as a fallback for any future
+            // caller that wants a per-session variant.
+            collector_pending_bytes: collector_pending_bytes(),
+            // Saturate on the 32-bit snapshot field; the full
+            // 64-bit total stays available via
+            // `webgl_error_overflow_total()`.
+            webgl_error_overflow: webgl_error_overflow_total().min(u32::MAX as u64) as u32,
+            sk_image_wrappers: self.sk_image_wrappers.load(Ordering::Relaxed),
+            deferred_uploads: self.deferred_uploads.load(Ordering::Relaxed),
+            canvas2d_snapshots_taken: self.canvas2d_snapshots_taken.load(Ordering::Relaxed),
+            canvas2d_snapshot_fallbacks: self
+                .canvas2d_snapshot_fallbacks
+                .load(Ordering::Relaxed),
+            canvas2d_snapshot_uploads: self.canvas2d_snapshot_uploads.load(Ordering::Relaxed),
+            canvas2d_snapshot_forced_readbacks: self
+                .canvas2d_snapshot_forced_readbacks
+                .load(Ordering::Relaxed),
         }
         .as_le_bytes()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Process-global WebGL error-queue overflow counter
+// ---------------------------------------------------------------------------
+//
+// Lives here rather than `js-runtime` so `DebugStats::snapshot()`
+// can pull the current value without taking a cross-crate
+// dependency.  The producer (WebGL error state) calls
+// `bump_webgl_error_overflow()` every time the per-context queue
+// drops a record; the consumer is the diagnostic snapshot.
+
+static WEBGL_ERROR_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+/// Increment the process-global WebGL error-queue overflow counter
+/// by `n`.  Typically called with `1` from the error queue's
+/// overflow path.
+#[inline]
+pub fn bump_webgl_error_overflow(n: u64) {
+    WEBGL_ERROR_OVERFLOW.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Snapshot the current WebGL overflow total.  Used by
+/// `DebugStats::snapshot` and any ad-hoc diagnostic paths.
+#[inline]
+pub fn webgl_error_overflow_total() -> u64 {
+    WEBGL_ERROR_OVERFLOW.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// Process-global frame-collector gauge
+// ---------------------------------------------------------------------------
+//
+// Producer: JS-runtime's `UnifiedFrameCollector::push_gl` /
+// `push_canvas2d`, which mirrors its current `pending_bytes` every
+// time the counter ticks (gauge semantics, not a cumulative sum).
+// Consumer: `DebugStats::snapshot`.  Put here rather than under the
+// `render_diagnostics` sink because js-runtime does not depend on
+// graphics.
+
+static COLLECTOR_PENDING_BYTES: AtomicU32 = AtomicU32::new(0);
+
+/// Publish the current frame-collector byte budget.  Called on every
+/// `push_*` / flush as a gauge.
+#[inline]
+pub fn set_collector_pending_bytes(bytes: u32) {
+    COLLECTOR_PENDING_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// Read the current frame-collector byte budget.
+#[inline]
+pub fn collector_pending_bytes() -> u32 {
+    COLLECTOR_PENDING_BYTES.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +495,26 @@ impl DebugStats {
 // session-scoped `DebugStats` through every `image_cache::insert`
 // or `fetch_http_image` call site.
 
+/// Why the AHB zero-copy decoder path rejected an image and fell
+/// back to RGBA. Kept in a narrow enum so every failure is reported
+/// as one of a few stable reasons; new reasons should be added as
+/// explicit variants rather than folded into `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AhbFallbackReason {
+    /// AHB path doesn't handle this codec (e.g. unusual WebP, GIF).
+    UnsupportedFormat,
+    /// ImageDecoder constructed but refused to decode (corrupt data,
+    /// unsupported color space, etc.).
+    DecoderRejected,
+    /// AHB allocation itself failed — pre-API-30 device, driver
+    /// refusal, or low memory.
+    HardwareBufferUnavailable,
+    /// Image exceeds per-buffer pixel/byte limits.
+    TooLarge,
+    /// Anything we haven't classified yet.
+    Unknown,
+}
+
 /// Atomic counters for the IO subsystem. Mirrored into every
 /// session's [`DebugStats::snapshot`] at the time of the call.
 #[derive(Default)]
@@ -292,6 +527,67 @@ pub struct IoMetrics {
     pub slow_io_count_100ms: AtomicU32,
     pub image_cache_admissions_rejected: AtomicU32,
     pub image_cache_trim_bytes: AtomicU32,
+    /// Per-reason AHB fallback counters. Sum equals
+    /// `decoder_fallback_count`; splitting lets operators see *why*
+    /// the fast path didn't engage without re-running traces.
+    pub ahb_fallback_unsupported_format: AtomicU32,
+    pub ahb_fallback_decoder_rejected: AtomicU32,
+    pub ahb_fallback_hw_unavailable: AtomicU32,
+    pub ahb_fallback_too_large: AtomicU32,
+    pub ahb_fallback_unknown: AtomicU32,
+
+    // ---- Per-operation latency counters (P4 observability) --------
+    //
+    // We expose `count`, `sum_ms`, and `max_ms` per class rather than
+    // real histograms so the telemetry cost stays an atomic add per
+    // op. Downstream dashboards can compute the mean (`sum / count`)
+    // and the peak; true p50 / p99 require a histogram (tdigest,
+    // HdrHistogram) that is a separate follow-up.
+    pub fetch_count: AtomicU64,
+    pub fetch_fail_count: AtomicU64,
+    pub fetch_total_ms_sum: AtomicU64,
+    pub fetch_total_ms_max: AtomicU64,
+    pub fetch_first_byte_ms_sum: AtomicU64,
+    pub fetch_first_byte_ms_max: AtomicU64,
+
+    pub ws_connect_ms_sum: AtomicU64,
+    pub ws_connect_ms_max: AtomicU64,
+    pub ws_connect_count: AtomicU64,
+    pub ws_msg_in_bytes_total: AtomicU64,
+
+    pub storage_get_count: AtomicU64,
+    pub storage_get_ms_sum: AtomicU64,
+    pub storage_get_ms_max: AtomicU64,
+    pub storage_set_count: AtomicU64,
+    pub storage_set_ms_sum: AtomicU64,
+    pub storage_set_ms_max: AtomicU64,
+    pub storage_info_count: AtomicU64,
+    pub storage_info_ms_sum: AtomicU64,
+    pub storage_info_ms_max: AtomicU64,
+
+    pub download_count: AtomicU64,
+    pub download_bytes_total: AtomicU64,
+    pub download_ms_sum: AtomicU64,
+    pub download_ms_max: AtomicU64,
+    pub upload_count: AtomicU64,
+    pub upload_bytes_total: AtomicU64,
+    pub upload_ms_sum: AtomicU64,
+    pub upload_ms_max: AtomicU64,
+}
+
+/// Bucketed operation-class selector for [`IoMetrics::record_op`].
+#[derive(Debug, Clone, Copy)]
+pub enum OpClass {
+    FetchTotal,
+    FetchFirstByte,
+    FetchFail,
+    WsConnect,
+    WsBytesIn(u64),
+    StorageGet,
+    StorageSet,
+    StorageInfo,
+    Download { bytes: u64 },
+    Upload { bytes: u64 },
 }
 
 impl IoMetrics {
@@ -305,6 +601,93 @@ impl IoMetrics {
         } else {
             0
         }
+    }
+
+    /// Record an operation's elapsed time + payload info against the
+    /// class-specific atomic counters. The `elapsed` argument is
+    /// accepted as `Duration` so call sites don't have to convert to
+    /// ms themselves; the stored field is ms (u64) because that's what
+    /// the downstream metrics surface expects.
+    pub fn record_op(&self, class: OpClass, elapsed: std::time::Duration) {
+        let ms = elapsed.as_millis() as u64;
+        #[inline]
+        fn bump_max(slot: &AtomicU64, v: u64) {
+            let mut cur = slot.load(Ordering::Relaxed);
+            while v > cur {
+                match slot.compare_exchange_weak(cur, v, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(new) => cur = new,
+                }
+            }
+        }
+        match class {
+            OpClass::FetchTotal => {
+                self.fetch_count.fetch_add(1, Ordering::Relaxed);
+                self.fetch_total_ms_sum.fetch_add(ms, Ordering::Relaxed);
+                bump_max(&self.fetch_total_ms_max, ms);
+            }
+            OpClass::FetchFirstByte => {
+                self.fetch_first_byte_ms_sum
+                    .fetch_add(ms, Ordering::Relaxed);
+                bump_max(&self.fetch_first_byte_ms_max, ms);
+            }
+            OpClass::FetchFail => {
+                self.fetch_fail_count.fetch_add(1, Ordering::Relaxed);
+            }
+            OpClass::WsConnect => {
+                self.ws_connect_count.fetch_add(1, Ordering::Relaxed);
+                self.ws_connect_ms_sum.fetch_add(ms, Ordering::Relaxed);
+                bump_max(&self.ws_connect_ms_max, ms);
+            }
+            OpClass::WsBytesIn(bytes) => {
+                self.ws_msg_in_bytes_total
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+            OpClass::StorageGet => {
+                self.storage_get_count.fetch_add(1, Ordering::Relaxed);
+                self.storage_get_ms_sum.fetch_add(ms, Ordering::Relaxed);
+                bump_max(&self.storage_get_ms_max, ms);
+            }
+            OpClass::StorageSet => {
+                self.storage_set_count.fetch_add(1, Ordering::Relaxed);
+                self.storage_set_ms_sum.fetch_add(ms, Ordering::Relaxed);
+                bump_max(&self.storage_set_ms_max, ms);
+            }
+            OpClass::StorageInfo => {
+                self.storage_info_count.fetch_add(1, Ordering::Relaxed);
+                self.storage_info_ms_sum.fetch_add(ms, Ordering::Relaxed);
+                bump_max(&self.storage_info_ms_max, ms);
+            }
+            OpClass::Download { bytes } => {
+                self.download_count.fetch_add(1, Ordering::Relaxed);
+                self.download_bytes_total
+                    .fetch_add(bytes, Ordering::Relaxed);
+                self.download_ms_sum.fetch_add(ms, Ordering::Relaxed);
+                bump_max(&self.download_ms_max, ms);
+            }
+            OpClass::Upload { bytes } => {
+                self.upload_count.fetch_add(1, Ordering::Relaxed);
+                self.upload_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+                self.upload_ms_sum.fetch_add(ms, Ordering::Relaxed);
+                bump_max(&self.upload_ms_max, ms);
+            }
+        }
+    }
+
+    /// Bump both the total AHB fallback counter and the per-reason
+    /// bucket. Call sites pass a classified reason so the per-bucket
+    /// counters stay in sync with `decoder_fallback_count`.
+    #[inline]
+    pub fn record_ahb_fallback(&self, reason: AhbFallbackReason) {
+        self.decoder_fallback_count.fetch_add(1, Ordering::Relaxed);
+        let bucket = match reason {
+            AhbFallbackReason::UnsupportedFormat => &self.ahb_fallback_unsupported_format,
+            AhbFallbackReason::DecoderRejected => &self.ahb_fallback_decoder_rejected,
+            AhbFallbackReason::HardwareBufferUnavailable => &self.ahb_fallback_hw_unavailable,
+            AhbFallbackReason::TooLarge => &self.ahb_fallback_too_large,
+            AhbFallbackReason::Unknown => &self.ahb_fallback_unknown,
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -358,14 +741,20 @@ mod tests {
 
         let bytes = stats.snapshot();
 
-        // v3 payload = 92 bytes (60 legacy + 32 IO tail) + 4 header = 96.
+        // v5 payload = 128 bytes (60 legacy + 32 IO + 20 queue/cache + 16 snapshot) + 4 header = 132.
         assert_eq!(bytes.len(), RenderMetricsSnapshot::BYTE_LEN);
-        assert_eq!(RenderMetricsSnapshot::BYTE_LEN, 96);
+        assert_eq!(RenderMetricsSnapshot::BYTE_LEN, 132);
 
-        // Header: magic 'MG' (0x4D47) at [0..2], version 3 at [2..4].
-        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), RenderMetricsSnapshot::MAGIC);
-        assert_eq!(u16::from_le_bytes(bytes[2..4].try_into().unwrap()), RenderMetricsSnapshot::VERSION);
-        assert_eq!(RenderMetricsSnapshot::VERSION, 3);
+        // Header: magic 'MG' (0x4D47) at [0..2], version 4 at [2..4].
+        assert_eq!(
+            u16::from_le_bytes(bytes[0..2].try_into().unwrap()),
+            RenderMetricsSnapshot::MAGIC
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[2..4].try_into().unwrap()),
+            RenderMetricsSnapshot::VERSION
+        );
+        assert_eq!(RenderMetricsSnapshot::VERSION, 5);
 
         // Payload fields — all offsets shifted by +4 (HEADER_LEN).
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 600);
@@ -392,13 +781,44 @@ mod tests {
 
         let bytes = stats.snapshot();
 
-        assert_eq!(bytes.len(), 96);
+        assert_eq!(bytes.len(), 132);
         // Payload offsets shifted by +4 (HEADER_LEN).
         assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 42);
         assert_eq!(u32::from_le_bytes(bytes[48..52].try_into().unwrap()), 7);
         assert_eq!(u32::from_le_bytes(bytes[52..56].try_into().unwrap()), 1500);
         assert_eq!(u32::from_le_bytes(bytes[56..60].try_into().unwrap()), 3);
         assert_eq!(u32::from_le_bytes(bytes[60..64].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn v4_queue_and_cache_fields_serialize_at_tail() {
+        // Zero the process-globals first so cross-test noise from
+        // other `shared::stats` tests doesn't leak into the offsets
+        // we're asserting below.
+        set_collector_pending_bytes(0);
+        // Can't directly reset the WebGL overflow total (atomic
+        // with no `store` exposed — mirrors gauge semantics), so
+        // snapshot the baseline and add to it.
+        let overflow_baseline = webgl_error_overflow_total();
+
+        let stats = DebugStats::default();
+        stats.render_queue_len.store(321, Ordering::Relaxed);
+        set_collector_pending_bytes(4_000_000);
+        bump_webgl_error_overflow(17);
+        stats.sk_image_wrappers.store(88, Ordering::Relaxed);
+        stats.deferred_uploads.store(5, Ordering::Relaxed);
+
+        let bytes = stats.snapshot();
+        assert_eq!(bytes.len(), 132);
+        assert_eq!(u32::from_le_bytes(bytes[96..100].try_into().unwrap()), 321);
+        assert_eq!(
+            u32::from_le_bytes(bytes[100..104].try_into().unwrap()),
+            4_000_000
+        );
+        let webgl_field = u32::from_le_bytes(bytes[104..108].try_into().unwrap()) as u64;
+        assert_eq!(webgl_field, overflow_baseline + 17);
+        assert_eq!(u32::from_le_bytes(bytes[108..112].try_into().unwrap()), 88);
+        assert_eq!(u32::from_le_bytes(bytes[112..116].try_into().unwrap()), 5);
     }
 
     #[test]
@@ -429,7 +849,10 @@ mod tests {
         let decoder_fb = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
         let dc_hits = u32::from_le_bytes(bytes[68..72].try_into().unwrap());
         let ws_rej = u32::from_le_bytes(bytes[80..84].try_into().unwrap());
-        assert!(decoder_fb >= base_decoder + 2, "fallback counter not forwarded");
+        assert!(
+            decoder_fb >= base_decoder + 2,
+            "fallback counter not forwarded"
+        );
         assert!(dc_hits >= base_hits + 5, "derived-cache hits not forwarded");
         assert!(ws_rej >= 1, "ws rejects not forwarded");
     }

@@ -10,8 +10,8 @@ use core::services::{
     ConnectivityServices, DeviceMotionService, FileService, GameLogService, GyroscopeService,
     ImageApiService, InteractionService, KeyboardService, LocationService, MediaServices,
     NavigateService, NetworkService, PaymentService, RecorderService, ScanCodeService,
-    ScreenService, SensorServices, ServiceError, ShareService, SubpackageService, SystemInfoService,
-    SystemUtilServices, VibrationService, VideoService,
+    ScreenService, SensorServices, ServiceError, ShareService, SubpackageService,
+    SystemInfoService, SystemUtilServices, VibrationService, VideoService,
 };
 
 use crate::android::jni;
@@ -29,50 +29,154 @@ impl AndroidDeviceServices {
 
 // ---- SensorServices ----
 impl SensorServices for AndroidDeviceServices {
-    fn battery(&self) -> Option<Arc<dyn BatteryService>> { Some(Arc::new(AndroidBattery)) }
-    fn vibration(&self) -> Option<Arc<dyn VibrationService>> { Some(Arc::new(AndroidVibration)) }
-    fn screen(&self) -> Option<Arc<dyn ScreenService>> { Some(Arc::new(AndroidScreen { host_id: self.host_id })) }
-    fn device_motion(&self) -> Option<Arc<dyn DeviceMotionService>> { Some(Arc::new(AndroidDeviceMotion { host_id: self.host_id })) }
-    fn gyroscope(&self) -> Option<Arc<dyn GyroscopeService>> { Some(Arc::new(AndroidGyroscope { host_id: self.host_id })) }
-    fn compass(&self) -> Option<Arc<dyn CompassService>> { Some(Arc::new(AndroidCompass { host_id: self.host_id })) }
-    fn accelerometer(&self) -> Option<Arc<dyn AccelerometerService>> { Some(Arc::new(AndroidAccelerometer { host_id: self.host_id })) }
+    fn battery(&self) -> Option<Arc<dyn BatteryService>> {
+        Some(Arc::new(AndroidBattery))
+    }
+    fn vibration(&self) -> Option<Arc<dyn VibrationService>> {
+        Some(Arc::new(AndroidVibration))
+    }
+    fn screen(&self) -> Option<Arc<dyn ScreenService>> {
+        Some(Arc::new(AndroidScreen {
+            host_id: self.host_id,
+        }))
+    }
+    fn device_motion(&self) -> Option<Arc<dyn DeviceMotionService>> {
+        Some(Arc::new(AndroidDeviceMotion {
+            host_id: self.host_id,
+        }))
+    }
+    fn gyroscope(&self) -> Option<Arc<dyn GyroscopeService>> {
+        Some(Arc::new(AndroidGyroscope {
+            host_id: self.host_id,
+        }))
+    }
+    fn compass(&self) -> Option<Arc<dyn CompassService>> {
+        Some(Arc::new(AndroidCompass {
+            host_id: self.host_id,
+        }))
+    }
+    fn accelerometer(&self) -> Option<Arc<dyn AccelerometerService>> {
+        Some(Arc::new(AndroidAccelerometer {
+            host_id: self.host_id,
+        }))
+    }
 }
 
 // ---- MediaServices ----
 impl MediaServices for AndroidDeviceServices {
-    fn audio_platform(&self) -> Option<Arc<dyn AudioPlatformService>> { Some(Arc::new(AndroidAudioPlatform { host_id: self.host_id })) }
-    fn recorder(&self) -> Option<Arc<dyn RecorderService>> { Some(Arc::new(AndroidRecorder { host_id: self.host_id })) }
-    fn camera(&self) -> Option<Arc<dyn CameraService>> { Some(Arc::new(AndroidCamera { host_id: self.host_id })) }
-    fn image_api(&self) -> Option<Arc<dyn ImageApiService>> { Some(Arc::new(AndroidImageApi { host_id: self.host_id })) }
-    fn video(&self) -> Option<Arc<dyn VideoService>> { Some(Arc::new(AndroidVideo { host_id: self.host_id })) }
+    fn audio_platform(&self) -> Option<Arc<dyn AudioPlatformService>> {
+        Some(Arc::new(AndroidAudioPlatform {
+            host_id: self.host_id,
+        }))
+    }
+    fn recorder(&self) -> Option<Arc<dyn RecorderService>> {
+        Some(Arc::new(AndroidRecorder {
+            host_id: self.host_id,
+        }))
+    }
+    fn camera(&self) -> Option<Arc<dyn CameraService>> {
+        Some(Arc::new(AndroidCamera {
+            host_id: self.host_id,
+        }))
+    }
+    fn image_api(&self) -> Option<Arc<dyn ImageApiService>> {
+        Some(Arc::new(AndroidImageApi {
+            host_id: self.host_id,
+        }))
+    }
+    fn video(&self) -> Option<Arc<dyn VideoService>> {
+        Some(Arc::new(AndroidVideo {
+            host_id: self.host_id,
+        }))
+    }
 }
 
 // ---- ConnectivityServices ----
 impl ConnectivityServices for AndroidDeviceServices {
-    fn network(&self) -> Option<Arc<dyn NetworkService>> { Some(Arc::new(AndroidNetwork { host_id: self.host_id })) }
-    fn bluetooth(&self) -> Option<Arc<dyn BluetoothService>> { Some(Arc::new(AndroidBluetooth { host_id: self.host_id })) }
-    fn location(&self) -> Option<Arc<dyn LocationService>> { Some(Arc::new(AndroidLocation { host_id: self.host_id })) }
+    fn network(&self) -> Option<Arc<dyn NetworkService>> {
+        Some(Arc::new(AndroidNetwork {
+            host_id: self.host_id,
+        }))
+    }
+    fn bluetooth(&self) -> Option<Arc<dyn BluetoothService>> {
+        Some(Arc::new(AndroidBluetooth {
+            host_id: self.host_id,
+        }))
+    }
+    fn location(&self) -> Option<Arc<dyn LocationService>> {
+        Some(Arc::new(AndroidLocation {
+            host_id: self.host_id,
+        }))
+    }
 }
 
 // ---- CommerceServices ----
 impl CommerceServices for AndroidDeviceServices {
-    fn game_log(&self) -> Option<Arc<dyn GameLogService>> { Some(Arc::new(AndroidGameLog { host_id: self.host_id })) }
-    fn auth(&self) -> Option<Arc<dyn AuthService>> { Some(Arc::new(AndroidAuth { host_id: self.host_id })) }
-    fn subpackage(&self) -> Option<Arc<dyn SubpackageService>> { Some(Arc::new(AndroidSubpackage { host_id: self.host_id })) }
-    fn share(&self) -> Option<Arc<dyn ShareService>> { Some(Arc::new(AndroidShare { host_id: self.host_id })) }
-    fn payment(&self) -> Option<Arc<dyn PaymentService>> { Some(Arc::new(AndroidPayment { host_id: self.host_id })) }
+    fn game_log(&self) -> Option<Arc<dyn GameLogService>> {
+        Some(Arc::new(AndroidGameLog {
+            host_id: self.host_id,
+        }))
+    }
+    fn auth(&self) -> Option<Arc<dyn AuthService>> {
+        Some(Arc::new(AndroidAuth {
+            host_id: self.host_id,
+        }))
+    }
+    fn subpackage(&self) -> Option<Arc<dyn SubpackageService>> {
+        Some(Arc::new(AndroidSubpackage {
+            host_id: self.host_id,
+        }))
+    }
+    fn share(&self) -> Option<Arc<dyn ShareService>> {
+        Some(Arc::new(AndroidShare {
+            host_id: self.host_id,
+        }))
+    }
+    fn payment(&self) -> Option<Arc<dyn PaymentService>> {
+        Some(Arc::new(AndroidPayment {
+            host_id: self.host_id,
+        }))
+    }
 }
 
 // ---- SystemUtilServices ----
 impl SystemUtilServices for AndroidDeviceServices {
-    fn clipboard(&self) -> Option<Arc<dyn ClipboardService>> { Some(Arc::new(AndroidClipboard { host_id: self.host_id })) }
-    fn keyboard(&self) -> Option<Arc<dyn KeyboardService>> { Some(Arc::new(AndroidKeyboard { host_id: self.host_id })) }
-    fn interaction(&self) -> Option<Arc<dyn InteractionService>> { Some(Arc::new(AndroidInteraction { host_id: self.host_id })) }
-    fn system_info(&self) -> Option<Arc<dyn SystemInfoService>> { Some(Arc::new(AndroidSystemInfo { host_id: self.host_id })) }
-    fn codec(&self) -> Option<Arc<dyn CodecService>> { Some(Arc::new(AndroidCodec)) }
-    fn file(&self) -> Option<Arc<dyn FileService>> { Some(Arc::new(AndroidFile)) }
-    fn scan_code(&self) -> Option<Arc<dyn ScanCodeService>> { Some(Arc::new(AndroidScanCode { host_id: self.host_id })) }
-    fn navigate(&self) -> Option<Arc<dyn NavigateService>> { Some(Arc::new(AndroidNavigate { host_id: self.host_id })) }
+    fn clipboard(&self) -> Option<Arc<dyn ClipboardService>> {
+        Some(Arc::new(AndroidClipboard {
+            host_id: self.host_id,
+        }))
+    }
+    fn keyboard(&self) -> Option<Arc<dyn KeyboardService>> {
+        Some(Arc::new(AndroidKeyboard {
+            host_id: self.host_id,
+        }))
+    }
+    fn interaction(&self) -> Option<Arc<dyn InteractionService>> {
+        Some(Arc::new(AndroidInteraction {
+            host_id: self.host_id,
+        }))
+    }
+    fn system_info(&self) -> Option<Arc<dyn SystemInfoService>> {
+        Some(Arc::new(AndroidSystemInfo {
+            host_id: self.host_id,
+        }))
+    }
+    fn codec(&self) -> Option<Arc<dyn CodecService>> {
+        Some(Arc::new(AndroidCodec))
+    }
+    fn file(&self) -> Option<Arc<dyn FileService>> {
+        Some(Arc::new(AndroidFile))
+    }
+    fn scan_code(&self) -> Option<Arc<dyn ScanCodeService>> {
+        Some(Arc::new(AndroidScanCode {
+            host_id: self.host_id,
+        }))
+    }
+    fn navigate(&self) -> Option<Arc<dyn NavigateService>> {
+        Some(Arc::new(AndroidNavigate {
+            host_id: self.host_id,
+        }))
+    }
 }
 
 // DeviceServices is auto-implemented via blanket impl in shared::services::device
@@ -129,15 +233,21 @@ impl ScreenService for AndroidScreen {
     }
 
     fn set_brightness(&self, value: f32) -> Result<(), ServiceError> {
-        jni::set_screen_brightness(self.host_id, value).map(|_| ()).map_err(Into::into)
+        jni::set_screen_brightness(self.host_id, value)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     fn set_keep_screen_on(&self, keep_on: bool) -> Result<(), ServiceError> {
-        jni::set_keep_screen_on(self.host_id, keep_on).map(|_| ()).map_err(Into::into)
+        jni::set_keep_screen_on(self.host_id, keep_on)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     fn set_orientation(&self, value: &str) -> Result<(), ServiceError> {
-        jni::set_device_orientation(self.host_id, value).map(|_| ()).map_err(Into::into)
+        jni::set_device_orientation(self.host_id, value)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     fn start_capture_screen(&self) -> Result<(), ServiceError> {
@@ -149,7 +259,9 @@ impl ScreenService for AndroidScreen {
     }
 
     fn set_enable_debug(&self, enabled: bool) -> Result<(), ServiceError> {
-        jni::set_enable_debug(self.host_id, enabled).map(|_| ()).map_err(Into::into)
+        jni::set_enable_debug(self.host_id, enabled)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 }
 
@@ -254,7 +366,12 @@ impl AudioPlatformService for AndroidAudioPlatform {
         obey_mute_switch: bool,
         speaker_on: bool,
     ) -> Result<(), ServiceError> {
-        Ok(jni::set_inner_audio_option(self.host_id, mix_with_other, obey_mute_switch, speaker_on)?)
+        Ok(jni::set_inner_audio_option(
+            self.host_id,
+            mix_with_other,
+            obey_mute_switch,
+            speaker_on,
+        )?)
     }
 
     fn get_available_audio_sources(&self) -> Result<Vec<String>, ServiceError> {
@@ -425,7 +542,10 @@ impl BluetoothService for AndroidBluetooth {
     }
 
     fn start_devices_discovery(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::bluetooth_start_devices_discovery(self.host_id, options_json)?)
+        Ok(jni::bluetooth_start_devices_discovery(
+            self.host_id,
+            options_json,
+        )?)
     }
 
     fn stop_devices_discovery(&self) -> Result<(), ServiceError> {
@@ -437,7 +557,10 @@ impl BluetoothService for AndroidBluetooth {
     }
 
     fn get_connected_devices(&self, options_json: &str) -> Result<String, ServiceError> {
-        Ok(jni::bluetooth_get_connected_devices(self.host_id, options_json)?)
+        Ok(jni::bluetooth_get_connected_devices(
+            self.host_id,
+            options_json,
+        )?)
     }
 
     fn make_pair(&self, options_json: &str) -> Result<(), ServiceError> {
@@ -449,7 +572,10 @@ impl BluetoothService for AndroidBluetooth {
     }
 
     fn start_beacon_discovery(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::bluetooth_start_beacon_discovery(self.host_id, options_json)?)
+        Ok(jni::bluetooth_start_beacon_discovery(
+            self.host_id,
+            options_json,
+        )?)
     }
 
     fn stop_beacon_discovery(&self) -> Result<(), ServiceError> {
@@ -475,19 +601,34 @@ impl BluetoothService for AndroidBluetooth {
     }
 
     fn get_ble_device_characteristics(&self, options_json: &str) -> Result<String, ServiceError> {
-        Ok(jni::ble_get_device_characteristics(self.host_id, options_json)?)
+        Ok(jni::ble_get_device_characteristics(
+            self.host_id,
+            options_json,
+        )?)
     }
 
     fn read_ble_characteristic_value(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::ble_read_characteristic_value(self.host_id, options_json)?)
+        Ok(jni::ble_read_characteristic_value(
+            self.host_id,
+            options_json,
+        )?)
     }
 
     fn write_ble_characteristic_value(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::ble_write_characteristic_value(self.host_id, options_json)?)
+        Ok(jni::ble_write_characteristic_value(
+            self.host_id,
+            options_json,
+        )?)
     }
 
-    fn notify_ble_characteristic_value_change(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::ble_notify_characteristic_value_change(self.host_id, options_json)?)
+    fn notify_ble_characteristic_value_change(
+        &self,
+        options_json: &str,
+    ) -> Result<(), ServiceError> {
+        Ok(jni::ble_notify_characteristic_value_change(
+            self.host_id,
+            options_json,
+        )?)
     }
 
     fn get_ble_device_rssi(&self, options_json: &str) -> Result<String, ServiceError> {
@@ -602,13 +743,21 @@ impl VideoService for AndroidVideo {
         Ok(jni::video_seek(self.host_id, video_id, position)?)
     }
     fn request_fullscreen(&self, video_id: u32, direction: i32) -> Result<(), ServiceError> {
-        Ok(jni::video_request_fullscreen(self.host_id, video_id, direction)?)
+        Ok(jni::video_request_fullscreen(
+            self.host_id,
+            video_id,
+            direction,
+        )?)
     }
     fn exit_fullscreen(&self, video_id: u32) -> Result<(), ServiceError> {
         Ok(jni::video_exit_fullscreen(self.host_id, video_id)?)
     }
     fn set_property(&self, video_id: u32, property_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::video_set_property(self.host_id, video_id, property_json)?)
+        Ok(jni::video_set_property(
+            self.host_id,
+            video_id,
+            property_json,
+        )?)
     }
     fn destroy(&self, video_id: u32) -> Result<(), ServiceError> {
         Ok(jni::video_destroy(self.host_id, video_id)?)
@@ -715,7 +864,10 @@ impl NavigateService for AndroidNavigate {
     }
 
     fn open_customer_service_conversation(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::open_customer_service_conversation(self.host_id, options_json)?)
+        Ok(jni::open_customer_service_conversation(
+            self.host_id,
+            options_json,
+        )?)
     }
 }
 
@@ -727,7 +879,10 @@ struct AndroidPayment {
 
 impl PaymentService for AndroidPayment {
     fn check_is_support_midas_payment(&self, options_json: &str) -> Result<String, ServiceError> {
-        Ok(jni::check_is_support_midas_payment(self.host_id, options_json)?)
+        Ok(jni::check_is_support_midas_payment(
+            self.host_id,
+            options_json,
+        )?)
     }
 
     fn request_midas_payment(&self, options_json: &str) -> Result<(), ServiceError> {
@@ -735,6 +890,9 @@ impl PaymentService for AndroidPayment {
     }
 
     fn request_midas_payment_game_item(&self, options_json: &str) -> Result<(), ServiceError> {
-        Ok(jni::request_midas_payment_game_item(self.host_id, options_json)?)
+        Ok(jni::request_midas_payment_game_item(
+            self.host_id,
+            options_json,
+        )?)
     }
 }

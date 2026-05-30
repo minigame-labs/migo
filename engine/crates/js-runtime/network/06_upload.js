@@ -5,7 +5,7 @@ import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 import {
     UploadResponse, UploadErrorResponse, Exception, abortedNetworkError,
 } from "ext:host_v8_network/02_response.js";
-import { op_fetch_upload, op_read_file } from "ext:core/ops";
+import { op_fetch_upload } from "ext:core/ops";
 
 const { TypeError } = primordials;
 
@@ -95,17 +95,16 @@ function uploadFile(options = {}) {
 
     (async () => {
         try {
-            // Read file content via file module (goes through VFS)
-            const fileData = await op_read_file(filePath, undefined, undefined);
-            if (cancellation.aborted) throw "aborted";
+            // We deliberately skip the old `op_read_file` + full-buffer
+            // roundtrip. The Rust op opens the VFS-resolved file and
+            // streams it directly into reqwest's multipart encoder,
+            // so a 50 MiB upload no longer pins the whole file in
+            // JS heap + Rust Vec at the same time.
+            uploadTask._triggerProgress(0, 0, 0);
 
-            const totalBytes = fileData.byteLength;
-            uploadTask._triggerProgress(0, 0, totalBytes);
-
-            // Send multipart upload via Rust op
             const result = await op_fetch_upload(
                 url,
-                fileData,
+                filePath,
                 name,
                 filename,
                 headers,
@@ -127,8 +126,13 @@ function uploadFile(options = {}) {
             const respHeader = new Header(result.headers, result.statusCode);
             uploadTask._triggerHeadersReceived(respHeader);
 
-            // Final progress at 100%
-            uploadTask._triggerProgress(100, totalBytes, totalBytes);
+            // Final progress at 100%. We don't have a pre-read size
+            // any more, so we use the totalBytesSent the Rust op
+            // reports after the request completes; if that's zero
+            // we still emit a progress=100 tick so callers can close
+            // out their state machines.
+            const sent = result.totalBytesSent || 0;
+            uploadTask._triggerProgress(100, sent, sent);
 
             const resp = new UploadResponse(result.data, result.statusCode);
             success(resp);

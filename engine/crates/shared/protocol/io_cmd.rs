@@ -249,7 +249,9 @@ pub enum ImagePriority {
 }
 
 impl Default for ImagePriority {
-    fn default() -> Self { Self::Normal }
+    fn default() -> Self {
+        Self::Normal
+    }
 }
 
 /// Known image variant extensions for companion file lookup and cache keying.
@@ -279,15 +281,12 @@ pub fn path_stem(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ahb::{
-        AhbDesc, OwnedAhb, write_rgba_into_ahb,
-    };
+    use crate::protocol::ahb::{AhbDesc, OwnedAhb, write_rgba_into_ahb};
 
     fn checker_2x2() -> Vec<u8> {
         // 2x2 RGBA, alternating opaque red / opaque blue.
         vec![
-            255, 0, 0, 255, 0, 0, 255, 255,
-            0, 0, 255, 255, 255, 0, 0, 255,
+            255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255,
         ]
     }
 

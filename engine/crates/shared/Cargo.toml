@@ -32,6 +32,7 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std"], o
 crc32fast = "1"
 zstd = { workspace = true }
 bitflags = "2"
+lru = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"

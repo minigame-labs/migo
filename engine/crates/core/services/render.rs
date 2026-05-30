@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, RecvTimeoutError};
+use crossbeam_channel::{RecvTimeoutError, bounded};
 use tracing::{info, warn};
 
 use graphics::{RenderThread, SurfaceSystem};
@@ -8,6 +8,7 @@ use graphics::{RenderThread, SurfaceSystem};
 use shared::{
     error::{EngineError, EngineResult, ErrorCode},
     protocol::render_cmd::{CanvasCmd, RenderCmdResp, RenderCommand},
+    render_event::RenderEventReceiver,
     surface::SurfaceRef,
 };
 
@@ -45,6 +46,7 @@ impl RenderService {
         host_id: i32,
         surface: SurfaceRef,
         pixel_ratio: f32,
+        target_fps: i32,
         app_cache_dir: Option<std::path::PathBuf>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
     ) -> EngineResult<Self> {
@@ -57,6 +59,11 @@ impl RenderService {
             app_cache_dir,
             gpu_caps,
         )?;
+        // Apply the host's configured target FPS to the render thread immediately
+        // so the first vsync tick already runs at the right cadence.
+        let _ = thread
+            .sender()
+            .send(RenderCommand::FrameRate(target_fps.clamp(1, 120) as u32));
         let mut surface_system = SurfaceSystem::new();
         surface_system.on_surface_available(surface.size());
         Ok(Self {
@@ -71,6 +78,20 @@ impl RenderService {
         self.thread.sender()
     }
 
+    #[inline]
+    pub(crate) fn events(&self) -> RenderEventReceiver {
+        self.thread.events()
+    }
+
+    /// F-2: pass-through accessor so `HostOpState` can adopt the
+    /// render thread's `SharedTextMeasurer`.  The measurer is
+    /// built at `RenderThread::spawn` time and lives for the
+    /// lifetime of the render service.
+    #[inline]
+    pub(crate) fn text_measurer(&self) -> shared::text_measurer::SharedTextMeasurer {
+        self.thread.text_measurer()
+    }
+
     /// Update onscreen surface and request backend recreate.
     pub(crate) fn update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
         let surface_size = surface.size();
@@ -78,7 +99,7 @@ impl RenderService {
         let (tx, rx) = bounded::<Result<(), EngineError>>(1);
         let cmd = RenderCommand::Canvas(CanvasCmd::RecreateOnscreen {
             surface: surface.clone(),
-            resp: RenderCmdResp::Sync(tx),
+            resp: RenderCmdResp::from_sync(tx),
         });
 
         self.sender().send(cmd).map_err(|e| {

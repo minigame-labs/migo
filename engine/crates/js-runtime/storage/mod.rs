@@ -170,8 +170,13 @@ pub fn op_storage_set(
 pub fn op_storage_remove(state: &mut OpState, #[string] key: &str) -> Result<(), JsErrorBox> {
     let scheduler = get_scheduler(state);
     let dir = storage_dir(state);
-    storage_ops::storage_remove_sync_with_scheduler(scheduler, dir, key.to_string(), MAX_TOTAL_BYTES)
-        .map_err(js_err)
+    storage_ops::storage_remove_sync_with_scheduler(
+        scheduler,
+        dir,
+        key.to_string(),
+        MAX_TOTAL_BYTES,
+    )
+    .map_err(js_err)
 }
 
 #[op2(fast)]
@@ -243,10 +248,16 @@ pub async fn op_storage_get_async(
         let st = state.borrow();
         (get_scheduler(&st), storage_dir(&st))
     };
-    storage_ops::storage_get_with_scheduler(scheduler, dir, key, MAX_TOTAL_BYTES, RequestKind::Async)
-        .await
-        .map(|opt| opt.unwrap_or_default())
-        .map_err(StorageError::from)
+    storage_ops::storage_get_with_scheduler(
+        scheduler,
+        dir,
+        key,
+        MAX_TOTAL_BYTES,
+        RequestKind::Async,
+    )
+    .await
+    .map(|opt| opt.unwrap_or_default())
+    .map_err(StorageError::from)
 }
 
 #[op2(async(lazy), fast)]

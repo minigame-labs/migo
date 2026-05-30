@@ -230,6 +230,7 @@ mod tests {
             vfs: None,
             mount_table: None,
             render_tx,
+            text_measurer: None,
             audio_tx: AudioSender::new(audio_raw_tx, ThreadWakeup::new()),
             host_tx,
             device_services: None,
@@ -238,6 +239,7 @@ mod tests {
             workers_path: None,
             network_policy: NetworkPolicy::default(),
             backgrounded: Arc::new(AtomicBool::new(false)),
+            webgl_context_created: Arc::new(AtomicBool::new(false)),
             code_signing_enabled: false,
             gpu_caps: GpuCaps::new(),
         }

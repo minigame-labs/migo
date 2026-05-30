@@ -1,7 +1,7 @@
 use std::{
     collections::BinaryHeap,
     fmt,
-    sync::{Arc, Condvar, OnceLock, Mutex as StdMutex, mpsc},
+    sync::{Arc, Condvar, Mutex as StdMutex, OnceLock, mpsc},
     thread,
 };
 
@@ -42,6 +42,14 @@ impl<T> PartialOrd for PriorityEntry<T> {
 struct PriorityChannelInner<T> {
     heap: BinaryHeap<PriorityEntry<T>>,
     next_seq: u64,
+    /// Monotonic pop counter used by the aging logic. Every
+    /// [`PriorityReceiver::AGING_INTERVAL`] pops, if the heap holds
+    /// any [`PriorityClass::Background`] entry while also holding a
+    /// higher-priority entry, we surface the oldest `Background`
+    /// first. This bounds the worst-case waiting time of a background
+    /// task to roughly `AGING_INTERVAL` high-priority tasks, rather
+    /// than "forever if foreground pressure never subsides".
+    pop_count: u64,
     closed: bool,
 }
 
@@ -91,6 +99,7 @@ pub(crate) fn priority_channel<T>() -> (PrioritySender<T>, PriorityReceiver<T>) 
         state: StdMutex::new(PriorityChannelInner {
             heap: BinaryHeap::new(),
             next_seq: 0,
+            pop_count: 0,
             closed: false,
         }),
         condvar: Condvar::new(),
@@ -129,10 +138,33 @@ impl<T> PrioritySender<T> {
 }
 
 impl<T> PriorityReceiver<T> {
+    /// How often the aging policy pre-empts strict priority. Every
+    /// `AGING_INTERVAL` successful pops, if the heap holds at least
+    /// one `Background` entry *and* at least one higher-priority
+    /// entry, we dequeue the oldest `Background` instead of the
+    /// usual highest-priority-first pick.
+    ///
+    /// 16 is empirically large enough that foreground latency is
+    /// dominated by the job itself (a 16th slot every cycle of small
+    /// foreground work is ≤ 1 / 16 ≈ 6 % throughput taxation) and
+    /// small enough that background tasks make steady progress under
+    /// sustained foreground load.
+    pub const AGING_INTERVAL: u64 = 16;
+
     pub fn recv(&self) -> Result<T, PoolError> {
         let mut state = self.shared.state.lock().unwrap();
         loop {
+            // Aging slot: every Nth pop, prefer the oldest Background
+            // entry if one is behind higher-priority work.
+            let aging_due = state.pop_count != 0 && (state.pop_count % Self::AGING_INTERVAL == 0);
+            if aging_due {
+                if let Some(entry) = take_oldest_background(&mut state.heap) {
+                    state.pop_count = state.pop_count.wrapping_add(1);
+                    return Ok(entry.value);
+                }
+            }
             if let Some(entry) = state.heap.pop() {
+                state.pop_count = state.pop_count.wrapping_add(1);
                 return Ok(entry.value);
             }
             if state.closed {
@@ -141,6 +173,59 @@ impl<T> PriorityReceiver<T> {
             state = self.shared.condvar.wait(state).unwrap();
         }
     }
+}
+
+/// Surface the oldest `Background` entry currently waiting in the
+/// heap, provided at least one higher-priority entry is present. If
+/// there are no `Background` entries, or if the heap is exclusively
+/// `Background`, returns `None` so the normal `pop` path handles it.
+///
+/// `BinaryHeap` has no indexed removal, so this drains and rebuilds
+/// the heap. It is O(N) on the size of the heap, but only runs on
+/// aging pulses (1 in `AGING_INTERVAL` pops) and typical IO-pool
+/// queues hold ≤ 100 entries at peak.
+fn take_oldest_background<T>(heap: &mut BinaryHeap<PriorityEntry<T>>) -> Option<PriorityEntry<T>> {
+    if heap.is_empty() {
+        return None;
+    }
+    let items: Vec<PriorityEntry<T>> = std::mem::take(heap).into_sorted_vec();
+    let has_higher = items
+        .iter()
+        .any(|e| e.priority != PriorityClass::Background);
+    if !has_higher {
+        // Nothing to pre-empt for; put them back and let `pop` run.
+        for e in items {
+            heap.push(e);
+        }
+        return None;
+    }
+    let mut oldest_bg_seq: Option<u64> = None;
+    for e in &items {
+        if e.priority == PriorityClass::Background {
+            oldest_bg_seq = Some(match oldest_bg_seq {
+                None => e.seq,
+                Some(s) => s.min(e.seq),
+            });
+        }
+    }
+    let oldest_bg_seq = match oldest_bg_seq {
+        Some(s) => s,
+        None => {
+            for e in items {
+                heap.push(e);
+            }
+            return None;
+        }
+    };
+    let mut picked = None;
+    for e in items {
+        if picked.is_none() && e.priority == PriorityClass::Background && e.seq == oldest_bg_seq {
+            picked = Some(e);
+        } else {
+            heap.push(e);
+        }
+    }
+    picked
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -259,11 +344,7 @@ impl WorkerPool {
         self.inner.thread_count
     }
 
-    pub fn submit<T, F>(
-        &self,
-        priority: PriorityClass,
-        job: F,
-    ) -> Result<JobHandle<T>, PoolError>
+    pub fn submit<T, F>(&self, priority: PriorityClass, job: F) -> Result<JobHandle<T>, PoolError>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
@@ -390,10 +471,14 @@ impl LazyWorkerPool {
 /// alternative [`std::thread::available_parallelism`] returns the
 /// same answer for our needs (after the OS accounts for the
 /// process cgroup limits Android applies).
-fn default_image_thread_count() -> usize {
-    let cpu_hint = std::thread::available_parallelism()
+fn cpu_hint() -> usize {
+    std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(2);
+        .unwrap_or(2)
+}
+
+fn default_image_thread_count() -> usize {
+    let cpu_hint = cpu_hint();
     // Reserve one core for the host thread and one for the render
     // thread; cap at 4 because two extra concurrent JNI
     // `AttachCurrentThread` calls already saturate the BitmapFactory
@@ -409,11 +494,44 @@ pub struct IoPools {
     archive: Arc<LazyWorkerPool>,
 }
 
+/// Filesystem reads on Android internal storage benefit from light
+/// parallelism: the kernel block layer reorders concurrent positional
+/// reads, and on warm page-cache hits the cost is dominated by
+/// per-call syscall overhead which fans out cleanly across threads.
+/// Cocos shop pages submit 30+ readFiles in a single tick.
+///
+/// Cap raised from 4 → 8 (2026-05) after `[Async] readFile` lines on
+/// shop open consistently sat around 70–130 ms while the in-pool
+/// `[IOTrace] read slow ≥30ms` warning never fired — meaning the
+/// disk read itself was fast and the latency was pool-queue wait.
+/// 30 in-flight requests across 4 threads = ~7 reqs per thread,
+/// even a 5 ms per-read = 35 ms tail; with 8 threads it's 4 reqs ×
+/// 5 ms = 20 ms tail.  Floor stays at 2 for single-core emulators.
+fn default_fs_thread_count() -> usize {
+    cpu_hint().saturating_sub(2).clamp(2, 8)
+}
+
+/// Pack reads decompress zstd chunks (CPU-bound) before returning, and
+/// the dominant menu-switch workload is many small entries fired in
+/// parallel. Fan out so they decompress concurrently. Cap at 4 because
+/// past that we contend with host + render threads on smaller phones.
+fn default_pack_thread_count() -> usize {
+    cpu_hint().saturating_sub(2).clamp(2, 4)
+}
+
 impl IoPools {
     pub fn new(host_id: i32) -> Self {
         Self {
-            fs: Arc::new(LazyWorkerPool::new(host_id, "fs")),
-            pack: Arc::new(LazyWorkerPool::new(host_id, "pack")),
+            fs: Arc::new(LazyWorkerPool::with_threads(
+                host_id,
+                "fs",
+                default_fs_thread_count(),
+            )),
+            pack: Arc::new(LazyWorkerPool::with_threads(
+                host_id,
+                "pack",
+                default_pack_thread_count(),
+            )),
             // Image decode is CPU-bound (JPEG IDCT, PNG inflate) and
             // trivially parallel across distinct input buffers — the
             // pool fans out so a cold-start screen of 20 images
@@ -426,6 +544,9 @@ impl IoPools {
                 "image",
                 default_image_thread_count(),
             )),
+            // Archive (zip extract) is one-shot startup work that we
+            // intentionally serialise so it doesn't compete with
+            // foreground reads for CPU during a hot session.
             archive: Arc::new(LazyWorkerPool::new(host_id, "archive")),
         }
     }
@@ -439,12 +560,7 @@ impl IoPools {
         }
     }
 
-    pub fn run<T, F>(
-        &self,
-        pool: PoolKind,
-        priority: PriorityClass,
-        job: F,
-    ) -> Result<T, PoolError>
+    pub fn run<T, F>(&self, pool: PoolKind, priority: PriorityClass, job: F) -> Result<T, PoolError>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
@@ -498,13 +614,47 @@ mod tests {
     fn priority_channel_delivers_highest_priority_first() {
         let (tx, rx) = priority_channel::<String>();
 
-        tx.send(PriorityClass::Background, "bg".to_string()).unwrap();
-        tx.send(PriorityClass::ForegroundAsync, "fg-async".to_string()).unwrap();
-        tx.send(PriorityClass::ForegroundBlocking, "fg-block".to_string()).unwrap();
+        tx.send(PriorityClass::Background, "bg".to_string())
+            .unwrap();
+        tx.send(PriorityClass::ForegroundAsync, "fg-async".to_string())
+            .unwrap();
+        tx.send(PriorityClass::ForegroundBlocking, "fg-block".to_string())
+            .unwrap();
 
         assert_eq!(rx.recv().unwrap(), "fg-block");
         assert_eq!(rx.recv().unwrap(), "fg-async");
         assert_eq!(rx.recv().unwrap(), "bg");
+    }
+
+    #[test]
+    fn priority_channel_aging_prevents_background_starvation() {
+        use super::PriorityReceiver;
+        let (tx, rx) = priority_channel::<String>();
+        // Enqueue one Background entry, then flood with Foreground
+        // work. Without aging, the Background entry would stay behind
+        // the newly-arriving high-priority work forever.
+        tx.send(PriorityClass::Background, "bg".to_string())
+            .unwrap();
+        // Enough foreground entries to exceed the aging interval.
+        let flood = PriorityReceiver::<String>::AGING_INTERVAL as usize * 2 + 1;
+        for i in 0..flood {
+            tx.send(PriorityClass::ForegroundAsync, format!("fg-{i}"))
+                .unwrap();
+        }
+        let mut seen_bg_at: Option<usize> = None;
+        for i in 0..flood + 1 {
+            let v = rx.recv().unwrap();
+            if v == "bg" {
+                seen_bg_at = Some(i);
+                break;
+            }
+        }
+        let at = seen_bg_at.expect("background entry must be dispatched");
+        assert!(
+            (at as u64) <= PriorityReceiver::<String>::AGING_INTERVAL + 1,
+            "background entry dispatched at {} pops, aging should surface it within AGING_INTERVAL+1",
+            at
+        );
     }
 
     #[test]
@@ -652,9 +802,13 @@ mod tests {
         let pools = IoPools::new(3);
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
-            let _ = pools.run(PoolKind::Pack, PriorityClass::ForegroundBlocking, || -> usize {
-                panic!("pool boom");
-            });
+            let _ = pools.run(
+                PoolKind::Pack,
+                PriorityClass::ForegroundBlocking,
+                || -> usize {
+                    panic!("pool boom");
+                },
+            );
         }))
         .unwrap_err();
 
@@ -665,7 +819,12 @@ mod tests {
         });
 
         assert_eq!(message, Some("pool boom"));
-        assert_eq!(pools.run(PoolKind::Pack, PriorityClass::ForegroundBlocking, || 7usize).unwrap(), 7);
+        assert_eq!(
+            pools
+                .run(PoolKind::Pack, PriorityClass::ForegroundBlocking, || 7usize)
+                .unwrap(),
+            7
+        );
     }
 
     #[test]

@@ -17,6 +17,8 @@ pub trait GameLogService: Send + Sync {
     /// - `value`: log content (any JSON-serializable value)
     /// - `commonInfo`: global info object at the time of reporting
     fn report_log(&self, _log_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("gameLog.log:fail not supported"))
+        Err(ServiceError::not_supported(
+            "gameLog.log:fail not supported",
+        ))
     }
 }

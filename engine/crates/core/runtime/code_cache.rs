@@ -104,7 +104,8 @@ impl DiskCodeCache {
         if fs::write(&path, data).is_ok() {
             let new_size = data.len() as u64;
             let cur = self.current_size.get();
-            self.current_size.set(cur.saturating_sub(old_size) + new_size);
+            self.current_size
+                .set(cur.saturating_sub(old_size) + new_size);
             self.evict_if_needed();
         }
     }

@@ -300,7 +300,13 @@ impl Canvas2DState {
     ///
     /// Returns `None` if any corner is non-finite (NaN / Inf CTM).
     #[inline]
-    pub fn map_axis_aligned_rect(&self, x: f32, y: f32, w: f32, h: f32) -> Option<(f32, f32, f32, f32)> {
+    pub fn map_axis_aligned_rect(
+        &self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    ) -> Option<(f32, f32, f32, f32)> {
         debug_assert!(
             self.ctm_is_axis_aligned(),
             "map_axis_aligned_rect called on non-axis-aligned CTM"
@@ -746,11 +752,24 @@ mod tests {
         // means we never clone its N colour stops.
         let mut state = Canvas2DState::default();
         let stops_vec = vec![
-            GradientStop { offset: 0.0, color: Color::black() },
-            GradientStop { offset: 1.0, color: Color::white() },
+            GradientStop {
+                offset: 0.0,
+                color: Color::black(),
+            },
+            GradientStop {
+                offset: 1.0,
+                color: Color::white(),
+            },
         ];
         state.fill = StyleKind::from_gradient(
-            GradientType::Linear, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, stops_vec,
+            GradientType::Linear,
+            0.0,
+            0.0,
+            0.0,
+            100.0,
+            0.0,
+            0.0,
+            stops_vec,
         );
         // Walk the Arc through a `push` + `pop` and check the refcount
         // observed from the *inside* of the enum never exceeded 2.
@@ -815,10 +834,7 @@ mod tests {
         // 1 live + `depth` snapshots on the stack, all sharing
         // the same Arc.  The original Arc in `state` itself is
         // the +1 at the end — total = 1 + depth.
-        assert_eq!(
-            std::sync::Arc::strong_count(&state.line_dash),
-            depth + 1,
-        );
+        assert_eq!(std::sync::Arc::strong_count(&state.line_dash), depth + 1,);
         assert_eq!(
             std::sync::Arc::strong_count(&state.text.families),
             depth + 1,
@@ -828,7 +844,8 @@ mod tests {
         // exactly that many (LIFO, no orphaning).
         let mut scratch = state.clone();
         // `scratch.clone()` bumped the Arc by 2 more; back it out.
-        drop(scratch.line_dash.clone()); drop(scratch);
+        drop(scratch.line_dash.clone());
+        drop(scratch);
         let scratch = &mut state.clone();
         for _ in 0..(depth / 2) {
             assert!(stack.pop(scratch));

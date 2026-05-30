@@ -28,6 +28,45 @@ public final class NativeBridge {
     public static native String version();
 
     /**
+     * Get the minimum Android API level the native engine was
+     * compiled for.
+     * <p>
+     * Sourced from the build script (see
+     * {@code scripts/build-android-so.sh::ANDROID_API}) so the Java
+     * SDK cannot silently drift from the native ABI floor.  The
+     * value changes only when the Rust engine is rebuilt against a
+     * different NDK preset.
+     *
+     * @return The minimum API level (e.g., 26)
+     */
+    public static native int getMinApiLevel();
+
+    /**
+     * Load an external {@code icudtl.dat} file so SkParagraph can
+     * perform text shaping.  The host should copy the bundled
+     * asset to the app's private cache dir once per install and
+     * pass the resulting absolute path here before creating any
+     * {@code GameSession}.
+     * <p>
+     * When the native engine was built with the embedded ICU
+     * payload (the default), this method returns {@code true}
+     * immediately without touching the file.  When built with the
+     * {@code external_icudtl} Cargo feature, the native side calls
+     * Skia's {@code SkLoadICU(path)} and returns the success code.
+     * <p>
+     * Callers that always ship the embedded path can skip this
+     * method entirely; callers that strip the ICU payload to keep
+     * {@code libmigo.so} small MUST call it before the first text
+     * layout op.
+     *
+     * @param icuDataPath Absolute path to the {@code icudtl.dat}
+     *                    file on device.
+     * @return {@code true} if ICU data is ready (either embedded
+     *         or successfully loaded), {@code false} on failure.
+     */
+    public static native boolean initIcuData(String icuDataPath);
+
+    /**
      * Initialize a new session with the given surface and options.
      *
      * @param surface Android Surface object for rendering
@@ -632,9 +671,11 @@ public final class NativeBridge {
      * shuttling pixel bytes through JNI.
      * <p>
      * Returns 0 if the handle is null or the underlying AHB can't be
-     * obtained (the NDK's {@code AHardwareBuffer_fromHardwareBuffer}
-     * has no documented failure mode, but we defensively clamp any
-     * anomaly to zero so the Rust side knows to fall back).
+     * obtained. On success the native side has already retained one
+     * extra {@code AHardwareBuffer} refcount, so callers may close
+     * the Java {@link android.hardware.HardwareBuffer} wrapper after
+     * this method returns and transfer ownership of that native ref
+     * to Rust.
      */
     public static native long nativeAhbPointerFromHardwareBuffer(
             android.hardware.HardwareBuffer hb);

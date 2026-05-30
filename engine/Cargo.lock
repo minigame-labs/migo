@@ -1046,6 +1046,7 @@ dependencies = [
  "raw-window-handle",
  "shared",
  "skia-safe",
+ "smallvec",
  "tokio",
  "tracing",
 ]
@@ -2623,6 +2624,7 @@ dependencies = [
  "encoding_rs",
  "hex",
  "libc",
+ "lru",
  "md-5",
  "parking_lot",
  "raw-window-handle",

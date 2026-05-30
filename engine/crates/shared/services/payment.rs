@@ -25,7 +25,9 @@ pub trait PaymentService: Send + Sync {
     ///
     /// Result delivered via `onMidasPaymentResult` callback.
     fn request_midas_payment(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("requestMidasPayment:fail not supported"))
+        Err(ServiceError::not_supported(
+            "requestMidasPayment:fail not supported",
+        ))
     }
 
     /// Trigger Midas payment for game items (Mode C, async).
@@ -37,6 +39,8 @@ pub trait PaymentService: Send + Sync {
     ///
     /// Result delivered via `onMidasPaymentGameItemResult` callback.
     fn request_midas_payment_game_item(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("requestMidasPaymentGameItem:fail not supported"))
+        Err(ServiceError::not_supported(
+            "requestMidasPaymentGameItem:fail not supported",
+        ))
     }
 }

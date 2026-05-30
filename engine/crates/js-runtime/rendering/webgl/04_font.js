@@ -2,22 +2,74 @@ const { core } = Deno;
 const { ops } = core;
 
 /**
- * loadFont(path)
+ * loadFont(path, family?)
  *
- * Loads a custom font file and returns the font family name.
- * The returned family name can be used in canvas font strings
- * (e.g., ctx.font = "16px custom-font").
+ * Loads a custom font file and returns the canonical font family name.
+ * When `family` is provided it becomes the preferred CSS family alias.
+ * The runtime also registers compatibility aliases from the font file
+ * stem and the font's internal family name when available.
  *
  * @param {string} path - Path to the font file (relative to game code directory).
+ * @param {string} [family] - Optional CSS family alias to register explicitly.
  * @returns {string} Font family name, or empty string on failure.
  */
-const loadFont = (path) => {
+const loadFont = (path, family) => {
     if (typeof path !== 'string' || path.length === 0) {
         console.error('loadFont: path must be a non-empty string');
         return '';
     }
-    return ops.op_load_font(path);
+    if (family !== undefined && typeof family !== 'string') {
+        console.error('loadFont: family must be a string when provided');
+        return '';
+    }
+    console.info('wx.loadFont called: path=' + path + (family ? ', family=' + family : ''));
+    const name = ops.op_load_font(path, family);
+    console.info('wx.loadFont result: path=' + path + ', family=' + (name || 'null'));
+    // R-10: bump the global font epoch so every per-canvas JS
+    // measureText cache invalidates its stored metrics on the
+    // next access.  Cheap monotonic counter; compared against
+    // `this._measureCacheEpoch` in `CanvasRenderingContext2D.
+    // measureText`.  No cross-thread synchronisation needed:
+    // V8's single-threaded execution model guarantees the JS
+    // measureText caller either sees the new epoch (cache miss
+    // -> refetch) or the old one (cache hit on stale metrics),
+    // and because any measurement depending on the newly-loaded
+    // font has to run after `loadFont` returns to JS, the
+    // happens-before is preserved by the microtask boundary.
+    globalThis.__migoFontEpoch = (globalThis.__migoFontEpoch | 0) + 1;
+    return name;
 };
+
+// wx.loadFont is a first-class WeChat API.  Some game bootstraps assign
+// `globalThis.wx` after the runtime globals are installed; keep this generic
+// alias in sync without knowing anything about the engine/adapter consuming it.
+function _installWxLoadFontAlias() {
+    try {
+        globalThis.loadFont = loadFont;
+        let wxObj = globalThis.wx;
+        function patchWx(v) {
+            if (v && typeof v === 'object') {
+                try { v.loadFont = loadFont; } catch (_) {}
+            }
+        }
+        patchWx(wxObj);
+        console.info('wx.loadFont bridge installed: wx=' + (typeof globalThis.wx) + ', hasWxLoadFont=' + !!(globalThis.wx && globalThis.wx.loadFont));
+        try {
+            Object.defineProperty(globalThis, 'wx', {
+                configurable: true,
+                get() { return wxObj; },
+                set(v) {
+                    wxObj = v;
+                    patchWx(wxObj);
+                },
+            });
+        } catch (_) {
+            patchWx(globalThis.wx);
+        }
+    } catch (_) {}
+}
+
+_installWxLoadFontAlias();
 
 /**
  * getTextLineHeight(object)

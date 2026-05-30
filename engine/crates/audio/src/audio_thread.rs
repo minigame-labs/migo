@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use shared::protocol::audio_cmd::{
     InnerAudioId, InnerAudioInfo, InnerAudioState,
 };
 use shared::protocol::host_cmd::HostCommand;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{error, info, warn};
 
 /// Best-effort thread join with a timeout.  Falls back to detaching the

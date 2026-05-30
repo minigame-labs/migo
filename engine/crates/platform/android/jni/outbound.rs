@@ -85,7 +85,9 @@ fn call_void_impl(env: &mut JNIEnv, method_name: &str, args: &[jvalue]) -> Resul
     let cache = JAVA_METHOD_CACHE
         .get()
         .ok_or("NativeExports class cache not initialized")?;
-    let method_id = cache.get_method_id(method_name).ok_or("Method ID not found")?;
+    let method_id = cache
+        .get_method_id(method_name)
+        .ok_or("Method ID not found")?;
     let class = cache.class();
 
     let start = std::time::Instant::now();
@@ -297,7 +299,12 @@ fn call_void_with_string(method_name: &str, host_id: i32, json: &str) -> Result<
             .new_string(json)
             .map_err(|e| format!("Failed to create Java string: {e}"))?;
         // Keep jstr alive until after the call so the local ref remains valid.
-        let args = [jvalue { i: host_id }, jvalue { l: jstr.as_raw() as *mut _ }];
+        let args = [
+            jvalue { i: host_id },
+            jvalue {
+                l: jstr.as_raw() as *mut _,
+            },
+        ];
         call_void_impl(env, method_name, &args)
     })
 }
@@ -307,7 +314,11 @@ fn call_void_with_string(method_name: &str, host_id: i32, json: &str) -> Result<
 /// the second argument is just an integer.
 fn call_void_with_int(method_name: &str, host_id: i32, value: i32) -> Result<(), String> {
     with_env(|env| {
-        call_void_impl(env, method_name, &[jvalue { i: host_id }, jvalue { i: value }])
+        call_void_impl(
+            env,
+            method_name,
+            &[jvalue { i: host_id }, jvalue { i: value }],
+        )
     })
 }
 
@@ -962,18 +973,33 @@ pub fn bluetooth_get_adapter_state(host_id: i32) -> Result<String, String> {
     call_bluetooth_json_no_args("bluetoothGetAdapterState", host_id)
 }
 
-jni_void_json!(bluetooth_start_devices_discovery, "bluetoothStartDevicesDiscovery");
-jni_void!(bluetooth_stop_devices_discovery, "bluetoothStopDevicesDiscovery");
+jni_void_json!(
+    bluetooth_start_devices_discovery,
+    "bluetoothStartDevicesDiscovery"
+);
+jni_void!(
+    bluetooth_stop_devices_discovery,
+    "bluetoothStopDevicesDiscovery"
+);
 
 pub fn bluetooth_get_devices(host_id: i32) -> Result<String, String> {
     call_bluetooth_json_no_args("bluetoothGetDevices", host_id)
 }
 
-jni_json!(bluetooth_get_connected_devices, "bluetoothGetConnectedDevices");
+jni_json!(
+    bluetooth_get_connected_devices,
+    "bluetoothGetConnectedDevices"
+);
 jni_void_json!(bluetooth_make_pair, "bluetoothMakePair");
 jni_void_json!(bluetooth_is_device_paired, "bluetoothIsDevicePaired");
-jni_void_json!(bluetooth_start_beacon_discovery, "bluetoothStartBeaconDiscovery");
-jni_void!(bluetooth_stop_beacon_discovery, "bluetoothStopBeaconDiscovery");
+jni_void_json!(
+    bluetooth_start_beacon_discovery,
+    "bluetoothStartBeaconDiscovery"
+);
+jni_void!(
+    bluetooth_stop_beacon_discovery,
+    "bluetoothStopBeaconDiscovery"
+);
 
 pub fn bluetooth_get_beacons(host_id: i32) -> Result<String, String> {
     call_bluetooth_json_no_args("bluetoothGetBeacons", host_id)
@@ -984,10 +1010,19 @@ pub fn bluetooth_get_beacons(host_id: i32) -> Result<String, String> {
 jni_void_json!(ble_create_connection, "bleCreateConnection");
 jni_void_json!(ble_close_connection, "bleCloseConnection");
 jni_json!(ble_get_device_services, "bleGetDeviceServices");
-jni_json!(ble_get_device_characteristics, "bleGetDeviceCharacteristics");
+jni_json!(
+    ble_get_device_characteristics,
+    "bleGetDeviceCharacteristics"
+);
 jni_void_json!(ble_read_characteristic_value, "bleReadCharacteristicValue");
-jni_void_json!(ble_write_characteristic_value, "bleWriteCharacteristicValue");
-jni_void_json!(ble_notify_characteristic_value_change, "bleNotifyCharacteristicValueChange");
+jni_void_json!(
+    ble_write_characteristic_value,
+    "bleWriteCharacteristicValue"
+);
+jni_void_json!(
+    ble_notify_characteristic_value_change,
+    "bleNotifyCharacteristicValueChange"
+);
 jni_json!(ble_get_device_rssi, "bleGetDeviceRSSI");
 jni_void_json!(ble_set_mtu, "bleSetMTU");
 jni_json!(ble_get_mtu, "bleGetMTU");
@@ -1216,9 +1251,10 @@ pub fn decode_image_rgba_jni(data: &[u8]) -> Result<NormalizedImage, EngineError
 /// A zero pointer means "decode failed or AHB path unavailable; caller
 /// must fall back to [`decode_image_rgba_jni`]".
 ///
-/// On success the returned [`AhbImage`] owns **one strong refcount**
-/// on the AHB; Java has already done its own `_acquire` so the
-/// pointer is safe to use until the returned [`OwnedAhb`] drops.
+/// On success the returned [`AhbImage`] adopts **one strong refcount**
+/// on the AHB. The Java bridge acquires that native ref before it
+/// closes its `HardwareBuffer` wrapper, so Rust must adopt the raw
+/// pointer without another acquire.
 pub fn decode_image_ahb_jni(
     data: &[u8],
 ) -> Result<shared::protocol::io_cmd::AhbImage, EngineError> {
@@ -1270,8 +1306,7 @@ pub fn decode_image_ahb_jni(
                     ));
                 }
                 let ahb_ptr = i64::from_le_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7],
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]);
                 let width = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
                 let height = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
@@ -1283,7 +1318,7 @@ pub fn decode_image_ahb_jni(
                 // Adopt the Java-bumped refcount. Descriptor width
                 // and height come straight from the decoder.
                 let desc = AhbDesc::rgba_sampled(width, height);
-                let ahb = OwnedAhb::from_raw_acquire(ahb_ptr as *mut std::ffi::c_void, desc)
+                let ahb = OwnedAhb::from_raw_owned(ahb_ptr as *mut std::ffi::c_void, desc)
                     .map_err(|e| format!("AHB adopt: {e}"))?;
                 Ok(AhbImage::new(width, height, ahb))
             }
@@ -1308,13 +1343,19 @@ jni_void_json!(share_app_message, "shareAppMessage");
 // ==================== Navigate ====================
 
 jni_void_json!(navigate_to_mini_program, "navigateToMiniProgram");
-jni_void_json!(open_customer_service_conversation, "openCustomerServiceConversation");
+jni_void_json!(
+    open_customer_service_conversation,
+    "openCustomerServiceConversation"
+);
 
 // ==================== Payment ====================
 
 jni_json!(check_is_support_midas_payment, "checkIsSupportMidasPayment");
 jni_void_json!(request_midas_payment, "requestMidasPayment");
-jni_void_json!(request_midas_payment_game_item, "requestMidasPaymentGameItem");
+jni_void_json!(
+    request_midas_payment_game_item,
+    "requestMidasPaymentGameItem"
+);
 
 // ==================== Video ====================
 
@@ -1333,11 +1374,19 @@ pub fn video_stop(host_id: i32, video_id: u32) -> Result<(), String> {
 }
 
 pub fn video_seek(host_id: i32, video_id: u32, position: f64) -> Result<(), String> {
-    call_void_with_string("videoSeek", host_id, &format!("{{\"videoId\":{},\"position\":{}}}", video_id, position))
+    call_void_with_string(
+        "videoSeek",
+        host_id,
+        &format!("{{\"videoId\":{},\"position\":{}}}", video_id, position),
+    )
 }
 
 pub fn video_request_fullscreen(host_id: i32, video_id: u32, direction: i32) -> Result<(), String> {
-    call_void_with_string("videoRequestFullscreen", host_id, &format!("{{\"videoId\":{},\"direction\":{}}}", video_id, direction))
+    call_void_with_string(
+        "videoRequestFullscreen",
+        host_id,
+        &format!("{{\"videoId\":{},\"direction\":{}}}", video_id, direction),
+    )
 }
 
 pub fn video_exit_fullscreen(host_id: i32, video_id: u32) -> Result<(), String> {
@@ -1345,7 +1394,14 @@ pub fn video_exit_fullscreen(host_id: i32, video_id: u32) -> Result<(), String> 
 }
 
 pub fn video_set_property(host_id: i32, video_id: u32, property_json: &str) -> Result<(), String> {
-    call_void_with_string("videoSetProperty", host_id, &format!("{{\"videoId\":{},\"properties\":{}}}", video_id, property_json))
+    call_void_with_string(
+        "videoSetProperty",
+        host_id,
+        &format!(
+            "{{\"videoId\":{},\"properties\":{}}}",
+            video_id, property_json
+        ),
+    )
 }
 
 pub fn video_destroy(host_id: i32, video_id: u32) -> Result<(), String> {

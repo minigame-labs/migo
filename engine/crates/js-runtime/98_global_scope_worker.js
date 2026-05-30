@@ -13,7 +13,6 @@ import "ext:host_v8_base/02_async.js";
 import "ext:host_v8_url/03_url.js";
 
 // web
-import "ext:host_v8_web/12_location.js";
 import "ext:host_v8_web/12_performance.js";
 import "ext:host_v8_web/03_canvas.js";
 

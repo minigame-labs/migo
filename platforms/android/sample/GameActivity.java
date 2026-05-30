@@ -61,7 +61,8 @@ public class GameActivity extends Activity {
                     // Surface recreated (e.g., returning from background).
                     // Re-attach the new surface so the render thread can recreate
                     // its EGL onscreen context.
-                    session.updateSurface(holder.getSurface());
+                    session.updateSurface(holder.getSurface(), holder.getSurfaceFrame().width(),
+                            holder.getSurfaceFrame().height());
                     Log.d(TAG, "Surface recreated, updated session surface");
                 } else {
                     // First-time initialization.
@@ -72,7 +73,7 @@ public class GameActivity extends Activity {
             @Override
             public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
                 if (session != null && session.isValid()) {
-                    session.updateSurface(holder.getSurface());
+                    session.updateSurface(holder.getSurface(), width, height);
                     Log.d(TAG, "Surface changed: " + width + "x" + height);
                 }
             }
@@ -84,6 +85,9 @@ public class GameActivity extends Activity {
                 // to background (onStop). The session is paused via onPause()
                 // and will be resumed when surfaceCreated is called again.
                 // Full cleanup happens in onDestroy().
+                if (session != null && session.isValid()) {
+                    session.onSurfaceDestroyed();
+                }
                 Log.d(TAG, "Surface destroyed (session kept alive)");
             }
         });

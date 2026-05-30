@@ -154,8 +154,7 @@ impl IoScheduler {
                 // IO scheduler's measurement because it includes
                 // both pool queue wait + the job itself, which is
                 // the latency the JS caller actually sees.
-                shared::stats::io_metrics_global()
-                    .record_if_slow(wait_micros / 1000);
+                shared::stats::io_metrics_global().record_if_slow(wait_micros / 1000);
                 match result {
                     Ok(Ok(value)) => Ok(value),
                     Ok(Err(err)) => {
@@ -283,7 +282,18 @@ fn classify_read(
     policy: &CheapPolicy,
 ) -> RouteDecision {
     match backend {
-        BackendKind::Pack => RouteDecision::Delegated(PoolKind::Pack),
+        // Small foreground pack reads (icons, JSON, atlas descriptors)
+        // run inline: the bytes are usually already in the OS page
+        // cache and a hot inflate cache hit returns instantly, so a
+        // pool hop just adds a thread handoff to a sub-millisecond
+        // operation. Everything else still fans out to the pack pool.
+        BackendKind::Pack => {
+            if is_foreground(priority) && estimated_bytes <= inline_read_bytes(spec, policy) {
+                RouteDecision::Inline
+            } else {
+                RouteDecision::Delegated(PoolKind::Pack)
+            }
+        }
         BackendKind::Archive => RouteDecision::Delegated(PoolKind::Archive),
         BackendKind::Filesystem => {
             if is_foreground(priority) && estimated_bytes <= inline_read_bytes(spec, policy) {
@@ -297,6 +307,9 @@ fn classify_read(
 
 fn classify_metadata(backend: BackendKind, priority: PriorityClass) -> RouteDecision {
     match backend {
+        // Pack metadata is an in-memory hashmap lookup; a pool hop is
+        // pure overhead. Inline foreground requests.
+        BackendKind::Pack if is_foreground(priority) => RouteDecision::Inline,
         BackendKind::Pack => RouteDecision::Delegated(PoolKind::Pack),
         BackendKind::Archive => RouteDecision::Delegated(PoolKind::Archive),
         BackendKind::Filesystem if is_foreground(priority) => RouteDecision::Inline,
@@ -353,12 +366,14 @@ mod tests {
     #[test]
     fn delegated_sync_pack_reads_use_pack_pool() {
         let scheduler = IoScheduler::new(7);
+        // Foreground reads under the inline threshold short-circuit, so
+        // size the request comfortably above it to verify delegation.
         let req = IoRequest::ReadFile {
             backend: BackendKind::Pack,
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
             spec: ReadSpec::Whole,
-            estimated_bytes: 4096,
+            estimated_bytes: 256 * 1024,
         };
 
         let thread_name = scheduler
@@ -384,7 +399,7 @@ mod tests {
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
             spec: ReadSpec::Whole,
-            estimated_bytes: 64,
+            estimated_bytes: 256 * 1024,
         };
 
         let _ = scheduler.run_sync(&req, || 1usize).unwrap();
@@ -410,7 +425,7 @@ mod tests {
             request: RequestKind::Sync,
             priority: PriorityClass::ForegroundBlocking,
             spec: ReadSpec::Whole,
-            estimated_bytes: 4096,
+            estimated_bytes: 256 * 1024,
         };
 
         scheduler.run_sync(&inline_req, || 1usize).unwrap();
@@ -423,13 +438,15 @@ mod tests {
 
     #[test]
     fn queued_delegated_work_rechecks_domain_closure_before_running() {
+        // Archive pool is intentionally single-threaded so the queueing
+        // semantics this test exercises (second job blocked behind the
+        // first, then sees Closed when the scheduler is shut down) are
+        // observable without timing-dependent assertions.
         let scheduler = Arc::new(IoScheduler::new(19));
-        let req = IoRequest::ReadFile {
-            backend: BackendKind::Pack,
-            request: RequestKind::Sync,
-            priority: PriorityClass::ForegroundBlocking,
-            spec: ReadSpec::Whole,
-            estimated_bytes: 4096,
+        let req = IoRequest::Unzip {
+            backend: BackendKind::Filesystem,
+            priority: PriorityClass::ForegroundAsync,
+            compressed_bytes: 64 * 1024,
         };
 
         let hook_calls = Arc::new(AtomicUsize::new(0));
@@ -632,7 +649,7 @@ mod tests {
             request: RequestKind::Async,
             priority: PriorityClass::ForegroundAsync,
             spec: ReadSpec::Whole,
-            estimated_bytes: 64,
+            estimated_bytes: 256 * 1024,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -664,7 +681,7 @@ mod tests {
             request: RequestKind::Async,
             priority: PriorityClass::ForegroundAsync,
             spec: ReadSpec::Whole,
-            estimated_bytes: 64,
+            estimated_bytes: 256 * 1024,
         };
 
         // Build a multi-thread runtime with exactly 1 blocking thread.

@@ -7,7 +7,9 @@ pub enum FrameOp {
     GlBatch(GlBatchPayload),
     /// Flush/materialize pending Canvas2D work for the given canvas
     /// so subsequent GL ops can observe it in the framebuffer.
-    Materialize { canvas_id: u32 },
+    Materialize {
+        canvas_id: u32,
+    },
     Present,
 }
 
@@ -108,6 +110,31 @@ impl FramePacket {
     pub fn set_frame_metadata(&mut self, frame_id: u64, raf_time_ms: f64) {
         self.frame_id = frame_id;
         self.raf_time_ms = raf_time_ms;
+    }
+
+    /// Walk every Canvas2D draw-image command in the packet and
+    /// feed its referenced image id into `sink` (F-1).  Used by
+    /// the render thread to pin `ImageStore` entries while the
+    /// packet is queued — a concurrent `DestroyImage` on one of
+    /// those ids then defers the actual `glDeleteTextures` call
+    /// to the post-frame Present barrier instead of freeing the
+    /// GL texture underneath Skia's still-pending draw.
+    ///
+    /// Pass-through rather than `Vec<u32>` so callers can
+    /// allocate their collection shape once (typically a
+    /// `SmallVec<[u32; 16]>` on the render thread) without this
+    /// helper forcing a `Vec` allocation first.
+    pub fn for_each_referenced_image<F: FnMut(crate::protocol::render_cmd::ImageId)>(
+        &self,
+        mut sink: F,
+    ) {
+        for op in &self.ops {
+            if let FrameOp::CanvasBatch(payload) = op {
+                for cmd in &payload.commands {
+                    cmd.for_each_referenced_image(&mut sink);
+                }
+            }
+        }
     }
 }
 
@@ -230,13 +257,21 @@ mod tests {
     fn for_gl_batch_builds_packet_with_begin_frame_and_gl_ops() {
         use crate::protocol::render_cmd::GLCmd;
 
-        let packet = FramePacket::for_gl_batch(0, 0.0, vec![
-            GLCmd::Clear { canvas_id: 1, bit_field: 0x4000 },
-        ]);
+        let packet = FramePacket::for_gl_batch(
+            0,
+            0.0,
+            vec![GLCmd::Clear {
+                canvas_id: 1,
+                bit_field: 0x4000,
+            }],
+        );
 
         assert_eq!(packet.ops().len(), 2);
         assert!(matches!(packet.ops()[0], FrameOp::BeginFrame));
-        assert!(matches!(packet.ops()[1], FrameOp::GlBatch(GlBatchPayload { .. })));
+        assert!(matches!(
+            packet.ops()[1],
+            FrameOp::GlBatch(GlBatchPayload { .. })
+        ));
         // No FrameOp::Present — dirty is driven by execute_gl_batch return value.
         assert!(!matches!(packet.ops().last(), Some(FrameOp::Present)));
     }

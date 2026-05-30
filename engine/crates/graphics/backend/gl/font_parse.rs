@@ -57,6 +57,18 @@ impl ParsedFont {
 /// Parse a CSS `font` shorthand.  Returns `None` if the input is
 /// syntactically invalid (no parseable size).  Callers should keep the
 /// previous `font` on `None` to mirror browser behaviour.
+///
+/// G-2 note: a second CSS-font parser lives in
+/// [`shared::css_font::parse_css_font`] for the JS-thread
+/// `measureText` fast path (F-2).  The two parsers are kept in
+/// sync via [`tests::shared_and_render_agree_on_canonical_inputs`]
+/// which pins the matrix of inputs where the two must produce
+/// equivalent outputs.  We kept two implementations rather than
+/// one because `shared` cannot depend on `graphics` (where the
+/// `Option`-semantics wrapper naturally lives) and this module's
+/// parser carries a larger state machine (multi-family list, size
+/// validation) that would inflate the `shared` crate beyond its
+/// no-GL remit.
 pub fn parse_font_shorthand(input: &str) -> Option<ParsedFont> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -134,9 +146,9 @@ pub fn parse_font_shorthand(input: &str) -> Option<ParsedFont> {
             // CSS font-stretch / font-variant keywords we tolerate but
             // don't map to Skia state.
             "ultra-condensed" | "extra-condensed" | "condensed" | "semi-condensed"
-            | "semi-expanded" | "expanded" | "extra-expanded" | "ultra-expanded"
-            | "small-caps" | "all-small-caps" | "petite-caps" | "all-petite-caps"
-            | "unicase" | "titling-caps" => {}
+            | "semi-expanded" | "expanded" | "extra-expanded" | "ultra-expanded" | "small-caps"
+            | "all-small-caps" | "petite-caps" | "all-petite-caps" | "unicase" | "titling-caps" => {
+            }
             _ => {
                 // Unknown keyword — ignore rather than abort so new
                 // CSS additions don't silently break `ctx.font`.
@@ -449,8 +461,7 @@ mod tests {
 
     #[test]
     fn family_list_unquotes_single_and_double_quotes() {
-        let f =
-            parse_font_shorthand("12px 'Helvetica Neue', \"Noto Sans\", sans-serif").unwrap();
+        let f = parse_font_shorthand("12px 'Helvetica Neue', \"Noto Sans\", sans-serif").unwrap();
         assert_eq!(
             f.families,
             fam(&["Helvetica Neue", "Noto Sans", "sans-serif"])
@@ -463,5 +474,58 @@ mod tests {
         // lowercase them.
         let f = parse_font_shorthand("12px \"PingFang SC\"").unwrap();
         assert_eq!(f.families, fam(&["PingFang SC"]));
+    }
+
+    /// G-2: the render side (`font_parse::parse_font_shorthand`)
+    /// and the JS-thread fast path (`shared::css_font::
+    /// parse_css_font`) must agree on the matrix of real-world
+    /// CSS font shorthands users write in canvas games.  A mismatch
+    /// would show up as a "measureText width differs from paint
+    /// width for the exact same `ctx.font`" UX regression.  This
+    /// test pins the equivalence via canonical inputs.
+    #[test]
+    fn shared_and_render_agree_on_canonical_inputs() {
+        const CASES: &[&str] = &[
+            "10px sans-serif",
+            "16px Arial",
+            "italic 700 24px 'Noto Sans CJK SC'",
+            "bold 14px Helvetica",
+            "14px \"Noto Sans\", Arial, sans-serif",
+            "12pt serif",
+            "1.5em monospace",
+            "16px/1.5 Arial",
+            "oblique 20px serif",
+            "300 18px Roboto",
+            "small-caps 18px serif",
+        ];
+        for input in CASES {
+            let render = match parse_font_shorthand(input) {
+                Some(p) => p,
+                None => panic!("render parser rejected canonical input: {input:?}"),
+            };
+            let shared_out = shared::css_font::parse_css_font(input);
+            assert!(
+                (render.size_px - shared_out.size).abs() < 0.05,
+                "size disagreement on {input:?}: render={} shared={}",
+                render.size_px,
+                shared_out.size,
+            );
+            assert_eq!(
+                render.weight, shared_out.weight,
+                "weight disagreement on {input:?}",
+            );
+            assert_eq!(
+                render.italic, shared_out.italic,
+                "italic disagreement on {input:?}",
+            );
+            // Shared parser only surfaces the head family; render
+            // parser retains the full list.  Agreement here is
+            // head-only.
+            assert_eq!(
+                render.families.first().map(|s| s.as_str()),
+                Some(shared_out.family.as_str()),
+                "family-head disagreement on {input:?}",
+            );
+        }
     }
 }

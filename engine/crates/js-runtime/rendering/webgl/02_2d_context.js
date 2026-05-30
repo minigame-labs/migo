@@ -8,7 +8,16 @@
 import {
     op_create_context_2d,
     op_measure_text,
+    op_measure_text_flat,
     op_get_image_data,
+    op_capture_canvas2d_snapshot,
+    op_capture_canvas2d_snapshot_for_cache,
+    op_force_readback_snapshot,
+    // Text texture cache
+    op_text_cache_peek_pin,
+    op_text_cache_unpin,
+    op_tex_image_2d_from_text_cache,
+    op_tex_image_2d_from_snapshot,
     // Frame lifecycle
     op_frame_begin,
     op_frame_end,
@@ -279,6 +288,17 @@ function _parseColorToRGBA(color) {
     return [0, 0, 0, 255];
 }
 
+// G-2: CSS `font` parsing used to live here as `_parseCssFont`
+// and in Rust as a separate implementation.  Both parsers could
+// subtly drift (different weight ladders, different unit
+// conversions), producing silent "measureText disagrees with
+// fillText" bugs.  The JS-side parser has been removed; the
+// authoritative implementation is now
+// `shared::css_font::parse_css_font` on the Rust side.  The JS
+// layer only needs to pass the raw `this._font` string through
+// to `op_measure_text_flat`, which parses it once through the
+// `SharedTextMeasurer::measure_css` trait.
+
 class CanvasRenderingContext2D {
     constructor(canvas) {
         this._canvas = canvas;
@@ -308,9 +328,145 @@ class CanvasRenderingContext2D {
 
         // Frame tracking
         this._frameStarted = false;
+
+        // Text texture cache state machine:
+        //   0 = none, 1 = pending record (cache miss; op_fill_text was
+        //       issued, the matching getImageData tags the snapshot),
+        //   2 = pending hit (op_fill_text suppressed; the matching
+        //       getImageData returns a cache-marked ImageData).
+        // `_tcKey` holds the args tuple from `_buildTextCacheArgs`
+        // plus `_x/_y/_mw` of the suppressed fillText for the
+        // abandon/recover path.
+        this._tcState = 0;
+        this._tcKey = null;
     }
 
     get canvas() { return this._canvas; }
+
+    // ==================== Text texture cache ====================
+
+    // Build the cache-key argument tuple for the current 2D state, or
+    // return null when the state is outside the cacheable whitelist
+    // (anything that moves / recolours / blends the glyph run beyond
+    // the keyed fields).  Font identity is carried entirely by the
+    // raw `font` string -- JS deliberately does not re-parse CSS font
+    // (see the G-2 note above), so size/weight/italic stay 0/false in
+    // the key; the render-thread resolves the string authoritatively
+    // and identical strings always render identically within a
+    // process generation.
+    _buildTextCacheArgs(text) {
+        const tm = this._tm;
+        if (tm[0] !== 1 || tm[1] !== 0 || tm[2] !== 0
+                || tm[3] !== 1 || tm[4] !== 0 || tm[5] !== 0) {
+            return null;
+        }
+        if ((this._shadowBlur || 0) !== 0) return null;
+        if ((this._shadowOffsetX || 0) !== 0) return null;
+        if ((this._shadowOffsetY || 0) !== 0) return null;
+        const ga = this._globalAlpha == null ? 1 : this._globalAlpha;
+        if (ga !== 1) return null;
+        const comp = this._compositeOp || 'source-over';
+        if (comp !== 'source-over') return null;
+        const cw = this._canvas.width | 0;
+        const ch = this._canvas.height | 0;
+        if (cw <= 0 || ch <= 0) return null;
+        const rgba = _parseColorToRGBA(this._fillStyle);
+        const color = (((rgba[0] & 255) << 24)
+            | ((rgba[1] & 255) << 16)
+            | ((rgba[2] & 255) << 8)
+            | (rgba[3] & 255)) >>> 0;
+        return {
+            text: String(text),
+            fontRequest: this._font,
+            fontSize: 0,
+            fontWeight: 0,
+            italic: false,
+            fillColor: color,
+            textAlign: TEXT_ALIGN_MAP[this._textAlign] ?? 0,
+            textBaseline: TEXT_BASELINE_MAP[this._textBaseline] ?? 3,
+            canvasW: cw,
+            canvasH: ch,
+        };
+    }
+
+    // Drop any pending cache state.  For a suppressed hit (state 2)
+    // this restores correctness: unpin the cache entry and actually
+    // render the text we previously skipped, so the canvas is not
+    // silently blank.  For a pending record (state 1) op_fill_text
+    // was already issued; nothing to undo, just forget the key so the
+    // next getImageData doesn't tag a snapshot that no longer matches
+    // the canvas content.
+    _abandonPendingTextCache() {
+        if (this._tcState === 0) return;
+        const k = this._tcKey;
+        if (this._tcState === 2 && k) {
+            op_text_cache_unpin(
+                k.text, k.fontRequest, k.fontSize, k.fontWeight,
+                k.italic, k.fillColor, k.textAlign, k.textBaseline,
+                k.canvasW, k.canvasH,
+            );
+            this._frameBegin();
+            op_fill_text(
+                this._canvasId,
+                k.text,
+                k._x || 0,
+                k._y || 0,
+                k._mw == null ? Infinity : k._mw,
+            );
+        }
+        this._tcState = 0;
+        this._tcKey = null;
+    }
+
+    // Called by WebGL `texImage2D(target, ..., canvasElement)` when the
+    // source canvas's 2D context has pending text-cache state.  This is
+    // cocos's actual upload path (NOT getImageData), so the
+    // hit/record decision has to happen here.  Returns true when it
+    // fully issued the upload (caller skips the normal direct path).
+    //
+    //   HIT  (suppressed fillText): copy the cached texture straight
+    //         into the bound WebGL dest; the 2D canvas was never
+    //         painted.  Render thread unpins.
+    //   MISS (fillText was let through): snapshot the just-painted 2D
+    //         canvas tagged for cache record, then upload that
+    //         snapshot into the WebGL dest.  Frame-end drain transfers
+    //         the snapshot texture into the cache so the next identical
+    //         fillText hits.
+    _consumeTextCacheForTexImage(glCanvasId, target, level, internalformat) {
+        if (this._tcState === 0 || this._tcKey === null) return false;
+        const k = this._tcKey;
+        const isHit = this._tcState === 2;
+        this._tcState = 0;
+        this._tcKey = null;
+        if (isHit) {
+            op_tex_image_2d_from_text_cache(
+                glCanvasId, target, level, internalformat,
+                k.text, k.fontRequest, k.fontSize, k.fontWeight,
+                k.italic, k.fillColor, k.textAlign, k.textBaseline,
+                k.canvasW, k.canvasH,
+            );
+            return true;
+        }
+        if (_migoSnapshotFrameCount >= MAX_LIVE_CANVAS2D_SNAPSHOTS_JS) {
+            // Snapshot budget exhausted this frame: can't record.
+            // Fall back to the normal direct path (text already
+            // painted, so the canvas is correct).
+            return false;
+        }
+        const snapId = _migoNextSnapshotId();
+        _migoSnapshotFrameCount++;
+        op_capture_canvas2d_snapshot_for_cache(
+            this._canvasId, 0, 0, k.canvasW, k.canvasH, snapId,
+            k.text, k.fontRequest, k.fontSize, k.fontWeight,
+            k.italic, k.fillColor, k.textAlign, k.textBaseline,
+            k.canvasW, k.canvasH,
+        );
+        op_tex_image_2d_from_snapshot(
+            glCanvasId, target, level, internalformat,
+            0, 0, snapId,
+        );
+        return true;
+    }
 
     // ==================== Frame Lifecycle ====================
 
@@ -322,6 +478,10 @@ class CanvasRenderingContext2D {
     }
 
     _frameEnd() {
+        // A pending suppressed-hit that never reached its consuming
+        // getImageData by frame end must be committed so the text
+        // isn't silently dropped.
+        this._abandonPendingTextCache();
         if (this._frameStarted) {
             op_frame_end(this._canvasId);
             this._frameStarted = false;
@@ -374,10 +534,12 @@ class CanvasRenderingContext2D {
     // ==================== Drawing Methods ====================
 
     fill(pathOrFillRule) {
+        this._abandonPendingTextCache();
         op_fill(this._canvasId);
     }
 
     stroke(path) {
+        this._abandonPendingTextCache();
         op_stroke(this._canvasId);
     }
 
@@ -388,16 +550,19 @@ class CanvasRenderingContext2D {
     // ==================== Rectangle Methods ====================
 
     fillRect(x, y, width, height) {
+        this._abandonPendingTextCache();
         this._frameBegin();
         op_fill_rect(this._canvasId, x, y, width, height);
     }
 
     strokeRect(x, y, width, height) {
+        this._abandonPendingTextCache();
         this._frameBegin();
         op_stroke_rect(this._canvasId, x, y, width, height);
     }
 
     clearRect(x, y, width, height) {
+        this._abandonPendingTextCache();
         this._frameBegin();
         op_clear_rect(this._canvasId, x, y, width, height);
     }
@@ -405,17 +570,109 @@ class CanvasRenderingContext2D {
     // ==================== Text Methods ====================
 
     fillText(text, x, y, maxWidth = Infinity) {
+        // A second fillText before the prior pending entry was
+        // consumed means the cocos single-label pattern doesn't
+        // hold; abandon (and commit) the prior one first.
+        this._abandonPendingTextCache();
+
+        const args = this._buildTextCacheArgs(text);
+        if (args !== null) {
+            const hit = op_text_cache_peek_pin(
+                args.text, args.fontRequest, args.fontSize, args.fontWeight,
+                args.italic, args.fillColor, args.textAlign, args.textBaseline,
+                args.canvasW, args.canvasH,
+            );
+            args._x = x;
+            args._y = y;
+            args._mw = maxWidth;
+            if (hit === 1) {
+                // HIT: suppress the Skia paint entirely.  The matching
+                // full-canvas getImageData returns a cache-marked
+                // ImageData; texImage2D copies the cached texture.
+                this._tcState = 2;
+                this._tcKey = args;
+                return;
+            }
+            // MISS: render normally + remember the key so the
+            // matching getImageData tags the snapshot for record.
+            this._tcState = 1;
+            this._tcKey = args;
+        }
         this._frameBegin();
         op_fill_text(this._canvasId, String(text), x, y, maxWidth);
     }
 
     strokeText(text, x, y, maxWidth = Infinity) {
+        this._abandonPendingTextCache();
         this._frameBegin();
         op_stroke_text(this._canvasId, String(text), x, y, maxWidth);
     }
 
     measureText(text) {
-        return op_measure_text(this._canvasId, String(text));
+        const s = String(text);
+        // R-10 + F-2: JS-side measure cache in front of the
+        // native op.  Cross-thread RPC into the render thread
+        // costs 30-50 us round-trip even on the cache-hit
+        // path; `op_measure_text_flat` (R-7 / F-2) drops that
+        // to ~5-10 us when the shared measurer is installed,
+        // and ~10 us otherwise.  Most UI code calls
+        // `measureText` with a repeating set of strings per
+        // frame (labels, digit sprites, button captions) --
+        // caching locally turns the hot case into a `Map.get`,
+        // ~100 ns.
+        //
+        // Cache key: `${font}\x1f${text}`.  `\x1f` is an ASCII
+        // unit-separator that cannot appear in a valid CSS font
+        // shorthand or in any canvas-drawable text snippet we
+        // care about, so no key collisions.  Epoch-invalidated
+        // against the global `__migoFontEpoch` set by
+        // `op_load_font`; see `registerFontFamily` in the bundled
+        // loader.
+        const epoch = (globalThis.__migoFontEpoch | 0);
+        if (this._measureCacheEpoch !== epoch) {
+            this._measureCacheEpoch = epoch;
+            this._measureCache = new Map();
+        }
+        const key = this._font + '\x1f' + s;
+        const hit = this._measureCache.get(key);
+        if (hit !== undefined) return hit;
+        // R-7: prefer the flat-buffer op so we skip serde_v8's
+        // 12-field V8 object construction on the hot measure
+        // path.  Layout is fixed little-endian f32 at the offsets
+        // documented on `op_measure_text_flat`; the Float32Array
+        // view is zero-copy.  Keep the old serde op as fallback
+        // for older snapshots -- the engine exposes both.
+        //
+        // G-2: pass the raw CSS font string; Rust-side
+        // `SharedTextMeasurer::measure_css` parses it through the
+        // shared `css_font::parse_css_font` implementation, which
+        // is also what the render-thread `SetFont` handler uses
+        // so the two sides can't disagree.
+        const buf = op_measure_text_flat(this._canvasId, s, this._font);
+        const f = new Float32Array(buf.buffer, buf.byteOffset, 12);
+        const metrics = {
+            width: f[0],
+            actualBoundingBoxLeft: f[1],
+            actualBoundingBoxRight: f[2],
+            emHeightAscent: f[3],
+            emHeightDescent: f[4],
+            alphabeticBaseline: f[5],
+            fontBoundingBoxDescent: f[6],
+            actualBoundingBoxAscent: f[7],
+            actualBoundingBoxDescent: f[8],
+            fontBoundingBoxAscent: f[9],
+            hangingBaseline: f[10],
+            ideographicBaseline: f[11],
+        };
+        // Cap the cache at 256 entries to match the render-side
+        // LRU budget; oldest-inserted drops when full.  `Map`
+        // iteration follows insertion order so this is O(1).
+        if (this._measureCache.size >= 256) {
+            const first = this._measureCache.keys().next().value;
+            if (first !== undefined) this._measureCache.delete(first);
+        }
+        this._measureCache.set(key, metrics);
+        return metrics;
     }
 
     // ==================== Style Properties ====================
@@ -504,6 +761,12 @@ class CanvasRenderingContext2D {
     set font(value) {
         if (this._font === value) return;
         this._font = value;
+        // G-2: no JS-side parsing needed.  The measure op
+        // receives `this._font` verbatim and parses it on the
+        // Rust side via `shared::css_font::parse_css_font`, the
+        // same function the render thread uses for
+        // `Canvas2DCmd::SetFont`.  One parser, one source of
+        // truth.
         this._frameBegin();
         op_set_font(this._canvasId, value);
     }
@@ -533,6 +796,35 @@ class CanvasRenderingContext2D {
     }
 
     // ==================== State Methods ====================
+
+    // Called by Canvas.set width/height after op_resize_canvas.  The Rust
+    // render thread resets Canvas2DState to defaults on every canvas resize
+    // (via Canvas2DRenderer::reset), so the JS shadow state must match or
+    // the early-return guards in property setters will suppress the
+    // corresponding op_set_* calls, leaving the render thread in its
+    // post-reset default state while JS thinks the old values are still live.
+    _resetShadowState() {
+        this._fillStyle = '#000000';
+        this._strokeStyle = '#000000';
+        this._lineWidth = 1;
+        this._lineCap = 'butt';
+        this._lineJoin = 'miter';
+        this._miterLimit = 10;
+        this._globalAlpha = 1;
+        this._font = '10px sans-serif';
+        this._textAlign = 'start';
+        this._textBaseline = 'alphabetic';
+        this._direction = undefined;
+        this._tm = [1, 0, 0, 1, 0, 0];
+        this._stateStack = [];
+        this._compositeOp = null;
+        this._lineDash = null;
+        this._lineDashOffset = null;
+        this._shadowBlur = null;
+        this._shadowColor = null;
+        this._shadowOffsetX = null;
+        this._shadowOffsetY = null;
+    }
 
     save() {
         this._stateStack.push({
@@ -654,6 +946,7 @@ class CanvasRenderingContext2D {
     // ==================== Image Methods ====================
 
     drawImage(image, ...args) {
+        this._abandonPendingTextCache();
         if (!image || !image.loaded) return;
 
         this._frameBegin();
@@ -708,8 +1001,79 @@ class CanvasRenderingContext2D {
     }
 
     getImageData(sx, sy, sw, sh) {
-        const data = op_get_image_data(this._canvasId, sx, sy, sw, sh);
-        return { width: sw, height: sh, data: new Uint8ClampedArray(data) };
+        // Zero-readback fast path.  Two layers of optimisation:
+        //
+        // 1. Snapshot id is allocated JS-side from a process-local
+        //    counter so the call NEVER blocks on a render-thread
+        //    round-trip -- the previous sync `op_get_image_data_snapshot`
+        //    still cost 5-15ms per call when the render thread had a
+        //    backlog (head-of-line stall).
+        // 2. Capture op rides the existing frame collector, so it
+        //    lands in the same FramePacket as the surrounding
+        //    canvas2D draws (correct ordering vs the prior fillText)
+        //    and the downstream texImage2DFromSnapshot GL op.
+        //
+        // Per-frame budget: the render-side pool caps at 1024 live
+        // snapshots; we cap JS-side at 512 with a fall-back to the
+        // legacy CPU path so a pathological scene (thousands of
+        // distinct text sprites in one frame) stays correct rather
+        // than silently dropping snapshots.  Counter resets on
+        // frame-end (see `__migo_frame_end_hooks` registration).
+        const x = sx | 0;
+        const y = sy | 0;
+        const w = Math.max(0, sw | 0);
+        const h = Math.max(0, sh | 0);
+
+        // Text texture cache: only a full-canvas read participates
+        // (cocos always does getImageData(0, 0, canvas.w, canvas.h)
+        // right after the single fillText).
+        if (this._tcState !== 0 && this._tcKey !== null) {
+            const k = this._tcKey;
+            const fullCanvas =
+                x === 0 && y === 0 && w === k.canvasW && h === k.canvasH;
+            if (fullCanvas && this._tcState === 2) {
+                // HIT: no snapshot -- hand back a cache-marked
+                // ImageData.  The pin is now owned by the upcoming
+                // texImage2D (it unpins after the GPU copy).
+                this._tcState = 0;
+                this._tcKey = null;
+                return _migoMakeTextCacheImageData(this, k, w, h);
+            }
+            if (fullCanvas && this._tcState === 1
+                    && w > 0 && h > 0
+                    && _migoSnapshotFrameCount < MAX_LIVE_CANVAS2D_SNAPSHOTS_JS) {
+                // MISS: capture + record.  for_cache op tags the
+                // snapshot so the render thread transfers its texture
+                // into the cache at frame-end drain.
+                const snapshotId = _migoNextSnapshotId();
+                op_capture_canvas2d_snapshot_for_cache(
+                    this._canvasId, x, y, w, h, snapshotId,
+                    k.text, k.fontRequest, k.fontSize, k.fontWeight,
+                    k.italic, k.fillColor, k.textAlign, k.textBaseline,
+                    k.canvasW, k.canvasH,
+                );
+                _migoSnapshotFrameCount++;
+                this._tcState = 0;
+                this._tcKey = null;
+                return _migoMakeSnapshotImageData(snapshotId, w, h);
+            }
+            // Pattern didn't hold (partial read or budget exhausted):
+            // abandon -- commits the suppressed fillText if it was a
+            // hit -- then fall through to the legacy path below.
+            this._abandonPendingTextCache();
+        }
+
+        if (w > 0 && h > 0
+                && _migoSnapshotFrameCount < MAX_LIVE_CANVAS2D_SNAPSHOTS_JS) {
+            const snapshotId = _migoNextSnapshotId();
+            op_capture_canvas2d_snapshot(this._canvasId, x, y, w, h, snapshotId);
+            _migoSnapshotFrameCount++;
+            return _migoMakeSnapshotImageData(snapshotId, w, h);
+        }
+        // Fall back to legacy CPU path (zero-area, GLES 2, or budget
+        // exhausted).  Behaviour preserved bit-exactly.
+        const data = op_get_image_data(this._canvasId, x, y, w, h);
+        return { width: w, height: h, data: new Uint8ClampedArray(data) };
     }
 
     createImageData(sw, sh) {
@@ -804,6 +1168,160 @@ class CanvasRenderingContext2D {
     }
 }
 
+// JS-side per-frame snapshot budget + id allocator (see
+// `getImageData` above).  Both are process-globals so multiple
+// CanvasRenderingContext2D instances share the same id namespace
+// (matches the render-side pool, which is keyed by global id).
+//
+// MAX_LIVE_CANVAS2D_SNAPSHOTS_JS must stay strictly less than the
+// render-side `MAX_LIVE_CANVAS2D_SNAPSHOTS` (currently 1024) so we
+// fall back to the legacy CPU path before the render-side pool
+// silently drops snapshots.
+const MAX_LIVE_CANVAS2D_SNAPSHOTS_JS = 512;
+let _migoSnapshotFrameCount = 0;
+
+let _migoSnapshotIdCounter = 0;
+function _migoNextSnapshotId() {
+    _migoSnapshotIdCounter = (_migoSnapshotIdCounter + 1) >>> 0;
+    if (_migoSnapshotIdCounter === 0) {
+        // u32 wrap; skip 0 (reserved sentinel).
+        _migoSnapshotIdCounter = 1;
+    }
+    return _migoSnapshotIdCounter;
+}
+
+// Build a synthetic ImageData whose `.data` is materialized lazily on
+// first access via a forced readback.  Critical for compatibility:
+// engines (notably cocos) often inspect the byte buffer between
+// getImageData and texImage2D -- e.g. an "is the region empty?" check
+// reading `imageData.data[3]` to skip transparent labels.  With a raw
+// zero-filled placeholder that probe always reads 0, so the engine
+// silently skips the upload and the label is missing on screen.
+//
+// On first `.data` read we fire the snapshot readback once, populate
+// the placeholder in place, and clear `__migo_snapshot_id__` so the
+// downstream texImage2D / texSubImage2D paths route through the
+// legacy bytes path with whatever is now in (and may have been
+// modified in) the buffer.  When JS never touches `.data`, the
+// snapshot fast path stays in effect and no readback occurs.
+function _migoMakeSnapshotImageData(snapshotId, w, h) {
+    const placeholder = new Uint8ClampedArray(w * h * 4);
+    let _populated = false;
+    const imageData = { width: w, height: h };
+    Object.defineProperty(imageData, '__migo_snapshot_id__', {
+        value: snapshotId,
+        enumerable: false,
+        writable: true,
+        configurable: true,
+    });
+    Object.defineProperty(imageData, 'data', {
+        get() {
+            if (!_populated) {
+                _populated = true;
+                const sid = imageData.__migo_snapshot_id__ | 0;
+                if (sid !== 0) {
+                    const real = op_force_readback_snapshot(sid);
+                    if (real && real.length === placeholder.length) {
+                        placeholder.set(real);
+                    }
+                    // JS now owns the buffer; subsequent uploads must
+                    // pick up any in-place mutations from this point on.
+                    imageData.__migo_snapshot_id__ = 0;
+                }
+            }
+            return placeholder;
+        },
+        enumerable: true,
+        configurable: true,
+    });
+    return imageData;
+}
+
+// Synthetic ImageData for a text texture cache HIT.  No snapshot was
+// captured (the offscreen fillText was suppressed entirely); the
+// downstream texImage2D detects `__migo_text_cache_key__` and routes
+// to `op_tex_image_2d_from_text_cache`, which copies the cached
+// texture and unpins the entry.
+//
+// `.data` fallback: a game that actually inspects the bytes of the
+// returned ImageData (cocos's "is this label empty?" probe) forces a
+// correctness recovery -- we have no GPU readback for cached text
+// textures, so re-render the text into the canvas, snapshot+read it
+// back the legacy way, unpin the cache, and clear the marker so
+// texImage2D routes the bytes path.  The target cocos game does NOT
+// read `.data` for these labels (otherwise the pre-existing snapshot
+// fast path wouldn't help either), so this stays cold in practice.
+function _migoMakeTextCacheImageData(ctx, k, w, h) {
+    const placeholder = new Uint8ClampedArray(w * h * 4);
+    let _populated = false;
+    const imageData = { width: w, height: h };
+    Object.defineProperty(imageData, '__migo_text_cache_key__', {
+        value: k,
+        enumerable: false,
+        writable: true,
+        configurable: true,
+    });
+    Object.defineProperty(imageData, 'data', {
+        get() {
+            if (!_populated) {
+                _populated = true;
+                const key = imageData.__migo_text_cache_key__;
+                if (key) {
+                    op_text_cache_unpin(
+                        key.text, key.fontRequest, key.fontSize, key.fontWeight,
+                        key.italic, key.fillColor, key.textAlign, key.textBaseline,
+                        key.canvasW, key.canvasH,
+                    );
+                    ctx._frameBegin();
+                    op_fill_text(
+                        ctx._canvasId,
+                        key.text,
+                        key._x || 0,
+                        key._y || 0,
+                        key._mw == null ? Infinity : key._mw,
+                    );
+                    const sid = _migoNextSnapshotId();
+                    op_capture_canvas2d_snapshot(ctx._canvasId, 0, 0, w, h, sid);
+                    const real = op_force_readback_snapshot(sid);
+                    if (real && real.length === placeholder.length) {
+                        placeholder.set(real);
+                    }
+                    imageData.__migo_text_cache_key__ = null;
+                }
+            }
+            return placeholder;
+        },
+        enumerable: true,
+        configurable: true,
+    });
+    return imageData;
+}
+
+// `migo._force_readback(imageData)` -- opt-in escape hatch for the
+// rare game that genuinely needs to inspect the bytes of a synthetic
+// snapshot ImageData.  Issues a synchronous render-thread readback
+// of the snapshot texture, fills `imageData.data` in place, and
+// returns it.  No-op (returns the same object) when the input is a
+// regular ImageData (no `__migo_snapshot_id__`) or the snapshot has
+// already been drained.
+function _migoForceReadback(imageData) {
+    if (!imageData || typeof imageData !== 'object') return imageData;
+    if ((imageData.__migo_snapshot_id__ | 0) === 0) return imageData;
+    // Reading `.data` triggers the lazy getter installed by
+    // _migoMakeSnapshotImageData, which fires the readback, fills the
+    // buffer in place, and clears `__migo_snapshot_id__`.
+    void imageData.data;
+    return imageData;
+}
+if (!globalThis._force_readback) {
+    Object.defineProperty(globalThis, '_force_readback', {
+        value: _migoForceReadback,
+        enumerable: false,
+        writable: true,
+        configurable: true,
+    });
+}
+
 // Frame-end callback registry. The unified frame-end op builds a single
 // interleaved FramePacket from both Canvas2D and GL segments, with
 // Materialize barriers at 2D->GL transitions.
@@ -818,6 +1336,15 @@ if (!globalThis.__migo_frame_end_hooks) {
 }
 globalThis.__migo_frame_end_hooks.push(() => {
     op_frame_end_unified();
+});
+// Reset the per-frame snapshot budget AFTER op_frame_end_unified
+// has flushed the FramePacket (so the capture ops we counted
+// against this frame's budget are dispatched to the render thread
+// before we clear the count).  The render-thread pool drains in
+// the same present_and_raf step, so the next frame starts clean
+// on both sides.
+globalThis.__migo_frame_end_hooks.push(() => {
+    _migoSnapshotFrameCount = 0;
 });
 
 export { CanvasRenderingContext2D, CanvasGradient };

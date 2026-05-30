@@ -5,8 +5,8 @@
   },
   "devices": [
     {
-      "tier": "api23-low",
-      "min_sdk": 23,
+      "tier": "api26-low",
+      "min_sdk": 26,
       "performance_class": "low",
       "refresh_class": "60hz",
       "workloads": [
@@ -18,7 +18,7 @@
     },
     {
       "tier": "mid-60hz",
-      "min_sdk": 23,
+      "min_sdk": 26,
       "performance_class": "mid",
       "refresh_class": "60hz",
       "workloads": [
@@ -30,7 +30,7 @@
     },
     {
       "tier": "high-refresh",
-      "min_sdk": 23,
+      "min_sdk": 26,
       "performance_class": "high",
       "refresh_class": "high-refresh",
       "workloads": [

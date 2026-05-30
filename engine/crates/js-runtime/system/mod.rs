@@ -197,9 +197,7 @@ pub fn op_close_ble_connection(
                 .map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic(
-        "closeBLEConnection:fail not supported",
-    ))
+    Err(JsErrorBox::generic("closeBLEConnection:fail not supported"))
 }
 
 #[op2]
@@ -308,9 +306,7 @@ pub fn op_get_ble_device_rssi(
                 .map_err(JsErrorBox::generic);
         }
     }
-    Err(JsErrorBox::generic(
-        "getBLEDeviceRSSI:fail not supported",
-    ))
+    Err(JsErrorBox::generic("getBLEDeviceRSSI:fail not supported"))
 }
 
 #[op2(fast)]
@@ -321,9 +317,7 @@ pub fn op_set_ble_mtu(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
-            return bt
-                .set_ble_mtu(&options_json)
-                .map_err(JsErrorBox::generic);
+            return bt.set_ble_mtu(&options_json).map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("setBLEMTU:fail not supported"))
@@ -338,9 +332,7 @@ pub fn op_get_ble_mtu(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
-            return bt
-                .get_ble_mtu(&options_json)
-                .map_err(JsErrorBox::generic);
+            return bt.get_ble_mtu(&options_json).map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("getBLEMTU:fail not supported"))
@@ -401,9 +393,7 @@ pub fn op_open_setting(
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(sys) = services.system_info() {
-            return sys
-                .open_setting(&options_json)
-                .map_err(JsErrorBox::generic);
+            return sys.open_setting(&options_json).map_err(JsErrorBox::generic);
         }
     }
     Err(JsErrorBox::generic("openSetting:fail not supported"))

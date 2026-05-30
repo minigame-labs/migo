@@ -12,7 +12,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::golden::{assert_matches_golden, GoldenCfg};
+use common::golden::{GoldenCfg, assert_matches_golden};
 use common::harness::{read_pixels_rgba8, with_raster_surface};
 
 use shared::protocol::color::Color as ProtoColor;
@@ -50,7 +50,13 @@ fn fill_rect_solid_red_over_white() {
         );
         read_pixels_rgba8(surface)
     });
-    assert_matches_golden("canvas2d_fill_rect_solid_red", w as u32, h as u32, &buf, GoldenCfg::default());
+    assert_matches_golden(
+        "canvas2d_fill_rect_solid_red",
+        w as u32,
+        h as u32,
+        &buf,
+        GoldenCfg::default(),
+    );
 }
 
 #[test]
@@ -126,7 +132,9 @@ fn fill_rect_respects_global_alpha() {
 fn clear_rect_erases_content_to_transparent() {
     let (w, h) = (32, 32);
     let buf = with_raster_surface(w, h, |surface| {
-        surface.canvas().clear(skia_safe::Color::from_argb(200, 255, 0, 0));
+        surface
+            .canvas()
+            .clear(skia_safe::Color::from_argb(200, 255, 0, 0));
         let mut ctx = Canvas2DRenderer::new();
         apply_all(
             &mut ctx,

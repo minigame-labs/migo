@@ -95,13 +95,15 @@ public class GameActivity extends Activity {
             @Override
             public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
                 if (session != null) {
-                    session.updateSurface(holder.getSurface());
+                    session.updateSurface(holder.getSurface(), width, height);
                 }
             }
 
             @Override
             public void surfaceDestroyed(SurfaceHolder holder) {
-                // 保持会话存活，仅在 onDestroy 中清理
+                if (session != null) {
+                    session.onSurfaceDestroyed();
+                }
             }
         });
     }

@@ -157,6 +157,7 @@ deno_core::extension!(
         dir "",
         "98_global_scope_shared.js",
         "98_global_scope_window.js",
+        "97_wx_namespace.js",
         "99_main.js",
     ],
 );

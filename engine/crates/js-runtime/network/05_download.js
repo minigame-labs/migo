@@ -8,6 +8,7 @@ import {
 import {
     op_fetch, op_fetch_send,
     op_open_file, op_write_file, op_close_file,
+    op_rename, op_unlink,
 } from "ext:core/ops";
 
 const { TypeError } = primordials;
@@ -82,6 +83,13 @@ function downloadFile(options = {}) {
     }
 
     const targetPath = filePath || generateTempFilePath();
+    // Write the body into `<targetPath>.part` first and only rename it
+    // onto the real `targetPath` when the whole response has been
+    // committed to disk. That way an abort / network error / process
+    // crash never leaves a half-written file pretending to be the
+    // real resource; callers that `stat(targetPath)` only see
+    // complete downloads.
+    const tmpPath = targetPath + ".part";
     const headers = Object.entries(header).map(([key, value]) => [key, String(value)]);
 
     // Create fetch request (GET, no body)
@@ -126,8 +134,10 @@ function downloadFile(options = {}) {
 
             const totalBytes = resp.contentLength || 0;
 
-            // Open target file for writing (truncate-create)
-            fd = await op_open_file(targetPath, "w");
+            // Open `tmpPath` for truncate-create. We never open the
+            // final `targetPath` ourselves; the rename at the bottom
+            // atomically swaps `.part` into place only on success.
+            fd = await op_open_file(tmpPath, "w");
 
             // Stream response body to file chunk by chunk
             let bytesWritten = 0;
@@ -165,9 +175,16 @@ function downloadFile(options = {}) {
 
             core.tryClose(resp.responseRid);
 
-            // Close file
+            // Close file so the kernel commits pending buffers
+            // before the rename lands.
             await op_close_file(fd);
             fd = null;
+
+            // Atomic commit: rename `<targetPath>.part` -> `<targetPath>`.
+            // `op_rename` maps to the Rust-side `fs_ops::rename` which
+            // now includes an EXDEV fallback, so this works even when
+            // the download dir and final path are on different mounts.
+            await op_rename(tmpPath, targetPath);
 
             // Final progress at 100%
             const finalTotal = totalBytes || bytesWritten;
@@ -186,6 +203,11 @@ function downloadFile(options = {}) {
             if (fd !== null) {
                 try { await op_close_file(fd); } catch (_) {}
             }
+            // Remove the `.part` so it never appears alongside (or in
+            // place of) a valid download. Swallowing errors is
+            // deliberate: the file may not exist yet, or the cleanup
+            // itself may race against a follow-up call.
+            try { await op_unlink(tmpPath); } catch (_) {}
 
             if (cancellation.aborted || err === "aborted") {
                 const error = abortedNetworkError();

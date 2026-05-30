@@ -21,7 +21,7 @@
 //!     that correctly, but we track `has_current_point` ourselves to
 //!     honour the spec's implicit-moveTo rules.
 
-use skia_safe::{path_builder::PathBuilder, Matrix, Path, PathDirection, Point, Rect};
+use skia_safe::{Matrix, Path, PathDirection, Point, Rect, path_builder::PathBuilder};
 
 use std::f32::consts::{PI, TAU};
 
@@ -103,19 +103,10 @@ impl CanvasPath {
         if !self.has_current_point {
             self.move_to(cpx, cpy);
         }
-        self.inner
-            .quad_to(Point::new(cpx, cpy), Point::new(x, y));
+        self.inner.quad_to(Point::new(cpx, cpy), Point::new(x, y));
     }
 
-    pub fn bezier_to(
-        &mut self,
-        cp1x: f32,
-        cp1y: f32,
-        cp2x: f32,
-        cp2y: f32,
-        x: f32,
-        y: f32,
-    ) {
+    pub fn bezier_to(&mut self, cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32) {
         if !self.has_current_point {
             self.move_to(cp1x, cp1y);
         }
@@ -159,8 +150,7 @@ impl CanvasPath {
             self.has_current_point = true;
         }
 
-        let bounds =
-            Rect::from_ltrb(cx - radius, cy - radius, cx + radius, cy + radius);
+        let bounds = Rect::from_ltrb(cx - radius, cy - radius, cx + radius, cy + radius);
 
         // Skia's `arc_to` treats `sweep >= 360` as a degenerate case and
         // may produce only the starting point.  Canvas spec requires a

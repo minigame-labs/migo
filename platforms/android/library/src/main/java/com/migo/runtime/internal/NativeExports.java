@@ -55,6 +55,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * @hide
  */
 public final class NativeExports {
+    private static final String TAG = "NativeExports";
 
     private static final int BLUETOOTH_SETTING_REQUEST_CODE = 10001;
     private static final int APP_AUTHORIZE_SETTING_REQUEST_CODE = 10002;
@@ -338,15 +339,18 @@ public final class NativeExports {
      * {@link #decodeImageRgba}".
      *
      * <p><b>Refcount contract:</b> on success, the native accessor
-     * returns a borrowed pointer; the Rust
-     * {@code OwnedAhb::from_raw_acquire} wrapper bumps its own
-     * strong reference immediately. This method then closes the
-     * Java-side {@link HardwareBuffer} wrapper in {@code finally},
-     * so the AHB survives on Rust's refcount alone. Net effect:
-     * Rust owns one strong refcount; Java owns zero.
+     * returns a raw pointer that already owns one extra native
+     * strong refcount. This method then closes the Java-side
+     * {@link HardwareBuffer} wrapper in {@code finally}, leaving the
+     * transferred native ref for Rust to adopt without another
+     * {@code AHardwareBuffer_acquire}. Net effect: Rust owns one
+     * strong refcount; Java owns zero.
      */
     public static byte[] decodeImageAhb(byte[] imageData) {
-        if (imageData == null || imageData.length == 0) return null;
+        if (imageData == null || imageData.length == 0) {
+            android.util.Log.w(TAG, "decodeImageAhb: empty image payload");
+            return null;
+        }
 
         // Quick-reject on API < 30 *before* we touch any class that
         // only exists on newer SDKs.  This matters beyond just
@@ -358,6 +362,7 @@ public final class NativeExports {
         // separate inner class, we guarantee API 26-29 devices never
         // trigger that lazy class-load.
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            android.util.Log.d(TAG, "decodeImageAhb: API < 30, fallback to RGBA");
             return null;
         }
 
@@ -367,6 +372,7 @@ public final class NativeExports {
         long used = rt.totalMemory() - rt.freeMemory();
         long free = rt.maxMemory() - used;
         if (free < 32L * 1024 * 1024) {
+            android.util.Log.w(TAG, "decodeImageAhb: low memory, fallback to RGBA");
             return null;
         }
 
@@ -409,10 +415,12 @@ public final class NativeExports {
                 if (hb == null) {
                     // Decoder didn't honour the HARDWARE allocator
                     // (driver quirk, small image, etc.). Fallback.
+                    android.util.Log.w(TAG, "decodeImageAhb: decoder returned bitmap without HardwareBuffer");
                     return null;
                 }
                 long ahbPtr = NativeBridge.nativeAhbPointerFromHardwareBuffer(hb);
                 if (ahbPtr == 0L) {
+                    android.util.Log.w(TAG, "decodeImageAhb: native bridge returned null AHB pointer");
                     return null;
                 }
 
@@ -423,12 +431,12 @@ public final class NativeExports {
                 buf.putInt(h);
                 return buf.array();
             } catch (Exception | OutOfMemoryError e) {
+                android.util.Log.w(TAG, "decodeImageAhb failed, fallback to RGBA", e);
                 return null;
             } finally {
                 // Close the Java wrapper first so its ref is
-                // released before recycle(); the Rust side already
-                // holds an independent strong ref via
-                // AHardwareBuffer_acquire.
+                // released before recycle(); the native bridge has
+                // already retained an independent AHB ref for Rust.
                 if (hb != null) {
                     try { hb.close(); } catch (Throwable ignored) {}
                 }
@@ -1212,17 +1220,13 @@ public final class NativeExports {
         sb.append(",mic");
 
         // CAMCORDER (5) - microphone tuned for video recording
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.HONEYCOMB) {
-            sb.append(",camcorder");
-        }
+        sb.append(",camcorder");
 
         // VOICE_RECOGNITION (6) - tuned for voice recognition
         sb.append(",voice_recognition");
 
         // VOICE_COMMUNICATION (7) - tuned for VoIP, includes echo cancellation
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.HONEYCOMB) {
-            sb.append(",voice_communication");
-        }
+        sb.append(",voice_communication");
 
         return sb.toString();
     }

@@ -21,8 +21,8 @@
 //! don't spin up the full stats pipeline), every bump is a no-op —
 //! hot code doesn't need a guard.
 
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use shared::stats::DebugStats;
 
@@ -168,6 +168,47 @@ pub fn bump_skia_context_reset() {
 }
 
 #[inline]
+pub fn bump_canvas2d_snapshot_taken() {
+    with_sink(|s| {
+        s.canvas2d_snapshots_taken.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn bump_canvas2d_snapshot_fallback() {
+    with_sink(|s| {
+        s.canvas2d_snapshot_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn bump_canvas2d_snapshot_upload() {
+    with_sink(|s| {
+        s.canvas2d_snapshot_uploads.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn bump_canvas2d_snapshot_forced_readback() {
+    with_sink(|s| {
+        s.canvas2d_snapshot_forced_readbacks
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Called from the `FrameOp::BeginFrame` handler.  Currently a
+/// no-op because all per-frame diagnostics ride on the swap /
+/// present path that sits later in the frame, but kept as a
+/// named hook so future additions (frame-id, cpu-timer start)
+/// can land without touching the render-thread code again
+/// (P2-13).
+#[inline]
+pub fn frame_begin() {
+    // Intentionally empty for now.  See doc comment.
+}
+
+#[inline]
 pub fn hit_shadow_filter_cache() {
     with_sink(|s| {
         s.shadow_filter_hits.fetch_add(1, Ordering::Relaxed);
@@ -206,6 +247,64 @@ pub fn hit_gradient_cache() {
 pub fn miss_gradient_cache() {
     with_sink(|s| {
         s.gradient_misses.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+// ---- Text texture cache counters -----------------------------------
+
+#[inline]
+pub fn hit_text_cache() {
+    with_sink(|s| {
+        s.text_cache_hits.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[inline]
+pub fn miss_text_cache() {
+    with_sink(|s| {
+        s.text_cache_misses.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Publish the current resident bytes and entry count (gauges).
+/// Called from the cache insert / evict / trim paths on the render
+/// thread, *after* the cache lock is released so the snapshot we
+/// store matches a consistent state.
+#[inline]
+pub fn set_text_cache_gauges(bytes: u32, entries: u32) {
+    with_sink(|s| {
+        s.text_cache_bytes.store(bytes, Ordering::Relaxed);
+        s.text_cache_entries.store(entries, Ordering::Relaxed);
+    });
+}
+
+// ---- v4 queue / collector / cache observability setters -------------
+
+/// Record the current render command channel backlog.  Sampled by
+/// the render thread at the top of each frame; the Java debug
+/// overlay reads the latest value via `DebugStats::snapshot`.
+#[inline]
+pub fn set_render_queue_len(len: u32) {
+    with_sink(|s| {
+        s.render_queue_len.store(len, Ordering::Relaxed);
+    });
+}
+
+/// Record the current live `SkImage` wrapper count.  `ImageStore`
+/// calls this whenever the wrapper cache changes size.
+#[inline]
+pub fn set_sk_image_wrapper_count(count: u32) {
+    with_sink(|s| {
+        s.sk_image_wrappers.store(count, Ordering::Relaxed);
+    });
+}
+
+/// Record the current deferred-upload queue depth (uploads waiting
+/// for the next frame's budget).
+#[inline]
+pub fn set_deferred_uploads(count: u32) {
+    with_sink(|s| {
+        s.deferred_uploads.store(count, Ordering::Relaxed);
     });
 }
 

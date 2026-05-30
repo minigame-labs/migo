@@ -10,7 +10,6 @@ import * as alert from "ext:host_v8_console/01_alert.js";
 import * as url from "ext:host_v8_url/03_url.js";
 import * as subpackage from 'ext:host_v8_base/04_subpackage.js';
 import * as gcApi from 'ext:host_v8_base/03_gc.js';
-import * as location from "ext:host_v8_web/12_location.js";
 import * as performance from "ext:host_v8_web/12_performance.js";
 import * as raf from "ext:host_v8_webgl/03_raf.js";
 import * as fontApi from "ext:host_v8_webgl/04_font.js";
@@ -32,7 +31,6 @@ import { core } from "ext:core/mod.js";
 const WindowGlobalScope = {
     alert: core.propWritable(alert.alert),
     URL: core.propNonEnumerable(url.URL),
-    location: core.propNonEnumerable(location.location),
     createCanvas: core.propNonEnumerable(canvas.createCanvas),
     requestAnimationFrame: core.propWritable(raf.requestAnimationFrame),
     cancelAnimationFrame: core.propWritable(raf.cancelAnimationFrame),

@@ -14,7 +14,9 @@ pub trait NavigateService: Send + Sync {
     ///
     /// Result delivered via `onNavigateToMiniProgramResult` callback.
     fn navigate_to_mini_program(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("navigateToMiniProgram:fail not supported"))
+        Err(ServiceError::not_supported(
+            "navigateToMiniProgram:fail not supported",
+        ))
     }
 
     /// Navigate back to the source mini program (Mode A, sync).
@@ -22,7 +24,9 @@ pub trait NavigateService: Send + Sync {
     /// JSON fields (input):
     /// - `extraData`: object (optional, data to pass back)
     fn navigate_back_mini_program(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("navigateBackMiniProgram:fail not supported"))
+        Err(ServiceError::not_supported(
+            "navigateBackMiniProgram:fail not supported",
+        ))
     }
 
     /// Open the customer service conversation (Mode A, sync).
@@ -34,6 +38,8 @@ pub trait NavigateService: Send + Sync {
     /// - `sendMessagePath`: string (optional)
     /// - `sendMessageImg`: string (optional)
     fn open_customer_service_conversation(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("openCustomerServiceConversation:fail not supported"))
+        Err(ServiceError::not_supported(
+            "openCustomerServiceConversation:fail not supported",
+        ))
     }
 }

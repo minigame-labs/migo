@@ -58,10 +58,6 @@ impl ImageRegistry {
         }
     }
 
-    pub fn generate_img_id(&self) -> u32 {
-        self.store.generate_id()
-    }
-
     pub fn load_shared_image(
         &mut self,
         gl: &glow::Context,
@@ -86,6 +82,8 @@ impl ImageRegistry {
             StoredImage {
                 gl_texture: result.texture.0.get(),
                 info: GpuImageInfo::rgba8_unpremul(result.width, result.height),
+                atlas_origin: None,
+                atlas_page_size: 0,
             },
         );
         Ok((result.width, result.height))
@@ -117,8 +115,8 @@ impl ImageRegistry {
         // Guard conditions: if the device lacks AHB support or we
         // have no display, downgrade and re-enter the legacy path.
         if !device_caps.ahb_available || egl_display_ptr.is_null() {
-            let rgba = shared::protocol::io_cmd::DecodedImage::HardwareBuffer(ahb_image)
-                .into_rgba()?;
+            let rgba =
+                shared::protocol::io_cmd::DecodedImage::HardwareBuffer(ahb_image).into_rgba()?;
             return self.load_shared_image(gl, image_id, rgba, device_caps, egl_display_ptr);
         }
 
@@ -128,7 +126,7 @@ impl ImageRegistry {
         // AHB stays alive until Drop.
         #[cfg(target_os = "android")]
         {
-            let result = unsafe {
+            let import_result = unsafe {
                 crate::texture_import::import_ahb_as_texture(
                     gl,
                     ahb_image.ahb.raw(),
@@ -136,18 +134,59 @@ impl ImageRegistry {
                     ahb_image.width,
                     ahb_image.height,
                 )
-            }
-            .map_err(|e| {
-                shared::error::EngineError::new(shared::error::ErrorCode::IoError)
-                    .with_msg("AHB EGLImage import failed")
-                    .with_detail(e.to_string())
-            })?;
+            };
+
+            let result = match import_result {
+                Ok(r) => r,
+                Err(e) => {
+                    // Graceful degradation: the zero-copy path
+                    // failed (driver quirk, missing proc address,
+                    // EGLImage creation refused, …) so fall
+                    // through to the CPU-staged RGBA → PBO path.
+                    //
+                    // Before the fix this returned `Err`, which
+                    // caused `op_load_image` to resolve with an
+                    // error and left `image_id` without a GL
+                    // texture — rendering as black in
+                    // `drawImage`.  That matched the "images go
+                    // black" symptom in the P0 audit report.
+                    //
+                    // R-9: once-only warn.  A driver that rejects
+                    // AHB once will reject it every image; spamming
+                    // the log at 30+ images per screen turned the
+                    // logcat into a 10kB/s firehose of identical
+                    // messages.  Downgrade subsequent entries to
+                    // `debug!` so the event is still captured at
+                    // higher verbosity without the CPU / log-size
+                    // tax at info level.
+                    shared::warn_once!(
+                        "AHB EGLImage import failed for image_id={image_id}; falling back to RGBA+PBO ({e}). \
+                         Further per-image warnings will be silenced for this process."
+                    );
+                    tracing::debug!(
+                        image_id,
+                        error = %e,
+                        "AHB fallback (debug-level; warn was fired once earlier)",
+                    );
+                    let rgba = shared::protocol::io_cmd::DecodedImage::HardwareBuffer(ahb_image)
+                        .into_rgba()?;
+                    return self.load_shared_image(
+                        gl,
+                        image_id,
+                        rgba,
+                        device_caps,
+                        egl_display_ptr,
+                    );
+                }
+            };
 
             self.store.insert(
                 image_id,
                 StoredImage {
                     gl_texture: result.texture.0.get(),
                     info: GpuImageInfo::rgba8_unpremul(result.width, result.height),
+                    atlas_origin: None,
+                    atlas_page_size: 0,
                 },
             );
             // Keep the AHB alive for at least as long as the GL
@@ -164,8 +203,8 @@ impl ImageRegistry {
             // Non-Android hosts do not have a real EGL/AHB import path;
             // the AHB is a mock `Vec<u8>` that we downgrade to CPU
             // RGBA just like the fallback above.
-            let rgba = shared::protocol::io_cmd::DecodedImage::HardwareBuffer(ahb_image)
-                .into_rgba()?;
+            let rgba =
+                shared::protocol::io_cmd::DecodedImage::HardwareBuffer(ahb_image).into_rgba()?;
             self.load_shared_image(gl, image_id, rgba, device_caps, egl_display_ptr)
         }
     }
@@ -183,11 +222,7 @@ impl ImageRegistry {
 
     /// Destroy a shared image — deletes its GL texture (if present) and
     /// removes it from the registry.
-    pub fn destroy_shared_image(
-        &mut self,
-        gl: &glow::Context,
-        image_id: u32,
-    ) -> EngineResult<()> {
+    pub fn destroy_shared_image(&mut self, gl: &glow::Context, image_id: u32) -> EngineResult<()> {
         if let Some(entry) = self.store.remove(image_id) {
             // SAFETY: we just removed the entry so no other live reference
             // to this texture exists in the registry.  Raw GL deletion.
@@ -217,6 +252,8 @@ impl ImageRegistry {
             StoredImage {
                 gl_texture: texture.0.get(),
                 info,
+                atlas_origin: None,
+                atlas_page_size: 0,
             },
         );
     }
@@ -229,6 +266,14 @@ impl ImageRegistry {
     /// resolution) that need the full entry plus a `GrDirectContext`.
     pub fn store(&self) -> &ImageStore {
         &self.store
+    }
+
+    /// Current `SkImage` wrapper cache size.  Snapshotted into
+    /// `DebugStats.sk_image_wrappers` so the overlay visualises
+    /// per-`GrDirectContext` duplication.
+    #[inline]
+    pub fn wrapper_cache_len(&self) -> usize {
+        self.store.wrapper_cache_len()
     }
 
     /// Mutable variant of [`Self::store`] for call sites that need to

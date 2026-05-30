@@ -38,10 +38,13 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use digest::Digest;
+use lru::LruCache;
+use parking_lot::Mutex;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -83,8 +86,16 @@ pub enum PackageError {
     UnsupportedVersion(u32),
     BadIndex(String),
     InvalidEntryPath(String),
-    ChecksumMismatch { path: String, expected: u32, actual: u32 },
-    DecompressSizeMismatch { path: String, expected: u64, actual: usize },
+    ChecksumMismatch {
+        path: String,
+        expected: u32,
+        actual: u32,
+    },
+    DecompressSizeMismatch {
+        path: String,
+        expected: u64,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for PackageError {
@@ -95,11 +106,25 @@ impl fmt::Display for PackageError {
             Self::UnsupportedVersion(v) => write!(f, "unsupported package version: {v}"),
             Self::BadIndex(msg) => write!(f, "corrupt package index: {msg}"),
             Self::InvalidEntryPath(p) => write!(f, "invalid entry path: {p}"),
-            Self::ChecksumMismatch { path, expected, actual } => {
-                write!(f, "CRC32 mismatch for '{path}': expected {expected:#010x}, got {actual:#010x}")
+            Self::ChecksumMismatch {
+                path,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "CRC32 mismatch for '{path}': expected {expected:#010x}, got {actual:#010x}"
+                )
             }
-            Self::DecompressSizeMismatch { path, expected, actual } => {
-                write!(f, "decompress size mismatch for '{path}': expected {expected}, got {actual}")
+            Self::DecompressSizeMismatch {
+                path,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "decompress size mismatch for '{path}': expected {expected}, got {actual}"
+                )
             }
         }
     }
@@ -108,7 +133,9 @@ impl fmt::Display for PackageError {
 impl std::error::Error for PackageError {}
 
 impl From<io::Error> for PackageError {
-    fn from(e: io::Error) -> Self { Self::Io(e) }
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,13 +147,15 @@ pub(crate) fn validate_entry_path(path: &str) -> Result<String, PackageError> {
         return Err(PackageError::InvalidEntryPath("empty path".into()));
     }
     if path.starts_with('/') {
-        return Err(PackageError::InvalidEntryPath(format!("absolute path: {path}")));
+        return Err(PackageError::InvalidEntryPath(format!(
+            "absolute path: {path}"
+        )));
     }
     for b in path.bytes() {
         if b < 0x20 || b == b'\\' {
-            return Err(PackageError::InvalidEntryPath(
-                format!("illegal character in path: {path}")
-            ));
+            return Err(PackageError::InvalidEntryPath(format!(
+                "illegal character in path: {path}"
+            )));
         }
     }
     let mut parts: Vec<&str> = Vec::new();
@@ -135,16 +164,18 @@ pub(crate) fn validate_entry_path(path: &str) -> Result<String, PackageError> {
             "" | "." => continue,
             ".." => {
                 if parts.pop().is_none() {
-                    return Err(PackageError::InvalidEntryPath(
-                        format!("path traversal: {path}")
-                    ));
+                    return Err(PackageError::InvalidEntryPath(format!(
+                        "path traversal: {path}"
+                    )));
                 }
             }
             c => parts.push(c),
         }
     }
     if parts.is_empty() {
-        return Err(PackageError::InvalidEntryPath(format!("empty after normalization: {path}")));
+        return Err(PackageError::InvalidEntryPath(format!(
+            "empty after normalization: {path}"
+        )));
     }
     Ok(parts.join("/"))
 }
@@ -420,11 +451,7 @@ impl<W: Write + Seek> PackageWriter<W> {
     }
 
     /// Add a file entry, splitting into zstd-compressed chunks.
-    pub fn add_entry(
-        &mut self,
-        path: &str,
-        data: &[u8],
-    ) -> Result<(), PackageError> {
+    pub fn add_entry(&mut self, path: &str, data: &[u8]) -> Result<(), PackageError> {
         if self.poisoned {
             return Err(PackageError::Io(io::Error::new(
                 io::ErrorKind::Other,
@@ -434,23 +461,23 @@ impl<W: Write + Seek> PackageWriter<W> {
 
         let normalized = validate_entry_path(path)?;
         if self.seen_paths.contains(&normalized) {
-            return Err(PackageError::InvalidEntryPath(
-                format!("duplicate entry: {normalized}")
-            ));
+            return Err(PackageError::InvalidEntryPath(format!(
+                "duplicate entry: {normalized}"
+            )));
         }
         // Prefix conflict check.
         let new_prefix = format!("{normalized}/");
         for existing in &self.seen_paths {
             if existing.starts_with(&new_prefix) {
-                return Err(PackageError::InvalidEntryPath(
-                    format!("prefix conflict: '{normalized}' conflicts with '{existing}'")
-                ));
+                return Err(PackageError::InvalidEntryPath(format!(
+                    "prefix conflict: '{normalized}' conflicts with '{existing}'"
+                )));
             }
             let existing_prefix = format!("{existing}/");
             if normalized.starts_with(&existing_prefix) {
-                return Err(PackageError::InvalidEntryPath(
-                    format!("prefix conflict: '{normalized}' conflicts with '{existing}'")
-                ));
+                return Err(PackageError::InvalidEntryPath(format!(
+                    "prefix conflict: '{normalized}' conflicts with '{existing}'"
+                )));
             }
         }
 
@@ -464,10 +491,12 @@ impl<W: Write + Seek> PackageWriter<W> {
             let chunk_data = &data[offset..end];
             let raw_size = chunk_data.len() as u32;
 
-            let compressed = zstd::bulk::compress(chunk_data, ZSTD_LEVEL)
-                .map_err(|e| PackageError::Io(io::Error::new(
-                    io::ErrorKind::Other, format!("zstd compress: {e}"),
-                )))?;
+            let compressed = zstd::bulk::compress(chunk_data, ZSTD_LEVEL).map_err(|e| {
+                PackageError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("zstd compress: {e}"),
+                ))
+            })?;
 
             if let Err(e) = self.writer.write_all(&compressed) {
                 self.poisoned = true;
@@ -503,7 +532,8 @@ impl<W: Write + Seek> PackageWriter<W> {
     ) -> Result<PackageIdentity, PackageError> {
         if self.poisoned {
             return Err(PackageError::Io(io::Error::new(
-                io::ErrorKind::Other, "writer poisoned: cannot finalize",
+                io::ErrorKind::Other,
+                "writer poisoned: cannot finalize",
             )));
         }
 
@@ -512,7 +542,8 @@ impl<W: Write + Seek> PackageWriter<W> {
         // Chunk table: 16 bytes per chunk.
         for chunk in &self.chunks {
             self.writer.write_all(&chunk.data_offset.to_le_bytes())?;
-            self.writer.write_all(&chunk.compressed_size.to_le_bytes())?;
+            self.writer
+                .write_all(&chunk.compressed_size.to_le_bytes())?;
             self.writer.write_all(&chunk.raw_size.to_le_bytes())?;
         }
 
@@ -536,7 +567,8 @@ impl<W: Write + Seek> PackageWriter<W> {
             chunk_count: self.chunks.len() as u32,
             chunk_table_offset,
             index_offset,
-        }.write_to(&mut self.writer)?;
+        }
+        .write_to(&mut self.writer)?;
         self.writer.flush()?;
 
         let mut hasher = crc32fast::Hasher::new();
@@ -556,11 +588,28 @@ impl<W: Write + Seek> PackageWriter<W> {
 // PackageReader
 // ---------------------------------------------------------------------------
 
+/// Maximum entry size (uncompressed) eligible for the inflate cache.
+/// Larger entries skip the cache so a single audio/video file can't
+/// evict every small JSON we just decompressed.
+const INFLATE_CACHE_MAX_ENTRY_BYTES: u64 = 128 * 1024;
+
+/// LRU bound on cache entry count. With the per-entry size cap above
+/// the worst-case footprint is ~16 MiB; in practice the working set
+/// of small atlases / configs hit during a hot menu sits well below.
+const INFLATE_CACHE_CAPACITY: usize = 128;
+
 struct ReaderInner {
     path: PathBuf,
     chunks: Vec<ChunkEntry>,
     entries: HashMap<String, EntryMeta>,
     identity: PackageIdentity,
+    /// Per-package decompressed-entry cache. Keyed by normalized
+    /// relative path; values are full entry bytes shared via `Arc` so
+    /// repeated reads avoid both the disk hop and the zstd inflate.
+    /// Menu re-entry in cocos titles re-reads the same atlas/json
+    /// dozens of times — the cache turns each subsequent miss into a
+    /// memcpy.
+    inflate_cache: Mutex<LruCache<String, Arc<Vec<u8>>>>,
 }
 
 pub struct PackageReader {
@@ -579,9 +628,13 @@ impl PackageReader {
         let header = Header::read_from(&mut reader)?;
 
         // Bounds.
-        let chunk_table_end = header.chunk_table_offset
-            .checked_add((header.chunk_count as u64).checked_mul(16)
-                .ok_or_else(|| PackageError::BadIndex("chunk table size overflow".into()))?)
+        let chunk_table_end = header
+            .chunk_table_offset
+            .checked_add(
+                (header.chunk_count as u64)
+                    .checked_mul(16)
+                    .ok_or_else(|| PackageError::BadIndex("chunk table size overflow".into()))?,
+            )
             .ok_or_else(|| PackageError::BadIndex("chunk table end overflow".into()))?;
         if chunk_table_end > file_len {
             return Err(PackageError::BadIndex("chunk table past EOF".into()));
@@ -600,10 +653,13 @@ impl PackageReader {
             let compressed_size = u32::from_le_bytes(buf[8..12].try_into().unwrap());
             let raw_size = u32::from_le_bytes(buf[12..16].try_into().unwrap());
 
-            let chunk_end = data_offset.checked_add(compressed_size as u64)
+            let chunk_end = data_offset
+                .checked_add(compressed_size as u64)
                 .ok_or_else(|| PackageError::BadIndex(format!("chunk {i} offset overflow")))?;
             if chunk_end > header.chunk_table_offset {
-                return Err(PackageError::BadIndex(format!("chunk {i} extends into table")));
+                return Err(PackageError::BadIndex(format!(
+                    "chunk {i} extends into table"
+                )));
             }
             if data_offset < HEADER_SIZE {
                 return Err(PackageError::BadIndex(format!("chunk {i} in header area")));
@@ -612,10 +668,15 @@ impl PackageReader {
             // This prevents a malicious package from causing huge allocations.
             if raw_size > MAX_CHUNK_RAW_SIZE {
                 return Err(PackageError::BadIndex(format!(
-                    "chunk {i} raw_size {} exceeds limit {}", raw_size, MAX_CHUNK_RAW_SIZE
+                    "chunk {i} raw_size {} exceeds limit {}",
+                    raw_size, MAX_CHUNK_RAW_SIZE
                 )));
             }
-            chunks.push(ChunkEntry { data_offset, compressed_size, raw_size });
+            chunks.push(ChunkEntry {
+                data_offset,
+                compressed_size,
+                raw_size,
+            });
         }
 
         // Read entry index.
@@ -639,20 +700,31 @@ impl PackageReader {
 
             let normalized = validate_entry_path(path_str)?;
             if entries.contains_key(&normalized) {
-                return Err(PackageError::InvalidEntryPath(format!("duplicate: {normalized}")));
-            }
-
-            let last = first_chunk.checked_add(chunk_count)
-                .ok_or_else(|| PackageError::BadIndex("chunk range overflow".into()))?;
-            if last > chunks.len() as u32 {
-                return Err(PackageError::BadIndex(format!(
-                    "entry '{normalized}' chunks [{first_chunk},{last}) exceeds {}", chunks.len()
+                return Err(PackageError::InvalidEntryPath(format!(
+                    "duplicate: {normalized}"
                 )));
             }
 
-            entries.insert(normalized, EntryMeta {
-                path: path_str.to_string(), raw_size, crc32, first_chunk, chunk_count,
-            });
+            let last = first_chunk
+                .checked_add(chunk_count)
+                .ok_or_else(|| PackageError::BadIndex("chunk range overflow".into()))?;
+            if last > chunks.len() as u32 {
+                return Err(PackageError::BadIndex(format!(
+                    "entry '{normalized}' chunks [{first_chunk},{last}) exceeds {}",
+                    chunks.len()
+                )));
+            }
+
+            entries.insert(
+                normalized,
+                EntryMeta {
+                    path: path_str.to_string(),
+                    raw_size,
+                    crc32,
+                    first_chunk,
+                    chunk_count,
+                },
+            );
         }
 
         // Prefix conflict check.
@@ -661,9 +733,10 @@ impl PackageReader {
             let ap = format!("{}/", a);
             for b in &paths[i + 1..] {
                 if b.starts_with(&ap) || a.starts_with(&format!("{}/", b)) {
-                    return Err(PackageError::InvalidEntryPath(
-                        format!("prefix conflict: '{}' and '{}'", a, b)
-                    ));
+                    return Err(PackageError::InvalidEntryPath(format!(
+                        "prefix conflict: '{}' and '{}'",
+                        a, b
+                    )));
                 }
             }
         }
@@ -684,6 +757,9 @@ impl PackageReader {
                     version: package_version.to_string(),
                     checksum: hasher.finalize(),
                 },
+                inflate_cache: Mutex::new(LruCache::new(
+                    NonZeroUsize::new(INFLATE_CACHE_CAPACITY).unwrap(),
+                )),
             }),
         })
     }
@@ -695,8 +771,10 @@ impl PackageReader {
         position: u64,
         length: Option<u64>,
     ) -> Result<Vec<u8>, PackageError> {
-        let entry = self.inner.entries.get(relative_path)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, relative_path.to_string()))?;
+        let entry =
+            self.inner.entries.get(relative_path).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, relative_path.to_string())
+            })?;
 
         if position >= entry.raw_size || length == Some(0) {
             return Ok(Vec::new());
@@ -707,6 +785,25 @@ impl PackageReader {
         };
         if entry.chunk_count == 0 {
             return Ok(Vec::new());
+        }
+
+        // Inflate-cache fast path: if we previously decompressed this
+        // entry in full, slice the requested range out of the cached
+        // bytes. Avoids both the file open + seek and the zstd inflate
+        // for the menu-switch repeat-read pattern.
+        let cacheable = entry.raw_size <= INFLATE_CACHE_MAX_ENTRY_BYTES;
+        if cacheable {
+            if let Some(full) = self
+                .inner
+                .inflate_cache
+                .lock()
+                .get(relative_path)
+                .map(Arc::clone)
+            {
+                let lo = position as usize;
+                let hi = end as usize;
+                return Ok(full[lo..hi].to_vec());
+            }
         }
 
         let chunk_size = self.inner.chunks[entry.first_chunk as usize].raw_size as u64;
@@ -726,16 +823,19 @@ impl PackageReader {
 
             // Cap decompress output at raw_size (already validated <= MAX_CHUNK_RAW_SIZE).
             let max_output = (chunk.raw_size as usize).min(MAX_CHUNK_RAW_SIZE as usize);
-            let decompressed = zstd::bulk::decompress(&compressed, max_output)
-                .map_err(|e| PackageError::Io(io::Error::new(
+            let decompressed = zstd::bulk::decompress(&compressed, max_output).map_err(|e| {
+                PackageError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("zstd decompress chunk {ci}: {e}"),
-                )))?;
+                ))
+            })?;
 
             let chunk_offset = i as u64 * chunk_size;
             let copy_start = if position > chunk_offset {
                 (position - chunk_offset) as usize
-            } else { 0 };
+            } else {
+                0
+            };
             let copy_end = if end < chunk_offset + decompressed.len() as u64 {
                 (end - chunk_offset) as usize
             } else {
@@ -744,6 +844,18 @@ impl PackageReader {
             if copy_start < copy_end {
                 result.extend_from_slice(&decompressed[copy_start..copy_end]);
             }
+        }
+        // Populate the inflate cache when the request covered the
+        // entire entry. We don't cache partial reads even if the entry
+        // is small — the next reader of the rest of the entry would
+        // miss anyway, and a separate full-read would have to do its
+        // own decompress + populate.
+        if cacheable && position == 0 && end == entry.raw_size {
+            let arc = Arc::new(result.clone());
+            self.inner
+                .inflate_cache
+                .lock()
+                .put(relative_path.to_string(), arc);
         }
         Ok(result)
     }
@@ -775,28 +887,41 @@ impl PackageReader {
         length: Option<u64>,
         max_inflate: u64,
     ) -> Result<Vec<u8>, PackageError> {
-        let entry = self.inner.entries.get(relative_path)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, relative_path.to_string()))?;
+        let entry =
+            self.inner.entries.get(relative_path).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, relative_path.to_string())
+            })?;
         // Reject if the entry's total uncompressed size exceeds the limit.
         if entry.raw_size > max_inflate {
             return Err(PackageError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("entry '{}' raw_size {} exceeds limit {}", relative_path, entry.raw_size, max_inflate),
+                format!(
+                    "entry '{}' raw_size {} exceeds limit {}",
+                    relative_path, entry.raw_size, max_inflate
+                ),
             )));
         }
         self.read_range(relative_path, position, length)
     }
 
-    pub fn contains(&self, path: &str) -> bool { self.inner.entries.contains_key(path) }
-    pub fn identity(&self) -> &PackageIdentity { &self.inner.identity }
-    pub fn entry_count(&self) -> usize { self.inner.entries.len() }
+    pub fn contains(&self, path: &str) -> bool {
+        self.inner.entries.contains_key(path)
+    }
+    pub fn identity(&self) -> &PackageIdentity {
+        &self.inner.identity
+    }
+    pub fn entry_count(&self) -> usize {
+        self.inner.entries.len()
+    }
     pub fn entry_raw_size(&self, path: &str) -> Option<u64> {
         self.inner.entries.get(path).map(|e| e.raw_size)
     }
     pub fn entry_paths(&self) -> impl Iterator<Item = &str> {
         self.inner.entries.keys().map(String::as_str)
     }
-    pub fn package_path(&self) -> &Path { &self.inner.path }
+    pub fn package_path(&self) -> &Path {
+        &self.inner.path
+    }
 
     /// Compute file info (size + digest) by streaming through chunks.
     pub fn get_file_info(
@@ -804,8 +929,10 @@ impl PackageReader {
         relative_path: &str,
         algorithm: &str,
     ) -> Result<(u64, String), PackageError> {
-        let entry = self.inner.entries.get(relative_path)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, relative_path.to_string()))?;
+        let entry =
+            self.inner.entries.get(relative_path).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, relative_path.to_string())
+            })?;
         let mut hasher = HashState::new(algorithm)?;
         let mut file = std::fs::File::open(&self.inner.path)?;
         let mut total = 0u64;
@@ -816,9 +943,12 @@ impl PackageReader {
             let mut compressed = vec![0u8; chunk.compressed_size as usize];
             file.read_exact(&mut compressed)?;
             let decompressed = zstd::bulk::decompress(&compressed, chunk.raw_size as usize)
-                .map_err(|e| PackageError::Io(io::Error::new(
-                    io::ErrorKind::InvalidData, format!("zstd: {e}"),
-                )))?;
+                .map_err(|e| {
+                    PackageError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("zstd: {e}"),
+                    ))
+                })?;
             hasher.update(&decompressed);
             total += decompressed.len() as u64;
         }
@@ -827,7 +957,11 @@ impl PackageReader {
 }
 
 impl Clone for PackageReader {
-    fn clone(&self) -> Self { Self { inner: Arc::clone(&self.inner) } }
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -839,12 +973,20 @@ pub struct PackSource {
 }
 
 impl PackSource {
-    pub fn new(reader: PackageReader) -> Self { Self { reader } }
-    pub fn open(path: &Path, name: &str, version: &str) -> Result<Self, PackageError> {
-        Ok(Self { reader: PackageReader::open(path, name, version)? })
+    pub fn new(reader: PackageReader) -> Self {
+        Self { reader }
     }
-    pub fn identity(&self) -> &PackageIdentity { self.reader.identity() }
-    pub fn reader(&self) -> &PackageReader { &self.reader }
+    pub fn open(path: &Path, name: &str, version: &str) -> Result<Self, PackageError> {
+        Ok(Self {
+            reader: PackageReader::open(path, name, version)?,
+        })
+    }
+    pub fn identity(&self) -> &PackageIdentity {
+        self.reader.identity()
+    }
+    pub fn reader(&self) -> &PackageReader {
+        &self.reader
+    }
 }
 
 impl fmt::Debug for PackSource {
@@ -863,30 +1005,53 @@ impl super::MountBackend for PackSource {
             other => io::Error::new(io::ErrorKind::Other, other.to_string()),
         })
     }
-    fn exists(&self, p: &str) -> bool { self.reader.contains(p) }
-    fn real_path(&self, _: &str) -> Option<PathBuf> { None }
-    fn root_dir(&self) -> Option<&Path> { None }
+    fn exists(&self, p: &str) -> bool {
+        self.reader.contains(p)
+    }
+    fn real_path(&self, _: &str) -> Option<PathBuf> {
+        None
+    }
+    fn root_dir(&self) -> Option<&Path> {
+        None
+    }
 
-    fn is_file(&self, p: &str) -> bool { self.reader.contains(p) }
+    fn is_file(&self, p: &str) -> bool {
+        self.reader.contains(p)
+    }
     fn is_dir(&self, p: &str) -> bool {
-        if p.is_empty() { return true; }
+        if p.is_empty() {
+            return true;
+        }
         let prefix = format!("{p}/");
         self.reader.entry_paths().any(|e| e.starts_with(&prefix))
     }
     fn list_dir(&self, dir: &str) -> Vec<String> {
-        let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
         let mut seen = std::collections::HashSet::new();
         for path in self.reader.entry_paths() {
-            let tail = if prefix.is_empty() { path } else {
-                match path.strip_prefix(&prefix) { Some(t) => t, None => continue }
+            let tail = if prefix.is_empty() {
+                path
+            } else {
+                match path.strip_prefix(&prefix) {
+                    Some(t) => t,
+                    None => continue,
+                }
             };
             if let Some(name) = tail.split('/').next() {
-                if !name.is_empty() { seen.insert(name.to_string()); }
+                if !name.is_empty() {
+                    seen.insert(name.to_string());
+                }
             }
         }
         seen.into_iter().collect()
     }
-    fn entry_size(&self, p: &str) -> Option<u64> { self.reader.entry_raw_size(p) }
+    fn entry_size(&self, p: &str) -> Option<u64> {
+        self.reader.entry_raw_size(p)
+    }
 
     fn read_range(&self, p: &str, pos: u64, len: Option<u64>) -> io::Result<Vec<u8>> {
         self.reader.read_range(p, pos, len).map_err(|e| match e {
@@ -894,17 +1059,27 @@ impl super::MountBackend for PackSource {
             other => io::Error::new(io::ErrorKind::Other, other.to_string()),
         })
     }
-    fn read_range_limited(&self, p: &str, pos: u64, len: Option<u64>, max: u64) -> io::Result<Vec<u8>> {
-        self.reader.read_range_limited(p, pos, len, max).map_err(|e| match e {
-            PackageError::Io(io_err) => io_err,
-            other => io::Error::new(io::ErrorKind::Other, other.to_string()),
-        })
+    fn read_range_limited(
+        &self,
+        p: &str,
+        pos: u64,
+        len: Option<u64>,
+        max: u64,
+    ) -> io::Result<Vec<u8>> {
+        self.reader
+            .read_range_limited(p, pos, len, max)
+            .map_err(|e| match e {
+                PackageError::Io(io_err) => io_err,
+                other => io::Error::new(io::ErrorKind::Other, other.to_string()),
+            })
     }
     fn get_file_info(&self, p: &str, algorithm: &str) -> io::Result<(u64, String)> {
-        self.reader.get_file_info(p, algorithm).map_err(|e| match e {
-            PackageError::Io(io_err) => io_err,
-            other => io::Error::new(io::ErrorKind::Other, other.to_string()),
-        })
+        self.reader
+            .get_file_info(p, algorithm)
+            .map_err(|e| match e {
+                PackageError::Io(io_err) => io_err,
+                other => io::Error::new(io::ErrorKind::Other, other.to_string()),
+            })
     }
     fn copy_to_writer(&self, p: &str, writer: &mut dyn io::Write) -> io::Result<()> {
         let data = self.read(p)?;
@@ -916,7 +1091,10 @@ impl super::MountBackend for PackSource {
 // validate_package
 // ---------------------------------------------------------------------------
 
-pub fn validate_package(path: &Path, verify_checksums: bool) -> Result<PackageIdentity, PackageError> {
+pub fn validate_package(
+    path: &Path,
+    verify_checksums: bool,
+) -> Result<PackageIdentity, PackageError> {
     let reader = PackageReader::open(path, "", "")?;
     if verify_checksums {
         for p in reader.entry_paths().collect::<Vec<_>>() {
@@ -924,6 +1102,82 @@ pub fn validate_package(path: &Path, verify_checksums: bool) -> Result<PackageId
         }
     }
     Ok(reader.identity().clone())
+}
+
+// ---------------------------------------------------------------------------
+// Optional signature verifier (trust chain)
+// ---------------------------------------------------------------------------
+
+use std::sync::OnceLock;
+
+/// Verifier function that the host can register once at startup to
+/// establish a *trust chain* for subpackage installs.
+///
+/// The runtime calls it as `verify(pkg_bytes, manifest_bytes, signature_bytes)`
+/// and refuses to mount the package unless the verifier returns `Ok(())`.
+/// Host apps that want the old "CDN-trusted" behaviour can simply
+/// leave the verifier unregistered; the runtime warns about this
+/// once at startup so the absence of a trust chain is auditable.
+///
+/// `pkg_bytes` is the full `.mpkg` file contents; `manifest` and
+/// `signature` are whatever opaque bytes the host's `SubpackageHandler`
+/// returned alongside the package path. The runtime treats them as
+/// opaque: the host controls the manifest schema, the signature
+/// format, and the trusted keyring.
+pub type SignatureVerifier =
+    fn(pkg_bytes: &[u8], manifest: &[u8], signature: &[u8]) -> Result<(), String>;
+
+static PACKAGE_SIGNATURE_VERIFIER: OnceLock<SignatureVerifier> = OnceLock::new();
+
+/// Register the signature verifier. Returns `true` on first
+/// registration, `false` if a verifier was already set.
+pub fn register_signature_verifier(f: SignatureVerifier) -> bool {
+    PACKAGE_SIGNATURE_VERIFIER.set(f).is_ok()
+}
+
+/// Run the registered verifier, if any. When no verifier has been
+/// registered the runtime surfaces a one-shot warning and accepts
+/// the package — that matches the previous "host said so, so it's
+/// fine" behaviour so existing deployments keep working while the
+/// trust chain is being rolled out.
+///
+/// **New code should always register a verifier.** Call sites that
+/// get an `Err(_)` back from this must abort the install: the runtime
+/// provides no silent fallback.
+pub fn verify_package_signature(
+    pkg_bytes: &[u8],
+    manifest: Option<&[u8]>,
+    signature: Option<&[u8]>,
+) -> Result<(), PackageError> {
+    static MISSING_WARNED: OnceLock<()> = OnceLock::new();
+    match PACKAGE_SIGNATURE_VERIFIER.get() {
+        Some(verify) => {
+            let manifest = manifest.ok_or_else(|| {
+                PackageError::BadIndex(
+                    "signature verifier registered but host did not supply manifest bytes"
+                        .to_string(),
+                )
+            })?;
+            let signature = signature.ok_or_else(|| {
+                PackageError::BadIndex(
+                    "signature verifier registered but host did not supply signature bytes"
+                        .to_string(),
+                )
+            })?;
+            verify(pkg_bytes, manifest, signature).map_err(PackageError::BadIndex)
+        }
+        None => {
+            MISSING_WARNED.get_or_init(|| {
+                tracing::warn!(
+                    "package signature verifier not registered — subpackages are being \
+                     mounted on host-supplied integrity only. Call \
+                     shared::vfs::package::register_signature_verifier once at startup \
+                     to enable runtime-side verification."
+                );
+            });
+            Ok(())
+        }
+    }
 }
 
 // ===========================================================================
@@ -956,13 +1210,19 @@ mod tests {
     }
 
     #[test]
-    fn reject_absolute() { assert!(validate_entry_path("/etc/passwd").is_err()); }
+    fn reject_absolute() {
+        assert!(validate_entry_path("/etc/passwd").is_err());
+    }
 
     #[test]
-    fn reject_empty() { assert!(validate_entry_path("").is_err()); }
+    fn reject_empty() {
+        assert!(validate_entry_path("").is_err());
+    }
 
     #[test]
-    fn reject_backslash() { assert!(validate_entry_path("a\\b").is_err()); }
+    fn reject_backslash() {
+        assert!(validate_entry_path("a\\b").is_err());
+    }
 
     #[test]
     fn reject_duplicate_in_writer() {
@@ -990,13 +1250,17 @@ mod tests {
             let f = std::fs::File::create(&p).unwrap();
             let mut w = PackageWriter::new(io::BufWriter::new(f)).unwrap();
             w.add_entry("main.js", b"console.log('hello')").unwrap();
-            w.add_entry("lib/utils.js", b"export function x() {}").unwrap();
+            w.add_entry("lib/utils.js", b"export function x() {}")
+                .unwrap();
             w.finish("test", "1.0").unwrap();
         }
         let r = PackageReader::open(&p, "test", "1.0").unwrap();
         assert_eq!(r.entry_count(), 2);
         assert_eq!(r.read_entry("main.js").unwrap(), b"console.log('hello')");
-        assert_eq!(r.read_entry("lib/utils.js").unwrap(), b"export function x() {}");
+        assert_eq!(
+            r.read_entry("lib/utils.js").unwrap(),
+            b"export function x() {}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1116,9 +1380,15 @@ mod tests {
         }
         let r = PackageReader::open(&p, "test", "1.0").unwrap();
         // Cross multiple 1KB chunks.
-        assert_eq!(r.read_range("data.bin", 500, Some(3000)).unwrap(), &content[500..3500]);
+        assert_eq!(
+            r.read_range("data.bin", 500, Some(3000)).unwrap(),
+            &content[500..3500]
+        );
         // Near end.
-        assert_eq!(r.read_range("data.bin", 199_000, None).unwrap(), &content[199_000..]);
+        assert_eq!(
+            r.read_range("data.bin", 199_000, None).unwrap(),
+            &content[199_000..]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1157,8 +1427,7 @@ mod tests {
             f.write_all(b"CORRUPT").unwrap();
         }
         // Corruption may be caught at open (chunk bounds) or read (decompress/CRC).
-        let result = PackageReader::open(&p, "test", "1.0")
-            .and_then(|r| r.read_entry("a.js"));
+        let result = PackageReader::open(&p, "test", "1.0").and_then(|r| r.read_entry("a.js"));
         assert!(result.is_err(), "corrupted package must fail");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1168,7 +1437,10 @@ mod tests {
         let dir = make_test_dir("bad_magic");
         let p = dir.join("test.mpkg");
         std::fs::write(&p, b"NOT_MPKG_HEADER_PADDING_TO_32B!!").unwrap();
-        assert!(matches!(PackageReader::open(&p, "t", "1"), Err(PackageError::BadMagic)));
+        assert!(matches!(
+            PackageReader::open(&p, "t", "1"),
+            Err(PackageError::BadMagic)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1206,9 +1478,15 @@ mod tests {
 
     #[test]
     fn writer_poisoned() {
-        struct FailWriter { count: usize, limit: usize, buf: Vec<u8> }
+        struct FailWriter {
+            count: usize,
+            limit: usize,
+            buf: Vec<u8>,
+        }
         impl io::Write for FailWriter {
-            fn write(&mut self, b: &[u8]) -> io::Result<usize> { self.buf.write(b) }
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.buf.write(b)
+            }
             fn write_all(&mut self, b: &[u8]) -> io::Result<()> {
                 self.count += 1;
                 if self.count > self.limit {
@@ -1216,13 +1494,21 @@ mod tests {
                 }
                 self.buf.write_all(b)
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
         impl io::Seek for FailWriter {
-            fn seek(&mut self, _: SeekFrom) -> io::Result<u64> { Ok(0) }
+            fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+                Ok(0)
+            }
         }
         // Header writes: magic(1) + ver(1) + entry_count(1) + chunk_count(1) + ct_offset(1) + idx_offset(1) = 6
-        let mut fw = FailWriter { count: 0, limit: 6, buf: Vec::new() };
+        let mut fw = FailWriter {
+            count: 0,
+            limit: 6,
+            buf: Vec::new(),
+        };
         let mut w = PackageWriter::new(&mut fw).unwrap();
         assert!(w.add_entry("a.txt", b"data").is_err());
         let err = w.add_entry("b.txt", b"x");

@@ -1,8 +1,7 @@
 use std::net::SocketAddr;
 
 /// Delay inserted before each poll iteration when the app is backgrounded.
-pub(super) const BACKGROUND_THROTTLE: std::time::Duration =
-    std::time::Duration::from_millis(500);
+pub(super) const BACKGROUND_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Resolve a host:port string to the first SocketAddr.
 ///

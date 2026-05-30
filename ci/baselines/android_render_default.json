@@ -9,22 +9,22 @@
   },
   "results": [
     {
-      "device": "api23-low",
+      "device": "api26-low",
       "workload": "cocos-webgl-gameplay",
       "stats": {"avg_fps": 55.0, "p95_ms": 24.0, "first_frame_ms": 520.0, "full_surface_frames": 900.0, "upload_frame_rejections": 0.0}
     },
     {
-      "device": "api23-low",
+      "device": "api26-low",
       "workload": "odc-canvas2d-ui",
       "stats": {"avg_fps": 57.0, "p95_ms": 21.0, "first_frame_ms": 410.0, "full_surface_frames": 850.0, "upload_frame_rejections": 0.0}
     },
     {
-      "device": "api23-low",
+      "device": "api26-low",
       "workload": "startup-loader",
       "stats": {"avg_fps": 54.0, "p95_ms": 25.0, "first_frame_ms": 780.0, "full_surface_frames": 500.0, "upload_frame_rejections": 0.0}
     },
     {
-      "device": "api23-low",
+      "device": "api26-low",
       "workload": "resize-orientation",
       "stats": {"avg_fps": 56.0, "p95_ms": 23.0, "first_frame_ms": 460.0, "full_surface_frames": 800.0, "upload_frame_rejections": 0.0}
     },

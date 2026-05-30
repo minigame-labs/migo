@@ -5,7 +5,7 @@ A lightweight, high-performance JavaScript game runtime for Android.
 ## Features
 
 - 🚀 **High Performance** - Native Rust engine with OpenGL ES rendering
-- 📱 **API 21+** - Supports Android 5.0 Lollipop and above
+- 📱 **API 26+** - Supports Android 8.0 Oreo and above
 - 🔧 **Zero Dependencies** - No AndroidX, Kotlin, or third-party libraries required
 - 🎮 **Game Ready** - Canvas 2D and WebGL support
 - 🔒 **Sandboxed Filesystem** - Isolated file storage per game
@@ -73,15 +73,14 @@ public class GameActivity extends Activity {
             @Override
             public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
                 if (session != null) {
-                    session.updateSurface(holder.getSurface());
+                    session.updateSurface(holder.getSurface(), width, height);
                 }
             }
 
             @Override
             public void surfaceDestroyed(SurfaceHolder holder) {
                 if (session != null) {
-                    session.close();
-                    session = null;
+                    session.onSurfaceDestroyed();
                 }
             }
         });
@@ -298,7 +297,7 @@ The library includes ProGuard rules. If you need to add custom rules:
 
 ## Requirements
 
-- **Minimum SDK**: 21 (Android 5.0 Lollipop)
+- **Minimum SDK**: 26 (Android 8.0 Oreo)
 - **Target SDK**: 34 (Android 14)
 - **Supported ABIs**: arm64-v8a, x86_64
 

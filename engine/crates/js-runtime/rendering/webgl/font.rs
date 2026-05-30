@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use deno_core::{op2, OpState};
+use deno_core::{OpState, op2};
 use tracing::{error, info};
 
 use shared::{
@@ -11,6 +11,64 @@ use shared::{
 
 const OP_LOAD_FONT: &str = "load_font";
 const OP_GET_TEXT_LINE_HEIGHT: &str = "get_text_line_height";
+
+#[derive(Debug, PartialEq, Eq)]
+struct FontRegistrationRequest {
+    family: String,
+    aliases: Vec<String>,
+}
+
+fn normalize_family_name(candidate: &str) -> Option<String> {
+    let trimmed = candidate
+        .trim()
+        .trim_matches(|ch| ch == '"' || ch == '\'')
+        .trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn push_alias(aliases: &mut Vec<String>, alias: String) {
+    let key = alias.to_lowercase();
+    if aliases
+        .iter()
+        .any(|existing| existing.to_lowercase() == key)
+    {
+        return;
+    }
+    aliases.push(alias);
+}
+
+fn build_font_registration_request(path: &str, family: Option<&str>) -> FontRegistrationRequest {
+    let explicit_family = family.and_then(normalize_family_name);
+    let raw_stem = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(normalize_family_name);
+    let lowercase_stem = raw_stem.as_ref().map(|stem| stem.to_lowercase());
+
+    let family = explicit_family
+        .clone()
+        .or_else(|| lowercase_stem.clone())
+        .or_else(|| raw_stem.clone())
+        .unwrap_or_else(|| "custom-font".to_string());
+
+    let mut aliases = Vec::new();
+    if let Some(explicit_family) = explicit_family {
+        push_alias(&mut aliases, explicit_family);
+    }
+    if let Some(raw_stem) = raw_stem {
+        push_alias(&mut aliases, raw_stem);
+    }
+    if let Some(lowercase_stem) = lowercase_stem {
+        push_alias(&mut aliases, lowercase_stem);
+    }
+    push_alias(&mut aliases, family.clone());
+
+    FontRegistrationRequest { family, aliases }
+}
 
 fn resolve_font_src_path(
     code_dir: &str,
@@ -63,10 +121,14 @@ fn resolve_font_src_path(
 /// bytes, sends them to the render thread for registration in both the global
 /// font store and all existing canvas FontManagers.
 ///
-/// Returns the font family key (file stem) on success, or empty string on failure.
+/// Returns the font family key on success, or empty string on failure.
 #[op2]
 #[string]
-pub(crate) fn op_load_font(state: &mut OpState, #[string] path: String) -> String {
+pub(crate) fn op_load_font(
+    state: &mut OpState,
+    #[string] path: String,
+    #[string] family: Option<String>,
+) -> String {
     // Resolve font path with VFS support (/code, /user, /cache, /tmp).
     let resolved = {
         let host = state.borrow::<HostOpState>();
@@ -94,24 +156,24 @@ pub(crate) fn op_load_font(state: &mut OpState, #[string] path: String) -> Strin
         return String::new();
     }
 
-    // Derive the font family key from the file stem.
-    let key = std::path::Path::new(&path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("custom-font")
-        .to_lowercase();
+    let request = build_font_registration_request(&path, family.as_deref());
 
     let bytes = Arc::new(bytes);
+    let aliases = Arc::new(request.aliases.clone());
 
     // Send to render thread for registration.
     let ctx = state.borrow::<CanvasOpState>();
     match send_render_with_resp_sync(ctx, OP_LOAD_FONT, |resp| RenderCommand::LoadFont {
-        key: key.clone(),
+        family: request.family.clone(),
+        aliases: aliases.clone(),
         bytes: bytes.clone(),
         resp,
     }) {
         Ok(family) => {
-            info!("op_load_font: loaded '{}' as '{}'", path, family);
+            info!(
+                "op_load_font: loaded '{}' as '{}' with aliases {:?}",
+                path, family, request.aliases
+            );
             family
         }
         Err(e) => {
@@ -154,7 +216,7 @@ pub(crate) fn op_get_text_line_height(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_font_src_path;
+    use super::{build_font_registration_request, resolve_font_src_path};
     use shared::vfs::VirtualFS;
     use std::{
         fs,
@@ -193,5 +255,30 @@ mod tests {
         assert_eq!(resolved, font_path.to_string_lossy());
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn explicit_family_becomes_canonical_registration_key() {
+        let request =
+            build_font_registration_request("fonts/NotoSans-Regular.ttf", Some("Brand Sans"));
+        assert_eq!(request.family, "Brand Sans");
+        assert_eq!(
+            request.aliases,
+            vec![
+                "Brand Sans".to_string(),
+                "NotoSans-Regular".to_string(),
+                "notosans-regular".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn file_stem_stays_backward_compatible_without_explicit_family() {
+        let request = build_font_registration_request("fonts/MyFont.ttf", None);
+        assert_eq!(request.family, "myfont");
+        assert_eq!(
+            request.aliases,
+            vec!["MyFont".to_string(), "myfont".to_string()]
+        );
     }
 }

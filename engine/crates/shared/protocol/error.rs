@@ -28,13 +28,22 @@ pub struct ServiceError {
 
 impl ServiceError {
     pub fn not_supported(msg: impl Into<String>) -> Self {
-        Self { code: ServiceErrorCode::NotSupported, message: msg.into() }
+        Self {
+            code: ServiceErrorCode::NotSupported,
+            message: msg.into(),
+        }
     }
     pub fn invalid_param(msg: impl Into<String>) -> Self {
-        Self { code: ServiceErrorCode::InvalidParam, message: msg.into() }
+        Self {
+            code: ServiceErrorCode::InvalidParam,
+            message: msg.into(),
+        }
     }
     pub fn system(msg: impl Into<String>) -> Self {
-        Self { code: ServiceErrorCode::SystemError, message: msg.into() }
+        Self {
+            code: ServiceErrorCode::SystemError,
+            message: msg.into(),
+        }
     }
 }
 
@@ -49,12 +58,18 @@ impl std::error::Error for ServiceError {}
 /// Conversion from String (for backward compatibility during migration)
 impl From<String> for ServiceError {
     fn from(msg: String) -> Self {
-        Self { code: ServiceErrorCode::SystemError, message: msg }
+        Self {
+            code: ServiceErrorCode::SystemError,
+            message: msg,
+        }
     }
 }
 impl From<&str> for ServiceError {
     fn from(msg: &str) -> Self {
-        Self { code: ServiceErrorCode::SystemError, message: msg.to_string() }
+        Self {
+            code: ServiceErrorCode::SystemError,
+            message: msg.to_string(),
+        }
     }
 }
 

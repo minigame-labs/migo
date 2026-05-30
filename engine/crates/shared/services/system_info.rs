@@ -9,12 +9,16 @@ use crate::protocol::error::ServiceError;
 pub trait SystemInfoService: Send + Sync {
     /// Open the system Bluetooth settings page.
     fn open_bluetooth_settings(&self) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("openSystemBluetoothSetting:fail not supported"))
+        Err(ServiceError::not_supported(
+            "openSystemBluetoothSetting:fail not supported",
+        ))
     }
 
     /// Open the app authorization settings page.
     fn open_app_authorize_setting(&self) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("openAppAuthorizeSetting:fail not supported"))
+        Err(ServiceError::not_supported(
+            "openAppAuthorizeSetting:fail not supported",
+        ))
     }
 
     /// Get the bounding client rect of the menu button (capsule) as JSON.
@@ -33,7 +37,9 @@ pub trait SystemInfoService: Send + Sync {
     /// `window_width`, `window_height`, `status_bar_height`, `screen_top`,
     /// `safe_area: { left, top, right, bottom }`.
     fn get_window_info_json(&self) -> Result<String, ServiceError> {
-        Err(ServiceError::not_supported("getWindowInfo:fail not supported"))
+        Err(ServiceError::not_supported(
+            "getWindowInfo:fail not supported",
+        ))
     }
 
     /// Get system settings as JSON string.
@@ -41,7 +47,9 @@ pub trait SystemInfoService: Send + Sync {
     /// Expected JSON fields: `bluetooth_enabled`, `location_enabled`,
     /// `wifi_enabled`, `orientation`.
     fn get_system_settings_json(&self) -> Result<String, ServiceError> {
-        Err(ServiceError::not_supported("getSystemSetting:fail not supported"))
+        Err(ServiceError::not_supported(
+            "getSystemSetting:fail not supported",
+        ))
     }
 
     /// Get device info as JSON string.
@@ -49,7 +57,9 @@ pub trait SystemInfoService: Send + Sync {
     /// Expected JSON fields: `abi`, `deviceAbi`, `benchmarkLevel`, `brand`,
     /// `model`, `system`, `platform`, `cpuType`, `memorySize`.
     fn get_device_info_json(&self) -> Result<String, ServiceError> {
-        Err(ServiceError::not_supported("getDeviceInfo:fail not supported"))
+        Err(ServiceError::not_supported(
+            "getDeviceInfo:fail not supported",
+        ))
     }
 
     /// Open the mini program setting page (Mode C, async).
@@ -57,7 +67,9 @@ pub trait SystemInfoService: Send + Sync {
     /// Result delivered via `onOpenSettingResult` callback with JSON:
     /// `{"authSetting":{"scope.userInfo":true,...}}`
     fn open_setting(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("openSetting:fail not supported"))
+        Err(ServiceError::not_supported(
+            "openSetting:fail not supported",
+        ))
     }
 
     /// Get app authorization setting as JSON string.
@@ -65,6 +77,8 @@ pub trait SystemInfoService: Send + Sync {
     /// Expected JSON fields: `albumAuthorized`, `bluetoothAuthorized`,
     /// `cameraAuthorized`, `locationAuthorized`, `microphoneAuthorized`, etc.
     fn get_app_authorization_setting_json(&self) -> Result<String, ServiceError> {
-        Err(ServiceError::not_supported("getAppAuthorizeSetting:fail not supported"))
+        Err(ServiceError::not_supported(
+            "getAppAuthorizeSetting:fail not supported",
+        ))
     }
 }

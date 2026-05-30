@@ -7,10 +7,10 @@
 //! shared EGL context (probed at init).  TierB devices skip this entirely
 //! and upload on the render thread as before.
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use glow::HasContext;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, info, warn};
 
 /// A single upload that completed on the upload thread but whose result
@@ -60,7 +60,9 @@ unsafe impl Send for CompletedUpload {}
 
 /// Handle to the upload thread.  Dropped when the engine shuts down.
 pub struct UploadThreadHandle {
-    job_tx: Sender<UploadJob>,
+    /// Wrapped in `Option` so `Drop` can take and drop it before joining,
+    /// closing the channel and unblocking the upload thread's `recv`.
+    job_tx: Option<Sender<UploadJob>>,
     result_rx: Receiver<CompletedUpload>,
     consecutive_failures: Arc<AtomicU32>,
     /// Per-item notifications for uploads that completed but whose results
@@ -68,7 +70,23 @@ pub struct UploadThreadHandle {
     /// enabling CanvasManager to recover budget and resolve pending responses.
     dropped_rx: Receiver<DroppedUpload>,
     degraded: bool,
-    _handle: std::thread::JoinHandle<()>,
+    /// Wrapped in `Option` so `Drop` can take and `join` the thread,
+    /// guaranteeing it fully releases its shared EGL context before the
+    /// parent's EGL display teardown runs.  Without the join the upload
+    /// thread races with EGL display destruction and emits
+    /// `EGL_BAD_SURFACE` / `EGL_BAD_CONTEXT` at process exit.
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for UploadThreadHandle {
+    fn drop(&mut self) {
+        // Close the job channel first so the upload thread's `recv()`
+        // returns Err and the loop exits.
+        drop(self.job_tx.take());
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Maximum consecutive upload failures before permanent degradation.
@@ -94,13 +112,26 @@ impl UploadThreadHandle {
         config: khronos_egl::Config,
         share_ctx: khronos_egl::Context,
         gles_major: u32,
+        has_robust_context: bool,
     ) -> Option<Self> {
-        // Create shared context matching the render context's GLES version.
-        let ctx_attribs = [
-            khronos_egl::CONTEXT_CLIENT_VERSION as i32,
-            gles_major as i32,
-            khronos_egl::NONE as i32,
+        // Create shared context matching the render context's GLES
+        // version.  R-3: mirror the render context's robustness
+        // setting so the shared context also reports reset via
+        // `glGetGraphicsResetStatus` if the driver supports it.
+        let mut ctx_attribs: Vec<khronos_egl::Int> = vec![
+            khronos_egl::CONTEXT_CLIENT_VERSION as khronos_egl::Int,
+            gles_major as khronos_egl::Int,
         ];
+        if has_robust_context {
+            // Same attribute pair as `egl_ops::build_ctx_attribs`;
+            // replicated here to keep `upload_thread` free of a
+            // manager-module dependency.
+            const EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT: khronos_egl::Int = 0x3138;
+            const EGL_LOSE_CONTEXT_ON_RESET_EXT: khronos_egl::Int = 0x31BF;
+            ctx_attribs.push(EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT);
+            ctx_attribs.push(EGL_LOSE_CONTEXT_ON_RESET_EXT);
+        }
+        ctx_attribs.push(khronos_egl::NONE as khronos_egl::Int);
 
         let shared_ctx = egl
             .create_context(display, config, Some(share_ctx), &ctx_attribs)
@@ -162,12 +193,12 @@ impl UploadThreadHandle {
         info!("Upload thread spawned (shared GL context)");
 
         Some(Self {
-            job_tx,
+            job_tx: Some(job_tx),
             result_rx,
             consecutive_failures,
             dropped_rx,
             degraded: false,
-            _handle: handle,
+            handle: Some(handle),
         })
     }
 
@@ -176,7 +207,10 @@ impl UploadThreadHandle {
         if self.degraded {
             return false;
         }
-        self.job_tx.try_send(job).is_ok()
+        match self.job_tx.as_ref() {
+            Some(tx) => tx.try_send(job).is_ok(),
+            None => false,
+        }
     }
 
     /// Drain completed uploads.  Non-blocking — returns whatever is ready.
@@ -249,6 +283,30 @@ fn upload_thread_main(
                 .unwrap_or(std::ptr::null())
         })
     };
+
+    // Re-run the AHB import-fn resolution on this thread, against
+    // this thread's EGL context.  On most Android drivers the
+    // `eglGetProcAddress` table is process-global and the
+    // process-wide `OnceLock::get_or_init` already holds the
+    // cached pointers — but the EGL 1.4 spec only guarantees the
+    // addresses are valid for the resolving context, so we
+    // defensively re-resolve under the upload thread's own
+    // context.  If the main thread's resolution already succeeded
+    // this is cheap (the `OnceLock` short-circuits); if the main
+    // thread never attempted resolution we still capture the
+    // diagnostic here so the operator sees where the failure
+    // originated.
+    let _ = crate::texture_import::ensure_import_fns(&|s| {
+        egl.get_proc_address(s)
+            .map(|f| unsafe { std::mem::transmute::<_, unsafe extern "C" fn()>(f) })
+    });
+    if let Err(e) = crate::texture_import::validate_import_fns() {
+        // Not a hard failure: the upload thread's primary job is
+        // PBO uploads; AHB is only a fast-path optimisation
+        // inside `upload_texture_tiered`.  Log and continue so
+        // PBO work still lands.
+        info!("Upload thread: AHB path unavailable ({e}); continuing with PBO only");
+    }
 
     info!("Upload thread: GL context ready");
 
@@ -332,12 +390,16 @@ impl UploadPboPool {
     ///
     /// # Safety
     /// A GL context must be current.
-    unsafe fn acquire(&mut self, gl: &glow::Context, need: usize) -> Result<glow::NativeBuffer, String> {
+    unsafe fn acquire(
+        &mut self,
+        gl: &glow::Context,
+        need: usize,
+    ) -> Result<glow::NativeBuffer, String> {
         if let Some(idx) = self.entries.iter().position(|(_, cap)| *cap >= need) {
             let (buf, _) = self.entries.remove(idx);
             return Ok(buf);
         }
-        gl.create_buffer().map_err(|e| format!("create_buffer(PBO): {e}"))
+        unsafe { gl.create_buffer() }.map_err(|e| format!("create_buffer(PBO): {e}"))
     }
 
     /// Return a PBO to the pool.  Drops the buffer if the pool is full.
@@ -345,7 +407,7 @@ impl UploadPboPool {
         if self.entries.len() < Self::MAX_ENTRIES {
             self.entries.push((buf, capacity));
         } else {
-            gl.delete_buffer(buf);
+            unsafe { gl.delete_buffer(buf) };
         }
     }
 }
@@ -395,13 +457,26 @@ fn do_upload(
         gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, &job.rgba, glow::STREAM_DRAW);
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
 
-        gl.tex_image_2d(
+        // Immutable storage + subimage upload. GLES 3.0+ drivers
+        // optimise this pair far more aggressively than the classic
+        // `glTexImage2D` path: the allocation is committed once and
+        // never reshaped, and subsequent rebinds skip validation of
+        // completeness flags. Sized internal format `GL_RGBA8`
+        // (`0x8058`) matches the canvas/manager immutable path.
+        gl.tex_storage_2d(
             glow::TEXTURE_2D,
-            0,
-            glow::RGBA as i32,
+            /* levels */ 1,
+            /* internal_format */ 0x8058,
             job.width as i32,
             job.height as i32,
+        );
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D,
             0,
+            0,
+            0,
+            job.width as i32,
+            job.height as i32,
             glow::RGBA,
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::BufferOffset(0),

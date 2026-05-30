@@ -109,6 +109,14 @@ impl ImageCache {
             if let Some(key) = self.shared_to_key.get(&shared_id).cloned() {
                 if let Some(entry) = self.by_src.get_mut(&key) {
                     entry.refs = entry.refs.saturating_sub(1);
+                    // H-5: each alias removal releases exactly one
+                    // pin on the io-side LRU entry.  When refs hits
+                    // zero the full unpin drops the count back to
+                    // regular-LRU eligibility so the bytes can age
+                    // out normally; idle entries don't deserve
+                    // permanent residence any more than the caller
+                    // deserves a silent black texture.
+                    io::image_cache::global_cache().unpin(&to_io_cache_key(&key));
                     if entry.refs == 0 {
                         self.by_src.remove(&key);
                         self.shared_to_key.remove(&shared_id);
@@ -131,6 +139,12 @@ impl ImageCache {
             self.shared_to_key
                 .entry(shared_id)
                 .or_insert_with(|| key.clone());
+            // H-5: every refs++ site must pair with a pin to keep
+            // the live-vs-cached split consistent.  The io cache
+            // side counts pins additively, so two aliases to the
+            // same shared image hold two pins; releasing one
+            // decrements without making the entry evictable.
+            io::image_cache::global_cache().pin(&to_io_cache_key(key));
 
             return BeginLoadResult::AlreadyLoaded((shared_id, entry.dims));
         }
@@ -180,6 +194,9 @@ impl ImageCache {
             self.shared_to_key
                 .entry(shared_id)
                 .or_insert_with(|| actual_key.clone());
+            // H-5: joiner became a real alias; pin the io entry
+            // to keep bytes alive for its texImage2D path.
+            io::image_cache::global_cache().pin(&to_io_cache_key(actual_key));
         }
     }
 
@@ -221,6 +238,8 @@ impl ImageCache {
                         existing.refs = existing.refs.saturating_add(1);
                         self.alias_to_shared
                             .insert(loader_image_id, existing_shared_id);
+                        // H-5: loader morphed into a real alias.
+                        io::image_cache::global_cache().pin(&to_io_cache_key(actual_key));
                     }
                     self.shared_to_key
                         .insert(existing_shared_id, actual_key.clone());
@@ -248,6 +267,12 @@ impl ImageCache {
                 );
                 if loader_alive {
                     self.alias_to_shared.insert(loader_image_id, shared_id);
+                    // H-5: new shared-entry path; pin for the
+                    // loader's alias.  Joiners (if any) will pin
+                    // separately when their `bind_alias_existing`
+                    // resolves, so each refs++ stays paired with
+                    // exactly one pin.
+                    io::image_cache::global_cache().pin(&to_io_cache_key(actual_key));
                 }
                 self.shared_to_key.insert(shared_id, actual_key.clone());
 
@@ -281,6 +306,13 @@ impl ImageCache {
             if let Some(entry) = self.by_src.get_mut(&key) {
                 if entry.refs > 0 {
                     entry.refs -= 1;
+                    // H-5: one alias released → unpin once.  When
+                    // entry.refs still > 0 the remaining aliases
+                    // keep their own pins, so the io entry
+                    // stays live.  When refs hits zero the
+                    // final unpin here transitions the entry
+                    // to LRU-evictable.
+                    io::image_cache::global_cache().unpin(&to_io_cache_key(&key));
                 }
                 if entry.refs == 0 {
                     self.by_src.remove(&key);
@@ -321,6 +353,21 @@ impl ImageCache {
             .unwrap_or(image_id);
         self.shared_to_key.get(&shared_id).cloned()
     }
+
+    /// Resolve a caller-side `image_id` (alias) to the underlying
+    /// shared image identifier and its decoded dimensions, if known.
+    ///
+    /// Returns `None` if no alias has been registered yet (e.g. the
+    /// caller invented an `image_id` it never loaded) or if the
+    /// underlying load is still in flight.  The dimensions are taken
+    /// from the cache entry so callers don't need to round-trip to
+    /// the render thread to learn texture extents.
+    pub fn shared_for_image_id(&self, image_id: u32) -> Option<(u32, (usize, usize))> {
+        let shared_id = self.alias_to_shared.get(&image_id).copied()?;
+        let key = self.shared_to_key.get(&shared_id)?;
+        let entry = self.by_src.get(key)?;
+        Some((shared_id, entry.dims))
+    }
 }
 
 pub static IMAGE_CACHE: LazyLock<Mutex<ImageCache>> =
@@ -343,6 +390,25 @@ pub fn drain_shared_image_cache() -> Vec<u32> {
     {
         if seen.insert(id) {
             shared_ids.push(id);
+        }
+    }
+    // H-5: release every pin we ever took before wiping the
+    // tracking maps.  Each (key, entry) pair held one pin per
+    // `refs` unit; draining must undo them all so the io cache
+    // doesn't carry dead pins into the next session (which
+    // would make those entries permanently un-evictable even
+    // after their aliases are gone).
+    let pin_releases: Vec<(io::image_cache::ImageCacheKey, usize)> = c
+        .by_src
+        .iter()
+        .map(|(k, v)| (to_io_cache_key(k), v.refs))
+        .collect();
+    {
+        let mut io_cache = io::image_cache::global_cache();
+        for (io_key, refs) in pin_releases {
+            for _ in 0..refs {
+                io_cache.unpin(&io_key);
+            }
         }
     }
     c.by_src.clear();

@@ -53,12 +53,16 @@ Feature requests are welcome. Please include:
 
 ## Development Setup
 
+> For the full, platform-specific build guide (Linux / macOS / Windows),
+> including Skia-from-source requirements and troubleshooting, see
+> [`docs/BUILD.md`](docs/BUILD.md). This section is the short version.
+
 ### Prerequisites
 
-- Rust 1.75+
-- Android NDK r25+ (for Android builds)
-- JDK 11+ (for Android builds)
-- (Optional) PowerShell 7+ if you use `*.ps1` scripts on macOS/Linux
+- Rust 1.80+ (edition 2024)
+- Android NDK r23+ (r23b or r25c recommended) — Android targets
+- JDK 17+ (for AAR builds)
+- `cargo-ndk`, `python3`, `ninja`, `git` (Android builds compile Skia from source)
 
 ### Clone
 
@@ -80,13 +84,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 ### Build Android AAR (if applicable)
 
 ```bash
-# From repo root
-./scripts/build-aar.ps1 -BuildType debug
-# or
-./scripts/build-aar.ps1 -BuildType release
+# Linux / macOS
+bash scripts/build-aar.sh release
+
+# Windows
+.\scripts\build-aar.ps1 release
 ```
 
-> Note: If you cannot run PowerShell scripts on your platform, please open an issue and we can add a cross-platform build script (e.g., bash) or CI artifacts.
+For ABI selection, single-step `.so` builds, and troubleshooting (NDK
+env vars, Skia source-build deps, proxy setup, WSL2 memory), see
+[`docs/BUILD.md`](docs/BUILD.md).
 
 ## Coding Guidelines
 

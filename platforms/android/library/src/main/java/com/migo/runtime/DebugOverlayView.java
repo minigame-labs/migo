@@ -59,6 +59,8 @@ public class DebugOverlayView extends LinearLayout {
     private final TextView rowFps;
     private final TextView rowTiming;
     private final TextView rowRender;
+    private final TextView rowQueue;
+    private final TextView rowSnap;
     private final TextView rowMem;
     private final TextView rowCpu;
     private TextView rowFatal;
@@ -102,6 +104,8 @@ public class DebugOverlayView extends LinearLayout {
 
         rowFps    = createRow("-- FPS  --ms");
         rowRender = createRow("RAF: --  Swap: --  UQ: --  GM: --");
+        rowQueue  = createRow("Q: --  PB: --  WR: --  SK: --  DU: --");
+        rowSnap   = createRow("Snap: --  Up: --  FB: --  FR: --");
         rowCpu    = createRow("CPU: --");
         rowMem    = createRow("Mem: --");
         rowTiming = createRow("Start: --  1st: --");
@@ -287,6 +291,20 @@ public class DebugOverlayView extends LinearLayout {
         int damageAreaKpx       = data.length >= h + 52 ? buf.getInt(h + 48) : 0;
         int uploadFrameReject   = data.length >= h + 56 ? buf.getInt(h + 52) : 0;
         int droppedUploadRecov  = data.length >= h + 60 ? buf.getInt(h + 56) : 0;
+        // v4 queue / cache observability at payload offsets 92..112.
+        // Tail-append only; a v3 native (payload 92) will simply
+        // short-circuit these reads to 0 via the length guards.
+        int renderQueueLen      = data.length >= h + 96  ? buf.getInt(h + 92)  : 0;
+        int collectorPending    = data.length >= h + 100 ? buf.getInt(h + 96)  : 0;
+        int webglErrOverflow    = data.length >= h + 104 ? buf.getInt(h + 100) : 0;
+        int skImageWrappers     = data.length >= h + 108 ? buf.getInt(h + 104) : 0;
+        int deferredUploads     = data.length >= h + 112 ? buf.getInt(h + 108) : 0;
+        // v5 Canvas2D zero-readback snapshot counters at payload
+        // offsets 112..128.  Older natives short-circuit to 0.
+        int snapTaken           = data.length >= h + 116 ? buf.getInt(h + 112) : 0;
+        int snapFallback        = data.length >= h + 120 ? buf.getInt(h + 116) : 0;
+        int snapUpload          = data.length >= h + 124 ? buf.getInt(h + 120) : 0;
+        int snapForcedReadback  = data.length >= h + 128 ? buf.getInt(h + 124) : 0;
 
         float fps     = (fpsX10 & 0xFFFFFFFFL) / 10f;
         float frameMs = (frameTimeUs & 0xFFFFFFFFL) / 1000f;
@@ -327,6 +345,45 @@ public class DebugOverlayView extends LinearLayout {
                 dmgInfo,
                 uploadInfo));
         rowRender.setTextColor((rafLatencyUs > 0 || swapBlockUs > 0) ? LABEL_COLOR : TEXT_COLOR);
+
+        // Queue / cache observability row (v4).  Collector pending
+        // bytes is shown in KiB to keep the line short; a rising
+        // render queue depth near the 512 cap means the host
+        // thread is on the verge of blocking in CommandSender::send.
+        int collectorKb = (int) ((collectorPending & 0xFFFFFFFFL) / 1024);
+        rowQueue.setText(String.format(
+                "Q: %d  PB: %dKB  WR: %d  SK: %d  DU: %d",
+                renderQueueLen & 0xFFFFFFFFL,
+                collectorKb,
+                webglErrOverflow & 0xFFFFFFFFL,
+                skImageWrappers & 0xFFFFFFFFL,
+                deferredUploads & 0xFFFFFFFFL));
+        // Highlight when queue is > 75% of its 512 cap, or when
+        // any WebGL error has been dropped.
+        boolean queueWarn = (renderQueueLen & 0xFFFFFFFFL) > 384
+                || (webglErrOverflow & 0xFFFFFFFFL) > 0;
+        rowQueue.setTextColor(queueWarn ? WARN_COLOR : TEXT_COLOR);
+
+        // Canvas2D zero-readback snapshot row (v5).
+        // Snap = snapshots taken (FBO blit succeeded);
+        // Up   = snapshots consumed by texImage2D (the cocos hot path);
+        // FB   = JS fell back to the legacy CPU getImageData;
+        // FR   = `migo._force_readback(imageData)` calls (slow CPU readback).
+        // Steady state for a Cocos text-heavy game: Snap≈Up, FB=0, FR=0.
+        rowSnap.setText(String.format(
+                "Snap: %d  Up: %d  FB: %d  FR: %d",
+                snapTaken & 0xFFFFFFFFL,
+                snapUpload & 0xFFFFFFFFL,
+                snapFallback & 0xFFFFFFFFL,
+                snapForcedReadback & 0xFFFFFFFFL));
+        // Warn when a non-trivial fraction of getImageData calls
+        // are falling back; the snapshot path was supposed to handle
+        // that traffic.  Threshold: any fallbacks at all if the
+        // snapshot path has produced output (rules out the GLES 2
+        // case where fallback is the only option).
+        boolean snapWarn = (snapTaken & 0xFFFFFFFFL) > 0
+                && (snapFallback & 0xFFFFFFFFL) > 0;
+        rowSnap.setTextColor(snapWarn ? WARN_COLOR : TEXT_COLOR);
 
         // First render (one-shot)
         if (!firstRenderShown && firstFrameMs > 0) {

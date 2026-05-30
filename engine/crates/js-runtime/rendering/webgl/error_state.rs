@@ -23,8 +23,25 @@
 //! `INVALID_FRAMEBUFFER_OPERATION = 0x0506`, `CONTEXT_LOST_WEBGL = 0x9242`.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 
 use deno_core::OpState;
+use shared::op_state::HostOpState;
+
+/// Hard cap on the per-context error queue length.
+///
+/// A misbehaving (or adversarial) script can keep issuing illegal
+/// WebGL calls without ever calling `getError()` to drain them.
+/// Without a cap, the queue grows until the process OOMs - a pure
+/// JS-side memory amplification.  256 is well above any realistic
+/// scripted burst (most engines drain every few frames) and costs
+/// ~1 KiB of bare payload per context.
+///
+/// Past the cap we switch to a "sticky overflow" mode: new pushes
+/// are dropped, but an `OUT_OF_MEMORY (0x0505)` sentinel is kept
+/// at the tail so the next `getError()` signals the truncation,
+/// matching the spirit of GL's own `GL_OUT_OF_MEMORY` semantics.
+const MAX_ERRORS_PER_CTX: usize = 256;
 
 /// Pushed by host-side validators; drained by `op_get_error`.
 ///
@@ -38,6 +55,14 @@ pub struct WebGLErrorState {
     /// Cached context attributes per canvas.  Returned as-is by
     /// `getContextAttributes()`.
     attrs: HashMap<u32, ContextAttributes>,
+    /// Per-context overflow counter (dropped pushes since last
+    /// drain to `OUT_OF_MEMORY` sentinel).  Not part of the spec;
+    /// used to keep exactly one sentinel in the queue regardless
+    /// of how long the overflow streak is.
+    overflow: HashMap<u32, u64>,
+    /// Per-context transform feedback active bit.  Used by host-side
+    /// validators for `bindBufferBase/Range`.
+    transform_feedback_active: HashMap<u32, bool>,
 }
 
 /// Mirror of WebGLContextAttributes IDL dictionary.  Values are the
@@ -101,8 +126,39 @@ impl WebGLErrorState {
     /// same error code, the spec allows us to coalesce, but Chrome /
     /// Firefox queue them separately; we match the latter so
     /// conformance scripts that count errors behave identically.
+    ///
+    /// Bounded at `MAX_ERRORS_PER_CTX`: once the queue fills, new
+    /// codes are dropped and a sticky `OUT_OF_MEMORY` sentinel is
+    /// kept at the tail so the next `getError()` reports the
+    /// truncation.  A global overflow counter is incremented for
+    /// every dropped record; `render_diagnostics` surfaces the
+    /// total to the Java debug overlay.
     pub fn push(&mut self, canvas_id: u32, code: u32) {
-        self.queues.entry(canvas_id).or_default().push_back(code);
+        let queue = self.queues.entry(canvas_id).or_default();
+        if queue.len() < MAX_ERRORS_PER_CTX {
+            queue.push_back(code);
+            return;
+        }
+        // Overflow path: drop the new code, bump counters, and
+        // guarantee an OOM sentinel is the last element so the
+        // next drain signals the truncation.
+        *self.overflow.entry(canvas_id).or_insert(0) += 1;
+        shared::stats::bump_webgl_error_overflow(1);
+        if queue.back().copied() != Some(codes::OUT_OF_MEMORY) {
+            // Make room for the sentinel by evicting the oldest
+            // entry.  The spec allows us to drop older errors when
+            // memory pressure forces it; we log at trace level for
+            // diagnostics and keep the sentinel as the ONLY signal
+            // the queue was truncated.
+            queue.pop_front();
+            queue.push_back(codes::OUT_OF_MEMORY);
+        }
+    }
+
+    /// Per-context overflow counter (cumulative dropped pushes).
+    #[inline]
+    pub fn overflow_count(&self, canvas_id: u32) -> u64 {
+        self.overflow.get(&canvas_id).copied().unwrap_or(0)
     }
 
     /// Drain the oldest error for `canvas_id`, or return
@@ -127,6 +183,17 @@ impl WebGLErrorState {
 
     pub fn get_attrs(&self, canvas_id: u32) -> Option<ContextAttributes> {
         self.attrs.get(&canvas_id).copied()
+    }
+
+    pub fn set_transform_feedback_active(&mut self, canvas_id: u32, active: bool) {
+        self.transform_feedback_active.insert(canvas_id, active);
+    }
+
+    pub fn is_transform_feedback_active(&self, canvas_id: u32) -> bool {
+        self.transform_feedback_active
+            .get(&canvas_id)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -159,6 +226,21 @@ pub fn push_error(state: &mut OpState, canvas_id: u32, code: u32) {
     q.push(canvas_id, code);
 }
 
+#[inline]
+pub fn set_transform_feedback_active(state: &mut OpState, canvas_id: u32, active: bool) {
+    let q = state.borrow_mut::<WebGLErrorState>();
+    q.set_transform_feedback_active(canvas_id, active);
+}
+
+#[inline]
+fn is_transform_feedback_active(state: &OpState, canvas_id: u32) -> bool {
+    let q = state.borrow::<WebGLErrorState>();
+    q.is_transform_feedback_active(canvas_id)
+}
+
+const GL_TRANSFORM_FEEDBACK_BUFFER: u32 = 0x8C8E;
+const GL_UNIFORM_BUFFER: u32 = 0x8A11;
+
 // ---- Validators (pure param checks, no GL state peek) ---------------
 
 /// Validate the `target` argument of `bindBuffer`.  Returns `true`
@@ -183,6 +265,66 @@ pub fn validate_bind_buffer_target(state: &mut OpState, canvas_id: u32, target: 
             false
         }
     }
+}
+
+#[inline]
+fn validate_bind_buffer_indexed_target(state: &mut OpState, canvas_id: u32, target: u32) -> bool {
+    match target {
+        GL_TRANSFORM_FEEDBACK_BUFFER | GL_UNIFORM_BUFFER => true,
+        _ => {
+            push_error(state, canvas_id, codes::INVALID_ENUM);
+            false
+        }
+    }
+}
+
+#[inline]
+pub fn validate_bind_buffer_base(
+    state: &mut OpState,
+    canvas_id: u32,
+    target: u32,
+    _index: u32,
+    _buffer: Option<u32>,
+) -> bool {
+    if !validate_bind_buffer_indexed_target(state, canvas_id, target) {
+        return false;
+    }
+    if target == GL_TRANSFORM_FEEDBACK_BUFFER && is_transform_feedback_active(state, canvas_id) {
+        push_error(state, canvas_id, codes::INVALID_OPERATION);
+        return false;
+    }
+    true
+}
+
+#[inline]
+pub fn validate_bind_buffer_range(
+    state: &mut OpState,
+    canvas_id: u32,
+    target: u32,
+    index: u32,
+    buffer: Option<u32>,
+    offset: i32,
+    size: i32,
+) -> bool {
+    if buffer.is_some() && offset < 0 {
+        push_error(state, canvas_id, codes::INVALID_VALUE);
+        return false;
+    }
+    if buffer.is_some() && size <= 0 {
+        push_error(state, canvas_id, codes::INVALID_VALUE);
+        return false;
+    }
+    if !validate_bind_buffer_base(state, canvas_id, target, index, buffer) {
+        return false;
+    }
+    if target == GL_TRANSFORM_FEEDBACK_BUFFER
+        && buffer.is_some()
+        && ((offset % 4) != 0 || (size % 4) != 0)
+    {
+        push_error(state, canvas_id, codes::INVALID_VALUE);
+        return false;
+    }
+    true
 }
 
 /// Validate the parameter tuple of `vertexAttribPointer`.  Returns
@@ -275,6 +417,34 @@ pub fn op_webgl_get_error(state: &mut OpState, #[smi] canvas_id: u32) -> u32 {
     q.drain_one(canvas_id)
 }
 
+/// Snapshot the compressed-texture caps the render thread detected
+/// during GL context init.  Returned as a bitfield so a single fast
+/// op replaces multiple boolean round-trips:
+///
+/// * bit 0 = ETC2 / EAC (GLES 3.0 core; always true on our runtime)
+/// * bit 1 = ASTC LDR (GL_KHR_texture_compression_astc_ldr / _hdr)
+///
+/// JS uses this to decide which `WEBGL_compressed_texture_*`
+/// extensions to advertise in `getExtension()` /
+/// `getSupportedExtensions()`.  Returns `0` (no compression) if the
+/// caps haven't been set yet (e.g. a very early JS call before the
+/// render thread has created a GL context).
+#[deno_core::op2(fast)]
+pub fn op_webgl_query_compressed_caps(state: &mut OpState) -> u32 {
+    let Some(host) = state.try_borrow::<shared::op_state::HostOpState>() else {
+        return 0;
+    };
+    let snap = host.gpu_caps.snapshot();
+    let mut bits = 0u32;
+    if snap.etc2 {
+        bits |= 1 << 0;
+    }
+    if snap.astc {
+        bits |= 1 << 1;
+    }
+    bits
+}
+
 /// Serializable mirror of `ContextAttributes` with camelCase field
 /// names (to match the WebGLContextAttributes IDL dictionary).
 #[derive(serde::Serialize)]
@@ -346,6 +516,10 @@ pub fn op_webgl_record_attributes(
     desynchronized: bool,
     xr_compatible: bool,
 ) {
+    state
+        .borrow::<HostOpState>()
+        .webgl_context_created
+        .store(true, Ordering::Relaxed);
     let power_preference = match power_preference {
         1 => PowerPreference::HighPerformance,
         2 => PowerPreference::LowPower,
@@ -398,6 +572,62 @@ mod tests {
         assert_eq!(q.drain_one(2), 0x0502);
         assert_eq!(q.drain_one(1), 0);
         assert_eq!(q.drain_one(2), 0);
+    }
+
+    #[test]
+    fn queue_is_bounded_and_overflow_is_counted() {
+        let mut q = WebGLErrorState::default();
+        // Fill exactly to the cap with plain INVALID_ENUM; overflow
+        // should still be zero and no sentinel planted yet.
+        for _ in 0..MAX_ERRORS_PER_CTX {
+            q.push(1, codes::INVALID_ENUM);
+        }
+        assert_eq!(q.overflow_count(1), 0);
+        assert_eq!(q.len(1), MAX_ERRORS_PER_CTX);
+
+        // Push past the cap; each push is dropped, overflow grows,
+        // and the queue length stays pinned at the cap.
+        for _ in 0..10 {
+            q.push(1, codes::INVALID_VALUE);
+        }
+        assert_eq!(q.overflow_count(1), 10);
+        assert_eq!(q.len(1), MAX_ERRORS_PER_CTX);
+
+        // The sentinel must be the tail so the *next* drain signal
+        // that a truncation happened.  Drain until we hit it.
+        let mut seen_oom = false;
+        for _ in 0..MAX_ERRORS_PER_CTX {
+            let c = q.drain_one(1);
+            if c == codes::OUT_OF_MEMORY {
+                seen_oom = true;
+                break;
+            }
+        }
+        assert!(seen_oom, "overflow must plant an OUT_OF_MEMORY sentinel");
+    }
+
+    #[test]
+    fn overflow_only_plants_one_sentinel_per_burst() {
+        let mut q = WebGLErrorState::default();
+        for _ in 0..MAX_ERRORS_PER_CTX {
+            q.push(1, codes::INVALID_ENUM);
+        }
+        // First overflow plants the sentinel.
+        q.push(1, codes::INVALID_VALUE);
+        // Subsequent overflows must not add more sentinels — they
+        // only increment the counter.
+        for _ in 0..100 {
+            q.push(1, codes::INVALID_VALUE);
+        }
+        assert_eq!(q.len(1), MAX_ERRORS_PER_CTX);
+        // Exactly one OOM at the tail.
+        let mut oom = 0;
+        while q.len(1) > 0 {
+            if q.drain_one(1) == codes::OUT_OF_MEMORY {
+                oom += 1;
+            }
+        }
+        assert_eq!(oom, 1);
     }
 
     #[test]

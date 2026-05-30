@@ -69,6 +69,19 @@ async function _startRafLoop() {
     __rafLoopRunning = false;
 }
 
+// Native lifecycle hook: when Android returns from background, there may
+// already be RAF callbacks queued while the async loop has stopped after idle
+// frames.  Restarting the loop is cheap (it will exit again after a few idle
+// ticks) and mirrors browser engines kicking their compositor/RAF scheduler on
+// visibility changes.  Exposed as a global so Host::on_update_surface can call
+// it immediately after the render thread has a valid surface again.
+globalThis.__migo_restart_raf_loop = function () {
+    if (!__rafLoopRunning) {
+        __rafLoopRunning = true;
+        _startRafLoop();
+    }
+};
+
 const setPreferredFramesPerSecond = (fps) => {
     op_set_preferred_fps(Math.max(1, Math.min(120, fps | 0)));
 };

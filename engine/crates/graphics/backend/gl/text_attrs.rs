@@ -82,11 +82,7 @@ impl ResolvedTextAlign {
 /// `ascent` is positive-above-baseline (as Skia reports it),
 /// `descent` is positive-below-baseline.
 #[inline]
-pub fn y_baseline_offset(
-    baseline: TextBaseline,
-    ascent: f32,
-    descent: f32,
-) -> f32 {
+pub fn y_baseline_offset(baseline: TextBaseline, ascent: f32, descent: f32) -> f32 {
     // Returns the offset such that: paragraph_top_y = caller_y - offset
     match baseline {
         TextBaseline::Top => 0.0,
@@ -199,14 +195,20 @@ mod tests {
     fn baseline_ideographic_is_below_alphabetic() {
         let alpha = y_baseline_offset(TextBaseline::Alphabetic, 12.0, 4.0);
         let ideo = y_baseline_offset(TextBaseline::Ideographic, 12.0, 4.0);
-        assert!(ideo > alpha, "ideographic {ideo} must sit below alphabetic {alpha}");
+        assert!(
+            ideo > alpha,
+            "ideographic {ideo} must sit below alphabetic {alpha}"
+        );
     }
 
     #[test]
     fn baseline_hanging_is_above_alphabetic() {
         let alpha = y_baseline_offset(TextBaseline::Alphabetic, 12.0, 4.0);
         let hang = y_baseline_offset(TextBaseline::Hanging, 12.0, 4.0);
-        assert!(hang < alpha, "hanging {hang} must sit above alphabetic {alpha}");
+        assert!(
+            hang < alpha,
+            "hanging {hang} must sit above alphabetic {alpha}"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ import android.os.Build;
 /**
  * Permission utilities.
  * <p>
- * Compatible with Android API 21+.
+ * Compatible with Android API 26+.
  *
  * @hide
  */
@@ -63,13 +63,8 @@ public final class Permissions {
      */
     public static boolean isGranted(Context context, String permission) {
         if (context == null || permission == null) return false;
-        
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            return context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED;
-        } else {
-            // Pre-M: permissions are granted at install time
-            return true;
-        }
+
+        return context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED;
     }
 
     /**
@@ -83,22 +78,15 @@ public final class Permissions {
         if (activity == null || permission == null) {
             return State.NOT_DETERMINED;
         }
-        
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            int result = activity.checkSelfPermission(permission);
-            if (result == PackageManager.PERMISSION_GRANTED) {
-                return State.AUTHORIZED;
-            } else {
-                // Could be denied or not determined
-                // If shouldShowRequestPermissionRationale is true, it was denied
-                if (activity.shouldShowRequestPermissionRationale(permission)) {
-                    return State.DENIED;
-                }
-                return State.NOT_DETERMINED;
-            }
-        } else {
-            // Pre-M: always authorized
+        int result = activity.checkSelfPermission(permission);
+        if (result == PackageManager.PERMISSION_GRANTED) {
             return State.AUTHORIZED;
+        } else {
+            // If shouldShowRequestPermissionRationale is true, it was denied.
+            if (activity.shouldShowRequestPermissionRationale(permission)) {
+                return State.DENIED;
+            }
+            return State.NOT_DETERMINED;
         }
     }
 
@@ -151,12 +139,8 @@ public final class Permissions {
 
     private static String getAuth(Context context, String permission) {
         if (context == null) return "not determined";
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            return context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
-                    ? "authorized" : "denied";
-        }
-        // Pre-M: permissions granted at install time
-        return "authorized";
+        return context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+                ? "authorized" : "denied";
     }
 
     private static String getBluetoothAuth(Context context) {
@@ -173,17 +157,14 @@ public final class Permissions {
         if (Build.VERSION.SDK_INT >= 33) {
             return getAuth(context, POST_NOTIFICATIONS);
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                NotificationManager nm = (NotificationManager)
-                        context.getSystemService(Context.NOTIFICATION_SERVICE);
-                if (nm != null) {
-                    return nm.areNotificationsEnabled() ? "authorized" : "denied";
-                }
-            } catch (Exception ignored) {
+        try {
+            NotificationManager nm = (NotificationManager)
+                    context.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) {
+                return nm.areNotificationsEnabled() ? "authorized" : "denied";
             }
+        } catch (Exception ignored) {
         }
-        // Pre-N: notifications always enabled
         return "authorized";
     }
 
@@ -196,7 +177,7 @@ public final class Permissions {
     }
 
     private static boolean getLocationReducedAccuracy(Context context) {
-        if (context == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false;
+        if (context == null) return false;
         boolean coarse = context.checkSelfPermission(COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
         boolean fine = context.checkSelfPermission(FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
         return coarse && !fine;

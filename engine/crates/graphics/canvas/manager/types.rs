@@ -3,8 +3,8 @@ extern crate khronos_egl as egl;
 use std::collections::{HashMap, HashSet};
 
 use glow::{
-    NativeBuffer, NativeFence, NativeFramebuffer, NativeProgram, NativeRenderbuffer,
-    NativeSampler, NativeShader, NativeTexture, NativeVertexArray,
+    NativeBuffer, NativeFence, NativeFramebuffer, NativeProgram, NativeRenderbuffer, NativeSampler,
+    NativeShader, NativeTexture, NativeVertexArray,
 };
 use shared::error::{EngineError, ErrorCode};
 use shared::protocol::render_cmd::{CanvasId, ProgramId, ShaderId, ShaderType};
@@ -42,7 +42,12 @@ pub(crate) enum ScissorState {
     /// `GL_SCISSOR_TEST` is disabled — scissor rect has no effect.
     Disabled,
     /// `GL_SCISSOR_TEST` is enabled with a known rect (set by explicit `glScissor`).
-    Enabled { x: i32, y: i32, width: i32, height: i32 },
+    Enabled {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
     /// `GL_SCISSOR_TEST` is enabled but no explicit `glScissor()` has been
     /// called yet.  The real GL initial scissor box is the full drawable —
     /// we don't know its size here, so damage must fall back to viewport
@@ -115,6 +120,27 @@ pub(crate) struct CanvasGLState {
     pub bound_array_buffer: Option<Option<u32>>,
     /// ELEMENT_ARRAY_BUFFER binding.
     pub bound_element_array_buffer: Option<Option<u32>>,
+    /// UNIFORM_BUFFER binding (WebGL 2 generic target).  Indexed
+    /// bindings set via `bindBufferBase` / `bindBufferRange` live
+    /// in [`Self::bound_uniform_buffer_indexed`].
+    pub bound_uniform_buffer: Option<Option<u32>>,
+    /// PIXEL_UNPACK_BUFFER binding (WebGL 2).  Dedup this avoids
+    /// the common pattern of `bindBuffer(PIXEL_UNPACK_BUFFER, b)`
+    /// before every `texImage2D` upload burst.
+    pub bound_pixel_unpack_buffer: Option<Option<u32>>,
+    /// PIXEL_PACK_BUFFER binding (WebGL 2, `readPixels`).
+    pub bound_pixel_pack_buffer: Option<Option<u32>>,
+    /// COPY_READ_BUFFER binding (WebGL 2, `copyBufferSubData`).
+    pub bound_copy_read_buffer: Option<Option<u32>>,
+    /// COPY_WRITE_BUFFER binding (WebGL 2, `copyBufferSubData`).
+    pub bound_copy_write_buffer: Option<Option<u32>>,
+    /// TRANSFORM_FEEDBACK_BUFFER generic binding (WebGL 2).
+    pub bound_transform_feedback_buffer: Option<Option<u32>>,
+    /// Indexed UNIFORM_BUFFER bindings keyed by binding index
+    /// (see `glBindBufferBase` / `glBindBufferRange`).  Value is
+    /// `(buffer_id, offset, size)` so range-bindings dedup
+    /// separately from full-buffer bindings.
+    pub bound_uniform_buffer_indexed: HashMap<u32, (Option<u32>, i32, i32)>,
     /// Active texture unit.
     pub active_texture_unit: Option<u32>,
     /// True when the DRAW_FRAMEBUFFER binding is the default framebuffer
@@ -264,6 +290,13 @@ impl Default for CanvasGLState {
             bound_texture_2d: HashMap::new(),
             bound_array_buffer: None,
             bound_element_array_buffer: None,
+            bound_uniform_buffer: None,
+            bound_pixel_unpack_buffer: None,
+            bound_pixel_pack_buffer: None,
+            bound_copy_read_buffer: None,
+            bound_copy_write_buffer: None,
+            bound_transform_feedback_buffer: None,
+            bound_uniform_buffer_indexed: HashMap::new(),
             active_texture_unit: None,
             // Initial GL state: default framebuffer is bound.
             draws_to_default_fbo: true,
@@ -352,6 +385,13 @@ impl CanvasGLState {
         self.bound_texture_2d.clear();
         self.bound_array_buffer = None;
         self.bound_element_array_buffer = None;
+        self.bound_uniform_buffer = None;
+        self.bound_pixel_unpack_buffer = None;
+        self.bound_pixel_pack_buffer = None;
+        self.bound_copy_read_buffer = None;
+        self.bound_copy_write_buffer = None;
+        self.bound_transform_feedback_buffer = None;
+        self.bound_uniform_buffer_indexed.clear();
         self.active_texture_unit = None;
         // Scissor: Skia typically leaves it disabled after its draw
         // batch completes.  Reset to the conservative "don't know
@@ -474,6 +514,25 @@ pub(crate) struct SamplerMeta {
 #[derive(Clone, Debug)]
 pub(crate) struct SyncMeta {
     pub gl_handle: Option<NativeFence>,
+    pub owner_canvas: Option<CanvasId>,
+    pub deleted: bool,
+}
+
+/// WebGL 2 query object.  Owned by a specific canvas context
+/// (queries are not shareable across GL contexts per the spec).
+#[derive(Clone, Debug)]
+pub(crate) struct QueryMeta {
+    pub gl_handle: Option<glow::NativeQuery>,
+    pub owner_canvas: Option<CanvasId>,
+    pub deleted: bool,
+}
+
+/// WebGL 2 transform feedback object.  Same context-locality as
+/// queries; we stash the owner canvas so deletion binds the right
+/// context first.
+#[derive(Clone, Debug)]
+pub(crate) struct TransformFeedbackMeta {
+    pub gl_handle: Option<glow::NativeTransformFeedback>,
     pub owner_canvas: Option<CanvasId>,
     pub deleted: bool,
 }

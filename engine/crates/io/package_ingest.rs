@@ -14,6 +14,7 @@ use crate::{
     pools::PoolError,
     scheduler::IoScheduler,
     task::{IoRequest, PriorityClass},
+    zip_extract::ExtractBudget,
 };
 
 fn package_ingest_request_for(zip_path: &Path) -> IoRequest {
@@ -34,19 +35,101 @@ impl From<PoolError> for PackageError {
     }
 }
 
+/// `Read` wrapper that counts bytes so the caller can enforce an
+/// archive-wide budget across entries. Streaming entry-level caps are
+/// still enforced inside `PackageWriter::add_entry_streaming`.
+struct CountingReader<'a, R: Read> {
+    inner: &'a mut R,
+    counted: &'a mut u64,
+}
+
+impl<'a, R: Read> Read for CountingReader<'a, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        *self.counted = self.counted.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
 /// Convert a zip archive into a `.mpkg` package file (zstd-chunked).
 ///
 /// Each entry is split into 64 KiB chunks, each independently
-/// zstd-compressed for random access.
+/// zstd-compressed for random access. Uses [`ExtractBudget::default`]
+/// for zip-bomb defense.
 pub fn ingest_zip_to_package(
     zip_path: &Path,
     pkg_path: &Path,
     package_name: &str,
     package_version: &str,
 ) -> Result<PackageIdentity, PackageError> {
+    ingest_zip_to_package_with_budget(
+        zip_path,
+        pkg_path,
+        package_name,
+        package_version,
+        ExtractBudget::default(),
+    )
+}
+
+/// Same as [`ingest_zip_to_package`] but with an explicit resource
+/// budget. Every entry is validated against the per-entry cap and the
+/// running total is validated against the archive-wide cap.
+pub fn ingest_zip_to_package_with_budget(
+    zip_path: &Path,
+    pkg_path: &Path,
+    package_name: &str,
+    package_version: &str,
+    budget: ExtractBudget,
+) -> Result<PackageIdentity, PackageError> {
     let zip_file = std::fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(BufReader::new(zip_file))
         .map_err(|e| PackageError::BadIndex(format!("invalid zip: {e}")))?;
+
+    let entry_count = archive.len();
+    if entry_count > budget.max_entries {
+        return Err(PackageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "zip has {} entries, exceeds budget {}",
+                entry_count, budget.max_entries
+            ),
+        )));
+    }
+
+    // Cheap header-time pre-scan: reject advertised totals that
+    // already exceed the archive-wide budget before spending any
+    // inflate CPU.
+    let mut advertised_total: u64 = 0;
+    for i in 0..entry_count {
+        let entry = archive.by_index_raw(i).map_err(|e| {
+            PackageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
+        let sz = entry.size();
+        if sz > budget.max_entry_uncompressed {
+            return Err(PackageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "zip entry '{}' advertises {} bytes, exceeds per-entry limit {}",
+                    entry.name(),
+                    sz,
+                    budget.max_entry_uncompressed
+                ),
+            )));
+        }
+        advertised_total = advertised_total.saturating_add(sz);
+        if advertised_total > budget.max_total_uncompressed {
+            return Err(PackageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "zip advertised total {} bytes exceeds budget {}",
+                    advertised_total, budget.max_total_uncompressed
+                ),
+            )));
+        }
+    }
 
     let tmp_pkg_path = pkg_path.with_extension("mpkg.tmp");
     let _ = std::fs::remove_file(&tmp_pkg_path);
@@ -54,7 +137,8 @@ pub fn ingest_zip_to_package(
     let mut writer = PackageWriter::new(std::io::BufWriter::new(pkg_file))?;
 
     let ingest_result: Result<PackageIdentity, PackageError> = (|| {
-        for i in 0..archive.len() {
+        let mut ingested_total: u64 = 0;
+        for i in 0..entry_count {
             let mut entry = archive.by_index(i).map_err(|e| {
                 PackageError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -71,16 +155,32 @@ pub fn ingest_zip_to_package(
                 continue;
             }
 
-            // Reject up-front on the advertised (uncompressed) size;
-            // the streaming reader below also enforces it, but a
-            // cheap header-time check lets us fail fast without
-            // paying the inflate cost of a 100 MiB entry.
-            let entry_size = entry.size();
-            if entry_size > MAX_READ_LENGTH {
+            let entry_cap = std::cmp::min(budget.max_entry_uncompressed, MAX_READ_LENGTH);
+            let remaining_total = budget.max_total_uncompressed.saturating_sub(ingested_total);
+            let cap = std::cmp::min(entry_cap, remaining_total);
+            if cap == 0 {
                 return Err(PackageError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("zip entry '{}' exceeds limit {}", name, MAX_READ_LENGTH),
+                    "archive total budget exhausted",
                 )));
+            }
+
+            // Per-entry ratio check (inflate bombs).
+            if budget.max_compression_ratio > 0 {
+                let compressed = entry.compressed_size();
+                let uncompressed_hdr = entry.size();
+                if compressed > 0 {
+                    let ratio = uncompressed_hdr / compressed;
+                    if ratio > budget.max_compression_ratio {
+                        return Err(PackageError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "zip entry '{}' compression ratio {} exceeds budget {}",
+                                name, ratio, budget.max_compression_ratio
+                            ),
+                        )));
+                    }
+                }
             }
 
             // Streaming add: the zip `entry` is itself a `Read`
@@ -88,7 +188,26 @@ pub fn ingest_zip_to_package(
             // bytes as a single `Vec<u8>`. Peak memory per entry
             // is bounded by the package writer's chunk size
             // (default 64 KiB).
-            writer.add_entry_streaming(&name, &mut entry, MAX_READ_LENGTH)?;
+            let before = ingested_total;
+            {
+                let mut counting = CountingReader {
+                    inner: &mut entry,
+                    counted: &mut ingested_total,
+                };
+                writer.add_entry_streaming(&name, &mut counting, cap)?;
+            }
+            if ingested_total > budget.max_total_uncompressed {
+                return Err(PackageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "ingested total {} bytes (entry '{}' added {}) exceeds budget {}",
+                        ingested_total,
+                        name,
+                        ingested_total - before,
+                        budget.max_total_uncompressed
+                    ),
+                )));
+            }
         }
 
         writer.finish(package_name, package_version)
@@ -117,11 +236,36 @@ pub async fn ingest_zip_to_package_with_scheduler(
     package_name: String,
     package_version: String,
 ) -> Result<PackageIdentity, PackageError> {
+    ingest_zip_to_package_with_scheduler_and_budget(
+        scheduler,
+        zip_path,
+        pkg_path,
+        package_name,
+        package_version,
+        ExtractBudget::default(),
+    )
+    .await
+}
+
+pub async fn ingest_zip_to_package_with_scheduler_and_budget(
+    scheduler: Arc<IoScheduler>,
+    zip_path: PathBuf,
+    pkg_path: PathBuf,
+    package_name: String,
+    package_version: String,
+    budget: ExtractBudget,
+) -> Result<PackageIdentity, PackageError> {
     let request = package_ingest_request_for(&zip_path);
 
     scheduler
         .run_async(request, move || {
-            ingest_zip_to_package(&zip_path, &pkg_path, &package_name, &package_version)
+            ingest_zip_to_package_with_budget(
+                &zip_path,
+                &pkg_path,
+                &package_name,
+                &package_version,
+                budget,
+            )
         })
         .await
         .map_err(PackageError::from)?

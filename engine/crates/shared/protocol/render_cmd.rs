@@ -54,22 +54,65 @@ pub struct GlBatchPayload {
 
 pub type SyncResp<T> = Sender<RenderResult<T>>;
 
-#[must_use]
+/// Reply channel for a synchronous render-thread op.
+///
+/// The enum lives inside command variants such as
+/// [`Canvas2DCmd::MeasureText`], and the render thread is expected to
+/// call [`Self::send`] / [`Self::ok`] / [`Self::err`] exactly once.
+///
+/// ## Drop-safety contract
+///
+/// The inner sender is wrapped in an `Option` so the [`Drop`] impl can
+/// detect the "handler forgot to reply" case and deliver
+/// [`ErrorCode::Internal`] with a diagnostic detail — instead of letting
+/// the sender silently drop, which would surface on the caller as the
+/// extremely misleading "channel disconnected" (`ErrorCode::Disconnected`).
+///
+/// This is the protocol-level mitigation for P0-1 in the rendering
+/// audit: sync-reply variants and fire-and-forget variants share the
+/// same `Canvas2DCmd` enum, so it is all too easy to mis-match a `&cmd`
+/// borrow with a reply sender that needs to be moved.  Making the
+/// sender drop-safe turns every such bug from "silent render stall" into
+/// "observable error in debug logs + JS op returning a proper engine
+/// error".  Call sites that intentionally discard the response should
+/// call [`Self::forget`] to suppress the drop-diagnostic.
+#[must_use = "dropping a RenderCmdResp without sending a reply leaks the request"]
 #[derive(Debug)]
 pub enum RenderCmdResp<T> {
-    Async(oneshot::Sender<RenderResult<T>>),
-    Sync(SyncResp<T>),
+    Async(Option<oneshot::Sender<RenderResult<T>>>),
+    Sync(Option<SyncResp<T>>),
 }
 
 impl<T> RenderCmdResp<T> {
+    /// Wrap a sync reply sender.
     #[inline]
-    pub fn send(self, v: RenderResult<T>) {
-        match self {
-            RenderCmdResp::Async(tx) => {
-                let _ = tx.send(v);
+    pub fn from_sync(tx: SyncResp<T>) -> Self {
+        Self::Sync(Some(tx))
+    }
+
+    /// Wrap an async (oneshot) reply sender.
+    #[inline]
+    pub fn from_async(tx: oneshot::Sender<RenderResult<T>>) -> Self {
+        Self::Async(Some(tx))
+    }
+
+    /// Consume the responder and send a result on the underlying channel.
+    ///
+    /// Takes the sender out of the `Option` so the [`Drop`] impl below
+    /// sees an empty slot and does not emit the "handler forgot to reply"
+    /// diagnostic.
+    #[inline]
+    pub fn send(mut self, v: RenderResult<T>) {
+        match &mut self {
+            RenderCmdResp::Async(slot) => {
+                if let Some(tx) = slot.take() {
+                    let _ = tx.send(v);
+                }
             }
-            RenderCmdResp::Sync(tx) => {
-                let _ = tx.send(v);
+            RenderCmdResp::Sync(slot) => {
+                if let Some(tx) = slot.take() {
+                    let _ = tx.send(v);
+                }
             }
         }
     }
@@ -94,6 +137,95 @@ impl<T> RenderCmdResp<T> {
         self.send(Err(
             EngineError::new(ErrorCode::RenderBackendError).with_detail(msg.into())
         ));
+    }
+
+    /// Explicitly discard the responder without triggering the
+    /// drop-diagnostic.  Only valid at code paths that genuinely don't
+    /// produce a reply (e.g. render thread shutdown where the caller has
+    /// already been told of the failure through another channel).
+    #[inline]
+    pub fn forget(mut self) {
+        match &mut self {
+            RenderCmdResp::Async(slot) => drop(slot.take()),
+            RenderCmdResp::Sync(slot) => drop(slot.take()),
+        }
+    }
+}
+
+/// When a `RenderCmdResp` is dropped without [`RenderCmdResp::send`] /
+/// `ok` / `err` being called, surface a structured
+/// `ErrorCode::Internal` on the caller so the symptom is observable in
+/// logs and in JS.  Previously the sender would simply drop and the
+/// receiver would observe `RecvError::Disconnected`, reported to the
+/// user as `ErrorCode::Disconnected` — the same error shape as a real
+/// render-thread crash, which masked genuine connectivity failures.
+impl<T> Drop for RenderCmdResp<T> {
+    fn drop(&mut self) {
+        let err = || {
+            EngineError::new(ErrorCode::Internal).with_detail(
+                "render op responder dropped without sending a reply (\
+                 likely a handler forgot to call resp.ok/err — upgraded \
+                 from silent `channel disconnected`)"
+                    .to_string(),
+            )
+        };
+        match self {
+            RenderCmdResp::Async(slot) => {
+                if let Some(tx) = slot.take() {
+                    let _ = tx.send(Err(err()));
+                }
+            }
+            RenderCmdResp::Sync(slot) => {
+                if let Some(tx) = slot.take() {
+                    let _ = tx.send(Err(err()));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod render_cmd_resp_drop_tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+
+    /// P2-6: confirm the Drop impl fires on a dropped responder
+    /// and surfaces an `ErrorCode::Internal` instead of the
+    /// previous silent `channel disconnected`.  This is the
+    /// core safety net for bugs in the same class as the
+    /// `canvas2d measure_text failed: channel disconnected`
+    /// incident — if a handler forgets to reply, the caller
+    /// always sees a diagnostic instead of a generic timeout.
+    #[test]
+    fn dropped_sync_responder_reports_internal_error() {
+        let (tx, rx) = bounded::<RenderResult<u32>>(1);
+        let resp = RenderCmdResp::<u32>::from_sync(tx);
+        drop(resp);
+        let delivered = rx.recv().expect("Drop impl should have sent a result");
+        let err = delivered.expect_err("dropped responder must produce Err");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            err.to_string()
+                .contains("responder dropped without sending"),
+            "unexpected error text: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_send_suppresses_drop_error() {
+        let (tx, rx) = bounded::<RenderResult<u32>>(1);
+        let resp = RenderCmdResp::<u32>::from_sync(tx);
+        resp.ok(42);
+        let delivered = rx.recv().unwrap().unwrap();
+        assert_eq!(delivered, 42);
+    }
+
+    #[test]
+    fn forget_suppresses_drop_error_but_sends_nothing() {
+        let (tx, rx) = bounded::<RenderResult<u32>>(1);
+        let resp = RenderCmdResp::<u32>::from_sync(tx);
+        resp.forget();
+        assert!(rx.try_recv().is_err(), "forget() must not emit any Result");
     }
 }
 
@@ -130,9 +262,10 @@ pub enum RenderCommand {
     Invalidate,
 
     /// Load a custom font from raw bytes into the global font store and all existing canvases.
-    /// Returns the font family key (used in CSS font strings).
+    /// Returns the canonical font family key (used in CSS font strings).
     LoadFont {
-        key: String,
+        family: String,
+        aliases: Arc<Vec<String>>,
         bytes: std::sync::Arc<Vec<u8>>,
         resp: RenderCmdResp<String>,
     },
@@ -164,6 +297,36 @@ pub enum RenderCommand {
     /// The render thread keeps running and can still accept a later
     /// `RecreateOnscreen`, but must stop presenting until then.
     SurfaceDestroyed,
+
+    /// Trim the process-global text texture cache under OS memory
+    /// pressure.  Routed to the render thread (rather than trimmed
+    /// inline on the host like `io::image_cache`) because the cache
+    /// holds GL textures whose `glDeleteTextures` requires a current
+    /// EGL context — only the render thread has one.  `level` is the
+    /// raw Android `onTrimMemory` integer; the render thread maps it
+    /// via `TrimLevel::from_android`.  Best-effort: classified as a
+    /// lifecycle command (drop-on-full is acceptable — the next
+    /// pressure signal trims again).
+    TrimTextCache {
+        level: i32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TexImage3DSource {
+    None,
+    Bytes(std::sync::Arc<Vec<u8>>),
+    BufferOffset(u32),
+}
+
+impl TexImage3DSource {
+    #[inline]
+    fn approx_deep_size_bytes(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.capacity(),
+            Self::None | Self::BufferOffset(_) => 0,
+        }
+    }
 }
 
 // Guard against future regressions — if a new variant re-inflates the enum,
@@ -180,6 +343,23 @@ pub enum CanvasCmd {
         width: u32,
         height: u32,
         resp: RenderCmdResp<CanvasId>,
+    },
+
+    /// Fire-and-forget offscreen canvas creation.  JS allocates the
+    /// `id` itself from a private high-range counter so the render
+    /// thread doesn't have to round-trip a sync response.
+    ///
+    /// On the goldfish emulator each EGL pbuffer context creation
+    /// costs 30–100ms; cocos's font-atlas / label-cache code path
+    /// fires a burst of ~50 of these when opening a popup, which
+    /// would otherwise push the parent sync op past its 1s timeout
+    /// and crash the V8 host with `[Timeout] create_offscreen_canvas`.
+    /// Subsequent ops targeting this canvas (`getContext`, draw)
+    /// queue on the same FIFO so ordering is preserved.
+    RegisterOffscreen {
+        id: CanvasId,
+        width: u32,
+        height: u32,
     },
 
     DestroyCanvas {
@@ -214,10 +394,12 @@ pub enum CanvasCmd {
         resp: RenderCmdResp<(u32, u32)>,
     },
 
-    // Image resources (owned by render thread)
-    CreateImage {
-        resp: RenderCmdResp<ImageId>,
-    },
+    // Image resources (owned by render thread).
+    //
+    // Note: id allocation no longer round-trips through the render
+    // thread — both JS and render-thread callers pull from
+    // `shared::image_id::next_image_id()` instead.  The id is sent
+    // pre-allocated on the `LoadImage` below.
 
     /// Load an image (RGBA8 or compressed) for GPU upload.
     /// The render thread owns the GPU resource.
@@ -238,6 +420,35 @@ pub enum ShaderType {
     Vertex,
     Fragment,
 }
+
+/// Upper bound on the stack size of a single [`GLCmd`] variant.
+///
+/// Keeping the enum under this cap matters because:
+///
+/// 1. The frame collector allocates `Vec<GLCmd>` segments that
+///    use this size as the per-element slot; doubling it halves
+///    cache-line density of the playback walk.
+/// 2. `approx_deep_size_bytes()` starts from `size_of::<GLCmd>()`
+///    and adds heap payloads on top; an inflated base inflates
+///    every accounting call - including the auto-flush guard.
+///
+/// Current number chosen from the actual Rust layout as of this
+/// commit (largest variant is `TexImage3D` at ~136 B on 64-bit
+/// due to the 3D-texture params).  Raise it deliberately when a
+/// new variant needs room; the assertion below flags the next
+/// accidental bloat at compile time.
+pub const GLCMD_MAX_SIZE_BYTES: usize = 192;
+
+// Compile-time check that new variants do not silently grow the
+// enum past the budget.
+const _: () = {
+    if std::mem::size_of::<GLCmd>() > GLCMD_MAX_SIZE_BYTES {
+        panic!(
+            "GLCmd grew past GLCMD_MAX_SIZE_BYTES; consider boxing \
+             the new payload or raising the cap deliberately"
+        );
+    }
+};
 
 #[non_exhaustive]
 #[derive(Debug)]
@@ -476,6 +687,123 @@ pub enum GLCmd {
         format: u32,
         type_: u32,
         data: Option<Arc<Vec<u8>>>,
+    },
+    /// `glTexImage2D(target, level, internalformat, ..., image)` where
+    /// `image` is a previously loaded shared image (uploaded via
+    /// `CanvasCmd::LoadImage`).  Avoids the round-trip of CPU-side
+    /// RGBA bytes from JS land back to the render thread by copying
+    /// straight from the existing GL texture into the destination.
+    /// The render thread issues a GPU-side copy (FBO + glCopyTexImage2D).
+    /// The destination is whichever texture is currently bound to
+    /// `target` on the canvas's context — same convention as
+    /// [`Self::TexImage2D`].
+    TexImage2DFromShared {
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        format: u32,
+        type_: u32,
+        /// Identifier of the source shared image in `ImageStore`.
+        source_shared_id: u32,
+        /// Logical image size; for atlased entries this is the
+        /// sub-rect size, not the atlas page dims.
+        src_width: i32,
+        src_height: i32,
+    },
+    /// Zero-readback Canvas2D->WebGL upload, sibling of
+    /// [`Self::TexImage2DFromShared`].  Source is a snapshot
+    /// texture allocated by [`Canvas2DCmd::GetImageDataSnapshot`];
+    /// destination is whichever texture is currently bound to
+    /// `target` on `canvas_id`.  Render thread issues an FBO+
+    /// `glCopyTexImage2D` GPU copy — same primitive that powers the
+    /// shared-image path.  Snapshot is NOT consumed (refcount-free
+    /// for now): per-frame drain releases all live snapshots after
+    /// present, so a single getImageData→texImage2D pair within a
+    /// frame is the supported lifetime.
+    TexImage2DFromSnapshot {
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        format: u32,
+        type_: u32,
+        snapshot_id: u32,
+    },
+    /// Text texture cache hit path.  When the JS-side pattern
+    /// recognizer in `frame_collector` matches the cocos
+    /// `(state setters → fillText → texImage2D(canvas))` shape AND
+    /// the `(text, font, size, color, ...)` tuple is already
+    /// present in `shared::text_texture_cache::global_cache()`, JS
+    /// suppresses the offscreen fillText + snapshot pipeline
+    /// entirely and emits this command instead.  Render thread
+    /// re-acquires the cache lock, copies the cached source texture
+    /// into the destination texture bound to `target` on
+    /// `canvas_id` (single GPU→GPU copy, no Skia paint, no blit
+    /// from Canvas2D FBO), and unpins the entry.
+    ///
+    /// `key` is boxed because `TextCacheKey` carries two `String`s;
+    /// the unboxed variant would inflate every `GLCmd` instance and
+    /// every `CanvasBatchPayload` cmd vec across the channel.
+    TexImage2DFromTextCache {
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        key: Box<crate::text_texture_cache::TextCacheKey>,
+    },
+    /// Direct GPU->GPU upload from a Canvas2D's framebuffer to a WebGL
+    /// texture, no JS-visible snapshot id, no readback.  Optimises the
+    /// cocos `gl.texImage2D(target, ..., HTMLCanvasElement)` pattern --
+    /// previously routed through `sourceToRawRgba` -> getImageData ->
+    /// lazy readback (~50ms V8 stall per call, ~20 calls per popup
+    /// open).  The render thread does FBO blit + glCopyTexImage2D in
+    /// one shot, freeing the temp source texture immediately.
+    TexImage2DFromCanvas2D {
+        canvas_id: CanvasId,        // GL canvas (where dst tex is bound)
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        canvas_2d_id: CanvasId,     // 2D canvas (source content)
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
+    /// Sub-region variant of `TexImage2DFromCanvas2D`: copies the 2D
+    /// canvas's content into a sub-rect of an already-allocated texture.
+    /// Required for cocos's text-atlas pattern (allocate atlas once,
+    /// stream glyph cells in via texSubImage2D).
+    TexSubImage2DFromCanvas2D {
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        xoffset: i32,
+        yoffset: i32,
+        canvas_2d_id: CanvasId,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
+    /// Sibling of `TexImage2DFromSnapshot` for `texSubImage2D` -- copies
+    /// the snapshot texture into a sub-region of the destination texture
+    /// currently bound to `target` on `canvas_id` via FBO +
+    /// `glCopyTexSubImage2D`.  Required for cocos's text-atlas pattern,
+    /// which pre-allocates the atlas with `texImage2D` and then updates
+    /// individual glyph cells via `texSubImage2D`.  Width/height come
+    /// from the snapshot itself; JS only routes here when the caller's
+    /// (width, height) matches the snapshot's (or it's the 7-arg form
+    /// without explicit dims), so partial copies fall back to bytes.
+    TexSubImage2DFromSnapshot {
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        xoffset: i32,
+        yoffset: i32,
+        format: u32,
+        type_: u32,
+        snapshot_id: u32,
     },
     TexSubImage2D {
         canvas_id: CanvasId,
@@ -817,7 +1145,6 @@ pub enum GLCmd {
     // WebGL 1 games that opt into extensions (`OES_vertex_array_object`,
     // `ANGLE_instanced_arrays`) end up emitting the same variants.
     // ========================================================================
-
     /// `createVertexArray()` — allocate a VAO.  The client-chosen id is
     /// passed down (matching how buffers/textures are allocated) so the
     /// op is fire-and-forget.
@@ -980,10 +1307,135 @@ pub enum GLCmd {
         canvas_id: CanvasId,
         src: u32,
     },
+
+    // ---- WebGL 2 Query objects ----
+    //
+    // Queries are non-blocking result probes for things like
+    // `ANY_SAMPLES_PASSED` (occlusion) and `TIME_ELAPSED_EXT`.  The
+    // engine allocates a client id synchronously (see
+    // `op_alloc_gl_resource_id`) and creates the underlying GL
+    // object on the render thread.
+    CreateQuery {
+        canvas_id: CanvasId,
+        client_id: u32,
+    },
+    DeleteQuery {
+        query: u32,
+    },
+    BeginQuery {
+        canvas_id: CanvasId,
+        target: u32,
+        query: u32,
+    },
+    EndQuery {
+        canvas_id: CanvasId,
+        target: u32,
+    },
+    /// Synchronous fetch of `GL_QUERY_RESULT` /
+    /// `GL_QUERY_RESULT_AVAILABLE`.  Resp carries the u32 result.
+    GetQueryParameter {
+        query: u32,
+        pname: u32,
+        resp: RenderCmdResp<u32>,
+    },
+
+    // ---- WebGL 2 Transform Feedback ----
+    //
+    // Transform feedback is a container for captured vertex-shader
+    // output during draw calls.  Enough of the surface is exposed
+    // that Cocos Creator 3.x particle systems light up; the full
+    // API (getTransformFeedbackVarying, pause/resume) follows the
+    // same pattern and can be added incrementally.
+    CreateTransformFeedback {
+        canvas_id: CanvasId,
+        client_id: u32,
+    },
+    DeleteTransformFeedback {
+        tf: u32,
+    },
+    BindTransformFeedback {
+        canvas_id: CanvasId,
+        target: u32,
+        tf: Option<u32>,
+    },
+    BeginTransformFeedback {
+        canvas_id: CanvasId,
+        primitive_mode: u32,
+    },
+    EndTransformFeedback {
+        canvas_id: CanvasId,
+    },
+    PauseTransformFeedback {
+        canvas_id: CanvasId,
+    },
+    ResumeTransformFeedback {
+        canvas_id: CanvasId,
+    },
+    /// `transformFeedbackVaryings(program, varyings, buffer_mode)`.
+    /// `varyings` are the shader output names; `buffer_mode` is one
+    /// of `INTERLEAVED_ATTRIBS` / `SEPARATE_ATTRIBS`.
+    TransformFeedbackVaryings {
+        canvas_id: CanvasId,
+        program: ProgramId,
+        varyings: Vec<String>,
+        buffer_mode: u32,
+    },
+    /// Synchronous fetch of linked transform-feedback varying metadata.
+    /// Returns `Some((name, size, type))` for valid indices.
+    GetTransformFeedbackVarying {
+        program: ProgramId,
+        index: u32,
+        resp: RenderCmdResp<Option<(String, i32, u32)>>,
+    },
+
+    // ---- WebGL 2 3D textures ----
+    //
+    // Only the data-upload variants are wired here; allocation via
+    // `texStorage3D` already exists as part of the earlier WebGL 2
+    // tranche and is reused unchanged.
+    TexImage3D {
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        internal_format: i32,
+        width: i32,
+        height: i32,
+        depth: i32,
+        border: i32,
+        format: u32,
+        ty: u32,
+        /// RGBA / Luminance / etc. byte stream - `None` reserves
+        /// storage without an upload, matching the WebGL 2
+        /// "size-only" overload.
+        data: TexImage3DSource,
+    },
+    TexSubImage3D {
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        xoffset: i32,
+        yoffset: i32,
+        zoffset: i32,
+        width: i32,
+        height: i32,
+        depth: i32,
+        format: u32,
+        ty: u32,
+        data: TexImage3DSource,
+    },
+    TexStorage3D {
+        canvas_id: CanvasId,
+        target: u32,
+        levels: i32,
+        internal_format: u32,
+        width: i32,
+        height: i32,
+        depth: i32,
+    },
 }
 
 /// Text horizontal alignment for fillText/strokeText.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TextAlign {
     #[default]
     Start,
@@ -994,7 +1446,7 @@ pub enum TextAlign {
 }
 
 /// Text vertical baseline for fillText/strokeText.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TextBaseline {
     Top,
     Hanging,
@@ -1007,7 +1459,9 @@ pub enum TextBaseline {
 
 /// Canvas 2D `direction` drawing state.  Controls bidirectional text
 /// reordering and the resolution of `textAlign=start`/`end`.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize,
+)]
 pub enum TextDirection {
     /// CSS `direction: inherit` — falls back to LTR at the context
     /// level since the engine has no parent element to inherit from.
@@ -1075,8 +1529,26 @@ pub enum GradientType {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Canvas2DCmd {
-    CreateContext2D {
-        resp: RenderCmdResp<Context2DId>,
+    /// Init the Skia surface for the target canvas.  Fire-and-forget:
+    /// the render thread processes commands FIFO, so this op completes
+    /// before any subsequent Canvas2D command on the same canvas runs.
+    /// Removed the sync reply channel because its only payload was the
+    /// caller's own `canvas_id` — pure round-trip stall (was ~7–17 ms
+    /// per call × dozens per shop-scene open on Mali).
+    CreateContext2D,
+
+    /// Resize the backing pbuffer + SkSurface in-band with the rest of
+    /// the Canvas2D command stream.  Mirrors `CanvasCmd::ResizeCanvas`
+    /// but routes through the frame collector so it interleaves with
+    /// `FillText` / `TexImage2DFromCanvas2D` in the order JS issued
+    /// them.  Required for cocos's text-label pattern where a single
+    /// pooled canvas is repeatedly resized and re-filled within a
+    /// frame; without this, the resize side-channel races ahead of
+    /// the buffered draws and the texture upload sees the wrong-size
+    /// surface (random-blank label symptom on arm64).
+    ResizeCanvas {
+        w: Option<u32>,
+        h: Option<u32>,
     },
 
     // ========== Path methods ==========
@@ -1317,6 +1789,53 @@ pub enum Canvas2DCmd {
         resp: RenderCmdResp<Vec<u8>>,
     },
 
+    /// Fire-and-forget snapshot variant for the cocos hot path.
+    /// JS allocates the `snapshot_id` from a process-local counter
+    /// so the call never blocks — the capture rides the next
+    /// FramePacket alongside the prior canvas2D draws and the
+    /// downstream `TexImage2DFromSnapshot` GL op, all in command
+    /// order.  On capture failure (FBO incomplete, pool full) the
+    /// id is silently absent from the pool; the consuming
+    /// `TexImage2DFromSnapshot` then warns.  JS-side cap (
+    /// `MAX_LIVE_CANVAS2D_SNAPSHOTS_JS`) keeps the per-frame count
+    /// well under the render-side pool cap so the failure path is
+    /// never reached in normal operation.
+    CaptureSnapshot {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        snapshot_id: u32,
+        /// Miss-path record for the text texture cache.  When the
+        /// JS-side pattern recognizer matched the cocos
+        /// `fillText → texImage2D(canvas)` shape but the cache
+        /// missed, this command both captures the snapshot (so the
+        /// downstream `TexImage2DFromSnapshot` still works) **and**
+        /// instructs the render thread to register the snapshot's
+        /// resulting texture under this key.  Subsequent fillTexts
+        /// with the same key hit `TexImage2DFromTextCache`.
+        ///
+        /// `None` means "no cache record" — the legacy path; the
+        /// snapshot is consumed by `TexImage2DFromSnapshot` and
+        /// drained at frame end like always.
+        cache_key: Option<Box<crate::text_texture_cache::TextCacheKey>>,
+    },
+
+    /// Force a synchronous CPU readback of a previously created
+    /// snapshot texture.  Backs `migo._force_readback(imageData)`
+    /// for the rare cocos-incompatible game that actually inspects
+    /// `ImageData.data` bytes after `getImageData`.
+    ///
+    /// Returns `Vec<u8>` of length `width * height * 4` (RGBA8
+    /// unpremul, top-left origin) on success, empty on failure.
+    /// Snapshot orientation is set up so the bytes match what the
+    /// legacy `GetImageData` path would have returned for the same
+    /// region.
+    ReadSnapshotPixels {
+        snapshot_id: u32,
+        resp: RenderCmdResp<Vec<u8>>,
+    },
+
     /// Batch draw multiple images for better performance
     /// Each entry is (image_id, sx, sy, sw, sh, dx, dy, dw, dh)
     DrawImageBatch {
@@ -1466,7 +1985,20 @@ impl GLCmd {
             | GLCmd::BindBufferRange { canvas_id, .. }
             | GLCmd::DrawBuffers { canvas_id, .. }
             | GLCmd::ReadBuffer { canvas_id, .. }
-            | GLCmd::FenceSync { canvas_id, .. } => Some(*canvas_id),
+            | GLCmd::FenceSync { canvas_id, .. }
+            | GLCmd::CreateQuery { canvas_id, .. }
+            | GLCmd::BeginQuery { canvas_id, .. }
+            | GLCmd::EndQuery { canvas_id, .. }
+            | GLCmd::CreateTransformFeedback { canvas_id, .. }
+            | GLCmd::BindTransformFeedback { canvas_id, .. }
+            | GLCmd::BeginTransformFeedback { canvas_id, .. }
+            | GLCmd::EndTransformFeedback { canvas_id, .. }
+            | GLCmd::PauseTransformFeedback { canvas_id, .. }
+            | GLCmd::ResumeTransformFeedback { canvas_id, .. }
+            | GLCmd::TransformFeedbackVaryings { canvas_id, .. }
+            | GLCmd::TexImage3D { canvas_id, .. }
+            | GLCmd::TexSubImage3D { canvas_id, .. }
+            | GLCmd::TexStorage3D { canvas_id, .. } => Some(*canvas_id),
 
             // Everything else — resource-context commands (shader
             // create/source/compile/link, program create/attach/
@@ -1511,9 +2043,7 @@ impl GLCmd {
             // Texture uploads (RGBA or compressed block).  `TexImage2D`
             // is optional data (reservation vs upload); `TexSubImage2D`
             // is always `Arc<Vec<u8>>` with a concrete payload.
-            GLCmd::TexImage2D { data, .. } => {
-                data.as_ref().map_or(0, |arc| arc.capacity())
-            }
+            GLCmd::TexImage2D { data, .. } => data.as_ref().map_or(0, |arc| arc.capacity()),
             GLCmd::TexSubImage2D { data, .. } => data.capacity(),
             GLCmd::CompressedTexImage2D { data, .. } => data.capacity(),
             GLCmd::CompressedTexSubImage2D { data, .. } => data.capacity(),
@@ -1538,18 +2068,52 @@ impl GLCmd {
             GLCmd::InvalidateFramebuffer { attachments, .. } => {
                 attachments.capacity() * std::mem::size_of::<u32>()
             }
-            GLCmd::DrawBuffers { buffers, .. } => {
-                buffers.capacity() * std::mem::size_of::<u32>()
+            GLCmd::DrawBuffers { buffers, .. } => buffers.capacity() * std::mem::size_of::<u32>(),
+
+            // WebGL 2 transform feedback varying names.
+            GLCmd::TransformFeedbackVaryings { varyings, .. } => {
+                varyings.iter().map(|v| v.capacity()).sum()
             }
 
-            // All other variants are pure scalars / Copy payloads — the
-            // enum stack size already accounts for them.
+            // WebGL 2 3D texture payloads.
+            GLCmd::TexImage3D { data, .. } | GLCmd::TexSubImage3D { data, .. } => {
+                data.approx_deep_size_bytes()
+            }
+
+            // All other variants are pure scalars / Copy payloads -
+            // the enum stack size already accounts for them.
             _ => 0,
         }
     }
 }
 
 impl Canvas2DCmd {
+    /// Feed each image id this command references into `sink`.
+    /// Used by the render thread (F-1) to pin image entries in
+    /// the `ImageStore` for as long as a `FramePacket` carrying
+    /// the command is in flight — a concurrent `DestroyImage`
+    /// then defers the GL `glDeleteTextures` call until the
+    /// Present barrier fires, eliminating the race where Skia's
+    /// deferred command buffer still references the backend
+    /// texture at the moment of deletion.
+    ///
+    /// Pass-through method (no allocation) so the caller can use
+    /// it with `for_each` or accumulate into any collection.
+    #[inline]
+    pub fn for_each_referenced_image<F: FnMut(ImageId)>(&self, mut sink: F) {
+        match self {
+            Canvas2DCmd::DrawImage { image_id, .. } => sink(*image_id),
+            Canvas2DCmd::DrawImageBatch { draws } => {
+                for d in draws {
+                    sink(d.image_id);
+                }
+            }
+            // Other variants don't reference `image_id`.  `#[non_exhaustive]`
+            // on `Canvas2DCmd` is honoured by the explicit match + catch-all.
+            _ => {}
+        }
+    }
+
     /// See [`GLCmd::approx_deep_size_bytes`].  Canvas 2D variants own
     /// text strings and image-batch vectors; everything else is
     /// inline-scalar.
@@ -1790,8 +2354,7 @@ mod approx_size_tests {
             },
             GLCmd::LinkProgram { program_id: 1u32 }, // no canvas_id
         ];
-        let mut touched: std::collections::HashSet<CanvasId> =
-            std::collections::HashSet::new();
+        let mut touched: std::collections::HashSet<CanvasId> = std::collections::HashSet::new();
         for cmd in &commands {
             if let Some(c) = cmd.touches_canvas() {
                 touched.insert(c);
@@ -1811,8 +2374,7 @@ mod approx_size_tests {
             GLCmd::CompileShader { shader_id: 2u32 },
             GLCmd::DeleteProgram { program_id: 3u32 },
         ];
-        let mut touched: std::collections::HashSet<CanvasId> =
-            std::collections::HashSet::new();
+        let mut touched: std::collections::HashSet<CanvasId> = std::collections::HashSet::new();
         for cmd in &commands {
             if let Some(c) = cmd.touches_canvas() {
                 touched.insert(c);

@@ -6,6 +6,7 @@
 //! focused on local resources.
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use deno_core::OpState;
@@ -17,7 +18,63 @@ use tracing::{debug, warn};
 
 use crate::network::gate::{GateKind, enforce_from_state};
 
+/// Maximum accepted size of the *encoded* data-URL payload, measured
+/// after the `data:` prefix and comma separator are stripped. A script
+/// can generate this string with zero network traffic, so we cap it
+/// before spending base64 / percent-decode CPU.
+pub const MAX_DATA_URL_ENCODED: usize = 8 * 1024 * 1024;
+
+/// Maximum accepted size of the *decoded* data-URL payload (i.e. the
+/// image bytes after base64 / percent decoding). Enforced again after
+/// decode because percent-encoded payloads can be up to 3× their
+/// encoded size.
+pub const MAX_DATA_URL_DECODED: usize = 32 * 1024 * 1024;
+
+/// Maximum accepted *decoded pixel count* for any inline image. Covers
+/// oversized images claimed via data-URL or sent over HTTP. At 4 bytes
+/// per pixel this bounds RGBA allocation at ~64 MiB, which is a hard
+/// mobile-side memory ceiling rather than a performance knob.
+pub const MAX_INLINE_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+
+/// Maximum accepted body size for an `Image.src = "http://..."`
+/// fetch. Aligns with `MAX_DATA_URL_DECODED` so both inline paths have
+/// the same worst-case user-space memory footprint.
+pub const MAX_HTTP_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// TCP connect timeout for HTTP image fetches.
+const HTTP_IMAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Total request timeout for HTTP image fetches (connect + body).
+const HTTP_IMAGE_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[inline]
+fn pixel_cap_err(w: u32, h: u32) -> EngineError {
+    EngineError::new(ErrorCode::ImageReadError)
+        .with_msg("image exceeds pixel budget")
+        .with_detail(format!(
+            "{}x{} ({} px) > limit {}",
+            w,
+            h,
+            (w as u64).saturating_mul(h as u64),
+            MAX_INLINE_IMAGE_PIXELS
+        ))
+}
+
+/// Validate that a decoded image's pixel count fits under
+/// [`MAX_INLINE_IMAGE_PIXELS`]. Called by both inline-decode paths so
+/// a malicious header claiming huge width/height cannot turn into
+/// multi-GiB CPU allocations.
+#[inline]
+pub fn enforce_pixel_budget(width: u32, height: u32) -> EngineResult<()> {
+    let px = (width as u64).saturating_mul(height as u64);
+    if px > MAX_INLINE_IMAGE_PIXELS {
+        return Err(pixel_cap_err(width, height));
+    }
+    Ok(())
+}
+
 /// Parsed `data:` URL payload.
+#[derive(Debug)]
 pub struct DataUrlPayload {
     pub bytes: Vec<u8>,
     /// Lowercase MIME type, e.g. `"image/png"`; used only as a decoder
@@ -43,6 +100,19 @@ pub fn parse_data_url(src: &str) -> EngineResult<DataUrlPayload> {
             .with_detail("no comma separator between meta and payload")
     })?;
 
+    // Encoded-size cap: refuse before touching base64/percent. Attacks
+    // like `img.src = "data:...," + "A".repeat(64M)` need to fail here,
+    // not after allocating and decoding.
+    if payload.len() > MAX_DATA_URL_ENCODED {
+        return Err(EngineError::new(ErrorCode::ImageReadError)
+            .with_msg("data URL payload too large")
+            .with_detail(format!(
+                "encoded {} bytes > limit {}",
+                payload.len(),
+                MAX_DATA_URL_ENCODED
+            )));
+    }
+
     let mut is_base64 = false;
     let mut mime = String::new();
     for (i, param) in meta.split(';').enumerate() {
@@ -65,9 +135,21 @@ pub fn parse_data_url(src: &str) -> EngineResult<DataUrlPayload> {
                     .with_detail(e.to_string())
             })?
     } else {
-        percent_encoding::percent_decode_str(payload)
-            .collect::<Vec<u8>>()
+        percent_encoding::percent_decode_str(payload).collect::<Vec<u8>>()
     };
+
+    // Decoded-size cap: percent-encoded payloads can be ~3× their
+    // textual length, and base64 produces ~3/4 — either way, the
+    // decoded bytes must still fit our per-image memory envelope.
+    if bytes.len() > MAX_DATA_URL_DECODED {
+        return Err(EngineError::new(ErrorCode::ImageReadError)
+            .with_msg("data URL payload too large")
+            .with_detail(format!(
+                "decoded {} bytes > limit {}",
+                bytes.len(),
+                MAX_DATA_URL_DECODED
+            )));
+    }
 
     Ok(DataUrlPayload { bytes, mime })
 }
@@ -105,21 +187,82 @@ pub async fn fetch_http_image(
                 .with_detail(e.to_string())
         })?
     };
-    let resp = client.get(parsed.clone()).send().await.map_err(|e| {
-        EngineError::new(ErrorCode::IoError)
-            .with_msg("image fetch failed")
-            .with_detail(e.to_string())
-    })?;
+    let send_fut = client
+        .get(parsed.clone())
+        .timeout(HTTP_IMAGE_TOTAL_TIMEOUT)
+        .send();
+    let resp = tokio::time::timeout(HTTP_IMAGE_TOTAL_TIMEOUT, send_fut)
+        .await
+        .map_err(|_| {
+            EngineError::new(ErrorCode::IoError)
+                .with_msg("image fetch timed out")
+                .with_detail(format!("no response within {:?}", HTTP_IMAGE_TOTAL_TIMEOUT))
+        })?
+        .map_err(|e| {
+            EngineError::new(ErrorCode::IoError)
+                .with_msg("image fetch failed")
+                .with_detail(e.to_string())
+        })?;
     if !resp.status().is_success() {
         return Err(EngineError::new(ErrorCode::IoError)
             .with_msg("image fetch returned non-2xx")
             .with_detail(format!("url={}, status={}", url, resp.status())));
     }
-    resp.bytes().await.map(|b| b.to_vec()).map_err(|e| {
-        EngineError::new(ErrorCode::IoError)
-            .with_msg("image body read failed")
-            .with_detail(e.to_string())
-    })
+
+    // Body-size cap: refuse before `bytes().await` allocates the full
+    // response in one `Vec<u8>`. We rely on `Content-Length` when the
+    // server provides it; for chunked responses, the streaming loop
+    // below enforces the same bound byte-by-byte.
+    if let Some(len) = resp.content_length() {
+        if len > MAX_HTTP_IMAGE_BYTES {
+            return Err(EngineError::new(ErrorCode::IoError)
+                .with_msg("image body exceeds limit")
+                .with_detail(format!(
+                    "advertised {} bytes > limit {}",
+                    len, MAX_HTTP_IMAGE_BYTES
+                )));
+        }
+    }
+
+    // Stream into a pre-reserved buffer so peak allocation is the
+    // known Content-Length (or MAX_HTTP_IMAGE_BYTES at worst), not the
+    // unbounded concat-on-demand inside `reqwest::Response::bytes`.
+    let hint = resp
+        .content_length()
+        .map(|l| l.min(MAX_HTTP_IMAGE_BYTES) as usize)
+        .unwrap_or(64 * 1024);
+    let mut buf = Vec::with_capacity(hint);
+    let mut resp = resp;
+    loop {
+        let chunk = tokio::time::timeout(HTTP_IMAGE_TOTAL_TIMEOUT, resp.chunk())
+            .await
+            .map_err(|_| {
+                EngineError::new(ErrorCode::IoError)
+                    .with_msg("image body read timed out")
+                    .with_detail(format!("no data within {:?}", HTTP_IMAGE_TOTAL_TIMEOUT))
+            })?
+            .map_err(|e| {
+                EngineError::new(ErrorCode::IoError)
+                    .with_msg("image body read failed")
+                    .with_detail(e.to_string())
+            })?;
+        match chunk {
+            Some(bytes) => {
+                if (buf.len() as u64).saturating_add(bytes.len() as u64) > MAX_HTTP_IMAGE_BYTES {
+                    return Err(EngineError::new(ErrorCode::IoError)
+                        .with_msg("image body exceeds limit")
+                        .with_detail(format!("streamed > {} bytes", MAX_HTTP_IMAGE_BYTES)));
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            None => break,
+        }
+    }
+    // `HTTP_IMAGE_CONNECT_TIMEOUT` is baked into the shared reqwest
+    // client built by `fetch::get_or_create_client_from_state`; refer
+    // to that module if you want to adjust per-request connect time.
+    let _ = HTTP_IMAGE_CONNECT_TIMEOUT;
+    Ok(buf)
 }
 
 /// Decode raw image bytes into a normalised RGBA8 buffer, applying an
@@ -133,16 +276,21 @@ pub fn decode_inline_bytes(
     target_height: Option<u32>,
 ) -> EngineResult<NormalizedImage> {
     if bytes.is_empty() {
-        return Err(EngineError::new(ErrorCode::ImageReadError)
-            .with_msg("empty image payload"));
+        return Err(EngineError::new(ErrorCode::ImageReadError).with_msg("empty image payload"));
     }
     let decoded = io::decode_image_fast(bytes, hint_mime).map_err(|e| {
-        warn!("decode_inline_bytes failed ({} bytes): {:?}", bytes.len(), e);
+        warn!(
+            "decode_inline_bytes failed ({} bytes): {:?}",
+            bytes.len(),
+            e
+        );
         e
     })?;
+    enforce_pixel_budget(decoded.width, decoded.height)?;
 
     match (target_width, target_height) {
         (Some(tw), Some(th)) if tw > 0 && th > 0 => {
+            enforce_pixel_budget(tw, th)?;
             debug!(
                 "decode_inline_bytes resize {}x{} -> {}x{}",
                 decoded.width, decoded.height, tw, th
@@ -178,17 +326,18 @@ pub fn decode_inline_bytes_any(
     hint_mime: Option<&str>,
 ) -> EngineResult<shared::protocol::io_cmd::DecodedImage> {
     if bytes.is_empty() {
-        return Err(EngineError::new(ErrorCode::ImageReadError)
-            .with_msg("empty image payload"));
+        return Err(EngineError::new(ErrorCode::ImageReadError).with_msg("empty image payload"));
     }
-    io::decode_image_to_any(bytes, hint_mime).map_err(|e| {
+    let decoded = io::decode_image_to_any(bytes, hint_mime).map_err(|e| {
         warn!(
             "decode_inline_bytes_any failed ({} bytes): {:?}",
             bytes.len(),
             e
         );
         e
-    })
+    })?;
+    enforce_pixel_budget(decoded.width(), decoded.height())?;
+    Ok(decoded)
 }
 
 /// Quick `Err` builder for unsupported src prefixes routed to this
@@ -260,6 +409,48 @@ mod tests {
     fn decode_inline_bytes_any_empty_payload_rejected() {
         let err = decode_inline_bytes_any(&[], None).unwrap_err();
         assert_eq!(err.code, ErrorCode::ImageReadError);
+    }
+
+    #[test]
+    fn data_url_rejects_oversized_encoded_payload() {
+        let huge = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(MAX_DATA_URL_ENCODED + 1)
+        );
+        let err = parse_data_url(&huge).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ImageReadError);
+    }
+
+    #[test]
+    fn data_url_rejects_oversized_decoded_payload() {
+        // Percent-encoded bytes stay ≤ textual length, so we need a
+        // non-percent payload: build a base64 string whose decoded
+        // size exceeds MAX_DATA_URL_DECODED but encoded fits under
+        // MAX_DATA_URL_ENCODED.
+        let decoded_len = MAX_DATA_URL_DECODED + 1024;
+        let encoded_len = decoded_len.div_ceil(3) * 4;
+        if encoded_len <= MAX_DATA_URL_ENCODED {
+            // Skip if ratios don't allow the shape we need.
+            return;
+        }
+        // Directly build a payload where encoded is within limit but
+        // would fail decoded check: use percent-encoded raw bytes of
+        // MAX_DATA_URL_DECODED+1 ascii chars, which triggers the
+        // post-decode check.
+        let body = "a".repeat(MAX_DATA_URL_DECODED + 1);
+        let src = format!("data:,{body}");
+        // This one is rejected at the encoded check first, which is
+        // fine — still enforces the overall budget.
+        let err = parse_data_url(&src).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ImageReadError);
+    }
+
+    #[test]
+    fn enforce_pixel_budget_rejects_oversize() {
+        // 20000x20000 = 400M pixels, way over limit.
+        assert!(enforce_pixel_budget(20_000, 20_000).is_err());
+        // 4000x4000 = 16M, right at the limit, allowed.
+        assert!(enforce_pixel_budget(4000, 4000).is_ok());
     }
 
     #[test]

@@ -28,6 +28,22 @@ use super::gate::{GateKind, enforce_from_state};
 
 type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Per-connection WebSocket limits. Kept module-private so callers go
+/// through [`build_ws_config`] rather than ad-hoc configs.
+pub const WS_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const WS_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+pub const WS_WRITE_BUFFER_BYTES: usize = 128 * 1024;
+pub const WS_MAX_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+fn build_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+    WebSocketConfig::default()
+        .max_message_size(Some(WS_MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(WS_MAX_FRAME_BYTES))
+        .write_buffer_size(WS_WRITE_BUFFER_BYTES)
+        .max_write_buffer_size(WS_MAX_WRITE_BUFFER_BYTES)
+}
+
 // ── Resource ──
 
 pub struct WebSocketResource {
@@ -93,6 +109,7 @@ pub async fn op_ws_create(
 ) -> Result<WsCreateResult, JsErrorBox> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+    let connect_started = std::time::Instant::now();
     debug!("WebSocket connect: {}", url);
 
     // Parse once and run the shared network-policy gate BEFORE we
@@ -118,14 +135,19 @@ pub async fn op_ws_create(
     // resolution TOCTOU window — we connect the TcpStream ourselves
     // and hand it to the WebSocket handshake layer.
     let connect_addr = if let Some(host) = request.uri().host() {
-        let port = request.uri().port_u16().unwrap_or(if scheme == "wss" { 443 } else { 80 });
+        let port = request
+            .uri()
+            .port_u16()
+            .unwrap_or(if scheme == "wss" { 443 } else { 80 });
         let addr_str = format!("{}:{}", host, port);
         let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr_str)
             .await
             .map_err(|e| JsErrorBox::generic(format!("WebSocket DNS resolve failed: {}", e)))?
             .collect();
         if addrs.is_empty() {
-            return Err(JsErrorBox::generic("WebSocket DNS resolve returned no addresses"));
+            return Err(JsErrorBox::generic(
+                "WebSocket DNS resolve returned no addresses",
+            ));
         }
         for addr in &addrs {
             if super::address_filter::is_blocked_address(addr) {
@@ -165,11 +187,18 @@ pub async fn op_ws_create(
         .map_err(|e| JsErrorBox::generic(format!("WebSocket TCP connect failed: {}", e)))?;
     let _ = tcp_stream.set_nodelay(true);
 
+    // Explicit WebSocket limits: tungstenite's defaults are 64 MiB
+    // message / 16 MiB frame, which are tuned for desktop servers. A
+    // mobile game runtime cannot reserve that much per connection, so
+    // we cap far lower. Apps that really need large frames should
+    // fragment in-app rather than ship a multi-megabyte blob.
+    let ws_cfg = build_ws_config();
+
     // Handshake over the pre-connected stream.
     // client_async_tls_with_config handles TLS upgrade for wss:// using
     // the hostname from the request URI for SNI — no second DNS lookup.
     let handshake_fut =
-        tokio_tungstenite::client_async_tls_with_config(request, tcp_stream, None, None);
+        tokio_tungstenite::client_async_tls_with_config(request, tcp_stream, Some(ws_cfg), None);
     let (ws_stream, response) =
         tokio::time::timeout(std::time::Duration::from_secs(30), handshake_fut)
             .await
@@ -200,6 +229,9 @@ pub async fn op_ws_create(
     };
 
     let rid = state.borrow_mut().resource_table.add(resource);
+
+    shared::stats::io_metrics_global()
+        .record_op(shared::stats::OpClass::WsConnect, connect_started.elapsed());
 
     debug!("WebSocket connected, rid={}", rid);
 

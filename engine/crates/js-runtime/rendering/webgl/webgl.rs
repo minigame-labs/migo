@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytemuck::allocation::cast_vec;
-use deno_core::{op2, OpState};
+use deno_core::{OpState, op2};
 use tracing::{error, warn};
 
 use crate::rendering::image::cache::IMAGE_CACHE;
@@ -44,7 +44,122 @@ impl GlResourceIdAllocator {
 
 #[cfg(test)]
 mod tests {
-    use super::GlResourceIdAllocator;
+    use std::{
+        cell::RefCell,
+        path::PathBuf,
+        rc::Rc,
+        sync::{Arc, atomic::AtomicBool},
+        time::Duration,
+    };
+
+    use deno_core::OpState;
+    use tokio::sync::mpsc;
+
+    use super::{
+        GlResourceIdAllocator, bind_buffer_base_impl, bind_buffer_range_impl,
+        normalize_tex_upload_3d_source,
+    };
+    use crate::rendering::webgl::{
+        error_state::{self, WebGLErrorState, codes},
+        frame_collector::UnifiedFrameCollector,
+    };
+    use crate::{HostJsRuntime, host_runtime::SharedMountTableRef};
+    use shared::{
+        channel::ThreadWakeup,
+        device::gpu_caps::GpuCaps,
+        op_state::{AudioSender, HostOpState, NetworkPolicy},
+        protocol::render_cmd::{GLCmd, RenderCommand, TexImage3DSource},
+        render_command_sender::CommandSender,
+    };
+
+    fn new_webgl_op_state() -> OpState {
+        let mut state = OpState::new(None);
+        state.put(UnifiedFrameCollector::new());
+        state.put(WebGLErrorState::default());
+        state
+    }
+
+    fn new_test_host_state() -> (HostOpState, crossbeam_channel::Receiver<RenderCommand>) {
+        let (render_tx, render_rx) = CommandSender::new();
+        let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
+        let (host_tx, _host_rx) = mpsc::channel(1);
+
+        (
+            HostOpState {
+                id: 1,
+                app_cache_dir: PathBuf::from("/tmp/cache"),
+                app_files_dir: PathBuf::from("/tmp/files"),
+                code_dir: None,
+                game_paths: None,
+                vfs: None,
+                mount_table: None,
+                render_tx,
+                text_measurer: None,
+                audio_tx: AudioSender::new(audio_raw_tx, ThreadWakeup::new()),
+                host_tx,
+                device_services: None,
+                raf_rx: None,
+                sub_packages: Vec::new(),
+                workers_path: None,
+                network_policy: NetworkPolicy::default(),
+                backgrounded: Arc::new(AtomicBool::new(false)),
+                webgl_context_created: Arc::new(AtomicBool::new(false)),
+                code_signing_enabled: false,
+                gpu_caps: GpuCaps::new(),
+            },
+            render_rx,
+        )
+    }
+
+    fn new_webgl_runtime() -> (HostJsRuntime, crossbeam_channel::Receiver<RenderCommand>) {
+        let (host_state, render_rx) = new_test_host_state();
+        let mount_ref: SharedMountTableRef = Rc::new(RefCell::new(None));
+        let runtime = HostJsRuntime::new(
+            1,
+            host_state,
+            Vec::new(),
+            None,
+            None,
+            mount_ref,
+            #[cfg(feature = "v8-limits")]
+            Default::default(),
+            #[cfg(feature = "code-signing")]
+            false,
+            #[cfg(feature = "code-signing")]
+            None,
+        );
+        (runtime, render_rx)
+    }
+
+    fn spawn_tf_varying_responder(
+        render_rx: crossbeam_channel::Receiver<RenderCommand>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut replies = 0;
+            while replies < 2 {
+                match render_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("expected transform feedback varying request")
+                {
+                    RenderCommand::FramePacket(_) => {}
+                    RenderCommand::GL(GLCmd::GetTransformFeedbackVarying {
+                        program,
+                        index,
+                        resp,
+                    }) => {
+                        assert_eq!(program, 17);
+                        match index {
+                            0 => resp.ok(Some(("v_pos".to_string(), 1, 0x8B51))),
+                            1 => resp.ok(None),
+                            other => panic!("unexpected varying index {other}"),
+                        }
+                        replies += 1;
+                    }
+                    other => panic!("unexpected render command in TF varying test: {other:?}"),
+                }
+            }
+        })
+    }
 
     #[test]
     fn allocates_monotonic_non_zero_ids() {
@@ -61,23 +176,215 @@ mod tests {
         assert_eq!(alloc.alloc(), 1);
         assert_ne!(alloc.alloc(), 0);
     }
+
+    #[test]
+    fn bind_buffer_base_rejects_transform_feedback_target_while_active() {
+        let mut state = new_webgl_op_state();
+        error_state::set_transform_feedback_active(&mut state, 7, true);
+
+        bind_buffer_base_impl(&mut state, 7, 0x8C8E, 0, 9);
+
+        assert_eq!(
+            state.borrow_mut::<WebGLErrorState>().drain_one(7),
+            codes::INVALID_OPERATION
+        );
+        assert_eq!(
+            state
+                .borrow::<UnifiedFrameCollector>()
+                .approx_pending_bytes(),
+            0,
+            "validator must reject the bind before queueing GL work"
+        );
+    }
+
+    #[test]
+    fn bind_buffer_range_rejects_transform_feedback_target_while_active() {
+        let mut state = new_webgl_op_state();
+        error_state::set_transform_feedback_active(&mut state, 7, true);
+
+        bind_buffer_range_impl(&mut state, 7, 0x8C8E, 0, 9, 0, 64);
+
+        assert_eq!(
+            state.borrow_mut::<WebGLErrorState>().drain_one(7),
+            codes::INVALID_OPERATION
+        );
+        assert_eq!(
+            state
+                .borrow::<UnifiedFrameCollector>()
+                .approx_pending_bytes(),
+            0,
+            "validator must reject the bind before queueing GL work"
+        );
+    }
+
+    #[test]
+    fn tex_image_3d_source_applies_src_offset_in_elements() {
+        match normalize_tex_upload_3d_source(Some(&[0, 1, 2, 3, 4, 5, 6, 7]), 2, 2, None) {
+            TexImage3DSource::Bytes(bytes) => assert_eq!(bytes.as_slice(), &[4, 5, 6, 7]),
+            other => panic!("expected sliced byte source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tex_sub_image_3d_source_uses_pbo_offset_when_requested() {
+        match normalize_tex_upload_3d_source(None, 0, 1, Some(24)) {
+            TexImage3DSource::BufferOffset(offset) => assert_eq!(offset, 24),
+            other => panic!("expected buffer offset source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webgl2_query_registry_matches_lifecycle_semantics() {
+        let (mut runtime, _render_rx) = new_webgl_runtime();
+        runtime
+            .exec_script(
+                "webgl2_query_registry.js",
+                r#"
+                const ctx = new WebGL2RenderingContext({ _rid: 7, width: 1, height: 1 }, {});
+                const q = ctx.createQuery();
+                if (ctx.isQuery(q) !== false) throw new Error("createQuery must not become true before first beginQuery");
+                if (ctx.getQuery(0x8C2F, 0x8865) !== null) throw new Error("CURRENT_QUERY must start as null");
+                ctx.beginQuery(0x8C2F, q);
+                if (ctx.isQuery(q) !== true) throw new Error("beginQuery must mark query as real");
+                if (ctx.getQuery(0x8C2F, 0x8865) !== q) throw new Error("CURRENT_QUERY must return the active query object");
+                ctx.endQuery(0x8C2F);
+                if (ctx.getQuery(0x8C2F, 0x8865) !== null) throw new Error("CURRENT_QUERY must clear after endQuery");
+                ctx.deleteQuery(q);
+                if (ctx.isQuery(q) !== false) throw new Error("deleteQuery must make isQuery false");
+                "#,
+            )
+            .expect("query lifecycle script should complete");
+    }
+
+    #[test]
+    fn webgl2_transform_feedback_delete_active_queues_invalid_operation() {
+        let (mut runtime, _render_rx) = new_webgl_runtime();
+        runtime
+            .exec_script(
+                "webgl2_tf_registry.js",
+                r#"
+                const ctx = new WebGL2RenderingContext({ _rid: 9, width: 1, height: 1 }, {});
+                const tf = ctx.createTransformFeedback();
+                if (ctx.isTransformFeedback(tf) !== false) throw new Error("createTransformFeedback must not become true before first bind");
+                ctx.bindTransformFeedback(0x8E22, tf);
+                if (ctx.isTransformFeedback(tf) !== true) throw new Error("bindTransformFeedback must mark object as real");
+                ctx.beginTransformFeedback(0x0004);
+                ctx.pauseTransformFeedback();
+                ctx.deleteTransformFeedback(tf);
+                if (ctx.getError() !== 0x0502) throw new Error("delete active transform feedback must queue INVALID_OPERATION");
+                if (ctx.isTransformFeedback(tf) !== true) throw new Error("failed delete must preserve transform feedback object");
+                ctx.endTransformFeedback();
+                ctx.deleteTransformFeedback(tf);
+                if (ctx.isTransformFeedback(tf) !== false) throw new Error("successful delete must clear transform feedback object");
+                "#,
+            )
+            .expect("transform feedback lifecycle script should complete");
+    }
+
+    #[test]
+    fn webgl2_get_transform_feedback_varying_parses_sync_result() {
+        let (mut runtime, render_rx) = new_webgl_runtime();
+        let responder = spawn_tf_varying_responder(render_rx);
+        runtime
+            .exec_script(
+                "webgl2_tf_varying.js",
+                r#"
+                const ctx = new WebGL2RenderingContext({ _rid: 11, width: 1, height: 1 }, {});
+                const program = { _id: 17, _kind: "program" };
+                const info = ctx.getTransformFeedbackVarying(program, 0);
+                if (!info) throw new Error("expected transform feedback varying metadata");
+                if (info.name !== "v_pos") throw new Error("varying name mismatch");
+                if (info.size !== 1) throw new Error("varying size mismatch");
+                if (info.type !== 0x8B51) throw new Error("varying type mismatch");
+                if (ctx.getTransformFeedbackVarying(program, 1) !== null) {
+                    throw new Error("out-of-range varying index must return null");
+                }
+                "#,
+            )
+            .expect("transform feedback varying script should complete");
+        responder
+            .join()
+            .expect("TF varying responder should exit cleanly");
+    }
+}
+
+/// Compile-time test: does this `GLCmd` variant carry a heap
+/// payload large enough that it could single-handedly blow the
+/// collector's 4 MiB soft budget?
+///
+/// `false` for scalar variants (viewport, bind*, uniform scalars,
+/// enable/disable, draw, scissor, ...) - the overwhelming majority
+/// of ops by count in a real frame.  `true` for `BufferData` /
+/// `TexImage2D` / `ShaderSource` / uniform array uploads, where a
+/// single call can be megabytes.
+///
+/// Branching on this lets `queue_gl_fire_and_forget` skip both the
+/// heavy `approx_deep_size_bytes` match AND the `maybe_auto_flush`
+/// OpState re-borrow on the scalar fast path, without forcing every
+/// call site to pick between `push_gl` / `push_gl_fast` manually.
+/// With LTO the `matches!` compiles down to a handful of discriminant
+/// comparisons (jump table), so the fast path remains cheap.
+#[inline(always)]
+fn gl_cmd_has_heap_payload(cmd: &GLCmd) -> bool {
+    matches!(
+        cmd,
+        GLCmd::BufferData { .. }
+            | GLCmd::BufferSubData { .. }
+            | GLCmd::TexImage2D { .. }
+            | GLCmd::TexSubImage2D { .. }
+            | GLCmd::CompressedTexImage2D { .. }
+            | GLCmd::CompressedTexSubImage2D { .. }
+            | GLCmd::ShaderSource { .. }
+            | GLCmd::GetUniformLocation { .. }
+            | GLCmd::GetAttribLocation { .. }
+            | GLCmd::GetUniformBlockIndex { .. }
+            | GLCmd::Uniform1iv { .. }
+            | GLCmd::Uniform2iv { .. }
+            | GLCmd::Uniform3iv { .. }
+            | GLCmd::Uniform4iv { .. }
+            | GLCmd::Uniform1fv { .. }
+            | GLCmd::Uniform2fv { .. }
+            | GLCmd::Uniform3fv { .. }
+            | GLCmd::Uniform4fv { .. }
+            | GLCmd::UniformMatrix2fv { .. }
+            | GLCmd::UniformMatrix3fv { .. }
+            | GLCmd::UniformMatrix4fv { .. }
+            | GLCmd::InvalidateFramebuffer { .. }
+            | GLCmd::DrawBuffers { .. }
+            | GLCmd::TransformFeedbackVaryings { .. }
+            | GLCmd::TexImage3D { .. }
+            | GLCmd::TexSubImage3D { .. }
+    )
 }
 
 #[inline]
-fn queue_gl_fire_and_forget(state: &mut OpState, cmd: GLCmd) {
-    let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() else {
+pub(crate) fn queue_gl_fire_and_forget(state: &mut OpState, cmd: GLCmd) {
+    let heap = gl_cmd_has_heap_payload(&cmd);
+    let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    else {
         error!("UnifiedFrameCollector missing in op state");
         return;
     };
-    collector.push_gl(cmd);
-    // Soft byte-budget backpressure: when a single push has pushed
-    // the accumulated batch past the 4 MB threshold (typically a
-    // `bufferData` / `texImage2D` with a fat payload), cut the
-    // barrier here so we don't hold tens of MB of heap on the JS
-    // thread while waiting for a frame boundary.  Mirrors
-    // Chromium's `CanvasResourceProvider::auto_flush` which uses
-    // its own byte estimate to decide when to forcibly commit.
-    maybe_auto_flush(state);
+    if heap {
+        collector.push_gl(cmd);
+        // Soft byte-budget backpressure: when a single push has
+        // pushed the accumulated batch past the 4 MB threshold
+        // (typically a `bufferData` / `texImage2D` with a fat
+        // payload), cut the barrier here so we don't hold tens
+        // of MB of heap on the JS thread while waiting for a
+        // frame boundary.  Mirrors Chromium's
+        // `CanvasResourceProvider::auto_flush` which uses its own
+        // byte estimate to decide when to forcibly commit.
+        maybe_auto_flush(state);
+    } else {
+        // Scalar fast path: accounted at `size_of::<GLCmd>()`,
+        // no auto-flush check.  Scalar commands alone never blow
+        // the soft budget - a bind/uniform storm of 100 000 calls
+        // at ~128 B enum size tops out around 12 MiB, and any
+        // frame holding that many GL ops is already pathological.
+        collector.push_gl_fast(cmd);
+    }
 }
 
 /// Inspect the frame collector; flush a non-presenting barrier if
@@ -109,23 +416,102 @@ fn send_gl_sync_with_flush<T>(
     send_gl_with_resp_sync(ctx, build)
 }
 
+/// Result of trying to resolve RGBA bytes for a caller `image_id`.
+///
+/// Encodes the distinction between "the caller is referencing an id
+/// we've never seen" and "we know the id but the bytes are missing"
+/// so the miss-diagnostic log can tell the two failure modes apart.
+enum RgbaLookup {
+    Found {
+        width: i32,
+        height: i32,
+        data: Arc<Vec<u8>>,
+        /// Which code path served the bytes.  Used only for the
+        /// `warn!` miss log — it tells us whether the pinned path
+        /// (H-1) is doing its job on the next production drop.
+        #[allow(dead_code)]
+        source: RgbaSource,
+    },
+    UnknownAlias,
+    AliasKnownButEvicted {
+        cache_key: crate::rendering::image::cache::ImageCacheKey,
+    },
+}
+
+#[derive(Debug)]
+enum RgbaSource {
+    /// Bytes came from the pin-protected io::global_cache.  This
+    /// is the only path post-H-5; the variant is kept so future
+    /// alternate sources (GPU-copy, direct-from-Skia) can be
+    /// distinguished in diagnostic logs without a schema change.
+    #[allow(dead_code)]
+    IoCache,
+}
+
 #[inline]
-fn load_cached_image_rgba(image_id: u32) -> Option<(i32, i32, Arc<Vec<u8>>)> {
+fn resolve_cached_image_rgba(image_id: u32) -> RgbaLookup {
+    // H-5: the io::global_cache is now the single source of truth
+    // for decoded RGBA bytes, with `pin()` / `unpin()` keeping
+    // actively referenced entries exempt from LRU eviction.  The
+    // js-runtime IMAGE_CACHE just tells us whether we have an
+    // alias for this caller `image_id` at all (and maps it to
+    // the canonical cache key); the byte lookup then runs
+    // against io::global_cache directly.
+    //
+    // The alias-known-but-evicted branch therefore only fires
+    // when something outside the pin path has cleared the LRU
+    // (e.g. `image_cache::global_cache().clear()` called
+    // manually, or a pin-mismatch bug — both of which we want to
+    // surface in the warn log rather than paper over silently).
     let key = {
         let c = IMAGE_CACHE.lock();
         c.cache_key_for_image_id(image_id)
-    }?;
+    };
+    let Some(key) = key else {
+        return RgbaLookup::UnknownAlias;
+    };
 
     let cached = {
         let mut cache = io::global_cache();
         cache.get(&crate::rendering::image::cache::to_io_cache_key(&key))
-    }?;
+    };
+    match cached {
+        Some(entry) => {
+            // Diag: trace confirms WebGL texImage2D actually
+            // found bytes for `image_id`.  Used to verify the
+            // H-5 pin path is keeping live aliases resident —
+            // a spike of warn-level `miss (bytes evicted)` logs
+            // would signal the pin is leaking.
+            tracing::trace!(
+                image_id,
+                path = key.0.as_str(),
+                gen = key.1,
+                width = entry.image.width,
+                height = entry.image.height,
+                "resolve_cached_image_rgba hit"
+            );
+            RgbaLookup::Found {
+                width: entry.image.width as i32,
+                height: entry.image.height as i32,
+                data: Arc::clone(&entry.image.rgba),
+                source: RgbaSource::IoCache,
+            }
+        }
+        None => RgbaLookup::AliasKnownButEvicted { cache_key: key },
+    }
+}
 
-    Some((
-        cached.image.width as i32,
-        cached.image.height as i32,
-        Arc::clone(&cached.image.rgba),
-    ))
+#[inline]
+fn load_cached_image_rgba(image_id: u32) -> Option<(i32, i32, Arc<Vec<u8>>)> {
+    match resolve_cached_image_rgba(image_id) {
+        RgbaLookup::Found {
+            width,
+            height,
+            data,
+            ..
+        } => Some((width, height, data)),
+        _ => None,
+    }
 }
 
 #[op2(fast)]
@@ -788,12 +1174,61 @@ pub fn op_tex_image_2d_from_image(
     #[smi] type_: u32,
     #[smi] image_id: u32,
 ) {
-    let Some((width, height, data)) = load_cached_image_rgba(image_id) else {
-        warn!(
-            "op_tex_image_2d_from_image cache miss: image_id={}",
-            image_id
+    // Fast path: the image has already been uploaded to a GL texture
+    // by `op_load_image` (CanvasCmd::LoadImage path) and is sitting
+    // in the render thread's `ImageStore`.  We hand the destination
+    // upload off as a GPU-side copy from that existing texture, so
+    // the WebGL texImage2D round-trip never re-reads the CPU-side
+    // RGBA bytes.  Mirrors what Chrome does for HTMLImageElement →
+    // gl.texImage2D after the bitmap has been promoted to a GPU
+    // texture.
+    let shared = {
+        let c = crate::rendering::image::cache::IMAGE_CACHE.lock();
+        c.shared_for_image_id(image_id)
+    };
+    if let Some((source_shared_id, (w, h))) = shared {
+        queue_gl_fire_and_forget(
+            state,
+            GLCmd::TexImage2DFromShared {
+                canvas_id,
+                target,
+                level,
+                internalformat,
+                format,
+                type_,
+                source_shared_id,
+                src_width: w as i32,
+                src_height: h as i32,
+            },
         );
         return;
+    }
+
+    // Slow path: the image's GL texture is not (yet) live in the
+    // store but the decoded RGBA bytes are still in the io cache —
+    // re-upload from CPU bytes.  Also covers the diagnostic miss
+    // classes (unknown alias / evicted bytes).
+    let (width, height, data) = match resolve_cached_image_rgba(image_id) {
+        RgbaLookup::Found {
+            width,
+            height,
+            data,
+            ..
+        } => (width, height, data),
+        RgbaLookup::UnknownAlias => {
+            warn!(
+                "op_tex_image_2d_from_image miss (unknown alias): image_id={}",
+                image_id
+            );
+            return;
+        }
+        RgbaLookup::AliasKnownButEvicted { cache_key } => {
+            warn!(
+                "op_tex_image_2d_from_image miss (bytes evicted): image_id={}, src={}, gen={}",
+                image_id, cache_key.0, cache_key.1
+            );
+            return;
+        }
     };
 
     queue_gl_fire_and_forget(
@@ -809,6 +1244,153 @@ pub fn op_tex_image_2d_from_image(
             format,
             type_,
             data: Some(data),
+        },
+    );
+}
+
+/// `texImage2D` from a Canvas2D snapshot allocated by
+/// `op_get_image_data_snapshot`.  Routes a single `GLCmd` into the
+/// frame collector so the upload lands inside the same FramePacket
+/// as the surrounding WebGL draw — no inserted Materialize barrier,
+/// no sync flush, no CPU readback.  Mirrors
+/// [`op_tex_image_2d_from_image`].
+#[op2(fast)]
+pub fn op_tex_image_2d_from_snapshot(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] level: i32,
+    #[smi] internalformat: i32,
+    #[smi] format: u32,
+    #[smi] type_: u32,
+    #[smi] snapshot_id: u32,
+) {
+    if snapshot_id == 0 {
+        // JS-side fallback already happened (`getImageData` returned
+        // a real CPU buffer instead of a snapshot wrapper); this op
+        // shouldn't be invoked.  Drop silently to keep the call site
+        // total; tracing-warn would just spam logs on misuse.
+        return;
+    }
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexImage2DFromSnapshot {
+            canvas_id,
+            target,
+            level,
+            internalformat,
+            format,
+            type_,
+            snapshot_id,
+        },
+    );
+}
+
+/// Direct GPU->GPU `texImage2D` from an HTMLCanvasElement -- bypasses
+/// the getImageData->snapshot->force-readback chain that cocos's
+/// `gl.texImage2D(target, ..., canvasElement)` pattern was triggering
+/// (~50ms V8 stall per call on the emulator, ~20 calls per popup).
+/// Fire-and-forget: render thread does FBO blit + glCopyTexImage2D in
+/// one shot.
+#[op2(fast)]
+pub fn op_tex_image_2d_from_canvas2d(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] level: i32,
+    #[smi] internalformat: i32,
+    #[smi] canvas_2d_id: u32,
+    #[smi] x: i32,
+    #[smi] y: i32,
+    #[smi] width: u32,
+    #[smi] height: u32,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexImage2DFromCanvas2D {
+            canvas_id,
+            target,
+            level,
+            internalformat,
+            canvas_2d_id,
+            x,
+            y,
+            width,
+            height,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_tex_sub_image_2d_from_canvas2d(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] level: i32,
+    #[smi] xoffset: i32,
+    #[smi] yoffset: i32,
+    #[smi] canvas_2d_id: u32,
+    #[smi] x: i32,
+    #[smi] y: i32,
+    #[smi] width: u32,
+    #[smi] height: u32,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexSubImage2DFromCanvas2D {
+            canvas_id,
+            target,
+            level,
+            xoffset,
+            yoffset,
+            canvas_2d_id,
+            x,
+            y,
+            width,
+            height,
+        },
+    );
+}
+
+/// `texSubImage2D` from a Canvas2D snapshot -- sibling of
+/// `op_tex_image_2d_from_snapshot` for cocos-style text atlases that
+/// pre-allocate an atlas texture and stream glyph cells in via
+/// `texSubImage2D`.  Without this op, the JS path falls through to
+/// `op_tex_sub_image_2d` and uploads the zero-filled placeholder
+/// `Uint8ClampedArray` carried by the synthetic ImageData -- visible
+/// as missing glyphs in the atlas.
+#[op2(fast)]
+pub fn op_tex_sub_image_2d_from_snapshot(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] level: i32,
+    #[smi] xoffset: i32,
+    #[smi] yoffset: i32,
+    #[smi] format: u32,
+    #[smi] type_: u32,
+    #[smi] snapshot_id: u32,
+) {
+    if snapshot_id == 0 {
+        return;
+    }
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexSubImage2DFromSnapshot {
+            canvas_id,
+            target,
+            level,
+            xoffset,
+            yoffset,
+            format,
+            type_,
+            snapshot_id,
         },
     );
 }
@@ -857,12 +1439,27 @@ pub fn op_tex_sub_image_2d_from_image(
     #[smi] type_: u32,
     #[smi] image_id: u32,
 ) {
-    let Some((width, height, data)) = load_cached_image_rgba(image_id) else {
-        warn!(
-            "op_tex_sub_image_2d_from_image cache miss: image_id={}",
-            image_id
-        );
-        return;
+    let (width, height, data) = match resolve_cached_image_rgba(image_id) {
+        RgbaLookup::Found {
+            width,
+            height,
+            data,
+            ..
+        } => (width, height, data),
+        RgbaLookup::UnknownAlias => {
+            warn!(
+                "op_tex_sub_image_2d_from_image miss (unknown alias): image_id={}",
+                image_id
+            );
+            return;
+        }
+        RgbaLookup::AliasKnownButEvicted { cache_key } => {
+            warn!(
+                "op_tex_sub_image_2d_from_image miss (bytes evicted): image_id={}, src={}, gen={}",
+                image_id, cache_key.0, cache_key.1
+            );
+            return;
+        }
     };
 
     queue_gl_fire_and_forget(
@@ -1866,7 +2463,10 @@ pub fn op_hint(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32, #
 pub fn op_create_vertex_array(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32) {
     queue_gl_fire_and_forget(
         state,
-        GLCmd::CreateVertexArray { canvas_id, client_id },
+        GLCmd::CreateVertexArray {
+            canvas_id,
+            client_id,
+        },
     );
 }
 
@@ -1955,7 +2555,11 @@ pub fn op_get_uniform_block_index(
     #[string] name: String,
 ) -> u32 {
     send_gl_sync_with_flush(state, |resp| {
-        RenderCommand::GL(GLCmd::GetUniformBlockIndex { program_id, name, resp })
+        RenderCommand::GL(GLCmd::GetUniformBlockIndex {
+            program_id,
+            name,
+            resp,
+        })
     })
     .unwrap_or(u32::MAX)
 }
@@ -1985,13 +2589,29 @@ pub fn op_bind_buffer_base(
     #[smi] index: u32,
     #[smi] buffer: u32,
 ) {
+    bind_buffer_base_impl(state, canvas_id, target, index, buffer);
+}
+
+fn bind_buffer_base_impl(
+    state: &mut OpState,
+    canvas_id: u32,
+    target: u32,
+    index: u32,
+    buffer: u32,
+) {
+    let buffer = if buffer == 0 { None } else { Some(buffer) };
+    if !crate::rendering::webgl::error_state::validate_bind_buffer_base(
+        state, canvas_id, target, index, buffer,
+    ) {
+        return;
+    }
     queue_gl_fire_and_forget(
         state,
         GLCmd::BindBufferBase {
             canvas_id,
             target,
             index,
-            buffer: if buffer == 0 { None } else { Some(buffer) },
+            buffer,
         },
     );
 }
@@ -2006,13 +2626,31 @@ pub fn op_bind_buffer_range(
     #[smi] offset: i32,
     #[smi] size: i32,
 ) {
+    bind_buffer_range_impl(state, canvas_id, target, index, buffer, offset, size);
+}
+
+fn bind_buffer_range_impl(
+    state: &mut OpState,
+    canvas_id: u32,
+    target: u32,
+    index: u32,
+    buffer: u32,
+    offset: i32,
+    size: i32,
+) {
+    let buffer = if buffer == 0 { None } else { Some(buffer) };
+    if !crate::rendering::webgl::error_state::validate_bind_buffer_range(
+        state, canvas_id, target, index, buffer, offset, size,
+    ) {
+        return;
+    }
     queue_gl_fire_and_forget(
         state,
         GLCmd::BindBufferRange {
             canvas_id,
             target,
             index,
-            buffer: if buffer == 0 { None } else { Some(buffer) },
+            buffer,
             offset,
             size,
         },
@@ -2120,7 +2758,13 @@ pub fn op_renderbuffer_storage_multisample(
 
 #[op2(fast)]
 pub fn op_create_sampler(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32) {
-    queue_gl_fire_and_forget(state, GLCmd::CreateSampler { canvas_id, client_id });
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CreateSampler {
+            canvas_id,
+            client_id,
+        },
+    );
 }
 
 #[op2(fast)]
@@ -2129,7 +2773,12 @@ pub fn op_delete_sampler(state: &mut OpState, #[smi] sampler: u32) {
 }
 
 #[op2(fast)]
-pub fn op_bind_sampler(state: &mut OpState, #[smi] canvas_id: u32, #[smi] unit: u32, #[smi] sampler: u32) {
+pub fn op_bind_sampler(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] unit: u32,
+    #[smi] sampler: u32,
+) {
     queue_gl_fire_and_forget(
         state,
         GLCmd::BindSampler {
@@ -2141,17 +2790,47 @@ pub fn op_bind_sampler(state: &mut OpState, #[smi] canvas_id: u32, #[smi] unit: 
 }
 
 #[op2(fast)]
-pub fn op_sampler_parameteri(state: &mut OpState, #[smi] sampler: u32, #[smi] pname: u32, #[smi] param: i32) {
-    queue_gl_fire_and_forget(state, GLCmd::SamplerParameteri { sampler, pname, param });
+pub fn op_sampler_parameteri(
+    state: &mut OpState,
+    #[smi] sampler: u32,
+    #[smi] pname: u32,
+    #[smi] param: i32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::SamplerParameteri {
+            sampler,
+            pname,
+            param,
+        },
+    );
 }
 
 #[op2(fast)]
-pub fn op_sampler_parameterf(state: &mut OpState, #[smi] sampler: u32, #[smi] pname: u32, param: f32) {
-    queue_gl_fire_and_forget(state, GLCmd::SamplerParameterf { sampler, pname, param });
+pub fn op_sampler_parameterf(
+    state: &mut OpState,
+    #[smi] sampler: u32,
+    #[smi] pname: u32,
+    param: f32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::SamplerParameterf {
+            sampler,
+            pname,
+            param,
+        },
+    );
 }
 
 #[op2(fast)]
-pub fn op_fence_sync(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32, #[smi] condition: u32, #[smi] flags: u32) {
+pub fn op_fence_sync(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] client_id: u32,
+    #[smi] condition: u32,
+    #[smi] flags: u32,
+) {
     queue_gl_fire_and_forget(
         state,
         GLCmd::FenceSync {
@@ -2205,4 +2884,324 @@ pub fn op_draw_buffers(
 #[op2(fast)]
 pub fn op_read_buffer(state: &mut OpState, #[smi] canvas_id: u32, #[smi] src: u32) {
     queue_gl_fire_and_forget(state, GLCmd::ReadBuffer { canvas_id, src });
+}
+
+// ---- WebGL 2 Query objects ---------------------------------------
+
+#[op2(fast)]
+pub fn op_create_query(state: &mut OpState, #[smi] canvas_id: u32, #[smi] client_id: u32) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CreateQuery {
+            canvas_id,
+            client_id,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_delete_query(state: &mut OpState, #[smi] query: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::DeleteQuery { query });
+}
+
+#[op2(fast)]
+pub fn op_begin_query(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] query: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BeginQuery {
+            canvas_id,
+            target,
+            query,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_end_query(state: &mut OpState, #[smi] canvas_id: u32, #[smi] target: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::EndQuery { canvas_id, target });
+}
+
+/// `getQueryParameter(query, pname)` - synchronous barrier because
+/// callers poll `QUERY_RESULT_AVAILABLE` in a tight loop before
+/// reading `QUERY_RESULT`; a queued call would stall behind normal
+/// render traffic.
+#[op2(fast)]
+#[smi]
+pub fn op_get_query_parameter(state: &mut OpState, #[smi] query: u32, #[smi] pname: u32) -> u32 {
+    send_gl_sync_with_flush(state, |resp| {
+        RenderCommand::GL(GLCmd::GetQueryParameter { query, pname, resp })
+    })
+    .unwrap_or(0)
+}
+
+// ---- WebGL 2 Transform Feedback ----------------------------------
+
+#[op2(fast)]
+pub fn op_create_transform_feedback(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] client_id: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::CreateTransformFeedback {
+            canvas_id,
+            client_id,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_delete_transform_feedback(state: &mut OpState, #[smi] tf: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::DeleteTransformFeedback { tf });
+}
+
+#[op2(fast)]
+pub fn op_bind_transform_feedback(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] tf: u32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BindTransformFeedback {
+            canvas_id,
+            target,
+            tf: if tf == 0 { None } else { Some(tf) },
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_begin_transform_feedback(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] primitive_mode: u32,
+) {
+    crate::rendering::webgl::error_state::set_transform_feedback_active(state, canvas_id, true);
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BeginTransformFeedback {
+            canvas_id,
+            primitive_mode,
+        },
+    );
+}
+
+#[op2(fast)]
+pub fn op_end_transform_feedback(state: &mut OpState, #[smi] canvas_id: u32) {
+    crate::rendering::webgl::error_state::set_transform_feedback_active(state, canvas_id, false);
+    queue_gl_fire_and_forget(state, GLCmd::EndTransformFeedback { canvas_id });
+}
+
+#[op2(fast)]
+pub fn op_pause_transform_feedback(state: &mut OpState, #[smi] canvas_id: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::PauseTransformFeedback { canvas_id });
+}
+
+#[op2(fast)]
+pub fn op_resume_transform_feedback(state: &mut OpState, #[smi] canvas_id: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::ResumeTransformFeedback { canvas_id });
+}
+
+#[op2]
+#[string]
+pub fn op_get_transform_feedback_varying(
+    state: &mut OpState,
+    #[smi] program: u32,
+    #[smi] index: u32,
+) -> String {
+    let info = send_gl_sync_with_flush(state, |resp| {
+        RenderCommand::GL(GLCmd::GetTransformFeedbackVarying {
+            program,
+            index,
+            resp,
+        })
+    })
+    .ok()
+    .flatten();
+
+    if let Some((name, size, type_)) = info {
+        let escaped_name = escape_for_json_string(&name);
+        return format!(
+            "{{\"name\":\"{}\",\"size\":{},\"type\":{}}}",
+            escaped_name, size, type_
+        );
+    }
+
+    String::new()
+}
+
+/// `transformFeedbackVaryings(program, varyings, bufferMode)`.
+///
+/// The JS shim passes the varyings array joined by `\x1f` (ASCII
+/// Unit Separator) so the op2 fast lane can accept a single
+/// `String` rather than spinning up a JSON parser.  US is invalid
+/// in GLSL identifiers, so the split is unambiguous.
+#[op2(fast)]
+pub fn op_transform_feedback_varyings(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] program: u32,
+    #[string] varyings_joined: String,
+    #[smi] buffer_mode: u32,
+) {
+    let varyings: Vec<String> = if varyings_joined.is_empty() {
+        Vec::new()
+    } else {
+        varyings_joined
+            .split('\x1f')
+            .map(|s| s.to_owned())
+            .collect()
+    };
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TransformFeedbackVaryings {
+            canvas_id,
+            program,
+            varyings,
+            buffer_mode,
+        },
+    );
+}
+
+// ---- WebGL 2 3D textures -----------------------------------------
+
+fn normalize_tex_upload_3d_source(
+    pixels: Option<&[u8]>,
+    src_offset: u32,
+    bytes_per_element: u32,
+    pbo_offset: Option<u32>,
+) -> shared::protocol::render_cmd::TexImage3DSource {
+    if let Some(offset) = pbo_offset {
+        return shared::protocol::render_cmd::TexImage3DSource::BufferOffset(offset);
+    }
+    let Some(pixels) = pixels else {
+        return shared::protocol::render_cmd::TexImage3DSource::None;
+    };
+    let elem_bytes = usize::try_from(bytes_per_element.max(1)).unwrap_or(1);
+    let start = elem_bytes.saturating_mul(src_offset as usize);
+    let bytes = pixels.get(start..).unwrap_or(&[]);
+    shared::protocol::render_cmd::TexImage3DSource::Bytes(Arc::new(bytes.to_vec()))
+}
+
+#[op2]
+#[allow(clippy::too_many_arguments)]
+pub fn op_tex_image_3d(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] level: i32,
+    #[smi] internal_format: i32,
+    #[smi] width: i32,
+    #[smi] height: i32,
+    #[smi] depth: i32,
+    #[smi] border: i32,
+    #[smi] format: u32,
+    #[smi] ty: u32,
+    // `None` when the call reserves storage without data.
+    #[buffer] pixels: Option<&[u8]>,
+    #[smi] src_offset: u32,
+    #[smi] bytes_per_element: u32,
+    #[smi] pbo_offset: i32,
+) {
+    let data = normalize_tex_upload_3d_source(
+        pixels,
+        src_offset,
+        bytes_per_element,
+        (pbo_offset >= 0).then_some(pbo_offset as u32),
+    );
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexImage3D {
+            canvas_id,
+            target,
+            level,
+            internal_format,
+            width,
+            height,
+            depth,
+            border,
+            format,
+            ty,
+            data,
+        },
+    );
+}
+
+#[op2]
+#[allow(clippy::too_many_arguments)]
+pub fn op_tex_sub_image_3d(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] level: i32,
+    #[smi] xoffset: i32,
+    #[smi] yoffset: i32,
+    #[smi] zoffset: i32,
+    #[smi] width: i32,
+    #[smi] height: i32,
+    #[smi] depth: i32,
+    #[smi] format: u32,
+    #[smi] ty: u32,
+    #[buffer] pixels: Option<&[u8]>,
+    #[smi] src_offset: u32,
+    #[smi] bytes_per_element: u32,
+    #[smi] pbo_offset: i32,
+) {
+    let data = normalize_tex_upload_3d_source(
+        pixels,
+        src_offset,
+        bytes_per_element,
+        (pbo_offset >= 0).then_some(pbo_offset as u32),
+    );
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexSubImage3D {
+            canvas_id,
+            target,
+            level,
+            xoffset,
+            yoffset,
+            zoffset,
+            width,
+            height,
+            depth,
+            format,
+            ty,
+            data,
+        },
+    );
+}
+
+#[op2(fast)]
+#[allow(clippy::too_many_arguments)]
+pub fn op_tex_storage_3d(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] levels: i32,
+    #[smi] internal_format: u32,
+    #[smi] width: i32,
+    #[smi] height: i32,
+    #[smi] depth: i32,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::TexStorage3D {
+            canvas_id,
+            target,
+            levels,
+            internal_format,
+            width,
+            height,
+            depth,
+        },
+    );
 }

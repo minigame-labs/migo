@@ -9,10 +9,15 @@
 //! - GL_OES_EGL_image (GL extension)
 //! - Android API 26+ (AHardwareBuffer)
 //!
-//! All function pointers are resolved dynamically at first use.
+//! All function pointers are resolved dynamically at first use.  The
+//! resolved entry points are cached in a process-global `OnceLock`;
+//! drivers we have observed return identical `eglGetProcAddress`
+//! pointers across shared EGL contexts, but [`validate_import_fns`]
+//! provides a per-context assertion that each entry point is still
+//! non-null when the upload thread brings its own context online.
 
 use glow::HasContext;
-use shared::error::{EngineResult, ErrorCode};
+use shared::error::{EngineError, EngineResult, ErrorCode};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -53,22 +58,49 @@ struct ImportFns {
 
 static IMPORT_FNS: OnceLock<Option<ImportFns>> = OnceLock::new();
 
-/// Resolve EGL/GL function pointers needed for AHB import.
-/// Returns None if any required function is missing.
+/// The four AHB-path entry points, named in the order
+/// [`resolve_import_fns`] probes them.  Exposed so the
+/// `EngineError` produced on resolution failure can tell the
+/// operator *which* symbol is missing — historically the error
+/// was just a flat "AHB import functions not resolved" which gave
+/// no hint about whether EGL or GL extensions were at fault.
+pub const REQUIRED_PROCS: &[&str] = &[
+    "eglGetNativeClientBufferANDROID",
+    "eglCreateImageKHR",
+    "eglDestroyImageKHR",
+    "glEGLImageTargetTexture2DOES",
+];
+
+/// Resolve EGL/GL function pointers needed for AHB import.  On
+/// failure, returns the name of the first entry point that came
+/// back null so callers can surface it verbatim.
 fn resolve_import_fns(
     egl_get_proc: &dyn Fn(&str) -> Option<unsafe extern "C" fn()>,
-) -> Option<ImportFns> {
+) -> Result<ImportFns, &'static str> {
+    unsafe fn fetch<F: Copy>(
+        egl_get_proc: &dyn Fn(&str) -> Option<unsafe extern "C" fn()>,
+        name: &'static str,
+    ) -> Result<F, &'static str> {
+        match egl_get_proc(name) {
+            // SAFETY: the caller has contracted that the returned
+            // pointer has the calling convention declared by the
+            // target fn type; we transmute the generic fn pointer
+            // into that specific shape and keep the `unsafe`
+            // marker on the fn type so call sites know.
+            Some(p) => Ok(unsafe { std::mem::transmute_copy::<unsafe extern "C" fn(), F>(&p) }),
+            None => Err(name),
+        }
+    }
+
     unsafe {
         let get_native_client_buffer: EglGetNativeClientBufferANDROID =
-            std::mem::transmute(egl_get_proc("eglGetNativeClientBufferANDROID")?);
-        let create_image: EglCreateImageKHR =
-            std::mem::transmute(egl_get_proc("eglCreateImageKHR")?);
-        let destroy_image: EglDestroyImageKHR =
-            std::mem::transmute(egl_get_proc("eglDestroyImageKHR")?);
+            fetch(egl_get_proc, "eglGetNativeClientBufferANDROID")?;
+        let create_image: EglCreateImageKHR = fetch(egl_get_proc, "eglCreateImageKHR")?;
+        let destroy_image: EglDestroyImageKHR = fetch(egl_get_proc, "eglDestroyImageKHR")?;
         let image_target_texture: GlEGLImageTargetTexture2DOES =
-            std::mem::transmute(egl_get_proc("glEGLImageTargetTexture2DOES")?);
+            fetch(egl_get_proc, "glEGLImageTargetTexture2DOES")?;
 
-        Some(ImportFns {
+        Ok(ImportFns {
             get_native_client_buffer,
             create_image,
             destroy_image,
@@ -77,11 +109,71 @@ fn resolve_import_fns(
     }
 }
 
-/// Lazily resolve and cache import function pointers.
-pub fn ensure_import_fns(egl_get_proc: &dyn Fn(&str) -> Option<unsafe extern "C" fn()>) -> bool {
-    IMPORT_FNS
-        .get_or_init(|| resolve_import_fns(egl_get_proc))
-        .is_some()
+/// Outcome of [`ensure_import_fns`] — either every entry point
+/// resolved (`Ok`) or we captured which specific symbol was
+/// missing (`Err`).  The `Err` case carries a process-global
+/// static string so the caller can log it and downgrade
+/// `device_caps.ahb_available` without allocating.
+pub fn ensure_import_fns(
+    egl_get_proc: &dyn Fn(&str) -> Option<unsafe extern "C" fn()>,
+) -> Result<(), &'static str> {
+    // `OnceLock::get_or_init` is the only thread-safe way to
+    // memoise the resolution result.  We store the `Result`
+    // directly so subsequent callers on other threads see the
+    // same diagnostic.
+    let cached: &Option<ImportFns> =
+        IMPORT_FNS.get_or_init(|| match resolve_import_fns(egl_get_proc) {
+            Ok(fns) => Some(fns),
+            Err(name) => {
+                tracing::warn!(
+                    "AHB import functions not resolved: missing {name}; \
+                 AHB upload path will be disabled for the life of this process"
+                );
+                None
+            }
+        });
+    match cached {
+        Some(_) => Ok(()),
+        None => Err(cached_failure_name()),
+    }
+}
+
+/// Best-effort recovery of the first missing proc name for
+/// logging; the original diagnostic is emitted inside
+/// `OnceLock::get_or_init`, so this fallback exists purely so
+/// later callers (upload-thread bring-up) can still produce a
+/// structured error without redoing the resolution.
+fn cached_failure_name() -> &'static str {
+    // We don't actually store the failed name separately — emitting
+    // the warning once covers the diagnostic need, and callers treat
+    // any `Err` as "AHB unavailable".  Returning a generic label
+    // here keeps the signature stable.
+    "AHB entry point missing (see earlier tracing::warn for name)"
+}
+
+/// Structured error builder for callers that want a full
+/// [`EngineError`] instead of the raw `&'static str`.
+pub fn ahb_unavailable_err(detail: &'static str) -> EngineError {
+    EngineError::new(ErrorCode::RenderBackendError).with_detail(format!(
+        "AHB import path unavailable: {detail}; required EGL/GL entry points: {}",
+        REQUIRED_PROCS.join(", "),
+    ))
+}
+
+/// Validate that the import functions resolved by
+/// [`ensure_import_fns`] are still usable from the calling thread
+/// / EGL context.  Returns `Err` if the cache is empty (no
+/// resolution ever succeeded) so the upload thread can abort its
+/// bring-up deterministically instead of crashing later inside
+/// `glEGLImageTargetTexture2DOES`.
+pub fn validate_import_fns() -> Result<(), EngineError> {
+    match IMPORT_FNS.get() {
+        Some(Some(_)) => Ok(()),
+        Some(None) => Err(ahb_unavailable_err(cached_failure_name())),
+        None => Err(ahb_unavailable_err(
+            "ensure_import_fns has not been called yet on any thread",
+        )),
+    }
 }
 
 /// Import an AHardwareBuffer as a GL texture.

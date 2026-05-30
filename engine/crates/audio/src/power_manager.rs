@@ -225,7 +225,7 @@ mod tests {
         let mut mgr = AudioPowerManager::new(config);
 
         mgr.update(false); // -> LowPower
-                           // 50ms is well under the 200ms timeout
+        // 50ms is well under the 200ms timeout
         std::thread::sleep(Duration::from_millis(50));
         mgr.update(false);
         assert_eq!(mgr.state(), AudioPowerState::LowPower);

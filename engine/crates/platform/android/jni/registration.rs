@@ -4,22 +4,22 @@ use jni::{JNIEnv, NativeMethod};
 use tracing::info;
 
 use crate::android::jni::{
-    executeScript, getConsoleLogs, getDebugStats, init, mod_main,
-    nativeAhbPointerFromHardwareBuffer, onAccelerometerChange, onActionSheetResult,
-    onAudioInterruptionBegin, onAudioInterruptionEnd, onBLECharacteristicValueChange,
-    onBLEConnectionStateChange, onBLEMTUChange, onBeaconServiceChange, onBeaconUpdate,
-    onBluetoothAdapterStateChange, onBluetoothDeviceFound, onCameraEvent, onCameraFrameData,
-    onCheckSessionResult, onChooseImageResult, onChooseMessageFileResult, onCompassChange,
-    onCompressImageResult, onDeviceMotionChange, onDeviceOrientationChange, onFuzzyLocationResult,
-    onGetPhoneNumberResult, onGetUserInfoResult, onGyroscopeChange, onHide, onKeyboardComplete,
-    onKeyboardConfirm, onKeyboardHeightChange, onKeyboardInput, onLocationResult, onLoginResult,
-    onMemoryWarning, onMidasPaymentGameItemResult, onMidasPaymentResult, onModalResult,
+    JAVA_METHOD_CACHE, JavaMethodCache, executeScript, getConsoleLogs, getDebugStats,
+    getMinApiLevel, init, initIcuData, mod_main, nativeAhbPointerFromHardwareBuffer,
+    onAccelerometerChange, onActionSheetResult, onAudioInterruptionBegin, onAudioInterruptionEnd,
+    onBLECharacteristicValueChange, onBLEConnectionStateChange, onBLEMTUChange,
+    onBeaconServiceChange, onBeaconUpdate, onBluetoothAdapterStateChange, onBluetoothDeviceFound,
+    onCameraEvent, onCameraFrameData, onCheckSessionResult, onChooseImageResult,
+    onChooseMessageFileResult, onCompassChange, onCompressImageResult, onDeviceMotionChange,
+    onDeviceOrientationChange, onFuzzyLocationResult, onGetPhoneNumberResult, onGetUserInfoResult,
+    onGyroscopeChange, onHide, onKeyboardComplete, onKeyboardConfirm, onKeyboardHeightChange,
+    onKeyboardInput, onLocationResult, onLoginResult, onMemoryWarning,
+    onMidasPaymentGameItemResult, onMidasPaymentResult, onModalResult,
     onNavigateToMiniProgramResult, onNetworkStatusChange, onOpenAppAuthorizeSetting,
     onOpenSettingResult, onOpenSystemBluetoothSetting, onRecorderEvent, onRecorderFrameData,
     onRestart, onScanCodeResult, onShareAppMessageResult, onShow, onSubpackageProgress,
     onSubpackageResult, onSurfaceDestroyed, onThermalStatusChanged, onTouch, onUserCaptureScreen,
     onVideoEvent, onVsync, setDisplayRefreshRate, shutdown, updateSurface, version,
-    JavaMethodCache, JAVA_METHOD_CACHE,
 };
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
@@ -34,6 +34,16 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
                 name: "version".into(),
                 sig: "()Ljava/lang/String;".into(),
                 fn_ptr: version as *mut c_void,
+            },
+            NativeMethod {
+                name: "getMinApiLevel".into(),
+                sig: "()I".into(),
+                fn_ptr: getMinApiLevel as *mut c_void,
+            },
+            NativeMethod {
+                name: "initIcuData".into(),
+                sig: "(Ljava/lang/String;)Z".into(),
+                fn_ptr: initIcuData as *mut c_void,
             },
             NativeMethod {
                 name: "init".into(),

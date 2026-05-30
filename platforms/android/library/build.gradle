@@ -45,17 +45,14 @@ android {
 
     sourceSets {
         main {
-            // keep module-local jniLibs and also include workspace jniLibs produced by your build script
-            jniLibs.srcDirs = ['src/main/jniLibs', file("$projectDir/../../../jniLibs")]
+            // build-aar.sh copies the selected native outputs here before Gradle runs;
+            // keep a single authoritative jniLibs source to avoid silently packaging
+            // an older duplicate .so from another directory.
+            jniLibs.srcDirs = ['src/main/jniLibs']
             assets.srcDirs = ['src/main/assets']
             // include generated BuildInfo.java
             java.srcDirs += "$buildDir/generated/source/buildinfo"
         }
-    }
-
-    // avoid duplicate native lib conflicts when same .so exists in multiple source dirs
-    packagingOptions {
-        pickFirst '**/*.so'
     }
 }
 

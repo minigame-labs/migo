@@ -271,7 +271,13 @@ function createListenerGroup(errorLabel, unique) {
                         _listeners[i](data);
                     }
                 } catch (e) {
-                    console.error(errorLabel + ' listener error:', e);
+                    // Log the normalized error string rather than the raw
+                    // object.  Some game exceptions are plain objects (or
+                    // Error objects crossing V8/native formatting) and showed
+                    // up in logcat as just "{}"; that made onShow/onHide
+                    // resume failures indistinguishable from a swallowed
+                    // callback.  Keep dispatching remaining listeners.
+                    console.error(errorLabel + ' listener error: ' + errorToString(e));
                 }
             }
         },

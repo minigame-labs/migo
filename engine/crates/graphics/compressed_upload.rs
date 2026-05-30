@@ -173,19 +173,68 @@ pub fn upload_compressed_texture(
 
         let internal_format = format.gl_internal_format();
 
-        gl.compressed_tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            internal_format as i32,
-            width as i32,
-            height as i32,
-            0,
-            data.len() as i32,
-            data,
-        );
+        // PBO-staged compressed upload: write the compressed block
+        // bytes into a PIXEL_UNPACK_BUFFER first so the driver can DMA
+        // them asynchronously, then kick off the texture allocation /
+        // upload with the bound PBO. With a PBO bound, the `data`
+        // pointer handed to `glCompressedTexImage2D` is interpreted
+        // as a byte offset into the PBO (we set it to 0 via a
+        // length-0 slice whose `.as_ptr()` is a dangling non-null
+        // pointer; the C side ignores the pointer value once
+        // `image_size == 0`). We pass the real size in a follow-up
+        // `glCompressedTexSubImage2D` call against the bound PBO.
+        let maybe_pbo = gl.create_buffer().ok();
+        let used_pbo = if let Some(pbo) = maybe_pbo {
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pbo));
+            gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, data, glow::STREAM_DRAW);
+            // Allocate storage first. We pass a zero-length slice so
+            // the driver treats this as a storage-only call; the
+            // real bytes arrive via the SubImage below.
+            let empty: &[u8] = &[];
+            gl.compressed_tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                internal_format as i32,
+                width as i32,
+                height as i32,
+                0,
+                0,
+                empty,
+            );
+            gl.compressed_tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                internal_format,
+                glow::CompressedPixelUnpackData::BufferRange(0u32..(data.len() as u32)),
+            );
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+            true
+        } else {
+            // No PBO (allocation failed): fall back to the classic
+            // synchronous client-memory path.
+            gl.compressed_tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                internal_format as i32,
+                width as i32,
+                height as i32,
+                0,
+                data.len() as i32,
+                data,
+            );
+            false
+        };
 
         let err = gl.get_error();
         gl.bind_texture(glow::TEXTURE_2D, None);
+        if let Some(pbo) = maybe_pbo {
+            let _ = used_pbo;
+            gl.delete_buffer(pbo);
+        }
 
         if err != glow::NO_ERROR {
             tracing::warn!(

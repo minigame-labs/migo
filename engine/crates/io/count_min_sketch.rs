@@ -98,7 +98,12 @@ impl CountMinSketch {
         // Four BuildHasherDefault instances still share the DefaultHasher
         // K0/K1 state.  To get distinct streams we xor the key bytes
         // with a row salt inside `index_for`.  See [`row_index_for`].
-        let hashers = [Hasher1::default(), Hasher1::default(), Hasher1::default(), Hasher1::default()];
+        let hashers = [
+            Hasher1::default(),
+            Hasher1::default(),
+            Hasher1::default(),
+            Hasher1::default(),
+        ];
         let sample_size = (cap as u64).saturating_mul(10);
         Self {
             counters,
@@ -305,10 +310,16 @@ mod tests {
             s.increment("k");
         }
         let before = s.estimate("k");
-        assert!(before >= 8 / 2, "pre-age estimate implausibly low: {before}");
+        assert!(
+            before >= 8 / 2,
+            "pre-age estimate implausibly low: {before}"
+        );
         s.age();
         let after = s.estimate("k");
-        assert!(after <= before / 2 + 1, "age should halve, got {before} -> {after}");
+        assert!(
+            after <= before / 2 + 1,
+            "age should halve, got {before} -> {after}"
+        );
     }
 
     #[test]

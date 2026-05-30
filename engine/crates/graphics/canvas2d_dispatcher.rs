@@ -12,9 +12,9 @@
 use shared::error::EngineResult;
 use shared::protocol::render_cmd::{Canvas2DCmd, CanvasId};
 
+use crate::CanvasManager;
 use crate::backend::gl::text::TextContext;
 use crate::damage_effect::DamageEffect;
-use crate::CanvasManager;
 
 /// Renderer-side shim around a shared [`TextContext`].
 ///
@@ -24,14 +24,30 @@ use crate::CanvasManager;
 /// the old femtovg `Renderer2d` so `render_thread.rs` can treat the
 /// dispatcher as a drop-in replacement.
 pub(crate) struct Renderer2d {
-    pub(crate) text: TextContext,
+    /// F-2: shared ownership with the JS-thread measurer.
+    /// `fillText` / `strokeText` acquire this mutex for the
+    /// duration of a paint (on the render thread), and the
+    /// JS-thread `op_measure_text_flat` acquires it for each
+    /// measurement.  The mutex is contended only on cache-miss
+    /// paths where the shaping is the real cost anyway; steady-
+    /// state `measureText` calls from JS hit the JS-side LRU
+    /// first (R-10) and never touch this lock at all.
+    pub(crate) text: crate::text_measurer_impl::SharedTextContext,
 }
 
 impl Renderer2d {
-    pub(crate) fn new() -> Self {
-        Self {
-            text: TextContext::new(),
-        }
+    pub(crate) fn new() -> (Self, shared::text_measurer::SharedTextMeasurer) {
+        let (shared, measurer) =
+            crate::text_measurer_impl::into_shared_measurer(TextContext::new());
+        (Self { text: shared }, measurer)
+    }
+
+    /// Construct with an externally-built shared `TextContext`
+    /// (F-2).  Used by `RenderThread::spawn`, which builds the
+    /// pair off-thread so the `SharedTextMeasurer` half can be
+    /// published before the render loop starts.
+    pub(crate) fn from_shared_text(shared: crate::text_measurer_impl::SharedTextContext) -> Self {
+        Self { text: shared }
     }
 
     /// Apply a single Canvas2D command.
@@ -46,25 +62,151 @@ impl Renderer2d {
         canvas_id: CanvasId,
         cmd: Canvas2DCmd,
     ) -> EngineResult<bool> {
-        // CreateContext2D fast path — the request must build the Skia
-        // surface before the reply is sent (otherwise the first real
-        // draw command would race against surface construction).
-        if let Canvas2DCmd::CreateContext2D { resp } = cmd {
-            cm.init_skia_for_canvas(canvas_id)?;
-            let _ = resp.send(Ok(canvas_id));
-            return Ok(false);
+        match cmd {
+            // CreateContext2D fast path — init the Skia surface in
+            // FIFO order with the surrounding command stream.  No reply
+            // channel: callers know `canvas_id` already (they passed it
+            // in), and any subsequent Canvas2D command on this canvas
+            // is serialised behind this op via the render command
+            // channel's FIFO semantics, so a race against surface
+            // construction is impossible.  An init failure is logged
+            // and the canvas stays uninitialised — later draws hit
+            // `get_2d_context_mut`'s `NotFound` error, matching the
+            // pre-existing failure shape.
+            Canvas2DCmd::CreateContext2D => {
+                cm.init_skia_for_canvas(canvas_id)?;
+                Ok(false)
+            }
+            // In-band resize: keeps surface dimension changes serialised
+            // with the surrounding `FillText` / `TexImage2DFromCanvas2D`
+            // commands.  Errors are logged but not propagated — a failed
+            // resize leaves the surface at its previous size, matching
+            // browser behaviour for the pathological case where the OS
+            // refuses a new pbuffer (allocation failure / oversize).
+            Canvas2DCmd::ResizeCanvas { w, h } => {
+                if let Err(e) = cm.resize_canvas(canvas_id, w, h) {
+                    tracing::warn!(
+                        "Canvas2DCmd::ResizeCanvas failed: canvas={:?}, w={:?}, h={:?}, err={}",
+                        canvas_id, w, h, e
+                    );
+                }
+                Ok(false)
+            }
+            Canvas2DCmd::GetImageData {
+                x,
+                y,
+                width,
+                height,
+                resp,
+            } => {
+                cm.make_current_needed(canvas_id)?;
+                let ctx = cm.get_2d_context_mut(canvas_id)?;
+                let pixels = ctx.read_image_data(x, y, width, height)?;
+                let _ = resp.send(Ok(pixels));
+                Ok(false)
+            }
+            Canvas2DCmd::ReadSnapshotPixels { snapshot_id, resp } => {
+                crate::render_diagnostics::bump_canvas2d_snapshot_forced_readback();
+                let pixels = cm
+                    .read_canvas2d_snapshot_pixels(snapshot_id)
+                    .unwrap_or_default();
+                let _ = resp.send(Ok(pixels));
+                Ok(false)
+            }
+            Canvas2DCmd::CaptureSnapshot {
+                x,
+                y,
+                width,
+                height,
+                snapshot_id,
+                cache_key,
+            } => {
+                let id = match cm.snapshot_canvas2d_region_with_id(
+                    canvas_id,
+                    x,
+                    y,
+                    width,
+                    height,
+                    snapshot_id,
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(
+                            "snapshot_canvas2d_region_with_id failed for canvas {:?}: {}",
+                            canvas_id,
+                            e
+                        );
+                        0
+                    }
+                };
+                if id == 0 {
+                    crate::render_diagnostics::bump_canvas2d_snapshot_fallback();
+                    // Cache record path was conditional on a successful
+                    // snapshot — if capture failed, drop the key on the
+                    // floor.  The downstream `TexImage2DFromSnapshot`
+                    // will also fail (and fall back to the JS-side legacy
+                    // path), and JS won't see the cache populated; on
+                    // the next attempt the cache miss recurs but eventually
+                    // a successful snapshot populates it.
+                    let _ = cache_key;
+                } else {
+                    crate::render_diagnostics::bump_canvas2d_snapshot_taken();
+                    if let Some(key) = cache_key {
+                        cm.mark_snapshot_for_text_cache(snapshot_id, key);
+                    }
+                }
+                Ok(false)
+            }
+            // MeasureText must be intercepted here: the downstream
+            // `apply_with_images` path borrows the command by reference, so
+            // its `MeasureText { resp, .. }` arm can't actually consume
+            // `resp` and reply.  Routing the measurement through the
+            // dispatcher lets us read the per-canvas `TextAttrs` from the
+            // renderer's own state and send the metrics back on the reply
+            // channel before `Canvas2DCmd` is dropped — without this, the
+            // sender side is dropped silently and the JS op fails with
+            // "channel disconnected", which collapses every text layout to
+            // zero-width metrics (symptom: fonts don't render at all).
+            Canvas2DCmd::MeasureText { text, resp } => {
+                let metrics = match cm.make_current_needed(canvas_id) {
+                    Ok(()) => match cm.get_2d_context_mut(canvas_id) {
+                        Ok(ctx) => {
+                            // Lock the shared TextContext only for the
+                            // duration of the measurement call; JS side
+                            // may contend but cache-hit paths are sub-μs.
+                            let text_ctx = self.text.lock();
+                            text_ctx.measure_text(&text, &ctx.renderer.state.text)
+                        }
+                        Err(e) => {
+                            resp.err(e);
+                            return Ok(false);
+                        }
+                    },
+                    Err(e) => {
+                        resp.err(e);
+                        return Ok(false);
+                    }
+                };
+                resp.ok(metrics);
+                Ok(false)
+            }
+            cmd => {
+                // Everything else routes through the per-canvas handler.
+                // Split-borrow `cm` so the handler can see both the 2D context
+                // (mutable, owns the Skia surface + GrDirectContext) and the
+                // shared image store (immutable, holds the GL texture table)
+                // at the same time — this is what turns `drawImage` from a
+                // no-op into a real rasterised draw.
+                cm.make_current_needed(canvas_id)?;
+                // F-2: lock the shared TextContext for the duration of the
+                // paint.  `apply_with_images` holds the `&TextContext`
+                // borrow only while running; the mutex guard's lifetime
+                // binds naturally to this scope.
+                let text_guard = self.text.lock();
+                let (ctx, image_store) = cm.split_2d_and_images(canvas_id)?;
+                Ok(ctx.apply_with_images(&cmd, &*text_guard, image_store))
+            }
         }
-
-        // Everything else routes through the per-canvas handler.
-        // Split-borrow `cm` so the handler can see both the 2D context
-        // (mutable, owns the Skia surface + GrDirectContext) and the
-        // shared image store (immutable, holds the GL texture table)
-        // at the same time — this is what turns `drawImage` from a
-        // no-op into a real rasterised draw.
-        cm.make_current_needed(canvas_id)?;
-        let text = &self.text;
-        let (ctx, image_store) = cm.split_2d_and_images(canvas_id)?;
-        Ok(ctx.apply_with_images(&cmd, text, image_store))
     }
 
     /// Legacy per-layer dirty bit hook.  Skia's own `GrDirectContext`
@@ -101,24 +243,52 @@ pub(crate) fn classify_draw_damage(
     use Canvas2DCmd::*;
     // Pure state / path-building commands never modify the framebuffer.
     match cmd {
-        BeginPath | ClosePath | MoveTo { .. } | LineTo { .. }
-        | QuadraticCurveTo { .. } | BezierCurveTo { .. } | Arc { .. }
-        | ArcTo { .. } | Rect { .. } | Ellipse { .. }
-        | SetFillStyle { .. } | SetStrokeStyle { .. } | SetLineWidth { .. }
-        | SetLineCap { .. } | SetLineJoin { .. } | SetMiterLimit { .. }
-        | SetGlobalAlpha { .. } | SetCompositeOperation { .. }
-        | SetLineDash { .. } | SetLineDashOffset { .. }
-        | SetShadowBlur { .. } | SetShadowColor { .. }
-        | SetShadowOffsetX { .. } | SetShadowOffsetY { .. }
-        | SetFillStyleGradient { .. } | SetStrokeStyleGradient { .. }
-        | SetFillStylePattern { .. } | SetStrokeStylePattern { .. }
-        | SetFont { .. } | SetTextAlign { .. } | SetTextBaseline { .. }
+        BeginPath
+        | ClosePath
+        | MoveTo { .. }
+        | LineTo { .. }
+        | QuadraticCurveTo { .. }
+        | BezierCurveTo { .. }
+        | Arc { .. }
+        | ArcTo { .. }
+        | Rect { .. }
+        | Ellipse { .. }
+        | SetFillStyle { .. }
+        | SetStrokeStyle { .. }
+        | SetLineWidth { .. }
+        | SetLineCap { .. }
+        | SetLineJoin { .. }
+        | SetMiterLimit { .. }
+        | SetGlobalAlpha { .. }
+        | SetCompositeOperation { .. }
+        | SetLineDash { .. }
+        | SetLineDashOffset { .. }
+        | SetShadowBlur { .. }
+        | SetShadowColor { .. }
+        | SetShadowOffsetX { .. }
+        | SetShadowOffsetY { .. }
+        | SetFillStyleGradient { .. }
+        | SetStrokeStyleGradient { .. }
+        | SetFillStylePattern { .. }
+        | SetStrokeStylePattern { .. }
+        | SetFont { .. }
+        | SetTextAlign { .. }
+        | SetTextBaseline { .. }
         | SetTextDirection { .. }
-        | Save | Restore | SetTransform { .. } | ResetTransform
-        | Translate { .. } | Rotate { .. } | Scale { .. }
+        | Save
+        | Restore
+        | SetTransform { .. }
+        | ResetTransform
+        | Translate { .. }
+        | Rotate { .. }
+        | Scale { .. }
         | Clip
-        | MeasureText { .. } | GetImageData { .. }
-        | CreateContext2D { .. } => return DamageEffect::NoDamage,
+        | MeasureText { .. }
+        | GetImageData { .. }
+        | CaptureSnapshot { .. }
+        | ReadSnapshotPixels { .. }
+        | CreateContext2D
+        | ResizeCanvas { .. } => return DamageEffect::NoDamage,
         _ => {}
     }
 
@@ -153,13 +323,7 @@ pub(crate) fn classify_draw_damage(
                 *h + state.line_width,
             )
         }
-        DrawImage {
-            dx,
-            dy,
-            dw,
-            dh,
-            ..
-        } => rect_damage_in_space(state, *dx, *dy, *dw, *dh),
+        DrawImage { dx, dy, dw, dh, .. } => rect_damage_in_space(state, *dx, *dy, *dw, *dh),
         DrawImageBatch { draws } => {
             // Union the sub-rects in OBJECT SPACE first, then CTM
             // the single union rect once.  This produces the same
@@ -178,9 +342,7 @@ pub(crate) fn classify_draw_damage(
             for d in draws.iter() {
                 // Skip obviously degenerate / non-finite entries
                 // so they can't poison the accumulator with NaN.
-                if !(d.dx.is_finite() && d.dy.is_finite()
-                    && d.dw.is_finite() && d.dh.is_finite())
-                {
+                if !(d.dx.is_finite() && d.dy.is_finite() && d.dw.is_finite() && d.dh.is_finite()) {
                     continue;
                 }
                 let (l, r) = if d.dw < 0.0 {
@@ -462,7 +624,10 @@ mod partial_damage_tests {
         // extraction would require the Skia path, which the
         // classifier intentionally doesn't run).
         let cmd = Canvas2DCmd::Fill;
-        assert_eq!(classify_draw_damage(&cmd, &base()), DamageEffect::FullSurface);
+        assert_eq!(
+            classify_draw_damage(&cmd, &base()),
+            DamageEffect::FullSurface
+        );
     }
 
     #[test]
@@ -524,7 +689,10 @@ mod partial_damage_tests {
         s.ctm_concat([1.0, 0.0, 0.0, 1.0, 100.0, 100.0]);
         expect_rect(
             classify_draw_damage(&fill_rect_cmd(10.0, 20.0, 50.0, 30.0), &s),
-            110, 120, 50, 30,
+            110,
+            120,
+            50,
+            30,
         );
     }
 
@@ -535,7 +703,10 @@ mod partial_damage_tests {
         s.ctm_concat([2.0, 0.0, 0.0, 3.0, 0.0, 0.0]);
         expect_rect(
             classify_draw_damage(&fill_rect_cmd(5.0, 10.0, 20.0, 10.0), &s),
-            10, 30, 40, 30,
+            10,
+            30,
+            40,
+            30,
         );
     }
 
@@ -550,7 +721,10 @@ mod partial_damage_tests {
         // by (7, 11) → (7, 11, 20, 20).
         expect_rect(
             classify_draw_damage(&fill_rect_cmd(0.0, 0.0, 10.0, 10.0), &s),
-            7, 11, 20, 20,
+            7,
+            11,
+            20,
+            20,
         );
     }
 
@@ -562,7 +736,10 @@ mod partial_damage_tests {
         // The earlier translate must NOT leak into the result.
         expect_rect(
             classify_draw_damage(&fill_rect_cmd(0.0, 0.0, 10.0, 10.0), &s),
-            0, 0, 20, 20,
+            0,
+            0,
+            20,
+            20,
         );
     }
 
@@ -573,7 +750,10 @@ mod partial_damage_tests {
         s.ctm_reset();
         expect_rect(
             classify_draw_damage(&fill_rect_cmd(0.0, 0.0, 10.0, 10.0), &s),
-            0, 0, 10, 10,
+            0,
+            0,
+            10,
+            10,
         );
     }
 
@@ -586,7 +766,10 @@ mod partial_damage_tests {
         s.ctm_concat([-1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
         expect_rect(
             classify_draw_damage(&fill_rect_cmd(10.0, 20.0, 50.0, 30.0), &s),
-            -60, 20, 50, 30,
+            -60,
+            20,
+            50,
+            30,
         );
     }
 
@@ -607,7 +790,10 @@ mod partial_damage_tests {
                 },
                 &s,
             ),
-            108, 108, 24, 24,
+            108,
+            108,
+            24,
+            24,
         );
     }
 
@@ -693,10 +879,7 @@ mod partial_damage_tests {
         // latter was a false NoDamage.  New guard checks finiteness
         // explicitly and normalises negatives.
         let cmd = fill_rect_cmd(0.0, 0.0, f32::NAN, 10.0);
-        assert_eq!(
-            classify_draw_damage(&cmd, &base()),
-            DamageEffect::NoDamage,
-        );
+        assert_eq!(classify_draw_damage(&cmd, &base()), DamageEffect::NoDamage,);
     }
 
     #[test]
@@ -705,10 +888,7 @@ mod partial_damage_tests {
         // pixels — damage should stay empty, not turn into a
         // 0-wide rectangle that the compositor still processes.
         let cmd = fill_rect_cmd(10.0, 10.0, 0.0, 10.0);
-        assert_eq!(
-            classify_draw_damage(&cmd, &base()),
-            DamageEffect::NoDamage,
-        );
+        assert_eq!(classify_draw_damage(&cmd, &base()), DamageEffect::NoDamage,);
     }
 
     #[test]
@@ -719,12 +899,26 @@ mod partial_damage_tests {
         let cmd = Canvas2DCmd::DrawImageBatch {
             draws: vec![
                 shared::protocol::render_cmd::DrawImageEntry {
-                    image_id: 1, sx: 0.0, sy: 0.0, sw: 10.0, sh: 10.0,
-                    dx: 100.0, dy: 10.0, dw: -50.0, dh: 10.0,
+                    image_id: 1,
+                    sx: 0.0,
+                    sy: 0.0,
+                    sw: 10.0,
+                    sh: 10.0,
+                    dx: 100.0,
+                    dy: 10.0,
+                    dw: -50.0,
+                    dh: 10.0,
                 },
                 shared::protocol::render_cmd::DrawImageEntry {
-                    image_id: 1, sx: 0.0, sy: 0.0, sw: 10.0, sh: 10.0,
-                    dx: 0.0, dy: 10.0, dw: 10.0, dh: 10.0,
+                    image_id: 1,
+                    sx: 0.0,
+                    sy: 0.0,
+                    sw: 10.0,
+                    sh: 10.0,
+                    dx: 0.0,
+                    dy: 10.0,
+                    dw: 10.0,
+                    dh: 10.0,
                 },
             ],
         };
@@ -738,12 +932,26 @@ mod partial_damage_tests {
         let cmd = Canvas2DCmd::DrawImageBatch {
             draws: vec![
                 shared::protocol::render_cmd::DrawImageEntry {
-                    image_id: 1, sx: 0.0, sy: 0.0, sw: 10.0, sh: 10.0,
-                    dx: f32::NAN, dy: 0.0, dw: 10.0, dh: 10.0,
+                    image_id: 1,
+                    sx: 0.0,
+                    sy: 0.0,
+                    sw: 10.0,
+                    sh: 10.0,
+                    dx: f32::NAN,
+                    dy: 0.0,
+                    dw: 10.0,
+                    dh: 10.0,
                 },
                 shared::protocol::render_cmd::DrawImageEntry {
-                    image_id: 1, sx: 0.0, sy: 0.0, sw: 10.0, sh: 10.0,
-                    dx: 0.0, dy: 0.0, dw: 10.0, dh: 10.0,
+                    image_id: 1,
+                    sx: 0.0,
+                    sy: 0.0,
+                    sw: 10.0,
+                    sh: 10.0,
+                    dx: 0.0,
+                    dy: 0.0,
+                    dw: 10.0,
+                    dh: 10.0,
                 },
             ],
         };
@@ -759,7 +967,10 @@ mod partial_damage_tests {
         s.ctm_concat([-1.0, 0.0, 0.0, -1.0, 0.0, 0.0]);
         expect_rect(
             classify_draw_damage(&fill_rect_cmd(10.0, 20.0, 50.0, 30.0), &s),
-            -60, -50, 50, 30,
+            -60,
+            -50,
+            50,
+            30,
         );
     }
 

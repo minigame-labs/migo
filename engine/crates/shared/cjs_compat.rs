@@ -25,9 +25,7 @@ pub fn is_cjs(code: &str) -> bool {
 
         // CJS patterns
         if !has_cjs
-            && (t.contains("require(")
-                || t.contains("module.exports")
-                || t.contains("exports."))
+            && (t.contains("require(") || t.contains("module.exports") || t.contains("exports."))
         {
             has_cjs = true;
         }
@@ -101,9 +99,7 @@ mod tests {
     #[test]
     fn ignores_import_in_comments() {
         // CJS code with an import mentioned in a comment should still be detected
-        assert!(is_cjs(
-            "const x = require('y');\n// import foo from 'bar';"
-        ));
+        assert!(is_cjs("const x = require('y');\n// import foo from 'bar';"));
     }
 
     #[test]

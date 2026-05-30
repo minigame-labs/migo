@@ -122,15 +122,33 @@ public final class DisplayCompat {
     }
 
     /**
-     * Check if device is in landscape orientation.
+     * Check whether the activity is currently displayed in landscape.
+     *
+     * <p>Uses {@link Configuration#orientation} as the source of truth. That
+     * field reflects the <em>activity's effective orientation</em> — i.e. it
+     * picks up {@code setRequestedOrientation()} regardless of the device's
+     * natural orientation. Using {@link Display#getRotation()} alone is wrong
+     * on devices whose natural orientation is landscape (tablets, ChromeOS,
+     * many emulators): there {@code rotation == ROTATION_0} even when the
+     * activity is forced to landscape, and a phone-natural assumption
+     * misclassifies the activity as portrait.
+     *
+     * <p>Display rotation is only consulted as a fallback when Configuration
+     * reports {@code ORIENTATION_UNDEFINED}.
      *
      * @param activity The activity
-     * @return true if landscape
+     * @return true if the activity is in landscape (incl. landscapeReverse)
      */
     public static boolean isLandscape(Activity activity) {
+        if (activity == null) return false;
+
+        int orientation = activity.getResources().getConfiguration().orientation;
+        if (orientation == Configuration.ORIENTATION_LANDSCAPE) return true;
+        if (orientation == Configuration.ORIENTATION_PORTRAIT) return false;
+
+        // ORIENTATION_UNDEFINED: best-effort fallback to the display rotation.
         int rotation = getRotation(activity);
-        return rotation == android.view.Surface.ROTATION_90 
-            || rotation == android.view.Surface.ROTATION_270;
+        return rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270;
     }
 
     /**
@@ -233,10 +251,10 @@ public final class DisplayCompat {
     /**
      * Get safe area insets (system bars + display cutout).
      * <p>
-     * On API 21-22: Returns status bar height as top inset only.
-     * On API 23-27: Uses WindowInsets system window insets.
+     * On API 26-27: Uses WindowInsets system window insets.
      * On API 28-29: Adds DisplayCutout safe insets.
      * On API 30+: Uses WindowInsets.Type for comprehensive insets.
+     * Falls back to status-bar height only when root insets are unavailable.
      *
      * @param activity The activity
      * @return Safe area insets
@@ -278,8 +296,8 @@ public final class DisplayCompat {
                 }
                 return new SafeAreaInsets(left, top, right, bottom);
             }
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            // API 23-27: Basic WindowInsets
+        } else {
+            // API 26-27: Basic WindowInsets
             WindowInsets insets = decorView.getRootWindowInsets();
             if (insets != null) {
                 return new SafeAreaInsets(
@@ -291,7 +309,7 @@ public final class DisplayCompat {
             }
         }
 
-        // API 21-22: Fallback - just status bar
+        // Fallback when root insets are temporarily unavailable.
         int statusBarHeight = getStatusBarHeight(activity);
         return new SafeAreaInsets(0, statusBarHeight, 0, 0);
     }

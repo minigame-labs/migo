@@ -46,16 +46,22 @@ pub trait AuthService: Send + Sync {
 
     /// Check current session validity asynchronously.
     fn check_session(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("checkSession:fail not supported"))
+        Err(ServiceError::not_supported(
+            "checkSession:fail not supported",
+        ))
     }
 
     /// Get user info asynchronously.
     fn get_user_info(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("getUserInfo:fail not supported"))
+        Err(ServiceError::not_supported(
+            "getUserInfo:fail not supported",
+        ))
     }
 
     /// Get phone number token asynchronously.
     fn get_phone_number(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("getPhoneNumber:fail not supported"))
+        Err(ServiceError::not_supported(
+            "getPhoneNumber:fail not supported",
+        ))
     }
 }

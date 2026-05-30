@@ -766,31 +766,27 @@ public class ImageApiManager {
 
     /**
      * Get a URI for a local file that is safe to pass to external apps.
-     * On API 24+, file:// URIs cause FileUriExposedException, so we use
-     * MediaStore to obtain a content:// URI instead. Returns null if
-     * the content URI cannot be created on API 24+.
+     * file:// URIs cause FileUriExposedException on supported devices, so
+     * we use MediaStore to obtain a content:// URI instead. Returns null
+     * if the content URI cannot be created.
      */
     private Uri getFileUri(File file) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            Activity activity = getActivity();
-            if (activity == null) return null;
-            try {
-                ContentValues values = new ContentValues();
-                values.put(MediaStore.Images.Media.DATA, file.getAbsolutePath());
-                values.put(MediaStore.Images.Media.MIME_TYPE, "image/*");
-                Uri uri = activity.getContentResolver().insert(
-                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
-                if (uri != null) {
-                    return uri;
-                }
-            } catch (Exception e) {
-                Log.w(TAG, "getFileUri: MediaStore insert failed", e);
+        Activity activity = getActivity();
+        if (activity == null) return null;
+        try {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.Images.Media.DATA, file.getAbsolutePath());
+            values.put(MediaStore.Images.Media.MIME_TYPE, "image/*");
+            Uri uri = activity.getContentResolver().insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+            if (uri != null) {
+                return uri;
             }
-            // Do NOT fall back to Uri.fromFile on API 24+ as it causes
-            // FileUriExposedException. Return null and let caller handle.
-            return null;
+        } catch (Exception e) {
+            Log.w(TAG, "getFileUri: MediaStore insert failed", e);
         }
-        return Uri.fromFile(file);
+        // Do not fall back to Uri.fromFile; let the caller handle the failure.
+        return null;
     }
 
     private int calculateInSampleSize(int srcW, int srcH, int reqW, int reqH) {

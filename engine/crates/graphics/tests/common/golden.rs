@@ -14,10 +14,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::pixel_diff::{
-    compare_tolerant, diff_image, dump_diff_summary, load_png_rgba8, save_png_rgba8, PixelDiff,
-};
 use super::TESTS_DIR;
+use super::pixel_diff::{
+    PixelDiff, compare_tolerant, diff_image, dump_diff_summary, load_png_rgba8, save_png_rgba8,
+};
 
 pub struct GoldenCfg {
     pub tolerance: u8,
@@ -68,13 +68,7 @@ fn regenerate_requested() -> bool {
 /// Compare `rgba` against the stored golden `<test_name>.png` with the
 /// given [`GoldenCfg`].  See module docs for the bootstrap + regenerate
 /// workflow.
-pub fn assert_matches_golden(
-    test_name: &str,
-    w: u32,
-    h: u32,
-    rgba: &[u8],
-    cfg: GoldenCfg,
-) {
+pub fn assert_matches_golden(test_name: &str, w: u32, h: u32, rgba: &[u8], cfg: GoldenCfg) {
     assert!(
         !test_name.contains(|c: char| c == '/' || c == '\\' || c == '.'),
         "test_name must be a stable slug (no path separators, no dots): {test_name:?}",

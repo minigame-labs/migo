@@ -7,7 +7,31 @@ edition = "2024"
 path = "lib.rs"
 
 [features]
-default = []
+# Default enables the embedded ICU data path so existing builds
+# keep working unchanged.  To strip ~10 MiB from `libmigo.so`,
+# build the workspace with
+# `--no-default-features --features external_icudtl` and load
+# `icudtl.dat` via the Android host bootstrap (see
+# `MigoRuntime.initIcuData`).
+default = ["embed_icudtl"]
+
+# Embedded ICU data: baked into the .so at build time.  Lights up
+# automatically when `default` is enabled.
+embed_icudtl = ["skia-safe/embed-icudtl"]
+
+# External ICU data: expects the host to load `icudtl.dat` before
+# first text layout.  Mutually exclusive with `embed_icudtl`;
+# turning this on also requires `--no-default-features` on the
+# workspace build.
+external_icudtl = []
+
+# Gates the small-sprite texture atlas (`crate::atlas`) code
+# paths (P1-13).  The atlas itself is always compiled so existing
+# tests keep working, but `CanvasManager::maybe_atlas_small_image`
+# and friends early-return `None` at runtime unless this feature
+# is enabled, keeping the idle memory footprint of the engine at
+# its pre-atlas levels until a profile-validated cutover.
+experimental_atlas = []
 
 [dependencies]
 glow = { workspace = true }
@@ -23,6 +47,7 @@ libloading = { version = "^0.8" }
 parking_lot = "0.12.4"
 bytemuck = { workspace = true }
 lru = { workspace = true }
+smallvec = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"

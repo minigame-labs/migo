@@ -36,8 +36,8 @@ use crate::audio::ops::{
     op_audio_create_wave_shaper,
     op_audio_decode_audio_data,
     op_audio_disconnect,
-    op_audio_get_available_audio_sources,
     op_audio_get_all_channel_data,
+    op_audio_get_available_audio_sources,
     op_audio_get_channel_data,
     // Frequency response & analysis ops
     op_audio_get_frequency_response,

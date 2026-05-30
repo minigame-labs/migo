@@ -17,6 +17,8 @@ pub trait ShareService: Send + Sync {
     ///
     /// Result delivered via `onShareAppMessageResult` callback.
     fn share_app_message(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("shareAppMessage:fail not supported"))
+        Err(ServiceError::not_supported(
+            "shareAppMessage:fail not supported",
+        ))
     }
 }

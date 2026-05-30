@@ -74,9 +74,7 @@ pub fn update_uniform(
             state.uniform_cache.remove(&k);
         }
     }
-    state
-        .uniform_cache
-        .insert(key, Box::from(value_bytes));
+    state.uniform_cache.insert(key, Box::from(value_bytes));
     true
 }
 
@@ -84,35 +82,102 @@ pub fn update_uniform(
 // Buffers + VAOs
 // ============================================================================
 
-/// Track `glBindBuffer(target, buf)`.  Currently dedups
-/// `ARRAY_BUFFER` (`0x8892`) and `ELEMENT_ARRAY_BUFFER` (`0x8893`);
-/// other targets (UNIFORM_BUFFER, PIXEL_UNPACK_BUFFER, …) always return
-/// `true` until we grow explicit tracking for them.
-pub fn update_bind_buffer(
-    state: &mut CanvasGLState,
-    target: u32,
-    new: Option<BufferId>,
-) -> bool {
+/// Track `glBindBuffer(target, buf)`.  Dedups all WebGL 1 / 2
+/// generic targets: ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER,
+/// UNIFORM_BUFFER, PIXEL_UNPACK_BUFFER, PIXEL_PACK_BUFFER,
+/// COPY_READ_BUFFER, COPY_WRITE_BUFFER, TRANSFORM_FEEDBACK_BUFFER.
+///
+/// Returns `true` when the caller must issue the underlying
+/// `glBindBuffer`, `false` when the binding already matches.  Any
+/// target we don't track is conservatively forwarded (returns
+/// `true`) rather than silently skipped.
+pub fn update_bind_buffer(state: &mut CanvasGLState, target: u32, new: Option<BufferId>) -> bool {
     const GL_ARRAY_BUFFER: u32 = 0x8892;
     const GL_ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
+    const GL_UNIFORM_BUFFER: u32 = 0x8A11;
+    const GL_PIXEL_UNPACK_BUFFER: u32 = 0x88EC;
+    const GL_PIXEL_PACK_BUFFER: u32 = 0x88EB;
+    const GL_COPY_READ_BUFFER: u32 = 0x8F36;
+    const GL_COPY_WRITE_BUFFER: u32 = 0x8F37;
+    const GL_TRANSFORM_FEEDBACK_BUFFER: u32 = 0x8C8E;
     let new_opt = Some(new);
+    // Macro keeps the per-target slot pattern uniform: match the
+    // previously-bound value, store the new one, and bubble up a
+    // "must issue" flag.  Inlined so this stays a branchless
+    // match plus a single comparison in the common case.
+    macro_rules! dedup_slot {
+        ($slot:ident) => {{
+            if state.$slot == new_opt {
+                false
+            } else {
+                state.$slot = new_opt;
+                true
+            }
+        }};
+    }
     match target {
-        GL_ARRAY_BUFFER => {
-            if state.bound_array_buffer == new_opt {
-                return false;
-            }
-            state.bound_array_buffer = new_opt;
-            true
-        }
-        GL_ELEMENT_ARRAY_BUFFER => {
-            if state.bound_element_array_buffer == new_opt {
-                return false;
-            }
-            state.bound_element_array_buffer = new_opt;
-            true
-        }
+        GL_ARRAY_BUFFER => dedup_slot!(bound_array_buffer),
+        GL_ELEMENT_ARRAY_BUFFER => dedup_slot!(bound_element_array_buffer),
+        GL_UNIFORM_BUFFER => dedup_slot!(bound_uniform_buffer),
+        GL_PIXEL_UNPACK_BUFFER => dedup_slot!(bound_pixel_unpack_buffer),
+        GL_PIXEL_PACK_BUFFER => dedup_slot!(bound_pixel_pack_buffer),
+        GL_COPY_READ_BUFFER => dedup_slot!(bound_copy_read_buffer),
+        GL_COPY_WRITE_BUFFER => dedup_slot!(bound_copy_write_buffer),
+        GL_TRANSFORM_FEEDBACK_BUFFER => dedup_slot!(bound_transform_feedback_buffer),
         _ => true,
     }
+}
+
+/// Track `glBindBufferBase(target, index, buf)` (WebGL 2).
+/// Dedups per-index UNIFORM_BUFFER indexed bindings.  A full
+/// `(buffer, 0, 0)` range entry is stored so that a subsequent
+/// `bindBufferBase` (full-buffer semantics) matches but a
+/// `bindBufferRange` with a different offset/size re-binds.
+///
+/// Returns `true` when the GL call must be issued.
+pub fn update_bind_buffer_base(
+    state: &mut CanvasGLState,
+    target: u32,
+    index: u32,
+    buffer: Option<BufferId>,
+) -> bool {
+    const GL_UNIFORM_BUFFER: u32 = 0x8A11;
+    // TRANSFORM_FEEDBACK_BUFFER (0x8C8E) also has indexed binding,
+    // but it pairs with an in-progress transform-feedback object
+    // and re-binding it mid-feedback is already guarded by the GL
+    // driver; we stay conservative and don't dedup it here.
+    if target != GL_UNIFORM_BUFFER {
+        return true;
+    }
+    let entry = (buffer, 0, 0);
+    if state.bound_uniform_buffer_indexed.get(&index) == Some(&entry) {
+        return false;
+    }
+    state.bound_uniform_buffer_indexed.insert(index, entry);
+    true
+}
+
+/// Track `glBindBufferRange(target, index, buf, offset, size)`
+/// (WebGL 2).  Dedup key includes offset and size so partial
+/// re-binds never coalesce with full bindings.
+pub fn update_bind_buffer_range(
+    state: &mut CanvasGLState,
+    target: u32,
+    index: u32,
+    buffer: Option<BufferId>,
+    offset: i32,
+    size: i32,
+) -> bool {
+    const GL_UNIFORM_BUFFER: u32 = 0x8A11;
+    if target != GL_UNIFORM_BUFFER {
+        return true;
+    }
+    let entry = (buffer, offset, size);
+    if state.bound_uniform_buffer_indexed.get(&index) == Some(&entry) {
+        return false;
+    }
+    state.bound_uniform_buffer_indexed.insert(index, entry);
+    true
 }
 
 pub fn update_bind_vertex_array(state: &mut CanvasGLState, new: Option<VaoId>) -> bool {
@@ -166,13 +231,7 @@ pub fn update_bind_texture_2d(state: &mut CanvasGLState, tex: Option<u32>) -> bo
 /// engines (often with the same values) — without dedup we pay an
 /// unconditional GL round-trip per frame per canvas.
 #[inline]
-pub fn update_viewport(
-    state: &mut CanvasGLState,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-) -> bool {
+pub fn update_viewport(state: &mut CanvasGLState, x: i32, y: i32, width: i32, height: i32) -> bool {
     let new = (x, y, width, height);
     if state.viewport == Some(new) {
         return false;
@@ -414,10 +473,17 @@ pub fn update_pack_alignment(state: &mut CanvasGLState, alignment: i32) -> bool 
 // Enable / disable capabilities
 // ============================================================================
 
+// Skia (Canvas2D Ganesh) shares the GL context with WebGL and toggles
+// `GL_STENCIL_TEST` internally without going through this tracker, so
+// our shadow drifts. cc.Mask round-avatars get rendered as triangles
+// when our dedup skips the next `glEnable` because the shadow says it
+// is already on. Always issue real GL calls for STENCIL_TEST.
+const GL_STENCIL_TEST: u32 = 0x0B90;
+
 /// `glEnable(cap)` — returns true if a real call is required.
 pub fn update_enable(state: &mut CanvasGLState, cap: u32) -> bool {
     if state.enabled_caps.contains(&cap) {
-        return false;
+        return cap == GL_STENCIL_TEST;
     }
     state.enabled_caps.insert(cap);
     state.disabled_caps.remove(&cap);
@@ -427,7 +493,7 @@ pub fn update_enable(state: &mut CanvasGLState, cap: u32) -> bool {
 /// `glDisable(cap)` — returns true if a real call is required.
 pub fn update_disable(state: &mut CanvasGLState, cap: u32) -> bool {
     if state.disabled_caps.contains(&cap) {
-        return false;
+        return cap == GL_STENCIL_TEST;
     }
     state.disabled_caps.insert(cap);
     state.enabled_caps.remove(&cap);
@@ -444,11 +510,7 @@ pub fn update_disable(state: &mut CanvasGLState, cap: u32) -> bool {
 /// WebGL spec: the same `target` value covers DRAW / READ on WebGL 1
 /// (they're identical), but WebGL 2 separates them.  We shadow per
 /// target key to keep both cases correct.
-pub fn update_bind_framebuffer(
-    state: &mut CanvasGLState,
-    target: u32,
-    fb: Option<u32>,
-) -> bool {
+pub fn update_bind_framebuffer(state: &mut CanvasGLState, target: u32, fb: Option<u32>) -> bool {
     match state.bound_framebuffer.get(&target) {
         Some(shadow) if *shadow == fb => false,
         _ => {
@@ -460,10 +522,7 @@ pub fn update_bind_framebuffer(
 
 /// `glBindRenderbuffer(RENDERBUFFER, rb)` dedup.  Only one target
 /// (`GL_RENDERBUFFER`) exists in GLES; tracked with a single slot.
-pub fn update_bind_renderbuffer(
-    state: &mut CanvasGLState,
-    rb: Option<u32>,
-) -> bool {
+pub fn update_bind_renderbuffer(state: &mut CanvasGLState, rb: Option<u32>) -> bool {
     match state.bound_renderbuffer {
         Some(shadow) if shadow == rb => false,
         _ => {
@@ -474,13 +533,7 @@ pub fn update_bind_renderbuffer(
 }
 
 /// `glColorMask(r, g, b, a)`.
-pub fn update_color_mask(
-    state: &mut CanvasGLState,
-    r: bool,
-    g: bool,
-    b: bool,
-    a: bool,
-) -> bool {
+pub fn update_color_mask(state: &mut CanvasGLState, r: bool, g: bool, b: bool, a: bool) -> bool {
     let new = (r, g, b, a);
     if state.color_mask == new {
         return false;
@@ -563,11 +616,7 @@ pub fn update_vertex_attrib_pointer(
 
 /// `glVertexAttribDivisor(index, divisor)` dedup for WebGL 2 /
 /// instanced_arrays.  A cheap keyed-shadow check.
-pub fn update_vertex_attrib_divisor(
-    state: &mut CanvasGLState,
-    index: u32,
-    divisor: u32,
-) -> bool {
+pub fn update_vertex_attrib_divisor(state: &mut CanvasGLState, index: u32, divisor: u32) -> bool {
     match state.vertex_attrib_divisor.get(&index).copied() {
         Some(cur) if cur == divisor => false,
         _ => {
@@ -900,7 +949,11 @@ mod tests {
         assert!(!update_bind_framebuffer(&mut s, glow::FRAMEBUFFER, Some(7)));
         // Different target is tracked independently — WebGL 2
         // separates DRAW / READ framebuffers, so this MUST reissue.
-        assert!(update_bind_framebuffer(&mut s, glow::DRAW_FRAMEBUFFER, Some(7)));
+        assert!(update_bind_framebuffer(
+            &mut s,
+            glow::DRAW_FRAMEBUFFER,
+            Some(7)
+        ));
         // Rebinding default FBO (0 / None) is a real call after a
         // named FBO was bound.
         assert!(update_bind_framebuffer(&mut s, glow::FRAMEBUFFER, None));
@@ -941,13 +994,45 @@ mod tests {
     fn vertex_attrib_pointer_dedups_identical_layout() {
         let mut s = fresh_state();
         // First call always issues.
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            32,
+            0
+        ));
         // Identical repeat — deduped.
-        assert!(!update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
+        assert!(!update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            32,
+            0
+        ));
         // Different offset → re-issue.
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 16));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            32,
+            16
+        ));
         // Different index → re-issue (tracked per-index).
-        assert!(update_vertex_attrib_pointer(&mut s, 1, 4, glow::FLOAT, false, 32, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            1,
+            4,
+            glow::FLOAT,
+            false,
+            32,
+            0
+        ));
     }
 
     #[test]
@@ -963,10 +1048,34 @@ mod tests {
         // differ in `array_buffer`, which would hide the VAO bug
         // behind the new buffer fingerprint.
         s.bound_array_buffer = Some(Some(99));
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            32,
+            0
+        ));
         s.bound_vao = Some(2);
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
-        assert!(!update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            32,
+            0
+        ));
+        assert!(!update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            32,
+            0
+        ));
     }
 
     // ---- ARRAY_BUFFER fingerprint (P0-3 regression) -----------------
@@ -985,7 +1094,15 @@ mod tests {
         let mut s = fresh_state();
         // Establish baseline with buffer A.
         s.bound_array_buffer = Some(Some(42));
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            32,
+            0
+        ));
         // Switch ARRAY_BUFFER to buffer B — same layout args, but
         // a different buffer must force the driver call.
         s.bound_array_buffer = Some(Some(43));
@@ -994,7 +1111,15 @@ mod tests {
             "switching ARRAY_BUFFER with identical pointer args MUST re-issue"
         );
         // Same buffer, same args — NOW the dedup should fire.
-        assert!(!update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 32, 0));
+        assert!(!update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            32,
+            0
+        ));
     }
 
     #[test]
@@ -1005,13 +1130,45 @@ mod tests {
         // though the layout tuple is identical.
         let mut s = fresh_state();
         s.bound_array_buffer = Some(Some(1));
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 2, glow::FLOAT, false, 8, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            2,
+            glow::FLOAT,
+            false,
+            8,
+            0
+        ));
         s.bound_array_buffer = Some(Some(2));
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 2, glow::FLOAT, false, 8, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            2,
+            glow::FLOAT,
+            false,
+            8,
+            0
+        ));
         s.bound_array_buffer = Some(Some(1));
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 2, glow::FLOAT, false, 8, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            2,
+            glow::FLOAT,
+            false,
+            8,
+            0
+        ));
         s.bound_array_buffer = Some(Some(1));
-        assert!(!update_vertex_attrib_pointer(&mut s, 0, 2, glow::FLOAT, false, 8, 0));
+        assert!(!update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            2,
+            glow::FLOAT,
+            false,
+            8,
+            0
+        ));
     }
 
     #[test]
@@ -1033,24 +1190,64 @@ mod tests {
         let mut s = fresh_state();
         s.bound_vao = Some(1);
         s.bound_array_buffer = Some(Some(10));
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 16, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            16,
+            0
+        ));
         // Same VAO, different buffer → overwrites VAO 1's slot.
         s.bound_array_buffer = Some(Some(11));
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 16, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            16,
+            0
+        ));
         // Switch to VAO 2, buffer 10.
         s.bound_vao = Some(2);
         s.bound_array_buffer = Some(Some(10));
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 16, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            16,
+            0
+        ));
         // Switch back to VAO 1 WITHOUT touching its slot — the
         // previous (vao=1, buffer=11) fp is still cached, so
         // re-applying with buffer=11 dedups.
         s.bound_vao = Some(1);
         s.bound_array_buffer = Some(Some(11));
-        assert!(!update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 16, 0));
+        assert!(!update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            16,
+            0
+        ));
         // But buffer=10 on VAO 1 was overwritten by the earlier
         // buffer=11 set, so it must re-issue now.
         s.bound_array_buffer = Some(Some(10));
-        assert!(update_vertex_attrib_pointer(&mut s, 0, 4, glow::FLOAT, false, 16, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            0,
+            4,
+            glow::FLOAT,
+            false,
+            16,
+            0
+        ));
     }
 
     #[test]
@@ -1140,27 +1337,11 @@ mod tests {
     #[test]
     fn pixel_store_i32_dedups_per_pname() {
         let mut s = fresh_state();
-        assert!(update_pixel_store_i32(
-            &mut s,
-            glow::UNPACK_ALIGNMENT,
-            4
-        ));
-        assert!(!update_pixel_store_i32(
-            &mut s,
-            glow::UNPACK_ALIGNMENT,
-            4
-        ));
-        assert!(update_pixel_store_i32(
-            &mut s,
-            glow::UNPACK_ALIGNMENT,
-            1
-        ));
+        assert!(update_pixel_store_i32(&mut s, glow::UNPACK_ALIGNMENT, 4));
+        assert!(!update_pixel_store_i32(&mut s, glow::UNPACK_ALIGNMENT, 4));
+        assert!(update_pixel_store_i32(&mut s, glow::UNPACK_ALIGNMENT, 1));
         // Different pname does not collide.
-        assert!(update_pixel_store_i32(
-            &mut s,
-            glow::PACK_ALIGNMENT,
-            1
-        ));
+        assert!(update_pixel_store_i32(&mut s, glow::PACK_ALIGNMENT, 1));
     }
 
     #[test]
@@ -1182,7 +1363,13 @@ mod tests {
         let _ = update_pixel_store_i32(&mut s, glow::UNPACK_ALIGNMENT, 4);
         s.invalidate_after_external_gl_use();
         // All four families re-issue on next call.
-        assert!(update_stencil_func(&mut s, glow::FRONT, glow::EQUAL, 0, 0xFF));
+        assert!(update_stencil_func(
+            &mut s,
+            glow::FRONT,
+            glow::EQUAL,
+            0,
+            0xFF
+        ));
         assert!(update_stencil_op(
             &mut s,
             glow::FRONT,
@@ -1272,7 +1459,15 @@ mod tests {
         // whole point of marking state stale around a Skia batch.
         assert!(update_bind_framebuffer(&mut s, glow::FRAMEBUFFER, Some(7)));
         assert!(update_enable_vertex_attrib(&mut s, 3));
-        assert!(update_vertex_attrib_pointer(&mut s, 3, 4, glow::FLOAT, false, 32, 0));
+        assert!(update_vertex_attrib_pointer(
+            &mut s,
+            3,
+            4,
+            glow::FLOAT,
+            false,
+            32,
+            0
+        ));
         assert!(update_vertex_attrib_divisor(&mut s, 3, 1));
     }
 }

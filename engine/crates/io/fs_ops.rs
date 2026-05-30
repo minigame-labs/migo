@@ -45,11 +45,7 @@ pub(crate) fn io_err(e: std::io::Error) -> EngineError {
 /// diagnosis noticeably better when games hit a permission or
 /// not-found failure.
 #[inline]
-pub(crate) fn io_err_ctx(
-    e: std::io::Error,
-    op: &'static str,
-    path: &str,
-) -> EngineError {
+pub(crate) fn io_err_ctx(e: std::io::Error, op: &'static str, path: &str) -> EngineError {
     EngineError::from(e).with_op(op).with_path(path.to_string())
 }
 
@@ -60,7 +56,7 @@ fn code_err(code: ErrorCode) -> EngineError {
 
 #[inline]
 fn trace_fs_edge(op: &str, target: &str, started_at: Instant, detail: &str) {
-    tracing::info!(
+    tracing::debug!(
         "[IOTrace] {} {}us target={} {}",
         op,
         started_at.elapsed().as_micros(),
@@ -500,13 +496,26 @@ pub fn mkdir(dir_path: &str, recursive: bool) -> Result<(), EngineError> {
 }
 
 /// List direct children of a directory, sorted.
+///
+/// Entries whose filenames are not valid UTF-8 are rejected with a
+/// hard error rather than silently dropped. This matches Node's
+/// behaviour: a directory with a ghost file is surfaced to the script
+/// so it can either migrate the name or explicitly skip it. Silent
+/// drops were a consistent source of "the file is there but my game
+/// doesn't see it" bug reports.
 pub fn readdir(dir_path: &str) -> Result<Vec<String>, EngineError> {
     let mut entries = Vec::new();
     let rd = std::fs::read_dir(dir_path).map_err(io_err)?;
     for entry_result in rd {
         let entry = entry_result.map_err(io_err)?;
-        if let Some(name) = entry.file_name().to_str() {
-            entries.push(name.to_string());
+        let os_name = entry.file_name();
+        match os_name.to_str() {
+            Some(name) => entries.push(name.to_string()),
+            None => {
+                return Err(EngineError::new(ErrorCode::InvalidArgument)
+                    .with_msg("readdir:fail non-UTF-8 filename")
+                    .with_detail(format!("dir={} name={:?}", dir_path, os_name)));
+            }
         }
     }
     entries.sort_unstable();
@@ -514,19 +523,166 @@ pub fn readdir(dir_path: &str) -> Result<Vec<String>, EngineError> {
 }
 
 /// Rename (move) a file or directory.
+///
+/// Falls back to copy + fsync + rename + unlink when `rename(2)`
+/// returns `EXDEV` (source and destination on different mount points,
+/// which on Android is the common case when `/tmp` lives on the app
+/// cache volume and `/user` lives on scoped storage). The fallback
+/// preserves atomicity *at the destination* by writing into a
+/// `<new_path>.partN` temp file and renaming it into place.
 pub fn rename(old_path: &str, new_path: &str) -> Result<(), EngineError> {
     // `old_path` is the "subject" — Node's convention puts that in
     // `err.path` on rename failures (new path appears in message
     // detail). Matches the JS layer's expectations for `err.path`.
-    std::fs::rename(old_path, new_path).map_err(|e| {
-        io_err_ctx(e, "rename", old_path)
-            .with_detail(format!("rename {old_path} -> {new_path}"))
-    })
+    match std::fs::rename(old_path, new_path) {
+        Ok(()) => Ok(()),
+        Err(e) if is_exdev(&e) => rename_cross_fs(old_path, new_path).map_err(|fallback_err| {
+            io_err_ctx(fallback_err, "rename:exdev", old_path)
+                .with_detail(format!("cross-fs rename {old_path} -> {new_path}"))
+        }),
+        Err(e) => Err(io_err_ctx(e, "rename", old_path)
+            .with_detail(format!("rename {old_path} -> {new_path}"))),
+    }
+}
+
+/// `true` if the error is a cross-mount error (`EXDEV`).
+///
+/// Hard-coded to 18 because Linux / Android / macOS / iOS all use that
+/// value; pulling in a `libc` dependency just to import `libc::EXDEV`
+/// would add a whole crate to the dep graph for one numeric literal.
+#[cfg(unix)]
+fn is_exdev(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(18)
+}
+
+#[cfg(not(unix))]
+fn is_exdev(_e: &std::io::Error) -> bool {
+    false
+}
+
+/// Copy-then-delete fallback for [`rename`] when source and
+/// destination are on different filesystems. Order of operations is
+/// chosen so an interrupted run leaves either the old file intact or
+/// a correctly-fsynced new file, never a half-copied intermediate:
+///
+/// 1. Write to `<new_path>.partN`.
+/// 2. `fsync` the tmp file.
+/// 3. `rename(tmp, new_path)` — atomic at the destination FS.
+/// 4. `fsync` the destination parent directory.
+/// 5. Unlink the source.
+/// 6. `fsync` the source parent (best-effort; already safe if crashed).
+fn rename_cross_fs(old_path: &str, new_path: &str) -> std::io::Result<()> {
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Read, Write};
+
+    let src_meta = std::fs::symlink_metadata(old_path)?;
+    if src_meta.file_type().is_symlink() {
+        // Refuse to traverse symlinks in cross-FS move: the runtime's
+        // VFS rejects symlink entries elsewhere, and a symlink would
+        // otherwise be silently materialised as its target.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename across filesystems refuses to follow symlinks",
+        ));
+    }
+    if src_meta.file_type().is_dir() {
+        // Directory cross-FS rename would require a recursive copy;
+        // keep it an explicit failure until a caller actually needs it.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename across filesystems does not support directories",
+        ));
+    }
+
+    let new_path_buf = std::path::PathBuf::from(new_path);
+    let parent = new_path_buf
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+
+    // Unique suffix: pid+nanoseconds is collision-resistant enough for
+    // the tmp file, and short enough to keep the path under any FS
+    // filename limit even for long destination names.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!(
+        ".{}.{}.{}.part",
+        new_path_buf
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rename"),
+        std::process::id(),
+        nanos
+    );
+    let tmp_path = parent.join(tmp_name);
+
+    {
+        let mut src = File::open(old_path)?;
+        let mut dst = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = src.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n])?;
+        }
+        dst.flush()?;
+        dst.sync_all()?;
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, new_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // Parent directory fsync is a no-op on some filesystems (e.g. tmpfs)
+    // and unavailable on Windows; we try and swallow errors because the
+    // `rename` above already committed the name, so the tmp file cannot
+    // resurface as a live entry.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    // Now the destination is durable — unlink the source.
+    if let Err(e) = std::fs::remove_file(old_path) {
+        // Source unlink failure is non-fatal: destination is valid, so
+        // `rename` has observably succeeded. Best-effort log only.
+        tracing::warn!(
+            "rename_cross_fs: destination committed but source unlink failed: {} ({})",
+            old_path,
+            e
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        if let Some(src_parent) = std::path::Path::new(old_path).parent() {
+            if let Ok(dir) = File::open(src_parent) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Remove a directory (optionally recursive).
 pub fn rmdir(dir_path: &str, recursive: bool) -> Result<(), EngineError> {
-    let op: &'static str = if recursive { "rmdir:recursive" } else { "rmdir" };
+    let op: &'static str = if recursive {
+        "rmdir:recursive"
+    } else {
+        "rmdir"
+    };
     if recursive {
         std::fs::remove_dir_all(dir_path).map_err(|e| io_err_ctx(e, op, dir_path))
     } else {
@@ -537,12 +693,9 @@ pub fn rmdir(dir_path: &str, recursive: bool) -> Result<(), EngineError> {
 /// Copy a file.
 pub fn copy(src_path: &str, dest_path: &str) -> Result<(), EngineError> {
     let started_at = Instant::now();
-    let result = std::fs::copy(src_path, dest_path)
-        .map(|_| ())
-        .map_err(|e| {
-            io_err_ctx(e, "copy", src_path)
-                .with_detail(format!("copy {src_path} -> {dest_path}"))
-        });
+    let result = std::fs::copy(src_path, dest_path).map(|_| ()).map_err(|e| {
+        io_err_ctx(e, "copy", src_path).with_detail(format!("copy {src_path} -> {dest_path}"))
+    });
     match &result {
         Ok(()) => trace_fs_edge("copy", dest_path, started_at, &format!("src={src_path}")),
         Err(err) => trace_fs_edge(
@@ -723,10 +876,16 @@ pub fn read_file(
             if file_len >= MMAP_READ_THRESHOLD {
                 match crate::mmap_reader::mmap_file_bytes(path) {
                     Ok(mapped) => {
-                        // `.to_vec()` is a single contiguous memcpy
-                        // into a `Vec` pre-sized to the file length.
-                        // Compare with the classic path which grew
-                        // the Vec in 8 KiB steps via realloc.
+                        // NOTE: this is **not** zero-copy. The mmap
+                        // speeds up the read itself (a single mapped
+                        // range instead of an 8 KiB loop with
+                        // incremental `Vec` growth), but `.to_vec()`
+                        // still produces an owned `Vec<u8>` of the
+                        // full file length. Peak user-space memory is
+                        // therefore `O(file_size)`. A truly zero-copy
+                        // path for JS requires a streaming RID model;
+                        // until that lands, callers must treat this
+                        // as a fast-copy, not a zero-copy.
                         let data = mapped.as_slice().to_vec();
                         trace_fs_edge(
                             "read_file",
@@ -748,8 +907,7 @@ pub fn read_file(
         }
     }
 
-    let mut file =
-        std::fs::File::open(path).map_err(|e| io_err_ctx(e, "read_file", path))?;
+    let mut file = std::fs::File::open(path).map_err(|e| io_err_ctx(e, "read_file", path))?;
 
     // When length is not specified, check that the remaining bytes from
     // position to EOF don't exceed the limit.
@@ -1474,7 +1632,9 @@ mod tests {
     /// can't accidentally benchmark the CPU cache instead of the IO
     /// path.
     fn big_payload(bytes: usize) -> Vec<u8> {
-        (0..bytes).map(|i| (i as u32).wrapping_mul(2654435761) as u8).collect()
+        (0..bytes)
+            .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+            .collect()
     }
 
     #[test]
@@ -1511,7 +1671,9 @@ mod tests {
         std::fs::write(&big, &big_data).unwrap();
 
         assert_eq!(
-            read_file(small.to_str().unwrap(), None, None).unwrap().len(),
+            read_file(small.to_str().unwrap(), None, None)
+                .unwrap()
+                .len(),
             small_data.len()
         );
         assert_eq!(
@@ -1537,7 +1699,10 @@ mod tests {
         let start = payload.len() as u64 / 2;
         let got = read_file(path.to_str().unwrap(), Some(start), Some(64)).unwrap();
         assert_eq!(got.len(), 64);
-        assert_eq!(got.as_slice(), &payload[start as usize..start as usize + 64]);
+        assert_eq!(
+            got.as_slice(),
+            &payload[start as usize..start as usize + 64]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1603,12 +1768,7 @@ mod tests {
         let dir = tmp_dir("rf_max");
         let path = dir.join("tiny.bin");
         std::fs::write(&path, b"tiny").unwrap();
-        let err = read_file(
-            path.to_str().unwrap(),
-            None,
-            Some(MAX_READ_LENGTH + 1),
-        )
-        .unwrap_err();
+        let err = read_file(path.to_str().unwrap(), None, Some(MAX_READ_LENGTH + 1)).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -18,6 +18,7 @@ use shared::{
     op_state::{HostOpState, RafRx},
     protocol::host_cmd::HostCommand,
     protocol::render_cmd::{CanvasCmd, RenderCommand},
+    render_event::{RenderEvent, RenderEventReceiver},
     surface::SurfaceRef,
 };
 
@@ -96,6 +97,7 @@ pub(crate) struct Host {
     platform: Arc<dyn PlatformServices>,
     init_options: InitOptions,
     network_policy: shared::op_state::NetworkPolicy,
+    render_events: RenderEventReceiver,
 
     last_game_id: Option<String>,
     last_entry: Option<String>,
@@ -103,6 +105,12 @@ pub(crate) struct Host {
     /// Shared flag: `true` while the app is backgrounded (OnHide).
     /// Network polling ops check this to throttle CPU usage.
     backgrounded: Arc<AtomicBool>,
+
+    /// Pending `onShow` script captured while Android has resumed the Activity
+    /// but has not yet delivered a fresh Surface.  WeChat/Chromium effectively
+    /// dispatch visibility callbacks only once the page can render again; doing
+    /// it earlier lets game code run against a paused render/audio subsystem.
+    pending_on_show_script: Option<String>,
 
     /// Per-session GPU caps shared with the render thread.
     /// Survives JS runtime restarts (same GL context).
@@ -175,9 +183,11 @@ impl Host {
             id,
             surface,
             init_options.pixel_ratio(),
+            init_options.target_fps(),
             Some(init_options.cache_dir().to_path_buf()),
             gpu_caps.clone(),
         )?;
+        let render_events = render.events();
 
         // Block until the render thread has completed GL init and
         // populated GPU compressed-format caps.  Prevents early image
@@ -223,6 +233,7 @@ impl Host {
         };
 
         let backgrounded = Arc::new(AtomicBool::new(false));
+        let webgl_context_created = Arc::new(AtomicBool::new(false));
 
         let host_state = HostOpState {
             id,
@@ -233,6 +244,11 @@ impl Host {
             app_cache_dir: init_options.cache_dir().to_path_buf(),
             app_files_dir: init_options.files_dir().to_path_buf(),
             render_tx: render.sender(),
+            // F-2: hand the shared TextMeasurer down from the
+            // render thread so the JS-thread fast path (JS-side
+            // LRU + inline measurement) can bypass the
+            // cross-thread RPC entirely.
+            text_measurer: Some(render.text_measurer()),
             audio_tx: audio.sender(),
             host_tx: host_tx.clone(),
             device_services,
@@ -241,6 +257,7 @@ impl Host {
             workers_path: init_options.workers_path().map(|s| s.to_string()),
             network_policy: network_policy.clone(),
             backgrounded: backgrounded.clone(),
+            webgl_context_created: webgl_context_created.clone(),
             #[cfg(feature = "code-signing")]
             code_signing_enabled: init_options.code_signing_enabled(),
             #[cfg(not(feature = "code-signing"))]
@@ -338,9 +355,11 @@ impl Host {
             platform,
             init_options,
             network_policy,
+            render_events,
             last_game_id: None,
             last_entry: None,
             backgrounded,
+            pending_on_show_script: None,
             gpu_caps,
             #[cfg(feature = "v8-limits")]
             watchdog,
@@ -350,6 +369,63 @@ impl Host {
     pub(crate) async fn handle_command(&mut self, cmd: HostCommand) {
         if let Err(e) = self.handle_command_inner(cmd).await {
             error!("[Host {}] handle_command failed: e={} ", self.id, e);
+        }
+    }
+
+    pub(crate) fn drain_render_events(&mut self) {
+        while let Ok(event) = self.render_events.try_recv() {
+            self.handle_render_event(event);
+        }
+    }
+
+    fn handle_render_event(&self, event: RenderEvent) {
+        match event {
+            RenderEvent::Canvas2DError { code, message }
+            | RenderEvent::GlError { code, message }
+            | RenderEvent::CanvasError { code, message } => {
+                warn!("[Host {}] render event: {}", self.id, message);
+                self.platform.notify_error(
+                    self.id,
+                    code.as_u16(),
+                    "render command failed",
+                    &message,
+                );
+            }
+            RenderEvent::SwapFailed { message } => {
+                warn!("[Host {}] swap failed: {}", self.id, message);
+                self.platform.notify_error(
+                    self.id,
+                    shared::error::ErrorCode::RenderBackendError.as_u16(),
+                    "render swap failed",
+                    &message,
+                );
+            }
+            RenderEvent::ContextLost => {
+                warn!("[Host {}] render context lost", self.id);
+                self.platform.notify_error(
+                    self.id,
+                    shared::error::ErrorCode::RenderBackendError.as_u16(),
+                    "render context lost",
+                    "",
+                );
+            }
+            RenderEvent::ContextRecovered { success } => {
+                if !success {
+                    self.platform.notify_error(
+                        self.id,
+                        shared::error::ErrorCode::RenderBackendError.as_u16(),
+                        "render context recovery failed",
+                        "",
+                    );
+                }
+            }
+            RenderEvent::RafBackpressure { consecutive_drops } => {
+                warn!(
+                    "[Host {}] RAF backpressure: consecutive_drops={}",
+                    self.id, consecutive_drops
+                );
+            }
+            _ => {}
         }
     }
 
@@ -373,8 +449,6 @@ impl Host {
                 // fires before surfaceCreated, so the old surface is already
                 // destroyed at this point. The render thread will be resumed
                 // when UpdateSurface arrives with the new valid surface.
-                self.audio.resume();
-
                 let script = if let Some(options_json) = options_json.as_deref() {
                     let options_json = options_json.trim();
                     if options_json.is_empty() {
@@ -407,7 +481,12 @@ impl Host {
                     "_internalTriggerOnShow()".to_string()
                 };
 
-                self.js.exec_script("onshow", &script)
+                // Defer JS onShow until a valid surface is back and render/audio
+                // have resumed.  Android calls Activity.onResume before
+                // SurfaceView.surfaceCreated; running game onShow immediately
+                // can throw or leave audio/RAF in a paused-looking state.
+                self.pending_on_show_script = Some(script);
+                Ok(())
             }
 
             HostCommand::OnHide => {
@@ -420,6 +499,7 @@ impl Host {
                 // The host/V8 thread stays alive for timers, network, etc.
                 self.render.pause();
                 self.audio.pause();
+                self.pending_on_show_script = None;
 
                 self.js.exec_script("onhide", "_internalTriggerOnHide()")
             }
@@ -634,19 +714,28 @@ impl Host {
                 // panic-free anything we already freed.
                 let trim = io::image_cache::TrimLevel::from_android(level);
                 let freed = io::image_cache::global_cache().trim(trim);
+                // Text texture cache holds GL textures; it can only be
+                // trimmed where there's a current EGL context, so hand
+                // the level to the render thread (best-effort, lifecycle
+                // class — a dropped trim just gets retried on the next
+                // pressure signal).
+                let _ = self
+                    .render
+                    .sender()
+                    .dispatch(RenderCommand::TrimTextCache { level });
                 match level {
                     5 => tracing::info!(
                         "Memory pressure: RUNNING_MODERATE (image cache freed {freed}B)"
                     ),
-                    10 => tracing::warn!(
-                        "Memory pressure: RUNNING_LOW (image cache freed {freed}B)"
-                    ),
+                    10 => {
+                        tracing::warn!("Memory pressure: RUNNING_LOW (image cache freed {freed}B)")
+                    }
                     15 => tracing::warn!(
                         "Memory pressure: RUNNING_CRITICAL (image cache freed {freed}B)"
                     ),
-                    _ => tracing::debug!(
-                        "Memory warning level {level} (image cache freed {freed}B)"
-                    ),
+                    _ => {
+                        tracing::debug!("Memory warning level {level} (image cache freed {freed}B)")
+                    }
                 }
                 self.js.dispatch_memory_warning(level);
                 Ok(())
@@ -760,9 +849,22 @@ impl Host {
         // (e.g., normal orientation change), resume() is a no-op.
         if result.is_ok() {
             self.render.resume();
+            self.audio.resume();
+            // Kick the JS RAF loop after a valid surface is back.  The loop is
+            // self-stopping after a few idle frames, so this is a low-cost
+            // lifecycle nudge rather than a permanent busy loop.  It fixes the
+            // Android resume window where callbacks are queued but the async
+            // RAF driver had previously stopped while the app was hidden.
+            let _ = self.js.exec_script(
+                "raf_resume_kick",
+                "globalThis.__migo_restart_raf_loop && globalThis.__migo_restart_raf_loop()",
+            );
             let _ = self
                 .js
                 .exec_script("window_resize", "_internalTriggerWindowResize()");
+            if let Some(script) = self.pending_on_show_script.take() {
+                let _ = self.js.exec_script("onshow", &script);
+            }
             info!("[Host {}] on_update_surface completed", self.id);
         } else if let Err(ref e) = result {
             warn!("[Host {}] on_update_surface failed: {}", self.id, e);
@@ -789,6 +891,7 @@ impl Host {
             app_cache_dir: cache_dir,
             app_files_dir: files_dir,
             render_tx: self.render.sender(),
+            text_measurer: Some(self.render.text_measurer()),
             audio_tx: self.audio.sender(),
             host_tx: self.host_tx.clone(),
             device_services,
@@ -797,6 +900,7 @@ impl Host {
             workers_path: self.init_options.workers_path().map(|s| s.to_string()),
             network_policy: self.network_policy.clone(),
             backgrounded: self.backgrounded.clone(),
+            webgl_context_created: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "code-signing")]
             code_signing_enabled: self.init_options.code_signing_enabled(),
             #[cfg(not(feature = "code-signing"))]

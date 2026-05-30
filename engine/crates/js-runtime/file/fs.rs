@@ -65,7 +65,7 @@ fn ioerr(msg: impl Into<String>) -> IOError {
 
 #[inline]
 fn trace_file_edge(op: &str, target: &str, started_at: Instant, detail: &str) {
-    tracing::info!(
+    tracing::debug!(
         "[IOTrace] {} {}us target={} {}",
         op,
         started_at.elapsed().as_micros(),
@@ -547,8 +547,14 @@ pub async fn op_access(
             let result = tokio::task::spawn_blocking(move || {
                 let t0 = std::time::Instant::now();
                 let r = fs_ops::access(&full_path);
-                let disk_us = t0.elapsed().as_micros();
-                tracing::info!("[IOTrace] access {}us path={}", disk_us, vpath);
+                let disk_ms = t0.elapsed().as_millis() as u64;
+                if disk_ms >= 30 {
+                    tracing::warn!(
+                        "[IOTrace] access slow {}ms path={}",
+                        disk_ms,
+                        vpath
+                    );
+                }
                 r
             })
             .await
@@ -1292,14 +1298,16 @@ pub async fn op_read_file(
                 .run_async(request, move || {
                     let t0 = std::time::Instant::now();
                     let r = fs_ops::read_file(&full_path, position, length);
-                    let disk_us = t0.elapsed().as_micros();
+                    let disk_ms = t0.elapsed().as_millis() as u64;
                     if let Ok(ref d) = r {
-                        tracing::info!(
-                            "[IOTrace] read {}us size={}B path={}",
-                            disk_us,
-                            d.len(),
-                            vpath
-                        );
+                        if disk_ms >= 30 {
+                            tracing::warn!(
+                                "[IOTrace] read slow {}ms size={}B path={}",
+                                disk_ms,
+                                d.len(),
+                                vpath
+                            );
+                        }
                     }
                     r
                 })
@@ -1376,8 +1384,21 @@ pub fn op_read_file_sync(
             }
         };
 
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
     match &result {
-        Ok(_) => trace_file_edge("read_file_sync", &path, started_at, "ok"),
+        Ok(_) => {
+            trace_file_edge("read_file_sync", &path, started_at, "ok");
+            if elapsed_ms >= 30 {
+                // Sync reads block V8; surface the path so callers can
+                // see which game-side readFileSync is freezing the
+                // event loop.
+                tracing::warn!(
+                    "[IOTrace] readFileSync slow {}ms path={}",
+                    elapsed_ms,
+                    path
+                );
+            }
+        }
         Err(err) => trace_file_edge("read_file_sync", &path, started_at, &format!("err={err}")),
     }
 

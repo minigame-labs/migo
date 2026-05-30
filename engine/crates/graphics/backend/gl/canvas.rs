@@ -16,12 +16,10 @@
 
 use shared::protocol::color::Color as ProtocolColor;
 use shared::protocol::render_cmd::{Canvas2DCmd, GradientType, TextAlign, TextBaseline};
-use skia_safe::{Canvas, ClipOp, Matrix, PaintCap, PaintJoin, Rect as SkRect};
+use skia_safe::{Canvas, ClipOp, Matrix, Paint, PaintCap, PaintJoin, Rect as SkRect};
 
 use super::blend_mode::blend_mode_from_code;
-use super::paint::{
-    build_clear_paint, build_fill_paint, build_stroke_paint, PatternResolver,
-};
+use super::paint::{PatternResolver, build_clear_paint, build_fill_paint, build_stroke_paint};
 use super::path::CanvasPath;
 use super::state::{Canvas2DState, Shadow, StateStack, StyleKind};
 use super::text::TextContext;
@@ -46,6 +44,54 @@ pub struct Canvas2DRenderer {
     pub state: Canvas2DState,
     pub stack: StateStack,
     pub path: CanvasPath,
+    /// Single-slot `SkPaint` cache keyed by the compact
+    /// [`ImagePaintKey`] encoding of the draw-relevant state
+    /// (anti-alias flag, blend mode, global alpha quantised to
+    /// u8, and a "no visible shadow" bit).  A hit returns a
+    /// clone of the cached `Paint`; `skia_safe::Paint` is an
+    /// `RCHandle`, so the clone is a refcount bump.
+    ///
+    /// Target workload: UI bursts that issue hundreds of
+    /// `drawImage` / `fillRect` with identical styling.  A
+    /// single-slot cache is the simplest thing that collapses
+    /// that burst to one real construction; the ~1 bit of
+    /// accuracy loss (alpha quantisation) is below display
+    /// resolution.
+    image_paint_cache: Option<(ImagePaintKey, Paint)>,
+}
+
+/// Compact key for [`Canvas2DRenderer::image_paint_cache`].
+///
+/// Packed to fit in a `u32` so the equality check is a single
+/// register compare.  Fields (LSB first):
+///
+/// * bit 0 : anti-alias flag
+/// * bits 1-6 : blend mode discriminant (5 bits is enough for
+///   every Skia `BlendMode`; we reserve a sixth for safety)
+/// * bits 8-15 : `global_alpha` quantised to u8 (0..=255)
+///
+/// The remaining bits are zero; reserving them now means adding
+/// new inputs (e.g. colour filter presence) later doesn't break
+/// callers that compare by value.
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct ImagePaintKey(u32);
+
+impl ImagePaintKey {
+    #[inline]
+    fn from_state(state: &Canvas2DState) -> Option<Self> {
+        // Shadow filters depend on 5 floats + a colour + offset;
+        // caching them here would require a far wider key.  The
+        // `effect_cache` module already caches the inner
+        // `ImageFilter`, so we opt out of the paint cache entirely
+        // when a shadow is visible rather than grow the key.
+        if state.shadow.is_visible() {
+            return None;
+        }
+        let aa = if state.antialias { 1u32 } else { 0 };
+        let blend = state.blend_mode as u32 & 0x3F;
+        let alpha = (state.global_alpha.clamp(0.0, 1.0) * 255.0 + 0.5) as u32 & 0xFF;
+        Some(ImagePaintKey(aa | (blend << 1) | (alpha << 8)))
+    }
 }
 
 impl Default for Canvas2DRenderer {
@@ -60,7 +106,36 @@ impl Canvas2DRenderer {
             state: Canvas2DState::default(),
             stack: StateStack::new(),
             path: CanvasPath::new(),
+            image_paint_cache: None,
         }
+    }
+
+    /// Look up or build the `SkPaint` used for `drawImage` /
+    /// `drawImageBatch` under the current state.  Returns a
+    /// refcounted clone of the cached instance on hit, or a
+    /// freshly built one (and stores it for the next call) on
+    /// miss.
+    ///
+    /// Workload assumption: UI-heavy pages issue long bursts of
+    /// draws with identical paint parameters.  A 1-slot cache
+    /// collapses those bursts to a single build; larger caches
+    /// don't pay off without also adding eviction machinery.
+    #[inline]
+    pub(crate) fn acquire_image_paint(&mut self, build: impl FnOnce() -> Paint) -> Paint {
+        let Some(key) = ImagePaintKey::from_state(&self.state) else {
+            // Shadow path: effect_cache already memoises the inner
+            // ImageFilter, so a full rebuild here is cheap and
+            // keeps the cache key narrow.
+            return build();
+        };
+        if let Some((cached_key, cached)) = &self.image_paint_cache {
+            if *cached_key == key {
+                return cached.clone();
+            }
+        }
+        let paint = build();
+        self.image_paint_cache = Some((key, paint.clone()));
+        paint
     }
 
     /// Apply one Canvas2D command.  Returns `true` when the command caused
@@ -470,14 +545,19 @@ impl Canvas2DRenderer {
                 text_ctx.stroke_text(canvas, text, *x, *y, *max_width, &self.state, resolver);
                 true
             }
-            MeasureText { resp, .. } => {
-                // MeasureText is normally routed to the text stack at the
-                // dispatcher layer; reaching here means a caller expected
-                // the backend to reply.  Send an empty metric to keep the
-                // channel alive.  Phase 5 replaces this branch.
-                // SAFETY: clone the response only when available via move;
-                // accessing `resp` through a &ref would require `Clone`.
-                let _ = resp; // keep borrow live; handled by upper layer
+            MeasureText { .. } => {
+                // Sync reply variant — routed through `canvas2d_dispatcher`
+                // which already handled the `resp` by the time control
+                // reaches this backend.  Reaching here means the dispatcher
+                // layering invariant is broken; the drop-safe `RenderCmdResp`
+                // will still report `ErrorCode::Internal` to the caller
+                // when the outer `Canvas2DCmd` is freed, but a warning
+                // makes the misrouting visible in logs so the regression
+                // is caught.
+                tracing::warn!(
+                    "Canvas2DCmd::MeasureText reached `apply_env` — dispatcher \
+                     layering regressed (expected intercept in canvas2d_dispatcher)"
+                );
                 false
             }
 
@@ -488,20 +568,47 @@ impl Canvas2DRenderer {
                 // command stream stays valid.
                 false
             }
-            GetImageData { resp, .. } => {
-                let _ = resp;
+            GetImageData { .. } => {
+                tracing::warn!(
+                    "Canvas2DCmd::GetImageData reached `apply_env` — dispatcher \
+                     layering regressed"
+                );
+                false
+            }
+            CaptureSnapshot { .. } => {
+                tracing::warn!(
+                    "Canvas2DCmd::CaptureSnapshot reached `apply_env` — dispatcher \
+                     layering regressed"
+                );
+                false
+            }
+            ReadSnapshotPixels { .. } => {
+                tracing::warn!(
+                    "Canvas2DCmd::ReadSnapshotPixels reached `apply_env` — dispatcher \
+                     layering regressed"
+                );
                 false
             }
 
-            CreateContext2D { resp } => {
-                let _ = resp;
+            CreateContext2D => {
+                tracing::warn!(
+                    "Canvas2DCmd::CreateContext2D reached `apply_env` — \
+                     dispatcher layering regressed"
+                );
                 false
             }
 
-            // Canvas2DCmd is #[non_exhaustive]; be permissive about future
-            // opcodes by logging-and-skipping.  Tests lock the exhaustive
-            // set above so a new variant won't be silently ignored in CI.
-            _ => false,
+            // `Canvas2DCmd` is `#[non_exhaustive]`, so rustc forces a
+            // catch-all.  Keep the arm, but emit a structured warning
+            // when hit so forgotten-variant regressions surface in
+            // logs instead of silently rendering nothing.
+            other => {
+                tracing::warn!(
+                    "Canvas2DCmd variant not handled in apply_env: {:?}",
+                    std::mem::discriminant(other)
+                );
+                false
+            }
         }
     }
 
@@ -517,10 +624,7 @@ impl Canvas2DRenderer {
     /// visible.  Exposed so `fill` / `stroke` paths can opt in at draw
     /// time without paying the cost when shadows are off (the common case).
     #[allow(dead_code)] // wired up in P4b drawing-side refinement
-    pub fn maybe_apply_shadow(
-        _paint: &mut skia_safe::Paint,
-        shadow: &Shadow,
-    ) -> bool {
+    pub fn maybe_apply_shadow(_paint: &mut skia_safe::Paint, shadow: &Shadow) -> bool {
         if !shadow.is_visible() {
             return false;
         }
@@ -547,10 +651,35 @@ fn _force_use_imports() {
 /// font assignment is a no-op" policy.
 pub(crate) fn apply_parsed_font(state: &mut Canvas2DState, font: &str) {
     if let Some(parsed) = super::font_parse::parse_font_shorthand(font) {
+        // Diag: parsed OK.  Logged at trace because SetFont can
+        // fire once per UI element per frame in Cocos Creator
+        // games; trace keeps the hot path free unless the
+        // operator actively asks for it via RUST_LOG.
+        tracing::trace!(
+            raw = font,
+            family = parsed.families.first().map(String::as_str).unwrap_or(""),
+            families_len = parsed.families.len(),
+            size = parsed.size_px,
+            weight = parsed.weight,
+            italic = parsed.italic,
+            "SetFont parsed"
+        );
         state.text.size = parsed.size_px;
         state.text.weight = parsed.weight;
         state.text.italic = parsed.italic;
         state.text.families = std::sync::Arc::new(parsed.families);
+    } else {
+        // Invalid CSS font shorthand per WHATWG; the state stays
+        // at the previous value (browser-equivalent no-op).  We
+        // warn *once per distinct source location* because a game
+        // that keeps sending the same bad string would otherwise
+        // flood logcat — but the first occurrence is worth
+        // surfacing because it usually points at a typo or a
+        // parser gap we haven't closed yet.
+        shared::warn_once!(
+            raw = font,
+            "SetFont rejected: unparseable CSS font shorthand"
+        );
     }
 }
 
@@ -561,7 +690,10 @@ mod set_font_tests {
     #[test]
     fn apply_parsed_font_updates_size_and_family() {
         let mut state = Canvas2DState::default();
-        apply_parsed_font(&mut state, "italic bold 24px 'Noto Sans CJK SC', sans-serif");
+        apply_parsed_font(
+            &mut state,
+            "italic bold 24px 'Noto Sans CJK SC', sans-serif",
+        );
         assert_eq!(state.text.size, 24.0);
         assert_eq!(state.text.weight, 700);
         assert!(state.text.italic);

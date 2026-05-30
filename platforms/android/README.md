@@ -5,7 +5,7 @@
 ## 特性
 
 - 🚀 **高性能** - 原生 Rust 引擎 + OpenGL ES 渲染
-- 📱 **API 21+** - 支持 Android 5.0 及以上版本
+- 📱 **API 26+** - 支持 Android 8.0 及以上版本
 - 🔧 **零依赖** - 无需 AndroidX、Kotlin 或其他第三方库
 - 🎮 **游戏就绪** - 支持 Canvas 2D 和 WebGL
 - 🔒 **沙箱隔离** - 每个游戏独立的文件系统空间
@@ -73,15 +73,14 @@ public class GameActivity extends Activity {
             @Override
             public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
                 if (session != null) {
-                    session.updateSurface(holder.getSurface());
+                    session.updateSurface(holder.getSurface(), width, height);
                 }
             }
 
             @Override
             public void surfaceDestroyed(SurfaceHolder holder) {
                 if (session != null) {
-                    session.close();
-                    session = null;
+                    session.onSurfaceDestroyed();
                 }
             }
         });
@@ -374,7 +373,7 @@ String message = ErrorCode.getMessage(code);
 
 ## 系统要求
 
-- **最低 SDK**: 21 (Android 5.0 Lollipop)
+- **最低 SDK**: 26 (Android 8.0 Oreo)
 - **目标 SDK**: 34 (Android 14)
 - **支持的 ABI**: arm64-v8a, x86_64
 

@@ -9,7 +9,7 @@ import java.util.Locale;
 /**
  * Device information utilities.
  * <p>
- * Compatible with Android API 21+.
+ * Compatible with Android API 26+.
  *
  * @hide
  */
@@ -82,14 +82,11 @@ public final class DeviceInfo {
      * @return Primary ABI (e.g., "arm64-v8a", "x86_64")
      */
     public static String getPrimaryAbi() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            String[] abis = Build.SUPPORTED_ABIS;
-            if (abis != null && abis.length > 0) {
-                return abis[0];
-            }
+        String[] abis = Build.SUPPORTED_ABIS;
+        if (abis != null && abis.length > 0) {
+            return abis[0];
         }
-        // Fallback for older devices (shouldn't happen with minSdk 21)
-        return safeString(Build.CPU_ABI);
+        return "";
     }
 
     /**
@@ -98,10 +95,7 @@ public final class DeviceInfo {
      * @return Array of supported ABIs
      */
     public static String[] getSupportedAbis() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            return Build.SUPPORTED_ABIS;
-        }
-        return new String[] { safeString(Build.CPU_ABI), safeString(Build.CPU_ABI2) };
+        return Build.SUPPORTED_ABIS;
     }
 
     /**

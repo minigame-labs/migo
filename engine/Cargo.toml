@@ -29,16 +29,32 @@ bytes = "1.4.0"
 glow = { version = "0.17", default-features = false }
 khronos-egl = { version = "6", features = ["dynamic"] }
 
-# Skia 2D renderer (Ganesh GL backend + SkParagraph text)
+# Skia 2D renderer (Ganesh GL backend + SkParagraph text).
 #   Features:
-#     gl + egl: OpenGL ES + EGL context (required on Android)
-#     textlayout: SkParagraph / SkShaper / HarfBuzz / ICU (browser-grade text)
-#     binary-cache: download prebuilt skia for host builds (fast dev loop)
-#     embed-icudtl: bundle icudtl.dat (~10MB) into the binary to avoid runtime load
-#   Host-only note: `binary-cache` downloads from GitHub on first build; CI
-#   caches $CARGO_HOME/registry and skia-bindings build outputs to amortize.
-#   Android cross-compile: see scripts/build-skia-android.sh (Phase 6).
-skia-safe = { version = "0.93", default-features = false, features = ["gl", "egl", "textlayout", "binary-cache", "embed-icudtl", "embed-freetype"] }
+#     gl + egl        OpenGL ES + EGL context (required on Android)
+#     textlayout      SkParagraph / SkShaper / HarfBuzz / ICU (browser-grade text)
+#     binary-cache    download prebuilt skia for host builds (fast dev loop)
+#     embed-icudtl    bundle icudtl.dat (~10 MiB) into the binary
+#     embed-freetype  bundle FreeType inside libmigo.so
+#
+# ICU packaging:
+#   The default Skia feature set embeds `icudtl.dat` into libmigo.so,
+#   adding ~10 MiB to the shipped .so.  Callers that prefer to ship
+#   `icudtl.dat` as an APK asset (and load it at session init via
+#   `MigoRuntime.initIcuData`) can build with the workspace flag
+#   `--no-default-features --features external_icudtl`, which
+#   rebuilds skia-safe without `embed-icudtl`.
+#
+#   The asset-based path requires a separate bootstrap step that
+#   copies the asset to a known path and calls
+#   `SkLoadICU(path)` / `SkInitializeICU` before the first text
+#   layout call.  See CLAUDE.md section 4 (Android bootstrap).
+#
+# `embed-icudtl` is opted in by the `graphics` crate's default
+# feature set, not here, so downstream crates can build without
+# it by passing `--no-default-features --features external_icudtl`
+# (see `crates/graphics/Cargo.toml`).
+skia-safe = { version = "0.93", default-features = false, features = ["gl", "egl", "textlayout", "binary-cache", "embed-freetype"] }
 
 # Image decoding - only enable formats actually needed
 # Removing unused formats can save 500KB-1MB

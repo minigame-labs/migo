@@ -263,11 +263,7 @@ mod tests {
         let stale: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with(".atomic.tmp")
-            })
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".atomic.tmp"))
             .collect();
         assert!(stale.is_empty(), "tmp files leaked: {:?}", stale);
     }
@@ -307,11 +303,7 @@ mod tests {
         let stale: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with(".atomic.tmp")
-            })
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".atomic.tmp"))
             .collect();
         assert!(stale.is_empty(), "tmp files leaked: {:?}", stale);
     }

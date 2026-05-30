@@ -1,15 +1,16 @@
 use deno_core::extension;
 
 mod context2d;
-pub(crate) mod frame_collector;
 mod font;
+pub(crate) mod frame_collector;
 mod raf;
 mod webgl;
 
 use context2d::*;
 pub mod error_state;
 use error_state::{
-    op_webgl_get_context_attributes, op_webgl_get_error, op_webgl_record_attributes,
+    op_webgl_get_context_attributes, op_webgl_get_error, op_webgl_query_compressed_caps,
+    op_webgl_record_attributes,
 };
 use font::*;
 use raf::*;
@@ -29,6 +30,7 @@ extension!(host_v8_webgl,
         op_webgl_get_error,
         op_webgl_get_context_attributes,
         op_webgl_record_attributes,
+        op_webgl_query_compressed_caps,
         op_create_program,
         op_use_program,
         op_link_program,
@@ -75,7 +77,11 @@ extension!(host_v8_webgl,
         op_active_texture,
         op_tex_image_2d,
         op_tex_image_2d_from_image,
+        op_tex_image_2d_from_snapshot,
+        op_tex_image_2d_from_canvas2d,
         op_tex_sub_image_2d,
+        op_tex_sub_image_2d_from_snapshot,
+        op_tex_sub_image_2d_from_canvas2d,
         op_tex_sub_image_2d_from_image,
         op_tex_parameteri,
         op_tex_parameterf,
@@ -147,7 +153,16 @@ extension!(host_v8_webgl,
         // 2D Context (sync ops)
         op_create_context_2d,
         op_measure_text,
+        op_measure_text_flat,
         op_get_image_data,
+        op_capture_canvas2d_snapshot,
+        op_capture_canvas2d_snapshot_for_cache,
+        op_force_readback_snapshot,
+
+        // Text texture cache
+        op_text_cache_peek_pin,
+        op_text_cache_unpin,
+        op_tex_image_2d_from_text_cache,
 
         // Frame lifecycle
         op_frame_begin,
@@ -250,6 +265,23 @@ extension!(host_v8_webgl,
         op_client_wait_sync,
         op_draw_buffers,
         op_read_buffer,
+        op_create_query,
+        op_delete_query,
+        op_begin_query,
+        op_end_query,
+        op_get_query_parameter,
+        op_create_transform_feedback,
+        op_delete_transform_feedback,
+        op_bind_transform_feedback,
+        op_begin_transform_feedback,
+        op_end_transform_feedback,
+        op_pause_transform_feedback,
+        op_resume_transform_feedback,
+        op_get_transform_feedback_varying,
+        op_transform_feedback_varyings,
+        op_tex_image_3d,
+        op_tex_sub_image_3d,
+        op_tex_storage_3d,
     ],
     esm = [
         dir "rendering/webgl",

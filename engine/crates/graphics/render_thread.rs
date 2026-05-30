@@ -1,30 +1,65 @@
+//! # Render thread driver
+//!
+//! Hosts the Migo render loop that drains [`RenderCommand`]s, runs
+//! Canvas2D / WebGL / upload work, and drives the
+//! `eglSwapBuffers` + RAF signal pipeline.
+//!
+//! ## Migration: command handlers → `RenderLoopState` methods
+//!
+//! The [`RenderThread::spawn`] body below has historically been
+//! one ~700-line lambda with three nested closures passing 11
+//! arguments each (`handle_one_cmd`, `drain_cmds`,
+//! `present_frame_and_signal_raf`).  F-3 landed the
+//! [`crate::render_loop::RenderLoopState`] struct that bundles
+//! every mutable per-loop value; the migration to method
+//! dispatch is happening incrementally — adding a new command
+//! variant no longer has to touch every closure's parameter list.
+//! The existing closures stay as-is until each is individually
+//! converted, at which point the struct's `pub(crate)` fields
+//! let the method body reach the sub-components without
+//! refactoring the disjoint borrows the current closures rely on.
+
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    canvas2d_dispatcher::Renderer2d,
-    damage_effect::DamageEffect,
-    dirty_region,
-    frame_scheduler::FrameScheduler,
-    onscreen_window_from_surface,
-    render_server::RenderServer,
-    surface_system::SurfaceSystem,
-    CanvasHandler, CanvasManager, RendererGL,
+    CanvasHandler, CanvasManager, RendererGL, canvas2d_dispatcher::Renderer2d,
+    damage_effect::DamageEffect, dirty_region, frame_scheduler::FrameScheduler,
+    onscreen_window_from_surface, render_server::RenderServer, surface_system::SurfaceSystem,
 };
-use crossbeam_channel::{select, tick, Receiver};
+use crossbeam_channel::{Receiver, select, tick};
 use glow::HasContext;
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::render_cmd::{CanvasBatchPayload, CanvasId, GlBatchPayload, RenderCommand};
 use shared::render_command_sender::CommandSender;
+use shared::render_event::{RenderEvent, RenderEventReceiver, RenderEventSender};
 use shared::surface::SurfaceRef;
 use shared::{FrameOp, FramePacket};
 use tracing::{error, info, warn};
 
 use shared::raf_signal::RafSender;
 
+/// Threshold at which `raf_drop_streak` turns into a
+/// `RenderEvent::RafBackpressure` emission (P2-10).  Three
+/// consecutive drops is stricter than a single-frame jitter but
+/// lax enough that an actually stalled producer trips it within a
+/// 50 ms window at 60 Hz.
+const RAF_BACKPRESSURE_STREAK_THRESHOLD: u32 = 3;
+
 pub struct RenderThread {
     cmd_tx: CommandSender,
+    /// Render-thread → host event feedback channel.  Exposed via
+    /// [`Self::events`] so the host runtime can subscribe and
+    /// forward events into JS or the debug overlay.  See
+    /// [`shared::render_event`] for the policy.
+    event_rx: RenderEventReceiver,
+    /// F-2: type-erased measurer handle shared with the JS
+    /// thread's `CanvasOpState`.  Cloned into the host runtime
+    /// wiring layer via [`Self::text_measurer`]; subsequent
+    /// `op_measure_text_flat` calls bypass the cross-thread
+    /// channel entirely when the host has installed it.
+    text_measurer: shared::text_measurer::SharedTextMeasurer,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -124,11 +159,7 @@ fn execute_canvas_batch(
             .get_2d_context_mut(canvas_id)
             .map(|ctx| state_allows_partial(&ctx.renderer.state))
             .unwrap_or(true); // no context yet → no draws → hint is fine
-        if state_safe {
-            payload.dirty_rect
-        } else {
-            None
-        }
+        if state_safe { payload.dirty_rect } else { None }
     };
 
     let scissor_applied = if let Some(setup) =
@@ -155,6 +186,21 @@ fn execute_canvas_batch(
         false
     };
 
+    // G-1: pin every image id this batch references so a
+    // concurrent `DestroyImage` cannot free the underlying GL
+    // texture mid-iteration.  The batch-scope retain is a
+    // strict subset of the frame-packet retain (F-1); both
+    // paths are safe to use independently because the refcount
+    // is additive.  Released unconditionally at the bottom so
+    // even an error mid-batch doesn't leak the retain.
+    let mut retained_image_ids: smallvec::SmallVec<[u32; 16]> = smallvec::SmallVec::new();
+    for cmd in &commands {
+        cmd.for_each_referenced_image(|id| {
+            cm.retain_in_flight_image(id);
+            retained_image_ids.push(id);
+        });
+    }
+
     for cmd in commands {
         // Classify damage BEFORE handle_command moves the cmd.
         // Reads Canvas2D state (transform, shadow) from the render thread —
@@ -175,6 +221,21 @@ fn execute_canvas_batch(
                 }
             }
             Err(e) => error!("Canvas2DBatch cmd failed: {}", e),
+        }
+    }
+
+    // G-1: release the batch-scope retain.  If any release drops
+    // the refcount to zero *and* a destroy was requested while
+    // the image was in flight, `release_in_flight_image`
+    // returns the entry so we can `glDeleteTextures` it here.
+    // Calls with no pending destroy return `None`, the hot path.
+    for id in retained_image_ids.drain(..) {
+        if let Some(entry) = cm.release_in_flight_image(id) {
+            if let Some(tex) =
+                <glow::NativeTexture as NativeTextureFromRawInline>::try_from_raw(entry.gl_texture)
+            {
+                unsafe { gl.delete_texture(tex) };
+            }
         }
     }
 
@@ -302,6 +363,40 @@ where
     execute_frame_packet_with_present_tracking(packet, state, on_canvas, on_gl)
 }
 
+/// Phase reorder: if the packet's CanvasBatches and GlBatches target
+/// disjoint sets of canvases (the cocos shop pattern — offscreen
+/// Canvas2D for text labels, onscreen WebGL for the UI), we can run
+/// all CanvasBatch + Materialize work as one phase and all GlBatch
+/// work as a second phase.  This collapses 100+ EGL context switches
+/// (alternating between offscreen canvases and the onscreen canvas)
+/// down to roughly `N_distinct_offscreen + 1`.
+///
+/// Returns `false` whenever the packet might contain a Canvas2D↔WebGL
+/// cross-dependency (e.g. `ctx.drawImage(webglCanvasElement, ...)` —
+/// the WebGL canvas's pixels must be flushed before the Canvas2D
+/// draw reads them), in which case we preserve issue order.
+fn packet_safe_to_reorder(ops: &[FrameOp]) -> bool {
+    use std::collections::HashSet;
+    let mut canvas_targets: HashSet<u32> = HashSet::new();
+    let mut gl_targets: HashSet<u32> = HashSet::new();
+    for op in ops {
+        match op {
+            FrameOp::CanvasBatch(payload) => {
+                canvas_targets.insert(u32::from(payload.canvas_id));
+            }
+            FrameOp::GlBatch(payload) => {
+                for cmd in &payload.commands {
+                    if let Some(cid) = cmd.touches_canvas() {
+                        gl_targets.insert(u32::from(cid));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    canvas_targets.is_disjoint(&gl_targets)
+}
+
 fn execute_frame_packet(
     cm: &mut CanvasManager,
     gl: &glow::Context,
@@ -311,9 +406,73 @@ fn execute_frame_packet(
 ) -> bool {
     let mut should_present = false;
 
-    for op in packet.into_ops() {
+    // F-1: pin every image id this packet references so a
+    // concurrent `DestroyImage` defers its `glDeleteTextures`
+    // until the Present barrier runs below.  The retained ids
+    // are released in strict LIFO order at the end of the
+    // function regardless of whether a Present op was present
+    // in the packet — otherwise a packet-without-Present (GL-only
+    // work, intra-frame Materialize) would leak the retention
+    // across the next frame and prevent destroy from ever
+    // succeeding.
+    let mut retained_image_ids: smallvec::SmallVec<[u32; 16]> = smallvec::SmallVec::new();
+    packet.for_each_referenced_image(|id| {
+        cm.retain_in_flight_image(id);
+        retained_image_ids.push(id);
+    });
+
+    // Reorder ops to minimise EGL context switching.  Profiling on
+    // hxddd's shop-open scene showed ~430 `eglMakeCurrent` calls per
+    // FramePacket — almost all from alternating between ~30 offscreen
+    // Canvas2D labels and the onscreen WebGL canvas, ping-pong style.
+    // When the packet's Canvas2D and WebGL halves don't share any
+    // canvas id, doing all Canvas2D work first then all WebGL work
+    // collapses the ping-pong into one switch per distinct canvas
+    // (measured: make_current 295 → 152 on the shop scene).  Falls
+    // back to issue order when a cross-dependency is detected.
+    let ops_vec = packet.into_ops();
+    let ops: Vec<FrameOp> = if packet_safe_to_reorder(&ops_vec) {
+        let mut phase1: Vec<FrameOp> = Vec::with_capacity(ops_vec.len());
+        let mut phase2: Vec<FrameOp> = Vec::with_capacity(ops_vec.len());
+        for op in ops_vec {
+            match &op {
+                FrameOp::BeginFrame
+                | FrameOp::CanvasBatch(_)
+                | FrameOp::Materialize { .. } => phase1.push(op),
+                FrameOp::GlBatch(_) | FrameOp::Present => phase2.push(op),
+            }
+        }
+        phase1.extend(phase2);
+        phase1
+    } else {
+        ops_vec
+    };
+
+    for op in ops {
         match op {
-            FrameOp::BeginFrame | FrameOp::Present => {}
+            FrameOp::BeginFrame => {
+                // P2-13: frame boundary markers are a natural place
+                // to refresh diagnostics and let Skia purge
+                // age-expired resources.  Both calls are cheap no-ops
+                // when no work is pending; they live here rather
+                // than in the command-dispatch path so diagnostic
+                // timing stays aligned with frame packets.
+                crate::render_diagnostics::frame_begin();
+            }
+            FrameOp::Present => {
+                // Skia's deferred cleanup releases GPU atlas /
+                // glyph entries that aged past their LRU bucket
+                // without the game's next draw having to trip the
+                // cache's size cap first.  200 ms matches the
+                // Chromium Ganesh integration default and
+                // empirically keeps the steady-state resident set
+                // close to `SKIA_RESOURCE_CACHE_BUDGET_BYTES`
+                // under bursty paint workloads.
+                let cleanup_age = std::time::Duration::from_millis(200);
+                for (_, ctx) in cm.contexts_2d_iter_mut() {
+                    ctx.perform_deferred_cleanup(cleanup_age);
+                }
+            }
             FrameOp::Materialize { canvas_id } => {
                 // Canvas2D → WebGL boundary.  We MUST:
                 //   1. Flush Skia so subsequent GL ops see the pixels.
@@ -326,6 +485,16 @@ fn execute_frame_packet(
                 //   3. *Not* eagerly call `reset_gl_state()` — the
                 //      per-context `skia_state_stale` flag picks
                 //      that up lazily the next time Skia draws.
+                //
+                // P1-7 invariant: calling `cm.clear_2d_dirty(canvas_id)`
+                // here guarantees that the end-of-frame
+                // `flush_dirty_2d_contexts` sweep in
+                // `present_frame_and_signal_raf` will NOT re-flush the
+                // same canvas (it drains `dirty_2d`).  A post-
+                // Materialize `Canvas2DBatch` that targets the same
+                // canvas will re-mark it dirty via
+                // `mark_2d_dirty`, which is the only code path that
+                // should trigger a second flush in one frame.
                 if cm.make_current_needed(canvas_id).is_ok() {
                     let _gl_scope = cm.begin_canvas2d_gl_scope_for(canvas_id);
                     if let Ok(ctx) = cm.get_2d_context_mut(canvas_id) {
@@ -346,7 +515,39 @@ fn execute_frame_packet(
         }
     }
 
+    // F-1 release-then-drain sequence.  Release every id the
+    // packet retained so any `DestroyImage` that arrived during
+    // the frame can finally free its GL texture; then call
+    // `drain_pending_image_deletions` which actually issues the
+    // `glDeleteTextures` for ids whose refcount just reached
+    // zero.  If the release returns `Some(entry)` directly,
+    // another caller's drain missed the release window; we
+    // free it here anyway so no entry leaks.
+    for id in retained_image_ids.drain(..) {
+        if let Some(entry) = cm.release_in_flight_image(id) {
+            if let Some(tex) =
+                <glow::NativeTexture as NativeTextureFromRawInline>::try_from_raw(entry.gl_texture)
+            {
+                unsafe { gl.delete_texture(tex) };
+            }
+        }
+    }
+    cm.drain_pending_image_deletions();
+
     should_present
+}
+
+/// Private shim mirroring the one in `canvas::manager::mod.rs`;
+/// kept here so `execute_frame_packet` can reconstruct a
+/// `NativeTexture` without cross-module visibility gymnastics.
+trait NativeTextureFromRawInline {
+    fn try_from_raw(raw: u32) -> Option<glow::NativeTexture>;
+}
+impl NativeTextureFromRawInline for glow::NativeTexture {
+    #[inline]
+    fn try_from_raw(raw: u32) -> Option<glow::NativeTexture> {
+        std::num::NonZeroU32::new(raw).map(glow::NativeTexture)
+    }
 }
 
 fn next_vsync_frame_decision(
@@ -388,7 +589,7 @@ mod tests {
         execute_frame_packet_with_present_tracking_for_test, finalize_vsync_frame_decision,
         mark_surface_destroyed, next_vsync_frame_decision,
     };
-    use crate::{frame_scheduler::FrameScheduler, SurfaceSystem};
+    use crate::{SurfaceSystem, frame_scheduler::FrameScheduler};
     use shared::protocol::render_cmd::{Canvas2DCmd, CanvasBatchPayload, DirtyRect};
     use shared::{FrameOp, FramePacketBuilder};
 
@@ -780,10 +981,24 @@ impl RenderThread {
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
     ) -> EngineResult<Self> {
         let (cmd_tx, cmd_rx) = CommandSender::new();
+        let (event_tx, event_rx) = shared::render_event::channel();
 
+        // F-2: build the shared TextContext here (no GL deps —
+        // SkFontMgr + SkFontCollection are pure CPU objects) so
+        // both halves — the render thread's `Renderer2d` and the
+        // type-erased handle we expose on `RenderThread` — pick
+        // up the same `Arc`.
+        let (shared_text_ctx, text_measurer) = crate::text_measurer_impl::into_shared_measurer(
+            crate::backend::gl::text::TextContext::new(),
+        );
+
+        let event_tx_thread = event_tx.clone();
+        let shared_text_ctx_for_thread = shared_text_ctx.clone();
         let handle = std::thread::Builder::new()
             .name("Migo-RenderThread".into())
             .spawn(move || {
+                let events: RenderEventSender = event_tx_thread;
+                let shared_text_ctx = shared_text_ctx_for_thread;
                 shared::thread_priority::set_current_thread_priority(
                     shared::thread_priority::Priority::Display,
                 );
@@ -859,7 +1074,7 @@ impl RenderThread {
                 }
 
                 let mut canvas_handler = CanvasHandler::new();
-                let mut renderer_2d = Renderer2d::new();
+                let mut renderer_2d = Renderer2d::from_shared_text(shared_text_ctx);
                 let mut renderer_gl = RendererGL::new();
                 let mut render_server = RenderServer::new();
 
@@ -879,6 +1094,18 @@ impl RenderThread {
                 // time-critical swap path where it delays the RAF signal and
                 // can cause cascading frame drops.
                 let mut needs_context_recovery = false;
+
+                // Diag: track when the render thread entered pause
+                // so `Resume` can report wall-clock paused duration.
+                // Useful for correlating "came back black" bug
+                // reports with Android TRIM_MEMORY / OOM kill
+                // timelines.
+                //
+                // Interior-mutability (`Cell`) because the handler
+                // closure captures immutably — wrapping avoids the
+                // blast radius of flipping the closure to FnMut.
+                let pause_started_at: core::cell::Cell<Option<Instant>> =
+                    core::cell::Cell::new(None);
 
                 enum LoopCtl {
                     Continue,
@@ -942,8 +1169,20 @@ impl RenderThread {
                                     if is_recreate {
                                         if let Some(size) = recreate_surface_size {
                                             surface_system.on_surface_available(size);
+                                            info!(
+                                                width = size.0,
+                                                height = size.1,
+                                                surface_state = ?surface_system.state(),
+                                                canvas_count = cm.canvas_count(),
+                                                "RenderThread surface recreated"
+                                            );
+                                        } else {
+                                            info!(
+                                                surface_state = ?surface_system.state(),
+                                                canvas_count = cm.canvas_count(),
+                                                "RenderThread surface recreated (no size reported)"
+                                            );
                                         }
-                                        info!("RenderThread surface recreated");
                                     }
                                     if affects_onscreen {
                                         *dirty = true;
@@ -951,6 +1190,13 @@ impl RenderThread {
                                 }
                                 Err(e) => {
                                     error!("CanvasCmd failed: {}", e);
+                                    debug_stats
+                                        .canvas_cmd_errors
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    events.emit(RenderEvent::CanvasError {
+                                        code: e.code,
+                                        message: e.to_string(),
+                                    });
                                 }
                             }
                         }
@@ -962,7 +1208,16 @@ impl RenderThread {
                                 }
                                 cm.add_damage(effect);
                             }
-                            Err(e) => error!("GLCmd failed: {}", e),
+                            Err(e) => {
+                                error!("GLCmd failed: {}", e);
+                                debug_stats
+                                    .gl_cmd_errors
+                                    .fetch_add(1, Ordering::Relaxed);
+                                events.emit(RenderEvent::GlError {
+                                    code: e.code,
+                                    message: e.to_string(),
+                                });
+                            }
                         },
                         RenderCommand::GLBatch(payload) => {
                             if execute_gl_batch(cm, gl, renderer_gl, payload) {
@@ -970,21 +1225,55 @@ impl RenderThread {
                             }
                         }
 
-                        RenderCommand::Canvas2D { canvas_id, cmd } => match renderer_2d.handle_command(cm, canvas_id, cmd) {
-                            Ok(was_render) => {
-                                if was_render {
-                                    cm.mark_2d_dirty(canvas_id);
-                                    // NOTE: dirty flag is NOT set here. Canvas2D commands
-                                    // may arrive mid-frame (e.g. _frameEnd() before
-                                    // measureText). Setting dirty here would cause the
-                                    // render thread to present a partial frame on the next
-                                    // VSync, producing visible flicker. Instead, the JS
-                                    // frame-end (op_frame_end_all) sends an explicit
-                                    // Invalidate to trigger the present.
+                        RenderCommand::Canvas2D { canvas_id, cmd } => {
+                            // G-1: retain referenced image ids around
+                            // the dispatch so a concurrent `DestroyImage`
+                            // still waits for the draw to land.
+                            // SmallVec-backed; zero allocation for the
+                            // common `DrawImage { image_id }` case.
+                            let mut retained: smallvec::SmallVec<[u32; 4]> =
+                                smallvec::SmallVec::new();
+                            cmd.for_each_referenced_image(|id| {
+                                cm.retain_in_flight_image(id);
+                                retained.push(id);
+                            });
+                            let result = renderer_2d.handle_command(cm, canvas_id, cmd);
+                            for id in retained.drain(..) {
+                                if let Some(entry) = cm.release_in_flight_image(id) {
+                                    if let Some(tex) =
+                                        <glow::NativeTexture as NativeTextureFromRawInline>::try_from_raw(
+                                            entry.gl_texture,
+                                        )
+                                    {
+                                        unsafe { gl.delete_texture(tex) };
+                                    }
                                 }
                             }
-                            Err(e) => error!("Canvas2D failed: {}", e),
-                        },
+                            match result {
+                                Ok(was_render) => {
+                                    if was_render {
+                                        cm.mark_2d_dirty(canvas_id);
+                                        // NOTE: dirty flag is NOT set here. Canvas2D commands
+                                        // may arrive mid-frame (e.g. _frameEnd() before
+                                        // measureText). Setting dirty here would cause the
+                                        // render thread to present a partial frame on the next
+                                        // VSync, producing visible flicker. Instead, the JS
+                                        // frame-end (op_frame_end_all) sends an explicit
+                                        // Invalidate to trigger the present.
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Canvas2D failed: {}", e);
+                                    debug_stats
+                                        .canvas2d_cmd_errors
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    events.emit(RenderEvent::Canvas2DError {
+                                        code: e.code,
+                                        message: e.to_string(),
+                                    });
+                                }
+                            }
+                        }
 
                         // V2: Batched commands - process all commands in a single frame
                         RenderCommand::Canvas2DBatch(payload) => {
@@ -1008,39 +1297,153 @@ impl RenderThread {
                         RenderCommand::Pause => {
                             if !*paused {
                                 *paused = true;
+                                let live_canvases = cm.canvas_count();
+                                let surface_state_before = surface_system.state();
                                 surface_system.on_pause();
                                 if !has_vsync {
                                     *ticker = crossbeam_channel::never();
                                 }
-                                info!("RenderThread paused");
+                                // R-6: the game just went to background.
+                                // Release GPU memory aggressively so the
+                                // Android lowmemorykiller does not evict
+                                // the whole process under memory
+                                // pressure.  `on_trim_memory` lowers the
+                                // Skia resource-cache budget AND runs a
+                                // synchronous deferred-cleanup sweep on
+                                // every live `Canvas2DContext`, matching
+                                // the Chromium Android idle idiom.
+                                // Resume will rehydrate caches on first
+                                // draw; the one-time CPU upload cost is
+                                // vastly preferred to being killed and
+                                // having to restart the engine.
+                                cm.on_trim_memory();
+                                pause_started_at.set(Some(Instant::now()));
+                                info!(
+                                    live_canvases,
+                                    has_vsync,
+                                    surface_state_before = ?surface_state_before,
+                                    "RenderThread paused; ran aggressive GPU cache trim"
+                                );
                             }
                         }
 
                         RenderCommand::Resume => {
                             if *paused {
                                 *paused = false;
+                                let paused_ms = pause_started_at
+                                    .take()
+                                    .map(|t: Instant| t.elapsed().as_millis() as u64)
+                                    .unwrap_or(0);
+                                let surface_state_before = surface_system.state();
                                 surface_system.on_resume();
+                                let surface_state_after = surface_system.state();
                                 if !has_vsync {
                                     *ticker = tick(Duration::from_secs_f32(1.0 / *fps as f32));
                                 }
-                                info!("RenderThread resumed");
+                                // Request a frame so the first post-
+                                // resume paint isn't gated on the game
+                                // JS happening to dirty something.
+                                // Without this, on some devices the
+                                // surface comes back but the canvas
+                                // stays on the pre-pause frame until
+                                // the next user interaction — looks
+                                // like "black / frozen on resume".
+                                *dirty = true;
+                                info!(
+                                    paused_ms,
+                                    has_vsync,
+                                    surface_state_before = ?surface_state_before,
+                                    surface_state_after = ?surface_state_after,
+                                    "RenderThread resumed (dirty forced for first-frame paint)"
+                                );
                             }
                         }
 
                         RenderCommand::SurfaceDestroyed => {
+                            let surface_state_before = surface_system.state();
+                            let paused_now = *paused;
                             mark_surface_destroyed(surface_system);
+                            info!(
+                                paused = paused_now,
+                                surface_state_before = ?surface_state_before,
+                                surface_state_after = ?surface_system.state(),
+                                "RenderThread SurfaceDestroyed acknowledged"
+                            );
                         }
 
-                        RenderCommand::LoadFont { key, bytes, resp } => {
-                            // Single shared TextContext owns all custom
-                            // typefaces; Skia's TypefaceFontProvider resolves
-                            // family lookups for every canvas on the fly.
-                            if renderer_2d.text.register_family(&key, &bytes) {
-                                info!("RenderThread: loaded font '{}' ({} bytes)", key, bytes.len());
-                                resp.ok(key);
+                        RenderCommand::TrimTextCache { level } => {
+                            // Text texture cache lives process-global but
+                            // its GL textures can only be freed with a
+                            // current EGL context, which only this thread
+                            // has.  Trim, then delete the returned victim
+                            // textures.
+                            let lvl =
+                                shared::text_texture_cache::TrimLevel::from_android(level);
+                            let (victims, stats) = {
+                                let mut tc = shared::text_texture_cache::global_cache();
+                                let v = tc.trim(lvl);
+                                (v, tc.stats())
+                            };
+                            if !victims.is_empty() && cm.ensure_any_canvas_current().is_ok() {
+                                unsafe {
+                                    for raw in &victims {
+                                        if let Some(t) = <glow::NativeTexture as NativeTextureFromRawInline>::try_from_raw(*raw) {
+                                            gl.delete_texture(t);
+                                        }
+                                    }
+                                }
+                            }
+                            crate::render_diagnostics::set_text_cache_gauges(
+                                stats.size_bytes as u32,
+                                stats.entries as u32,
+                            );
+                            info!(
+                                "RenderThread: text cache trim level={} freed_textures={} resident_bytes={}",
+                                level,
+                                victims.len(),
+                                stats.size_bytes
+                            );
+                        }
+
+                        RenderCommand::LoadFont { family, aliases, bytes, resp } => {
+                            // F-2: the render thread + the JS-thread
+                            // measurer share the same `TextContext` via
+                            // `Arc<Mutex<_>>`, so a single registration
+                            // is visible to both sides.  Locking only
+                            // happens here (one-shot on font load);
+                            // measurement contention is on the JS side
+                            // which locks separately.
+                            let mut text_ctx = renderer_2d.text.lock();
+                            if let Some(registration) =
+                                text_ctx.register_family_aliases(aliases.as_ref().as_slice(), &bytes)
+                            {
+                                // A newly-registered / replaced typeface
+                                // can change how any cached text rendered:
+                                // bump the global font generation so all
+                                // existing text-texture-cache entries
+                                // (keyed on the prior generation) become
+                                // unreachable and age out via LRU.  New
+                                // fillTexts capture the bumped generation.
+                                let font_gen = shared::text_texture_cache::bump_font_generation();
+                                info!(
+                                    "RenderThread: loaded font '{}' aliases={:?} internal_family={:?} ({} bytes), text_cache_generation={}",
+                                    family,
+                                    registration.aliases,
+                                    registration.internal_family,
+                                    bytes.len(),
+                                    font_gen
+                                );
+                                resp.ok(family);
                             } else {
-                                warn!("RenderThread: failed to parse font '{}' ({} bytes)", key, bytes.len());
-                                resp.err_msg(format!("font '{key}' rejected: invalid typeface data"));
+                                warn!(
+                                    "RenderThread: failed to parse font '{}' aliases={:?} ({} bytes)",
+                                    family,
+                                    aliases,
+                                    bytes.len()
+                                );
+                                resp.err_msg(format!(
+                                    "font '{family}' rejected: invalid typeface data"
+                                ));
                             }
                         }
 
@@ -1057,7 +1460,9 @@ impl RenderThread {
                                 direction: TextDirection::Inherit,
                             };
                             // Empty-string layout still reports line metrics.
-                            let m = renderer_2d.text.measure_text(" ", &attrs);
+                            let text_ctx = renderer_2d.text.lock();
+                            let m = text_ctx.measure_text(" ", &attrs);
+                            drop(text_ctx);
                             let line_height = m.font_bounding_box_ascent
                                 + m.font_bounding_box_descent;
                             let result = if line_height > 0.0 {
@@ -1087,10 +1492,42 @@ impl RenderThread {
                                        surface_system: &mut SurfaceSystem,
                                        render_server: &mut RenderServer|
                  -> LoopCtl {
-                    // Drain pending commands from the channel.
-                    // Limit per drain to prevent frame-time spikes (~2-3 ms on ARM SoC).
-                    const MAX_DRAIN: usize = 512;
-                    for _ in 0..MAX_DRAIN {
+                    crate::atrace_scope!("migo.render.drain_cmds");
+                    // Drain pending commands with a *dual budget*:
+                    // capped by both command count and elapsed CPU
+                    // time.  Previously only the count was bounded,
+                    // which let a burst of cheap but numerous ops
+                    // (thousands of scalar `bindBuffer` /
+                    // `uniform*`) still add up to millions of
+                    // nanoseconds before VSync caught up, turning
+                    // into frame-time jitter rather than average
+                    // throughput.
+                    //
+                    // MAX_CMDS keeps us from starving the outer
+                    // select! loop; MAX_DRAIN_US caps the worst-
+                    // case CPU burst so a backlog spills across
+                    // frames instead of pathologically stretching
+                    // one.  Values are conservative -- profile will
+                    // tell us whether to widen / narrow.
+                    const MAX_CMDS: usize = 512;
+                    const MAX_DRAIN_US: u128 = 1_500; // 1.5 ms
+                    let drain_start = Instant::now();
+                    // P1-9: track whether the loop exited because of
+                    // the CPU budget vs naturally.  Budget exits
+                    // bump a counter so the overlay can distinguish
+                    // "engine busy" from "engine idle".
+                    let mut budget_exit = false;
+                    for i in 0..MAX_CMDS {
+                        // Re-check the CPU budget every 32 commands
+                        // rather than on every iteration; the loop
+                        // body is ~100 ns for a cheap cmd so the
+                        // query cadence doesn't need to be tighter.
+                        if i > 0 && (i & 31) == 0
+                            && drain_start.elapsed().as_micros() >= MAX_DRAIN_US
+                        {
+                            budget_exit = true;
+                            break;
+                        }
                         match cmd_rx.try_recv() {
                             Ok(cmd) => {
                                 match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, frame_scheduler, ticker, dirty, paused, has_vsync, surface_system, render_server) {
@@ -1100,6 +1537,11 @@ impl RenderThread {
                             }
                             Err(_) => break,
                         }
+                    }
+                    if budget_exit {
+                        debug_stats
+                            .drain_budget_exhausted
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     LoopCtl::Continue
                 };
@@ -1117,6 +1559,16 @@ impl RenderThread {
                                                         last_frame_time: &mut Instant,
                                                         first_frame_recorded: &mut bool,
                                                         needs_recovery: &mut bool| {
+                    crate::atrace_scope!("migo.render.present_and_raf");
+                    // Drain Canvas2D snapshot textures captured during this
+                    // frame's `getImageData` calls.  By this point the
+                    // FramePacket has already executed every queued
+                    // `TexImage2DFromSnapshot`, so the snapshots are no
+                    // longer referenced by any pending command.  Deleting
+                    // them now keeps the pool tiny under the cocos text-
+                    // rendering pattern (hundreds of getImageData calls per
+                    // frame).
+                    cm.drain_canvas2d_snapshots();
                     // Drain completed texture uploads from the upload thread
                     // and register them in the image registry for rendering.
                     let dropped_recoveries = cm.drain_upload_completed();
@@ -1141,8 +1593,73 @@ impl RenderThread {
                     // while the GPU waits for VSync.  Must be unconditional —
                     // JS may call requestAnimationFrame without drawing (dirty=false)
                     // and still needs the next timestamp to keep the loop alive.
-                    if !paused && !raf_tx.signal(ts) {
-                        debug_stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                    //
+                    // Track consecutive-drop streak so P2-10 can emit a
+                    // `RafBackpressure` event once the saturation threshold is
+                    // crossed — transient drops are normal (JS task scheduling
+                    // jitter, WebGL texture upload bursts) and shouldn't spam
+                    // the event channel.
+                    if !paused {
+                        if raf_tx.signal(ts) {
+                            // Diag: if we just exited a long streak,
+                            // emit a one-shot recovery log so the
+                            // operator can bracket the backpressure
+                            // window in a field log.  Read the old
+                            // streak BEFORE the store so `prev_streak`
+                            // reflects the peak.
+                            let prev_streak =
+                                debug_stats.raf_drop_streak.swap(0, Ordering::Relaxed);
+                            if prev_streak >= RAF_BACKPRESSURE_STREAK_THRESHOLD {
+                                info!(
+                                    prev_streak,
+                                    "RAF backpressure streak cleared"
+                                );
+                            }
+                        } else {
+                            debug_stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                            let streak = debug_stats
+                                .raf_drop_streak
+                                .fetch_add(1, Ordering::Relaxed)
+                                + 1;
+                            if streak == RAF_BACKPRESSURE_STREAK_THRESHOLD {
+                                debug_stats
+                                    .raf_backpressure_events
+                                    .fetch_add(1, Ordering::Relaxed);
+                                events.emit(RenderEvent::RafBackpressure {
+                                    consecutive_drops: streak,
+                                });
+                                info!(
+                                    consecutive_drops = streak,
+                                    threshold = RAF_BACKPRESSURE_STREAK_THRESHOLD,
+                                    "RAF backpressure threshold crossed"
+                                );
+                            }
+                        }
+                    }
+
+                    // R-3: robustness poll — if the driver flagged a
+                    // GL reset between frames, short-circuit the
+                    // present path and let the next-frame recovery
+                    // handle teardown.  Without this poll, a silently
+                    // reset context would keep emitting "successful"
+                    // GL calls (all no-ops on the wrong state) until
+                    // `eglSwapBuffers` eventually caught it — meaning
+                    // an entire frame's worth of Canvas2D / WebGL
+                    // work gets run against a dead context before the
+                    // user sees the black screen.
+                    if cm.check_graphics_reset_status() {
+                        *needs_recovery = true;
+                        debug_stats
+                            .context_lost_events
+                            .fetch_add(1, Ordering::Relaxed);
+                        let failed = cm.fail_pending_sync_responders(
+                            "GL_KHR_robustness reported context reset",
+                        );
+                        if failed > 0 {
+                            warn!("Aborted {failed} pending sync responder(s) due to robustness-reported reset");
+                        }
+                        cm.abandon_all_2d_contexts();
+                        events.emit(RenderEvent::ContextLost);
                     }
 
                     // Present the completed frame (only if we have a valid surface).
@@ -1160,6 +1677,7 @@ impl RenderThread {
                         // framebuffer so the driver can skip loading unchanged tiles.
                         cm.declare_frame_damage(onscreen_id);
 
+                        crate::atrace_scope!("migo.render.flush_2d");
                         match cm.flush_dirty_2d_contexts() {
                             Ok(flushed_ids) => {
                                 for canvas_id in flushed_ids {
@@ -1179,6 +1697,7 @@ impl RenderThread {
                             )
                         };
 
+                        crate::atrace_scope!("migo.render.swap_buffers");
                         let swap_ok = match cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
                             Ok(resolved_damage) => {
                                 use crate::dirty_region::damage_tracker::ResolvedDamage;
@@ -1199,6 +1718,38 @@ impl RenderThread {
                                 if cm.is_context_lost() {
                                     *needs_recovery = true;
                                     warn!("EGL context lost, recovery deferred to next frame");
+                                    debug_stats
+                                        .context_lost_events
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    // P1-2: fail any pending sync op the
+                                    // manager is still holding on behalf of
+                                    // a JS caller.  Prevents 10 s
+                                    // COMMAND_TIMEOUT_MS stalls on
+                                    // Image.src / getImageData when EGL
+                                    // state has already been discarded.
+                                    let failed = cm.fail_pending_sync_responders(
+                                        "EGL context lost; responder aborted before recovery",
+                                    );
+                                    if failed > 0 {
+                                        warn!(
+                                            "Aborted {failed} pending sync responder(s) due to context loss"
+                                        );
+                                    }
+                                    // R-2: mark every Skia context
+                                    // abandoned so `Drop` can't try
+                                    // `glDelete*` against a dead EGL
+                                    // context.  `try_recover_context`
+                                    // on the next frame will recreate
+                                    // fresh `Canvas2DContext`s.
+                                    cm.abandon_all_2d_contexts();
+                                    events.emit(RenderEvent::ContextLost);
+                                } else {
+                                    debug_stats
+                                        .swap_failures
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    events.emit(RenderEvent::SwapFailed {
+                                        message: e.to_string(),
+                                    });
                                 }
                                 false
                             }
@@ -1214,6 +1765,18 @@ impl RenderThread {
                     } else {
                         false
                     };
+
+                    // v4 cache / queue observability: sampled once
+                    // per frame; the overlay reads them via
+                    // `DebugStats::snapshot()`.  Placed after the
+                    // swap so wrappers created during the frame's
+                    // flush are reflected immediately.
+                    crate::render_diagnostics::set_sk_image_wrapper_count(
+                        cm.image_wrapper_cache_len() as u32,
+                    );
+                    crate::render_diagnostics::set_deferred_uploads(
+                        cm.deferred_uploads_len() as u32,
+                    );
 
                     // FPS stats.
                     let now = Instant::now();
@@ -1240,16 +1803,32 @@ impl RenderThread {
                     if needs_context_recovery {
                         needs_context_recovery = false;
                         match cm.try_recover_context() {
-                            Ok(true) => info!("EGL context recovered at frame top, resuming rendering"),
-                            Ok(false) => warn!("EGL context recovery deferred (no window handle)"),
-                            Err(re) => warn!("EGL context recovery failed: {}", re),
+                            Ok(true) => {
+                                info!("EGL context recovered at frame top, resuming rendering");
+                                debug_stats
+                                    .context_recoveries
+                                    .fetch_add(1, Ordering::Relaxed);
+                                events.emit(RenderEvent::ContextRecovered {
+                                    success: true,
+                                });
+                            }
+                            Ok(false) => {
+                                warn!("EGL context recovery deferred (no window handle)");
+                            }
+                            Err(re) => {
+                                warn!("EGL context recovery failed: {}", re);
+                                events.emit(RenderEvent::ContextRecovered {
+                                    success: false,
+                                });
+                            }
                         }
                     }
 
                     select! {
                         recv(ticker) -> _ => {
                             // Software ticker path (non-Android fallback).
-                            // Frame timing: drain → swap → RAF signal.
+                            // Frame timing: drain -> swap -> RAF signal.
+                            crate::render_diagnostics::set_render_queue_len(cmd_rx.len() as u32);
                             let ts = start_time.elapsed().as_secs_f64() * 1000.0;
                             render_server.set_raf_time_ms(ts);
 
@@ -1268,6 +1847,7 @@ impl RenderThread {
 
                         recv(vsync) -> _msg => {
                             // Choreographer VSync path (Android).
+                            crate::render_diagnostics::set_render_queue_len(cmd_rx.len() as u32);
                             let Some(frame_time_ms) = _msg.ok() else {
                                 continue;
                             };
@@ -1279,6 +1859,23 @@ impl RenderThread {
                             );
 
                             if !decision.should_signal_raf {
+                                // RAF-skipped tick (e.g. game hasn't
+                                // called requestAnimationFrame yet
+                                // during startup).  We still need to
+                                // open the per-frame upload-budget
+                                // window and retry any uploads that
+                                // the previous tick deferred --
+                                // otherwise burst image loads at
+                                // boot sit in `deferred_uploads`
+                                // forever while the budget never
+                                // resets, surfacing as a 10 s
+                                // OP_LOAD_IMAGE timeout in JS.
+                                cm.reset_frame_upload_budget();
+                                cm.try_drain_deferred_uploads();
+                                // Also pick up any completed fences
+                                // so resp oneshots from prior ticks
+                                // don't sit idle either.
+                                let _ = cm.drain_upload_completed();
                                 continue;
                             }
 
@@ -1378,12 +1975,35 @@ impl RenderThread {
 
         Ok(Self {
             cmd_tx,
+            event_rx,
+            text_measurer,
             handle: Some(handle),
         })
     }
 
     pub fn sender(&self) -> CommandSender {
         self.cmd_tx.clone()
+    }
+
+    /// Clone the event feedback receiver.  Callers poll /
+    /// `try_recv` this to surface render-thread failures into JS
+    /// (error events, `performance.mark`) or into the Android
+    /// debug overlay.  Multiple consumers may `clone()` the
+    /// receiver — events are delivered to whichever consumer
+    /// wins the underlying crossbeam MPMC race, so deploying more
+    /// than one subscriber only makes sense if the consumers
+    /// partition on event `kind()`.
+    pub fn events(&self) -> RenderEventReceiver {
+        self.event_rx.clone()
+    }
+
+    /// F-2: clone the shared `TextMeasurer` handle.  Host runtime
+    /// wiring installs this on `CanvasOpState` so JS-side
+    /// `op_measure_text_flat` / `op_get_text_line_height` can
+    /// bypass the render thread entirely for the measurement
+    /// fast path.
+    pub fn text_measurer(&self) -> shared::text_measurer::SharedTextMeasurer {
+        self.text_measurer.clone()
     }
 
     pub fn shutdown(&mut self) {

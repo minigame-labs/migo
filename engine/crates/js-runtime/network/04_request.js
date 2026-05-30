@@ -262,24 +262,22 @@ function request(options = {}) {
                     let bodyBytes;
 
                     if (enableChunked) {
-                        const chunks = [];
+                        // Truly streaming: chunks are handed to the
+                        // user's onChunkReceived listener as they
+                        // arrive and then released. We do NOT
+                        // accumulate and concatenate; that behaviour
+                        // kept peak JS heap at O(body_size) instead of
+                        // O(chunk_size), defeating the point of the
+                        // chunked mode. `cbResp.data` stays empty in
+                        // this branch; chunk consumers own the data.
                         const buffer = new Uint8Array(64 * 1024);
                         await rds.pull(buffer, (chunk) => {
                             if (chunk === undefined) return;
+                            // Copy out of the shared read buffer; the
+                            // listener can retain the ArrayBuffer.
                             const chunkCopy = new Uint8Array(chunk);
                             requestTask._triggerChunkReceived({ data: chunkCopy.buffer });
-                            chunks.push(chunkCopy);
                         });
-
-                        const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
-                        if (totalLen > 0) {
-                            bodyBytes = new Uint8Array(totalLen);
-                            let offset = 0;
-                            for (const chunk of chunks) {
-                                bodyBytes.set(chunk, offset);
-                                offset += chunk.length;
-                            }
-                        }
                     } else {
                         bodyBytes = await rds.readAll();
                     }

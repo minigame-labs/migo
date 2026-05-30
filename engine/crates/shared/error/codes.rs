@@ -286,6 +286,74 @@ mod tests {
         assert_eq!(ErrorCode::Internal.default_message(), "internal error");
     }
 
+    /// P2-7: pin every variant's `as u16` value so accidental
+    /// reorders or renumbers surface as a failing test rather
+    /// than a wire-format compatibility break.  The `ErrorCode`
+    /// enum is Serialize+Deserialize and its numeric
+    /// representation leaks into `RenderMetricsSnapshot`,
+    /// Android JNI error callbacks, and persisted crash dumps —
+    /// silent renumbers would misclassify historical incidents
+    /// and break alerting rules keyed on specific codes.
+    #[test]
+    fn stable_error_code_numeric_values() {
+        // Group assertions by class for readable diffs when a
+        // new variant is added.
+        assert_eq!(ErrorCode::Ok as u16, 0);
+
+        // General 1..=10
+        assert_eq!(ErrorCode::Internal as u16, 1);
+        assert_eq!(ErrorCode::InvalidArgument as u16, 2);
+        assert_eq!(ErrorCode::NotFound as u16, 3);
+        assert_eq!(ErrorCode::PermissionDenied as u16, 4);
+        assert_eq!(ErrorCode::Timeout as u16, 5);
+        assert_eq!(ErrorCode::Unsupported as u16, 6);
+        assert_eq!(ErrorCode::NotImplemented as u16, 7);
+        assert_eq!(ErrorCode::Cancelled as u16, 8);
+        assert_eq!(ErrorCode::Disconnected as u16, 9);
+        assert_eq!(ErrorCode::InvalidOperation as u16, 10);
+
+        // IO / FS
+        assert_eq!(ErrorCode::IoError as u16, 100);
+        assert_eq!(ErrorCode::BadFileDescriptor as u16, 101);
+        assert_eq!(ErrorCode::ExceedMaxConcurrentFdLimit as u16, 102);
+
+        // V8 / JS / Buffer
+        assert_eq!(ErrorCode::ArrayBufferDoesNotExist as u16, 200);
+        assert_eq!(ErrorCode::JsException as u16, 201);
+        assert_eq!(ErrorCode::ModuleLoadError as u16, 202);
+        assert_eq!(ErrorCode::OutOfMemory as u16, 203);
+        assert_eq!(ErrorCode::JsExecutionTimeout as u16, 204);
+        assert_eq!(ErrorCode::HostPanic as u16, 205);
+        assert_eq!(ErrorCode::Anr as u16, 206);
+        assert_eq!(ErrorCode::CodeSignatureInvalid as u16, 207);
+        assert_eq!(ErrorCode::CodeIntegrityFailed as u16, 208);
+
+        // Image
+        assert_eq!(ErrorCode::ImageReadError as u16, 300);
+        assert_eq!(ErrorCode::InvalidImageBuffer as u16, 301);
+
+        // Render / GL
+        assert_eq!(ErrorCode::RenderBackendError as u16, 400);
+        assert_eq!(ErrorCode::ShaderCompileError as u16, 401);
+        assert_eq!(ErrorCode::ProgramLinkError as u16, 402);
+        assert_eq!(ErrorCode::RenderLibraryLoadError as u16, 403);
+        assert_eq!(ErrorCode::RenderSymbolLoadError as u16, 404);
+        assert_eq!(ErrorCode::RenderBindApiError as u16, 405);
+        assert_eq!(ErrorCode::RenderGetDisplayError as u16, 406);
+        assert_eq!(ErrorCode::RenderInitializeError as u16, 407);
+        assert_eq!(ErrorCode::RenderChooseConfigError as u16, 408);
+        assert_eq!(ErrorCode::RenderCreateSurfaceError as u16, 409);
+        assert_eq!(ErrorCode::RenderCreateContextError as u16, 410);
+        assert_eq!(ErrorCode::RenderMakeCurrentError as u16, 411);
+        assert_eq!(ErrorCode::RenderSwapIntervalError as u16, 412);
+        assert_eq!(ErrorCode::RenderSwapBuffersError as u16, 413);
+        assert_eq!(ErrorCode::RenderInvalidStateError as u16, 414);
+
+        // 2D / Canvas
+        assert_eq!(ErrorCode::Render2DInitError as u16, 420);
+        assert_eq!(ErrorCode::Render2DResourceError as u16, 421);
+    }
+
     #[test]
     fn test_io_error_kind_conversion() {
         use std::io::ErrorKind;

@@ -26,12 +26,16 @@ pub trait CameraService: Send + Sync {
     ///
     /// Returns JSON: `{"cameraId": <id>}` on success.
     fn create(&self, _options_json: &str) -> Result<String, ServiceError> {
-        Err(ServiceError::not_supported("createCamera:fail not supported"))
+        Err(ServiceError::not_supported(
+            "createCamera:fail not supported",
+        ))
     }
 
     /// Destroy a camera instance and release all resources.
     fn destroy(&self, _camera_id: u32) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("camera.destroy:fail not supported"))
+        Err(ServiceError::not_supported(
+            "camera.destroy:fail not supported",
+        ))
     }
 
     /// Take a photo.
@@ -42,7 +46,9 @@ pub trait CameraService: Send + Sync {
     ///
     /// Returns JSON: `{"tempImagePath": "<path>", "width": <w>, "height": <h>}` on success.
     fn take_photo(&self, _options_json: &str) -> Result<String, ServiceError> {
-        Err(ServiceError::not_supported("camera.takePhoto:fail not supported"))
+        Err(ServiceError::not_supported(
+            "camera.takePhoto:fail not supported",
+        ))
     }
 
     /// Start video recording.
@@ -52,7 +58,9 @@ pub trait CameraService: Send + Sync {
     ///
     /// Returns JSON: `{}` on success (recording started).
     fn start_record(&self, _options_json: &str) -> Result<String, ServiceError> {
-        Err(ServiceError::not_supported("camera.startRecord:fail not supported"))
+        Err(ServiceError::not_supported(
+            "camera.startRecord:fail not supported",
+        ))
     }
 
     /// Stop video recording.
@@ -63,7 +71,9 @@ pub trait CameraService: Send + Sync {
     ///
     /// Returns JSON: `{"tempThumbPath": "<path>", "tempVideoPath": "<path>"}` on success.
     fn stop_record(&self, _options_json: &str) -> Result<String, ServiceError> {
-        Err(ServiceError::not_supported("camera.stopRecord:fail not supported"))
+        Err(ServiceError::not_supported(
+            "camera.stopRecord:fail not supported",
+        ))
     }
 
     /// Set camera zoom level.
@@ -74,7 +84,9 @@ pub trait CameraService: Send + Sync {
     ///
     /// Returns JSON: `{"zoom": <actual_zoom>}` on success.
     fn set_zoom(&self, _options_json: &str) -> Result<String, ServiceError> {
-        Err(ServiceError::not_supported("camera.setZoom:fail not supported"))
+        Err(ServiceError::not_supported(
+            "camera.setZoom:fail not supported",
+        ))
     }
 
     /// Start listening for camera frame changes (high-frequency streaming).
@@ -82,11 +94,15 @@ pub trait CameraService: Send + Sync {
     /// After calling this, the platform should continuously push frame data via
     /// `_internalOnCameraFrameData(cameraId, arrayBuffer, width, height)`.
     fn listen_frame_change(&self, _camera_id: u32) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("camera.listenFrameChange:fail not supported"))
+        Err(ServiceError::not_supported(
+            "camera.listenFrameChange:fail not supported",
+        ))
     }
 
     /// Stop listening for camera frame changes.
     fn close_frame_change(&self, _camera_id: u32) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("camera.closeFrameChange:fail not supported"))
+        Err(ServiceError::not_supported(
+            "camera.closeFrameChange:fail not supported",
+        ))
     }
 }

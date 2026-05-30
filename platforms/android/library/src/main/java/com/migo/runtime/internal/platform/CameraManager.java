@@ -128,8 +128,7 @@ public final class CameraManager {
         parseOptions(optionsJson);
         Log.d(TAG, "create() parsed options - position: " + position + ", flash: " + flash + ", size: " + sizePreset);
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
-                && activity.checkSelfPermission(Manifest.permission.CAMERA)
+        if (activity.checkSelfPermission(Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
             Log.w(TAG, "create() camera permission denied");
             fireEvent("authCancel", "{}");

@@ -16,7 +16,9 @@ pub trait LocationService: Send + Sync {
     /// - `isHighAccuracy`: bool (default false)
     /// - `highAccuracyExpireTime`: number in ms
     fn get_location(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("getLocation:fail not supported"))
+        Err(ServiceError::not_supported(
+            "getLocation:fail not supported",
+        ))
     }
 
     /// Start a fuzzy location request (getFuzzyLocation).
@@ -24,6 +26,8 @@ pub trait LocationService: Send + Sync {
     /// Options JSON fields:
     /// - `type`: "wgs84" (default) or "gcj02"
     fn get_fuzzy_location(&self, _options_json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("getFuzzyLocation:fail not supported"))
+        Err(ServiceError::not_supported(
+            "getFuzzyLocation:fail not supported",
+        ))
     }
 }

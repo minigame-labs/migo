@@ -38,6 +38,20 @@ function formatErrorMessage(reason) {
     if (reason instanceof Error) {
         return reason.stack || reason.message || String(reason);
     }
+    // Plain objects (e.g. wrapAsync's `{ errMsg, ... }` rejection shape)
+    // would otherwise stringify as "[object Object]" and hide the actual
+    // failure message.  Surface common error-bearing fields first, fall
+    // back to JSON, fall back to String() last.
+    if (reason !== null && typeof reason === 'object') {
+        if (typeof reason.errMsg === 'string') return reason.errMsg;
+        if (typeof reason.message === 'string') return reason.message;
+        if (typeof reason.error === 'string') return reason.error;
+        try {
+            return JSON.stringify(reason);
+        } catch (_) {
+            // circular / non-serializable -- fall through
+        }
+    }
     return String(reason);
 }
 

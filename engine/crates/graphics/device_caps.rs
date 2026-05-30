@@ -52,7 +52,12 @@ impl DeviceCapabilities {
     /// all drivers.
     ///
     /// Must be called with a valid GL context current on the calling thread.
-    pub fn detect(gl: &glow::Context, egl_extensions: &str, negotiated_gles_major: u32, gpu_caps: &shared::device::gpu_caps::GpuCaps) -> Self {
+    pub fn detect(
+        gl: &glow::Context,
+        egl_extensions: &str,
+        negotiated_gles_major: u32,
+        gpu_caps: &shared::device::gpu_caps::GpuCaps,
+    ) -> Self {
         let version_str = unsafe { gl.get_parameter_string(glow::VERSION) };
         let detected = parse_gles_version(&version_str);
         // Use the minimum of detected and negotiated — belt-and-suspenders.
@@ -85,7 +90,8 @@ impl DeviceCapabilities {
             || egl_extensions.contains("EGL_KHR_partial_update");
         let has_partial_update = egl_extensions.contains("EGL_KHR_partial_update");
 
-        let compressed_format_support = crate::compressed_upload::CompressedFormatSupport::detect(gl, gpu_caps);
+        let compressed_format_support =
+            crate::compressed_upload::CompressedFormatSupport::detect(gl, gpu_caps);
 
         Self {
             gles_version,

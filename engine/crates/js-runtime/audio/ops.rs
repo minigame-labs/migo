@@ -1,5 +1,5 @@
 use bytemuck;
-use deno_core::{op2, JsBuffer, OpState};
+use deno_core::{JsBuffer, OpState, op2};
 use shared::{
     error::{EngineError, ErrorCode},
     op_state::{AudioSender, HostOpState},
@@ -916,7 +916,7 @@ pub async fn op_audio_get_channel_data(
 ///
 /// `#[buffer]` ensures the result arrives as a real `Uint8Array` in JS
 /// (not a JSON-serialized number array), preserving `.buffer` / `.byteOffset`.
-#[op2(async(lazy),fast)]
+#[op2(async(lazy), fast)]
 #[buffer]
 pub async fn op_audio_get_all_channel_data(
     state: Rc<RefCell<OpState>>,

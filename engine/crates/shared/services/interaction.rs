@@ -23,16 +23,22 @@ pub trait InteractionService: Send + Sync {
 
     /// Show a loading indicator. `json`: `{"title","mask"}`
     fn show_loading(&self, _json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("showLoading:fail not supported"))
+        Err(ServiceError::not_supported(
+            "showLoading:fail not supported",
+        ))
     }
 
     /// Hide the current loading indicator.
     fn hide_loading(&self) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("hideLoading:fail not supported"))
+        Err(ServiceError::not_supported(
+            "hideLoading:fail not supported",
+        ))
     }
 
     /// Show an action sheet. `json`: `{"alertText","itemList","itemColor"}`
     fn show_action_sheet(&self, _json: &str) -> Result<(), ServiceError> {
-        Err(ServiceError::not_supported("showActionSheet:fail not supported"))
+        Err(ServiceError::not_supported(
+            "showActionSheet:fail not supported",
+        ))
     }
 }

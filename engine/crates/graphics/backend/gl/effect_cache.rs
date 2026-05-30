@@ -28,7 +28,7 @@ use std::cell::RefCell;
 use std::num::NonZeroUsize;
 
 use lru::LruCache;
-use skia_safe::{image_filters, gradient_shader, ImageFilter, PathEffect, Point, Shader, TileMode};
+use skia_safe::{ImageFilter, PathEffect, Point, Shader, TileMode, gradient_shader, image_filters};
 
 use shared::protocol::render_cmd::GradientStop;
 
@@ -226,7 +226,9 @@ pub fn get_or_build_linear_gradient(
             y0.to_bits(),
             x1.to_bits(),
             y1.to_bits(),
-            0, 0, 0,
+            0,
+            0,
+            0,
         ],
         alpha_bits: global_alpha.to_bits(),
         stops_addr: std::sync::Arc::as_ptr(stops) as usize,
@@ -302,7 +304,10 @@ pub fn get_or_build_conic_gradient(
             cx.to_bits(),
             cy.to_bits(),
             start_angle_rad.to_bits(),
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
         ],
         alpha_bits: global_alpha.to_bits(),
         stops_addr: std::sync::Arc::as_ptr(stops) as usize,
@@ -368,9 +373,7 @@ fn build_colors_positions(
     // samples pick it up automatically.
     let colors = stops
         .iter()
-        .map(|s| {
-            super::color::to_sk_color4f_modulated(s.color, global_alpha).to_color()
-        })
+        .map(|s| super::color::to_sk_color4f_modulated(s.color, global_alpha).to_color())
         .collect::<Vec<_>>();
     let positions = stops.iter().map(|s| s.offset.clamp(0.0, 1.0)).collect();
     Some((colors, positions))
@@ -430,7 +433,11 @@ mod tests {
         // so we can at least verify the cache doesn't grow past 1
         // entry after two identical requests.
         SHADOW_CACHE.with(|c| {
-            assert_eq!(c.borrow().len(), 1, "two identical requests produced two entries");
+            assert_eq!(
+                c.borrow().len(),
+                1,
+                "two identical requests produced two entries"
+            );
         });
         let _ = (a, b);
     }
@@ -444,7 +451,11 @@ mod tests {
         let _ = get_or_build_drop_shadow(0xFF00_0000, 8.0, 8.0, 2.0, 2.0).unwrap();
         let _ = get_or_build_drop_shadow(0xFF00_0000, 4.0, 4.0, 5.0, 2.0).unwrap();
         SHADOW_CACHE.with(|c| {
-            assert_eq!(c.borrow().len(), 4, "each distinct param tuple must occupy its own slot");
+            assert_eq!(
+                c.borrow().len(),
+                4,
+                "each distinct param tuple must occupy its own slot"
+            );
         });
     }
 
@@ -578,11 +589,9 @@ mod tests {
         let _g = guard();
         clear_all();
         let stops = simple_stops();
-        let _ =
-            get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0).expect("build");
+        let _ = get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0).expect("build");
         // Same Arc + same geometry must hit.
-        let _ =
-            get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0).expect("build");
+        let _ = get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0).expect("build");
         GRADIENT_CACHE.with(|c| {
             assert_eq!(c.borrow().len(), 1, "identical request must not grow cache");
         });
@@ -619,8 +628,7 @@ mod tests {
         clear_all();
         let stops = simple_stops();
         assert!(
-            get_or_build_radial_gradient(0.0, 0.0, 10.0, 50.0, 50.0, 100.0, &stops, 1.0)
-                .is_some()
+            get_or_build_radial_gradient(0.0, 0.0, 10.0, 50.0, 50.0, 100.0, &stops, 1.0).is_some()
         );
         assert!(get_or_build_conic_gradient(50.0, 50.0, 0.0, &stops, 1.0).is_some());
     }
@@ -634,14 +642,12 @@ mod tests {
             let stops = simple_stops();
 
             // First call: miss.
-            let _ = get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0)
-                .expect("build");
+            let _ = get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0).expect("build");
             assert_eq!(stats.gradient_misses.load(Ordering::Relaxed), 1);
             assert_eq!(stats.gradient_hits.load(Ordering::Relaxed), 0);
 
             // Second call with same Arc + same geometry: hit.
-            let _ = get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0)
-                .expect("build");
+            let _ = get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0).expect("build");
             assert_eq!(stats.gradient_misses.load(Ordering::Relaxed), 1);
             assert_eq!(stats.gradient_hits.load(Ordering::Relaxed), 1);
         });

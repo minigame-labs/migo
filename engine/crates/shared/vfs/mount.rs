@@ -27,8 +27,8 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -189,11 +189,7 @@ impl MountBackend for DirSource {
         // Only return Some when the target actually exists on disk.
         // Returning Some for non-existent paths would prevent overlay parent
         // directory synthesis from running in resolve().
-        if p.exists() {
-            Some(p)
-        } else {
-            None
-        }
+        if p.exists() { Some(p) } else { None }
     }
 
     fn root_dir(&self) -> Option<&Path> {
@@ -1008,6 +1004,34 @@ impl StagingArea {
     /// This is the pack-native install path — the runtime reads entries
     /// directly from the package file, never unpacking to a directory.
     pub fn install_package(
+        self,
+        mount_table: &MountTable,
+        pkg_filename: &str,
+        final_path: &Path,
+        mount_prefix: &str,
+        package_name: &str,
+        package_version: &str,
+    ) -> Result<super::package::PackageIdentity, io::Error> {
+        self.install_package_signed(
+            mount_table,
+            pkg_filename,
+            final_path,
+            mount_prefix,
+            package_name,
+            package_version,
+            None,
+            None,
+        )
+    }
+
+    /// Install a staged package, optionally verifying a host-supplied
+    /// manifest + signature pair against the runtime's registered
+    /// [`super::package::SignatureVerifier`]. Signatures are the trust
+    /// root for subpackage installs: without a verifier registered or
+    /// with a verifier present but validation failing, the package
+    /// never replaces a live mount.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_package_signed(
         mut self,
         mount_table: &MountTable,
         pkg_filename: &str,
@@ -1015,6 +1039,8 @@ impl StagingArea {
         mount_prefix: &str,
         package_name: &str,
         package_version: &str,
+        manifest: Option<&[u8]>,
+        signature: Option<&[u8]>,
     ) -> Result<super::package::PackageIdentity, io::Error> {
         let staged_pkg = self.staging_dir.join(pkg_filename);
         if !staged_pkg.exists() {
@@ -1028,6 +1054,18 @@ impl StagingArea {
         // This prevents a corrupted .mpkg from replacing a working version.
         super::package::validate_package(&staged_pkg, true)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        // Signature verification. We read the full package bytes
+        // (bounded by the ingest-time ExtractBudget that originally
+        // produced the .mpkg, so this is safe) and hand them to the
+        // host-registered verifier. The runtime refuses to proceed
+        // if verification fails; when no verifier has been registered
+        // at all, `verify_package_signature` logs a one-shot warning
+        // and accepts — that matches the pre-trust-chain behaviour so
+        // rollout can be gradual.
+        let pkg_bytes = std::fs::read(&staged_pkg)?;
+        super::package::verify_package_signature(&pkg_bytes, manifest, signature)
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
 
         // Ensure parent directory of final_path exists.
         if let Some(parent) = final_path.parent() {
@@ -1186,7 +1224,8 @@ impl PackageManifest {
 
     /// Record a newly installed package.
     pub fn record(&mut self, name: String, prefix: String, version: String) {
-        self.packages.insert(name, ManifestEntry { prefix, version });
+        self.packages
+            .insert(name, ManifestEntry { prefix, version });
     }
 }
 
@@ -1221,7 +1260,10 @@ pub fn restore_installed_packages(
     for (name, entry) in &manifest.packages {
         let pkg_path = store.join(format!("{name}.mpkg"));
         if !pkg_path.exists() {
-            tracing::warn!("manifest references missing package: {name} at {}", pkg_path.display());
+            tracing::warn!(
+                "manifest references missing package: {name} at {}",
+                pkg_path.display()
+            );
             continue;
         }
         match super::package::PackSource::open(&pkg_path, name, &entry.version) {
@@ -1233,7 +1275,10 @@ pub fn restore_installed_packages(
                 ) {
                     tracing::info!("restored package '{name}' at prefix '{}'", entry.prefix);
                 } else {
-                    tracing::warn!("failed to mount restored package '{name}' at '{}'", entry.prefix);
+                    tracing::warn!(
+                        "failed to mount restored package '{name}' at '{}'",
+                        entry.prefix
+                    );
                 }
             }
             Err(e) => {

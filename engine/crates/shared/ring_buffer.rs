@@ -104,7 +104,10 @@ impl<T, const CAPACITY: usize> SpscRing<T, CAPACITY> {
                 // Update metrics.
                 self.metrics.total_pushed.fetch_add(1, Ordering::Relaxed);
                 let pending = w + 1 - r;
-                let _ = self.metrics.max_pending.fetch_max(pending, Ordering::Relaxed);
+                let _ = self
+                    .metrics
+                    .max_pending
+                    .fetch_max(pending, Ordering::Relaxed);
                 return;
             }
 
@@ -118,9 +121,7 @@ impl<T, const CAPACITY: usize> SpscRing<T, CAPACITY> {
                 continue; // Space freed while we waited for the lock.
             }
             // Wait with 2ms timeout — prevents deadlock if consumer died.
-            let _ = self
-                .not_full
-                .wait_timeout(guard, Duration::from_millis(2));
+            let _ = self.not_full.wait_timeout(guard, Duration::from_millis(2));
         }
     }
 

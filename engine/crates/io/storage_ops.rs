@@ -232,7 +232,9 @@ pub fn storage_set_sync_with_scheduler(
 ) -> Result<(), EngineError> {
     let request = storage_mutate_request(RequestKind::Sync);
     scheduler
-        .run_sync(&request, move || storage_set(&dir, &key, &value, quota_bytes))
+        .run_sync(&request, move || {
+            storage_set(&dir, &key, &value, quota_bytes)
+        })
         .map_err(pool_err)?
 }
 
@@ -290,7 +292,10 @@ mod tests {
     fn set_get_remove_roundtrip() {
         let dir = fresh_dir();
         storage_set(dir.path(), "k", "v", QUOTA).unwrap();
-        assert_eq!(storage_get(dir.path(), "k", QUOTA).unwrap().as_deref(), Some("v"));
+        assert_eq!(
+            storage_get(dir.path(), "k", QUOTA).unwrap().as_deref(),
+            Some("v")
+        );
         storage_remove(dir.path(), "k", QUOTA).unwrap();
         assert_eq!(storage_get(dir.path(), "k", QUOTA).unwrap(), None);
     }
@@ -368,13 +373,9 @@ mod tests {
             QUOTA,
         )
         .unwrap();
-        let got = storage_get_sync_with_scheduler(
-            scheduler,
-            dir.path().to_path_buf(),
-            "k".into(),
-            QUOTA,
-        )
-        .unwrap();
+        let got =
+            storage_get_sync_with_scheduler(scheduler, dir.path().to_path_buf(), "k".into(), QUOTA)
+                .unwrap();
         assert_eq!(got.as_deref(), Some("v"));
     }
 

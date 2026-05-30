@@ -2,14 +2,14 @@ use std::{cell::RefCell, rc::Rc};
 
 use deno_core::{OpState, extension, op2};
 use deno_error::JsErrorBox;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use shared::{
     error::{EngineError, EngineResult, ErrorCode},
     op_state::{CanvasOpState, HostOpState},
     protocol::{
         render_cmd::{CanvasCmd, RenderCommand},
-        send_render_with_resp_async, send_render_with_resp_sync,
+        send_render_with_resp_async,
     },
     vfs::FileOp,
 };
@@ -19,7 +19,6 @@ use crate::io_state::IoSchedulerState;
 pub(crate) mod cache;
 mod inline_src;
 
-const OP_CREATE_IMAGE: &str = "canvas create image";
 const OP_LOAD_IMAGE: &str = "canvas load image";
 
 #[inline]
@@ -256,17 +255,17 @@ fn resolve_local_src(
 }
 
 #[op2(fast)]
-pub fn op_create_image(state: &mut OpState) -> u32 {
-    let ctx = state.borrow::<CanvasOpState>();
-    match send_render_with_resp_sync(ctx, OP_CREATE_IMAGE, |resp| {
-        RenderCommand::Canvas(CanvasCmd::CreateImage { resp })
-    }) {
-        Ok(id) => id,
-        Err(e) => {
-            error!("{OP_CREATE_IMAGE} failed: {:?}", e);
-            0
-        }
-    }
+pub fn op_create_image(_state: &mut OpState) -> u32 {
+    // Allocate the id directly from the process-global counter in
+    // `shared::image_id`.  Historically this op did a sync round-trip
+    // to the render thread to call `cm.generate_img_id()`, which was a
+    // pointless serialisation: the operation is a pure counter bump,
+    // but any busy render thread (e.g. mid-FramePacket) blocked
+    // `new Image()` in JS for the duration.  On the cocos shop scene
+    // first frame that was ~700 ms of head-of-line stall.  The render
+    // thread's `ImageStore::generate_id` reads from the same counter,
+    // so cross-thread allocation stays unique without coordination.
+    shared::image_id::next_image_id()
 }
 
 async fn op_load_image_inner(
@@ -276,7 +275,7 @@ async fn op_load_image_inner(
     target_width: Option<u32>,
     target_height: Option<u32>,
 ) -> EngineResult<(u32, (usize, usize))> {
-    let (scheduler, vfs, mount_table, game_cache_dir, gpu_caps) = {
+    let (scheduler, vfs, mount_table, game_cache_dir, gpu_caps, force_rgba_for_webgl) = {
         let op = state.borrow();
         let host = op.borrow::<HostOpState>();
         let gcd = host
@@ -289,6 +288,8 @@ async fn op_load_image_inner(
             host.mount_table.clone(),
             gcd,
             host.gpu_caps.snapshot(),
+            host.webgl_context_created
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     };
 
@@ -404,9 +405,21 @@ async fn op_load_image_inner(
                 let mut c = cache::IMAGE_CACHE.lock();
                 c.register_inflight_alias(image_id, shared_id);
             }
+            // H-6: pre-pin the io::global_cache slot before decode inserts
+            // RGBA bytes.  Without this, a cold WebGL image can be rejected by
+            // the W-TinyLFU admission filter before `finish_load()` has a
+            // chance to pin it as a live alias; texImage2D(image) then misses
+            // one frame later even though the Image object is alive.
+            let pre_pinned_io_key = if force_rgba_for_webgl {
+                let key = cache::to_io_cache_key(&cache_key);
+                io::global_cache().pin(&key);
+                Some(key)
+            } else {
+                None
+            };
             info!(
-                "op_load_image start loader: image_id={}, shared_id={}, src={}",
-                image_id, shared_id, src
+                "op_load_image start loader: image_id={}, shared_id={}, src={}, force_rgba_for_webgl={}",
+                image_id, shared_id, src, force_rgba_for_webgl
             );
 
             let decoded = match io::image_ops::read_image_rgba8(
@@ -419,6 +432,7 @@ async fn op_load_image_inner(
                 game_cache_dir.clone(),
                 gpu_caps,
                 mount_table.clone(),
+                force_rgba_for_webgl,
             )
             .await
             {
@@ -431,6 +445,11 @@ async fn op_load_image_inner(
                     );
                     let mut c = cache::IMAGE_CACHE.lock();
                     let _ = c.finish_load(image_id, shared_id, &cache_key, &cache_key, Err(msg));
+                    // Pre-pin must not survive decode failure: there
+                    // is no live alias and no upload to release it.
+                    if let Some(key) = pre_pinned_io_key.as_ref() {
+                        io::global_cache().unpin(key);
+                    }
                     return Err(e);
                 }
             };
@@ -443,9 +462,29 @@ async fn op_load_image_inner(
             );
             let img = decoded.image;
 
-            // For scaled RGBA decodes, store in IO cache.
-            // Compressed images skip the IO cache (fast to re-read).
+            // Store full-resolution + resized RGBA decodes in the
+            // io LRU.  `read_image_rgba8` already inserted the
+            // freshly decoded bytes; this second insert is a no-op
+            // for the common full-resolution case and only matters
+            // when callers pass explicit `target_width/height` that
+            // `read_image_rgba8` keyed differently from
+            // `actual_cache_key`.  Pin bookkeeping for both paths
+            // happens in `finish_load` below.
             if target_width.is_some() && target_height.is_some() {
+                if let shared::protocol::io_cmd::DecodedImage::Rgba(ref rgba) = img {
+                    io::global_cache()
+                        .insert(cache::to_io_cache_key(&actual_cache_key), rgba.clone());
+                }
+            }
+
+            // H-5: for *inline* RGBA decodes served by the local
+            // file path we also drop bytes into the io LRU so
+            // `op_tex_image_2d_from_image` can hit a single source
+            // of truth.  The full-resolution branch above only
+            // covers resized variants; without this additional
+            // insert, non-resized loads would never populate the
+            // LRU slot keyed on the full-res key.
+            if target_width.is_none() && target_height.is_none() {
                 if let shared::protocol::io_cmd::DecodedImage::Rgba(ref rgba) = img {
                     io::global_cache()
                         .insert(cache::to_io_cache_key(&actual_cache_key), rgba.clone());
@@ -465,7 +504,7 @@ async fn op_load_image_inner(
 
             let maybe_destroy = {
                 let mut c = cache::IMAGE_CACHE.lock();
-                match &res {
+                let destroy = match &res {
                     Ok((w, h)) => c.finish_load(
                         image_id,
                         shared_id,
@@ -480,7 +519,16 @@ async fn op_load_image_inner(
                         &actual_cache_key,
                         Err(engine_err_to_text(e)),
                     ),
+                };
+                // Balance the pre-pin taken before decode.  On success,
+                // `finish_load` has already taken the real alias pin (possibly
+                // on `actual_cache_key` if the mounted source remapped it).  On
+                // failure, there is no live alias and the pre-pin must not
+                // survive.
+                if let Some(key) = pre_pinned_io_key.as_ref() {
+                    io::global_cache().unpin(key);
                 }
+                destroy
             };
 
             if let Some(to_destroy) = maybe_destroy {
@@ -540,6 +588,27 @@ async fn upload_inline_image(
         DecodedImage::Compressed(c) => (c.width as i32, c.height as i32),
     };
 
+    // H-5: populate io::global_cache BEFORE moving `decoded`
+    // into the render command.  Data-URL and http(s):// paths
+    // previously skipped the LRU entirely, which made every later
+    // `texImage2D(image)` on those images a guaranteed cache miss
+    // → black texture.  We now insert exactly like local-file
+    // loads so the pin bookkeeping below covers all three load
+    // paths uniformly.
+    let pre_pinned_io_key = if matches!(decoded, DecodedImage::Rgba(_)) {
+        let key = cache::to_io_cache_key(&cache_key);
+        // Same live-resource invariant as the local-file path: pin before
+        // inserting so the admission filter cannot reject bytes for an Image
+        // that is already being loaded for WebGL use.
+        io::global_cache().pin(&key);
+        if let DecodedImage::Rgba(ref rgba) = decoded {
+            io::global_cache().insert(key.clone(), rgba.clone());
+        }
+        Some(key)
+    } else {
+        None
+    };
+
     let res = send_render_with_resp_async(&canvas_ctx, OP_LOAD_IMAGE, |resp| {
         RenderCommand::Canvas(CanvasCmd::LoadImage {
             image_id: shared_id,
@@ -552,7 +621,7 @@ async fn upload_inline_image(
 
     let maybe_destroy = {
         let mut c = cache::IMAGE_CACHE.lock();
-        match &res {
+        let destroy = match &res {
             Ok((actual_w, actual_h)) => c.finish_load(
                 image_id,
                 shared_id,
@@ -567,7 +636,11 @@ async fn upload_inline_image(
                 &cache_key,
                 Err(engine_err_to_text(e)),
             ),
+        };
+        if let Some(key) = pre_pinned_io_key.as_ref() {
+            io::global_cache().unpin(key);
         }
+        destroy
     };
 
     if let Some(to_destroy) = maybe_destroy {
@@ -623,14 +696,19 @@ async fn load_image_from_inline_bytes(
     // API >= 26) when the caller didn't ask for a resize.  AHB
     // buffers are opaque GPU handles, so the resize case still has
     // to go through the RGBA decoder.
+    let force_rgba_for_webgl = {
+        let op = _state.borrow();
+        op.borrow::<HostOpState>()
+            .webgl_context_created
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
     let decoded = match (target_width, target_height) {
-        (Some(tw), Some(th)) if tw > 0 && th > 0 => {
-            shared::protocol::io_cmd::DecodedImage::Rgba(
-                inline_src::decode_inline_bytes(
-                    &payload.bytes, hint, Some(tw), Some(th),
-                )?,
-            )
-        }
+        (Some(tw), Some(th)) if tw > 0 && th > 0 => shared::protocol::io_cmd::DecodedImage::Rgba(
+            inline_src::decode_inline_bytes(&payload.bytes, hint, Some(tw), Some(th))?,
+        ),
+        _ if force_rgba_for_webgl => shared::protocol::io_cmd::DecodedImage::Rgba(
+            inline_src::decode_inline_bytes(&payload.bytes, hint, None, None)?,
+        ),
         _ => inline_src::decode_inline_bytes_any(&payload.bytes, hint)?,
     };
 
@@ -725,23 +803,31 @@ async fn load_image_from_http(
     // so joiners unblock (mirrors the local-file error path).  AHB
     // fast path activates when no resize is requested; resize forces
     // the RGBA route because Hardware Buffers are opaque.
+    let state_for_decode_policy = state.clone();
     let result: EngineResult<shared::protocol::io_cmd::DecodedImage> = async {
         let bytes = inline_src::fetch_http_image(state, &src).await?;
+        let force_rgba_for_webgl = {
+            let op = state_for_decode_policy.borrow();
+            op.borrow::<HostOpState>()
+                .webgl_context_created
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
         match (target_width, target_height) {
-            (Some(tw), Some(th)) if tw > 0 && th > 0 => Ok(
-                shared::protocol::io_cmd::DecodedImage::Rgba(
+            (Some(tw), Some(th)) if tw > 0 && th > 0 => {
+                Ok(shared::protocol::io_cmd::DecodedImage::Rgba(
                     inline_src::decode_inline_bytes(&bytes, None, Some(tw), Some(th))?,
-                ),
-            ),
+                ))
+            }
+            _ if force_rgba_for_webgl => Ok(shared::protocol::io_cmd::DecodedImage::Rgba(
+                inline_src::decode_inline_bytes(&bytes, None, None, None)?,
+            )),
             _ => inline_src::decode_inline_bytes_any(&bytes, None),
         }
     }
     .await;
 
     match result {
-        Ok(decoded) => {
-            upload_inline_image(canvas_ctx, image_id, cache_key, decoded, &src).await
-        }
+        Ok(decoded) => upload_inline_image(canvas_ctx, image_id, cache_key, decoded, &src).await,
         Err(e) => {
             let msg = engine_err_to_text(&e);
             // Finish the load with error so any pending joiners unblock.
@@ -773,9 +859,17 @@ pub async fn op_load_image(
     } else {
         None
     };
-    op_load_image_inner(state, image_id, src, tw, th)
+    let started_at = std::time::Instant::now();
+    let result = op_load_image_inner(state, image_id, src.clone(), tw, th)
         .await
-        .map_err(js_err_from_engine)
+        .map_err(js_err_from_engine);
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    if elapsed_ms >= 50 {
+        tracing::warn!(
+            "[MigoPerf][LoadImage] op_load_image {elapsed_ms}ms image_id={image_id} src={src}"
+        );
+    }
+    result
 }
 
 /// `createImageBitmap(source, sx, sy, sw, sh[, {resizeWidth, resizeHeight}])`
@@ -819,7 +913,10 @@ async fn op_load_image_subrect_inner(
     use shared::protocol::io_cmd::DecodedImage;
 
     if sw == 0 || sh == 0 {
-        shared::bail!(ErrorCode::InvalidOperation, "createImageBitmap sub-rect has zero width/height");
+        shared::bail!(
+            ErrorCode::InvalidOperation,
+            "createImageBitmap sub-rect has zero width/height"
+        );
     }
 
     // Pull decoder / VFS / mount table handles in one borrow.
@@ -916,6 +1013,7 @@ async fn op_load_image_subrect_inner(
         game_cache_dir,
         gpu_caps,
         mount_table,
+        true,
     )
     .await?;
 
@@ -941,7 +1039,8 @@ async fn op_load_image_subrect_inner(
         ),
     };
     let cropped = io::crop_image(rgba, sx, sy, sw, sh)?;
-    let final_img = if resize_w > 0 && resize_h > 0
+    let final_img = if resize_w > 0
+        && resize_h > 0
         && (resize_w != cropped.width || resize_h != cropped.height)
     {
         io::resize_image(cropped, resize_w, resize_h)

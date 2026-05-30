@@ -17,11 +17,7 @@ use skia_safe::{BlendMode, Paint, Shader};
 /// Returns `None` when the kind is a flat colour, or when the gradient has
 /// fewer than two stops (spec-invalid, silently suppressed to match browser
 /// behaviour), or when a pattern image is not yet loaded.
-pub fn build_shader<R>(
-    kind: &StyleKind,
-    global_alpha: f32,
-    image_resolver: &R,
-) -> Option<Shader>
+pub fn build_shader<R>(kind: &StyleKind, global_alpha: f32, image_resolver: &R) -> Option<Shader>
 where
     R: PatternResolver,
 {
@@ -34,7 +30,12 @@ where
             y1,
             stops,
         } => super::effect_cache::get_or_build_linear_gradient(
-            *x0, *y0, *x1, *y1, stops, global_alpha,
+            *x0,
+            *y0,
+            *x1,
+            *y1,
+            stops,
+            global_alpha,
         ),
         StyleKind::RadialGradient {
             x0,
@@ -45,7 +46,14 @@ where
             r1,
             stops,
         } => super::effect_cache::get_or_build_radial_gradient(
-            *x0, *y0, *r0, *x1, *y1, *r1, stops, global_alpha,
+            *x0,
+            *y0,
+            *r0,
+            *x1,
+            *y1,
+            *r1,
+            stops,
+            global_alpha,
         ),
         StyleKind::ConicGradient {
             cx,
@@ -53,14 +61,17 @@ where
             start_angle,
             stops,
         } => super::effect_cache::get_or_build_conic_gradient(
-            *cx, *cy, *start_angle, stops, global_alpha,
+            *cx,
+            *cy,
+            *start_angle,
+            stops,
+            global_alpha,
         ),
         StyleKind::Pattern {
             image_id,
             repeat_x,
             repeat_y,
-        } => image_resolver
-            .resolve_pattern(*image_id, *repeat_x, *repeat_y, global_alpha),
+        } => image_resolver.resolve_pattern(*image_id, *repeat_x, *repeat_y, global_alpha),
     }
 }
 
@@ -126,10 +137,7 @@ pub fn apply_shadow_to_paint(paint: &mut Paint, state: &Canvas2DState) {
 }
 
 /// Build a `Paint` preset for the Canvas2D *fill* side.
-pub fn build_fill_paint<R: PatternResolver>(
-    state: &Canvas2DState,
-    resolver: &R,
-) -> Paint {
+pub fn build_fill_paint<R: PatternResolver>(state: &Canvas2DState, resolver: &R) -> Paint {
     let mut paint = Paint::default();
     paint.set_anti_alias(state.antialias);
     paint.set_style(skia_safe::paint::Style::Fill);
@@ -175,10 +183,7 @@ fn apply_style_alpha(paint: &mut Paint, kind: &StyleKind, global_alpha: f32) {
 }
 
 /// Build a `Paint` preset for the Canvas2D *stroke* side.
-pub fn build_stroke_paint<R: PatternResolver>(
-    state: &Canvas2DState,
-    resolver: &R,
-) -> Paint {
+pub fn build_stroke_paint<R: PatternResolver>(state: &Canvas2DState, resolver: &R) -> Paint {
     let mut paint = Paint::default();
     paint.set_anti_alias(state.antialias);
     paint.set_style(skia_safe::paint::Style::Stroke);

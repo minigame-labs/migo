@@ -10,7 +10,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::golden::{assert_matches_golden, GoldenCfg};
+use common::golden::{GoldenCfg, assert_matches_golden};
 use common::harness::{read_pixels_rgba8, with_raster_surface};
 use skia_safe::{Color, Color4f, Paint, Rect};
 

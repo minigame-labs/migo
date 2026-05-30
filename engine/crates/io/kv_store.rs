@@ -4,8 +4,9 @@
 //!
 //! * **Batched writes** are one transaction instead of N rename+fsync
 //!   pairs — measured >10× on the `setStorageBatch` fast path.
-//! * **Quota** is a single `SUM(size)` query instead of a directory
-//!   scan; a running total cached in `_meta` keeps it O(1).
+//! * **Quota** is O(1): the running total is cached in `_meta` under
+//!   key `total_bytes` and updated inside every write transaction,
+//!   so `set` / `set_batch` / `info` never scan the `kv` table.
 //! * **Crash-safety** comes from WAL + `synchronous=NORMAL`, which
 //!   is the combination SQLite itself recommends for KV workloads.
 //!   We never lose a committed write on power loss; at worst the
@@ -91,7 +92,15 @@ struct Inner {
     conn: Connection,
     path: PathBuf,
     quota_bytes: u64,
+    /// Running total of `size` across all rows in `kv`. Loaded once at
+    /// open time from `_meta.total_bytes` (or reconciled with
+    /// `SUM(size)` on first use if the value is missing / corrupt) and
+    /// updated inside every write transaction. This is the only
+    /// source-of-truth for quota checks; no read path does `SUM`.
+    total_bytes: u64,
 }
+
+const META_TOTAL_BYTES: &str = "total_bytes";
 
 impl KvStore {
     /// Open (creating if missing) the KV DB at `path`.
@@ -140,22 +149,36 @@ impl KvStore {
 
         migrate_to_current(&mut conn)?;
 
+        // Load (or reconcile) the cached total so every write/read
+        // path after this is O(1). If `_meta.total_bytes` is missing
+        // we do a single O(N) reconcile-SUM and persist the result;
+        // this is the only place in the KV store that scans `kv`.
+        let total_bytes = load_or_reconcile_total(&conn)?;
+
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 conn,
                 path,
                 quota_bytes,
+                total_bytes,
             })),
         })
     }
 
     /// Read the value for `key`, or `Ok(None)` if absent.
     pub fn get(&self, key: &str) -> Result<Option<String>, EngineError> {
+        let started = std::time::Instant::now();
         let g = self.inner.lock();
-        g.conn
-            .query_row("SELECT v FROM kv WHERE k = ?1", [key], |row| row.get::<_, String>(0))
+        let out = g
+            .conn
+            .query_row("SELECT v FROM kv WHERE k = ?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
             .optional()
-            .map_err(sql_err("kv: get"))
+            .map_err(sql_err("kv: get"));
+        shared::stats::io_metrics_global()
+            .record_op(shared::stats::OpClass::StorageGet, started.elapsed());
+        out
     }
 
     /// Write `value` under `key`, honouring the configured quota.
@@ -166,8 +189,17 @@ impl KvStore {
     /// exceed the quota the call returns `ResourceExhausted` and
     /// the DB is untouched.
     pub fn set(&self, key: &str, value: &str) -> Result<(), EngineError> {
+        let started = std::time::Instant::now();
+        let result = self.set_inner(key, value);
+        shared::stats::io_metrics_global()
+            .record_op(shared::stats::OpClass::StorageSet, started.elapsed());
+        result
+    }
+
+    fn set_inner(&self, key: &str, value: &str) -> Result<(), EngineError> {
         let mut g = self.inner.lock();
         let quota = g.quota_bytes;
+        let current_total = g.total_bytes;
         let tx = g
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -178,13 +210,12 @@ impl KvStore {
             .optional()
             .map_err(sql_err("kv: set: read old"))?
             .unwrap_or(0);
-        let total_bytes: i64 = tx
-            .query_row("SELECT COALESCE(SUM(size), 0) FROM kv", [], |r| r.get(0))
-            .map_err(sql_err("kv: set: sum"))?;
         let new_size = value.len() as i64;
-        // All fields are non-negative; saturating_sub avoids panic on
-        // a hypothetical corrupt row with negative size.
-        let projected = (total_bytes as u64).saturating_sub(old_size as u64) + new_size as u64;
+        // `total_bytes` is always non-negative; saturating_sub avoids
+        // panic on a hypothetical corrupt row with negative size.
+        let projected = current_total
+            .saturating_sub(old_size as u64)
+            .saturating_add(new_size as u64);
         if projected > quota {
             return Err(EngineError::new(ErrorCode::OutOfMemory)
                 .with_msg("setStorage:fail storage limit exceeded")
@@ -201,7 +232,11 @@ impl KvStore {
             params![key, value, new_size, now_ms()],
         )
         .map_err(sql_err("kv: set: upsert"))?;
+        persist_total_in_tx(&tx, projected)?;
         tx.commit().map_err(sql_err("kv: set: commit"))?;
+        // Update cache only after the commit succeeded; otherwise a
+        // failed commit would leave the cached total ahead of the DB.
+        g.total_bytes = projected;
         Ok(())
     }
 
@@ -215,17 +250,16 @@ impl KvStore {
         }
         let mut g = self.inner.lock();
         let quota = g.quota_bytes;
+        let current_total = g.total_bytes;
         let tx = g
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_err("kv: batch: begin"))?;
 
-        // Project the new total: replace-aware, so a key that appears
-        // in the batch overwrites any existing row without adding it.
-        let mut projected: i64 = tx
-            .query_row("SELECT COALESCE(SUM(size), 0) FROM kv", [], |r| r.get(0))
-            .map_err(sql_err("kv: batch: sum"))?;
-
+        // Project the new total against the cached value. We must
+        // look up each incoming key's old size to handle overwrites
+        // correctly, but we never run `SUM(size)`.
+        let mut projected: i128 = current_total as i128;
         {
             let mut q = tx
                 .prepare_cached("SELECT size FROM kv WHERE k = ?1")
@@ -236,11 +270,11 @@ impl KvStore {
                     .optional()
                     .map_err(sql_err("kv: batch: size"))?
                     .unwrap_or(0);
-                projected = projected - old + v.len() as i64;
+                projected = projected - old as i128 + v.len() as i128;
             }
         }
 
-        if projected > quota as i64 {
+        if projected < 0 || projected as u128 > quota as u128 {
             return Err(EngineError::new(ErrorCode::OutOfMemory)
                 .with_msg("setStorageBatch:fail storage limit exceeded")
                 .with_detail(format!(
@@ -248,6 +282,7 @@ impl KvStore {
                     projected, quota
                 )));
         }
+        let projected = projected as u64;
 
         {
             let mut up = tx
@@ -263,16 +298,31 @@ impl KvStore {
                     .map_err(sql_err("kv: batch: upsert"))?;
             }
         }
+        persist_total_in_tx(&tx, projected)?;
         tx.commit().map_err(sql_err("kv: batch: commit"))?;
+        g.total_bytes = projected;
         Ok(())
     }
 
     /// Remove `key` if present. No error on missing key.
     pub fn remove(&self, key: &str) -> Result<(), EngineError> {
-        let g = self.inner.lock();
-        g.conn
-            .execute("DELETE FROM kv WHERE k = ?1", [key])
+        let mut g = self.inner.lock();
+        let current_total = g.total_bytes;
+        let tx = g
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err("kv: remove: begin"))?;
+        let old_size: i64 = tx
+            .query_row("SELECT size FROM kv WHERE k = ?1", [key], |r| r.get(0))
+            .optional()
+            .map_err(sql_err("kv: remove: read old"))?
+            .unwrap_or(0);
+        tx.execute("DELETE FROM kv WHERE k = ?1", [key])
             .map_err(sql_err("kv: remove"))?;
+        let new_total = current_total.saturating_sub(old_size as u64);
+        persist_total_in_tx(&tx, new_total)?;
+        tx.commit().map_err(sql_err("kv: remove: commit"))?;
+        g.total_bytes = new_total;
         Ok(())
     }
 
@@ -280,10 +330,16 @@ impl KvStore {
     /// because SQLite takes the truncate-optimisation path when a
     /// WHERE clause is absent.
     pub fn clear(&self) -> Result<(), EngineError> {
-        let g = self.inner.lock();
-        g.conn
-            .execute("DELETE FROM kv", [])
+        let mut g = self.inner.lock();
+        let tx = g
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err("kv: clear: begin"))?;
+        tx.execute("DELETE FROM kv", [])
             .map_err(sql_err("kv: clear"))?;
+        persist_total_in_tx(&tx, 0)?;
+        tx.commit().map_err(sql_err("kv: clear: commit"))?;
+        g.total_bytes = 0;
         Ok(())
     }
 
@@ -291,7 +347,19 @@ impl KvStore {
     ///
     /// Ordering is deterministic (`updated_at DESC, k ASC`) so
     /// callers that diff consecutive snapshots see stable output.
+    ///
+    /// `current_bytes` is read from the cached `_meta.total_bytes`
+    /// value maintained by every write path, so this call is O(N keys)
+    /// only in the key-listing pass, never in the totals pass.
     pub fn info(&self) -> Result<KvInfo, EngineError> {
+        let started = std::time::Instant::now();
+        let result = self.info_inner();
+        shared::stats::io_metrics_global()
+            .record_op(shared::stats::OpClass::StorageInfo, started.elapsed());
+        result
+    }
+
+    fn info_inner(&self) -> Result<KvInfo, EngineError> {
         let g = self.inner.lock();
         let mut stmt = g
             .conn
@@ -304,13 +372,9 @@ impl KvStore {
         for row in rows {
             keys.push(row.map_err(sql_err("kv: info: row"))?);
         }
-        let current_bytes: i64 = g
-            .conn
-            .query_row("SELECT COALESCE(SUM(size), 0) FROM kv", [], |r| r.get(0))
-            .map_err(sql_err("kv: info: sum"))?;
         Ok(KvInfo {
             keys,
-            current_bytes: current_bytes as u64,
+            current_bytes: g.total_bytes,
             limit_bytes: g.quota_bytes,
         })
     }
@@ -347,9 +411,7 @@ fn migrate_to_current(conn: &mut Connection) -> Result<(), EngineError> {
     }
 
     // v0 -> v1: initial schema.
-    let tx = conn
-        .transaction()
-        .map_err(sql_err("kv: migrate begin"))?;
+    let tx = conn.transaction().map_err(sql_err("kv: migrate begin"))?;
     tx.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS kv (
@@ -392,6 +454,57 @@ fn sql_err(ctx: &'static str) -> impl Fn(rusqlite::Error) -> EngineError {
             .with_msg(ctx)
             .with_detail(e.to_string())
     }
+}
+
+/// Persist `total_bytes` into the `_meta` table as part of the caller's
+/// write transaction, so commit atomicity covers both the row change
+/// and the cached total.
+fn persist_total_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    total_bytes: u64,
+) -> Result<(), EngineError> {
+    tx.execute(
+        "INSERT INTO _meta(k, v) VALUES (?1, ?2) \
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        params![META_TOTAL_BYTES, total_bytes.to_string()],
+    )
+    .map_err(sql_err("kv: meta: set total"))?;
+    Ok(())
+}
+
+/// On open, read the cached running total from `_meta.total_bytes`. If
+/// it's missing or corrupt (e.g. the DB was written by an older binary
+/// that never maintained the cache), fall back to a single
+/// reconciliation `SUM(size)` and persist the result so subsequent
+/// opens are O(1).
+fn load_or_reconcile_total(conn: &Connection) -> Result<u64, EngineError> {
+    let cached: Option<String> = conn
+        .query_row(
+            "SELECT v FROM _meta WHERE k = ?1",
+            [META_TOTAL_BYTES],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql_err("kv: meta: get total"))?;
+
+    if let Some(s) = cached {
+        if let Ok(n) = s.parse::<u64>() {
+            return Ok(n);
+        }
+    }
+
+    // Missing or corrupt — reconcile once.
+    let reconciled: i64 = conn
+        .query_row("SELECT COALESCE(SUM(size), 0) FROM kv", [], |r| r.get(0))
+        .map_err(sql_err("kv: meta: reconcile sum"))?;
+    let reconciled = reconciled.max(0) as u64;
+    conn.execute(
+        "INSERT INTO _meta(k, v) VALUES (?1, ?2) \
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        params![META_TOTAL_BYTES, reconciled.to_string()],
+    )
+    .map_err(sql_err("kv: meta: persist reconciled total"))?;
+    Ok(reconciled)
 }
 
 // ---------------------------------------------------------------------------
@@ -483,7 +596,11 @@ mod tests {
         // One more byte should push us over.
         let err = kv.set("overflow", &"y".repeat(100)).unwrap_err();
         assert_eq!(err.code, ErrorCode::OutOfMemory);
-        assert_eq!(kv.get("overflow").unwrap(), None, "aborted write must not leak");
+        assert_eq!(
+            kv.get("overflow").unwrap(),
+            None,
+            "aborted write must not leak"
+        );
     }
 
     #[test]
@@ -581,6 +698,54 @@ mod tests {
         assert_eq!(kv.get(evil).unwrap().as_deref(), Some("still here"));
         // The kv table must still exist.
         assert!(kv.info().is_ok());
+    }
+
+    #[test]
+    fn total_bytes_stays_in_sync_across_operations() {
+        let dir = tempdir().unwrap();
+        let kv = open(dir.path());
+        kv.set("a", "aa").unwrap();
+        kv.set("b", "bbb").unwrap();
+        assert_eq!(kv.info().unwrap().current_bytes, 5);
+        kv.set("a", "aaaaa").unwrap();
+        assert_eq!(kv.info().unwrap().current_bytes, 8);
+        kv.remove("b").unwrap();
+        assert_eq!(kv.info().unwrap().current_bytes, 5);
+        kv.set_batch(&[("c", "cc"), ("d", "d")]).unwrap();
+        assert_eq!(kv.info().unwrap().current_bytes, 8);
+        kv.clear().unwrap();
+        assert_eq!(kv.info().unwrap().current_bytes, 0);
+    }
+
+    #[test]
+    fn reopen_reuses_cached_total_without_rescanning() {
+        let dir = tempdir().unwrap();
+        {
+            let kv = open(dir.path());
+            kv.set("k", "hello").unwrap();
+        }
+        // Reopen: the cached total must survive the process boundary.
+        let kv = open(dir.path());
+        assert_eq!(kv.info().unwrap().current_bytes, 5);
+    }
+
+    #[test]
+    fn missing_meta_total_reconciles_on_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage.db");
+        {
+            let kv = KvStore::open(&path, QUOTA).unwrap();
+            kv.set("a", "12345").unwrap();
+            kv.checkpoint().unwrap();
+        }
+        // Simulate an older binary that never wrote `_meta.total_bytes`.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("DELETE FROM _meta WHERE k = 'total_bytes'", [])
+                .unwrap();
+        }
+        let kv = KvStore::open(&path, QUOTA).unwrap();
+        assert_eq!(kv.info().unwrap().current_bytes, 5);
     }
 
     #[test]

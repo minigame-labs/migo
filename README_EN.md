@@ -95,13 +95,15 @@ public class GameActivity extends Activity {
             @Override
             public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
                 if (session != null) {
-                    session.updateSurface(holder.getSurface());
+                    session.updateSurface(holder.getSurface(), width, height);
                 }
             }
 
             @Override
             public void surfaceDestroyed(SurfaceHolder holder) {
-                // Keep session alive, only clean up in onDestroy
+                if (session != null) {
+                    session.onSurfaceDestroyed();
+                }
             }
         });
     }

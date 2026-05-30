@@ -2,8 +2,8 @@
 //!
 //! Enable with `#[cfg(test)]` -- this module is only compiled for tests.
 
-use std::sync::Arc;
 use crate::services::*;
+use std::sync::Arc;
 
 /// Mock implementation of all DeviceServices sub-traits.
 ///
@@ -463,9 +463,10 @@ mod tests {
 
     #[test]
     fn builder_sets_battery_service() {
-        let mock = MockDeviceServices::new()
-            .with_battery(Arc::new(StubBattery));
-        let svc = mock.battery().expect("battery should be Some after with_battery");
+        let mock = MockDeviceServices::new().with_battery(Arc::new(StubBattery));
+        let svc = mock
+            .battery()
+            .expect("battery should be Some after with_battery");
         let info = svc.get_info_json().unwrap();
         assert!(info.contains("42"));
     }
@@ -479,9 +480,10 @@ mod tests {
 
     #[test]
     fn builder_sets_clipboard_service() {
-        let mock = MockDeviceServices::new()
-            .with_clipboard(Arc::new(StubClipboard));
-        let svc = mock.clipboard().expect("clipboard should be Some after with_clipboard");
+        let mock = MockDeviceServices::new().with_clipboard(Arc::new(StubClipboard));
+        let svc = mock
+            .clipboard()
+            .expect("clipboard should be Some after with_clipboard");
         assert_eq!(svc.get_data().unwrap(), "clipboard-content");
     }
 

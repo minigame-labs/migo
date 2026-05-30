@@ -5,9 +5,8 @@
 //! On Android, a platform-native decoder (BitmapFactory via JNI) can be
 //! registered at init time via `register_platform_decoder()`.
 
-use std::sync::OnceLock;
-#[cfg(feature = "rust-image-decode")]
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use shared::{
     error::{EngineError, ErrorCode},
@@ -33,8 +32,7 @@ static PLATFORM_DECODER: OnceLock<fn(&[u8]) -> Result<NormalizedImage, EngineErr
 /// OOM, AHB alloc refused by driver); on failure we transparently
 /// retry via [`PLATFORM_DECODER`] so the caller sees either a valid
 /// image or a single error, never a silent downgrade.
-static PLATFORM_AHB_DECODER: OnceLock<fn(&[u8]) -> Result<AhbImage, EngineError>> =
-    OnceLock::new();
+static PLATFORM_AHB_DECODER: OnceLock<fn(&[u8]) -> Result<AhbImage, EngineError>> = OnceLock::new();
 
 pub fn register_platform_decoder(f: fn(&[u8]) -> Result<NormalizedImage, EngineError>) {
     if PLATFORM_DECODER.set(f).is_ok() {
@@ -203,20 +201,45 @@ fn probe_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 ///
 /// # Returns
 /// `NormalizedImage` with RGBA8 pixel data
+///
+/// # Supported formats / compatibility matrix
+///
+/// | Format              | Animation | Behaviour                                    |
+/// |---------------------|-----------|----------------------------------------------|
+/// | JPEG                | N/A       | Full support, EXIF orientation auto-applied  |
+/// | PNG                 | N/A       | Full support                                 |
+/// | APNG (animated PNG) | No        | **First frame only** (zune/image limitation) |
+/// | GIF (animated)      | No        | **First frame only**                         |
+/// | WebP (lossy/lossless) | N/A     | Full support                                 |
+/// | WebP (animated)     | No        | **First frame only**                         |
+/// | BMP / TIFF          | N/A       | Depends on `image` crate fallback            |
+///
+/// Animated formats decode to a single still image. A multi-frame
+/// pipeline (frame timing, disposal handling, per-frame cache) would
+/// need to live above this function; at the moment `Image.src` treats
+/// every source as a static bitmap. Games that need animation should
+/// render frames themselves from a sprite atlas.
 pub fn decode_image_fast(
     data: &[u8],
     _path_hint: Option<&str>,
 ) -> Result<NormalizedImage, EngineError> {
+    // Sniff EXIF orientation *before* we hand bytes off to a decoder
+    // that might either drop the metadata (zune) or interpret it
+    // differently (platform BitmapFactory). We apply rotation/flip
+    // ourselves so every decode path produces pixels that match the
+    // way a camera-shot JPEG is meant to be displayed.
+    let orientation = detect_jpeg_exif_orientation(data).unwrap_or(1);
+
     // Priority: Rust-native decoders first (zero JNI, zero Java Heap),
     // platform decoder (BitmapFactory) as last resort.
     #[cfg(feature = "rust-image-decode")]
     {
         match decode_with_zune(data) {
-            Ok(img) => return Ok(img),
+            Ok(img) => return Ok(apply_exif_orientation(img, orientation)),
             Err(_zune_err) => {
-                // zune failed — try image crate before falling back to platform.
+                // zune failed; try image crate before falling back to platform.
                 match decode_with_image_crate(data) {
-                    Ok(img) => return Ok(img),
+                    Ok(img) => return Ok(apply_exif_orientation(img, orientation)),
                     Err(_img_err) => {
                         tracing::debug!(
                             "Rust decoders failed (zune: {_zune_err}, image: {_img_err}), trying platform"
@@ -229,11 +252,176 @@ pub fn decode_image_fast(
 
     // Platform decoder fallback (e.g., Android BitmapFactory via JNI).
     if let Some(decoder) = PLATFORM_DECODER.get() {
-        return decoder(data);
+        let img = decoder(data)?;
+        return Ok(apply_exif_orientation(img, orientation));
     }
 
     Err(EngineError::new(ErrorCode::ImageReadError)
         .with_detail("no image decoder available (all decoders failed or not registered)"))
+}
+
+/// Parse just enough of a JPEG to extract the EXIF `Orientation` tag
+/// (TIFF tag 0x0112). Returns `Some(1..=8)` on success.
+///
+/// We don't bring in a full EXIF crate because we only care about one
+/// tag and the rest of the metadata (GPS, maker notes, …) has no
+/// privacy- or correctness-impacting role in a game runtime.
+fn detect_jpeg_exif_orientation(data: &[u8]) -> Option<u8> {
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None; // not JPEG
+    }
+    let mut i = 2;
+    while i + 4 < data.len() {
+        if data[i] != 0xFF {
+            return None;
+        }
+        // Skip fill bytes (FF FF ... sequences).
+        let mut marker_i = i + 1;
+        while marker_i < data.len() && data[marker_i] == 0xFF {
+            marker_i += 1;
+        }
+        let marker = *data.get(marker_i)?;
+        i = marker_i + 1;
+        // SOS (0xDA) marks start of compressed data; EXIF is always before it.
+        if marker == 0xDA || marker == 0xD9 {
+            return None;
+        }
+        if i + 2 > data.len() {
+            return None;
+        }
+        let seg_len = ((data[i] as usize) << 8) | (data[i + 1] as usize);
+        if seg_len < 2 || i + seg_len > data.len() {
+            return None;
+        }
+        let seg = &data[i + 2..i + seg_len];
+        i += seg_len;
+        // Look for APP1 with "Exif\0\0" prefix.
+        if marker == 0xE1 && seg.len() > 6 && &seg[0..6] == b"Exif\0\0" {
+            let tiff = &seg[6..];
+            if tiff.len() < 8 {
+                return None;
+            }
+            let (little, magic_ok) = match &tiff[0..2] {
+                b"II" => (true, tiff[2] == 0x2A && tiff[3] == 0x00),
+                b"MM" => (false, tiff[2] == 0x00 && tiff[3] == 0x2A),
+                _ => return None,
+            };
+            if !magic_ok {
+                return None;
+            }
+            let ifd_offset = if little {
+                u32::from_le_bytes([tiff[4], tiff[5], tiff[6], tiff[7]]) as usize
+            } else {
+                u32::from_be_bytes([tiff[4], tiff[5], tiff[6], tiff[7]]) as usize
+            };
+            if ifd_offset + 2 > tiff.len() {
+                return None;
+            }
+            let entry_count = if little {
+                u16::from_le_bytes([tiff[ifd_offset], tiff[ifd_offset + 1]])
+            } else {
+                u16::from_be_bytes([tiff[ifd_offset], tiff[ifd_offset + 1]])
+            } as usize;
+            let entries_start = ifd_offset + 2;
+            for e in 0..entry_count {
+                let off = entries_start + e * 12;
+                if off + 12 > tiff.len() {
+                    break;
+                }
+                let tag = if little {
+                    u16::from_le_bytes([tiff[off], tiff[off + 1]])
+                } else {
+                    u16::from_be_bytes([tiff[off], tiff[off + 1]])
+                };
+                if tag == 0x0112 {
+                    // Orientation is SHORT (type=3) in bytes 8..10.
+                    let val = if little {
+                        u16::from_le_bytes([tiff[off + 8], tiff[off + 9]])
+                    } else {
+                        u16::from_be_bytes([tiff[off + 8], tiff[off + 9]])
+                    };
+                    if (1..=8).contains(&val) {
+                        return Some(val as u8);
+                    }
+                    return None;
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Apply an EXIF `Orientation` value to an already-decoded RGBA8
+/// image, producing a visually-correct buffer. Values 1..8 follow the
+/// TIFF spec:
+///
+/// | value | meaning                       |
+/// |-------|-------------------------------|
+/// | 1     | Normal                        |
+/// | 2     | Flip horizontal               |
+/// | 3     | Rotate 180                    |
+/// | 4     | Flip vertical                 |
+/// | 5     | Transpose (flip along TL-BR)  |
+/// | 6     | Rotate 90 CW                  |
+/// | 7     | Transverse (flip along TR-BL) |
+/// | 8     | Rotate 90 CCW                 |
+fn apply_exif_orientation(img: NormalizedImage, orientation: u8) -> NormalizedImage {
+    if orientation <= 1 || orientation > 8 {
+        return img;
+    }
+    let NormalizedImage {
+        width,
+        height,
+        rgba,
+    } = img;
+    let w = width as usize;
+    let h = height as usize;
+    let src: &[u8] = rgba.as_ref();
+    if src.len() != w * h * 4 {
+        return NormalizedImage {
+            width,
+            height,
+            rgba,
+        }; // malformed; leave untouched
+    }
+    let mut dst = vec![0u8; src.len()];
+
+    // Helper to write pixel (x, y) of the output buffer from
+    // source position (sx, sy). `out_w` is the output width.
+    let mut put = |out_w: usize, x: usize, y: usize, sx: usize, sy: usize| {
+        let si = (sy * w + sx) * 4;
+        let di = (y * out_w + x) * 4;
+        dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+    };
+
+    let (new_w, new_h) = match orientation {
+        5 | 6 | 7 | 8 => (height, width), // 90 CW / 90 CCW / transverse / transpose
+        _ => (width, height),
+    };
+    let new_w_usize = new_w as usize;
+
+    for y in 0..h {
+        for x in 0..w {
+            let (nx, ny) = match orientation {
+                2 => (w - 1 - x, y),
+                3 => (w - 1 - x, h - 1 - y),
+                4 => (x, h - 1 - y),
+                5 => (y, x),                 // transpose
+                6 => (h - 1 - y, x),         // rotate 90 CW
+                7 => (h - 1 - y, w - 1 - x), // transverse
+                8 => (y, w - 1 - x),         // rotate 90 CCW
+                _ => (x, y),
+            };
+            put(new_w_usize, nx, ny, x, y);
+        }
+    }
+
+    NormalizedImage {
+        width: new_w,
+        height: new_h,
+        rgba: Arc::new(dst),
+    }
 }
 
 /// Decode to the best available representation: prefers the AHB
@@ -257,19 +445,64 @@ pub fn decode_image_to_any(
         match ahb_decoder(data) {
             Ok(ahb) => return Ok(DecodedImage::HardwareBuffer(ahb)),
             Err(e) => {
-                // AHB decode failed (OOM, AHB alloc refused, API<30,
-                // etc.). Bump the observability counter and fall
-                // through — the caller still gets a valid image via
-                // the RGBA path.
-                shared::stats::io_metrics_global()
-                    .decoder_fallback_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::debug!("AHB decode failed, falling back to RGBA: {e:?}");
+                // AHB decode failed. Bump the total counter and the
+                // per-reason bucket so operators can see at a glance
+                // *why* the zero-copy path didn't engage (format,
+                // hardware, size, etc.) without re-running traces.
+                let reason = classify_ahb_fallback(&e);
+                shared::stats::io_metrics_global().record_ahb_fallback(reason);
+                tracing::debug!("AHB decode failed ({reason:?}), falling back to RGBA: {e:?}");
             }
         }
     }
 
     decode_image_fast(data, path_hint).map(DecodedImage::Rgba)
+}
+
+/// Best-effort classifier mapping an AHB decode error into a
+/// [`shared::stats::AhbFallbackReason`]. The AHB decoder is platform-
+/// specific and doesn't expose a typed error taxonomy, so we pattern-
+/// match on the error's detail / msg / code fields.
+fn classify_ahb_fallback(e: &EngineError) -> shared::stats::AhbFallbackReason {
+    use shared::stats::AhbFallbackReason::*;
+    let detail = e.detail.as_deref().unwrap_or("").to_ascii_lowercase();
+    let msg = e.msg.as_ref().to_ascii_lowercase();
+    let haystack = format!("{detail} {msg}");
+
+    // Order matters: "too large" wins over generic "decoder" because
+    // the native AHB path surfaces size rejections as decoder errors.
+    if haystack.contains("too large")
+        || haystack.contains("too big")
+        || haystack.contains("exceeds")
+        || haystack.contains("size limit")
+        || haystack.contains("max dimension")
+    {
+        return TooLarge;
+    }
+    if haystack.contains("unsupported format")
+        || haystack.contains("unsupported codec")
+        || haystack.contains("no decoder")
+        || haystack.contains("unknown mime")
+    {
+        return UnsupportedFormat;
+    }
+    if haystack.contains("hardwarebuffer")
+        || haystack.contains("ahardwarebuffer")
+        || haystack.contains("ahb_alloc")
+        || haystack.contains("no hardware buffer")
+        || haystack.contains("api level")
+        || haystack.contains("unsupported device")
+    {
+        return HardwareBufferUnavailable;
+    }
+    if haystack.contains("decoder")
+        || haystack.contains("imagedecoder")
+        || haystack.contains("corrupt")
+        || haystack.contains("malformed")
+    {
+        return DecoderRejected;
+    }
+    Unknown
 }
 
 /// Decode using zune-image (fast, SIMD-optimized).
@@ -403,10 +636,12 @@ pub fn crop_image(
             .with_detail(format!("crop: {} pixels * 4 bytes overflows usize", pixels))
     })?;
     if bytes > MAX_SUBRECT_BYTES {
-        return Err(EngineError::new(ErrorCode::OutOfMemory).with_detail(format!(
-            "crop: {}x{} ({} bytes) exceeds MAX_SUBRECT_BYTES={}",
-            sw, sh, bytes, MAX_SUBRECT_BYTES
-        )));
+        return Err(
+            EngineError::new(ErrorCode::OutOfMemory).with_detail(format!(
+                "crop: {}x{} ({} bytes) exceeds MAX_SUBRECT_BYTES={}",
+                sw, sh, bytes, MAX_SUBRECT_BYTES
+            )),
+        );
     }
 
     let out_w = sw as i32;
@@ -426,10 +661,8 @@ pub fn crop_image(
         let row_bytes_src = (src_w as usize) * 4;
         let row_bytes_dst = (out_w as usize) * 4;
         for y in intersect_y0..intersect_y1 {
-            let src_row_start = (y as usize) * row_bytes_src
-                + (intersect_x0 as usize) * 4;
-            let src_row_end = (y as usize) * row_bytes_src
-                + (intersect_x1 as usize) * 4;
+            let src_row_start = (y as usize) * row_bytes_src + (intersect_x0 as usize) * 4;
+            let src_row_end = (y as usize) * row_bytes_src + (intersect_x1 as usize) * 4;
             let dst_y = (y - sy) as usize;
             let dst_x = (intersect_x0 - sx) as usize;
             let dst_start = dst_y * row_bytes_dst + dst_x * 4;
@@ -484,7 +717,8 @@ pub fn resize_image(img: NormalizedImage, target_w: u32, target_h: u32) -> Norma
         }
     };
 
-    let resized = image::imageops::resize(&src, new_w, new_h, image::imageops::FilterType::Triangle);
+    let resized =
+        image::imageops::resize(&src, new_w, new_h, image::imageops::FilterType::Triangle);
     NormalizedImage {
         width: new_w,
         height: new_h,
@@ -595,10 +829,12 @@ mod crop_tests {
         let img = checkerboard(4, 4);
         // 65536 x 65536 x 4 = 16 GiB; exceeds MAX_SUBRECT_BYTES on
         // every target, so this also validates the size-cap path.
-        let err = crop_image(img, 0, 0, 65_536, 65_536)
-            .expect_err("huge crop must be rejected");
+        let err = crop_image(img, 0, 0, 65_536, 65_536).expect_err("huge crop must be rejected");
         assert!(
-            matches!(err.code, ErrorCode::InvalidArgument | ErrorCode::OutOfMemory),
+            matches!(
+                err.code,
+                ErrorCode::InvalidArgument | ErrorCode::OutOfMemory
+            ),
             "unexpected code: {:?}",
             err.code
         );
@@ -608,8 +844,8 @@ mod crop_tests {
     fn crop_rejects_above_max_subrect_bytes() {
         // 8192 x 8192 x 4 = 256 MiB > MAX_SUBRECT_BYTES (128 MiB).
         let img = checkerboard(4, 4);
-        let err = crop_image(img, 0, 0, 8192, 8192)
-            .expect_err("> MAX_SUBRECT_BYTES must be rejected");
+        let err =
+            crop_image(img, 0, 0, 8192, 8192).expect_err("> MAX_SUBRECT_BYTES must be rejected");
         assert_eq!(err.code, ErrorCode::OutOfMemory);
     }
 
@@ -672,7 +908,8 @@ mod crop_tests {
                     &out.rgba[i..i + 4],
                     &[0, 0, 0, 0],
                     "OOB pixel at ({}, {}) not transparent",
-                    x, y
+                    x,
+                    y
                 );
             }
         }

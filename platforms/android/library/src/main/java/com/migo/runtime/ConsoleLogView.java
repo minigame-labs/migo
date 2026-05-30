@@ -1,6 +1,8 @@
 package com.migo.runtime;
 
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
@@ -22,6 +24,7 @@ import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.migo.runtime.internal.NativeBridge;
 
@@ -325,6 +328,19 @@ public class ConsoleLogView {
         });
         bar.addView(clearBtn);
 
+        TextView copyBtn = new TextView(context);
+        copyBtn.setText("Copy");
+        copyBtn.setTextColor(TAB_ACTIVE_COLOR);
+        copyBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        copyBtn.setPadding(dpToPx(8), dpToPx(4), dpToPx(8), dpToPx(4));
+        copyBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyVisibleLogsToClipboard();
+            }
+        });
+        bar.addView(copyBtn);
+
         // Spacer
         View spacer = new View(context);
         bar.addView(spacer, new LinearLayout.LayoutParams(0,
@@ -514,6 +530,34 @@ public class ConsoleLogView {
         }
 
         return tv;
+    }
+
+    // ==================== Clipboard ====================
+
+    private void copyVisibleLogsToClipboard() {
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (LogEntry entry : allLogs) {
+            if (!matchesTab(entry.level)) continue;
+            String time = timeFmt.format(new Date(entry.timestamp));
+            String tag;
+            switch (entry.level) {
+                case 0:  tag = "[D]"; break;
+                case 2:  tag = "[W]"; break;
+                case 3:  tag = "[E]"; break;
+                default: tag = "[I]"; break;
+            }
+            sb.append(time).append(' ').append(tag).append(' ').append(entry.message).append('\n');
+            count++;
+        }
+
+        ClipboardManager cm = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm == null) {
+            Toast.makeText(context, "Clipboard unavailable", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        cm.setPrimaryClip(ClipData.newPlainText("vConsole", sb.toString()));
+        Toast.makeText(context, "Copied " + count + " line(s)", Toast.LENGTH_SHORT).show();
     }
 
     // ==================== Util ====================

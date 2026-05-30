@@ -1,9 +1,9 @@
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use shared::config::LogLevel;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Registry};
+use tracing_subscriber::{Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Stores the active log level as a `LevelFilter` discriminant.
 /// Updated via `update_log_level()`; read on every tracing event.
@@ -87,7 +87,7 @@ pub fn init_logging() {
         use std::sync::{Arc, Mutex};
         use std::time::Instant;
 
-        use tracing::{field::Visit, Id, Subscriber};
+        use tracing::{Id, Subscriber, field::Visit};
         use tracing_subscriber::layer::{Context, Layer};
         use tracing_subscriber::registry::LookupSpan;
 

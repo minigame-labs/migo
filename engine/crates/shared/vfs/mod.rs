@@ -41,9 +41,7 @@ pub mod package;
 
 pub use game_paths::{GamePathError, GamePathStrings, GamePaths, validate_game_id};
 pub use mount::{DirSource, MountBackend, MountTable, ResolvedCode, StagingArea};
-pub use package::{
-    PackSource, PackageError, PackageIdentity, PackageReader, PackageWriter,
-};
+pub use package::{PackSource, PackageError, PackageIdentity, PackageReader, PackageWriter};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -701,8 +699,7 @@ fn verify_nonexistent_containment(
         }
     }
 
-    let canonical_ancestor =
-        std::fs::canonicalize(&current).map_err(|_| VfsError::InvalidPath)?;
+    let canonical_ancestor = std::fs::canonicalize(&current).map_err(|_| VfsError::InvalidPath)?;
     let canonical_base = canonical_base_for(base_dir);
 
     if canonical_ancestor.starts_with(&canonical_base) {
@@ -731,10 +728,7 @@ fn verify_nonexistent_containment(
 
 /// Walk every component between `base` and `full_path`, reject if any is
 /// a symbolic link.  Uses `symlink_metadata` (lstat).
-pub(crate) fn check_no_symlinks_in_chain(
-    full_path: &Path,
-    base: &Path,
-) -> Result<(), VfsError> {
+pub(crate) fn check_no_symlinks_in_chain(full_path: &Path, base: &Path) -> Result<(), VfsError> {
     let relative = full_path
         .strip_prefix(base)
         .map_err(|_| VfsError::PathTraversal)?;
@@ -743,8 +737,7 @@ pub(crate) fn check_no_symlinks_in_chain(
     for component in relative.components() {
         current.push(component);
         if current.exists() {
-            let meta =
-                std::fs::symlink_metadata(&current).map_err(|_| VfsError::InvalidPath)?;
+            let meta = std::fs::symlink_metadata(&current).map_err(|_| VfsError::InvalidPath)?;
             if meta.file_type().is_symlink() {
                 return Err(VfsError::SymlinkNotAllowed);
             }
@@ -1260,7 +1253,10 @@ mod tests {
             std::os::unix::fs::symlink(&outside, &link).unwrap();
 
             let result = vfs.resolve("/user/escape_link/file.txt", FileOp::Write);
-            assert!(result.is_err(), "Symlink in writable dir to outside must be blocked");
+            assert!(
+                result.is_err(),
+                "Symlink in writable dir to outside must be blocked"
+            );
 
             let _ = fs::remove_dir_all(&base);
         }
@@ -1277,7 +1273,8 @@ mod tests {
             let err = result.unwrap_err();
             assert!(
                 err == VfsError::SymlinkNotAllowed || err == VfsError::SymlinkEscape,
-                "expected SymlinkNotAllowed or SymlinkEscape, got {:?}", err
+                "expected SymlinkNotAllowed or SymlinkEscape, got {:?}",
+                err
             );
 
             let _ = fs::remove_dir_all(&base);
@@ -1295,7 +1292,8 @@ mod tests {
             let err = result.unwrap_err();
             assert!(
                 err == VfsError::SymlinkNotAllowed || err == VfsError::SymlinkEscape,
-                "expected rejection, got {:?}", err
+                "expected rejection, got {:?}",
+                err
             );
 
             let _ = fs::remove_dir_all(&base);
@@ -1329,11 +1327,16 @@ mod tests {
                 std::os::unix::fs::symlink(&outside, &link).unwrap();
 
                 let vpath = format!("/{}/link_out/x.txt", dir_name);
-                let op = if *dir_name == "code" { FileOp::Read } else { FileOp::Write };
+                let op = if *dir_name == "code" {
+                    FileOp::Read
+                } else {
+                    FileOp::Write
+                };
                 let result = vfs.resolve(&vpath, op);
                 assert!(
                     result.is_err(),
-                    "Symlink escape in /{} should be blocked, but got Ok", dir_name
+                    "Symlink escape in /{} should be blocked, but got Ok",
+                    dir_name
                 );
             }
 

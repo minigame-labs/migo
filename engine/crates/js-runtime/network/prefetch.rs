@@ -102,9 +102,7 @@ fn prefetch_cache_insert(url: String, status: u16, body: Bytes) {
 /// Resolution happens in background Tokio tasks. This op returns immediately.
 /// Invalid or private/loopback addresses are silently skipped.
 #[op2(fast)]
-pub fn op_prefetch_dns(
-    #[string] hosts_json: String,
-) -> Result<(), JsErrorBox> {
+pub fn op_prefetch_dns(#[string] hosts_json: String) -> Result<(), JsErrorBox> {
     let hosts: Vec<String> = serde_json::from_str(&hosts_json)
         .map_err(|e| JsErrorBox::type_error(format!("prefetchDns: invalid JSON: {}", e)))?;
 
@@ -162,8 +160,7 @@ pub async fn op_prefetch_assets(
             // Single gate call replaces the three-way SSRF + whitelist
             // + HTTPS check.  Any rule failure -> quietly skip (this
             // is a best-effort prefetch, errors must not leak out).
-            if super::gate::enforce_from_state(&url, &st, super::gate::GateKind::Prefetch)
-                .is_err()
+            if super::gate::enforce_from_state(&url, &st, super::gate::GateKind::Prefetch).is_err()
             {
                 continue;
             }

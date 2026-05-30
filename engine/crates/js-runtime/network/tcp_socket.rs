@@ -134,6 +134,20 @@ pub async fn op_tcp_connect(
 
     debug!("TCP connect: {}:{} (timeout={}s)", address, port, timeout);
 
+    // Shared network-policy gate: raw TCP must obey the same domain
+    // whitelist / IP-literal block as `fetch` and `WebSocket`. Without
+    // this, a game that can't reach `evil.example` via `fetch()` could
+    // still reach it via `createTCPSocket().connect(...)`.
+    {
+        let st = state.borrow();
+        super::gate::enforce_host_from_state(
+            &address,
+            port,
+            &st,
+            super::gate::GateKind::TcpSocket,
+        )?;
+    }
+
     // Resolve address — supports both IP and hostname.
     // tokio::net::lookup_host handles DNS resolution asynchronously.
     let addr_str = format!("{}:{}", address, port);
@@ -299,4 +313,3 @@ pub fn op_tcp_close(state: &mut OpState, #[smi] rid: ResourceId) -> Result<(), J
     resource.close();
     Ok(())
 }
-

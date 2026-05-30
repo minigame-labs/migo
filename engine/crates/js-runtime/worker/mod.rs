@@ -254,6 +254,9 @@ async fn op_worker_create(
             vfs: host.vfs.clone(),
             mount_table: host.mount_table.clone(),
             render_tx,
+            // Workers don't drive measureText (no Canvas2D context in
+            // Web Worker yet), so the fast-path measurer is left `None`.
+            text_measurer: None,
             audio_tx,
             host_tx: host.host_tx.clone(),
             device_services: None,
@@ -262,6 +265,7 @@ async fn op_worker_create(
             workers_path: host.workers_path.clone(),
             network_policy: host.network_policy.clone(),
             backgrounded: host.backgrounded.clone(),
+            webgl_context_created: host.webgl_context_created.clone(),
             code_signing_enabled: host.code_signing_enabled,
             gpu_caps: host.gpu_caps.clone(),
         };

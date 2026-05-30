@@ -14,7 +14,7 @@
 //! Both entry points take a closure to ensure Skia resources are dropped
 //! before the EGL context is torn down.
 
-use skia_safe::{surfaces, ColorType, ISize, ImageInfo, Surface};
+use skia_safe::{ColorType, ISize, ImageInfo, Surface, surfaces};
 
 /// Run `f` with a fresh CPU-backed Skia surface of size `(w, h)` in
 /// un-premultiplied RGBA8888 colour space.
@@ -63,11 +63,7 @@ pub fn read_pixels_rgba8(surface: &mut Surface) -> Vec<u8> {
 /// Phase 6+ GL-specific coverage so that sandbox CI machines don't block
 /// progress on Phase 4.
 #[cfg(any())]
-pub fn with_gl_surface<T>(
-    _w: i32,
-    _h: i32,
-    _f: impl FnOnce(&mut Surface) -> T,
-) -> Option<T> {
+pub fn with_gl_surface<T>(_w: i32, _h: i32, _f: impl FnOnce(&mut Surface) -> T) -> Option<T> {
     // Deliberately unimplemented until Phase 6.  Keeping the symbol in the
     // module acts as a reminder that we will need it.
     None

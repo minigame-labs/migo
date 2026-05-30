@@ -141,7 +141,7 @@ public final class AudioRecorderManager {
         }
     }
 
-    /** Pause recording. API 24+ required for MediaRecorder modes. */
+    /** Pause recording. */
     public void pause() {
         if (state.get() != STATE_RECORDING) return;
 
@@ -153,20 +153,15 @@ public final class AudioRecorderManager {
             fireEvent("pause", "{}");
         } else {
             // MediaRecorder-based (encoded mode or encoded-frame mode)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                try {
-                    mediaRecorder.pause();
-                    state.set(STATE_PAUSED);
-                    recordedDuration += System.currentTimeMillis() - recordStartTime;
-                    cancelAutoStop();
-                    fireEvent("pause", "{}");
-                } catch (Exception e) {
-                    fireEvent("error",
-                            "{\"errMsg\":\"" + escapeJson("recorderManager.pause:fail " + e.getMessage()) + "\"}");
-                }
-            } else {
+            try {
+                mediaRecorder.pause();
+                state.set(STATE_PAUSED);
+                recordedDuration += System.currentTimeMillis() - recordStartTime;
+                cancelAutoStop();
+                fireEvent("pause", "{}");
+            } catch (Exception e) {
                 fireEvent("error",
-                        "{\"errMsg\":\"recorderManager.pause:fail not supported below API 24\"}");
+                        "{\"errMsg\":\"" + escapeJson("recorderManager.pause:fail " + e.getMessage()) + "\"}");
             }
         }
     }
@@ -181,20 +176,15 @@ public final class AudioRecorderManager {
             scheduleAutoStop();
             fireEvent("resume", "{}");
         } else {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                try {
-                    mediaRecorder.resume();
-                    state.set(STATE_RECORDING);
-                    recordStartTime = System.currentTimeMillis();
-                    scheduleAutoStop();
-                    fireEvent("resume", "{}");
-                } catch (Exception e) {
-                    fireEvent("error",
-                            "{\"errMsg\":\"" + escapeJson("recorderManager.resume:fail " + e.getMessage()) + "\"}");
-                }
-            } else {
+            try {
+                mediaRecorder.resume();
+                state.set(STATE_RECORDING);
+                recordStartTime = System.currentTimeMillis();
+                scheduleAutoStop();
+                fireEvent("resume", "{}");
+            } catch (Exception e) {
                 fireEvent("error",
-                        "{\"errMsg\":\"recorderManager.resume:fail not supported below API 24\"}");
+                        "{\"errMsg\":\"" + escapeJson("recorderManager.resume:fail " + e.getMessage()) + "\"}");
             }
         }
     }

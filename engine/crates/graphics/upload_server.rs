@@ -183,6 +183,17 @@ impl UploadServer {
         self.try_acquire(job.byte_len())
     }
 
+    pub(crate) fn can_ever_fit_bytes(&self, bytes: usize) -> bool {
+        if self.budget.max_jobs == 0 || bytes > self.budget.max_bytes {
+            return false;
+        }
+
+        match &self.frame_budget {
+            Some(frame) => frame.max_jobs > 0 && bytes <= frame.max_bytes,
+            None => true,
+        }
+    }
+
     pub(crate) fn finish_job(&mut self, job: &UploadJob) {
         self.finish_job_bytes(job.byte_len());
     }
@@ -246,7 +257,10 @@ mod tests {
             ahb_available: false,
             has_buffer_age: false,
             has_partial_update: false,
-            compressed_format_support: crate::compressed_upload::CompressedFormatSupport { etc2: false, astc: false },
+            compressed_format_support: crate::compressed_upload::CompressedFormatSupport {
+                etc2: false,
+                astc: false,
+            },
         };
 
         let server = UploadServer::for_device(&caps, 23);
@@ -268,7 +282,10 @@ mod tests {
             ahb_available: false,
             has_buffer_age: false,
             has_partial_update: false,
-            compressed_format_support: crate::compressed_upload::CompressedFormatSupport { etc2: false, astc: false },
+            compressed_format_support: crate::compressed_upload::CompressedFormatSupport {
+                etc2: false,
+                astc: false,
+            },
         };
         let mut server = UploadServer::for_device(&caps, 23);
 
@@ -311,7 +328,10 @@ mod tests {
             ahb_available: false,
             has_buffer_age: false,
             has_partial_update: false,
-            compressed_format_support: crate::compressed_upload::CompressedFormatSupport { etc2: false, astc: false },
+            compressed_format_support: crate::compressed_upload::CompressedFormatSupport {
+                etc2: false,
+                astc: false,
+            },
         };
         let mut server = UploadServer::for_device(&caps, 28);
 
@@ -325,7 +345,11 @@ mod tests {
         // TierA budget: 4 jobs, 4MB.
         let jobs: Vec<_> = (0..4).map(|i| make_job(i, 256 * 1024)).collect();
         for job in &jobs {
-            assert!(server.try_acquire_job(job), "job {} should be accepted", job.image_id);
+            assert!(
+                server.try_acquire_job(job),
+                "job {} should be accepted",
+                job.image_id
+            );
         }
         assert_eq!(server.queue_depth(), 4);
 
@@ -352,7 +376,10 @@ mod tests {
             ahb_available: false,
             has_buffer_age: false,
             has_partial_update: false,
-            compressed_format_support: crate::compressed_upload::CompressedFormatSupport { etc2: false, astc: false },
+            compressed_format_support: crate::compressed_upload::CompressedFormatSupport {
+                etc2: false,
+                astc: false,
+            },
         };
         // Conservative: 1 job, 512KB
         let mut server = UploadServer::for_device(&caps, 23);
@@ -536,6 +563,43 @@ mod tests {
             rgba: Arc::new(vec![0; 200 * 1024]), // 200KB, total would be 600KB > 512KB
         };
         assert!(!server.try_acquire_job(&second));
+    }
+
+    #[test]
+    fn oversized_job_can_never_fit_frame_budget() {
+        let mut server = UploadServer::new(4, 4 * 1024 * 1024);
+        server.set_frame_budget(2, 512 * 1024);
+
+        assert!(!server.can_ever_fit_bytes(600 * 1024));
+        assert!(server.can_ever_fit_bytes(400 * 1024));
+    }
+
+    #[test]
+    fn temporary_frame_exhaustion_still_reports_job_as_fit_capable() {
+        let mut server = UploadServer::new(4, 4 * 1024 * 1024);
+        server.set_frame_budget(2, 1024 * 1024);
+
+        let small = |id| UploadJob {
+            image_id: id,
+            width: 16,
+            height: 16,
+            rgba: Arc::new(vec![0; 256 * 1024]),
+        };
+
+        assert!(server.try_acquire_job(&small(1)));
+        assert!(server.try_acquire_job(&small(2)));
+        assert!(!server.try_acquire_job(&small(3)));
+
+        assert!(server.can_ever_fit_bytes(256 * 1024));
+    }
+
+    #[test]
+    fn oversized_and_temporary_rejections_split_differently() {
+        let mut server = UploadServer::new(4, 4 * 1024 * 1024);
+        server.set_frame_budget(2, 512 * 1024);
+
+        assert!(!server.can_ever_fit_bytes(600 * 1024));
+        assert!(server.can_ever_fit_bytes(256 * 1024));
     }
 
     /// Dropped upload recovery only restores in-flight, not frame budget.

@@ -263,8 +263,7 @@ async fn cached_preload_result_with_scheduler(
     gpu_caps: GpuCapsSnapshot,
     mount_table: Option<Arc<MountTable>>,
 ) -> PreloadResult {
-    let pg_key = match current_image_cache_key(&path, generation, &source, mount_table.as_deref())
-    {
+    let pg_key = match current_image_cache_key(&path, generation, &source, mount_table.as_deref()) {
         Ok(key) => key,
         Err(err) => return (path, Err(format!("{:?}", err))),
     };
@@ -517,10 +516,10 @@ pub async fn read_image_rgba8(
     game_cache_dir: Option<String>,
     gpu_caps: GpuCapsSnapshot,
     mount_table: Option<Arc<MountTable>>,
+    force_rgba: bool,
 ) -> Result<ReadImageResult, EngineError> {
     let has_resize = target_width.is_some() && target_height.is_some();
-    let pg_key =
-        current_image_cache_key(&path, cache_generation, &source, mount_table.as_deref())?;
+    let pg_key = current_image_cache_key(&path, cache_generation, &source, mount_table.as_deref())?;
     // LRU cache fast path: full-resolution hits as before, and
     // pre-resized variants get their own cache slot keyed by
     // `(path, gen, target_w, target_h)` so scroll-list games that
@@ -534,17 +533,13 @@ pub async fn read_image_rgba8(
         );
         let cached_image = cached.image;
         let encoded_bytes = cached_image.rgba.len();
-        return run_image_job_with_scheduler(
-            scheduler,
-            encoded_bytes,
-            true,
-            source,
-            move || ReadImageResult {
+        return run_image_job_with_scheduler(scheduler, encoded_bytes, true, source, move || {
+            ReadImageResult {
                 cache_path: io_cache_key.0,
                 image: DecodedImage::Rgba(cached_image),
                 source_generation: io_cache_key.1,
-            },
-        )
+            }
+        })
         .await;
     }
 
@@ -579,8 +574,15 @@ pub async fn read_image_rgba8(
 
             let tw = target_width.unwrap_or(0);
             let th = target_height.unwrap_or(0);
-            let variant =
-                select_variant(&path_for_decode, data, &gpu_caps, has_resize, mt.as_deref())?;
+            let variant = if force_rgba {
+                VariantDecision::DecodeRgba {
+                    data,
+                    path_hint: path_for_decode.clone(),
+                    variant_kind: VARIANT_PRIMARY_RGBA,
+                }
+            } else {
+                select_variant(&path_for_decode, data, &gpu_caps, has_resize, mt.as_deref())?
+            };
 
             let variant_kind = variant.variant_kind();
             let cache_fmt = variant.gpu_format();
@@ -598,25 +600,57 @@ pub async fn read_image_rgba8(
                 if let Some(cached) =
                     derived_cache::load_derived(std::path::Path::new(cache_dir), &cache_key)
                 {
-                    tracing::debug!("derived cache hit: {}", path_for_decode);
-                    shared::stats::io_metrics_global()
-                        .derived_cache_hits
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(ReadImageResult {
-                        cache_path: worker_source.cache_path,
-                        image: cached,
-                        source_generation: worker_source.source_generation,
-                    });
+                    if force_rgba && !matches!(cached, DecodedImage::Rgba(_)) {
+                        tracing::debug!(
+                            "derived cache hit ignored for WebGL RGBA backing: {} ({})",
+                            path_for_decode,
+                            match &cached {
+                                DecodedImage::HardwareBuffer(_) => "AHB",
+                                DecodedImage::Compressed(_) => "compressed",
+                                DecodedImage::Rgba(_) => "RGBA",
+                            }
+                        );
+                        // Count as a miss from the caller's perspective: the cached
+                        // representation cannot satisfy texImage2D(image), so we must
+                        // decode a CPU-readable RGBA version.  Do not return the
+                        // GPU-only cached payload.
+                        shared::stats::io_metrics_global()
+                            .derived_cache_misses
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        tracing::debug!("derived cache hit: {}", path_for_decode);
+                        shared::stats::io_metrics_global()
+                            .derived_cache_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(ReadImageResult {
+                            cache_path: worker_source.cache_path,
+                            image: cached,
+                            source_generation: worker_source.source_generation,
+                        });
+                    }
                 }
                 // Missed -- the decoder will run below. Counted
                 // here rather than in the decode branch so cache
                 // stats reflect "we consulted the cache" exactly.
-                shared::stats::io_metrics_global()
-                    .derived_cache_misses
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !force_rgba {
+                    shared::stats::io_metrics_global()
+                        .derived_cache_misses
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
 
-            let result = decode_selected_variant(variant, has_resize, target_width, target_height)?;
+            let result = if force_rgba {
+                // WebGL `texImage2D(image)` requires CPU-readable pixels for
+                // the source image.  Merely choosing a `DecodeRgba` variant is
+                // not enough: the normal `decode_selected_variant()` still
+                // delegates to `decode_image_to_any()` for non-resized images,
+                // which may return an Android HardwareBuffer.  Force the
+                // RGBA-only decoder here so live Image objects used by WebGL
+                // always have backing bytes in io::global_cache.
+                decode_selected_variant_rgba_only(variant, has_resize, target_width, target_height)?
+            } else {
+                decode_selected_variant(variant, has_resize, target_width, target_height)?
+            };
 
             if let Some(ref cache_dir) = gcd {
                 derived_cache::save_derived(std::path::Path::new(cache_dir), &cache_key, &result);
@@ -731,7 +765,10 @@ async fn decode_preload_result_with_scheduler(
                         let dims = (cached.width(), cached.height());
                         if let DecodedImage::Rgba(ref rgba) = cached {
                             image_cache::global_cache().insert(
-                                image_cache::full_res_key(path.clone(), worker_source.source_generation),
+                                image_cache::full_res_key(
+                                    path.clone(),
+                                    worker_source.source_generation,
+                                ),
                                 rgba.clone(),
                             );
                         }
@@ -746,11 +783,10 @@ async fn decode_preload_result_with_scheduler(
                 // cached (no persistable representation, GPU-memory
                 // pressure) and without caching, prefetch would do
                 // decode work that `Image.src =` then repeats.
-                let decoded =
-                    match decode_selected_variant_rgba_only(variant, false, None, None) {
-                        Ok(v) => v,
-                        Err(e) => return (path, Err(format!("{:?}", e))),
-                    };
+                let decoded = match decode_selected_variant_rgba_only(variant, false, None, None) {
+                    Ok(v) => v,
+                    Err(e) => return (path, Err(format!("{:?}", e))),
+                };
 
                 let dims = (decoded.width(), decoded.height());
                 if let DecodedImage::Rgba(ref rgba) = decoded {
@@ -791,15 +827,11 @@ pub async fn preload_images(
     {
         let cache = image_cache::global_cache();
         for (i, (path, generation, source)) in entries.into_iter().enumerate() {
-            let key = match current_image_cache_key(
-                &path,
-                generation,
-                &source,
-                mount_table.as_deref(),
-            )
-            .map(|pg| image_cache::full_res_key(pg.0, pg.1))
-            {
-                Ok(key) => key,
+            let key =
+                match current_image_cache_key(&path, generation, &source, mount_table.as_deref())
+                    .map(|pg| image_cache::full_res_key(pg.0, pg.1))
+                {
+                    Ok(key) => key,
                     Err(_) => {
                         handles.push((
                             i,
@@ -1161,13 +1193,7 @@ fn decode_selected_variant(
             // a download-then-resize-then-reupload shuffle.  Leave the
             // AHB fast path to the common (non-resize) case.
             if has_resize {
-                let img = decode_rgba(
-                    &data,
-                    &path_hint,
-                    has_resize,
-                    target_width,
-                    target_height,
-                )?;
+                let img = decode_rgba(&data, &path_hint, has_resize, target_width, target_height)?;
                 return Ok(DecodedImage::Rgba(img));
             }
             // Happy path: let the decoder pick the best representation.
@@ -1197,8 +1223,7 @@ fn decode_selected_variant_rgba_only(
         VariantDecision::DecodeRgba {
             data, path_hint, ..
         } => {
-            let img =
-                decode_rgba(&data, &path_hint, has_resize, target_width, target_height)?;
+            let img = decode_rgba(&data, &path_hint, has_resize, target_width, target_height)?;
             Ok(DecodedImage::Rgba(img))
         }
     }
@@ -1208,19 +1233,18 @@ fn decode_selected_variant_rgba_only(
 mod tests {
     use std::sync::{Arc, atomic::Ordering};
 
+    use shared::vfs::package::PackageWriter;
     use shared::{
         device::gpu_caps::GpuCapsSnapshot,
         protocol::io_cmd::NormalizedImage,
         vfs::{DirSource, MountTable, PackSource},
     };
-    use shared::vfs::package::PackageWriter;
     use tokio::sync::Notify;
 
     use super::{
-        preload_images, read_image_rgba8, ImageSource,
-        run_image_job_with_scheduler, worker_image_source, read_image_source,
-        mounted_variant_source_version_token,
-        TEST_SCHEDULER_RUNS, TEST_PRELOAD_CACHE_HOOK, TEST_PRELOAD_DECODE_STARTED,
+        ImageSource, TEST_PRELOAD_CACHE_HOOK, TEST_PRELOAD_DECODE_STARTED, TEST_SCHEDULER_RUNS,
+        mounted_variant_source_version_token, preload_images, read_image_rgba8, read_image_source,
+        run_image_job_with_scheduler, worker_image_source,
     };
     use crate::scheduler::IoScheduler;
 
@@ -1308,7 +1332,10 @@ mod tests {
 
         reset_scheduler_run_count();
         crate::image_cache::global_cache().clear();
-        crate::image_cache::global_cache().insert(crate::image_cache::full_res_key(path.clone(), cache_generation), cached.clone());
+        crate::image_cache::global_cache().insert(
+            crate::image_cache::full_res_key(path.clone(), cache_generation),
+            cached.clone(),
+        );
 
         let result = runtime.block_on(read_image_rgba8(
             Arc::clone(&scheduler),
@@ -1320,6 +1347,7 @@ mod tests {
             None,
             GpuCapsSnapshot::default(),
             None,
+            false,
         ));
 
         let decoded = result.expect("cached read_image_rgba8 should succeed");
@@ -1414,7 +1442,10 @@ mod tests {
 
         reset_scheduler_run_count();
         crate::image_cache::global_cache().clear();
-        crate::image_cache::global_cache().insert(crate::image_cache::full_res_key(path.clone(), cache_generation), cached);
+        crate::image_cache::global_cache().insert(
+            crate::image_cache::full_res_key(path.clone(), cache_generation),
+            cached,
+        );
 
         let results = runtime.block_on(preload_images(
             Arc::clone(&scheduler),
@@ -1688,6 +1719,7 @@ mod tests {
             None,
             GpuCapsSnapshot::default(),
             Some(Arc::clone(&mount_table)),
+            false,
         ));
 
         let decoded = result.expect("read_image_rgba8 should revalidate mount-backed cache hit");

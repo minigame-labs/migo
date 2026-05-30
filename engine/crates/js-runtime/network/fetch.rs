@@ -106,7 +106,8 @@ impl reqwest::dns::Resolve for SsrfCheckingResolver {
                             "fetch: connection to {} is not allowed (private/loopback address)",
                             addr.ip()
                         ),
-                    )) as Box<dyn std::error::Error + Send + Sync>);
+                    ))
+                        as Box<dyn std::error::Error + Send + Sync>);
                 }
             }
 
@@ -237,7 +238,10 @@ pub fn get_or_create_client_from_state(
         } else {
             let options = state.borrow::<Options>();
             let user_agent = options.user_agent.clone();
-            let policy = state.borrow::<shared::op_state::HostOpState>().network_policy.clone();
+            let policy = state
+                .borrow::<shared::op_state::HostOpState>()
+                .network_policy
+                .clone();
             let client = create_http_client(&user_agent, true, &policy)?;
             state.put::<Http2Client>(Http2Client(client.clone()));
             Ok(client)
@@ -248,7 +252,10 @@ pub fn get_or_create_client_from_state(
         } else {
             let options = state.borrow::<Options>();
             let user_agent = options.user_agent.clone();
-            let policy = state.borrow::<shared::op_state::HostOpState>().network_policy.clone();
+            let policy = state
+                .borrow::<shared::op_state::HostOpState>()
+                .network_policy
+                .clone();
             let client = create_http_client(&user_agent, false, &policy)?;
             state.put::<Http1Client>(Http1Client(client.clone()));
             Ok(client)
@@ -319,6 +326,9 @@ pub fn op_fetch(
             // once; individual ops can't accidentally skip a rule.
             super::gate::enforce_from_state(&url, state, super::gate::GateKind::Fetch)?;
 
+            // Capture the URL for the [NetTrace] log line before the
+            // `client.request(..., url)` call below consumes it.
+            let url_for_trace = url.to_string();
             let mut request = client
                 .request(method.clone(), url)
                 .timeout(Duration::from_millis(timeout as u64));
@@ -388,11 +398,28 @@ pub fn op_fetch(
             let fut = async move {
                 // DNS resolution and SSRF check happen inside
                 // SsrfCheckingResolver when reqwest opens the connection.
-                request
+                let net_started = std::time::Instant::now();
+                let result = request
                     .send()
                     .or_cancel(cancel_handle_)
                     .await
-                    .map(|res| res.map_err(|err| err.into()))
+                    .map(|res| res.map_err(|err| err.into()));
+                // Tight network-only timer: covers TLS + TCP + request
+                // write + response-head read.  Note this is the future's
+                // own observed elapsed; if the V8 event loop is stalled
+                // when the network IO completes, the wake-up of this
+                // task is delayed by the stall, inflating the number.
+                // It is therefore an upper bound on real network time,
+                // not an exact measurement.
+                let net_ms = net_started.elapsed().as_millis() as u64;
+                if net_ms >= 50 {
+                    tracing::warn!(
+                        "[NetTrace] reqwest send {}ms url={}",
+                        net_ms,
+                        url_for_trace
+                    );
+                }
+                result
             };
 
             let request_rid = state
@@ -541,6 +568,8 @@ pub async fn op_fetch_send(
         .ok()
         .expect("multiple op_fetch_send ongoing");
 
+    let started_at = std::time::Instant::now();
+
     let res = match request.0.await {
         Ok(Ok(res)) => res,
         Ok(Err(err)) => {
@@ -598,6 +627,16 @@ pub async fn op_fetch_send(
         .resource_table
         .add(FetchResponseResource::new(res, content_length));
 
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    if elapsed_ms >= 100 {
+        tracing::warn!(
+            "[NetTrace] fetch slow {}ms status={} url={}",
+            elapsed_ms,
+            status.as_u16(),
+            url
+        );
+    }
+
     Ok(FetchResponse {
         status: status.as_u16(),
         status_text: status.canonical_reason().unwrap_or("").to_string(),
@@ -648,16 +687,16 @@ pub fn create_http_client(
                 format!(
                     "fetch: redirect rejected: {}",
                     match &reject {
-                        super::gate::GateReject::BlockedAddress { display } =>
-                            format!("connection to {display} is not allowed (private/loopback address)"),
+                        super::gate::GateReject::BlockedAddress { display } => format!(
+                            "connection to {display} is not allowed (private/loopback address)"
+                        ),
                         super::gate::GateReject::NotWhitelisted { host } =>
                             format!("'{host}' is not in the allowed domain list"),
                         super::gate::GateReject::HttpsRequired =>
                             "HTTPS required (enforce_https=true)".to_string(),
                         super::gate::GateReject::UnsupportedScheme { scheme } =>
                             format!("scheme '{scheme}' is not allowed"),
-                        super::gate::GateReject::MissingHost =>
-                            "URL has no host".to_string(),
+                        super::gate::GateReject::MissingHost => "URL has no host".to_string(),
                     }
                 ),
             )),
@@ -667,7 +706,13 @@ pub fn create_http_client(
     let mut builder = Client::builder()
         .dns_resolver(std::sync::Arc::new(SsrfCheckingResolver))
         .redirect(ssrf_redirect_policy)
-        .default_headers(headers);
+        .default_headers(headers)
+        // Connect timeout applies to TCP + TLS handshake only; per-
+        // request `RequestBuilder::timeout` still bounds the full
+        // exchange. Mobile networks frequently stall at connect time
+        // when going through captive portals, so cap that specifically
+        // rather than waiting for the OS-level SYN retry window.
+        .connect_timeout(Duration::from_secs(5));
 
     if enable_http2 {
         // HTTP/2 multiplexes many streams over a single TCP connection, so we
@@ -692,6 +737,87 @@ pub fn create_http_client(
 
 // ── Upload ──
 
+/// Resolve a JS-visible virtual path into a real filesystem path for
+/// upload. We deliberately reuse neither `op_read_file`'s private
+/// resolver nor the VFS error variants — upload only cares whether
+/// the path is readable, and the error prefix stays consistent with
+/// other `uploadFile:*` failure messages.
+fn resolve_upload_path(
+    vfs: Option<&shared::vfs::VirtualFS>,
+    mount_table: Option<&shared::vfs::MountTable>,
+    path: &str,
+) -> Result<std::path::PathBuf, JsErrorBox> {
+    use shared::vfs::VfsError;
+
+    let virtual_path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/code/{}", path)
+    };
+
+    // `/code` is preferred via the mount table because it may be
+    // package-backed; other prefixes go through the normal VFS.
+    if virtual_path == "/code" || virtual_path.starts_with("/code/") {
+        if let Some(mt) = mount_table {
+            if let Some(res) = mt.resolve_code_path(&virtual_path) {
+                if let Some(real) = res.real_path {
+                    return Ok(real);
+                }
+                return Err(JsErrorBox::generic(format!(
+                    "uploadFile:fail {} is inside a package and cannot be streamed",
+                    path
+                )));
+            }
+        }
+    }
+
+    let vfs = vfs.ok_or_else(|| JsErrorBox::generic("uploadFile:fail VFS not initialised"))?;
+    vfs.resolve(&virtual_path, shared::vfs::FileOp::Read)
+        .map_err(|e| {
+            JsErrorBox::generic(match e {
+                VfsError::PathNotAllowed => format!(
+                    "uploadFile:fail path not allowed: {} (use /user, /cache, /code, /tmp)",
+                    path
+                ),
+                VfsError::PermissionDenied => {
+                    format!("uploadFile:fail permission denied: {}", path)
+                }
+                VfsError::PathTraversal => {
+                    format!("uploadFile:fail path traversal: {}", path)
+                }
+                VfsError::SymlinkEscape => {
+                    format!("uploadFile:fail symlink escape: {}", path)
+                }
+                VfsError::SymlinkNotAllowed => {
+                    format!("uploadFile:fail symlinks not allowed: {}", path)
+                }
+                VfsError::InvalidPath => format!("uploadFile:fail invalid path: {}", path),
+            })
+        })
+}
+
+/// Convert a `tokio::fs::File` into a stream of `Bytes` chunks that
+/// `reqwest::Body::wrap_stream` accepts. 64 KiB is large enough to
+/// keep syscall overhead low but small enough that a paused upload
+/// (backpressure) doesn't pin down megabytes of RAM per connection.
+fn file_to_byte_stream(file: tokio::fs::File) -> impl Stream<Item = std::io::Result<Bytes>> {
+    use tokio::io::AsyncReadExt;
+    deno_core::futures::stream::unfold((file, false), |(mut f, done)| async move {
+        if done {
+            return None;
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        match f.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(Bytes::from(buf)), (f, false)))
+            }
+            Err(e) => Some((Err(e), (f, true))),
+        }
+    })
+}
+
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchUploadResult {
@@ -702,13 +828,22 @@ pub struct FetchUploadResult {
     pub error: Option<String>,
 }
 
+/// Streaming multipart upload.
+///
+/// The JS caller passes the **virtual path** of the file to upload
+/// (e.g. `/user/foo.png`). The op resolves it through the host's VFS
+/// and feeds a `tokio::fs::File` straight into `reqwest::Body::wrap_stream`,
+/// so the process never materialises a second copy of the file in
+/// user-space. For a 50 MiB upload this removes ~100 MiB of peak
+/// allocation compared with the old `buffer -> Vec<u8> -> clone`
+/// pipeline.
 #[op2(async(lazy))]
 #[serde]
 #[allow(clippy::too_many_arguments)]
 pub async fn op_fetch_upload(
     state: Rc<RefCell<OpState>>,
     #[string] url: String,
-    #[buffer] file_data: JsBuffer,
+    #[string] file_path: String,
     #[string] name: String,
     #[string] filename: String,
     #[serde] headers: Vec<(ByteString, ByteString)>,
@@ -722,8 +857,22 @@ pub async fn op_fetch_upload(
             .map_err(|e| JsErrorBox::generic(e.to_string()))?
     };
 
-    let file_bytes = file_data.to_vec();
-    let file_size = file_bytes.len() as u64;
+    // Resolve the JS-visible virtual path (e.g. `/user/foo.png`) into
+    // a real filesystem path via the same VFS the file API uses. We
+    // do the resolve inside a short `borrow` scope so the RefCell
+    // guard is dropped before `await` points below.
+    let real_path = {
+        let st = state.borrow();
+        let host = st.borrow::<shared::op_state::HostOpState>();
+        let vfs = host.vfs.as_ref().map(|arc| arc.as_ref());
+        let mount_table = host.mount_table.as_ref().map(|arc| arc.as_ref());
+        resolve_upload_path(vfs, mount_table, &file_path)?
+    };
+
+    let file = tokio::fs::File::open(&real_path)
+        .await
+        .map_err(|e| JsErrorBox::generic(format!("uploadFile:fail open {}: {}", file_path, e)))?;
+    let file_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
     // Guess MIME type from filename extension
     let mime = match filename.rsplit('.').next().map(|e| e.to_lowercase()) {
@@ -745,11 +894,29 @@ pub async fn op_fetch_upload(
         None => "application/octet-stream",
     };
 
-    // Build multipart form
-    let file_part = reqwest::multipart::Part::bytes(file_bytes)
+    // Streaming body: pull 64 KiB at a time from the file and emit
+    // `Bytes` chunks to the multipart encoder. `reqwest::Body::wrap_stream`
+    // owns the stream and drives it as the HTTP layer asks for data,
+    // so peak user-space memory per upload is one chunk, not the
+    // whole file.
+    let byte_stream = file_to_byte_stream(file);
+    let body = Body::wrap_stream(byte_stream);
+    let mut file_part = reqwest::multipart::Part::stream_with_length(body, file_size)
         .file_name(filename)
         .mime_str(mime)
         .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    // If metadata() didn't give us a length we fall back to
+    // chunked encoding; reqwest handles that automatically.
+    if file_size == 0 {
+        file_part = reqwest::multipart::Part::stream(Body::wrap_stream(file_to_byte_stream(
+            tokio::fs::File::open(&real_path)
+                .await
+                .map_err(|e| JsErrorBox::generic(format!("uploadFile:fail reopen: {e}")))?,
+        )))
+        .file_name(file_path.clone())
+        .mime_str(mime)
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    }
 
     let mut form = reqwest::multipart::Form::new().part(name, file_part);
 

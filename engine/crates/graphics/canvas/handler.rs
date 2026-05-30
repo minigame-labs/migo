@@ -3,7 +3,7 @@ use shared::{
     protocol::render_cmd::CanvasCmd,
 };
 
-use crate::{onscreen_window_from_surface, CanvasManager};
+use crate::{CanvasManager, onscreen_window_from_surface};
 
 pub(crate) struct CanvasHandler;
 
@@ -30,6 +30,18 @@ impl CanvasHandler {
             } => {
                 let res = cm.create_offscreen(width, height);
                 let _ = resp.send(res);
+            }
+
+            CanvasCmd::RegisterOffscreen { id, width, height } => {
+                if let Err(e) = cm.register_offscreen(id, width, height) {
+                    tracing::warn!(
+                        "CanvasCmd::RegisterOffscreen failed: id={:?}, {}x{}, err={}",
+                        id,
+                        width,
+                        height,
+                        e
+                    );
+                }
             }
 
             CanvasCmd::DestroyCanvas { id, resp } => {
@@ -89,11 +101,6 @@ impl CanvasHandler {
                 let _ = resp.send(size);
             }
 
-            CanvasCmd::CreateImage { resp } => {
-                let res = cm.generate_img_id();
-                let _ = resp.send(Ok(res));
-            }
-
             CanvasCmd::LoadImage {
                 image_id,
                 image,
@@ -133,9 +140,11 @@ impl CanvasHandler {
                         // thread -- the sync path was the exact
                         // frame spike the async thread was meant to
                         // avoid.  The sync fallback is reserved for
-                        // permanent degradation (no upload thread,
-                        // or upload thread reported unrecoverable
-                        // failure) where waiting can't help.
+                        // cases where waiting can't help: permanent
+                        // degradation (no upload thread, or upload
+                        // thread reported unrecoverable failure) and
+                        // images that can never fit the async upload
+                        // budget window.
                         if priority == ImagePriority::Critical {
                             let res = cm.load_shared_image(image_id, rgba_image);
                             let _ = resp.send(res);
@@ -143,26 +152,28 @@ impl CanvasHandler {
                             match cm.submit_async_upload(image_id, &rgba_image, resp) {
                                 Ok(()) => {}
                                 Err(resp) => {
-                                    if cm.upload_thread_healthy() {
-                                        // Budget squeeze: queue for retry.
-                                        // If the deferred queue is
-                                        // already full (pathological
-                                        // burst), last-resort sync.
-                                        match cm.defer_upload(
-                                            image_id,
-                                            rgba_image.clone(),
-                                            resp,
-                                        ) {
-                                            Ok(()) => {}
-                                            Err((img, resp)) => {
-                                                let res = cm.load_shared_image(image_id, img);
-                                                let _ = resp.send(res);
+                                    match cm.async_upload_reject_action(rgba_image.rgba.len()) {
+                                        crate::canvas::manager::AsyncUploadRejectAction::SyncFallback => {
+                                            let res = cm.load_shared_image(image_id, rgba_image);
+                                            let _ = resp.send(res);
+                                        }
+                                        crate::canvas::manager::AsyncUploadRejectAction::DeferRetry => {
+                                            // Budget squeeze: queue for retry.
+                                            // If the deferred queue is
+                                            // already full (pathological
+                                            // burst), last-resort sync.
+                                            match cm.defer_upload(
+                                                image_id,
+                                                rgba_image.clone(),
+                                                resp,
+                                            ) {
+                                                Ok(()) => {}
+                                                Err((img, resp)) => {
+                                                    let res = cm.load_shared_image(image_id, img);
+                                                    let _ = resp.send(res);
+                                                }
                                             }
                                         }
-                                    } else {
-                                        // Upload thread degraded -- sync fallback.
-                                        let res = cm.load_shared_image(image_id, rgba_image);
-                                        let _ = resp.send(res);
                                     }
                                 }
                             }

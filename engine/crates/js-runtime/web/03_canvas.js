@@ -23,25 +23,31 @@ class Canvas {
     }
 
     get width() {
-        return op_get_canvas_info(this._rid)[0];
+        return this._width;
     }
     get height() {
-        return op_get_canvas_info(this._rid)[1];
+        return this._height;
     }
     set width(v) {
         op_resize_canvas(this._rid, v, undefined);
         this._width = v;
+        if (this._context && this._context._resetShadowState) {
+            this._context._resetShadowState();
+        }
     }
     set height(v) {
         op_resize_canvas(this._rid, undefined, v);
         this._height = v;
+        if (this._context && this._context._resetShadowState) {
+            this._context._resetShadowState();
+        }
     }
 
     get clientWidth() {
-        return op_get_canvas_info(this._rid)[0];
+        return this._width;
     }
     get clientHeight() {
-        return op_get_canvas_info(this._rid)[1];
+        return this._height;
     }
     getContext(contextType, options) {
         if (this._context) { return this._context; }

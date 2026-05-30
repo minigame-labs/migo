@@ -170,6 +170,15 @@ pub async fn op_udp_connect(
     #[smi] port: u32,
 ) -> Result<(), JsErrorBox> {
     let port = port as u16;
+    {
+        let st = state.borrow();
+        super::gate::enforce_host_from_state(
+            &address,
+            port,
+            &st,
+            super::gate::GateKind::UdpSocket,
+        )?;
+    }
     let resource = state
         .borrow()
         .resource_table
@@ -211,30 +220,45 @@ pub async fn op_udp_send(
     set_broadcast: bool,
 ) -> Result<(), JsErrorBox> {
     let port = port as u16;
+    // Broadcast is refused outright: the destination address filter
+    // already blocks 255.255.255.255 and every multicast/link-local
+    // range, so a `set_broadcast` flag has no legitimate target and
+    // would only serve to escape those checks via a misconfigured
+    // kernel option. Game scripts that need fan-out must go through
+    // server-mediated delivery.
+    if set_broadcast {
+        return Err(JsErrorBox::generic(
+            "send:fail broadcast is not permitted by the runtime policy",
+        ));
+    }
+    {
+        let st = state.borrow();
+        super::gate::enforce_host_from_state(
+            &address,
+            port,
+            &st,
+            super::gate::GateKind::UdpSocket,
+        )?;
+    }
     let resource = state
         .borrow()
         .resource_table
         .get::<UdpSocketResource>(rid)
         .map_err(|_| JsErrorBox::generic("UDPSocket not found"))?;
 
-    // Resolve target address
     let addr_str = format!("{}:{}", address, port);
-    debug!(
-        "UDP send: rid={}, target={}, broadcast={}",
-        rid, addr_str, set_broadcast
-    );
+    debug!("UDP send: rid={}, target={}", rid, addr_str);
+    // `resolve_first` runs the shared `address_filter` on every DNS
+    // answer, which now covers multicast, documentation, benchmarking
+    // and future-reserved ranges in addition to the classic private /
+    // link-local / loopback set. So a multicast destination (whether
+    // supplied as hostname or IP literal) is rejected here before any
+    // `send_to` hits the kernel.
     let sock_addr = resolve_first(&addr_str)
         .await
         .map_err(|e| JsErrorBox::generic(format!("send:fail resolve error: {}", e)))?;
 
     let socket = RcRef::map(&resource, |r| &r.socket).borrow().await;
-
-    // Set broadcast if requested
-    if set_broadcast {
-        socket
-            .set_broadcast(true)
-            .map_err(|e| JsErrorBox::generic(format!("send:fail set_broadcast: {}", e)))?;
-    }
 
     let bytes: Vec<u8> = if let Some(ref text) = data_str {
         text.as_bytes().to_vec()
@@ -261,12 +285,6 @@ pub async fn op_udp_send(
         .map_err(|e| JsErrorBox::generic(format!("send:fail {}", e)))?;
 
     debug!("UDP send: success");
-
-    // Reset broadcast after sending
-    if set_broadcast {
-        let _ = socket.set_broadcast(false);
-    }
-
     Ok(())
 }
 

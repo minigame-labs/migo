@@ -22,10 +22,7 @@ pub(crate) fn get_optional_string_field(
         return None;
     }
     let jstr = JString::from(jobj);
-    let s: String = env
-        .get_string(&jstr)
-        .ok()
-        .map(|s| s.into())?;
+    let s: String = env.get_string(&jstr).ok().map(|s| s.into())?;
     if s.is_empty() { None } else { Some(s) }
 }
 

@@ -57,13 +57,17 @@ pub fn op_camera_create(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    with_camera(state, "createCamera:fail not supported", |c| c.create(options_json))
+    with_camera(state, "createCamera:fail not supported", |c| {
+        c.create(options_json)
+    })
 }
 
 /// Destroy a camera instance and release all resources.
 #[op2(fast)]
 pub fn op_camera_destroy(state: &mut OpState, #[smi] camera_id: u32) -> Result<(), JsErrorBox> {
-    with_camera(state, "camera.destroy:fail not supported", |c| c.destroy(camera_id))
+    with_camera(state, "camera.destroy:fail not supported", |c| {
+        c.destroy(camera_id)
+    })
 }
 
 /// Take a photo. Options as JSON, returns JSON with tempImagePath.
@@ -73,7 +77,9 @@ pub fn op_camera_take_photo(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    with_camera(state, "camera.takePhoto:fail not supported", |c| c.take_photo(options_json))
+    with_camera(state, "camera.takePhoto:fail not supported", |c| {
+        c.take_photo(options_json)
+    })
 }
 
 /// Start video recording. Options as JSON.
@@ -83,7 +89,9 @@ pub fn op_camera_start_record(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    with_camera(state, "camera.startRecord:fail not supported", |c| c.start_record(options_json))
+    with_camera(state, "camera.startRecord:fail not supported", |c| {
+        c.start_record(options_json)
+    })
 }
 
 /// Stop video recording. Returns JSON with tempThumbPath, tempVideoPath.
@@ -93,7 +101,9 @@ pub fn op_camera_stop_record(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    with_camera(state, "camera.stopRecord:fail not supported", |c| c.stop_record(options_json))
+    with_camera(state, "camera.stopRecord:fail not supported", |c| {
+        c.stop_record(options_json)
+    })
 }
 
 /// Set camera zoom level. Returns JSON with actual zoom applied.
@@ -103,7 +113,9 @@ pub fn op_camera_set_zoom(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    with_camera(state, "camera.setZoom:fail not supported", |c| c.set_zoom(options_json))
+    with_camera(state, "camera.setZoom:fail not supported", |c| {
+        c.set_zoom(options_json)
+    })
 }
 
 /// Start listening for camera frame changes (high-frequency streaming).
@@ -112,7 +124,9 @@ pub fn op_camera_listen_frame_change(
     state: &mut OpState,
     #[smi] camera_id: u32,
 ) -> Result<(), JsErrorBox> {
-    with_camera(state, "camera.listenFrameChange:fail not supported", |c| c.listen_frame_change(camera_id))
+    with_camera(state, "camera.listenFrameChange:fail not supported", |c| {
+        c.listen_frame_change(camera_id)
+    })
 }
 
 /// Stop listening for camera frame changes.
@@ -121,7 +135,9 @@ pub fn op_camera_close_frame_change(
     state: &mut OpState,
     #[smi] camera_id: u32,
 ) -> Result<(), JsErrorBox> {
-    with_camera(state, "camera.closeFrameChange:fail not supported", |c| c.close_frame_change(camera_id))
+    with_camera(state, "camera.closeFrameChange:fail not supported", |c| {
+        c.close_frame_change(camera_id)
+    })
 }
 
 // ==================== Image API Ops ====================
@@ -132,7 +148,9 @@ pub fn op_save_image_to_photos_album(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    with_image_api(state, "saveImageToPhotosAlbum:fail not supported", |svc| svc.save_image_to_photos_album(options_json))
+    with_image_api(state, "saveImageToPhotosAlbum:fail not supported", |svc| {
+        svc.save_image_to_photos_album(options_json)
+    })
 }
 
 /// Preview images and videos.
@@ -141,7 +159,9 @@ pub fn op_preview_media(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    with_image_api(state, "previewMedia:fail not supported", |svc| svc.preview_media(options_json))
+    with_image_api(state, "previewMedia:fail not supported", |svc| {
+        svc.preview_media(options_json)
+    })
 }
 
 /// Preview images fullscreen.
@@ -150,7 +170,9 @@ pub fn op_preview_image(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    with_image_api(state, "previewImage:fail not supported", |svc| svc.preview_image(options_json))
+    with_image_api(state, "previewImage:fail not supported", |svc| {
+        svc.preview_image(options_json)
+    })
 }
 
 /// Compress image (async, result via callback).
@@ -159,7 +181,9 @@ pub fn op_compress_image(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    with_image_api(state, "compressImage:fail not supported", |svc| svc.compress_image(options_json))
+    with_image_api(state, "compressImage:fail not supported", |svc| {
+        svc.compress_image(options_json)
+    })
 }
 
 /// Choose files from client session (async, result via callback).
@@ -168,7 +192,9 @@ pub fn op_choose_message_file(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    with_image_api(state, "chooseMessageFile:fail not supported", |svc| svc.choose_message_file(options_json))
+    with_image_api(state, "chooseMessageFile:fail not supported", |svc| {
+        svc.choose_message_file(options_json)
+    })
 }
 
 /// Choose images from album or camera (async, result via callback).
@@ -177,7 +203,9 @@ pub fn op_choose_image(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    with_image_api(state, "chooseImage:fail not supported", |svc| svc.choose_image(options_json))
+    with_image_api(state, "chooseImage:fail not supported", |svc| {
+        svc.choose_image(options_json)
+    })
 }
 
 // ==================== Video Ops ====================
@@ -189,7 +217,9 @@ pub fn op_video_create(
     state: &mut OpState,
     #[string] options_json: &str,
 ) -> Result<String, JsErrorBox> {
-    with_video(state, "createVideo:fail not supported", |v| v.create(options_json))
+    with_video(state, "createVideo:fail not supported", |v| {
+        v.create(options_json)
+    })
 }
 
 /// Start or resume video playback.
@@ -201,7 +231,9 @@ pub fn op_video_play(state: &mut OpState, #[smi] video_id: u32) -> Result<(), Js
 /// Pause video playback.
 #[op2(fast)]
 pub fn op_video_pause(state: &mut OpState, #[smi] video_id: u32) -> Result<(), JsErrorBox> {
-    with_video(state, "video.pause:fail not supported", |v| v.pause(video_id))
+    with_video(state, "video.pause:fail not supported", |v| {
+        v.pause(video_id)
+    })
 }
 
 /// Stop video playback and reset to beginning.
@@ -217,7 +249,9 @@ pub fn op_video_seek(
     #[smi] video_id: u32,
     position: f64,
 ) -> Result<(), JsErrorBox> {
-    with_video(state, "video.seek:fail not supported", |v| v.seek(video_id, position))
+    with_video(state, "video.seek:fail not supported", |v| {
+        v.seek(video_id, position)
+    })
 }
 
 /// Enter fullscreen mode.
@@ -227,7 +261,9 @@ pub fn op_video_request_fullscreen(
     #[smi] video_id: u32,
     direction: i32,
 ) -> Result<(), JsErrorBox> {
-    with_video(state, "video.requestFullScreen:fail not supported", |v| v.request_fullscreen(video_id, direction))
+    with_video(state, "video.requestFullScreen:fail not supported", |v| {
+        v.request_fullscreen(video_id, direction)
+    })
 }
 
 /// Exit fullscreen mode.
@@ -236,7 +272,9 @@ pub fn op_video_exit_fullscreen(
     state: &mut OpState,
     #[smi] video_id: u32,
 ) -> Result<(), JsErrorBox> {
-    with_video(state, "video.exitFullScreen:fail not supported", |v| v.exit_fullscreen(video_id))
+    with_video(state, "video.exitFullScreen:fail not supported", |v| {
+        v.exit_fullscreen(video_id)
+    })
 }
 
 /// Set a video property (JSON-encoded key-value pair).
@@ -246,13 +284,17 @@ pub fn op_video_set_property(
     #[smi] video_id: u32,
     #[string] options_json: &str,
 ) -> Result<(), JsErrorBox> {
-    with_video(state, "video.setProperty:fail not supported", |v| v.set_property(video_id, options_json))
+    with_video(state, "video.setProperty:fail not supported", |v| {
+        v.set_property(video_id, options_json)
+    })
 }
 
 /// Destroy a video player instance and release all resources.
 #[op2(fast)]
 pub fn op_video_destroy(state: &mut OpState, #[smi] video_id: u32) -> Result<(), JsErrorBox> {
-    with_video(state, "video.destroy:fail not supported", |v| v.destroy(video_id))
+    with_video(state, "video.destroy:fail not supported", |v| {
+        v.destroy(video_id)
+    })
 }
 
 // ==================== Extension Definition ====================

@@ -37,8 +37,8 @@
 //!
 //! All code in this module is gated behind `cfg(feature = "v8-limits")`.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use deno_core::v8;

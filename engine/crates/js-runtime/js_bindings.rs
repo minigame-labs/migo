@@ -184,7 +184,11 @@ impl JsBindings {
                 get_global_fn(scope, global, "_internalTriggerBeaconUpdate"),
                 get_global_fn(scope, global, "_internalTriggerBeaconServiceChange"),
                 get_global_fn(scope, global, "_internalTriggerBLEConnectionStateChange"),
-                get_global_fn(scope, global, "_internalTriggerBLECharacteristicValueChange"),
+                get_global_fn(
+                    scope,
+                    global,
+                    "_internalTriggerBLECharacteristicValueChange",
+                ),
                 get_global_fn(scope, global, "_internalTriggerBLEMTUChange"),
                 get_global_fn(scope, global, "_internalTriggerMemoryWarning"),
                 get_global_fn(scope, global, "_internalTriggerKeyboardInput"),

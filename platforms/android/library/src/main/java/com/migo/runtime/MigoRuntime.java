@@ -62,15 +62,14 @@ import com.migo.runtime.internal.platform.DisplayCompat;
  *             @Override
  *             public void surfaceChanged(SurfaceHolder holder, int f, int w, int h) {
  *                 if (session != null) {
- *                     session.updateSurface(holder.getSurface());
+ *                     session.updateSurface(holder.getSurface(), w, h);
  *                 }
  *             }
  *
  *             @Override
  *             public void surfaceDestroyed(SurfaceHolder holder) {
  *                 if (session != null) {
- *                     session.close();
- *                     session = null;
+ *                     session.onSurfaceDestroyed();
  *                 }
  *             }
  *         });
@@ -116,6 +115,8 @@ public final class MigoRuntime {
 
     /** Java SDK version. Must match native engine version (major.minor). */
     public static final String SDK_VERSION = "0.1.0";
+    /** Fallback API floor used when native metadata is unavailable. */
+    private static final int FALLBACK_MIN_SDK = 26;
 
     private static final Object LOCK = new Object();
     private static volatile MigoRuntime sInstance;
@@ -201,10 +202,38 @@ public final class MigoRuntime {
     /**
      * Get the minimum supported Android API level.
      *
-     * @return Minimum API level (21 = Android 5.0)
+     * @return Minimum API level required by the native engine
      */
     public int getMinSdkVersion() {
-        return 21;
+        if (!nativeLoaded) {
+            return FALLBACK_MIN_SDK;
+        }
+        try {
+            return NativeBridge.getMinApiLevel();
+        } catch (Throwable t) {
+            return FALLBACK_MIN_SDK;
+        }
+    }
+
+    /**
+     * Initialize ICU data for text shaping when the runtime was built
+     * with {@code external_icudtl}.
+     * <p>
+     * In the default embedded-ICU build this returns {@code true}
+     * immediately. In external-ICU builds, call this once before
+     * creating any {@link GameSession}.
+     *
+     * @param icuDataPath absolute path to {@code icudtl.dat}
+     * @return {@code true} if ICU data is ready for text layout
+     */
+    public boolean initIcuData(String icuDataPath) {
+        if (!nativeLoaded) {
+            return false;
+        }
+        if (icuDataPath == null || icuDataPath.trim().isEmpty()) {
+            throw new IllegalArgumentException("icuDataPath cannot be null or empty");
+        }
+        return NativeBridge.initIcuData(icuDataPath);
     }
 
     // ==================== Session Creation ====================
@@ -331,11 +360,21 @@ public final class MigoRuntime {
 
     /**
      * Check if the current device meets minimum requirements.
+     * <p>
+     * The minimum API level is sourced from the native engine
+     * (see {@link NativeBridge#getMinApiLevel()}), so this method
+     * stays in sync with the build script's {@code ANDROID_API}
+     * without requiring a Java-side constant update on every
+     * NDK preset change.  Returns {@code false} if the native
+     * library failed to load.
      *
      * @return true if device is supported
      */
     public boolean isDeviceSupported() {
-        return Build.VERSION.SDK_INT >= 21 && nativeLoaded;
+        if (!nativeLoaded) {
+            return false;
+        }
+        return Build.VERSION.SDK_INT >= getMinSdkVersion();
     }
 
     /**

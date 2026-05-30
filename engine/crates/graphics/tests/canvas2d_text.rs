@@ -15,7 +15,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::golden::{assert_matches_golden, GoldenCfg};
+use common::golden::{GoldenCfg, assert_matches_golden};
 use common::harness::{read_pixels_rgba8, with_raster_surface};
 
 use shared::protocol::color::Color as ProtoColor;
@@ -54,8 +54,7 @@ fn apply_env(
 /// `Canvas2DRenderer::state.text` directly.  This helper keeps that local
 /// to tests so production code never reaches into private state.
 fn set_font(ctx: &mut Canvas2DRenderer, size: f32) {
-    ctx.state.text.families =
-        std::sync::Arc::new(vec!["test-noto".into(), "sans-serif".into()]);
+    ctx.state.text.families = std::sync::Arc::new(vec!["test-noto".into(), "sans-serif".into()]);
     ctx.state.text.size = size;
 }
 
@@ -176,14 +175,8 @@ fn text_align_shifts_x_anchor() {
     let left_cx = dark_centroid_x(&left_buf);
     let right_cx = dark_centroid_x(&right_buf);
 
-    assert!(
-        left_cx.is_finite(),
-        "align=left rendered no visible text"
-    );
-    assert!(
-        right_cx.is_finite(),
-        "align=right rendered no visible text"
-    );
+    assert!(left_cx.is_finite(), "align=left rendered no visible text");
+    assert!(right_cx.is_finite(), "align=right rendered no visible text");
     // align=right must shift the text LEFT relative to align=left by the
     // full text width, so the right-variant centroid is strictly lower.
     assert!(
@@ -236,12 +229,8 @@ fn text_baseline_shifts_y_anchor() {
 
     // Count non-white pixels in the upper vs lower half of the canvas.
     let half = (h / 2) * w * 4;
-    let darken = |slice: &[u8]| -> u32 {
-        slice
-            .chunks_exact(4)
-            .filter(|c| c[0] < 220)
-            .count() as u32
-    };
+    let darken =
+        |slice: &[u8]| -> u32 { slice.chunks_exact(4).filter(|c| c[0] < 220).count() as u32 };
     let top_upper = darken(&top[..half as usize]);
     let top_lower = darken(&top[half as usize..]);
     let bot_upper = darken(&bottom[..half as usize]);
@@ -292,11 +281,11 @@ fn stroke_text_produces_outline_not_fill() {
     });
 
     // At least some dark pixels (the outline).
-    let dark = stroke_buf
-        .chunks_exact(4)
-        .filter(|c| c[0] < 60)
-        .count();
-    assert!(dark >= 8, "stroke outline should produce ≥8 dark pixels, got {dark}");
+    let dark = stroke_buf.chunks_exact(4).filter(|c| c[0] < 60).count();
+    assert!(
+        dark >= 8,
+        "stroke outline should produce ≥8 dark pixels, got {dark}"
+    );
 }
 
 #[test]

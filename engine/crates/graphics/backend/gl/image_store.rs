@@ -14,16 +14,13 @@
 //! [`images::borrow_from_backend_texture`]: https://skia.org/docs/user/api/gpu/
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use skia_safe::{
-    gpu::{
-        self,
-        backend_textures,
-        gl::{self as sk_gl, TextureInfo},
-        Mipmapped, SurfaceOrigin,
-    },
     AlphaType, ColorType, Image as SkImage,
+    gpu::{
+        self, Mipmapped, SurfaceOrigin, backend_textures,
+        gl::{self as sk_gl, TextureInfo},
+    },
 };
 
 /// Metadata we retain for every uploaded image.  Kept deliberately minimal;
@@ -50,15 +47,44 @@ impl GpuImageInfo {
     }
 }
 
-/// One entry in the image store.  `texture` is a raw GLuint held by the
-/// engine (uploaded via PBO or AHB from the `upload_thread`).  Ownership
-/// is exclusive: when the refcount hits zero (driven by the JS-side
-/// cache) we call `glDeleteTextures` and drop the entry.
+/// One entry in the image store.  `texture` is a raw GLuint held by
+/// the engine (uploaded via PBO or AHB from the `upload_thread`).
+/// Ownership is exclusive: when the refcount hits zero (driven by
+/// the JS-side cache) we call `glDeleteTextures` and drop the entry.
+///
+/// When [`Self::atlas_origin`] is `Some`, the `gl_texture` is an
+/// atlas page shared with other small images; `info.width/height`
+/// still describe the *logical* image size (used by JS), while the
+/// atlas page's full dimensions are given by `atlas_page_size`.
+/// Draw sites offset their source rect by `atlas_origin` and treat
+/// the Skia `SkImage` wrapper's dims as `atlas_page_size`.
 #[derive(Clone, Copy, Debug)]
 pub struct StoredImage {
     /// Raw GL texture name (GLuint).
     pub gl_texture: u32,
     pub info: GpuImageInfo,
+    /// `(x, y)` of this image within the atlas page, in pixels.
+    /// `None` when the texture is a dedicated per-image allocation
+    /// (the legacy path).
+    pub atlas_origin: Option<(u16, u16)>,
+    /// Full dimensions of the atlas page texture (always square in
+    /// our layout).  Only meaningful when `atlas_origin.is_some()`.
+    pub atlas_page_size: u16,
+}
+
+impl StoredImage {
+    /// Construct a stored image backed by its own dedicated GL
+    /// texture (no atlas).  Shortcut so call sites don't have to
+    /// spell out the atlas fields when they're not in use.
+    #[inline]
+    pub fn dedicated(gl_texture: u32, info: GpuImageInfo) -> Self {
+        Self {
+            gl_texture,
+            info,
+            atlas_origin: None,
+            atlas_page_size: 0,
+        }
+    }
 }
 
 /// Shared image registry.  Lives on the render thread — not `Send` because
@@ -71,31 +97,135 @@ pub struct StoredImage {
 /// DirectContextId.id())`; a second canvas (different DirectContext)
 /// will lazily populate its own entry on first draw.  `SkImage` is
 /// an `RCHandle`, so cloning it on cache hit is a refcount bump.
+///
+/// `in_flight` is the image lifetime refcount (P1-6): any
+/// `FramePacket` that still carries a `DrawImage { image_id }` holds
+/// a +1 reference, and `destroy_shared_image` subtracts 1 only once
+/// the packet has been executed.  When JS calls
+/// `destroyImage(id)` while the image is still in flight, the
+/// store marks the entry "pending delete" and defers the GL
+/// `glDeleteTextures` call until the refcount hits zero — without
+/// this, a future `drawImage(id)` race between JS and render thread
+/// could sample a freed GL name (undefined behaviour).
 #[derive(Default)]
 pub struct ImageStore {
     entries: HashMap<u32, StoredImage>,
-    next_id: AtomicU32,
     sk_image_cache: HashMap<(u32, u32), SkImage>,
+    /// Per-image-id in-flight counter.  Incremented when a command
+    /// carrying the id is queued into the render thread, decremented
+    /// when that command finishes executing.  A zero count means no
+    /// queued reference holds the texture alive — safe to actually
+    /// delete.  Not all code paths pin entries (tests, offline
+    /// tooling) so a missing entry is treated as zero.
+    in_flight: HashMap<u32, u32>,
+    /// Image ids whose destroy was requested while in flight.  The
+    /// actual GL texture deletion happens in
+    /// `drain_pending_deletions` once `in_flight[id]` hits zero.
+    pending_delete: HashMap<u32, StoredImage>,
 }
 
 impl ImageStore {
     pub fn new() -> Self {
         Self {
             entries: HashMap::with_capacity(32),
-            next_id: AtomicU32::new(1),
             sk_image_cache: HashMap::with_capacity(32),
+            in_flight: HashMap::with_capacity(32),
+            pending_delete: HashMap::with_capacity(8),
         }
     }
 
     /// Reserve a fresh image id.  Always `> 0`.
+    ///
+    /// Delegates to the process-global counter in
+    /// `shared::image_id` so the JS thread can allocate ids without
+    /// a render-thread round-trip — see `op_create_image` in
+    /// `js-runtime/rendering/image/mod.rs` for the JS-side caller.
     pub fn generate_id(&self) -> u32 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+        shared::image_id::next_image_id()
+    }
+
+    /// Current size of the `SkImage` wrapper cache.  Exposed for
+    /// `DebugStats.sk_image_wrappers` so the debug overlay shows
+    /// cache multiplication (image_count * live_gr_contexts).
+    #[inline]
+    pub fn wrapper_cache_len(&self) -> usize {
+        self.sk_image_cache.len()
+    }
+
+    /// Images currently queued into unexecuted frame packets —
+    /// exposed for diagnostics; a rising value without a matching
+    /// draw-call throughput increase indicates frame-packet
+    /// backlog.
+    #[inline]
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// F-1: drain every `pending_delete` entry whose in-flight
+    /// refcount has already reached zero.  Returns the freed
+    /// entries so the caller can issue `glDeleteTextures` under
+    /// the correct GL context.  Idempotent when no deletions are
+    /// pending.  Used at the post-frame Present barrier so
+    /// Skia's deferred command buffer is guaranteed to have
+    /// submitted all references to the texture before it is
+    /// freed.
+    pub fn take_unreferenced_pending_delete(&mut self) -> Vec<StoredImage> {
+        if self.pending_delete.is_empty() {
+            return Vec::new();
+        }
+        let ready_ids: Vec<u32> = self
+            .pending_delete
+            .keys()
+            .filter(|id| !self.in_flight.contains_key(id))
+            .copied()
+            .collect();
+        let mut out = Vec::with_capacity(ready_ids.len());
+        for id in ready_ids {
+            if let Some(entry) = self.pending_delete.remove(&id) {
+                out.push(entry);
+            }
+        }
+        out
+    }
+
+    /// Mark `image_id` as queued into a render-thread command.  Must
+    /// be paired 1:1 with [`Self::release_in_flight`] when the
+    /// command executes.
+    #[inline]
+    pub fn retain_in_flight(&mut self, image_id: u32) {
+        *self.in_flight.entry(image_id).or_insert(0) += 1;
+    }
+
+    /// Decrement the in-flight refcount.  When it hits zero and
+    /// a destroy was previously deferred, the (removed) entry is
+    /// returned so the caller can issue `glDeleteTextures` on its
+    /// raw name.  Returning the entry rather than calling `gl`
+    /// here keeps the store `!Send`-free and avoids wiring a
+    /// `glow::Context` reference through every release site.
+    #[must_use = "GL texture must be deleted by the caller when returned"]
+    pub fn release_in_flight(&mut self, image_id: u32) -> Option<StoredImage> {
+        if let Some(count) = self.in_flight.get_mut(&image_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.in_flight.remove(&image_id);
+            }
+        }
+        if !self.in_flight.contains_key(&image_id) {
+            self.pending_delete.remove(&image_id)
+        } else {
+            None
+        }
     }
 
     pub fn insert(&mut self, image_id: u32, entry: StoredImage) {
         self.entries.insert(image_id, entry);
     }
 
+    /// Remove an entry by id.  If the image is still in flight the
+    /// entry is moved into `pending_delete` and `None` is returned
+    /// — the actual GL texture deletion must wait until the final
+    /// in-flight reference is released.  Otherwise returns the
+    /// entry so the caller can delete the GL texture immediately.
     pub fn remove(&mut self, image_id: u32) -> Option<StoredImage> {
         // Evict every SkImage wrapper that pointed at this image id
         // so a future insert with the same id doesn't accidentally
@@ -110,7 +240,18 @@ impl ImageStore {
         for k in stale_keys {
             self.sk_image_cache.remove(&k);
         }
-        self.entries.remove(&image_id)
+        let entry = self.entries.remove(&image_id)?;
+        if self.in_flight.contains_key(&image_id) {
+            // Still referenced by an unexecuted command; defer the
+            // GL deletion.  The render thread's per-frame packet
+            // completion path calls `release_in_flight`, which
+            // eventually returns this entry to the caller for
+            // glDeleteTextures.
+            self.pending_delete.insert(image_id, entry);
+            None
+        } else {
+            Some(entry)
+        }
     }
 
     pub fn get(&self, image_id: u32) -> Option<&StoredImage> {
@@ -234,10 +375,7 @@ mod tests {
         let id = s.generate_id();
         s.insert(
             id,
-            StoredImage {
-                gl_texture: 42,
-                info: GpuImageInfo::rgba8_unpremul(64, 64),
-            },
+            StoredImage::dedicated(42, GpuImageInfo::rgba8_unpremul(64, 64)),
         );
         let got = s.get(id).expect("missing");
         assert_eq!(got.gl_texture, 42);
@@ -250,10 +388,7 @@ mod tests {
         let id = s.generate_id();
         s.insert(
             id,
-            StoredImage {
-                gl_texture: 1,
-                info: GpuImageInfo::rgba8_unpremul(1, 1),
-            },
+            StoredImage::dedicated(1, GpuImageInfo::rgba8_unpremul(1, 1)),
         );
         assert!(s.remove(id).is_some());
         assert!(s.remove(id).is_none());
@@ -271,10 +406,7 @@ mod tests {
         let id = s.generate_id();
         s.insert(
             id,
-            StoredImage {
-                gl_texture: 1,
-                info: GpuImageInfo::rgba8_unpremul(4, 4),
-            },
+            StoredImage::dedicated(1, GpuImageInfo::rgba8_unpremul(4, 4)),
         );
         // Populate the cache directly (can't call resolve_cached_or_wrap
         // without a live DirectContext in pure-Rust tests).
@@ -287,12 +419,8 @@ mod tests {
             // immediately forgotten.
             {
                 // A trivial 1x1 raster SkImage works as a placeholder.
-                let info = skia_safe::ImageInfo::new(
-                    (1, 1),
-                    ColorType::RGBA8888,
-                    AlphaType::Premul,
-                    None,
-                );
+                let info =
+                    skia_safe::ImageInfo::new((1, 1), ColorType::RGBA8888, AlphaType::Premul, None);
                 let mut surf = skia_safe::surfaces::raster(&info, None, None).unwrap();
                 surf.image_snapshot()
             },
@@ -307,12 +435,7 @@ mod tests {
         // Build a two-context shape: ctx_tag A has two images, ctx B
         // has one.  Purging A's wrappers leaves B's untouched.
         let mut s = ImageStore::new();
-        let info = skia_safe::ImageInfo::new(
-            (1, 1),
-            ColorType::RGBA8888,
-            AlphaType::Premul,
-            None,
-        );
+        let info = skia_safe::ImageInfo::new((1, 1), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut mk_img = || {
             skia_safe::surfaces::raster(&info, None, None)
                 .unwrap()
@@ -335,12 +458,7 @@ mod tests {
     #[test]
     fn purge_then_new_ctx_tag_isolates_pre_resize_wrappers() {
         let mut s = ImageStore::new();
-        let info = skia_safe::ImageInfo::new(
-            (1, 1),
-            ColorType::RGBA8888,
-            AlphaType::Premul,
-            None,
-        );
+        let info = skia_safe::ImageInfo::new((1, 1), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut mk_img = || {
             skia_safe::surfaces::raster(&info, None, None)
                 .unwrap()

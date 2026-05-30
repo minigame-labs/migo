@@ -42,6 +42,11 @@ import {
     op_active_texture,
     op_tex_image_2d,
     op_tex_image_2d_from_image,
+    op_tex_image_2d_from_snapshot,
+    op_tex_image_2d_from_canvas2d,
+    op_tex_image_2d_from_text_cache,
+    op_tex_sub_image_2d_from_snapshot,
+    op_tex_sub_image_2d_from_canvas2d,
     op_tex_sub_image_2d,
     op_tex_sub_image_2d_from_image,
     op_tex_parameteri,
@@ -127,6 +132,24 @@ import {
     op_draw_buffers,
     op_read_buffer,
     op_alloc_gl_resource_id as op_alloc_gl_resource_id_webgl2,
+    op_webgl_query_compressed_caps,
+    op_create_query,
+    op_delete_query,
+    op_begin_query,
+    op_end_query,
+    op_get_query_parameter,
+    op_create_transform_feedback,
+    op_delete_transform_feedback,
+    op_bind_transform_feedback,
+    op_begin_transform_feedback,
+    op_end_transform_feedback,
+    op_pause_transform_feedback,
+    op_resume_transform_feedback,
+    op_transform_feedback_varyings,
+    op_get_transform_feedback_varying,
+    op_tex_image_3d,
+    op_tex_sub_image_3d,
+    op_tex_storage_3d,
 } from "ext:core/ops";
 
 import { core, primordials } from "ext:core/mod.js";
@@ -148,6 +171,9 @@ const {
 } = primordials;
 
 import { WebglConstants } from "./01_constants.js";
+
+const GL_CURRENT_QUERY = 0x8865;
+const GL_INVALID_OPERATION = 0x0502;
 
 function toTypedArray(input, Type) {
     if (isTypedArray(input)) {
@@ -186,6 +212,43 @@ function toUnit32Array(input) {
 function toInt32AsUint32(input) {
     const i32 = toTypedArray(input, Int32Array);
     return new Uint32Array(i32.buffer, i32.byteOffset, i32.length);
+}
+
+// Direct-path detection: cocos's `gl.texImage2D(target, ..., canvas)`
+// pattern hands us an HTMLCanvasElement.  These have a numeric `_rid`
+// (allocated by op_create_canvas) and a `getContext` method.  When we
+// see one, we route to the GPU->GPU `op_tex_image_2d_from_canvas2d`
+// instead of the legacy sourceToRawRgba->getImageData->readback dance.
+function _migoIsHTMLCanvas(source) {
+    return source
+        && typeof source === "object"
+        && typeof source._rid === "number"
+        && typeof source.getContext === "function";
+}
+
+// Text texture cache HIT: `getImageData` returned a synthetic
+// ImageData carrying `__migo_text_cache_key__` (the offscreen
+// fillText was suppressed).  Route straight to the cached-texture
+// copy; the render thread unpins the entry after the GPU copy.
+// Returns true when it handled the upload.
+function _migoTexImageFromTextCache(canvasId, target, level, internalformat, src) {
+    if (!src || typeof src !== "object") return false;
+    const k = src.__migo_text_cache_key__;
+    if (!k) return false;
+    op_tex_image_2d_from_text_cache(
+        canvasId,
+        target,
+        level,
+        internalformat,
+        k.text, k.fontRequest, k.fontSize, k.fontWeight,
+        k.italic, k.fillColor, k.textAlign, k.textBaseline,
+        k.canvasW, k.canvasH,
+    );
+    // Single-shot: clear the marker so a re-upload of the same
+    // ImageData object doesn't double-consume the (already unpinned)
+    // entry.
+    src.__migo_text_cache_key__ = null;
+    return true;
 }
 
 function sourceToRawRgba(source) {
@@ -259,6 +322,7 @@ class WebGLRenderingContext {
         this._programParameterCache = new Map();
         // shaderId -> Map(pname -> value)
         this._shaderParameterCache = new Map();
+        this._jsErrorQueue = [];
 
         // Record the negotiated attributes so `getContextAttributes()`
         // returns real values instead of bare spec defaults.  We do
@@ -293,6 +357,10 @@ class WebGLRenderingContext {
         this._attribLocationCache.delete(programId);
         this._uniformLocationCache.delete(programId);
         this._programParameterCache.delete(programId);
+    }
+
+    _pushJsError(code) {
+        this._jsErrorQueue.push(code >>> 0);
     }
 
     get canvas() {
@@ -584,6 +652,9 @@ class WebGLRenderingContext {
     }
 
     getError() {
+        if (this._jsErrorQueue.length > 0) {
+            return this._jsErrorQueue.shift();
+        }
         // Drain one entry from the host-side per-context WebGL
         // error queue.  Returns `NO_ERROR (0)` when empty.  Any
         // validator op that detects an illegal enum / value /
@@ -634,6 +705,31 @@ class WebGLRenderingContext {
             return this._angleInstancedArrays ||
                 (this._angleInstancedArrays = this._buildAngleInstancedArrays());
         }
+        // Multiple render targets.  The underlying op is the WebGL 2
+        // `drawBuffers`; the WebGL 1 alias just re-spells the method
+        // name and enum prefix, so Cocos / three.js deferred paths
+        // can detect support and light up G-buffer rendering.
+        if (name === 'WEBGL_draw_buffers') {
+            return this._webglDrawBuffers ||
+                (this._webglDrawBuffers = this._buildWebglDrawBuffers());
+        }
+        // Compressed texture uploads.  The Rust backend accepts
+        // ETC2/EAC unconditionally (GLES 3.0 core) and ASTC when
+        // the device advertises GL_KHR_texture_compression_astc_*.
+        // Exposing the extensions here lets engines pick the
+        // compressed asset path instead of falling back to RGBA,
+        // which can save ~16 MiB of heap per 2048^2 texture.
+        if (name === 'WEBGL_compressed_texture_etc' ||
+            name === 'WEBGL_compressed_texture_etc1') {
+            if (!(this._compressedCaps & 1)) return null;
+            return this._webglCompressedEtc ||
+                (this._webglCompressedEtc = this._buildCompressedEtc());
+        }
+        if (name === 'WEBGL_compressed_texture_astc') {
+            if (!(this._compressedCaps & 2)) return null;
+            return this._webglCompressedAstc ||
+                (this._webglCompressedAstc = this._buildCompressedAstc());
+        }
         return null;
     }
 
@@ -641,12 +737,130 @@ class WebGLRenderingContext {
         // Mirror the subset `getExtension` actually honours so
         // engines that probe the list before requesting (three.js,
         // pixi.js in some configurations) see the expected set.
-        return [
+        const list = [
             'OES_vertex_array_object',
             'ANGLE_instanced_arrays',
             'EXT_instanced_arrays',
             'WEBGL_instanced_arrays',
+            'WEBGL_draw_buffers',
         ];
+        const caps = this._compressedCaps;
+        if (caps & 1) {
+            list.push('WEBGL_compressed_texture_etc');
+            list.push('WEBGL_compressed_texture_etc1');
+        }
+        if (caps & 2) {
+            list.push('WEBGL_compressed_texture_astc');
+        }
+        return list;
+    }
+
+    // Compressed-texture caps snapshot.  Lazily read once per
+    // context; the render thread sets the caps before any JS GL
+    // call completes, so caching this is safe.  Bit 0 = ETC2,
+    // bit 1 = ASTC.  See `op_webgl_query_compressed_caps`.
+    get _compressedCaps() {
+        if (this._compressedCapsCache === undefined) {
+            this._compressedCapsCache = op_webgl_query_compressed_caps() | 0;
+        }
+        return this._compressedCapsCache;
+    }
+
+    _buildWebglDrawBuffers() {
+        // Enum table from the WEBGL_draw_buffers extension spec.
+        // The numeric values match the GLES 3.0 core enums
+        // (`GL_COLOR_ATTACHMENT0_WEBGL == GL_COLOR_ATTACHMENT0`),
+        // so we can forward the untransformed buffer list straight
+        // to `op_draw_buffers`.
+        const ctx = this;
+        const obj = {
+            COLOR_ATTACHMENT0_WEBGL: 0x8CE0,
+            COLOR_ATTACHMENT1_WEBGL: 0x8CE1,
+            COLOR_ATTACHMENT2_WEBGL: 0x8CE2,
+            COLOR_ATTACHMENT3_WEBGL: 0x8CE3,
+            COLOR_ATTACHMENT4_WEBGL: 0x8CE4,
+            COLOR_ATTACHMENT5_WEBGL: 0x8CE5,
+            COLOR_ATTACHMENT6_WEBGL: 0x8CE6,
+            COLOR_ATTACHMENT7_WEBGL: 0x8CE7,
+            COLOR_ATTACHMENT8_WEBGL: 0x8CE8,
+            COLOR_ATTACHMENT9_WEBGL: 0x8CE9,
+            COLOR_ATTACHMENT10_WEBGL: 0x8CEA,
+            COLOR_ATTACHMENT11_WEBGL: 0x8CEB,
+            COLOR_ATTACHMENT12_WEBGL: 0x8CEC,
+            COLOR_ATTACHMENT13_WEBGL: 0x8CED,
+            COLOR_ATTACHMENT14_WEBGL: 0x8CEE,
+            COLOR_ATTACHMENT15_WEBGL: 0x8CEF,
+            DRAW_BUFFER0_WEBGL: 0x8825,
+            DRAW_BUFFER1_WEBGL: 0x8826,
+            DRAW_BUFFER2_WEBGL: 0x8827,
+            DRAW_BUFFER3_WEBGL: 0x8828,
+            DRAW_BUFFER4_WEBGL: 0x8829,
+            DRAW_BUFFER5_WEBGL: 0x882A,
+            DRAW_BUFFER6_WEBGL: 0x882B,
+            DRAW_BUFFER7_WEBGL: 0x882C,
+            DRAW_BUFFER8_WEBGL: 0x882D,
+            DRAW_BUFFER9_WEBGL: 0x882E,
+            DRAW_BUFFER10_WEBGL: 0x882F,
+            DRAW_BUFFER11_WEBGL: 0x8830,
+            DRAW_BUFFER12_WEBGL: 0x8831,
+            DRAW_BUFFER13_WEBGL: 0x8832,
+            DRAW_BUFFER14_WEBGL: 0x8833,
+            DRAW_BUFFER15_WEBGL: 0x8834,
+            MAX_COLOR_ATTACHMENTS_WEBGL: 0x8CDF,
+            MAX_DRAW_BUFFERS_WEBGL: 0x8824,
+            drawBuffersWEBGL(buffers) {
+                const buf = new Uint32Array(buffers);
+                op_draw_buffers(ctx._canvasId, buf);
+            },
+        };
+        return obj;
+    }
+
+    _buildCompressedEtc() {
+        // ETC2/EAC format enum block.  No methods - data upload
+        // goes through `compressedTexImage2D` like every other
+        // compressed extension.  Values mirror the GLES 3.0 core
+        // internal-format constants so our existing
+        // `op_compressed_tex_image_2d` accepts them unchanged.
+        return {
+            COMPRESSED_R11_EAC: 0x9270,
+            COMPRESSED_SIGNED_R11_EAC: 0x9271,
+            COMPRESSED_RG11_EAC: 0x9272,
+            COMPRESSED_SIGNED_RG11_EAC: 0x9273,
+            COMPRESSED_RGB8_ETC2: 0x9274,
+            COMPRESSED_SRGB8_ETC2: 0x9275,
+            COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2: 0x9276,
+            COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2: 0x9277,
+            COMPRESSED_RGBA8_ETC2_EAC: 0x9278,
+            COMPRESSED_SRGB8_ALPHA8_ETC2_EAC: 0x9279,
+        };
+    }
+
+    _buildCompressedAstc() {
+        // ASTC LDR format block.  Included enums are the subset the
+        // compressed upload path accepts (see
+        // `graphics/compressed_upload.rs::CompressedFormat`).  Games
+        // that query the full ASTC enum table get the 4x4 / 6x6 /
+        // 8x8 blocks we actually decode.
+        return {
+            COMPRESSED_RGBA_ASTC_4x4_KHR: 0x93B0,
+            COMPRESSED_RGBA_ASTC_5x4_KHR: 0x93B1,
+            COMPRESSED_RGBA_ASTC_5x5_KHR: 0x93B2,
+            COMPRESSED_RGBA_ASTC_6x5_KHR: 0x93B3,
+            COMPRESSED_RGBA_ASTC_6x6_KHR: 0x93B4,
+            COMPRESSED_RGBA_ASTC_8x5_KHR: 0x93B5,
+            COMPRESSED_RGBA_ASTC_8x6_KHR: 0x93B6,
+            COMPRESSED_RGBA_ASTC_8x8_KHR: 0x93B7,
+            COMPRESSED_RGBA_ASTC_10x5_KHR: 0x93B8,
+            COMPRESSED_RGBA_ASTC_10x6_KHR: 0x93B9,
+            COMPRESSED_RGBA_ASTC_10x8_KHR: 0x93BA,
+            COMPRESSED_RGBA_ASTC_10x10_KHR: 0x93BB,
+            COMPRESSED_RGBA_ASTC_12x10_KHR: 0x93BC,
+            COMPRESSED_RGBA_ASTC_12x12_KHR: 0x93BD,
+            COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR: 0x93D0,
+            COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR: 0x93D4,
+            COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR: 0x93D7,
+        };
     }
 
     _buildAngleInstancedArrays() {
@@ -715,10 +929,116 @@ class WebGLRenderingContext {
         // 9-arg: (target, level, internalformat, width, height, border, format, type, pixels)
         // 6-arg: (target, level, internalformat, format, type, source)
         if (a7 !== undefined) {
+            // Text texture cache hit takes precedence: a suppressed
+            // fillText produced no snapshot, only a cache marker.
+            if (_migoTexImageFromTextCache(this._canvasId, target, level, internalformat, a9)) {
+                return;
+            }
+            // 9-arg form.  When `pixels` is a synthetic snapshot
+            // ImageData (__migo_snapshot_id__ set by 02_2d_context's
+            // getImageData), promote to the GPU-side copy path so we
+            // don't upload the zero-filled placeholder.  Width/height
+            // must match the snapshot's; if they don't (caller built
+            // an ImageData with mismatched dims) fall back to bytes.
+            const snapshotId =
+                a9 && typeof a9 === "object" && (a9.__migo_snapshot_id__ | 0);
+            if (
+                snapshotId &&
+                snapshotId !== 0 &&
+                a9.width === a4 &&
+                a9.height === a5
+            ) {
+                op_tex_image_2d_from_snapshot(
+                    this._canvasId,
+                    target,
+                    level,
+                    internalformat,
+                    a7,
+                    a8,
+                    snapshotId,
+                );
+                return;
+            }
+            // Direct GPU->GPU path for HTMLCanvasElement source where
+            // caller-supplied (width, height) match the canvas dims.
+            // Partial / scaled uploads fall through to bytes.
+            if (_migoIsHTMLCanvas(a9) && a9.width === a4 && a9.height === a5) {
+                // Text texture cache: cocos's real upload path is
+                // texImage2D(canvasElement), so the hit/record decision
+                // lives here, keyed off the source canvas's 2D context.
+                const ctx9 = a9._context;
+                if (ctx9 && typeof ctx9._consumeTextCacheForTexImage === "function"
+                        && ctx9._consumeTextCacheForTexImage(
+                            this._canvasId, target, level, internalformat)) {
+                    return;
+                }
+                op_tex_image_2d_from_canvas2d(
+                    this._canvasId,
+                    target,
+                    level,
+                    internalformat,
+                    a9._rid,
+                    0,
+                    0,
+                    a4 | 0,
+                    a5 | 0,
+                );
+                return;
+            }
             const data = a9 != null ? toUnit8Array(a9) : null;
             op_tex_image_2d(this._canvasId, target, level, internalformat, a4, a5, a6, a7, a8, data);
         } else {
             const source = a6;
+            // Text texture cache hit (6-arg spec form).
+            if (_migoTexImageFromTextCache(this._canvasId, target, level, internalformat, source)) {
+                return;
+            }
+            // 6-arg form.  Same snapshot detection as the 9-arg
+            // branch -- handles the spec form `texImage2D(target,
+            // level, ifmt, format, type, ImageData)` that some games
+            // call with the synthetic ImageData.
+            const snapshotId =
+                source && typeof source === "object"
+                    ? (source.__migo_snapshot_id__ | 0)
+                    : 0;
+            if (snapshotId !== 0) {
+                op_tex_image_2d_from_snapshot(
+                    this._canvasId,
+                    target,
+                    level,
+                    internalformat,
+                    a4,
+                    a5,
+                    snapshotId,
+                );
+                return;
+            }
+            // Direct GPU->GPU path: cocos's text-label pattern feeds an
+            // HTMLCanvasElement here.  Skip getImageData + readback.
+            if (_migoIsHTMLCanvas(source)) {
+                const cw = source.width | 0;
+                const ch = source.height | 0;
+                if (cw > 0 && ch > 0) {
+                    const ctx6 = source._context;
+                    if (ctx6 && typeof ctx6._consumeTextCacheForTexImage === "function"
+                            && ctx6._consumeTextCacheForTexImage(
+                                this._canvasId, target, level, internalformat)) {
+                        return;
+                    }
+                    op_tex_image_2d_from_canvas2d(
+                        this._canvasId,
+                        target,
+                        level,
+                        internalformat,
+                        source._rid,
+                        0,
+                        0,
+                        cw,
+                        ch,
+                    );
+                    return;
+                }
+            }
             const imageId = source && typeof source.rid === "number" ? source.rid : null;
             if (imageId != null) {
                 op_tex_image_2d_from_image(this._canvasId, target, level, internalformat, a4, a5, imageId);
@@ -749,6 +1069,54 @@ class WebGLRenderingContext {
         // 9-arg: (..., width, height, format, type, pixels)
         if (pixels !== undefined) {
             if (pixels == null) return;
+            // Snapshot fast path: when `pixels` is the synthetic
+            // ImageData from getImageData(), uploading its `data` field
+            // would copy zero bytes (the placeholder).  Route to the
+            // GPU-side copy op instead.  Only safe when caller's
+            // (width, height) matches the snapshot's exactly -- partial
+            // copies need the legacy bytes path.
+            const snapshotId =
+                pixels && typeof pixels === "object"
+                    ? (pixels.__migo_snapshot_id__ | 0)
+                    : 0;
+            if (
+                snapshotId !== 0 &&
+                pixels.width === width &&
+                pixels.height === height
+            ) {
+                op_tex_sub_image_2d_from_snapshot(
+                    this._canvasId,
+                    target,
+                    level,
+                    xoffset,
+                    yoffset,
+                    format,
+                    type,
+                    snapshotId,
+                );
+                return;
+            }
+            // Direct GPU->GPU path for HTMLCanvasElement with matching
+            // dims (cocos atlas-update pattern).
+            if (
+                _migoIsHTMLCanvas(pixels) &&
+                pixels.width === width &&
+                pixels.height === height
+            ) {
+                op_tex_sub_image_2d_from_canvas2d(
+                    this._canvasId,
+                    target,
+                    level,
+                    xoffset,
+                    yoffset,
+                    pixels._rid,
+                    0,
+                    0,
+                    width | 0,
+                    height | 0,
+                );
+                return;
+            }
             const data = toUnit8Array(pixels);
             op_tex_sub_image_2d(this._canvasId, target, level, xoffset, yoffset, width, height, format, type, data);
             return;
@@ -758,6 +1126,46 @@ class WebGLRenderingContext {
         const source = format;
         const sourceFormat = width;
         const sourceType = height;
+        // 7-arg snapshot detection: the source's intrinsic size is used,
+        // so the snapshot's own (width, height) is authoritative.
+        const subSnapshotId =
+            source && typeof source === "object"
+                ? (source.__migo_snapshot_id__ | 0)
+                : 0;
+        if (subSnapshotId !== 0) {
+            op_tex_sub_image_2d_from_snapshot(
+                this._canvasId,
+                target,
+                level,
+                xoffset,
+                yoffset,
+                sourceFormat,
+                sourceType,
+                subSnapshotId,
+            );
+            return;
+        }
+        // Direct GPU->GPU path for HTMLCanvasElement (7-arg form has
+        // no explicit dims; the canvas's intrinsic size is the source).
+        if (_migoIsHTMLCanvas(source)) {
+            const cw = source.width | 0;
+            const ch = source.height | 0;
+            if (cw > 0 && ch > 0) {
+                op_tex_sub_image_2d_from_canvas2d(
+                    this._canvasId,
+                    target,
+                    level,
+                    xoffset,
+                    yoffset,
+                    source._rid,
+                    0,
+                    0,
+                    cw,
+                    ch,
+                );
+                return;
+            }
+        }
         const imageId = source && typeof source.rid === "number" ? source.rid : null;
         if (imageId != null) {
             op_tex_sub_image_2d_from_image(
@@ -979,6 +1387,10 @@ Object.assign(WebGLRenderingContext.prototype, WebglConstants);
 class WebGL2RenderingContext extends WebGLRenderingContext {
     constructor(canvas) {
         super(canvas);
+        this._queryRegistry = new Map();
+        this._currentQueryByTarget = new Map();
+        this._tfRegistry = new Map();
+        this._currentTransformFeedback = null;
     }
 
     // ---- Vertex Array Objects ----------------------------------
@@ -1090,6 +1502,241 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
     }
     readBuffer(src) {
         op_read_buffer(this._canvasId, src);
+    }
+
+    // ---- Query objects -----------------------------------------
+    createQuery() {
+        const id = op_alloc_gl_resource_id_webgl2();
+        op_create_query(this._canvasId, id);
+        const query = { _id: id, _kind: 'query' };
+        this._queryRegistry.set(id, {
+            active: false,
+            boundOnce: false,
+            deleted: false,
+            target: 0,
+        });
+        return query;
+    }
+    deleteQuery(query) {
+        if (!query || !query._id) return;
+        const state = this._queryRegistry.get(query._id);
+        if (!state || state.deleted) return;
+        state.deleted = true;
+        state.active = false;
+        if (this._currentQueryByTarget.get(state.target) === query) {
+            this._currentQueryByTarget.delete(state.target);
+        }
+        op_delete_query(query._id);
+    }
+    isQuery(query) {
+        if (!query || !query._id) return false;
+        const state = this._queryRegistry.get(query._id);
+        return !!(state && state.boundOnce && !state.deleted);
+    }
+    beginQuery(target, query) {
+        if (!query || !query._id) return;
+        const state = this._queryRegistry.get(query._id);
+        if (!state || state.deleted) return;
+        state.boundOnce = true;
+        state.target = target;
+        state.active = true;
+        this._currentQueryByTarget.set(target, query);
+        op_begin_query(this._canvasId, target, query._id);
+    }
+    endQuery(target) {
+        const query = this._currentQueryByTarget.get(target);
+        if (query) {
+            const state = this._queryRegistry.get(query._id);
+            if (state) state.active = false;
+        }
+        this._currentQueryByTarget.delete(target);
+        op_end_query(this._canvasId, target);
+    }
+    getQuery(target, pname) {
+        if (pname !== GL_CURRENT_QUERY) return null;
+        return this._currentQueryByTarget.get(target) || null;
+    }
+    /**
+     * Synchronous query parameter fetch.  Supported pname values:
+     *   QUERY_RESULT           (0x8866) - u32 sample count / timer delta
+     *   QUERY_RESULT_AVAILABLE (0x8867) - 0 or 1
+     * Callers typically poll AVAILABLE before reading RESULT.
+     */
+    getQueryParameter(query, pname) {
+        if (!query || !query._id) return 0;
+        return op_get_query_parameter(query._id, pname);
+    }
+
+    // ---- Transform Feedback ------------------------------------
+    createTransformFeedback() {
+        const id = op_alloc_gl_resource_id_webgl2();
+        op_create_transform_feedback(this._canvasId, id);
+        const tf = { _id: id, _kind: 'tf' };
+        this._tfRegistry.set(id, {
+            active: false,
+            boundOnce: false,
+            deleted: false,
+            paused: false,
+        });
+        return tf;
+    }
+    deleteTransformFeedback(tf) {
+        if (!tf || !tf._id) return;
+        const state = this._tfRegistry.get(tf._id);
+        if (!state || state.deleted) return;
+        if (state.active || state.paused) {
+            this._pushJsError(GL_INVALID_OPERATION);
+            return;
+        }
+        state.deleted = true;
+        if (this._currentTransformFeedback === tf) {
+            this._currentTransformFeedback = null;
+        }
+        op_delete_transform_feedback(tf._id);
+    }
+    isTransformFeedback(tf) {
+        if (!tf || !tf._id) return false;
+        const state = this._tfRegistry.get(tf._id);
+        return !!(state && state.boundOnce && !state.deleted);
+    }
+    bindTransformFeedback(target, tf) {
+        this._currentTransformFeedback = tf || null;
+        if (tf && tf._id) {
+            const state = this._tfRegistry.get(tf._id);
+            if (state && !state.deleted) {
+                state.boundOnce = true;
+            }
+        }
+        op_bind_transform_feedback(this._canvasId, target, tf ? tf._id : 0);
+    }
+    beginTransformFeedback(primitiveMode) {
+        if (this._currentTransformFeedback && this._currentTransformFeedback._id) {
+            const state = this._tfRegistry.get(this._currentTransformFeedback._id);
+            if (state && !state.deleted) {
+                state.active = true;
+                state.paused = false;
+            }
+        }
+        op_begin_transform_feedback(this._canvasId, primitiveMode);
+    }
+    endTransformFeedback() {
+        if (this._currentTransformFeedback && this._currentTransformFeedback._id) {
+            const state = this._tfRegistry.get(this._currentTransformFeedback._id);
+            if (state) {
+                state.active = false;
+                state.paused = false;
+            }
+        }
+        op_end_transform_feedback(this._canvasId);
+    }
+    pauseTransformFeedback() {
+        if (this._currentTransformFeedback && this._currentTransformFeedback._id) {
+            const state = this._tfRegistry.get(this._currentTransformFeedback._id);
+            if (state && state.active && !state.deleted) {
+                state.paused = true;
+            }
+        }
+        op_pause_transform_feedback(this._canvasId);
+    }
+    resumeTransformFeedback() {
+        if (this._currentTransformFeedback && this._currentTransformFeedback._id) {
+            const state = this._tfRegistry.get(this._currentTransformFeedback._id);
+            if (state && state.active && !state.deleted) {
+                state.paused = false;
+            }
+        }
+        op_resume_transform_feedback(this._canvasId);
+    }
+    /**
+     * transformFeedbackVaryings(program, varyings, bufferMode)
+     * The varyings array is sent as a single US-separated string
+     * because the fast op lane accepts one `#[string]` argument
+     * per call.  ASCII 0x1F (Unit Separator) is chosen because
+     * it can't legally appear in GLSL identifiers.
+     */
+    transformFeedbackVaryings(program, varyings, bufferMode) {
+        if (!program || !program._id) return;
+        const joined = (varyings || []).join('\x1f');
+        op_transform_feedback_varyings(this._canvasId, program._id, joined, bufferMode);
+    }
+    getTransformFeedbackVarying(program, index) {
+        if (!program || !program._id) return null;
+        const json = op_get_transform_feedback_varying(program._id, index);
+        if (!json) return null;
+        try {
+            return JSON.parse(json);
+        } catch (_) {
+            return null;
+        }
+    }
+
+    // ---- 3D textures -------------------------------------------
+    texImage3D(
+        target, level, internalformat,
+        width, height, depth, border,
+        format, type, pixelsOrOffset, srcOffset
+    ) {
+        // WebGL 2 overloads: data may be ArrayBufferView + optional
+        // srcOffset, a PBO offset integer, or null (reserve storage).
+        let view = null;
+        let bytesPerElement = 1;
+        let elementOffset = Number(srcOffset) || 0;
+        let pboOffset = -1;
+        if (typeof pixelsOrOffset === 'number') {
+            pboOffset = pixelsOrOffset | 0;
+        } else if (pixelsOrOffset && pixelsOrOffset.buffer) {
+            bytesPerElement = pixelsOrOffset.BYTES_PER_ELEMENT || 1;
+            view = new Uint8Array(
+                pixelsOrOffset.buffer,
+                pixelsOrOffset.byteOffset || 0,
+                pixelsOrOffset.byteLength || 0,
+            );
+        } else if (pixelsOrOffset instanceof ArrayBuffer) {
+            view = new Uint8Array(pixelsOrOffset);
+        }
+        op_tex_image_3d(
+            this._canvasId, target, level, internalformat,
+            width, height, depth, border, format, type,
+            view, elementOffset, bytesPerElement, pboOffset,
+        );
+    }
+    texSubImage3D(
+        target, level,
+        xoffset, yoffset, zoffset,
+        width, height, depth,
+        format, type, pixelsOrOffset, srcOffset
+    ) {
+        let view = null;
+        let bytesPerElement = 1;
+        let elementOffset = Number(srcOffset) || 0;
+        let pboOffset = -1;
+        if (typeof pixelsOrOffset === 'number') {
+            pboOffset = pixelsOrOffset | 0;
+        } else if (pixelsOrOffset && pixelsOrOffset.buffer) {
+            bytesPerElement = pixelsOrOffset.BYTES_PER_ELEMENT || 1;
+            view = new Uint8Array(
+                pixelsOrOffset.buffer,
+                pixelsOrOffset.byteOffset || 0,
+                pixelsOrOffset.byteLength || 0,
+            );
+        } else if (pixelsOrOffset) {
+            view = new Uint8Array(pixelsOrOffset);
+        }
+        if (!view && pboOffset < 0) {
+            return;
+        }
+        op_tex_sub_image_3d(
+            this._canvasId, target, level,
+            xoffset, yoffset, zoffset,
+            width, height, depth, format, type,
+            view, elementOffset, bytesPerElement, pboOffset,
+        );
+    }
+    texStorage3D(target, levels, internalformat, width, height, depth) {
+        op_tex_storage_3d(
+            this._canvasId, target, levels, internalformat,
+            width, height, depth,
+        );
     }
 }
 

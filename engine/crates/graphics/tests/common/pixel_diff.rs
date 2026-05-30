@@ -41,8 +41,7 @@ impl PixelDiff {
 /// Panics if the PNG does not decode as 8-bit RGBA.  Goldens are always
 /// authored in that format so a mismatch is a programmer error.
 pub fn load_png_rgba8(path: &Path) -> (u32, u32, Vec<u8>) {
-    let file = File::open(path)
-        .unwrap_or_else(|e| panic!("failed to open golden {path:?}: {e}"));
+    let file = File::open(path).unwrap_or_else(|e| panic!("failed to open golden {path:?}: {e}"));
     let decoder = Decoder::new(BufReader::new(file));
     let mut reader = decoder
         .read_info()
@@ -73,11 +72,9 @@ pub fn load_png_rgba8(path: &Path) -> (u32, u32, Vec<u8>) {
 pub fn save_png_rgba8(path: &Path, w: u32, h: u32, rgba: &[u8]) {
     assert_eq!(rgba.len(), (w * h * 4) as usize);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .unwrap_or_else(|e| panic!("mkdir -p {parent:?}: {e}"));
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("mkdir -p {parent:?}: {e}"));
     }
-    let file = File::create(path)
-        .unwrap_or_else(|e| panic!("create {path:?}: {e}"));
+    let file = File::create(path).unwrap_or_else(|e| panic!("create {path:?}: {e}"));
     let mut encoder = Encoder::new(BufWriter::new(file), w, h);
     encoder.set_color(ColorType::Rgba);
     encoder.set_depth(BitDepth::Eight);
@@ -90,12 +87,7 @@ pub fn save_png_rgba8(path: &Path, w: u32, h: u32, rgba: &[u8]) {
 }
 
 /// Exact comparison (tolerance = 0) of two RGBA buffers of identical shape.
-pub fn compare_exact(
-    w: u32,
-    h: u32,
-    actual: &[u8],
-    expected: &[u8],
-) -> PixelDiff {
+pub fn compare_exact(w: u32, h: u32, actual: &[u8], expected: &[u8]) -> PixelDiff {
     compare_tolerant(w, h, actual, expected, 0)
 }
 
@@ -165,13 +157,7 @@ pub fn compare_tolerant(
 
 /// Build a synthetic "diff" image that highlights divergent pixels in red
 /// on a 50%-grey background, for human inspection.
-pub fn diff_image(
-    w: u32,
-    h: u32,
-    actual: &[u8],
-    expected: &[u8],
-    tolerance: u8,
-) -> Vec<u8> {
+pub fn diff_image(w: u32, h: u32, actual: &[u8], expected: &[u8], tolerance: u8) -> Vec<u8> {
     let mut out = vec![128u8; (w * h * 4) as usize];
     for i in (0..out.len()).step_by(4) {
         out[i + 3] = 255;

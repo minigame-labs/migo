@@ -204,13 +204,12 @@ impl UnifiedFrameCollector {
 
     pub(crate) fn push_canvas2d(&mut self, canvas_id: u32, cmd: Canvas2DCmd) {
         if self.current != CurrentKind::Canvas2D(canvas_id) {
-            self.segments
-                .push(FrameSegment::Canvas2D(Canvas2DSegment {
-                    canvas_id,
-                    commands: Vec::with_capacity(256),
-                    dirty_rect: None,
-                    dirty_poisoned: false,
-                }));
+            self.segments.push(FrameSegment::Canvas2D(Canvas2DSegment {
+                canvas_id,
+                commands: Vec::with_capacity(256),
+                dirty_rect: None,
+                dirty_poisoned: false,
+            }));
             self.current = CurrentKind::Canvas2D(canvas_id);
         }
         // Walk the full deep size (enum base + heap payload) so the
@@ -222,6 +221,7 @@ impl UnifiedFrameCollector {
         self.pending_bytes = self
             .pending_bytes
             .saturating_add(cmd.approx_deep_size_bytes());
+        shared::stats::set_collector_pending_bytes(self.pending_bytes as u32);
         if let Some(FrameSegment::Canvas2D(seg)) = self.segments.last_mut() {
             seg.mark_dirty_for_cmd(&cmd);
             seg.commands.push(cmd);
@@ -235,7 +235,7 @@ impl UnifiedFrameCollector {
             }));
             self.current = CurrentKind::GL;
         }
-        // Deep size walk — see the Canvas2D counterpart.  This is
+        // Deep size walk - see the Canvas2D counterpart.  This is
         // especially critical for `BufferData(Vec<u8>)` /
         // `TexImage2D(Arc<Vec<u8>>)` / `ShaderSource(String)`, the
         // three GL variants most likely to single-handedly blow
@@ -243,6 +243,47 @@ impl UnifiedFrameCollector {
         self.pending_bytes = self
             .pending_bytes
             .saturating_add(cmd.approx_deep_size_bytes());
+        shared::stats::set_collector_pending_bytes(self.pending_bytes as u32);
+        if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
+            seg.commands.push(cmd);
+        }
+    }
+
+    /// Fast-path variant of [`Self::push_gl`] for scalar-only
+    /// commands (viewport, bind*, uniform scalars, enable/disable,
+    /// draw, scissor...).
+    ///
+    /// Scalar ops are the majority of a WebGL frame by count —
+    /// Cocos/three.js emit hundreds per frame — and every byte of
+    /// overhead multiplies.  The fast path drops two pieces of
+    /// work versus `push_gl`:
+    ///
+    /// 1. No `approx_deep_size_bytes()` match.  The enum base size
+    ///    is a compile-time constant and the heap payload is known
+    ///    to be zero, so we add `size_of::<GLCmd>()` directly.
+    /// 2. No auto-flush guard.  Only fat payloads
+    ///    (`BufferData` / `TexImage2D` / `ShaderSource`) can push
+    ///    the batch past the 4 MiB soft budget; scalar commands
+    ///    add at most ~128 B apiece, so it takes tens of thousands
+    ///    of them in a single frame to matter.  Callers that do
+    ///    produce that many still get the check on the next fat
+    ///    command or at frame flush.
+    ///
+    /// Callers MUST uphold the precondition that the pushed
+    /// variant carries no heap payload.  Passing a
+    /// `BufferData { data: Some(_) }` through this path would
+    /// under-count the batch and defeat the auto-flush guard.
+    #[inline]
+    pub(crate) fn push_gl_fast(&mut self, cmd: GLCmd) {
+        const BASE_BYTES: usize = std::mem::size_of::<GLCmd>();
+        if self.current != CurrentKind::GL {
+            self.segments.push(FrameSegment::GL(GlSegment {
+                commands: Vec::with_capacity(256),
+            }));
+            self.current = CurrentKind::GL;
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(BASE_BYTES);
+        shared::stats::set_collector_pending_bytes(self.pending_bytes as u32);
         if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
             seg.commands.push(cmd);
         }
@@ -270,6 +311,7 @@ impl UnifiedFrameCollector {
             // enforce and makes the flush protocol easier to
             // audit.
             self.pending_bytes = 0;
+            shared::stats::set_collector_pending_bytes(0);
             self.current = CurrentKind::None;
             return None;
         }
@@ -277,9 +319,9 @@ impl UnifiedFrameCollector {
         let segments = std::mem::take(&mut self.segments);
         self.current = CurrentKind::None;
         self.pending_bytes = 0;
+        shared::stats::set_collector_pending_bytes(0);
 
-        let mut builder =
-            shared::FramePacketBuilder::new(0, 0.0).push(FrameOp::BeginFrame);
+        let mut builder = shared::FramePacketBuilder::new(0, 0.0).push(FrameOp::BeginFrame);
 
         // Track which canvases have unmaterialized 2D work as we scan.
         // Canvas2D segments add to the set; GL segments consume it.
@@ -362,7 +404,11 @@ impl UnifiedFrameCollector {
     }
 
     #[inline]
-    pub(crate) fn set_stroke_color(&mut self, canvas_id: u32, color: shared::protocol::color::Color) {
+    pub(crate) fn set_stroke_color(
+        &mut self,
+        canvas_id: u32,
+        color: shared::protocol::color::Color,
+    ) {
         self.push_canvas2d(canvas_id, Canvas2DCmd::SetStrokeStyle { color });
     }
 
@@ -397,7 +443,11 @@ impl UnifiedFrameCollector {
     }
 
     #[inline]
-    pub(crate) fn set_shadow_color(&mut self, canvas_id: u32, color: shared::protocol::color::Color) {
+    pub(crate) fn set_shadow_color(
+        &mut self,
+        canvas_id: u32,
+        color: shared::protocol::color::Color,
+    ) {
         self.push_canvas2d(canvas_id, Canvas2DCmd::SetShadowColor { color });
     }
 
@@ -416,13 +466,27 @@ impl UnifiedFrameCollector {
         &mut self,
         canvas_id: u32,
         gradient_type: shared::protocol::render_cmd::GradientType,
-        x0: f32, y0: f32, r0: f32,
-        x1: f32, y1: f32, r1: f32,
+        x0: f32,
+        y0: f32,
+        r0: f32,
+        x1: f32,
+        y1: f32,
+        r1: f32,
         stops: Vec<shared::protocol::render_cmd::GradientStop>,
     ) {
-        self.push_canvas2d(canvas_id, Canvas2DCmd::SetFillStyleGradient {
-            gradient_type, x0, y0, r0, x1, y1, r1, stops,
-        });
+        self.push_canvas2d(
+            canvas_id,
+            Canvas2DCmd::SetFillStyleGradient {
+                gradient_type,
+                x0,
+                y0,
+                r0,
+                x1,
+                y1,
+                r1,
+                stops,
+            },
+        );
     }
 
     #[inline]
@@ -430,23 +494,63 @@ impl UnifiedFrameCollector {
         &mut self,
         canvas_id: u32,
         gradient_type: shared::protocol::render_cmd::GradientType,
-        x0: f32, y0: f32, r0: f32,
-        x1: f32, y1: f32, r1: f32,
+        x0: f32,
+        y0: f32,
+        r0: f32,
+        x1: f32,
+        y1: f32,
+        r1: f32,
         stops: Vec<shared::protocol::render_cmd::GradientStop>,
     ) {
-        self.push_canvas2d(canvas_id, Canvas2DCmd::SetStrokeStyleGradient {
-            gradient_type, x0, y0, r0, x1, y1, r1, stops,
-        });
+        self.push_canvas2d(
+            canvas_id,
+            Canvas2DCmd::SetStrokeStyleGradient {
+                gradient_type,
+                x0,
+                y0,
+                r0,
+                x1,
+                y1,
+                r1,
+                stops,
+            },
+        );
     }
 
     #[inline]
-    pub(crate) fn set_fill_style_pattern(&mut self, canvas_id: u32, image_id: u32, repeat_x: bool, repeat_y: bool) {
-        self.push_canvas2d(canvas_id, Canvas2DCmd::SetFillStylePattern { image_id, repeat_x, repeat_y });
+    pub(crate) fn set_fill_style_pattern(
+        &mut self,
+        canvas_id: u32,
+        image_id: u32,
+        repeat_x: bool,
+        repeat_y: bool,
+    ) {
+        self.push_canvas2d(
+            canvas_id,
+            Canvas2DCmd::SetFillStylePattern {
+                image_id,
+                repeat_x,
+                repeat_y,
+            },
+        );
     }
 
     #[inline]
-    pub(crate) fn set_stroke_style_pattern(&mut self, canvas_id: u32, image_id: u32, repeat_x: bool, repeat_y: bool) {
-        self.push_canvas2d(canvas_id, Canvas2DCmd::SetStrokeStylePattern { image_id, repeat_x, repeat_y });
+    pub(crate) fn set_stroke_style_pattern(
+        &mut self,
+        canvas_id: u32,
+        image_id: u32,
+        repeat_x: bool,
+        repeat_y: bool,
+    ) {
+        self.push_canvas2d(
+            canvas_id,
+            Canvas2DCmd::SetStrokeStylePattern {
+                image_id,
+                repeat_x,
+                repeat_y,
+            },
+        );
     }
 
     #[inline]
@@ -465,12 +569,20 @@ impl UnifiedFrameCollector {
     }
 
     #[inline]
-    pub(crate) fn set_text_align(&mut self, canvas_id: u32, align: shared::protocol::render_cmd::TextAlign) {
+    pub(crate) fn set_text_align(
+        &mut self,
+        canvas_id: u32,
+        align: shared::protocol::render_cmd::TextAlign,
+    ) {
         self.push_canvas2d(canvas_id, Canvas2DCmd::SetTextAlign { align });
     }
 
     #[inline]
-    pub(crate) fn set_text_baseline(&mut self, canvas_id: u32, baseline: shared::protocol::render_cmd::TextBaseline) {
+    pub(crate) fn set_text_baseline(
+        &mut self,
+        canvas_id: u32,
+        baseline: shared::protocol::render_cmd::TextBaseline,
+    ) {
         self.push_canvas2d(canvas_id, Canvas2DCmd::SetTextBaseline { baseline });
     }
 
@@ -497,6 +609,22 @@ pub(crate) fn flush_unified_barrier(state: &mut deno_core::OpState) {
     };
 
     if let Some(packet) = packet {
+        // Diag: how many GL ops did the caller pile up before the
+        // sync barrier?  A spike here correlates with the
+        // [MigoPerf][SyncOp] wait time on the render-thread side.
+        let gl_ops = packet
+            .ops()
+            .iter()
+            .map(|op| match op {
+                shared::protocol::FrameOp::GlBatch(p) => p.commands.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        if gl_ops >= 64 {
+            tracing::warn!(
+                "[MigoPerf][SyncFlush] sync barrier flushed {gl_ops} pending GL ops"
+            );
+        }
         let ctx = state.borrow::<shared::op_state::CanvasOpState>();
         if let Err(e) = ctx
             .tx
@@ -682,7 +810,10 @@ mod tests {
         c.push_canvas2d(1, Canvas2DCmd::Save);
         let after_one = c.approx_pending_bytes();
         assert!(after_one > 0, "after one push should be non-zero");
-        c.push_gl(GLCmd::Clear { canvas_id: 1u32.into(), bit_field: 0x4000 });
+        c.push_gl(GLCmd::Clear {
+            canvas_id: 1u32.into(),
+            bit_field: 0x4000,
+        });
         assert!(c.approx_pending_bytes() > after_one, "second push must add");
         // A barrier flush drains the counter back to zero.
         let _ = c.flush_as_barrier();
@@ -768,7 +899,8 @@ mod tests {
         let large = c2.approx_pending_bytes();
 
         assert!(
-            large > small + 900 * std::mem::size_of::<shared::protocol::render_cmd::DrawImageEntry>(),
+            large
+                > small + 900 * std::mem::size_of::<shared::protocol::render_cmd::DrawImageEntry>(),
             "1000-entry batch ({}b) should far exceed 10-entry batch ({}b)",
             large,
             small,
@@ -813,7 +945,10 @@ mod tests {
         // test pins the idempotence.
         let mut c = UnifiedFrameCollector::new();
         c.push_canvas2d(1, Canvas2DCmd::Save);
-        c.push_gl(GLCmd::Clear { canvas_id: 1u32.into(), bit_field: 0x4000 });
+        c.push_gl(GLCmd::Clear {
+            canvas_id: 1u32.into(),
+            bit_field: 0x4000,
+        });
         let _ = c.flush_as_barrier();
         assert_eq!(c.approx_pending_bytes(), 0);
 
@@ -858,9 +993,10 @@ mod tests {
         // Should NOT have Present at the end
         assert!(!matches!(ops.last().unwrap(), FrameOp::Present));
         // But should still have Materialize
-        assert!(ops
-            .iter()
-            .any(|op| matches!(op, FrameOp::Materialize { .. })));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, FrameOp::Materialize { .. }))
+        );
     }
 
     #[test]
@@ -885,7 +1021,10 @@ mod tests {
             .iter()
             .filter(|op| matches!(op, FrameOp::Materialize { .. }))
             .count();
-        assert_eq!(mat_count, 2, "each 2D→GL transition needs its own Materialize");
+        assert_eq!(
+            mat_count, 2,
+            "each 2D→GL transition needs its own Materialize"
+        );
     }
 
     #[test]
@@ -907,9 +1046,7 @@ mod tests {
         let ops = packet.ops();
         // [BeginFrame, CanvasBatch(1, 3 cmds), Present]
         assert_eq!(ops.len(), 3);
-        assert!(
-            matches!(&ops[1], FrameOp::CanvasBatch(p) if p.commands.len() == 3)
-        );
+        assert!(matches!(&ops[1], FrameOp::CanvasBatch(p) if p.commands.len() == 3));
     }
 
     #[test]
@@ -972,7 +1109,10 @@ mod tests {
             .iter()
             .filter(|op| matches!(op, FrameOp::Materialize { .. }))
             .count();
-        assert_eq!(mat_count, 2, "barrier must materialize all pending 2D canvases");
+        assert_eq!(
+            mat_count, 2,
+            "barrier must materialize all pending 2D canvases"
+        );
     }
 
     // ── Blocker 2: dirty_rect must be tracked per segment ──
@@ -1063,9 +1203,25 @@ mod tests {
     fn fill_text_poisons_dirty_rect_to_none() {
         let mut c = UnifiedFrameCollector::new();
         // FillRect first — establishes a valid dirty_rect
-        c.push_canvas2d(1, Canvas2DCmd::FillRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 });
+        c.push_canvas2d(
+            1,
+            Canvas2DCmd::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+        );
         // FillText — bounds unknown, must poison
-        c.push_canvas2d(1, Canvas2DCmd::FillText { text: "hi".into(), x: 0.0, y: 0.0, max_width: f32::INFINITY });
+        c.push_canvas2d(
+            1,
+            Canvas2DCmd::FillText {
+                text: "hi".into(),
+                x: 0.0,
+                y: 0.0,
+                max_width: f32::INFINITY,
+            },
+        );
 
         let packet = c.build_frame_packet(true).unwrap();
         let dirty = match &packet.ops()[1] {
@@ -1078,7 +1234,15 @@ mod tests {
     #[test]
     fn path_fill_poisons_dirty_rect_to_none() {
         let mut c = UnifiedFrameCollector::new();
-        c.push_canvas2d(1, Canvas2DCmd::FillRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 });
+        c.push_canvas2d(
+            1,
+            Canvas2DCmd::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+        );
         c.push_canvas2d(1, Canvas2DCmd::Fill);
 
         let packet = c.build_frame_packet(true).unwrap();
@@ -1092,7 +1256,15 @@ mod tests {
     #[test]
     fn clip_poisons_dirty_rect_to_none() {
         let mut c = UnifiedFrameCollector::new();
-        c.push_canvas2d(1, Canvas2DCmd::FillRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 });
+        c.push_canvas2d(
+            1,
+            Canvas2DCmd::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+        );
         c.push_canvas2d(1, Canvas2DCmd::Clip);
 
         let packet = c.build_frame_packet(true).unwrap();
@@ -1107,7 +1279,15 @@ mod tests {
     fn rect_after_poison_stays_none() {
         let mut c = UnifiedFrameCollector::new();
         c.push_canvas2d(1, Canvas2DCmd::Fill); // poison
-        c.push_canvas2d(1, Canvas2DCmd::FillRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }); // should NOT recover
+        c.push_canvas2d(
+            1,
+            Canvas2DCmd::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+        ); // should NOT recover
 
         let packet = c.build_frame_packet(true).unwrap();
         let dirty = match &packet.ops()[1] {
@@ -1120,21 +1300,50 @@ mod tests {
     #[test]
     fn stroke_rect_poisons_dirty_rect() {
         let mut c = UnifiedFrameCollector::new();
-        c.push_canvas2d(1, Canvas2DCmd::StrokeRect { x: 10.0, y: 20.0, w: 100.0, h: 50.0 });
+        c.push_canvas2d(
+            1,
+            Canvas2DCmd::StrokeRect {
+                x: 10.0,
+                y: 20.0,
+                w: 100.0,
+                h: 50.0,
+            },
+        );
 
         let packet = c.build_frame_packet(true).unwrap();
         let dirty = match &packet.ops()[1] {
             FrameOp::CanvasBatch(p) => p.dirty_rect,
             _ => panic!("expected CanvasBatch"),
         };
-        assert!(dirty.is_none(), "StrokeRect must poison (lineWidth unknown JS-side)");
+        assert!(
+            dirty.is_none(),
+            "StrokeRect must poison (lineWidth unknown JS-side)"
+        );
     }
 
     #[test]
     fn set_transform_poisons_dirty_rect() {
         let mut c = UnifiedFrameCollector::new();
-        c.push_canvas2d(1, Canvas2DCmd::SetTransform { a: 2.0, b: 0.0, c: 0.0, d: 2.0, e: 0.0, f: 0.0 });
-        c.push_canvas2d(1, Canvas2DCmd::FillRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 });
+        c.push_canvas2d(
+            1,
+            Canvas2DCmd::SetTransform {
+                a: 2.0,
+                b: 0.0,
+                c: 0.0,
+                d: 2.0,
+                e: 0.0,
+                f: 0.0,
+            },
+        );
+        c.push_canvas2d(
+            1,
+            Canvas2DCmd::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+        );
 
         let packet = c.build_frame_packet(true).unwrap();
         let dirty = match &packet.ops()[1] {
@@ -1148,7 +1357,15 @@ mod tests {
     fn translate_poisons_dirty_rect() {
         let mut c = UnifiedFrameCollector::new();
         c.push_canvas2d(1, Canvas2DCmd::Translate { x: 10.0, y: 10.0 });
-        c.push_canvas2d(1, Canvas2DCmd::FillRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 });
+        c.push_canvas2d(
+            1,
+            Canvas2DCmd::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+        );
 
         let packet = c.build_frame_packet(true).unwrap();
         let dirty = match &packet.ops()[1] {
@@ -1162,7 +1379,15 @@ mod tests {
     fn set_shadow_blur_poisons_dirty_rect() {
         let mut c = UnifiedFrameCollector::new();
         c.push_canvas2d(1, Canvas2DCmd::SetShadowBlur { blur: 5.0 });
-        c.push_canvas2d(1, Canvas2DCmd::FillRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 });
+        c.push_canvas2d(
+            1,
+            Canvas2DCmd::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+        );
 
         let packet = c.build_frame_packet(true).unwrap();
         let dirty = match &packet.ops()[1] {
@@ -1176,7 +1401,15 @@ mod tests {
     fn set_line_width_poisons_dirty_rect() {
         let mut c = UnifiedFrameCollector::new();
         c.push_canvas2d(1, Canvas2DCmd::SetLineWidth { width: 4.0 });
-        c.push_canvas2d(1, Canvas2DCmd::FillRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 });
+        c.push_canvas2d(
+            1,
+            Canvas2DCmd::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+        );
 
         let packet = c.build_frame_packet(true).unwrap();
         let dirty = match &packet.ops()[1] {

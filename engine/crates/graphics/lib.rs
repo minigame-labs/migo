@@ -30,11 +30,17 @@
 //! - [`render_thread`]: Render thread loop and command dispatch.
 //! - [`canvas`]: `CanvasManager` (EGL contexts, DrawingBuffer FBO, image
 //!   registry).
-//! - [`backend`]: Pluggable rendering backends.  Currently only
-//!   `backend::gl` (Skia Ganesh on GL ES 3.0) is implemented.
+//! - [`backend`]: Backend-specific rendering glue.  Only `backend::gl`
+//!   (Skia Ganesh on GL ES 3.0) is implemented today; the module is
+//!   organised as if it were pluggable because we may add a Vulkan /
+//!   wgpu backend later, but there is **no** `RenderBackend` trait
+//!   abstraction and no runtime choice between backends yet — the
+//!   name is aspirational, not plug-and-play.  See
+//!   `AUDIT.md` P2-2 for the full-trait roadmap.
 //! - [`renderergl`]: WebGL 1.0 / 2.0 command handler (glow-backed).
 
 pub mod atlas;
+pub mod atrace;
 #[doc(hidden)]
 pub mod backend;
 mod canvas;
@@ -47,12 +53,15 @@ pub mod dirty_region;
 pub mod frame_scheduler;
 mod legacy_frame_bridge;
 pub mod render_diagnostics;
+pub(crate) mod render_loop;
 mod render_server;
 mod render_thread;
 mod renderergl;
 pub(crate) mod shader_cache;
 pub mod surface_system;
+pub mod text_measurer_impl;
 pub mod texture_import;
+pub mod upload_policy;
 pub(crate) mod upload_server;
 pub mod upload_thread;
 

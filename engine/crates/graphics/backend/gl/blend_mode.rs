@@ -148,8 +148,17 @@ mod tests {
     fn porter_duff_modes_11_entries() {
         use BlendMode as B;
         let expected = [
-            B::SrcOver, B::SrcIn, B::SrcOut, B::SrcATop, B::DstOver,
-            B::DstIn, B::DstOut, B::DstATop, B::Plus, B::Src, B::Xor,
+            B::SrcOver,
+            B::SrcIn,
+            B::SrcOut,
+            B::SrcATop,
+            B::DstOver,
+            B::DstIn,
+            B::DstOut,
+            B::DstATop,
+            B::Plus,
+            B::Src,
+            B::Xor,
         ];
         for (op, mode) in expected.iter().enumerate() {
             assert_eq!(

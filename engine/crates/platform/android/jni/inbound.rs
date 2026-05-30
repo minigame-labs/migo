@@ -33,10 +33,7 @@ fn jni_string_to_cow(
     jstr: &JString,
     known: &[&'static str],
 ) -> Cow<'static, str> {
-    let s: String = env
-        .get_string(jstr)
-        .map(|s| s.into())
-        .unwrap_or_default();
+    let s: String = env.get_string(jstr).map(|s| s.into()).unwrap_or_default();
     for &k in known {
         if s == k {
             return Cow::Borrowed(k);
@@ -143,6 +140,68 @@ pub(crate) extern "system" fn version<'local>(
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),
         }
+    })
+}
+
+/// Minimum Android API level the native engine was compiled for.
+///
+/// Sourced from the single authority (`scripts/build-android-so.sh`
+/// - currently API 26, matching skia-bindings 0.93's Android NDK
+/// preset).  The Java SDK uses this in `isDeviceSupported()` so
+/// there is exactly ONE place to change when the floor moves; no
+/// silent mismatch between the build script's ANDROID_API and a
+/// hard-coded Java constant is possible any more.
+pub(crate) extern "system" fn getMinApiLevel<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jint {
+    // Must be kept in sync with scripts/build-android-so.sh
+    // (`ANDROID_API`) and platforms/android/library/build.gradle
+    // (`minSdk`).  The test in `platform/android/tests` pins the
+    // trio together.
+    26
+}
+
+/// Bridge for `NativeBridge.initIcuData(path)`.
+///
+/// Two build-time paths:
+///
+/// * With the default (`graphics` crate's `embed_icudtl` feature):
+///   Skia links `icudtl.dat` into `libmigo.so` at build time.  No
+///   runtime load is needed; the Java wrapper may still call this
+///   for uniform handling, and we return `true` immediately.
+///
+/// * With `--no-default-features --features external_icudtl`:
+///   `icudtl.dat` is NOT embedded; Skia needs `SkLoadICU(path)`
+///   invoked once before the first text layout op.  The wiring of
+///   that Skia entry point is pending a profile-validated cutover
+///   (see CLAUDE.md); until then this path returns `false` so
+///   callers surface a clear "ICU bootstrap incomplete" signal
+///   instead of crashing inside SkParagraph.
+pub(crate) extern "system" fn initIcuData<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    icu_path: JString<'local>,
+) -> jni::sys::jboolean {
+    jni_safe!("initIcuData", jni::sys::JNI_FALSE, {
+        // Fast path: embedded data.  We still read the string so
+        // Java doesn't leak the local ref but ignore the value.
+        if cfg!(not(feature = "external_icudtl")) {
+            let _ = env.get_string(&icu_path);
+            return jni::sys::JNI_TRUE;
+        }
+        // External path: placeholder until SkLoadICU is linked.
+        // Read the string to consume the arg, then log + return
+        // false so the caller knows the bootstrap didn't run.
+        let path: String = env
+            .get_string(&icu_path)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        tracing::warn!(
+            "initIcuData: external ICU mode not yet wired (path={})",
+            path
+        );
+        jni::sys::JNI_FALSE
     })
 }
 
@@ -351,8 +410,7 @@ pub(crate) extern "system" fn updateSurface<'local>(
             h = provided_h;
         }
 
-        let set_geo_rc =
-            unsafe { ANativeWindow_setBuffersGeometry(window, w as i32, h as i32, 0) };
+        let set_geo_rc = unsafe { ANativeWindow_setBuffersGeometry(window, w as i32, h as i32, 0) };
         if set_geo_rc != 0 {
             tracing::warn!(
                 "updateSurface: ANativeWindow_setBuffersGeometry({}x{}) failed: {}",
@@ -597,9 +655,7 @@ pub(crate) extern "system" fn onShow<'local>(
         let options_json: Option<String> = if options_json.is_null() {
             None
         } else {
-            env.get_string(&options_json)
-                .ok()
-                .map(|s| s.into())
+            env.get_string(&options_json).ok().map(|s| s.into())
         };
 
         if let Some(json) = options_json.as_ref() {
@@ -971,8 +1027,7 @@ pub(crate) extern "system" fn onBeaconUpdate<'local>(
             .get_string(&beacons_json)
             .map(|s| s.into())
             .unwrap_or_else(|_| "[]".to_string());
-        let _ =
-            send_command_to_host(host_id, HostCommand::OnBeaconUpdate { beacons_json: json });
+        let _ = send_command_to_host(host_id, HostCommand::OnBeaconUpdate { beacons_json: json });
     });
 }
 
@@ -1084,10 +1139,7 @@ pub(crate) extern "system" fn onKeyboardInput<'local>(
     value: JString<'local>,
 ) {
     jni_safe!("onKeyboardInput", {
-        let val: String = env
-            .get_string(&value)
-            .map(|s| s.into())
-            .unwrap_or_default();
+        let val: String = env.get_string(&value).map(|s| s.into()).unwrap_or_default();
         let _ = send_command_to_host(host_id, HostCommand::OnKeyboardInput { value: val });
     });
 }
@@ -1099,10 +1151,7 @@ pub(crate) extern "system" fn onKeyboardConfirm<'local>(
     value: JString<'local>,
 ) {
     jni_safe!("onKeyboardConfirm", {
-        let val: String = env
-            .get_string(&value)
-            .map(|s| s.into())
-            .unwrap_or_default();
+        let val: String = env.get_string(&value).map(|s| s.into()).unwrap_or_default();
         let _ = send_command_to_host(host_id, HostCommand::OnKeyboardConfirm { value: val });
     });
 }
@@ -1114,10 +1163,7 @@ pub(crate) extern "system" fn onKeyboardComplete<'local>(
     value: JString<'local>,
 ) {
     jni_safe!("onKeyboardComplete", {
-        let val: String = env
-            .get_string(&value)
-            .map(|s| s.into())
-            .unwrap_or_default();
+        let val: String = env.get_string(&value).map(|s| s.into()).unwrap_or_default();
         let _ = send_command_to_host(host_id, HostCommand::OnKeyboardComplete { value: val });
     });
 }
@@ -1167,7 +1213,9 @@ pub(crate) extern "system" fn onThermalStatusChanged(
     jni_safe!("onThermalStatusChanged", {
         let _ = send_command_to_host(
             host_id,
-            HostCommand::OnThermalStatusChanged { status: status as i32 },
+            HostCommand::OnThermalStatusChanged {
+                status: status as i32,
+            },
         );
     });
 }
@@ -1335,10 +1383,10 @@ pub(crate) extern "system" fn getConsoleLogs<'local>(
 
 // ==================== AHardwareBuffer native helpers ====================
 
-/// NDK declarations for the subset of AHB ABI we need on the inbound
-/// side. Kept separate from `shared::protocol::ahb::sys` so this
-/// module can compile stand-alone; the duplicate `extern` declaration
-/// is deduplicated by the linker (the symbol comes from `libandroid`).
+// NDK declarations for the subset of AHB ABI we need on the inbound
+// side. Kept separate from `shared::protocol::ahb::sys` so this
+// module can compile stand-alone; the duplicate `extern` declaration
+// is deduplicated by the linker (the symbol comes from `libandroid`).
 #[cfg(target_os = "android")]
 unsafe extern "C" {
     /// Native accessor for Java `HardwareBuffer` — NDK API 26+.
@@ -1349,6 +1397,7 @@ unsafe extern "C" {
         env: *mut jni::sys::JNIEnv,
         hardware_buffer_obj: jni::sys::jobject,
     ) -> *mut std::ffi::c_void;
+    fn AHardwareBuffer_acquire(buffer: *mut std::ffi::c_void);
 }
 
 /// Called by `NativeBridge.nativeAhbPointerFromHardwareBuffer`.
@@ -1358,13 +1407,15 @@ unsafe extern "C" {
 /// [`NativeExports.decodeImageAhb`] treats as "no AHB handle, fall
 /// back to the RGBA byte[] path".
 ///
-/// No refcount change happens here: `AHardwareBuffer_fromHardwareBuffer`
-/// returns a borrowed pointer valid as long as the Java wrapper is
-/// live. The companion [`nativeAhbAcquire`] is the explicit refcount
-/// bump the caller uses before handing the pointer off to Rust.
+/// The returned raw pointer owns one extra strong refcount:
+/// `AHardwareBuffer_fromHardwareBuffer` yields a borrowed pointer,
+/// then this bridge calls `AHardwareBuffer_acquire` before returning
+/// to Java. That lets Java close its `HardwareBuffer` wrapper in a
+/// `finally` block while Rust later adopts the native handle without
+/// another acquire.
 #[cfg(target_os = "android")]
 pub(crate) extern "system" fn nativeAhbPointerFromHardwareBuffer<'local>(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     hb: JObject<'local>,
 ) -> jni::sys::jlong {
@@ -1377,6 +1428,13 @@ pub(crate) extern "system" fn nativeAhbPointerFromHardwareBuffer<'local>(
         // a `JNIEnv*` + `jobject`; both come directly from the
         // caller's frame.
         let ptr = unsafe { AHardwareBuffer_fromHardwareBuffer(env.get_raw(), hb.as_raw()) };
+        if ptr.is_null() {
+            return 0;
+        }
+        // SAFETY: `ptr` came from `AHardwareBuffer_fromHardwareBuffer`
+        // for a live Java `HardwareBuffer`; acquire publishes one
+        // independent native refcount the Rust side can later own.
+        unsafe { AHardwareBuffer_acquire(ptr) };
         ptr as jni::sys::jlong
     })
 }

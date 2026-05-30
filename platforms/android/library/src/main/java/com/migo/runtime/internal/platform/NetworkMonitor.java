@@ -4,7 +4,6 @@ import android.content.Context;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
-import android.net.NetworkInfo;
 import android.net.NetworkRequest;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
@@ -25,7 +24,7 @@ import java.util.List;
  * Network status monitoring utility.
  * <p>
  * Uses ConnectivityManager and NetworkCallback to monitor network changes.
- * Compatible with Android API 21+.
+ * Compatible with Android API 26+.
  *
  * @hide
  */
@@ -113,31 +112,19 @@ public final class NetworkMonitor {
             boolean hasSystemProxy = checkSystemProxy();
             boolean weakNet = false;
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                Network network = connectivityManager.getActiveNetwork();
-                if (network != null) {
-                    NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
-                    if (capabilities != null) {
-                        networkType = getNetworkTypeFromCapabilities(capabilities);
-                        isConnected = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
-                        
-                        // Calculate signal strength and weak net status
-                        if ("wifi".equals(networkType)) {
-                            signalStrength = getWifiSignalStrength();
-                        } else {
-                            signalStrength = getCellularSignalStrength();
-                        }
-                    }
-                }
-            } else {
-                // Fallback for API 21-22
-                NetworkInfo activeNetwork = connectivityManager.getActiveNetworkInfo();
-                if (activeNetwork != null && activeNetwork.isConnected()) {
-                    networkType = getNetworkTypeFromNetworkInfo(activeNetwork);
-                    isConnected = true;
+            Network network = connectivityManager.getActiveNetwork();
+            if (network != null) {
+                NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
+                if (capabilities != null) {
+                    networkType = getNetworkTypeFromCapabilities(capabilities);
+                    isConnected = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                            && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+
+                    // Calculate signal strength and weak net status
                     if ("wifi".equals(networkType)) {
-                         signalStrength = getWifiSignalStrength();
+                        signalStrength = getWifiSignalStrength();
+                    } else {
+                        signalStrength = getCellularSignalStrength();
                     }
                 }
             }
@@ -225,12 +212,7 @@ public final class NetworkMonitor {
             TelephonyManager tm = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
             if (tm == null) return "unknown";
 
-            int networkType;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                networkType = tm.getDataNetworkType();
-            } else {
-                networkType = tm.getNetworkType();
-            }
+            int networkType = tm.getDataNetworkType();
 
             switch (networkType) {
                 case TelephonyManager.NETWORK_TYPE_GPRS:
@@ -262,46 +244,6 @@ public final class NetworkMonitor {
         } catch (Exception e) {
             return "unknown";
         }
-    }
-
-    /**
-     * Get network type string from NetworkInfo (API 21-22 fallback).
-     */
-    @SuppressWarnings("deprecation")
-    private String getNetworkTypeFromNetworkInfo(NetworkInfo networkInfo) {
-        int type = networkInfo.getType();
-        if (type == ConnectivityManager.TYPE_WIFI) {
-            return "wifi";
-        } else if (type == ConnectivityManager.TYPE_MOBILE) {
-            int subType = networkInfo.getSubtype();
-            switch (subType) {
-                case TelephonyManager.NETWORK_TYPE_GPRS:
-                case TelephonyManager.NETWORK_TYPE_EDGE:
-                case TelephonyManager.NETWORK_TYPE_CDMA:
-                case TelephonyManager.NETWORK_TYPE_1xRTT:
-                case TelephonyManager.NETWORK_TYPE_IDEN:
-                    return "2g";
-                case TelephonyManager.NETWORK_TYPE_UMTS:
-                case TelephonyManager.NETWORK_TYPE_EVDO_0:
-                case TelephonyManager.NETWORK_TYPE_EVDO_A:
-                case TelephonyManager.NETWORK_TYPE_HSDPA:
-                case TelephonyManager.NETWORK_TYPE_HSUPA:
-                case TelephonyManager.NETWORK_TYPE_HSPA:
-                case TelephonyManager.NETWORK_TYPE_EVDO_B:
-                case TelephonyManager.NETWORK_TYPE_EHRPD:
-                case TelephonyManager.NETWORK_TYPE_HSPAP:
-                    return "3g";
-                case TelephonyManager.NETWORK_TYPE_LTE:
-                    return "4g";
-                case TelephonyManager.NETWORK_TYPE_NR:
-                    return "5g";
-                default:
-                    return "unknown";
-            }
-        } else if (type == ConnectivityManager.TYPE_ETHERNET) {
-            return "wifi";
-        }
-        return "unknown";
     }
 
     /**

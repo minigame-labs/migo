@@ -354,7 +354,10 @@ pub(crate) fn blit_to_surface(
         if err != glow::NO_ERROR {
             tracing::warn!(
                 "DrawingBuffer blit: glBlitFramebuffer failed (gl_error=0x{err:X}), db={}x{} surface={}x{}",
-                db.width, db.height, surface_w, surface_h
+                db.width,
+                db.height,
+                surface_w,
+                surface_h
             );
         }
     }

@@ -18,25 +18,29 @@ pub(crate) fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
 macro_rules! jni_safe {
     // Void variant (no return value)
     ($name:expr, $body:expr) => {{
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            $body
-        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body));
         match result {
             Ok(val) => val,
             Err(e) => {
-                tracing::error!("JNI panic in {}: {}", $name, $crate::android::jni::safe::panic_message(&e));
+                tracing::error!(
+                    "JNI panic in {}: {}",
+                    $name,
+                    $crate::android::jni::safe::panic_message(&e)
+                );
             }
         }
     }};
     // Return-value variant (with default on panic)
     ($name:expr, $default:expr, $body:expr) => {{
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            $body
-        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body));
         match result {
             Ok(val) => val,
             Err(e) => {
-                tracing::error!("JNI panic in {}: {}", $name, $crate::android::jni::safe::panic_message(&e));
+                tracing::error!(
+                    "JNI panic in {}: {}",
+                    $name,
+                    $crate::android::jni::safe::panic_message(&e)
+                );
                 $default
             }
         }

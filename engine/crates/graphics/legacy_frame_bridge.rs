@@ -1,5 +1,5 @@
-use shared::protocol::render_cmd::{Canvas2DCmd, CanvasBatchPayload, DirtyRect, GLCmd};
 use shared::protocol::GlBatchPayload;
+use shared::protocol::render_cmd::{Canvas2DCmd, CanvasBatchPayload, DirtyRect, GLCmd};
 use shared::{FrameOp, FramePacket, FramePacketBuilder};
 
 pub(crate) struct LegacyFrameBridge {

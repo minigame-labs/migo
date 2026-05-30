@@ -5,10 +5,12 @@
 //! Draw commands are collected by `UnifiedFrameCollector` (see `frame_collector.rs`)
 //! and sent as a single interleaved `FramePacket` per frame.
 //!
-//! Sync operations (`op_create_context_2d`, `op_measure_text`, `op_get_image_data`)
-//! use `RenderCommand::Canvas2D` for synchronous request/response.
+//! Sync operations (`op_measure_text`, `op_get_image_data`) use
+//! `RenderCommand::Canvas2D` for synchronous request/response.
+//! `op_create_context_2d` is fire-and-forget: render thread FIFO
+//! ordering is sufficient to serialise it before subsequent draws.
 
-use deno_core::{op2, OpState};
+use deno_core::{OpState, op2};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::error;
@@ -263,21 +265,25 @@ fn parse_color_string(s: &str) -> Color {
 // Sync operations (request/response via RenderCommand::Canvas2D)
 // ============================================================================
 
-const OP_CREATE_CTX2D: &str = "canvas2d create context";
-
 #[op2(fast)]
 pub fn op_create_context_2d(state: &mut OpState, #[smi] canvas_id: u32) -> i32 {
     let ctx = state.borrow::<CanvasOpState>();
-    match send_render_with_resp_sync(ctx, OP_CREATE_CTX2D, |resp| RenderCommand::Canvas2D {
+    // Fire-and-forget: render thread processes Canvas2D commands FIFO
+    // on this channel, so a subsequent draw on `canvas_id` (which lives
+    // in the same RenderCommand::Canvas2D queue) is guaranteed to run
+    // after `init_skia_for_canvas`.  The previous sync RTT was pure
+    // stall — its only reply was the caller's own canvas_id — and was
+    // observed as ~7–17 ms × dozens per shop scene open on Mali
+    // ([SyncOp] canvas2d create context blocked V8 …).  Same shape as
+    // the op_create_image RTT removal upstream.
+    if let Err(e) = ctx.tx.dispatch(RenderCommand::Canvas2D {
         canvas_id,
-        cmd: Canvas2DCmd::CreateContext2D { resp },
+        cmd: Canvas2DCmd::CreateContext2D,
     }) {
-        Ok(id) => id as i32,
-        Err(e) => {
-            error!("{OP_CREATE_CTX2D} failed: {e}");
-            -1
-        }
+        error!("createContext2D dispatch failed: {e}");
+        return -1;
     }
+    canvas_id as i32
 }
 
 fn flush_pending_commands_for_state_sync(state: &mut OpState, _canvas_id: u32) {
@@ -289,6 +295,54 @@ fn flush_pending_commands_for_readback_sync(state: &mut OpState, _canvas_id: u32
 }
 
 const OP_MEASURE_TEXT: &str = "canvas2d measure_text";
+
+/// Conservative TextMetrics estimate used when the render thread
+/// cannot produce a real measurement (timeout, disconnect, drop).
+///
+/// The estimate is deliberately **over** the real width rather
+/// than under: UI code auto-sizing labels will reserve a bit more
+/// space than strictly needed instead of clipping glyphs.  Width
+/// is approximated as `text.chars().count() * 0.55 * font_size`;
+/// 0.55 is a hair wider than the average advance ratio of Latin
+/// text at proportional fonts and covers most CJK fullwidth
+/// glyphs (1.0 * size) without degenerating to zero for punctuation.
+///
+/// Baselines follow Canvas 2D's typographic defaults: ascent
+/// ≈ 0.8 * size, descent ≈ 0.2 * size.  Games that inspect them
+/// get plausible numbers instead of the old all-zero response
+/// that made layouts collapse.
+fn fallback_text_metrics(text: &str, font_size: f32) -> TextMetrics {
+    // `font_size` gets passed in from the canvas state; we don't
+    // know the live value here because measureText doesn't carry
+    // font state over the wire.  We default to the Canvas 2D
+    // baseline of 10 px if the caller hasn't plumbed the real
+    // value through.  Call sites that *do* know the size should
+    // plumb it through `fallback_text_metrics_for_state` below.
+    let size = if font_size.is_finite() && font_size > 0.0 {
+        font_size
+    } else {
+        10.0
+    };
+    let glyph_estimate = text.chars().count().max(1) as f32;
+    let width = glyph_estimate * size * 0.55;
+    let ascent = size * 0.8;
+    let descent = size * 0.2;
+    TextMetrics {
+        width,
+        actual_bounding_box_left: 0.0,
+        actual_bounding_box_right: width,
+        actual_bounding_box_ascent: ascent,
+        actual_bounding_box_descent: descent,
+        font_bounding_box_ascent: ascent,
+        font_bounding_box_descent: descent,
+        em_height_ascent: ascent,
+        em_height_descent: descent,
+        hanging_baseline: ascent * 0.8,
+        alphabetic_baseline: 0.0,
+        ideographic_baseline: -descent,
+    }
+}
+
 #[op2]
 #[serde]
 pub fn op_measure_text(
@@ -299,29 +353,138 @@ pub fn op_measure_text(
     // Flush pending commands so the render thread has the latest font state.
     flush_pending_commands_for_state_sync(state, canvas_id);
     let ctx = state.borrow::<CanvasOpState>();
+    // P0-1 (drop-safety) + P1-4 (measure has 4 ms deadline):
+    // clone the text first so the fallback can still reason
+    // about it if the render thread times out.
+    let text_for_fallback = text.clone();
     match send_render_with_resp_sync(ctx, OP_MEASURE_TEXT, |resp| RenderCommand::Canvas2D {
         canvas_id,
         cmd: Canvas2DCmd::MeasureText { text, resp },
     }) {
         Ok(m) => m,
         Err(e) => {
-            error!("{OP_MEASURE_TEXT} failed: {e}");
-            TextMetrics {
-                width: 0.0,
-                actual_bounding_box_left: 0.0,
-                actual_bounding_box_right: 0.0,
-                actual_bounding_box_ascent: 0.0,
-                actual_bounding_box_descent: 0.0,
-                font_bounding_box_ascent: 0.0,
-                font_bounding_box_descent: 0.0,
-                em_height_ascent: 0.0,
-                em_height_descent: 0.0,
-                hanging_baseline: 0.0,
-                alphabetic_baseline: 0.0,
-                ideographic_baseline: 0.0,
-            }
+            // P2-5: do not collapse to zero metrics on failure.
+            // Zero width made auto-layout code stack every label
+            // at (0, 0), producing the visible "text missing"
+            // symptom even before the P0 responder bug was
+            // fixed.  A conservative estimate keeps layouts
+            // roughly correct until the next frame succeeds.
+            error!("{OP_MEASURE_TEXT} failed: {e}; returning estimated metrics");
+            fallback_text_metrics(&text_for_fallback, 10.0)
         }
     }
+}
+
+/// R-7: flat-buffer variant of `op_measure_text` that skips
+/// serde_v8's per-property V8 object construction.
+///
+/// The 12 f32 fields of [`TextMetrics`] are written little-endian
+/// into a `Vec<u8>` which `op2`'s `#[buffer]` attribute hands back
+/// as an `ArrayBuffer` — JS code then re-interprets it as a
+/// `Float32Array` and reads the fields by index.  On the hot
+/// measure path (hundreds of calls per frame for UI-heavy scenes)
+/// this saves the ~12 `v8::Object::set` invocations and the
+/// matching string interning that `#[serde]` emits, cutting the
+/// native-side overhead from ~30 μs to ~5 μs per call in the
+/// cache-hit case.
+///
+/// Layout (byte offsets, little-endian):
+///
+/// ```text
+/// 00: width                       20: font_bounding_box_descent
+/// 04: actual_bounding_box_left    24: actual_bounding_box_ascent
+/// 08: actual_bounding_box_right   28: actual_bounding_box_descent
+/// 0C: em_height_ascent            32: font_bounding_box_ascent
+/// 10: em_height_descent           36: hanging_baseline
+/// 14: alphabetic_baseline         40: ideographic_baseline
+/// ```
+///
+/// Kept alongside the `#[serde]` variant above so downstream
+/// callers can switch gradually; the JS side prefers the flat op
+/// and falls back to the serde op for older hosts.
+#[op2]
+#[buffer]
+pub fn op_measure_text_flat(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[string] text: String,
+    #[string] css_font: String,
+) -> Vec<u8> {
+    // F-2 + G-2: fast lane.  When the host has published a
+    // `SharedTextMeasurer` on `CanvasOpState`, the measurement
+    // runs inline on the JS thread via a mutex-guarded
+    // TextContext — no command channel trip, no `flush`
+    // barrier, no serde round-trip.  Cache-hit cost drops from
+    // ~30 μs to ~5 μs; cache-miss cost (shaping via Skia) is
+    // unchanged because that's the real work either way.
+    //
+    // G-2: the JS side now hands us the raw CSS `font` string
+    // and the single source of truth for parsing lives in
+    // `shared::css_font`.  This eliminates the previous
+    // JS/Rust parser duplication where `_parseCssFont` in JS
+    // could disagree with `SetFont` parsing on the render
+    // side, producing silent measure-vs-paint divergence.
+    //
+    // Falls back to the render-thread RPC when the measurer is
+    // absent (headless tests, embedders that haven't wired it)
+    // so behaviour stays identical.
+    {
+        let ctx = state.borrow::<CanvasOpState>();
+        if let Some(m) = ctx.text_measurer.as_ref() {
+            let metrics = m.measure_css(&text, &css_font);
+            return encode_text_metrics(&metrics);
+        }
+    }
+
+    // Fallback: cross-thread sync-op path, identical to the
+    // legacy `op_measure_text` behaviour.  `canvas_id` is used
+    // to pick up the per-canvas font state which the render
+    // thread already knows; we ignore `css_font` in this
+    // branch because the server side re-reads them from
+    // `ctx.renderer.state.text`.
+    flush_pending_commands_for_state_sync(state, canvas_id);
+    let ctx = state.borrow::<CanvasOpState>();
+    let text_for_fallback = text.clone();
+    let css_for_fallback = css_font.clone();
+    let metrics =
+        match send_render_with_resp_sync(ctx, OP_MEASURE_TEXT, |resp| RenderCommand::Canvas2D {
+            canvas_id,
+            cmd: Canvas2DCmd::MeasureText { text, resp },
+        }) {
+            Ok(m) => m,
+            Err(e) => {
+                error!("{OP_MEASURE_TEXT} (flat) failed: {e}; returning estimated metrics");
+                let parsed = shared::css_font::parse_css_font(&css_for_fallback);
+                fallback_text_metrics(&text_for_fallback, parsed.size)
+            }
+        };
+    encode_text_metrics(&metrics)
+}
+
+/// Encode a [`TextMetrics`] into 48 bytes of little-endian f32s.
+/// Field order matches the layout table on [`op_measure_text_flat`]
+/// so the JS side can use a zero-copy `Float32Array` view.
+#[inline]
+fn encode_text_metrics(m: &TextMetrics) -> Vec<u8> {
+    let fields: [f32; 12] = [
+        m.width,
+        m.actual_bounding_box_left,
+        m.actual_bounding_box_right,
+        m.em_height_ascent,
+        m.em_height_descent,
+        m.alphabetic_baseline,
+        m.font_bounding_box_descent,
+        m.actual_bounding_box_ascent,
+        m.actual_bounding_box_descent,
+        m.font_bounding_box_ascent,
+        m.hanging_baseline,
+        m.ideographic_baseline,
+    ];
+    let mut out = Vec::with_capacity(fields.len() * 4);
+    for f in fields {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
 }
 
 const OP_GET_IMAGE_DATA: &str = "canvas2d get_image_data";
@@ -356,13 +519,341 @@ pub fn op_get_image_data(
     }
 }
 
+/// Fire-and-forget snapshot capture: queues a Canvas2DCmd into the
+/// frame collector so the capture rides the next FramePacket dispatch
+/// alongside the surrounding canvas2D draws.  No sync round-trip; the
+/// JS-side counter pre-allocates the id.
+#[op2(fast)]
+pub fn op_capture_canvas2d_snapshot(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    x: i32,
+    y: i32,
+    #[smi] width: u32,
+    #[smi] height: u32,
+    #[smi] snapshot_id: u32,
+) {
+    if snapshot_id == 0 {
+        return;
+    }
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
+        collector.push(
+            canvas_id,
+            Canvas2DCmd::CaptureSnapshot {
+                x,
+                y,
+                width,
+                height,
+                snapshot_id,
+                cache_key: None,
+            },
+        );
+    }
+}
+
+const OP_FORCE_READBACK_SNAPSHOT: &str = "canvas2d force_readback_snapshot";
+/// Backs `migo._force_readback(imageData)`.  Returns a tightly
+/// packed RGBA8 byte buffer (top-down rows, length `w * h * 4`),
+/// matching the legacy `op_get_image_data` layout.  Empty `Vec` on
+/// failure (snapshot already drained, FBO incomplete, …).
+#[op2]
+#[buffer]
+pub fn op_force_readback_snapshot(state: &mut OpState, #[smi] snapshot_id: u32) -> Vec<u8> {
+    if snapshot_id == 0 {
+        return Vec::new();
+    }
+    // Flush the unified frame collector before the sync round-trip.
+    // The matching `op_capture_canvas2d_snapshot` was queued (fire-
+    // and-forget) into the same collector earlier on this JS turn; if
+    // we read directly via the bypass channel, the render thread sees
+    // the ReadSnapshotPixels first, the snapshot pool is empty, and
+    // we return zeros -- which the lazy ImageData getter then writes
+    // into the placeholder, producing blank textures (visible as
+    // missing dynamic labels in cocos's gl.texImage2D(canvas) path).
+    crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
+    let ctx = state.borrow::<CanvasOpState>();
+    // canvas_id is irrelevant for the readback path; the manager
+    // hops onto any current canvas to issue the FBO bind.  Use 1
+    // (onscreen) as a stable id for the routing.
+    match send_render_with_resp_sync(
+        ctx,
+        OP_FORCE_READBACK_SNAPSHOT,
+        |resp| RenderCommand::Canvas2D {
+            canvas_id: 1,
+            cmd: Canvas2DCmd::ReadSnapshotPixels { snapshot_id, resp },
+        },
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            error!("{OP_FORCE_READBACK_SNAPSHOT} failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+// ============================================================================
+// Text texture cache integration
+// ============================================================================
+//
+// Three ops bridge the JS-side pattern recognizer in `02_2d_context.js` to
+// `shared::text_texture_cache::global_cache()`:
+//   * `op_text_cache_peek_pin` — lookup-and-pin at `fillText` time.
+//     Returns 1 on hit (caller MUST balance with `op_text_cache_unpin` once
+//     the matching `texImage2D` consumes the entry, OR if the pattern
+//     fails to materialise and the cache hit is abandoned).
+//   * `op_text_cache_unpin` — pin balance, used for abandon paths.
+//   * `op_capture_canvas2d_snapshot_for_cache` — miss-path record.  Same
+//     shape as `op_capture_canvas2d_snapshot` but routes through
+//     `Canvas2DCmd::CaptureSnapshot { cache_key: Some(_), .. }`, so the
+//     render-thread snapshot drain transfers the texture into the cache
+//     instead of deleting it.
+//   * `op_tex_image_2d_from_text_cache` — hit-path GL upload.  Emits
+//     `GLCmd::TexImage2DFromTextCache`, skipping the offscreen Canvas2D
+//     pipeline entirely.
+//
+// The 11-field cache key is passed as primitives across the FFI rather
+// than serialized (e.g. JSON) because each fillText / texImage2D pair
+// pays the cost ≥twice per label, and on a cocos shop scene that's ~250
+// op crossings.  Primitive args compile to a `Box<TextCacheKey>` once
+// per call site without intermediate allocation.
+
+fn build_text_cache_key(
+    text: String,
+    font_request: String,
+    font_size: f32,
+    font_weight: u16,
+    italic: bool,
+    fill_color: u32,
+    text_align_u8: u8,
+    text_baseline_u8: u8,
+    canvas_w: u32,
+    canvas_h: u32,
+) -> shared::text_texture_cache::TextCacheKey {
+    let text_align = match text_align_u8 {
+        0 => TextAlign::Start,
+        1 => TextAlign::End,
+        2 => TextAlign::Left,
+        3 => TextAlign::Right,
+        4 => TextAlign::Center,
+        _ => TextAlign::Start,
+    };
+    let text_baseline = match text_baseline_u8 {
+        0 => TextBaseline::Top,
+        1 => TextBaseline::Hanging,
+        2 => TextBaseline::Middle,
+        3 => TextBaseline::Alphabetic,
+        4 => TextBaseline::Ideographic,
+        5 => TextBaseline::Bottom,
+        _ => TextBaseline::Alphabetic,
+    };
+    shared::text_texture_cache::TextCacheKey {
+        text,
+        font_request,
+        font_size_bits: font_size.to_bits(),
+        font_weight,
+        italic,
+        fill_color,
+        text_align,
+        text_baseline,
+        canvas_w,
+        canvas_h,
+        font_generation: shared::text_texture_cache::current_font_generation(),
+    }
+}
+
+/// Look up the text texture cache; on hit, increment the pin count and
+/// return `1` so the caller can safely emit a `TexImage2DFromTextCache`
+/// later in the same frame.  On miss, returns `0` without side effects.
+/// The pin acquired on hit MUST be balanced by either
+/// `op_tex_image_2d_from_text_cache` (which the render thread unpins
+/// after executing the copy) or `op_text_cache_unpin` if the JS-side
+/// abandons the hit before the consuming texImage2D arrives.
+#[op2(fast)]
+#[allow(clippy::too_many_arguments)]
+pub fn op_text_cache_peek_pin(
+    #[string] text: String,
+    #[string] font_request: String,
+    font_size: f32,
+    #[smi] font_weight: u32,
+    italic: bool,
+    #[smi] fill_color: u32,
+    #[smi] text_align: u8,
+    #[smi] text_baseline: u8,
+    #[smi] canvas_w: u32,
+    #[smi] canvas_h: u32,
+) -> u8 {
+    let key = build_text_cache_key(
+        text,
+        font_request,
+        font_size,
+        font_weight as u16,
+        italic,
+        fill_color,
+        text_align,
+        text_baseline,
+        canvas_w,
+        canvas_h,
+    );
+    let mut cache = shared::text_texture_cache::global_cache();
+    if cache.peek(&key).is_some() {
+        cache.pin(&key);
+        1
+    } else {
+        0
+    }
+}
+
+/// Drop a pin previously acquired by `op_text_cache_peek_pin`.  Used on
+/// abandon paths (the JS-side cocos pattern broke before the consuming
+/// `texImage2D` arrived; the cache entry would otherwise stay pinned
+/// indefinitely).
+#[op2(fast)]
+#[allow(clippy::too_many_arguments)]
+pub fn op_text_cache_unpin(
+    #[string] text: String,
+    #[string] font_request: String,
+    font_size: f32,
+    #[smi] font_weight: u32,
+    italic: bool,
+    #[smi] fill_color: u32,
+    #[smi] text_align: u8,
+    #[smi] text_baseline: u8,
+    #[smi] canvas_w: u32,
+    #[smi] canvas_h: u32,
+) {
+    let key = build_text_cache_key(
+        text,
+        font_request,
+        font_size,
+        font_weight as u16,
+        italic,
+        fill_color,
+        text_align,
+        text_baseline,
+        canvas_w,
+        canvas_h,
+    );
+    let mut cache = shared::text_texture_cache::global_cache();
+    cache.unpin(&key);
+}
+
+/// Miss-path snapshot capture: identical to `op_capture_canvas2d_snapshot`
+/// except the pushed `Canvas2DCmd::CaptureSnapshot` carries `cache_key =
+/// Some(_)`.  At frame end the render thread transfers the resulting GL
+/// texture into the text texture cache instead of deleting it, so the
+/// next identical fillText hits.
+#[op2(fast)]
+#[allow(clippy::too_many_arguments)]
+pub fn op_capture_canvas2d_snapshot_for_cache(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    x: i32,
+    y: i32,
+    #[smi] width: u32,
+    #[smi] height: u32,
+    #[smi] snapshot_id: u32,
+    #[string] text: String,
+    #[string] font_request: String,
+    font_size: f32,
+    #[smi] font_weight: u32,
+    italic: bool,
+    #[smi] fill_color: u32,
+    #[smi] text_align: u8,
+    #[smi] text_baseline: u8,
+    #[smi] canvas_w: u32,
+    #[smi] canvas_h: u32,
+) {
+    if snapshot_id == 0 {
+        return;
+    }
+    let key = build_text_cache_key(
+        text,
+        font_request,
+        font_size,
+        font_weight as u16,
+        italic,
+        fill_color,
+        text_align,
+        text_baseline,
+        canvas_w,
+        canvas_h,
+    );
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
+        collector.push(
+            canvas_id,
+            Canvas2DCmd::CaptureSnapshot {
+                x,
+                y,
+                width,
+                height,
+                snapshot_id,
+                cache_key: Some(Box::new(key)),
+            },
+        );
+    }
+}
+
+/// Hit-path GL upload.  Emits `GLCmd::TexImage2DFromTextCache` so the
+/// destination texture currently bound to `target` on `canvas_id` is
+/// populated from the cached source texture via FBO + glCopyTexImage2D
+/// on the render thread.  The cached entry is unpinned by the render
+/// thread inside `tex_image_2d_from_text_cache`.
+#[op2(fast)]
+#[allow(clippy::too_many_arguments)]
+pub fn op_tex_image_2d_from_text_cache(
+    state: &mut OpState,
+    #[smi] canvas_id: u32,
+    #[smi] target: u32,
+    #[smi] level: i32,
+    #[smi] internalformat: i32,
+    #[string] text: String,
+    #[string] font_request: String,
+    font_size: f32,
+    #[smi] font_weight: u32,
+    italic: bool,
+    #[smi] fill_color: u32,
+    #[smi] text_align: u8,
+    #[smi] text_baseline: u8,
+    #[smi] canvas_w: u32,
+    #[smi] canvas_h: u32,
+) {
+    let key = build_text_cache_key(
+        text,
+        font_request,
+        font_size,
+        font_weight as u16,
+        italic,
+        fill_color,
+        text_align,
+        text_baseline,
+        canvas_w,
+        canvas_h,
+    );
+    super::webgl::queue_gl_fire_and_forget(
+        state,
+        shared::protocol::render_cmd::GLCmd::TexImage2DFromTextCache {
+            canvas_id,
+            target,
+            level,
+            internalformat,
+            key: Box::new(key),
+        },
+    );
+}
+
 // ============================================================================
 // Frame lifecycle operations
 // ============================================================================
 
 #[op2(fast)]
 pub fn op_frame_begin(state: &mut OpState, #[smi] canvas_id: u32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.frame_begin(canvas_id);
     }
 }
@@ -371,7 +862,9 @@ pub fn op_frame_begin(state: &mut OpState, #[smi] canvas_id: u32) {
 /// Canvas2D + GL segments, with Materialize barriers at 2D->GL transitions.
 fn do_frame_end_unified(state: &mut OpState) {
     let packet = {
-        if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+        if let Some(collector) = state
+            .try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>(
+        ) {
             collector.build_frame_packet(true)
         } else {
             None
@@ -380,8 +873,14 @@ fn do_frame_end_unified(state: &mut OpState) {
 
     if let Some(packet) = packet {
         let ctx = state.borrow::<CanvasOpState>();
-        if let Err(e) = ctx.tx.send(RenderCommand::FramePacket(packet)) {
-            error!("frame_end_unified: send failed: {e}");
+        // FramePacket carries the frame's Canvas2D + GL draw work.
+        // Non-idempotent, so route via `dispatch()` — on sustained
+        // backpressure we prefer blocking the JS tick for a
+        // sub-frame window over silently dropping an entire
+        // frame's pixels.  The `BLOCKING_SEND_DEADLINE` (8 ms) cap
+        // still bounds worst-case stall.
+        if let Err(e) = ctx.tx.dispatch(RenderCommand::FramePacket(packet)) {
+            error!("frame_end_unified: dispatch failed: {e}");
         }
     }
 }
@@ -420,7 +919,9 @@ macro_rules! batched_op {
     ($fn_name:ident, $cmd:expr) => {
         #[op2(fast)]
         pub fn $fn_name(state: &mut OpState, #[smi] canvas_id: u32) {
-            if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+            if let Some(collector) = state
+                .try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>(
+            ) {
                 collector.push(canvas_id, $cmd);
             }
             // Soft byte-budget backpressure — mirror of the GL
@@ -446,7 +947,9 @@ batched_op!(op_save, Canvas2DCmd::Save);
 
 #[op2(fast)]
 pub fn op_restore(state: &mut OpState, #[smi] canvas_id: u32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.restore(canvas_id);
     }
 }
@@ -456,14 +959,18 @@ batched_op!(op_reset_transform, Canvas2DCmd::ResetTransform);
 
 #[op2(fast)]
 pub fn op_move_to(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::MoveTo { x, y });
     }
 }
 
 #[op2(fast)]
 pub fn op_line_to(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::LineTo { x, y });
     }
 }
@@ -477,7 +984,9 @@ pub fn op_quadratic_curve_to(
     x: f32,
     y: f32,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::QuadraticCurveTo { cpx, cpy, x, y });
     }
 }
@@ -493,7 +1002,9 @@ pub fn op_bezier_curve_to(
     x: f32,
     y: f32,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(
             canvas_id,
             Canvas2DCmd::BezierCurveTo {
@@ -519,7 +1030,9 @@ pub fn op_arc(
     end_angle: f32,
     counterclockwise: bool,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(
             canvas_id,
             Canvas2DCmd::Arc {
@@ -544,7 +1057,9 @@ pub fn op_arc_to(
     y2: f32,
     radius: f32,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(
             canvas_id,
             Canvas2DCmd::ArcTo {
@@ -560,7 +1075,9 @@ pub fn op_arc_to(
 
 #[op2(fast)]
 pub fn op_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::Rect { x, y, w, h });
     }
 }
@@ -579,7 +1096,9 @@ pub fn op_ellipse(
     end_angle: f32,
     counterclockwise: bool,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(
             canvas_id,
             Canvas2DCmd::Ellipse {
@@ -599,21 +1118,27 @@ pub fn op_ellipse(
 // Rectangle operations
 #[op2(fast)]
 pub fn op_fill_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::FillRect { x, y, w, h });
     }
 }
 
 #[op2(fast)]
 pub fn op_stroke_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::StrokeRect { x, y, w, h });
     }
 }
 
 #[op2(fast)]
 pub fn op_clear_rect(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32, w: f32, h: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::ClearRect { x, y, w, h });
     }
 }
@@ -628,7 +1153,9 @@ pub fn op_fill_text(
     y: f32,
     max_width: f32,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(
             canvas_id,
             Canvas2DCmd::FillText {
@@ -650,7 +1177,9 @@ pub fn op_stroke_text(
     y: f32,
     max_width: f32,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(
             canvas_id,
             Canvas2DCmd::StrokeText {
@@ -666,7 +1195,9 @@ pub fn op_stroke_text(
 // Style operations (with deduplication)
 #[op2(fast)]
 pub fn op_set_fill_style(state: &mut OpState, #[smi] canvas_id: u32, #[string] color_str: String) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         let color = parse_color_string(&color_str);
         collector.set_fill_color(canvas_id, color);
     }
@@ -678,7 +1209,9 @@ pub fn op_set_stroke_style(
     #[smi] canvas_id: u32,
     #[string] color_str: String,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         let color = parse_color_string(&color_str);
         collector.set_stroke_color(canvas_id, color);
     }
@@ -686,49 +1219,63 @@ pub fn op_set_stroke_style(
 
 #[op2(fast)]
 pub fn op_set_line_width(state: &mut OpState, #[smi] canvas_id: u32, width: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_line_width(canvas_id, width);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_line_cap(state: &mut OpState, #[smi] canvas_id: u32, #[smi] cap: u8) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_line_cap(canvas_id, cap);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_line_join(state: &mut OpState, #[smi] canvas_id: u32, #[smi] join: u8) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_line_join(canvas_id, join);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_miter_limit(state: &mut OpState, #[smi] canvas_id: u32, limit: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_miter_limit(canvas_id, limit);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_global_alpha(state: &mut OpState, #[smi] canvas_id: u32, alpha: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_global_alpha(canvas_id, alpha);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_composite_operation(state: &mut OpState, #[smi] canvas_id: u32, #[smi] op: u8) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_composite_operation(canvas_id, op);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_line_dash(state: &mut OpState, #[smi] canvas_id: u32, #[buffer] segments: &[u8]) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         // segments is a Float32Array transferred as raw bytes
         let floats: Vec<f32> = segments
             .chunks_exact(4)
@@ -740,14 +1287,18 @@ pub fn op_set_line_dash(state: &mut OpState, #[smi] canvas_id: u32, #[buffer] se
 
 #[op2(fast)]
 pub fn op_set_line_dash_offset(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_line_dash_offset(canvas_id, offset);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_shadow_blur(state: &mut OpState, #[smi] canvas_id: u32, blur: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_shadow_blur(canvas_id, blur);
     }
 }
@@ -758,7 +1309,9 @@ pub fn op_set_shadow_color(
     #[smi] canvas_id: u32,
     #[string] color_str: String,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         let color = parse_color_string(&color_str);
         collector.set_shadow_color(canvas_id, color);
     }
@@ -766,14 +1319,18 @@ pub fn op_set_shadow_color(
 
 #[op2(fast)]
 pub fn op_set_shadow_offset_x(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_shadow_offset_x(canvas_id, offset);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_shadow_offset_y(state: &mut OpState, #[smi] canvas_id: u32, offset: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_shadow_offset_y(canvas_id, offset);
     }
 }
@@ -791,7 +1348,9 @@ pub fn op_set_fill_style_gradient(
     r1: f32,
     #[string] stops_json: String,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         // Parse stops from JSON: [{"offset":0,"r":255,"g":0,"b":0,"a":255}, ...]
         let stops = parse_gradient_stops(&stops_json);
         let gradient_type = match gradient_type {
@@ -816,7 +1375,9 @@ pub fn op_set_stroke_style_gradient(
     r1: f32,
     #[string] stops_json: String,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         let stops = parse_gradient_stops(&stops_json);
         let gradient_type = match gradient_type {
             1 => GradientType::Radial,
@@ -884,7 +1445,9 @@ pub fn op_set_fill_style_pattern(
     repeat_x: bool,
     repeat_y: bool,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_fill_style_pattern(canvas_id, image_id, repeat_x, repeat_y);
     }
 }
@@ -897,21 +1460,27 @@ pub fn op_set_stroke_style_pattern(
     repeat_x: bool,
     repeat_y: bool,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_stroke_style_pattern(canvas_id, image_id, repeat_x, repeat_y);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_font(state: &mut OpState, #[smi] canvas_id: u32, #[string] font: String) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.set_font(canvas_id, font);
     }
 }
 
 #[op2(fast)]
 pub fn op_set_text_align(state: &mut OpState, #[smi] canvas_id: u32, #[smi] align: u8) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         let align = match align {
             0 => TextAlign::Start,
             1 => TextAlign::End,
@@ -926,7 +1495,9 @@ pub fn op_set_text_align(state: &mut OpState, #[smi] canvas_id: u32, #[smi] alig
 
 #[op2(fast)]
 pub fn op_set_text_baseline(state: &mut OpState, #[smi] canvas_id: u32, #[smi] baseline: u8) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         let baseline = match baseline {
             0 => TextBaseline::Top,
             1 => TextBaseline::Hanging,
@@ -945,44 +1516,43 @@ pub fn op_set_text_baseline(state: &mut OpState, #[smi] canvas_id: u32, #[smi] b
 /// fast-call lane; unknown values fall back to `Inherit`, matching
 /// browser behaviour of ignoring unsupported directions.
 #[op2(fast)]
-pub fn op_set_text_direction(
-    state: &mut OpState,
-    #[smi] canvas_id: u32,
-    #[smi] direction: u8,
-) {
-    if let Some(collector) = state
-        .try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+pub fn op_set_text_direction(state: &mut OpState, #[smi] canvas_id: u32, #[smi] direction: u8) {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
     {
         let direction = match direction {
             1 => shared::protocol::render_cmd::TextDirection::Ltr,
             2 => shared::protocol::render_cmd::TextDirection::Rtl,
             _ => shared::protocol::render_cmd::TextDirection::Inherit,
         };
-        collector.push(
-            canvas_id,
-            Canvas2DCmd::SetTextDirection { direction },
-        );
+        collector.push(canvas_id, Canvas2DCmd::SetTextDirection { direction });
     }
 }
 
 // Transform operations
 #[op2(fast)]
 pub fn op_translate(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::Translate { x, y });
     }
 }
 
 #[op2(fast)]
 pub fn op_rotate(state: &mut OpState, #[smi] canvas_id: u32, angle: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::Rotate { angle });
     }
 }
 
 #[op2(fast)]
 pub fn op_scale(state: &mut OpState, #[smi] canvas_id: u32, x: f32, y: f32) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::Scale { x, y });
     }
 }
@@ -999,7 +1569,9 @@ pub fn op_set_transform(
     e: f32,
     f: f32,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::SetTransform { a, b, c, d, e, f });
     }
 }
@@ -1020,7 +1592,9 @@ pub fn op_draw_image(
     dw: f32,
     dh: f32,
 ) {
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(
             canvas_id,
             Canvas2DCmd::DrawImage {
@@ -1073,7 +1647,9 @@ pub fn op_draw_image_batch(state: &mut OpState, #[smi] canvas_id: u32, #[buffer]
         });
     }
 
-    if let Some(collector) = state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>() {
+    if let Some(collector) =
+        state.try_borrow_mut::<crate::rendering::webgl::frame_collector::UnifiedFrameCollector>()
+    {
         collector.push(canvas_id, Canvas2DCmd::DrawImageBatch { draws });
     }
 }

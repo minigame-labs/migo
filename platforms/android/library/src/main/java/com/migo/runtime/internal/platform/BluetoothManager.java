@@ -449,12 +449,8 @@ public class BluetoothManager {
                 }
             };
 
-            BluetoothGatt gatt;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                gatt = device.connectGatt(ctx, false, callback, BluetoothDevice.TRANSPORT_LE);
-            } else {
-                gatt = device.connectGatt(ctx, false, callback);
-            }
+            BluetoothGatt gatt = device.connectGatt(
+                    ctx, false, callback, BluetoothDevice.TRANSPORT_LE);
             if (gatt == null) {
                 throw new RuntimeException("createBLEConnection:fail connect failed");
             }
@@ -674,14 +670,10 @@ public class BluetoothManager {
             if (gatt == null) {
                 throw new RuntimeException("setBLEMTU:fail not connected");
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                if (!gatt.requestMtu(mtu)) {
-                    throw new RuntimeException("setBLEMTU:fail request failed");
-                }
-                // Result delivered via onMtuChanged callback
-            } else {
-                throw new RuntimeException("setBLEMTU:fail not supported on this API level");
+            if (!gatt.requestMtu(mtu)) {
+                throw new RuntimeException("setBLEMTU:fail request failed");
             }
+            // Result delivered via onMtuChanged callback
         } catch (JSONException e) {
             throw new RuntimeException("setBLEMTU:fail invalid options");
         }

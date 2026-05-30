@@ -1,10 +1,38 @@
 extern crate khronos_egl as egl;
 
+use crate::BoundContext;
 use crate::backend::gl::surface::Canvas2DContext;
 use crate::dirty_region::damage_tracker::ResolvedDamage;
-use crate::BoundContext;
 use egl::EGL1_4;
 use glow::HasContext;
+
+/// Local shim for the `NativeTextureFromRaw` pattern used in
+/// `image.rs` — kept private to this module so callers inside
+/// `manager/mod.rs` can reconstruct a `glow::NativeTexture` from
+/// the raw GLuint stored in `StoredImage` without importing the
+/// trait from an adjacent child module.
+trait NativeTextureFromRawShim {
+    fn try_from_raw(raw: u32) -> Option<glow::NativeTexture>;
+}
+impl NativeTextureFromRawShim for glow::NativeTexture {
+    #[inline]
+    fn try_from_raw(raw: u32) -> Option<glow::NativeTexture> {
+        std::num::NonZeroU32::new(raw).map(glow::NativeTexture)
+    }
+}
+
+/// Mirror of [`NativeTextureFromRawShim`] for `glow::NativeFramebuffer`.
+/// Lets the GPU-side image copy path reconstruct a framebuffer handle
+/// from the raw GLuint stored alongside other state-tracker fields.
+trait NativeFramebufferFromRawShim {
+    fn try_from_raw(raw: u32) -> Option<glow::NativeFramebuffer>;
+}
+impl NativeFramebufferFromRawShim for glow::NativeFramebuffer {
+    #[inline]
+    fn try_from_raw(raw: u32) -> Option<glow::NativeFramebuffer> {
+        std::num::NonZeroU32::new(raw).map(glow::NativeFramebuffer)
+    }
+}
 use shared::{
     error::{EngineResult, ErrorCode},
     protocol::{
@@ -27,14 +55,33 @@ mod pbo_upload;
 mod types;
 
 pub(crate) use types::{
-    ee, BlendEquation, BlendFactors, BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta,
-    VertexAttribPointerFp,
-    ProgramMeta, RenderbufferMeta, SamplerMeta, ScissorState, ShaderMeta, SyncMeta, TextureMeta,
-    VaoMeta, MAX_UNIFORM_CACHE,
+    BlendEquation, BlendFactors, BufferMeta, CanvasGLState, CanvasInfo, FramebufferMeta,
+    MAX_UNIFORM_CACHE, ProgramMeta, QueryMeta, RenderbufferMeta, SamplerMeta, ScissorState,
+    ShaderMeta, SyncMeta, TextureMeta, TransformFeedbackMeta, VaoMeta, VertexAttribPointerFp, ee,
 };
 use types::{CanvasEntry, EglContextHandle, SurfaceKind};
 
 use self::image::ImageRegistry;
+
+/// One entry in the [`CanvasManager::canvas2d_snapshots`] pool.
+/// `tex` is owned by the EGL share group; deletion happens at
+/// frame-end drain or on canvas-manager teardown.  Width/height are
+/// retained so the upload path can size the destination glCopyTexImage2D
+/// without a JS-side handshake.
+///
+/// `cache_key` is `Some` for snapshots whose JS-side originator
+/// matched the cocos text pattern and whose key missed the text
+/// texture cache: the drain path hands the texture off to
+/// `shared::text_texture_cache::global_cache()` instead of deleting
+/// it, so a subsequent identical fillText hits the cache.  `None`
+/// for legacy snapshots (`getImageData` readback, generic uploads).
+#[derive(Clone)]
+struct Canvas2DSnapshotEntry {
+    tex: glow::NativeTexture,
+    width: u32,
+    height: u32,
+    cache_key: Option<Box<shared::text_texture_cache::TextCacheKey>>,
+}
 
 /// A budget-rejected upload still holding the caller's oneshot
 /// `resp`, waiting for the next frame's upload budget to open up.
@@ -59,6 +106,32 @@ pub(crate) struct DeferredUpload {
 /// a first-screen burst (hundreds of assets) while still capping
 /// worst-case residency.
 pub(crate) const MAX_DEFERRED_UPLOADS: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AsyncUploadRejectAction {
+    SyncFallback,
+    DeferRetry,
+}
+
+fn should_latch_default_fbo_readback(needs_default_fbo_readback: bool) -> bool {
+    !needs_default_fbo_readback
+}
+
+fn decide_async_upload_reject_action(
+    upload_thread_healthy: bool,
+    upload_server: Option<&crate::upload_server::UploadServer>,
+    bytes: usize,
+) -> AsyncUploadRejectAction {
+    let can_fit_later = upload_server
+        .map(|server| server.can_ever_fit_bytes(bytes))
+        .unwrap_or(false);
+
+    if upload_thread_healthy && can_fit_later {
+        AsyncUploadRejectAction::DeferRetry
+    } else {
+        AsyncUploadRejectAction::SyncFallback
+    }
+}
 
 #[allow(private_interfaces)]
 pub(crate) struct CanvasManager {
@@ -85,6 +158,41 @@ pub(crate) struct CanvasManager {
 
     // Image registry
     image_registry: ImageRegistry,
+
+    /// Per-canvas FBO used as the read source for `glCopyTexImage2D`
+    /// when handling `GLCmd::TexImage2DFromShared`.  Lazy-created on
+    /// first use because most canvases never trigger the WebGL
+    /// `texImage2D(image)` path; one FBO per canvas because FBO
+    /// names live in their owning context's namespace even when
+    /// textures are shared via EGL share lists.  Deleted in
+    /// `destroy_canvas` / `destroy_all` alongside other per-canvas
+    /// GL objects.
+    image_copy_fbos: HashMap<CanvasId, glow::NativeFramebuffer>,
+
+    /// Pool of GL textures that mirror Canvas2D regions captured by
+    /// [`shared::protocol::render_cmd::Canvas2DCmd::GetImageDataSnapshot`].
+    /// Keyed by an opaque `snapshot_id` JS holds onto.  Drained at
+    /// frame-end (`drain_canvas2d_snapshots`) so cocos's
+    /// `getImageData(text)`→`texImage2D` pattern stays GPU-only and
+    /// never builds up across frames.  Bounded at
+    /// [`MAX_LIVE_CANVAS2D_SNAPSHOTS`] entries; oldest evicted first.
+    canvas2d_snapshots: HashMap<u32, Canvas2DSnapshotEntry>,
+    /// Insertion order tracker for the per-frame drain.
+    /// `VecDeque` for O(1) push/pop on both ends.  Snapshot ids are
+    /// allocated JS-side and arrive on the wire with the capture
+    /// command, so the manager only tracks insertion order, not
+    /// allocation.
+    canvas2d_snapshot_order: std::collections::VecDeque<u32>,
+    /// Lazy per-render-thread temp FBO used as the DRAW target when
+    /// blitting from a Canvas2D surface into a freshly allocated
+    /// snapshot texture.  One global FBO is enough because we
+    /// detach the colour attachment immediately after each blit.
+    canvas2d_snapshot_blit_fbo: Option<glow::NativeFramebuffer>,
+    /// Lazy per-render-thread temp FBO used as the READ source when
+    /// uploading a snapshot texture into a destination texture via
+    /// `glCopyTexImage2D`.  Same one-FBO-many-attachments idiom as
+    /// [`Self::canvas2d_snapshot_blit_fbo`].
+    canvas2d_snapshot_read_fbo: Option<glow::NativeFramebuffer>,
 
     /// Last eglSwapInterval value to avoid redundant driver calls per frame.
     /// Initialized to -1 (sentinel) so the first swap forces an actual EGL call.
@@ -119,12 +227,35 @@ pub(crate) struct CanvasManager {
     pub(crate) vaos: HashMap<shared::protocol::render_cmd::VaoId, VaoMeta>,
     pub(crate) samplers: HashMap<shared::protocol::render_cmd::SamplerId, SamplerMeta>,
     pub(crate) syncs: HashMap<shared::protocol::render_cmd::SyncId, SyncMeta>,
+    /// WebGL 2 Query objects (occlusion, timer, etc.).
+    pub(crate) queries: HashMap<u32, QueryMeta>,
+    /// WebGL 2 Transform Feedback objects.
+    pub(crate) transform_feedbacks: HashMap<u32, TransformFeedbackMeta>,
+
+    /// Texture atlas for small Canvas2D `drawImage` sources.
+    /// Lazy-initialised on first use to keep the idle memory
+    /// footprint unchanged (a single 2048x2048 page is 16 MiB).
+    ///
+    /// Enabling path: [`Self::maybe_atlas_small_image`] allocates a
+    /// region and returns the adjusted origin.  The call site can
+    /// then reuse the atlas page texture + UV offset in
+    /// `StoredImage` so `drawImage` of many small sprites (icons,
+    /// HUD) avoids per-draw texture bind churn.  The Skia backend
+    /// still wraps the atlas page into an `SkImage`; the draw
+    /// path offsets its source rect by the atlas region.
+    ///
+    /// P1-13: gated behind the `experimental_atlas` cargo feature
+    /// until the profile-validated cutover lands.  The field is
+    /// kept at the struct level (rather than behind `cfg!`) so
+    /// the hot-path fast check (`atlas.is_some()`) still compiles
+    /// to a simple `None` discriminant test without needing a
+    /// branch on a feature flag.
+    pub(crate) atlas: Option<crate::atlas::AtlasManager>,
 
     // NOTE: WebGL → Canvas2D invalidation is now tracked per-context
     // via `Canvas2DContext::skia_state_stale` (see backend/gl/surface.rs).
     // The old manager-global `skia_needs_reset` flag was removed after
     // it was observed to over-/mis-invalidate in multi-canvas scenes.
-
     /// Runtime device capabilities, detected once at init.
     pub(crate) device_caps: crate::device_caps::DeviceCapabilities,
 
@@ -132,10 +263,41 @@ pub(crate) struct CanvasManager {
     /// Used when creating shared contexts (offscreen canvas, upload thread).
     gles_major: u32,
 
+    /// Whether the EGL implementation supports
+    /// `EGL_EXT_create_context_robustness`.  When true, every context
+    /// the manager creates asks for `LOSE_CONTEXT_ON_RESET_EXT` so the
+    /// GL driver reports resets synchronously (R-3).
+    has_robust_context: bool,
+
+    /// Resolved `glGetGraphicsResetStatusKHR` entry point (R-3).
+    /// `None` on drivers without `GL_KHR_robustness` — the render
+    /// thread then has to fall back to detecting loss at
+    /// `eglSwapBuffers` time, same as the legacy path.
+    #[allow(improper_ctypes_definitions)]
+    pub(crate) gl_get_graphics_reset_status_fn: Option<unsafe extern "C" fn() -> u32>,
+
     /// Preserved EGL context from the last destroyed onscreen canvas.
     /// Reused on the next `create_onscreen()` to avoid losing GL state
     /// (textures, shaders, buffers) across Android surface destroy/recreate cycles.
     preserved_ctx: Option<egl::Context>,
+
+    /// Preserved onscreen DrawingBuffer paired with [`Self::preserved_ctx`].
+    ///
+    /// Android `SurfaceView` destruction invalidates the window EGLSurface, not
+    /// the share-group GL objects.  Industry renderers (Chromium's
+    /// DrawingBuffer, Flutter's surface/picture split, Slint's Skia surface
+    /// layer) keep the offscreen backbuffer independent from the platform
+    /// surface so returning from background can immediately blit the last
+    /// rendered frame while the JS/game loop schedules its next redraw.
+    ///
+    /// Before this field we destroyed the DrawingBuffer on
+    /// `surfaceDestroyed()` but preserved the EGL context.  On resume,
+    /// `create_onscreen()` then allocated a brand-new empty FBO, forced
+    /// `dirty = true`, and blitted black to the new window surface.  If Cocos
+    /// had not yet produced a new RAF frame (as seen in hxddd logs), the screen
+    /// remained black even though textures/programs survived.  Preserving the
+    /// DrawingBuffer closes that lifecycle gap.
+    preserved_drawing_buffer: Option<drawing_buffer::DrawingBuffer>,
 
     /// Set to true when a game reads pixels from the onscreen default framebuffer
     /// (readPixels on canvas_id=1 with default FBO bound). Once set, DrawingBuffer
@@ -205,8 +367,10 @@ pub(crate) struct CanvasManager {
     /// The accumulator is never mutated between those two calls in
     /// the current render-thread loop, so the second resolve is
     /// observationally identical.  Cleared after swap consumes it.
-    pending_declared_damage:
-        Option<(CanvasId, crate::dirty_region::damage_tracker::ResolvedDamage)>,
+    pending_declared_damage: Option<(
+        CanvasId,
+        crate::dirty_region::damage_tracker::ResolvedDamage,
+    )>,
 }
 
 impl CanvasManager {
@@ -226,10 +390,19 @@ impl CanvasManager {
         let display = init.display;
         let config = init.config;
         let gles_major = init.gles_major;
+        let has_robust_context = init.has_robust_context;
 
         // Create resource context + pbuffer.
-        let (resource_ctx, resource_surf) =
-            egl_ops::create_pbuffer_context(&egl, display, config, None, 16, 16, gles_major)?;
+        let (resource_ctx, resource_surf) = egl_ops::create_pbuffer_context(
+            &egl,
+            display,
+            config,
+            None,
+            16,
+            16,
+            gles_major,
+            has_robust_context,
+        )?;
         let resource = EglContextHandle {
             ctx: resource_ctx,
             surf: resource_surf,
@@ -261,7 +434,55 @@ impl CanvasManager {
             .query_string(Some(display), egl::EXTENSIONS)
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let device_caps = crate::device_caps::DeviceCapabilities::detect(&gl, &egl_extensions, gles_major, gpu_caps);
+        let mut device_caps = crate::device_caps::DeviceCapabilities::detect(
+            &gl,
+            &egl_extensions,
+            gles_major,
+            gpu_caps,
+        );
+
+        // Resolve the AHardwareBuffer → EGLImage → GL texture import
+        // function pointers exactly once, while the resource EGL context is
+        // still current (so `eglGetProcAddress` can return driver pointers
+        // for both EGL and GL extension entry points).  Without this call
+        // every `import_ahb_as_texture` invocation fails with
+        // "AHB import functions not resolved" — the zero-copy path in
+        // `load_ahb_image` has no fallback, so images end up black on
+        // screen.  Downgrade `ahb_available` if the driver doesn't actually
+        // expose all four required entry points, which lets the upload
+        // pipeline skip the AHB path entirely and go through the PBO
+        // fallback instead of hitting the same error on every image.
+        if device_caps.ahb_available {
+            // `eglGetProcAddress` returns `extern "system" fn()`; on every
+            // platform Migo targets this is ABI-identical to the
+            // `unsafe extern "C" fn()` the import helper expects, so the
+            // transmute below is just a calling-convention re-tagging.
+            // Kept `unsafe` for documentation because the compiler cannot
+            // verify the invariant.
+            match crate::texture_import::ensure_import_fns(&|s| {
+                egl.get_proc_address(s)
+                    .map(|f| unsafe { std::mem::transmute::<_, unsafe extern "C" fn()>(f) })
+            }) {
+                Ok(()) => {}
+                Err(missing) => {
+                    tracing::warn!("AHB advertised but {missing}; disabling AHB upload path");
+                    device_caps.ahb_available = false;
+                }
+            }
+        }
+
+        // P1-12: set the Skia resource-cache budget from the
+        // detected device tier before any `Canvas2DContext` is
+        // created.  The per-context cap is derived lazily in
+        // `per_ctx_resource_cache_bytes`, so updating the global
+        // here propagates automatically to every subsequent
+        // canvas creation.  On low-memory signals the manager
+        // can further lower the budget via
+        // `set_skia_resource_cache_budget(low_memory_budget())`
+        // — see [`CanvasManager::on_trim_memory`].
+        crate::backend::gl::surface::set_skia_resource_cache_budget(
+            crate::backend::gl::surface::tier_budget(device_caps.tier()),
+        );
         tracing::info!(
             "DeviceCapabilities: GLES {:?}, tier={:?}, pbo={}, fence={}, compute={}, ahb={}, buffer_age={}, partial_update={}",
             device_caps.gles_version,
@@ -287,13 +508,23 @@ impl CanvasManager {
         // Spawn upload thread on TierA devices (shared GL context for async texture upload).
         let api_level = crate::device_caps::android_api_level();
         let upload_thread = if device_caps.tier() == crate::device_caps::DeviceTier::TierA {
-            crate::upload_thread::UploadThreadHandle::try_spawn(&egl, display, config, resource.ctx, gles_major)
+            crate::upload_thread::UploadThreadHandle::try_spawn(
+                &egl,
+                display,
+                config,
+                resource.ctx,
+                gles_major,
+                has_robust_context,
+            )
         } else {
             None
         };
         // Budget gating: only when upload thread is live.
         let upload_server = if upload_thread.is_some() {
-            Some(crate::upload_server::UploadServer::for_device(&device_caps, api_level))
+            Some(crate::upload_server::UploadServer::for_device(
+                &device_caps,
+                api_level,
+            ))
         } else {
             None
         };
@@ -310,6 +541,37 @@ impl CanvasManager {
             tracing::info!("EGL_KHR_partial_update available");
         }
 
+        // Probe `GL_KHR_robustness::glGetGraphicsResetStatusKHR` (R-3).
+        // Only resolved when both the EGL extension for robust contexts
+        // and the GL extension are advertised — otherwise calling
+        // `glGetGraphicsResetStatus` is a no-op on some drivers and a
+        // hard crash on others.  The render loop uses the resolved
+        // pointer to poll context health at frame boundaries instead
+        // of waiting for `eglSwapBuffers` to fail.
+        let gl_get_graphics_reset_status_fn: Option<unsafe extern "C" fn() -> u32> =
+            if has_robust_context {
+                let gl_exts = unsafe {
+                    let ptr = gl.get_parameter_string(glow::EXTENSIONS);
+                    ptr
+                };
+                if gl_exts.contains("GL_KHR_robustness") || gl_exts.contains("GL_EXT_robustness") {
+                    // Prefer the KHR-suffixed symbol when present.
+                    let primary = egl.get_proc_address("glGetGraphicsResetStatusKHR");
+                    let fallback = egl.get_proc_address("glGetGraphicsResetStatusEXT");
+                    let fn_ptr = primary.or(fallback);
+                    if let Some(p) = fn_ptr {
+                        tracing::info!("GL_KHR_robustness::glGetGraphicsResetStatus resolved");
+                        Some(unsafe { std::mem::transmute::<_, unsafe extern "C" fn() -> u32>(p) })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         // Pre-allocate with reasonable capacities to reduce rehashing.
         // Most games use a small number of canvases and GL objects.
         Ok(Self {
@@ -325,6 +587,11 @@ impl CanvasManager {
             contexts_2d: HashMap::with_capacity(4),
             dirty_2d: HashSet::with_capacity(4),
             image_registry: ImageRegistry::new(),
+            image_copy_fbos: HashMap::with_capacity(4),
+            canvas2d_snapshots: HashMap::with_capacity(8),
+            canvas2d_snapshot_order: std::collections::VecDeque::with_capacity(8),
+            canvas2d_snapshot_blit_fbo: None,
+            canvas2d_snapshot_read_fbo: None,
             last_swap_interval: -1, // force first eglSwapInterval call
             context_lost: false,
             last_window: None,
@@ -338,9 +605,15 @@ impl CanvasManager {
             vaos: HashMap::with_capacity(16),
             samplers: HashMap::with_capacity(8),
             syncs: HashMap::with_capacity(4),
+            queries: HashMap::with_capacity(4),
+            transform_feedbacks: HashMap::with_capacity(2),
+            atlas: None,
             device_caps,
             gles_major,
+            has_robust_context,
+            gl_get_graphics_reset_status_fn,
             preserved_ctx: None,
+            preserved_drawing_buffer: None,
             needs_default_fbo_readback: false,
             upload_server,
             upload_thread,
@@ -369,10 +642,35 @@ impl CanvasManager {
     /// `canvas.width`/`canvas.height` uses, matching browser semantics.
     pub(crate) fn create_offscreen(&mut self, w: u32, h: u32) -> EngineResult<CanvasId> {
         let id = self.new_canvas_id();
+        self.register_offscreen(id, w, h)?;
+        Ok(id)
+    }
+
+    /// Same as `create_offscreen` but uses the supplied `id` instead
+    /// of allocating one.  Used by the fire-and-forget JS path
+    /// (`CanvasCmd::RegisterOffscreen`) where JS owns the id range.
+    /// Idempotent: if `id` already exists this is a no-op.
+    pub(crate) fn register_offscreen(
+        &mut self,
+        id: CanvasId,
+        w: u32,
+        h: u32,
+    ) -> EngineResult<()> {
+        if self.canvases.contains_key(&id) {
+            return Ok(());
+        }
 
         let share = Some(self.resource.ctx);
-        let (ctx, surf) =
-            egl_ops::create_pbuffer_context(&self.egl, self.display, self.config, share, w, h, self.gles_major)?;
+        let (ctx, surf) = egl_ops::create_pbuffer_context(
+            &self.egl,
+            self.display,
+            self.config,
+            share,
+            w,
+            h,
+            self.gles_major,
+            self.has_robust_context,
+        )?;
 
         let info = CanvasInfo {
             id,
@@ -396,7 +694,7 @@ impl CanvasManager {
         // Offscreen canvas created → bypass no longer valid.
         self.evaluate_bypass();
 
-        Ok(id)
+        Ok(())
     }
 
     /// Create or recreate the onscreen canvas (id=1).
@@ -445,6 +743,43 @@ impl CanvasManager {
             }
         }
 
+        // R-5: same ANativeWindow but physical dimensions changed
+        // (status bar hide/show, keyboard open/close, orientation
+        // where the window handle is preserved).  Fast-path via
+        // `resize_canvas`, which keeps the EGL context, Skia
+        // DirectContext, every uploaded texture, and every
+        // compiled program alive — the only work is rebuilding
+        // the onscreen `SkSurface` and the DrawingBuffer FBO at
+        // the new dimensions.  The previous path destroyed the
+        // entire EGL surface + context (50-100 ms stall) on every
+        // orientation change even when it wasn't needed.
+        //
+        // Skipped when:
+        //   * surface_size is `None` (first create / recovery);
+        //   * the window pointer changed (genuine surface recreate
+        //     — EGLSurface is bound to the ANativeWindow that's
+        //     gone);
+        //   * there is no existing 2D context (first frame).
+        if let Some((exp_w, exp_h)) = surface_size {
+            if let Some(entry) = self.canvases.get(&id) {
+                if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
+                    && self.contexts_2d.contains_key(&id)
+                {
+                    tracing::info!(
+                        "CanvasManager::create_onscreen fast resize {}x{} -> {}x{} (same window 0x{window:x})",
+                        entry.physical_width,
+                        entry.physical_height,
+                        exp_w,
+                        exp_h,
+                    );
+                    // `resize_canvas` takes `Option<u32>` per-dim so the
+                    // caller can signal "don't change this axis" with `None`.
+                    // Always pass the full new size here.
+                    return self.resize_canvas(id, Some(exp_w), Some(exp_h));
+                }
+            }
+        }
+
         self.last_window = Some(window);
         self.context_lost = false;
 
@@ -480,11 +815,25 @@ impl CanvasManager {
 
         let surf = egl_ops::create_window_surface(&self.egl, self.display, self.config, window)?;
 
-        let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION as i32, self.gles_major as i32, egl::NONE as i32];
+        // R-3: apply robust-context attribs when the driver supports
+        // them so the onscreen context signals resets via
+        // `glGetGraphicsResetStatus` instead of waiting for the
+        // swap-buffers detection path.
+        let ctx_attribs = egl_ops::build_ctx_attribs(self.gles_major, self.has_robust_context);
         let ctx = if let Some(preserved) = self.preserved_ctx.take() {
-            tracing::info!("Reusing preserved EGL context for onscreen canvas {id}");
+            tracing::info!(
+                canvas_id = %id,
+                has_robust = self.has_robust_context,
+                "Reusing preserved EGL context for onscreen canvas"
+            );
             preserved
         } else {
+            tracing::info!(
+                canvas_id = %id,
+                has_robust = self.has_robust_context,
+                gles_major = self.gles_major,
+                "Creating fresh EGL context for onscreen canvas"
+            );
             self.egl
                 .create_context(
                     self.display,
@@ -558,17 +907,64 @@ impl CanvasManager {
         // Make current so GL calls work.
         self.make_current_needed(id)?;
 
-        // Create the DrawingBuffer (intermediate FBO) for the onscreen canvas.
-        // WebGL renders to this FBO; it gets blitted to the window surface on swap.
-        match drawing_buffer::create(&self.gl, physical_w, physical_h) {
-            Ok(db) => {
-                if let Some(entry) = self.canvases.get_mut(&id) {
-                    entry.drawing_buffer = Some(db);
+        // Attach the DrawingBuffer (intermediate FBO) for the onscreen canvas.
+        // WebGL renders to this FBO; it gets blitted to the window surface on
+        // swap.  If the previous Android surface was destroyed while the EGL
+        // context was preserved, the DrawingBuffer GL objects are still valid
+        // and should be reused.  Reusing them preserves the last frame and
+        // avoids a black resume frame before Cocos schedules a new RAF draw.
+        let drawing_buffer = if let Some(mut db) = self.preserved_drawing_buffer.take() {
+            if db.width == physical_w && db.height == physical_h {
+                tracing::info!(
+                    canvas_id = %id,
+                    width = physical_w,
+                    height = physical_h,
+                    "Reusing preserved DrawingBuffer for onscreen canvas"
+                );
+                unsafe {
+                    self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
+                }
+                Some(db)
+            } else {
+                tracing::info!(
+                    canvas_id = %id,
+                    old_width = db.width,
+                    old_height = db.height,
+                    new_width = physical_w,
+                    new_height = physical_h,
+                    "Resizing preserved DrawingBuffer for onscreen canvas"
+                );
+                match drawing_buffer::resize(&self.gl, &mut db, physical_w, physical_h) {
+                    Ok(()) => Some(db),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Preserved DrawingBuffer resize failed; recreating instead: {e}"
+                        );
+                        drawing_buffer::destroy(&self.gl, db);
+                        None
+                    }
                 }
             }
-            Err(e) => {
-                tracing::error!("DrawingBuffer creation failed, rendering direct to surface: {e}");
-                // Fallback: render directly to window surface (legacy behavior).
+        } else {
+            None
+        };
+        if let Some(db) = drawing_buffer {
+            if let Some(entry) = self.canvases.get_mut(&id) {
+                entry.drawing_buffer = Some(db);
+            }
+        } else {
+            match drawing_buffer::create(&self.gl, physical_w, physical_h) {
+                Ok(db) => {
+                    if let Some(entry) = self.canvases.get_mut(&id) {
+                        entry.drawing_buffer = Some(db);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "DrawingBuffer creation failed, rendering direct to surface: {e}"
+                    );
+                    // Fallback: render directly to window surface (legacy behavior).
+                }
             }
         }
         self.evaluate_bypass();
@@ -602,11 +998,21 @@ impl CanvasManager {
         // reference to the image store into the resize path — the
         // context uses it to purge stale SkImage wrappers tied to
         // its outgoing GrDirectContext.
-        let image_store = self.image_registry.store_mut();
-        if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-            ctx2d.resize(new_fbo, physical_w, physical_h, image_store);
+        let resized_ok = {
+            let image_store = self.image_registry.store_mut();
+            self.contexts_2d
+                .get_mut(&id)
+                .map(|ctx2d| ctx2d.resize(new_fbo, physical_w, physical_h, image_store))
+                .unwrap_or(true)
+        };
+        if !resized_ok {
+            if let Some(tag) = self.drop_2d_context(id, true) {
+                self.image_registry
+                    .store_mut()
+                    .purge_wrappers_for_context(tag);
+            }
         }
-        if had_2d_context && !self.contexts_2d.contains_key(&id) {
+        if had_2d_context && (!self.contexts_2d.contains_key(&id) || !resized_ok) {
             context_2d_impl::init_skia_for_canvas(self, id)?;
         }
 
@@ -615,25 +1021,15 @@ impl CanvasManager {
 
     fn destroy_onscreen_internal(&mut self, id: CanvasId) -> EngineResult<()> {
         if let Some(mut entry) = self.canvases.remove(&id) {
-            // Destroy DrawingBuffer while the EGL context is still current.
-            if let Some(db) = entry.drawing_buffer.take() {
-                let _ = self.egl.make_current(
+            let skia_ctx_current = self
+                .egl
+                .make_current(
                     self.display,
                     Some(entry.ctx.surf),
                     Some(entry.ctx.surf),
                     Some(entry.ctx.ctx),
-                );
-                drawing_buffer::destroy(&self.gl, db);
-            }
-
-            // Switch to the resource (pbuffer) context so the ANativeWindow is
-            // properly disconnected before we destroy the onscreen surface.
-            let _ = self.egl.make_current(
-                self.display,
-                Some(self.resource.surf),
-                Some(self.resource.surf),
-                Some(self.resource.ctx),
-            );
+                )
+                .is_ok();
 
             // Capture the context's `ctx_tag` BEFORE dropping it so we
             // can purge matching SkImage wrappers from the shared
@@ -643,24 +1039,79 @@ impl CanvasManager {
             // (sk_image_cache has no LRU / size cap) and the
             // dangling pointers would be a correctness landmine if
             // any future caller hit the cache for the recycled tag.
-            let ctx_tag = self.contexts_2d.remove(&id).map(|c| c.ctx_tag);
+            let ctx_tag = self.drop_2d_context(id, skia_ctx_current);
             if let Some(tag) = ctx_tag {
                 self.image_registry
                     .store_mut()
                     .purge_wrappers_for_context(tag);
             }
+            // Rebalance Skia resource-cache caps now that one
+            // fewer context is sharing the aggregate budget.
+            let live = self.contexts_2d.len();
+            for ctx in self.contexts_2d.values_mut() {
+                ctx.rebalance_resource_cache(live);
+            }
             self.dirty_2d.remove(&id);
             self.gl_state.remove(&id);
             self.image_registry.remove_canvas_images(id);
 
+            // Switch to the resource (pbuffer) context so the ANativeWindow is
+            // properly disconnected before we destroy the onscreen surface.
+            let _ = self.egl.make_current(
+                self.display,
+                Some(self.resource.surf),
+                Some(self.resource.surf),
+                Some(self.resource.ctx),
+            );
             let _ = self.egl.destroy_surface(self.display, entry.ctx.surf);
             // Preserve the context for reuse on the next create_onscreen().
             // This avoids losing GL state (textures, shaders) across
             // Android surface destroy/recreate cycles (pause/resume).
-            if let Some(old_ctx) = self.preserved_ctx.replace(entry.ctx.ctx) {
-                // If there was already a preserved context (shouldn't happen normally),
-                // destroy the older one to avoid leaking.
+            //
+            // Also preserve the DrawingBuffer when the context is preserved:
+            // it is an offscreen FBO/texture owned by the context/share group,
+            // not by the outgoing ANativeWindow.  Dropping it here created a
+            // fresh empty black FBO on resume; if JS didn't redraw immediately
+            // the user saw a black screen.  Keeping it matches Chromium-style
+            // DrawingBuffer lifecycle: surface loss detaches presentation, not
+            // the retained drawing target.
+            let old_preserved_ctx = self.preserved_ctx.take();
+            if let Some(old_db) = self.preserved_drawing_buffer.take() {
+                if let Some(old_ctx) = old_preserved_ctx {
+                    // Delete the old DrawingBuffer while its owning context is
+                    // current, then switch away before destroying that context.
+                    let _ = self.egl.make_current(
+                        self.display,
+                        Some(self.resource.surf),
+                        Some(self.resource.surf),
+                        Some(old_ctx),
+                    );
+                    drawing_buffer::destroy(&self.gl, old_db);
+                    let _ = self.egl.make_current(
+                        self.display,
+                        Some(self.resource.surf),
+                        Some(self.resource.surf),
+                        Some(self.resource.ctx),
+                    );
+                    let _ = self.egl.destroy_context(self.display, old_ctx);
+                } else {
+                    // Should not happen: DrawingBuffer and context are paired.
+                    // Destroy against the current resource context as a best
+                    // effort so we do not leak the GL objects.
+                    drawing_buffer::destroy(&self.gl, old_db);
+                }
+            } else if let Some(old_ctx) = old_preserved_ctx {
                 let _ = self.egl.destroy_context(self.display, old_ctx);
+            }
+            let preserved_db = entry.drawing_buffer.take();
+            self.preserved_ctx = Some(entry.ctx.ctx);
+            if let Some(db) = preserved_db {
+                tracing::info!(
+                    width = db.width,
+                    height = db.height,
+                    "Preserved DrawingBuffer across onscreen surface destruction"
+                );
+                self.preserved_drawing_buffer = Some(db);
             }
 
             self.bound = BoundContext::Resource;
@@ -677,6 +1128,125 @@ impl CanvasManager {
     #[inline]
     pub(crate) fn is_context_lost(&self) -> bool {
         self.context_lost
+    }
+
+    /// Low-memory signal handler (P1-12).  Called by the host
+    /// runtime in response to an Android `onTrimMemory`
+    /// notification or any equivalent platform signal.  Lowers
+    /// the Skia aggregate resource-cache budget to
+    /// [`crate::backend::gl::surface::low_memory_budget`] and
+    /// kicks every live `Canvas2DContext` to rebalance so the
+    /// effect lands within one frame instead of waiting for the
+    /// next canvas create / destroy.  Also runs a deferred-
+    /// resource purge so Skia can drop atlas / glyph entries
+    /// that the new budget no longer fits.
+    pub(crate) fn on_trim_memory(&mut self) {
+        use crate::backend::gl::surface::{low_memory_budget, set_skia_resource_cache_budget};
+        set_skia_resource_cache_budget(low_memory_budget());
+        let live = self.contexts_2d.len();
+        for ctx in self.contexts_2d.values_mut() {
+            ctx.rebalance_resource_cache(live);
+            ctx.perform_deferred_cleanup(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Poll `glGetGraphicsResetStatus` (R-3).  Returns `true` when
+    /// the driver reports a reset, in which case the caller should
+    /// treat the GL context as dead and trigger recovery.  A `None`
+    /// function pointer (driver without `GL_KHR_robustness`) falls
+    /// through to `false` so legacy behaviour is preserved.
+    ///
+    /// Glazed-over `u32` return matches the raw
+    /// `glGetGraphicsResetStatus` ABI — `GL_NO_ERROR = 0` means
+    /// healthy, anything else (`GL_GUILTY_CONTEXT_RESET = 0x8253`,
+    /// `GL_INNOCENT_CONTEXT_RESET = 0x8254`,
+    /// `GL_UNKNOWN_CONTEXT_RESET = 0x8255`) indicates loss.  The
+    /// probing itself is cheap: a single driver function pointer
+    /// call per frame.
+    pub(crate) fn check_graphics_reset_status(&mut self) -> bool {
+        let Some(poll) = self.gl_get_graphics_reset_status_fn else {
+            return false;
+        };
+        // SAFETY: `poll` was resolved via `eglGetProcAddress` under
+        // a GL context of the same share group.  `glGetGraphicsResetStatus`
+        // reads driver-internal state only; no preconditions on the
+        // currently-bound context or thread beyond "a GL context is
+        // current", which is guaranteed by the render-thread loop
+        // calling this helper after `make_current`.
+        let status = unsafe { poll() };
+        if status != 0 {
+            tracing::warn!("GL_KHR_robustness reports context reset: status=0x{status:04X}");
+            self.context_lost = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark every live Skia `DirectContext` as abandoned.  After
+    /// this call Skia will neither flush nor `glDelete*` any
+    /// resource — subsequent `Drop` runs become no-ops and can't
+    /// crash the driver.  Called when the render loop detects
+    /// EGL context loss and knows the underlying GL objects are
+    /// already invalid.  Mirrors Slint's `Drop for OpenGLSurface`
+    /// pattern
+    /// (`internal/renderers/skia/opengl_surface.rs:515-525`)
+    /// which calls `GrDirectContext::abandon()` when
+    /// `make_current` fails.  Without this, dropping a
+    /// `Canvas2DContext` on a lost EGL context produces
+    /// `GL_INVALID_OPERATION` storms in logcat and on some
+    /// Adreno / Mali drivers crashes the renderer thread.
+    /// Total number of canvases (onscreen + offscreen) currently
+    /// tracked by the manager.  Cheap counter read, mainly used
+    /// by lifecycle diagnostic logs (`Pause` / `Resume`) to
+    /// correlate field reports with the amount of GPU state the
+    /// engine is holding at the time.
+    #[inline]
+    pub(crate) fn canvas_count(&self) -> usize {
+        self.canvases.len()
+    }
+
+    pub(crate) fn abandon_all_2d_contexts(&mut self) {
+        for ctx in self.contexts_2d.values_mut() {
+            ctx.abandon();
+        }
+    }
+
+    /// Fail every responder the manager is holding on behalf of a
+    /// JS-side sync op with `ErrorCode::ContextLost`.
+    ///
+    /// Called by the render thread the moment `swap_buffers` sets
+    /// `context_lost = true`.  Without this sweep, a call like
+    /// `Image.src = ...` whose `LoadImage` response is still sitting
+    /// in `pending_load_responses` would time out the full 10 s
+    /// `COMMAND_TIMEOUT_MS` before the host learns the context
+    /// vanished — with the sweep it fails immediately and the JS
+    /// game code can choose to retry on the next surface.  The
+    /// guarantee is "every responder we track is honoured exactly
+    /// once" — Drop-safety of `RenderCmdResp` turns any responder
+    /// we might miss into a structured `Internal` error instead of
+    /// a silent disconnect.
+    pub(crate) fn fail_pending_sync_responders(&mut self, reason: &str) -> usize {
+        use shared::error::EngineError;
+
+        let mut drained = 0usize;
+        let take_pending = std::mem::take(&mut self.pending_load_responses);
+        for (image_id, resp) in take_pending {
+            drained += 1;
+            let err = EngineError::new(ErrorCode::RenderBackendError)
+                .with_msg("image upload aborted")
+                .with_detail(format!("image_id={image_id}: {reason}"));
+            resp.err(err);
+        }
+        let take_deferred = std::mem::take(&mut self.deferred_uploads);
+        for pending in take_deferred {
+            drained += 1;
+            let err = EngineError::new(ErrorCode::RenderBackendError)
+                .with_msg("deferred upload aborted")
+                .with_detail(format!("image_id={}: {reason}", pending.image_id));
+            pending.resp.err(err);
+        }
+        drained
     }
 
     /// Attempt to recover from EGL context loss by re-creating the
@@ -706,25 +1276,50 @@ impl CanvasManager {
         );
 
         if let Some(entry) = self.canvases.remove(&id) {
-            // If currently bound, switch to resource first
-            if self.bound == BoundContext::Canvas(id) {
+            let saved_bound = self.bound;
+            let skia_ctx_current = self
+                .egl
+                .make_current(
+                    self.display,
+                    Some(entry.ctx.surf),
+                    Some(entry.ctx.surf),
+                    Some(entry.ctx.ctx),
+                )
+                .is_ok();
+            if skia_ctx_current {
+                self.bound = BoundContext::Canvas(id);
+            }
+
+            // Same SkImage-wrapper purge pattern as the onscreen
+            // destroy path: capture ctx_tag before removing.
+            let ctx_tag = self.drop_2d_context(id, skia_ctx_current);
+            if skia_ctx_current {
                 let _ = self.bind_resource();
             }
             self.egl.destroy_surface(self.display, entry.ctx.surf).ok();
             self.egl.destroy_context(self.display, entry.ctx.ctx).ok();
-
-            // Same SkImage-wrapper purge pattern as the onscreen
-            // destroy path: capture ctx_tag before removing.
-            let ctx_tag = self.contexts_2d.remove(&id).map(|c| c.ctx_tag);
             if let Some(tag) = ctx_tag {
                 self.image_registry
                     .store_mut()
                     .purge_wrappers_for_context(tag);
             }
+            // Rebalance Skia caches now that the denominator changed.
+            let live = self.contexts_2d.len();
+            for ctx in self.contexts_2d.values_mut() {
+                ctx.rebalance_resource_cache(live);
+            }
             self.dirty_2d.remove(&id);
             self.gl_state.remove(&id);
 
+            // Release the GPU-copy FBO for this canvas.  FBO names
+            // are context-local, so it would be unusable after the
+            // owning canvas is gone.
+            if let Some(fbo) = self.image_copy_fbos.remove(&id) {
+                unsafe { self.gl.delete_framebuffer(fbo) };
+            }
+
             self.image_registry.remove_canvas_images(id);
+            let _ = self.restore_bound(saved_bound);
         }
         // Canvas destroyed → re-evaluate (may re-enable bypass).
         self.evaluate_bypass();
@@ -770,6 +1365,19 @@ impl CanvasManager {
                 if let Some(h) = f.gl_handle {
                     gl.delete_framebuffer(h);
                 }
+            }
+            for (_id, fbo) in self.image_copy_fbos.drain() {
+                gl.delete_framebuffer(fbo);
+            }
+            for (_id, entry) in self.canvas2d_snapshots.drain() {
+                gl.delete_texture(entry.tex);
+            }
+            self.canvas2d_snapshot_order.clear();
+            if let Some(fbo) = self.canvas2d_snapshot_blit_fbo.take() {
+                gl.delete_framebuffer(fbo);
+            }
+            if let Some(fbo) = self.canvas2d_snapshot_read_fbo.take() {
+                gl.delete_framebuffer(fbo);
             }
             for (_id, r) in self.renderbuffers.drain() {
                 if let Some(h) = r.gl_handle {
@@ -933,8 +1541,7 @@ impl CanvasManager {
                 }
 
                 let info = crate::backend::gl::image_store::GpuImageInfo::rgba8_unpremul(
-                    c.width,
-                    c.height,
+                    c.width, c.height,
                 );
                 self.image_registry
                     .register_shared_texture(c.image_id as u32, c.texture, info);
@@ -993,59 +1600,9 @@ impl CanvasManager {
     /// readback that triggered this signal sees valid content immediately,
     /// not just on subsequent frames.
     pub(crate) fn signal_default_fbo_readback(&mut self) {
-        if !self.needs_default_fbo_readback {
-            let onscreen_id = CanvasId::from(1u32);
-            let was_bypass = self
-                .canvases
-                .get(&onscreen_id)
-                .map_or(false, |e| e.bypass_drawing_buffer);
-
-            tracing::info!("Default-FBO readback detected — disabling DrawingBuffer bypass");
+        if should_latch_default_fbo_readback(self.needs_default_fbo_readback) {
             self.needs_default_fbo_readback = true;
-            self.evaluate_bypass(); // sets bypass_drawing_buffer = false
-
-            // If bypass was active, the window surface (FBO 0) has the current
-            // frame's content but the DrawingBuffer is stale.  Blit window → DB
-            // so the DrawingBuffer has valid content for the imminent readback
-            // and for all subsequent frames.
-            //
-            // COUPLING NOTE: This reverse blit requires glBlitFramebuffer (ES 3.0).
-            // The DrawingBuffer itself is only created when blit is available
-            // (see drawing_buffer::create which probes blit at init).  If the
-            // DrawingBuffer creation conditions or the bypass evaluation logic
-            // change, this path must be re-verified to stay consistent.
-            if was_bypass {
-                if let Some(entry) = self.canvases.get(&onscreen_id) {
-                    if let Some(ref db) = entry.drawing_buffer {
-                        let w = entry.physical_width;
-                        let h = entry.physical_height;
-                        unsafe {
-                            use glow::HasContext;
-                            // READ from window surface (FBO 0), DRAW to DrawingBuffer.
-                            self.gl
-                                .bind_framebuffer(glow::READ_FRAMEBUFFER, None);
-                            self.gl
-                                .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(db.fbo));
-                            self.gl.blit_framebuffer(
-                                0,
-                                0,
-                                w as i32,
-                                h as i32,
-                                0,
-                                0,
-                                w as i32,
-                                h as i32,
-                                glow::COLOR_BUFFER_BIT,
-                                glow::NEAREST,
-                            );
-                            // Re-bind DrawingBuffer as the active FBO for subsequent
-                            // rendering and the imminent readback.
-                            self.gl
-                                .bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
-                        }
-                    }
-                }
-            }
+            self.evaluate_bypass();
         }
     }
 
@@ -1152,6 +1709,23 @@ impl CanvasManager {
         }
     }
 
+    /// Remove a Canvas2DContext and drop it under a known-good GL context
+    /// when possible. If the matching EGL context is not current, abandon
+    /// the Skia context first so Drop doesn't issue GL destruction calls
+    /// against the wrong or already-destroyed driver context.
+    fn drop_2d_context(&mut self, id: CanvasId, ctx_is_current: bool) -> Option<u32> {
+        let mut ctx = self.contexts_2d.remove(&id)?;
+        let ctx_tag = ctx.ctx_tag;
+        if !ctx_is_current {
+            tracing::warn!(
+                "dropping Canvas2DContext for canvas {id:?} without its EGL context current; abandoning Skia context first"
+            );
+            ctx.abandon();
+        }
+        drop(ctx);
+        Some(ctx_tag)
+    }
+
     // ==================== Canvas Operations ====================
 
     /// Resize a canvas buffer.
@@ -1208,9 +1782,20 @@ impl CanvasManager {
                 .and_then(|e| e.drawing_buffer.as_ref())
                 .map(|db| db.fbo.0.get())
                 .unwrap_or(0);
-            let image_store = self.image_registry.store_mut();
-            if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-                ctx2d.resize(new_fbo, new_w, new_h, image_store);
+            let resized_ok = {
+                let image_store = self.image_registry.store_mut();
+                self.contexts_2d
+                    .get_mut(&id)
+                    .map(|ctx2d| ctx2d.resize(new_fbo, new_w, new_h, image_store))
+                    .unwrap_or(true)
+            };
+            if !resized_ok {
+                if let Some(tag) = self.drop_2d_context(id, true) {
+                    self.image_registry
+                        .store_mut()
+                        .purge_wrappers_for_context(tag);
+                }
+                context_2d_impl::init_skia_for_canvas(self, id)?;
             }
 
             // WebGL default framebuffer viewport resets after drawing buffer resize.
@@ -1289,6 +1874,22 @@ impl CanvasManager {
                 })?;
             self.bound = BoundContext::Canvas(id);
         }
+        if !was_current {
+            self.egl
+                .make_current(
+                    self.display,
+                    Some(new_surf),
+                    Some(new_surf),
+                    Some(ctx_handle),
+                )
+                .map_err(|e| {
+                    ee(
+                        ErrorCode::RenderBackendError,
+                        format!("resize_canvas: make_current(resized surf) failed: {e:?}"),
+                    )
+                })?;
+            self.bound = BoundContext::Canvas(id);
+        }
 
         // Keep canvas metrics aligned with JS-requested dimensions. On some
         // devices EGL surface queries may return rotated values for window
@@ -1312,9 +1913,20 @@ impl CanvasManager {
         }
 
         // Offscreen pbuffer: Skia renders into FBO 0 directly.
-        let image_store = self.image_registry.store_mut();
-        if let Some(ctx2d) = self.contexts_2d.get_mut(&id) {
-            ctx2d.resize(0, actual_w, actual_h, image_store);
+        let resized_ok = {
+            let image_store = self.image_registry.store_mut();
+            self.contexts_2d
+                .get_mut(&id)
+                .map(|ctx2d| ctx2d.resize(0, actual_w, actual_h, image_store))
+                .unwrap_or(true)
+        };
+        if !resized_ok {
+            if let Some(tag) = self.drop_2d_context(id, true) {
+                self.image_registry
+                    .store_mut()
+                    .purge_wrappers_for_context(tag);
+            }
+            context_2d_impl::init_skia_for_canvas(self, id)?;
         }
 
         if !was_current {
@@ -1355,10 +1967,13 @@ impl CanvasManager {
         // Query buffer age and expand with history.
         const EGL_BUFFER_AGE_KHR: egl::Int = 0x313D;
         let buffer_damage = if self.device_caps.has_buffer_age {
-            match self.egl.query_surface(self.display, surf, EGL_BUFFER_AGE_KHR) {
-                Ok(age) if age > 0 => {
-                    self.damage_history.resolve_with_age(current_frame_damage, age)
-                }
+            match self
+                .egl
+                .query_surface(self.display, surf, EGL_BUFFER_AGE_KHR)
+            {
+                Ok(age) if age > 0 => self
+                    .damage_history
+                    .resolve_with_age(current_frame_damage, age),
                 _ => ResolvedDamage::FullSurface,
             }
         } else {
@@ -1366,14 +1981,68 @@ impl CanvasManager {
         };
 
         // Declare to the compositor what we will redraw.
-        if let (
-            Some(set_damage),
-            ResolvedDamage::Partial { x, y, width, height },
-        ) = (self.egl_set_damage_region_fn, buffer_damage)
-        {
-            let rect = [x, y, width, height];
-            unsafe {
-                set_damage(self.display, surf, rect.as_ptr(), 1);
+        //
+        // When the buffer-age-expanded result is `Partial` we'd
+        // otherwise just forward that single AABB.  But the
+        // accumulator still has the per-rect detail for the
+        // *current* frame: when `buffer_damage == current_frame_damage`
+        // (age=1 path) we upgrade to the multi-rect form so the
+        // driver can skip tiles not covered by any fragment.
+        // History-unioned results stay at single AABB because
+        // mixing per-rect and union semantics would require the
+        // history ring to keep per-rect records too.
+        let set_damage = match self.egl_set_damage_region_fn {
+            Some(f) => f,
+            None => return,
+        };
+        match buffer_damage {
+            ResolvedDamage::FullSurface => { /* no damage hint */ }
+            ResolvedDamage::Partial {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                // Age > 1 path (history-unioned): single AABB.
+                // The two `Partial` values won't match bitwise
+                // when a history union widened the rect, so this
+                // branch also catches history-expanded cases.
+                if matches!(current_frame_damage, ResolvedDamage::Partial { x: cx, y: cy, width: cw, height: ch } if cx == x && cy == y && cw == width && ch == height)
+                {
+                    // Age=1 (or no expansion): emit per-rect.
+                    if let Some(rects) = self
+                        .damage
+                        .resolve_rects((surface_w as i32, surface_h as i32))
+                    {
+                        // Flatten into a `[i32; 4N]` buffer for the
+                        // driver call.  4 rects * 4 ints = 16 ints;
+                        // stack allocation, no heap.
+                        let mut flat: [i32; 16] = [0; 16];
+                        let n = rects
+                            .len()
+                            .min(crate::dirty_region::damage_tracker::MAX_DAMAGE_RECTS);
+                        for (i, r) in rects.iter().take(n).enumerate() {
+                            flat[i * 4] = r.0;
+                            flat[i * 4 + 1] = r.1;
+                            flat[i * 4 + 2] = r.2;
+                            flat[i * 4 + 3] = r.3;
+                        }
+                        unsafe {
+                            set_damage(self.display, surf, flat.as_ptr(), n as i32);
+                        }
+                    } else {
+                        // resolve_rects returned None (full-redraw
+                        // escalation in the clipped form) - fall
+                        // back to single AABB.
+                        let rect = [x, y, width, height];
+                        unsafe { set_damage(self.display, surf, rect.as_ptr(), 1) };
+                    }
+                } else {
+                    // Buffer-age history widened the region; emit
+                    // the single widened AABB.
+                    let rect = [x, y, width, height];
+                    unsafe { set_damage(self.display, surf, rect.as_ptr(), 1) };
+                }
             }
         }
     }
@@ -1421,9 +2090,24 @@ impl CanvasManager {
         // Fall back to a live resolve when the cache is empty or
         // stale (different canvas id), which keeps correctness on
         // the barrier-flush / multi-canvas paths.
+        //
+        // P1-8: catch declare ↔ swap mismatches that would silently
+        // re-resolve against a mutated accumulator.  Debug builds
+        // panic; release builds fall through to the live resolve
+        // and log a warning so an operator can file a bug.
         let current_frame_damage = match self.pending_declared_damage.take() {
             Some((cached_id, resolved)) if cached_id == id => resolved,
-            _ => self.resolve_pending_damage(entry.physical_width, entry.physical_height),
+            Some((cached_id, _)) => {
+                debug_assert!(
+                    false,
+                    "damage-declare/swap guard violated: declared on canvas_id={cached_id:?} but swapping canvas_id={id:?}"
+                );
+                tracing::warn!(
+                    "damage guard: declared on {cached_id:?} but swap targets {id:?}; falling back to live resolve"
+                );
+                self.resolve_pending_damage(entry.physical_width, entry.physical_height)
+            }
+            None => self.resolve_pending_damage(entry.physical_width, entry.physical_height),
         };
         self.damage.reset();
 
@@ -1554,7 +2238,8 @@ impl CanvasManager {
 
     #[allow(dead_code)]
     pub(crate) fn mark_current_frame_requires_full_redraw(&mut self) {
-        self.damage.add(crate::damage_effect::DamageEffect::FullSurface);
+        self.damage
+            .add(crate::damage_effect::DamageEffect::FullSurface);
     }
 
     #[allow(dead_code)]
@@ -1566,7 +2251,13 @@ impl CanvasManager {
         if width <= 0 || height <= 0 {
             return;
         }
-        self.damage.add(crate::damage_effect::DamageEffect::OnscreenRect { x, y, width, height });
+        self.damage
+            .add(crate::damage_effect::DamageEffect::OnscreenRect {
+                x,
+                y,
+                width,
+                height,
+            });
     }
 
     /// Feed a DamageEffect directly into the per-frame accumulator.
@@ -1592,6 +2283,20 @@ impl CanvasManager {
         }
     }
 
+    /// Narrow-scope variant of [`mark_all_2d_contexts_stale`]: only
+    /// invalidate the caller-declared state bits across every live
+    /// 2D context.  Used by shared-context ops (AHB import, PBO
+    /// upload) that mutate a *specific* subset of GL state — e.g.
+    /// AHB import only touches the texture binding on the active
+    /// unit, so there's no reason to force every Canvas2D context
+    /// to re-send its entire tracked GL state before the next
+    /// draw.
+    pub(crate) fn mark_all_2d_contexts_stale_bits(&mut self, bits: u32) {
+        for ctx in self.contexts_2d.values_mut() {
+            ctx.mark_state_stale_bits(bits);
+        }
+    }
+
     /// Mark a SPECIFIC 2D context's Skia cache as stale.  Silent
     /// no-op when the canvas id has no 2D context (e.g. a
     /// WebGL-only canvas was the one targeted by the GL batch).
@@ -1600,6 +2305,15 @@ impl CanvasManager {
     pub(crate) fn mark_2d_context_stale(&mut self, canvas_id: CanvasId) {
         if let Some(ctx) = self.contexts_2d.get_mut(&canvas_id) {
             ctx.mark_state_stale();
+        }
+    }
+
+    /// Narrow-scope variant of [`mark_2d_context_stale`]: the caller
+    /// declares which slice of Skia's GL state needs invalidation.
+    #[allow(dead_code)]
+    pub(crate) fn mark_2d_context_stale_bits(&mut self, canvas_id: CanvasId, bits: u32) {
+        if let Some(ctx) = self.contexts_2d.get_mut(&canvas_id) {
+            ctx.mark_state_stale_bits(bits);
         }
     }
 
@@ -1672,10 +2386,6 @@ impl CanvasManager {
 
     // ==================== Image Management ====================
 
-    pub(crate) fn generate_img_id(&self) -> u32 {
-        self.image_registry.generate_img_id()
-    }
-
     pub(crate) fn load_shared_image(
         &mut self,
         image_id: u32,
@@ -1683,13 +2393,1180 @@ impl CanvasManager {
     ) -> EngineResult<(u32, u32)> {
         self.ensure_any_canvas_current()?;
         let display_ptr = self.display.as_ptr() as *const std::ffi::c_void;
-        self.image_registry.load_shared_image(
+        let result = self.image_registry.load_shared_image(
             &self.gl,
             image_id,
             image,
             &self.device_caps,
             display_ptr,
-        )
+        )?;
+        // PBO / glTexImage2D uploads bind, parameterise, and
+        // (optionally) use a PBO buffer behind Skia's back.
+        // Declare only the bits we actually touched so the next
+        // Canvas2D draw on any live context re-sends that GL
+        // slice — not the whole tracked state.  See
+        // `backend/gl/surface.rs::gr_state_bits`.
+        self.mark_all_2d_contexts_stale_bits(
+            crate::backend::gl::surface::gr_state_bits::TEXTURE_BINDING
+                | crate::backend::gl::surface::gr_state_bits::PIXEL_STORE,
+        );
+        Ok(result)
+    }
+
+    /// GPU-side `glTexImage2D(image)`: copy from a previously uploaded
+    /// shared image's GL texture into the destination texture
+    /// currently bound to `target` on `canvas_id`.  Replaces the slow
+    /// path of round-tripping CPU-side RGBA bytes back through the
+    /// render thread for WebGL `texImage2D(image)` calls.
+    ///
+    /// The destination texture is whichever the caller bound via
+    /// `gl.bindTexture(target, my_dst)` before issuing the WebGL
+    /// call — same semantics as the regular `TexImage2D` path.
+    /// Returns silently (with a `tracing::warn`) on lookup miss or
+    /// FBO completeness failure so a stale alias never panics the
+    /// render thread.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tex_image_2d_from_shared(
+        &mut self,
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        source_shared_id: u32,
+        src_width: i32,
+        src_height: i32,
+    ) -> EngineResult<()> {
+        self.make_current_needed(canvas_id)?;
+
+        let stored = match self.image_registry.get_shared_texture(source_shared_id) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    "TexImage2DFromShared: source shared_id {} not found",
+                    source_shared_id
+                );
+                return Ok(());
+            }
+        };
+
+        let src_tex = match <glow::NativeTexture as NativeTextureFromRawShim>::try_from_raw(
+            stored.gl_texture,
+        ) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(
+                    "TexImage2DFromShared: source texture handle is 0 for shared_id {}",
+                    source_shared_id
+                );
+                return Ok(());
+            }
+        };
+
+        let (sx, sy) = stored
+            .atlas_origin
+            .map(|(x, y)| (x as i32, y as i32))
+            .unwrap_or((0, 0));
+
+        let copy_fbo = self.ensure_image_copy_fbo(canvas_id)?;
+
+        // Save the current GL_READ_FRAMEBUFFER binding so the WebGL
+        // game's READ_FRAMEBUFFER expectations survive this op.
+        let prev_read_fbo = self
+            .gl_state
+            .get(&canvas_id)
+            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .flatten();
+
+        {
+            let entry = self.gl_state.entry(canvas_id).or_default();
+            if crate::backend::gl::state_tracker::update_bind_framebuffer(
+                entry,
+                glow::READ_FRAMEBUFFER,
+                Some(copy_fbo.0.get()),
+            ) {
+                unsafe {
+                    self.gl
+                        .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(copy_fbo));
+                }
+            }
+        }
+
+        unsafe {
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(src_tex),
+                0,
+            );
+            let status = self.gl.check_framebuffer_status(glow::READ_FRAMEBUFFER);
+            if status == glow::FRAMEBUFFER_COMPLETE {
+                self.gl.copy_tex_image_2d(
+                    target,
+                    level,
+                    internalformat as u32,
+                    sx,
+                    sy,
+                    src_width,
+                    src_height,
+                    0,
+                );
+            } else {
+                tracing::warn!(
+                    "TexImage2DFromShared: read FBO incomplete: 0x{:X}",
+                    status
+                );
+            }
+            // Detach so the source texture isn't kept implicitly
+            // alive by this FBO across calls.
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                None,
+                0,
+            );
+        }
+
+        // Restore the previous READ_FRAMEBUFFER.
+        {
+            let entry = self.gl_state.entry(canvas_id).or_default();
+            if crate::backend::gl::state_tracker::update_bind_framebuffer(
+                entry,
+                glow::READ_FRAMEBUFFER,
+                prev_read_fbo,
+            ) {
+                let prev = prev_read_fbo.and_then(
+                    <glow::NativeFramebuffer as NativeFramebufferFromRawShim>::try_from_raw,
+                );
+                unsafe {
+                    self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, prev);
+                }
+            }
+        }
+
+        // The destination texture binding under `target` is now the
+        // freshly populated copy.  Mark Skia's view of TEXTURE_BINDING
+        // stale on every live Canvas2D context — same accounting as
+        // load_shared_image, just for the WebGL re-upload flavour.
+        self.mark_all_2d_contexts_stale_bits(
+            crate::backend::gl::surface::gr_state_bits::TEXTURE_BINDING,
+        );
+        Ok(())
+    }
+
+    fn ensure_image_copy_fbo(
+        &mut self,
+        canvas_id: CanvasId,
+    ) -> EngineResult<glow::NativeFramebuffer> {
+        if let Some(fbo) = self.image_copy_fbos.get(&canvas_id).copied() {
+            return Ok(fbo);
+        }
+        let fbo = unsafe {
+            self.gl.create_framebuffer().map_err(|e| {
+                shared::error::EngineError::new(ErrorCode::Internal)
+                    .with_msg("create_framebuffer failed for image copy FBO")
+                    .with_detail(e)
+            })?
+        };
+        self.image_copy_fbos.insert(canvas_id, fbo);
+        Ok(fbo)
+    }
+
+    // -----------------------------------------------------------------
+    // Canvas2D zero-readback snapshot pool (cocos text-rendering fast path)
+    // -----------------------------------------------------------------
+    //
+    // hxddd 商城 spammed `getImageData(text)` → `texImage2D(data)` per
+    // sprite, blocking V8 36-65 ms each call.  The snapshot pool keeps
+    // the bytes on the GPU: `getImageData` produces a snapshot texture
+    // (FBO blit with Y-flip to match CPU-path orientation), and
+    // `texImage2D` consumes it via the existing `image_copy_fbos`
+    // FBO + glCopyTexImage2D primitive.  See
+    // `Canvas2DCmd::GetImageDataSnapshot` for the protocol.
+    //
+    // Tradeoff: Skia renders premultiplied alpha; our snapshot
+    // reads the FB as-is, so the resulting texture is premul.  The
+    // legacy CPU path explicitly converted to unpremul during
+    // `read_pixels`.  For pure-black anti-aliased text (cocos's
+    // dominant case: prices, button labels, item names) the bytes
+    // are byte-identical because `0 * alpha == 0`.  Coloured AA
+    // glyphs render with marginally darker fringes — acceptable for
+    // the >10× perf win.  Games that need bit-exact unpremul bytes
+    // can call `migo._force_readback(imageData)` to fall back to the
+    // legacy `read_image_data` synchronous path.
+
+    /// Maximum live snapshot textures kept in the pool at any time.
+    /// Frame-end drain releases everything from the prior frame, so
+    /// this only matters within a single frame: getImageData →
+    /// texImage2D pairs all queue snapshots that accumulate until
+    /// frame-end execution.  Cocos商城 has been observed with ~200
+    /// text sprites per frame (each price/button/item label takes
+    /// one snapshot), so the cap must comfortably exceed that.
+    ///
+    /// Sizing: 1024 snapshots * 32 KiB (typical text strip = 200x40
+    /// RGBA8) ≈ 32 MiB peak — high enough that the JS-side per-frame
+    /// budget (`MAX_LIVE_CANVAS2D_SNAPSHOTS_JS`, currently 512 in
+    /// `02_2d_context.js`) reaches its limit first and falls back to
+    /// the legacy CPU readback well before the render-side cap is
+    /// hit.  Render-side cap remains as a memory ceiling: when the
+    /// JS-side budget is somehow bypassed (different runtime, old
+    /// cached JS), we silently drop the snapshot rather than
+    /// blowing past the 200 MB native-heap target.
+    const MAX_LIVE_CANVAS2D_SNAPSHOTS: usize = 1024;
+
+    /// Capture a Canvas2D sub-rectangle into a GL texture using a
+    /// caller-supplied `snapshot_id`.  Powers the fire-and-forget
+    /// hot path where JS pre-allocated the id from a process-local
+    /// counter — there is intentionally no sync wrapper; supporting
+    /// both an internally-allocated and externally-allocated id
+    /// risked counter-collision in the shared pool HashMap.
+    ///
+    /// The blit applies a vertical mirror so the resulting texture's
+    /// GL row 0 (== bottom in GL coords) holds the JS top row of the
+    /// captured region — matching the on-wire layout WebGL produces
+    /// when uploading an unflipped `ImageData` (CPU path).  Without
+    /// the mirror, every cocos text sprite would render upside-down.
+    ///
+    /// Returns `0` on failure (caller has already committed to the
+    /// id; the consuming `TexImage2DFromSnapshot` will detect the
+    /// missing pool entry and warn).
+    pub(crate) fn snapshot_canvas2d_region_with_id(
+        &mut self,
+        canvas_id: CanvasId,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        snapshot_id: u32,
+    ) -> EngineResult<u32> {
+        if width == 0 || height == 0 {
+            return Ok(0);
+        }
+        // GLES 3.0+ required for glBlitFramebuffer.  On GLES 2 we
+        // bail; JS-side falls back to op_get_image_data + texImage2D.
+        if self.gles_major < 3 {
+            return Ok(0);
+        }
+        // Pool already at cap → return 0 so JS falls back to the
+        // legacy CPU path.  Eviction-and-overwrite would corrupt an
+        // in-flight snapshot whose texImage2DFromSnapshot is still
+        // pending in the frame collector.
+        if self.canvas2d_snapshot_order.len() >= Self::MAX_LIVE_CANVAS2D_SNAPSHOTS {
+            return Ok(0);
+        }
+        self.make_current_needed(canvas_id)?;
+
+        // Flush the source Canvas2D batch so the FB content is up to
+        // date before we sample it.  Mirrors what `read_image_data`
+        // does for the legacy path.
+        let surface_height = match self.contexts_2d.get_mut(&canvas_id) {
+            Some(ctx) => {
+                ctx.reset_gl_state_if_stale();
+                ctx.flush_and_submit();
+                ctx.height as i32
+            }
+            None => return Ok(0),
+        };
+
+        // Force the GPU to actually complete Skia's submitted draws
+        // before the subsequent `glBlitFramebuffer` samples this
+        // canvas's FBO.  `flush_and_submit` only enqueues commands;
+        // on Mali tile-based GPUs (Kirin 980 / HUAWEI EMUI) we have
+        // observed the blit reading pre-draw tile contents when no
+        // explicit sync is inserted — symptom: cocos text labels
+        // intermittently upload as blank textures.  See section
+        // "Mali Canvas2D snapshot sync" in CLAUDE.md for full
+        // background.
+        //
+        // `glFenceSync` + `glClientWaitSync` is the targeted form of
+        // `glFinish`: it only waits for the commands queued before
+        // this fence (Skia's `flushAndSubmit`), not for anything
+        // submitted later or on other contexts.  `SYNC_FLUSH_COMMANDS_BIT`
+        // gives `glFlush` semantics for free so the fence is
+        // guaranteed to make it to the GPU.  Mirrors the upload-thread
+        // pattern in `upload_thread.rs`.
+        unsafe {
+            if let Ok(fence) = self.gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0) {
+                // glow narrows the spec's GLuint64 timeout to i32
+                // (nanoseconds).  i32::MAX ns ≈ 2.1 s — easily enough
+                // for one Skia paragraph paint; if a single fillText
+                // takes longer than that we have bigger problems than
+                // this fence.
+                //
+                // NOTE (2026-05): we briefly tried swapping this for
+                // `wait_sync` (GPU-side barrier) to avoid the CPU
+                // stall — that immediately regressed §14.1 on arm64
+                // Mali (cocos labels rendered blank again).  The
+                // CPU-side `client_wait_sync` is load-bearing; do
+                // not touch without a Mali device in hand.
+                let _ = self.gl.client_wait_sync(
+                    fence,
+                    glow::SYNC_FLUSH_COMMANDS_BIT,
+                    i32::MAX,
+                );
+                self.gl.delete_sync(fence);
+            }
+        }
+
+        let src_fbo_raw = match self.contexts_2d.get(&canvas_id) {
+            Some(ctx) => ctx.fbo_id,
+            None => return Ok(0),
+        };
+        let src_fbo = <glow::NativeFramebuffer as NativeFramebufferFromRawShim>::try_from_raw(
+            src_fbo_raw,
+        );
+        // src_fbo == None means "default framebuffer"; pass `None` to
+        // bind FBO 0 explicitly.
+
+        // Allocate the destination texture before touching FBO state
+        // so we can roll back cleanly on alloc failure.
+        let dest_tex = unsafe {
+            self.gl.create_texture().map_err(|e| {
+                shared::error::EngineError::new(ErrorCode::Internal)
+                    .with_msg("snapshot_canvas2d_region: create_texture failed")
+                    .with_detail(e)
+            })?
+        };
+
+        let (w_i32, h_i32) = (width as i32, height as i32);
+
+        // Save GL state we're about to mutate so the surrounding
+        // WebGL/Canvas2D batch sees no observable change.
+        let prev_active_texture = unsafe {
+            self.gl
+                .get_parameter_i32(glow::ACTIVE_TEXTURE)
+        };
+        let prev_tex_2d = unsafe {
+            self.gl
+                .get_parameter_i32(glow::TEXTURE_BINDING_2D)
+        };
+        let prev_read_fbo = unsafe { self.gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING) };
+        let prev_draw_fbo = unsafe { self.gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) };
+
+        // Allocate storage on the destination texture.
+        unsafe {
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(dest_tex));
+            // Match CPU-path texture parameters: linear filter, clamp.
+            // Cocos sets these explicitly post-upload, so the values
+            // are mostly cosmetic — but a complete texture must have
+            // a min-filter that doesn't require mipmaps.
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            // Use sized internal format GL_RGBA8 (0x8058) so the
+            // FBO attachment is guaranteed color-renderable across
+            // GLES 3 drivers.  Unsized GL_RGBA is GLES 2 style and
+            // some Mali / Adreni drivers reject it as a colour-
+            // attachment source for glBlitFramebuffer / glCopy.
+            self.gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                w_i32,
+                h_i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+        }
+
+        // Lazy-init the temp FBOs.  Read FBO is not used in this
+        // function but the snapshot upload path needs it; create it
+        // here too so destroy_all has a single deletion site.
+        let blit_fbo = match self.canvas2d_snapshot_blit_fbo {
+            Some(f) => f,
+            None => {
+                let f = unsafe {
+                    self.gl.create_framebuffer().map_err(|e| {
+                        shared::error::EngineError::new(ErrorCode::Internal)
+                            .with_msg("snapshot blit FBO alloc failed")
+                            .with_detail(e)
+                    })?
+                };
+                self.canvas2d_snapshot_blit_fbo = Some(f);
+                f
+            }
+        };
+
+        unsafe {
+            self.gl
+                .bind_framebuffer(glow::READ_FRAMEBUFFER, src_fbo);
+            self.gl
+                .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(blit_fbo));
+            self.gl.framebuffer_texture_2d(
+                glow::DRAW_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(dest_tex),
+                0,
+            );
+            let status = self.gl.check_framebuffer_status(glow::DRAW_FRAMEBUFFER);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                tracing::warn!(
+                    "snapshot_canvas2d_region: draw FBO incomplete: 0x{:X}",
+                    status
+                );
+                self.gl.framebuffer_texture_2d(
+                    glow::DRAW_FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    None,
+                    0,
+                );
+                self.gl.delete_texture(dest_tex);
+                self.restore_state_after_snapshot(
+                    prev_active_texture,
+                    prev_tex_2d,
+                    prev_read_fbo,
+                    prev_draw_fbo,
+                );
+                return Ok(0);
+            }
+            // Mirror Y: srcY0 = top edge in GL coords (== JS y_min),
+            // srcY1 = bottom edge.  GL spec: src(srcX0, srcY0) maps to
+            // dst(dstX0, dstY0).  With dstY0=0 (GL bottom of dst tex)
+            // and srcY0 = surface_h - y (the top of the JS region in
+            // GL coords), the destination texture's GL row 0 ends up
+            // holding the JS top row — exactly the layout the
+            // downstream `glCopyTexImage2D` upload needs to land on
+            // the same GL coords as the legacy CPU path's
+            // `texImage2D(unpremul_bytes)`.
+            let src_y_top = surface_height - y;
+            let src_y_bot = surface_height - y - h_i32;
+            self.gl.blit_framebuffer(
+                x,
+                src_y_top,
+                x + w_i32,
+                src_y_bot,
+                0,
+                0,
+                w_i32,
+                h_i32,
+                glow::COLOR_BUFFER_BIT,
+                glow::NEAREST,
+            );
+            // Detach so the texture lifetime isn't pinned by the FBO
+            // beyond the blit.
+            self.gl.framebuffer_texture_2d(
+                glow::DRAW_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                None,
+                0,
+            );
+        }
+
+        self.restore_state_after_snapshot(
+            prev_active_texture,
+            prev_tex_2d,
+            prev_read_fbo,
+            prev_draw_fbo,
+        );
+
+        // We mutated ACTIVE_TEXTURE/TEXTURE_BINDING_2D and the FBO
+        // bindings out from under Skia.  Tell every live Canvas2D
+        // context that those slices are stale so the next 2D draw
+        // re-syncs Skia's tracking.
+        self.mark_all_2d_contexts_stale_bits(
+            crate::backend::gl::surface::gr_state_bits::TEXTURE_BINDING
+                | crate::backend::gl::surface::gr_state_bits::RENDER_TARGET,
+        );
+
+        // Use caller-supplied id (or auto-allocated by the wrapper).
+        // ID == 0 means "JS sentinel for absent snapshot"; reject so
+        // a buggy caller can't poison the pool with a never-lookup
+        // entry.
+        if snapshot_id == 0 {
+            unsafe { self.gl.delete_texture(dest_tex) };
+            return Ok(0);
+        }
+        self.canvas2d_snapshots.insert(
+            snapshot_id,
+            Canvas2DSnapshotEntry {
+                tex: dest_tex,
+                width,
+                height,
+                cache_key: None,
+            },
+        );
+        self.canvas2d_snapshot_order.push_back(snapshot_id);
+        Ok(snapshot_id)
+    }
+
+    /// Tag a previously-captured snapshot with a text-cache key so
+    /// the next `drain_canvas2d_snapshots` hands its GL texture off
+    /// to the global text texture cache instead of deleting it.
+    /// Called by the dispatcher after a `CaptureSnapshot { cache_key:
+    /// Some(_), .. }` succeeded.  No-op when the snapshot is absent
+    /// (capture failed earlier in the same packet).
+    pub(crate) fn mark_snapshot_for_text_cache(
+        &mut self,
+        snapshot_id: u32,
+        key: Box<shared::text_texture_cache::TextCacheKey>,
+    ) {
+        if let Some(entry) = self.canvas2d_snapshots.get_mut(&snapshot_id) {
+            entry.cache_key = Some(key);
+        }
+    }
+
+    /// Helper used by [`Self::snapshot_canvas2d_region`] to roll
+    /// back the GL state we mutated for the blit.
+    fn restore_state_after_snapshot(
+        &self,
+        prev_active_texture: i32,
+        prev_tex_2d: i32,
+        prev_read_fbo: i32,
+        prev_draw_fbo: i32,
+    ) {
+        unsafe {
+            // ACTIVE_TEXTURE first because the texture binding is
+            // unit-scoped.
+            if prev_active_texture as u32 >= glow::TEXTURE0 {
+                self.gl.active_texture(prev_active_texture as u32);
+            }
+            let prev_tex = <glow::NativeTexture as NativeTextureFromRawShim>::try_from_raw(
+                prev_tex_2d as u32,
+            );
+            self.gl.bind_texture(glow::TEXTURE_2D, prev_tex);
+            let prev_read = <glow::NativeFramebuffer as NativeFramebufferFromRawShim>::try_from_raw(
+                prev_read_fbo as u32,
+            );
+            let prev_draw = <glow::NativeFramebuffer as NativeFramebufferFromRawShim>::try_from_raw(
+                prev_draw_fbo as u32,
+            );
+            self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, prev_read);
+            self.gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, prev_draw);
+        }
+    }
+
+    /// Upload a previously captured snapshot texture into the
+    /// destination texture currently bound to `target` on
+    /// `canvas_id`.  Mirrors [`Self::tex_image_2d_from_shared`] but
+    /// pulls from the snapshot pool.
+    pub(crate) fn tex_image_2d_from_canvas2d_snapshot(
+        &mut self,
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        snapshot_id: u32,
+    ) -> EngineResult<()> {
+        let entry = match self.canvas2d_snapshots.get(&snapshot_id) {
+            Some(e) => e.clone(),
+            None => {
+                tracing::warn!(
+                    "TexImage2DFromSnapshot: snapshot_id {} not in pool (frame drain race?)",
+                    snapshot_id
+                );
+                return Ok(());
+            }
+        };
+        self.make_current_needed(canvas_id)?;
+
+        // Reuse the per-canvas image_copy_fbo as the READ framebuffer
+        // — exactly the same primitive `tex_image_2d_from_shared`
+        // uses, so the same driver paths are exercised.
+        let copy_fbo = self.ensure_image_copy_fbo(canvas_id)?;
+
+        let prev_read_fbo = self
+            .gl_state
+            .get(&canvas_id)
+            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .flatten();
+
+        {
+            let entry = self.gl_state.entry(canvas_id).or_default();
+            if crate::backend::gl::state_tracker::update_bind_framebuffer(
+                entry,
+                glow::READ_FRAMEBUFFER,
+                Some(copy_fbo.0.get()),
+            ) {
+                unsafe {
+                    self.gl
+                        .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(copy_fbo));
+                }
+            }
+        }
+
+        unsafe {
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(entry.tex),
+                0,
+            );
+            let status = self.gl.check_framebuffer_status(glow::READ_FRAMEBUFFER);
+            if status == glow::FRAMEBUFFER_COMPLETE {
+                self.gl.copy_tex_image_2d(
+                    target,
+                    level,
+                    internalformat as u32,
+                    0,
+                    0,
+                    entry.width as i32,
+                    entry.height as i32,
+                    0,
+                );
+            } else {
+                tracing::warn!(
+                    "TexImage2DFromSnapshot: read FBO incomplete: 0x{:X}",
+                    status
+                );
+            }
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                None,
+                0,
+            );
+        }
+
+        {
+            let s = self.gl_state.entry(canvas_id).or_default();
+            if crate::backend::gl::state_tracker::update_bind_framebuffer(
+                s,
+                glow::READ_FRAMEBUFFER,
+                prev_read_fbo,
+            ) {
+                let prev = prev_read_fbo.and_then(
+                    <glow::NativeFramebuffer as NativeFramebufferFromRawShim>::try_from_raw,
+                );
+                unsafe {
+                    self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, prev);
+                }
+            }
+        }
+
+        // Destination texture bound under `target` is now populated;
+        // mark Skia's per-context cached texture binding stale.
+        self.mark_all_2d_contexts_stale_bits(
+            crate::backend::gl::surface::gr_state_bits::TEXTURE_BINDING,
+        );
+        Ok(())
+    }
+
+    /// Text texture cache hit path: copy from the cached source
+    /// texture (lives in `shared::text_texture_cache::global_cache()`)
+    /// into the destination texture currently bound to `target` on
+    /// `canvas_id`.  Mirrors `tex_image_2d_from_canvas2d_snapshot`'s
+    /// FBO + `glCopyTexImage2D` shape — same correctness story, just
+    /// the source texture comes from the global text cache instead
+    /// of the per-frame snapshot pool.
+    ///
+    /// Always unpins `key` on return (success OR error path), so a
+    /// JS-side pin acquired at fillText time is balanced exactly
+    /// once.  A miss (cache evicted between JS lookup + render
+    /// execution despite the pin) returns `Ok(false)` to signal the
+    /// caller "we did nothing"; the caller has no way to recover
+    /// (the original fillText was suppressed) so it warns.  The pin
+    /// guarantees this should not happen in practice.
+    pub(crate) fn tex_image_2d_from_text_cache(
+        &mut self,
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        key: &shared::text_texture_cache::TextCacheKey,
+    ) -> EngineResult<bool> {
+        let (src_tex_raw, width, height) = {
+            let mut cache = shared::text_texture_cache::global_cache();
+            let lookup = cache.get(key);
+            // Always unpin once, regardless of hit/miss — the JS-side
+            // pin is balanced by this render-thread call.  Doing it
+            // BEFORE we drop the lock keeps the bookkeeping atomic
+            // with the lookup.
+            cache.unpin(key);
+            match lookup {
+                Some(entry) => (entry.texture_id, entry.width, entry.height),
+                None => return Ok(false),
+            }
+        };
+
+        let src_tex = match <glow::NativeTexture as NativeTextureFromRawShim>::try_from_raw(
+            src_tex_raw,
+        ) {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+
+        self.make_current_needed(canvas_id)?;
+        let copy_fbo = self.ensure_image_copy_fbo(canvas_id)?;
+
+        let prev_read_fbo = self
+            .gl_state
+            .get(&canvas_id)
+            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .flatten();
+
+        {
+            let entry = self.gl_state.entry(canvas_id).or_default();
+            if crate::backend::gl::state_tracker::update_bind_framebuffer(
+                entry,
+                glow::READ_FRAMEBUFFER,
+                Some(copy_fbo.0.get()),
+            ) {
+                unsafe {
+                    self.gl
+                        .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(copy_fbo));
+                }
+            }
+        }
+
+        unsafe {
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(src_tex),
+                0,
+            );
+            let status = self.gl.check_framebuffer_status(glow::READ_FRAMEBUFFER);
+            if status == glow::FRAMEBUFFER_COMPLETE {
+                self.gl.copy_tex_image_2d(
+                    target,
+                    level,
+                    internalformat as u32,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    0,
+                );
+            } else {
+                tracing::warn!(
+                    "TexImage2DFromTextCache: read FBO incomplete: 0x{:X}",
+                    status
+                );
+            }
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                None,
+                0,
+            );
+        }
+
+        {
+            let s = self.gl_state.entry(canvas_id).or_default();
+            if crate::backend::gl::state_tracker::update_bind_framebuffer(
+                s,
+                glow::READ_FRAMEBUFFER,
+                prev_read_fbo,
+            ) {
+                let prev = prev_read_fbo.and_then(
+                    <glow::NativeFramebuffer as NativeFramebufferFromRawShim>::try_from_raw,
+                );
+                unsafe {
+                    self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, prev);
+                }
+            }
+        }
+
+        self.mark_all_2d_contexts_stale_bits(
+            crate::backend::gl::surface::gr_state_bits::TEXTURE_BINDING,
+        );
+        Ok(true)
+    }
+
+    /// Reserved snapshot id for the direct `tex_image_2d_from_canvas2d`
+    /// path: the entry is captured + consumed + freed within a single
+    /// render-thread call, so the slot is never observable to anyone
+    /// else.  Sentinel chosen at the very top of the u32 range so JS-
+    /// allocated ids (which start at 1 and increment) effectively can
+    /// never reach it.
+    const DIRECT_CANVAS2D_RESERVED_ID: u32 = u32::MAX;
+
+    /// Direct GPU->GPU upload from a 2D canvas's framebuffer to the
+    /// WebGL texture currently bound to `target` on `canvas_id`.
+    /// Combines `snapshot_canvas2d_region_with_id` and
+    /// `tex_image_2d_from_canvas2d_snapshot` so the cocos
+    /// `gl.texImage2D(target, ..., HTMLCanvasElement)` pattern never
+    /// has to round-trip through `getImageData` + a sync readback --
+    /// previously ~50ms V8 stall per label, ~20 labels per cocos popup
+    /// open.
+    pub(crate) fn tex_image_2d_from_canvas2d_direct(
+        &mut self,
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        internalformat: i32,
+        canvas_2d_id: CanvasId,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> EngineResult<()> {
+        let id = Self::DIRECT_CANVAS2D_RESERVED_ID;
+
+        // Defence: free any leftover entry from a prior direct call
+        // that errored before the post-upload cleanup ran.
+        if let Some(entry) = self.canvas2d_snapshots.remove(&id) {
+            self.canvas2d_snapshot_order.retain(|&i| i != id);
+            unsafe {
+                self.gl.delete_texture(entry.tex);
+            }
+        }
+
+        // Capture into the reserved slot.  Returns 0 on failure (pool
+        // full, GLES 2, zero area, or FBO-incomplete) -- in which case
+        // we silently drop the upload, mirroring the pre-existing
+        // `texImage2D` fallback contract.
+        let captured =
+            self.snapshot_canvas2d_region_with_id(canvas_2d_id, x, y, width, height, id)?;
+        if captured == 0 {
+            return Ok(());
+        }
+
+        // Upload into the texture currently bound on `canvas_id`.
+        self.tex_image_2d_from_canvas2d_snapshot(canvas_id, target, level, internalformat, id)?;
+
+        // Free immediately.  The drain at frame end would clean it up
+        // anyway, but we'd rather not pin the slot for a whole frame.
+        if let Some(entry) = self.canvas2d_snapshots.remove(&id) {
+            self.canvas2d_snapshot_order.retain(|&i| i != id);
+            unsafe {
+                self.gl.delete_texture(entry.tex);
+            }
+        }
+        Ok(())
+    }
+
+    /// Sub-region variant of `tex_image_2d_from_canvas2d_direct`.
+    /// Mirrors `tex_sub_image_2d_from_canvas2d_snapshot` for the cocos
+    /// text-atlas pattern that streams glyph cells in via
+    /// `gl.texSubImage2D(..., HTMLCanvasElement)`.
+    pub(crate) fn tex_sub_image_2d_from_canvas2d_direct(
+        &mut self,
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        xoffset: i32,
+        yoffset: i32,
+        canvas_2d_id: CanvasId,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> EngineResult<()> {
+        let id = Self::DIRECT_CANVAS2D_RESERVED_ID;
+
+        if let Some(entry) = self.canvas2d_snapshots.remove(&id) {
+            self.canvas2d_snapshot_order.retain(|&i| i != id);
+            unsafe {
+                self.gl.delete_texture(entry.tex);
+            }
+        }
+
+        let captured =
+            self.snapshot_canvas2d_region_with_id(canvas_2d_id, x, y, width, height, id)?;
+        if captured == 0 {
+            return Ok(());
+        }
+
+        self.tex_sub_image_2d_from_canvas2d_snapshot(canvas_id, target, level, xoffset, yoffset, id)?;
+
+        if let Some(entry) = self.canvas2d_snapshots.remove(&id) {
+            self.canvas2d_snapshot_order.retain(|&i| i != id);
+            unsafe {
+                self.gl.delete_texture(entry.tex);
+            }
+        }
+        Ok(())
+    }
+
+    /// Sub-region variant of `tex_image_2d_from_canvas2d_snapshot`.
+    /// Uses `glCopyTexSubImage2D` to copy the entire snapshot texture
+    /// into the destination texture currently bound to `target` on
+    /// `canvas_id`, anchored at (`xoffset`, `yoffset`).  Required for
+    /// cocos-style text atlases that pre-allocate via `texImage2D` and
+    /// stream glyphs in via `texSubImage2D`.
+    pub(crate) fn tex_sub_image_2d_from_canvas2d_snapshot(
+        &mut self,
+        canvas_id: CanvasId,
+        target: u32,
+        level: i32,
+        xoffset: i32,
+        yoffset: i32,
+        snapshot_id: u32,
+    ) -> EngineResult<()> {
+        let entry = match self.canvas2d_snapshots.get(&snapshot_id) {
+            Some(e) => e.clone(),
+            None => {
+                tracing::warn!(
+                    "TexSubImage2DFromSnapshot: snapshot_id {} not in pool (frame drain race?)",
+                    snapshot_id
+                );
+                return Ok(());
+            }
+        };
+        self.make_current_needed(canvas_id)?;
+
+        let copy_fbo = self.ensure_image_copy_fbo(canvas_id)?;
+
+        let prev_read_fbo = self
+            .gl_state
+            .get(&canvas_id)
+            .and_then(|s| s.bound_framebuffer.get(&glow::READ_FRAMEBUFFER).copied())
+            .flatten();
+
+        {
+            let entry = self.gl_state.entry(canvas_id).or_default();
+            if crate::backend::gl::state_tracker::update_bind_framebuffer(
+                entry,
+                glow::READ_FRAMEBUFFER,
+                Some(copy_fbo.0.get()),
+            ) {
+                unsafe {
+                    self.gl
+                        .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(copy_fbo));
+                }
+            }
+        }
+
+        unsafe {
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(entry.tex),
+                0,
+            );
+            let status = self.gl.check_framebuffer_status(glow::READ_FRAMEBUFFER);
+            if status == glow::FRAMEBUFFER_COMPLETE {
+                self.gl.copy_tex_sub_image_2d(
+                    target,
+                    level,
+                    xoffset,
+                    yoffset,
+                    0,
+                    0,
+                    entry.width as i32,
+                    entry.height as i32,
+                );
+            } else {
+                tracing::warn!(
+                    "TexSubImage2DFromSnapshot: read FBO incomplete: 0x{:X}",
+                    status
+                );
+            }
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                None,
+                0,
+            );
+        }
+
+        {
+            let s = self.gl_state.entry(canvas_id).or_default();
+            if crate::backend::gl::state_tracker::update_bind_framebuffer(
+                s,
+                glow::READ_FRAMEBUFFER,
+                prev_read_fbo,
+            ) {
+                let prev = prev_read_fbo.and_then(
+                    <glow::NativeFramebuffer as NativeFramebufferFromRawShim>::try_from_raw,
+                );
+                unsafe {
+                    self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, prev);
+                }
+            }
+        }
+
+        self.mark_all_2d_contexts_stale_bits(
+            crate::backend::gl::surface::gr_state_bits::TEXTURE_BINDING,
+        );
+        Ok(())
+    }
+
+    /// Sync CPU readback of a snapshot texture, used by
+    /// `migo._force_readback(imageData)`.  Layout matches the
+    /// legacy CPU path: top-down RGBA8 rows, length `w * h * 4`.
+    /// Empty `Vec` on failure.
+    pub(crate) fn read_canvas2d_snapshot_pixels(
+        &mut self,
+        snapshot_id: u32,
+    ) -> EngineResult<Vec<u8>> {
+        let entry = match self.canvas2d_snapshots.get(&snapshot_id) {
+            Some(e) => e.clone(),
+            None => return Ok(Vec::new()),
+        };
+        // Need any current GL context to issue commands.  Hop on
+        // whichever canvas is convenient — the snapshot tex is
+        // shared across the EGL share group.
+        self.ensure_any_canvas_current()?;
+
+        let read_fbo = match self.canvas2d_snapshot_read_fbo {
+            Some(f) => f,
+            None => {
+                let f = unsafe {
+                    self.gl.create_framebuffer().map_err(|e| {
+                        shared::error::EngineError::new(ErrorCode::Internal)
+                            .with_msg("snapshot read FBO alloc failed")
+                            .with_detail(e)
+                    })?
+                };
+                self.canvas2d_snapshot_read_fbo = Some(f);
+                f
+            }
+        };
+
+        let row_bytes = entry.width as usize * 4;
+        let mut out = vec![0u8; row_bytes * entry.height as usize];
+
+        let prev_read_fbo =
+            unsafe { self.gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING) as u32 };
+        let prev_pack_alignment = unsafe { self.gl.get_parameter_i32(glow::PACK_ALIGNMENT) };
+
+        unsafe {
+            self.gl
+                .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(read_fbo));
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(entry.tex),
+                0,
+            );
+            let status = self.gl.check_framebuffer_status(glow::READ_FRAMEBUFFER);
+            if status == glow::FRAMEBUFFER_COMPLETE {
+                // Tightly packed rows (RGBA8 = 4-byte aligned anyway,
+                // but be explicit so a host-side PACK_ALIGNMENT change
+                // doesn't corrupt the readback).
+                self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+                self.gl.read_pixels(
+                    0,
+                    0,
+                    entry.width as i32,
+                    entry.height as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut out)),
+                );
+                self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, prev_pack_alignment);
+            } else {
+                tracing::warn!(
+                    "read_canvas2d_snapshot_pixels: FBO incomplete: 0x{:X}",
+                    status
+                );
+                out.clear();
+            }
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                None,
+                0,
+            );
+            let prev = <glow::NativeFramebuffer as NativeFramebufferFromRawShim>::try_from_raw(
+                prev_read_fbo,
+            );
+            self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, prev);
+        }
+        Ok(out)
+    }
+
+    /// Drain every live snapshot.  Called at frame-end so the
+    /// `getImageData` → `texImage2D` pattern within a frame stays
+    /// GPU-only without leaking textures across frames.
+    ///
+    /// Snapshots tagged with `cache_key` (the cocos text miss path)
+    /// have their texture transferred to
+    /// `shared::text_texture_cache::global_cache()` instead of being
+    /// deleted, so a subsequent identical fillText resolves through
+    /// `TexImage2DFromTextCache` without a re-render.  The cache's
+    /// own LRU may evict an older entry to make room — any returned
+    /// victim texture ids are deleted here as part of the same drain.
+    pub(crate) fn drain_canvas2d_snapshots(&mut self) {
+        if self.canvas2d_snapshots.is_empty() {
+            return;
+        }
+        // Need a current GL context for `glDeleteTextures`.
+        if self.ensure_any_canvas_current().is_err() {
+            // No live canvas → drop the entries; the textures will
+            // leak until the EGL context tears down.  This is
+            // acceptable because `destroy_all` re-runs the cleanup.
+            self.canvas2d_snapshots.clear();
+            self.canvas2d_snapshot_order.clear();
+            return;
+        }
+
+        // First pass: split into (delete now) and (hand off to text
+        // cache).  Doing the cache inserts after we've collected all
+        // entries means we touch the text cache mutex only once even
+        // when many entries are being moved.
+        let drained: Vec<(u32, Canvas2DSnapshotEntry)> =
+            self.canvas2d_snapshots.drain().collect();
+        self.canvas2d_snapshot_order.clear();
+
+        let mut to_delete: Vec<glow::NativeTexture> = Vec::new();
+        let mut to_cache: Vec<Canvas2DSnapshotEntry> = Vec::new();
+        for (_id, entry) in drained {
+            if entry.cache_key.is_some() {
+                to_cache.push(entry);
+            } else {
+                to_delete.push(entry.tex);
+            }
+        }
+
+        if !to_cache.is_empty() {
+            let mut cache = shared::text_texture_cache::global_cache();
+            for entry in to_cache {
+                let key = entry.cache_key.expect("cache_key checked above");
+                let size_bytes =
+                    (entry.width as usize).saturating_mul(entry.height as usize).saturating_mul(4);
+                let cached = shared::text_texture_cache::CachedTextEntry {
+                    texture_id: entry.tex.0.get(),
+                    width: entry.width,
+                    height: entry.height,
+                    size_bytes,
+                };
+                let evicted_ids = cache.insert(*key, cached);
+                for raw in evicted_ids {
+                    if let Some(t) =
+                        <glow::NativeTexture as NativeTextureFromRawShim>::try_from_raw(raw)
+                    {
+                        to_delete.push(t);
+                    }
+                }
+            }
+            // Publish gauges with the post-insert state.
+            let stats = cache.stats();
+            drop(cache);
+            crate::render_diagnostics::set_text_cache_gauges(
+                stats.size_bytes as u32,
+                stats.entries as u32,
+            );
+        }
+
+        unsafe {
+            for tex in to_delete {
+                self.gl.delete_texture(tex);
+            }
+        }
     }
 
     /// Zero-copy AHB upload path. See
@@ -1702,13 +3579,25 @@ impl CanvasManager {
     ) -> EngineResult<(u32, u32)> {
         self.ensure_any_canvas_current()?;
         let display_ptr = self.display.as_ptr() as *const std::ffi::c_void;
-        self.image_registry.load_ahb_image(
+        let result = self.image_registry.load_ahb_image(
             &self.gl,
             image_id,
             ahb_image,
             &self.device_caps,
             display_ptr,
-        )
+        )?;
+        // AHB → EGLImage → `glEGLImageTargetTexture2DOES` mutates
+        // the active GL_TEXTURE_2D binding on texture unit 0 out
+        // from under Skia.  Declare it stale (P0-5): without this
+        // the next Canvas2D draw on this EGL context may sample
+        // the wrong texture because Skia believes its own binding
+        // table is still valid.  See Skia's
+        // `AHardwareBufferGL.cpp::GrAHardwareBufferUtils` which
+        // does the same `resetContext(kTextureBinding)` dance.
+        self.mark_all_2d_contexts_stale_bits(
+            crate::backend::gl::surface::gr_state_bits::TEXTURE_BINDING,
+        );
+        Ok(result)
     }
 
     /// Upload a compressed texture (KTX2/ETC2/ASTC) directly to the GPU.
@@ -1724,16 +3613,24 @@ impl CanvasManager {
         use shared::error::EngineError;
         self.ensure_any_canvas_current()?;
 
-        let format = crate::compressed_upload::CompressedFormat::from_vk_format(compressed.vk_format)
-            .ok_or_else(|| {
-                EngineError::new(ErrorCode::Unsupported)
-                    .with_detail(format!("unsupported compressed format: {}", compressed.vk_format))
-            })?;
+        let format =
+            crate::compressed_upload::CompressedFormat::from_vk_format(compressed.vk_format)
+                .ok_or_else(|| {
+                    EngineError::new(ErrorCode::Unsupported).with_detail(format!(
+                        "unsupported compressed format: {}",
+                        compressed.vk_format
+                    ))
+                })?;
 
-        if !self.device_caps.compressed_format_support.is_supported(format) {
+        if !self
+            .device_caps
+            .compressed_format_support
+            .is_supported(format)
+        {
             tracing::warn!(
                 "GPU does not support {}, image_id={}",
-                format.label(), image_id,
+                format.label(),
+                image_id,
             );
             return Err(EngineError::new(ErrorCode::Unsupported)
                 .with_detail(format!("GPU does not support {}", format.label())));
@@ -1745,20 +3642,24 @@ impl CanvasManager {
             compressed.width,
             compressed.height,
             &compressed.data,
-        ).ok_or_else(|| {
-            EngineError::new(ErrorCode::Unsupported)
-                .with_detail("glCompressedTexImage2D failed")
+        )
+        .ok_or_else(|| {
+            EngineError::new(ErrorCode::Unsupported).with_detail("glCompressedTexImage2D failed")
         })?;
 
         let info = crate::backend::gl::image_store::GpuImageInfo::rgba8_unpremul(
             compressed.width,
             compressed.height,
         );
-        self.image_registry.register_shared_texture(image_id, texture, info);
+        self.image_registry
+            .register_shared_texture(image_id, texture, info);
 
         tracing::debug!(
             "compressed texture uploaded: image_id={} {}x{} {}",
-            image_id, compressed.width, compressed.height, format.label(),
+            image_id,
+            compressed.width,
+            compressed.height,
+            format.label(),
         );
 
         Ok((compressed.width, compressed.height))
@@ -1832,7 +3733,13 @@ impl CanvasManager {
         image_id: u32,
         image: shared::protocol::io_cmd::NormalizedImage,
         resp: shared::protocol::render_cmd::RenderCmdResp<(u32, u32)>,
-    ) -> Result<(), (shared::protocol::io_cmd::NormalizedImage, shared::protocol::render_cmd::RenderCmdResp<(u32, u32)>)> {
+    ) -> Result<
+        (),
+        (
+            shared::protocol::io_cmd::NormalizedImage,
+            shared::protocol::render_cmd::RenderCmdResp<(u32, u32)>,
+        ),
+    > {
         if self.deferred_uploads.len() >= MAX_DEFERRED_UPLOADS {
             return Err((image, resp));
         }
@@ -1853,8 +3760,55 @@ impl CanvasManager {
     /// monotonic within a frame, so once it rejects a small-ish
     /// upload nothing larger will fit either.  Leaves the rest of the
     /// queue intact for the next frame.
+    /// Current depth of the deferred-upload queue.  Surfaced to
+    /// `DebugStats.deferred_uploads` so the overlay shows when
+    /// asset ingestion is outpacing the per-frame upload budget.
+    pub(crate) fn deferred_uploads_len(&self) -> usize {
+        self.deferred_uploads.len()
+    }
+
+    /// Current size of the shared `SkImage` wrapper cache.
+    /// Surfaced to `DebugStats.sk_image_wrappers`.
+    pub(crate) fn image_wrapper_cache_len(&self) -> usize {
+        self.image_registry.wrapper_cache_len()
+    }
+
+    /// Try to pack a small RGBA image into the shared atlas.
+    ///
+    /// Lazy-initialises [`Self::atlas`] on the first call.  Returns
+    /// an `AtlasEntry` on success, or `None` when the image is too
+    /// large for the current atlas layout, the allocator is out of
+    /// space, or no GL context is current.  A current GL context is
+    /// required because the upload issues `glTexSubImage2D` on the
+    /// atlas page.
+    ///
+    /// The typical call site is `load_shared_image` for small
+    /// sprites (icons, HUD tiles): when this returns `Some`, the
+    /// caller should store an atlas-aware [`StoredImage`] (setting
+    /// `atlas_origin` + `atlas_page_size`) and skip the dedicated
+    /// per-image GL texture path.  Existing Skia `drawImage` code
+    /// then wraps the atlas page and offsets its source rect.
+    ///
+    /// # Safety
+    ///
+    /// Caller must have a current GL context on the calling thread.
+    /// The atlas module's `upload` is `unsafe` for the same reason;
+    /// this wrapper forwards the obligation.
+    #[allow(dead_code)]
+    pub(crate) unsafe fn atlas_upload_small(
+        &mut self,
+        width: u16,
+        height: u16,
+        rgba: &[u8],
+    ) -> Option<crate::atlas::AtlasEntry> {
+        let atlas = self
+            .atlas
+            .get_or_insert_with(crate::atlas::AtlasManager::new);
+        unsafe { atlas.upload(&self.gl, width, height, rgba) }
+    }
+
     pub(crate) fn try_drain_deferred_uploads(&mut self) {
-        while let Some(front) = self.deferred_uploads.front() {
+        while self.deferred_uploads.front().is_some() {
             // Snapshot the image data + resp via a take that puts them
             // back if submit fails — avoids cloning the RGBA Arc.
             // front.image holds an `Arc<Vec<u8>>` internally, so
@@ -1865,14 +3819,23 @@ impl CanvasManager {
             match self.submit_async_upload(pending.image_id, &pending.image, pending.resp) {
                 Ok(()) => continue,
                 Err(resp) => {
-                    // Budget still exhausted or upload thread now
-                    // degraded; push back to the head and stop.
-                    self.deferred_uploads.push_front(DeferredUpload {
-                        image_id: pending.image_id,
-                        image: pending.image,
-                        resp,
-                    });
-                    break;
+                    match self.async_upload_reject_action(pending.image.rgba.len()) {
+                        AsyncUploadRejectAction::SyncFallback => {
+                            let res = self.load_shared_image(pending.image_id, pending.image);
+                            let _ = resp.send(res);
+                            continue;
+                        }
+                        AsyncUploadRejectAction::DeferRetry => {
+                            // Budget still exhausted; keep the request at the
+                            // head of the queue and retry next frame.
+                            self.deferred_uploads.push_front(DeferredUpload {
+                                image_id: pending.image_id,
+                                image: pending.image,
+                                resp,
+                            });
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1894,6 +3857,14 @@ impl CanvasManager {
             .as_ref()
             .map(|u| !u.is_degraded())
             .unwrap_or(false)
+    }
+
+    pub(crate) fn async_upload_reject_action(&self, bytes: usize) -> AsyncUploadRejectAction {
+        decide_async_upload_reject_action(
+            self.upload_thread_healthy(),
+            self.upload_server.as_ref(),
+            bytes,
+        )
     }
 
     /// Cancel a pending async upload for the given image_id.
@@ -1935,9 +3906,83 @@ impl CanvasManager {
         }
     }
 
+    /// `glClientWaitSync` with a full 64-bit timeout.
+    ///
+    /// glow 0.17's `HasContext::client_wait_sync` signature takes an
+    /// `i32` timeout (which it internally casts to `u64`), so using
+    /// it would silently clamp any timeout above `i32::MAX` ns
+    /// (~2.147 s).  The WebGL 2 spec mandates the full
+    /// `GLuint64 timeout` range, so we resolve the raw symbol via
+    /// EGL and call it directly.  Returns one of `ALREADY_SIGNALED`,
+    /// `TIMEOUT_EXPIRED`, `CONDITION_SATISFIED`, or `WAIT_FAILED`.
+    pub(crate) fn client_wait_sync_u64(
+        &self,
+        sync: *const std::ffi::c_void,
+        flags: u32,
+        timeout_ns: u64,
+    ) -> u32 {
+        type GlClientWaitSyncFn =
+            unsafe extern "system" fn(*const std::ffi::c_void, u32, u64) -> u32;
+        static FN_PTR: std::sync::OnceLock<Option<GlClientWaitSyncFn>> = std::sync::OnceLock::new();
+        let resolved = *FN_PTR.get_or_init(|| {
+            self.egl
+                .get_proc_address("glClientWaitSync")
+                .map(|p| unsafe { std::mem::transmute::<_, GlClientWaitSyncFn>(p) })
+        });
+        match resolved {
+            Some(f) => unsafe { f(sync, flags, timeout_ns) },
+            None => glow::WAIT_FAILED,
+        }
+    }
+
     pub(crate) fn destroy_shared_image(&mut self, image_id: u32) -> EngineResult<()> {
         self.ensure_any_canvas_current()?;
         self.image_registry.destroy_shared_image(&self.gl, image_id)
+    }
+
+    /// F-1: Pin an image id so a concurrent `DestroyImage` can't
+    /// glDeleteTextures the underlying texture while a queued
+    /// `DrawImage` / `DrawImageBatch` command still references
+    /// it.  Call once per referenced id when a `FramePacket`
+    /// arrives on the render thread; pair with
+    /// [`release_in_flight_image`] exactly once per retain at
+    /// Present barrier (or on packet abort).
+    ///
+    /// Cheap: one `HashMap` entry update per id per frame.
+    #[inline]
+    pub(crate) fn retain_in_flight_image(&mut self, image_id: u32) {
+        self.image_registry.store_mut().retain_in_flight(image_id);
+    }
+
+    /// F-1: Companion to [`retain_in_flight_image`].  Returns the
+    /// `StoredImage` that the caller should `glDeleteTextures`
+    /// when the release caused the refcount to hit zero AND a
+    /// destroy had been requested while the image was in flight.
+    /// Returns `None` otherwise (more references outstanding, or
+    /// no destroy was ever requested).
+    #[inline]
+    #[must_use = "if Some(entry), glDeleteTextures(entry.gl_texture) is required"]
+    pub(crate) fn release_in_flight_image(
+        &mut self,
+        image_id: u32,
+    ) -> Option<crate::backend::gl::image_store::StoredImage> {
+        self.image_registry.store_mut().release_in_flight(image_id)
+    }
+
+    /// F-1: Flush deferred deletions.  Called at the post-frame
+    /// Present barrier: walks the `pending_delete` map for every
+    /// id whose in-flight refcount has dropped to zero and
+    /// deletes its GL texture.  Idempotent and cheap when the
+    /// map is empty (the common case).
+    pub(crate) fn drain_pending_image_deletions(&mut self) {
+        let store = self.image_registry.store_mut();
+        for entry in store.take_unreferenced_pending_delete() {
+            if let Some(tex) =
+                <glow::NativeTexture as NativeTextureFromRawShim>::try_from_raw(entry.gl_texture)
+            {
+                unsafe { self.gl.delete_texture(tex) };
+            }
+        }
     }
 
     /// Look up an image by id.  Returns the raw GL texture + dimensions +
@@ -1950,8 +3995,6 @@ impl CanvasManager {
     ) -> Option<crate::backend::gl::image_store::StoredImage> {
         self.image_registry.get_shared_texture(image_id)
     }
-
-
 
     /// Access the PBO pool for WebGL texture uploads.
     /// Returns None if no images have been loaded yet (pool not initialized).
@@ -1980,6 +4023,30 @@ impl CanvasManager {
 
 impl Drop for CanvasManager {
     fn drop(&mut self) {
+        // Tear down the upload thread first.  Its `Drop` joins the worker,
+        // which finalises the worker's `egl.make_current(None,..)` and
+        // `destroy_context` calls before our own EGL display/context
+        // disappear.  Without this the worker races with EGL teardown
+        // and emits `EGL_BAD_SURFACE` / `EGL_BAD_CONTEXT` at process exit.
+        drop(self.upload_thread.take());
+
+        if let Some(db) = self.preserved_drawing_buffer.take() {
+            if let Some(ctx) = self.preserved_ctx {
+                let _ = self.egl.make_current(
+                    self.display,
+                    Some(self.resource.surf),
+                    Some(self.resource.surf),
+                    Some(ctx),
+                );
+            }
+            drawing_buffer::destroy(&self.gl, db);
+            let _ = self.egl.make_current(
+                self.display,
+                Some(self.resource.surf),
+                Some(self.resource.surf),
+                Some(self.resource.ctx),
+            );
+        }
         if let Some(ctx) = self.preserved_ctx.take() {
             let _ = self.egl.destroy_context(self.display, ctx);
         }
@@ -1999,28 +4066,58 @@ mod tests {
     #[test]
     fn canvas2d_rect_resolves_to_partial_damage() {
         let mut acc = FrameDamageAccumulator::new();
-        acc.add(DamageEffect::OnscreenRect { x: 10, y: 20, width: 300, height: 400 });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 400,
+        });
         assert_eq!(
             acc.resolve((1080, 1920)),
-            ResolvedDamage::Partial { x: 10, y: 20, width: 300, height: 400 }
+            ResolvedDamage::Partial {
+                x: 10,
+                y: 20,
+                width: 300,
+                height: 400
+            }
         );
     }
 
     #[test]
     fn canvas2d_plus_gl_viewport_unions_to_partial() {
         let mut acc = FrameDamageAccumulator::new();
-        acc.add(DamageEffect::OnscreenRect { x: 10, y: 20, width: 100, height: 50 });
-        acc.add(DamageEffect::OnscreenRect { x: 200, y: 300, width: 150, height: 100 });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 50,
+        });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 200,
+            y: 300,
+            width: 150,
+            height: 100,
+        });
         assert_eq!(
             acc.resolve((1080, 1920)),
-            ResolvedDamage::Partial { x: 10, y: 20, width: 340, height: 380 }
+            ResolvedDamage::Partial {
+                x: 10,
+                y: 20,
+                width: 340,
+                height: 380
+            }
         );
     }
 
     #[test]
     fn untracked_gl_clear_forces_full_surface() {
         let mut acc = FrameDamageAccumulator::new();
-        acc.add(DamageEffect::OnscreenRect { x: 10, y: 20, width: 100, height: 50 });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 50,
+        });
         acc.add(DamageEffect::FullSurface);
         assert_eq!(acc.resolve((1080, 1920)), ResolvedDamage::FullSurface);
     }
@@ -2028,19 +4125,39 @@ mod tests {
     #[test]
     fn offscreen_gl_produces_no_damage() {
         let mut acc = FrameDamageAccumulator::new();
-        acc.add(DamageEffect::OnscreenRect { x: 10, y: 20, width: 100, height: 50 });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 50,
+        });
         acc.add(DamageEffect::NoDamage); // offscreen GL
         assert_eq!(
             acc.resolve((1080, 1920)),
-            ResolvedDamage::Partial { x: 10, y: 20, width: 100, height: 50 }
+            ResolvedDamage::Partial {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 50
+            }
         );
     }
 
     #[test]
     fn full_surface_after_partial_rects_poisons_accumulator() {
         let mut acc = FrameDamageAccumulator::new();
-        acc.add(DamageEffect::OnscreenRect { x: 10, y: 20, width: 100, height: 50 });
-        acc.add(DamageEffect::OnscreenRect { x: 200, y: 300, width: 150, height: 100 });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 50,
+        });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 200,
+            y: 300,
+            width: 150,
+            height: 100,
+        });
         acc.add(DamageEffect::FullSurface);
         assert_eq!(acc.resolve((1080, 1920)), ResolvedDamage::FullSurface);
     }
@@ -2048,13 +4165,38 @@ mod tests {
     #[test]
     fn multiple_mixed_batches_union_correctly() {
         let mut acc = FrameDamageAccumulator::new();
-        acc.add(DamageEffect::OnscreenRect { x: 0, y: 0, width: 50, height: 50 });
-        acc.add(DamageEffect::OnscreenRect { x: 100, y: 100, width: 60, height: 40 });
-        acc.add(DamageEffect::OnscreenRect { x: 30, y: 20, width: 80, height: 60 });
-        acc.add(DamageEffect::OnscreenRect { x: 200, y: 0, width: 50, height: 200 });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 100,
+            y: 100,
+            width: 60,
+            height: 40,
+        });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 30,
+            y: 20,
+            width: 80,
+            height: 60,
+        });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 200,
+            y: 0,
+            width: 50,
+            height: 200,
+        });
         assert_eq!(
             acc.resolve((1080, 1920)),
-            ResolvedDamage::Partial { x: 0, y: 0, width: 250, height: 200 }
+            ResolvedDamage::Partial {
+                x: 0,
+                y: 0,
+                width: 250,
+                height: 200
+            }
         );
     }
 
@@ -2062,12 +4204,27 @@ mod tests {
     fn scissor_bounded_clear_unions_with_canvas2d() {
         let mut acc = FrameDamageAccumulator::new();
         // Canvas2D rect
-        acc.add(DamageEffect::OnscreenRect { x: 0, y: 0, width: 100, height: 100 });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        });
         // Scissor-bounded clear (produced by damage_for_clear when scissor is active)
-        acc.add(DamageEffect::OnscreenRect { x: 200, y: 200, width: 50, height: 50 });
+        acc.add(DamageEffect::OnscreenRect {
+            x: 200,
+            y: 200,
+            width: 50,
+            height: 50,
+        });
         assert_eq!(
             acc.resolve((1080, 1920)),
-            ResolvedDamage::Partial { x: 0, y: 0, width: 250, height: 250 }
+            ResolvedDamage::Partial {
+                x: 0,
+                y: 0,
+                width: 250,
+                height: 250
+            }
         );
     }
 
@@ -2093,7 +4250,12 @@ mod tests {
 
         // Set scissor rect + enable
         state.last_scissor_rect = Some((10, 20, 100, 50));
-        state.scissor = ScissorState::Enabled { x: 10, y: 20, width: 100, height: 50 };
+        state.scissor = ScissorState::Enabled {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 50,
+        };
         assert!(matches!(state.scissor, ScissorState::Enabled { .. }));
 
         // Disable scissor
@@ -2101,6 +4263,53 @@ mod tests {
         assert_eq!(state.scissor, ScissorState::Disabled);
         // last_scissor_rect retained
         assert_eq!(state.last_scissor_rect, Some((10, 20, 100, 50)));
+    }
+
+    #[test]
+    fn handler_rejection_sync_fallbacks_when_image_can_never_fit() {
+        let mut server = crate::upload_server::UploadServer::new(4, 4 * 1024 * 1024);
+        server.set_frame_budget(2, 512 * 1024);
+
+        assert_eq!(
+            decide_async_upload_reject_action(true, Some(&server), 600 * 1024),
+            AsyncUploadRejectAction::SyncFallback
+        );
+    }
+
+    #[test]
+    fn deferred_retry_rejection_stays_deferred_when_budget_pressure_is_temporary() {
+        let mut server = crate::upload_server::UploadServer::new(4, 4 * 1024 * 1024);
+        server.set_frame_budget(2, 512 * 1024);
+
+        assert_eq!(
+            decide_async_upload_reject_action(true, Some(&server), 256 * 1024),
+            AsyncUploadRejectAction::DeferRetry
+        );
+    }
+
+    #[test]
+    fn handler_rejection_sync_fallbacks_when_upload_thread_is_degraded() {
+        let mut server = crate::upload_server::UploadServer::new(4, 4 * 1024 * 1024);
+        server.set_frame_budget(2, 512 * 1024);
+
+        assert_eq!(
+            decide_async_upload_reject_action(false, Some(&server), 256 * 1024),
+            AsyncUploadRejectAction::SyncFallback
+        );
+    }
+
+    #[test]
+    fn handler_rejection_sync_fallbacks_without_upload_server() {
+        assert_eq!(
+            decide_async_upload_reject_action(true, None, 256 * 1024),
+            AsyncUploadRejectAction::SyncFallback
+        );
+    }
+
+    #[test]
+    fn default_fbo_readback_latch_only_on_first_signal() {
+        assert!(should_latch_default_fbo_readback(false));
+        assert!(!should_latch_default_fbo_readback(true));
     }
 
     // ---- DeferredUpload queue semantics (P13) ------------------------

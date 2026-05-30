@@ -17,7 +17,15 @@ param(
 # ------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------
-$ANDROID_API = 21
+# Android minimum supported API level.
+#
+# Raised from 21 to 26 in lock-step with build-android-so.sh because
+# skia-bindings 0.93 hard-codes API 26 in
+# `build_support/platform/android.rs` (the first Oreo API; needed for
+# full Vulkan and a number of modern NDK headers Skia depends on).
+# Linking Skia against an older runtime would be ABI-unsafe, so we
+# promote minSdk for the whole engine.
+$ANDROID_API = 26
 
 $CRATE_NAME = "platform"
 $CRATE_DIR  = "crates/$CRATE_NAME"
@@ -161,6 +169,12 @@ function Build-Platform {
     # --------------------------------------------------------
     $origRUSTFLAGS = $env:RUSTFLAGS
 
+    # `-Wl,--allow-multiple-definition` is needed because skia-bindings
+    # emits `-lc++_static` which redefines symbols already provided by
+    # the NDK's libc++.so.  Without this the final link fails with
+    # "multiple definition of std::…" on some symbols.
+    $commonRustflags = "-Clink-arg=-Wl,--allow-multiple-definition"
+
     if ($platform -eq "arm64-v8a") {
         $builtins = Find-Arm64Builtins
         if (-not $builtins) {
@@ -169,10 +183,34 @@ function Build-Platform {
         }
 
         $builtinsDir = Split-Path $builtins -Parent
-        $env:RUSTFLAGS = "$origRUSTFLAGS -L $builtinsDir -l static=clang_rt.builtins-aarch64-android"
+        # --exclude-libs,ALL prevents re-exporting symbols from static
+        # libs (V8, ring, Skia), shaving ~430 KB off .dynsym/.rela.dyn.
+        # Not usable on x86_64 due to relocation model differences.
+        $env:RUSTFLAGS = "$origRUSTFLAGS $commonRustflags -L $builtinsDir -l static=clang_rt.builtins-aarch64-android -Clink-arg=-Wl,--exclude-libs,ALL"
 
-        Print-Info "Using arm64 clang builtins"
+        Print-Info "Using arm64 clang builtins + --exclude-libs,ALL + --allow-multiple-definition"
+    } else {
+        $env:RUSTFLAGS = "$origRUSTFLAGS $commonRustflags"
     }
+
+    # --------------------------------------------------------
+    # SQLite bundled compile flags — trim features we never use.
+    # libsqlite3-sys' build.rs reads $env:LIBSQLITE3_FLAGS and passes
+    # them verbatim to the amalgamation compile. Flags here are a
+    # pure *subtraction* on top of the default ENABLE_* matrix; any
+    # attempt to OMIT a feature that sqlite3-sys defaults to
+    # ENABLE_ would fail at cc_compile.  Keep this list in lock-step
+    # with build-android-so.sh to avoid target-specific binary drift.
+    $env:LIBSQLITE3_FLAGS = (@(
+        "-DSQLITE_OMIT_LOAD_EXTENSION",
+        "-DSQLITE_OMIT_DEPRECATED",
+        "-DSQLITE_OMIT_AUTHORIZATION",
+        "-DSQLITE_OMIT_SHARED_CACHE",
+        "-DSQLITE_DQS=0",
+        "-DSQLITE_DEFAULT_MEMSTATUS=0",
+        "-DSQLITE_LIKE_DOESNT_MATCH_BLOBS",
+        "-DSQLITE_MAX_EXPR_DEPTH=0"
+    ) -join " ")
 
     # --------------------------------------------------------
     # Build
