@@ -7,9 +7,18 @@
   "exports": {
     ".": "./src/index.js"
   },
-  "files": ["src", "README.md"],
+  "files": [
+    "src",
+    "dist",
+    "README.md"
+  ],
   "scripts": {
-    "test": "node tests/adapter.test.mjs"
+    "build": "node scripts/build-bundle.mjs",
+    "test": "node tests/adapter.test.mjs && node tests/bundle.test.mjs",
+    "prepack": "npm run build"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  }
 }

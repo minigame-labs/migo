@@ -798,6 +798,36 @@ impl Host {
         self.last_game_id = Some(game_id.clone());
         self.last_entry = Some(entry.clone());
 
+        // Run boot prelude scripts (e.g. BOM/DOM adapter for browser-style
+        // games) before the main module loads. Prelude failures abort the
+        // launch with the same error path as the main module — a partially
+        // adapted globalThis is worse than no game at all.
+        let prelude_count = self.init_options.prelude_scripts().len();
+        if prelude_count > 0 {
+            let t_prelude = Instant::now();
+            // Clone out of init_options to release the borrow on `self`
+            // before the &mut self.js call below.
+            let scripts: Vec<(String, String)> =
+                self.init_options.prelude_scripts().to_vec();
+            for (name, source) in &scripts {
+                self.js
+                    .exec_script_owned(name.clone(), source)
+                    .map_err(|e| {
+                        error!(
+                            "[Host {}] prelude script '{}' failed: {}",
+                            self.id, name, e
+                        );
+                        e
+                    })?;
+            }
+            info!(
+                "[Host {}] {} prelude script(s) executed: {:.1}ms",
+                self.id,
+                prelude_count,
+                t_prelude.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+
         self.js
             .evaluate_module(game_id.clone(), entry.clone())
             .await?;

@@ -581,6 +581,23 @@ impl HostJsRuntime {
         Ok(())
     }
 
+    /// Variant of [`Self::exec_script`] that accepts an owned `name`.
+    ///
+    /// Use this when the script name is built at runtime (e.g. boot prelude
+    /// scripts whose names come from `InitOptions`). For static call sites
+    /// prefer [`Self::exec_script`] to avoid the allocation.
+    pub fn exec_script_owned(&mut self, name: String, source: &str) -> EngineResult<()> {
+        let source = deno_core::FastString::from(source.to_string());
+        let name_for_err = name.clone();
+        self.rt.execute_script(name, source).map_err(|e| {
+            EngineError::new(ErrorCode::JsException)
+                .with_msg(name_for_err)
+                .with_detail(e.to_string())
+        })?;
+
+        Ok(())
+    }
+
     /// Evaluate a module with VFS sandboxing.
     ///
     /// Creates game-specific paths from the game_id and base directories,

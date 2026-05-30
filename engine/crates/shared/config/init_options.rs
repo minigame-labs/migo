@@ -126,6 +126,19 @@ pub struct InitOptions {
     /// Workers directory path relative to code directory.
     /// Provided by the host app via RuntimeConfig.
     workers_path: Option<String>,
+    /// Boot prelude scripts: `(name, source)` pairs evaluated **before**
+    /// every `EvaluateModule` call.
+    ///
+    /// Useful for injecting a host-side BOM/DOM adapter (e.g. the
+    /// `@minigame-labs/migo-adapter` IIFE bundle) so browser-style games
+    /// can run unmodified, without touching the `migo.*` API surface.
+    /// `name` is the script name shown in V8 stack traces; `source` is
+    /// plain JavaScript (NOT an ES module).
+    ///
+    /// Scripts run in declaration order, in the global scope, before the
+    /// game's main module is loaded. They are re-applied on every
+    /// `Restart`-driven re-evaluation.
+    prelude_scripts: Vec<(String, String)>,
     /// Platform-specific or experimental options.
     extras: Extras,
 }
@@ -148,6 +161,7 @@ impl Default for InitOptions {
             code_signing_pubkey: None,
             sub_packages: Vec::new(),
             workers_path: None,
+            prelude_scripts: Vec::new(),
             extras: Extras::new(),
         }
     }
@@ -270,6 +284,16 @@ impl InitOptions {
     #[inline]
     pub fn workers_path(&self) -> Option<&str> {
         self.workers_path.as_deref()
+    }
+
+    /// Returns the configured boot prelude scripts as `(name, source)` pairs.
+    ///
+    /// Each script runs in the global scope before `EvaluateModule` loads
+    /// the game's main module. See [`Self::with_prelude_script`] for the
+    /// intended use case (BOM/DOM adapter injection).
+    #[inline]
+    pub fn prelude_scripts(&self) -> &[(String, String)] {
+        &self.prelude_scripts
     }
 
     /// Returns a reference to the extras map.
@@ -453,6 +477,32 @@ impl InitOptions {
     #[must_use]
     pub fn with_workers_path(mut self, path: Option<String>) -> Self {
         self.workers_path = path;
+        self
+    }
+
+    /// Appends a boot prelude script (builder pattern).
+    ///
+    /// The script runs as a plain (non-module) `<script>`-style snippet in
+    /// the global scope before every `EvaluateModule`. Use this to inject
+    /// a BOM/DOM adapter on top of the `migo.*` runtime so browser-style
+    /// games (Cocos / Egret / Laya / Pixi / raw WebGL) load unchanged.
+    ///
+    /// `name` shows up in V8 stack traces. Multiple calls accumulate; the
+    /// scripts execute in the order they were added.
+    #[must_use]
+    pub fn with_prelude_script(
+        mut self,
+        name: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        self.prelude_scripts.push((name.into(), source.into()));
+        self
+    }
+
+    /// Replaces all boot prelude scripts (builder pattern).
+    #[must_use]
+    pub fn with_prelude_scripts(mut self, scripts: Vec<(String, String)>) -> Self {
+        self.prelude_scripts = scripts;
         self
     }
 
