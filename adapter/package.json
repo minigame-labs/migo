@@ -1,0 +1,15 @@
+{
+  "name": "@minigame-labs/migo-adapter",
+  "version": "0.1.0",
+  "description": "Browser-style BOM/DOM adapter layered on top of the migo mini-game runtime. Layered on top of `migo.*` APIs.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": ["src", "README.md"],
+  "scripts": {
+    "test": "node tests/adapter.test.mjs"
+  },
+  "license": "MIT"
+}
