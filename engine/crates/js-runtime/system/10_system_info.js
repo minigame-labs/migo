@@ -11,6 +11,13 @@ function getSystemInfoSync() {
         brand: '',
         model: 'unknown',
         pixelRatio: 1,
+        // Alias of pixelRatio. WeChat's getSystemInfoSync returns BOTH
+        // `pixelRatio` and `devicePixelRatio`; browser-style engines
+        // (Cocos/Laya/...) read `devicePixelRatio` to size the canvas
+        // backing store (`canvas.width = screenWidth * devicePixelRatio`).
+        // Omitting it makes those engines fall back to dpr=1, rendering
+        // the whole scene into 1/dpr of the surface (horizontal squish).
+        devicePixelRatio: 1,
         screenWidth: 0,
         screenHeight: 0,
         windowWidth: 0,
@@ -57,6 +64,7 @@ function getSystemInfoSync() {
         var winJson = op_get_window_info();
         var win = JSON.parse(winJson);
         result.pixelRatio = win.pixel_ratio || 1;
+        result.devicePixelRatio = result.pixelRatio;
         result.screenWidth = win.screen_width || 0;
         result.screenHeight = win.screen_height || 0;
         result.windowWidth = win.window_width || 0;
