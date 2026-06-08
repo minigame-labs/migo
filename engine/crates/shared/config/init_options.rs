@@ -518,3 +518,73 @@ impl InitOptions {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prelude_scripts_default_empty() {
+        let opt = InitOptions::new();
+        assert!(opt.prelude_scripts().is_empty());
+    }
+
+    #[test]
+    fn with_prelude_script_appends_in_order() {
+        let opt = InitOptions::new()
+            .with_prelude_script("<a>", "globalThis.a = 1;")
+            .with_prelude_script("<b>", "globalThis.b = 2;");
+        let scripts = opt.prelude_scripts();
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(scripts[0].0, "<a>");
+        assert_eq!(scripts[0].1, "globalThis.a = 1;");
+        assert_eq!(scripts[1].0, "<b>");
+        assert_eq!(scripts[1].1, "globalThis.b = 2;");
+    }
+
+    #[test]
+    fn with_prelude_scripts_replaces_all() {
+        let opt = InitOptions::new()
+            .with_prelude_script("<old>", "noop")
+            .with_prelude_scripts(vec![
+                ("<x>".to_string(), "x".to_string()),
+                ("<y>".to_string(), "y".to_string()),
+            ]);
+        let scripts = opt.prelude_scripts();
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(scripts[0].0, "<x>");
+        assert_eq!(scripts[1].0, "<y>");
+    }
+
+    /// Round-trip the JSON shape the Android JNI bridge produces (see
+    /// `RuntimeConfig.buildPreludeScriptsJson`) — ensure the Rust side
+    /// can deserialize it back into `(name, source)` pairs and that
+    /// embedded control characters in `source` survive intact.
+    ///
+    /// Mirrors the parse_prelude_scripts implementation in
+    /// `crates/platform/android/jni/inbound.rs`. Kept here so the
+    /// contract is independently checkable on a host that can't build
+    /// the Android NDK toolchain.
+    #[test]
+    fn prelude_scripts_json_roundtrip() {
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            name: String,
+            source: String,
+        }
+        // What the Java side serializes for two entries, including a
+        // newline + quote in the source to exercise escaping.
+        let json = r#"[{"name":"<a>","source":"line1\nline2"},{"name":"<b>","source":"alert(\"hi\")"}]"#;
+        let parsed: Vec<Entry> = deno_core::serde_json::from_str(json).unwrap();
+        let pairs: Vec<(String, String)> =
+            parsed.into_iter().map(|e| (e.name, e.source)).collect();
+
+        let opt = InitOptions::new().with_prelude_scripts(pairs);
+        let s = opt.prelude_scripts();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].0, "<a>");
+        assert_eq!(s[0].1, "line1\nline2");
+        assert_eq!(s[1].0, "<b>");
+        assert_eq!(s[1].1, "alert(\"hi\")");
+    }
+}

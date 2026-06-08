@@ -52,6 +52,18 @@ let init = InitOptions::new()
 // then EvaluateModule the game's entry as usual
 ```
 
+On Android, configure it via `RuntimeConfig.Builder`:
+
+```java
+String bundle = readAssetAsString(context, "migo-adapter.bundle.js");
+RuntimeConfig config = new RuntimeConfig.Builder(context)
+        .addPreludeScript("<migo-adapter>", bundle)
+        .build();
+```
+
+Drop `migo-adapter.bundle.js` into your app's `assets/` folder so the
+host app can read it once at launch and pass the source to the builder.
+
 The prelude runs in the global scope before every `EvaluateModule`, so the
 game sees `window.innerWidth`, `document.createElement`, `Image`,
 `XMLHttpRequest`, etc. already wired up. Multiple `with_prelude_script`

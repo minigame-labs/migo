@@ -83,6 +83,13 @@ public final class RuntimeConfig {
     // Internal: serialized subPackages for JNI field access
     private final String subPackagesJson;
 
+    // Boot prelude scripts: pairs of {name, source} executed before every
+    // EvaluateModule. Used to inject a BOM/DOM adapter so browser-style
+    // games can run unchanged. See Builder#addPreludeScript.
+    private final List<String[]> preludeScripts;
+    // Internal: serialized preludeScripts for JNI field access
+    private final String preludeScriptsJson;
+
     private RuntimeConfig(Builder builder) {
         this.cacheDir = builder.cacheDir;
         this.filesDir = builder.filesDir;
@@ -100,6 +107,8 @@ public final class RuntimeConfig {
         this.subPackages = Collections.unmodifiableList(new ArrayList<>(builder.subPackages));
         this.workersPath = builder.workersPath;
         this.subPackagesJson = buildSubPackagesJson(this.subPackages);
+        this.preludeScripts = Collections.unmodifiableList(new ArrayList<>(builder.preludeScripts));
+        this.preludeScriptsJson = buildPreludeScriptsJson(this.preludeScripts);
     }
 
     // ==================== Getters ====================
@@ -158,6 +167,15 @@ public final class RuntimeConfig {
     /** Get the workers directory path (nullable). */
     public String getWorkersPath() { return workersPath; }
 
+    /**
+     * Get the configured boot prelude scripts.
+     * Each entry is a {@code String[2]} of {@code {name, source}} run in
+     * declaration order before every {@code EvaluateModule}.
+     *
+     * @return Unmodifiable list of prelude scripts (may be empty)
+     */
+    public List<String[]> getPreludeScripts() { return preludeScripts; }
+
     // ==================== JNI field access ====================
 
     /** @hide */
@@ -197,8 +215,49 @@ public final class RuntimeConfig {
         return sb.toString();
     }
 
+    /**
+     * Serialize prelude scripts to JSON for JNI transfer.
+     * Returns null if the list is empty. Each entry is a
+     * {@code {"name":"...","source":"..."}} object with the same key
+     * shape the Rust side parses on `preludeScriptsJson`.
+     */
+    private static String buildPreludeScriptsJson(List<String[]> list) {
+        if (list == null || list.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < list.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append("{\"name\":\"");
+            sb.append(escapeJsonString(list.get(i)[0]));
+            sb.append("\",\"source\":\"");
+            sb.append(escapeJsonString(list.get(i)[1]));
+            sb.append("\"}");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
     private static String escapeJsonString(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+        // Cover the JSON control set; prelude sources can contain anything.
+        StringBuilder out = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\': out.append("\\\\"); break;
+                case '"':  out.append("\\\""); break;
+                case '\n': out.append("\\n"); break;
+                case '\r': out.append("\\r"); break;
+                case '\t': out.append("\\t"); break;
+                case '\b': out.append("\\b"); break;
+                case '\f': out.append("\\f"); break;
+                default:
+                    if (c < 0x20) {
+                        out.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        out.append(c);
+                    }
+            }
+        }
+        return out.toString();
     }
 
     // ==================== Builder ====================
@@ -233,6 +292,7 @@ public final class RuntimeConfig {
         // Game config
         private final List<String[]> subPackages = new ArrayList<>();
         private String workersPath = null;
+        private final List<String[]> preludeScripts = new ArrayList<>();
 
         /**
          * Create a new builder with required context.
@@ -437,6 +497,35 @@ public final class RuntimeConfig {
          */
         public Builder setWorkersPath(String path) {
             this.workersPath = path;
+            return this;
+        }
+
+        /**
+         * Add a boot prelude script.
+         * <p>
+         * The script runs as a plain (non-module) snippet in the global
+         * scope before every {@code EvaluateModule}. Use this to inject
+         * a BOM/DOM adapter (e.g. the {@code migo-adapter} IIFE bundle)
+         * so browser-style games (Cocos / Egret / Laya / Pixi / raw WebGL)
+         * load unchanged on top of the {@code migo.*} runtime.
+         * <p>
+         * Multiple calls accumulate; scripts execute in declaration order,
+         * and each call is independent of the others. {@code name} appears
+         * in V8 stack traces.
+         *
+         * @param name   Script name shown in stack traces (e.g. {@code "<migo-adapter>"})
+         * @param source JavaScript source — NOT an ES module
+         * @return this builder
+         * @throws IllegalArgumentException if {@code name} or {@code source} is null/empty
+         */
+        public Builder addPreludeScript(String name, String source) {
+            if (name == null || name.trim().isEmpty()) {
+                throw new IllegalArgumentException("prelude script name cannot be null or empty");
+            }
+            if (source == null || source.isEmpty()) {
+                throw new IllegalArgumentException("prelude script source cannot be null or empty");
+            }
+            this.preludeScripts.add(new String[]{name.trim(), source});
             return this;
         }
 

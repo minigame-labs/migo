@@ -25,6 +25,34 @@ fn parse_sub_packages(json: Option<String>) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Parse the internal preludeScriptsJson field into a Vec of (name, source)
+/// pairs. The Java side encodes prelude entries as
+/// `[{"name":"...","source":"..."}, ...]`; we deserialize back into the
+/// owned-string pairs `InitOptions::with_prelude_scripts` expects.
+///
+/// Returns an empty vec on null/empty/malformed input — a malformed prelude
+/// list shouldn't kill init; the launch will simply proceed without
+/// adapter injection (and the misconfigured client should notice that
+/// browser-style globals are missing and read this code path's logs).
+fn parse_prelude_scripts(json: Option<String>) -> Vec<(String, String)> {
+    let json = match json {
+        Some(s) if !s.is_empty() => s,
+        _ => return Vec::new(),
+    };
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        name: String,
+        source: String,
+    }
+    match deno_core::serde_json::from_str::<Vec<Entry>>(&json) {
+        Ok(v) => v.into_iter().map(|e| (e.name, e.source)).collect(),
+        Err(e) => {
+            tracing::warn!("invalid preludeScriptsJson, ignoring: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 /// Convert a JNI string to `Cow<'static, str>`.
 /// Returns a borrowed `&'static str` for known constant values,
 /// avoiding heap allocation in the common case.
@@ -307,6 +335,14 @@ pub(crate) extern "system" fn init(
         ));
         let workers_path = super::get_optional_string_field(&mut env, "workersPath", &options);
 
+        // Boot prelude scripts (BOM/DOM adapter injection, etc.).
+        // Optional — empty list when the host app doesn't configure any.
+        let prelude_scripts = parse_prelude_scripts(super::get_optional_string_field(
+            &mut env,
+            "preludeScriptsJson",
+            &options,
+        ));
+
         let log_level = shared::config::LogLevel::from(log_level_ordinal);
 
         let init_options = InitOptions::new()
@@ -322,7 +358,8 @@ pub(crate) extern "system" fn init(
             .with_code_signing_enabled(code_signing_enabled)
             .with_code_signing_pubkey(code_signing_pubkey)
             .with_sub_packages(sub_packages)
-            .with_workers_path(workers_path);
+            .with_workers_path(workers_path)
+            .with_prelude_scripts(prelude_scripts);
 
         // Apply RuntimeConfig log level to the tracing subscriber.
         logging::update_log_level(log_level);
