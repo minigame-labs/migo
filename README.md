@@ -1,15 +1,33 @@
-# Migo 小游戏运行时引擎
+# Migo — 为游戏而生的开源原生运行时
 
 [中文](README.md) | [English](README_EN.md)
 
-面向移动应用的跨平台高性能小游戏运行时引擎。
+**嵌入式 HTML5 / 小游戏的 WebView 替代方案。**
 
-Migo 让 App 厂商可以在自己的应用中运行小游戏：提供**兼容主流小游戏平台风格的 API 环境**，同时具备接近原生的性能表现。
+Migo 是一个开源、高性能、可嵌入的 HTML5 / Canvas2D / WebGL 原生游戏运行时。App 厂商把它嵌入自己的应用，就能跑 HTML5 与小游戏内容——**无需 WebView**：没有浏览器、DOM、CSS、layout 与合成层的开销，启动更快、内存更低，运行时版本由你打包钉死，不随 OEM 与系统版本漂移。
+
+兼容两个适配 profile，现有游戏**零改动或少量改动**直接运行：
+
+- **跨引擎 HTML5 / Canvas2D / WebGL** —— 零改动跑 Cocos / Egret / Pixi / 原生 Canvas 游戏（`adapter` + `prelude` 提供浏览器风格 BOM/DOM）。
+- **主流小游戏 API 风格** —— 兼容主流小游戏平台风格的 API 环境（`wx` 命名空间适配层）。
+
+## 为什么选 Migo（对比 WebView）
+
+| 维度 | Migo | Android System WebView |
+|---|---|---|
+| 版本一致性 | 运行时由你打包、版本钉死，跨 OEM/系统可控 | 随用户系统与 OEM 自升级、自漂移，你无法控制 |
+| 可审计性 | 开源、沙箱边界可逐行审计（fintech/政务/出海合规） | 闭源，无法审计 |
+| 启动 / 内存 | 无 DOM/layout、V8 snapshot 预热，体积小、启动快、内存低 | 带整个 Chromium，常驻开销大 |
+| 跨引擎兼容 | 同一 API 跑多引擎，不绑定单一引擎 | — |
+
+> **诚实边界：** Migo 与 WebView 底层同为 V8，**不宣称"跑 JS 更快"**；优势在无浏览器层的轻量、跨 OEM **版本确定性** 与开源可审计。渲染受 GPU/驱动差异影响，卖点是"碎片化由你掌控"，**而非"渲染处处一致"**。iOS 因 jitless 限制走 WKWebView 后端、不主打性能；**Android 是性能与差异化的主战场**。
 
 ## 特性
 
-- **主流小游戏 API 风格** - 现有小游戏可零改动或少量改动直接运行
-- **高性能** - Rust 核心引擎，优化的渲染管线
+- **WebView 替代** - 嵌入式 HTML5 / 小游戏的原生运行时，无浏览器层开销
+- **跨引擎零改动** - Cocos / Egret / Pixi / 原生 Canvas 游戏直接运行
+- **开源可审计** - 沙箱边界可逐行审计，合规友好（[BSL 1.1](LICENSE)，2029-01-01 转 Apache 2.0）
+- **高性能** - Rust 核心引擎，优化的渲染管线，启动快、内存低
 - **Canvas 2D & WebGL** - 完整支持 2D 画布与 WebGL 渲染
 - **音频支持** - WebAudio 风格 API（含流式播放能力）
 - **跨平台** - 支持 Android（iOS、Windows 计划中）
@@ -160,10 +178,15 @@ migo/
 ├── platforms/
 │   └── android/            # Android SDK
 ├── scripts/                # 构建脚本
-├── LICENSE                 # 许可证
+├── LICENSE                 # 许可证（BSL 1.1）
+├── LEGAL.md                # 法律声明（许可/商标/测试内容）
 ├── NOTICE                  # 第三方声明
 └── README.md
 ```
+
+## 许可证
+
+Migo 采用 **source-available** 的 [Business Source License 1.1](LICENSE)（BSL 1.1），**2029-01-01 自动转为 Apache 2.0**。许可、商标与测试内容的完整说明见 [LEGAL.md](LEGAL.md)。
 
 ## 贡献
 

@@ -1,19 +1,37 @@
-# Migo — Mini-game Runtime Engine
+# Migo — The Open Native Runtime for HTML5 & Mini-games
 
 [中文](README.md) | [English](README_EN.md)
 
-High-performance, cross-platform mini-game runtime engine for mobile apps.
+**A WebView replacement built for games — embeddable HTML5 / mini-game content without a browser.**
 
-Migo enables app developers to run mini-games inside their own apps, providing a mainstream mini-game platform–style API environment with near-native performance.
+Migo is an open, high-performance, embeddable native runtime for HTML5 / Canvas2D / WebGL games. Embed it in your app to run HTML5 and mini-game content **without a WebView**: no browser, DOM, CSS, layout, or compositor overhead — faster startup, lower memory, and a runtime version you pin yourself instead of one that drifts across OEMs and OS updates.
+
+Two adapter profiles let existing games run with **zero or minimal changes**:
+
+- **Cross-engine HTML5 / Canvas2D / WebGL** — run Cocos / Egret / Pixi / vanilla Canvas games unmodified (`adapter` + `prelude` provide a browser-style BOM/DOM).
+- **Mainstream mini-game API style** — a mini-game platform–style API environment (`wx` namespace adapter layer).
+
+## Why Migo (vs. WebView)
+
+| Dimension | Migo | Android System WebView |
+|---|---|---|
+| Version consistency | Runtime packaged and version-pinned by you; controllable across OEMs/OS versions | Auto-updates and drifts with the user's system and OEM, outside your control |
+| Auditability | Open source; sandbox boundary auditable line by line (fintech/gov/overseas compliance) | Closed source, not auditable |
+| Startup / memory | No DOM/layout, V8 snapshot warm-up — small footprint, fast startup, low memory | Ships the whole Chromium, heavy resident cost |
+| Cross-engine | One API across multiple engines, not locked to a single engine | — |
+
+> **Honest boundaries:** Migo and WebView both run on V8 underneath, so we **do not claim "faster JS"**; the edge is the lightweight no-browser layer, cross-OEM **version determinism**, and open auditability. Rendering is still subject to GPU/driver differences — the pitch is "fragmentation under your control," **not "pixel-identical everywhere."** On iOS, jitless restrictions mean a WKWebView backend and we don't lead with performance there; **Android is the battleground for performance and differentiation.**
 
 ## Features
 
-- **Mainstream mini-game API style** — Run existing mini-games with zero or minimal changes
-- **High performance** — Rust core engine with an optimized rendering pipeline
-- **Canvas 2D & WebGL** — Full support for 2D canvas and WebGL rendering
+- **WebView replacement** — native runtime for embedded HTML5 / mini-games, no browser-layer overhead
+- **Zero-change cross-engine** — Cocos / Egret / Pixi / vanilla Canvas games run unmodified
+- **Open & auditable** — sandbox boundary auditable line by line, compliance-friendly ([BSL 1.1](LICENSE), converts to Apache 2.0 on 2029-01-01)
+- **High performance** — Rust core engine with an optimized rendering pipeline; fast startup, low memory
+- **Canvas 2D & WebGL** — full support for 2D canvas and WebGL rendering
 - **Audio support** — WebAudio-style APIs (including streaming playback)
-- **Cross-platform** — Android (iOS and Windows planned) 
-- **Lightweight** — Small footprint and fast startup
+- **Cross-platform** — Android (iOS and Windows planned)
+- **Lightweight** — small footprint and fast startup
 
 ## Architecture
 
@@ -160,10 +178,15 @@ migo/
 ├── platforms/
 │   └── android/            # Android SDK
 ├── scripts/                # Build scripts
-├── LICENSE                 # License
+├── LICENSE                 # License (BSL 1.1)
+├── LEGAL.md                # Legal notice (license/trademarks/test content)
 ├── NOTICE                  # Third-party notices
 └── README.md
 ```
+
+## License
+
+Migo is **source-available** under the [Business Source License 1.1](LICENSE) (BSL 1.1) and **converts to Apache 2.0 on 2029-01-01**. See [LEGAL.md](LEGAL.md) for the full statement on licensing, trademarks, and test content.
 
 ## Contributing
 
