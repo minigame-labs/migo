@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-use shared::js_escape::build_eval_script;
+use shared::js_escape::{HOST_BRIDGE_EXPR, build_eval_script};
 
 use std::borrow::Cow;
 use std::ffi::c_void;
@@ -516,7 +516,10 @@ pub(crate) extern "system" fn onOpenSystemBluetoothSetting<'local>(
             .replace('\n', "\\n")
             .replace('\r', "\\r");
         let cmd = HostCommand::EvalScript {
-            source: format!("_internalOnOpenBluetoothSettingResult('{}');", escaped),
+            source: format!(
+                "{HOST_BRIDGE_EXPR}._internalOnOpenBluetoothSettingResult('{}');",
+                escaped
+            ),
         };
         let _ = send_command_to_host(host_id, cmd);
     });
@@ -530,7 +533,10 @@ pub(crate) extern "system" fn onOpenAppAuthorizeSetting<'local>(
 ) {
     jni_safe!("onOpenAppAuthorizeSetting", {
         let cmd = HostCommand::EvalScript {
-            source: format!("_internalOnOpenAppAuthorizeSettingFinished({});", code),
+            source: format!(
+                "{HOST_BRIDGE_EXPR}._internalOnOpenAppAuthorizeSettingFinished({});",
+                code
+            ),
         };
         let _ = send_command_to_host(host_id, cmd);
     });
@@ -759,7 +765,10 @@ pub(crate) extern "system" fn onModalResult<'local>(
 ) {
     jni_safe!("onModalResult", {
         let cmd = HostCommand::EvalScript {
-            source: format!("_internalOnModalResult({},{});", confirm, cancel),
+            source: format!(
+                "{HOST_BRIDGE_EXPR}._internalOnModalResult({},{});",
+                confirm, cancel
+            ),
         };
         let _ = send_command_to_host(host_id, cmd);
     });
@@ -773,7 +782,10 @@ pub(crate) extern "system" fn onActionSheetResult<'local>(
 ) {
     jni_safe!("onActionSheetResult", {
         let cmd = HostCommand::EvalScript {
-            source: format!("_internalOnActionSheetResult({});", tap_index),
+            source: format!(
+                "{HOST_BRIDGE_EXPR}._internalOnActionSheetResult({});",
+                tap_index
+            ),
         };
         let _ = send_command_to_host(host_id, cmd);
     });

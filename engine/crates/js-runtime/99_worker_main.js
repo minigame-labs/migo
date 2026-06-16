@@ -22,3 +22,9 @@ initializeEventHandlers();
 
 // Start the message pump (async, keeps event loop alive)
 _startMessagePump();
+
+// Remove deno_core's internal namespaces from the worker's game-visible global
+// (same rationale as 99_main.js). Workers have no _internal* host bridge, so
+// only Deno/__bootstrap need removal here.
+delete globalThis.Deno;
+delete globalThis.__bootstrap;

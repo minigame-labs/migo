@@ -137,6 +137,26 @@ impl JsBindings {
             Some(v8::Global::new(scope, f))
         }
 
+        /// Resolve the Symbol-keyed host-bridge holder that `99_main.js`
+        /// installs (`globalThis[Symbol.for('Migo.hostBridge')]`). The
+        /// `_internal*` event-pump hooks live on this holder, not on the
+        /// global, so an audit dump of globalThis does not surface them.
+        /// Falls back to the global object if the holder is missing (e.g. a
+        /// worker realm or an older bundle), preserving the prior behavior.
+        fn resolve_host_bridge<'s>(
+            scope: &v8::PinScope<'s, '_>,
+            global: v8::Local<'s, v8::Object>,
+        ) -> v8::Local<'s, v8::Object> {
+            let Some(name) = v8::String::new(scope, "Migo.hostBridge") else {
+                return global;
+            };
+            let sym = v8::Symbol::for_key(scope, name);
+            match global.get(scope, sym.into()) {
+                Some(v) => v8::Local::<v8::Object>::try_from(v).unwrap_or(global),
+                None => global,
+            }
+        }
+
         let (
             enqueue_touch,
             enqueue_audio,
@@ -166,38 +186,41 @@ impl JsBindings {
             key_up,
             video_event,
         ) = self.with_main_context(rt, |scope, _ctx, global| {
+            // Hooks were relocated off the global onto the host-bridge holder
+            // (see 99_main.js). Resolve it once, then look up every hook there.
+            let bridge = resolve_host_bridge(scope, global);
             (
-                get_global_fn(scope, global, "_internalEnqueueRawTouchEvent"),
-                get_global_fn(scope, global, "_internalEnqueueInnerAudioEvent"),
-                get_global_fn(scope, global, "_internalOnRecorderEvent"),
-                get_global_fn(scope, global, "_internalOnRecorderFrameData"),
-                get_global_fn(scope, global, "_internalOnCameraEvent"),
-                get_global_fn(scope, global, "_internalOnCameraFrameData"),
-                get_global_fn(scope, global, "_internalTriggerDeviceMotionChange"),
-                get_global_fn(scope, global, "_internalTriggerGyroscopeChange"),
-                get_global_fn(scope, global, "_internalTriggerAccelerometerChange"),
-                get_global_fn(scope, global, "_internalTriggerCompassChange"),
-                get_global_fn(scope, global, "_internalTriggerDeviceOrientationChange"),
-                get_global_fn(scope, global, "_internalTriggerNetworkStatusChange"),
-                get_global_fn(scope, global, "_internalTriggerBluetoothAdapterStateChange"),
-                get_global_fn(scope, global, "_internalTriggerBluetoothDeviceFound"),
-                get_global_fn(scope, global, "_internalTriggerBeaconUpdate"),
-                get_global_fn(scope, global, "_internalTriggerBeaconServiceChange"),
-                get_global_fn(scope, global, "_internalTriggerBLEConnectionStateChange"),
+                get_global_fn(scope, bridge, "_internalEnqueueRawTouchEvent"),
+                get_global_fn(scope, bridge, "_internalEnqueueInnerAudioEvent"),
+                get_global_fn(scope, bridge, "_internalOnRecorderEvent"),
+                get_global_fn(scope, bridge, "_internalOnRecorderFrameData"),
+                get_global_fn(scope, bridge, "_internalOnCameraEvent"),
+                get_global_fn(scope, bridge, "_internalOnCameraFrameData"),
+                get_global_fn(scope, bridge, "_internalTriggerDeviceMotionChange"),
+                get_global_fn(scope, bridge, "_internalTriggerGyroscopeChange"),
+                get_global_fn(scope, bridge, "_internalTriggerAccelerometerChange"),
+                get_global_fn(scope, bridge, "_internalTriggerCompassChange"),
+                get_global_fn(scope, bridge, "_internalTriggerDeviceOrientationChange"),
+                get_global_fn(scope, bridge, "_internalTriggerNetworkStatusChange"),
+                get_global_fn(scope, bridge, "_internalTriggerBluetoothAdapterStateChange"),
+                get_global_fn(scope, bridge, "_internalTriggerBluetoothDeviceFound"),
+                get_global_fn(scope, bridge, "_internalTriggerBeaconUpdate"),
+                get_global_fn(scope, bridge, "_internalTriggerBeaconServiceChange"),
+                get_global_fn(scope, bridge, "_internalTriggerBLEConnectionStateChange"),
                 get_global_fn(
                     scope,
-                    global,
+                    bridge,
                     "_internalTriggerBLECharacteristicValueChange",
                 ),
-                get_global_fn(scope, global, "_internalTriggerBLEMTUChange"),
-                get_global_fn(scope, global, "_internalTriggerMemoryWarning"),
-                get_global_fn(scope, global, "_internalTriggerKeyboardInput"),
-                get_global_fn(scope, global, "_internalTriggerKeyboardHeightChange"),
-                get_global_fn(scope, global, "_internalTriggerKeyboardConfirm"),
-                get_global_fn(scope, global, "_internalTriggerKeyboardComplete"),
-                get_global_fn(scope, global, "_internalTriggerKeyDown"),
-                get_global_fn(scope, global, "_internalTriggerKeyUp"),
-                get_global_fn(scope, global, "_internalTriggerVideoEvent"),
+                get_global_fn(scope, bridge, "_internalTriggerBLEMTUChange"),
+                get_global_fn(scope, bridge, "_internalTriggerMemoryWarning"),
+                get_global_fn(scope, bridge, "_internalTriggerKeyboardInput"),
+                get_global_fn(scope, bridge, "_internalTriggerKeyboardHeightChange"),
+                get_global_fn(scope, bridge, "_internalTriggerKeyboardConfirm"),
+                get_global_fn(scope, bridge, "_internalTriggerKeyboardComplete"),
+                get_global_fn(scope, bridge, "_internalTriggerKeyDown"),
+                get_global_fn(scope, bridge, "_internalTriggerKeyUp"),
+                get_global_fn(scope, bridge, "_internalTriggerVideoEvent"),
             )
         });
 

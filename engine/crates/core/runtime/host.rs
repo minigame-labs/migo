@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use shared::{
     config::InitOptions,
     error::EngineResult,
-    js_escape::escape_for_js_string,
+    js_escape::{HOST_BRIDGE_EXPR, escape_for_js_string},
     op_state::{HostOpState, RafRx},
     protocol::host_cmd::HostCommand,
     protocol::render_cmd::{CanvasCmd, RenderCommand},
@@ -452,7 +452,7 @@ impl Host {
                 let script = if let Some(options_json) = options_json.as_deref() {
                     let options_json = options_json.trim();
                     if options_json.is_empty() {
-                        "_internalTriggerOnShow()".to_string()
+                        format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
                     } else {
                         match deno_core::serde_json::from_str::<Value>(options_json) {
                             Ok(value) if value.is_object() => {
@@ -465,20 +465,23 @@ impl Host {
                                 let json_str = deno_core::serde_json::to_string(&value)
                                     .unwrap_or_else(|_| "{}".to_string());
                                 let escaped = escape_for_js_string(&json_str);
-                                format!("_internalTriggerOnShow(JSON.parse('{}'))", escaped)
+                                format!(
+                                    "{HOST_BRIDGE_EXPR}._internalTriggerOnShow(JSON.parse('{}'))",
+                                    escaped
+                                )
                             }
-                            Ok(_) => "_internalTriggerOnShow()".to_string(),
+                            Ok(_) => format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()"),
                             Err(e) => {
                                 warn!(
                                     "[Host {}] invalid onShow options JSON, fallback to default: {}",
                                     self.id, e
                                 );
-                                "_internalTriggerOnShow()".to_string()
+                                format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
                             }
                         }
                     }
                 } else {
-                    "_internalTriggerOnShow()".to_string()
+                    format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
                 };
 
                 // Defer JS onShow until a valid surface is back and render/audio
@@ -501,17 +504,20 @@ impl Host {
                 self.audio.pause();
                 self.pending_on_show_script = None;
 
-                self.js.exec_script("onhide", "_internalTriggerOnHide()")
+                self.js.exec_script(
+                    "onhide",
+                    &format!("{HOST_BRIDGE_EXPR}._internalTriggerOnHide()"),
+                )
             }
 
             HostCommand::OnAudioInterruptionBegin => self.js.exec_script(
                 "audio_interruption_begin",
-                "_internalTriggerAudioInterruptionBegin()",
+                &format!("{HOST_BRIDGE_EXPR}._internalTriggerAudioInterruptionBegin()"),
             ),
 
             HostCommand::OnAudioInterruptionEnd => self.js.exec_script(
                 "audio_interruption_end",
-                "_internalTriggerAudioInterruptionEnd()",
+                &format!("{HOST_BRIDGE_EXPR}._internalTriggerAudioInterruptionEnd()"),
             ),
 
             HostCommand::OnTouch(touch) => {
@@ -741,9 +747,10 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnUserCaptureScreen => self
-                .js
-                .exec_script("user_capture_screen", "_internalTriggerUserCaptureScreen()"),
+            HostCommand::OnUserCaptureScreen => self.js.exec_script(
+                "user_capture_screen",
+                &format!("{HOST_BRIDGE_EXPR}._internalTriggerUserCaptureScreen()"),
+            ),
 
             // Android ADPF thermal status (PowerManager.THERMAL_STATUS_*).
             HostCommand::OnThermalStatusChanged { status } => {
@@ -889,9 +896,10 @@ impl Host {
                 "raf_resume_kick",
                 "globalThis.__migo_restart_raf_loop && globalThis.__migo_restart_raf_loop()",
             );
-            let _ = self
-                .js
-                .exec_script("window_resize", "_internalTriggerWindowResize()");
+            let _ = self.js.exec_script(
+                "window_resize",
+                &format!("{HOST_BRIDGE_EXPR}._internalTriggerWindowResize()"),
+            );
             if let Some(script) = self.pending_on_show_script.take() {
                 let _ = self.js.exec_script("onshow", &script);
             }

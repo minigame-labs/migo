@@ -40,18 +40,35 @@ pub fn escape_for_js_string(s: &str) -> String {
     out
 }
 
-/// Build a complete `callbackName('escaped_json');` JS source string in a
-/// single allocation.
+/// JS expression that resolves the host-bridge holder object at runtime.
+///
+/// The runtime relocates all `_internal*` host-bridge hooks off the
+/// game-visible global onto a Symbol-keyed holder (see `99_main.js`). Host
+/// callbacks delivered through the EvalScript channel must therefore qualify
+/// the hook name with this prefix instead of calling a bare global identifier.
+///
+/// Keep this in sync with the Symbol key used in `99_main.js` and the lookup
+/// in `js-runtime/js_bindings.rs`.
+pub const HOST_BRIDGE_EXPR: &str = "globalThis[Symbol.for('Migo.hostBridge')]";
+
+/// Build a complete `<holder>.callbackName('escaped_json');` JS source string
+/// in a single allocation.
+///
+/// `callback_name` is the bare hook name (e.g. `_internalOnLoginResult`); this
+/// function prefixes it with [`HOST_BRIDGE_EXPR`] so the call resolves the hook
+/// from the Symbol-keyed host-bridge holder rather than the global scope (the
+/// hooks are no longer exposed as global identifiers -- see `99_main.js`).
 ///
 /// This combines the work of `escape_for_js_string` + `format!` into one pass,
 /// eliminating the intermediate escaped String allocation. The escape rules are
 /// identical to `escape_for_js_string`.
-///
-/// Pre-calculates capacity: `callback_name.len() + json.len() + 5 + 16`
-/// where 5 covers the `('');` overhead and 16 is headroom for escape sequences.
 pub fn build_eval_script(callback_name: &str, json: &str) -> String {
-    // 5 = len("('');") , 16 = escape headroom
-    let mut out = String::with_capacity(callback_name.len() + json.len() + 5 + 16);
+    // HOST_BRIDGE_EXPR + '.' + name + "('" + escaped + "');"
+    let mut out = String::with_capacity(
+        HOST_BRIDGE_EXPR.len() + 1 + callback_name.len() + json.len() + 5 + 16,
+    );
+    out.push_str(HOST_BRIDGE_EXPR);
+    out.push('.');
     out.push_str(callback_name);
     out.push_str("('");
     for c in json.chars() {
@@ -150,7 +167,7 @@ mod tests {
     fn build_eval_script_plain_json() {
         assert_eq!(
             build_eval_script("_internalOnResult", r#"{"ok":true}"#),
-            r#"_internalOnResult('{"ok":true}');"#
+            format!("{HOST_BRIDGE_EXPR}._internalOnResult('{{\"ok\":true}}');"),
         );
     }
 
@@ -158,7 +175,7 @@ mod tests {
     fn build_eval_script_json_with_single_quotes() {
         assert_eq!(
             build_eval_script("_internalOnResult", r#"{"msg":"it's done"}"#),
-            r#"_internalOnResult('{"msg":"it\'s done"}');"#
+            format!("{HOST_BRIDGE_EXPR}._internalOnResult('{{\"msg\":\"it\\'s done\"}}');"),
         );
     }
 
@@ -166,7 +183,7 @@ mod tests {
     fn build_eval_script_empty_json() {
         assert_eq!(
             build_eval_script("_internalOnResult", ""),
-            "_internalOnResult('');",
+            format!("{HOST_BRIDGE_EXPR}._internalOnResult('');"),
         );
     }
 
@@ -176,7 +193,11 @@ mod tests {
         // two-step escape_for_js_string + format! approach.
         let json = r#"{"path":"C:\\Users\\test","note":"line1\nline2"}"#;
         let callback = "_internalOnChooseImageResult";
-        let expected = format!("{}('{}');", callback, escape_for_js_string(json));
+        let expected = format!(
+            "{HOST_BRIDGE_EXPR}.{}('{}');",
+            callback,
+            escape_for_js_string(json)
+        );
         assert_eq!(build_eval_script(callback, json), expected);
     }
 
@@ -184,7 +205,11 @@ mod tests {
     fn build_eval_script_all_special_chars() {
         let json = "\\'\n\r\0`$\u{2028}\u{2029}";
         let callback = "_cb";
-        let expected = format!("{}('{}');", callback, escape_for_js_string(json));
+        let expected = format!(
+            "{HOST_BRIDGE_EXPR}.{}('{}');",
+            callback,
+            escape_for_js_string(json)
+        );
         assert_eq!(build_eval_script(callback, json), expected);
     }
 }

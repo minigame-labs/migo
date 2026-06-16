@@ -3,7 +3,7 @@
 // triggerGC()         - triggers a full V8 GC cycle
 // getHeapStatistics() - returns V8 heap usage info (totalHeapSize, usedHeapSize, ...)
 
-const core = Deno.core;
+import { core } from "ext:core/mod.js";
 
 /**
  * Trigger a full V8 garbage collection cycle.
