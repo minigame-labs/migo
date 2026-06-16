@@ -577,14 +577,12 @@ pub fn op_force_readback_snapshot(state: &mut OpState, #[smi] snapshot_id: u32) 
     // canvas_id is irrelevant for the readback path; the manager
     // hops onto any current canvas to issue the FBO bind.  Use 1
     // (onscreen) as a stable id for the routing.
-    match send_render_with_resp_sync(
-        ctx,
-        OP_FORCE_READBACK_SNAPSHOT,
-        |resp| RenderCommand::Canvas2D {
+    match send_render_with_resp_sync(ctx, OP_FORCE_READBACK_SNAPSHOT, |resp| {
+        RenderCommand::Canvas2D {
             canvas_id: 1,
             cmd: Canvas2DCmd::ReadSnapshotPixels { snapshot_id, resp },
-        },
-    ) {
+        }
+    }) {
         Ok(d) => d,
         Err(e) => {
             error!("{OP_FORCE_READBACK_SNAPSHOT} failed: {e}");

@@ -219,9 +219,7 @@ pub fn send_render_with_resp_sync<T>(
         // uploads or a heavy GL command queued earlier in the
         // batch.  Surface it so logcat can correlate with
         // [MigoPerf] readFile spikes.
-        tracing::warn!(
-            "[MigoPerf][SyncOp] {op} blocked V8 {elapsed_ms}ms"
-        );
+        tracing::warn!("[MigoPerf][SyncOp] {op} blocked V8 {elapsed_ms}ms");
     }
     result
 }

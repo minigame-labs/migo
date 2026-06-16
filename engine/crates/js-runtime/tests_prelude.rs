@@ -102,9 +102,7 @@ mod prelude_tests {
     fn prelude_syntax_error_fails_fast() {
         let mut rt = JsRuntime::new(RuntimeOptions::default());
         let name = String::from("<prelude:broken>");
-        let result =
-            rt.execute_script(name, FastString::from_static("this is not valid js (("));
+        let result = rt.execute_script(name, FastString::from_static("this is not valid js (("));
         assert!(result.is_err(), "syntax error should fail synchronously");
     }
 }
-

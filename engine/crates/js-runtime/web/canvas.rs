@@ -92,11 +92,7 @@ pub fn op_create_offscreen_canvas(
     let raw_id = NEXT_JS_OFFSCREEN_CANVAS_ID.fetch_add(1, Ordering::Relaxed);
     let id = CanvasId::from(raw_id);
 
-    let cmd = RenderCommand::Canvas(CanvasCmd::RegisterOffscreen {
-        id,
-        width,
-        height,
-    });
+    let cmd = RenderCommand::Canvas(CanvasCmd::RegisterOffscreen { id, width, height });
 
     ctx.tx.send(cmd).map_err(|e| {
         js_err_from_engine(

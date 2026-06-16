@@ -574,10 +574,10 @@ mod tests {
         }
         // What the Java side serializes for two entries, including a
         // newline + quote in the source to exercise escaping.
-        let json = r#"[{"name":"<a>","source":"line1\nline2"},{"name":"<b>","source":"alert(\"hi\")"}]"#;
+        let json =
+            r#"[{"name":"<a>","source":"line1\nline2"},{"name":"<b>","source":"alert(\"hi\")"}]"#;
         let parsed: Vec<Entry> = deno_core::serde_json::from_str(json).unwrap();
-        let pairs: Vec<(String, String)> =
-            parsed.into_iter().map(|e| (e.name, e.source)).collect();
+        let pairs: Vec<(String, String)> = parsed.into_iter().map(|e| (e.name, e.source)).collect();
 
         let opt = InitOptions::new().with_prelude_scripts(pairs);
         let s = opt.prelude_scripts();

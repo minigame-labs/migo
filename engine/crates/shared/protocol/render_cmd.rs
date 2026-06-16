@@ -400,7 +400,6 @@ pub enum CanvasCmd {
     // thread — both JS and render-thread callers pull from
     // `shared::image_id::next_image_id()` instead.  The id is sent
     // pre-allocated on the `LoadImage` below.
-
     /// Load an image (RGBA8 or compressed) for GPU upload.
     /// The render thread owns the GPU resource.
     LoadImage {
@@ -760,11 +759,11 @@ pub enum GLCmd {
     /// open).  The render thread does FBO blit + glCopyTexImage2D in
     /// one shot, freeing the temp source texture immediately.
     TexImage2DFromCanvas2D {
-        canvas_id: CanvasId,        // GL canvas (where dst tex is bound)
+        canvas_id: CanvasId, // GL canvas (where dst tex is bound)
         target: u32,
         level: i32,
         internalformat: i32,
-        canvas_2d_id: CanvasId,     // 2D canvas (source content)
+        canvas_2d_id: CanvasId, // 2D canvas (source content)
         x: i32,
         y: i32,
         width: u32,

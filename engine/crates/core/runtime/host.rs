@@ -814,16 +814,12 @@ impl Host {
             let t_prelude = Instant::now();
             // Clone out of init_options to release the borrow on `self`
             // before the &mut self.js call below.
-            let scripts: Vec<(String, String)> =
-                self.init_options.prelude_scripts().to_vec();
+            let scripts: Vec<(String, String)> = self.init_options.prelude_scripts().to_vec();
             for (name, source) in &scripts {
                 self.js
                     .exec_script_owned(name.clone(), source)
                     .map_err(|e| {
-                        error!(
-                            "[Host {}] prelude script '{}' failed: {}",
-                            self.id, name, e
-                        );
+                        error!("[Host {}] prelude script '{}' failed: {}", self.id, name, e);
                         e
                     })?;
             }

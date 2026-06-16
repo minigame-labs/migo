@@ -87,7 +87,10 @@ impl Renderer2d {
                 if let Err(e) = cm.resize_canvas(canvas_id, w, h) {
                     tracing::warn!(
                         "Canvas2DCmd::ResizeCanvas failed: canvas={:?}, w={:?}, h={:?}, err={}",
-                        canvas_id, w, h, e
+                        canvas_id,
+                        w,
+                        h,
+                        e
                     );
                 }
                 Ok(false)

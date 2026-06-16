@@ -147,11 +147,11 @@ pub use host_runtime::SharedMountTableRef;
 pub use host_runtime::V8LimitsConfig;
 
 #[cfg(test)]
-mod tests_v8_limits;
+mod tests_global_surface;
 #[cfg(test)]
 mod tests_prelude;
 #[cfg(test)]
-mod tests_global_surface;
+mod tests_v8_limits;
 pub use rendering::image::cache::{clear_shared_image_cache, drain_shared_image_cache};
 
 deno_core::extension!(

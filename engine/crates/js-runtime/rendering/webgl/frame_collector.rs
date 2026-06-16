@@ -621,9 +621,7 @@ pub(crate) fn flush_unified_barrier(state: &mut deno_core::OpState) {
             })
             .sum::<usize>();
         if gl_ops >= 64 {
-            tracing::warn!(
-                "[MigoPerf][SyncFlush] sync barrier flushed {gl_ops} pending GL ops"
-            );
+            tracing::warn!("[MigoPerf][SyncFlush] sync barrier flushed {gl_ops} pending GL ops");
         }
         let ctx = state.borrow::<shared::op_state::CanvasOpState>();
         if let Err(e) = ctx

@@ -549,11 +549,7 @@ pub async fn op_access(
                 let r = fs_ops::access(&full_path);
                 let disk_ms = t0.elapsed().as_millis() as u64;
                 if disk_ms >= 30 {
-                    tracing::warn!(
-                        "[IOTrace] access slow {}ms path={}",
-                        disk_ms,
-                        vpath
-                    );
+                    tracing::warn!("[IOTrace] access slow {}ms path={}", disk_ms, vpath);
                 }
                 r
             })
@@ -1392,11 +1388,7 @@ pub fn op_read_file_sync(
                 // Sync reads block V8; surface the path so callers can
                 // see which game-side readFileSync is freezing the
                 // event loop.
-                tracing::warn!(
-                    "[IOTrace] readFileSync slow {}ms path={}",
-                    elapsed_ms,
-                    path
-                );
+                tracing::warn!("[IOTrace] readFileSync slow {}ms path={}", elapsed_ms, path);
             }
         }
         Err(err) => trace_file_edge("read_file_sync", &path, started_at, &format!("err={err}")),

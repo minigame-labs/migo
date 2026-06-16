@@ -413,11 +413,7 @@ pub fn op_fetch(
                 // not an exact measurement.
                 let net_ms = net_started.elapsed().as_millis() as u64;
                 if net_ms >= 50 {
-                    tracing::warn!(
-                        "[NetTrace] reqwest send {}ms url={}",
-                        net_ms,
-                        url_for_trace
-                    );
+                    tracing::warn!("[NetTrace] reqwest send {}ms url={}", net_ms, url_for_trace);
                 }
                 result
             };

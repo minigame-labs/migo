@@ -419,9 +419,7 @@ impl DebugStats {
             sk_image_wrappers: self.sk_image_wrappers.load(Ordering::Relaxed),
             deferred_uploads: self.deferred_uploads.load(Ordering::Relaxed),
             canvas2d_snapshots_taken: self.canvas2d_snapshots_taken.load(Ordering::Relaxed),
-            canvas2d_snapshot_fallbacks: self
-                .canvas2d_snapshot_fallbacks
-                .load(Ordering::Relaxed),
+            canvas2d_snapshot_fallbacks: self.canvas2d_snapshot_fallbacks.load(Ordering::Relaxed),
             canvas2d_snapshot_uploads: self.canvas2d_snapshot_uploads.load(Ordering::Relaxed),
             canvas2d_snapshot_forced_readbacks: self
                 .canvas2d_snapshot_forced_readbacks

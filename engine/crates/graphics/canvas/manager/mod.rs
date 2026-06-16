@@ -650,12 +650,7 @@ impl CanvasManager {
     /// of allocating one.  Used by the fire-and-forget JS path
     /// (`CanvasCmd::RegisterOffscreen`) where JS owns the id range.
     /// Idempotent: if `id` already exists this is a no-op.
-    pub(crate) fn register_offscreen(
-        &mut self,
-        id: CanvasId,
-        w: u32,
-        h: u32,
-    ) -> EngineResult<()> {
+    pub(crate) fn register_offscreen(&mut self, id: CanvasId, w: u32, h: u32) -> EngineResult<()> {
         if self.canvases.contains_key(&id) {
             return Ok(());
         }
@@ -2512,10 +2507,7 @@ impl CanvasManager {
                     0,
                 );
             } else {
-                tracing::warn!(
-                    "TexImage2DFromShared: read FBO incomplete: 0x{:X}",
-                    status
-                );
+                tracing::warn!("TexImage2DFromShared: read FBO incomplete: 0x{:X}", status);
             }
             // Detach so the source texture isn't kept implicitly
             // alive by this FBO across calls.
@@ -2700,11 +2692,9 @@ impl CanvasManager {
                 // Mali (cocos labels rendered blank again).  The
                 // CPU-side `client_wait_sync` is load-bearing; do
                 // not touch without a Mali device in hand.
-                let _ = self.gl.client_wait_sync(
-                    fence,
-                    glow::SYNC_FLUSH_COMMANDS_BIT,
-                    i32::MAX,
-                );
+                let _ = self
+                    .gl
+                    .client_wait_sync(fence, glow::SYNC_FLUSH_COMMANDS_BIT, i32::MAX);
                 self.gl.delete_sync(fence);
             }
         }
@@ -2713,9 +2703,8 @@ impl CanvasManager {
             Some(ctx) => ctx.fbo_id,
             None => return Ok(0),
         };
-        let src_fbo = <glow::NativeFramebuffer as NativeFramebufferFromRawShim>::try_from_raw(
-            src_fbo_raw,
-        );
+        let src_fbo =
+            <glow::NativeFramebuffer as NativeFramebufferFromRawShim>::try_from_raw(src_fbo_raw);
         // src_fbo == None means "default framebuffer"; pass `None` to
         // bind FBO 0 explicitly.
 
@@ -2733,14 +2722,8 @@ impl CanvasManager {
 
         // Save GL state we're about to mutate so the surrounding
         // WebGL/Canvas2D batch sees no observable change.
-        let prev_active_texture = unsafe {
-            self.gl
-                .get_parameter_i32(glow::ACTIVE_TEXTURE)
-        };
-        let prev_tex_2d = unsafe {
-            self.gl
-                .get_parameter_i32(glow::TEXTURE_BINDING_2D)
-        };
+        let prev_active_texture = unsafe { self.gl.get_parameter_i32(glow::ACTIVE_TEXTURE) };
+        let prev_tex_2d = unsafe { self.gl.get_parameter_i32(glow::TEXTURE_BINDING_2D) };
         let prev_read_fbo = unsafe { self.gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING) };
         let prev_draw_fbo = unsafe { self.gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) };
 
@@ -2808,8 +2791,7 @@ impl CanvasManager {
         };
 
         unsafe {
-            self.gl
-                .bind_framebuffer(glow::READ_FRAMEBUFFER, src_fbo);
+            self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, src_fbo);
             self.gl
                 .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(blit_fbo));
             self.gl.framebuffer_texture_2d(
@@ -2943,9 +2925,8 @@ impl CanvasManager {
             if prev_active_texture as u32 >= glow::TEXTURE0 {
                 self.gl.active_texture(prev_active_texture as u32);
             }
-            let prev_tex = <glow::NativeTexture as NativeTextureFromRawShim>::try_from_raw(
-                prev_tex_2d as u32,
-            );
+            let prev_tex =
+                <glow::NativeTexture as NativeTextureFromRawShim>::try_from_raw(prev_tex_2d as u32);
             self.gl.bind_texture(glow::TEXTURE_2D, prev_tex);
             let prev_read = <glow::NativeFramebuffer as NativeFramebufferFromRawShim>::try_from_raw(
                 prev_read_fbo as u32,
@@ -3103,12 +3084,11 @@ impl CanvasManager {
             }
         };
 
-        let src_tex = match <glow::NativeTexture as NativeTextureFromRawShim>::try_from_raw(
-            src_tex_raw,
-        ) {
-            Some(t) => t,
-            None => return Ok(false),
-        };
+        let src_tex =
+            match <glow::NativeTexture as NativeTextureFromRawShim>::try_from_raw(src_tex_raw) {
+                Some(t) => t,
+                None => return Ok(false),
+            };
 
         self.make_current_needed(canvas_id)?;
         let copy_fbo = self.ensure_image_copy_fbo(canvas_id)?;
@@ -3285,7 +3265,9 @@ impl CanvasManager {
             return Ok(());
         }
 
-        self.tex_sub_image_2d_from_canvas2d_snapshot(canvas_id, target, level, xoffset, yoffset, id)?;
+        self.tex_sub_image_2d_from_canvas2d_snapshot(
+            canvas_id, target, level, xoffset, yoffset, id,
+        )?;
 
         if let Some(entry) = self.canvas2d_snapshots.remove(&id) {
             self.canvas2d_snapshot_order.retain(|&i| i != id);
@@ -3466,7 +3448,8 @@ impl CanvasManager {
                     glow::UNSIGNED_BYTE,
                     glow::PixelPackData::Slice(Some(&mut out)),
                 );
-                self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, prev_pack_alignment);
+                self.gl
+                    .pixel_store_i32(glow::PACK_ALIGNMENT, prev_pack_alignment);
             } else {
                 tracing::warn!(
                     "read_canvas2d_snapshot_pixels: FBO incomplete: 0x{:X}",
@@ -3518,8 +3501,7 @@ impl CanvasManager {
         // cache).  Doing the cache inserts after we've collected all
         // entries means we touch the text cache mutex only once even
         // when many entries are being moved.
-        let drained: Vec<(u32, Canvas2DSnapshotEntry)> =
-            self.canvas2d_snapshots.drain().collect();
+        let drained: Vec<(u32, Canvas2DSnapshotEntry)> = self.canvas2d_snapshots.drain().collect();
         self.canvas2d_snapshot_order.clear();
 
         let mut to_delete: Vec<glow::NativeTexture> = Vec::new();
@@ -3536,8 +3518,9 @@ impl CanvasManager {
             let mut cache = shared::text_texture_cache::global_cache();
             for entry in to_cache {
                 let key = entry.cache_key.expect("cache_key checked above");
-                let size_bytes =
-                    (entry.width as usize).saturating_mul(entry.height as usize).saturating_mul(4);
+                let size_bytes = (entry.width as usize)
+                    .saturating_mul(entry.height as usize)
+                    .saturating_mul(4);
                 let cached = shared::text_texture_cache::CachedTextEntry {
                     texture_id: entry.tex.0.get(),
                     width: entry.width,

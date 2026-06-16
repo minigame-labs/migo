@@ -436,9 +436,9 @@ fn execute_frame_packet(
         let mut phase2: Vec<FrameOp> = Vec::with_capacity(ops_vec.len());
         for op in ops_vec {
             match &op {
-                FrameOp::BeginFrame
-                | FrameOp::CanvasBatch(_)
-                | FrameOp::Materialize { .. } => phase1.push(op),
+                FrameOp::BeginFrame | FrameOp::CanvasBatch(_) | FrameOp::Materialize { .. } => {
+                    phase1.push(op)
+                }
                 FrameOp::GlBatch(_) | FrameOp::Present => phase2.push(op),
             }
         }
