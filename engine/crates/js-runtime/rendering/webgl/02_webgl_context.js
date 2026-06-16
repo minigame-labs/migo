@@ -2,6 +2,7 @@ import {
     op_viewport,
     op_clear,
     op_clear_color,
+    op_gl_flush,
     op_create_program,
     op_use_program,
     op_link_program,
@@ -403,6 +404,23 @@ class WebGLRenderingContext {
 
     clear(mask) {
         return op_clear(this._canvasId, mask);
+    }
+
+    // WebGL `flush()` forces queued commands to begin execution;
+    // `finish()` additionally blocks until they complete.  Our backend
+    // batches GL commands into the unified frame collector and dispatches
+    // them to the render thread on a barrier flush, so both map to a
+    // barrier flush here.  We do not expose a true GPU fence/glFinish
+    // round-trip: Cocos calls finish() on resume (onShow) purely to drain
+    // any commands queued before the surface was lost, which the barrier
+    // flush satisfies.  Defining these is required: without them onShow
+    // throws "finish is not a function" and the resume listener chain aborts.
+    flush() {
+        op_gl_flush();
+    }
+
+    finish() {
+        op_gl_flush();
     }
 
     createProgram() {
