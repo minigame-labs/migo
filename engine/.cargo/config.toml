@@ -153,7 +153,14 @@ rustflags = [
 # Disable fontconfig on Linux (we ship SkFontMgr_Android on device and a
 # TypefaceFontProvider with bundled fonts for headless tests). This avoids
 # the system libfontconfig-dev dependency.
-SKIA_GN_ARGS = "skia_use_fontconfig=false skia_enable_fontmgr_fontconfig=false"
+#
+# extra_cflags_cc adds C++-only flags WITHOUT overriding skia-bindings'
+# own extra_cflags (-Oz / -D__ANDROID_API__). We drop unwind tables:
+# the engine builds with panic=abort and Skia is compiled -fno-exceptions,
+# so the .eh_frame / .eh_frame_hdr unwind data (~part of 3 MB) is dead
+# weight in the final .so. -fno-asynchronous-unwind-tables removes the
+# per-function CFI; -fno-unwind-tables drops the rest.
+SKIA_GN_ARGS = "skia_use_fontconfig=false skia_enable_fontmgr_fontconfig=false extra_cflags_cc=[\"-fno-asynchronous-unwind-tables\",\"-fno-unwind-tables\"]"
 
 # On WSL / Ubuntu hosts, Skia's C++20 consteval usage in src/base/SkTime.cpp
 # does not compile with clang-12 against the GCC-13 libstdc++ shipped by

@@ -1,0 +1,40 @@
+diff --git a/build.rs b/build.rs
+index 970e88b..a968545 100644
+--- a/build.rs
++++ b/build.rs
+@@ -141,6 +141,26 @@ fn acquire_lock() -> LockFile {
+ }
+ 
+ fn build_binding() {
++  // MIGO: allow reusing a pre-generated src_binding.rs (same bindgen
++  // 0.72 + same V8 14.5.201 = identical FFI ABI) to skip the local
++  // bindgen step, which would otherwise require a Clang 20+ libclang to
++  // parse V8's vendored libc++ headers. Set V8_PREBUILT_BINDING to the
++  // path of a known-good src_binding.rs.
++  if let Ok(prebuilt) = env::var("V8_PREBUILT_BINDING") {
++    if Path::new(&prebuilt).is_file() {
++      let out_path = build_dir().join("gn_out").join("src_binding.rs");
++      fs::copy(&prebuilt, &out_path)
++        .expect("MIGO: failed to copy V8_PREBUILT_BINDING");
++      println!(
++        "cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH={}",
++        out_path.display()
++      );
++      println!("cargo:warning=MIGO: using prebuilt binding {prebuilt}");
++      return;
++    }
++    panic!("V8_PREBUILT_BINDING set but not a file: {prebuilt}");
++  }
++
+   // Bindgen needs Clang 19+ for V8's libc++ builtin type traits.
+   if env::var("LIBCLANG_PATH").is_err() {
+     eprintln!("Warning: LIBCLANG_PATH not set. Bindgen requires Clang 19+.");
+@@ -352,7 +372,7 @@ fn build_v8(is_asan: bool) {
+   // cross-compilation setup
+   if target_arch == "aarch64" {
+     gn_args.push(r#"target_cpu="arm64""#.to_string());
+-    if target_os == "linux" {
++    if target_os == "linux" || target_os == "android" {
+       gn_args.push("use_sysroot=true".to_string());
+       maybe_install_sysroot("arm64");
+       maybe_install_sysroot("amd64");

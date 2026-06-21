@@ -188,6 +188,60 @@ get_host_platform() {
 # ------------------------------------------------------------
 # Build one platform
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# Slim the embedded ICU data (stage 2 size reduction)
+# ------------------------------------------------------------
+# Skia bakes an ICU data blob into libicu.a via GN's make_data_assembly
+# (externals/icu/<variant>/icudtl.dat -> icudtl_dat.S -> libicu.a). On
+# Android it picks the `android` variant (8.5 MB, 121 locales). Our game
+# runtime never uses ICU locale/format data (no Intl); text rendering
+# only needs the break-iterator + char/line data. The `flutter` variant
+# (761 KB) keeps char.brk / line_normal_cj.brk / word.brk + SE-Asian
+# dictionaries (thai/khmer/lao/burmese) and drops the locale tables,
+# saving ~7.7 MB off the final .so.
+#
+# We overwrite the `android` variant file with the `flutter` one (idempotent;
+# the original is kept as .orig). Done before cargo build so GN/ninja
+# regenerate icudtl_dat.S from the smaller blob. Set MIGO_FULL_ICU=1 to
+# restore the full android data.
+slim_icu_data() {
+    local skia_src
+    skia_src="$(find "$HOME/.cargo/registry/src" -maxdepth 2 -type d -name 'skia-bindings-*' 2>/dev/null | sort | tail -1)"
+    if [[ -z "$skia_src" ]]; then
+        print_warning "skia-bindings src not found; skipping ICU slim"
+        return 0
+    fi
+    local icu_dir="$skia_src/skia/third_party/externals/icu"
+    local android_dat="$icu_dir/android/icudtl.dat"
+    local flutter_dat="$icu_dir/flutter/icudtl.dat"
+    [[ -f "$android_dat" && -f "$flutter_dat" ]] || { print_warning "ICU variants missing; skipping"; return 0; }
+
+    # Keep a one-time backup of the ORIGINAL (large) android blob. Guard
+    # against backing up an already-slimmed file: only snapshot when no
+    # backup exists AND the current android blob differs from flutter
+    # (i.e. it is still the original large variant).
+    if [[ ! -f "$android_dat.orig" ]] && ! cmp -s "$flutter_dat" "$android_dat"; then
+        cp "$android_dat" "$android_dat.orig"
+    fi
+
+    if [[ "${MIGO_FULL_ICU:-0}" == "1" ]]; then
+        cp "$android_dat.orig" "$android_dat"
+        print_info "ICU: restored full android data (MIGO_FULL_ICU=1)"
+        return 0
+    fi
+
+    # overwrite only if not already the flutter (small) blob
+    if ! cmp -s "$flutter_dat" "$android_dat"; then
+        cp "$flutter_dat" "$android_dat"
+        print_info "ICU: slimmed android->flutter icudtl ($(du -h "$android_dat" | cut -f1))"
+        # force GN to regenerate the data assembly on next build
+        find "$TARGET_DIR" -path '*skia-bindings*/out/skia/gen/third_party/icu/icudtl_dat.S' -delete 2>/dev/null || true
+        find "$TARGET_DIR" -path '*skia-bindings*/out/skia/libicu.a' -delete 2>/dev/null || true
+    else
+        print_info "ICU: already slimmed (flutter blob)"
+    fi
+}
+
 build_platform() {
     local platform="$1"
     local build_type="$2"
@@ -377,7 +431,11 @@ build_platform() {
 # ------------------------------------------------------------
 check_dependencies
 
-build_type="debug"
+# Default to release.  The debug profile produces a ~347 MB .so (no
+# strip / LTO / opt) versus ~49 MB for release; shipping debug into
+# jniLibs was the single biggest size regression.  Pass `debug`
+# explicitly when you need an unoptimized build for local debugging.
+build_type="release"
 platforms=()
 use_all=false
 
@@ -434,6 +492,9 @@ fi
 
 print_info "Build type : $build_type"
 print_info "Platforms  : ${platforms[*]}"
+
+# Stage-2: ensure the embedded ICU blob is the slim variant before building.
+slim_icu_data
 
 failed=()
 for p in "${platforms[@]}"; do
