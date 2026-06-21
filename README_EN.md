@@ -20,8 +20,6 @@ Two adapter profiles let existing games run with **zero or minimal changes**:
 | Startup / memory | No DOM/layout, V8 snapshot warm-up — small footprint, fast startup, low memory | Ships the whole Chromium, heavy resident cost |
 | Cross-engine | One API across multiple engines, not locked to a single engine | — |
 
-> **Honest boundaries:** Migo and WebView both run on V8 underneath, so we **do not claim "faster JS"**; the edge is the lightweight no-browser layer, cross-OEM **version determinism**, and open auditability. Rendering is still subject to GPU/driver differences — the pitch is "fragmentation under your control," **not "pixel-identical everywhere."** On iOS, jitless restrictions mean a WKWebView backend and we don't lead with performance there; **Android is the battleground for performance and differentiation.**
-
 ## Features
 
 - **WebView replacement** — native runtime for embedded HTML5 / mini-games, no browser-layer overhead
