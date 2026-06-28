@@ -51,11 +51,18 @@ mod global_surface_tests {
     }
 
     /// Boot a runtime with the full main extension chain so `99_main.js` runs.
+    ///
+    /// Mirrors `HostJsRuntime::new`: the `Deno`/`__bootstrap` hardening is now
+    /// applied at runtime via `crate::harden_global_scope` (not in 99_main.js, so
+    /// it stays out of the V8 startup snapshot), so the test helper must apply it
+    /// too to represent the real game-visible global surface.
     fn boot_runtime() -> JsRuntime {
-        JsRuntime::new(RuntimeOptions {
+        let mut rt = JsRuntime::new(RuntimeOptions {
             extensions: crate::main_extensions(test_host_state()),
             ..Default::default()
-        })
+        });
+        crate::harden_global_scope(&mut rt);
+        rt
     }
 
     /// Run an assertion script that should `throw` on failure, surfacing the

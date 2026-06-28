@@ -205,7 +205,13 @@ if [[ "$REPRODUCE" == false ]]; then
     # (~1.6 MB of V8). This does NOT affect V8's JS-level unwinder API
     # (v8-unwinder.h), which is separate.
     GN_ARGS+=" exclude_unwind_tables=true"
-    info "optimized build: +is_official_build +symbol_level=0 (pgo off, no unwind tables)"
+    # official_build defaults use_thin_lto=true → archive members become LLVM
+    # bitcode tied to V8's bundled clang (LLVM22). NDK lld (<=19) can't read
+    # that bitcode, so ANY later v8-crate relink fails ("Invalid value
+    # (Producer LLVM22 Reader LLVM..)"). Hidden until the v8 cache is cleared.
+    # Force native objects: links with any NDK lld and is truly reproducible.
+    GN_ARGS+=" use_thin_lto=false"
+    info "optimized build: +is_official_build +symbol_level=0 (pgo off, no unwind tables, no thin-lto)"
 else
     info "reproduce build: termux-equivalent args only (no official_build)"
 fi

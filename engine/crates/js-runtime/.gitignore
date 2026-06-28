@@ -1,0 +1,7 @@
+# Per-arch V8 startup snapshots (snapshots/SNAPSHOT-<arch>.bin) are committed
+# via Git LFS — see /.gitattributes and snapshots/README.md — so release builds
+# are hermetic and the arm64 snapshot (not CI-generatable) has a home. They are
+# therefore intentionally NOT ignored here.
+#
+# Legacy single-file location (pre per-arch layout) stays ignored.
+/SNAPSHOT.bin

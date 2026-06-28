@@ -1,0 +1,167 @@
+name: Build V8 Snapshot
+
+# V8 startup snapshots are PLATFORM-bound (OS + CPU arch): a snapshot serializes
+# a live V8 heap, so it must be produced by the *same* android-<arch> V8 that
+# the target .so links — a host-linux V8 (or the wrong CPU arch) produces a
+# snapshot that fails V8's magic-number check at load and hard-crashes.
+#
+# We therefore generate the snapshot the "Deno issue #27496" way: cross-compile
+# `migo-snapshot-gen` to the target Android ABI (linking the committed,
+# self-built android V8 archive via Git LFS), then RUN it on that ABI's Android
+# emulator/device.
+#
+#   x86_64 -> GitHub-hosted `ubuntu-latest` HAS /dev/kvm, so we boot a
+#             hardware-accelerated x86_64 Android emulator and run the generator
+#             on it (job below).
+#
+#   arm64  -> GitHub-hosted `ubuntu-24.04-arm` runners do NOT expose /dev/kvm,
+#             so an arm64 Android emulator cannot be hardware-accelerated and
+#             this approach is not available on hosted runners. Generate the
+#             arm64 snapshot on a real arm64 device and commit/upload
+#             engine/crates/js-runtime/snapshots/SNAPSHOT-aarch64.bin. The exact
+#             device steps are documented in crates/snapshot-gen/src/main.rs.
+#             (A self-hosted arm64 runner with an attached device could automate
+#             this later.)
+#
+# This workflow uploads the snapshot as an artifact. Embedding into the .so is
+# done by js-runtime/build.rs at .so build time: it picks
+# snapshots/SNAPSHOT-<target arch>.bin for android targets only.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "engine/crates/js-runtime/**"
+      - "engine/crates/snapshot-gen/**"
+      - "engine/third_party/rusty_v8/**"
+      - "engine/Cargo.toml"
+      - "engine/Cargo.lock"
+      - ".github/workflows/build-snapshot.yml"
+
+concurrency:
+  group: build-snapshot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Release gate: confirm the COMMITTED per-arch snapshots are not stale vs the
+  # current extension JS / deno_core version — host-only, no device needed
+  # (those inputs are platform-independent). Fails the run if a present snapshot
+  # is stale, telling you to regenerate (see engine/crates/js-runtime/snapshots/README.md §4).
+  freshness:
+    name: snapshot freshness gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # No LFS needed: the gate reads only *.manifest.json (plain text) + the
+        # source tree, not the snapshot blobs themselves.
+      - name: Check snapshot freshness
+        run: bash scripts/check-snapshot-freshness.sh
+
+  snapshot-x86_64:
+    name: snapshot (x86_64 / emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # LFS is required: engine/third_party/rusty_v8/**/librusty_v8.a (the
+      # self-built android V8 archives) are stored via Git LFS, and snapshot-gen
+      # must link the android-x86_64 one so the snapshot's external-reference
+      # table matches the .so's V8 exactly.
+      - name: Checkout (with LFS for the android V8 archive)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      # Pinned to match engine/rust-toolchain.toml (frozen build chain).
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-linux-android
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine -> target
+          key: snapshot-x86_64
+          cache-on-failure: true
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # Pin the NDK to the same version the .so build uses (pr-ci.yml build job)
+      # and export ANDROID_NDK_HOME via $GITHUB_ENV so it is set for the
+      # cross-compile AND emulator steps. NOTE: do NOT set it from
+      # `${{ env.ANDROID_NDK_LATEST_HOME }}` — runner OS env vars are not in the
+      # Actions `env` expression context, so that resolves to "" and breaks
+      # cargo-ndk's NDK detection.
+      - name: Install Android NDK + cargo-ndk
+        run: |
+          sdkmanager "ndk;23.2.8568313"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
+          cargo install cargo-ndk --locked
+
+      # ReactiveCircus/android-emulator-runner needs /dev/kvm group-accessible.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Cross-compile the generator to android-x86_64 against the committed
+      # android V8 archive. `--allow-multiple-definition` tolerates the handful
+      # of libc++ symbols defined in both V8 and (later) Skia archives; `-landroid`
+      # supplies AHardwareBuffer symbols. NOTE: unlike arm64, x86_64 does NOT need
+      # libclang_rt.builtins (no __clear_cache reference in cpu-x64.cc).
+      - name: Cross-compile snapshot-gen (x86_64-android)
+        working-directory: engine
+        run: |
+          export RUSTY_V8_ARCHIVE="$PWD/third_party/rusty_v8/x86_64/librusty_v8.a"
+          export RUSTY_V8_SRC_BINDING_PATH="$PWD/third_party/rusty_v8/x86_64/src_binding.rs"
+          export RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition -C link-arg=-landroid"
+          cargo ndk -t x86_64 --platform 26 build -p migo-snapshot-gen
+          # Stage libc++_shared.so next to the binary here (ANDROID_NDK_HOME is
+          # reliably set in this run-step) so the emulator-runner script below
+          # does not depend on it being propagated into the action's shell.
+          cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_shared.so" \
+             target/x86_64-linux-android/debug/libc++_shared.so
+
+      # Boot a hardware-accelerated x86_64 emulator and run the generator on it.
+      # IMPORTANT: android-emulator-runner executes each line of `script` as a
+      # SEPARATE `/usr/bin/sh -c <line>`. So: no cross-line shell variables (they
+      # don't persist), no `set ...` lines (no effect on later lines, and
+      # `set -o pipefail` is even illegal in dash). Each line is a self-contained
+      # command with literal paths. The action stops on the first failing line.
+      - name: Generate snapshot on x86_64 emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          arch: x86_64
+          target: default
+          force-avd-creation: false
+          emulator-options: -no-window -no-snapshot -noaudio -no-boot-anim -gpu swiftshader_indirect
+          disable-animations: true
+          script: |
+            adb push engine/target/x86_64-linux-android/debug/libc++_shared.so /data/local/tmp/libc++_shared.so
+            adb push engine/target/x86_64-linux-android/debug/migo-snapshot-gen /data/local/tmp/migo-snapshot-gen
+            adb shell chmod 755 /data/local/tmp/migo-snapshot-gen
+            adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp MIGO_SNAPSHOT_OUT=/data/local/tmp/SNAPSHOT.bin ./migo-snapshot-gen"
+            mkdir -p engine/crates/js-runtime/snapshots
+            adb pull /data/local/tmp/SNAPSHOT.bin engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin
+
+      - name: Inspect snapshot
+        run: |
+          f=engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin
+          ls -la "$f"
+          echo "size:  $(stat -c %s "$f") bytes"
+          echo "sha256:"; sha256sum "$f"
+
+      - name: Upload snapshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-x86_64
+          path: engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin
+          if-no-files-found: error

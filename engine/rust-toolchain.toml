@@ -1,5 +1,9 @@
 [toolchain]
-channel = "stable"
+# Pinned for a frozen, reproducible build chain. rustc 1.95.0 ships LLVM 22;
+# the Android .so links fine because `embed-bitcode=no` keeps fat-LTO inside
+# rustc (the NDK lld only ever sees native objects). Bump deliberately, not
+# via `rustup update`. See engine/.cargo/config.toml for the linker setup.
+channel = "1.95.0"
 
 components = ["rustfmt", "clippy"]
 

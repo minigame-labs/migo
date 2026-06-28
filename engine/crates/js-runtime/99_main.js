@@ -40,15 +40,17 @@ Object.defineProperty(globalThis, '_perf', {
 // (which use the _NON_WX exclusion list to stay off the wx namespace).
 installWxNamespace();
 
-// Remove deno_core's internal namespaces from the game-visible global.
-// `Deno` (full op surface) and `__bootstrap` are deno_core bootstrap internals
-// that game code must never see -- an audit dump of globalThis would otherwise
-// reveal the entire file/network op table. The host's op callbacks
-// (eventLoopTick, etc.) were captured as Rust handles during JsRuntime::new and
-// no longer read globalThis.Deno at runtime, so deleting here is safe.
+// NOTE: `delete globalThis.Deno` / `delete globalThis.__bootstrap` are NOT done
+// here. This module is baked into the V8 startup snapshot, and deno_core's
+// snapshot RESTORE path re-runs `store_js_callbacks` unconditionally, reading
+// `Deno.core.{ops,eventLoopTick,buildCustomError,runImmediateCallbacks}` back
+// out of the snapshotted heap. Deleting `Deno` here removes those from the
+// snapshot, so restore would panic ("Deno is not defined" / "unable to
+// convert"). Following deno's own pattern, this game-visible-global hardening
+// runs at RUNTIME after the runtime is constructed (snapshot-restored or not),
+// in `HostJsRuntime::new` -> `harden_global_scope()`, so it is never captured
+// in the snapshot. Game code still never sees `Deno`/`__bootstrap`.
 // (Engine JS uses `import { core } from "ext:core/mod.js"`, never global Deno.)
-delete globalThis.Deno;
-delete globalThis.__bootstrap;
 
 // Move host-bridge hooks (_internal*) off the game-visible global onto a
 // Symbol-keyed holder. These are the engine's event-pump entry points the

@@ -9,17 +9,16 @@
 //!
 //! # How it works
 //!
-//! 1. **Build-time** -- the `migo-snapshot-gen` binary creates a snapshot:
-//!    ```text
-//!    cargo run -p migo-snapshot-gen
-//!    ```
+//! 1. **Build-time** -- the `migo-snapshot-gen` binary creates a snapshot.
 //!    It calls [`lazy_extensions()`] to get extensions with JS but without
 //!    runtime state, feeds them to `deno_core::create_snapshot()`, and writes
-//!    the output to `SNAPSHOT.bin`.
+//!    the output to `snapshots/SNAPSHOT-<arch>.bin`. Because snapshots are
+//!    platform-bound, the generator is cross-compiled to each Android ABI and
+//!    run on that ABI's emulator/device (see `crates/snapshot-gen`).
 //!
-//! 2. **Compile-time** -- `SNAPSHOT.bin` is embedded via `include_bytes!`.
-//!    Release builds require the snapshot (compile error if missing).
-//!    Debug builds allow fallback to JS source loading for faster iteration.
+//! 2. **Compile-time** -- for android targets, `build.rs` picks
+//!    `snapshots/SNAPSHOT-<target arch>.bin` and embeds it via `include_bytes!`.
+//!    Missing snapshot or host builds fall back to JS source loading.
 //!
 //! 3. **Runtime** -- `HostJsRuntime::new()` passes the snapshot bytes to
 //!    `RuntimeOptions::startup_snapshot`.  Extensions are created via
@@ -50,18 +49,22 @@ use crate::{payment, share};
 
 /// Embedded snapshot bytes.
 ///
-/// Currently disabled: the Android V8 is a custom termux-packages build
-/// whose internal configuration (pointer compression, sandbox flags, etc.)
-/// differs from the official denoland/rusty_v8 releases.  Since the
-/// official releases don't include `aarch64-linux-android` targets,
-/// cross-platform snapshot generation is not yet feasible.
+/// Snapshots are produced by `migo-snapshot-gen` (cross-compiled to a target
+/// ABI and run on that ABI's emulator/device) and stored per-arch under
+/// `snapshots/SNAPSHOT-<arch>.bin`. V8 startup snapshots are **platform-bound**
+/// (OS + CPU arch): an android-<arch> snapshot only loads in that exact
+/// android-<arch> V8, so `build.rs` embeds the file matching
+/// `CARGO_CFG_TARGET_ARCH` and ONLY for android targets. Host builds
+/// (`cargo test`, dev) never embed and fall back to loading extension JS from
+/// source.
 ///
-/// When a compatible V8 build is available for both host and Android,
-/// re-enable by using `include_bytes!("SNAPSHOT.bin")` gated behind
-/// `migo_has_snapshot` cfg.
-///
-/// The snapshot generator (`migo-snapshot-gen`) and build infrastructure
-/// (`build-snapshot.ps1`) are kept in place for future use.
+/// When the matching snapshot exists, `build.rs` sets the `migo_has_snapshot`
+/// cfg + `MIGO_SNAPSHOT_PATH` and we embed it via `include_bytes!`; otherwise
+/// `SNAPSHOT_BYTES` is `None` (from-source fallback, slower cold start).
+#[cfg(migo_has_snapshot)]
+pub static SNAPSHOT_BYTES: Option<&'static [u8]> = Some(include_bytes!(env!("MIGO_SNAPSHOT_PATH")));
+
+#[cfg(not(migo_has_snapshot))]
 pub static SNAPSHOT_BYTES: Option<&'static [u8]> = None;
 
 /// Create all extensions in **lazy-init** mode (JS loaded, ops registered,

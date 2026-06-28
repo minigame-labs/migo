@@ -6,13 +6,21 @@
 //!
 //! # Usage
 //!
+//! Snapshots are platform-bound (OS + CPU arch), so this generator must be
+//! cross-compiled to a target Android ABI and run on that ABI's emulator
+//! (x86_64) or device (arm64):
+//!
 //! ```bash
-//! # From engine/ directory:
-//! cargo run -p migo-snapshot-gen
+//! # Cross-compile to the target ABI (see crates/js-runtime memory notes for
+//! # the exact RUSTY_V8_ARCHIVE / cargo-ndk invocation), push to the device,
+//! # then run with MIGO_SNAPSHOT_OUT and `adb pull` the result into
+//! # crates/js-runtime/snapshots/SNAPSHOT-<arch>.bin.
 //! ```
 //!
-//! This writes `crates/js-runtime/SNAPSHOT.bin`.  The snapshot is always
-//! embedded at compile time — release builds fail without it.
+//! When run without `MIGO_SNAPSHOT_OUT`, it writes to
+//! `crates/js-runtime/snapshots/SNAPSHOT-<arch>.bin` (arch = the ABI this
+//! binary was compiled for). `js-runtime/build.rs` embeds the matching file
+//! for android targets at compile time.
 //!
 //! # When to regenerate
 //!
@@ -56,15 +64,31 @@ fn main() {
     )
     .expect("Failed to create V8 snapshot");
 
-    // Write raw snapshot to js-runtime crate directory.
-    let snapshot_path: PathBuf = [
-        env!("CARGO_MANIFEST_DIR"),
-        "..",
-        "js-runtime",
-        "SNAPSHOT.bin",
-    ]
-    .iter()
-    .collect();
+    // Output path. MIGO_SNAPSHOT_OUT overrides the default — required when the
+    // generator runs cross-compiled on a device/emulator (V8 startup snapshots
+    // are platform-bound, so each ABI's snapshot must be produced by the SAME
+    // android V8 the .so links), where the host CARGO_MANIFEST_DIR doesn't
+    // exist: write to e.g. /data/local/tmp/SNAPSHOT.bin then `adb pull` it into
+    // `crates/js-runtime/snapshots/SNAPSHOT-<arch>.bin`.
+    //
+    // The default path is per-arch (`std::env::consts::ARCH` is the arch this
+    // generator was compiled for), matching what `js-runtime/build.rs` selects.
+    let snapshot_path: PathBuf = match std::env::var_os("MIGO_SNAPSHOT_OUT") {
+        Some(p) => PathBuf::from(p),
+        None => [
+            env!("CARGO_MANIFEST_DIR"),
+            "..",
+            "js-runtime",
+            "snapshots",
+            &format!("SNAPSHOT-{}.bin", std::env::consts::ARCH),
+        ]
+        .iter()
+        .collect(),
+    };
+
+    if let Some(dir) = snapshot_path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
 
     let snapshot_data = &*output.output;
     std::fs::write(&snapshot_path, snapshot_data).expect("Failed to write SNAPSHOT.bin");

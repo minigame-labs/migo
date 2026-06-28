@@ -299,7 +299,13 @@ build_platform() {
     # occurrence, which is safe (identical NDK ABI) but lld defaults to
     # erroring.  The flag only needs to exist on the final link of
     # libmigo.so, which happens inside the cargo invocation below.
-    local common_rustflags="-C link-arg=-Wl,--allow-multiple-definition"
+    # `embed-bitcode=no` must be repeated here: exporting RUSTFLAGS below
+    # OVERRIDES (does not merge with) config.toml's [target] rustflags, so the
+    # config's embed-bitcode=no would be dropped — and a fresh v8 crate build
+    # then emits an LLVM-bitcode binding.o that the NDK lld cannot link
+    # ("Invalid value (Producer: 'LLVM..' Reader: 'LLVM..')"). Normally hidden
+    # because the v8 crate is cached; surfaces after `cargo clean -p v8`.
+    local common_rustflags="-C link-arg=-Wl,--allow-multiple-definition -C embed-bitcode=no"
 
     if [[ "$platform" == "arm64-v8a" ]]; then
         local builtins

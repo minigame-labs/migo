@@ -158,6 +158,12 @@ impl HostJsRuntime {
             startup_snapshot: snapshot_bytes,
             extension_code_cache,
             shared_array_buffer_store: Some(sab_store.clone()),
+            // Ops are already registered inside the snapshot. Without this,
+            // InitMode::FromSnapshot{skip_op_registration:false} makes deno_core
+            // re-bind ops via initialize_deno_core_ops_bindings → get(Deno.core.ops),
+            // which panics ("unable to convert"). We trust the snapshot's ops;
+            // per-extension state is restored below via lazy_init_extensions().
+            skip_op_registration: use_snapshot,
             ..Default::default()
         });
         let t_rt_created = Instant::now();
@@ -187,6 +193,13 @@ impl HostJsRuntime {
                 t_rt_created.elapsed().as_secs_f64() * 1000.0,
             );
         }
+
+        // Harden the game-visible global scope: remove deno_core's bootstrap
+        // internals (`Deno`, `__bootstrap`) at RUNTIME, for BOTH the snapshot and
+        // non-snapshot paths. This is intentionally not done in the bootstrap
+        // module (99_main.js) so `Deno.core` survives in the V8 startup snapshot
+        // for deno_core's restore path. See `crate::harden_global_scope`.
+        crate::harden_global_scope(&mut rt);
 
         // Register near-heap-limit callback that terminates execution on OOM
         #[cfg(feature = "v8-limits")]

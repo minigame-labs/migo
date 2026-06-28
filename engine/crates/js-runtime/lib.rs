@@ -293,3 +293,31 @@ pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
 
     exts
 }
+
+/// Harden the game-visible global scope by removing deno_core's bootstrap
+/// internals (`Deno` op surface, `__bootstrap`) so game code can never see them.
+///
+/// Call this ONCE, at runtime, after a *main* runtime is fully constructed
+/// (snapshot-restored or built from source). It is deliberately NOT performed
+/// inside the bootstrap module (99_main.js): that module is captured in the V8
+/// startup snapshot, and deno_core's snapshot RESTORE re-runs
+/// `store_js_callbacks`, reading `Deno.core.{ops,eventLoopTick,buildCustomError,
+/// runImmediateCallbacks}` back out of the snapshotted heap. If `Deno` were
+/// deleted before the snapshot was taken, restore would panic ("Deno is not
+/// defined" / "unable to convert"). Deferring the deletion to here keeps
+/// `Deno.core` intact in the snapshot while still hiding it from games — the
+/// same approach deno's own runtime uses (hardening runs at startup, not in the
+/// snapshot).
+///
+/// Workers do not use the snapshot, so they delete `Deno` directly in their
+/// bootstrap (`99_worker_main.js`) and do not call this.
+pub fn harden_global_scope(rt: &mut deno_core::JsRuntime) {
+    if let Err(e) = rt.execute_script(
+        "ext:runtime/harden_global.js",
+        deno_core::FastString::from_static(
+            "delete globalThis.Deno; delete globalThis.__bootstrap;",
+        ),
+    ) {
+        tracing::error!("failed to harden global scope (Deno/__bootstrap not removed): {e}");
+    }
+}
