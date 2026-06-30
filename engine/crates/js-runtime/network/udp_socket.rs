@@ -263,17 +263,9 @@ pub async fn op_udp_send(
     let bytes: Vec<u8> = if let Some(ref text) = data_str {
         text.as_bytes().to_vec()
     } else if let Some(ref buf) = data_buf {
-        let off = offset as usize;
-        let len = if length == 0 {
-            buf.len().saturating_sub(off)
-        } else {
-            length as usize
-        };
-        let end = (off + len).min(buf.len());
-        if off >= buf.len() {
-            return Err(JsErrorBox::generic("send:fail offset out of bounds"));
-        }
-        buf[off..end].to_vec()
+        let (start, end) = udp_send_range(buf.len(), offset as usize, length as usize)
+            .map_err(|e| JsErrorBox::generic(format!("send:fail {}", e)))?;
+        buf[start..end].to_vec()
     } else {
         return Err(JsErrorBox::type_error("send:fail no data provided"));
     };
@@ -390,4 +382,72 @@ pub fn op_udp_close(state: &mut OpState, #[smi] rid: ResourceId) -> Result<(), J
         .map_err(|_| JsErrorBox::generic("UDPSocket not found"))?;
     resource.close();
     Ok(())
+}
+
+/// Resolve the `[start, end)` slice of an outbound UDP payload for the
+/// given `offset` / `length`.
+///
+/// Rejects out-of-bounds requests instead of silently clamping (the old
+/// `(off + len).min(buf.len())` quietly sent fewer bytes than the caller
+/// asked for, and `off + len` could overflow on 32-bit targets).
+/// `length == 0` means "from `offset` to the end of the buffer".
+fn udp_send_range(
+    buf_len: usize,
+    offset: usize,
+    length: usize,
+) -> Result<(usize, usize), &'static str> {
+    if offset > buf_len {
+        return Err("offset out of bounds");
+    }
+    let end = if length == 0 {
+        buf_len
+    } else {
+        let end = offset.checked_add(length).ok_or("length overflow")?;
+        if end > buf_len {
+            return Err("offset+length out of bounds");
+        }
+        end
+    };
+    Ok((offset, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::udp_send_range;
+
+    #[test]
+    fn length_zero_means_offset_to_end() {
+        assert_eq!(udp_send_range(10, 0, 0), Ok((0, 10)));
+        assert_eq!(udp_send_range(10, 3, 0), Ok((3, 10)));
+    }
+
+    #[test]
+    fn explicit_length_within_bounds() {
+        assert_eq!(udp_send_range(10, 0, 10), Ok((0, 10)));
+        assert_eq!(udp_send_range(10, 2, 5), Ok((2, 7)));
+    }
+
+    #[test]
+    fn offset_at_end_sends_empty_slice() {
+        assert_eq!(udp_send_range(10, 10, 0), Ok((10, 10)));
+        assert_eq!(udp_send_range(0, 0, 0), Ok((0, 0)));
+    }
+
+    #[test]
+    fn rejects_offset_past_buffer() {
+        assert!(udp_send_range(10, 11, 0).is_err());
+    }
+
+    #[test]
+    fn rejects_offset_plus_length_past_buffer_instead_of_clamping() {
+        // Regression: this used to clamp to buf.len() and silently send
+        // fewer bytes than requested.
+        assert!(udp_send_range(10, 5, 10).is_err());
+        assert!(udp_send_range(10, 0, 11).is_err());
+    }
+
+    #[test]
+    fn rejects_overflowing_length_without_panicking() {
+        assert_eq!(udp_send_range(10, 4, usize::MAX), Err("length overflow"));
+    }
 }

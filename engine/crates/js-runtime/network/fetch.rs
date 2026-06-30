@@ -824,6 +824,22 @@ pub struct FetchUploadResult {
     pub error: Option<String>,
 }
 
+/// Create a cancel handle for an in-flight `uploadFile`.
+///
+/// The JS layer gets the rid back immediately (before it awaits
+/// `op_fetch_upload`), stores it on the upload task, and `abort()` closes
+/// it — closing the resource cancels the upload future via
+/// [`FetchCancelHandle::close`]. Mirrors the cancel handle `op_fetch`
+/// hands back for `downloadFile`, which previously had no analogue for
+/// uploads (so `UploadTask.abort()` could not stop an in-flight request).
+#[op2(fast)]
+#[smi]
+pub fn op_fetch_upload_cancel_handle(state: &mut OpState) -> ResourceId {
+    state
+        .resource_table
+        .add(FetchCancelHandle(CancelHandle::new_rc()))
+}
+
 /// Streaming multipart upload.
 ///
 /// The JS caller passes the **virtual path** of the file to upload
@@ -838,6 +854,7 @@ pub struct FetchUploadResult {
 #[allow(clippy::too_many_arguments)]
 pub async fn op_fetch_upload(
     state: Rc<RefCell<OpState>>,
+    #[smi] cancel_rid: ResourceId,
     #[string] url: String,
     #[string] file_path: String,
     #[string] name: String,
@@ -957,34 +974,56 @@ pub async fn op_fetch_upload(
     }
     request = request.headers(header_map);
 
-    // Send request
-    let res = match request.send().await {
-        Ok(res) => res,
-        Err(err) => {
-            return Ok(FetchUploadResult {
-                error: Some(err.to_string()),
-                ..Default::default()
-            });
-        }
+    // Look up the JS-provided cancel handle so `UploadTask.abort()`
+    // (which closes the handle's resource) interrupts the in-flight
+    // upload. A missing handle (already closed, or never created) simply
+    // means "not cancellable" and the exchange runs to completion.
+    let cancel_handle = {
+        let st = state.borrow();
+        st.resource_table
+            .get::<FetchCancelHandle>(cancel_rid)
+            .ok()
+            .map(|h| h.0.clone())
     };
 
-    // Extract response
-    let status = res.status().as_u16();
-    let mut res_headers = Vec::new();
-    for (key, val) in res.headers().iter() {
-        res_headers.push((key.as_str().into(), val.as_bytes().into()));
+    // Drive send + response read as one cancellable unit.
+    let exchange = async move {
+        let res = request.send().await?;
+        let status = res.status().as_u16();
+        let mut res_headers = Vec::new();
+        for (key, val) in res.headers().iter() {
+            res_headers.push((key.as_str().into(), val.as_bytes().into()));
+        }
+        let body = res.text().await?;
+        Ok::<FetchUploadResult, reqwest::Error>(FetchUploadResult {
+            data: body,
+            status_code: status,
+            headers: res_headers,
+            total_bytes_sent: file_size,
+            error: None,
+        })
+    };
+
+    let outcome = match cancel_handle {
+        Some(c) => match exchange.or_cancel(c).await {
+            Ok(inner) => inner,
+            Err(_canceled) => {
+                return Ok(FetchUploadResult {
+                    error: Some("uploadFile:fail aborted".to_string()),
+                    ..Default::default()
+                });
+            }
+        },
+        None => exchange.await,
+    };
+
+    // Network / decode errors surface through the result's `error` field
+    // (same contract as the send-error path) rather than throwing.
+    match outcome {
+        Ok(result) => Ok(result),
+        Err(err) => Ok(FetchUploadResult {
+            error: Some(err.to_string()),
+            ..Default::default()
+        }),
     }
-
-    let body = res
-        .text()
-        .await
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
-
-    Ok(FetchUploadResult {
-        data: body,
-        status_code: status,
-        headers: res_headers,
-        total_bytes_sent: file_size,
-        error: None,
-    })
 }

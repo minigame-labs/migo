@@ -3,22 +3,17 @@
 //! Provides two ops:
 //!
 //! - `op_prefetch_dns`: Takes a JSON array of hostnames and pre-resolves them
-//!   in the background, warming both the in-process DNS cache and the OS
-//!   resolver cache.
+//!   in the background, warming the OS resolver cache.
 //!
 //! - `op_prefetch_assets`: Takes a JSON array of URLs and fires off background
-//!   HTTP GET requests. Responses are stored in an in-process memory cache
-//!   keyed by URL. Subsequent `fetch()` calls do NOT automatically hit this
-//!   cache (that would add complexity); the main benefit is warming the HTTP
-//!   connection pool and the DNS cache.
+//!   HTTP GET requests purely to warm the HTTP connection pool and the OS DNS
+//!   cache. Responses are NOT cached in-process — `fetch()` re-requests
+//!   normally — so prefetch never pins asset bytes in memory.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use bytes::Bytes;
 use deno_core::OpState;
 use deno_core::op2;
 use deno_core::serde_json;
@@ -32,64 +27,12 @@ use super::fetch::get_or_create_client_from_state;
 /// Maximum number of concurrent prefetch requests.
 const MAX_CONCURRENT_PREFETCH: usize = 6;
 
-/// Maximum response body size to cache (1 MB).
-const MAX_CACHED_BODY: usize = 1024 * 1024;
-
-/// TTL for cached prefetch responses (5 minutes).
-const PREFETCH_CACHE_TTL: Duration = Duration::from_secs(300);
-
-/// Maximum number of cached prefetch entries.
-const MAX_CACHE_ENTRIES: usize = 64;
-
-// ---------------------------------------------------------------------------
-// Prefetch response cache
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-struct CachedResponse {
-    status: u16,
-    body: Bytes,
-    expires: Instant,
-}
-
-static PREFETCH_CACHE: Mutex<Option<HashMap<String, CachedResponse>>> = Mutex::new(None);
-
-/// Look up a URL in the prefetch cache.
-///
-/// Returns `Some((status, body))` if the URL was prefetched, the entry is not
-/// expired, and the body was small enough to cache.
-#[allow(dead_code)]
-pub(crate) fn prefetch_cache_lookup(url: &str) -> Option<(u16, Bytes)> {
-    let guard = PREFETCH_CACHE.lock().ok()?;
-    let cache = guard.as_ref()?;
-    let entry = cache.get(url)?;
-    if Instant::now() >= entry.expires {
-        return None;
-    }
-    Some((entry.status, entry.body.clone()))
-}
-
-fn prefetch_cache_insert(url: String, status: u16, body: Bytes) {
-    if let Ok(mut guard) = PREFETCH_CACHE.lock() {
-        let cache = guard.get_or_insert_with(HashMap::new);
-        // Evict expired entries if at capacity
-        if cache.len() >= MAX_CACHE_ENTRIES {
-            let now = Instant::now();
-            cache.retain(|_, e| now < e.expires);
-        }
-        if cache.len() >= MAX_CACHE_ENTRIES {
-            return;
-        }
-        cache.insert(
-            url,
-            CachedResponse {
-                status,
-                body,
-                expires: Instant::now() + PREFETCH_CACHE_TTL,
-            },
-        );
-    }
-}
+/// Largest response body we will drain during a prefetch. Draining a
+/// small body lets the HTTP/1.1 connection return to the pool warm;
+/// larger bodies are left unread (the TCP/TLS handshake is already warmed
+/// and pulling a multi-megabyte asset we will not keep would only waste
+/// bandwidth). Bodies are never stored — see the module note above.
+const MAX_DRAIN_BODY: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // op_prefetch_dns
@@ -113,6 +56,23 @@ pub fn op_prefetch_dns(#[string] hosts_json: String) -> Result<(), JsErrorBox> {
     debug!("prefetchDns: pre-resolving {} hosts", hosts.len());
     dns_cache::pre_resolve(hosts);
     Ok(())
+}
+
+/// Partition `items` into sequential batches, each at most
+/// `max_in_flight` long, preserving order and including **every** item.
+///
+/// `op_prefetch_assets` uses this to bound how many prefetch requests are
+/// in flight at once without dropping URLs: it spawns one batch, awaits
+/// it, then moves on to the next. A `max_in_flight` of `0` degrades to
+/// one-at-a-time rather than panicking in `slice::chunks(0)`.
+fn concurrency_batches<T: Clone>(items: &[T], max_in_flight: usize) -> Vec<Vec<T>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    items
+        .chunks(max_in_flight.max(1))
+        .map(|c| c.to_vec())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -172,83 +132,71 @@ pub async fn op_prefetch_assets(
         return Ok(());
     }
 
-    // Limit concurrency
-    let batch_size = valid_urls.len().min(MAX_CONCURRENT_PREFETCH);
-    let urls_to_fetch = &valid_urls[..batch_size];
-
     debug!(
-        "prefetchAssets: fetching {} URLs (of {} requested)",
-        batch_size,
-        valid_urls.len()
+        "prefetchAssets: fetching {} URLs (max {} in flight)",
+        valid_urls.len(),
+        MAX_CONCURRENT_PREFETCH
     );
 
-    // Spawn all prefetches and collect handles
-    let mut handles = Vec::with_capacity(batch_size);
-    for url in urls_to_fetch {
-        let client = client.clone();
-        let url = url.clone();
-        let handle = tokio::spawn(async move {
-            let url_str = url.to_string();
-            match client
-                .get(url)
-                .timeout(Duration::from_secs(30))
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    // Only cache small successful responses
-                    if status >= 200 && status < 400 {
-                        if let Some(len) = resp.content_length() {
-                            if len as usize > MAX_CACHED_BODY {
-                                // Too large to cache, but connection is warmed
-                                debug!(
-                                    "prefetchAssets: {} -> {} (too large to cache: {} bytes)",
-                                    url_str, status, len
-                                );
-                                return;
-                            }
-                        }
-                        match resp.bytes().await {
-                            Ok(body) if body.len() <= MAX_CACHED_BODY => {
-                                debug!(
-                                    "prefetchAssets: {} -> {} ({} bytes cached)",
-                                    url_str,
-                                    status,
-                                    body.len()
-                                );
-                                prefetch_cache_insert(url_str, status, body);
-                            }
-                            Ok(body) => {
-                                debug!(
-                                    "prefetchAssets: {} -> {} ({} bytes, too large)",
-                                    url_str,
-                                    status,
-                                    body.len()
-                                );
-                            }
-                            Err(e) => {
-                                debug!("prefetchAssets: {} body read error: {}", url_str, e);
-                            }
-                        }
-                    } else {
-                        debug!("prefetchAssets: {} -> {} (not cached)", url_str, status);
-                    }
-                }
-                Err(e) => {
-                    debug!("prefetchAssets: {} fetch error: {}", url_str, e);
-                }
-            }
-        });
-        handles.push(handle);
-    }
-
-    // Wait for all prefetch tasks to complete
-    for handle in handles {
-        let _ = handle.await;
+    // Fetch EVERY valid URL, capping how many run at once. This path
+    // used to truncate to the first MAX_CONCURRENT_PREFETCH URLs and
+    // silently drop the rest; batching keeps the concurrency bound while
+    // still warming all of the requested assets.
+    for batch in concurrency_batches(&valid_urls, MAX_CONCURRENT_PREFETCH) {
+        let mut handles = Vec::with_capacity(batch.len());
+        for url in batch {
+            handles.push(tokio::spawn(prefetch_one(client.clone(), url)));
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 
     Ok(())
+}
+
+/// Fetch a single prefetch URL and, when the response is small and
+/// successful, store it in the in-process prefetch cache. Errors are
+/// swallowed: prefetch is best-effort warmup and must never surface a
+/// failure to the calling game.
+async fn prefetch_one(client: reqwest::Client, url: Url) {
+    let url_str = url.to_string();
+    match client
+        .get(url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            // Drain a small successful body so the HTTP/1.1 connection
+            // returns to the pool warm; large bodies are skipped (the
+            // handshake is already warmed). Nothing is stored either way.
+            let drain = (200..400).contains(&status)
+                && resp
+                    .content_length()
+                    .is_none_or(|len| len as usize <= MAX_DRAIN_BODY);
+            if drain {
+                match resp.bytes().await {
+                    Ok(body) => debug!(
+                        "prefetchAssets: {} -> {} ({} bytes, warmed)",
+                        url_str,
+                        status,
+                        body.len()
+                    ),
+                    Err(e) => debug!("prefetchAssets: {} body read error: {}", url_str, e),
+                }
+            } else {
+                debug!(
+                    "prefetchAssets: {} -> {} (warmed, body not drained)",
+                    url_str, status
+                );
+            }
+        }
+        Err(e) => {
+            debug!("prefetchAssets: {} fetch error: {}", url_str, e);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -256,17 +204,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_insert_and_lookup() {
-        let url = "https://example.com/asset.png".to_string();
-        let body = Bytes::from_static(b"fake png data");
-        prefetch_cache_insert(url.clone(), 200, body.clone());
-        let (status, cached_body) = prefetch_cache_lookup(&url).unwrap();
-        assert_eq!(status, 200);
-        assert_eq!(cached_body, body);
+    fn batches_cover_every_item_without_dropping() {
+        // Regression: `op_prefetch_assets` used to fetch only the first
+        // `MAX_CONCURRENT_PREFETCH` URLs and silently drop the rest. The
+        // batching helper must schedule EVERY url, in order, while still
+        // bounding how many run at once.
+        let items: Vec<u32> = (0..20).collect();
+        let batches = concurrency_batches(&items, 6);
+
+        let flat: Vec<u32> = batches.iter().flatten().copied().collect();
+        assert_eq!(flat, items, "no item may be dropped");
+        assert!(
+            batches.iter().all(|b| b.len() <= 6),
+            "each batch must respect the concurrency bound"
+        );
+        assert_eq!(batches.len(), 4, "20 items / 6 per batch => 6+6+6+2");
     }
 
     #[test]
-    fn cache_miss_returns_none() {
-        assert!(prefetch_cache_lookup("https://missing.example.com/x").is_none());
+    fn batches_handle_empty_and_singletons() {
+        assert!(concurrency_batches::<u32>(&[], 6).is_empty());
+        assert_eq!(concurrency_batches(&[42u32], 6), vec![vec![42]]);
+    }
+
+    #[test]
+    fn batches_never_divide_by_zero() {
+        // A zero bound must not panic via `slice::chunks(0)`; it degrades
+        // to one-at-a-time rather than dropping or crashing.
+        let items: Vec<u32> = (0..3).collect();
+        let batches = concurrency_batches(&items, 0);
+        let flat: Vec<u32> = batches.iter().flatten().copied().collect();
+        assert_eq!(flat, items);
+        assert!(batches.iter().all(|b| b.len() <= 1));
     }
 }

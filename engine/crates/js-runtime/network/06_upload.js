@@ -5,7 +5,7 @@ import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 import {
     UploadResponse, UploadErrorResponse, Exception, abortedNetworkError,
 } from "ext:host_v8_network/02_response.js";
-import { op_fetch_upload } from "ext:core/ops";
+import { op_fetch_upload, op_fetch_upload_cancel_handle } from "ext:core/ops";
 
 const { TypeError } = primordials;
 
@@ -86,9 +86,23 @@ function uploadFile(options = {}) {
     const formEntries = Object.entries(formData).map(([key, value]) => [key, String(value)]);
     const filename = extractFilename(filePath);
 
+    // Create a cancel handle up front so abort() can interrupt the
+    // in-flight request: closing this resource cancels the Rust upload
+    // future (which wraps send+read in `.or_cancel`). Without it,
+    // abort() only flipped a flag and the upload kept running.
+    let cancelHandleRid = null;
+    try {
+        cancelHandleRid = op_fetch_upload_cancel_handle();
+    } catch (_) {
+        cancelHandleRid = null;
+    }
+
     const cancellation = {
         aborted: false,
-        abort() { this.aborted = true; }
+        abort() {
+            this.aborted = true;
+            if (cancelHandleRid !== null) core.tryClose(cancelHandleRid);
+        }
     };
 
     const uploadTask = new UploadTask(cancellation);
@@ -103,6 +117,7 @@ function uploadFile(options = {}) {
             uploadTask._triggerProgress(0, 0, 0);
 
             const result = await op_fetch_upload(
+                cancelHandleRid === null ? 0 : cancelHandleRid,
                 url,
                 filePath,
                 name,
@@ -148,6 +163,11 @@ function uploadFile(options = {}) {
                 fail(error);
                 complete(error);
             }
+        } finally {
+            // Release the cancel handle on every exit path (success,
+            // failure, or abort). tryClose is a no-op if abort() already
+            // closed it.
+            if (cancelHandleRid !== null) core.tryClose(cancelHandleRid);
         }
     })();
 

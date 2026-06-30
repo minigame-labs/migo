@@ -351,16 +351,12 @@ impl FileTable {
             file.seek(SeekFrom::Start(pos)).map_err(io_err)?;
         }
 
-        let mut buf = vec![0u8; len as usize];
-        let mut total = 0;
-        while total < buf.len() {
-            match file.read(&mut buf[total..]) {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(e) => return Err(io_err(e)),
-            }
-        }
-        buf.truncate(total);
+        // Read at most `len` bytes, growing the buffer as data actually
+        // arrives instead of reserving the full `len` up front. A small
+        // file read with a large `len` (capped at `MAX_READ_LENGTH`
+        // above) no longer allocates the whole cap and then truncates.
+        let mut buf = Vec::with_capacity((len as usize).min(64 * 1024));
+        file.take(len).read_to_end(&mut buf).map_err(io_err)?;
         Ok(buf)
     }
 
