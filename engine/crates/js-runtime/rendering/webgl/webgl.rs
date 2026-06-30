@@ -337,6 +337,7 @@ fn gl_cmd_has_heap_payload(cmd: &GLCmd) -> bool {
             | GLCmd::ShaderSource { .. }
             | GLCmd::GetUniformLocation { .. }
             | GLCmd::GetAttribLocation { .. }
+            | GLCmd::BindAttribLocation { .. }
             | GLCmd::GetUniformBlockIndex { .. }
             | GLCmd::Uniform1iv { .. }
             | GLCmd::Uniform2iv { .. }
@@ -778,6 +779,23 @@ pub fn op_get_attrib_location(
     .flatten()
     .map(|v| v as i32)
     .unwrap_or(-1)
+}
+
+#[op2(fast)]
+pub fn op_bind_attrib_location(
+    state: &mut OpState,
+    #[smi] program_id: u32,
+    #[smi] index: u32,
+    #[string] name: String,
+) {
+    queue_gl_fire_and_forget(
+        state,
+        GLCmd::BindAttribLocation {
+            program_id,
+            index,
+            name,
+        },
+    );
 }
 
 #[op2]

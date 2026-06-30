@@ -625,6 +625,22 @@ impl RendererGL {
                 Ok(DamageEffect::NoDamage)
             }
 
+            GLCmd::BindAttribLocation {
+                program_id,
+                index,
+                name,
+            } => {
+                let _ = self.bind_for_contextless_gl(cm)?;
+                if let Some(meta) = cm.programs.get(&program_id) {
+                    if !meta.deleted {
+                        if let Some(ph) = meta.gl_handle {
+                            unsafe { gl.bind_attrib_location(ph, index, &name) };
+                        }
+                    }
+                }
+                Ok(DamageEffect::NoDamage)
+            }
+
             GLCmd::GetProgramParameter {
                 program_id,
                 pname,

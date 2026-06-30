@@ -50,6 +50,7 @@ extension!(host_v8_webgl,
         op_draw_elements,
 
         op_get_attrib_location,
+        op_bind_attrib_location,
         op_get_active_attrib,
         op_get_active_uniform,
         op_enable_vertex_attrib_array,

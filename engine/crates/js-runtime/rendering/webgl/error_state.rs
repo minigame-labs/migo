@@ -91,7 +91,12 @@ impl Default for ContextAttributes {
             alpha: true,
             antialias: true,
             depth: true,
-            stencil: false,
+            // Our GL backend is fixed-format depth24 + stencil8 (see
+            // `record_context_attrs`), so an actual stencil buffer always
+            // exists. Reporting it (like `depth`) lets engine mask systems
+            // (Pixi/Cocos) use stencil masking instead of warning "does not
+            // have a stencil buffer, masks may not render correctly".
+            stencil: true,
             premultiplied_alpha: true,
             preserve_drawing_buffer: false,
             power_preference: PowerPreference::Default,

@@ -567,6 +567,14 @@ pub enum GLCmd {
         resp: RenderCmdResp<Option<u32>>,
     },
 
+    // Fire-and-forget: binds an attribute index for a program (takes effect on
+    // the next LinkProgram). Program-context op like LinkProgram — no canvas_id.
+    BindAttribLocation {
+        program_id: ProgramId,
+        index: u32,
+        name: String,
+    },
+
     GetActiveAttrib {
         canvas_id: CanvasId,
         program_id: ProgramId,
@@ -2031,7 +2039,8 @@ impl GLCmd {
             // so they have no outbound string payload.
             GLCmd::GetUniformLocation { name, .. }
             | GLCmd::GetAttribLocation { name, .. }
-            | GLCmd::GetUniformBlockIndex { name, .. } => name.capacity(),
+            | GLCmd::GetUniformBlockIndex { name, .. }
+            | GLCmd::BindAttribLocation { name, .. } => name.capacity(),
 
             // Buffer uploads — the dominant budget item for 3D games.
             // `BufferData.data` is optional (spec allows passing

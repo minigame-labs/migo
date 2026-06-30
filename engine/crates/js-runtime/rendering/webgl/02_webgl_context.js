@@ -19,6 +19,7 @@ import {
     op_draw_arrays,
     op_draw_elements,
     op_get_attrib_location,
+    op_bind_attrib_location,
     op_get_active_attrib,
     op_get_active_uniform,
     op_enable_vertex_attrib_array,
@@ -328,9 +329,9 @@ class WebGLRenderingContext {
         // Record the negotiated attributes so `getContextAttributes()`
         // returns real values instead of bare spec defaults.  We do
         // not actually negotiate (backend is fixed RGBA8 + depth24 +
-        // stencil8); the stored values are the flags the caller
-        // requested, with missing properties defaulted per WebGL
-        // 1.0 s5.2.1.
+        // stencil8) so depth + stencil always exist -- both default true,
+        // deviating from the WebGL 1.0 s5.2.1 stencil-defaults-false rule so
+        // engine mask systems (Pixi/Cocos) do not skip stencil masking.
         const opts = this._options;
         const powerPref =
             opts.powerPreference === "high-performance"
@@ -343,7 +344,7 @@ class WebGLRenderingContext {
             opts.alpha !== false, // default true
             opts.antialias !== false, // default true
             opts.depth !== false, // default true
-            opts.stencil === true, // default false
+            opts.stencil !== false, // default true: backend is fixed depth24+stencil8, so a stencil buffer always exists (engine mask systems check this attr)
             opts.premultipliedAlpha !== false, // default true
             opts.preserveDrawingBuffer === true, // default false
             powerPref,
@@ -548,6 +549,28 @@ class WebGLRenderingContext {
         return op_draw_elements(this._canvasId, mode, count, type, offset);
     }
 
+    bindAttribLocation(program, index, name) {
+        const programId = program?.id;
+        if (programId === undefined) return;
+        op_bind_attrib_location(programId, index >>> 0, name);
+        // Locations only change on the next link; drop any cached lookups.
+        this._attribLocationCache.delete(programId);
+    }
+
+    isContextLost() {
+        return false;
+    }
+
+    getShaderPrecisionFormat(_shaderType, precisionType) {
+        // Migo is a WebGL2 / GLES3 context: highp is guaranteed in both vertex
+        // and fragment shaders. Return spec-correct GLES3 values. Integer
+        // precision types are HIGH_INT/MEDIUM_INT/LOW_INT (0x8DF3..0x8DF5).
+        const isInt = precisionType >= 0x8df3 && precisionType <= 0x8df5;
+        return isInt
+            ? { rangeMin: 31, rangeMax: 30, precision: 0 }
+            : { rangeMin: 127, rangeMax: 127, precision: 23 };
+    }
+
     getAttribLocation(program, name) {
         const programId = program?.id;
         if (programId === undefined) return -1;
@@ -748,6 +771,15 @@ class WebGLRenderingContext {
             return this._webglCompressedAstc ||
                 (this._webglCompressedAstc = this._buildCompressedAstc());
         }
+        // 32-bit element indices are GLES 3.0 core (drawElements honors
+        // UNSIGNED_INT), so expose the WebGL 1 extension alias. Without it,
+        // engines (Pixi, three.js) assume 16-bit-only and cap batches at 65535
+        // indices ("does not support 32 index buffer"), forcing extra draw calls
+        // for large scenes. The extension object carries no methods -- its mere
+        // presence signals support.
+        if (name === 'OES_element_index_uint') {
+            return this._oesElementIndexUint || (this._oesElementIndexUint = {});
+        }
         return null;
     }
 
@@ -761,6 +793,7 @@ class WebGLRenderingContext {
             'EXT_instanced_arrays',
             'WEBGL_instanced_arrays',
             'WEBGL_draw_buffers',
+            'OES_element_index_uint',
         ];
         const caps = this._compressedCaps;
         if (caps & 1) {
@@ -1231,6 +1264,15 @@ class WebGLRenderingContext {
     }
 
     pixelStorei(pname, param) {
+        // UNPACK_FLIP_Y_WEBGL (0x9240), UNPACK_PREMULTIPLY_ALPHA_WEBGL (0x9241)
+        // and UNPACK_COLORSPACE_CONVERSION_WEBGL (0x9243) are WebGL-only -- GLES
+        // has no such glPixelStorei params, so forwarding them to the native
+        // glPixelStorei raises GL_INVALID_ENUM (0x500). Track flip-Y /
+        // premultiply as upload state (for the canvas/image texImage2D path to
+        // honor) instead of forwarding; colorspace conversion is a no-op.
+        if (pname === 0x9240) { this._unpackFlipY = !!param; return; }
+        if (pname === 0x9241) { this._unpackPremultiplyAlpha = !!param; return; }
+        if (pname === 0x9243) { return; }
         let value;
         if (param === true) value = 1;
         else if (param === false) value = 0;
