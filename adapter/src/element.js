@@ -42,6 +42,17 @@ export class Node extends EventTarget {
   }
 
   cloneNode() { return null; }
+
+  // `node.contains(other)` — engines (e.g. PixiJS CanvasSource) call
+  // `document.body.contains(canvas)` to decide if a canvas is live in the DOM.
+  contains(node) {
+    if (node == null) return false;
+    if (node === this) return true;
+    for (const c of this.children) {
+      if (c === node || (typeof c.contains === "function" && c.contains(node))) return true;
+    }
+    return false;
+  }
 }
 
 export class Element extends Node {
@@ -93,6 +104,27 @@ export class HTMLImageElement extends HTMLElement {
 
 export class HTMLCanvasElement extends HTMLElement {
   constructor() { super("canvas"); }
+
+  // `document.createElement('canvas')` / `new Canvas()` returns the native
+  // `migo.createCanvas()` object, which is NOT in this class hierarchy. Engines
+  // detect canvases via `resource instanceof HTMLCanvasElement` (e.g. PixiJS
+  // CanvasSource.test → otherwise "Could not find a source type for resource").
+  // Duck-type so a native migo canvas passes, while still accepting any real
+  // prototype-chain instance (Symbol.hasInstance replaces the default check).
+  static [Symbol.hasInstance](obj) {
+    if (obj == null) return false;
+    if (
+      typeof obj.getContext === "function" &&
+      typeof obj.width === "number" &&
+      typeof obj.height === "number"
+    ) {
+      return true;
+    }
+    for (let p = Object.getPrototypeOf(obj); p; p = Object.getPrototypeOf(p)) {
+      if (p === HTMLCanvasElement.prototype) return true;
+    }
+    return false;
+  }
 }
 
 export class HTMLAudioElement extends HTMLElement {

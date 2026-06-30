@@ -25,6 +25,7 @@ import localStorage from "./local-storage.js";
 import XMLHttpRequest from "./xhr.js";
 import WebSocket from "./websocket.js";
 import FileReader from "./file-reader.js";
+import Intl from "./intl.js";
 
 if (!globalThis.__migoAdapterInjected) {
   globalThis.__migoAdapterInjected = true;
@@ -75,6 +76,10 @@ if (!globalThis.__migoAdapterInjected) {
     XMLHttpRequest, WebSocket, FileReader,
     localStorage,
   };
+
+  // `Intl` is absent under Migo's no-i18n V8; provide the polyfill, but never
+  // clobber a real `Intl` (e.g. a future ICU-enabled build or a host browser).
+  if (!globalThis.Intl) surface.Intl = Intl;
 
   for (const key of Object.keys(surface)) {
     try {
