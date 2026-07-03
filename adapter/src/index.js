@@ -36,14 +36,25 @@ if (!globalThis.__migoAdapterInjected) {
   canvas.id = "GameCanvas";
   globalThis.canvas = canvas;
 
-  // 2. Forward host touch events to the canvas + document.
+  // 2. Forward host touch events to the canvas + document + window.
+  //    Browsers fire touch events on the target element AND they bubble to
+  //    document AND window, so games listen on any of the three. Migo's
+  //    globalThis has no native EventTarget, so back `window` with our own.
+  const _winTarget = new EventTarget();
   const _forward = (type) => (e) => {
-    const ev = { type, ...e, target: canvas };
+    // `type` must come AFTER `...e`: the host event may carry its own `type`
+    // field which would otherwise clobber the DOM event name and make
+    // `addEventListener('touchstart', ...)` never match.
+    const ev = { ...e, type, target: canvas };
     canvas.dispatchEvent && canvas.dispatchEvent(ev);
     document.dispatchEvent(ev);
-    // Also trigger document.ontouch* sinks if engines set those directly.
+    _winTarget.dispatchEvent(ev);
+    // Also trigger document.ontouch* / window.ontouch* sinks if engines set
+    // those directly.
     const sink = document["on" + type];
     if (typeof sink === "function") try { sink(ev); } catch {}
+    const wsink = globalThis["on" + type];
+    if (typeof wsink === "function") try { wsink(ev); } catch {}
   };
   if (typeof migo.onTouchStart === "function") migo.onTouchStart(_forward("touchstart"));
   if (typeof migo.onTouchMove === "function") migo.onTouchMove(_forward("touchmove"));
@@ -75,6 +86,11 @@ if (!globalThis.__migoAdapterInjected) {
     Image, Audio,
     XMLHttpRequest, WebSocket, FileReader,
     localStorage,
+    // window EventTarget surface (touch/resize/etc.). Games commonly do
+    // `window.addEventListener('touchstart', ...)`.
+    addEventListener: (type, listener, opts) => _winTarget.addEventListener(type, listener, opts),
+    removeEventListener: (type, listener, opts) => _winTarget.removeEventListener(type, listener, opts),
+    dispatchEvent: (event) => _winTarget.dispatchEvent(event),
   };
 
   // `Intl` is absent under Migo's no-i18n V8; provide the polyfill, but never

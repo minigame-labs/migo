@@ -1741,13 +1741,19 @@ impl CanvasManager {
                 )
             })?;
 
-            (
-                entry.physical_width,
-                entry.physical_height,
-                entry.kind,
-                entry.ctx.ctx,
-                entry.ctx.surf,
-            )
+            // The baseline for the *unset* dimension must be the CURRENT canvas
+            // buffer size, not the fixed EGL surface size.  For a window canvas
+            // that current size is the DrawingBuffer's; `physical_width/height`
+            // is the (immutable) surface size.  JS sets `canvas.width` and
+            // `canvas.height` in two separate ops (Pixi does), so if we used the
+            // surface size here, setting one dimension would reset the other to
+            // the surface size — corrupting the canvas (content renders into a
+            // corner of an over-sized DrawingBuffer instead of filling it).
+            let (cur_w, cur_h) = match (entry.kind, entry.drawing_buffer.as_ref()) {
+                (SurfaceKind::Window(_), Some(db)) => (db.width, db.height),
+                _ => (entry.physical_width, entry.physical_height),
+            };
+            (cur_w, cur_h, entry.kind, entry.ctx.ctx, entry.ctx.surf)
         };
 
         let new_w = w.unwrap_or(old_w);

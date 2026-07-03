@@ -549,20 +549,24 @@ pub fn update_color_mask(state: &mut CanvasGLState, r: bool, g: bool, b: bool, a
 /// `glEnableVertexAttribArray(index)`.  Returns `true` when the index
 /// isn't already tracked as enabled.
 pub fn update_enable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> bool {
-    if state.enabled_vertex_attribs.contains(&index) {
+    // Enable state is per-VAO: scope the shadow by the bound VAO so that
+    // re-enabling the same index on a different VAO still hits the driver.
+    let key = (state.bound_vao.unwrap_or(0), index);
+    if state.enabled_vertex_attribs.contains(&key) {
         return false;
     }
-    state.enabled_vertex_attribs.insert(index);
+    state.enabled_vertex_attribs.insert(key);
     true
 }
 
 /// `glDisableVertexAttribArray(index)`.  Returns `true` when the index
-/// was previously tracked as enabled.
+/// was previously tracked as enabled *for the currently bound VAO*.
 pub fn update_disable_vertex_attrib(state: &mut CanvasGLState, index: u32) -> bool {
-    if !state.enabled_vertex_attribs.contains(&index) {
+    let key = (state.bound_vao.unwrap_or(0), index);
+    if !state.enabled_vertex_attribs.contains(&key) {
         return false;
     }
-    state.enabled_vertex_attribs.remove(&index);
+    state.enabled_vertex_attribs.remove(&key);
     true
 }
 
@@ -617,10 +621,12 @@ pub fn update_vertex_attrib_pointer(
 /// `glVertexAttribDivisor(index, divisor)` dedup for WebGL 2 /
 /// instanced_arrays.  A cheap keyed-shadow check.
 pub fn update_vertex_attrib_divisor(state: &mut CanvasGLState, index: u32, divisor: u32) -> bool {
-    match state.vertex_attrib_divisor.get(&index).copied() {
+    // Divisor is per-VAO: scope the shadow by the bound VAO.
+    let key = (state.bound_vao.unwrap_or(0), index);
+    match state.vertex_attrib_divisor.get(&key).copied() {
         Some(cur) if cur == divisor => false,
         _ => {
-            state.vertex_attrib_divisor.insert(index, divisor);
+            state.vertex_attrib_divisor.insert(key, divisor);
             true
         }
     }
@@ -991,6 +997,33 @@ mod tests {
     }
 
     #[test]
+    fn enable_vertex_attrib_reissues_after_vao_change() {
+        // The enabled/disabled state of a vertex-attribute array lives
+        // INSIDE the bound VAO (GLES 3.0 §6.2 / WebGL 2).  Enabling attrib
+        // 0 on VAO 0, then binding VAO 2 (whose attrib 0 starts DISABLED)
+        // and enabling attrib 0 again MUST hit the driver — otherwise the
+        // newly-bound VAO draws with a disabled attribute (constant/zero
+        // vertex data), producing degenerate geometry that renders nothing.
+        // Regression test for the "draws with vertex attributes render
+        // nothing on real devices, but clear + gl_VertexID draws work" bug.
+        let mut s = fresh_state();
+        assert!(update_enable_vertex_attrib(&mut s, 0)); // VAO 0: issue
+        assert!(!update_enable_vertex_attrib(&mut s, 0)); // VAO 0: dedup
+        update_bind_vertex_array(&mut s, Some(2));
+        assert!(update_enable_vertex_attrib(&mut s, 0)); // VAO 2: MUST re-issue
+        assert!(!update_enable_vertex_attrib(&mut s, 0)); // VAO 2: dedup
+        // Back to VAO 0 — it still has attrib 0 enabled, so this dedups
+        // (per-VAO scoping, not a blunt clear-on-bind).
+        update_bind_vertex_array(&mut s, Some(0));
+        assert!(!update_enable_vertex_attrib(&mut s, 0));
+        // Disable is likewise VAO-scoped: disabling attrib 0 on VAO 0
+        // must not report a change for VAO 2 (already independent).
+        assert!(update_disable_vertex_attrib(&mut s, 0)); // VAO 0: was enabled
+        update_bind_vertex_array(&mut s, Some(2));
+        assert!(update_disable_vertex_attrib(&mut s, 0)); // VAO 2: was enabled
+    }
+
+    #[test]
     fn vertex_attrib_pointer_dedups_identical_layout() {
         let mut s = fresh_state();
         // First call always issues.
@@ -1257,6 +1290,19 @@ mod tests {
         assert!(!update_vertex_attrib_divisor(&mut s, 0, 1));
         assert!(update_vertex_attrib_divisor(&mut s, 0, 0));
         assert!(update_vertex_attrib_divisor(&mut s, 1, 1));
+    }
+
+    #[test]
+    fn vertex_attrib_divisor_reissues_after_vao_change() {
+        // Divisor is per-VAO too: the same (index, divisor) after binding
+        // a different VAO must hit the driver, or instanced draws on the
+        // new VAO inherit the wrong divisor.
+        let mut s = fresh_state();
+        assert!(update_vertex_attrib_divisor(&mut s, 0, 1)); // VAO 0: issue
+        assert!(!update_vertex_attrib_divisor(&mut s, 0, 1)); // VAO 0: dedup
+        update_bind_vertex_array(&mut s, Some(2));
+        assert!(update_vertex_attrib_divisor(&mut s, 0, 1)); // VAO 2: re-issue
+        assert!(!update_vertex_attrib_divisor(&mut s, 0, 1)); // VAO 2: dedup
     }
 
     #[test]

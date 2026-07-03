@@ -197,9 +197,16 @@ pub(crate) struct CanvasGLState {
     /// Last-bound renderbuffer id (glBindRenderbuffer only has one
     /// target, RENDERBUFFER).
     pub bound_renderbuffer: Option<Option<u32>>,
-    /// Which vertex-attribute array indices are enabled.  Keyed by
-    /// attribute index (0..=MAX_VERTEX_ATTRIBS-1); presence = enabled.
-    pub enabled_vertex_attribs: HashSet<u32>,
+    /// Which vertex-attribute array indices are enabled.  The enable
+    /// state of an attribute array lives INSIDE the bound VAO (GLES 3.0
+    /// §6.2 / WebGL 2), so this is keyed by `(vao, index)` — mirroring
+    /// [`Self::vertex_attrib_pointer_fp`].  `vao` is `bound_vao` (0 = the
+    /// default VAO).  Presence = enabled.  Keying by index alone would let
+    /// an `enableVertexAttribArray` on a freshly-bound VAO get deduped
+    /// away because a *different* VAO already had that index enabled,
+    /// leaving the new VAO's attribute disabled → draws fetch constant
+    /// vertex data → nothing renders.
+    pub enabled_vertex_attribs: HashSet<(u32, u32)>,
     /// Shadow for `glVertexAttribPointer`: keyed by `(vao, index)`,
     /// value is a fingerprint of (size, type, normalized, stride,
     /// offset, array_buffer).  A repeat call with identical
@@ -215,8 +222,11 @@ pub(crate) struct CanvasGLState {
     /// other VAO.
     pub vertex_attrib_pointer_fp: HashMap<(u32, u32), VertexAttribPointerFp>,
     /// `glVertexAttribDivisor(index, divisor)` shadow.  ANGLE / WebGL 2
-    /// games instancing sprites update this per attribute.
-    pub vertex_attrib_divisor: HashMap<u32, u32>,
+    /// games instancing sprites update this per attribute.  The divisor is
+    /// per-VAO state (GLES 3.0 §6.2), so this is keyed by `(vao, index)`
+    /// like [`Self::vertex_attrib_pointer_fp`] — keying by index alone
+    /// would dedup away a divisor set on a freshly-bound VAO.
+    pub vertex_attrib_divisor: HashMap<(u32, u32), u32>,
 
     // ---- Stencil state shadows (P14) ----------------------------------
     //
@@ -443,6 +453,13 @@ pub(crate) struct ProgramMeta {
     /// Shader IDs attached via `glAttachShader`.  Used by shader cache to
     /// reconstruct the cache key at link time.
     pub attached_shaders: Vec<ShaderId>,
+    /// `glBindAttribLocation(program, index, name)` bindings recorded since
+    /// the program was created.  These change the linked program's attribute
+    /// locations, so they MUST be part of the shader-binary cache key —
+    /// otherwise a re-link with new bindings (Pixi v8 sorts attributes and
+    /// re-links) loads a stale cached binary with the wrong locations, and
+    /// every vertex attribute reads the wrong stream.
+    pub attrib_bindings: Vec<(u32, String)>,
 }
 
 #[derive(Debug)]

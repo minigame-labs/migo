@@ -576,6 +576,7 @@ impl RendererGL {
                                     owner_canvas: owner,
                                     deleted: false,
                                     attached_shaders: Vec::new(),
+                                    attrib_bindings: Vec::new(),
                                 },
                             );
                         }
@@ -594,15 +595,28 @@ impl RendererGL {
                         if let Some(ph) = meta.gl_handle {
                             // Try shader cache: load pre-compiled binary to skip link.
                             let (vsrc, fsrc) = Self::get_program_shader_sources(cm, meta);
+                            // Attribute bindings are part of what determines the
+                            // linked binary's attribute locations, so they must be
+                            // in the cache key (sorted for a stable key).
+                            let attrib_key = {
+                                let mut ab = meta.attrib_bindings.clone();
+                                ab.sort();
+                                ab.iter()
+                                    .map(|(i, n)| format!("{i}={n};"))
+                                    .collect::<String>()
+                            };
                             let cache_hit = match (&cm.shader_cache, &vsrc, &fsrc) {
-                                (Some(cache), Some(vs), Some(fs)) => match cache.load(vs, fs) {
-                                    Some((format, buffer)) => {
-                                        let prog_binary = glow::ProgramBinary { format, buffer };
-                                        unsafe { gl.program_binary(ph, &prog_binary) };
-                                        unsafe { gl.get_program_link_status(ph) }
+                                (Some(cache), Some(vs), Some(fs)) => {
+                                    match cache.load(vs, fs, &attrib_key) {
+                                        Some((format, buffer)) => {
+                                            let prog_binary =
+                                                glow::ProgramBinary { format, buffer };
+                                            unsafe { gl.program_binary(ph, &prog_binary) };
+                                            unsafe { gl.get_program_link_status(ph) }
+                                        }
+                                        None => false,
                                     }
-                                    None => false,
-                                },
+                                }
                                 _ => false,
                             };
 
@@ -615,7 +629,7 @@ impl RendererGL {
                                     if let (Some(cache), Some(vs), Some(fs)) =
                                         (&cm.shader_cache, &vsrc, &fsrc)
                                     {
-                                        cache.save(gl, ph, vs, fs);
+                                        cache.save(gl, ph, vs, fs, &attrib_key);
                                     }
                                 }
                             }
@@ -631,11 +645,16 @@ impl RendererGL {
                 name,
             } => {
                 let _ = self.bind_for_contextless_gl(cm)?;
-                if let Some(meta) = cm.programs.get(&program_id) {
+                if let Some(meta) = cm.programs.get_mut(&program_id) {
                     if !meta.deleted {
                         if let Some(ph) = meta.gl_handle {
                             unsafe { gl.bind_attrib_location(ph, index, &name) };
                         }
+                        // Record the binding so it participates in the shader
+                        // binary cache key at (re-)link time.  Replace any prior
+                        // binding for the same index to mirror GL's last-wins.
+                        meta.attrib_bindings.retain(|(i, _)| *i != index);
+                        meta.attrib_bindings.push((index, name));
                     }
                 }
                 Ok(DamageEffect::NoDamage)

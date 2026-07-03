@@ -68,11 +68,16 @@ impl ShaderCache {
 
     /// Try to load a cached binary for the given shader source pair.
     /// Returns `Some(binary_format, binary_data)` on cache hit.
-    pub fn load(&self, vertex_src: &str, fragment_src: &str) -> Option<(u32, Vec<u8>)> {
+    pub fn load(
+        &self,
+        vertex_src: &str,
+        fragment_src: &str,
+        attrib_key: &str,
+    ) -> Option<(u32, Vec<u8>)> {
         if !self.supported {
             return None;
         }
-        let key = self.cache_key(vertex_src, fragment_src);
+        let key = self.cache_key(vertex_src, fragment_src, attrib_key);
         let path = self.cache_dir.join(&key);
 
         let data = std::fs::read(&path).ok()?;
@@ -93,6 +98,7 @@ impl ShaderCache {
         program: glow::NativeProgram,
         vertex_src: &str,
         fragment_src: &str,
+        attrib_key: &str,
     ) {
         if !self.supported {
             return;
@@ -101,7 +107,7 @@ impl ShaderCache {
             Some(v) => v,
             None => return,
         };
-        let key = self.cache_key(vertex_src, fragment_src);
+        let key = self.cache_key(vertex_src, fragment_src, attrib_key);
         let path = self.cache_dir.join(&key);
 
         // Prepend format as 4-byte LE header.
@@ -116,10 +122,14 @@ impl ShaderCache {
         }
     }
 
-    fn cache_key(&self, vertex_src: &str, fragment_src: &str) -> String {
+    fn cache_key(&self, vertex_src: &str, fragment_src: &str, attrib_key: &str) -> String {
         let mut hasher = DefaultHasher::new();
         vertex_src.hash(&mut hasher);
         fragment_src.hash(&mut hasher);
+        // Attribute bindings (glBindAttribLocation) change the linked binary's
+        // attribute locations, so they are part of the key.  Empty for programs
+        // that never call bindAttribLocation (keeps their key stable).
+        attrib_key.hash(&mut hasher);
         format!("{:016x}.bin", hasher.finish())
     }
 }

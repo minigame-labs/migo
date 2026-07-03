@@ -39,6 +39,24 @@ const WebglConstants = {
     ELEMENT_ARRAY_BUFFER: 34963,
     ARRAY_BUFFER_BINDING: 34964,
     ELEMENT_ARRAY_BUFFER_BINDING: 34965,
+    // WebGL 2.0 buffer targets (GLES 3.0). Pixi v8 delivers its batch
+    // projection matrix through a UNIFORM_BUFFER; without these constants
+    // `gl.UNIFORM_BUFFER` is undefined, so the UBO upload targets `undefined`
+    // and the shader never receives a projection -> geometry renders outside
+    // the clip volume -> nothing is visible.
+    UNIFORM_BUFFER: 35345,
+    UNIFORM_BUFFER_BINDING: 35368,
+    UNIFORM_BUFFER_OFFSET_ALIGNMENT: 35380,
+    COPY_READ_BUFFER: 36662,
+    COPY_WRITE_BUFFER: 36663,
+    COPY_READ_BUFFER_BINDING: 36662,
+    COPY_WRITE_BUFFER_BINDING: 36663,
+    PIXEL_PACK_BUFFER: 35051,
+    PIXEL_UNPACK_BUFFER: 35052,
+    PIXEL_PACK_BUFFER_BINDING: 35053,
+    PIXEL_UNPACK_BUFFER_BINDING: 35055,
+    TRANSFORM_FEEDBACK_BUFFER: 35982,
+    TRANSFORM_FEEDBACK_BUFFER_BINDING: 35983,
     STREAM_DRAW: 35040,
     STATIC_DRAW: 35044,
     DYNAMIC_DRAW: 35048,
