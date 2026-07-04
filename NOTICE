@@ -22,7 +22,7 @@ The following components are licensed under the MIT License:
 - hyper (https://hyper.rs/) - MIT
 - serde (https://serde.rs/) - MIT OR Apache-2.0
 - image (https://github.com/image-rs/image) - MIT OR Apache-2.0
-- femtovg (https://github.com/femtovg/femtovg) - MIT OR Apache-2.0
+- skia-safe, skia-bindings (https://github.com/rust-skia/rust-skia) - MIT
 - tracing (https://github.com/tokio-rs/tracing) - MIT
 - crossbeam (https://github.com/crossbeam-rs/crossbeam) - MIT OR Apache-2.0
 - reqwest (https://github.com/seanmonstar/reqwest) - MIT OR Apache-2.0
@@ -89,6 +89,12 @@ BSD-3-Clause:
 - encoding_rs - (Apache-2.0 OR MIT) AND BSD-3-Clause
 - moxcms - BSD-3-Clause OR Apache-2.0
 - pxfm - BSD-3-Clause OR Apache-2.0
+- Skia (https://skia.org/) - BSD-3-Clause
+
+Note: Migo's 2D graphics are rendered by Skia (Ganesh GL backend). The bundled
+Skia binary embeds FreeType (FreeType License "FTL", or GPLv2) and ICU data
+(Unicode-3.0) via the embed-freetype / embed-icudtl build features. See Skia's
+own third-party license notices for the complete list of components it bundles.
 
 --------------------------------------------------------------------------------
 ISC License

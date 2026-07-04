@@ -143,7 +143,7 @@ public class GameActivity extends Activity {
   - `aarch64-linux-android`
   - `x86_64-linux-android`
 - Android NDK r23+
-- JDK 11+
+- JDK 17+ (required by Android Gradle Plugin 8.x)
 
 #### Build Commands
 
@@ -171,7 +171,8 @@ migo/
 │   │   ├── io/             # File & network I/O
 │   │   ├── js-runtime/     # JavaScript runtime (deno_core)
 │   │   ├── shared/         # Shared types & protocols
-│   │   └── platform/       # Platform-specific code
+│   │   ├── platform/       # Platform-specific code
+│   │   └── snapshot-gen/   # V8 snapshot generation (build-time tool)
 │   └── Cargo.toml
 ├── platforms/
 │   └── android/            # Android SDK
@@ -204,7 +205,7 @@ Migo is built on top of these great open-source projects:
 - [Deno Core](https://github.com/denoland/deno_core) - JavaScript/TypeScript runtime foundation
 - [V8](https://v8.dev/) - JavaScript engine
 - [Tokio](https://tokio.rs/) - Rust async runtime
-- [FemtoVG](https://github.com/femtovg/femtovg) - 2D vector graphics library
+- [Skia](https://skia.org/) - 2D graphics library (Ganesh GL backend + SkParagraph text layout)
 
 See [NOTICE](NOTICE) for the full list of dependencies and licenses.
 

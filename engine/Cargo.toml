@@ -72,7 +72,7 @@ image = { version = "=0.25.8", default-features = false, features = [
 zune-image = { version = "0.5", default-features = false, features = ["jpeg", "png", "bmp", "simd"] }
 zune-core = { version = "0.5", default-features = false, features = ["std"] }
 
-# LRU cache for decoded images (0.16 to align with femtovg's dep)
+# LRU cache for decoded images
 lru = "0.16"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12"

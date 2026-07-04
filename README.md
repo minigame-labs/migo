@@ -143,7 +143,7 @@ public class GameActivity extends Activity {
   - `aarch64-linux-android`
   - `x86_64-linux-android`
 - Android NDK r23+
-- JDK 11+
+- JDK 17+（Android Gradle Plugin 8.x 要求）
 
 #### 构建命令
 
@@ -171,7 +171,8 @@ migo/
 │   │   ├── io/             # 文件与网络 I/O
 │   │   ├── js-runtime/     # JavaScript 运行时（deno_core）
 │   │   ├── shared/         # 共享类型与协议
-│   │   └── platform/       # 平台相关代码
+│   │   ├── platform/       # 平台相关代码
+│   │   └── snapshot-gen/   # V8 快照生成（构建期工具）
 │   └── Cargo.toml
 ├── platforms/
 │   └── android/            # Android SDK
@@ -204,7 +205,7 @@ Migo 基于以下优秀的开源项目构建：
 - [Deno Core](https://github.com/denoland/deno_core) - JavaScript/TypeScript 运行时基础
 - [V8](https://v8.dev/) - JavaScript 引擎
 - [Tokio](https://tokio.rs/) - Rust 异步运行时
-- [FemtoVG](https://github.com/femtovg/femtovg) - 2D 矢量图形库
+- [Skia](https://skia.org/) - 2D 图形库（Ganesh GL 后端 + SkParagraph 文本排版）
 
 完整第三方依赖列表与许可证信息请参阅 [NOTICE](NOTICE)。
 
