@@ -55,7 +55,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         # No LFS needed: the gate reads only *.manifest.json (plain text) + the
         # source tree, not the snapshot blobs themselves.
       - name: Check snapshot freshness
@@ -71,7 +71,7 @@ jobs:
       # must link the android-x86_64 one so the snapshot's external-reference
       # table matches the .so's V8 exactly.
       - name: Checkout (with LFS for the android V8 archive)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           lfs: true
 
@@ -103,7 +103,7 @@ jobs:
       # change, so a reliable ~15 min cold build beats a fragile cached one.
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       # Pin the NDK to the same version the .so build uses (pr-ci.yml build job)
       # and export ANDROID_NDK_HOME via $GITHUB_ENV so it is set for the
@@ -174,7 +174,7 @@ jobs:
           echo "sha256:"; sha256sum "$f"
 
       - name: Upload snapshot artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: snapshot-x86_64
           path: engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin
