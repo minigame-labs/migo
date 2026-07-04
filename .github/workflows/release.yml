@@ -17,6 +17,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        # No LFS needed: the freshness gate reads only *.manifest.json + source.
+
+      # Block the release if a committed per-arch snapshot is stale vs the
+      # current embedded JS / deno_core — a stale snapshot bakes OLD JS into the
+      # shipped .so. Regenerate (see snapshots/README.md) before tagging.
+      - name: Check snapshot freshness
+        run: bash scripts/check-snapshot-freshness.sh
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable

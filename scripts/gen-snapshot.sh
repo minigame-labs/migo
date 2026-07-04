@@ -129,25 +129,11 @@ OUT="$OUT_DIR/SNAPSHOT-$RUST_ARCH.bin"
 "${ADBD[@]}" pull /data/local/tmp/SNAPSHOT.bin "$OUT" >/dev/null
 [[ -s "$OUT" ]] || die "pulled snapshot is empty"
 
-# Fingerprint of the inputs that determine snapshot validity (see
-# check-snapshot-freshness.sh). Computed identically there.
-# shellcheck source=scripts/lib/snapshot-fingerprint.sh
-source "$ROOT/scripts/lib/snapshot-fingerprint.sh"
-JS_HASH="$(snapshot_js_hash "$ROOT")"
-DENO_CORE_VER="$(snapshot_deno_core_version "$ENGINE")"
-
+# Fingerprint manifest (js_sources_sha256 + deno_core_version). Written by the
+# shared helper so this on-device arm64 path and CI's x86_64 path emit identical
+# manifests — see scripts/write-snapshot-manifest.sh + check-snapshot-freshness.sh.
 MANIFEST="$OUT.manifest.json"
-cat > "$MANIFEST" <<EOF
-{
-  "arch": "$RUST_ARCH",
-  "snapshot_size": $(stat -c %s "$OUT"),
-  "snapshot_sha256": "$(sha256sum "$OUT" | awk '{print $1}')",
-  "js_sources_sha256": "$JS_HASH",
-  "deno_core_version": "$DENO_CORE_VER",
-  "git_commit": "$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)",
-  "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-EOF
+bash "$ROOT/scripts/write-snapshot-manifest.sh" "$RUST_ARCH" "$OUT"
 
 # ---- 4. cleanup -------------------------------------------------------------
 if [[ "$KEEP" -eq 0 ]]; then
