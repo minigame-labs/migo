@@ -16,12 +16,8 @@ use std::{
 type WorkerStartHook = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[cfg(test)]
-static WORKER_START_TEST_HOOK: std::sync::Mutex<Option<WorkerStartHook>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-fn run_worker_start_test_hook() {
-    let hook = WORKER_START_TEST_HOOK.lock().unwrap().clone();
+fn run_worker_start_test_hook(slot: &std::sync::Mutex<Option<WorkerStartHook>>) {
+    let hook = slot.lock().unwrap().clone();
     if let Some(hook) = hook {
         hook();
     }
@@ -40,6 +36,10 @@ pub struct IoScheduler {
     domain: Arc<IoDomain>,
     policy: CheapPolicy,
     metrics: Arc<SchedulerMetrics>,
+    #[cfg(test)]
+    worker_start_hook: Arc<std::sync::Mutex<Option<WorkerStartHook>>>,
+    #[cfg(test)]
+    image_job_runs: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -66,6 +66,10 @@ impl IoScheduler {
             domain: Arc::new(IoDomain::new()),
             policy: CheapPolicy::default(),
             metrics: Arc::new(SchedulerMetrics::default()),
+            #[cfg(test)]
+            worker_start_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            image_job_runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -130,9 +134,11 @@ impl IoScheduler {
                 let started_at = Instant::now();
                 let priority = req.priority();
                 let domain = Arc::clone(&self.domain);
+                #[cfg(test)]
+                let worker_start_hook = Arc::clone(&self.worker_start_hook);
                 let result = self.pools.run(pool, priority, move || {
                     #[cfg(test)]
-                    run_worker_start_test_hook();
+                    run_worker_start_test_hook(&worker_start_hook);
 
                     if domain.is_closed() {
                         return Err(PoolError::Closed);
@@ -186,9 +192,11 @@ impl IoScheduler {
                 self.metrics.delegated_runs.fetch_add(1, Ordering::Relaxed);
                 let priority = req.priority();
                 let domain = Arc::clone(&self.domain);
+                #[cfg(test)]
+                let worker_start_hook = Arc::clone(&self.worker_start_hook);
                 let rx = self.pools.submit_async(pool, priority, move || {
                     #[cfg(test)]
-                    run_worker_start_test_hook();
+                    run_worker_start_test_hook(&worker_start_hook);
 
                     if domain.is_closed() {
                         return Err(PoolError::Closed);
@@ -210,23 +218,25 @@ impl IoScheduler {
 }
 
 #[cfg(test)]
-pub(crate) struct WorkerStartTestHookGuard;
-
-#[cfg(test)]
-impl Drop for WorkerStartTestHookGuard {
-    fn drop(&mut self) {
-        WORKER_START_TEST_HOOK.lock().unwrap().take();
-    }
-}
-
-#[cfg(test)]
 impl IoScheduler {
-    pub(crate) fn install_worker_start_test_hook(
-        hook: WorkerStartHook,
-    ) -> WorkerStartTestHookGuard {
-        let mut slot = WORKER_START_TEST_HOOK.lock().unwrap();
-        *slot = Some(hook);
-        WorkerStartTestHookGuard
+    // Per-instance, NOT a process-global slot — see IoDomain's hook for the
+    // same deadlock rationale: parallel tests each own their own scheduler, so
+    // another test's worker starting no longer trips this test's barrier hook.
+    pub(crate) fn install_worker_start_test_hook(&self, hook: WorkerStartHook) {
+        *self.worker_start_hook.lock().unwrap() = Some(hook);
+    }
+
+    // Per-instance counter of image jobs routed through this scheduler. A
+    // process-global counter made the image tests' reset→assert(==1) windows
+    // race under parallel execution; each test owns its own scheduler.
+    pub(crate) fn note_image_job_run(&self) {
+        self.image_job_runs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn image_job_run_count(&self) -> usize {
+        self.image_job_runs
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -455,7 +465,7 @@ mod tests {
         let hook_calls_clone = Arc::clone(&hook_calls);
         let hook_entered_clone = Arc::clone(&hook_entered);
         let hook_release_clone = Arc::clone(&hook_release);
-        let _guard = IoScheduler::install_worker_start_test_hook(Arc::new(move || {
+        scheduler.install_worker_start_test_hook(Arc::new(move || {
             let call = hook_calls_clone.fetch_add(1, Ordering::SeqCst) + 1;
             if call == 2 {
                 hook_entered_clone.wait();

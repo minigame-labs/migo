@@ -15,6 +15,8 @@ use crate::fs_ops::FileTable;
 pub struct IoDomain {
     state: Mutex<DomainState>,
     closed: AtomicBool,
+    #[cfg(test)]
+    register_temp_file_hook: Mutex<Option<RegisterTempFileHook>>,
 }
 
 #[derive(Debug)]
@@ -38,6 +40,8 @@ impl IoDomain {
                 temp_files: HashSet::new(),
             }),
             closed: AtomicBool::new(false),
+            #[cfg(test)]
+            register_temp_file_hook: Mutex::new(None),
         }
     }
 
@@ -119,7 +123,7 @@ impl IoDomain {
 
     pub fn register_temp_file(&self, path: PathBuf) {
         #[cfg(test)]
-        run_register_temp_file_test_hook();
+        self.run_register_temp_file_test_hook();
 
         if self.is_closed() {
             let _ = std::fs::remove_file(path);
@@ -183,35 +187,20 @@ impl IoDomain {
 type RegisterTempFileHook = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[cfg(test)]
-static REGISTER_TEMP_FILE_TEST_HOOK: std::sync::Mutex<Option<RegisterTempFileHook>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-fn run_register_temp_file_test_hook() {
-    let hook = REGISTER_TEMP_FILE_TEST_HOOK.lock().unwrap().clone();
-    if let Some(hook) = hook {
-        hook();
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct RegisterTempFileTestHookGuard;
-
-#[cfg(test)]
-impl Drop for RegisterTempFileTestHookGuard {
-    fn drop(&mut self) {
-        REGISTER_TEMP_FILE_TEST_HOOK.lock().unwrap().take();
-    }
-}
-
-#[cfg(test)]
 impl IoDomain {
-    pub(crate) fn install_register_temp_file_test_hook(
-        hook: RegisterTempFileHook,
-    ) -> RegisterTempFileTestHookGuard {
-        let mut slot = REGISTER_TEMP_FILE_TEST_HOOK.lock().unwrap();
-        *slot = Some(hook);
-        RegisterTempFileTestHookGuard
+    fn run_register_temp_file_test_hook(&self) {
+        let hook = self.register_temp_file_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    // Per-instance, NOT a process-global slot: each test owns its own
+    // IoDomain, so another test's parallel `register_temp_file` can no longer
+    // run this test's barrier-based hook and deadlock. The hook drops with the
+    // domain, so no teardown guard is needed.
+    pub(crate) fn install_register_temp_file_test_hook(&self, hook: RegisterTempFileHook) {
+        *self.register_temp_file_hook.lock() = Some(hook);
     }
 
     pub(crate) fn temp_file_count(&self) -> usize {
@@ -283,7 +272,7 @@ mod tests {
         let register_path = path.clone();
         let register_entered = Arc::clone(&entered_hook);
         let register_continue = Arc::clone(&allow_register);
-        let _guard = IoDomain::install_register_temp_file_test_hook(Arc::new(move || {
+        domain.install_register_temp_file_test_hook(Arc::new(move || {
             register_entered.wait();
             register_continue.wait();
         }));

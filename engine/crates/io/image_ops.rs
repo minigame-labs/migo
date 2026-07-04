@@ -207,9 +207,6 @@ fn image_decode_request(source: &ImageSource, encoded_bytes: usize, cache_hit: b
 }
 
 #[cfg(test)]
-static TEST_SCHEDULER_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
 static TEST_PRELOAD_CACHE_HOOK: std::sync::Mutex<
     Option<(
         std::sync::Arc<tokio::sync::Notify>,
@@ -246,7 +243,7 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     #[cfg(test)]
-    TEST_SCHEDULER_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    scheduler.note_image_job_run();
 
     scheduler
         .run_async(image_decode_request(&source, encoded_bytes, cache_hit), job)
@@ -1231,7 +1228,7 @@ fn decode_selected_variant_rgba_only(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::Ordering};
+    use std::sync::Arc;
 
     use shared::vfs::package::PackageWriter;
     use shared::{
@@ -1242,18 +1239,17 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        ImageSource, TEST_PRELOAD_CACHE_HOOK, TEST_PRELOAD_DECODE_STARTED, TEST_SCHEDULER_RUNS,
+        ImageSource, TEST_PRELOAD_CACHE_HOOK, TEST_PRELOAD_DECODE_STARTED,
         mounted_variant_source_version_token, preload_images, read_image_rgba8, read_image_source,
         run_image_job_with_scheduler, worker_image_source,
     };
     use crate::scheduler::IoScheduler;
 
-    fn scheduler_run_count() -> usize {
-        TEST_SCHEDULER_RUNS.load(Ordering::Relaxed)
-    }
-
-    fn reset_scheduler_run_count() {
-        TEST_SCHEDULER_RUNS.store(0, Ordering::Relaxed);
+    // Per-instance (was a process-global counter that raced across parallel
+    // tests' reset→assert windows). Each test owns its own scheduler, so the
+    // count reflects only its own image jobs; no reset needed.
+    fn scheduler_run_count(scheduler: &IoScheduler) -> usize {
+        scheduler.image_job_run_count()
     }
 
     fn install_preload_cache_hook() -> (Arc<Notify>, Arc<Notify>) {
@@ -1296,7 +1292,6 @@ mod tests {
     #[test]
     fn uncached_image_decode_requests_use_image_pool() {
         let scheduler = Arc::new(IoScheduler::new(53));
-        reset_scheduler_run_count();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1316,7 +1311,7 @@ mod tests {
         ));
 
         assert!(thread_name.unwrap().contains("io-image-host-53"));
-        assert_eq!(scheduler_run_count(), 1);
+        assert_eq!(scheduler_run_count(&scheduler), 1);
     }
 
     #[test]
@@ -1331,7 +1326,6 @@ mod tests {
         let cache_generation = 7;
         let cached = NormalizedImage::new(1, 1, vec![255, 0, 0, 255]);
 
-        reset_scheduler_run_count();
         crate::image_cache::global_cache().clear();
         crate::image_cache::global_cache().insert(
             crate::image_cache::full_res_key(path.clone(), cache_generation),
@@ -1360,7 +1354,7 @@ mod tests {
             }
             other => panic!("expected cached RGBA image, got {:?}", other),
         }
-        assert_eq!(scheduler_run_count(), 1);
+        assert_eq!(scheduler_run_count(&scheduler), 1);
         assert_eq!(scheduler.pools().spawned_pool_count(), 0);
         crate::image_cache::global_cache().clear();
     }
@@ -1395,7 +1389,6 @@ mod tests {
         let uncached_path = uncached_path.to_string_lossy().into_owned();
         let cached_path = "/tmp/cached-preload-parallel.png".to_string();
 
-        reset_scheduler_run_count();
         crate::image_cache::global_cache().clear();
         crate::image_cache::global_cache().insert(
             crate::image_cache::full_res_key(cached_path.clone(), 1),
@@ -1452,7 +1445,6 @@ mod tests {
         let cache_generation = 9;
         let cached = NormalizedImage::new(2, 3, vec![255; 2 * 3 * 4]);
 
-        reset_scheduler_run_count();
         crate::image_cache::global_cache().clear();
         crate::image_cache::global_cache().insert(
             crate::image_cache::full_res_key(path.clone(), cache_generation),
@@ -1470,7 +1462,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, path);
         assert_eq!(results[0].1, Ok((2, 3)));
-        assert_eq!(scheduler_run_count(), 1);
+        assert_eq!(scheduler_run_count(&scheduler), 1);
         assert_eq!(scheduler.pools().spawned_pool_count(), 0);
         crate::image_cache::global_cache().clear();
     }
@@ -1500,7 +1492,6 @@ mod tests {
         let path = path.to_string_lossy().into_owned();
         let cache_generation = 11;
 
-        reset_scheduler_run_count();
         crate::image_cache::global_cache().clear();
         crate::image_cache::global_cache().insert(
             crate::image_cache::full_res_key(path.clone(), cache_generation),
@@ -1528,7 +1519,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, path);
         assert_eq!(results[0].1, Ok((1, 1)));
-        assert_eq!(scheduler_run_count(), 1);
+        assert_eq!(scheduler_run_count(&scheduler), 1);
         assert_eq!(scheduler.pools().spawned_pool_count(), 1);
         crate::image_cache::global_cache().clear();
         let _ = std::fs::remove_dir_all(&dir);

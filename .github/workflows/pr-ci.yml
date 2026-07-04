@@ -54,19 +54,17 @@ jobs:
         working-directory: engine
         run: cargo clippy -p shared -p io -p js-runtime --all-targets -- --cap-lints warn
 
-      # Blocking gate for the host-buildable crates. The shared + js-runtime lib
-      # tests must pass — the 5 formerly-failing ones (css_font numeric weight,
-      # log_throttle first-emit, text_texture_cache pin eviction, webgl default
-      # attrs) were real defects / stale assertions and are now fixed, so this
-      # step no longer runs under continue-on-error.
-      #
-      # io is intentionally NOT in this gate: its host tests need image fixtures
-      # and hit scheduler/temp-tracking flakiness — tracked separately. io still
-      # gets compile + clippy coverage above, and android build-aar.sh is the
-      # real cross-compile gate.
+      # Blocking gate for the host-buildable crates (shared + io + js-runtime).
+      # All their lib tests must pass. Previously-masked failures have been
+      # fixed at the root: shared/js-runtime had 5 real defects / stale
+      # assertions; io had test-only global state (domain/scheduler hooks + an
+      # image-run counter) that deadlocked or raced under parallel execution and
+      # is now per-instance. The handful of io tests needing image fixtures
+      # absent in CI stay #[ignore]d. graphics/audio still can't build here (skia
+      # EGL / alsa system deps) — android build-aar.sh is their real gate.
       - name: Run Rust tests (host-buildable crates)
         working-directory: engine
-        run: cargo test -p shared -p js-runtime --lib
+        run: cargo test -p shared -p io -p js-runtime --lib
         env:
           RUST_BACKTRACE: 1
 
