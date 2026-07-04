@@ -129,15 +129,16 @@ jobs:
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: engine -> target
-          # Fresh key: the failing builds above ran with cache-on-failure:true and
-          # saved partial/poisoned caches under the default key. Bust it once and
-          # keep cache-on-failure off so a failed run can't re-poison the cache.
-          key: build-v2
-          cache-on-failure: false
+      # NO Rust cache here — same rusty_v8 incompatibility as the snapshot job.
+      # Swatinem/rust-cache prunes large files out of each crate's build-script
+      # OUT_DIR to shrink the cache, including the `librusty_v8.a` the `v8` crate
+      # copies there, while keeping that build script's fingerprint "fresh". On a
+      # cache hit cargo then skips re-running the build script (so the archive is
+      # never re-copied) and the link fails with "could not find native static
+      # library rusty_v8" — reliably on the SECOND run (first cold run passes,
+      # warm run breaks). Bumping the key only bought one green run. A cold
+      # cross-compile of both ABIs is ~20 min, well inside the 90-min timeout, so
+      # a reliable uncached build beats a cache that fails every other run.
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
