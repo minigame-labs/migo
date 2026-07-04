@@ -47,6 +47,7 @@ use reqwest::Client;
 use reqwest::Method;
 use reqwest::Response;
 use reqwest::redirect::Policy;
+use serde::Deserialize;
 use serde::Serialize;
 use tracing::debug;
 
@@ -849,9 +850,22 @@ pub fn op_fetch_upload_cancel_handle(state: &mut OpState) -> ResourceId {
 /// user-space. For a 50 MiB upload this removes ~100 MiB of peak
 /// allocation compared with the old `buffer -> Vec<u8> -> clone`
 /// pipeline.
+/// Scalar options for `op_fetch_upload`, bundled into one `#[serde]` arg.
+///
+/// deno_core's `setUpAsyncStub` only codegens async-op arities up to 10
+/// (`arg_count` = js args + 2). With every scalar passed separately this op
+/// hit `arg_count = 11`, tripping the "Too many arguments for async op codegen"
+/// throw and aborting V8 snapshot creation. Folding the trailing scalars into
+/// one serde struct keeps the op under the limit.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchUploadOpts {
+    timeout: u32,
+    enable_http2: bool,
+}
+
 #[op2(async(lazy))]
 #[serde]
-#[allow(clippy::too_many_arguments)]
 pub async fn op_fetch_upload(
     state: Rc<RefCell<OpState>>,
     #[smi] cancel_rid: ResourceId,
@@ -861,9 +875,12 @@ pub async fn op_fetch_upload(
     #[string] filename: String,
     #[serde] headers: Vec<(ByteString, ByteString)>,
     #[serde] form_data: Vec<(String, String)>,
-    #[smi] timeout: u32,
-    enable_http2: bool,
+    #[serde] opts: FetchUploadOpts,
 ) -> Result<FetchUploadResult, JsErrorBox> {
+    let FetchUploadOpts {
+        timeout,
+        enable_http2,
+    } = opts;
     let client = {
         let mut st = state.borrow_mut();
         get_or_create_client_from_state(&mut st, enable_http2)

@@ -75,18 +75,32 @@ jobs:
         with:
           lfs: true
 
+      # actions/checkout sets GIT_LFS_SKIP_SMUDGE during the initial checkout and
+      # doesn't always smudge large objects back into the working tree, leaving
+      # third_party/rusty_v8/x86_64/librusty_v8.a as a ~130-byte pointer — which
+      # makes the rusty_v8 build script emit "could not find native static
+      # library rusty_v8". Force the smudge and guard against a pointer.
+      - name: Materialize android V8 archive from LFS
+        run: |
+          git lfs pull --include="engine/third_party/rusty_v8/x86_64/librusty_v8.a"
+          sz=$(stat -c %s engine/third_party/rusty_v8/x86_64/librusty_v8.a)
+          echo "x86_64 V8 archive: $sz bytes"
+          [ "$sz" -gt 1000000 ] || { echo "ERROR: librusty_v8.a is still an LFS pointer"; exit 1; }
+
       # Pinned to match engine/rust-toolchain.toml (frozen build chain).
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: x86_64-linux-android
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: engine -> target
-          key: snapshot-x86_64
-          cache-on-failure: true
+      # NOTE: intentionally NO Rust cache here. Swatinem/rust-cache prunes large
+      # files out of each crate's build-script OUT_DIR to shrink the cache —
+      # including the `librusty_v8.a` that the `v8` crate's build script copies
+      # there — while keeping that build script's fingerprint "fresh". On a cache
+      # hit cargo then skips re-running the build script (so the archive is never
+      # re-copied) and the final link fails with "could not find native static
+      # library rusty_v8". This generator job runs only when the snapshot inputs
+      # change, so a reliable ~15 min cold build beats a fragile cached one.
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3

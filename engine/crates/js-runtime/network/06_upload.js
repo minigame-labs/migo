@@ -124,8 +124,7 @@ function uploadFile(options = {}) {
                 filename,
                 headers,
                 formEntries,
-                timeout,
-                enableHttp2,
+                { timeout, enableHttp2 },
             );
 
             if (cancellation.aborted) throw "aborted";
