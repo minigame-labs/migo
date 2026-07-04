@@ -96,6 +96,25 @@ jobs:
         with:
           lfs: true
 
+      # actions/checkout sets GIT_LFS_SKIP_SMUDGE during checkout and does not
+      # reliably smudge large objects back into the tree, leaving the V8 archives
+      # (and per-arch snapshots) as ~130-byte pointer stubs — which makes the
+      # rusty_v8 build script emit "could not find native static library
+      # rusty_v8" and the .so link fail. Force the smudge for exactly the files
+      # this job links/embeds (both shipped ABIs) and guard against a pointer.
+      - name: Materialize LFS objects (V8 archives + snapshots)
+        run: |
+          git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/js-runtime/snapshots/SNAPSHOT-aarch64.bin,engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin"
+          for f in \
+            engine/third_party/rusty_v8/aarch64/librusty_v8.a \
+            engine/third_party/rusty_v8/x86_64/librusty_v8.a \
+            engine/crates/js-runtime/snapshots/SNAPSHOT-aarch64.bin \
+            engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin ; do
+            sz=$(stat -c %s "$f")
+            echo "$f: $sz bytes"
+            [ "$sz" -gt 100000 ] || { echo "ERROR: $f is still an LFS pointer"; exit 1; }
+          done
+
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -116,7 +135,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine -> target
-          cache-on-failure: true
+          # Fresh key: the failing builds above ran with cache-on-failure:true and
+          # saved partial/poisoned caches under the default key. Bust it once and
+          # keep cache-on-failure off so a failed run can't re-poison the cache.
+          key: build-v2
+          cache-on-failure: false
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
