@@ -1,10 +1,23 @@
 name: PR CI
 
 on:
+  # Skip pure-docs changes: they can't affect the Rust build or the Android AAR,
+  # so there's no point spending ~23 min on the build job for a README/NOTICE
+  # edit. `paths-ignore` only skips a run when EVERY changed file matches, so a
+  # PR touching any non-doc file still runs. pr-ci is not a required check, so a
+  # skipped docs-only PR is not blocked from merging.
   pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "NOTICE*"
   push:
     branches:
       - master
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "NOTICE*"
 
 # Cancel in-progress runs for the same PR/branch
 concurrency:
