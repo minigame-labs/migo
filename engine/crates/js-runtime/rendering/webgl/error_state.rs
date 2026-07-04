@@ -642,7 +642,11 @@ mod tests {
         assert!(a.alpha);
         assert!(a.antialias);
         assert!(a.depth);
-        assert!(!a.stencil);
+        // Migo's GL backend is fixed-format depth24 + stencil8, so unlike the
+        // bare WebGL spec default (stencil:false) we deliberately report
+        // stencil:true (see the ContextAttributes Default impl) so Pixi/Cocos
+        // stencil masking works without a "no stencil buffer" warning.
+        assert!(a.stencil);
         assert!(a.premultiplied_alpha);
         assert!(!a.preserve_drawing_buffer);
         assert_eq!(a.power_preference.as_str(), "default");

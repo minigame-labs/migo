@@ -489,12 +489,14 @@ mod tests {
         let _ = c.insert(pinned.clone(), entry(1, 1000));
         c.pin(&pinned);
         let _ = c.insert(k("b", 2), entry(2, 1000));
-        // Inserting "c" would normally evict the LRU tail ("p"); the
-        // pin protects it, so the cache goes over budget instead.
+        // Inserting "c" needs room. The LRU tail is the pinned "p", but the
+        // pin protects it, so eviction skips past it to the unpinned "b" —
+        // the cache stays within budget by dropping "b" instead of displacing
+        // the pin (see the evict-unpinned-until-room contract on `insert`).
         let evicted = c.insert(k("c", 3), entry(3, 1000));
-        // No eviction occurred (over-budget allowed).
-        assert!(evicted.is_empty());
-        assert!(c.peek(&pinned).is_some());
+        assert_eq!(evicted, vec![2]); // unpinned "b" was the victim
+        assert!(c.peek(&pinned).is_some()); // pinned "p" survived
+        assert!(c.get(&k("b", 2)).is_none());
     }
 
     #[test]

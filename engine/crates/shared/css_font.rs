@@ -199,10 +199,13 @@ fn strip_line_height(input: &str) -> String {
 }
 
 /// Size tokens match `<number><unit>` with unit =
-/// `px|pt|em|rem|%` (case-insensitive).  Unitless numbers are
-/// treated as `px`.  On a hit, writes the resolved pixel size to
-/// `out.size` and returns `true` so the caller knows the rest of
-/// the tokens belong to the family list.
+/// `px|pt|em|rem|%` (case-insensitive).  A **unit is required** —
+/// unitless numbers are NOT sizes (browsers reject unitless
+/// `font-size`), which also keeps a bare numeric `font-weight`
+/// like `300` from being swallowed here before `classify_as_weight`
+/// sees it.  On a hit, writes the resolved pixel size to `out.size`
+/// and returns `true` so the caller knows the rest of the tokens
+/// belong to the family list.
 fn classify_as_size(tok: &str, out: &mut ParsedFont) -> bool {
     let (num, unit) = split_number_unit(tok);
     let Some(n) = num.parse::<f32>().ok() else {
@@ -210,7 +213,7 @@ fn classify_as_size(tok: &str, out: &mut ParsedFont) -> bool {
     };
     let unit_l = unit.to_ascii_lowercase();
     let px = match unit_l.as_str() {
-        "px" | "" => n,
+        "px" => n,
         "pt" => n * 4.0 / 3.0,
         "em" | "rem" => n * 16.0,
         "%" => n * 0.16,

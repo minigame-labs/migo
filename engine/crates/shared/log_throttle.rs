@@ -70,7 +70,12 @@ pub struct RateGate {
 impl RateGate {
     pub const fn new(min_interval: Duration) -> Self {
         Self {
-            last_emit_ns: AtomicU64::new(0),
+            // `u64::MAX` is the "never emitted yet" sentinel so the first
+            // call always emits. A literal `0` would be ambiguous with a
+            // real "emitted at epoch t≈0" timestamp — and since the epoch
+            // is lazily set on the first `should_emit`, that first call sees
+            // `now_ns ≈ 0` and would wrongly suppress itself.
+            last_emit_ns: AtomicU64::new(u64::MAX),
             // `Duration::as_nanos` isn't `const` on stable for
             // some toolchains, but `as_secs * 1e9 + subsec_nanos`
             // is; we accept a small truncation for durations >
@@ -86,7 +91,9 @@ impl RateGate {
         let epoch = *EPOCH.get_or_init(Instant::now);
         let now_ns = epoch.elapsed().as_nanos() as u64;
         let last = self.last_emit_ns.load(Ordering::Relaxed);
-        if now_ns.saturating_sub(last) < self.min_interval_nanos {
+        // `u64::MAX` == never emitted → fall through and emit. Otherwise
+        // suppress while still inside the rate-limit window.
+        if last != u64::MAX && now_ns.saturating_sub(last) < self.min_interval_nanos {
             return false;
         }
         // Compare-and-swap so only one thread wins the race on
