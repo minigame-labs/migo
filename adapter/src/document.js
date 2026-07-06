@@ -13,7 +13,12 @@ import EventTarget from "./event-target.js";
 const _docTarget = new EventTarget();
 
 const document = {
-  readyState: "complete",
+  // Starts "loading"; index.js walks it "loading" → "interactive" (fires
+  // DOMContentLoaded) → "complete" (fires window `load`) on a deferred
+  // macrotask, mirroring how a browser drives a `<script defer>` page. Browser
+  // engines (Phaser, Egret, …) boot from those events, so they must fire.
+  readyState: "loading",
+  onreadystatechange: null,
   visibilityState: "visible",
   hidden: false,
   documentElement: null, // patched at the end (circular: window → document)
@@ -27,9 +32,30 @@ const document = {
   head: new HTMLElement("head"),
   body: new HTMLElement("body"),
 
+  // Set true by index.js when the `load` event fires; gates display-canvas
+  // routing below so it only applies to canvases created during engine boot.
+  _loadFired: false,
+  _mainCanvasRouted: false,
+
   createElement(tag) {
     const t = String(tag).toLowerCase();
-    if (t === "canvas") return new Canvas();
+    if (t === "canvas") {
+      // Migo presents only the onscreen canvas (rid 1, exposed as
+      // `globalThis.canvas`). Browser engines that create their own render
+      // canvas via `document.createElement('canvas')` (e.g. Phaser) would
+      // otherwise draw into an offscreen buffer that is never shown. So the
+      // first canvas created after `load`, while the onscreen canvas is still
+      // unclaimed (no rendering context), is treated as the engine's display
+      // canvas and backed by the onscreen surface. Engines that instead reuse
+      // the global `canvas` (Pixi/Cocos) claim it before this fires and are
+      // unaffected; feature-detection canvases are created before `load`.
+      if (this._loadFired && !this._mainCanvasRouted
+          && globalThis.canvas && !globalThis.canvas._context) {
+        this._mainCanvasRouted = true;
+        return globalThis.canvas;
+      }
+      return new Canvas();
+    }
     if (t === "img" || t === "image") return new Image();
     if (t === "audio") return new Audio();
     return new HTMLElement(tag);

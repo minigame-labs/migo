@@ -482,7 +482,6 @@ fn run_audio_thread(
 
     // Pre-allocate with reasonable capacity to avoid rehashing
     let mut contexts: HashMap<AudioContextId, AudioContext> = HashMap::with_capacity(4);
-    let mut next_context_id: AudioContextId = 1;
 
     // Node-to-context index for O(1) lookup
     let mut node_index = NodeContextIndex::new();
@@ -574,14 +573,11 @@ fn run_audio_thread(
                 }
 
                 AudioCmd::CreateContext {
+                    ctx_id,
                     sample_rate: req_rate,
-                    resp,
                 } => {
                     let rate = req_rate.unwrap_or(sample_rate);
-                    let id = next_context_id;
-                    next_context_id += 1;
-                    contexts.insert(id, AudioContext::new(id, rate, channels));
-                    let _ = resp.send(Ok(id));
+                    contexts.insert(ctx_id, AudioContext::new(ctx_id, rate, channels));
                 }
 
                 AudioCmd::CloseContext { ctx_id, resp } => {

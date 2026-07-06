@@ -1,9 +1,9 @@
 {
   "arch": "aarch64",
-  "snapshot_size": 1927910,
-  "snapshot_sha256": "173a1710b6962bc0d326f2ddfadc8ccfe792851e9d9b0428ae73b6aed1c9cc3e",
-  "js_sources_sha256": "b888d6ced3b651fb46e5ee82be0532e2ddc8488f81e89d568ec36931d3274d0d",
+  "snapshot_size": 1934137,
+  "snapshot_sha256": "df63d962b4dbe07fe191c445e99635781d9ebc8d12c6bd4c6a46dab8cd5e75b8",
+  "js_sources_sha256": "c349143d8b56dbca1c3bcb96c622afa9c4c86182d9a0e1a5acd637bcff1ae182",
   "deno_core_version": "0.385.0",
-  "git_commit": "fdba0ff",
-  "generated_at": "2026-07-03T17:19:14Z"
+  "git_commit": "9fab004",
+  "generated_at": "2026-07-06T14:39:58Z"
 }

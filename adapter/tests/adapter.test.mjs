@@ -105,13 +105,39 @@ assert.match(globalThis.navigator.userAgent, /Android/);
 assert.equal(globalThis.location.href, "game.js");
 
 // 5. document
-assert.equal(globalThis.document.readyState, "complete");
+// The DOM lifecycle is deferred to a macrotask, so synchronously (before any
+// await) readyState is still "loading" and load/DOMContentLoaded have not
+// fired. Register listeners now, then let the macrotask run (section 5b).
+assert.equal(globalThis.document.readyState, "loading", "readyState starts 'loading' until lifecycle fires");
+let _domContentLoadedFired = false;
+let _windowLoadFired = false;
+let _readyStateAtLoad = null;
+globalThis.document.addEventListener("DOMContentLoaded", () => { _domContentLoadedFired = true; });
+globalThis.addEventListener("load", () => { _windowLoadFired = true; _readyStateAtLoad = globalThis.document.readyState; });
 const c = globalThis.document.createElement("canvas");
 assert.ok(c.getContext, "createElement(canvas) returns a host canvas");
 const i = globalThis.document.createElement("img");
 assert.ok("src" in i, "createElement(img) returns image-shaped object");
 assert.equal(globalThis.document.getElementById("GameCanvas"), globalThis.canvas);
 assert.equal(globalThis.document.getElementsByTagName("div").length, 0);
+
+// 5b. DOM lifecycle: after a macrotask the adapter fires DOMContentLoaded then
+// window 'load', walking readyState to "complete". Browser engines (Phaser,
+// Egret, …) gate their boot on these events, so they must fire.
+await new Promise((r) => setTimeout(r, 0));
+assert.equal(_domContentLoadedFired, true, "DOMContentLoaded fires after a macrotask");
+assert.equal(_windowLoadFired, true, "window 'load' fires after a macrotask");
+assert.equal(_readyStateAtLoad, "complete", "readyState is 'complete' when load fires");
+assert.equal(globalThis.document.readyState, "complete", "readyState settles at 'complete'");
+
+// 5c. Display-canvas routing: after load, the first createElement('canvas')
+// (while the onscreen canvas is unclaimed) is backed by the onscreen canvas so
+// an engine that creates its own render canvas (Phaser) draws to the screen,
+// which Migo presents. Subsequent canvases are offscreen.
+const _routed = globalThis.document.createElement("canvas");
+assert.equal(_routed, globalThis.canvas, "first post-load canvas routes to the onscreen canvas");
+const _offscreen2 = globalThis.document.createElement("canvas");
+assert.notEqual(_offscreen2, globalThis.canvas, "subsequent post-load canvases stay offscreen");
 
 // 6. HTMLElement basics
 const div = globalThis.document.createElement("div");

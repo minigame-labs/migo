@@ -122,6 +122,45 @@ if (!globalThis.__migoAdapterInjected) {
     globalThis.removeEventListener = (t, l) => document.removeEventListener(t, l);
     globalThis.dispatchEvent = (e) => document.dispatchEvent(e);
   }
+
+  // 7. DOM lifecycle events. Browser-targeted engines commonly boot from
+  //    `window.addEventListener('load', ...)` or `DOMContentLoaded` (e.g.
+  //    Phaser's game entry is `window.addEventListener('load', () => new
+  //    Phaser.Game(cfg))`). A real browser fires these AFTER a `<script defer>`
+  //    game has run and registered its listeners. The adapter+game prelude runs
+  //    in one synchronous turn, so defer to a macrotask — by then the game's
+  //    top-level code has registered its listeners. readyState walks
+  //    "loading" → "interactive" (DOMContentLoaded) → "complete" (load),
+  //    matching the sequence a deferred script observes on the web. Fires once
+  //    (the whole block is guarded by `__migoAdapterInjected`).
+  const _setReadyState = (state) => {
+    document.readyState = state;
+    const ev = { type: "readystatechange", target: document, currentTarget: document };
+    document.dispatchEvent(ev);
+    if (typeof document.onreadystatechange === "function") {
+      try { document.onreadystatechange(ev); } catch {}
+    }
+  };
+  const _fireDomLifecycle = () => {
+    _setReadyState("interactive");
+    const domReady = { type: "DOMContentLoaded", target: document, currentTarget: document };
+    document.dispatchEvent(domReady);
+    _winTarget.dispatchEvent(domReady); // some libs listen for it on window
+    _setReadyState("complete");
+    // Gate display-canvas routing (document.js) to boot-time canvases: the
+    // load listeners below are where engines construct and create their canvas.
+    document._loadFired = true;
+    const load = { type: "load", target: globalThis, currentTarget: globalThis };
+    _winTarget.dispatchEvent(load);     // window 'load' listeners
+    document.dispatchEvent(load);        // and document, for engines that listen there
+    if (typeof globalThis.onload === "function") { try { globalThis.onload(load); } catch {} }
+    if (typeof document.onload === "function") { try { document.onload(load); } catch {} }
+  };
+  // Defer past the current synchronous turn. Prefer a macrotask (matches the
+  // browser, where load is a task, not a microtask); fall back if unavailable.
+  if (typeof setTimeout === "function") setTimeout(_fireDomLifecycle, 0);
+  else if (typeof queueMicrotask === "function") queueMicrotask(_fireDomLifecycle);
+  else Promise.resolve().then(_fireDomLifecycle);
 }
 
 export default globalThis;

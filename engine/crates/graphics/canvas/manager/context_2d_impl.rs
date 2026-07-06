@@ -72,6 +72,14 @@ pub(super) fn init_skia_for_canvas(
     for ctx in cm.contexts_2d.values_mut() {
         ctx.rebalance_resource_cache(live);
     }
+    // A freshly-created onscreen (id=1) 2D context invalidates DrawingBuffer
+    // bypass: Skia renders into the DrawingBuffer FBO, which the bypass path
+    // (single-canvas WebGL optimization) would skip blitting to the window,
+    // stranding every 2D draw offscreen. Re-evaluate so bypass turns off and
+    // the DrawingBuffer→window blit runs.
+    if canvas_id == CanvasId::from(1u32) {
+        cm.evaluate_bypass();
+    }
     Ok(())
 }
 

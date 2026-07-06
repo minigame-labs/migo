@@ -112,10 +112,13 @@ pub enum AudioContextState {
 /// - Commands with `resp: AudioResp<T>` require a response
 pub enum AudioCmd {
     // ==================== Context ====================
-    /// Create a new AudioContext
+    /// Create a new AudioContext with a JS-allocated id (fire-and-forget).
+    /// The id is generated on the JS side so the context is usable synchronously
+    /// (browser semantics); FIFO channel ordering guarantees this command is
+    /// processed before any node op that references `ctx_id`.
     CreateContext {
+        ctx_id: AudioContextId,
         sample_rate: Option<u32>,
-        resp: AudioResp<AudioContextId>,
     },
 
     /// Close an AudioContext and release resources

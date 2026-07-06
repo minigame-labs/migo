@@ -1603,15 +1603,29 @@ impl CanvasManager {
 
     pub(crate) fn evaluate_bypass(&mut self) {
         let onscreen_id = CanvasId::from(1u32);
-        // Bypass requires: single canvas, has DrawingBuffer, and no default-FBO readback.
-        // Once needs_default_fbo_readback is set, bypass stays disabled permanently
-        // so the DrawingBuffer preserves content across swaps.
-        let can_bypass = self.canvases.len() == 1
-            && !self.needs_default_fbo_readback
-            && self
-                .canvases
+        // Bypass requires: single canvas, has DrawingBuffer, no default-FBO
+        // readback, and the onscreen canvas is NOT a Canvas2D canvas.
+        //
+        // Bypass is a WebGL-only optimization: in bypass mode WebGL's default
+        // framebuffer is redirected to the real FBO 0 (see
+        // `get_drawing_buffer_fbo`), so `swap_buffers_no_restore` can skip the
+        // DrawingBuffer→window blit. Skia/Canvas2D has no such redirect — its
+        // onscreen surface always targets the DrawingBuffer FBO
+        // (`init_skia_for_canvas`), so skipping the blit would leave every 2D
+        // draw stranded in the DrawingBuffer and never presented (black
+        // screen). Canvas2D also requires preserved content across swaps
+        // (the canvas is not implicitly cleared each frame), which only the
+        // DrawingBuffer provides. So whenever the onscreen canvas has a 2D
+        // context, bypass must stay off. `init_skia_for_canvas` re-runs this
+        // check when an onscreen 2D context is created.
+        let can_bypass = can_bypass_drawing_buffer(
+            self.canvases.len(),
+            self.needs_default_fbo_readback,
+            self.contexts_2d.contains_key(&onscreen_id),
+            self.canvases
                 .get(&onscreen_id)
-                .map_or(false, |e| e.drawing_buffer.is_some());
+                .map_or(false, |e| e.drawing_buffer.is_some()),
+        );
 
         if let Some(entry) = self.canvases.get_mut(&onscreen_id) {
             if entry.bypass_drawing_buffer != can_bypass {
@@ -4042,10 +4056,57 @@ impl Drop for CanvasManager {
     }
 }
 
+/// Pure decision for whether the onscreen canvas may bypass its DrawingBuffer
+/// (render straight to FBO 0 and skip the DrawingBuffer→window blit at swap).
+///
+/// Bypass is a WebGL-only optimization. It is safe ONLY when every draw to the
+/// onscreen canvas lands in FBO 0 — which holds for WebGL (its default
+/// framebuffer is redirected to FBO 0 in bypass mode) but NOT for Skia/Canvas2D
+/// (whose onscreen surface always targets the DrawingBuffer FBO). It also
+/// requires no default-FBO readback (which needs preserved content) and exactly
+/// one canvas. Extracted as a pure fn so the conditions are unit-testable
+/// without a live GL context.
+fn can_bypass_drawing_buffer(
+    canvas_count: usize,
+    needs_default_fbo_readback: bool,
+    onscreen_has_2d_context: bool,
+    onscreen_has_drawing_buffer: bool,
+) -> bool {
+    canvas_count == 1
+        && !needs_default_fbo_readback
+        && !onscreen_has_2d_context
+        && onscreen_has_drawing_buffer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::damage_effect::{DamageEffect, FrameDamageAccumulator};
+
+    #[test]
+    fn bypass_ok_for_single_webgl_onscreen_canvas() {
+        // The canonical bypass case: one onscreen canvas, a DrawingBuffer, no
+        // 2D context (WebGL), no readback → bypass is safe.
+        assert!(can_bypass_drawing_buffer(1, false, false, true));
+    }
+
+    #[test]
+    fn onscreen_canvas2d_context_disables_bypass() {
+        // Regression: a single onscreen Canvas2D canvas. Skia renders into the
+        // DrawingBuffer FBO; if bypass skipped the blit those pixels would
+        // never reach the window (black screen). Bypass MUST be off.
+        assert!(!can_bypass_drawing_buffer(1, false, true, true));
+    }
+
+    #[test]
+    fn bypass_off_for_multi_canvas_readback_or_no_drawing_buffer() {
+        // More than one canvas (offscreen canvases exist) → never bypass.
+        assert!(!can_bypass_drawing_buffer(2, false, false, true));
+        // Default-FBO readback latched (content must be preserved) → never bypass.
+        assert!(!can_bypass_drawing_buffer(1, true, false, true));
+        // No DrawingBuffer at all → nothing to bypass.
+        assert!(!can_bypass_drawing_buffer(1, false, false, false));
+    }
 
     // ---- Unified DamageEffect accumulator integration tests ----
     // These verify that the CanvasManager methods correctly feed the accumulator,

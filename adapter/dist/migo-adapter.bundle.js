@@ -365,7 +365,12 @@
   // src/document.js
   var _docTarget = new EventTarget();
   var document = {
-    readyState: "complete",
+    // Starts "loading"; index.js walks it "loading" → "interactive" (fires
+    // DOMContentLoaded) → "complete" (fires window `load`) on a deferred
+    // macrotask, mirroring how a browser drives a `<script defer>` page. Browser
+    // engines (Phaser, Egret, …) boot from those events, so they must fire.
+    readyState: "loading",
+    onreadystatechange: null,
     visibilityState: "visible",
     hidden: false,
     documentElement: null,
@@ -378,9 +383,19 @@
     style: {},
     head: new HTMLElement("head"),
     body: new HTMLElement("body"),
+    // Set true by index.js when the `load` event fires; gates display-canvas
+    // routing below so it only applies to canvases created during engine boot.
+    _loadFired: false,
+    _mainCanvasRouted: false,
     createElement(tag) {
       const t = String(tag).toLowerCase();
-      if (t === "canvas") return new Canvas();
+      if (t === "canvas") {
+        if (this._loadFired && !this._mainCanvasRouted && globalThis.canvas && !globalThis.canvas._context) {
+          this._mainCanvasRouted = true;
+          return globalThis.canvas;
+        }
+        return new Canvas();
+      }
       if (t === "img" || t === "image") return new Image();
       if (t === "audio") return new Audio();
       return new HTMLElement(tag);
@@ -850,13 +865,20 @@
     const canvas = new Canvas();
     canvas.id = "GameCanvas";
     globalThis.canvas = canvas;
+    const _winTarget = new EventTarget();
     const _forward = (type) => (e) => {
-      const ev = { type, ...e, target: canvas };
+      const ev = { ...e, type, target: canvas };
       canvas.dispatchEvent && canvas.dispatchEvent(ev);
       document_default.dispatchEvent(ev);
+      _winTarget.dispatchEvent(ev);
       const sink = document_default["on" + type];
       if (typeof sink === "function") try {
         sink(ev);
+      } catch {
+      }
+      const wsink = globalThis["on" + type];
+      if (typeof wsink === "function") try {
+        wsink(ev);
       } catch {
       }
     };
@@ -899,7 +921,12 @@
       XMLHttpRequest,
       WebSocket,
       FileReader,
-      localStorage: local_storage_default
+      localStorage: local_storage_default,
+      // window EventTarget surface (touch/resize/etc.). Games commonly do
+      // `window.addEventListener('touchstart', ...)`.
+      addEventListener: (type, listener, opts) => _winTarget.addEventListener(type, listener, opts),
+      removeEventListener: (type, listener, opts) => _winTarget.removeEventListener(type, listener, opts),
+      dispatchEvent: (event) => _winTarget.dispatchEvent(event)
     };
     if (!globalThis.Intl) surface.Intl = intl_default;
     for (const key of Object.keys(surface)) {
@@ -922,6 +949,43 @@
       globalThis.removeEventListener = (t, l) => document_default.removeEventListener(t, l);
       globalThis.dispatchEvent = (e) => document_default.dispatchEvent(e);
     }
+    const _setReadyState = (state) => {
+      document_default.readyState = state;
+      const ev = { type: "readystatechange", target: document_default, currentTarget: document_default };
+      document_default.dispatchEvent(ev);
+      if (typeof document_default.onreadystatechange === "function") {
+        try {
+          document_default.onreadystatechange(ev);
+        } catch {
+        }
+      }
+    };
+    const _fireDomLifecycle = () => {
+      _setReadyState("interactive");
+      const domReady = { type: "DOMContentLoaded", target: document_default, currentTarget: document_default };
+      document_default.dispatchEvent(domReady);
+      _winTarget.dispatchEvent(domReady);
+      _setReadyState("complete");
+      document_default._loadFired = true;
+      const load = { type: "load", target: globalThis, currentTarget: globalThis };
+      _winTarget.dispatchEvent(load);
+      document_default.dispatchEvent(load);
+      if (typeof globalThis.onload === "function") {
+        try {
+          globalThis.onload(load);
+        } catch {
+        }
+      }
+      if (typeof document_default.onload === "function") {
+        try {
+          document_default.onload(load);
+        } catch {
+        }
+      }
+    };
+    if (typeof setTimeout === "function") setTimeout(_fireDomLifecycle, 0);
+    else if (typeof queueMicrotask === "function") queueMicrotask(_fireDomLifecycle);
+    else Promise.resolve().then(_fireDomLifecycle);
   }
   var index_default = globalThis;
 })();

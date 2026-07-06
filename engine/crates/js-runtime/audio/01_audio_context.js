@@ -47,6 +47,14 @@ const BUFFER_REGISTRY = new Map();
 // JS-side node ID generator (starting from 1000 to avoid collision with native IDs)
 let nextNodeId = 1000;
 
+// JS-side AudioContext ID generator. Allocated synchronously so a freshly
+// constructed context is usable on the very next line (browser semantics -
+// games do `new AudioContext().createGain()`), instead of racing an async
+// round-trip to the audio thread that leaves `#nativeId` null. Contexts and
+// nodes live in separate registries on the audio thread, so this range only
+// needs to be internally unique.
+let nextContextId = 1;
+
 class BaseAudioContext {
   #nativeId = null;
   #sampleRate;
@@ -57,8 +65,13 @@ class BaseAudioContext {
     this.#sampleRate = sampleRate;
   }
 
-  async _initNative(sampleRate) {
-    this.#nativeId = await op_audio_create_context(sampleRate || 0);
+  // Synchronous: allocate the id in JS and fire the create command. It rides
+  // the same FIFO channel as every subsequent node op, so the audio thread
+  // always creates the context before any node that references it. This keeps
+  // `new AudioContext()` synchronously usable, matching the browser.
+  _initNative(sampleRate) {
+    this.#nativeId = nextContextId++;
+    op_audio_create_context(this.#nativeId, sampleRate || 0);
     this.#destination = new AudioDestinationNode(this, 0, 2);
     this.#state = "running";
     CONTEXT_REGISTRY.set(this.#nativeId, this);
@@ -255,8 +268,10 @@ class AudioContext extends BaseAudioContext {
     const sampleRate = options.sampleRate || 44100;
     super(sampleRate);
 
-    // Start async initialization
-    this.#ready = this._initNative(sampleRate);
+    // Initialize synchronously so the context is immediately usable. Expose a
+    // resolved promise for callers that `await context.ready`.
+    this._initNative(sampleRate);
+    this.#ready = Promise.resolve(this);
   }
 
   get baseLatency() {

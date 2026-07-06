@@ -18,6 +18,10 @@ class Canvas {
         const info = op_get_canvas_info(rid);
         this._width = info['0'];
         this._height = info['1'];
+        // Engines treat the canvas as a DOM element and set CSS on it (e.g.
+        // Phaser's ScaleManager writes `canvas.style.marginLeft` to center it).
+        // Absorb those writes on a plain object.
+        this.style = {};
 
         registry.register(this, rid);
     }
@@ -48,6 +52,34 @@ class Canvas {
     }
     get clientHeight() {
         return this._height;
+    }
+    get offsetWidth() {
+        return this._width;
+    }
+    get offsetHeight() {
+        return this._height;
+    }
+    // Engines treat the canvas as a DOM element. Provide the minimal element
+    // surface their scale/DOM managers touch (Phaser's ScaleManager measures
+    // via getBoundingClientRect and reads/writes attributes; `style` is set in
+    // the constructor). The canvas fills the surface at the origin.
+    getBoundingClientRect() {
+        const w = this._width, h = this._height;
+        return { x: 0, y: 0, top: 0, left: 0, right: w, bottom: h, width: w, height: h };
+    }
+    setAttribute(name, value) {
+        if (name === "width") this.width = value;
+        else if (name === "height") this.height = value;
+        else this["_attr_" + name] = value;
+    }
+    getAttribute(name) {
+        if (name === "width") return this._width;
+        if (name === "height") return this._height;
+        const v = this["_attr_" + name];
+        return v === undefined ? null : v;
+    }
+    removeAttribute(name) {
+        delete this["_attr_" + name];
     }
     getContext(contextType, options) {
         if (this._context) { return this._context; }

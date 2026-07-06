@@ -73,14 +73,21 @@ fn get_audio_tx(state: Rc<RefCell<OpState>>) -> AudioSender {
 // Context Operations
 // ============================================================================
 
-#[op2(async(lazy), fast)]
-#[smi]
-pub async fn op_audio_create_context(
+/// Create an AudioContext with a JS-allocated id (fire-and-forget).
+///
+/// The id is generated on the JS side so `new AudioContext()` is usable
+/// synchronously (browser semantics) instead of racing an async round-trip —
+/// otherwise `createGain()` on the next line runs with a null context id and
+/// the smi decode fails with "expected i32". Ordering is safe: this command and
+/// every later node op share one FIFO channel, so the context is created before
+/// any node that references it.
+#[op2(fast)]
+pub fn op_audio_create_context(
     state: Rc<RefCell<OpState>>,
+    #[smi] ctx_id: AudioContextId,
     #[smi] sample_rate: u32,
-) -> Result<AudioContextId, AudioError> {
+) -> Result<(), AudioError> {
     let tx = get_audio_tx(state);
-    let (resp_tx, resp_rx) = oneshot::channel();
 
     let sample_rate_opt = if sample_rate == 0 {
         None
@@ -89,15 +96,10 @@ pub async fn op_audio_create_context(
     };
 
     tx.send(AudioCmd::CreateContext {
+        ctx_id,
         sample_rate: sample_rate_opt,
-        resp: resp_tx,
     })
-    .map_err(|_| audio_err("Audio thread disconnected"))?;
-
-    resp_rx
-        .await
-        .map_err(|_| audio_err("Response channel closed"))?
-        .map_err(AudioError::from)
+    .map_err(|_| audio_err("Audio thread disconnected"))
 }
 
 #[op2(async(lazy), fast)]

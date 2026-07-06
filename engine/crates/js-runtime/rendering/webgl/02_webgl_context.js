@@ -159,6 +159,7 @@ import { core, primordials } from "ext:core/mod.js";
 const { isArrayBuffer, isTypedArray, isDataView } = core;
 
 const {
+    ArrayIsArray,
     TypedArrayPrototypeGetBuffer,
     TypedArrayPrototypeGetByteLength,
     TypedArrayPrototypeGetByteOffset,
@@ -196,6 +197,12 @@ function toTypedArray(input, Type) {
             0,
             ArrayBufferPrototypeGetByteLength(input) / Type.BYTES_PER_ELEMENT,
         );
+    } else if (ArrayIsArray(input)) {
+        // WebGL typed-list setters (uniform1iv/uniform4fv/... take an
+        // `Int32List`/`Float32List`) accept a plain `sequence<GLint/GLfloat>`,
+        // not only a TypedArray. Copy the array into the target typed array.
+        // e.g. Phaser's multi-texture shader sets `uniform1iv(loc, [0,1,2,...])`.
+        return new Type(input);
     }
     throw new TypeError("Invalid input: must be a TypedArray, DataView, or ArrayBuffer");
 }
@@ -326,6 +333,20 @@ class WebGLRenderingContext {
         this._shaderParameterCache = new Map();
         this._jsErrorQueue = [];
 
+        // Client-side binding state. `getParameter(<X>_BINDING)` must return the
+        // bound wrapper object (or null), per the WebGL spec -- engines commonly
+        // save/restore bindings via `bindX(target, gl.getParameter(X_BINDING))`,
+        // which requires the wrapper, not a raw GL handle. The render thread only
+        // knows native GL handles, so we track the JS-side objects here.
+        this._activeTextureUnit = 0x84c0; // TEXTURE0
+        this._textureBindings2D = new Map(); // texture unit -> WebglObject|null
+        this._textureBindingsCube = new Map(); // texture unit -> WebglObject|null
+        this._arrayBufferBinding = null;
+        this._elementArrayBufferBinding = null;
+        this._programBinding = null;
+        this._framebufferBinding = null;
+        this._renderbufferBinding = null;
+
         // Record the negotiated attributes so `getContextAttributes()`
         // returns real values instead of bare spec defaults.  We do
         // not actually negotiate (backend is fixed RGBA8 + depth24 +
@@ -431,6 +452,7 @@ class WebGLRenderingContext {
     }
 
     useProgram(program) {
+        this._programBinding = program || null;
         return op_use_program(this._canvasId, program?.id);
     }
 
@@ -626,6 +648,9 @@ class WebGLRenderingContext {
     }
 
     bindBuffer(target, buffer) {
+        const buf = buffer || null;
+        if (target === 0x8892) this._arrayBufferBinding = buf; // ARRAY_BUFFER
+        else if (target === 0x8893) this._elementArrayBufferBinding = buf; // ELEMENT_ARRAY_BUFFER
         // use -1 to indicate unbinding
         return op_bind_buffer(this._canvasId, target, buffer?.id || -1);
     }
@@ -662,7 +687,7 @@ class WebGLRenderingContext {
     }
 
     uniform3f(location, x, y, z) {
-        op_uniform3f(this._canvasId, _loc(location), x, y, z);
+        op_uniform3f(this._canvasId, _loc(location), +x, +y, +z);
     }
 
     uniformMatrix3fv(location, transpose, value) {
@@ -687,6 +712,18 @@ class WebGLRenderingContext {
     }
 
     getParameter(pname) {
+        // Binding-state queries return the JS-side wrapper object (or null), per
+        // the WebGL spec, so `bindX(target, getParameter(X_BINDING))` round-trips.
+        switch (pname) {
+            case 0x8069: return this._textureBindings2D.get(this._activeTextureUnit) || null; // TEXTURE_BINDING_2D
+            case 0x8514: return this._textureBindingsCube.get(this._activeTextureUnit) || null; // TEXTURE_BINDING_CUBE_MAP
+            case 0x8894: return this._arrayBufferBinding; // ARRAY_BUFFER_BINDING
+            case 0x8895: return this._elementArrayBufferBinding; // ELEMENT_ARRAY_BUFFER_BINDING
+            case 0x8b8d: return this._programBinding; // CURRENT_PROGRAM
+            case 0x8ca6: return this._framebufferBinding; // FRAMEBUFFER_BINDING
+            case 0x8ca7: return this._renderbufferBinding; // RENDERBUFFER_BINDING
+            default: break;
+        }
         const json = op_get_parameter(this._canvasId, pname);
         if (!json) return null;
         try { return JSON.parse(json); } catch (_) { return null; }
@@ -969,10 +1006,14 @@ class WebGLRenderingContext {
     }
 
     bindTexture(target, texture) {
-        op_bind_texture(this._canvasId, target, texture ? texture.id : -1);
+        const tex = texture || null;
+        if (target === 0x0de1) this._textureBindings2D.set(this._activeTextureUnit, tex); // TEXTURE_2D
+        else if (target === 0x8513) this._textureBindingsCube.set(this._activeTextureUnit, tex); // TEXTURE_CUBE_MAP
+        op_bind_texture(this._canvasId, target, tex ? tex.id : -1);
     }
 
     activeTexture(unit) {
+        this._activeTextureUnit = unit;
         op_active_texture(this._canvasId, unit);
     }
 
@@ -1335,16 +1376,19 @@ class WebGLRenderingContext {
     // -- Phase 2B: Uniform Variants --
 
     uniform1i(location, x) {
-        op_uniform1i(this._canvasId, _loc(location), x);
+        // WebGL coerces the value (WebIDL GLint) -- engines pass booleans for
+        // `uniform bool` samplers/flags (e.g. Phaser: `uniform1i(loc, true)`).
+        // `| 0` applies ToInt32 (true -> 1, false -> 0), matching the browser.
+        op_uniform1i(this._canvasId, _loc(location), x | 0);
     }
     uniform1f(location, x) {
-        op_uniform1f(this._canvasId, _loc(location), x);
+        op_uniform1f(this._canvasId, _loc(location), +x);
     }
     uniform2f(location, x, y) {
-        op_uniform2f(this._canvasId, _loc(location), x, y);
+        op_uniform2f(this._canvasId, _loc(location), +x, +y);
     }
     uniform4f(location, x, y, z, w) {
-        op_uniform4f(this._canvasId, _loc(location), x, y, z, w);
+        op_uniform4f(this._canvasId, _loc(location), +x, +y, +z, +w);
     }
     uniform1iv(location, value) {
         op_uniform1iv(this._canvasId, _loc(location), toInt32AsUint32(value));
@@ -1388,6 +1432,7 @@ class WebGLRenderingContext {
         if (fb && fb.id !== undefined) op_delete_framebuffer(fb.id);
     }
     bindFramebuffer(target, fb) {
+        this._framebufferBinding = fb || null;
         op_bind_framebuffer(this._canvasId, target, fb ? fb.id : -1);
     }
     framebufferTexture2D(target, attachment, textarget, texture, level) {
@@ -1408,6 +1453,7 @@ class WebGLRenderingContext {
         if (rb && rb.id !== undefined) op_delete_renderbuffer(rb.id);
     }
     bindRenderbuffer(target, rb) {
+        this._renderbufferBinding = rb || null;
         op_bind_renderbuffer(this._canvasId, target, rb ? rb.id : -1);
     }
     renderbufferStorage(target, internalformat, width, height) {

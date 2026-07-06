@@ -104,6 +104,17 @@ assert.equal(sandbox.top, sandbox.window);
 sandbox.localStorage.setItem("k", "v");
 assert.equal(sandbox.localStorage.getItem("k"), "v");
 
+// 6b. DOM lifecycle fires from the built bundle too (deferred to a macrotask):
+// DOMContentLoaded on document, then window 'load', readyState → "complete".
+assert.equal(sandbox.document.readyState, "loading", "bundle readyState starts 'loading'");
+let bundleDCLFired = false, bundleLoadFired = false;
+sandbox.document.addEventListener("DOMContentLoaded", () => { bundleDCLFired = true; });
+sandbox.addEventListener("load", () => { bundleLoadFired = true; });
+await new Promise((r) => setTimeout(r, 0));
+assert.equal(bundleDCLFired, true, "bundle fires DOMContentLoaded after a macrotask");
+assert.equal(bundleLoadFired, true, "bundle fires window 'load' after a macrotask");
+assert.equal(sandbox.document.readyState, "complete", "bundle readyState settles at 'complete'");
+
 // 7. Idempotent: re-evaluating the bundle doesn't double-inject.
 sandbox.innerWidth = 9999; // user override before re-run
 vm.runInContext(bundleSrc, sandbox, { filename: bundlePath });
