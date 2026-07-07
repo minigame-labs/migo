@@ -4,8 +4,11 @@
 //! PBOs allow async DMA transfers from CPU to GPU memory, reducing CPU stalls.
 //!
 //! Design considerations:
-//! - Android API 21 compatible (OpenGL ES 3.0 required for PBO)
-//! - Automatic fallback to synchronous upload on ES 2.0
+//! - Requires OpenGL ES 3.0 (PBO + `glFenceSync`); the engine's minSdk is
+//!   API 26, which guarantees ES 3.0 on conforming devices. The PBO/fence
+//!   entry points themselves are ES 3.0, not API 21 — an earlier version of
+//!   this note said "API 21 compatible", which was misleading.
+//! - Automatic fallback to synchronous upload on ES 2.0 / TierB drivers
 //! - Memory-efficient: reuses PBO buffers when possible
 
 use glow::HasContext;

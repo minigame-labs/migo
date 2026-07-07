@@ -281,6 +281,18 @@ pub fn classify_request(req: &IoRequest, policy: &CheapPolicy) -> RouteDecision 
         IoRequest::StorageMutate { .. } | IoRequest::StorageInfo { .. } => {
             RouteDecision::Delegated(PoolKind::Fs)
         }
+        // Generic fs ops (write/copy/mkdir/stat/...): sync/foreground-blocking
+        // runs inline on the caller (V8) thread — matching the pre-scheduler
+        // behaviour where sync fs ops ran directly on the V8 thread; async
+        // work fans out to the fs pool, replacing the raw `spawn_blocking`
+        // so it becomes bounded, prioritized and domain-close-aware.
+        IoRequest::FsOp { priority, .. } => {
+            if *priority == PriorityClass::ForegroundBlocking {
+                RouteDecision::Inline
+            } else {
+                RouteDecision::Delegated(PoolKind::Fs)
+            }
+        }
     }
 }
 
@@ -603,6 +615,34 @@ mod tests {
         };
 
         assert_eq!(classify_request(&req, &policy), RouteDecision::Inline);
+    }
+
+    #[test]
+    fn scheduler_keeps_sync_fs_ops_inline() {
+        // Sync (ForegroundBlocking) generic fs ops run inline on the caller
+        // (V8) thread, matching pre-scheduler behaviour.
+        let req = IoRequest::FsOp {
+            request: RequestKind::Sync,
+            priority: PriorityClass::ForegroundBlocking,
+        };
+        assert_eq!(
+            classify_request(&req, &CheapPolicy::default()),
+            RouteDecision::Inline
+        );
+    }
+
+    #[test]
+    fn scheduler_routes_async_fs_ops_to_fs_pool() {
+        // Async generic fs ops (writes/mutations/metadata) fan out to the fs
+        // pool instead of tokio's unbounded blocking pool.
+        let req = IoRequest::FsOp {
+            request: RequestKind::Async,
+            priority: PriorityClass::ForegroundAsync,
+        };
+        assert_eq!(
+            classify_request(&req, &CheapPolicy::default()),
+            RouteDecision::Delegated(PoolKind::Fs)
+        );
     }
 
     #[test]

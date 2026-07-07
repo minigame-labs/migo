@@ -15,6 +15,7 @@ import {
   op_write_file, op_write_file_sync,
   op_read_compressed_file, op_read_compressed_file_sync,
   op_read_fd, op_read_fd_sync,
+  op_read_fd_into, op_read_fd_into_sync,
   op_read_file, op_read_file_sync,
   op_read_zip_entry,
   op_unzip,
@@ -159,11 +160,11 @@ function loadSavedFileRegistrySync() {
 }
 
 async function persistSavedFileRegistry(paths) {
-  await op_write_or_append_file(SAVED_FILE_REGISTRY, null, `${paths.join("\n")}\n`, "utf8", false);
+  await op_write_or_append_file(SAVED_FILE_REGISTRY, null, `${paths.join("\n")}\n`, "utf8", false, true);
 }
 
 function persistSavedFileRegistrySync(paths) {
-  op_write_or_append_file_sync(SAVED_FILE_REGISTRY, null, `${paths.join("\n")}\n`, "utf8", false);
+  op_write_or_append_file_sync(SAVED_FILE_REGISTRY, null, `${paths.join("\n")}\n`, "utf8", false, true);
 }
 
 async function trackSavedFilePath(path) {
@@ -172,7 +173,7 @@ async function trackSavedFilePath(path) {
   await queueSavedRegistryOp(async () => {
     const current = await loadSavedFileRegistry();
     if (!current.includes(path)) {
-      await op_write_or_append_file(SAVED_FILE_REGISTRY, null, `${path}\n`, "utf8", true);
+      await op_write_or_append_file(SAVED_FILE_REGISTRY, null, `${path}\n`, "utf8", true, true);
     }
   });
 }
@@ -180,7 +181,7 @@ async function trackSavedFilePath(path) {
 function trackSavedFilePathSync(path) {
   rememberSavedFilePath(path);
   if (!shouldTrackSavedFilePath(path)) return;
-  op_write_or_append_file_sync(SAVED_FILE_REGISTRY, null, `${path}\n`, "utf8", true);
+    op_write_or_append_file_sync(SAVED_FILE_REGISTRY, null, `${path}\n`, "utf8", true, true);
 }
 
 async function untrackSavedFilePath(path) {
@@ -226,34 +227,39 @@ class BaseFileManager {
   }
 
   static writeFileSync(filePath_or_obj, data_arg, encoding_arg) {
-    let filePath, data, encoding;
+    let filePath, data, encoding, durable = true;
     if (typeof filePath_or_obj === "object" && filePath_or_obj !== null && !ArrayBuffer.isView(filePath_or_obj) && !(filePath_or_obj instanceof ArrayBuffer)) {
       ({ filePath, data, encoding = "utf8" } = filePath_or_obj);
+      // Opt-in fast (non-crash-safe) write; defaults to durable.
+      durable = filePath_or_obj.durable !== false;
     } else {
       filePath = filePath_or_obj;
       data = data_arg;
       encoding = encoding_arg || "utf8";
     }
     const { data_buf, data_str } = toUint8Array(data);
+    const eff = BaseFileManager.#effectiveDurable(filePath, durable);
     wrapSync(() => {
-      const ok = op_write_or_append_file_sync(filePath, data_buf, data_str, encoding, false);
+      const ok = op_write_or_append_file_sync(filePath, data_buf, data_str, encoding, false, eff);
       if (!ok) throw new IOError("unknown error");
       return undefined;
     }, "writeFileSync");
   }
 
   static appendFileSync(filePath_or_obj, data_arg, encoding_arg) {
-    let filePath, data, encoding;
+    let filePath, data, encoding, durable = true;
     if (typeof filePath_or_obj === "object" && filePath_or_obj !== null && !ArrayBuffer.isView(filePath_or_obj) && !(filePath_or_obj instanceof ArrayBuffer)) {
       ({ filePath, data, encoding = "utf8" } = filePath_or_obj);
+      durable = filePath_or_obj.durable !== false;
     } else {
       filePath = filePath_or_obj;
       data = data_arg;
       encoding = encoding_arg || "utf8";
     }
     const { data_buf, data_str } = toUint8Array(data);
+    const eff = BaseFileManager.#effectiveDurable(filePath, durable);
     wrapSync(() => {
-      const ok = op_write_or_append_file_sync(filePath, data_buf, data_str, encoding, true);
+      const ok = op_write_or_append_file_sync(filePath, data_buf, data_str, encoding, true, eff);
       if (!ok) throw new IOError("unknown error");
       return undefined;
     }, "appendFileSync");
@@ -261,10 +267,14 @@ class BaseFileManager {
 
   static #writeFileCommon(options, append) {
     const prefix = append ? "appendFile" : "writeFile";
+    // durable defaults to true (crash-safe); { durable: false } opts into the
+    // faster non-fsync write, but is only honored for disposable /cache//tmp
+    // data (see #effectiveDurable) -- /user saves stay durable.
+    const eff = BaseFileManager.#effectiveDurable(options.filePath, options.durable);
     return wrapAsync(prefix, () => {
       const { data_buf, data_str } = toUint8Array(options.data);
       const encoding = options.encoding || "utf8";
-      return op_write_or_append_file(options.filePath, data_buf, data_str, encoding, append)
+      return op_write_or_append_file(options.filePath, data_buf, data_str, encoding, append, eff)
         .then((ok) => {
           if (!ok) throw new IOError("unknown error");
         });
@@ -552,9 +562,38 @@ class BaseFileManager {
 
   static #decodeReadResult(bytes, encoding) {
     if (encoding === undefined || encoding === null || encoding === "") {
-      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      return BaseFileManager.#exactBuffer(bytes);
     }
     return BaseFileManager.#decodeBytes(bytes, encoding);
+  }
+
+  // Resolve the effective write durability. Correctness-first: a fast
+  // (non-crash-safe) write is only honored for disposable /cache and /tmp
+  // data. /user (game saves) and anywhere else is always Durable regardless
+  // of the requested flag -- a torn/lost save is worse than a slow one.
+  // Callers pass the *requested* value (undefined/true => Durable).
+  static #effectiveDurable(filePath, requestedDurable) {
+    if (requestedDurable !== false) return true;
+    const p = String(filePath || "");
+    const disposable =
+      p === "/cache" || p.startsWith("/cache/") || p === "/tmp" || p.startsWith("/tmp/");
+    return !disposable;
+  }
+
+  // Return the ArrayBuffer for an op result without a defensive copy when
+  // the view already covers its whole (freshly-allocated) buffer -- which is
+  // the case for ToJsBuffer op returns (offset 0, full length). Only fall
+  // back to slicing for a partial-window view. Accepts either a typed-array
+  // view or a raw ArrayBuffer, and preserves the view's own window so a
+  // future partial-window op return stays correct.
+  static #exactBuffer(view) {
+    if (view instanceof ArrayBuffer) {
+      return view;
+    }
+    if (view.byteOffset === 0 && view.byteLength === view.buffer.byteLength) {
+      return view.buffer;
+    }
+    return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
   }
 
   static #decodeReadData(bytes, encoding) {
@@ -643,11 +682,12 @@ class BaseFileManager {
         throw new IOError("arrayBuffer must be an ArrayBuffer instance");
       }
       let offset = Math.trunc(options.offset || 0);
-      if (offset < 0 || offset >= arrayBuffer.byteLength) {
+      // Allow offset == byteLength (a valid 0-byte read at EOF of the
+      // buffer, and the only valid offset for an empty ArrayBuffer).
+      if (offset < 0 || offset > arrayBuffer.byteLength) {
         throw new IOError("invalid offset");
       }
       const maxLen = arrayBuffer.byteLength - offset;
-      const length = options.length || 0;
       const hasLength = typeof options.length === "number" && Number.isFinite(options.length);
       let readLen = hasLength ? Math.min(Math.max(0, Math.trunc(options.length)), maxLen) : maxLen;
       if (readLen < 0) throw new IOError("invalid length");
@@ -657,12 +697,14 @@ class BaseFileManager {
         pos = BigInt(Math.trunc(options.position));
       }
 
-      return op_read_fd(numFd, BigInt(readLen), pos).then((data) => {
-        const src = new Uint8Array(data.buffer || data);
-        const dst = new Uint8Array(arrayBuffer);
-        const bytesRead = Math.min(src.length, maxLen);
-        dst.set(src.subarray(0, bytesRead), offset);
-        return { bytesRead, arrayBuffer };
+      // Zero-copy: read straight into the caller's ArrayBuffer window
+      // (no intermediate Rust Vec / V8 buffer / dst.set copy). BYOB
+      // contract (same as Node fs.read): the ArrayBuffer is written by an
+      // IO worker while this promise is pending -- the caller must not read
+      // or write it until the promise settles.
+      const view = new Uint8Array(arrayBuffer, offset, readLen);
+      return op_read_fd_into(numFd, view, pos).then((bytesRead) => {
+        return { bytesRead: Number(bytesRead), arrayBuffer };
       });
     }, options);
   }
@@ -673,7 +715,9 @@ class BaseFileManager {
       throw new IOError("arrayBuffer must be an ArrayBuffer instance");
     }
     offset = Math.trunc(offset);
-    if (offset < 0 || offset >= arrayBuffer.byteLength) {
+    // Allow offset == byteLength (valid 0-byte read; also the only valid
+    // offset for an empty ArrayBuffer).
+    if (offset < 0 || offset > arrayBuffer.byteLength) {
       throw new IOError("invalid offset");
     }
     const maxLen = arrayBuffer.byteLength - offset;
@@ -686,12 +730,10 @@ class BaseFileManager {
     }
 
     return wrapSync(() => {
-      const data = op_read_fd_sync(numFd, BigInt(readLen), pos);
-      const src = new Uint8Array(data.buffer || data);
-      const dst = new Uint8Array(arrayBuffer);
-      const bytesRead = Math.min(src.length, maxLen);
-      dst.set(src.subarray(0, bytesRead), offset);
-      return { bytesRead, arrayBuffer };
+      // Zero-copy: fill the caller's ArrayBuffer window directly.
+      const view = new Uint8Array(arrayBuffer, offset, readLen);
+      const bytesRead = op_read_fd_into_sync(numFd, view, pos);
+      return { bytesRead: Number(bytesRead), arrayBuffer };
     }, "readSync");
   }
 
@@ -704,8 +746,9 @@ class BaseFileManager {
         throw new IOError("unsupported compressionAlgorithm");
       }
       return op_read_compressed_file(options.filePath).then((data) => {
-        const bytes = new Uint8Array(data.buffer || data);
-        return { data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
+        // Preserve the op result's own window (#exactBuffer handles both a
+        // typed-array view and a raw ArrayBuffer).
+        return { data: BaseFileManager.#exactBuffer(data) };
       });
     }, options);
   }
@@ -718,8 +761,7 @@ class BaseFileManager {
     }
     return wrapSync(() => {
       const data = op_read_compressed_file_sync(filePath);
-      const bytes = new Uint8Array(data.buffer || data);
-      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      return BaseFileManager.#exactBuffer(data);
     }, "readCompressedFileSync");
   }
 

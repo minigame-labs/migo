@@ -104,6 +104,7 @@ mod tests {
                 network_policy: NetworkPolicy::default(),
                 backgrounded: Arc::new(AtomicBool::new(false)),
                 webgl_context_created: Arc::new(AtomicBool::new(false)),
+                context_lost: Arc::new(AtomicBool::new(false)),
                 code_signing_enabled: false,
                 gpu_caps: GpuCaps::new(),
             },
@@ -403,7 +404,13 @@ pub(crate) fn maybe_auto_flush(state: &mut OpState) {
         .map(|c| c.should_auto_flush())
         .unwrap_or(false);
     if over_budget {
-        crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
+        // Best-effort: auto-flush is a memory-pressure relief, not a
+        // correctness barrier. `dispatch` is still bounded-blocking (no
+        // silent drop), so this only errors under extreme backpressure /
+        // shutdown, where logging and moving on is acceptable.
+        if let Err(e) = crate::rendering::webgl::frame_collector::flush_unified_barrier(state) {
+            tracing::warn!("maybe_auto_flush: barrier flush failed: {e}");
+        }
     }
 }
 
@@ -412,7 +419,14 @@ fn send_gl_sync_with_flush<T>(
     state: &mut OpState,
     build: impl FnOnce(RenderCmdResp<T>) -> RenderCommand,
 ) -> Result<T, EngineError> {
-    crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
+    // Required barrier: if the pre-read flush can't be delivered we must
+    // NOT proceed to the sync read — it would observe un-materialized 2D
+    // content or a stale GL state (e.g. readPixels reading the previous
+    // frame). Surface the failure to JS instead of returning stale data.
+    crate::rendering::webgl::frame_collector::flush_unified_barrier(state).map_err(|e| {
+        EngineError::new(shared::error::ErrorCode::RenderBackendError)
+            .with_detail(format!("sync barrier flush failed before GL readback: {e}"))
+    })?;
     let ctx = state.borrow::<CanvasOpState>();
     send_gl_with_resp_sync(ctx, build)
 }
@@ -526,7 +540,22 @@ pub fn op_alloc_gl_resource_id(state: &mut OpState) -> u32 {
 
 #[op2(fast)]
 pub fn op_gl_flush(state: &mut OpState) {
-    crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
+    // WebGL `gl.flush()` is advisory; best-effort delivery is fine.
+    if let Err(e) = crate::rendering::webgl::frame_collector::flush_unified_barrier(state) {
+        tracing::warn!("op_gl_flush: barrier flush failed: {e}");
+    }
+}
+
+/// Backs JS `gl.isContextLost()`. Reads the shared `context_lost` flag that
+/// the host sets on a render `ContextLost` event and clears on a successful
+/// `ContextRecovered` (see `HostOpState::context_lost`). Returns `false`
+/// when the host state isn't present (headless tests).
+#[op2(fast)]
+pub fn op_gl_is_context_lost(state: &mut OpState) -> bool {
+    state
+        .try_borrow::<shared::op_state::HostOpState>()
+        .map(|h| h.context_lost.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false)
 }
 
 #[op2(fast)]

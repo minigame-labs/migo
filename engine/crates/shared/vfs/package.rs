@@ -715,6 +715,41 @@ impl PackageReader {
                 )));
             }
 
+            // Index self-consistency — keep the random-access reader
+            // (`read_range`) sound against a corrupt/malicious .mpkg:
+            //   * A non-empty entry must reference at least one chunk, and
+            //     its first chunk's `raw_size` (used as the chunk-size
+            //     divisor in `read_range`) must be non-zero — otherwise a
+            //     read would divide by zero.
+            //   * The sum of referenced chunk `raw_size`s must equal the
+            //     entry's advertised `raw_size`, so `read_range`'s
+            //     `Vec::with_capacity(end - position)` can't be inflated
+            //     beyond the bytes that actually exist in the chunks.
+            if chunk_count == 0 {
+                if raw_size != 0 {
+                    return Err(PackageError::BadIndex(format!(
+                        "entry '{normalized}' has raw_size {raw_size} but zero chunks"
+                    )));
+                }
+            } else {
+                let mut chunk_sum: u64 = 0;
+                for c in &chunks[first_chunk as usize..last as usize] {
+                    chunk_sum = chunk_sum.checked_add(c.raw_size as u64).ok_or_else(|| {
+                        PackageError::BadIndex(format!("entry '{normalized}' chunk sum overflow"))
+                    })?;
+                }
+                if chunk_sum != raw_size {
+                    return Err(PackageError::BadIndex(format!(
+                        "entry '{normalized}' raw_size {raw_size} != chunk raw_size sum {chunk_sum}"
+                    )));
+                }
+                if chunks[first_chunk as usize].raw_size == 0 {
+                    return Err(PackageError::BadIndex(format!(
+                        "entry '{normalized}' first chunk has zero raw_size"
+                    )));
+                }
+            }
+
             entries.insert(
                 normalized,
                 EntryMeta {
@@ -780,7 +815,11 @@ impl PackageReader {
             return Ok(Vec::new());
         }
         let end = match length {
-            Some(len) => (position + len).min(entry.raw_size),
+            // `saturating_add` so a caller-supplied `len` near `u64::MAX`
+            // can't overflow (debug panic / release wrap → later
+            // `end - position` underflow). This is a public API; it must
+            // stay sound without relying on the JS-layer MAX_READ_LENGTH clamp.
+            Some(len) => position.saturating_add(len).min(entry.raw_size),
             None => entry.raw_size,
         };
         if entry.chunk_count == 0 {
@@ -806,7 +845,17 @@ impl PackageReader {
             }
         }
 
+        // `PackageReader::open` validates that a non-empty entry's first
+        // chunk has a non-zero `raw_size`, so `chunk_size` is > 0 here.
+        // Guard anyway (defense in depth) so a future code path that
+        // bypasses open-time validation degrades to an error, never a
+        // divide-by-zero panic.
         let chunk_size = self.inner.chunks[entry.first_chunk as usize].raw_size as u64;
+        if chunk_size == 0 {
+            return Err(PackageError::BadIndex(format!(
+                "entry '{relative_path}' first chunk has zero raw_size"
+            )));
+        }
         let first_needed = (position / chunk_size) as u32;
         let last_needed = ((end - 1) / chunk_size) as u32;
 
@@ -1389,6 +1438,38 @@ mod tests {
             r.read_range("data.bin", 199_000, None).unwrap(),
             &content[199_000..]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_range_huge_length_does_not_overflow() {
+        // Regression: `position + len` must not overflow u64 for a
+        // caller-supplied length near the max. Before the
+        // `saturating_add` fix this panicked in debug / wrapped in
+        // release, corrupting the `end` bound.
+        let dir = make_test_dir("read_range_overflow");
+        let p = dir.join("test.mpkg");
+        let content: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        {
+            let f = std::fs::File::create(&p).unwrap();
+            let mut w = PackageWriter::new(io::BufWriter::new(f)).unwrap();
+            w.add_entry("data.bin", &content).unwrap();
+            w.finish("test", "1.0").unwrap();
+        }
+        let r = PackageReader::open(&p, "test", "1.0").unwrap();
+        // position within bounds, length so large that position+length
+        // overflows u64 without saturation. Must clamp to entry size.
+        let got = r.read_range("data.bin", 100, Some(u64::MAX)).unwrap();
+        assert_eq!(got, &content[100..]);
+        // position + len overflow with position 0 too.
+        let all = r.read_range("data.bin", 0, Some(u64::MAX - 1)).unwrap();
+        assert_eq!(all, content);
+        // read_range_limited delegates to read_range, so the same
+        // saturation must hold once the max_inflate gate is passed.
+        let limited = r
+            .read_range_limited("data.bin", 100, Some(u64::MAX), u64::MAX)
+            .unwrap();
+        assert_eq!(limited, &content[100..]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -180,13 +180,30 @@ pub fn spawn_host_thread(
                                 // park on the command channel to avoid busy spinning.
                                 warn!("[Host {}] event loop idle, parking on command channel", id);
                                 loop {
-                                    match host_rx.recv().await {
-                                        Some(HostCommand::Shutdown) => break 'outer,
-                                        Some(msg) => {
-                                            host.handle_command(msg).await;
-                                            break; // back to outer select to re-poll event loop
+                                    // Park on the command channel, but keep
+                                    // the heartbeat live so render-thread
+                                    // events (e.g. ContextLost) are still
+                                    // drained while idle — otherwise the
+                                    // bounded "<=3s" drain latency would not
+                                    // hold during long command-less stretches.
+                                    tokio::select! {
+                                        maybe_msg = host_rx.recv() => {
+                                            match maybe_msg {
+                                                Some(HostCommand::Shutdown) => break 'outer,
+                                                Some(msg) => {
+                                                    host.handle_command(msg).await;
+                                                    break; // back to outer select to re-poll event loop
+                                                }
+                                                None => break 'outer,
+                                            }
                                         }
-                                        None => break 'outer,
+                                        _ = &mut heartbeat_sleep => {
+                                            host.drain_render_events();
+                                            heartbeat_sleep.as_mut().reset(
+                                                tokio::time::Instant::now()
+                                                    + std::time::Duration::from_secs(3),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -200,6 +217,11 @@ pub fn spawn_host_thread(
                             }
 
                             _ = &mut heartbeat_sleep => {
+                                // Drain render-thread events even when no host
+                                // commands arrive, so a ContextLost during an
+                                // idle stretch still reaches Host.context_lost
+                                // (backing gl.isContextLost()) within one tick.
+                                host.drain_render_events();
                                 // Reset the timer for the next cycle
                                 heartbeat_sleep.as_mut().reset(
                                     tokio::time::Instant::now() + std::time::Duration::from_secs(3)

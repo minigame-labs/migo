@@ -243,6 +243,7 @@ mod tests {
             network_policy: NetworkPolicy::default(),
             backgrounded: Arc::new(AtomicBool::new(false)),
             webgl_context_created: Arc::new(AtomicBool::new(false)),
+            context_lost: Arc::new(AtomicBool::new(false)),
             code_signing_enabled: false,
             gpu_caps: GpuCaps::new(),
         }

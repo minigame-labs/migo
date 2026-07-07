@@ -78,6 +78,16 @@ pub enum IoRequest {
         request: RequestKind,
         priority: PriorityClass,
     },
+    /// Generic filesystem operation that isn't a plain ReadFile:
+    /// writes, appends, fd writes, copy, mkdir, unlink, rename, rmdir,
+    /// truncate, and metadata (stat/access/readdir/list). Routed through
+    /// the scheduler so these blocking ops respect domain-close, priority,
+    /// backpressure and metrics instead of escaping onto tokio's unbounded
+    /// blocking pool.
+    FsOp {
+        request: RequestKind,
+        priority: PriorityClass,
+    },
 }
 
 impl IoRequest {
@@ -90,7 +100,8 @@ impl IoRequest {
             | IoRequest::PackageIngest { priority, .. }
             | IoRequest::StorageGet { priority, .. }
             | IoRequest::StorageMutate { priority, .. }
-            | IoRequest::StorageInfo { priority, .. } => *priority,
+            | IoRequest::StorageInfo { priority, .. }
+            | IoRequest::FsOp { priority, .. } => *priority,
         }
     }
 }

@@ -449,7 +449,16 @@ fn do_upload(
         // a reusable buffer (with matching or larger capacity) so we
         // don't pay a glGenBuffers round-trip per image.
         let need = job.rgba.len();
-        let pbo = pbo_pool.acquire(gl, need)?;
+        let pbo = match pbo_pool.acquire(gl, need) {
+            Ok(p) => p,
+            Err(e) => {
+                // Free the texture we already created before bailing —
+                // otherwise a run of acquire failures (PBO pool churn /
+                // OOM) leaks one GL texture per attempt.
+                gl.delete_texture(tex);
+                return Err(e);
+            }
+        };
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pbo));
         // `STREAM_DRAW` with a full-buffer replacement orphans the
         // driver-side storage (per spec §6.2), so reuse is safe even
@@ -489,9 +498,14 @@ fn do_upload(
         pbo_pool.release(gl, pbo, need);
 
         // Insert fence so the render thread knows when the upload is complete.
-        let fence = gl
-            .fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)
-            .map_err(|e| format!("fence_sync: {e}"))?;
+        let fence = match gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0) {
+            Ok(f) => f,
+            Err(e) => {
+                // Same leak guard as the PBO-acquire path above.
+                gl.delete_texture(tex);
+                return Err(format!("fence_sync: {e}"));
+            }
+        };
 
         // Flush to ensure the fence and upload are submitted to the GPU.
         gl.flush();

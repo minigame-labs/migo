@@ -599,7 +599,23 @@ impl UnifiedFrameCollector {
 
 /// Flush all pending unified segments to the render thread as a barrier.
 /// Call before any sync operation that observes prior drawing results.
-pub(crate) fn flush_unified_barrier(state: &mut deno_core::OpState) {
+///
+/// Returns `Ok(())` when there was nothing to flush **or** the barrier was
+/// delivered. Returns `Err` only when delivery failed (channel timeout /
+/// disconnect).
+///
+/// Delivery uses [`CommandSender::dispatch`] rather than the legacy
+/// `send()`: a `FramePacket` classifies as `Draw`, so `dispatch` applies
+/// the bounded-**blocking** policy and the barrier is guaranteed to reach
+/// the render thread (or surface an error) instead of being **silently
+/// dropped** when the channel is full. This is load-bearing for sync
+/// readbacks (`getImageData` / `readPixels`): if the barrier were dropped,
+/// the subsequent sync read would observe un-materialized 2D content or a
+/// stale GL state. `flush_as_barrier` has already drained the collector, so
+/// a silent drop would also *lose* those draw commands outright.
+pub(crate) fn flush_unified_barrier(
+    state: &mut deno_core::OpState,
+) -> Result<(), shared::render_command_sender::SendError> {
     let packet = {
         if let Some(collector) = state.try_borrow_mut::<UnifiedFrameCollector>() {
             collector.flush_as_barrier()
@@ -608,31 +624,29 @@ pub(crate) fn flush_unified_barrier(state: &mut deno_core::OpState) {
         }
     };
 
-    if let Some(packet) = packet {
-        // Diag: how many GL ops did the caller pile up before the
-        // sync barrier?  A spike here correlates with the
-        // [MigoPerf][SyncOp] wait time on the render-thread side.
-        let gl_ops = packet
-            .ops()
-            .iter()
-            .map(|op| match op {
-                shared::protocol::FrameOp::GlBatch(p) => p.commands.len(),
-                _ => 0,
-            })
-            .sum::<usize>();
-        if gl_ops >= 64 {
-            tracing::warn!("[MigoPerf][SyncFlush] sync barrier flushed {gl_ops} pending GL ops");
-        }
-        let ctx = state.borrow::<shared::op_state::CanvasOpState>();
-        if let Err(e) = ctx
-            .tx
-            .send(shared::protocol::render_cmd::RenderCommand::FramePacket(
-                packet,
-            ))
-        {
-            tracing::error!("flush_unified_barrier: send failed: {e}");
-        }
+    let Some(packet) = packet else {
+        return Ok(());
+    };
+
+    // Diag: how many GL ops did the caller pile up before the
+    // sync barrier?  A spike here correlates with the
+    // [MigoPerf][SyncOp] wait time on the render-thread side.
+    let gl_ops = packet
+        .ops()
+        .iter()
+        .map(|op| match op {
+            shared::protocol::FrameOp::GlBatch(p) => p.commands.len(),
+            _ => 0,
+        })
+        .sum::<usize>();
+    if gl_ops >= 64 {
+        tracing::warn!("[MigoPerf][SyncFlush] sync barrier flushed {gl_ops} pending GL ops");
     }
+    let ctx = state.borrow::<shared::op_state::CanvasOpState>();
+    ctx.tx
+        .dispatch(shared::protocol::render_cmd::RenderCommand::FramePacket(
+            packet,
+        ))
 }
 
 #[cfg(test)]

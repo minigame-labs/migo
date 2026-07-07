@@ -36,6 +36,24 @@ pub enum WriteMode {
     Append,
 }
 
+/// Crash-durability level for writes.
+///
+/// The default is [`Durable`](WriteDurability::Durable): the overwrite path
+/// uses the atomic `temp -> fsync -> rename -> dir fsync` sequence and the
+/// append path `fsync`s, so a crash / power loss never leaves a torn or
+/// lost write. This is the correct default for game saves.
+///
+/// [`Fast`](WriteDurability::Fast) trades that guarantee for throughput:
+/// overwrite does a plain truncating write and append skips the per-write
+/// `fsync`. Suitable for high-frequency scratch / cache writes the game can
+/// afford to lose on a crash. Callers opt in explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteDurability {
+    #[default]
+    Durable,
+    Fast,
+}
+
 /// Image cache statistics
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImageCacheStats {

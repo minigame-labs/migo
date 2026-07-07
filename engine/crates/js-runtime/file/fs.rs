@@ -6,7 +6,9 @@ use shared::{
     codec,
     error::{EngineError, ErrorCode},
     op_state::HostOpState,
-    protocol::io_cmd::{FileId, FileStat, OpenFlag, SavedFileInfo, StatResult, WriteMode},
+    protocol::io_cmd::{
+        FileId, FileStat, OpenFlag, SavedFileInfo, StatResult, WriteDurability, WriteMode,
+    },
     vfs::{FileOp, VfsError, VirtualFS},
 };
 
@@ -123,6 +125,47 @@ fn copy_request(backend: BackendKind, request: RequestKind) -> IoRequest {
         spec: ReadSpec::Whole,
         estimated_bytes: shared::protocol::io_cmd::MAX_READ_LENGTH as usize,
     }
+}
+
+/// Request descriptor for a generic blocking fs op (write/copy/mkdir/
+/// stat/...). Routing these through the scheduler (instead of a raw
+/// `tokio::spawn_blocking`) gives them domain-close checks, priority,
+/// backpressure and the shared IO metrics.
+#[inline]
+fn fs_op_request(request: RequestKind) -> IoRequest {
+    IoRequest::FsOp {
+        request,
+        priority: PriorityClass::from(request),
+    }
+}
+
+/// Run a blocking fs job through the scheduler on the async path,
+/// flattening the `PoolError` and the inner `EngineError`.
+async fn run_fs_async<T, F>(scheduler: Arc<IoScheduler>, job: F) -> Result<T, IOError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, EngineError> + Send + 'static,
+{
+    scheduler
+        .run_async(fs_op_request(RequestKind::Async), job)
+        .await
+        .map_err(pool_err)?
+        .map_err(IOError::from)
+}
+
+/// Run a blocking fs job through the scheduler on the sync path. Sync
+/// (ForegroundBlocking) ops classify as Inline, so the job runs on the
+/// calling (V8) thread exactly as before — but now behind the scheduler's
+/// domain-close guard and metrics.
+fn run_fs_sync<T, F>(scheduler: &IoScheduler, job: F) -> Result<T, IOError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, EngineError> + Send + 'static,
+{
+    scheduler
+        .run_sync(&fs_op_request(RequestKind::Sync), job)
+        .map_err(pool_err)?
+        .map_err(IOError::from)
 }
 
 async fn copy_pack_file_async(
@@ -250,6 +293,18 @@ fn require_fs_path(resolved: ResolvedPath) -> Result<String, IOError> {
 #[inline]
 fn code_relative(virtual_path: &str) -> &str {
     virtual_path.strip_prefix("/code/").unwrap_or("")
+}
+
+/// Whether a virtual path refers to the read-only `/code` mount.
+///
+/// mmap-based whole-file reads are only safe on read-only, immutable
+/// backends: `/code` is read-only and immutable within a mount generation,
+/// so mapping its files can't hit the truncation→SIGBUS window. `/user`
+/// `/cache` `/tmp` are writable and must not be mmap'd. Mirrors
+/// `resolve_path_vfs`'s mapping of relative paths onto `/code`.
+#[inline]
+fn is_read_only_code_path(path: &str) -> bool {
+    !path.starts_with('/') || path == "/code" || path.starts_with("/code/")
 }
 
 /// Read bytes for a /code path via MountTable.  Used by read-oriented ops
@@ -473,6 +528,17 @@ fn mode_from_append(append: bool) -> WriteMode {
     }
 }
 
+/// Map the JS `durable` flag to a durability level. Defaults to `Durable`
+/// (crash-safe) — callers must explicitly opt into `Fast`.
+#[inline]
+fn durability_from(durable: bool) -> WriteDurability {
+    if durable {
+        WriteDurability::Durable
+    } else {
+        WriteDurability::Fast
+    }
+}
+
 /// Copy a byte range out of a V8 BackingStore safely.
 fn copy_backing_store_bytes(
     store: &v8::SharedRef<v8::BackingStore>,
@@ -531,6 +597,10 @@ pub async fn op_access(
     #[string] path: String,
 ) -> Result<bool, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
         ResolvedPath::Pack { virtual_path } => {
             // Pack-backed: check existence via mount table.
@@ -544,7 +614,7 @@ pub async fn op_access(
         }
         ResolvedPath::Filesystem(full_path) => {
             let vpath = path.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = run_fs_async(scheduler, move || {
                 let t0 = std::time::Instant::now();
                 let r = fs_ops::access(&full_path);
                 let disk_ms = t0.elapsed().as_millis() as u64;
@@ -553,9 +623,7 @@ pub async fn op_access(
                 }
                 r
             })
-            .await
-            .map_err(|e| ioerr(format!("task join error: {e}")))?
-            .map_err(IOError::from)?;
+            .await?;
             Ok(result.0 || result.1)
         }
     }
@@ -572,9 +640,11 @@ pub fn op_access_sync(state: &mut OpState, #[string] path: String) -> Result<boo
                 m.exists_or_is_dir(rel)
             })
             .unwrap_or(false)),
-        ResolvedPath::Filesystem(full_path) => fs_ops::access(&full_path)
-            .map(|(is_file, is_dir, _size)| is_file || is_dir)
-            .map_err(IOError::from),
+        ResolvedPath::Filesystem(full_path) => {
+            let scheduler = get_scheduler(state);
+            run_fs_sync(&scheduler, move || fs_ops::access(&full_path))
+                .map(|(is_file, is_dir, _size)| is_file || is_dir)
+        }
     }
 }
 
@@ -589,8 +659,13 @@ pub async fn op_write_or_append_file(
     #[string] data_str: Option<String>,
     #[string] encoding: Option<String>,
     append: bool,
+    durable: bool,
 ) -> Result<bool, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     let full_path = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
         mt.as_deref(),
@@ -598,9 +673,11 @@ pub async fn op_write_or_append_file(
         FileOp::Write,
     )?)?;
     let mode = mode_from_append(append);
+    let durability = durability_from(durable);
     let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
 
-    // Extract bytes from SharedRef before spawn_blocking (SharedRef is not Send).
+    // Extract bytes from SharedRef before the job crosses the thread
+    // boundary (SharedRef is not Send).
     let bytes: Vec<u8> = if let Some((store, range)) = buf_opt {
         copy_backing_store_bytes(&store, range)?
     } else if let Some(data) = data_opt {
@@ -609,10 +686,10 @@ pub async fn op_write_or_append_file(
         return Err(ioerr("No data provided"));
     };
 
-    tokio::task::spawn_blocking(move || fs_ops::write_file(&full_path, &bytes, mode))
-        .await
-        .map_err(|e| ioerr(format!("task join error: {e}")))?
-        .map_err(IOError::from)
+    run_fs_async(scheduler, move || {
+        fs_ops::write_file(&full_path, &bytes, mode, durability)
+    })
+    .await
 }
 
 #[op2]
@@ -623,8 +700,10 @@ pub fn op_write_or_append_file_sync(
     #[string] data_str: Option<String>,
     #[string] encoding: Option<String>,
     append: bool,
+    durable: bool,
 ) -> Result<bool, IOError> {
     let (vfs, mt) = get_vfs_sync(state);
+    let scheduler = get_scheduler(state);
     let full_path = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
         mt.as_deref(),
@@ -632,6 +711,7 @@ pub fn op_write_or_append_file_sync(
         FileOp::Write,
     )?)?;
     let mode = mode_from_append(append);
+    let durability = durability_from(durable);
     let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
 
     // Extract bytes from SharedRef (for consistency, though sync ops run on V8 thread).
@@ -643,7 +723,9 @@ pub fn op_write_or_append_file_sync(
         return Err(ioerr("No data provided"));
     };
 
-    fs_ops::write_file(&full_path, &bytes, mode).map_err(IOError::from)
+    run_fs_sync(&scheduler, move || {
+        fs_ops::write_file(&full_path, &bytes, mode, durability)
+    })
 }
 
 //
@@ -815,10 +897,7 @@ pub async fn op_copy_file(
 
     match src_resolved {
         ResolvedPath::Filesystem(src_full) => {
-            tokio::task::spawn_blocking(move || fs_ops::copy(&src_full, &dest_full))
-                .await
-                .map_err(|e| ioerr(format!("task join error: {e}")))?
-                .map_err(IOError::from)
+            run_fs_async(scheduler, move || fs_ops::copy(&src_full, &dest_full)).await
         }
         ResolvedPath::Pack { virtual_path } => {
             let mount_table = mt
@@ -837,6 +916,7 @@ pub fn op_copy_file_sync(
     #[string] dest_path: String,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
+    let scheduler = get_scheduler(state);
     let src_resolved = resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &src_path, FileOp::Read)?;
     let dest_full = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
@@ -847,7 +927,7 @@ pub fn op_copy_file_sync(
 
     match src_resolved {
         ResolvedPath::Filesystem(src_full) => {
-            fs_ops::copy(&src_full, &dest_full).map_err(IOError::from)
+            run_fs_sync(&scheduler, move || fs_ops::copy(&src_full, &dest_full))
         }
         ResolvedPath::Pack { virtual_path } => {
             let m = mt
@@ -919,6 +999,10 @@ pub async fn op_mkdir(
     recursive: bool,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     let full_path = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
         mt.as_deref(),
@@ -926,10 +1010,7 @@ pub async fn op_mkdir(
         FileOp::Create,
     )?)?;
 
-    tokio::task::spawn_blocking(move || fs_ops::mkdir(&full_path, recursive))
-        .await
-        .map_err(|e| ioerr(format!("task join error: {e}")))?
-        .map_err(IOError::from)
+    run_fs_async(scheduler, move || fs_ops::mkdir(&full_path, recursive)).await
 }
 
 #[op2(fast)]
@@ -939,6 +1020,7 @@ pub fn op_mkdir_sync(
     recursive: bool,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
+    let scheduler = get_scheduler(state);
     let full_path = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
         mt.as_deref(),
@@ -946,7 +1028,7 @@ pub fn op_mkdir_sync(
         FileOp::Create,
     )?)?;
 
-    fs_ops::mkdir(&full_path, recursive).map_err(IOError::from)
+    run_fs_sync(&scheduler, move || fs_ops::mkdir(&full_path, recursive))
 }
 
 #[op2(async(lazy), fast)]
@@ -956,6 +1038,10 @@ pub async fn op_readdir(
     #[string] dir_path: String,
 ) -> Result<Vec<String>, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &dir_path, FileOp::Read)? {
         ResolvedPath::Pack { virtual_path } => {
             let m = mt
@@ -974,10 +1060,7 @@ pub async fn op_readdir(
             Ok(m.list_dir(rel))
         }
         ResolvedPath::Filesystem(full_path) => {
-            tokio::task::spawn_blocking(move || fs_ops::readdir(&full_path))
-                .await
-                .map_err(|e| ioerr(format!("task join error: {e}")))?
-                .map_err(IOError::from)
+            run_fs_async(scheduler, move || fs_ops::readdir(&full_path)).await
         }
     }
 }
@@ -989,6 +1072,7 @@ pub fn op_readdir_sync(
     #[string] dir_path: String,
 ) -> Result<Vec<String>, IOError> {
     let (vfs, mt) = get_vfs_sync(state);
+    let scheduler = get_scheduler(state);
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &dir_path, FileOp::Read)? {
         ResolvedPath::Pack { virtual_path } => {
             let m = mt
@@ -1006,7 +1090,9 @@ pub fn op_readdir_sync(
             }
             Ok(m.list_dir(rel))
         }
-        ResolvedPath::Filesystem(full_path) => fs_ops::readdir(&full_path).map_err(IOError::from),
+        ResolvedPath::Filesystem(full_path) => {
+            run_fs_sync(&scheduler, move || fs_ops::readdir(&full_path))
+        }
     }
 }
 
@@ -1019,6 +1105,10 @@ pub async fn op_unlink(
     #[string] file_path: String,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     let full_path = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
         mt.as_deref(),
@@ -1026,15 +1116,13 @@ pub async fn op_unlink(
         FileOp::Delete,
     )?)?;
 
-    tokio::task::spawn_blocking(move || fs_ops::unlink(&full_path))
-        .await
-        .map_err(|e| ioerr(format!("task join error: {e}")))?
-        .map_err(IOError::from)
+    run_fs_async(scheduler, move || fs_ops::unlink(&full_path)).await
 }
 
 #[op2(fast)]
 pub fn op_unlink_sync(state: &mut OpState, #[string] file_path: String) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
+    let scheduler = get_scheduler(state);
     let full_path = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
         mt.as_deref(),
@@ -1042,7 +1130,7 @@ pub fn op_unlink_sync(state: &mut OpState, #[string] file_path: String) -> Resul
         FileOp::Delete,
     )?)?;
 
-    fs_ops::unlink(&full_path).map_err(IOError::from)
+    run_fs_sync(&scheduler, move || fs_ops::unlink(&full_path))
 }
 
 #[op2(async(lazy), fast)]
@@ -1052,6 +1140,10 @@ pub async fn op_rename(
     #[string] new_path: String,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     // Rename needs delete on source and create on destination
     let old_full = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
@@ -1066,10 +1158,7 @@ pub async fn op_rename(
         FileOp::Create,
     )?)?;
 
-    tokio::task::spawn_blocking(move || fs_ops::rename(&old_full, &new_full))
-        .await
-        .map_err(|e| ioerr(format!("task join error: {e}")))?
-        .map_err(IOError::from)
+    run_fs_async(scheduler, move || fs_ops::rename(&old_full, &new_full)).await
 }
 
 #[op2(fast)]
@@ -1079,6 +1168,7 @@ pub fn op_rename_sync(
     #[string] new_path: String,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
+    let scheduler = get_scheduler(state);
     let old_full = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
         mt.as_deref(),
@@ -1092,7 +1182,7 @@ pub fn op_rename_sync(
         FileOp::Create,
     )?)?;
 
-    fs_ops::rename(&old_full, &new_full).map_err(IOError::from)
+    run_fs_sync(&scheduler, move || fs_ops::rename(&old_full, &new_full))
 }
 
 #[op2(async(lazy), fast)]
@@ -1102,6 +1192,10 @@ pub async fn op_rmdir(
     recursive: bool,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     let full_path = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
         mt.as_deref(),
@@ -1109,10 +1203,7 @@ pub async fn op_rmdir(
         FileOp::Delete,
     )?)?;
 
-    tokio::task::spawn_blocking(move || fs_ops::rmdir(&full_path, recursive))
-        .await
-        .map_err(|e| ioerr(format!("task join error: {e}")))?
-        .map_err(IOError::from)
+    run_fs_async(scheduler, move || fs_ops::rmdir(&full_path, recursive)).await
 }
 
 #[op2(fast)]
@@ -1122,6 +1213,7 @@ pub fn op_rmdir_sync(
     recursive: bool,
 ) -> Result<(), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
+    let scheduler = get_scheduler(state);
     let full_path = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
         mt.as_deref(),
@@ -1129,7 +1221,7 @@ pub fn op_rmdir_sync(
         FileOp::Delete,
     )?)?;
 
-    fs_ops::rmdir(&full_path, recursive).map_err(IOError::from)
+    run_fs_sync(&scheduler, move || fs_ops::rmdir(&full_path, recursive))
 }
 
 //
@@ -1143,13 +1235,14 @@ pub async fn op_stat(
     recursive: bool,
 ) -> Result<StatResult, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
         ResolvedPath::Pack { virtual_path } => pack_stat(mt.as_deref(), &virtual_path, recursive),
         ResolvedPath::Filesystem(full_path) => {
-            tokio::task::spawn_blocking(move || fs_ops::stat(&full_path, recursive))
-                .await
-                .map_err(|e| ioerr(format!("task join error: {e}")))?
-                .map_err(IOError::from)
+            run_fs_async(scheduler, move || fs_ops::stat(&full_path, recursive)).await
         }
     }
 }
@@ -1162,10 +1255,11 @@ pub fn op_stat_sync(
     recursive: bool,
 ) -> Result<StatResult, IOError> {
     let (vfs, mt) = get_vfs_sync(state);
+    let scheduler = get_scheduler(state);
     match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
         ResolvedPath::Pack { virtual_path } => pack_stat(mt.as_deref(), &virtual_path, recursive),
         ResolvedPath::Filesystem(full_path) => {
-            fs_ops::stat(&full_path, recursive).map_err(IOError::from)
+            run_fs_sync(&scheduler, move || fs_ops::stat(&full_path, recursive))
         }
     }
 }
@@ -1289,11 +1383,12 @@ pub async fn op_read_file(
         }
         ResolvedPath::Filesystem(full_path) => {
             let vpath = path.clone();
+            let allow_mmap = is_read_only_code_path(&path);
             let request = read_request(BackendKind::Filesystem, request_kind, length);
             let data = scheduler
                 .run_async(request, move || {
                     let t0 = std::time::Instant::now();
-                    let r = fs_ops::read_file(&full_path, position, length);
+                    let r = fs_ops::read_file(&full_path, position, length, allow_mmap);
                     let disk_ms = t0.elapsed().as_millis() as u64;
                     if let Ok(ref d) = r {
                         if disk_ms >= 30 {
@@ -1369,10 +1464,11 @@ pub fn op_read_file_sync(
                 Ok(data.into())
             }
             ResolvedPath::Filesystem(full_path) => {
+                let allow_mmap = is_read_only_code_path(&path);
                 let request = read_request(BackendKind::Filesystem, request_kind, length);
                 let data = scheduler
                     .run_sync(&request, move || {
-                        fs_ops::read_file(&full_path, position, length)
+                        fs_ops::read_file(&full_path, position, length, allow_mmap)
                     })
                     .map_err(pool_err)?
                     .map_err(IOError::from)?;
@@ -1452,6 +1548,72 @@ pub fn op_read_fd_sync(
 }
 
 //
+// read(fd) into a caller-provided buffer — zero-alloc fast path
+//
+// Reads straight into the JS `ArrayBuffer` backing store (passed as the
+// buffer view). Eliminates the Rust `Vec` allocation, the V8 `ToJsBuffer`
+// copy, and the JS-side `dst.set` copy that `op_read_fd` + `read()` incur —
+// a single kernel copy into user memory. Returns the number of bytes read.
+//
+// **Contract (BYOB, matches Node's `fs.read(fd, buffer, …)`):** the async
+// variant fills the caller's `ArrayBuffer` from an IO worker thread while
+// the JS promise is pending. The caller MUST NOT read from or write to that
+// `ArrayBuffer` until the promise settles — doing so races the worker's
+// write. `JsBuffer`/`V8Slice` keeps the backing store alive across the hop,
+// and SharedArrayBuffer / resizable / detached buffers are rejected by the
+// op's deserialization, so the only unsound usage is the caller violating
+// this "don't touch while pending" rule. The sync variant has no such window
+// (V8 is blocked for the whole call).
+//
+// The byte count is returned via `#[number]` (JS `Number`), not `#[smi]`:
+// an SMI return truncates through `i32`, so a >2 GiB read (theoretically
+// possible for a huge buffer) would surface as a negative count.
+//
+#[op2(async(lazy))]
+#[number]
+pub async fn op_read_fd_into(
+    state: Rc<RefCell<OpState>>,
+    #[smi] rid: FileId,
+    #[buffer] mut buf: JsBuffer,
+    #[bigint] position: Option<u64>,
+) -> Result<usize, IOError> {
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
+    let domain = scheduler.domain();
+    let len = buf.len() as u64;
+    let request = read_request(BackendKind::Filesystem, RequestKind::Async, Some(len));
+    scheduler
+        .run_async(request, move || {
+            domain.read_file_into(rid, buf.as_mut(), position)
+        })
+        .await
+        .map_err(pool_err)?
+        .map_err(domain_err)
+}
+
+#[op2]
+#[number]
+pub fn op_read_fd_into_sync(
+    state: &mut OpState,
+    #[smi] rid: FileId,
+    #[buffer] mut buf: JsBuffer,
+    #[bigint] position: Option<u64>,
+) -> Result<usize, IOError> {
+    let scheduler = get_scheduler(state);
+    let domain = scheduler.domain();
+    let len = buf.len() as u64;
+    let request = read_request(BackendKind::Filesystem, RequestKind::Sync, Some(len));
+    scheduler
+        .run_sync(&request, move || {
+            domain.read_file_into(rid, buf.as_mut(), position)
+        })
+        .map_err(pool_err)?
+        .map_err(domain_err)
+}
+
+//
 // readCompressedFile (path) - read brotli-compressed file
 //
 #[op2(async(lazy), fast)]
@@ -1461,6 +1623,10 @@ pub async fn op_read_compressed_file(
     #[string] path: String,
 ) -> Result<ToJsBuffer, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     let (full_path, pack_data) =
         match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
             ResolvedPath::Filesystem(p) => (p, None),
@@ -1470,11 +1636,11 @@ pub async fn op_read_compressed_file(
             }
         };
 
-    tokio::task::spawn_blocking(move || fs_ops::read_compressed_file(&full_path, pack_data))
-        .await
-        .map_err(|e| ioerr(format!("task join error: {e}")))?
-        .map(|data| data.into())
-        .map_err(IOError::from)
+    run_fs_async(scheduler, move || {
+        fs_ops::read_compressed_file(&full_path, pack_data)
+    })
+    .await
+    .map(|data| data.into())
 }
 
 #[op2]
@@ -1484,6 +1650,7 @@ pub fn op_read_compressed_file_sync(
     #[string] path: String,
 ) -> Result<ToJsBuffer, IOError> {
     let (vfs, mt) = get_vfs_sync(state);
+    let scheduler = get_scheduler(state);
     let (full_path, pack_data) =
         match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
             ResolvedPath::Filesystem(p) => (p, None),
@@ -1493,9 +1660,10 @@ pub fn op_read_compressed_file_sync(
             }
         };
 
-    fs_ops::read_compressed_file(&full_path, pack_data)
-        .map(|data| data.into())
-        .map_err(IOError::from)
+    run_fs_sync(&scheduler, move || {
+        fs_ops::read_compressed_file(&full_path, pack_data)
+    })
+    .map(|data| data.into())
 }
 
 // ============================ ReadZipEntry ============================
@@ -1670,6 +1838,10 @@ pub async fn op_get_file_info(
     #[string] algorithm: String,
 ) -> Result<(u64, String), IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     let (full_path, pack_data) =
         match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
             ResolvedPath::Pack { virtual_path } => {
@@ -1684,10 +1856,10 @@ pub async fn op_get_file_info(
             ResolvedPath::Filesystem(fp) => (fp, None),
         };
 
-    tokio::task::spawn_blocking(move || fs_ops::get_file_info(&full_path, &algorithm, pack_data))
-        .await
-        .map_err(|e| ioerr(format!("task join error: {e}")))?
-        .map_err(IOError::from)
+    run_fs_async(scheduler, move || {
+        fs_ops::get_file_info(&full_path, &algorithm, pack_data)
+    })
+    .await
 }
 
 #[op2]
@@ -1698,6 +1870,7 @@ pub fn op_get_file_info_sync(
     #[string] algorithm: String,
 ) -> Result<(u64, String), IOError> {
     let (vfs, mt) = get_vfs_sync(state);
+    let scheduler = get_scheduler(state);
     let (full_path, pack_data) =
         match resolve_path_vfs(vfs.as_deref(), mt.as_deref(), &path, FileOp::Read)? {
             ResolvedPath::Pack { virtual_path } => {
@@ -1712,7 +1885,9 @@ pub fn op_get_file_info_sync(
             ResolvedPath::Filesystem(fp) => (fp, None),
         };
 
-    fs_ops::get_file_info(&full_path, &algorithm, pack_data).map_err(IOError::from)
+    run_fs_sync(&scheduler, move || {
+        fs_ops::get_file_info(&full_path, &algorithm, pack_data)
+    })
 }
 
 // ============================ ListSavedFiles ============================
@@ -1725,6 +1900,10 @@ pub async fn op_list_saved_files(
     #[string] prefix: String,
 ) -> Result<Vec<SavedFileInfo>, IOError> {
     let (vfs, mt) = get_vfs_async(&state);
+    let scheduler = {
+        let st = state.borrow();
+        get_scheduler(&st)
+    };
     let full_dir = require_fs_path(resolve_path_vfs(
         vfs.as_deref(),
         mt.as_deref(),
@@ -1733,10 +1912,10 @@ pub async fn op_list_saved_files(
     )?)?;
     let virtual_dir = dir;
 
-    tokio::task::spawn_blocking(move || fs_ops::list_saved_files(&full_dir, &prefix, &virtual_dir))
-        .await
-        .map_err(|e| ioerr(format!("task join error: {e}")))?
-        .map_err(IOError::from)
+    run_fs_async(scheduler, move || {
+        fs_ops::list_saved_files(&full_dir, &prefix, &virtual_dir)
+    })
+    .await
 }
 
 #[cfg(test)]

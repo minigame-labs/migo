@@ -286,12 +286,27 @@ pub fn op_create_context_2d(state: &mut OpState, #[smi] canvas_id: u32) -> i32 {
     canvas_id as i32
 }
 
+/// Best-effort barrier before a state-sync op (e.g. `measureText`): the
+/// dispatch is bounded-blocking (no silent drop), but a delivery failure
+/// only means a possibly-stale *font* measurement — the caller's fallback
+/// estimate handles that, so we log and proceed rather than fail the op.
 fn flush_pending_commands_for_state_sync(state: &mut OpState, _canvas_id: u32) {
-    crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
+    if let Err(e) = crate::rendering::webgl::frame_collector::flush_unified_barrier(state) {
+        error!("canvas2d state-sync barrier flush failed: {e}");
+    }
 }
 
-fn flush_pending_commands_for_readback_sync(state: &mut OpState, _canvas_id: u32) {
-    crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
+/// Required barrier before a pixel readback (`getImageData`): if the flush
+/// can't be delivered we must NOT read — the result would reflect
+/// un-materialized 2D content. Returns `Err(())` so the caller bails to its
+/// error path instead of returning stale pixels.
+fn flush_pending_commands_for_readback_sync(
+    state: &mut OpState,
+    _canvas_id: u32,
+) -> Result<(), ()> {
+    crate::rendering::webgl::frame_collector::flush_unified_barrier(state).map_err(|e| {
+        error!("canvas2d readback barrier flush failed, refusing stale read: {e}");
+    })
 }
 
 const OP_MEASURE_TEXT: &str = "canvas2d measure_text";
@@ -498,8 +513,12 @@ pub fn op_get_image_data(
     width: u32,
     height: u32,
 ) -> Vec<u8> {
-    // Flush only dirty Canvas2D work before sync readback.
-    flush_pending_commands_for_readback_sync(state, canvas_id);
+    // Flush only dirty Canvas2D work before sync readback. If the barrier
+    // can't be delivered, refuse to read stale/un-materialized pixels.
+    if flush_pending_commands_for_readback_sync(state, canvas_id).is_err() {
+        error!("{OP_GET_IMAGE_DATA}: barrier flush failed, returning empty");
+        return vec![];
+    }
     let ctx = state.borrow::<CanvasOpState>();
     match send_render_with_resp_sync(ctx, OP_GET_IMAGE_DATA, |resp| RenderCommand::Canvas2D {
         canvas_id,
@@ -572,7 +591,13 @@ pub fn op_force_readback_snapshot(state: &mut OpState, #[smi] snapshot_id: u32) 
     // we return zeros -- which the lazy ImageData getter then writes
     // into the placeholder, producing blank textures (visible as
     // missing dynamic labels in cocos's gl.texImage2D(canvas) path).
-    crate::rendering::webgl::frame_collector::flush_unified_barrier(state);
+    //
+    // Required barrier: if it can't be delivered, refuse to read — the
+    // snapshot pool would be empty and we'd return zeros (blank texture).
+    if crate::rendering::webgl::frame_collector::flush_unified_barrier(state).is_err() {
+        error!("{OP_FORCE_READBACK_SNAPSHOT}: barrier flush failed, returning empty");
+        return Vec::new();
+    }
     let ctx = state.borrow::<CanvasOpState>();
     // canvas_id is irrelevant for the readback path; the manager
     // hops onto any current canvas to issue the FBO bind.  Use 1
@@ -1164,6 +1189,11 @@ pub fn op_fill_text(
             },
         );
     }
+    // Hand-written ops must trigger the same soft-budget auto-flush the
+    // macro-generated ops get, or a burst of fillText/drawImage can balloon
+    // the collector's pending bytes past the budget without ever flushing
+    // (intra-frame memory + latency spike).
+    crate::rendering::webgl::webgl::maybe_auto_flush(state);
 }
 
 #[op2(fast)]
@@ -1188,6 +1218,7 @@ pub fn op_stroke_text(
             },
         );
     }
+    crate::rendering::webgl::webgl::maybe_auto_flush(state);
 }
 
 // Style operations (with deduplication)
@@ -1281,6 +1312,7 @@ pub fn op_set_line_dash(state: &mut OpState, #[smi] canvas_id: u32, #[buffer] se
             .collect();
         collector.set_line_dash(canvas_id, floats);
     }
+    crate::rendering::webgl::webgl::maybe_auto_flush(state);
 }
 
 #[op2(fast)]
@@ -1358,6 +1390,7 @@ pub fn op_set_fill_style_gradient(
         };
         collector.set_fill_style_gradient(canvas_id, gradient_type, x0, y0, r0, x1, y1, r1, stops);
     }
+    crate::rendering::webgl::webgl::maybe_auto_flush(state);
 }
 
 #[op2(fast)]
@@ -1394,6 +1427,7 @@ pub fn op_set_stroke_style_gradient(
             stops,
         );
     }
+    crate::rendering::webgl::webgl::maybe_auto_flush(state);
 }
 
 fn parse_gradient_stops(json: &str) -> Vec<shared::protocol::render_cmd::GradientStop> {
@@ -1472,6 +1506,7 @@ pub fn op_set_font(state: &mut OpState, #[smi] canvas_id: u32, #[string] font: S
     {
         collector.set_font(canvas_id, font);
     }
+    crate::rendering::webgl::webgl::maybe_auto_flush(state);
 }
 
 #[op2(fast)]
@@ -1608,6 +1643,7 @@ pub fn op_draw_image(
             },
         );
     }
+    crate::rendering::webgl::webgl::maybe_auto_flush(state);
 }
 
 #[op2(fast)]
@@ -1650,6 +1686,9 @@ pub fn op_draw_image_batch(state: &mut OpState, #[smi] canvas_id: u32, #[buffer]
     {
         collector.push(canvas_id, Canvas2DCmd::DrawImageBatch { draws });
     }
+    // drawImageBatch can add many entries at once — the most important op to
+    // auto-flush so a sprite storm doesn't blow past the pending-bytes budget.
+    crate::rendering::webgl::webgl::maybe_auto_flush(state);
 }
 
 // Tests for the unified frame collector are in frame_collector.rs.

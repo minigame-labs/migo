@@ -266,6 +266,7 @@ async fn op_worker_create(
             network_policy: host.network_policy.clone(),
             backgrounded: host.backgrounded.clone(),
             webgl_context_created: host.webgl_context_created.clone(),
+            context_lost: host.context_lost.clone(),
             code_signing_enabled: host.code_signing_enabled,
             gpu_caps: host.gpu_caps.clone(),
         };

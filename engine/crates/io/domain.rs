@@ -111,6 +111,18 @@ impl IoDomain {
             .map_err(DomainError::from)
     }
 
+    /// Read into a caller-provided buffer (the JS `ArrayBuffer` backing
+    /// store). Zero-alloc fast path for `read(fd, buffer, …)`.
+    pub fn read_file_into(
+        &self,
+        id: FileId,
+        buf: &mut [u8],
+        position: Option<u64>,
+    ) -> Result<usize, DomainError> {
+        self.with_file_table(|table| table.read_into(id, buf, position))?
+            .map_err(DomainError::from)
+    }
+
     pub fn fstat(&self, id: FileId) -> Result<FileStat, DomainError> {
         self.with_file_table(|table| table.fstat(id))?
             .map_err(DomainError::from)

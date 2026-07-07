@@ -26,11 +26,13 @@
 
 use std::fmt;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::RwLock;
+use lru::LruCache;
+use parking_lot::{Mutex, RwLock};
 
 // ---------------------------------------------------------------------------
 // MountBackend trait
@@ -309,6 +311,22 @@ pub struct MountTable {
     /// the base mount is directory-backed or pack-backed.  Used to reverse-map
     /// `file://` URLs to `/code`-relative paths in the module loader.
     code_dir: PathBuf,
+    /// Memoised results of the expensive `canonicalize` + symlink-chain
+    /// verification for filesystem-backed `/code` paths, keyed by
+    /// `(generation, real_path)`.
+    ///
+    /// `/code` is a **read-only** mount (the JS/VFS layer rejects writes to
+    /// it) whose on-disk tree is immutable within a generation — every
+    /// `mount_overlay` / `unmount_overlay` / `swap_base` bumps `generation`.
+    /// So a real path that once passed the full symlink-escape verification
+    /// stays valid until the next structural change. Including `generation`
+    /// in the key means a mount mutation transparently invalidates every
+    /// stale entry (they can never be read back). On a hit we skip ~10–15
+    /// `stat`/`lstat`/`realpath` syscalls per read — the dominant cost of
+    /// resolving a hot game asset — while `real_path()` still does its single
+    /// existence `stat`, so a file deleted within a generation is still
+    /// surfaced as "not found".
+    verify_cache: Mutex<LruCache<(u64, PathBuf), ()>>,
 }
 
 impl fmt::Debug for MountTable {
@@ -323,6 +341,10 @@ impl fmt::Debug for MountTable {
 }
 
 impl MountTable {
+    /// Capacity of the per-generation verified-path cache. Sized to hold a
+    /// large game's working set of `/code` assets; LRU-evicted beyond that.
+    const VERIFY_CACHE_CAPACITY: usize = 2048;
+
     /// Create a mount table with `base_dir` as the base code directory.
     pub fn new(base_dir: PathBuf) -> Self {
         Self {
@@ -337,7 +359,36 @@ impl MountTable {
                 overlays: Vec::new(),
             }),
             generation: AtomicU64::new(1),
+            verify_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(Self::VERIFY_CACHE_CAPACITY).unwrap(),
+            )),
         }
+    }
+
+    /// `verify_path_containment` for a filesystem-backed `/code` path,
+    /// memoised per `(generation, real_path)`. See the `verify_cache` field
+    /// doc for why this is sound for the read-only `/code` mount.
+    fn verify_contained_cached(&self, real: &Path, root: &Path, generation: u64) -> bool {
+        let key = (generation, real.to_path_buf());
+        if self.verify_cache.lock().get(&key).is_some() {
+            return true;
+        }
+        // Miss: run the full (expensive) verification. A benign race where
+        // two threads verify the same path concurrently just does the work
+        // twice and inserts the same idempotent entry — no correctness issue.
+        if super::verify_path_containment(real, root, true).is_ok() {
+            self.verify_cache.lock().put(key, ());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop all cached verifications. Called on structural mutations; keying
+    /// by generation already makes stale entries unreachable, but clearing
+    /// bounds memory so old generations don't linger until LRU eviction.
+    fn invalidate_verify_cache(&self) {
+        self.verify_cache.lock().clear();
     }
 
     /// Current generation counter.
@@ -368,7 +419,7 @@ impl MountTable {
             match overlay.backend.real_path(sub) {
                 Some(real) => {
                     if let Some(root) = overlay.backend.root_dir() {
-                        if super::verify_path_containment(&real, root, true).is_err() {
+                        if !self.verify_contained_cached(&real, root, current_gen) {
                             return None;
                         }
                     }
@@ -412,7 +463,7 @@ impl MountTable {
         match inner.base.backend.real_path(&normalized) {
             Some(real) => {
                 if let Some(root) = inner.base.backend.root_dir() {
-                    if super::verify_path_containment(&real, root, true).is_err() {
+                    if !self.verify_contained_cached(&real, root, current_gen) {
                         return None;
                     }
                 }
@@ -614,20 +665,22 @@ impl MountTable {
     /// doesn't escape via symlinks.
     pub fn is_allowed_path(&self, path: &Path) -> bool {
         let normalized = super::normalize_path(path);
+        let current_gen = self.generation.load(Ordering::Acquire);
         let inner = self.inner.read();
 
-        // Check filesystem-backed mounts (with canonicalize + symlink verification).
+        // Check filesystem-backed mounts (with canonicalize + symlink
+        // verification, memoised per generation like `resolve`).
         if let Some(root) = inner.base.backend.root_dir() {
             let norm_root = super::normalize_path(root);
             if normalized.starts_with(&norm_root) {
-                return super::verify_path_containment(path, root, true).is_ok();
+                return self.verify_contained_cached(path, root, current_gen);
             }
         }
         for overlay in &inner.overlays {
             if let Some(root) = overlay.backend.root_dir() {
                 let norm_root = super::normalize_path(root);
                 if normalized.starts_with(&norm_root) {
-                    return super::verify_path_containment(path, root, true).is_ok();
+                    return self.verify_contained_cached(path, root, current_gen);
                 }
             }
         }
@@ -806,6 +859,7 @@ impl MountTable {
         }
 
         let new_gen = self.generation.fetch_add(1, Ordering::Release) + 1;
+        self.invalidate_verify_cache();
         let mut inner = self.inner.write();
         inner.overlays.retain(|e| e.prefix != normalized_prefix);
         inner.overlays.push(MountEntry {
@@ -825,6 +879,7 @@ impl MountTable {
         let removed = inner.overlays.len() < before;
         if removed {
             self.generation.fetch_add(1, Ordering::Release);
+            self.invalidate_verify_cache();
         }
         removed
     }
@@ -832,6 +887,7 @@ impl MountTable {
     /// Atomically swap the base mount (e.g. hot-update of the main package).
     pub fn swap_base(&self, new_backend: Arc<dyn MountBackend>) {
         let new_gen = self.generation.fetch_add(1, Ordering::Release) + 1;
+        self.invalidate_verify_cache();
         let mut inner = self.inner.write();
         inner.base = MountEntry {
             name: "base".to_string(),
@@ -1818,6 +1874,68 @@ mod tests {
         let res2 = mt.resolve("main.js").unwrap();
         assert_eq!(res2.real_path, Some(v2.join("main.js")));
         assert!(res2.mount_generation > res1.mount_generation);
+
+        let _ = fs::remove_dir_all(&v1);
+        let _ = fs::remove_dir_all(&v2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Verified-path cache (P0 perf): correctness must be unchanged
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_repeat_hits_verify_cache_and_stays_correct() {
+        // Second resolve of the same path takes the verify-cache fast path
+        // (skips canonicalize + symlink chain walk). Result must be identical.
+        let base = make_test_dir("verify_cache_hit");
+        fs::create_dir_all(base.join("a/b")).unwrap();
+        fs::write(base.join("a/b/c.js"), "//").unwrap();
+
+        let mt = MountTable::new(base.clone());
+        let r1 = mt.resolve("a/b/c.js").unwrap();
+        let r2 = mt.resolve("a/b/c.js").unwrap();
+        assert_eq!(r1.real_path, r2.real_path);
+        assert_eq!(r1.mount_generation, r2.mount_generation);
+        assert_eq!(r2.real_path, Some(base.join("a/b/c.js")));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_cache_never_caches_a_rejected_symlink() {
+        // A rejected (escaping) path must never be inserted into the cache,
+        // so a repeat resolve stays rejected rather than being served a
+        // stale "valid" entry.
+        let base = make_test_dir("verify_cache_reject");
+        let outside = make_test_dir("verify_cache_outside");
+        fs::write(outside.join("secret.txt"), "leaked").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("evil")).unwrap();
+
+        let mt = MountTable::new(base.clone());
+        assert!(mt.resolve("evil/secret.txt").is_none());
+        assert!(mt.resolve("evil/secret.txt").is_none());
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn swap_base_invalidates_verify_cache() {
+        // Priming the cache under generation N must not leak a stale real
+        // path after swap_base bumps the generation and clears the cache.
+        let v1 = make_test_dir("verify_cache_swap_v1");
+        let v2 = make_test_dir("verify_cache_swap_v2");
+        fs::write(v1.join("main.js"), "v1").unwrap();
+        fs::write(v2.join("main.js"), "v2").unwrap();
+
+        let mt = MountTable::new(v1.clone());
+        let r1 = mt.resolve("main.js").unwrap();
+        assert_eq!(r1.real_path, Some(v1.join("main.js")));
+
+        mt.swap_base(Arc::new(DirSource::new(v2.clone())));
+        let r2 = mt.resolve("main.js").unwrap();
+        assert_eq!(r2.real_path, Some(v2.join("main.js")));
 
         let _ = fs::remove_dir_all(&v1);
         let _ = fs::remove_dir_all(&v2);

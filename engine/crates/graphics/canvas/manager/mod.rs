@@ -1241,6 +1241,26 @@ impl CanvasManager {
                 .with_detail(format!("image_id={}: {reason}", pending.image_id));
             pending.resp.err(err);
         }
+
+        // Drop in-flight async uploads too. Their textures + fences were
+        // created on the now-lost context: the fences can never signal, so
+        // `drain_upload_completed` would re-queue each entry forever
+        // (leaking the GL texture + fence) and their upload budget would
+        // never be released, eventually wedging all future uploads. Delete
+        // the (already-dead) GL objects best-effort and, crucially, release
+        // the byte budget locally.
+        let take_uploads = std::mem::take(&mut self.pending_uploads);
+        for c in take_uploads {
+            unsafe {
+                self.gl.delete_texture(c.texture);
+                self.gl.delete_sync(c.fence);
+            }
+            if let Some(ref mut server) = self.upload_server {
+                server.finish_job_bytes(c.byte_len);
+            }
+            self.cancelled_uploads.remove(&c.image_id);
+            drained += 1;
+        }
         drained
     }
 
@@ -1248,6 +1268,23 @@ impl CanvasManager {
     /// onscreen surface using the last known window handle.
     /// Returns Ok(true) if recovery succeeded, Ok(false) if no window
     /// handle is available, or Err on failure.
+    ///
+    /// KNOWN LIMITATION (tracked for a device-verified rework): a real
+    /// `EGL_CONTEXT_LOST` / GPU reset invalidates the *entire share group*
+    /// — the resource context, every canvas context, the upload-thread
+    /// context, and all GL objects (WebGL programs/buffers/textures/FBOs,
+    /// `image_registry`, snapshot FBOs, atlas, PBO pools). This recovery
+    /// only re-creates the onscreen surface and (via `create_onscreen`)
+    /// currently *reuses* the preserved onscreen context, which is dead
+    /// after a genuine loss; it also leaves offscreen 2D Ganesh contexts
+    /// abandoned-but-present so they are not rebuilt. Fully correct recovery
+    /// must: recreate the whole EGL stack, drop/rebuild every GL resource,
+    /// expose `isContextLost()==true` to JS during the gap, and let the game
+    /// rebuild its WebGL resources on restore. That requires a device that
+    /// can trigger context loss to verify, so it is intentionally left as a
+    /// dedicated task rather than a blind, unverifiable partial fix here.
+    /// `gl_state.clear()` below is necessary (invalidate the shadow state)
+    /// but NOT sufficient on its own.
     pub(crate) fn try_recover_context(&mut self) -> EngineResult<bool> {
         if !self.context_lost {
             return Ok(false);
@@ -1255,6 +1292,16 @@ impl CanvasManager {
         if let Some(window) = self.last_window {
             tracing::info!("Attempting EGL context loss recovery");
             self.create_onscreen(window, None)?;
+            // The recovered context starts from GL defaults, but the
+            // per-canvas `gl_state` shadow still holds the *old* context's
+            // cached bindings/state. Leaving it would let the state tracker
+            // dedupe away GL calls the fresh context actually needs
+            // (program/buffer/texture binds, blend/scissor/viewport), i.e.
+            // render with the wrong or unbound state. Clear it so the next
+            // frame re-issues everything; `or_default()` on next access
+            // yields the conservative "unknown, must re-issue" state. The
+            // 2D Skia contexts are separately abandoned on the loss path.
+            self.gl_state.clear();
             tracing::info!("EGL context recovered successfully");
             Ok(true)
         } else {

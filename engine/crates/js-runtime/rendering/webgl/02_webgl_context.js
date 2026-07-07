@@ -3,6 +3,7 @@ import {
     op_clear,
     op_clear_color,
     op_gl_flush,
+    op_gl_is_context_lost,
     op_create_program,
     op_use_program,
     op_link_program,
@@ -580,7 +581,13 @@ class WebGLRenderingContext {
     }
 
     isContextLost() {
-        return false;
+        // Reflects the real render-context state (set by the host on a
+        // ContextLost render event, cleared on successful recovery), so
+        // games that guard draw calls on this stop issuing GL into a dead
+        // context. Note: a webglcontextlost/restored *event* is not yet
+        // dispatched -- poll this instead until the device-verified recovery
+        // task wires the event.
+        return op_gl_is_context_lost();
     }
 
     getShaderPrecisionFormat(_shaderType, precisionType) {

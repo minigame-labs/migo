@@ -17,7 +17,7 @@ use shared::{
     error::{EngineError, ErrorCode},
     protocol::io_cmd::{
         FileId, FileStat, MAX_READ_LENGTH, OpenFlag, SavedFileInfo, StatEntry, StatResult,
-        WriteMode,
+        WriteDurability, WriteMode,
     },
     vfs::MountTable,
 };
@@ -52,6 +52,79 @@ pub(crate) fn io_err_ctx(e: std::io::Error, op: &'static str, path: &str) -> Eng
 #[inline]
 fn code_err(code: ErrorCode) -> EngineError {
     EngineError::new(code)
+}
+
+/// `fsync` the directory containing `path` so a newly created file's
+/// *name* (the directory entry) survives a crash / power loss.
+///
+/// Returns the underlying error so callers with a strict durability
+/// contract (default-`Durable` `appendFile` creating a new file) can
+/// **propagate** it — matching [`crate::atomic_write::atomic_write`],
+/// which also fails if the parent-dir fsync fails. Callers with a mere
+/// durability *hint* (the `'as'` open flag) intentionally ignore it.
+///
+/// A no-op returning `Ok(())` on Windows (directory handles don't accept
+/// `FlushFileBuffers`).
+/// Open a file for appending, reporting whether *this* call created it.
+///
+/// Race-free against a concurrent create/delete storm: `create_new` is the
+/// only *creating* open. The existing-file fallback opens **without**
+/// `create`, so a file deleted between the `create_new` (AlreadyExists) and
+/// the fallback can't be silently re-created with `created = false` (the
+/// TOCTOU that would make a Durable append skip its parent-dir fsync).
+/// Instead the fallback sees `NotFound` and we retry `create_new`.
+///
+/// Bounded to a handful of iterations so a pathological external process
+/// alternately creating and deleting the path can't spin forever.
+fn open_append_created_aware(
+    path: &str,
+    read: bool,
+) -> Result<(std::fs::File, bool), EngineError> {
+    for _ in 0..16 {
+        let mut create_opts = std::fs::OpenOptions::new();
+        if read {
+            create_opts.read(true);
+        }
+        create_opts.append(true).create_new(true);
+        match create_opts.open(path) {
+            Ok(f) => return Ok((f, true)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Fallback WITHOUT create: if the file vanished meanwhile we
+                // get NotFound and loop back to create_new rather than
+                // re-creating it with the wrong `created` flag.
+                let mut open_opts = std::fs::OpenOptions::new();
+                if read {
+                    open_opts.read(true);
+                }
+                open_opts.append(true);
+                match open_opts.open(path) {
+                    Ok(f) => return Ok((f, false)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(io_err(e)),
+                }
+            }
+            Err(e) => return Err(io_err(e)),
+        }
+    }
+    Err(EngineError::new(ErrorCode::IoError)
+        .with_detail("append open lost a create/delete race repeatedly"))
+}
+
+#[inline]
+fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                return std::fs::File::open(parent)?.sync_all();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 #[inline]
@@ -210,6 +283,12 @@ pub struct FileTable {
     files: HashMap<FileId, std::fs::File>,
     temp_files: HashMap<FileId, PathBuf>,
     synthetic_stats: HashMap<FileId, FileStat>,
+    /// FDs opened with a synchronous-write flag (`'as'` / `'as+'`).
+    /// Each `write` to these must `fsync` before returning so the
+    /// durability the flag name promises actually holds — matching
+    /// Node/`wx` `'as'` semantics. Kept as a set (not a `File` field)
+    /// so the common non-sync fd pays nothing.
+    sync_on_write: std::collections::HashSet<FileId>,
 }
 
 impl FileTable {
@@ -223,6 +302,7 @@ impl FileTable {
             files: HashMap::with_capacity(Self::INITIAL_FILE_CAPACITY),
             temp_files: HashMap::new(),
             synthetic_stats: HashMap::new(),
+            sync_on_write: std::collections::HashSet::new(),
         }
     }
 
@@ -289,8 +369,36 @@ impl FileTable {
             }
         }
 
-        let file = opts.open(path).map_err(io_err)?;
+        let is_sync_append = matches!(
+            flag,
+            OpenFlag::AppendSyncCreate | OpenFlag::ReadAppendSyncCreate
+        );
+
+        // For the sync-append flags, open in a created-aware, race-free way
+        // (see `open_append_created_aware`) so we fsync the parent dir *only*
+        // when we actually created the file, instead of on every `'as'` open.
+        // Other flags use the `opts` built above.
+        let (file, created) = if is_sync_append {
+            open_append_created_aware(path, matches!(flag, OpenFlag::ReadAppendSyncCreate))?
+        } else {
+            (opts.open(path).map_err(io_err)?, false)
+        };
+
         let id = self.alloc_id()?;
+        // `'as'` / `'as+'` request synchronous appends: remember the fd so
+        // every `write` fsyncs before returning (see `write`).
+        if is_sync_append {
+            self.sync_on_write.insert(id);
+            if created {
+                // Only a freshly-created file needs its directory entry
+                // (the name) made durable. Best-effort here: `'as'` is a
+                // durability *hint*, not the strict Durable `appendFile`
+                // contract, so a parent-dir fsync failure doesn't fail the
+                // open. Per-write `sync_data` (see `write`) keeps contents
+                // durable regardless.
+                let _ = fsync_parent_dir(Path::new(path));
+            }
+        }
         self.files.insert(id, file);
         if let Some(path) = cleanup_path {
             self.temp_files.insert(id, path);
@@ -311,6 +419,9 @@ impl FileTable {
                     let _ = std::fs::remove_file(path);
                 }
                 self.synthetic_stats.remove(&id);
+                // Clear the sync flag so a later fd that reuses this id
+                // (via `free_ids`) doesn't inherit a stale sync intent.
+                self.sync_on_write.remove(&id);
                 self.free_ids.push(id);
                 cleanup_path
             })
@@ -360,11 +471,20 @@ impl FileTable {
         Ok(buf)
     }
 
-    /// Write data to a file descriptor, optionally seeking first.
-    pub fn write(
+    /// Read into a caller-provided buffer, optionally seeking first.
+    ///
+    /// Fills `buf` from the file and returns the number of bytes read
+    /// (`< buf.len()` at EOF). Unlike [`read`](Self::read) this performs
+    /// **no allocation** — the destination is the JS `ArrayBuffer`'s backing
+    /// store, so the read is a single kernel copy straight into user memory
+    /// (no intermediate `Vec` + no V8 `ToJsBuffer` copy + no JS-side
+    /// `dst.set`). The length is implicitly bounded by `buf.len()`, which is
+    /// itself bounded by the JS-allocated buffer, so no `MAX_READ_LENGTH`
+    /// check is needed here.
+    pub fn read_into(
         &mut self,
         id: FileId,
-        data: &[u8],
+        buf: &mut [u8],
         position: Option<u64>,
     ) -> Result<usize, EngineError> {
         let file = self
@@ -376,7 +496,46 @@ impl FileTable {
             file.seek(SeekFrom::Start(pos)).map_err(io_err)?;
         }
 
+        let mut total = 0;
+        while total < buf.len() {
+            match file.read(&mut buf[total..]) {
+                Ok(0) => break, // EOF
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(io_err(e)),
+            }
+        }
+        Ok(total)
+    }
+
+    /// Write data to a file descriptor, optionally seeking first.
+    ///
+    /// For fds opened with a synchronous flag (`'as'` / `'as+'`) the
+    /// written bytes are flushed to disk (`sync_data`) before returning,
+    /// so the durability those flags advertise actually holds.
+    pub fn write(
+        &mut self,
+        id: FileId,
+        data: &[u8],
+        position: Option<u64>,
+    ) -> Result<usize, EngineError> {
+        let sync = self.sync_on_write.contains(&id);
+        let file = self
+            .files
+            .get_mut(&id)
+            .ok_or_else(|| code_err(ErrorCode::BadFileDescriptor))?;
+
+        if let Some(pos) = position {
+            file.seek(SeekFrom::Start(pos)).map_err(io_err)?;
+        }
+
         file.write_all(data).map_err(io_err)?;
+        if sync {
+            // `sync_data` (fdatasync) rather than `sync_all`: we only need
+            // the data + size durable, not the atime/mtime metadata, which
+            // is the cheaper guarantee callers of `'as'` actually want.
+            file.sync_data().map_err(io_err)?;
+        }
         Ok(data.len())
     }
 
@@ -415,6 +574,7 @@ impl FileTable {
             let _ = std::fs::remove_file(path);
         }
         self.synthetic_stats.clear();
+        self.sync_on_write.clear();
         self.free_ids.clear();
     }
 }
@@ -830,16 +990,26 @@ const MMAP_READ_THRESHOLD: u64 = 256 * 1024;
 
 /// Read a file (or a range within it). Enforces MAX_READ_LENGTH.
 ///
-/// Whole-file reads (`position == None && length == None`) where the
-/// file is at least [`MMAP_READ_THRESHOLD`] bytes are served via
-/// `mmap` + a single `to_vec` copy, eliminating the `Vec` realloc
-/// loop of the byte-by-byte path.  Partial-range reads and small
-/// files still use the classic `File::read` loop — mmap on small
-/// files pays more in setup than it saves in copy cost.
+/// Opens the file **once** and uses a single `fstat` for the size /
+/// limit checks — the previous implementation did a redundant
+/// path-based `std::fs::metadata` before opening on every whole-file
+/// read.
+///
+/// Whole-file reads (`position == None && length == None`) of at least
+/// [`MMAP_READ_THRESHOLD`] bytes are served via `mmap` + a single
+/// `to_vec` copy **only when `allow_mmap` is set**. mmap is gated to
+/// read-only backends (`/code`) because mapping a *writable* file is
+/// unsound: if a concurrent writer truncates it while we copy pages
+/// out, touching a page past the new EOF raises `SIGBUS` and crashes
+/// the process. `/code` is read-only and immutable within a mount
+/// generation, so it is safe there; `/user` `/cache` `/tmp` are not and
+/// fall back to a presized `read`. Smaller whole-file reads and all
+/// range reads use `read` regardless.
 pub fn read_file(
     path: &str,
     position: Option<u64>,
     length: Option<u64>,
+    allow_mmap: bool,
 ) -> Result<Vec<u8>, EngineError> {
     let started_at = Instant::now();
     if let Some(len) = length {
@@ -853,65 +1023,73 @@ pub fn read_file(
         }
     }
 
-    // Fast path: whole-file read, size >= threshold → mmap.  The
-    // file's metadata tells us the size without opening a read
-    // handle twice; we skip this when a range is requested because
-    // mmap-of-partial makes no sense (memmap2 maps the entire file,
-    // not a sub-range).
+    // Open once; every subsequent size check uses this handle's `fstat`.
+    let mut file = std::fs::File::open(path).map_err(|e| io_err_ctx(e, "read_file", path))?;
+
+    // Whole-file read: one fstat serves the limit check, the mmap
+    // decision, and the presized allocation.
     if position.is_none() && length.is_none() {
-        if let Ok(meta) = std::fs::metadata(path) {
-            let file_len = meta.len();
-            if file_len > MAX_READ_LENGTH {
-                return Err(
-                    EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
-                        "remaining file size {} exceeds limit {}",
-                        file_len, MAX_READ_LENGTH
-                    )),
-                );
-            }
-            if file_len >= MMAP_READ_THRESHOLD {
-                match crate::mmap_reader::mmap_file_bytes(path) {
-                    Ok(mapped) => {
-                        // NOTE: this is **not** zero-copy. The mmap
-                        // speeds up the read itself (a single mapped
-                        // range instead of an 8 KiB loop with
-                        // incremental `Vec` growth), but `.to_vec()`
-                        // still produces an owned `Vec<u8>` of the
-                        // full file length. Peak user-space memory is
-                        // therefore `O(file_size)`. A truly zero-copy
-                        // path for JS requires a streaming RID model;
-                        // until that lands, callers must treat this
-                        // as a fast-copy, not a zero-copy.
-                        let data = mapped.as_slice().to_vec();
-                        trace_fs_edge(
-                            "read_file",
-                            path,
-                            started_at,
-                            &format!("size={}B mmap=1", data.len()),
-                        );
-                        return Ok(data);
-                    }
-                    Err(e) => {
-                        // mmap failed (sparse file, network FS quirk,
-                        // exotic kernel restriction). Surface only at
-                        // debug level and fall through to the read
-                        // loop — correctness wins over the speedup.
-                        tracing::debug!("mmap read failed for {path}, falling back: {e}");
-                    }
+        let file_len = file
+            .metadata()
+            .map_err(|e| io_err_ctx(e, "read_file:metadata", path))?
+            .len();
+        if file_len > MAX_READ_LENGTH {
+            return Err(
+                EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
+                    "remaining file size {} exceeds limit {}",
+                    file_len, MAX_READ_LENGTH
+                )),
+            );
+        }
+
+        if allow_mmap && file_len >= MMAP_READ_THRESHOLD {
+            // Map the already-open handle (no second `open`). NOT
+            // zero-copy: `.to_vec()` still owns a `Vec<u8>` of the full
+            // length. Only reached for read-only backends (see fn doc)
+            // so the truncation→SIGBUS window doesn't apply.
+            match crate::mmap_reader::mmap_bytes_from_file(&file) {
+                Ok(mapped) => {
+                    let data = mapped.as_slice().to_vec();
+                    trace_fs_edge(
+                        "read_file",
+                        path,
+                        started_at,
+                        &format!("size={}B mmap=1", data.len()),
+                    );
+                    return Ok(data);
+                }
+                Err(e) => {
+                    // Exotic FS / kernel restriction: fall through to the
+                    // read path using the same open handle.
+                    tracing::debug!("mmap read failed for {path}, falling back: {e}");
                 }
             }
         }
+
+        // Non-mmap whole-file read: presize to the exact length (bounded
+        // by MAX_READ_LENGTH, checked above) so we skip the `Vec` realloc
+        // growth loop.
+        let mut buf = Vec::with_capacity(file_len as usize);
+        (&mut file)
+            .take(file_len)
+            .read_to_end(&mut buf)
+            .map_err(|e| io_err_ctx(e, "read_file", path))?;
+        trace_fs_edge(
+            "read_file",
+            path,
+            started_at,
+            &format!("size={}B mmap=0", buf.len()),
+        );
+        return Ok(buf);
     }
 
-    let mut file = std::fs::File::open(path).map_err(|e| io_err_ctx(e, "read_file", path))?;
-
-    // When length is not specified, check that the remaining bytes from
-    // position to EOF don't exceed the limit.
+    // Range read. When length is unspecified (position-only) verify the
+    // remaining bytes from position to EOF are within the limit.
     if length.is_none() {
-        let meta = file
+        let file_len = file
             .metadata()
-            .map_err(|e| io_err_ctx(e, "read_file:metadata", path))?;
-        let file_len = meta.len();
+            .map_err(|e| io_err_ctx(e, "read_file:metadata", path))?
+            .len();
         let remaining = file_len.saturating_sub(position.unwrap_or(0));
         if remaining > MAX_READ_LENGTH {
             return Err(
@@ -930,16 +1108,16 @@ pub fn read_file(
 
     // Read specified length or rest of file.
     let data = if let Some(len) = length {
-        let mut buf = vec![0u8; len as usize];
-        let mut total = 0;
-        while total < buf.len() {
-            match file.read(&mut buf[total..]) {
-                Ok(0) => break, // EOF
-                Ok(n) => total += n,
-                Err(e) => return Err(io_err_ctx(e, "read_file", path)),
-            }
-        }
-        buf.truncate(total);
+        // Grow the buffer as bytes actually arrive instead of reserving
+        // the full `len` up front: a small file read with a large `len`
+        // (e.g. readFile(path, {length: 100 MiB}) on a 1 KiB file) no
+        // longer allocates the whole cap and then truncates. Mirrors the
+        // fd-based `FileTable::read` fix.
+        let mut buf = Vec::with_capacity((len as usize).min(64 * 1024));
+        (&mut file)
+            .take(len)
+            .read_to_end(&mut buf)
+            .map_err(|e| io_err_ctx(e, "read_file", path))?;
         buf
     } else {
         read_file_to_end_limited(&mut file, MAX_READ_LENGTH)
@@ -1215,29 +1393,57 @@ pub fn list_saved_files(
 // File writes (5)
 // ---------------------------------------------------------------------------
 
-/// Write data to a file (overwrite or append).
+/// Write data to a file (overwrite or append) at the requested durability.
 ///
-/// Overwrite uses [`crate::atomic_write::atomic_write`] so a crash or
-/// power loss never leaves the target file truncated: readers observe
-/// either the old bytes or the new bytes.  Append opens with `O_APPEND`
-/// and fsyncs after the write — atomicity only guarantees each
-/// individual `write_all` is one contiguous tail slice.
-pub fn write_file(path: &str, data: &[u8], mode: WriteMode) -> Result<bool, EngineError> {
+/// With [`WriteDurability::Durable`] (the default) overwrite uses
+/// [`crate::atomic_write::atomic_write`] (`temp -> fsync -> rename -> dir
+/// fsync`) so a crash or power loss never leaves the target truncated —
+/// readers observe either the old or the new bytes — and append `fsync`s
+/// after writing so an `appendFile` immediately followed by power loss
+/// can't lose the just-appended bytes.
+///
+/// With [`WriteDurability::Fast`] overwrite does a plain truncating
+/// `std::fs::write` and append skips the `fsync`: higher throughput, but a
+/// crash can leave a torn (overwrite) or lost (append) write. Only for
+/// scratch/cache data the caller can afford to lose.
+pub fn write_file(
+    path: &str,
+    data: &[u8],
+    mode: WriteMode,
+    durability: WriteDurability,
+) -> Result<bool, EngineError> {
     match mode {
-        WriteMode::Overwrite => crate::atomic_write::atomic_write(path, data)
-            .map(|_| true)
-            .map_err(io_err),
+        WriteMode::Overwrite => match durability {
+            WriteDurability::Durable => crate::atomic_write::atomic_write(path, data)
+                .map(|_| true)
+                .map_err(io_err),
+            WriteDurability::Fast => std::fs::write(path, data)
+                .map(|_| true)
+                .map_err(|e| io_err_ctx(e, "write_file", path)),
+        },
         WriteMode::Append => {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(io_err)?;
+            // Distinguish a freshly-created file from an append to an
+            // existing one, race-free (see `open_append_created_aware`).
+            // Only a newly-created file needs a parent-dir fsync (its *name*
+            // must be durable); an existing file's directory entry already
+            // survived a prior fsync.
+            let (mut file, created) = open_append_created_aware(path, false)?;
             file.write_all(data).map_err(io_err)?;
-            // Ensure the appended region is on disk before we return
-            // success to JS; without this an `appendFile` immediately
-            // followed by a power loss can lose the just-appended bytes.
-            file.sync_all().map_err(io_err)?;
+            if durability == WriteDurability::Durable {
+                // Ensure the appended region is on disk before we return
+                // success to JS; without this an `appendFile` immediately
+                // followed by a power loss can lose the just-appended bytes.
+                file.sync_all().map_err(io_err)?;
+                if created {
+                    // Data + size are durable, but for a file we just
+                    // created the directory entry (the name itself) also
+                    // needs an fsync, else a crash right after create+append
+                    // can lose the whole file. Propagate the error (like
+                    // atomic_write) so a Durable append can't silently
+                    // claim crash-safety it didn't achieve.
+                    fsync_parent_dir(Path::new(path)).map_err(io_err)?;
+                }
+            }
             Ok(true)
         }
     }
@@ -1249,8 +1455,13 @@ pub fn write_file(path: &str, data: &[u8], mode: WriteMode) -> Result<bool, Engi
 /// BackingStore before crossing the thread boundary.  For direct-call mode
 /// the caller will have already performed the copy, so this function just
 /// delegates to `write_file`.
-pub fn write_shared(path: &str, data: &[u8], mode: WriteMode) -> Result<bool, EngineError> {
-    write_file(path, data, mode)
+pub fn write_shared(
+    path: &str,
+    data: &[u8],
+    mode: WriteMode,
+    durability: WriteDurability,
+) -> Result<bool, EngineError> {
+    write_file(path, data, mode, durability)
 }
 
 /// Delete a file.
@@ -1460,6 +1671,104 @@ mod tests {
     }
 
     #[test]
+    fn file_table_append_sync_flag_writes_and_syncs() {
+        // `'as'` (AppendSyncCreate) must append and durably sync each
+        // write. We can't observe fsync directly in a unit test, but we
+        // verify the write path (which now calls sync_data) succeeds and
+        // the bytes land correctly on repeated appends.
+        let dir = tmp_dir("ft_append_sync");
+        let path = dir.join("as.log");
+
+        let mut ft = FileTable::new();
+        let id = ft
+            .open(
+                path.to_str().unwrap(),
+                OpenFlag::AppendSyncCreate,
+                None,
+                None,
+            )
+            .unwrap();
+        ft.write(id, b"line1\n", None).unwrap();
+        ft.write(id, b"line2\n", None).unwrap();
+        ft.close(id).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"line1\nline2\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_table_sync_flag_cleared_on_close_for_reused_id() {
+        // The sync-on-write set must not leak across fd reuse: after
+        // closing an `'as'` fd, the next fd (which reuses the id from
+        // free_ids) must not inherit the sync intent. A non-sync write
+        // to the reused id must still behave correctly.
+        let dir = tmp_dir("ft_sync_reuse");
+        let sync_path = dir.join("sync.log");
+        let plain_path = dir.join("plain.txt");
+
+        let mut ft = FileTable::new();
+        let sync_id = ft
+            .open(
+                sync_path.to_str().unwrap(),
+                OpenFlag::AppendSyncCreate,
+                None,
+                None,
+            )
+            .unwrap();
+        ft.close(sync_id).unwrap();
+
+        // Reuses `sync_id` from free_ids.
+        let reused_id = ft
+            .open(
+                plain_path.to_str().unwrap(),
+                OpenFlag::WriteTruncateCreate,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(reused_id, sync_id, "id should be reused from free_ids");
+        assert!(
+            !ft.sync_on_write.contains(&reused_id),
+            "reused fd must not inherit stale sync intent"
+        );
+        ft.write(reused_id, b"data", None).unwrap();
+        ft.close(reused_id).unwrap();
+
+        assert_eq!(std::fs::read(&plain_path).unwrap(), b"data");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_table_read_into_fills_caller_buffer() {
+        let dir = tmp_dir("ft_read_into");
+        let path = dir.join("ri.txt");
+        std::fs::write(&path, b"abcdef").unwrap();
+
+        let mut ft = FileTable::new();
+        let id = ft
+            .open(path.to_str().unwrap(), OpenFlag::Read, None, None)
+            .unwrap();
+
+        let mut buf = [0u8; 4];
+        let n = ft.read_into(id, &mut buf, None).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf, b"abcd");
+
+        // Positional read where the buffer is larger than the remaining
+        // bytes returns a short count (EOF), not an error.
+        let mut buf2 = [0u8; 10];
+        let n2 = ft.read_into(id, &mut buf2, Some(4)).unwrap();
+        assert_eq!(n2, 2);
+        assert_eq!(&buf2[..2], b"ef");
+
+        // Bad fd is an error.
+        assert!(ft.read_into(9999, &mut buf, None).is_err());
+
+        ft.close(id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn file_table_ftruncate() {
         let dir = tmp_dir("ft_trunc");
         let path = dir.join("trunc.txt");
@@ -1610,15 +1919,15 @@ mod tests {
         std::fs::write(&path, b"0123456789").unwrap();
 
         // Full read
-        let data = read_file(path.to_str().unwrap(), None, None).unwrap();
+        let data = read_file(path.to_str().unwrap(), None, None, true).unwrap();
         assert_eq!(&data, b"0123456789");
 
         // Partial read with position + length
-        let data2 = read_file(path.to_str().unwrap(), Some(3), Some(4)).unwrap();
+        let data2 = read_file(path.to_str().unwrap(), Some(3), Some(4), true).unwrap();
         assert_eq!(&data2, b"3456");
 
         // Read from position to end
-        let data3 = read_file(path.to_str().unwrap(), Some(7), None).unwrap();
+        let data3 = read_file(path.to_str().unwrap(), Some(7), None, true).unwrap();
         assert_eq!(&data3, b"789");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1644,7 +1953,7 @@ mod tests {
         let payload = big_payload((MMAP_READ_THRESHOLD as usize) + 8 * 1024);
         std::fs::write(&path, &payload).unwrap();
 
-        let via_mmap = read_file(path.to_str().unwrap(), None, None).unwrap();
+        let via_mmap = read_file(path.to_str().unwrap(), None, None, true).unwrap();
         let via_std = std::fs::read(&path).unwrap();
         assert_eq!(via_mmap.len(), payload.len());
         assert_eq!(via_mmap, via_std);
@@ -1667,15 +1976,34 @@ mod tests {
         std::fs::write(&big, &big_data).unwrap();
 
         assert_eq!(
-            read_file(small.to_str().unwrap(), None, None)
+            read_file(small.to_str().unwrap(), None, None, true)
                 .unwrap()
                 .len(),
             small_data.len()
         );
         assert_eq!(
-            read_file(big.to_str().unwrap(), None, None).unwrap().len(),
+            read_file(big.to_str().unwrap(), None, None, true)
+                .unwrap()
+                .len(),
             big_data.len()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_disallow_mmap_still_returns_correct_bytes() {
+        // Writable-dir reads pass allow_mmap=false (mmap of a truncatable
+        // file risks SIGBUS). A large file must still read correctly via
+        // the presized read path.
+        let dir = tmp_dir("rf_no_mmap");
+        let path = dir.join("big.bin");
+        let payload = big_payload((MMAP_READ_THRESHOLD as usize) + 4096);
+        std::fs::write(&path, &payload).unwrap();
+
+        let via_read = read_file(path.to_str().unwrap(), None, None, false).unwrap();
+        assert_eq!(via_read.len(), payload.len());
+        assert_eq!(via_read, payload);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1693,7 +2021,7 @@ mod tests {
 
         // Read a 64-byte range from the middle.
         let start = payload.len() as u64 / 2;
-        let got = read_file(path.to_str().unwrap(), Some(start), Some(64)).unwrap();
+        let got = read_file(path.to_str().unwrap(), Some(start), Some(64), true).unwrap();
         assert_eq!(got.len(), 64);
         assert_eq!(
             got.as_slice(),
@@ -1711,7 +2039,7 @@ mod tests {
         // `err.errno === -2` / `err.path === '/…'` without
         // string-parsing.
         let bad = "/does/not/exist/migo_errno_probe";
-        let err = read_file(bad, None, None).unwrap_err();
+        let err = read_file(bad, None, None, true).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         // -2 is ENOENT on every Linux/Android build we target.
         assert_eq!(err.errno, Some(-2), "errno not captured: {err:?}");
@@ -1764,8 +2092,30 @@ mod tests {
         let dir = tmp_dir("rf_max");
         let path = dir.join("tiny.bin");
         std::fs::write(&path, b"tiny").unwrap();
-        let err = read_file(path.to_str().unwrap(), None, Some(MAX_READ_LENGTH + 1)).unwrap_err();
+        let err =
+            read_file(path.to_str().unwrap(), None, Some(MAX_READ_LENGTH + 1), true).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_large_length_on_small_file_returns_only_file_bytes() {
+        // Regression: a big `length` on a tiny file must return just the
+        // file's bytes without pre-allocating the full (valid, <=
+        // MAX_READ_LENGTH) length. Behaviour guard for the growth-based
+        // read path that replaced `vec![0u8; len]`.
+        let dir = tmp_dir("rf_big_len_small_file");
+        let path = dir.join("tiny.bin");
+        std::fs::write(&path, b"0123456789").unwrap();
+
+        // length far larger than the file, but within MAX_READ_LENGTH.
+        let data = read_file(path.to_str().unwrap(), None, Some(8 * 1024 * 1024), true).unwrap();
+        assert_eq!(&data, b"0123456789");
+
+        // With a position + oversized length: returns from position to EOF.
+        let data2 =
+            read_file(path.to_str().unwrap(), Some(4), Some(8 * 1024 * 1024), true).unwrap();
+        assert_eq!(&data2, b"456789");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1774,14 +2124,73 @@ mod tests {
         let dir = tmp_dir("wf_modes");
         let path = dir.join("w.txt");
 
-        write_file(path.to_str().unwrap(), b"hello", WriteMode::Overwrite).unwrap();
+        write_file(
+            path.to_str().unwrap(),
+            b"hello",
+            WriteMode::Overwrite,
+            WriteDurability::Durable,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
 
-        write_file(path.to_str().unwrap(), b" world", WriteMode::Append).unwrap();
+        write_file(
+            path.to_str().unwrap(),
+            b" world",
+            WriteMode::Append,
+            WriteDurability::Durable,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
 
-        write_file(path.to_str().unwrap(), b"new", WriteMode::Overwrite).unwrap();
+        // Fast durability: overwrite still lands correctly (just not fsync'd).
+        write_file(
+            path.to_str().unwrap(),
+            b"new",
+            WriteMode::Overwrite,
+            WriteDurability::Fast,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_append_creates_new_file_then_appends() {
+        // First durable append to a non-existent path exercises the
+        // created=true branch (parent-dir fsync); the second hits the
+        // existing-file branch. Then a Fast append to a fresh file.
+        let dir = tmp_dir("wf_append_new");
+        let path = dir.join("newlog.txt");
+        assert!(!path.exists());
+
+        write_file(
+            path.to_str().unwrap(),
+            b"line1\n",
+            WriteMode::Append,
+            WriteDurability::Durable,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"line1\n");
+
+        write_file(
+            path.to_str().unwrap(),
+            b"line2\n",
+            WriteMode::Append,
+            WriteDurability::Durable,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"line1\nline2\n");
+
+        let path2 = dir.join("fast.txt");
+        write_file(
+            path2.to_str().unwrap(),
+            b"x",
+            WriteMode::Append,
+            WriteDurability::Fast,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path2).unwrap(), b"x");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

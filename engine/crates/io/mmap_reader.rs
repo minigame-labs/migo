@@ -84,13 +84,23 @@ impl AsRef<[u8]> for MappedBytes {
 /// derefs to an empty slice.
 pub fn mmap_file_bytes(path: impl AsRef<Path>) -> io::Result<Arc<MappedBytes>> {
     let file = File::open(path.as_ref())?;
-    // SAFETY: we hold an exclusive handle to the File for the
-    // duration of the mmap call.  `memmap2::Mmap` requires the
-    // backing file to outlive the mapping, which we ensure by
-    // keeping `file` alive until the mmap is constructed (the OS
-    // mapping persists independently via the inode reference
-    // obtained during the `mmap` syscall).
-    let mmap = unsafe { Mmap::map(&file)? };
+    mmap_bytes_from_file(&file)
+}
+
+/// Memory-map an already-open file, avoiding a second `open`.
+///
+/// # Safety / caveats
+/// The caller must ensure the backing file is **not truncated** for the
+/// lifetime of the returned mapping: reading a page that falls beyond a
+/// shrunk EOF raises `SIGBUS`. Only use this for files on read-only /
+/// immutable backends (e.g. `/code`), never for writable-directory files
+/// a concurrent op could truncate.
+pub fn mmap_bytes_from_file(file: &File) -> io::Result<Arc<MappedBytes>> {
+    // SAFETY: `memmap2::Mmap` requires the backing file to outlive the
+    // mapping. The OS mapping persists independently via the inode
+    // reference obtained during the `mmap` syscall, and the caller's
+    // truncation contract (above) keeps every mapped page valid.
+    let mmap = unsafe { Mmap::map(file)? };
     Ok(Arc::new(MappedBytes { mmap }))
 }
 

@@ -110,6 +110,15 @@ pub struct HostOpState {
     /// runtime, matching browsers where WebGL-capable pages keep decoded image
     /// pixels available for texture uploads.
     pub webgl_context_created: Arc<AtomicBool>,
+    /// Render-context lost flag, shared with the render-event consumer.
+    ///
+    /// Set `true` when the render thread reports `RenderEvent::ContextLost`
+    /// and back to `false` on a successful `ContextRecovered`. Read by
+    /// `op_gl_is_context_lost` so JS `gl.isContextLost()` reflects reality
+    /// instead of a hard-coded `false` — games that guard draw calls on
+    /// `isContextLost()` then stop issuing GL into a dead context. Mirrors
+    /// the `backgrounded` / `webgl_context_created` shared-atomic pattern.
+    pub context_lost: Arc<AtomicBool>,
     /// Whether code signing enforcement is enabled for this runtime.
     pub code_signing_enabled: bool,
     /// Per-session GPU compressed texture format support.

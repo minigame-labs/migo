@@ -472,10 +472,28 @@ public final class NativeExports {
         return cacheDir != null ? cacheDir.getAbsolutePath() : "";
     }
 
+    // Zip-bomb defense budget. MUST stay in sync with the Rust
+    // `ExtractBudget::DEFAULT` in engine/crates/io/zip_extract.rs so
+    // the Android (java.util.zip) unzip path enforces the same limits
+    // as the desktop Rust path — otherwise a malicious/oversized zip
+    // that Rust rejects would be extracted unbounded on Android,
+    // exhausting storage or CPU.
+    private static final int UNZIP_MAX_ENTRIES = 20_000;
+    private static final long UNZIP_MAX_TOTAL_UNCOMPRESSED = 256L * 1024 * 1024;
+    private static final long UNZIP_MAX_ENTRY_UNCOMPRESSED = 100L * 1024 * 1024;
+    private static final long UNZIP_MAX_COMPRESSION_RATIO = 200L;
+
     /**
      * Extract a zip file to target directory using Android's built-in java.util.zip.
      * <p>
-     * Includes path traversal protection (zip slip prevention).
+     * Includes path traversal protection (zip slip prevention) and a
+     * zip-bomb resource budget (entry count, per-entry size, total
+     * uncompressed size, compression ratio) mirroring the Rust
+     * {@code ExtractBudget::DEFAULT}. Because {@code ZipInputStream} does
+     * not reliably expose sizes from the local header (they can be -1
+     * for streamed entries), the byte-size limits are enforced against
+     * the bytes actually written while streaming, not just the
+     * advertised header sizes.
      *
      * @param zipFilePath Path to the zip file
      * @param targetPath  Destination directory
@@ -504,6 +522,8 @@ public final class NativeExports {
         }
 
         int fileCount = 0;
+        int entryCount = 0;
+        long totalWritten = 0;
         try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
                 new java.io.BufferedInputStream(new java.io.FileInputStream(zipFile), 65536))) {
 
@@ -511,33 +531,98 @@ public final class NativeExports {
             byte[] buffer = new byte[8192];
 
             while ((entry = zis.getNextEntry()) != null) {
+                // Budget: entry count (files + directories), rejects inode bombs.
+                entryCount++;
+                if (entryCount > UNZIP_MAX_ENTRIES) {
+                    // NOTE: do NOT call zis.closeEntry() on failure paths.
+                    // closeEntry() drains (inflates) the rest of the current
+                    // entry to seek to the next one — for a zip bomb that
+                    // would keep burning CPU/memory on the very entry we're
+                    // rejecting. Returning here lets try-with-resources close
+                    // the whole stream without draining.
+                    return "ERR:unzip:fail entry count exceeds limit " + UNZIP_MAX_ENTRIES;
+                }
+
                 File outFile = new File(destDir, entry.getName());
 
                 // Security: path traversal protection (zip slip)
                 String canonicalPath = outFile.getCanonicalPath();
                 if (!canonicalPath.startsWith(canonicalDest + File.separator)
                         && !canonicalPath.equals(canonicalDest)) {
-                    zis.closeEntry();
                     return "ERR:unzip:fail path traversal detected: " + entry.getName();
                 }
 
+                // NOTE on symlink divergence vs the Rust path: the Rust
+                // extractor rejects symlink entries outright. java.util.zip's
+                // ZipInputStream does not surface a zip entry's Unix mode
+                // (that lives in the central directory, which ZipInputStream
+                // never reads), so a symlink entry here is materialised as a
+                // regular file whose contents are the link target string — it
+                // is never turned into a real symlink. That is safe (no
+                // symlink escape is possible) but behaviourally different
+                // from the Rust path. Documented rather than "fixed" because
+                // detecting it requires reading the central directory
+                // (ZipFile) or a non-stdlib zip library.
+
                 if (entry.isDirectory()) {
-                    if (!outFile.exists()) {
-                        outFile.mkdirs();
+                    if (!outFile.exists() && !outFile.mkdirs() && !outFile.isDirectory()) {
+                        return "ERR:unzip:fail cannot create directory: " + entry.getName();
                     }
                 } else {
-                    // Ensure parent directories exist
-                    File parent = outFile.getParentFile();
-                    if (parent != null && !parent.exists()) {
-                        parent.mkdirs();
+                    // Budget: compression-ratio check when both sizes are
+                    // known (streamed entries may report -1; the streaming
+                    // byte caps below still bound those).
+                    long advertised = entry.getSize();
+                    long compressed = entry.getCompressedSize();
+                    if (UNZIP_MAX_COMPRESSION_RATIO > 0 && advertised > 0 && compressed > 0
+                            && advertised / compressed > UNZIP_MAX_COMPRESSION_RATIO) {
+                        return "ERR:unzip:fail compression ratio exceeds limit " + UNZIP_MAX_COMPRESSION_RATIO
+                                + ": " + entry.getName();
                     }
 
+                    // Ensure parent directories exist. mkdirs() returns false
+                    // if the dir already exists, so re-check isDirectory().
+                    File parent = outFile.getParentFile();
+                    if (parent != null && !parent.isDirectory() && !parent.mkdirs()
+                            && !parent.isDirectory()) {
+                        return "ERR:unzip:fail cannot create parent directory: " + entry.getName();
+                    }
+
+                    long entryWritten = 0;
+                    boolean overBudget = false;
+                    String budgetErr = null;
                     try (java.io.FileOutputStream fos = new java.io.FileOutputStream(outFile)) {
                         int len;
                         while ((len = zis.read(buffer)) > 0) {
+                            entryWritten += len;
+                            // Budget: per-entry uncompressed cap.
+                            if (entryWritten > UNZIP_MAX_ENTRY_UNCOMPRESSED) {
+                                overBudget = true;
+                                budgetErr = "ERR:unzip:fail entry exceeds per-entry limit "
+                                        + UNZIP_MAX_ENTRY_UNCOMPRESSED + ": " + entry.getName();
+                                break;
+                            }
+                            // Budget: total uncompressed cap across all entries.
+                            if (totalWritten + entryWritten > UNZIP_MAX_TOTAL_UNCOMPRESSED) {
+                                overBudget = true;
+                                budgetErr = "ERR:unzip:fail total uncompressed size exceeds limit "
+                                        + UNZIP_MAX_TOTAL_UNCOMPRESSED;
+                                break;
+                            }
                             fos.write(buffer, 0, len);
                         }
                     }
+                    if (overBudget) {
+                        // Remove the partial file so a rejected bomb leaves
+                        // no half-written entry behind. Do NOT closeEntry()
+                        // (see note above): return and let try-with-resources
+                        // tear down the stream without draining the rest of
+                        // this over-budget entry.
+                        //noinspection ResultOfMethodCallIgnored
+                        outFile.delete();
+                        return budgetErr;
+                    }
+                    totalWritten += entryWritten;
                     fileCount++;
                 }
                 zis.closeEntry();

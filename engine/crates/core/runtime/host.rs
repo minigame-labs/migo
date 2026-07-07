@@ -105,6 +105,10 @@ pub(crate) struct Host {
     /// Shared flag: `true` while the app is backgrounded (OnHide).
     /// Network polling ops check this to throttle CPU usage.
     backgrounded: Arc<AtomicBool>,
+    /// Shared flag mirrored into `HostOpState.context_lost`: set `true`
+    /// between a render `ContextLost` and a successful `ContextRecovered`
+    /// so JS `gl.isContextLost()` reflects reality.
+    context_lost: Arc<AtomicBool>,
 
     /// Pending `onShow` script captured while Android has resumed the Activity
     /// but has not yet delivered a fresh Surface.  WeChat/Chromium effectively
@@ -234,6 +238,7 @@ impl Host {
 
         let backgrounded = Arc::new(AtomicBool::new(false));
         let webgl_context_created = Arc::new(AtomicBool::new(false));
+        let context_lost = Arc::new(AtomicBool::new(false));
 
         let host_state = HostOpState {
             id,
@@ -258,6 +263,7 @@ impl Host {
             network_policy: network_policy.clone(),
             backgrounded: backgrounded.clone(),
             webgl_context_created: webgl_context_created.clone(),
+            context_lost: context_lost.clone(),
             #[cfg(feature = "code-signing")]
             code_signing_enabled: init_options.code_signing_enabled(),
             #[cfg(not(feature = "code-signing"))]
@@ -359,6 +365,7 @@ impl Host {
             last_game_id: None,
             last_entry: None,
             backgrounded,
+            context_lost,
             pending_on_show_script: None,
             gpu_caps,
             #[cfg(feature = "v8-limits")]
@@ -367,6 +374,12 @@ impl Host {
     }
 
     pub(crate) async fn handle_command(&mut self, cmd: HostCommand) {
+        // Drain render-thread events on every host command so state they
+        // carry (notably `ContextLost` -> `context_lost`, which backs
+        // `gl.isContextLost()`) is synced on a stable path. The event loop
+        // also drains on the heartbeat tick (see `thread.rs`) to cover idle
+        // periods with no incoming commands.
+        self.drain_render_events();
         if let Err(e) = self.handle_command_inner(cmd).await {
             error!("[Host {}] handle_command failed: e={} ", self.id, e);
         }
@@ -402,6 +415,10 @@ impl Host {
             }
             RenderEvent::ContextLost => {
                 warn!("[Host {}] render context lost", self.id);
+                // Expose the loss to JS so `gl.isContextLost()` returns true
+                // and games that guard draws on it stop issuing GL into a
+                // dead context.
+                self.context_lost.store(true, Ordering::Relaxed);
                 self.platform.notify_error(
                     self.id,
                     shared::error::ErrorCode::RenderBackendError.as_u16(),
@@ -410,6 +427,18 @@ impl Host {
                 );
             }
             RenderEvent::ContextRecovered { success } => {
+                // NOTE: we deliberately do NOT clear `context_lost` here yet.
+                // The render thread reports `success: true` whenever
+                // `try_recover_context()` returns Ok, but that path is
+                // currently incomplete — it reuses the (dead) preserved
+                // context and does not rebuild the share group / GL
+                // resources (see CanvasManager::try_recover_context docs).
+                // Clearing on that unreliable success would make
+                // `gl.isContextLost()` a false negative (report "recovered"
+                // while GL is still unusable), which is worse than staying
+                // lost. Once real recovery lands and `success` truthfully
+                // reflects a usable context, re-enable the clear here:
+                //   if success { self.context_lost.store(false, Relaxed); }
                 if !success {
                     self.platform.notify_error(
                         self.id,
@@ -935,6 +964,7 @@ impl Host {
             network_policy: self.network_policy.clone(),
             backgrounded: self.backgrounded.clone(),
             webgl_context_created: Arc::new(AtomicBool::new(false)),
+            context_lost: self.context_lost.clone(),
             #[cfg(feature = "code-signing")]
             code_signing_enabled: self.init_options.code_signing_enabled(),
             #[cfg(not(feature = "code-signing"))]
