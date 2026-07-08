@@ -4,6 +4,7 @@ import {
     op_clear_color,
     op_gl_flush,
     op_gl_is_context_lost,
+    op_gl_lose_context,
     op_create_program,
     op_use_program,
     op_link_program,
@@ -777,6 +778,19 @@ class WebGLRenderingContext {
             return this._oesVertexArrayObject ||
                 (this._oesVertexArrayObject = this._buildOesVertexArrayObject());
         }
+        // Standard debug/robustness extension. loseContext() arms a one-shot
+        // simulated GPU reset on the render thread, driving the real
+        // context-loss -> recovery pipeline (webglcontextlost/restored events,
+        // isContextLost()); the runtime recovers automatically on the next
+        // frame, so restoreContext() is a no-op here. Lets engines (and our own
+        // device tests) exercise context loss without a real driver reset.
+        if (name === 'WEBGL_lose_context') {
+            return this._webglLoseContext ||
+                (this._webglLoseContext = {
+                    loseContext: () => { op_gl_lose_context(this._canvasId); },
+                    restoreContext: () => {},
+                });
+        }
         // Instanced drawing: the ops are already the WebGL2 variants
         // (ES 3.0 core), so we alias the ANGLE_/EXT_ spellings to the
         // same bindings.  Cocos Creator 2.x's particle system and
@@ -838,6 +852,7 @@ class WebGLRenderingContext {
             'WEBGL_instanced_arrays',
             'WEBGL_draw_buffers',
             'OES_element_index_uint',
+            'WEBGL_lose_context',
         ];
         const caps = this._compressedCaps;
         if (caps & 1) {

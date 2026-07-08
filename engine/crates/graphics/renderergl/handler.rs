@@ -200,6 +200,14 @@ impl RendererGL {
                 Ok(Self::damage_for_clear(cm, canvas_id, bit_field))
             }
 
+            GLCmd::DebugLoseContext { canvas_id: _ } => {
+                // Debug trigger (WEBGL_lose_context.loseContext): arm a one-shot
+                // simulated reset; the next check_graphics_reset_status() poll
+                // drives the real loss -> recovery pipeline.
+                cm.request_simulated_reset();
+                Ok(DamageEffect::NoDamage)
+            }
+
             GLCmd::ClearColor {
                 canvas_id,
                 r,

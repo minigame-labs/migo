@@ -32,6 +32,10 @@ const WindowGlobalScope = {
     alert: core.propWritable(alert.alert),
     URL: core.propNonEnumerable(url.URL),
     createCanvas: core.propNonEnumerable(canvas.createCanvas),
+    // Host hook: 99_main.js relocates `_internal*` onto the Symbol-keyed host
+    // bridge, from where js_bindings resolves it to fire webglcontextlost/
+    // restored on the main canvas after a context-loss rebuild.
+    _internalTriggerWebglContextEvent: core.propNonEnumerable(canvas.dispatchWebglContextEvent),
     requestAnimationFrame: core.propWritable(raf.requestAnimationFrame),
     cancelAnimationFrame: core.propWritable(raf.cancelAnimationFrame),
     setPreferredFramesPerSecond: core.propWritable(raf.setPreferredFramesPerSecond),

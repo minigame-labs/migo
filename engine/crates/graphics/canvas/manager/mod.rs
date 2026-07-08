@@ -206,6 +206,14 @@ pub(crate) struct CanvasManager {
     /// The next `create_onscreen()` call will perform a full resource rebuild.
     context_lost: bool,
 
+    /// Debug one-shot: when set (via `WEBGL_lose_context.loseContext()` ->
+    /// `GLCmd::DebugLoseContext`), the next `check_graphics_reset_status()`
+    /// poll reports a reset and consumes the flag, driving the exact same
+    /// detection -> teardown -> recovery pipeline as a real GPU reset. This is
+    /// how context-loss recovery is verified on devices that cannot be made to
+    /// trigger a real EGL_CONTEXT_LOST on demand.
+    simulated_reset: bool,
+
     /// Last window handle used by create_onscreen, preserved for context
     /// loss recovery (re-create surface without waiting for UpdateSurface).
     last_window: Option<usize>,
@@ -594,6 +602,7 @@ impl CanvasManager {
             canvas2d_snapshot_read_fbo: None,
             last_swap_interval: -1, // force first eglSwapInterval call
             context_lost: false,
+            simulated_reset: false,
             last_window: None,
             programs: HashMap::with_capacity(16),
             shaders: HashMap::with_capacity(32),
@@ -1163,6 +1172,15 @@ impl CanvasManager {
     /// probing itself is cheap: a single driver function pointer
     /// call per frame.
     pub(crate) fn check_graphics_reset_status(&mut self) -> bool {
+        // Debug one-shot injection (WEBGL_lose_context): report a reset once so
+        // the real detection -> recovery pipeline runs on demand. Consumed here
+        // so it fires for exactly one frame, mirroring a real driver reset.
+        if self.simulated_reset {
+            self.simulated_reset = false;
+            tracing::warn!("Simulated GL context reset (WEBGL_lose_context.loseContext)");
+            self.context_lost = true;
+            return true;
+        }
         let Some(poll) = self.gl_get_graphics_reset_status_fn else {
             return false;
         };
@@ -1180,6 +1198,14 @@ impl CanvasManager {
         } else {
             false
         }
+    }
+
+    /// Arm a one-shot simulated context reset (debug trigger for
+    /// `WEBGL_lose_context.loseContext()`). The next
+    /// `check_graphics_reset_status()` poll consumes it and drives the real
+    /// loss -> recovery path. No-op-safe to call repeatedly.
+    pub(crate) fn request_simulated_reset(&mut self) {
+        self.simulated_reset = true;
     }
 
     /// Mark every live Skia `DirectContext` as abandoned.  After
@@ -1273,45 +1299,183 @@ impl CanvasManager {
     /// Returns Ok(true) if recovery succeeded, Ok(false) if no window
     /// handle is available, or Err on failure.
     ///
-    /// KNOWN LIMITATION (tracked for a device-verified rework): a real
-    /// `EGL_CONTEXT_LOST` / GPU reset invalidates the *entire share group*
-    /// — the resource context, every canvas context, the upload-thread
-    /// context, and all GL objects (WebGL programs/buffers/textures/FBOs,
-    /// `image_registry`, snapshot FBOs, atlas, PBO pools). This recovery
-    /// only re-creates the onscreen surface and (via `create_onscreen`)
-    /// currently *reuses* the preserved onscreen context, which is dead
-    /// after a genuine loss; it also leaves offscreen 2D Ganesh contexts
-    /// abandoned-but-present so they are not rebuilt. Fully correct recovery
-    /// must: recreate the whole EGL stack, drop/rebuild every GL resource,
-    /// expose `isContextLost()==true` to JS during the gap, and let the game
-    /// rebuild its WebGL resources on restore. That requires a device that
-    /// can trigger context loss to verify, so it is intentionally left as a
-    /// dedicated task rather than a blind, unverifiable partial fix here.
-    /// `gl_state.clear()` below is necessary (invalidate the shadow state)
-    /// but NOT sufficient on its own.
+    /// A real `EGL_CONTEXT_LOST` / GPU reset invalidates the *entire share
+    /// group* — the resource context, every canvas context, the upload-thread
+    /// context, and every GL object created through them. Recovery therefore
+    /// tears the whole share group down and rebuilds it from scratch, rather
+    /// than reusing the (dead) preserved onscreen context:
+    ///
+    ///   1. Drop all GL-object bookkeeping WITHOUT calling `glDelete` — the
+    ///      handles name objects in a context that no longer exists, so a
+    ///      delete is at best a no-op and at worst a driver error. EGL-level
+    ///      `destroy_context` / `destroy_surface` on the (still-allocated but
+    ///      lost) handles is safe and reclaims the EGL objects.
+    ///   2. Rebuild the resource pbuffer context, respawn the upload thread
+    ///      (shares the new resource context), and recreate the onscreen
+    ///      canvas with a fresh context (`preserved_ctx` is cleared so
+    ///      `create_onscreen` cannot reuse the dead one).
+    ///   3. Re-initialise the onscreen 2D (Skia) context if the game had one;
+    ///      offscreen canvases / the atlas rebuild lazily on next use.
+    ///   4. Probe the rebuilt context with a trivial clear + `glGetError` +
+    ///      `glGetGraphicsResetStatus`. Only a passing probe returns `Ok(true)`
+    ///      so the caller can honestly report `ContextRecovered { success }`.
+    ///
+    /// The game's own WebGL resources (programs/buffers/textures) are gone; the
+    /// game rebuilds them in its `webglcontextrestored` handler. Until then
+    /// `isContextLost()` stays true and the caller keeps the JS-visible flag
+    /// set (see `render_thread` / `host`).
     pub(crate) fn try_recover_context(&mut self) -> EngineResult<bool> {
         if !self.context_lost {
             return Ok(false);
         }
-        if let Some(window) = self.last_window {
-            tracing::info!("Attempting EGL context loss recovery");
-            self.create_onscreen(window, None)?;
-            // The recovered context starts from GL defaults, but the
-            // per-canvas `gl_state` shadow still holds the *old* context's
-            // cached bindings/state. Leaving it would let the state tracker
-            // dedupe away GL calls the fresh context actually needs
-            // (program/buffer/texture binds, blend/scissor/viewport), i.e.
-            // render with the wrong or unbound state. Clear it so the next
-            // frame re-issues everything; `or_default()` on next access
-            // yields the conservative "unknown, must re-issue" state. The
-            // 2D Skia contexts are separately abandoned on the loss path.
-            self.gl_state.clear();
-            tracing::info!("EGL context recovered successfully");
-            Ok(true)
-        } else {
+        let Some(window) = self.last_window else {
             tracing::warn!("Cannot recover EGL context: no window handle available");
-            Ok(false)
+            return Ok(false);
+        };
+        tracing::warn!("EGL context loss: tearing down and rebuilding the share group");
+
+        let onscreen_id = CanvasId::from(1u32);
+        let had_onscreen_2d = self.contexts_2d.contains_key(&onscreen_id);
+
+        // ---- Phase 1: hard teardown of the dead share group ----
+        // No `glDelete` — the objects live in a context that is gone. Drop the
+        // Rust-side handles and release EGL objects (destroy_* is safe on a
+        // lost-but-allocated context).
+
+        // Skia contexts: abandoned on the loss path; drop every one so they
+        // rebuild against the new share group. `abandon()` makes Drop a no-op.
+        for (_id, mut ctx) in std::mem::take(&mut self.contexts_2d) {
+            ctx.abandon();
         }
+        self.dirty_2d.clear();
+
+        // Every canvas's EGL surface + context (onscreen + offscreen).
+        for (_id, entry) in std::mem::take(&mut self.canvases) {
+            self.egl.destroy_surface(self.display, entry.ctx.surf).ok();
+            self.egl.destroy_context(self.display, entry.ctx.ctx).ok();
+        }
+        // Preserved onscreen ctx / DrawingBuffer from a prior resume are dead.
+        if let Some(c) = self.preserved_ctx.take() {
+            self.egl.destroy_context(self.display, c).ok();
+        }
+        self.preserved_drawing_buffer.take();
+
+        // Upload thread shares the dead resource context — stop it (Drop joins
+        // the thread; it does no GL in Drop) before we destroy that context.
+        self.upload_thread.take();
+        self.upload_server.take();
+        self.pending_uploads.clear();
+        self.cancelled_uploads.clear();
+
+        // Resource (root) context + surface.
+        self.egl.make_current(self.display, None, None, None).ok();
+        self.egl
+            .destroy_surface(self.display, self.resource.surf)
+            .ok();
+        self.egl
+            .destroy_context(self.display, self.resource.ctx)
+            .ok();
+
+        // Drop all GL-object bookkeeping (invalid handles; no glDelete).
+        self.programs.clear();
+        self.shaders.clear();
+        self.buffers.clear();
+        self.textures.clear();
+        self.framebuffers.clear();
+        self.renderbuffers.clear();
+        self.vaos.clear();
+        self.queries.clear();
+        self.transform_feedbacks.clear();
+        self.image_copy_fbos.clear();
+        self.gl_state.clear();
+        self.atlas = None;
+        self.image_registry = ImageRegistry::new();
+        self.damage_history.clear();
+        self.last_swap_interval = -1;
+
+        // ---- Phase 2: rebuild the share group ----
+        let (resource_ctx, resource_surf) = egl_ops::create_pbuffer_context(
+            &self.egl,
+            self.display,
+            self.config,
+            None,
+            16,
+            16,
+            self.gles_major,
+            self.has_robust_context,
+        )?;
+        self.resource = EglContextHandle {
+            ctx: resource_ctx,
+            surf: resource_surf,
+        };
+        self.bind_resource()?;
+
+        // Respawn the async upload thread on TierA (shares the new resource ctx).
+        if self.device_caps.tier() == crate::device_caps::DeviceTier::TierA {
+            self.upload_thread = crate::upload_thread::UploadThreadHandle::try_spawn(
+                &self.egl,
+                self.display,
+                self.config,
+                self.resource.ctx,
+                self.gles_major,
+                self.has_robust_context,
+            );
+            if self.upload_thread.is_some() {
+                self.upload_server = Some(crate::upload_server::UploadServer::for_device(
+                    &self.device_caps,
+                    crate::device_caps::android_api_level(),
+                ));
+            }
+        }
+
+        // Recreate the onscreen canvas with a fresh context. `canvases` is empty
+        // and `preserved_ctx` is None, so `create_onscreen` builds a new one.
+        self.context_lost = false;
+        self.create_onscreen(window, None)?;
+
+        // Rebuild the onscreen 2D (Skia) context if the game had one so JS
+        // targeting canvas_id=1 keeps working after the reset.
+        if had_onscreen_2d {
+            context_2d_impl::init_skia_for_canvas(self, onscreen_id)?;
+        }
+
+        // ---- Phase 3: probe the rebuilt context for real usability ----
+        if !self.probe_context_usable(onscreen_id) {
+            tracing::error!("EGL recovery: probe draw failed, context still unusable");
+            self.context_lost = true;
+            return Ok(false);
+        }
+
+        tracing::info!("EGL context share group rebuilt and probed OK");
+        Ok(true)
+    }
+
+    /// Probe whether a freshly rebuilt onscreen context is actually usable:
+    /// bind it, drain stale errors, issue a trivial clear, and check both
+    /// `glGetError` and (when available) `glGetGraphicsResetStatus`. Returns
+    /// `false` on any failure so recovery can report an honest `success`.
+    fn probe_context_usable(&mut self, id: CanvasId) -> bool {
+        if self.make_current_needed(id).is_err() {
+            return false;
+        }
+        unsafe {
+            for _ in 0..8 {
+                if self.gl.get_error() == glow::NO_ERROR {
+                    break;
+                }
+            }
+            self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            self.gl.clear(glow::COLOR_BUFFER_BIT);
+            if self.gl.get_error() != glow::NO_ERROR {
+                return false;
+            }
+        }
+        if let Some(poll) = self.gl_get_graphics_reset_status_fn {
+            if unsafe { poll() } != 0 {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) fn destroy_canvas(&mut self, id: CanvasId) -> EngineResult<()> {

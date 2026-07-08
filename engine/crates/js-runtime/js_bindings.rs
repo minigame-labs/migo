@@ -66,6 +66,9 @@ pub(crate) struct JsBindings {
     // ---- System ----
     memory_warning_fn: Option<v8::Global<v8::Function>>,
 
+    // ---- WebGL context-loss lifecycle (webglcontextlost/restored) ----
+    webgl_context_event_fn: Option<v8::Global<v8::Function>>,
+
     // ---- Keyboard (soft keyboard + physical key events) ----
     keyboard_input_fn: Option<v8::Global<v8::Function>>,
     keyboard_height_change_fn: Option<v8::Global<v8::Function>>,
@@ -112,6 +115,7 @@ impl JsBindings {
             ble_characteristic_value_change_fn: None,
             ble_mtu_change_fn: None,
             memory_warning_fn: None,
+            webgl_context_event_fn: None,
             keyboard_input_fn: None,
             keyboard_height_change_fn: None,
             keyboard_confirm_fn: None,
@@ -251,6 +255,12 @@ impl JsBindings {
         self.key_down_fn = key_down;
         self.key_up_fn = key_up;
         self.video_event_fn = video_event;
+
+        // Resolved separately to avoid growing the tuple above; init-time only.
+        self.webgl_context_event_fn = self.with_main_context(rt, |scope, _ctx, global| {
+            let bridge = resolve_host_bridge(scope, global);
+            get_global_fn(scope, bridge, "_internalTriggerWebglContextEvent")
+        });
 
         if self.enqueue_touch_event_fn.is_none() {
             warn!("[Host {}] _internalEnqueueRawTouchEvent not found", host_id);
@@ -719,6 +729,21 @@ impl JsBindings {
     // ---- Keyboard event dispatch ----
 
     /// Dispatch keyboard input event (soft keyboard text changed).
+    /// Fire a WebGL context-loss lifecycle event (`webglcontextlost` /
+    /// `webglcontextrestored`) on the main canvas so the engine can drop and
+    /// rebuild its GL resources. No-op if the JS hook was not resolved.
+    pub(crate) fn dispatch_webgl_context_event(&self, rt: &mut deno_core::JsRuntime, kind: &str) {
+        if let Some(func_g) = self.webgl_context_event_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::String::new(scope, kind)
+                    .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
+                    .into()];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
     pub(crate) fn dispatch_keyboard_input(&self, rt: &mut deno_core::JsRuntime, value: &str) {
         if let Some(func_g) = self.keyboard_input_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {

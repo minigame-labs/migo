@@ -1813,7 +1813,15 @@ impl RenderThread {
                                 });
                             }
                             Ok(false) => {
-                                warn!("EGL context recovery deferred (no window handle)");
+                                // Not recovered: either no window handle yet, or
+                                // the rebuilt context failed its probe draw and
+                                // is still unusable. The context remains lost, so
+                                // report an honest failure (isContextLost() stays
+                                // true) rather than a false "recovered".
+                                warn!("EGL context recovery incomplete; context still lost");
+                                events.emit(RenderEvent::ContextRecovered {
+                                    success: false,
+                                });
                             }
                             Err(re) => {
                                 warn!("EGL context recovery failed: {}", re);

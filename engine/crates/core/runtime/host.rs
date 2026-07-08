@@ -1,10 +1,11 @@
 use std::{
+    collections::HashMap,
     rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use deno_core::ModuleLoader;
@@ -109,6 +110,13 @@ pub(crate) struct Host {
     /// between a render `ContextLost` and a successful `ContextRecovered`
     /// so JS `gl.isContextLost()` reflects reality.
     context_lost: Arc<AtomicBool>,
+
+    /// Last time each render-error kind fired a Java `notify_error`. Now that
+    /// `drain_render_events` is wired, a sustained GL/Canvas2D error stream (a
+    /// game hammering a broken pipeline) would flood the Java layer with
+    /// callbacks; this throttles `notify_error` to at most one per kind per
+    /// `ERROR_NOTIFY_MIN_INTERVAL`. The `warn!` log is left unthrottled.
+    render_error_throttle: HashMap<&'static str, Instant>,
 
     /// Pending `onShow` script captured while Android has resumed the Activity
     /// but has not yet delivered a fresh Surface.  WeChat/Chromium effectively
@@ -366,6 +374,7 @@ impl Host {
             last_entry: None,
             backgrounded,
             context_lost,
+            render_error_throttle: HashMap::new(),
             pending_on_show_script: None,
             gpu_caps,
             #[cfg(feature = "v8-limits")]
@@ -391,27 +400,52 @@ impl Host {
         }
     }
 
-    fn handle_render_event(&self, event: RenderEvent) {
+    /// Minimum spacing between Java `notify_error` callbacks of the same kind.
+    const ERROR_NOTIFY_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+
+    /// True (and records `now`) if a `notify_error` of `kind` may fire; false if
+    /// one already fired within `ERROR_NOTIFY_MIN_INTERVAL`. Keeps a sustained
+    /// render-error stream from flooding the Java layer with callbacks.
+    fn should_notify_error(&mut self, kind: &'static str) -> bool {
+        let now = Instant::now();
+        match self.render_error_throttle.get(kind) {
+            Some(&last) if now.duration_since(last) < Self::ERROR_NOTIFY_MIN_INTERVAL => false,
+            _ => {
+                self.render_error_throttle.insert(kind, now);
+                true
+            }
+        }
+    }
+
+    fn on_render_error(&mut self, kind: &'static str, code: u16, message: &str) {
+        warn!("[Host {}] render event ({}): {}", self.id, kind, message);
+        if self.should_notify_error(kind) {
+            self.platform
+                .notify_error(self.id, code, "render command failed", message);
+        }
+    }
+
+    fn handle_render_event(&mut self, event: RenderEvent) {
         match event {
-            RenderEvent::Canvas2DError { code, message }
-            | RenderEvent::GlError { code, message }
-            | RenderEvent::CanvasError { code, message } => {
-                warn!("[Host {}] render event: {}", self.id, message);
-                self.platform.notify_error(
-                    self.id,
-                    code.as_u16(),
-                    "render command failed",
-                    &message,
-                );
+            RenderEvent::Canvas2DError { code, message } => {
+                self.on_render_error("canvas2d", code.as_u16(), &message);
+            }
+            RenderEvent::GlError { code, message } => {
+                self.on_render_error("gl", code.as_u16(), &message);
+            }
+            RenderEvent::CanvasError { code, message } => {
+                self.on_render_error("canvas", code.as_u16(), &message);
             }
             RenderEvent::SwapFailed { message } => {
                 warn!("[Host {}] swap failed: {}", self.id, message);
-                self.platform.notify_error(
-                    self.id,
-                    shared::error::ErrorCode::RenderBackendError.as_u16(),
-                    "render swap failed",
-                    &message,
-                );
+                if self.should_notify_error("swap") {
+                    self.platform.notify_error(
+                        self.id,
+                        shared::error::ErrorCode::RenderBackendError.as_u16(),
+                        "render swap failed",
+                        &message,
+                    );
+                }
             }
             RenderEvent::ContextLost => {
                 warn!("[Host {}] render context lost", self.id);
@@ -419,6 +453,10 @@ impl Host {
                 // and games that guard draws on it stop issuing GL into a
                 // dead context.
                 self.context_lost.store(true, Ordering::Relaxed);
+                // Fire `webglcontextlost` on the canvas (after the flag is set,
+                // so a listener sees isContextLost()==true) so the engine drops
+                // its GL resources per the WebGL spec.
+                self.js.dispatch_webgl_context_event("webglcontextlost");
                 self.platform.notify_error(
                     self.id,
                     shared::error::ErrorCode::RenderBackendError.as_u16(),
@@ -427,19 +465,21 @@ impl Host {
                 );
             }
             RenderEvent::ContextRecovered { success } => {
-                // NOTE: we deliberately do NOT clear `context_lost` here yet.
-                // The render thread reports `success: true` whenever
-                // `try_recover_context()` returns Ok, but that path is
-                // currently incomplete — it reuses the (dead) preserved
-                // context and does not rebuild the share group / GL
-                // resources (see CanvasManager::try_recover_context docs).
-                // Clearing on that unreliable success would make
-                // `gl.isContextLost()` a false negative (report "recovered"
-                // while GL is still unusable), which is worse than staying
-                // lost. Once real recovery lands and `success` truthfully
-                // reflects a usable context, re-enable the clear here:
-                //   if success { self.context_lost.store(false, Relaxed); }
-                if !success {
+                // `success` now truthfully reflects a probe-verified context:
+                // `try_recover_context()` rebuilds the whole share group and
+                // only reports success after a clear + glGetError +
+                // glGetGraphicsResetStatus probe passes (see
+                // CanvasManager::try_recover_context / probe_context_usable).
+                // So it is safe to clear the JS-visible loss flag on success;
+                // on failure we keep `isContextLost()` true (the context is
+                // still unusable) and surface the error.
+                if success {
+                    // Clear the flag first so a `webglcontextrestored` listener
+                    // sees isContextLost()==false, then fire the event so the
+                    // engine rebuilds its GL resources against the fresh context.
+                    self.context_lost.store(false, Ordering::Relaxed);
+                    self.js.dispatch_webgl_context_event("webglcontextrestored");
+                } else {
                     self.platform.notify_error(
                         self.id,
                         shared::error::ErrorCode::RenderBackendError.as_u16(),

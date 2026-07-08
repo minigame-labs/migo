@@ -558,6 +558,15 @@ pub fn op_gl_is_context_lost(state: &mut OpState) -> bool {
         .unwrap_or(false)
 }
 
+/// Backs JS `WEBGL_lose_context.loseContext()`. Arms a one-shot simulated GPU
+/// reset on the render thread so the real context-loss -> recovery pipeline can
+/// be exercised on demand (there is otherwise no way to trigger EGL_CONTEXT_LOST
+/// from software). Fire-and-forget; the loss surfaces on the next render frame.
+#[op2(fast)]
+pub fn op_gl_lose_context(state: &mut OpState, #[smi] canvas_id: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::DebugLoseContext { canvas_id });
+}
+
 #[op2(fast)]
 pub fn op_viewport(
     state: &mut OpState,

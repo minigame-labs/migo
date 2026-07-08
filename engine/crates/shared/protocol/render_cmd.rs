@@ -465,6 +465,13 @@ pub enum GLCmd {
         bit_field: u32,
     },
 
+    /// Debug trigger for `WEBGL_lose_context.loseContext()`: arm a one-shot
+    /// simulated GPU reset on the render thread so the real context-loss
+    /// recovery pipeline can be exercised on demand.
+    DebugLoseContext {
+        canvas_id: CanvasId,
+    },
+
     ClearColor {
         canvas_id: CanvasId,
         r: f32,

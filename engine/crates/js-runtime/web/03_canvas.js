@@ -81,6 +81,38 @@ class Canvas {
     removeAttribute(name) {
         delete this["_attr_" + name];
     }
+    // Minimal EventTarget so engines can register canvas-level listeners
+    // (notably `webglcontextlost` / `webglcontextrestored`; also touch). The
+    // adapter's canvas shim only installs a no-op `addEventListener` when the
+    // native canvas lacks one, so providing a real implementation here makes
+    // engine listeners actually fire.
+    addEventListener(type, listener) {
+        if (typeof listener !== "function") return;
+        if (!this._listeners) this._listeners = { __proto__: null };
+        (this._listeners[type] || (this._listeners[type] = [])).push(listener);
+    }
+    removeEventListener(type, listener) {
+        const arr = this._listeners && this._listeners[type];
+        if (!arr) return;
+        const i = arr.indexOf(listener);
+        if (i !== -1) arr.splice(i, 1);
+    }
+    dispatchEvent(event) {
+        const arr = this._listeners && this._listeners[event.type];
+        if (arr) {
+            // Copy so a listener removing itself mid-dispatch is safe.
+            const copy = arr.slice();
+            for (let i = 0; i < copy.length; i++) {
+                try { copy[i].call(this, event); } catch (_e) { /* DOM swallows */ }
+            }
+        }
+        // Also honor an `on<type>` property (e.g. canvas.onwebglcontextlost).
+        const on = this["on" + event.type];
+        if (typeof on === "function") {
+            try { on.call(this, event); } catch (_e) { /* swallow */ }
+        }
+        return !event.defaultPrevented;
+    }
     getContext(contextType, options) {
         if (this._context) { return this._context; }
         if (contextType === 'webgl2') {
@@ -117,8 +149,31 @@ const getMainCanvas = () => {
     return _mainCanvas;
 };
 
+// Host-driven WebGL context-loss lifecycle. When the render thread rebuilds the
+// GL share group after a real GPU reset (or a WEBGL_lose_context.loseContext
+// simulation), it drives these events so the engine can drop and rebuild its
+// own GL resources per the WebGL spec: `webglcontextlost` (cancelable -- the
+// engine calls preventDefault to opt into restoration) then, once the fresh
+// context is ready, `webglcontextrestored`. Dispatched on the main (onscreen)
+// canvas, which is where engines register their listeners. Invoked from the
+// host via `_internalTriggerWebglContextEvent` (see 98_global_scope_window.js).
+const dispatchWebglContextEvent = (type) => {
+    if (!_mainCanvas) return;
+    let prevented = false;
+    const event = {
+        type,
+        statusMessage: "",
+        bubbles: false,
+        cancelable: type === "webglcontextlost",
+        get defaultPrevented() { return prevented; },
+        preventDefault() { prevented = true; },
+    };
+    _mainCanvas.dispatchEvent(event);
+};
+
 export {
     createCanvas,
     createOffscreenCanvas,
     getMainCanvas,
+    dispatchWebglContextEvent,
 };

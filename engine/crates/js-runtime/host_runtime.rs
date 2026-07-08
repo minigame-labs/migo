@@ -380,6 +380,13 @@ impl HostJsRuntime {
             .dispatch_touch(&mut self.rt, self.host_id, touch_type, points, timestamp_ms);
     }
 
+    /// Fire a WebGL context-loss lifecycle event on the main canvas
+    /// (`webglcontextlost` / `webglcontextrestored`).
+    pub fn dispatch_webgl_context_event(&mut self, kind: &str) {
+        self.bindings
+            .dispatch_webgl_context_event(&mut self.rt, kind);
+    }
+
     pub fn dispatch_inner_audio_event(&mut self, id: u32, event_type: &str, current_time: f64) {
         self.bindings.dispatch_inner_audio_event(
             &mut self.rt,

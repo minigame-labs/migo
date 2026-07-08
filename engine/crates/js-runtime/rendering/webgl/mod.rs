@@ -65,6 +65,7 @@ extension!(host_v8_webgl,
         op_uniform_matrix_3fv,
         op_gl_flush,
         op_gl_is_context_lost,
+        op_gl_lose_context,
 
         // GL State
         op_enable,
