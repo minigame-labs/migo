@@ -412,6 +412,16 @@ pub enum CanvasCmd {
     DestroyImage {
         image_id: ImageId,
     },
+
+    /// Batch variant of [`CanvasCmd::DestroyImage`]: destroy many shared images
+    /// in a single command. Bulk teardown paths (clearImageCache, session
+    /// restart) can enqueue potentially hundreds of ids; sending them one by one
+    /// as must-deliver Sync-class commands can block the producer up to the send
+    /// deadline *per id*. Batching bounds that to a single bounded-blocking send
+    /// while preserving must-deliver semantics.
+    DestroyImages {
+        image_ids: Vec<ImageId>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

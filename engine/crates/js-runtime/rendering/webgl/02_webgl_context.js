@@ -582,12 +582,13 @@ class WebGLRenderingContext {
     }
 
     isContextLost() {
-        // Reflects the real render-context state (set by the host on a
-        // ContextLost render event, cleared on successful recovery), so
-        // games that guard draw calls on this stop issuing GL into a dead
-        // context. Note: a webglcontextlost/restored *event* is not yet
-        // dispatched -- poll this instead until the device-verified recovery
-        // task wires the event.
+        // Reflects the authoritative render-context state: the render thread
+        // sets/clears the shared `context_lost` atomic the instant it loses or
+        // recovers the context, so this is always accurate (and independent of
+        // the lossy render-event channel). The matching `webglcontextlost` /
+        // `webglcontextrestored` events ARE dispatched on the main canvas (see
+        // dispatchWebglContextEvent + Host::reconcile_context_lost); games may
+        // either listen for those events or poll this.
         return op_gl_is_context_lost();
     }
 

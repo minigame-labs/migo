@@ -19,6 +19,7 @@
 //! let the method body reach the sub-components without
 //! refactoring the disjoint borrows the current closures rely on.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -46,6 +47,32 @@ use shared::raf_signal::RafSender;
 /// lax enough that an actually stalled producer trips it within a
 /// 50 ms window at 60 Hz.
 const RAF_BACKPRESSURE_STREAK_THRESHOLD: u32 = 3;
+
+/// Report a context-recovery failure at most once per loss episode.
+///
+/// Recovery is retried every frame while the context is lost; emitting a
+/// `ContextRecovered{success:false}` event, waking the host, and (downstream)
+/// firing a Java `notify_error` on every failed retry would flood at frame
+/// rate. The loss epoch bumps on each fresh loss, so gating on it reports the
+/// first failure of an episode and then stays silent until recovery succeeds or
+/// a new loss starts. The per-frame `warn!` log is intentionally left to the
+/// call site (cheap, and useful for diagnosing a stuck context).
+fn report_recovery_failure(
+    context_lost: &Arc<shared::op_state::ContextLostState>,
+    events: &RenderEventSender,
+    wake: &Option<Arc<dyn Fn() + Send + Sync>>,
+    last_recovery_fail_epoch: &mut u64,
+) {
+    let (_, epoch) = context_lost.snapshot();
+    if epoch == *last_recovery_fail_epoch {
+        return;
+    }
+    *last_recovery_fail_epoch = epoch;
+    events.emit(RenderEvent::ContextRecovered { success: false });
+    if let Some(w) = wake.as_ref() {
+        w();
+    }
+}
 
 pub struct RenderThread {
     cmd_tx: CommandSender,
@@ -971,6 +998,7 @@ impl RenderThread {
     ///   On Android this is eventfd-backed; on other platforms, tokio mpsc.
     /// * `vsync_rx` — optional crossbeam receiver for Choreographer VSync signals
     /// * `host_id` — host identifier for debug stats registry
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         raf_tx: RafSender,
         vsync_rx: Option<Receiver<f64>>,
@@ -979,6 +1007,20 @@ impl RenderThread {
         dpi: f32,
         app_cache_dir: Option<std::path::PathBuf>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
+        // Authoritative GL-context-loss state, shared with the host runtime and
+        // JS `op_gl_is_context_lost`. The render thread is the *only* writer and
+        // updates it edge-triggered: `lost` false->true on a real reset / EGL
+        // loss, true->false on a probe-verified recovery, bumping `epoch` on
+        // each transition. Because the render-event channel is lossy and drained
+        // only on host commands/heartbeat, this state -- not the event -- is the
+        // source of truth for `gl.isContextLost()`, and `epoch` lets the host
+        // recover event edges that the channel dropped.
+        context_lost: Arc<shared::op_state::ContextLostState>,
+        // Optional wake nudge invoked right after a context lost/recovered
+        // transition so the host drains + reconciles promptly instead of
+        // waiting for the next heartbeat tick. Decoupled from `HostCommand`
+        // so the graphics crate stays independent of the host command enum.
+        wake: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> EngineResult<Self> {
         let (cmd_tx, cmd_rx) = CommandSender::new();
         let (event_tx, event_rx) = shared::render_event::channel();
@@ -1094,6 +1136,15 @@ impl RenderThread {
                 // time-critical swap path where it delays the RAF signal and
                 // can cause cascading frame drops.
                 let mut needs_context_recovery = false;
+
+                // Epoch of the last context-loss episode we already reported a
+                // *recovery failure* for. Recovery is retried every frame while
+                // lost; without this, each failed retry would emit a
+                // ContextRecovered{success:false} + wake the host + trigger a
+                // Java notify_error at up to 60 fps. We report the failure once
+                // per loss episode (the epoch bumps on each fresh loss), then
+                // stay quiet until recovery succeeds or a new loss occurs.
+                let mut last_recovery_fail_epoch: u64 = u64::MAX;
 
                 // Diag: track when the render thread entered pause
                 // so `Resume` can report wall-clock paused duration.
@@ -1659,7 +1710,17 @@ impl RenderThread {
                             warn!("Aborted {failed} pending sync responder(s) due to robustness-reported reset");
                         }
                         cm.abandon_all_2d_contexts();
-                        events.emit(RenderEvent::ContextLost);
+                        // Edge-triggered authoritative write (single packed
+                        // atomic): `set_lost` returns true only on the
+                        // false->true transition, so we emit + nudge exactly
+                        // once. A sustained / re-detected loss must not keep
+                        // flooding the host command queue with no-op nudges.
+                        if context_lost.set_lost() {
+                            events.emit(RenderEvent::ContextLost);
+                            if let Some(w) = wake.as_ref() {
+                                w();
+                            }
+                        }
                     }
 
                     // Present the completed frame (only if we have a valid surface).
@@ -1742,7 +1803,14 @@ impl RenderThread {
                                     // on the next frame will recreate
                                     // fresh `Canvas2DContext`s.
                                     cm.abandon_all_2d_contexts();
-                                    events.emit(RenderEvent::ContextLost);
+                                    // Edge-triggered: emit + nudge only on the
+                                    // false->true transition (see robustness path).
+                                    if context_lost.set_lost() {
+                                        events.emit(RenderEvent::ContextLost);
+                                        if let Some(w) = wake.as_ref() {
+                                            w();
+                                        }
+                                    }
                                 } else {
                                     debug_stats
                                         .swap_failures
@@ -1808,9 +1876,19 @@ impl RenderThread {
                                 debug_stats
                                     .context_recoveries
                                     .fetch_add(1, Ordering::Relaxed);
-                                events.emit(RenderEvent::ContextRecovered {
-                                    success: true,
-                                });
+                                // Edge-triggered clear (single packed atomic):
+                                // `set_recovered` returns true only on the
+                                // true->false transition, atomically publishing
+                                // the new level+epoch so a `webglcontextrestored`
+                                // listener sees isContextLost()==false.
+                                if context_lost.set_recovered() {
+                                    events.emit(RenderEvent::ContextRecovered {
+                                        success: true,
+                                    });
+                                    if let Some(w) = wake.as_ref() {
+                                        w();
+                                    }
+                                }
                             }
                             Ok(false) => {
                                 // Not recovered: either no window handle yet, or
@@ -1819,15 +1897,21 @@ impl RenderThread {
                                 // report an honest failure (isContextLost() stays
                                 // true) rather than a false "recovered".
                                 warn!("EGL context recovery incomplete; context still lost");
-                                events.emit(RenderEvent::ContextRecovered {
-                                    success: false,
-                                });
+                                report_recovery_failure(
+                                    &context_lost,
+                                    &events,
+                                    &wake,
+                                    &mut last_recovery_fail_epoch,
+                                );
                             }
                             Err(re) => {
                                 warn!("EGL context recovery failed: {}", re);
-                                events.emit(RenderEvent::ContextRecovered {
-                                    success: false,
-                                });
+                                report_recovery_failure(
+                                    &context_lost,
+                                    &events,
+                                    &wake,
+                                    &mut last_recovery_fail_epoch,
+                                );
                             }
                         }
                     }

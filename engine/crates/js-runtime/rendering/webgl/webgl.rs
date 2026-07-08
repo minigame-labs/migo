@@ -104,7 +104,7 @@ mod tests {
                 network_policy: NetworkPolicy::default(),
                 backgrounded: Arc::new(AtomicBool::new(false)),
                 webgl_context_created: Arc::new(AtomicBool::new(false)),
-                context_lost: Arc::new(AtomicBool::new(false)),
+                context_lost: Arc::new(shared::op_state::ContextLostState::default()),
                 code_signing_enabled: false,
                 gpu_caps: GpuCaps::new(),
             },
@@ -554,7 +554,7 @@ pub fn op_gl_flush(state: &mut OpState) {
 pub fn op_gl_is_context_lost(state: &mut OpState) -> bool {
     state
         .try_borrow::<shared::op_state::HostOpState>()
-        .map(|h| h.context_lost.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|h| h.context_lost.is_lost())
         .unwrap_or(false)
 }
 

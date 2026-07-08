@@ -338,11 +338,7 @@ async fn op_load_image_inner(
         let mut c = cache::IMAGE_CACHE.lock();
         c.remove_previous_alias(image_id)
     } {
-        let _ = canvas_ctx
-            .tx
-            .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
-                image_id: to_destroy,
-            }));
+        dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
     }
 
     // Structured cache key: (path\0WxH, generation) — no delimiter collision.
@@ -532,11 +528,7 @@ async fn op_load_image_inner(
             };
 
             if let Some(to_destroy) = maybe_destroy {
-                let _ = canvas_ctx
-                    .tx
-                    .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
-                        image_id: to_destroy,
-                    }));
+                dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
             }
 
             match res {
@@ -644,11 +636,7 @@ async fn upload_inline_image(
     };
 
     if let Some(to_destroy) = maybe_destroy {
-        let _ = canvas_ctx
-            .tx
-            .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
-                image_id: to_destroy,
-            }));
+        dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
     }
 
     match res {
@@ -722,11 +710,7 @@ async fn load_image_from_inline_bytes(
         let mut c = cache::IMAGE_CACHE.lock();
         c.remove_previous_alias(image_id)
     } {
-        let _ = canvas_ctx
-            .tx
-            .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
-                image_id: to_destroy,
-            }));
+        dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
     }
 
     let label = format!("data:[{}b]", payload.bytes.len());
@@ -772,11 +756,7 @@ async fn load_image_from_http(
         let mut c = cache::IMAGE_CACHE.lock();
         c.remove_previous_alias(image_id)
     } {
-        let _ = canvas_ctx
-            .tx
-            .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
-                image_id: to_destroy,
-            }));
+        dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
     }
 
     let start = match {
@@ -970,11 +950,7 @@ async fn op_load_image_subrect_inner(
         let mut c = cache::IMAGE_CACHE.lock();
         c.remove_previous_alias(image_id)
     } {
-        let _ = canvas_ctx
-            .tx
-            .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
-                image_id: to_destroy,
-            }));
+        dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
     }
 
     // Cache-hit fast path: second+ call with identical args returns
@@ -1092,16 +1068,47 @@ async fn op_load_image_subrect_inner(
         }
     };
     if let Some(to_destroy) = maybe_destroy {
-        let _ = canvas_ctx
-            .tx
-            .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
-                image_id: to_destroy,
-            }));
+        dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
     }
 
     let (rw, rh) = send_res?;
     let _ = (final_w, final_h); // `rw/rh` from render thread is authoritative
     Ok((shared_id, (rw as usize, rh as usize)))
+}
+
+/// Send a single `DestroyImage` as a must-deliver Sync-class command.
+///
+/// Uses `dispatch()` (bounded-blocking) rather than the legacy non-blocking
+/// `send()`, so a full render queue can't silently drop the destroy and leak the
+/// GPU texture / AHB. A disconnected render thread (already shut down) returns
+/// immediately — the only expected best-effort case. `context` labels the call
+/// site in the warn log. All `DestroyImage` producers in this module must route
+/// through this helper (or the batch `dispatch_destroy_images`) rather than the
+/// bare `send()` that silently drops on backpressure.
+fn dispatch_destroy_image(
+    tx: &shared::render_command_sender::CommandSender,
+    image_id: u32,
+    context: &str,
+) {
+    if let Err(e) = tx.dispatch(RenderCommand::Canvas(CanvasCmd::DestroyImage { image_id })) {
+        warn!("{context}: DestroyImage dispatch failed (texture may leak): {e}");
+    }
+}
+
+/// Batch variant of [`dispatch_destroy_image`]: destroy many shared images in a
+/// single must-deliver command so bulk teardown costs one bounded-blocking send
+/// instead of N. No-op on an empty list.
+fn dispatch_destroy_images(
+    tx: &shared::render_command_sender::CommandSender,
+    image_ids: Vec<u32>,
+    context: &str,
+) {
+    if image_ids.is_empty() {
+        return;
+    }
+    if let Err(e) = tx.dispatch(RenderCommand::Canvas(CanvasCmd::DestroyImages { image_ids })) {
+        warn!("{context}: DestroyImages dispatch failed (textures may leak): {e}");
+    }
 }
 
 #[op2(fast)]
@@ -1113,9 +1120,7 @@ pub fn op_destroy_image(state: &mut OpState, #[smi] image_id: u32) -> bool {
 
     if let Some(rid) = to_destroy {
         let ctx = state.borrow::<CanvasOpState>();
-        let _ = ctx.tx.send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
-            image_id: rid,
-        }));
+        dispatch_destroy_image(&ctx.tx, rid, "op_destroy_image");
     }
     true
 }
@@ -1213,11 +1218,13 @@ pub fn op_clear_image_cache(state: &mut OpState) -> Result<(), JsErrorBox> {
     };
     let render_tx = state.borrow::<HostOpState>().render_tx.clone();
 
-    for shared_id in cache::drain_shared_image_cache() {
-        let _ = render_tx.send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
-            image_id: shared_id,
-        }));
-    }
+    // Batch the whole shared-image set into one must-deliver command so a large
+    // cache doesn't block the caller up to the send deadline per image.
+    dispatch_destroy_images(
+        &render_tx,
+        cache::drain_shared_image_cache(),
+        "op_clear_image_cache",
+    );
 
     // 2. Clear IO in-memory cache + derived disk cache directly.
     io::image_ops::clear_image_cache(gcd.as_deref());

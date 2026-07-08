@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -116,9 +116,12 @@ pub struct HostOpState {
     /// and back to `false` on a successful `ContextRecovered`. Read by
     /// `op_gl_is_context_lost` so JS `gl.isContextLost()` reflects reality
     /// instead of a hard-coded `false` — games that guard draw calls on
-    /// `isContextLost()` then stop issuing GL into a dead context. Mirrors
-    /// the `backgrounded` / `webgl_context_created` shared-atomic pattern.
-    pub context_lost: Arc<AtomicBool>,
+    /// `isContextLost()` then stop issuing GL into a dead context.
+    ///
+    /// Written exclusively by the render thread (see [`ContextLostState`]); the
+    /// host reads it to reconcile JS lifecycle events and JS reads `.lost` via
+    /// `op_gl_is_context_lost`.
+    pub context_lost: Arc<ContextLostState>,
     /// Whether code signing enforcement is enabled for this runtime.
     pub code_signing_enabled: bool,
     /// Per-session GPU compressed texture format support.
@@ -126,6 +129,76 @@ pub struct HostOpState {
     /// `set()` after GL context init.  JS ops take a `snapshot()` and
     /// pass it to image decode functions.
     pub gpu_caps: Arc<crate::device::gpu_caps::GpuCaps>,
+}
+
+/// Shared GL context-loss state. The render thread is the **sole writer** and
+/// updates it edge-triggered: on a real loss `lost` flips false→true and the
+/// epoch bumps; on a probe-verified recovery it flips true→false and the epoch
+/// bumps.
+///
+/// The `(lost, epoch)` pair is packed into a **single** `AtomicU64` (bit 0 =
+/// `lost`, bits 1.. = `epoch`) so a reader always gets a *consistent snapshot*.
+/// A previous two-atomic design allowed a torn read in the window between the
+/// render thread writing `lost` and bumping `epoch`, which made the host emit a
+/// spurious `restored, lost, restored` sequence. A single atomic eliminates
+/// that: the render thread (sole writer) does a plain load+store RMW — no CAS
+/// needed — and the host does one `Acquire` load.
+///
+/// The epoch exists because the render-event channel is lossy (bounded, drops
+/// on full): if a `ContextLost`/`ContextRecovered` notification is dropped, the
+/// host still detects that a transition happened by observing the epoch jump
+/// and synthesizes the missing `webglcontextlost`/`webglcontextrestored` pair.
+/// A bare `lost` bool alone can only converge to the final level and would
+/// silently swallow a lost→recovered edge pair.
+///
+/// JS `op_gl_is_context_lost` reads the `lost` bit via [`Self::is_lost`].
+#[derive(Debug, Default)]
+pub struct ContextLostState {
+    /// Packed `(epoch << 1) | (lost as u64)`.
+    packed: AtomicU64,
+}
+
+impl ContextLostState {
+    /// Read a consistent `(lost, epoch)` snapshot (host reconcile path).
+    #[inline]
+    pub fn snapshot(&self) -> (bool, u64) {
+        let v = self.packed.load(Ordering::Acquire);
+        (v & 1 == 1, v >> 1)
+    }
+
+    /// Read just the current lost level (JS `op_gl_is_context_lost`). A single
+    /// bool query tolerates `Relaxed`.
+    #[inline]
+    pub fn is_lost(&self) -> bool {
+        self.packed.load(Ordering::Relaxed) & 1 == 1
+    }
+
+    /// Render thread only: transition to lost. Returns `true` iff this was the
+    /// false→true edge (so the caller emits the event + nudges exactly once).
+    #[inline]
+    pub fn set_lost(&self) -> bool {
+        let cur = self.packed.load(Ordering::Acquire);
+        if cur & 1 == 1 {
+            return false; // already lost — no edge
+        }
+        let epoch = cur >> 1;
+        self.packed
+            .store(((epoch + 1) << 1) | 1, Ordering::Release);
+        true
+    }
+
+    /// Render thread only: transition to recovered. Returns `true` iff this was
+    /// the true→false edge.
+    #[inline]
+    pub fn set_recovered(&self) -> bool {
+        let cur = self.packed.load(Ordering::Acquire);
+        if cur & 1 == 0 {
+            return false; // already recovered — no edge
+        }
+        let epoch = cur >> 1;
+        self.packed.store((epoch + 1) << 1, Ordering::Release);
+        true
+    }
 }
 
 /// Network-level security policy, populated from InitOptions.extras.

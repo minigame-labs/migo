@@ -214,6 +214,18 @@ pub enum HostCommand {
     /// Notify that the current rendering surface has been destroyed.
     SurfaceDestroyed,
 
+    /// Wake the host loop so it drains render-thread feedback events promptly.
+    ///
+    /// The render thread's [`crate::render_event::RenderEvent`] channel is a
+    /// synchronous crossbeam channel that cannot participate in the host's
+    /// `tokio::select!`, so render feedback is only drained on incoming
+    /// commands and the periodic heartbeat. For latency-sensitive state
+    /// transitions (notably GL context lost/recovered) the render thread sends
+    /// this no-op nudge to force an immediate drain + reconcile instead of
+    /// waiting for the next heartbeat tick. Carries no payload — the authoritative
+    /// state lives in shared atomics; this only controls *when* the host reacts.
+    DrainRenderEvents,
+
     // ---- Touch / Input ----
     /// Dispatch touch input events to the game.
     ///

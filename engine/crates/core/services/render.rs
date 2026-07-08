@@ -40,6 +40,7 @@ mod tests {
 impl RenderService {
     pub(crate) const RECREATE_ONSCREEN_TIMEOUT: Duration = Duration::from_millis(500);
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         raf_tx: shared::raf_signal::RafSender,
         vsync_rx: Option<crossbeam_channel::Receiver<f64>>,
@@ -49,6 +50,8 @@ impl RenderService {
         target_fps: i32,
         app_cache_dir: Option<std::path::PathBuf>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
+        context_lost: std::sync::Arc<shared::op_state::ContextLostState>,
+        wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) -> EngineResult<Self> {
         let thread = RenderThread::spawn(
             raf_tx,
@@ -58,6 +61,8 @@ impl RenderService {
             pixel_ratio,
             app_cache_dir,
             gpu_caps,
+            context_lost,
+            wake,
         )?;
         // Apply the host's configured target FPS to the render thread immediately
         // so the first vsync tick already runs at the right cadence.

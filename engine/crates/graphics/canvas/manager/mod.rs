@@ -1428,26 +1428,44 @@ impl CanvasManager {
             }
         }
 
-        // Recreate the onscreen canvas with a fresh context. `canvases` is empty
-        // and `preserved_ctx` is None, so `create_onscreen` builds a new one.
-        self.context_lost = false;
-        self.create_onscreen(window, None)?;
+        // Recreate the onscreen canvas + 2D context and probe, all inside one
+        // fallible block. `context_lost` must NOT be cleared until the ENTIRE
+        // sequence succeeds: `create_onscreen` clears it internally (line ~788)
+        // and any later `?` failure or a failed probe would otherwise leave the
+        // manager's flag `false` while the render thread's shared atomic is still
+        // `true` — a split-brain that removes the stable basis for the next
+        // recovery retry. So on ANY failure (Err or a failed probe) we force
+        // `context_lost = true`; only full success leaves it `false`.
+        let rebuilt = (|| -> EngineResult<bool> {
+            // `canvases` is empty and `preserved_ctx` is None, so
+            // `create_onscreen` builds a fresh onscreen context.
+            self.create_onscreen(window, None)?;
+            // Rebuild the onscreen 2D (Skia) context if the game had one so JS
+            // targeting canvas_id=1 keeps working after the reset.
+            if had_onscreen_2d {
+                context_2d_impl::init_skia_for_canvas(self, onscreen_id)?;
+            }
+            // ---- Phase 3: probe the rebuilt context for real usability ----
+            Ok(self.probe_context_usable(onscreen_id))
+        })();
 
-        // Rebuild the onscreen 2D (Skia) context if the game had one so JS
-        // targeting canvas_id=1 keeps working after the reset.
-        if had_onscreen_2d {
-            context_2d_impl::init_skia_for_canvas(self, onscreen_id)?;
+        match rebuilt {
+            Ok(true) => {
+                self.context_lost = false;
+                tracing::info!("EGL context share group rebuilt and probed OK");
+                Ok(true)
+            }
+            Ok(false) => {
+                self.context_lost = true;
+                tracing::error!("EGL recovery: probe draw failed, context still unusable");
+                Ok(false)
+            }
+            Err(e) => {
+                self.context_lost = true;
+                tracing::error!("EGL recovery failed during rebuild: {e}");
+                Err(e)
+            }
         }
-
-        // ---- Phase 3: probe the rebuilt context for real usability ----
-        if !self.probe_context_usable(onscreen_id) {
-            tracing::error!("EGL recovery: probe draw failed, context still unusable");
-            self.context_lost = true;
-            return Ok(false);
-        }
-
-        tracing::info!("EGL context share group rebuilt and probed OK");
-        Ok(true)
     }
 
     /// Probe whether a freshly rebuilt onscreen context is actually usable:

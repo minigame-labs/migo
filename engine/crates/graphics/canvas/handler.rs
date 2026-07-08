@@ -187,6 +187,13 @@ impl CanvasHandler {
                 let _ = cm.destroy_shared_image(image_id);
             }
 
+            CanvasCmd::DestroyImages { image_ids } => {
+                for image_id in image_ids {
+                    cm.cancel_pending_load(image_id);
+                    let _ = cm.destroy_shared_image(image_id);
+                }
+            }
+
             _ => {}
         }
         Ok(())

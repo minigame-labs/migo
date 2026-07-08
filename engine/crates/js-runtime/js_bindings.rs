@@ -732,6 +732,12 @@ impl JsBindings {
     /// Fire a WebGL context-loss lifecycle event (`webglcontextlost` /
     /// `webglcontextrestored`) on the main canvas so the engine can drop and
     /// rebuild its GL resources. No-op if the JS hook was not resolved.
+    ///
+    /// The JS handler returns whether a listener called `preventDefault()`, but
+    /// Migo's recovery is mandatory and automatic (driven entirely by the render
+    /// thread), so the return value is intentionally NOT consumed to gate
+    /// restoration — see `dispatchWebglContextEvent` in `web/03_canvas.js` for
+    /// the non-spec recovery contract.
     pub(crate) fn dispatch_webgl_context_event(&self, rt: &mut deno_core::JsRuntime, kind: &str) {
         if let Some(func_g) = self.webgl_context_event_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
