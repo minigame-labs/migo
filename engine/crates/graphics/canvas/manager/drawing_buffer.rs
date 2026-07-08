@@ -286,6 +286,18 @@ pub(crate) fn blit_to_surface(
         // Clear any pending GL error.
         clear_gl_errors(gl);
 
+        // `glBlitFramebuffer` writes to the DRAW framebuffer through the
+        // scissor test. Games routinely leave GL_SCISSOR_TEST enabled with a
+        // sub-window box (e.g. Phaser scissors to its 960x640 render size); if
+        // we blit with that still active, the present is clipped to that box —
+        // the game lands in a corner of the window with the rest black. The
+        // blit is a system-level present that must cover the whole surface, so
+        // disable scissor for the blit and restore the game's state after.
+        let scissor_was_enabled = gl.is_enabled(glow::SCISSOR_TEST);
+        if scissor_was_enabled {
+            gl.disable(glow::SCISSOR_TEST);
+        }
+
         // READ from DrawingBuffer, DRAW to window surface (FBO 0).
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(db.fbo));
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
@@ -359,6 +371,12 @@ pub(crate) fn blit_to_surface(
                 surface_w,
                 surface_h
             );
+        }
+
+        // Restore the game's scissor-test enable state (the game reprograms the
+        // scissor box itself; we only touched the enable flag).
+        if scissor_was_enabled {
+            gl.enable(glow::SCISSOR_TEST);
         }
     }
 }

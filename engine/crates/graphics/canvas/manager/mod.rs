@@ -908,45 +908,46 @@ impl CanvasManager {
         // context was preserved, the DrawingBuffer GL objects are still valid
         // and should be reused.  Reusing them preserves the last frame and
         // avoids a black resume frame before Cocos schedules a new RAF draw.
-        let drawing_buffer = if let Some(mut db) = self.preserved_drawing_buffer.take() {
-            if db.width == physical_w && db.height == physical_h {
-                tracing::info!(
-                    canvas_id = %id,
-                    width = physical_w,
-                    height = physical_h,
-                    "Reusing preserved DrawingBuffer for onscreen canvas"
-                );
-                unsafe {
-                    self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
-                }
-                Some(db)
-            } else {
-                tracing::info!(
-                    canvas_id = %id,
-                    old_width = db.width,
-                    old_height = db.height,
-                    new_width = physical_w,
-                    new_height = physical_h,
-                    "Resizing preserved DrawingBuffer for onscreen canvas"
-                );
-                match drawing_buffer::resize(&self.gl, &mut db, physical_w, physical_h) {
-                    Ok(()) => Some(db),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Preserved DrawingBuffer resize failed; recreating instead: {e}"
-                        );
-                        drawing_buffer::destroy(&self.gl, db);
-                        None
-                    }
-                }
+        let drawing_buffer = if let Some(db) = self.preserved_drawing_buffer.take() {
+            // Reuse the preserved DrawingBuffer AS-IS, at its own size. That
+            // size is the canvas *backing store* the game chose
+            // (canvas.width/height), which is INDEPENDENT of the EGL surface
+            // size — the swap-time blit scales db -> surface. Resizing it to
+            // the new surface here would clobber a game that picked a fixed
+            // canvas resolution (e.g. Phaser `Scale.NONE` at 960x640 on a
+            // 2340x1080 screen): its content would then render into a corner of
+            // an over-sized buffer instead of being upscaled to fill the
+            // window. The game itself drives backing-size changes through
+            // `resize_canvas` (canvas.width/height). Reusing also preserves the
+            // last frame, avoiding a black resume frame after a surface
+            // recreate (device rotation / resume).
+            tracing::info!(
+                canvas_id = %id,
+                width = db.width,
+                height = db.height,
+                surface_width = physical_w,
+                surface_height = physical_h,
+                "Reusing preserved DrawingBuffer for onscreen canvas"
+            );
+            unsafe {
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
             }
+            Some(db)
         } else {
             None
         };
-        if let Some(db) = drawing_buffer {
+        // The onscreen canvas backing store == the DrawingBuffer. Track its
+        // actual size in the entry so bypass evaluation (db vs surface) and JS
+        // canvas.width/height stay consistent; a fresh buffer defaults to the
+        // surface size (the default canvas fills the window).
+        let (backing_w, backing_h) = if let Some(db) = drawing_buffer {
+            let (dbw, dbh) = (db.width, db.height);
             if let Some(entry) = self.canvases.get_mut(&id) {
+                entry.info.width = dbw;
+                entry.info.height = dbh;
                 entry.drawing_buffer = Some(db);
             }
+            (dbw, dbh)
         } else {
             match drawing_buffer::create(&self.gl, physical_w, physical_h) {
                 Ok(db) => {
@@ -961,19 +962,22 @@ impl CanvasManager {
                     // Fallback: render directly to window surface (legacy behavior).
                 }
             }
-        }
+            (physical_w, physical_h)
+        };
         self.evaluate_bypass();
 
         // Reset default viewport/state for the newly created onscreen context.
-        // Context recreation invalidates old GL state tracking.
+        // Context recreation invalidates old GL state tracking. The default
+        // framebuffer viewport covers the DrawingBuffer (backing store), not
+        // the surface — the blit handles buffer -> surface scaling.
         unsafe {
-            self.gl.viewport(0, 0, physical_w as i32, physical_h as i32);
+            self.gl.viewport(0, 0, backing_w as i32, backing_h as i32);
         }
         self.gl_state.insert(
             id,
             CanvasGLState {
                 current_program: None,
-                viewport: Some((0, 0, physical_w as i32, physical_h as i32)),
+                viewport: Some((0, 0, backing_w as i32, backing_h as i32)),
                 ..Default::default()
             },
         );
@@ -1665,13 +1669,23 @@ impl CanvasManager {
         // DrawingBuffer provides. So whenever the onscreen canvas has a 2D
         // context, bypass must stay off. `init_skia_for_canvas` re-runs this
         // check when an onscreen 2D context is created.
+        // Bypass is only safe when the DrawingBuffer is exactly the surface
+        // size: the swap-time blit scales db→surface, but bypass renders
+        // straight to FBO 0 with no scaling. A game that shrinks its canvas
+        // below the surface (Phaser Scale.NONE) must go through the blit so it
+        // fills the window instead of landing in a corner. `false` when there
+        // is no DrawingBuffer, which also (correctly) disables bypass.
+        let onscreen_db_matches_surface =
+            self.canvases.get(&onscreen_id).map_or(false, |e| {
+                e.drawing_buffer.as_ref().map_or(false, |db| {
+                    db.width == e.physical_width && db.height == e.physical_height
+                })
+            });
         let can_bypass = can_bypass_drawing_buffer(
             self.canvases.len(),
             self.needs_default_fbo_readback,
             self.contexts_2d.contains_key(&onscreen_id),
-            self.canvases
-                .get(&onscreen_id)
-                .map_or(false, |e| e.drawing_buffer.is_some()),
+            onscreen_db_matches_surface,
         );
 
         if let Some(entry) = self.canvases.get_mut(&onscreen_id) {
@@ -1867,6 +1881,15 @@ impl CanvasManager {
             self.gl_state.entry(id).or_default().viewport =
                 Some((0, 0, new_w as i32, new_h as i32));
 
+            // The DrawingBuffer size just changed, which affects bypass
+            // eligibility: bypass is only safe when db == surface (see
+            // `can_bypass_drawing_buffer`). A game shrinking its onscreen canvas
+            // below the surface (Phaser Scale.NONE) must fall back to the
+            // scaling blit so it fills the window instead of a corner.
+            if id == CanvasId::from(1u32) {
+                self.evaluate_bypass();
+            }
+
             return Ok(());
         }
 
@@ -2010,10 +2033,34 @@ impl CanvasManager {
     /// Called from the render thread right before `flush_dirty_2d_contexts()`.
     pub(crate) fn declare_frame_damage(&mut self, id: CanvasId) {
         // Read what we need from the canvas entry, then drop the borrow.
-        let (surface_w, surface_h, surf) = match self.canvases.get(&id) {
-            Some(e) => (e.physical_width, e.physical_height, e.ctx.surf),
+        let (surface_w, surface_h, surf, scaling_blit) = match self.canvases.get(&id) {
+            Some(e) => {
+                // When the DrawingBuffer differs from the surface, the swap-time
+                // blit *scales* db -> surface, so it rewrites the entire surface
+                // every frame AND the game's damage rects (in DrawingBuffer /
+                // game coordinates) no longer map 1:1 onto surface pixels.
+                // Declaring a partial `eglSetDamageRegionKHR` in that case is a
+                // lie to the compositor (it points at the wrong surface region
+                // and claims the rest is unchanged when the scaled blit
+                // overwrote it), which corrupts buffer-age reuse and makes the
+                // screen flicker. Force full-surface damage whenever the blit
+                // scales.
+                let scaling = e
+                    .drawing_buffer
+                    .as_ref()
+                    .map_or(false, |db| {
+                        db.width != e.physical_width || db.height != e.physical_height
+                    });
+                (e.physical_width, e.physical_height, e.ctx.surf, scaling)
+            }
             None => return,
         };
+
+        if scaling_blit {
+            // Whole surface changes each frame: no partial-update hint.
+            self.pending_declared_damage = Some((id, ResolvedDamage::FullSurface));
+            return;
+        }
 
         // Resolve this frame's accumulated damage (does not reset — swap does that).
         let current_frame_damage = self.resolve_pending_damage(surface_w, surface_h);
@@ -4111,18 +4158,31 @@ impl Drop for CanvasManager {
 /// framebuffer is redirected to FBO 0 in bypass mode) but NOT for Skia/Canvas2D
 /// (whose onscreen surface always targets the DrawingBuffer FBO). It also
 /// requires no default-FBO readback (which needs preserved content) and exactly
-/// one canvas. Extracted as a pure fn so the conditions are unit-testable
-/// without a live GL context.
+/// one canvas.
+///
+/// Crucially, bypass also requires the DrawingBuffer to be exactly the surface
+/// size (`onscreen_db_matches_surface`). The DrawingBuffer→window blit *scales*
+/// (`glBlitFramebuffer` src=db → dst=surface), so a game that sizes its canvas
+/// below the surface (e.g. Phaser `Scale.NONE` at a fixed 960x640 on a 2340x1080
+/// screen) is upscaled to fill the window by the blit path. Bypass has no such
+/// scaling — WebGL renders straight into FBO 0 at the game's viewport, landing a
+/// 960x640 image in the bottom-left corner of the surface with the rest black.
+/// So whenever the DrawingBuffer differs from the surface, bypass must be off.
+/// (`onscreen_db_matches_surface` is false when there is no DrawingBuffer at all,
+/// which also correctly disables bypass.)
+///
+/// Extracted as a pure fn so the conditions are unit-testable without a live GL
+/// context.
 fn can_bypass_drawing_buffer(
     canvas_count: usize,
     needs_default_fbo_readback: bool,
     onscreen_has_2d_context: bool,
-    onscreen_has_drawing_buffer: bool,
+    onscreen_db_matches_surface: bool,
 ) -> bool {
     canvas_count == 1
         && !needs_default_fbo_readback
         && !onscreen_has_2d_context
-        && onscreen_has_drawing_buffer
+        && onscreen_db_matches_surface
 }
 
 #[cfg(test)]
@@ -4132,8 +4192,9 @@ mod tests {
 
     #[test]
     fn bypass_ok_for_single_webgl_onscreen_canvas() {
-        // The canonical bypass case: one onscreen canvas, a DrawingBuffer, no
-        // 2D context (WebGL), no readback → bypass is safe.
+        // The canonical bypass case: one onscreen canvas whose DrawingBuffer
+        // matches the surface, no 2D context (WebGL), no readback → bypass is
+        // safe.
         assert!(can_bypass_drawing_buffer(1, false, false, true));
     }
 
@@ -4146,13 +4207,22 @@ mod tests {
     }
 
     #[test]
-    fn bypass_off_for_multi_canvas_readback_or_no_drawing_buffer() {
+    fn onscreen_db_smaller_than_surface_disables_bypass() {
+        // Regression: a game (Phaser Scale.NONE) shrinks its onscreen canvas
+        // below the surface, so the DrawingBuffer no longer matches the surface.
+        // Bypass renders straight to FBO 0 with no scaling, landing the small
+        // image in the corner; the DrawingBuffer→surface blit upscales it to
+        // fill the window. Bypass MUST be off whenever db != surface (here also
+        // false when no DrawingBuffer exists).
+        assert!(!can_bypass_drawing_buffer(1, false, false, false));
+    }
+
+    #[test]
+    fn bypass_off_for_multi_canvas_or_readback() {
         // More than one canvas (offscreen canvases exist) → never bypass.
         assert!(!can_bypass_drawing_buffer(2, false, false, true));
         // Default-FBO readback latched (content must be preserved) → never bypass.
         assert!(!can_bypass_drawing_buffer(1, true, false, true));
-        // No DrawingBuffer at all → nothing to bypass.
-        assert!(!can_bypass_drawing_buffer(1, false, false, false));
     }
 
     // ---- Unified DamageEffect accumulator integration tests ----
