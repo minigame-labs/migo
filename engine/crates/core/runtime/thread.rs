@@ -1,4 +1,10 @@
-use std::{panic, sync::Arc};
+use std::{
+    panic,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use deno_core::PollEventLoopOptions;
 use tokio::runtime::{Builder, Runtime};
@@ -30,7 +36,11 @@ pub fn spawn_host_thread(
     let (host_tx, mut host_rx) = tokio::sync::mpsc::channel::<HostCommand>(512);
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
 
-    registry::register_sender(id, host_tx.clone());
+    // Authoritative shutdown signal, independent of the bounded command queue:
+    // `shutdown_host` sets this even when the queue is full (where a Shutdown
+    // command would be dropped) and the host loop polls it every iteration.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    registry::register_sender(id, host_tx.clone(), shutdown.clone());
 
     // Clone the platform Arc so we can use it in the catch_unwind path
     // to notify Java about errors from any context (host loop, panic, etc.).
@@ -92,6 +102,9 @@ pub fn spawn_host_thread(
                     }
                 });
 
+                // Owned handle to the shutdown flag so the `async move` loop
+                // below can poll it (the thread closure only lends it to us).
+                let shutdown = shutdown.clone();
                 runtime.block_on(async move {
                     let poll = PollEventLoopOptions::default();
                     let mut host = host;
@@ -113,6 +126,13 @@ pub fn spawn_host_thread(
                     let mut notify_exit = true;
 
                     'outer: loop {
+                        // Authoritative shutdown check: a full command queue can
+                        // make `shutdown_host`'s wake-up Shutdown enqueue fail, so
+                        // the flag (never blocked by the queue) is the real signal.
+                        if shutdown.load(Ordering::Acquire) {
+                            break 'outer;
+                        }
+
                         // Tick the watchdog heartbeat before each iteration
                         #[cfg(feature = "v8-limits")]
                         if let Some(ref wd) = host.watchdog {

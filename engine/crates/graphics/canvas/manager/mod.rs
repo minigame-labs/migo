@@ -3890,6 +3890,21 @@ impl CanvasManager {
         compressed: &shared::protocol::io_cmd::CompressedImage,
     ) -> EngineResult<(u32, u32)> {
         use shared::error::EngineError;
+
+        // Sink-side pixel cap: the io layer already rejects oversized KTX2, but
+        // this is the last line before glCompressedTexImage2D allocates a GPU
+        // texture, so guard here too against any future producer that bypasses
+        // the io cap. Uses the shared single-source-of-truth constant so io and
+        // graphics can't drift.
+        let cap = shared::protocol::io_cmd::MAX_IMAGE_PIXELS;
+        let px = (compressed.width as u64).saturating_mul(compressed.height as u64);
+        if px > cap {
+            return Err(EngineError::new(ErrorCode::OutOfMemory).with_detail(format!(
+                "compressed texture {}x{} ({} px) exceeds cap ({} px); refusing GPU upload",
+                compressed.width, compressed.height, px, cap
+            )));
+        }
+
         self.ensure_any_canvas_current()?;
 
         let format =
@@ -3915,12 +3930,28 @@ impl CanvasManager {
                 .with_detail(format!("GPU does not support {}", format.label())));
         }
 
+        // Reject a malformed KTX2 whose level-0 byte length doesn't match its
+        // declared dimensions before the driver would fail the upload with
+        // GL_INVALID_VALUE (glCompressedTexImage2D requires an exact size).
+        let expected = format.expected_level0_bytes(compressed.width, compressed.height);
+        if compressed.data.len() as u64 != expected {
+            return Err(EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
+                "compressed KTX2 level0 is {} bytes but {} {}x{} requires {} bytes",
+                compressed.data.len(),
+                format.label(),
+                compressed.width,
+                compressed.height,
+                expected
+            )));
+        }
+
         let texture = crate::compressed_upload::upload_compressed_texture(
             &self.gl,
             format,
             compressed.width,
             compressed.height,
             &compressed.data,
+            self.device_caps.has_pbo,
         )
         .ok_or_else(|| {
             EngineError::new(ErrorCode::Unsupported).with_detail("glCompressedTexImage2D failed")

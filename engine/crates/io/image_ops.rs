@@ -984,6 +984,22 @@ fn try_ktx2_as_compressed(
     gpu_caps: &GpuCapsSnapshot,
 ) -> Option<shared::protocol::io_cmd::CompressedImage> {
     let ktx2 = crate::ktx2::parse_ktx2(data).ok()?;
+    // A compressed KTX2 bypasses decode_image_fast / decode_image_to_any, so it
+    // would otherwise dodge MAX_IMAGE_PIXELS. A tiny compressed file can still
+    // declare an enormous texture that OOMs the GPU at glCompressedTexImage2D;
+    // enforce the same pixel cap on the header dimensions here. On over-cap we
+    // return None so the caller falls back to (capped) RGBA or a clean error.
+    if let Err(e) =
+        crate::fast_image_decoder::enforce_pixel_cap(ktx2.header.width, ktx2.header.height)
+    {
+        tracing::warn!(
+            "KTX2 compressed variant rejected ({}x{}): {}",
+            ktx2.header.width,
+            ktx2.header.height,
+            e
+        );
+        return None;
+    }
     let vk_format = ktx2_vk_format_code(&ktx2.header.format);
     if vk_format == 0 || !gpu_supports_vk_format(vk_format, gpu_caps) {
         return None;

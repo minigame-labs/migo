@@ -35,6 +35,40 @@ pub(crate) struct WorkerHandle {
     #[allow(dead_code)]
     join_handle: Option<std::thread::JoinHandle<()>>,
     terminated: bool,
+    /// Thread-safe handle to the worker's V8 isolate, published by the worker
+    /// thread right after it builds its `JsRuntime`. Used to *forcibly* stop a
+    /// runaway worker: the cooperative `Terminate` message is only observed
+    /// when the worker is awaiting `op_worker_inner_recv_message`, so a
+    /// compute-bound `while (true) {}` would otherwise never exit. Wrapped in a
+    /// `Mutex<Option<..>>` because it is filled asynchronously (the worker may
+    /// not have created the isolate yet when this handle is stored).
+    isolate_handle: Arc<std::sync::Mutex<Option<v8::IsolateHandle>>>,
+}
+
+impl WorkerHandle {
+    /// Force the worker to stop: interrupt any executing JS via the isolate
+    /// handle (breaks a runaway loop that ignores the cooperative `Terminate`)
+    /// and signal the message pump to exit. Safe to call more than once and
+    /// after the worker isolate has already been disposed.
+    fn force_terminate(&self) {
+        if let Ok(guard) = self.isolate_handle.lock() {
+            if let Some(h) = guard.as_ref() {
+                h.terminate_execution();
+            }
+        }
+        let _ = self.tx_to_worker.send(WorkerMessage::Terminate);
+    }
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        // Guarantees the worker thread + its V8 isolate are torn down when the
+        // main runtime is dropped (JS runtime restart / host shutdown), even if
+        // the game never called `terminate()`. Without the isolate interrupt a
+        // compute-bound worker would leak its OS thread and isolate for the rest
+        // of the process lifetime.
+        self.force_terminate();
+    }
 }
 
 /// Stored in the **worker** thread's `OpState`.
@@ -74,8 +108,15 @@ impl WorkerModuleLoader {
         &self,
         url: &deno_core::ModuleSpecifier,
     ) -> Result<(), deno_core::error::ModuleLoaderError> {
+        // Fail-closed: a worker with no /code mount table has no sandbox to
+        // enforce against, so refuse module loading rather than fall through to
+        // the raw filesystem loader. `op_worker_create` also requires a mount
+        // table, so reaching here with `None` should be impossible — this is
+        // defense in depth against a future caller that skips that check.
         let Some(mt) = self.mount_table.as_ref() else {
-            return Ok(());
+            return Err(deno_core::error::ModuleLoaderError::generic(
+                "Worker module load blocked: no /code mount table (sandbox unavailable)",
+            ));
         };
         let Ok(path) = url.to_file_path() else {
             return Ok(());
@@ -211,13 +252,33 @@ async fn op_worker_create(
     state: Rc<RefCell<OpState>>,
     #[string] script_path: String,
 ) -> Result<(), WorkerError> {
-    // Check existing worker
+    // Check existing worker. A previously terminated worker whose thread has
+    // fully exited is reaped here so a new one can be created; but we refuse
+    // while any worker is still alive OR still winding down after terminate()
+    // (its thread not yet finished), so an old and new worker never coexist.
     {
-        let st = state.borrow();
-        if st.try_borrow::<WorkerHandle>().is_some() {
-            return Err(WorkerError::Message(
-                "Only one worker can exist at a time. Call terminate() first.".into(),
-            ));
+        let needs_reap = {
+            let st = state.borrow();
+            match st.try_borrow::<WorkerHandle>() {
+                None => false,
+                Some(h) => {
+                    let finished =
+                        h.join_handle.as_ref().map_or(true, |jh| jh.is_finished());
+                    if h.terminated && finished {
+                        true
+                    } else {
+                        return Err(WorkerError::Message(
+                            "Only one worker can exist at a time. Call terminate() first."
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        };
+        if needs_reap {
+            // Drop the finished, terminated handle (its thread already exited,
+            // so the detached JoinHandle leaks nothing).
+            drop(state.borrow_mut().take::<WorkerHandle>());
         }
     }
 
@@ -236,6 +297,15 @@ async fn op_worker_create(
         let code_dir = host.code_dir.clone().ok_or_else(|| {
             WorkerError::Message("No code directory set (game not loaded yet)".into())
         })?;
+
+        // Fail-closed sandbox: refuse to spawn a worker before the /code mount
+        // table exists, so the worker module loader always has a sandbox to
+        // enforce (see WorkerModuleLoader::validate_sandbox).
+        if host.mount_table.is_none() {
+            return Err(WorkerError::Message(
+                "No /code mount table set (game not fully loaded yet)".into(),
+            ));
+        }
 
         // Create dummy channels for services the worker does not use
         let (render_tx, _render_rx) = shared::render_command_sender::CommandSender::new();
@@ -285,6 +355,12 @@ async fn op_worker_create(
         rx_from_main: Arc::new(tokio::sync::Mutex::new(rx_main_to_worker)),
     };
 
+    // Shared slot the worker thread fills with its isolate handle once its
+    // JsRuntime is built, so the main thread can forcibly terminate a runaway
+    // worker (see WorkerHandle::force_terminate).
+    let isolate_handle: Arc<std::sync::Mutex<Option<v8::IsolateHandle>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
     // Spawn worker thread
     info!(
         "[Worker] spawning worker thread for script: {}",
@@ -296,6 +372,7 @@ async fn op_worker_create(
         worker_ctx,
         worker_host_state,
         sab_store,
+        isolate_handle.clone(),
     )?;
     info!("[Worker] worker thread spawned, storing handle");
 
@@ -306,6 +383,7 @@ async fn op_worker_create(
         rx_errors: Arc::new(tokio::sync::Mutex::new(rx_worker_errors)),
         join_handle: Some(join_handle),
         terminated: false,
+        isolate_handle,
     };
 
     state.borrow_mut().put(handle);
@@ -390,14 +468,17 @@ fn op_worker_terminate(state: &mut OpState) -> Result<(), WorkerError> {
     let handle = state
         .try_borrow_mut::<WorkerHandle>()
         .ok_or_else(|| WorkerError::Message("No active worker".into()))?;
-
     if !handle.terminated {
         handle.terminated = true;
-        let _ = handle.tx_to_worker.send(WorkerMessage::Terminate);
+        // Interrupt any executing JS (breaks a runaway `while (true) {}`) and
+        // signal the message pump to exit.
+        handle.force_terminate();
     }
-
-    // Remove handle from state so a new worker can be created
-    state.take::<WorkerHandle>();
+    // The handle is intentionally KEPT in OpState (not taken) until the worker
+    // thread has actually exited. `op_worker_create` reaps it once
+    // `join_handle.is_finished()`, so a freshly created worker can never coexist
+    // with an old one that is still winding down (e.g. briefly stuck in a native
+    // op after the JS-loop interrupt).
     Ok(())
 }
 
@@ -632,12 +713,18 @@ fn spawn_worker_thread(
     ctx: WorkerCtx,
     host_state: HostOpState,
     sab_store: SharedArrayBufferStore,
+    isolate_handle_slot: Arc<std::sync::Mutex<Option<v8::IsolateHandle>>>,
 ) -> Result<std::thread::JoinHandle<()>, WorkerError> {
     let tx_errors = ctx.tx_errors.clone();
 
     std::thread::Builder::new()
         .name("Migo-Worker".into())
         .spawn(move || {
+            // Clone kept in the outer scope so we can clear the published isolate
+            // handle once the thread exits (any path). `run` moves the original
+            // clone into its async block. Clearing the slot makes a post-exit
+            // `force_terminate` an observable no-op and aids state inspection.
+            let slot_for_cleanup = isolate_handle_slot.clone();
             let run = || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_io()
@@ -676,6 +763,14 @@ fn spawn_worker_thread(
                         ..Default::default()
                     });
                     info!("[Worker] JsRuntime created successfully");
+
+                    // Publish the isolate handle so the main thread can forcibly
+                    // terminate this worker (WorkerHandle::force_terminate) even
+                    // if it's stuck in a runaway JS loop that never awaits the
+                    // cooperative Terminate message.
+                    if let Ok(mut slot) = isolate_handle_slot.lock() {
+                        *slot = Some(rt.v8_isolate().thread_safe_handle());
+                    }
 
                     // Register near-heap-limit callback for OOM protection
                     {
@@ -768,6 +863,13 @@ fn spawn_worker_thread(
                     .unwrap_or_else(|| "Unknown panic".to_string());
 
                 error!("[Worker] panicked: {}", panic_msg);
+            }
+
+            // Thread is exiting (clean, error, or panic): drop the published
+            // isolate handle so the main thread stops holding a handle to a dead
+            // isolate.
+            if let Ok(mut slot) = slot_for_cleanup.lock() {
+                *slot = None;
             }
         })
         .map_err(|e| WorkerError::Message(format!("Failed to spawn worker thread: {e}")))

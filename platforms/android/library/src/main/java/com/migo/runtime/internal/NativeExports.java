@@ -260,9 +260,44 @@ public final class NativeExports {
             return null;
         }
 
+        // Hard image-bomb ceiling, mirroring the Rust MAX_IMAGE_PIXELS guard in
+        // io/fast_image_decoder.rs: 64 Mpx = 8192x8192 = 256 MiB RGBA. A tiny
+        // compressed file can declare huge dimensions; probing bounds first lets
+        // us reject before allocating a multi-hundred-MB bitmap.
+        final long MAX_IMAGE_PIXELS = 8192L * 8192L;
+
         Bitmap bitmap = null;
         try {
             BitmapFactory.Options opts = new BitmapFactory.Options();
+
+            // Pass 1 -- bounds only (no pixel allocation). Read the declared
+            // dimensions and reject an oversized / undecodable image up front,
+            // before committing the full ARGB_8888 buffer.
+            opts.inJustDecodeBounds = true;
+            BitmapFactory.decodeByteArray(imageData, 0, imageData.length, opts);
+            long probedPixels = (long) opts.outWidth * (long) opts.outHeight;
+            if (opts.outWidth <= 0 || opts.outHeight <= 0 || probedPixels > MAX_IMAGE_PIXELS) {
+                // Undecodable header or exceeds the pixel ceiling: refuse rather
+                // than risk an OOM on the full decode.
+                return null;
+            }
+
+            // Dynamic memory budget: the decode needs ~pixels*4 for the
+            // ARGB_8888 bitmap plus pixels*4 for the exported byte[] below
+            // (= pixels*8), plus slack for GC headroom. A large-but-under-cap
+            // image (e.g. 8192x8192 = 256 MiB bitmap + 256 MiB output) can still
+            // OOM / GC-storm a low-memory device, so refuse when the free heap
+            // can't comfortably hold it. This complements the fixed 32 MiB
+            // headroom gate above with a size-proportional one.
+            long needBytes = probedPixels * 8L + (16L * 1024 * 1024);
+            Runtime rt2 = Runtime.getRuntime();
+            long free2 = rt2.maxMemory() - (rt2.totalMemory() - rt2.freeMemory());
+            if (free2 < needBytes) {
+                return null;
+            }
+
+            // Pass 2 -- real decode.
+            opts.inJustDecodeBounds = false;
             opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
             // Decode as non-premultiplied so RGB channels are unmodified.
             // The GL pipeline handles alpha blending; premultiplied data

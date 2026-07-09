@@ -117,6 +117,24 @@ pub struct SavedFileInfo {
     pub create_time: u64,
 }
 
+/// Hard upper bound on decoded image dimensions (total pixel count), shared as
+/// the single source of truth across the decode layer (`io`) and the GPU upload
+/// layer (`graphics`) so the two can never drift apart.
+///
+/// A tiny compressed file can declare enormous dimensions — e.g. a ~50 KB PNG
+/// with a `30000x30000` header decodes to 3.6 GiB of RGBA, and a small KTX2 can
+/// declare an equally huge GPU texture. 64 Mpx = `8192x8192` = 256 MiB RGBA is
+/// generous for legitimate high-res bundled game textures (8K square) while
+/// blocking the multi-GiB allocations that instantly OOM the process. The
+/// inline/HTTP paths keep their own tighter budget for untrusted sources.
+///
+/// Mirrored in the Android platform decoder (`NativeExports.decodeImageRgba`)
+/// as an early-rejection optimisation — keep the two in sync when changing this
+/// value. The Rust `enforce_pixel_cap` is authoritative: it re-checks the
+/// platform-decoder result, so a Java-side drift only wastes one bitmap decode,
+/// it cannot defeat the OOM guard.
+pub const MAX_IMAGE_PIXELS: u64 = 8192 * 8192;
+
 /// A simple, protocol-friendly image representation.
 /// - `rgba` length must be width * height * 4.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
