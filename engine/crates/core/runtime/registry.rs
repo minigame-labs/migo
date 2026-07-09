@@ -86,11 +86,14 @@ pub fn send_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), Str
 }
 
 pub fn shutdown_host(id: HostId) -> Result<(), String> {
-    // Set the shutdown flag first: it is the authoritative signal the host loop
-    // polls every iteration, so shutdown succeeds even when the bounded command
-    // queue is full and the wake-up `try_send` below would be dropped -- the bug
-    // this guards against is a full queue silently swallowing
-    // HostCommand::Shutdown and leaking the host thread forever.
+    // Set the shutdown flag first: the host loop checks it every iteration, which
+    // decouples shutdown from the command queue -- a full queue can no longer
+    // swallow the request (the bug this fixes: HostCommand::Shutdown dropped by
+    // try_send when the 512-slot queue is full, leaking the host thread). The flag
+    // takes effect the next time the loop returns to the top of its iteration; it
+    // does not preempt a runaway synchronous JS section that never yields (an
+    // inherent bound of the cooperative loop; the v8-limits ANR watchdog covers
+    // that case), so this is not an instantaneous hard kill.
     let sender = {
         let map = host_senders().read();
         let Some((tx, shutdown)) = map.get(&id) else {
@@ -102,8 +105,8 @@ pub fn shutdown_host(id: HostId) -> Result<(), String> {
         tx.clone()
     };
     // Best-effort nudge so a host parked on `recv()` reacts immediately; if the
-    // queue is full this send is dropped, but the flag above already guarantees
-    // the loop will exit on its next iteration.
+    // queue is full this send is dropped, but the flag above still stops the loop
+    // when it next iterates.
     let _ = sender.try_send(HostCommand::Shutdown);
     Ok(())
 }

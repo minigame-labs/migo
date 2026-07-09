@@ -17,7 +17,11 @@
 //! └──────────────┘                      └──────────────┘
 //! ```
 //!
-//! ## Command Categories (37 variants)
+//! ## Command Categories
+//!
+//! The `HostCommand` enum is the authoritative list; the grouping and counts
+//! below are indicative and may lag as variants (e.g. `DrainRenderEvents`) are
+//! added.
 //!
 //! - **Module Loading** (2): `EvaluateModule`, `EvalScript`
 //! - **Lifecycle** (4): `Restart`, `Shutdown`, `OnShow`, `OnHide`
@@ -77,7 +81,10 @@ pub struct BleCharacteristicData {
 /// These commands drive the JavaScript runtime and coordinate between
 /// native subsystems (rendering, audio, input) and the JS game code.
 ///
-/// # Variant Groups (37 variants total)
+/// # Variant Groups
+///
+/// The enum below is the authoritative list; the grouping and counts here are
+/// indicative and may lag as variants (e.g. `DrainRenderEvents`) are added.
 ///
 /// - **Module Loading** (2): `EvaluateModule`, `EvalScript`
 /// - **Lifecycle** (4): `Restart`, `Shutdown`, `OnShow`, `OnHide`

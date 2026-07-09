@@ -177,7 +177,7 @@ const dispatchWebglContextEvent = (type) => {
         bubbles: false,
         cancelable: type === "webglcontextlost",
         get defaultPrevented() { return prevented; },
-        preventDefault() { prevented = true; },
+        preventDefault() { if (type === "webglcontextlost") prevented = true; },
     };
     _mainCanvas.dispatchEvent(event);
     return prevented;

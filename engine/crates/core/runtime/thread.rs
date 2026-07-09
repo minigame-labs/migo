@@ -126,9 +126,11 @@ pub fn spawn_host_thread(
                     let mut notify_exit = true;
 
                     'outer: loop {
-                        // Authoritative shutdown check: a full command queue can
-                        // make `shutdown_host`'s wake-up Shutdown enqueue fail, so
-                        // the flag (never blocked by the queue) is the real signal.
+                        // Shutdown check, decoupled from the command queue so a
+                        // full queue can't swallow the request (see shutdown_host).
+                        // Stops the loop the next time control returns here; a
+                        // runaway JS section that never yields is handled by the
+                        // ANR watchdog, not this flag.
                         if shutdown.load(Ordering::Acquire) {
                             break 'outer;
                         }

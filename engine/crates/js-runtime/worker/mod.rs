@@ -707,6 +707,122 @@ pub fn create_worker_runtime_extensions(ctx: WorkerCtx, host_state: HostOpState)
 // Worker thread spawn
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Runaway watchdog
+// ---------------------------------------------------------------------------
+
+/// How often the monitor thread samples the worker heartbeat.
+const WORKER_WATCHDOG_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Max time a worker may run without yielding before it is force-terminated.
+/// Matches the host ANR timeout: generous enough to cover module compilation on
+/// low-end devices, tight enough to catch a `while(true)` runaway.
+const WORKER_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Liveness heartbeat for a worker isolate. The worker runs on a
+/// **single-threaded** tokio runtime, so a runaway JS loop that never yields
+/// monopolises the thread and starves the ticker task; the heartbeat then goes
+/// stale and the monitor thread force-terminates the isolate. Self-contained
+/// mirror of the host ANR watchdog (`js-runtime` cannot depend on `core`).
+struct WorkerWatchdog {
+    epoch: std::time::Instant,
+    heartbeat_ms: std::sync::atomic::AtomicU64,
+}
+
+impl WorkerWatchdog {
+    #[inline]
+    fn mono_millis(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+    #[inline]
+    fn tick(&self) {
+        self.heartbeat_ms
+            .store(self.mono_millis(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Arm the runaway watchdog for the current worker. Spawns two helpers:
+///   * a ticker task on the worker's single-threaded runtime that refreshes the
+///     heartbeat once a second — it can only run when JS yields, so a runaway
+///     loop stops it (and is cancelled automatically when the runtime is
+///     dropped on worker exit);
+///   * a monitor OS thread (unaffected by a blocked runtime) that terminates
+///     the isolate via the published handle once the heartbeat is older than
+///     [`WORKER_WATCHDOG_TIMEOUT`], and exits on its own once the worker clears
+///     the handle slot on any exit path.
+fn spawn_worker_watchdog(
+    isolate_handle_slot: Arc<std::sync::Mutex<Option<v8::IsolateHandle>>>,
+    tx_errors: mpsc::UnboundedSender<String>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let wd = Arc::new(WorkerWatchdog {
+        epoch: std::time::Instant::now(),
+        heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+    });
+    wd.tick();
+
+    let wd_tick = Arc::clone(&wd);
+    tokio::task::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            wd_tick.tick();
+        }
+    });
+
+    let spawned = std::thread::Builder::new()
+        .name("Migo-WorkerWatchdog".into())
+        .spawn(move || {
+            let timeout_ms = WORKER_WATCHDOG_TIMEOUT.as_millis() as u64;
+            let mut reported = false;
+            loop {
+                std::thread::sleep(WORKER_WATCHDOG_CHECK_INTERVAL);
+                let elapsed = wd
+                    .mono_millis()
+                    .saturating_sub(wd.heartbeat_ms.load(Ordering::Acquire));
+                // Hold the slot lock only briefly. The worker never holds it
+                // while executing JS, so a runaway loop can still be reached.
+                let slot = match isolate_handle_slot.lock() {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                match slot.as_ref() {
+                    // Handle cleared => worker exited (all exit paths clear it)
+                    // => the isolate is gone, stop the monitor.
+                    None => break,
+                    Some(handle) => {
+                        if elapsed > timeout_ms {
+                            // Re-arm termination every cycle until the worker
+                            // actually exits (slot clears). One
+                            // terminate_execution() is enough for a JS runaway,
+                            // but a worker wedged in an uninterruptible native op
+                            // won't drop until that op returns; keep the request
+                            // live rather than giving up after one shot. Report
+                            // once to avoid spamming the error channel.
+                            if !reported {
+                                warn!(
+                                    "[Worker] watchdog: runaway detected ({}ms unresponsive > {}ms), terminating isolate",
+                                    elapsed, timeout_ms
+                                );
+                                let _ = tx_errors.send(
+                                    r#"{"message":"Worker terminated: unresponsive (watchdog timeout)"}"#
+                                        .to_string(),
+                                );
+                                reported = true;
+                            }
+                            handle.terminate_execution();
+                        }
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        // Non-fatal: without the monitor the worker simply lacks auto-kill (the
+        // pre-existing state), so log and continue rather than fail the spawn.
+        warn!("[Worker] failed to spawn watchdog monitor thread: {e}");
+    }
+}
+
 fn spawn_worker_thread(
     script_path: String,
     code_dir: String,
@@ -800,6 +916,12 @@ fn spawn_worker_thread(
                             current_limit.saturating_add(1024 * 1024).min(hard_cap)
                         });
                     }
+
+                    // Arm the runaway watchdog now that the isolate handle is
+                    // published: covers module evaluation and the event loop. A
+                    // worker that stops yielding (infinite loop) starves the
+                    // ticker on this single-threaded runtime and gets killed.
+                    spawn_worker_watchdog(isolate_handle_slot.clone(), tx_errors.clone());
 
                     // Resolve and load worker script
                     let code_path = std::path::PathBuf::from(&code_dir);
