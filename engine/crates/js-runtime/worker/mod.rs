@@ -676,7 +676,7 @@ pub fn worker_inner_extensions(ctx: WorkerCtx) -> Vec<Extension> {
 /// This gives workers the same shared APIs as the main thread.
 pub fn create_worker_runtime_extensions(ctx: WorkerCtx, host_state: HostOpState) -> Vec<Extension> {
     use crate::{
-        base, console, env, event, file, io_state, network, rendering, url, utility, web,
+        base, console, env, event, file, io_state, lifecycle, network, rendering, url, utility, web,
         worker_runtime,
     };
 
@@ -694,7 +694,12 @@ pub fn create_worker_runtime_extensions(ctx: WorkerCtx, host_state: HostOpState)
     exts.extend(network::network_extensions());
 
     #[cfg(feature = "api-media")]
-    exts.extend(crate::audio::audio_extensions());
+    {
+        // host_v8_audio depends on host_v8_lifecycle, so it must be registered
+        // first (its esm imports onHide/onShow from the lifecycle module).
+        exts.extend(lifecycle::lifecycle_extensions());
+        exts.extend(crate::audio::audio_extensions());
+    }
 
     exts.extend(env::env_extensions());
     exts.extend(worker_inner_extensions(ctx));

@@ -39,6 +39,13 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
         }
 
         let frame_count = packet[0].len();
+        // Reject a decode bomb before reserving/growing the buffer.
+        if !crate::limits::pcm_samples_within_budget(samples.len() + frame_count * packet.len()) {
+            return Err(EngineError::from_detail(
+                ErrorCode::InvalidArgument,
+                "OGG decode exceeds the PCM budget",
+            ));
+        }
         samples.reserve(frame_count * packet.len());
         for i in 0..frame_count {
             for ch in &packet {

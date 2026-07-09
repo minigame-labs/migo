@@ -1,103 +1,100 @@
-use shared::error::EngineResult;
+use shared::error::{EngineError, EngineResult, ErrorCode};
 
 use crate::decoder::DecodedAudio;
 
 /// Simple streaming resampler using linear interpolation
 /// Suitable for real-time streaming where low latency is more important than quality
 pub struct StreamResampler {
-    input_rate: u32,
-    output_rate: u32,
     channels: u32,
-    /// Fractional position in input (16.16 fixed point per channel)
+    /// Fractional read position (16.16 fixed point) into the virtual input, which is
+    /// `[previous chunk's last frame] ++ current chunk`.
     position: u64,
-    /// Rate ratio as 16.16 fixed point
+    /// Rate ratio as 16.16 fixed point (input_rate / output_rate).
     ratio: u64,
-    /// Last sample per channel for interpolation
-    last_samples: Vec<f32>,
+    /// Last input frame of the previous chunk (`channels` samples), used as the virtual
+    /// prefix so interpolation stays continuous across chunk boundaries. `None` before
+    /// the first chunk.
+    history: Option<Vec<f32>>,
 }
 
 impl StreamResampler {
     pub fn new(input_rate: u32, output_rate: u32, channels: u32) -> Self {
-        // Calculate ratio as 16.16 fixed point
+        // Rate ratio as 16.16 fixed point.
         let ratio = ((input_rate as u64) << 16) / output_rate as u64;
 
         Self {
-            input_rate,
-            output_rate,
             channels,
             position: 0,
             ratio,
-            last_samples: vec![0.0; channels as usize],
+            history: None,
         }
     }
 
-    /// Process interleaved samples, returns resampled interleaved output
+    /// Process interleaved samples, returns resampled interleaved output.
+    ///
+    /// Streaming-safe: an output frame whose right-hand interpolation neighbour would
+    /// fall in the *next* chunk is deferred (the read position carries over) rather than
+    /// approximated, so concatenating the per-chunk outputs equals a single-pass resample
+    /// of the whole stream — no sample is skipped or duplicated at a chunk boundary.
     pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        let mut output = Vec::new();
+        self.process_into(input, &mut output);
+        output
+    }
+
+    /// Resample `input`, **appending** the result to `output`.
+    ///
+    /// Appending (rather than allocating a fresh `Vec` per call) lets a caller
+    /// resample a large buffer chunk-by-chunk into one destination without a
+    /// temporary allocation + copy per chunk.
+    pub fn process_into(&mut self, input: &[f32], output: &mut Vec<f32>) {
         let channels = self.channels as usize;
         if channels == 0 || input.is_empty() {
-            return Vec::new();
+            return;
         }
 
-        let input_frames = input.len() / channels;
-        // Ceiling division: generate enough output frames to consume ALL input.
-        // Floor division would leave a fractional frame unconsumed per chunk,
-        // causing cumulative drift (~28ms over 3 minutes for 44.1→48kHz).
-        let output_frames =
-            ((input_frames as u64 * self.output_rate as u64 + self.input_rate as u64 - 1)
-                / self.input_rate as u64) as usize;
-
-        if output_frames == 0 {
-            return Vec::new();
+        let n_chunk = input.len() / channels;
+        if n_chunk == 0 {
+            // Not even one full frame; leave the carried-over prefix untouched.
+            return;
         }
 
-        let mut output = Vec::with_capacity(output_frames * channels);
+        // Virtual input = [previous chunk's last frame] ++ this chunk.
+        let prefix = self.history.take();
+        let work_len = n_chunk + usize::from(prefix.is_some());
 
-        for _ in 0..output_frames {
+        let virtual_at = |frame: usize, ch: usize| -> f32 {
+            match &prefix {
+                Some(p) if frame == 0 => p[ch],
+                Some(_) => input[(frame - 1) * channels + ch],
+                None => input[frame * channels + ch],
+            }
+        };
+
+        let est_frames = ((n_chunk as u64) << 16) / self.ratio.max(1);
+        output.reserve((est_frames as usize + 1) * channels);
+
+        loop {
             let pos_int = (self.position >> 16) as usize;
+            if pos_int + 1 >= work_len {
+                break; // the successor sample belongs to the next chunk — defer it
+            }
             let frac = (self.position & 0xFFFF) as f32 / 65536.0;
-
             for ch in 0..channels {
-                let idx0 = pos_int * channels + ch;
-                let idx1 = (pos_int + 1) * channels + ch;
-
-                let s0 = if pos_int == 0 && self.position < (1 << 16) {
-                    self.last_samples[ch]
-                } else if idx0 < input.len() {
-                    input[idx0]
-                } else {
-                    0.0
-                };
-
-                let s1 = if idx1 < input.len() {
-                    input[idx1]
-                } else if idx0 < input.len() {
-                    input[idx0]
-                } else {
-                    0.0
-                };
-
-                // Linear interpolation
+                let s0 = virtual_at(pos_int, ch);
+                let s1 = virtual_at(pos_int + 1, ch);
                 output.push(s0 + (s1 - s0) * frac);
             }
-
             self.position += self.ratio;
         }
 
-        // Save last samples for next chunk
-        if input_frames > 0 {
-            let last_frame_start = (input_frames - 1) * channels;
-            for ch in 0..channels {
-                self.last_samples[ch] = input[last_frame_start + ch];
-            }
-        }
+        // This chunk's last frame becomes virtual index 0 of the next chunk, so rebase the
+        // read position by however many virtual frames we advanced past.
+        let consumed = (work_len - 1) as u64;
+        self.position -= consumed << 16;
 
-        // Keep only fractional part of position for next chunk
-        let frames_consumed = self.position >> 16;
-        if frames_consumed >= input_frames as u64 {
-            self.position = self.position - ((input_frames as u64) << 16);
-        }
-
-        output
+        let last_frame_start = (n_chunk - 1) * channels;
+        self.history = Some(input[last_frame_start..last_frame_start + channels].to_vec());
     }
 }
 
@@ -132,18 +129,28 @@ pub fn resample_if_needed(
     let resample_ratio = target_sample_rate as f64 / audio.sample_rate as f64;
     let output_frames = (input_frames as f64 * resample_ratio).ceil() as usize;
 
+    // A within-budget input can still upsample past the PCM budget; reject before
+    // allocating the (potentially huge) output buffer.
+    let output_total = output_frames.saturating_mul(channels);
+    if !crate::limits::pcm_samples_within_budget(output_total) {
+        return Err(EngineError::from_detail(
+            ErrorCode::InvalidArgument,
+            format!("resampled output ({output_total} samples) exceeds the PCM budget"),
+        ));
+    }
+
     let mut resampler = StreamResampler::new(audio.sample_rate, target_sample_rate, audio.channels);
 
-    // Process in chunks to bound memory for large files
+    // Process in chunks to bound memory for large files, appending each chunk's
+    // output directly into the destination (no per-chunk temporary + copy).
     const CHUNK_FRAMES: usize = 8192;
     let chunk_samples = CHUNK_FRAMES * channels;
-    let mut output_samples = Vec::with_capacity(output_frames * channels);
+    let mut output_samples = Vec::with_capacity(output_total);
 
     let mut pos = 0;
     while pos < audio.samples.len() {
         let end = (pos + chunk_samples).min(audio.samples.len());
-        let resampled = resampler.process(&audio.samples[pos..end]);
-        output_samples.extend_from_slice(&resampled);
+        resampler.process_into(&audio.samples[pos..end], &mut output_samples);
         pos = end;
     }
 
@@ -158,4 +165,119 @@ pub fn resample_if_needed(
         sample_rate: target_sample_rate,
         channels: audio.channels,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoder::DecodedAudio;
+
+    /// A linear ramp resampled with linear interpolation must stay a linear ramp:
+    /// output[k] == k * input_rate / output_rate. Any deviation means input samples
+    /// were skipped or duplicated — historically once per 8192-frame chunk boundary.
+    #[test]
+    fn upsample_ramp_has_no_chunk_boundary_glitch() {
+        let input_rate = 24_000;
+        let output_rate = 48_000; // integer 2x upsampling
+        let n = 20_000; // > 2 * CHUNK_FRAMES so several chunk boundaries are crossed
+        let samples: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let audio = DecodedAudio {
+            samples,
+            sample_rate: input_rate,
+            channels: 1,
+        };
+
+        let out = resample_if_needed(audio, output_rate).unwrap();
+
+        let expected_len = n as usize * output_rate as usize / input_rate as usize;
+        assert!(
+            (out.frame_count() as i64 - expected_len as i64).abs() <= 3,
+            "unexpected output length: got {}, want ~{}",
+            out.frame_count(),
+            expected_len
+        );
+
+        let step = input_rate as f64 / output_rate as f64; // 0.5 input frame per output frame
+        let mut max_err = 0.0f64;
+        let mut worst_k = 0usize;
+        // The final 2 frames have no successor sample (end of stream) — skip them.
+        for k in 0..out.frame_count().saturating_sub(2) {
+            let want = k as f64 * step;
+            let err = (out.samples[k] as f64 - want).abs();
+            if err > max_err {
+                max_err = err;
+                worst_k = k;
+            }
+        }
+        assert!(
+            max_err < 0.01,
+            "resample glitch: max error {:.3} at output frame {} (chunk boundary near k≈{})",
+            max_err,
+            worst_k,
+            2 * 8192
+        );
+    }
+
+    /// Chunking is only a memory optimisation: feeding the stream in 8192-frame chunks
+    /// (as `resample_if_needed` does) must produce identical output to resampling the whole
+    /// buffer in one call. This isolates chunk-boundary correctness from the inherent
+    /// fixed-point ratio drift, and covers a non-integer ratio plus a stereo layout.
+    #[test]
+    fn chunked_resample_matches_single_pass() {
+        let input_rate = 44_100;
+        let output_rate = 48_000; // non-integer ratio
+        let channels = 2u32;
+        let n = 20_000usize;
+
+        // A distinct ramp per channel so any channel bleed shows up.
+        let mut samples = Vec::with_capacity(n * channels as usize);
+        for i in 0..n {
+            samples.push(i as f32); // channel 0
+            samples.push(-(i as f32) * 2.0); // channel 1
+        }
+
+        let single = StreamResampler::new(input_rate, output_rate, channels).process(&samples);
+
+        let audio = DecodedAudio {
+            samples,
+            sample_rate: input_rate,
+            channels,
+        };
+        let chunked = resample_if_needed(audio, output_rate).unwrap();
+
+        assert_eq!(
+            chunked.samples.len(),
+            single.len(),
+            "chunked length {} != single-pass length {}",
+            chunked.samples.len(),
+            single.len()
+        );
+        for (i, (chunk_s, single_s)) in chunked.samples.iter().zip(single.iter()).enumerate() {
+            assert!(
+                (chunk_s - single_s).abs() < 1e-6,
+                "sample {} differs: chunked={} single-pass={}",
+                i,
+                chunk_s,
+                single_s
+            );
+        }
+    }
+
+    /// A within-budget input that upsamples past the PCM budget must be rejected
+    /// *before* the giant output buffer is allocated (the guard runs first).
+    #[test]
+    fn resample_rejects_over_budget_upsampling() {
+        // 600k mono frames (~2.4 MB) upsampled 256x (3kHz -> 768kHz) => ~153M
+        // output samples, above the 512 MiB / 4 = 134M-sample budget.
+        let input_frames = 600_000usize;
+        let audio = DecodedAudio {
+            samples: vec![0.0f32; input_frames],
+            sample_rate: 3_000,
+            channels: 1,
+        };
+        assert!(
+            resample_if_needed(audio, 768_000).is_err(),
+            "over-budget upsample must be rejected"
+        );
+    }
 }

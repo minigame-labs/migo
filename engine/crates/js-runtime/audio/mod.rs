@@ -101,7 +101,7 @@ use crate::audio::ops::{
 mod ops;
 
 extension!(host_v8_audio,
-    deps = [host_v8_base],
+    deps = [host_v8_base, host_v8_lifecycle],
     ops = [
         // WebAudio ops
         op_audio_create_context,

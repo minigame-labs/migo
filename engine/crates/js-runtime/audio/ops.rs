@@ -1409,8 +1409,17 @@ fn resolve_local_src(
                     ))
                 });
         }
+
+        // A VFS is active. Relative paths and the virtual roots (/code, /user,
+        // /cache, /tmp) were handled above; anything remaining is an absolute
+        // path outside the sandbox — reject it instead of reading a raw location.
+        return Err(audio_err(format!(
+            "audio path '{}' is outside the sandbox",
+            src
+        )));
     }
 
+    // No VFS (headless / tooling): fall back to code_dir-relative resolution.
     Ok(resolve_path(code_dir, &normalized))
 }
 
@@ -1649,6 +1658,32 @@ mod tests {
             resolve_local_src(code.to_str(), Some(&vfs), "/user/gamecaches/audio/bgm.mp3").unwrap();
 
         assert_eq!(PathBuf::from(resolved), target);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn resolve_local_src_rejects_absolute_path_outside_sandbox() {
+        let base = make_temp_dir("migo_audio_escape");
+        let code = base.join("code");
+        let user = base.join("user");
+        let cache = base.join("cache");
+        let tmp = base.join("tmp");
+
+        fs::create_dir_all(&code).unwrap();
+        fs::create_dir_all(&user).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&tmp).unwrap();
+
+        let vfs = VirtualFS::new(code.clone(), user, cache, tmp);
+        // An absolute path outside every virtual root (/code, /user, /cache, /tmp)
+        // must NOT resolve to a real filesystem path — that would escape the sandbox.
+        let result = resolve_local_src(code.to_str(), Some(&vfs), "/etc/passwd");
+        assert!(
+            result.is_err(),
+            "absolute non-virtual path must be rejected under VFS, got {:?}",
+            result
+        );
 
         let _ = fs::remove_dir_all(base);
     }

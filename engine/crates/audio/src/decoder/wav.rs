@@ -18,6 +18,19 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
     let sample_rate = spec.sample_rate;
     let channels = spec.channels as u32;
 
+    // Reject decode bombs up front: the header declares the total sample count,
+    // so we can bail before allocating gigabytes of PCM.
+    let declared_samples = reader.len() as usize;
+    if !crate::limits::pcm_samples_within_budget(declared_samples) {
+        return Err(EngineError::from_detail(
+            ErrorCode::InvalidArgument,
+            format!(
+                "WAV declares {} samples, exceeding the PCM budget",
+                declared_samples
+            ),
+        ));
+    }
+
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => {
             let bits = spec.bits_per_sample;

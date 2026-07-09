@@ -32,7 +32,13 @@ class AudioBuffer {
     if (channelData) {
       this.#channelData = channelData;
     } else {
-      // createBuffer: allocate zero-filled Float32Arrays
+      // createBuffer path: allocate zero-filled Float32Arrays. createBuffer()
+      // already validates, but guard the raw allocation too (defense in depth):
+      // mirror of audio::limits::MAX_AUDIO_PCM_BYTES (512 MiB).
+      const bytes = this.#length * this.#numberOfChannels * 4;
+      if (!Number.isFinite(bytes) || bytes < 0 || bytes > 512 * 1024 * 1024) {
+        throw new Error(`AudioBuffer: PCM size ${bytes} bytes out of range`);
+      }
       this.#channelData = [];
       for (let i = 0; i < this.#numberOfChannels; i++) {
         this.#channelData.push(new Float32Array(this.#length));

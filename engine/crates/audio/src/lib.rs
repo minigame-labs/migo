@@ -79,6 +79,7 @@ pub mod cache;
 mod context;
 mod decoder;
 mod inner_audio;
+mod limits;
 mod nodes;
 mod output;
 pub mod param;

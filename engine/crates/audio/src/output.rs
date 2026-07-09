@@ -16,6 +16,12 @@ const RING_BUFFER_FRAMES: usize = 8192;
 /// 2048 frames at 48kHz = ~42ms
 const LOW_WATERMARK_FRAMES: usize = 2048;
 
+/// High watermark - the refill *target*. A refill pass fills only up to here,
+/// not to the top of the ring, so a freshly triggered sound isn't queued behind
+/// ~150ms of already-buffered audio. 4096 frames at 48kHz = ~85ms, which still
+/// leaves 2x the low-watermark margin against underruns.
+const HIGH_WATERMARK_FRAMES: usize = 4096;
+
 /// Lightweight signaling for callback-driven audio.
 /// Uses atomic flag instead of Condvar for lower overhead.
 ///
@@ -51,6 +57,9 @@ pub struct AudioSync {
     /// Current buffer fill level (in samples).
     /// Ordering: Relaxed -- advisory hint only, not used for synchronization.
     buffer_level: Arc<AtomicUsize>,
+    /// Largest hardware callback request seen so far (in samples).
+    /// Ordering: Relaxed -- advisory; lets the refill target cover a full callback.
+    max_callback: Arc<AtomicUsize>,
 }
 
 impl AudioSync {
@@ -58,6 +67,7 @@ impl AudioSync {
         Self {
             needs_data: Arc::new(AtomicBool::new(false)),
             buffer_level: Arc::new(AtomicUsize::new(0)),
+            max_callback: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -83,6 +93,18 @@ impl AudioSync {
     pub fn buffer_level(&self) -> usize {
         self.buffer_level.load(Ordering::Relaxed)
     }
+
+    /// Record the sample count of a hardware callback request (running max).
+    #[inline]
+    fn observe_callback(&self, len: usize) {
+        self.max_callback.fetch_max(len, Ordering::Relaxed);
+    }
+
+    /// Largest hardware callback request seen so far (samples); 0 until the first callback.
+    #[inline]
+    pub fn max_callback(&self) -> usize {
+        self.max_callback.load(Ordering::Relaxed)
+    }
 }
 
 /// Audio output handle
@@ -93,6 +115,7 @@ pub struct AudioOutput {
     channels: u32,
     sync: AudioSync,
     low_watermark_samples: usize,
+    high_watermark_samples: usize,
     stream_error: Arc<AtomicBool>,
 }
 
@@ -130,6 +153,7 @@ impl AudioOutput {
 
         let sync = AudioSync::new();
         let low_watermark_samples = LOW_WATERMARK_FRAMES * channels as usize;
+        let high_watermark_samples = HIGH_WATERMARK_FRAMES * channels as usize;
         let stream_error = Arc::new(AtomicBool::new(false));
 
         let stream = match config.sample_format() {
@@ -179,6 +203,7 @@ impl AudioOutput {
             channels,
             sync,
             low_watermark_samples,
+            high_watermark_samples,
             stream_error,
         })
     }
@@ -206,6 +231,26 @@ impl AudioOutput {
     #[inline]
     pub fn available(&self) -> usize {
         self.producer.vacant_len()
+    }
+
+    /// Currently buffered sample count, read from the producer side so it is
+    /// always fresh — unlike the callback-updated `buffer_level` hint behind
+    /// [`needs_data`](Self::needs_data). Use this to decide how much to refill.
+    #[inline]
+    pub fn buffered(&self) -> usize {
+        self.producer.occupied_len()
+    }
+
+    /// Refill target depth in samples: fill up to here, not the whole ring.
+    ///
+    /// Never below twice the largest observed device callback, so a device that
+    /// requests large blocks can always hold a full callback (otherwise every
+    /// callback would partially underrun). The fill loop's `available() >=
+    /// buffer_size` check still bounds this to the ring capacity.
+    #[inline]
+    pub fn high_watermark(&self) -> usize {
+        self.high_watermark_samples
+            .max(self.sync.max_callback().saturating_mul(2))
     }
 
     /// Check if buffer needs more data
@@ -257,6 +302,7 @@ fn build_stream_f32(
         .build_output_stream(
             config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                sync.observe_callback(data.len());
                 // Direct read into output buffer - no allocation!
                 let read = consumer.pop_slice(data);
 
@@ -305,6 +351,7 @@ fn build_stream_i16(
         .build_output_stream(
             config,
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                sync.observe_callback(data.len());
                 // Resize temp buffer if needed (should be rare after warmup)
                 if temp_buffer.len() < data.len() {
                     temp_buffer.resize(data.len(), 0.0);
@@ -360,6 +407,7 @@ fn build_stream_u16(
         .build_output_stream(
             config,
             move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                sync.observe_callback(data.len());
                 if temp_buffer.len() < data.len() {
                     temp_buffer.resize(data.len(), 0.0);
                 }

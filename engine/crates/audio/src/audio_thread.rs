@@ -720,17 +720,26 @@ fn run_audio_thread(
                     when,
                     resp,
                 } => {
-                    // Use index for O(1) context lookup
-                    let found = node_index
+                    // Stop the node, then check whether it finished immediately
+                    // (stop(when<=0)). Only then unregister now; a future-dated
+                    // stop stays reachable and is swept by context.process() when
+                    // it actually finishes.
+                    let (found, finished) = match node_index
                         .get_context(node_id)
                         .and_then(|ctx_id| contexts.get_mut(&ctx_id))
-                        .map(|ctx| ctx.stop_source(node_id, when))
-                        .unwrap_or(false);
+                    {
+                        Some(ctx) => {
+                            let found = ctx.stop_source(node_id, when);
+                            let finished = found && ctx.is_node_finished(node_id);
+                            (found, finished)
+                        }
+                        None => (false, false),
+                    };
 
                     if found {
-                        // BufferSourceNodes are one-shot per Web Audio spec;
-                        // unregister from the index to prevent unbounded growth.
-                        node_index.unregister(node_id);
+                        if finished {
+                            node_index.unregister(node_id);
+                        }
                         let _ = resp.send(Ok(()));
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(
@@ -846,8 +855,8 @@ fn run_audio_thread(
                             });
                         }
                     }
-                    // OscillatorNodes are one-shot; unregister to prevent unbounded growth.
-                    node_index.unregister(node_id);
+                    // Unregistered by the finished-node sweep in context.process()
+                    // once the scheduled stop time is actually reached.
                 }
 
                 AudioCmd::CreateDelay {
@@ -1084,8 +1093,8 @@ fn run_audio_thread(
                             });
                         }
                     }
-                    // ConstantSourceNodes are one-shot; unregister to prevent unbounded growth.
-                    node_index.unregister(node_id);
+                    // Unregistered by the finished-node sweep in context.process()
+                    // once the scheduled stop time is actually reached.
                 }
 
                 AudioCmd::CreateIIRFilter {
@@ -1321,14 +1330,20 @@ fn run_audio_thread(
                     resp,
                 } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {
-                        let id = ctx.create_empty_buffer(channels, length, buf_rate);
-                        let _ = resp.send(Ok(AudioBufferInfo {
-                            id,
-                            duration: length as f64 / buf_rate as f64,
-                            sample_rate: buf_rate,
-                            channels,
-                            length,
-                        }));
+                        match ctx.create_empty_buffer(channels, length, buf_rate) {
+                            Ok(id) => {
+                                let _ = resp.send(Ok(AudioBufferInfo {
+                                    id,
+                                    duration: length as f64 / buf_rate as f64,
+                                    sample_rate: buf_rate,
+                                    channels,
+                                    length,
+                                }));
+                            }
+                            Err(e) => {
+                                let _ = resp.send(Err(e));
+                            }
+                        }
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(
                             ErrorCode::NotFound,
@@ -1801,14 +1816,24 @@ fn run_audio_thread(
         if has_running_context || has_active_inner {
             // Check if callback signaled need for data (lightweight atomic check)
             if sync.check_and_clear() || output.needs_data() {
-                // Fill buffer until it's above low watermark
-                while output.needs_data() && output.available() >= buffer_size {
+                // Refill only up to the high watermark, measured from the *current*
+                // buffer depth (output.buffered()) rather than the stale callback
+                // hint behind needs_data() — otherwise the loop would keep filling
+                // until the ring is nearly full, adding ~130ms of latency before a
+                // freshly triggered sound is heard.
+                while output.buffered() < output.high_watermark()
+                    && output.available() >= buffer_size
+                {
                     process_buffer.fill(0.0);
 
-                    // Process WebAudio contexts
+                    // Process WebAudio contexts, unregistering from the
+                    // node→context index any source that finished this block
+                    // (context.process() has already dropped it internally).
                     for ctx in contexts.values_mut() {
                         if ctx.state() == AudioContextState::Running {
-                            ctx.process(&mut process_buffer);
+                            for finished_id in ctx.process(&mut process_buffer) {
+                                node_index.unregister(finished_id);
+                            }
                         }
                     }
 
