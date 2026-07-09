@@ -721,16 +721,17 @@ fn run_audio_thread(
                     resp,
                 } => {
                     // Stop the node, then check whether it finished immediately
-                    // (stop(when<=0)). Only then unregister now; a future-dated
-                    // stop stays reachable and is swept by context.process() when
-                    // it actually finishes.
+                    // (stop(when<=0)). If so, fully remove it now (index + context
+                    // maps) so a stop on a *suspended* context doesn't linger until
+                    // resume/close. A future-dated stop stays reachable and is swept
+                    // by context.process() when it actually finishes.
                     let (found, finished) = match node_index
                         .get_context(node_id)
                         .and_then(|ctx_id| contexts.get_mut(&ctx_id))
                     {
                         Some(ctx) => {
                             let found = ctx.stop_source(node_id, when);
-                            let finished = found && ctx.is_node_finished(node_id);
+                            let finished = found && ctx.remove_finished_node(node_id);
                             (found, finished)
                         }
                         None => (false, false),

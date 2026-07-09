@@ -17,10 +17,14 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
     let sample_rate = reader.ident_hdr.audio_sample_rate;
     let channels = reader.ident_hdr.audio_channels as u32;
 
-    // Estimate capacity from file size to reduce reallocations.
-    // OGG Vorbis typical compression ratio is ~10:1 for stereo 44.1kHz,
-    // so decoded f32 samples ~ data.len() * 10 / 4 (bytes → f32).
-    let estimated_samples = data.len() * 2; // conservative: ~8:1 ratio
+    // Estimate capacity from file size to reduce reallocations, but never
+    // pre-allocate beyond the PCM budget: `data.len()*2` scales with the
+    // *compressed* size, so a large input would otherwise reserve gigabytes
+    // before the per-packet budget check runs.
+    let estimated_samples = data
+        .len()
+        .saturating_mul(2)
+        .min(crate::limits::MAX_AUDIO_PCM_SAMPLES as usize);
     let mut samples: Vec<f32> = Vec::with_capacity(estimated_samples);
 
     while let Some(packet) = reader
@@ -40,7 +44,9 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
 
         let frame_count = packet[0].len();
         // Reject a decode bomb before reserving/growing the buffer.
-        if !crate::limits::pcm_samples_within_budget(samples.len() + frame_count * packet.len()) {
+        if !crate::limits::pcm_samples_within_budget(
+            samples.len().saturating_add(frame_count.saturating_mul(packet.len())),
+        ) {
             return Err(EngineError::from_detail(
                 ErrorCode::InvalidArgument,
                 "OGG decode exceeds the PCM budget",

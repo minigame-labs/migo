@@ -350,14 +350,28 @@ impl AudioContext {
         false
     }
 
-    /// Whether a node exists and has already finished (e.g. `stop(when <= 0)`
-    /// finishes a buffer source immediately). Lets the caller unregister it now
-    /// rather than waiting for the next `process()` sweep.
-    pub fn is_node_finished(&self, node_id: AudioNodeId) -> bool {
-        self.nodes
+    /// If the node exists and has already finished (e.g. `stop(when <= 0)`
+    /// finishes a buffer source immediately), remove it from every per-node
+    /// structure (node map, output buffer, connections) and return `true`.
+    ///
+    /// Lets the audio thread fully clean up an immediately-finished node now,
+    /// rather than waiting for the next `process()` sweep — which never runs
+    /// while the context is suspended.
+    pub fn remove_finished_node(&mut self, node_id: AudioNodeId) -> bool {
+        let finished = self
+            .nodes
             .get(&node_id)
             .map(|n| n.is_finished())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !finished {
+            return false;
+        }
+        self.nodes.remove(&node_id);
+        self.node_buffers.remove(&node_id);
+        self.connections
+            .retain(|c| c.src != node_id && c.dst != node_id);
+        self.graph_dirty = true;
+        true
     }
 
     pub fn set_loop(&mut self, node_id: AudioNodeId, enabled: bool, start: f64, end: f64) -> bool {
@@ -756,5 +770,29 @@ mod tests {
             !ctx.connections.iter().any(|c| c.src == 10 || c.dst == 10),
             "graph connections referencing the finished node must be dropped"
         );
+    }
+
+    #[test]
+    fn remove_finished_node_purges_immediate_stop_only() {
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+
+        // stop(when <= 0) finishes a buffer source immediately -> fully removed.
+        ctx.create_buffer_source(20);
+        ctx.connect(20, DESTINATION_NODE_ID);
+        assert!(ctx.stop_source(20, 0.0));
+        assert!(ctx.remove_finished_node(20), "immediate-finished node removed");
+        assert!(!ctx.nodes.contains_key(&20));
+        assert!(!ctx.node_buffers.contains_key(&20));
+        assert!(!ctx.connections.iter().any(|c| c.src == 20 || c.dst == 20));
+
+        // A future-dated stop has NOT finished yet -> must stay reachable.
+        ctx.create_buffer_source(21);
+        ctx.connect(21, DESTINATION_NODE_ID);
+        assert!(ctx.stop_source(21, 1000.0));
+        assert!(
+            !ctx.remove_finished_node(21),
+            "future-dated stop must remain until it actually finishes"
+        );
+        assert!(ctx.nodes.contains_key(&21));
     }
 }

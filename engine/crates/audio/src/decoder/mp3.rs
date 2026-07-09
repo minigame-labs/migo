@@ -24,7 +24,9 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
                 }
 
                 // Reject a decode bomb before growing the buffer.
-                if !crate::limits::pcm_samples_within_budget(samples.len() + frame_data.len()) {
+                if !crate::limits::pcm_samples_within_budget(
+                    samples.len().saturating_add(frame_data.len()),
+                ) {
                     return Err(EngineError::from_detail(
                         ErrorCode::InvalidArgument,
                         "MP3 decode exceeds the PCM budget",

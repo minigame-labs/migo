@@ -162,6 +162,10 @@ class InnerAudioContext {
         this.#fireListeners("waiting");
         break;
       case "error":
+        // A playback error stops playback (e.g. native aborted an over-budget
+        // stream). Reflect that in JS state so `paused` isn't left false after
+        // an earlier canplay/play already flipped it.
+        this.#paused = true;
         this.#fireListeners("error", { errCode: 10001, errMsg: "Playback error" });
         break;
     }

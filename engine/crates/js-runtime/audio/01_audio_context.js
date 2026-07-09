@@ -69,6 +69,13 @@ const MAX_SAMPLE_RATE = 768000;
 // resume it on foreground, so scheduled start(when)/stop(when) stay aligned
 // with the native timeline across a background/foreground cycle. The
 // module-level flag also lets contexts CREATED while backgrounded start frozen.
+//
+// KNOWN LIMITATION: onHide/onShow are delivered only to the main JS runtime.
+// A Worker's AudioContext (non-standard - browsers keep WebAudio on the main
+// thread) therefore won't freeze on background, so its currentTime can drift
+// from the globally-paused native clock. Accepted as low-impact given how rare
+// worker WebAudio is; revisit with host->worker lifecycle forwarding or a
+// native-authoritative clock if it becomes a real use case.
 let _appBackgrounded = false;
 onHide(() => {
   _appBackgrounded = true;
