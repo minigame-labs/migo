@@ -16,7 +16,7 @@ use shared::{
     config::InitOptions,
     error::EngineResult,
     js_escape::{HOST_BRIDGE_EXPR, escape_for_js_string},
-    op_state::{ContextLostState, HostOpState, RafRx},
+    op_state::{ContextLostState, HostOpState, HostTx, RafRx},
     protocol::host_cmd::HostCommand,
     protocol::render_cmd::{CanvasCmd, RenderCommand},
     render_event::{RenderEvent, RenderEventReceiver},
@@ -93,7 +93,7 @@ pub(crate) struct Host {
     raf_rx: RafRx,
 
     /// Sender back to the host event loop (for JS-initiated restart/exit).
-    host_tx: tokio::sync::mpsc::Sender<HostCommand>,
+    host_tx: HostTx,
 
     platform: Arc<dyn PlatformServices>,
     init_options: InitOptions,
@@ -180,7 +180,7 @@ impl Drop for Host {
 impl Host {
     pub(crate) fn new(
         id: HostId,
-        host_tx: tokio::sync::mpsc::Sender<HostCommand>,
+        host_tx: HostTx,
         surface: SurfaceRef,
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,
@@ -1005,8 +1005,8 @@ impl Host {
                 // serde_json::Value is *mostly* JS-safe, but U+2028/U+2029 are
                 // valid JSON yet act as line terminators in JS source, so
                 // JSON.parse(escaped_string) is universally safe.
-                let json_str = deno_core::serde_json::to_string(&value)
-                    .unwrap_or_else(|_| "{}".to_string());
+                let json_str =
+                    deno_core::serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
                 let escaped = escape_for_js_string(&json_str);
                 format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow(JSON.parse('{escaped}'))")
             }

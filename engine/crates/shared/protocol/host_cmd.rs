@@ -237,7 +237,8 @@ pub enum HostCommand {
     /// Dispatch touch input events to the game.
     ///
     /// Boxed to keep the `HostCommand` enum small (~56-64 bytes instead of ~216).
-    /// Every `try_send()` on the 512-slot channel copies the full enum size.
+    /// Up to 512 normal commands can be pending, so enum size directly affects
+    /// bounded queue memory.
     OnTouch(Box<TouchData>),
 
     // ---- Sensor Events ----

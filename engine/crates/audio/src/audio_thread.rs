@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use shared::channel::ThreadWakeup;
 use shared::error::{EngineError, EngineResult, ErrorCode};
+use shared::op_state::HostTx;
 use shared::protocol::audio_cmd::{
     AudioBufferInfo, AudioCmd, AudioContextId, AudioContextState, AudioNodeId, AudioResp,
     InnerAudioId, InnerAudioInfo, InnerAudioState,
@@ -323,7 +324,7 @@ pub struct AudioThread {
 }
 
 impl AudioThread {
-    pub fn spawn(host_tx: tokio::sync::mpsc::Sender<HostCommand>) -> EngineResult<Self> {
+    pub fn spawn(host_tx: HostTx) -> EngineResult<Self> {
         let (tx, rx) = unbounded_channel::<AudioCmd>();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<InitResult>(1);
 
@@ -421,7 +422,7 @@ impl AudioThread {
         tx: UnboundedSender<AudioCmd>,
         rx: UnboundedReceiver<AudioCmd>,
         wakeup: ThreadWakeup,
-        host_tx: tokio::sync::mpsc::Sender<HostCommand>,
+        host_tx: HostTx,
     ) -> EngineResult<Self> {
         let wakeup_for_thread = wakeup.clone();
 
@@ -543,7 +544,7 @@ fn wait_for_audio_work(wakeup: &ThreadWakeup, mode: AudioWaitMode) {
 fn run_audio_thread(
     mut rx: UnboundedReceiver<AudioCmd>,
     mut output: AudioOutput,
-    host_tx: tokio::sync::mpsc::Sender<HostCommand>,
+    host_tx: HostTx,
     wakeup: ThreadWakeup,
 ) {
     let sample_rate = output.sample_rate();

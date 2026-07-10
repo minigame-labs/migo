@@ -7,19 +7,21 @@ use std::{
 };
 
 use parking_lot::RwLock;
-use tokio::sync::mpsc::{Sender, error::TrySendError};
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, warn};
 
-use shared::protocol::host_cmd::HostCommand;
+use shared::{
+    host_channel::CriticalHostCommandSender, op_state::HostTx, protocol::host_cmd::HostCommand,
+};
 
 use crate::runtime::HostId;
 
 static NEXT_HOST_ID: AtomicI32 = AtomicI32::new(1);
 
-/// Per-host control handle: the bounded command sender plus a shutdown flag.
+/// Per-host control handle: the ordered command sender plus a shutdown flag.
 /// The flag is the authoritative, queue-independent shutdown signal so a full
-/// command queue can never swallow a shutdown request.
-type HostHandle = (Sender<HostCommand>, Arc<AtomicBool>);
+/// normal-command budget can never swallow a shutdown request.
+type HostHandle = (HostTx, CriticalHostCommandSender, Arc<AtomicBool>);
 
 static HOST_SENDERS: OnceLock<RwLock<HashMap<HostId, HostHandle>>> = OnceLock::new();
 
@@ -85,11 +87,12 @@ pub(crate) fn alloc_host_id() -> HostId {
 /// Returns the previous sender if existed (should normally be None).
 pub(crate) fn register_sender(
     id: HostId,
-    tx: Sender<HostCommand>,
+    tx: HostTx,
+    critical_tx: CriticalHostCommandSender,
     shutdown: Arc<AtomicBool>,
 ) -> Option<HostHandle> {
     let mut map = host_senders().write();
-    map.insert(id, (tx, shutdown))
+    map.insert(id, (tx, critical_tx, shutdown))
 }
 
 /// Unregister sender for a host.
@@ -103,7 +106,7 @@ pub fn send_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), Str
     // Clone sender and drop lock before sending (lower contention / avoids lock hazards).
     let sender = {
         let map = host_senders().read();
-        map.get(&host_id).map(|(tx, _)| tx.clone())
+        map.get(&host_id).map(|(tx, _, _)| tx.clone())
     }
     .ok_or_else(|| {
         // Use debug level: this commonly happens during shutdown when JNI callbacks
@@ -140,63 +143,45 @@ pub fn send_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), Str
 /// That is fine for high-frequency, coalescible commands (touch, vsync) but not
 /// for surface/lifecycle transitions (UpdateSurface, SurfaceDestroyed, OnShow,
 /// OnHide): dropping one permanently desyncs Java's lifecycle state from the
-/// host/render/JS state. This variant briefly retries on a full queue so a
-/// transient backlog drains first. It is bounded (never blocks the calling UI
-/// thread long enough to risk an ANR); a still-full queue after the budget means
-/// the host is genuinely stalled (a separate condition the ANR watchdog covers).
-pub fn send_critical_command_to_host(host_id: HostId, mut cmd: HostCommand) -> Result<(), String> {
-    // ~100ms worst case (20 * 5ms), well under Android's 5s ANR threshold.
-    const MAX_ATTEMPTS: u32 = 20;
-    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
-
+/// host/render/JS state. Critical commands share the ordered host channel but
+/// bypass its normal-command quota, so enqueue never waits for normal backlog
+/// capacity.
+pub fn send_critical_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), String> {
     let sender = {
         let map = host_senders().read();
-        map.get(&host_id).map(|(tx, _)| tx.clone())
+        map.get(&host_id)
+            .map(|(_, critical_tx, _)| critical_tx.clone())
     }
     .ok_or_else(|| {
-        debug!("send_critical_command_to_host: host_id={host_id} not found (likely already shut down)");
+        debug!(
+            "send_critical_command_to_host: host_id={host_id} not found (likely already shut down)"
+        );
         format!("Cannot find host_id={host_id} sender")
     })?;
 
-    for attempt in 0..MAX_ATTEMPTS {
-        match sender.try_send(cmd) {
-            Ok(()) => return Ok(()),
-            Err(TrySendError::Full(returned)) => {
-                cmd = returned;
-                if attempt + 1 < MAX_ATTEMPTS {
-                    std::thread::sleep(BACKOFF);
-                }
-            }
-            Err(TrySendError::Closed(_cmd)) => {
-                let _ = unregister_sender(host_id);
-                return Err(format!(
-                    "Failed to send critical command to host {host_id}: channel is closed"
-                ));
-            }
+    match sender.send(cmd) {
+        Ok(()) => Ok(()),
+        Err(_error) => {
+            let _ = unregister_sender(host_id);
+            Err(format!(
+                "Failed to send critical command to host {host_id}: channel is closed"
+            ))
         }
     }
-
-    if let Some(stats) = shared::stats::get_stats(host_id) {
-        stats.command_drops.fetch_add(1, Ordering::Relaxed);
-    }
-    warn!("Host {host_id} command queue full after retries; dropping critical command");
-    Err(format!(
-        "Failed to send critical command to host {host_id}: queue full after retries"
-    ))
 }
 
 pub fn shutdown_host(id: HostId) -> Result<(), String> {
     // Set the shutdown flag first: the host loop checks it every iteration, which
     // decouples shutdown from the command queue -- a full queue can no longer
     // swallow the request (the bug this fixes: HostCommand::Shutdown dropped by
-    // try_send when the 512-slot queue is full, leaking the host thread). The flag
-    // takes effect the next time the loop returns to the top of its iteration; it
+    // try_send when the 512-slot normal budget is full, leaking the host thread).
+    // The flag takes effect the next time the loop returns to the top of its iteration; it
     // does not preempt a runaway synchronous JS section that never yields (an
     // inherent bound of the cooperative loop; the v8-limits ANR watchdog covers
     // that case), so this is not an instantaneous hard kill.
     let sender = {
         let map = host_senders().read();
-        let Some((tx, shutdown)) = map.get(&id) else {
+        let Some((tx, _, shutdown)) = map.get(&id) else {
             // Already unregistered => the host is gone => shutdown goal achieved.
             debug!("shutdown_host: host_id={id} not found (already shut down)");
             return Ok(());
@@ -205,8 +190,41 @@ pub fn shutdown_host(id: HostId) -> Result<(), String> {
         tx.clone()
     };
     // Best-effort nudge so a host parked on `recv()` reacts immediately; if the
-    // queue is full this send is dropped, but the flag above still stops the loop
-    // when it next iterates.
+    // normal budget is full this send is dropped, but the flag above still stops
+    // the loop when it next iterates.
     let _ = sender.try_send(HostCommand::Shutdown);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RegisteredHost(HostId);
+
+    impl Drop for RegisteredHost {
+        fn drop(&mut self) {
+            unregister_sender(self.0);
+        }
+    }
+
+    #[test]
+    fn critical_commands_bypass_saturated_normal_budget_in_fifo_order() {
+        let id = alloc_host_id();
+        let (tx, critical_tx, mut rx) = shared::host_channel::channel(1);
+        assert!(register_sender(id, tx, critical_tx, Arc::new(AtomicBool::new(false))).is_none());
+        let _registration = RegisteredHost(id);
+
+        send_command_to_host(id, HostCommand::Restart).unwrap();
+        assert!(send_command_to_host(id, HostCommand::Shutdown).is_err());
+        send_critical_command_to_host(id, HostCommand::OnHide).unwrap();
+        send_critical_command_to_host(id, HostCommand::OnShow { options_json: None }).unwrap();
+
+        assert!(matches!(rx.try_recv(), Ok(HostCommand::Restart)));
+        assert!(matches!(rx.try_recv(), Ok(HostCommand::OnHide)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostCommand::OnShow { options_json: None })
+        ));
+    }
 }

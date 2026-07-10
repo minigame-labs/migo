@@ -2,9 +2,8 @@ use audio::AudioThread;
 
 use shared::channel::ThreadWakeup;
 use shared::error::EngineResult;
-use shared::op_state::AudioSender;
+use shared::op_state::{AudioSender, HostTx};
 use shared::protocol::audio_cmd::AudioCmd;
-use shared::protocol::host_cmd::HostCommand;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::info;
 
@@ -41,7 +40,7 @@ pub(crate) struct AudioService {
     /// Handle to the spawned `AudioThread` (Some once started).
     thread: Option<AudioThread>,
     /// Host command sender — needed to construct `AudioThread`.
-    host_tx: tokio::sync::mpsc::Sender<HostCommand>,
+    host_tx: HostTx,
     /// Tracks whether the app is currently paused (OnHide received).
     /// If the thread is lazily started while paused, we immediately
     /// send `PauseAll` to avoid audio playing in the background.
@@ -50,7 +49,7 @@ pub(crate) struct AudioService {
 
 impl AudioService {
     /// Create a lazy audio service.  **No thread is spawned.**
-    pub(crate) fn new(host_tx: tokio::sync::mpsc::Sender<HostCommand>) -> Self {
+    pub(crate) fn new(host_tx: HostTx) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let wakeup = ThreadWakeup::new();
         Self {

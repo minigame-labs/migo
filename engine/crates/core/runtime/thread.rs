@@ -30,17 +30,19 @@ pub fn spawn_host_thread(
 ) -> EngineResult<HostId> {
     let id = registry::alloc_host_id();
 
-    // 512: sized to accommodate burst touch/vsync events at 120Hz without
-    // dropping, while bounding memory. `send_command_to_host` uses `try_send`
-    // and drops commands when full.
-    let (host_tx, mut host_rx) = tokio::sync::mpsc::channel::<HostCommand>(512);
+    // Bound all normal/game-controlled traffic while allowing the four trusted
+    // lifecycle/surface callbacks to share the same FIFO without consuming
+    // that quota. This preserves the old 512 pending-normal-command limit.
+    const HOST_NORMAL_COMMAND_CAPACITY: usize = 512;
+    let (host_tx, critical_host_tx, mut host_rx) =
+        shared::host_channel::channel(HOST_NORMAL_COMMAND_CAPACITY);
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
 
-    // Authoritative shutdown signal, independent of the bounded command queue:
-    // `shutdown_host` sets this even when the queue is full (where a Shutdown
-    // command would be dropped) and the host loop polls it every iteration.
+    // Authoritative shutdown signal, independent of the normal-command budget:
+    // `shutdown_host` sets this even when the budget is full (where its normal
+    // Shutdown nudge is dropped) and the host loop polls it every iteration.
     let shutdown = Arc::new(AtomicBool::new(false));
-    registry::register_sender(id, host_tx.clone(), shutdown.clone());
+    registry::register_sender(id, host_tx.clone(), critical_host_tx, shutdown.clone());
 
     // Clone the platform Arc so we can use it in the catch_unwind path
     // to notify Java about errors from any context (host loop, panic, etc.).

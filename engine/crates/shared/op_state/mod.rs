@@ -6,14 +6,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::channel::ThreadWakeup;
-use crate::protocol::{audio_cmd::AudioCmd, host_cmd::HostCommand};
+use crate::protocol::audio_cmd::AudioCmd;
 use crate::services::DeviceServices;
 use crate::vfs::{GamePaths, MountTable, VirtualFS};
 
 /// Host-side operational state shared across runtime layers.
 pub type RenderTx = crate::render_command_sender::CommandSender;
 pub type AudioTx = AudioSender;
-pub type HostTx = tokio::sync::mpsc::Sender<HostCommand>;
+pub type HostTx = crate::host_channel::HostCommandSender;
 
 /// Receiver for RAF (requestAnimationFrame) frame signals from the render thread.
 ///
@@ -182,8 +182,7 @@ impl ContextLostState {
             return false; // already lost — no edge
         }
         let epoch = cur >> 1;
-        self.packed
-            .store(((epoch + 1) << 1) | 1, Ordering::Release);
+        self.packed.store(((epoch + 1) << 1) | 1, Ordering::Release);
         true
     }
 

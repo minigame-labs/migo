@@ -82,7 +82,7 @@ mod tests {
     fn new_test_host_state() -> (HostOpState, crossbeam_channel::Receiver<RenderCommand>) {
         let (render_tx, render_rx) = CommandSender::new();
         let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
-        let (host_tx, _host_rx) = mpsc::channel(1);
+        let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
 
         (
             HostOpState {
