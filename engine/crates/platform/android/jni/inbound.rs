@@ -121,7 +121,10 @@ use jni::{JNIEnv, JavaVM};
 
 use tracing::{error, info};
 
-use core::{send_command_to_host, shutdown_host, spawn_host_thread};
+use core::{
+    send_command_to_host, send_critical_command_to_host, set_surface_present, shutdown_host,
+    spawn_host_thread,
+};
 use shared::protocol::host_cmd::{
     BleCharacteristicData, HostCommand, TouchData, TouchPoint, TouchType,
 };
@@ -135,7 +138,7 @@ use crate::android::logging;
 use crate::android::platform::AndroidPlatform;
 use crate::android::surface::{
     ANativeWindow_fromSurface, ANativeWindow_getHeight, ANativeWindow_getWidth,
-    ANativeWindow_setBuffersGeometry, AndroidSurfaceWrapper,
+    ANativeWindow_release, ANativeWindow_setBuffersGeometry, AndroidSurfaceWrapper,
 };
 
 #[unsafe(no_mangle)]
@@ -258,13 +261,29 @@ pub(crate) extern "system" fn init(
                 "init failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}",
                 raw_w, raw_h
             );
+            unsafe { ANativeWindow_release(window) };
             return -1;
         }
         let (w, h) = (raw_w as u32, raw_h as u32);
 
+        // Take ownership of the ANativeWindow ref (acquired by
+        // ANativeWindow_fromSurface) via RAII now, so every early return below
+        // releases it. Previously each error path between here and host spawn
+        // leaked the ref.
+        let android_surface = match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) }
+        {
+            Ok(s) => s,
+            Err(e) => {
+                error!("init failed: create AndroidSurfaceWrapper error: {}", e);
+                unsafe { ANativeWindow_release(window) };
+                return -1;
+            }
+        };
+
         // Normalize native window buffer geometry to the observed dimensions.
         // This helps avoid stale rotated geometry during startup transitions.
-        let set_geo_rc = unsafe { ANativeWindow_setBuffersGeometry(window, raw_w, raw_h, 0) };
+        let set_geo_rc =
+            unsafe { ANativeWindow_setBuffersGeometry(android_surface.native_handle(), raw_w, raw_h, 0) };
         if set_geo_rc != 0 {
             tracing::warn!(
                 "init: ANativeWindow_setBuffersGeometry({}x{}) failed: {}",
@@ -374,16 +393,8 @@ pub(crate) extern "system" fn init(
 
         let platform = Arc::new(AndroidPlatform::new());
 
-        // ANativeWindow_fromSurface returns a new strong ref; wrap as owned (no acquire).
-        let android_surface =
-            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) } {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("init failed: create AndroidSurfaceWrapper error: {}", e);
-                    return -1;
-                }
-            };
-
+        // `android_surface` already owns the ANativeWindow ref (wrapped above so
+        // early returns release it); hand it to the host.
         let surface_ref: SurfaceRef = Arc::new(android_surface);
 
         let host_id = spawn_host_thread(surface_ref, platform, init_options);
@@ -426,6 +437,9 @@ pub(crate) extern "system" fn updateSurface<'local>(
                 "updateSurface failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}",
                 raw_w, raw_h
             );
+            // Release the strong ref acquired by ANativeWindow_fromSurface before
+            // bailing; only the success path transfers it to AndroidSurfaceWrapper.
+            unsafe { ANativeWindow_release(window) };
             return;
         }
 
@@ -471,7 +485,12 @@ pub(crate) extern "system" fn updateSurface<'local>(
 
         let surface_ref: SurfaceRef = Arc::new(android_surface);
 
-        if let Err(e) = send_command_to_host(
+        // NOTE: surface_present is set true ONLY by the render thread after it
+        // recreates the onscreen surface (see render_thread.rs), never here.
+        // Setting it true from JNI before the recreate ran would let the render
+        // thread read `true` against the stale/abandoned surface (destroy->create
+        // ABA on the boolean).
+        if let Err(e) = send_critical_command_to_host(
             host_id,
             HostCommand::UpdateSurface {
                 surface: surface_ref,
@@ -486,7 +505,12 @@ pub(crate) extern "system" fn updateSurface<'local>(
 
 pub(crate) extern "system" fn onSurfaceDestroyed(_env: JNIEnv, _class: JClass, host_id: jint) {
     jni_safe!("onSurfaceDestroyed", {
-        if let Err(e) = send_command_to_host(host_id, HostCommand::SurfaceDestroyed) {
+        // Stop the render thread from presenting to the surface BEFORE this
+        // callback returns (Android abandons the BufferQueue on return). This is
+        // synchronous and queue-independent, so it takes effect even before the
+        // async SurfaceDestroyed command below is dequeued.
+        set_surface_present(host_id, false);
+        if let Err(e) = send_critical_command_to_host(host_id, HostCommand::SurfaceDestroyed) {
             error!("Failed to send SurfaceDestroyed for host {host_id}: {e}");
         }
     });
@@ -711,7 +735,8 @@ pub(crate) extern "system" fn onShow<'local>(
             info!("Host {} onShow received (options_json=<none>)", host_id);
         }
 
-        if let Err(e) = send_command_to_host(host_id, HostCommand::OnShow { options_json }) {
+        if let Err(e) = send_critical_command_to_host(host_id, HostCommand::OnShow { options_json })
+        {
             error!("Failed to send OnShow for host {host_id}: {e}");
         }
     });
@@ -720,7 +745,7 @@ pub(crate) extern "system" fn onShow<'local>(
 pub(crate) extern "system" fn onHide(_env: JNIEnv, _class: JClass, host_id: jint) {
     jni_safe!("onHide", {
         info!("Host {} onHide received", host_id);
-        if let Err(e) = send_command_to_host(host_id, HostCommand::OnHide) {
+        if let Err(e) = send_critical_command_to_host(host_id, HostCommand::OnHide) {
             error!("Failed to send OnHide for host {host_id}: {e}");
         }
     });

@@ -409,9 +409,10 @@ impl AudioContext {
 
     /// Set an AudioParam value on a node by name
     pub fn set_node_param(&mut self, node_id: AudioNodeId, param_name: &str, value: f32) -> bool {
+        let now = self.current_time();
         if let Some(node) = self.nodes.get_mut(&node_id) {
             if let Some(param) = node.get_param_mut(param_name) {
-                param.set_value(value);
+                param.set_value_now(value, now);
                 return true;
             }
         }
@@ -426,9 +427,11 @@ impl AudioContext {
         value: f32,
         time: f64,
     ) -> bool {
+        let now = self.current_time();
         if let Some(node) = self.nodes.get_mut(&node_id) {
             if let Some(param) = node.get_param_mut(param_name) {
                 param.set_value_at_time(value, time);
+                param.gc_events(now);
                 return true;
             }
         }
@@ -442,9 +445,11 @@ impl AudioContext {
         value: f32,
         end_time: f64,
     ) -> bool {
+        let now = self.current_time();
         if let Some(node) = self.nodes.get_mut(&node_id) {
             if let Some(param) = node.get_param_mut(param_name) {
                 param.linear_ramp_to_value_at_time(value, end_time);
+                param.gc_events(now);
                 return true;
             }
         }
@@ -458,9 +463,11 @@ impl AudioContext {
         value: f32,
         end_time: f64,
     ) -> bool {
+        let now = self.current_time();
         if let Some(node) = self.nodes.get_mut(&node_id) {
             if let Some(param) = node.get_param_mut(param_name) {
                 param.exponential_ramp_to_value_at_time(value, end_time);
+                param.gc_events(now);
                 return true;
             }
         }
@@ -475,9 +482,11 @@ impl AudioContext {
         start_time: f64,
         time_constant: f64,
     ) -> bool {
+        let now = self.current_time();
         if let Some(node) = self.nodes.get_mut(&node_id) {
             if let Some(param) = node.get_param_mut(param_name) {
                 param.set_target_at_time(target, start_time, time_constant);
+                param.gc_events(now);
                 return true;
             }
         }

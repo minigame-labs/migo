@@ -53,6 +53,15 @@ impl RenderService {
         context_lost: std::sync::Arc<shared::op_state::ContextLostState>,
         wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) -> EngineResult<Self> {
+        // Surface-present flag: written by the JNI/UI thread (false the instant
+        // Java's surfaceDestroyed() runs, true on a new surface) and read by the
+        // render thread each frame so it stops presenting to an abandoned surface
+        // synchronously, closing the swap-on-abandoned-surface race. Init true —
+        // this service is constructed with a live surface.
+        let surface_present =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        crate::runtime::registry::register_surface_flag(host_id, surface_present.clone());
+
         let thread = RenderThread::spawn(
             raf_tx,
             vsync_rx,
@@ -63,6 +72,7 @@ impl RenderService {
             gpu_caps,
             context_lost,
             wake,
+            surface_present,
         )?;
         // Apply the host's configured target FPS to the render thread immediately
         // so the first vsync tick already runs at the right cadence.
@@ -81,6 +91,13 @@ impl RenderService {
     #[inline]
     pub(crate) fn sender(&self) -> shared::render_command_sender::CommandSender {
         self.thread.sender()
+    }
+
+    /// Whether the host currently holds a live onscreen surface. False after
+    /// `on_surface_destroyed()` until the next successful `update_surface()`.
+    #[inline]
+    pub(crate) fn has_live_surface(&self) -> bool {
+        self.surface.is_some()
     }
 
     #[inline]
@@ -107,7 +124,11 @@ impl RenderService {
             resp: RenderCmdResp::from_sync(tx),
         });
 
-        self.sender().send(cmd).map_err(|e| {
+        // RecreateOnscreen carries a sync responder; route it through the
+        // policy-aware `dispatch` (bounded-blocking for its Sync class) rather
+        // than the legacy drop-on-full `send`, so a transiently full render queue
+        // doesn't silently drop the recreate and strand the reply/onShow.
+        self.sender().dispatch(cmd).map_err(|e| {
             EngineError::new(ErrorCode::Cancelled)
                 .with_msg("recreate onscreen: send failed")
                 .with_detail(e.to_string())
@@ -162,20 +183,26 @@ impl RenderService {
     /// Pause rendering (stop RAF ticker and frame presentation).
     pub(crate) fn pause(&mut self) {
         self.surface_system.on_pause();
-        let _ = self.sender().send(RenderCommand::Pause);
+        // Bounded-blocking: dropping these on a full render queue desyncs the
+        // render thread from the surface/lifecycle state (a dropped Resume
+        // leaves the app frozen; a dropped SurfaceDestroyed leaves the render
+        // thread presenting to a dead surface), so wait rather than drop.
+        let _ = self.sender().send_blocking_bounded(RenderCommand::Pause);
     }
 
     /// Record surface loss and clear any stale surface handle.
     pub(crate) fn on_surface_destroyed(&mut self) {
         self.surface = None;
         self.surface_system.on_surface_destroyed();
-        let _ = self.sender().send(RenderCommand::SurfaceDestroyed);
+        let _ = self
+            .sender()
+            .send_blocking_bounded(RenderCommand::SurfaceDestroyed);
     }
 
     /// Resume rendering (restart RAF ticker and frame presentation).
     pub(crate) fn resume(&mut self) {
         self.surface_system.on_resume();
-        let _ = self.sender().send(RenderCommand::Resume);
+        let _ = self.sender().send_blocking_bounded(RenderCommand::Resume);
     }
 
     /// Re-signal the current live surface to the render thread.

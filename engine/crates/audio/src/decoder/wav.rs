@@ -34,18 +34,29 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => {
             let bits = spec.bits_per_sample;
-            let max_val = (1i32 << (bits - 1)) as f32;
+            // i64 so 32-bit PCM (1<<31) doesn't overflow i32 into a negative scale.
+            let max_val = (1i64 << (bits - 1)) as f32;
 
             reader
                 .into_samples::<i32>()
-                .filter_map(|s| s.ok())
-                .map(|s| s as f32 / max_val)
-                .collect()
+                .map(|s| s.map(|v| v as f32 / max_val))
+                .collect::<Result<Vec<f32>, _>>()
+                .map_err(|e| {
+                    EngineError::from_detail(
+                        ErrorCode::InvalidArgument,
+                        format!("WAV decode error: {}", e),
+                    )
+                })?
         }
         hound::SampleFormat::Float => reader
             .into_samples::<f32>()
-            .filter_map(|s| s.ok())
-            .collect(),
+            .collect::<Result<Vec<f32>, _>>()
+            .map_err(|e| {
+                EngineError::from_detail(
+                    ErrorCode::InvalidArgument,
+                    format!("WAV decode error: {}", e),
+                )
+            })?,
     };
 
     Ok(DecodedAudio {

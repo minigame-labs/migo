@@ -24,18 +24,25 @@ pub struct DelayNode {
 
 impl DelayNode {
     pub fn new(id: AudioNodeId, max_delay_time: f32, sample_rate: u32, channels: u32) -> Self {
-        let max_delay = max_delay_time.max(0.001).min(179.0); // Web Audio spec max
-        let buffer_size = (max_delay as f64 * sample_rate as f64) as usize * channels as usize;
-        let buffer_bytes = buffer_size * std::mem::size_of::<f32>();
-        if buffer_bytes > 5 * 1024 * 1024 {
+        // Per-node delay-buffer memory cap. Web Audio allows maxDelayTime up to
+        // 180s, which at 48kHz stereo f32 is ~68MB for a single node; cap the
+        // allocation and shrink max_delay to fit the budget.
+        const MAX_DELAY_BYTES: usize = 16 * 1024 * 1024;
+        let ch = channels.max(1) as usize;
+        let requested = max_delay_time.max(0.001).min(179.0); // Web Audio spec max
+        let bytes_per_sec = sample_rate as f64 * ch as f64 * std::mem::size_of::<f32>() as f64;
+        let budget_secs = (MAX_DELAY_BYTES as f64 / bytes_per_sec.max(1.0)) as f32;
+        let max_delay = requested.min(budget_secs);
+        if max_delay < requested {
             tracing::warn!(
-                "DelayNode {}: large buffer allocation ({:.1} MB for {:.1}s delay). \
-                 Consider reducing maxDelayTime for mobile.",
+                "DelayNode {}: maxDelayTime {:.1}s exceeds the {}MB per-node budget; clamped to {:.1}s",
                 id,
-                buffer_bytes as f64 / (1024.0 * 1024.0),
+                requested,
+                MAX_DELAY_BYTES / (1024 * 1024),
                 max_delay
             );
         }
+        let buffer_size = (max_delay as f64 * sample_rate as f64) as usize * ch;
         Self {
             id,
             delay_time: AudioParamTimeline::new(0.0, 0.0, max_delay),
@@ -66,7 +73,7 @@ impl AudioNodeProcessor for DelayNode {
         output: &mut [f32],
         sample_rate: u32,
         _channels: u32,
-        _current_time: f64,
+        current_time: f64,
     ) -> usize {
         let len = inputs.len().min(output.len());
         if len == 0 || self.buffer.is_empty() {
@@ -77,7 +84,7 @@ impl AudioNodeProcessor for DelayNode {
         let frames = len / channels;
         let buf_len = self.buffer.len();
 
-        let delay_secs = self.delay_time.value().max(0.0).min(self.max_delay);
+        let delay_secs = self.delay_time.compute_value(current_time).max(0.0).min(self.max_delay);
         let delay_samples = (delay_secs as f64 * sample_rate as f64) as usize * channels;
 
         for frame in 0..frames {

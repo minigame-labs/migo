@@ -138,8 +138,8 @@ impl AudioNodeProcessor for OscillatorNode {
         }
 
         let sr = sample_rate as f64;
-        let freq = self.frequency.value() as f64;
-        let detune = self.detune.value() as f64;
+        let freq = self.frequency.compute_value(current_time) as f64;
+        let detune = self.detune.compute_value(current_time) as f64;
 
         // Compute actual frequency with detune (cents to ratio)
         let computed_freq = freq * (2.0f64).powf(detune / 1200.0);

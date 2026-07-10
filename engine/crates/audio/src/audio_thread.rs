@@ -820,6 +820,26 @@ fn run_audio_thread(
                     }
                 }
 
+                AudioCmd::SetNodeParam {
+                    node_id,
+                    param_name,
+                    value,
+                } => {
+                    let found = node_index
+                        .get_context(node_id)
+                        .and_then(|ctx_id| contexts.get_mut(&ctx_id))
+                        .map(|ctx| ctx.set_node_param(node_id, &param_name, value))
+                        .unwrap_or(false);
+
+                    if !found {
+                        tracing::warn!(
+                            "SetNodeParam: node {} param {} not found",
+                            node_id,
+                            param_name
+                        );
+                    }
+                }
+
                 // ==================== Phase 2 Nodes ====================
                 AudioCmd::CreateOscillator { ctx_id, node_id } => {
                     if let Some(ctx) = contexts.get_mut(&ctx_id) {

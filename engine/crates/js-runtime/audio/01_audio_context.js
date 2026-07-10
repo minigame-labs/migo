@@ -76,6 +76,12 @@ const MAX_SAMPLE_RATE = 768000;
 // from the globally-paused native clock. Accepted as low-impact given how rare
 // worker WebAudio is; revisit with host->worker lifecycle forwarding or a
 // native-authoritative clock if it becomes a real use case.
+//
+// Audio interruptions (phone calls / focus loss) are intentionally NOT tied to
+// this freeze: the native audio thread keeps processing during an interruption
+// (the OS ducks/pauses the actual output), so currentTime stays consistent with
+// the native clock. Games pause/resume playback themselves via
+// onAudioInterruptionBegin/End if they want it to stop.
 let _appBackgrounded = false;
 onHide(() => {
   _appBackgrounded = true;
@@ -267,6 +273,11 @@ class BaseAudioContext {
   }
 
   createDelay(maxDelayTime = 1.0) {
+    // Match the native 16MB per-node delay-buffer budget so delayTime.maxValue
+    // reflects what native will actually honor (native clamps too; assume stereo).
+    const MAX_DELAY_BYTES = 16 * 1024 * 1024;
+    const budgetSecs = MAX_DELAY_BYTES / (this.sampleRate * 2 * 4);
+    maxDelayTime = Math.min(Math.max(0.001, maxDelayTime), Math.min(180, budgetSecs));
     const nodeId = nextNodeId++;
     op_audio_create_delay(this.#nativeId, nodeId, maxDelayTime);
     return new DelayNode(this, nodeId, maxDelayTime);
@@ -321,9 +332,24 @@ class BaseAudioContext {
   }
 
   createIIRFilter(feedforward, feedback) {
+    // Accept any sequence<double> (incl. Float32Array/Float64Array), per Web Audio.
+    const ff = Array.from(feedforward ?? []);
+    const fb = Array.from(feedback ?? []);
+    if (ff.length === 0 || fb.length === 0) {
+      throw new Error("createIIRFilter: feedforward and feedback must be non-empty");
+    }
+    if (ff.length > 20 || fb.length > 20) {
+      throw new Error("createIIRFilter: coefficient arrays must have at most 20 elements");
+    }
+    if (fb[0] === 0) {
+      throw new Error("createIIRFilter: feedback[0] must not be zero");
+    }
+    if (!ff.every(Number.isFinite) || !fb.every(Number.isFinite)) {
+      throw new Error("createIIRFilter: coefficients must be finite numbers");
+    }
     const nodeId = nextNodeId++;
-    op_audio_create_iir_filter(this.#nativeId, nodeId, feedforward, feedback);
-    return new IIRFilterNode(this, nodeId, feedforward, feedback);
+    op_audio_create_iir_filter(this.#nativeId, nodeId, ff, fb);
+    return new IIRFilterNode(this, nodeId, ff, fb);
   }
 
   createScriptProcessor(bufferSize = 0, numberOfInputChannels = 2, numberOfOutputChannels = 2) {

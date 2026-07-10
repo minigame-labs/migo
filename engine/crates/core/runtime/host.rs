@@ -590,53 +590,22 @@ impl Host {
                 // Mark foreground so network polling ops resume normal rate.
                 self.backgrounded.store(false, Ordering::Relaxed);
 
-                // Resume audio thread before notifying JS so the game can
-                // immediately start playing audio in its onShow callback.
-                //
-                // The render thread is NOT resumed here. On Android, onResume
-                // fires before surfaceCreated, so the old surface is already
-                // destroyed at this point. The render thread will be resumed
-                // when UpdateSurface arrives with the new valid surface.
-                let script = if let Some(options_json) = options_json.as_deref() {
-                    let options_json = options_json.trim();
-                    if options_json.is_empty() {
-                        format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
-                    } else {
-                        match deno_core::serde_json::from_str::<Value>(options_json) {
-                            Ok(value) if value.is_object() => {
-                                // Serialize back through serde_json::to_string and pass
-                                // via JSON.parse() with proper JS string escaping.
-                                // Using Display on serde_json::Value is *mostly* JS-safe,
-                                // but edge cases exist (U+2028/U+2029 are valid JSON but
-                                // act as line terminators in JS source). Going through
-                                // JSON.parse(escaped_string) is universally safe.
-                                let json_str = deno_core::serde_json::to_string(&value)
-                                    .unwrap_or_else(|_| "{}".to_string());
-                                let escaped = escape_for_js_string(&json_str);
-                                format!(
-                                    "{HOST_BRIDGE_EXPR}._internalTriggerOnShow(JSON.parse('{}'))",
-                                    escaped
-                                )
-                            }
-                            Ok(_) => format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()"),
-                            Err(e) => {
-                                warn!(
-                                    "[Host {}] invalid onShow options JSON, fallback to default: {}",
-                                    self.id, e
-                                );
-                                format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
-                            }
-                        }
-                    }
-                } else {
-                    format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
-                };
+                let script = self.build_on_show_script(options_json.as_deref());
 
-                // Defer JS onShow until a valid surface is back and render/audio
-                // have resumed.  Android calls Activity.onResume before
-                // SurfaceView.surfaceCreated; running game onShow immediately
-                // can throw or leave audio/RAF in a paused-looking state.
-                self.pending_on_show_script = Some(script);
+                if self.render.has_live_surface() {
+                    // The SurfaceView surface survived the hide (Android does not
+                    // guarantee a destroy/recreate across every pause/resume). No
+                    // UpdateSurface will arrive to drive the resume, so resume
+                    // render/audio and fire onShow now; otherwise the app would
+                    // stay frozen and onShow would never fire.
+                    self.enter_foreground();
+                    let _ = self.js.exec_script("onshow", &script);
+                } else {
+                    // Android fires Activity.onResume before surfaceCreated: the
+                    // old surface is already gone. Defer render/audio resume and
+                    // onShow until the new surface arrives (on_update_surface).
+                    self.pending_on_show_script = Some(script);
+                }
                 Ok(())
             }
 
@@ -1019,6 +988,58 @@ impl Host {
         self.js.exec_script("eval-script", &source)
     }
 
+    /// Build the JS snippet that fires the game's `onShow`, embedding launch
+    /// options (if any) via `JSON.parse` of a safely escaped string.
+    fn build_on_show_script(&self, options_json: Option<&str>) -> String {
+        let Some(options_json) = options_json else {
+            return format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()");
+        };
+        let options_json = options_json.trim();
+        if options_json.is_empty() {
+            return format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()");
+        }
+        match deno_core::serde_json::from_str::<Value>(options_json) {
+            Ok(value) if value.is_object() => {
+                // Round-trip through serde_json::to_string and pass via
+                // JSON.parse() with proper JS string escaping. Display on a
+                // serde_json::Value is *mostly* JS-safe, but U+2028/U+2029 are
+                // valid JSON yet act as line terminators in JS source, so
+                // JSON.parse(escaped_string) is universally safe.
+                let json_str = deno_core::serde_json::to_string(&value)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let escaped = escape_for_js_string(&json_str);
+                format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow(JSON.parse('{escaped}'))")
+            }
+            Ok(_) => format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()"),
+            Err(e) => {
+                warn!(
+                    "[Host {}] invalid onShow options JSON, fallback to default: {}",
+                    self.id, e
+                );
+                format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
+            }
+        }
+    }
+
+    /// Resume the render/audio threads and nudge the JS RAF loop + window resize
+    /// after the app returns to the foreground with a live surface. Safe to call
+    /// when nothing was paused (resume is a no-op then). Does NOT fire onShow —
+    /// the caller owns onShow sequencing.
+    fn enter_foreground(&mut self) {
+        self.render.resume();
+        self.audio.resume();
+        // The RAF loop self-stops after a few idle frames while hidden; this is a
+        // low-cost nudge to restart it now that the surface/foreground is back.
+        let _ = self.js.exec_script(
+            "raf_resume_kick",
+            "globalThis.__migo_restart_raf_loop && globalThis.__migo_restart_raf_loop()",
+        );
+        let _ = self.js.exec_script(
+            "window_resize",
+            &format!("{HOST_BRIDGE_EXPR}._internalTriggerWindowResize()"),
+        );
+    }
+
     fn on_update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
         let (w, h) = surface.size();
         info!(
@@ -1028,29 +1049,18 @@ impl Host {
 
         let result = self.render.update_surface(surface);
 
-        // Resume the render thread after the surface is successfully recreated.
-        // This handles the Android lifecycle where onResume fires before
-        // surfaceCreated: OnHide pauses the render thread, and it stays paused
-        // until a valid surface arrives here. If the render thread wasn't paused
-        // (e.g., normal orientation change), resume() is a no-op.
+        // Resume the foreground after the surface is (re)created — but only when
+        // actually foregrounded. Android can deliver surfaceCreated/Changed while
+        // still hidden (before onResume) or recreate a surface while backgrounded;
+        // resuming then would run render/audio in the background. In that case the
+        // surface is marked live but stays paused, and the OnShow live-surface
+        // path drives the resume once `backgrounded` clears.
         if result.is_ok() {
-            self.render.resume();
-            self.audio.resume();
-            // Kick the JS RAF loop after a valid surface is back.  The loop is
-            // self-stopping after a few idle frames, so this is a low-cost
-            // lifecycle nudge rather than a permanent busy loop.  It fixes the
-            // Android resume window where callbacks are queued but the async
-            // RAF driver had previously stopped while the app was hidden.
-            let _ = self.js.exec_script(
-                "raf_resume_kick",
-                "globalThis.__migo_restart_raf_loop && globalThis.__migo_restart_raf_loop()",
-            );
-            let _ = self.js.exec_script(
-                "window_resize",
-                &format!("{HOST_BRIDGE_EXPR}._internalTriggerWindowResize()"),
-            );
-            if let Some(script) = self.pending_on_show_script.take() {
-                let _ = self.js.exec_script("onshow", &script);
+            if !self.backgrounded.load(Ordering::Relaxed) {
+                self.enter_foreground();
+                if let Some(script) = self.pending_on_show_script.take() {
+                    let _ = self.js.exec_script("onshow", &script);
+                }
             }
             info!("[Host {}] on_update_surface completed", self.id);
         } else if let Err(ref e) = result {

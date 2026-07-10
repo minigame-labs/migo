@@ -312,8 +312,16 @@ public final class AudioRecorderManager {
                 }
 
                 int bytesRead = audioRecord.read(readBuf, 0, readBuf.length);
-                if (bytesRead <= 0) {
-                    if (bytesRead == AudioRecord.ERROR_INVALID_OPERATION) break;
+                if (bytesRead < 0) {
+                    // Any negative return is a fatal AudioRecord error (dead object,
+                    // invalid op, bad value, ...). Stop + clean up instead of
+                    // breaking without cleanup or spinning on repeated errors.
+                    fireEvent("error",
+                            "{\"errMsg\":\"" + escapeJson("recorderManager: AudioRecord read error " + bytesRead) + "\"}");
+                    mainHandler.post(() -> stopInternal(false));
+                    break;
+                }
+                if (bytesRead == 0) {
                     continue;
                 }
 
@@ -330,6 +338,9 @@ public final class AudioRecorderManager {
         } catch (IOException e) {
             fireEvent("error",
                     "{\"errMsg\":\"" + escapeJson("recording write error: " + e.getMessage()) + "\"}");
+            // Fatal I/O error: tear down + go idle from the main thread (the capture
+            // thread can't join itself). Idempotent with an explicit stop().
+            mainHandler.post(() -> stopInternal(false));
         }
 
         // Flush remaining
@@ -423,6 +434,8 @@ public final class AudioRecorderManager {
             if (captureRunning) {
                 fireEvent("error",
                         "{\"errMsg\":\"" + escapeJson("pipe read error: " + e.getMessage()) + "\"}");
+                // Fatal error mid-recording: tear down from the main thread.
+                mainHandler.post(() -> stopInternal(false));
             }
             // else: pipe closed during normal stop, ignore
         }
@@ -638,7 +651,10 @@ public final class AudioRecorderManager {
             encodeBitRate = opts.optInt("encodeBitRate", 48000);
             format = opts.optString("format", "aac");
             audioSource = opts.optString("audioSource", "auto");
-            frameSize = opts.optInt("frameSize", 0);
+            // Clamp to [0, 1024] KB: 0 disables frame mode; frameSize*1024 is the
+            // per-chunk byte allocation (new byte[frameSize*1024]), so an unbounded
+            // value would overflow int and/or OOM.
+            frameSize = Math.max(0, Math.min(1024, opts.optInt("frameSize", 0)));
         } catch (JSONException e) {
             // Use defaults
         }
@@ -724,15 +740,39 @@ public final class AudioRecorderManager {
             recordDir.mkdirs();
         }
 
-        String ext;
-        switch (format.toLowerCase()) {
-            case "mp3":  ext = ".mp3"; break;
-            case "wav":  ext = ".wav"; break;
-            case "pcm":  ext = ".pcm"; break;
-            default:     ext = ".m4a"; break;
-        }
-        return new File(recordDir, "rec_" + sessionId + "_" + System.currentTimeMillis() + ext)
+        return new File(recordDir,
+                "rec_" + sessionId + "_" + System.currentTimeMillis() + outputExtension())
                 .getAbsolutePath();
+    }
+
+    /**
+     * Extension reflecting the container we ACTUALLY write, not the requested
+     * format. Android has no native MP3 encoder, and "encoded" wav/pcm is emulated
+     * with a compressed codec, so labelling those files ".mp3"/".wav" would
+     * misrepresent their bytes and break downstream format detection.
+     */
+    private String outputExtension() {
+        switch (frameMode) {
+            case FRAME_PCM:
+                // AudioRecord writes raw PCM (no WAV header) regardless of whether
+                // "pcm" or "wav" was requested.
+                return ".pcm";
+            case FRAME_ENCODED:
+                // configureStreamingFormatAndEncoder(): AAC in an ADTS stream.
+                return ".aac";
+            default: // FRAME_NONE -> configureFormatAndEncoder()
+                switch (format.toLowerCase()) {
+                    case "wav":
+                    case "pcm":
+                        // OGG/Opus on Android Q+, else 3GPP/AMR-WB.
+                        return (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ? ".ogg" : ".3gp";
+                    case "mp3":
+                    case "aac":
+                    default:
+                        // MPEG-4 container with an AAC track.
+                        return ".m4a";
+                }
+        }
     }
 
     private void scheduleAutoStop() {

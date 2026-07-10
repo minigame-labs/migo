@@ -335,6 +335,24 @@ pub fn op_audio_set_gain_value(
         .map_err(|_| audio_err("Audio thread disconnected"))
 }
 
+/// Set an AudioParam's current value now by node + param name (fire and forget).
+#[op2(fast)]
+pub fn op_audio_set_node_param(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] param_name: String,
+    value: f32,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+
+    tx.send(AudioCmd::SetNodeParam {
+        node_id,
+        param_name,
+        value,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
 // ============================================================================
 // Graph Operations
 // ============================================================================
@@ -837,6 +855,25 @@ pub fn op_audio_create_iir_filter(
     #[serde] feedforward: Vec<f64>,
     #[serde] feedback: Vec<f64>,
 ) -> Result<(), AudioError> {
+    // WebAudio: coefficient arrays must be non-empty, <= 20 long, feedback[0] != 0,
+    // and finite. Reject here so the audio thread never divides by an empty length.
+    if feedforward.is_empty() || feedback.is_empty() {
+        return Err(audio_err(
+            "createIIRFilter: feedforward and feedback must be non-empty",
+        ));
+    }
+    if feedforward.len() > 20 || feedback.len() > 20 {
+        return Err(audio_err(
+            "createIIRFilter: coefficient arrays must have at most 20 elements",
+        ));
+    }
+    if feedback[0] == 0.0 {
+        return Err(audio_err("createIIRFilter: feedback[0] must not be zero"));
+    }
+    if feedforward.iter().chain(feedback.iter()).any(|v| !v.is_finite()) {
+        return Err(audio_err("createIIRFilter: coefficients must be finite"));
+    }
+
     let tx = get_audio_tx(state);
     tx.send(AudioCmd::CreateIIRFilter {
         ctx_id,

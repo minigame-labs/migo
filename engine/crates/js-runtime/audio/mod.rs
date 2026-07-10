@@ -55,6 +55,7 @@ use crate::audio::ops::{
     op_audio_set_buffer,
     op_audio_set_distance_model,
     op_audio_set_gain_value,
+    op_audio_set_node_param,
     // Phase 4: Global audio options ops
     op_audio_set_inner_audio_option,
     op_audio_set_loop,
@@ -116,6 +117,7 @@ extension!(host_v8_audio,
         op_audio_set_loop,
         op_audio_create_gain,
         op_audio_set_gain_value,
+        op_audio_set_node_param,
         op_audio_connect,
         op_audio_disconnect,
         // AudioParam automation ops

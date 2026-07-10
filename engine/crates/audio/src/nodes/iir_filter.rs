@@ -146,6 +146,14 @@ impl AudioNodeProcessor for IIRFilterNode {
         let ff_len = ff.len();
         let fb_len = fb.len();
 
+        // Degenerate filter with no coefficients: pass input through unchanged.
+        // Guards the `% ff_len` / `% fb_len` below against a divide-by-zero panic
+        // (the op/JS layers also reject empty coefficient arrays).
+        if ff_len == 0 || fb_len == 0 {
+            output[..len].copy_from_slice(&inputs[..len]);
+            return len / channels;
+        }
+
         for frame in 0..frames {
             for ch in 0..channels {
                 let idx = frame * channels + ch;

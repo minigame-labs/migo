@@ -309,11 +309,13 @@ pub fn spawn_host_thread(
             // late-arriving commands is the correct behavior.  The JNI callers
             // already ignore send failures (they use `let _ = send_command_to_host(...)`).
             registry::unregister_sender(id);
+            registry::unregister_surface_flag(id);
         });
 
     if let Err(e) = spawn_result {
         error!("[Host {}] failed to spawn thread: {}", id, e);
         registry::unregister_sender(id);
+        registry::unregister_surface_flag(id);
         return Err(EngineError::new(ErrorCode::Internal)
             .with_msg("failed to spawn host thread")
             .with_detail(e.to_string()));
@@ -322,6 +324,7 @@ pub fn spawn_host_thread(
     if ready_rx.recv().is_err() {
         error!("[Host {}] failed to start (init panic / early exit)", id);
         registry::unregister_sender(id);
+        registry::unregister_surface_flag(id);
         return Err(EngineError::new(ErrorCode::Internal)
             .with_msg("host thread failed to start")
             .with_detail("init panic / early exit".to_string()));

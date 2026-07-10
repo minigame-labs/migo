@@ -597,7 +597,9 @@ impl InnerAudioEventType {
 /// - `id`: Unique identifier for the touch pointer (stable across move events)
 /// - `x`, `y`: Touch coordinates in CSS pixels (logical, not physical)
 /// - `pressure`: Pressure value from 0.0 (none) to 1.0 (maximum)
-/// - `flags`: Reserved for future use (e.g., touch type, device type)
+/// - `flags`: Bitfield describing this pointer for the current event:
+///   bit 0 (`0x1`) = in `changedTouches`; bit 1 (`0x2`) = removed from the
+///   surface this event (finger up / cancel), so it is excluded from `touches`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct TouchPoint {
@@ -611,7 +613,8 @@ pub struct TouchPoint {
     /// Touch pressure, normalized to 0.0–1.0 range.
     /// May be 0.0 if the device doesn't support pressure sensing.
     pub pressure: f32,
-    /// Reserved flags for future use.
+    /// Per-pointer bitfield: bit 0 = in `changedTouches`, bit 1 = removed from
+    /// the surface this event (excluded from `touches`).
     pub flags: u32,
 }
 

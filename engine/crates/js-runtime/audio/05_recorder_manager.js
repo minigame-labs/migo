@@ -58,9 +58,12 @@ class RecorderManager {
     };
     // Clamp duration
     opts.duration = Math.max(0, Math.min(600000, opts.duration));
-    // Only include frameSize if explicitly set
+    // Only include frameSize if explicitly set. Clamp to [0, 1024] KB: 0 disables
+    // frame mode; native allocates frameSize*1024 bytes per chunk, so an unbounded
+    // value would overflow int / OOM.
     if (options.frameSize != null) {
-      opts.frameSize = options.frameSize;
+      const fs = Math.trunc(Number(options.frameSize));
+      opts.frameSize = Number.isFinite(fs) ? Math.max(0, Math.min(1024, fs)) : 0;
     }
 
     try {

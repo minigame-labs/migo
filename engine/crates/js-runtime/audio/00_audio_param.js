@@ -4,6 +4,7 @@ import {
   op_audio_param_exponential_ramp,
   op_audio_param_set_target,
   op_audio_param_cancel_scheduled,
+  op_audio_set_node_param,
 } from "ext:core/ops";
 
 class AudioParam {
@@ -36,6 +37,19 @@ class AudioParam {
     const val = Number(v);
     if (Number.isNaN(val)) return;
     this.#value = Math.max(this.#minValue, Math.min(this.#maxValue, val));
+    this._onValueSet(this.#value);
+  }
+
+  // Push a direct `.value = x` to native. Bound params (oscillator freq, biquad,
+  // delay, compressor, panner, buffer-source playbackRate, ...) have native DSP
+  // that reads the param, so a plain assignment must reach native or it's a no-op.
+  // Sets the intrinsic value directly (no timeline event), so repeated writes and
+  // interaction with scheduled automation stay coherent. Overridden by
+  // NativeAudioParam for params with a dedicated native setter.
+  _onValueSet(val) {
+    if (this.#nodeId !== null) {
+      op_audio_set_node_param(this.#nodeId, this.#paramName, val);
+    }
   }
 
   get defaultValue() {
@@ -103,15 +117,12 @@ class NativeAudioParam extends AudioParam {
     this.#onChangeCallback = onChangeCallback;
   }
 
-  set value(v) {
-    super.value = v;
+  // Use the dedicated native setter (e.g. op_audio_set_gain_value) instead of the
+  // generic set-value-at-time op, so a `.value =` doesn't double-dispatch.
+  _onValueSet(val) {
     if (this.#onChangeCallback) {
-      this.#onChangeCallback(super.value);
+      this.#onChangeCallback(val);
     }
-  }
-
-  get value() {
-    return super.value;
   }
 }
 

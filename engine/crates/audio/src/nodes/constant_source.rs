@@ -79,7 +79,7 @@ impl AudioNodeProcessor for ConstantSourceNode {
             return 0;
         }
 
-        let value = self.offset.value();
+        let value = self.offset.compute_value(current_time);
         let channels = channels.max(1) as usize;
         let frames = output.len() / channels;
         let len = frames * channels;

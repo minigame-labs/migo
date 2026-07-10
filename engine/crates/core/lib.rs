@@ -101,5 +101,8 @@ mod runtime;
 pub mod services;
 
 pub use runtime::vsync::send_vsync;
-pub use runtime::{send_command_to_host, shutdown_host, spawn_host_thread};
+pub use runtime::{
+    send_command_to_host, send_critical_command_to_host, set_surface_present, shutdown_host,
+    spawn_host_thread,
+};
 pub use services::PlatformServices;

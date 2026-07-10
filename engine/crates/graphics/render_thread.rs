@@ -1021,6 +1021,12 @@ impl RenderThread {
         // waiting for the next heartbeat tick. Decoupled from `HostCommand`
         // so the graphics crate stays independent of the host command enum.
         wake: Option<Arc<dyn Fn() + Send + Sync>>,
+        // Set false by the JNI/UI thread the instant Java's surfaceDestroyed()
+        // runs (before Android abandons the BufferQueue) and true on a new
+        // surface. Checked each frame to stop presenting to an abandoned surface
+        // synchronously, without waiting for the async SurfaceDestroyed command
+        // and independent of the render command queue.
+        surface_present: Arc<std::sync::atomic::AtomicBool>,
     ) -> EngineResult<Self> {
         let (cmd_tx, cmd_rx) = CommandSender::new();
         let (event_tx, event_rx) = shared::render_event::channel();
@@ -1220,6 +1226,12 @@ impl RenderThread {
                                     if is_recreate {
                                         if let Some(size) = recreate_surface_size {
                                             surface_system.on_surface_available(size);
+                                            // Allow presenting again only now that the render
+                                            // thread has actually recreated the onscreen surface.
+                                            // Set true ONLY here (never from JNI) so the flag can
+                                            // never read true against a stale/abandoned surface
+                                            // (avoids the destroy->create ABA on the boolean).
+                                            surface_present.store(true, std::sync::atomic::Ordering::Release);
                                             info!(
                                                 width = size.0,
                                                 height = size.1,
@@ -1934,6 +1946,13 @@ impl RenderThread {
                             }
 
                             // 2) Present frame and signal RAF.
+                            // JNI clears surface_present the instant Java's
+                            // surfaceDestroyed() runs; honor it here so we stop
+                            // presenting to an abandoned surface without waiting
+                            // for the async SurfaceDestroyed command.
+                            if !surface_present.load(std::sync::atomic::Ordering::Acquire) {
+                                surface_system.on_surface_destroyed();
+                            }
                             present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, surface_system.can_present(), ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
                         }
 
@@ -1983,6 +2002,9 @@ impl RenderThread {
                             }
 
                             // 2) Present frame and signal RAF.
+                            if !surface_present.load(std::sync::atomic::Ordering::Acquire) {
+                                surface_system.on_surface_destroyed();
+                            }
                             let should_present = decision.should_signal_raf && surface_system.can_present();
                             present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, should_present, decision.raf_time_ms, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
                         }

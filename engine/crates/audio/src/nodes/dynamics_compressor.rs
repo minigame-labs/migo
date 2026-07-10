@@ -63,7 +63,7 @@ impl AudioNodeProcessor for DynamicsCompressorNode {
         output: &mut [f32],
         sample_rate: u32,
         _channels: u32,
-        _current_time: f64,
+        current_time: f64,
     ) -> usize {
         let len = inputs.len().min(output.len());
         if len == 0 {
@@ -74,11 +74,11 @@ impl AudioNodeProcessor for DynamicsCompressorNode {
         let frames = len / channels;
         let sr = sample_rate as f32;
 
-        let threshold_db = self.threshold.value();
-        let knee_db = self.knee.value();
-        let ratio = self.ratio.value().max(1.0);
-        let attack = self.attack.value().max(0.0001);
-        let release = self.release.value().max(0.0001);
+        let threshold_db = self.threshold.compute_value(current_time);
+        let knee_db = self.knee.compute_value(current_time);
+        let ratio = self.ratio.compute_value(current_time).max(1.0);
+        let attack = self.attack.compute_value(current_time).max(0.0001);
+        let release = self.release.compute_value(current_time).max(0.0001);
 
         // Compute attack/release coefficients
         let attack_coeff = (-1.0 / (attack * sr)).exp();

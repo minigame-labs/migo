@@ -11,6 +11,7 @@ import {
   op_inner_audio_set_loop,
   op_inner_audio_set_playback_rate,
   op_inner_audio_set_autoplay,
+  op_inner_audio_get_state,
   op_audio_set_inner_audio_option,
   op_audio_get_available_audio_sources,
 } from "ext:core/ops";
@@ -129,10 +130,12 @@ class InnerAudioContext {
     switch (event.eventType) {
       case "canPlay":
         this.#buffered = true;
+        this.#refreshState(); // populate duration/buffered (events carry only currentTime)
         this.#fireListeners("canplay");
         break;
       case "play":
         this.#paused = false;
+        this.#refreshState(); // refresh duration for streaming sources
         this.#fireListeners("play");
         break;
       case "pause":
@@ -175,6 +178,22 @@ class InnerAudioContext {
     const group = this.#listeners[type];
     if (!group) return;
     group.trigger(arg);
+  }
+
+  // Pull duration/buffered (and a fresh currentTime) from native. The push-based
+  // event stream only carries currentTime, so duration/buffered would otherwise
+  // stay 0. Fire-and-forget; guarded against teardown.
+  async #refreshState() {
+    if (this.#destroyed) return;
+    try {
+      const st = await op_inner_audio_get_state(this.#id);
+      if (this.#destroyed) return;
+      if (typeof st.duration === "number") this.#duration = st.duration;
+      if (typeof st.buffered === "boolean") this.#buffered = st.buffered;
+      if (typeof st.current_time === "number") this.#currentTime = st.current_time;
+    } catch (_) {
+      /* context gone or audio thread unavailable */
+    }
   }
 
   // ==================== Properties ====================
