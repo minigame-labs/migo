@@ -12,6 +12,15 @@ use shared::error::{EngineError, EngineResult, ErrorCode};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+/// Keep only a small number of decoded chunks ahead of the audio thread.
+/// When the app is backgrounded and stops polling, async sends apply
+/// backpressure to both decoding and the network response body.
+const STREAM_CHANNEL_CAPACITY: usize = 4;
+
+fn stream_channel() -> (mpsc::Sender<StreamMsg>, mpsc::Receiver<StreamMsg>) {
+    mpsc::channel(STREAM_CHANNEL_CAPACITY)
+}
+
 /// Message from download task to audio thread
 pub enum StreamMsg {
     /// Audio format detected, can start playback
@@ -66,8 +75,7 @@ impl Default for StreamingState {
     }
 }
 
-/// Shared runtime for all audio streaming downloads
-/// Uses a multi-threaded runtime with 2 worker threads
+/// Shared single-worker runtime for all audio streaming downloads.
 static STREAM_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn get_stream_runtime() -> &'static tokio::runtime::Runtime {
@@ -87,13 +95,13 @@ pub fn start_streaming_download(
     url: String,
     state: Arc<StreamingState>,
     target_sample_rate: u32,
-) -> mpsc::UnboundedReceiver<StreamMsg> {
-    let (tx, rx) = mpsc::unbounded_channel();
+) -> mpsc::Receiver<StreamMsg> {
+    let (tx, rx) = stream_channel();
 
     // Spawn download task on the shared runtime
     get_stream_runtime().spawn(async move {
         if let Err(e) = streaming_download_task(url, tx.clone(), state, target_sample_rate).await {
-            let _ = tx.send(StreamMsg::Error(e.to_string()));
+            let _ = tx.send(StreamMsg::Error(e.to_string())).await;
         }
     });
 
@@ -102,7 +110,7 @@ pub fn start_streaming_download(
 
 async fn streaming_download_task(
     url: String,
-    tx: mpsc::UnboundedSender<StreamMsg>,
+    tx: mpsc::Sender<StreamMsg>,
     state: Arc<StreamingState>,
     target_sample_rate: u32,
 ) -> EngineResult<()> {
@@ -195,10 +203,16 @@ async fn streaming_download_task(
                 sample_rate,
                 channels
             );
-            let _ = tx.send(StreamMsg::Ready {
-                sample_rate,
-                channels,
-            });
+            if tx
+                .send(StreamMsg::Ready {
+                    sample_rate,
+                    channels,
+                })
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
             ready_sent = true;
         }
 
@@ -210,7 +224,9 @@ async fn streaming_download_task(
                 new_samples.len(),
                 total_decoded_samples
             );
-            let _ = tx.send(StreamMsg::Samples(new_samples));
+            if tx.send(StreamMsg::Samples(new_samples)).await.is_err() {
+                return Ok(());
+            }
         }
     }
 
@@ -219,11 +235,15 @@ async fn streaming_download_task(
     if !final_samples.is_empty() {
         total_decoded_samples += final_samples.len();
         tracing::trace!("Flushed {} final samples", final_samples.len());
-        let _ = tx.send(StreamMsg::Samples(final_samples));
+        if tx.send(StreamMsg::Samples(final_samples)).await.is_err() {
+            return Ok(());
+        }
     }
 
     state.download_complete.store(true, Ordering::Release);
-    let _ = tx.send(StreamMsg::Done);
+    if tx.send(StreamMsg::Done).await.is_err() {
+        return Ok(());
+    }
 
     let downloaded = state.bytes_downloaded.load(Ordering::Relaxed);
     debug!(
@@ -340,5 +360,27 @@ impl Mp3StreamDecoder {
     fn flush(&mut self) -> (Vec<f32>, u32, u32) {
         // Try one more decode pass
         self.decode_available()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::error::TrySendError;
+
+    #[test]
+    fn stream_channel_applies_backpressure_at_capacity() {
+        let (tx, mut rx) = stream_channel();
+
+        for _ in 0..STREAM_CHANNEL_CAPACITY {
+            assert!(tx.try_send(StreamMsg::Done).is_ok());
+        }
+        assert!(matches!(
+            tx.try_send(StreamMsg::Done),
+            Err(TrySendError::Full(_))
+        ));
+
+        assert!(rx.try_recv().is_ok());
+        assert!(tx.try_send(StreamMsg::Done).is_ok());
     }
 }

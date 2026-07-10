@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use shared::protocol::audio_cmd::{InnerAudioEvent, InnerAudioEventType, InnerAudioId};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 use crate::decoder::DecodedAudio;
 use crate::streaming::{StreamMsg, StreamingState};
@@ -295,7 +295,7 @@ pub struct InnerAudioPlayer {
     /// Pending events to send back to JS
     pending_events: Vec<InnerAudioEvent>,
     /// Streaming receiver (if streaming mode)
-    stream_rx: Option<UnboundedReceiver<StreamMsg>>,
+    stream_rx: Option<Receiver<StreamMsg>>,
     /// Streaming state for progress tracking
     stream_state: Option<Arc<StreamingState>>,
     /// Whether streaming download is complete
@@ -438,7 +438,7 @@ impl InnerAudioPlayer {
     pub fn start_streaming(
         &mut self,
         url: String,
-        rx: UnboundedReceiver<StreamMsg>,
+        rx: Receiver<StreamMsg>,
         state: Arc<StreamingState>,
     ) {
         // Cancel any previous stream
@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn dropping_player_cancels_streaming_download() {
         let state = StreamingState::new();
-        let (_tx, rx) = mpsc::unbounded_channel::<StreamMsg>();
+        let (_tx, rx) = mpsc::channel::<StreamMsg>(1);
         let mut player = InnerAudioPlayer::new(1, 2);
         player.start_streaming("http://example/x.mp3".into(), rx, state.clone());
 
@@ -918,7 +918,7 @@ mod tests {
     #[test]
     fn waiting_event_emitted_once_per_stall() {
         let state = StreamingState::new();
-        let (_tx, rx) = mpsc::unbounded_channel::<StreamMsg>();
+        let (_tx, rx) = mpsc::channel::<StreamMsg>(1);
         let mut player = InnerAudioPlayer::new(1, 2); // stereo output
         player.start_streaming("http://example/x.mp3".into(), rx, state);
 
@@ -949,7 +949,7 @@ mod tests {
     #[test]
     fn waiting_event_refires_after_seek() {
         let state = StreamingState::new();
-        let (_tx, rx) = mpsc::unbounded_channel::<StreamMsg>();
+        let (_tx, rx) = mpsc::channel::<StreamMsg>(1);
         let mut player = InnerAudioPlayer::new(1, 2);
         player.start_streaming("http://example/x.mp3".into(), rx, state);
         player.shared.set_sample_rate(44_100);

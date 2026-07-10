@@ -273,16 +273,25 @@ impl AudioOutput {
 
     /// Pause the audio stream (stops the hardware callback).
     /// Use when the app is backgrounded or no audio is playing to save power.
-    pub fn pause_stream(&self) {
-        if let Err(e) = self.stream.pause() {
-            tracing::warn!("Failed to pause audio stream: {}", e);
+    pub fn pause_stream(&self) -> bool {
+        match self.stream.pause() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("Failed to pause audio stream: {}", e);
+                false
+            }
         }
     }
 
     /// Resume the audio stream (restarts the hardware callback).
-    pub fn resume_stream(&self) {
-        if let Err(e) = self.stream.play() {
-            tracing::warn!("Failed to resume audio stream: {}", e);
+    pub fn resume_stream(&self) -> bool {
+        match self.stream.play() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("Failed to resume audio stream: {}", e);
+                self.stream_error.store(true, Ordering::Release);
+                false
+            }
         }
     }
 }

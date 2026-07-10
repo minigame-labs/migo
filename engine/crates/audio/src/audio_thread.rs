@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use shared::channel::ThreadWakeup;
 use shared::error::{EngineError, EngineResult, ErrorCode};
@@ -31,6 +31,18 @@ fn join_with_timeout(handle: thread::JoinHandle<()>, timeout: Duration, label: &
             "{} did not shut down within {:?}, detaching",
             label, timeout
         );
+    }
+}
+
+fn join_all_with_timeout(
+    handles: impl IntoIterator<Item = thread::JoinHandle<()>>,
+    total_timeout: Duration,
+    label: &str,
+) {
+    let deadline = Instant::now() + total_timeout;
+    for (i, handle) in handles.into_iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        join_with_timeout(handle, remaining, &format!("{}-{}", label, i));
     }
 }
 
@@ -99,6 +111,47 @@ struct DecodePool {
     workers: Vec<thread::JoinHandle<()>>,
 }
 
+/// Owns the decode-pool configuration without starting worker threads until
+/// the first decode job arrives.
+struct LazyDecodePool {
+    pool: Option<DecodePool>,
+    result_tx: std_mpsc::Sender<DecodeResult>,
+    sample_rate: u32,
+    wakeup: ThreadWakeup,
+}
+
+impl LazyDecodePool {
+    fn new(
+        result_tx: std_mpsc::Sender<DecodeResult>,
+        sample_rate: u32,
+        wakeup: ThreadWakeup,
+    ) -> Self {
+        Self {
+            pool: None,
+            result_tx,
+            sample_rate,
+            wakeup,
+        }
+    }
+
+    fn submit(&mut self, job: DecodeJob) {
+        let pool = self.pool.get_or_insert_with(|| {
+            DecodePool::new(
+                DECODE_POOL_SIZE,
+                self.result_tx.clone(),
+                self.sample_rate,
+                self.wakeup.clone(),
+            )
+        });
+        pool.submit(job);
+    }
+
+    #[cfg(test)]
+    fn is_started(&self) -> bool {
+        self.pool.is_some()
+    }
+}
+
 impl DecodePool {
     fn new(
         num_workers: usize,
@@ -153,10 +206,13 @@ impl Drop for DecodePool {
         for _ in &self.workers {
             let _ = self.job_tx.send(PoolMsg::Shutdown);
         }
-        // Join with timeout — don't block forever.
-        for (i, h) in self.workers.drain(..).enumerate() {
-            join_with_timeout(h, Duration::from_secs(3), &format!("decode-worker-{}", i));
-        }
+        // All workers share one deadline so audio-thread shutdown stays within
+        // its own three-second join budget.
+        join_all_with_timeout(
+            self.workers.drain(..),
+            Duration::from_secs(3),
+            "decode-worker",
+        );
     }
 }
 
@@ -197,7 +253,7 @@ fn decode_worker(
                     }
                 }
                 // Wake the audio thread so it processes the result immediately,
-                // rather than waiting for the next tick (up to 500 ms in Sleep).
+                // rather than waiting for the next management-loop tick.
                 wakeup.notify();
             }
             Ok(PoolMsg::Shutdown) | Err(_) => break,
@@ -214,7 +270,10 @@ use crate::nodes::{
     OscillatorNode, OscillatorType, OversampleType, PannerNode, PanningModel, WaveShaperNode,
 };
 use crate::output::AudioOutput;
-use crate::power_manager::{AudioPowerConfig, AudioPowerManager, AudioPowerState};
+use crate::power_manager::{
+    AudioPowerConfig, AudioPowerManager, AudioPowerState, AudioStreamAction, AudioStreamGate,
+    AudioWaitMode, audio_wait_mode,
+};
 use crate::streaming::{self, StreamingState};
 
 /// Reverse lookup from node_id to context_id for O(1) access.
@@ -458,6 +517,16 @@ fn calculate_process_frames(sample_rate: u32) -> usize {
     frames.next_power_of_two().max(512).min(4096)
 }
 
+fn wait_for_audio_work(wakeup: &ThreadWakeup, mode: AudioWaitMode) {
+    match mode {
+        AudioWaitMode::Continue => {}
+        AudioWaitMode::Indefinite => wakeup.wait(),
+        AudioWaitMode::Timed(duration) => {
+            wakeup.wait_timeout(duration);
+        }
+    }
+}
+
 /// Audio thread main loop — 3-level power management.
 ///
 /// # Power States
@@ -466,11 +535,11 @@ fn calculate_process_frames(sample_rate: u32) -> usize {
 /// |-------------|-----------|-----------------------------------------------|
 /// | **Active**  |   5 ms    | context Running / player Playing / streaming  |
 /// | **LowPower**|  50 ms    | idle < 3 s (recently stopped)                 |
-/// | **Sleep**   | 500 ms    | idle >= 3 s (deep power save, condvar sleep)  |
+/// | **Sleep**   | event     | idle >= 3 s (stream paused, condvar wait)     |
 ///
 /// In all states, the thread sleeps on a [`ThreadWakeup`] condvar so that
 /// incoming commands (via [`AudioSender`](shared::op_state::AudioSender))
-/// wake it instantly (< 0.5 ms latency).
+/// wake it without waiting for the next timed tick.
 fn run_audio_thread(
     mut rx: UnboundedReceiver<AudioCmd>,
     mut output: AudioOutput,
@@ -498,10 +567,9 @@ fn run_audio_thread(
     // Channel for receiving decode+resample results from worker threads.
     let (decode_tx, decode_rx) = std_mpsc::channel::<DecodeResult>();
 
-    // Fixed-size decode thread pool (2 workers).
-    // Workers persist for the audio thread's lifetime — no per-decode
-    // thread creation/teardown overhead.
-    let decode_pool = DecodePool::new(DECODE_POOL_SIZE, decode_tx, sample_rate, wakeup.clone());
+    // The fixed-size pool starts only if a decode job arrives. Once started,
+    // its two workers persist for the audio thread's lifetime.
+    let mut decode_pool = LazyDecodePool::new(decode_tx, sample_rate, wakeup.clone());
 
     // Audio processing buffer - dynamically sized based on sample rate
     let process_frames = calculate_process_frames(sample_rate);
@@ -514,8 +582,13 @@ fn run_audio_thread(
     // Pause state: when true, skip audio processing but still handle commands.
     let mut paused = false;
 
-    // ---- Power manager (3-level: Active / LowPower / Sleep) ----
-    let mut power = AudioPowerManager::new(AudioPowerConfig::default());
+    // Management work (including streaming) and audible output have separate
+    // idle clocks so a download does not keep the hardware callback running.
+    let power_config = AudioPowerConfig::default();
+    let stream_retry_delay = power_config.sleep_tick;
+    let mut power = AudioPowerManager::new(power_config.clone());
+    let mut output_power = AudioPowerManager::new(power_config);
+    let mut stream_gate = AudioStreamGate::new_running();
 
     // Exponential backoff for audio output recovery
     let mut recovery_delay = Duration::from_secs(1);
@@ -544,31 +617,14 @@ fn run_audio_thread(
                 AudioCmd::PauseAll => {
                     if !paused {
                         paused = true;
-                        output.pause_stream();
-                        info!("AudioThread paused (stream paused)");
+                        info!("AudioThread pause requested");
                     }
                 }
 
                 AudioCmd::ResumeAll => {
                     if paused {
                         paused = false;
-                        // If the audio stream died while paused (e.g. device
-                        // disconnected during a phone call), recreate it now.
-                        if !output.is_alive() {
-                            match AudioOutput::new() {
-                                Ok(new_output) => {
-                                    sync = new_output.sync().clone();
-                                    output = new_output;
-                                    info!("AudioThread: audio output recreated after stream error");
-                                }
-                                Err(e) => {
-                                    error!("AudioThread: failed to recreate audio output: {}", e);
-                                }
-                            }
-                        } else {
-                            output.resume_stream();
-                        }
-                        info!("AudioThread resumed");
+                        info!("AudioThread resume requested");
                     }
                 }
 
@@ -1725,12 +1781,39 @@ fn run_audio_thread(
             }
         }
 
+        // Hitting the drain cap means the channel may still contain commands.
+        // Notifications are intentionally coalesced into one latch, so the
+        // loop must not block until it has observed the channel below the cap.
+        let commands_may_remain = cmd_count == MAX_CMD_DRAIN;
+
         // -----------------------------------------------------------------
-        // 2. When paused (app in background), deep-sleep on condvar.
-        //    Commands are still processed on wake.
+        // 2. When backgrounded, pause the hardware stream and wait for an
+        //    explicit command. A failed pause retains a bounded retry tick.
         // -----------------------------------------------------------------
         if paused {
-            wakeup.wait_timeout(Duration::from_millis(500));
+            if !output.is_alive() {
+                stream_gate.mark_stopped();
+            }
+            if let Some(AudioStreamAction::Pause) =
+                stream_gate.next_action(true, output_power.state())
+            {
+                if output.pause_stream() {
+                    stream_gate.commit(AudioStreamAction::Pause);
+                    info!("AudioThread paused (stream paused)");
+                }
+            }
+
+            wait_for_audio_work(
+                &wakeup,
+                audio_wait_mode(
+                    commands_may_remain,
+                    true,
+                    power.state(),
+                    stream_gate.is_running(),
+                    power.wait_duration(),
+                    stream_retry_delay,
+                ),
+            );
             continue;
         }
 
@@ -1780,30 +1863,7 @@ fn run_audio_thread(
         }
 
         // -----------------------------------------------------------------
-        // 5. Recover from dead audio output stream (with exponential backoff).
-        // -----------------------------------------------------------------
-        if !output.is_alive() {
-            match AudioOutput::new() {
-                Ok(new_output) => {
-                    sync = new_output.sync().clone();
-                    output = new_output;
-                    recovery_delay = Duration::from_secs(1); // Reset on success
-                    info!("AudioThread: audio output recovered after stream error");
-                }
-                Err(e) => {
-                    error!(
-                        "AudioThread: failed to recover audio output (retry in {:?}): {}",
-                        recovery_delay, e
-                    );
-                    wakeup.wait_timeout(recovery_delay);
-                    recovery_delay = (recovery_delay * 2).min(MAX_RECOVERY_DELAY);
-                    continue;
-                }
-            }
-        }
-
-        // -----------------------------------------------------------------
-        // 6. Determine activity and update power state.
+        // 5. Determine management and audible-output activity independently.
         //    Single pass over players for active/streaming, and use
         //    has_active_sources() for contexts (not just Running state).
         // -----------------------------------------------------------------
@@ -1822,21 +1882,55 @@ fn run_audio_thread(
             }
         }
 
-        let is_active = has_active_context || has_active_inner || has_active_streaming;
+        let output_is_active = has_active_context || has_active_inner;
+        let is_active = output_is_active || has_active_streaming;
 
         let power_state = power.update(is_active);
+        let output_power_state = output_power.update(output_is_active);
 
         // -----------------------------------------------------------------
-        // 7. Audio processing (only when active).
-        //    Gate on Running state (not just has_active_sources) so that
-        //    finished node cleanup still happens inside context.process().
+        // 6. Recover dead output only when there is audible work. A newly
+        //    created AudioOutput starts in play state.
         // -----------------------------------------------------------------
-        let has_running_context = contexts
-            .values()
-            .any(|ctx| ctx.state() == AudioContextState::Running);
-        if has_running_context || has_active_inner {
-            // Check if callback signaled need for data (lightweight atomic check)
-            if sync.check_and_clear() || output.needs_data() {
+        if !output.is_alive() {
+            stream_gate.mark_stopped();
+            if output_is_active {
+                match AudioOutput::new() {
+                    Ok(new_output) => {
+                        sync = new_output.sync().clone();
+                        output = new_output;
+                        stream_gate.mark_running();
+                        recovery_delay = Duration::from_secs(1);
+                        info!("AudioThread: audio output recovered after stream error");
+                    }
+                    Err(e) => {
+                        error!(
+                            "AudioThread: failed to recover audio output (retry in {:?}): {}",
+                            recovery_delay, e
+                        );
+                        wakeup.wait_timeout(recovery_delay);
+                        recovery_delay = (recovery_delay * 2).min(MAX_RECOVERY_DELAY);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let stream_action = stream_gate.next_action(false, output_power_state);
+        if stream_action == Some(AudioStreamAction::Pause) && output.pause_stream() {
+            stream_gate.commit(AudioStreamAction::Pause);
+            info!("AudioThread entered idle sleep (stream paused)");
+        }
+        let resume_after_refill = stream_action == Some(AudioStreamAction::Resume);
+
+        // -----------------------------------------------------------------
+        // 7. Audio processing (only with audible work). A resume forces one
+        //    refill pass before the hardware callback is restarted.
+        // -----------------------------------------------------------------
+        if output_is_active {
+            let should_refill = resume_after_refill
+                || (stream_gate.is_running() && (sync.check_and_clear() || output.needs_data()));
+            if should_refill {
                 // Refill only up to the high watermark, measured from the *current*
                 // buffer depth (output.buffered()) rather than the stale callback
                 // hint behind needs_data() — otherwise the loop would keep filling
@@ -1868,18 +1962,71 @@ fn run_audio_thread(
             }
         }
 
+        if resume_after_refill && output.resume_stream() {
+            stream_gate.commit(AudioStreamAction::Resume);
+            info!("AudioThread resumed active output after refill");
+        }
+
         // -----------------------------------------------------------------
-        // 8. Sleep on condvar for the power-state-appropriate duration.
-        //    In ALL states, AudioSender.send() calls wakeup.notify()
-        //    so the thread wakes instantly when a new command arrives.
+        // 8. Sleep on the condvar. Stable idle is event-driven only after the
+        //    output is confirmed paused; pause failures retain a retry tick.
         //
         //    Active:    5 ms — low-latency mixing
         //    LowPower: 50 ms — recently stopped, may resume
-        //    Sleep:   500 ms — deep power save, < 0.1% CPU
+        //    Sleep:    event — explicit command wakeup
         // -----------------------------------------------------------------
         if power_state != AudioPowerState::Active {
             tracing::trace!("AudioThread power state: {:?}", power_state);
         }
-        wakeup.wait_timeout(power.wait_duration());
+        wait_for_audio_work(
+            &wakeup,
+            audio_wait_mode(
+                commands_may_remain,
+                false,
+                power_state,
+                stream_gate.is_running(),
+                power.wait_duration(),
+                stream_retry_delay,
+            ),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_pool_starts_only_when_first_job_is_submitted() {
+        let (result_tx, result_rx) = std_mpsc::channel();
+        let mut pool = LazyDecodePool::new(result_tx, 48_000, ThreadWakeup::new());
+
+        assert!(!pool.is_started());
+
+        let (resp, _resp_rx) = tokio::sync::oneshot::channel();
+        pool.submit(DecodeJob::InnerAudio {
+            id: 7,
+            data: Vec::new(),
+            resp,
+        });
+
+        assert!(pool.is_started());
+        assert!(result_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn worker_joins_share_one_total_deadline() {
+        let handles = vec![
+            thread::spawn(|| thread::sleep(Duration::from_secs(1))),
+            thread::spawn(|| thread::sleep(Duration::from_secs(1))),
+        ];
+        let started = std::time::Instant::now();
+
+        join_all_with_timeout(handles, Duration::from_millis(100), "test-worker");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(175),
+            "worker timeouts must share one total deadline"
+        );
     }
 }
