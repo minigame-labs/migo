@@ -122,8 +122,8 @@ use jni::{JNIEnv, JavaVM};
 use tracing::{error, info};
 
 use core::{
-    send_command_to_host, send_critical_command_to_host, set_surface_present, shutdown_host,
-    spawn_host_thread,
+    bump_destroy_epoch, current_destroy_epoch, send_command_to_host,
+    send_critical_command_to_host, shutdown_host, spawn_host_thread,
 };
 use shared::protocol::host_cmd::{
     BleCharacteristicData, HostCommand, TouchData, TouchPoint, TouchType,
@@ -270,8 +270,9 @@ pub(crate) extern "system" fn init(
         // ANativeWindow_fromSurface) via RAII now, so every early return below
         // releases it. Previously each error path between here and host spawn
         // leaked the ref.
-        let android_surface = match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) }
-        {
+        let android_surface = match unsafe {
+            AndroidSurfaceWrapper::from_surface_owned(window, w, h, 0)
+        } {
             Ok(s) => s,
             Err(e) => {
                 error!("init failed: create AndroidSurfaceWrapper error: {}", e);
@@ -471,8 +472,11 @@ pub(crate) extern "system" fn updateSurface<'local>(
             );
         }
 
+        // Stamp the surface with the current destroy-epoch so the render thread
+        // can tell, after it recreates, whether a newer destroy has since raced.
+        let surface_epoch = current_destroy_epoch(host_id);
         let android_surface =
-            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) } {
+            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h, surface_epoch) } {
                 Ok(s) => s,
                 Err(e) => {
                     error!(
@@ -485,7 +489,7 @@ pub(crate) extern "system" fn updateSurface<'local>(
 
         let surface_ref: SurfaceRef = Arc::new(android_surface);
 
-        // NOTE: surface_present is set true ONLY by the render thread after it
+        // NOTE: the render thread adopts this surface's epoch as its valid_epoch
         // recreates the onscreen surface (see render_thread.rs), never here.
         // Setting it true from JNI before the recreate ran would let the render
         // thread read `true` against the stale/abandoned surface (destroy->create
@@ -505,11 +509,11 @@ pub(crate) extern "system" fn updateSurface<'local>(
 
 pub(crate) extern "system" fn onSurfaceDestroyed(_env: JNIEnv, _class: JClass, host_id: jint) {
     jni_safe!("onSurfaceDestroyed", {
-        // Stop the render thread from presenting to the surface BEFORE this
-        // callback returns (Android abandons the BufferQueue on return). This is
-        // synchronous and queue-independent, so it takes effect even before the
-        // async SurfaceDestroyed command below is dequeued.
-        set_surface_present(host_id, false);
+        // Advance the destroy-epoch BEFORE this callback returns (Android
+        // abandons the BufferQueue on return). The render thread compares each
+        // frame and stops presenting to the now-stale surface synchronously and
+        // independent of the (async, lossy) SurfaceDestroyed command below.
+        bump_destroy_epoch(host_id);
         if let Err(e) = send_critical_command_to_host(host_id, HostCommand::SurfaceDestroyed) {
             error!("Failed to send SurfaceDestroyed for host {host_id}: {e}");
         }

@@ -1021,12 +1021,14 @@ impl RenderThread {
         // waiting for the next heartbeat tick. Decoupled from `HostCommand`
         // so the graphics crate stays independent of the host command enum.
         wake: Option<Arc<dyn Fn() + Send + Sync>>,
-        // Set false by the JNI/UI thread the instant Java's surfaceDestroyed()
-        // runs (before Android abandons the BufferQueue) and true on a new
-        // surface. Checked each frame to stop presenting to an abandoned surface
-        // synchronously, without waiting for the async SurfaceDestroyed command
-        // and independent of the render command queue.
-        surface_present: Arc<std::sync::atomic::AtomicBool>,
+        // Per-host surface destroy-epoch (monotonic), advanced by the JNI/UI
+        // thread on every surfaceDestroyed. Each SurfaceRef carries the epoch it
+        // was created at (Surface::surface_epoch); the render loop compares its
+        // current surface's epoch against this live counter every frame and stops
+        // presenting on any mismatch — synchronously and independent of the async
+        // SurfaceDestroyed command. A monotonic counter (vs a boolean) is required
+        // to survive fast destroy->create->destroy without ABA masking.
+        destroy_epoch: Arc<std::sync::atomic::AtomicU64>,
     ) -> EngineResult<Self> {
         let (cmd_tx, cmd_rx) = CommandSender::new();
         let (event_tx, event_rx) = shared::render_event::channel();
@@ -1113,6 +1115,13 @@ impl RenderThread {
                 let mut dirty = true;
                 let mut paused = false;
                 let mut surface_system = SurfaceSystem::new();
+                // Epoch of the surface the render thread currently holds. Compared
+                // against the live `destroy_epoch` each frame; a mismatch means the
+                // surface was destroyed after hand-off. Init 0 to match the initial
+                // surface's epoch and the destroy counter's initial value. `Cell`
+                // so the command-handling closures can update it via shared capture
+                // (they already borrow the environment) without a unique borrow.
+                let valid_epoch = std::cell::Cell::new(0u64);
                 if initial_onscreen_ok {
                     if let Some(size) = initial_surface_size {
                         surface_system.on_surface_available(size);
@@ -1216,22 +1225,49 @@ impl RenderThread {
                                 } => Some(surface.size()),
                                 _ => None,
                             };
+                            // Epoch stamped on the surface at updateSurface time —
+                            // becomes this render thread's valid_epoch once the
+                            // surface is successfully recreated.
+                            let recreate_surface_epoch = match &canvas_cmd {
+                                shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen {
+                                    surface,
+                                    ..
+                                } => Some(surface.surface_epoch()),
+                                _ => None,
+                            };
                             let affects_onscreen = match &canvas_cmd {
                                 shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen { .. } => true,
                                 shared::protocol::render_cmd::CanvasCmd::ResizeCanvas { id, .. } => *id == 1,
                                 _ => false,
                             };
+                            // If the incoming surface's destroy-epoch differs from the
+                            // one we currently hold, a surfaceDestroyed occurred since:
+                            // the old onscreen EGLSurface is bound to an abandoned
+                            // window. Force a full recreate so create_onscreen's
+                            // same-window fast paths can't keep presenting to the dead
+                            // surface. (Same epoch => a benign resize/redundant call,
+                            // where the fast path safely avoids an EGL re-connect.)
+                            if is_recreate {
+                                if let Some(e) = recreate_surface_epoch {
+                                    if e != valid_epoch.get() {
+                                        cm.force_next_onscreen_recreate();
+                                    }
+                                }
+                            }
                             match canvas_handler.handle_command(cm, canvas_cmd) {
                                 Ok(()) => {
                                     if is_recreate {
                                         if let Some(size) = recreate_surface_size {
                                             surface_system.on_surface_available(size);
-                                            // Allow presenting again only now that the render
-                                            // thread has actually recreated the onscreen surface.
-                                            // Set true ONLY here (never from JNI) so the flag can
-                                            // never read true against a stale/abandoned surface
-                                            // (avoids the destroy->create ABA on the boolean).
-                                            surface_present.store(true, std::sync::atomic::Ordering::Release);
+                                            // Adopt the recreated surface's epoch. From now on the
+                                            // present-gate compares this against the live destroy
+                                            // counter, so a destroy that raced this recreate (bumped
+                                            // the counter past this epoch) still stops presenting —
+                                            // no ABA, because a monotonic epoch can't read "equal"
+                                            // against a newer surface generation.
+                                            if let Some(e) = recreate_surface_epoch {
+                                                valid_epoch.set(e);
+                                            }
                                             info!(
                                                 width = size.0,
                                                 height = size.1,
@@ -1736,7 +1772,13 @@ impl RenderThread {
                     }
 
                     // Present the completed frame (only if we have a valid surface).
-                    let did_swap = if *dirty && should_present {
+                    // Re-check the surface epoch here, immediately before the swap:
+                    // the caller's gate ran before upload-drain / flush / RAF work,
+                    // and a surfaceDestroyed may have advanced the epoch since. This
+                    // closes the residual "check early, swap late" window.
+                    let surface_current =
+                        destroy_epoch.load(std::sync::atomic::Ordering::Acquire) == valid_epoch.get();
+                    let did_swap = if *dirty && should_present && surface_current {
                         let onscreen_id = shared::protocol::render_cmd::CanvasId::from(1u32);
                         let (canvas_w, canvas_h) = cm.get_canvas_size(onscreen_id).unwrap_or((0, 0));
                         let tracked_viewport = cm
@@ -1771,7 +1813,17 @@ impl RenderThread {
                         };
 
                         crate::atrace_scope!("migo.render.swap_buffers");
-                        let swap_ok = match cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
+                        // Final epoch re-check at the swap boundary: a surfaceDestroyed
+                        // may have raced the flush/damage work above. If stale, skip the
+                        // EGL swap entirely (the next present-gate iteration marks the
+                        // surface lost); presenting to the abandoned BufferQueue is the
+                        // one thing we must never do.
+                        let swap_ok = if destroy_epoch.load(std::sync::atomic::Ordering::Acquire)
+                            != valid_epoch.get()
+                        {
+                            false
+                        } else {
+                            match cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
                             Ok(resolved_damage) => {
                                 use crate::dirty_region::damage_tracker::ResolvedDamage;
                                 match resolved_damage {
@@ -1832,6 +1884,7 @@ impl RenderThread {
                                     });
                                 }
                                 false
+                            }
                             }
                         };
                         *dirty = false;
@@ -1946,11 +1999,12 @@ impl RenderThread {
                             }
 
                             // 2) Present frame and signal RAF.
-                            // JNI clears surface_present the instant Java's
-                            // surfaceDestroyed() runs; honor it here so we stop
-                            // presenting to an abandoned surface without waiting
+                            // If a surfaceDestroyed has occurred since our current
+                            // surface was handed off (live epoch moved past it),
+                            // stop presenting to it now — before Java returns and
+                            // Android abandons the BufferQueue — without waiting
                             // for the async SurfaceDestroyed command.
-                            if !surface_present.load(std::sync::atomic::Ordering::Acquire) {
+                            if destroy_epoch.load(std::sync::atomic::Ordering::Acquire) != valid_epoch.get() {
                                 surface_system.on_surface_destroyed();
                             }
                             present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, surface_system.can_present(), ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
@@ -2002,7 +2056,7 @@ impl RenderThread {
                             }
 
                             // 2) Present frame and signal RAF.
-                            if !surface_present.load(std::sync::atomic::Ordering::Acquire) {
+                            if destroy_epoch.load(std::sync::atomic::Ordering::Acquire) != valid_epoch.get() {
                                 surface_system.on_surface_destroyed();
                             }
                             let should_present = decision.should_signal_raf && surface_system.can_present();

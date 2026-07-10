@@ -206,6 +206,14 @@ pub(crate) struct CanvasManager {
     /// The next `create_onscreen()` call will perform a full resource rebuild.
     context_lost: bool,
 
+    /// One-shot: force the next `create_onscreen()` to fully tear down and
+    /// recreate the onscreen EGL surface, bypassing the same-window fast paths
+    /// (skip-recreate and fast-resize). Set by the render thread when a
+    /// surfaceDestroyed occurred (epoch advanced), because the previous
+    /// EGLSurface is bound to an abandoned ANativeWindow even if Android hands
+    /// back an equal window pointer/size. Consumed (cleared) on read.
+    force_onscreen_recreate: bool,
+
     /// Debug one-shot: when set (via `WEBGL_lose_context.loseContext()` ->
     /// `GLCmd::DebugLoseContext`), the next `check_graphics_reset_status()`
     /// poll reports a reset and consumes the flag, driving the exact same
@@ -602,6 +610,7 @@ impl CanvasManager {
             canvas2d_snapshot_read_fbo: None,
             last_swap_interval: -1, // force first eglSwapInterval call
             context_lost: false,
+            force_onscreen_recreate: false,
             simulated_reset: false,
             last_window: None,
             programs: HashMap::with_capacity(16),
@@ -701,6 +710,14 @@ impl CanvasManager {
         Ok(())
     }
 
+    /// Force the next `create_onscreen()` to fully recreate the onscreen EGL
+    /// surface, bypassing the same-window fast paths. Call before recreating
+    /// after a surfaceDestroyed (the old EGLSurface is bound to an abandoned
+    /// ANativeWindow even if the new window pointer/size compare equal).
+    pub(crate) fn force_next_onscreen_recreate(&mut self) {
+        self.force_onscreen_recreate = true;
+    }
+
     /// Create or recreate the onscreen canvas (id=1).
     ///
     /// `surface_size`: expected physical dimensions from the SurfaceRef.
@@ -730,19 +747,27 @@ impl CanvasManager {
 
         let id = CanvasId::from(1u32);
 
+        // Consume the force flag: when set (a surfaceDestroyed occurred), skip
+        // both same-window fast paths below and fall through to a full teardown +
+        // recreate, since the existing EGLSurface is bound to an abandoned window
+        // even if `window`/size compare equal.
+        let force_recreate = std::mem::take(&mut self.force_onscreen_recreate);
+
         // Same native window + same physical dimensions → skip destroy-recreate.
-        if let Some((exp_w, exp_h)) = surface_size {
-            if let Some(entry) = self.canvases.get(&id) {
-                if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
-                    && entry.physical_width == exp_w
-                    && entry.physical_height == exp_h
-                {
-                    tracing::info!(
-                        "CanvasManager::create_onscreen skip recreate: window unchanged and size matched {}x{}",
-                        exp_w,
-                        exp_h
-                    );
-                    return Ok(());
+        if !force_recreate {
+            if let Some((exp_w, exp_h)) = surface_size {
+                if let Some(entry) = self.canvases.get(&id) {
+                    if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
+                        && entry.physical_width == exp_w
+                        && entry.physical_height == exp_h
+                    {
+                        tracing::info!(
+                            "CanvasManager::create_onscreen skip recreate: window unchanged and size matched {}x{}",
+                            exp_w,
+                            exp_h
+                        );
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -764,22 +789,24 @@ impl CanvasManager {
         //     — EGLSurface is bound to the ANativeWindow that's
         //     gone);
         //   * there is no existing 2D context (first frame).
-        if let Some((exp_w, exp_h)) = surface_size {
-            if let Some(entry) = self.canvases.get(&id) {
-                if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
-                    && self.contexts_2d.contains_key(&id)
-                {
-                    tracing::info!(
-                        "CanvasManager::create_onscreen fast resize {}x{} -> {}x{} (same window 0x{window:x})",
-                        entry.physical_width,
-                        entry.physical_height,
-                        exp_w,
-                        exp_h,
-                    );
-                    // `resize_canvas` takes `Option<u32>` per-dim so the
-                    // caller can signal "don't change this axis" with `None`.
-                    // Always pass the full new size here.
-                    return self.resize_canvas(id, Some(exp_w), Some(exp_h));
+        if !force_recreate {
+            if let Some((exp_w, exp_h)) = surface_size {
+                if let Some(entry) = self.canvases.get(&id) {
+                    if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
+                        && self.contexts_2d.contains_key(&id)
+                    {
+                        tracing::info!(
+                            "CanvasManager::create_onscreen fast resize {}x{} -> {}x{} (same window 0x{window:x})",
+                            entry.physical_width,
+                            entry.physical_height,
+                            exp_w,
+                            exp_h,
+                        );
+                        // `resize_canvas` takes `Option<u32>` per-dim so the
+                        // caller can signal "don't change this axis" with `None`.
+                        // Always pass the full new size here.
+                        return self.resize_canvas(id, Some(exp_w), Some(exp_h));
+                    }
                 }
             }
         }

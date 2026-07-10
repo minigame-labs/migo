@@ -53,14 +53,13 @@ impl RenderService {
         context_lost: std::sync::Arc<shared::op_state::ContextLostState>,
         wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) -> EngineResult<Self> {
-        // Surface-present flag: written by the JNI/UI thread (false the instant
-        // Java's surfaceDestroyed() runs, true on a new surface) and read by the
-        // render thread each frame so it stops presenting to an abandoned surface
-        // synchronously, closing the swap-on-abandoned-surface race. Init true —
-        // this service is constructed with a live surface.
-        let surface_present =
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        crate::runtime::registry::register_surface_flag(host_id, surface_present.clone());
+        // Per-host surface destroy-epoch: bumped by JNI on surfaceDestroyed,
+        // captured onto each new SurfaceRef at updateSurface time, and compared
+        // by the render thread every frame so it stops presenting to a surface
+        // that was torn down after hand-off (queue-independent, ABA-proof).
+        // Init 0 — the initial surface (below) is stamped epoch 0 to match.
+        let destroy_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        crate::runtime::registry::register_destroy_epoch(host_id, destroy_epoch.clone());
 
         let thread = RenderThread::spawn(
             raf_tx,
@@ -72,7 +71,7 @@ impl RenderService {
             gpu_caps,
             context_lost,
             wake,
-            surface_present,
+            destroy_epoch,
         )?;
         // Apply the host's configured target FPS to the render thread immediately
         // so the first vsync tick already runs at the right cadence.

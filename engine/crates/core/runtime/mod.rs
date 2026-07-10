@@ -14,6 +14,7 @@ pub mod vsync;
 pub mod watchdog;
 
 pub use registry::{
-    send_command_to_host, send_critical_command_to_host, set_surface_present, shutdown_host,
+    bump_destroy_epoch, current_destroy_epoch, send_command_to_host, send_critical_command_to_host,
+    shutdown_host,
 };
 pub use thread::spawn_host_thread;

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicI32, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     },
 };
 
@@ -28,40 +28,53 @@ fn host_senders() -> &'static RwLock<HashMap<HostId, HostHandle>> {
     HOST_SENDERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Per-host "onscreen surface is present" flag, shared with the render thread.
+/// Per-host monotonic surface destroy-epoch, shared with the render thread.
 ///
-/// Written ONLY by the JNI/UI thread (false in `onSurfaceDestroyed` *before*
-/// the callback returns and Android abandons the BufferQueue; true in
-/// `updateSurface`). Read by the render thread each frame, AND-ed with its own
-/// `can_present()` gate, so it stops `eglSwapBuffers` on the abandoned surface
-/// immediately — without waiting for the async `SurfaceDestroyed` command to be
-/// dequeued (which closes the one-frame swap-on-abandoned-surface race) and
-/// independent of the render command queue's fullness.
-static SURFACE_FLAGS: OnceLock<RwLock<HashMap<HostId, Arc<AtomicBool>>>> = OnceLock::new();
+/// Incremented by the JNI/UI thread on every `onSurfaceDestroyed` (before the
+/// callback returns and Android abandons the BufferQueue). Each new surface
+/// captures the counter value at `updateSurface` time (stored on the SurfaceRef
+/// via `Surface::surface_epoch`). The render thread compares its current
+/// surface's epoch against this live counter every frame; any mismatch means a
+/// destroy occurred after that surface was handed off, so it stops presenting
+/// immediately — synchronously, and independent of the (lossy, async) command
+/// queue. A monotonic counter (not a boolean) is required so a fast
+/// destroy->create->destroy can't be masked by an intervening value (ABA).
+static DESTROY_EPOCHS: OnceLock<RwLock<HashMap<HostId, Arc<AtomicU64>>>> = OnceLock::new();
 
 #[inline]
-fn surface_flags() -> &'static RwLock<HashMap<HostId, Arc<AtomicBool>>> {
-    SURFACE_FLAGS.get_or_init(|| RwLock::new(HashMap::new()))
+fn destroy_epochs() -> &'static RwLock<HashMap<HostId, Arc<AtomicU64>>> {
+    DESTROY_EPOCHS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Register a host's surface-present flag (created by the render service and
-/// shared with the render thread). Returns the previous flag if any.
-pub(crate) fn register_surface_flag(id: HostId, flag: Arc<AtomicBool>) -> Option<Arc<AtomicBool>> {
-    surface_flags().write().insert(id, flag)
+/// Register a host's destroy-epoch counter (created by the render service and
+/// shared with the render thread). Returns the previous counter if any.
+pub(crate) fn register_destroy_epoch(id: HostId, epoch: Arc<AtomicU64>) -> Option<Arc<AtomicU64>> {
+    destroy_epochs().write().insert(id, epoch)
 }
 
-/// Remove a host's surface-present flag (on shutdown).
-pub(crate) fn unregister_surface_flag(id: HostId) -> Option<Arc<AtomicBool>> {
-    surface_flags().write().remove(&id)
+/// Remove a host's destroy-epoch counter (on shutdown).
+pub(crate) fn unregister_destroy_epoch(id: HostId) -> Option<Arc<AtomicU64>> {
+    destroy_epochs().write().remove(&id)
 }
 
-/// Set a host's surface-present flag. Called from JNI on surface create/destroy
-/// so the render thread stops/starts presenting synchronously with the Java
-/// SurfaceView lifecycle. No-op if the host has no registered flag yet.
-pub fn set_surface_present(host_id: HostId, present: bool) {
-    if let Some(flag) = surface_flags().read().get(&host_id) {
-        flag.store(present, Ordering::Release);
+/// Advance a host's destroy-epoch. Called from JNI on `onSurfaceDestroyed` so
+/// the render thread stops presenting to the surface being torn down. No-op if
+/// the host has no registered counter yet.
+pub fn bump_destroy_epoch(host_id: HostId) {
+    if let Some(epoch) = destroy_epochs().read().get(&host_id) {
+        epoch.fetch_add(1, Ordering::AcqRel);
     }
+}
+
+/// Read a host's current destroy-epoch. Called from JNI on `updateSurface` to
+/// stamp the new surface with the epoch it corresponds to. Returns 0 if the
+/// host has no registered counter yet (matches the render thread's init value).
+pub fn current_destroy_epoch(host_id: HostId) -> u64 {
+    destroy_epochs()
+        .read()
+        .get(&host_id)
+        .map(|e| e.load(Ordering::Acquire))
+        .unwrap_or(0)
 }
 
 pub(crate) fn alloc_host_id() -> HostId {
