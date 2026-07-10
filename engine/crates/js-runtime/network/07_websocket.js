@@ -61,6 +61,17 @@ class SocketTask {
             return;
         }
 
+        if (this._rid < 0) {
+            // Handshake has not produced a rid yet. Mark closed so the
+            // pending connect (connectSocket) tears down the socket it is
+            // about to create, instead of leaving a live ghost connection.
+            this._closed = true;
+            const res = { errMsg: "closeSocket:ok" };
+            if (typeof success === 'function') success(res);
+            if (typeof complete === 'function') complete(res);
+            return;
+        }
+
         op_ws_close(this._rid, code, reason).then(() => {
             const res = { errMsg: "closeSocket:ok" };
             if (typeof success === 'function') success(res);
@@ -205,8 +216,16 @@ function connectSocket(options = {}) {
     // Async connection
     (async () => {
         try {
-            const result = await op_ws_create(url, protocols, headerList);
+            const result = await op_ws_create(url, protocols, headerList, timeout);
             task._rid = result.rid;
+
+            // close() may have run while the handshake was in flight; if so,
+            // tear down the freshly-created socket rather than leaving a
+            // live ghost connection the caller believes is closed.
+            if (task._closed) {
+                core.tryClose(result.rid);
+                return;
+            }
 
             const res = { errMsg: "connectSocket:ok" };
             if (typeof success === 'function') success(res);
@@ -222,6 +241,9 @@ function connectSocket(options = {}) {
             await _pollEvents(task);
 
         } catch (err) {
+            // If close() already ran (e.g. connect failed after the caller
+            // closed), stay silent: no post-close fail/onError/onClose.
+            if (task._closed) return;
             const res = { errMsg: "connectSocket:fail " + (err.message || err) };
             if (typeof fail === 'function') fail(res);
             if (typeof complete === 'function') complete(res);

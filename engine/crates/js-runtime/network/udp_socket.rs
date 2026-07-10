@@ -28,7 +28,7 @@ use shared::op_state::HostOpState;
 use tokio::net::UdpSocket;
 use tracing::debug;
 
-use super::common::{BACKGROUND_THROTTLE, addr_family, resolve_first};
+use super::common::{BACKGROUND_THROTTLE, addr_family, checked_port, join_host_port, resolve_first};
 
 // -- Resource --
 
@@ -111,7 +111,7 @@ pub fn op_udp_bind(
     #[smi] port: u32,
     #[string] socket_type: String,
 ) -> Result<UdpBindResult, JsErrorBox> {
-    let port = port as u16;
+    let port = checked_port(port)?;
     let is_v6 = socket_type == "udp6";
 
     let bind_addr: SocketAddr = if is_v6 {
@@ -169,7 +169,7 @@ pub async fn op_udp_connect(
     #[string] address: String,
     #[smi] port: u32,
 ) -> Result<(), JsErrorBox> {
-    let port = port as u16;
+    let port = checked_port(port)?;
     {
         let st = state.borrow();
         super::gate::enforce_host_from_state(
@@ -185,7 +185,7 @@ pub async fn op_udp_connect(
         .get::<UdpSocketResource>(rid)
         .map_err(|_| JsErrorBox::generic("UDPSocket not found"))?;
 
-    let addr_str = format!("{}:{}", address, port);
+    let addr_str = join_host_port(&address, port);
     debug!("UDP connect: rid={}, target={}", rid, addr_str);
     let sock_addr = resolve_first(&addr_str)
         .await
@@ -219,7 +219,7 @@ pub async fn op_udp_send(
     #[smi] length: u32,
     set_broadcast: bool,
 ) -> Result<(), JsErrorBox> {
-    let port = port as u16;
+    let port = checked_port(port)?;
     // Broadcast is refused outright: the destination address filter
     // already blocks 255.255.255.255 and every multicast/link-local
     // range, so a `set_broadcast` flag has no legitimate target and
@@ -246,7 +246,7 @@ pub async fn op_udp_send(
         .get::<UdpSocketResource>(rid)
         .map_err(|_| JsErrorBox::generic("UDPSocket not found"))?;
 
-    let addr_str = format!("{}:{}", address, port);
+    let addr_str = join_host_port(&address, port);
     debug!("UDP send: rid={}, target={}", rid, addr_str);
     // `resolve_first` runs the shared `address_filter` on every DNS
     // answer, which now covers multicast, documentation, benchmarking
@@ -345,8 +345,12 @@ pub async fn op_udp_next_event(
 
         let socket = RcRef::map(&resource, |r| &r.socket).borrow().await;
 
-        // 4096 bytes max per UDP message
-        let mut buf = vec![0u8; 4096];
+        // A single recv must be able to hold a whole datagram: the
+        // kernel delivers a UDP datagram in one recv and silently
+        // discards any bytes past the buffer end (no truncation flag on
+        // a plain recv_from). The max UDP payload is 65507 (IPv4) /
+        // 65527 (IPv6), so size the buffer to 64 KiB to never lose data.
+        let mut buf = vec![0u8; 65536];
 
         match socket.recv_from(&mut buf).await {
             Ok((n, peer)) => {

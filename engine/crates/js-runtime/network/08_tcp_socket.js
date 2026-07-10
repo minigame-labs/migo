@@ -44,6 +44,13 @@ class TCPSocket {
         (async () => {
             try {
                 const result = await op_tcp_connect(address, port, timeout);
+                if (this._closed) {
+                    // close() ran while the connect was in flight; tear down
+                    // the freshly-created socket instead of leaving a leaked
+                    // (ghost) connection the caller believes is closed.
+                    try { op_tcp_close(result.rid); } catch (_) { /* ignore */ }
+                    return;
+                }
                 this._rid = result.rid;
                 this._connected = true;
 
@@ -65,6 +72,9 @@ class TCPSocket {
                 await this._pollEvents();
 
             } catch (err) {
+                // If close() already ran (e.g. connect failed after the
+                // caller closed), stay silent: no post-close onError/onClose.
+                if (this._closed) return;
                 this._fireError(err.message || 'connect:fail unknown error');
                 this._doClose();
             }
@@ -208,8 +218,12 @@ class TCPSocket {
                     break;
                 }
                 case 'error':
+                    // A read error on a TCP stream is terminal: the
+                    // connection is broken, so fire onError then close
+                    // (onClose follows) instead of re-polling a dead fd.
                     this._fireError(event.errMsg);
-                    break;
+                    this._doClose();
+                    return;
                 case 'close':
                     this._doClose();
                     return;

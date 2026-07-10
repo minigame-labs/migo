@@ -29,7 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
 
-use super::common::{BACKGROUND_THROTTLE, addr_family, resolve_first};
+use super::common::{BACKGROUND_THROTTLE, addr_family, checked_port, join_host_port, resolve_first};
 
 // ── Resource ──
 
@@ -125,7 +125,7 @@ pub async fn op_tcp_connect(
     #[smi] port: u32,
     #[smi] timeout_secs: u32,
 ) -> Result<TcpConnectResult, JsErrorBox> {
-    let port = port as u16;
+    let port = checked_port(port)?;
     let timeout = if timeout_secs == 0 {
         2
     } else {
@@ -150,7 +150,7 @@ pub async fn op_tcp_connect(
 
     // Resolve address — supports both IP and hostname.
     // tokio::net::lookup_host handles DNS resolution asynchronously.
-    let addr_str = format!("{}:{}", address, port);
+    let addr_str = join_host_port(&address, port);
     let sock_addr = tokio::time::timeout(
         std::time::Duration::from_secs(timeout as u64),
         resolve_first(&addr_str),

@@ -164,6 +164,22 @@ fn scheme_allowed(kind: GateKind, scheme: &str) -> bool {
     }
 }
 
+/// True if `host` is permitted by the domain whitelist. An empty
+/// whitelist means "allow all" (dev / first-boot behaviour). A non-empty
+/// list matches an exact host or any subdomain of a listed domain
+/// (`cdn.mygame.com` is allowed by `mygame.com`, but `evilmygame.com`
+/// is not). Shared by [`evaluate_policy`] and the DNS-prefetch op so
+/// prefetch can't warm the resolver for off-whitelist hosts.
+pub(crate) fn is_host_whitelisted(host: &str, policy: &NetworkPolicy) -> bool {
+    if policy.domain_whitelist.is_empty() {
+        return true;
+    }
+    policy
+        .domain_whitelist
+        .iter()
+        .any(|allowed| host == allowed.as_str() || host.ends_with(&format!(".{allowed}")))
+}
+
 /// Pure, side-effect-free policy evaluator.
 ///
 /// Returns `Ok(())` iff every rule applicable to `kind` passes.
@@ -206,19 +222,10 @@ pub(crate) fn evaluate_policy(
     // 4. Domain whitelist. Empty whitelist means "allow all" (dev /
     //    first-boot behaviour — a dedicated warning path is the
     //    caller's responsibility and lives in `enforce_from_state`).
-    if !policy.domain_whitelist.is_empty() {
-        let mut matched = false;
-        for allowed in &policy.domain_whitelist {
-            if host == allowed.as_str() || host.ends_with(&format!(".{allowed}")) {
-                matched = true;
-                break;
-            }
-        }
-        if !matched {
-            return Err(GateReject::NotWhitelisted {
-                host: host.to_string(),
-            });
-        }
+    if !is_host_whitelisted(host, policy) {
+        return Err(GateReject::NotWhitelisted {
+            host: host.to_string(),
+        });
     }
 
     // 5. HTTPS enforcement. For HTTP kinds, reject `http://`.

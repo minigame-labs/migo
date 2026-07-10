@@ -23,7 +23,7 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 
-use super::common::BACKGROUND_THROTTLE;
+use super::common::{BACKGROUND_THROTTLE, join_host_port};
 use super::gate::{GateKind, enforce_from_state};
 
 type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -42,6 +42,23 @@ fn build_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfi
         .max_frame_size(Some(WS_MAX_FRAME_BYTES))
         .write_buffer_size(WS_WRITE_BUFFER_BYTES)
         .max_write_buffer_size(WS_MAX_WRITE_BUFFER_BYTES)
+}
+
+/// Handshake-critical headers the client must control itself. If game JS
+/// supplied these they'd corrupt the upgrade (or override the subprotocol
+/// negotiated via the `protocols` argument), so they're dropped. Names
+/// compare against `HeaderName::as_str()`, which is always lowercase.
+fn is_reserved_ws_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "upgrade"
+            | "sec-websocket-key"
+            | "sec-websocket-version"
+            | "sec-websocket-accept"
+            | "sec-websocket-protocol"
+            | "sec-websocket-extensions"
+    )
 }
 
 // ── Resource ──
@@ -106,11 +123,30 @@ pub async fn op_ws_create(
     #[string] url: String,
     #[serde] protocols: Vec<String>,
     #[serde] headers: Vec<(String, String)>,
+    #[smi] timeout_ms: Option<u32>,
 ) -> Result<WsCreateResult, JsErrorBox> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let connect_started = std::time::Instant::now();
     debug!("WebSocket connect: {}", url);
+
+    // Single deadline for the whole connect (DNS + TCP + TLS/WS
+    // handshake). Previously only the handshake was bounded (30s) while
+    // DNS and TCP connect could hang until the OS SYN timeout, and the
+    // JS-supplied `timeout` was dropped entirely.
+    //
+    // `Option` (not a bare u32) is deliberate: a stale V8 snapshot whose
+    // baked JS still calls the old 3-arg op_ws_create passes no 4th arg.
+    // deno_core coerces a missing `Option` smi to `None`, whereas a
+    // missing *required* smi throws (Smi::from_v8 -> to_i32_option ->
+    // None -> BadType). So `Option` lets an un-regenerated snapshot fall
+    // back to the default timeout instead of breaking WebSocket connect.
+    // None or 0 => 60s.
+    let connect_timeout = std::time::Duration::from_millis(match timeout_ms {
+        Some(ms) if ms > 0 => ms as u64,
+        _ => 60_000,
+    });
+    let deadline = tokio::time::Instant::now() + connect_timeout;
 
     // Parse once and run the shared network-policy gate BEFORE we
     // do anything network-visible (DNS, TLS, TCP connect). The gate
@@ -131,19 +167,21 @@ pub async fn op_ws_create(
     let scheme = request.uri().scheme_str().unwrap_or("");
 
     // SSRF prevention: resolve DNS, check ALL addresses, then connect
-    // to the verified address directly.  This eliminates the double-
+    // to a verified address directly.  This eliminates the double-
     // resolution TOCTOU window — we connect the TcpStream ourselves
     // and hand it to the WebSocket handshake layer.
-    let connect_addr = if let Some(host) = request.uri().host() {
+    let connect_addrs: Vec<std::net::SocketAddr> = if let Some(host) = request.uri().host() {
         let port = request
             .uri()
             .port_u16()
             .unwrap_or(if scheme == "wss" { 443 } else { 80 });
-        let addr_str = format!("{}:{}", host, port);
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr_str)
-            .await
-            .map_err(|e| JsErrorBox::generic(format!("WebSocket DNS resolve failed: {}", e)))?
-            .collect();
+        let addr_str = join_host_port(host, port);
+        let addrs: Vec<std::net::SocketAddr> =
+            tokio::time::timeout_at(deadline, tokio::net::lookup_host(&addr_str))
+                .await
+                .map_err(|_| JsErrorBox::generic("WebSocket DNS resolve timeout"))?
+                .map_err(|e| JsErrorBox::generic(format!("WebSocket DNS resolve failed: {}", e)))?
+                .collect();
         if addrs.is_empty() {
             return Err(JsErrorBox::generic(
                 "WebSocket DNS resolve returned no addresses",
@@ -157,18 +195,28 @@ pub async fn op_ws_create(
                 )));
             }
         }
-        addrs[0]
+        addrs
     } else {
         return Err(JsErrorBox::generic("WebSocket URL has no host"));
     };
 
-    // Add custom headers
+    // Add custom headers — same filtering as fetch so a game can't
+    // inject Host (vhost/routing bypass), proxy/forwarding headers
+    // (SSRF amplification, credential leak) or the handshake-critical
+    // WebSocket headers (which would corrupt the upgrade). Blocked
+    // headers are dropped silently, matching fetch's behaviour.
     let req_headers = request.headers_mut();
     for (key, value) in &headers {
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(key.as_bytes()),
             HeaderValue::from_str(value),
         ) {
+            if name.as_str() == "host"
+                || crate::network::fetch::is_blocked_header(&name)
+                || is_reserved_ws_header(&name)
+            {
+                continue;
+            }
             req_headers.insert(name, val);
         }
     }
@@ -181,10 +229,28 @@ pub async fn op_ws_create(
         }
     }
 
-    // Connect TCP to the verified address (no second DNS resolution).
-    let tcp_stream = tokio::net::TcpStream::connect(connect_addr)
-        .await
-        .map_err(|e| JsErrorBox::generic(format!("WebSocket TCP connect failed: {}", e)))?;
+    // Connect TCP, trying each verified address in turn within the
+    // shared deadline. A dual-stack / multi-A host may list a dead
+    // address first (e.g. an unreachable IPv6); connecting only to
+    // addrs[0] would fail even when a later address works.
+    let mut tcp_stream = None;
+    let mut last_err = String::from("no address");
+    for addr in &connect_addrs {
+        match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(*addr)).await {
+            Ok(Ok(s)) => {
+                tcp_stream = Some(s);
+                break;
+            }
+            Ok(Err(e)) => last_err = e.to_string(),
+            Err(_) => {
+                // Deadline hit: stop trying further addresses.
+                last_err = "timeout".to_string();
+                break;
+            }
+        }
+    }
+    let tcp_stream = tcp_stream
+        .ok_or_else(|| JsErrorBox::generic(format!("WebSocket TCP connect failed: {}", last_err)))?;
     let _ = tcp_stream.set_nodelay(true);
 
     // Explicit WebSocket limits: tungstenite's defaults are 64 MiB
@@ -199,11 +265,10 @@ pub async fn op_ws_create(
     // the hostname from the request URI for SNI — no second DNS lookup.
     let handshake_fut =
         tokio_tungstenite::client_async_tls_with_config(request, tcp_stream, Some(ws_cfg), None);
-    let (ws_stream, response) =
-        tokio::time::timeout(std::time::Duration::from_secs(30), handshake_fut)
-            .await
-            .map_err(|_| JsErrorBox::generic("WebSocket handshake timeout"))?
-            .map_err(|e| JsErrorBox::generic(format!("WebSocket handshake failed: {}", e)))?;
+    let (ws_stream, response) = tokio::time::timeout_at(deadline, handshake_fut)
+        .await
+        .map_err(|_| JsErrorBox::generic("WebSocket handshake timeout"))?
+        .map_err(|e| JsErrorBox::generic(format!("WebSocket handshake failed: {}", e)))?;
 
     let protocol = response
         .headers()

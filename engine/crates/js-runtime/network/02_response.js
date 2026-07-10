@@ -37,6 +37,14 @@ class ResponseBase {
         return this._exception;
     }
 
+    // Callbacks receive this instance directly (not toJSON output), so
+    // the wx-standard `res.errMsg` must be a live getter, not just a
+    // toJSON field. Same reason header/errno getters exist on the
+    // subclasses below.
+    get errMsg() {
+        return this._errMsg;
+    }
+
     toJSON() {
         return {
             useHttpDNS: this._useHttpDNS,
@@ -70,6 +78,10 @@ class Response extends ResponseBase {
         return this._header?.statusCode;
     }
 
+    get header() {
+        return this._header?.headers;
+    }
+
     get cookies() {
         return this._header?.cookies;
     }
@@ -87,6 +99,10 @@ class ErrorResponse extends ResponseBase {
     constructor(errno, exception) {
         super(false, requestFailMsg, exception);
         this._errno = errno;
+    }
+
+    get errno() {
+        return this._errno;
     }
 
     toJSON() {
@@ -146,6 +162,10 @@ class DownloadErrorResponse extends ResponseBase {
         this._errno = errno;
     }
 
+    get errno() {
+        return this._errno;
+    }
+
     toJSON() {
         return {
             ...super.toJSON(),
@@ -187,6 +207,10 @@ class UploadErrorResponse extends ResponseBase {
     constructor(errno, exception) {
         super(false, uploadFailMsg, exception);
         this._errno = errno;
+    }
+
+    get errno() {
+        return this._errno;
     }
 
     toJSON() {

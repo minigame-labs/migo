@@ -65,7 +65,9 @@ use crate::network::Options;
 
 /// Headers that game JS must not inject — these can amplify SSRF,
 /// bypass reverse proxies, or leak internal routing information.
-fn is_blocked_header(name: &HeaderName) -> bool {
+/// Shared with the WebSocket op so raw `new WebSocket(url, ...)` headers
+/// get the same filtering as `fetch`.
+pub(crate) fn is_blocked_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
         "x-forwarded-for"
