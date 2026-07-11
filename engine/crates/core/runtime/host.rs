@@ -106,6 +106,9 @@ pub(crate) struct Host {
     /// Shared flag: `true` while the app is backgrounded (OnHide).
     /// Network polling ops check this to throttle CPU usage.
     backgrounded: Arc<AtomicBool>,
+    /// Shared timer lifecycle level. It remains hidden until OnShow is
+    /// delivered to JS, including the deferred-Surface path.
+    timer_backgrounded: Arc<AtomicBool>,
     /// Shared flag mirrored into `HostOpState.context_lost`: set `true`
     /// between a render `ContextLost` and a successful `ContextRecovered`
     /// so JS `gl.isContextLost()` reflects reality.
@@ -281,6 +284,7 @@ impl Host {
         };
 
         let backgrounded = Arc::new(AtomicBool::new(false));
+        let timer_backgrounded = Arc::new(AtomicBool::new(false));
         let webgl_context_created = Arc::new(AtomicBool::new(false));
         // `context_lost` was created above (before the render thread, which is
         // its authoritative writer).
@@ -307,6 +311,7 @@ impl Host {
             workers_path: init_options.workers_path().map(|s| s.to_string()),
             network_policy: network_policy.clone(),
             backgrounded: backgrounded.clone(),
+            timer_backgrounded: timer_backgrounded.clone(),
             webgl_context_created: webgl_context_created.clone(),
             context_lost: context_lost.clone(),
             #[cfg(feature = "code-signing")]
@@ -410,6 +415,7 @@ impl Host {
             last_game_id: None,
             last_entry: None,
             backgrounded,
+            timer_backgrounded,
             context_lost,
             last_dispatched_context_lost: false,
             last_context_epoch: 0,
@@ -599,6 +605,7 @@ impl Host {
                     // render/audio and fire onShow now; otherwise the app would
                     // stay frozen and onShow would never fire.
                     self.enter_foreground();
+                    self.js.set_timer_backgrounded(false);
                     let _ = self.js.exec_script("onshow", &script);
                 } else {
                     // Android fires Activity.onResume before surfaceCreated: the
@@ -621,10 +628,12 @@ impl Host {
                 self.audio.pause();
                 self.pending_on_show_script = None;
 
-                self.js.exec_script(
+                let result = self.js.exec_script(
                     "onhide",
                     &format!("{HOST_BRIDGE_EXPR}._internalTriggerOnHide()"),
-                )
+                );
+                self.js.set_timer_backgrounded(true);
+                result
             }
 
             HostCommand::OnAudioInterruptionBegin => self.js.exec_script(
@@ -1073,6 +1082,7 @@ impl Host {
             if !self.backgrounded.load(Ordering::Relaxed) {
                 self.enter_foreground();
                 if let Some(script) = self.pending_on_show_script.take() {
+                    self.js.set_timer_backgrounded(false);
                     let _ = self.js.exec_script("onshow", &script);
                 }
             }
@@ -1111,6 +1121,7 @@ impl Host {
             workers_path: self.init_options.workers_path().map(|s| s.to_string()),
             network_policy: self.network_policy.clone(),
             backgrounded: self.backgrounded.clone(),
+            timer_backgrounded: self.timer_backgrounded.clone(),
             webgl_context_created: Arc::new(AtomicBool::new(false)),
             context_lost: self.context_lost.clone(),
             #[cfg(feature = "code-signing")]

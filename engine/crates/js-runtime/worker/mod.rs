@@ -27,11 +27,41 @@ pub(crate) enum WorkerMessage {
     Terminate,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WorkerTimerLifecycleTransition {
+    backgrounded: bool,
+    occurred_at: tokio::time::Instant,
+}
+
+impl WorkerTimerLifecycleTransition {
+    fn now(backgrounded: bool) -> Self {
+        Self {
+            backgrounded,
+            occurred_at: tokio::time::Instant::now(),
+        }
+    }
+}
+
+/// Typed events delivered only to the worker's internal message pump.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub(crate) enum WorkerInbound {
+    Message {
+        data: String,
+    },
+    Lifecycle {
+        backgrounded: bool,
+        #[serde(rename = "elapsedMicros")]
+        elapsed_micros: u64,
+    },
+}
+
 /// Stored in the **main** thread's `OpState` when a worker is active.
 pub(crate) struct WorkerHandle {
     tx_to_worker: mpsc::UnboundedSender<WorkerMessage>,
     rx_from_worker: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>>,
     rx_errors: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>>,
+    timer_backgrounded_tx: mpsc::UnboundedSender<WorkerTimerLifecycleTransition>,
     #[allow(dead_code)]
     join_handle: Option<std::thread::JoinHandle<()>>,
     terminated: bool,
@@ -76,6 +106,8 @@ pub(crate) struct WorkerCtx {
     tx_to_main: mpsc::UnboundedSender<String>,
     tx_errors: mpsc::UnboundedSender<String>,
     rx_from_main: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<WorkerMessage>>>,
+    timer_backgrounded_rx:
+        Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<WorkerTimerLifecycleTransition>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -262,14 +294,12 @@ async fn op_worker_create(
             match st.try_borrow::<WorkerHandle>() {
                 None => false,
                 Some(h) => {
-                    let finished =
-                        h.join_handle.as_ref().map_or(true, |jh| jh.is_finished());
+                    let finished = h.join_handle.as_ref().map_or(true, |jh| jh.is_finished());
                     if h.terminated && finished {
                         true
                     } else {
                         return Err(WorkerError::Message(
-                            "Only one worker can exist at a time. Call terminate() first."
-                                .into(),
+                            "Only one worker can exist at a time. Call terminate() first.".into(),
                         ));
                     }
                 }
@@ -335,6 +365,7 @@ async fn op_worker_create(
             workers_path: host.workers_path.clone(),
             network_policy: host.network_policy.clone(),
             backgrounded: host.backgrounded.clone(),
+            timer_backgrounded: host.timer_backgrounded.clone(),
             webgl_context_created: host.webgl_context_created.clone(),
             context_lost: host.context_lost.clone(),
             code_signing_enabled: host.code_signing_enabled,
@@ -348,11 +379,13 @@ async fn op_worker_create(
     let (tx_main_to_worker, rx_main_to_worker) = mpsc::unbounded_channel::<WorkerMessage>();
     let (tx_worker_to_main, rx_worker_to_main) = mpsc::unbounded_channel::<String>();
     let (tx_worker_errors, rx_worker_errors) = mpsc::unbounded_channel::<String>();
+    let (timer_backgrounded_tx, timer_backgrounded_rx) = mpsc::unbounded_channel();
 
     let worker_ctx = WorkerCtx {
         tx_to_main: tx_worker_to_main,
         tx_errors: tx_worker_errors,
         rx_from_main: Arc::new(tokio::sync::Mutex::new(rx_main_to_worker)),
+        timer_backgrounded_rx: Arc::new(tokio::sync::Mutex::new(timer_backgrounded_rx)),
     };
 
     // Shared slot the worker thread fills with its isolate handle once its
@@ -381,6 +414,7 @@ async fn op_worker_create(
         tx_to_worker: tx_main_to_worker,
         rx_from_worker: Arc::new(tokio::sync::Mutex::new(rx_worker_to_main)),
         rx_errors: Arc::new(tokio::sync::Mutex::new(rx_worker_errors)),
+        timer_backgrounded_tx,
         join_handle: Some(join_handle),
         terminated: false,
         isolate_handle,
@@ -543,24 +577,11 @@ fn op_worker_inner_post_message(
         .map_err(|_| WorkerError::Message("Main thread channel closed".into()))
 }
 
-/// Async op: wait for a message from the main thread.
-/// Returns `None` when a Terminate signal is received.
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_worker_inner_recv_message(
-    state: Rc<RefCell<OpState>>,
-) -> Result<Option<String>, WorkerError> {
-    let rx = {
-        let st = state.borrow();
-        st.borrow::<WorkerCtx>().rx_from_main.clone()
-    };
-
-    info!("[Worker] worker waiting for main message...");
-    let mut guard = rx.lock().await;
-    match guard.recv().await {
+fn worker_message_to_inbound(message: Option<WorkerMessage>) -> Option<WorkerInbound> {
+    match message {
         Some(WorkerMessage::Message(json)) => {
             info!("[Worker] worker received from main: {} bytes", json.len());
-            Ok(Some(json))
+            Some(WorkerInbound::Message { data: json })
         }
         Some(WorkerMessage::Binary(data)) => {
             // Encode binary as JSON with base64 payload so JS can reconstruct
@@ -570,17 +591,69 @@ async fn op_worker_inner_recv_message(
                 "base64": base64_encode(&data),
                 "byteLength": data.len()
             });
-            Ok(Some(encoded.to_string()))
+            Some(WorkerInbound::Message {
+                data: encoded.to_string(),
+            })
         }
         Some(WorkerMessage::Terminate) => {
             info!("[Worker] worker received Terminate signal");
-            Ok(None)
+            None
         }
         None => {
             info!("[Worker] worker channel closed (None)");
-            Ok(None)
+            None
         }
     }
+}
+
+async fn recv_worker_inbound(ctx: &WorkerCtx) -> Result<Option<WorkerInbound>, WorkerError> {
+    let mut lifecycle = ctx.timer_backgrounded_rx.lock().await;
+    let mut messages = ctx.rx_from_main.lock().await;
+
+    if let Ok(transition) = lifecycle.try_recv() {
+        return Ok(Some(worker_lifecycle_to_inbound(transition)));
+    }
+
+    tokio::select! {
+        biased;
+        transition = lifecycle.recv() => {
+            match transition {
+                Some(transition) => Ok(Some(worker_lifecycle_to_inbound(transition))),
+                None => Ok(worker_message_to_inbound(messages.recv().await)),
+            }
+        }
+        message = messages.recv() => Ok(worker_message_to_inbound(message)),
+    }
+}
+
+fn worker_lifecycle_to_inbound(transition: WorkerTimerLifecycleTransition) -> WorkerInbound {
+    let elapsed = tokio::time::Instant::now().saturating_duration_since(transition.occurred_at);
+    WorkerInbound::Lifecycle {
+        backgrounded: transition.backgrounded,
+        elapsed_micros: elapsed.as_micros().min(u64::MAX as u128) as u64,
+    }
+}
+
+/// Async op: wait for an internal lifecycle event or a user message.
+/// Returns `None` when a Terminate signal is received.
+#[op2(async(lazy), fast)]
+#[serde]
+async fn op_worker_inner_recv_message(
+    state: Rc<RefCell<OpState>>,
+) -> Result<Option<WorkerInbound>, WorkerError> {
+    let ctx = {
+        let st = state.borrow();
+        let ctx = st.borrow::<WorkerCtx>();
+        WorkerCtx {
+            tx_to_main: ctx.tx_to_main.clone(),
+            tx_errors: ctx.tx_errors.clone(),
+            rx_from_main: ctx.rx_from_main.clone(),
+            timer_backgrounded_rx: ctx.timer_backgrounded_rx.clone(),
+        }
+    };
+
+    info!("[Worker] worker waiting for main message or lifecycle...");
+    recv_worker_inbound(&ctx).await
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +742,18 @@ pub fn worker_inner_extensions(ctx: WorkerCtx) -> Vec<Extension> {
     vec![host_v8_worker_inner::init(ctx)]
 }
 
+pub(crate) fn set_timer_backgrounded(state: &mut OpState, backgrounded: bool) {
+    let Some(handle) = state.try_borrow::<WorkerHandle>() else {
+        return;
+    };
+    if handle.terminated {
+        return;
+    }
+    let _ = handle
+        .timer_backgrounded_tx
+        .send(WorkerTimerLifecycleTransition::now(backgrounded));
+}
+
 /// Create the full extension set for a worker JsRuntime.
 ///
 /// Includes all extensions needed by `98_global_scope_shared.js`:
@@ -676,8 +761,8 @@ pub fn worker_inner_extensions(ctx: WorkerCtx) -> Vec<Extension> {
 /// This gives workers the same shared APIs as the main thread.
 pub fn create_worker_runtime_extensions(ctx: WorkerCtx, host_state: HostOpState) -> Vec<Extension> {
     use crate::{
-        base, console, env, event, file, io_state, lifecycle, network, rendering, url, utility, web,
-        worker_runtime,
+        base, console, env, event, file, io_state, lifecycle, network, rendering, url, utility,
+        web, worker_runtime,
     };
 
     let mut exts: Vec<Extension> = Vec::new();
@@ -1000,4 +1085,316 @@ fn spawn_worker_thread(
             }
         })
         .map_err(|e| WorkerError::Message(format!("Failed to spawn worker thread: {e}")))
+}
+
+#[cfg(test)]
+mod timer_lifecycle_tests {
+    use super::*;
+    use std::{path::PathBuf, sync::atomic::AtomicBool, time::Duration};
+
+    use deno_core::{FastString, PollEventLoopOptions, RuntimeOptions};
+    use futures::future::poll_fn;
+    use shared::{
+        channel::ThreadWakeup,
+        device::gpu_caps::GpuCaps,
+        op_state::{AudioSender, NetworkPolicy},
+        render_command_sender::CommandSender,
+    };
+    fn test_host_state(timer_backgrounded: Arc<AtomicBool>) -> HostOpState {
+        let (render_tx, _render_rx) = CommandSender::new();
+        let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
+        let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
+
+        HostOpState {
+            id: 1,
+            app_cache_dir: PathBuf::from("/tmp/cache"),
+            app_files_dir: PathBuf::from("/tmp/files"),
+            code_dir: None,
+            game_paths: None,
+            vfs: None,
+            mount_table: None,
+            render_tx,
+            text_measurer: None,
+            audio_tx: AudioSender::new(audio_raw_tx, ThreadWakeup::new()),
+            host_tx,
+            device_services: None,
+            raf_rx: None,
+            sub_packages: Vec::new(),
+            workers_path: None,
+            network_policy: NetworkPolicy::default(),
+            backgrounded: Arc::new(AtomicBool::new(false)),
+            timer_backgrounded,
+            webgl_context_created: Arc::new(AtomicBool::new(false)),
+            context_lost: Arc::new(shared::op_state::ContextLostState::default()),
+            code_signing_enabled: false,
+            gpu_caps: GpuCaps::new(),
+        }
+    }
+
+    fn test_worker_ctx(
+        rx_from_main: mpsc::UnboundedReceiver<WorkerMessage>,
+        timer_backgrounded_rx: mpsc::UnboundedReceiver<WorkerTimerLifecycleTransition>,
+    ) -> WorkerCtx {
+        let (tx_to_main, _rx_to_main) = mpsc::unbounded_channel();
+        let (tx_errors, _rx_errors) = mpsc::unbounded_channel();
+        WorkerCtx {
+            tx_to_main,
+            tx_errors,
+            rx_from_main: Arc::new(tokio::sync::Mutex::new(rx_from_main)),
+            timer_backgrounded_rx: Arc::new(tokio::sync::Mutex::new(timer_backgrounded_rx)),
+        }
+    }
+
+    fn exec(rt: &mut JsRuntime, source: impl Into<String>) {
+        rt.execute_script("<test:worker-timer>", FastString::from(source.into()))
+            .expect("worker timer script");
+    }
+
+    fn assert_js(rt: &mut JsRuntime, expression: &str) {
+        exec(
+            rt,
+            format!(
+                "if (!({expression})) throw new Error('worker timer assertion failed: ' + ({expression}));"
+            ),
+        );
+    }
+
+    async fn poll_once(rt: &mut JsRuntime) {
+        poll_fn(|cx| {
+            let _ = rt.poll_event_loop(cx, PollEventLoopOptions::default());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    async fn drain_ready(rt: &mut JsRuntime) {
+        for _ in 0..6 {
+            poll_once(rt).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn advance_and_drain(rt: &mut JsRuntime, duration: Duration) {
+        poll_once(rt).await;
+        tokio::time::advance(duration).await;
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        drain_ready(rt).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_change_preempts_a_queued_user_message() {
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        message_tx
+            .send(WorkerMessage::Message("user".into()))
+            .unwrap();
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        lifecycle_tx
+            .send(WorkerTimerLifecycleTransition::now(true))
+            .unwrap();
+        let ctx = test_worker_ctx(message_rx, lifecycle_rx);
+
+        assert_eq!(
+            recv_worker_inbound(&ctx).await.unwrap(),
+            Some(WorkerInbound::Lifecycle {
+                backgrounded: true,
+                elapsed_micros: 0,
+            })
+        );
+        assert_eq!(
+            recv_worker_inbound(&ctx).await.unwrap(),
+            Some(WorkerInbound::Message {
+                data: "user".into(),
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_changes_preserve_every_edge() {
+        let (_message_tx, message_rx) = mpsc::unbounded_channel();
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        lifecycle_tx
+            .send(WorkerTimerLifecycleTransition::now(true))
+            .unwrap();
+        lifecycle_tx
+            .send(WorkerTimerLifecycleTransition::now(false))
+            .unwrap();
+        lifecycle_tx
+            .send(WorkerTimerLifecycleTransition::now(true))
+            .unwrap();
+        let ctx = test_worker_ctx(message_rx, lifecycle_rx);
+
+        assert_eq!(
+            recv_worker_inbound(&ctx).await.unwrap(),
+            Some(WorkerInbound::Lifecycle {
+                backgrounded: true,
+                elapsed_micros: 0,
+            })
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(10), recv_worker_inbound(&ctx))
+                .await
+                .expect("the foreground edge must not be coalesced")
+                .unwrap(),
+            Some(WorkerInbound::Lifecycle {
+                backgrounded: false,
+                elapsed_micros: 0,
+            })
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(10), recv_worker_inbound(&ctx))
+                .await
+                .expect("the second background edge must not be coalesced")
+                .unwrap(),
+            Some(WorkerInbound::Lifecycle {
+                backgrounded: true,
+                elapsed_micros: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn inbound_events_have_non_user_control_shapes() {
+        let lifecycle = deno_core::serde_json::to_value(WorkerInbound::Lifecycle {
+            backgrounded: true,
+            elapsed_micros: 2500,
+        })
+        .unwrap();
+        assert_eq!(lifecycle["type"], "lifecycle");
+        assert_eq!(lifecycle["backgrounded"], true);
+        assert_eq!(lifecycle["elapsedMicros"], 2500);
+        assert!(lifecycle.get("data").is_none());
+
+        let message = deno_core::serde_json::to_value(WorkerInbound::Message {
+            data: "payload".into(),
+        })
+        .unwrap();
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["data"], "payload");
+        assert!(message.get("backgrounded").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_pump_consumes_lifecycle_and_freezes_timer_remainder() {
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let timer_backgrounded = Arc::new(AtomicBool::new(false));
+        let ctx = test_worker_ctx(message_rx, lifecycle_rx);
+        let mut rt = JsRuntime::new(RuntimeOptions {
+            extensions: create_worker_runtime_extensions(
+                ctx,
+                test_host_state(timer_backgrounded.clone()),
+            ),
+            ..Default::default()
+        });
+
+        exec(
+            &mut rt,
+            "globalThis.__workerMessages = 0; \
+             globalThis.__workerTimer = 0; \
+             worker.onMessage(() => __workerMessages++); \
+             setTimeout(() => __workerTimer++, 100)",
+        );
+        advance_and_drain(&mut rt, Duration::from_millis(30)).await;
+
+        timer_backgrounded.store(true, std::sync::atomic::Ordering::Release);
+        lifecycle_tx
+            .send(WorkerTimerLifecycleTransition::now(true))
+            .unwrap();
+        drain_ready(&mut rt).await;
+        advance_and_drain(&mut rt, Duration::from_secs(10)).await;
+        assert_js(&mut rt, "__workerTimer === 0 && __workerMessages === 0");
+
+        timer_backgrounded.store(false, std::sync::atomic::Ordering::Release);
+        lifecycle_tx
+            .send(WorkerTimerLifecycleTransition::now(false))
+            .unwrap();
+        drain_ready(&mut rt).await;
+        advance_and_drain(&mut rt, Duration::from_millis(69)).await;
+        assert_js(&mut rt, "__workerTimer === 0 && __workerMessages === 0");
+        advance_and_drain(&mut rt, Duration::from_millis(1)).await;
+        assert_js(&mut rt, "__workerTimer === 1 && __workerMessages === 0");
+
+        drop(message_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_pump_uses_transition_time_when_lifecycle_delivery_is_delayed() {
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let timer_backgrounded = Arc::new(AtomicBool::new(false));
+        let ctx = test_worker_ctx(message_rx, lifecycle_rx);
+        let mut rt = JsRuntime::new(RuntimeOptions {
+            extensions: create_worker_runtime_extensions(
+                ctx,
+                test_host_state(timer_backgrounded.clone()),
+            ),
+            ..Default::default()
+        });
+
+        exec(
+            &mut rt,
+            "globalThis.__workerMessages = 0; \
+             globalThis.__workerTimer = 0; \
+             worker.onMessage(() => __workerMessages++); \
+             setTimeout(() => __workerTimer++, 100)",
+        );
+        advance_and_drain(&mut rt, Duration::from_millis(30)).await;
+
+        timer_backgrounded.store(true, std::sync::atomic::Ordering::Release);
+        lifecycle_tx
+            .send(WorkerTimerLifecycleTransition::now(true))
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        timer_backgrounded.store(false, std::sync::atomic::Ordering::Release);
+        lifecycle_tx
+            .send(WorkerTimerLifecycleTransition::now(false))
+            .unwrap();
+        drain_ready(&mut rt).await;
+
+        assert_js(&mut rt, "__workerTimer === 0 && __workerMessages === 0");
+        advance_and_drain(&mut rt, Duration::from_millis(69)).await;
+        assert_js(&mut rt, "__workerTimer === 0 && __workerMessages === 0");
+        advance_and_drain(&mut rt, Duration::from_millis(1)).await;
+        assert_js(&mut rt, "__workerTimer === 1 && __workerMessages === 0");
+
+        drop(message_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_created_hidden_keeps_its_first_timer_logical_until_show() {
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let timer_backgrounded = Arc::new(AtomicBool::new(true));
+        let ctx = test_worker_ctx(message_rx, lifecycle_rx);
+        let mut rt = JsRuntime::new(RuntimeOptions {
+            extensions: create_worker_runtime_extensions(
+                ctx,
+                test_host_state(timer_backgrounded.clone()),
+            ),
+            ..Default::default()
+        });
+
+        exec(
+            &mut rt,
+            "globalThis.__workerTimer = 0; setTimeout(() => __workerTimer++, 100)",
+        );
+        advance_and_drain(&mut rt, Duration::from_secs(10)).await;
+        assert_js(&mut rt, "__workerTimer === 0");
+
+        // A Worker created after the host entered the background has no prior
+        // hide edge in its per-worker queue. The shared level initializes its
+        // timer registry; the first queued edge is therefore show.
+        timer_backgrounded.store(false, std::sync::atomic::Ordering::Release);
+        lifecycle_tx
+            .send(WorkerTimerLifecycleTransition::now(false))
+            .unwrap();
+        drain_ready(&mut rt).await;
+        advance_and_drain(&mut rt, Duration::from_millis(99)).await;
+        assert_js(&mut rt, "__workerTimer === 0");
+        advance_and_drain(&mut rt, Duration::from_millis(1)).await;
+        assert_js(&mut rt, "__workerTimer === 1");
+
+        drop(message_tx);
+    }
 }

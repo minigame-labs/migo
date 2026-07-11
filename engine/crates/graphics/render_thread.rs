@@ -31,6 +31,7 @@ use crate::{
 };
 use crossbeam_channel::{Receiver, select, tick};
 use glow::HasContext;
+use shared::command_vec_pool::{recycle_canvas_command_vec, recycle_gl_command_vec};
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::render_cmd::{CanvasBatchPayload, CanvasId, GlBatchPayload, RenderCommand};
 use shared::render_command_sender::CommandSender;
@@ -159,7 +160,7 @@ fn execute_canvas_batch(
     use crate::damage_effect::DamageEffect;
 
     let canvas_id = payload.canvas_id;
-    let commands = payload.commands;
+    let mut commands = payload.commands;
     let present = payload.present;
     let mut batch_dirty = false;
     let is_onscreen = canvas_id == shared::protocol::render_cmd::CanvasId::from(1u32);
@@ -228,7 +229,7 @@ fn execute_canvas_batch(
         });
     }
 
-    for cmd in commands {
+    for cmd in commands.drain(..) {
         // Classify damage BEFORE handle_command moves the cmd.
         // Reads Canvas2D state (transform, shadow) from the render thread —
         // this is the authoritative damage source, not the JS-side hint.
@@ -277,7 +278,14 @@ fn execute_canvas_batch(
         cm.mark_2d_dirty(canvas_id);
     }
 
-    canvas2d_batch_should_mark_present_dirty(canvas_id, batch_dirty, present, dirty_rect.is_some())
+    let should_mark_present = canvas2d_batch_should_mark_present_dirty(
+        canvas_id,
+        batch_dirty,
+        present,
+        dirty_rect.is_some(),
+    );
+    recycle_canvas_command_vec(commands);
+    should_mark_present
 }
 
 fn execute_gl_batch(
@@ -286,7 +294,7 @@ fn execute_gl_batch(
     renderer_gl: &mut RendererGL,
     payload: GlBatchPayload,
 ) -> bool {
-    let commands = payload.commands;
+    let mut commands = payload.commands;
     let cmd_count = commands.len();
     let mut batch_hit_onscreen = false;
     let mut error_count: u32 = 0;
@@ -297,7 +305,7 @@ fn execute_gl_batch(
     let mut touched_canvases: std::collections::HashSet<CanvasId> =
         std::collections::HashSet::new();
 
-    for gl_cmd in commands {
+    for gl_cmd in commands.drain(..) {
         if let Some(cid) = gl_cmd.touches_canvas() {
             touched_canvases.insert(cid);
         }
@@ -335,6 +343,7 @@ fn execute_gl_batch(
         cm.mark_2d_context_stale(cid);
     }
 
+    recycle_gl_command_vec(commands);
     batch_hit_onscreen
 }
 

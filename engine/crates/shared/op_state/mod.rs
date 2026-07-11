@@ -100,6 +100,9 @@ pub struct HostOpState {
     /// Async polling loops (WebSocket, TCP, UDP) check this flag and
     /// throttle their iteration rate to reduce CPU/battery usage.
     pub backgrounded: Arc<AtomicBool>,
+    /// Timer lifecycle level. Unlike `backgrounded`, this remains true until
+    /// the main isolate actually receives OnShow (which may wait for Surface).
+    pub timer_backgrounded: Arc<AtomicBool>,
     /// True after the first WebGL context is constructed in this runtime.
     ///
     /// Image decode policy uses this to choose the industrial fast path:

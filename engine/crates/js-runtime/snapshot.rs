@@ -242,6 +242,7 @@ mod tests {
             workers_path: None,
             network_policy: NetworkPolicy::default(),
             backgrounded: Arc::new(AtomicBool::new(false)),
+            timer_backgrounded: Arc::new(AtomicBool::new(false)),
             webgl_context_created: Arc::new(AtomicBool::new(false)),
             context_lost: Arc::new(shared::op_state::ContextLostState::default()),
             code_signing_enabled: false,

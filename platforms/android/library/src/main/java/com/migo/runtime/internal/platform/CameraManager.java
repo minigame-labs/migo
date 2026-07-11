@@ -61,6 +61,7 @@ public final class CameraManager {
     private final int cameraId;
     private final Activity activity;
     private final Handler mainHandler;
+    private final Object initializationLock = new Object();
 
     // Camera2 objects
     private android.hardware.camera2.CameraManager cameraManager;
@@ -96,6 +97,9 @@ public final class CameraManager {
     private final Semaphore cameraOpenCompleteLock = new Semaphore(0);
 
     private final AtomicInteger state = new AtomicInteger(STATE_CLOSED);
+    private final LifecycleRequestState<Boolean> cameraActivityRequest;
+    private volatile boolean recordingPausedForLifecycle = false;
+    private volatile boolean sessionNeedsReconfigure = false;
 
     // Configuration
     private String position = "back";   // "back" or "front"
@@ -110,10 +114,19 @@ public final class CameraManager {
     private Size videoSize;
 
     public CameraManager(int sessionId, int cameraId, Activity activity) {
+        this(sessionId, cameraId, activity, false);
+    }
+
+    public CameraManager(
+            int sessionId,
+            int cameraId,
+            Activity activity,
+            boolean lifecycleSuspended) {
         this.sessionId = sessionId;
         this.cameraId = cameraId;
         this.activity = activity;
         this.mainHandler = new Handler(Looper.getMainLooper());
+        this.cameraActivityRequest = new LifecycleRequestState<>(lifecycleSuspended);
     }
 
     /**
@@ -154,25 +167,44 @@ public final class CameraManager {
 
             resolveSizes();
             Log.d(TAG, "create() resolved sizes - preview: " + previewSize + ", photo: " + photoSize + ", video: " + videoSize);
-            startBackgroundThread();
-            Log.d(TAG, "create() started background thread");
-            openCamera();
-            Log.d(TAG, "create() called openCamera()");
+            synchronized (initializationLock) {
+                if (cameraActivityRequest.isDestroyed()) {
+                    return errorJson("createCamera:fail session destroyed");
+                }
+                startBackgroundThread();
+                Log.d(TAG, "create() started background thread");
+
+                LifecycleRequestState.Action action =
+                        cameraActivityRequest.requestStart(Boolean.TRUE);
+                if (action == LifecycleRequestState.Action.NONE) {
+                    if (cameraActivityRequest.isDestroyed()) {
+                        return errorJson("createCamera:fail session destroyed");
+                    }
+                    Log.d(TAG, "create() deferred camera open while lifecycle-suspended");
+                    return createResultJson();
+                }
+
+                if (cameraActivityRequest.isDestroyed()) {
+                    return errorJson("createCamera:fail session destroyed");
+                }
+                openCamera();
+                Log.d(TAG, "create() called openCamera()");
+            }
 
             // Wait for camera to be fully opened and preview session configured
             Log.d(TAG, "create() waiting for camera open to complete...");
             boolean opened = cameraOpenCompleteLock.tryAcquire(5000, TimeUnit.MILLISECONDS);
             if (!opened) {
                 Log.w(TAG, "create() timeout waiting for camera open");
+                cameraActivityRequest.startFailed(false);
                 return errorJson("createCamera:fail timeout waiting for camera open");
             }
             Log.d(TAG, "create() camera open completed");
 
-            JSONObject result = new JSONObject();
-            result.put("cameraId", cameraId);
             Log.d(TAG, "create() returning successfully with cameraId: " + cameraId);
-            return result.toString();
+            return createResultJson();
         } catch (Exception e) {
+            cameraActivityRequest.startFailed(false);
             Log.e(TAG, "create() exception: " + e.getMessage(), e);
             return errorJson("createCamera:fail " + e.getMessage());
         }
@@ -183,11 +215,123 @@ public final class CameraManager {
      */
     public void destroy() {
         Log.d(TAG, "destroy() called");
-        state.set(STATE_CLOSED);
-        closeCamera();
-        stopBackgroundThread();
+        cameraActivityRequest.destroy();
+        synchronized (initializationLock) {
+            state.set(STATE_CLOSED);
+            closeCamera();
+            stopBackgroundThread();
+        }
         fireEvent("stop", "{}");
         Log.d(TAG, "destroy() completed");
+    }
+
+    public synchronized void setLifecycleSuspended(boolean suspended) {
+        if (suspended) {
+            suspendForLifecycle();
+        } else {
+            resumeForLifecycle();
+        }
+    }
+
+    public synchronized void suspendForLifecycle() {
+        if (cameraActivityRequest.suspend() == LifecycleRequestState.Action.STOP) {
+            postCameraAction(this::suspendCameraInternal);
+        }
+    }
+
+    public synchronized void resumeForLifecycle() {
+        if (cameraActivityRequest.resume() == LifecycleRequestState.Action.START) {
+            postCameraAction(this::resumeCameraInternal);
+        }
+    }
+
+    private void postCameraAction(Runnable action) {
+        Handler handler = backgroundHandler;
+        if (handler != null) {
+            handler.post(action);
+        }
+    }
+
+    private void suspendCameraInternal() {
+        if (cameraActivityRequest.isDestroyed()) return;
+
+        if (state.get() == STATE_RECORDING
+                && mediaRecorder != null
+                && !recordingPausedForLifecycle) {
+            try {
+                mediaRecorder.pause();
+                recordingPausedForLifecycle = true;
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Failed to pause camera recording for lifecycle: " + e.getMessage());
+            }
+        }
+
+        if (captureSession != null) {
+            try {
+                captureSession.stopRepeating();
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to stop camera repeating request: " + e.getMessage());
+            }
+        }
+    }
+
+    private void resumeCameraInternal() {
+        if (!cameraActivityRequest.isActive() || cameraActivityRequest.isDestroyed()) return;
+
+        if (cameraDevice == null) {
+            cameraOpenCompleteLock.drainPermits();
+            try {
+                openCamera();
+            } catch (Exception e) {
+                cameraActivityRequest.startFailed(true);
+                fireEvent("error", "{\"errMsg\":\""
+                        + escapeJson("camera resume:fail " + e.getMessage()) + "\"}");
+            }
+            return;
+        }
+
+        if (state.get() != STATE_RECORDING && sessionNeedsReconfigure) {
+            try {
+                closeSession();
+                if (frameListening.get()) {
+                    createFrameReader();
+                } else if (frameReader != null) {
+                    frameReader.close();
+                    frameReader = null;
+                }
+                startPreviewSession();
+            } catch (Exception e) {
+                fireEvent("error", "{\"errMsg\":\""
+                        + escapeJson("camera resume:fail " + e.getMessage()) + "\"}");
+            }
+            return;
+        }
+
+        if (captureSession == null) {
+            if (state.get() == STATE_OPENED) {
+                try {
+                    startPreviewSession();
+                } catch (Exception e) {
+                    fireEvent("error", "{\"errMsg\":\""
+                            + escapeJson("camera resume:fail " + e.getMessage()) + "\"}");
+                }
+            }
+            return;
+        }
+
+        try {
+            captureSession.setRepeatingRequest(
+                    previewRequestBuilder.build(), null, backgroundHandler);
+            if (state.get() == STATE_RECORDING
+                    && mediaRecorder != null
+                    && recordingPausedForLifecycle) {
+                mediaRecorder.resume();
+                recordingPausedForLifecycle = false;
+            }
+        } catch (Exception e) {
+            fireEvent("error", "{\"errMsg\":\""
+                    + escapeJson("camera resume:fail " + e.getMessage()) + "\"}");
+        }
     }
 
     /**
@@ -198,6 +342,9 @@ public final class CameraManager {
      */
     public String takePhoto(String optionsJson) {
         Log.d(TAG, "takePhoto() called with optionsJson: " + optionsJson);
+        if (!cameraActivityRequest.isActive()) {
+            return errorJson("camera.takePhoto:fail camera lifecycle suspended");
+        }
         if (state.get() == STATE_CLOSED || captureSession == null || cameraDevice == null) {
             Log.e(TAG, "takePhoto() camera not ready - state: " + state.get() + ", captureSession: " + (captureSession != null) + ", cameraDevice: " + (cameraDevice != null));
             return errorJson("camera.takePhoto:fail camera not ready");
@@ -307,6 +454,9 @@ public final class CameraManager {
      */
     public String startRecord(String optionsJson) {
         Log.d(TAG, "startRecord() called");
+        if (!cameraActivityRequest.isActive()) {
+            return errorJson("camera.startRecord:fail camera lifecycle suspended");
+        }
         if (state.get() != STATE_OPENED || cameraDevice == null) {
             Log.e(TAG, "startRecord() camera not ready - state: " + state.get() + ", cameraDevice: " + (cameraDevice != null));
             return errorJson("camera.startRecord:fail camera not ready");
@@ -318,6 +468,7 @@ public final class CameraManager {
 
             videoFilePath = createTempFilePath("video", ".mp4");
             setupMediaRecorder();
+            recordingPausedForLifecycle = false;
 
             // Create recording session with preview + mediaRecorder surfaces
             List<android.view.Surface> surfaces = new ArrayList<>();
@@ -343,12 +494,22 @@ public final class CameraManager {
                         @Override
                         public void onConfigured(CameraCaptureSession session) {
                             captureSession = session;
+                            if (cameraActivityRequest.isDestroyed()) {
+                                session.close();
+                                return;
+                            }
                             try {
+                                boolean suspendAfterStart = !cameraActivityRequest.isActive();
                                 captureSession.setRepeatingRequest(
                                         previewRequestBuilder.build(), null, backgroundHandler);
                                 mediaRecorder.start();
                                 state.set(STATE_RECORDING);
                                 recordStartTime = System.currentTimeMillis();
+                                if (suspendAfterStart) {
+                                    mediaRecorder.pause();
+                                    recordingPausedForLifecycle = true;
+                                    captureSession.stopRepeating();
+                                }
                             } catch (Exception e) {
                                 fireEvent("error",
                                         "{\"errMsg\":\"" + escapeJson("camera.startRecord:fail " + e.getMessage()) + "\"}");
@@ -390,9 +551,9 @@ public final class CameraManager {
      * @param optionsJson JSON with keys: zoom (number)
      * @return JSON result: {"zoom": <actual_zoom>}
      */
-    public String setZoom(String optionsJson) {
+    public synchronized String setZoom(String optionsJson) {
         Log.d(TAG, "setZoom() called with optionsJson: " + optionsJson);
-        if (state.get() == STATE_CLOSED) {
+        if (state.get() == STATE_CLOSED && !cameraActivityRequest.isRequested()) {
             Log.e(TAG, "setZoom() camera not ready");
             return errorJson("camera.setZoom:fail camera not ready");
         }
@@ -406,7 +567,9 @@ public final class CameraManager {
         currentZoom = Math.max(1.0f, Math.min(zoom, maxZoom));
         Log.d(TAG, "setZoom() requested: " + zoom + ", actual: " + currentZoom + ", maxZoom: " + maxZoom);
 
-        if (previewRequestBuilder != null && captureSession != null) {
+        if (cameraActivityRequest.isActive()
+                && previewRequestBuilder != null
+                && captureSession != null) {
             try {
                 applyZoom(previewRequestBuilder);
                 captureSession.setRepeatingRequest(
@@ -439,8 +602,11 @@ public final class CameraManager {
             return; // already listening
         }
 
-        if (state.get() == STATE_CLOSED || cameraDevice == null) {
+        if (!cameraActivityRequest.isActive()
+                || state.get() == STATE_CLOSED
+                || cameraDevice == null) {
             Log.w(TAG, "listenFrameChange() camera not ready, state: " + state.get());
+            sessionNeedsReconfigure = true;
             return;
         }
 
@@ -465,11 +631,15 @@ public final class CameraManager {
             return;
         }
 
-        try {
-            restartPreviewSession();
-        } catch (Exception e) {
-            Log.w(TAG, "closeFrameChange() restart preview failed: " + e.getMessage());
-            // Best effort
+        if (cameraActivityRequest.isActive()) {
+            try {
+                restartPreviewSession();
+            } catch (Exception e) {
+                Log.w(TAG, "closeFrameChange() restart preview failed: " + e.getMessage());
+                // Best effort
+            }
+        } else {
+            sessionNeedsReconfigure = true;
         }
 
         if (frameReader != null) {
@@ -503,6 +673,18 @@ public final class CameraManager {
                     Log.d(TAG, "openCamera() camera opened successfully, state set to OPENED");
 
                     try {
+                        if (cameraActivityRequest.isDestroyed()
+                                || !cameraActivityRequest.isRequested()) {
+                            camera.close();
+                            cameraDevice = null;
+                            state.set(STATE_CLOSED);
+                            cameraOpenCompleteLock.release();
+                            return;
+                        }
+                        if (!cameraActivityRequest.isActive()) {
+                            cameraOpenCompleteLock.release();
+                            return;
+                        }
                         if (frameListening.get()) {
                             Log.d(TAG, "openCamera() frame listening is enabled, creating frame reader");
                             createFrameReader();
@@ -528,6 +710,7 @@ public final class CameraManager {
                     camera.close();
                     cameraDevice = null;
                     state.set(STATE_CLOSED);
+                    cameraActivityRequest.startFailed(true);
                     fireEvent("stop", "{}");
                 }
 
@@ -539,6 +722,7 @@ public final class CameraManager {
                     camera.close();
                     cameraDevice = null;
                     state.set(STATE_CLOSED);
+                    cameraActivityRequest.startFailed(true);
                     fireEvent("error", "{\"errMsg\":\"camera device error: " + error + "\"}");
                 }
             }, backgroundHandler);
@@ -555,6 +739,8 @@ public final class CameraManager {
 
     private void closeCamera() {
         Log.d(TAG, "closeCamera() called");
+        recordingPausedForLifecycle = false;
+        sessionNeedsReconfigure = false;
         try {
             cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
@@ -675,6 +861,12 @@ public final class CameraManager {
                             return;
                         }
                         captureSession = session;
+                        sessionNeedsReconfigure = false;
+                        if (!cameraActivityRequest.isActive()) {
+                            Log.d(TAG, "startPreviewSession() configured while suspended");
+                            cameraOpenCompleteLock.release();
+                            return;
+                        }
                         try {
                             Log.d(TAG, "startPreviewSession() setting repeating request");
                             captureSession.setRepeatingRequest(
@@ -693,6 +885,7 @@ public final class CameraManager {
                     @Override
                     public void onConfigureFailed(CameraCaptureSession session) {
                         Log.e(TAG, "startPreviewSession() onConfigureFailed callback called");
+                        sessionNeedsReconfigure = true;
                         cameraOpenCompleteLock.release();
                         fireEvent("error", "{\"errMsg\":\"preview session config failed\"}");
                     }
@@ -742,8 +935,11 @@ public final class CameraManager {
                 uBuffer.get(data, ySize, uSize);
                 vBuffer.get(data, ySize + uSize, vSize);
 
-                NativeMethods.onCameraFrameData(sessionId, cameraId, data,
-                        image.getWidth(), image.getHeight());
+                synchronized (CameraManager.this) {
+                    if (!frameListening.get() || !cameraActivityRequest.isActive()) return;
+                    NativeMethods.onCameraFrameData(sessionId, cameraId, data,
+                            image.getWidth(), image.getHeight());
+                }
             } finally {
                 if (image != null) image.close();
             }
@@ -784,6 +980,7 @@ public final class CameraManager {
         }
 
         state.set(STATE_OPENED);
+        recordingPausedForLifecycle = false;
         Log.d(TAG, "stopRecordInternal() state set to OPENED");
 
         try {
@@ -806,6 +1003,7 @@ public final class CameraManager {
 
         // Restart preview
         try {
+            sessionNeedsReconfigure = false;
             startPreviewSession();
             Log.d(TAG, "stopRecordInternal() preview session restarted");
         } catch (Exception e) {
@@ -1036,6 +1234,12 @@ public final class CameraManager {
     private void fireEvent(String eventType, String jsonPayload) {
         Log.d(TAG, "fireEvent() eventType: " + eventType + ", payload: " + jsonPayload);
         NativeMethods.onCameraEvent(sessionId, cameraId, eventType, jsonPayload);
+    }
+
+    private String createResultJson() throws JSONException {
+        JSONObject result = new JSONObject();
+        result.put("cameraId", cameraId);
+        return result.toString();
     }
 
     private static String errorJson(String errMsg) {

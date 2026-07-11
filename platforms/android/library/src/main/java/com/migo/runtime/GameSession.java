@@ -347,6 +347,7 @@ public final class GameSession implements Closeable {
         SessionState prev = state.getAndSet(SessionState.RUNNING);
         Log.d("MigoSession", "Session " + sessionId + " state: " + prev + " -> RUNNING");
         notifyStateChange(prev, SessionState.RUNNING);
+        NativeExports.resumePowerSensitiveManagers(sessionId);
     }
 
     /**
@@ -425,6 +426,7 @@ public final class GameSession implements Closeable {
         synchronized (lock) {
             if (state.get() == SessionState.DESTROYED) return;
             transitionState(SessionState.RUNNING, SessionState.PAUSED);
+            NativeExports.suspendPowerSensitiveManagers(sessionId);
             vsyncScheduler.stop();
             if (debugOverlay != null) {
                 debugOverlay.stopMonitoring();
@@ -460,6 +462,7 @@ public final class GameSession implements Closeable {
                 }
             }
             dispatchShowIfNeeded();
+            NativeExports.resumePowerSensitiveManagers(sessionId);
             // Re-request audio focus in case it was permanently lost (e.g.
             // after a phone call). This ensures onAudioInterruptionEnd fires.
             audioFocusManager.requestFocusIfNeeded();
@@ -555,6 +558,7 @@ public final class GameSession implements Closeable {
         }
         notifyStateChange(prev, SessionState.DESTROYED);
 
+        NativeExports.suspendPowerSensitiveManagers(sessionId);
         vsyncScheduler.setSurfaceReady(false);
         vsyncScheduler.stop();
         if (debugOverlay != null) {

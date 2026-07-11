@@ -17,6 +17,7 @@ import org.json.JSONObject;
 import java.lang.ref.WeakReference;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -32,29 +33,51 @@ public class VideoManager {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Map<Integer, VideoPlayer> players = new ConcurrentHashMap<>();
     private final AtomicInteger nextVideoId = new AtomicInteger(1);
+    private final AtomicBoolean lifecycleSuspendedTarget;
+    private final AtomicBoolean destroyed = new AtomicBoolean(false);
+    private boolean lifecycleSuspended;
 
     public VideoManager(int sessionId, Activity activity) {
+        this(sessionId, activity, false);
+    }
+
+    public VideoManager(int sessionId, Activity activity, boolean lifecycleSuspended) {
         this.sessionId = sessionId;
         this.activityRef = new WeakReference<>(activity);
+        this.lifecycleSuspendedTarget = new AtomicBoolean(lifecycleSuspended);
+        this.lifecycleSuspended = lifecycleSuspended;
     }
 
     private Activity getActivity() {
         return activityRef.get();
     }
 
+    private void runOnMain(Runnable action) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            action.run();
+        } else {
+            mainHandler.post(action);
+        }
+    }
+
     public String create(String optionsJson) {
         try {
+            if (destroyed.get()) throw new IllegalStateException("session destroyed");
             JSONObject opts = new JSONObject(optionsJson);
             int videoId = nextVideoId.getAndIncrement();
             String src = opts.optString("src", "");
             // Store initial properties
             VideoPlayer player = new VideoPlayer(videoId, src, opts);
             players.put(videoId, player);
+            if (destroyed.get() && players.remove(videoId, player)) {
+                runOnMain(player::release);
+                throw new IllegalStateException("session destroyed");
+            }
 
             // Create TextureView on UI thread
             Activity activity = getActivity();
             if (activity != null) {
-                mainHandler.post(() -> player.createView(activity));
+                runOnMain(() -> player.createView(activity));
             }
 
             return "{\"videoId\":" + videoId + "}";
@@ -65,17 +88,17 @@ public class VideoManager {
 
     public void play(int videoId) {
         VideoPlayer p = players.get(videoId);
-        if (p != null) mainHandler.post(() -> p.play());
+        if (p != null) runOnMain(() -> p.play());
     }
 
     public void pause(int videoId) {
         VideoPlayer p = players.get(videoId);
-        if (p != null) mainHandler.post(() -> p.pause());
+        if (p != null) runOnMain(() -> p.pause());
     }
 
     public void stop(int videoId) {
         VideoPlayer p = players.get(videoId);
-        if (p != null) mainHandler.post(() -> p.stop());
+        if (p != null) runOnMain(() -> p.stop());
     }
 
     public void seek(String json) {
@@ -84,11 +107,12 @@ public class VideoManager {
             int videoId = obj.optInt("videoId", 0);
             double position = obj.optDouble("position", 0);
             VideoPlayer p = players.get(videoId);
-            if (p != null) mainHandler.post(() -> p.seek(position));
+            if (p != null) runOnMain(() -> p.seek(position));
         } catch (Exception ignored) {}
     }
 
     public void requestFullscreen(String json) {
+        if (destroyed.get()) return;
         // Fullscreen requires UI thread operations
         // Simplified: just notify JS of state change
         try {
@@ -99,6 +123,7 @@ public class VideoManager {
     }
 
     public void exitFullscreen(int videoId) {
+        if (destroyed.get()) return;
         NativeMethods.onVideoEvent(sessionId, videoId, "fullscreenchange", "{\"fullScreen\":false}");
     }
 
@@ -109,21 +134,56 @@ public class VideoManager {
             JSONObject props = obj.optJSONObject("properties");
             VideoPlayer p = players.get(videoId);
             if (p != null && props != null) {
-                mainHandler.post(() -> p.setProperties(props));
+                runOnMain(() -> p.setProperties(props));
             }
         } catch (Exception ignored) {}
     }
 
     public void destroyVideo(int videoId) {
         VideoPlayer p = players.remove(videoId);
-        if (p != null) mainHandler.post(() -> p.release());
+        if (p != null) runOnMain(() -> p.release());
     }
 
     public void destroy() {
-        for (VideoPlayer p : players.values()) {
-            mainHandler.post(() -> p.release());
+        if (!destroyed.compareAndSet(false, true)) return;
+        runOnMain(() -> {
+            for (VideoPlayer p : players.values()) {
+                p.release();
+            }
+            players.clear();
+        });
+    }
+
+    public synchronized void setLifecycleSuspended(boolean suspended) {
+        if (destroyed.get()) return;
+        lifecycleSuspendedTarget.set(suspended);
+        runOnMain(this::applyLifecycleTarget);
+    }
+
+    public synchronized void suspendForLifecycle() {
+        setLifecycleSuspended(true);
+    }
+
+    public synchronized void resumeForLifecycle() {
+        setLifecycleSuspended(false);
+    }
+
+    private void applyLifecycleTarget() {
+        if (destroyed.get()) return;
+        boolean suspended = lifecycleSuspendedTarget.get();
+        if (suspended) {
+            if (lifecycleSuspended) return;
+            lifecycleSuspended = true;
+            for (VideoPlayer player : players.values()) {
+                player.suspendForLifecycle();
+            }
+        } else {
+            if (!lifecycleSuspended) return;
+            lifecycleSuspended = false;
+            for (VideoPlayer player : players.values()) {
+                player.resumeForLifecycle();
+            }
         }
-        players.clear();
     }
 
     // Inner class: per-video-instance state
@@ -141,6 +201,8 @@ public class VideoManager {
         Surface surface;
         boolean prepared = false;
         boolean pendingPlay = false;
+        boolean resumeAfterLifecyclePause = false;
+        final ResourceLifetime lifetime = new ResourceLifetime();
         Handler timeUpdateHandler;
         Runnable timeUpdateRunnable;
 
@@ -153,6 +215,7 @@ public class VideoManager {
         }
 
         void createView(Activity activity) {
+            if (!lifetime.canRun()) return;
             textureView = new TextureView(activity);
             textureView.setSurfaceTextureListener(this);
             // Add to activity's content view (overlay on game)
@@ -168,12 +231,19 @@ public class VideoManager {
         }
 
         void play() {
+            if (!lifetime.canRun()) return;
+            resumeAfterLifecyclePause = false;
+            if (lifecycleSuspended) {
+                pendingPlay = true;
+                return;
+            }
             if (mediaPlayer == null) {
                 initMediaPlayer();
             }
             if (prepared) {
                 mediaPlayer.start();
                 startTimeUpdates();
+                pendingPlay = false;
                 NativeMethods.onVideoEvent(sessionId, videoId, "play", "{}");
             } else {
                 pendingPlay = true;
@@ -181,6 +251,9 @@ public class VideoManager {
         }
 
         void pause() {
+            if (!lifetime.canRun()) return;
+            pendingPlay = false;
+            resumeAfterLifecyclePause = false;
             if (mediaPlayer != null && mediaPlayer.isPlaying()) {
                 mediaPlayer.pause();
                 stopTimeUpdates();
@@ -189,6 +262,9 @@ public class VideoManager {
         }
 
         void stop() {
+            if (!lifetime.canRun()) return;
+            pendingPlay = false;
+            resumeAfterLifecyclePause = false;
             if (mediaPlayer != null) {
                 mediaPlayer.stop();
                 prepared = false;
@@ -198,20 +274,29 @@ public class VideoManager {
         }
 
         void seek(double positionSec) {
+            if (!lifetime.canRun()) return;
             if (mediaPlayer != null && prepared) {
                 mediaPlayer.seekTo((int) (positionSec * 1000));
             }
         }
 
         void setProperties(JSONObject props) {
+            if (!lifetime.canRun()) return;
             if (props.has("src")) {
                 String newSrc = props.optString("src", "");
                 if (!newSrc.equals(src)) {
                     src = newSrc;
+                    pendingPlay = false;
+                    resumeAfterLifecyclePause = false;
                     if (mediaPlayer != null) {
-                        mediaPlayer.reset();
+                        if (lifecycleSuspended) {
+                            try { mediaPlayer.release(); } catch (Exception ignored) {}
+                            mediaPlayer = null;
+                        } else {
+                            mediaPlayer.reset();
+                            initMediaPlayer();
+                        }
                         prepared = false;
-                        initMediaPlayer();
                     }
                 }
             }
@@ -237,6 +322,10 @@ public class VideoManager {
         }
 
         void release() {
+            if (!lifetime.release()) return;
+            pendingPlay = false;
+            resumeAfterLifecyclePause = false;
+            prepared = false;
             stopTimeUpdates();
             if (mediaPlayer != null) {
                 try { mediaPlayer.release(); } catch (Exception ignored) {}
@@ -253,7 +342,39 @@ public class VideoManager {
             }
         }
 
+        void suspendForLifecycle() {
+            if (!lifetime.canRun()) return;
+            if (mediaPlayer == null || !prepared) return;
+            try {
+                if (mediaPlayer.isPlaying()) {
+                    mediaPlayer.pause();
+                    stopTimeUpdates();
+                    resumeAfterLifecyclePause = true;
+                }
+            } catch (IllegalStateException ignored) {
+                resumeAfterLifecyclePause = false;
+            }
+        }
+
+        void resumeForLifecycle() {
+            if (!lifetime.canRun()) return;
+            if (resumeAfterLifecyclePause) {
+                resumeAfterLifecyclePause = false;
+                if (mediaPlayer != null && prepared) {
+                    try {
+                        mediaPlayer.start();
+                        startTimeUpdates();
+                    } catch (IllegalStateException ignored) {}
+                }
+                return;
+            }
+            if (pendingPlay) {
+                play();
+            }
+        }
+
         private void initMediaPlayer() {
+            if (!lifetime.canRun()) return;
             try {
                 mediaPlayer = new MediaPlayer();
                 mediaPlayer.setDataSource(src);
@@ -275,13 +396,17 @@ public class VideoManager {
         }
 
         private void startTimeUpdates() {
+            if (!lifetime.canRun()) return;
             if (timeUpdateHandler == null) {
                 timeUpdateHandler = new Handler(Looper.getMainLooper());
             }
             stopTimeUpdates();
             timeUpdateRunnable = new Runnable() {
                 public void run() {
-                    if (mediaPlayer != null && mediaPlayer.isPlaying()) {
+                    if (lifetime.canRun()
+                            && !lifecycleSuspended
+                            && mediaPlayer != null
+                            && mediaPlayer.isPlaying()) {
                         int pos = mediaPlayer.getCurrentPosition();
                         int dur = mediaPlayer.getDuration();
                         NativeMethods.onVideoEvent(sessionId, videoId, "timeupdate",
@@ -301,12 +426,14 @@ public class VideoManager {
 
         // TextureView callbacks
         public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
+            if (!lifetime.canRun()) return;
             surface = new Surface(st);
             if (mediaPlayer != null) mediaPlayer.setSurface(surface);
             if (textureView != null) textureView.setVisibility(android.view.View.VISIBLE);
         }
         public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int h) {}
         public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+            if (!lifetime.canRun()) return true;
             if (surface != null) { surface.release(); surface = null; }
             return true;
         }
@@ -314,11 +441,15 @@ public class VideoManager {
 
         // MediaPlayer callbacks
         public void onPrepared(MediaPlayer mp) {
+            if (!lifetime.canRun()) {
+                try { mp.release(); } catch (Exception ignored) {}
+                return;
+            }
             prepared = true;
             if (android.os.Build.VERSION.SDK_INT >= 23 && playbackRate != 1.0f) {
                 try { mp.setPlaybackParams(mp.getPlaybackParams().setSpeed(playbackRate)); } catch (Exception ignored) {}
             }
-            if (pendingPlay) {
+            if (pendingPlay && !lifecycleSuspended) {
                 pendingPlay = false;
                 mp.start();
                 startTimeUpdates();
@@ -326,16 +457,20 @@ public class VideoManager {
             }
         }
         public void onCompletion(MediaPlayer mp) {
+            if (!lifetime.canRun()) return;
+            pendingPlay = false;
+            resumeAfterLifecyclePause = false;
             stopTimeUpdates();
             NativeMethods.onVideoEvent(sessionId, videoId, "ended", "{}");
         }
         public boolean onError(MediaPlayer mp, int what, int extra) {
+            if (!lifetime.canRun()) return true;
             NativeMethods.onVideoEvent(sessionId, videoId, "error",
                 "{\"errCode\":" + what + ",\"errMsg\":\"MediaPlayer error " + what + "/" + extra + "\"}");
             return true;
         }
         public void onBufferingUpdate(MediaPlayer mp, int percent) {
-            if (prepared) {
+            if (lifetime.canRun() && prepared && !lifecycleSuspended) {
                 int dur = mp.getDuration();
                 double buffered = dur > 0 ? (percent / 100.0) * (dur / 1000.0) : 0;
                 NativeMethods.onVideoEvent(sessionId, videoId, "progress",

@@ -22,6 +22,7 @@ import com.migo.runtime.callback.GameLogHandler;
 import com.migo.runtime.callback.SubpackageHandler;
 
 import com.migo.runtime.GameSession;
+import com.migo.runtime.SessionState;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -163,6 +164,38 @@ public final class NativeExports {
      */
     public static void unregisterSession(int sessionId) {
         sSessions.remove(sessionId);
+    }
+
+    /**
+     * Returns whether power-sensitive platform resources must remain inactive.
+     * Missing, not-yet-running, paused, and destroyed sessions fail closed.
+     *
+     * @hide
+     */
+    public static boolean isSessionResourceSuspended(int sessionId) {
+        GameSession session = sSessions.get(sessionId);
+        return session == null || session.getState() != SessionState.RUNNING;
+    }
+
+    /** Returns true once a session can no longer own newly-created managers. */
+    public static boolean isSessionTerminated(int sessionId) {
+        GameSession session = sSessions.get(sessionId);
+        return session == null || session.getState() == SessionState.DESTROYED;
+    }
+
+    /** Suspend sensors, BLE scans, camera capture, and video for OnHide. */
+    public static void suspendPowerSensitiveManagers(int sessionId) {
+        SensorExports.suspendPowerSensitiveManagers(sessionId);
+        BluetoothExports.suspendPowerSensitiveManagers(sessionId);
+        MediaExports.suspendPowerSensitiveManagers(sessionId);
+    }
+
+    /** Restore only platform resources still requested when the session runs. */
+    public static void resumePowerSensitiveManagers(int sessionId) {
+        if (isSessionResourceSuspended(sessionId)) return;
+        MediaExports.resumePowerSensitiveManagers(sessionId);
+        BluetoothExports.resumePowerSensitiveManagers(sessionId);
+        SensorExports.resumePowerSensitiveManagers(sessionId);
     }
 
     /**

@@ -7,6 +7,7 @@ import * as websocket from "ext:host_v8_network/07_websocket.js";
 import * as innerAudio from "ext:host_v8_audio/02_inner_audio_context.js";
 import * as fileManager from "ext:host_v8_file/02_file_manager.js";
 import * as envApi from "ext:host_v8_env/00_env.js";
+import * as timersInternal from "ext:host_v8_web/02_timers.js";
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
 
 const messageListeners = createListenerGroup("[Worker-JS] onMessage");
@@ -14,18 +15,28 @@ const messageListeners = createListenerGroup("[Worker-JS] onMessage");
 async function _startMessagePump() {
     console.log("[Worker-JS] message pump started, listeners:", messageListeners.size());
     while (true) {
-        let json;
+        let event;
         try {
-            json = await op_worker_inner_recv_message();
+            event = await op_worker_inner_recv_message();
         } catch (e) {
             console.error("[Worker-JS] recv error:", e);
             break;
         }
         // null/undefined means Terminate signal received
-        if (json === null || json === undefined) {
+        if (event === null || event === undefined) {
             console.log("[Worker-JS] received null/terminate, exiting pump");
             break;
         }
+
+        if (event.type === "lifecycle") {
+            timersInternal._internalSetTimerBackgrounded(
+                event.backgrounded,
+                event.elapsedMicros,
+            );
+            continue;
+        }
+
+        const json = event.data;
 
         console.log("[Worker-JS] received message, listeners:", messageListeners.size());
 

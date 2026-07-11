@@ -26,18 +26,34 @@ public final class SensorExports {
     private static final ConcurrentHashMap<Integer, ScreenCaptureObserver> sCaptureObservers =
             new ConcurrentHashMap<>();
 
+    private static void syncSensorLifecycle(int sessionId, DeviceSensorManager manager) {
+        LifecycleStateSynchronizer.synchronize(
+                manager,
+                () -> NativeExports.isSessionResourceSuspended(sessionId),
+                manager::setLifecycleSuspended);
+    }
+
     private static DeviceSensorManager getOrCreateSensorManager(int sessionId) {
         DeviceSensorManager existing = sSensorManagers.get(sessionId);
-        if (existing != null) return existing;
+        if (existing != null) {
+            syncSensorLifecycle(sessionId, existing);
+            return existing;
+        }
         synchronized (sSensorLock) {
             existing = sSensorManagers.get(sessionId);
-            if (existing != null) return existing;
+            if (existing != null) {
+                syncSensorLifecycle(sessionId, existing);
+                return existing;
+            }
+            if (NativeExports.isSessionTerminated(sessionId)) return null;
             RuntimeContext ctx = RuntimeRegistry.get(sessionId);
             if (ctx == null) return null;
             Activity activity = ctx.getActivity();
             if (activity == null) return null;
-            DeviceSensorManager mgr = new DeviceSensorManager(sessionId, activity);
+            boolean suspended = NativeExports.isSessionResourceSuspended(sessionId);
+            DeviceSensorManager mgr = new DeviceSensorManager(sessionId, activity, suspended);
             sSensorManagers.put(sessionId, mgr);
+            syncSensorLifecycle(sessionId, mgr);
             return mgr;
         }
     }
@@ -99,9 +115,26 @@ public final class SensorExports {
     }
 
     public static void destroySensorManager(int sessionId) {
-        DeviceSensorManager mgr = sSensorManagers.remove(sessionId);
+        DeviceSensorManager mgr;
+        synchronized (sSensorLock) {
+            mgr = sSensorManagers.remove(sessionId);
+        }
         if (mgr != null) {
             mgr.destroy();
+        }
+    }
+
+    public static void suspendPowerSensitiveManagers(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.suspendForLifecycle();
+        }
+    }
+
+    public static void resumePowerSensitiveManagers(int sessionId) {
+        DeviceSensorManager mgr = sSensorManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.resumeForLifecycle();
         }
     }
 

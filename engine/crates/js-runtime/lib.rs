@@ -151,6 +151,8 @@ mod tests_global_surface;
 #[cfg(test)]
 mod tests_prelude;
 #[cfg(test)]
+mod tests_timers;
+#[cfg(test)]
 mod tests_v8_limits;
 pub use rendering::image::cache::{clear_shared_image_cache, drain_shared_image_cache};
 

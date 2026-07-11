@@ -3,6 +3,7 @@ use shared::{
     error::{EngineError, EngineResult, ErrorCode},
     protocol::render_cmd::{CanvasId, GLCmd, ShaderType},
 };
+use smallvec::SmallVec;
 use tracing::trace;
 
 #[cfg(test)]
@@ -67,10 +68,13 @@ fn should_issue_uniform(
 
 /// Build a scratch buffer `[transpose_byte, matrix_bytes...]` for
 /// matrix-uniform dedup.  Returned slice's lifetime is the caller's
-/// scratch `Vec`, re-used across matrix uploads to avoid per-call
-/// allocation.
+/// scratch SmallVec. One mat4 plus the transpose byte fits inline.
 #[inline]
-fn mat_uniform_bytes<'a>(scratch: &'a mut Vec<u8>, transpose: bool, data: &[f32]) -> &'a [u8] {
+fn mat_uniform_bytes<'a>(
+    scratch: &'a mut SmallVec<[u8; 65]>,
+    transpose: bool,
+    data: &[f32],
+) -> &'a [u8] {
     scratch.clear();
     scratch.push(transpose as u8);
     scratch.extend_from_slice(bytemuck::cast_slice::<f32, u8>(data));
@@ -459,7 +463,7 @@ impl RendererGL {
                 value,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                let mut scratch = Vec::with_capacity(1 + value.len() * 4);
+                let mut scratch = SmallVec::<[u8; 65]>::new();
                 let bytes = mat_uniform_bytes(&mut scratch, transpose, &value);
                 if should_issue_uniform(cm, canvas_id, location, bytes) {
                     unsafe {
@@ -2122,7 +2126,7 @@ impl RendererGL {
                 value,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                let mut scratch = Vec::with_capacity(1 + value.len() * 4);
+                let mut scratch = SmallVec::<[u8; 65]>::new();
                 let bytes = mat_uniform_bytes(&mut scratch, transpose, &value);
                 if should_issue_uniform(cm, canvas_id, location, bytes) {
                     unsafe {
@@ -2143,7 +2147,7 @@ impl RendererGL {
                 value,
             } => {
                 cm.make_current_needed(canvas_id)?;
-                let mut scratch = Vec::with_capacity(1 + value.len() * 4);
+                let mut scratch = SmallVec::<[u8; 65]>::new();
                 let bytes = mat_uniform_bytes(&mut scratch, transpose, &value);
                 if should_issue_uniform(cm, canvas_id, location, bytes) {
                     unsafe {
@@ -3277,6 +3281,18 @@ mod tests {
             width: w,
             height: h,
         }
+    }
+
+    #[test]
+    fn single_mat4_uniform_dedup_scratch_stays_inline() {
+        let mut scratch = smallvec::SmallVec::<[u8; 65]>::new();
+        let matrix = [1.0f32; 16];
+        {
+            let bytes = mat_uniform_bytes(&mut scratch, false, &matrix);
+            assert_eq!(bytes.len(), 65);
+            assert_eq!(bytes[0], 0);
+        }
+        assert!(!scratch.spilled());
     }
 
     // ---- clear_damage_effect tests ----

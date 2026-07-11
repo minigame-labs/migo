@@ -186,7 +186,7 @@ pub(crate) struct CanvasGLState {
     pub bound_vao: Option<u32>,
     /// Per-program uniform value cache.  Keys are `glGetUniformLocation`
     /// values (u32, stored as the location-index returned to JS).
-    pub uniform_cache: HashMap<(ProgramId, u32), Box<[u8]>>,
+    pub uniform_cache: HashMap<(ProgramId, u32), Vec<u8>>,
 
     // ---- P11-state-tracker expansion ----------------------------------
     /// Currently bound FBO id for each GL binding target.  Keys are

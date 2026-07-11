@@ -11,6 +11,7 @@ extension!(
     ops = [
         timers::op_now,
         timers::op_now_us,
+        timers::op_timer_is_backgrounded,
         canvas::op_create_offscreen_canvas,
         canvas::op_get_canvas_info,
         canvas::op_resize_canvas,

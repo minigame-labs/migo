@@ -68,11 +68,19 @@ public class BluetoothManager {
     private BluetoothLeScanner leScanner;
     private ScanCallback leScanCallback;
     private BroadcastReceiver adapterStateReceiver;
+    private final LifecycleRequestState<String> discoveryRequest;
+    private final LifecycleRequestState<String> beaconRequest;
 
     public BluetoothManager(int sessionId, Activity activity) {
+        this(sessionId, activity, false);
+    }
+
+    public BluetoothManager(int sessionId, Activity activity, boolean lifecycleSuspended) {
         this.sessionId = sessionId;
         this.activityRef = new WeakReference<>(activity);
         this.adapter = getAdapter(activity);
+        this.discoveryRequest = new LifecycleRequestState<>(lifecycleSuspended);
+        this.beaconRequest = new LifecycleRequestState<>(lifecycleSuspended);
     }
 
     private Activity getActivity() {
@@ -130,8 +138,35 @@ public class BluetoothManager {
 
     // ==================== Device Discovery ====================
 
-    public void startDiscovery(String optionsJson) {
+    public synchronized void startDiscovery(String optionsJson) {
         if (adapter == null || !adapterOpened) {
+            throw new RuntimeException("startBluetoothDevicesDiscovery:fail adapter not opened");
+        }
+
+        discoveredDevices.clear();
+        LifecycleRequestState.Action action = discoveryRequest.requestStart(optionsJson);
+        if (action == LifecycleRequestState.Action.NONE) {
+            discovering = false;
+            return;
+        }
+        if (action == LifecycleRequestState.Action.RESTART) {
+            stopDiscoveryInternal();
+        }
+
+        try {
+            startDiscoveryInternal(optionsJson);
+            discovering = true;
+            NativeMethods.onBluetoothAdapterStateChange(sessionId, adapter.isEnabled(), true);
+        } catch (RuntimeException e) {
+            stopDiscoveryInternal();
+            discovering = false;
+            discoveryRequest.startFailed(false);
+            throw e;
+        }
+    }
+
+    private void startDiscoveryInternal(String optionsJson) {
+        if (adapter == null || !adapterOpened || !adapter.isEnabled()) {
             throw new RuntimeException("startBluetoothDevicesDiscovery:fail adapter not opened");
         }
 
@@ -168,9 +203,6 @@ public class BluetoothManager {
             }
         } catch (JSONException ignored) {}
 
-        stopDiscoveryInternal();
-        discoveredDevices.clear();
-
         leScanner = adapter.getBluetoothLeScanner();
         if (leScanner == null) {
             throw new RuntimeException("startBluetoothDevicesDiscovery:fail scanner not available");
@@ -183,49 +215,61 @@ public class BluetoothManager {
         leScanCallback = new ScanCallback() {
             @Override
             public void onScanResult(int callbackType, ScanResult result) {
-                handleScanResult(result);
-            }
-
-            @Override
-            public void onBatchScanResults(List<ScanResult> results) {
-                for (ScanResult result : results) {
+                synchronized (BluetoothManager.this) {
+                    if (leScanCallback != this || !discoveryRequest.isActive()) return;
                     handleScanResult(result);
                 }
             }
 
             @Override
+            public void onBatchScanResults(List<ScanResult> results) {
+                synchronized (BluetoothManager.this) {
+                    if (leScanCallback != this || !discoveryRequest.isActive()) return;
+                    for (ScanResult result : results) {
+                        handleScanResult(result);
+                    }
+                }
+            }
+
+            @Override
             public void onScanFailed(int errorCode) {
-                Log.e(TAG, "BLE scan failed: " + errorCode);
-                discovering = false;
-                NativeMethods.onBluetoothAdapterStateChange(sessionId,
-                        adapter.isEnabled(), false);
+                synchronized (BluetoothManager.this) {
+                    if (leScanCallback != this || !discoveryRequest.isActive()) return;
+                    Log.e(TAG, "BLE scan failed: " + errorCode);
+                    leScanCallback = null;
+                    discovering = false;
+                    discoveryRequest.startFailed(false);
+                    NativeMethods.onBluetoothAdapterStateChange(sessionId,
+                            adapter.isEnabled(), false);
+                }
             }
         };
 
         leScanner.startScan(filters.isEmpty() ? null : filters, settings, leScanCallback);
-        discovering = true;
-        NativeMethods.onBluetoothAdapterStateChange(sessionId, adapter.isEnabled(), true);
     }
 
-    public void stopDiscovery() {
-        stopDiscoveryInternal();
-        if (discovering) {
+    public synchronized void stopDiscovery() {
+        boolean wasDiscovering = discovering;
+        if (discoveryRequest.requestStop() == LifecycleRequestState.Action.STOP) {
+            stopDiscoveryInternal();
             discovering = false;
-            if (adapter != null) {
-                NativeMethods.onBluetoothAdapterStateChange(sessionId,
-                        adapter.isEnabled(), false);
-            }
+        }
+        if (wasDiscovering && adapter != null) {
+            NativeMethods.onBluetoothAdapterStateChange(sessionId,
+                    adapter.isEnabled(), false);
         }
     }
 
     private void stopDiscoveryInternal() {
-        if (leScanner != null && leScanCallback != null) {
+        BluetoothLeScanner scanner = leScanner;
+        ScanCallback callback = leScanCallback;
+        leScanCallback = null;
+        if (scanner != null && callback != null) {
             try {
-                leScanner.stopScan(leScanCallback);
+                scanner.stopScan(callback);
             } catch (Exception e) {
                 Log.w(TAG, "stopScan error: " + e.getMessage());
             }
-            leScanCallback = null;
         }
     }
 
@@ -298,13 +342,37 @@ public class BluetoothManager {
     private ScanCallback beaconScanCallback;
     private final ConcurrentHashMap<String, JSONObject> discoveredBeacons = new ConcurrentHashMap<>();
 
-    public void startBeaconDiscovery(String optionsJson) {
+    public synchronized void startBeaconDiscovery(String optionsJson) {
         if (adapter == null || !adapter.isEnabled()) {
             throw new RuntimeException("startBeaconDiscovery:fail not available");
         }
 
-        stopBeaconDiscoveryInternal();
         discoveredBeacons.clear();
+        LifecycleRequestState.Action action = beaconRequest.requestStart(optionsJson);
+        if (action == LifecycleRequestState.Action.NONE) {
+            beaconDiscovering = false;
+            return;
+        }
+        if (action == LifecycleRequestState.Action.RESTART) {
+            stopBeaconDiscoveryInternal();
+        }
+
+        try {
+            startBeaconDiscoveryInternal();
+            beaconDiscovering = true;
+            NativeMethods.onBeaconServiceChange(sessionId, true, true);
+        } catch (RuntimeException e) {
+            stopBeaconDiscoveryInternal();
+            beaconDiscovering = false;
+            beaconRequest.startFailed(false);
+            throw e;
+        }
+    }
+
+    private void startBeaconDiscoveryInternal() {
+        if (adapter == null || !adapter.isEnabled()) {
+            throw new RuntimeException("startBeaconDiscovery:fail not available");
+        }
 
         beaconScanner = adapter.getBluetoothLeScanner();
         if (beaconScanner == null) {
@@ -318,46 +386,60 @@ public class BluetoothManager {
         beaconScanCallback = new ScanCallback() {
             @Override
             public void onScanResult(int callbackType, ScanResult result) {
-                handleBeaconResult(result);
+                synchronized (BluetoothManager.this) {
+                    if (beaconScanCallback != this || !beaconRequest.isActive()) return;
+                    handleBeaconResult(result);
+                }
             }
 
             @Override
             public void onBatchScanResults(List<ScanResult> results) {
-                for (ScanResult r : results) {
-                    handleBeaconResult(r);
+                synchronized (BluetoothManager.this) {
+                    if (beaconScanCallback != this || !beaconRequest.isActive()) return;
+                    for (ScanResult r : results) {
+                        handleBeaconResult(r);
+                    }
                 }
             }
 
             @Override
             public void onScanFailed(int errorCode) {
-                Log.e(TAG, "Beacon scan failed: " + errorCode);
-                beaconDiscovering = false;
-                NativeMethods.onBeaconServiceChange(sessionId, false, false);
+                synchronized (BluetoothManager.this) {
+                    if (beaconScanCallback != this || !beaconRequest.isActive()) return;
+                    Log.e(TAG, "Beacon scan failed: " + errorCode);
+                    beaconScanCallback = null;
+                    beaconDiscovering = false;
+                    beaconRequest.startFailed(false);
+                    NativeMethods.onBeaconServiceChange(sessionId, false, false);
+                }
             }
         };
 
         beaconScanner.startScan(null, settings, beaconScanCallback);
-        beaconDiscovering = true;
-        NativeMethods.onBeaconServiceChange(sessionId, true, true);
     }
 
-    public void stopBeaconDiscovery() {
-        stopBeaconDiscoveryInternal();
-        if (beaconDiscovering) {
+    public synchronized void stopBeaconDiscovery() {
+        boolean wasDiscovering = beaconDiscovering;
+        if (beaconRequest.requestStop() == LifecycleRequestState.Action.STOP) {
+            stopBeaconDiscoveryInternal();
             beaconDiscovering = false;
+        }
+        if (wasDiscovering) {
             NativeMethods.onBeaconServiceChange(sessionId,
                     adapter != null && adapter.isEnabled(), false);
         }
     }
 
     private void stopBeaconDiscoveryInternal() {
-        if (beaconScanner != null && beaconScanCallback != null) {
+        BluetoothLeScanner scanner = beaconScanner;
+        ScanCallback callback = beaconScanCallback;
+        beaconScanCallback = null;
+        if (scanner != null && callback != null) {
             try {
-                beaconScanner.stopScan(beaconScanCallback);
+                scanner.stopScan(callback);
             } catch (Exception e) {
                 Log.w(TAG, "stopBeaconScan error: " + e.getMessage());
             }
-            beaconScanCallback = null;
         }
     }
 
@@ -720,10 +802,66 @@ public class BluetoothManager {
 
     // ==================== Cleanup ====================
 
-    public void destroy() {
+    public synchronized void setLifecycleSuspended(boolean suspended) {
+        if (suspended) {
+            suspendForLifecycle();
+        } else {
+            resumeForLifecycle();
+        }
+    }
+
+    public synchronized void suspendForLifecycle() {
+        if (discoveryRequest.suspend() == LifecycleRequestState.Action.STOP) {
+            stopDiscoveryInternal();
+            discovering = false;
+        }
+        if (beaconRequest.suspend() == LifecycleRequestState.Action.STOP) {
+            stopBeaconDiscoveryInternal();
+            beaconDiscovering = false;
+        }
+    }
+
+    public synchronized void resumeForLifecycle() {
+        if (discoveryRequest.resume() == LifecycleRequestState.Action.START) {
+            try {
+                startDiscoveryInternal(discoveryRequest.getRequest());
+                discovering = true;
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Failed to resume BLE discovery: " + e.getMessage());
+                stopDiscoveryInternal();
+                discovering = false;
+                discoveryRequest.startFailed(false);
+                NativeMethods.onBluetoothAdapterStateChange(sessionId,
+                        adapter != null && adapter.isEnabled(), false);
+            }
+        }
+
+        if (beaconRequest.resume() == LifecycleRequestState.Action.START) {
+            try {
+                startBeaconDiscoveryInternal();
+                beaconDiscovering = true;
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Failed to resume beacon discovery: " + e.getMessage());
+                stopBeaconDiscoveryInternal();
+                beaconDiscovering = false;
+                beaconRequest.startFailed(false);
+                NativeMethods.onBeaconServiceChange(sessionId,
+                        adapter != null && adapter.isEnabled(), false);
+            }
+        }
+    }
+
+    public synchronized void destroy() {
+        if (discoveryRequest.destroy() == LifecycleRequestState.Action.STOP) {
+            stopDiscoveryInternal();
+        }
+        if (beaconRequest.destroy() == LifecycleRequestState.Action.STOP) {
+            stopBeaconDiscoveryInternal();
+        }
+        discovering = false;
+        beaconDiscovering = false;
         closeAdapter();
         stopBeaconDiscoveryInternal();
-        beaconDiscovering = false;
         discoveredBeacons.clear();
         // Close all GATT connections
         for (BluetoothGatt gatt : gattConnections.values()) {

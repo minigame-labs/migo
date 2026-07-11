@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use bytemuck::allocation::cast_vec;
 use deno_core::{OpState, op2};
 use tracing::{error, warn};
 
@@ -11,7 +10,9 @@ use shared::{
     js_escape::escape_for_json_string,
     op_state::CanvasOpState,
     protocol::{
-        render_cmd::{GLCmd, RenderCmdResp, RenderCommand, ShaderType},
+        render_cmd::{
+            GLCmd, RenderCmdResp, RenderCommand, ShaderType, UniformF32Values, UniformI32Values,
+        },
         send_gl_with_resp_sync,
     },
 };
@@ -56,8 +57,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        GlResourceIdAllocator, bind_buffer_base_impl, bind_buffer_range_impl,
-        normalize_tex_upload_3d_source,
+        GlResourceIdAllocator, bind_buffer_base_impl, bind_buffer_range_impl, copy_f32_words,
+        copy_i32_words, gl_cmd_has_heap_payload, normalize_tex_upload_3d_source,
     };
     use crate::rendering::webgl::{
         error_state::{self, WebGLErrorState, codes},
@@ -65,6 +66,7 @@ mod tests {
     };
     use crate::{HostJsRuntime, host_runtime::SharedMountTableRef};
     use shared::{
+        FrameOp,
         channel::ThreadWakeup,
         device::gpu_caps::GpuCaps,
         op_state::{AudioSender, HostOpState, NetworkPolicy},
@@ -103,6 +105,7 @@ mod tests {
                 workers_path: None,
                 network_policy: NetworkPolicy::default(),
                 backgrounded: Arc::new(AtomicBool::new(false)),
+                timer_backgrounded: Arc::new(AtomicBool::new(false)),
                 webgl_context_created: Arc::new(AtomicBool::new(false)),
                 context_lost: Arc::new(shared::op_state::ContextLostState::default()),
                 code_signing_enabled: false,
@@ -162,12 +165,79 @@ mod tests {
         })
     }
 
+    fn recv_gl_commands(render_rx: &crossbeam_channel::Receiver<RenderCommand>) -> Vec<GLCmd> {
+        loop {
+            match render_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("expected flushed WebGL frame packet")
+            {
+                RenderCommand::FramePacket(packet) => {
+                    for op in packet.into_ops() {
+                        if let FrameOp::GlBatch(payload) = op {
+                            return payload.commands;
+                        }
+                    }
+                    panic!("flushed frame packet did not contain a GL batch");
+                }
+                other => panic!("unexpected render command before GL batch: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn allocates_monotonic_non_zero_ids() {
         let mut alloc = GlResourceIdAllocator::new();
         assert_eq!(alloc.alloc(), 1);
         assert_eq!(alloc.alloc(), 2);
         assert_eq!(alloc.alloc(), 3);
+    }
+
+    #[test]
+    fn sixteen_uniform_words_copy_inline_and_seventeen_spill() {
+        let inline_words = [1.0f32.to_bits(); 16];
+        let inline = copy_f32_words(&inline_words);
+        assert_eq!(inline.len(), 16);
+        assert!(!inline.spilled());
+        assert!(inline.iter().all(|value| *value == 1.0));
+
+        let spilled_words = [2.0f32.to_bits(); 17];
+        let spilled = copy_f32_words(&spilled_words);
+        assert_eq!(spilled.len(), 17);
+        assert!(spilled.spilled());
+    }
+
+    #[test]
+    fn integer_uniform_words_preserve_signed_bits() {
+        let words = [0u32, 1, u32::MAX, i32::MIN as u32];
+        let copied = copy_i32_words(&words);
+        assert_eq!(copied.as_slice(), &[0, 1, -1, i32::MIN]);
+        assert!(!copied.spilled());
+    }
+
+    #[test]
+    fn empty_uniform_word_slices_stay_inline() {
+        assert!(copy_f32_words(&[]).is_empty());
+        assert!(!copy_f32_words(&[]).spilled());
+        assert!(copy_i32_words(&[]).is_empty());
+        assert!(!copy_i32_words(&[]).spilled());
+    }
+
+    #[test]
+    fn only_spilled_uniform_values_are_classified_as_heap_payloads() {
+        let inline = GLCmd::UniformMatrix4fv {
+            canvas_id: 1,
+            location: Some(1),
+            transpose: false,
+            value: (0..16).map(|n| n as f32).collect(),
+        };
+        let spilled = GLCmd::Uniform1fv {
+            canvas_id: 1,
+            location: Some(1),
+            value: (0..17).map(|n| n as f32).collect(),
+        };
+
+        assert!(!gl_cmd_has_heap_payload(&inline));
+        assert!(gl_cmd_has_heap_payload(&spilled));
     }
 
     #[test]
@@ -232,6 +302,163 @@ mod tests {
             TexImage3DSource::BufferOffset(offset) => assert_eq!(offset, 24),
             other => panic!("expected buffer offset source, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plain_float_uniform_sequence_preserves_values() {
+        let (mut runtime, render_rx) = new_webgl_runtime();
+        runtime
+            .exec_script(
+                "plain_float_uniform_sequence.js",
+                r#"
+                const ctx = new WebGLRenderingContext({ _rid: 13, width: 1, height: 1 }, {});
+                ctx.uniform4fv({ id: 9 }, [1.5, -2.25, 0.0, 7.75]);
+                ctx.flush();
+                "#,
+            )
+            .expect("plain float uniform sequence should be accepted");
+
+        let commands = recv_gl_commands(&render_rx);
+        let Some(GLCmd::Uniform4fv { value, .. }) = commands.into_iter().next() else {
+            panic!("expected one Uniform4fv command");
+        };
+        assert_eq!(value.as_slice(), &[1.5, -2.25, 0.0, 7.75]);
+    }
+
+    #[test]
+    fn uniform_array_is_copied_when_the_op_is_called() {
+        let (mut runtime, render_rx) = new_webgl_runtime();
+        runtime
+            .exec_script(
+                "uniform_call_time_copy.js",
+                r#"
+                const ctx = new WebGLRenderingContext({ _rid: 14, width: 1, height: 1 }, {});
+                const source = new Float32Array([1.25, 2.5, 3.75, 5.0]);
+                ctx.uniform4fv({ id: 10 }, source);
+                source[0] = 99.0;
+                source[1] = 101.0;
+                ctx.flush();
+                "#,
+            )
+            .expect("typed float uniform should be accepted");
+
+        let commands = recv_gl_commands(&render_rx);
+        let Some(GLCmd::Uniform4fv { value, .. }) = commands.into_iter().next() else {
+            panic!("expected one Uniform4fv command");
+        };
+        assert_eq!(value.as_slice(), &[1.25, 2.5, 3.75, 5.0]);
+    }
+
+    #[test]
+    fn integer_uniform_typed_sequence_is_converted_numerically() {
+        let (mut runtime, render_rx) = new_webgl_runtime();
+        runtime
+            .exec_script(
+                "integer_uniform_typed_sequence.js",
+                r#"
+                const ctx = new WebGLRenderingContext({ _rid: 17, width: 1, height: 1 }, {});
+                ctx.uniform4iv({ id: 13 }, new Uint16Array([1, 2, 32768, 65535]));
+                ctx.flush();
+                "#,
+            )
+            .expect("integer typed sequence should be accepted");
+
+        let commands = recv_gl_commands(&render_rx);
+        let Some(GLCmd::Uniform4iv { value, .. }) = commands.into_iter().next() else {
+            panic!("expected one Uniform4iv command");
+        };
+        assert_eq!(value.as_slice(), &[1, 2, 32768, 65535]);
+    }
+
+    #[test]
+    fn uniform_helpers_copy_shared_backing_before_fast_borrow() {
+        let source = include_str!("02_webgl_context.js");
+
+        assert!(
+            source.contains("isSharedArrayBuffer"),
+            "uniform conversion must identify SharedArrayBuffer backing"
+        );
+        assert!(
+            source.contains("ensureNonSharedTypedArray"),
+            "uniform conversion must copy shared views before Rust borrows them"
+        );
+    }
+
+    #[test]
+    fn shared_uniform_source_preserves_call_time_values() {
+        let (mut runtime, render_rx) = new_webgl_runtime();
+        runtime
+            .exec_script(
+                "shared_uniform_call_time_copy.js",
+                r#"
+                const ctx = new WebGLRenderingContext({ _rid: 18, width: 1, height: 1 }, {});
+                const source = new Float32Array(new SharedArrayBuffer(16));
+                source.set([1.25, 2.5, 3.75, 5.0]);
+                ctx.uniform4fv({ id: 14 }, source);
+                source.set([99.0, 101.0, 103.0, 105.0]);
+                ctx.flush();
+                "#,
+            )
+            .expect("shared float uniform should be copied safely");
+
+        let commands = recv_gl_commands(&render_rx);
+        let Some(GLCmd::Uniform4fv { value, .. }) = commands.into_iter().next() else {
+            panic!("expected one Uniform4fv command");
+        };
+        assert_eq!(value.as_slice(), &[1.25, 2.5, 3.75, 5.0]);
+    }
+
+    #[test]
+    fn plain_matrix3_uniform_sequence_is_accepted() {
+        let (mut runtime, render_rx) = new_webgl_runtime();
+        runtime
+            .exec_script(
+                "plain_matrix3_uniform_sequence.js",
+                r#"
+                const ctx = new WebGLRenderingContext({ _rid: 15, width: 1, height: 1 }, {});
+                ctx.uniformMatrix3fv(
+                    { id: 11 },
+                    false,
+                    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                );
+                ctx.flush();
+                "#,
+            )
+            .expect("plain matrix3 Float32List sequence should be accepted");
+
+        let commands = recv_gl_commands(&render_rx);
+        let Some(GLCmd::UniformMatrix3fv { value, .. }) = commands.into_iter().next() else {
+            panic!("expected one UniformMatrix3fv command");
+        };
+        assert_eq!(
+            value.as_slice(),
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn float_uniform_ignores_shadowed_typed_array_metadata() {
+        let (mut runtime, render_rx) = new_webgl_runtime();
+        runtime
+            .exec_script(
+                "shadowed_float_uniform_metadata.js",
+                r#"
+                const ctx = new WebGLRenderingContext({ _rid: 16, width: 1, height: 1 }, {});
+                const source = new Float32Array([1.5, 2.5, 3.5, 4.5]);
+                Object.defineProperty(source, "buffer", { value: new ArrayBuffer(16) });
+                Object.defineProperty(source, "byteOffset", { value: 0 });
+                Object.defineProperty(source, "length", { value: 4 });
+                ctx.uniform4fv({ id: 12 }, source);
+                ctx.flush();
+                "#,
+            )
+            .expect("shadow properties must not affect internal typed-array metadata");
+
+        let commands = recv_gl_commands(&render_rx);
+        let Some(GLCmd::Uniform4fv { value, .. }) = commands.into_iter().next() else {
+            panic!("expected one Uniform4fv command");
+        };
+        assert_eq!(value.as_slice(), &[1.5, 2.5, 3.5, 4.5]);
     }
 
     #[test]
@@ -309,6 +536,19 @@ mod tests {
     }
 }
 
+#[inline]
+fn copy_f32_words(words: &[u32]) -> UniformF32Values {
+    words.iter().map(|word| f32::from_bits(*word)).collect()
+}
+
+#[inline]
+fn copy_i32_words(words: &[u32]) -> UniformI32Values {
+    words
+        .iter()
+        .map(|word| i32::from_ne_bytes(word.to_ne_bytes()))
+        .collect()
+}
+
 /// Compile-time test: does this `GLCmd` variant carry a heap
 /// payload large enough that it could single-handedly blow the
 /// collector's 4 MiB soft budget?
@@ -327,36 +567,38 @@ mod tests {
 /// comparisons (jump table), so the fast path remains cheap.
 #[inline(always)]
 fn gl_cmd_has_heap_payload(cmd: &GLCmd) -> bool {
-    matches!(
-        cmd,
-        GLCmd::BufferData { .. }
-            | GLCmd::BufferSubData { .. }
-            | GLCmd::TexImage2D { .. }
-            | GLCmd::TexSubImage2D { .. }
-            | GLCmd::CompressedTexImage2D { .. }
-            | GLCmd::CompressedTexSubImage2D { .. }
-            | GLCmd::ShaderSource { .. }
-            | GLCmd::GetUniformLocation { .. }
-            | GLCmd::GetAttribLocation { .. }
-            | GLCmd::BindAttribLocation { .. }
-            | GLCmd::GetUniformBlockIndex { .. }
-            | GLCmd::Uniform1iv { .. }
-            | GLCmd::Uniform2iv { .. }
-            | GLCmd::Uniform3iv { .. }
-            | GLCmd::Uniform4iv { .. }
-            | GLCmd::Uniform1fv { .. }
-            | GLCmd::Uniform2fv { .. }
-            | GLCmd::Uniform3fv { .. }
-            | GLCmd::Uniform4fv { .. }
-            | GLCmd::UniformMatrix2fv { .. }
-            | GLCmd::UniformMatrix3fv { .. }
-            | GLCmd::UniformMatrix4fv { .. }
-            | GLCmd::InvalidateFramebuffer { .. }
-            | GLCmd::DrawBuffers { .. }
-            | GLCmd::TransformFeedbackVaryings { .. }
-            | GLCmd::TexImage3D { .. }
-            | GLCmd::TexSubImage3D { .. }
-    )
+    match cmd {
+        GLCmd::Uniform1iv { value, .. }
+        | GLCmd::Uniform2iv { value, .. }
+        | GLCmd::Uniform3iv { value, .. }
+        | GLCmd::Uniform4iv { value, .. } => value.spilled(),
+        GLCmd::Uniform1fv { value, .. }
+        | GLCmd::Uniform2fv { value, .. }
+        | GLCmd::Uniform3fv { value, .. }
+        | GLCmd::Uniform4fv { value, .. }
+        | GLCmd::UniformMatrix2fv { value, .. }
+        | GLCmd::UniformMatrix3fv { value, .. }
+        | GLCmd::UniformMatrix4fv { value, .. } => value.spilled(),
+        _ => matches!(
+            cmd,
+            GLCmd::BufferData { .. }
+                | GLCmd::BufferSubData { .. }
+                | GLCmd::TexImage2D { .. }
+                | GLCmd::TexSubImage2D { .. }
+                | GLCmd::CompressedTexImage2D { .. }
+                | GLCmd::CompressedTexSubImage2D { .. }
+                | GLCmd::ShaderSource { .. }
+                | GLCmd::GetUniformLocation { .. }
+                | GLCmd::GetAttribLocation { .. }
+                | GLCmd::BindAttribLocation { .. }
+                | GLCmd::GetUniformBlockIndex { .. }
+                | GLCmd::InvalidateFramebuffer { .. }
+                | GLCmd::DrawBuffers { .. }
+                | GLCmd::TransformFeedbackVaryings { .. }
+                | GLCmd::TexImage3D { .. }
+                | GLCmd::TexSubImage3D { .. }
+        ),
+    }
 }
 
 #[inline]
@@ -1064,14 +1306,14 @@ pub fn op_uniform_matrix_3fv(
     #[smi] canvas_id: u32,
     location: i32,
     transpose: bool,
-    #[buffer(copy)] value: Vec<u32>,
+    #[buffer] value: &[u32],
 ) {
     let location = if location < 0 {
         None
     } else {
         Some(location as u32)
     };
-    let value: Vec<f32> = cast_vec(value);
+    let value = copy_f32_words(value);
 
     queue_gl_fire_and_forget(
         state,
@@ -2062,14 +2304,14 @@ pub fn op_uniform1iv(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     location: i32,
-    #[buffer(copy)] value: Vec<u32>,
+    #[buffer] value: &[u32],
 ) {
     let location = if location < 0 {
         None
     } else {
         Some(location as u32)
     };
-    let value: Vec<i32> = cast_vec(value);
+    let value = copy_i32_words(value);
     queue_gl_fire_and_forget(
         state,
         GLCmd::Uniform1iv {
@@ -2085,14 +2327,14 @@ pub fn op_uniform1fv(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     location: i32,
-    #[buffer(copy)] value: Vec<u32>,
+    #[buffer] value: &[u32],
 ) {
     let location = if location < 0 {
         None
     } else {
         Some(location as u32)
     };
-    let value: Vec<f32> = cast_vec(value);
+    let value = copy_f32_words(value);
     queue_gl_fire_and_forget(
         state,
         GLCmd::Uniform1fv {
@@ -2108,14 +2350,14 @@ pub fn op_uniform2iv(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     location: i32,
-    #[buffer(copy)] value: Vec<u32>,
+    #[buffer] value: &[u32],
 ) {
     let location = if location < 0 {
         None
     } else {
         Some(location as u32)
     };
-    let value: Vec<i32> = cast_vec(value);
+    let value = copy_i32_words(value);
     queue_gl_fire_and_forget(
         state,
         GLCmd::Uniform2iv {
@@ -2131,14 +2373,14 @@ pub fn op_uniform2fv(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     location: i32,
-    #[buffer(copy)] value: Vec<u32>,
+    #[buffer] value: &[u32],
 ) {
     let location = if location < 0 {
         None
     } else {
         Some(location as u32)
     };
-    let value: Vec<f32> = cast_vec(value);
+    let value = copy_f32_words(value);
     queue_gl_fire_and_forget(
         state,
         GLCmd::Uniform2fv {
@@ -2154,14 +2396,14 @@ pub fn op_uniform3iv(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     location: i32,
-    #[buffer(copy)] value: Vec<u32>,
+    #[buffer] value: &[u32],
 ) {
     let location = if location < 0 {
         None
     } else {
         Some(location as u32)
     };
-    let value: Vec<i32> = cast_vec(value);
+    let value = copy_i32_words(value);
     queue_gl_fire_and_forget(
         state,
         GLCmd::Uniform3iv {
@@ -2177,14 +2419,14 @@ pub fn op_uniform3fv(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     location: i32,
-    #[buffer(copy)] value: Vec<u32>,
+    #[buffer] value: &[u32],
 ) {
     let location = if location < 0 {
         None
     } else {
         Some(location as u32)
     };
-    let value: Vec<f32> = cast_vec(value);
+    let value = copy_f32_words(value);
     queue_gl_fire_and_forget(
         state,
         GLCmd::Uniform3fv {
@@ -2200,14 +2442,14 @@ pub fn op_uniform4iv(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     location: i32,
-    #[buffer(copy)] value: Vec<u32>,
+    #[buffer] value: &[u32],
 ) {
     let location = if location < 0 {
         None
     } else {
         Some(location as u32)
     };
-    let value: Vec<i32> = cast_vec(value);
+    let value = copy_i32_words(value);
     queue_gl_fire_and_forget(
         state,
         GLCmd::Uniform4iv {
@@ -2223,14 +2465,14 @@ pub fn op_uniform4fv(
     state: &mut OpState,
     #[smi] canvas_id: u32,
     location: i32,
-    #[buffer(copy)] value: Vec<u32>,
+    #[buffer] value: &[u32],
 ) {
     let location = if location < 0 {
         None
     } else {
         Some(location as u32)
     };
-    let value: Vec<f32> = cast_vec(value);
+    let value = copy_f32_words(value);
     queue_gl_fire_and_forget(
         state,
         GLCmd::Uniform4fv {
@@ -2247,14 +2489,14 @@ pub fn op_uniform_matrix_2fv(
     #[smi] canvas_id: u32,
     location: i32,
     transpose: bool,
-    #[buffer(copy)] value: Vec<u32>,
+    #[buffer] value: &[u32],
 ) {
     let location = if location < 0 {
         None
     } else {
         Some(location as u32)
     };
-    let value: Vec<f32> = cast_vec(value);
+    let value = copy_f32_words(value);
     queue_gl_fire_and_forget(
         state,
         GLCmd::UniformMatrix2fv {
@@ -2272,14 +2514,14 @@ pub fn op_uniform_matrix_4fv(
     #[smi] canvas_id: u32,
     location: i32,
     transpose: bool,
-    #[buffer(copy)] value: Vec<u32>,
+    #[buffer] value: &[u32],
 ) {
     let location = if location < 0 {
         None
     } else {
         Some(location as u32)
     };
-    let value: Vec<f32> = cast_vec(value);
+    let value = copy_f32_words(value);
     queue_gl_fire_and_forget(
         state,
         GLCmd::UniformMatrix4fv {

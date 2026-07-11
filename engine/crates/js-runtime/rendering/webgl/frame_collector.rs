@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 
+use shared::command_vec_pool::{take_canvas_command_vec, take_gl_command_vec};
 use shared::protocol::frame_packet::FrameOp;
 use shared::protocol::render_cmd::{
     Canvas2DCmd, CanvasBatchPayload, DirtyRect, GLCmd, GlBatchPayload,
@@ -206,7 +207,7 @@ impl UnifiedFrameCollector {
         if self.current != CurrentKind::Canvas2D(canvas_id) {
             self.segments.push(FrameSegment::Canvas2D(Canvas2DSegment {
                 canvas_id,
-                commands: Vec::with_capacity(256),
+                commands: take_canvas_command_vec(),
                 dirty_rect: None,
                 dirty_poisoned: false,
             }));
@@ -231,7 +232,7 @@ impl UnifiedFrameCollector {
     pub(crate) fn push_gl(&mut self, cmd: GLCmd) {
         if self.current != CurrentKind::GL {
             self.segments.push(FrameSegment::GL(GlSegment {
-                commands: Vec::with_capacity(256),
+                commands: take_gl_command_vec(),
             }));
             self.current = CurrentKind::GL;
         }
@@ -278,7 +279,7 @@ impl UnifiedFrameCollector {
         const BASE_BYTES: usize = std::mem::size_of::<GLCmd>();
         if self.current != CurrentKind::GL {
             self.segments.push(FrameSegment::GL(GlSegment {
-                commands: Vec::with_capacity(256),
+                commands: take_gl_command_vec(),
             }));
             self.current = CurrentKind::GL;
         }
@@ -813,6 +814,38 @@ mod tests {
         c.push_canvas2d(1, Canvas2DCmd::Save);
         let _ = c.build_frame_packet(true);
         assert!(c.build_frame_packet(true).is_none());
+    }
+
+    #[test]
+    fn interleaved_single_command_segments_do_not_reserve_256_slots_each() {
+        let mut c = UnifiedFrameCollector::new();
+        for _ in 0..50 {
+            c.push_canvas2d(1, Canvas2DCmd::Save);
+            c.push_gl(GLCmd::Clear {
+                canvas_id: 1u32.into(),
+                bit_field: 0x4000,
+            });
+        }
+
+        let reserved_bytes = c
+            .segments
+            .iter()
+            .map(|segment| match segment {
+                FrameSegment::Canvas2D(segment) => {
+                    segment.commands.capacity() * std::mem::size_of::<Canvas2DCmd>()
+                }
+                FrameSegment::GL(segment) => {
+                    segment.commands.capacity() * std::mem::size_of::<GLCmd>()
+                }
+            })
+            .sum::<usize>();
+        let old_256_slot_bytes =
+            50 * 256 * (std::mem::size_of::<Canvas2DCmd>() + std::mem::size_of::<GLCmd>());
+
+        assert!(
+            reserved_bytes <= old_256_slot_bytes / 8,
+            "100 single-command interleaved segments reserved {reserved_bytes} bytes; old policy reserved {old_256_slot_bytes} bytes"
+        );
     }
 
     #[test]

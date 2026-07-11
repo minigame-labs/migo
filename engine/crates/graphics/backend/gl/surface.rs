@@ -459,7 +459,7 @@ impl Canvas2DContext {
     ) -> bool {
         let env = super::canvas::DrawEnv {
             canvas: self.surface.canvas(),
-            text,
+            text: Some(text),
             resolver,
         };
         self.renderer.apply_env(&env, cmd)
@@ -481,7 +481,7 @@ impl Canvas2DContext {
     pub fn apply_with_images(
         &mut self,
         cmd: &shared::protocol::render_cmd::Canvas2DCmd,
-        text: &TextContext,
+        text: Option<&TextContext>,
         image_store: &mut ImageStore,
     ) -> bool {
         // P2-12: dispatch via an explicit `FastPathOutcome` rather

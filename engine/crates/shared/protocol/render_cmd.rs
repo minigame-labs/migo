@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crossbeam_channel::Sender;
+use smallvec::SmallVec;
 use tokio::sync::oneshot;
 
 pub use crate::protocol::color::Color;
@@ -18,6 +19,8 @@ pub type TextureId = u32;
 pub type FramebufferId = u32;
 pub type RenderbufferId = u32;
 pub type Context2DId = u32;
+pub type UniformI32Values = SmallVec<[i32; 16]>;
+pub type UniformF32Values = SmallVec<[f32; 16]>;
 /// WebGL 2 Vertex Array Object id.  Also used by WebGL 1 games that opt
 /// into the `OES_vertex_array_object` extension — the underlying engine
 /// resource is the same.
@@ -660,7 +663,7 @@ pub enum GLCmd {
         canvas_id: CanvasId,
         location: Option<u32>,
         transpose: bool,
-        value: Vec<f32>,
+        value: UniformF32Values,
     },
 
     // ========== Phase 1A: GL State ==========
@@ -1041,54 +1044,54 @@ pub enum GLCmd {
     Uniform1iv {
         canvas_id: CanvasId,
         location: Option<u32>,
-        value: Vec<i32>,
+        value: UniformI32Values,
     },
     Uniform1fv {
         canvas_id: CanvasId,
         location: Option<u32>,
-        value: Vec<f32>,
+        value: UniformF32Values,
     },
     Uniform2iv {
         canvas_id: CanvasId,
         location: Option<u32>,
-        value: Vec<i32>,
+        value: UniformI32Values,
     },
     Uniform2fv {
         canvas_id: CanvasId,
         location: Option<u32>,
-        value: Vec<f32>,
+        value: UniformF32Values,
     },
     Uniform3iv {
         canvas_id: CanvasId,
         location: Option<u32>,
-        value: Vec<i32>,
+        value: UniformI32Values,
     },
     Uniform3fv {
         canvas_id: CanvasId,
         location: Option<u32>,
-        value: Vec<f32>,
+        value: UniformF32Values,
     },
     Uniform4iv {
         canvas_id: CanvasId,
         location: Option<u32>,
-        value: Vec<i32>,
+        value: UniformI32Values,
     },
     Uniform4fv {
         canvas_id: CanvasId,
         location: Option<u32>,
-        value: Vec<f32>,
+        value: UniformF32Values,
     },
     UniformMatrix2fv {
         canvas_id: CanvasId,
         location: Option<u32>,
         transpose: bool,
-        value: Vec<f32>,
+        value: UniformF32Values,
     },
     UniformMatrix4fv {
         canvas_id: CanvasId,
         location: Option<u32>,
         transpose: bool,
-        value: Vec<f32>,
+        value: UniformF32Values,
     },
 
     // ========== Phase 3A: Framebuffer/Renderbuffer ==========
@@ -1867,6 +1870,71 @@ pub enum Canvas2DCmd {
     },
 }
 
+impl Canvas2DCmd {
+    /// Whether executing this command consults the shared text shaping and
+    /// font context. This match is deliberately exhaustive so every future
+    /// command must make an explicit lock decision when it is introduced.
+    #[inline]
+    pub fn requires_text_context(&self) -> bool {
+        match self {
+            Self::FillText { .. } | Self::StrokeText { .. } | Self::MeasureText { .. } => true,
+
+            Self::CreateContext2D
+            | Self::ResizeCanvas { .. }
+            | Self::BeginPath
+            | Self::ClosePath
+            | Self::MoveTo { .. }
+            | Self::LineTo { .. }
+            | Self::QuadraticCurveTo { .. }
+            | Self::BezierCurveTo { .. }
+            | Self::Arc { .. }
+            | Self::ArcTo { .. }
+            | Self::Rect { .. }
+            | Self::Ellipse { .. }
+            | Self::Fill
+            | Self::Stroke
+            | Self::Clip
+            | Self::FillRect { .. }
+            | Self::StrokeRect { .. }
+            | Self::ClearRect { .. }
+            | Self::SetFillStyle { .. }
+            | Self::SetStrokeStyle { .. }
+            | Self::SetLineWidth { .. }
+            | Self::SetLineCap { .. }
+            | Self::SetLineJoin { .. }
+            | Self::SetMiterLimit { .. }
+            | Self::SetGlobalAlpha { .. }
+            | Self::SetCompositeOperation { .. }
+            | Self::SetLineDash { .. }
+            | Self::SetLineDashOffset { .. }
+            | Self::SetShadowBlur { .. }
+            | Self::SetShadowColor { .. }
+            | Self::SetShadowOffsetX { .. }
+            | Self::SetShadowOffsetY { .. }
+            | Self::SetFillStyleGradient { .. }
+            | Self::SetStrokeStyleGradient { .. }
+            | Self::SetFillStylePattern { .. }
+            | Self::SetStrokeStylePattern { .. }
+            | Self::SetFont { .. }
+            | Self::SetTextAlign { .. }
+            | Self::SetTextBaseline { .. }
+            | Self::SetTextDirection { .. }
+            | Self::Save
+            | Self::Restore
+            | Self::SetTransform { .. }
+            | Self::ResetTransform
+            | Self::Translate { .. }
+            | Self::Rotate { .. }
+            | Self::Scale { .. }
+            | Self::DrawImage { .. }
+            | Self::GetImageData { .. }
+            | Self::CaptureSnapshot { .. }
+            | Self::ReadSnapshotPixels { .. }
+            | Self::DrawImageBatch { .. } => false,
+        }
+    }
+}
+
 /// A single color stop for a linear/radial gradient.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GradientStop {
@@ -2078,7 +2146,9 @@ impl GLCmd {
             GLCmd::Uniform1iv { value, .. }
             | GLCmd::Uniform2iv { value, .. }
             | GLCmd::Uniform3iv { value, .. }
-            | GLCmd::Uniform4iv { value, .. } => value.capacity() * std::mem::size_of::<i32>(),
+            | GLCmd::Uniform4iv { value, .. } => {
+                usize::from(value.spilled()) * value.capacity() * std::mem::size_of::<i32>()
+            }
             GLCmd::Uniform1fv { value, .. }
             | GLCmd::Uniform2fv { value, .. }
             | GLCmd::Uniform3fv { value, .. }
@@ -2086,7 +2156,7 @@ impl GLCmd {
             | GLCmd::UniformMatrix2fv { value, .. }
             | GLCmd::UniformMatrix3fv { value, .. }
             | GLCmd::UniformMatrix4fv { value, .. } => {
-                value.capacity() * std::mem::size_of::<f32>()
+                usize::from(value.spilled()) * value.capacity() * std::mem::size_of::<f32>()
             }
 
             // WebGL 2 framebuffer metadata arrays.
@@ -2283,7 +2353,7 @@ mod approx_size_tests {
     #[test]
     fn uniform_matrix_4fv_counts_f32_slice() {
         // 3 matrices of 16 floats each = 48 floats = 192 bytes.
-        let value = vec![0.0f32; 48];
+        let value = vec![0.0f32; 48].into();
         let cmd = GLCmd::UniformMatrix4fv {
             canvas_id: CanvasId::from(1u32),
             location: Some(0),
@@ -2292,6 +2362,45 @@ mod approx_size_tests {
         };
         let size = cmd.approx_deep_size_bytes();
         assert!(size >= std::mem::size_of::<GLCmd>() + 48 * 4);
+    }
+
+    #[test]
+    fn single_mat4_uniform_payload_is_inline() {
+        let cmd = GLCmd::UniformMatrix4fv {
+            canvas_id: CanvasId::from(1u32),
+            location: Some(0),
+            transpose: false,
+            value: (0..16).map(|n| n as f32).collect(),
+        };
+
+        assert_eq!(
+            cmd.approx_deep_size_bytes(),
+            std::mem::size_of::<GLCmd>(),
+            "one mat4 should fit in the command's inline uniform storage"
+        );
+    }
+
+    #[test]
+    fn uniform_payload_over_inline_limit_counts_spilled_capacity() {
+        let cmd = GLCmd::Uniform1fv {
+            canvas_id: CanvasId::from(1u32),
+            location: Some(0),
+            value: (0..17).map(|n| n as f32).collect(),
+        };
+
+        assert!(
+            cmd.approx_deep_size_bytes() >= std::mem::size_of::<GLCmd>() + 17 * 4,
+            "17 floats must spill and contribute their heap capacity"
+        );
+    }
+
+    #[test]
+    fn gl_command_size_stays_within_existing_cache_line_budget() {
+        assert!(
+            std::mem::size_of::<GLCmd>() <= 144,
+            "GLCmd grew to {} bytes",
+            std::mem::size_of::<GLCmd>()
+        );
     }
 
     #[test]
@@ -2423,5 +2532,85 @@ mod approx_size_tests {
         assert_eq!(ca.touches_canvas(), Some(a));
         assert_eq!(cb.touches_canvas(), Some(b));
         assert_ne!(ca.touches_canvas(), cb.touches_canvas());
+    }
+}
+
+#[cfg(test)]
+mod text_context_tests {
+    use super::{Canvas2DCmd, RenderCmdResp, TextAlign, TextMetrics};
+
+    #[test]
+    fn only_text_execution_commands_require_the_shared_context() {
+        let fill = Canvas2DCmd::FillText {
+            text: "fill".into(),
+            x: 1.0,
+            y: 2.0,
+            max_width: 100.0,
+        };
+        let stroke = Canvas2DCmd::StrokeText {
+            text: "stroke".into(),
+            x: 1.0,
+            y: 2.0,
+            max_width: 100.0,
+        };
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let measure = Canvas2DCmd::MeasureText {
+            text: "measure".into(),
+            resp: RenderCmdResp::<TextMetrics>::from_sync(tx),
+        };
+
+        assert!(fill.requires_text_context());
+        assert!(stroke.requires_text_context());
+        assert!(measure.requires_text_context());
+
+        if let Canvas2DCmd::MeasureText { resp, .. } = measure {
+            resp.forget();
+        }
+    }
+
+    #[test]
+    fn text_state_and_non_text_commands_do_not_require_the_shared_context() {
+        let commands = [
+            Canvas2DCmd::SetFont {
+                font: "16px sans-serif".into(),
+            },
+            Canvas2DCmd::SetTextAlign {
+                align: TextAlign::Center,
+            },
+            Canvas2DCmd::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+            Canvas2DCmd::DrawImage {
+                image_id: 7,
+                sx: 0.0,
+                sy: 0.0,
+                sw: 1.0,
+                sh: 1.0,
+                dx: 0.0,
+                dy: 0.0,
+                dw: 1.0,
+                dh: 1.0,
+            },
+            Canvas2DCmd::BeginPath,
+            Canvas2DCmd::Save,
+            Canvas2DCmd::CaptureSnapshot {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                snapshot_id: 1,
+                cache_key: None,
+            },
+        ];
+
+        for command in commands {
+            assert!(
+                !command.requires_text_context(),
+                "unexpected text lock requirement for {command:?}"
+            );
+        }
     }
 }
