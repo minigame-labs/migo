@@ -853,13 +853,14 @@ impl JsBindings {
         }
     }
 
-    /// Dispatch camera frame data (RGBA pixel buffer for onCameraFrame / listenFrameChange).
+    /// Dispatch camera frame data (raw Y/U/V plane-window bytes concatenated in
+    /// Y, U, V order, for onCameraFrame / listenFrameChange).
     pub(crate) fn dispatch_camera_frame_data(
         &self,
         rt: &mut deno_core::JsRuntime,
         host_id: i32,
         camera_id: u32,
-        data: &[u8],
+        data: Vec<u8>,
         width: u32,
         height: u32,
     ) {
@@ -868,20 +869,18 @@ impl JsBindings {
             return;
         };
 
-        self.with_main_context(rt, |scope, _ctx, global| {
-            let ab = v8::ArrayBuffer::new(scope, data.len());
-            if !data.is_empty() {
-                let backing = ab.get_backing_store();
-                if let Some(ptr) = backing.data() {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            data.as_ptr(),
-                            ptr.as_ptr() as *mut u8,
-                            data.len(),
-                        );
-                    }
-                }
-            }
+        self.with_main_context(rt, move |scope, _ctx, global| {
+            // Hand the packed frame's allocation to V8 instead of copying it:
+            // `new_backing_store_from_vec` adopts the `Vec`'s heap buffer as the
+            // ArrayBuffer backing store, so there is no Rust->V8 copy. Valid
+            // camera frames are non-empty; an empty frame degrades to a plain
+            // empty ArrayBuffer.
+            let ab = if data.is_empty() {
+                v8::ArrayBuffer::new(scope, 0)
+            } else {
+                let store = v8::ArrayBuffer::new_backing_store_from_vec(data).make_shared();
+                v8::ArrayBuffer::with_backing_store(scope, &store)
+            };
 
             let args = [
                 v8::Integer::new(scope, camera_id as i32).into(),
@@ -920,5 +919,114 @@ impl JsBindings {
                 let _ = func.call(scope, global.into(), &args);
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deno_core::{JsRuntime, RuntimeOptions};
+
+    /// Real V8 regression for the camera-frame path: the frame `Vec<u8>` must be
+    /// ADOPTED by V8 (its allocation becomes the ArrayBuffer backing) instead of
+    /// copied. Records the `Vec`'s allocation pointer before the move, dispatches
+    /// through the production `dispatch_camera_frame_data`, then reads the
+    /// callback-visible `ArrayBuffer` back from Rust and asserts its backing
+    /// pointer equals the original `Vec` pointer (RED under the old copy path),
+    /// plus exact bytes, ArrayBuffer type/length, camera id, width, height.
+    #[test]
+    fn camera_frame_arraybuffer_adopts_vec_allocation_without_copy() {
+        let mut rt = JsRuntime::new(RuntimeOptions::default());
+        let mut bindings = JsBindings::new(&mut rt, 1);
+
+        // Install a capturing camera callback and register it as the handler.
+        let func = {
+            let ctx = rt.main_context();
+            let isolate = rt.v8_isolate();
+            v8::scope_with_context!(scope, isolate, &ctx);
+            let src = v8::String::new(
+                scope,
+                "(function(id, ab, w, h){ globalThis.__cam = { id: id, ab: ab, w: w, h: h }; })",
+            )
+            .unwrap();
+            let script = v8::Script::compile(scope, src, None).unwrap();
+            let val = script.run(scope).unwrap();
+            let f = v8::Local::<v8::Function>::try_from(val).unwrap();
+            v8::Global::new(scope, f)
+        };
+        bindings.camera_frame_fn = Some(func);
+
+        // Record the Vec's allocation pointer BEFORE it is moved into dispatch.
+        let bytes: Vec<u8> = vec![10, 20, 30, 0xFF, 0, 7, 200];
+        let expected = bytes.clone();
+        let orig_ptr = bytes.as_ptr();
+
+        bindings.dispatch_camera_frame_data(&mut rt, 1, 42, bytes, 640, 480);
+
+        // Read the callback-visible ArrayBuffer + scalars back from Rust.
+        let ctx = rt.main_context();
+        let isolate = rt.v8_isolate();
+        v8::scope_with_context!(scope, isolate, &ctx);
+        let context = v8::Local::new(scope, &ctx);
+        let global = context.global(scope);
+
+        let cam_key: v8::Local<v8::Value> = v8::String::new(scope, "__cam").unwrap().into();
+        let cam = global.get(scope, cam_key).expect("__cam set by callback");
+        let cam_obj = v8::Local::<v8::Object>::try_from(cam).expect("__cam is an object");
+
+        let id_key: v8::Local<v8::Value> = v8::String::new(scope, "id").unwrap().into();
+        let id = cam_obj
+            .get(scope, id_key)
+            .unwrap()
+            .int32_value(scope)
+            .unwrap();
+        assert_eq!(id, 42, "camera id preserved");
+
+        let w_key: v8::Local<v8::Value> = v8::String::new(scope, "w").unwrap().into();
+        let w = cam_obj
+            .get(scope, w_key)
+            .unwrap()
+            .int32_value(scope)
+            .unwrap();
+        assert_eq!(w, 640, "width preserved");
+
+        let h_key: v8::Local<v8::Value> = v8::String::new(scope, "h").unwrap().into();
+        let h = cam_obj
+            .get(scope, h_key)
+            .unwrap()
+            .int32_value(scope)
+            .unwrap();
+        assert_eq!(h, 480, "height preserved");
+
+        let ab_key: v8::Local<v8::Value> = v8::String::new(scope, "ab").unwrap().into();
+        let ab_val = cam_obj.get(scope, ab_key).unwrap();
+        assert!(
+            ab_val.is_array_buffer(),
+            "frame delivered as an ArrayBuffer"
+        );
+        let ab = v8::Local::<v8::ArrayBuffer>::try_from(ab_val).unwrap();
+        assert_eq!(
+            ab.byte_length(),
+            expected.len(),
+            "ArrayBuffer length == frame length"
+        );
+
+        let backing = ab.get_backing_store();
+        let backing_ptr = backing.data().expect("non-empty backing store").as_ptr() as *const u8;
+
+        // Exact bytes visible to JS.
+        let mut got = vec![0u8; expected.len()];
+        unsafe {
+            std::ptr::copy_nonoverlapping(backing_ptr, got.as_mut_ptr(), expected.len());
+        }
+        assert_eq!(got, expected, "exact frame bytes visible to JS");
+
+        // The regression: V8 adopts the moved Vec's allocation, so the backing
+        // pointer equals the original Vec pointer. Under the old copy path these
+        // differ (a fresh V8 allocation), which is the RED evidence.
+        assert_eq!(
+            backing_ptr, orig_ptr,
+            "ArrayBuffer backing must be the moved Vec's allocation (zero-copy transfer)"
+        );
     }
 }

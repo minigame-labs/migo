@@ -486,7 +486,7 @@ impl HostJsRuntime {
     pub fn dispatch_camera_frame_data(
         &mut self,
         camera_id: u32,
-        data: &[u8],
+        data: Vec<u8>,
         width: u32,
         height: u32,
     ) {

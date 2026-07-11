@@ -295,9 +295,8 @@ public final class CameraManager {
                 closeSession();
                 if (frameListening.get()) {
                     createFrameReader();
-                } else if (frameReader != null) {
-                    frameReader.close();
-                    frameReader = null;
+                } else {
+                    closeFrameReader();
                 }
                 startPreviewSession();
             } catch (Exception e) {
@@ -642,10 +641,7 @@ public final class CameraManager {
             sessionNeedsReconfigure = true;
         }
 
-        if (frameReader != null) {
-            frameReader.close();
-            frameReader = null;
-        }
+        closeFrameReader();
         Log.d(TAG, "closeFrameChange() completed");
     }
 
@@ -769,11 +765,7 @@ public final class CameraManager {
                 cameraDevice = null;
             }
 
-            if (frameReader != null) {
-                Log.d(TAG, "closeCamera() closing frame reader");
-                frameReader.close();
-                frameReader = null;
-            }
+            closeFrameReader();
 
             if (photoReader != null) {
                 Log.d(TAG, "closeCamera() closing photo reader");
@@ -902,10 +894,29 @@ public final class CameraManager {
         startPreviewSession();
     }
 
-    private void createFrameReader() {
+    /**
+     * Close and clear {@link #frameReader} under the CameraManager monitor.
+     *
+     * <p>Holding this monitor is what makes reader teardown safe against the
+     * frame listener, not merely lifecycle-event delivery: after
+     * {@link ImageReader#close()} any previously-acquired {@link Image} and its
+     * {@link Image.Plane} direct {@code ByteBuffer}s are undefined (per the
+     * ImageReader docs), and Q8's native path reads that plane memory in JNI.
+     * The listener holds the same monitor across acquire/read/close, so a close
+     * routed through here can never invalidate a reader/Image mid-read. Every
+     * {@code frameReader.close()} must go through this helper.
+     */
+    private synchronized void closeFrameReader() {
         if (frameReader != null) {
             frameReader.close();
+            frameReader = null;
         }
+    }
+
+    private synchronized void createFrameReader() {
+        // Close/replace/configure the reader under the same monitor the listener
+        // uses, so the swap is atomic with respect to frame delivery.
+        closeFrameReader();
 
         // Use YUV_420_888 for frame data - widely supported and efficient
         frameReader = ImageReader.newInstance(
@@ -913,35 +924,58 @@ public final class CameraManager {
                 ImageFormat.YUV_420_888, 2);
 
         frameReader.setOnImageAvailableListener(reader -> {
-            if (!frameListening.get()) return;
+            // The CameraManager monitor is held across acquire -> plane read ->
+            // JNI -> Image close so that no concurrent frameReader close (via
+            // closeFrameReader, used by destroy/closeCamera/closeFrameChange/
+            // resume/createFrameReader) can invalidate the reader or the
+            // acquired Image's direct plane ByteBuffers while native code reads
+            // them. This guards direct-buffer USE, not just event delivery.
+            synchronized (CameraManager.this) {
+                // A stale/replaced reader may still fire; only serve the current
+                // frameReader.
+                if (reader != frameReader) return;
+                if (!frameListening.get() || !cameraActivityRequest.isActive()) return;
 
-            Image image = null;
-            try {
-                image = reader.acquireLatestImage();
-                if (image == null) return;
+                Image image = null;
+                try {
+                    image = reader.acquireLatestImage();
+                    if (image == null) return;
 
-                // Extract Y plane data (grayscale) for minimal overhead,
-                // or full RGBA if needed. We send raw bytes for JS to process.
-                ByteBuffer yBuffer = image.getPlanes()[0].getBuffer();
-                ByteBuffer uBuffer = image.getPlanes()[1].getBuffer();
-                ByteBuffer vBuffer = image.getPlanes()[2].getBuffer();
+                    // YUV_420_888 must expose exactly three planes; drop
+                    // malformed vendor output rather than indexing blindly.
+                    Image.Plane[] planes = image.getPlanes();
+                    if (planes.length != 3) {
+                        Log.w(TAG, "onImageAvailable: expected 3 planes, got " + planes.length);
+                        return;
+                    }
 
-                int ySize = yBuffer.remaining();
-                int uSize = uBuffer.remaining();
-                int vSize = vBuffer.remaining();
+                    // Pass each plane's direct ByteBuffer by reference plus its
+                    // [position, position+remaining) window; native code copies
+                    // the windows once, concatenating them in Y/U/V order.
+                    // position()/remaining() are pure reads (no get()), so the
+                    // window matches position..limit and the planes are untouched.
+                    ByteBuffer yBuffer = planes[0].getBuffer();
+                    ByteBuffer uBuffer = planes[1].getBuffer();
+                    ByteBuffer vBuffer = planes[2].getBuffer();
 
-                byte[] data = new byte[ySize + uSize + vSize];
-                yBuffer.get(data, 0, ySize);
-                uBuffer.get(data, ySize, uSize);
-                vBuffer.get(data, ySize + uSize, vSize);
+                    int yOff = yBuffer.position();
+                    int yLen = yBuffer.remaining();
+                    int uOff = uBuffer.position();
+                    int uLen = uBuffer.remaining();
+                    int vOff = vBuffer.position();
+                    int vLen = vBuffer.remaining();
 
-                synchronized (CameraManager.this) {
-                    if (!frameListening.get() || !cameraActivityRequest.isActive()) return;
-                    NativeMethods.onCameraFrameData(sessionId, cameraId, data,
+                    // Synchronous native copy while the Image is still open.
+                    NativeMethods.onCameraFrameData(sessionId, cameraId,
+                            yBuffer, yOff, yLen,
+                            uBuffer, uOff, uLen,
+                            vBuffer, vOff, vLen,
                             image.getWidth(), image.getHeight());
+                } finally {
+                    // Close the Image BEFORE releasing the monitor so no closer
+                    // holding the same monitor can observe a half-consumed reader.
+                    if (image != null) image.close();
                 }
-            } finally {
-                if (image != null) image.close();
             }
         }, backgroundHandler);
     }

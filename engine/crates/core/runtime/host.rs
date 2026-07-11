@@ -748,7 +748,7 @@ impl Host {
                 height,
             } => {
                 self.js
-                    .dispatch_camera_frame_data(camera_id, &data, width, height);
+                    .dispatch_camera_frame_data(camera_id, data, width, height);
                 Ok(())
             }
 

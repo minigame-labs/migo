@@ -125,6 +125,7 @@ use core::{
     bump_destroy_epoch, current_destroy_epoch, send_command_to_host,
     send_critical_command_to_host, shutdown_host, spawn_host_thread,
 };
+use shared::protocol::camera_frame::{PlaneWindow, pack_yuv_planes};
 use shared::protocol::host_cmd::{
     BleCharacteristicData, HostCommand, TouchData, TouchPoint, TouchType,
 };
@@ -1024,22 +1025,92 @@ pub(crate) extern "system" fn onCameraEvent<'local>(
     });
 }
 
-pub(crate) extern "system" fn onCameraFrameData(
-    env: JNIEnv,
-    _class: JClass,
+pub(crate) extern "system" fn onCameraFrameData<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
     host_id: jint,
     camera_id: jint,
-    frame_data: jni::sys::jbyteArray,
+    y_buf: JByteBuffer<'local>,
+    y_off: jint,
+    y_len: jint,
+    u_buf: JByteBuffer<'local>,
+    u_off: jint,
+    u_len: jint,
+    v_buf: JByteBuffer<'local>,
+    v_off: jint,
+    v_len: jint,
     width: jint,
     height: jint,
 ) {
     jni_safe!("onCameraFrameData", {
-        let data = match env
-            .convert_byte_array(unsafe { jni::objects::JByteArray::from_raw(frame_data) })
-        {
+        // Validate dimensions before the signed -> unsigned cast below.
+        if width <= 0 || height <= 0 {
+            tracing::warn!(
+                "onCameraFrameData: non-positive dimensions {}x{}",
+                width,
+                height
+            );
+            return;
+        }
+
+        // Resolve each direct plane buffer's base address + capacity. The jni
+        // wrapper rejects null / non-direct buffers and a -1 capacity, so a
+        // malformed buffer is dropped rather than mis-read.
+        let resolve = |buf: &JByteBuffer, plane: &str| -> Option<(*mut u8, usize)> {
+            match (
+                env.get_direct_buffer_address(buf),
+                env.get_direct_buffer_capacity(buf),
+            ) {
+                (Ok(addr), Ok(cap)) => Some((addr, cap)),
+                _ => {
+                    tracing::warn!(
+                        "onCameraFrameData: {} plane buffer not direct/usable",
+                        plane
+                    );
+                    None
+                }
+            }
+        };
+        let (Some((y_addr, y_cap)), Some((u_addr, u_cap)), Some((v_addr, v_cap))) = (
+            resolve(&y_buf, "Y"),
+            resolve(&u_buf, "U"),
+            resolve(&v_buf, "V"),
+        ) else {
+            return;
+        };
+
+        // SAFETY: each (addr, cap) comes from a live, direct ByteBuffer whose
+        // backing Image is held open by the synchronous Java caller for the
+        // duration of this call. `u8` has alignment 1 and `addr` is non-null
+        // (the jni wrapper rejects null). These capacity slices are used only
+        // to pack into an owned `Vec` below; no slice, raw address, or
+        // `JByteBuffer` escapes this call or crosses the host channel.
+        let y_slice = unsafe { std::slice::from_raw_parts(y_addr as *const u8, y_cap) };
+        let u_slice = unsafe { std::slice::from_raw_parts(u_addr as *const u8, u_cap) };
+        let v_slice = unsafe { std::slice::from_raw_parts(v_addr as *const u8, v_cap) };
+
+        // The single copy: validate each `[offset, offset+len)` window against
+        // its capacity and concatenate Y/U/V into one owned Vec.
+        let packed = match pack_yuv_planes([
+            PlaneWindow {
+                buffer: y_slice,
+                offset: y_off,
+                len: y_len,
+            },
+            PlaneWindow {
+                buffer: u_slice,
+                offset: u_off,
+                len: u_len,
+            },
+            PlaneWindow {
+                buffer: v_slice,
+                offset: v_off,
+                len: v_len,
+            },
+        ]) {
             Ok(v) => v,
             Err(e) => {
-                error!("onCameraFrameData: failed to read byte array: {:?}", e);
+                tracing::warn!("onCameraFrameData: invalid plane window: {:?}", e);
                 return;
             }
         };
@@ -1048,7 +1119,7 @@ pub(crate) extern "system" fn onCameraFrameData(
             host_id,
             HostCommand::CameraFrameData {
                 camera_id: camera_id as u32,
-                data,
+                data: packed,
                 width: width as u32,
                 height: height as u32,
             },

@@ -327,7 +327,8 @@ pub enum HostCommand {
     CameraFrameData {
         /// JS-assigned camera instance ID.
         camera_id: u32,
-        /// Raw pixel data (RGBA).
+        /// Raw Y/U/V plane-window bytes concatenated in Y, U, V order (each
+        /// plane's `position..limit`), exactly as delivered to JS.
         data: Vec<u8>,
         /// Frame width in pixels.
         width: u32,
