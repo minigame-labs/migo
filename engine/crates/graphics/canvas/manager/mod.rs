@@ -206,6 +206,14 @@ pub(crate) struct CanvasManager {
     /// The next `create_onscreen()` call will perform a full resource rebuild.
     context_lost: bool,
 
+    /// One-shot: force the next `create_onscreen()` to fully tear down and
+    /// recreate the onscreen EGL surface, bypassing the same-window fast paths
+    /// (skip-recreate and fast-resize). Set by the render thread when a
+    /// surfaceDestroyed occurred (epoch advanced), because the previous
+    /// EGLSurface is bound to an abandoned ANativeWindow even if Android hands
+    /// back an equal window pointer/size. Consumed (cleared) on read.
+    force_onscreen_recreate: bool,
+
     /// Debug one-shot: when set (via `WEBGL_lose_context.loseContext()` ->
     /// `GLCmd::DebugLoseContext`), the next `check_graphics_reset_status()`
     /// poll reports a reset and consumes the flag, driving the exact same
@@ -602,6 +610,7 @@ impl CanvasManager {
             canvas2d_snapshot_read_fbo: None,
             last_swap_interval: -1, // force first eglSwapInterval call
             context_lost: false,
+            force_onscreen_recreate: false,
             simulated_reset: false,
             last_window: None,
             programs: HashMap::with_capacity(16),
@@ -701,6 +710,14 @@ impl CanvasManager {
         Ok(())
     }
 
+    /// Force the next `create_onscreen()` to fully recreate the onscreen EGL
+    /// surface, bypassing the same-window fast paths. Call before recreating
+    /// after a surfaceDestroyed (the old EGLSurface is bound to an abandoned
+    /// ANativeWindow even if the new window pointer/size compare equal).
+    pub(crate) fn force_next_onscreen_recreate(&mut self) {
+        self.force_onscreen_recreate = true;
+    }
+
     /// Create or recreate the onscreen canvas (id=1).
     ///
     /// `surface_size`: expected physical dimensions from the SurfaceRef.
@@ -730,19 +747,27 @@ impl CanvasManager {
 
         let id = CanvasId::from(1u32);
 
+        // Consume the force flag: when set (a surfaceDestroyed occurred), skip
+        // both same-window fast paths below and fall through to a full teardown +
+        // recreate, since the existing EGLSurface is bound to an abandoned window
+        // even if `window`/size compare equal.
+        let force_recreate = std::mem::take(&mut self.force_onscreen_recreate);
+
         // Same native window + same physical dimensions → skip destroy-recreate.
-        if let Some((exp_w, exp_h)) = surface_size {
-            if let Some(entry) = self.canvases.get(&id) {
-                if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
-                    && entry.physical_width == exp_w
-                    && entry.physical_height == exp_h
-                {
-                    tracing::info!(
-                        "CanvasManager::create_onscreen skip recreate: window unchanged and size matched {}x{}",
-                        exp_w,
-                        exp_h
-                    );
-                    return Ok(());
+        if !force_recreate {
+            if let Some((exp_w, exp_h)) = surface_size {
+                if let Some(entry) = self.canvases.get(&id) {
+                    if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
+                        && entry.physical_width == exp_w
+                        && entry.physical_height == exp_h
+                    {
+                        tracing::info!(
+                            "CanvasManager::create_onscreen skip recreate: window unchanged and size matched {}x{}",
+                            exp_w,
+                            exp_h
+                        );
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -764,22 +789,24 @@ impl CanvasManager {
         //     — EGLSurface is bound to the ANativeWindow that's
         //     gone);
         //   * there is no existing 2D context (first frame).
-        if let Some((exp_w, exp_h)) = surface_size {
-            if let Some(entry) = self.canvases.get(&id) {
-                if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
-                    && self.contexts_2d.contains_key(&id)
-                {
-                    tracing::info!(
-                        "CanvasManager::create_onscreen fast resize {}x{} -> {}x{} (same window 0x{window:x})",
-                        entry.physical_width,
-                        entry.physical_height,
-                        exp_w,
-                        exp_h,
-                    );
-                    // `resize_canvas` takes `Option<u32>` per-dim so the
-                    // caller can signal "don't change this axis" with `None`.
-                    // Always pass the full new size here.
-                    return self.resize_canvas(id, Some(exp_w), Some(exp_h));
+        if !force_recreate {
+            if let Some((exp_w, exp_h)) = surface_size {
+                if let Some(entry) = self.canvases.get(&id) {
+                    if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
+                        && self.contexts_2d.contains_key(&id)
+                    {
+                        tracing::info!(
+                            "CanvasManager::create_onscreen fast resize {}x{} -> {}x{} (same window 0x{window:x})",
+                            entry.physical_width,
+                            entry.physical_height,
+                            exp_w,
+                            exp_h,
+                        );
+                        // `resize_canvas` takes `Option<u32>` per-dim so the
+                        // caller can signal "don't change this axis" with `None`.
+                        // Always pass the full new size here.
+                        return self.resize_canvas(id, Some(exp_w), Some(exp_h));
+                    }
                 }
             }
         }
@@ -1428,26 +1455,44 @@ impl CanvasManager {
             }
         }
 
-        // Recreate the onscreen canvas with a fresh context. `canvases` is empty
-        // and `preserved_ctx` is None, so `create_onscreen` builds a new one.
-        self.context_lost = false;
-        self.create_onscreen(window, None)?;
+        // Recreate the onscreen canvas + 2D context and probe, all inside one
+        // fallible block. `context_lost` must NOT be cleared until the ENTIRE
+        // sequence succeeds: `create_onscreen` clears it internally (line ~788)
+        // and any later `?` failure or a failed probe would otherwise leave the
+        // manager's flag `false` while the render thread's shared atomic is still
+        // `true` — a split-brain that removes the stable basis for the next
+        // recovery retry. So on ANY failure (Err or a failed probe) we force
+        // `context_lost = true`; only full success leaves it `false`.
+        let rebuilt = (|| -> EngineResult<bool> {
+            // `canvases` is empty and `preserved_ctx` is None, so
+            // `create_onscreen` builds a fresh onscreen context.
+            self.create_onscreen(window, None)?;
+            // Rebuild the onscreen 2D (Skia) context if the game had one so JS
+            // targeting canvas_id=1 keeps working after the reset.
+            if had_onscreen_2d {
+                context_2d_impl::init_skia_for_canvas(self, onscreen_id)?;
+            }
+            // ---- Phase 3: probe the rebuilt context for real usability ----
+            Ok(self.probe_context_usable(onscreen_id))
+        })();
 
-        // Rebuild the onscreen 2D (Skia) context if the game had one so JS
-        // targeting canvas_id=1 keeps working after the reset.
-        if had_onscreen_2d {
-            context_2d_impl::init_skia_for_canvas(self, onscreen_id)?;
+        match rebuilt {
+            Ok(true) => {
+                self.context_lost = false;
+                tracing::info!("EGL context share group rebuilt and probed OK");
+                Ok(true)
+            }
+            Ok(false) => {
+                self.context_lost = true;
+                tracing::error!("EGL recovery: probe draw failed, context still unusable");
+                Ok(false)
+            }
+            Err(e) => {
+                self.context_lost = true;
+                tracing::error!("EGL recovery failed during rebuild: {e}");
+                Err(e)
+            }
         }
-
-        // ---- Phase 3: probe the rebuilt context for real usability ----
-        if !self.probe_context_usable(onscreen_id) {
-            tracing::error!("EGL recovery: probe draw failed, context still unusable");
-            self.context_lost = true;
-            return Ok(false);
-        }
-
-        tracing::info!("EGL context share group rebuilt and probed OK");
-        Ok(true)
     }
 
     /// Probe whether a freshly rebuilt onscreen context is actually usable:
@@ -3872,6 +3917,21 @@ impl CanvasManager {
         compressed: &shared::protocol::io_cmd::CompressedImage,
     ) -> EngineResult<(u32, u32)> {
         use shared::error::EngineError;
+
+        // Sink-side pixel cap: the io layer already rejects oversized KTX2, but
+        // this is the last line before glCompressedTexImage2D allocates a GPU
+        // texture, so guard here too against any future producer that bypasses
+        // the io cap. Uses the shared single-source-of-truth constant so io and
+        // graphics can't drift.
+        let cap = shared::protocol::io_cmd::MAX_IMAGE_PIXELS;
+        let px = (compressed.width as u64).saturating_mul(compressed.height as u64);
+        if px > cap {
+            return Err(EngineError::new(ErrorCode::OutOfMemory).with_detail(format!(
+                "compressed texture {}x{} ({} px) exceeds cap ({} px); refusing GPU upload",
+                compressed.width, compressed.height, px, cap
+            )));
+        }
+
         self.ensure_any_canvas_current()?;
 
         let format =
@@ -3897,12 +3957,28 @@ impl CanvasManager {
                 .with_detail(format!("GPU does not support {}", format.label())));
         }
 
+        // Reject a malformed KTX2 whose level-0 byte length doesn't match its
+        // declared dimensions before the driver would fail the upload with
+        // GL_INVALID_VALUE (glCompressedTexImage2D requires an exact size).
+        let expected = format.expected_level0_bytes(compressed.width, compressed.height);
+        if compressed.data.len() as u64 != expected {
+            return Err(EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
+                "compressed KTX2 level0 is {} bytes but {} {}x{} requires {} bytes",
+                compressed.data.len(),
+                format.label(),
+                compressed.width,
+                compressed.height,
+                expected
+            )));
+        }
+
         let texture = crate::compressed_upload::upload_compressed_texture(
             &self.gl,
             format,
             compressed.width,
             compressed.height,
             &compressed.data,
+            self.device_caps.has_pbo,
         )
         .ok_or_else(|| {
             EngineError::new(ErrorCode::Unsupported).with_detail("glCompressedTexImage2D failed")

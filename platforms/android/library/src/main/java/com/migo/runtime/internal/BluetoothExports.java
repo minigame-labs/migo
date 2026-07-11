@@ -20,18 +20,34 @@ public final class BluetoothExports {
     private static final ConcurrentHashMap<Integer, BluetoothManager> sBluetoothManagers =
             new ConcurrentHashMap<>();
 
+    private static void syncBluetoothLifecycle(int sessionId, BluetoothManager manager) {
+        LifecycleStateSynchronizer.synchronize(
+                manager,
+                () -> NativeExports.isSessionResourceSuspended(sessionId),
+                manager::setLifecycleSuspended);
+    }
+
     private static BluetoothManager getOrCreateBluetoothManager(int sessionId) {
         BluetoothManager existing = sBluetoothManagers.get(sessionId);
-        if (existing != null) return existing;
+        if (existing != null) {
+            syncBluetoothLifecycle(sessionId, existing);
+            return existing;
+        }
         synchronized (sBluetoothLock) {
             existing = sBluetoothManagers.get(sessionId);
-            if (existing != null) return existing;
+            if (existing != null) {
+                syncBluetoothLifecycle(sessionId, existing);
+                return existing;
+            }
+            if (NativeExports.isSessionTerminated(sessionId)) return null;
             RuntimeContext ctx = RuntimeRegistry.get(sessionId);
             if (ctx == null) return null;
             Activity activity = ctx.getActivity();
             if (activity == null) return null;
-            BluetoothManager mgr = new BluetoothManager(sessionId, activity);
+            boolean suspended = NativeExports.isSessionResourceSuspended(sessionId);
+            BluetoothManager mgr = new BluetoothManager(sessionId, activity, suspended);
             sBluetoothManagers.put(sessionId, mgr);
+            syncBluetoothLifecycle(sessionId, mgr);
             return mgr;
         }
     }
@@ -182,9 +198,26 @@ public final class BluetoothExports {
     }
 
     public static void destroyBluetoothManager(int sessionId) {
-        BluetoothManager mgr = sBluetoothManagers.remove(sessionId);
+        BluetoothManager mgr;
+        synchronized (sBluetoothLock) {
+            mgr = sBluetoothManagers.remove(sessionId);
+        }
         if (mgr != null) {
             mgr.destroy();
+        }
+    }
+
+    public static void suspendPowerSensitiveManagers(int sessionId) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.suspendForLifecycle();
+        }
+    }
+
+    public static void resumePowerSensitiveManagers(int sessionId) {
+        BluetoothManager mgr = sBluetoothManagers.get(sessionId);
+        if (mgr != null) {
+            mgr.resumeForLifecycle();
         }
     }
 

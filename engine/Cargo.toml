@@ -16,7 +16,7 @@ members = [
 tokio = { version = "1.46.1", default-features = false }
 futures = "0.3.31"
 serde = { version = "1.0.219", features = ["rc"] }
-reqwest = { version = "=0.12.4", default-features = false, features = ["rustls-tls", "stream", "http2", "multipart"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "stream", "http2", "multipart"] }
 # Note: reqwest "rustls-tls" already bundles webpki-roots (~100KB Mozilla root cert list).
 # On Android, native root-store discovery may fail in some environments, causing
 # WebSocket TLS handshake errors such as "no native root CA certificates found".

@@ -178,7 +178,7 @@ impl AudioNodeProcessor for PannerNode {
         output: &mut [f32],
         _sample_rate: u32,
         channels: u32,
-        _current_time: f64,
+        current_time: f64,
     ) -> usize {
         let ch = channels.max(1) as usize;
         let len = inputs.len().min(output.len());
@@ -187,9 +187,9 @@ impl AudioNodeProcessor for PannerNode {
         }
 
         // Get source position
-        let px = self.position_x.value() as f64;
-        let py = self.position_y.value() as f64;
-        let pz = self.position_z.value() as f64;
+        let px = self.position_x.compute_value(current_time) as f64;
+        let py = self.position_y.compute_value(current_time) as f64;
+        let pz = self.position_z.compute_value(current_time) as f64;
 
         // Recompute gains only if position changed (skip expensive trig otherwise)
         if px != self.cached_px || py != self.cached_py || pz != self.cached_pz {

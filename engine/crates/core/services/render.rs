@@ -40,6 +40,7 @@ mod tests {
 impl RenderService {
     pub(crate) const RECREATE_ONSCREEN_TIMEOUT: Duration = Duration::from_millis(500);
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         raf_tx: shared::raf_signal::RafSender,
         vsync_rx: Option<crossbeam_channel::Receiver<f64>>,
@@ -49,7 +50,17 @@ impl RenderService {
         target_fps: i32,
         app_cache_dir: Option<std::path::PathBuf>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
+        context_lost: std::sync::Arc<shared::op_state::ContextLostState>,
+        wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) -> EngineResult<Self> {
+        // Per-host surface destroy-epoch: bumped by JNI on surfaceDestroyed,
+        // captured onto each new SurfaceRef at updateSurface time, and compared
+        // by the render thread every frame so it stops presenting to a surface
+        // that was torn down after hand-off (queue-independent, ABA-proof).
+        // Init 0 — the initial surface (below) is stamped epoch 0 to match.
+        let destroy_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        crate::runtime::registry::register_destroy_epoch(host_id, destroy_epoch.clone());
+
         let thread = RenderThread::spawn(
             raf_tx,
             vsync_rx,
@@ -58,6 +69,9 @@ impl RenderService {
             pixel_ratio,
             app_cache_dir,
             gpu_caps,
+            context_lost,
+            wake,
+            destroy_epoch,
         )?;
         // Apply the host's configured target FPS to the render thread immediately
         // so the first vsync tick already runs at the right cadence.
@@ -76,6 +90,13 @@ impl RenderService {
     #[inline]
     pub(crate) fn sender(&self) -> shared::render_command_sender::CommandSender {
         self.thread.sender()
+    }
+
+    /// Whether the host currently holds a live onscreen surface. False after
+    /// `on_surface_destroyed()` until the next successful `update_surface()`.
+    #[inline]
+    pub(crate) fn has_live_surface(&self) -> bool {
+        self.surface.is_some()
     }
 
     #[inline]
@@ -102,7 +123,11 @@ impl RenderService {
             resp: RenderCmdResp::from_sync(tx),
         });
 
-        self.sender().send(cmd).map_err(|e| {
+        // RecreateOnscreen carries a sync responder; route it through the
+        // policy-aware `dispatch` (bounded-blocking for its Sync class) rather
+        // than the legacy drop-on-full `send`, so a transiently full render queue
+        // doesn't silently drop the recreate and strand the reply/onShow.
+        self.sender().dispatch(cmd).map_err(|e| {
             EngineError::new(ErrorCode::Cancelled)
                 .with_msg("recreate onscreen: send failed")
                 .with_detail(e.to_string())
@@ -157,20 +182,26 @@ impl RenderService {
     /// Pause rendering (stop RAF ticker and frame presentation).
     pub(crate) fn pause(&mut self) {
         self.surface_system.on_pause();
-        let _ = self.sender().send(RenderCommand::Pause);
+        // Bounded-blocking: dropping these on a full render queue desyncs the
+        // render thread from the surface/lifecycle state (a dropped Resume
+        // leaves the app frozen; a dropped SurfaceDestroyed leaves the render
+        // thread presenting to a dead surface), so wait rather than drop.
+        let _ = self.sender().send_blocking_bounded(RenderCommand::Pause);
     }
 
     /// Record surface loss and clear any stale surface handle.
     pub(crate) fn on_surface_destroyed(&mut self) {
         self.surface = None;
         self.surface_system.on_surface_destroyed();
-        let _ = self.sender().send(RenderCommand::SurfaceDestroyed);
+        let _ = self
+            .sender()
+            .send_blocking_bounded(RenderCommand::SurfaceDestroyed);
     }
 
     /// Resume rendering (restart RAF ticker and frame presentation).
     pub(crate) fn resume(&mut self) {
         self.surface_system.on_resume();
-        let _ = self.sender().send(RenderCommand::Resume);
+        let _ = self.sender().send_blocking_bounded(RenderCommand::Resume);
     }
 
     /// Re-signal the current live surface to the render thread.

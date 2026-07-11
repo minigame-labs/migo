@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 
+use shared::command_vec_pool::{take_canvas_command_vec, take_gl_command_vec};
 use shared::protocol::frame_packet::FrameOp;
 use shared::protocol::render_cmd::{
     Canvas2DCmd, CanvasBatchPayload, DirtyRect, GLCmd, GlBatchPayload,
@@ -206,7 +207,7 @@ impl UnifiedFrameCollector {
         if self.current != CurrentKind::Canvas2D(canvas_id) {
             self.segments.push(FrameSegment::Canvas2D(Canvas2DSegment {
                 canvas_id,
-                commands: Vec::with_capacity(256),
+                commands: take_canvas_command_vec(),
                 dirty_rect: None,
                 dirty_poisoned: false,
             }));
@@ -231,7 +232,7 @@ impl UnifiedFrameCollector {
     pub(crate) fn push_gl(&mut self, cmd: GLCmd) {
         if self.current != CurrentKind::GL {
             self.segments.push(FrameSegment::GL(GlSegment {
-                commands: Vec::with_capacity(256),
+                commands: take_gl_command_vec(),
             }));
             self.current = CurrentKind::GL;
         }
@@ -255,19 +256,20 @@ impl UnifiedFrameCollector {
     ///
     /// Scalar ops are the majority of a WebGL frame by count —
     /// Cocos/three.js emit hundreds per frame — and every byte of
-    /// overhead multiplies.  The fast path drops two pieces of
-    /// work versus `push_gl`:
+    /// overhead multiplies.  Versus `push_gl` this drops the heavy
+    /// per-command work while keeping the memory bound:
     ///
     /// 1. No `approx_deep_size_bytes()` match.  The enum base size
     ///    is a compile-time constant and the heap payload is known
     ///    to be zero, so we add `size_of::<GLCmd>()` directly.
-    /// 2. No auto-flush guard.  Only fat payloads
-    ///    (`BufferData` / `TexImage2D` / `ShaderSource`) can push
-    ///    the batch past the 4 MiB soft budget; scalar commands
-    ///    add at most ~128 B apiece, so it takes tens of thousands
-    ///    of them in a single frame to matter.  Callers that do
-    ///    produce that many still get the check on the next fat
-    ///    command or at frame flush.
+    /// 2. `push_gl_fast` itself never flushes — it only maintains
+    ///    `pending_bytes`.  The caller (`queue_gl_fire_and_forget`)
+    ///    performs a cheap `should_auto_flush()` field comparison
+    ///    right after this push and cuts a barrier when a
+    ///    scalar/inline-uniform storm crosses the 4 MiB soft budget.
+    ///    Untrusted code that synchronously enqueues tens of
+    ///    thousands of these (each ~`size_of::<GLCmd>()`) therefore
+    ///    cannot pin unbounded JS-side memory until frame end.
     ///
     /// Callers MUST uphold the precondition that the pushed
     /// variant carries no heap payload.  Passing a
@@ -278,7 +280,7 @@ impl UnifiedFrameCollector {
         const BASE_BYTES: usize = std::mem::size_of::<GLCmd>();
         if self.current != CurrentKind::GL {
             self.segments.push(FrameSegment::GL(GlSegment {
-                commands: Vec::with_capacity(256),
+                commands: take_gl_command_vec(),
             }));
             self.current = CurrentKind::GL;
         }
@@ -813,6 +815,38 @@ mod tests {
         c.push_canvas2d(1, Canvas2DCmd::Save);
         let _ = c.build_frame_packet(true);
         assert!(c.build_frame_packet(true).is_none());
+    }
+
+    #[test]
+    fn interleaved_single_command_segments_do_not_reserve_256_slots_each() {
+        let mut c = UnifiedFrameCollector::new();
+        for _ in 0..50 {
+            c.push_canvas2d(1, Canvas2DCmd::Save);
+            c.push_gl(GLCmd::Clear {
+                canvas_id: 1u32.into(),
+                bit_field: 0x4000,
+            });
+        }
+
+        let reserved_bytes = c
+            .segments
+            .iter()
+            .map(|segment| match segment {
+                FrameSegment::Canvas2D(segment) => {
+                    segment.commands.capacity() * std::mem::size_of::<Canvas2DCmd>()
+                }
+                FrameSegment::GL(segment) => {
+                    segment.commands.capacity() * std::mem::size_of::<GLCmd>()
+                }
+            })
+            .sum::<usize>();
+        let old_256_slot_bytes =
+            50 * 256 * (std::mem::size_of::<Canvas2DCmd>() + std::mem::size_of::<GLCmd>());
+
+        assert!(
+            reserved_bytes <= old_256_slot_bytes / 8,
+            "100 single-command interleaved segments reserved {reserved_bytes} bytes; old policy reserved {old_256_slot_bytes} bytes"
+        );
     }
 
     #[test]

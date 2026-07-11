@@ -37,6 +37,12 @@ public final class TouchEventHandler {
      */
     public static final int FLAG_CHANGED = 1;
 
+    /**
+     * Flag indicating this pointer left the surface (finger up / cancel), so it
+     * belongs in changedTouches but must be excluded from the touches list.
+     */
+    public static final int FLAG_REMOVED = 2;
+
     // Multiply is faster than divide; computed once in constructor.
     private final float inverseDensity;
     private final ByteBuffer buffer;
@@ -78,6 +84,17 @@ public final class TouchEventHandler {
                 return;
         }
 
+        // Drop a pointer-down/up whose triggering pointer was truncated beyond
+        // MAX_POINTERS: we cannot represent it in the packed slice, so emitting
+        // the event would deliver empty changedTouches. (The other 10 pointers'
+        // state is unchanged by this pointer's transition, so nothing is lost.)
+        if (actionMasked == MotionEvent.ACTION_POINTER_DOWN
+                || actionMasked == MotionEvent.ACTION_POINTER_UP) {
+            if (event.getActionIndex() >= MAX_POINTERS) {
+                return;
+            }
+        }
+
         final int count = flatten(event, actionMasked);
         NativeMethods.onTouchRaw(sessionId, actionMasked, event.getEventTime(), count, buffer);
     }
@@ -102,13 +119,28 @@ public final class TouchEventHandler {
         final boolean perPointer = (actionMasked == MotionEvent.ACTION_POINTER_DOWN
                 || actionMasked == MotionEvent.ACTION_POINTER_UP);
 
+        // Pointers leaving the surface must be flagged so JS excludes them from
+        // `touches` (they still appear in `changedTouches`): CANCEL removes every
+        // pointer; UP/POINTER_UP removes only the triggering (actionIndex) one.
+        final boolean cancel = (actionMasked == MotionEvent.ACTION_CANCEL);
+        final boolean up = (actionMasked == MotionEvent.ACTION_UP
+                || actionMasked == MotionEvent.ACTION_POINTER_UP);
+
+        // Only the latest sample of a batched ACTION_MOVE is forwarded;
+        // historical samples (event.getHistorical*) are intentionally coalesced.
+        // Games sample input once per frame, so the newest position is what
+        // matters, and coalescing minimizes per-event work and latency.
         for (int i = 0; i < count; i++) {
             buffer.putInt(event.getPointerId(i));
             buffer.putFloat(event.getX(i) * scale);
             buffer.putFloat(event.getY(i) * scale);
             float pressure = event.getPressure(i);
             buffer.putFloat(pressure > 0 ? pressure : 1.0f);
-            buffer.putInt((!perPointer || i == actionIndex) ? FLAG_CHANGED : 0);
+            int flags = (!perPointer || i == actionIndex) ? FLAG_CHANGED : 0;
+            if (cancel || (up && i == actionIndex)) {
+                flags |= FLAG_REMOVED;
+            }
+            buffer.putInt(flags);
         }
 
         buffer.flip();

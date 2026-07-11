@@ -58,6 +58,7 @@ use crate::audio::ops::{
     // Phase 4: Global audio options ops
     op_audio_set_inner_audio_option,
     op_audio_set_loop,
+    op_audio_set_node_param,
     op_audio_set_oscillator_type,
     op_audio_set_panner_scalar,
     op_audio_set_panning_model,
@@ -101,7 +102,7 @@ use crate::audio::ops::{
 mod ops;
 
 extension!(host_v8_audio,
-    deps = [host_v8_base],
+    deps = [host_v8_base, host_v8_lifecycle],
     ops = [
         // WebAudio ops
         op_audio_create_context,
@@ -116,6 +117,7 @@ extension!(host_v8_audio,
         op_audio_set_loop,
         op_audio_create_gain,
         op_audio_set_gain_value,
+        op_audio_set_node_param,
         op_audio_connect,
         op_audio_disconnect,
         // AudioParam automation ops

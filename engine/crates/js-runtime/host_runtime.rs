@@ -323,6 +323,32 @@ impl HostJsRuntime {
         updater(op_state.borrow_mut::<HostOpState>());
     }
 
+    /// Publish the timer lifecycle level and notify the active Worker. The
+    /// caller owns sequencing relative to the main isolate's lifecycle script.
+    pub fn set_timer_backgrounded(&mut self, backgrounded: bool) {
+        let op_state_rc = self.rt.op_state();
+        #[cfg(feature = "api-system")]
+        {
+            let mut op_state = op_state_rc.borrow_mut();
+            let previous = op_state
+                .borrow::<HostOpState>()
+                .timer_backgrounded
+                .swap(backgrounded, std::sync::atomic::Ordering::AcqRel);
+            if previous != backgrounded {
+                crate::worker::set_timer_backgrounded(&mut op_state, backgrounded);
+            }
+        }
+
+        #[cfg(not(feature = "api-system"))]
+        {
+            op_state_rc
+                .borrow()
+                .borrow::<HostOpState>()
+                .timer_backgrounded
+                .store(backgrounded, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     pub fn set_code_dir(&mut self, dir: Option<String>) {
         self.update_host_op_state(|s| s.code_dir = dir);
     }
@@ -460,7 +486,7 @@ impl HostJsRuntime {
     pub fn dispatch_camera_frame_data(
         &mut self,
         camera_id: u32,
-        data: &[u8],
+        data: Vec<u8>,
         width: u32,
         height: u32,
     ) {

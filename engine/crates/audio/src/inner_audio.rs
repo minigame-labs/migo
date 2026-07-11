@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use shared::protocol::audio_cmd::{InnerAudioEvent, InnerAudioEventType, InnerAudioId};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 use crate::decoder::DecodedAudio;
 use crate::streaming::{StreamMsg, StreamingState};
@@ -295,13 +295,21 @@ pub struct InnerAudioPlayer {
     /// Pending events to send back to JS
     pending_events: Vec<InnerAudioEvent>,
     /// Streaming receiver (if streaming mode)
-    stream_rx: Option<UnboundedReceiver<StreamMsg>>,
+    stream_rx: Option<Receiver<StreamMsg>>,
     /// Streaming state for progress tracking
     stream_state: Option<Arc<StreamingState>>,
     /// Whether streaming download is complete
     stream_complete: bool,
     /// Whether we've sent canplay event for streaming
     stream_canplay_sent: bool,
+    /// Whether a `Waiting` (buffering-stall) event has already been emitted for
+    /// the current stall. Reset when new stream data arrives or playback
+    /// (re)starts, so `Waiting` fires once per stall instead of every tick.
+    waiting_notified: bool,
+    /// Output frames rendered since the last throttled `TimeUpdate`. Accumulating
+    /// real-time frames (not the looped media position) makes `onTimeUpdate` fire
+    /// steadily even for loops shorter than the throttle interval.
+    frames_since_time_update: u64,
     /// URL being loaded (for cache key)
     loading_url: Option<String>,
 }
@@ -319,6 +327,8 @@ impl InnerAudioPlayer {
             stream_state: None,
             stream_complete: false,
             stream_canplay_sent: false,
+            waiting_notified: false,
+            frames_since_time_update: 0,
             loading_url: None,
         }
     }
@@ -331,6 +341,27 @@ impl InnerAudioPlayer {
             event_type,
             current_time: self.shared.current_time(),
         });
+    }
+
+    /// Accumulate rendered output frames and emit a throttled `TimeUpdate`
+    /// (~4/sec). Emits at most one event per call and reduces the accumulator
+    /// modulo the interval, so a block spanning several intervals fires once and
+    /// leaves no backlog (which would over-fire on the next small block). For
+    /// normal blocks smaller than the interval this is identical to subtracting
+    /// it, keeping the long-term cadence ~4/sec regardless of block size.
+    /// Callable on both the normal and early-return (stall) paths.
+    #[inline]
+    fn accumulate_time_update(&mut self, frames_rendered: usize) {
+        let sr = self.shared.sample_rate() as u64;
+        if sr == 0 {
+            return;
+        }
+        let interval = (sr / 4).max(1);
+        self.frames_since_time_update += frames_rendered as u64;
+        if self.frames_since_time_update >= interval {
+            self.frames_since_time_update %= interval;
+            self.push_event(InnerAudioEventType::TimeUpdate);
+        }
     }
 
     /// Load decoded audio data (full load mode, owned)
@@ -354,6 +385,7 @@ impl InnerAudioPlayer {
         self.shared.set_position_frames(0);
         self.source = AudioSource::Owned(audio.samples);
         self.position = 0;
+        self.frames_since_time_update = 0;
         self.stream_complete = true;
         self.loading_url = None;
         self.shared.set_loaded(true);
@@ -388,6 +420,7 @@ impl InnerAudioPlayer {
         self.shared.set_position_frames(0);
         self.source = AudioSource::Cached(audio);
         self.position = 0;
+        self.frames_since_time_update = 0;
         self.stream_complete = true;
         self.loading_url = None;
         self.shared.set_loaded(true);
@@ -405,7 +438,7 @@ impl InnerAudioPlayer {
     pub fn start_streaming(
         &mut self,
         url: String,
-        rx: UnboundedReceiver<StreamMsg>,
+        rx: Receiver<StreamMsg>,
         state: Arc<StreamingState>,
     ) {
         // Cancel any previous stream
@@ -416,6 +449,7 @@ impl InnerAudioPlayer {
         const ESTIMATED_CAPACITY: usize = 44100 * 2 * 5;
         self.source = AudioSource::Owned(Vec::with_capacity(ESTIMATED_CAPACITY));
         self.position = 0;
+        self.frames_since_time_update = 0;
         self.shared.set_position_frames(0);
         self.shared.set_duration_frames(0);
         self.shared.set_sample_rate(0);
@@ -496,6 +530,30 @@ impl InnerAudioPlayer {
                 }
                 StreamMsg::Samples(new_samples) => {
                     self.source.extend(new_samples);
+                    // Fresh data arrived: re-arm the stall notification so a
+                    // subsequent underrun emits `Waiting` again.
+                    self.waiting_notified = false;
+
+                    // Cap accumulated PCM at the budget; abort a runaway stream
+                    // instead of growing memory without bound. Crucially, do NOT
+                    // mark the stream complete — a complete stream is treated as a
+                    // success by the audio thread (cached + load_cached -> CanPlay).
+                    // Discard the partial data and make the player inert instead.
+                    if !crate::limits::pcm_samples_within_budget(self.source.len()) {
+                        tracing::error!(
+                            "InnerAudioPlayer {} streaming exceeded the PCM budget ({} samples), aborting",
+                            self.id,
+                            self.source.len()
+                        );
+                        self.cancel_stream();
+                        self.source = AudioSource::Owned(Vec::new());
+                        self.loading_url = None;
+                        self.shared.set_loaded(false);
+                        self.shared.set_state(PlaybackState::Stopped);
+                        stream_ended = true;
+                        self.push_event(InnerAudioEventType::Error);
+                        break;
+                    }
 
                     // Update duration as we receive more data
                     let channels = self.shared.channels() as usize;
@@ -607,6 +665,7 @@ impl InnerAudioPlayer {
                 prev_state
             );
             self.shared.set_state(PlaybackState::Playing);
+            self.waiting_notified = false;
             self.push_event(InnerAudioEventType::Play);
         }
     }
@@ -630,6 +689,7 @@ impl InnerAudioPlayer {
         self.shared.set_state(PlaybackState::Stopped);
         self.position = 0;
         self.shared.set_position_frames(0);
+        self.frames_since_time_update = 0;
         self.push_event(InnerAudioEventType::Stop);
     }
 
@@ -671,6 +731,10 @@ impl InnerAudioPlayer {
             self.position = self.position.min(self.source.len());
             self.shared
                 .set_position_frames(self.position as u64 / channels as u64);
+            // A seek may land in buffered data and resume playback, so a later
+            // underrun should notify again.
+            self.waiting_notified = false;
+            self.frames_since_time_update = 0; // restart the TimeUpdate throttle
             self.push_event(InnerAudioEventType::Seeked);
         }
 
@@ -692,8 +756,7 @@ impl InnerAudioPlayer {
         let output_frames = output.len() / output_channels;
 
         for frame_idx in 0..output_frames {
-            let src_frame = (frame_fixed >> 16) as usize;
-            let src_sample_start = src_frame * channels;
+            let mut src_frame = (frame_fixed >> 16) as usize;
 
             // Check if we've reached the end of available data
             if src_frame >= total_frames {
@@ -714,15 +777,28 @@ impl InnerAudioPlayer {
                     let final_frame = total_frames.saturating_sub(1);
                     self.position = final_frame * channels;
                     self.shared.set_position_frames(final_frame as u64);
-                    self.push_event(InnerAudioEventType::Waiting);
+                    if !self.waiting_notified {
+                        self.waiting_notified = true;
+                        self.push_event(InnerAudioEventType::Waiting);
+                    }
+                    // Count frames actually rendered before the stall (and emit a
+                    // TimeUpdate if the throttle threshold is now crossed).
+                    self.accumulate_time_update(frame_idx);
                     return true; // Still playing, waiting for data
                 }
 
                 if loop_enabled {
-                    // Loop back to start
+                    // Loop back to start, carrying the fixed-point overshoot so high
+                    // playback rates keep correct loop timing, and render the restart
+                    // frame this iteration (a `continue` would drop one output frame).
                     tracing::trace!("InnerAudioPlayer {} looping back to start", self.id);
-                    frame_fixed = 0;
-                    continue;
+                    let loop_len_fixed = (total_frames as u64) << 16;
+                    frame_fixed = if loop_len_fixed > 0 {
+                        frame_fixed % loop_len_fixed
+                    } else {
+                        0
+                    };
+                    src_frame = (frame_fixed >> 16) as usize;
                 } else {
                     // Playback finished
                     tracing::debug!("InnerAudioPlayer {} playback ended", self.id);
@@ -736,9 +812,12 @@ impl InnerAudioPlayer {
                     }
                     self.position = 0;
                     self.shared.set_position_frames(0);
+                    self.frames_since_time_update = 0;
                     return false;
                 }
             }
+
+            let src_sample_start = src_frame * channels;
 
             // Mix into output (handle channel conversion)
             let dst_start = frame_idx * output_channels;
@@ -779,10 +858,22 @@ impl InnerAudioPlayer {
             frame_fixed += rate_fixed;
         }
 
-        // Update position (convert frame back to sample index)
+        // Update position (convert frame back to sample index). When looping,
+        // normalize a final overshoot so the stored currentTime doesn't briefly
+        // pin at duration until the next callback wraps.
+        if loop_enabled {
+            let loop_len_fixed = (total_frames as u64) << 16;
+            if loop_len_fixed > 0 && frame_fixed >= loop_len_fixed {
+                frame_fixed %= loop_len_fixed;
+            }
+        }
         let final_frame = ((frame_fixed >> 16) as usize).min(total_frames);
         self.position = final_frame * channels;
         self.shared.set_position_frames(final_frame as u64);
+
+        // Throttled TimeUpdate (~4x/sec of playback) so JS currentTime advances
+        // and onTimeUpdate fires between the discrete lifecycle events.
+        self.accumulate_time_update(output_frames);
 
         true
     }
@@ -790,5 +881,136 @@ impl InnerAudioPlayer {
     /// Check if stream download is complete (for caching)
     pub fn is_stream_complete(&self) -> bool {
         self.stream_complete
+    }
+}
+
+impl Drop for InnerAudioPlayer {
+    fn drop(&mut self) {
+        // Cancel any in-flight streaming download so its background task stops
+        // promptly instead of downloading/decoding into a dropped channel
+        // (happens on DestroyInnerAudio, which removes the player from the map).
+        self.cancel_stream();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::streaming::{StreamMsg, StreamingState};
+    use shared::protocol::audio_cmd::InnerAudioEventType;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn dropping_player_cancels_streaming_download() {
+        let state = StreamingState::new();
+        let (_tx, rx) = mpsc::channel::<StreamMsg>(1);
+        let mut player = InnerAudioPlayer::new(1, 2);
+        player.start_streaming("http://example/x.mp3".into(), rx, state.clone());
+
+        assert!(!state.is_cancelled(), "should not be cancelled while alive");
+        drop(player);
+        assert!(
+            state.is_cancelled(),
+            "dropping the player must cancel the in-flight streaming download"
+        );
+    }
+
+    #[test]
+    fn waiting_event_emitted_once_per_stall() {
+        let state = StreamingState::new();
+        let (_tx, rx) = mpsc::channel::<StreamMsg>(1);
+        let mut player = InnerAudioPlayer::new(1, 2); // stereo output
+        player.start_streaming("http://example/x.mp3".into(), rx, state);
+
+        // ~0.5 s of stereo data buffered, playback caught up to the end.
+        player.shared.set_sample_rate(44_100);
+        player.shared.set_channels(2);
+        player.shared.set_loaded(true);
+        player.source.extend(vec![0.0f32; 44_100]); // 22050 stereo frames
+        player.shared.set_state(PlaybackState::Playing);
+        player.position = 44_100; // at the end of available data
+
+        let mut out = [0.0f32; 8]; // 4 stereo frames per call
+        for _ in 0..5 {
+            player.process(&mut out);
+        }
+
+        let waiting = player
+            .take_events()
+            .into_iter()
+            .filter(|e| matches!(e.event_type, InnerAudioEventType::Waiting))
+            .count();
+        assert_eq!(
+            waiting, 1,
+            "Waiting must fire once per stall episode, not every audio tick"
+        );
+    }
+
+    #[test]
+    fn waiting_event_refires_after_seek() {
+        let state = StreamingState::new();
+        let (_tx, rx) = mpsc::channel::<StreamMsg>(1);
+        let mut player = InnerAudioPlayer::new(1, 2);
+        player.start_streaming("http://example/x.mp3".into(), rx, state);
+        player.shared.set_sample_rate(44_100);
+        player.shared.set_channels(2);
+        player.shared.set_loaded(true);
+        player.source.extend(vec![0.0f32; 44_100]); // 22050 stereo frames
+        player.shared.set_state(PlaybackState::Playing);
+
+        let mut out = [0.0f32; 8];
+
+        // First stall at the buffered edge -> one Waiting.
+        player.position = 44_100;
+        player.process(&mut out);
+
+        // Seek back into buffered data (consumes the seek, should re-arm Waiting),
+        // then stall again at the edge.
+        player.shared.request_seek(0);
+        player.process(&mut out);
+        player.position = 44_100;
+        player.process(&mut out);
+
+        let waiting = player
+            .take_events()
+            .into_iter()
+            .filter(|e| matches!(e.event_type, InnerAudioEventType::Waiting))
+            .count();
+        assert_eq!(
+            waiting, 2,
+            "a stall after a seek must emit Waiting again (latch re-armed on seek)"
+        );
+    }
+
+    #[test]
+    fn time_update_caps_at_one_per_call_without_backlog() {
+        // A process block spanning multiple TimeUpdate intervals must emit at
+        // most one TimeUpdate and leave no interval-sized backlog, so a later
+        // small block cannot immediately over-fire while a backlog drains.
+        let mut player = InnerAudioPlayer::new(1, 2);
+        player.shared.set_sample_rate(44_100); // interval = 11_025 frames
+        let interval = 44_100u64 / 4;
+
+        // One block covering >2 intervals.
+        player.accumulate_time_update((interval * 2 + 500) as usize);
+        let first = player
+            .take_events()
+            .into_iter()
+            .filter(|e| matches!(e.event_type, InnerAudioEventType::TimeUpdate))
+            .count();
+        assert_eq!(first, 1, "a multi-interval block emits at most one TimeUpdate");
+        assert!(
+            player.frames_since_time_update < interval,
+            "no interval-sized backlog may remain after emitting"
+        );
+
+        // A tiny follow-up block must not fire again from a drained backlog.
+        player.accumulate_time_update(1);
+        let second = player
+            .take_events()
+            .into_iter()
+            .filter(|e| matches!(e.event_type, InnerAudioEventType::TimeUpdate))
+            .count();
+        assert_eq!(second, 0, "a small next block must not over-fire from backlog");
     }
 }

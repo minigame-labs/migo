@@ -37,6 +37,7 @@ unsafe extern "C" {
 pub struct AndroidSurfaceWrapper {
     handle: NonNull<ANativeWindow>,
     dimension: (u32, u32), // physical pixels
+    epoch: u64,            // destroy-epoch captured at hand-off (see Surface::surface_epoch)
 }
 
 unsafe impl Send for AndroidSurfaceWrapper {}
@@ -54,15 +55,21 @@ impl fmt::Debug for AndroidSurfaceWrapper {
 impl AndroidSurfaceWrapper {
     /// Use this when you already own a strong ref (e.g. `ANativeWindow_fromSurface()`).
     /// Do NOT call `acquire()` again.
+    ///
+    /// `epoch` is the per-host destroy counter value at hand-off (see
+    /// `Surface::surface_epoch`); pass the current counter from JNI so the render
+    /// thread can detect a surface that was destroyed after this one was created.
     pub unsafe fn from_surface_owned(
         handle: *mut ANativeWindow,
         width: u32,
         height: u32,
+        epoch: u64,
     ) -> Result<Self, &'static str> {
         let handle = NonNull::new(handle).ok_or("ANativeWindow pointer is null")?;
         Ok(Self {
             handle,
             dimension: (width, height),
+            epoch,
         })
     }
 
@@ -77,6 +84,7 @@ impl AndroidSurfaceWrapper {
         Ok(Self {
             handle,
             dimension: (width, height),
+            epoch: 0,
         })
     }
 
@@ -126,5 +134,9 @@ impl Surface for AndroidSurfaceWrapper {
 
     fn raw_display_handle(&self) -> RawDisplayHandle {
         RawDisplayHandle::Android(AndroidDisplayHandle::new())
+    }
+
+    fn surface_epoch(&self) -> u64 {
+        self.epoch
     }
 }

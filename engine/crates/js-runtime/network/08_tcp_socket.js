@@ -7,6 +7,7 @@ import {
     op_tcp_connect, op_tcp_next_event, op_tcp_write, op_tcp_close,
 } from "ext:core/ops";
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { toExactArrayBuffer } from "ext:host_v8_network/00_binary.js";
 
 // -- TCPSocket class --
 
@@ -44,6 +45,13 @@ class TCPSocket {
         (async () => {
             try {
                 const result = await op_tcp_connect(address, port, timeout);
+                if (this._closed) {
+                    // close() ran while the connect was in flight; tear down
+                    // the freshly-created socket instead of leaving a leaked
+                    // (ghost) connection the caller believes is closed.
+                    try { op_tcp_close(result.rid); } catch (_) { /* ignore */ }
+                    return;
+                }
                 this._rid = result.rid;
                 this._connected = true;
 
@@ -65,6 +73,9 @@ class TCPSocket {
                 await this._pollEvents();
 
             } catch (err) {
+                // If close() already ran (e.g. connect failed after the
+                // caller closed), stay silent: no post-close onError/onClose.
+                if (this._closed) return;
                 this._fireError(err.message || 'connect:fail unknown error');
                 this._doClose();
             }
@@ -190,8 +201,9 @@ class TCPSocket {
 
             switch (event.type) {
                 case 'message': {
-                    // Convert the raw byte array to ArrayBuffer
-                    const buf = new Uint8Array(event.data).buffer;
+                    // event.data is an exact-length Uint8Array (external
+                    // backing); hand its buffer to the callback without a copy.
+                    const buf = toExactArrayBuffer(event.data);
                     this._fireMessage(
                         buf,
                         {
@@ -208,8 +220,12 @@ class TCPSocket {
                     break;
                 }
                 case 'error':
+                    // A read error on a TCP stream is terminal: the
+                    // connection is broken, so fire onError then close
+                    // (onClose follows) instead of re-polling a dead fd.
                     this._fireError(event.errMsg);
-                    break;
+                    this._doClose();
+                    return;
                 case 'close':
                     this._doClose();
                     return;

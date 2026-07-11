@@ -14,6 +14,7 @@ use crate::{
 
 pub mod ahb;
 pub mod audio_cmd;
+pub mod camera_frame;
 pub mod color;
 pub mod error;
 pub mod frame_packet;

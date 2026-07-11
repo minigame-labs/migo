@@ -335,6 +335,24 @@ pub fn op_audio_set_gain_value(
         .map_err(|_| audio_err("Audio thread disconnected"))
 }
 
+/// Set an AudioParam's current value now by node + param name (fire and forget).
+#[op2(fast)]
+pub fn op_audio_set_node_param(
+    state: Rc<RefCell<OpState>>,
+    #[smi] node_id: AudioNodeId,
+    #[string] param_name: String,
+    value: f32,
+) -> Result<(), AudioError> {
+    let tx = get_audio_tx(state);
+
+    tx.send(AudioCmd::SetNodeParam {
+        node_id,
+        param_name,
+        value,
+    })
+    .map_err(|_| audio_err("Audio thread disconnected"))
+}
+
 // ============================================================================
 // Graph Operations
 // ============================================================================
@@ -837,6 +855,29 @@ pub fn op_audio_create_iir_filter(
     #[serde] feedforward: Vec<f64>,
     #[serde] feedback: Vec<f64>,
 ) -> Result<(), AudioError> {
+    // WebAudio: coefficient arrays must be non-empty, <= 20 long, feedback[0] != 0,
+    // and finite. Reject here so the audio thread never divides by an empty length.
+    if feedforward.is_empty() || feedback.is_empty() {
+        return Err(audio_err(
+            "createIIRFilter: feedforward and feedback must be non-empty",
+        ));
+    }
+    if feedforward.len() > 20 || feedback.len() > 20 {
+        return Err(audio_err(
+            "createIIRFilter: coefficient arrays must have at most 20 elements",
+        ));
+    }
+    if feedback[0] == 0.0 {
+        return Err(audio_err("createIIRFilter: feedback[0] must not be zero"));
+    }
+    if feedforward
+        .iter()
+        .chain(feedback.iter())
+        .any(|v| !v.is_finite())
+    {
+        return Err(audio_err("createIIRFilter: coefficients must be finite"));
+    }
+
     let tx = get_audio_tx(state);
     tx.send(AudioCmd::CreateIIRFilter {
         ctx_id,
@@ -1409,8 +1450,17 @@ fn resolve_local_src(
                     ))
                 });
         }
+
+        // A VFS is active. Relative paths and the virtual roots (/code, /user,
+        // /cache, /tmp) were handled above; anything remaining is an absolute
+        // path outside the sandbox — reject it instead of reading a raw location.
+        return Err(audio_err(format!(
+            "audio path '{}' is outside the sandbox",
+            src
+        )));
     }
 
+    // No VFS (headless / tooling): fall back to code_dir-relative resolution.
     Ok(resolve_path(code_dir, &normalized))
 }
 
@@ -1649,6 +1699,32 @@ mod tests {
             resolve_local_src(code.to_str(), Some(&vfs), "/user/gamecaches/audio/bgm.mp3").unwrap();
 
         assert_eq!(PathBuf::from(resolved), target);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn resolve_local_src_rejects_absolute_path_outside_sandbox() {
+        let base = make_temp_dir("migo_audio_escape");
+        let code = base.join("code");
+        let user = base.join("user");
+        let cache = base.join("cache");
+        let tmp = base.join("tmp");
+
+        fs::create_dir_all(&code).unwrap();
+        fs::create_dir_all(&user).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&tmp).unwrap();
+
+        let vfs = VirtualFS::new(code.clone(), user, cache, tmp);
+        // An absolute path outside every virtual root (/code, /user, /cache, /tmp)
+        // must NOT resolve to a real filesystem path — that would escape the sandbox.
+        let result = resolve_local_src(code.to_str(), Some(&vfs), "/etc/passwd");
+        assert!(
+            result.is_err(),
+            "absolute non-virtual path must be rejected under VFS, got {:?}",
+            result
+        );
 
         let _ = fs::remove_dir_all(base);
     }

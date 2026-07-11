@@ -53,6 +53,9 @@ class AudioBufferSourceNode extends AudioNode {
 
   set loopStart(value) {
     this.#loopStart = Number(value) || 0;
+    // Push updated loop points to native regardless of setter order
+    // (e.g. loop = true; loopStart = 1; loopEnd = 2).
+    op_audio_set_loop(this._nodeId, this.#loop, this.#loopStart, this.#loopEnd);
   }
 
   get loopEnd() {
@@ -61,6 +64,7 @@ class AudioBufferSourceNode extends AudioNode {
 
   set loopEnd(value) {
     this.#loopEnd = Number(value) || 0;
+    op_audio_set_loop(this._nodeId, this.#loop, this.#loopStart, this.#loopEnd);
   }
 
   get playbackRate() {

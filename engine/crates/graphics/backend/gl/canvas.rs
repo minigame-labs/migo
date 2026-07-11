@@ -28,14 +28,14 @@ use super::text::TextContext;
 ///
 /// Factored out so the handler stays a single entry point regardless of
 /// which resources a specific command consults: plain `fillRect` only
-/// uses `canvas`; `fillText` additionally uses `text`; `drawImage` /
+/// uses `canvas`; `fillText` additionally requires `text`; `drawImage` /
 /// `Pattern` gradient uses `resolver`.
 ///
 /// `'e` bounds the lifetime of the environment borrow, ensuring that
 /// `apply()` does not retain any reference past the call.
 pub struct DrawEnv<'e, R: PatternResolver> {
     pub canvas: &'e Canvas,
-    pub text: &'e TextContext,
+    pub text: Option<&'e TextContext>,
     pub resolver: &'e R,
 }
 
@@ -144,19 +144,18 @@ impl Canvas2DRenderer {
     /// building.  The render thread uses the boolean to decide whether
     /// the canvas requires a present.
     ///
-    /// Legacy form — callers that don't need text rendering can pass only
-    /// a canvas + resolver.  Forwards internally to the full `DrawEnv`
-    /// variant with a lazily-constructed fresh [`TextContext`].
+    /// Legacy form for callers that do not execute text commands. No dummy
+    /// [`TextContext`] is constructed: non-text dispatch has no dependency on
+    /// the font registry or shaping caches.
     pub fn apply<R: PatternResolver>(
         &mut self,
         canvas: &Canvas,
         cmd: &Canvas2DCmd,
         resolver: &R,
     ) -> bool {
-        let empty_text = TextContext::new();
         let env = DrawEnv {
             canvas,
-            text: &empty_text,
+            text: None,
             resolver,
         };
         self.apply_env(&env, cmd)
@@ -171,7 +170,6 @@ impl Canvas2DRenderer {
     ) -> bool {
         let canvas = env.canvas;
         let resolver = env.resolver;
-        let text_ctx = env.text;
         use Canvas2DCmd::*;
         match cmd {
             // ---- Path building -------------------------------------
@@ -533,6 +531,9 @@ impl Canvas2DRenderer {
                 y,
                 max_width,
             } => {
+                let text_ctx = env
+                    .text
+                    .expect("FillText routed without the shared TextContext");
                 text_ctx.fill_text(canvas, text, *x, *y, *max_width, &self.state, resolver);
                 true
             }
@@ -542,6 +543,9 @@ impl Canvas2DRenderer {
                 y,
                 max_width,
             } => {
+                let text_ctx = env
+                    .text
+                    .expect("StrokeText routed without the shared TextContext");
                 text_ctx.stroke_text(canvas, text, *x, *y, *max_width, &self.state, resolver);
                 true
             }

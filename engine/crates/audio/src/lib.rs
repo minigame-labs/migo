@@ -35,7 +35,7 @@
 //! - **Streaming**: Edge-download-edge-play for large audio files
 //! - **Caching**: LRU cache for decoded audio to avoid repeated decoding
 //! - **Resampling**: Automatic sample rate conversion for device compatibility
-//! - **3-Level Power Management**: Active (5ms) / LowPower (50ms) / Sleep (500ms+condvar)
+//! - **3-Level Power Management**: Active (5ms) / LowPower (50ms) / event-driven Sleep
 //!
 //! ## Usage
 //!
@@ -79,6 +79,7 @@ pub mod cache;
 mod context;
 mod decoder;
 mod inner_audio;
+mod limits;
 mod nodes;
 mod output;
 pub mod param;

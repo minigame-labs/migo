@@ -284,7 +284,10 @@ public final class NetworkMonitor {
      * Convert prefix length to netmask string.
      */
     private static String prefixToNetmask(short prefixLength) {
-        int mask = 0xFFFFFFFF << (32 - prefixLength);
+        // Java shift counts are taken mod 32, so `0xFFFFFFFF << 32` is a
+        // no-op (a /0 prefix would wrongly yield 255.255.255.255 instead
+        // of 0.0.0.0); special-case the zero prefix.
+        int mask = prefixLength <= 0 ? 0 : (0xFFFFFFFF << (32 - prefixLength));
         return String.format("%d.%d.%d.%d",
                 (mask >> 24) & 0xFF,
                 (mask >> 16) & 0xFF,

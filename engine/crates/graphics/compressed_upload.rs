@@ -78,6 +78,37 @@ impl CompressedFormat {
             Self::Astc8x8 => "ASTC_8x8",
         }
     }
+
+    /// Compressed-block footprint `(width, height)` in texels.
+    fn block_dims(self) -> (u32, u32) {
+        match self {
+            Self::Etc2Rgb | Self::Etc2Rgba | Self::Astc4x4 => (4, 4),
+            Self::Astc6x6 => (6, 6),
+            Self::Astc8x8 => (8, 8),
+        }
+    }
+
+    /// Bytes per compressed block.
+    fn bytes_per_block(self) -> u64 {
+        match self {
+            Self::Etc2Rgb => 8,
+            Self::Etc2Rgba | Self::Astc4x4 | Self::Astc6x6 | Self::Astc8x8 => 16,
+        }
+    }
+
+    /// Exact byte length a tightly-packed level-0 image of `width`x`height`
+    /// must have in this format. A malformed KTX2 can declare dimensions that
+    /// don't match its level-0 byte length; validating against this lets the
+    /// caller reject it with a structured error instead of letting the driver
+    /// fail the upload with GL_INVALID_VALUE.
+    pub fn expected_level0_bytes(self, width: u32, height: u32) -> u64 {
+        let (bw, bh) = self.block_dims();
+        let blocks_x = (width as u64).div_ceil(bw as u64);
+        let blocks_y = (height as u64).div_ceil(bh as u64);
+        blocks_x
+            .saturating_mul(blocks_y)
+            .saturating_mul(self.bytes_per_block())
+    }
 }
 
 /// Cached compressed-format support flags, detected once at init.
@@ -134,6 +165,10 @@ impl CompressedFormatSupport {
 /// * `width` -- texture width in pixels (must match the data).
 /// * `height` -- texture height in pixels (must match the data).
 /// * `data` -- raw compressed block data (e.g., from a KTX2 level 0).
+/// * `supports_pbo` -- whether the context has pixel-buffer objects (ES3 or
+///   `GL_NV_pixel_buffer_object`). When false (bare ES2) the PBO binding is
+///   left untouched, since querying `PIXEL_UNPACK_BUFFER_BINDING` would raise
+///   `GL_INVALID_ENUM` and no PBO can be bound on such a context anyway.
 ///
 /// # Returns
 ///
@@ -144,9 +179,28 @@ pub fn upload_compressed_texture(
     width: u32,
     height: u32,
     data: &[u8],
+    supports_pbo: bool,
 ) -> Option<glow::NativeTexture> {
     unsafe {
         let tex = gl.create_texture().ok()?;
+
+        // This may run on a live WebGL/Canvas2D context, so save every
+        // app-visible binding we clobber and restore it afterwards; leaving one
+        // changed would corrupt WebGL-visible state and desync the state
+        // tracker (which would then dedup a later re-bind that GL never applied).
+        //   * TEXTURE_BINDING_2D: core since ES2, always saved/restored.
+        //   * PIXEL_UNPACK_BUFFER: the enum is ES3 / GL_NV_pixel_buffer_object
+        //     only; querying it on a bare ES2 context raises GL_INVALID_ENUM, so
+        //     only touch it when PBOs exist. With one bound, the `data` slice
+        //     below would otherwise be reinterpreted as an offset into it.
+        let saved_texture = gl.get_parameter_i32(glow::TEXTURE_BINDING_2D) as u32;
+        let saved_unpack_buffer = if supports_pbo {
+            let prev = gl.get_parameter_buffer(glow::PIXEL_UNPACK_BUFFER_BINDING);
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+            Some(prev)
+        } else {
+            None
+        };
 
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
 
@@ -173,67 +227,32 @@ pub fn upload_compressed_texture(
 
         let internal_format = format.gl_internal_format();
 
-        // PBO-staged compressed upload: write the compressed block
-        // bytes into a PIXEL_UNPACK_BUFFER first so the driver can DMA
-        // them asynchronously, then kick off the texture allocation /
-        // upload with the bound PBO. With a PBO bound, the `data`
-        // pointer handed to `glCompressedTexImage2D` is interpreted
-        // as a byte offset into the PBO (we set it to 0 via a
-        // length-0 slice whose `.as_ptr()` is a dangling non-null
-        // pointer; the C side ignores the pointer value once
-        // `image_size == 0`). We pass the real size in a follow-up
-        // `glCompressedTexSubImage2D` call against the bound PBO.
-        let maybe_pbo = gl.create_buffer().ok();
-        let used_pbo = if let Some(pbo) = maybe_pbo {
-            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pbo));
-            gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, data, glow::STREAM_DRAW);
-            // Allocate storage first. We pass a zero-length slice so
-            // the driver treats this as a storage-only call; the
-            // real bytes arrive via the SubImage below.
-            let empty: &[u8] = &[];
-            gl.compressed_tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                internal_format as i32,
-                width as i32,
-                height as i32,
-                0,
-                0,
-                empty,
-            );
-            gl.compressed_tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                width as i32,
-                height as i32,
-                internal_format,
-                glow::CompressedPixelUnpackData::BufferRange(0u32..(data.len() as u32)),
-            );
-            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
-            true
-        } else {
-            // No PBO (allocation failed): fall back to the classic
-            // synchronous client-memory path.
-            gl.compressed_tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                internal_format as i32,
-                width as i32,
-                height as i32,
-                0,
-                data.len() as i32,
-                data,
-            );
-            false
-        };
+        // For ETC2/ASTC block formats `imageSize` must equal the exact
+        // format+dimension-derived byte count; glCompressedTexImage2D returns
+        // GL_INVALID_VALUE on any mismatch (there is no "allocate storage
+        // only" idiom for compressed textures the way NULL pixels work for
+        // glTexImage2D). Pass the real `data.len()` and upload straight from
+        // client memory.
+        gl.compressed_tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            internal_format as i32,
+            width as i32,
+            height as i32,
+            0,
+            data.len() as i32,
+            data,
+        );
 
         let err = gl.get_error();
-        gl.bind_texture(glow::TEXTURE_2D, None);
-        if let Some(pbo) = maybe_pbo {
-            let _ = used_pbo;
-            gl.delete_buffer(pbo);
+
+        // Restore the app-visible bindings on both success and failure paths.
+        gl.bind_texture(
+            glow::TEXTURE_2D,
+            std::num::NonZeroU32::new(saved_texture).map(glow::NativeTexture),
+        );
+        if let Some(prev) = saved_unpack_buffer {
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, prev);
         }
 
         if err != glow::NO_ERROR {
@@ -281,5 +300,20 @@ mod tests {
         assert_eq!(CompressedFormat::Astc4x4.label(), "ASTC_4x4");
         assert_eq!(CompressedFormat::Astc6x6.label(), "ASTC_6x6");
         assert_eq!(CompressedFormat::Astc8x8.label(), "ASTC_8x8");
+    }
+
+    #[test]
+    fn expected_level0_bytes_block_math() {
+        // ETC2 RGB: 4x4 block, 8 B/block.
+        assert_eq!(CompressedFormat::Etc2Rgb.expected_level0_bytes(8, 8), 32);
+        assert_eq!(CompressedFormat::Etc2Rgb.expected_level0_bytes(1, 1), 8);
+        // ETC2 RGBA / ASTC 4x4: 4x4 block, 16 B/block.
+        assert_eq!(CompressedFormat::Etc2Rgba.expected_level0_bytes(8, 8), 64);
+        assert_eq!(CompressedFormat::Astc4x4.expected_level0_bytes(8, 8), 64);
+        // ASTC 6x6: ceil(7/6)=2 per axis -> 4 blocks * 16 = 64.
+        assert_eq!(CompressedFormat::Astc6x6.expected_level0_bytes(7, 7), 64);
+        // ASTC 8x8: exact single block vs partial-edge round-up.
+        assert_eq!(CompressedFormat::Astc8x8.expected_level0_bytes(8, 8), 16);
+        assert_eq!(CompressedFormat::Astc8x8.expected_level0_bytes(9, 9), 64);
     }
 }

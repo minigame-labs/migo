@@ -7,6 +7,8 @@ import com.migo.runtime.internal.platform.CameraManager;
 import com.migo.runtime.internal.platform.ImageApiManager;
 import com.migo.runtime.internal.platform.VideoManager;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -109,6 +111,21 @@ public final class MediaExports {
         }
     }
 
+    private static void syncCameraLifecycle(int sessionId, CameraManager manager) {
+        LifecycleStateSynchronizer.synchronize(
+                manager,
+                () -> NativeExports.isSessionResourceSuspended(sessionId),
+                manager::setLifecycleSuspended);
+    }
+
+    private static CameraManager getCameraManager(int sessionId, int cameraId) {
+        CameraManager manager = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        if (manager != null) {
+            syncCameraLifecycle(sessionId, manager);
+        }
+        return manager;
+    }
+
     public static String cameraCreate(int sessionId, String optionsJson) {
         RuntimeContext ctx = RuntimeRegistry.get(sessionId);
         if (ctx == null) {
@@ -126,21 +143,30 @@ public final class MediaExports {
         } catch (Exception ignored) {}
 
         String key = cameraKey(sessionId, cameraId);
-        CameraManager existing = sCameraManagers.get(key);
-        if (existing != null) {
-            existing.destroy();
-            sCameraManagers.remove(key);
+        CameraManager existing;
+        CameraManager mgr;
+        synchronized (sCameraLock) {
+            if (NativeExports.isSessionTerminated(sessionId)) {
+                return "{\"_error\":{\"errMsg\":\"createCamera:fail session destroyed\"}}";
+            }
+            existing = sCameraManagers.remove(key);
+            boolean suspended = NativeExports.isSessionResourceSuspended(sessionId);
+            mgr = new CameraManager(sessionId, cameraId, activity, suspended);
+            sCameraManagers.put(key, mgr);
         }
-
-        CameraManager mgr = new CameraManager(sessionId, cameraId, activity);
+        if (existing != null) existing.destroy();
+        syncCameraLifecycle(sessionId, mgr);
         String result = mgr.create(optionsJson);
-        sCameraManagers.put(key, mgr);
+        syncCameraLifecycle(sessionId, mgr);
         return result;
     }
 
     public static void cameraDestroy(int sessionId, int cameraId) {
         String key = cameraKey(sessionId, cameraId);
-        CameraManager mgr = sCameraManagers.remove(key);
+        CameraManager mgr;
+        synchronized (sCameraLock) {
+            mgr = sCameraManagers.remove(key);
+        }
         if (mgr != null) {
             mgr.destroy();
         }
@@ -148,7 +174,7 @@ public final class MediaExports {
 
     public static String cameraTakePhoto(int sessionId, String optionsJson) {
         int cameraId = extractCameraId(optionsJson);
-        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        CameraManager mgr = getCameraManager(sessionId, cameraId);
         if (mgr == null) {
             return "{\"_error\":{\"errMsg\":\"camera.takePhoto:fail camera not found\"}}";
         }
@@ -157,7 +183,7 @@ public final class MediaExports {
 
     public static String cameraStartRecord(int sessionId, String optionsJson) {
         int cameraId = extractCameraId(optionsJson);
-        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        CameraManager mgr = getCameraManager(sessionId, cameraId);
         if (mgr == null) {
             return "{\"_error\":{\"errMsg\":\"camera.startRecord:fail camera not found\"}}";
         }
@@ -166,7 +192,7 @@ public final class MediaExports {
 
     public static String cameraStopRecord(int sessionId, String optionsJson) {
         int cameraId = extractCameraId(optionsJson);
-        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        CameraManager mgr = getCameraManager(sessionId, cameraId);
         if (mgr == null) {
             return "{\"_error\":{\"errMsg\":\"camera.stopRecord:fail camera not found\"}}";
         }
@@ -175,7 +201,7 @@ public final class MediaExports {
 
     public static String cameraSetZoom(int sessionId, String optionsJson) {
         int cameraId = extractCameraId(optionsJson);
-        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        CameraManager mgr = getCameraManager(sessionId, cameraId);
         if (mgr == null) {
             return "{\"_error\":{\"errMsg\":\"camera.setZoom:fail camera not found\"}}";
         }
@@ -183,14 +209,14 @@ public final class MediaExports {
     }
 
     public static void cameraListenFrameChange(int sessionId, int cameraId) {
-        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        CameraManager mgr = getCameraManager(sessionId, cameraId);
         if (mgr != null) {
             mgr.listenFrameChange();
         }
     }
 
     public static void cameraCloseFrameChange(int sessionId, int cameraId) {
-        CameraManager mgr = sCameraManagers.get(cameraKey(sessionId, cameraId));
+        CameraManager mgr = getCameraManager(sessionId, cameraId);
         if (mgr != null) {
             mgr.closeFrameChange();
         }
@@ -198,14 +224,16 @@ public final class MediaExports {
 
     public static void destroyCameraManagers(int sessionId) {
         String prefix = sessionId + ":";
-        for (String key : sCameraManagers.keySet()) {
-            if (key.startsWith(prefix)) {
-                CameraManager mgr = sCameraManagers.remove(key);
-                if (mgr != null) {
-                    mgr.destroy();
+        List<CameraManager> removed = new ArrayList<>();
+        synchronized (sCameraLock) {
+            for (String key : sCameraManagers.keySet()) {
+                if (key.startsWith(prefix)) {
+                    CameraManager mgr = sCameraManagers.remove(key);
+                    if (mgr != null) removed.add(mgr);
                 }
             }
         }
+        for (CameraManager mgr : removed) mgr.destroy();
     }
 
     // ==================== Image API ====================
@@ -275,18 +303,34 @@ public final class MediaExports {
 
     // ==================== Video ====================
 
+    private static void syncVideoLifecycle(int sessionId, VideoManager manager) {
+        LifecycleStateSynchronizer.synchronize(
+                manager,
+                () -> NativeExports.isSessionResourceSuspended(sessionId),
+                manager::setLifecycleSuspended);
+    }
+
     private static VideoManager getOrCreateVideoManager(int sessionId) {
         VideoManager existing = sVideoManagers.get(sessionId);
-        if (existing != null) return existing;
+        if (existing != null) {
+            syncVideoLifecycle(sessionId, existing);
+            return existing;
+        }
         synchronized (sVideoLock) {
             existing = sVideoManagers.get(sessionId);
-            if (existing != null) return existing;
+            if (existing != null) {
+                syncVideoLifecycle(sessionId, existing);
+                return existing;
+            }
+            if (NativeExports.isSessionTerminated(sessionId)) return null;
             RuntimeContext ctx = RuntimeRegistry.get(sessionId);
             if (ctx == null) return null;
             Activity activity = ctx.getActivity();
             if (activity == null) return null;
-            VideoManager mgr = new VideoManager(sessionId, activity);
+            boolean suspended = NativeExports.isSessionResourceSuspended(sessionId);
+            VideoManager mgr = new VideoManager(sessionId, activity, suspended);
             sVideoManagers.put(sessionId, mgr);
+            syncVideoLifecycle(sessionId, mgr);
             return mgr;
         }
     }
@@ -346,9 +390,46 @@ public final class MediaExports {
     }
 
     public static void destroyVideoManager(int sessionId) {
-        VideoManager mgr = sVideoManagers.remove(sessionId);
+        VideoManager mgr;
+        synchronized (sVideoLock) {
+            mgr = sVideoManagers.remove(sessionId);
+        }
         if (mgr != null) {
             mgr.destroy();
+        }
+    }
+
+    public static void suspendPowerSensitiveManagers(int sessionId) {
+        String cameraPrefix = sessionId + ":";
+        for (String key : sCameraManagers.keySet()) {
+            if (key.startsWith(cameraPrefix)) {
+                CameraManager camera = sCameraManagers.get(key);
+                if (camera != null) {
+                    camera.suspendForLifecycle();
+                }
+            }
+        }
+
+        VideoManager video = sVideoManagers.get(sessionId);
+        if (video != null) {
+            video.suspendForLifecycle();
+        }
+    }
+
+    public static void resumePowerSensitiveManagers(int sessionId) {
+        String cameraPrefix = sessionId + ":";
+        for (String key : sCameraManagers.keySet()) {
+            if (key.startsWith(cameraPrefix)) {
+                CameraManager camera = sCameraManagers.get(key);
+                if (camera != null) {
+                    camera.resumeForLifecycle();
+                }
+            }
+        }
+
+        VideoManager video = sVideoManagers.get(sessionId);
+        if (video != null) {
+            video.resumeForLifecycle();
         }
     }
 

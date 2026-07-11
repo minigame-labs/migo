@@ -127,8 +127,29 @@ pub fn estimate_decoded_size(data: &[u8]) -> usize {
     }
 }
 
+/// Hard upper bound on decoded image dimensions, enforced at every decode entry
+/// point ([`decode_image_fast`], [`decode_image_to_any`]) and the KTX2
+/// compressed path. Single source of truth lives in `shared` so `io` and
+/// `graphics` cannot drift apart.
+pub use shared::protocol::io_cmd::MAX_IMAGE_PIXELS;
+
+/// Reject an image whose pixel count exceeds [`MAX_IMAGE_PIXELS`]. Cheap;
+/// used both as a pre-decode header guard and a post-decode sanity check, and by
+/// the KTX2 compressed-variant path (which never goes through the RGBA decoders)
+/// in `image_ops`.
+pub(crate) fn enforce_pixel_cap(width: u32, height: u32) -> Result<(), EngineError> {
+    let px = (width as u64).saturating_mul(height as u64);
+    if px > MAX_IMAGE_PIXELS {
+        return Err(EngineError::new(ErrorCode::OutOfMemory).with_detail(format!(
+            "image {width}x{height} ({px} px) exceeds MAX_IMAGE_PIXELS ({} px); \
+             refusing decode to avoid OOM",
+            MAX_IMAGE_PIXELS
+        )));
+    }
+    Ok(())
+}
+
 /// Try to read image dimensions from the file header.
-#[allow(dead_code)]
 fn probe_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     // KTX2: compressed texture container -- width/height in header.
     if ktx2::is_ktx2(data) {
@@ -153,7 +174,15 @@ fn probe_dimensions(data: &[u8]) -> Option<(u32, u32)> {
                 continue;
             }
             let marker = data[i + 1];
-            if marker == 0xC0 || marker == 0xC2 {
+            // Any Start-Of-Frame marker carries the dimensions: SOF0..SOF15 =
+            // 0xC0..=0xCF, excluding DHT(0xC4), JPG(0xC8), DAC(0xCC). Only
+            // probing SOF0/SOF2 missed progressive/arithmetic/lossless JPEGs,
+            // leaving their (possibly huge) dimensions for the post-decode cap.
+            let is_sof = (0xC0..=0xCF).contains(&marker)
+                && marker != 0xC4
+                && marker != 0xC8
+                && marker != 0xCC;
+            if is_sof {
                 // SOF: length(2) + precision(1) + height(2) + width(2)
                 let h = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
                 let w = u16::from_be_bytes([data[i + 7], data[i + 8]]) as u32;
@@ -169,25 +198,59 @@ fn probe_dimensions(data: &[u8]) -> Option<(u32, u32)> {
         }
     }
 
-    // BMP: bytes 18..26 contain width (i32 LE) and height (i32 LE).
+    // BMP: bytes 18..26 contain width (i32 LE) and height (i32 LE; negative =
+    // top-down). These are untrusted header fields, so use `unsigned_abs` rather
+    // than `i32::abs` — the latter panics on `i32::MIN` in an overflow-checked
+    // build. Reject non-positive width / zero height (invalid) so we don't feed
+    // a bogus 0 into the pixel cap; the decoder will surface a clean error.
     if data.len() >= 26 && &data[0..2] == b"BM" {
         let w = i32::from_le_bytes([data[18], data[19], data[20], data[21]]);
-        let h = i32::from_le_bytes([data[22], data[23], data[24], data[25]]).abs();
-        return Some((w as u32, h as u32));
+        let h = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+        if w > 0 && h != 0 {
+            return Some((w as u32, h.unsigned_abs()));
+        }
+        return None;
     }
 
-    // WebP: "RIFF" + size + "WEBP" + chunk. VP8 /VP8L/VP8X have dimensions.
+    // WebP: "RIFF" + size + "WEBP" + a chunk fourcc at offset 12. All three
+    // frame kinds (lossy VP8, lossless VP8L, extended VP8X) carry dimensions;
+    // parsing all of them keeps the pre-decode guard effective for the common
+    // lossy/extended files, not just VP8L.
     if data.len() >= 30 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
-        // VP8L (lossless): signature 0x2F at offset 12
-        if data[12] == 0x56 && data[13] == 0x50 && data[14] == 0x38 && data[15] == 0x4C {
-            // VP8L: width-1 at bits [0..14], height-1 at bits [14..28] of bytes 21..25
-            if data.len() >= 25 {
+        match &data[12..16] {
+            // VP8L (lossless): 0x2F signature at offset 20, then width-1 in bits
+            // [0..14] and height-1 in bits [14..28] of the following 4 bytes.
+            b"VP8L" => {
                 let b = u32::from_le_bytes([data[21], data[22], data[23], data[24]]);
                 let w = (b & 0x3FFF) + 1;
                 let h = ((b >> 14) & 0x3FFF) + 1;
                 return Some((w, h));
             }
+            // VP8 (lossy): 3-byte frame tag, start code 0x9D 0x01 0x2A at 23..26,
+            // then 14-bit width at 26..28 and 14-bit height at 28..30.
+            b"VP8 " => {
+                if data[23] == 0x9D && data[24] == 0x01 && data[25] == 0x2A {
+                    let w = (u16::from_le_bytes([data[26], data[27]]) & 0x3FFF) as u32;
+                    let h = (u16::from_le_bytes([data[28], data[29]]) & 0x3FFF) as u32;
+                    return Some((w, h));
+                }
+            }
+            // VP8X (extended): 1 flag byte + 3 reserved at 20..24, then canvas
+            // width-1 (24-bit LE) at 24..27 and height-1 (24-bit LE) at 27..30.
+            b"VP8X" => {
+                let w = (u32::from_le_bytes([data[24], data[25], data[26], 0]) & 0x00FF_FFFF) + 1;
+                let h = (u32::from_le_bytes([data[27], data[28], data[29], 0]) & 0x00FF_FFFF) + 1;
+                return Some((w, h));
+            }
+            _ => {}
         }
+    }
+
+    // GIF: "GIF87a" / "GIF89a" + logical screen width/height (LE u16) at 6..10.
+    if data.len() >= 10 && (&data[0..6] == b"GIF87a" || &data[0..6] == b"GIF89a") {
+        let w = u16::from_le_bytes([data[6], data[7]]) as u32;
+        let h = u16::from_le_bytes([data[8], data[9]]) as u32;
+        return Some((w, h));
     }
 
     None
@@ -230,16 +293,35 @@ pub fn decode_image_fast(
     // way a camera-shot JPEG is meant to be displayed.
     let orientation = detect_jpeg_exif_orientation(data).unwrap_or(1);
 
+    // Image-bomb guard #1 (pre-decode): reject a header that declares more than
+    // MAX_IMAGE_PIXELS *before* any decoder allocates. Covers the primary attack
+    // vector (PNG/JPEG/BMP/WebP/KTX2 with a tiny compressed body but huge
+    // declared dimensions). Formats whose header we can't parse fall through to
+    // guard #2 below.
+    if let Some((w, h)) = probe_dimensions(data) {
+        enforce_pixel_cap(w, h)?;
+    }
+
     // Priority: Rust-native decoders first (zero JNI, zero Java Heap),
     // platform decoder (BitmapFactory) as last resort.
+    //
+    // Image-bomb guard #2 (post-decode): re-check the *actual* decoded
+    // dimensions so a format the header probe couldn't read (or a decoder that
+    // ignores our estimate) still can't propagate a multi-GiB buffer downstream.
     #[cfg(feature = "rust-image-decode")]
     {
         match decode_with_zune(data) {
-            Ok(img) => return Ok(apply_exif_orientation(img, orientation)),
+            Ok(img) => {
+                enforce_pixel_cap(img.width, img.height)?;
+                return Ok(apply_exif_orientation(img, orientation));
+            }
             Err(_zune_err) => {
                 // zune failed; try image crate before falling back to platform.
                 match decode_with_image_crate(data) {
-                    Ok(img) => return Ok(apply_exif_orientation(img, orientation)),
+                    Ok(img) => {
+                        enforce_pixel_cap(img.width, img.height)?;
+                        return Ok(apply_exif_orientation(img, orientation));
+                    }
                     Err(_img_err) => {
                         tracing::debug!(
                             "Rust decoders failed (zune: {_zune_err}, image: {_img_err}), trying platform"
@@ -253,6 +335,7 @@ pub fn decode_image_fast(
     // Platform decoder fallback (e.g., Android BitmapFactory via JNI).
     if let Some(decoder) = PLATFORM_DECODER.get() {
         let img = decoder(data)?;
+        enforce_pixel_cap(img.width, img.height)?;
         return Ok(apply_exif_orientation(img, orientation));
     }
 
@@ -441,9 +524,19 @@ pub fn decode_image_to_any(
 ) -> Result<shared::protocol::io_cmd::DecodedImage, EngineError> {
     use shared::protocol::io_cmd::DecodedImage;
 
+    // Image-bomb guard (pre-decode): same header check as decode_image_fast, so
+    // the AHB path is capped too. The RGBA fallback below re-checks via
+    // decode_image_fast.
+    if let Some((w, h)) = probe_dimensions(data) {
+        enforce_pixel_cap(w, h)?;
+    }
+
     if let Some(ahb_decoder) = PLATFORM_AHB_DECODER.get() {
         match ahb_decoder(data) {
-            Ok(ahb) => return Ok(DecodedImage::HardwareBuffer(ahb)),
+            Ok(ahb) => {
+                enforce_pixel_cap(ahb.width, ahb.height)?;
+                return Ok(DecodedImage::HardwareBuffer(ahb));
+            }
             Err(e) => {
                 // AHB decode failed. Bump the total counter and the
                 // per-reason bucket so operators can see at a glance
@@ -562,13 +655,36 @@ fn decode_with_zune(data: &[u8]) -> Result<NormalizedImage, EngineError> {
 #[cfg(feature = "rust-image-decode")]
 fn decode_with_image_crate(data: &[u8]) -> Result<NormalizedImage, EngineError> {
     use image::GenericImageView;
+    use std::io::Cursor;
 
-    let img = image::load_from_memory(data).map_err(|e| {
+    // Bound the decoder's allocation to the pixel cap BEFORE decoding, so a
+    // format the header probe can't read (TIFF, uncommon JPEG SOF, animated
+    // containers, ...) can't allocate a multi-GiB buffer that only the
+    // post-decode check would catch. `max_alloc` caps total decode allocation;
+    // MAX_IMAGE_PIXELS * 4 is the RGBA byte ceiling.
+    let mut limits = image::Limits::no_limits();
+    limits.max_alloc = Some(MAX_IMAGE_PIXELS.saturating_mul(4));
+
+    let mut reader = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| {
+            EngineError::new(ErrorCode::ImageReadError)
+                .with_detail(format!("image crate format detection error: {}", e))
+        })?;
+    reader.limits(limits);
+    let img = reader.decode().map_err(|e| {
         EngineError::new(ErrorCode::ImageReadError)
             .with_detail(format!("image crate decode error: {}", e))
     })?;
 
     let (width, height) = img.dimensions();
+    // `max_alloc` above bounds the decoder's *native* output (e.g. 1 byte/px
+    // for L8 grayscale), but `into_rgba8()` is a separate allocation that
+    // expands sub-RGBA formats by up to 4x. Enforce the pixel cap before that
+    // expansion so a low-bpp giant (grayscale TIFF, uncommon SOF, ...) that
+    // squeaked under `max_alloc` can't balloon past the RGBA ceiling here,
+    // before the caller's post-decode check ever runs.
+    enforce_pixel_cap(width, height)?;
     let rgba = img.into_rgba8().into_raw();
 
     Ok(NormalizedImage {
@@ -925,5 +1041,34 @@ mod crop_tests {
         assert_eq!(out.width, 2);
         assert_eq!(out.height, 2);
         assert!(out.rgba.iter().all(|&b| b == 0));
+    }
+}
+
+#[cfg(test)]
+mod pixel_cap_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_exactly_at_cap() {
+        // 64 Mpx fits in u32; a 1-tall strip of MAX_IMAGE_PIXELS width sits
+        // exactly at the ceiling and must be accepted.
+        let n = MAX_IMAGE_PIXELS as u32;
+        assert!(enforce_pixel_cap(n, 1).is_ok());
+    }
+
+    #[test]
+    fn rejects_one_over_cap() {
+        let n = MAX_IMAGE_PIXELS as u32;
+        let err = enforce_pixel_cap(n + 1, 1).expect_err("one pixel over cap must reject");
+        assert_eq!(err.code, ErrorCode::OutOfMemory);
+    }
+
+    #[test]
+    fn rejects_max_u32_dimensions_without_panic() {
+        // (u32::MAX as u64)^2 still fits in u64, so saturating_mul returns the
+        // exact (astronomical) product; the guard must reject it cleanly with
+        // no overflow panic.
+        let err = enforce_pixel_cap(u32::MAX, u32::MAX).expect_err("huge dims must reject");
+        assert_eq!(err.code, ErrorCode::OutOfMemory);
     }
 }

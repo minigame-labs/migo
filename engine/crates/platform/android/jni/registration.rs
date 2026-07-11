@@ -22,6 +22,14 @@ use crate::android::jni::{
     onVideoEvent, onVsync, setDisplayRefreshRate, shutdown, updateSurface, version,
 };
 
+/// JNI descriptor for `onCameraFrameData` — the single source of truth shared
+/// by the native-method registration and the contract guard test. Shape:
+/// `host_id, camera_id, (yBuf, yOff, yLen), (uBuf, uOff, uLen), (vBuf, vOff,
+/// vLen), width, height`. Must stay in exact lockstep with the Java
+/// `NativeMethods`/`NativeBridge` declarations and the Rust extern `fn`.
+const ON_CAMERA_FRAME_DATA_SIG: &str =
+    "(IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIII)V";
+
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
     let class = env
         .find_class("com/migo/runtime/internal/NativeBridge")
@@ -202,7 +210,7 @@ pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
             },
             NativeMethod {
                 name: "onCameraFrameData".into(),
-                sig: "(II[BII)V".into(),
+                sig: ON_CAMERA_FRAME_DATA_SIG.into(),
                 fn_ptr: onCameraFrameData as *mut c_void,
             },
             NativeMethod {
@@ -603,4 +611,32 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
 
     info!("Cached NativeExports class + static method IDs");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ON_CAMERA_FRAME_DATA_SIG;
+
+    /// Contract guard: the camera-frame JNI descriptor must expose exactly three
+    /// `ByteBuffer` plane params, ten `int` params (host_id, camera_id, three
+    /// offset/length pairs, width, height), and a void return. This catches a
+    /// descriptor edit that drops a buffer or an int. The full Java<->Rust ABI
+    /// (param order and the Rust extern arity) is verified by the Java compile,
+    /// the API 26 build, and the on-device `RegisterNatives` smoke.
+    #[test]
+    fn on_camera_frame_data_descriptor_shape() {
+        assert_eq!(
+            ON_CAMERA_FRAME_DATA_SIG
+                .matches("Ljava/nio/ByteBuffer;")
+                .count(),
+            3,
+            "three plane ByteBuffer params"
+        );
+        assert_eq!(
+            ON_CAMERA_FRAME_DATA_SIG.matches('I').count(),
+            10,
+            "ten int params: host_id, camera_id, 3x(offset,length), width, height"
+        );
+        assert!(ON_CAMERA_FRAME_DATA_SIG.ends_with(")V"), "void return");
+    }
 }

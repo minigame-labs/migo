@@ -68,6 +68,31 @@ impl AudioParamTimeline {
         self.current_value = value.clamp(self.min_value, self.max_value);
     }
 
+    /// Set the current value now, dropping automation anchors at or before
+    /// `current_time` so a direct `.value = x` takes effect immediately. Future
+    /// scheduled events are preserved. Per Web Audio, `.value = x` is equivalent
+    /// to `setValueAtTime(x, now)`: if an in-progress ramp survives, we insert an
+    /// anchor at `current_time` holding the NEW value, so the value jumps now and
+    /// the ramp continues from it toward its target (ramp events store only their
+    /// end, so without the anchor they would interpolate from t=0).
+    pub fn set_value_now(&mut self, value: f32, current_time: f64) {
+        let clamped = value.clamp(self.min_value, self.max_value);
+        self.events.retain(|e| e.time() > current_time);
+        let has_active_ramp = self.events.iter().any(|e| {
+            matches!(
+                e,
+                AutomationEvent::LinearRamp { .. } | AutomationEvent::ExponentialRamp { .. }
+            )
+        });
+        if has_active_ramp {
+            self.insert_event(AutomationEvent::SetValue {
+                value: clamped,
+                time: current_time,
+            });
+        }
+        self.current_value = clamped;
+    }
+
     pub fn default_value(&self) -> f32 {
         self.default_value
     }
@@ -143,9 +168,11 @@ impl AudioParamTimeline {
                 } => {
                     if current_time >= *time {
                         value = *set_val;
-                        prev_value = *set_val;
-                        prev_time = *time;
                     }
+                    // This event bounds the start of any following ramp, even when
+                    // it is still in the future relative to `current_time`.
+                    prev_time = *time;
+                    prev_value = *set_val;
                 }
                 AutomationEvent::LinearRamp {
                     value: end_val,
@@ -153,15 +180,18 @@ impl AudioParamTimeline {
                 } => {
                     if current_time >= *end_time {
                         value = *end_val;
-                        prev_value = *end_val;
-                        prev_time = *end_time;
-                    } else if current_time > prev_time {
+                    } else if current_time >= prev_time {
                         let duration = *end_time - prev_time;
-                        if duration > 0.0 {
-                            let t = (current_time - prev_time) / duration;
-                            value = prev_value + (*end_val - prev_value) * t as f32;
-                        }
+                        value = if duration > 0.0 {
+                            let t = ((current_time - prev_time) / duration) as f32;
+                            prev_value + (*end_val - prev_value) * t
+                        } else {
+                            *end_val
+                        };
                     }
+                    // current_time < prev_time: the ramp has not started; hold value.
+                    prev_time = *end_time;
+                    prev_value = *end_val;
                 }
                 AutomationEvent::ExponentialRamp {
                     value: end_val,
@@ -169,16 +199,16 @@ impl AudioParamTimeline {
                 } => {
                     if current_time >= *end_time {
                         value = *end_val;
-                        prev_value = *end_val;
-                        prev_time = *end_time;
-                    } else if current_time > prev_time {
+                    } else if current_time >= prev_time && prev_value.abs() > f32::EPSILON {
                         let duration = *end_time - prev_time;
-                        if duration > 0.0 && prev_value.abs() > f32::EPSILON {
-                            let t = (current_time - prev_time) / duration;
+                        if duration > 0.0 {
+                            let t = ((current_time - prev_time) / duration) as f32;
                             let ratio = *end_val / prev_value;
-                            value = prev_value * ratio.powf(t as f32);
+                            value = prev_value * ratio.powf(t);
                         }
                     }
+                    prev_time = *end_time;
+                    prev_value = *end_val;
                 }
                 AutomationEvent::SetTarget {
                     target,
@@ -190,6 +220,10 @@ impl AudioParamTimeline {
                         let exp = (-elapsed / *time_constant).exp() as f32;
                         value = *target + (prev_value - *target) * exp;
                     }
+                    // SetTarget is asymptotic; treat the target as the segment's
+                    // nominal endpoint for any following ramp.
+                    prev_time = *start_time;
+                    prev_value = *target;
                 }
                 AutomationEvent::CancelScheduled { .. } => {
                     // Already handled by cancel_scheduled_values
@@ -216,10 +250,20 @@ impl AudioParamTimeline {
         let inv_sample_rate = 1.0 / sample_rate as f64;
         let end_time = start_time + (buffer.len() as f64) * inv_sample_rate;
 
-        // Fast path: all events are in the future — fill with current value
-        if self.events.first().map_or(false, |e| e.time() > end_time) {
-            buffer.fill(self.current_value);
-            return;
+        // Fast path: nothing is active yet. Only valid when the first event is a
+        // plain SetValue/SetTarget whose start is after this block. Ramps are
+        // excluded: their interpolation begins at the preceding event (or t=0), so
+        // a ramp whose *end* is after the block may still be active within it.
+        if let Some(first) = self.events.first() {
+            let inactive = first.time() > end_time
+                && !matches!(
+                    first,
+                    AutomationEvent::LinearRamp { .. } | AutomationEvent::ExponentialRamp { .. }
+                );
+            if inactive {
+                buffer.fill(self.current_value);
+                return;
+            }
         }
 
         for (i, sample) in buffer.iter_mut().enumerate() {
@@ -306,9 +350,33 @@ mod tests {
 
     #[test]
     fn test_compute_values_buffer() {
-        let mut param = AudioParamTimeline::new(1.0, 0.0, 10.0);
+        let param = AudioParamTimeline::new(1.0, 0.0, 10.0);
         let mut buffer = vec![0.0f32; 4];
         param.compute_values(0.0, &mut buffer, 44100);
         assert!(buffer.iter().all(|&v| (v - 1.0).abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn gc_events_collapses_past_but_keeps_future() {
+        // Repeated scheduling would grow `events` without bound; gc collapses
+        // consumed past events to a single anchor.
+        let mut param = AudioParamTimeline::new(0.0, -1.0e30, 1.0e30);
+        for i in 0..100 {
+            param.set_value_at_time(i as f32, i as f64);
+        }
+        assert_eq!(param.events.len(), 100);
+        param.gc_events(100.0); // now is past every scheduled event
+        assert!(
+            param.events.len() <= 1,
+            "gc must collapse consumed past events, got {}",
+            param.events.len()
+        );
+
+        // Future events must survive a gc whose time precedes them.
+        let mut future = AudioParamTimeline::new(0.0, -1.0e30, 1.0e30);
+        future.set_value_at_time(1.0, 10.0);
+        future.set_value_at_time(2.0, 20.0);
+        future.gc_events(5.0);
+        assert_eq!(future.events.len(), 2, "future events must be kept");
     }
 }

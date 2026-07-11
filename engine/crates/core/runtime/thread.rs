@@ -1,4 +1,10 @@
-use std::{panic, sync::Arc};
+use std::{
+    panic,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use deno_core::PollEventLoopOptions;
 use tokio::runtime::{Builder, Runtime};
@@ -24,13 +30,19 @@ pub fn spawn_host_thread(
 ) -> EngineResult<HostId> {
     let id = registry::alloc_host_id();
 
-    // 512: sized to accommodate burst touch/vsync events at 120Hz without
-    // dropping, while bounding memory. `send_command_to_host` uses `try_send`
-    // and drops commands when full.
-    let (host_tx, mut host_rx) = tokio::sync::mpsc::channel::<HostCommand>(512);
+    // Bound all normal/game-controlled traffic while allowing the four trusted
+    // lifecycle/surface callbacks to share the same FIFO without consuming
+    // that quota. This preserves the old 512 pending-normal-command limit.
+    const HOST_NORMAL_COMMAND_CAPACITY: usize = 512;
+    let (host_tx, critical_host_tx, mut host_rx) =
+        shared::host_channel::channel(HOST_NORMAL_COMMAND_CAPACITY);
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
 
-    registry::register_sender(id, host_tx.clone());
+    // Authoritative shutdown signal, independent of the normal-command budget:
+    // `shutdown_host` sets this even when the budget is full (where its normal
+    // Shutdown nudge is dropped) and the host loop polls it every iteration.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    registry::register_sender(id, host_tx.clone(), critical_host_tx, shutdown.clone());
 
     // Clone the platform Arc so we can use it in the catch_unwind path
     // to notify Java about errors from any context (host loop, panic, etc.).
@@ -92,6 +104,9 @@ pub fn spawn_host_thread(
                     }
                 });
 
+                // Owned handle to the shutdown flag so the `async move` loop
+                // below can poll it (the thread closure only lends it to us).
+                let shutdown = shutdown.clone();
                 runtime.block_on(async move {
                     let poll = PollEventLoopOptions::default();
                     let mut host = host;
@@ -113,6 +128,15 @@ pub fn spawn_host_thread(
                     let mut notify_exit = true;
 
                     'outer: loop {
+                        // Shutdown check, decoupled from the command queue so a
+                        // full queue can't swallow the request (see shutdown_host).
+                        // Stops the loop the next time control returns here; a
+                        // runaway JS section that never yields is handled by the
+                        // ANR watchdog, not this flag.
+                        if shutdown.load(Ordering::Acquire) {
+                            break 'outer;
+                        }
+
                         // Tick the watchdog heartbeat before each iteration
                         #[cfg(feature = "v8-limits")]
                         if let Some(ref wd) = host.watchdog {
@@ -287,11 +311,13 @@ pub fn spawn_host_thread(
             // late-arriving commands is the correct behavior.  The JNI callers
             // already ignore send failures (they use `let _ = send_command_to_host(...)`).
             registry::unregister_sender(id);
+            registry::unregister_destroy_epoch(id);
         });
 
     if let Err(e) = spawn_result {
         error!("[Host {}] failed to spawn thread: {}", id, e);
         registry::unregister_sender(id);
+        registry::unregister_destroy_epoch(id);
         return Err(EngineError::new(ErrorCode::Internal)
             .with_msg("failed to spawn host thread")
             .with_detail(e.to_string()));
@@ -300,6 +326,7 @@ pub fn spawn_host_thread(
     if ready_rx.recv().is_err() {
         error!("[Host {}] failed to start (init panic / early exit)", id);
         registry::unregister_sender(id);
+        registry::unregister_destroy_epoch(id);
         return Err(EngineError::new(ErrorCode::Internal)
             .with_msg("host thread failed to start")
             .with_detail("init panic / early exit".to_string()));

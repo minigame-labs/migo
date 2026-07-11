@@ -16,11 +16,6 @@ pub struct RafSender(SenderInner);
 /// Wrapped in `Arc` for restart survival.
 pub struct RafReceiver(ReceiverInner);
 
-unsafe impl Send for RafSender {}
-unsafe impl Sync for RafSender {}
-unsafe impl Send for RafReceiver {}
-unsafe impl Sync for RafReceiver {}
-
 impl RafSender {
     /// Signal the next frame timestamp (milliseconds).
     ///
@@ -62,14 +57,30 @@ impl RafReceiver {
     pub async fn recv(&self) -> Option<f64> {
         match &self.0 {
             #[cfg(target_os = "android")]
-            ReceiverInner::Eventfd { fd, timestamp } => {
+            ReceiverInner::Eventfd {
+                async_fd,
+                fd,
+                timestamp,
+            } => {
                 use std::os::fd::AsRawFd;
                 use std::sync::atomic::Ordering;
 
                 let raw_fd = fd.as_raw_fd();
-                let async_fd =
-                    tokio::io::unix::AsyncFd::with_interest(raw_fd, tokio::io::Interest::READABLE)
-                        .ok()?;
+                // Register the fd with epoll once and reuse it every frame.
+                // Recreating an `AsyncFd` per `recv()` did an epoll add+remove on
+                // every RAF wait. Lazily initialised because the first `recv()`
+                // is the earliest point a tokio reactor is guaranteed current;
+                // the host tokio runtime (and thus this registration) survives
+                // soft restarts, so the cached handle stays valid.
+                let async_fd = async_fd
+                    .get_or_try_init(|| async {
+                        tokio::io::unix::AsyncFd::with_interest(
+                            raw_fd,
+                            tokio::io::Interest::READABLE,
+                        )
+                    })
+                    .await
+                    .ok()?;
 
                 // Loop until we get a real read or a fatal error.
                 // EAGAIN (spurious wake) just re-enters the readable wait.
@@ -98,7 +109,20 @@ impl RafReceiver {
                     return None;
                 }
             }
-            ReceiverInner::Channel(rx) => rx.lock().await.recv().await,
+            ReceiverInner::Channel(rx) => {
+                let mut rx = rx.lock().await;
+                let first = rx.recv().await?;
+                // Coalesce to the newest queued timestamp so RAF uses the latest
+                // frame time, matching the eventfd path (which collapses multiple
+                // signals into one wake with the newest ts via the atomic). The
+                // bounded(2) channel would otherwise hand back a stale buffered
+                // frame first when the consumer briefly falls behind.
+                let mut latest = first;
+                while let Ok(ts) = rx.try_recv() {
+                    latest = ts;
+                }
+                Some(latest)
+            }
         }
     }
 }
@@ -119,6 +143,11 @@ enum SenderInner {
 enum ReceiverInner {
     #[cfg(target_os = "android")]
     Eventfd {
+        /// Cached epoll registration for `fd`, created on the first `recv()`
+        /// (needs a live tokio reactor) and reused every frame to avoid a
+        /// per-frame epoll add/remove. Declared before `fd` so it deregisters
+        /// before the fd is closed on drop.
+        async_fd: tokio::sync::OnceCell<tokio::io::unix::AsyncFd<std::os::fd::RawFd>>,
         fd: std::os::fd::OwnedFd,
         timestamp: Arc<std::sync::atomic::AtomicU64>,
     },
@@ -175,6 +204,7 @@ fn create_eventfd_pair() -> Result<(RafSender, RafReceiver), String> {
             timestamp: timestamp.clone(),
         }),
         RafReceiver(ReceiverInner::Eventfd {
+            async_fd: tokio::sync::OnceCell::new(),
             fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd2) },
             timestamp,
         }),

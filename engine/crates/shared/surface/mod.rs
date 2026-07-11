@@ -90,6 +90,16 @@ pub trait Surface: std::fmt::Debug + Send + Sync {
     /// - `Xlib`: Contains X11 `Display*`
     /// - `Wayland`: Contains `wl_display*`
     fn raw_display_handle(&self) -> raw_window_handle::RawDisplayHandle;
+
+    /// Monotonic destroy-epoch captured when this surface was handed off from
+    /// the platform layer. The render thread compares it against the live
+    /// per-host destroy counter each frame: if a `surfaceDestroyed` has occurred
+    /// since (live counter advanced past this value), the surface is stale and
+    /// must not be presented to. Defaults to 0 for platforms without surface
+    /// teardown semantics.
+    fn surface_epoch(&self) -> u64 {
+        0
+    }
 }
 
 /// Thread-safe reference to a surface.

@@ -33,6 +33,7 @@ crc32fast = "1"
 zstd = { workspace = true }
 bitflags = "2"
 lru = { workspace = true }
+smallvec = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"

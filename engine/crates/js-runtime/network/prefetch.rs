@@ -27,6 +27,11 @@ use super::fetch::get_or_create_client_from_state;
 /// Maximum number of concurrent prefetch requests.
 const MAX_CONCURRENT_PREFETCH: usize = 6;
 
+/// Maximum hostnames a single `prefetchDns` call will act on, so a game
+/// passing thousands of names can't translate into an unbounded pile of
+/// background DNS work.
+const MAX_PREFETCH_DNS_HOSTS: usize = 32;
+
 /// Largest response body we will drain during a prefetch. Draining a
 /// small body lets the HTTP/1.1 connection return to the pool warm;
 /// larger bodies are left unread (the TCP/TLS handshake is already warmed
@@ -45,7 +50,10 @@ const MAX_DRAIN_BODY: usize = 1024 * 1024;
 /// Resolution happens in background Tokio tasks. This op returns immediately.
 /// Invalid or private/loopback addresses are silently skipped.
 #[op2(fast)]
-pub fn op_prefetch_dns(#[string] hosts_json: String) -> Result<(), JsErrorBox> {
+pub fn op_prefetch_dns(
+    state: &mut OpState,
+    #[string] hosts_json: String,
+) -> Result<(), JsErrorBox> {
     let hosts: Vec<String> = serde_json::from_str(&hosts_json)
         .map_err(|e| JsErrorBox::type_error(format!("prefetchDns: invalid JSON: {}", e)))?;
 
@@ -53,8 +61,27 @@ pub fn op_prefetch_dns(#[string] hosts_json: String) -> Result<(), JsErrorBox> {
         return Ok(());
     }
 
-    debug!("prefetchDns: pre-resolving {} hosts", hosts.len());
-    dns_cache::pre_resolve(hosts);
+    // Apply the same domain whitelist as fetch/WebSocket: prefetch must
+    // not warm the resolver (or leak hostnames to the DNS server) for
+    // hosts the policy would refuse to connect to. Empty whitelist =
+    // allow all, matching the gate.
+    let policy = state
+        .borrow::<shared::op_state::HostOpState>()
+        .network_policy
+        .clone();
+    let mut allowed: Vec<String> = hosts
+        .into_iter()
+        .filter(|h| super::gate::is_host_whitelisted(h, &policy))
+        .collect();
+
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    // Bound the fan-out so one call can't schedule unbounded background work.
+    allowed.truncate(MAX_PREFETCH_DNS_HOSTS);
+
+    debug!("prefetchDns: pre-resolving {} hosts", allowed.len());
+    dns_cache::pre_resolve(allowed);
     Ok(())
 }
 
@@ -167,31 +194,46 @@ async fn prefetch_one(client: reqwest::Client, url: Url) {
         .send()
         .await
     {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let status = resp.status().as_u16();
-            // Drain a small successful body so the HTTP/1.1 connection
-            // returns to the pool warm; large bodies are skipped (the
-            // handshake is already warmed). Nothing is stored either way.
-            let drain = (200..400).contains(&status)
-                && resp
-                    .content_length()
-                    .is_none_or(|len| len as usize <= MAX_DRAIN_BODY);
-            if drain {
-                match resp.bytes().await {
-                    Ok(body) => debug!(
-                        "prefetchAssets: {} -> {} ({} bytes, warmed)",
-                        url_str,
-                        status,
-                        body.len()
-                    ),
-                    Err(e) => debug!("prefetchAssets: {} body read error: {}", url_str, e),
-                }
-            } else {
+            // Only warm on success/redirect, and skip draining when a
+            // declared Content-Length already exceeds the cap.
+            let cl_too_big = resp
+                .content_length()
+                .is_some_and(|len| len as usize > MAX_DRAIN_BODY);
+            if !(200..400).contains(&status) || cl_too_big {
                 debug!(
                     "prefetchAssets: {} -> {} (warmed, body not drained)",
                     url_str, status
                 );
+                return;
             }
+            // Drain up to MAX_DRAIN_BODY so an HTTP/1.1 connection returns
+            // to the pool warm, then stop. The cap is enforced on the
+            // stream itself (not via Content-Length), so a chunked /
+            // Content-Length-less response can't pull an unbounded body
+            // into memory — the previous `resp.bytes()` did exactly that
+            // whenever the header was absent. Nothing is stored either way.
+            let mut drained = 0usize;
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        drained += chunk.len();
+                        if drained >= MAX_DRAIN_BODY {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        debug!("prefetchAssets: {} body read error: {}", url_str, e);
+                        return;
+                    }
+                }
+            }
+            debug!(
+                "prefetchAssets: {} -> {} ({} bytes drained, warmed)",
+                url_str, status, drained
+            );
         }
         Err(e) => {
             debug!("prefetchAssets: {} fetch error: {}", url_str, e);

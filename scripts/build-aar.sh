@@ -88,7 +88,9 @@ if [[ ! -f "$RUST_BUILD_SCRIPT" ]]; then
     exit 1
 fi
 
-chmod +x "$RUST_BUILD_SCRIPT"
+if [[ ! -x "$RUST_BUILD_SCRIPT" ]]; then
+    chmod +x "$RUST_BUILD_SCRIPT"
+fi
 
 # ------------------------------------------------------------
 # Parse arguments
@@ -224,7 +226,9 @@ build_aar() {
 
     local gradle_cmd
     if [[ -f "./gradlew" ]]; then
-        chmod +x ./gradlew
+        if [[ ! -x "./gradlew" ]]; then
+            chmod +x ./gradlew
+        fi
         gradle_cmd="./gradlew"
     elif command -v gradle &> /dev/null; then
         gradle_cmd="gradle"

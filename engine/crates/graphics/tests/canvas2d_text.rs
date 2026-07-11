@@ -67,7 +67,7 @@ fn fill_text_draws_non_empty_pixels() {
             let resolver = NullPatternResolver;
             let env = DrawEnv {
                 canvas: surface.canvas(),
-                text,
+                text: Some(text),
                 resolver: &resolver,
             };
             let mut ctx = Canvas2DRenderer::new();
@@ -121,7 +121,7 @@ fn text_align_shifts_x_anchor() {
                 let resolver = NullPatternResolver;
                 let env = DrawEnv {
                     canvas: surface.canvas(),
-                    text,
+                    text: Some(text),
                     resolver: &resolver,
                 };
                 let mut ctx = Canvas2DRenderer::new();
@@ -198,7 +198,7 @@ fn text_baseline_shifts_y_anchor() {
                 let resolver = NullPatternResolver;
                 let env = DrawEnv {
                     canvas: surface.canvas(),
-                    text,
+                    text: Some(text),
                     resolver: &resolver,
                 };
                 let mut ctx = Canvas2DRenderer::new();
@@ -255,7 +255,7 @@ fn stroke_text_produces_outline_not_fill() {
             let resolver = NullPatternResolver;
             let env = DrawEnv {
                 canvas: surface.canvas(),
-                text,
+                text: Some(text),
                 resolver: &resolver,
             };
             let mut ctx = Canvas2DRenderer::new();
@@ -317,7 +317,7 @@ fn max_width_scales_long_text_horizontally() {
             let resolver = NullPatternResolver;
             let env = DrawEnv {
                 canvas: surface.canvas(),
-                text,
+                text: Some(text),
                 resolver: &resolver,
             };
             let mut ctx = Canvas2DRenderer::new();

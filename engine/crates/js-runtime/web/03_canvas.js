@@ -152,13 +152,24 @@ const getMainCanvas = () => {
 // Host-driven WebGL context-loss lifecycle. When the render thread rebuilds the
 // GL share group after a real GPU reset (or a WEBGL_lose_context.loseContext
 // simulation), it drives these events so the engine can drop and rebuild its
-// own GL resources per the WebGL spec: `webglcontextlost` (cancelable -- the
-// engine calls preventDefault to opt into restoration) then, once the fresh
-// context is ready, `webglcontextrestored`. Dispatched on the main (onscreen)
-// canvas, which is where engines register their listeners. Invoked from the
-// host via `_internalTriggerWebglContextEvent` (see 98_global_scope_window.js).
+// own GL resources: `webglcontextlost` then, once the fresh context is ready,
+// `webglcontextrestored`. Dispatched on the main (onscreen) canvas, which is
+// where engines register their listeners. Invoked from the host via
+// `_internalTriggerWebglContextEvent` (see 98_global_scope_window.js).
+//
+// NON-SPEC RECOVERY MODEL: unlike browsers, Migo recovery is MANDATORY and
+// automatic -- the render thread always tears down and rebuilds the share group
+// and only reports success after a probe. Recovery is therefore NOT gated on
+// the listener calling `preventDefault()`. The event is still exposed as
+// `cancelable` for engine compatibility, and `preventDefault()` is honored as a
+// signal (returned to the host) rather than as the trigger for restoration.
+// Engines should treat all GL resources as invalid on `webglcontextlost` and
+// rebuild them on `webglcontextrestored`; `gl.isContextLost()` reflects the
+// render-thread-owned authoritative state at all times.
+//
+// Returns `true` if a listener called `preventDefault()`, else `false`.
 const dispatchWebglContextEvent = (type) => {
-    if (!_mainCanvas) return;
+    if (!_mainCanvas) return false;
     let prevented = false;
     const event = {
         type,
@@ -166,9 +177,10 @@ const dispatchWebglContextEvent = (type) => {
         bubbles: false,
         cancelable: type === "webglcontextlost",
         get defaultPrevented() { return prevented; },
-        preventDefault() { prevented = true; },
+        preventDefault() { if (type === "webglcontextlost") prevented = true; },
     };
     _mainCanvas.dispatchEvent(event);
+    return prevented;
 };
 
 export {

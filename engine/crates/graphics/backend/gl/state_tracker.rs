@@ -52,30 +52,22 @@ pub fn update_use_program(state: &mut CanvasGLState, new: ProgramId) -> bool {
 ///
 /// `value_bytes` is the raw byte slice the caller would have handed to
 /// `glUniform*` (e.g. `bytemuck::bytes_of(&[f32; 4])`).  Returns `true`
-/// if the upload is not redundant and should be issued; on `true` the
-/// cache entry is updated so the *next* call with identical bytes will
-/// dedup.
+/// if the upload is not redundant and should be issued. On `true`, normal-size
+/// values update the cache so the *next* identical call dedups; oversized
+/// values deliberately bypass retention and therefore continue to return true.
 pub fn update_uniform(
     state: &mut CanvasGLState,
     program: ProgramId,
     location: u32,
     value_bytes: &[u8],
 ) -> bool {
-    let key = (program, location);
-    match state.uniform_cache.get(&key) {
-        Some(prev) if prev.as_ref() == value_bytes => return false,
-        _ => {}
-    }
-    if state.uniform_cache.len() >= MAX_UNIFORM_CACHE && !state.uniform_cache.contains_key(&key) {
-        // Simple LRU-ish eviction: drop an arbitrary entry.  A ring-buffer
-        // would be better but this path triggers only for pathological
-        // games using >256 unique locations per program.
-        if let Some(k) = state.uniform_cache.keys().next().copied() {
-            state.uniform_cache.remove(&k);
-        }
-    }
-    state.uniform_cache.insert(key, Box::from(value_bytes));
-    true
+    super::uniform_cache::update(
+        &mut state.uniform_cache,
+        MAX_UNIFORM_CACHE,
+        program,
+        location,
+        value_bytes,
+    )
 }
 
 // ============================================================================
@@ -699,6 +691,21 @@ mod tests {
         let mut s = fresh_state();
         assert!(update_uniform(&mut s, 1, 5, &[1u8, 2]));
         assert!(update_uniform(&mut s, 1, 5, &[1u8, 3]));
+    }
+
+    #[test]
+    fn changed_uniform_reuses_cached_value_allocation() {
+        let mut s = fresh_state();
+        assert!(update_uniform(&mut s, 1, 5, &[1u8, 2, 3, 4]));
+        let first_allocation = s.uniform_cache.get(&(1, 5)).unwrap().as_ptr();
+
+        assert!(update_uniform(&mut s, 1, 5, &[5u8, 6, 7, 8]));
+        let second_allocation = s.uniform_cache.get(&(1, 5)).unwrap().as_ptr();
+
+        assert_eq!(
+            second_allocation, first_allocation,
+            "same-sized changes should update the existing cache buffer"
+        );
     }
 
     #[test]

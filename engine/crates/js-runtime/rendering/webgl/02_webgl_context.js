@@ -158,13 +158,14 @@ import {
 
 import { core, primordials } from "ext:core/mod.js";
 
-const { isArrayBuffer, isTypedArray, isDataView } = core;
+const { isArrayBuffer, isTypedArray, isDataView, isSharedArrayBuffer } = core;
 
 const {
     ArrayIsArray,
     TypedArrayPrototypeGetBuffer,
     TypedArrayPrototypeGetByteLength,
     TypedArrayPrototypeGetByteOffset,
+    TypedArrayPrototypeGetSymbolToStringTag,
     Uint8Array,
     Uint32Array,
     Int32Array,
@@ -213,16 +214,81 @@ function toUnit8Array(input) {
     return toTypedArray(input, Uint8Array);
 }
 
-function toUnit32Array(input) {
-    return toTypedArray(input, Uint32Array);
+// Rust's fast `#[buffer]` path borrows the typed-array backing as a slice.
+// A SharedArrayBuffer can be mutated concurrently by another isolate, which
+// is not a valid Rust shared-slice contract. Copy shared views in V8 first;
+// normal ArrayBuffer-backed target arrays retain the zero-copy path.
+function ensureNonSharedTypedArray(view, Type) {
+    return isSharedArrayBuffer(TypedArrayPrototypeGetBuffer(view))
+        ? new Type(view)
+        : view;
 }
 
-// Reinterpret Int32Array bits as Uint32Array without copying.
-// Needed because deno_core #[buffer(copy)] only accepts Vec<u32>;
-// Rust cast_vec then reinterprets the bits back to the target type.
+function toFloat32AsUint32(input) {
+    let f32;
+    if (isTypedArray(input)) {
+        f32 = TypedArrayPrototypeGetSymbolToStringTag(input) === "Float32Array"
+            ? input
+            : new Float32Array(input);
+    } else if (ArrayIsArray(input)) {
+        // Float32List accepts numeric sequences. Constructing Uint32Array
+        // directly would truncate each float to an integer before Rust
+        // reinterprets the words, corrupting values such as 1.5.
+        f32 = new Float32Array(input);
+    } else if (isDataView(input)) {
+        f32 = new Float32Array(
+            DataViewPrototypeGetBuffer(input),
+            DataViewPrototypeGetByteOffset(input),
+            DataViewPrototypeGetByteLength(input) / Float32Array.BYTES_PER_ELEMENT,
+        );
+    } else if (isArrayBuffer(input)) {
+        f32 = new Float32Array(
+            input,
+            0,
+            ArrayBufferPrototypeGetByteLength(input) / Float32Array.BYTES_PER_ELEMENT,
+        );
+    } else {
+        throw new TypeError("Invalid float list: must be a numeric sequence or buffer view");
+    }
+    f32 = ensureNonSharedTypedArray(f32, Float32Array);
+    return new Uint32Array(
+        TypedArrayPrototypeGetBuffer(f32),
+        TypedArrayPrototypeGetByteOffset(f32),
+        TypedArrayPrototypeGetByteLength(f32) / Uint32Array.BYTES_PER_ELEMENT,
+    );
+}
+
+// Convert to an Int32 typed list, then expose the same bits to the fast
+// borrowed u32 op. Rust copies those words into inline SmallVec storage.
 function toInt32AsUint32(input) {
-    const i32 = toTypedArray(input, Int32Array);
-    return new Uint32Array(i32.buffer, i32.byteOffset, i32.length);
+    let i32;
+    if (isTypedArray(input)) {
+        i32 = TypedArrayPrototypeGetSymbolToStringTag(input) === "Int32Array"
+            ? input
+            : new Int32Array(input);
+    } else if (ArrayIsArray(input)) {
+        i32 = new Int32Array(input);
+    } else if (isDataView(input)) {
+        i32 = new Int32Array(
+            DataViewPrototypeGetBuffer(input),
+            DataViewPrototypeGetByteOffset(input),
+            DataViewPrototypeGetByteLength(input) / Int32Array.BYTES_PER_ELEMENT,
+        );
+    } else if (isArrayBuffer(input)) {
+        i32 = new Int32Array(
+            input,
+            0,
+            ArrayBufferPrototypeGetByteLength(input) / Int32Array.BYTES_PER_ELEMENT,
+        );
+    } else {
+        throw new TypeError("Invalid integer list: must be a numeric sequence or buffer view");
+    }
+    i32 = ensureNonSharedTypedArray(i32, Int32Array);
+    return new Uint32Array(
+        TypedArrayPrototypeGetBuffer(i32),
+        TypedArrayPrototypeGetByteOffset(i32),
+        TypedArrayPrototypeGetByteLength(i32) / Uint32Array.BYTES_PER_ELEMENT,
+    );
 }
 
 // Direct-path detection: cocos's `gl.texImage2D(target, ..., canvas)`
@@ -582,12 +648,13 @@ class WebGLRenderingContext {
     }
 
     isContextLost() {
-        // Reflects the real render-context state (set by the host on a
-        // ContextLost render event, cleared on successful recovery), so
-        // games that guard draw calls on this stop issuing GL into a dead
-        // context. Note: a webglcontextlost/restored *event* is not yet
-        // dispatched -- poll this instead until the device-verified recovery
-        // task wires the event.
+        // Reflects the authoritative render-context state: the render thread
+        // sets/clears the shared `context_lost` atomic the instant it loses or
+        // recovers the context, so this is always accurate (and independent of
+        // the lossy render-event channel). The matching `webglcontextlost` /
+        // `webglcontextrestored` events ARE dispatched on the main canvas (see
+        // dispatchWebglContextEvent + Host::reconcile_context_lost); games may
+        // either listen for those events or poll this.
         return op_gl_is_context_lost();
     }
 
@@ -699,10 +766,7 @@ class WebGLRenderingContext {
     }
 
     uniformMatrix3fv(location, transpose, value) {
-        if (!(value instanceof Float32Array)) {
-            throw new Error("Invalid data, must be a Float32Array");
-        }
-        op_uniform_matrix_3fv(this._canvasId, _loc(location), transpose, toUnit32Array(value));
+        op_uniform_matrix_3fv(this._canvasId, _loc(location), transpose, toFloat32AsUint32(value));
     }
 
     // -- Phase 1A: GL State --
@@ -1416,31 +1480,31 @@ class WebGLRenderingContext {
         op_uniform1iv(this._canvasId, _loc(location), toInt32AsUint32(value));
     }
     uniform1fv(location, value) {
-        op_uniform1fv(this._canvasId, _loc(location), toUnit32Array(value));
+        op_uniform1fv(this._canvasId, _loc(location), toFloat32AsUint32(value));
     }
     uniform2iv(location, value) {
         op_uniform2iv(this._canvasId, _loc(location), toInt32AsUint32(value));
     }
     uniform2fv(location, value) {
-        op_uniform2fv(this._canvasId, _loc(location), toUnit32Array(value));
+        op_uniform2fv(this._canvasId, _loc(location), toFloat32AsUint32(value));
     }
     uniform3iv(location, value) {
         op_uniform3iv(this._canvasId, _loc(location), toInt32AsUint32(value));
     }
     uniform3fv(location, value) {
-        op_uniform3fv(this._canvasId, _loc(location), toUnit32Array(value));
+        op_uniform3fv(this._canvasId, _loc(location), toFloat32AsUint32(value));
     }
     uniform4iv(location, value) {
         op_uniform4iv(this._canvasId, _loc(location), toInt32AsUint32(value));
     }
     uniform4fv(location, value) {
-        op_uniform4fv(this._canvasId, _loc(location), toUnit32Array(value));
+        op_uniform4fv(this._canvasId, _loc(location), toFloat32AsUint32(value));
     }
     uniformMatrix2fv(location, transpose, value) {
-        op_uniform_matrix_2fv(this._canvasId, _loc(location), transpose, toUnit32Array(value));
+        op_uniform_matrix_2fv(this._canvasId, _loc(location), transpose, toFloat32AsUint32(value));
     }
     uniformMatrix4fv(location, transpose, value) {
-        op_uniform_matrix_4fv(this._canvasId, _loc(location), transpose, toUnit32Array(value));
+        op_uniform_matrix_4fv(this._canvasId, _loc(location), transpose, toFloat32AsUint32(value));
     }
 
     // -- Phase 3A: Framebuffer/Renderbuffer --

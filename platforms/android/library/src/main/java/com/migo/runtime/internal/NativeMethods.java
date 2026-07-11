@@ -598,13 +598,35 @@ public final class NativeMethods {
      *
      * @param sessionId The session ID
      * @param cameraId  The camera instance ID
-     * @param frameData Raw frame bytes
+     * @param yBuffer   Direct Y-plane ByteBuffer
+     * @param yOffset   Y-plane window start (buffer position)
+     * @param yLength   Y-plane window length (buffer remaining)
+     * @param uBuffer   Direct U-plane ByteBuffer
+     * @param uOffset   U-plane window start
+     * @param uLength   U-plane window length
+     * @param vBuffer   Direct V-plane ByteBuffer
+     * @param vOffset   V-plane window start
+     * @param vLength   V-plane window length
      * @param width     Frame width in pixels
      * @param height    Frame height in pixels
      */
-    public static void onCameraFrameData(int sessionId, int cameraId, byte[] frameData, int width, int height) {
-        if (sessionId >= 0 && frameData != null && width > 0 && height > 0) {
-            NativeBridge.onCameraFrameData(sessionId, cameraId, frameData, width, height);
+    public static void onCameraFrameData(int sessionId, int cameraId,
+            ByteBuffer yBuffer, int yOffset, int yLength,
+            ByteBuffer uBuffer, int uOffset, int uLength,
+            ByteBuffer vBuffer, int vOffset, int vLength,
+            int width, int height) {
+        // Native code reads each plane via its direct address; only direct,
+        // non-null buffers with positive dimensions are forwarded.
+        if (sessionId >= 0
+                && width > 0 && height > 0
+                && yBuffer != null && yBuffer.isDirect()
+                && uBuffer != null && uBuffer.isDirect()
+                && vBuffer != null && vBuffer.isDirect()) {
+            NativeBridge.onCameraFrameData(sessionId, cameraId,
+                    yBuffer, yOffset, yLength,
+                    uBuffer, uOffset, uLength,
+                    vBuffer, vOffset, vLength,
+                    width, height);
         }
     }
 

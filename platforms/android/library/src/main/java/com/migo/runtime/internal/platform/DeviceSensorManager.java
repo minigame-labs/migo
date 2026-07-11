@@ -47,10 +47,23 @@ public final class DeviceSensorManager {
     private SensorEventListener compassListener;
     private SensorEventListener accelerometerListener;
 
+    private final LifecycleRequestState<String> motionRequest;
+    private final LifecycleRequestState<String> gyroscopeRequest;
+    private final LifecycleRequestState<Boolean> compassRequest;
+    private final LifecycleRequestState<String> accelerometerRequest;
+
     public DeviceSensorManager(int sessionId, Context context) {
+        this(sessionId, context, false);
+    }
+
+    public DeviceSensorManager(int sessionId, Context context, boolean lifecycleSuspended) {
         this.sessionId = sessionId;
         this.sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
         this.windowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+        this.motionRequest = new LifecycleRequestState<>(lifecycleSuspended);
+        this.gyroscopeRequest = new LifecycleRequestState<>(lifecycleSuspended);
+        this.compassRequest = new LifecycleRequestState<>(lifecycleSuspended);
+        this.accelerometerRequest = new LifecycleRequestState<>(lifecycleSuspended);
     }
 
     // ==================== Device Motion ====================
@@ -63,16 +76,27 @@ public final class DeviceSensorManager {
      *
      * @param interval "game", "ui", or "normal"
      */
-    public void startDeviceMotionListening(String interval) {
-        if (sensorManager == null) return;
-        stopDeviceMotionListening();
+    public synchronized void startDeviceMotionListening(String interval) {
+        LifecycleRequestState.Action action = motionRequest.requestStart(interval);
+        if (action == LifecycleRequestState.Action.RESTART) {
+            stopDeviceMotionListeningInternal();
+        }
+        if ((action == LifecycleRequestState.Action.START
+                || action == LifecycleRequestState.Action.RESTART)
+                && !startDeviceMotionListeningInternal(interval)) {
+            motionRequest.startFailed(true);
+        }
+    }
+
+    private boolean startDeviceMotionListeningInternal(String interval) {
+        if (sensorManager == null) return false;
 
         Sensor sensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
         if (sensor == null) {
             // Fallback to game rotation vector (no magnetic field, less accurate but more available)
             sensor = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
         }
-        if (sensor == null) return;
+        if (sensor == null) return false;
 
         final int delay = parseInterval(interval);
 
@@ -82,24 +106,27 @@ public final class DeviceSensorManager {
 
             @Override
             public void onSensorChanged(SensorEvent event) {
-                SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
+                synchronized (DeviceSensorManager.this) {
+                    if (motionListener != this || !motionRequest.isActive()) return;
+                    SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
 
-                // Remap coordinate system based on display rotation for correct
-                // alpha/beta/gamma regardless of screen orientation
-                float[] remapped = remapForDisplay(rotationMatrix);
+                    // Remap coordinate system based on display rotation for correct
+                    // alpha/beta/gamma regardless of screen orientation
+                    float[] remapped = remapForDisplay(rotationMatrix);
 
-                SensorManager.getOrientation(remapped, orientation);
+                    SensorManager.getOrientation(remapped, orientation);
 
-                // Convert from radians to degrees
-                // orientation[0] = azimuth (rotation around Z), -PI..PI -> alpha 0..360
-                // orientation[1] = pitch (rotation around X), -PI..PI -> beta -180..180
-                // orientation[2] = roll (rotation around Y), -PI/2..PI/2 -> gamma -90..90
-                double alpha = Math.toDegrees(orientation[0]);
-                if (alpha < 0) alpha += 360.0;
-                double beta = Math.toDegrees(orientation[1]);
-                double gamma = Math.toDegrees(orientation[2]);
+                    // Convert from radians to degrees
+                    // orientation[0] = azimuth (rotation around Z), -PI..PI -> alpha 0..360
+                    // orientation[1] = pitch (rotation around X), -PI..PI -> beta -180..180
+                    // orientation[2] = roll (rotation around Y), -PI/2..PI/2 -> gamma -90..90
+                    double alpha = Math.toDegrees(orientation[0]);
+                    if (alpha < 0) alpha += 360.0;
+                    double beta = Math.toDegrees(orientation[1]);
+                    double gamma = Math.toDegrees(orientation[2]);
 
-                NativeMethods.onDeviceMotionChange(sessionId, alpha, beta, gamma);
+                    NativeMethods.onDeviceMotionChange(sessionId, alpha, beta, gamma);
+                }
             }
 
             @Override
@@ -107,16 +134,27 @@ public final class DeviceSensorManager {
             }
         };
 
-        sensorManager.registerListener(motionListener, sensor, delay);
+        if (!sensorManager.registerListener(motionListener, sensor, delay)) {
+            motionListener = null;
+            return false;
+        }
+        return true;
     }
 
     /**
      * Stop listening for device motion events.
      */
-    public void stopDeviceMotionListening() {
-        if (sensorManager != null && motionListener != null) {
-            sensorManager.unregisterListener(motionListener);
-            motionListener = null;
+    public synchronized void stopDeviceMotionListening() {
+        if (motionRequest.requestStop() == LifecycleRequestState.Action.STOP) {
+            stopDeviceMotionListeningInternal();
+        }
+    }
+
+    private void stopDeviceMotionListeningInternal() {
+        SensorEventListener listener = motionListener;
+        motionListener = null;
+        if (sensorManager != null && listener != null) {
+            sensorManager.unregisterListener(listener);
         }
     }
 
@@ -129,24 +167,38 @@ public final class DeviceSensorManager {
      *
      * @param interval "game", "ui", or "normal"
      */
-    public void startGyroscope(String interval) {
-        if (sensorManager == null) return;
-        stopGyroscope();
+    public synchronized void startGyroscope(String interval) {
+        LifecycleRequestState.Action action = gyroscopeRequest.requestStart(interval);
+        if (action == LifecycleRequestState.Action.RESTART) {
+            stopGyroscopeInternal();
+        }
+        if ((action == LifecycleRequestState.Action.START
+                || action == LifecycleRequestState.Action.RESTART)
+                && !startGyroscopeInternal(interval)) {
+            gyroscopeRequest.startFailed(true);
+        }
+    }
+
+    private boolean startGyroscopeInternal(String interval) {
+        if (sensorManager == null) return false;
 
         Sensor sensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
-        if (sensor == null) return;
+        if (sensor == null) return false;
 
         final int delay = parseInterval(interval);
 
         gyroscopeListener = new SensorEventListener() {
             @Override
             public void onSensorChanged(SensorEvent event) {
-                NativeMethods.onGyroscopeChange(
-                        sessionId,
-                        event.values[0],
-                        event.values[1],
-                        event.values[2]
-                );
+                synchronized (DeviceSensorManager.this) {
+                    if (gyroscopeListener != this || !gyroscopeRequest.isActive()) return;
+                    NativeMethods.onGyroscopeChange(
+                            sessionId,
+                            event.values[0],
+                            event.values[1],
+                            event.values[2]
+                    );
+                }
             }
 
             @Override
@@ -154,16 +206,27 @@ public final class DeviceSensorManager {
             }
         };
 
-        sensorManager.registerListener(gyroscopeListener, sensor, delay);
+        if (!sensorManager.registerListener(gyroscopeListener, sensor, delay)) {
+            gyroscopeListener = null;
+            return false;
+        }
+        return true;
     }
 
     /**
      * Stop listening for gyroscope events.
      */
-    public void stopGyroscope() {
-        if (sensorManager != null && gyroscopeListener != null) {
-            sensorManager.unregisterListener(gyroscopeListener);
-            gyroscopeListener = null;
+    public synchronized void stopGyroscope() {
+        if (gyroscopeRequest.requestStop() == LifecycleRequestState.Action.STOP) {
+            stopGyroscopeInternal();
+        }
+    }
+
+    private void stopGyroscopeInternal() {
+        SensorEventListener listener = gyroscopeListener;
+        gyroscopeListener = null;
+        if (sensorManager != null && listener != null) {
+            sensorManager.unregisterListener(listener);
         }
     }
 
@@ -178,9 +241,20 @@ public final class DeviceSensorManager {
      * <p>
      * Frequency: ~5 times/second (200ms interval, SENSOR_DELAY_NORMAL).
      */
-    public void startCompass() {
-        if (sensorManager == null) return;
-        stopCompass();
+    public synchronized void startCompass() {
+        LifecycleRequestState.Action action = compassRequest.requestStart(Boolean.TRUE);
+        if (action == LifecycleRequestState.Action.RESTART) {
+            stopCompassInternal();
+        }
+        if ((action == LifecycleRequestState.Action.START
+                || action == LifecycleRequestState.Action.RESTART)
+                && !startCompassInternal()) {
+            compassRequest.startFailed(true);
+        }
+    }
+
+    private boolean startCompassInternal() {
+        if (sensorManager == null) return false;
 
         // Use TYPE_ORIENTATION for simplicity (deprecated but still works)
         Sensor orientationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ORIENTATION);
@@ -188,11 +262,13 @@ public final class DeviceSensorManager {
             compassListener = new SensorEventListener() {
                 @Override
                 public void onSensorChanged(SensorEvent event) {
-                    // event.values[0] = azimuth (direction, 0-360 degrees)
-                    double direction = event.values[0];
-                    // Accuracy as string for Android
-                    String accuracy = mapAccuracy(event.accuracy);
-                    NativeMethods.onCompassChange(sessionId, direction, accuracy);
+                    synchronized (DeviceSensorManager.this) {
+                        if (compassListener != this || !compassRequest.isActive()) return;
+                        // event.values[0] = azimuth (direction, 0-360 degrees)
+                        double direction = event.values[0];
+                        String accuracy = mapAccuracy(event.accuracy);
+                        NativeMethods.onCompassChange(sessionId, direction, accuracy);
+                    }
                 }
 
                 @Override
@@ -200,14 +276,18 @@ public final class DeviceSensorManager {
                 }
             };
             // ~5 times/second = 200ms = SENSOR_DELAY_NORMAL
-            sensorManager.registerListener(compassListener, orientationSensor, SensorManager.SENSOR_DELAY_NORMAL);
-            return;
+            if (!sensorManager.registerListener(
+                    compassListener, orientationSensor, SensorManager.SENSOR_DELAY_NORMAL)) {
+                compassListener = null;
+                return false;
+            }
+            return true;
         }
 
         // Fallback: Use magnetic field + accelerometer
         final Sensor magneticSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
         final Sensor accelerometerSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
-        if (magneticSensor == null || accelerometerSensor == null) return;
+        if (magneticSensor == null || accelerometerSensor == null) return false;
 
         compassListener = new SensorEventListener() {
             private final float[] gravity = new float[3];
@@ -218,41 +298,62 @@ public final class DeviceSensorManager {
 
             @Override
             public void onSensorChanged(SensorEvent event) {
-                if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
-                    System.arraycopy(event.values, 0, gravity, 0, 3);
-                } else if (event.sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD) {
-                    System.arraycopy(event.values, 0, geomagnetic, 0, 3);
-                    currentAccuracy = event.accuracy;
-                }
+                synchronized (DeviceSensorManager.this) {
+                    if (compassListener != this || !compassRequest.isActive()) return;
+                    if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
+                        System.arraycopy(event.values, 0, gravity, 0, 3);
+                    } else if (event.sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD) {
+                        System.arraycopy(event.values, 0, geomagnetic, 0, 3);
+                        currentAccuracy = event.accuracy;
+                    }
 
-                if (SensorManager.getRotationMatrix(rotationMatrix, null, gravity, geomagnetic)) {
-                    SensorManager.getOrientation(rotationMatrix, orientation);
-                    double direction = Math.toDegrees(orientation[0]);
-                    if (direction < 0) direction += 360.0;
-                    String accuracy = mapAccuracy(currentAccuracy);
-                    NativeMethods.onCompassChange(sessionId, direction, accuracy);
+                    if (SensorManager.getRotationMatrix(rotationMatrix, null, gravity, geomagnetic)) {
+                        SensorManager.getOrientation(rotationMatrix, orientation);
+                        double direction = Math.toDegrees(orientation[0]);
+                        if (direction < 0) direction += 360.0;
+                        String accuracy = mapAccuracy(currentAccuracy);
+                        NativeMethods.onCompassChange(sessionId, direction, accuracy);
+                    }
                 }
             }
 
             @Override
             public void onAccuracyChanged(Sensor sensor, int accuracy) {
-                if (sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD) {
-                    currentAccuracy = accuracy;
+                synchronized (DeviceSensorManager.this) {
+                    if (compassListener != this || !compassRequest.isActive()) return;
+                    if (sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD) {
+                        currentAccuracy = accuracy;
+                    }
                 }
             }
         };
 
-        sensorManager.registerListener(compassListener, magneticSensor, SensorManager.SENSOR_DELAY_NORMAL);
-        sensorManager.registerListener(compassListener, accelerometerSensor, SensorManager.SENSOR_DELAY_NORMAL);
+        boolean magneticRegistered = sensorManager.registerListener(
+                compassListener, magneticSensor, SensorManager.SENSOR_DELAY_NORMAL);
+        boolean accelerometerRegistered = sensorManager.registerListener(
+                compassListener, accelerometerSensor, SensorManager.SENSOR_DELAY_NORMAL);
+        if (!magneticRegistered || !accelerometerRegistered) {
+            sensorManager.unregisterListener(compassListener);
+            compassListener = null;
+            return false;
+        }
+        return true;
     }
 
     /**
      * Stop listening for compass events.
      */
-    public void stopCompass() {
-        if (sensorManager != null && compassListener != null) {
-            sensorManager.unregisterListener(compassListener);
-            compassListener = null;
+    public synchronized void stopCompass() {
+        if (compassRequest.requestStop() == LifecycleRequestState.Action.STOP) {
+            stopCompassInternal();
+        }
+    }
+
+    private void stopCompassInternal() {
+        SensorEventListener listener = compassListener;
+        compassListener = null;
+        if (sensorManager != null && listener != null) {
+            sensorManager.unregisterListener(listener);
         }
     }
 
@@ -285,24 +386,38 @@ public final class DeviceSensorManager {
      *
      * @param interval "game", "ui", or "normal"
      */
-    public void startAccelerometer(String interval) {
-        if (sensorManager == null) return;
-        stopAccelerometer();
+    public synchronized void startAccelerometer(String interval) {
+        LifecycleRequestState.Action action = accelerometerRequest.requestStart(interval);
+        if (action == LifecycleRequestState.Action.RESTART) {
+            stopAccelerometerInternal();
+        }
+        if ((action == LifecycleRequestState.Action.START
+                || action == LifecycleRequestState.Action.RESTART)
+                && !startAccelerometerInternal(interval)) {
+            accelerometerRequest.startFailed(true);
+        }
+    }
+
+    private boolean startAccelerometerInternal(String interval) {
+        if (sensorManager == null) return false;
 
         Sensor sensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
-        if (sensor == null) return;
+        if (sensor == null) return false;
 
         final int delay = parseInterval(interval);
 
         accelerometerListener = new SensorEventListener() {
             @Override
             public void onSensorChanged(SensorEvent event) {
-                NativeMethods.onAccelerometerChange(
-                        sessionId,
-                        event.values[0],
-                        event.values[1],
-                        event.values[2]
-                );
+                synchronized (DeviceSensorManager.this) {
+                    if (accelerometerListener != this || !accelerometerRequest.isActive()) return;
+                    NativeMethods.onAccelerometerChange(
+                            sessionId,
+                            event.values[0],
+                            event.values[1],
+                            event.values[2]
+                    );
+                }
             }
 
             @Override
@@ -310,29 +425,86 @@ public final class DeviceSensorManager {
             }
         };
 
-        sensorManager.registerListener(accelerometerListener, sensor, delay);
+        if (!sensorManager.registerListener(accelerometerListener, sensor, delay)) {
+            accelerometerListener = null;
+            return false;
+        }
+        return true;
     }
 
     /**
      * Stop listening for accelerometer events.
      */
-    public void stopAccelerometer() {
-        if (sensorManager != null && accelerometerListener != null) {
-            sensorManager.unregisterListener(accelerometerListener);
-            accelerometerListener = null;
+    public synchronized void stopAccelerometer() {
+        if (accelerometerRequest.requestStop() == LifecycleRequestState.Action.STOP) {
+            stopAccelerometerInternal();
+        }
+    }
+
+    private void stopAccelerometerInternal() {
+        SensorEventListener listener = accelerometerListener;
+        accelerometerListener = null;
+        if (sensorManager != null && listener != null) {
+            sensorManager.unregisterListener(listener);
         }
     }
 
     // ==================== Cleanup ====================
 
+    public synchronized void setLifecycleSuspended(boolean suspended) {
+        if (suspended) {
+            suspendForLifecycle();
+        } else {
+            resumeForLifecycle();
+        }
+    }
+
+    public synchronized void suspendForLifecycle() {
+        if (motionRequest.suspend() == LifecycleRequestState.Action.STOP) {
+            stopDeviceMotionListeningInternal();
+        }
+        if (gyroscopeRequest.suspend() == LifecycleRequestState.Action.STOP) {
+            stopGyroscopeInternal();
+        }
+        if (compassRequest.suspend() == LifecycleRequestState.Action.STOP) {
+            stopCompassInternal();
+        }
+        if (accelerometerRequest.suspend() == LifecycleRequestState.Action.STOP) {
+            stopAccelerometerInternal();
+        }
+    }
+
+    public synchronized void resumeForLifecycle() {
+        if (motionRequest.resume() == LifecycleRequestState.Action.START
+                && !startDeviceMotionListeningInternal(motionRequest.getRequest())) {
+            motionRequest.startFailed(true);
+        }
+        if (gyroscopeRequest.resume() == LifecycleRequestState.Action.START
+                && !startGyroscopeInternal(gyroscopeRequest.getRequest())) {
+            gyroscopeRequest.startFailed(true);
+        }
+        if (compassRequest.resume() == LifecycleRequestState.Action.START
+                && !startCompassInternal()) {
+            compassRequest.startFailed(true);
+        }
+        if (accelerometerRequest.resume() == LifecycleRequestState.Action.START
+                && !startAccelerometerInternal(accelerometerRequest.getRequest())) {
+            accelerometerRequest.startFailed(true);
+        }
+    }
+
     /**
      * Stop all sensor listeners. Call when session is destroyed.
      */
-    public void destroy() {
-        stopDeviceMotionListening();
-        stopGyroscope();
-        stopCompass();
-        stopAccelerometer();
+    public synchronized void destroy() {
+        motionRequest.destroy();
+        gyroscopeRequest.destroy();
+        compassRequest.destroy();
+        accelerometerRequest.destroy();
+        stopDeviceMotionListeningInternal();
+        stopGyroscopeInternal();
+        stopCompassInternal();
+        stopAccelerometerInternal();
     }
 
     // ==================== Internal ====================

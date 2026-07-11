@@ -112,6 +112,31 @@ impl BufferSourceNode {
         self.loop_end = end;
     }
 
+    /// Frame index at which playback wraps: the loop end (clamped to the buffer)
+    /// when looping with a valid `loopEnd`, otherwise the end of the buffer. A
+    /// `loopEnd` of 0 or <= `loopStart` means "use the whole buffer" (Web Audio).
+    #[inline]
+    fn loop_wrap_frame(&self, buffer_frames: usize, sample_rate: f64) -> usize {
+        if self.loop_enabled && self.loop_end > self.loop_start && self.loop_end > 0.0 {
+            ((self.loop_end * sample_rate) as usize).min(buffer_frames)
+        } else {
+            buffer_frames
+        }
+    }
+
+    /// Frame index to jump back to when looping. Clamps `loopStart` to a valid
+    /// frame; an out-of-range `loopStart` restarts at 0 (full-buffer loop) rather
+    /// than jumping past the buffer and looping silence.
+    #[inline]
+    fn loop_restart_pos(&self, buffer_frames: usize, sample_rate: f64) -> f64 {
+        let start_frame = (self.loop_start.max(0.0) * sample_rate).floor();
+        if start_frame >= buffer_frames as f64 {
+            0.0
+        } else {
+            start_frame
+        }
+    }
+
     pub fn set_playback_rate(&mut self, rate: f32) {
         self.playback_rate.set_value(rate.max(0.0));
     }
@@ -122,7 +147,12 @@ impl BufferSourceNode {
     }
 
     /// Process with explicit output channel count
-    pub fn process_with_channels(&mut self, output: &mut [f32], output_channels: u32) -> usize {
+    pub fn process_with_channels(
+        &mut self,
+        output: &mut [f32],
+        output_channels: u32,
+        current_time: f64,
+    ) -> usize {
         if self.state != BufferSourceState::Playing {
             return 0;
         }
@@ -147,6 +177,7 @@ impl BufferSourceNode {
                 buffer_frames,
                 output_frames,
                 sample_rate,
+                current_time,
             ),
             (2, 2) => self.process_stereo_to_stereo(
                 output,
@@ -154,6 +185,7 @@ impl BufferSourceNode {
                 buffer_frames,
                 output_frames,
                 sample_rate,
+                current_time,
             ),
             _ => self.process_generic(
                 output,
@@ -163,6 +195,7 @@ impl BufferSourceNode {
                 src_channels,
                 dst_channels,
                 sample_rate,
+                current_time,
             ),
         }
     }
@@ -176,17 +209,25 @@ impl BufferSourceNode {
         buffer_frames: usize,
         output_frames: usize,
         sample_rate: f64,
+        current_time: f64,
     ) -> usize {
         let mut frames_written = 0;
-        let playback_rate = self.playback_rate.value() as f64;
+        let playback_rate = self.playback_rate.compute_value(current_time).max(0.0) as f64;
 
         for frame_idx in 0..output_frames {
-            let src_frame = self.position as usize;
+            let mut src_frame = self.position as usize;
 
-            if src_frame >= buffer_frames {
+            let wrap_frame = self.loop_wrap_frame(buffer_frames, sample_rate);
+            if src_frame >= wrap_frame {
                 if self.loop_enabled {
-                    self.position = self.loop_start * sample_rate;
-                    continue;
+                    // Wrap and render the restart sample this iteration (a `continue`
+                    // would drop a frame), carrying the fractional/rate overshoot so
+                    // high or fractional playback rates keep correct loop timing.
+                    let restart = self.loop_restart_pos(buffer_frames, sample_rate);
+                    let loop_len = (wrap_frame as f64 - restart).max(1.0);
+                    let overshoot = (self.position - wrap_frame as f64).max(0.0);
+                    self.position = restart + overshoot.rem_euclid(loop_len);
+                    src_frame = self.position as usize;
                 } else {
                     self.state = BufferSourceState::Finished;
                     break;
@@ -225,17 +266,25 @@ impl BufferSourceNode {
         buffer_frames: usize,
         output_frames: usize,
         sample_rate: f64,
+        current_time: f64,
     ) -> usize {
         let mut frames_written = 0;
-        let playback_rate = self.playback_rate.value() as f64;
+        let playback_rate = self.playback_rate.compute_value(current_time).max(0.0) as f64;
 
         for frame_idx in 0..output_frames {
-            let src_frame = self.position as usize;
+            let mut src_frame = self.position as usize;
 
-            if src_frame >= buffer_frames {
+            let wrap_frame = self.loop_wrap_frame(buffer_frames, sample_rate);
+            if src_frame >= wrap_frame {
                 if self.loop_enabled {
-                    self.position = self.loop_start * sample_rate;
-                    continue;
+                    // Wrap and render the restart sample this iteration (a `continue`
+                    // would drop a frame), carrying the fractional/rate overshoot so
+                    // high or fractional playback rates keep correct loop timing.
+                    let restart = self.loop_restart_pos(buffer_frames, sample_rate);
+                    let loop_len = (wrap_frame as f64 - restart).max(1.0);
+                    let overshoot = (self.position - wrap_frame as f64).max(0.0);
+                    self.position = restart + overshoot.rem_euclid(loop_len);
+                    src_frame = self.position as usize;
                 } else {
                     self.state = BufferSourceState::Finished;
                     break;
@@ -275,17 +324,25 @@ impl BufferSourceNode {
         src_channels: usize,
         dst_channels: usize,
         sample_rate: f64,
+        current_time: f64,
     ) -> usize {
         let mut frames_written = 0;
-        let playback_rate = self.playback_rate.value() as f64;
+        let playback_rate = self.playback_rate.compute_value(current_time).max(0.0) as f64;
 
         for frame_idx in 0..output_frames {
-            let src_frame = self.position as usize;
+            let mut src_frame = self.position as usize;
 
-            if src_frame >= buffer_frames {
+            let wrap_frame = self.loop_wrap_frame(buffer_frames, sample_rate);
+            if src_frame >= wrap_frame {
                 if self.loop_enabled {
-                    self.position = self.loop_start * sample_rate;
-                    continue;
+                    // Wrap and render the restart sample this iteration (a `continue`
+                    // would drop a frame), carrying the fractional/rate overshoot so
+                    // high or fractional playback rates keep correct loop timing.
+                    let restart = self.loop_restart_pos(buffer_frames, sample_rate);
+                    let loop_len = (wrap_frame as f64 - restart).max(1.0);
+                    let overshoot = (self.position - wrap_frame as f64).max(0.0);
+                    self.position = restart + overshoot.rem_euclid(loop_len);
+                    src_frame = self.position as usize;
                 } else {
                     self.state = BufferSourceState::Finished;
                     break;
@@ -366,7 +423,7 @@ impl AudioNodeProcessor for BufferSourceNode {
         }
 
         // Source node: ignore inputs, generate from buffer
-        self.process_with_channels(output, channels)
+        self.process_with_channels(output, channels, current_time)
     }
 
     fn is_finished(&self) -> bool {

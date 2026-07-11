@@ -7,6 +7,7 @@ import {
     op_udp_set_ttl, op_udp_next_event, op_udp_close,
 } from "ext:core/ops";
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { toExactArrayBuffer } from "ext:host_v8_network/00_binary.js";
 
 // -- UDPSocket class --
 
@@ -215,7 +216,9 @@ class UDPSocket {
 
             switch (event.type) {
                 case 'message': {
-                    const buf = new Uint8Array(event.data).buffer;
+                    // event.data is an exact-length Uint8Array (external
+                    // backing); hand its buffer to the callback without a copy.
+                    const buf = toExactArrayBuffer(event.data);
                     this._fireMessage(
                         buf,
                         {

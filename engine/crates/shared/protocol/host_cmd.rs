@@ -17,7 +17,11 @@
 //! └──────────────┘                      └──────────────┘
 //! ```
 //!
-//! ## Command Categories (37 variants)
+//! ## Command Categories
+//!
+//! The `HostCommand` enum is the authoritative list; the grouping and counts
+//! below are indicative and may lag as variants (e.g. `DrainRenderEvents`) are
+//! added.
 //!
 //! - **Module Loading** (2): `EvaluateModule`, `EvalScript`
 //! - **Lifecycle** (4): `Restart`, `Shutdown`, `OnShow`, `OnHide`
@@ -77,7 +81,10 @@ pub struct BleCharacteristicData {
 /// These commands drive the JavaScript runtime and coordinate between
 /// native subsystems (rendering, audio, input) and the JS game code.
 ///
-/// # Variant Groups (37 variants total)
+/// # Variant Groups
+///
+/// The enum below is the authoritative list; the grouping and counts here are
+/// indicative and may lag as variants (e.g. `DrainRenderEvents`) are added.
 ///
 /// - **Module Loading** (2): `EvaluateModule`, `EvalScript`
 /// - **Lifecycle** (4): `Restart`, `Shutdown`, `OnShow`, `OnHide`
@@ -214,11 +221,24 @@ pub enum HostCommand {
     /// Notify that the current rendering surface has been destroyed.
     SurfaceDestroyed,
 
+    /// Wake the host loop so it drains render-thread feedback events promptly.
+    ///
+    /// The render thread's [`crate::render_event::RenderEvent`] channel is a
+    /// synchronous crossbeam channel that cannot participate in the host's
+    /// `tokio::select!`, so render feedback is only drained on incoming
+    /// commands and the periodic heartbeat. For latency-sensitive state
+    /// transitions (notably GL context lost/recovered) the render thread sends
+    /// this no-op nudge to force an immediate drain + reconcile instead of
+    /// waiting for the next heartbeat tick. Carries no payload — the authoritative
+    /// state lives in shared atomics; this only controls *when* the host reacts.
+    DrainRenderEvents,
+
     // ---- Touch / Input ----
     /// Dispatch touch input events to the game.
     ///
     /// Boxed to keep the `HostCommand` enum small (~56-64 bytes instead of ~216).
-    /// Every `try_send()` on the 512-slot channel copies the full enum size.
+    /// Up to 512 normal commands can be pending, so enum size directly affects
+    /// bounded queue memory.
     OnTouch(Box<TouchData>),
 
     // ---- Sensor Events ----
@@ -307,7 +327,8 @@ pub enum HostCommand {
     CameraFrameData {
         /// JS-assigned camera instance ID.
         camera_id: u32,
-        /// Raw pixel data (RGBA).
+        /// Raw Y/U/V plane-window bytes concatenated in Y, U, V order (each
+        /// plane's `position..limit`), exactly as delivered to JS.
         data: Vec<u8>,
         /// Frame width in pixels.
         width: u32,
@@ -578,7 +599,9 @@ impl InnerAudioEventType {
 /// - `id`: Unique identifier for the touch pointer (stable across move events)
 /// - `x`, `y`: Touch coordinates in CSS pixels (logical, not physical)
 /// - `pressure`: Pressure value from 0.0 (none) to 1.0 (maximum)
-/// - `flags`: Reserved for future use (e.g., touch type, device type)
+/// - `flags`: Bitfield describing this pointer for the current event:
+///   bit 0 (`0x1`) = in `changedTouches`; bit 1 (`0x2`) = removed from the
+///   surface this event (finger up / cancel), so it is excluded from `touches`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct TouchPoint {
@@ -592,7 +615,8 @@ pub struct TouchPoint {
     /// Touch pressure, normalized to 0.0–1.0 range.
     /// May be 0.0 if the device doesn't support pressure sensing.
     pub pressure: f32,
-    /// Reserved flags for future use.
+    /// Per-pointer bitfield: bit 0 = in `changedTouches`, bit 1 = removed from
+    /// the surface this event (excluded from `touches`).
     pub flags: u32,
 }
 

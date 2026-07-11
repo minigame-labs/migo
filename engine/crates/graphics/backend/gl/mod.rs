@@ -28,3 +28,4 @@ pub mod state_tracker;
 pub mod surface;
 pub mod text;
 pub mod text_attrs;
+pub(crate) mod uniform_cache;

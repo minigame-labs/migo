@@ -8,6 +8,10 @@ import "ext:host_v8_console/01_alert.js";
 
 // base
 import "ext:host_v8_base/02_async.js";
+import "ext:host_v8_base/04_subpackage.js";
+
+// lifecycle
+import "ext:host_v8_lifecycle/02_restart_exit.js";
 
 // url
 import "ext:host_v8_url/03_url.js";
@@ -15,6 +19,10 @@ import "ext:host_v8_url/03_url.js";
 // web
 import "ext:host_v8_web/12_performance.js";
 import "ext:host_v8_web/03_canvas.js";
+
+// network
+import "ext:host_v8_network/08_tcp_socket.js";
+import "ext:host_v8_network/09_udp_socket.js";
 
 // webgl (registered by rendering extension)
 import "ext:host_v8_webgl/01_constants.js";

@@ -63,6 +63,7 @@ pub struct BiquadFilterNode {
     last_q: f32,
     last_gain: f32,
     last_type: BiquadFilterType,
+    last_detune: f32,
 }
 
 impl BiquadFilterNode {
@@ -84,8 +85,9 @@ impl BiquadFilterNode {
             last_q: -1.0,
             last_gain: f32::NAN,
             last_type: BiquadFilterType::Lowpass,
+            last_detune: f32::NAN,
         };
-        node.compute_coefficients(44100.0); // Will be recomputed on first process
+        node.compute_coefficients(44100.0, 0.0); // Will be recomputed on first process
         node
     }
 
@@ -104,7 +106,7 @@ impl BiquadFilterNode {
         frequencies: &[f32],
     ) -> (Vec<f32>, Vec<f32>) {
         // Ensure coefficients are up-to-date
-        self.compute_coefficients(sample_rate);
+        self.compute_coefficients(sample_rate, 0.0);
 
         let len = frequencies.len();
         let mut mag_response = Vec::with_capacity(len);
@@ -149,17 +151,19 @@ impl BiquadFilterNode {
     }
 
     /// Compute biquad coefficients using Robert Bristow-Johnson's formulas
-    fn compute_coefficients(&mut self, sample_rate: f64) {
-        let freq = self.frequency.value();
-        let q = self.q.value();
-        let db_gain = self.gain.value();
+    fn compute_coefficients(&mut self, sample_rate: f64, current_time: f64) {
+        let freq = self.frequency.compute_value(current_time);
+        let q = self.q.compute_value(current_time);
+        let db_gain = self.gain.compute_value(current_time);
+        let detune_val = self.detune.compute_value(current_time);
         let ft = self.filter_type;
 
-        // Skip if nothing changed
+        // Skip if nothing changed (detune included — it shifts f0 below)
         if freq == self.last_freq
             && q == self.last_q
             && db_gain == self.last_gain
             && ft == self.last_type
+            && detune_val == self.last_detune
         {
             return;
         }
@@ -167,8 +171,9 @@ impl BiquadFilterNode {
         self.last_q = q;
         self.last_gain = db_gain;
         self.last_type = ft;
+        self.last_detune = detune_val;
 
-        let detune = self.detune.value() as f64;
+        let detune = detune_val as f64;
         let f0 = (freq as f64) * (2.0f64).powf(detune / 1200.0);
         let w0 = std::f64::consts::TAU * f0 / sample_rate;
         let cos_w0 = w0.cos();
@@ -282,7 +287,7 @@ impl AudioNodeProcessor for BiquadFilterNode {
         output: &mut [f32],
         sample_rate: u32,
         _channels: u32,
-        _current_time: f64,
+        current_time: f64,
     ) -> usize {
         let len = inputs.len().min(output.len());
         if len == 0 {
@@ -292,8 +297,8 @@ impl AudioNodeProcessor for BiquadFilterNode {
         let channels = self.states.len().max(1);
         let frames = len / channels;
 
-        // Recompute coefficients if params changed
-        self.compute_coefficients(sample_rate as f64);
+        // Recompute coefficients if params changed (k-rate: sampled once per block)
+        self.compute_coefficients(sample_rate as f64, current_time);
 
         let (b0, b1, b2, a1, a2) = (self.b0, self.b1, self.b2, self.a1, self.a2);
 

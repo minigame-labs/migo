@@ -16,7 +16,7 @@ use shared::{
     config::InitOptions,
     error::EngineResult,
     js_escape::{HOST_BRIDGE_EXPR, escape_for_js_string},
-    op_state::{HostOpState, RafRx},
+    op_state::{ContextLostState, HostOpState, HostTx, RafRx},
     protocol::host_cmd::HostCommand,
     protocol::render_cmd::{CanvasCmd, RenderCommand},
     render_event::{RenderEvent, RenderEventReceiver},
@@ -93,7 +93,7 @@ pub(crate) struct Host {
     raf_rx: RafRx,
 
     /// Sender back to the host event loop (for JS-initiated restart/exit).
-    host_tx: tokio::sync::mpsc::Sender<HostCommand>,
+    host_tx: HostTx,
 
     platform: Arc<dyn PlatformServices>,
     init_options: InitOptions,
@@ -106,10 +106,26 @@ pub(crate) struct Host {
     /// Shared flag: `true` while the app is backgrounded (OnHide).
     /// Network polling ops check this to throttle CPU usage.
     backgrounded: Arc<AtomicBool>,
+    /// Shared timer lifecycle level. It remains hidden until OnShow is
+    /// delivered to JS, including the deferred-Surface path.
+    timer_backgrounded: Arc<AtomicBool>,
     /// Shared flag mirrored into `HostOpState.context_lost`: set `true`
     /// between a render `ContextLost` and a successful `ContextRecovered`
     /// so JS `gl.isContextLost()` reflects reality.
-    context_lost: Arc<AtomicBool>,
+    ///
+    /// Written exclusively by the render thread (authoritative). The host only
+    /// reads it — see `reconcile_context_lost`.
+    context_lost: Arc<ContextLostState>,
+
+    /// Last GL-context-lost level the host has dispatched to JS
+    /// (`webglcontextlost` = `true`, `webglcontextrestored` = `false`).
+    last_dispatched_context_lost: bool,
+
+    /// Last `ContextLostState::epoch` the host has reconciled. A jump beyond
+    /// what the delivered render events accounted for means a `ContextLost` /
+    /// `ContextRecovered` edge was dropped by the bounded channel, and
+    /// `reconcile_context_lost` synthesizes the missing lifecycle event(s).
+    last_context_epoch: u64,
 
     /// Last time each render-error kind fired a Java `notify_error`. Now that
     /// `drain_render_events` is wired, a sustained GL/Canvas2D error stream (a
@@ -167,7 +183,7 @@ impl Drop for Host {
 impl Host {
     pub(crate) fn new(
         id: HostId,
-        host_tx: tokio::sync::mpsc::Sender<HostCommand>,
+        host_tx: HostTx,
         surface: SurfaceRef,
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,
@@ -189,6 +205,27 @@ impl Host {
         // real audio command.  Saves ~80 ms on cold start.
         let audio = AudioService::new(host_tx.clone());
         let gpu_caps = shared::device::gpu_caps::GpuCaps::new();
+
+        // Authoritative GL-context-loss state. Created here (before the render
+        // thread) and written exclusively by the render thread (edge-triggered
+        // level + epoch); the host and JS `op_gl_is_context_lost` only read it.
+        // Survives JS runtime restarts (same GL context / render thread) via the
+        // shared `Arc`.
+        let context_lost = Arc::new(shared::op_state::ContextLostState::default());
+
+        // Wake nudge: the render thread invokes this after a context
+        // lost/recovered transition so the host drains + reconciles the
+        // (lossy, non-select-able) render-event channel promptly instead of
+        // waiting for the heartbeat. Best-effort — a full command queue falls
+        // back to the heartbeat drain. Decoupled via a closure so `graphics`
+        // never depends on `HostCommand`.
+        let render_wake: Option<Arc<dyn Fn() + Send + Sync>> = {
+            let wake_tx = host_tx.clone();
+            Some(Arc::new(move || {
+                let _ = wake_tx.try_send(HostCommand::DrainRenderEvents);
+            }))
+        };
+
         let mut render = RenderService::new(
             raf_tx,
             Some(vsync_rx),
@@ -198,6 +235,8 @@ impl Host {
             init_options.target_fps(),
             Some(init_options.cache_dir().to_path_buf()),
             gpu_caps.clone(),
+            context_lost.clone(),
+            render_wake,
         )?;
         let render_events = render.events();
 
@@ -245,8 +284,10 @@ impl Host {
         };
 
         let backgrounded = Arc::new(AtomicBool::new(false));
+        let timer_backgrounded = Arc::new(AtomicBool::new(false));
         let webgl_context_created = Arc::new(AtomicBool::new(false));
-        let context_lost = Arc::new(AtomicBool::new(false));
+        // `context_lost` was created above (before the render thread, which is
+        // its authoritative writer).
 
         let host_state = HostOpState {
             id,
@@ -270,6 +311,7 @@ impl Host {
             workers_path: init_options.workers_path().map(|s| s.to_string()),
             network_policy: network_policy.clone(),
             backgrounded: backgrounded.clone(),
+            timer_backgrounded: timer_backgrounded.clone(),
             webgl_context_created: webgl_context_created.clone(),
             context_lost: context_lost.clone(),
             #[cfg(feature = "code-signing")]
@@ -373,7 +415,10 @@ impl Host {
             last_game_id: None,
             last_entry: None,
             backgrounded,
+            timer_backgrounded,
             context_lost,
+            last_dispatched_context_lost: false,
+            last_context_epoch: 0,
             render_error_throttle: HashMap::new(),
             pending_on_show_script: None,
             gpu_caps,
@@ -398,6 +443,57 @@ impl Host {
         while let Ok(event) = self.render_events.try_recv() {
             self.handle_render_event(event);
         }
+        // Safety net: even if a `ContextLost` / `ContextRecovered` event was
+        // dropped by the bounded render-event channel, the render thread has
+        // written the authoritative `context_lost` atomic. Reconcile the JS
+        // lifecycle event against it so `gl.isContextLost()` and the last
+        // dispatched `webglcontext{lost,restored}` never disagree.
+        self.reconcile_context_lost();
+    }
+
+    /// Reconcile JS `webglcontext{lost,restored}` events against the render-
+    /// thread-owned authoritative state. Called after every render-event drain
+    /// (command / idle-parking / heartbeat / wake nudge) and is the SOLE
+    /// dispatcher of these events, so a `ContextLost` / `ContextRecovered`
+    /// render event dropped by the bounded channel still results in the correct
+    /// JS lifecycle events.
+    ///
+    /// Uses `epoch` (bumped by the render thread on every transition) to detect
+    /// dropped *edges*: if the epoch advanced but the level is back to what we
+    /// last dispatched, a full lost→recovered cycle was missed and we synthesize
+    /// the pair so the engine still invalidates + rebuilds its GL resources.
+    /// Idempotent: a no-op when already in sync.
+    fn reconcile_context_lost(&mut self) {
+        // Single consistent snapshot: `lost` and `epoch` are packed in one
+        // atomic, so there is no torn (new level / old epoch) read window.
+        let (lost, epoch) = self.context_lost.snapshot();
+
+        if epoch == self.last_context_epoch && lost == self.last_dispatched_context_lost {
+            return; // fully in sync
+        }
+
+        if lost {
+            // Currently lost: ensure the engine has seen `webglcontextlost`.
+            if !self.last_dispatched_context_lost {
+                self.last_dispatched_context_lost = true;
+                self.js.dispatch_webgl_context_event("webglcontextlost");
+            }
+        } else if self.last_dispatched_context_lost {
+            // We dispatched lost earlier; the context is back → dispatch restored.
+            self.last_dispatched_context_lost = false;
+            self.js.dispatch_webgl_context_event("webglcontextrestored");
+        } else if epoch != self.last_context_epoch {
+            // Currently recovered and we never told the engine it was lost, yet
+            // the epoch advanced: a full lost→recovered cycle happened while the
+            // render event(s) were dropped. Synthesize the missing pair so the
+            // engine invalidates + rebuilds against the fresh share group. Order
+            // matters: lost before restored.
+            self.js.dispatch_webgl_context_event("webglcontextlost");
+            self.js.dispatch_webgl_context_event("webglcontextrestored");
+            // `last_dispatched_context_lost` stays false (net level = recovered).
+        }
+
+        self.last_context_epoch = epoch;
     }
 
     /// Minimum spacing between Java `notify_error` callbacks of the same kind.
@@ -449,14 +545,11 @@ impl Host {
             }
             RenderEvent::ContextLost => {
                 warn!("[Host {}] render context lost", self.id);
-                // Expose the loss to JS so `gl.isContextLost()` returns true
-                // and games that guard draws on it stop issuing GL into a
-                // dead context.
-                self.context_lost.store(true, Ordering::Relaxed);
-                // Fire `webglcontextlost` on the canvas (after the flag is set,
-                // so a listener sees isContextLost()==true) so the engine drops
-                // its GL resources per the WebGL spec.
-                self.js.dispatch_webgl_context_event("webglcontextlost");
+                // JS `webglcontextlost` dispatch is handled centrally by
+                // `reconcile_context_lost` (run at the end of every drain), which
+                // reads the render-owned authoritative state and is robust to this
+                // event being dropped by the bounded channel. Here we only surface
+                // the one-shot Java notification.
                 self.platform.notify_error(
                     self.id,
                     shared::error::ErrorCode::RenderBackendError.as_u16(),
@@ -465,21 +558,13 @@ impl Host {
                 );
             }
             RenderEvent::ContextRecovered { success } => {
-                // `success` now truthfully reflects a probe-verified context:
-                // `try_recover_context()` rebuilds the whole share group and
-                // only reports success after a clear + glGetError +
-                // glGetGraphicsResetStatus probe passes (see
-                // CanvasManager::try_recover_context / probe_context_usable).
-                // So it is safe to clear the JS-visible loss flag on success;
-                // on failure we keep `isContextLost()` true (the context is
-                // still unusable) and surface the error.
-                if success {
-                    // Clear the flag first so a `webglcontextrestored` listener
-                    // sees isContextLost()==false, then fire the event so the
-                    // engine rebuilds its GL resources against the fresh context.
-                    self.context_lost.store(false, Ordering::Relaxed);
-                    self.js.dispatch_webgl_context_event("webglcontextrestored");
-                } else {
+                // On success, the render thread already cleared the authoritative
+                // state; `reconcile_context_lost` dispatches `webglcontextrestored`.
+                // On failure the state stays lost (isContextLost() remains true);
+                // surface the error, but throttle it (the render thread already
+                // rate-limits per loss episode; this is defense-in-depth so a
+                // burst can't flood the Java layer) via `should_notify_error`.
+                if !success && self.should_notify_error("context_recovery") {
                     self.platform.notify_error(
                         self.id,
                         shared::error::ErrorCode::RenderBackendError.as_u16(),
@@ -511,53 +596,23 @@ impl Host {
                 // Mark foreground so network polling ops resume normal rate.
                 self.backgrounded.store(false, Ordering::Relaxed);
 
-                // Resume audio thread before notifying JS so the game can
-                // immediately start playing audio in its onShow callback.
-                //
-                // The render thread is NOT resumed here. On Android, onResume
-                // fires before surfaceCreated, so the old surface is already
-                // destroyed at this point. The render thread will be resumed
-                // when UpdateSurface arrives with the new valid surface.
-                let script = if let Some(options_json) = options_json.as_deref() {
-                    let options_json = options_json.trim();
-                    if options_json.is_empty() {
-                        format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
-                    } else {
-                        match deno_core::serde_json::from_str::<Value>(options_json) {
-                            Ok(value) if value.is_object() => {
-                                // Serialize back through serde_json::to_string and pass
-                                // via JSON.parse() with proper JS string escaping.
-                                // Using Display on serde_json::Value is *mostly* JS-safe,
-                                // but edge cases exist (U+2028/U+2029 are valid JSON but
-                                // act as line terminators in JS source). Going through
-                                // JSON.parse(escaped_string) is universally safe.
-                                let json_str = deno_core::serde_json::to_string(&value)
-                                    .unwrap_or_else(|_| "{}".to_string());
-                                let escaped = escape_for_js_string(&json_str);
-                                format!(
-                                    "{HOST_BRIDGE_EXPR}._internalTriggerOnShow(JSON.parse('{}'))",
-                                    escaped
-                                )
-                            }
-                            Ok(_) => format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()"),
-                            Err(e) => {
-                                warn!(
-                                    "[Host {}] invalid onShow options JSON, fallback to default: {}",
-                                    self.id, e
-                                );
-                                format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
-                            }
-                        }
-                    }
-                } else {
-                    format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
-                };
+                let script = self.build_on_show_script(options_json.as_deref());
 
-                // Defer JS onShow until a valid surface is back and render/audio
-                // have resumed.  Android calls Activity.onResume before
-                // SurfaceView.surfaceCreated; running game onShow immediately
-                // can throw or leave audio/RAF in a paused-looking state.
-                self.pending_on_show_script = Some(script);
+                if self.render.has_live_surface() {
+                    // The SurfaceView surface survived the hide (Android does not
+                    // guarantee a destroy/recreate across every pause/resume). No
+                    // UpdateSurface will arrive to drive the resume, so resume
+                    // render/audio and fire onShow now; otherwise the app would
+                    // stay frozen and onShow would never fire.
+                    self.enter_foreground();
+                    self.js.set_timer_backgrounded(false);
+                    let _ = self.js.exec_script("onshow", &script);
+                } else {
+                    // Android fires Activity.onResume before surfaceCreated: the
+                    // old surface is already gone. Defer render/audio resume and
+                    // onShow until the new surface arrives (on_update_surface).
+                    self.pending_on_show_script = Some(script);
+                }
                 Ok(())
             }
 
@@ -573,10 +628,12 @@ impl Host {
                 self.audio.pause();
                 self.pending_on_show_script = None;
 
-                self.js.exec_script(
+                let result = self.js.exec_script(
                     "onhide",
                     &format!("{HOST_BRIDGE_EXPR}._internalTriggerOnHide()"),
-                )
+                );
+                self.js.set_timer_backgrounded(true);
+                result
             }
 
             HostCommand::OnAudioInterruptionBegin => self.js.exec_script(
@@ -606,6 +663,11 @@ impl Host {
             }
 
             HostCommand::Shutdown => Ok(()),
+
+            // Wake nudge from the render thread. The actual drain + reconcile
+            // already ran in `handle_command` before dispatching here, so this
+            // is an intentional no-op that only served to wake the select loop.
+            HostCommand::DrainRenderEvents => Ok(()),
 
             HostCommand::InnerAudioEvent {
                 id,
@@ -686,7 +748,7 @@ impl Host {
                 height,
             } => {
                 self.js
-                    .dispatch_camera_frame_data(camera_id, &data, width, height);
+                    .dispatch_camera_frame_data(camera_id, data, width, height);
                 Ok(())
             }
 
@@ -935,6 +997,58 @@ impl Host {
         self.js.exec_script("eval-script", &source)
     }
 
+    /// Build the JS snippet that fires the game's `onShow`, embedding launch
+    /// options (if any) via `JSON.parse` of a safely escaped string.
+    fn build_on_show_script(&self, options_json: Option<&str>) -> String {
+        let Some(options_json) = options_json else {
+            return format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()");
+        };
+        let options_json = options_json.trim();
+        if options_json.is_empty() {
+            return format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()");
+        }
+        match deno_core::serde_json::from_str::<Value>(options_json) {
+            Ok(value) if value.is_object() => {
+                // Round-trip through serde_json::to_string and pass via
+                // JSON.parse() with proper JS string escaping. Display on a
+                // serde_json::Value is *mostly* JS-safe, but U+2028/U+2029 are
+                // valid JSON yet act as line terminators in JS source, so
+                // JSON.parse(escaped_string) is universally safe.
+                let json_str =
+                    deno_core::serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
+                let escaped = escape_for_js_string(&json_str);
+                format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow(JSON.parse('{escaped}'))")
+            }
+            Ok(_) => format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()"),
+            Err(e) => {
+                warn!(
+                    "[Host {}] invalid onShow options JSON, fallback to default: {}",
+                    self.id, e
+                );
+                format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
+            }
+        }
+    }
+
+    /// Resume the render/audio threads and nudge the JS RAF loop + window resize
+    /// after the app returns to the foreground with a live surface. Safe to call
+    /// when nothing was paused (resume is a no-op then). Does NOT fire onShow —
+    /// the caller owns onShow sequencing.
+    fn enter_foreground(&mut self) {
+        self.render.resume();
+        self.audio.resume();
+        // The RAF loop self-stops after a few idle frames while hidden; this is a
+        // low-cost nudge to restart it now that the surface/foreground is back.
+        let _ = self.js.exec_script(
+            "raf_resume_kick",
+            "globalThis.__migo_restart_raf_loop && globalThis.__migo_restart_raf_loop()",
+        );
+        let _ = self.js.exec_script(
+            "window_resize",
+            &format!("{HOST_BRIDGE_EXPR}._internalTriggerWindowResize()"),
+        );
+    }
+
     fn on_update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
         let (w, h) = surface.size();
         info!(
@@ -942,31 +1056,35 @@ impl Host {
             self.id, w, h
         );
 
-        let result = self.render.update_surface(surface);
+        // Retry a bounded number of times: a transiently full render command
+        // queue can make the bounded-blocking recreate send/reply time out, and a
+        // dropped recreate would strand the app on a black frame with no further
+        // surface callback from Java. Surface updates are rare, so a few host-
+        // thread retries are an acceptable tradeoff for not losing the surface.
+        let mut result = self.render.update_surface(surface.clone());
+        let mut attempts = 1u32;
+        while result.is_err() && attempts < 3 {
+            attempts += 1;
+            warn!(
+                "[Host {}] on_update_surface attempt {} after error: {:?}",
+                self.id, attempts, result
+            );
+            result = self.render.update_surface(surface.clone());
+        }
 
-        // Resume the render thread after the surface is successfully recreated.
-        // This handles the Android lifecycle where onResume fires before
-        // surfaceCreated: OnHide pauses the render thread, and it stays paused
-        // until a valid surface arrives here. If the render thread wasn't paused
-        // (e.g., normal orientation change), resume() is a no-op.
+        // Resume the foreground after the surface is (re)created — but only when
+        // actually foregrounded. Android can deliver surfaceCreated/Changed while
+        // still hidden (before onResume) or recreate a surface while backgrounded;
+        // resuming then would run render/audio in the background. In that case the
+        // surface is marked live but stays paused, and the OnShow live-surface
+        // path drives the resume once `backgrounded` clears.
         if result.is_ok() {
-            self.render.resume();
-            self.audio.resume();
-            // Kick the JS RAF loop after a valid surface is back.  The loop is
-            // self-stopping after a few idle frames, so this is a low-cost
-            // lifecycle nudge rather than a permanent busy loop.  It fixes the
-            // Android resume window where callbacks are queued but the async
-            // RAF driver had previously stopped while the app was hidden.
-            let _ = self.js.exec_script(
-                "raf_resume_kick",
-                "globalThis.__migo_restart_raf_loop && globalThis.__migo_restart_raf_loop()",
-            );
-            let _ = self.js.exec_script(
-                "window_resize",
-                &format!("{HOST_BRIDGE_EXPR}._internalTriggerWindowResize()"),
-            );
-            if let Some(script) = self.pending_on_show_script.take() {
-                let _ = self.js.exec_script("onshow", &script);
+            if !self.backgrounded.load(Ordering::Relaxed) {
+                self.enter_foreground();
+                if let Some(script) = self.pending_on_show_script.take() {
+                    self.js.set_timer_backgrounded(false);
+                    let _ = self.js.exec_script("onshow", &script);
+                }
             }
             info!("[Host {}] on_update_surface completed", self.id);
         } else if let Err(ref e) = result {
@@ -1003,6 +1121,7 @@ impl Host {
             workers_path: self.init_options.workers_path().map(|s| s.to_string()),
             network_policy: self.network_policy.clone(),
             backgrounded: self.backgrounded.clone(),
+            timer_backgrounded: self.timer_backgrounded.clone(),
             webgl_context_created: Arc::new(AtomicBool::new(false)),
             context_lost: self.context_lost.clone(),
             #[cfg(feature = "code-signing")]
@@ -1030,14 +1149,23 @@ impl Host {
         // drain_shared_image_cache() returns shared IDs and clears the JS-side
         // bookkeeping (process-global).  We must send DestroyImage for each ID
         // *before* clearing the IO cache — otherwise the render thread holds
-        // orphaned GPU textures that no one will ever release.
-        for shared_id in js_runtime::drain_shared_image_cache() {
-            let _ = self
-                .render
-                .sender()
-                .send(RenderCommand::Canvas(CanvasCmd::DestroyImage {
-                    image_id: shared_id,
-                }));
+        // orphaned GPU textures that no one will ever release. Batch them into a
+        // single must-deliver command so a large image set doesn't block restart
+        // up to the send deadline per image.
+        let shared_ids = js_runtime::drain_shared_image_cache();
+        if !shared_ids.is_empty() {
+            if let Err(e) =
+                self.render
+                    .sender()
+                    .dispatch(RenderCommand::Canvas(CanvasCmd::DestroyImages {
+                        image_ids: shared_ids,
+                    }))
+            {
+                warn!(
+                    "[Host {}] on_restart: DestroyImages dispatch failed (textures may leak): {}",
+                    self.id, e
+                );
+            }
         }
         io::global_cache().clear();
 
@@ -1134,6 +1262,15 @@ impl Host {
         }
         self.render.resume();
         self.audio.resume();
+
+        // The JS runtime was recreated: its canvas carries no context-loss state
+        // yet. Reset our dispatch bookkeeping and reconcile against the (render-
+        // owned) authoritative atomic, so a genuinely still-lost context surfaces
+        // `webglcontextlost` to the fresh runtime while a healthy one dispatches
+        // nothing. The `context_lost` atomic itself is NOT reset here — the render
+        // thread remains its sole authority across restarts.
+        self.last_dispatched_context_lost = false;
+        self.reconcile_context_lost();
 
         reload_result
     }

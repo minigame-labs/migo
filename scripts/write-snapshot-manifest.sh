@@ -15,7 +15,11 @@ BIN="${2:?usage: write-snapshot-manifest.sh <arch> <bin-path>}"
 [[ -s "$BIN" ]] || { echo "ERROR: snapshot missing or empty: $BIN" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+# Derive the repo root from this script's own location (scripts/..), NOT
+# `git rev-parse` — the latter exits 128 without an accessible `.git`, which
+# would abort gen-snapshot's manifest step under `set -e`. Matches how
+# check-snapshot-freshness.sh locates ROOT so both agree with no git dependency.
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE="$ROOT/engine"
 
 # shellcheck source=scripts/lib/snapshot-fingerprint.sh

@@ -324,13 +324,30 @@ public final class NativeBridge {
     /**
      * Callback when camera frame data is available.
      *
+     * <p>The three YUV_420_888 plane buffers are passed by reference (direct
+     * ByteBuffers) together with each plane's window; native code copies the
+     * {@code [offset, offset + length)} bytes synchronously. The buffers must
+     * stay valid (their Image open) for the duration of this call.
+     *
      * @param sessionId The session ID
      * @param cameraId  The camera instance ID
-     * @param frameData Raw frame bytes (YUV_420_888)
+     * @param yBuffer   Direct Y-plane ByteBuffer
+     * @param yOffset   Y-plane window start (buffer position)
+     * @param yLength   Y-plane window length (buffer remaining)
+     * @param uBuffer   Direct U-plane ByteBuffer
+     * @param uOffset   U-plane window start
+     * @param uLength   U-plane window length
+     * @param vBuffer   Direct V-plane ByteBuffer
+     * @param vOffset   V-plane window start
+     * @param vLength   V-plane window length
      * @param width     Frame width in pixels
      * @param height    Frame height in pixels
      */
-    public static native void onCameraFrameData(int sessionId, int cameraId, byte[] frameData, int width, int height);
+    public static native void onCameraFrameData(int sessionId, int cameraId,
+            ByteBuffer yBuffer, int yOffset, int yLength,
+            ByteBuffer uBuffer, int uOffset, int uLength,
+            ByteBuffer vBuffer, int vOffset, int vLength,
+            int width, int height);
 
     // ==================== Bluetooth Callbacks ====================
 

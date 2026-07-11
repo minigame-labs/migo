@@ -1,5 +1,6 @@
 const TOUCH_STRIDE = 20; // bytes
-const FLAG_CHANGED = 1;
+const FLAG_CHANGED = 1; // pointer is in changedTouches
+const FLAG_REMOVED = 2; // pointer left the surface (end/cancel) -> excluded from touches
 
 // typeCode from native
 const TYPE_MAP = Object.freeze({
@@ -88,6 +89,10 @@ function _drain() {
     const listeners = TOUCH_LISTENERS[type];
     if (!listeners || listeners.size === 0) continue;
 
+    // Snapshot listeners: a handler that adds/removes listeners mid-dispatch
+    // must not change who receives the current event (stable event semantics).
+    const fns = Array.from(listeners);
+
     const count = ev.count | 0;
     if (count <= 0 || !(ev.buffer instanceof ArrayBuffer)) {
       const event = {
@@ -97,9 +102,9 @@ function _drain() {
         timeStamp: ev.timeStamp,
       };
 
-      for (const fn of listeners) {
+      for (let li = 0; li < fns.length; li++) {
         try {
-          fn(event);
+          fns[li](event);
         } catch (_) {
           // swallow listener errors to avoid breaking input pipeline
         }
@@ -121,7 +126,9 @@ function _drain() {
       const flags = view.getUint32(base + 16, true);
 
       const touch = _makeTouch(id, x, y, pressure);
-      touches.push(touch);
+      // `touches` = points still on the surface; a lifted/cancelled pointer
+      // (FLAG_REMOVED) appears only in `changedTouches`.
+      if (!(flags & FLAG_REMOVED)) touches.push(touch);
       if (flags & FLAG_CHANGED) changedTouches.push(touch);
     }
 
@@ -132,9 +139,9 @@ function _drain() {
       timeStamp: ev.timeStamp,
     };
 
-    for (const fn of listeners) {
+    for (let li = 0; li < fns.length; li++) {
       try {
-        fn(event);
+        fns[li](event);
       } catch (_) {
         // swallow listener errors to avoid breaking input pipeline
       }

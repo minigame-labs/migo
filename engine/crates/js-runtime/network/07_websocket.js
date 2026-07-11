@@ -3,6 +3,7 @@ import {
     op_ws_create, op_ws_next_event, op_ws_send, op_ws_close,
 } from "ext:core/ops";
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { toExactArrayBuffer } from "ext:host_v8_network/00_binary.js";
 
 // -- SocketTask --
 
@@ -55,6 +56,17 @@ class SocketTask {
     close(options = {}) {
         const { code = 1000, reason = "", success, fail, complete } = options;
         if (this._closed) {
+            const res = { errMsg: "closeSocket:ok" };
+            if (typeof success === 'function') success(res);
+            if (typeof complete === 'function') complete(res);
+            return;
+        }
+
+        if (this._rid < 0) {
+            // Handshake has not produced a rid yet. Mark closed so the
+            // pending connect (connectSocket) tears down the socket it is
+            // about to create, instead of leaving a live ghost connection.
+            this._closed = true;
             const res = { errMsg: "closeSocket:ok" };
             if (typeof success === 'function') success(res);
             if (typeof complete === 'function') complete(res);
@@ -127,7 +139,9 @@ async function _pollEvents(task) {
         switch (event.type) {
             case "message":
                 if (event.isBinary) {
-                    const buf = new Uint8Array(event.dataBin).buffer;
+                    // event.dataBin is an exact-length Uint8Array (external
+                    // backing); hand its buffer to the callback without a copy.
+                    const buf = toExactArrayBuffer(event.dataBin);
                     task._fireMessage(buf);
                 } else {
                     task._fireMessage(event.dataStr);
@@ -205,8 +219,16 @@ function connectSocket(options = {}) {
     // Async connection
     (async () => {
         try {
-            const result = await op_ws_create(url, protocols, headerList);
+            const result = await op_ws_create(url, protocols, headerList, timeout);
             task._rid = result.rid;
+
+            // close() may have run while the handshake was in flight; if so,
+            // tear down the freshly-created socket rather than leaving a
+            // live ghost connection the caller believes is closed.
+            if (task._closed) {
+                core.tryClose(result.rid);
+                return;
+            }
 
             const res = { errMsg: "connectSocket:ok" };
             if (typeof success === 'function') success(res);
@@ -222,6 +244,9 @@ function connectSocket(options = {}) {
             await _pollEvents(task);
 
         } catch (err) {
+            // If close() already ran (e.g. connect failed after the caller
+            // closed), stay silent: no post-close fail/onError/onClose.
+            if (task._closed) return;
             const res = { errMsg: "connectSocket:fail " + (err.message || err) };
             if (typeof fail === 'function') fail(res);
             if (typeof complete === 'function') complete(res);

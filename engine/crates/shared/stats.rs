@@ -128,8 +128,9 @@ pub struct DebugStats {
     /// Milliseconds from render thread start to first frame presentation.
     /// Set once on the first swap_buffers; remains 0 until then.
     pub first_frame_ms: AtomicU32,
-    /// Total number of HostCommand messages dropped due to queue overflow (cumulative).
-    /// Incremented by `send_command_to_host` when `try_send` returns `Full`.
+    /// Normal HostCommand quota drops recorded by the host registry
+    /// (cumulative, per session). Trusted lifecycle/surface commands bypass
+    /// this quota and are not counted in this field.
     pub command_drops: AtomicU32,
     /// Last measured RAF scheduling latency in microseconds.
     pub raf_latency_us: AtomicU32,

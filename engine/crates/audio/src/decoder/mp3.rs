@@ -23,6 +23,16 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
                     channels = ch as u32;
                 }
 
+                // Reject a decode bomb before growing the buffer.
+                if !crate::limits::pcm_samples_within_budget(
+                    samples.len().saturating_add(frame_data.len()),
+                ) {
+                    return Err(EngineError::from_detail(
+                        ErrorCode::InvalidArgument,
+                        "MP3 decode exceeds the PCM budget",
+                    ));
+                }
+
                 // Convert i16 to f32
                 for s in frame_data {
                     samples.push(s as f32 / 32768.0);

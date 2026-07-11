@@ -201,13 +201,17 @@ impl Renderer2d {
                 // at the same time — this is what turns `drawImage` from a
                 // no-op into a real rasterised draw.
                 cm.make_current_needed(canvas_id)?;
-                // F-2: lock the shared TextContext for the duration of the
-                // paint.  `apply_with_images` holds the `&TextContext`
-                // borrow only while running; the mutex guard's lifetime
-                // binds naturally to this scope.
-                let text_guard = self.text.lock();
                 let (ctx, image_store) = cm.split_2d_and_images(canvas_id)?;
-                Ok(ctx.apply_with_images(&cmd, &*text_guard, image_store))
+                // Q6: only commands that execute shaping/painting acquire the
+                // shared text mutex, and only AFTER the split borrow succeeds so
+                // a split error never takes the mutex. The classification is
+                // exhaustive in the command's defining crate, so adding a future
+                // variant requires an explicit lock decision at compile time. The
+                // guard then covers exactly the `apply_with_images`/`apply_env`
+                // text execution; text state setters remain ordered commands but
+                // do not consult TextContext.
+                let text_guard = cmd.requires_text_context().then(|| self.text.lock());
+                Ok(ctx.apply_with_images(&cmd, text_guard.as_deref(), image_store))
             }
         }
     }

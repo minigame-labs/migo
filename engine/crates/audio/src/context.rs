@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use shared::error::EngineResult;
 use shared::protocol::audio_cmd::{AudioBufferId, AudioContextId, AudioContextState, AudioNodeId};
 
 use crate::decoder::DecodedAudio;
@@ -157,23 +158,30 @@ impl AudioContext {
         self.buffers.remove(&id).is_some()
     }
 
-    /// Create an empty buffer with the given parameters
+    /// Create an empty buffer with the given parameters.
+    ///
+    /// Validates channel count, sample rate and total PCM size (with checked
+    /// arithmetic) before allocating, so an overflowing or budget-busting
+    /// request is rejected instead of panicking / wrapping to a bogus size.
     pub fn create_empty_buffer(
         &mut self,
         channels: u32,
         length: u32,
         sample_rate: u32,
-    ) -> AudioBufferId {
+    ) -> EngineResult<AudioBufferId> {
+        crate::limits::validate_buffer_alloc(channels, length, sample_rate)?;
+
         let id = self.next_buffer_id;
         self.next_buffer_id += 1;
-        let samples = vec![0.0f32; (length * channels) as usize];
+        // Safe: validated above to fit and stay within the PCM budget.
+        let samples = vec![0.0f32; length as usize * channels as usize];
         let audio = DecodedAudio {
             samples,
             sample_rate,
             channels,
         };
         self.buffers.insert(id, Arc::new(audio));
-        id
+        Ok(id)
     }
 
     /// Number of channels in a buffer (0 if not found).
@@ -342,6 +350,30 @@ impl AudioContext {
         false
     }
 
+    /// If the node exists and has already finished (e.g. `stop(when <= 0)`
+    /// finishes a buffer source immediately), remove it from every per-node
+    /// structure (node map, output buffer, connections) and return `true`.
+    ///
+    /// Lets the audio thread fully clean up an immediately-finished node now,
+    /// rather than waiting for the next `process()` sweep — which never runs
+    /// while the context is suspended.
+    pub fn remove_finished_node(&mut self, node_id: AudioNodeId) -> bool {
+        let finished = self
+            .nodes
+            .get(&node_id)
+            .map(|n| n.is_finished())
+            .unwrap_or(false);
+        if !finished {
+            return false;
+        }
+        self.nodes.remove(&node_id);
+        self.node_buffers.remove(&node_id);
+        self.connections
+            .retain(|c| c.src != node_id && c.dst != node_id);
+        self.graph_dirty = true;
+        true
+    }
+
     pub fn set_loop(&mut self, node_id: AudioNodeId, enabled: bool, start: f64, end: f64) -> bool {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             let any = node.as_any_mut();
@@ -377,9 +409,10 @@ impl AudioContext {
 
     /// Set an AudioParam value on a node by name
     pub fn set_node_param(&mut self, node_id: AudioNodeId, param_name: &str, value: f32) -> bool {
+        let now = self.current_time();
         if let Some(node) = self.nodes.get_mut(&node_id) {
             if let Some(param) = node.get_param_mut(param_name) {
-                param.set_value(value);
+                param.set_value_now(value, now);
                 return true;
             }
         }
@@ -394,9 +427,11 @@ impl AudioContext {
         value: f32,
         time: f64,
     ) -> bool {
+        let now = self.current_time();
         if let Some(node) = self.nodes.get_mut(&node_id) {
             if let Some(param) = node.get_param_mut(param_name) {
                 param.set_value_at_time(value, time);
+                param.gc_events(now);
                 return true;
             }
         }
@@ -410,9 +445,11 @@ impl AudioContext {
         value: f32,
         end_time: f64,
     ) -> bool {
+        let now = self.current_time();
         if let Some(node) = self.nodes.get_mut(&node_id) {
             if let Some(param) = node.get_param_mut(param_name) {
                 param.linear_ramp_to_value_at_time(value, end_time);
+                param.gc_events(now);
                 return true;
             }
         }
@@ -426,9 +463,11 @@ impl AudioContext {
         value: f32,
         end_time: f64,
     ) -> bool {
+        let now = self.current_time();
         if let Some(node) = self.nodes.get_mut(&node_id) {
             if let Some(param) = node.get_param_mut(param_name) {
                 param.exponential_ramp_to_value_at_time(value, end_time);
+                param.gc_events(now);
                 return true;
             }
         }
@@ -443,9 +482,11 @@ impl AudioContext {
         start_time: f64,
         time_constant: f64,
     ) -> bool {
+        let now = self.current_time();
         if let Some(node) = self.nodes.get_mut(&node_id) {
             if let Some(param) = node.get_param_mut(param_name) {
                 param.set_target_at_time(target, start_time, time_constant);
+                param.gc_events(now);
                 return true;
             }
         }
@@ -580,10 +621,13 @@ impl AudioContext {
     /// allowing multiple AudioContexts to be mixed together by the caller.
     ///
     /// The caller must zero the output buffer before the first context's process() call.
-    pub fn process(&mut self, output: &mut [f32]) {
+    ///
+    /// Returns the ids of source nodes that finished during this block, so the
+    /// audio thread can drop its `node → context` index entries for them.
+    pub fn process(&mut self, output: &mut [f32]) -> Vec<AudioNodeId> {
         if self.state != AudioContextState::Running {
             // Don't touch output — other contexts may have already written to it
-            return;
+            return Vec::new();
         }
 
         // Rebuild processing order if graph changed
@@ -679,11 +723,85 @@ impl AudioContext {
         let frames = buffer_size / self.channels.max(1) as usize;
         self.frames_processed += frames as u64;
 
-        // Clean up finished source nodes
-        let old_count = self.nodes.len();
-        self.nodes.retain(|_, node| !node.is_finished());
-        if self.nodes.len() != old_count {
-            self.graph_dirty = true;
+        // Clean up finished source nodes. A naturally-ended one-shot source
+        // must be removed from *every* per-node structure — the node map, its
+        // output buffer, and any graph connections — and its id reported so the
+        // audio thread drops its node→context index entry. Missing any of these
+        // leaks one entry per fired sound effect.
+        let mut finished: Vec<AudioNodeId> = Vec::new();
+        for (&id, node) in self.nodes.iter() {
+            if node.is_finished() {
+                finished.push(id);
+            }
         }
+        if !finished.is_empty() {
+            for &id in &finished {
+                self.nodes.remove(&id);
+                self.node_buffers.remove(&id);
+            }
+            self.connections
+                .retain(|c| !finished.contains(&c.src) && !finished.contains(&c.dst));
+            self.graph_dirty = true; // processing_order + input_adjacency rebuilt next block
+        }
+
+        finished
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_fully_cleans_up_finished_nodes() {
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+
+        // A buffer source wired to the destination.
+        ctx.create_buffer_source(10);
+        ctx.connect(10, DESTINATION_NODE_ID);
+
+        // Per W3C, stop(when <= 0) finishes the source immediately.
+        assert!(ctx.stop_source(10, 0.0));
+
+        let mut out = vec![0.0f32; 2 * 128];
+        let finished = ctx.process(&mut out);
+
+        assert!(
+            finished.contains(&10),
+            "finished node id must be reported so the audio thread can unregister it"
+        );
+        assert!(!ctx.nodes.contains_key(&10), "removed from the node map");
+        assert!(
+            !ctx.node_buffers.contains_key(&10),
+            "per-node output buffer must be freed"
+        );
+        assert!(
+            !ctx.connections.iter().any(|c| c.src == 10 || c.dst == 10),
+            "graph connections referencing the finished node must be dropped"
+        );
+    }
+
+    #[test]
+    fn remove_finished_node_purges_immediate_stop_only() {
+        let mut ctx = AudioContext::new(1, 48_000, 2);
+
+        // stop(when <= 0) finishes a buffer source immediately -> fully removed.
+        ctx.create_buffer_source(20);
+        ctx.connect(20, DESTINATION_NODE_ID);
+        assert!(ctx.stop_source(20, 0.0));
+        assert!(ctx.remove_finished_node(20), "immediate-finished node removed");
+        assert!(!ctx.nodes.contains_key(&20));
+        assert!(!ctx.node_buffers.contains_key(&20));
+        assert!(!ctx.connections.iter().any(|c| c.src == 20 || c.dst == 20));
+
+        // A future-dated stop has NOT finished yet -> must stay reachable.
+        ctx.create_buffer_source(21);
+        ctx.connect(21, DESTINATION_NODE_ID);
+        assert!(ctx.stop_source(21, 1000.0));
+        assert!(
+            !ctx.remove_finished_node(21),
+            "future-dated stop must remain until it actually finishes"
+        );
+        assert!(ctx.nodes.contains_key(&21));
     }
 }

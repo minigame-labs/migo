@@ -1,7 +1,7 @@
 //! Thread-safe wakeup primitives for cross-thread signaling.
 //!
 //! Provides [`ThreadWakeup`], a condvar-based wakeup handle that allows
-//! one thread to wake another from a timed sleep. Used by the audio thread's
+//! one thread to wake another from a timed or indefinite sleep. Used by the audio thread's
 //! power management to enable instant wakeup from deep-sleep states when
 //! a new command arrives.
 
@@ -11,9 +11,9 @@ use std::time::Duration;
 
 /// A condvar-based thread wakeup handle.
 ///
-/// When a thread is sleeping via [`wait_timeout`](ThreadWakeup::wait_timeout),
-/// another thread can call [`notify`](ThreadWakeup::notify) to wake it
-/// immediately, regardless of the remaining timeout.
+/// When a thread is sleeping via [`wait`](ThreadWakeup::wait) or
+/// [`wait_timeout`](ThreadWakeup::wait_timeout), another thread can call
+/// [`notify`](ThreadWakeup::notify) to wake it immediately.
 ///
 /// This is `Clone` and `Send + Sync` — multiple producers can hold clones
 /// and wake the single consumer.
@@ -32,9 +32,9 @@ impl ThreadWakeup {
 
     /// Signal the sleeping thread to wake up.
     ///
-    /// If the thread is currently in [`wait_timeout`](ThreadWakeup::wait_timeout),
-    /// it will return immediately. If it is not sleeping, the signal is
-    /// latched and the next `wait_timeout` call will return instantly.
+    /// If the thread is currently waiting, it will return immediately. If it
+    /// is not sleeping, the signal is latched and the next wait call returns
+    /// instantly.
     #[inline]
     pub fn notify(&self) {
         let (lock, cvar) = &*self.inner;
@@ -44,6 +44,20 @@ impl ThreadWakeup {
         let mut signaled = lock.lock().unwrap_or_else(|e| e.into_inner());
         *signaled = true;
         cvar.notify_one();
+    }
+
+    /// Wait until explicitly signaled by [`notify`](ThreadWakeup::notify).
+    ///
+    /// Notifications are latched, so a notification sent before this call is
+    /// consumed without blocking. The predicate loop handles spurious condvar
+    /// wakeups without turning them into work-loop wakeups.
+    pub fn wait(&self) {
+        let (lock, cvar) = &*self.inner;
+        let mut signaled = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !*signaled {
+            signaled = cvar.wait(signaled).unwrap_or_else(|e| e.into_inner());
+        }
+        *signaled = false;
     }
 
     /// Wait for a signal or timeout.
@@ -80,5 +94,83 @@ impl Default for ThreadWakeup {
 impl fmt::Debug for ThreadWakeup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ThreadWakeup").finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    #[test]
+    fn wait_consumes_notification_that_arrived_before_waiting() {
+        let wakeup = ThreadWakeup::new();
+        wakeup.notify();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            wakeup.wait();
+            done_tx.send(()).unwrap();
+        });
+
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+    }
+
+    #[test]
+    fn wait_blocks_until_notified() {
+        let wakeup = ThreadWakeup::new();
+        let waiter = wakeup.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            waiter.wait();
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(25)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        wakeup.notify();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+    }
+
+    #[test]
+    fn wait_timeout_consumes_latched_notification() {
+        let wakeup = ThreadWakeup::new();
+        wakeup.notify();
+
+        assert!(wakeup.wait_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn wait_timeout_returns_false_when_deadline_expires() {
+        let wakeup = ThreadWakeup::new();
+
+        assert!(!wakeup.wait_timeout(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn wait_timeout_returns_true_when_notified_by_peer() {
+        let wakeup = ThreadWakeup::new();
+        let waiter = wakeup.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(waiter.wait_timeout(Duration::from_secs(1)))
+                .unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wakeup.notify();
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)), Ok(true));
     }
 }

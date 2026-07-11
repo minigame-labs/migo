@@ -227,9 +227,15 @@ function request(options = {}) {
 
     const cancellation = {
         aborted: false,
+        responseRid: null,
         abort() {
             this.aborted = true;
             if (cancelHandleRid !== null) core.tryClose(cancelHandleRid);
+            // The request cancel handle only covers the send phase. Once
+            // headers are in, abort() must also close the body resource so
+            // an in-flight (possibly large) download stops immediately
+            // instead of running to completion and firing success().
+            if (this.responseRid !== null) core.tryClose(this.responseRid);
         }
     };
 
@@ -246,6 +252,10 @@ function request(options = {}) {
                 complete(error);
                 return;
             }
+
+            // Track the body resource so cancellation.abort() can close
+            // it mid-download (see the cancellation object above).
+            cancellation.responseRid = resp.responseRid;
 
             const respHeader = new Header(resp.headers, resp.status);
             requestTask._triggerHeadersReceived(respHeader);
@@ -286,12 +296,17 @@ function request(options = {}) {
                         cbResp.data = fromBodyBuffer(bodyBytes, dataType, responseType);
                     }
                 } catch (err) {
+                    // A read cancelled by abort() surfaces here; report it
+                    // as an abort (via the outer catch), not a 500.
+                    if (cancellation.aborted) throw "aborted";
                     const error = new ErrorResponse(500, new Exception(500, "read data failed: " + err, 0));
                     fail(error);
                     complete(error);
                     return;
                 }
             }
+
+            if (cancellation.aborted) throw "aborted";
 
             success(cbResp);
             complete(cbResp);

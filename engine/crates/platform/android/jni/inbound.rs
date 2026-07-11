@@ -121,7 +121,11 @@ use jni::{JNIEnv, JavaVM};
 
 use tracing::{error, info};
 
-use core::{send_command_to_host, shutdown_host, spawn_host_thread};
+use core::{
+    bump_destroy_epoch, current_destroy_epoch, send_command_to_host,
+    send_critical_command_to_host, shutdown_host, spawn_host_thread,
+};
+use shared::protocol::camera_frame::{PlaneWindow, pack_yuv_planes};
 use shared::protocol::host_cmd::{
     BleCharacteristicData, HostCommand, TouchData, TouchPoint, TouchType,
 };
@@ -135,7 +139,7 @@ use crate::android::logging;
 use crate::android::platform::AndroidPlatform;
 use crate::android::surface::{
     ANativeWindow_fromSurface, ANativeWindow_getHeight, ANativeWindow_getWidth,
-    ANativeWindow_setBuffersGeometry, AndroidSurfaceWrapper,
+    ANativeWindow_release, ANativeWindow_setBuffersGeometry, AndroidSurfaceWrapper,
 };
 
 #[unsafe(no_mangle)]
@@ -258,13 +262,30 @@ pub(crate) extern "system" fn init(
                 "init failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}",
                 raw_w, raw_h
             );
+            unsafe { ANativeWindow_release(window) };
             return -1;
         }
         let (w, h) = (raw_w as u32, raw_h as u32);
 
+        // Take ownership of the ANativeWindow ref (acquired by
+        // ANativeWindow_fromSurface) via RAII now, so every early return below
+        // releases it. Previously each error path between here and host spawn
+        // leaked the ref.
+        let android_surface = match unsafe {
+            AndroidSurfaceWrapper::from_surface_owned(window, w, h, 0)
+        } {
+            Ok(s) => s,
+            Err(e) => {
+                error!("init failed: create AndroidSurfaceWrapper error: {}", e);
+                unsafe { ANativeWindow_release(window) };
+                return -1;
+            }
+        };
+
         // Normalize native window buffer geometry to the observed dimensions.
         // This helps avoid stale rotated geometry during startup transitions.
-        let set_geo_rc = unsafe { ANativeWindow_setBuffersGeometry(window, raw_w, raw_h, 0) };
+        let set_geo_rc =
+            unsafe { ANativeWindow_setBuffersGeometry(android_surface.native_handle(), raw_w, raw_h, 0) };
         if set_geo_rc != 0 {
             tracing::warn!(
                 "init: ANativeWindow_setBuffersGeometry({}x{}) failed: {}",
@@ -374,16 +395,8 @@ pub(crate) extern "system" fn init(
 
         let platform = Arc::new(AndroidPlatform::new());
 
-        // ANativeWindow_fromSurface returns a new strong ref; wrap as owned (no acquire).
-        let android_surface =
-            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) } {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("init failed: create AndroidSurfaceWrapper error: {}", e);
-                    return -1;
-                }
-            };
-
+        // `android_surface` already owns the ANativeWindow ref (wrapped above so
+        // early returns release it); hand it to the host.
         let surface_ref: SurfaceRef = Arc::new(android_surface);
 
         let host_id = spawn_host_thread(surface_ref, platform, init_options);
@@ -426,6 +439,9 @@ pub(crate) extern "system" fn updateSurface<'local>(
                 "updateSurface failed: ANativeWindow_getWidth/Height returned invalid size: {}x{}",
                 raw_w, raw_h
             );
+            // Release the strong ref acquired by ANativeWindow_fromSurface before
+            // bailing; only the success path transfers it to AndroidSurfaceWrapper.
+            unsafe { ANativeWindow_release(window) };
             return;
         }
 
@@ -457,8 +473,11 @@ pub(crate) extern "system" fn updateSurface<'local>(
             );
         }
 
+        // Stamp the surface with the current destroy-epoch so the render thread
+        // can tell, after it recreates, whether a newer destroy has since raced.
+        let surface_epoch = current_destroy_epoch(host_id);
         let android_surface =
-            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) } {
+            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h, surface_epoch) } {
                 Ok(s) => s,
                 Err(e) => {
                     error!(
@@ -471,7 +490,12 @@ pub(crate) extern "system" fn updateSurface<'local>(
 
         let surface_ref: SurfaceRef = Arc::new(android_surface);
 
-        if let Err(e) = send_command_to_host(
+        // NOTE: the render thread adopts this surface's epoch as its valid_epoch
+        // recreates the onscreen surface (see render_thread.rs), never here.
+        // Setting it true from JNI before the recreate ran would let the render
+        // thread read `true` against the stale/abandoned surface (destroy->create
+        // ABA on the boolean).
+        if let Err(e) = send_critical_command_to_host(
             host_id,
             HostCommand::UpdateSurface {
                 surface: surface_ref,
@@ -486,7 +510,12 @@ pub(crate) extern "system" fn updateSurface<'local>(
 
 pub(crate) extern "system" fn onSurfaceDestroyed(_env: JNIEnv, _class: JClass, host_id: jint) {
     jni_safe!("onSurfaceDestroyed", {
-        if let Err(e) = send_command_to_host(host_id, HostCommand::SurfaceDestroyed) {
+        // Advance the destroy-epoch BEFORE this callback returns (Android
+        // abandons the BufferQueue on return). The render thread compares each
+        // frame and stops presenting to the now-stale surface synchronously and
+        // independent of the (async, lossy) SurfaceDestroyed command below.
+        bump_destroy_epoch(host_id);
+        if let Err(e) = send_critical_command_to_host(host_id, HostCommand::SurfaceDestroyed) {
             error!("Failed to send SurfaceDestroyed for host {host_id}: {e}");
         }
     });
@@ -711,7 +740,8 @@ pub(crate) extern "system" fn onShow<'local>(
             info!("Host {} onShow received (options_json=<none>)", host_id);
         }
 
-        if let Err(e) = send_command_to_host(host_id, HostCommand::OnShow { options_json }) {
+        if let Err(e) = send_critical_command_to_host(host_id, HostCommand::OnShow { options_json })
+        {
             error!("Failed to send OnShow for host {host_id}: {e}");
         }
     });
@@ -720,7 +750,7 @@ pub(crate) extern "system" fn onShow<'local>(
 pub(crate) extern "system" fn onHide(_env: JNIEnv, _class: JClass, host_id: jint) {
     jni_safe!("onHide", {
         info!("Host {} onHide received", host_id);
-        if let Err(e) = send_command_to_host(host_id, HostCommand::OnHide) {
+        if let Err(e) = send_critical_command_to_host(host_id, HostCommand::OnHide) {
             error!("Failed to send OnHide for host {host_id}: {e}");
         }
     });
@@ -995,22 +1025,92 @@ pub(crate) extern "system" fn onCameraEvent<'local>(
     });
 }
 
-pub(crate) extern "system" fn onCameraFrameData(
-    env: JNIEnv,
-    _class: JClass,
+pub(crate) extern "system" fn onCameraFrameData<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
     host_id: jint,
     camera_id: jint,
-    frame_data: jni::sys::jbyteArray,
+    y_buf: JByteBuffer<'local>,
+    y_off: jint,
+    y_len: jint,
+    u_buf: JByteBuffer<'local>,
+    u_off: jint,
+    u_len: jint,
+    v_buf: JByteBuffer<'local>,
+    v_off: jint,
+    v_len: jint,
     width: jint,
     height: jint,
 ) {
     jni_safe!("onCameraFrameData", {
-        let data = match env
-            .convert_byte_array(unsafe { jni::objects::JByteArray::from_raw(frame_data) })
-        {
+        // Validate dimensions before the signed -> unsigned cast below.
+        if width <= 0 || height <= 0 {
+            tracing::warn!(
+                "onCameraFrameData: non-positive dimensions {}x{}",
+                width,
+                height
+            );
+            return;
+        }
+
+        // Resolve each direct plane buffer's base address + capacity. The jni
+        // wrapper rejects null / non-direct buffers and a -1 capacity, so a
+        // malformed buffer is dropped rather than mis-read.
+        let resolve = |buf: &JByteBuffer, plane: &str| -> Option<(*mut u8, usize)> {
+            match (
+                env.get_direct_buffer_address(buf),
+                env.get_direct_buffer_capacity(buf),
+            ) {
+                (Ok(addr), Ok(cap)) => Some((addr, cap)),
+                _ => {
+                    tracing::warn!(
+                        "onCameraFrameData: {} plane buffer not direct/usable",
+                        plane
+                    );
+                    None
+                }
+            }
+        };
+        let (Some((y_addr, y_cap)), Some((u_addr, u_cap)), Some((v_addr, v_cap))) = (
+            resolve(&y_buf, "Y"),
+            resolve(&u_buf, "U"),
+            resolve(&v_buf, "V"),
+        ) else {
+            return;
+        };
+
+        // SAFETY: each (addr, cap) comes from a live, direct ByteBuffer whose
+        // backing Image is held open by the synchronous Java caller for the
+        // duration of this call. `u8` has alignment 1 and `addr` is non-null
+        // (the jni wrapper rejects null). These capacity slices are used only
+        // to pack into an owned `Vec` below; no slice, raw address, or
+        // `JByteBuffer` escapes this call or crosses the host channel.
+        let y_slice = unsafe { std::slice::from_raw_parts(y_addr as *const u8, y_cap) };
+        let u_slice = unsafe { std::slice::from_raw_parts(u_addr as *const u8, u_cap) };
+        let v_slice = unsafe { std::slice::from_raw_parts(v_addr as *const u8, v_cap) };
+
+        // The single copy: validate each `[offset, offset+len)` window against
+        // its capacity and concatenate Y/U/V into one owned Vec.
+        let packed = match pack_yuv_planes([
+            PlaneWindow {
+                buffer: y_slice,
+                offset: y_off,
+                len: y_len,
+            },
+            PlaneWindow {
+                buffer: u_slice,
+                offset: u_off,
+                len: u_len,
+            },
+            PlaneWindow {
+                buffer: v_slice,
+                offset: v_off,
+                len: v_len,
+            },
+        ]) {
             Ok(v) => v,
             Err(e) => {
-                error!("onCameraFrameData: failed to read byte array: {:?}", e);
+                tracing::warn!("onCameraFrameData: invalid plane window: {:?}", e);
                 return;
             }
         };
@@ -1019,7 +1119,7 @@ pub(crate) extern "system" fn onCameraFrameData(
             host_id,
             HostCommand::CameraFrameData {
                 camera_id: camera_id as u32,
-                data,
+                data: packed,
                 width: width as u32,
                 height: height as u32,
             },

@@ -19,6 +19,7 @@
 //! let the method body reach the sub-components without
 //! refactoring the disjoint borrows the current closures rely on.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,6 +31,7 @@ use crate::{
 };
 use crossbeam_channel::{Receiver, select, tick};
 use glow::HasContext;
+use shared::command_vec_pool::{recycle_canvas_command_vec, recycle_gl_command_vec};
 use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::render_cmd::{CanvasBatchPayload, CanvasId, GlBatchPayload, RenderCommand};
 use shared::render_command_sender::CommandSender;
@@ -46,6 +48,32 @@ use shared::raf_signal::RafSender;
 /// lax enough that an actually stalled producer trips it within a
 /// 50 ms window at 60 Hz.
 const RAF_BACKPRESSURE_STREAK_THRESHOLD: u32 = 3;
+
+/// Report a context-recovery failure at most once per loss episode.
+///
+/// Recovery is retried every frame while the context is lost; emitting a
+/// `ContextRecovered{success:false}` event, waking the host, and (downstream)
+/// firing a Java `notify_error` on every failed retry would flood at frame
+/// rate. The loss epoch bumps on each fresh loss, so gating on it reports the
+/// first failure of an episode and then stays silent until recovery succeeds or
+/// a new loss starts. The per-frame `warn!` log is intentionally left to the
+/// call site (cheap, and useful for diagnosing a stuck context).
+fn report_recovery_failure(
+    context_lost: &Arc<shared::op_state::ContextLostState>,
+    events: &RenderEventSender,
+    wake: &Option<Arc<dyn Fn() + Send + Sync>>,
+    last_recovery_fail_epoch: &mut u64,
+) {
+    let (_, epoch) = context_lost.snapshot();
+    if epoch == *last_recovery_fail_epoch {
+        return;
+    }
+    *last_recovery_fail_epoch = epoch;
+    events.emit(RenderEvent::ContextRecovered { success: false });
+    if let Some(w) = wake.as_ref() {
+        w();
+    }
+}
 
 pub struct RenderThread {
     cmd_tx: CommandSender,
@@ -132,7 +160,7 @@ fn execute_canvas_batch(
     use crate::damage_effect::DamageEffect;
 
     let canvas_id = payload.canvas_id;
-    let commands = payload.commands;
+    let mut commands = payload.commands;
     let present = payload.present;
     let mut batch_dirty = false;
     let is_onscreen = canvas_id == shared::protocol::render_cmd::CanvasId::from(1u32);
@@ -201,7 +229,7 @@ fn execute_canvas_batch(
         });
     }
 
-    for cmd in commands {
+    for cmd in commands.drain(..) {
         // Classify damage BEFORE handle_command moves the cmd.
         // Reads Canvas2D state (transform, shadow) from the render thread —
         // this is the authoritative damage source, not the JS-side hint.
@@ -250,7 +278,14 @@ fn execute_canvas_batch(
         cm.mark_2d_dirty(canvas_id);
     }
 
-    canvas2d_batch_should_mark_present_dirty(canvas_id, batch_dirty, present, dirty_rect.is_some())
+    let should_mark_present = canvas2d_batch_should_mark_present_dirty(
+        canvas_id,
+        batch_dirty,
+        present,
+        dirty_rect.is_some(),
+    );
+    recycle_canvas_command_vec(commands);
+    should_mark_present
 }
 
 fn execute_gl_batch(
@@ -259,7 +294,7 @@ fn execute_gl_batch(
     renderer_gl: &mut RendererGL,
     payload: GlBatchPayload,
 ) -> bool {
-    let commands = payload.commands;
+    let mut commands = payload.commands;
     let cmd_count = commands.len();
     let mut batch_hit_onscreen = false;
     let mut error_count: u32 = 0;
@@ -270,7 +305,7 @@ fn execute_gl_batch(
     let mut touched_canvases: std::collections::HashSet<CanvasId> =
         std::collections::HashSet::new();
 
-    for gl_cmd in commands {
+    for gl_cmd in commands.drain(..) {
         if let Some(cid) = gl_cmd.touches_canvas() {
             touched_canvases.insert(cid);
         }
@@ -308,6 +343,7 @@ fn execute_gl_batch(
         cm.mark_2d_context_stale(cid);
     }
 
+    recycle_gl_command_vec(commands);
     batch_hit_onscreen
 }
 
@@ -971,6 +1007,7 @@ impl RenderThread {
     ///   On Android this is eventfd-backed; on other platforms, tokio mpsc.
     /// * `vsync_rx` — optional crossbeam receiver for Choreographer VSync signals
     /// * `host_id` — host identifier for debug stats registry
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         raf_tx: RafSender,
         vsync_rx: Option<Receiver<f64>>,
@@ -979,6 +1016,28 @@ impl RenderThread {
         dpi: f32,
         app_cache_dir: Option<std::path::PathBuf>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
+        // Authoritative GL-context-loss state, shared with the host runtime and
+        // JS `op_gl_is_context_lost`. The render thread is the *only* writer and
+        // updates it edge-triggered: `lost` false->true on a real reset / EGL
+        // loss, true->false on a probe-verified recovery, bumping `epoch` on
+        // each transition. Because the render-event channel is lossy and drained
+        // only on host commands/heartbeat, this state -- not the event -- is the
+        // source of truth for `gl.isContextLost()`, and `epoch` lets the host
+        // recover event edges that the channel dropped.
+        context_lost: Arc<shared::op_state::ContextLostState>,
+        // Optional wake nudge invoked right after a context lost/recovered
+        // transition so the host drains + reconciles promptly instead of
+        // waiting for the next heartbeat tick. Decoupled from `HostCommand`
+        // so the graphics crate stays independent of the host command enum.
+        wake: Option<Arc<dyn Fn() + Send + Sync>>,
+        // Per-host surface destroy-epoch (monotonic), advanced by the JNI/UI
+        // thread on every surfaceDestroyed. Each SurfaceRef carries the epoch it
+        // was created at (Surface::surface_epoch); the render loop compares its
+        // current surface's epoch against this live counter every frame and stops
+        // presenting on any mismatch — synchronously and independent of the async
+        // SurfaceDestroyed command. A monotonic counter (vs a boolean) is required
+        // to survive fast destroy->create->destroy without ABA masking.
+        destroy_epoch: Arc<std::sync::atomic::AtomicU64>,
     ) -> EngineResult<Self> {
         let (cmd_tx, cmd_rx) = CommandSender::new();
         let (event_tx, event_rx) = shared::render_event::channel();
@@ -1065,6 +1124,13 @@ impl RenderThread {
                 let mut dirty = true;
                 let mut paused = false;
                 let mut surface_system = SurfaceSystem::new();
+                // Epoch of the surface the render thread currently holds. Compared
+                // against the live `destroy_epoch` each frame; a mismatch means the
+                // surface was destroyed after hand-off. Init 0 to match the initial
+                // surface's epoch and the destroy counter's initial value. `Cell`
+                // so the command-handling closures can update it via shared capture
+                // (they already borrow the environment) without a unique borrow.
+                let valid_epoch = std::cell::Cell::new(0u64);
                 if initial_onscreen_ok {
                     if let Some(size) = initial_surface_size {
                         surface_system.on_surface_available(size);
@@ -1094,6 +1160,15 @@ impl RenderThread {
                 // time-critical swap path where it delays the RAF signal and
                 // can cause cascading frame drops.
                 let mut needs_context_recovery = false;
+
+                // Epoch of the last context-loss episode we already reported a
+                // *recovery failure* for. Recovery is retried every frame while
+                // lost; without this, each failed retry would emit a
+                // ContextRecovered{success:false} + wake the host + trigger a
+                // Java notify_error at up to 60 fps. We report the failure once
+                // per loss episode (the epoch bumps on each fresh loss), then
+                // stay quiet until recovery succeeds or a new loss occurs.
+                let mut last_recovery_fail_epoch: u64 = u64::MAX;
 
                 // Diag: track when the render thread entered pause
                 // so `Resume` can report wall-clock paused duration.
@@ -1159,16 +1234,49 @@ impl RenderThread {
                                 } => Some(surface.size()),
                                 _ => None,
                             };
+                            // Epoch stamped on the surface at updateSurface time —
+                            // becomes this render thread's valid_epoch once the
+                            // surface is successfully recreated.
+                            let recreate_surface_epoch = match &canvas_cmd {
+                                shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen {
+                                    surface,
+                                    ..
+                                } => Some(surface.surface_epoch()),
+                                _ => None,
+                            };
                             let affects_onscreen = match &canvas_cmd {
                                 shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen { .. } => true,
                                 shared::protocol::render_cmd::CanvasCmd::ResizeCanvas { id, .. } => *id == 1,
                                 _ => false,
                             };
+                            // If the incoming surface's destroy-epoch differs from the
+                            // one we currently hold, a surfaceDestroyed occurred since:
+                            // the old onscreen EGLSurface is bound to an abandoned
+                            // window. Force a full recreate so create_onscreen's
+                            // same-window fast paths can't keep presenting to the dead
+                            // surface. (Same epoch => a benign resize/redundant call,
+                            // where the fast path safely avoids an EGL re-connect.)
+                            if is_recreate {
+                                if let Some(e) = recreate_surface_epoch {
+                                    if e != valid_epoch.get() {
+                                        cm.force_next_onscreen_recreate();
+                                    }
+                                }
+                            }
                             match canvas_handler.handle_command(cm, canvas_cmd) {
                                 Ok(()) => {
                                     if is_recreate {
                                         if let Some(size) = recreate_surface_size {
                                             surface_system.on_surface_available(size);
+                                            // Adopt the recreated surface's epoch. From now on the
+                                            // present-gate compares this against the live destroy
+                                            // counter, so a destroy that raced this recreate (bumped
+                                            // the counter past this epoch) still stops presenting —
+                                            // no ABA, because a monotonic epoch can't read "equal"
+                                            // against a newer surface generation.
+                                            if let Some(e) = recreate_surface_epoch {
+                                                valid_epoch.set(e);
+                                            }
                                             info!(
                                                 width = size.0,
                                                 height = size.1,
@@ -1659,11 +1767,27 @@ impl RenderThread {
                             warn!("Aborted {failed} pending sync responder(s) due to robustness-reported reset");
                         }
                         cm.abandon_all_2d_contexts();
-                        events.emit(RenderEvent::ContextLost);
+                        // Edge-triggered authoritative write (single packed
+                        // atomic): `set_lost` returns true only on the
+                        // false->true transition, so we emit + nudge exactly
+                        // once. A sustained / re-detected loss must not keep
+                        // flooding the host command queue with no-op nudges.
+                        if context_lost.set_lost() {
+                            events.emit(RenderEvent::ContextLost);
+                            if let Some(w) = wake.as_ref() {
+                                w();
+                            }
+                        }
                     }
 
                     // Present the completed frame (only if we have a valid surface).
-                    let did_swap = if *dirty && should_present {
+                    // Re-check the surface epoch here, immediately before the swap:
+                    // the caller's gate ran before upload-drain / flush / RAF work,
+                    // and a surfaceDestroyed may have advanced the epoch since. This
+                    // closes the residual "check early, swap late" window.
+                    let surface_current =
+                        destroy_epoch.load(std::sync::atomic::Ordering::Acquire) == valid_epoch.get();
+                    let did_swap = if *dirty && should_present && surface_current {
                         let onscreen_id = shared::protocol::render_cmd::CanvasId::from(1u32);
                         let (canvas_w, canvas_h) = cm.get_canvas_size(onscreen_id).unwrap_or((0, 0));
                         let tracked_viewport = cm
@@ -1698,7 +1822,17 @@ impl RenderThread {
                         };
 
                         crate::atrace_scope!("migo.render.swap_buffers");
-                        let swap_ok = match cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
+                        // Final epoch re-check at the swap boundary: a surfaceDestroyed
+                        // may have raced the flush/damage work above. If stale, skip the
+                        // EGL swap entirely (the next present-gate iteration marks the
+                        // surface lost); presenting to the abandoned BufferQueue is the
+                        // one thing we must never do.
+                        let swap_ok = if destroy_epoch.load(std::sync::atomic::Ordering::Acquire)
+                            != valid_epoch.get()
+                        {
+                            false
+                        } else {
+                            match cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
                             Ok(resolved_damage) => {
                                 use crate::dirty_region::damage_tracker::ResolvedDamage;
                                 match resolved_damage {
@@ -1742,7 +1876,14 @@ impl RenderThread {
                                     // on the next frame will recreate
                                     // fresh `Canvas2DContext`s.
                                     cm.abandon_all_2d_contexts();
-                                    events.emit(RenderEvent::ContextLost);
+                                    // Edge-triggered: emit + nudge only on the
+                                    // false->true transition (see robustness path).
+                                    if context_lost.set_lost() {
+                                        events.emit(RenderEvent::ContextLost);
+                                        if let Some(w) = wake.as_ref() {
+                                            w();
+                                        }
+                                    }
                                 } else {
                                     debug_stats
                                         .swap_failures
@@ -1752,6 +1893,7 @@ impl RenderThread {
                                     });
                                 }
                                 false
+                            }
                             }
                         };
                         *dirty = false;
@@ -1808,9 +1950,19 @@ impl RenderThread {
                                 debug_stats
                                     .context_recoveries
                                     .fetch_add(1, Ordering::Relaxed);
-                                events.emit(RenderEvent::ContextRecovered {
-                                    success: true,
-                                });
+                                // Edge-triggered clear (single packed atomic):
+                                // `set_recovered` returns true only on the
+                                // true->false transition, atomically publishing
+                                // the new level+epoch so a `webglcontextrestored`
+                                // listener sees isContextLost()==false.
+                                if context_lost.set_recovered() {
+                                    events.emit(RenderEvent::ContextRecovered {
+                                        success: true,
+                                    });
+                                    if let Some(w) = wake.as_ref() {
+                                        w();
+                                    }
+                                }
                             }
                             Ok(false) => {
                                 // Not recovered: either no window handle yet, or
@@ -1819,15 +1971,21 @@ impl RenderThread {
                                 // report an honest failure (isContextLost() stays
                                 // true) rather than a false "recovered".
                                 warn!("EGL context recovery incomplete; context still lost");
-                                events.emit(RenderEvent::ContextRecovered {
-                                    success: false,
-                                });
+                                report_recovery_failure(
+                                    &context_lost,
+                                    &events,
+                                    &wake,
+                                    &mut last_recovery_fail_epoch,
+                                );
                             }
                             Err(re) => {
                                 warn!("EGL context recovery failed: {}", re);
-                                events.emit(RenderEvent::ContextRecovered {
-                                    success: false,
-                                });
+                                report_recovery_failure(
+                                    &context_lost,
+                                    &events,
+                                    &wake,
+                                    &mut last_recovery_fail_epoch,
+                                );
                             }
                         }
                     }
@@ -1850,6 +2008,14 @@ impl RenderThread {
                             }
 
                             // 2) Present frame and signal RAF.
+                            // If a surfaceDestroyed has occurred since our current
+                            // surface was handed off (live epoch moved past it),
+                            // stop presenting to it now — before Java returns and
+                            // Android abandons the BufferQueue — without waiting
+                            // for the async SurfaceDestroyed command.
+                            if destroy_epoch.load(std::sync::atomic::Ordering::Acquire) != valid_epoch.get() {
+                                surface_system.on_surface_destroyed();
+                            }
                             present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, surface_system.can_present(), ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
                         }
 
@@ -1899,6 +2065,9 @@ impl RenderThread {
                             }
 
                             // 2) Present frame and signal RAF.
+                            if destroy_epoch.load(std::sync::atomic::Ordering::Acquire) != valid_epoch.get() {
+                                surface_system.on_surface_destroyed();
+                            }
                             let should_present = decision.should_signal_raf && surface_system.can_present();
                             present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, should_present, decision.raf_time_ms, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
                         }

@@ -215,6 +215,15 @@ pub enum AudioCmd {
     /// Set gain value (fire-and-forget)
     SetGainValue { node_id: AudioNodeId, value: f32 },
 
+    /// Set an AudioParam's current value now, by node + param name (fire-and-forget).
+    /// Used for direct `param.value = x` writes on bound params; sets the intrinsic
+    /// value without inserting a timeline event.
+    SetNodeParam {
+        node_id: AudioNodeId,
+        param_name: String,
+        value: f32,
+    },
+
     // ==================== Graph ====================
     /// Connect two nodes
     Connect {

@@ -40,6 +40,7 @@ import { IIRFilterNode } from "ext:host_v8_audio/00_iir_filter_node.js";
 import { ScriptProcessorNode } from "ext:host_v8_audio/00_script_processor_node.js";
 import { PeriodicWave } from "ext:host_v8_audio/00_periodic_wave.js";
 import { AudioListener } from "ext:host_v8_audio/00_audio_listener.js";
+import { onHide, onShow } from "ext:host_v8_lifecycle/01_lifecycle.js";
 
 const CONTEXT_REGISTRY = new Map();
 const BUFFER_REGISTRY = new Map();
@@ -55,14 +56,80 @@ let nextNodeId = 1000;
 // needs to be internally unique.
 let nextContextId = 1;
 
+// PCM allocation limits - mirror of `audio::limits` (the Rust side is the
+// authoritative source of truth; native validates again). Kept here so invalid
+// createBuffer args fail synchronously with a clear error and never allocate.
+const MAX_AUDIO_PCM_BYTES = 512 * 1024 * 1024;
+const MAX_AUDIO_CHANNELS = 32;
+const MIN_SAMPLE_RATE = 3000;
+const MAX_SAMPLE_RATE = 768000;
+
+// While the app is hidden the audio thread is paused (OnHide -> PauseAll), so
+// native currentTime freezes. Freeze every context's JS clock to match, and
+// resume it on foreground, so scheduled start(when)/stop(when) stay aligned
+// with the native timeline across a background/foreground cycle. The
+// module-level flag also lets contexts CREATED while backgrounded start frozen.
+//
+// KNOWN LIMITATION: onHide/onShow are delivered only to the main JS runtime.
+// A Worker's AudioContext (non-standard - browsers keep WebAudio on the main
+// thread) therefore won't freeze on background, so its currentTime can drift
+// from the globally-paused native clock. Accepted as low-impact given how rare
+// worker WebAudio is; revisit with host->worker lifecycle forwarding or a
+// native-authoritative clock if it becomes a real use case.
+//
+// Audio interruptions (phone calls / focus loss) are intentionally NOT tied to
+// this freeze: the native audio thread keeps processing during an interruption
+// (the OS ducks/pauses the actual output), so currentTime stays consistent with
+// the native clock. Games pause/resume playback themselves via
+// onAudioInterruptionBegin/End if they want it to stop.
+let _appBackgrounded = false;
+onHide(() => {
+  _appBackgrounded = true;
+  for (const ctx of CONTEXT_REGISTRY.values()) ctx._setBackgrounded(true);
+});
+onShow(() => {
+  _appBackgrounded = false;
+  for (const ctx of CONTEXT_REGISTRY.values()) ctx._setBackgrounded(false);
+});
+
 class BaseAudioContext {
   #nativeId = null;
   #sampleRate;
   #destination = null;
   #state = "suspended";
+  // Clock bookkeeping so `currentTime` mirrors the native frame clock
+  // (frames_processed / sampleRate): it starts at 0 when the context is
+  // created and freezes whenever native processing stops - both on explicit
+  // suspend() and while the app is backgrounded (OnHide pauses the audio
+  // thread, freezing native frames_processed, without changing #state).
+  #clockEpoch = 0; // performance.now() (ms) at the start of the running segment
+  #accumulated = 0; // running seconds banked before the current segment
+  #backgrounded = false; // app hidden -> audio thread paused
+  #clockRunning = false; // whether the epoch is currently counting
 
   constructor(sampleRate) {
     this.#sampleRate = sampleRate;
+  }
+
+  // Recompute whether the clock should advance ((running state) AND (foreground))
+  // and bank/restart the epoch on any change, so `currentTime` stays aligned
+  // with native current_time across suspend/resume and background/foreground.
+  #reconcileClock() {
+    const shouldRun = this.#state === "running" && !this.#backgrounded;
+    if (shouldRun === this.#clockRunning) return;
+    const now = performance.now();
+    if (this.#clockRunning) {
+      this.#accumulated += (now - this.#clockEpoch) / 1000; // freezing: bank elapsed
+    } else {
+      this.#clockEpoch = now; // resuming: restart the epoch
+    }
+    this.#clockRunning = shouldRun;
+  }
+
+  /** Internal: freeze/resume the clock when the app is hidden/shown. */
+  _setBackgrounded(backgrounded) {
+    this.#backgrounded = !!backgrounded;
+    this.#reconcileClock();
   }
 
   // Synchronous: allocate the id in JS and fire the create command. It rides
@@ -73,7 +140,12 @@ class BaseAudioContext {
     this.#nativeId = nextContextId++;
     op_audio_create_context(this.#nativeId, sampleRate || 0);
     this.#destination = new AudioDestinationNode(this, 0, 2);
+    // Anchor the clock origin at creation, matching native frames_processed=0.
+    // If the app is already backgrounded, start frozen (native is paused).
+    this.#accumulated = 0;
+    this.#backgrounded = _appBackgrounded;
     this.#state = "running";
+    this.#reconcileClock(); // start counting only if running + foreground
     CONTEXT_REGISTRY.set(this.#nativeId, this);
   }
 
@@ -94,8 +166,12 @@ class BaseAudioContext {
   }
 
   get currentTime() {
-    // Use high-resolution timer
-    return performance.now() / 1000;
+    // Sample-frame clock (W3C): starts at 0 at creation, advances in real time
+    // while running in the foreground, freezes while suspended/closed/hidden.
+    if (this.#clockRunning) {
+      return this.#accumulated + (performance.now() - this.#clockEpoch) / 1000;
+    }
+    return this.#accumulated;
   }
 
   async decodeAudioData(audioData, successCallback, errorCallback) {
@@ -139,6 +215,31 @@ class BaseAudioContext {
   }
 
   async createBuffer(numberOfChannels, length, sampleRate) {
+    numberOfChannels = Math.trunc(numberOfChannels);
+    length = Math.trunc(length);
+    sampleRate = Math.trunc(sampleRate);
+
+    if (!Number.isFinite(numberOfChannels) || numberOfChannels < 1 || numberOfChannels > MAX_AUDIO_CHANNELS) {
+      throw new Error(
+        `createBuffer: numberOfChannels ${numberOfChannels} out of range [1, ${MAX_AUDIO_CHANNELS}]`
+      );
+    }
+    if (!Number.isFinite(length) || length < 1) {
+      throw new Error(`createBuffer: length must be a positive integer`);
+    }
+    if (!Number.isFinite(sampleRate) || sampleRate < MIN_SAMPLE_RATE || sampleRate > MAX_SAMPLE_RATE) {
+      throw new Error(
+        `createBuffer: sampleRate ${sampleRate} out of range [${MIN_SAMPLE_RATE}, ${MAX_SAMPLE_RATE}]`
+      );
+    }
+    // f32 PCM: length * channels * 4 bytes. Exact in f64 for any valid input.
+    const bytes = length * numberOfChannels * 4;
+    if (bytes > MAX_AUDIO_PCM_BYTES) {
+      throw new Error(
+        `createBuffer: ${bytes} bytes exceeds the PCM budget of ${MAX_AUDIO_PCM_BYTES}`
+      );
+    }
+
     const info = await op_audio_create_buffer(
       this.#nativeId,
       numberOfChannels,
@@ -172,6 +273,11 @@ class BaseAudioContext {
   }
 
   createDelay(maxDelayTime = 1.0) {
+    // Match the native 16MB per-node delay-buffer budget so delayTime.maxValue
+    // reflects what native will actually honor (native clamps too; assume stereo).
+    const MAX_DELAY_BYTES = 16 * 1024 * 1024;
+    const budgetSecs = MAX_DELAY_BYTES / (this.sampleRate * 2 * 4);
+    maxDelayTime = Math.min(Math.max(0.001, maxDelayTime), Math.min(180, budgetSecs));
     const nodeId = nextNodeId++;
     op_audio_create_delay(this.#nativeId, nodeId, maxDelayTime);
     return new DelayNode(this, nodeId, maxDelayTime);
@@ -226,9 +332,24 @@ class BaseAudioContext {
   }
 
   createIIRFilter(feedforward, feedback) {
+    // Accept any sequence<double> (incl. Float32Array/Float64Array), per Web Audio.
+    const ff = Array.from(feedforward ?? []);
+    const fb = Array.from(feedback ?? []);
+    if (ff.length === 0 || fb.length === 0) {
+      throw new Error("createIIRFilter: feedforward and feedback must be non-empty");
+    }
+    if (ff.length > 20 || fb.length > 20) {
+      throw new Error("createIIRFilter: coefficient arrays must have at most 20 elements");
+    }
+    if (fb[0] === 0) {
+      throw new Error("createIIRFilter: feedback[0] must not be zero");
+    }
+    if (!ff.every(Number.isFinite) || !fb.every(Number.isFinite)) {
+      throw new Error("createIIRFilter: coefficients must be finite numbers");
+    }
     const nodeId = nextNodeId++;
-    op_audio_create_iir_filter(this.#nativeId, nodeId, feedforward, feedback);
-    return new IIRFilterNode(this, nodeId, feedforward, feedback);
+    op_audio_create_iir_filter(this.#nativeId, nodeId, ff, fb);
+    return new IIRFilterNode(this, nodeId, ff, fb);
   }
 
   createScriptProcessor(bufferSize = 0, numberOfInputChannels = 2, numberOfOutputChannels = 2) {
@@ -251,7 +372,10 @@ class BaseAudioContext {
   }
 
   _setState(state) {
+    // Keep the sample-frame clock consistent across suspend/resume by
+    // recomputing the advancing predicate (see #reconcileClock).
     this.#state = state;
+    this.#reconcileClock();
   }
 
   _setSampleRate(rate) {
