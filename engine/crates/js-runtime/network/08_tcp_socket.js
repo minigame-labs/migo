@@ -7,6 +7,7 @@ import {
     op_tcp_connect, op_tcp_next_event, op_tcp_write, op_tcp_close,
 } from "ext:core/ops";
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { toExactArrayBuffer } from "ext:host_v8_network/00_binary.js";
 
 // -- TCPSocket class --
 
@@ -200,8 +201,9 @@ class TCPSocket {
 
             switch (event.type) {
                 case 'message': {
-                    // Convert the raw byte array to ArrayBuffer
-                    const buf = new Uint8Array(event.data).buffer;
+                    // event.data is an exact-length Uint8Array (external
+                    // backing); hand its buffer to the callback without a copy.
+                    const buf = toExactArrayBuffer(event.data);
                     this._fireMessage(
                         buf,
                         {

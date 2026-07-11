@@ -44,6 +44,7 @@ extension!(host_v8_network,
   ],
   esm = [
      dir "network",
+     "00_binary.js",
      "01_header.js",
      "02_response.js",
      "03_task.js",

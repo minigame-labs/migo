@@ -462,6 +462,184 @@ mod tests {
     }
 
     #[test]
+    fn inline_uniform_stream_auto_flushes_at_soft_budget_without_explicit_flush() {
+        use crate::rendering::webgl::frame_collector::AUTO_FLUSH_SOFT_BUDGET_BYTES;
+
+        let (mut runtime, render_rx) = new_webgl_runtime();
+
+        // Each inline `uniform4fv` (4 floats => <=16-word SmallVec, no spill)
+        // queues one GLCmd through the scalar/inline fast path, adding
+        // `size_of::<GLCmd>()` to the collector's pending-byte budget. Derive
+        // the count from the real constants (no magic numbers) so a single
+        // synchronous burst crosses the soft budget with no explicit flush.
+        let per_cmd = std::mem::size_of::<GLCmd>();
+        let count = AUTO_FLUSH_SOFT_BUDGET_BYTES / per_cmd + 2;
+
+        runtime
+            .exec_script(
+                "inline_uniform_autoflush.js",
+                &format!(
+                    r#"
+                    globalThis.__ctx = new WebGLRenderingContext({{ _rid: 21, width: 1, height: 1 }}, {{}});
+                    const loc = {{ id: 9 }};
+                    // Encode the submission index in each component. `i` is
+                    // exactly representable as f32 (i < 2^24, and count << that),
+                    // so the consumer can assert strict submission ORDER, not
+                    // merely count / no-loss.
+                    for (let i = 0; i < {count}; i++) {{
+                        globalThis.__ctx.uniform4fv(loc, [i, i, i, i]);
+                    }}
+                    // Intentionally NO flush() and NO frame end: untrusted JS can
+                    // enqueue this many inline uniforms synchronously in one turn.
+                    "#,
+                ),
+            )
+            .expect("inline uniform stream should be accepted");
+
+        // The burst crossed the soft budget, so an automatic non-presenting
+        // barrier FramePacket must already be queued BEFORE any explicit flush.
+        let first = match render_rx.try_recv() {
+            Ok(RenderCommand::FramePacket(packet)) => packet,
+            Ok(other) => panic!("unexpected render command: {other:?}"),
+            Err(_) => panic!(
+                "inline uniform burst crossed the {AUTO_FLUSH_SOFT_BUDGET_BYTES}-byte soft budget \
+                 but no automatic barrier FramePacket was emitted before an explicit flush"
+            ),
+        };
+        assert!(
+            !first.ops().iter().any(|op| matches!(op, FrameOp::Present)),
+            "auto-flush barrier must be non-presenting"
+        );
+
+        // Order survives the auto-flush boundary: flush the remainder, then
+        // consume the automatic packet followed by the explicit remainder. Each
+        // command must carry its strictly-increasing submission index — a lost,
+        // duplicated, or reordered command breaks the running counter.
+        runtime
+            .exec_script(
+                "inline_uniform_autoflush_drain.js",
+                "globalThis.__ctx.flush();",
+            )
+            .expect("explicit flush of the remainder should be accepted");
+
+        let mut expected = 0.0f32;
+        for packet in
+            std::iter::once(first).chain(std::iter::from_fn(|| match render_rx.try_recv() {
+                Ok(RenderCommand::FramePacket(p)) => Some(p),
+                _ => None,
+            }))
+        {
+            for op in packet.into_ops() {
+                if let FrameOp::GlBatch(payload) = op {
+                    for cmd in payload.commands {
+                        match cmd {
+                            GLCmd::Uniform4fv { value, .. } => {
+                                assert_eq!(
+                                    value.as_slice(),
+                                    &[expected, expected, expected, expected],
+                                    "uniforms must arrive in strict submission order across the \
+                                     auto-flush boundary"
+                                );
+                                expected += 1.0;
+                            }
+                            other => panic!("unexpected command across auto-flush: {other:?}"),
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            expected as usize, count,
+            "every queued uniform must survive the auto-flush boundary exactly once, in order"
+        );
+    }
+
+    #[test]
+    fn small_inline_uniform_sequence_does_not_auto_flush() {
+        let (mut runtime, render_rx) = new_webgl_runtime();
+        runtime
+            .exec_script(
+                "small_inline_uniform.js",
+                r#"
+                const ctx = new WebGLRenderingContext({ _rid: 22, width: 1, height: 1 }, {});
+                const loc = { id: 9 };
+                for (let i = 0; i < 8; i++) ctx.uniform4fv(loc, [1.0, 2.0, 3.0, 4.0]);
+                "#,
+            )
+            .expect("small uniform sequence should be accepted");
+        assert!(
+            render_rx.try_recv().is_err(),
+            "a small inline uniform sequence must not trigger an automatic flush"
+        );
+    }
+
+    // Characterization (Q5 review gap): a length-tracking `Float32Array` over a
+    // *resizable* `ArrayBuffer` is a legal uniform source, before AND after a
+    // grow. The op must copy at call time; a later mutate/`resize` must never
+    // change an already-queued command, and two calls from the same view must
+    // keep their respective call-time values and submission order. If the locked
+    // V8 rejects RAB construction the `.expect` below fails loudly and we would
+    // document RAB-unavailable instead of asserting fabricated behavior.
+    #[test]
+    fn resizable_arraybuffer_uniform_source_copies_at_call_time() {
+        let (mut runtime, render_rx) = new_webgl_runtime();
+        runtime
+            .exec_script(
+                "rab_uniform_call_time_copy.js",
+                r#"
+                const rab = new ArrayBuffer(16, { maxByteLength: 64 });
+                if (rab.resizable !== true) throw new Error("expected a resizable ArrayBuffer");
+                const view = new Float32Array(rab); // length-tracks the RAB (4 floats)
+                const ctx = new WebGLRenderingContext({ _rid: 23, width: 1, height: 1 }, {});
+
+                // Call 1: pre-grow 4-float view.
+                view.set([1.5, -2.25, 0.0, 7.75]);
+                ctx.uniform4fv({ id: 9 }, view);
+                view[0] = 99.0; // post-call mutation must not affect command 1
+
+                // Grow the backing; the length-tracking view now spans 16 floats.
+                rab.resize(64);
+                if (view.length !== 16) {
+                    throw new Error("length-tracking view must span 16 floats after grow, got " + view.length);
+                }
+
+                // Call 2: post-grow, same view, distinguishable 16-word payload
+                // (fills the inline SmallVec exactly, no spill).
+                for (let i = 0; i < 16; i++) view[i] = 100 + i;
+                ctx.uniform1fv({ id: 10 }, view);
+
+                // Post-call mutate + shrink must not affect command 2.
+                view[0] = -1.0;
+                rab.resize(16);
+                ctx.flush();
+                "#,
+            )
+            .expect("resizable ArrayBuffer uniform source should be accepted");
+
+        let commands = recv_gl_commands(&render_rx);
+        let mut it = commands.into_iter();
+
+        // Order + call-time values: command 1 is the pre-grow vec4.
+        let Some(GLCmd::Uniform4fv { value, .. }) = it.next() else {
+            panic!("expected Uniform4fv as the first command");
+        };
+        assert_eq!(value.as_slice(), &[1.5, -2.25, 0.0, 7.75]);
+
+        // Command 2 is the post-grow 16-word inline payload, unaffected by the
+        // later mutate + shrink.
+        let Some(GLCmd::Uniform1fv { value, .. }) = it.next() else {
+            panic!("expected Uniform1fv as the second command");
+        };
+        let expected: Vec<f32> = (0..16).map(|i| 100.0 + i as f32).collect();
+        assert_eq!(value.as_slice(), expected.as_slice());
+        assert!(
+            !value.spilled(),
+            "a 16-word post-grow uniform payload must stay inline"
+        );
+        assert!(it.next().is_none(), "exactly two GL commands expected");
+    }
+
+    #[test]
     fn webgl2_query_registry_matches_lifecycle_semantics() {
         let (mut runtime, _render_rx) = new_webgl_runtime();
         runtime
@@ -622,12 +800,21 @@ pub(crate) fn queue_gl_fire_and_forget(state: &mut OpState, cmd: GLCmd) {
         // byte estimate to decide when to forcibly commit.
         maybe_auto_flush(state);
     } else {
-        // Scalar fast path: accounted at `size_of::<GLCmd>()`,
-        // no auto-flush check.  Scalar commands alone never blow
-        // the soft budget - a bind/uniform storm of 100 000 calls
-        // at ~128 B enum size tops out around 12 MiB, and any
-        // frame holding that many GL ops is already pathological.
+        // Scalar/inline fast path.  `push_gl_fast` already maintained
+        // `pending_bytes` (adding `size_of::<GLCmd>()`), so we skip the
+        // `approx_deep_size_bytes` match here.  We still bound JS-side
+        // retained memory: untrusted code can synchronously enqueue tens of
+        // thousands of inline uniforms / binds in one turn (each
+        // ~`size_of::<GLCmd>()`), and such a storm CAN cross the 4 MiB soft
+        // budget.  The guard is a single field comparison on the borrow we
+        // already hold; only when it trips do we pay the `maybe_auto_flush`
+        // re-borrow + barrier dispatch, keeping the common per-command path
+        // free of the deep-size walk.
         collector.push_gl_fast(cmd);
+        let over_budget = collector.should_auto_flush();
+        if over_budget {
+            maybe_auto_flush(state);
+        }
     }
 }
 

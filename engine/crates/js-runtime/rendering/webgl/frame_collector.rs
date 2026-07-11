@@ -256,19 +256,20 @@ impl UnifiedFrameCollector {
     ///
     /// Scalar ops are the majority of a WebGL frame by count —
     /// Cocos/three.js emit hundreds per frame — and every byte of
-    /// overhead multiplies.  The fast path drops two pieces of
-    /// work versus `push_gl`:
+    /// overhead multiplies.  Versus `push_gl` this drops the heavy
+    /// per-command work while keeping the memory bound:
     ///
     /// 1. No `approx_deep_size_bytes()` match.  The enum base size
     ///    is a compile-time constant and the heap payload is known
     ///    to be zero, so we add `size_of::<GLCmd>()` directly.
-    /// 2. No auto-flush guard.  Only fat payloads
-    ///    (`BufferData` / `TexImage2D` / `ShaderSource`) can push
-    ///    the batch past the 4 MiB soft budget; scalar commands
-    ///    add at most ~128 B apiece, so it takes tens of thousands
-    ///    of them in a single frame to matter.  Callers that do
-    ///    produce that many still get the check on the next fat
-    ///    command or at frame flush.
+    /// 2. `push_gl_fast` itself never flushes — it only maintains
+    ///    `pending_bytes`.  The caller (`queue_gl_fire_and_forget`)
+    ///    performs a cheap `should_auto_flush()` field comparison
+    ///    right after this push and cuts a barrier when a
+    ///    scalar/inline-uniform storm crosses the 4 MiB soft budget.
+    ///    Untrusted code that synchronously enqueues tens of
+    ///    thousands of these (each ~`size_of::<GLCmd>()`) therefore
+    ///    cannot pin unbounded JS-side memory until frame end.
     ///
     /// Callers MUST uphold the precondition that the pushed
     /// variant carries no heap payload.  Passing a

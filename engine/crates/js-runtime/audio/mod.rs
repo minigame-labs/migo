@@ -55,10 +55,10 @@ use crate::audio::ops::{
     op_audio_set_buffer,
     op_audio_set_distance_model,
     op_audio_set_gain_value,
-    op_audio_set_node_param,
     // Phase 4: Global audio options ops
     op_audio_set_inner_audio_option,
     op_audio_set_loop,
+    op_audio_set_node_param,
     op_audio_set_oscillator_type,
     op_audio_set_panner_scalar,
     op_audio_set_panning_model,

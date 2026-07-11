@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use deno_core::AsyncRefCell;
@@ -21,6 +22,7 @@ use deno_core::OpState;
 use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ResourceId;
+use deno_core::ToJsBuffer;
 use deno_core::op2;
 use deno_error::JsErrorBox;
 use serde::Serialize;
@@ -29,20 +31,35 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
 
-use super::common::{BACKGROUND_THROTTLE, addr_family, checked_port, join_host_port, resolve_first};
+use super::common::{
+    AddrMeta, BACKGROUND_THROTTLE, ReceiveScratch, checked_port, join_host_port, resolve_first,
+};
 
 // ── Resource ──
 
+/// Max single TCP read (bytes). 64 KiB balances syscall overhead against the
+/// per-socket retained receive scratch; not reduced without a device A/B.
+const TCP_RECV_CAPACITY: usize = 65536;
+
+/// Read half + reusable 64 KiB receive scratch, kept together in one
+/// `AsyncRefCell` so concurrent `op_tcp_next_event` calls serialize on the same
+/// guard and a cancelled read drops it safely.
+struct TcpReceiveState {
+    reader: tokio::io::ReadHalf<TcpStream>,
+    scratch: ReceiveScratch,
+}
+
 /// Internal state for a connected TCP socket.
 ///
-/// Read and write halves are split via `tokio::io::split()` and wrapped
-/// in `AsyncRefCell` to satisfy deno_core's single-threaded async model.
+/// The read half + scratch live in one `AsyncRefCell` (`rx`); the write half is
+/// a separate `AsyncRefCell` so reads and writes don't block each other.
+/// Address metadata is formatted once at connect and cheaply cloned per event.
 pub struct TcpSocketResource {
-    reader: AsyncRefCell<tokio::io::ReadHalf<TcpStream>>,
+    rx: AsyncRefCell<TcpReceiveState>,
     writer: AsyncRefCell<tokio::io::WriteHalf<TcpStream>>,
     cancel: CancelHandle,
-    local_addr: SocketAddr,
-    remote_addr: SocketAddr,
+    local: AddrMeta,
+    remote: AddrMeta,
 }
 
 // Safety: the deno runtime is single-threaded; all access is via AsyncRefCell.
@@ -74,15 +91,16 @@ pub enum TcpEvent {
     /// Data received from the remote end.
     #[serde(rename = "message")]
     Message {
-        /// Raw bytes received.
-        data: Vec<u8>,
-        /// Remote address info.
-        remote_address: String,
-        remote_family: String,
+        /// Raw bytes received (external Uint8Array backing, exact length).
+        data: ToJsBuffer,
+        /// Remote address info (cached `Arc<str>`, cloned per event; serde's
+        /// `rc` feature serializes it as a plain JS string).
+        remote_address: Arc<str>,
+        remote_family: &'static str,
         remote_port: u16,
         /// Local address info.
-        local_address: String,
-        local_family: String,
+        local_address: Arc<str>,
+        local_family: &'static str,
         local_port: u16,
     },
     /// An error occurred on the socket.
@@ -100,11 +118,11 @@ pub enum TcpEvent {
 #[serde(rename_all = "camelCase")]
 pub struct TcpConnectResult {
     pub rid: ResourceId,
-    pub remote_address: String,
-    pub remote_family: String,
+    pub remote_address: Arc<str>,
+    pub remote_family: &'static str,
     pub remote_port: u16,
-    pub local_address: String,
-    pub local_family: String,
+    pub local_address: Arc<str>,
+    pub local_family: &'static str,
     pub local_port: u16,
 }
 
@@ -178,12 +196,20 @@ pub async fn op_tcp_connect(
 
     let (reader, writer) = tokio::io::split(stream);
 
+    // Format address metadata once at connect; events and the connect result
+    // clone the `Arc<str>` (refcount bump) instead of re-formatting per event.
+    let local = AddrMeta::new(&local_addr);
+    let remote = AddrMeta::new(&remote_addr);
+
     let resource = TcpSocketResource {
-        reader: AsyncRefCell::new(reader),
+        rx: AsyncRefCell::new(TcpReceiveState {
+            reader,
+            scratch: ReceiveScratch::new(TCP_RECV_CAPACITY),
+        }),
         writer: AsyncRefCell::new(writer),
         cancel: CancelHandle::default(),
-        local_addr,
-        remote_addr,
+        local: local.clone(),
+        remote: remote.clone(),
     };
 
     let rid = state.borrow_mut().resource_table.add(resource);
@@ -195,12 +221,12 @@ pub async fn op_tcp_connect(
 
     Ok(TcpConnectResult {
         rid,
-        remote_address: remote_addr.ip().to_string(),
-        remote_family: addr_family(&remote_addr),
-        remote_port: remote_addr.port(),
-        local_address: local_addr.ip().to_string(),
-        local_family: addr_family(&local_addr),
-        local_port: local_addr.port(),
+        remote_address: remote.address,
+        remote_family: remote.family,
+        remote_port: remote.port,
+        local_address: local.address,
+        local_family: local.family,
+        local_port: local.port,
     })
 }
 
@@ -227,8 +253,6 @@ pub async fn op_tcp_next_event(
     };
 
     let cancel = RcRef::map(&resource, |r| &r.cancel);
-    let local_addr = resource.local_addr;
-    let remote_addr = resource.remote_addr;
 
     let event = async {
         // Throttle polling when the app is in the background to save
@@ -237,25 +261,33 @@ pub async fn op_tcp_next_event(
             tokio::time::sleep(BACKGROUND_THROTTLE).await;
         }
 
-        let mut reader = RcRef::map(&resource, |r| &r.reader).borrow_mut().await;
+        // One `borrow_mut` over the reader+scratch receive state: concurrent
+        // `op_tcp_next_event` calls serialize on this guard, and a cancelled
+        // read drops it safely.
+        let mut rx = RcRef::map(&resource, |r| &r.rx).borrow_mut().await;
+        let rx = &mut *rx;
 
-        // 64 KB read buffer — balances memory usage vs syscall overhead.
-        let mut buf = vec![0u8; 65536];
+        // Read into the retained scratch. The disjoint field borrow lets the
+        // read fill `scratch` while holding `&mut reader`; both borrows end
+        // with this block so `scratch.copy_filled` can run afterward.
+        let read = {
+            let TcpReceiveState { reader, scratch } = rx;
+            reader.read(scratch.as_mut_slice()).await
+        };
 
-        match reader.read(&mut buf).await {
+        match read {
             Ok(0) => Ok::<TcpEvent, JsErrorBox>(TcpEvent::Close),
-            Ok(n) => {
-                buf.truncate(n);
-                Ok(TcpEvent::Message {
-                    data: buf,
-                    remote_address: remote_addr.ip().to_string(),
-                    remote_family: addr_family(&remote_addr),
-                    remote_port: remote_addr.port(),
-                    local_address: local_addr.ip().to_string(),
-                    local_family: addr_family(&local_addr),
-                    local_port: local_addr.port(),
-                })
-            }
+            // Copy exactly the filled prefix into an exact-length `Box<[u8]>`;
+            // no trailing zeros from an earlier, longer read leak through.
+            Ok(n) => Ok(TcpEvent::Message {
+                data: ToJsBuffer::from(rx.scratch.copy_filled(n)),
+                remote_address: resource.remote.address.clone(),
+                remote_family: resource.remote.family,
+                remote_port: resource.remote.port,
+                local_address: resource.local.address.clone(),
+                local_family: resource.local.family,
+                local_port: resource.local.port,
+            }),
             Err(e) => Ok(TcpEvent::Error {
                 err_msg: e.to_string(),
             }),
@@ -312,4 +344,63 @@ pub fn op_tcp_close(state: &mut OpState, #[smi] rid: ResourceId) -> Result<(), J
         .map_err(|_| JsErrorBox::generic("TCPSocket not found"))?;
     resource.close();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deno_core::{JsRuntime, RuntimeOptions, v8};
+
+    /// Real serde_v8/V8 regression (not just upstream serde_v8): a composite
+    /// TCP message envelope must serialize its `data` as a `Uint8Array` backed
+    /// by an exact-length external `ArrayBuffer` (offset 0, byteLength == n ==
+    /// backing length), with exact contents — including the 0-length case.
+    /// Fails on `Vec<u8>` (serde_v8 serializes it as a numeric `Array`).
+    #[test]
+    fn tcp_message_data_serializes_as_exact_uint8array() {
+        let mut rt = JsRuntime::new(RuntimeOptions::default());
+        let main_context = rt.main_context();
+        let isolate = rt.v8_isolate();
+        v8::scope_with_context!(scope, isolate, &main_context);
+
+        for bytes in [Vec::<u8>::new(), vec![1u8, 2, 3, 4, 255, 0, 7]] {
+            let n = bytes.len();
+            let event = TcpEvent::Message {
+                data: ToJsBuffer::from(bytes.clone().into_boxed_slice()),
+                remote_address: Arc::from("1.2.3.4"),
+                remote_family: "IPv4",
+                remote_port: 1234,
+                local_address: Arc::from("5.6.7.8"),
+                local_family: "IPv4",
+                local_port: 5678,
+            };
+
+            let v = deno_core::serde_v8::to_v8(scope, &event).expect("serialize TcpEvent");
+            let obj = v8::Local::<v8::Object>::try_from(v).expect("event serializes to an object");
+            let key: v8::Local<v8::Value> = v8::String::new(scope, "data").unwrap().into();
+            let data_val = obj.get(scope, key).expect("data field present");
+
+            assert!(
+                data_val.is_uint8_array(),
+                "TcpEvent data must serialize as a Uint8Array (external ArrayBuffer), not a \
+                 numeric Array, for n={n}"
+            );
+            let ta = v8::Local::<v8::Uint8Array>::try_from(data_val).unwrap();
+            assert_eq!(
+                ta.byte_offset(),
+                0,
+                "external buffer view must start at offset 0"
+            );
+            assert_eq!(ta.byte_length(), n, "view length must equal payload length");
+            let backing = ta.buffer(scope).expect("typed array has a backing buffer");
+            assert_eq!(
+                backing.byte_length(),
+                n,
+                "backing ArrayBuffer must be exact length (no slack)"
+            );
+            let mut out = vec![0u8; n];
+            assert_eq!(ta.copy_contents(&mut out), n);
+            assert_eq!(out, bytes, "exact contents preserved");
+        }
+    }
 }

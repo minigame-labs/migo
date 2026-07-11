@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use deno_core::AsyncRefCell;
@@ -21,6 +22,7 @@ use deno_core::OpState;
 use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ResourceId;
+use deno_core::ToJsBuffer;
 use deno_core::op2;
 use deno_error::JsErrorBox;
 use serde::Serialize;
@@ -28,15 +30,40 @@ use shared::op_state::HostOpState;
 use tokio::net::UdpSocket;
 use tracing::debug;
 
-use super::common::{BACKGROUND_THROTTLE, addr_family, checked_port, join_host_port, resolve_first};
+use super::common::{
+    AddrMeta, BACKGROUND_THROTTLE, ReceiveScratch, addr_family, checked_port, join_host_port,
+    resolve_first,
+};
 
 // -- Resource --
 
+/// Max single UDP recv (bytes). A datagram is delivered in one `recv_from` and
+/// bytes past the buffer end are silently dropped (no truncation flag), so this
+/// must hold the max UDP payload (65507 IPv4 / 65527 IPv6).
+const UDP_RECV_CAPACITY: usize = 65536;
+
+/// Receive-side state kept in its own `AsyncRefCell` so `op_udp_next_event`
+/// serializes on it (no two concurrent recvs race the scratch) while the
+/// `socket` stays shared for send/connect/set_ttl.
+struct UdpReceiveState {
+    scratch: ReceiveScratch,
+    /// Bounded single-entry last-peer cache: the remote-address `Arc<str>` is
+    /// reused only when the datagram's peer matches the cached one; a different
+    /// peer rebuilds and replaces it, so `remoteAddress` always reflects the
+    /// actual peer (never a stale value).
+    last_peer: Option<(SocketAddr, Arc<str>)>,
+}
+
 /// Internal state for a bound UDP socket.
+///
+/// `socket` stays shared (immutable `borrow`) for `recv_from`/`send_to`/
+/// `connect`/`set_ttl`; `rx` is a separate `AsyncRefCell` acquired only by
+/// `next_event`. Lock order is `rx → socket`, so there is no deadlock.
 pub struct UdpSocketResource {
     socket: AsyncRefCell<UdpSocket>,
+    rx: AsyncRefCell<UdpReceiveState>,
     cancel: CancelHandle,
-    local_addr: SocketAddr,
+    local: AddrMeta,
 }
 
 // Safety: the deno runtime is single-threaded; all access is via AsyncRefCell.
@@ -66,13 +93,14 @@ pub enum UdpEvent {
     /// Data received from a remote peer.
     #[serde(rename = "message")]
     Message {
-        data: Vec<u8>,
-        remote_address: String,
-        remote_family: String,
+        /// Raw bytes received (external Uint8Array backing, exact length).
+        data: ToJsBuffer,
+        remote_address: Arc<str>,
+        remote_family: &'static str,
         remote_port: u16,
         size: usize,
-        local_address: String,
-        local_family: String,
+        local_address: Arc<str>,
+        local_family: &'static str,
         local_port: u16,
     },
     /// An error occurred on the socket.
@@ -92,8 +120,8 @@ pub enum UdpEvent {
 pub struct UdpBindResult {
     pub rid: ResourceId,
     pub port: u16,
-    pub address: String,
-    pub family: String,
+    pub address: Arc<str>,
+    pub family: &'static str,
 }
 
 /// Bind a UDP socket to a local port (synchronous).
@@ -140,10 +168,17 @@ pub fn op_udp_bind(
         .local_addr()
         .map_err(|e| JsErrorBox::generic(format!("bind:fail {}", e)))?;
 
+    // Cache local address metadata once; events clone the `Arc<str>` per event.
+    let local = AddrMeta::new(&local_addr);
+
     let resource = UdpSocketResource {
         socket: AsyncRefCell::new(socket),
+        rx: AsyncRefCell::new(UdpReceiveState {
+            scratch: ReceiveScratch::new(UDP_RECV_CAPACITY),
+            last_peer: None,
+        }),
         cancel: CancelHandle::default(),
-        local_addr,
+        local: local.clone(),
     };
 
     let rid = state.borrow_mut().resource_table.add(resource);
@@ -152,9 +187,9 @@ pub fn op_udp_bind(
 
     Ok(UdpBindResult {
         rid,
-        port: local_addr.port(),
-        address: local_addr.ip().to_string(),
-        family: addr_family(&local_addr),
+        port: local.port,
+        address: local.address,
+        family: local.family,
     })
 }
 
@@ -334,7 +369,6 @@ pub async fn op_udp_next_event(
     };
 
     let cancel = RcRef::map(&resource, |r| &r.cancel);
-    let local_addr = resource.local_addr;
 
     let event = async {
         // Throttle polling when the app is in the background to save
@@ -343,27 +377,36 @@ pub async fn op_udp_next_event(
             tokio::time::sleep(BACKGROUND_THROTTLE).await;
         }
 
-        let socket = RcRef::map(&resource, |r| &r.socket).borrow().await;
+        // Lock order `rx → socket`: take the receive state exclusively (so two
+        // concurrent `next_event` calls can't race the scratch), then the
+        // shared socket borrow. `rx` is only ever acquired here, so this never
+        // deadlocks with `send`/`connect`/`set_ttl` (which take only `socket`).
+        let mut rx = RcRef::map(&resource, |r| &r.rx).borrow_mut().await;
+        let rx = &mut *rx;
 
-        // A single recv must be able to hold a whole datagram: the
-        // kernel delivers a UDP datagram in one recv and silently
-        // discards any bytes past the buffer end (no truncation flag on
-        // a plain recv_from). The max UDP payload is 65507 (IPv4) /
-        // 65527 (IPv6), so size the buffer to 64 KiB to never lose data.
-        let mut buf = vec![0u8; 65536];
+        // A single recv must hold a whole datagram: the kernel delivers a UDP
+        // datagram in one recv and silently discards any bytes past the buffer
+        // end. The scratch is sized to 64 KiB (>= max UDP payload) so no data
+        // is lost, and is reused across recvs instead of reallocated per event.
+        let recv = {
+            let socket = RcRef::map(&resource, |r| &r.socket).borrow().await;
+            socket.recv_from(rx.scratch.as_mut_slice()).await
+        };
 
-        match socket.recv_from(&mut buf).await {
+        match recv {
             Ok((n, peer)) => {
-                buf.truncate(n);
+                // Copy exactly the filled prefix; datagram boundaries preserved.
+                let data = ToJsBuffer::from(rx.scratch.copy_filled(n));
+                let remote_address = udp_peer_address(&mut rx.last_peer, peer);
                 Ok::<UdpEvent, JsErrorBox>(UdpEvent::Message {
                     size: n,
-                    data: buf,
-                    remote_address: peer.ip().to_string(),
+                    data,
+                    remote_address,
                     remote_family: addr_family(&peer),
                     remote_port: peer.port(),
-                    local_address: local_addr.ip().to_string(),
-                    local_family: addr_family(&local_addr),
-                    local_port: local_addr.port(),
+                    local_address: resource.local.address.clone(),
+                    local_family: resource.local.family,
+                    local_port: resource.local.port,
                 })
             }
             Err(e) => Ok(UdpEvent::Error {
@@ -373,6 +416,21 @@ pub async fn op_udp_next_event(
     };
 
     event.try_or_cancel(cancel).await
+}
+
+/// Return the remote-address string for `peer`, reusing the cached `Arc<str>`
+/// when the peer is unchanged and rebuilding (replacing) it when the peer
+/// differs. Single entry and bounded, so `remoteAddress` always reflects the
+/// actual datagram peer — never a stale value.
+fn udp_peer_address(cache: &mut Option<(SocketAddr, Arc<str>)>, peer: SocketAddr) -> Arc<str> {
+    if let Some((cached_peer, cached_addr)) = cache.as_ref() {
+        if *cached_peer == peer {
+            return cached_addr.clone();
+        }
+    }
+    let addr: Arc<str> = Arc::from(peer.ip().to_string());
+    *cache = Some((peer, addr.clone()));
+    addr
 }
 
 // -- op_udp_close --
@@ -417,7 +475,9 @@ fn udp_send_range(
 
 #[cfg(test)]
 mod tests {
-    use super::udp_send_range;
+    use super::{udp_peer_address, udp_send_range};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
 
     #[test]
     fn length_zero_means_offset_to_end() {
@@ -453,5 +513,32 @@ mod tests {
     #[test]
     fn rejects_overflowing_length_without_panicking() {
         assert_eq!(udp_send_range(10, 4, usize::MAX), Err("length overflow"));
+    }
+
+    #[test]
+    fn udp_peer_cache_reuses_same_peer_and_rebuilds_on_change() {
+        let a: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+        let b: SocketAddr = "9.8.7.6:6000".parse().unwrap();
+        let mut cache: Option<(SocketAddr, Arc<str>)> = None;
+
+        // First datagram from peer A: builds and caches.
+        let first = udp_peer_address(&mut cache, a);
+        assert_eq!(&*first, "1.2.3.4");
+
+        // Same peer A: reuses the identical Arc allocation (refcount bump).
+        let again = udp_peer_address(&mut cache, a);
+        assert_eq!(&*again, "1.2.3.4");
+        assert!(Arc::ptr_eq(&first, &again));
+
+        // Different peer B: rebuilds, and the event reflects the ACTUAL peer,
+        // never a stale cached value.
+        let other = udp_peer_address(&mut cache, b);
+        assert_eq!(&*other, "9.8.7.6");
+        assert!(!Arc::ptr_eq(&first, &other));
+
+        // Single-entry cache: A was evicted, so it rebuilds (new allocation).
+        let a_third = udp_peer_address(&mut cache, a);
+        assert_eq!(&*a_third, "1.2.3.4");
+        assert!(!Arc::ptr_eq(&first, &a_third));
     }
 }

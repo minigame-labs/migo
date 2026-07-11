@@ -29,7 +29,15 @@ use std::{
 };
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+
+// The snapshot-input fingerprint helpers are shared verbatim with the
+// regression test (`tests_snapshot_fingerprint.rs`) so the compile-time embed
+// decision and the test agree byte-for-byte. They also mirror
+// `scripts/lib/snapshot-fingerprint.sh` (filesystem walk + LC_ALL=C byte order).
+mod build_snapshot {
+    include!("build_snapshot.rs");
+}
+use build_snapshot::{collect_js_files, sha256_file, snapshot_js_hash};
 
 fn main() {
     // Declare custom cfg for check-cfg lint.
@@ -50,19 +58,27 @@ fn main() {
         .join(format!("SNAPSHOT-{target_arch}.bin"));
     let snapshot_manifest = PathBuf::from(format!("{}.manifest.json", snapshot_path.display()));
 
-    let mut js_files = Vec::new();
-    if let Err(error) = collect_js_files(manifest_dir, &mut js_files) {
-        println!("cargo:warning=Failed to enumerate snapshot JS inputs: {error}");
-    }
-    js_files.sort();
-
     // Re-run if the snapshot or any input covered by its fingerprint changes.
     // Watching the directory recursively also catches newly-added JS files;
-    // the per-file entries keep ordinary content changes explicit.
+    // the per-file entries below keep ordinary content changes explicit.
     println!("cargo:rerun-if-changed={}", manifest_dir.display());
     println!("cargo:rerun-if-changed={}", snapshot_path.display());
     println!("cargo:rerun-if-changed={}", snapshot_manifest.display());
     println!("cargo:rerun-if-changed={}", cargo_lock.display());
+
+    // Enumerate extension JS. On ANY error, fail safe: a partial set could
+    // hash-match a stale manifest and wrongly accept an outdated snapshot, so
+    // never validate/embed here — load JS from source instead. The directory
+    // watch above still re-triggers the build once the tree is readable again.
+    let js_files = match collect_js_files(manifest_dir) {
+        Ok(files) => files,
+        Err(error) => {
+            println!(
+                "cargo:warning=Failed to enumerate snapshot JS inputs: {error}; loading JS from source"
+            );
+            return;
+        }
+    };
     for path in &js_files {
         println!("cargo:rerun-if-changed={}", path.display());
     }
@@ -107,20 +123,6 @@ fn main() {
             snapshot_path.display()
         );
     }
-}
-
-fn collect_js_files(dir: &Path, output: &mut Vec<PathBuf>) -> Result<(), std::io::Error> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            collect_js_files(&path, output)?;
-        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "js") {
-            output.push(path);
-        }
-    }
-    Ok(())
 }
 
 fn validate_snapshot(
@@ -190,35 +192,6 @@ fn require_equal_hash(kind: &str, expected: &str, actual: &str) -> Result<(), St
             &actual[..actual.len().min(12)],
         ))
     }
-}
-
-fn snapshot_js_hash(repo_root: &Path, js_files: &[PathBuf]) -> Result<String, String> {
-    let mut outer = Sha256::new();
-    for path in js_files {
-        let relative = path
-            .strip_prefix(repo_root)
-            .map_err(|error| format!("JS path {} is outside repo: {error}", path.display()))?;
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        let file_hash = sha256_file(path)
-            .map_err(|error| format!("cannot hash JS {}: {error}", path.display()))?;
-        outer.update(format!("{file_hash}  {relative}\n").as_bytes());
-    }
-    Ok(hex_digest(outer.finalize().as_slice()))
-}
-
-fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
-    let bytes = fs::read(path)?;
-    Ok(hex_digest(Sha256::digest(bytes).as_slice()))
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 fn deno_core_version(cargo_lock: &Path) -> Result<String, String> {

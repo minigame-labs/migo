@@ -147,9 +147,13 @@ pub use host_runtime::SharedMountTableRef;
 pub use host_runtime::V8LimitsConfig;
 
 #[cfg(test)]
+mod tests_binary_helper;
+#[cfg(test)]
 mod tests_global_surface;
 #[cfg(test)]
 mod tests_prelude;
+#[cfg(test)]
+mod tests_snapshot_fingerprint;
 #[cfg(test)]
 mod tests_timers;
 #[cfg(test)]

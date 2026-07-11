@@ -1106,7 +1106,9 @@ fn dispatch_destroy_images(
     if image_ids.is_empty() {
         return;
     }
-    if let Err(e) = tx.dispatch(RenderCommand::Canvas(CanvasCmd::DestroyImages { image_ids })) {
+    if let Err(e) = tx.dispatch(RenderCommand::Canvas(CanvasCmd::DestroyImages {
+        image_ids,
+    })) {
         warn!("{context}: DestroyImages dispatch failed (textures may leak): {e}");
     }
 }

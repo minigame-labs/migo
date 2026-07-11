@@ -870,7 +870,11 @@ pub fn op_audio_create_iir_filter(
     if feedback[0] == 0.0 {
         return Err(audio_err("createIIRFilter: feedback[0] must not be zero"));
     }
-    if feedforward.iter().chain(feedback.iter()).any(|v| !v.is_finite()) {
+    if feedforward
+        .iter()
+        .chain(feedback.iter())
+        .any(|v| !v.is_finite())
+    {
         return Err(audio_err("createIIRFilter: coefficients must be finite"));
     }
 

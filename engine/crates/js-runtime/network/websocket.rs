@@ -11,6 +11,7 @@ use deno_core::OpState;
 use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ResourceId;
+use deno_core::ToJsBuffer;
 use deno_core::op2;
 use deno_error::JsErrorBox;
 use futures::stream::{SplitSink, SplitStream};
@@ -96,8 +97,9 @@ pub enum WsEvent {
     Message {
         #[serde(skip_serializing_if = "Option::is_none")]
         data_str: Option<String>,
+        /// Binary payload as an external exact-length Uint8Array backing.
         #[serde(skip_serializing_if = "Option::is_none")]
-        data_bin: Option<Vec<u8>>,
+        data_bin: Option<ToJsBuffer>,
         is_binary: bool,
     },
     #[serde(rename = "error")]
@@ -249,8 +251,9 @@ pub async fn op_ws_create(
             }
         }
     }
-    let tcp_stream = tcp_stream
-        .ok_or_else(|| JsErrorBox::generic(format!("WebSocket TCP connect failed: {}", last_err)))?;
+    let tcp_stream = tcp_stream.ok_or_else(|| {
+        JsErrorBox::generic(format!("WebSocket TCP connect failed: {}", last_err))
+    })?;
     let _ = tcp_stream.set_nodelay(true);
 
     // Explicit WebSocket limits: tungstenite's defaults are 64 MiB
@@ -346,9 +349,12 @@ pub async fn op_ws_next_event(
                     });
                 }
                 Some(Ok(Message::Binary(data))) => {
+                    // `Vec::<u8>::from(Bytes)` transfers the allocation when the
+                    // `Bytes` is uniquely owned and full-length, and copies
+                    // otherwise — opportunistic, not guaranteed zero-copy.
                     return Ok(WsEvent::Message {
                         data_str: None,
-                        data_bin: Some(data.to_vec()),
+                        data_bin: Some(ToJsBuffer::from(Vec::<u8>::from(data))),
                         is_binary: true,
                     });
                 }
@@ -437,4 +443,183 @@ pub async fn op_ws_close(
     tx.send(Message::Close(Some(close_frame)))
         .await
         .map_err(|e| JsErrorBox::generic(format!("WebSocket close failed: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use deno_core::{JsRuntime, RuntimeOptions, v8};
+
+    /// Real serde_v8/V8 regression for the WebSocket event envelope, covering
+    /// the `Option<ToJsBuffer>` + `skip_serializing_if` path the TCP direct-field
+    /// test does not exercise. A binary message serializes `dataBin` as an exact
+    /// external `Uint8Array` and OMITS `dataStr`; a text message serializes
+    /// `dataStr` and OMITS `dataBin` -- so the JS-visible event shape stays
+    /// compatible with the `event.isBinary ? dataBin : dataStr` branch.
+    #[test]
+    fn ws_message_binary_and_text_serialize_with_correct_shape() {
+        let mut rt = JsRuntime::new(RuntimeOptions::default());
+        let main_context = rt.main_context();
+        let isolate = rt.v8_isolate();
+        v8::scope_with_context!(scope, isolate, &main_context);
+
+        // Binary: empty and non-empty payloads. `dataBin` must be an exact
+        // external Uint8Array (offset 0, view == backing == n) and `dataStr`
+        // must be omitted (skip_serializing_if on None).
+        for bytes in [Vec::<u8>::new(), vec![9u8, 8, 7, 0, 255, 1]] {
+            let n = bytes.len();
+            let event = WsEvent::Message {
+                data_str: None,
+                data_bin: Some(ToJsBuffer::from(bytes.clone().into_boxed_slice())),
+                is_binary: true,
+            };
+            let v = deno_core::serde_v8::to_v8(scope, &event).expect("serialize WsEvent");
+            let obj = v8::Local::<v8::Object>::try_from(v).expect("event serializes to an object");
+
+            let type_key: v8::Local<v8::Value> = v8::String::new(scope, "type").unwrap().into();
+            assert_eq!(
+                obj.get(scope, type_key)
+                    .unwrap()
+                    .to_rust_string_lossy(scope),
+                "message"
+            );
+
+            let is_binary_key: v8::Local<v8::Value> =
+                v8::String::new(scope, "isBinary").unwrap().into();
+            assert!(
+                obj.get(scope, is_binary_key).unwrap().is_true(),
+                "isBinary must be true for a binary message (n={n})"
+            );
+
+            let data_bin_key: v8::Local<v8::Value> =
+                v8::String::new(scope, "dataBin").unwrap().into();
+            let data_bin = obj.get(scope, data_bin_key).unwrap();
+            assert!(
+                data_bin.is_uint8_array(),
+                "dataBin must be a Uint8Array (n={n})"
+            );
+            let ta = v8::Local::<v8::Uint8Array>::try_from(data_bin).unwrap();
+            assert_eq!(ta.byte_offset(), 0, "view must start at offset 0 (n={n})");
+            assert_eq!(ta.byte_length(), n, "view length must equal payload length");
+            let backing = ta.buffer(scope).expect("typed array has a backing buffer");
+            assert_eq!(
+                backing.byte_length(),
+                n,
+                "backing ArrayBuffer must be exact length"
+            );
+            let mut out = vec![0u8; n];
+            assert_eq!(ta.copy_contents(&mut out), n);
+            assert_eq!(out, bytes, "exact contents preserved (n={n})");
+
+            let data_str_key: v8::Local<v8::Value> =
+                v8::String::new(scope, "dataStr").unwrap().into();
+            assert!(
+                obj.get(scope, data_str_key).unwrap().is_undefined(),
+                "dataStr must be omitted for a binary message (n={n})"
+            );
+        }
+
+        // Text: `dataStr` present, `dataBin` omitted (skip_serializing_if).
+        let event = WsEvent::Message {
+            data_str: Some("hello".to_string()),
+            data_bin: None,
+            is_binary: false,
+        };
+        let v = deno_core::serde_v8::to_v8(scope, &event).expect("serialize WsEvent");
+        let obj = v8::Local::<v8::Object>::try_from(v).expect("event serializes to an object");
+
+        let type_key: v8::Local<v8::Value> = v8::String::new(scope, "type").unwrap().into();
+        assert_eq!(
+            obj.get(scope, type_key)
+                .unwrap()
+                .to_rust_string_lossy(scope),
+            "message"
+        );
+
+        let is_binary_key: v8::Local<v8::Value> =
+            v8::String::new(scope, "isBinary").unwrap().into();
+        assert!(
+            obj.get(scope, is_binary_key).unwrap().is_false(),
+            "isBinary must be false for a text message"
+        );
+
+        let data_str_key: v8::Local<v8::Value> = v8::String::new(scope, "dataStr").unwrap().into();
+        let data_str = obj.get(scope, data_str_key).unwrap();
+        assert!(
+            data_str.is_string(),
+            "dataStr must be present for a text message"
+        );
+        assert_eq!(data_str.to_rust_string_lossy(scope), "hello");
+
+        let data_bin_key: v8::Local<v8::Value> = v8::String::new(scope, "dataBin").unwrap().into();
+        assert!(
+            obj.get(scope, data_bin_key).unwrap().is_undefined(),
+            "dataBin must be omitted for a text message"
+        );
+    }
+
+    /// Characterization for the locked `bytes` 1.11 conversion used by
+    /// `op_ws_next_event`'s Binary branch: `Vec::<u8>::from(Bytes)`.
+    ///
+    /// A uniquely-owned, full-length `Bytes` reclaims its original allocation
+    /// (pointer transfer, no copy). Contents are always exact; the pointer
+    /// equality documents the current opportunistic-transfer behavior so a
+    /// future `bytes` upgrade that regresses it trips this test.
+    #[test]
+    fn ws_binary_unique_full_bytes_transfers_allocation() {
+        let original = vec![1u8, 2, 3, 4, 255, 0, 7];
+        let orig_ptr = original.as_ptr();
+
+        let data = Bytes::from(original);
+        let out = Vec::<u8>::from(data);
+
+        assert_eq!(out, [1u8, 2, 3, 4, 255, 0, 7], "exact contents preserved");
+        assert_eq!(
+            out.as_ptr(),
+            orig_ptr,
+            "a unique full Bytes should transfer its allocation, not copy"
+        );
+    }
+
+    /// The transfer is opportunistic, not guaranteed: a shared `Bytes` (an
+    /// outstanding clone) cannot reclaim, so it copies. Contents stay exact,
+    /// and the copy is confirmed by the resulting `Vec` pointer differing from
+    /// the still-shared backing. A sliced `Bytes` (non-zero offset) likewise
+    /// copies to its exact slice contents.
+    #[test]
+    fn ws_binary_shared_bytes_copies_but_preserves_contents() {
+        let data = Bytes::from(vec![9u8, 9, 9]);
+        // Keep a clone alive so the backing stays shared (refcount > 1) across
+        // the conversion; its pointer is the shared backing address.
+        let keep_alive = data.clone();
+        let backing_ptr = keep_alive.as_ptr();
+
+        let out = Vec::<u8>::from(data);
+
+        assert_eq!(
+            out,
+            [9u8, 9, 9],
+            "exact contents preserved on the copy path"
+        );
+        assert_ne!(
+            out.as_ptr(),
+            backing_ptr,
+            "a shared Bytes must copy, not transfer, while a clone is alive"
+        );
+        // Hold the clone past the pointer comparison so the shared backing is
+        // not freed/reused underneath the address check.
+        assert_eq!(&keep_alive[..], &[9u8, 9, 9]);
+
+        // A sliced Bytes (sub-window at a non-zero offset) also cannot reclaim
+        // the original allocation, so it copies to its exact slice contents.
+        let full = Bytes::from(vec![10u8, 11, 12, 13, 14]);
+        let sliced = full.slice(1..4);
+        let out_sliced = Vec::<u8>::from(sliced);
+        assert_eq!(
+            out_sliced,
+            [11u8, 12, 13],
+            "sliced Bytes yields exact slice contents on the copy path"
+        );
+    }
 }

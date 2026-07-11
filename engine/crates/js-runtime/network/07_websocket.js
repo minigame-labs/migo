@@ -3,6 +3,7 @@ import {
     op_ws_create, op_ws_next_event, op_ws_send, op_ws_close,
 } from "ext:core/ops";
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import { toExactArrayBuffer } from "ext:host_v8_network/00_binary.js";
 
 // -- SocketTask --
 
@@ -138,7 +139,9 @@ async function _pollEvents(task) {
         switch (event.type) {
             case "message":
                 if (event.isBinary) {
-                    const buf = new Uint8Array(event.dataBin).buffer;
+                    // event.dataBin is an exact-length Uint8Array (external
+                    // backing); hand its buffer to the callback without a copy.
+                    const buf = toExactArrayBuffer(event.dataBin);
                     task._fireMessage(buf);
                 } else {
                     task._fireMessage(event.dataStr);
