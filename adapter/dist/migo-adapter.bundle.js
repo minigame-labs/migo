@@ -12,13 +12,14 @@
     }
     return { windowWidth: 0, windowHeight: 0, screenWidth: 0, screenHeight: 0, pixelRatio: 1 };
   })();
-  var innerWidth = _info.windowWidth || _info.screenWidth || 0;
-  var innerHeight = _info.windowHeight || _info.screenHeight || 0;
+  var _dpr = _info.pixelRatio || 1;
+  var devicePixelRatio = 1;
+  var innerWidth = Math.round((_info.windowWidth || _info.screenWidth || 0) * _dpr);
+  var innerHeight = Math.round((_info.windowHeight || _info.screenHeight || 0) * _dpr);
   var outerWidth = innerWidth;
   var outerHeight = innerHeight;
-  var screenWidth = _info.screenWidth || innerWidth;
-  var screenHeight = _info.screenHeight || innerHeight;
-  var devicePixelRatio = _info.pixelRatio || 1;
+  var screenWidth = Math.round((_info.screenWidth || _info.windowWidth || 0) * _dpr);
+  var screenHeight = Math.round((_info.screenHeight || _info.windowHeight || 0) * _dpr);
   var screen = {
     width: screenWidth,
     height: screenHeight,
@@ -290,6 +291,12 @@
   }
 
   // src/audio.js
+  var _audioFinalizer = typeof FinalizationRegistry === "function" ? new FinalizationRegistry((ctx) => {
+    try {
+      if (ctx && typeof ctx.destroy === "function") ctx.destroy();
+    } catch (_) {
+    }
+  }) : null;
   var Audio = class _Audio extends EventTarget {
     constructor(src) {
       super();
@@ -298,15 +305,34 @@
       }
       this._ctx = migo.createInnerAudioContext();
       this._readyState = 0;
-      const dispatchSelf = (type) => () => {
-        if (type === "canplay") this._readyState = 4;
-        this.dispatchEvent({ type });
-      };
-      this._ctx.onCanplay && this._ctx.onCanplay(dispatchSelf("canplay"));
-      this._ctx.onPlay && this._ctx.onPlay(dispatchSelf("play"));
-      this._ctx.onPause && this._ctx.onPause(dispatchSelf("pause"));
-      this._ctx.onEnded && this._ctx.onEnded(dispatchSelf("ended"));
-      this._ctx.onError && this._ctx.onError((err) => this.dispatchEvent({ type: "error", error: err }));
+      if (typeof WeakRef === "function") {
+        const selfRef = new WeakRef(this);
+        const dispatchSelf = (type) => () => {
+          const self = selfRef.deref();
+          if (!self) return;
+          if (type === "canplay") self._readyState = 4;
+          self.dispatchEvent({ type });
+        };
+        this._ctx.onCanplay && this._ctx.onCanplay(dispatchSelf("canplay"));
+        this._ctx.onPlay && this._ctx.onPlay(dispatchSelf("play"));
+        this._ctx.onPause && this._ctx.onPause(dispatchSelf("pause"));
+        this._ctx.onEnded && this._ctx.onEnded(dispatchSelf("ended"));
+        this._ctx.onError && this._ctx.onError((err) => {
+          const self = selfRef.deref();
+          if (self) self.dispatchEvent({ type: "error", error: err });
+        });
+      } else {
+        const dispatchSelf = (type) => () => {
+          if (type === "canplay") this._readyState = 4;
+          this.dispatchEvent({ type });
+        };
+        this._ctx.onCanplay && this._ctx.onCanplay(dispatchSelf("canplay"));
+        this._ctx.onPlay && this._ctx.onPlay(dispatchSelf("play"));
+        this._ctx.onPause && this._ctx.onPause(dispatchSelf("pause"));
+        this._ctx.onEnded && this._ctx.onEnded(dispatchSelf("ended"));
+        this._ctx.onError && this._ctx.onError((err) => this.dispatchEvent({ type: "error", error: err }));
+      }
+      if (_audioFinalizer) _audioFinalizer.register(this, this._ctx, this);
       if (src) this.src = src;
     }
     set src(v) {
@@ -359,6 +385,12 @@
     // no-op — InnerAudioContext loads on src set / play
     cloneNode() {
       return new _Audio(this.src);
+    }
+    // Not a standard HTMLMediaElement method, but exposed so callers can release
+    // the native context deterministically instead of waiting for GC.
+    destroy() {
+      if (_audioFinalizer) _audioFinalizer.unregister(this);
+      if (this._ctx && typeof this._ctx.destroy === "function") this._ctx.destroy();
     }
   };
 
