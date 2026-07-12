@@ -1034,20 +1034,47 @@ impl CanvasManager {
             }
             (dbw, dbh)
         } else {
-            match drawing_buffer::create(&self.gl, physical_w, physical_h) {
+            // Default the fresh onscreen backing store to LOGICAL (CSS) pixels
+            // (surface / devicePixelRatio), not the physical surface size, to
+            // match browser/wx canvas semantics. A DPR-naive engine (Pixi/Phaser
+            // created with resolution = 1) sizes its GL viewport to the logical
+            // window size; with a logical-sized backing it fills the buffer and
+            // the swap-time blit upscales it to the physical surface (exactly how
+            // a browser CSS-scales a logical canvas to fill the display), instead
+            // of rendering into a corner of an over-sized physical buffer. A
+            // DPR-aware engine (e.g. Cocos) that sets canvas.width = logical*dpr
+            // resizes the DrawingBuffer back to the physical size via
+            // `resize_canvas`, which re-enables the direct-to-surface bypass for
+            // crisp native-resolution rendering. Making the *default* logical also
+            // keeps it stable across the multiple surfaceChanged events fired
+            // during startup layout (each fresh buffer is logical, not physical),
+            // so a logical-sized game no longer races back to a corner.
+            let (def_w, def_h) = if self.dpi > 1.0 {
+                (
+                    ((physical_w as f32 / self.dpi).round() as u32).max(1),
+                    ((physical_h as f32 / self.dpi).round() as u32).max(1),
+                )
+            } else {
+                (physical_w, physical_h)
+            };
+            match drawing_buffer::create(&self.gl, def_w, def_h) {
                 Ok(db) => {
                     if let Some(entry) = self.canvases.get_mut(&id) {
+                        entry.info.width = def_w;
+                        entry.info.height = def_h;
                         entry.drawing_buffer = Some(db);
                     }
+                    (def_w, def_h)
                 }
                 Err(e) => {
                     tracing::error!(
                         "DrawingBuffer creation failed, rendering direct to surface: {e}"
                     );
-                    // Fallback: render directly to window surface (legacy behavior).
+                    // Fallback: render directly to the window surface at its
+                    // physical size (legacy behaviour; no scaling blit).
+                    (physical_w, physical_h)
                 }
             }
-            (physical_w, physical_h)
         };
         self.evaluate_bypass();
 
