@@ -1,8 +1,10 @@
 use deno_core::extension;
 
 mod context2d;
+pub(crate) mod decode;
 mod font;
 pub(crate) mod frame_collector;
+pub(crate) mod gl_stream;
 mod raf;
 mod webgl;
 
@@ -285,9 +287,11 @@ extension!(host_v8_webgl,
         op_tex_image_3d,
         op_tex_sub_image_3d,
         op_tex_storage_3d,
+        op_gl_submit_stream,
     ],
     esm = [
         dir "rendering/webgl",
+        "00_gl_command_stream.js",
         "01_constants.js",
         "02_2d_context.js",
         "02_webgl_context.js",

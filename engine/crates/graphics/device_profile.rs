@@ -56,6 +56,7 @@ mod tests {
             has_compute: false,
             ahb_available: false,
             has_buffer_age: false,
+            has_ext_buffer_age: false,
             has_partial_update: false,
             compressed_format_support: crate::compressed_upload::CompressedFormatSupport {
                 etc2: false,
@@ -77,6 +78,7 @@ mod tests {
             has_compute: false,
             ahb_available: false,
             has_buffer_age: false,
+            has_ext_buffer_age: false,
             has_partial_update: false,
             compressed_format_support: crate::compressed_upload::CompressedFormatSupport {
                 etc2: true,
@@ -101,6 +103,7 @@ mod tests {
             has_compute: false,
             ahb_available: false,
             has_buffer_age: false,
+            has_ext_buffer_age: false,
             has_partial_update: false,
             compressed_format_support: crate::compressed_upload::CompressedFormatSupport {
                 etc2: false,

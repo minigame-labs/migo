@@ -185,6 +185,7 @@ mod tests {
             has_compute: false,
             ahb_available: ahb,
             has_buffer_age: false,
+            has_ext_buffer_age: false,
             has_partial_update: false,
             compressed_format_support: CompressedFormatSupport {
                 etc2: false,

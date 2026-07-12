@@ -174,9 +174,233 @@ const {
     DataViewPrototypeGetByteLength,
     DataViewPrototypeGetByteOffset,
     ArrayBufferPrototypeGetByteLength,
+    ReflectApply,
 } = primordials;
 
 import { WebglConstants } from "./01_constants.js";
+import {
+    flushGlCommandStream,
+    encodeViewport,
+    encodeClear,
+    encodeClearColor,
+    encodeClearDepth,
+    encodeClearStencil,
+    encodeEnable,
+    encodeDisable,
+    encodeUseProgram,
+    encodeBindBuffer,
+    encodeBindTexture,
+    encodeActiveTexture,
+    encodeBindFramebuffer,
+    encodeBindRenderbuffer,
+    encodeBindVertexArray,
+    encodeBindSampler,
+    encodeEnableVertexAttribArray,
+    encodeDisableVertexAttribArray,
+    encodeVertexAttribPointer,
+    encodeVertexAttribDivisor,
+    encodeBlendFunc,
+    encodeBlendFuncSeparate,
+    encodeBlendEquation,
+    encodeBlendEquationSeparate,
+    encodeBlendColor,
+    encodeDepthFunc,
+    encodeDepthMask,
+    encodeDepthRange,
+    encodeStencilFunc,
+    encodeStencilFuncSeparate,
+    encodeStencilOp,
+    encodeStencilOpSeparate,
+    encodeStencilMask,
+    encodeStencilMaskSeparate,
+    encodeCullFace,
+    encodeFrontFace,
+    encodeColorMask,
+    encodeScissor,
+    encodeLineWidth,
+    encodePolygonOffset,
+    encodeTexParameteri,
+    encodeTexParameterf,
+    encodeGenerateMipmap,
+    encodePixelStorei,
+    encodeHint,
+    encodeSamplerParameteri,
+    encodeSamplerParameterf,
+    encodeDrawArrays,
+    encodeDrawElements,
+    encodeDrawArraysInstanced,
+    encodeDrawElementsInstanced,
+    encodeBindBufferBase,
+    encodeBindBufferRange,
+    encodeReadBuffer,
+    encodeUniform1i,
+    encodeUniform1f,
+    encodeUniform2f,
+    encodeUniform3f,
+    encodeUniform4f,
+    encodeUniform1iv,
+    encodeUniform1fv,
+    encodeUniform2iv,
+    encodeUniform2fv,
+    encodeUniform3iv,
+    encodeUniform3fv,
+    encodeUniform4iv,
+    encodeUniform4fv,
+    encodeUniformMatrix2fv,
+    encodeUniformMatrix3fv,
+    encodeUniformMatrix4fv,
+} from "./00_gl_command_stream.js";
+
+// -- Ordered-raw op wrappers --
+// Built once at module init. Each wrapper: flush pending stream, then dispatch.
+// rest-args are ONLY on this raw path; the hot encode path has no rest allocations.
+//
+// Direct / no-submit ops (call without flush):
+//   op_alloc_gl_resource_id, op_gl_is_context_lost, op_webgl_get_context_attributes,
+//   op_webgl_record_attributes, op_webgl_query_compressed_caps.
+//
+// All others: orderedRaw(op) -> flushGlCommandStream() then ReflectApply.
+
+function _makeOrderedRaw(op) {
+    // Capture op reference at init time so game code cannot replace it.
+    return function orderedRawOp(...args) {
+        flushGlCommandStream();
+        return ReflectApply(op, undefined, args);
+    };
+}
+
+const _rawGlFlush            = _makeOrderedRaw(op_gl_flush);
+const _rawClearColor         = _makeOrderedRaw(op_clear_color);
+const _rawEnable             = _makeOrderedRaw(op_enable);
+const _rawDisable            = _makeOrderedRaw(op_disable);
+const _rawGlLoseContext      = _makeOrderedRaw(op_gl_lose_context);
+const _rawCreateProgram      = _makeOrderedRaw(op_create_program);
+const _rawUseProgram         = _makeOrderedRaw(op_use_program);
+const _rawLinkProgram        = _makeOrderedRaw(op_link_program);
+const _rawGetProgramParameter= _makeOrderedRaw(op_get_program_parameter);
+const _rawGetProgramInfoLog  = _makeOrderedRaw(op_get_program_info_log);
+const _rawDeleteProgram      = _makeOrderedRaw(op_delete_program);
+const _rawCreateShader       = _makeOrderedRaw(op_create_shader);
+const _rawShaderSource       = _makeOrderedRaw(op_shader_source);
+const _rawCompileShader      = _makeOrderedRaw(op_compile_shader);
+const _rawAttachShader       = _makeOrderedRaw(op_attach_shader);
+const _rawGetShaderParameter = _makeOrderedRaw(op_get_shader_parameter);
+const _rawGetShaderInfoLog   = _makeOrderedRaw(op_get_shader_info_log);
+const _rawDeleteShader       = _makeOrderedRaw(op_delete_shader);
+const _rawDrawArrays         = _makeOrderedRaw(op_draw_arrays);
+const _rawDrawElements       = _makeOrderedRaw(op_draw_elements);
+const _rawGetAttribLocation  = _makeOrderedRaw(op_get_attrib_location);
+const _rawBindAttribLocation = _makeOrderedRaw(op_bind_attrib_location);
+const _rawGetActiveAttrib    = _makeOrderedRaw(op_get_active_attrib);
+const _rawGetActiveUniform   = _makeOrderedRaw(op_get_active_uniform);
+const _rawEnableVertexAttribArray = _makeOrderedRaw(op_enable_vertex_attrib_array);
+const _rawCreateBuffer       = _makeOrderedRaw(op_create_buffer);
+const _rawBindBuffer         = _makeOrderedRaw(op_bind_buffer);
+const _rawBufferData         = _makeOrderedRaw(op_buffer_data);
+const _rawGetUniformLocation = _makeOrderedRaw(op_get_uniform_location);
+const _rawGetParameter       = _makeOrderedRaw(op_get_parameter);
+const _rawIsEnabled          = _makeOrderedRaw(op_is_enabled);
+const _rawCreateTexture      = _makeOrderedRaw(op_create_texture);
+const _rawDeleteTexture      = _makeOrderedRaw(op_delete_texture);
+const _rawTexImage2D         = _makeOrderedRaw(op_tex_image_2d);
+const _rawTexImage2DFromImage= _makeOrderedRaw(op_tex_image_2d_from_image);
+const _rawTexImage2DFromSnapshot = _makeOrderedRaw(op_tex_image_2d_from_snapshot);
+const _rawTexImage2DFromCanvas2d = _makeOrderedRaw(op_tex_image_2d_from_canvas2d);
+const _rawTexImage2DFromTextCache= _makeOrderedRaw(op_tex_image_2d_from_text_cache);
+const _rawTexSubImage2DFromSnapshot= _makeOrderedRaw(op_tex_sub_image_2d_from_snapshot);
+const _rawTexSubImage2DFromCanvas2d= _makeOrderedRaw(op_tex_sub_image_2d_from_canvas2d);
+const _rawTexSubImage2D      = _makeOrderedRaw(op_tex_sub_image_2d);
+const _rawTexSubImage2DFromImage= _makeOrderedRaw(op_tex_sub_image_2d_from_image);
+const _rawTexParameteri      = _makeOrderedRaw(op_tex_parameteri);
+const _rawTexParameterf      = _makeOrderedRaw(op_tex_parameterf);
+const _rawGenerateMipmap     = _makeOrderedRaw(op_generate_mipmap);
+const _rawPixelStorei        = _makeOrderedRaw(op_pixel_storei);
+const _rawCompressedTexImage2D = _makeOrderedRaw(op_compressed_tex_image_2d);
+const _rawCompressedTexSubImage2D= _makeOrderedRaw(op_compressed_tex_sub_image_2d);
+const _rawBufferSubData      = _makeOrderedRaw(op_buffer_sub_data);
+const _rawDisableVertexAttribArray= _makeOrderedRaw(op_disable_vertex_attrib_array);
+const _rawClearDepth         = _makeOrderedRaw(op_clear_depth);
+const _rawClearStencil       = _makeOrderedRaw(op_clear_stencil);
+const _rawBlendFunc          = _makeOrderedRaw(op_blend_func);
+const _rawBlendFuncSeparate  = _makeOrderedRaw(op_blend_func_separate);
+const _rawBlendEquation      = _makeOrderedRaw(op_blend_equation);
+const _rawBlendEquationSeparate= _makeOrderedRaw(op_blend_equation_separate);
+const _rawBlendColor         = _makeOrderedRaw(op_blend_color);
+const _rawDepthFunc          = _makeOrderedRaw(op_depth_func);
+const _rawDepthRange         = _makeOrderedRaw(op_depth_range);
+const _rawStencilFunc        = _makeOrderedRaw(op_stencil_func);
+const _rawStencilFuncSeparate= _makeOrderedRaw(op_stencil_func_separate);
+const _rawStencilOp          = _makeOrderedRaw(op_stencil_op);
+const _rawStencilOpSeparate  = _makeOrderedRaw(op_stencil_op_separate);
+const _rawStencilMask        = _makeOrderedRaw(op_stencil_mask);
+const _rawStencilMaskSeparate= _makeOrderedRaw(op_stencil_mask_separate);
+const _rawCullFace           = _makeOrderedRaw(op_cull_face);
+const _rawFrontFace          = _makeOrderedRaw(op_front_face);
+const _rawScissor            = _makeOrderedRaw(op_scissor);
+const _rawLineWidth          = _makeOrderedRaw(op_line_width);
+const _rawPolygonOffset      = _makeOrderedRaw(op_polygon_offset);
+const _rawUniform1iv         = _makeOrderedRaw(op_uniform1iv);
+const _rawUniform1fv         = _makeOrderedRaw(op_uniform1fv);
+const _rawUniform2iv         = _makeOrderedRaw(op_uniform2iv);
+const _rawUniform2fv         = _makeOrderedRaw(op_uniform2fv);
+const _rawUniform3iv         = _makeOrderedRaw(op_uniform3iv);
+const _rawUniform3fv         = _makeOrderedRaw(op_uniform3fv);
+const _rawUniform4iv         = _makeOrderedRaw(op_uniform4iv);
+const _rawUniform4fv         = _makeOrderedRaw(op_uniform4fv);
+const _rawHint               = _makeOrderedRaw(op_hint);
+const _rawReadPixels         = _makeOrderedRaw(op_read_pixels);
+const _rawCreateFramebuffer  = _makeOrderedRaw(op_create_framebuffer);
+const _rawDeleteFramebuffer  = _makeOrderedRaw(op_delete_framebuffer);
+const _rawBindFramebuffer    = _makeOrderedRaw(op_bind_framebuffer);
+const _rawFramebufferTexture2D= _makeOrderedRaw(op_framebuffer_texture_2d);
+const _rawFramebufferRenderbuffer= _makeOrderedRaw(op_framebuffer_renderbuffer);
+const _rawCheckFramebufferStatus= _makeOrderedRaw(op_check_framebuffer_status);
+const _rawCreateRenderbuffer = _makeOrderedRaw(op_create_renderbuffer);
+const _rawDeleteRenderbuffer = _makeOrderedRaw(op_delete_renderbuffer);
+const _rawBindRenderbuffer   = _makeOrderedRaw(op_bind_renderbuffer);
+const _rawRenderbufferStorage= _makeOrderedRaw(op_renderbuffer_storage);
+// WebGL2 ordered raw ops
+const _rawCreateVertexArray  = _makeOrderedRaw(op_create_vertex_array);
+const _rawDeleteVertexArray  = _makeOrderedRaw(op_delete_vertex_array);
+const _rawBindVertexArray    = _makeOrderedRaw(op_bind_vertex_array);
+const _rawVertexAttribDivisor= _makeOrderedRaw(op_vertex_attrib_divisor);
+const _rawDrawArraysInstanced= _makeOrderedRaw(op_draw_arrays_instanced);
+const _rawDrawElementsInstanced= _makeOrderedRaw(op_draw_elements_instanced);
+const _rawGetUniformBlockIndex= _makeOrderedRaw(op_get_uniform_block_index);
+const _rawUniformBlockBinding= _makeOrderedRaw(op_uniform_block_binding);
+const _rawBindBufferBase     = _makeOrderedRaw(op_bind_buffer_base);
+const _rawBindBufferRange    = _makeOrderedRaw(op_bind_buffer_range);
+const _rawTexStorage2D       = _makeOrderedRaw(op_tex_storage_2d);
+const _rawBlitFramebuffer    = _makeOrderedRaw(op_blit_framebuffer);
+const _rawInvalidateFramebuffer= _makeOrderedRaw(op_invalidate_framebuffer);
+const _rawRenderbufferStorageMultisample= _makeOrderedRaw(op_renderbuffer_storage_multisample);
+const _rawCreateSampler      = _makeOrderedRaw(op_create_sampler);
+const _rawDeleteSampler      = _makeOrderedRaw(op_delete_sampler);
+const _rawBindSampler        = _makeOrderedRaw(op_bind_sampler);
+const _rawSamplerParameteri  = _makeOrderedRaw(op_sampler_parameteri);
+const _rawSamplerParameterf  = _makeOrderedRaw(op_sampler_parameterf);
+const _rawFenceSync          = _makeOrderedRaw(op_fence_sync);
+const _rawDeleteSync         = _makeOrderedRaw(op_delete_sync);
+const _rawClientWaitSync     = _makeOrderedRaw(op_client_wait_sync);
+const _rawDrawBuffers        = _makeOrderedRaw(op_draw_buffers);
+const _rawReadBuffer         = _makeOrderedRaw(op_read_buffer);
+const _rawCreateQuery        = _makeOrderedRaw(op_create_query);
+const _rawDeleteQuery        = _makeOrderedRaw(op_delete_query);
+const _rawBeginQuery         = _makeOrderedRaw(op_begin_query);
+const _rawEndQuery           = _makeOrderedRaw(op_end_query);
+const _rawGetQueryParameter  = _makeOrderedRaw(op_get_query_parameter);
+const _rawCreateTransformFeedback= _makeOrderedRaw(op_create_transform_feedback);
+const _rawDeleteTransformFeedback= _makeOrderedRaw(op_delete_transform_feedback);
+const _rawBindTransformFeedback= _makeOrderedRaw(op_bind_transform_feedback);
+const _rawBeginTransformFeedback= _makeOrderedRaw(op_begin_transform_feedback);
+const _rawEndTransformFeedback= _makeOrderedRaw(op_end_transform_feedback);
+const _rawPauseTransformFeedback= _makeOrderedRaw(op_pause_transform_feedback);
+const _rawResumeTransformFeedback= _makeOrderedRaw(op_resume_transform_feedback);
+const _rawTransformFeedbackVaryings= _makeOrderedRaw(op_transform_feedback_varyings);
+const _rawGetTransformFeedbackVarying= _makeOrderedRaw(op_get_transform_feedback_varying);
+const _rawTexImage3D         = _makeOrderedRaw(op_tex_image_3d);
+const _rawTexSubImage3D      = _makeOrderedRaw(op_tex_sub_image_3d);
+const _rawTexStorage3D       = _makeOrderedRaw(op_tex_storage_3d);
 
 const GL_CURRENT_QUERY = 0x8865;
 const GL_INVALID_OPERATION = 0x0502;
@@ -312,7 +536,7 @@ function _migoTexImageFromTextCache(canvasId, target, level, internalformat, src
     if (!src || typeof src !== "object") return false;
     const k = src.__migo_text_cache_key__;
     if (!k) return false;
-    op_tex_image_2d_from_text_cache(
+    _rawTexImage2DFromTextCache(
         canvasId,
         target,
         level,
@@ -485,15 +709,34 @@ class WebGLRenderingContext {
     }
 
     viewport(x, y, width, height) {
+        // Encodability: all 4 are i32/u32. Check typeof number before x|0/>>>0.
+        if (typeof x === "number" && typeof y === "number" &&
+            typeof width === "number" && typeof height === "number") {
+            encodeViewport(this._canvasId, x | 0, y | 0, width >>> 0, height >>> 0);
+            return;
+        }
+        // Raw fallback: flush pending stream then call original op.
+        flushGlCommandStream();
         op_viewport(this._canvasId, x, y, width, height);
     }
 
     clearColor(r, g, b, a) {
-        return op_clear_color(this._canvasId, r, g, b, a);
+        if (typeof r === "number" && typeof g === "number" &&
+            typeof b === "number" && typeof a === "number") {
+            encodeClearColor(this._canvasId, r, g, b, a);
+            return;
+        }
+        _rawClearColor(this._canvasId, r, g, b, a);
     }
 
     clear(mask) {
-        return op_clear(this._canvasId, mask);
+        // u32: check number.
+        if (typeof mask === "number") {
+            encodeClear(this._canvasId, mask >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        op_clear(this._canvasId, mask);
     }
 
     // WebGL `flush()` forces queued commands to begin execution;
@@ -506,27 +749,35 @@ class WebGLRenderingContext {
     // flush satisfies.  Defining these is required: without them onShow
     // throws "finish is not a function" and the resume listener chain aborts.
     flush() {
-        op_gl_flush();
+        _rawGlFlush();
     }
 
     finish() {
-        op_gl_flush();
+        _rawGlFlush();
     }
 
     createProgram() {
         const id = nextResourceId();
-        op_create_program(this._canvasId, id);
+        // op_create_program: ordered raw (not in encoded set).
+        _rawCreateProgram(this._canvasId, id);
         return new WebglObject(id);
     }
 
     useProgram(program) {
         this._programBinding = program || null;
-        return op_use_program(this._canvasId, program?.id);
+        const programId = program?.id ?? 0;
+        // useProgram: opcode 8, H C U. programId is u32.
+        if (typeof programId === "number") {
+            encodeUseProgram(this._canvasId, programId >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawUseProgram(this._canvasId, program?.id);
     }
 
     linkProgram(program) {
         const programId = program?.id;
-        op_link_program(programId);
+        _rawLinkProgram(programId);
         if (programId !== undefined) {
             // Linking can change active attrib/uniform locations and link status.
             this._invalidateProgramCaches(programId);
@@ -553,7 +804,7 @@ class WebGLRenderingContext {
             inner = new Map();
             this._programParameterCache.set(programId, inner);
         }
-        const param = op_get_program_parameter(programId, pname);
+        const param = _rawGetProgramParameter(programId, pname);
         inner.set(pname, param);
         if (
             pname === WebglConstants.DELETE_STATUS ||
@@ -566,12 +817,12 @@ class WebGLRenderingContext {
     }
 
     getProgramInfoLog(program) {
-        return op_get_program_info_log(program?.id);
+        return _rawGetProgramInfoLog(program?.id);
     }
 
     deleteProgram(program) {
         const programId = program?.id;
-        op_delete_program(programId);
+        _rawDeleteProgram(programId);
         if (programId !== undefined) {
             this._invalidateProgramCaches(programId);
         }
@@ -579,16 +830,16 @@ class WebGLRenderingContext {
 
     createShader(type) {
         const id = nextResourceId();
-        op_create_shader(this._canvasId, id, type);
+        _rawCreateShader(this._canvasId, id, type);
         return new WebglObject(id);
     }
 
     shaderSource(shader, src) {
-        return op_shader_source(shader?.id, src);
+        return _rawShaderSource(shader?.id, src);
     }
 
     compileShader(shader) {
-        op_compile_shader(shader?.id);
+        _rawCompileShader(shader?.id);
     }
 
     getShaderParameter(shader, pname) {
@@ -604,11 +855,11 @@ class WebGLRenderingContext {
                 inner = new Map();
                 this._shaderParameterCache.set(shaderId, inner);
             }
-            const val = op_get_shader_parameter(shaderId, pname);
+            const val = _rawGetShaderParameter(shaderId, pname);
             inner.set(pname, val);
             return val;
         }
-        const ret = op_get_shader_parameter(shaderId, pname);
+        const ret = _rawGetShaderParameter(shaderId, pname);
         if (pname === WebglConstants.COMPILE_STATUS || pname === WebglConstants.DELETE_STATUS) {
             return Boolean(ret);
         }
@@ -616,45 +867,52 @@ class WebGLRenderingContext {
     }
 
     attachShader(program, shader) {
-        return op_attach_shader(program?.id, shader?.id);
+        return _rawAttachShader(program?.id, shader?.id);
     }
 
     getShaderInfoLog(shader) {
-        return op_get_shader_info_log(shader?.id);
+        return _rawGetShaderInfoLog(shader?.id);
     }
 
     deleteShader(shader) {
         const shaderId = shader?.id;
-        op_delete_shader(shaderId);
+        _rawDeleteShader(shaderId);
         if (shaderId !== undefined) {
             this._shaderParameterCache.delete(shaderId);
         }
     }
 
     drawArrays(mode, first, count) {
-        return op_draw_arrays(this._canvasId, mode, first, count);
+        // opcode 47: H C U I I. mode is u32, first/count are i32.
+        if (typeof mode === "number" && typeof first === "number" && typeof count === "number") {
+            encodeDrawArrays(this._canvasId, mode >>> 0, first | 0, count | 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawDrawArrays(this._canvasId, mode, first, count);
     }
 
     drawElements(mode, count, type, offset) {
-        return op_draw_elements(this._canvasId, mode, count, type, offset);
+        // opcode 48: H C U I U I. mode/type are u32, count/offset are i32.
+        if (typeof mode === "number" && typeof count === "number" &&
+            typeof type === "number" && typeof offset === "number") {
+            encodeDrawElements(this._canvasId, mode >>> 0, count | 0, type >>> 0, offset | 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawDrawElements(this._canvasId, mode, count, type, offset);
     }
 
     bindAttribLocation(program, index, name) {
         const programId = program?.id;
         if (programId === undefined) return;
-        op_bind_attrib_location(programId, index >>> 0, name);
+        _rawBindAttribLocation(programId, index >>> 0, name);
         // Locations only change on the next link; drop any cached lookups.
         this._attribLocationCache.delete(programId);
     }
 
     isContextLost() {
-        // Reflects the authoritative render-context state: the render thread
-        // sets/clears the shared `context_lost` atomic the instant it loses or
-        // recovers the context, so this is always accurate (and independent of
-        // the lossy render-event channel). The matching `webglcontextlost` /
-        // `webglcontextrestored` events ARE dispatched on the main canvas (see
-        // dispatchWebglContextEvent + Host::reconcile_context_lost); games may
-        // either listen for those events or poll this.
+        // Direct, no submit: op_gl_is_context_lost is host-local.
         return op_gl_is_context_lost();
     }
 
@@ -679,7 +937,7 @@ class WebGLRenderingContext {
             inner = new Map();
             this._attribLocationCache.set(programId, inner);
         }
-        const location = op_get_attrib_location(this._canvasId, programId, name);
+        const location = _rawGetAttribLocation(this._canvasId, programId, name);
         inner.set(name, location);
         return location;
     }
@@ -687,7 +945,7 @@ class WebGLRenderingContext {
     getActiveAttrib(program, index) {
         const programId = program?.id;
         if (programId === undefined) return null;
-        const json = op_get_active_attrib(this._canvasId, programId, index >>> 0);
+        const json = _rawGetActiveAttrib(this._canvasId, programId, index >>> 0);
         if (!json) return null;
         try { return JSON.parse(json); } catch (_) { return null; }
     }
@@ -695,17 +953,40 @@ class WebGLRenderingContext {
     getActiveUniform(program, index) {
         const programId = program?.id;
         if (programId === undefined) return null;
-        const json = op_get_active_uniform(this._canvasId, programId, index >>> 0);
+        const json = _rawGetActiveUniform(this._canvasId, programId, index >>> 0);
         if (!json) return null;
         try { return JSON.parse(json); } catch (_) { return null; }
     }
 
     enableVertexAttribArray(index) {
-        return op_enable_vertex_attrib_array(this._canvasId, index);
+        // opcode 16: H C U. index is u32.
+        if (typeof index === "number") {
+            encodeEnableVertexAttribArray(this._canvasId, index >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawEnableVertexAttribArray(this._canvasId, index);
     }
 
     vertexAttribPointer(index, size, type, normalized, stride, offset) {
-        return op_vertex_attrib_pointer(
+        // opcode 18: H C U I U B I I.
+        // index/type are u32, size/stride/offset are i32, normalized is bool.
+        if (typeof index === "number" && typeof size === "number" &&
+            typeof type === "number" && typeof normalized === "boolean" &&
+            typeof stride === "number" && typeof offset === "number") {
+            encodeVertexAttribPointer(
+                this._canvasId,
+                index >>> 0,
+                size | 0,
+                type >>> 0,
+                normalized,
+                stride | 0,
+                offset | 0,
+            );
+            return;
+        }
+        flushGlCommandStream();
+        op_vertex_attrib_pointer(
             this._canvasId,
             index,
             size,
@@ -718,7 +999,7 @@ class WebGLRenderingContext {
 
     createBuffer() {
         const id = nextResourceId();
-        op_create_buffer(this._canvasId, id);
+        _rawCreateBuffer(this._canvasId, id);
         return new WebglObject(id);
     }
 
@@ -726,17 +1007,23 @@ class WebGLRenderingContext {
         const buf = buffer || null;
         if (target === 0x8892) this._arrayBufferBinding = buf; // ARRAY_BUFFER
         else if (target === 0x8893) this._elementArrayBufferBinding = buf; // ELEMENT_ARRAY_BUFFER
-        // use -1 to indicate unbinding
-        return op_bind_buffer(this._canvasId, target, buffer?.id || -1);
+        const bufferId = buffer?.id ?? -1;
+        // opcode 9: H C U I. target is u32, bufferId is i32 (negative = unbind).
+        if (typeof target === "number" && typeof bufferId === "number") {
+            encodeBindBuffer(this._canvasId, target >>> 0, bufferId | 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawBindBuffer(this._canvasId, target, buffer?.id || -1);
     }
 
     bufferData(target, srcOrSize, usage) {
         if (typeof srcOrSize === "number") {
             const size = srcOrSize >>> 0;
-            return op_buffer_data(this._canvasId, target, size, null, usage);
+            return _rawBufferData(this._canvasId, target, size, null, usage);
         } else {
             const u8 = toUnit8Array(srcOrSize);
-            return op_buffer_data(this._canvasId, target, -1, u8, usage);
+            return _rawBufferData(this._canvasId, target, -1, u8, usage);
         }
     }
 
@@ -751,7 +1038,7 @@ class WebGLRenderingContext {
             inner = new Map();
             this._uniformLocationCache.set(programId, inner);
         }
-        const id = op_get_uniform_location(this._canvasId, programId, name);
+        const id = _rawGetUniformLocation(this._canvasId, programId, name);
         if (id < 0) {
             inner.set(name, null);
             return null;
@@ -762,25 +1049,47 @@ class WebGLRenderingContext {
     }
 
     uniform3f(location, x, y, z) {
-        op_uniform3f(this._canvasId, _loc(location), +x, +y, +z);
+        // opcode 57: H C I F F F. location is i32, x/y/z are f32.
+        // All f32 values are encodable. Check location is a number (or null -> -1).
+        const loc = _loc(location);
+        encodeUniform3f(this._canvasId, loc, +x, +y, +z);
     }
 
     uniformMatrix3fv(location, transpose, value) {
-        op_uniform_matrix_3fv(this._canvasId, _loc(location), transpose, toFloat32AsUint32(value));
+        const loc = _loc(location);
+        const payload = toFloat32AsUint32(value);
+        if (typeof transpose !== "boolean" ||
+            !encodeUniformMatrix3fv(this._canvasId, loc, transpose, payload)) {
+            // Payload > 512 words: flush pending stream, then call raw op.
+            flushGlCommandStream();
+            op_uniform_matrix_3fv(this._canvasId, loc, transpose, payload);
+        }
     }
 
     // -- Phase 1A: GL State --
 
     enable(cap) {
-        op_enable(this._canvasId, cap);
+        // opcode 6: H C U.
+        if (typeof cap === "number") {
+            encodeEnable(this._canvasId, cap >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawEnable(this._canvasId, cap);
     }
 
     disable(cap) {
-        op_disable(this._canvasId, cap);
+        // opcode 7: H C U.
+        if (typeof cap === "number") {
+            encodeDisable(this._canvasId, cap >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawDisable(this._canvasId, cap);
     }
 
     isEnabled(cap) {
-        return Boolean(op_is_enabled(this._canvasId, cap));
+        return Boolean(_rawIsEnabled(this._canvasId, cap));
     }
 
     getParameter(pname) {
@@ -796,36 +1105,29 @@ class WebGLRenderingContext {
             case 0x8ca7: return this._renderbufferBinding; // RENDERBUFFER_BINDING
             default: break;
         }
-        const json = op_get_parameter(this._canvasId, pname);
+        const json = _rawGetParameter(this._canvasId, pname);
         if (!json) return null;
         try { return JSON.parse(json); } catch (_) { return null; }
     }
 
     getError() {
+        // CRITICAL (design s8, s2): flush the stream FIRST, unconditionally,
+        // so that pending stream records are decoded and their validators push
+        // any errors into the host queue BEFORE we observe the error state.
+        // This must happen even when _jsErrorQueue is non-empty, because a
+        // later getError() call needs to find the stream-produced host errors.
+        flushGlCommandStream();
+        // JS-queue priority: return JS errors before host errors (two-level
+        // queue semantics per WebGL 1.0 spec s5.14.3).
         if (this._jsErrorQueue.length > 0) {
             return this._jsErrorQueue.shift();
         }
-        // Drain one entry from the host-side per-context WebGL
-        // error queue.  Returns `NO_ERROR (0)` when empty.  Any
-        // validator op that detects an illegal enum / value /
-        // operation earlier in the pipeline will have pushed the
-        // matching code, so games using `getError()` for defensive
-        // shader/resource checks observe real failures now instead
-        // of the previous always-zero stub.  Matches WebGL 1.0
-        // spec s5.14.3 and Firefox's WebGLContextGL::GetError
-        // two-level queue (JS-side validation errors surface before
-        // any driver-level error, which keeps reported codes stable
-        // across GL drivers).
+        // Drain one entry from the host-side per-context WebGL error queue.
         return op_webgl_get_error(this._canvasId);
     }
 
     getContextAttributes() {
-        // Returns the actual negotiated context attributes.  The
-        // returned object is a fresh snapshot per spec, so JS
-        // callers can mutate their copy without affecting future
-        // calls.  Never returns `null` -- context-lost reporting is
-        // not yet wired (see op_webgl_is_context_lost when it
-        // lands).
+        // Direct, no-submit: op_webgl_get_context_attributes is host-local.
         return op_webgl_get_context_attributes(this._canvasId);
     }
 
@@ -851,7 +1153,7 @@ class WebGLRenderingContext {
         if (name === 'WEBGL_lose_context') {
             return this._webglLoseContext ||
                 (this._webglLoseContext = {
-                    loseContext: () => { op_gl_lose_context(this._canvasId); },
+                    loseContext: () => { _rawGlLoseContext(this._canvasId); },
                     restoreContext: () => {},
                 });
         }
@@ -984,7 +1286,7 @@ class WebGLRenderingContext {
             MAX_DRAW_BUFFERS_WEBGL: 0x8824,
             drawBuffersWEBGL(buffers) {
                 const buf = new Uint32Array(buffers);
-                op_draw_buffers(ctx._canvasId, buf);
+                _rawDrawBuffers(ctx._canvasId, buf);
             },
         };
         return obj;
@@ -1043,17 +1345,40 @@ class WebGLRenderingContext {
             // Published enum from the ANGLE_instanced_arrays spec.
             VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE: 0x88FE,
             drawArraysInstancedANGLE(mode, first, count, primcount) {
-                op_draw_arrays_instanced(
-                    ctx._canvasId, mode, first, count, primcount,
-                );
+                // Encode if all params are numbers; otherwise flush+raw.
+                if (typeof mode === "number" && typeof first === "number" &&
+                    typeof count === "number" && typeof primcount === "number") {
+                    encodeDrawArraysInstanced(
+                        ctx._canvasId, mode >>> 0, first | 0, count | 0, primcount | 0,
+                    );
+                } else {
+                    flushGlCommandStream();
+                    op_draw_arrays_instanced(
+                        ctx._canvasId, mode, first, count, primcount,
+                    );
+                }
             },
             drawElementsInstancedANGLE(mode, count, type, offset, primcount) {
-                op_draw_elements_instanced(
-                    ctx._canvasId, mode, count, type, offset, primcount,
-                );
+                if (typeof mode === "number" && typeof count === "number" &&
+                    typeof type === "number" && typeof offset === "number" &&
+                    typeof primcount === "number") {
+                    encodeDrawElementsInstanced(
+                        ctx._canvasId, mode >>> 0, count | 0, type >>> 0, offset | 0, primcount | 0,
+                    );
+                } else {
+                    flushGlCommandStream();
+                    op_draw_elements_instanced(
+                        ctx._canvasId, mode, count, type, offset, primcount,
+                    );
+                }
             },
             vertexAttribDivisorANGLE(index, divisor) {
-                op_vertex_attrib_divisor(ctx._canvasId, index, divisor);
+                if (typeof index === "number" && typeof divisor === "number") {
+                    encodeVertexAttribDivisor(ctx._canvasId, index >>> 0, divisor >>> 0);
+                } else {
+                    flushGlCommandStream();
+                    op_vertex_attrib_divisor(ctx._canvasId, index, divisor);
+                }
             },
         };
     }
@@ -1064,17 +1389,24 @@ class WebGLRenderingContext {
             VERTEX_ARRAY_BINDING_OES: 0x85B5,
             createVertexArrayOES() {
                 const id = nextResourceId();
-                op_create_vertex_array(ctx._canvasId, id);
+                _rawCreateVertexArray(ctx._canvasId, id);
                 return { _id: id, _kind: 'vao' };
             },
             deleteVertexArrayOES(vao) {
-                if (vao && vao._id) op_delete_vertex_array(vao._id);
+                if (vao && vao._id) _rawDeleteVertexArray(vao._id);
             },
             isVertexArrayOES(vao) {
                 return !!(vao && typeof vao._id === 'number' && vao._kind === 'vao');
             },
             bindVertexArrayOES(vao) {
-                op_bind_vertex_array(ctx._canvasId, vao ? vao._id : 0);
+                // opcode 14: H C U. vaoId is u32 (0 = unbind).
+                const vaoId = vao ? vao._id : 0;
+                if (typeof vaoId === "number") {
+                    encodeBindVertexArray(ctx._canvasId, vaoId >>> 0);
+                } else {
+                    flushGlCommandStream();
+                    op_bind_vertex_array(ctx._canvasId, vaoId);
+                }
             },
         };
     }
@@ -1083,23 +1415,36 @@ class WebGLRenderingContext {
 
     createTexture() {
         const id = nextResourceId();
-        op_create_texture(this._canvasId, id);
+        _rawCreateTexture(this._canvasId, id);
         return new WebglObject(id);
     }
 
     deleteTexture(texture) {
-        if (texture && texture.id !== undefined) op_delete_texture(texture.id);
+        if (texture && texture.id !== undefined) _rawDeleteTexture(texture.id);
     }
 
     bindTexture(target, texture) {
         const tex = texture || null;
         if (target === 0x0de1) this._textureBindings2D.set(this._activeTextureUnit, tex); // TEXTURE_2D
         else if (target === 0x8513) this._textureBindingsCube.set(this._activeTextureUnit, tex); // TEXTURE_CUBE_MAP
-        op_bind_texture(this._canvasId, target, tex ? tex.id : -1);
+        const texId = tex ? tex.id : -1;
+        // opcode 10: H C U I. target is u32, texId is i32 (negative = unbind).
+        if (typeof target === "number" && typeof texId === "number") {
+            encodeBindTexture(this._canvasId, target >>> 0, texId | 0);
+            return;
+        }
+        flushGlCommandStream();
+        op_bind_texture(this._canvasId, target, texId);
     }
 
     activeTexture(unit) {
         this._activeTextureUnit = unit;
+        // opcode 11: H C U.
+        if (typeof unit === "number") {
+            encodeActiveTexture(this._canvasId, unit >>> 0);
+            return;
+        }
+        flushGlCommandStream();
         op_active_texture(this._canvasId, unit);
     }
 
@@ -1107,17 +1452,10 @@ class WebGLRenderingContext {
         // 9-arg: (target, level, internalformat, width, height, border, format, type, pixels)
         // 6-arg: (target, level, internalformat, format, type, source)
         if (a7 !== undefined) {
-            // Text texture cache hit takes precedence: a suppressed
-            // fillText produced no snapshot, only a cache marker.
+            // Text texture cache hit takes precedence.
             if (_migoTexImageFromTextCache(this._canvasId, target, level, internalformat, a9)) {
                 return;
             }
-            // 9-arg form.  When `pixels` is a synthetic snapshot
-            // ImageData (__migo_snapshot_id__ set by 02_2d_context's
-            // getImageData), promote to the GPU-side copy path so we
-            // don't upload the zero-filled placeholder.  Width/height
-            // must match the snapshot's; if they don't (caller built
-            // an ImageData with mismatched dims) fall back to bytes.
             const snapshotId =
                 a9 && typeof a9 === "object" && (a9.__migo_snapshot_id__ | 0);
             if (
@@ -1126,73 +1464,40 @@ class WebGLRenderingContext {
                 a9.width === a4 &&
                 a9.height === a5
             ) {
-                op_tex_image_2d_from_snapshot(
-                    this._canvasId,
-                    target,
-                    level,
-                    internalformat,
-                    a7,
-                    a8,
-                    snapshotId,
+                _rawTexImage2DFromSnapshot(
+                    this._canvasId, target, level, internalformat, a7, a8, snapshotId,
                 );
                 return;
             }
-            // Direct GPU->GPU path for HTMLCanvasElement source where
-            // caller-supplied (width, height) match the canvas dims.
-            // Partial / scaled uploads fall through to bytes.
             if (_migoIsHTMLCanvas(a9) && a9.width === a4 && a9.height === a5) {
-                // Text texture cache: cocos's real upload path is
-                // texImage2D(canvasElement), so the hit/record decision
-                // lives here, keyed off the source canvas's 2D context.
                 const ctx9 = a9._context;
                 if (ctx9 && typeof ctx9._consumeTextCacheForTexImage === "function"
                         && ctx9._consumeTextCacheForTexImage(
                             this._canvasId, target, level, internalformat)) {
                     return;
                 }
-                op_tex_image_2d_from_canvas2d(
-                    this._canvasId,
-                    target,
-                    level,
-                    internalformat,
-                    a9._rid,
-                    0,
-                    0,
-                    a4 | 0,
-                    a5 | 0,
+                _rawTexImage2DFromCanvas2d(
+                    this._canvasId, target, level, internalformat, a9._rid, 0, 0, a4 | 0, a5 | 0,
                 );
                 return;
             }
             const data = a9 != null ? toUnit8Array(a9) : null;
-            op_tex_image_2d(this._canvasId, target, level, internalformat, a4, a5, a6, a7, a8, data);
+            _rawTexImage2D(this._canvasId, target, level, internalformat, a4, a5, a6, a7, a8, data);
         } else {
             const source = a6;
-            // Text texture cache hit (6-arg spec form).
             if (_migoTexImageFromTextCache(this._canvasId, target, level, internalformat, source)) {
                 return;
             }
-            // 6-arg form.  Same snapshot detection as the 9-arg
-            // branch -- handles the spec form `texImage2D(target,
-            // level, ifmt, format, type, ImageData)` that some games
-            // call with the synthetic ImageData.
             const snapshotId =
                 source && typeof source === "object"
                     ? (source.__migo_snapshot_id__ | 0)
                     : 0;
             if (snapshotId !== 0) {
-                op_tex_image_2d_from_snapshot(
-                    this._canvasId,
-                    target,
-                    level,
-                    internalformat,
-                    a4,
-                    a5,
-                    snapshotId,
+                _rawTexImage2DFromSnapshot(
+                    this._canvasId, target, level, internalformat, a4, a5, snapshotId,
                 );
                 return;
             }
-            // Direct GPU->GPU path: cocos's text-label pattern feeds an
-            // HTMLCanvasElement here.  Skip getImageData + readback.
             if (_migoIsHTMLCanvas(source)) {
                 const cw = source.width | 0;
                 const ch = source.height | 0;
@@ -1203,37 +1508,22 @@ class WebGLRenderingContext {
                                 this._canvasId, target, level, internalformat)) {
                         return;
                     }
-                    op_tex_image_2d_from_canvas2d(
-                        this._canvasId,
-                        target,
-                        level,
-                        internalformat,
-                        source._rid,
-                        0,
-                        0,
-                        cw,
-                        ch,
+                    _rawTexImage2DFromCanvas2d(
+                        this._canvasId, target, level, internalformat,
+                        source._rid, 0, 0, cw, ch,
                     );
                     return;
                 }
             }
             const imageId = source && typeof source.rid === "number" ? source.rid : null;
             if (imageId != null) {
-                op_tex_image_2d_from_image(this._canvasId, target, level, internalformat, a4, a5, imageId);
+                _rawTexImage2DFromImage(this._canvasId, target, level, internalformat, a4, a5, imageId);
             } else {
                 const raw = sourceToRawRgba(source);
                 if (raw) {
-                    op_tex_image_2d(
-                        this._canvasId,
-                        target,
-                        level,
-                        internalformat,
-                        raw.width,
-                        raw.height,
-                        0,
-                        a4,
-                        a5,
-                        raw.data,
+                    _rawTexImage2D(
+                        this._canvasId, target, level, internalformat,
+                        raw.width, raw.height, 0, a4, a5, raw.data,
                     );
                     return;
                 }
@@ -1247,56 +1537,25 @@ class WebGLRenderingContext {
         // 9-arg: (..., width, height, format, type, pixels)
         if (pixels !== undefined) {
             if (pixels == null) return;
-            // Snapshot fast path: when `pixels` is the synthetic
-            // ImageData from getImageData(), uploading its `data` field
-            // would copy zero bytes (the placeholder).  Route to the
-            // GPU-side copy op instead.  Only safe when caller's
-            // (width, height) matches the snapshot's exactly -- partial
-            // copies need the legacy bytes path.
             const snapshotId =
                 pixels && typeof pixels === "object"
                     ? (pixels.__migo_snapshot_id__ | 0)
                     : 0;
-            if (
-                snapshotId !== 0 &&
-                pixels.width === width &&
-                pixels.height === height
-            ) {
-                op_tex_sub_image_2d_from_snapshot(
-                    this._canvasId,
-                    target,
-                    level,
-                    xoffset,
-                    yoffset,
-                    format,
-                    type,
-                    snapshotId,
+            if (snapshotId !== 0 && pixels.width === width && pixels.height === height) {
+                _rawTexSubImage2DFromSnapshot(
+                    this._canvasId, target, level, xoffset, yoffset, format, type, snapshotId,
                 );
                 return;
             }
-            // Direct GPU->GPU path for HTMLCanvasElement with matching
-            // dims (cocos atlas-update pattern).
-            if (
-                _migoIsHTMLCanvas(pixels) &&
-                pixels.width === width &&
-                pixels.height === height
-            ) {
-                op_tex_sub_image_2d_from_canvas2d(
-                    this._canvasId,
-                    target,
-                    level,
-                    xoffset,
-                    yoffset,
-                    pixels._rid,
-                    0,
-                    0,
-                    width | 0,
-                    height | 0,
+            if (_migoIsHTMLCanvas(pixels) && pixels.width === width && pixels.height === height) {
+                _rawTexSubImage2DFromCanvas2d(
+                    this._canvasId, target, level, xoffset, yoffset,
+                    pixels._rid, 0, 0, width | 0, height | 0,
                 );
                 return;
             }
             const data = toUnit8Array(pixels);
-            op_tex_sub_image_2d(this._canvasId, target, level, xoffset, yoffset, width, height, format, type, data);
+            _rawTexSubImage2D(this._canvasId, target, level, xoffset, yoffset, width, height, format, type, data);
             return;
         }
 
@@ -1304,72 +1563,38 @@ class WebGLRenderingContext {
         const source = format;
         const sourceFormat = width;
         const sourceType = height;
-        // 7-arg snapshot detection: the source's intrinsic size is used,
-        // so the snapshot's own (width, height) is authoritative.
         const subSnapshotId =
             source && typeof source === "object"
                 ? (source.__migo_snapshot_id__ | 0)
                 : 0;
         if (subSnapshotId !== 0) {
-            op_tex_sub_image_2d_from_snapshot(
-                this._canvasId,
-                target,
-                level,
-                xoffset,
-                yoffset,
-                sourceFormat,
-                sourceType,
-                subSnapshotId,
+            _rawTexSubImage2DFromSnapshot(
+                this._canvasId, target, level, xoffset, yoffset, sourceFormat, sourceType, subSnapshotId,
             );
             return;
         }
-        // Direct GPU->GPU path for HTMLCanvasElement (7-arg form has
-        // no explicit dims; the canvas's intrinsic size is the source).
         if (_migoIsHTMLCanvas(source)) {
             const cw = source.width | 0;
             const ch = source.height | 0;
             if (cw > 0 && ch > 0) {
-                op_tex_sub_image_2d_from_canvas2d(
-                    this._canvasId,
-                    target,
-                    level,
-                    xoffset,
-                    yoffset,
-                    source._rid,
-                    0,
-                    0,
-                    cw,
-                    ch,
+                _rawTexSubImage2DFromCanvas2d(
+                    this._canvasId, target, level, xoffset, yoffset,
+                    source._rid, 0, 0, cw, ch,
                 );
                 return;
             }
         }
         const imageId = source && typeof source.rid === "number" ? source.rid : null;
         if (imageId != null) {
-            op_tex_sub_image_2d_from_image(
-                this._canvasId,
-                target,
-                level,
-                xoffset,
-                yoffset,
-                sourceFormat,
-                sourceType,
-                imageId,
+            _rawTexSubImage2DFromImage(
+                this._canvasId, target, level, xoffset, yoffset, sourceFormat, sourceType, imageId,
             );
         } else {
             const raw = sourceToRawRgba(source);
             if (raw) {
-                op_tex_sub_image_2d(
-                    this._canvasId,
-                    target,
-                    level,
-                    xoffset,
-                    yoffset,
-                    raw.width,
-                    raw.height,
-                    sourceFormat,
-                    sourceType,
-                    raw.data,
+                _rawTexSubImage2D(
+                    this._canvasId, target, level, xoffset, yoffset,
+                    raw.width, raw.height, sourceFormat, sourceType, raw.data,
                 );
                 return;
             }
@@ -1379,24 +1604,39 @@ class WebGLRenderingContext {
     }
 
     texParameteri(target, pname, param) {
-        op_tex_parameteri(this._canvasId, target, pname, param);
+        // opcode 40: H C U U I. target/pname are u32, param is i32.
+        if (typeof target === "number" && typeof pname === "number" &&
+            typeof param === "number") {
+            encodeTexParameteri(this._canvasId, target >>> 0, pname >>> 0, param | 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawTexParameteri(this._canvasId, target, pname, param);
     }
 
     texParameterf(target, pname, param) {
-        op_tex_parameterf(this._canvasId, target, pname, param);
+        // opcode 41: H C U U F. target/pname are u32, param is f32.
+        if (typeof target === "number" && typeof pname === "number" &&
+            typeof param === "number") {
+            encodeTexParameterf(this._canvasId, target >>> 0, pname >>> 0, param);
+            return;
+        }
+        _rawTexParameterf(this._canvasId, target, pname, param);
     }
 
     generateMipmap(target) {
-        op_generate_mipmap(this._canvasId, target);
+        // opcode 42: H C U.
+        if (typeof target === "number") {
+            encodeGenerateMipmap(this._canvasId, target >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawGenerateMipmap(this._canvasId, target);
     }
 
     pixelStorei(pname, param) {
-        // UNPACK_FLIP_Y_WEBGL (0x9240), UNPACK_PREMULTIPLY_ALPHA_WEBGL (0x9241)
-        // and UNPACK_COLORSPACE_CONVERSION_WEBGL (0x9243) are WebGL-only -- GLES
-        // has no such glPixelStorei params, so forwarding them to the native
-        // glPixelStorei raises GL_INVALID_ENUM (0x500). Track flip-Y /
-        // premultiply as upload state (for the canvas/image texImage2D path to
-        // honor) instead of forwarding; colorspace conversion is a no-op.
+        // UNPACK_FLIP_Y_WEBGL / UNPACK_PREMULTIPLY_ALPHA_WEBGL / UNPACK_COLORSPACE_CONVERSION_WEBGL
+        // are JS-only state; colorspace is a no-op.
         if (pname === 0x9240) { this._unpackFlipY = !!param; return; }
         if (pname === 0x9241) { this._unpackPremultiplyAlpha = !!param; return; }
         if (pname === 0x9243) { return; }
@@ -1404,60 +1644,226 @@ class WebGLRenderingContext {
         if (param === true) value = 1;
         else if (param === false) value = 0;
         else value = Number(param) | 0;
-        op_pixel_storei(this._canvasId, pname, value);
+        // opcode 43: H C U I. pname is u32, value is i32.
+        if (typeof pname === "number") {
+            encodePixelStorei(this._canvasId, pname >>> 0, value);
+            return;
+        }
+        flushGlCommandStream();
+        _rawPixelStorei(this._canvasId, pname, value);
     }
 
     compressedTexImage2D(target, level, internalformat, width, height, border, data) {
         const u8 = toUnit8Array(data);
-        op_compressed_tex_image_2d(this._canvasId, target, level, internalformat, width, height, border, u8);
+        _rawCompressedTexImage2D(this._canvasId, target, level, internalformat, width, height, border, u8);
     }
 
     compressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, data) {
         const u8 = toUnit8Array(data);
-        op_compressed_tex_sub_image_2d(this._canvasId, target, level, xoffset, yoffset, width, height, format, u8);
+        _rawCompressedTexSubImage2D(this._canvasId, target, level, xoffset, yoffset, width, height, format, u8);
     }
 
     // -- Phase 1C: Buffer & Vertex Extensions --
 
     bufferSubData(target, offset, data) {
         const u8 = toUnit8Array(data);
-        op_buffer_sub_data(this._canvasId, target, offset, u8);
+        _rawBufferSubData(this._canvasId, target, offset, u8);
     }
 
     disableVertexAttribArray(index) {
-        op_disable_vertex_attrib_array(this._canvasId, index);
+        // opcode 17: H C U.
+        if (typeof index === "number") {
+            encodeDisableVertexAttribArray(this._canvasId, index >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawDisableVertexAttribArray(this._canvasId, index);
     }
 
     clearDepth(depth) {
-        op_clear_depth(this._canvasId, depth);
+        // opcode 4: H C F.
+        if (typeof depth === "number") {
+            encodeClearDepth(this._canvasId, depth);
+            return;
+        }
+        _rawClearDepth(this._canvasId, depth);
     }
 
     clearStencil(s) {
-        op_clear_stencil(this._canvasId, s);
+        // opcode 5: H C I.
+        if (typeof s === "number") {
+            encodeClearStencil(this._canvasId, s | 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawClearStencil(this._canvasId, s);
     }
 
     // -- Phase 2A: Blend/Depth/Stencil/Cull State --
 
-    blendFunc(sfactor, dfactor) { op_blend_func(this._canvasId, sfactor, dfactor); }
-    blendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha) { op_blend_func_separate(this._canvasId, srcRGB, dstRGB, srcAlpha, dstAlpha); }
-    blendEquation(mode) { op_blend_equation(this._canvasId, mode); }
-    blendEquationSeparate(modeRGB, modeAlpha) { op_blend_equation_separate(this._canvasId, modeRGB, modeAlpha); }
-    blendColor(r, g, b, a) { op_blend_color(this._canvasId, r, g, b, a); }
-    depthFunc(func) { op_depth_func(this._canvasId, func); }
-    depthMask(flag) { op_depth_mask(this._canvasId, flag); }
-    depthRange(near, far) { op_depth_range(this._canvasId, near, far); }
-    stencilFunc(func, ref_, mask) { op_stencil_func(this._canvasId, func, ref_, mask); }
-    stencilFuncSeparate(face, func, ref_, mask) { op_stencil_func_separate(this._canvasId, face, func, ref_, mask); }
-    stencilOp(fail, zfail, zpass) { op_stencil_op(this._canvasId, fail, zfail, zpass); }
-    stencilOpSeparate(face, fail, zfail, zpass) { op_stencil_op_separate(this._canvasId, face, fail, zfail, zpass); }
-    stencilMask(mask) { op_stencil_mask(this._canvasId, mask); }
-    stencilMaskSeparate(face, mask) { op_stencil_mask_separate(this._canvasId, face, mask); }
-    cullFace(mode) { op_cull_face(this._canvasId, mode); }
-    frontFace(mode) { op_front_face(this._canvasId, mode); }
-    colorMask(r, g, b, a) { op_color_mask(this._canvasId, r, g, b, a); }
-    scissor(x, y, width, height) { op_scissor(this._canvasId, x, y, width, height); }
-    lineWidth(width) { op_line_width(this._canvasId, width); }
-    polygonOffset(factor, units) { op_polygon_offset(this._canvasId, factor, units); }
+    blendFunc(sfactor, dfactor) {
+        if (typeof sfactor === "number" && typeof dfactor === "number") {
+            encodeBlendFunc(this._canvasId, sfactor >>> 0, dfactor >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawBlendFunc(this._canvasId, sfactor, dfactor);
+        }
+    }
+    blendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha) {
+        if (typeof srcRGB === "number" && typeof dstRGB === "number" &&
+            typeof srcAlpha === "number" && typeof dstAlpha === "number") {
+            encodeBlendFuncSeparate(this._canvasId, srcRGB >>> 0, dstRGB >>> 0, srcAlpha >>> 0, dstAlpha >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawBlendFuncSeparate(this._canvasId, srcRGB, dstRGB, srcAlpha, dstAlpha);
+        }
+    }
+    blendEquation(mode) {
+        if (typeof mode === "number") {
+            encodeBlendEquation(this._canvasId, mode >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawBlendEquation(this._canvasId, mode);
+        }
+    }
+    blendEquationSeparate(modeRGB, modeAlpha) {
+        if (typeof modeRGB === "number" && typeof modeAlpha === "number") {
+            encodeBlendEquationSeparate(this._canvasId, modeRGB >>> 0, modeAlpha >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawBlendEquationSeparate(this._canvasId, modeRGB, modeAlpha);
+        }
+    }
+    blendColor(r, g, b, a) {
+        if (typeof r === "number" && typeof g === "number" &&
+            typeof b === "number" && typeof a === "number") {
+            encodeBlendColor(this._canvasId, r, g, b, a);
+        } else {
+            _rawBlendColor(this._canvasId, r, g, b, a);
+        }
+    }
+    depthFunc(func) {
+        if (typeof func === "number") {
+            encodeDepthFunc(this._canvasId, func >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawDepthFunc(this._canvasId, func);
+        }
+    }
+    depthMask(flag) {
+        if (typeof flag === "boolean") {
+            encodeDepthMask(this._canvasId, flag);
+        } else {
+            flushGlCommandStream();
+            op_depth_mask(this._canvasId, flag);
+        }
+    }
+    depthRange(near, far) {
+        if (typeof near === "number" && typeof far === "number") {
+            encodeDepthRange(this._canvasId, near, far);
+        } else {
+            _rawDepthRange(this._canvasId, near, far);
+        }
+    }
+    stencilFunc(func, ref_, mask) {
+        if (typeof func === "number" && typeof ref_ === "number" && typeof mask === "number") {
+            encodeStencilFunc(this._canvasId, func >>> 0, ref_ | 0, mask >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawStencilFunc(this._canvasId, func, ref_, mask);
+        }
+    }
+    stencilFuncSeparate(face, func, ref_, mask) {
+        if (typeof face === "number" && typeof func === "number" &&
+            typeof ref_ === "number" && typeof mask === "number") {
+            encodeStencilFuncSeparate(this._canvasId, face >>> 0, func >>> 0, ref_ | 0, mask >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawStencilFuncSeparate(this._canvasId, face, func, ref_, mask);
+        }
+    }
+    stencilOp(fail, zfail, zpass) {
+        if (typeof fail === "number" && typeof zfail === "number" && typeof zpass === "number") {
+            encodeStencilOp(this._canvasId, fail >>> 0, zfail >>> 0, zpass >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawStencilOp(this._canvasId, fail, zfail, zpass);
+        }
+    }
+    stencilOpSeparate(face, fail, zfail, zpass) {
+        if (typeof face === "number" && typeof fail === "number" &&
+            typeof zfail === "number" && typeof zpass === "number") {
+            encodeStencilOpSeparate(this._canvasId, face >>> 0, fail >>> 0, zfail >>> 0, zpass >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawStencilOpSeparate(this._canvasId, face, fail, zfail, zpass);
+        }
+    }
+    stencilMask(mask) {
+        if (typeof mask === "number") {
+            encodeStencilMask(this._canvasId, mask >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawStencilMask(this._canvasId, mask);
+        }
+    }
+    stencilMaskSeparate(face, mask) {
+        if (typeof face === "number" && typeof mask === "number") {
+            encodeStencilMaskSeparate(this._canvasId, face >>> 0, mask >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawStencilMaskSeparate(this._canvasId, face, mask);
+        }
+    }
+    cullFace(mode) {
+        if (typeof mode === "number") {
+            encodeCullFace(this._canvasId, mode >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawCullFace(this._canvasId, mode);
+        }
+    }
+    frontFace(mode) {
+        if (typeof mode === "number") {
+            encodeFrontFace(this._canvasId, mode >>> 0);
+        } else {
+            flushGlCommandStream();
+            _rawFrontFace(this._canvasId, mode);
+        }
+    }
+    colorMask(r, g, b, a) {
+        if (typeof r === "boolean" && typeof g === "boolean" &&
+            typeof b === "boolean" && typeof a === "boolean") {
+            encodeColorMask(this._canvasId, r, g, b, a);
+        } else {
+            flushGlCommandStream();
+            op_color_mask(this._canvasId, r, g, b, a);
+        }
+    }
+    scissor(x, y, width, height) {
+        // opcode 37: H C I I I I.
+        if (typeof x === "number" && typeof y === "number" &&
+            typeof width === "number" && typeof height === "number") {
+            encodeScissor(this._canvasId, x | 0, y | 0, width | 0, height | 0);
+        } else {
+            flushGlCommandStream();
+            _rawScissor(this._canvasId, x, y, width, height);
+        }
+    }
+    lineWidth(width) {
+        if (typeof width === "number") {
+            encodeLineWidth(this._canvasId, width);
+        } else {
+            _rawLineWidth(this._canvasId, width);
+        }
+    }
+    polygonOffset(factor, units) {
+        if (typeof factor === "number" && typeof units === "number") {
+            encodePolygonOffset(this._canvasId, factor, units);
+        } else {
+            _rawPolygonOffset(this._canvasId, factor, units);
+        }
+    }
 
     // -- Phase 2B: Uniform Variants --
 
@@ -1465,98 +1871,176 @@ class WebGLRenderingContext {
         // WebGL coerces the value (WebIDL GLint) -- engines pass booleans for
         // `uniform bool` samplers/flags (e.g. Phaser: `uniform1i(loc, true)`).
         // `| 0` applies ToInt32 (true -> 1, false -> 0), matching the browser.
-        op_uniform1i(this._canvasId, _loc(location), x | 0);
+        // opcode 54: H C I I. location is i32, x is i32.
+        const loc = _loc(location);
+        const xi = x | 0;
+        encodeUniform1i(this._canvasId, loc, xi);
     }
     uniform1f(location, x) {
-        op_uniform1f(this._canvasId, _loc(location), +x);
+        // opcode 55: H C I F. Always encodable (f32 accepts any number).
+        encodeUniform1f(this._canvasId, _loc(location), +x);
     }
     uniform2f(location, x, y) {
-        op_uniform2f(this._canvasId, _loc(location), +x, +y);
+        // opcode 56: H C I F F.
+        encodeUniform2f(this._canvasId, _loc(location), +x, +y);
     }
     uniform4f(location, x, y, z, w) {
-        op_uniform4f(this._canvasId, _loc(location), +x, +y, +z, +w);
+        // opcode 58: H C I F F F F.
+        encodeUniform4f(this._canvasId, _loc(location), +x, +y, +z, +w);
     }
     uniform1iv(location, value) {
-        op_uniform1iv(this._canvasId, _loc(location), toInt32AsUint32(value));
+        const loc = _loc(location);
+        const payload = toInt32AsUint32(value);
+        if (!encodeUniform1iv(this._canvasId, loc, payload)) {
+            flushGlCommandStream();
+            _rawUniform1iv(this._canvasId, loc, payload);
+        }
     }
     uniform1fv(location, value) {
-        op_uniform1fv(this._canvasId, _loc(location), toFloat32AsUint32(value));
+        const loc = _loc(location);
+        const payload = toFloat32AsUint32(value);
+        if (!encodeUniform1fv(this._canvasId, loc, payload)) {
+            flushGlCommandStream();
+            _rawUniform1fv(this._canvasId, loc, payload);
+        }
     }
     uniform2iv(location, value) {
-        op_uniform2iv(this._canvasId, _loc(location), toInt32AsUint32(value));
+        const loc = _loc(location);
+        const payload = toInt32AsUint32(value);
+        if (!encodeUniform2iv(this._canvasId, loc, payload)) {
+            flushGlCommandStream();
+            _rawUniform2iv(this._canvasId, loc, payload);
+        }
     }
     uniform2fv(location, value) {
-        op_uniform2fv(this._canvasId, _loc(location), toFloat32AsUint32(value));
+        const loc = _loc(location);
+        const payload = toFloat32AsUint32(value);
+        if (!encodeUniform2fv(this._canvasId, loc, payload)) {
+            flushGlCommandStream();
+            _rawUniform2fv(this._canvasId, loc, payload);
+        }
     }
     uniform3iv(location, value) {
-        op_uniform3iv(this._canvasId, _loc(location), toInt32AsUint32(value));
+        const loc = _loc(location);
+        const payload = toInt32AsUint32(value);
+        if (!encodeUniform3iv(this._canvasId, loc, payload)) {
+            flushGlCommandStream();
+            _rawUniform3iv(this._canvasId, loc, payload);
+        }
     }
     uniform3fv(location, value) {
-        op_uniform3fv(this._canvasId, _loc(location), toFloat32AsUint32(value));
+        const loc = _loc(location);
+        const payload = toFloat32AsUint32(value);
+        if (!encodeUniform3fv(this._canvasId, loc, payload)) {
+            flushGlCommandStream();
+            _rawUniform3fv(this._canvasId, loc, payload);
+        }
     }
     uniform4iv(location, value) {
-        op_uniform4iv(this._canvasId, _loc(location), toInt32AsUint32(value));
+        const loc = _loc(location);
+        const payload = toInt32AsUint32(value);
+        if (!encodeUniform4iv(this._canvasId, loc, payload)) {
+            flushGlCommandStream();
+            _rawUniform4iv(this._canvasId, loc, payload);
+        }
     }
     uniform4fv(location, value) {
-        op_uniform4fv(this._canvasId, _loc(location), toFloat32AsUint32(value));
+        const loc = _loc(location);
+        const payload = toFloat32AsUint32(value);
+        if (!encodeUniform4fv(this._canvasId, loc, payload)) {
+            flushGlCommandStream();
+            _rawUniform4fv(this._canvasId, loc, payload);
+        }
     }
     uniformMatrix2fv(location, transpose, value) {
-        op_uniform_matrix_2fv(this._canvasId, _loc(location), transpose, toFloat32AsUint32(value));
+        const loc = _loc(location);
+        const payload = toFloat32AsUint32(value);
+        if (typeof transpose !== "boolean" ||
+            !encodeUniformMatrix2fv(this._canvasId, loc, transpose, payload)) {
+            flushGlCommandStream();
+            op_uniform_matrix_2fv(this._canvasId, loc, transpose, payload);
+        }
     }
     uniformMatrix4fv(location, transpose, value) {
-        op_uniform_matrix_4fv(this._canvasId, _loc(location), transpose, toFloat32AsUint32(value));
+        const loc = _loc(location);
+        const payload = toFloat32AsUint32(value);
+        if (typeof transpose !== "boolean" ||
+            !encodeUniformMatrix4fv(this._canvasId, loc, transpose, payload)) {
+            flushGlCommandStream();
+            op_uniform_matrix_4fv(this._canvasId, loc, transpose, payload);
+        }
     }
 
     // -- Phase 3A: Framebuffer/Renderbuffer --
 
     createFramebuffer() {
         const id = nextResourceId();
-        op_create_framebuffer(this._canvasId, id);
+        _rawCreateFramebuffer(this._canvasId, id);
         return new WebglObject(id);
     }
     deleteFramebuffer(fb) {
-        if (fb && fb.id !== undefined) op_delete_framebuffer(fb.id);
+        if (fb && fb.id !== undefined) _rawDeleteFramebuffer(fb.id);
     }
     bindFramebuffer(target, fb) {
         this._framebufferBinding = fb || null;
-        op_bind_framebuffer(this._canvasId, target, fb ? fb.id : -1);
+        const fbId = fb ? fb.id : -1;
+        // opcode 12: H C U I.
+        if (typeof target === "number" && typeof fbId === "number") {
+            encodeBindFramebuffer(this._canvasId, target >>> 0, fbId | 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawBindFramebuffer(this._canvasId, target, fbId);
     }
     framebufferTexture2D(target, attachment, textarget, texture, level) {
-        op_framebuffer_texture_2d(this._canvasId, target, attachment, textarget, texture ? texture.id : -1, level);
+        _rawFramebufferTexture2D(this._canvasId, target, attachment, textarget, texture ? texture.id : -1, level);
     }
     framebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer) {
-        op_framebuffer_renderbuffer(this._canvasId, target, attachment, renderbuffertarget, renderbuffer ? renderbuffer.id : -1);
+        _rawFramebufferRenderbuffer(this._canvasId, target, attachment, renderbuffertarget, renderbuffer ? renderbuffer.id : -1);
     }
     checkFramebufferStatus(target) {
-        return op_check_framebuffer_status(this._canvasId, target);
+        return _rawCheckFramebufferStatus(this._canvasId, target);
     }
     createRenderbuffer() {
         const id = nextResourceId();
-        op_create_renderbuffer(this._canvasId, id);
+        _rawCreateRenderbuffer(this._canvasId, id);
         return new WebglObject(id);
     }
     deleteRenderbuffer(rb) {
-        if (rb && rb.id !== undefined) op_delete_renderbuffer(rb.id);
+        if (rb && rb.id !== undefined) _rawDeleteRenderbuffer(rb.id);
     }
     bindRenderbuffer(target, rb) {
         this._renderbufferBinding = rb || null;
-        op_bind_renderbuffer(this._canvasId, target, rb ? rb.id : -1);
+        const rbId = rb ? rb.id : -1;
+        // opcode 13: H C U I.
+        if (typeof target === "number" && typeof rbId === "number") {
+            encodeBindRenderbuffer(this._canvasId, target >>> 0, rbId | 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawBindRenderbuffer(this._canvasId, target, rbId);
     }
     renderbufferStorage(target, internalformat, width, height) {
-        op_renderbuffer_storage(this._canvasId, target, internalformat, width, height);
+        _rawRenderbufferStorage(this._canvasId, target, internalformat, width, height);
     }
 
     // -- Phase 3B: Misc --
 
     readPixels(x, y, width, height, format, type, pixels) {
-        const data = op_read_pixels(this._canvasId, x, y, width, height, format, type);
+        const data = _rawReadPixels(this._canvasId, x, y, width, height, format, type);
         if (data && pixels) {
             const u8 = new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
             u8.set(data.subarray(0, u8.length));
         }
     }
     hint(target, mode) {
-        op_hint(this._canvasId, target, mode);
+        // opcode 44: H C U U.
+        if (typeof target === "number" && typeof mode === "number") {
+            encodeHint(this._canvasId, target >>> 0, mode >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawHint(this._canvasId, target, mode);
     }
 }
 
@@ -1587,50 +2071,94 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
 
     // ---- Vertex Array Objects ----------------------------------
     createVertexArray() {
+        // op_alloc_gl_resource_id: direct, no-submit.
         const id = op_alloc_gl_resource_id_webgl2();
-        op_create_vertex_array(this._canvasId, id);
+        _rawCreateVertexArray(this._canvasId, id);
         return { _id: id, _kind: 'vao' };
     }
     deleteVertexArray(vao) {
-        if (vao && vao._id) op_delete_vertex_array(vao._id);
+        if (vao && vao._id) _rawDeleteVertexArray(vao._id);
     }
     bindVertexArray(vao) {
-        op_bind_vertex_array(this._canvasId, vao ? vao._id : 0);
+        // opcode 14: H C U. vaoId is u32 (0 = unbind).
+        const vaoId = vao ? vao._id : 0;
+        if (typeof vaoId === "number") {
+            encodeBindVertexArray(this._canvasId, vaoId >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawBindVertexArray(this._canvasId, vaoId);
     }
 
     // ---- Instanced drawing -------------------------------------
     vertexAttribDivisor(index, divisor) {
-        op_vertex_attrib_divisor(this._canvasId, index, divisor);
+        // opcode 19: H C U U.
+        if (typeof index === "number" && typeof divisor === "number") {
+            encodeVertexAttribDivisor(this._canvasId, index >>> 0, divisor >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawVertexAttribDivisor(this._canvasId, index, divisor);
     }
     drawArraysInstanced(mode, first, count, instanceCount) {
-        op_draw_arrays_instanced(this._canvasId, mode, first, count, instanceCount);
+        // opcode 49: H C U I I I.
+        if (typeof mode === "number" && typeof first === "number" &&
+            typeof count === "number" && typeof instanceCount === "number") {
+            encodeDrawArraysInstanced(this._canvasId, mode >>> 0, first | 0, count | 0, instanceCount | 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawDrawArraysInstanced(this._canvasId, mode, first, count, instanceCount);
     }
     drawElementsInstanced(mode, count, type, offset, instanceCount) {
-        op_draw_elements_instanced(this._canvasId, mode, count, type, offset, instanceCount);
+        // opcode 50: H C U I U I I.
+        if (typeof mode === "number" && typeof count === "number" &&
+            typeof type === "number" && typeof offset === "number" &&
+            typeof instanceCount === "number") {
+            encodeDrawElementsInstanced(this._canvasId, mode >>> 0, count | 0, type >>> 0, offset | 0, instanceCount | 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawDrawElementsInstanced(this._canvasId, mode, count, type, offset, instanceCount);
     }
 
     // ---- Uniform Buffer Objects --------------------------------
     getUniformBlockIndex(program, name) {
-        return op_get_uniform_block_index(program._id, name);
+        return _rawGetUniformBlockIndex(program._id, name);
     }
     uniformBlockBinding(program, uniformBlockIndex, uniformBlockBinding) {
-        op_uniform_block_binding(program._id, uniformBlockIndex, uniformBlockBinding);
+        _rawUniformBlockBinding(program._id, uniformBlockIndex, uniformBlockBinding);
     }
     bindBufferBase(target, index, buffer) {
-        op_bind_buffer_base(this._canvasId, target, index, buffer ? buffer._id : 0);
+        // opcode 51: H C U U U. target/index are u32, bufferId is u32 (0 = unbind).
+        const bufferId = buffer ? buffer.id ?? buffer._id : 0;
+        if (typeof target === "number" && typeof index === "number" && typeof bufferId === "number") {
+            encodeBindBufferBase(this._canvasId, target >>> 0, index >>> 0, bufferId >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawBindBufferBase(this._canvasId, target, index, bufferId);
     }
     bindBufferRange(target, index, buffer, offset, size) {
-        op_bind_buffer_range(this._canvasId, target, index, buffer ? buffer._id : 0, offset, size);
+        // opcode 52: H C U U U I I.
+        const bufferId = buffer ? buffer.id ?? buffer._id : 0;
+        if (typeof target === "number" && typeof index === "number" &&
+            typeof bufferId === "number" && typeof offset === "number" && typeof size === "number") {
+            encodeBindBufferRange(this._canvasId, target >>> 0, index >>> 0, bufferId >>> 0, offset | 0, size | 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawBindBufferRange(this._canvasId, target, index, bufferId, offset, size);
     }
 
     // ---- Immutable texture storage ------------------------------
     texStorage2D(target, levels, internalformat, width, height) {
-        op_tex_storage_2d(this._canvasId, target, levels, internalformat, width, height);
+        _rawTexStorage2D(this._canvasId, target, levels, internalformat, width, height);
     }
 
     // ---- Framebuffer ops ---------------------------------------
     blitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter) {
-        op_blit_framebuffer(this._canvasId, srcX0, srcY0, srcX1, srcY1,
+        _rawBlitFramebuffer(this._canvasId, srcX0, srcY0, srcX1, srcY1,
                              dstX0, dstY0, dstX1, dstY1, mask, filter);
     }
     invalidateFramebuffer(target, attachments) {
@@ -1639,40 +2167,64 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         const buf = attachments instanceof Uint32Array
             ? attachments
             : new Uint32Array(attachments || []);
-        op_invalidate_framebuffer(this._canvasId, target, buf);
+        _rawInvalidateFramebuffer(this._canvasId, target, buf);
     }
     renderbufferStorageMultisample(target, samples, internalformat, width, height) {
-        op_renderbuffer_storage_multisample(this._canvasId, target, samples,
+        _rawRenderbufferStorageMultisample(this._canvasId, target, samples,
                                             internalformat, width, height);
     }
 
     // ---- Sampler objects ---------------------------------------
     createSampler() {
+        // op_alloc_gl_resource_id: direct, no-submit.
         const id = op_alloc_gl_resource_id_webgl2();
-        op_create_sampler(this._canvasId, id);
+        _rawCreateSampler(this._canvasId, id);
         return { _id: id, _kind: 'sampler' };
     }
     deleteSampler(sampler) {
-        if (sampler && sampler._id) op_delete_sampler(sampler._id);
+        if (sampler && sampler._id) _rawDeleteSampler(sampler._id);
     }
     bindSampler(unit, sampler) {
-        op_bind_sampler(this._canvasId, unit, sampler ? sampler._id : 0);
+        // opcode 15: H C U U. unit is u32, samplerId is u32 (0 = unbind).
+        const samplerId = sampler ? sampler._id : 0;
+        if (typeof unit === "number" && typeof samplerId === "number") {
+            encodeBindSampler(this._canvasId, unit >>> 0, samplerId >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawBindSampler(this._canvasId, unit, samplerId);
     }
     samplerParameteri(sampler, pname, param) {
-        if (sampler && sampler._id) op_sampler_parameteri(sampler._id, pname, param);
+        // opcode 45: H U U I. samplerId is u32, pname is u32, param is i32.
+        // No canvas field: sampler is a global resource identified by its id.
+        if (!sampler || !sampler._id) return;
+        if (typeof pname === "number" && typeof param === "number") {
+            encodeSamplerParameteri(sampler._id >>> 0, pname >>> 0, param | 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawSamplerParameteri(sampler._id, pname, param);
     }
     samplerParameterf(sampler, pname, param) {
-        if (sampler && sampler._id) op_sampler_parameterf(sampler._id, pname, param);
+        // opcode 46: H U U F. samplerId is u32, pname is u32, param is f32.
+        // No canvas field: sampler is a global resource identified by its id.
+        if (!sampler || !sampler._id) return;
+        if (typeof pname === "number" && typeof param === "number") {
+            encodeSamplerParameterf(sampler._id >>> 0, pname >>> 0, param);
+            return;
+        }
+        _rawSamplerParameterf(sampler._id, pname, param);
     }
 
     // ---- Fence syncs -------------------------------------------
     fenceSync(condition, flags) {
+        // op_alloc_gl_resource_id: direct, no-submit.
         const id = op_alloc_gl_resource_id_webgl2();
-        op_fence_sync(this._canvasId, id, condition, flags);
+        _rawFenceSync(this._canvasId, id, condition, flags);
         return { _id: id, _kind: 'sync' };
     }
     deleteSync(sync) {
-        if (sync && sync._id) op_delete_sync(sync._id);
+        if (sync && sync._id) _rawDeleteSync(sync._id);
     }
     /**
      * clientWaitSync(sync, flags, timeout) -- WebGL spec says timeout is
@@ -1682,7 +2234,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
      */
     clientWaitSync(sync, flags, timeout) {
         if (!sync || !sync._id) return 0x911D; // WAIT_FAILED
-        return op_client_wait_sync(sync._id, flags, Number(timeout) || 0);
+        return _rawClientWaitSync(sync._id, flags, Number(timeout) || 0);
     }
 
     // ---- Draw / read buffer selection --------------------------
@@ -1690,16 +2242,23 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         const buf = buffers instanceof Uint32Array
             ? buffers
             : new Uint32Array(buffers || []);
-        op_draw_buffers(this._canvasId, buf);
+        _rawDrawBuffers(this._canvasId, buf);
     }
     readBuffer(src) {
-        op_read_buffer(this._canvasId, src);
+        // opcode 53: H C U.
+        if (typeof src === "number") {
+            encodeReadBuffer(this._canvasId, src >>> 0);
+            return;
+        }
+        flushGlCommandStream();
+        _rawReadBuffer(this._canvasId, src);
     }
 
     // ---- Query objects -----------------------------------------
     createQuery() {
+        // op_alloc_gl_resource_id: direct, no-submit.
         const id = op_alloc_gl_resource_id_webgl2();
-        op_create_query(this._canvasId, id);
+        _rawCreateQuery(this._canvasId, id);
         const query = { _id: id, _kind: 'query' };
         this._queryRegistry.set(id, {
             active: false,
@@ -1718,7 +2277,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         if (this._currentQueryByTarget.get(state.target) === query) {
             this._currentQueryByTarget.delete(state.target);
         }
-        op_delete_query(query._id);
+        _rawDeleteQuery(query._id);
     }
     isQuery(query) {
         if (!query || !query._id) return false;
@@ -1733,7 +2292,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         state.target = target;
         state.active = true;
         this._currentQueryByTarget.set(target, query);
-        op_begin_query(this._canvasId, target, query._id);
+        _rawBeginQuery(this._canvasId, target, query._id);
     }
     endQuery(target) {
         const query = this._currentQueryByTarget.get(target);
@@ -1742,7 +2301,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
             if (state) state.active = false;
         }
         this._currentQueryByTarget.delete(target);
-        op_end_query(this._canvasId, target);
+        _rawEndQuery(this._canvasId, target);
     }
     getQuery(target, pname) {
         if (pname !== GL_CURRENT_QUERY) return null;
@@ -1756,13 +2315,14 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
      */
     getQueryParameter(query, pname) {
         if (!query || !query._id) return 0;
-        return op_get_query_parameter(query._id, pname);
+        return _rawGetQueryParameter(query._id, pname);
     }
 
     // ---- Transform Feedback ------------------------------------
     createTransformFeedback() {
+        // op_alloc_gl_resource_id: direct, no-submit.
         const id = op_alloc_gl_resource_id_webgl2();
-        op_create_transform_feedback(this._canvasId, id);
+        _rawCreateTransformFeedback(this._canvasId, id);
         const tf = { _id: id, _kind: 'tf' };
         this._tfRegistry.set(id, {
             active: false,
@@ -1784,7 +2344,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         if (this._currentTransformFeedback === tf) {
             this._currentTransformFeedback = null;
         }
-        op_delete_transform_feedback(tf._id);
+        _rawDeleteTransformFeedback(tf._id);
     }
     isTransformFeedback(tf) {
         if (!tf || !tf._id) return false;
@@ -1799,7 +2359,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
                 state.boundOnce = true;
             }
         }
-        op_bind_transform_feedback(this._canvasId, target, tf ? tf._id : 0);
+        _rawBindTransformFeedback(this._canvasId, target, tf ? tf._id : 0);
     }
     beginTransformFeedback(primitiveMode) {
         if (this._currentTransformFeedback && this._currentTransformFeedback._id) {
@@ -1809,7 +2369,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
                 state.paused = false;
             }
         }
-        op_begin_transform_feedback(this._canvasId, primitiveMode);
+        _rawBeginTransformFeedback(this._canvasId, primitiveMode);
     }
     endTransformFeedback() {
         if (this._currentTransformFeedback && this._currentTransformFeedback._id) {
@@ -1819,7 +2379,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
                 state.paused = false;
             }
         }
-        op_end_transform_feedback(this._canvasId);
+        _rawEndTransformFeedback(this._canvasId);
     }
     pauseTransformFeedback() {
         if (this._currentTransformFeedback && this._currentTransformFeedback._id) {
@@ -1828,7 +2388,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
                 state.paused = true;
             }
         }
-        op_pause_transform_feedback(this._canvasId);
+        _rawPauseTransformFeedback(this._canvasId);
     }
     resumeTransformFeedback() {
         if (this._currentTransformFeedback && this._currentTransformFeedback._id) {
@@ -1837,7 +2397,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
                 state.paused = false;
             }
         }
-        op_resume_transform_feedback(this._canvasId);
+        _rawResumeTransformFeedback(this._canvasId);
     }
     /**
      * transformFeedbackVaryings(program, varyings, bufferMode)
@@ -1849,11 +2409,11 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
     transformFeedbackVaryings(program, varyings, bufferMode) {
         if (!program || !program._id) return;
         const joined = (varyings || []).join('\x1f');
-        op_transform_feedback_varyings(this._canvasId, program._id, joined, bufferMode);
+        _rawTransformFeedbackVaryings(this._canvasId, program._id, joined, bufferMode);
     }
     getTransformFeedbackVarying(program, index) {
         if (!program || !program._id) return null;
-        const json = op_get_transform_feedback_varying(program._id, index);
+        const json = _rawGetTransformFeedbackVarying(program._id, index);
         if (!json) return null;
         try {
             return JSON.parse(json);
@@ -1886,7 +2446,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         } else if (pixelsOrOffset instanceof ArrayBuffer) {
             view = new Uint8Array(pixelsOrOffset);
         }
-        op_tex_image_3d(
+        _rawTexImage3D(
             this._canvasId, target, level, internalformat,
             width, height, depth, border, format, type,
             view, elementOffset, bytesPerElement, pboOffset,
@@ -1917,7 +2477,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         if (!view && pboOffset < 0) {
             return;
         }
-        op_tex_sub_image_3d(
+        _rawTexSubImage3D(
             this._canvasId, target, level,
             xoffset, yoffset, zoffset,
             width, height, depth, format, type,
@@ -1925,7 +2485,7 @@ class WebGL2RenderingContext extends WebGLRenderingContext {
         );
     }
     texStorage3D(target, levels, internalformat, width, height, depth) {
-        op_tex_storage_3d(
+        _rawTexStorage3D(
             this._canvasId, target, levels, internalformat,
             width, height, depth,
         );

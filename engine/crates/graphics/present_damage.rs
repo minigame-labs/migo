@@ -1,0 +1,1143 @@
+// present_damage.rs — pure, dependency-free damage/blit plan model.
+// No `use crate::…`, no Android/EGL/GL/Skia, no external crates.
+// Can be tested standalone: rustc --edition 2024 --test present_damage.rs
+
+// ── Public types ──────────────────────────────────────────────────────────────
+
+/// A non-empty, clipped, lower-left pixel rectangle.
+///
+/// All constructor math is checked or widened to i64 so no integer overflow is
+/// possible.  An invalid/empty geometry returns `None`; the caller must fall
+/// back to `DamageRegion::FullSurface`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl DamageRect {
+    /// Returns `None` if `width` or `height` <= 0, or if the right/top edge
+    /// overflows `i32`.
+    pub fn new(x: i32, y: i32, width: i32, height: i32) -> Option<Self> {
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        // Check x + width and y + height do not overflow i32.
+        let right = (x as i64).checked_add(width as i64)?;
+        let top = (y as i64).checked_add(height as i64)?;
+        if right > i32::MAX as i64 || top > i32::MAX as i64 {
+            return None;
+        }
+        Some(Self {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    /// Right edge (exclusive), always valid after construction.
+    #[inline]
+    fn right(self) -> i32 {
+        self.x + self.width
+    }
+
+    /// Top edge (exclusive, lower-left coords), always valid after
+    /// construction.
+    #[inline]
+    fn top(self) -> i32 {
+        self.y + self.height
+    }
+
+    /// Returns true if `other` is fully contained within `self`.
+    fn contains(self, other: Self) -> bool {
+        self.x <= other.x
+            && self.y <= other.y
+            && self.right() >= other.right()
+            && self.top() >= other.top()
+    }
+
+    /// Smallest AABB that covers both rectangles.
+    fn union_aabb(self, other: Self) -> Option<Self> {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = self.right().max(other.right());
+        let top = self.top().max(other.top());
+        let width = i32::try_from((right as i64) - (x as i64)).ok()?;
+        let height = i32::try_from((top as i64) - (y as i64)).ok()?;
+        Self::new(x, y, width, height)
+    }
+}
+
+// ── DamageRegion ─────────────────────────────────────────────────────────────
+
+/// A damage region: either the full surface, or 1-4 discrete lower-left rects.
+///
+/// The `Partial` variant is always non-empty (`len >= 1`) and never exceeds
+/// capacity 4.  Once the union causes effective rects to exceed 4, the region
+/// collapses to a single AABB and stays collapsed (sticky) for all future
+/// unions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DamageRegion {
+    /// Entire surface is damaged (or eligibility is unknown/failed).
+    FullSurface,
+    /// 1-4 discrete rectangles. No heap allocation.
+    Partial(PartialRegion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialRegion {
+    rects: [DamageRect; 4],
+    len: u8,
+    /// True once a union forced a 5th rect and we collapsed to one AABB.
+    collapsed: bool,
+}
+
+// Safe placeholder rect that is never exposed when `len < index`.
+const PLACEHOLDER: DamageRect = DamageRect {
+    x: 0,
+    y: 0,
+    width: 1,
+    height: 1,
+};
+
+impl PartialRegion {
+    /// Construct a region with exactly one rect.
+    fn single(r: DamageRect) -> Self {
+        Self {
+            rects: [r, PLACEHOLDER, PLACEHOLDER, PLACEHOLDER],
+            len: 1,
+            collapsed: false,
+        }
+    }
+
+    /// Slice of the live rectangles.
+    pub fn rects(&self) -> &[DamageRect] {
+        &self.rects[..self.len as usize]
+    }
+
+    /// Whether this region was collapsed to one AABB due to exceeding 4 rects.
+    #[allow(dead_code)]
+    pub fn is_collapsed(&self) -> bool {
+        self.collapsed
+    }
+}
+
+impl DamageRegion {
+    /// Single-rect partial region. Returns `FullSurface` on invalid geometry.
+    pub fn from_rect(r: DamageRect) -> Self {
+        DamageRegion::Partial(PartialRegion::single(r))
+    }
+
+    /// Union `self` with another region according to the sticky bounded rules.
+    ///
+    /// - Exact duplicates and fully-contained rects are dropped.
+    /// - Partial overlaps are kept as discrete rects.
+    /// - On overflow (would need >4 rects), collapse to one AABB (sticky).
+    /// - `FullSurface` union with anything => `FullSurface`.
+    pub fn union(self, other: DamageRegion) -> DamageRegion {
+        match (self, other) {
+            (DamageRegion::FullSurface, _) | (_, DamageRegion::FullSurface) => {
+                DamageRegion::FullSurface
+            }
+            (DamageRegion::Partial(mut a), DamageRegion::Partial(b)) => {
+                for &r in b.rects() {
+                    let Some(next) = union_rect_into(a, r) else {
+                        return DamageRegion::FullSurface;
+                    };
+                    a = next;
+                }
+                DamageRegion::Partial(a)
+            }
+        }
+    }
+
+    /// Returns the rects slice if this is a `Partial` region.
+    pub fn rects(&self) -> Option<&[DamageRect]> {
+        match self {
+            DamageRegion::FullSurface => None,
+            DamageRegion::Partial(p) => Some(p.rects()),
+        }
+    }
+
+    /// Return one AABB for stats/legacy consumers. `None` means the region is
+    /// full-surface or its discrete span cannot be represented by `DamageRect`.
+    pub fn bounding_rect(&self) -> Option<DamageRect> {
+        let mut rects = self.rects()?.iter().copied();
+        let mut aabb = rects.next()?;
+        for rect in rects {
+            aabb = aabb.union_aabb(rect)?;
+        }
+        Some(aabb)
+    }
+
+    pub fn is_full_surface(&self) -> bool {
+        matches!(self, DamageRegion::FullSurface)
+    }
+}
+
+/// Insert one rect into a `PartialRegion`, applying deduplication and sticky
+/// AABB collapse when needed. Returns `None` when the combined AABB cannot be
+/// represented by `DamageRect`; callers must fail closed to full-surface damage.
+fn union_rect_into(mut region: PartialRegion, new_rect: DamageRect) -> Option<PartialRegion> {
+    // If already collapsed to one AABB, expand it.
+    if region.collapsed {
+        let aabb = region.rects[0].union_aabb(new_rect)?;
+        region.rects[0] = aabb;
+        return Some(region);
+    }
+
+    let live = region.rects();
+
+    // Drop if it is fully contained by any existing rect.
+    for &existing in live {
+        if existing.contains(new_rect) {
+            return Some(region);
+        }
+    }
+
+    // Remove existing rects that are fully contained by new_rect.
+    let mut buf: [DamageRect; 4] = [PLACEHOLDER; 4];
+    let mut buf_len: u8 = 0;
+    for &existing in live {
+        if !new_rect.contains(existing) {
+            buf[buf_len as usize] = existing;
+            buf_len += 1;
+        }
+    }
+
+    // Check for exact duplicate.
+    let already_present = buf[..buf_len as usize].iter().any(|&r| r == new_rect);
+    if already_present {
+        return Some(PartialRegion {
+            rects: buf,
+            len: buf_len,
+            collapsed: false,
+        });
+    }
+
+    if buf_len < 4 {
+        buf[buf_len as usize] = new_rect;
+        buf_len += 1;
+        Some(PartialRegion {
+            rects: buf,
+            len: buf_len,
+            collapsed: false,
+        })
+    } else {
+        // Would need a fifth slot → collapse to AABB.
+        let mut aabb = buf[0];
+        for i in 1..buf_len as usize {
+            aabb = aabb.union_aabb(buf[i])?;
+        }
+        aabb = aabb.union_aabb(new_rect)?;
+        Some(PartialRegion {
+            rects: [aabb, PLACEHOLDER, PLACEHOLDER, PLACEHOLDER],
+            len: 1,
+            collapsed: true,
+        })
+    }
+}
+
+// ── PresentDamageHistory ─────────────────────────────────────────────────────
+
+/// Ring-buffer of up to 4 successfully-presented current-frame regions.
+///
+/// Entry 0 is the most-recently pushed.  Capacity matches the maximum
+/// buffer age a driver can return (4 is generous; EGL implementations
+/// typically stay at 2-3 but the spec has no upper bound).
+pub struct PresentDamageHistory {
+    // Index 0 = newest; up to 4 entries.
+    entries: [Option<DamageRegion>; 4],
+    len: usize,
+}
+
+impl PresentDamageHistory {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None, None, None, None],
+            len: 0,
+        }
+    }
+
+    /// Record the current-frame region after a successful swap.
+    /// Oldest entry is dropped when capacity is exceeded.
+    pub fn push(&mut self, region: DamageRegion) {
+        // Shift older entries towards the end to make room at index 0 for newest.
+        if self.len < 4 {
+            self.len += 1;
+        }
+        for i in (1..self.len).rev() {
+            self.entries[i] = self.entries[i - 1].take();
+        }
+        self.entries[0] = Some(region);
+    }
+
+    /// Number of stored entries.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Clear all history (surface resize, context loss, etc.).
+    pub fn clear(&mut self) {
+        self.entries = [None, None, None, None];
+        self.len = 0;
+    }
+
+    /// Compute the repair region for the given buffer age.
+    ///
+    /// - age <= 0 → `FullSurface`
+    /// - age 1 → return `current` directly (no history needed)
+    /// - age N → union `current` with the newest `N-1` history entries
+    /// - fewer than `N-1` history entries → `FullSurface`
+    /// - `current` or any consumed entry is `FullSurface` → `FullSurface`
+    pub fn resolve_with_age(&self, current: &DamageRegion, buffer_age: i32) -> DamageRegion {
+        if buffer_age <= 0 {
+            return DamageRegion::FullSurface;
+        }
+        if buffer_age == 1 {
+            return current.clone();
+        }
+        // Need age-1 history entries.
+        let needed = (buffer_age - 1) as usize;
+        if self.len < needed {
+            return DamageRegion::FullSurface;
+        }
+        // Start with current and union each required history entry.
+        let mut repair = current.clone();
+        for i in 0..needed {
+            let entry = self.entries[i]
+                .as_ref()
+                .expect("len guarantees entry present");
+            repair = repair.union(entry.clone());
+            if repair.is_full_surface() {
+                return DamageRegion::FullSurface;
+            }
+        }
+        repair
+    }
+}
+
+// ── PresentDamagePlan ─────────────────────────────────────────────────────────
+
+/// Output of the eligibility gate.
+///
+/// `current` is always the real current-frame damage (for history recording).
+/// `repair` is the age-expanded buffer damage; `FullSurface` when any
+/// eligibility check fails.
+#[derive(Debug, Clone)]
+pub struct PresentDamagePlan {
+    pub current: DamageRegion,
+    pub repair: DamageRegion,
+}
+
+/// Build a `PresentDamagePlan` from current damage + eligibility parameters.
+///
+/// Eligibility fails (repair=FullSurface) when:
+/// - `age_supported` is false
+/// - `buffer_age <= 0`
+/// - `!db_matches_surface` (dimension mismatch)
+/// - `!dest_single_sample` (multisampled window surface)
+/// - history shortage for the requested age
+/// - `current` is `FullSurface`
+/// - any history entry consumed is `FullSurface`
+pub fn build_present_plan(
+    current: DamageRegion,
+    history: &PresentDamageHistory,
+    age_supported: bool,
+    buffer_age: i32,
+    db_matches_surface: bool,
+    dest_single_sample: bool,
+) -> PresentDamagePlan {
+    let repair = if !age_supported || buffer_age <= 0 || !db_matches_surface || !dest_single_sample
+    {
+        DamageRegion::FullSurface
+    } else if current.is_full_surface() {
+        DamageRegion::FullSurface
+    } else {
+        history.resolve_with_age(&current, buffer_age)
+    };
+    PresentDamagePlan { current, repair }
+}
+
+// ── EXT-vs-KHR demotion helper ────────────────────────────────────────────────
+
+/// Adjust repair after `eglSetDamageRegionKHR` declaration failure.
+///
+/// If `EGL_EXT_buffer_age` is independently advertised, the aged buffer
+/// contents are available regardless of the KHR declaration, so the partial
+/// repair can be kept.
+///
+/// If only `EGL_KHR_partial_update` provides age semantics and its declaration
+/// failed, the spec says contents outside the declared region are undefined;
+/// we must fall back to `FullSurface`.
+pub fn repair_after_declaration_failure(
+    plan: PresentDamagePlan,
+    ext_buffer_age_independently_advertised: bool,
+) -> PresentDamagePlan {
+    if ext_buffer_age_independently_advertised {
+        plan
+    } else {
+        PresentDamagePlan {
+            current: plan.current,
+            repair: DamageRegion::FullSurface,
+        }
+    }
+}
+
+// ── BlitPlan ──────────────────────────────────────────────────────────────────
+
+/// How the DrawingBuffer should be blitted to the window surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlitPlan {
+    /// Full-surface blit using GL_LINEAR (legacy / scaled path).
+    Full { linear: bool },
+    /// 1-4 identity-coordinate rects using GL_NEAREST.
+    Rects(BlitRects),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlitRects {
+    rects: [DamageRect; 4],
+    len: u8,
+}
+
+impl BlitRects {
+    /// Slice of the rects to blit.
+    pub fn rects(&self) -> &[DamageRect] {
+        &self.rects[..self.len as usize]
+    }
+}
+
+/// Derive a `BlitPlan` from the repair region and surface/sample properties.
+///
+/// Partial (NEAREST, identity coords) requires:
+/// - `repair` is `Partial`
+/// - `db_matches_surface` (same-size: source == destination, no Y flip)
+/// - `dest_single_sample` (no MSAA on the window surface)
+///
+/// Otherwise: `Full { linear: true }`.
+pub fn blit_plan(
+    repair: &DamageRegion,
+    db_matches_surface: bool,
+    dest_single_sample: bool,
+) -> BlitPlan {
+    match repair {
+        DamageRegion::Partial(p) if db_matches_surface && dest_single_sample => {
+            let mut rects = [PLACEHOLDER; 4];
+            let len = p.len;
+            rects[..len as usize].copy_from_slice(p.rects());
+            BlitPlan::Rects(BlitRects { rects, len })
+        }
+        _ => BlitPlan::Full { linear: true },
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> DamageRect {
+        DamageRect::new(x, y, w, h).expect("valid rect")
+    }
+
+    fn partial(rects: &[DamageRect]) -> DamageRegion {
+        assert!(!rects.is_empty() && rects.len() <= 4);
+        let mut region = DamageRegion::from_rect(rects[0]);
+        for &r in &rects[1..] {
+            region = region.union(DamageRegion::from_rect(r));
+        }
+        region
+    }
+
+    // ── DamageRect validation ────────────────────────────────────────────────
+
+    #[test]
+    fn empty_width_fails() {
+        assert!(DamageRect::new(0, 0, 0, 10).is_none());
+    }
+
+    #[test]
+    fn empty_height_fails() {
+        assert!(DamageRect::new(0, 0, 10, 0).is_none());
+    }
+
+    #[test]
+    fn negative_width_fails() {
+        assert!(DamageRect::new(0, 0, -1, 10).is_none());
+    }
+
+    #[test]
+    fn negative_height_fails() {
+        assert!(DamageRect::new(0, 0, 10, -1).is_none());
+    }
+
+    #[test]
+    fn overflow_right_edge_fails() {
+        assert!(DamageRect::new(i32::MAX, 0, 1, 1).is_none());
+    }
+
+    #[test]
+    fn overflow_top_edge_fails() {
+        assert!(DamageRect::new(0, i32::MAX, 1, 1).is_none());
+    }
+
+    #[test]
+    fn valid_rect_succeeds() {
+        let rect = DamageRect::new(10, 20, 100, 200).unwrap();
+        assert_eq!(rect.x, 10);
+        assert_eq!(rect.y, 20);
+        assert_eq!(rect.width, 100);
+        assert_eq!(rect.height, 200);
+    }
+
+    // ── age 0 / query failure / unsupported → FullSurface ────────────────────
+
+    #[test]
+    fn age_zero_gives_full_repair() {
+        let h = PresentDamageHistory::new();
+        let current = partial(&[r(0, 0, 100, 100)]);
+        let plan = build_present_plan(current, &h, true, 0, true, true);
+        assert!(plan.repair.is_full_surface());
+    }
+
+    #[test]
+    fn negative_age_gives_full_repair() {
+        let h = PresentDamageHistory::new();
+        let current = partial(&[r(0, 0, 100, 100)]);
+        let plan = build_present_plan(current, &h, true, -1, true, true);
+        assert!(plan.repair.is_full_surface());
+    }
+
+    #[test]
+    fn unsupported_age_gives_full_repair() {
+        let h = PresentDamageHistory::new();
+        let current = partial(&[r(0, 0, 100, 100)]);
+        let plan = build_present_plan(current, &h, false, 1, true, true);
+        assert!(plan.repair.is_full_surface());
+    }
+
+    #[test]
+    fn history_shortage_gives_full_repair() {
+        let mut h = PresentDamageHistory::new();
+        h.push(partial(&[r(0, 0, 50, 50)]));
+        let current = partial(&[r(10, 10, 20, 20)]);
+        let plan = build_present_plan(current, &h, true, 3, true, true);
+        assert!(plan.repair.is_full_surface());
+    }
+
+    #[test]
+    fn full_current_gives_full_repair() {
+        let mut h = PresentDamageHistory::new();
+        h.push(partial(&[r(0, 0, 50, 50)]));
+        let plan = build_present_plan(DamageRegion::FullSurface, &h, true, 1, true, true);
+        assert!(plan.repair.is_full_surface());
+    }
+
+    #[test]
+    fn full_history_entry_poisons_repair() {
+        let mut h = PresentDamageHistory::new();
+        h.push(DamageRegion::FullSurface);
+        let current = partial(&[r(0, 0, 10, 10)]);
+        let plan = build_present_plan(current, &h, true, 2, true, true);
+        assert!(plan.repair.is_full_surface());
+    }
+
+    // ── current is always preserved ──────────────────────────────────────────
+
+    #[test]
+    fn current_preserved_when_repair_full() {
+        let h = PresentDamageHistory::new();
+        let current = partial(&[r(5, 5, 30, 30)]);
+        let plan = build_present_plan(current.clone(), &h, true, 0, true, true);
+        assert!(plan.repair.is_full_surface());
+        assert_eq!(plan.current, current);
+    }
+
+    // ── KHR-only vs EXT-independent demotion ─────────────────────────────────
+
+    #[test]
+    fn khr_only_declaration_failure_forces_full() {
+        let h = PresentDamageHistory::new();
+        let current = partial(&[r(0, 0, 100, 100)]);
+        let plan = build_present_plan(current, &h, true, 1, true, true);
+        let demoted = repair_after_declaration_failure(plan, false);
+        assert!(demoted.repair.is_full_surface());
+    }
+
+    #[test]
+    fn ext_independent_declaration_failure_keeps_partial() {
+        let h = PresentDamageHistory::new();
+        let current = partial(&[r(0, 0, 100, 100)]);
+        let plan = build_present_plan(current, &h, true, 1, true, true);
+        let kept = repair_after_declaration_failure(plan, true);
+        assert!(!kept.repair.is_full_surface());
+    }
+
+    // ── age 1 preserves 1-4 current rects ────────────────────────────────────
+
+    #[test]
+    fn age_1_single_rect() {
+        let h = PresentDamageHistory::new();
+        let rect = r(10, 10, 50, 50);
+        let current = DamageRegion::from_rect(rect);
+        let plan = build_present_plan(current, &h, true, 1, true, true);
+        let repair_rects = plan.repair.rects().expect("partial repair");
+        assert_eq!(repair_rects, &[rect]);
+    }
+
+    #[test]
+    fn age_1_four_rects_preserved() {
+        let h = PresentDamageHistory::new();
+        let rects = [
+            r(0, 0, 10, 10),
+            r(20, 0, 10, 10),
+            r(0, 20, 10, 10),
+            r(20, 20, 10, 10),
+        ];
+        let current = partial(&rects);
+        let plan = build_present_plan(current, &h, true, 1, true, true);
+        let repair_rects = plan.repair.rects().expect("partial repair");
+        assert_eq!(repair_rects.len(), 4);
+    }
+
+    // ── age 2/3 unions exactly the newest required frames ────────────────────
+
+    #[test]
+    fn age_2_unions_current_with_newest_history() {
+        let mut h = PresentDamageHistory::new();
+        let hist_rect = r(50, 50, 10, 10);
+        let curr_rect = r(0, 0, 10, 10);
+        h.push(partial(&[hist_rect]));
+        let current = partial(&[curr_rect]);
+        let plan = build_present_plan(current, &h, true, 2, true, true);
+        let repair_rects = plan.repair.rects().expect("partial repair");
+        assert_eq!(repair_rects.len(), 2);
+        assert!(repair_rects.contains(&curr_rect));
+        assert!(repair_rects.contains(&hist_rect));
+    }
+
+    #[test]
+    fn age_3_unions_current_with_two_newest_history() {
+        let mut h = PresentDamageHistory::new();
+        let h0 = r(0, 0, 10, 10);
+        let h1 = r(20, 20, 10, 10);
+        let older = r(200, 200, 5, 5);
+        h.push(partial(&[older]));
+        h.push(partial(&[h1]));
+        h.push(partial(&[h0]));
+        let curr_rect = r(40, 40, 10, 10);
+        let current = partial(&[curr_rect]);
+        let plan = build_present_plan(current, &h, true, 3, true, true);
+        let repair_rects = plan.repair.rects().expect("partial repair");
+        assert!(repair_rects.contains(&curr_rect));
+        assert!(repair_rects.contains(&h0));
+        assert!(repair_rects.contains(&h1));
+        assert!(!repair_rects.contains(&older));
+    }
+
+    // ── >4 rects collapse to sticky AABB ─────────────────────────────────────
+
+    #[test]
+    fn fifth_rect_collapses_to_aabb() {
+        let r1 = r(0, 0, 10, 10);
+        let r2 = r(20, 0, 10, 10);
+        let r3 = r(0, 20, 10, 10);
+        let r4 = r(20, 20, 10, 10);
+        let r5 = r(40, 40, 10, 10);
+
+        let region = partial(&[r1, r2, r3, r4]);
+        let region = region.union(DamageRegion::from_rect(r5));
+
+        let p = match &region {
+            DamageRegion::Partial(p) => p,
+            _ => panic!("expected Partial"),
+        };
+        assert!(p.is_collapsed());
+        assert_eq!(p.rects().len(), 1);
+        let aabb = p.rects()[0];
+        assert!(aabb.x <= 0 && aabb.y <= 0);
+        assert!(aabb.right() >= 50 && aabb.top() >= 50);
+    }
+
+    #[test]
+    fn post_collapse_union_stays_collapsed_does_not_refragment() {
+        let r1 = r(0, 0, 10, 10);
+        let r2 = r(20, 0, 10, 10);
+        let r3 = r(0, 20, 10, 10);
+        let r4 = r(20, 20, 10, 10);
+        let r5 = r(40, 40, 10, 10);
+
+        let region = partial(&[r1, r2, r3, r4]);
+        let region = region.union(DamageRegion::from_rect(r5));
+        let region = region.union(DamageRegion::from_rect(r(100, 100, 5, 5)));
+        let region = region.union(DamageRegion::from_rect(r(200, 200, 5, 5)));
+
+        let p = match &region {
+            DamageRegion::Partial(p) => p,
+            _ => panic!("expected Partial"),
+        };
+        assert!(p.is_collapsed(), "must stay collapsed");
+        assert_eq!(p.rects().len(), 1, "must remain one AABB");
+        let aabb = p.rects()[0];
+        assert!(aabb.right() >= 205 && aabb.top() >= 205);
+    }
+
+    #[test]
+    fn unrepresentable_aabb_span_fails_closed_to_full_surface() {
+        let rects = [
+            r(i32::MIN, 0, 1, 1),
+            r(i32::MAX - 1, 0, 1, 1),
+            r(0, 10, 1, 1),
+            r(0, 20, 1, 1),
+            r(0, 30, 1, 1),
+        ];
+
+        let region = partial(&rects[..4]).union(DamageRegion::from_rect(rects[4]));
+
+        assert_eq!(region, DamageRegion::FullSurface);
+    }
+
+    #[test]
+    fn unrepresentable_discrete_region_has_no_stats_aabb() {
+        let region = partial(&[r(i32::MIN, 0, 1, 1), r(i32::MAX - 1, 0, 1, 1)]);
+
+        assert!(region.bounding_rect().is_none());
+    }
+
+    // ── containment deduplication ─────────────────────────────────────────────
+
+    #[test]
+    fn contained_rect_dropped() {
+        let big = r(0, 0, 100, 100);
+        let small = r(10, 10, 10, 10);
+        let region = partial(&[big]);
+        let region = region.union(DamageRegion::from_rect(small));
+        let rects = region.rects().expect("partial");
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0], big);
+    }
+
+    #[test]
+    fn exact_duplicate_dropped() {
+        let rect = r(5, 5, 20, 20);
+        let region = DamageRegion::from_rect(rect);
+        let region = region.union(DamageRegion::from_rect(rect));
+        let rects = region.rects().expect("partial");
+        assert_eq!(rects.len(), 1);
+    }
+
+    #[test]
+    fn new_rect_containing_existing_absorbs_it() {
+        let small = r(10, 10, 5, 5);
+        let big = r(0, 0, 100, 100);
+        let region = DamageRegion::from_rect(small);
+        let region = region.union(DamageRegion::from_rect(big));
+        let rects = region.rects().expect("partial");
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0], big);
+    }
+
+    // ── history mechanics ─────────────────────────────────────────────────────
+
+    #[test]
+    fn history_advances_only_on_push() {
+        let mut h = PresentDamageHistory::new();
+        assert_eq!(h.len(), 0);
+        h.push(partial(&[r(0, 0, 10, 10)]));
+        assert_eq!(h.len(), 1);
+        h.push(partial(&[r(10, 10, 10, 10)]));
+        assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn history_clears_on_reset() {
+        let mut h = PresentDamageHistory::new();
+        h.push(partial(&[r(0, 0, 10, 10)]));
+        h.push(partial(&[r(20, 20, 10, 10)]));
+        h.clear();
+        assert_eq!(h.len(), 0);
+    }
+
+    #[test]
+    fn history_evicts_oldest_when_at_capacity() {
+        let mut h = PresentDamageHistory::new();
+        h.push(partial(&[r(0, 0, 5, 5)]));
+        h.push(partial(&[r(10, 0, 5, 5)]));
+        h.push(partial(&[r(20, 0, 5, 5)]));
+        h.push(partial(&[r(30, 0, 5, 5)]));
+        h.push(partial(&[r(40, 0, 5, 5)]));
+        assert_eq!(h.len(), 4);
+        let current = partial(&[r(50, 0, 5, 5)]);
+        let repair = h.resolve_with_age(&current, 5);
+        assert!(!repair.is_full_surface());
+        let repair_rects = repair.rects().expect("partial");
+        assert!(!repair_rects.contains(&r(0, 0, 5, 5)));
+    }
+
+    #[test]
+    fn history_newest_entry_is_at_index_zero() {
+        let mut h = PresentDamageHistory::new();
+        h.push(partial(&[r(0, 0, 10, 10)]));
+        h.push(partial(&[r(99, 99, 1, 1)]));
+        let current = partial(&[r(50, 50, 5, 5)]);
+        let repair = h.resolve_with_age(&current, 2);
+        let rects = repair.rects().expect("partial");
+        assert!(rects.contains(&r(99, 99, 1, 1)));
+    }
+
+    // ── scaling / multisample → Full BlitPlan ────────────────────────────────
+
+    #[test]
+    fn size_mismatch_gives_full_blit_plan() {
+        let repair = partial(&[r(0, 0, 100, 100)]);
+        let plan = blit_plan(&repair, false, true);
+        assert_eq!(plan, BlitPlan::Full { linear: true });
+    }
+
+    #[test]
+    fn multisample_gives_full_blit_plan() {
+        let repair = partial(&[r(0, 0, 100, 100)]);
+        let plan = blit_plan(&repair, true, false);
+        assert_eq!(plan, BlitPlan::Full { linear: true });
+    }
+
+    #[test]
+    fn full_surface_repair_gives_full_blit_plan() {
+        let plan = blit_plan(&DamageRegion::FullSurface, true, true);
+        assert_eq!(plan, BlitPlan::Full { linear: true });
+    }
+
+    // ── same-size partial → Rects NEAREST ────────────────────────────────────
+
+    #[test]
+    fn same_size_single_sample_gives_rect_blit_plan() {
+        let rect = r(10, 10, 50, 50);
+        let repair = DamageRegion::from_rect(rect);
+        let plan = blit_plan(&repair, true, true);
+        match plan {
+            BlitPlan::Rects(br) => {
+                assert_eq!(br.rects(), &[rect]);
+            }
+            other => panic!("expected Rects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rect_blit_coords_are_identical_source_and_dest_no_y_flip() {
+        let rects_in = [r(0, 0, 10, 10), r(50, 50, 20, 20)];
+        let repair = partial(&rects_in);
+        let plan = blit_plan(&repair, true, true);
+        match plan {
+            BlitPlan::Rects(br) => {
+                let out = br.rects();
+                for expected in &rects_in {
+                    assert!(
+                        out.contains(expected),
+                        "rect {expected:?} missing from blit plan"
+                    );
+                }
+            }
+            other => panic!("expected Rects, got {other:?}"),
+        }
+    }
+
+    // ── build_present_plan eligibility checks ─────────────────────────────────
+
+    #[test]
+    fn size_mismatch_in_plan_gives_full_repair() {
+        let mut h = PresentDamageHistory::new();
+        h.push(partial(&[r(0, 0, 10, 10)]));
+        let current = partial(&[r(0, 0, 10, 10)]);
+        let plan = build_present_plan(current, &h, true, 2, false, true);
+        assert!(plan.repair.is_full_surface());
+    }
+
+    #[test]
+    fn multisample_in_plan_gives_full_repair() {
+        let mut h = PresentDamageHistory::new();
+        h.push(partial(&[r(0, 0, 10, 10)]));
+        let current = partial(&[r(0, 0, 10, 10)]);
+        let plan = build_present_plan(current, &h, true, 2, true, false);
+        assert!(plan.repair.is_full_surface());
+    }
+
+    // ── full-surface union ─────────────────────────────────────────────────────
+
+    #[test]
+    fn full_union_anything_stays_full() {
+        let region = DamageRegion::FullSurface;
+        let other = partial(&[r(0, 0, 100, 100)]);
+        assert_eq!(region.union(other), DamageRegion::FullSurface);
+    }
+
+    #[test]
+    fn anything_union_full_stays_full() {
+        let region = partial(&[r(0, 0, 100, 100)]);
+        assert_eq!(
+            region.union(DamageRegion::FullSurface),
+            DamageRegion::FullSurface
+        );
+    }
+}
+
+// ── Wiring source-contract guards ──────────────────────────────────────────────
+//
+// The manager/DrawingBuffer wiring cannot be unit-tested at runtime on this host
+// (the full `graphics` test binary fails to link without EGL/freetype/fontconfig).
+// The pure decision logic above IS runtime-tested; these guards lock the
+// remaining wiring invariants that the pure tests cannot observe — that the
+// manager consumes `repair` (never `current`) for the EGL declaration and blit,
+// records `current` (never `repair`) into history, queries the destination
+// sample config + the independent EXT flag, and clears the pending plan on every
+// lifecycle reset; and that the blit consumes a `BlitPlan`, restores scissor once,
+// and never invalidates the framebuffer. `include_str!` keeps them host-runnable
+// (paths resolve relative to this file under both `rustc --test` and cargo).
+#[cfg(test)]
+mod wiring_source_guards {
+    const MGR: &str = include_str!("canvas/manager/mod.rs");
+    const DB: &str = include_str!("canvas/manager/drawing_buffer.rs");
+
+    fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .expect("function signature must exist");
+        let source = &source[start..];
+        let open = source.find('{').expect("function body must open");
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open + 1..open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("function body must close");
+    }
+
+    #[test]
+    fn manager_uses_present_damage_history_not_legacy() {
+        assert!(
+            MGR.contains("PresentDamageHistory"),
+            "manager must store the multi-rect PresentDamageHistory"
+        );
+        assert!(
+            !MGR.contains("damage_tracker::DamageHistory"),
+            "legacy AABB-only DamageHistory must be removed from the manager"
+        );
+    }
+
+    #[test]
+    fn manager_uses_keyed_pending_plan() {
+        assert!(
+            MGR.contains("pending_present_plan"),
+            "manager must cache a keyed PresentDamagePlan"
+        );
+        assert!(
+            !MGR.contains("pending_declared_damage"),
+            "legacy tuple cache must be replaced by the keyed plan"
+        );
+        assert!(
+            MGR.contains("pending_present_plan = Some((id,"),
+            "declare_frame_damage must cache the plan keyed by canvas id"
+        );
+    }
+
+    #[test]
+    fn manager_blit_consumes_repair_and_history_records_current() {
+        // The blit's region argument must be `repair`, never `current`. Scan the
+        // window after the single `blit_plan(` call so the guard is robust to
+        // rustfmt wrapping the arguments across lines.
+        let call = MGR.find("blit_plan(").expect("swap must call blit_plan");
+        let window = &MGR[call..(call + 160).min(MGR.len())];
+        assert!(
+            window.contains("&plan.repair"),
+            "blit_plan's region argument must be the repair region"
+        );
+        assert!(
+            !window.contains("plan.current"),
+            "the blit must never be derived from the current region"
+        );
+        assert!(
+            MGR.contains("push(plan.current"),
+            "successful-swap history must record current-frame surface damage"
+        );
+        assert!(
+            !MGR.contains("push(plan.repair"),
+            "history must never record the age-expanded repair region"
+        );
+    }
+
+    #[test]
+    fn manager_queries_config_samples_and_independent_ext_flag() {
+        assert!(
+            MGR.contains("EGL_SAMPLE_BUFFERS") && MGR.contains("dest_single_sample"),
+            "manager must query the selected EGL config sample buffers/samples"
+        );
+        assert!(
+            MGR.contains("repair_after_declaration_failure") && MGR.contains("has_ext_buffer_age"),
+            "declaration failure must demote via the independent EGL_EXT_buffer_age flag"
+        );
+    }
+
+    #[test]
+    fn manager_clears_pending_plan_on_every_lifecycle_reset() {
+        let clears = MGR.matches("self.pending_present_plan = None;").count();
+        assert!(
+            clears >= 4,
+            "every history-clear lifecycle site must also clear the pending plan (found {clears})"
+        );
+    }
+
+    #[test]
+    fn manager_makes_target_surface_current_before_age_query_and_declaration() {
+        let body = function_body(MGR, "fn prepare_present_plan");
+        let make_current = body
+            .find("make_current_needed(id)")
+            .expect("present-plan preparation must make the target surface current");
+        let age_query = body
+            .find("query_surface")
+            .expect("present-plan preparation must query buffer age");
+        assert!(
+            make_current < age_query,
+            "the target surface must be current before querying age or declaring damage"
+        );
+    }
+
+    #[test]
+    fn onscreen_drawing_buffer_resize_invalidates_present_state() {
+        let start = MGR
+            .find("if matches!(kind, SurfaceKind::Window(_))")
+            .expect("window DrawingBuffer resize branch must exist");
+        let end = MGR[start..]
+            .find("return Ok(());")
+            .expect("window DrawingBuffer resize branch must return");
+        let branch = &MGR[start..start + end];
+        assert!(
+            branch.contains("self.damage_history.clear()"),
+            "DrawingBuffer resize must invalidate buffer-age history"
+        );
+        assert!(
+            branch.contains("self.pending_present_plan = None;"),
+            "DrawingBuffer resize must discard any plan built for the old storage"
+        );
+        assert!(
+            branch.contains("DamageEffect::FullSurface"),
+            "the first present after DrawingBuffer resize must be full"
+        );
+    }
+
+    #[test]
+    fn same_window_surface_resize_updates_physical_extent() {
+        let start = MGR
+            .find("CanvasManager::create_onscreen fast resize")
+            .expect("same-window surface resize branch must exist");
+        let end = MGR[start..]
+            .find("self.last_window = Some(window);")
+            .expect("fast resize branch must precede full surface recreation");
+        let branch = &MGR[start..start + end];
+        assert!(
+            branch.contains("entry.physical_width =") && branch.contains("entry.physical_height ="),
+            "surface-driven fast resize must update the dimensions used by present/blit"
+        );
+    }
+
+    #[test]
+    fn swap_failure_preserves_accumulated_damage_for_retry() {
+        let body = function_body(MGR, "pub(crate) fn swap_buffers_no_restore");
+        let swap = body
+            .find(".swap_buffers(")
+            .expect("swap path must call eglSwapBuffers");
+        let reset = body
+            .find("self.damage.reset()")
+            .expect("successful present must reset frame damage");
+        assert!(
+            swap < reset,
+            "frame damage must only reset after eglSwapBuffers succeeds"
+        );
+    }
+
+    #[test]
+    fn blit_failure_poison_is_propagated_to_present_history() {
+        let declaration = DB
+            .find("pub(crate) fn blit_to_surface")
+            .expect("DrawingBuffer blit function must exist");
+        let signature_end = DB[declaration..]
+            .find('{')
+            .expect("DrawingBuffer blit function body must open");
+        assert!(
+            DB[declaration..declaration + signature_end].contains("-> bool"),
+            "DrawingBuffer blit must report whether every repair write succeeded"
+        );
+
+        let swap = function_body(MGR, "pub(crate) fn swap_buffers_no_restore");
+        assert!(
+            swap.contains("blit_succeeded"),
+            "swap must consume the DrawingBuffer blit outcome"
+        );
+        assert!(
+            swap.contains("self.damage_history.clear()")
+                && swap.contains("DamageRegion::FullSurface"),
+            "a failed blit followed by a successful swap must poison history"
+        );
+    }
+
+    #[test]
+    fn bypass_transition_invalidates_present_history() {
+        let body = function_body(MGR, "pub(crate) fn evaluate_bypass");
+        assert!(
+            body.contains("self.damage_history.clear()")
+                && body.contains("self.pending_present_plan = None;")
+                && body.contains("DamageEffect::FullSurface"),
+            "switching between direct-FBO and DrawingBuffer presentation must force a full boundary"
+        );
+    }
+
+    #[test]
+    fn drawing_buffer_consumes_blit_plan_with_correct_filters() {
+        assert!(
+            DB.contains("BlitPlan"),
+            "blit_to_surface must consume a BlitPlan"
+        );
+        assert!(
+            DB.contains("BlitPlan::Rects") && DB.contains("BlitPlan::Full"),
+            "blit must handle both the rect and full variants"
+        );
+        assert!(
+            DB.contains("glow::NEAREST"),
+            "identity partial rect blits must use NEAREST"
+        );
+        assert!(
+            DB.contains("glow::LINEAR"),
+            "the full/scaled fallback must keep LINEAR filtering"
+        );
+    }
+
+    #[test]
+    fn drawing_buffer_no_invalidate_single_scissor_restore() {
+        assert!(
+            !DB.contains("invalidate_framebuffer") && !DB.contains("invalidate_sub_framebuffer"),
+            "must not invalidate the framebuffer — buffer-age repair needs persistent pixels"
+        );
+        let restores = DB.matches("enable(glow::SCISSOR_TEST)").count();
+        assert_eq!(
+            restores, 1,
+            "scissor enable must be restored from exactly one cleanup epilogue (found {restores})"
+        );
+    }
+}

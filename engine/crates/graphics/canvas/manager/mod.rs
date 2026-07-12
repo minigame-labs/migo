@@ -374,19 +374,29 @@ pub(crate) struct CanvasManager {
     /// Resolved at swap time to determine partial vs full surface update.
     pub(crate) damage: crate::damage_effect::FrameDamageAccumulator,
 
-    /// History of recent frame damages for buffer-age-aware partial present.
-    damage_history: crate::dirty_region::damage_tracker::DamageHistory,
+    /// History of recent successfully-presented current-frame damage regions.
+    /// Unioned with the queried buffer age to compute the exact repair region.
+    damage_history: crate::present_damage::PresentDamageHistory,
 
-    /// Resolved damage for the frame-in-flight, cached by
-    /// [`declare_frame_damage`] so that [`swap_buffers_no_restore`]
-    /// can reuse the result instead of resolving a second time.
-    /// The accumulator is never mutated between those two calls in
-    /// the current render-thread loop, so the second resolve is
-    /// observationally identical.  Cleared after swap consumes it.
-    pending_declared_damage: Option<(
-        CanvasId,
-        crate::dirty_region::damage_tracker::ResolvedDamage,
-    )>,
+    /// The present/blit plan for the frame-in-flight, keyed by canvas id.
+    /// [`declare_frame_damage`] builds and caches it (declaring the `repair`
+    /// region to the compositor before any FBO 0 write); [`swap_buffers_no_restore`]
+    /// consumes it so the blit and history use the exact same `repair`/`current`
+    /// regions. A missing or mismatched entry is recomputed safely before
+    /// touching FBO 0; it never reuses another canvas/frame's plan.
+    pending_present_plan: Option<(CanvasId, crate::present_damage::PresentDamagePlan)>,
+
+    /// Whether the selected EGL window-surface config is single-sample
+    /// (`EGL_SAMPLE_BUFFERS == 0 && EGL_SAMPLES == 0`). Queried once at init;
+    /// a multisampled config — or a failed query — disables the partial blit
+    /// because identity-coordinate rect blits are only valid single-sample.
+    dest_single_sample: bool,
+
+    /// `EGL_EXT_buffer_age` is independently advertised (never inferred from
+    /// `EGL_KHR_partial_update`). Governs whether a rejected/absent
+    /// `eglSetDamageRegionKHR` declaration may keep a partial repair: EXT
+    /// guarantees the aged back-buffer contents, KHR-only does not.
+    has_ext_buffer_age: bool,
 }
 
 impl CanvasManager {
@@ -557,6 +567,24 @@ impl CanvasManager {
             tracing::info!("EGL_KHR_partial_update available");
         }
 
+        // Query the selected EGL config's multisample state once. The partial
+        // DrawingBuffer→surface blit uses identity source/dest coordinates,
+        // which is only valid for a single-sample destination; a multisampled
+        // window surface — or a failed query — forces the legacy full blit.
+        const EGL_SAMPLE_BUFFERS: egl::Int = 0x3032;
+        const EGL_SAMPLES: egl::Int = 0x3031;
+        let dest_single_sample = match (
+            egl.get_config_attrib(display, config, EGL_SAMPLE_BUFFERS),
+            egl.get_config_attrib(display, config, EGL_SAMPLES),
+        ) {
+            (Ok(sample_buffers), Ok(samples)) => sample_buffers == 0 && samples == 0,
+            _ => false,
+        };
+        // Cache whether EGL_EXT_buffer_age is *independently* advertised (as
+        // opposed to age support supplied only by EGL_KHR_partial_update) before
+        // `device_caps` is moved into `Self`.
+        let has_ext_buffer_age = device_caps.has_ext_buffer_age;
+
         // Probe `GL_KHR_robustness::glGetGraphicsResetStatusKHR` (R-3).
         // Only resolved when both the EGL extension for robust contexts
         // and the GL extension are advertised — otherwise calling
@@ -642,8 +670,10 @@ impl CanvasManager {
             cancelled_uploads: HashSet::new(),
             egl_set_damage_region_fn,
             damage: crate::damage_effect::FrameDamageAccumulator::new(),
-            pending_declared_damage: None,
-            damage_history: crate::dirty_region::damage_tracker::DamageHistory::new(),
+            pending_present_plan: None,
+            damage_history: crate::present_damage::PresentDamageHistory::new(),
+            dest_single_sample,
+            has_ext_buffer_age,
         })
     }
 
@@ -804,8 +834,25 @@ impl CanvasManager {
                         );
                         // `resize_canvas` takes `Option<u32>` per-dim so the
                         // caller can signal "don't change this axis" with `None`.
-                        // Always pass the full new size here.
-                        return self.resize_canvas(id, Some(exp_w), Some(exp_h));
+                        // Always pass the full new size here. Unlike a JS
+                        // backing-store resize, this callback also changes the
+                        // real window extent used by present/blit eligibility.
+                        let physical_w = exp_w.max(1);
+                        let physical_h = exp_h.max(1);
+                        self.resize_canvas(id, Some(physical_w), Some(physical_h))?;
+                        if let Some(entry) = self.canvases.get_mut(&id) {
+                            entry.physical_width = physical_w;
+                            entry.physical_height = physical_h;
+                        }
+                        // `resize_canvas` may have returned early when the
+                        // backing store already matched the new surface. The
+                        // surface boundary still invalidates the old plan.
+                        self.damage_history.clear();
+                        self.pending_present_plan = None;
+                        self.damage
+                            .add(crate::damage_effect::DamageEffect::FullSurface);
+                        self.evaluate_bypass();
+                        return Ok(());
                     }
                 }
             }
@@ -836,6 +883,8 @@ impl CanvasManager {
         self.last_swap_interval = -1;
         // New surface = new back buffers, old damage history is invalid.
         self.damage_history.clear();
+        // The pending plan targets the abandoned surface — drop it too.
+        self.pending_present_plan = None;
 
         self.egl.bind_api(egl::OPENGL_ES_API).map_err(|e| {
             ee(
@@ -1152,6 +1201,7 @@ impl CanvasManager {
             self.bound = BoundContext::Resource;
             self.last_swap_interval = -1;
             self.damage_history.clear();
+            self.pending_present_plan = None;
         }
         // Onscreen destroyed → bypass must be off until re-created.
         self.evaluate_bypass();
@@ -1418,6 +1468,7 @@ impl CanvasManager {
         self.atlas = None;
         self.image_registry = ImageRegistry::new();
         self.damage_history.clear();
+        self.pending_present_plan = None;
         self.last_swap_interval = -1;
 
         // ---- Phase 2: rebuild the share group ----
@@ -1884,12 +1935,11 @@ impl CanvasManager {
         // below the surface (Phaser Scale.NONE) must go through the blit so it
         // fills the window instead of landing in a corner. `false` when there
         // is no DrawingBuffer, which also (correctly) disables bypass.
-        let onscreen_db_matches_surface =
-            self.canvases.get(&onscreen_id).map_or(false, |e| {
-                e.drawing_buffer.as_ref().map_or(false, |db| {
-                    db.width == e.physical_width && db.height == e.physical_height
-                })
-            });
+        let onscreen_db_matches_surface = self.canvases.get(&onscreen_id).map_or(false, |e| {
+            e.drawing_buffer.as_ref().map_or(false, |db| {
+                db.width == e.physical_width && db.height == e.physical_height
+            })
+        });
         let can_bypass = can_bypass_drawing_buffer(
             self.canvases.len(),
             self.needs_default_fbo_readback,
@@ -1897,6 +1947,7 @@ impl CanvasManager {
             onscreen_db_matches_surface,
         );
 
+        let mut mode_changed = false;
         if let Some(entry) = self.canvases.get_mut(&onscreen_id) {
             if entry.bypass_drawing_buffer != can_bypass {
                 tracing::info!(
@@ -1905,7 +1956,17 @@ impl CanvasManager {
                     can_bypass,
                 );
                 entry.bypass_drawing_buffer = can_bypass;
+                mode_changed = true;
             }
+        }
+        if mode_changed {
+            // Direct-FBO frames and DrawingBuffer frames do not share a
+            // trustworthy repair history. Start the new presentation mode at
+            // a full boundary and discard any plan built for the old mode.
+            self.damage_history.clear();
+            self.pending_present_plan = None;
+            self.damage
+                .add(crate::damage_effect::DamageEffect::FullSurface);
         }
     }
 
@@ -2090,6 +2151,17 @@ impl CanvasManager {
             self.gl_state.entry(id).or_default().viewport =
                 Some((0, 0, new_w as i32, new_h as i32));
 
+            // `drawing_buffer::resize` reallocates its attachments, so neither
+            // the old buffer-age history nor a plan referencing the old
+            // storage remains valid. Poison this frame to guarantee the first
+            // present after resize is a full repair.
+            if id == CanvasId::from(1u32) {
+                self.damage_history.clear();
+                self.pending_present_plan = None;
+                self.damage
+                    .add(crate::damage_effect::DamageEffect::FullSurface);
+            }
+
             // The DrawingBuffer size just changed, which affects bypass
             // eligibility: bypass is only safe when db == surface (see
             // `can_bypass_drawing_buffer`). A game shrinking its onscreen canvas
@@ -2131,6 +2203,7 @@ impl CanvasManager {
             SurfaceKind::Window(native_window) => {
                 self.last_swap_interval = -1;
                 self.damage_history.clear();
+                self.pending_present_plan = None;
                 egl_ops::create_window_surface(&self.egl, self.display, self.config, native_window)?
             }
             SurfaceKind::Pbuffer => {
@@ -2240,129 +2313,179 @@ impl CanvasManager {
     /// render at least this region (and typically the full game frame on top).
     ///
     /// Called from the render thread right before `flush_dirty_2d_contexts()`.
-    pub(crate) fn declare_frame_damage(&mut self, id: CanvasId) {
-        // Read what we need from the canvas entry, then drop the borrow.
-        let (surface_w, surface_h, surf, scaling_blit) = match self.canvases.get(&id) {
-            Some(e) => {
-                // When the DrawingBuffer differs from the surface, the swap-time
-                // blit *scales* db -> surface, so it rewrites the entire surface
-                // every frame AND the game's damage rects (in DrawingBuffer /
-                // game coordinates) no longer map 1:1 onto surface pixels.
-                // Declaring a partial `eglSetDamageRegionKHR` in that case is a
-                // lie to the compositor (it points at the wrong surface region
-                // and claims the rest is unchanged when the scaled blit
-                // overwrote it), which corrupts buffer-age reuse and makes the
-                // screen flicker. Force full-surface damage whenever the blit
-                // scales.
-                let scaling = e
-                    .drawing_buffer
-                    .as_ref()
-                    .map_or(false, |db| {
-                        db.width != e.physical_width || db.height != e.physical_height
-                    });
-                (e.physical_width, e.physical_height, e.ctx.surf, scaling)
-            }
-            None => return,
+    /// Build the present/blit plan for `id` and declare its repair region to the
+    /// compositor (when partial). Shared by [`Self::declare_frame_damage`] and the
+    /// [`Self::swap_buffers_no_restore`] cache-miss fallback so both paths agree on
+    /// the exact `repair`/`current` regions. For a non-bypassed surface this
+    /// helper makes `id` current before querying age or declaring damage, as
+    /// required by `EGL_KHR_partial_update`.
+    fn prepare_present_plan(&mut self, id: CanvasId) -> crate::present_damage::PresentDamagePlan {
+        use crate::present_damage::{
+            DamageRegion, PresentDamagePlan, build_present_plan, repair_after_declaration_failure,
         };
 
-        if scaling_blit {
-            // Whole surface changes each frame: no partial-update hint.
-            self.pending_declared_damage = Some((id, ResolvedDamage::FullSurface));
-            return;
+        let (surface_w, surface_h, surf, db_matches, bypass) = match self.canvases.get(&id) {
+            Some(e) => {
+                // A partial identity blit requires the DrawingBuffer to exactly
+                // match the surface. When it differs, the swap-time blit *scales*
+                // db -> surface: it rewrites the whole surface every frame and the
+                // game's damage rects (DrawingBuffer/game coordinates) no longer
+                // map 1:1 onto surface pixels, so partial repair must stay full.
+                let db_matches = e.drawing_buffer.as_ref().map_or(false, |db| {
+                    db.width == e.physical_width && db.height == e.physical_height
+                });
+                (
+                    e.physical_width,
+                    e.physical_height,
+                    e.ctx.surf,
+                    db_matches,
+                    e.bypass_drawing_buffer,
+                )
+            }
+            // No canvas entry: nothing to blit — a full/full plan is safe.
+            None => {
+                return PresentDamagePlan {
+                    current: DamageRegion::FullSurface,
+                    repair: DamageRegion::FullSurface,
+                };
+            }
+        };
+
+        // Current-frame surface damage as discrete lower-left rects.
+        let current = self.current_damage_region(surface_w, surface_h);
+
+        // Bypass renders directly to FBO 0 *before* this declaration point, so a
+        // restricted region here would violate EGL_KHR_partial_update ordering.
+        // The direct-to-FBO-0 path also skips the DrawingBuffer blit entirely.
+        if bypass {
+            return PresentDamagePlan {
+                current,
+                repair: DamageRegion::FullSurface,
+            };
         }
 
-        // Resolve this frame's accumulated damage (does not reset — swap does that).
-        let current_frame_damage = self.resolve_pending_damage(surface_w, surface_h);
-        // Stash the resolved result so the subsequent
-        // `swap_buffers_no_restore` call can reuse it — the
-        // accumulator is not mutated between these two call sites
-        // in the render loop, so resolving twice was pure waste.
-        // Keyed by `id` so that if a future change routes the two
-        // calls to different canvases we fall back to the live
-        // resolve instead of serving a stale result.
-        self.pending_declared_damage = Some((id, current_frame_damage));
+        // EGL_BUFFER_AGE_KHR and eglSetDamageRegionKHR apply to the current
+        // draw surface. Switching contexts binds the persistent DrawingBuffer,
+        // not FBO 0, so this still precedes every write to the window surface.
+        if let Err(err) = self.make_current_needed(id) {
+            tracing::warn!(
+                "present damage: failed to make canvas {id:?} current before buffer-age query: {err}"
+            );
+            return PresentDamagePlan {
+                current,
+                repair: DamageRegion::FullSurface,
+            };
+        }
 
-        // Query buffer age and expand with history.
+        // Query buffer age every eligible frame; a query error maps to 0 (full).
         const EGL_BUFFER_AGE_KHR: egl::Int = 0x313D;
-        let buffer_damage = if self.device_caps.has_buffer_age {
-            match self
-                .egl
+        let buffer_age = if self.device_caps.has_buffer_age {
+            self.egl
                 .query_surface(self.display, surf, EGL_BUFFER_AGE_KHR)
-            {
-                Ok(age) if age > 0 => self
-                    .damage_history
-                    .resolve_with_age(current_frame_damage, age),
-                _ => ResolvedDamage::FullSurface,
-            }
+                .unwrap_or(0)
         } else {
-            current_frame_damage
+            0
         };
 
-        // Declare to the compositor what we will redraw.
-        //
-        // When the buffer-age-expanded result is `Partial` we'd
-        // otherwise just forward that single AABB.  But the
-        // accumulator still has the per-rect detail for the
-        // *current* frame: when `buffer_damage == current_frame_damage`
-        // (age=1 path) we upgrade to the multi-rect form so the
-        // driver can skip tiles not covered by any fragment.
-        // History-unioned results stay at single AABB because
-        // mixing per-rect and union semantics would require the
-        // history ring to keep per-rect records too.
-        let set_damage = match self.egl_set_damage_region_fn {
-            Some(f) => f,
-            None => return,
-        };
-        match buffer_damage {
-            ResolvedDamage::FullSurface => { /* no damage hint */ }
-            ResolvedDamage::Partial {
-                x,
-                y,
-                width,
-                height,
-            } => {
-                // Age > 1 path (history-unioned): single AABB.
-                // The two `Partial` values won't match bitwise
-                // when a history union widened the rect, so this
-                // branch also catches history-expanded cases.
-                if matches!(current_frame_damage, ResolvedDamage::Partial { x: cx, y: cy, width: cw, height: ch } if cx == x && cy == y && cw == width && ch == height)
-                {
-                    // Age=1 (or no expansion): emit per-rect.
-                    if let Some(rects) = self
-                        .damage
-                        .resolve_rects((surface_w as i32, surface_h as i32))
-                    {
-                        // Flatten into a `[i32; 4N]` buffer for the
-                        // driver call.  4 rects * 4 ints = 16 ints;
-                        // stack allocation, no heap.
-                        let mut flat: [i32; 16] = [0; 16];
-                        let n = rects
-                            .len()
-                            .min(crate::dirty_region::damage_tracker::MAX_DAMAGE_RECTS);
-                        for (i, r) in rects.iter().take(n).enumerate() {
-                            flat[i * 4] = r.0;
-                            flat[i * 4 + 1] = r.1;
-                            flat[i * 4 + 2] = r.2;
-                            flat[i * 4 + 3] = r.3;
-                        }
-                        unsafe {
-                            set_damage(self.display, surf, flat.as_ptr(), n as i32);
-                        }
-                    } else {
-                        // resolve_rects returned None (full-redraw
-                        // escalation in the clipped form) - fall
-                        // back to single AABB.
-                        let rect = [x, y, width, height];
-                        unsafe { set_damage(self.display, surf, rect.as_ptr(), 1) };
-                    }
+        let plan = build_present_plan(
+            current,
+            &self.damage_history,
+            self.device_caps.has_buffer_age,
+            buffer_age,
+            db_matches,
+            self.dest_single_sample,
+        );
+
+        // Declare the exact repair rectangles before any FBO 0 write. A full
+        // repair leaves the compositor's default full damage region untouched.
+        match &plan.repair {
+            DamageRegion::FullSurface => plan,
+            DamageRegion::Partial(_) => {
+                if self.declare_repair_region(surf, &plan.repair) {
+                    plan
                 } else {
-                    // Buffer-age history widened the region; emit
-                    // the single widened AABB.
-                    let rect = [x, y, width, height];
-                    unsafe { set_damage(self.display, surf, rect.as_ptr(), 1) };
+                    // Declaration unavailable/rejected: keep the partial repair
+                    // only when EGL_EXT_buffer_age independently guarantees the
+                    // aged back-buffer contents; otherwise fall back to full
+                    // before the blit touches FBO 0.
+                    repair_after_declaration_failure(plan, self.has_ext_buffer_age)
                 }
             }
         }
+    }
+
+    /// Resolve the current-frame accumulator into a bounded [`DamageRegion`] of
+    /// discrete lower-left rects, failing closed to `FullSurface`.
+    fn current_damage_region(
+        &self,
+        surface_w: u32,
+        surface_h: u32,
+    ) -> crate::present_damage::DamageRegion {
+        use crate::present_damage::{DamageRect, DamageRegion};
+        match self
+            .damage
+            .resolve_rects((surface_w as i32, surface_h as i32))
+        {
+            None => DamageRegion::FullSurface,
+            Some(rects) => {
+                let mut region: Option<DamageRegion> = None;
+                for (x, y, w, h) in rects {
+                    let Some(rect) = DamageRect::new(x, y, w, h) else {
+                        return DamageRegion::FullSurface;
+                    };
+                    region = Some(match region {
+                        None => DamageRegion::from_rect(rect),
+                        Some(acc) => acc.union(DamageRegion::from_rect(rect)),
+                    });
+                }
+                region.unwrap_or(DamageRegion::FullSurface)
+            }
+        }
+    }
+
+    /// Flatten up to four repair rectangles into a fixed stack array and issue
+    /// one `eglSetDamageRegionKHR` call. Returns `true` only when the driver
+    /// accepted the declaration. A missing function pointer (KHR unavailable) or
+    /// an empty/full region counts as a declaration failure so the caller can
+    /// apply the EXT-vs-KHR fallback.
+    fn declare_repair_region(
+        &self,
+        surf: egl::Surface,
+        repair: &crate::present_damage::DamageRegion,
+    ) -> bool {
+        let set_damage = match self.egl_set_damage_region_fn {
+            Some(f) => f,
+            None => return false,
+        };
+        let rects = match repair.rects() {
+            Some(r) if !r.is_empty() => r,
+            _ => return false,
+        };
+        // 4 rects * 4 ints = 16 ints; stack allocation, no heap.
+        let mut flat: [egl::Int; 16] = [0; 16];
+        let n = rects.len().min(4);
+        for (i, r) in rects.iter().take(n).enumerate() {
+            flat[i * 4] = r.x;
+            flat[i * 4 + 1] = r.y;
+            flat[i * 4 + 2] = r.width;
+            flat[i * 4 + 3] = r.height;
+        }
+        let ret = unsafe { set_damage(self.display, surf, flat.as_ptr(), n as egl::Int) };
+        ret == egl::TRUE
+    }
+
+    /// Damage-region declaration point.
+    ///
+    /// Builds and caches the frame's [`PresentDamagePlan`], declaring the exact
+    /// buffer-age repair region to the compositor before any FBO 0 rendering
+    /// (`flush_dirty_2d_contexts`, DrawingBuffer blit). Per EGL_KHR_partial_update
+    /// the declaration must precede GL draws to the main framebuffer so the driver
+    /// can skip loading unchanged tiles.
+    ///
+    /// Called from the render thread right before `flush_dirty_2d_contexts()`.
+    pub(crate) fn declare_frame_damage(&mut self, id: CanvasId) {
+        let plan = self.prepare_present_plan(id);
+        self.pending_present_plan = Some((id, plan));
     }
 
     pub(crate) fn swap_buffers_no_restore(
@@ -2371,20 +2494,52 @@ impl CanvasManager {
         wait_for_vsync: bool,
     ) -> EngineResult<ResolvedDamage> {
         self.make_current_needed(id)?;
+
+        // Consume the plan declared earlier this frame. A missing/mismatched
+        // entry recomputes safely with the same plan-preparation helper before
+        // any FBO 0 write; it never reuses another canvas/frame's plan.
+        //
+        // P1-8: a mismatch means declare ↔ swap targeted different canvases.
+        // Debug builds panic; release builds recompute and log a warning.
+        let plan = match self.pending_present_plan.take() {
+            Some((cached_id, plan)) if cached_id == id => plan,
+            Some((cached_id, _)) => {
+                debug_assert!(
+                    false,
+                    "present-plan/swap guard violated: declared on canvas_id={cached_id:?} but swapping canvas_id={id:?}"
+                );
+                tracing::warn!(
+                    "present-plan guard: declared on {cached_id:?} but swap targets {id:?}; recomputing before swap"
+                );
+                self.prepare_present_plan(id)
+            }
+            None => self.prepare_present_plan(id),
+        };
+
         let entry = self
             .canvases
             .get(&id)
             .ok_or_else(|| ee(ErrorCode::NotFound, format!("canvas not found: {id:?}")))?;
 
-        // Blit DrawingBuffer to the real window surface before swap.
-        // When bypass is active, WebGL already rendered to FBO 0 — skip blit.
+        // Blit DrawingBuffer to the real window surface before swap, driven by the
+        // plan's `repair` region (never `current`). When bypass is active, WebGL
+        // already rendered to FBO 0 — skip the blit.
+        let mut blit_succeeded = true;
         if !entry.bypass_drawing_buffer {
             if let Some(ref db) = entry.drawing_buffer {
-                drawing_buffer::blit_to_surface(
+                let db_matches =
+                    db.width == entry.physical_width && db.height == entry.physical_height;
+                let blit = crate::present_damage::blit_plan(
+                    &plan.repair,
+                    db_matches,
+                    self.dest_single_sample,
+                );
+                blit_succeeded = drawing_buffer::blit_to_surface(
                     &self.gl,
                     db,
                     entry.physical_width,
                     entry.physical_height,
+                    &blit,
                 );
             }
         }
@@ -2395,39 +2550,6 @@ impl CanvasManager {
             let _ = self.egl.swap_interval(self.display, interval);
             self.last_swap_interval = interval;
         }
-
-        // Resolve this frame's damage for history recording and stats.
-        // The eglSetDamageRegionKHR call was already made in declare_frame_damage()
-        // before rendering — per spec it must happen before GL draws.
-        //
-        // If `declare_frame_damage` ran for this same canvas earlier
-        // in the frame, the result is already cached and we reuse it
-        // — same accumulator, no mutations between the two calls, so
-        // resolving again would produce an identical `ResolvedDamage`
-        // at the cost of another `DamageTracker::mark_rect` pass.
-        // Fall back to a live resolve when the cache is empty or
-        // stale (different canvas id), which keeps correctness on
-        // the barrier-flush / multi-canvas paths.
-        //
-        // P1-8: catch declare ↔ swap mismatches that would silently
-        // re-resolve against a mutated accumulator.  Debug builds
-        // panic; release builds fall through to the live resolve
-        // and log a warning so an operator can file a bug.
-        let current_frame_damage = match self.pending_declared_damage.take() {
-            Some((cached_id, resolved)) if cached_id == id => resolved,
-            Some((cached_id, _)) => {
-                debug_assert!(
-                    false,
-                    "damage-declare/swap guard violated: declared on canvas_id={cached_id:?} but swapping canvas_id={id:?}"
-                );
-                tracing::warn!(
-                    "damage guard: declared on {cached_id:?} but swap targets {id:?}; falling back to live resolve"
-                );
-                self.resolve_pending_damage(entry.physical_width, entry.physical_height)
-            }
-            None => self.resolve_pending_damage(entry.physical_width, entry.physical_height),
-        };
-        self.damage.reset();
 
         self.egl
             .swap_buffers(self.display, entry.ctx.surf)
@@ -2443,6 +2565,10 @@ impl CanvasManager {
                     format!("eglSwapBuffers failed: {e:?}"),
                 )
             })?;
+
+        // Reset only after a successful frame boundary. The `?` above returns
+        // before this line on swap failure, preserving damage for a retry.
+        self.damage.reset();
 
         // Re-bind the DrawingBuffer FBO after swap so the next frame's GL
         // commands target it instead of the window surface.
@@ -2463,12 +2589,37 @@ impl CanvasManager {
             }
         }
 
-        // Record this frame's damage AFTER successful swap. If swap failed,
-        // the frame was never presented and must not pollute the history —
-        // buffer age semantics assume history entries correspond to actual swaps.
-        self.damage_history.push(current_frame_damage);
+        if blit_succeeded {
+            // Record this frame's *current* surface damage AFTER both a complete
+            // blit and a successful swap — never the age-expanded `repair`.
+            self.damage_history.push(plan.current.clone());
+            Ok(Self::region_to_resolved(&plan.current))
+        } else {
+            // The swap advanced EGL's buffer sequence, but the back buffer is
+            // only partially defined because at least one repair write failed.
+            // Poison history and force the next present to repair everything;
+            // a same-frame full retry is illegal after a partial declaration.
+            self.damage_history.clear();
+            self.damage_history
+                .push(crate::present_damage::DamageRegion::FullSurface);
+            self.damage
+                .add(crate::damage_effect::DamageEffect::FullSurface);
+            Ok(ResolvedDamage::FullSurface)
+        }
+    }
 
-        Ok(current_frame_damage)
+    /// Collapse a [`crate::present_damage::DamageRegion`] to a single-AABB
+    /// [`ResolvedDamage`] for swap-stats reporting of current-frame surface damage.
+    fn region_to_resolved(region: &crate::present_damage::DamageRegion) -> ResolvedDamage {
+        let Some(rect) = region.bounding_rect() else {
+            return ResolvedDamage::FullSurface;
+        };
+        ResolvedDamage::Partial {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        }
     }
 
     #[allow(dead_code)]
@@ -2695,11 +2846,6 @@ impl CanvasManager {
             }
         }
         buf
-    }
-
-    fn resolve_pending_damage(&self, surface_width: u32, surface_height: u32) -> ResolvedDamage {
-        self.damage
-            .resolve((surface_width as i32, surface_height as i32))
     }
 
     // ==================== Image Management ====================
@@ -3926,10 +4072,12 @@ impl CanvasManager {
         let cap = shared::protocol::io_cmd::MAX_IMAGE_PIXELS;
         let px = (compressed.width as u64).saturating_mul(compressed.height as u64);
         if px > cap {
-            return Err(EngineError::new(ErrorCode::OutOfMemory).with_detail(format!(
-                "compressed texture {}x{} ({} px) exceeds cap ({} px); refusing GPU upload",
-                compressed.width, compressed.height, px, cap
-            )));
+            return Err(
+                EngineError::new(ErrorCode::OutOfMemory).with_detail(format!(
+                    "compressed texture {}x{} ({} px) exceeds cap ({} px); refusing GPU upload",
+                    compressed.width, compressed.height, px, cap
+                )),
+            );
         }
 
         self.ensure_any_canvas_current()?;
@@ -3962,14 +4110,16 @@ impl CanvasManager {
         // GL_INVALID_VALUE (glCompressedTexImage2D requires an exact size).
         let expected = format.expected_level0_bytes(compressed.width, compressed.height);
         if compressed.data.len() as u64 != expected {
-            return Err(EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
-                "compressed KTX2 level0 is {} bytes but {} {}x{} requires {} bytes",
-                compressed.data.len(),
-                format.label(),
-                compressed.width,
-                compressed.height,
-                expected
-            )));
+            return Err(
+                EngineError::new(ErrorCode::InvalidArgument).with_detail(format!(
+                    "compressed KTX2 level0 is {} bytes but {} {}x{} requires {} bytes",
+                    compressed.data.len(),
+                    format.label(),
+                    compressed.width,
+                    compressed.height,
+                    expected
+                )),
+            );
         }
 
         let texture = crate::compressed_upload::upload_compressed_texture(

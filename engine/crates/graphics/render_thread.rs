@@ -199,11 +199,13 @@ fn execute_canvas_batch(
         //
         // NOTE: invalidate_outside_dirty() was previously called here to
         // hint the tiled GPU that clean strips need not be loaded from
-        // memory.  Removed because the DrawingBuffer path later does a
-        // full-surface blit (blit_to_surface), which would read those
-        // invalidated (now-undefined) regions and copy garbage to the
-        // window surface on drivers that aggressively discard tiles
-        // (Mali, PowerVR).
+        // memory.  Removed because the DrawingBuffer blit (blit_to_surface)
+        // reads those regions — the whole surface, or per damage rect on the
+        // partial-blit path — and would copy the invalidated (now-undefined)
+        // pixels to the window surface on drivers that aggressively discard
+        // tiles (Mali, PowerVR).  Buffer-age partial repair further needs the
+        // DrawingBuffer and destination pixels to persist, so invalidation
+        // must stay off this path.
         let applied = if cm.make_current_needed(canvas_id).is_ok() {
             dirty_region::apply_scissor(gl, &setup.region, setup.canvas_w, setup.canvas_h);
             true
