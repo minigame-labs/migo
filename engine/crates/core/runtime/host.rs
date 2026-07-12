@@ -92,6 +92,15 @@ pub(crate) struct Host {
     /// Shared RAF receiver — survives JS runtime restarts.
     raf_rx: RafRx,
 
+    /// R1 RAF waiter demand latch — shared with the render thread; re-cloned
+    /// into each new HostOpState so it survives JS runtime restarts.
+    raf_demand: shared::raf_signal::RafDemandRef,
+
+    /// R1 one-shot vsync arm closure (platform-agnostic). Stored so restart can
+    /// re-clone it into the new HostOpState. `None` on platforms without a
+    /// demand-driven display clock.
+    request_vsync: Option<Arc<dyn Fn() + Send + Sync>>,
+
     /// Sender back to the host event loop (for JS-initiated restart/exit).
     host_tx: HostTx,
 
@@ -196,9 +205,21 @@ impl Host {
         // Other platforms: tokio mpsc channel (unchanged behavior).
         let (raf_tx, raf_rx) = shared::raf_signal::create_raf_pair();
 
+        // ---- R1 RAF demand latch (host op <-> render thread) ----
+        let raf_demand = Arc::new(shared::raf_signal::RafDemand::new());
+
         // ---- VSync channel (Choreographer JNI → render thread) ----
-        let (vsync_tx, vsync_rx) = crossbeam_channel::bounded::<f64>(2);
-        vsync::register_vsync_sender(id, vsync_tx);
+        // Only platforms that actually publish external timestamps get this
+        // receiver. Passing a never-fed `Some(receiver)` on desktop would make
+        // RenderThread disable its software ticker and freeze the frame loop.
+        let uses_external_vsync = platform.uses_external_vsync();
+        let vsync_rx = if uses_external_vsync {
+            let (vsync_tx, vsync_rx) = crossbeam_channel::bounded::<f64>(2);
+            vsync::register_vsync_sender(id, vsync_tx);
+            Some(vsync_rx)
+        } else {
+            None
+        };
 
         // ---- Services ----
         // AudioService is lazy — no thread spawned until the first
@@ -226,9 +247,20 @@ impl Host {
             }))
         };
 
+        // R1: one-shot vsync arm. Routes to `platform.request_vsync(id)` (a
+        // no-op by default; Android posts a single Choreographer frame callback
+        // via JNI). The closure keeps `graphics` decoupled from `platform` — the
+        // render thread and `op_await_next_frame` only invoke `Arc<dyn Fn()>`.
+        let request_vsync: Option<Arc<dyn Fn() + Send + Sync>> = if uses_external_vsync {
+            let platform = platform.clone();
+            Some(Arc::new(move || platform.request_vsync(id)))
+        } else {
+            None
+        };
+
         let mut render = RenderService::new(
             raf_tx,
-            Some(vsync_rx),
+            vsync_rx,
             id,
             surface,
             init_options.pixel_ratio(),
@@ -237,6 +269,8 @@ impl Host {
             gpu_caps.clone(),
             context_lost.clone(),
             render_wake,
+            raf_demand.clone(),
+            request_vsync.clone(),
         )?;
         let render_events = render.events();
 
@@ -307,6 +341,8 @@ impl Host {
             host_tx: host_tx.clone(),
             device_services,
             raf_rx: Some(raf_rx.clone()),
+            raf_demand: raf_demand.clone(),
+            request_vsync: request_vsync.clone(),
             sub_packages: init_options.sub_packages().to_vec(),
             workers_path: init_options.workers_path().map(|s| s.to_string()),
             network_policy: network_policy.clone(),
@@ -407,6 +443,8 @@ impl Host {
             audio,
             js: JsRuntimeSlot::new(js),
             raf_rx,
+            raf_demand,
+            request_vsync,
             host_tx,
             platform,
             init_options,
@@ -1121,6 +1159,8 @@ impl Host {
             host_tx: self.host_tx.clone(),
             device_services,
             raf_rx: Some(self.raf_rx.clone()),
+            raf_demand: self.raf_demand.clone(),
+            request_vsync: self.request_vsync.clone(),
             sub_packages: self.init_options.sub_packages().to_vec(),
             workers_path: self.init_options.workers_path().map(|s| s.to_string()),
             network_policy: self.network_policy.clone(),

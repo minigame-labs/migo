@@ -4104,6 +4104,20 @@ impl CanvasManager {
         self.deferred_uploads.len()
     }
 
+    /// R1 on-demand vsync source: whether any upload still needs a frame to
+    /// make progress. Covers fence-pending completed uploads, budget-deferred
+    /// retries, and in-flight jobs submitted to the upload thread but not yet
+    /// drained. The render thread treats this as demand so an async upload that
+    /// completes while the frame clock is idle still gets one frame to poll its
+    /// fence and fire `Image.onload`, rather than waiting forever for a vsync.
+    pub(crate) fn has_outstanding_upload_work(&self) -> bool {
+        crate::frame_scheduler::outstanding_upload_work(
+            self.pending_uploads.len(),
+            self.deferred_uploads.len(),
+            self.upload_server.as_ref().map_or(0, |s| s.queue_depth()),
+        )
+    }
+
     /// Current size of the shared `SkImage` wrapper cache.
     /// Surfaced to `DebugStats.sk_image_wrappers`.
     pub(crate) fn image_wrapper_cache_len(&self) -> usize {

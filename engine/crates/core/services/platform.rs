@@ -25,6 +25,27 @@ pub trait PlatformServices: Send + Sync {
         None
     }
 
+    /// Whether this platform supplies frame timestamps through the external
+    /// vsync channel. Platforms returning `false` keep the render thread's
+    /// software ticker enabled.
+    fn uses_external_vsync(&self) -> bool {
+        false
+    }
+
+    /// R1: request exactly one display frame callback for `host_id`.
+    ///
+    /// Called by the render thread (and `op_await_next_frame`) when there is
+    /// demand for a frame — an actual RAF waiter, dirty content, outstanding
+    /// upload work, or a resume/recreate task. Must be cheap and safe to call
+    /// from any thread; the implementation is responsible for hopping to the UI
+    /// thread and rechecking the live session before touching the Choreographer.
+    ///
+    /// Default is a no-op: platforms without a demand-driven display clock rely
+    /// on the software ticker instead, so the render thread never arms.
+    fn request_vsync(&self, _host_id: i32) {
+        // Default: no-op.
+    }
+
     /// Notify the host application that the game module has been loaded and
     /// is ready to run.
     ///

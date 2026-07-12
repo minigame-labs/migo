@@ -26,6 +26,20 @@ impl PlatformServices for AndroidPlatform {
         Some(Arc::new(AndroidDeviceServices::new(host_id)))
     }
 
+    fn uses_external_vsync(&self) -> bool {
+        true
+    }
+
+    fn request_vsync(&self, host_id: i32) {
+        // R1: route to `NativeExports.requestVsync`, which hops to the main
+        // thread and arms one Choreographer callback. Failures here are benign
+        // (idle races / session torn down), so log at debug and drop — never
+        // escalate to notify_error and never flood on the hot path.
+        if let Err(e) = jni::request_vsync(host_id) {
+            tracing::debug!("[Host {}] request_vsync JNI call failed: {}", host_id, e);
+        }
+    }
+
     fn notify_game_ready(&self, host_id: i32) {
         if let Err(e) = jni::notify_game_ready(host_id) {
             error!(
@@ -57,5 +71,15 @@ impl PlatformServices for AndroidPlatform {
                 host_id, e
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn android_declares_external_vsync_source() {
+        assert!(AndroidPlatform::new().uses_external_vsync());
     }
 }

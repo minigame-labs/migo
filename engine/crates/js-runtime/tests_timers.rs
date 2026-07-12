@@ -51,6 +51,8 @@ mod timer_tests {
             host_tx,
             device_services: None,
             raf_rx: None,
+            raf_demand: std::sync::Arc::new(shared::raf_signal::RafDemand::new()),
+            request_vsync: None,
             sub_packages: Vec::new(),
             workers_path: None,
             network_policy: NetworkPolicy::default(),
