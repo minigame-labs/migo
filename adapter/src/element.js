@@ -5,6 +5,47 @@
 
 import EventTarget from "./event-target.js";
 
+// Browser boot pages commonly load the engine/game via a `<script src>` that
+// webpack/rollup emit (e.g. Phaser/Egret HTML output: an index.html whose only
+// job is `<script src="main.<hash>.js">`). A mini-game host has no HTML parser,
+// so nothing loads that chunk and the game never boots. Mini-game runtimes
+// (correctly, like WeChat) forbid loading REMOTE scripts, but a script that
+// points at a LOCAL file bundled inside the game package is safe: read it via
+// the host filesystem and execute it in global scope, then fire the element's
+// `load` event so the boot sequence continues. Remote (http/https) srcs are
+// refused. This runs once per connected <script src>, deferred to a microtask
+// so an `onload` assigned right after `appendChild` is observed.
+function maybeLoadScript(node) {
+  if (!node || node.tagName !== "SCRIPT" || !node.src || node._migoLoaded) return;
+  node._migoLoaded = true;
+  Promise.resolve().then(() => {
+    const src = String(node.src);
+    try {
+      if (/^(https?:)?\/\//i.test(src) || /^data:/i.test(src)) {
+        console.warn("[migo-adapter] refusing to load non-local script:", src);
+        if (typeof node.onerror === "function") node.onerror(new Error("non-local script blocked"));
+        node.dispatchEvent && node.dispatchEvent({ type: "error" });
+        return;
+      }
+      const path = src.replace(/^\.?\//, "").split("?")[0].split("#")[0];
+      const fs = typeof migo !== "undefined" && migo.getFileSystemManager && migo.getFileSystemManager();
+      if (!fs || typeof fs.readFileSync !== "function") {
+        throw new Error("no filesystem manager to read local script");
+      }
+      const code = fs.readFileSync(path, "utf8");
+      // Indirect eval → global scope: webpack/engine bundles are top-level
+      // IIFEs that install globals; they must not run in a nested lexical scope.
+      (0, eval)(code);
+      if (typeof node.onload === "function") node.onload();
+      node.dispatchEvent && node.dispatchEvent({ type: "load" });
+    } catch (e) {
+      console.error("[migo-adapter] local script load failed:", src, e);
+      if (typeof node.onerror === "function") node.onerror(e);
+      node.dispatchEvent && node.dispatchEvent({ type: "error" });
+    }
+  });
+}
+
 export class Node extends EventTarget {
   constructor() {
     super();
@@ -19,6 +60,7 @@ export class Node extends EventTarget {
     if (node.parentNode) node.parentNode.removeChild(node);
     this.children.push(node);
     node.parentNode = this;
+    maybeLoadScript(node);
     return node;
   }
 
@@ -38,6 +80,7 @@ export class Node extends EventTarget {
     if (newNode.parentNode) newNode.parentNode.removeChild(newNode);
     this.children.splice(i, 0, newNode);
     newNode.parentNode = this;
+    maybeLoadScript(newNode);
     return newNode;
   }
 

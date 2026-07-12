@@ -121,6 +121,34 @@
   };
 
   // src/element.js
+  function maybeLoadScript(node) {
+    if (!node || node.tagName !== "SCRIPT" || !node.src || node._migoLoaded) return;
+    node._migoLoaded = true;
+    Promise.resolve().then(() => {
+      const src = String(node.src);
+      try {
+        if (/^(https?:)?\/\//i.test(src) || /^data:/i.test(src)) {
+          console.warn("[migo-adapter] refusing to load non-local script:", src);
+          if (typeof node.onerror === "function") node.onerror(new Error("non-local script blocked"));
+          node.dispatchEvent && node.dispatchEvent({ type: "error" });
+          return;
+        }
+        const path = src.replace(/^\.?\//, "").split("?")[0].split("#")[0];
+        const fs = typeof migo !== "undefined" && migo.getFileSystemManager && migo.getFileSystemManager();
+        if (!fs || typeof fs.readFileSync !== "function") {
+          throw new Error("no filesystem manager to read local script");
+        }
+        const code = fs.readFileSync(path, "utf8");
+        (0, eval)(code);
+        if (typeof node.onload === "function") node.onload();
+        node.dispatchEvent && node.dispatchEvent({ type: "load" });
+      } catch (e) {
+        console.error("[migo-adapter] local script load failed:", src, e);
+        if (typeof node.onerror === "function") node.onerror(e);
+        node.dispatchEvent && node.dispatchEvent({ type: "error" });
+      }
+    });
+  }
   var Node = class extends EventTarget {
     constructor() {
       super();
@@ -134,6 +162,7 @@
       if (node.parentNode) node.parentNode.removeChild(node);
       this.children.push(node);
       node.parentNode = this;
+      maybeLoadScript(node);
       return node;
     }
     removeChild(node) {
@@ -151,6 +180,7 @@
       if (newNode.parentNode) newNode.parentNode.removeChild(newNode);
       this.children.splice(i, 0, newNode);
       newNode.parentNode = this;
+      maybeLoadScript(newNode);
       return newNode;
     }
     cloneNode() {
