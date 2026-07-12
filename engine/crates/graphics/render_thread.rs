@@ -56,23 +56,24 @@ const RAF_BACKPRESSURE_STREAK_THRESHOLD: u32 = 3;
 /// firing a Java `notify_error` on every failed retry would flood at frame
 /// rate. The loss epoch bumps on each fresh loss, so gating on it reports the
 /// first failure of an episode and then stays silent until recovery succeeds or
-/// a new loss starts. The per-frame `warn!` log is intentionally left to the
-/// call site (cheap, and useful for diagnosing a stuck context).
+/// a new loss starts. Returns `true` only for that first report so callers can
+/// gate warning logs on the same epoch and avoid a 60-120 logs/s failure loop.
 fn report_recovery_failure(
     context_lost: &Arc<shared::op_state::ContextLostState>,
     events: &RenderEventSender,
     wake: &Option<Arc<dyn Fn() + Send + Sync>>,
     last_recovery_fail_epoch: &mut u64,
-) {
+) -> bool {
     let (_, epoch) = context_lost.snapshot();
     if epoch == *last_recovery_fail_epoch {
-        return;
+        return false;
     }
     *last_recovery_fail_epoch = epoch;
     events.emit(RenderEvent::ContextRecovered { success: false });
     if let Some(w) = wake.as_ref() {
         w();
     }
+    true
 }
 
 pub struct RenderThread {
@@ -623,11 +624,107 @@ mod tests {
     use super::{
         canvas2d_batch_should_mark_present_dirty,
         execute_frame_packet_with_present_tracking_for_test, finalize_vsync_frame_decision,
-        mark_surface_destroyed, next_vsync_frame_decision,
+        mark_surface_destroyed, next_vsync_frame_decision, report_recovery_failure,
     };
     use crate::{SurfaceSystem, frame_scheduler::FrameScheduler};
     use shared::protocol::render_cmd::{Canvas2DCmd, CanvasBatchPayload, DirtyRect};
     use shared::{FrameOp, FramePacketBuilder};
+
+    #[test]
+    fn recovery_failure_report_and_log_gate_once_per_loss_epoch() {
+        let context = std::sync::Arc::new(shared::op_state::ContextLostState::default());
+        assert!(context.set_lost());
+        let (events, _event_rx) = shared::render_event::channel();
+        let wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>> = None;
+        let mut last_epoch = u64::MAX;
+
+        assert!(report_recovery_failure(
+            &context,
+            &events,
+            &wake,
+            &mut last_epoch,
+        ));
+        assert!(!report_recovery_failure(
+            &context,
+            &events,
+            &wake,
+            &mut last_epoch,
+        ));
+
+        assert!(context.set_recovered());
+        assert!(context.set_lost());
+        assert!(report_recovery_failure(
+            &context,
+            &events,
+            &wake,
+            &mut last_epoch,
+        ));
+    }
+
+    // R1 demand-model contracts. These combine the real `RafDemand` latch with
+    // the pure arm-decision helpers to pin the render-thread behaviour the
+    // present/arm wiring depends on. (They run under `cargo ndk test -p graphics`
+    // on device; on host the graphics test binary cannot link freetype/EGL.)
+    use crate::frame_scheduler::{raf_demand_remains, should_arm_one_shot};
+    use shared::raf_signal::RafDemand;
+
+    #[test]
+    fn raf_signalled_only_when_waiter_pending_and_consumed() {
+        let demand = RafDemand::new();
+        // Dirty-only / upload-only frame: no waiter -> must NOT signal RAF.
+        assert!(
+            demand.take_waiter().is_none(),
+            "dirty-only / upload-only frame does not signal RAF"
+        );
+        // A pending waiter is signalled exactly once and consumed.
+        let ticket = demand.mark_waiting();
+        assert_eq!(
+            demand.take_waiter(),
+            Some(ticket),
+            "waiter pending -> signal"
+        );
+        assert!(
+            demand.take_waiter().is_none(),
+            "already consumed -> no second signal"
+        );
+    }
+
+    #[test]
+    fn failed_signal_restores_waiter() {
+        let demand = RafDemand::new();
+        let ticket = demand.mark_waiting();
+        assert_eq!(demand.take_waiter(), Some(ticket));
+        // Simulate raf_tx.signal(ts) == false (eventfd/channel full):
+        demand.restore_waiter(ticket);
+        assert!(
+            demand.is_waiting(),
+            "failed signal re-arms so RAF is not frozen"
+        );
+    }
+
+    #[test]
+    fn skipped_vsync_with_pending_waiter_rearms_until_deadline() {
+        let demand = RafDemand::new();
+        demand.mark_waiting();
+        // FrameScheduler skipped this physical vsync (should_signal_raf=false):
+        // the waiter is NOT consumed, so demand remains and we must re-arm to
+        // keep receiving physical vsyncs until the target-FPS deadline is hit.
+        let remains = raf_demand_remains(demand.is_waiting(), false, false, false);
+        assert!(remains, "pending waiter keeps demand after a skipped vsync");
+        assert!(
+            should_arm_one_shot(true, true, false, true, remains, false),
+            "skipped vsync with a pending waiter re-arms the one-shot"
+        );
+        // Paused / no live surface must block the arm even with demand.
+        assert!(
+            !should_arm_one_shot(true, true, true, true, remains, false),
+            "paused blocks arm"
+        );
+        assert!(
+            !should_arm_one_shot(true, true, false, false, remains, false),
+            "no surface blocks arm"
+        );
+    }
 
     #[test]
     fn vsync_path_uses_scheduler_and_surface_state_for_presentation() {
@@ -1030,6 +1127,18 @@ impl RenderThread {
         // waiting for the next heartbeat tick. Decoupled from `HostCommand`
         // so the graphics crate stays independent of the host command enum.
         wake: Option<Arc<dyn Fn() + Send + Sync>>,
+        // R1: shared RAF waiter demand latch. `op_await_next_frame` publishes a
+        // waiter before awaiting; the render thread consumes it (and only then
+        // signals RAF) so dirty-only / upload-only frames never write an
+        // unconsumed timestamp, and a failed signal restores it so RAF cannot
+        // freeze. Shared `Arc` survives JS soft restart with the RafReceiver.
+        raf_demand: shared::raf_signal::RafDemandRef,
+        // R1: one-shot vsync arm. `Some` on platforms with a demand-driven
+        // display clock (Android Choreographer via a native->Java route);
+        // `None` on the software-ticker path and in tests. The render thread
+        // calls it to request exactly one more frame while demand remains;
+        // graphics stays decoupled from `platform` (it only invokes a closure).
+        request_vsync: Option<Arc<dyn Fn() + Send + Sync>>,
         // Per-host surface destroy-epoch (monotonic), advanced by the JNI/UI
         // thread on every surfaceDestroyed. Each SurfaceRef carries the epoch it
         // was created at (Surface::surface_epoch); the render loop compares its
@@ -1123,6 +1232,13 @@ impl RenderThread {
                 let start_time = Instant::now();
                 let mut dirty = true;
                 let mut paused = false;
+                // R1: whether a one-shot vsync callback has been requested but not
+                // yet delivered. Suppresses redundant `request_vsync` JNI calls
+                // while a callback is already in flight; reset when a vsync is
+                // delivered or on any lifecycle edge (Pause/Resume/SurfaceDestroyed/
+                // RecreateOnscreen) where Java unschedules/reschedules. `Cell` so
+                // the command-handling closure can reset it via shared capture.
+                let vsync_armed = std::cell::Cell::new(false);
                 let mut surface_system = SurfaceSystem::new();
                 // Epoch of the surface the render thread currently holds. Compared
                 // against the live `destroy_epoch` each frame; a mismatch means the
@@ -1268,6 +1384,10 @@ impl RenderThread {
                                     if is_recreate {
                                         if let Some(size) = recreate_surface_size {
                                             surface_system.on_surface_available(size);
+                                            // R1: surface is back — clear the
+                                            // in-flight flag so the post-recreate
+                                            // dirty frame re-arms the clock.
+                                            vsync_armed.set(false);
                                             // Adopt the recreated surface's epoch. From now on the
                                             // present-gate compares this against the live destroy
                                             // counter, so a destroy that raced this recreate (bumped
@@ -1405,6 +1525,10 @@ impl RenderThread {
                         RenderCommand::Pause => {
                             if !*paused {
                                 *paused = true;
+                                // R1: Java stops the scheduler on pause (removing
+                                // any posted callback); clear our in-flight flag so
+                                // Resume re-arms retained demand.
+                                vsync_armed.set(false);
                                 let live_canvases = cm.canvas_count();
                                 let surface_state_before = surface_system.state();
                                 surface_system.on_pause();
@@ -1438,6 +1562,10 @@ impl RenderThread {
                         RenderCommand::Resume => {
                             if *paused {
                                 *paused = false;
+                                // R1: clear in-flight flag so the forced first-frame
+                                // dirty below re-arms even if a stale callback was
+                                // dropped while paused.
+                                vsync_armed.set(false);
                                 let paused_ms = pause_started_at
                                     .take()
                                     .map(|t: Instant| t.elapsed().as_millis() as u64)
@@ -1471,6 +1599,10 @@ impl RenderThread {
                             let surface_state_before = surface_system.state();
                             let paused_now = *paused;
                             mark_surface_destroyed(surface_system);
+                            // R1: Java clears surfaceReady (removing any posted
+                            // callback); clear our in-flight flag so a later
+                            // RecreateOnscreen re-arms retained demand.
+                            vsync_armed.set(false);
                             info!(
                                 paused = paused_now,
                                 surface_state_before = ?surface_state_before,
@@ -1707,8 +1839,8 @@ impl RenderThread {
                     // crossed — transient drops are normal (JS task scheduling
                     // jitter, WebGL texture upload bursts) and shouldn't spam
                     // the event channel.
-                    if !paused {
-                        if raf_tx.signal(ts) {
+                    if !paused && let Some(ticket) = raf_demand.take_waiter() {
+                        if raf_tx.signal(ts, ticket) {
                             // Diag: if we just exited a long streak,
                             // emit a one-shot recovery log so the
                             // operator can bracket the backpressure
@@ -1724,6 +1856,10 @@ impl RenderThread {
                                 );
                             }
                         } else {
+                            // R1: delivery failed (eventfd write error / channel
+                            // full) — restore the waiter so a later frame retries
+                            // and RAF is not frozen.
+                            raf_demand.restore_waiter(ticket);
                             debug_stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
                             let streak = debug_stats
                                 .raf_drop_streak
@@ -1937,6 +2073,40 @@ impl RenderThread {
                     }
                 };
 
+                // R1: request exactly one more display frame iff demand remains
+                // (RAF waiter / dirty / outstanding upload work) and we can present.
+                // Idle, paused, or surfaceless => no arm, so the frame clock stops
+                // and there is no idle JNI flood. `vsync_armed` suppresses a
+                // redundant request while one callback is already in flight; Java's
+                // own requested/callbackPosted latch is the authoritative dedup. A
+                // no-op on the software-ticker path (`has_vsync` false / no closure).
+                let arm_if_needed =
+                    |paused: bool,
+                     dirty: bool,
+                     recovery_pending: bool,
+                     cm: &CanvasManager,
+                     surface_system: &SurfaceSystem| {
+                        let demand = crate::frame_scheduler::raf_demand_remains(
+                            raf_demand.is_waiting(),
+                            dirty,
+                            cm.has_outstanding_upload_work(),
+                            recovery_pending,
+                        );
+                        if crate::frame_scheduler::should_arm_one_shot(
+                            has_vsync,
+                            request_vsync.is_some(),
+                            paused,
+                            surface_system.can_present(),
+                            demand,
+                            vsync_armed.get(),
+                        ) {
+                            if let Some(rv) = request_vsync.as_ref() {
+                                rv();
+                            }
+                            vsync_armed.set(true);
+                        }
+                    };
+
                 loop {
                     // --- Deferred EGL context recovery ---
                     // Performed at the top of the frame loop where it is less
@@ -1947,6 +2117,11 @@ impl RenderThread {
                         match cm.try_recover_context() {
                             Ok(true) => {
                                 info!("EGL context recovered at frame top, resuming rendering");
+                                // The rebuilt contexts have no presented contents.
+                                // Force one repaint and keep the already-requested
+                                // one-shot alive so a static scene cannot remain
+                                // frozen after recovery.
+                                dirty = true;
                                 debug_stats
                                     .context_recoveries
                                     .fetch_add(1, Ordering::Relaxed);
@@ -1970,22 +2145,26 @@ impl RenderThread {
                                 // is still unusable. The context remains lost, so
                                 // report an honest failure (isContextLost() stays
                                 // true) rather than a false "recovered".
-                                warn!("EGL context recovery incomplete; context still lost");
-                                report_recovery_failure(
+                                if report_recovery_failure(
                                     &context_lost,
                                     &events,
                                     &wake,
                                     &mut last_recovery_fail_epoch,
-                                );
+                                ) {
+                                    warn!("EGL context recovery incomplete; context still lost");
+                                }
+                                needs_context_recovery = true;
                             }
                             Err(re) => {
-                                warn!("EGL context recovery failed: {}", re);
-                                report_recovery_failure(
+                                if report_recovery_failure(
                                     &context_lost,
                                     &events,
                                     &wake,
                                     &mut last_recovery_fail_epoch,
-                                );
+                                ) {
+                                    warn!("EGL context recovery failed: {}", re);
+                                }
+                                needs_context_recovery = true;
                             }
                         }
                     }
@@ -2017,10 +2196,17 @@ impl RenderThread {
                                 surface_system.on_surface_destroyed();
                             }
                             present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, surface_system.can_present(), ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
+                            // R1: no-op on the software-ticker path (has_vsync
+                            // false); kept for symmetry with the vsync branch.
+                            arm_if_needed(paused, dirty, needs_context_recovery, &cm, &surface_system);
                         }
 
                         recv(vsync) -> _msg => {
                             // Choreographer VSync path (Android).
+                            // R1: the requested one-shot callback was delivered —
+                            // clear the in-flight flag so demand that remains this
+                            // frame can re-arm the next one.
+                            vsync_armed.set(false);
                             crate::render_diagnostics::set_render_queue_len(cmd_rx.len() as u32);
                             let Some(frame_time_ms) = _msg.ok() else {
                                 continue;
@@ -2050,6 +2236,13 @@ impl RenderThread {
                                 // so resp oneshots from prior ticks
                                 // don't sit idle either.
                                 let _ = cm.drain_upload_completed();
+                                // R1: a scheduler-skipped physical vsync still has
+                                // pending demand (e.g. a RAF waiter awaiting the
+                                // next target-FPS deadline on a 90/120Hz panel, or
+                                // outstanding upload work) — re-arm so we keep
+                                // receiving physical vsyncs until the native
+                                // deadline is reached, then present at target FPS.
+                                arm_if_needed(paused, dirty, needs_context_recovery, &cm, &surface_system);
                                 continue;
                             }
 
@@ -2070,6 +2263,10 @@ impl RenderThread {
                             }
                             let should_present = decision.should_signal_raf && surface_system.can_present();
                             present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, should_present, decision.raf_time_ms, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
+                            // R1: re-arm iff demand remains after this frame
+                            // (continuous RAF, still-dirty content, or outstanding
+                            // upload work); otherwise the clock stops.
+                            arm_if_needed(paused, dirty, needs_context_recovery, &cm, &surface_system);
                         }
 
                         recv(cmd_rx) -> msg => {
@@ -2113,6 +2310,11 @@ impl RenderThread {
                                     if dropped_recoveries > 0 {
                                         debug_stats.dropped_upload_recoveries.fetch_add(dropped_recoveries, Ordering::Relaxed);
                                     }
+                                    // R1: a command batch may have created demand
+                                    // (dirty onscreen content, or a LoadImage that
+                                    // is now in-flight) — arm one frame to present
+                                    // / poll the fence. Idle commands don't arm.
+                                    arm_if_needed(paused, dirty, needs_context_recovery, &cm, &surface_system);
                                 }
                                 Err(_) => {
                                     info!("Command channel closed, exiting RenderThread");

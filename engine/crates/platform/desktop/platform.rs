@@ -21,3 +21,13 @@ impl PlatformServices for DesktopPlatform {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_keeps_software_frame_ticker() {
+        assert!(!DesktopPlatform::new().uses_external_vsync());
+    }
+}

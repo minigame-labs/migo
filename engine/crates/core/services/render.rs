@@ -52,6 +52,8 @@ impl RenderService {
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
         context_lost: std::sync::Arc<shared::op_state::ContextLostState>,
         wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        raf_demand: shared::raf_signal::RafDemandRef,
+        request_vsync: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) -> EngineResult<Self> {
         // Per-host surface destroy-epoch: bumped by JNI on surfaceDestroyed,
         // captured onto each new SurfaceRef at updateSurface time, and compared
@@ -71,6 +73,8 @@ impl RenderService {
             gpu_caps,
             context_lost,
             wake,
+            raf_demand,
+            request_vsync,
             destroy_epoch,
         )?;
         // Apply the host's configured target FPS to the render thread immediately

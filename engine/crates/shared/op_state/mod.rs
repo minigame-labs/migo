@@ -90,6 +90,14 @@ pub struct HostOpState {
     pub device_services: Option<Arc<dyn DeviceServices>>,
     /// RAF frame signal receiver (set by Host::new, consumed by op_await_next_frame).
     pub raf_rx: Option<RafRx>,
+    /// R1 RAF waiter demand latch. `op_await_next_frame` calls `mark_waiting()`
+    /// before awaiting so the render thread only signals RAF when a consumer is
+    /// actually pending. Shared `Arc` with the render thread; survives restart.
+    pub raf_demand: crate::raf_signal::RafDemandRef,
+    /// R1 one-shot vsync arm. `op_await_next_frame` invokes it after publishing
+    /// demand to kick the display clock awake from idle. `None` on platforms
+    /// without a demand-driven clock and in test harnesses.
+    pub request_vsync: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Subpackage definitions: (name, root) pairs from RuntimeConfig.
     pub sub_packages: Vec<(String, String)>,
     /// Workers directory path from RuntimeConfig.

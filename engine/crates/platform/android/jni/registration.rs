@@ -30,6 +30,11 @@ use crate::android::jni::{
 const ON_CAMERA_FRAME_DATA_SIG: &str =
     "(IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIII)V";
 
+/// JNI descriptor for the R1 outbound `NativeExports.requestVsync(int)` — the
+/// single source of truth shared by the static-method cache registration and
+/// the contract guard test. Must stay in lockstep with the Java declaration.
+const REQUEST_VSYNC_SIG: &str = "(I)V";
+
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
     let class = env
         .find_class("com/migo/runtime/internal/NativeBridge")
@@ -582,6 +587,8 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
         ("videoDestroy", "(II)V"),
         // Lifecycle callback
         ("onGameReady", "(I)V"),
+        // R1 on-demand vsync: Rust render/host requests one Choreographer frame.
+        ("requestVsync", REQUEST_VSYNC_SIG),
         // Error notification callback
         // onError(hostId, errorCode, message, detail)
         ("onError", "(IILjava/lang/String;Ljava/lang/String;)V"),
@@ -616,6 +623,24 @@ pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::ON_CAMERA_FRAME_DATA_SIG;
+    use super::REQUEST_VSYNC_SIG;
+
+    /// Contract guard: R1's outbound `NativeExports.requestVsync(int)` must be
+    /// registered as `(I)V`. A single `int` host_id and a void return; the Java
+    /// method, this cached descriptor, and the `jni_void!(request_vsync, ...)`
+    /// outbound wrapper must agree. Catches a descriptor drift that would make
+    /// the cached static-method id fail to resolve at runtime.
+    #[test]
+    fn request_vsync_descriptor_is_int_to_void() {
+        assert_eq!(
+            REQUEST_VSYNC_SIG.matches('I').count(),
+            1,
+            "one int param: host_id"
+        );
+        assert!(!REQUEST_VSYNC_SIG.contains('L'), "no object params");
+        assert!(REQUEST_VSYNC_SIG.ends_with(")V"), "void return");
+        assert_eq!(REQUEST_VSYNC_SIG, "(I)V");
+    }
 
     /// Contract guard: the camera-frame JNI descriptor must expose exactly three
     /// `ByteBuffer` plane params, ten `int` params (host_id, camera_id, three

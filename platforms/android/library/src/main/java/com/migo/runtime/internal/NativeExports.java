@@ -88,6 +88,21 @@ public final class NativeExports {
     /** Handler for dispatching callbacks to the main thread. */
     private static final Handler sMainHandler = new Handler(Looper.getMainLooper());
 
+    /** R1 hot-path message code; uses pooled Message objects instead of one Runnable allocation/frame. */
+    private static final int MSG_REQUEST_VSYNC = 1;
+
+    /** Dedicated frame-arm handler. The callback object is allocated once at class initialization. */
+    private static final Handler sVsyncHandler = new Handler(Looper.getMainLooper(), message -> {
+        if (message.what != MSG_REQUEST_VSYNC) {
+            return false;
+        }
+        GameSession session = sSessions.get(message.arg1);
+        if (session != null) {
+            session.requestVsyncFrame();
+        }
+        return true;
+    });
+
     private NativeExports() {}
 
     // ==================== Error Notification (from native) ====================
@@ -212,6 +227,22 @@ public final class NativeExports {
                 session.notifyGameReady();
             }
         });
+    }
+
+    /**
+     * Called from native code (Rust render/host thread) to request exactly one
+     * Choreographer frame callback (R1 demand-driven vsync).
+     * <p>
+     * Hops to the main thread and rechecks the live {@link GameSession} before
+     * touching the Choreographer, so a call that races session teardown is a
+     * harmless no-op. The scheduler coalesces duplicate requests.
+     * <p>
+     * JNI signature: {@code (I)V}
+     *
+     * @param hostId Session/host ID
+     */
+    public static void requestVsync(int hostId) {
+        sVsyncHandler.obtainMessage(MSG_REQUEST_VSYNC, hostId, 0).sendToTarget();
     }
 
     /**

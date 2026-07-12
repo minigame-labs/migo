@@ -155,6 +155,15 @@ public final class GameSession implements Closeable {
         // Register session for lifecycle callbacks from native
         NativeExports.registerSession(sessionId, this);
 
+        // R1 bootstrap: native render initialization may request its first
+        // one-shot before this Java wrapper is registered (notably through the
+        // Context overload, which may be created off the UI thread). That early
+        // request is intentionally a no-op because no live session exists yet.
+        // Re-request once after publication so the initial dirty frame cannot
+        // remain stranded. NativeExports hops to the main thread and the Java
+        // scheduler coalesces this with any request already in flight.
+        NativeExports.requestVsync(sessionId);
+
         // Register for native engine error callbacks (OOM, ANR, Panic, Timeout)
         NativeExports.registerErrorCallback(sessionId, new NativeExports.NativeErrorCallback() {
             @Override
@@ -721,6 +730,20 @@ public final class GameSession implements Closeable {
                 l2.onGameReady();
             }
         });
+    }
+
+    /**
+     * @hide R1: arm exactly one Choreographer frame. Called from
+     * {@link com.migo.runtime.internal.NativeExports#requestVsync(int)} on the
+     * main thread when the native render thread / RAF loop has frame demand.
+     * Idempotent: the underlying scheduler coalesces duplicate requests.
+     */
+    public void requestVsyncFrame() {
+        ThreadCheck.ensureMainThread();
+        synchronized (lock) {
+            if (state.get() == SessionState.DESTROYED) return;
+            vsyncScheduler.requestFrame();
+        }
     }
 
     /** @hide Called from native code (potentially from a non-UI thread). */

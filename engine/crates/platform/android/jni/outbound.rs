@@ -153,6 +153,11 @@ jni_void!(open_bluetooth_settings, "openSystemBluetoothSetting");
 
 jni_void!(open_app_authorize_setting, "openAppAuthorizeSetting");
 
+// R1: request one Choreographer frame callback (Rust render/host -> Java).
+// `NativeExports.requestVsync` posts to the main thread and rechecks the live
+// GameSession, so a late call after teardown is harmless.
+jni_void!(request_vsync, "requestVsync");
+
 pub fn get_window_info(host_id: i32) -> Result<WindowInfo, String> {
     call_static_method(
         "getWindowInfoBytes",
