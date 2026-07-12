@@ -12,14 +12,13 @@
     }
     return { windowWidth: 0, windowHeight: 0, screenWidth: 0, screenHeight: 0, pixelRatio: 1 };
   })();
-  var _dpr = _info.pixelRatio || 1;
-  var devicePixelRatio = 1;
-  var innerWidth = Math.round((_info.windowWidth || _info.screenWidth || 0) * _dpr);
-  var innerHeight = Math.round((_info.windowHeight || _info.screenHeight || 0) * _dpr);
+  var innerWidth = _info.windowWidth || _info.screenWidth || 0;
+  var innerHeight = _info.windowHeight || _info.screenHeight || 0;
   var outerWidth = innerWidth;
   var outerHeight = innerHeight;
-  var screenWidth = Math.round((_info.screenWidth || _info.windowWidth || 0) * _dpr);
-  var screenHeight = Math.round((_info.screenHeight || _info.windowHeight || 0) * _dpr);
+  var screenWidth = _info.screenWidth || innerWidth;
+  var screenHeight = _info.screenHeight || innerHeight;
+  var devicePixelRatio = _info.pixelRatio || 1;
   var screen = {
     width: screenWidth,
     height: screenHeight,
