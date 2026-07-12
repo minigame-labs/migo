@@ -545,17 +545,21 @@ impl Host {
             }
             RenderEvent::ContextLost => {
                 warn!("[Host {}] render context lost", self.id);
-                // JS `webglcontextlost` dispatch is handled centrally by
-                // `reconcile_context_lost` (run at the end of every drain), which
-                // reads the render-owned authoritative state and is robust to this
-                // event being dropped by the bounded channel. Here we only surface
-                // the one-shot Java notification.
-                self.platform.notify_error(
-                    self.id,
-                    shared::error::ErrorCode::RenderBackendError.as_u16(),
-                    "render context lost",
-                    "",
-                );
+                // A context loss is a *recoverable* condition: the render thread
+                // immediately rebuilds the share group and always follows up with
+                // `ContextRecovered { success }`. The JS-visible `webglcontextlost`
+                // event is dispatched centrally by `reconcile_context_lost` (run at
+                // the end of every drain), robust to this event being dropped by
+                // the bounded channel.
+                //
+                // We deliberately do NOT raise a Java-level `notify_error` here.
+                // That callback is delivered as non-recoverable (see GameSession:
+                // "all native fatal errors are non-recoverable"), so signalling it
+                // on every loss would tell a spec-compliant app to tear down the
+                // session even when recovery succeeds a few milliseconds later
+                // (e.g. a `WEBGL_lose_context.loseContext()` robustness probe or a
+                // transient GPU reset). The genuine unrecoverable case is surfaced
+                // from the `ContextRecovered { success: false }` arm below.
             }
             RenderEvent::ContextRecovered { success } => {
                 // On success, the render thread already cleared the authoritative

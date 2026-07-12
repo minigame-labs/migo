@@ -26,8 +26,6 @@ import com.migo.runtime.SessionState;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.graphics.ImageDecoder;
-import android.hardware.HardwareBuffer;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -382,137 +380,36 @@ public final class NativeExports {
     }
 
     /**
-     * Decode image bytes into a GPU-importable {@link HardwareBuffer}
-     * ("AHB"), returning a native pointer the Rust engine imports
-     * directly via {@code eglCreateImageKHR} -- the zero-memcpy path.
+     * Zero-copy {@code HardwareBuffer} ("AHB") image-decode hook.
      *
-     * <p><b>Availability:</b> API <b>30+</b> only. The zero-copy
-     * bridge requires {@link Bitmap#getHardwareBuffer()} (added in
-     * API 30) to expose the underlying AHB to JNI. On API 26/27/28/29
-     * this method returns {@code null} immediately so the caller
-     * falls back to {@link #decodeImageRgba} without decoding twice.
+     * <p><b>Disabled — always returns {@code null}.</b> The engine's
+     * minimum supported API level is 26, but the AHB fast path relied
+     * on {@link android.graphics.ImageDecoder} (API 28) and
+     * {@code Bitmap.getHardwareBuffer()} (API <b>31</b>). The old
+     * {@code SDK_INT >= R} (API 30) gate was itself wrong: an API 30
+     * device passed the gate and then invoked the API 31
+     * {@code getHardwareBuffer()}, which raises
+     * {@code NoSuchMethodError}/{@code VerifyError} (neither caught by
+     * the former decoder's {@code Exception|OutOfMemoryError} handler).
      *
-     * <p>On API 30+ the decode strategy is {@code ImageDecoder} with
-     * {@code ALLOCATOR_HARDWARE}: the JPEG/PNG decoder writes
-     * straight into an HWB-backed Bitmap, skipping the intermediate
-     * RGBA heap allocation that {@link #decodeImageRgba} uses.
+     * <p>To keep the whole library free of framework APIs above the
+     * API 26 floor, this hook now returns {@code null} unconditionally,
+     * so the native caller ({@code decode_image_ahb_jni}) falls back to
+     * the API-26-safe {@link #decodeImageRgba}. The JNI layer resolves
+     * this method by name, so the {@code decodeImageAhb([B)[B}
+     * signature is preserved.
      *
-     * <p>The returned array layout is a fixed 16-byte header:
-     * <pre>
-     *   bytes [0..8)   AHardwareBuffer* as little-endian int64
-     *   bytes [8..12)  width  (little-endian uint32)
-     *   bytes [12..16) height (little-endian uint32)
-     * </pre>
-     * {@code null} signals "give up, fall back to
-     * {@link #decodeImageRgba}".
-     *
-     * <p><b>Refcount contract:</b> on success, the native accessor
-     * returns a raw pointer that already owns one extra native
-     * strong refcount. This method then closes the Java-side
-     * {@link HardwareBuffer} wrapper in {@code finally}, leaving the
-     * transferred native ref for Rust to adopt without another
-     * {@code AHardwareBuffer_acquire}. Net effect: Rust owns one
-     * strong refcount; Java owns zero.
+     * <p>A genuine API-26 zero-copy path (Rust/Skia decode +
+     * {@code AHardwareBuffer_allocate} through the NDK, available since
+     * API 26) can replace this stub later; until then RGBA decode is
+     * the only path.
      */
     public static byte[] decodeImageAhb(byte[] imageData) {
-        if (imageData == null || imageData.length == 0) {
-            android.util.Log.w(TAG, "decodeImageAhb: empty image payload");
-            return null;
-        }
-
-        // Quick-reject on API < 30 *before* we touch any class that
-        // only exists on newer SDKs.  This matters beyond just
-        // "wasting work":  ART's verifier is allowed to refuse to
-        // load a method whose bytecode references classes missing
-        // from the running platform's framework. By gating on
-        // `Build.VERSION.SDK_INT` here and delegating all work that
-        // needs {@link ImageDecoder} / {@link HardwareBuffer} to a
-        // separate inner class, we guarantee API 26-29 devices never
-        // trigger that lazy class-load.
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            android.util.Log.d(TAG, "decodeImageAhb: API < 30, fallback to RGBA");
-            return null;
-        }
-
-        // Fail fast under memory pressure -- same rationale as
-        // decodeImageRgba above.
-        Runtime rt = Runtime.getRuntime();
-        long used = rt.totalMemory() - rt.freeMemory();
-        long free = rt.maxMemory() - used;
-        if (free < 32L * 1024 * 1024) {
-            android.util.Log.w(TAG, "decodeImageAhb: low memory, fallback to RGBA");
-            return null;
-        }
-
-        // Hand off to the API-30+ helper. The JVM only loads
-        // `AhbDecoder` when this line executes, which never happens
-        // on older devices thanks to the guard above.
-        return AhbDecoder.decode(imageData);
-    }
-
-    /**
-     * API-30+ decode path for {@link #decodeImageAhb}, factored out
-     * so older devices never load the class. Accessing
-     * {@link ImageDecoder} / {@link HardwareBuffer} from within
-     * this type is safe because the outer method guarantees we
-     * only reach here on API 30+.
-     *
-     * <p><b>Do not add {@code @RequiresApi}</b> — the project
-     * forbids AndroidX dependencies ({@code build.gradle} declares
-     * "zero dependencies"). Version gating is enforced by the
-     * runtime check in the caller.
-     */
-    private static final class AhbDecoder {
-        static byte[] decode(byte[] imageData) {
-            Bitmap bitmap = null;
-            HardwareBuffer hb = null;
-            try {
-                ImageDecoder.Source src = ImageDecoder.createSource(
-                        ByteBuffer.wrap(imageData));
-                bitmap = ImageDecoder.decodeBitmap(src, (decoder, info, source) -> {
-                    decoder.setAllocator(ImageDecoder.ALLOCATOR_HARDWARE);
-                    // Don't premultiply -- matches decodeImageRgba above.
-                    decoder.setUnpremultipliedRequired(true);
-                });
-                if (bitmap == null) return null;
-
-                int w = bitmap.getWidth();
-                int h = bitmap.getHeight();
-
-                hb = bitmap.getHardwareBuffer();
-                if (hb == null) {
-                    // Decoder didn't honour the HARDWARE allocator
-                    // (driver quirk, small image, etc.). Fallback.
-                    android.util.Log.w(TAG, "decodeImageAhb: decoder returned bitmap without HardwareBuffer");
-                    return null;
-                }
-                long ahbPtr = NativeBridge.nativeAhbPointerFromHardwareBuffer(hb);
-                if (ahbPtr == 0L) {
-                    android.util.Log.w(TAG, "decodeImageAhb: native bridge returned null AHB pointer");
-                    return null;
-                }
-
-                ByteBuffer buf = ByteBuffer.allocate(16);
-                buf.order(ByteOrder.LITTLE_ENDIAN);
-                buf.putLong(ahbPtr);
-                buf.putInt(w);
-                buf.putInt(h);
-                return buf.array();
-            } catch (Exception | OutOfMemoryError e) {
-                android.util.Log.w(TAG, "decodeImageAhb failed, fallback to RGBA", e);
-                return null;
-            } finally {
-                // Close the Java wrapper first so its ref is
-                // released before recycle(); the native bridge has
-                // already retained an independent AHB ref for Rust.
-                if (hb != null) {
-                    try { hb.close(); } catch (Throwable ignored) {}
-                }
-                if (bitmap != null && !bitmap.isRecycled()) {
-                    bitmap.recycle();
-                }
-            }
-        }
+        // AHB fast path intentionally disabled: it required framework
+        // APIs above the API 26 floor (ImageDecoder/API28,
+        // Bitmap.getHardwareBuffer/API31). Returning null routes
+        // decoding through the API-26-safe RGBA fallback in the caller.
+        return null;
     }
 
     // ==================== File System ====================
