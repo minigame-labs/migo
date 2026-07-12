@@ -19,9 +19,15 @@ pub struct DeviceCapabilities {
     pub has_compute: bool,
     /// `AHardwareBuffer` available (Android API 26+).
     pub ahb_available: bool,
-    /// `EGL_EXT_buffer_age` — can query `EGL_BUFFER_AGE_KHR` on the surface
-    /// to determine how many swaps ago the current back buffer was presented.
+    /// Buffer-age query (`EGL_BUFFER_AGE_KHR`) is available — advertised by
+    /// either `EGL_EXT_buffer_age` or `EGL_KHR_partial_update`.
     pub has_buffer_age: bool,
+    /// `EGL_EXT_buffer_age` is *independently* advertised. Unlike
+    /// [`Self::has_buffer_age`] this is never inferred from
+    /// `EGL_KHR_partial_update`: EXT guarantees the aged back-buffer contents
+    /// regardless of any `eglSetDamageRegionKHR` declaration, so a rejected/absent
+    /// KHR declaration may keep a partial repair only when this is true.
+    pub has_ext_buffer_age: bool,
     /// `EGL_KHR_partial_update` — can call `eglSetDamageRegionKHR` to tell
     /// the compositor which region changed before swap.
     pub has_partial_update: bool,
@@ -81,13 +87,17 @@ impl DeviceCapabilities {
             && gl_extensions.contains("GL_OES_EGL_image")
             && egl_extensions.contains("EGL_ANDROID_image_native_buffer");
 
-        // EGL_EXT_buffer_age: query surface for back buffer age.
-        // EGL_KHR_partial_update: set damage region before swap.
-        // These are independent capabilities — partial_update implies buffer_age
-        // per the KHR spec (it includes the buffer age query), but EXT_buffer_age
-        // can exist without partial_update.
-        let has_buffer_age = egl_extensions.contains("EGL_EXT_buffer_age")
-            || egl_extensions.contains("EGL_KHR_partial_update");
+        // EGL_EXT_buffer_age: query surface for back buffer age, and guarantees
+        // aged back-buffer contents independently of any damage declaration.
+        // EGL_KHR_partial_update: set damage region before swap (and includes
+        // the buffer age query). These are independent capabilities —
+        // partial_update implies the age query per the KHR spec, but
+        // EGL_EXT_buffer_age can exist without partial_update. Track the EXT
+        // advertisement separately so the partial-blit path can tell "aged
+        // contents guaranteed" (EXT) apart from "age query only via KHR".
+        let has_ext_buffer_age = egl_extensions.contains("EGL_EXT_buffer_age");
+        let has_buffer_age =
+            has_ext_buffer_age || egl_extensions.contains("EGL_KHR_partial_update");
         let has_partial_update = egl_extensions.contains("EGL_KHR_partial_update");
 
         let compressed_format_support =
@@ -100,6 +110,7 @@ impl DeviceCapabilities {
             has_compute,
             ahb_available,
             has_buffer_age,
+            has_ext_buffer_age,
             has_partial_update,
             compressed_format_support,
         }

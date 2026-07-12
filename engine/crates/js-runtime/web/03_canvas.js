@@ -2,9 +2,17 @@ import { primordials } from "ext:core/mod.js";
 import { op_create_offscreen_canvas, op_get_canvas_info, op_resize_canvas, op_destroy_canvas } from "ext:core/ops";
 import { WebGLRenderingContext, WebGL2RenderingContext } from "ext:host_v8_webgl/02_webgl_context.js";
 import { CanvasRenderingContext2D } from "ext:host_v8_webgl/02_2d_context.js";
+import {
+    flushGlCommandStream,
+    discardGlCommandStream,
+} from "ext:host_v8_webgl/00_gl_command_stream.js";
 const { SafeFinalizationRegistry } = primordials;
 
 const registry = new SafeFinalizationRegistry((rid) => {
+    // Flush any pending GL/2D collector commands before the synchronous destroy
+    // so they arrive at the render thread BEFORE the DestroyCanvas command
+    // (design S8 ordering: pending work for canvas N must precede its teardown).
+    flushGlCommandStream();
     op_destroy_canvas(rid);
 });
 
@@ -15,6 +23,7 @@ class Canvas {
     constructor(rid) {
         this._rid = rid;
         this._offscreen = rid !== 1;
+        flushGlCommandStream();
         const info = op_get_canvas_info(rid);
         this._width = info['0'];
         this._height = info['1'];
@@ -33,6 +42,9 @@ class Canvas {
         return this._height;
     }
     set width(v) {
+        // Flush pending GL stream before resize so GL commands encoded before this
+        // resize arrive at the render thread before the ResizeCanvas command.
+        flushGlCommandStream();
         op_resize_canvas(this._rid, v, undefined);
         this._width = v;
         if (this._context && this._context._resetShadowState) {
@@ -40,6 +52,8 @@ class Canvas {
         }
     }
     set height(v) {
+        // Flush pending GL stream before resize (same ordering invariant as width setter).
+        flushGlCommandStream();
         op_resize_canvas(this._rid, undefined, v);
         this._height = v;
         if (this._context && this._context._resetShadowState) {
@@ -137,6 +151,7 @@ const createCanvas = () => {
 
 // SDK internal: always creates an offscreen canvas, never touches rid 1.
 const createOffscreenCanvas = (width, height) => {
+    flushGlCommandStream();
     const rid = op_create_offscreen_canvas(width || 1, height || 1);
     return new Canvas(rid);
 };
@@ -169,6 +184,14 @@ const getMainCanvas = () => {
 //
 // Returns `true` if a listener called `preventDefault()`, else `false`.
 const dispatchWebglContextEvent = (type) => {
+    // On context loss: discard (do NOT submit) any pending GL stream commands.
+    // Dead-context commands must never reach the render thread; submitting them
+    // would corrupt ordering and potentially trigger use-after-free on the render
+    // side. Discard before any early return and before dispatching to game listeners
+    // so the stream is clean regardless of what listeners do (design S9).
+    if (type === "webglcontextlost") {
+        discardGlCommandStream();
+    }
     if (!_mainCanvas) return false;
     let prevented = false;
     const event = {

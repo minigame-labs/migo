@@ -65,6 +65,7 @@ pub mod upload_policy;
 pub(crate) mod upload_server;
 pub mod upload_thread;
 
+pub(crate) mod present_damage;
 pub(crate) use canvas::*;
 pub(crate) use legacy_frame_bridge::LegacyFrameBridge;
 pub use render_server::RenderServer;

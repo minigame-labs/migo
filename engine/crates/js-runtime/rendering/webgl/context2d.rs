@@ -267,11 +267,20 @@ fn parse_color_string(s: &str) -> Color {
 
 #[op2(fast)]
 pub fn op_create_context_2d(state: &mut OpState, #[smi] canvas_id: u32) -> i32 {
+    // The JS facade submits its typed GL stream before this op. Materialize the
+    // resulting collector segments before dispatching the direct Canvas2D
+    // command, otherwise CreateContext2D can overtake earlier GL/2D work on the
+    // render channel.
+    if let Err(e) = crate::rendering::webgl::frame_collector::flush_unified_barrier(state) {
+        error!("createContext2D barrier flush failed: {e}");
+        return -1;
+    }
+
     let ctx = state.borrow::<CanvasOpState>();
     // Fire-and-forget: render thread processes Canvas2D commands FIFO
-    // on this channel, so a subsequent draw on `canvas_id` (which lives
-    // in the same RenderCommand::Canvas2D queue) is guaranteed to run
-    // after `init_skia_for_canvas`.  The previous sync RTT was pure
+    // on this channel. The barrier above has already put prior collector
+    // work on that FIFO, so subsequent draws are guaranteed to run after
+    // `init_skia_for_canvas`. The previous sync RTT was pure
     // stall — its only reply was the caller's own canvas_id — and was
     // observed as ~7–17 ms × dozens per shop scene open on Mali
     // ([SyncOp] canvas2d create context blocked V8 …).  Same shape as

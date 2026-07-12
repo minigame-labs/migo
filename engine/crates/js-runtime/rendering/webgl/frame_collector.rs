@@ -6,7 +6,9 @@
 
 use std::collections::HashSet;
 
-use shared::command_vec_pool::{take_canvas_command_vec, take_gl_command_vec};
+use shared::command_vec_pool::{
+    recycle_gl_command_vec, take_canvas_command_vec, take_gl_command_vec,
+};
 use shared::protocol::frame_packet::FrameOp;
 use shared::protocol::render_cmd::{
     Canvas2DCmd, CanvasBatchPayload, DirtyRect, GLCmd, GlBatchPayload,
@@ -289,6 +291,50 @@ impl UnifiedFrameCollector {
         if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
             seg.commands.push(cmd);
         }
+    }
+
+    /// Bulk-append a decoded GL command batch from the stream submit path.
+    ///
+    /// Design §7 contract:
+    /// - Empty `commands`: recycle the vec and return immediately (no segment, no stats).
+    /// - Non-empty + current segment is GL: `Vec::append` then recycle the now-empty
+    ///   input vec back to the pool.
+    /// - Non-empty + current segment is not GL: move the input vec directly into a new
+    ///   GL segment (same as `push_gl` creates a `GlSegment`).
+    /// - Update `pending_bytes` ONCE via `saturating_add(approx_bytes)`.
+    /// - Call `shared::stats::set_collector_pending_bytes` EXACTLY once.
+    /// - Check the 4 MiB soft budget ONCE; returns `true` when the budget is exceeded
+    ///   so the caller can invoke `maybe_auto_flush` (which re-borrows `OpState`).
+    pub(crate) fn append_gl_batch(
+        &mut self,
+        mut commands: Vec<GLCmd>,
+        approx_bytes: usize,
+    ) -> bool {
+        if commands.is_empty() {
+            // Nothing to do — recycle the empty vec and bail without touching stats.
+            recycle_gl_command_vec(commands);
+            return false;
+        }
+
+        if self.current == CurrentKind::GL {
+            // Extend the current GL segment in place.
+            if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
+                seg.commands.append(&mut commands);
+                // commands is now empty; return to pool.
+                recycle_gl_command_vec(commands);
+            }
+        } else {
+            // Start a new GL segment by moving the vec directly in.
+            self.segments.push(FrameSegment::GL(GlSegment { commands }));
+            self.current = CurrentKind::GL;
+        }
+
+        // Update byte budget exactly once.
+        self.pending_bytes = self.pending_bytes.saturating_add(approx_bytes);
+        shared::stats::set_collector_pending_bytes(self.pending_bytes as u32);
+
+        // Report whether auto-flush is needed; caller handles it.
+        self.should_auto_flush()
     }
 
     /// Build a single FramePacket from all accumulated segments.
@@ -596,6 +642,30 @@ impl UnifiedFrameCollector {
     /// Reset dedup state (no-op without dedup) and push Restore.
     pub(crate) fn restore(&mut self, canvas_id: u32) {
         self.push_canvas2d(canvas_id, Canvas2DCmd::Restore);
+    }
+
+    /// Count GL commands across all GL segments (test-only helper).
+    #[cfg(test)]
+    pub(crate) fn gl_cmd_count_for_test(&self) -> usize {
+        self.segments
+            .iter()
+            .filter_map(|seg| {
+                if let FrameSegment::GL(s) = seg {
+                    Some(s.commands.len())
+                } else {
+                    None
+                }
+            })
+            .sum()
+    }
+
+    /// Count GL segments (test-only helper).
+    #[cfg(test)]
+    pub(crate) fn gl_segment_count_for_test(&self) -> usize {
+        self.segments
+            .iter()
+            .filter(|seg| matches!(seg, FrameSegment::GL(_)))
+            .count()
     }
 }
 
@@ -965,6 +1035,132 @@ mod tests {
             dw: 1.0,
             dh: 1.0,
         }
+    }
+
+    // ── Task 3 RED: append_gl_batch ──────────────────────────────────────────
+
+    #[test]
+    fn append_gl_batch_into_empty_collector_creates_one_gl_segment() {
+        let mut c = UnifiedFrameCollector::new();
+        let cmds = vec![
+            GLCmd::Clear {
+                canvas_id: 1,
+                bit_field: 0x4000,
+            },
+            GLCmd::Clear {
+                canvas_id: 1,
+                bit_field: 0x4100,
+            },
+        ];
+        c.append_gl_batch(cmds, 128);
+
+        let packet = c.build_frame_packet(false).unwrap();
+        let ops = packet.ops();
+        // [BeginFrame, GlBatch(2)]
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(&ops[1], FrameOp::GlBatch(p) if p.commands.len() == 2));
+    }
+
+    #[test]
+    fn append_gl_batch_into_existing_gl_segment_merges_and_preserves_order() {
+        let mut c = UnifiedFrameCollector::new();
+        // Start with one GL command via push_gl
+        c.push_gl(GLCmd::Clear {
+            canvas_id: 1,
+            bit_field: 0x4000,
+        });
+
+        let cmds = vec![
+            GLCmd::Clear {
+                canvas_id: 1,
+                bit_field: 0x4100,
+            },
+            GLCmd::Clear {
+                canvas_id: 1,
+                bit_field: 0x4200,
+            },
+        ];
+        c.append_gl_batch(cmds, 64);
+
+        let packet = c.build_frame_packet(false).unwrap();
+        let ops = packet.ops();
+        // Must be a single GlBatch with all 3 commands in order
+        assert_eq!(ops.len(), 2, "must be single GL segment");
+        if let FrameOp::GlBatch(p) = &ops[1] {
+            assert_eq!(p.commands.len(), 3);
+            // Check order: first 0x4000, then 0x4100, then 0x4200
+            assert!(matches!(
+                &p.commands[0],
+                GLCmd::Clear {
+                    bit_field: 0x4000,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                &p.commands[1],
+                GLCmd::Clear {
+                    bit_field: 0x4100,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                &p.commands[2],
+                GLCmd::Clear {
+                    bit_field: 0x4200,
+                    ..
+                }
+            ));
+        } else {
+            panic!("expected GlBatch");
+        }
+    }
+
+    #[test]
+    fn append_gl_batch_pending_bytes_increases_once_by_approx_bytes() {
+        let mut c = UnifiedFrameCollector::new();
+        assert_eq!(c.approx_pending_bytes(), 0);
+        c.append_gl_batch(
+            vec![GLCmd::Clear {
+                canvas_id: 1,
+                bit_field: 0,
+            }],
+            777,
+        );
+        assert_eq!(c.approx_pending_bytes(), 777);
+        // A second batch adds exactly the specified approx_bytes
+        c.append_gl_batch(
+            vec![GLCmd::Clear {
+                canvas_id: 1,
+                bit_field: 0,
+            }],
+            333,
+        );
+        assert_eq!(c.approx_pending_bytes(), 1110);
+    }
+
+    #[test]
+    fn append_gl_batch_crossing_soft_budget_makes_should_auto_flush_true() {
+        let mut c = UnifiedFrameCollector::new();
+        assert!(!c.should_auto_flush());
+        // Append with approx_bytes that crosses the 4MiB budget
+        c.append_gl_batch(
+            vec![GLCmd::Clear {
+                canvas_id: 1,
+                bit_field: 0,
+            }],
+            AUTO_FLUSH_SOFT_BUDGET_BYTES + 1,
+        );
+        assert!(c.should_auto_flush());
+    }
+
+    #[test]
+    fn append_gl_batch_empty_creates_no_segment_and_does_not_publish_bytes() {
+        let mut c = UnifiedFrameCollector::new();
+        c.append_gl_batch(vec![], 999);
+        // No segment created
+        assert!(c.build_frame_packet(false).is_none());
+        // pending_bytes stays at 0
+        assert_eq!(c.approx_pending_bytes(), 0);
     }
 
     #[test]

@@ -83,6 +83,8 @@ pub fn op_create_offscreen_canvas(
     #[smi] width: u32,
     #[smi] height: u32,
 ) -> Result<u32, JsErrorBox> {
+    crate::rendering::webgl::frame_collector::flush_unified_barrier(state)
+        .map_err(|e| js_err_from_engine(from_send_err(e)))?;
     let ctx = state.borrow::<CanvasOpState>();
 
     // Fire-and-forget: JS allocates the id locally and posts a
@@ -108,6 +110,8 @@ pub fn op_create_offscreen_canvas(
 #[op2]
 #[serde]
 pub fn op_get_canvas_info(state: &mut OpState, #[smi] id: u32) -> Result<(u32, u32), JsErrorBox> {
+    crate::rendering::webgl::frame_collector::flush_unified_barrier(state)
+        .map_err(|e| js_err_from_engine(from_send_err(e)))?;
     let ctx = state.borrow::<CanvasOpState>();
 
     send_canvas_sync(
@@ -155,15 +159,42 @@ pub fn op_resize_canvas(
     Ok(())
 }
 
-#[op2(fast)]
-pub fn op_destroy_canvas(state: &mut OpState, #[smi] rid: u32) -> Result<(), JsErrorBox> {
-    let ctx = state.borrow::<CanvasOpState>();
-
+/// Inner implementation for `op_destroy_canvas`, callable from tests.
+///
+/// Design §8 ordering invariant: flush the unified barrier BEFORE borrowing
+/// `CanvasOpState` and sending the synchronous DestroyCanvas, so any pending
+/// collector commands (Canvas2D draw ops, GL batch) for this canvas arrive at
+/// the render thread as a FramePacket barrier strictly BEFORE the DestroyCanvas
+/// command. Without this, a pending FillRect or GlBatch for canvas N could
+/// arrive AFTER the render thread has already destroyed canvas N's resources,
+/// causing use-after-free on the render side.
+///
+/// On flush error (channel timeout / disconnect), the error is surfaced to JS
+/// immediately — we do NOT destroy-then-lose pending commands.
+pub(crate) fn destroy_canvas_impl(state: &mut OpState, rid: u32) -> Result<(), JsErrorBox> {
     // Onscreen canvas (id=1) is not destroyed by render thread; just drop JS-side ownership.
     if rid == 1 {
         return Ok(());
     }
 
+    // Flush any pending collector commands as a barrier before sending DestroyCanvas.
+    // This ensures program-order: pending Canvas2D/GL work for this canvas arrives at
+    // the render thread before the synchronous destroy.
+    crate::rendering::webgl::frame_collector::flush_unified_barrier(state).map_err(|e| {
+        use shared::error::{EngineError, ErrorCode};
+        use shared::render_command_sender::SendError;
+        let err = match e {
+            SendError::Timeout => EngineError::new(ErrorCode::Timeout)
+                .with_msg("flush barrier before destroy_canvas timed out"),
+            SendError::Disconnected => EngineError::new(ErrorCode::Disconnected)
+                .with_msg("flush barrier before destroy_canvas: channel disconnected"),
+            SendError::Overflow => EngineError::new(ErrorCode::Internal)
+                .with_msg("flush barrier before destroy_canvas: channel overflow"),
+        };
+        js_err_from_engine(err)
+    })?;
+
+    let ctx = state.borrow::<CanvasOpState>();
     let _ = send_canvas_sync(
         ctx,
         |resp| RenderCommand::Canvas(CanvasCmd::DestroyCanvas { id: rid, resp }),
@@ -173,12 +204,18 @@ pub fn op_destroy_canvas(state: &mut OpState, #[smi] rid: u32) -> Result<(), JsE
     Ok(())
 }
 
+#[op2(fast)]
+pub fn op_destroy_canvas(state: &mut OpState, #[smi] rid: u32) -> Result<(), JsErrorBox> {
+    destroy_canvas_impl(state, rid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::send_canvas_sync;
     use shared::{
+        FrameOp,
         op_state::CanvasOpState,
-        protocol::render_cmd::{CanvasCmd, RenderCmdResp, RenderCommand},
+        protocol::render_cmd::{Canvas2DCmd, CanvasCmd, GLCmd, RenderCmdResp, RenderCommand},
         render_command_sender::CommandSender,
     };
 
@@ -209,6 +246,201 @@ mod tests {
         assert!(
             err.to_string().contains("[Timeout]"),
             "expected timeout error when sync canvas send hits a full queue, got: {err}"
+        );
+    }
+
+    // ── Task 6 RED: op_destroy_canvas barrier ──────────────────────────────────
+
+    /// Build a minimal OpState with both a CanvasOpState (connected render channel)
+    /// and a UnifiedFrameCollector.
+    fn new_canvas_op_state_with_collector(
+        tx: shared::render_command_sender::CommandSender,
+    ) -> deno_core::OpState {
+        use crate::rendering::webgl::frame_collector::UnifiedFrameCollector;
+        let mut state = deno_core::OpState::new(None);
+        state.put(CanvasOpState::new(tx));
+        state.put(UnifiedFrameCollector::new());
+        state
+    }
+
+    #[test]
+    fn task6_destroy_canvas_flushes_barrier_before_destroy_command() {
+        use crate::rendering::webgl::frame_collector::UnifiedFrameCollector;
+
+        let (tx, rx) = CommandSender::new();
+
+        // Spawn a responder that handles both the barrier FramePacket and the
+        // sync DestroyCanvas. It collects commands in arrival order.
+        let responder = std::thread::spawn(move || {
+            let timeout = std::time::Duration::from_secs(2);
+            let mut commands: Vec<&'static str> = Vec::new();
+            loop {
+                match rx.recv_timeout(timeout) {
+                    Ok(RenderCommand::FramePacket(packet)) => {
+                        // Any FramePacket arriving before DestroyCanvas is the barrier.
+                        let has_canvas_batch = packet
+                            .ops()
+                            .iter()
+                            .any(|op| matches!(op, FrameOp::CanvasBatch(_)));
+                        let has_gl_batch = packet
+                            .ops()
+                            .iter()
+                            .any(|op| matches!(op, FrameOp::GlBatch(_)));
+                        if has_canvas_batch || has_gl_batch {
+                            commands.push("barrier_packet");
+                        } else {
+                            commands.push("empty_packet");
+                        }
+                    }
+                    Ok(RenderCommand::Canvas(CanvasCmd::DestroyCanvas { resp, id: _ })) => {
+                        resp.ok(());
+                        commands.push("destroy_canvas");
+                        break;
+                    }
+                    Ok(_) => {
+                        commands.push("other");
+                    }
+                    Err(_) => break,
+                }
+            }
+            commands
+        });
+
+        let mut state = new_canvas_op_state_with_collector(tx);
+
+        // Push a 2D command into the collector to simulate pending work.
+        {
+            let collector = state.borrow_mut::<UnifiedFrameCollector>();
+            collector.push_canvas2d(
+                7,
+                Canvas2DCmd::FillRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            );
+        }
+
+        // Call op_destroy_canvas for canvas 7 (not the immortal rid=1).
+        super::destroy_canvas_impl(&mut state, 7).expect("op_destroy_canvas must not fail");
+
+        let commands = responder.join().expect("responder must not panic");
+        assert_eq!(
+            commands.len(),
+            2,
+            "must see exactly barrier_packet + destroy_canvas, got: {:?}",
+            commands
+        );
+        assert_eq!(
+            commands[0], "barrier_packet",
+            "barrier FramePacket must arrive BEFORE DestroyCanvas"
+        );
+        assert_eq!(
+            commands[1], "destroy_canvas",
+            "DestroyCanvas must arrive AFTER the barrier"
+        );
+    }
+
+    #[test]
+    fn task6_destroy_canvas_rid1_never_destroys_and_does_not_flush() {
+        use crate::rendering::webgl::frame_collector::UnifiedFrameCollector;
+
+        let (tx, rx) = CommandSender::new();
+        let mut state = new_canvas_op_state_with_collector(tx);
+
+        // Push pending work into the collector.
+        {
+            let collector = state.borrow_mut::<UnifiedFrameCollector>();
+            collector.push_canvas2d(
+                1,
+                Canvas2DCmd::FillRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                },
+            );
+        }
+
+        // Destroying rid=1 must be a silent no-op: no flush, no DestroyCanvas sent.
+        super::destroy_canvas_impl(&mut state, 1).expect("op_destroy_canvas(1) must succeed");
+
+        // Give any async messages time to arrive.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "destroying the immortal onscreen canvas (rid=1) must send nothing to the render thread"
+        );
+
+        // Collector still has the pending work (we didn't flush it).
+        let bytes = state
+            .borrow::<UnifiedFrameCollector>()
+            .approx_pending_bytes();
+        assert!(
+            bytes > 0,
+            "pending 2D work must remain in the collector after no-op rid=1 destroy"
+        );
+    }
+
+    #[test]
+    fn task6_destroy_canvas_with_pending_gl_batch_flushes_gl_before_destroy() {
+        use crate::rendering::webgl::frame_collector::UnifiedFrameCollector;
+
+        let (tx, rx) = CommandSender::new();
+
+        let responder = std::thread::spawn(move || {
+            let timeout = std::time::Duration::from_secs(2);
+            let mut order: Vec<&'static str> = Vec::new();
+            loop {
+                match rx.recv_timeout(timeout) {
+                    Ok(RenderCommand::FramePacket(packet)) => {
+                        let has_gl = packet
+                            .ops()
+                            .iter()
+                            .any(|op| matches!(op, FrameOp::GlBatch(_)));
+                        if has_gl {
+                            order.push("gl_barrier");
+                        } else {
+                            order.push("empty_barrier");
+                        }
+                    }
+                    Ok(RenderCommand::Canvas(CanvasCmd::DestroyCanvas { resp, id: _ })) => {
+                        resp.ok(());
+                        order.push("destroy");
+                        break;
+                    }
+                    Ok(_) => order.push("other"),
+                    Err(_) => break,
+                }
+            }
+            order
+        });
+
+        let mut state = new_canvas_op_state_with_collector(tx);
+
+        // Push a GL command into the collector.
+        {
+            let collector = state.borrow_mut::<UnifiedFrameCollector>();
+            collector.push_gl(GLCmd::Clear {
+                canvas_id: 7,
+                bit_field: 0x4000,
+            });
+        }
+
+        super::destroy_canvas_impl(&mut state, 7).expect("op_destroy_canvas must succeed");
+
+        let order = responder.join().expect("responder panicked");
+        assert!(
+            order.contains(&"gl_barrier"),
+            "pending GL work must be flushed before destroy; got: {order:?}"
+        );
+        let gl_pos = order.iter().position(|&s| s == "gl_barrier").unwrap();
+        let destroy_pos = order.iter().position(|&s| s == "destroy").unwrap();
+        assert!(
+            gl_pos < destroy_pos,
+            "GL barrier must come before DestroyCanvas; got order: {order:?}"
         );
     }
 }

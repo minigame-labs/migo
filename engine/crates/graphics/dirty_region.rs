@@ -45,7 +45,9 @@ pub fn clear_scissor(gl: &glow::Context) {
 }
 
 // invalidate_outside_dirty() was removed — it issued glInvalidateSubFramebuffer
-// on the DrawingBuffer FBO, but the subsequent full-surface blit_to_surface()
-// would read the invalidated (now-undefined) regions, risking garbage pixels
-// on tiled GPUs (Mali, PowerVR). Can be reintroduced if the blit path is
-// later changed to partial-region only.
+// on the DrawingBuffer FBO, but blit_to_surface() reads those regions (the whole
+// surface, or per damage rect on the partial-blit path) and would copy the
+// invalidated (now-undefined) pixels to the window surface on tiled GPUs
+// (Mali, PowerVR). It must not be reintroduced: buffer-age partial repair also
+// depends on the DrawingBuffer and destination pixels persisting across frames,
+// so no framebuffer invalidation is safe on this path.

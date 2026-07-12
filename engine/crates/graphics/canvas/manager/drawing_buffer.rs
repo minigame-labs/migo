@@ -281,7 +281,10 @@ pub(crate) fn blit_to_surface(
     db: &DrawingBuffer,
     surface_w: u32,
     surface_h: u32,
-) {
+    plan: &crate::present_damage::BlitPlan,
+) -> bool {
+    use crate::present_damage::BlitPlan;
+    let mut succeeded = false;
     unsafe {
         // Clear any pending GL error.
         clear_gl_errors(gl);
@@ -291,94 +294,137 @@ pub(crate) fn blit_to_surface(
         // sub-window box (e.g. Phaser scissors to its 960x640 render size); if
         // we blit with that still active, the present is clipped to that box —
         // the game lands in a corner of the window with the rest black. The
-        // blit is a system-level present that must cover the whole surface, so
-        // disable scissor for the blit and restore the game's state after.
+        // blit is a system-level present, so disable scissor for the blit and
+        // restore the game's enable state from the single cleanup epilogue
+        // below — which runs on every exit path, including early failures.
         let scissor_was_enabled = gl.is_enabled(glow::SCISSOR_TEST);
         if scissor_was_enabled {
             gl.disable(glow::SCISSOR_TEST);
         }
 
-        // READ from DrawingBuffer, DRAW to window surface (FBO 0).
-        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(db.fbo));
-        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
-
-        let err = gl.get_error();
-        if err != glow::NO_ERROR {
-            tracing::warn!(
-                "DrawingBuffer blit: bind failed (gl_error=0x{err:X}), db={}x{} surface={}x{}",
-                db.width,
-                db.height,
-                surface_w,
-                surface_h
-            );
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            return;
-        }
-
-        // Check READ framebuffer completeness before blit.  Game WebGL code
-        // can accidentally modify the DrawingBuffer FBO attachments (e.g.
-        // framebufferTexture2D on "null" framebuffer), making it incomplete.
-        let status = gl.check_framebuffer_status(glow::READ_FRAMEBUFFER);
-        if status != glow::FRAMEBUFFER_COMPLETE {
-            // Try to heal: re-attach original color + depth/stencil.
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
-            gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                Some(db.color_tex),
-                0,
-            );
-            gl.framebuffer_renderbuffer(
-                glow::FRAMEBUFFER,
-                glow::DEPTH_STENCIL_ATTACHMENT,
-                glow::RENDERBUFFER,
-                Some(db.depth_stencil_rb),
-            );
-            let healed = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-            if healed != glow::FRAMEBUFFER_COMPLETE {
-                tracing::warn!(
-                    "DrawingBuffer blit: FBO incomplete (0x{status:X}), re-attach failed (0x{healed:X})"
-                );
-                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                return;
-            }
-            tracing::debug!("DrawingBuffer blit: FBO healed after re-attach");
-            // Re-bind for blit.
+        'blit: {
+            // READ from DrawingBuffer, DRAW to window surface (FBO 0). Bound
+            // once for every rect in the plan.
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(db.fbo));
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+
+            let err = gl.get_error();
+            if err != glow::NO_ERROR {
+                tracing::warn!(
+                    "DrawingBuffer blit: bind failed (gl_error=0x{err:X}), db={}x{} surface={}x{}",
+                    db.width,
+                    db.height,
+                    surface_w,
+                    surface_h
+                );
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                break 'blit;
+            }
+
+            // Check READ framebuffer completeness before the first blit.  Game
+            // WebGL code can accidentally modify the DrawingBuffer FBO
+            // attachments (e.g. framebufferTexture2D on "null" framebuffer),
+            // making it incomplete.
+            let status = gl.check_framebuffer_status(glow::READ_FRAMEBUFFER);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                // Try to heal: re-attach original color + depth/stencil.
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(db.fbo));
+                gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(db.color_tex),
+                    0,
+                );
+                gl.framebuffer_renderbuffer(
+                    glow::FRAMEBUFFER,
+                    glow::DEPTH_STENCIL_ATTACHMENT,
+                    glow::RENDERBUFFER,
+                    Some(db.depth_stencil_rb),
+                );
+                let healed = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+                if healed != glow::FRAMEBUFFER_COMPLETE {
+                    tracing::warn!(
+                        "DrawingBuffer blit: FBO incomplete (0x{status:X}), re-attach failed (0x{healed:X})"
+                    );
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    break 'blit;
+                }
+                tracing::debug!("DrawingBuffer blit: FBO healed after re-attach");
+                // Re-bind for blit.
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(db.fbo));
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+            }
+
+            match plan {
+                BlitPlan::Full { linear } => {
+                    // Legacy / scaled path: one blit over the whole surface,
+                    // preserving the existing filter (LINEAR for scaling).
+                    let filter = if *linear { glow::LINEAR } else { glow::NEAREST };
+                    gl.blit_framebuffer(
+                        0,
+                        0,
+                        db.width as i32,
+                        db.height as i32,
+                        0,
+                        0,
+                        surface_w as i32,
+                        surface_h as i32,
+                        glow::COLOR_BUFFER_BIT,
+                        filter,
+                    );
+                }
+                BlitPlan::Rects(rects) => {
+                    // Same-size partial repair: identical lower-left source and
+                    // destination coordinates (no scaling, no Y flip) with
+                    // NEAREST. Up to four bounded rect ops; no full retry after
+                    // a partial declaration succeeded.
+                    for r in rects.rects() {
+                        let x0 = r.x;
+                        let y0 = r.y;
+                        let x1 = r.x + r.width;
+                        let y1 = r.y + r.height;
+                        gl.blit_framebuffer(
+                            x0,
+                            y0,
+                            x1,
+                            y1,
+                            x0,
+                            y0,
+                            x1,
+                            y1,
+                            glow::COLOR_BUFFER_BIT,
+                            glow::NEAREST,
+                        );
+                    }
+                }
+            }
+
+            let err = gl.get_error();
+            if err != glow::NO_ERROR {
+                tracing::warn!(
+                    "DrawingBuffer blit: glBlitFramebuffer failed (gl_error=0x{err:X}), db={}x{} surface={}x{}",
+                    db.width,
+                    db.height,
+                    surface_w,
+                    surface_h
+                );
+                break 'blit;
+            }
+            succeeded = true;
         }
 
-        gl.blit_framebuffer(
-            0,
-            0,
-            db.width as i32,
-            db.height as i32,
-            0,
-            0,
-            surface_w as i32,
-            surface_h as i32,
-            glow::COLOR_BUFFER_BIT,
-            glow::LINEAR,
-        );
-
-        let err = gl.get_error();
-        if err != glow::NO_ERROR {
-            tracing::warn!(
-                "DrawingBuffer blit: glBlitFramebuffer failed (gl_error=0x{err:X}), db={}x{} surface={}x{}",
-                db.width,
-                db.height,
-                surface_w,
-                surface_h
-            );
-        }
-
-        // Restore the game's scissor-test enable state (the game reprograms the
-        // scissor box itself; we only touched the enable flag).
+        // Single cleanup epilogue: restore the game's scissor-test enable state
+        // on every exit path — normal completion, bind failure, and FBO-heal
+        // failure alike. We only touched the enable flag; the game reprograms
+        // the scissor box itself. No glInvalidate*: clean destination and
+        // persistent DrawingBuffer pixels are required for future buffer-age
+        // repair, so we must not discard either framebuffer's contents.
         if scissor_was_enabled {
             gl.enable(glow::SCISSOR_TEST);
         }
     }
+    succeeded
 }
 
 /// Restore a texture binding from a raw GL integer (0 = unbind).
