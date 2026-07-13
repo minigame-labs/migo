@@ -832,14 +832,40 @@ impl CanvasManager {
                             exp_w,
                             exp_h,
                         );
-                        // `resize_canvas` takes `Option<u32>` per-dim so the
-                        // caller can signal "don't change this axis" with `None`.
-                        // Always pass the full new size here. Unlike a JS
-                        // backing-store resize, this callback also changes the
-                        // real window extent used by present/blit eligibility.
                         let physical_w = exp_w.max(1);
                         let physical_h = exp_h.max(1);
-                        self.resize_canvas(id, Some(physical_w), Some(physical_h))?;
+                        // Preserve the game's logical-vs-physical BACKING choice
+                        // across the surface resize instead of forcing the backing
+                        // to the new physical size. Scale the DrawingBuffer by the
+                        // same ratio it had to the OLD surface: a DPR-naive game
+                        // (Pixi/Phaser/vanilla Canvas2D at resolution 1) keeps its
+                        // logical-sized backing (physical/dpi) — the swap-blit keeps
+                        // upscaling it to fill the window — while a DPR-aware game
+                        // (Cocos, backing == physical) stays physical/crisp. Forcing
+                        // physical here clobbered a logical Canvas2D game's backing:
+                        // it reads the canvas size ONCE and draws in logical
+                        // coordinates forever, so an over-sized physical backing left
+                        // all of its drawing stranded in a corner (WebGL games re-read
+                        // the canvas size each frame, so they were unaffected).
+                        // `resize_canvas` takes `Option<u32>` per-dim; pass both.
+                        let (backing_w, backing_h) = {
+                            let e = self
+                                .canvases
+                                .get(&id)
+                                .expect("entry present (checked above)");
+                            let (obw, obh) = e
+                                .drawing_buffer
+                                .as_ref()
+                                .map(|db| (db.width, db.height))
+                                .unwrap_or((e.physical_width, e.physical_height));
+                            let opw = e.physical_width.max(1) as f32;
+                            let oph = e.physical_height.max(1) as f32;
+                            (
+                                ((physical_w as f32 * obw as f32 / opw).round() as u32).max(1),
+                                ((physical_h as f32 * obh as f32 / oph).round() as u32).max(1),
+                            )
+                        };
+                        self.resize_canvas(id, Some(backing_w), Some(backing_h))?;
                         if let Some(entry) = self.canvases.get_mut(&id) {
                             entry.physical_width = physical_w;
                             entry.physical_height = physical_h;
