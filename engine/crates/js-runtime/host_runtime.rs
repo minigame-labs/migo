@@ -148,6 +148,29 @@ impl HostJsRuntime {
         #[cfg(not(feature = "v8-limits"))]
         let create_params: Option<v8::CreateParams> = None;
 
+        // Debug-only V8 flag injection for on-device profiling. On debug builds,
+        // any V8 flags placed in /data/local/tmp/v8flags.txt are applied before
+        // the isolate is created, e.g.:
+        //   --prof --logfile=/data/data/<pkg>/files/v8.log   (SIGPROF sampling; no perf_event)
+        //   --trace-deopt / --trace-opt                      (deopt/optimization tracing)
+        // Compiled out of release builds (cfg!(debug_assertions) is false there),
+        // so shipping builds never read the world-writable temp file. See scripts/
+        // profile-migo.sh + tickparse.mjs in the bench repo for the full workflow.
+        #[cfg(debug_assertions)]
+        {
+            use std::sync::Once;
+            static V8_FLAGS: Once = Once::new();
+            V8_FLAGS.call_once(|| {
+                let flags = std::fs::read_to_string("/data/local/tmp/v8flags.txt")
+                    .unwrap_or_default();
+                let flags = flags.trim();
+                if !flags.is_empty() {
+                    tracing::error!("applying debug V8 flags from v8flags.txt: {flags}");
+                    deno_core::v8::V8::set_flags_from_string(flags);
+                }
+            });
+        }
+
         let t_rt_start = Instant::now();
         let sab_store = deno_core::SharedArrayBufferStore::default();
 
