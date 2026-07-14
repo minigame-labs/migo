@@ -65,6 +65,10 @@ pub enum IoRequest {
         priority: PriorityClass,
         compressed_bytes: usize,
     },
+    /// Startup-time exact package verification. Unlike generic synchronous
+    /// filesystem operations, this always runs on the bounded FS pool because
+    /// tree enumeration and hashing are never cheap enough for the host thread.
+    VerifyPackage { priority: PriorityClass },
     StorageGet {
         request: RequestKind,
         priority: PriorityClass,
@@ -98,6 +102,7 @@ impl IoRequest {
             | IoRequest::DecodeImage { priority, .. }
             | IoRequest::Unzip { priority, .. }
             | IoRequest::PackageIngest { priority, .. }
+            | IoRequest::VerifyPackage { priority }
             | IoRequest::StorageGet { priority, .. }
             | IoRequest::StorageMutate { priority, .. }
             | IoRequest::StorageInfo { priority, .. }

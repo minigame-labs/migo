@@ -52,4 +52,4 @@ local.properties
 *.temp
 AI_PROJECT_OVERVIEW.md
 
-docs/
+!docs/

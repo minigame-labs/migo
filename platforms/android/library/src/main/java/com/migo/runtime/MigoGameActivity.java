@@ -305,7 +305,7 @@ public class MigoGameActivity extends Activity
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
-        if (session != null && session.isValid()) {
+        if (BuildConfig.MIGO_API_SENSORS && session != null && session.isValid()) {
             String value = DisplayCompat.mapDeviceOrientationValue(this, newConfig);
             if (!value.equals(lastOrientationEventValue)) {
                 lastOrientationEventValue = value;

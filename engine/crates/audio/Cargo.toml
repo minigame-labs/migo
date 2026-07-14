@@ -16,14 +16,14 @@ hound = "3.5"        # WAV, Apache-2.0
 ringbuf = "0.4"
 
 # Async
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "time", "macros"] }
 
 # HTTP client for streaming download
 reqwest = { workspace = true }
 futures-util = "0.3"
 
 # Shared
-shared = { path = "../shared" }
+shared = { path = "../shared", default-features = false }
 tracing = { workspace = true }
 
 # Android specific: use oboe backend + shared C++ STL.

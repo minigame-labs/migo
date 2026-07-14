@@ -275,7 +275,7 @@ use crate::power_manager::{
     AudioPowerConfig, AudioPowerManager, AudioPowerState, AudioStreamAction, AudioStreamGate,
     AudioWaitMode, audio_wait_mode,
 };
-use crate::streaming::{self, StreamingState};
+use crate::streaming::{self, LazyStreamingClient, StreamingHttpClientFactory, StreamingState};
 
 /// Reverse lookup from node_id to context_id for O(1) access.
 /// This avoids iterating all contexts when looking up a node.
@@ -324,7 +324,10 @@ pub struct AudioThread {
 }
 
 impl AudioThread {
-    pub fn spawn(host_tx: HostTx) -> EngineResult<Self> {
+    pub fn spawn(
+        host_tx: HostTx,
+        http_client_factory: StreamingHttpClientFactory,
+    ) -> EngineResult<Self> {
         let (tx, rx) = unbounded_channel::<AudioCmd>();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<InitResult>(1);
 
@@ -359,7 +362,7 @@ impl AudioThread {
                     info!("AudioThread started");
 
                     // Run the audio thread loop with power management
-                    run_audio_thread(rx, output, host_tx, wakeup_for_thread);
+                    run_audio_thread(rx, output, host_tx, wakeup_for_thread, http_client_factory);
 
                     info!("AudioThread stopped");
                 })); // end catch_unwind
@@ -423,6 +426,7 @@ impl AudioThread {
         rx: UnboundedReceiver<AudioCmd>,
         wakeup: ThreadWakeup,
         host_tx: HostTx,
+        http_client_factory: StreamingHttpClientFactory,
     ) -> EngineResult<Self> {
         let wakeup_for_thread = wakeup.clone();
 
@@ -447,7 +451,7 @@ impl AudioThread {
                     };
 
                     info!("AudioThread (lazy) started");
-                    run_audio_thread(rx, output, host_tx, wakeup_for_thread);
+                    run_audio_thread(rx, output, host_tx, wakeup_for_thread, http_client_factory);
                     info!("AudioThread (lazy) stopped");
                 })); // end catch_unwind
                 if let Err(panic_info) = result {
@@ -546,6 +550,7 @@ fn run_audio_thread(
     mut output: AudioOutput,
     host_tx: HostTx,
     wakeup: ThreadWakeup,
+    http_client_factory: StreamingHttpClientFactory,
 ) {
     let sample_rate = output.sample_rate();
     let channels = output.channels();
@@ -564,6 +569,10 @@ fn run_audio_thread(
 
     // Global audio cache (64MB default)
     let audio_cache = GlobalAudioCache::new();
+
+    // Per-host and lazy: local audio never builds an HTTP pool, while every
+    // remote cache miss after the first reuses the same DNS/TCP/TLS/H2 state.
+    let mut streaming_client = LazyStreamingClient::new(http_client_factory);
 
     // Channel for receiving decode+resample results from worker threads.
     let (decode_tx, decode_rx) = std_mpsc::channel::<DecodeResult>();
@@ -1601,19 +1610,26 @@ fn run_audio_thread(
                             player.load_cached(cached_audio);
                             let _ = resp.send(Ok(()));
                         } else {
-                            // Start streaming download
-                            let state = StreamingState::new();
-                            let rx = streaming::start_streaming_download(
-                                url.clone(),
-                                state.clone(),
-                                sample_rate,
-                            );
-                            player.start_streaming(url, rx, state);
-                            let _ = resp.send(Ok(()));
-                            tracing::debug!(
-                                "Started streaming for InnerAudioContext {}: (cache miss)",
-                                id
-                            );
+                            match streaming_client.get() {
+                                Ok(client) => {
+                                    let state = StreamingState::new();
+                                    let rx = streaming::start_streaming_download(
+                                        client,
+                                        url.clone(),
+                                        state.clone(),
+                                        sample_rate,
+                                    );
+                                    player.start_streaming(url, rx, state);
+                                    let _ = resp.send(Ok(()));
+                                    tracing::debug!(
+                                        "Started streaming for InnerAudioContext {}: (cache miss)",
+                                        id
+                                    );
+                                }
+                                Err(error) => {
+                                    let _ = resp.send(Err(error));
+                                }
+                            }
                         }
                     } else {
                         let _ = resp.send(Err(EngineError::from_detail(

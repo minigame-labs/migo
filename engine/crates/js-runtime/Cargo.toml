@@ -7,7 +7,12 @@ edition = "2024"
 path = "lib.rs"
 
 [features]
-default = ["v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system"]
+default = ["profile-full"]
+profile-full = ["v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system"]
+profile-slim = ["v8-limits", "code-signing"]
+# Opt-in R9 A/B candidate. Android builds additionally require a validated,
+# kind-bound Worker snapshot; the shipping default keeps source bootstrap.
+worker-snapshot = []
 v8-limits = ["shared/v8-limits"]
 code-signing = ["shared/code-signing"]
 # Gate the image crate behind a feature flag — js-runtime does not use it directly.
@@ -39,7 +44,7 @@ deno_core.workspace=true
 # Only enable tokio features actually needed (not "full")
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "rt-multi-thread", "net"] }
 tracing = { workspace = true }
-shared = {path = "../shared"}
+shared = { path = "../shared", default-features = false }
 io = { path = "../io", default-features = false, features = ["zip-extract"] }
 serde.workspace = true
 reqwest.workspace = true

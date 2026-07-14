@@ -344,7 +344,8 @@ public class MigoGameView extends FrameLayout implements SurfaceHolder.Callback 
 
             @Override
             public void onConfigurationChanged(Configuration newConfig) {
-                if (session != null && session.isValid() && boundActivity != null) {
+                if (BuildConfig.MIGO_API_SENSORS
+                        && session != null && session.isValid() && boundActivity != null) {
                     String value = DisplayCompat.mapDeviceOrientationValue(boundActivity, newConfig);
                     if (!value.equals(lastOrientationEventValue)) {
                         lastOrientationEventValue = value;

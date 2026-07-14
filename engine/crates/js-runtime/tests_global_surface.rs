@@ -100,15 +100,61 @@ mod global_surface_tests {
     #[test]
     fn host_bridge_holder_reachable() {
         let mut rt = boot_runtime();
+        let optional_hooks = if cfg!(feature = "api-connectivity") && cfg!(feature = "api-commerce")
+        {
+            "&& typeof b._internalOnLoginResult === 'function' \
+             && typeof b._internalOnMidasPaymentResult === 'function'"
+        } else {
+            "&& typeof b._internalOnLoginResult === 'undefined' \
+             && typeof b._internalOnMidasPaymentResult === 'undefined'"
+        };
         assert_js(
             &mut rt,
-            "const b = globalThis[Symbol.for('Migo.hostBridge')]; \
+            &format!(
+                "const b = globalThis[Symbol.for('Migo.hostBridge')]; \
              let __ok = !!b \
-                 && typeof b._internalOnLoginResult === 'function' \
-                 && typeof b._internalOnMidasPaymentResult === 'function' \
+                 {optional_hooks} \
                  && typeof b._internalEnqueueRawTouchEvent === 'function'; \
-             let __msg = 'holder=' + (b ? Object.getOwnPropertyNames(b).length + ' keys' : 'missing')",
+             let __msg = 'holder=' + (b ? Object.getOwnPropertyNames(b).length + ' keys' : 'missing')"
+            ),
         );
+    }
+
+    /// R6 named products must expose exactly the optional domains selected at
+    /// compile time while retaining the same core game surface.
+    #[test]
+    fn product_profile_surface_matches_features() {
+        let mut rt = boot_runtime();
+        assert_js(
+            &mut rt,
+            "const coreNames = ['createCanvas', 'request', 'getFileSystemManager', \
+                                'setStorage', 'onTouchStart', 'setTimeout']; \
+             const missingCore = coreNames.filter(k => typeof wx[k] === 'undefined'); \
+             let __ok = wx === migo && missingCore.length === 0; \
+             let __msg = 'missing core=' + JSON.stringify(missingCore)",
+        );
+
+        let expected = [
+            ("startAccelerometer", cfg!(feature = "api-sensors")),
+            ("createCamera", cfg!(feature = "api-media")),
+            ("createInnerAudioContext", cfg!(feature = "api-media")),
+            ("openBluetoothAdapter", cfg!(feature = "api-connectivity")),
+            ("shareAppMessage", cfg!(feature = "api-commerce")),
+            ("requestMidasPayment", cfg!(feature = "api-commerce")),
+            ("showToast", cfg!(feature = "api-system")),
+            ("createWorker", cfg!(feature = "api-system")),
+            ("createBannerAd", cfg!(feature = "api-system")),
+        ];
+        for (name, should_exist) in expected {
+            assert_js(
+                &mut rt,
+                &format!(
+                    "const actual = typeof wx[{name:?}] !== 'undefined'; \
+                     let __ok = actual === {should_exist}; \
+                     let __msg = {name:?} + ' actual=' + actual + ' expected=' + {should_exist}"
+                ),
+            );
+        }
     }
 
     /// The eval-channel script shape the host builds must resolve to the holder

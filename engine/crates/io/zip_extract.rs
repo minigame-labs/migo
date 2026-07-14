@@ -515,7 +515,7 @@ mod tests {
         zip.finish().unwrap();
 
         let dest_dir = dir.join("out");
-        let scheduler = Arc::new(IoScheduler::new(31));
+        let scheduler = Arc::new(IoScheduler::local_for_test(31, 2));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -530,7 +530,7 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(scheduler.pools().spawned_pool_count(), 1);
+        assert_eq!(scheduler.pools().started_thread_count_for_test(), 2);
         assert_eq!(
             std::fs::read(dest_dir.join("hello.txt")).unwrap(),
             b"hello archive"

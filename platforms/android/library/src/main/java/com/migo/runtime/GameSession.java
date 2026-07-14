@@ -122,7 +122,7 @@ public final class GameSession implements Closeable {
         this.config = config;
         this.paths = new GamePaths(config, gameId);
         this.touchHandler = new TouchEventHandler(config.getDisplayDensity());
-        this.audioFocusManager = new AudioFocusManager(sessionId, context);
+        this.audioFocusManager = BuildConfig.MIGO_API_MEDIA ? new AudioFocusManager(sessionId, context) : null;
         this.vsyncScheduler = new VsyncScheduler(sessionId);
         this.mainHandler = new Handler(Looper.getMainLooper());
 
@@ -138,7 +138,9 @@ public final class GameSession implements Closeable {
         this.paths.ensureDirectories();
 
         // Start listening for audio focus changes
-        this.audioFocusManager.start();
+        if (audioFocusManager != null) {
+            audioFocusManager.start();
+        }
 
         this.vsyncScheduler.setSurfaceReady(hasLiveSurface);
 
@@ -312,7 +314,13 @@ public final class GameSession implements Closeable {
      * <p>
      * Before calling this method:
      * <ul>
-     *   <li>Deploy game code to {@code paths.getCodeDir()}</li>
+     *   <li>For a first install, deploy the complete signed game tree to
+     *       {@code paths.getCodeDir()}</li>
+     *   <li>For an update, stop every session for this game, serialize deployment
+     *       against new starts, and publish a complete sibling tree with a
+     *       recoverable transaction; a previously verified active tree is
+     *       sealed read-only and must never be modified in place</li>
+     *   <li>Complete any interrupted deployment recovery before starting</li>
      *   <li>Verify the entry point file exists</li>
      * </ul>
      *
@@ -474,7 +482,9 @@ public final class GameSession implements Closeable {
             NativeExports.resumePowerSensitiveManagers(sessionId);
             // Re-request audio focus in case it was permanently lost (e.g.
             // after a phone call). This ensures onAudioInterruptionEnd fires.
-            audioFocusManager.requestFocusIfNeeded();
+            if (audioFocusManager != null) {
+                audioFocusManager.requestFocusIfNeeded();
+            }
         }
         GameSessionListener l = listener;
         if (l != null) {
@@ -577,7 +587,9 @@ public final class GameSession implements Closeable {
         if (consoleLogView != null) {
             consoleLogView.detach();
         }
-        audioFocusManager.stop();
+        if (audioFocusManager != null) {
+            audioFocusManager.stop();
+        }
 
         // Destroy all per-session managers (unified cleanup)
         NativeExports.destroyAllManagers(sessionId);

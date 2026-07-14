@@ -95,6 +95,14 @@ public final class GamePaths {
      * Get the code directory (read-only for game).
      * <p>
      * Contains the game's JavaScript code and assets.
+     * After the first successful signed launch, Migo clears Unix write bits on
+     * the active tree. A trusted installer must stage a complete sibling tree
+     * for an update; it must serialize deployment against session start, stop
+     * every session for this game, and publish only a complete tree. It must not
+     * overwrite the active tree in place or assume {@link File#renameTo(File)}
+     * atomically replaces a non-empty directory on API 26. Use a recoverable
+     * whole-tree transaction and finish recovery before the next start. A
+     * detached old tree may have its write bits restored before cleanup.
      * Maps to virtual path: /code
      */
     public File getCodeDir() {
@@ -158,6 +166,10 @@ public final class GamePaths {
     private static void deleteRecursive(File file) {
         if (file == null || !file.exists()) return;
         if (file.isDirectory()) {
+            // Signed launch seals the active code tree. Trusted uninstall must
+            // restore owner traversal/mutation bits before removing children.
+            file.setWritable(true, true);
+            file.setExecutable(true, true);
             File[] children = file.listFiles();
             if (children != null) {
                 for (File child : children) {

@@ -275,6 +275,10 @@ pub(crate) struct CanvasManager {
     /// Runtime device capabilities, detected once at init.
     pub(crate) device_caps: crate::device_caps::DeviceCapabilities,
 
+    /// Cross-thread image capability publication. A runtime AHB import failure
+    /// clears its one-way AHB bit so later IO jobs skip decode-to-AHB.
+    gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
+
     /// GLES major version negotiated during EGL init (3 = ES 3.0+, 2 = ES 2.0).
     /// Used when creating shared contexts (offscreen canvas, upload thread).
     gles_major: u32,
@@ -409,7 +413,7 @@ impl CanvasManager {
         egl_lib_path: &str,
         dpi: f32,
         cache_dir: Option<&std::path::Path>,
-        gpu_caps: &shared::device::gpu_caps::GpuCaps,
+        gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
     ) -> EngineResult<Self> {
         let init = egl_ops::init_egl(egl_lib_path)?;
         let egl = init.egl;
@@ -460,21 +464,16 @@ impl CanvasManager {
             .query_string(Some(display), egl::EXTENSIONS)
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let mut device_caps = crate::device_caps::DeviceCapabilities::detect(
-            &gl,
-            &egl_extensions,
-            gles_major,
-            gpu_caps,
-        );
+        let mut device_caps =
+            crate::device_caps::DeviceCapabilities::detect(&gl, &egl_extensions, gles_major);
 
         // Resolve the AHardwareBuffer → EGLImage → GL texture import
         // function pointers exactly once, while the resource EGL context is
         // still current (so `eglGetProcAddress` can return driver pointers
         // for both EGL and GL extension entry points).  Without this call
-        // every `import_ahb_as_texture` invocation fails with
-        // "AHB import functions not resolved" — the zero-copy path in
-        // `load_ahb_image` has no fallback, so images end up black on
-        // screen.  Downgrade `ahb_available` if the driver doesn't actually
+        // every `import_ahb_as_texture` invocation would fail with
+        // "AHB import functions not resolved" and force a costly AHB readback.
+        // Downgrade `ahb_available` if the driver doesn't actually
         // expose all four required entry points, which lets the upload
         // pipeline skip the AHB path entirely and go through the PBO
         // fallback instead of hitting the same error on every image.
@@ -655,6 +654,7 @@ impl CanvasManager {
             transform_feedbacks: HashMap::with_capacity(2),
             atlas: None,
             device_caps,
+            gpu_caps,
             gles_major,
             has_robust_context,
             gl_get_graphics_reset_status_fn,
@@ -680,6 +680,18 @@ impl CanvasManager {
     fn new_canvas_id(&self) -> CanvasId {
         let id = self.next_canvas_id.fetch_add(1, Ordering::Relaxed);
         CanvasId::from(id)
+    }
+
+    /// Publish the immutable startup capabilities after the render thread has
+    /// also resolved its initial surface. Keeping this separate from resource
+    /// context construction prevents a successful caps snapshot from racing a
+    /// subsequent initial-surface failure.
+    pub(crate) fn publish_gpu_caps(&self) {
+        self.gpu_caps.set(
+            self.device_caps.compressed_format_support.etc2,
+            self.device_caps.compressed_format_support.astc,
+            self.device_caps.ahb_available,
+        );
     }
 
     // ==================== Canvas Lifecycle ====================
@@ -1284,7 +1296,16 @@ impl CanvasManager {
         let live = self.contexts_2d.len();
         for ctx in self.contexts_2d.values_mut() {
             ctx.rebalance_resource_cache(live);
-            ctx.perform_deferred_cleanup(std::time::Duration::from_millis(200));
+        }
+        self.perform_deferred_cleanup_all(std::time::Duration::from_millis(200));
+    }
+
+    /// Purge only Skia resources older than `unused_age` in every live 2D
+    /// context. The render thread calls this after a coalesced cadence decision
+    /// or an explicit memory-pressure edge; it never schedules work itself.
+    pub(crate) fn perform_deferred_cleanup_all(&mut self, unused_age: std::time::Duration) {
+        for ctx in self.contexts_2d.values_mut() {
+            ctx.perform_deferred_cleanup(unused_age);
         }
     }
 
@@ -2741,13 +2762,6 @@ impl CanvasManager {
         Ok((ctx, self.image_registry.store_mut()))
     }
 
-    /// Iterate over all 2D contexts mutably (for font registration, etc.).
-    pub(crate) fn contexts_2d_iter_mut(
-        &mut self,
-    ) -> impl Iterator<Item = (&CanvasId, &mut Canvas2DContext)> {
-        self.contexts_2d.iter_mut()
-    }
-
     pub(crate) fn mark_2d_dirty(&mut self, canvas_id: CanvasId) {
         self.dirty_2d.insert(canvas_id);
     }
@@ -2915,6 +2929,7 @@ impl CanvasManager {
             image_id,
             image,
             &self.device_caps,
+            &self.gpu_caps,
             display_ptr,
         )?;
         // PBO / glTexImage2D uploads bind, parameterise, and
@@ -4089,18 +4104,20 @@ impl CanvasManager {
             image_id,
             ahb_image,
             &self.device_caps,
+            &self.gpu_caps,
             display_ptr,
         )?;
-        // AHB → EGLImage → `glEGLImageTargetTexture2DOES` mutates
-        // the active GL_TEXTURE_2D binding on texture unit 0 out
-        // from under Skia.  Declare it stale (P0-5): without this
-        // the next Canvas2D draw on this EGL context may sample
-        // the wrong texture because Skia believes its own binding
-        // table is still valid.  See Skia's
+        // AHB → EGLImage → `glEGLImageTargetTexture2DOES` mutates the active
+        // GL_TEXTURE_2D binding on texture unit 0 out from under Skia. An AHB
+        // failure can also fall through to PBO/synchronous upload, which
+        // changes pixel-store state. Declare both slices stale: without this
+        // the next Canvas2D draw may sample the wrong texture or reuse an
+        // incorrect unpack alignment. See Skia's
         // `AHardwareBufferGL.cpp::GrAHardwareBufferUtils` which
         // does the same `resetContext(kTextureBinding)` dance.
         self.mark_all_2d_contexts_stale_bits(
-            crate::backend::gl::surface::gr_state_bits::TEXTURE_BINDING,
+            crate::backend::gl::surface::gr_state_bits::TEXTURE_BINDING
+                | crate::backend::gl::surface::gr_state_bits::PIXEL_STORE,
         );
         Ok(result)
     }

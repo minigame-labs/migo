@@ -105,6 +105,7 @@ import {
     op_check_framebuffer_status,
     op_create_renderbuffer,
     op_delete_renderbuffer,
+    op_delete_buffer,
     op_bind_renderbuffer,
     op_renderbuffer_storage,
     op_read_pixels,
@@ -357,6 +358,7 @@ const _rawFramebufferRenderbuffer= _makeOrderedRaw(op_framebuffer_renderbuffer);
 const _rawCheckFramebufferStatus= _makeOrderedRaw(op_check_framebuffer_status);
 const _rawCreateRenderbuffer = _makeOrderedRaw(op_create_renderbuffer);
 const _rawDeleteRenderbuffer = _makeOrderedRaw(op_delete_renderbuffer);
+const _rawDeleteBuffer       = _makeOrderedRaw(op_delete_buffer);
 const _rawBindRenderbuffer   = _makeOrderedRaw(op_bind_renderbuffer);
 const _rawRenderbufferStorage= _makeOrderedRaw(op_renderbuffer_storage);
 // WebGL2 ordered raw ops
@@ -1001,6 +1003,13 @@ class WebGLRenderingContext {
         const id = nextResourceId();
         _rawCreateBuffer(this._canvasId, id);
         return new WebglObject(id);
+    }
+
+    deleteBuffer(buffer) {
+        // Per WebGL: deleting a bound buffer unbinds it from the current target.
+        if (this._arrayBufferBinding === buffer) this._arrayBufferBinding = null;
+        if (this._elementArrayBufferBinding === buffer) this._elementArrayBufferBinding = null;
+        if (buffer && buffer.id !== undefined) _rawDeleteBuffer(buffer.id);
     }
 
     bindBuffer(target, buffer) {

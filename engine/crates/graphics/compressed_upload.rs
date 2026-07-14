@@ -123,17 +123,13 @@ pub struct CompressedFormatSupport {
 impl CompressedFormatSupport {
     /// Detect compressed format support from the current GL context.
     /// Call once during initialization and cache the result.
-    /// Sets the per-session `GpuCaps` (shared via `Arc` with the host thread).
-    pub fn detect(gl: &glow::Context, gpu_caps: &shared::device::gpu_caps::GpuCaps) -> Self {
+    pub fn detect(gl: &glow::Context) -> Self {
         let version = unsafe { gl.get_parameter_string(glow::VERSION) };
         let etc2 = version.contains("OpenGL ES 3.") || version.contains("OpenGL ES 4.");
 
         let extensions = unsafe { gl.get_parameter_string(glow::EXTENSIONS) };
         let astc = extensions.contains("GL_KHR_texture_compression_astc_ldr")
             || extensions.contains("GL_KHR_texture_compression_astc_hdr");
-
-        // Set session-level caps so IO/JS threads see them via snapshot().
-        gpu_caps.set(etc2, astc);
 
         Self { etc2, astc }
     }

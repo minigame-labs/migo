@@ -84,7 +84,11 @@ impl AudioNodeProcessor for DelayNode {
         let frames = len / channels;
         let buf_len = self.buffer.len();
 
-        let delay_secs = self.delay_time.compute_value(current_time).max(0.0).min(self.max_delay);
+        let delay_secs = self
+            .delay_time
+            .compute_value(current_time)
+            .max(0.0)
+            .min(self.max_delay);
         let delay_samples = (delay_secs as f64 * sample_rate as f64) as usize * channels;
 
         for frame in 0..frames {

@@ -31,9 +31,11 @@ use crate::{
 use js_runtime::HostJsRuntime;
 
 #[cfg(feature = "v8-limits")]
-use crate::runtime::watchdog::{self, WatchdogConfig, WatchdogHandle};
-#[cfg(feature = "v8-limits")]
 use js_runtime::V8LimitsConfig;
+#[cfg(feature = "v8-limits")]
+use js_runtime::watchdog::DeadlineWatchdogConfig;
+
+const GPU_INIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Wrapper around `Option<HostJsRuntime>` with `Deref`/`DerefMut`.
 ///
@@ -78,6 +80,48 @@ impl std::ops::DerefMut for JsRuntimeSlot {
         self.0
             .as_mut()
             .expect("[BUG] JsRuntime accessed after drop")
+    }
+}
+
+/// Cleans process-global registrations if `Host::new` exits before ownership
+/// transfers to the fully assembled `Host` and its normal `Drop` path.
+struct HostStartupGuard {
+    id: HostId,
+    vsync_registered: bool,
+    console_registered: bool,
+}
+
+impl HostStartupGuard {
+    fn new(id: HostId) -> Self {
+        Self {
+            id,
+            vsync_registered: false,
+            console_registered: false,
+        }
+    }
+
+    fn mark_vsync_registered(&mut self) {
+        self.vsync_registered = true;
+    }
+
+    fn mark_console_registered(&mut self) {
+        self.console_registered = true;
+    }
+
+    fn disarm(&mut self) {
+        self.vsync_registered = false;
+        self.console_registered = false;
+    }
+}
+
+impl Drop for HostStartupGuard {
+    fn drop(&mut self) {
+        if self.console_registered {
+            shared::console_log::unregister_console_log(self.id);
+        }
+        if self.vsync_registered {
+            vsync::unregister_vsync_sender(self.id);
+        }
     }
 }
 
@@ -153,10 +197,12 @@ pub(crate) struct Host {
     /// Survives JS runtime restarts (same GL context).
     gpu_caps: Arc<shared::device::gpu_caps::GpuCaps>,
 
-    /// Watchdog handle for JS execution timeout detection.
-    /// Present only when `v8-limits` feature is enabled.
-    #[cfg(feature = "v8-limits")]
-    pub(crate) watchdog: Option<WatchdogHandle>,
+    /// Coalescing render-feedback wake. The render thread's event channel calls
+    /// `notify_one()` on every successfully enqueued event; the host loop selects
+    /// on this to drain + reconcile promptly instead of polling. Replaces the
+    /// deleted 3-second heartbeat's render-drain. Tokio latches one permit, so an
+    /// event emitted during a JS poll is not lost.
+    render_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for Host {
@@ -213,18 +259,39 @@ impl Host {
         // receiver. Passing a never-fed `Some(receiver)` on desktop would make
         // RenderThread disable its software ticker and freeze the frame loop.
         let uses_external_vsync = platform.uses_external_vsync();
+        let mut startup_guard = HostStartupGuard::new(id);
         let vsync_rx = if uses_external_vsync {
             let (vsync_tx, vsync_rx) = crossbeam_channel::bounded::<f64>(2);
             vsync::register_vsync_sender(id, vsync_tx);
+            startup_guard.mark_vsync_registered();
             Some(vsync_rx)
         } else {
             None
         };
 
+        // Immutable per-host policy. Audio captures this in a lazy client
+        // factory; JS network ops keep the same snapshot across restarts.
+        let network_policy = {
+            use shared::op_state::NetworkPolicy;
+            let mut policy = NetworkPolicy::default();
+            if let Some(wl) = init_options.extras().get("domain_whitelist") {
+                if let Some(arr) = wl.as_array() {
+                    policy.domain_whitelist = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                }
+            }
+            if let Some(v) = init_options.extras().get("enforce_https") {
+                policy.enforce_https = v.as_bool().unwrap_or(false);
+            }
+            policy
+        };
+
         // ---- Services ----
         // AudioService is lazy — no thread spawned until the first
         // real audio command.  Saves ~80 ms on cold start.
-        let audio = AudioService::new(host_tx.clone());
+        let audio = AudioService::new(host_tx.clone(), network_policy.clone());
         let gpu_caps = shared::device::gpu_caps::GpuCaps::new();
 
         // Authoritative GL-context-loss state. Created here (before the render
@@ -234,16 +301,18 @@ impl Host {
         // shared `Arc`.
         let context_lost = Arc::new(shared::op_state::ContextLostState::default());
 
-        // Wake nudge: the render thread invokes this after a context
-        // lost/recovered transition so the host drains + reconciles the
-        // (lossy, non-select-able) render-event channel promptly instead of
-        // waiting for the heartbeat. Best-effort — a full command queue falls
-        // back to the heartbeat drain. Decoupled via a closure so `graphics`
-        // never depends on `HostCommand`.
+        // Coalescing render-feedback wake: the render thread's event channel
+        // fires this after every successfully enqueued event, so the host loop
+        // drains + reconciles promptly (Canvas/GL/swap/RAF-backpressure/context)
+        // without a polling timer. Tokio `Notify` coalesces a burst to one permit
+        // and latches a permit if no waiter is registered, so an event emitted
+        // inside a JS poll is delivered on the next select iteration rather than
+        // lost.
+        let render_notify = Arc::new(tokio::sync::Notify::new());
         let render_wake: Option<Arc<dyn Fn() + Send + Sync>> = {
-            let wake_tx = host_tx.clone();
+            let notify = render_notify.clone();
             Some(Arc::new(move || {
-                let _ = wake_tx.try_send(HostCommand::DrainRenderEvents);
+                notify.notify_one();
             }))
         };
 
@@ -272,51 +341,13 @@ impl Host {
             raf_demand.clone(),
             request_vsync.clone(),
         )?;
+        // Preserve the old two-second render-startup budget. V8 construction
+        // below consumes this same deadline while the render thread initializes.
+        let gpu_init_started = Instant::now();
         let render_events = render.events();
-
-        // Block until the render thread has completed GL init and
-        // populated GPU compressed-format caps.  Prevents early image
-        // loads from seeing all-false caps.  Typically < 50 ms.
-        match gpu_caps.wait_ready(std::time::Duration::from_secs(2)) {
-            shared::device::gpu_caps::GpuCapsReadyState::Ready => {}
-            shared::device::gpu_caps::GpuCapsReadyState::Failed(detail) => {
-                render.shutdown_detached();
-                vsync::unregister_vsync_sender(id);
-                return Err(shared::error::EngineError::new(
-                    shared::error::ErrorCode::Render2DInitError,
-                )
-                .with_detail(detail));
-            }
-            shared::device::gpu_caps::GpuCapsReadyState::Timeout => {
-                render.shutdown_detached();
-                vsync::unregister_vsync_sender(id);
-                return Err(
-                    shared::error::EngineError::new(shared::error::ErrorCode::Timeout)
-                        .with_detail("render thread did not publish GPU caps within 2 seconds"),
-                );
-            }
-        }
 
         // ---- HostOpState for extensions ----
         let device_services = platform.create_device_services(id);
-        // Build network policy from InitOptions extras.
-        let network_policy = {
-            use shared::op_state::NetworkPolicy;
-            let mut policy = NetworkPolicy::default();
-            if let Some(wl) = init_options.extras().get("domain_whitelist") {
-                if let Some(arr) = wl.as_array() {
-                    policy.domain_whitelist = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect();
-                }
-            }
-            if let Some(v) = init_options.extras().get("enforce_https") {
-                policy.enforce_https = v.as_bool().unwrap_or(false);
-            }
-            policy
-        };
-
         let backgrounded = Arc::new(AtomicBool::new(false));
         let timer_backgrounded = Arc::new(AtomicBool::new(false));
         let webgl_context_created = Arc::new(AtomicBool::new(false));
@@ -360,6 +391,7 @@ impl Host {
         // ---- Console log buffer (debug only) ----
         if init_options.debug_enabled() {
             shared::console_log::register_console_log(id);
+            startup_guard.mark_console_registered();
         }
 
         // ---- Code cache (V8 bytecode persistence) ----
@@ -380,11 +412,11 @@ impl Host {
         // ---- Extensions ----
         let extra_ext = platform.extensions(&init_options);
 
-        let t_services = Instant::now();
+        let t_pre_js_done = Instant::now();
         info!(
-            "[Host {}] services init: {:.1}ms (render + audio channels)",
+            "[Host {}] pre-JS services: {:.1}ms (render launched + host state wired)",
             id,
-            t_services.duration_since(t_start).as_secs_f64() * 1000.0
+            t_pre_js_done.duration_since(t_start).as_secs_f64() * 1000.0
         );
 
         // ---- V8 limits config ----
@@ -414,30 +446,66 @@ impl Host {
             t_js_done.duration_since(t_js_start).as_secs_f64() * 1000.0
         );
 
-        // ---- Watchdog (v8-limits) ----
-        #[cfg(feature = "v8-limits")]
-        let watchdog = if init_options.watchdog_enabled() {
-            let isolate_handle = js.isolate_handle();
-            let config = WatchdogConfig::default().with_timeout(std::time::Duration::from_secs(
-                init_options.watchdog_timeout_secs() as u64,
-            ));
-            Some(watchdog::spawn_watchdog(isolate_handle, config, id as i32)?)
-        } else {
-            info!("[Host {}] ANR watchdog disabled via InitOptions", id);
-            None
+        // The render thread has been initializing EGL/GL/Skia concurrently with
+        // HostJsRuntime::new. Join before watchdog installation, Host publication,
+        // the caller's ready signal, or any untrusted game evaluation. This keeps
+        // image ops from observing the provisional all-false capability snapshot.
+        let t_gpu_join_start = Instant::now();
+        let gpu_join_error = match gpu_caps.wait_ready_until(gpu_init_started, GPU_INIT_TIMEOUT) {
+            shared::device::gpu_caps::GpuCapsReadyState::Ready => None,
+            shared::device::gpu_caps::GpuCapsReadyState::Failed(detail) => Some(
+                shared::error::EngineError::new(shared::error::ErrorCode::Render2DInitError)
+                    .with_detail(detail),
+            ),
+            shared::device::gpu_caps::GpuCapsReadyState::Timeout => Some(
+                shared::error::EngineError::new(shared::error::ErrorCode::Timeout)
+                    .with_detail("render thread did not publish GPU caps within 2 seconds"),
+            ),
         };
+        if let Some(error) = gpu_join_error {
+            // Preserve V8 thread affinity and the normal Host teardown order:
+            // destroy the isolate while still on its owner thread, then stop GL.
+            drop(js);
+            render.shutdown_detached();
+            return Err(error);
+        }
+        let t_gpu_ready = Instant::now();
+        info!(
+            "[Host {}] GPU init joined: {:.1}ms since readiness budget start, residual wait {:.1}ms",
+            id,
+            t_gpu_ready.duration_since(gpu_init_started).as_secs_f64() * 1000.0,
+            t_gpu_ready.duration_since(t_gpu_join_start).as_secs_f64() * 1000.0,
+        );
+
+        // ---- Process deadline watchdog (v8-limits) ----
+        // Install AFTER trusted runtime/bootstrap construction and BEFORE any
+        // game prelude or module executes. The one process monitor thread is
+        // shared across all isolates; a failed install fails host creation
+        // (matching the old policy).
+        #[cfg(feature = "v8-limits")]
+        if init_options.watchdog_enabled() {
+            let secs = init_options.watchdog_timeout_secs() as u64;
+            let config = DeadlineWatchdogConfig::new(
+                std::time::Duration::from_secs(secs),
+                format!("host-{id}"),
+            );
+            js.install_watchdog(config)?;
+        } else {
+            info!("[Host {}] deadline watchdog disabled via InitOptions", id);
+        }
 
         let t_total = Instant::now();
         info!(
-            "[Host {}] Host::new() total: {:.1}ms (services={:.1}ms, JsRuntime={:.1}ms, watchdog={:.1}ms)",
+            "[Host {}] Host::new() total: {:.1}ms (pre_js={:.1}ms, JsRuntime={:.1}ms, gpu_join_wait={:.1}ms, post_join={:.1}ms)",
             id,
             t_total.duration_since(t_start).as_secs_f64() * 1000.0,
-            t_services.duration_since(t_start).as_secs_f64() * 1000.0,
+            t_pre_js_done.duration_since(t_start).as_secs_f64() * 1000.0,
             t_js_done.duration_since(t_js_start).as_secs_f64() * 1000.0,
-            t_total.duration_since(t_js_done).as_secs_f64() * 1000.0,
+            t_gpu_ready.duration_since(t_gpu_join_start).as_secs_f64() * 1000.0,
+            t_total.duration_since(t_gpu_ready).as_secs_f64() * 1000.0,
         );
 
-        Ok(Self {
+        let host = Self {
             id,
             render,
             audio,
@@ -460,21 +528,26 @@ impl Host {
             render_error_throttle: HashMap::new(),
             pending_on_show_script: None,
             gpu_caps,
-            #[cfg(feature = "v8-limits")]
-            watchdog,
-        })
+            render_notify,
+        };
+        startup_guard.disarm();
+        Ok(host)
     }
 
     pub(crate) async fn handle_command(&mut self, cmd: HostCommand) {
         // Drain render-thread events on every host command so state they
         // carry (notably `ContextLost` -> `context_lost`, which backs
-        // `gl.isContextLost()`) is synced on a stable path. The event loop
-        // also drains on the heartbeat tick (see `thread.rs`) to cover idle
-        // periods with no incoming commands.
+        // `gl.isContextLost()`) is synced on a stable path. The host loop's
+        // render Notify branch covers idle periods with no incoming commands.
         self.drain_render_events();
         if let Err(e) = self.handle_command_inner(cmd).await {
             error!("[Host {}] handle_command failed: e={} ", self.id, e);
         }
+    }
+
+    /// Clone of the render-feedback wake `Notify` for the host loop to select on.
+    pub(crate) fn render_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.render_notify.clone()
     }
 
     pub(crate) fn drain_render_events(&mut self) {
@@ -491,8 +564,8 @@ impl Host {
 
     /// Reconcile JS `webglcontext{lost,restored}` events against the render-
     /// thread-owned authoritative state. Called after every render-event drain
-    /// (command / idle-parking / heartbeat / wake nudge) and is the SOLE
-    /// dispatcher of these events, so a `ContextLost` / `ContextRecovered`
+    /// (command, idle parking, or render Notify) and is the SOLE dispatcher of
+    /// these events, so a `ContextLost` / `ContextRecovered`
     /// render event dropped by the bounded channel still results in the correct
     /// JS lifecycle events.
     ///
@@ -705,11 +778,6 @@ impl Host {
             }
 
             HostCommand::Shutdown => Ok(()),
-
-            // Wake nudge from the render thread. The actual drain + reconcile
-            // already ran in `handle_command` before dispatching here, so this
-            // is an intentional no-op that only served to wake the select loop.
-            HostCommand::DrainRenderEvents => Ok(()),
 
             HostCommand::InnerAudioEvent {
                 id,
@@ -1213,12 +1281,6 @@ impl Host {
         }
         io::global_cache().clear();
 
-        // Drop the old watchdog before dropping the runtime.
-        #[cfg(feature = "v8-limits")]
-        {
-            self.watchdog.take();
-        }
-
         // ---- V8 limits config ----
         #[cfg(feature = "v8-limits")]
         let v8_limits = V8LimitsConfig::from_max_memory_mb(self.init_options.max_memory_mb());
@@ -1257,29 +1319,25 @@ impl Host {
 
         // Recreate watchdog for the new isolate
         #[cfg(feature = "v8-limits")]
-        let mut new_watchdog = None;
-        #[cfg(feature = "v8-limits")]
         if self.init_options.watchdog_enabled() {
-            let isolate_handle = new_js.isolate_handle();
-            let config = WatchdogConfig::default().with_timeout(std::time::Duration::from_secs(
-                self.init_options.watchdog_timeout_secs() as u64,
-            ));
-            match watchdog::spawn_watchdog(isolate_handle, config, self.id as i32) {
-                Ok(handle) => new_watchdog = Some(handle),
-                Err(e) => {
-                    error!(
-                        "[Host {}] failed to start watchdog after restart: {} (continuing without watchdog)",
-                        self.id, e
-                    );
-                }
+            // The old runtime (with its watchdog field, dropped first) already
+            // disarmed + unregistered before `take_and_drop()` above, so the new
+            // isolate registers a fresh target with no overlap. A failed install
+            // on restart logs and continues without a watchdog.
+            let secs = self.init_options.watchdog_timeout_secs() as u64;
+            let config = DeadlineWatchdogConfig::new(
+                std::time::Duration::from_secs(secs),
+                format!("host-{}", self.id),
+            );
+            if let Err(e) = new_js.install_watchdog(config) {
+                error!(
+                    "[Host {}] failed to install watchdog after restart: {} (continuing without watchdog)",
+                    self.id, e
+                );
             }
         }
 
         self.js.set(new_js);
-        #[cfg(feature = "v8-limits")]
-        {
-            self.watchdog = new_watchdog;
-        }
 
         // If we have a last evaluated module, reload it. Even if re-evaluation
         // fails, resume render/audio below so the session doesn't stay paused.

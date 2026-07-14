@@ -17,10 +17,15 @@ edition = "2024"
 name = "migo-snapshot-gen"
 path = "src/main.rs"
 
+[features]
+default = ["profile-full"]
+profile-full = ["js-runtime/profile-full"]
+profile-slim = ["js-runtime/profile-slim"]
+
 [dependencies]
 deno_core.workspace = true
 # IMPORTANT: features must match the runtime build exactly.
 # Mismatched features → different op count → different ExternalReferenceTable::kSize
 # → V8 snapshot magic number mismatch → crash at runtime.
-js-runtime = { path = "../js-runtime" }
-shared = { path = "../shared" }
+js-runtime = { path = "../js-runtime", default-features = false }
+shared = { path = "../shared", default-features = false }

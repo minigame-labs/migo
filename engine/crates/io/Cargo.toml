@@ -15,7 +15,7 @@ compress-brotli = ["dep:brotli"]
 [dependencies]
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
-shared = { path = "../shared" }
+shared = { path = "../shared", default-features = false }
 deno_core.workspace = true
 parking_lot = "0.12.4"
 

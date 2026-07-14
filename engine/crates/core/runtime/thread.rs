@@ -20,8 +20,10 @@ use shared::{
 use crate::runtime::{HostId, host::Host, registry};
 use crate::services::PlatformServices;
 
-#[cfg(feature = "v8-limits")]
-use crate::runtime::watchdog::TerminationReason;
+// Tokio still backs `tokio::fs` uploads/local-audio reads and resolver
+// fallbacks. Keep a small lazy compatibility pool; bounded engine I/O uses the
+// process-wide Migo-IO executor instead.
+const HOST_BLOCKING_FALLBACK_THREADS: usize = 4;
 
 pub fn spawn_host_thread(
     surface: SurfaceRef,
@@ -91,19 +93,6 @@ pub fn spawn_host_thread(
                 // Keep a reference to platform_for_error for use in the event loop
                 let platform_ref = &platform_for_error;
 
-                // Pre-warm the blocking thread pool to avoid cold-start
-                // latency on the first real spawn_blocking call.
-                // Creates 4 threads eagerly (covers most concurrent IO).
-                runtime.block_on(async {
-                    let mut handles = Vec::with_capacity(4);
-                    for _ in 0..4 {
-                        handles.push(tokio::task::spawn_blocking(|| {}));
-                    }
-                    for h in handles {
-                        let _ = h.await;
-                    }
-                });
-
                 // Owned handle to the shutdown flag so the `async move` loop
                 // below can poll it (the thread closure only lends it to us).
                 let shutdown = shutdown.clone();
@@ -111,14 +100,16 @@ pub fn spawn_host_thread(
                     let poll = PollEventLoopOptions::default();
                     let mut host = host;
 
-                    // Heartbeat interval: run_event_loop may block indefinitely
-                    // when long-lived async ops are pending (e.g., the RAF
-                    // loop's op_await_next_frame).  This sleep ensures the
-                    // outer loop re-iterates to tick the watchdog heartbeat,
-                    // preventing false ANR reports.  The watchdog checks every
-                    // 2s with a 10s timeout, so 3s gives comfortable margin.
-                    let heartbeat_sleep = tokio::time::sleep(std::time::Duration::from_secs(3));
-                    tokio::pin!(heartbeat_sleep);
+                    // Coalescing wake signals replace the deleted 3-second
+                    // heartbeat. The render event channel calls `notify_one()` on
+                    // every successfully enqueued event; the lazy-audio start
+                    // signal fires on the first pre-start command. Both are Tokio
+                    // `Notify`s that latch one permit even with no waiter
+                    // registered, so a signal emitted while the host is inside a
+                    // `run_event_loop` poll is delivered on the next select
+                    // iteration rather than lost. Cloned once, outside the loop.
+                    let render_notify = host.render_notify();
+                    let audio_signal = host.audio.start_signal();
 
                     // Track whether to notify Java on exit.
                     // Error paths set this to false (they already call notify_error).
@@ -132,23 +123,9 @@ pub fn spawn_host_thread(
                         // full queue can't swallow the request (see shutdown_host).
                         // Stops the loop the next time control returns here; a
                         // runaway JS section that never yields is handled by the
-                        // ANR watchdog, not this flag.
+                        // deadline watchdog, not this flag.
                         if shutdown.load(Ordering::Acquire) {
                             break 'outer;
-                        }
-
-                        // Tick the watchdog heartbeat before each iteration
-                        #[cfg(feature = "v8-limits")]
-                        if let Some(ref wd) = host.watchdog {
-                            wd.state.tick();
-                        }
-
-                        // Lazy audio — check if buffered audio commands
-                        // require spawning the AudioThread.  Cost when thread
-                        // is already running: one branch (is_some check).
-                        if let Err(e) = host.audio.check_and_start() {
-                            error!("[Host {}] failed to start audio thread: {}", host.id, e);
-                            // Non-fatal: game continues without audio.
                         }
 
                         tokio::select! {
@@ -201,16 +178,13 @@ pub fn spawn_host_thread(
                                 // Event loop returned Ok — no pending ops/timers/promises.
                                 // With op-based RAF this normally shouldn't happen (the pending
                                 // op_await_next_frame keeps the loop alive).  Safety fallback:
-                                // park on the command channel to avoid busy spinning.
-                                warn!("[Host {}] event loop idle, parking on command channel", id);
+                                // park on the command channel + render/audio signals (no polling
+                                // timer) so a ContextLost or a first audio command during an idle
+                                // stretch is still handled promptly.
+                                warn!("[Host {}] event loop idle, parking on command/render/audio signals", id);
                                 loop {
-                                    // Park on the command channel, but keep
-                                    // the heartbeat live so render-thread
-                                    // events (e.g. ContextLost) are still
-                                    // drained while idle — otherwise the
-                                    // bounded "<=3s" drain latency would not
-                                    // hold during long command-less stretches.
                                     tokio::select! {
+                                        biased;
                                         maybe_msg = host_rx.recv() => {
                                             match maybe_msg {
                                                 Some(HostCommand::Shutdown) => break 'outer,
@@ -221,12 +195,13 @@ pub fn spawn_host_thread(
                                                 None => break 'outer,
                                             }
                                         }
-                                        _ = &mut heartbeat_sleep => {
+                                        _ = render_notify.notified() => {
                                             host.drain_render_events();
-                                            heartbeat_sleep.as_mut().reset(
-                                                tokio::time::Instant::now()
-                                                    + std::time::Duration::from_secs(3),
-                                            );
+                                        }
+                                        _ = audio_signal.notified() => {
+                                            if let Err(e) = host.audio.check_and_start() {
+                                                error!("[Host {}] failed to start audio thread: {}", host.id, e);
+                                            }
                                         }
                                     }
                                 }
@@ -240,17 +215,22 @@ pub fn spawn_host_thread(
                                 }
                             }
 
-                            _ = &mut heartbeat_sleep => {
-                                // Drain render-thread events even when no host
-                                // commands arrive, so a ContextLost during an
-                                // idle stretch still reaches Host.context_lost
-                                // (backing gl.isContextLost()) within one tick.
+                            _ = render_notify.notified() => {
+                                // A render-thread event was enqueued: drain +
+                                // reconcile (notably ContextLost/Recovered) now,
+                                // instead of waiting for the next command.
                                 host.drain_render_events();
-                                // Reset the timer for the next cycle
-                                heartbeat_sleep.as_mut().reset(
-                                    tokio::time::Instant::now() + std::time::Duration::from_secs(3)
-                                );
-                                continue;
+                            }
+
+                            _ = audio_signal.notified() => {
+                                // First pre-start audio command: lazily spawn the
+                                // AudioThread. The signal disables itself
+                                // (mark_started) once the thread is installed, so
+                                // this branch stops firing afterwards.
+                                if let Err(e) = host.audio.check_and_start() {
+                                    error!("[Host {}] failed to start audio thread: {}", host.id, e);
+                                    // Non-fatal: game continues without audio.
+                                }
                             }
                         }
                     }
@@ -344,9 +324,9 @@ fn create_basic_runtime() -> EngineResult<Runtime> {
         .event_interval(event_interval)
         .global_queue_interval(global_queue_interval)
         .max_io_events_per_tick(max_io_events_per_tick)
-        // All blocking work (file IO, image decode, zip extract) runs on
-        // this runtime's blocking pool via spawn_blocking.
-        .max_blocking_threads(32)
+        // Bounded engine I/O runs on the process Migo-IO executor. This lazy
+        // fallback remains for tokio::fs and resolver internals only.
+        .max_blocking_threads(HOST_BLOCKING_FALLBACK_THREADS)
         .build()
         .map_err(|e| {
             EngineError::from_detail(
@@ -382,20 +362,14 @@ fn classify_termination_error(host: &Host, original: &EngineError) -> Option<Eng
         );
     }
 
-    // Check watchdog timeout
-    if let Some(ref wd) = host.watchdog {
-        if let Some(reason) = wd.state.termination_reason() {
-            return Some(match reason {
-                TerminationReason::Timeout => EngineError::new(ErrorCode::JsExecutionTimeout)
-                    .with_msg("JS execution exceeded watchdog timeout")
-                    .with_detail(
-                        "watchdog detected unresponsive JS execution and terminated isolate",
-                    ),
-                TerminationReason::OutOfMemory => EngineError::new(ErrorCode::OutOfMemory)
-                    .with_msg("V8 heap limit exceeded")
-                    .with_detail("watchdog OOM termination"),
-            });
-        }
+    // Then the process deadline watchdog. OOM stays higher priority than a
+    // timeout; the timeout is sticky per isolate.
+    if host.js.watchdog_timed_out() {
+        return Some(
+            EngineError::new(ErrorCode::JsExecutionTimeout)
+                .with_msg("JS execution exceeded watchdog timeout")
+                .with_detail("watchdog detected unresponsive JS execution and terminated isolate"),
+        );
     }
 
     // Generic termination (unknown source)

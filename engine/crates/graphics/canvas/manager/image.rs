@@ -64,6 +64,7 @@ impl ImageRegistry {
         image_id: u32,
         image: NormalizedImage,
         device_caps: &crate::device_caps::DeviceCapabilities,
+        gpu_caps: &shared::device::gpu_caps::GpuCaps,
         egl_display_ptr: *const std::ffi::c_void,
     ) -> EngineResult<(u32, u32)> {
         self.ensure_pbo_pool(gl);
@@ -74,6 +75,7 @@ impl ImageRegistry {
             self.use_pbo,
             self.pbo_pool.as_mut(),
             device_caps,
+            gpu_caps,
             egl_display_ptr,
         )?;
 
@@ -102,22 +104,31 @@ impl ImageRegistry {
     ///
     /// Both fallbacks go through `into_rgba()` which locks the AHB
     /// for CPU read and copies once into a plain `NormalizedImage`.
-    /// The penalty is identical to the pre-M2 path, so a driver
-    /// without AHB import is no worse off than before.
+    /// Normal capability rejection is prevented before decode; an unexpected
+    /// runtime import rejection pays this round trip once and then disables AHB
+    /// for the host session.
     pub fn load_ahb_image(
         &mut self,
         gl: &glow::Context,
         image_id: u32,
         ahb_image: AhbImage,
         device_caps: &crate::device_caps::DeviceCapabilities,
+        gpu_caps: &shared::device::gpu_caps::GpuCaps,
         egl_display_ptr: *const std::ffi::c_void,
     ) -> EngineResult<(u32, u32)> {
         // Guard conditions: if the device lacks AHB support or we
         // have no display, downgrade and re-enter the legacy path.
-        if !device_caps.ahb_available || egl_display_ptr.is_null() {
+        if !device_caps.ahb_available || !gpu_caps.snapshot().ahb || egl_display_ptr.is_null() {
             let rgba =
                 shared::protocol::io_cmd::DecodedImage::HardwareBuffer(ahb_image).into_rgba()?;
-            return self.load_shared_image(gl, image_id, rgba, device_caps, egl_display_ptr);
+            return self.load_shared_image(
+                gl,
+                image_id,
+                rgba,
+                device_caps,
+                gpu_caps,
+                egl_display_ptr,
+            );
         }
 
         // Zero-copy GPU import. The `OwnedAhb` held by `AhbImage`
@@ -159,9 +170,14 @@ impl ImageRegistry {
                     // `debug!` so the event is still captured at
                     // higher verbosity without the CPU / log-size
                     // tax at info level.
+                    if gpu_caps.disable_ahb() {
+                        shared::stats::io_metrics_global().record_ahb_fallback(
+                            shared::stats::AhbFallbackReason::HardwareBufferUnavailable,
+                        );
+                    }
                     shared::warn_once!(
                         "AHB EGLImage import failed for image_id={image_id}; falling back to RGBA+PBO ({e}). \
-                         Further per-image warnings will be silenced for this process."
+                         AHB decode is disabled for this host session."
                     );
                     tracing::debug!(
                         image_id,
@@ -175,6 +191,7 @@ impl ImageRegistry {
                         image_id,
                         rgba,
                         device_caps,
+                        gpu_caps,
                         egl_display_ptr,
                     );
                 }
@@ -205,7 +222,7 @@ impl ImageRegistry {
             // RGBA just like the fallback above.
             let rgba =
                 shared::protocol::io_cmd::DecodedImage::HardwareBuffer(ahb_image).into_rgba()?;
-            self.load_shared_image(gl, image_id, rgba, device_caps, egl_display_ptr)
+            self.load_shared_image(gl, image_id, rgba, device_caps, gpu_caps, egl_display_ptr)
         }
     }
 

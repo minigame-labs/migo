@@ -339,44 +339,6 @@ pub fn op_get_local_ip_address(state: &mut OpState) -> Result<String, JsErrorBox
     Err(JsErrorBox::generic("getLocalIPAddress:fail not supported"))
 }
 
-// ==================== Keyboard Ops ====================
-
-#[op2(fast)]
-pub fn op_show_keyboard(
-    state: &mut OpState,
-    #[string] options_json: String,
-) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(keyboard) = services.keyboard() {
-            return keyboard.show(&options_json).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("showKeyboard:fail not supported"))
-}
-
-#[op2(fast)]
-pub fn op_hide_keyboard(state: &mut OpState) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(keyboard) = services.keyboard() {
-            return keyboard.hide().map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("hideKeyboard:fail not supported"))
-}
-
-#[op2(fast)]
-pub fn op_update_keyboard(state: &mut OpState, #[string] value: String) -> Result<(), JsErrorBox> {
-    let host = state.borrow::<HostOpState>();
-    if let Some(ref services) = host.device_services {
-        if let Some(keyboard) = services.keyboard() {
-            return keyboard.update(&value).map_err(JsErrorBox::generic);
-        }
-    }
-    Err(JsErrorBox::generic("updateKeyboard:fail not supported"))
-}
-
 // ==================== Location Ops ====================
 
 #[op2(fast)]
@@ -466,10 +428,6 @@ deno_core::extension!(
         op_stop_network_monitoring,
         op_get_network_type,
         op_get_local_ip_address,
-        // Keyboard
-        op_show_keyboard,
-        op_hide_keyboard,
-        op_update_keyboard,
         // Location
         op_get_location,
         op_get_fuzzy_location,

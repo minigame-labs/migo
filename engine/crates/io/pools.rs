@@ -1,231 +1,561 @@
 use std::{
-    collections::BinaryHeap,
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
-    sync::{Arc, Condvar, Mutex as StdMutex, OnceLock, mpsc},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar as ParkingCondvar, Mutex};
 use shared::error::{EngineError, ErrorCode};
 
 use crate::task::{PoolKind, PriorityClass};
 
-// ---------------------------------------------------------------------------
-// Priority channel — BinaryHeap + Mutex + Condvar
-// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct HostToken(u64);
 
-struct PriorityEntry<T> {
-    priority: PriorityClass,
-    seq: u64,
+struct HostQueue<T> {
+    jobs: VecDeque<T>,
+    in_rotation: bool,
+}
+
+impl<T> Default for HostQueue<T> {
+    fn default() -> Self {
+        Self {
+            jobs: VecDeque::new(),
+            in_rotation: false,
+        }
+    }
+}
+
+struct FairLane<T> {
+    hosts: HashMap<HostToken, HostQueue<T>>,
+    rotation: VecDeque<HostToken>,
+}
+
+impl<T> Default for FairLane<T> {
+    fn default() -> Self {
+        Self {
+            hosts: HashMap::new(),
+            rotation: VecDeque::new(),
+        }
+    }
+}
+
+impl<T> FairLane<T> {
+    fn push(&mut self, host: HostToken, value: T) {
+        let queue = self.hosts.entry(host).or_default();
+        let was_empty = queue.jobs.is_empty();
+        queue.jobs.push_back(value);
+        if was_empty {
+            debug_assert!(!queue.in_rotation);
+            queue.in_rotation = true;
+            self.rotation.push_back(host);
+        }
+    }
+
+    fn pop_where(&mut self, mut eligible: impl FnMut(HostToken) -> bool) -> Option<(HostToken, T)> {
+        let attempts = self.rotation.len();
+        for _ in 0..attempts {
+            let host = self
+                .rotation
+                .pop_front()
+                .expect("rotation length changed while popping fair lane");
+            if !eligible(host) {
+                self.rotation.push_back(host);
+                continue;
+            }
+
+            let queue = self
+                .hosts
+                .get_mut(&host)
+                .expect("rotation token must have a host queue");
+            let value = queue
+                .jobs
+                .pop_front()
+                .expect("rotation token must have queued work");
+            if queue.jobs.is_empty() {
+                queue.in_rotation = false;
+            } else {
+                self.rotation.push_back(host);
+            }
+            return Some((host, value));
+        }
+        None
+    }
+
+    fn has_work(&self) -> bool {
+        !self.rotation.is_empty()
+    }
+
+    #[cfg(test)]
+    fn contains_host(&self, host: HostToken) -> bool {
+        self.hosts.contains_key(&host)
+    }
+
+    fn remove_host_if_empty(&mut self, host: HostToken) {
+        let removable = self
+            .hosts
+            .get(&host)
+            .is_some_and(|queue| queue.jobs.is_empty() && !queue.in_rotation);
+        if removable {
+            self.hosts.remove(&host);
+        }
+    }
+}
+
+const POOL_COUNT: usize = 4;
+const PRIORITY_COUNT: usize = 3;
+const LANE_COUNT: usize = POOL_COUNT * PRIORITY_COUNT;
+
+const fn pool_index(pool: PoolKind) -> usize {
+    match pool {
+        PoolKind::Fs => 0,
+        PoolKind::Pack => 1,
+        PoolKind::Image => 2,
+        PoolKind::Archive => 3,
+    }
+}
+
+const fn pool_from_index(index: usize) -> PoolKind {
+    match index {
+        0 => PoolKind::Fs,
+        1 => PoolKind::Pack,
+        2 => PoolKind::Image,
+        3 => PoolKind::Archive,
+        _ => panic!("invalid pool index"),
+    }
+}
+
+const fn priority_index(priority: PriorityClass) -> usize {
+    match priority {
+        PriorityClass::Background => 0,
+        PriorityClass::ForegroundAsync => 1,
+        PriorityClass::ForegroundBlocking => 2,
+    }
+}
+
+const fn lane_index(priority: PriorityClass, pool: PoolKind) -> usize {
+    priority_index(priority) * POOL_COUNT + pool_index(pool)
+}
+
+#[derive(Debug, Clone)]
+struct ExecutorConfig {
+    worker_count: usize,
+    class_caps: [usize; POOL_COUNT],
+    host_cap_when_contended: usize,
+    aging_interval: u64,
+}
+
+impl ExecutorConfig {
+    fn for_workers(worker_count: usize) -> Self {
+        let worker_count = worker_count.max(1);
+        let cpu_heavy_cap = worker_count.saturating_sub(1).clamp(1, 2);
+        Self {
+            worker_count,
+            class_caps: [worker_count, cpu_heavy_cap, cpu_heavy_cap, 1],
+            host_cap_when_contended: worker_count.div_ceil(2),
+            aging_interval: 16,
+        }
+    }
+
+    #[cfg(test)]
+    fn class_cap(&self, pool: PoolKind) -> usize {
+        self.class_caps[pool_index(pool)]
+    }
+}
+
+struct Dispatched<T> {
+    host: HostToken,
+    pool: PoolKind,
     value: T,
 }
 
-impl<T> Eq for PriorityEntry<T> {}
-impl<T> PartialEq for PriorityEntry<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.seq == other.seq
-    }
-}
-impl<T> Ord for PriorityEntry<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.priority
-            .cmp(&other.priority)
-            .then_with(|| other.seq.cmp(&self.seq))
-    }
-}
-impl<T> PartialOrd for PriorityEntry<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-struct PriorityChannelInner<T> {
-    heap: BinaryHeap<PriorityEntry<T>>,
-    next_seq: u64,
-    /// Monotonic pop counter used by the aging logic. Every
-    /// [`PriorityReceiver::AGING_INTERVAL`] pops, if the heap holds
-    /// any [`PriorityClass::Background`] entry while also holding a
-    /// higher-priority entry, we surface the oldest `Background`
-    /// first. This bounds the worst-case waiting time of a background
-    /// task to roughly `AGING_INTERVAL` high-priority tasks, rather
-    /// than "forever if foreground pressure never subsides".
-    pop_count: u64,
+struct QueueState<T> {
+    lanes: [FairLane<T>; LANE_COUNT],
+    class_cursor: [usize; PRIORITY_COUNT],
+    active_by_class: [usize; POOL_COUNT],
+    active_by_host: HashMap<HostToken, usize>,
+    pending_by_host: HashMap<HostToken, usize>,
+    retired_hosts: HashSet<HostToken>,
+    active_total: usize,
+    pending_total: usize,
+    dispatch_count: u64,
     closed: bool,
 }
 
-struct PriorityChannelShared<T> {
-    state: StdMutex<PriorityChannelInner<T>>,
-    condvar: Condvar,
-    sender_count: std::sync::atomic::AtomicUsize,
-}
-
-pub(crate) struct PrioritySender<T> {
-    shared: Arc<PriorityChannelShared<T>>,
-}
-
-impl<T> Clone for PrioritySender<T> {
-    fn clone(&self) -> Self {
-        self.shared
-            .sender_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+impl<T> Default for QueueState<T> {
+    fn default() -> Self {
         Self {
-            shared: Arc::clone(&self.shared),
-        }
-    }
-}
-
-impl<T> Drop for PrioritySender<T> {
-    fn drop(&mut self) {
-        if self
-            .shared
-            .sender_count
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-            == 1
-        {
-            // Last sender dropped — close the channel.
-            let mut state = self.shared.state.lock().unwrap();
-            state.closed = true;
-            self.shared.condvar.notify_all();
-        }
-    }
-}
-
-pub(crate) struct PriorityReceiver<T> {
-    shared: Arc<PriorityChannelShared<T>>,
-}
-
-pub(crate) fn priority_channel<T>() -> (PrioritySender<T>, PriorityReceiver<T>) {
-    let shared = Arc::new(PriorityChannelShared {
-        state: StdMutex::new(PriorityChannelInner {
-            heap: BinaryHeap::new(),
-            next_seq: 0,
-            pop_count: 0,
+            lanes: std::array::from_fn(|_| FairLane::default()),
+            class_cursor: [0; PRIORITY_COUNT],
+            active_by_class: [0; POOL_COUNT],
+            active_by_host: HashMap::new(),
+            pending_by_host: HashMap::new(),
+            retired_hosts: HashSet::new(),
+            active_total: 0,
+            pending_total: 0,
+            dispatch_count: 0,
             closed: false,
-        }),
-        condvar: Condvar::new(),
-        sender_count: std::sync::atomic::AtomicUsize::new(1),
-    });
-    (
-        PrioritySender {
-            shared: Arc::clone(&shared),
-        },
-        PriorityReceiver { shared },
-    )
+        }
+    }
 }
 
-impl<T> PrioritySender<T> {
-    pub fn send(&self, priority: PriorityClass, value: T) -> Result<(), PoolError> {
-        let mut state = self.shared.state.lock().unwrap();
+impl<T> QueueState<T> {
+    fn push(&mut self, host: HostToken, pool: PoolKind, priority: PriorityClass, value: T) {
+        debug_assert!(!self.retired_hosts.contains(&host));
+        self.lanes[lane_index(priority, pool)].push(host, value);
+        self.pending_total += 1;
+        *self.pending_by_host.entry(host).or_default() += 1;
+    }
+
+    fn pop_next(&mut self, config: &ExecutorConfig) -> Option<Dispatched<T>> {
+        if self.active_total >= config.worker_count {
+            return None;
+        }
+
+        let aging_due = self.dispatch_count != 0
+            && self.dispatch_count.is_multiple_of(config.aging_interval)
+            && self.has_priority_work(PriorityClass::Background)
+            && (self.has_priority_work(PriorityClass::ForegroundBlocking)
+                || self.has_priority_work(PriorityClass::ForegroundAsync));
+        if aging_due {
+            if let Some(job) = self.pop_priority(PriorityClass::Background, config) {
+                return Some(job);
+            }
+        }
+
+        for priority in [
+            PriorityClass::ForegroundBlocking,
+            PriorityClass::ForegroundAsync,
+            PriorityClass::Background,
+        ] {
+            if let Some(job) = self.pop_priority(priority, config) {
+                return Some(job);
+            }
+        }
+        None
+    }
+
+    fn has_priority_work(&self, priority: PriorityClass) -> bool {
+        let base = priority_index(priority) * POOL_COUNT;
+        self.lanes[base..base + POOL_COUNT]
+            .iter()
+            .any(FairLane::has_work)
+    }
+
+    fn pop_priority(
+        &mut self,
+        priority: PriorityClass,
+        config: &ExecutorConfig,
+    ) -> Option<Dispatched<T>> {
+        let priority_idx = priority_index(priority);
+        let cursor = self.class_cursor[priority_idx];
+        let host_contended = self.pending_by_host.len() > 1;
+        let active_by_host = &self.active_by_host;
+        let host_cap = config.host_cap_when_contended;
+
+        for offset in 0..POOL_COUNT {
+            let class_idx = (cursor + offset) % POOL_COUNT;
+            if self.active_by_class[class_idx] >= config.class_caps[class_idx] {
+                continue;
+            }
+            let pool = pool_from_index(class_idx);
+            let popped = self.lanes[lane_index(priority, pool)].pop_where(|host| {
+                !host_contended || active_by_host.get(&host).copied().unwrap_or(0) < host_cap
+            });
+            let Some((host, value)) = popped else {
+                continue;
+            };
+
+            self.class_cursor[priority_idx] = (class_idx + 1) % POOL_COUNT;
+            self.pending_total -= 1;
+            let pending = self
+                .pending_by_host
+                .get_mut(&host)
+                .expect("dispatched host must have pending count");
+            *pending -= 1;
+            if *pending == 0 {
+                self.pending_by_host.remove(&host);
+            }
+            self.active_total += 1;
+            self.active_by_class[class_idx] += 1;
+            *self.active_by_host.entry(host).or_default() += 1;
+            self.dispatch_count = self.dispatch_count.wrapping_add(1);
+            return Some(Dispatched { host, pool, value });
+        }
+        None
+    }
+
+    fn complete(&mut self, host: HostToken, pool: PoolKind) {
+        let class_idx = pool_index(pool);
+        self.active_total = self
+            .active_total
+            .checked_sub(1)
+            .expect("completed job must be active");
+        self.active_by_class[class_idx] = self.active_by_class[class_idx]
+            .checked_sub(1)
+            .expect("completed class must be active");
+        let active = self
+            .active_by_host
+            .get_mut(&host)
+            .expect("completed host must be active");
+        *active -= 1;
+        if *active == 0 {
+            self.active_by_host.remove(&host);
+        }
+        self.cleanup_retired_host(host);
+    }
+
+    fn retire_host(&mut self, host: HostToken) {
+        self.retired_hosts.insert(host);
+        self.cleanup_retired_host(host);
+    }
+
+    fn cleanup_retired_host(&mut self, host: HostToken) {
+        if !self.retired_hosts.contains(&host)
+            || self.pending_by_host.contains_key(&host)
+            || self.active_by_host.contains_key(&host)
+        {
+            return;
+        }
+        for lane in &mut self.lanes {
+            lane.remove_host_if_empty(host);
+        }
+        self.retired_hosts.remove(&host);
+    }
+
+    #[cfg(test)]
+    fn contains_host(&self, host: HostToken) -> bool {
+        self.lanes.iter().any(|lane| lane.contains_host(host))
+    }
+
+    #[cfg(test)]
+    fn is_retired(&self, host: HostToken) -> bool {
+        self.retired_hosts.contains(&host)
+    }
+}
+
+struct ExecutorShared {
+    state: Mutex<QueueState<Job>>,
+    condvar: ParkingCondvar,
+    config: ExecutorConfig,
+}
+
+impl ExecutorShared {
+    fn is_closed(&self) -> bool {
+        self.state.lock().closed
+    }
+
+    fn enqueue(
+        &self,
+        host: HostToken,
+        pool: PoolKind,
+        priority: PriorityClass,
+        job: Job,
+    ) -> Result<(), PoolError> {
+        let mut state = self.state.lock();
         if state.closed {
             return Err(PoolError::Closed);
         }
-        let seq = state.next_seq;
-        state.next_seq += 1;
-        state.heap.push(PriorityEntry {
-            priority,
-            value,
-            seq,
-        });
-        self.shared.condvar.notify_one();
+        state.push(host, pool, priority, job);
+        self.condvar.notify_one();
         Ok(())
     }
 
-    pub fn close(&self) {
-        let mut state = self.shared.state.lock().unwrap();
-        state.closed = true;
-        self.shared.condvar.notify_all();
-    }
-}
-
-impl<T> PriorityReceiver<T> {
-    /// How often the aging policy pre-empts strict priority. Every
-    /// `AGING_INTERVAL` successful pops, if the heap holds at least
-    /// one `Background` entry *and* at least one higher-priority
-    /// entry, we dequeue the oldest `Background` instead of the
-    /// usual highest-priority-first pick.
-    ///
-    /// 16 is empirically large enough that foreground latency is
-    /// dominated by the job itself (a 16th slot every cycle of small
-    /// foreground work is ≤ 1 / 16 ≈ 6 % throughput taxation) and
-    /// small enough that background tasks make steady progress under
-    /// sustained foreground load.
-    pub const AGING_INTERVAL: u64 = 16;
-
-    pub fn recv(&self) -> Result<T, PoolError> {
-        let mut state = self.shared.state.lock().unwrap();
+    fn next_job(&self, completed: Option<(HostToken, PoolKind)>) -> Option<Dispatched<Job>> {
+        let mut state = self.state.lock();
+        if let Some((host, pool)) = completed {
+            state.complete(host, pool);
+            if state.pending_total != 0 {
+                self.condvar.notify_one();
+            }
+        }
         loop {
-            // Aging slot: every Nth pop, prefer the oldest Background
-            // entry if one is behind higher-priority work.
-            let aging_due = state.pop_count != 0 && (state.pop_count % Self::AGING_INTERVAL == 0);
-            if aging_due {
-                if let Some(entry) = take_oldest_background(&mut state.heap) {
-                    state.pop_count = state.pop_count.wrapping_add(1);
-                    return Ok(entry.value);
-                }
+            if let Some(job) = state.pop_next(&self.config) {
+                return Some(job);
             }
-            if let Some(entry) = state.heap.pop() {
-                state.pop_count = state.pop_count.wrapping_add(1);
-                return Ok(entry.value);
+            if state.closed && state.pending_total == 0 {
+                return None;
             }
-            if state.closed {
-                return Err(PoolError::Closed);
-            }
-            state = self.shared.condvar.wait(state).unwrap();
+            self.condvar.wait(&mut state);
         }
+    }
+
+    fn retire_host(&self, host: HostToken) {
+        self.state.lock().retire_host(host);
+    }
+
+    fn close(&self) {
+        self.state.lock().closed = true;
+        self.condvar.notify_all();
     }
 }
 
-/// Surface the oldest `Background` entry currently waiting in the
-/// heap, provided at least one higher-priority entry is present. If
-/// there are no `Background` entries, or if the heap is exclusively
-/// `Background`, returns `None` so the normal `pop` path handles it.
-///
-/// `BinaryHeap` has no indexed removal, so this drains and rebuilds
-/// the heap. It is O(N) on the size of the heap, but only runs on
-/// aging pulses (1 in `AGING_INTERVAL` pops) and typical IO-pool
-/// queues hold ≤ 100 entries at peak.
-fn take_oldest_background<T>(heap: &mut BinaryHeap<PriorityEntry<T>>) -> Option<PriorityEntry<T>> {
-    if heap.is_empty() {
-        return None;
+struct HostRegistration {
+    token: HostToken,
+    host_id: i32,
+    executor: Arc<ProcessIoExecutor>,
+}
+
+impl Drop for HostRegistration {
+    fn drop(&mut self) {
+        self.executor.shared.retire_host(self.token);
     }
-    let items: Vec<PriorityEntry<T>> = std::mem::take(heap).into_sorted_vec();
-    let has_higher = items
-        .iter()
-        .any(|e| e.priority != PriorityClass::Background);
-    if !has_higher {
-        // Nothing to pre-empt for; put them back and let `pop` run.
-        for e in items {
-            heap.push(e);
-        }
-        return None;
+}
+
+struct ProcessIoExecutor {
+    shared: Arc<ExecutorShared>,
+    workers: OnceLock<Mutex<Vec<thread::JoinHandle<()>>>>,
+    next_host_token: AtomicU64,
+}
+
+impl ProcessIoExecutor {
+    fn new(config: ExecutorConfig) -> Arc<Self> {
+        Arc::new(Self {
+            shared: Arc::new(ExecutorShared {
+                state: Mutex::new(QueueState::default()),
+                condvar: ParkingCondvar::new(),
+                config,
+            }),
+            workers: OnceLock::new(),
+            next_host_token: AtomicU64::new(1),
+        })
     }
-    let mut oldest_bg_seq: Option<u64> = None;
-    for e in &items {
-        if e.priority == PriorityClass::Background {
-            oldest_bg_seq = Some(match oldest_bg_seq {
-                None => e.seq,
-                Some(s) => s.min(e.seq),
-            });
-        }
+
+    fn register_host(self: &Arc<Self>, host_id: i32) -> Arc<HostRegistration> {
+        let token = HostToken(
+            self.next_host_token
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                    next.checked_add(1)
+                })
+                .unwrap_or_else(|_| panic!("process IO host token space exhausted")),
+        );
+        Arc::new(HostRegistration {
+            token,
+            host_id,
+            executor: Arc::clone(self),
+        })
     }
-    let oldest_bg_seq = match oldest_bg_seq {
-        Some(s) => s,
-        None => {
-            for e in items {
-                heap.push(e);
+
+    fn ensure_started(&self) {
+        self.workers.get_or_init(|| {
+            let mut workers = Vec::with_capacity(self.shared.config.worker_count);
+            for worker_index in 0..self.shared.config.worker_count {
+                let shared = Arc::clone(&self.shared);
+                workers.push(
+                    thread::Builder::new()
+                        .name(format!("Migo-IO-{worker_index}"))
+                        .spawn(move || worker_main(shared))
+                        .expect("failed to spawn process IO executor thread"),
+                );
             }
-            return None;
+            Mutex::new(workers)
+        });
+    }
+
+    fn submit<T, F>(
+        &self,
+        registration: &HostRegistration,
+        pool: PoolKind,
+        priority: PriorityClass,
+        job: F,
+    ) -> Result<JobHandle<T>, PoolError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        debug_assert!(std::ptr::eq(self, Arc::as_ptr(&registration.executor)));
+        if self.shared.is_closed() {
+            return Err(PoolError::Closed);
         }
-    };
-    let mut picked = None;
-    for e in items {
-        if picked.is_none() && e.priority == PriorityClass::Background && e.seq == oldest_bg_seq {
-            picked = Some(e);
-        } else {
-            heap.push(e);
+        self.ensure_started();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.shared.enqueue(
+            registration.token,
+            pool,
+            priority,
+            Box::new(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                let _ = result_tx.send(result);
+            }),
+        )?;
+        Ok(JobHandle { rx: result_rx })
+    }
+
+    fn submit_async<T, F>(
+        &self,
+        registration: &HostRegistration,
+        pool: PoolKind,
+        priority: PriorityClass,
+        job: F,
+    ) -> Result<tokio::sync::oneshot::Receiver<std::thread::Result<T>>, PoolError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        debug_assert!(std::ptr::eq(self, Arc::as_ptr(&registration.executor)));
+        if self.shared.is_closed() {
+            return Err(PoolError::Closed);
+        }
+        self.ensure_started();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.shared.enqueue(
+            registration.token,
+            pool,
+            priority,
+            Box::new(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                let _ = result_tx.send(result);
+            }),
+        )?;
+        Ok(result_rx)
+    }
+
+    #[cfg(test)]
+    fn started_thread_count(&self) -> usize {
+        self.workers
+            .get()
+            .map(|workers| workers.lock().len())
+            .unwrap_or(0)
+    }
+}
+
+fn worker_main(shared: Arc<ExecutorShared>) {
+    let mut completed = None;
+    while let Some(job) = shared.next_job(completed.take()) {
+        let host = job.host;
+        let pool = job.pool;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.value));
+        if result.is_err() {
+            tracing::error!("process IO executor job wrapper panicked");
+        }
+        completed = Some((host, pool));
+    }
+}
+
+impl Drop for ProcessIoExecutor {
+    fn drop(&mut self) {
+        self.shared.close();
+        let Some(workers) = self.workers.get() else {
+            return;
+        };
+        let handles = std::mem::take(&mut *workers.lock());
+        let current = thread::current().id();
+        if handles.iter().any(|handle| handle.thread().id() == current) {
+            // Joining any peer from inside this executor can deadlock when
+            // that peer is waiting for the current job to release a class
+            // slot. Dropping JoinHandles detaches them; `close` above wakes
+            // the peers and they drain all already-accepted work before exit.
+            return;
+        }
+        for handle in handles {
+            let _ = handle.join();
         }
     }
-    picked
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -266,298 +596,30 @@ impl<T> JobHandle<T> {
     }
 }
 
-#[derive(Clone)]
-pub struct WorkerPool {
-    inner: Arc<WorkerPoolInner>,
-}
+static PROCESS_IO_EXECUTOR: OnceLock<Arc<ProcessIoExecutor>> = OnceLock::new();
 
-struct WorkerPoolInner {
-    name: String,
-    tx: Mutex<Option<PrioritySender<Job>>>,
-    workers: Mutex<Vec<thread::JoinHandle<()>>>,
-    thread_count: usize,
-}
-
-impl WorkerPool {
-    /// Single-threaded pool.  Kept as the default because most pool
-    /// kinds (fs / pack / archive) aren't CPU-bound and don't benefit
-    /// from fan-out — one worker keeps ordering predictable and
-    /// serialises bursts against the shared pack/VFS layer.
-    pub fn new(host_id: i32, label: &'static str) -> Self {
-        Self::with_threads(host_id, label, 1)
-    }
-
-    /// Multi-threaded pool.  Use for CPU-heavy work that is safe to
-    /// run concurrently (image decode + upload staging).  Threads
-    /// share one [`PrioritySender`]/[`PriorityReceiver`] pair; since
-    /// `PriorityReceiver::recv` serialises on the heap's internal
-    /// mutex, the N workers dequeue atomically — no duplicate
-    /// delivery, no cross-worker coordination needed from callers.
-    ///
-    /// `thread_count` is clamped to `≥ 1`; `with_threads(h, l, 0)` is
-    /// treated as `with_threads(h, l, 1)` rather than panicking.
-    pub fn with_threads(host_id: i32, label: &'static str, thread_count: usize) -> Self {
-        let n = thread_count.max(1);
-        let name = format!("io-{label}-host-{host_id}");
-        let (tx, rx) = priority_channel::<Job>();
-        let rx = Arc::new(rx);
-
-        let mut workers = Vec::with_capacity(n);
-        for worker_idx in 0..n {
-            // When there's only one thread keep the legacy name so
-            // telemetry / log greps keep matching (existing tests
-            // assert on "io-{label}-host-{id}"). Multi-thread pools
-            // get a -{idx} suffix so logs can tell threads apart.
-            let thread_name = if n == 1 {
-                name.clone()
-            } else {
-                format!("{name}-{worker_idx}")
-            };
-            let rx_clone = Arc::clone(&rx);
-            let handle = thread::Builder::new()
-                .name(thread_name)
-                .spawn(move || {
-                    while let Ok(job) = rx_clone.recv() {
-                        job();
-                    }
-                })
-                .expect("failed to spawn IO worker pool thread");
-            workers.push(handle);
-        }
-
-        Self {
-            inner: Arc::new(WorkerPoolInner {
-                name,
-                tx: Mutex::new(Some(tx)),
-                workers: Mutex::new(workers),
-                thread_count: n,
-            }),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.inner.name
-    }
-
-    /// Actual thread count this pool was configured with.
-    pub fn thread_count(&self) -> usize {
-        self.inner.thread_count
-    }
-
-    pub fn submit<T, F>(&self, priority: PriorityClass, job: F) -> Result<JobHandle<T>, PoolError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        let (result_tx, result_rx) = mpsc::sync_channel(1);
-        let sender = self.inner.tx.lock().clone().ok_or(PoolError::Closed)?;
-        sender
-            .send(
-                priority,
-                Box::new(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-                    let _ = result_tx.send(result);
-                }),
-            )
-            .map_err(|_| PoolError::Closed)?;
-
-        Ok(JobHandle { rx: result_rx })
-    }
-
-    pub fn run<T, F>(&self, priority: PriorityClass, job: F) -> Result<T, PoolError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        self.submit(priority, job)?.join()
-    }
-
-    pub fn submit_async<T, F>(
-        &self,
-        priority: PriorityClass,
-        job: F,
-    ) -> Result<tokio::sync::oneshot::Receiver<std::thread::Result<T>>, PoolError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let sender = self.inner.tx.lock().clone().ok_or(PoolError::Closed)?;
-        sender
-            .send(
-                priority,
-                Box::new(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-                    let _ = result_tx.send(result);
-                }),
-            )
-            .map_err(|_| PoolError::Closed)?;
-        Ok(result_rx)
-    }
-}
-
-impl Drop for WorkerPoolInner {
-    fn drop(&mut self) {
-        // Close the channel first so every worker's recv() returns
-        // Err(Closed) and the outer loop exits.  Joining before the
-        // close would deadlock: the worker would be parked in
-        // `condvar.wait`.
-        if let Some(tx) = self.tx.lock().take() {
-            tx.close();
-        }
-        // Collect the handles out of the Mutex so we can join
-        // without holding any lock a worker might need. Skip the
-        // handle for the current thread — self-join would hang, and
-        // the common case that triggers it is an outer pool owner
-        // being dropped from inside a job closure.
-        let handles: Vec<_> = std::mem::take(&mut *self.workers.lock());
-        let current_id = thread::current().id();
-        for h in handles {
-            if h.thread().id() != current_id {
-                let _ = h.join();
-            }
-        }
-    }
-}
-
-impl fmt::Debug for WorkerPool {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WorkerPool")
-            .field("name", &self.inner.name)
-            .finish()
-    }
-}
-
-#[derive(Debug)]
-struct LazyWorkerPool {
-    host_id: i32,
-    label: &'static str,
-    thread_count: usize,
-    pool: OnceLock<WorkerPool>,
-}
-
-impl LazyWorkerPool {
-    fn new(host_id: i32, label: &'static str) -> Self {
-        Self::with_threads(host_id, label, 1)
-    }
-
-    fn with_threads(host_id: i32, label: &'static str, thread_count: usize) -> Self {
-        Self {
-            host_id,
-            label,
-            thread_count: thread_count.max(1),
-            pool: OnceLock::new(),
-        }
-    }
-
-    fn get(&self) -> &WorkerPool {
-        self.pool
-            .get_or_init(|| WorkerPool::with_threads(self.host_id, self.label, self.thread_count))
-    }
-
-    #[cfg(test)]
-    fn is_spawned(&self) -> bool {
-        self.pool.get().is_some()
-    }
-}
-
-/// Pick a sensible parallelism level for the image decode pool.
-/// Two threads is a floor so even single-core emulators benefit
-/// marginally from overlapping the JNI hop with a second decode;
-/// past four threads the contention against host+render+audio
-/// threads outweighs the JNI throughput gain on mobile.
-///
-/// The `num_cpus` crate isn't a workspace dependency; the std-only
-/// alternative [`std::thread::available_parallelism`] returns the
-/// same answer for our needs (after the OS accounts for the
-/// process cgroup limits Android applies).
-fn cpu_hint() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
+fn default_executor_config() -> ExecutorConfig {
+    let worker_count = std::thread::available_parallelism()
+        .map(|count| count.get())
         .unwrap_or(2)
+        .clamp(2, 6);
+    ExecutorConfig::for_workers(worker_count)
 }
 
-fn default_image_thread_count() -> usize {
-    let cpu_hint = cpu_hint();
-    // Reserve one core for the host thread and one for the render
-    // thread; cap at 4 because two extra concurrent JNI
-    // `AttachCurrentThread` calls already saturate the BitmapFactory
-    // Java-heap pressure on mid-tier devices.
-    cpu_hint.saturating_sub(2).clamp(2, 4)
+fn process_io_executor() -> Arc<ProcessIoExecutor> {
+    Arc::clone(
+        PROCESS_IO_EXECUTOR.get_or_init(|| ProcessIoExecutor::new(default_executor_config())),
+    )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IoPools {
-    fs: Arc<LazyWorkerPool>,
-    pack: Arc<LazyWorkerPool>,
-    image: Arc<LazyWorkerPool>,
-    archive: Arc<LazyWorkerPool>,
-}
-
-/// Filesystem reads on Android internal storage benefit from light
-/// parallelism: the kernel block layer reorders concurrent positional
-/// reads, and on warm page-cache hits the cost is dominated by
-/// per-call syscall overhead which fans out cleanly across threads.
-/// Cocos shop pages submit 30+ readFiles in a single tick.
-///
-/// Cap raised from 4 → 8 (2026-05) after `[Async] readFile` lines on
-/// shop open consistently sat around 70–130 ms while the in-pool
-/// `[IOTrace] read slow ≥30ms` warning never fired — meaning the
-/// disk read itself was fast and the latency was pool-queue wait.
-/// 30 in-flight requests across 4 threads = ~7 reqs per thread,
-/// even a 5 ms per-read = 35 ms tail; with 8 threads it's 4 reqs ×
-/// 5 ms = 20 ms tail.  Floor stays at 2 for single-core emulators.
-fn default_fs_thread_count() -> usize {
-    cpu_hint().saturating_sub(2).clamp(2, 8)
-}
-
-/// Pack reads decompress zstd chunks (CPU-bound) before returning, and
-/// the dominant menu-switch workload is many small entries fired in
-/// parallel. Fan out so they decompress concurrently. Cap at 4 because
-/// past that we contend with host + render threads on smaller phones.
-fn default_pack_thread_count() -> usize {
-    cpu_hint().saturating_sub(2).clamp(2, 4)
+    registration: Arc<HostRegistration>,
 }
 
 impl IoPools {
     pub fn new(host_id: i32) -> Self {
-        Self {
-            fs: Arc::new(LazyWorkerPool::with_threads(
-                host_id,
-                "fs",
-                default_fs_thread_count(),
-            )),
-            pack: Arc::new(LazyWorkerPool::with_threads(
-                host_id,
-                "pack",
-                default_pack_thread_count(),
-            )),
-            // Image decode is CPU-bound (JPEG IDCT, PNG inflate) and
-            // trivially parallel across distinct input buffers — the
-            // pool fans out so a cold-start screen of 20 images
-            // doesn't serialise behind a single BitmapFactory
-            // invocation. Kept lazy: spawning only happens on the
-            // first `get()`, so sessions that never draw an image
-            // pay zero.
-            image: Arc::new(LazyWorkerPool::with_threads(
-                host_id,
-                "image",
-                default_image_thread_count(),
-            )),
-            // Archive (zip extract) is one-shot startup work that we
-            // intentionally serialise so it doesn't compete with
-            // foreground reads for CPU during a hot session.
-            archive: Arc::new(LazyWorkerPool::new(host_id, "archive")),
-        }
-    }
-
-    fn get_pool(&self, pool: PoolKind) -> &WorkerPool {
-        match pool {
-            PoolKind::Fs => self.fs.get(),
-            PoolKind::Pack => self.pack.get(),
-            PoolKind::Image => self.image.get(),
-            PoolKind::Archive => self.archive.get(),
-        }
+        Self::with_executor(host_id, process_io_executor())
     }
 
     pub fn run<T, F>(&self, pool: PoolKind, priority: PriorityClass, job: F) -> Result<T, PoolError>
@@ -565,7 +627,10 @@ impl IoPools {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        self.get_pool(pool).run(priority, job)
+        self.registration
+            .executor
+            .submit(&self.registration, pool, priority, job)?
+            .join()
     }
 
     pub fn submit_async<T, F>(
@@ -578,365 +643,848 @@ impl IoPools {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        self.get_pool(pool).submit_async(priority, job)
+        self.registration
+            .executor
+            .submit_async(&self.registration, pool, priority, job)
+    }
+
+    fn with_executor(host_id: i32, executor: Arc<ProcessIoExecutor>) -> Self {
+        Self {
+            registration: executor.register_host(host_id),
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn spawned_pool_count(&self) -> usize {
-        [
-            self.fs.is_spawned(),
-            self.pack.is_spawned(),
-            self.image.is_spawned(),
-            self.archive.is_spawned(),
-        ]
-        .into_iter()
-        .filter(|spawned| *spawned)
-        .count()
+    pub(crate) fn shared_pair_for_test(
+        first_host_id: i32,
+        second_host_id: i32,
+        worker_count: usize,
+    ) -> (Self, Self) {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(worker_count));
+        (
+            Self::with_executor(first_host_id, Arc::clone(&executor)),
+            Self::with_executor(second_host_id, executor),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_for_test(host_id: i32, worker_count: usize) -> Self {
+        Self::with_executor(
+            host_id,
+            ProcessIoExecutor::new(ExecutorConfig::for_workers(worker_count)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_work_for_test(&self) -> usize {
+        self.registration.executor.shared.state.lock().pending_total
+    }
+
+    #[cfg(test)]
+    pub(crate) fn started_thread_count_for_test(&self) -> usize {
+        self.registration.executor.started_thread_count()
+    }
+}
+
+impl fmt::Debug for IoPools {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IoPools")
+            .field("host_id", &self.registration.host_id)
+            .field("host_token", &self.registration.token)
+            .finish()
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        panic::{AssertUnwindSafe, catch_unwind},
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
-        },
-    };
-
-    use crate::{
-        pools::{IoPools, PoolError, priority_channel},
-        task::{PoolKind, PriorityClass},
-    };
+mod r5_queue_tests {
+    use super::{ExecutorConfig, FairLane, HostToken, QueueState, pool_index};
+    use crate::task::{PoolKind, PriorityClass};
 
     #[test]
-    fn priority_channel_delivers_highest_priority_first() {
-        let (tx, rx) = priority_channel::<String>();
+    fn lane_is_fifo_within_one_host() {
+        let mut lane = FairLane::default();
+        lane.push(HostToken(1), 1_u32);
+        lane.push(HostToken(1), 2_u32);
 
-        tx.send(PriorityClass::Background, "bg".to_string())
-            .unwrap();
-        tx.send(PriorityClass::ForegroundAsync, "fg-async".to_string())
-            .unwrap();
-        tx.send(PriorityClass::ForegroundBlocking, "fg-block".to_string())
-            .unwrap();
-
-        assert_eq!(rx.recv().unwrap(), "fg-block");
-        assert_eq!(rx.recv().unwrap(), "fg-async");
-        assert_eq!(rx.recv().unwrap(), "bg");
+        assert_eq!(lane.pop_where(|_| true), Some((HostToken(1), 1)));
+        assert_eq!(lane.pop_where(|_| true), Some((HostToken(1), 2)));
     }
 
     #[test]
-    fn priority_channel_aging_prevents_background_starvation() {
-        use super::PriorityReceiver;
-        let (tx, rx) = priority_channel::<String>();
-        // Enqueue one Background entry, then flood with Foreground
-        // work. Without aging, the Background entry would stay behind
-        // the newly-arriving high-priority work forever.
-        tx.send(PriorityClass::Background, "bg".to_string())
-            .unwrap();
-        // Enough foreground entries to exceed the aging interval.
-        let flood = PriorityReceiver::<String>::AGING_INTERVAL as usize * 2 + 1;
-        for i in 0..flood {
-            tx.send(PriorityClass::ForegroundAsync, format!("fg-{i}"))
-                .unwrap();
+    fn lane_round_robins_hosts_with_unequal_backlog() {
+        let mut lane = FairLane::default();
+        for id in 1..=4 {
+            lane.push(HostToken(1), id);
         }
-        let mut seen_bg_at: Option<usize> = None;
-        for i in 0..flood + 1 {
-            let v = rx.recv().unwrap();
-            if v == "bg" {
-                seen_bg_at = Some(i);
+        lane.push(HostToken(2), 20);
+
+        assert_eq!(lane.pop_where(|_| true), Some((HostToken(1), 1)));
+        assert_eq!(lane.pop_where(|_| true), Some((HostToken(2), 20)));
+        assert_eq!(lane.pop_where(|_| true), Some((HostToken(1), 2)));
+    }
+
+    #[test]
+    fn blocking_precedes_async_and_background() {
+        let config = ExecutorConfig::for_workers(6);
+        let mut state = QueueState::default();
+        state.push(HostToken(1), PoolKind::Fs, PriorityClass::Background, 1_u32);
+        state.push(
+            HostToken(1),
+            PoolKind::Fs,
+            PriorityClass::ForegroundAsync,
+            2,
+        );
+        state.push(
+            HostToken(1),
+            PoolKind::Fs,
+            PriorityClass::ForegroundBlocking,
+            3,
+        );
+
+        assert_eq!(state.pop_next(&config).unwrap().value, 3);
+        state.complete(HostToken(1), PoolKind::Fs);
+        assert_eq!(state.pop_next(&config).unwrap().value, 2);
+        state.complete(HostToken(1), PoolKind::Fs);
+        assert_eq!(state.pop_next(&config).unwrap().value, 1);
+    }
+
+    #[test]
+    fn background_gets_the_sixteenth_aging_opportunity() {
+        let config = ExecutorConfig::for_workers(6);
+        let mut state = QueueState::default();
+        state.push(
+            HostToken(1),
+            PoolKind::Fs,
+            PriorityClass::Background,
+            999_u32,
+        );
+        for id in 0..33 {
+            state.push(
+                HostToken(1),
+                PoolKind::Fs,
+                PriorityClass::ForegroundAsync,
+                id,
+            );
+        }
+
+        let mut background_at = None;
+        for dispatch_index in 0..34 {
+            let dispatched = state.pop_next(&config).unwrap();
+            state.complete(dispatched.host, dispatched.pool);
+            if dispatched.value == 999 {
+                background_at = Some(dispatch_index);
                 break;
             }
         }
-        let at = seen_bg_at.expect("background entry must be dispatched");
+
+        assert_eq!(background_at, Some(16));
+    }
+
+    #[test]
+    fn class_cursor_prevents_one_class_from_owning_a_priority() {
+        let config = ExecutorConfig::for_workers(6);
+        let mut state = QueueState::default();
+        for id in [1_u32, 2] {
+            state.push(
+                HostToken(1),
+                PoolKind::Fs,
+                PriorityClass::ForegroundBlocking,
+                id,
+            );
+        }
+        for id in [20_u32, 21] {
+            state.push(
+                HostToken(1),
+                PoolKind::Image,
+                PriorityClass::ForegroundBlocking,
+                id,
+            );
+        }
+
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            let dispatched = state.pop_next(&config).unwrap();
+            order.push(dispatched.value);
+            state.complete(dispatched.host, dispatched.pool);
+        }
+        assert_eq!(order, vec![1, 20, 2, 21]);
+    }
+
+    #[test]
+    fn blocked_class_is_skipped_without_dropping_its_job() {
+        let config = ExecutorConfig::for_workers(6);
+        let mut state = QueueState::default();
+        state.active_by_class[pool_index(PoolKind::Image)] = config.class_cap(PoolKind::Image);
+        state.push(
+            HostToken(1),
+            PoolKind::Image,
+            PriorityClass::ForegroundBlocking,
+            20_u32,
+        );
+        state.push(
+            HostToken(1),
+            PoolKind::Fs,
+            PriorityClass::ForegroundBlocking,
+            1,
+        );
+
+        let fs = state.pop_next(&config).unwrap();
+        assert_eq!(fs.value, 1);
+        state.complete(fs.host, fs.pool);
+        assert_eq!(state.pending_total, 1, "blocked image job remains queued");
+    }
+
+    #[test]
+    fn single_host_can_fill_all_fs_slots() {
+        let config = ExecutorConfig::for_workers(6);
+        let mut state = QueueState::default();
+        for id in 0_u32..7 {
+            state.push(
+                HostToken(1),
+                PoolKind::Fs,
+                PriorityClass::ForegroundAsync,
+                id,
+            );
+        }
+
+        for expected in 0_u32..6 {
+            assert_eq!(state.pop_next(&config).unwrap().value, expected);
+        }
+        assert!(state.pop_next(&config).is_none(), "all workers are active");
+        assert_eq!(state.active_total, 6);
+        assert_eq!(state.pending_total, 1);
+    }
+
+    #[test]
+    fn contending_host_caps_new_dispatches_at_half_workers() {
+        let config = ExecutorConfig::for_workers(6);
+        let mut state = QueueState::default();
+        for id in 0_u32..3 {
+            state.push(
+                HostToken(1),
+                PoolKind::Fs,
+                PriorityClass::ForegroundAsync,
+                id,
+            );
+            assert_eq!(state.pop_next(&config).unwrap().host, HostToken(1));
+        }
+        state.push(
+            HostToken(1),
+            PoolKind::Fs,
+            PriorityClass::ForegroundAsync,
+            10,
+        );
+        state.push(
+            HostToken(2),
+            PoolKind::Fs,
+            PriorityClass::ForegroundAsync,
+            20,
+        );
+
+        let next = state.pop_next(&config).unwrap();
+        assert_eq!(next.host, HostToken(2));
+        assert_eq!(next.value, 20);
+    }
+
+    #[test]
+    fn image_pack_and_archive_respect_class_caps() {
+        let config = ExecutorConfig::for_workers(6);
+        for (pool, cap) in [
+            (PoolKind::Image, 2_usize),
+            (PoolKind::Pack, 2),
+            (PoolKind::Archive, 1),
+        ] {
+            let mut state = QueueState::default();
+            for id in 0_u32..4 {
+                state.push(HostToken(1), pool, PriorityClass::ForegroundAsync, id);
+            }
+            for _ in 0..cap {
+                assert!(state.pop_next(&config).is_some());
+            }
+            assert!(
+                state.pop_next(&config).is_none(),
+                "{pool:?} must stop dispatching at its class cap"
+            );
+            assert_eq!(state.active_by_class[pool_index(pool)], cap);
+        }
+    }
+
+    #[test]
+    fn completing_a_job_releases_class_and_host_slots() {
+        let config = ExecutorConfig::for_workers(2);
+        let mut state = QueueState::default();
+        state.push(
+            HostToken(7),
+            PoolKind::Image,
+            PriorityClass::ForegroundAsync,
+            1_u32,
+        );
+        state.push(
+            HostToken(7),
+            PoolKind::Image,
+            PriorityClass::ForegroundAsync,
+            2,
+        );
+
+        let first = state.pop_next(&config).unwrap();
+        assert!(state.pop_next(&config).is_none());
+        state.complete(first.host, first.pool);
+        assert_eq!(state.active_total, 0);
+        assert!(!state.active_by_host.contains_key(&HostToken(7)));
+        assert_eq!(state.pop_next(&config).unwrap().value, 2);
+    }
+
+    #[test]
+    fn live_host_keeps_empty_lane_for_capacity_reuse() {
+        let config = ExecutorConfig::for_workers(2);
+        let mut state = QueueState::default();
+        state.push(
+            HostToken(3),
+            PoolKind::Fs,
+            PriorityClass::ForegroundAsync,
+            1_u32,
+        );
+        let job = state.pop_next(&config).unwrap();
+        state.complete(job.host, job.pool);
+
+        assert!(state.contains_host(HostToken(3)));
+    }
+
+    #[test]
+    fn retiring_empty_host_removes_lane_state_immediately() {
+        let config = ExecutorConfig::for_workers(2);
+        let mut state = QueueState::default();
+        state.push(
+            HostToken(4),
+            PoolKind::Fs,
+            PriorityClass::ForegroundAsync,
+            1_u32,
+        );
+        let job = state.pop_next(&config).unwrap();
+        state.complete(job.host, job.pool);
+
+        state.retire_host(HostToken(4));
+
+        assert!(!state.contains_host(HostToken(4)));
+        assert!(!state.is_retired(HostToken(4)));
+    }
+
+    #[test]
+    fn retiring_queued_host_drains_then_removes_accepted_state() {
+        let config = ExecutorConfig::for_workers(2);
+        let mut state = QueueState::default();
+        state.push(
+            HostToken(5),
+            PoolKind::Pack,
+            PriorityClass::ForegroundAsync,
+            7_u32,
+        );
+        state.retire_host(HostToken(5));
+        assert!(state.contains_host(HostToken(5)));
+        assert!(state.is_retired(HostToken(5)));
+
+        let job = state.pop_next(&config).unwrap();
+        assert_eq!(job.value, 7);
+        state.complete(job.host, job.pool);
+
+        assert!(!state.contains_host(HostToken(5)));
+        assert!(!state.is_retired(HostToken(5)));
+    }
+}
+
+#[cfg(test)]
+mod r5_executor_tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+    use std::time::Duration;
+
+    use super::{
+        ExecutorConfig, IoPools, PoolError, ProcessIoExecutor, default_executor_config, pool_index,
+    };
+    use crate::task::{PoolKind, PriorityClass};
+
+    #[test]
+    fn executor_starts_no_threads_before_first_submit() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(3));
+        let _host = executor.register_host(10);
+
+        assert_eq!(executor.started_thread_count(), 0);
+    }
+
+    #[test]
+    fn first_submit_starts_exactly_configured_threads_once() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(3));
+        let host = executor.register_host(11);
+
+        let first = executor
+            .submit(&host, PoolKind::Fs, PriorityClass::ForegroundAsync, || {
+                1_u32
+            })
+            .unwrap();
+        assert_eq!(first.join().unwrap(), 1);
+        assert_eq!(executor.started_thread_count(), 3);
+
+        let second = executor
+            .submit(&host, PoolKind::Fs, PriorityClass::ForegroundAsync, || {
+                2_u32
+            })
+            .unwrap();
+        assert_eq!(second.join().unwrap(), 2);
+        assert_eq!(executor.started_thread_count(), 3);
+    }
+
+    #[test]
+    fn worker_names_use_migo_io_prefix() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(2));
+        let host = executor.register_host(12);
+        let name = executor
+            .submit(&host, PoolKind::Fs, PriorityClass::ForegroundAsync, || {
+                std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_string()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
         assert!(
-            (at as u64) <= PriorityReceiver::<String>::AGING_INTERVAL + 1,
-            "background entry dispatched at {} pops, aging should surface it within AGING_INTERVAL+1",
-            at
+            name.starts_with("Migo-IO-"),
+            "unexpected worker name: {name}"
         );
     }
 
     #[test]
-    fn priority_channel_preserves_fifo_within_same_priority() {
-        let (tx, rx) = priority_channel::<u32>();
+    fn same_numeric_host_id_gets_distinct_registration_tokens() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(2));
+        let first = executor.register_host(13);
+        let second = executor.register_host(13);
 
-        tx.send(PriorityClass::ForegroundAsync, 1).unwrap();
-        tx.send(PriorityClass::ForegroundAsync, 2).unwrap();
-        tx.send(PriorityClass::ForegroundAsync, 3).unwrap();
-
-        assert_eq!(rx.recv().unwrap(), 1);
-        assert_eq!(rx.recv().unwrap(), 2);
-        assert_eq!(rx.recv().unwrap(), 3);
+        assert_ne!(first.token, second.token);
+        assert_eq!(first.host_id, second.host_id);
     }
 
     #[test]
-    fn priority_channel_recv_blocks_until_send() {
-        let (tx, rx) = priority_channel::<u32>();
-        let received = Arc::new(AtomicBool::new(false));
-        let received_clone = Arc::clone(&received);
+    fn host_registration_token_exhaustion_never_wraps() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(2));
+        executor
+            .next_host_token
+            .store(u64::MAX - 1, Ordering::Relaxed);
 
-        let handle = std::thread::spawn(move || {
-            let val = rx.recv().unwrap();
-            received_clone.store(true, Ordering::SeqCst);
-            val
-        });
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(!received.load(Ordering::SeqCst), "recv should block");
-
-        tx.send(PriorityClass::Background, 99).unwrap();
-        assert_eq!(handle.join().unwrap(), 99);
+        let last = executor.register_host(13);
+        assert_eq!(last.token, super::HostToken(u64::MAX - 1));
+        let exhausted = catch_unwind(AssertUnwindSafe(|| executor.register_host(13)));
+        assert!(exhausted.is_err());
     }
 
     #[test]
-    fn priority_channel_recv_returns_closed_when_sender_dropped() {
-        let (tx, rx) = priority_channel::<u32>();
-        drop(tx);
-        assert!(matches!(rx.recv(), Err(PoolError::Closed)));
-    }
-
-    #[test]
-    fn pool_executes_higher_priority_job_first() {
-        use crate::pools::WorkerPool;
-
-        let pool = WorkerPool::new(110, "prio-test");
-        let execution_order = Arc::new(Mutex::new(Vec::<&str>::new()));
-
-        // Block the worker thread
-        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
-        pool.submit(PriorityClass::Background, move || {
-            let _ = block_rx.recv();
-        })
-        .unwrap();
-
-        // Give the blocking job time to start on the worker
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // While blocked, enqueue jobs at different priorities
-        let o1 = Arc::clone(&execution_order);
-        let h1 = pool
-            .submit(PriorityClass::Background, move || {
-                o1.lock().unwrap().push("bg");
-            })
-            .unwrap();
-
-        let o2 = Arc::clone(&execution_order);
-        let h2 = pool
-            .submit(PriorityClass::ForegroundBlocking, move || {
-                o2.lock().unwrap().push("fg-block");
-            })
-            .unwrap();
-
-        let o3 = Arc::clone(&execution_order);
-        let h3 = pool
-            .submit(PriorityClass::ForegroundAsync, move || {
-                o3.lock().unwrap().push("fg-async");
-            })
-            .unwrap();
-
-        // Unblock the worker
-        block_tx.send(()).unwrap();
-
-        // Wait for all jobs
-        h1.join().unwrap();
-        h2.join().unwrap();
-        h3.join().unwrap();
-
-        let order = execution_order.lock().unwrap();
-        assert_eq!(&*order, &["fg-block", "fg-async", "bg"]);
-    }
-
-    #[test]
-    fn submit_async_resolves_job_on_worker_thread() {
-        use crate::pools::WorkerPool;
-
-        let pool = WorkerPool::new(120, "async-test");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let result = runtime.block_on(async {
-            let rx = pool
-                .submit_async(PriorityClass::ForegroundBlocking, || {
-                    std::thread::current()
-                        .name()
-                        .unwrap_or("unnamed")
-                        .to_string()
-                })
-                .unwrap();
-            rx.await.unwrap().unwrap()
-        });
-
-        assert!(result.contains("io-async-test-host-120"));
-    }
-
-    #[test]
-    fn io_pools_submit_async_routes_to_correct_pool() {
-        let pools = IoPools::new(121);
+    fn submit_async_resolves_on_process_worker() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(2));
+        let host = executor.register_host(14);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         let name = runtime.block_on(async {
-            let rx = pools
-                .submit_async(PoolKind::Image, PriorityClass::ForegroundAsync, || {
-                    std::thread::current()
-                        .name()
-                        .unwrap_or("unnamed")
-                        .to_string()
-                })
-                .unwrap();
-            rx.await.unwrap().unwrap()
+            executor
+                .submit_async(
+                    &host,
+                    PoolKind::Image,
+                    PriorityClass::ForegroundAsync,
+                    || {
+                        std::thread::current()
+                            .name()
+                            .unwrap_or("unnamed")
+                            .to_string()
+                    },
+                )
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap()
         });
 
-        assert!(name.contains("io-image-host-121"));
+        assert!(name.starts_with("Migo-IO-"));
     }
 
-    static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
-    fn pool_run_preserves_panic_payload() {
-        let pools = IoPools::new(3);
-
-        let panic = catch_unwind(AssertUnwindSafe(|| {
-            let _ = pools.run(
+    fn user_panic_payload_is_preserved_and_capacity_survives() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(2));
+        let host = executor.register_host(15);
+        let panicking = executor
+            .submit(
+                &host,
                 PoolKind::Pack,
-                PriorityClass::ForegroundBlocking,
-                || -> usize {
-                    panic!("pool boom");
-                },
-            );
-        }))
-        .unwrap_err();
+                PriorityClass::ForegroundAsync,
+                || -> () { panic!("r5-panic-payload") },
+            )
+            .unwrap();
 
-        let message = panic.downcast_ref::<&str>().copied().or_else(|| {
-            panic
-                .downcast_ref::<String>()
-                .map(std::string::String::as_str)
+        let payload = catch_unwind(AssertUnwindSafe(|| panicking.join()))
+            .expect_err("join must resume the user panic");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"r5-panic-payload"));
+
+        let next = executor
+            .submit(
+                &host,
+                PoolKind::Pack,
+                PriorityClass::ForegroundAsync,
+                || 42_u32,
+            )
+            .unwrap();
+        assert_eq!(next.join().unwrap(), 42);
+    }
+
+    #[test]
+    fn concurrent_submitters_start_one_worker_set_and_run_once() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(4));
+        let host = executor.register_host(16);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let submitters: Vec<_> = (0..32)
+            .map(|_| {
+                let executor = Arc::clone(&executor);
+                let host = Arc::clone(&host);
+                let runs = Arc::clone(&runs);
+                std::thread::spawn(move || {
+                    executor
+                        .submit(
+                            &host,
+                            PoolKind::Fs,
+                            PriorityClass::ForegroundAsync,
+                            move || {
+                                runs.fetch_add(1, Ordering::SeqCst);
+                            },
+                        )
+                        .unwrap()
+                        .join()
+                        .unwrap();
+                })
+            })
+            .collect();
+
+        for submitter in submitters {
+            submitter.join().unwrap();
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 32);
+        assert_eq!(executor.started_thread_count(), 4);
+    }
+
+    fn assert_runtime_class_cap(pool: PoolKind, expected_cap: usize) {
+        let config = ExecutorConfig::for_workers(4);
+        let executor = ProcessIoExecutor::new(config.clone());
+        let host = executor.register_host(17);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let current = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut handles = Vec::new();
+
+        for _ in 0..8 {
+            let gate = Arc::clone(&gate);
+            let current = Arc::clone(&current);
+            let maximum = Arc::clone(&maximum);
+            let started_tx = started_tx.clone();
+            handles.push(
+                executor
+                    .submit(&host, pool, PriorityClass::ForegroundAsync, move || {
+                        let active = current.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(active, Ordering::SeqCst);
+                        started_tx.send(()).unwrap();
+
+                        let (lock, condvar) = &*gate;
+                        let mut released = lock.lock().unwrap();
+                        while !*released {
+                            released = condvar.wait(released).unwrap();
+                        }
+                        current.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .unwrap(),
+            );
+        }
+        drop(started_tx);
+
+        let all_expected_started =
+            (0..expected_cap).all(|_| started_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        let (active, pending) = {
+            let state = executor.shared.state.lock();
+            (state.active_by_class[pool_index(pool)], state.pending_total)
+        };
+
+        let (lock, condvar) = &*gate;
+        *lock.lock().unwrap() = true;
+        condvar.notify_all();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert!(
+            all_expected_started,
+            "{pool:?} did not reach its configured cap"
+        );
+        assert_eq!(active, expected_cap, "{pool:?} exceeded its class cap");
+        assert_eq!(pending, 8 - expected_cap);
+        assert_eq!(maximum.load(Ordering::SeqCst), expected_cap);
+    }
+
+    #[test]
+    fn runtime_class_caps_bound_concurrent_work() {
+        for (pool, expected_cap) in [
+            (PoolKind::Fs, 4),
+            (PoolKind::Pack, 2),
+            (PoolKind::Image, 2),
+            (PoolKind::Archive, 1),
+        ] {
+            assert_runtime_class_cap(pool, expected_cap);
+        }
+    }
+
+    #[test]
+    fn close_before_first_submit_rejects_without_starting_threads() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(2));
+        let host = executor.register_host(18);
+        executor.shared.close();
+
+        let result = executor.submit(&host, PoolKind::Fs, PriorityClass::ForegroundAsync, || {
+            1_u32
         });
 
-        assert_eq!(message, Some("pool boom"));
-        assert_eq!(
-            pools
-                .run(PoolKind::Pack, PriorityClass::ForegroundBlocking, || 7usize)
-                .unwrap(),
-            7
-        );
+        assert!(matches!(result, Err(PoolError::Closed)));
+        assert_eq!(executor.started_thread_count(), 0);
     }
 
     #[test]
-    fn with_threads_zero_is_clamped_to_one() {
-        let pool = crate::pools::WorkerPool::with_threads(200, "zero-clamp", 0);
-        assert_eq!(pool.thread_count(), 1);
-        // Must still accept jobs.
-        let result = pool.run(PriorityClass::ForegroundAsync, || 42i32).unwrap();
-        assert_eq!(result, 42);
+    fn close_drains_jobs_accepted_before_close() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(1));
+        let host = executor.register_host(19);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let first_gate = Arc::clone(&gate);
+        let first = executor
+            .submit(
+                &host,
+                PoolKind::Fs,
+                PriorityClass::ForegroundAsync,
+                move || {
+                    started_tx.send(()).unwrap();
+                    let (lock, condvar) = &*first_gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = condvar.wait(released).unwrap();
+                    }
+                    1_u32
+                },
+            )
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = executor
+            .submit(&host, PoolKind::Fs, PriorityClass::ForegroundAsync, || {
+                2_u32
+            })
+            .unwrap();
+
+        executor.shared.close();
+        let (lock, condvar) = &*gate;
+        *lock.lock().unwrap() = true;
+        condvar.notify_all();
+
+        assert_eq!(first.join().unwrap(), 1);
+        assert_eq!(second.join().unwrap(), 2);
     }
 
     #[test]
-    fn multi_threaded_pool_runs_jobs_concurrently() {
-        use std::time::{Duration, Instant};
+    fn final_executor_owner_can_drop_inside_its_worker() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(2));
+        let host = executor.register_host(20);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let executor_in_job = Arc::clone(&executor);
+        let job_gate = Arc::clone(&gate);
 
-        // Three workers + three blocking jobs whose total wall-clock
-        // time would be ~300 ms if serialised. Parallel execution
-        // puts them below ~150 ms. Generous headroom on the ceiling
-        // so CI with noisy neighbours doesn't flake.
-        let pool = crate::pools::WorkerPool::with_threads(300, "parallel", 3);
-        assert_eq!(pool.thread_count(), 3);
+        let handle = executor
+            .submit(
+                &host,
+                PoolKind::Fs,
+                PriorityClass::ForegroundAsync,
+                move || {
+                    started_tx.send(()).unwrap();
+                    let (lock, condvar) = &*job_gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = condvar.wait(released).unwrap();
+                    }
+                    drop(executor_in_job);
+                    21_u32
+                },
+            )
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
-        let start = Instant::now();
-        let h1 = pool
-            .submit(PriorityClass::ForegroundAsync, || {
-                std::thread::sleep(Duration::from_millis(100));
-            })
+        drop(host);
+        drop(executor);
+        let (lock, condvar) = &*gate;
+        *lock.lock().unwrap() = true;
+        condvar.notify_all();
+
+        let result = handle
+            .rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker self-drop must not deadlock")
+            .expect("worker result must not be disconnected");
+        assert_eq!(result, 21);
+    }
+
+    #[test]
+    fn worker_side_final_drop_does_not_join_workers_blocked_by_its_class_slot() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(2));
+        let host = executor.register_host(23);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let executor_in_job = Arc::clone(&executor);
+        let first_gate = Arc::clone(&gate);
+        let first = executor
+            .submit(
+                &host,
+                PoolKind::Archive,
+                PriorityClass::ForegroundAsync,
+                move || {
+                    started_tx.send(()).unwrap();
+                    let (lock, condvar) = &*first_gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = condvar.wait(released).unwrap();
+                    }
+                    drop(executor_in_job);
+                    1_u32
+                },
+            )
             .unwrap();
-        let h2 = pool
-            .submit(PriorityClass::ForegroundAsync, || {
-                std::thread::sleep(Duration::from_millis(100));
-            })
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = executor
+            .submit(
+                &host,
+                PoolKind::Archive,
+                PriorityClass::ForegroundAsync,
+                || 2_u32,
+            )
             .unwrap();
-        let h3 = pool
-            .submit(PriorityClass::ForegroundAsync, || {
-                std::thread::sleep(Duration::from_millis(100));
-            })
+
+        drop(host);
+        drop(executor);
+        let (lock, condvar) = &*gate;
+        *lock.lock().unwrap() = true;
+        condvar.notify_all();
+
+        let first_result = first
+            .rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker-side executor drop must not wait on a class-blocked worker")
             .unwrap();
-        h1.join().unwrap();
-        h2.join().unwrap();
-        h3.join().unwrap();
-        let elapsed = start.elapsed();
+        let second_result = second
+            .rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("accepted archive work must drain after close")
+            .unwrap();
+        assert_eq!((first_result, second_result), (1, 2));
+    }
+
+    #[test]
+    fn completion_wakes_a_peer_when_class_and_host_caps_unblock_two_jobs() {
+        let executor = ProcessIoExecutor::new(ExecutorConfig::for_workers(2));
+        let host_a = executor.register_host(24);
+        let host_b = executor.register_host(25);
+        let archive_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let fs_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (archive_a_started_tx, archive_a_started_rx) = mpsc::channel();
+        let (archive_b_started_tx, archive_b_started_rx) = mpsc::channel();
+        let (fs_started_tx, fs_started_rx) = mpsc::channel();
+
+        let first_gate = Arc::clone(&archive_gate);
+        let archive_a = executor
+            .submit(
+                &host_a,
+                PoolKind::Archive,
+                PriorityClass::ForegroundAsync,
+                move || {
+                    archive_a_started_tx.send(()).unwrap();
+                    let (lock, condvar) = &*first_gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = condvar.wait(released).unwrap();
+                    }
+                },
+            )
+            .unwrap();
+        archive_a_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let archive_b = executor
+            .submit(
+                &host_b,
+                PoolKind::Archive,
+                PriorityClass::ForegroundAsync,
+                move || archive_b_started_tx.send(()).unwrap(),
+            )
+            .unwrap();
+        let second_gate = Arc::clone(&fs_gate);
+        let fs_a = executor
+            .submit(
+                &host_a,
+                PoolKind::Fs,
+                PriorityClass::ForegroundAsync,
+                move || {
+                    fs_started_tx.send(()).unwrap();
+                    let (lock, condvar) = &*second_gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = condvar.wait(released).unwrap();
+                    }
+                },
+            )
+            .unwrap();
+
+        let (lock, condvar) = &*archive_gate;
+        *lock.lock().unwrap() = true;
+        condvar.notify_all();
+        fs_started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let archive_b_started = archive_b_started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_ok();
+
+        let (lock, condvar) = &*fs_gate;
+        *lock.lock().unwrap() = true;
+        condvar.notify_all();
+        archive_a.join().unwrap();
+        fs_a.join().unwrap();
+        archive_b.join().unwrap();
+
         assert!(
-            elapsed < Duration::from_millis(250),
-            "3 parallel 100ms jobs took {:?}, expected <250ms",
-            elapsed
+            archive_b_started,
+            "a peer worker stayed parked after completion unblocked archive capacity"
         );
     }
 
     #[test]
-    fn multi_threaded_workers_consume_each_job_exactly_once() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    fn io_pools_share_one_process_executor_but_not_registration_tokens() {
+        let first = IoPools::new(30);
+        let second = IoPools::new(30);
 
-        let pool = crate::pools::WorkerPool::with_threads(301, "exactly-once", 4);
-        let counter = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::new();
-        for _ in 0..64 {
-            let c = Arc::clone(&counter);
-            handles.push(
-                pool.submit(PriorityClass::ForegroundAsync, move || {
-                    c.fetch_add(1, Ordering::SeqCst);
-                })
-                .unwrap(),
-            );
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            64,
-            "each job must run once, not more, not less"
-        );
+        assert!(Arc::ptr_eq(
+            &first.registration.executor,
+            &second.registration.executor,
+        ));
+        assert_ne!(first.registration.token, second.registration.token);
     }
 
     #[test]
-    fn default_image_thread_count_is_within_safe_bounds() {
-        let n = super::default_image_thread_count();
-        assert!(n >= 2, "floor of 2 threads");
-        assert!(n <= 4, "ceiling of 4 threads");
-    }
-
-    #[test]
-    fn dropping_last_pool_owner_inside_worker_does_not_self_join() {
-        let _hook_guard = PANIC_HOOK_LOCK.lock().unwrap();
-        let panics = Arc::new(Mutex::new(Vec::<String>::new()));
-        let previous_hook = std::panic::take_hook();
-        let panic_messages = Arc::clone(&panics);
-        std::panic::set_hook(Box::new(move |info| {
-            let message = info
-                .payload()
-                .downcast_ref::<&str>()
-                .map(|msg| (*msg).to_string())
-                .or_else(|| info.payload().downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic".to_string());
-            panic_messages.lock().unwrap().push(message);
-        }));
-
-        let pool = crate::pools::WorkerPool::new(9, "self-drop");
-        let captured_pool = pool.clone();
-        let handle = pool
-            .submit(PriorityClass::Background, move || {
-                drop(captured_pool);
-            })
-            .unwrap();
-        drop(pool);
-
-        let result = handle.join();
-
-        std::panic::set_hook(previous_hook);
-
-        assert!(result.is_ok());
-        assert!(panics.lock().unwrap().is_empty());
+    fn default_process_worker_count_is_mobile_bounded() {
+        let worker_count = default_executor_config().worker_count;
+        assert!((2..=6).contains(&worker_count));
     }
 }

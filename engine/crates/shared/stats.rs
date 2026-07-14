@@ -334,6 +334,11 @@ pub struct DebugStats {
     /// storm is visible before it turns into a stall.
     pub render_queue_len: AtomicU32,
 
+    /// Peak command bytes retained by the JS-side frame collector during the
+    /// most recently completed logical frame. Published once at frame end;
+    /// sync/auto-flush barriers do not reset the logical-frame peak.
+    pub collector_pending_bytes: AtomicU32,
+
     /// Current count of `SkImage` wrapper entries held by
     /// `ImageStore::sk_image_cache`.  Dividing by the number of
     /// live `Canvas2DContext`s gives the wrapper multiplication
@@ -346,13 +351,9 @@ pub struct DebugStats {
     /// A rising number means the per-frame upload budget is
     /// undersized for the current workload.
     pub deferred_uploads: AtomicU32,
-    // Note: `collector_pending_bytes` and `webgl_error_overflow`
-    // are intentionally absent from this struct because their
-    // producers (JS-runtime frame collector, WebGL error state)
-    // live in crates that don't have a `DebugStats` handle in
-    // scope.  They're published to process-global atomics
-    // (`set_collector_pending_bytes`, `bump_webgl_error_overflow`)
-    // and pulled into the snapshot at serialisation time.
+    // `webgl_error_overflow` remains process-global because its producer does
+    // not currently carry a host identity. The frame collector does, so its
+    // gauge is session-local above.
 }
 
 impl DebugStats {
@@ -407,12 +408,7 @@ impl DebugStats {
                 .load(Ordering::Relaxed),
             image_cache_trim_bytes: io.image_cache_trim_bytes.load(Ordering::Relaxed),
             render_queue_len: self.render_queue_len.load(Ordering::Relaxed),
-            // Both counters are process-global (js-runtime doesn't
-            // depend on graphics' render_diagnostics sink), so we
-            // pull them directly at snapshot time.  The session
-            // DebugStats field is kept as a fallback for any future
-            // caller that wants a per-session variant.
-            collector_pending_bytes: collector_pending_bytes(),
+            collector_pending_bytes: self.collector_pending_bytes.load(Ordering::Relaxed),
             // Saturate on the 32-bit snapshot field; the full
             // 64-bit total stays available via
             // `webgl_error_overflow_total()`.
@@ -455,32 +451,6 @@ pub fn bump_webgl_error_overflow(n: u64) {
 #[inline]
 pub fn webgl_error_overflow_total() -> u64 {
     WEBGL_ERROR_OVERFLOW.load(Ordering::Relaxed)
-}
-
-// ---------------------------------------------------------------------------
-// Process-global frame-collector gauge
-// ---------------------------------------------------------------------------
-//
-// Producer: JS-runtime's `UnifiedFrameCollector::push_gl` /
-// `push_canvas2d`, which mirrors its current `pending_bytes` every
-// time the counter ticks (gauge semantics, not a cumulative sum).
-// Consumer: `DebugStats::snapshot`.  Put here rather than under the
-// `render_diagnostics` sink because js-runtime does not depend on
-// graphics.
-
-static COLLECTOR_PENDING_BYTES: AtomicU32 = AtomicU32::new(0);
-
-/// Publish the current frame-collector byte budget.  Called on every
-/// `push_*` / flush as a gauge.
-#[inline]
-pub fn set_collector_pending_bytes(bytes: u32) {
-    COLLECTOR_PENDING_BYTES.store(bytes, Ordering::Relaxed);
-}
-
-/// Read the current frame-collector byte budget.
-#[inline]
-pub fn collector_pending_bytes() -> u32 {
-    COLLECTOR_PENDING_BYTES.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -791,10 +761,6 @@ mod tests {
 
     #[test]
     fn v4_queue_and_cache_fields_serialize_at_tail() {
-        // Zero the process-globals first so cross-test noise from
-        // other `shared::stats` tests doesn't leak into the offsets
-        // we're asserting below.
-        set_collector_pending_bytes(0);
         // Can't directly reset the WebGL overflow total (atomic
         // with no `store` exposed — mirrors gauge semantics), so
         // snapshot the baseline and add to it.
@@ -802,7 +768,9 @@ mod tests {
 
         let stats = DebugStats::default();
         stats.render_queue_len.store(321, Ordering::Relaxed);
-        set_collector_pending_bytes(4_000_000);
+        stats
+            .collector_pending_bytes
+            .store(4_000_000, Ordering::Relaxed);
         bump_webgl_error_overflow(17);
         stats.sk_image_wrappers.store(88, Ordering::Relaxed);
         stats.deferred_uploads.store(5, Ordering::Relaxed);
@@ -818,6 +786,13 @@ mod tests {
         assert_eq!(webgl_field, overflow_baseline + 17);
         assert_eq!(u32::from_le_bytes(bytes[108..112].try_into().unwrap()), 88);
         assert_eq!(u32::from_le_bytes(bytes[112..116].try_into().unwrap()), 5);
+
+        let other = DebugStats::default().snapshot();
+        assert_eq!(
+            u32::from_le_bytes(other[100..104].try_into().unwrap()),
+            0,
+            "collector peak must be scoped to one DebugStats/session"
+        );
     }
 
     #[test]

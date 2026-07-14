@@ -71,12 +71,12 @@ show_help() {
     echo ""
     echo "Usage:"
     echo "  ./build-android-so.sh [arm64-v8a|x86_64|all] [release|debug]"
-    echo "  ./build-android-so.sh [--build-type release|debug] [architectures...]"
+    echo "  ./build-android-so.sh [--product-profile full|slim] [--codegen-profile z|2|3] [--worker-snapshot] [--build-type release|debug] [architectures...]"
     echo ""
     echo "Examples:"
     echo "  ./build-android-so.sh"
     echo "  ./build-android-so.sh arm64-v8a release"
-    echo "  ./build-android-so.sh all --build-type release"
+    echo "  ./build-android-so.sh all --product-profile slim --codegen-profile 2 --build-type release"
     exit 0
 }
 
@@ -245,6 +245,8 @@ slim_icu_data() {
 build_platform() {
     local platform="$1"
     local build_type="$2"
+    local codegen_profile="$3"
+    local worker_snapshot="$4"
 
     if [[ "$platform" == "armv7" || "$platform" == "x86" ]]; then
         print_error "$platform is not supported"
@@ -256,12 +258,32 @@ build_platform() {
         print_error "Unknown platform: $platform"
         return 1
     fi
-    local profile_flag=""
+    local -a profile_args=()
     local out_dir="debug"
+    local destination_suffix=""
 
     if [[ "$build_type" == "release" ]]; then
-        profile_flag="--release"
-        out_dir="release"
+        case "$codegen_profile" in
+            z)
+                profile_args=(--release)
+                out_dir="release"
+                ;;
+            2)
+                profile_args=(--profile release-hot2)
+                out_dir="release-hot2"
+                destination_suffix="-opt2"
+                ;;
+            3)
+                profile_args=(--profile release-hot3)
+                out_dir="release-hot3"
+                destination_suffix="-opt3"
+                ;;
+        esac
+    fi
+    local cargo_features="profile-$product_profile"
+    if [[ "$worker_snapshot" == true ]]; then
+        destination_suffix+="-worker-snapshot"
+        cargo_features+=",worker-snapshot"
     fi
 
     # --------------------------------------------------------
@@ -328,7 +350,7 @@ build_platform() {
     # --------------------------------------------------------
     # Build
     # --------------------------------------------------------
-    print_info "Building $platform ($target_triple) [$build_type]"
+    print_info "Building $platform ($target_triple) [$build_type, codegen=$codegen_profile, worker-snapshot=$worker_snapshot]"
 
     # Trim the bundled SQLite amalgamation to just the KV surface we
     # need. libsqlite3-sys's build.rs already injects a default set
@@ -364,7 +386,9 @@ build_platform() {
     # a stale .so on disk made the later `cp` succeed.  Capture the exit
     # code explicitly so we can propagate the real failure upward.
     local cargo_rc=0
-    cargo ndk --target "$target_triple" --platform "$ANDROID_API" -- build $profile_flag \
+    cargo ndk --target "$target_triple" --platform "$ANDROID_API" -- build \
+        --target-dir "$TARGET_DIR" "${profile_args[@]}" \
+        --no-default-features --features "$cargo_features" \
         || cargo_rc=$?
 
     popd > /dev/null
@@ -380,19 +404,28 @@ build_platform() {
     # --------------------------------------------------------
     local abi
     abi=$(get_abi_name "$platform")
-    local dst_dir="$JNI_LIBS_DIR/$abi"
+    local dst_dir="$JNI_LIBS_DIR/${product_profile}${destination_suffix}/$abi"
 
-    mkdir -p "$dst_dir"
+    if ! mkdir -p "$dst_dir"; then
+        print_error "Unable to create output directory: $dst_dir"
+        export RUSTFLAGS="$orig_rustflags"
+        return 1
+    fi
 
     local src_so="$TARGET_DIR/$target_triple/$out_dir/$CRATE_SO_NAME"
     local dst_so="$dst_dir/$OUTPUT_SO_NAME"
 
-    if [[ -f "$src_so" ]]; then
-        cp "$src_so" "$dst_so"
-        print_success "Copied -> $dst_so"
-    else
-        print_warning "Output .so not found: $src_so"
+    if [[ ! -f "$src_so" ]]; then
+        print_error "Output .so not found: $src_so"
+        export RUSTFLAGS="$orig_rustflags"
+        return 1
     fi
+    if ! cp "$src_so" "$dst_so"; then
+        print_error "Unable to copy $src_so to $dst_so"
+        export RUSTFLAGS="$orig_rustflags"
+        return 1
+    fi
+    print_success "Copied -> $dst_so"
 
     # --------------------------------------------------------
     # Copy libc++_shared.so (required by cpal/oboe shared STL)
@@ -409,7 +442,11 @@ build_platform() {
     local libcpp_dst="$dst_dir/libc++_shared.so"
 
     if [[ -f "$libcpp_src" ]]; then
-        cp "$libcpp_src" "$libcpp_dst"
+        if ! cp "$libcpp_src" "$libcpp_dst"; then
+            print_error "Unable to copy $libcpp_src to $libcpp_dst"
+            export RUSTFLAGS="$orig_rustflags"
+            return 1
+        fi
         # Strip debug symbols from libc++_shared.so (NDK ships unstripped, ~6.6MB -> ~800KB)
         local llvm_strip_bin=""
         if command -v llvm-strip &>/dev/null; then
@@ -419,13 +456,19 @@ build_platform() {
         fi
 
         if [[ -n "$llvm_strip_bin" ]]; then
-            "$llvm_strip_bin" --strip-all "$libcpp_dst"
+            if ! "$llvm_strip_bin" --strip-all "$libcpp_dst"; then
+                print_error "Unable to strip $libcpp_dst"
+                export RUSTFLAGS="$orig_rustflags"
+                return 1
+            fi
             print_success "Copied + stripped -> $libcpp_dst"
         else
             print_success "Copied -> $libcpp_dst (llvm-strip not found, skipped stripping)"
         fi
     else
-        print_warning "libc++_shared.so not found: $libcpp_src"
+        print_error "libc++_shared.so not found: $libcpp_src"
+        export RUSTFLAGS="$orig_rustflags"
+        return 1
     fi
 
     export RUSTFLAGS="$orig_rustflags"
@@ -435,13 +478,14 @@ build_platform() {
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
-check_dependencies
-
 # Default to release.  The debug profile produces a ~347 MB .so (no
 # strip / LTO / opt) versus ~49 MB for release; shipping debug into
 # jniLibs was the single biggest size regression.  Pass `debug`
 # explicitly when you need an unoptimized build for local debugging.
 build_type="release"
+product_profile="full"
+codegen_profile="z"
+worker_snapshot=false
 platforms=()
 use_all=false
 
@@ -461,6 +505,31 @@ while [[ $# -gt 0 ]]; do
             ;;
         --build-type=*)
             build_type="${arg#*=}"
+            ;;
+        --product-profile)
+            shift
+            if [[ $# -eq 0 ]]; then
+                print_error "--product-profile requires a value"
+                exit 1
+            fi
+            product_profile="$1"
+            ;;
+        --product-profile=*)
+            product_profile="${arg#*=}"
+            ;;
+        --codegen-profile)
+            shift
+            if [[ $# -eq 0 ]]; then
+                print_error "--codegen-profile requires a value"
+                exit 1
+            fi
+            codegen_profile="$1"
+            ;;
+        --codegen-profile=*)
+            codegen_profile="${arg#*=}"
+            ;;
+        --worker-snapshot)
+            worker_snapshot=true
             ;;
         release)
             build_type="release"
@@ -486,6 +555,24 @@ if [[ "$build_type" != "release" && "$build_type" != "debug" ]]; then
     print_error "Invalid build type: $build_type (expected release|debug)"
     exit 1
 fi
+if [[ "$product_profile" != "full" && "$product_profile" != "slim" ]]; then
+    print_error "Invalid product profile: $product_profile (expected full|slim)"
+    exit 1
+fi
+if [[ "$codegen_profile" != "z" && "$codegen_profile" != "2" && "$codegen_profile" != "3" ]]; then
+    print_error "Invalid codegen profile: $codegen_profile (expected z|2|3)"
+    exit 1
+fi
+if [[ "$build_type" == "debug" && "$codegen_profile" != "z" ]]; then
+    print_error "Codegen profile $codegen_profile requires a release build"
+    exit 1
+fi
+if [[ "$worker_snapshot" == true && ( "$build_type" != "release" || "$product_profile" != "full" ) ]]; then
+    print_error "Worker snapshot requires a full release build"
+    exit 1
+fi
+
+check_dependencies
 
 if [[ "$use_all" == true ]]; then
     platforms=("arm64-v8a" "x86_64")
@@ -497,6 +584,9 @@ if [[ ${#platforms[@]} -eq 0 ]]; then
 fi
 
 print_info "Build type : $build_type"
+print_info "Product    : $product_profile"
+print_info "Codegen    : $codegen_profile"
+print_info "Worker snap: $worker_snapshot"
 print_info "Platforms  : ${platforms[*]}"
 
 # Stage-2: ensure the embedded ICU blob is the slim variant before building.
@@ -504,7 +594,7 @@ slim_icu_data
 
 failed=()
 for p in "${platforms[@]}"; do
-    if ! build_platform "$p" "$build_type"; then
+    if ! build_platform "$p" "$build_type" "$codegen_profile" "$worker_snapshot"; then
         failed+=("$p")
     fi
 done

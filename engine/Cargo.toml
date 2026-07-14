@@ -136,6 +136,66 @@ codegen-units = 1
 debug = false
 
 # =============================================================================
+# Q14 Release Profiles - Hot workspace crates only
+# =============================================================================
+# Keep the shipping `release` profile as the size baseline. These profiles
+# vary only the audited hot workspace crates so Android device A/B results are
+# attributable to codegen level rather than dependency or linker changes.
+[profile.release-hot2]
+inherits = "release"
+
+[profile.release-hot2.build-override]
+opt-level = "z"
+codegen-units = 1
+
+[profile.release-hot2.package."*"]
+opt-level = "z"
+codegen-units = 1
+debug = false
+
+[profile.release-hot2.package.audio]
+opt-level = 2
+
+[profile.release-hot2.package.core]
+opt-level = 2
+
+[profile.release-hot2.package.graphics]
+opt-level = 2
+
+[profile.release-hot2.package.io]
+opt-level = 2
+
+[profile.release-hot2.package.js-runtime]
+opt-level = 2
+
+[profile.release-hot3]
+inherits = "release"
+
+[profile.release-hot3.build-override]
+opt-level = "z"
+codegen-units = 1
+
+[profile.release-hot3.package."*"]
+opt-level = "z"
+codegen-units = 1
+debug = false
+
+[profile.release-hot3.package.audio]
+opt-level = 3
+
+[profile.release-hot3.package.core]
+opt-level = 3
+
+[profile.release-hot3.package.graphics]
+opt-level = 3
+
+[profile.release-hot3.package.io]
+opt-level = 3
+
+[profile.release-hot3.package.js-runtime]
+opt-level = 3
+
+# =============================================================================
 # Dev Profile - Faster compilation for development
 # =============================================================================
 [profile.dev]

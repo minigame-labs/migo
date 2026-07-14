@@ -5374,6 +5374,11 @@ pub fn op_delete_renderbuffer(state: &mut OpState, #[smi] renderbuffer_id: u32) 
 }
 
 #[op2(fast)]
+pub fn op_delete_buffer(state: &mut OpState, #[smi] buffer_id: u32) {
+    queue_gl_fire_and_forget(state, GLCmd::DeleteBuffer { buffer_id });
+}
+
+#[op2(fast)]
 pub fn op_bind_renderbuffer(
     state: &mut OpState,
     #[smi] canvas_id: u32,

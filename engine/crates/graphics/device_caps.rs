@@ -7,6 +7,13 @@ use glow::HasContext;
 
 use crate::device_profile::DeviceRenderProfile;
 
+#[inline]
+fn has_extension(extensions: &str, expected: &str) -> bool {
+    extensions
+        .split_ascii_whitespace()
+        .any(|extension| extension == expected)
+}
+
 /// Runtime-detected device capabilities.
 #[derive(Debug, Clone)]
 pub struct DeviceCapabilities {
@@ -58,12 +65,7 @@ impl DeviceCapabilities {
     /// all drivers.
     ///
     /// Must be called with a valid GL context current on the calling thread.
-    pub fn detect(
-        gl: &glow::Context,
-        egl_extensions: &str,
-        negotiated_gles_major: u32,
-        gpu_caps: &shared::device::gpu_caps::GpuCaps,
-    ) -> Self {
+    pub fn detect(gl: &glow::Context, egl_extensions: &str, negotiated_gles_major: u32) -> Self {
         let version_str = unsafe { gl.get_parameter_string(glow::VERSION) };
         let detected = parse_gles_version(&version_str);
         // Use the minimum of detected and negotiated — belt-and-suspenders.
@@ -74,7 +76,8 @@ impl DeviceCapabilities {
         };
 
         let gl_extensions = unsafe { gl.get_parameter_string(glow::EXTENSIONS) };
-        let has_pbo = gles_version >= (3, 0) || gl_extensions.contains("GL_NV_pixel_buffer_object");
+        let has_pbo =
+            gles_version >= (3, 0) || has_extension(&gl_extensions, "GL_NV_pixel_buffer_object");
         let has_fence_sync = gles_version >= (3, 0);
         let has_compute = gles_version >= (3, 1);
 
@@ -84,8 +87,8 @@ impl DeviceCapabilities {
         // - EGL_ANDROID_image_native_buffer (EGL side can wrap AHB)
         let ahb_available = cfg!(target_os = "android")
             && android_api_level() >= 26
-            && gl_extensions.contains("GL_OES_EGL_image")
-            && egl_extensions.contains("EGL_ANDROID_image_native_buffer");
+            && has_extension(&gl_extensions, "GL_OES_EGL_image")
+            && has_extension(egl_extensions, "EGL_ANDROID_image_native_buffer");
 
         // EGL_EXT_buffer_age: query surface for back buffer age, and guarantees
         // aged back-buffer contents independently of any damage declaration.
@@ -95,13 +98,12 @@ impl DeviceCapabilities {
         // EGL_EXT_buffer_age can exist without partial_update. Track the EXT
         // advertisement separately so the partial-blit path can tell "aged
         // contents guaranteed" (EXT) apart from "age query only via KHR".
-        let has_ext_buffer_age = egl_extensions.contains("EGL_EXT_buffer_age");
-        let has_buffer_age =
-            has_ext_buffer_age || egl_extensions.contains("EGL_KHR_partial_update");
-        let has_partial_update = egl_extensions.contains("EGL_KHR_partial_update");
+        let has_ext_buffer_age = has_extension(egl_extensions, "EGL_EXT_buffer_age");
+        let has_partial_update = has_extension(egl_extensions, "EGL_KHR_partial_update");
+        let has_buffer_age = has_ext_buffer_age || has_partial_update;
 
         let compressed_format_support =
-            crate::compressed_upload::CompressedFormatSupport::detect(gl, gpu_caps);
+            crate::compressed_upload::CompressedFormatSupport::detect(gl);
 
         Self {
             gles_version,
@@ -173,5 +175,17 @@ mod tests {
         assert_eq!(parse_gles_version("OpenGL ES 2.0"), (2, 0));
         assert_eq!(parse_gles_version("4.6.0 NVIDIA 535"), (4, 6));
         assert_eq!(parse_gles_version("garbage"), (2, 0));
+    }
+
+    #[test]
+    fn extension_matching_is_token_exact() {
+        assert!(has_extension(
+            "GL_EXT_debug_marker GL_OES_EGL_image GL_EXT_texture",
+            "GL_OES_EGL_image"
+        ));
+        assert!(!has_extension(
+            "GL_OES_EGL_image_external GL_OES_EGL_image_external_essl3",
+            "GL_OES_EGL_image"
+        ));
     }
 }

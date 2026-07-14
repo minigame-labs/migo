@@ -37,6 +37,22 @@ fn engine_err_to_text(e: &EngineError) -> String {
     }
 }
 
+#[inline]
+fn data_url_cache_identity(src: &str) -> String {
+    format!(
+        "data:sha256:{}",
+        shared::vfs::integrity::sha256_bytes(src.as_bytes())
+    )
+}
+
+#[inline]
+fn ahb_image_decode_allowed(
+    gpu_caps: &shared::device::gpu_caps::GpuCaps,
+    cpu_backing_required: &std::sync::atomic::AtomicBool,
+) -> bool {
+    !cpu_backing_required.load(std::sync::atomic::Ordering::Acquire) && gpu_caps.snapshot().ahb
+}
+
 /// Resolved image source: real path + version identity (for cache keying).
 struct ResolvedSrc {
     path: String,
@@ -275,7 +291,7 @@ async fn op_load_image_inner(
     target_width: Option<u32>,
     target_height: Option<u32>,
 ) -> EngineResult<(u32, (usize, usize))> {
-    let (scheduler, vfs, mount_table, game_cache_dir, gpu_caps, force_rgba_for_webgl) = {
+    let (scheduler, vfs, mount_table, game_cache_dir, gpu_caps, cpu_backing_required) = {
         let op = state.borrow();
         let host = op.borrow::<HostOpState>();
         let gcd = host
@@ -287,9 +303,8 @@ async fn op_load_image_inner(
             host.vfs.clone(),
             host.mount_table.clone(),
             gcd,
-            host.gpu_caps.snapshot(),
-            host.webgl_context_created
-                .load(std::sync::atomic::Ordering::Relaxed),
+            host.gpu_caps.clone(),
+            host.webgl_context_created.clone(),
         )
     };
 
@@ -305,7 +320,9 @@ async fn op_load_image_inner(
     // assignments re-use the already-uploaded shared texture.
     if src.starts_with("data:") {
         return load_image_from_inline_bytes(
-            state.clone(),
+            scheduler,
+            gpu_caps,
+            cpu_backing_required,
             canvas_ctx,
             image_id,
             src,
@@ -317,6 +334,9 @@ async fn op_load_image_inner(
     if src.starts_with("http://") || src.starts_with("https://") {
         return load_image_from_http(
             state.clone(),
+            scheduler,
+            gpu_caps,
+            cpu_backing_required,
             canvas_ctx,
             image_id,
             src,
@@ -406,16 +426,21 @@ async fn op_load_image_inner(
             // the W-TinyLFU admission filter before `finish_load()` has a
             // chance to pin it as a live alias; texImage2D(image) then misses
             // one frame later even though the Image object is alive.
-            let pre_pinned_io_key = if force_rgba_for_webgl {
+            // The WebGL flag is monotonic and is sampled again by the actual
+            // decode worker. Pre-pin unconditionally so a request that queued
+            // before WebGL creation but starts afterwards cannot have its
+            // newly-required RGBA backing rejected by W-TinyLFU admission.
+            let pre_pinned_io_key = {
                 let key = cache::to_io_cache_key(&cache_key);
                 io::global_cache().pin(&key);
                 Some(key)
-            } else {
-                None
             };
             info!(
-                "op_load_image start loader: image_id={}, shared_id={}, src={}, force_rgba_for_webgl={}",
-                image_id, shared_id, src, force_rgba_for_webgl
+                "op_load_image start loader: image_id={}, shared_id={}, src={}, cpu_backing_required={}",
+                image_id,
+                shared_id,
+                src,
+                cpu_backing_required.load(std::sync::atomic::Ordering::Acquire)
             );
 
             let decoded = match io::image_ops::read_image_rgba8(
@@ -428,7 +453,9 @@ async fn op_load_image_inner(
                 game_cache_dir.clone(),
                 gpu_caps,
                 mount_table.clone(),
-                force_rgba_for_webgl,
+                io::image_ops::ImageDecodePolicy::PreferGpuNative {
+                    cpu_backing_required,
+                },
             )
             .await
             {
@@ -556,21 +583,17 @@ async fn op_load_image_inner(
 /// Common upload path for inline-bytes loaders (`data:` / `http(s)://`).
 ///
 /// Identical in shape to the local-file flow (begin_load → shared_id →
-/// LoadImage → finish_load), but decode is performed inline on the host
-/// instead of routed through `read_image_rgba8`.
+/// LoadImage → finish_load). Parsing and decode have already run through the
+/// shared bounded image worker path before this upload stage.
 async fn upload_inline_image(
     canvas_ctx: CanvasOpState,
     image_id: u32,
+    shared_id: u32,
     cache_key: cache::ImageCacheKey,
     decoded: shared::protocol::io_cmd::DecodedImage,
     src_label: &str,
 ) -> EngineResult<(u32, (usize, usize))> {
     use shared::protocol::io_cmd::DecodedImage;
-    let shared_id = cache::alloc_shared_id();
-    {
-        let mut c = cache::IMAGE_CACHE.lock();
-        c.register_inflight_alias(image_id, shared_id);
-    }
     // Extract dimensions for the error-path logging below; both
     // variants can report their own width/height without needing
     // a CPU-side copy.
@@ -662,7 +685,9 @@ async fn upload_inline_image(
 }
 
 async fn load_image_from_inline_bytes(
-    _state: Rc<RefCell<OpState>>,
+    scheduler: std::sync::Arc<io::scheduler::IoScheduler>,
+    gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
+    cpu_backing_required: std::sync::Arc<std::sync::atomic::AtomicBool>,
     canvas_ctx: CanvasOpState,
     image_id: u32,
     src: String,
@@ -674,36 +699,14 @@ async fn load_image_from_inline_bytes(
         image_id,
         src.len()
     );
-    let payload = inline_src::parse_data_url(&src)?;
-    let hint = if payload.mime.is_empty() {
-        None
-    } else {
-        Some(payload.mime.as_str())
-    };
-    // Prefer the platform-optimised path (AHB zero-copy on Android
-    // API >= 26) when the caller didn't ask for a resize.  AHB
-    // buffers are opaque GPU handles, so the resize case still has
-    // to go through the RGBA decoder.
-    let force_rgba_for_webgl = {
-        let op = _state.borrow();
-        op.borrow::<HostOpState>()
-            .webgl_context_created
-            .load(std::sync::atomic::Ordering::Relaxed)
-    };
-    let decoded = match (target_width, target_height) {
-        (Some(tw), Some(th)) if tw > 0 && th > 0 => shared::protocol::io_cmd::DecodedImage::Rgba(
-            inline_src::decode_inline_bytes(&payload.bytes, hint, Some(tw), Some(th))?,
-        ),
-        _ if force_rgba_for_webgl => shared::protocol::io_cmd::DecodedImage::Rgba(
-            inline_src::decode_inline_bytes(&payload.bytes, hint, None, None)?,
-        ),
-        _ => inline_src::decode_inline_bytes_any(&payload.bytes, hint)?,
-    };
-
-    // Key the dedup table by the full data URL so two Image objects
-    // assigned the same `data:` string share a GPU texture.  Data
-    // URLs are immutable by definition → generation = 0.
-    let cache_key = cache::make_cache_key(&src, target_width, target_height, 0);
+    // Reject pathological metadata/payload lengths before hashing or cloning
+    // the source into cache state. The fixed-size SHA-256 identity prevents an
+    // otherwise-valid multi-megabyte data URL from being duplicated across
+    // the cache's source/alias/loading maps. Data URLs are immutable, so the
+    // generation remains zero.
+    inline_src::validate_data_url_cache_input(&src)?;
+    let cache_identity = data_url_cache_identity(&src);
+    let cache_key = cache::make_cache_key(&cache_identity, target_width, target_height, 0);
 
     // Replace any prior alias (mirrors the local-file flow).
     if let Some(to_destroy) = {
@@ -713,7 +716,6 @@ async fn load_image_from_inline_bytes(
         dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
     }
 
-    let label = format!("data:[{}b]", payload.bytes.len());
     match {
         let mut c = cache::IMAGE_CACHE.lock();
         c.begin_load(image_id, &cache_key)
@@ -731,13 +733,68 @@ async fn load_image_from_inline_bytes(
             Err(_) => shared::bail!(ErrorCode::Cancelled, "data url wait canceled"),
         },
         cache::BeginLoadResult::StartLoading => {
-            upload_inline_image(canvas_ctx, image_id, cache_key, decoded, &label).await
+            let shared_id = cache::alloc_shared_id();
+            {
+                let mut c = cache::IMAGE_CACHE.lock();
+                c.register_inflight_alias(image_id, shared_id);
+            }
+
+            let encoded_len = src.len();
+            let result =
+                io::image_ops::run_bounded_inline_image_job(scheduler, encoded_len, move || {
+                    let payload = inline_src::parse_data_url(&src)?;
+                    let hint = if payload.mime.is_empty() {
+                        None
+                    } else {
+                        Some(payload.mime.as_str())
+                    };
+                    // Prefer the API-26 AHB path only if the live worker-time
+                    // capability and WebGL policy still permit GPU-only pixels.
+                    let allow_ahb = ahb_image_decode_allowed(&gpu_caps, &cpu_backing_required);
+                    let decoded = match (target_width, target_height) {
+                        (Some(tw), Some(th)) if tw > 0 && th > 0 => {
+                            shared::protocol::io_cmd::DecodedImage::Rgba(
+                                inline_src::decode_inline_bytes(
+                                    &payload.bytes,
+                                    hint,
+                                    Some(tw),
+                                    Some(th),
+                                )?,
+                            )
+                        }
+                        _ => inline_src::decode_inline_bytes_any(&payload.bytes, hint, allow_ahb)?,
+                    };
+                    Ok((decoded, payload.bytes.len()))
+                })
+                .await;
+
+            match result {
+                Ok((decoded, payload_len)) => {
+                    let label = format!("data:[{}b]", payload_len);
+                    upload_inline_image(canvas_ctx, image_id, shared_id, cache_key, decoded, &label)
+                        .await
+                }
+                Err(e) => {
+                    let mut c = cache::IMAGE_CACHE.lock();
+                    let _ = c.finish_load(
+                        image_id,
+                        shared_id,
+                        &cache_key,
+                        &cache_key,
+                        Err(engine_err_to_text(&e)),
+                    );
+                    Err(e)
+                }
+            }
         }
     }
 }
 
 async fn load_image_from_http(
     state: Rc<RefCell<OpState>>,
+    scheduler: std::sync::Arc<io::scheduler::IoScheduler>,
+    gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
+    cpu_backing_required: std::sync::Arc<std::sync::atomic::AtomicBool>,
     canvas_ctx: CanvasOpState,
     image_id: u32,
     src: String,
@@ -759,7 +816,7 @@ async fn load_image_from_http(
         dispatch_destroy_image(&canvas_ctx.tx, to_destroy, "image cache eviction");
     }
 
-    let start = match {
+    match {
         let mut c = cache::IMAGE_CACHE.lock();
         c.begin_load(image_id, &cache_key)
     } {
@@ -775,46 +832,46 @@ async fn load_image_from_http(
                 Err(_) => shared::bail!(ErrorCode::Cancelled, "http wait canceled"),
             };
         }
-        cache::BeginLoadResult::StartLoading => (),
-    };
-    let _ = start;
+        cache::BeginLoadResult::StartLoading => {}
+    }
+
+    let shared_id = cache::alloc_shared_id();
+    {
+        let mut c = cache::IMAGE_CACHE.lock();
+        c.register_inflight_alias(image_id, shared_id);
+    }
 
     // Active fetch + decode.  Any failure must still call finish_load
     // so joiners unblock (mirrors the local-file error path).  AHB
     // fast path activates when no resize is requested; resize forces
     // the RGBA route because Hardware Buffers are opaque.
-    let state_for_decode_policy = state.clone();
     let result: EngineResult<shared::protocol::io_cmd::DecodedImage> = async {
         let bytes = inline_src::fetch_http_image(state, &src).await?;
-        let force_rgba_for_webgl = {
-            let op = state_for_decode_policy.borrow();
-            op.borrow::<HostOpState>()
-                .webgl_context_created
-                .load(std::sync::atomic::Ordering::Relaxed)
-        };
-        match (target_width, target_height) {
-            (Some(tw), Some(th)) if tw > 0 && th > 0 => {
-                Ok(shared::protocol::io_cmd::DecodedImage::Rgba(
-                    inline_src::decode_inline_bytes(&bytes, None, Some(tw), Some(th))?,
-                ))
+        let encoded_len = bytes.len();
+        io::image_ops::run_bounded_inline_image_job(scheduler, encoded_len, move || {
+            let allow_ahb = ahb_image_decode_allowed(&gpu_caps, &cpu_backing_required);
+            match (target_width, target_height) {
+                (Some(tw), Some(th)) if tw > 0 && th > 0 => {
+                    Ok(shared::protocol::io_cmd::DecodedImage::Rgba(
+                        inline_src::decode_inline_bytes(&bytes, None, Some(tw), Some(th))?,
+                    ))
+                }
+                _ => inline_src::decode_inline_bytes_any(&bytes, None, allow_ahb),
             }
-            _ if force_rgba_for_webgl => Ok(shared::protocol::io_cmd::DecodedImage::Rgba(
-                inline_src::decode_inline_bytes(&bytes, None, None, None)?,
-            )),
-            _ => inline_src::decode_inline_bytes_any(&bytes, None),
-        }
+        })
+        .await
     }
     .await;
 
     match result {
-        Ok(decoded) => upload_inline_image(canvas_ctx, image_id, cache_key, decoded, &src).await,
+        Ok(decoded) => {
+            upload_inline_image(canvas_ctx, image_id, shared_id, cache_key, decoded, &src).await
+        }
         Err(e) => {
             let msg = engine_err_to_text(&e);
             // Finish the load with error so any pending joiners unblock.
-            // Shared id doesn't exist yet; use a dummy (0) that will be
-            // discarded along with the error result.
             let mut c = cache::IMAGE_CACHE.lock();
-            let _ = c.finish_load(image_id, 0, &cache_key, &cache_key, Err(msg));
+            let _ = c.finish_load(image_id, shared_id, &cache_key, &cache_key, Err(msg));
             Err(e)
         }
     }
@@ -912,7 +969,7 @@ async fn op_load_image_subrect_inner(
             host.vfs.clone(),
             host.mount_table.clone(),
             gcd,
-            host.gpu_caps.snapshot(),
+            host.gpu_caps.clone(),
             op.borrow::<CanvasOpState>().clone(),
         )
     };
@@ -989,7 +1046,7 @@ async fn op_load_image_subrect_inner(
         game_cache_dir,
         gpu_caps,
         mount_table,
-        true,
+        io::image_ops::ImageDecodePolicy::RgbaOnly,
     )
     .await?;
 
@@ -1268,7 +1325,18 @@ pub(super) fn image_lazy_extensions() -> Vec<deno_core::Extension> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resized_rgba_io_cache_key, variant_source_version_token};
+    use super::{data_url_cache_identity, resized_rgba_io_cache_key, variant_source_version_token};
+
+    #[test]
+    fn data_url_cache_identity_is_fixed_size_and_content_addressed() {
+        let first = data_url_cache_identity("data:image/png;base64,AAAA");
+        let same = data_url_cache_identity("data:image/png;base64,AAAA");
+        let different = data_url_cache_identity("data:image/png;base64,AAAB");
+
+        assert_eq!(first, same);
+        assert_ne!(first, different);
+        assert_eq!(first.len(), "data:sha256:".len() + 64);
+    }
 
     #[test]
     fn companion_appearing_invalidates_variant_token() {

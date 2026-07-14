@@ -35,6 +35,24 @@ const EGL_NO_CONTEXT: *const c_void = std::ptr::null();
 const EGL_NONE: i32 = 0x3038;
 const EGL_IMAGE_PRESERVED_KHR: i32 = 0x30D2;
 const EGL_TRUE: i32 = 1;
+const MAX_STALE_GL_ERRORS: usize = 32;
+
+/// Drain errors left by earlier GL work before attributing a later error to
+/// the EGLImage import. The bound protects against a lost/broken vendor
+/// context that never returns `GL_NO_ERROR`.
+fn drain_stale_gl_errors(mut get_error: impl FnMut() -> u32) -> EngineResult<usize> {
+    for drained in 0..MAX_STALE_GL_ERRORS {
+        if get_error() == glow::NO_ERROR {
+            return Ok(drained);
+        }
+    }
+
+    Err(
+        EngineError::new(ErrorCode::RenderBackendError).with_detail(format!(
+            "stale GL error queue did not drain after {MAX_STALE_GL_ERRORS} reads"
+        )),
+    )
+}
 
 // --- Function pointer types ---
 
@@ -226,6 +244,21 @@ pub unsafe fn import_ahb_as_texture(
         );
     }
 
+    // `glGetError` is sticky across unrelated commands. Drain the old queue
+    // before issuing any GL command for this import, otherwise a prior error
+    // can be misattributed to a valid AHB and permanently trip the session
+    // circuit breaker. A non-draining queue is treated as a broken context.
+    let stale_errors = match drain_stale_gl_errors(|| gl.get_error()) {
+        Ok(count) => count,
+        Err(error) => {
+            (fns.destroy_image)(egl_display, egl_image);
+            return Err(error);
+        }
+    };
+    if stale_errors != 0 {
+        tracing::debug!(stale_errors, "drained stale GL errors before AHB import");
+    }
+
     // Create GL texture and bind EGLImage
     let tex = gl.create_texture().map_err(|e| {
         (fns.destroy_image)(egl_display, egl_image);
@@ -267,7 +300,7 @@ pub unsafe fn import_ahb_as_texture(
         gl.delete_texture(tex);
         return Err(
             shared::error::EngineError::new(ErrorCode::RenderBackendError).with_detail(format!(
-                "glEGLImageTargetTexture2DOES failed: gl_error=0x{gl_err:X}"
+                "AHB GL import sequence failed: gl_error=0x{gl_err:X}"
             )),
         );
     }
@@ -279,4 +312,33 @@ pub unsafe fn import_ahb_as_texture(
         width,
         height,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorCode, drain_stale_gl_errors};
+
+    #[test]
+    fn stale_gl_errors_are_drained_before_import_error_attribution() {
+        let mut errors = [glow::INVALID_ENUM, glow::INVALID_OPERATION, glow::NO_ERROR].into_iter();
+        let drained = drain_stale_gl_errors(|| errors.next().unwrap_or(glow::NO_ERROR))
+            .expect("finite stale error queue should drain");
+
+        assert_eq!(drained, 2);
+    }
+
+    #[test]
+    fn non_draining_gl_error_queue_fails_closed() {
+        let error = drain_stale_gl_errors(|| glow::INVALID_OPERATION)
+            .expect_err("a broken context must not spin forever");
+
+        assert_eq!(error.code, ErrorCode::RenderBackendError);
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("stale GL error queue")
+        );
+    }
 }

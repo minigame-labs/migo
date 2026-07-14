@@ -1,8 +1,9 @@
 //! V8 startup snapshot generator for the Migo JS runtime.
 //!
 //! Generates a serialized V8 heap snapshot containing all pre-parsed and
-//! pre-compiled extension JS modules.  Loading from this snapshot at runtime
-//! eliminates ~150–300 ms of JS parsing/compilation on cold start.
+//! pre-compiled extension JS modules. Loading from this snapshot avoids source
+//! parsing/compilation at runtime; actual device latency and size tradeoffs
+//! require matched measurement.
 //!
 //! # Usage
 //!
@@ -14,11 +15,11 @@
 //! # Cross-compile to the target ABI (see crates/js-runtime memory notes for
 //! # the exact RUSTY_V8_ARCHIVE / cargo-ndk invocation), push to the device,
 //! # then run with MIGO_SNAPSHOT_OUT and `adb pull` the result into
-//! # crates/js-runtime/snapshots/SNAPSHOT-<arch>.bin.
+//! # crates/js-runtime/snapshots/SNAPSHOT-<profile>-<arch>.bin.
 //! ```
 //!
 //! When run without `MIGO_SNAPSHOT_OUT`, it writes to
-//! `crates/js-runtime/snapshots/SNAPSHOT-<arch>.bin` (arch = the ABI this
+//! `crates/js-runtime/snapshots/SNAPSHOT-<profile>-<arch>.bin` (arch = the ABI this
 //! binary was compiled for). `js-runtime/build.rs` embeds the matching file
 //! for android targets at compile time.
 //!
@@ -37,14 +38,60 @@
 
 use std::path::PathBuf;
 
+#[cfg(all(feature = "profile-full", feature = "profile-slim"))]
+compile_error!("profile-full and profile-slim are mutually exclusive");
+
+#[cfg(feature = "profile-slim")]
+const PRODUCT_PROFILE: &str = "slim";
+#[cfg(not(feature = "profile-slim"))]
+const PRODUCT_PROFILE: &str = "full";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotKind {
+    Host,
+    Worker,
+}
+
+impl SnapshotKind {
+    fn from_env() -> Self {
+        match std::env::var("MIGO_SNAPSHOT_KIND") {
+            Ok(value) if value == "host" => Self::Host,
+            Ok(value) if value == "worker" => Self::Worker,
+            Ok(value) => panic!("invalid MIGO_SNAPSHOT_KIND={value:?}; expected host|worker"),
+            Err(std::env::VarError::NotPresent) => Self::Host,
+            Err(error) => panic!("MIGO_SNAPSHOT_KIND is not valid Unicode: {error}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Worker => "worker",
+        }
+    }
+}
+
 fn main() {
+    let snapshot_kind = SnapshotKind::from_env();
+    #[cfg(feature = "profile-slim")]
+    if snapshot_kind == SnapshotKind::Worker {
+        panic!("Worker snapshot requires product profile full");
+    }
+
     // Initialize V8 platform (required before any V8 operations).
     deno_core::JsRuntime::init_platform(None);
 
-    let extensions = js_runtime::snapshot::lazy_extensions();
+    let extensions = match snapshot_kind {
+        SnapshotKind::Host => js_runtime::snapshot::lazy_extensions(),
+        #[cfg(feature = "profile-full")]
+        SnapshotKind::Worker => js_runtime::snapshot::worker_lazy_extensions(),
+        #[cfg(feature = "profile-slim")]
+        SnapshotKind::Worker => unreachable!("Worker+slim rejected before V8 initialization"),
+    };
 
     println!(
-        "Creating V8 snapshot with {} extensions...",
+        "Creating {} V8 snapshot with {} extensions...",
+        snapshot_kind.as_str(),
         extensions.len()
     );
     for ext in &extensions {
@@ -58,7 +105,29 @@ fn main() {
             skip_op_registration: false,
             extensions,
             extension_transpiler: None,
-            with_runtime_cb: None,
+            with_runtime_cb: match snapshot_kind {
+                SnapshotKind::Host => None,
+                SnapshotKind::Worker => Some(Box::new(|rt| {
+                    rt.execute_script(
+                        "worker-snapshot-generation-check",
+                        "if (typeof Deno.core.eventLoopTick !== 'function') throw new Error('Deno.core callbacks missing');\n\
+                         if (typeof globalThis.__migoStartWorkerMessagePump !== 'function') throw new Error('deferred Worker pump hook missing');",
+                    )
+                    .expect("Worker snapshot bootstrap must remain restorable");
+                    let mut context =
+                        std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(
+                        matches!(
+                            rt.poll_event_loop(
+                                &mut context,
+                                deno_core::PollEventLoopOptions::default()
+                            ),
+                            std::task::Poll::Ready(Ok(()))
+                        ),
+                        "Worker snapshot must not capture a pending receive op"
+                    );
+                })),
+            },
         },
         None, // no warmup script
     )
@@ -69,7 +138,7 @@ fn main() {
     // are platform-bound, so each ABI's snapshot must be produced by the SAME
     // android V8 the .so links), where the host CARGO_MANIFEST_DIR doesn't
     // exist: write to e.g. /data/local/tmp/SNAPSHOT.bin then `adb pull` it into
-    // `crates/js-runtime/snapshots/SNAPSHOT-<arch>.bin`.
+    // `crates/js-runtime/snapshots/SNAPSHOT-<profile>-<arch>.bin`.
     //
     // The default path is per-arch (`std::env::consts::ARCH` is the arch this
     // generator was compiled for), matching what `js-runtime/build.rs` selects.
@@ -80,7 +149,18 @@ fn main() {
             "..",
             "js-runtime",
             "snapshots",
-            &format!("SNAPSHOT-{}.bin", std::env::consts::ARCH),
+            &match snapshot_kind {
+                SnapshotKind::Host => format!(
+                    "SNAPSHOT-{}-{}.bin",
+                    PRODUCT_PROFILE,
+                    std::env::consts::ARCH
+                ),
+                SnapshotKind::Worker => format!(
+                    "SNAPSHOT-worker-{}-{}.bin",
+                    PRODUCT_PROFILE,
+                    std::env::consts::ARCH
+                ),
+            },
         ]
         .iter()
         .collect(),

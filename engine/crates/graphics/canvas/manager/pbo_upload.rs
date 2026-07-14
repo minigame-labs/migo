@@ -46,6 +46,15 @@ pub struct PboUploadResult {
     pub height: u32,
 }
 
+#[inline]
+fn should_try_ahb_upload(
+    device_available: bool,
+    session_enabled: bool,
+    display_available: bool,
+) -> bool {
+    device_available && session_enabled && display_available
+}
+
 /// Check if OpenGL ES 3.0+ is available (required for PBO)
 ///
 /// Returns true if PBOs can be used
@@ -497,21 +506,36 @@ pub fn upload_texture_tiered(
     use_pbo: bool,
     pool: Option<&mut PboPool>,
     device_caps: &crate::device_caps::DeviceCapabilities,
+    gpu_caps: &shared::device::gpu_caps::GpuCaps,
     egl_display_ptr: *const std::ffi::c_void,
 ) -> EngineResult<PboUploadResult> {
+    let try_ahb = should_try_ahb_upload(
+        device_caps.ahb_available,
+        gpu_caps.snapshot().ahb,
+        !egl_display_ptr.is_null(),
+    );
+
     // AHB path: decode RGBA → AHardwareBuffer → EGLImage → GL texture.
     #[cfg(target_os = "android")]
-    if device_caps.ahb_available && !egl_display_ptr.is_null() {
+    if try_ahb {
         match try_ahb_upload(gl, image, egl_display_ptr) {
             Ok(result) => return Ok(result),
             Err(e) => {
+                if gpu_caps.disable_ahb() {
+                    shared::stats::io_metrics_global().record_ahb_fallback(
+                        shared::stats::AhbFallbackReason::HardwareBufferUnavailable,
+                    );
+                    shared::warn_once!(
+                        "Legacy RGBA-to-AHB upload failed; disabling AHB for this host session ({e})"
+                    );
+                }
                 debug!("AHB upload failed, falling back to PBO: {e}");
             }
         }
     }
 
     #[cfg(not(target_os = "android"))]
-    let _ = egl_display_ptr; // unused off-Android
+    let _ = try_ahb; // selection is still unit-tested off-Android
 
     // Fallback: immutable PBO, mutable PBO, or synchronous upload.
     let has_tex_storage = device_caps.gles_version >= (3, 0);
@@ -532,7 +556,7 @@ fn try_ahb_upload(
     // zero-memcpy path — decoder writes straight into AHB — lives in
     // [`upload_ahb_image`]; `CanvasCmd::LoadImage` routes to it when
     // the caller has a [`DecodedImage::HardwareBuffer`] already.
-    let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled(image.width, image.height))
+    let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled_cpu_decode(image.width, image.height))
         .map_err(|e| format!("AHB allocate: {e}"))?;
     write_rgba_into_ahb(&ahb, &image.rgba).map_err(|e| format!("AHB write: {e}"))?;
 
@@ -562,6 +586,14 @@ mod tests {
     // Path selection is a pure function — exhaustive decision-table tests
     // below run without any GL context.  Full-stack upload tests require a
     // GL context and live in the on-device integration suite.
+
+    #[test]
+    fn legacy_ahb_upload_obeys_the_session_circuit_breaker() {
+        assert!(should_try_ahb_upload(true, true, true));
+        assert!(!should_try_ahb_upload(false, true, true));
+        assert!(!should_try_ahb_upload(true, false, true));
+        assert!(!should_try_ahb_upload(true, true, false));
+    }
 
     #[test]
     fn select_path_prefers_immutable_when_everything_available() {

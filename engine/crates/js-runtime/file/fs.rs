@@ -117,6 +117,11 @@ fn read_request(backend: BackendKind, request: RequestKind, length: Option<u64>)
 }
 
 #[inline]
+fn archive_read_request() -> IoRequest {
+    read_request(BackendKind::Archive, RequestKind::Async, None)
+}
+
+#[inline]
 fn copy_request(backend: BackendKind, request: RequestKind) -> IoRequest {
     IoRequest::ReadFile {
         backend,
@@ -151,6 +156,21 @@ where
         .await
         .map_err(pool_err)?
         .map_err(IOError::from)
+}
+
+/// Run a blocking file-table operation through the bounded filesystem class.
+/// Keep `DomainError` distinct until the final flattening so closed-domain and
+/// filesystem errors retain their existing JS-visible messages.
+async fn run_domain_async<T, F>(scheduler: Arc<IoScheduler>, job: F) -> Result<T, IOError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, DomainError> + Send + 'static,
+{
+    scheduler
+        .run_async(fs_op_request(RequestKind::Async), job)
+        .await
+        .map_err(pool_err)?
+        .map_err(domain_err)
 }
 
 /// Run a blocking fs job through the scheduler on the sync path. Sync
@@ -775,7 +795,7 @@ pub async fn op_open_file(
     let cleanup_on_error = cleanup_path.clone();
     let cleanup_path_for_open = cleanup_path.map(PathBuf::from);
 
-    tokio::task::spawn_blocking(move || {
+    let result = run_domain_async(Arc::clone(&scheduler), move || {
         domain.open_file(
             PathBuf::from(full_path).as_path(),
             open_flag,
@@ -783,16 +803,16 @@ pub async fn op_open_file(
             synthetic_stat,
         )
     })
-    .await
-    .map_err(|e| ioerr(format!("task join error: {e}")))?
-    .map_err(|e| {
+    .await;
+
+    if result.is_err() {
         if let Some(path) = cleanup_on_error {
             scheduler
                 .domain()
                 .remove_temp_file(std::path::Path::new(&path));
         }
-        domain_err(e)
-    })
+    }
+    result
 }
 
 #[op2(fast)]
@@ -857,10 +877,11 @@ pub fn op_open_file_sync(
 
 #[op2(async(lazy), fast)]
 pub async fn op_close_file(state: Rc<RefCell<OpState>>, #[smi] rid: FileId) -> Result<(), IOError> {
-    let domain = {
+    let scheduler = {
         let st = state.borrow();
-        get_scheduler(&st).domain()
+        get_scheduler(&st)
     };
+    let domain = scheduler.domain();
 
     domain.close_file(rid).map_err(domain_err)
 }
@@ -1277,13 +1298,15 @@ pub async fn op_write_file(
     #[string] encoding: Option<String>,
     #[bigint] position: Option<u64>,
 ) -> Result<usize, IOError> {
-    let domain = {
+    let scheduler = {
         let st = state.borrow();
-        get_scheduler(&st).domain()
+        get_scheduler(&st)
     };
+    let domain = scheduler.domain();
     let (buf_opt, data_opt) = prepare_data(data_buf, data_str, encoding)?;
 
-    // Extract bytes from SharedRef before spawn_blocking (SharedRef is not Send).
+    // Extract bytes from SharedRef before crossing the worker boundary
+    // (SharedRef is not Send).
     let bytes: Vec<u8> = if let Some((store, range)) = buf_opt {
         copy_backing_store_bytes(&store, range)?
     } else if let Some(data) = data_opt {
@@ -1292,10 +1315,7 @@ pub async fn op_write_file(
         return Err(ioerr("No data provided"));
     };
 
-    tokio::task::spawn_blocking(move || domain.write_file(rid, &bytes, position))
-        .await
-        .map_err(|e| ioerr(format!("task join error: {e}")))?
-        .map_err(domain_err)
+    run_domain_async(scheduler, move || domain.write_file(rid, &bytes, position)).await
 }
 
 #[op2]
@@ -1701,10 +1721,11 @@ pub async fn op_read_zip_entry(
             }
         };
 
-    let results = tokio::task::spawn_blocking(move || {
-        fs_ops::read_zip_entry(&full_path, &entries_json, pack_data)
-    })
-    .await;
+    let results = scheduler
+        .run_async(archive_read_request(), move || {
+            fs_ops::read_zip_entry(&full_path, &entries_json, pack_data)
+        })
+        .await;
 
     if let Some(path) = &cleanup_path {
         scheduler
@@ -1712,9 +1733,7 @@ pub async fn op_read_zip_entry(
             .remove_temp_file(std::path::Path::new(path));
     }
 
-    let results = results
-        .map_err(|e| ioerr(format!("task join error: {e}")))?
-        .map_err(IOError::from)?;
+    let results = results.map_err(pool_err)?.map_err(IOError::from)?;
 
     // Build serde_json::Value — serde_v8 serializes this directly to a V8 object
     // (no JSON stringify/parse round-trip).
@@ -1921,20 +1940,180 @@ pub async fn op_list_saved_files(
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         io,
+        panic::{AssertUnwindSafe, catch_unwind},
         path::{Path, PathBuf},
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        task::{Context, Poll, Waker},
+        time::Duration,
     };
 
-    use ::io::scheduler::IoScheduler;
-    use shared::vfs::{MountBackend, MountTable};
+    use ::io::{
+        domain::DomainError,
+        scheduler::{IoScheduler, RouteDecision},
+        task::PoolKind,
+    };
+    use shared::{
+        protocol::io_cmd::OpenFlag,
+        vfs::{MountBackend, MountTable},
+    };
 
     use super::{
-        copy_pack_file_async, materialize_pack_to_temp_async, materialize_pack_to_temp_checked,
+        IOError, archive_read_request, copy_pack_file_async, materialize_pack_to_temp_async,
+        materialize_pack_to_temp_checked, run_domain_async,
     };
+
+    #[test]
+    fn q12_production_file_ops_do_not_escape_to_tokio_blocking_pool() {
+        let source = include_str!("fs.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("fs production source");
+
+        assert!(
+            !production.contains("tokio::task::spawn_blocking"),
+            "production file ops still bypass the bounded R5 executor"
+        );
+    }
+
+    #[test]
+    fn q12_async_domain_jobs_run_on_r5_fs_worker() {
+        let scheduler = Arc::new(IoScheduler::new(1210));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let thread_name = runtime
+            .block_on(run_domain_async(scheduler, || {
+                Ok::<_, DomainError>(
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("unnamed")
+                        .to_string(),
+                )
+            }))
+            .unwrap();
+
+        assert!(thread_name.starts_with("Migo-IO-"));
+    }
+
+    #[test]
+    fn q12_domain_adapter_preserves_open_and_positioned_write_semantics() {
+        let dir = temp_dir("q12_domain_file_semantics");
+        let path = dir.join("file.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let scheduler = Arc::new(IoScheduler::new(1215));
+        let domain = scheduler.domain();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let domain_for_open = Arc::clone(&domain);
+        let path_for_open = path.clone();
+        let rid = runtime
+            .block_on(run_domain_async(Arc::clone(&scheduler), move || {
+                domain_for_open.open_file(&path_for_open, OpenFlag::ReadWrite, None, None)
+            }))
+            .unwrap();
+        let domain_for_write = Arc::clone(&domain);
+        let written = runtime
+            .block_on(run_domain_async(Arc::clone(&scheduler), move || {
+                domain_for_write.write_file(rid, b"Z", Some(1))
+            }))
+            .unwrap();
+
+        assert_eq!(written, 1);
+        domain.close_file(rid).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"aZc");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn q12_zip_entry_reads_use_archive_class() {
+        let scheduler = IoScheduler::new(1211);
+
+        assert_eq!(
+            scheduler.classify(&archive_read_request()),
+            RouteDecision::Delegated(PoolKind::Archive)
+        );
+    }
+
+    #[test]
+    fn q12_closed_scheduler_rejects_domain_job_before_it_runs() {
+        let scheduler = Arc::new(IoScheduler::new(1212));
+        scheduler.close();
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_job = Arc::clone(&ran);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = runtime.block_on(run_domain_async(scheduler, move || {
+            ran_in_job.store(true, Ordering::SeqCst);
+            Ok::<_, DomainError>(())
+        }));
+
+        assert!(matches!(
+            result,
+            Err(IOError::Message(ref message)) if message == "IO worker pool closed"
+        ));
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn q12_cancelling_waiter_does_not_abort_in_flight_domain_job() {
+        let scheduler = Arc::new(IoScheduler::new(1213));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let mut future = Box::pin(run_domain_async(scheduler, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            finished_tx.send(()).unwrap();
+            Ok::<_, DomainError>(())
+        }));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            Future::poll(future.as_mut(), &mut context),
+            Poll::Pending
+        ));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(future);
+        release_tx.send(()).unwrap();
+
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn q12_domain_adapter_preserves_worker_panic_payload() {
+        let scheduler = Arc::new(IoScheduler::new(1214));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _: Result<(), IOError> = runtime.block_on(run_domain_async(scheduler, || {
+                panic!("q12-domain-worker-panic")
+            }));
+        }));
+        let payload = result.expect_err("worker panic must propagate to the host boundary");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+
+        assert_eq!(message, Some("q12-domain-worker-panic"));
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("migo_js_file_{label}_{}", std::process::id()));

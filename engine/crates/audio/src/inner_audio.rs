@@ -998,7 +998,10 @@ mod tests {
             .into_iter()
             .filter(|e| matches!(e.event_type, InnerAudioEventType::TimeUpdate))
             .count();
-        assert_eq!(first, 1, "a multi-interval block emits at most one TimeUpdate");
+        assert_eq!(
+            first, 1,
+            "a multi-interval block emits at most one TimeUpdate"
+        );
         assert!(
             player.frames_since_time_update < interval,
             "no interval-sized backlog may remain after emitting"
@@ -1011,6 +1014,9 @@ mod tests {
             .into_iter()
             .filter(|e| matches!(e.event_type, InnerAudioEventType::TimeUpdate))
             .count();
-        assert_eq!(second, 0, "a small next block must not over-fire from backlog");
+        assert_eq!(
+            second, 0,
+            "a small next block must not over-fire from backlog"
+        );
     }
 }

@@ -1,0 +1,7 @@
+{
+    "productProfile": "full",
+    "buildType": "release",
+    "codegenProfile": "3",
+    "cargoProfile": "release-hot3",
+    "buildTime": "2026-07-14 08:56:28"
+}

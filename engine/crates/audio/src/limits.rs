@@ -134,6 +134,8 @@ mod tests {
     #[test]
     fn pcm_samples_budget_boundary() {
         assert!(pcm_samples_within_budget(MAX_AUDIO_PCM_SAMPLES as usize));
-        assert!(!pcm_samples_within_budget(MAX_AUDIO_PCM_SAMPLES as usize + 1));
+        assert!(!pcm_samples_within_budget(
+            MAX_AUDIO_PCM_SAMPLES as usize + 1
+        ));
     }
 }

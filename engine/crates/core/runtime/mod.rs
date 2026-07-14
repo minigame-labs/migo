@@ -10,8 +10,12 @@ pub mod registry;
 pub mod thread;
 pub mod vsync;
 
-#[cfg(feature = "v8-limits")]
-pub mod watchdog;
+#[cfg(test)]
+mod tests_q12_contract;
+#[cfg(test)]
+mod tests_q13_contract;
+#[cfg(test)]
+mod tests_r4_contract;
 
 pub use registry::{
     bump_destroy_epoch, current_destroy_epoch, send_command_to_host, send_critical_command_to_host,

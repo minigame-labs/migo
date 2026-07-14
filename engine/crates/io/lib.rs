@@ -22,8 +22,8 @@ mod zip_extract;
 pub use derived_cache::{DEFAULT_DERIVED_CACHE_MAX_BYTES, PruneReport, prune_derived_cache};
 pub use fast_image_decoder::{
     CompressedImageInfo, crop_image, decode_image_fast, decode_image_to_any,
-    detect_compressed_format, register_platform_ahb_decoder, register_platform_decoder,
-    resize_image,
+    detect_compressed_format, probe_image_dimensions, register_platform_ahb_decoder,
+    register_platform_decoder, resize_image,
 };
 pub use image_cache::{CacheStats, CachedImage, ImageCache, global_cache};
 #[cfg(feature = "zip-extract")]

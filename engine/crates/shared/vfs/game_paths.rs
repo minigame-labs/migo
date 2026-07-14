@@ -129,6 +129,19 @@ impl GamePaths {
         &self.code_dir
     }
 
+    /// Persistent receipt for the sealed code tree. It is deliberately a
+    /// sibling of `/code`: game VFS access cannot reach it and Android cache
+    /// eviction does not discard the verification result.
+    pub fn integrity_receipt_path(&self) -> PathBuf {
+        self.code_dir
+            .with_file_name("code.integrity-receipt-v1.json")
+    }
+
+    /// Advisory process lock serializing receipt promotion for this game.
+    pub fn integrity_lock_path(&self) -> PathBuf {
+        self.integrity_receipt_path().with_extension("lock")
+    }
+
     /// Get the user data directory path (persistent).
     pub fn user_data_dir(&self) -> &Path {
         &self.user_data_dir
@@ -187,6 +200,7 @@ impl GamePaths {
         // Delete files dir (user_data + code)
         let files_game_dir = self.user_data_dir.parent().unwrap_or(&self.user_data_dir);
         if files_game_dir.exists() {
+            prepare_code_tree_for_removal(&self.code_dir)?;
             std::fs::remove_dir_all(files_game_dir)?;
         }
 
@@ -230,6 +244,45 @@ pub struct GamePathStrings {
     pub user_data_dir: String,
     pub cache_dir: String,
     pub temp_dir: String,
+}
+
+#[cfg(unix)]
+fn prepare_code_tree_for_removal(code_dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = match std::fs::symlink_metadata(code_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
+
+    let mut directories = vec![code_dir.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let metadata = std::fs::symlink_metadata(&directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        std::fs::set_permissions(
+            &directory,
+            std::fs::Permissions::from_mode(metadata.mode() | 0o300),
+        )?;
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                directories.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_code_tree_for_removal(_code_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Calculate directory size recursively.
@@ -288,5 +341,54 @@ mod tests {
         );
         assert!(paths.cache_dir().ends_with("migo/games/test-game"));
         assert!(paths.temp_dir().ends_with("migo/games/test-game/tmp"));
+    }
+
+    #[test]
+    fn integrity_receipt_is_persistent_sibling_of_code() {
+        let paths = GamePaths::new("/data/files", "/data/cache", "test-game").unwrap();
+
+        assert_eq!(
+            paths.integrity_receipt_path(),
+            PathBuf::from("/data/files/migo/games/test-game/code.integrity-receipt-v1.json")
+        );
+        assert_eq!(
+            paths.integrity_lock_path(),
+            PathBuf::from("/data/files/migo/games/test-game/code.integrity-receipt-v1.lock")
+        );
+        assert!(
+            !paths
+                .integrity_receipt_path()
+                .starts_with(paths.cache_dir())
+        );
+        assert!(!paths.integrity_receipt_path().starts_with(paths.code_dir()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_all_removes_a_sealed_code_tree_and_receipt() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join("migo_game_paths_sealed_delete");
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = GamePaths::new(root.join("files"), root.join("cache"), "sealed").unwrap();
+        paths.ensure_directories().unwrap();
+        std::fs::create_dir_all(paths.code_dir().join("nested")).unwrap();
+        std::fs::write(paths.code_dir().join("nested/game.js"), "code").unwrap();
+        std::fs::write(paths.integrity_receipt_path(), "receipt").unwrap();
+        std::fs::write(paths.integrity_lock_path(), "lock").unwrap();
+        for directory in [
+            paths.code_dir().join("nested"),
+            paths.code_dir().to_path_buf(),
+        ] {
+            let mode = std::fs::metadata(&directory).unwrap().mode();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode & !0o222))
+                .unwrap();
+        }
+
+        paths.delete_all().unwrap();
+
+        assert!(!root.join("files/migo/games/sealed").exists());
+        assert!(!root.join("cache/migo/games/sealed").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

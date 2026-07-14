@@ -225,3 +225,11 @@ impl RenderService {
         self.thread.shutdown_detached();
     }
 }
+
+impl Drop for RenderService {
+    fn drop(&mut self) {
+        // `Host::drop` performs the normal joined shutdown first. This fallback
+        // only has work on partial construction, `?` returns, or unwinding.
+        self.shutdown_detached();
+    }
+}

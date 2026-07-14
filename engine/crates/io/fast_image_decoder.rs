@@ -21,18 +21,24 @@ use crate::ktx2;
 static PLATFORM_DECODER: OnceLock<fn(&[u8]) -> Result<NormalizedImage, EngineError>> =
     OnceLock::new();
 
-/// Zero-copy AHB decoder hook. Android's `NativeExports.decodeImageAhb`
-/// hands back an `AHardwareBuffer*`; the Rust side wraps it as an
-/// [`AhbImage`] and the renderer imports it via `eglCreateImageKHR`
-/// without touching CPU pixel bytes.
+/// Zero-staging AHB decoder hook. Android's Rust/Skia decoder writes directly
+/// into an API-26 `AHardwareBuffer`; the renderer imports it via
+/// `eglCreateImageKHR` without materializing a tightly-packed RGBA `Vec`.
 ///
-/// When this hook is registered **and** succeeds, [`decode_image_fast`]
-/// returns the AHB variant; callers who need RGBA call `into_rgba()`
-/// explicitly.  The hook may fail on a per-image basis (e.g. decoder
+/// When this hook is registered, allowed, and succeeds,
+/// [`decode_image_to_any`] returns the AHB variant; callers who need RGBA use
+/// [`decode_image_fast`] directly. The hook may fail on a per-image basis (e.g. decoder
 /// OOM, AHB alloc refused by driver); on failure we transparently
 /// retry via [`PLATFORM_DECODER`] so the caller sees either a valid
 /// image or a single error, never a silent downgrade.
 static PLATFORM_AHB_DECODER: OnceLock<fn(&[u8]) -> Result<AhbImage, EngineError>> = OnceLock::new();
+
+type AhbDecoder = fn(&[u8]) -> Result<AhbImage, EngineError>;
+
+#[inline]
+fn select_ahb_decoder(allow_ahb: bool, decoder: Option<AhbDecoder>) -> Option<AhbDecoder> {
+    allow_ahb.then_some(decoder).flatten()
+}
 
 pub fn register_platform_decoder(f: fn(&[u8]) -> Result<NormalizedImage, EngineError>) {
     if PLATFORM_DECODER.set(f).is_ok() {
@@ -116,7 +122,7 @@ pub fn estimate_decoded_size(data: &[u8]) -> usize {
     const FALLBACK: usize = 2048 * 2048 * 4; // 16 MB
     const MAX_ESTIMATE: usize = 256 * 1024 * 1024; // 256 MB cap
 
-    if let Some((w, h)) = probe_dimensions(data) {
+    if let Some((w, h)) = probe_image_dimensions(data) {
         (w as usize)
             .checked_mul(h as usize)
             .and_then(|pixels| pixels.checked_mul(4))
@@ -140,17 +146,21 @@ pub use shared::protocol::io_cmd::MAX_IMAGE_PIXELS;
 pub(crate) fn enforce_pixel_cap(width: u32, height: u32) -> Result<(), EngineError> {
     let px = (width as u64).saturating_mul(height as u64);
     if px > MAX_IMAGE_PIXELS {
-        return Err(EngineError::new(ErrorCode::OutOfMemory).with_detail(format!(
-            "image {width}x{height} ({px} px) exceeds MAX_IMAGE_PIXELS ({} px); \
+        return Err(
+            EngineError::new(ErrorCode::OutOfMemory).with_detail(format!(
+                "image {width}x{height} ({px} px) exceeds MAX_IMAGE_PIXELS ({} px); \
              refusing decode to avoid OOM",
-            MAX_IMAGE_PIXELS
-        )));
+                MAX_IMAGE_PIXELS
+            )),
+        );
     }
     Ok(())
 }
 
-/// Try to read image dimensions from the file header.
-fn probe_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+/// Best-effort, allocation-free image-dimension probe for pre-decode resource
+/// limits. Callers must still validate the decoder's returned dimensions
+/// because unknown formats and malformed headers deliberately return `None`.
+pub fn probe_image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     // KTX2: compressed texture container -- width/height in header.
     if ktx2::is_ktx2(data) {
         if let Ok(f) = ktx2::parse_ktx2(data) {
@@ -298,7 +308,7 @@ pub fn decode_image_fast(
     // vector (PNG/JPEG/BMP/WebP/KTX2 with a tiny compressed body but huge
     // declared dimensions). Formats whose header we can't parse fall through to
     // guard #2 below.
-    if let Some((w, h)) = probe_dimensions(data) {
+    if let Some((w, h)) = probe_image_dimensions(data) {
         enforce_pixel_cap(w, h)?;
     }
 
@@ -507,9 +517,9 @@ fn apply_exif_orientation(img: NormalizedImage, orientation: u8) -> NormalizedIm
     }
 }
 
-/// Decode to the best available representation: prefers the AHB
-/// zero-copy path when registered (Android API 28+ via
-/// [`register_platform_ahb_decoder`]), otherwise falls through to
+/// Decode to the best available representation. When `allow_ahb` is true,
+/// prefers the registered AHB zero-staging path (Android API 26+ via
+/// [`register_platform_ahb_decoder`]); otherwise falls through to
 /// [`decode_image_fast`] and wraps the result as
 /// [`shared::protocol::io_cmd::DecodedImage::Rgba`].
 ///
@@ -521,17 +531,18 @@ fn apply_exif_orientation(img: NormalizedImage, orientation: u8) -> NormalizedIm
 pub fn decode_image_to_any(
     data: &[u8],
     path_hint: Option<&str>,
+    allow_ahb: bool,
 ) -> Result<shared::protocol::io_cmd::DecodedImage, EngineError> {
     use shared::protocol::io_cmd::DecodedImage;
 
     // Image-bomb guard (pre-decode): same header check as decode_image_fast, so
     // the AHB path is capped too. The RGBA fallback below re-checks via
     // decode_image_fast.
-    if let Some((w, h)) = probe_dimensions(data) {
+    if let Some((w, h)) = probe_image_dimensions(data) {
         enforce_pixel_cap(w, h)?;
     }
 
-    if let Some(ahb_decoder) = PLATFORM_AHB_DECODER.get() {
+    if let Some(ahb_decoder) = select_ahb_decoder(allow_ahb, PLATFORM_AHB_DECODER.get().copied()) {
         match ahb_decoder(data) {
             Ok(ahb) => {
                 enforce_pixel_cap(ahb.width, ahb.height)?;
@@ -596,6 +607,22 @@ fn classify_ahb_fallback(e: &EngineError) -> shared::stats::AhbFallbackReason {
         return DecoderRejected;
     }
     Unknown
+}
+
+#[cfg(test)]
+mod ahb_selection_tests {
+    use super::*;
+
+    fn available_decoder(_: &[u8]) -> Result<AhbImage, EngineError> {
+        panic!("selection test must not invoke the decoder")
+    }
+
+    #[test]
+    fn renderer_capability_is_required_even_when_decoder_is_registered() {
+        assert!(select_ahb_decoder(false, Some(available_decoder)).is_none());
+        assert!(select_ahb_decoder(true, None).is_none());
+        assert!(select_ahb_decoder(true, Some(available_decoder)).is_some());
+    }
 }
 
 /// Decode using zune-image (fast, SIMD-optimized).

@@ -24,6 +24,11 @@ use crate::network::gate::{GateKind, enforce_from_state};
 /// before spending base64 / percent-decode CPU.
 pub const MAX_DATA_URL_ENCODED: usize = 8 * 1024 * 1024;
 
+/// Maximum media-type/parameter prefix before the comma. Image data URLs need
+/// only a short MIME type plus optional charset/base64 markers; bounding this
+/// separately prevents a hostile prefix from being cloned into cache keys.
+pub const MAX_DATA_URL_METADATA: usize = 4 * 1024;
+
 /// Maximum accepted size of the *decoded* data-URL payload (i.e. the
 /// image bytes after base64 / percent decoding). Enforced again after
 /// decode because percent-encoded payloads can be up to 3× their
@@ -73,6 +78,14 @@ pub fn enforce_pixel_budget(width: u32, height: u32) -> EngineResult<()> {
     Ok(())
 }
 
+#[inline]
+fn enforce_encoded_pixel_budget(bytes: &[u8]) -> EngineResult<()> {
+    if let Some((width, height)) = io::probe_image_dimensions(bytes) {
+        enforce_pixel_budget(width, height)?;
+    }
+    Ok(())
+}
+
 /// Parsed `data:` URL payload.
 #[derive(Debug)]
 pub struct DataUrlPayload {
@@ -82,27 +95,36 @@ pub struct DataUrlPayload {
     pub mime: String,
 }
 
-/// Parse an RFC 2397 `data:` URL.
-///
-/// Supports both base64 and percent-encoded payloads; tolerates the
-/// permissive MIME / charset variations that show up in real small-game
-/// bundles (`data:image/png;base64,…`, `data:;base64,…`, `data:,raw%20text`).
-pub fn parse_data_url(src: &str) -> EngineResult<DataUrlPayload> {
+fn checked_data_url_parts(src: &str) -> EngineResult<(&str, &str)> {
     let rest = src.strip_prefix("data:").ok_or_else(|| {
         EngineError::new(ErrorCode::ImageReadError)
             .with_msg("invalid data URL")
             .with_detail("missing data: prefix")
     })?;
-    // `mediatype,payload` — comma separator MUST exist.
-    let (meta, payload) = rest.split_once(',').ok_or_else(|| {
-        EngineError::new(ErrorCode::ImageReadError)
+    // Search at most one byte beyond the metadata cap. A hostile source with
+    // hundreds of megabytes before its first comma must fail in bounded time
+    // on the host thread rather than scan the whole V8-provided string.
+    let comma = rest
+        .as_bytes()
+        .iter()
+        .take(MAX_DATA_URL_METADATA + 1)
+        .position(|byte| *byte == b',');
+    let Some(comma) = comma else {
+        if rest.len() > MAX_DATA_URL_METADATA {
+            return Err(EngineError::new(ErrorCode::ImageReadError)
+                .with_msg("data URL metadata too large")
+                .with_detail(format!(
+                    "metadata exceeds limit {} before comma separator",
+                    MAX_DATA_URL_METADATA
+                )));
+        }
+        return Err(EngineError::new(ErrorCode::ImageReadError)
             .with_msg("malformed data URL")
-            .with_detail("no comma separator between meta and payload")
-    })?;
+            .with_detail("no comma separator between meta and payload"));
+    };
+    let (meta, payload_with_comma) = rest.split_at(comma);
+    let payload = &payload_with_comma[1..];
 
-    // Encoded-size cap: refuse before touching base64/percent. Attacks
-    // like `img.src = "data:...," + "A".repeat(64M)` need to fail here,
-    // not after allocating and decoding.
     if payload.len() > MAX_DATA_URL_ENCODED {
         return Err(EngineError::new(ErrorCode::ImageReadError)
             .with_msg("data URL payload too large")
@@ -112,6 +134,23 @@ pub fn parse_data_url(src: &str) -> EngineResult<DataUrlPayload> {
                 MAX_DATA_URL_ENCODED
             )));
     }
+
+    Ok((meta, payload))
+}
+
+/// Allocation-free validation performed before cache identity construction.
+/// Full base64/percent parsing remains on the bounded image worker.
+pub fn validate_data_url_cache_input(src: &str) -> EngineResult<()> {
+    checked_data_url_parts(src).map(|_| ())
+}
+
+/// Parse an RFC 2397 `data:` URL.
+///
+/// Supports both base64 and percent-encoded payloads; tolerates the
+/// permissive MIME / charset variations that show up in real small-game
+/// bundles (`data:image/png;base64,…`, `data:;base64,…`, `data:,raw%20text`).
+pub fn parse_data_url(src: &str) -> EngineResult<DataUrlPayload> {
+    let (meta, payload) = checked_data_url_parts(src)?;
 
     let mut is_base64 = false;
     let mut mime = String::new();
@@ -278,6 +317,12 @@ pub fn decode_inline_bytes(
     if bytes.is_empty() {
         return Err(EngineError::new(ErrorCode::ImageReadError).with_msg("empty image payload"));
     }
+    enforce_encoded_pixel_budget(bytes)?;
+    if let (Some(tw), Some(th)) = (target_width, target_height) {
+        if tw > 0 && th > 0 {
+            enforce_pixel_budget(tw, th)?;
+        }
+    }
     let decoded = io::decode_image_fast(bytes, hint_mime).map_err(|e| {
         warn!(
             "decode_inline_bytes failed ({} bytes): {:?}",
@@ -290,7 +335,6 @@ pub fn decode_inline_bytes(
 
     match (target_width, target_height) {
         (Some(tw), Some(th)) if tw > 0 && th > 0 => {
-            enforce_pixel_budget(tw, th)?;
             debug!(
                 "decode_inline_bytes resize {}x{} -> {}x{}",
                 decoded.width, decoded.height, tw, th
@@ -303,7 +347,8 @@ pub fn decode_inline_bytes(
 
 /// Decode raw image bytes via the platform-optimised path
 /// ([`io::decode_image_to_any`]): on Android API ≥ 26 with the AHB
-/// decoder registered, returns a `DecodedImage::HardwareBuffer` for
+/// decoder registered and `allow_ahb` confirmed by the renderer, returns a
+/// `DecodedImage::HardwareBuffer` for
 /// zero-copy GPU upload.  Falls back to `DecodedImage::Rgba` on every
 /// other platform / when AHB allocation fails.
 ///
@@ -318,17 +363,19 @@ pub fn decode_inline_bytes(
 /// let decoded = match (target_w, target_h) {
 ///     (Some(w), Some(h)) if w > 0 && h > 0 =>
 ///         DecodedImage::Rgba(decode_inline_bytes(bytes, hint, Some(w), Some(h))?),
-///     _ => decode_inline_bytes_any(bytes, hint)?,
+///     _ => decode_inline_bytes_any(bytes, hint, allow_ahb)?,
 /// };
 /// ```
 pub fn decode_inline_bytes_any(
     bytes: &[u8],
     hint_mime: Option<&str>,
+    allow_ahb: bool,
 ) -> EngineResult<shared::protocol::io_cmd::DecodedImage> {
     if bytes.is_empty() {
         return Err(EngineError::new(ErrorCode::ImageReadError).with_msg("empty image payload"));
     }
-    let decoded = io::decode_image_to_any(bytes, hint_mime).map_err(|e| {
+    enforce_encoded_pixel_budget(bytes)?;
+    let decoded = io::decode_image_to_any(bytes, hint_mime, allow_ahb).map_err(|e| {
         warn!(
             "decode_inline_bytes_any failed ({} bytes): {:?}",
             bytes.len(),
@@ -407,7 +454,7 @@ mod tests {
 
     #[test]
     fn decode_inline_bytes_any_empty_payload_rejected() {
-        let err = decode_inline_bytes_any(&[], None).unwrap_err();
+        let err = decode_inline_bytes_any(&[], None, false).unwrap_err();
         assert_eq!(err.code, ErrorCode::ImageReadError);
     }
 
@@ -419,6 +466,15 @@ mod tests {
         );
         let err = parse_data_url(&huge).unwrap_err();
         assert_eq!(err.code, ErrorCode::ImageReadError);
+    }
+
+    #[test]
+    fn data_url_rejects_oversized_metadata_before_cache_keying() {
+        let src = format!("data:{};base64,AA==", "x".repeat(MAX_DATA_URL_METADATA + 1));
+        let err = validate_data_url_cache_input(&src).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::ImageReadError);
+        assert!(err.msg.contains("metadata too large"));
     }
 
     #[test]
@@ -451,6 +507,20 @@ mod tests {
         assert!(enforce_pixel_budget(20_000, 20_000).is_err());
         // 4000x4000 = 16M, right at the limit, allowed.
         assert!(enforce_pixel_budget(4000, 4000).is_ok());
+    }
+
+    #[test]
+    fn encoded_header_is_rejected_before_inline_decode_allocation() {
+        let mut png = vec![0u8; 24];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[16..20].copy_from_slice(&8192u32.to_be_bytes());
+        png[20..24].copy_from_slice(&8192u32.to_be_bytes());
+        assert!(enforce_encoded_pixel_budget(&png).is_err());
+
+        png[16..20].copy_from_slice(&4096u32.to_be_bytes());
+        png[20..24].copy_from_slice(&4096u32.to_be_bytes());
+        assert!(enforce_encoded_pixel_budget(&png).is_ok());
+        assert!(enforce_encoded_pixel_budget(b"unknown format").is_ok());
     }
 
     #[test]

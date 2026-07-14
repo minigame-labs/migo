@@ -29,32 +29,39 @@ impl AndroidDeviceServices {
 
 // ---- SensorServices ----
 impl SensorServices for AndroidDeviceServices {
+    #[cfg(feature = "api-sensors")]
     fn battery(&self) -> Option<Arc<dyn BatteryService>> {
         Some(Arc::new(AndroidBattery))
     }
+    #[cfg(feature = "api-sensors")]
     fn vibration(&self) -> Option<Arc<dyn VibrationService>> {
         Some(Arc::new(AndroidVibration))
     }
+    #[cfg(feature = "api-sensors")]
     fn screen(&self) -> Option<Arc<dyn ScreenService>> {
         Some(Arc::new(AndroidScreen {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-sensors")]
     fn device_motion(&self) -> Option<Arc<dyn DeviceMotionService>> {
         Some(Arc::new(AndroidDeviceMotion {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-sensors")]
     fn gyroscope(&self) -> Option<Arc<dyn GyroscopeService>> {
         Some(Arc::new(AndroidGyroscope {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-sensors")]
     fn compass(&self) -> Option<Arc<dyn CompassService>> {
         Some(Arc::new(AndroidCompass {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-sensors")]
     fn accelerometer(&self) -> Option<Arc<dyn AccelerometerService>> {
         Some(Arc::new(AndroidAccelerometer {
             host_id: self.host_id,
@@ -64,26 +71,31 @@ impl SensorServices for AndroidDeviceServices {
 
 // ---- MediaServices ----
 impl MediaServices for AndroidDeviceServices {
+    #[cfg(feature = "api-media")]
     fn audio_platform(&self) -> Option<Arc<dyn AudioPlatformService>> {
         Some(Arc::new(AndroidAudioPlatform {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-media")]
     fn recorder(&self) -> Option<Arc<dyn RecorderService>> {
         Some(Arc::new(AndroidRecorder {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-media")]
     fn camera(&self) -> Option<Arc<dyn CameraService>> {
         Some(Arc::new(AndroidCamera {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-media")]
     fn image_api(&self) -> Option<Arc<dyn ImageApiService>> {
         Some(Arc::new(AndroidImageApi {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-media")]
     fn video(&self) -> Option<Arc<dyn VideoService>> {
         Some(Arc::new(AndroidVideo {
             host_id: self.host_id,
@@ -93,16 +105,19 @@ impl MediaServices for AndroidDeviceServices {
 
 // ---- ConnectivityServices ----
 impl ConnectivityServices for AndroidDeviceServices {
+    #[cfg(feature = "api-sensors")]
     fn network(&self) -> Option<Arc<dyn NetworkService>> {
         Some(Arc::new(AndroidNetwork {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-connectivity")]
     fn bluetooth(&self) -> Option<Arc<dyn BluetoothService>> {
         Some(Arc::new(AndroidBluetooth {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-sensors")]
     fn location(&self) -> Option<Arc<dyn LocationService>> {
         Some(Arc::new(AndroidLocation {
             host_id: self.host_id,
@@ -112,11 +127,13 @@ impl ConnectivityServices for AndroidDeviceServices {
 
 // ---- CommerceServices ----
 impl CommerceServices for AndroidDeviceServices {
+    #[cfg(feature = "api-connectivity")]
     fn game_log(&self) -> Option<Arc<dyn GameLogService>> {
         Some(Arc::new(AndroidGameLog {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-connectivity")]
     fn auth(&self) -> Option<Arc<dyn AuthService>> {
         Some(Arc::new(AndroidAuth {
             host_id: self.host_id,
@@ -127,11 +144,13 @@ impl CommerceServices for AndroidDeviceServices {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-commerce")]
     fn share(&self) -> Option<Arc<dyn ShareService>> {
         Some(Arc::new(AndroidShare {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-commerce")]
     fn payment(&self) -> Option<Arc<dyn PaymentService>> {
         Some(Arc::new(AndroidPayment {
             host_id: self.host_id,
@@ -141,6 +160,7 @@ impl CommerceServices for AndroidDeviceServices {
 
 // ---- SystemUtilServices ----
 impl SystemUtilServices for AndroidDeviceServices {
+    #[cfg(feature = "api-sensors")]
     fn clipboard(&self) -> Option<Arc<dyn ClipboardService>> {
         Some(Arc::new(AndroidClipboard {
             host_id: self.host_id,
@@ -151,11 +171,13 @@ impl SystemUtilServices for AndroidDeviceServices {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-system")]
     fn interaction(&self) -> Option<Arc<dyn InteractionService>> {
         Some(Arc::new(AndroidInteraction {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-connectivity")]
     fn system_info(&self) -> Option<Arc<dyn SystemInfoService>> {
         Some(Arc::new(AndroidSystemInfo {
             host_id: self.host_id,
@@ -167,11 +189,13 @@ impl SystemUtilServices for AndroidDeviceServices {
     fn file(&self) -> Option<Arc<dyn FileService>> {
         Some(Arc::new(AndroidFile))
     }
+    #[cfg(feature = "api-sensors")]
     fn scan_code(&self) -> Option<Arc<dyn ScanCodeService>> {
         Some(Arc::new(AndroidScanCode {
             host_id: self.host_id,
         }))
     }
+    #[cfg(feature = "api-connectivity")]
     fn navigate(&self) -> Option<Arc<dyn NavigateService>> {
         Some(Arc::new(AndroidNavigate {
             host_id: self.host_id,

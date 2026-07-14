@@ -122,8 +122,8 @@ use jni::{JNIEnv, JavaVM};
 use tracing::{error, info};
 
 use core::{
-    bump_destroy_epoch, current_destroy_epoch, send_command_to_host,
-    send_critical_command_to_host, shutdown_host, spawn_host_thread,
+    bump_destroy_epoch, current_destroy_epoch, send_command_to_host, send_critical_command_to_host,
+    shutdown_host, spawn_host_thread,
 };
 use shared::protocol::camera_frame::{PlaneWindow, pack_yuv_planes};
 use shared::protocol::host_cmd::{
@@ -271,21 +271,21 @@ pub(crate) extern "system" fn init(
         // ANativeWindow_fromSurface) via RAII now, so every early return below
         // releases it. Previously each error path between here and host spawn
         // leaked the ref.
-        let android_surface = match unsafe {
-            AndroidSurfaceWrapper::from_surface_owned(window, w, h, 0)
-        } {
-            Ok(s) => s,
-            Err(e) => {
-                error!("init failed: create AndroidSurfaceWrapper error: {}", e);
-                unsafe { ANativeWindow_release(window) };
-                return -1;
-            }
-        };
+        let android_surface =
+            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h, 0) } {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("init failed: create AndroidSurfaceWrapper error: {}", e);
+                    unsafe { ANativeWindow_release(window) };
+                    return -1;
+                }
+            };
 
         // Normalize native window buffer geometry to the observed dimensions.
         // This helps avoid stale rotated geometry during startup transitions.
-        let set_geo_rc =
-            unsafe { ANativeWindow_setBuffersGeometry(android_surface.native_handle(), raw_w, raw_h, 0) };
+        let set_geo_rc = unsafe {
+            ANativeWindow_setBuffersGeometry(android_surface.native_handle(), raw_w, raw_h, 0)
+        };
         if set_geo_rc != 0 {
             tracing::warn!(
                 "init: ANativeWindow_setBuffersGeometry({}x{}) failed: {}",
@@ -477,7 +477,8 @@ pub(crate) extern "system" fn updateSurface<'local>(
         // can tell, after it recreates, whether a newer destroy has since raced.
         let surface_epoch = current_destroy_epoch(host_id);
         let android_surface =
-            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h, surface_epoch) } {
+            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h, surface_epoch) }
+            {
                 Ok(s) => s,
                 Err(e) => {
                     error!(

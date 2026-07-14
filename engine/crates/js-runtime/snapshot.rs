@@ -4,20 +4,20 @@
 //!
 //! V8 startup snapshots capture the heap state after all extension JS files
 //! have been parsed, compiled and executed.  Loading from a snapshot skips
-//! these steps entirely, reducing cold-start by ~150-300 ms on mid-range
-//! Android devices (~230 KB of JS across 75 extension files).
+//! these steps entirely. The device-specific cold-start tradeoff must be
+//! measured against the added artifact bytes before enabling a snapshot.
 //!
 //! # How it works
 //!
 //! 1. **Build-time** -- the `migo-snapshot-gen` binary creates a snapshot.
 //!    It calls [`lazy_extensions()`] to get extensions with JS but without
 //!    runtime state, feeds them to `deno_core::create_snapshot()`, and writes
-//!    the output to `snapshots/SNAPSHOT-<arch>.bin`. Because snapshots are
+//!    the output to `snapshots/SNAPSHOT-<profile>-<arch>.bin`. Because snapshots are
 //!    platform-bound, the generator is cross-compiled to each Android ABI and
 //!    run on that ABI's emulator/device (see `crates/snapshot-gen`).
 //!
 //! 2. **Compile-time** -- for android targets, `build.rs` picks
-//!    `snapshots/SNAPSHOT-<target arch>.bin` and embeds it via `include_bytes!`.
+//!    `snapshots/SNAPSHOT-<profile>-<target arch>.bin` and embeds it via `include_bytes!`.
 //!    Missing snapshot or host builds fall back to JS source loading.
 //!
 //! 3. **Runtime** -- `HostJsRuntime::new()` passes the snapshot bytes to
@@ -50,8 +50,8 @@ use crate::{payment, share};
 /// Embedded snapshot bytes.
 ///
 /// Snapshots are produced by `migo-snapshot-gen` (cross-compiled to a target
-/// ABI and run on that ABI's emulator/device) and stored per-arch under
-/// `snapshots/SNAPSHOT-<arch>.bin`. V8 startup snapshots are **platform-bound**
+/// ABI and run on that ABI's emulator/device) and stored per product/arch under
+/// `snapshots/SNAPSHOT-<profile>-<arch>.bin`. V8 startup snapshots are **platform-bound**
 /// (OS + CPU arch): an android-<arch> snapshot only loads in that exact
 /// android-<arch> V8, so `build.rs` embeds the file matching
 /// `CARGO_CFG_TARGET_ARCH` and ONLY for android targets. Host builds
@@ -66,6 +66,22 @@ pub static SNAPSHOT_BYTES: Option<&'static [u8]> = Some(include_bytes!(env!("MIG
 
 #[cfg(not(migo_has_snapshot))]
 pub static SNAPSHOT_BYTES: Option<&'static [u8]> = None;
+
+/// Dedicated Worker snapshot bytes. These are deliberately never aliased to
+/// [`SNAPSHOT_BYTES`]: the extension/op table and bootstrap heap are different.
+#[cfg(all(feature = "worker-snapshot", migo_has_worker_snapshot))]
+pub static WORKER_SNAPSHOT_BYTES: Option<&'static [u8]> =
+    Some(include_bytes!(env!("MIGO_WORKER_SNAPSHOT_PATH")));
+
+#[cfg(not(all(feature = "worker-snapshot", migo_has_worker_snapshot)))]
+pub static WORKER_SNAPSHOT_BYTES: Option<&'static [u8]> = None;
+
+/// Worker extension heap used by snapshot generation and restoration.
+/// Runtime-only `WorkerCtx` and `HostOpState` are injected separately.
+#[cfg(feature = "api-system")]
+pub fn worker_lazy_extensions() -> Vec<Extension> {
+    worker::create_worker_runtime_lazy_extensions()
+}
 
 /// Create all extensions in **lazy-init** mode (JS loaded, ops registered,
 /// state callbacks deferred).

@@ -1,0 +1,8 @@
+{
+    "productProfile": "full",
+    "buildType": "release",
+    "codegenProfile": "3",
+    "cargoProfile": "release-hot3",
+    "sourceDateEpoch": "1783987200",
+    "buildTime": "2026-07-14 09:50:43"
+}

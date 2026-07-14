@@ -58,6 +58,13 @@ pub(crate) enum GateKind {
     /// Same rule set as `Fetch`: a 302 into a blocked host is just
     /// as dangerous as the initial request.
     FetchRedirect,
+    /// `InnerAudioContext.src` HTTP streaming request. Uses the same HTTP
+    /// security rules as fetch, but keeps diagnostics attributable to audio.
+    #[cfg_attr(not(feature = "api-media"), allow(dead_code))]
+    AudioStream,
+    /// Redirect hop followed by an audio streaming request.
+    #[cfg_attr(not(feature = "api-media"), allow(dead_code))]
+    AudioStreamRedirect,
     /// Body upload via `fetch` / `uploadFile`. Same as `Fetch`.
     FetchUpload,
     /// DNS prefetch / asset warmup. `data:` is not applicable; the
@@ -127,6 +134,8 @@ fn kind_prefix(kind: GateKind) -> &'static str {
     match kind {
         GateKind::Fetch => "fetch",
         GateKind::FetchRedirect => "fetch:redirect",
+        GateKind::AudioStream => "audio",
+        GateKind::AudioStreamRedirect => "audio:redirect",
         GateKind::FetchUpload => "uploadFile",
         GateKind::Prefetch => "prefetch",
         GateKind::ImageInlineSrc => "Image.src",
@@ -149,6 +158,8 @@ fn scheme_allowed(kind: GateKind, scheme: &str) -> bool {
         (
             GateKind::Fetch
             | GateKind::FetchRedirect
+            | GateKind::AudioStream
+            | GateKind::AudioStreamRedirect
             | GateKind::FetchUpload
             | GateKind::Prefetch
             | GateKind::ImageInlineSrc,
@@ -239,6 +250,8 @@ pub(crate) fn evaluate_policy(
             kind,
             GateKind::Fetch
                 | GateKind::FetchRedirect
+                | GateKind::AudioStream
+                | GateKind::AudioStreamRedirect
                 | GateKind::FetchUpload
                 | GateKind::Prefetch
                 | GateKind::ImageInlineSrc
@@ -342,6 +355,7 @@ pub(crate) fn enforce_from_state(
                 | GateKind::FetchRedirect
                 | GateKind::FetchUpload
                 | GateKind::Prefetch => {}
+                GateKind::AudioStream | GateKind::AudioStreamRedirect => {}
                 GateKind::TcpSocket | GateKind::UdpSocket => {
                     // Fold into the ws bucket for now: both are raw
                     // transport rejects and the binary snapshot
@@ -364,6 +378,87 @@ mod tests {
         NetworkPolicy {
             domain_whitelist: whitelist.iter().map(|s| s.to_string()).collect(),
             enforce_https,
+        }
+    }
+
+    #[test]
+    fn audio_stream_accepts_http_and_https_schemes() {
+        let policy = policy(&[], false);
+        assert!(
+            evaluate_policy(
+                &u("http://media.example/track.mp3"),
+                &policy,
+                GateKind::AudioStream,
+            )
+            .is_ok()
+        );
+        assert!(
+            evaluate_policy(
+                &u("https://media.example/track.mp3"),
+                &policy,
+                GateKind::AudioStream,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            evaluate_policy(
+                &u("ws://media.example/track.mp3"),
+                &policy,
+                GateKind::AudioStream,
+            ),
+            Err(GateReject::UnsupportedScheme { .. })
+        ));
+    }
+
+    #[test]
+    fn audio_stream_enforces_allowlist_https_and_ip_literal_rules() {
+        let strict_policy = policy(&["media.example"], true);
+        assert!(
+            evaluate_policy(
+                &u("https://cdn.media.example/track.mp3"),
+                &strict_policy,
+                GateKind::AudioStream,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            evaluate_policy(
+                &u("https://other.example/track.mp3"),
+                &strict_policy,
+                GateKind::AudioStream,
+            ),
+            Err(GateReject::NotWhitelisted { .. })
+        ));
+        assert!(matches!(
+            evaluate_policy(
+                &u("http://media.example/track.mp3"),
+                &strict_policy,
+                GateKind::AudioStream,
+            ),
+            Err(GateReject::HttpsRequired)
+        ));
+        assert!(matches!(
+            evaluate_policy(
+                &u("https://127.0.0.1/track.mp3"),
+                &policy(&[], false),
+                GateKind::AudioStream,
+            ),
+            Err(GateReject::BlockedAddress { .. })
+        ));
+    }
+
+    #[test]
+    fn audio_redirect_uses_the_same_policy_as_initial_audio_url() {
+        let policy = policy(&["media.example"], true);
+        for kind in [GateKind::AudioStream, GateKind::AudioStreamRedirect] {
+            assert!(matches!(
+                evaluate_policy(&u("https://blocked.example/next.mp3"), &policy, kind,),
+                Err(GateReject::NotWhitelisted { .. })
+            ));
+            assert!(matches!(
+                evaluate_policy(&u("http://media.example/next.mp3"), &policy, kind),
+                Err(GateReject::HttpsRequired)
+            ));
         }
     }
 

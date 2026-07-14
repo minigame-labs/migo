@@ -148,6 +148,7 @@ extension!(host_v8_webgl,
         op_check_framebuffer_status,
         op_create_renderbuffer,
         op_delete_renderbuffer,
+        op_delete_buffer,
         op_bind_renderbuffer,
         op_renderbuffer_storage,
 
@@ -299,8 +300,9 @@ extension!(host_v8_webgl,
         "04_font.js",
     ],
     state = |state| {
+        let host_id = state.borrow::<shared::op_state::HostOpState>().id;
         state.put(GlResourceIdAllocator::new());
-        state.put(frame_collector::UnifiedFrameCollector::new());
+        state.put(frame_collector::UnifiedFrameCollector::with_host_id(host_id));
         state.put(error_state::WebGLErrorState::default());
     }
 );

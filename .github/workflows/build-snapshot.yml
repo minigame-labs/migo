@@ -18,29 +18,53 @@ name: Build V8 Snapshot
 #             so an arm64 Android emulator cannot be hardware-accelerated and
 #             this approach is not available on hosted runners. Generate the
 #             arm64 snapshot on a real arm64 device and commit/upload
-#             engine/crates/js-runtime/snapshots/SNAPSHOT-aarch64.bin. The exact
-#             device steps are documented in crates/snapshot-gen/src/main.rs.
+#             engine/crates/js-runtime/snapshots/SNAPSHOT-<profile>-aarch64.bin.
+#             The exact device steps are documented in snapshot-gen/src/main.rs.
 #             (A self-hosted arm64 runner with an attached device could automate
 #             this later.)
 #
 # This workflow uploads the snapshot as an artifact. Embedding into the .so is
 # done by js-runtime/build.rs at .so build time: it picks
-# snapshots/SNAPSHOT-<target arch>.bin for android targets only.
+# snapshots/SNAPSHOT-<profile>-<target arch>.bin for android targets only.
 
 on:
   workflow_dispatch:
+    inputs:
+      product_profile:
+        description: Product profile to regenerate
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - slim
+      snapshot_kind:
+        description: Runtime heap to regenerate
+        required: true
+        default: host
+        type: choice
+        options:
+          - host
+          - worker
   push:
     branches:
       - "**"
     # On push only the fast `freshness` gate runs (the x86_64 generator is
-    # workflow_dispatch-only). Freshness depends solely on the embedded JS
-    # (js_sources_sha256) and the deno_core version (Cargo.lock) — so trigger on
-    # exactly those, not on js-runtime Rust/docs or the V8 archive / snapshot-gen
-    # crate (those only affect the dispatch-only generator, and op-change
-    # staleness isn't caught by the v1 fingerprint anyway — see snapshots/README).
+    # workflow_dispatch-only). Schema v3 binds runtime kind and fingerprints extension JS, js-runtime
+    # and snapshot-gen Rust/feature inputs, Cargo.lock, product features, and the
+    # exact Android V8 archive, so every one of those changes must run the gate.
     paths:
-      - "engine/crates/js-runtime/**.js"
+      - "engine/crates/js-runtime/**/*.js"
+      - "engine/crates/js-runtime/**/*.rs"
+      - "engine/crates/js-runtime/Cargo.toml"
+      - "engine/crates/js-runtime/snapshots/**"
+      - "engine/crates/snapshot-gen/**/*.rs"
+      - "engine/crates/snapshot-gen/Cargo.toml"
+      - "engine/third_party/rusty_v8/**/librusty_v8.a"
       - "engine/Cargo.lock"
+      - "scripts/lib/snapshot-fingerprint.sh"
+      - "scripts/check-snapshot-freshness.sh"
+      - "scripts/write-snapshot-manifest.sh"
       - ".github/workflows/build-snapshot.yml"
 
 concurrency:
@@ -54,10 +78,9 @@ permissions:
   contents: write
 
 jobs:
-  # Release gate: confirm the COMMITTED per-arch snapshots are not stale vs the
-  # current extension JS / deno_core version — host-only, no device needed
-  # (those inputs are platform-independent). Fails the run if a present snapshot
-  # is stale, telling you to regenerate (see engine/crates/js-runtime/snapshots/README.md §4).
+  # Confirm all committed kind/profile/ABI snapshots match every schema-v3 input.
+  # The host-only gate reads Git LFS pointer oid/size identities, so it does not
+  # need to download the large snapshot or V8 archive objects.
   freshness:
     name: snapshot freshness gate
     runs-on: ubuntu-latest
@@ -65,23 +88,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-        # No LFS needed: the gate reads only *.manifest.json (plain text) + the
-        # source tree, not the snapshot blobs themselves.
+        # No LFS download: the gate validates large objects from pointer oid/size.
       - name: Check snapshot freshness
-        run: bash scripts/check-snapshot-freshness.sh
+        run: |
+          bash scripts/check-snapshot-freshness.sh --snapshot-kind host --product-profile full
+          bash scripts/check-snapshot-freshness.sh --snapshot-kind host --product-profile slim
+          bash scripts/check-snapshot-freshness.sh --snapshot-kind worker --product-profile full
 
   # Runs ONLY on manual workflow_dispatch. The ~15 min cross-compile + emulator
-  # generation is wasteful on every push: a js-runtime *Rust* change doesn't
-  # touch the embedded JS, so the snapshot stays fresh. On push only the fast
-  # `freshness` gate above runs; when it goes red (embedded JS or deno_core
-  # changed), click "Run workflow" here and this job regenerates the x86_64
-  # snapshot, writes its manifest, and opens a PR. (arm64 has no hosted KVM —
-  # regenerate it on a device: bash scripts/gen-snapshot.sh arm64 --device <id>.)
+  # generation is wasteful on every push. On push only the fast `freshness`
+  # gate runs; when any schema-v3 input makes it red, manually regenerate the
+  # selected x86_64 product here. arm64 still requires a matching real device.
   snapshot-x86_64:
-    name: snapshot (x86_64 / emulator)
+    name: snapshot (${{ inputs.snapshot_kind }} / x86_64 / emulator)
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      SNAPSHOT_KIND: ${{ inputs.snapshot_kind }}
+      SNAPSHOT_PREFIX: ${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}
     steps:
       # LFS is required: engine/third_party/rusty_v8/**/librusty_v8.a (the
       # self-built android V8 archives) are stored via Git LFS, and snapshot-gen
@@ -91,6 +116,13 @@ jobs:
         uses: actions/checkout@v5
         with:
           lfs: true
+
+      - name: Validate snapshot identity selection
+        run: |
+          if [[ "$SNAPSHOT_KIND" == worker && "${{ inputs.product_profile }}" != full ]]; then
+            echo "Worker snapshot requires product profile full" >&2
+            exit 1
+          fi
 
       # actions/checkout sets GIT_LFS_SKIP_SMUDGE during the initial checkout and
       # doesn't always smudge large objects back into the working tree, leaving
@@ -153,7 +185,8 @@ jobs:
           export RUSTY_V8_ARCHIVE="$PWD/third_party/rusty_v8/x86_64/librusty_v8.a"
           export RUSTY_V8_SRC_BINDING_PATH="$PWD/third_party/rusty_v8/x86_64/src_binding.rs"
           export RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition -C link-arg=-landroid"
-          cargo ndk -t x86_64 --platform 26 build -p migo-snapshot-gen
+          cargo ndk -t x86_64 --platform 26 build -p migo-snapshot-gen \
+            --no-default-features --features profile-${{ inputs.product_profile }} --locked
           # Stage libc++_shared.so next to the binary here (ANDROID_NDK_HOME is
           # reliably set in this run-step) so the emulator-runner script below
           # does not depend on it being propagated into the action's shell.
@@ -179,19 +212,19 @@ jobs:
             adb push engine/target/x86_64-linux-android/debug/libc++_shared.so /data/local/tmp/libc++_shared.so
             adb push engine/target/x86_64-linux-android/debug/migo-snapshot-gen /data/local/tmp/migo-snapshot-gen
             adb shell chmod 755 /data/local/tmp/migo-snapshot-gen
-            adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp MIGO_SNAPSHOT_OUT=/data/local/tmp/SNAPSHOT.bin ./migo-snapshot-gen"
+            adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp MIGO_SNAPSHOT_KIND=$SNAPSHOT_KIND MIGO_SNAPSHOT_OUT=/data/local/tmp/SNAPSHOT.bin ./migo-snapshot-gen"
             mkdir -p engine/crates/js-runtime/snapshots
-            adb pull /data/local/tmp/SNAPSHOT.bin engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin
+            adb pull /data/local/tmp/SNAPSHOT.bin engine/crates/js-runtime/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
 
       - name: Inspect snapshot
         run: |
-          f=engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin
+          f=engine/crates/js-runtime/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
           ls -la "$f"
           echo "size:  $(stat -c %s "$f") bytes"
           echo "sha256:"; sha256sum "$f"
 
       - name: Write manifest
-        run: bash scripts/write-snapshot-manifest.sh x86_64 engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin
+        run: bash scripts/write-snapshot-manifest.sh ${{ inputs.product_profile }} x86_64 engine/crates/js-runtime/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin $SNAPSHOT_KIND
 
       # Push the regenerated snapshot to a branch and surface a one-click
       # "create PR" link in the run summary. We deliberately do NOT call
@@ -202,21 +235,40 @@ jobs:
       - name: Push regen branch + surface PR link
         run: |
           set -euo pipefail
-          bin=engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin
+          bin=engine/crates/js-runtime/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
           man="$bin.manifest.json"
-          # Skip when the regenerated bytes match what's committed (only the
-          # manifest timestamp would differ) — nothing to push.
-          if git diff --quiet -- "$bin"; then
-            echo "x86_64 snapshot bytes unchanged — nothing to push."
-            echo "x86_64 snapshot bytes unchanged — no regen branch pushed." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          # `git diff` ignores untracked files, so require both artifacts to be
+          # tracked before considering the first Worker generation unchanged.
+          # Ignore only informational manifest fields; all schema/fingerprint/
+          # artifact identities remain authoritative even when bytes match.
+          if git ls-files --error-unmatch "$bin" "$man" >/dev/null 2>&1 && \
+             git diff --quiet -- "$bin"; then
+            git show "HEAD:$man" > /tmp/committed-snapshot-manifest.json
+            if python3 - "$man" /tmp/committed-snapshot-manifest.json <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          def identity(path):
+              value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+              value.pop("generated_at", None)
+              value.pop("git_commit", None)
+              return value
+
+          raise SystemExit(0 if identity(sys.argv[1]) == identity(sys.argv[2]) else 1)
+          PY
+            then
+              echo "x86_64 snapshot bytes and identity unchanged — nothing to push."
+              echo "x86_64 snapshot bytes and identity unchanged — no regen branch pushed." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
           fi
-          branch="bot/regen-x86_64-snapshot"
+          branch="bot/regen-${SNAPSHOT_KIND}-${{ inputs.product_profile }}-x86_64-snapshot"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add "$bin" "$man"
-          git commit -m "chore(snapshot): regenerate x86_64 snapshot"
+          git commit -m "chore(snapshot): regenerate ${SNAPSHOT_KIND} ${{ inputs.product_profile }} x86_64 snapshot"
           git push -f origin "$branch"
           url="${{ github.server_url }}/${{ github.repository }}/compare/${{ github.ref_name }}...${branch}?expand=1"
           {
@@ -224,15 +276,15 @@ jobs:
             echo ""
             echo "Pushed to \`$branch\`. Open the PR (one click): $url"
             echo ""
-            echo "> arm64 must be regenerated separately on a device — \`scripts/gen-snapshot.sh arm64 --device <serial>\` — and committed into the same PR."
+            echo "> arm64 must be regenerated separately on a device — \`scripts/gen-snapshot.sh arm64 --snapshot-kind ${SNAPSHOT_KIND} --product-profile ${{ inputs.product_profile }} --device <serial>\` — and committed into the same PR."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Open the PR: $url"
 
       - name: Upload snapshot artifact
         uses: actions/upload-artifact@v5
         with:
-          name: snapshot-x86_64
+          name: snapshot-${{ inputs.snapshot_kind }}-${{ inputs.product_profile }}-x86_64
           path: |
-            engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin
-            engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin.manifest.json
+            engine/crates/js-runtime/snapshots/${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}-${{ inputs.product_profile }}-x86_64.bin
+            engine/crates/js-runtime/snapshots/${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}-${{ inputs.product_profile }}-x86_64.bin.manifest.json
           if-no-files-found: error

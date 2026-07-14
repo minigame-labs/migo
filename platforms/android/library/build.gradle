@@ -2,6 +2,65 @@ plugins {
     id 'com.android.library'
 }
 
+def supportedMigoAbis = ['arm64-v8a', 'x86_64']
+def migoAbis = providers.gradleProperty('migoAbis')
+        .getOrElse(supportedMigoAbis.join(','))
+        .split(',')
+        .collect { it.trim() }
+        .findAll { !it.isEmpty() }
+        .unique()
+if (migoAbis.isEmpty() || !supportedMigoAbis.containsAll(migoAbis)) {
+    throw new GradleException("Invalid -PmigoAbis=${migoAbis}; expected arm64-v8a and/or x86_64")
+}
+
+def supportedMigoCodegenProfiles = ['z', '2', '3']
+def migoCodegenProfile = providers.gradleProperty('migoCodegenProfile').getOrElse('z')
+if (!supportedMigoCodegenProfiles.contains(migoCodegenProfile)) {
+    throw new GradleException(
+            "Invalid -PmigoCodegenProfile=${migoCodegenProfile}; expected z, 2, or 3")
+}
+def migoNativeProfileSuffix = migoCodegenProfile == 'z' ? '' : "-opt${migoCodegenProfile}"
+
+def supportedMigoWorkerSnapshotValues = ['true', 'false']
+def migoWorkerSnapshotValue = providers.gradleProperty('migoWorkerSnapshot').getOrElse('false')
+if (!supportedMigoWorkerSnapshotValues.contains(migoWorkerSnapshotValue)) {
+    throw new GradleException(
+            "Invalid -PmigoWorkerSnapshot=${migoWorkerSnapshotValue}; expected true or false")
+}
+def migoWorkerSnapshot = migoWorkerSnapshotValue == 'true'
+def migoWorkerSnapshotSuffix = migoWorkerSnapshot ? '-worker-snapshot' : ''
+
+// An explicit candidate may only configure a full-release artifact. The
+// default property is false, so ordinary IDE sync and every shipping task keep
+// their existing variant graph and native roots.
+def requestedTasks = gradle.startParameter.taskNames.collect {
+    it.tokenize(':').last().toLowerCase(Locale.ROOT)
+}
+def workerSnapshotNeutralTasks = [
+        'clean', 'help', 'tasks', 'properties', 'projects', 'dependencies',
+        'dependencyinsight', 'components', 'model', 'wrapper'
+]
+if (migoWorkerSnapshot && requestedTasks.any {
+    !workerSnapshotNeutralTasks.contains(it) && !it.contains('fullrelease')
+}) {
+    throw new GradleException(
+            'Worker snapshot requires a full release build task')
+}
+
+def sourceDateEpoch = providers.environmentVariable('SOURCE_DATE_EPOCH').getOrElse('')
+Long sourceDateEpochMillis = null
+if (!sourceDateEpoch.isEmpty()) {
+    try {
+        if (!(sourceDateEpoch ==~ /[0-9]+/)) {
+            throw new NumberFormatException('not an unsigned integer')
+        }
+        sourceDateEpochMillis = Math.multiplyExact(Long.parseLong(sourceDateEpoch), 1000L)
+    } catch (NumberFormatException | ArithmeticException ignored) {
+        throw new GradleException(
+                'Invalid SOURCE_DATE_EPOCH; expected non-negative Unix seconds that fit in milliseconds')
+    }
+}
+
 android {
     namespace 'com.migo.runtime'
     compileSdk 34
@@ -20,17 +79,45 @@ android {
         versionCode 1
         versionName "0.1.0"
 
-        consumerProguardFiles "consumer-rules.pro"
+        consumerProguardFiles "consumer-rules-common.pro"
 
         ndk {
-            abiFilters "arm64-v8a", "x86_64"
+            abiFilters(*migoAbis)
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    flavorDimensions "product"
+    productFlavors {
+        full {
+            dimension "product"
+            buildConfigField "boolean", "MIGO_API_SENSORS", "true"
+            buildConfigField "boolean", "MIGO_API_MEDIA", "true"
+            buildConfigField "boolean", "MIGO_API_CONNECTIVITY", "true"
+            buildConfigField "boolean", "MIGO_API_COMMERCE", "true"
+            buildConfigField "boolean", "MIGO_API_SYSTEM", "true"
+            proguardFile "proguard-full.pro"
+            consumerProguardFiles "consumer-rules-full.pro"
+        }
+        slim {
+            dimension "product"
+            buildConfigField "boolean", "MIGO_API_SENSORS", "false"
+            buildConfigField "boolean", "MIGO_API_MEDIA", "false"
+            buildConfigField "boolean", "MIGO_API_CONNECTIVITY", "false"
+            buildConfigField "boolean", "MIGO_API_COMMERCE", "false"
+            buildConfigField "boolean", "MIGO_API_SYSTEM", "false"
+            proguardFile "proguard-slim.pro"
+            consumerProguardFiles "consumer-rules-slim.pro"
         }
     }
 
     buildTypes {
         release {
             minifyEnabled true
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-common.pro'
         }
         debug {
             debuggable true
@@ -45,13 +132,16 @@ android {
 
     sourceSets {
         main {
-            // build-aar.sh copies the selected native outputs here before Gradle runs;
-            // keep a single authoritative jniLibs source to avoid silently packaging
-            // an older duplicate .so from another directory.
-            jniLibs.srcDirs = ['src/main/jniLibs']
+            jniLibs.srcDirs = []
             assets.srcDirs = ['src/main/assets']
             // include generated BuildInfo.java
             java.srcDirs += "$buildDir/generated/source/buildinfo"
+        }
+        full {
+            jniLibs.srcDirs = ["../../../engine/jniLibs/full${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}"]
+        }
+        slim {
+            jniLibs.srcDirs = ["../../../engine/jniLibs/slim${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}"]
         }
     }
 }
@@ -65,6 +155,7 @@ task generateBuildInfo {
     def taskProjectDir = projectDir
     outputs.dir outputDir
     inputs.property("sdkVersion", versionName)
+    inputs.property("sourceDateEpoch", sourceDateEpoch)
     // BuildInfo contains BUILD_TIME and COMMIT; always regenerate to avoid stale metadata.
     outputs.upToDateWhen { false }
 
@@ -72,7 +163,9 @@ task generateBuildInfo {
         outputDir.mkdirs()
         def timestamp = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'")
                 .with { timeZone = TimeZone.getTimeZone("UTC"); it }
-                .format(new Date())
+                .format(sourceDateEpochMillis == null
+                        ? new Date()
+                        : new Date(sourceDateEpochMillis))
 
         def commitHash = "unknown"
         try {

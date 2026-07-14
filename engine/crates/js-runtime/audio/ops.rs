@@ -1354,10 +1354,27 @@ pub async fn op_inner_audio_load(
         .map_err(AudioError::from)
 }
 
-/// Check if a string is an HTTP/HTTPS URL
-#[inline]
-fn is_http_url(s: &str) -> bool {
-    s.starts_with("http://") || s.starts_with("https://")
+/// Parse a remote audio URL without reclassifying ordinary local/VFS paths.
+/// URL schemes are case-insensitive; malformed strings that explicitly claim
+/// HTTP(S) are errors rather than filesystem fallbacks.
+fn parse_remote_audio_url(src: &str) -> Result<Option<deno_core::url::Url>, AudioError> {
+    match deno_core::url::Url::parse(src) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(Some(url)),
+        Ok(_) => Ok(None),
+        Err(error) => {
+            let is_http = src
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+            let is_https = src
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"));
+            if is_http || is_https {
+                Err(audio_err(format!("Invalid audio URL: {error}")))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Normalize local audio source path variants.
@@ -1473,8 +1490,17 @@ pub async fn op_inner_audio_load_url(
     #[smi] id: InnerAudioId,
     #[string] src: String,
 ) -> Result<(), AudioError> {
-    if is_http_url(&src) {
+    if let Some(url) = parse_remote_audio_url(&src)? {
         // HTTP URL - use streaming download
+        {
+            let st = state.borrow();
+            crate::network::gate::enforce_from_state(
+                &url,
+                &st,
+                crate::network::gate::GateKind::AudioStream,
+            )
+            .map_err(|error| audio_err(error.to_string()))?;
+        }
         let tx = get_audio_tx(state);
         let (resp_tx, resp_rx) = oneshot::channel();
 
@@ -1649,7 +1675,7 @@ pub async fn op_inner_audio_get_state(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_local_src, resolve_path};
+    use super::{parse_remote_audio_url, resolve_local_src, resolve_path};
     use shared::vfs::VirtualFS;
     use std::{
         fs,
@@ -1663,6 +1689,50 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{}_{}", prefix, nanos))
+    }
+
+    #[test]
+    fn remote_audio_url_classification_is_case_insensitive_and_exact() {
+        let http = parse_remote_audio_url("HTTP://media.example/a.mp3")
+            .unwrap()
+            .expect("HTTP URL should be remote");
+        assert_eq!(http.scheme(), "http");
+
+        let https = parse_remote_audio_url("https://media.example/b.mp3")
+            .unwrap()
+            .expect("HTTPS URL should be remote");
+        assert_eq!(https.scheme(), "https");
+
+        assert!(parse_remote_audio_url("audio/bgm.mp3").unwrap().is_none());
+        assert!(
+            parse_remote_audio_url("wxfile://usr/audio/bgm.mp3")
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_remote_audio_url("http://").is_err());
+    }
+
+    #[test]
+    fn remote_audio_is_gated_before_it_reaches_the_audio_command_channel() {
+        let source = include_str!("ops.rs");
+        let start = source
+            .find("pub async fn op_inner_audio_load_url")
+            .expect("audio load op");
+        let end = source[start..]
+            .find("/// Play InnerAudioContext")
+            .map(|offset| start + offset)
+            .expect("end of audio load op");
+        let body = &source[start..end];
+        let gate = body
+            .find("GateKind::AudioStream")
+            .expect("remote audio must use the shared gate");
+        let enqueue = body
+            .find("AudioCmd::InnerAudioLoadUrl")
+            .expect("remote audio command");
+        assert!(
+            gate < enqueue,
+            "policy gate must run before command enqueue"
+        );
     }
 
     #[test]

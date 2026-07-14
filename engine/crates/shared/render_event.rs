@@ -98,6 +98,11 @@ pub struct RenderEventSender {
     /// was full at emit time.  Useful to distinguish "no events"
     /// from "consumer drowning".
     dropped: Arc<AtomicU64>,
+    /// Optional wake callback invoked after each *successfully* enqueued event.
+    /// The host installs a `tokio::sync::Notify`-backed closure so render
+    /// feedback is delivered without a polling timer; `None` for the no-wake
+    /// test/default constructor.
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl RenderEventSender {
@@ -106,9 +111,16 @@ impl RenderEventSender {
     /// older (still more informative) events.  Returning `()`
     /// keeps call sites terse and signals that the send is
     /// advisory.
+    ///
+    /// The wake callback (when present) fires only on a successful enqueue, so a
+    /// full/disconnected send never claims a spurious wake.
     pub fn emit(&self, ev: RenderEvent) {
         match self.tx.try_send(ev) {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(wake) = &self.wake {
+                    wake();
+                }
+            }
             Err(TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -138,15 +150,169 @@ impl RenderEventSender {
 /// layer a broadcast adapter on top.
 pub type RenderEventReceiver = Receiver<RenderEvent>;
 
-/// Construct a new `(sender, receiver)` pair.  One pair is created
-/// per `RenderThread` at spawn time.
+/// Construct a new `(sender, receiver)` pair with no wake callback.  Used by
+/// tests and any host that drains on its own schedule.
 pub fn channel() -> (RenderEventSender, RenderEventReceiver) {
     let (tx, rx) = bounded(EVENT_CHANNEL_CAPACITY);
     (
         RenderEventSender {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
+            wake: None,
         },
         rx,
     )
+}
+
+/// Construct a `(sender, receiver)` pair whose sender invokes `wake` after each
+/// successfully enqueued event. The host installs a `tokio::sync::Notify`-backed
+/// closure so every Canvas/GL/swap/RAF-backpressure/context event is delivered
+/// promptly without a polling timer; `Notify` coalesces bursts to one permit.
+pub fn channel_with_wake(
+    wake: Arc<dyn Fn() + Send + Sync>,
+) -> (RenderEventSender, RenderEventReceiver) {
+    let (tx, rx) = bounded(EVENT_CHANNEL_CAPACITY);
+    (
+        RenderEventSender {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            wake: Some(wake),
+        },
+        rx,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EVENT_CHANNEL_CAPACITY, RenderEvent, channel_with_wake};
+    use crate::error::ErrorCode;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Poll `Notify::notified()` once with a no-op waker; returns whether a
+    /// permit was present (and consumes it if so).
+    fn took_permit(notify: &tokio::sync::Notify) -> bool {
+        use std::task::{Context, Poll};
+        let fut = notify.notified();
+        let mut fut = std::pin::pin!(fut);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        matches!(
+            std::future::Future::poll(fut.as_mut(), &mut cx),
+            Poll::Ready(())
+        )
+    }
+
+    fn all_variants() -> Vec<RenderEvent> {
+        vec![
+            RenderEvent::Canvas2DError {
+                code: ErrorCode::RenderBackendError,
+                message: "x".into(),
+            },
+            RenderEvent::GlError {
+                code: ErrorCode::RenderBackendError,
+                message: "x".into(),
+            },
+            RenderEvent::CanvasError {
+                code: ErrorCode::RenderBackendError,
+                message: "x".into(),
+            },
+            RenderEvent::SwapFailed {
+                message: "x".into(),
+            },
+            RenderEvent::ContextLost,
+            RenderEvent::ContextRecovered { success: true },
+            RenderEvent::RafBackpressure {
+                consecutive_drops: 3,
+            },
+        ]
+    }
+
+    #[test]
+    fn every_variant_wakes_after_a_successful_enqueue() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        let (tx, rx) = channel_with_wake(Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        let variants = all_variants();
+        let n = variants.len();
+        for (i, ev) in variants.into_iter().enumerate() {
+            tx.emit(ev);
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                i + 1,
+                "each successful enqueue must signal exactly once"
+            );
+        }
+        let mut drained = 0;
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(drained, n, "all events delivered");
+        assert_eq!(tx.dropped(), 0);
+    }
+
+    #[test]
+    fn burst_coalesces_via_a_notify_closure() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let n = Arc::clone(&notify);
+        let (tx, _rx) = channel_with_wake(Arc::new(move || {
+            n.notify_one();
+        }));
+        tx.emit(RenderEvent::ContextLost);
+        tx.emit(RenderEvent::ContextLost);
+        tx.emit(RenderEvent::ContextLost);
+        assert!(
+            took_permit(&notify),
+            "the first signal of the burst is delivered"
+        );
+        assert!(
+            !took_permit(&notify),
+            "a Notify closure coalesces the burst to a single permit"
+        );
+    }
+
+    #[test]
+    fn full_channel_is_non_blocking_and_claims_no_wake() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        // Keep the receiver alive so overflow is Full (not Disconnected).
+        let (tx, _rx) = channel_with_wake(Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            tx.emit(RenderEvent::ContextLost);
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            EVENT_CHANNEL_CAPACITY,
+            "each successful enqueue woke once"
+        );
+        for _ in 0..10 {
+            tx.emit(RenderEvent::ContextLost);
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            EVENT_CHANNEL_CAPACITY,
+            "a full channel drops without claiming a wake"
+        );
+        assert_eq!(tx.dropped(), 10, "dropped-event count is preserved");
+    }
+
+    #[test]
+    fn disconnected_send_does_not_wake() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        let (tx, rx) = channel_with_wake(Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        drop(rx);
+        tx.emit(RenderEvent::ContextLost);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "a disconnected send must not wake"
+        );
+        assert_eq!(tx.dropped(), 1, "dropped-event count is preserved");
+    }
 }

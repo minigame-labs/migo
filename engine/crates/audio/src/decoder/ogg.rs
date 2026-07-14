@@ -45,7 +45,9 @@ pub fn decode(data: &[u8]) -> EngineResult<DecodedAudio> {
         let frame_count = packet[0].len();
         // Reject a decode bomb before reserving/growing the buffer.
         if !crate::limits::pcm_samples_within_budget(
-            samples.len().saturating_add(frame_count.saturating_mul(packet.len())),
+            samples
+                .len()
+                .saturating_add(frame_count.saturating_mul(packet.len())),
         ) {
             return Err(EngineError::from_detail(
                 ErrorCode::InvalidArgument,

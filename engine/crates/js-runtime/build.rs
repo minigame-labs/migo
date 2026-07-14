@@ -1,8 +1,8 @@
 //! Build script for js-runtime crate.
 //!
-//! Selects and validates the per-architecture V8 startup snapshot. A matching
-//! manifest sets `migo_has_snapshot` + `MIGO_SNAPSHOT_PATH`; stale or malformed
-//! inputs leave the runtime on its source-JS fallback.
+//! Selects and validates kind/profile/architecture-bound V8 startup snapshots.
+//! Host and Worker artifacts have independent cfg/env outputs and can never be
+//! substituted for one another.
 //!
 //! # Why per-arch + Android-only
 //!
@@ -11,7 +11,8 @@
 //! in an android-aarch64 V8, an android-x86_64 snapshot only in android-x86_64,
 //! and a host-linux V8 cannot use either. Therefore:
 //!
-//!   * We keep one snapshot per Android ABI under `snapshots/SNAPSHOT-<arch>.bin`
+//!   * We keep one snapshot per product and Android ABI under
+//!     `snapshots/SNAPSHOT-<profile>-<arch>.bin`
 //!     and pick the one matching `CARGO_CFG_TARGET_ARCH`. This makes a single
 //!     multi-ABI `build-aar.sh` invocation embed the *correct* snapshot into
 //!     each `.so` (embedding the wrong-arch snapshot would crash at startup with
@@ -37,15 +38,31 @@ use serde_json::Value;
 mod build_snapshot {
     include!("build_snapshot.rs");
 }
-use build_snapshot::{collect_js_files, sha256_file, snapshot_js_hash};
+use build_snapshot::{
+    ManifestIdentity, SNAPSHOT_SCHEMA_VERSION, SnapshotIdentity, collect_js_files,
+    collect_rust_files, require_materialized_size, sha256_file, snapshot_feature_hash,
+    snapshot_js_hash, snapshot_profile_features, snapshot_runtime_hash, validate_snapshot_identity,
+};
 
 fn main() {
     // Declare custom cfg for check-cfg lint.
     println!("cargo::rustc-check-cfg=cfg(migo_has_snapshot)");
+    println!("cargo::rustc-check-cfg=cfg(migo_has_worker_snapshot)");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PROFILE_FULL");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PROFILE_SLIM");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WORKER_SNAPSHOT");
+    println!("cargo:rerun-if-env-changed=RUSTY_V8_ARCHIVE");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let profile = std::env::var("PROFILE").unwrap_or_default();
+    let product_profile = match selected_product_profile() {
+        Ok(profile) => profile,
+        Err(reason) => {
+            println!("cargo:warning={reason}; loading JS from source");
+            return;
+        }
+    };
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir
@@ -53,10 +70,23 @@ fn main() {
         .nth(3)
         .expect("js-runtime must live under <repo>/engine/crates");
     let cargo_lock = repo_root.join("engine/Cargo.lock");
+    let v8_archive = std::env::var_os("RUSTY_V8_ARCHIVE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            repo_root
+                .join("engine/third_party/rusty_v8")
+                .join(&target_arch)
+                .join("librusty_v8.a")
+        });
     let snapshot_path = manifest_dir
         .join("snapshots")
-        .join(format!("SNAPSHOT-{target_arch}.bin"));
+        .join(format!("SNAPSHOT-{product_profile}-{target_arch}.bin"));
     let snapshot_manifest = PathBuf::from(format!("{}.manifest.json", snapshot_path.display()));
+    let worker_snapshot_path = manifest_dir.join("snapshots").join(format!(
+        "SNAPSHOT-worker-{product_profile}-{target_arch}.bin"
+    ));
+    let worker_snapshot_manifest =
+        PathBuf::from(format!("{}.manifest.json", worker_snapshot_path.display()));
 
     // Re-run if the snapshot or any input covered by its fingerprint changes.
     // Watching the directory recursively also catches newly-added JS files;
@@ -64,7 +94,13 @@ fn main() {
     println!("cargo:rerun-if-changed={}", manifest_dir.display());
     println!("cargo:rerun-if-changed={}", snapshot_path.display());
     println!("cargo:rerun-if-changed={}", snapshot_manifest.display());
+    println!("cargo:rerun-if-changed={}", worker_snapshot_path.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        worker_snapshot_manifest.display()
+    );
     println!("cargo:rerun-if-changed={}", cargo_lock.display());
+    println!("cargo:rerun-if-changed={}", v8_archive.display());
 
     // Enumerate extension JS. On ANY error, fail safe: a partial set could
     // hash-match a stale manifest and wrongly accept an outdated snapshot, so
@@ -82,6 +118,18 @@ fn main() {
     for path in &js_files {
         println!("cargo:rerun-if-changed={}", path.display());
     }
+    let rust_files = match collect_rust_files(manifest_dir) {
+        Ok(files) => files,
+        Err(error) => {
+            println!(
+                "cargo:warning=Failed to enumerate snapshot Rust inputs: {error}; loading JS from source"
+            );
+            return;
+        }
+    };
+    for path in &rust_files {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 
     // V8 startup snapshots only load in the matching android-<arch> V8. Never
     // embed for host (linux/macos) builds — they use the from-source path.
@@ -96,6 +144,10 @@ fn main() {
             &snapshot_manifest,
             &cargo_lock,
             &js_files,
+            &rust_files,
+            &v8_archive,
+            "host",
+            product_profile,
             &target_arch,
         ) {
             Ok(()) => {
@@ -106,22 +158,70 @@ fn main() {
                     snapshot_path.display()
                 );
                 println!(
-                    "cargo:warning=Validated V8 snapshot for {} ({} bytes), embedding into binary",
+                    "cargo:warning=Validated V8 snapshot for {}-{} ({} bytes), embedding into binary",
+                    product_profile,
                     target_arch,
                     fs::metadata(&snapshot_path).map(|m| m.len()).unwrap_or(0)
                 );
             }
             Err(reason) => {
                 println!(
-                    "cargo:warning=Ignoring stale or invalid V8 snapshot for {target_arch}: {reason}; loading JS from source"
+                    "cargo:warning=Ignoring stale or invalid V8 snapshot for {product_profile}-{target_arch}: {reason}; loading JS from source"
                 );
             }
         }
     } else if profile == "release" {
         println!(
-            "cargo:warning=No V8 snapshot for {target_arch} at {} — release build will load JS from source (slower cold start)",
+            "cargo:warning=No V8 snapshot for {product_profile}-{target_arch} at {} — release build will load JS from source (slower cold start)",
             snapshot_path.display()
         );
+    }
+
+    if std::env::var_os("CARGO_FEATURE_WORKER_SNAPSHOT").is_some() {
+        if product_profile != "full" {
+            println!(
+                "cargo:warning=Worker snapshots require profile-full; explicit selection will fail closed"
+            );
+            return;
+        }
+        if worker_snapshot_path.exists() {
+            match validate_snapshot(
+                repo_root,
+                &worker_snapshot_path,
+                &worker_snapshot_manifest,
+                &cargo_lock,
+                &js_files,
+                &rust_files,
+                &v8_archive,
+                "worker",
+                product_profile,
+                &target_arch,
+            ) {
+                Ok(()) => {
+                    println!("cargo:rustc-cfg=migo_has_worker_snapshot");
+                    println!(
+                        "cargo:rustc-env=MIGO_WORKER_SNAPSHOT_PATH={}",
+                        worker_snapshot_path.display()
+                    );
+                    println!(
+                        "cargo:warning=Validated Worker V8 snapshot for {}-{} ({} bytes), embedding into opt-in binary",
+                        product_profile,
+                        target_arch,
+                        fs::metadata(&worker_snapshot_path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0)
+                    );
+                }
+                Err(reason) => println!(
+                    "cargo:warning=Worker snapshot for {product_profile}-{target_arch} is stale or invalid: {reason}; explicit selection will fail closed"
+                ),
+            }
+        } else {
+            println!(
+                "cargo:warning=No Worker V8 snapshot for {product_profile}-{target_arch} at {}; explicit selection will fail closed",
+                worker_snapshot_path.display()
+            );
+        }
     }
 }
 
@@ -131,6 +231,10 @@ fn validate_snapshot(
     manifest_path: &Path,
     cargo_lock: &Path,
     js_files: &[PathBuf],
+    rust_files: &[PathBuf],
+    v8_archive: &Path,
+    snapshot_kind: &str,
+    product_profile: &str,
     target_arch: &str,
 ) -> Result<(), String> {
     let manifest_bytes = fs::read(manifest_path)
@@ -138,7 +242,64 @@ fn validate_snapshot(
     let manifest: Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("manifest JSON is invalid: {error}"))?;
 
-    require_manifest_value(&manifest, "arch", target_arch)?;
+    let snapshot_size = fs::metadata(snapshot_path)
+        .map_err(|error| format!("snapshot {} unavailable: {error}", snapshot_path.display()))?
+        .len();
+    require_materialized_size("snapshot", snapshot_size)?;
+    let expected_features = snapshot_profile_features(product_profile)?;
+    let expected_feature_hash = snapshot_feature_hash(expected_features);
+    let expected_runtime_hash = snapshot_runtime_hash(repo_root, rust_files)?;
+    let expected_js_hash = snapshot_js_hash(repo_root, js_files)?;
+    let expected_deno = deno_core_version(cargo_lock)?;
+    let v8_size = fs::metadata(v8_archive)
+        .map_err(|error| format!("V8 archive {} unavailable: {error}", v8_archive.display()))?
+        .len();
+    require_materialized_size(&format!("V8 archive {}", v8_archive.display()), v8_size)?;
+    let expected_v8_hash = sha256_file(v8_archive)
+        .map_err(|error| format!("cannot hash V8 archive {}: {error}", v8_archive.display()))?;
+    validate_snapshot_identity(
+        ManifestIdentity {
+            schema_version: manifest.get("schema_version").and_then(Value::as_u64),
+            snapshot_kind: manifest.get("snapshot_kind").and_then(Value::as_str),
+            profile: manifest.get("profile").and_then(Value::as_str),
+            arch: manifest.get("arch").and_then(Value::as_str),
+            features_sha256: manifest.get("features_sha256").and_then(Value::as_str),
+            rust_sources_sha256: manifest.get("rust_sources_sha256").and_then(Value::as_str),
+            v8_archive_sha256: manifest.get("v8_archive_sha256").and_then(Value::as_str),
+            js_sources_sha256: manifest.get("js_sources_sha256").and_then(Value::as_str),
+            deno_core_version: manifest.get("deno_core_version").and_then(Value::as_str),
+            snapshot_size: manifest.get("snapshot_size").and_then(Value::as_u64),
+        },
+        SnapshotIdentity {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            snapshot_kind,
+            profile: product_profile,
+            arch: target_arch,
+            features_sha256: &expected_feature_hash,
+            rust_sources_sha256: &expected_runtime_hash,
+            v8_archive_sha256: &expected_v8_hash,
+            js_sources_sha256: &expected_js_hash,
+            deno_core_version: &expected_deno,
+            snapshot_size,
+        },
+    )?;
+
+    let manifest_features = manifest
+        .get("features")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "manifest field \"features\" is missing or not an array".to_string())?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| "manifest features contains a non-string".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if manifest_features != expected_features {
+        return Err(format!(
+            "manifest features mismatch (manifest={manifest_features:?}, target={expected_features:?})"
+        ));
+    }
 
     let expected_snapshot_hash = manifest_string(&manifest, "snapshot_sha256")?;
     let actual_snapshot_hash =
@@ -149,29 +310,17 @@ fn validate_snapshot(
         &actual_snapshot_hash,
     )?;
 
-    let expected_js_hash = manifest_string(&manifest, "js_sources_sha256")?;
-    let actual_js_hash = snapshot_js_hash(repo_root, js_files)?;
-    require_equal_hash("extension JS", expected_js_hash, &actual_js_hash)?;
-
-    let expected_deno = manifest_string(&manifest, "deno_core_version")?;
-    let actual_deno = deno_core_version(cargo_lock)?;
-    if expected_deno != actual_deno {
-        return Err(format!(
-            "deno_core changed (manifest={expected_deno}, current={actual_deno})"
-        ));
-    }
-
     Ok(())
 }
 
-fn require_manifest_value(manifest: &Value, field: &str, expected: &str) -> Result<(), String> {
-    let actual = manifest_string(manifest, field)?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(format!(
-            "manifest {field} mismatch (manifest={actual}, target={expected})"
-        ))
+fn selected_product_profile() -> Result<&'static str, String> {
+    let full = std::env::var_os("CARGO_FEATURE_PROFILE_FULL").is_some();
+    let slim = std::env::var_os("CARGO_FEATURE_PROFILE_SLIM").is_some();
+    match (full, slim) {
+        (true, false) => Ok("full"),
+        (false, true) => Ok("slim"),
+        (true, true) => Err("both snapshot product profiles are enabled".to_string()),
+        (false, false) => Err("no named snapshot product profile is enabled".to_string()),
     }
 }
 

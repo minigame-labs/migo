@@ -1134,6 +1134,9 @@ pub enum GLCmd {
     DeleteRenderbuffer {
         renderbuffer_id: RenderbufferId,
     },
+    DeleteBuffer {
+        buffer_id: BufferId,
+    },
     BindRenderbuffer {
         canvas_id: CanvasId,
         target: u32,

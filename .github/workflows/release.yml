@@ -17,13 +17,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-        # No LFS needed: the freshness gate reads only *.manifest.json + source.
+        # No LFS download: freshness reads committed pointer oid/size identities.
 
-      # Block the release if a committed per-arch snapshot is stale vs the
-      # current embedded JS / deno_core — a stale snapshot bakes OLD JS into the
-      # shipped .so. Regenerate (see snapshots/README.md) before tagging.
+      # Block the release if any committed profile/ABI snapshot identity is
+      # stale. Regenerate all affected products (see snapshots/README.md) before
+      # tagging.
       - name: Check snapshot freshness
-        run: bash scripts/check-snapshot-freshness.sh
+        run: |
+          bash scripts/check-snapshot-freshness.sh --product-profile full
+          bash scripts/check-snapshot-freshness.sh --product-profile slim
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -56,6 +58,11 @@ jobs:
       - name: Shell script syntax check
         run: bash -n scripts/*.sh scripts/ci/*.sh
 
+      - name: Product profile and R8 contract gates
+        run: |
+          bash scripts/test-product-profiles.sh
+          bash scripts/test-r8-profile-contract.sh
+
   # ── Job 2: Release AAR build ────────────────────────────────────────
   release-android:
     needs: quality-gate
@@ -69,18 +76,19 @@ jobs:
           lfs: true
 
       # checkout leaves LFS objects as ~130-byte pointers; force-smudge the V8
-      # archives + per-arch snapshots this release links/embeds (both shipped
-      # ABIs). Without this the link fails with "could not find native static
-      # library rusty_v8", and build.rs would bake a pointer stub in as the
-      # "snapshot" (it only checks .exists(), no size guard) → V8 crash on load.
+      # archives + profile/ABI snapshots this release links/embeds. build.rs also
+      # rejects unresolved pointers, but a release must fail rather than silently
+      # take the slower source-JS fallback.
       - name: Materialize LFS objects (V8 archives + snapshots)
         run: |
-          git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/js-runtime/snapshots/SNAPSHOT-aarch64.bin,engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin"
+          git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/js-runtime/snapshots/SNAPSHOT-*.bin"
           for f in \
             engine/third_party/rusty_v8/aarch64/librusty_v8.a \
             engine/third_party/rusty_v8/x86_64/librusty_v8.a \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-aarch64.bin \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin ; do
+            engine/crates/js-runtime/snapshots/SNAPSHOT-full-aarch64.bin \
+            engine/crates/js-runtime/snapshots/SNAPSHOT-full-x86_64.bin \
+            engine/crates/js-runtime/snapshots/SNAPSHOT-slim-aarch64.bin \
+            engine/crates/js-runtime/snapshots/SNAPSHOT-slim-x86_64.bin ; do
             sz=$(stat -c %s "$f")
             echo "$f: $sz bytes"
             [ "$sz" -gt 100000 ] || { echo "ERROR: $f is still an LFS pointer"; exit 1; }
@@ -127,13 +135,17 @@ jobs:
           key: gradle-${{ hashFiles('platforms/android/**/*.gradle*') }}
           restore-keys: gradle-
 
-      - name: Build Android AAR (release)
-        run: bash scripts/build-aar.sh release
+      - name: Build Android AARs (release)
+        run: |
+          bash scripts/build-aar.sh --product-profile full release
+          bash scripts/build-aar.sh --product-profile slim release
 
       - name: Analyze AAR size report
         run: |
-          python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-release.aar \
-            > platforms/android/dist/size-report.txt || true
+          python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-full-release.aar \
+            > platforms/android/dist/size-report-full.txt || true
+          python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-slim-release.aar \
+            > platforms/android/dist/size-report-slim.txt || true
 
       - name: Generate checksums
         run: |

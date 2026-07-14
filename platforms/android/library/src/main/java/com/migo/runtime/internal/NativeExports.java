@@ -23,6 +23,7 @@ import com.migo.runtime.callback.SubpackageHandler;
 
 import com.migo.runtime.GameSession;
 import com.migo.runtime.SessionState;
+import com.migo.runtime.BuildConfig;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -198,17 +199,29 @@ public final class NativeExports {
 
     /** Suspend sensors, BLE scans, camera capture, and video for OnHide. */
     public static void suspendPowerSensitiveManagers(int sessionId) {
-        SensorExports.suspendPowerSensitiveManagers(sessionId);
-        BluetoothExports.suspendPowerSensitiveManagers(sessionId);
-        MediaExports.suspendPowerSensitiveManagers(sessionId);
+        if (BuildConfig.MIGO_API_SENSORS) {
+            SensorExports.suspendPowerSensitiveManagers(sessionId);
+        }
+        if (BuildConfig.MIGO_API_CONNECTIVITY) {
+            BluetoothExports.suspendPowerSensitiveManagers(sessionId);
+        }
+        if (BuildConfig.MIGO_API_MEDIA) {
+            MediaExports.suspendPowerSensitiveManagers(sessionId);
+        }
     }
 
     /** Restore only platform resources still requested when the session runs. */
     public static void resumePowerSensitiveManagers(int sessionId) {
         if (isSessionResourceSuspended(sessionId)) return;
-        MediaExports.resumePowerSensitiveManagers(sessionId);
-        BluetoothExports.resumePowerSensitiveManagers(sessionId);
-        SensorExports.resumePowerSensitiveManagers(sessionId);
+        if (BuildConfig.MIGO_API_MEDIA) {
+            MediaExports.resumePowerSensitiveManagers(sessionId);
+        }
+        if (BuildConfig.MIGO_API_CONNECTIVITY) {
+            BluetoothExports.resumePowerSensitiveManagers(sessionId);
+        }
+        if (BuildConfig.MIGO_API_SENSORS) {
+            SensorExports.resumePowerSensitiveManagers(sessionId);
+        }
     }
 
     /**
@@ -2464,11 +2477,17 @@ public final class NativeExports {
      * @param sessionId The session ID
      */
     public static void destroyAllManagers(int sessionId) {
-        SensorExports.destroyAll(sessionId);
-        NetworkExports.destroyAll(sessionId);
-        MediaExports.destroyAll(sessionId);
+        if (BuildConfig.MIGO_API_SENSORS) {
+            SensorExports.destroyAll(sessionId);
+            NetworkExports.destroyAll(sessionId);
+        }
+        if (BuildConfig.MIGO_API_MEDIA) {
+            MediaExports.destroyAll(sessionId);
+        }
         InputExports.destroyAll(sessionId);
-        BluetoothExports.destroyAll(sessionId);
+        if (BuildConfig.MIGO_API_CONNECTIVITY) {
+            BluetoothExports.destroyAll(sessionId);
+        }
         clearGameLogHandler(sessionId);
         clearAuthHandler(sessionId);
         clearSubpackageHandler(sessionId);

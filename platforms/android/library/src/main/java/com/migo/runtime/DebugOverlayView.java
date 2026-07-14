@@ -295,7 +295,7 @@ public class DebugOverlayView extends LinearLayout {
         // Tail-append only; a v3 native (payload 92) will simply
         // short-circuit these reads to 0 via the length guards.
         int renderQueueLen      = data.length >= h + 96  ? buf.getInt(h + 92)  : 0;
-        int collectorPending    = data.length >= h + 100 ? buf.getInt(h + 96)  : 0;
+        int collectorFramePeak  = data.length >= h + 100 ? buf.getInt(h + 96)  : 0;
         int webglErrOverflow    = data.length >= h + 104 ? buf.getInt(h + 100) : 0;
         int skImageWrappers     = data.length >= h + 108 ? buf.getInt(h + 104) : 0;
         int deferredUploads     = data.length >= h + 112 ? buf.getInt(h + 108) : 0;
@@ -346,15 +346,16 @@ public class DebugOverlayView extends LinearLayout {
                 uploadInfo));
         rowRender.setTextColor((rafLatencyUs > 0 || swapBlockUs > 0) ? LABEL_COLOR : TEXT_COLOR);
 
-        // Queue / cache observability row (v4).  Collector pending
-        // bytes is shown in KiB to keep the line short; a rising
+        // Queue / cache observability row (v4). PB is the peak bytes retained
+        // by the collector in the most recently completed logical JS frame,
+        // shown in KiB to keep the line short; a rising
         // render queue depth near the 512 cap means the host
         // thread is on the verge of blocking in CommandSender::send.
-        int collectorKb = (int) ((collectorPending & 0xFFFFFFFFL) / 1024);
+        int collectorPeakKb = (int) ((collectorFramePeak & 0xFFFFFFFFL) / 1024);
         rowQueue.setText(String.format(
                 "Q: %d  PB: %dKB  WR: %d  SK: %d  DU: %d",
                 renderQueueLen & 0xFFFFFFFFL,
-                collectorKb,
+                collectorPeakKb,
                 webglErrOverflow & 0xFFFFFFFFL,
                 skImageWrappers & 0xFFFFFFFFL,
                 deferredUploads & 0xFFFFFFFFL));

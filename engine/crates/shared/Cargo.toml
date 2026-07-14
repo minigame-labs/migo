@@ -35,5 +35,5 @@ bitflags = "2"
 lru = { workspace = true }
 smallvec = { workspace = true }
 
-[target.'cfg(target_os = "android")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

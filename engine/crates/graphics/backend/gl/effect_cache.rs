@@ -411,18 +411,8 @@ fn hash_intervals(intervals: &[f32]) -> u64 {
 mod tests {
     use super::*;
 
-    /// Alias to the crate-wide diagnostics test guard.  See
-    /// [`crate::render_diagnostics::TEST_GUARD`] for the rationale
-    /// — any test whose production path touches the diagnostics
-    /// SINK must take this mutex, otherwise cross-module parallel
-    /// tests stomp on each other's metric assertions.
-    fn guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::render_diagnostics::test_guard()
-    }
-
     #[test]
     fn shadow_cache_hits_on_identical_params() {
-        let _g = guard();
         clear_all();
         let color = 0xFF00_0000u32;
         let a = get_or_build_drop_shadow(color, 4.0, 4.0, 2.0, 2.0).expect("build");
@@ -444,7 +434,6 @@ mod tests {
 
     #[test]
     fn shadow_cache_distinguishes_colour_and_sigma() {
-        let _g = guard();
         clear_all();
         let _ = get_or_build_drop_shadow(0xFF00_0000, 4.0, 4.0, 2.0, 2.0).unwrap();
         let _ = get_or_build_drop_shadow(0xFFFF_0000, 4.0, 4.0, 2.0, 2.0).unwrap();
@@ -461,7 +450,6 @@ mod tests {
 
     #[test]
     fn dash_cache_hits_on_identical_intervals_and_phase() {
-        let _g = guard();
         clear_all();
         let _ = get_or_build_dash(&[4.0, 2.0], 0.0).unwrap();
         let _ = get_or_build_dash(&[4.0, 2.0], 0.0).unwrap();
@@ -472,7 +460,6 @@ mod tests {
 
     #[test]
     fn dash_cache_preserves_interval_order() {
-        let _g = guard();
         clear_all();
         // [4, 2] and [2, 4] render differently; the cache MUST
         // NOT alias them even if a naive multiset hash would.
@@ -485,14 +472,12 @@ mod tests {
 
     #[test]
     fn dash_rejects_empty_intervals() {
-        let _g = guard();
         clear_all();
         assert!(get_or_build_dash(&[], 0.0).is_none());
     }
 
     #[test]
     fn dash_cache_distinguishes_phase() {
-        let _g = guard();
         clear_all();
         let _ = get_or_build_dash(&[4.0, 2.0], 0.0).unwrap();
         let _ = get_or_build_dash(&[4.0, 2.0], 1.0).unwrap();
@@ -503,10 +488,8 @@ mod tests {
 
     // ---- metrics wiring (P1-3a/b + P1-5) --------------------------
 
-    /// Helper: run `body` with a fresh DebugStats sink installed
-    /// and cleaned up afterwards.  Callers must hold the module's
-    /// `TEST_GUARD` mutex so concurrent effect_cache tests don't
-    /// bump counters on the installed sink.
+    /// Run `body` with a fresh current-thread `DebugStats` sink installed and
+    /// clean it up afterwards. TLS keeps parallel tests isolated.
     fn with_sink<F: FnOnce(&std::sync::Arc<shared::stats::DebugStats>)>(f: F) {
         use crate::render_diagnostics;
         render_diagnostics::uninstall_for_tests();
@@ -518,18 +501,19 @@ mod tests {
 
     #[test]
     fn shadow_cache_miss_and_hit_each_bump_respective_metric() {
-        let _g = guard();
         with_sink(|stats| {
             use std::sync::atomic::Ordering;
             clear_all();
 
             // First call: miss.
             let _ = get_or_build_drop_shadow(0xFF00_0000, 4.0, 4.0, 2.0, 2.0).unwrap();
+            crate::render_diagnostics::flush_frame();
             assert_eq!(stats.shadow_filter_misses.load(Ordering::Relaxed), 1);
             assert_eq!(stats.shadow_filter_hits.load(Ordering::Relaxed), 0);
 
             // Second call with same params: hit.
             let _ = get_or_build_drop_shadow(0xFF00_0000, 4.0, 4.0, 2.0, 2.0).unwrap();
+            crate::render_diagnostics::flush_frame();
             assert_eq!(stats.shadow_filter_misses.load(Ordering::Relaxed), 1);
             assert_eq!(stats.shadow_filter_hits.load(Ordering::Relaxed), 1);
         });
@@ -537,16 +521,17 @@ mod tests {
 
     #[test]
     fn dash_cache_miss_and_hit_each_bump_respective_metric() {
-        let _g = guard();
         with_sink(|stats| {
             use std::sync::atomic::Ordering;
             clear_all();
 
             let _ = get_or_build_dash(&[4.0, 2.0], 0.0).unwrap();
+            crate::render_diagnostics::flush_frame();
             assert_eq!(stats.dash_effect_misses.load(Ordering::Relaxed), 1);
             assert_eq!(stats.dash_effect_hits.load(Ordering::Relaxed), 0);
 
             let _ = get_or_build_dash(&[4.0, 2.0], 0.0).unwrap();
+            crate::render_diagnostics::flush_frame();
             assert_eq!(stats.dash_effect_misses.load(Ordering::Relaxed), 1);
             assert_eq!(stats.dash_effect_hits.load(Ordering::Relaxed), 1);
         });
@@ -554,7 +539,6 @@ mod tests {
 
     #[test]
     fn distinct_params_all_register_as_misses() {
-        let _g = guard();
         with_sink(|stats| {
             use std::sync::atomic::Ordering;
             clear_all();
@@ -563,6 +547,7 @@ mod tests {
             let _ = get_or_build_drop_shadow(0xFF00_0000, 4.0, 4.0, 2.0, 2.0).unwrap();
             let _ = get_or_build_drop_shadow(0xFFFF_0000, 4.0, 4.0, 2.0, 2.0).unwrap();
             let _ = get_or_build_drop_shadow(0xFF00_0000, 8.0, 8.0, 2.0, 2.0).unwrap();
+            crate::render_diagnostics::flush_frame();
             assert_eq!(stats.shadow_filter_misses.load(Ordering::Relaxed), 3);
             assert_eq!(stats.shadow_filter_hits.load(Ordering::Relaxed), 0);
         });
@@ -586,7 +571,6 @@ mod tests {
 
     #[test]
     fn linear_gradient_hits_on_identical_params_and_same_arc() {
-        let _g = guard();
         clear_all();
         let stops = simple_stops();
         let _ = get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0).expect("build");
@@ -599,7 +583,6 @@ mod tests {
 
     #[test]
     fn linear_gradient_distinguishes_geometry() {
-        let _g = guard();
         clear_all();
         let stops = simple_stops();
         let _ = get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0).unwrap();
@@ -612,7 +595,6 @@ mod tests {
 
     #[test]
     fn gradient_distinguishes_global_alpha() {
-        let _g = guard();
         clear_all();
         let stops = simple_stops();
         let _ = get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0).unwrap();
@@ -624,7 +606,6 @@ mod tests {
 
     #[test]
     fn radial_and_conic_gradient_build() {
-        let _g = guard();
         clear_all();
         let stops = simple_stops();
         assert!(
@@ -635,7 +616,6 @@ mod tests {
 
     #[test]
     fn gradient_cache_miss_and_hit_each_bump_metric() {
-        let _g = guard();
         with_sink(|stats| {
             use std::sync::atomic::Ordering;
             clear_all();
@@ -643,11 +623,13 @@ mod tests {
 
             // First call: miss.
             let _ = get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0).expect("build");
+            crate::render_diagnostics::flush_frame();
             assert_eq!(stats.gradient_misses.load(Ordering::Relaxed), 1);
             assert_eq!(stats.gradient_hits.load(Ordering::Relaxed), 0);
 
             // Second call with same Arc + same geometry: hit.
             let _ = get_or_build_linear_gradient(0.0, 0.0, 100.0, 0.0, &stops, 1.0).expect("build");
+            crate::render_diagnostics::flush_frame();
             assert_eq!(stats.gradient_misses.load(Ordering::Relaxed), 1);
             assert_eq!(stats.gradient_hits.load(Ordering::Relaxed), 1);
         });

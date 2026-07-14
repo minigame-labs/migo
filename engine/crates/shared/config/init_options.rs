@@ -104,12 +104,12 @@ pub struct InitOptions {
     /// Maximum memory limit for JavaScript runtime in MB.
     max_memory_mb: i32,
     /// Whether the ANR watchdog is enabled.
-    /// When enabled, a background thread monitors the host thread's heartbeat
-    /// and terminates the V8 isolate if it becomes unresponsive.
+    /// When enabled, the process deadline scheduler guards each synchronous V8
+    /// execution/poll and terminates an isolate that exceeds its budget.
     watchdog_enabled: bool,
     /// ANR watchdog timeout in seconds.
-    /// If the host thread doesn't heartbeat within this duration, the watchdog
-    /// will terminate the V8 isolate and report an ANR.
+    /// If one guarded V8 execution does not return within this duration, the
+    /// watchdog terminates the isolate and reports an ANR.
     /// Clamped to [5, 120]. Default: 10.
     watchdog_timeout_secs: i32,
     /// Whether code signing verification is enforced.
@@ -417,8 +417,8 @@ impl InitOptions {
 
     /// Enable or disable the ANR watchdog (builder pattern).
     ///
-    /// When enabled, a background thread monitors the host thread's heartbeat
-    /// and terminates the V8 isolate if it becomes unresponsive.
+    /// When enabled, the process deadline scheduler guards synchronous V8
+    /// execution and terminates an isolate that exceeds its budget.
     ///
     /// # Arguments
     ///

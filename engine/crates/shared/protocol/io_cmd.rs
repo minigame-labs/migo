@@ -183,7 +183,7 @@ pub struct CompressedImage {
 ///
 /// `Clone` is cheap on every variant: `Rgba` clones an `Arc<Vec<u8>>`,
 /// `Compressed` clones an `Arc<Vec<u8>>`, `HardwareBuffer` clones an
-/// `Arc<AhbBox>` (one `_acquire` on Android).
+/// `Arc<AhbBox>` (one Rust atomic refcount increment).
 #[derive(Debug, Clone)]
 pub enum DecodedImage {
     Rgba(NormalizedImage),
@@ -342,7 +342,7 @@ mod tests {
         // decoder wrote into the AHB must come back out of `into_rgba`
         // unchanged, regardless of the driver's row stride padding.
         let pixels = checker_2x2();
-        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled(2, 2)).expect("alloc");
+        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled_cpu_decode(2, 2)).expect("alloc");
         write_rgba_into_ahb(&ahb, &pixels).expect("write");
         let img = DecodedImage::HardwareBuffer(AhbImage::new(2, 2, ahb));
 
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn cloning_decoded_image_does_not_copy_pixels() {
         let pixels = checker_2x2();
-        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled(2, 2)).unwrap();
+        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled_cpu_decode(2, 2)).unwrap();
         write_rgba_into_ahb(&ahb, &pixels).unwrap();
         let img = DecodedImage::HardwareBuffer(AhbImage::new(2, 2, ahb));
 

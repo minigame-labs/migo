@@ -7,16 +7,24 @@ edition = "2024"
 path = "lib.rs"
 
 [features]
-default = ["v8-limits", "code-signing"]
+default = ["profile-full"]
+profile-full = ["js-runtime/profile-full", "v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system", "graphics/profile-full"]
+profile-slim = ["js-runtime/profile-slim", "v8-limits", "code-signing", "graphics/profile-slim"]
+worker-snapshot = ["js-runtime/worker-snapshot"]
 v8-limits = ["js-runtime/v8-limits", "shared/v8-limits"]
 code-signing = ["js-runtime/code-signing", "shared/code-signing"]
+api-sensors = ["js-runtime/api-sensors"]
+api-media = ["js-runtime/api-media", "dep:audio"]
+api-connectivity = ["js-runtime/api-connectivity"]
+api-commerce = ["js-runtime/api-commerce"]
+api-system = ["js-runtime/api-system"]
 
 [dependencies]
-shared = {path = "../shared"}
-js-runtime = {path = "../js-runtime"}
-graphics = {path = "../graphics"}
+shared = { path = "../shared", default-features = false }
+js-runtime = { path = "../js-runtime", default-features = false }
+graphics = { path = "../graphics", default-features = false }
 io = { path = "../io", default-features = false }
-audio = {path = "../audio"}
+audio = { path = "../audio", default-features = false, optional = true }
 crossbeam-channel = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
@@ -32,5 +40,5 @@ parking_lot = { workspace = true }
 # - codec-gbk: GBK encoding via `encoding_rs` crate (Android uses java.nio.charset via JNI)
 # - rust-image-decode: image/zune-image decoders (Android uses BitmapFactory via JNI)
 [target.'cfg(not(target_os = "android"))'.dependencies]
-io = { path = "../io", features = ["zip-extract", "rust-image-decode"] }
-shared = { path = "../shared", features = ["codec-gbk"] }
+io = { path = "../io", default-features = false, features = ["zip-extract", "rust-image-decode"] }
+shared = { path = "../shared", default-features = false, features = ["codec-gbk"] }

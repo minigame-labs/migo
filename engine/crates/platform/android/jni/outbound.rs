@@ -1323,8 +1323,12 @@ pub fn decode_image_ahb_jni(
                 // Adopt the Java-bumped refcount. Descriptor width
                 // and height come straight from the decoder.
                 let desc = AhbDesc::rgba_sampled(width, height);
-                let ahb = OwnedAhb::from_raw_owned(ahb_ptr as *mut std::ffi::c_void, desc)
-                    .map_err(|e| format!("AHB adopt: {e}"))?;
+                // SAFETY: the trusted Java bridge returns a live AHB pointer
+                // with one native reference transferred to Rust. This path
+                // creates the canonical wrapper; any Rust sharing uses Clone.
+                let ahb =
+                    unsafe { OwnedAhb::from_raw_owned(ahb_ptr as *mut std::ffi::c_void, desc) }
+                        .map_err(|e| format!("AHB adopt: {e}"))?;
                 Ok(AhbImage::new(width, height, ahb))
             }
             Err(e) => {

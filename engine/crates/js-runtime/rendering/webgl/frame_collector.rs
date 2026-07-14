@@ -5,6 +5,8 @@
 //! built with `Materialize` barriers inserted at Canvas2D→GL transitions.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use shared::command_vec_pool::{
     recycle_gl_command_vec, take_canvas_command_vec, take_gl_command_vec,
@@ -147,6 +149,12 @@ pub(crate) struct UnifiedFrameCollector {
     /// `build_frame_packet_inner` consumes the segments.  See
     /// [`AUTO_FLUSH_SOFT_BUDGET_BYTES`] for the flush policy.
     pending_bytes: usize,
+    /// High-water mark across every partial batch in the current logical JS
+    /// frame. A sync/auto-flush barrier resets `pending_bytes` but not this
+    /// value; only `build_frame_packet` publishes and resets it.
+    frame_peak_bytes: usize,
+    diagnostics_host_id: Option<i32>,
+    diagnostics_stats: Option<Arc<shared::stats::DebugStats>>,
 }
 
 /// Soft cap on the approximate byte-size of pending commands in the
@@ -170,11 +178,50 @@ pub(crate) struct UnifiedFrameCollector {
 pub(crate) const AUTO_FLUSH_SOFT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
 impl UnifiedFrameCollector {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::new_inner(None, None)
+    }
+
+    pub(crate) fn with_host_id(host_id: i32) -> Self {
+        Self::new_inner(Some(host_id), None)
+    }
+
+    #[cfg(test)]
+    fn with_diagnostics(stats: Arc<shared::stats::DebugStats>) -> Self {
+        Self::new_inner(None, Some(stats))
+    }
+
+    fn new_inner(
+        diagnostics_host_id: Option<i32>,
+        diagnostics_stats: Option<Arc<shared::stats::DebugStats>>,
+    ) -> Self {
         Self {
             segments: Vec::new(),
             current: CurrentKind::None,
             pending_bytes: 0,
+            frame_peak_bytes: 0,
+            diagnostics_host_id,
+            diagnostics_stats,
+        }
+    }
+
+    #[inline]
+    fn record_pending_peak(&mut self) {
+        self.frame_peak_bytes = self.frame_peak_bytes.max(self.pending_bytes);
+    }
+
+    fn publish_frame_peak(&mut self) {
+        let peak = self.frame_peak_bytes.min(u32::MAX as usize) as u32;
+        self.frame_peak_bytes = 0;
+
+        if self.diagnostics_stats.is_none()
+            && let Some(host_id) = self.diagnostics_host_id
+        {
+            self.diagnostics_stats = shared::stats::get_stats(host_id);
+        }
+        if let Some(stats) = &self.diagnostics_stats {
+            stats.collector_pending_bytes.store(peak, Ordering::Relaxed);
         }
     }
 
@@ -224,7 +271,7 @@ impl UnifiedFrameCollector {
         self.pending_bytes = self
             .pending_bytes
             .saturating_add(cmd.approx_deep_size_bytes());
-        shared::stats::set_collector_pending_bytes(self.pending_bytes as u32);
+        self.record_pending_peak();
         if let Some(FrameSegment::Canvas2D(seg)) = self.segments.last_mut() {
             seg.mark_dirty_for_cmd(&cmd);
             seg.commands.push(cmd);
@@ -246,7 +293,7 @@ impl UnifiedFrameCollector {
         self.pending_bytes = self
             .pending_bytes
             .saturating_add(cmd.approx_deep_size_bytes());
-        shared::stats::set_collector_pending_bytes(self.pending_bytes as u32);
+        self.record_pending_peak();
         if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
             seg.commands.push(cmd);
         }
@@ -287,7 +334,7 @@ impl UnifiedFrameCollector {
             self.current = CurrentKind::GL;
         }
         self.pending_bytes = self.pending_bytes.saturating_add(BASE_BYTES);
-        shared::stats::set_collector_pending_bytes(self.pending_bytes as u32);
+        self.record_pending_peak();
         if let Some(FrameSegment::GL(seg)) = self.segments.last_mut() {
             seg.commands.push(cmd);
         }
@@ -302,7 +349,7 @@ impl UnifiedFrameCollector {
     /// - Non-empty + current segment is not GL: move the input vec directly into a new
     ///   GL segment (same as `push_gl` creates a `GlSegment`).
     /// - Update `pending_bytes` ONCE via `saturating_add(approx_bytes)`.
-    /// - Call `shared::stats::set_collector_pending_bytes` EXACTLY once.
+    /// - Update the logical-frame high-water mark exactly once.
     /// - Check the 4 MiB soft budget ONCE; returns `true` when the budget is exceeded
     ///   so the caller can invoke `maybe_auto_flush` (which re-borrows `OpState`).
     pub(crate) fn append_gl_batch(
@@ -331,7 +378,7 @@ impl UnifiedFrameCollector {
 
         // Update byte budget exactly once.
         self.pending_bytes = self.pending_bytes.saturating_add(approx_bytes);
-        shared::stats::set_collector_pending_bytes(self.pending_bytes as u32);
+        self.record_pending_peak();
 
         // Report whether auto-flush is needed; caller handles it.
         self.should_auto_flush()
@@ -359,7 +406,6 @@ impl UnifiedFrameCollector {
             // enforce and makes the flush protocol easier to
             // audit.
             self.pending_bytes = 0;
-            shared::stats::set_collector_pending_bytes(0);
             self.current = CurrentKind::None;
             return None;
         }
@@ -367,7 +413,6 @@ impl UnifiedFrameCollector {
         let segments = std::mem::take(&mut self.segments);
         self.current = CurrentKind::None;
         self.pending_bytes = 0;
-        shared::stats::set_collector_pending_bytes(0);
 
         let mut builder = shared::FramePacketBuilder::new(0, 0.0).push(FrameOp::BeginFrame);
 
@@ -418,7 +463,9 @@ impl UnifiedFrameCollector {
     /// Inserts `Materialize` ops at each Canvas2D→GL boundary.
     /// Resets the collector for the next frame.
     pub(crate) fn build_frame_packet(&mut self, present: bool) -> Option<shared::FramePacket> {
-        self.build_frame_packet_inner(present, false)
+        let packet = self.build_frame_packet_inner(present, false);
+        self.publish_frame_peak();
+        packet
     }
 
     /// Flush all pending segments as a non-presenting partial FramePacket.
@@ -724,6 +771,125 @@ pub(crate) fn flush_unified_barrier(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    fn clear_command() -> GLCmd {
+        GLCmd::Clear {
+            canvas_id: 1u32.into(),
+            bit_field: 0x4000,
+        }
+    }
+
+    #[test]
+    fn pushes_do_not_publish_before_logical_frame_end() {
+        let stats = Arc::new(shared::stats::DebugStats::default());
+        let mut collector = UnifiedFrameCollector::with_diagnostics(stats.clone());
+
+        collector.append_gl_batch(vec![clear_command()], 4_096);
+
+        assert_eq!(
+            stats.collector_pending_bytes.load(Ordering::Relaxed),
+            0,
+            "per-op collection must not write the shared diagnostic field"
+        );
+    }
+
+    #[test]
+    fn barrier_preserves_the_logical_frame_peak() {
+        let stats = Arc::new(shared::stats::DebugStats::default());
+        let mut collector = UnifiedFrameCollector::with_diagnostics(stats.clone());
+        collector.append_gl_batch(vec![clear_command()], 4_096);
+
+        assert!(collector.flush_as_barrier().is_some());
+        assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 0);
+
+        collector.append_gl_batch(vec![clear_command()], 1_024);
+        assert!(collector.build_frame_packet(true).is_some());
+        assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 4_096);
+    }
+
+    #[test]
+    fn frame_end_publishes_peak_then_resets_for_next_frame() {
+        let stats = Arc::new(shared::stats::DebugStats::default());
+        let mut collector = UnifiedFrameCollector::with_diagnostics(stats.clone());
+
+        collector.append_gl_batch(vec![clear_command()], 8_192);
+        assert!(collector.build_frame_packet(true).is_some());
+        assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 8_192);
+
+        collector.append_gl_batch(vec![clear_command()], 512);
+        assert!(collector.build_frame_packet(true).is_some());
+        assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 512);
+
+        assert!(collector.build_frame_packet(true).is_none());
+        assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn frame_peak_saturates_at_u32_max() {
+        let stats = Arc::new(shared::stats::DebugStats::default());
+        let mut collector = UnifiedFrameCollector::with_diagnostics(stats.clone());
+
+        collector.append_gl_batch(vec![clear_command()], usize::MAX);
+        assert!(collector.build_frame_packet(true).is_some());
+        assert_eq!(
+            stats.collector_pending_bytes.load(Ordering::Relaxed),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn two_collectors_publish_to_distinct_session_stats() {
+        let stats_a = Arc::new(shared::stats::DebugStats::default());
+        let stats_b = Arc::new(shared::stats::DebugStats::default());
+        let mut a = UnifiedFrameCollector::with_diagnostics(stats_a.clone());
+        let mut b = UnifiedFrameCollector::with_diagnostics(stats_b.clone());
+
+        a.append_gl_batch(vec![clear_command()], 1_111);
+        b.append_gl_batch(vec![clear_command()], 2_222);
+        assert!(a.build_frame_packet(true).is_some());
+        assert!(b.build_frame_packet(true).is_some());
+
+        assert_eq!(
+            stats_a.collector_pending_bytes.load(Ordering::Relaxed),
+            1_111
+        );
+        assert_eq!(
+            stats_b.collector_pending_bytes.load(Ordering::Relaxed),
+            2_222
+        );
+    }
+
+    #[test]
+    fn host_stats_lookup_retries_after_startup_race() {
+        static NEXT_HOST_ID: std::sync::atomic::AtomicI32 =
+            std::sync::atomic::AtomicI32::new(-1_000_000);
+        let host_id = NEXT_HOST_ID.fetch_sub(1, Ordering::Relaxed);
+        shared::stats::unregister_stats(host_id);
+        let mut collector = UnifiedFrameCollector::with_host_id(host_id);
+
+        collector.append_gl_batch(vec![clear_command()], 111);
+        assert!(collector.build_frame_packet(true).is_some());
+
+        let stats = shared::stats::register_stats(host_id);
+        collector.append_gl_batch(vec![clear_command()], 333);
+        assert!(collector.build_frame_packet(true).is_some());
+        assert_eq!(stats.collector_pending_bytes.load(Ordering::Relaxed), 333);
+        shared::stats::unregister_stats(host_id);
+    }
+
+    #[test]
+    fn production_wiring_has_no_per_op_global_publication() {
+        let collector = include_str!("frame_collector.rs");
+        let extension = include_str!("mod.rs");
+        let old_setter = ["set_collector_", "pending_bytes"].concat();
+        let old_static = ["COLLECTOR_", "PENDING_BYTES"].concat();
+
+        assert!(!collector.contains(&old_setter));
+        assert!(!collector.contains(&old_static));
+        assert!(extension.contains("UnifiedFrameCollector::with_host_id(host_id)"));
+    }
 
     #[test]
     fn empty_collector_returns_none() {

@@ -39,6 +39,9 @@
 //!   `AUDIT.md` P2-2 for the full-trait roadmap.
 //! - [`renderergl`]: WebGL 1.0 / 2.0 command handler (glow-backed).
 
+#[cfg(all(feature = "profile-full", feature = "profile-slim"))]
+compile_error!("profile-full and profile-slim are mutually exclusive");
+
 pub mod atlas;
 pub mod atrace;
 #[doc(hidden)]
@@ -51,8 +54,10 @@ pub mod device_caps;
 pub mod device_profile;
 pub mod dirty_region;
 pub mod frame_scheduler;
+pub mod image_decode_ahb;
 mod legacy_frame_bridge;
 pub mod render_diagnostics;
+mod render_frame_state;
 pub(crate) mod render_loop;
 mod render_server;
 mod render_thread;

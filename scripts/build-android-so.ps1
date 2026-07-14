@@ -7,6 +7,7 @@
 #   ./build-android.ps1 arm64-v8a
 #   ./build-android.ps1 arm64-v8a x86_64 release
 #   ./build-android.ps1 all release
+#   ./build-android.ps1 arm64-v8a release --codegen-profile=2
 # ============================================================
 
 param(
@@ -134,6 +135,9 @@ function Build-Platform {
     param(
         [string]$platform,
         [string]$buildType,
+        [string]$productProfile,
+        [string]$codegenProfile,
+        [bool]$workerSnapshot,
         [hashtable]$paths
     )
 
@@ -143,8 +147,32 @@ function Build-Platform {
     }
 
     $targetTriple = $PLATFORM_MAP[$platform]
-    $profileFlag  = if ($buildType -eq "release") { "--release" } else { "" }
-    $outDir       = if ($buildType -eq "release") { "release" } else { "debug" }
+    $profileArgs = @()
+    $outDir = "debug"
+    $destinationSuffix = ""
+    if ($buildType -eq "release") {
+        switch ($codegenProfile) {
+            "z" {
+                $profileArgs = @("--release")
+                $outDir = "release"
+            }
+            "2" {
+                $profileArgs = @("--profile", "release-hot2")
+                $outDir = "release-hot2"
+                $destinationSuffix = "-opt2"
+            }
+            "3" {
+                $profileArgs = @("--profile", "release-hot3")
+                $outDir = "release-hot3"
+                $destinationSuffix = "-opt3"
+            }
+        }
+    }
+    $cargoFeatures = "profile-$productProfile"
+    if ($workerSnapshot) {
+        $destinationSuffix += "-worker-snapshot"
+        $cargoFeatures += ",worker-snapshot"
+    }
 
     # --------------------------------------------------------
     # Rusty V8 config
@@ -215,27 +243,43 @@ function Build-Platform {
     # --------------------------------------------------------
     # Build
     # --------------------------------------------------------
-    Print-Info "Building $platform ($targetTriple) [$buildType]"
-
-    Push-Location $paths.Crate
+    Print-Info "Building $platform ($targetTriple) [$buildType, codegen=$codegenProfile, worker-snapshot=$workerSnapshot]"
 
     $cargoArgs = @(
         "ndk",
         "--target", $targetTriple,
         "--platform", $ANDROID_API,
         "--",
-        "build"
+        "build",
+        "--target-dir", $paths.Target
     )
-    if ($profileFlag) { $cargoArgs += $profileFlag }
+    $cargoArgs += $profileArgs
+    $cargoArgs += @(
+        "--no-default-features",
+        "--features", $cargoFeatures
+    )
 
-    $proc = Start-Process `
-        -FilePath "cargo" `
-        -ArgumentList $cargoArgs `
-        -Wait `
-        -NoNewWindow `
-        -PassThru
-
-    Pop-Location
+    $locationPushed = $false
+    try {
+        Push-Location $paths.Crate
+        $locationPushed = $true
+        $proc = Start-Process `
+            -FilePath "cargo" `
+            -ArgumentList $cargoArgs `
+            -Wait `
+            -NoNewWindow `
+            -PassThru
+    }
+    catch {
+        Print-Error "Unable to start cargo build for $platform`: $_"
+        $env:RUSTFLAGS = $origRUSTFLAGS
+        return $false
+    }
+    finally {
+        if ($locationPushed) {
+            Pop-Location
+        }
+    }
 
     if ($proc.ExitCode -ne 0) {
         Print-Error "Build failed for $platform"
@@ -247,7 +291,7 @@ function Build-Platform {
     # Copy output .so
     # --------------------------------------------------------
     $abi     = Get-AbiName $platform
-    $dstDir = Join-Path $paths.JniLibs $abi
+    $dstDir = Join-Path $paths.JniLibs "$productProfile$destinationSuffix\$abi"
 
     if (-not (Test-Path $dstDir)) {
         New-Item -ItemType Directory -Path $dstDir | Out-Null
@@ -256,12 +300,20 @@ function Build-Platform {
     $srcSo = Join-Path $paths.Target "$targetTriple\$outDir\$CRATE_SO_NAME"
     $dstSo = Join-Path $dstDir $OUTPUT_SO_NAME
 
-    if (Test-Path $srcSo) {
-        Copy-Item $srcSo $dstSo -Force
-        Print-Success "Copied -> $dstSo"
-    } else {
-        Print-Warning "Output .so not found: $srcSo"
+    if (-not (Test-Path $srcSo)) {
+        Print-Error "Output .so not found: $srcSo"
+        $env:RUSTFLAGS = $origRUSTFLAGS
+        return $false
     }
+    try {
+        Copy-Item $srcSo $dstSo -Force -ErrorAction Stop
+    }
+    catch {
+        Print-Error "Unable to copy $srcSo to $dstSo`: $_"
+        $env:RUSTFLAGS = $origRUSTFLAGS
+        return $false
+    }
+    Print-Success "Copied -> $dstSo"
 
     # --------------------------------------------------------
     # Copy libc++_shared.so (required by cpal/oboe)
@@ -270,7 +322,14 @@ function Build-Platform {
     $libcppDst = Join-Path $dstDir "libc++_shared.so"
 
     if (Test-Path $libcppSrc) {
-        Copy-Item $libcppSrc $libcppDst -Force
+        try {
+            Copy-Item $libcppSrc $libcppDst -Force -ErrorAction Stop
+        }
+        catch {
+            Print-Error "Unable to copy $libcppSrc to $libcppDst`: $_"
+            $env:RUSTFLAGS = $origRUSTFLAGS
+            return $false
+        }
         # Strip debug symbols from libc++_shared.so (NDK ships unstripped, ~6.6MB -> ~800KB)
         $llvmStrip = Get-Command "llvm-strip" -ErrorAction SilentlyContinue
         if (-not $llvmStrip) {
@@ -278,12 +337,19 @@ function Build-Platform {
         }
         if ($llvmStrip) {
             & $llvmStrip.Source --strip-all $libcppDst
+            if ($LASTEXITCODE -ne 0) {
+                Print-Error "Unable to strip $libcppDst"
+                $env:RUSTFLAGS = $origRUSTFLAGS
+                return $false
+            }
             Print-Success "Copied + stripped -> $libcppDst"
         } else {
             Print-Success "Copied -> $libcppDst (llvm-strip not found, skipped stripping)"
         }
     } else {
-        Print-Warning "libc++_shared.so not found: $libcppSrc"
+        Print-Error "libc++_shared.so not found: $libcppSrc"
+        $env:RUSTFLAGS = $origRUSTFLAGS
+        return $false
     }
 
     $env:RUSTFLAGS = $origRUSTFLAGS
@@ -293,24 +359,58 @@ function Build-Platform {
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
-Check-Dependencies
-$paths = Resolve-Paths
-
-$buildType = "debug"
+$buildType = "release"
+$productProfile = "full"
+$codegenProfile = "z"
+$workerSnapshot = $false
 $platforms = @()
 
-foreach ($arg in $Args) {
+for ($i = 0; $i -lt $Args.Count; $i++) {
+    $arg = $Args[$i]
     if ($arg -eq "release") {
         $buildType = "release"
+    } elseif ($arg -eq "debug") {
+        $buildType = "debug"
+    } elseif ($arg -eq "--product-profile") {
+        $i++
+        if ($i -ge $Args.Count) { throw "--product-profile requires full|slim" }
+        $productProfile = $Args[$i]
+    } elseif ($arg -like "--product-profile=*") {
+        $productProfile = $arg.Substring("--product-profile=".Length)
+    } elseif ($arg -eq "--codegen-profile") {
+        $i++
+        if ($i -ge $Args.Count) { throw "--codegen-profile requires z|2|3" }
+        $codegenProfile = $Args[$i]
+    } elseif ($arg -like "--codegen-profile=*") {
+        $codegenProfile = $arg.Substring("--codegen-profile=".Length)
+    } elseif ($arg -eq "--worker-snapshot") {
+        $workerSnapshot = $true
     } elseif ($PLATFORM_MAP.ContainsKey($arg)) {
         if ($arg -eq "all") {
             $platforms = @("arm64-v8a", "x86_64")
-            break
         } else {
             $platforms += $arg
         }
+    } else {
+        throw "Unknown argument: $arg"
     }
 }
+
+if ($productProfile -notin @("full", "slim")) {
+    throw "Invalid product profile '$productProfile' (expected full|slim)"
+}
+if ($codegenProfile -notin @("z", "2", "3")) {
+    throw "Invalid codegen profile '$codegenProfile' (expected z|2|3)"
+}
+if ($buildType -eq "debug" -and $codegenProfile -ne "z") {
+    throw "Codegen profile $codegenProfile requires a release build"
+}
+if ($workerSnapshot -and ($buildType -ne "release" -or $productProfile -ne "full")) {
+    throw "Worker snapshot requires a full release build"
+}
+
+Check-Dependencies
+$paths = Resolve-Paths
 
 if ($platforms.Count -eq 0) {
     $platforms = @("arm64-v8a", "x86_64")
@@ -318,11 +418,14 @@ if ($platforms.Count -eq 0) {
 }
 
 Print-Info "Build type : $buildType"
+Print-Info "Product    : $productProfile"
+Print-Info "Codegen    : $codegenProfile"
+Print-Info "Worker snap: $workerSnapshot"
 Print-Info "Platforms  : $($platforms -join ', ')"
 
 $failed = @()
 foreach ($p in $platforms) {
-    if (-not (Build-Platform $p $buildType $paths)) {
+    if (-not (Build-Platform $p $buildType $productProfile $codegenProfile $workerSnapshot $paths)) {
         $failed += $p
     }
 }

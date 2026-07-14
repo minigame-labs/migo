@@ -3,665 +3,230 @@ use std::ffi::c_void;
 use jni::{JNIEnv, NativeMethod};
 use tracing::info;
 
-use crate::android::jni::{
-    JAVA_METHOD_CACHE, JavaMethodCache, executeScript, getConsoleLogs, getDebugStats,
-    getMinApiLevel, init, initIcuData, mod_main, nativeAhbPointerFromHardwareBuffer,
-    onAccelerometerChange, onActionSheetResult, onAudioInterruptionBegin, onAudioInterruptionEnd,
-    onBLECharacteristicValueChange, onBLEConnectionStateChange, onBLEMTUChange,
-    onBeaconServiceChange, onBeaconUpdate, onBluetoothAdapterStateChange, onBluetoothDeviceFound,
-    onCameraEvent, onCameraFrameData, onCheckSessionResult, onChooseImageResult,
-    onChooseMessageFileResult, onCompassChange, onCompressImageResult, onDeviceMotionChange,
-    onDeviceOrientationChange, onFuzzyLocationResult, onGetPhoneNumberResult, onGetUserInfoResult,
-    onGyroscopeChange, onHide, onKeyboardComplete, onKeyboardConfirm, onKeyboardHeightChange,
-    onKeyboardInput, onLocationResult, onLoginResult, onMemoryWarning,
-    onMidasPaymentGameItemResult, onMidasPaymentResult, onModalResult,
-    onNavigateToMiniProgramResult, onNetworkStatusChange, onOpenAppAuthorizeSetting,
-    onOpenSettingResult, onOpenSystemBluetoothSetting, onRecorderEvent, onRecorderFrameData,
-    onRestart, onScanCodeResult, onShareAppMessageResult, onShow, onSubpackageProgress,
-    onSubpackageResult, onSurfaceDestroyed, onThermalStatusChanged, onTouch, onUserCaptureScreen,
-    onVideoEvent, onVsync, setDisplayRefreshRate, shutdown, updateSurface, version,
+use crate::{
+    android::jni::{
+        JAVA_METHOD_CACHE, JavaMethodCache, executeScript, getConsoleLogs, getDebugStats,
+        getMinApiLevel, init, initIcuData, mod_main, nativeAhbPointerFromHardwareBuffer,
+        onAccelerometerChange, onActionSheetResult, onAudioInterruptionBegin,
+        onAudioInterruptionEnd, onBLECharacteristicValueChange, onBLEConnectionStateChange,
+        onBLEMTUChange, onBeaconServiceChange, onBeaconUpdate, onBluetoothAdapterStateChange,
+        onBluetoothDeviceFound, onCameraEvent, onCameraFrameData, onCheckSessionResult,
+        onChooseImageResult, onChooseMessageFileResult, onCompassChange, onCompressImageResult,
+        onDeviceMotionChange, onDeviceOrientationChange, onFuzzyLocationResult,
+        onGetPhoneNumberResult, onGetUserInfoResult, onGyroscopeChange, onHide, onKeyboardComplete,
+        onKeyboardConfirm, onKeyboardHeightChange, onKeyboardInput, onLocationResult,
+        onLoginResult, onMemoryWarning, onMidasPaymentGameItemResult, onMidasPaymentResult,
+        onModalResult, onNavigateToMiniProgramResult, onNetworkStatusChange,
+        onOpenAppAuthorizeSetting, onOpenSettingResult, onOpenSystemBluetoothSetting,
+        onRecorderEvent, onRecorderFrameData, onRestart, onScanCodeResult, onShareAppMessageResult,
+        onShow, onSubpackageProgress, onSubpackageResult, onSurfaceDestroyed,
+        onThermalStatusChanged, onTouch, onUserCaptureScreen, onVideoEvent, onVsync,
+        setDisplayRefreshRate, shutdown, updateSurface, version,
+    },
+    jni_profile_contract::{self, JniMethod, MethodDirection},
 };
 
-/// JNI descriptor for `onCameraFrameData` — the single source of truth shared
-/// by the native-method registration and the contract guard test. Shape:
-/// `host_id, camera_id, (yBuf, yOff, yLen), (uBuf, uOff, uLen), (vBuf, vOff,
-/// vLen), width, height`. Must stay in exact lockstep with the Java
-/// `NativeMethods`/`NativeBridge` declarations and the Rust extern `fn`.
-const ON_CAMERA_FRAME_DATA_SIG: &str =
-    "(IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIII)V";
+fn native_fn_ptr(name: &str) -> Option<*mut c_void> {
+    let pointer = match name {
+        "version" => version as *mut c_void,
+        "getMinApiLevel" => getMinApiLevel as *mut c_void,
+        "initIcuData" => initIcuData as *mut c_void,
+        "init" => init as *mut c_void,
+        "shutdown" => shutdown as *mut c_void,
+        "onShow" => onShow as *mut c_void,
+        "onHide" => onHide as *mut c_void,
+        "onRestart" => onRestart as *mut c_void,
+        "updateSurface" => updateSurface as *mut c_void,
+        "onSurfaceDestroyed" => onSurfaceDestroyed as *mut c_void,
+        "onTouchEvent" => onTouch as *mut c_void,
+        "modMain" => mod_main as *mut c_void,
+        "executeScript" => executeScript as *mut c_void,
+        "onVsync" => onVsync as *mut c_void,
+        "setDisplayRefreshRate" => setDisplayRefreshRate as *mut c_void,
+        "getDebugStats" => getDebugStats as *mut c_void,
+        "getConsoleLogs" => getConsoleLogs as *mut c_void,
+        "nativeAhbPointerFromHardwareBuffer" => nativeAhbPointerFromHardwareBuffer as *mut c_void,
+        "onKeyboardInput" => onKeyboardInput as *mut c_void,
+        "onKeyboardConfirm" => onKeyboardConfirm as *mut c_void,
+        "onKeyboardComplete" => onKeyboardComplete as *mut c_void,
+        "onKeyboardHeightChange" => onKeyboardHeightChange as *mut c_void,
+        "onMemoryWarning" => onMemoryWarning as *mut c_void,
+        "onThermalStatusChanged" => onThermalStatusChanged as *mut c_void,
+        "onSubpackageProgress" => onSubpackageProgress as *mut c_void,
+        "onSubpackageResult" => onSubpackageResult as *mut c_void,
+        #[cfg(feature = "api-sensors")]
+        "onDeviceMotionChange" => onDeviceMotionChange as *mut c_void,
+        #[cfg(feature = "api-sensors")]
+        "onGyroscopeChange" => onGyroscopeChange as *mut c_void,
+        #[cfg(feature = "api-sensors")]
+        "onDeviceOrientationChange" => onDeviceOrientationChange as *mut c_void,
+        #[cfg(feature = "api-sensors")]
+        "onCompassChange" => onCompassChange as *mut c_void,
+        #[cfg(feature = "api-sensors")]
+        "onAccelerometerChange" => onAccelerometerChange as *mut c_void,
+        #[cfg(feature = "api-sensors")]
+        "onNetworkStatusChange" => onNetworkStatusChange as *mut c_void,
+        #[cfg(feature = "api-sensors")]
+        "onUserCaptureScreen" => onUserCaptureScreen as *mut c_void,
+        #[cfg(feature = "api-sensors")]
+        "onLocationResult" => onLocationResult as *mut c_void,
+        #[cfg(feature = "api-sensors")]
+        "onFuzzyLocationResult" => onFuzzyLocationResult as *mut c_void,
+        #[cfg(feature = "api-sensors")]
+        "onScanCodeResult" => onScanCodeResult as *mut c_void,
+        #[cfg(feature = "api-media")]
+        "onAudioInterruptionBegin" => onAudioInterruptionBegin as *mut c_void,
+        #[cfg(feature = "api-media")]
+        "onAudioInterruptionEnd" => onAudioInterruptionEnd as *mut c_void,
+        #[cfg(feature = "api-media")]
+        "onRecorderEvent" => onRecorderEvent as *mut c_void,
+        #[cfg(feature = "api-media")]
+        "onRecorderFrameData" => onRecorderFrameData as *mut c_void,
+        #[cfg(feature = "api-media")]
+        "onCameraEvent" => onCameraEvent as *mut c_void,
+        #[cfg(feature = "api-media")]
+        "onCameraFrameData" => onCameraFrameData as *mut c_void,
+        #[cfg(feature = "api-media")]
+        "onCompressImageResult" => onCompressImageResult as *mut c_void,
+        #[cfg(feature = "api-media")]
+        "onChooseImageResult" => onChooseImageResult as *mut c_void,
+        #[cfg(feature = "api-media")]
+        "onChooseMessageFileResult" => onChooseMessageFileResult as *mut c_void,
+        #[cfg(feature = "api-media")]
+        "onVideoEvent" => onVideoEvent as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onOpenSystemBluetoothSetting" => onOpenSystemBluetoothSetting as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onOpenAppAuthorizeSetting" => onOpenAppAuthorizeSetting as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onBluetoothAdapterStateChange" => onBluetoothAdapterStateChange as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onBluetoothDeviceFound" => onBluetoothDeviceFound as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onBeaconUpdate" => onBeaconUpdate as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onBeaconServiceChange" => onBeaconServiceChange as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onBLEConnectionStateChange" => onBLEConnectionStateChange as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onBLECharacteristicValueChange" => onBLECharacteristicValueChange as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onBLEMTUChange" => onBLEMTUChange as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onLoginResult" => onLoginResult as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onCheckSessionResult" => onCheckSessionResult as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onGetUserInfoResult" => onGetUserInfoResult as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onGetPhoneNumberResult" => onGetPhoneNumberResult as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onOpenSettingResult" => onOpenSettingResult as *mut c_void,
+        #[cfg(feature = "api-connectivity")]
+        "onNavigateToMiniProgramResult" => onNavigateToMiniProgramResult as *mut c_void,
+        #[cfg(feature = "api-commerce")]
+        "onShareAppMessageResult" => onShareAppMessageResult as *mut c_void,
+        #[cfg(feature = "api-commerce")]
+        "onMidasPaymentResult" => onMidasPaymentResult as *mut c_void,
+        #[cfg(feature = "api-commerce")]
+        "onMidasPaymentGameItemResult" => onMidasPaymentGameItemResult as *mut c_void,
+        #[cfg(feature = "api-system")]
+        "onModalResult" => onModalResult as *mut c_void,
+        #[cfg(feature = "api-system")]
+        "onActionSheetResult" => onActionSheetResult as *mut c_void,
+        _ => return None,
+    };
+    Some(pointer)
+}
 
-/// JNI descriptor for the R1 outbound `NativeExports.requestVsync(int)` — the
-/// single source of truth shared by the static-method cache registration and
-/// the contract guard test. Must stay in lockstep with the Java declaration.
-const REQUEST_VSYNC_SIG: &str = "(I)V";
+fn registered_native_method(spec: JniMethod) -> Result<NativeMethod, String> {
+    let fn_ptr = native_fn_ptr(spec.name).ok_or_else(|| {
+        format!(
+            "active NativeBridge method has no compiled Rust callback: {} {}",
+            spec.name, spec.sig
+        )
+    })?;
+    Ok(NativeMethod {
+        name: spec.name.into(),
+        sig: spec.sig.into(),
+        fn_ptr,
+    })
+}
 
 pub(crate) fn register_native_exports(env: &mut JNIEnv) -> Result<(), String> {
     let class = env
         .find_class("com/migo/runtime/internal/NativeBridge")
-        .map_err(|e| format!("Failed to find NativeBridge: {e:?}"))?;
+        .map_err(|error| format!("Failed to find NativeBridge: {error:?}"))?;
+    let methods = jni_profile_contract::active_methods(MethodDirection::JavaToNative)
+        .into_iter()
+        .map(registered_native_method)
+        .collect::<Result<Vec<_>, _>>()?;
 
-    env.register_native_methods(
-        &class,
-        &[
-            NativeMethod {
-                name: "version".into(),
-                sig: "()Ljava/lang/String;".into(),
-                fn_ptr: version as *mut c_void,
-            },
-            NativeMethod {
-                name: "getMinApiLevel".into(),
-                sig: "()I".into(),
-                fn_ptr: getMinApiLevel as *mut c_void,
-            },
-            NativeMethod {
-                name: "initIcuData".into(),
-                sig: "(Ljava/lang/String;)Z".into(),
-                fn_ptr: initIcuData as *mut c_void,
-            },
-            NativeMethod {
-                name: "init".into(),
-                sig: "(Ljava/lang/Object;Lcom/migo/runtime/RuntimeConfig;)I".into(),
-                fn_ptr: init as *mut c_void,
-            },
-            NativeMethod {
-                name: "shutdown".into(),
-                sig: "(I)V".into(),
-                fn_ptr: shutdown as *mut c_void,
-            },
-            NativeMethod {
-                name: "onOpenSystemBluetoothSetting".into(),
-                sig: "(II)V".into(),
-                fn_ptr: onOpenSystemBluetoothSetting as *mut c_void,
-            },
-            NativeMethod {
-                name: "onOpenAppAuthorizeSetting".into(),
-                sig: "(II)V".into(),
-                fn_ptr: onOpenAppAuthorizeSetting as *mut c_void,
-            },
-            NativeMethod {
-                name: "onShow".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onShow as *mut c_void,
-            },
-            NativeMethod {
-                name: "onHide".into(),
-                sig: "(I)V".into(),
-                fn_ptr: onHide as *mut c_void,
-            },
-            NativeMethod {
-                name: "onRestart".into(),
-                sig: "(I)V".into(),
-                fn_ptr: onRestart as *mut c_void,
-            },
-            NativeMethod {
-                name: "onAudioInterruptionBegin".into(),
-                sig: "(I)V".into(),
-                fn_ptr: onAudioInterruptionBegin as *mut c_void,
-            },
-            NativeMethod {
-                name: "onAudioInterruptionEnd".into(),
-                sig: "(I)V".into(),
-                fn_ptr: onAudioInterruptionEnd as *mut c_void,
-            },
-            NativeMethod {
-                name: "updateSurface".into(),
-                sig: "(ILjava/lang/Object;II)V".into(),
-                fn_ptr: updateSurface as *mut c_void,
-            },
-            NativeMethod {
-                name: "onSurfaceDestroyed".into(),
-                sig: "(I)V".into(),
-                fn_ptr: onSurfaceDestroyed as *mut c_void,
-            },
-            NativeMethod {
-                name: "onTouchEvent".into(),
-                sig: "(IIJILjava/nio/ByteBuffer;)V".into(),
-                fn_ptr: onTouch as *mut c_void,
-            },
-            NativeMethod {
-                name: "modMain".into(),
-                // (sessionId, gameId, entry) -> int
-                sig: "(ILjava/lang/String;Ljava/lang/String;)I".into(),
-                fn_ptr: mod_main as *mut c_void,
-            },
-            NativeMethod {
-                name: "executeScript".into(),
-                // (sessionId, script) -> int
-                sig: "(ILjava/lang/String;)I".into(),
-                fn_ptr: executeScript as *mut c_void,
-            },
-            NativeMethod {
-                name: "onModalResult".into(),
-                sig: "(III)V".into(),
-                fn_ptr: onModalResult as *mut c_void,
-            },
-            NativeMethod {
-                name: "onActionSheetResult".into(),
-                sig: "(II)V".into(),
-                fn_ptr: onActionSheetResult as *mut c_void,
-            },
-            NativeMethod {
-                name: "onDeviceMotionChange".into(),
-                sig: "(IDDD)V".into(),
-                fn_ptr: onDeviceMotionChange as *mut c_void,
-            },
-            NativeMethod {
-                name: "onGyroscopeChange".into(),
-                sig: "(IDDD)V".into(),
-                fn_ptr: onGyroscopeChange as *mut c_void,
-            },
-            NativeMethod {
-                name: "onDeviceOrientationChange".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onDeviceOrientationChange as *mut c_void,
-            },
-            NativeMethod {
-                name: "onCompassChange".into(),
-                sig: "(IDLjava/lang/String;)V".into(),
-                fn_ptr: onCompassChange as *mut c_void,
-            },
-            NativeMethod {
-                name: "onAccelerometerChange".into(),
-                sig: "(IDDD)V".into(),
-                fn_ptr: onAccelerometerChange as *mut c_void,
-            },
-            NativeMethod {
-                name: "onNetworkStatusChange".into(),
-                sig: "(IZLjava/lang/String;)V".into(),
-                fn_ptr: onNetworkStatusChange as *mut c_void,
-            },
-            NativeMethod {
-                name: "onVsync".into(),
-                sig: "(IJ)V".into(),
-                fn_ptr: onVsync as *mut c_void,
-            },
-            NativeMethod {
-                name: "setDisplayRefreshRate".into(),
-                sig: "(IJ)V".into(),
-                fn_ptr: setDisplayRefreshRate as *mut c_void,
-            },
-            NativeMethod {
-                name: "getDebugStats".into(),
-                sig: "(I)[B".into(),
-                fn_ptr: getDebugStats as *mut c_void,
-            },
-            NativeMethod {
-                name: "getConsoleLogs".into(),
-                sig: "(IJ)Ljava/lang/String;".into(),
-                fn_ptr: getConsoleLogs as *mut c_void,
-            },
-            // AHardwareBuffer helper used by `NativeExports.decodeImageAhb`
-            // to hand a native AHB pointer to Rust without copying
-            // pixel bytes through a Java `byte[]`.
-            NativeMethod {
-                name: "nativeAhbPointerFromHardwareBuffer".into(),
-                sig: "(Landroid/hardware/HardwareBuffer;)J".into(),
-                fn_ptr: nativeAhbPointerFromHardwareBuffer as *mut c_void,
-            },
-            NativeMethod {
-                name: "onRecorderEvent".into(),
-                sig: "(ILjava/lang/String;Ljava/lang/String;)V".into(),
-                fn_ptr: onRecorderEvent as *mut c_void,
-            },
-            NativeMethod {
-                name: "onRecorderFrameData".into(),
-                sig: "(I[BZ)V".into(),
-                fn_ptr: onRecorderFrameData as *mut c_void,
-            },
-            NativeMethod {
-                name: "onCameraEvent".into(),
-                sig: "(IILjava/lang/String;Ljava/lang/String;)V".into(),
-                fn_ptr: onCameraEvent as *mut c_void,
-            },
-            NativeMethod {
-                name: "onCameraFrameData".into(),
-                sig: ON_CAMERA_FRAME_DATA_SIG.into(),
-                fn_ptr: onCameraFrameData as *mut c_void,
-            },
-            NativeMethod {
-                name: "onUserCaptureScreen".into(),
-                sig: "(I)V".into(),
-                fn_ptr: onUserCaptureScreen as *mut c_void,
-            },
-            NativeMethod {
-                name: "onBluetoothAdapterStateChange".into(),
-                sig: "(IZZ)V".into(),
-                fn_ptr: onBluetoothAdapterStateChange as *mut c_void,
-            },
-            NativeMethod {
-                name: "onBluetoothDeviceFound".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onBluetoothDeviceFound as *mut c_void,
-            },
-            NativeMethod {
-                name: "onBeaconUpdate".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onBeaconUpdate as *mut c_void,
-            },
-            NativeMethod {
-                name: "onBeaconServiceChange".into(),
-                sig: "(IZZ)V".into(),
-                fn_ptr: onBeaconServiceChange as *mut c_void,
-            },
-            // BLE GATT callbacks
-            NativeMethod {
-                name: "onBLEConnectionStateChange".into(),
-                sig: "(ILjava/lang/String;Z)V".into(),
-                fn_ptr: onBLEConnectionStateChange as *mut c_void,
-            },
-            NativeMethod {
-                name: "onBLECharacteristicValueChange".into(),
-                sig: "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;[B)V".into(),
-                fn_ptr: onBLECharacteristicValueChange as *mut c_void,
-            },
-            NativeMethod {
-                name: "onBLEMTUChange".into(),
-                sig: "(ILjava/lang/String;I)V".into(),
-                fn_ptr: onBLEMTUChange as *mut c_void,
-            },
-            // Keyboard callbacks
-            NativeMethod {
-                name: "onKeyboardInput".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onKeyboardInput as *mut c_void,
-            },
-            NativeMethod {
-                name: "onKeyboardConfirm".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onKeyboardConfirm as *mut c_void,
-            },
-            NativeMethod {
-                name: "onKeyboardComplete".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onKeyboardComplete as *mut c_void,
-            },
-            NativeMethod {
-                name: "onKeyboardHeightChange".into(),
-                sig: "(ID)V".into(),
-                fn_ptr: onKeyboardHeightChange as *mut c_void,
-            },
-            // Memory warning callback
-            NativeMethod {
-                name: "onMemoryWarning".into(),
-                sig: "(II)V".into(),
-                fn_ptr: onMemoryWarning as *mut c_void,
-            },
-            // ADPF thermal callback
-            NativeMethod {
-                name: "onThermalStatusChanged".into(),
-                sig: "(II)V".into(),
-                fn_ptr: onThermalStatusChanged as *mut c_void,
-            },
-            // Image API callbacks
-            NativeMethod {
-                name: "onCompressImageResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onCompressImageResult as *mut c_void,
-            },
-            NativeMethod {
-                name: "onChooseImageResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onChooseImageResult as *mut c_void,
-            },
-            NativeMethod {
-                name: "onChooseMessageFileResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onChooseMessageFileResult as *mut c_void,
-            },
-            // Location callbacks
-            NativeMethod {
-                name: "onLocationResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onLocationResult as *mut c_void,
-            },
-            NativeMethod {
-                name: "onFuzzyLocationResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onFuzzyLocationResult as *mut c_void,
-            },
-            // Scan Code callback
-            NativeMethod {
-                name: "onScanCodeResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onScanCodeResult as *mut c_void,
-            },
-            // Auth callbacks
-            NativeMethod {
-                name: "onLoginResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onLoginResult as *mut c_void,
-            },
-            NativeMethod {
-                name: "onCheckSessionResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onCheckSessionResult as *mut c_void,
-            },
-            NativeMethod {
-                name: "onGetUserInfoResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onGetUserInfoResult as *mut c_void,
-            },
-            NativeMethod {
-                name: "onGetPhoneNumberResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onGetPhoneNumberResult as *mut c_void,
-            },
-            // Subpackage callbacks
-            NativeMethod {
-                name: "onSubpackageProgress".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onSubpackageProgress as *mut c_void,
-            },
-            NativeMethod {
-                name: "onSubpackageResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onSubpackageResult as *mut c_void,
-            },
-            // Setting callbacks
-            NativeMethod {
-                name: "onOpenSettingResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onOpenSettingResult as *mut c_void,
-            },
-            // Share callbacks
-            NativeMethod {
-                name: "onShareAppMessageResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onShareAppMessageResult as *mut c_void,
-            },
-            // Navigate callbacks
-            NativeMethod {
-                name: "onNavigateToMiniProgramResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onNavigateToMiniProgramResult as *mut c_void,
-            },
-            // Payment callbacks
-            NativeMethod {
-                name: "onMidasPaymentResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onMidasPaymentResult as *mut c_void,
-            },
-            NativeMethod {
-                name: "onMidasPaymentGameItemResult".into(),
-                sig: "(ILjava/lang/String;)V".into(),
-                fn_ptr: onMidasPaymentGameItemResult as *mut c_void,
-            },
-            // Video callback
-            NativeMethod {
-                name: "onVideoEvent".into(),
-                sig: "(IILjava/lang/String;Ljava/lang/String;)V".into(),
-                fn_ptr: onVideoEvent as *mut c_void,
-            },
-        ],
-    )
-    .map_err(|e| format!("Failed to register native methods: {e:?}"))?;
+    env.register_native_methods(&class, &methods)
+        .map_err(|error| format!("Failed to register native methods: {error:?}"))?;
 
-    info!("Registered native methods for NativeBridge");
+    info!(
+        method_count = methods.len(),
+        "Registered NativeBridge methods"
+    );
     Ok(())
 }
 
 pub(crate) fn register_java_exports(env: &mut JNIEnv) -> Result<(), String> {
     let local_class = env
         .find_class("com/migo/runtime/internal/NativeExports")
-        .map_err(|e| format!("Failed to find class NativeExports: {e}"))?;
-
-    let methods = [
-        ("getCacheDirPath", "()Ljava/lang/String;"),
-        ("openSystemBluetoothSetting", "(I)V"),
-        ("openAppAuthorizeSetting", "(I)V"),
-        ("getWindowInfoBytes", "(I)[B"),
-        ("getSystemSettingInfoBytes", "()[B"),
-        ("getDeviceInfoJson", "()Ljava/lang/String;"),
-        ("getAppAuthorizationSettingJson", "()Ljava/lang/String;"),
-        // UI interaction
-        ("showToast", "(ILjava/lang/String;)V"),
-        ("hideToast", "(I)V"),
-        ("showModal", "(ILjava/lang/String;)V"),
-        ("showLoading", "(ILjava/lang/String;)V"),
-        ("hideLoading", "(I)V"),
-        ("showActionSheet", "(ILjava/lang/String;)V"),
-        // Battery
-        ("getBatteryInfoJson", "()Ljava/lang/String;"),
-        // Vibration
-        ("vibrateShort", "(Ljava/lang/String;)I"),
-        ("vibrateLong", "()I"),
-        // Screen
-        ("getScreenBrightness", "(I)F"),
-        ("setScreenBrightness", "(IF)I"),
-        ("setKeepScreenOn", "(IZ)I"),
-        ("setDeviceOrientation", "(ILjava/lang/String;)I"),
-        // Screen capture
-        ("startCaptureScreen", "(I)V"),
-        ("stopCaptureScreen", "(I)V"),
-        // Debug
-        ("setEnableDebug", "(IZ)I"),
-        // Device sensor
-        ("startDeviceMotionListening", "(ILjava/lang/String;)V"),
-        ("stopDeviceMotionListening", "(I)V"),
-        ("startGyroscope", "(ILjava/lang/String;)V"),
-        ("stopGyroscope", "(I)V"),
-        // Compass
-        ("startCompass", "(I)V"),
-        ("stopCompass", "(I)V"),
-        // Accelerometer
-        ("startAccelerometer", "(ILjava/lang/String;)V"),
-        ("stopAccelerometer", "(I)V"),
-        // Network
-        ("startNetworkMonitoring", "(I)V"),
-        ("stopNetworkMonitoring", "(I)V"),
-        ("getNetworkTypeJson", "(I)Ljava/lang/String;"),
-        ("getLocalIPAddressJson", "()Ljava/lang/String;"),
-        // File operations
-        (
-            "unzipFile",
-            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-        ),
-        // Charset encoding (GBK via java.nio.charset)
-        ("encodeGbk", "(Ljava/lang/String;)[B"),
-        ("decodeGbk", "([B)Ljava/lang/String;"),
-        // Image decoding (BitmapFactory / ImageDecoder).
-        // `decodeImageAhb` returns a packed 16-byte header:
-        //   [ahb_ptr_i64_le][width_u32_le][height_u32_le]
-        // The AHB refcount has been incremented once for the Rust
-        // side; `AHardwareBuffer_release` is the caller's
-        // responsibility (via `OwnedAhb` Drop). A zero pointer means
-        // "decode failed, fall back to legacy byte[] path".
-        ("decodeImageAhb", "([B)[B"),
-        // Legacy: RGBA `byte[]` — kept until the zero-copy path is
-        // exercised on all target devices and we trust AHB import
-        // across vendor drivers.
-        ("decodeImageRgba", "([B)[B"),
-        // Clipboard
-        ("setClipboardData", "(ILjava/lang/String;)I"),
-        ("getClipboardData", "(I)Ljava/lang/String;"),
-        // Audio platform
-        ("setInnerAudioOption", "(IZZZ)V"),
-        ("getAvailableAudioSources", "(I)Ljava/lang/String;"),
-        // Recorder
-        ("recorderStart", "(ILjava/lang/String;)V"),
-        ("recorderPause", "(I)V"),
-        ("recorderResume", "(I)V"),
-        ("recorderStop", "(I)V"),
-        // Camera
-        ("cameraCreate", "(ILjava/lang/String;)Ljava/lang/String;"),
-        ("cameraDestroy", "(II)V"),
-        ("cameraTakePhoto", "(ILjava/lang/String;)Ljava/lang/String;"),
-        (
-            "cameraStartRecord",
-            "(ILjava/lang/String;)Ljava/lang/String;",
-        ),
-        (
-            "cameraStopRecord",
-            "(ILjava/lang/String;)Ljava/lang/String;",
-        ),
-        ("cameraSetZoom", "(ILjava/lang/String;)Ljava/lang/String;"),
-        ("cameraListenFrameChange", "(II)V"),
-        ("cameraCloseFrameChange", "(II)V"),
-        // Bluetooth
-        ("bluetoothOpenAdapter", "(ILjava/lang/String;)V"),
-        ("bluetoothCloseAdapter", "(I)V"),
-        ("bluetoothGetAdapterState", "(I)Ljava/lang/String;"),
-        ("bluetoothStartDevicesDiscovery", "(ILjava/lang/String;)V"),
-        ("bluetoothStopDevicesDiscovery", "(I)V"),
-        ("bluetoothGetDevices", "(I)Ljava/lang/String;"),
-        (
-            "bluetoothGetConnectedDevices",
-            "(ILjava/lang/String;)Ljava/lang/String;",
-        ),
-        ("bluetoothMakePair", "(ILjava/lang/String;)V"),
-        ("bluetoothIsDevicePaired", "(ILjava/lang/String;)V"),
-        ("bluetoothStartBeaconDiscovery", "(ILjava/lang/String;)V"),
-        ("bluetoothStopBeaconDiscovery", "(I)V"),
-        ("bluetoothGetBeacons", "(I)Ljava/lang/String;"),
-        // BLE GATT
-        ("bleCreateConnection", "(ILjava/lang/String;)V"),
-        ("bleCloseConnection", "(ILjava/lang/String;)V"),
-        (
-            "bleGetDeviceServices",
-            "(ILjava/lang/String;)Ljava/lang/String;",
-        ),
-        (
-            "bleGetDeviceCharacteristics",
-            "(ILjava/lang/String;)Ljava/lang/String;",
-        ),
-        ("bleReadCharacteristicValue", "(ILjava/lang/String;)V"),
-        ("bleWriteCharacteristicValue", "(ILjava/lang/String;)V"),
-        (
-            "bleNotifyCharacteristicValueChange",
-            "(ILjava/lang/String;)V",
-        ),
-        (
-            "bleGetDeviceRSSI",
-            "(ILjava/lang/String;)Ljava/lang/String;",
-        ),
-        ("bleSetMTU", "(ILjava/lang/String;)V"),
-        ("bleGetMTU", "(ILjava/lang/String;)Ljava/lang/String;"),
-        // Keyboard
-        ("keyboardShow", "(ILjava/lang/String;)V"),
-        ("keyboardHide", "(I)V"),
-        ("keyboardUpdate", "(ILjava/lang/String;)V"),
-        // Image API
-        ("imageSaveToPhotosAlbum", "(ILjava/lang/String;)V"),
-        ("imagePreviewMedia", "(ILjava/lang/String;)V"),
-        ("imagePreviewImage", "(ILjava/lang/String;)V"),
-        ("imageCompress", "(ILjava/lang/String;)V"),
-        ("imageChooseMessageFile", "(ILjava/lang/String;)V"),
-        ("imageChooseImage", "(ILjava/lang/String;)V"),
-        // Location
-        ("getLocation", "(ILjava/lang/String;)V"),
-        ("getFuzzyLocation", "(ILjava/lang/String;)V"),
-        // Scan Code
-        ("scanCode", "(ILjava/lang/String;)V"),
-        // Game Log
-        ("gameLogReport", "(ILjava/lang/String;)V"),
-        // Auth
-        ("authLogin", "(ILjava/lang/String;)V"),
-        ("authCheckSession", "(ILjava/lang/String;)V"),
-        ("authGetUserInfo", "(ILjava/lang/String;)V"),
-        ("authGetPhoneNumber", "(ILjava/lang/String;)V"),
-        // Subpackage
-        ("subpackageDownload", "(ILjava/lang/String;)V"),
-        // Setting
-        ("openSetting", "(ILjava/lang/String;)V"),
-        // Share
-        ("shareAppMessage", "(ILjava/lang/String;)V"),
-        // Navigate
-        ("navigateToMiniProgram", "(ILjava/lang/String;)V"),
-        ("openCustomerServiceConversation", "(ILjava/lang/String;)V"),
-        // Payment
-        (
-            "checkIsSupportMidasPayment",
-            "(ILjava/lang/String;)Ljava/lang/String;",
-        ),
-        ("requestMidasPayment", "(ILjava/lang/String;)V"),
-        ("requestMidasPaymentGameItem", "(ILjava/lang/String;)V"),
-        // Video
-        ("videoCreate", "(ILjava/lang/String;)Ljava/lang/String;"),
-        ("videoPlay", "(II)V"),
-        ("videoPause", "(II)V"),
-        ("videoStop", "(II)V"),
-        ("videoSeek", "(ILjava/lang/String;)V"),
-        ("videoRequestFullscreen", "(ILjava/lang/String;)V"),
-        ("videoExitFullscreen", "(II)V"),
-        ("videoSetProperty", "(ILjava/lang/String;)V"),
-        ("videoDestroy", "(II)V"),
-        // Lifecycle callback
-        ("onGameReady", "(I)V"),
-        // R1 on-demand vsync: Rust render/host requests one Choreographer frame.
-        ("requestVsync", REQUEST_VSYNC_SIG),
-        // Error notification callback
-        // onError(hostId, errorCode, message, detail)
-        ("onError", "(IILjava/lang/String;Ljava/lang/String;)V"),
-        // Exit callback
-        ("onExit", "(I)V"),
-        // Host message channel callback
-        // onHostMessage(hostId, json)
-        ("onHostMessage", "(ILjava/lang/String;)V"),
-    ];
-
+        .map_err(|error| format!("Failed to find class NativeExports: {error}"))?;
+    let methods = jni_profile_contract::active_methods(MethodDirection::NativeToJava);
     let global_class = env
         .new_global_ref(local_class)
-        .map_err(|e| format!("Failed to create global ref for NativeExports: {e}"))?;
-
+        .map_err(|error| format!("Failed to create global ref for NativeExports: {error}"))?;
     let mut cache = JavaMethodCache::new(global_class);
 
-    for (name, sig) in methods {
-        let mid = env
-            .get_static_method_id("com/migo/runtime/internal/NativeExports", name, sig)
-            .map_err(|e| format!("Failed to get method id for {name} {sig}: {e}"))?;
-        cache.insert_method_id(name, mid);
+    for method in &methods {
+        let method_id = env
+            .get_static_method_id(
+                "com/migo/runtime/internal/NativeExports",
+                method.name,
+                method.sig,
+            )
+            .map_err(|error| {
+                format!(
+                    "Failed to get method id for {} {}: {error}",
+                    method.name, method.sig
+                )
+            })?;
+        cache.insert_method_id(method.name, method_id);
     }
 
     JAVA_METHOD_CACHE
         .set(cache)
         .map_err(|_| "Failed to set JAVA_METHOD_CACHE (already initialized)".to_string())?;
 
-    info!("Cached NativeExports class + static method IDs");
+    info!(method_count = methods.len(), "Cached NativeExports methods");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ON_CAMERA_FRAME_DATA_SIG;
-    use super::REQUEST_VSYNC_SIG;
+    use crate::jni_profile_contract::{MethodDirection, MethodGroup, group_methods};
 
-    /// Contract guard: R1's outbound `NativeExports.requestVsync(int)` must be
-    /// registered as `(I)V`. A single `int` host_id and a void return; the Java
-    /// method, this cached descriptor, and the `jni_void!(request_vsync, ...)`
-    /// outbound wrapper must agree. Catches a descriptor drift that would make
-    /// the cached static-method id fail to resolve at runtime.
     #[test]
     fn request_vsync_descriptor_is_int_to_void() {
-        assert_eq!(
-            REQUEST_VSYNC_SIG.matches('I').count(),
-            1,
-            "one int param: host_id"
-        );
-        assert!(!REQUEST_VSYNC_SIG.contains('L'), "no object params");
-        assert!(REQUEST_VSYNC_SIG.ends_with(")V"), "void return");
-        assert_eq!(REQUEST_VSYNC_SIG, "(I)V");
+        let method = group_methods(MethodGroup::Core, MethodDirection::NativeToJava)
+            .iter()
+            .find(|method| method.name == "requestVsync")
+            .expect("core requestVsync contract");
+        assert_eq!(method.sig, "(I)V");
     }
 
-    /// Contract guard: the camera-frame JNI descriptor must expose exactly three
-    /// `ByteBuffer` plane params, ten `int` params (host_id, camera_id, three
-    /// offset/length pairs, width, height), and a void return. This catches a
-    /// descriptor edit that drops a buffer or an int. The full Java<->Rust ABI
-    /// (param order and the Rust extern arity) is verified by the Java compile,
-    /// the API 26 build, and the on-device `RegisterNatives` smoke.
     #[test]
     fn on_camera_frame_data_descriptor_shape() {
-        assert_eq!(
-            ON_CAMERA_FRAME_DATA_SIG
-                .matches("Ljava/nio/ByteBuffer;")
-                .count(),
-            3,
-            "three plane ByteBuffer params"
-        );
-        assert_eq!(
-            ON_CAMERA_FRAME_DATA_SIG.matches('I').count(),
-            10,
-            "ten int params: host_id, camera_id, 3x(offset,length), width, height"
-        );
-        assert!(ON_CAMERA_FRAME_DATA_SIG.ends_with(")V"), "void return");
+        let method = group_methods(MethodGroup::Media, MethodDirection::JavaToNative)
+            .iter()
+            .find(|method| method.name == "onCameraFrameData")
+            .expect("media camera-frame contract");
+        assert_eq!(method.sig.matches("Ljava/nio/ByteBuffer;").count(), 3);
+        assert_eq!(method.sig.matches('I').count(), 10);
+        assert!(method.sig.ends_with(")V"));
     }
 }

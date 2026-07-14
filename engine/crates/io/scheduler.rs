@@ -5,12 +5,38 @@ use crate::{
     task::{BackendKind, IoRequest, PoolKind, PriorityClass, ReadSpec, RequestKind},
 };
 use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock, Mutex as StdMutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
 };
+
+type PackageVerificationGate = tokio::sync::Mutex<()>;
+
+// Coalesce same-package launch misses before they consume a bounded FS worker.
+// Weak values avoid retaining the gates themselves; dead path entries are
+// pruned whenever a new gate is created. Cross-process exclusion remains the
+// integrity layer's responsibility via its on-disk promotion lock.
+static PACKAGE_VERIFICATION_GATES: LazyLock<
+    StdMutex<HashMap<PathBuf, Weak<PackageVerificationGate>>>,
+> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn package_verification_gate(receipt_path: &Path) -> Arc<PackageVerificationGate> {
+    let mut gates = PACKAGE_VERIFICATION_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(gate) = gates.get(receipt_path).and_then(Weak::upgrade) {
+        return gate;
+    }
+
+    gates.retain(|_, gate| gate.strong_count() != 0);
+    let gate = Arc::new(PackageVerificationGate::new(()));
+    gates.insert(receipt_path.to_path_buf(), Arc::downgrade(&gate));
+    gate
+}
 
 #[cfg(test)]
 type WorkerStartHook = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
@@ -60,9 +86,13 @@ struct SchedulerMetrics {
 
 impl IoScheduler {
     pub fn new(host_id: i32) -> Self {
+        Self::with_pools(host_id, IoPools::new(host_id))
+    }
+
+    fn with_pools(host_id: i32, pools: IoPools) -> Self {
         Self {
             host_id,
-            pools: IoPools::new(host_id),
+            pools,
             domain: Arc::new(IoDomain::new()),
             policy: CheapPolicy::default(),
             metrics: Arc::new(SchedulerMetrics::default()),
@@ -215,6 +245,39 @@ impl IoScheduler {
             }
         }
     }
+
+    /// Run full install verification without allowing concurrent misses for
+    /// the same receipt to occupy multiple bounded filesystem workers.
+    pub async fn run_package_verification<T, F>(
+        &self,
+        receipt_path: PathBuf,
+        priority: PriorityClass,
+        job: F,
+    ) -> Result<T, PoolError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        if self.ensure_open().is_err() {
+            self.metrics.rejected_runs.fetch_add(1, Ordering::Relaxed);
+            return Err(PoolError::Closed);
+        }
+
+        // This is an async wait, so another launch for the same package does
+        // not consume a worker while the first verifier hashes/seals it.
+        let gate = package_verification_gate(&receipt_path);
+        let guard = gate.lock_owned().await;
+
+        // run_async rechecks the domain after the wait and again when the
+        // delegated closure starts, preserving close semantics. Move the
+        // guard into that closure so cancelling the receiver cannot release
+        // the package gate while its blocking worker is still running.
+        self.run_async(IoRequest::VerifyPackage { priority }, move || {
+            let _guard = guard;
+            job()
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +300,27 @@ impl IoScheduler {
     pub(crate) fn image_job_run_count(&self) -> usize {
         self.image_job_runs
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn shared_executor_pair_for_test(
+        first_host_id: i32,
+        second_host_id: i32,
+        worker_count: usize,
+    ) -> (Self, Self) {
+        let (first_pools, second_pools) =
+            IoPools::shared_pair_for_test(first_host_id, second_host_id, worker_count);
+        (
+            Self::with_pools(first_host_id, first_pools),
+            Self::with_pools(second_host_id, second_pools),
+        )
+    }
+
+    pub(crate) fn local_for_test(host_id: i32, worker_count: usize) -> Self {
+        Self::with_pools(host_id, IoPools::local_for_test(host_id, worker_count))
+    }
+
+    pub(crate) fn pending_work_for_test(&self) -> usize {
+        self.pools.pending_work_for_test()
     }
 }
 
@@ -273,6 +357,7 @@ pub fn classify_request(req: &IoRequest, policy: &CheapPolicy) -> RouteDecision 
         }
         IoRequest::Unzip { .. } => RouteDecision::Delegated(PoolKind::Archive),
         IoRequest::PackageIngest { .. } => RouteDecision::Delegated(PoolKind::Archive),
+        IoRequest::VerifyPackage { .. } => RouteDecision::Delegated(PoolKind::Fs),
         IoRequest::StorageGet {
             request,
             priority,
@@ -372,11 +457,13 @@ fn is_foreground(priority: PriorityClass) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc, Barrier,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        task::{Context, Poll, Waker},
     };
 
     use crate::{
@@ -407,14 +494,14 @@ mod tests {
             })
             .unwrap();
 
-        assert!(thread_name.contains("io-pack-host-7"));
+        assert!(thread_name.starts_with("Migo-IO-"));
     }
 
     #[test]
     fn scheduler_does_not_spawn_pools_until_delegated_work_runs() {
-        let scheduler = IoScheduler::new(11);
+        let scheduler = IoScheduler::local_for_test(11, 3);
 
-        assert_eq!(scheduler.pools().spawned_pool_count(), 0);
+        assert_eq!(scheduler.pools().started_thread_count_for_test(), 0);
 
         let req = IoRequest::ReadFile {
             backend: BackendKind::Pack,
@@ -426,7 +513,7 @@ mod tests {
 
         let _ = scheduler.run_sync(&req, || 1usize).unwrap();
 
-        assert_eq!(scheduler.pools().spawned_pool_count(), 1);
+        assert_eq!(scheduler.pools().started_thread_count_for_test(), 3);
     }
 
     #[test]
@@ -464,7 +551,7 @@ mod tests {
         // semantics this test exercises (second job blocked behind the
         // first, then sees Closed when the scheduler is shut down) are
         // observable without timing-dependent assertions.
-        let scheduler = Arc::new(IoScheduler::new(19));
+        let scheduler = Arc::new(IoScheduler::local_for_test(19, 2));
         let req = IoRequest::Unzip {
             backend: BackendKind::Filesystem,
             priority: PriorityClass::ForegroundAsync,
@@ -527,6 +614,67 @@ mod tests {
             Err(crate::pools::PoolError::Closed)
         ));
         assert!(!second_ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn closing_one_domain_does_not_reject_another_host_on_shared_executor() {
+        let (scheduler_a, scheduler_b) = IoScheduler::shared_executor_pair_for_test(21, 22, 2);
+        let scheduler_a = Arc::new(scheduler_a);
+        let archive_req = IoRequest::Unzip {
+            backend: BackendKind::Filesystem,
+            priority: PriorityClass::ForegroundAsync,
+            compressed_bytes: 64 * 1024,
+        };
+
+        let first_started = Arc::new(Barrier::new(2));
+        let first_release = Arc::new(Barrier::new(2));
+        let first_scheduler = Arc::clone(&scheduler_a);
+        let first_req = archive_req.clone();
+        let first_started_job = Arc::clone(&first_started);
+        let first_release_job = Arc::clone(&first_release);
+        let first = std::thread::spawn(move || {
+            first_scheduler.run_sync(&first_req, move || {
+                first_started_job.wait();
+                first_release_job.wait();
+                1_u32
+            })
+        });
+        first_started.wait();
+
+        let queued_user_ran = Arc::new(AtomicBool::new(false));
+        let queued_user_ran_job = Arc::clone(&queued_user_ran);
+        let queued_scheduler = Arc::clone(&scheduler_a);
+        let queued_req = archive_req.clone();
+        let queued = std::thread::spawn(move || {
+            queued_scheduler.run_sync(&queued_req, move || {
+                queued_user_ran_job.store(true, Ordering::SeqCst);
+                2_u32
+            })
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while scheduler_a.pending_work_for_test() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(scheduler_a.pending_work_for_test(), 1);
+        scheduler_a.close();
+
+        let pack_req = IoRequest::ReadFile {
+            backend: BackendKind::Pack,
+            request: RequestKind::Sync,
+            priority: PriorityClass::ForegroundBlocking,
+            spec: ReadSpec::Whole,
+            estimated_bytes: 256 * 1024,
+        };
+        assert_eq!(scheduler_b.run_sync(&pack_req, || 3_u32).unwrap(), 3);
+
+        first_release.wait();
+        assert_eq!(first.join().unwrap().unwrap(), 1);
+        assert!(matches!(
+            queued.join().unwrap(),
+            Err(crate::pools::PoolError::Closed)
+        ));
+        assert!(!queued_user_ran.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -642,6 +790,189 @@ mod tests {
         assert_eq!(
             classify_request(&req, &CheapPolicy::default()),
             RouteDecision::Delegated(PoolKind::Fs)
+        );
+    }
+
+    #[test]
+    fn package_verification_routes_to_fs_pool_at_startup_priority() {
+        let req = IoRequest::VerifyPackage {
+            priority: PriorityClass::ForegroundBlocking,
+        };
+
+        assert_eq!(req.priority(), PriorityClass::ForegroundBlocking);
+        assert_eq!(
+            classify_request(&req, &CheapPolicy::default()),
+            RouteDecision::Delegated(PoolKind::Fs)
+        );
+    }
+
+    #[test]
+    fn package_verification_runs_on_bounded_fs_worker() {
+        let scheduler = IoScheduler::new(203);
+        let req = IoRequest::VerifyPackage {
+            priority: PriorityClass::ForegroundBlocking,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let thread_name = runtime
+            .block_on(scheduler.run_async(req, || {
+                std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_string()
+            }))
+            .unwrap();
+
+        assert!(thread_name.starts_with("Migo-IO-"));
+    }
+
+    #[test]
+    fn package_verification_is_rejected_after_domain_close() {
+        let scheduler = IoScheduler::new(205);
+        scheduler.close();
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_job = Arc::clone(&ran);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = runtime.block_on(scheduler.run_package_verification(
+            std::env::temp_dir().join("migo-closed-package-verification"),
+            PriorityClass::ForegroundBlocking,
+            move || ran_in_job.store(true, Ordering::SeqCst),
+        ));
+
+        assert!(matches!(result, Err(crate::pools::PoolError::Closed)));
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn same_package_verifications_wait_before_worker_dispatch() {
+        let scheduler = Arc::new(IoScheduler::local_for_test(207, 4));
+        let receipt_key = std::env::temp_dir().join(format!(
+            "migo-package-verification-singleflight-{}",
+            std::process::id()
+        ));
+        let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let first_scheduler = Arc::clone(&scheduler);
+        let first_key = receipt_key.clone();
+        let first = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(first_scheduler.run_package_verification(
+                first_key,
+                PriorityClass::ForegroundBlocking,
+                move || {
+                    first_started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            ))
+        });
+        first_started_rx.recv().unwrap();
+
+        let second_started = Arc::new(AtomicBool::new(false));
+        let second_started_in_job = Arc::clone(&second_started);
+        let (second_submitted_tx, second_submitted_rx) = std::sync::mpsc::channel();
+        let second_scheduler = Arc::clone(&scheduler);
+        let second = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            second_submitted_tx.send(()).unwrap();
+            runtime.block_on(second_scheduler.run_package_verification(
+                receipt_key,
+                PriorityClass::ForegroundBlocking,
+                move || second_started_in_job.store(true, Ordering::SeqCst),
+            ))
+        });
+        second_submitted_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "same-package waiter occupied another FS worker instead of awaiting the keyed gate"
+        );
+        assert_eq!(
+            scheduler.metrics().delegated_runs,
+            1,
+            "same-package waiter was dispatched before the first verifier released the gate"
+        );
+
+        release_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert!(second_started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn package_verification_cancelled_receiver_keeps_gate_until_worker_finishes() {
+        let scheduler = Arc::new(IoScheduler::local_for_test(209, 4));
+        let receipt_key = std::env::temp_dir().join(format!(
+            "migo-package-verification-cancel-{}",
+            std::process::id()
+        ));
+        let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let mut first = Box::pin(scheduler.run_package_verification(
+            receipt_key.clone(),
+            PriorityClass::ForegroundBlocking,
+            move || {
+                first_started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            },
+        ));
+
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Future::poll(first.as_mut(), &mut context),
+            Poll::Pending
+        ));
+        first_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        // Cancelling the receiver must not release the per-package gate while
+        // its already-dispatched blocking closure is still running.
+        drop(first);
+
+        let second_started = Arc::new(AtomicBool::new(false));
+        let second_started_in_job = Arc::clone(&second_started);
+        let second_scheduler = Arc::clone(&scheduler);
+        let (second_submitted_tx, second_submitted_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            second_submitted_tx.send(()).unwrap();
+            runtime.block_on(second_scheduler.run_package_verification(
+                receipt_key,
+                PriorityClass::ForegroundBlocking,
+                move || second_started_in_job.store(true, Ordering::SeqCst),
+            ))
+        });
+        second_submitted_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let started_before_release = second_started.load(Ordering::SeqCst);
+        let delegated_before_release = scheduler.metrics().delegated_runs;
+
+        release_tx.send(()).unwrap();
+        second.join().unwrap().unwrap();
+
+        assert!(
+            !started_before_release,
+            "cancelling the first receiver released its gate while the worker was still running"
+        );
+        assert_eq!(
+            delegated_before_release, 1,
+            "cancelling the first receiver allowed another same-package worker dispatch"
         );
     }
 

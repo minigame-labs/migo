@@ -254,11 +254,6 @@ mod tests {
 
     #[test]
     fn build_stroke_paint_carries_line_attributes() {
-        // Routes through `effect_cache::get_or_build_dash` which
-        // bumps a global metric counter; hold the crate-wide test
-        // guard so concurrent tests in effect_cache don't see this
-        // bump on their installed sink.
-        let _g = crate::render_diagnostics::test_guard();
         let mut s = Canvas2DState::default();
         s.stroke = StyleKind::Color(ProtocolColor::black());
         s.line_width = 5.0;
@@ -440,10 +435,6 @@ mod tests {
 
     #[test]
     fn fill_paint_carries_shadow_filter_when_visible() {
-        // Routes through `effect_cache::get_or_build_drop_shadow`
-        // which bumps a global metric counter; hold the crate-wide
-        // guard so effect_cache's metric tests don't see this bump.
-        let _g = crate::render_diagnostics::test_guard();
         let mut s = Canvas2DState::default();
         s.shadow = Shadow {
             blur: 4.0,

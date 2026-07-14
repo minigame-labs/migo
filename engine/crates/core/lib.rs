@@ -83,11 +83,13 @@
 //! | **Host** | JS runtime, event loop, command dispatch, I/O dispatch (tokio task) |
 //! | **Render** | OpenGL/Canvas2D rendering, vsync |
 //! | **Audio** | Audio decoding, mixing, output |
-//! | **Blocking pool** | File system ops, image decode, zip extract (`spawn_blocking`) |
+//! | **Process I/O executor** | Bounded file ops, image decode, archive work (`Migo-IO-*`) |
+//! | **Tokio blocking fallback** | Lazy `tokio::fs` and resolver compatibility work |
 //!
-//! The IO handler runs as a `tokio::spawn` task on the Host runtime, sharing
-//! the same epoll fd, timer wheel, and blocking thread pool.  Heavy I/O work
-//! is offloaded to the blocking pool via `tokio::fs` / `spawn_blocking`.
+//! The host event loop shares one Tokio epoll fd and timer wheel. Heavy engine
+//! I/O is routed through the process-wide bounded I/O executor; the host's
+//! small Tokio blocking pool is created only if a remaining `tokio::fs` or
+//! resolver compatibility path needs it.
 //!
 //! All threads/tasks communicate via typed channels, ensuring thread safety
 //! without shared mutable state.
@@ -106,3 +108,18 @@ pub use runtime::{
     shutdown_host, spawn_host_thread,
 };
 pub use services::PlatformServices;
+#[cfg(all(feature = "profile-full", feature = "profile-slim"))]
+compile_error!("profile-full and profile-slim are mutually exclusive");
+#[cfg(all(feature = "worker-snapshot", not(feature = "profile-full")))]
+compile_error!("worker-snapshot requires profile-full");
+#[cfg(all(
+    feature = "profile-slim",
+    any(
+        feature = "api-sensors",
+        feature = "api-media",
+        feature = "api-connectivity",
+        feature = "api-commerce",
+        feature = "api-system"
+    )
+))]
+compile_error!("profile-slim is exact and cannot be combined with optional API groups");

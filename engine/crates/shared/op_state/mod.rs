@@ -24,6 +24,47 @@ pub type HostTx = crate::host_channel::HostCommandSender;
 /// both variants internally.  Wrapped in Arc for restart survival.
 pub type RafRx = Arc<crate::raf_signal::RafReceiver>;
 
+/// Coalescing lazy-audio host-start signal.
+///
+/// While the real `AudioThread` is absent, a successful audio-command send nudges
+/// the host event loop (via `tokio::sync::Notify`) to run
+/// `AudioService::check_and_start()`. `notify_one` coalesces a burst to a single
+/// permit. Once the thread is installed, [`Self::mark_started`] flips `needed` to
+/// false and later sends pay only one relaxed atomic load with no notification.
+/// This replaces the lazy-audio poll that the deleted 3-second host heartbeat
+/// performed each tick.
+pub struct AudioHostStartSignal {
+    needed: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl AudioHostStartSignal {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            needed: AtomicBool::new(true),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Await the next host-start nudge. The host loop selects on this branch and
+    /// calls `AudioService::check_and_start()` when it fires.
+    pub async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    /// Disable the signal once the real audio thread is installed.
+    pub fn mark_started(&self) {
+        self.needed.store(false, Ordering::Release);
+    }
+
+    /// Nudge the host only while the audio thread is still absent.
+    fn notify_if_needed(&self) {
+        if self.needed.load(Ordering::Acquire) {
+            self.notify.notify_one();
+        }
+    }
+}
+
 /// A wrapper around `UnboundedSender<AudioCmd>` that automatically notifies
 /// the audio thread's [`ThreadWakeup`] on every send.
 ///
@@ -34,12 +75,34 @@ pub type RafRx = Arc<crate::raf_signal::RafReceiver>;
 pub struct AudioSender {
     tx: UnboundedSender<AudioCmd>,
     wakeup: ThreadWakeup,
+    /// Optional coalescing lazy-audio host-start signal. Present only on the host
+    /// `AudioSender`s built by `AudioService`; `None` for Workers and tests.
+    host_start: Option<Arc<AudioHostStartSignal>>,
 }
 
 impl AudioSender {
-    /// Create a new `AudioSender` that wraps the given channel + wakeup.
+    /// Create a new `AudioSender` that wraps the given channel + wakeup, with no
+    /// host-start signal (used by Workers and test harnesses).
     pub fn new(tx: UnboundedSender<AudioCmd>, wakeup: ThreadWakeup) -> Self {
-        Self { tx, wakeup }
+        Self {
+            tx,
+            wakeup,
+            host_start: None,
+        }
+    }
+
+    /// Create a host `AudioSender` that also nudges the host loop to lazily start
+    /// the real audio thread on the first successful pre-start send.
+    pub fn with_host_start_signal(
+        tx: UnboundedSender<AudioCmd>,
+        wakeup: ThreadWakeup,
+        host_start: Arc<AudioHostStartSignal>,
+    ) -> Self {
+        Self {
+            tx,
+            wakeup,
+            host_start: Some(host_start),
+        }
     }
 
     /// Send a command to the audio thread and immediately signal wakeup.
@@ -49,8 +112,17 @@ impl AudioSender {
         value: AudioCmd,
     ) -> Result<(), tokio::sync::mpsc::error::SendError<AudioCmd>> {
         let result = self.tx.send(value);
-        // Always notify — even if the send fails (thread may still be draining).
+        // Always notify the audio thread — even if the send fails (thread may
+        // still be draining). Unchanged existing behavior.
         self.wakeup.notify();
+        // Lazy host-start: only a successful send while the real audio thread is
+        // still absent nudges the host to start it. After start it is one relaxed
+        // atomic load with no notification.
+        if result.is_ok() {
+            if let Some(signal) = &self.host_start {
+                signal.notify_if_needed();
+            }
+        }
         result
     }
 }
@@ -135,10 +207,11 @@ pub struct HostOpState {
     pub context_lost: Arc<ContextLostState>,
     /// Whether code signing enforcement is enabled for this runtime.
     pub code_signing_enabled: bool,
-    /// Per-session GPU compressed texture format support.
-    /// Shared with the render thread via `Arc`; render thread calls
-    /// `set()` after GL context init.  JS ops take a `snapshot()` and
-    /// pass it to image decode functions.
+    /// Per-session GPU image-path support (compressed formats and AHB import).
+    /// Shared with the render thread via `Arc`; render thread calls `set()`
+    /// after GL context init. On-demand image ops keep the `Arc` through queue
+    /// wait and snapshot when their decode worker starts, so the one-way AHB
+    /// circuit breaker is observed by queued work.
     pub gpu_caps: Arc<crate::device::gpu_caps::GpuCaps>,
 }
 
@@ -288,5 +361,93 @@ impl CanvasOpState {
     ) -> Self {
         self.text_measurer = Some(measurer);
         self
+    }
+}
+
+#[cfg(test)]
+mod audio_host_start_tests {
+    use super::*;
+    use crate::channel::ThreadWakeup;
+    use crate::protocol::audio_cmd::AudioCmd;
+    use tokio::sync::mpsc;
+
+    /// Poll `AudioHostStartSignal::notified()` exactly once with a no-op waker,
+    /// returning whether a permit was present (and consuming it if so). Lets the
+    /// coalescing behaviour be asserted deterministically without an async
+    /// runtime.
+    fn took_permit(signal: &AudioHostStartSignal) -> bool {
+        use std::task::{Context, Poll};
+        let fut = signal.notified();
+        let mut fut = std::pin::pin!(fut);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        matches!(
+            std::future::Future::poll(fut.as_mut(), &mut cx),
+            Poll::Ready(())
+        )
+    }
+
+    #[test]
+    fn successful_prestart_send_notifies_host() {
+        let signal = AudioHostStartSignal::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sender = AudioSender::with_host_start_signal(tx, ThreadWakeup::new(), signal.clone());
+        assert!(sender.send(AudioCmd::PauseAll).is_ok());
+        assert!(
+            took_permit(&signal),
+            "a successful pre-start send must notify the host to start audio"
+        );
+    }
+
+    #[test]
+    fn failed_send_does_not_notify_host() {
+        let signal = AudioHostStartSignal::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx); // close the channel so send fails
+        let sender = AudioSender::with_host_start_signal(tx, ThreadWakeup::new(), signal.clone());
+        assert!(sender.send(AudioCmd::PauseAll).is_err());
+        assert!(
+            !took_permit(&signal),
+            "a failed send must not notify the host"
+        );
+    }
+
+    #[test]
+    fn repeated_prestart_sends_coalesce_to_one_permit() {
+        let signal = AudioHostStartSignal::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sender = AudioSender::with_host_start_signal(tx, ThreadWakeup::new(), signal.clone());
+        sender.send(AudioCmd::PauseAll).unwrap();
+        sender.send(AudioCmd::PauseAll).unwrap();
+        sender.send(AudioCmd::PauseAll).unwrap();
+        assert!(took_permit(&signal), "the first notification is delivered");
+        assert!(
+            !took_permit(&signal),
+            "repeated pre-start sends coalesce to a single Notify permit"
+        );
+    }
+
+    #[test]
+    fn mark_started_disables_the_host_start_signal() {
+        let signal = AudioHostStartSignal::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sender = AudioSender::with_host_start_signal(tx, ThreadWakeup::new(), signal.clone());
+        sender.send(AudioCmd::PauseAll).unwrap();
+        assert!(took_permit(&signal));
+        signal.mark_started();
+        sender.send(AudioCmd::PauseAll).unwrap();
+        assert!(
+            !took_permit(&signal),
+            "once the real audio thread is installed, sends no longer signal the host"
+        );
+    }
+
+    #[test]
+    fn audio_sender_new_has_no_host_start_signal() {
+        // The no-signal constructor (used by Workers and test harnesses) must
+        // keep working and still enqueue the command.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sender = AudioSender::new(tx, ThreadWakeup::new());
+        assert!(sender.send(AudioCmd::PauseAll).is_ok());
+        assert!(rx.try_recv().is_ok(), "the command must still be enqueued");
     }
 }

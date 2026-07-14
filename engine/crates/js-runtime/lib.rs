@@ -98,6 +98,8 @@ mod input;
 mod io_state;
 mod lifecycle;
 pub(crate) mod network;
+#[cfg(feature = "api-media")]
+pub use network::fetch::create_audio_http_client;
 mod rendering;
 mod storage;
 mod url;
@@ -141,6 +143,7 @@ pub(crate) mod worker;
 mod host_runtime;
 mod js_bindings;
 pub mod snapshot;
+pub mod watchdog;
 
 pub use host_runtime::HostJsRuntime;
 pub use host_runtime::SharedMountTableRef;
@@ -152,6 +155,8 @@ mod tests_binary_helper;
 mod tests_global_surface;
 #[cfg(test)]
 mod tests_prelude;
+#[cfg(test)]
+mod tests_r8_install_receipt;
 #[cfg(test)]
 mod tests_snapshot_fingerprint;
 #[cfg(test)]
@@ -315,8 +320,8 @@ pub fn main_extensions(host: HostOpState) -> Vec<deno_core::Extension> {
 /// same approach deno's own runtime uses (hardening runs at startup, not in the
 /// snapshot).
 ///
-/// Workers do not use the snapshot, so they delete `Deno` directly in their
-/// bootstrap (`99_worker_main.js`) and do not call this.
+/// Workers use their own bootstrap helper because they must also start and
+/// remove a deferred message-pump hook after runtime-only op state exists.
 pub fn harden_global_scope(rt: &mut deno_core::JsRuntime) {
     if let Err(e) = rt.execute_script(
         "ext:runtime/harden_global.js",
@@ -327,3 +332,26 @@ pub fn harden_global_scope(rt: &mut deno_core::JsRuntime) {
         tracing::error!("failed to harden global scope (Deno/__bootstrap not removed): {e}");
     }
 }
+#[cfg(all(feature = "profile-full", feature = "profile-slim"))]
+compile_error!("profile-full and profile-slim are mutually exclusive");
+#[cfg(all(feature = "worker-snapshot", not(feature = "profile-full")))]
+compile_error!("worker-snapshot requires profile-full");
+#[cfg(all(
+    target_os = "android",
+    feature = "worker-snapshot",
+    not(migo_has_worker_snapshot)
+))]
+compile_error!(
+    "worker-snapshot was requested, but no exact schema-v3 Worker snapshot was validated"
+);
+#[cfg(all(
+    feature = "profile-slim",
+    any(
+        feature = "api-sensors",
+        feature = "api-media",
+        feature = "api-connectivity",
+        feature = "api-commerce",
+        feature = "api-system"
+    )
+))]
+compile_error!("profile-slim is exact and cannot be combined with optional API groups");

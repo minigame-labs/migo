@@ -19,7 +19,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use sha2::{Digest, Sha256};
 
-use build_snapshot::{collect_js_files, snapshot_js_hash};
+use build_snapshot::{
+    ManifestIdentity, SNAPSHOT_SCHEMA_VERSION, SnapshotIdentity, collect_js_files,
+    collect_rust_files, require_materialized_size, sha256_file, snapshot_feature_hash,
+    snapshot_js_hash, snapshot_profile_features, snapshot_runtime_hash, validate_snapshot_identity,
+};
 
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -212,6 +216,125 @@ fn rust_and_shell_fingerprints_match_on_the_real_tree() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn rust_and_shell_profile_runtime_fingerprints_match() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .ancestors()
+        .nth(3)
+        .expect("js-runtime lives under <repo>/engine/crates");
+    let rust_files = collect_rust_files(manifest_dir).unwrap();
+    let rust_runtime_hash = snapshot_runtime_hash(repo_root, &rust_files).unwrap();
+    let rust_feature_hash = snapshot_feature_hash(snapshot_profile_features("slim").unwrap());
+    let script = repo_root.join("scripts/lib/snapshot-fingerprint.sh");
+
+    let output = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "source '{}' && snapshot_runtime_hash '{}' && snapshot_feature_hash slim",
+            script.display(),
+            repo_root.display()
+        ))
+        .output()
+        .expect("run shell snapshot helpers");
+    assert!(
+        output.status.success(),
+        "shell fingerprints failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines: Vec<_> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines, vec![rust_runtime_hash, rust_feature_hash]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shell_v8_fingerprint_uses_content_hash_for_archive_and_lfs_pointer() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .ancestors()
+        .nth(3)
+        .expect("js-runtime lives under <repo>/engine/crates");
+    let script = repo_root.join("scripts/lib/snapshot-fingerprint.sh");
+    let root = unique_tmp_dir("v8-lfs");
+    let archive = root.join("librusty_v8.a");
+    let pointer = root.join("librusty_v8.pointer");
+    let malformed = root.join("malformed-small-file");
+
+    std::fs::write(&archive, vec![0x5a; 100_000]).unwrap();
+    let expected = sha256_file(&archive).unwrap();
+    std::fs::write(
+        &pointer,
+        format!(
+            "version https://git-lfs.github.com/spec/v1\n\
+             oid sha256:{expected}\n\
+             size 100000\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(&malformed, b"not a materialized archive or LFS pointer\n").unwrap();
+
+    let output = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(
+            "source \"$1\" && snapshot_v8_archive_hash \"$2\" && \
+             snapshot_v8_archive_hash \"$3\" && \
+             snapshot_artifact_size \"$2\" && snapshot_artifact_size \"$3\"",
+        )
+        .arg("migo-v8-hash-test")
+        .arg(&script)
+        .arg(&archive)
+        .arg(&pointer)
+        .output()
+        .expect("run shell V8 fingerprint helper");
+    assert!(
+        output.status.success(),
+        "archive/LFS identity helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hashes: Vec<_> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        hashes,
+        vec![
+            expected.clone(),
+            expected,
+            "100000".to_string(),
+            "100000".to_string()
+        ]
+    );
+
+    let malformed_output = std::process::Command::new("bash")
+        .arg("-c")
+        .arg("source \"$1\" && snapshot_v8_archive_hash \"$2\"")
+        .arg("migo-v8-hash-test")
+        .arg(&script)
+        .arg(&malformed)
+        .output()
+        .expect("run malformed V8 fingerprint helper");
+    assert!(
+        !malformed_output.status.success(),
+        "small non-LFS files must not be accepted as a V8 archive identity"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn materialized_snapshot_and_v8_inputs_reject_lfs_pointer_sizes() {
+    assert!(require_materialized_size("snapshot", 132).is_err());
+    assert!(require_materialized_size("V8 archive", 132).is_err());
+    assert!(require_materialized_size("snapshot", 99_999).is_err());
+    assert!(require_materialized_size("snapshot", 100_000).is_ok());
+}
+
 /// Enumeration is atomic from the caller's perspective: pointing at a
 /// non-directory fails outright and returns no `Vec`. The `io::Result<Vec>`
 /// signature is what makes it impossible for `build.rs` to observe a partial
@@ -291,7 +414,11 @@ fn write_snapshot_manifest_succeeds_without_git() {
     std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let bin = tmp.join("SNAPSHOT-testarch.bin");
-    std::fs::write(&bin, b"dummy snapshot bytes").unwrap();
+    std::fs::write(&bin, vec![0x53; 100_000]).unwrap();
+    let v8_archive = tmp.join("librusty_v8.a");
+    // Snapshot generation must use the materialized V8 archive. A tiny Git LFS
+    // pointer is useful to freshness-only CI, but must never create a manifest.
+    std::fs::write(&v8_archive, vec![0x41; 100_000]).unwrap();
     let manifest = PathBuf::from(format!("{}.manifest.json", bin.display()));
 
     let path_env = format!(
@@ -301,8 +428,11 @@ fn write_snapshot_manifest_succeeds_without_git() {
     );
     let output = std::process::Command::new("bash")
         .arg(&script)
+        .arg("full")
         .arg("testarch")
         .arg(&bin)
+        .arg("worker")
+        .env("MIGO_V8_ARCHIVE", &v8_archive)
         .env("PATH", path_env)
         .output()
         .expect("run scripts/write-snapshot-manifest.sh");
@@ -319,6 +449,30 @@ fn write_snapshot_manifest_succeeds_without_git() {
         "manifest: {written}"
     );
     assert!(
+        written.contains("\"schema_version\": 3"),
+        "manifest: {written}"
+    );
+    assert!(
+        written.contains("\"snapshot_kind\": \"worker\""),
+        "manifest: {written}"
+    );
+    assert!(
+        written.contains("\"profile\": \"full\""),
+        "manifest: {written}"
+    );
+    assert!(
+        written.contains("\"features_sha256\""),
+        "manifest: {written}"
+    );
+    assert!(
+        written.contains("\"rust_sources_sha256\""),
+        "manifest: {written}"
+    );
+    assert!(
+        written.contains("\"v8_archive_sha256\""),
+        "manifest: {written}"
+    );
+    assert!(
         written.contains("\"js_sources_sha256\""),
         "manifest: {written}"
     );
@@ -332,4 +486,172 @@ fn write_snapshot_manifest_succeeds_without_git() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn product_feature_hash_is_canonical_and_profile_specific() {
+    let full = snapshot_profile_features("full").expect("full features");
+    let slim = snapshot_profile_features("slim").expect("slim features");
+    assert_ne!(snapshot_feature_hash(full), snapshot_feature_hash(slim));
+
+    let mut reversed = full.to_vec();
+    reversed.reverse();
+    assert_eq!(
+        snapshot_feature_hash(full),
+        snapshot_feature_hash(&reversed),
+        "feature hash must sort internally"
+    );
+    assert!(snapshot_profile_features("custom").is_err());
+}
+
+#[test]
+fn runtime_fingerprint_changes_when_an_op_source_changes() {
+    let root = unique_tmp_dir("runtime-rs");
+    let jsr = root.join("engine/crates/js-runtime");
+    let snapshot_gen = root.join("engine/crates/snapshot-gen");
+    write_file(&jsr.join("lib.rs"), b"fn stable() {}\n");
+    write_file(
+        &jsr.join("device/mod.rs"),
+        b"#[op2(fast)] fn op_value() -> i32 { 1 }\n",
+    );
+    write_file(&jsr.join("device/ignored.js"), b"ignored here\n");
+    write_file(&jsr.join("Cargo.toml"), b"[features]\nprofile-slim=[]\n");
+    write_file(
+        &snapshot_gen.join("src/main.rs"),
+        b"fn create_snapshot() {}\n",
+    );
+    write_file(
+        &snapshot_gen.join("Cargo.toml"),
+        b"[features]\nprofile-slim=[]\n",
+    );
+    write_file(&root.join("engine/Cargo.lock"), b"version = 4\n");
+
+    let files = collect_rust_files(&jsr).unwrap();
+    let relative: Vec<_> = files.iter().map(|path| rel(&root, path)).collect();
+    for required in [
+        "engine/crates/js-runtime/Cargo.toml",
+        "engine/crates/snapshot-gen/src/main.rs",
+        "engine/crates/snapshot-gen/Cargo.toml",
+        "engine/Cargo.lock",
+    ] {
+        assert!(
+            relative.iter().any(|path| path == required),
+            "snapshot runtime fingerprint omitted {required}: {relative:?}"
+        );
+    }
+
+    let before = snapshot_runtime_hash(&root, &files).unwrap();
+    write_file(
+        &jsr.join("device/mod.rs"),
+        b"#[op2(fast)] fn op_value() -> i32 { 2 }\n",
+    );
+    let after = snapshot_runtime_hash(&root, &files).unwrap();
+    assert_ne!(before, after);
+
+    write_file(
+        &snapshot_gen.join("src/main.rs"),
+        b"fn create_snapshot_with_warmup() {}\n",
+    );
+    let generator_after = snapshot_runtime_hash(&root, &files).unwrap();
+    assert_ne!(after, generator_after);
+
+    write_file(
+        &snapshot_gen.join("Cargo.toml"),
+        b"[features]\nprofile-slim=[\"js-runtime/profile-slim\"]\n",
+    );
+    assert_ne!(
+        generator_after,
+        snapshot_runtime_hash(&root, &files).unwrap()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn legacy_or_mismatched_snapshot_identity_is_rejected() {
+    let expected = SnapshotIdentity {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        snapshot_kind: "worker",
+        profile: "full",
+        arch: "aarch64",
+        features_sha256: "features",
+        rust_sources_sha256: "runtime",
+        v8_archive_sha256: "v8",
+        js_sources_sha256: "js",
+        deno_core_version: "0.385.0",
+        snapshot_size: 1_900_000,
+    };
+    let legacy = ManifestIdentity {
+        arch: Some("aarch64"),
+        ..ManifestIdentity::default()
+    };
+    assert!(validate_snapshot_identity(legacy, expected).is_err());
+
+    let valid = ManifestIdentity {
+        schema_version: Some(SNAPSHOT_SCHEMA_VERSION),
+        snapshot_kind: Some("worker"),
+        profile: Some("full"),
+        arch: Some("aarch64"),
+        features_sha256: Some("features"),
+        rust_sources_sha256: Some("runtime"),
+        v8_archive_sha256: Some("v8"),
+        js_sources_sha256: Some("js"),
+        deno_core_version: Some("0.385.0"),
+        snapshot_size: Some(1_900_000),
+    };
+    assert!(validate_snapshot_identity(valid, expected).is_ok());
+    assert!(
+        validate_snapshot_identity(
+            ManifestIdentity {
+                snapshot_kind: Some("host"),
+                ..valid
+            },
+            expected
+        )
+        .is_err(),
+        "a host snapshot must never load in a Worker"
+    );
+    assert!(
+        validate_snapshot_identity(
+            ManifestIdentity {
+                snapshot_kind: None,
+                ..valid
+            },
+            expected
+        )
+        .is_err(),
+        "schema 3 must reject a manifest without snapshot_kind"
+    );
+    assert!(
+        validate_snapshot_identity(
+            ManifestIdentity {
+                profile: Some("slim"),
+                ..valid
+            },
+            expected
+        )
+        .is_err(),
+        "a slim snapshot must never load in a full Worker"
+    );
+    assert!(
+        validate_snapshot_identity(
+            ManifestIdentity {
+                js_sources_sha256: Some("other-js"),
+                ..valid
+            },
+            expected
+        )
+        .is_err(),
+        "changed extension JS must invalidate a snapshot"
+    );
+    assert!(
+        validate_snapshot_identity(
+            ManifestIdentity {
+                deno_core_version: Some("other-deno"),
+                ..valid
+            },
+            expected
+        )
+        .is_err(),
+        "a deno_core version mismatch must invalidate a snapshot"
+    );
 }

@@ -84,11 +84,16 @@ jobs:
       - name: Shell script syntax check
         run: bash -n scripts/*.sh scripts/ci/*.sh
 
+      - name: Product profile and R8 contract gates
+        run: |
+          bash scripts/test-product-profiles.sh
+          bash scripts/test-r8-profile-contract.sh
+
       - name: Python script syntax check
         run: python3 -m py_compile scripts/ci/compare_baseline.py scripts/ci/check_migo_test_suite.py
 
   # ── Job 2: Android AAR build — the real "does the whole project compile,
-  # link, and embed the per-arch snapshot" gate (cross-compiles graphics/audio
+  # link, and embed the profile/ABI snapshot" gate (cross-compiles graphics/audio
   # via the NDK, where skia/alsa deps are handled). ───────────────────
   build:
     needs: quality-gate
@@ -107,18 +112,20 @@ jobs:
 
       # actions/checkout sets GIT_LFS_SKIP_SMUDGE during checkout and does not
       # reliably smudge large objects back into the tree, leaving the V8 archives
-      # (and per-arch snapshots) as ~130-byte pointer stubs — which makes the
+      # (and profile/ABI snapshots) as ~130-byte pointer stubs — which makes the
       # rusty_v8 build script emit "could not find native static library
       # rusty_v8" and the .so link fail. Force the smudge for exactly the files
       # this job links/embeds (both shipped ABIs) and guard against a pointer.
       - name: Materialize LFS objects (V8 archives + snapshots)
         run: |
-          git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/js-runtime/snapshots/SNAPSHOT-aarch64.bin,engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin"
+          git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/js-runtime/snapshots/SNAPSHOT-*.bin"
           for f in \
             engine/third_party/rusty_v8/aarch64/librusty_v8.a \
             engine/third_party/rusty_v8/x86_64/librusty_v8.a \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-aarch64.bin \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-x86_64.bin ; do
+            engine/crates/js-runtime/snapshots/SNAPSHOT-full-aarch64.bin \
+            engine/crates/js-runtime/snapshots/SNAPSHOT-full-x86_64.bin \
+            engine/crates/js-runtime/snapshots/SNAPSHOT-slim-aarch64.bin \
+            engine/crates/js-runtime/snapshots/SNAPSHOT-slim-x86_64.bin ; do
             sz=$(stat -c %s "$f")
             echo "$f: $sz bytes"
             [ "$sz" -gt 100000 ] || { echo "ERROR: $f is still an LFS pointer"; exit 1; }
@@ -170,15 +177,19 @@ jobs:
           key: gradle-${{ hashFiles('platforms/android/**/*.gradle*') }}
           restore-keys: gradle-
 
-      # Build the ABIs we ship V8 archives + snapshots for (arm64-v8a, x86_64).
-      # build.rs embeds snapshots/SNAPSHOT-<arch>.bin per target arch.
-      - name: Build Android AAR (debug)
-        run: bash scripts/build-aar.sh debug arm64-v8a x86_64
+      # Build both products for both shipped ABIs. build.rs embeds only the
+      # matching SNAPSHOT-<profile>-<arch>.bin after schema-v2 validation.
+      - name: Build Android AARs (debug)
+        run: |
+          bash scripts/build-aar.sh --product-profile full debug arm64-v8a x86_64
+          bash scripts/build-aar.sh --product-profile slim debug arm64-v8a x86_64
 
       - name: Analyze AAR size report
         run: |
-          python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-debug.aar \
-            > platforms/android/dist/size-report.txt || true
+          python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-full-debug.aar \
+            > platforms/android/dist/size-report-full.txt || true
+          python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-slim-debug.aar \
+            > platforms/android/dist/size-report-slim.txt || true
 
       - name: Optional perf baseline compare
         run: |

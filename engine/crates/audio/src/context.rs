@@ -789,7 +789,10 @@ mod tests {
         ctx.create_buffer_source(20);
         ctx.connect(20, DESTINATION_NODE_ID);
         assert!(ctx.stop_source(20, 0.0));
-        assert!(ctx.remove_finished_node(20), "immediate-finished node removed");
+        assert!(
+            ctx.remove_finished_node(20),
+            "immediate-finished node removed"
+        );
         assert!(!ctx.nodes.contains_key(&20));
         assert!(!ctx.node_buffers.contains_key(&20));
         assert!(!ctx.connections.iter().any(|c| c.src == 20 || c.dst == 20));

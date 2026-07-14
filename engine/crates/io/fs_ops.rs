@@ -1,8 +1,8 @@
 //! Synchronous file-system operations.
 //!
-//! Each function uses blocking `std::fs` calls.  Called directly on
-//! the V8 thread (for sync ops) or via `tokio::spawn_blocking`
-//! (for async ops).
+//! Each function uses blocking `std::fs` calls. Called directly on the V8
+//! thread for sync ops or through the process-wide bounded `IoScheduler` for
+//! async ops.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -76,10 +76,7 @@ fn code_err(code: ErrorCode) -> EngineError {
 ///
 /// Bounded to a handful of iterations so a pathological external process
 /// alternately creating and deleting the path can't spin forever.
-fn open_append_created_aware(
-    path: &str,
-    read: bool,
-) -> Result<(std::fs::File, bool), EngineError> {
+fn open_append_created_aware(path: &str, read: bool) -> Result<(std::fs::File, bool), EngineError> {
     for _ in 0..16 {
         let mut create_opts = std::fs::OpenOptions::new();
         if read {
@@ -2092,8 +2089,13 @@ mod tests {
         let dir = tmp_dir("rf_max");
         let path = dir.join("tiny.bin");
         std::fs::write(&path, b"tiny").unwrap();
-        let err =
-            read_file(path.to_str().unwrap(), None, Some(MAX_READ_LENGTH + 1), true).unwrap_err();
+        let err = read_file(
+            path.to_str().unwrap(),
+            None,
+            Some(MAX_READ_LENGTH + 1),
+            true,
+        )
+        .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         let _ = std::fs::remove_dir_all(&dir);
     }

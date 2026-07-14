@@ -1,13 +1,15 @@
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{cell::RefCell, future::Future, rc::Rc, sync::Arc};
 
 use deno_core::{
-    Extension, FsModuleLoader, JsRuntime, ModuleLoader, OpState, PollEventLoopOptions,
-    RuntimeOptions, SharedArrayBufferStore, op2, resolve_path, v8,
+    Extension, ExtensionArguments, FsModuleLoader, JsRuntime, ModuleLoader, OpState,
+    PollEventLoopOptions, RuntimeOptions, SharedArrayBufferStore, op2, resolve_path, v8,
 };
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use shared::op_state::HostOpState;
+
+use crate::watchdog::{DeadlineWatchdog, DeadlineWatchdogConfig};
 
 /// Maximum size for a single worker message payload (16 MB).
 /// Prevents large messages from bypassing V8 heap limits.
@@ -795,124 +797,196 @@ pub fn create_worker_runtime_extensions(ctx: WorkerCtx, host_state: HostOpState)
     exts
 }
 
+/// Create the exact Worker extension chain in lazy-init mode for snapshot
+/// creation/restoration. Keep this order byte-identical to
+/// [`create_worker_runtime_extensions`] and [`create_worker_runtime_extension_args`].
+pub(crate) fn create_worker_runtime_lazy_extensions() -> Vec<Extension> {
+    use crate::{
+        base, console, env, event, file, io_state, lifecycle, network, rendering, url, utility,
+        web, worker_runtime,
+    };
+
+    let mut exts = vec![
+        base::host_v8_base::lazy_init(),
+        io_state::host_v8_io_state::lazy_init(),
+    ];
+    exts.extend(console::console_lazy_extensions());
+    exts.extend(event::event_lazy_extensions());
+    exts.extend(utility::utility_lazy_extensions());
+    exts.extend(file::file_lazy_extensions());
+    exts.extend(rendering::rendering_lazy_extensions());
+    exts.extend(web::web_lazy_extensions());
+    exts.extend(url::url_lazy_extensions());
+    exts.extend(network::network_lazy_extensions());
+
+    #[cfg(feature = "api-media")]
+    {
+        exts.push(lifecycle::host_v8_lifecycle::lazy_init());
+        exts.extend(crate::audio::audio_lazy_extensions());
+    }
+
+    exts.push(env::host_v8_env::lazy_init());
+    exts.push(host_v8_worker_inner::lazy_init());
+    exts.push(worker_runtime::lazy_init());
+    exts
+}
+
+/// Runtime-only state callbacks for a restored Worker snapshot.
+pub(crate) fn create_worker_runtime_extension_args(
+    ctx: WorkerCtx,
+    host_state: HostOpState,
+) -> Vec<ExtensionArguments> {
+    use crate::{
+        base, console, env, event, file, io_state, lifecycle, network, rendering, url, utility,
+        web, worker_runtime,
+    };
+
+    let mut args = vec![
+        base::host_v8_base::args(host_state),
+        io_state::host_v8_io_state::args(),
+        console::host_v8_console::args(),
+        event::host_v8_event::args(),
+        utility::host_v8_utility::args(),
+        file::host_v8_file::args(),
+        rendering::image::host_v8_image::args(),
+        rendering::webgl::host_v8_webgl::args(),
+        web::host_v8_web::args(),
+        url::host_v8_url::args(),
+        network::network_extension_args(),
+    ];
+
+    #[cfg(feature = "api-media")]
+    {
+        args.push(lifecycle::host_v8_lifecycle::args());
+        args.push(crate::audio::host_v8_audio::args());
+    }
+
+    args.push(env::host_v8_env::args());
+    args.push(host_v8_worker_inner::args(ctx));
+    args.push(worker_runtime::args());
+    args
+}
+
 // ---------------------------------------------------------------------------
 // Worker thread spawn
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Runaway watchdog
+// Runaway protection via the process deadline watchdog
 // ---------------------------------------------------------------------------
 
-/// How often the monitor thread samples the worker heartbeat.
-const WORKER_WATCHDOG_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-/// Max time a worker may run without yielding before it is force-terminated.
-/// Matches the host ANR timeout: generous enough to cover module compilation on
-/// low-end devices, tight enough to catch a `while(true)` runaway.
-const WORKER_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Max time a Worker may run untrusted JS without yielding before it is
+/// force-terminated. Matches the host ANR budget: generous enough for module
+/// compilation on low-end devices, tight enough to catch a `while (true)`.
+const WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Liveness heartbeat for a worker isolate. The worker runs on a
-/// **single-threaded** tokio runtime, so a runaway JS loop that never yields
-/// monopolises the thread and starves the ticker task; the heartbeat then goes
-/// stale and the monitor thread force-terminates the isolate. Self-contained
-/// mirror of the host ANR watchdog (`js-runtime` cannot depend on `core`).
-struct WorkerWatchdog {
-    epoch: std::time::Instant,
-    heartbeat_ms: std::sync::atomic::AtomicU64,
-}
+/// The single JSON error reported (exactly once) when the deadline watchdog
+/// terminates a runaway Worker.
+const WORKER_TIMEOUT_MSG: &str =
+    r#"{"message":"Worker terminated: unresponsive (watchdog timeout)"}"#;
 
-impl WorkerWatchdog {
-    #[inline]
-    fn mono_millis(&self) -> u64 {
-        self.epoch.elapsed().as_millis() as u64
-    }
-    #[inline]
-    fn tick(&self) {
-        self.heartbeat_ms
-            .store(self.mono_millis(), std::sync::atomic::Ordering::Release);
-    }
-}
-
-/// Arm the runaway watchdog for the current worker. Spawns two helpers:
-///   * a ticker task on the worker's single-threaded runtime that refreshes the
-///     heartbeat once a second — it can only run when JS yields, so a runaway
-///     loop stops it (and is cancelled automatically when the runtime is
-///     dropped on worker exit);
-///   * a monitor OS thread (unaffected by a blocked runtime) that terminates
-///     the isolate via the published handle once the heartbeat is older than
-///     [`WORKER_WATCHDOG_TIMEOUT`], and exits on its own once the worker clears
-///     the handle slot on any exit path.
-fn spawn_worker_watchdog(
-    isolate_handle_slot: Arc<std::sync::Mutex<Option<v8::IsolateHandle>>>,
-    tx_errors: mpsc::UnboundedSender<String>,
+/// Report a Worker error unless the deadline watchdog already fired. On a
+/// timeout the watchdog observer sends [`WORKER_TIMEOUT_MSG`] exactly once, so
+/// the load/eval/event-loop error paths must not additionally report the
+/// resulting "execution terminated" error.
+fn report_worker_error(
+    watchdog: Option<&DeadlineWatchdog>,
+    tx_errors: &mpsc::UnboundedSender<String>,
+    message: String,
 ) {
-    use std::sync::atomic::Ordering;
-
-    let wd = Arc::new(WorkerWatchdog {
-        epoch: std::time::Instant::now(),
-        heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
-    });
-    wd.tick();
-
-    let wd_tick = Arc::clone(&wd);
-    tokio::task::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            wd_tick.tick();
-        }
-    });
-
-    let spawned = std::thread::Builder::new()
-        .name("Migo-WorkerWatchdog".into())
-        .spawn(move || {
-            let timeout_ms = WORKER_WATCHDOG_TIMEOUT.as_millis() as u64;
-            let mut reported = false;
-            loop {
-                std::thread::sleep(WORKER_WATCHDOG_CHECK_INTERVAL);
-                let elapsed = wd
-                    .mono_millis()
-                    .saturating_sub(wd.heartbeat_ms.load(Ordering::Acquire));
-                // Hold the slot lock only briefly. The worker never holds it
-                // while executing JS, so a runaway loop can still be reached.
-                let slot = match isolate_handle_slot.lock() {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                match slot.as_ref() {
-                    // Handle cleared => worker exited (all exit paths clear it)
-                    // => the isolate is gone, stop the monitor.
-                    None => break,
-                    Some(handle) => {
-                        if elapsed > timeout_ms {
-                            // Re-arm termination every cycle until the worker
-                            // actually exits (slot clears). One
-                            // terminate_execution() is enough for a JS runaway,
-                            // but a worker wedged in an uninterruptible native op
-                            // won't drop until that op returns; keep the request
-                            // live rather than giving up after one shot. Report
-                            // once to avoid spamming the error channel.
-                            if !reported {
-                                warn!(
-                                    "[Worker] watchdog: runaway detected ({}ms unresponsive > {}ms), terminating isolate",
-                                    elapsed, timeout_ms
-                                );
-                                let _ = tx_errors.send(
-                                    r#"{"message":"Worker terminated: unresponsive (watchdog timeout)"}"#
-                                        .to_string(),
-                                );
-                                reported = true;
-                            }
-                            handle.terminate_execution();
-                        }
-                    }
-                }
-            }
-        });
-    if let Err(e) = spawned {
-        // Non-fatal: without the monitor the worker simply lacks auto-kill (the
-        // pre-existing state), so log and continue rather than fail the spawn.
-        warn!("[Worker] failed to spawn watchdog monitor thread: {e}");
+    if watchdog.is_some_and(DeadlineWatchdog::timed_out) {
+        return;
     }
+    let _ = tx_errors.send(message);
+}
+
+fn worker_initialization_error(stage: &str, error: &dyn std::fmt::Display) -> String {
+    deno_core::serde_json::json!({
+        "message": format!("Worker {stage} failed: {error}")
+    })
+    .to_string()
+}
+
+/// Guard every poll of module loading (V8 parse/compile of untrusted code counts
+/// against the budget).
+async fn worker_load_module(
+    rt: &mut JsRuntime,
+    watchdog: Option<&DeadlineWatchdog>,
+    resolved: &deno_core::ModuleSpecifier,
+) -> Result<deno_core::ModuleId, String> {
+    let mut load = std::pin::pin!(rt.load_main_es_module(resolved));
+    std::future::poll_fn(|cx| crate::watchdog::poll_guarded(watchdog, load.as_mut(), cx))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Guard the SYNCHRONOUS `mod_evaluate` constructor — deno_core 0.385 enters V8
+/// to run the module top-level while building the returned future, so a
+/// top-level `while (true) {}` must be covered here, not only in later polls —
+/// plus every poll of the evaluation future and the event loop.
+async fn worker_evaluate_module(
+    rt: &mut JsRuntime,
+    watchdog: Option<&DeadlineWatchdog>,
+    module_id: deno_core::ModuleId,
+) -> Result<(), String> {
+    let evaluation = {
+        let _scope = watchdog.map(DeadlineWatchdog::enter);
+        rt.mod_evaluate(module_id)
+    };
+    let mut evaluation = std::pin::pin!(evaluation);
+    std::future::poll_fn(move |cx| -> std::task::Poll<Result<(), String>> {
+        let _scope = watchdog.map(DeadlineWatchdog::enter);
+        if let std::task::Poll::Ready(res) = evaluation.as_mut().poll(cx) {
+            return std::task::Poll::Ready(res.map_err(|e| e.to_string()));
+        }
+        match rt.poll_event_loop(cx, PollEventLoopOptions::default()) {
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e.to_string())),
+            _ => std::task::Poll::Pending,
+        }
+    })
+    .await
+}
+
+/// Guard every poll of the Worker event loop. The Worker message pump runs here,
+/// so a runaway message handler is force-terminated on the next poll boundary.
+async fn worker_run_event_loop(
+    rt: &mut JsRuntime,
+    watchdog: Option<&DeadlineWatchdog>,
+) -> Result<(), String> {
+    std::future::poll_fn(move |cx| {
+        let _scope = watchdog.map(DeadlineWatchdog::enter);
+        rt.poll_event_loop(cx, PollEventLoopOptions::default())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Start the Worker receive loop and remove snapshot/bootstrap internals before
+/// the isolate becomes reachable from another thread or game code is loaded.
+fn initialize_worker_runtime(rt: &mut JsRuntime) -> Result<(), String> {
+    rt.execute_script(
+        "ext:worker_runtime/initialize_runtime.js",
+        deno_core::FastString::from_static(
+            r#"(() => {
+                const start = globalThis.__migoStartWorkerMessagePump;
+                if (typeof start !== "function") {
+                    throw new Error("Worker message-pump bootstrap hook is missing");
+                }
+                start();
+                if (!delete globalThis.__migoStartWorkerMessagePump ||
+                    !delete globalThis.Deno ||
+                    !delete globalThis.__bootstrap) {
+                    throw new Error("Worker bootstrap globals could not be removed");
+                }
+                if ("__migoStartWorkerMessagePump" in globalThis ||
+                    "Deno" in globalThis || "__bootstrap" in globalThis) {
+                    throw new Error("Worker bootstrap globals remain visible");
+                }
+            })();"#,
+        ),
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 fn spawn_worker_thread(
@@ -946,7 +1020,19 @@ fn spawn_worker_thread(
 
                 runtime.block_on(async move {
                     let worker_mount_table = host_state.mount_table.clone();
-                    let exts = create_worker_runtime_extensions(ctx, host_state);
+                    let snapshot_bytes = crate::snapshot::WORKER_SNAPSHOT_BYTES;
+                    let use_snapshot = snapshot_bytes.is_some();
+                    let (exts, extension_args) = if use_snapshot {
+                        (
+                            create_worker_runtime_lazy_extensions(),
+                            Some(create_worker_runtime_extension_args(ctx, host_state)),
+                        )
+                    } else {
+                        (
+                            create_worker_runtime_extensions(ctx, host_state),
+                            None,
+                        )
+                    };
 
                     let module_loader: Option<Rc<dyn ModuleLoader>> =
                         Some(Rc::new(WorkerModuleLoader {
@@ -962,15 +1048,39 @@ fn spawn_worker_thread(
                             .heap_limits(v8_limits.initial_heap_size, v8_limits.max_heap_size),
                     );
 
-                    info!("[Worker] creating JsRuntime with {} extensions", exts.len());
+                    info!(
+                        "[Worker] creating JsRuntime with {} extensions (snapshot={})",
+                        exts.len(),
+                        use_snapshot
+                    );
                     let mut rt = JsRuntime::new(RuntimeOptions {
                         module_loader,
                         extensions: exts,
                         create_params,
+                        startup_snapshot: snapshot_bytes,
                         shared_array_buffer_store: Some(sab_store),
+                        skip_op_registration: use_snapshot,
                         ..Default::default()
                     });
                     info!("[Worker] JsRuntime created successfully");
+
+                    if let Some(extension_args) = extension_args {
+                        if let Err(error) = rt.lazy_init_extensions(extension_args) {
+                            error!("[Worker] snapshot state initialization failed: {error}");
+                            let _ = tx_errors.send(worker_initialization_error(
+                                "snapshot state initialization",
+                                &error,
+                            ));
+                            return;
+                        }
+                    }
+
+                    if let Err(error) = initialize_worker_runtime(&mut rt) {
+                        error!("[Worker] runtime bootstrap failed: {error}");
+                        let _ = tx_errors
+                            .send(worker_initialization_error("runtime bootstrap", &error));
+                        return;
+                    }
 
                     // Publish the isolate handle so the main thread can forcibly
                     // terminate this worker (WorkerHandle::force_terminate) even
@@ -1009,11 +1119,31 @@ fn spawn_worker_thread(
                         });
                     }
 
-                    // Arm the runaway watchdog now that the isolate handle is
-                    // published: covers module evaluation and the event loop. A
-                    // worker that stops yielding (infinite loop) starves the
-                    // ticker on this single-threaded runtime and gets killed.
-                    spawn_worker_watchdog(isolate_handle_slot.clone(), tx_errors.clone());
+                    // Register with the ONE process deadline watchdog. This
+                    // replaces the per-Worker one-second ticker + two-second
+                    // monitor OS thread; the observer reports the timeout exactly
+                    // once on `tx_errors`. Unconditional (not `v8-limits`-gated):
+                    // Worker runaway protection exists even under
+                    // `--no-default-features`. Declared after `rt` so it disarms +
+                    // unregisters (RAII) before `rt`/the isolate drops on every
+                    // exit path (success, error, panic).
+                    let watchdog = {
+                        let handle = rt.v8_isolate().thread_safe_handle();
+                        let tx = tx_errors.clone();
+                        let config = DeadlineWatchdogConfig::new(WORKER_TIMEOUT, "worker")
+                            .with_observer(Arc::new(move |_| {
+                                let _ = tx.send(WORKER_TIMEOUT_MSG.to_string());
+                            }));
+                        match DeadlineWatchdog::register_isolate(handle, config) {
+                            Ok(w) => Some(w),
+                            Err(e) => {
+                                warn!(
+                                    "[Worker] deadline watchdog unavailable, continuing without runaway protection: {e}"
+                                );
+                                None
+                            }
+                        }
+                    };
 
                     // Resolve and load worker script
                     let code_path = std::path::PathBuf::from(&code_dir);
@@ -1024,44 +1154,51 @@ fn spawn_worker_thread(
                                 "[Worker] failed to resolve worker script '{}' in '{}': {}",
                                 script_path, code_dir, e
                             );
-                            let _ = tx_errors.send(format!(
-                                r#"{{"message":"Failed to resolve worker script: {}"}}"#,
-                                e
-                            ));
+                            report_worker_error(
+                                watchdog.as_ref(),
+                                &tx_errors,
+                                format!(r#"{{"message":"Failed to resolve worker script: {}"}}"#, e),
+                            );
                             return;
                         }
                     };
 
                     info!("[Worker] loading main module: {}", resolved);
-                    let module_id = match rt.load_main_es_module(&resolved).await {
-                        Ok(id) => id,
-                        Err(e) => {
-                            error!("[Worker] failed to load worker script: {}", e);
-                            let _ = tx_errors.send(format!(
-                                r#"{{"message":"Failed to load worker script: {}"}}"#,
-                                e
-                            ));
-                            return;
-                        }
-                    };
+                    let module_id =
+                        match worker_load_module(&mut rt, watchdog.as_ref(), &resolved).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                error!("[Worker] failed to load worker script: {}", e);
+                                report_worker_error(
+                                    watchdog.as_ref(),
+                                    &tx_errors,
+                                    format!(r#"{{"message":"Failed to load worker script: {}"}}"#, e),
+                                );
+                                return;
+                            }
+                        };
 
                     info!("[Worker] module loaded (id={}), evaluating...", module_id);
-                    if let Err(e) = rt.mod_evaluate(module_id).await {
+                    if let Err(e) = worker_evaluate_module(&mut rt, watchdog.as_ref(), module_id).await
+                    {
                         error!("[Worker] worker script evaluation error: {}", e);
-                        let _ = tx_errors.send(format!(
-                            r#"{{"message":"Worker script evaluation error: {}"}}"#,
-                            e
-                        ));
+                        report_worker_error(
+                            watchdog.as_ref(),
+                            &tx_errors,
+                            format!(r#"{{"message":"Worker script evaluation error: {}"}}"#, e),
+                        );
                         return;
                     }
 
                     info!("[Worker] module evaluated, running event loop");
                     // Run event loop until it completes (message pump op keeps it alive)
-                    let poll = PollEventLoopOptions::default();
-                    if let Err(e) = rt.run_event_loop(poll).await {
+                    if let Err(e) = worker_run_event_loop(&mut rt, watchdog.as_ref()).await {
                         error!("[Worker] event loop error: {}", e);
-                        let _ = tx_errors
-                            .send(format!(r#"{{"message":"Worker event loop error: {}"}}"#, e));
+                        report_worker_error(
+                            watchdog.as_ref(),
+                            &tx_errors,
+                            format!(r#"{{"message":"Worker event loop error: {}"}}"#, e),
+                        );
                     }
 
                     info!("[Worker] thread exiting cleanly");
@@ -1278,6 +1415,48 @@ mod timer_lifecycle_tests {
         assert!(message.get("backgrounded").is_none());
     }
 
+    #[test]
+    fn worker_initialization_errors_are_valid_json() {
+        let encoded = worker_initialization_error("runtime bootstrap", &"bad \"hook\"");
+        let decoded: deno_core::serde_json::Value =
+            deno_core::serde_json::from_str(&encoded).expect("valid Worker error JSON");
+        assert_eq!(
+            decoded["message"],
+            "Worker runtime bootstrap failed: bad \"hook\""
+        );
+    }
+
+    #[test]
+    fn worker_snapshot_extensions_match_eager_and_argument_order() {
+        let (_eager_message_tx, eager_message_rx) = mpsc::unbounded_channel();
+        let (_eager_lifecycle_tx, eager_lifecycle_rx) = mpsc::unbounded_channel();
+        let eager_names: Vec<_> = create_worker_runtime_extensions(
+            test_worker_ctx(eager_message_rx, eager_lifecycle_rx),
+            test_host_state(Arc::new(AtomicBool::new(false))),
+        )
+        .into_iter()
+        .map(|extension| extension.name)
+        .collect();
+
+        let lazy_names: Vec<_> = create_worker_runtime_lazy_extensions()
+            .into_iter()
+            .map(|extension| extension.name)
+            .collect();
+
+        let (_args_message_tx, args_message_rx) = mpsc::unbounded_channel();
+        let (_args_lifecycle_tx, args_lifecycle_rx) = mpsc::unbounded_channel();
+        let argument_names: Vec<_> = create_worker_runtime_extension_args(
+            test_worker_ctx(args_message_rx, args_lifecycle_rx),
+            test_host_state(Arc::new(AtomicBool::new(false))),
+        )
+        .into_iter()
+        .map(|arguments| arguments.name)
+        .collect();
+
+        assert_eq!(lazy_names, eager_names);
+        assert_eq!(argument_names, eager_names);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn worker_pump_consumes_lifecycle_and_freezes_timer_remainder() {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
@@ -1291,6 +1470,7 @@ mod timer_lifecycle_tests {
             ),
             ..Default::default()
         });
+        initialize_worker_runtime(&mut rt).expect("worker runtime bootstrap");
 
         exec(
             &mut rt,
@@ -1335,6 +1515,7 @@ mod timer_lifecycle_tests {
             ),
             ..Default::default()
         });
+        initialize_worker_runtime(&mut rt).expect("worker runtime bootstrap");
 
         exec(
             &mut rt,
@@ -1378,6 +1559,7 @@ mod timer_lifecycle_tests {
             ),
             ..Default::default()
         });
+        initialize_worker_runtime(&mut rt).expect("worker runtime bootstrap");
 
         exec(
             &mut rt,
@@ -1400,5 +1582,221 @@ mod timer_lifecycle_tests {
         assert_js(&mut rt, "__workerTimer === 1");
 
         drop(message_tx);
+    }
+}
+
+/// R4: Worker runaway protection via the one process deadline watchdog.
+#[cfg(all(test, feature = "v8-limits"))]
+mod watchdog_worker_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use deno_core::{FastString, JsRuntime, RuntimeOptions};
+    use shared::{
+        channel::ThreadWakeup,
+        device::gpu_caps::GpuCaps,
+        op_state::{AudioSender, HostOpState, NetworkPolicy},
+        render_command_sender::CommandSender,
+    };
+
+    use crate::watchdog::{DeadlineWatchdog, DeadlineWatchdogConfig, Scheduler};
+
+    fn wt_host_state() -> HostOpState {
+        let (render_tx, _render_rx) = CommandSender::new();
+        let (audio_raw_tx, _audio_rx) = mpsc::unbounded_channel();
+        let (host_tx, _critical_host_tx, _host_rx) = shared::host_channel::channel(1);
+        HostOpState {
+            id: 1,
+            app_cache_dir: PathBuf::from("/tmp/cache"),
+            app_files_dir: PathBuf::from("/tmp/files"),
+            code_dir: None,
+            game_paths: None,
+            vfs: None,
+            mount_table: None,
+            render_tx,
+            text_measurer: None,
+            audio_tx: AudioSender::new(audio_raw_tx, ThreadWakeup::new()),
+            host_tx,
+            device_services: None,
+            raf_rx: None,
+            raf_demand: std::sync::Arc::new(shared::raf_signal::RafDemand::new()),
+            request_vsync: None,
+            sub_packages: Vec::new(),
+            workers_path: None,
+            network_policy: NetworkPolicy::default(),
+            backgrounded: Arc::new(AtomicBool::new(false)),
+            timer_backgrounded: Arc::new(AtomicBool::new(false)),
+            webgl_context_created: Arc::new(AtomicBool::new(false)),
+            context_lost: Arc::new(shared::op_state::ContextLostState::default()),
+            code_signing_enabled: false,
+            gpu_caps: GpuCaps::new(),
+        }
+    }
+
+    fn build_worker_rt(loader: Option<Rc<dyn ModuleLoader>>) -> JsRuntime {
+        let (_tx, rx_from_main) = mpsc::unbounded_channel::<WorkerMessage>();
+        let (_ltx, lifecycle_rx) = mpsc::unbounded_channel::<WorkerTimerLifecycleTransition>();
+        let (tx_to_main, _rx_to_main) = mpsc::unbounded_channel();
+        let (tx_errors, _rx_errors) = mpsc::unbounded_channel();
+        let ctx = WorkerCtx {
+            tx_to_main,
+            tx_errors,
+            rx_from_main: Arc::new(tokio::sync::Mutex::new(rx_from_main)),
+            timer_backgrounded_rx: Arc::new(tokio::sync::Mutex::new(lifecycle_rx)),
+        };
+        let mut rt = JsRuntime::new(RuntimeOptions {
+            module_loader: loader,
+            extensions: create_worker_runtime_extensions(ctx, wt_host_state()),
+            ..Default::default()
+        });
+        initialize_worker_runtime(&mut rt).expect("worker runtime bootstrap");
+        rt
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("migo-worker-wd-{tag}-{nanos}"))
+    }
+
+    #[tokio::test]
+    async fn worker_top_level_infinite_loop_is_terminated_and_reports_once() {
+        let dir = unique_dir("toplevel");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.js"), "while (true) {}").unwrap();
+
+        let mut rt = build_worker_rt(Some(Rc::new(FsModuleLoader)));
+        let sched = Scheduler::new_test();
+        let (err_tx, mut err_rx) = mpsc::unbounded_channel::<String>();
+        let obs_tx = err_tx.clone();
+        let config = DeadlineWatchdogConfig::new(Duration::from_millis(200), "worker-test")
+            .with_observer(Arc::new(move |_| {
+                let _ = obs_tx.send("watchdog-timeout".to_string());
+            }));
+        let wd = DeadlineWatchdog::register_isolate_on(
+            sched,
+            rt.v8_isolate().thread_safe_handle(),
+            config,
+        );
+
+        let resolved = resolve_path("main.js", &dir).unwrap();
+        let module_id = worker_load_module(&mut rt, Some(&wd), &resolved)
+            .await
+            .expect("module load (compile) succeeds; top-level runs during evaluate");
+        let eval = worker_evaluate_module(&mut rt, Some(&wd), module_id).await;
+        assert!(
+            eval.is_err(),
+            "a top-level infinite loop must be terminated"
+        );
+        assert!(wd.timed_out());
+
+        // Mirror the run block: the eval error is suppressed because the observer
+        // already reported the timeout exactly once.
+        if let Err(e) = eval {
+            report_worker_error(Some(&wd), &err_tx, format!("eval error: {e}"));
+        }
+        let first = tokio::time::timeout(Duration::from_secs(2), err_rx.recv())
+            .await
+            .expect("the observer must report the timeout")
+            .expect("message present");
+        assert_eq!(first, "watchdog-timeout");
+        assert!(
+            err_rx.try_recv().is_err(),
+            "exactly one timeout error; the eval error must be suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_message_handler_infinite_loop_is_terminated() {
+        let mut rt = build_worker_rt(None);
+        let sched = Scheduler::new_test();
+        let config = DeadlineWatchdogConfig::new(Duration::from_millis(200), "worker-test");
+        let wd = DeadlineWatchdog::register_isolate_on(
+            sched,
+            rt.v8_isolate().thread_safe_handle(),
+            config,
+        );
+
+        // A macrotask that never yields; it runs inside the guarded event loop,
+        // not during the (unguarded) setup script.
+        rt.execute_script(
+            "<setup>",
+            FastString::from_static("setTimeout(() => { while (true) {} }, 0);"),
+        )
+        .unwrap();
+
+        let result = worker_run_event_loop(&mut rt, Some(&wd)).await;
+        assert!(
+            result.is_err(),
+            "a runaway handler running in the event loop must be terminated"
+        );
+        assert!(wd.timed_out());
+    }
+
+    #[tokio::test]
+    async fn worker_watchdog_unregisters_on_drop() {
+        let mut rt = build_worker_rt(None);
+        let sched = Scheduler::new_test();
+        let wd = DeadlineWatchdog::register_isolate_on(
+            sched,
+            rt.v8_isolate().thread_safe_handle(),
+            DeadlineWatchdogConfig::new(Duration::from_secs(10), "worker-test"),
+        );
+        assert_eq!(sched.registered_len(), 1);
+        drop(wd);
+        assert_eq!(
+            sched.registered_len(),
+            0,
+            "dropping the watchdog must unregister the target (no leak on any exit path)"
+        );
+    }
+
+    #[test]
+    fn worker_uses_shared_scheduler_not_a_local_monitor() {
+        let src = include_str!("mod.rs");
+        // Forbidden symbols (split via concat! so this test's own text does not
+        // match the needle).
+        assert!(
+            !src.contains(concat!("Migo-", "WorkerWatchdog")),
+            "the per-Worker monitor thread must be gone"
+        );
+        assert!(
+            !src.contains(concat!("WORKER_WATCHDOG_", "CHECK_INTERVAL")),
+            "the periodic check interval constant must be gone"
+        );
+        assert!(
+            !src.contains(concat!("WORKER_WATCHDOG_", "TIMEOUT")),
+            "the old timeout constant must be gone"
+        );
+        assert!(
+            !src.contains(concat!("spawn_worker_", "watchdog")),
+            "the per-Worker watchdog spawner must be gone"
+        );
+        assert!(
+            !src.contains(concat!("struct Worker", "Watchdog")),
+            "the per-Worker heartbeat struct must be gone"
+        );
+        assert!(
+            !src.contains(concat!("tokio::time::", "interval")),
+            "the one-second ticker task must be gone"
+        );
+        // Required new wiring.
+        assert!(
+            src.contains(concat!("DeadlineWatchdog::register_", "isolate")),
+            "the Worker must register with the shared process scheduler"
+        );
+        assert!(
+            src.contains(concat!("poll_", "guarded")),
+            "the Worker must guard its module-load/event-loop polls"
+        );
+        // Main-thread force-terminate stays independent.
+        assert!(
+            src.contains(concat!("fn force_", "terminate")),
+            "WorkerHandle::force_terminate must remain"
+        );
     }
 }

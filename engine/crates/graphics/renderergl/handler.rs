@@ -2371,6 +2371,16 @@ impl RendererGL {
                 Ok(DamageEffect::NoDamage)
             }
 
+            GLCmd::DeleteBuffer { buffer_id } => {
+                let _ = self.bind_for_contextless_gl(cm)?;
+                if let Some(meta) = cm.buffers.remove(&buffer_id) {
+                    if let Some(h) = meta.gl_handle {
+                        unsafe { gl.delete_buffer(h) };
+                    }
+                }
+                Ok(DamageEffect::NoDamage)
+            }
+
             GLCmd::BindRenderbuffer {
                 canvas_id,
                 target,

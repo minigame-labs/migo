@@ -1,10 +1,19 @@
+#[cfg(feature = "api-media")]
 use audio::AudioThread;
 
+#[cfg(feature = "api-media")]
 use shared::channel::ThreadWakeup;
-use shared::error::EngineResult;
-use shared::op_state::{AudioSender, HostTx};
+#[cfg(feature = "api-media")]
+use shared::error::{EngineError, EngineResult, ErrorCode};
+#[cfg(feature = "api-media")]
+use shared::op_state::{AudioHostStartSignal, AudioSender, HostTx};
+#[cfg(feature = "api-media")]
 use shared::protocol::audio_cmd::AudioCmd;
+#[cfg(feature = "api-media")]
+use std::sync::Arc;
+#[cfg(feature = "api-media")]
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+#[cfg(feature = "api-media")]
 use tracing::info;
 
 /// Lazy audio service — the actual `AudioThread` is not spawned until the
@@ -21,13 +30,15 @@ use tracing::info;
 ///
 /// ## Implementation
 ///
-/// 1. `AudioService::new()` only creates the channel + wakeup.
+/// 1. `AudioService::new()` creates the channel, wakeup, and a policy-capturing
+///    HTTP factory closure. It does not build a reqwest client/pool or thread.
 /// 2. `sender()` returns an [`AudioSender`] backed by the channel.
-/// 3. `check_and_start()` is called from the Host event loop on every
-///    iteration.  It drains queued commands and, upon the first *real*
+/// 3. A successful pre-start command notifies the Host event loop, which calls
+///    `check_and_start()`. It drains queued commands and, upon the first *real*
 ///    audio command (i.e. not PauseAll/ResumeAll/Shutdown), spawns the
 ///    real `AudioThread` via [`AudioThread::spawn_with_channel`] which
 ///    re-uses the **same channel** — no forwarding task needed.
+#[cfg(feature = "api-media")]
 pub(crate) struct AudioService {
     /// Sender end of the channel.  Ops write here immediately.
     tx: UnboundedSender<AudioCmd>,
@@ -45,13 +56,31 @@ pub(crate) struct AudioService {
     /// If the thread is lazily started while paused, we immediately
     /// send `PauseAll` to avoid audio playing in the background.
     is_paused: bool,
+    /// Coalescing lazy-audio host-start signal. Handed to every host
+    /// `AudioSender` so a pre-start command nudges the host loop to call
+    /// `check_and_start()`, and disabled (`mark_started`) once the thread runs.
+    /// Replaces the lazy-audio poll that the deleted 3-second heartbeat did.
+    host_start: Arc<AudioHostStartSignal>,
+    /// Per-host factory. The audio thread invokes it only on the first remote
+    /// cache miss, then keeps the resulting reqwest pool for its lifetime.
+    http_client_factory: audio::streaming::StreamingHttpClientFactory,
 }
 
+#[cfg(feature = "api-media")]
 impl AudioService {
-    /// Create a lazy audio service.  **No thread is spawned.**
-    pub(crate) fn new(host_tx: HostTx) -> Self {
+    /// Create a lazy audio service. **No thread or HTTP client is created.**
+    pub(crate) fn new(host_tx: HostTx, network_policy: shared::op_state::NetworkPolicy) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let wakeup = ThreadWakeup::new();
+        let http_client_factory: audio::streaming::StreamingHttpClientFactory =
+            Arc::new(move || {
+                js_runtime::create_audio_http_client(&network_policy).map_err(|error| {
+                    EngineError::from_detail(
+                        ErrorCode::IoError,
+                        format!("failed to build audio HTTP client: {error}"),
+                    )
+                })
+            });
         Self {
             tx,
             wakeup,
@@ -60,18 +89,31 @@ impl AudioService {
             thread: None,
             host_tx,
             is_paused: false,
+            host_start: AudioHostStartSignal::new(),
+            http_client_factory,
         }
     }
 
     /// Return an [`AudioSender`] that auto-wakes the audio thread on each
     /// send.  Safe to call before the thread is started — commands queue up
-    /// and are replayed once the thread spawns.
+    /// and are replayed once the thread spawns.  Carries the lazy-audio
+    /// host-start signal so a pre-start send nudges the host loop.
     #[inline]
     pub(crate) fn sender(&self) -> AudioSender {
-        AudioSender::new(self.tx.clone(), self.wakeup.clone())
+        AudioSender::with_host_start_signal(
+            self.tx.clone(),
+            self.wakeup.clone(),
+            self.host_start.clone(),
+        )
     }
 
-    /// Called from the Host event loop on **every iteration**.
+    /// The lazy-audio host-start signal, for the host event loop to select on.
+    #[inline]
+    pub(crate) fn start_signal(&self) -> Arc<AudioHostStartSignal> {
+        self.host_start.clone()
+    }
+
+    /// Called from the Host event loop when the coalescing start signal fires.
     ///
     /// Drains queued commands from the channel and starts the audio thread
     /// on the first "real" command (anything except PauseAll/ResumeAll/
@@ -139,9 +181,14 @@ impl AudioService {
             rx,
             self.wakeup.clone(),
             self.host_tx.clone(),
+            self.http_client_factory.clone(),
         )?;
 
         self.thread = Some(thread);
+        // The real audio thread is installed: disable the host-start signal so
+        // later sends stop nudging the host loop (release ordering, after the
+        // thread is stored).
+        self.host_start.mark_started();
         Ok(())
     }
 
@@ -171,4 +218,54 @@ impl AudioService {
             thread.shutdown();
         }
     }
+}
+
+#[cfg(not(feature = "api-media"))]
+pub(crate) struct AudioService {
+    tx: tokio::sync::mpsc::UnboundedSender<shared::protocol::audio_cmd::AudioCmd>,
+    _rx: tokio::sync::mpsc::UnboundedReceiver<shared::protocol::audio_cmd::AudioCmd>,
+    wakeup: shared::channel::ThreadWakeup,
+    start_signal: std::sync::Arc<shared::op_state::AudioHostStartSignal>,
+}
+
+#[cfg(not(feature = "api-media"))]
+impl AudioService {
+    pub(crate) fn new(
+        _host_tx: shared::op_state::HostTx,
+        _network_policy: shared::op_state::NetworkPolicy,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let start_signal = shared::op_state::AudioHostStartSignal::new();
+        start_signal.mark_started();
+        Self {
+            tx,
+            _rx: rx,
+            wakeup: shared::channel::ThreadWakeup::new(),
+            start_signal,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn sender(&self) -> shared::op_state::AudioSender {
+        shared::op_state::AudioSender::new(self.tx.clone(), self.wakeup.clone())
+    }
+
+    #[inline]
+    pub(crate) fn start_signal(&self) -> std::sync::Arc<shared::op_state::AudioHostStartSignal> {
+        self.start_signal.clone()
+    }
+
+    #[inline]
+    pub(crate) fn check_and_start(&mut self) -> shared::error::EngineResult<()> {
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn pause(&mut self) {}
+
+    #[inline]
+    pub(crate) fn resume(&mut self) {}
+
+    #[inline]
+    pub(crate) fn shutdown(&mut self) {}
 }

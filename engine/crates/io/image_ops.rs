@@ -7,13 +7,16 @@
 //! Budget limiting and decode-concurrency semaphore keep memory behaviour
 //! bounded.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use shared::{
-    device::gpu_caps::GpuCapsSnapshot,
+    device::gpu_caps::{GpuCaps, GpuCapsSnapshot},
     error::{EngineError, ErrorCode},
     protocol::io_cmd::{
         DecodedImage, ImageCacheStats, MAX_READ_LENGTH, NormalizedImage, VARIANT_EXTENSIONS,
@@ -39,6 +42,31 @@ pub enum ImageSource {
     Pack {
         relative_path: String,
     },
+}
+
+/// CPU-backing requirement evaluated when an image worker actually starts.
+///
+/// `cpu_backing_required` is monotonic for the host session. Keeping the
+/// shared atomic here prevents a request that waited behind the decode
+/// semaphore or image pool from using a stale pre-WebGL policy.
+#[derive(Clone)]
+pub enum ImageDecodePolicy {
+    PreferGpuNative {
+        cpu_backing_required: Arc<AtomicBool>,
+    },
+    RgbaOnly,
+}
+
+impl ImageDecodePolicy {
+    #[inline]
+    fn requires_rgba(&self) -> bool {
+        match self {
+            Self::PreferGpuNative {
+                cpu_backing_required,
+            } => cpu_backing_required.load(Ordering::Acquire),
+            Self::RgbaOnly => true,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +279,55 @@ where
         .map_err(pool_err)
 }
 
+/// Route a decode job through the image pool and sample the one-way GPU
+/// capability breaker only after the worker has left the queue.
+async fn run_image_job_with_live_caps<T, F>(
+    scheduler: Arc<IoScheduler>,
+    encoded_bytes: usize,
+    cache_hit: bool,
+    source: ImageSource,
+    gpu_caps: Arc<GpuCaps>,
+    job: F,
+) -> Result<T, EngineError>
+where
+    T: Send + 'static,
+    F: FnOnce(GpuCapsSnapshot) -> T + Send + 'static,
+{
+    run_image_job_with_scheduler(scheduler, encoded_bytes, cache_hit, source, move || {
+        job(gpu_caps.snapshot())
+    })
+    .await
+}
+
+/// Run an already-materialized inline image decode under the same process-wide
+/// memory budget, three-decode semaphore, and image worker pool as file-backed
+/// images. The closure returns an `EngineResult` so parser/decoder failures
+/// retain their original error codes across the scheduler boundary.
+pub async fn run_bounded_inline_image_job<T, F>(
+    scheduler: Arc<IoScheduler>,
+    encoded_bytes: usize,
+    job: F,
+) -> Result<T, EngineError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, EngineError> + Send + 'static,
+{
+    let pre_estimate = encoded_bytes
+        .saturating_mul(16)
+        .clamp(16 * 1024, 256 * 1024 * 1024);
+    let _budget = io_budget().acquire(pre_estimate).await;
+    let _permit = image_decode_semaphore().acquire().await.unwrap();
+
+    run_image_job_with_scheduler(
+        scheduler,
+        encoded_bytes,
+        false,
+        ImageSource::Filesystem,
+        job,
+    )
+    .await?
+}
+
 async fn cached_preload_result_with_scheduler(
     scheduler: Arc<IoScheduler>,
     path: String,
@@ -311,7 +388,7 @@ async fn pause_after_preload_cache_classification() {
 #[cfg(test)]
 fn notify_preload_decode_started() {
     if let Some(notify) = TEST_PRELOAD_DECODE_STARTED.lock().unwrap().clone() {
-        notify.notify_waiters();
+        notify.notify_one();
     }
 }
 
@@ -511,9 +588,9 @@ pub async fn read_image_rgba8(
     cache_generation: u64,
     source: ImageSource,
     game_cache_dir: Option<String>,
-    gpu_caps: GpuCapsSnapshot,
+    gpu_caps: Arc<GpuCaps>,
     mount_table: Option<Arc<MountTable>>,
-    force_rgba: bool,
+    decode_policy: ImageDecodePolicy,
 ) -> Result<ReadImageResult, EngineError> {
     let has_resize = target_width.is_some() && target_height.is_some();
     let pg_key = current_image_cache_key(&path, cache_generation, &source, mount_table.as_deref())?;
@@ -555,12 +632,14 @@ pub async fn read_image_rgba8(
     let gcd = game_cache_dir.clone();
     let mt = mount_table.clone();
     let path_for_decode = path.clone();
-    let task = run_image_job_with_scheduler(
+    let task = run_image_job_with_live_caps(
         scheduler,
         primary_size,
         false,
         source.clone(),
-        move || -> Result<ReadImageResult, EngineError> {
+        gpu_caps,
+        move |gpu_caps| -> Result<ReadImageResult, EngineError> {
+            let force_rgba = decode_policy.requires_rgba();
             let worker_source =
                 worker_image_source(&path_for_decode, cache_generation, &source, mt.as_deref())?;
             let data = read_image_source(
@@ -646,7 +725,13 @@ pub async fn read_image_rgba8(
                 // always have backing bytes in io::global_cache.
                 decode_selected_variant_rgba_only(variant, has_resize, target_width, target_height)?
             } else {
-                decode_selected_variant(variant, has_resize, target_width, target_height)?
+                decode_selected_variant(
+                    variant,
+                    has_resize,
+                    target_width,
+                    target_height,
+                    gpu_caps.ahb,
+                )?
             };
 
             if let Some(ref cache_dir) = gcd {
@@ -1193,6 +1278,7 @@ fn decode_selected_variant(
     has_resize: bool,
     target_width: Option<u32>,
     target_height: Option<u32>,
+    allow_ahb: bool,
 ) -> Result<DecodedImage, EngineError> {
     match variant {
         VariantDecision::Compressed(img) | VariantDecision::CompressedFromCompanion(img) => {
@@ -1205,15 +1291,16 @@ fn decode_selected_variant(
             // CPU pixels, so asking for an AHB here would just trigger
             // a download-then-resize-then-reupload shuffle.  Leave the
             // AHB fast path to the common (non-resize) case.
-            if has_resize {
+            if has_resize || !allow_ahb {
                 let img = decode_rgba(&data, &path_hint, has_resize, target_width, target_height)?;
                 return Ok(DecodedImage::Rgba(img));
             }
             // Happy path: let the decoder pick the best representation.
-            // On Android API 28+ this lands in an AHB, giving the
+            // On Android API 26+ with a proven EGL/GL import path this lands in
+            // an AHB, giving the
             // renderer a zero-memcpy EGLImage import.  On everything
             // else it transparently falls back to RGBA.
-            crate::fast_image_decoder::decode_image_to_any(&data, Some(&path_hint))
+            crate::fast_image_decoder::decode_image_to_any(&data, Some(&path_hint), allow_ahb)
         }
     }
 }
@@ -1244,22 +1331,69 @@ fn decode_selected_variant_rgba_only(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use shared::vfs::package::PackageWriter;
     use shared::{
-        device::gpu_caps::GpuCapsSnapshot,
+        device::gpu_caps::{GpuCaps, GpuCapsSnapshot},
+        error::EngineError,
         protocol::io_cmd::NormalizedImage,
         vfs::{DirSource, MountTable, PackSource},
     };
     use tokio::sync::Notify;
 
     use super::{
-        ImageSource, TEST_PRELOAD_CACHE_HOOK, TEST_PRELOAD_DECODE_STARTED,
+        ImageDecodePolicy, ImageSource, TEST_PRELOAD_CACHE_HOOK, TEST_PRELOAD_DECODE_STARTED,
         mounted_variant_source_version_token, preload_images, read_image_rgba8, read_image_source,
-        run_image_job_with_scheduler, worker_image_source,
+        run_bounded_inline_image_job, run_image_job_with_live_caps, run_image_job_with_scheduler,
+        worker_image_source,
     };
     use crate::scheduler::IoScheduler;
+
+    struct CachePin(crate::image_cache::ImageCacheKey);
+
+    impl CachePin {
+        fn new(key: crate::image_cache::ImageCacheKey) -> Self {
+            crate::image_cache::global_cache().pin(&key);
+            Self(key)
+        }
+    }
+
+    impl Drop for CachePin {
+        fn drop(&mut self) {
+            crate::image_cache::global_cache().unpin(&self.0);
+        }
+    }
+
+    static PRELOAD_HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct PreloadHookTestGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl PreloadHookTestGuard {
+        fn lock() -> Self {
+            Self {
+                _guard: PRELOAD_HOOK_TEST_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            }
+        }
+    }
+
+    impl Drop for PreloadHookTestGuard {
+        fn drop(&mut self) {
+            *TEST_PRELOAD_CACHE_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *TEST_PRELOAD_DECODE_STARTED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
 
     // Per-instance (was a process-global counter that raced across parallel
     // tests' reset→assert windows). Each test owns its own scheduler, so the
@@ -1326,14 +1460,80 @@ mod tests {
             },
         ));
 
-        assert!(thread_name.unwrap().contains("io-image-host-53"));
+        assert!(thread_name.unwrap().starts_with("Migo-IO-"));
+        assert_eq!(scheduler_run_count(&scheduler), 1);
+    }
+
+    #[test]
+    fn queued_image_job_observes_live_caps_at_worker_start() {
+        let scheduler = Arc::new(IoScheduler::new(54));
+        let caps = GpuCaps::new();
+        caps.set(false, false, true);
+        let cpu_backing_required = Arc::new(AtomicBool::new(false));
+        let decode_policy = ImageDecodePolicy::PreferGpuNative {
+            cpu_backing_required: Arc::clone(&cpu_backing_required),
+        };
+        let caps_for_hook = Arc::clone(&caps);
+        let cpu_backing_for_hook = Arc::clone(&cpu_backing_required);
+        scheduler.install_worker_start_test_hook(Arc::new(move || {
+            caps_for_hook.disable_ahb();
+            cpu_backing_for_hook.store(true, Ordering::Release);
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (observed_caps, observed_force_rgba) = runtime
+            .block_on(run_image_job_with_live_caps(
+                Arc::clone(&scheduler),
+                64 * 1024,
+                false,
+                ImageSource::Filesystem,
+                caps,
+                move |snapshot| (snapshot, decode_policy.requires_rgba()),
+            ))
+            .unwrap();
+
+        assert!(
+            !observed_caps.ahb,
+            "a queued decode must observe a session breaker tripped before its worker runs"
+        );
+        assert!(
+            observed_force_rgba,
+            "a queued decode must observe WebGL's monotonic CPU-backing requirement"
+        );
+    }
+
+    #[test]
+    fn inline_decode_job_uses_bounded_image_scheduler_path() {
+        let scheduler = Arc::new(IoScheduler::new(55));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let thread_name = runtime
+            .block_on(run_bounded_inline_image_job(
+                Arc::clone(&scheduler),
+                64 * 1024,
+                || -> Result<String, EngineError> {
+                    Ok(std::thread::current()
+                        .name()
+                        .unwrap_or("unnamed")
+                        .to_string())
+                },
+            ))
+            .unwrap();
+
+        assert!(thread_name.starts_with("Migo-IO-"));
         assert_eq!(scheduler_run_count(&scheduler), 1);
     }
 
     #[test]
     #[ignore = "pre-existing: needs an image fixture missing in CI; fix in cleanup PR"]
     fn cached_read_image_path_still_flows_through_scheduler_helper() {
-        let scheduler = Arc::new(IoScheduler::new(59));
+        let scheduler = Arc::new(IoScheduler::local_for_test(59, 2));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1356,9 +1556,11 @@ mod tests {
             cache_generation,
             ImageSource::Filesystem,
             None,
-            GpuCapsSnapshot::default(),
+            GpuCaps::new(),
             None,
-            false,
+            ImageDecodePolicy::PreferGpuNative {
+                cpu_backing_required: Arc::new(AtomicBool::new(false)),
+            },
         ));
 
         let decoded = result.expect("cached read_image_rgba8 should succeed");
@@ -1371,19 +1573,14 @@ mod tests {
             other => panic!("expected cached RGBA image, got {:?}", other),
         }
         assert_eq!(scheduler_run_count(&scheduler), 1);
-        assert_eq!(scheduler.pools().spawned_pool_count(), 0);
+        assert_eq!(scheduler.pools().started_thread_count_for_test(), 0);
         crate::image_cache::global_cache().clear();
     }
 
-    // PRE-EXISTING FAILURE (predates feat/v8-snapshot; file unchanged vs
-    // master). Depends on an on-disk image fixture absent in CI ("failed to
-    // read file: No such file or directory"). Ignored so the snapshot PR's test
-    // gate can pass; un-ignore + provide the fixture (or make it fixture-free)
-    // in the lint/test cleanup PR.
     #[test]
-    #[ignore = "pre-existing: needs an image fixture missing in CI; fix in cleanup PR"]
     fn mixed_preload_batches_keep_decode_work_running_while_cached_tasks_wait() {
-        let scheduler = Arc::new(IoScheduler::new(63));
+        let _hook_guard = PreloadHookTestGuard::lock();
+        let scheduler = Arc::new(IoScheduler::local_for_test(63, 2));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1405,11 +1602,11 @@ mod tests {
         let uncached_path = uncached_path.to_string_lossy().into_owned();
         let cached_path = "/tmp/cached-preload-parallel.png".to_string();
 
+        let cache_key = crate::image_cache::full_res_key(cached_path.clone(), 1);
+        let cache_pin = CachePin::new(cache_key.clone());
         crate::image_cache::global_cache().clear();
-        crate::image_cache::global_cache().insert(
-            crate::image_cache::full_res_key(cached_path.clone(), 1),
-            NormalizedImage::new(2, 2, vec![255; 2 * 2 * 4]),
-        );
+        crate::image_cache::global_cache()
+            .insert(cache_key, NormalizedImage::new(2, 2, vec![255; 2 * 2 * 4]));
 
         let (classified, resume) = install_preload_cache_hook();
         let decode_started = install_preload_decode_started_hook();
@@ -1441,6 +1638,7 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].1, Ok((2, 2)));
         assert_eq!(results[1].1, Ok((1, 1)));
+        drop(cache_pin);
         crate::image_cache::global_cache().clear();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1452,7 +1650,8 @@ mod tests {
     #[test]
     #[ignore = "pre-existing: image-fixture/scheduler test fails in CI; fix in cleanup PR"]
     fn cached_preload_entries_still_flow_through_scheduler_helper() {
-        let scheduler = Arc::new(IoScheduler::new(61));
+        let _hook_guard = PreloadHookTestGuard::lock();
+        let scheduler = Arc::new(IoScheduler::local_for_test(61, 2));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1479,14 +1678,15 @@ mod tests {
         assert_eq!(results[0].0, path);
         assert_eq!(results[0].1, Ok((2, 3)));
         assert_eq!(scheduler_run_count(&scheduler), 1);
-        assert_eq!(scheduler.pools().spawned_pool_count(), 0);
+        assert_eq!(scheduler.pools().started_thread_count_for_test(), 0);
         crate::image_cache::global_cache().clear();
     }
 
     #[test]
     #[ignore = "pre-existing: cache-churn fallback count is flaky in CI; fix in cleanup PR"]
     fn cached_preload_entries_fall_back_cleanly_under_cache_churn() {
-        let scheduler = Arc::new(IoScheduler::new(67));
+        let _hook_guard = PreloadHookTestGuard::lock();
+        let scheduler = Arc::new(IoScheduler::local_for_test(67, 2));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1536,7 +1736,7 @@ mod tests {
         assert_eq!(results[0].0, path);
         assert_eq!(results[0].1, Ok((1, 1)));
         assert_eq!(scheduler_run_count(&scheduler), 1);
-        assert_eq!(scheduler.pools().spawned_pool_count(), 1);
+        assert_eq!(scheduler.pools().started_thread_count_for_test(), 2);
         crate::image_cache::global_cache().clear();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1737,9 +1937,11 @@ mod tests {
                 relative_path: "tex.png".to_string(),
             },
             None,
-            GpuCapsSnapshot::default(),
+            GpuCaps::new(),
             Some(Arc::clone(&mount_table)),
-            false,
+            ImageDecodePolicy::PreferGpuNative {
+                cpu_backing_required: Arc::new(AtomicBool::new(false)),
+            },
         ));
 
         let decoded = result.expect("read_image_rgba8 should revalidate mount-backed cache hit");
@@ -1753,6 +1955,7 @@ mod tests {
 
     #[test]
     fn mount_backed_preload_cache_hit_is_revalidated_after_directory_remount() {
+        let _hook_guard = PreloadHookTestGuard::lock();
         let scheduler = Arc::new(IoScheduler::new(73));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1809,6 +2012,7 @@ mod tests {
 
     #[test]
     fn mount_backed_preload_cached_task_revalidates_after_remount_before_consumption() {
+        let _hook_guard = PreloadHookTestGuard::lock();
         let scheduler = Arc::new(IoScheduler::new(79));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1832,11 +2036,12 @@ mod tests {
             Some(mount_table.as_ref()),
         );
 
+        let cache_key =
+            crate::image_cache::full_res_key("/code/tex.png".to_string(), old_generation);
+        let cache_pin = CachePin::new(cache_key.clone());
         crate::image_cache::global_cache().clear();
-        crate::image_cache::global_cache().insert(
-            crate::image_cache::full_res_key("/code/tex.png".to_string(), old_generation),
-            NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]),
-        );
+        crate::image_cache::global_cache()
+            .insert(cache_key, NormalizedImage::new(9, 9, vec![255; 9 * 9 * 4]));
 
         let (classified, resume) = install_preload_cache_hook();
         let results = runtime.block_on(async {
@@ -1867,6 +2072,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "/code/tex.png");
         assert_eq!(results[0].1, Ok((1, 1)));
+        drop(cache_pin);
         crate::image_cache::global_cache().clear();
         let _ = std::fs::remove_dir_all(&dir);
     }

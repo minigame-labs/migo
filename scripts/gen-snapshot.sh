@@ -8,11 +8,13 @@
 # links. We therefore cross-compile `migo-snapshot-gen` to the target ABI
 # (linking the committed android V8 archive) and RUN it on that ABI's
 # emulator/device (Deno issue #27496 approach), then pull the result into
-#   engine/crates/js-runtime/snapshots/SNAPSHOT-<arch>.bin
+#   engine/crates/js-runtime/snapshots/SNAPSHOT-<profile>-<arch>.bin
 # which js-runtime/build.rs embeds (android targets only) at .so build time.
 #
 # Usage:
-#   scripts/gen-snapshot.sh <x86_64|arm64> [--device SERIAL] [--keep]
+#   scripts/gen-snapshot.sh <x86_64|arm64> [--product-profile full|slim]
+#                           [--snapshot-kind host|worker]
+#                           [--device SERIAL] [--keep]
 #
 #   x86_64  -> run on an x86_64 Android emulator (or CI; see build-snapshot.yml)
 #   arm64   -> run on a real arm64 device (hosted CI has no arm64 KVM)
@@ -26,8 +28,8 @@
 #   ADB               adb path (default: ~/Android/Sdk/platform-tools/adb, then PATH)
 #
 # Output:
-#   engine/crates/js-runtime/snapshots/SNAPSHOT-<arch>.bin            (gitignored)
-#   engine/crates/js-runtime/snapshots/SNAPSHOT-<arch>.bin.manifest.json
+#   engine/crates/js-runtime/snapshots/SNAPSHOT-<profile>-<arch>.bin
+#   engine/crates/js-runtime/snapshots/SNAPSHOT-<profile>-<arch>.bin.manifest.json
 #
 # After generating BOTH ABIs, build with embedding:
 #   bash scripts/build-aar.sh release arm64-v8a x86_64
@@ -44,14 +46,32 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then sed -n '2,40p' "$0"; exi
 ABI="${1:-}"; shift || true
 SERIAL="${ANDROID_SERIAL:-}"
 KEEP=0
+PRODUCT_PROFILE="full"
+SNAPSHOT_KIND="host"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --device) SERIAL="${2:-}"; shift 2 ;;
+    --product-profile) PRODUCT_PROFILE="${2:-}"; shift 2 ;;
+    --product-profile=*) PRODUCT_PROFILE="${1#*=}"; shift ;;
+    --snapshot-kind) SNAPSHOT_KIND="${2:-}"; shift 2 ;;
+    --snapshot-kind=*) SNAPSHOT_KIND="${1#*=}"; shift ;;
     --keep)   KEEP=1; shift ;;
     -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
     *) die "unknown arg: $1 (try --help)" ;;
   esac
 done
+
+case "$PRODUCT_PROFILE" in
+  full|slim) ;;
+  *) die "invalid --product-profile '$PRODUCT_PROFILE' (expected full|slim)" ;;
+esac
+case "$SNAPSHOT_KIND" in
+  host|worker) ;;
+  *) die "invalid snapshot kind '$SNAPSHOT_KIND' (expected host|worker)" ;;
+esac
+if [[ "$SNAPSHOT_KIND" == "worker" && "$PRODUCT_PROFILE" != "full" ]]; then
+  die "Worker snapshot requires product profile full"
+fi
 
 case "$ABI" in
   x86_64)
@@ -61,7 +81,7 @@ case "$ABI" in
     ABI="arm64"
     NDK_TARGET="arm64-v8a"; TRIPLE="aarch64-linux-android"; RUST_ARCH="aarch64"
     V8_DIR="aarch64"; LIBCXX_TRIPLE="aarch64-linux-android"; NEEDS_BUILTINS=1 ;;
-  *) die "usage: gen-snapshot.sh <x86_64|arm64> [--device SERIAL] [--keep]" ;;
+  *) die "usage: gen-snapshot.sh <x86_64|arm64> [--product-profile full|slim] [--device SERIAL] [--keep]" ;;
 esac
 
 # ---- paths / tools ----------------------------------------------------------
@@ -90,7 +110,7 @@ if [[ -z "$SERIAL" ]]; then
   SERIAL="${DEVS[0]}"
 fi
 ADBD=("$ADB" -s "$SERIAL")
-c_info "ABI=$ABI  device=$SERIAL  NDK=$NDK"
+c_info "kind=$SNAPSHOT_KIND  profile=$PRODUCT_PROFILE  ABI=$ABI  device=$SERIAL  NDK=$NDK"
 
 # ---- 1. cross-compile snapshot-gen -----------------------------------------
 # RUSTFLAGS here intentionally overrides .cargo/config.toml (snapshot-gen is a
@@ -108,7 +128,8 @@ c_info "cross-compiling migo-snapshot-gen for $TRIPLE ..."
   RUSTY_V8_ARCHIVE="$V8_ARCHIVE" \
   RUSTY_V8_SRC_BINDING_PATH="$V8_BINDING" \
   RUSTFLAGS="$RUSTFLAGS_COMMON" \
-  cargo ndk -t "$NDK_TARGET" --platform 26 build -p migo-snapshot-gen )
+  cargo ndk -t "$NDK_TARGET" --platform 26 build -p migo-snapshot-gen \
+    --no-default-features --features "profile-$PRODUCT_PROFILE" --locked )
 
 BIN="$ENGINE/target/$TRIPLE/debug/migo-snapshot-gen"
 [[ -f "$BIN" ]] || die "build produced no binary at $BIN"
@@ -120,12 +141,16 @@ c_info "pushing to device ..."
 "${ADBD[@]}" shell chmod 755 /data/local/tmp/migo-snapshot-gen
 
 c_info "generating snapshot on device ..."
-"${ADBD[@]}" shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp MIGO_SNAPSHOT_OUT=/data/local/tmp/SNAPSHOT.bin ./migo-snapshot-gen"
+"${ADBD[@]}" shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp MIGO_SNAPSHOT_KIND=$SNAPSHOT_KIND MIGO_SNAPSHOT_OUT=/data/local/tmp/SNAPSHOT.bin ./migo-snapshot-gen"
 
 # ---- 3. pull + manifest -----------------------------------------------------
 OUT_DIR="$ENGINE/crates/js-runtime/snapshots"
 mkdir -p "$OUT_DIR"
-OUT="$OUT_DIR/SNAPSHOT-$RUST_ARCH.bin"
+if [[ "$SNAPSHOT_KIND" == "host" ]]; then
+  OUT="$OUT_DIR/SNAPSHOT-$PRODUCT_PROFILE-$RUST_ARCH.bin"
+else
+  OUT="$OUT_DIR/SNAPSHOT-worker-$PRODUCT_PROFILE-$RUST_ARCH.bin"
+fi
 "${ADBD[@]}" pull /data/local/tmp/SNAPSHOT.bin "$OUT" >/dev/null
 [[ -s "$OUT" ]] || die "pulled snapshot is empty"
 
@@ -133,7 +158,8 @@ OUT="$OUT_DIR/SNAPSHOT-$RUST_ARCH.bin"
 # shared helper so this on-device arm64 path and CI's x86_64 path emit identical
 # manifests — see scripts/write-snapshot-manifest.sh + check-snapshot-freshness.sh.
 MANIFEST="$OUT.manifest.json"
-bash "$ROOT/scripts/write-snapshot-manifest.sh" "$RUST_ARCH" "$OUT"
+bash "$ROOT/scripts/write-snapshot-manifest.sh" \
+  "$PRODUCT_PROFILE" "$RUST_ARCH" "$OUT" "$SNAPSHOT_KIND"
 
 # ---- 4. cleanup -------------------------------------------------------------
 if [[ "$KEEP" -eq 0 ]]; then
@@ -143,4 +169,8 @@ fi
 c_ok "snapshot -> $OUT  ($(stat -c %s "$OUT") bytes)"
 c_ok "manifest -> $MANIFEST"
 echo
-c_info "Build with embedding:  bash scripts/build-aar.sh release $NDK_TARGET <other abis...>"
+if [[ "$SNAPSHOT_KIND" == "worker" ]]; then
+  c_info "Build candidate: bash scripts/build-aar.sh --product-profile full --worker-snapshot release $NDK_TARGET <other abis...>"
+else
+  c_info "Build with embedding: bash scripts/build-aar.sh --product-profile $PRODUCT_PROFILE release $NDK_TARGET <other abis...>"
+fi

@@ -551,7 +551,7 @@ mod tests {
             ))
             .unwrap();
 
-        assert!(worker_name.contains("io-archive-host-47"));
+        assert!(worker_name.starts_with("Migo-IO-"));
         assert_eq!(
             mount_table.read("subpackages/stage2/main.js").unwrap(),
             b"console.log('subpackage')"

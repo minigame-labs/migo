@@ -89,10 +89,13 @@ pub(crate) fn is_blocked_header(name: &HeaderName) -> bool {
 ///
 /// Note: hyper-util bypasses the resolver for IP-literal hosts, so callers
 /// must also call `reject_blocked_ip_literal()` before sending requests.
-struct SsrfCheckingResolver;
+struct SsrfCheckingResolver {
+    operation: &'static str,
+}
 
 impl reqwest::dns::Resolve for SsrfCheckingResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let operation = self.operation;
         Box::pin(async move {
             let host = name.as_str();
             let addr_str = format!("{}:0", host);
@@ -106,7 +109,8 @@ impl reqwest::dns::Resolve for SsrfCheckingResolver {
                     return Err(Box::new(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!(
-                            "fetch: connection to {} is not allowed (private/loopback address)",
+                            "{}: connection to {} is not allowed (private/loopback address)",
+                            operation,
                             addr.ip()
                         ),
                     ))
@@ -654,6 +658,38 @@ pub fn create_http_client(
     enable_http2: bool,
     net_policy: &shared::op_state::NetworkPolicy,
 ) -> Result<Client, AnyError> {
+    create_policy_http_client(
+        user_agent,
+        enable_http2,
+        net_policy,
+        super::gate::GateKind::FetchRedirect,
+        "fetch",
+    )
+}
+
+/// Build the per-host client used by streamed audio. Construction is lazy at
+/// the audio-service boundary; this function only centralizes the same TLS,
+/// resolver, redirect, and pool configuration used by fetch.
+#[cfg(feature = "api-media")]
+pub fn create_audio_http_client(
+    net_policy: &shared::op_state::NetworkPolicy,
+) -> Result<Client, AnyError> {
+    create_policy_http_client(
+        "migo",
+        true,
+        net_policy,
+        super::gate::GateKind::AudioStreamRedirect,
+        "audio",
+    )
+}
+
+fn create_policy_http_client(
+    user_agent: &str,
+    enable_http2: bool,
+    net_policy: &shared::op_state::NetworkPolicy,
+    redirect_kind: super::gate::GateKind,
+    operation: &'static str,
+) -> Result<Client, AnyError> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, user_agent.parse().unwrap());
 
@@ -672,38 +708,17 @@ pub fn create_http_client(
         if attempt.previous().len() >= 10 {
             return attempt.stop();
         }
-        match super::gate::evaluate_policy(
-            attempt.url(),
-            &redirect_policy,
-            super::gate::GateKind::FetchRedirect,
-        ) {
+        match super::gate::evaluate_policy(attempt.url(), &redirect_policy, redirect_kind) {
             Ok(()) => attempt.follow(),
             Err(reject) => attempt.error(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                // Reuse the gate's own message formatting so CLI
-                // diagnostics read identically whether the rule
-                // fires on the initial URL or a redirect hop.
-                format!(
-                    "fetch: redirect rejected: {}",
-                    match &reject {
-                        super::gate::GateReject::BlockedAddress { display } => format!(
-                            "connection to {display} is not allowed (private/loopback address)"
-                        ),
-                        super::gate::GateReject::NotWhitelisted { host } =>
-                            format!("'{host}' is not in the allowed domain list"),
-                        super::gate::GateReject::HttpsRequired =>
-                            "HTTPS required (enforce_https=true)".to_string(),
-                        super::gate::GateReject::UnsupportedScheme { scheme } =>
-                            format!("scheme '{scheme}' is not allowed"),
-                        super::gate::GateReject::MissingHost => "URL has no host".to_string(),
-                    }
-                ),
+                redirect_reject_message(operation, &reject),
             )),
         }
     });
 
     let mut builder = Client::builder()
-        .dns_resolver(std::sync::Arc::new(SsrfCheckingResolver))
+        .dns_resolver(std::sync::Arc::new(SsrfCheckingResolver { operation }))
         .redirect(ssrf_redirect_policy)
         .default_headers(headers)
         // Connect timeout applies to TCP + TLS handshake only; per-
@@ -732,6 +747,52 @@ pub fn create_http_client(
     }
 
     builder.build().map_err(|e| e.into())
+}
+
+fn redirect_reject_message(operation: &str, reject: &super::gate::GateReject) -> String {
+    let detail = match reject {
+        super::gate::GateReject::BlockedAddress { display } => {
+            format!("connection to {display} is not allowed (private/loopback address)")
+        }
+        super::gate::GateReject::NotWhitelisted { host } => {
+            format!("'{host}' is not in the allowed domain list")
+        }
+        super::gate::GateReject::HttpsRequired => "HTTPS required (enforce_https=true)".to_string(),
+        super::gate::GateReject::UnsupportedScheme { scheme } => {
+            format!("scheme '{scheme}' is not allowed")
+        }
+        super::gate::GateReject::MissingHost => "URL has no host".to_string(),
+    };
+    format!("{operation}: redirect rejected: {detail}")
+}
+
+#[cfg(all(test, feature = "api-media"))]
+mod q10_client_tests {
+    use super::*;
+
+    #[test]
+    fn fetch_redirect_error_vocabulary_stays_backward_compatible() {
+        let reject = super::super::gate::GateReject::NotWhitelisted {
+            host: "blocked.example".to_string(),
+        };
+        assert_eq!(
+            redirect_reject_message("fetch", &reject),
+            "fetch: redirect rejected: 'blocked.example' is not in the allowed domain list"
+        );
+        assert_eq!(
+            redirect_reject_message("audio", &reject),
+            "audio: redirect rejected: 'blocked.example' is not in the allowed domain list"
+        );
+    }
+
+    #[test]
+    fn audio_policy_client_build_is_side_effect_free() {
+        let policy = shared::op_state::NetworkPolicy {
+            domain_whitelist: vec!["media.example".to_string()],
+            enforce_https: true,
+        };
+        create_audio_http_client(&policy).expect("client construction must not require a runtime");
+    }
 }
 
 // ── Upload ──

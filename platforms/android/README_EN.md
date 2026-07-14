@@ -12,13 +12,22 @@ A lightweight, high-performance JavaScript game runtime for Android.
 
 ## Installation
 
+Release builds have two products: `full` retains every platform `wx.*` group;
+`slim` keeps rendering, input, lifecycle, storage/VFS, network, subpackages,
+and host messaging. Both retain code signing, V8 resource limits, and API 26.
+
+```bash
+bash scripts/build-aar.sh --product-profile full release
+bash scripts/build-aar.sh --product-profile slim release
+```
+
 ### Gradle
 
 Add the AAR to your project:
 
 ```groovy
 dependencies {
-    implementation files('libs/migo-release.aar')
+    implementation files('libs/migo-full-release.aar')
 }
 ```
 

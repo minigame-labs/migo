@@ -47,11 +47,18 @@ ObjectDefineProperty(globalThis, "worker", {
 // Initialize error handlers
 initializeEventHandlers();
 
-// Start the message pump (async, keeps event loop alive)
-_startMessagePump();
+// Snapshot creation evaluates extension ESM without runtime WorkerCtx state.
+// Starting the async receive here would capture a pending promise whose Rust
+// future cannot survive serialization. Rust invokes and deletes this hook only
+// after eager state construction or lazy snapshot-state injection succeeds.
+ObjectDefineProperty(globalThis, "__migoStartWorkerMessagePump", {
+    value: _startMessagePump,
+    writable: false,
+    enumerable: false,
+    configurable: true,
+});
 
-// Remove deno_core's internal namespaces from the worker's game-visible global
-// (same rationale as 99_main.js). Workers have no _internal* host bridge, so
-// only Deno/__bootstrap need removal here.
-delete globalThis.Deno;
-delete globalThis.__bootstrap;
+// Deno/__bootstrap must remain until after snapshot restore: deno_core reads
+// Deno.core callbacks while restoring the heap. Rust removes both namespaces,
+// together with the private hook above, before publishing the isolate or
+// evaluating untrusted Worker code.

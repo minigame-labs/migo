@@ -25,9 +25,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    CanvasHandler, CanvasManager, RendererGL, canvas2d_dispatcher::Renderer2d,
-    damage_effect::DamageEffect, dirty_region, frame_scheduler::FrameScheduler,
-    onscreen_window_from_surface, render_server::RenderServer, surface_system::SurfaceSystem,
+    CanvasHandler, CanvasManager, RendererGL,
+    canvas2d_dispatcher::Renderer2d,
+    damage_effect::DamageEffect,
+    dirty_region,
+    frame_scheduler::FrameScheduler,
+    onscreen_window_from_surface,
+    render_frame_state::{DEFERRED_CLEANUP_UNUSED_AGE, DeferredCleanupCadence},
+    render_server::RenderServer,
+    surface_system::SurfaceSystem,
 };
 use crossbeam_channel::{Receiver, select, tick};
 use glow::HasContext;
@@ -61,7 +67,6 @@ const RAF_BACKPRESSURE_STREAK_THRESHOLD: u32 = 3;
 fn report_recovery_failure(
     context_lost: &Arc<shared::op_state::ContextLostState>,
     events: &RenderEventSender,
-    wake: &Option<Arc<dyn Fn() + Send + Sync>>,
     last_recovery_fail_epoch: &mut u64,
 ) -> bool {
     let (_, epoch) = context_lost.snapshot();
@@ -69,15 +74,15 @@ fn report_recovery_failure(
         return false;
     }
     *last_recovery_fail_epoch = epoch;
+    // `emit` on a wake-backed channel signals the host exactly once per
+    // successful enqueue, so no separate manual nudge is needed here.
     events.emit(RenderEvent::ContextRecovered { success: false });
-    if let Some(w) = wake.as_ref() {
-        w();
-    }
     true
 }
 
 pub struct RenderThread {
     cmd_tx: CommandSender,
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Render-thread → host event feedback channel.  Exposed via
     /// [`Self::events`] so the host runtime can subscribe and
     /// forward events into JS or the debug overlay.  See
@@ -489,29 +494,11 @@ fn execute_frame_packet(
 
     for op in ops {
         match op {
-            FrameOp::BeginFrame => {
-                // P2-13: frame boundary markers are a natural place
-                // to refresh diagnostics and let Skia purge
-                // age-expired resources.  Both calls are cheap no-ops
-                // when no work is pending; they live here rather
-                // than in the command-dispatch path so diagnostic
-                // timing stays aligned with frame packets.
-                crate::render_diagnostics::frame_begin();
-            }
-            FrameOp::Present => {
-                // Skia's deferred cleanup releases GPU atlas /
-                // glyph entries that aged past their LRU bucket
-                // without the game's next draw having to trip the
-                // cache's size cap first.  200 ms matches the
-                // Chromium Ganesh integration default and
-                // empirically keeps the steady-state resident set
-                // close to `SKIA_RESOURCE_CACHE_BUDGET_BYTES`
-                // under bursty paint workloads.
-                let cleanup_age = std::time::Duration::from_millis(200);
-                for (_, ctx) in cm.contexts_2d_iter_mut() {
-                    ctx.perform_deferred_cleanup(cleanup_age);
-                }
-            }
+            FrameOp::BeginFrame => {}
+            // Presentation is coalesced by the physical-frame loop below. Skia
+            // maintenance also lives there so multiple packets cannot trigger
+            // multiple all-context sweeps in one display frame.
+            FrameOp::Present => {}
             FrameOp::Materialize { canvas_id } => {
                 // Canvas2D → WebGL boundary.  We MUST:
                 //   1. Flush Skia so subsequent GL ops see the pixels.
@@ -637,30 +624,14 @@ mod tests {
         let context = std::sync::Arc::new(shared::op_state::ContextLostState::default());
         assert!(context.set_lost());
         let (events, _event_rx) = shared::render_event::channel();
-        let wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>> = None;
         let mut last_epoch = u64::MAX;
 
-        assert!(report_recovery_failure(
-            &context,
-            &events,
-            &wake,
-            &mut last_epoch,
-        ));
-        assert!(!report_recovery_failure(
-            &context,
-            &events,
-            &wake,
-            &mut last_epoch,
-        ));
+        assert!(report_recovery_failure(&context, &events, &mut last_epoch,));
+        assert!(!report_recovery_failure(&context, &events, &mut last_epoch,));
 
         assert!(context.set_recovered());
         assert!(context.set_lost());
-        assert!(report_recovery_failure(
-            &context,
-            &events,
-            &wake,
-            &mut last_epoch,
-        ));
+        assert!(report_recovery_failure(&context, &events, &mut last_epoch,));
     }
 
     // R1 demand-model contracts. These combine the real `RafDemand` latch with
@@ -1119,15 +1090,16 @@ impl RenderThread {
         // JS `op_gl_is_context_lost`. The render thread is the *only* writer and
         // updates it edge-triggered: `lost` false->true on a real reset / EGL
         // loss, true->false on a probe-verified recovery, bumping `epoch` on
-        // each transition. Because the render-event channel is lossy and drained
-        // only on host commands/heartbeat, this state -- not the event -- is the
-        // source of truth for `gl.isContextLost()`, and `epoch` lets the host
-        // recover event edges that the channel dropped.
+        // each transition. Because the render-event channel is lossy, this state
+        // -- not the event -- is the source of truth for `gl.isContextLost()`,
+        // and `epoch` lets the host recover event edges that the channel dropped.
         context_lost: Arc<shared::op_state::ContextLostState>,
-        // Optional wake nudge invoked right after a context lost/recovered
-        // transition so the host drains + reconciles promptly instead of
-        // waiting for the next heartbeat tick. Decoupled from `HostCommand`
-        // so the graphics crate stays independent of the host command enum.
+        // Wake callback fired after EVERY successfully enqueued render event, so
+        // Canvas/GL/swap/RAF-backpressure/context feedback reaches the host
+        // without a polling timer. The host supplies a `tokio::sync::Notify`-
+        // backed closure (coalescing bursts to one permit); `None` falls back to
+        // the no-wake channel. Decoupled from `HostCommand` so the graphics crate
+        // stays independent of the host command enum.
         wake: Option<Arc<dyn Fn() + Send + Sync>>,
         // R1: shared RAF waiter demand latch. `op_await_next_frame` publishes a
         // waiter before awaiting; the render thread consumes it (and only then
@@ -1151,7 +1123,13 @@ impl RenderThread {
         destroy_epoch: Arc<std::sync::atomic::AtomicU64>,
     ) -> EngineResult<Self> {
         let (cmd_tx, cmd_rx) = CommandSender::new();
-        let (event_tx, event_rx) = shared::render_event::channel();
+        // Wire the host wake into the event channel so every successful emit
+        // signals the host (coalesced by the host's Notify); no manual per-event
+        // nudge remains below.
+        let (event_tx, event_rx) = match wake {
+            Some(w) => shared::render_event::channel_with_wake(w),
+            None => shared::render_event::channel(),
+        };
 
         // F-2: build the shared TextContext here (no GL deps —
         // SkFontMgr + SkFontCollection are pure CPU objects) so
@@ -1164,6 +1142,8 @@ impl RenderThread {
 
         let event_tx_thread = event_tx.clone();
         let shared_text_ctx_for_thread = shared_text_ctx.clone();
+        let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_requested_for_owner = shutdown_requested.clone();
         let handle = std::thread::Builder::new()
             .name("Migo-RenderThread".into())
             .spawn(move || {
@@ -1176,7 +1156,7 @@ impl RenderThread {
                 // Both Android and non-Android use the same EGL library name.
                 const EGL_LIB: &str = "libEGL.so";
 
-                let mut cm = match CanvasManager::new_with_resource(EGL_LIB, dpi, app_cache_dir.as_deref(), &gpu_caps) {
+                let mut cm = match CanvasManager::new_with_resource(EGL_LIB, dpi, app_cache_dir.as_deref(), gpu_caps.clone()) {
                     Ok(c) => c,
                     Err(e) => {
                         gpu_caps.set_failed(format!("CanvasManager init failed: {}", e));
@@ -1188,6 +1168,7 @@ impl RenderThread {
                 let has_initial_surface = initial_surface.is_some();
                 let initial_surface_size = initial_surface.as_ref().map(|surface| surface.size());
                 let mut initial_onscreen_ok = false;
+                let mut startup_failed = false;
 
                 // If an initial surface is provided, create the onscreen context immediately.
                 if let Some(surface) = initial_surface {
@@ -1196,15 +1177,24 @@ impl RenderThread {
                             if let Err(e) = cm.create_onscreen(win, None) {
                                 error!("create_onscreen failed: {}", e);
                                 gpu_caps.set_failed(format!("create_onscreen failed: {}", e));
+                                startup_failed = true;
                             } else {
                                 initial_onscreen_ok = true;
                             }
                         }
                         Err(e) => {
                             gpu_caps.set_failed(format!("initial surface is not supported: {}", e));
-                            error!("initial surface is not supported: {}", e)
+                            error!("initial surface is not supported: {}", e);
+                            startup_failed = true;
                         }
                     }
+                }
+
+                // Publish Ready only after every startup step represented by the
+                // host's GPU join has succeeded. A surface failure has already
+                // published Failed and must never be overwritten by Ready.
+                if !startup_failed {
+                    cm.publish_gpu_caps();
                 }
 
                 // Create GL function loader.
@@ -1232,6 +1222,7 @@ impl RenderThread {
                 let mut frame_scheduler = FrameScheduler::new(fps);
 
                 let start_time = Instant::now();
+                let cleanup_cadence = DeferredCleanupCadence::new(start_time.elapsed());
                 let mut dirty = true;
                 let mut paused = false;
                 // R1: whether a one-shot vsync callback has been requested but not
@@ -1264,6 +1255,7 @@ impl RenderThread {
 
                 // ---- FPS stats ----
                 let debug_stats = shared::stats::register_stats(host_id);
+                crate::render_diagnostics::install(debug_stats.clone());
                 let mut frame_count: u32 = 0;
                 let mut fps_timer = Instant::now();
                 let mut last_frame_time = Instant::now();
@@ -1282,7 +1274,7 @@ impl RenderThread {
                 // Epoch of the last context-loss episode we already reported a
                 // *recovery failure* for. Recovery is retried every frame while
                 // lost; without this, each failed retry would emit a
-                // ContextRecovered{success:false} + wake the host + trigger a
+                // ContextRecovered{success:false} + signal the host + trigger a
                 // Java notify_error at up to 60 fps. We report the failure once
                 // per loss episode (the epoch bumps on each fresh loss), then
                 // stay quiet until recovery succeeds or a new loss occurs.
@@ -1551,6 +1543,7 @@ impl RenderThread {
                                 // vastly preferred to being killed and
                                 // having to restart the engine.
                                 cm.on_trim_memory();
+                                cleanup_cadence.mark_forced(start_time.elapsed());
                                 pause_started_at.set(Some(Instant::now()));
                                 info!(
                                     live_canvases,
@@ -1639,6 +1632,12 @@ impl RenderThread {
                                 stats.size_bytes as u32,
                                 stats.entries as u32,
                             );
+                            // Android memory pressure is an explicit cleanup
+                            // edge even while the app stays foregrounded. Keep
+                            // the existing age threshold; unlike Pause this
+                            // does not lower the long-lived Skia cache budget.
+                            cm.perform_deferred_cleanup_all(DEFERRED_CLEANUP_UNUSED_AGE);
+                            cleanup_cadence.mark_forced(start_time.elapsed());
                             info!(
                                 "RenderThread: text cache trim level={} freed_textures={} resident_bytes={}",
                                 level,
@@ -1907,14 +1906,11 @@ impl RenderThread {
                         cm.abandon_all_2d_contexts();
                         // Edge-triggered authoritative write (single packed
                         // atomic): `set_lost` returns true only on the
-                        // false->true transition, so we emit + nudge exactly
+                        // false->true transition, so we emit + notify exactly
                         // once. A sustained / re-detected loss must not keep
-                        // flooding the host command queue with no-op nudges.
+                        // flooding the host with duplicate events.
                         if context_lost.set_lost() {
                             events.emit(RenderEvent::ContextLost);
-                            if let Some(w) = wake.as_ref() {
-                                w();
-                            }
                         }
                     }
 
@@ -2014,13 +2010,10 @@ impl RenderThread {
                                     // on the next frame will recreate
                                     // fresh `Canvas2DContext`s.
                                     cm.abandon_all_2d_contexts();
-                                    // Edge-triggered: emit + nudge only on the
+                                    // Edge-triggered: emit + notify only on the
                                     // false->true transition (see robustness path).
                                     if context_lost.set_lost() {
                                         events.emit(RenderEvent::ContextLost);
-                                        if let Some(w) = wake.as_ref() {
-                                            w();
-                                        }
                                     }
                                 } else {
                                     debug_stats
@@ -2058,6 +2051,13 @@ impl RenderThread {
                         cm.deferred_uploads_len() as u32,
                     );
 
+                    // Piggyback maintenance on an already-requested physical
+                    // frame. No timer is armed while idle, and advancing to
+                    // `now` prevents catch-up sweeps after a long pause.
+                    if cleanup_cadence.should_run(start_time.elapsed()) {
+                        cm.perform_deferred_cleanup_all(DEFERRED_CLEANUP_UNUSED_AGE);
+                    }
+
                     // FPS stats.
                     let now = Instant::now();
                     if did_swap {
@@ -2073,6 +2073,7 @@ impl RenderThread {
                         *frame_count = 0;
                         *fps_timer = now;
                     }
+                    crate::render_diagnostics::flush_frame();
                 };
 
                 // R1: request exactly one more display frame iff demand remains
@@ -2110,6 +2111,17 @@ impl RenderThread {
                     };
 
                 loop {
+                    // Shutdown has an out-of-band level because the bounded
+                    // command queue deliberately drops lifecycle commands when
+                    // full. The best-effort Shutdown command wakes an idle loop;
+                    // this level guarantees exit after a saturated queue drains.
+                    if shutdown_requested.load(Ordering::Acquire) {
+                        info!("RenderThread observed shutdown request");
+                        cm.destroy_all(&gl);
+                        shared::stats::unregister_stats(host_id);
+                        return;
+                    }
+
                     // --- Deferred EGL context recovery ---
                     // Performed at the top of the frame loop where it is less
                     // timing-critical than inside the swap path. This avoids
@@ -2136,9 +2148,6 @@ impl RenderThread {
                                     events.emit(RenderEvent::ContextRecovered {
                                         success: true,
                                     });
-                                    if let Some(w) = wake.as_ref() {
-                                        w();
-                                    }
                                 }
                             }
                             Ok(false) => {
@@ -2150,7 +2159,6 @@ impl RenderThread {
                                 if report_recovery_failure(
                                     &context_lost,
                                     &events,
-                                    &wake,
                                     &mut last_recovery_fail_epoch,
                                 ) {
                                     warn!("EGL context recovery incomplete; context still lost");
@@ -2161,7 +2169,6 @@ impl RenderThread {
                                 if report_recovery_failure(
                                     &context_lost,
                                     &events,
-                                    &wake,
                                     &mut last_recovery_fail_epoch,
                                 ) {
                                     warn!("EGL context recovery failed: {}", re);
@@ -2337,6 +2344,11 @@ impl RenderThread {
                     } else {
                         "Unknown panic".to_string()
                     };
+                    if !gpu_caps.is_ready() {
+                        gpu_caps.set_failed(format!(
+                            "RenderThread panicked during initialization: {msg}"
+                        ));
+                    }
                     error!("[RenderThread host={}] PANIC: {}", host_id, msg);
                     if let Some(stats) = shared::stats::get_stats(host_id) {
                         stats.fatal_error_code.store(
@@ -2356,6 +2368,7 @@ impl RenderThread {
 
         Ok(Self {
             cmd_tx,
+            shutdown_requested: shutdown_requested_for_owner,
             event_rx,
             text_measurer,
             handle: Some(handle),
@@ -2388,18 +2401,27 @@ impl RenderThread {
     }
 
     pub fn shutdown(&mut self) {
+        let Some(h) = self.handle.take() else {
+            return;
+        };
+        self.shutdown_requested.store(true, Ordering::Release);
         let _ = self.cmd_tx.send(RenderCommand::Shutdown);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        let _ = h.join();
     }
 
     pub fn shutdown_detached(&mut self) {
+        let Some(h) = self.handle.take() else {
+            return;
+        };
+        self.shutdown_requested.store(true, Ordering::Release);
         let _ = self.cmd_tx.send(RenderCommand::Shutdown);
-        if let Some(h) = self.handle.take() {
-            std::thread::spawn(move || {
+        // This path is also called from Drop while unwinding. Builder::spawn
+        // returns an error instead of panicking if a joiner cannot be created;
+        // dropping `h` then detaches it after Shutdown was already sent.
+        let _ = std::thread::Builder::new()
+            .name("Migo-RenderJoin".into())
+            .spawn(move || {
                 let _ = h.join();
             });
-        }
     }
 }

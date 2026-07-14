@@ -12,13 +12,22 @@
 
 ## 安装
 
+发布构建提供两个产品：`full` 保留全部 `wx.*` 平台能力，`slim` 仅保留渲染、
+输入、生命周期、存储/VFS、网络、subpackage 与 host message 核心。两者都保留
+代码签名、V8 资源限制及 API 26 地板。
+
+```bash
+bash scripts/build-aar.sh --product-profile full release
+bash scripts/build-aar.sh --product-profile slim release
+```
+
 ### Gradle
 
 将 AAR 添加到项目：
 
 ```groovy
 dependencies {
-    implementation files('libs/migo-release.aar')
+    implementation files('libs/migo-full-release.aar')
 }
 ```
 
@@ -246,7 +255,7 @@ File userDataDir = paths.getUserDataDir(); // 用户数据
 File cacheDir = paths.getCacheDir();     // 缓存文件
 File tempDir = paths.getTempDir();       // 临时文件
 
-// 部署游戏代码
+// 首次安装且该 gameId 没有活动 session 时，才可直接填充空的 codeDir
 unzipGamePackage(downloadedZip, codeDir);
 
 // 启动游戏
@@ -262,6 +271,12 @@ paths.cleanupTemp();  // 清理临时文件
 // 完全删除游戏数据
 paths.deleteAll();    // 卸载游戏
 ```
+
+签名树首次成功启动后会被封存为只读。更新同一 `gameId` 时，必须先停止并销毁
+全部相关 session，并把部署事务与新的 `startGame` 串行化：在 sibling 目录构建完整
+staging tree，再用可恢复的整树事务发布，恢复完成后才允许启动。API 26 的
+`File.renameTo` 不保证原子替换非空目录，不能把它单独当作更新事务；也不得在活动
+`codeDir` 中原地解压或覆盖文件。
 
 ### gameId 要求
 

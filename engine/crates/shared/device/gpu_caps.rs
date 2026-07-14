@@ -1,12 +1,13 @@
-//! Per-session GPU compressed texture format support.
+//! Per-session GPU image-path capabilities.
 //!
 //! `GpuCaps` is created by the host thread and shared with the render
 //! thread via `Arc`.  The render thread calls `set()` after GL context
 //! init; IO/JS threads read via `snapshot()`.
 //!
-//! `GpuCapsSnapshot` is a plain `Copy` struct passed to image decode
-//! functions so that decode decisions use the caps that were current
-//! when the request was dispatched.
+//! `GpuCapsSnapshot` is a plain `Copy` point-in-time view. On-demand image
+//! decodes retain the shared `GpuCaps` until their worker starts so the
+//! one-way runtime AHB circuit breaker cannot be bypassed by queued work;
+//! stable capability consumers such as preloading may still pass snapshots.
 //!
 //! `wait_ready()` blocks until the render thread has completed GL init
 //! and called `set()`.  `Host::new()` calls this to ensure caps are
@@ -15,6 +16,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+fn remaining_wait(
+    started: std::time::Instant,
+    timeout: std::time::Duration,
+) -> std::time::Duration {
+    timeout.saturating_sub(started.elapsed())
+}
+
 #[derive(Debug, Clone)]
 pub enum GpuCapsReadyState {
     Ready,
@@ -22,7 +30,7 @@ pub enum GpuCapsReadyState {
     Timeout,
 }
 
-/// Per-session GPU compressed texture format support.
+/// Per-session GPU image-path capabilities.
 ///
 /// Created once per host session, shared with the render thread.
 /// The render thread writes after GL context init (via `set`);
@@ -31,6 +39,7 @@ pub enum GpuCapsReadyState {
 pub struct GpuCaps {
     etc2: AtomicBool,
     astc: AtomicBool,
+    ahb: AtomicBool,
     /// Set to `true` after `set()` is called.  `wait_ready()` blocks
     /// until this flag is true, ensuring no early snapshot reads
     /// uninitialized (all-false) caps.
@@ -46,6 +55,7 @@ impl Default for GpuCaps {
         Self {
             etc2: AtomicBool::new(false),
             astc: AtomicBool::new(false),
+            ahb: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             ready_lock: Mutex::new(false),
@@ -56,15 +66,16 @@ impl Default for GpuCaps {
 }
 
 impl GpuCaps {
-    /// Create a new `Arc<GpuCaps>` with both formats defaulting to `false`.
+    /// Create a new `Arc<GpuCaps>` with every capability defaulting to `false`.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
     /// Called by the render thread after GL context init.
-    pub fn set(&self, etc2: bool, astc: bool) {
+    pub fn set(&self, etc2: bool, astc: bool, ahb: bool) {
         self.etc2.store(etc2, Ordering::Release);
         self.astc.store(astc, Ordering::Release);
+        self.ahb.store(ahb, Ordering::Release);
         self.ready.store(true, Ordering::Release);
         if let Ok(mut ready) = self.ready_lock.lock() {
             *ready = true;
@@ -72,12 +83,21 @@ impl GpuCaps {
         }
     }
 
+    /// Permanently disable AHB for this host session after a runtime import
+    /// failure. Returns `true` only for the first enabled-to-disabled edge.
+    /// Capability publication is complete before image work starts, so this
+    /// flag is intentionally one-way and cannot race with a later `set()`.
+    pub fn disable_ahb(&self) -> bool {
+        self.ahb.swap(false, Ordering::AcqRel)
+    }
+
     pub fn set_failed(&self, detail: impl Into<String>) {
+        let detail = detail.into();
+        if let Ok(mut failure) = self.failure_detail.lock() {
+            *failure = Some(detail);
+        }
         self.failed.store(true, Ordering::Release);
         self.ready.store(true, Ordering::Release);
-        if let Ok(mut failure) = self.failure_detail.lock() {
-            *failure = Some(detail.into());
-        }
         if let Ok(mut ready) = self.ready_lock.lock() {
             *ready = true;
             self.ready_cv.notify_all();
@@ -137,29 +157,44 @@ impl GpuCaps {
         }
     }
 
+    /// Wait for initial capability publication without extending an existing
+    /// startup deadline. `started` is captured by the host immediately after
+    /// render service launch; work before this call consumes the same budget.
+    pub fn wait_ready_until(
+        &self,
+        started: std::time::Instant,
+        timeout: std::time::Duration,
+    ) -> GpuCapsReadyState {
+        self.wait_ready(remaining_wait(started, timeout))
+    }
+
     /// Take an immutable point-in-time snapshot for passing to image decode functions.
     pub fn snapshot(&self) -> GpuCapsSnapshot {
         GpuCapsSnapshot {
             etc2: self.etc2.load(Ordering::Acquire),
             astc: self.astc.load(Ordering::Acquire),
+            ahb: self.ahb.load(Ordering::Acquire),
         }
     }
 }
 
 /// Immutable point-in-time copy of GPU caps.
 ///
-/// Passed to image decode functions so decode decisions use the caps
-/// that were current when the request was dispatched.
+/// Stable consumers may pass this directly. On-demand decode jobs should keep
+/// the shared [`GpuCaps`] until worker execution and snapshot there so they
+/// observe a runtime AHB disable edge.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GpuCapsSnapshot {
     pub etc2: bool,
     pub astc: bool,
+    /// The renderer can import an API-26 AHardwareBuffer as a texture.
+    pub ahb: bool,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuCaps, GpuCapsReadyState};
-    use std::time::Duration;
+    use super::{GpuCaps, GpuCapsReadyState, remaining_wait};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn wait_ready_observes_set() {
@@ -167,7 +202,7 @@ mod tests {
         let worker = caps.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(10));
-            worker.set(true, false);
+            worker.set(true, false, true);
         });
         assert!(matches!(
             caps.wait_ready(Duration::from_secs(1)),
@@ -176,6 +211,7 @@ mod tests {
         let snap = caps.snapshot();
         assert!(snap.etc2);
         assert!(!snap.astc);
+        assert!(snap.ahb);
     }
 
     #[test]
@@ -195,5 +231,73 @@ mod tests {
             GpuCapsReadyState::Failed(msg) => assert!(msg.contains("boom")),
             other => panic!("expected failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wait_ready_until_observes_already_published_caps_after_deadline() {
+        let caps = GpuCaps::new();
+        caps.set(true, false, true);
+        let started = Instant::now() - Duration::from_secs(1);
+
+        assert!(matches!(
+            caps.wait_ready_until(started, Duration::from_millis(10)),
+            GpuCapsReadyState::Ready
+        ));
+    }
+
+    #[test]
+    fn wait_ready_until_observes_already_published_failure_after_deadline() {
+        let caps = GpuCaps::new();
+        caps.set_failed("render init failed");
+        let started = Instant::now() - Duration::from_secs(1);
+
+        match caps.wait_ready_until(started, Duration::from_millis(10)) {
+            GpuCapsReadyState::Failed(detail) => {
+                assert_eq!(detail, "render init failed");
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_ready_until_expired_deadline_does_not_start_a_new_timeout() {
+        let caps = GpuCaps::new();
+        let started = Instant::now() - Duration::from_secs(1);
+
+        assert!(matches!(
+            caps.wait_ready_until(started, Duration::from_millis(10)),
+            GpuCapsReadyState::Timeout
+        ));
+        assert_eq!(
+            remaining_wait(started, Duration::from_millis(10)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn wait_ready_until_uses_only_the_remaining_budget() {
+        let caps = GpuCaps::new();
+        let publisher = caps.clone();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            publisher.set(false, true, false);
+        });
+
+        assert!(matches!(
+            caps.wait_ready_until(started, Duration::from_secs(1)),
+            GpuCapsReadyState::Ready
+        ));
+        assert!(caps.snapshot().astc);
+    }
+
+    #[test]
+    fn ahb_can_be_disabled_after_a_runtime_import_failure() {
+        let caps = GpuCaps::new();
+        caps.set(false, false, true);
+        assert!(caps.snapshot().ahb);
+        assert!(caps.disable_ahb());
+        assert!(!caps.snapshot().ahb);
+        assert!(!caps.disable_ahb(), "second disable is idempotent");
     }
 }

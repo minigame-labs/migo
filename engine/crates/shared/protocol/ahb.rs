@@ -35,8 +35,8 @@
 //! * Not a Vulkan importer — that lives in `graphics/`.
 //! * Not a Java `HardwareBuffer` bridge — `platform/android/jni`
 //!   wraps `_acquire` and hands the raw pointer through `jlong`.
-//! * Not a fence/sync primitive — sync fences travel separately
-//!   (`fence_fd: i32` field on `DecodedImage::HardwareBuffer`).
+//! * Not a general fence/sync primitive. CPU locks are synchronously
+//!   released before a buffer is published to another subsystem.
 
 use std::fmt;
 
@@ -188,6 +188,21 @@ impl AhbDesc {
             stride_pixels: 0,
         }
     }
+
+    /// Descriptor for a static image decoded once on the CPU, sampled by the
+    /// GPU, and occasionally read back if EGLImage import is unavailable.
+    pub fn rgba_sampled_cpu_decode(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            layers: 1,
+            format: AhbFormat::R8g8b8a8Unorm,
+            usage: AhbUsage::GPU_SAMPLED_IMAGE
+                | AhbUsage::CPU_WRITE_RARELY
+                | AhbUsage::CPU_READ_RARELY,
+            stride_pixels: 0,
+        }
+    }
 }
 
 /// Result type for AHB operations. Errors are coarse on purpose —
@@ -209,6 +224,9 @@ pub enum AhbError {
     /// CPU lock requested with usage flags that exclude both
     /// `CPU_READ_*` and `CPU_WRITE_*`.
     InvalidLockUsage,
+    /// The requested or driver-returned descriptor cannot be represented by
+    /// this single-plane RGBA contract.
+    InvalidDescriptor { reason: &'static str },
 }
 
 impl fmt::Display for AhbError {
@@ -220,11 +238,78 @@ impl fmt::Display for AhbError {
             AhbError::NotAndroid => write!(f, "AHB not available on this target"),
             AhbError::NullHandle => write!(f, "AHB null handle"),
             AhbError::InvalidLockUsage => write!(f, "AHB lock usage missing CPU_READ/WRITE bit"),
+            AhbError::InvalidDescriptor { reason } => {
+                write!(f, "AHB invalid descriptor: {reason}")
+            }
         }
     }
 }
 
 impl std::error::Error for AhbError {}
+
+const CPU_READ_MASK: u64 = 0x0f;
+const CPU_WRITE_MASK: u64 = 0xf0;
+const CPU_USAGE_MASK: u64 = CPU_READ_MASK | CPU_WRITE_MASK;
+
+fn checked_layout(desc: &AhbDesc) -> Result<(usize, usize), AhbError> {
+    if desc.width == 0 || desc.height == 0 {
+        return Err(AhbError::InvalidDescriptor {
+            reason: "zero width or height",
+        });
+    }
+    if desc.width > i32::MAX as u32 || desc.height > i32::MAX as u32 {
+        return Err(AhbError::InvalidDescriptor {
+            reason: "dimensions exceed signed graphics limits",
+        });
+    }
+    if desc.layers != 1 {
+        return Err(AhbError::InvalidDescriptor {
+            reason: "only one-layer RGBA buffers are supported",
+        });
+    }
+
+    let stride_pixels = if desc.stride_pixels == 0 {
+        desc.width
+    } else {
+        desc.stride_pixels
+    };
+    if stride_pixels < desc.width {
+        return Err(AhbError::InvalidDescriptor {
+            reason: "row stride is smaller than width",
+        });
+    }
+    let stride_bytes = (stride_pixels as usize)
+        .checked_mul(desc.format.bytes_per_pixel() as usize)
+        .ok_or(AhbError::InvalidDescriptor {
+            reason: "row byte size overflows usize",
+        })?;
+    let len_bytes =
+        stride_bytes
+            .checked_mul(desc.height as usize)
+            .ok_or(AhbError::InvalidDescriptor {
+                reason: "buffer byte size overflows usize",
+            })?;
+    Ok((stride_bytes, len_bytes))
+}
+
+fn validate_lock_usage(desc: &AhbDesc, usage: AhbUsage) -> Result<(), AhbError> {
+    let requested = usage.bits();
+    let requested_read = requested & CPU_READ_MASK;
+    let requested_write = requested & CPU_WRITE_MASK;
+    let valid_read = requested_read == 0 || requested_read == 0x2 || requested_read == 0x3;
+    let valid_write = requested_write == 0 || requested_write == 0x20 || requested_write == 0x30;
+
+    if requested == 0
+        || requested & !CPU_USAGE_MASK != 0
+        || !valid_read
+        || !valid_write
+        || (requested_read != 0 && desc.usage.bits() & CPU_READ_MASK == 0)
+        || (requested_write != 0 && desc.usage.bits() & CPU_WRITE_MASK == 0)
+    {
+        return Err(AhbError::InvalidLockUsage);
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // OwnedAhb — Android backend
@@ -237,16 +322,21 @@ mod imp {
     use std::ptr;
     use std::sync::Arc;
 
-    /// Refcount-owned AHB. Cheap to clone (one `_acquire` call).
+    /// Refcount-owned AHB. Cheap to clone (one Rust `Arc` increment).
     pub struct OwnedAhb {
-        // `Arc` so `Clone` is one atomic increment + one
-        // `_acquire`; the inner box owns the AHB drop.
+        // `Arc` makes Clone one atomic increment. `AhbBox` owns exactly one
+        // native AHB reference, released after the final Rust clone drops.
         inner: Arc<AhbBox>,
         desc: AhbDesc,
     }
 
     struct AhbBox {
         ptr: *mut sys::AHardwareBuffer,
+        // NDK permits concurrent read locks but declares every simultaneous
+        // write/read-write lock undefined. Serialize all CPU access so the
+        // safe mutable-slice API can never create aliased `&mut [u8]` across
+        // cloned `OwnedAhb` handles, even if a vendor driver accepts both.
+        cpu_lock: parking_lot::Mutex<()>,
     }
 
     // SAFETY: `AHardwareBuffer_*` calls are documented thread-safe.
@@ -264,6 +354,7 @@ mod imp {
 
     impl OwnedAhb {
         pub fn allocate(mut desc: AhbDesc) -> Result<Self, AhbError> {
+            checked_layout(&desc)?;
             // The NDK ignores `stride` on input but writes it on the
             // descriptor it stores; we still zero it for clarity.
             desc.stride_pixels = 0;
@@ -282,6 +373,10 @@ mod imp {
             if status != 0 || out.is_null() {
                 return Err(AhbError::AllocateFailed { status });
             }
+            let inner = Arc::new(AhbBox {
+                ptr: out,
+                cpu_lock: parking_lot::Mutex::new(()),
+            });
             // Read back the *actual* stride (driver may have padded).
             let mut described = sys::AHardwareBuffer_Desc {
                 width: 0,
@@ -294,43 +389,69 @@ mod imp {
                 rfu1: 0,
             };
             unsafe { sys::AHardwareBuffer_describe(out, &mut described) };
+            if described.width != desc.width
+                || described.height != desc.height
+                || described.layers != desc.layers
+                || described.format != desc.format as u32
+                || described.usage & desc.usage.bits() != desc.usage.bits()
+            {
+                return Err(AhbError::InvalidDescriptor {
+                    reason: "driver description differs from allocation request",
+                });
+            }
             desc.stride_pixels = described.stride;
-            Ok(Self {
-                inner: Arc::new(AhbBox { ptr: out }),
-                desc,
-            })
+            checked_layout(&desc)?;
+            Ok(Self { inner, desc })
         }
 
-        /// Adopt an externally-allocated AHB pointer.  Typically used
+        /// Adopt an externally-allocated AHB pointer. Typically used
         /// when Java passed `Bitmap.getHardwareBuffer()` back through
         /// JNI as a `jlong` — the Java side held a reference, so we
         /// `_acquire` to gain our own.
-        pub fn from_raw_acquire(ptr: *mut c_void, desc: AhbDesc) -> Result<Self, AhbError> {
+        ///
+        /// # Safety
+        ///
+        /// `ptr` must identify a live AHB matching `desc`. Callers must not
+        /// create another independently synchronized `OwnedAhb` for the same
+        /// pointer and then perform overlapping CPU access; use `Clone` after
+        /// the first adoption so all safe locks share one mutex.
+        pub unsafe fn from_raw_acquire(ptr: *mut c_void, desc: AhbDesc) -> Result<Self, AhbError> {
             if ptr.is_null() {
                 return Err(AhbError::NullHandle);
             }
             let ahb = ptr as *mut sys::AHardwareBuffer;
             unsafe { sys::AHardwareBuffer_acquire(ahb) };
             Ok(Self {
-                inner: Arc::new(AhbBox { ptr: ahb }),
+                inner: Arc::new(AhbBox {
+                    ptr: ahb,
+                    cpu_lock: parking_lot::Mutex::new(()),
+                }),
                 desc,
             })
         }
 
-        /// Adopt an externally-allocated AHB pointer that already
-        /// owns one strong refcount.
+        /// Adopt an externally-allocated AHB pointer that already owns one
+        /// strong refcount.
         ///
         /// This is the transfer-ownership counterpart to
         /// [`Self::from_raw_acquire`]: use it when the producer has
-        /// already called `AHardwareBuffer_acquire` (or equivalent)
-        /// before handing the pointer across an FFI boundary.
-        pub fn from_raw_owned(ptr: *mut c_void, desc: AhbDesc) -> Result<Self, AhbError> {
+        /// already called `AHardwareBuffer_acquire` (or equivalent) before
+        /// handing the pointer across an FFI boundary.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` must identify a live AHB matching `desc`, and the caller must
+        /// transfer exactly one native reference. As with
+        /// [`Self::from_raw_acquire`], create subsequent owners with `Clone`
+        /// so safe CPU locks share the same serialization guard.
+        pub unsafe fn from_raw_owned(ptr: *mut c_void, desc: AhbDesc) -> Result<Self, AhbError> {
             if ptr.is_null() {
                 return Err(AhbError::NullHandle);
             }
             Ok(Self {
                 inner: Arc::new(AhbBox {
                     ptr: ptr as *mut sys::AHardwareBuffer,
+                    cpu_lock: parking_lot::Mutex::new(()),
                 }),
                 desc,
             })
@@ -366,13 +487,9 @@ mod imp {
         /// `R8G8B8A8_UNORM`); planar / YUV formats need a different
         /// API which we don't currently use.
         pub fn lock_cpu(&self, usage: AhbUsage) -> Result<AhbLock<'_>, AhbError> {
-            let cpu_bits = AhbUsage::CPU_READ_OFTEN
-                | AhbUsage::CPU_READ_RARELY
-                | AhbUsage::CPU_WRITE_OFTEN
-                | AhbUsage::CPU_WRITE_RARELY;
-            if !usage.intersects(cpu_bits) {
-                return Err(AhbError::InvalidLockUsage);
-            }
+            validate_lock_usage(&self.desc, usage)?;
+            let (stride_bytes, len_bytes) = checked_layout(&self.desc)?;
+            let cpu_lock = self.inner.cpu_lock.lock();
             let mut addr: *mut c_void = ptr::null_mut();
             let status = unsafe {
                 sys::AHardwareBuffer_lock(
@@ -383,13 +500,25 @@ mod imp {
                     &mut addr,
                 )
             };
-            if status != 0 || addr.is_null() {
+            if status != 0 {
                 return Err(AhbError::LockFailed { status });
+            }
+            if addr.is_null() {
+                // A successful lock owns a matching unlock even if a broken
+                // driver failed to return the promised address.
+                unsafe {
+                    let _ = sys::AHardwareBuffer_unlock(self.inner.ptr, ptr::null_mut());
+                }
+                return Err(AhbError::LockFailed { status: -1 });
             }
             Ok(AhbLock {
                 ahb: self,
+                _cpu_lock: cpu_lock,
                 addr: addr as *mut u8,
-                stride_bytes: self.desc.stride_pixels * self.desc.format.bytes_per_pixel(),
+                stride_bytes,
+                len_bytes,
+                writable: usage.bits() & CPU_WRITE_MASK != 0,
+                locked: true,
             })
         }
     }
@@ -414,8 +543,12 @@ mod imp {
 
     pub struct AhbLock<'a> {
         ahb: &'a OwnedAhb,
+        _cpu_lock: parking_lot::MutexGuard<'a, ()>,
         addr: *mut u8,
-        stride_bytes: u32,
+        stride_bytes: usize,
+        len_bytes: usize,
+        writable: bool,
+        locked: bool,
     }
 
     impl<'a> AhbLock<'a> {
@@ -423,21 +556,49 @@ mod imp {
         pub fn as_ptr(&self) -> *mut u8 {
             self.addr
         }
-        pub fn stride_bytes(&self) -> u32 {
+        pub fn stride_bytes(&self) -> usize {
             self.stride_bytes
+        }
+
+        /// Entire locked allocation, including any driver row padding.
+        pub fn as_bytes_mut(&mut self) -> Result<&mut [u8], AhbError> {
+            if !self.writable {
+                return Err(AhbError::InvalidLockUsage);
+            }
+            // SAFETY: a successful exclusive CPU write lock owns this address
+            // for `len_bytes`, which was checked from the described stride and
+            // height. The mutable borrow cannot outlive this guard.
+            Ok(unsafe { std::slice::from_raw_parts_mut(self.addr, self.len_bytes) })
+        }
+
+        /// Finish CPU access synchronously and surface an unlock failure.
+        pub fn finish(mut self) -> Result<(), AhbError> {
+            self.unlock()
+        }
+
+        fn unlock(&mut self) -> Result<(), AhbError> {
+            if !self.locked {
+                return Ok(());
+            }
+            // Mark consumed before entering the driver: retrying an unlock
+            // after an error has undefined ownership semantics.
+            self.locked = false;
+            let status = unsafe {
+                // API 26 contract: a null fence makes unlock block until CPU
+                // writes and cache maintenance are complete.
+                sys::AHardwareBuffer_unlock(self.ahb.inner.ptr, ptr::null_mut())
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(AhbError::UnlockFailed { status })
+            }
         }
     }
 
     impl<'a> Drop for AhbLock<'a> {
         fn drop(&mut self) {
-            // We don't propagate an out-fence here; if the caller
-            // needs a fence-back protocol they should use the lock
-            // form that exposes it. Best-effort unlock; on error
-            // there's nothing the destructor can do.
-            let mut out_fence: std::os::raw::c_int = -1;
-            unsafe {
-                let _ = sys::AHardwareBuffer_unlock(self.ahb.inner.ptr, &mut out_fence);
-            }
+            let _ = self.unlock();
         }
     }
 }
@@ -470,14 +631,18 @@ mod imp {
 
     impl OwnedAhb {
         pub fn allocate(mut desc: AhbDesc) -> Result<Self, AhbError> {
+            checked_layout(&desc)?;
             // Simulate driver-chosen stride: align to 64 px (a value
             // close to what real Mali / Adreno drivers tend to pick).
-            let aligned = (desc.width + 63) & !63;
+            let aligned = desc
+                .width
+                .checked_add(63)
+                .ok_or(AhbError::InvalidDescriptor {
+                    reason: "aligned row stride overflows u32",
+                })?
+                & !63;
             desc.stride_pixels = aligned.max(desc.width);
-            let bytes = (desc.stride_pixels as usize)
-                .checked_mul(desc.height as usize)
-                .and_then(|p| p.checked_mul(desc.format.bytes_per_pixel() as usize))
-                .ok_or(AhbError::AllocateFailed { status: -1 })?;
+            let (_, bytes) = checked_layout(&desc)?;
             Ok(Self {
                 inner: Arc::new(MockInner {
                     pixels: parking_lot::Mutex::new(vec![0u8; bytes]),
@@ -486,12 +651,15 @@ mod imp {
             })
         }
 
-        pub fn from_raw_acquire(_ptr: *mut c_void, _desc: AhbDesc) -> Result<Self, AhbError> {
+        pub unsafe fn from_raw_acquire(
+            _ptr: *mut c_void,
+            _desc: AhbDesc,
+        ) -> Result<Self, AhbError> {
             // The mock has no notion of an external pointer to adopt.
             Err(AhbError::NotAndroid)
         }
 
-        pub fn from_raw_owned(_ptr: *mut c_void, _desc: AhbDesc) -> Result<Self, AhbError> {
+        pub unsafe fn from_raw_owned(_ptr: *mut c_void, _desc: AhbDesc) -> Result<Self, AhbError> {
             // The mock has no notion of an external pointer to adopt.
             Err(AhbError::NotAndroid)
         }
@@ -513,19 +681,14 @@ mod imp {
         }
 
         pub fn lock_cpu(&self, usage: AhbUsage) -> Result<AhbLock<'_>, AhbError> {
-            let cpu_bits = AhbUsage::CPU_READ_OFTEN
-                | AhbUsage::CPU_READ_RARELY
-                | AhbUsage::CPU_WRITE_OFTEN
-                | AhbUsage::CPU_WRITE_RARELY;
-            if !usage.intersects(cpu_bits) {
-                return Err(AhbError::InvalidLockUsage);
-            }
+            validate_lock_usage(&self.desc, usage)?;
             let guard = self.inner.pixels.lock();
-            let stride_bytes = self.desc.stride_pixels * self.desc.format.bytes_per_pixel();
+            let (stride_bytes, _) = checked_layout(&self.desc)?;
             Ok(AhbLock {
                 _ahb: self,
                 guard,
                 stride_bytes,
+                writable: usage.bits() & CPU_WRITE_MASK != 0,
             })
         }
     }
@@ -541,15 +704,27 @@ mod imp {
     pub struct AhbLock<'a> {
         _ahb: &'a OwnedAhb,
         guard: parking_lot::MutexGuard<'a, Vec<u8>>,
-        stride_bytes: u32,
+        stride_bytes: usize,
+        writable: bool,
     }
 
     impl<'a> AhbLock<'a> {
         pub fn as_ptr(&self) -> *mut u8 {
             self.guard.as_ptr() as *mut u8
         }
-        pub fn stride_bytes(&self) -> u32 {
+        pub fn stride_bytes(&self) -> usize {
             self.stride_bytes
+        }
+
+        pub fn as_bytes_mut(&mut self) -> Result<&mut [u8], AhbError> {
+            if !self.writable {
+                return Err(AhbError::InvalidLockUsage);
+            }
+            Ok(self.guard.as_mut_slice())
+        }
+
+        pub fn finish(self) -> Result<(), AhbError> {
+            Ok(())
         }
     }
 }
@@ -577,8 +752,8 @@ pub fn write_rgba_into_ahb(ahb: &OwnedAhb, rgba: &[u8]) -> Result<(), AhbError> 
         desc.height,
         bpp,
     );
-    let lock = ahb.lock_cpu(AhbUsage::CPU_WRITE_OFTEN)?;
-    let stride_bytes = lock.stride_bytes() as usize;
+    let lock = ahb.lock_cpu(AhbUsage::CPU_WRITE_RARELY)?;
+    let stride_bytes = lock.stride_bytes();
     let dst_base = lock.as_ptr();
     // SAFETY: the lock guarantees exclusive access to `desc.height`
     // rows of `stride_bytes` each; we copy at most `row_bytes_src`
@@ -591,7 +766,7 @@ pub fn write_rgba_into_ahb(ahb: &OwnedAhb, rgba: &[u8]) -> Result<(), AhbError> 
             std::ptr::copy_nonoverlapping(src, dst, row_bytes_src);
         }
     }
-    Ok(())
+    lock.finish()
 }
 
 /// Read the AHB pixels back into a tightly-packed RGBA `Vec<u8>`.
@@ -601,8 +776,8 @@ pub fn read_rgba_from_ahb(ahb: &OwnedAhb) -> Result<Vec<u8>, AhbError> {
     let bpp = desc.format.bytes_per_pixel() as usize;
     let row_bytes_src = desc.width as usize * bpp;
     let mut out = vec![0u8; row_bytes_src * desc.height as usize];
-    let lock = ahb.lock_cpu(AhbUsage::CPU_READ_OFTEN)?;
-    let stride_bytes = lock.stride_bytes() as usize;
+    let lock = ahb.lock_cpu(AhbUsage::CPU_READ_RARELY)?;
+    let stride_bytes = lock.stride_bytes();
     let src_base = lock.as_ptr();
     // SAFETY: see `write_rgba_into_ahb`. Same row-stride caveat.
     unsafe {
@@ -612,6 +787,7 @@ pub fn read_rgba_from_ahb(ahb: &OwnedAhb) -> Result<Vec<u8>, AhbError> {
             std::ptr::copy_nonoverlapping(src, dst, row_bytes_src);
         }
     }
+    lock.finish()?;
     Ok(out)
 }
 
@@ -634,6 +810,34 @@ mod tests {
     }
 
     #[test]
+    fn decode_descriptor_declares_one_shot_cpu_access_and_gpu_sampling() {
+        let desc = AhbDesc::rgba_sampled_cpu_decode(3, 2);
+        assert!(desc.usage.contains(AhbUsage::GPU_SAMPLED_IMAGE));
+        assert!(desc.usage.contains(AhbUsage::CPU_READ_RARELY));
+        assert!(desc.usage.contains(AhbUsage::CPU_WRITE_RARELY));
+        assert!(!desc.usage.contains(AhbUsage::CPU_WRITE_OFTEN));
+
+        let adopted = AhbDesc::rgba_sampled(3, 2);
+        assert!(!adopted.usage.contains(AhbUsage::CPU_WRITE_RARELY));
+    }
+
+    #[test]
+    fn allocate_rejects_zero_and_overflowing_geometry() {
+        assert!(matches!(
+            OwnedAhb::allocate(AhbDesc::rgba_sampled_cpu_decode(0, 1)),
+            Err(AhbError::InvalidDescriptor { .. })
+        ));
+        assert!(matches!(
+            OwnedAhb::allocate(AhbDesc::rgba_sampled_cpu_decode(1, 0)),
+            Err(AhbError::InvalidDescriptor { .. })
+        ));
+        assert!(matches!(
+            OwnedAhb::allocate(AhbDesc::rgba_sampled_cpu_decode(u32::MAX, 1)),
+            Err(AhbError::InvalidDescriptor { .. })
+        ));
+    }
+
+    #[test]
     fn clone_is_cheap_and_independent_lifetime() {
         let a = OwnedAhb::allocate(AhbDesc::rgba_sampled(8, 8)).unwrap();
         let b = a.clone();
@@ -650,8 +854,42 @@ mod tests {
     }
 
     #[test]
-    fn write_then_read_roundtrips_pixels() {
+    fn lock_rejects_non_cpu_bits_and_access_not_declared_at_allocation() {
+        let read_only = OwnedAhb::allocate(AhbDesc::rgba_sampled(4, 4)).unwrap();
+        assert!(matches!(
+            read_only.lock_cpu(AhbUsage::CPU_WRITE_RARELY),
+            Err(AhbError::InvalidLockUsage)
+        ));
+        assert!(matches!(
+            read_only.lock_cpu(AhbUsage::CPU_READ_RARELY | AhbUsage::GPU_SAMPLED_IMAGE),
+            Err(AhbError::InvalidLockUsage)
+        ));
+    }
+
+    #[test]
+    fn locked_slice_covers_checked_padded_rows_and_finishes_explicitly() {
+        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled_cpu_decode(3, 2)).unwrap();
+        let mut lock = ahb.lock_cpu(AhbUsage::CPU_WRITE_RARELY).unwrap();
+        let expected = lock.stride_bytes() * ahb.desc().height as usize;
+        assert!(lock.stride_bytes() >= 3 * 4);
+        assert_eq!(lock.as_bytes_mut().unwrap().len(), expected);
+        lock.finish().expect("synchronous unlock");
+    }
+
+    #[test]
+    fn read_lock_does_not_expose_a_safe_mutable_slice() {
         let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled(3, 2)).unwrap();
+        let mut lock = ahb.lock_cpu(AhbUsage::CPU_READ_RARELY).unwrap();
+        assert!(matches!(
+            lock.as_bytes_mut(),
+            Err(AhbError::InvalidLockUsage)
+        ));
+        lock.finish().unwrap();
+    }
+
+    #[test]
+    fn write_then_read_roundtrips_pixels() {
+        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled_cpu_decode(3, 2)).unwrap();
         // 3x2 image, RGBA bytes.
         #[rustfmt::skip]
         let pixels: Vec<u8> = vec![
@@ -666,7 +904,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "source size mismatch")]
     fn write_panics_on_size_mismatch() {
-        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled(2, 2)).unwrap();
+        let ahb = OwnedAhb::allocate(AhbDesc::rgba_sampled_cpu_decode(2, 2)).unwrap();
         let _ = write_rgba_into_ahb(&ahb, &[0u8; 8]); // 2 rows of 8 bytes != 2*2*4
     }
 
@@ -674,7 +912,11 @@ mod tests {
     fn from_raw_acquire_rejects_null_on_android() {
         // On non-Android the mock always returns NotAndroid; on
         // Android the same call with a null pointer must error too.
-        let r = OwnedAhb::from_raw_acquire(std::ptr::null_mut(), AhbDesc::rgba_sampled(1, 1));
+        // SAFETY: null is passed deliberately to exercise validation; the
+        // implementation rejects it before touching the pointer.
+        let r = unsafe {
+            OwnedAhb::from_raw_acquire(std::ptr::null_mut(), AhbDesc::rgba_sampled(1, 1))
+        };
         assert!(matches!(
             r,
             Err(AhbError::NullHandle) | Err(AhbError::NotAndroid)
@@ -685,7 +927,10 @@ mod tests {
     fn from_raw_owned_rejects_null_on_android() {
         // Mirrors the transfer-ownership path used by the Android
         // Java bridge after it acquires its own native refcount.
-        let r = OwnedAhb::from_raw_owned(std::ptr::null_mut(), AhbDesc::rgba_sampled(1, 1));
+        // SAFETY: null is passed deliberately to exercise validation; the
+        // implementation rejects it before taking ownership.
+        let r =
+            unsafe { OwnedAhb::from_raw_owned(std::ptr::null_mut(), AhbDesc::rgba_sampled(1, 1)) };
         assert!(matches!(
             r,
             Err(AhbError::NullHandle) | Err(AhbError::NotAndroid)
