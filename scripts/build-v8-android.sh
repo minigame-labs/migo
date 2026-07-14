@@ -205,11 +205,13 @@ if [[ "$REPRODUCE" == false ]]; then
     # (~1.6 MB of V8). This does NOT affect V8's JS-level unwinder API
     # (v8-unwinder.h), which is separate.
     GN_ARGS+=" exclude_unwind_tables=true"
-    # official_build defaults use_thin_lto=true → archive members become LLVM
-    # bitcode tied to V8's bundled clang (LLVM22). NDK lld (<=19) can't read
-    # that bitcode, so ANY later v8-crate relink fails ("Invalid value
-    # (Producer LLVM22 Reader LLVM..)"). Hidden until the v8 cache is cleared.
-    # Force native objects: links with any NDK lld and is truly reproducible.
+    # ThinLTO OFF (measured 2026-07-14: no stress fps gain). The migo-vs-Chromium
+    # stress gap is NOT V8 execution — pure-JS microbenches (mono/mega/GC) run
+    # EQUAL-OR-FASTER on migo's V8 14.5 than on webview's V8 11.4. The gap is the
+    # rendering/command-stream path, not V8, so PGO/ThinLTO don't help. Keeping
+    # native objects → links with plain NDK lld 12, portable + reproducible.
+    # (To re-experiment with ThinLTO: use_thin_lto=true + point migo's linker at
+    # rusty_v8's own ld.lld 22 via engine/.cargo/config.toml --ld-path.)
     GN_ARGS+=" use_thin_lto=false"
     info "optimized build: +is_official_build +symbol_level=0 (pgo off, no unwind tables, no thin-lto)"
 else
