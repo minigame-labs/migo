@@ -173,8 +173,8 @@ impl HostJsRuntime {
             use std::sync::Once;
             static V8_FLAGS: Once = Once::new();
             V8_FLAGS.call_once(|| {
-                let flags = std::fs::read_to_string("/data/local/tmp/v8flags.txt")
-                    .unwrap_or_default();
+                let flags =
+                    std::fs::read_to_string("/data/local/tmp/v8flags.txt").unwrap_or_default();
                 let flags = flags.trim();
                 if !flags.is_empty() {
                     tracing::error!("applying debug V8 flags from v8flags.txt: {flags}");

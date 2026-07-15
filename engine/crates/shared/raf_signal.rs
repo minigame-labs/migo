@@ -167,7 +167,15 @@ struct RafFrame {
 
 #[inline]
 fn frame_matches_ticket(delivered_ticket: u64, expected_ticket: u64) -> bool {
-    delivered_ticket == expected_ticket
+    // `>=` (not `==`) so the render thread can PRE-signal a frame with the
+    // current session ticket before the JS consumer re-publishes demand, letting
+    // `recv` return without blocking (free-run) instead of one eventfd wait per
+    // frame — the wait that dropped the compute thread's utilisation and, via the
+    // governor, its clock, halving stress fps. Restart-safe because session
+    // tickets are monotonic: a fresh isolate's ticket is strictly greater, so it
+    // ignores any stale lower-ticket signal left in the shared eventfd, and the
+    // old isolate's in-flight `recv(old)` never matches the new session's frames.
+    delivered_ticket >= expected_ticket
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +265,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct RafDemand {
     next_ticket: AtomicU64,
     waiter_ticket: AtomicU64,
+    /// The current isolate session's ticket. Constant for the life of a JS
+    /// session and bumped by [`begin_session`] on each (soft-)restart, so it is
+    /// monotonic across the shared eventfd. Every waiter in a session uses this
+    /// same ticket (rather than a fresh per-frame ticket), which lets the render
+    /// thread pre-signal a frame the consumer will accept — the basis of the
+    /// free-run path that keeps the compute thread busy (see `frame_matches_ticket`).
+    session_ticket: AtomicU64,
 }
 
 impl RafDemand {
@@ -264,20 +279,29 @@ impl RafDemand {
         Self::default()
     }
 
-    /// Publish demand before awaiting (op side).
+    /// Begin a new JS session: allocate a fresh, strictly-greater session ticket.
+    /// Called once at host construction and again on every soft restart so a new
+    /// isolate never accepts a signal produced for the old one.
+    #[inline]
+    pub fn begin_session(&self) -> u64 {
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed) + 1;
+        self.session_ticket.store(ticket, Ordering::Release);
+        ticket
+    }
+
+    /// The current session ticket, allocating one lazily if a session was never
+    /// explicitly begun (defensive: keeps standalone/test `RafDemand`s working).
+    #[inline]
+    pub fn session_ticket(&self) -> u64 {
+        let t = self.session_ticket.load(Ordering::Acquire);
+        if t != 0 { t } else { self.begin_session() }
+    }
+
+    /// Publish demand before awaiting (op side). Uses the session ticket so the
+    /// render thread can pre-signal a matching frame (`>=`) without blocking.
     #[inline]
     pub fn mark_waiting(&self) -> u64 {
-        let previous = self
-            .next_ticket
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(if current == u64::MAX { 1 } else { current + 1 })
-            })
-            .expect("RAF ticket update always succeeds");
-        let ticket = if previous == u64::MAX {
-            1
-        } else {
-            previous + 1
-        };
+        let ticket = self.session_ticket();
         self.waiter_ticket.store(ticket, Ordering::Release);
         ticket
     }
@@ -359,8 +383,53 @@ mod demand_tests {
 
     #[test]
     fn receiver_ticket_filter_rejects_soft_restart_stale_signal() {
+        // A stale (lower) ticket is rejected; the current/newer one is accepted.
         assert!(!frame_matches_ticket(7, 8));
         assert!(frame_matches_ticket(8, 8));
+        // Free-run: a signal carrying a >= ticket (same session) is accepted, so
+        // the render thread can pre-signal before the consumer re-publishes demand.
+        assert!(frame_matches_ticket(9, 8));
+    }
+
+    #[test]
+    fn session_ticket_constant_within_session_and_bumps_across() {
+        let d = RafDemand::new();
+        let s1 = d.begin_session();
+        assert_ne!(s1, 0, "session ticket is non-zero (0 == no waiter)");
+        // Every frame in a session uses the SAME ticket (enables pre-signalling).
+        assert_eq!(d.mark_waiting(), s1);
+        assert_eq!(d.mark_waiting(), s1);
+        // A new session's ticket is strictly greater (monotonic => restart-safe).
+        let s2 = d.begin_session();
+        assert!(s2 > s1);
+        assert_eq!(d.mark_waiting(), s2);
+    }
+
+    #[test]
+    fn free_run_presignal_matches_waiter_but_stale_session_is_ignored() {
+        let d = RafDemand::new();
+        let s1 = d.begin_session();
+        // Render pre-signals with the session ticket; a later waiter accepts it.
+        let expected = d.mark_waiting();
+        assert!(
+            frame_matches_ticket(s1, expected),
+            "pre-signal accepted (>=)"
+        );
+        // After a soft restart (new session), the old session's signal is ignored.
+        let s2 = d.begin_session();
+        assert!(
+            !frame_matches_ticket(s1, s2),
+            "stale session signal rejected"
+        );
+    }
+
+    #[test]
+    fn session_ticket_lazily_allocated_if_never_begun() {
+        let d = RafDemand::new();
+        // Defensive: standalone RafDemand (no explicit begin_session) still yields
+        // a usable non-zero ticket so mark/signal/recv line up.
+        assert_ne!(d.session_ticket(), 0);
+        assert_eq!(d.mark_waiting(), d.session_ticket());
     }
 
     #[test]

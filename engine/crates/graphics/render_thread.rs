@@ -1788,6 +1788,48 @@ impl RenderThread {
                 };
 
                 // Shared frame presentation + RAF signal logic.
+                // Free-run RAF signal. Writes the frame timestamp with the
+                // CONSTANT per-session ticket, and is called every scheduled
+                // vsync while animating — NOT gated on a live waiter. That keeps
+                // the eventfd primed so the JS consumer's `recv` returns without
+                // blocking, so the compute thread stays busy and the CPU governor
+                // holds a high clock. (The old demand-latch path signalled only
+                // when JS was already awaiting, so JS blocked once per frame, its
+                // utilisation fell to ~40%, the governor parked it at ~1.5GHz, and
+                // stress fps halved.) Returns whether the signal was delivered.
+                let signal_raf = |paused: bool, ts: f64| -> bool {
+                    if paused {
+                        return false;
+                    }
+                    let ticket = raf_demand.session_ticket();
+                    if raf_tx.signal(ts, ticket) {
+                        let prev_streak =
+                            debug_stats.raf_drop_streak.swap(0, Ordering::Relaxed);
+                        if prev_streak >= RAF_BACKPRESSURE_STREAK_THRESHOLD {
+                            info!(prev_streak, "RAF backpressure streak cleared");
+                        }
+                        true
+                    } else {
+                        debug_stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                        let streak =
+                            debug_stats.raf_drop_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                        if streak == RAF_BACKPRESSURE_STREAK_THRESHOLD {
+                            debug_stats
+                                .raf_backpressure_events
+                                .fetch_add(1, Ordering::Relaxed);
+                            events.emit(RenderEvent::RafBackpressure {
+                                consecutive_drops: streak,
+                            });
+                            info!(
+                                consecutive_drops = streak,
+                                threshold = RAF_BACKPRESSURE_STREAK_THRESHOLD,
+                                "RAF backpressure threshold crossed"
+                            );
+                        }
+                        false
+                    }
+                };
+
                 let present_frame_and_signal_raf = |cm: &mut CanvasManager,
                                                          renderer_2d: &mut Renderer2d,
                                                          dirty: &mut bool,
@@ -1801,6 +1843,7 @@ impl RenderThread {
                                                         first_frame_recorded: &mut bool,
                                                         needs_recovery: &mut bool| {
                     crate::atrace_scope!("migo.render.present_and_raf");
+                    let _ = ts; // RAF is signalled before the drain now (see signal_raf)
                     // Drain Canvas2D snapshot textures captured during this
                     // frame's `getImageData` calls.  By this point the
                     // FramePacket has already executed every queued
@@ -1830,57 +1873,8 @@ impl RenderThread {
                     // so a rejection stops the loop and the rest
                     // waits for the next frame's window.
                     cm.try_drain_deferred_uploads();
-                    // Signal RAF BEFORE swap so JS can prepare the next frame
-                    // while the GPU waits for VSync.  Must be unconditional —
-                    // JS may call requestAnimationFrame without drawing (dirty=false)
-                    // and still needs the next timestamp to keep the loop alive.
-                    //
-                    // Track consecutive-drop streak so P2-10 can emit a
-                    // `RafBackpressure` event once the saturation threshold is
-                    // crossed — transient drops are normal (JS task scheduling
-                    // jitter, WebGL texture upload bursts) and shouldn't spam
-                    // the event channel.
-                    if !paused && let Some(ticket) = raf_demand.take_waiter() {
-                        if raf_tx.signal(ts, ticket) {
-                            // Diag: if we just exited a long streak,
-                            // emit a one-shot recovery log so the
-                            // operator can bracket the backpressure
-                            // window in a field log.  Read the old
-                            // streak BEFORE the store so `prev_streak`
-                            // reflects the peak.
-                            let prev_streak =
-                                debug_stats.raf_drop_streak.swap(0, Ordering::Relaxed);
-                            if prev_streak >= RAF_BACKPRESSURE_STREAK_THRESHOLD {
-                                info!(
-                                    prev_streak,
-                                    "RAF backpressure streak cleared"
-                                );
-                            }
-                        } else {
-                            // R1: delivery failed (eventfd write error / channel
-                            // full) — restore the waiter so a later frame retries
-                            // and RAF is not frozen.
-                            raf_demand.restore_waiter(ticket);
-                            debug_stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                            let streak = debug_stats
-                                .raf_drop_streak
-                                .fetch_add(1, Ordering::Relaxed)
-                                + 1;
-                            if streak == RAF_BACKPRESSURE_STREAK_THRESHOLD {
-                                debug_stats
-                                    .raf_backpressure_events
-                                    .fetch_add(1, Ordering::Relaxed);
-                                events.emit(RenderEvent::RafBackpressure {
-                                    consecutive_drops: streak,
-                                });
-                                info!(
-                                    consecutive_drops = streak,
-                                    threshold = RAF_BACKPRESSURE_STREAK_THRESHOLD,
-                                    "RAF backpressure threshold crossed"
-                                );
-                            }
-                        }
-                    }
+                    // RAF was already signalled before the drain (see `signal_raf`),
+                    // so JS is producing the next frame in parallel with this swap.
 
                     // R-3: robustness poll — if the driver flagged a
                     // GL reset between frames, short-circuit the
@@ -2084,17 +2078,25 @@ impl RenderThread {
                 // own requested/callbackPosted latch is the authoritative dedup. A
                 // no-op on the software-ticker path (`has_vsync` false / no closure).
                 let arm_if_needed =
-                    |paused: bool,
+                    |warm: bool,
+                     paused: bool,
                      dirty: bool,
                      recovery_pending: bool,
                      cm: &CanvasManager,
                      surface_system: &SurfaceSystem| {
-                        let demand = crate::frame_scheduler::raf_demand_remains(
-                            raf_demand.is_waiting(),
-                            dirty,
-                            cm.has_outstanding_upload_work(),
-                            recovery_pending,
-                        );
+                        // `warm`: an actively-animating loop this frame. Keep the
+                        // vsync clock armed continuously (rather than re-deriving
+                        // demand from `is_waiting()`, which the free-run signal has
+                        // just consumed) so vsyncs stay at display rate; the warm
+                        // window drains to false a few frames after JS goes idle,
+                        // then the clock stops.
+                        let demand = warm
+                            || crate::frame_scheduler::raf_demand_remains(
+                                raf_demand.is_waiting(),
+                                dirty,
+                                cm.has_outstanding_upload_work(),
+                                recovery_pending,
+                            );
                         if crate::frame_scheduler::should_arm_one_shot(
                             has_vsync,
                             request_vsync.is_some(),
@@ -2109,6 +2111,14 @@ impl RenderThread {
                             vsync_armed.set(true);
                         }
                     };
+
+                // Free-run warm window: number of scheduled vsyncs to keep
+                // signalling RAF and arming the clock after the last frame in
+                // which JS was observed awaiting. Non-zero == "animating". A
+                // consumed waiter refills it; it decays to 0 a few frames after JS
+                // stops requesting, which stops the clock (idle power preserved).
+                const RAF_WARM_FRAMES: u8 = 3;
+                let mut warm_frames: u8 = 0;
 
                 loop {
                     // Shutdown has an out-of-band level because the bounded
@@ -2186,7 +2196,20 @@ impl RenderThread {
                             let ts = start_time.elapsed().as_secs_f64() * 1000.0;
                             render_server.set_raf_time_ms(ts);
 
-                            // 1) Drain all pending commands from the previous frame.
+                            // 1) Signal RAF first (free-run), unconditionally while
+                            // animating, so JS produces the next frame in parallel
+                            // with this drain+swap and never blocks between frames.
+                            let has_waiter = raf_demand.take_waiter().is_some();
+                            if has_waiter {
+                                warm_frames = RAF_WARM_FRAMES;
+                            } else if warm_frames > 0 {
+                                warm_frames -= 1;
+                            }
+                            if has_waiter || warm_frames > 0 {
+                                let _ = signal_raf(paused, ts);
+                            }
+
+                            // 2) Drain all pending commands from the previous frame.
                             match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, &mut surface_system, &mut render_server) {
                                 LoopCtl::Continue => {}
                                 LoopCtl::Shutdown => {
@@ -2195,7 +2218,7 @@ impl RenderThread {
                                 }
                             }
 
-                            // 2) Present frame and signal RAF.
+                            // 3) Present (swap) the drained frame.
                             // If a surfaceDestroyed has occurred since our current
                             // surface was handed off (live epoch moved past it),
                             // stop presenting to it now — before Java returns and
@@ -2205,9 +2228,9 @@ impl RenderThread {
                                 surface_system.on_surface_destroyed();
                             }
                             present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, surface_system.can_present(), ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
-                            // R1: no-op on the software-ticker path (has_vsync
-                            // false); kept for symmetry with the vsync branch.
-                            arm_if_needed(paused, dirty, needs_context_recovery, &cm, &surface_system);
+                            // No-op on the software-ticker path (has_vsync false);
+                            // kept for symmetry with the vsync branch.
+                            arm_if_needed(false, paused, dirty, needs_context_recovery, &cm, &surface_system);
                         }
 
                         recv(vsync) -> _msg => {
@@ -2245,19 +2268,38 @@ impl RenderThread {
                                 // so resp oneshots from prior ticks
                                 // don't sit idle either.
                                 let _ = cm.drain_upload_completed();
-                                // R1: a scheduler-skipped physical vsync still has
-                                // pending demand (e.g. a RAF waiter awaiting the
-                                // next target-FPS deadline on a 90/120Hz panel, or
+                                // A scheduler-skipped physical vsync still has
+                                // pending demand (a RAF waiter awaiting the next
+                                // target-FPS deadline on a 90/120Hz panel, or
                                 // outstanding upload work) — re-arm so we keep
-                                // receiving physical vsyncs until the native
-                                // deadline is reached, then present at target FPS.
-                                arm_if_needed(paused, dirty, needs_context_recovery, &cm, &surface_system);
+                                // receiving physical vsyncs until the deadline.
+                                arm_if_needed(warm_frames > 0, paused, dirty, needs_context_recovery, &cm, &surface_system);
                                 continue;
                             }
 
                             render_server.set_raf_time_ms(decision.raf_time_ms);
 
-                            // 1) Drain all pending commands.
+                            // 1) Signal RAF FIRST, and unconditionally while
+                            // animating (free-run). A consumed waiter marks JS as
+                            // actively animating and refills the warm window; while
+                            // warm we keep signalling even on frames where JS has
+                            // not yet re-published demand, so its `recv` finds a
+                            // primed signal and never blocks — keeping the compute
+                            // thread busy (high clock). The warm window decays a few
+                            // frames after JS stops, then the clock idles.
+                            let has_waiter = raf_demand.take_waiter().is_some();
+                            if has_waiter {
+                                warm_frames = RAF_WARM_FRAMES;
+                            } else if warm_frames > 0 {
+                                warm_frames -= 1;
+                            }
+                            let animating = has_waiter || warm_frames > 0;
+                            if animating {
+                                let _ = signal_raf(paused, decision.raf_time_ms);
+                            }
+
+                            // 2) Drain all pending commands (in parallel with JS
+                            // producing the next frame, which the signal above woke).
                             match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, &mut surface_system, &mut render_server) {
                                 LoopCtl::Continue => {}
                                 LoopCtl::Shutdown => {
@@ -2266,16 +2308,16 @@ impl RenderThread {
                                 }
                             }
 
-                            // 2) Present frame and signal RAF.
+                            // 3) Present (swap) the drained frame.
                             if destroy_epoch.load(std::sync::atomic::Ordering::Acquire) != valid_epoch.get() {
                                 surface_system.on_surface_destroyed();
                             }
                             let should_present = decision.should_signal_raf && surface_system.can_present();
                             present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, should_present, decision.raf_time_ms, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
-                            // R1: re-arm iff demand remains after this frame
-                            // (continuous RAF, still-dirty content, or outstanding
-                            // upload work); otherwise the clock stops.
-                            arm_if_needed(paused, dirty, needs_context_recovery, &cm, &surface_system);
+                            // Keep the vsync clock at display rate while animating;
+                            // otherwise re-arm only on residual demand (dirty /
+                            // upload), else the clock stops.
+                            arm_if_needed(animating, paused, dirty, needs_context_recovery, &cm, &surface_system);
                         }
 
                         recv(cmd_rx) -> msg => {
@@ -2323,7 +2365,7 @@ impl RenderThread {
                                     // (dirty onscreen content, or a LoadImage that
                                     // is now in-flight) — arm one frame to present
                                     // / poll the fence. Idle commands don't arm.
-                                    arm_if_needed(paused, dirty, needs_context_recovery, &cm, &surface_system);
+                                    arm_if_needed(false, paused, dirty, needs_context_recovery, &cm, &surface_system);
                                 }
                                 Err(_) => {
                                     info!("Command channel closed, exiting RenderThread");

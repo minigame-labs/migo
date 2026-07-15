@@ -253,6 +253,9 @@ impl Host {
 
         // ---- R1 RAF demand latch (host op <-> render thread) ----
         let raf_demand = Arc::new(shared::raf_signal::RafDemand::new());
+        // Allocate the first session ticket up front so pre-signals (free-run
+        // RAF) have a stable ticket to match from the very first frame.
+        raf_demand.begin_session();
 
         // ---- VSync channel (Choreographer JNI → render thread) ----
         // Only platforms that actually publish external timestamps get this
@@ -1208,6 +1211,11 @@ impl Host {
         // Pause subsystems to ensure a clean restart
         self.render.pause();
         self.audio.pause();
+
+        // Bump the RAF session ticket so the fresh isolate ignores any signal
+        // (stale timestamp) produced for the old one on the shared eventfd, and
+        // the old isolate's in-flight `recv` never matches the new session.
+        self.raf_demand.begin_session();
 
         // Recreate JS runtime with fresh state
         let (files_dir, cache_dir) = self.js.get_base_dirs();

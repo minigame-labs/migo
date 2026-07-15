@@ -1,9 +1,0 @@
-{
-  "arch": "x86_64",
-  "snapshot_size": 1927910,
-  "snapshot_sha256": "29986bcbc91f1ad694be6cc6bb1f6a6eae06acee16f672eb8186895b839be303",
-  "js_sources_sha256": "b888d6ced3b651fb46e5ee82be0532e2ddc8488f81e89d568ec36931d3274d0d",
-  "deno_core_version": "0.385.0",
-  "git_commit": "5cb4385",
-  "generated_at": "2026-07-03T17:51:13Z"
-}

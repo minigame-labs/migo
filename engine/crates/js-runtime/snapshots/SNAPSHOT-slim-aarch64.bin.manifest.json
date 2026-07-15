@@ -1,0 +1,16 @@
+{
+  "schema_version": 3,
+  "snapshot_kind": "host",
+  "profile": "slim",
+  "arch": "aarch64",
+  "features": ["code-signing","profile-slim","v8-limits"],
+  "features_sha256": "2cdc398a325c8559e9c623222b8dccdf72b12a7119b680c6f6f9883eff0cfb94",
+  "rust_sources_sha256": "6d3f9d01feb0f18bce717be4d593440bc929257c3c126d7af7da4ee2385a611c",
+  "v8_archive_sha256": "681aaa39367a9aa35ab7e584ddd4b36273acbc0ccb4177648c43b9b55b7eb273",
+  "snapshot_size": 1400847,
+  "snapshot_sha256": "218e65cf2f199f371234b4a77f5ca8f7c10c60f2030158bdf229f593bb28c9a6",
+  "js_sources_sha256": "a65914e30060c4f5c69a6082db415630e5d5eb70c369e395e916584a04065828",
+  "deno_core_version": "0.385.0",
+  "git_commit": "d5dbbcb",
+  "generated_at": "2026-07-15T07:17:39Z"
+}
