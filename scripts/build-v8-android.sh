@@ -7,6 +7,7 @@
 # libcxx / jumbo build),但 GN_ARGS 完全可控并追加体积优化。
 #
 # 产出:engine/third_party/rusty_v8/<arch>/librusty_v8.a + src_binding.rs
+#      + component-manifest.json (verified source/toolchain/GN provenance)
 #       (覆盖现有预编译 archive)
 #
 # 前置:
@@ -30,6 +31,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_ROOT="$PROJECT_ROOT/engine"
 PATCH_DIR="$ENGINE_ROOT/third_party/v8-patches"
 V8_OUT_DIR="$ENGINE_ROOT/third_party/rusty_v8"
+V8_COMPONENT_WRITER="$SCRIPT_DIR/write-v8-component-manifest.py"
+V8_BUILD_LOCK="$PROJECT_ROOT/contracts/artifact-manifest/android-v8.lock.json"
 
 RUSTY_V8_SRC="${RUSTY_V8_SRC:-/home/wkspace/rusty_v8_src}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Ndk}"
@@ -68,6 +71,9 @@ esac
 [[ -f "$RUSTY_V8_SRC/build.rs" ]] || { err "not a rusty_v8 tree (no build.rs): $RUSTY_V8_SRC"; exit 1; }
 [[ -d "$ANDROID_NDK_HOME" ]]   || { err "ANDROID_NDK_HOME not found: $ANDROID_NDK_HOME"; exit 1; }
 [[ -d "$PATCH_DIR" ]]          || { err "patch dir not found: $PATCH_DIR"; exit 1; }
+[[ -f "$V8_COMPONENT_WRITER" ]] || { err "component writer not found: $V8_COMPONENT_WRITER"; exit 1; }
+[[ -f "$V8_BUILD_LOCK" ]]       || { err "V8 source lock not found: $V8_BUILD_LOCK"; exit 1; }
+[[ "$ANDROID_API" == "26" ]]    || { err "verified Android V8 builds require ANDROID_API=26"; exit 1; }
 
 # submodule completeness
 if [[ ! -f "$RUSTY_V8_SRC/v8/include/v8-version.h" ]]; then
@@ -111,7 +117,8 @@ apply_patches() {
     for spec in "${specs[@]}"; do
         local tgt="${spec%%|*}"; local rest="${spec#*|}"
         local sentinel="${rest%%|*}"; local glob="${rest##*|}"
-        local pf; pf="$(ls "$PATCH_DIR"/$glob 2>/dev/null | head -1)"
+        local -a matches=("$PATCH_DIR"/$glob)
+        local pf="${matches[0]}"
         [[ -f "$pf" ]] || { err "missing patch: $glob"; exit 1; }
         if grep -qF "$sentinel" "$RUSTY_V8_SRC/$tgt" 2>/dev/null; then
             echo "  = already in effect: $(basename "$pf")"
@@ -161,7 +168,9 @@ fi
 #     - i18n: DISABLED  (no game uses Intl; drops V8-side ICU)
 #     - is_official_build: ENABLED unless --reproduce (the main new win)
 # ------------------------------------------------------------
-NDK_VER="$(grep -E '^Pkg.Revision' "$ANDROID_NDK_HOME/source.properties" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+NDK_VER="$(awk -F= '/^Pkg\.Revision/{gsub(/[[:space:]]/, "", $2); split($2, parts, "."); print parts[1]; exit}' \
+    "$ANDROID_NDK_HOME/source.properties" 2>/dev/null || true)"
+[[ -n "$NDK_VER" ]] || { err "cannot read NDK major revision from source.properties"; exit 1; }
 
 GN_ARGS="android_ndk_api_level=$ANDROID_API"
 GN_ARGS+=" android_ndk_root=\"$ANDROID_NDK_HOME\""
@@ -238,7 +247,7 @@ GN_BIN="${V8_GN_PATH:-}"
 
 if [[ -n "$GN_BIN" && -x "$GN_BIN" ]]; then
     export GN="$GN_BIN"
-    info "using gn: $GN ($("$GN" --version 2>/dev/null | head -1))"
+    info "using gn: $GN ($("$GN" --version 2>/dev/null))"
 else
     err "no gn binary available and chrome-infra download is blocked."
     err "install gn, or set V8_GN_PATH=/path/to/gn"
@@ -294,7 +303,7 @@ rustup target add "$TARGET" >/dev/null 2>&1 || true
 info "starting cargo build (first run downloads gn/sysroot/android_platform, slow)"
 pushd "$RUSTY_V8_SRC" >/dev/null
 
-BUILD_LOG="$RUSTY_V8_SRC/.migo_build_${ARCH}.log"
+BUILD_LOG="${TMPDIR:-/tmp}/migo-v8-build-${ARCH}.$$.log"
 set +e
 cargo build --release --target "$TARGET" -vv 2>&1 | tee "$BUILD_LOG" | \
     grep --line-buffered -iE "error|warning: |Compiling v8|Finished|gn gen|ninja|downloading|cloning" | tail -100
@@ -313,8 +322,8 @@ fi
 # Locate + copy artifacts
 # ------------------------------------------------------------
 GN_OUT="$RUSTY_V8_SRC/target/$TARGET/release/gn_out/obj/librusty_v8.a"
-[[ -f "$GN_OUT" ]] || GN_OUT="$(find "$RUSTY_V8_SRC/target/$TARGET/release" -name 'librusty_v8.a' 2>/dev/null | head -1)"
-BINDING="$(find "$RUSTY_V8_SRC/target/$TARGET/release" -name 'src_binding*.rs' 2>/dev/null | head -1)"
+[[ -f "$GN_OUT" ]] || GN_OUT="$(find "$RUSTY_V8_SRC/target/$TARGET/release" -name 'librusty_v8.a' -print -quit 2>/dev/null)"
+BINDING="$(find "$RUSTY_V8_SRC/target/$TARGET/release" -name 'src_binding*.rs' -print -quit 2>/dev/null)"
 
 [[ -f "$GN_OUT" ]] || { err "librusty_v8.a not found after build"; exit 1; }
 
@@ -328,10 +337,21 @@ fi
 
 cp "$GN_OUT" "$DEST/librusty_v8.a"
 ok "archive -> $DEST/librusty_v8.a ($(ls -lh "$DEST/librusty_v8.a" | awk '{print $5}'))"
-if [[ -n "$BINDING" && -f "$BINDING" ]]; then
-    cp "$BINDING" "$DEST/src_binding.rs"
-    ok "binding -> $DEST/src_binding.rs"
-fi
+[[ -n "$BINDING" && -f "$BINDING" ]] || { err "src_binding.rs not found after build"; exit 1; }
+cp "$BINDING" "$DEST/src_binding.rs"
+ok "binding -> $DEST/src_binding.rs"
+
+python3 "$V8_COMPONENT_WRITER" \
+    --repo-root "$PROJECT_ROOT" \
+    --rusty-v8-src "$RUSTY_V8_SRC" \
+    --ndk-home "$ANDROID_NDK_HOME" \
+    --arch "$ARCH" \
+    --extra-gn-args "$EXTRA_GN_ARGS" \
+    --archive "$DEST/librusty_v8.a" \
+    --binding "$DEST/src_binding.rs" \
+    --output "$DEST/component-manifest.json" \
+    --lock "$V8_BUILD_LOCK"
+ok "component manifest -> $DEST/component-manifest.json"
 
 ok "V8 build complete for $ARCH (reproduce=$REPRODUCE)"
 echo "next: rebuild libmigo.so via scripts/build-android-so.sh $([ "$ARCH" = aarch64 ] && echo arm64-v8a || echo x86_64)"

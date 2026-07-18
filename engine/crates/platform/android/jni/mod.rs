@@ -9,6 +9,7 @@ mod safe;
 mod utils;
 
 pub use env::{init_jni_env, with_env};
+pub use inbound::on_load;
 pub use outbound::*;
 
 pub(crate) use inbound::*;

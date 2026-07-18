@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, info, warn};
 
+use crate::egl_platform::{EglInstance, EglProvider, GraphicsBackendId};
+use shared::error::{EngineError, EngineResult, ErrorCode};
+
 /// A single upload that completed on the upload thread but whose result
 /// could not be delivered to the render thread (channel full or disconnected).
 /// Sent per-item through a dedicated channel so CanvasManager can recover
@@ -107,6 +110,7 @@ impl UploadThreadHandle {
     /// * `config` — EGL config used by the render context
     /// * `share_ctx` — the render thread's EGL context to share with
     pub fn try_spawn(
+        egl_provider: Arc<dyn EglProvider>,
         egl: &khronos_egl::DynamicInstance<khronos_egl::EGL1_4>,
         display: khronos_egl::Display,
         config: khronos_egl::Config,
@@ -165,7 +169,7 @@ impl UploadThreadHandle {
 
         // We need raw pointers to pass to the thread because EGL types are
         // not Send.  The upload thread will reconstruct EGL/GL wrappers.
-        let egl_lib_path = "libEGL.so";
+        let expected_backend = egl_provider.backend_id();
         let display_raw = display.as_ptr() as usize;
         let ctx_raw = shared_ctx.as_ptr() as usize;
         let pbuf_raw = pbuf.as_ptr() as usize;
@@ -177,7 +181,8 @@ impl UploadThreadHandle {
                     shared::thread_priority::Priority::Default,
                 );
                 upload_thread_main(
-                    egl_lib_path,
+                    egl_provider,
+                    expected_backend,
                     display_raw,
                     ctx_raw,
                     pbuf_raw,
@@ -243,7 +248,8 @@ impl UploadThreadHandle {
 // ---------------------------------------------------------------------------
 
 fn upload_thread_main(
-    _egl_lib_path: &str,
+    egl_provider: Arc<dyn EglProvider>,
+    expected_backend: GraphicsBackendId,
     display_raw: usize,
     ctx_raw: usize,
     pbuf_raw: usize,
@@ -252,12 +258,15 @@ fn upload_thread_main(
     failures: Arc<AtomicU32>,
     dropped_tx: Sender<DroppedUpload>,
 ) {
-    // Reconstruct EGL instance on this thread.
-    let egl = match unsafe { khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required() }
-    {
+    // Load through the exact provider selected and validated for the render
+    // thread before reconstructing any raw EGL handles.
+    let egl = match load_upload_egl(egl_provider.as_ref(), expected_backend) {
         Ok(e) => e,
         Err(e) => {
-            warn!("Upload thread: failed to load EGL: {e:?}");
+            warn!(
+                provider = egl_provider.label(),
+                "Upload thread: failed to load EGL: {e}"
+            );
             return;
         }
     };
@@ -360,6 +369,22 @@ fn upload_thread_main(
     egl.destroy_context(display, ctx).ok();
     egl.destroy_surface(display, pbuf).ok();
     info!("Upload thread: exited");
+}
+
+fn load_upload_egl(
+    provider: &dyn EglProvider,
+    expected_backend: GraphicsBackendId,
+) -> EngineResult<EglInstance> {
+    if provider.backend_id() != expected_backend {
+        return Err(EngineError::new(ErrorCode::InvalidOperation)
+            .with_msg("upload EGL provider identity changed")
+            .with_detail(format!(
+                "expected={expected_backend:?}, actual={:?}, provider={}",
+                provider.backend_id(),
+                provider.label()
+            )));
+    }
+    provider.load()
 }
 
 /// Ring-buffer of PBOs kept live on the upload thread so that each
@@ -541,6 +566,43 @@ fn do_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct InjectedFailureProvider {
+        loads: Arc<AtomicU32>,
+    }
+
+    impl EglProvider for InjectedFailureProvider {
+        fn backend_id(&self) -> GraphicsBackendId {
+            GraphicsBackendId::of::<Self>()
+        }
+
+        fn label(&self) -> &str {
+            "upload-sentinel-egl"
+        }
+
+        fn load(&self) -> EngineResult<EglInstance> {
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            Err(EngineError::new(ErrorCode::RenderInitializeError)
+                .with_msg("upload sentinel provider load failure"))
+        }
+
+        fn display(&self, _egl: &EglInstance) -> EngineResult<khronos_egl::Display> {
+            panic!("upload worker must only load before reconstructing raw handles")
+        }
+    }
+
+    #[test]
+    fn injected_egl_provider_is_the_only_upload_worker_loader() {
+        let loads = Arc::new(AtomicU32::new(0));
+        let provider = InjectedFailureProvider {
+            loads: Arc::clone(&loads),
+        };
+
+        let error = load_upload_egl(&provider, provider.backend_id()).unwrap_err();
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert_eq!(error.msg, "upload sentinel provider load failure");
+    }
 
     /// Verifies that the dropped upload channel delivers consistent per-item
     /// data — no torn reads, no lost image_ids, no byte_len mismatch.

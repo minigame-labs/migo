@@ -20,7 +20,7 @@ fn parse_sub_packages(json: Option<String>) -> Vec<(String, String)> {
         name: String,
         root: String,
     }
-    deno_core::serde_json::from_str::<Vec<Entry>>(&json)
+    serde_json::from_str::<Vec<Entry>>(&json)
         .map(|v| v.into_iter().map(|e| (e.name, e.root)).collect())
         .unwrap_or_default()
 }
@@ -44,7 +44,7 @@ fn parse_prelude_scripts(json: Option<String>) -> Vec<(String, String)> {
         name: String,
         source: String,
     }
-    match deno_core::serde_json::from_str::<Vec<Entry>>(&json) {
+    match serde_json::from_str::<Vec<Entry>>(&json) {
         Ok(v) => v.into_iter().map(|e| (e.name, e.source)).collect(),
         Err(e) => {
             tracing::warn!("invalid preludeScriptsJson, ignoring: {}", e);
@@ -122,7 +122,7 @@ use jni::{JNIEnv, JavaVM};
 use tracing::{error, info};
 
 use core::{
-    bump_destroy_epoch, current_destroy_epoch, send_command_to_host, send_critical_command_to_host,
+    lease_surface, retire_surface, send_command_to_host, send_critical_command_to_host,
     shutdown_host, spawn_host_thread,
 };
 use shared::protocol::camera_frame::{PlaneWindow, pack_yuv_planes};
@@ -142,8 +142,14 @@ use crate::android::surface::{
     ANativeWindow_release, ANativeWindow_setBuffersGeometry, AndroidSurfaceWrapper,
 };
 
-#[unsafe(no_mangle)]
-pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
+/// Body of the Android `JNI_OnLoad` entry point.
+///
+/// The exported `JNI_OnLoad` symbol itself lives in the `android-jni` cdylib
+/// crate, which exists only to be `libmigo.so`. Keeping the logic here — and
+/// the one exported symbol there — is what lets `platform` stay an rlib, so
+/// host targets can build and test it (a cdylib cannot link the
+/// executable-TLS Linux V8; see CLAUDE.md §10).
+pub fn on_load(vm: JavaVM) -> jint {
     // Initialize logging/tracing once.
     logging::init_logging();
 
@@ -272,7 +278,7 @@ pub(crate) extern "system" fn init(
         // releases it. Previously each error path between here and host spawn
         // leaked the ref.
         let android_surface =
-            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h, 0) } {
+            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) } {
                 Ok(s) => s,
                 Err(e) => {
                     error!("init failed: create AndroidSurfaceWrapper error: {}", e);
@@ -394,12 +400,19 @@ pub(crate) extern "system" fn init(
         );
 
         let platform = Arc::new(AndroidPlatform::new());
+        let graphics_platform = match crate::android::presenter::android_graphics_platform() {
+            Ok(platform) => platform,
+            Err(error) => {
+                error!("Android graphics platform initialization failed: {error}");
+                return -1;
+            }
+        };
 
         // `android_surface` already owns the ANativeWindow ref (wrapped above so
         // early returns release it); hand it to the host.
         let surface_ref: SurfaceRef = Arc::new(android_surface);
 
-        let host_id = spawn_host_thread(surface_ref, platform, init_options);
+        let host_id = spawn_host_thread(surface_ref, graphics_platform, platform, init_options);
         match host_id {
             Ok(id) => id,
             Err(e) => {
@@ -473,12 +486,8 @@ pub(crate) extern "system" fn updateSurface<'local>(
             );
         }
 
-        // Stamp the surface with the current destroy-epoch so the render thread
-        // can tell, after it recreates, whether a newer destroy has since raced.
-        let surface_epoch = current_destroy_epoch(host_id);
         let android_surface =
-            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h, surface_epoch) }
-            {
+            match unsafe { AndroidSurfaceWrapper::from_surface_owned(window, w, h) } {
                 Ok(s) => s,
                 Err(e) => {
                     error!(
@@ -490,18 +499,21 @@ pub(crate) extern "system" fn updateSurface<'local>(
             };
 
         let surface_ref: SurfaceRef = Arc::new(android_surface);
+        let lease = match lease_surface(host_id, surface_ref) {
+            Ok(lease) => lease,
+            Err(e) => {
+                // `lease_surface` consumes and drops the candidate SurfaceRef on
+                // every failure, releasing the ANativeWindow strong reference.
+                error!("Failed to lease Surface for host {host_id}: {e}");
+                return;
+            }
+        };
 
-        // NOTE: the render thread adopts this surface's epoch as its valid_epoch
-        // recreates the onscreen surface (see render_thread.rs), never here.
-        // Setting it true from JNI before the recreate ran would let the render
-        // thread read `true` against the stale/abandoned surface (destroy->create
-        // ABA on the boolean).
-        if let Err(e) = send_critical_command_to_host(
-            host_id,
-            HostCommand::UpdateSurface {
-                surface: surface_ref,
-            },
-        ) {
+        // The generation gate is the queue-independent liveness authority. The
+        // render thread validates the lease before native-handle extraction and
+        // commits it only after EGL recreation succeeds.
+        if let Err(e) = send_critical_command_to_host(host_id, HostCommand::UpdateSurface { lease })
+        {
             error!("Failed to send UpdateSurface for host {host_id}: {e}");
         }
 
@@ -511,13 +523,24 @@ pub(crate) extern "system" fn updateSurface<'local>(
 
 pub(crate) extern "system" fn onSurfaceDestroyed(_env: JNIEnv, _class: JClass, host_id: jint) {
     jni_safe!("onSurfaceDestroyed", {
-        // Advance the destroy-epoch BEFORE this callback returns (Android
-        // abandons the BufferQueue on return). The render thread compares each
-        // frame and stops presenting to the now-stale surface synchronously and
-        // independent of the (async, lossy) SurfaceDestroyed command below.
-        bump_destroy_epoch(host_id);
-        if let Err(e) = send_critical_command_to_host(host_id, HostCommand::SurfaceDestroyed) {
-            error!("Failed to send SurfaceDestroyed for host {host_id}: {e}");
+        // Retire the exact generation BEFORE this callback returns (Android
+        // abandons the BufferQueue on return). Duplicate destroy callbacks are
+        // idempotent and emit no command.
+        match retire_surface(host_id) {
+            Ok(Some(generation)) => {
+                if let Err(e) = send_critical_command_to_host(
+                    host_id,
+                    HostCommand::SurfaceDestroyed { generation },
+                ) {
+                    error!("Failed to send SurfaceDestroyed for host {host_id}: {e}");
+                }
+            }
+            Ok(None) => {
+                tracing::debug!("Host {host_id} Surface already retired");
+            }
+            Err(e) => {
+                error!("Failed to retire Surface for host {host_id}: {e}");
+            }
         }
     });
 }

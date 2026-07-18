@@ -1,8 +1,6 @@
 use std::{cell::RefCell, future::Future, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 
-use deno_core::{
-    Extension, JsRuntime, ModuleLoader, PollEventLoopOptions, RuntimeOptions, resolve_path, v8,
-};
+use deno_core::{JsRuntime, ModuleLoader, PollEventLoopOptions, RuntimeOptions, resolve_path, v8};
 
 use shared::{
     error::{EngineError, EngineResult, ErrorCode},
@@ -97,20 +95,31 @@ impl HostJsRuntime {
     /// Create a fully initialized JS runtime + bindings cache.
     ///
     /// - `host_state` will be consumed by js-runtime extensions
-    /// - `extra_extensions` is for platform-specific extensions (Android, etc.)
-    /// - `module_loader` is supplied by core (e.g., MyModuleLoader(FsModuleLoader))
+    /// - `cache_dir` is where the V8 code cache persists compiled bytecode;
+    ///   the module loader and code cache are assembled internally
     /// - `v8_limits` configures heap limits when `v8-limits` feature is enabled
     pub fn new(
         host_id: i32,
         host_state: HostOpState,
-        extra_extensions: Vec<Extension>,
-        module_loader: Option<Rc<dyn ModuleLoader>>,
-        extension_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>>,
-        loader_mount_ref: SharedMountTableRef,
+        cache_dir: &std::path::Path,
         #[cfg(feature = "v8-limits")] v8_limits: V8LimitsConfig,
         #[cfg(feature = "code-signing")] code_signing_enabled: bool,
         #[cfg(feature = "code-signing")] code_signing_pubkey: Option<&str>,
     ) -> Self {
+        // Backend-owned module loader + V8 code cache assembly. Moved out of
+        // core (Phase B) so the orchestration layer never names deno_core. The
+        // disk code cache is shared between the module loader and the V8
+        // extension code cache; the mount ref is populated later by
+        // evaluate_module.
+        let shared_cache = crate::code_cache::create_code_cache(cache_dir);
+        let loader_mount_ref: SharedMountTableRef = Rc::new(RefCell::new(None));
+        let module_loader: Option<Rc<dyn ModuleLoader>> =
+            Some(Rc::new(crate::loader::MyModuleLoader::new(
+                Some(shared_cache.clone()),
+                loader_mount_ref.clone(),
+            )));
+        let extension_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>> =
+            Some(crate::code_cache::ExtCodeCacheAdapter::new(shared_cache));
         // V8 startup snapshot support.
         //
         // When a snapshot is available, we use lazy_extensions() to create
@@ -131,15 +140,9 @@ impl HostJsRuntime {
                 snapshot_bytes.map(|b| b.len()).unwrap_or(0)
             );
             crate::snapshot::lazy_extensions()
-                .into_iter()
-                .chain(extra_extensions)
-                .collect::<Vec<_>>()
         } else {
             tracing::info!("[Host {}] no snapshot, loading JS from source", host_id);
             main_extensions(host_state.clone())
-                .into_iter()
-                .chain(extra_extensions)
-                .collect::<Vec<_>>()
         };
         let t_exts = Instant::now();
         tracing::info!(
@@ -929,6 +932,13 @@ impl HostJsRuntime {
             t_eval.elapsed().as_secs_f64() * 1000.0,
         );
         Ok(())
+    }
+
+    /// Backend-neutral event-loop pump. Wraps `run_event_loop` with default
+    /// poll options so non-V8 callers (the core host thread) never name
+    /// `PollEventLoopOptions`.
+    pub async fn pump_event_loop(&mut self) -> EngineResult<()> {
+        self.run_event_loop(PollEventLoopOptions::default()).await
     }
 
     /// Run one drive of the event loop (used by host thread main loop).

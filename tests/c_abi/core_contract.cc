@@ -1,0 +1,88 @@
+#include <migo/migo.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+#define MIGO_CHECK_CXX_RECORD(TYPE)                                            \
+    static_assert(std::is_standard_layout<TYPE>::value, #TYPE " standard layout"); \
+    static_assert(std::is_trivially_copyable<TYPE>::value,                    \
+                  #TYPE " trivially copyable");                              \
+    static_assert(offsetof(TYPE, struct_size) == 0, #TYPE " size prefix");   \
+    static_assert(offsetof(TYPE, abi_version) == 4, #TYPE " ABI prefix")
+
+static_assert(MIGO_C_ABI_CANDIDATE == 1, "candidate marker");
+static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "compile-only candidate");
+static_assert(sizeof(MigoResult) == 4, "fixed-width result");
+
+MIGO_CHECK_CXX_RECORD(MigoError);
+MIGO_CHECK_CXX_RECORD(MigoEngineConfig);
+MIGO_CHECK_CXX_RECORD(MigoSessionConfig);
+MIGO_CHECK_CXX_RECORD(MigoPlatformSurfaceDescriptor);
+MIGO_CHECK_CXX_RECORD(MigoSurfaceMetrics);
+MIGO_CHECK_CXX_RECORD(MigoSurfaceDescriptor);
+MIGO_CHECK_CXX_RECORD(MigoHostCallbacks);
+
+using AttachFn = MigoResult(MIGO_CALL *)(MigoSession *,
+                                         const MigoSurfaceDescriptor *,
+                                         MigoSurfaceAttachment **);
+using UpdateFn = MigoResult(MIGO_CALL *)(MigoSurfaceAttachment *,
+                                         const MigoSurfaceMetrics *);
+using DetachFn = MigoResult(MIGO_CALL *)(MigoSurfaceAttachment *);
+using EngineCreateFn = MigoResult(MIGO_CALL *)(const MigoEngineConfig *,
+                                               MigoEngine **);
+using EngineDestroyFn = MigoResult(MIGO_CALL *)(MigoEngine *);
+using SessionCreateFn = MigoResult(MIGO_CALL *)(MigoEngine *,
+                                                const MigoSessionConfig *,
+                                                MigoSession **);
+using SetCallbacksFn = MigoResult(MIGO_CALL *)(MigoSession *,
+                                               const MigoHostCallbacks *);
+using SetLifecycleFn = MigoResult(MIGO_CALL *)(MigoSession *, MigoLifecycleState);
+using SetVisibilityFn = MigoResult(MIGO_CALL *)(MigoSession *, std::uint8_t);
+using SetFocusFn = MigoResult(MIGO_CALL *)(MigoSession *, std::uint8_t);
+using SessionDestroyFn = MigoResult(MIGO_CALL *)(MigoSession *);
+
+static_assert(std::is_same<decltype(&migo_session_attach_surface), AttachFn>::value,
+              "attach declaration");
+static_assert(std::is_same<decltype(&migo_surface_update), UpdateFn>::value,
+              "update declaration");
+static_assert(std::is_same<decltype(&migo_surface_detach), DetachFn>::value,
+              "detach declaration");
+static_assert(std::is_same<decltype(&migo_engine_create), EngineCreateFn>::value,
+              "engine create declaration");
+static_assert(std::is_same<decltype(&migo_engine_destroy), EngineDestroyFn>::value,
+              "engine destroy declaration");
+static_assert(std::is_same<decltype(&migo_session_create), SessionCreateFn>::value,
+              "session create declaration");
+static_assert(
+    std::is_same<decltype(&migo_session_set_host_callbacks), SetCallbacksFn>::value,
+    "callback declaration");
+static_assert(
+    std::is_same<decltype(&migo_session_set_lifecycle), SetLifecycleFn>::value,
+    "lifecycle declaration");
+static_assert(
+    std::is_same<decltype(&migo_session_set_visibility), SetVisibilityFn>::value,
+    "visibility declaration");
+static_assert(std::is_same<decltype(&migo_session_set_focus), SetFocusFn>::value,
+              "focus declaration");
+static_assert(std::is_same<decltype(&migo_session_destroy), SessionDestroyFn>::value,
+              "session destroy declaration");
+
+int migo_core_cpp_contract() {
+    MigoEngineConfig engine_config{};
+    MigoSessionConfig session_config{};
+    MigoSurfaceDescriptor surface{};
+    MigoHostCallbacks callbacks{};
+
+    engine_config.struct_size = static_cast<std::uint32_t>(sizeof(engine_config));
+    engine_config.abi_version = MIGO_ABI_VERSION_1;
+    session_config.struct_size = static_cast<std::uint32_t>(sizeof(session_config));
+    session_config.abi_version = MIGO_ABI_VERSION_1;
+    surface.struct_size = static_cast<std::uint32_t>(sizeof(surface));
+    surface.abi_version = MIGO_ABI_VERSION_1;
+    callbacks.struct_size = static_cast<std::uint32_t>(sizeof(callbacks));
+    callbacks.abi_version = MIGO_ABI_VERSION_1;
+
+    return static_cast<int>(engine_config.struct_size + session_config.struct_size +
+                            surface.struct_size + callbacks.struct_size);
+}

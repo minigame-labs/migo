@@ -30,9 +30,13 @@ use crate::{
     damage_effect::DamageEffect,
     dirty_region,
     frame_scheduler::FrameScheduler,
-    onscreen_window_from_surface,
     render_frame_state::{DEFERRED_CLEANUP_UNUSED_AGE, DeferredCleanupCadence},
     render_server::RenderServer,
+    surface_binding::{
+        CandidateCleanup, InstallPhase, PresentationDisposition, RecreateKind,
+        RenderSurfaceBinding, SurfaceBindingError, SurfaceInstallFailure, SurfaceRecreateError,
+        run_surface_recreate,
+    },
     surface_system::SurfaceSystem,
 };
 use crossbeam_channel::{Receiver, select, tick};
@@ -42,7 +46,7 @@ use shared::error::{EngineError, EngineResult, ErrorCode};
 use shared::protocol::render_cmd::{CanvasBatchPayload, CanvasId, GlBatchPayload, RenderCommand};
 use shared::render_command_sender::CommandSender;
 use shared::render_event::{RenderEvent, RenderEventReceiver, RenderEventSender};
-use shared::surface::SurfaceRef;
+use shared::surface::SurfaceLease;
 use shared::{FrameOp, FramePacket};
 use tracing::{error, info, warn};
 
@@ -154,6 +158,71 @@ fn prepare_batch_scissor(
 
 fn mark_surface_destroyed(surface: &mut SurfaceSystem) {
     surface.on_surface_destroyed();
+}
+
+fn binding_error(context: &'static str, error: SurfaceBindingError) -> EngineError {
+    EngineError::new(ErrorCode::InvalidOperation)
+        .with_msg(context)
+        .with_detail(error.to_string())
+}
+
+/// The single Surface ownership transaction used by both startup and later
+/// lifecycle updates. Generation preflight precedes pure platform conversion;
+/// the converted target is revalidated after the candidate lease is staged.
+/// CanvasManager's explicit disposition is the sole authority for releasing
+/// that lease after a failed EGL operation.
+fn install_surface_lease(
+    graphics_platform: &crate::egl_platform::GraphicsPlatform,
+    cm: &mut CanvasManager,
+    binding: &mut RenderSurfaceBinding,
+    lease: SurfaceLease,
+    surface_size: Option<(u32, u32)>,
+) -> Result<RecreateKind, SurfaceRecreateError> {
+    // Reject stale/conflicting work before even reading a platform-native
+    // descriptor. run_surface_recreate repeats preflight immediately before
+    // staging so an asynchronous retirement in this small interval also fails
+    // closed without any EGL call.
+    binding
+        .preflight(&lease)
+        .map_err(SurfaceRecreateError::Binding)?;
+    let had_usable_previous = binding.is_live();
+    let prepared = graphics_platform
+        .prepare_surface(lease.surface().as_ref())
+        .map_err(|error| {
+            SurfaceRecreateError::Install(SurfaceInstallFailure::from_phase(
+                error,
+                had_usable_previous,
+                InstallPhase::BeforePreviousInvalidation,
+                CandidateCleanup::NotRequired,
+            ))
+        })?;
+    run_surface_recreate(binding, lease, move |kind, _staged| {
+        graphics_platform
+            .validate_prepared(prepared.as_ref())
+            .map_err(|error| {
+                SurfaceInstallFailure::from_phase(
+                    error,
+                    had_usable_previous,
+                    InstallPhase::BeforePreviousInvalidation,
+                    CandidateCleanup::NotRequired,
+                )
+            })?;
+        if kind == RecreateKind::NewGeneration {
+            cm.force_next_onscreen_recreate();
+        }
+        cm.create_onscreen(prepared, kind, surface_size, had_usable_previous)
+    })
+    .map(|(kind, ())| kind)
+}
+
+fn recreate_engine_error(
+    context: &'static str,
+    error: SurfaceRecreateError,
+) -> (EngineError, Option<PresentationDisposition>) {
+    match error {
+        SurfaceRecreateError::Binding(error) => (binding_error(context, error), None),
+        SurfaceRecreateError::Install(failure) => (failure.error, Some(failure.presentation)),
+    }
 }
 
 fn execute_canvas_batch(
@@ -1082,7 +1151,8 @@ impl RenderThread {
         raf_tx: RafSender,
         vsync_rx: Option<Receiver<f64>>,
         host_id: i32,
-        initial_surface: Option<SurfaceRef>,
+        initial_surface: Option<SurfaceLease>,
+        graphics_platform: crate::egl_platform::GraphicsPlatform,
         dpi: f32,
         app_cache_dir: Option<std::path::PathBuf>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
@@ -1113,14 +1183,6 @@ impl RenderThread {
         // calls it to request exactly one more frame while demand remains;
         // graphics stays decoupled from `platform` (it only invokes a closure).
         request_vsync: Option<Arc<dyn Fn() + Send + Sync>>,
-        // Per-host surface destroy-epoch (monotonic), advanced by the JNI/UI
-        // thread on every surfaceDestroyed. Each SurfaceRef carries the epoch it
-        // was created at (Surface::surface_epoch); the render loop compares its
-        // current surface's epoch against this live counter every frame and stops
-        // presenting on any mismatch — synchronously and independent of the async
-        // SurfaceDestroyed command. A monotonic counter (vs a boolean) is required
-        // to survive fast destroy->create->destroy without ABA masking.
-        destroy_epoch: Arc<std::sync::atomic::AtomicU64>,
     ) -> EngineResult<Self> {
         let (cmd_tx, cmd_rx) = CommandSender::new();
         // Wire the host wake into the event channel so every successful emit
@@ -1153,10 +1215,15 @@ impl RenderThread {
                     shared::thread_priority::Priority::Display,
                 );
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Both Android and non-Android use the same EGL library name.
-                const EGL_LIB: &str = "libEGL.so";
-
-                let mut cm = match CanvasManager::new_with_resource(EGL_LIB, dpi, app_cache_dir.as_deref(), gpu_caps.clone()) {
+                // Declared before CanvasManager so unwind drops EGL ownership
+                // first and the retained native Surface lease last.
+                let mut render_binding = RenderSurfaceBinding::new();
+                let mut cm = match CanvasManager::new_with_resource(
+                    Arc::clone(graphics_platform.egl_provider()),
+                    dpi,
+                    app_cache_dir.as_deref(),
+                    gpu_caps.clone(),
+                ) {
                     Ok(c) => c,
                     Err(e) => {
                         gpu_caps.set_failed(format!("CanvasManager init failed: {}", e));
@@ -1171,20 +1238,24 @@ impl RenderThread {
                 let mut startup_failed = false;
 
                 // If an initial surface is provided, create the onscreen context immediately.
-                if let Some(surface) = initial_surface {
-                    match onscreen_window_from_surface(surface.as_ref()) {
-                        Ok(win) => {
-                            if let Err(e) = cm.create_onscreen(win, None) {
-                                error!("create_onscreen failed: {}", e);
-                                gpu_caps.set_failed(format!("create_onscreen failed: {}", e));
-                                startup_failed = true;
-                            } else {
-                                initial_onscreen_ok = true;
-                            }
+                if let Some(lease) = initial_surface {
+                    let initial_result = install_surface_lease(
+                        &graphics_platform,
+                        &mut cm,
+                        &mut render_binding,
+                        lease,
+                        None,
+                    );
+                    match initial_result {
+                        Ok(kind) => {
+                            debug_assert_eq!(kind, RecreateKind::Initial);
+                            initial_onscreen_ok = true;
                         }
-                        Err(e) => {
-                            gpu_caps.set_failed(format!("initial surface is not supported: {}", e));
-                            error!("initial surface is not supported: {}", e);
+                        Err(error) => {
+                            let (e, _) =
+                                recreate_engine_error("initial Surface rejected", error);
+                            error!("create_onscreen failed: {}", e);
+                            gpu_caps.set_failed(format!("create_onscreen failed: {}", e));
                             startup_failed = true;
                         }
                     }
@@ -1199,12 +1270,7 @@ impl RenderThread {
 
                 // Create GL function loader.
                 let gl = unsafe {
-                    glow::Context::from_loader_function(|s| {
-                        cm.egl
-                            .get_proc_address(s)
-                            .map(|f| f as *const std::ffi::c_void)
-                            .unwrap_or(std::ptr::null())
-                    })
+                    glow::Context::from_loader_function(|symbol| cm.gl_proc_address(symbol))
                 };
 
                 // ---- Timing sources ----
@@ -1233,18 +1299,15 @@ impl RenderThread {
                 // the command-handling closure can reset it via shared capture.
                 let vsync_armed = std::cell::Cell::new(false);
                 let mut surface_system = SurfaceSystem::new();
-                // Epoch of the surface the render thread currently holds. Compared
-                // against the live `destroy_epoch` each frame; a mismatch means the
-                // surface was destroyed after hand-off. Init 0 to match the initial
-                // surface's epoch and the destroy counter's initial value. `Cell`
-                // so the command-handling closures can update it via shared capture
-                // (they already borrow the environment) without a unique borrow.
-                let valid_epoch = std::cell::Cell::new(0u64);
                 if initial_onscreen_ok {
-                    if let Some(size) = initial_surface_size {
+                    if render_binding.is_live() {
+                        if let Some(size) = initial_surface_size {
                         surface_system.on_surface_available(size);
-                    } else if has_initial_surface {
-                        surface_system.on_resume();
+                        } else if has_initial_surface {
+                            surface_system.on_resume();
+                        }
+                    } else {
+                        surface_system.on_surface_destroyed();
                     }
                 }
 
@@ -1310,12 +1373,14 @@ impl RenderThread {
                                            paused: &mut bool,
                                            has_vsync: bool,
                                            surface_system: &mut SurfaceSystem,
+                                           render_binding: &mut RenderSurfaceBinding,
                                            render_server: &mut RenderServer|
                  -> LoopCtl {
                     match cmd {
                         RenderCommand::Shutdown => {
                             info!("RenderThread received Shutdown");
-                            cm.destroy_all(&gl);
+                            cm.destroy_all();
+                            render_binding.clear_after_egl_teardown();
                             return LoopCtl::Shutdown;
                         }
 
@@ -1334,94 +1399,101 @@ impl RenderThread {
                             }
                         }
 
-                        RenderCommand::Canvas(canvas_cmd) => {
-                            // Only mark dirty for commands that affect onscreen visual output.
-                            let is_recreate = matches!(&canvas_cmd, shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen { .. });
-                            let recreate_surface_size = match &canvas_cmd {
-                                shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen {
-                                    surface,
-                                    ..
-                                } => Some(surface.size()),
-                                _ => None,
-                            };
-                            // Epoch stamped on the surface at updateSurface time —
-                            // becomes this render thread's valid_epoch once the
-                            // surface is successfully recreated.
-                            let recreate_surface_epoch = match &canvas_cmd {
-                                shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen {
-                                    surface,
-                                    ..
-                                } => Some(surface.surface_epoch()),
-                                _ => None,
-                            };
-                            let affects_onscreen = match &canvas_cmd {
-                                shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen { .. } => true,
-                                shared::protocol::render_cmd::CanvasCmd::ResizeCanvas { id, .. } => *id == 1,
-                                _ => false,
-                            };
-                            // If the incoming surface's destroy-epoch differs from the
-                            // one we currently hold, a surfaceDestroyed occurred since:
-                            // the old onscreen EGLSurface is bound to an abandoned
-                            // window. Force a full recreate so create_onscreen's
-                            // same-window fast paths can't keep presenting to the dead
-                            // surface. (Same epoch => a benign resize/redundant call,
-                            // where the fast path safely avoids an EGL re-connect.)
-                            if is_recreate {
-                                if let Some(e) = recreate_surface_epoch {
-                                    if e != valid_epoch.get() {
-                                        cm.force_next_onscreen_recreate();
+                        RenderCommand::Canvas(canvas_cmd) => match canvas_cmd {
+                            shared::protocol::render_cmd::CanvasCmd::RecreateOnscreen {
+                                lease,
+                                resp,
+                            } => {
+                                let size = lease.size();
+                                let generation = lease.generation();
+                                tracing::info!(
+                                    generation = generation.get(),
+                                    "CanvasCmd::RecreateOnscreen: requested={}x{}",
+                                    size.0,
+                                    size.1
+                                );
+                                let recreate = install_surface_lease(
+                                    &graphics_platform,
+                                    cm,
+                                    render_binding,
+                                    lease,
+                                    Some(size),
+                                );
+
+                                match recreate {
+                                    Ok(_) => {
+                                        if render_binding.is_live() {
+                                            surface_system.on_surface_available(size);
+                                        } else {
+                                            mark_surface_destroyed(surface_system);
+                                        }
+                                        vsync_armed.set(false);
+                                        *dirty = true;
+                                        let _ = resp.send(Ok(()));
+                                        info!(
+                                            generation = generation.get(),
+                                            width = size.0,
+                                            height = size.1,
+                                            live = render_binding.is_live(),
+                                            surface_state = ?surface_system.state(),
+                                            canvas_count = cm.canvas_count(),
+                                            "RenderThread surface recreated"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let (e, presentation) = recreate_engine_error(
+                                            "recreate onscreen: rejected Surface",
+                                            error,
+                                        );
+                                        if presentation
+                                            == Some(PresentationDisposition::Unavailable)
+                                        {
+                                            mark_surface_destroyed(surface_system);
+                                            vsync_armed.set(false);
+                                        }
+                                        let _ = resp.send(Err(e.clone()));
+                                        error!(
+                                            generation = generation.get(),
+                                            "CanvasCmd::RecreateOnscreen failed: {}",
+                                            e
+                                        );
+                                        debug_stats
+                                            .canvas_cmd_errors
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        events.emit(RenderEvent::CanvasError {
+                                            code: e.code,
+                                            message: e.to_string(),
+                                        });
                                     }
                                 }
                             }
-                            match canvas_handler.handle_command(cm, canvas_cmd) {
-                                Ok(()) => {
-                                    if is_recreate {
-                                        if let Some(size) = recreate_surface_size {
-                                            surface_system.on_surface_available(size);
-                                            // R1: surface is back — clear the
-                                            // in-flight flag so the post-recreate
-                                            // dirty frame re-arms the clock.
-                                            vsync_armed.set(false);
-                                            // Adopt the recreated surface's epoch. From now on the
-                                            // present-gate compares this against the live destroy
-                                            // counter, so a destroy that raced this recreate (bumped
-                                            // the counter past this epoch) still stops presenting —
-                                            // no ABA, because a monotonic epoch can't read "equal"
-                                            // against a newer surface generation.
-                                            if let Some(e) = recreate_surface_epoch {
-                                                valid_epoch.set(e);
-                                            }
-                                            info!(
-                                                width = size.0,
-                                                height = size.1,
-                                                surface_state = ?surface_system.state(),
-                                                canvas_count = cm.canvas_count(),
-                                                "RenderThread surface recreated"
-                                            );
-                                        } else {
-                                            info!(
-                                                surface_state = ?surface_system.state(),
-                                                canvas_count = cm.canvas_count(),
-                                                "RenderThread surface recreated (no size reported)"
-                                            );
+                            other => {
+                                let affects_onscreen = matches!(
+                                    &other,
+                                    shared::protocol::render_cmd::CanvasCmd::ResizeCanvas {
+                                        id,
+                                        ..
+                                    } if *id == 1
+                                );
+                                match canvas_handler.handle_command(cm, other) {
+                                    Ok(()) => {
+                                        if affects_onscreen {
+                                            *dirty = true;
                                         }
                                     }
-                                    if affects_onscreen {
-                                        *dirty = true;
+                                    Err(e) => {
+                                        error!("CanvasCmd failed: {}", e);
+                                        debug_stats
+                                            .canvas_cmd_errors
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        events.emit(RenderEvent::CanvasError {
+                                            code: e.code,
+                                            message: e.to_string(),
+                                        });
                                     }
                                 }
-                                Err(e) => {
-                                    error!("CanvasCmd failed: {}", e);
-                                    debug_stats
-                                        .canvas_cmd_errors
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    events.emit(RenderEvent::CanvasError {
-                                        code: e.code,
-                                        message: e.to_string(),
-                                    });
-                                }
                             }
-                        }
+                        },
 
                         RenderCommand::GL(gl_cmd) => match renderer_gl.handle_command(cm, gl, gl_cmd) {
                             Ok(effect) => {
@@ -1590,20 +1662,29 @@ impl RenderThread {
                             }
                         }
 
-                        RenderCommand::SurfaceDestroyed => {
-                            let surface_state_before = surface_system.state();
-                            let paused_now = *paused;
-                            mark_surface_destroyed(surface_system);
-                            // R1: Java clears surfaceReady (removing any posted
-                            // callback); clear our in-flight flag so a later
-                            // RecreateOnscreen re-arms retained demand.
-                            vsync_armed.set(false);
-                            info!(
-                                paused = paused_now,
-                                surface_state_before = ?surface_state_before,
-                                surface_state_after = ?surface_system.state(),
-                                "RenderThread SurfaceDestroyed acknowledged"
-                            );
+                        RenderCommand::SurfaceDestroyed { generation } => {
+                            if render_binding.on_surface_destroyed(generation) {
+                                let surface_state_before = surface_system.state();
+                                let paused_now = *paused;
+                                mark_surface_destroyed(surface_system);
+                                // R1: Java clears surfaceReady (removing any posted
+                                // callback); clear our in-flight flag so a later
+                                // RecreateOnscreen re-arms retained demand.
+                                vsync_armed.set(false);
+                                info!(
+                                    generation = generation.get(),
+                                    paused = paused_now,
+                                    surface_state_before = ?surface_state_before,
+                                    surface_state_after = ?surface_system.state(),
+                                    "RenderThread SurfaceDestroyed acknowledged"
+                                );
+                            } else {
+                                info!(
+                                    generation = generation.get(),
+                                    current_generation = ?render_binding.generation().map(|value| value.get()),
+                                    "RenderThread ignored stale or non-retired SurfaceDestroyed"
+                                );
+                            }
                         }
 
                         RenderCommand::TrimTextCache { level } => {
@@ -1731,6 +1812,7 @@ impl RenderThread {
                                        dirty: &mut bool,
                                        paused: &mut bool,
                                        surface_system: &mut SurfaceSystem,
+                                       render_binding: &mut RenderSurfaceBinding,
                                        render_server: &mut RenderServer|
                  -> LoopCtl {
                     crate::atrace_scope!("migo.render.drain_cmds");
@@ -1771,7 +1853,7 @@ impl RenderThread {
                         }
                         match cmd_rx.try_recv() {
                             Ok(cmd) => {
-                                match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, frame_scheduler, ticker, dirty, paused, has_vsync, surface_system, render_server) {
+                                match handle_one_cmd(cmd, cm, gl, canvas_handler, renderer_2d, renderer_gl, fps, frame_scheduler, ticker, dirty, paused, has_vsync, surface_system, render_binding, render_server) {
                                     LoopCtl::Continue => {}
                                     LoopCtl::Shutdown => return LoopCtl::Shutdown,
                                 }
@@ -1841,7 +1923,8 @@ impl RenderThread {
                                                         fps_timer: &mut Instant,
                                                         last_frame_time: &mut Instant,
                                                         first_frame_recorded: &mut bool,
-                                                        needs_recovery: &mut bool| {
+                                                        needs_recovery: &mut bool,
+                                                        render_binding: &RenderSurfaceBinding| {
                     crate::atrace_scope!("migo.render.present_and_raf");
                     let _ = ts; // RAF is signalled before the drain now (see signal_raf)
                     // Drain Canvas2D snapshot textures captured during this
@@ -1909,12 +1992,10 @@ impl RenderThread {
                     }
 
                     // Present the completed frame (only if we have a valid surface).
-                    // Re-check the surface epoch here, immediately before the swap:
-                    // the caller's gate ran before upload-drain / flush / RAF work,
-                    // and a surfaceDestroyed may have advanced the epoch since. This
-                    // closes the residual "check early, swap late" window.
-                    let surface_current =
-                        destroy_epoch.load(std::sync::atomic::Ordering::Acquire) == valid_epoch.get();
+                    // Re-check this exact generation here, immediately before
+                    // the swap path: destroy may have retired it after the
+                    // caller's early gate but before upload/flush work completed.
+                    let surface_current = render_binding.is_live();
                     let did_swap = if *dirty && should_present && surface_current {
                         let onscreen_id = shared::protocol::render_cmd::CanvasId::from(1u32);
                         let (canvas_w, canvas_h) = cm.get_canvas_size(onscreen_id).unwrap_or((0, 0));
@@ -1950,14 +2031,10 @@ impl RenderThread {
                         };
 
                         crate::atrace_scope!("migo.render.swap_buffers");
-                        // Final epoch re-check at the swap boundary: a surfaceDestroyed
-                        // may have raced the flush/damage work above. If stale, skip the
-                        // EGL swap entirely (the next present-gate iteration marks the
-                        // surface lost); presenting to the abandoned BufferQueue is the
-                        // one thing we must never do.
-                        let swap_ok = if destroy_epoch.load(std::sync::atomic::Ordering::Acquire)
-                            != valid_epoch.get()
-                        {
+                        // Final generation re-check at the swap boundary. If
+                        // destroy raced the flush/damage work, skip EGL swap;
+                        // presenting to the abandoned BufferQueue is forbidden.
+                        let swap_ok = if !render_binding.is_live() {
                             false
                         } else {
                             match cm.swap_buffers_no_restore(shared::protocol::render_cmd::CanvasId::from(1u32), true) {
@@ -2127,7 +2204,8 @@ impl RenderThread {
                     // this level guarantees exit after a saturated queue drains.
                     if shutdown_requested.load(Ordering::Acquire) {
                         info!("RenderThread observed shutdown request");
-                        cm.destroy_all(&gl);
+                        cm.destroy_all();
+                        render_binding.clear_after_egl_teardown();
                         shared::stats::unregister_stats(host_id);
                         return;
                     }
@@ -2136,7 +2214,11 @@ impl RenderThread {
                     // Performed at the top of the frame loop where it is less
                     // timing-critical than inside the swap path. This avoids
                     // blocking the RAF signal with a full EGL teardown+recreate.
-                    if needs_context_recovery {
+                    if needs_context_recovery
+                        && render_binding.is_live()
+                        && render_binding.pending_generation().is_none()
+                        && cm.is_surface_recovery_ready()
+                    {
                         needs_context_recovery = false;
                         match cm.try_recover_context() {
                             Ok(true) => {
@@ -2210,7 +2292,7 @@ impl RenderThread {
                             }
 
                             // 2) Drain all pending commands from the previous frame.
-                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, &mut surface_system, &mut render_server) {
+                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, &mut surface_system, &mut render_binding, &mut render_server) {
                                 LoopCtl::Continue => {}
                                 LoopCtl::Shutdown => {
                                     shared::stats::unregister_stats(host_id);
@@ -2219,15 +2301,13 @@ impl RenderThread {
                             }
 
                             // 3) Present (swap) the drained frame.
-                            // If a surfaceDestroyed has occurred since our current
-                            // surface was handed off (live epoch moved past it),
-                            // stop presenting to it now — before Java returns and
-                            // Android abandons the BufferQueue — without waiting
-                            // for the async SurfaceDestroyed command.
-                            if destroy_epoch.load(std::sync::atomic::Ordering::Acquire) != valid_epoch.get() {
+                            // If surfaceDestroyed retired the current generation,
+                            // stop presenting now — independently of the queued
+                            // SurfaceDestroyed command.
+                            if !render_binding.is_live() {
                                 surface_system.on_surface_destroyed();
                             }
-                            present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, surface_system.can_present(), ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
+                            present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, surface_system.can_present(), ts, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery, &render_binding);
                             // No-op on the software-ticker path (has_vsync false);
                             // kept for symmetry with the vsync branch.
                             arm_if_needed(false, paused, dirty, needs_context_recovery, &cm, &surface_system);
@@ -2300,7 +2380,7 @@ impl RenderThread {
 
                             // 2) Drain all pending commands (in parallel with JS
                             // producing the next frame, which the signal above woke).
-                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, &mut surface_system, &mut render_server) {
+                            match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, &mut surface_system, &mut render_binding, &mut render_server) {
                                 LoopCtl::Continue => {}
                                 LoopCtl::Shutdown => {
                                     shared::stats::unregister_stats(host_id);
@@ -2309,11 +2389,11 @@ impl RenderThread {
                             }
 
                             // 3) Present (swap) the drained frame.
-                            if destroy_epoch.load(std::sync::atomic::Ordering::Acquire) != valid_epoch.get() {
+                            if !render_binding.is_live() {
                                 surface_system.on_surface_destroyed();
                             }
                             let should_present = decision.should_signal_raf && surface_system.can_present();
-                            present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, should_present, decision.raf_time_ms, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery);
+                            present_frame_and_signal_raf(&mut cm, &mut renderer_2d, &mut dirty, paused, should_present, decision.raf_time_ms, &debug_stats, &mut frame_count, &mut fps_timer, &mut last_frame_time, &mut first_frame_recorded, &mut needs_context_recovery, &render_binding);
                             // Keep the vsync clock at display rate while animating;
                             // otherwise re-arm only on residual demand (dirty /
                             // upload), else the clock stops.
@@ -2323,7 +2403,7 @@ impl RenderThread {
                         recv(cmd_rx) -> msg => {
                             match msg {
                                 Ok(cmd) => {
-                                    match handle_one_cmd(cmd, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, has_vsync, &mut surface_system, &mut render_server) {
+                                    match handle_one_cmd(cmd, &mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, has_vsync, &mut surface_system, &mut render_binding, &mut render_server) {
                                         LoopCtl::Continue => {}
                                         LoopCtl::Shutdown => {
                                             shared::stats::unregister_stats(host_id);
@@ -2331,7 +2411,7 @@ impl RenderThread {
                                         }
                                     }
                                     // Drain remaining pending commands.
-                                    match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, &mut surface_system, &mut render_server) {
+                                    match drain_cmds(&mut cm, &gl, &mut canvas_handler, &mut renderer_2d, &mut renderer_gl, &mut fps, &mut frame_scheduler, &mut ticker, &mut dirty, &mut paused, &mut surface_system, &mut render_binding, &mut render_server) {
                                         LoopCtl::Continue => {}
                                         LoopCtl::Shutdown => {
                                             shared::stats::unregister_stats(host_id);
@@ -2369,7 +2449,8 @@ impl RenderThread {
                                 }
                                 Err(_) => {
                                     info!("Command channel closed, exiting RenderThread");
-                                    cm.destroy_all(&gl);
+                                    cm.destroy_all();
+                                    render_binding.clear_after_egl_teardown();
                                     shared::stats::unregister_stats(host_id);
                                     return;
                                 }

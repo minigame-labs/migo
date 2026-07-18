@@ -6,25 +6,29 @@ edition = "2024"
 [lib]
 name = "platform"
 path = "lib.rs"
-crate-type = ["cdylib", "rlib"]
+# rlib only. The Android cdylib (`libmigo.so`) is the separate `android-jni`
+# crate: a cdylib here would be built for every target, and on a glibc host the
+# Linux V8 archive cannot be linked into a shared object (CLAUDE.md §10), which
+# is what previously kept `cargo test -p platform` and the Linux player from
+# building without a crate-type toggle.
+crate-type = ["rlib"]
 
 [features]
 default = ["profile-full"]
-profile-full = ["v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system", "core/profile-full", "js-runtime/profile-full", "graphics/profile-full"]
-profile-slim = ["v8-limits", "code-signing", "core/profile-slim", "js-runtime/profile-slim", "graphics/profile-slim"]
-worker-snapshot = ["core/worker-snapshot", "js-runtime/worker-snapshot"]
+profile-full = ["v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system", "core/profile-full", "graphics/profile-full"]
+profile-slim = ["v8-limits", "code-signing", "core/profile-slim", "graphics/profile-slim"]
+worker-snapshot = ["core/worker-snapshot"]
 v8-limits = ["core/v8-limits"]
 code-signing = ["core/code-signing"]
-api-sensors = ["core/api-sensors", "js-runtime/api-sensors"]
-api-media = ["core/api-media", "js-runtime/api-media"]
-api-connectivity = ["core/api-connectivity", "js-runtime/api-connectivity"]
-api-commerce = ["core/api-commerce", "js-runtime/api-commerce"]
-api-system = ["core/api-system", "js-runtime/api-system"]
+api-sensors = ["core/api-sensors"]
+api-media = ["core/api-media"]
+api-connectivity = ["core/api-connectivity"]
+api-commerce = ["core/api-commerce"]
+api-system = ["core/api-system"]
 
 [dependencies]
 core = { path = "../core", default-features = false }
 shared = { path = "../shared", default-features = false }
-js-runtime = { path = "../js-runtime", default-features = false }
 graphics = { path = "../graphics", default-features = false }
 io = { path = "../io", default-features = false }
 crossbeam-channel = { workspace = true }
@@ -32,11 +36,11 @@ bytemuck = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-deno_error = { workspace = true }
-deno_core = { workspace = true }
-raw-window-handle = { workspace = true }
+khronos-egl = { workspace = true }
+libloading = "^0.8"
 
 # On non-Android platforms, enable Rust-native implementations:
 # - zip-extract: Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)

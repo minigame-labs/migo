@@ -46,9 +46,7 @@ impl GlResourceIdAllocator {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::RefCell,
         path::PathBuf,
-        rc::Rc,
         sync::{Arc, atomic::AtomicBool},
         time::Duration,
     };
@@ -60,11 +58,11 @@ mod tests {
         GlResourceIdAllocator, bind_buffer_base_impl, bind_buffer_range_impl, copy_f32_words,
         copy_i32_words, gl_cmd_has_heap_payload, normalize_tex_upload_3d_source,
     };
+    use crate::HostJsRuntime;
     use crate::rendering::webgl::{
         error_state::{self, WebGLErrorState, codes},
         frame_collector::UnifiedFrameCollector,
     };
-    use crate::{HostJsRuntime, host_runtime::SharedMountTableRef};
     use shared::{
         FrameOp,
         channel::ThreadWakeup,
@@ -119,14 +117,10 @@ mod tests {
 
     fn new_webgl_runtime() -> (HostJsRuntime, crossbeam_channel::Receiver<RenderCommand>) {
         let (host_state, render_rx) = new_test_host_state();
-        let mount_ref: SharedMountTableRef = Rc::new(RefCell::new(None));
         let runtime = HostJsRuntime::new(
             1,
             host_state,
-            Vec::new(),
-            None,
-            None,
-            mount_ref,
+            &std::env::temp_dir(),
             #[cfg(feature = "v8-limits")]
             Default::default(),
             #[cfg(feature = "code-signing")]

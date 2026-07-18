@@ -562,7 +562,7 @@ pub(super) struct EglContextHandle {
 
 #[derive(Clone, Copy)]
 pub(super) enum SurfaceKind {
-    Window(usize),
+    Window,
     Pbuffer,
 }
 

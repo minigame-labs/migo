@@ -6,7 +6,6 @@ use std::{
     },
 };
 
-use deno_core::PollEventLoopOptions;
 use tokio::runtime::{Builder, Runtime};
 use tracing::{error, info, warn};
 
@@ -14,7 +13,7 @@ use shared::{
     config::InitOptions,
     error::{EngineError, EngineResult, ErrorCode},
     protocol::host_cmd::HostCommand,
-    surface::SurfaceRef,
+    surface::{SurfaceGenerationGate, SurfaceLease, SurfaceRef},
 };
 
 use crate::runtime::{HostId, host::Host, registry};
@@ -27,10 +26,21 @@ const HOST_BLOCKING_FALLBACK_THREADS: usize = 4;
 
 pub fn spawn_host_thread(
     surface: SurfaceRef,
+    graphics_platform: graphics::egl_platform::GraphicsPlatform,
     platform: Arc<dyn PlatformServices>,
     opt: InitOptions,
 ) -> EngineResult<HostId> {
     let id = registry::alloc_host_id();
+
+    // Issue generation 1 before publishing the Host. A fresh gate cannot be
+    // exhausted, but keep the failure path explicit so generation wrap always
+    // fails closed rather than silently creating an untracked Surface.
+    let surface_gate = Arc::new(SurfaceGenerationGate::new());
+    let initial_token = surface_gate.attach_or_update().map_err(|_| {
+        EngineError::new(ErrorCode::InvalidOperation)
+            .with_msg("initial Surface generation exhausted")
+    })?;
+    let initial_surface = SurfaceLease::new(surface, initial_token);
 
     // Bound all normal/game-controlled traffic while allowing the four trusted
     // lifecycle/surface callbacks to share the same FIFO without consuming
@@ -44,7 +54,13 @@ pub fn spawn_host_thread(
     // `shutdown_host` sets this even when the budget is full (where its normal
     // Shutdown nudge is dropped) and the host loop polls it every iteration.
     let shutdown = Arc::new(AtomicBool::new(false));
-    registry::register_sender(id, host_tx.clone(), critical_host_tx, shutdown.clone());
+    registry::register_sender(
+        id,
+        host_tx.clone(),
+        critical_host_tx,
+        shutdown.clone(),
+        surface_gate,
+    );
 
     // Clone the platform Arc so we can use it in the catch_unwind path
     // to notify Java about errors from any context (host loop, panic, etc.).
@@ -54,7 +70,14 @@ pub fn spawn_host_thread(
         .name(format!("Migo-Main-{}", id))
         .spawn(move || {
             let run = || {
-                let host = match Host::new(id, host_tx, surface, platform, opt) {
+                let host = match Host::new(
+                    id,
+                    host_tx,
+                    initial_surface,
+                    graphics_platform,
+                    platform,
+                    opt,
+                ) {
                     Ok(h) => h,
                     Err(e) => {
                         error!("[Host {}] failed to create host: {}", id, e);
@@ -97,7 +120,6 @@ pub fn spawn_host_thread(
                 // below can poll it (the thread closure only lends it to us).
                 let shutdown = shutdown.clone();
                 runtime.block_on(async move {
-                    let poll = PollEventLoopOptions::default();
                     let mut host = host;
 
                     // Coalescing wake signals replace the deleted 3-second
@@ -131,7 +153,7 @@ pub fn spawn_host_thread(
                         tokio::select! {
                             biased;
 
-                            host_event = host.js.run_event_loop(poll) => {
+                            host_event = host.js.pump_event_loop() => {
                                 if let Err(e) = host_event {
                                     // Check if this was a watchdog/OOM termination
                                     #[cfg(feature = "v8-limits")]
@@ -291,13 +313,11 @@ pub fn spawn_host_thread(
             // late-arriving commands is the correct behavior.  The JNI callers
             // already ignore send failures (they use `let _ = send_command_to_host(...)`).
             registry::unregister_sender(id);
-            registry::unregister_destroy_epoch(id);
         });
 
     if let Err(e) = spawn_result {
         error!("[Host {}] failed to spawn thread: {}", id, e);
         registry::unregister_sender(id);
-        registry::unregister_destroy_epoch(id);
         return Err(EngineError::new(ErrorCode::Internal)
             .with_msg("failed to spawn host thread")
             .with_detail(e.to_string()));
@@ -306,7 +326,6 @@ pub fn spawn_host_thread(
     if ready_rx.recv().is_err() {
         error!("[Host {}] failed to start (init panic / early exit)", id);
         registry::unregister_sender(id);
-        registry::unregister_destroy_epoch(id);
         return Err(EngineError::new(ErrorCode::Internal)
             .with_msg("host thread failed to start")
             .with_detail("init panic / early exit".to_string()));

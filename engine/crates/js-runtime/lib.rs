@@ -74,10 +74,16 @@
 //! The js-runtime is created by the core module and not directly instantiated:
 //!
 //! ```rust,ignore
-//! use js_runtime::{HostJsRuntime, main_extensions};
+//! use js_runtime::HostJsRuntime;
 //!
-//! let extensions = main_extensions(host_state);
-//! let mut runtime = HostJsRuntime::new(host_id, host_state, extensions, module_loader);
+//! let mut runtime = HostJsRuntime::new(
+//!     host_id,
+//!     host_state,
+//!     cache_dir,
+//!     v8_limits,
+//!     code_signing_enabled,
+//!     code_signing_pubkey,
+//! );
 //!
 //! // Load and run a game
 //! runtime.evaluate_module("/game".into(), "main.js".into()).await?;
@@ -140,8 +146,12 @@ mod update;
 #[cfg(feature = "api-system")]
 pub(crate) mod worker;
 
+mod code_cache;
 mod host_runtime;
+#[allow(dead_code)]
+mod isolate_pool;
 mod js_bindings;
+mod loader;
 pub mod snapshot;
 pub mod watchdog;
 

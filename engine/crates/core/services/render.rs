@@ -9,20 +9,28 @@ use shared::{
     error::{EngineError, EngineResult, ErrorCode},
     protocol::render_cmd::{CanvasCmd, RenderCmdResp, RenderCommand},
     render_event::RenderEventReceiver,
-    surface::SurfaceRef,
+    surface::{SurfaceGeneration, SurfaceLease},
 };
 
+use super::{SurfaceAttachmentSlot, SurfaceTransitionError};
+
 pub(crate) struct RenderService {
-    surface: Option<SurfaceRef>,
+    attachment: SurfaceAttachmentSlot,
     surface_system: SurfaceSystem,
     thread: RenderThread,
 }
 
-fn surface_for_restore(surface: Option<SurfaceRef>) -> EngineResult<SurfaceRef> {
-    surface.ok_or_else(|| {
+fn surface_for_restore(lease: Option<SurfaceLease>) -> EngineResult<SurfaceLease> {
+    lease.ok_or_else(|| {
         EngineError::new(ErrorCode::InvalidOperation)
             .with_msg("restore surface: no live surface available")
     })
+}
+
+fn transition_error(context: &'static str, error: SurfaceTransitionError) -> EngineError {
+    EngineError::new(ErrorCode::InvalidOperation)
+        .with_msg(context)
+        .with_detail(error.to_string())
 }
 
 #[cfg(test)]
@@ -45,7 +53,8 @@ impl RenderService {
         raf_tx: shared::raf_signal::RafSender,
         vsync_rx: Option<crossbeam_channel::Receiver<f64>>,
         host_id: i32,
-        surface: SurfaceRef,
+        initial_surface: SurfaceLease,
+        graphics_platform: graphics::egl_platform::GraphicsPlatform,
         pixel_ratio: f32,
         target_fps: i32,
         app_cache_dir: Option<std::path::PathBuf>,
@@ -55,19 +64,14 @@ impl RenderService {
         raf_demand: shared::raf_signal::RafDemandRef,
         request_vsync: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) -> EngineResult<Self> {
-        // Per-host surface destroy-epoch: bumped by JNI on surfaceDestroyed,
-        // captured onto each new SurfaceRef at updateSurface time, and compared
-        // by the render thread every frame so it stops presenting to a surface
-        // that was torn down after hand-off (queue-independent, ABA-proof).
-        // Init 0 — the initial surface (below) is stamped epoch 0 to match.
-        let destroy_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        crate::runtime::registry::register_destroy_epoch(host_id, destroy_epoch.clone());
+        let surface_size = initial_surface.size();
 
         let thread = RenderThread::spawn(
             raf_tx,
             vsync_rx,
             host_id,
-            Some(surface.clone()),
+            Some(initial_surface.clone()),
+            graphics_platform,
             pixel_ratio,
             app_cache_dir,
             gpu_caps,
@@ -75,7 +79,6 @@ impl RenderService {
             wake,
             raf_demand,
             request_vsync,
-            destroy_epoch,
         )?;
         // Apply the host's configured target FPS to the render thread immediately
         // so the first vsync tick already runs at the right cadence.
@@ -83,9 +86,9 @@ impl RenderService {
             .sender()
             .send(RenderCommand::FrameRate(target_fps.clamp(1, 120) as u32));
         let mut surface_system = SurfaceSystem::new();
-        surface_system.on_surface_available(surface.size());
+        surface_system.on_surface_available(surface_size);
         Ok(Self {
-            surface: Some(surface),
+            attachment: SurfaceAttachmentSlot::from_initial(initial_surface),
             surface_system,
             thread,
         })
@@ -100,7 +103,7 @@ impl RenderService {
     /// `on_surface_destroyed()` until the next successful `update_surface()`.
     #[inline]
     pub(crate) fn has_live_surface(&self) -> bool {
-        self.surface.is_some()
+        self.attachment.has_live_surface()
     }
 
     #[inline]
@@ -118,12 +121,15 @@ impl RenderService {
     }
 
     /// Update onscreen surface and request backend recreate.
-    pub(crate) fn update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
-        let surface_size = surface.size();
+    pub(crate) fn update_surface(&mut self, lease: SurfaceLease) -> EngineResult<()> {
+        self.attachment
+            .prepare(&lease)
+            .map_err(|error| transition_error("recreate onscreen: rejected Surface", error))?;
+        let surface_size = lease.size();
 
         let (tx, rx) = bounded::<Result<(), EngineError>>(1);
         let cmd = RenderCommand::Canvas(CanvasCmd::RecreateOnscreen {
-            surface: surface.clone(),
+            lease: lease.clone(),
             resp: RenderCmdResp::from_sync(tx),
         });
 
@@ -139,7 +145,18 @@ impl RenderService {
 
         match rx.recv_timeout(Self::RECREATE_ONSCREEN_TIMEOUT) {
             Ok(Ok(())) => {
-                self.surface = Some(surface);
+                // Retirement is synchronous and independent of the command
+                // response. Never publish a ready Host attachment if destroy
+                // raced with EGL recreation.
+                if !lease.is_live() {
+                    self.surface_system.on_surface_destroyed();
+                    return Err(EngineError::new(ErrorCode::Cancelled)
+                        .with_msg("recreate onscreen: Surface retired before commit"));
+                }
+                self.attachment.commit(lease).map_err(|error| {
+                    self.surface_system.on_surface_destroyed();
+                    transition_error("recreate onscreen: commit rejected Surface", error)
+                })?;
                 self.surface_system.on_surface_available(surface_size);
                 info!(
                     "RenderService::update_surface ok: requested={}x{}",
@@ -186,20 +203,26 @@ impl RenderService {
     /// Pause rendering (stop RAF ticker and frame presentation).
     pub(crate) fn pause(&mut self) {
         self.surface_system.on_pause();
-        // Bounded-blocking: dropping these on a full render queue desyncs the
-        // render thread from the surface/lifecycle state (a dropped Resume
-        // leaves the app frozen; a dropped SurfaceDestroyed leaves the render
-        // thread presenting to a dead surface), so wait rather than drop.
+        // Bounded-blocking: dropping Pause/Resume on a full render queue
+        // desynchronizes lifecycle state and can leave the app frozen.
         let _ = self.sender().send_blocking_bounded(RenderCommand::Pause);
     }
 
     /// Record surface loss and clear any stale surface handle.
-    pub(crate) fn on_surface_destroyed(&mut self) {
-        self.surface = None;
+    pub(crate) fn on_surface_destroyed(&mut self, generation: SurfaceGeneration) {
+        // Only the exact current generation may cross this bridge. A delayed
+        // destroy for an older attachment cannot invalidate a newer Surface.
+        if !self.attachment.detach(generation) {
+            return;
+        }
         self.surface_system.on_surface_destroyed();
+        // Deliberately override SurfaceDestroyed's drop-on-full lifecycle
+        // policy so render-side state converges promptly. Presentation safety
+        // does not depend on delivery: the retired generation token is the
+        // queue-independent barrier checked at every present boundary.
         let _ = self
             .sender()
-            .send_blocking_bounded(RenderCommand::SurfaceDestroyed);
+            .send_blocking_bounded(RenderCommand::SurfaceDestroyed { generation });
     }
 
     /// Resume rendering (restart RAF ticker and frame presentation).
@@ -214,7 +237,7 @@ impl RenderService {
     /// After `on_surface_destroyed()`, the handle is cleared and callers must
     /// wait for a fresh `update_surface()` instead of reusing a stale surface.
     pub(crate) fn restore_surface(&mut self) -> EngineResult<()> {
-        self.update_surface(surface_for_restore(self.surface.clone())?)
+        self.update_surface(surface_for_restore(self.attachment.live_lease())?)
     }
 
     pub(crate) fn shutdown(&mut self) {

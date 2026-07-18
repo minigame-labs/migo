@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
     },
 };
 
@@ -11,72 +11,33 @@ use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, warn};
 
 use shared::{
-    host_channel::CriticalHostCommandSender, op_state::HostTx, protocol::host_cmd::HostCommand,
+    host_channel::CriticalHostCommandSender,
+    op_state::HostTx,
+    protocol::host_cmd::HostCommand,
+    surface::{SurfaceGeneration, SurfaceGenerationGate, SurfaceLease, SurfaceRef},
 };
 
 use crate::runtime::HostId;
 
 static NEXT_HOST_ID: AtomicI32 = AtomicI32::new(1);
 
-/// Per-host control handle: the ordered command sender plus a shutdown flag.
-/// The flag is the authoritative, queue-independent shutdown signal so a full
-/// normal-command budget can never swallow a shutdown request.
-type HostHandle = (HostTx, CriticalHostCommandSender, Arc<AtomicBool>);
+/// Per-host control handle published to platform callback threads.
+///
+/// The shutdown flag and Surface generation gate are queue-independent state:
+/// a saturated command queue cannot swallow shutdown or keep a retired Surface
+/// generation live.
+pub(crate) struct HostHandle {
+    tx: HostTx,
+    critical_tx: CriticalHostCommandSender,
+    shutdown: Arc<AtomicBool>,
+    surface_gate: Arc<SurfaceGenerationGate>,
+}
 
 static HOST_SENDERS: OnceLock<RwLock<HashMap<HostId, HostHandle>>> = OnceLock::new();
 
 #[inline]
 fn host_senders() -> &'static RwLock<HashMap<HostId, HostHandle>> {
     HOST_SENDERS.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Per-host monotonic surface destroy-epoch, shared with the render thread.
-///
-/// Incremented by the JNI/UI thread on every `onSurfaceDestroyed` (before the
-/// callback returns and Android abandons the BufferQueue). Each new surface
-/// captures the counter value at `updateSurface` time (stored on the SurfaceRef
-/// via `Surface::surface_epoch`). The render thread compares its current
-/// surface's epoch against this live counter every frame; any mismatch means a
-/// destroy occurred after that surface was handed off, so it stops presenting
-/// immediately — synchronously, and independent of the (lossy, async) command
-/// queue. A monotonic counter (not a boolean) is required so a fast
-/// destroy->create->destroy can't be masked by an intervening value (ABA).
-static DESTROY_EPOCHS: OnceLock<RwLock<HashMap<HostId, Arc<AtomicU64>>>> = OnceLock::new();
-
-#[inline]
-fn destroy_epochs() -> &'static RwLock<HashMap<HostId, Arc<AtomicU64>>> {
-    DESTROY_EPOCHS.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Register a host's destroy-epoch counter (created by the render service and
-/// shared with the render thread). Returns the previous counter if any.
-pub(crate) fn register_destroy_epoch(id: HostId, epoch: Arc<AtomicU64>) -> Option<Arc<AtomicU64>> {
-    destroy_epochs().write().insert(id, epoch)
-}
-
-/// Remove a host's destroy-epoch counter (on shutdown).
-pub(crate) fn unregister_destroy_epoch(id: HostId) -> Option<Arc<AtomicU64>> {
-    destroy_epochs().write().remove(&id)
-}
-
-/// Advance a host's destroy-epoch. Called from JNI on `onSurfaceDestroyed` so
-/// the render thread stops presenting to the surface being torn down. No-op if
-/// the host has no registered counter yet.
-pub fn bump_destroy_epoch(host_id: HostId) {
-    if let Some(epoch) = destroy_epochs().read().get(&host_id) {
-        epoch.fetch_add(1, Ordering::AcqRel);
-    }
-}
-
-/// Read a host's current destroy-epoch. Called from JNI on `updateSurface` to
-/// stamp the new surface with the epoch it corresponds to. Returns 0 if the
-/// host has no registered counter yet (matches the render thread's init value).
-pub fn current_destroy_epoch(host_id: HostId) -> u64 {
-    destroy_epochs()
-        .read()
-        .get(&host_id)
-        .map(|e| e.load(Ordering::Acquire))
-        .unwrap_or(0)
 }
 
 pub(crate) fn alloc_host_id() -> HostId {
@@ -90,9 +51,18 @@ pub(crate) fn register_sender(
     tx: HostTx,
     critical_tx: CriticalHostCommandSender,
     shutdown: Arc<AtomicBool>,
+    surface_gate: Arc<SurfaceGenerationGate>,
 ) -> Option<HostHandle> {
     let mut map = host_senders().write();
-    map.insert(id, (tx, critical_tx, shutdown))
+    map.insert(
+        id,
+        HostHandle {
+            tx,
+            critical_tx,
+            shutdown,
+            surface_gate,
+        },
+    )
 }
 
 /// Unregister sender for a host.
@@ -102,11 +72,72 @@ pub(crate) fn unregister_sender(id: HostId) -> Option<HostHandle> {
     map.remove(&id)
 }
 
+/// Pair a candidate Surface with the registered Host's current live
+/// generation. The registry lock is released before the lock-free gate
+/// transition and before the Surface lease is constructed.
+pub fn lease_surface(host_id: HostId, surface: SurfaceRef) -> Result<SurfaceLease, String> {
+    let (gate, shutdown) = {
+        let map = host_senders().read();
+        map.get(&host_id).map(|handle| {
+            (
+                Arc::clone(&handle.surface_gate),
+                Arc::clone(&handle.shutdown),
+            )
+        })
+    }
+    .ok_or_else(|| {
+        debug!("lease_surface: host_id={host_id} not found (likely already shut down)");
+        format!("Cannot find host_id={host_id} Surface generation gate")
+    })?;
+
+    if shutdown.load(Ordering::Acquire) {
+        return Err(format!(
+            "Cannot lease Surface for host_id={host_id}: host is shutting down"
+        ));
+    }
+
+    let token = gate.attach_or_update().map_err(|error| {
+        warn!("lease_surface: host_id={host_id} failed: {error}");
+        format!("Cannot lease Surface for host_id={host_id}: {error}")
+    })?;
+
+    // Close the race where shutdown begins after the first check but before
+    // attach_or_update. The candidate has not escaped yet, and retiring the
+    // current generation is correct for every concurrent shutdown contender.
+    if shutdown.load(Ordering::Acquire) {
+        gate.retire_current();
+        return Err(format!(
+            "Cannot lease Surface for host_id={host_id}: host is shutting down"
+        ));
+    }
+
+    Ok(SurfaceLease::new(surface, token))
+}
+
+/// Synchronously retire the registered Host's current Surface generation.
+///
+/// A successful `Some(generation)` is the queue-independent present barrier;
+/// `None` means the generation was already retired and no duplicate lifecycle
+/// command should be emitted.
+pub fn retire_surface(host_id: HostId) -> Result<Option<SurfaceGeneration>, String> {
+    let gate = {
+        let map = host_senders().read();
+        map.get(&host_id)
+            .map(|handle| Arc::clone(&handle.surface_gate))
+    }
+    .ok_or_else(|| {
+        debug!("retire_surface: host_id={host_id} not found (likely already shut down)");
+        format!("Cannot find host_id={host_id} Surface generation gate")
+    })?;
+
+    Ok(gate.retire_current())
+}
+
 pub fn send_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), String> {
     // Clone sender and drop lock before sending (lower contention / avoids lock hazards).
     let sender = {
         let map = host_senders().read();
-        map.get(&host_id).map(|(tx, _, _)| tx.clone())
+        map.get(&host_id).map(|handle| handle.tx.clone())
     }
     .ok_or_else(|| {
         // Use debug level: this commonly happens during shutdown when JNI callbacks
@@ -149,8 +180,7 @@ pub fn send_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), Str
 pub fn send_critical_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), String> {
     let sender = {
         let map = host_senders().read();
-        map.get(&host_id)
-            .map(|(_, critical_tx, _)| critical_tx.clone())
+        map.get(&host_id).map(|handle| handle.critical_tx.clone())
     }
     .ok_or_else(|| {
         debug!(
@@ -179,16 +209,19 @@ pub fn shutdown_host(id: HostId) -> Result<(), String> {
     // does not preempt a runaway synchronous JS section that never yields (an
     // inherent bound of the cooperative loop; the v8-limits ANR watchdog covers
     // that case), so this is not an instantaneous hard kill.
-    let sender = {
+    let (sender, surface_gate) = {
         let map = host_senders().read();
-        let Some((tx, _, shutdown)) = map.get(&id) else {
+        let Some(handle) = map.get(&id) else {
             // Already unregistered => the host is gone => shutdown goal achieved.
             debug!("shutdown_host: host_id={id} not found (already shut down)");
             return Ok(());
         };
-        shutdown.store(true, Ordering::Release);
-        tx.clone()
+        handle.shutdown.store(true, Ordering::Release);
+        (handle.tx.clone(), Arc::clone(&handle.surface_gate))
     };
+    // Queue-independent presentation barrier. This happens before the nudge
+    // and before render join; late attach attempts observe shutdown and fail.
+    surface_gate.retire_current();
     // Best-effort nudge so a host parked on `recv()` reacts immediately; if the
     // normal budget is full this send is dropped, but the flag above still stops
     // the loop when it next iterates.
@@ -198,7 +231,37 @@ pub fn shutdown_host(id: HostId) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use shared::surface::{Surface, SurfaceGenerationGate, SurfaceRef};
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
+
+    #[derive(Debug)]
+    struct TestSurface {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Surface for TestSurface {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn size(&self) -> (u32, u32) {
+            (640, 480)
+        }
+    }
+
+    impl Drop for TestSurface {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn test_surface(drops: &Arc<AtomicUsize>) -> SurfaceRef {
+        Arc::new(TestSurface {
+            drops: Arc::clone(drops),
+        })
+    }
 
     struct RegisteredHost(HostId);
 
@@ -208,11 +271,78 @@ mod tests {
         }
     }
 
+    fn register_test_host(id: HostId) -> RegisteredHost {
+        let (tx, critical_tx, _rx) = shared::host_channel::channel(1);
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        assert!(
+            register_sender(id, tx, critical_tx, Arc::new(AtomicBool::new(false)), gate,).is_none()
+        );
+        RegisteredHost(id)
+    }
+
+    #[test]
+    fn surface_lifecycle_is_scoped_to_the_registered_host() {
+        let id = alloc_host_id();
+        let _registration = register_test_host(id);
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        let first = lease_surface(id, test_surface(&drops)).unwrap();
+        assert_eq!(first.generation().get(), 1);
+        assert!(first.is_live());
+
+        assert_eq!(retire_surface(id).unwrap(), Some(first.generation()));
+        assert!(!first.is_live());
+        assert_eq!(retire_surface(id).unwrap(), None);
+
+        let second = lease_surface(id, test_surface(&drops)).unwrap();
+        assert_eq!(second.generation().get(), 2);
+        assert!(second.is_live());
+        assert!(!first.is_live());
+
+        drop(first);
+        drop(second);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn missing_host_rejects_and_drops_the_candidate_surface() {
+        let id = alloc_host_id();
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        assert!(lease_surface(id, test_surface(&drops)).is_err());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(retire_surface(id).is_err());
+    }
+
+    #[test]
+    fn shutdown_retires_the_surface_before_the_queue_nudge() {
+        let id = alloc_host_id();
+        let _registration = register_test_host(id);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let lease = lease_surface(id, test_surface(&drops)).unwrap();
+
+        shutdown_host(id).unwrap();
+
+        assert!(!lease.is_live());
+        assert_eq!(retire_surface(id).unwrap(), None);
+        assert!(lease_surface(id, test_surface(&drops)).is_err());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn critical_commands_bypass_saturated_normal_budget_in_fifo_order() {
         let id = alloc_host_id();
         let (tx, critical_tx, mut rx) = shared::host_channel::channel(1);
-        assert!(register_sender(id, tx, critical_tx, Arc::new(AtomicBool::new(false))).is_none());
+        assert!(
+            register_sender(
+                id,
+                tx,
+                critical_tx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(SurfaceGenerationGate::new()),
+            )
+            .is_none()
+        );
         let _registration = RegisteredHost(id);
 
         send_command_to_host(id, HostCommand::Restart).unwrap();

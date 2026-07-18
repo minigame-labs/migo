@@ -3,6 +3,10 @@ plugins {
 }
 
 def supportedMigoAbis = ['arm64-v8a', 'x86_64']
+def supportedMigoTargets = [
+        'arm64-v8a': [arch: 'aarch64', triple: 'aarch64-linux-android'],
+        'x86_64'   : [arch: 'x86_64', triple: 'x86_64-linux-android']
+]
 def migoAbis = providers.gradleProperty('migoAbis')
         .getOrElse(supportedMigoAbis.join(','))
         .split(',')
@@ -29,6 +33,17 @@ if (!supportedMigoWorkerSnapshotValues.contains(migoWorkerSnapshotValue)) {
 }
 def migoWorkerSnapshot = migoWorkerSnapshotValue == 'true'
 def migoWorkerSnapshotSuffix = migoWorkerSnapshot ? '-worker-snapshot' : ''
+
+def supportedVerifiedReleasePackagingValues = ['true', 'false']
+def migoVerifiedReleasePackagingValue = providers.gradleProperty('migoVerifiedReleasePackaging')
+        .getOrElse('false')
+if (!supportedVerifiedReleasePackagingValues.contains(migoVerifiedReleasePackagingValue)) {
+    throw new GradleException(
+            "Invalid -PmigoVerifiedReleasePackaging=${migoVerifiedReleasePackagingValue}; expected true or false")
+}
+def migoVerifiedReleasePackaging = migoVerifiedReleasePackagingValue == 'true'
+def migoArtifactManifestToolValue = providers.gradleProperty('migoArtifactManifestTool')
+        .getOrElse('')
 
 // An explicit candidate may only configure a full-release artifact. The
 // default property is false, so ordinary IDE sync and every shipping task keep
@@ -133,7 +148,13 @@ android {
     sourceSets {
         main {
             jniLibs.srcDirs = []
-            assets.srcDirs = ['src/main/assets']
+            // Artifact manifests are generated only after `gradle clean` by
+            // scripts/build-aar.sh. Keeping them under build/ prevents stale
+            // identity from leaking into a later variant.
+            assets.srcDirs = [
+                    'src/main/assets',
+                    "$buildDir/generated/migoArtifactManifest/assets"
+            ]
             // include generated BuildInfo.java
             java.srcDirs += "$buildDir/generated/source/buildinfo"
         }
@@ -142,6 +163,155 @@ android {
         }
         slim {
             jniLibs.srcDirs = ["../../../engine/jniLibs/slim${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}"]
+        }
+    }
+}
+
+// A release AAR is a verified artifact only when build-aar.sh has generated
+// and verified its per-slice identities. This gate prevents an accidental
+// direct `gradle assemble*Release` from producing an unidentifiable package.
+// The final AAR byte verification and external attestation still run in
+// build-aar.sh after Gradle has completed.
+def migoArtifactManifestRoot = layout.buildDirectory.dir(
+        'generated/migoArtifactManifest/assets/migo/artifacts')
+def migoArtifactManifestPackageRoot = layout.buildDirectory.dir(
+        'generated/migoArtifactManifest')
+['Full': 'full', 'Slim': 'slim'].each { variantName, productProfile ->
+    def releaseNativeRoot = layout.projectDirectory.dir(
+            "../../../engine/jniLibs/${productProfile}${migoNativeProfileSuffix}${migoWorkerSnapshotSuffix}")
+    def gate = tasks.register("verifyMigoReleaseArtifactPackaging${variantName}") {
+        group = 'verification'
+        description = "Require verified Migo manifests before assembling ${productProfile} release"
+        inputs.property('migoVerifiedReleasePackaging', migoVerifiedReleasePackagingValue)
+        inputs.property('migoArtifactManifestTool', migoArtifactManifestToolValue)
+        outputs.upToDateWhen { false }
+
+        doLast {
+            if (!migoVerifiedReleasePackaging) {
+                throw new GradleException(
+                        'Direct release assembly is unsupported; use scripts/build-aar.sh')
+            }
+            def manifestRoot = migoArtifactManifestRoot.get().asFile
+            def indexFile = new File(manifestRoot, 'package-index.json')
+            if (!indexFile.isFile()) {
+                throw new GradleException("Verified package index is missing: ${indexFile}")
+            }
+            if (migoArtifactManifestToolValue.isEmpty()) {
+                throw new GradleException(
+                        'Verified release packaging requires the manifest tool from scripts/build-aar.sh')
+            }
+            def manifestTool = new File(migoArtifactManifestToolValue)
+            if (!manifestTool.isFile() || !manifestTool.canExecute()) {
+                throw new GradleException(
+                        "Artifact manifest tool is missing or not executable: ${manifestTool}")
+            }
+            def packageRoot = migoArtifactManifestPackageRoot.get().asFile
+            def verifyProcess = new ProcessBuilder(
+                    manifestTool.absolutePath,
+                    'verify-index',
+                    indexFile.absolutePath,
+                    packageRoot.absolutePath)
+                    .redirectErrorStream(true)
+                    .start()
+            def verifyOutput = verifyProcess.inputStream.getText('UTF-8').trim()
+            if (verifyProcess.waitFor() != 0) {
+                throw new GradleException(
+                        "Artifact manifest tool rejected the package index: ${verifyOutput}")
+            }
+            def index = new groovy.json.JsonSlurper().parse(indexFile)
+            if (index.schema != 'migo-artifact-package-index/v1') {
+                throw new GradleException("Unsupported package index schema ${index.schema}")
+            }
+            if (index.product_profile != productProfile) {
+                throw new GradleException(
+                        "Package index profile ${index.product_profile} does not match ${productProfile}")
+            }
+            if (index.build_type != 'release') {
+                throw new GradleException(
+                        "Package index build type ${index.build_type} is not release")
+            }
+            if (index.codegen_profile != migoCodegenProfile) {
+                throw new GradleException(
+                        "Package index codegen profile ${index.codegen_profile} does not match ${migoCodegenProfile}")
+            }
+            if (!(index.slices instanceof Collection) || index.slices.size() != migoAbis.size()) {
+                throw new GradleException(
+                        "Package index must contain exactly ${migoAbis.size()} requested slice(s)")
+            }
+
+            def sha256 = { File source ->
+                if (!source.isFile()) {
+                    throw new GradleException("Verified artifact input is missing: ${source}")
+                }
+                def digest = java.security.MessageDigest.getInstance('SHA-256')
+                source.withInputStream { input ->
+                    byte[] buffer = new byte[64 * 1024]
+                    int count
+                    while ((count = input.read(buffer)) != -1) {
+                        digest.update(buffer, 0, count)
+                    }
+                }
+                digest.digest().encodeHex().toString()
+            }
+            def sha256Pattern = ~/[0-9a-f]{64}/
+            migoAbis.each { abi ->
+                def expectedTarget = supportedMigoTargets[abi]
+                def manifestPath = "assets/migo/artifacts/slices/${abi}.json"
+                def entries = index.slices.findAll { entry ->
+                    entry instanceof Map && entry.manifest_path == manifestPath
+                }
+                if (entries.size() != 1) {
+                    throw new GradleException(
+                            "Package index must contain exactly one ${manifestPath}")
+                }
+                def entry = entries[0]
+                def slice = new File(manifestRoot, "slices/${abi}.json")
+                if (!slice.isFile()) {
+                    throw new GradleException("Verified slice manifest is missing: ${slice}")
+                }
+                def sliceHash = sha256(slice)
+                if (!(entry.manifest_sha256 instanceof String) ||
+                        !(entry.manifest_sha256 ==~ sha256Pattern) ||
+                        entry.manifest_sha256 != sliceHash) {
+                    throw new GradleException(
+                            "Package index manifest hash does not match ${manifestPath}")
+                }
+                def identity = new groovy.json.JsonSlurper().parse(slice)
+                if (identity.schema != 'migo-artifact-manifest/v1' ||
+                        identity.product_profile != productProfile ||
+                        identity.build_type != 'release' ||
+                        identity.codegen_profile != migoCodegenProfile) {
+                    throw new GradleException(
+                            "Slice identity profile/build/codegen does not match ${abi} release")
+                }
+                if (identity.target?.arch != expectedTarget.arch ||
+                        identity.target?.triple != expectedTarget.triple ||
+                        identity.target?.runtime_floor?.android_api != '26' ||
+                        entry.arch != expectedTarget.arch ||
+                        entry.target_triple != expectedTarget.triple) {
+                    throw new GradleException(
+                            "Slice target identity does not match Android API 26 ${abi}")
+                }
+                if (!(identity.artifact_id instanceof String) ||
+                        !(identity.artifact_id ==~ sha256Pattern) ||
+                        entry.artifact_id != identity.artifact_id) {
+                    throw new GradleException(
+                            "Package index artifact_id does not match ${abi} slice")
+                }
+                def nativeRoot = new File(releaseNativeRoot.asFile, abi)
+                if (identity.hashes?.runtime_binary != sha256(new File(nativeRoot, 'libmigo.so')) ||
+                        identity.hashes?.cxx_runtime != sha256(new File(nativeRoot, 'libc++_shared.so'))) {
+                    throw new GradleException(
+                            "Slice JNI hashes do not match the release inputs for ${abi}")
+                }
+            }
+        }
+    }
+    tasks.configureEach { task ->
+        if (task.name == "pre${variantName}ReleaseBuild" ||
+                task.name == "assemble${variantName}Release" ||
+                task.name == "bundle${variantName}ReleaseAar") {
+            task.dependsOn(gate)
         }
     }
 }

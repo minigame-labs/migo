@@ -3,6 +3,11 @@
 **/target
 **/*.rs.bk
 Cargo.lock
+# ...except the application/tool lockfiles, which are committed so builds are
+# reproducible. CI runs these with `--locked`, which fails outright when the
+# lockfile is missing.
+!engine/Cargo.lock
+!tools/artifact-manifest/Cargo.lock
 
 # Build outputs
 *.aar

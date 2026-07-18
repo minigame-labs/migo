@@ -32,19 +32,18 @@
 //!         (self.width, self.height)
 //!     }
 //!
-//!     fn raw_window_handle(&self) -> RawWindowHandle {
-//!         RawWindowHandle::AndroidNdk(AndroidNdkWindowHandle::new(
-//!             self.native_window
-//!         ))
-//!     }
-//!     // ...
 //! }
 //! ```
 
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
+mod attachment;
 mod geometry;
 
+pub use attachment::{
+    SurfaceGeneration, SurfaceGenerationError, SurfaceGenerationGate, SurfaceLease,
+    SurfaceLivenessToken,
+};
 pub use geometry::{SafeArea, WindowInfo};
 
 /// A platform window/surface abstraction used by the renderer.
@@ -62,6 +61,10 @@ pub use geometry::{SafeArea, WindowInfo};
 /// - **Android**: Wraps `ANativeWindow*` from the NDK
 /// - **Desktop (future)**: Could wrap winit `Window` or raw X11/Wayland handles
 pub trait Surface: std::fmt::Debug + Send + Sync {
+    /// Type-erased platform payload access for the selected presenter.
+    /// Downcasts are control-path only and must fail closed.
+    fn as_any(&self) -> &dyn Any;
+
     /// Returns the physical size of the surface in pixels.
     ///
     /// This is the actual framebuffer size, not the logical (CSS pixel) size.
@@ -71,35 +74,6 @@ pub trait Surface: std::fmt::Debug + Send + Sync {
     ///
     /// Tuple of `(width, height)` in physical pixels.
     fn size(&self) -> (u32, u32);
-
-    /// Returns the raw window handle for native graphics API integration.
-    ///
-    /// This handle is used by EGL/OpenGL to create a rendering surface.
-    /// The specific handle type depends on the platform:
-    ///
-    /// - `AndroidNdk`: Contains `ANativeWindow*`
-    /// - `Xlib`/`Wayland`: Contains X11/Wayland window handles
-    /// - `Win32`: Contains HWND
-    fn raw_window_handle(&self) -> raw_window_handle::RawWindowHandle;
-
-    /// Returns the raw display handle for the platform's display server.
-    ///
-    /// Required by EGL to connect to the display system:
-    ///
-    /// - `AndroidNdk`: No display handle needed (returns Android variant)
-    /// - `Xlib`: Contains X11 `Display*`
-    /// - `Wayland`: Contains `wl_display*`
-    fn raw_display_handle(&self) -> raw_window_handle::RawDisplayHandle;
-
-    /// Monotonic destroy-epoch captured when this surface was handed off from
-    /// the platform layer. The render thread compares it against the live
-    /// per-host destroy counter each frame: if a `surfaceDestroyed` has occurred
-    /// since (live counter advanced past this value), the surface is stale and
-    /// must not be presented to. Defaults to 0 for platforms without surface
-    /// teardown semantics.
-    fn surface_epoch(&self) -> u64 {
-        0
-    }
 }
 
 /// Thread-safe reference to a surface.

@@ -49,6 +49,29 @@ jobs:
         working-directory: engine
         run: cargo fmt --all -- --check
 
+      - name: C ABI and Surface candidate contract
+        run: |
+          bash scripts/test-c-abi-surface-candidate.sh
+          CC=clang CXX=clang++ bash scripts/test-c-abi-surface-candidate.sh
+
+      - name: SurfaceAttachment lifecycle contract
+        run: bash scripts/test-surface-attachment-contract.sh
+
+      - name: Platform/V8 dependency boundary contract
+        run: bash scripts/test-platform-v8-boundary-contract.sh
+
+      - name: Core/V8 dependency boundary contract
+        run: bash scripts/test-core-v8-boundary-contract.sh
+
+      - name: Platform services capability contract
+        run: bash scripts/test-platform-services-capability-contract.sh
+
+      - name: Artifact manifest tooling and contract
+        run: |
+          cargo fmt --manifest-path tools/artifact-manifest/Cargo.toml -- --check
+          cargo test --manifest-path tools/artifact-manifest/Cargo.toml --locked
+          bash scripts/test-artifact-manifest-contract.sh
+
       # Host clippy/test are SCOPED to the crates that build on a plain Linux
       # host: shared, io, js-runtime. The graphics (skia → needs EGL/GLES dev
       # headers) and audio (alsa-sys → needs libasound) crates only build with
@@ -90,7 +113,14 @@ jobs:
           bash scripts/test-r8-profile-contract.sh
 
       - name: Python script syntax check
-        run: python3 -m py_compile scripts/ci/compare_baseline.py scripts/ci/check_migo_test_suite.py
+        run: |
+          python3 -m py_compile \
+            scripts/ci/compare_baseline.py \
+            scripts/ci/check_migo_test_suite.py \
+            scripts/generate-android-artifact-manifests.py \
+            scripts/write-android-build-metadata.py \
+            scripts/write-v8-component-manifest.py \
+            scripts/verify-android-aar-manifests.py
 
   # ── Job 2: Android AAR build — the real "does the whole project compile,
   # link, and embed the profile/ABI snapshot" gate (cross-compiles graphics/audio
@@ -168,6 +198,15 @@ jobs:
           echo "$ANDROID_HOME/ndk/23.2.8568313/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
           cargo install cargo-ndk --locked
 
+      # Layout-only compatibility check. This does not publish or claim an
+      # armeabi-v7a artifact; it exercises the 8-byte uint64_t alignment used
+      # by ARM ILP32 at the Android API 26 floor.
+      - name: C ABI API 26 ARMv7 layout contract
+        run: |
+          CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi26-clang" \
+          CXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi26-clang++" \
+            bash scripts/test-c-abi-surface-candidate.sh
+
       - name: Gradle cache
         uses: actions/cache@v5
         with:
@@ -176,6 +215,9 @@ jobs:
             ~/.gradle/wrapper
           key: gradle-${{ hashFiles('platforms/android/**/*.gradle*') }}
           restore-keys: gradle-
+
+      - name: Release artifact manifest gate contract
+        run: bash scripts/test-android-release-manifest-gate.sh
 
       # Build both products for both shipped ABIs. build.rs embeds only the
       # matching SNAPSHOT-<profile>-<arch>.bin after schema-v2 validation.

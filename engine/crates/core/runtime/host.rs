@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -8,8 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use deno_core::ModuleLoader;
-use deno_core::serde_json::Value;
+use serde_json::Value;
 use tracing::{error, info, warn};
 
 use shared::{
@@ -20,11 +18,11 @@ use shared::{
     protocol::host_cmd::HostCommand,
     protocol::render_cmd::{CanvasCmd, RenderCommand},
     render_event::{RenderEvent, RenderEventReceiver},
-    surface::SurfaceRef,
+    surface::SurfaceLease,
 };
 
 use crate::{
-    runtime::{HostId, code_cache, loader::MyModuleLoader, vsync},
+    runtime::{HostId, vsync},
     services::{AudioService, PlatformServices, RenderService},
 };
 
@@ -239,7 +237,8 @@ impl Host {
     pub(crate) fn new(
         id: HostId,
         host_tx: HostTx,
-        surface: SurfaceRef,
+        surface: SurfaceLease,
+        graphics_platform: graphics::egl_platform::GraphicsPlatform,
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,
     ) -> EngineResult<Self> {
@@ -335,6 +334,7 @@ impl Host {
             vsync_rx,
             id,
             surface,
+            graphics_platform,
             init_options.pixel_ratio(),
             init_options.target_fps(),
             Some(init_options.cache_dir().to_path_buf()),
@@ -397,24 +397,6 @@ impl Host {
             startup_guard.mark_console_registered();
         }
 
-        // ---- Code cache (V8 bytecode persistence) ----
-        let shared_cache = code_cache::create_code_cache(init_options.cache_dir());
-
-        // SharedMountTableRef: created here, shared with the module loader
-        // and HostJsRuntime. evaluate_module() populates it later.
-        let loader_mount_ref: js_runtime::SharedMountTableRef =
-            Rc::new(std::cell::RefCell::new(None));
-        let module_loader: Option<Rc<dyn ModuleLoader>> = Some(Rc::new(MyModuleLoader::new(
-            Some(shared_cache.clone()),
-            loader_mount_ref.clone(),
-        )));
-
-        let ext_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>> =
-            Some(code_cache::ExtCodeCacheAdapter::new(shared_cache));
-
-        // ---- Extensions ----
-        let extra_ext = platform.extensions(&init_options);
-
         let t_pre_js_done = Instant::now();
         info!(
             "[Host {}] pre-JS services: {:.1}ms (render launched + host state wired)",
@@ -431,10 +413,7 @@ impl Host {
         let mut js = HostJsRuntime::new(
             id as i32,
             host_state,
-            extra_ext,
-            module_loader,
-            ext_code_cache,
-            loader_mount_ref,
+            init_options.cache_dir(),
             #[cfg(feature = "v8-limits")]
             v8_limits,
             #[cfg(feature = "code-signing")]
@@ -774,9 +753,9 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::UpdateSurface { surface } => self.on_update_surface(surface),
-            HostCommand::SurfaceDestroyed => {
-                self.render.on_surface_destroyed();
+            HostCommand::UpdateSurface { lease } => self.on_update_surface(lease),
+            HostCommand::SurfaceDestroyed { generation } => {
+                self.render.on_surface_destroyed(generation);
                 Ok(())
             }
 
@@ -1120,15 +1099,14 @@ impl Host {
         if options_json.is_empty() {
             return format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()");
         }
-        match deno_core::serde_json::from_str::<Value>(options_json) {
+        match serde_json::from_str::<Value>(options_json) {
             Ok(value) if value.is_object() => {
                 // Round-trip through serde_json::to_string and pass via
                 // JSON.parse() with proper JS string escaping. Display on a
                 // serde_json::Value is *mostly* JS-safe, but U+2028/U+2029 are
                 // valid JSON yet act as line terminators in JS source, so
                 // JSON.parse(escaped_string) is universally safe.
-                let json_str =
-                    deno_core::serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
+                let json_str = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
                 let escaped = escape_for_js_string(&json_str);
                 format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow(JSON.parse('{escaped}'))")
             }
@@ -1162,8 +1140,8 @@ impl Host {
         );
     }
 
-    fn on_update_surface(&mut self, surface: SurfaceRef) -> EngineResult<()> {
-        let (w, h) = surface.size();
+    fn on_update_surface(&mut self, lease: SurfaceLease) -> EngineResult<()> {
+        let (w, h) = lease.size();
         info!(
             "[Host {}] on_update_surface: requested={}x{}",
             self.id, w, h
@@ -1174,7 +1152,7 @@ impl Host {
         // dropped recreate would strand the app on a black frame with no further
         // surface callback from Java. Surface updates are rare, so a few host-
         // thread retries are an acceptable tradeoff for not losing the surface.
-        let mut result = self.render.update_surface(surface.clone());
+        let mut result = self.render.update_surface(lease.clone());
         let mut attempts = 1u32;
         while result.is_err() && attempts < 3 {
             attempts += 1;
@@ -1182,7 +1160,7 @@ impl Host {
                 "[Host {}] on_update_surface attempt {} after error: {:?}",
                 self.id, attempts, result
             );
-            result = self.render.update_surface(surface.clone());
+            result = self.render.update_surface(lease.clone());
         }
 
         // Resume the foreground after the surface is (re)created — but only when
@@ -1251,21 +1229,6 @@ impl Host {
             gpu_caps: self.gpu_caps.clone(),
         };
 
-        // ---- Code cache (V8 bytecode persistence) ----
-        let shared_cache = code_cache::create_code_cache(self.init_options.cache_dir());
-
-        let loader_mount_ref: js_runtime::SharedMountTableRef =
-            Rc::new(std::cell::RefCell::new(None));
-        let module_loader: Option<Rc<dyn ModuleLoader>> = Some(Rc::new(MyModuleLoader::new(
-            Some(shared_cache.clone()),
-            loader_mount_ref.clone(),
-        )));
-
-        let ext_code_cache: Option<Rc<dyn deno_core::ExtCodeCache>> =
-            Some(code_cache::ExtCodeCacheAdapter::new(shared_cache));
-
-        let extra_ext = self.platform.extensions(&self.init_options);
-
         // drain_shared_image_cache() returns shared IDs and clears the JS-side
         // bookkeeping (process-global).  We must send DestroyImage for each ID
         // *before* clearing the IO cache — otherwise the render thread holds
@@ -1313,10 +1276,7 @@ impl Host {
         let mut new_js = HostJsRuntime::new(
             self.id as i32,
             host_state,
-            extra_ext,
-            module_loader,
-            ext_code_cache,
-            loader_mount_ref,
+            self.init_options.cache_dir(),
             #[cfg(feature = "v8-limits")]
             v8_limits,
             #[cfg(feature = "code-signing")]

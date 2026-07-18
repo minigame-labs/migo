@@ -1,20 +1,9 @@
 use std::sync::Arc;
 
-use deno_core::Extension;
-use shared::config::InitOptions;
-
 use super::DeviceServices;
 
-/// Platform-specific services and extensions.
-///
-/// Each platform (Android, iOS, etc.) implements this trait to provide:
-/// - Deno extensions with platform-specific ops
-/// - Device services (clipboard, sensors, etc.)
-/// - Error notification to the host app
-pub trait PlatformServices: Send + Sync {
-    /// Get platform-specific Deno extensions.
-    fn extensions(&self, opts: &InitOptions) -> Vec<Extension>;
-
+/// Device-service factory capability supplied by a platform Host Kit.
+pub trait DeviceServiceProvider: Send + Sync {
     /// Create device services for a specific host session.
     ///
     /// # Arguments
@@ -24,7 +13,10 @@ pub trait PlatformServices: Send + Sync {
     fn create_device_services(&self, _host_id: i32) -> Option<Arc<dyn DeviceServices>> {
         None
     }
+}
 
+/// Display frame-clock capability supplied by a platform Host Kit.
+pub trait FrameClock: Send + Sync {
     /// Whether this platform supplies frame timestamps through the external
     /// vsync channel. Platforms returning `false` keep the render thread's
     /// software ticker enabled.
@@ -45,7 +37,10 @@ pub trait PlatformServices: Send + Sync {
     fn request_vsync(&self, _host_id: i32) {
         // Default: no-op.
     }
+}
 
+/// Host-application notification callbacks supplied by a platform Host Kit.
+pub trait HostNotifier: Send + Sync {
     /// Notify the host application that the game module has been loaded and
     /// is ready to run.
     ///
@@ -96,3 +91,14 @@ pub trait PlatformServices: Send + Sync {
         // Default: no-op.
     }
 }
+
+/// Backend-neutral services supplied by a platform Host Kit, composed of the
+/// device, frame-clock, and notification capability interfaces.
+///
+/// A platform (Android, iOS, etc.) implements the three capability traits; the
+/// blanket impl below provides this marker automatically, so `core` can keep a
+/// single `Arc<dyn PlatformServices>` handle while platforms implement focused
+/// interfaces rather than one growing trait.
+pub trait PlatformServices: DeviceServiceProvider + FrameClock + HostNotifier {}
+
+impl<T> PlatformServices for T where T: DeviceServiceProvider + FrameClock + HostNotifier {}

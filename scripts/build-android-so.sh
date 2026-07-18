@@ -27,11 +27,13 @@ set -euo pipefail
 # report shows <1.5% of active Android devices below API 26.
 ANDROID_API=26
 
-CRATE_NAME="platform"
+# The cdylib is its own crate so that `platform` can stay an rlib (host builds
+# and tests cannot link V8 into a shared object; see CLAUDE.md §10). Its
+# `[lib] name` is `migo`, so cargo emits the shipping name directly.
+CRATE_NAME="android-jni"
 CRATE_DIR="crates/$CRATE_NAME"
 
-# cargo output naming rule: lib{crate}.so
-CRATE_SO_NAME="lib$CRATE_NAME.so"
+CRATE_SO_NAME="libmigo.so"
 OUTPUT_SO_NAME="libmigo.so"
 
 declare -A PLATFORM_MAP=(

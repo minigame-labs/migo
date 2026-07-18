@@ -54,6 +54,9 @@ link_runtime_so() {
 link_runtime_so "libfontconfig.so.1"
 link_runtime_so "libfreetype.so.6"
 link_runtime_so "libEGL.so.1"
+# Desktop GL exports the gl* entry points Skia (skia_use_gl=true) references;
+# the Linux dev player links -lGL against it (see engine/crates/player/build.rs).
+link_runtime_so "libGL.so.1"
 
 # ---- ninja --------------------------------------------------------------
 if ! command -v ninja >/dev/null 2>&1; then

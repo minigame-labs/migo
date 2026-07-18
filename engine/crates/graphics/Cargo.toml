@@ -42,10 +42,8 @@ tokio = { workspace = true }
 skia-safe = { workspace = true }
 crossbeam-channel = { workspace = true }
 tracing = { workspace = true }
-raw-window-handle = { workspace = true }
 shared = { path = "../shared", default-features = false }
 
-libloading = { version = "^0.8" }
 parking_lot = "0.12.4"
 bytemuck = { workspace = true }
 lru = { workspace = true }

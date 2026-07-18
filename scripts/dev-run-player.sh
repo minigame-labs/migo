@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# scripts/dev-run-player.sh
+#
+# Build + run the headless Linux dev player (engine/crates/player) on
+# x86_64-unknown-linux-gnu, rendering a wx-style minigame bundle offscreen.
+#
+# Usage:
+#   scripts/dev-run-player.sh [GAME_BUNDLE_DIR] [SECONDS]
+#
+# `platform` is an rlib and the Android cdylib lives in the `android-jni` crate,
+# so the player links it directly — no crate-type juggling. (A cdylib is built
+# for every target, and on a glibc host the executable-TLS Linux V8 cannot be
+# linked into a shared object: `R_X86_64_TPOFF32 ... cannot be used with
+# -shared`. See CLAUDE.md §10.)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ENGINE_DIR="$REPO_ROOT/engine"
+
+c_info() { echo -e "\033[0;36m[player] $*\033[0m"; }
+c_err()  { echo -e "\033[0;31m[player] $*\033[0m" >&2; }
+
+GAME_DIR="${1:-$REPO_ROOT/../migo-bench/shells/migo-shell/app/src/main/assets/game}"
+SECS="${2:-8}"
+
+# ---- host V8 + Skia toolchain env (see scripts/dev-test-host.sh) ----
+V8_DIR="${MIGO_HOST_V8_DIR:-$REPO_ROOT/../rusty_v8_src/target/x86_64-unknown-linux-gnu/release/gn_out}"
+[[ -f "$V8_DIR/obj/librusty_v8.a" ]] || { c_err "linux-gnu V8 missing: $V8_DIR/obj/librusty_v8.a"; exit 1; }
+bash "$SCRIPT_DIR/dev-setup-skia.sh" >/dev/null
+
+export RUSTY_V8_ARCHIVE="$V8_DIR/obj/librusty_v8.a"
+export RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs"
+export CC="${CC_HOST:-/usr/bin/clang}"
+export CXX="${CXX_HOST:-/usr/bin/clang++}"
+export CPATH="$HOME/.local/skia-headers${CPATH:+:$CPATH}"
+export LIBRARY_PATH="$HOME/.local/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$HOME/.local/lib:/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH="$HOME/.local/bin:$PATH"
+unset ANDROID_NDK ANDROID_NDK_HOME || true
+
+cd "$ENGINE_DIR"
+c_info "building player ..."
+cargo build -p player --offline
+
+c_info "running player: game=$GAME_DIR secs=$SECS"
+exec ./target/debug/migo-player "$GAME_DIR" "$SECS"

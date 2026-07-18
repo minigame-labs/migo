@@ -8,7 +8,7 @@ use deno_core::{
 
 use shared::vfs::MountTable;
 
-use super::code_cache::SharedCodeCache;
+use crate::code_cache::SharedCodeCache;
 
 /// Shared reference to the mount table, updated after `evaluate_module`
 /// creates it. The module loader holds a clone and checks it on every

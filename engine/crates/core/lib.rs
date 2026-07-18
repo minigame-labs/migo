@@ -59,7 +59,7 @@
 //! use shared::protocol::host_cmd::HostCommand;
 //!
 //! // 1. Spawn the host thread
-//! let host_id = spawn_host_thread(surface, platform, init_options)?;
+//! let host_id = spawn_host_thread(surface, graphics_platform, platform, init_options)?;
 //!
 //! // 2. Send commands to run a game
 //! send_command_to_host(host_id, HostCommand::EvaluateModule {
@@ -104,10 +104,10 @@ pub mod services;
 
 pub use runtime::vsync::send_vsync;
 pub use runtime::{
-    bump_destroy_epoch, current_destroy_epoch, send_command_to_host, send_critical_command_to_host,
+    lease_surface, retire_surface, send_command_to_host, send_critical_command_to_host,
     shutdown_host, spawn_host_thread,
 };
-pub use services::PlatformServices;
+pub use services::{DeviceServiceProvider, FrameClock, HostNotifier, PlatformServices};
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]
 compile_error!("profile-full and profile-slim are mutually exclusive");
 #[cfg(all(feature = "worker-snapshot", not(feature = "profile-full")))]

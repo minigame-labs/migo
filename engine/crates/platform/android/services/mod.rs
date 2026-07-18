@@ -523,13 +523,13 @@ impl SystemInfoService for AndroidSystemInfo {
 
     fn get_window_info_json(&self) -> Result<String, ServiceError> {
         let info = jni::get_window_info(self.host_id)?;
-        deno_core::serde_json::to_string(&info)
+        serde_json::to_string(&info)
             .map_err(|e| ServiceError::system(format!("getWindowInfo:fail {}", e)))
     }
 
     fn get_system_settings_json(&self) -> Result<String, ServiceError> {
         let settings = jni::get_system_settings()?;
-        deno_core::serde_json::to_string(&settings)
+        serde_json::to_string(&settings)
             .map_err(|e| ServiceError::system(format!("getSystemSetting:fail {}", e)))
     }
 

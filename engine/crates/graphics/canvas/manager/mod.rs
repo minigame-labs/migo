@@ -1,9 +1,12 @@
 extern crate khronos_egl as egl;
 
-use crate::BoundContext;
 use crate::backend::gl::surface::Canvas2DContext;
 use crate::dirty_region::damage_tracker::ResolvedDamage;
-use egl::EGL1_4;
+use crate::{
+    BoundContext,
+    egl_platform::{EglProvider, PreparedEglSurfaceRef},
+    surface_binding::{CandidateCleanup, InstallPhase, RecreateKind, SurfaceInstallFailure},
+};
 use glow::HasContext;
 
 /// Local shim for the `NativeTextureFromRaw` pattern used in
@@ -83,6 +86,24 @@ struct Canvas2DSnapshotEntry {
     cache_key: Option<Box<shared::text_texture_cache::TextCacheKey>>,
 }
 
+/// Bounded ownership for a window EGLSurface between native creation and
+/// installation in `canvases`.  The slot is populated immediately after
+/// `eglCreateWindowSurface` succeeds, before any later fallible operation.
+///
+/// `context` is optional because context creation is itself fallible.  Once a
+/// context exists it remains owned here until the pair is moved atomically into
+/// the onscreen `CanvasEntry`, or until cleanup proves the EGLSurface no longer
+/// references the native window.
+struct PendingOnscreenEgl {
+    target: PreparedEglSurfaceRef,
+    surface: egl::Surface,
+    context: Option<egl::Context>,
+    /// A preserved DrawingBuffer is ownership-paired with `context`. Moving
+    /// both into this slot before the first make-current keeps a transient
+    /// candidate failure from discarding the last presented frame.
+    drawing_buffer: Option<drawing_buffer::DrawingBuffer>,
+}
+
 /// A budget-rejected upload still holding the caller's oneshot
 /// `resp`, waiting for the next frame's upload budget to open up.
 /// See [`CanvasManager::deferred_uploads`].
@@ -135,7 +156,8 @@ fn decide_async_upload_reject_action(
 
 #[allow(private_interfaces)]
 pub(crate) struct CanvasManager {
-    pub(crate) egl: egl::DynamicInstance<EGL1_4>,
+    egl_provider: std::sync::Arc<dyn EglProvider>,
+    egl: egl_ops::EglRuntime,
     gl: glow::Context,
     display: egl::Display,
     config: egl::Config,
@@ -222,9 +244,18 @@ pub(crate) struct CanvasManager {
     /// trigger a real EGL_CONTEXT_LOST on demand.
     simulated_reset: bool,
 
-    /// Last window handle used by create_onscreen, preserved for context
-    /// loss recovery (re-create surface without waiting for UpdateSurface).
-    last_window: Option<usize>,
+    /// Prepared platform target paired with the installed onscreen EGLSurface.
+    /// It is non-owning; the render binding's current SurfaceLease owns the
+    /// underlying native resource and is dropped after CanvasManager.
+    installed_surface: Option<PreparedEglSurfaceRef>,
+
+    /// At most one partially-created onscreen EGL target.  This is a control
+    /// path only; it adds no work to drawing or presentation.
+    pending_onscreen: Option<PendingOnscreenEgl>,
+
+    /// Makes explicit shutdown and the `Drop` fallback share one idempotent
+    /// teardown path.
+    teardown_complete: bool,
 
     // GL object registries
     pub(crate) programs: HashMap<ProgramId, ProgramMeta>,
@@ -409,14 +440,23 @@ impl CanvasManager {
         &self.gl
     }
 
+    /// Resolve a GL entry point from the exact EGL implementation injected for
+    /// this manager. Used only while constructing render-thread dispatch tables.
+    pub(crate) fn gl_proc_address(&self, symbol: &str) -> *const std::ffi::c_void {
+        self.egl
+            .get_proc_address(symbol)
+            .map(|function| function as *const std::ffi::c_void)
+            .unwrap_or(std::ptr::null())
+    }
+
     pub(crate) fn new_with_resource(
-        egl_lib_path: &str,
+        egl_provider: std::sync::Arc<dyn EglProvider>,
         dpi: f32,
         cache_dir: Option<&std::path::Path>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
     ) -> EngineResult<Self> {
-        let init = egl_ops::init_egl(egl_lib_path)?;
-        let egl = init.egl;
+        let init = egl_ops::init_egl(egl_provider.as_ref())?;
+        let mut egl = init.egl;
         let display = init.display;
         let config = init.config;
         let gles_major = init.gles_major;
@@ -433,6 +473,9 @@ impl CanvasManager {
             gles_major,
             has_robust_context,
         )?;
+        // From this point onward EglRuntime owns the share-group root. Any
+        // later constructor error/panic destroys it and terminates the display.
+        egl.track_resource(resource_ctx, resource_surf);
         let resource = EglContextHandle {
             ctx: resource_ctx,
             surf: resource_surf,
@@ -534,6 +577,7 @@ impl CanvasManager {
         let api_level = crate::device_caps::android_api_level();
         let upload_thread = if device_caps.tier() == crate::device_caps::DeviceTier::TierA {
             crate::upload_thread::UploadThreadHandle::try_spawn(
+                std::sync::Arc::clone(&egl_provider),
                 &egl,
                 display,
                 config,
@@ -618,6 +662,7 @@ impl CanvasManager {
         // Pre-allocate with reasonable capacities to reduce rehashing.
         // Most games use a small number of canvases and GL objects.
         Ok(Self {
+            egl_provider,
             egl,
             gl,
             display,
@@ -639,7 +684,9 @@ impl CanvasManager {
             context_lost: false,
             force_onscreen_recreate: false,
             simulated_reset: false,
-            last_window: None,
+            installed_surface: None,
+            pending_onscreen: None,
+            teardown_complete: false,
             programs: HashMap::with_capacity(16),
             shaders: HashMap::with_capacity(32),
             buffers: HashMap::with_capacity(32),
@@ -770,20 +817,39 @@ impl CanvasManager {
     /// Pass `None` for initial creation and context recovery.
     pub(crate) fn create_onscreen(
         &mut self,
-        window: usize,
+        target: PreparedEglSurfaceRef,
+        recreate_kind: RecreateKind,
         surface_size: Option<(u32, u32)>,
-    ) -> EngineResult<()> {
+        had_usable_previous: bool,
+    ) -> Result<(), SurfaceInstallFailure> {
+        // A prior failed cleanup may still own a window EGLSurface.  Retry its
+        // cleanup before touching the new candidate, but never infer release
+        // from the new operation's error code.
+        if self.pending_onscreen.is_some()
+            && self.cleanup_pending_onscreen() != CandidateCleanup::Released
+        {
+            return Err(SurfaceInstallFailure::from_phase(
+                ee(
+                    ErrorCode::RenderBackendError,
+                    "previous partial onscreen EGL target is still retained",
+                ),
+                false,
+                InstallPhase::PreviousInvalidated,
+                CandidateCleanup::NotRequired,
+            ));
+        }
+
         if let Some((exp_w, exp_h)) = surface_size {
             tracing::info!(
-                "CanvasManager::create_onscreen begin: window=0x{:x}, expected={}x{}",
-                window,
+                target = ?target,
+                "CanvasManager::create_onscreen begin: expected={}x{}",
                 exp_w,
                 exp_h
             );
         } else {
             tracing::info!(
-                "CanvasManager::create_onscreen begin: window=0x{:x}, expected=<none>",
-                window
+                target = ?target,
+                "CanvasManager::create_onscreen begin: expected=<none>"
             );
         }
 
@@ -794,12 +860,28 @@ impl CanvasManager {
         // recreate, since the existing EGLSurface is bound to an abandoned window
         // even if `window`/size compare equal.
         let force_recreate = std::mem::take(&mut self.force_onscreen_recreate);
+        let native_equivalent = self
+            .installed_surface
+            .as_ref()
+            .is_some_and(|installed| installed.same_native_surface(target.as_ref()));
+        let installed_size = self
+            .canvases
+            .get(&id)
+            .map(|entry| (entry.physical_width, entry.physical_height));
+        let install_policy = crate::canvas::classify_surface_install(
+            recreate_kind,
+            native_equivalent,
+            installed_size,
+            surface_size,
+            self.contexts_2d.contains_key(&id),
+            force_recreate,
+        );
 
         // Same native window + same physical dimensions → skip destroy-recreate.
-        if !force_recreate {
+        if install_policy == crate::canvas::InstallPolicy::Skip {
             if let Some((exp_w, exp_h)) = surface_size {
                 if let Some(entry) = self.canvases.get(&id) {
-                    if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
+                    if matches!(entry.kind, SurfaceKind::Window)
                         && entry.physical_width == exp_w
                         && entry.physical_height == exp_h
                     {
@@ -808,6 +890,7 @@ impl CanvasManager {
                             exp_w,
                             exp_h
                         );
+                        self.installed_surface = Some(target);
                         return Ok(());
                     }
                 }
@@ -831,14 +914,14 @@ impl CanvasManager {
         //     — EGLSurface is bound to the ANativeWindow that's
         //     gone);
         //   * there is no existing 2D context (first frame).
-        if !force_recreate {
+        if install_policy == crate::canvas::InstallPolicy::FastResize {
             if let Some((exp_w, exp_h)) = surface_size {
                 if let Some(entry) = self.canvases.get(&id) {
-                    if matches!(entry.kind, SurfaceKind::Window(w) if w == window)
+                    if matches!(entry.kind, SurfaceKind::Window)
                         && self.contexts_2d.contains_key(&id)
                     {
                         tracing::info!(
-                            "CanvasManager::create_onscreen fast resize {}x{} -> {}x{} (same window 0x{window:x})",
+                            "CanvasManager::create_onscreen fast resize {}x{} -> {}x{} (same native surface)",
                             entry.physical_width,
                             entry.physical_height,
                             exp_w,
@@ -877,7 +960,15 @@ impl CanvasManager {
                                 ((physical_h as f32 * obh as f32 / oph).round() as u32).max(1),
                             )
                         };
-                        self.resize_canvas(id, Some(backing_w), Some(backing_h))?;
+                        self.resize_canvas(id, Some(backing_w), Some(backing_h))
+                            .map_err(|error| {
+                                SurfaceInstallFailure::from_phase(
+                                    error,
+                                    had_usable_previous,
+                                    InstallPhase::PreviousInvalidated,
+                                    CandidateCleanup::NotRequired,
+                                )
+                            })?;
                         if let Some(entry) = self.canvases.get_mut(&id) {
                             entry.physical_width = physical_w;
                             entry.physical_height = physical_h;
@@ -890,13 +981,28 @@ impl CanvasManager {
                         self.damage
                             .add(crate::damage_effect::DamageEffect::FullSurface);
                         self.evaluate_bypass();
+                        self.installed_surface = Some(target);
                         return Ok(());
                     }
                 }
             }
         }
 
-        self.last_window = Some(window);
+        // Validate the client API while the previous presentation is still
+        // untouched.  This is the last failure point allowed to report the
+        // previous presentation as usable.
+        self.egl.bind_api(egl::OPENGL_ES_API).map_err(|e| {
+            SurfaceInstallFailure::from_phase(
+                ee(
+                    ErrorCode::RenderBackendError,
+                    format!("eglBindAPI failed: {e:?}"),
+                ),
+                had_usable_previous,
+                InstallPhase::BeforePreviousInvalidation,
+                CandidateCleanup::NotRequired,
+            )
+        })?;
+
         self.context_lost = false;
 
         // Track whether a 2D context existed before destruction, so we can
@@ -913,7 +1019,14 @@ impl CanvasManager {
             // surface leads to buffer size mismatches that SurfaceFlinger
             // rejects ("rejecting buffer"), causing flicker.
             had_2d_context = self.contexts_2d.contains_key(&id);
-            self.destroy_onscreen_internal(id)?;
+            self.destroy_onscreen_internal(id).map_err(|error| {
+                SurfaceInstallFailure::from_phase(
+                    error,
+                    had_usable_previous,
+                    InstallPhase::PreviousInvalidated,
+                    CandidateCleanup::NotRequired,
+                )
+            })?;
         }
 
         // A newly created window surface may not inherit the previous swap
@@ -924,48 +1037,79 @@ impl CanvasManager {
         // The pending plan targets the abandoned surface — drop it too.
         self.pending_present_plan = None;
 
-        self.egl.bind_api(egl::OPENGL_ES_API).map_err(|e| {
-            ee(
-                ErrorCode::RenderBackendError,
-                format!("eglBindAPI failed: {e:?}"),
-            )
-        })?;
-
-        let surf = egl_ops::create_window_surface(&self.egl, self.display, self.config, window)?;
+        let surf = target
+            .create_window_surface(&self.egl, self.display, self.config)
+            .map_err(|error| {
+                SurfaceInstallFailure::from_phase(
+                    error,
+                    had_usable_previous,
+                    InstallPhase::PreviousInvalidated,
+                    CandidateCleanup::NotRequired,
+                )
+            })?;
+        debug_assert!(self.pending_onscreen.is_none());
+        self.pending_onscreen = Some(PendingOnscreenEgl {
+            target,
+            surface: surf,
+            context: None,
+            drawing_buffer: None,
+        });
 
         // R-3: apply robust-context attribs when the driver supports
         // them so the onscreen context signals resets via
         // `glGetGraphicsResetStatus` instead of waiting for the
         // swap-buffers detection path.
         let ctx_attribs = egl_ops::build_ctx_attribs(self.gles_major, self.has_robust_context);
-        let ctx = if let Some(preserved) = self.preserved_ctx.take() {
+        let (ctx, preserved_drawing_buffer) = if let Some(preserved) = self.preserved_ctx.take() {
             tracing::info!(
                 canvas_id = %id,
                 has_robust = self.has_robust_context,
                 "Reusing preserved EGL context for onscreen canvas"
             );
-            preserved
+            // Context and DrawingBuffer are one recovery unit. Stage both
+            // before the first fallible make-current so every cleanup path
+            // can restore the exact pair for the next retry.
+            (preserved, self.preserved_drawing_buffer.take())
         } else {
+            debug_assert!(
+                self.preserved_drawing_buffer.is_none(),
+                "a preserved DrawingBuffer must never outlive its context"
+            );
             tracing::info!(
                 canvas_id = %id,
                 has_robust = self.has_robust_context,
                 gles_major = self.gles_major,
                 "Creating fresh EGL context for onscreen canvas"
             );
-            self.egl
-                .create_context(
-                    self.display,
-                    self.config,
-                    Some(self.resource.ctx),
-                    &ctx_attribs,
-                )
-                .map_err(|e| {
-                    ee(
+            let context = match self.egl.create_context(
+                self.display,
+                self.config,
+                Some(self.resource.ctx),
+                &ctx_attribs,
+            ) {
+                Ok(context) => context,
+                Err(e) => {
+                    let error = ee(
                         ErrorCode::RenderBackendError,
                         format!("eglCreateContext(onscreen) failed: {e:?}"),
-                    )
-                })?
+                    );
+                    let cleanup = self.cleanup_pending_onscreen();
+                    return Err(SurfaceInstallFailure::from_phase(
+                        error,
+                        had_usable_previous,
+                        InstallPhase::CandidateReferenced,
+                        cleanup,
+                    ));
+                }
+            };
+            (context, None)
         };
+        let pending = self
+            .pending_onscreen
+            .as_mut()
+            .expect("window EGLSurface must be staged before its context");
+        pending.context = Some(ctx);
+        pending.drawing_buffer = preserved_drawing_buffer;
 
         // Query EGL for diagnostics only. Some Android stacks report a rotated
         // size here (e.g. 1080x2340 while the Java SurfaceHolder reports
@@ -986,12 +1130,11 @@ impl CanvasManager {
         let (physical_w, physical_h) = if let Some((exp_w, exp_h)) = surface_size {
             if exp_w != queried_w || exp_h != queried_h {
                 tracing::warn!(
-                    "CanvasManager::create_onscreen size mismatch: expected={}x{}, egl_surface={}x{}, window=0x{:x}; using expected size",
+                    "CanvasManager::create_onscreen size mismatch: expected={}x{}, egl_surface={}x{}; using expected size",
                     exp_w,
                     exp_h,
                     queried_w,
-                    queried_h,
-                    window
+                    queried_h
                 );
             }
             (exp_w.max(1), exp_h.max(1))
@@ -1009,21 +1152,42 @@ impl CanvasManager {
             is_onscreen: true,
         };
 
+        let pending = self
+            .pending_onscreen
+            .take()
+            .expect("window EGL target must stay owned until CanvasEntry install");
+        let installed_ctx = pending
+            .context
+            .expect("onscreen EGL context must exist before CanvasEntry install");
         self.canvases.insert(
             id,
             CanvasEntry {
                 info,
-                kind: SurfaceKind::Window(window),
+                kind: SurfaceKind::Window,
                 physical_width: physical_w,
                 physical_height: physical_h,
-                ctx: EglContextHandle { ctx, surf },
-                drawing_buffer: None, // initialized below after make_current
+                ctx: EglContextHandle {
+                    ctx: installed_ctx,
+                    surf: pending.surface,
+                },
+                // A preserved buffer moves with its context before the first
+                // make-current. A fresh buffer is initialized below.
+                drawing_buffer: pending.drawing_buffer,
                 bypass_drawing_buffer: false, // evaluated after DrawingBuffer creation
             },
         );
+        self.installed_surface = Some(pending.target);
 
         // Make current so GL calls work.
-        self.make_current_needed(id)?;
+        if let Err(error) = self.make_current_needed(id) {
+            let cleanup = self.cleanup_failed_onscreen_install(id);
+            return Err(SurfaceInstallFailure::from_phase(
+                error,
+                had_usable_previous,
+                InstallPhase::CandidateReferenced,
+                cleanup,
+            ));
+        }
 
         // Attach the DrawingBuffer (intermediate FBO) for the onscreen canvas.
         // WebGL renders to this FBO; it gets blitted to the window surface on
@@ -1031,7 +1195,11 @@ impl CanvasManager {
         // context was preserved, the DrawingBuffer GL objects are still valid
         // and should be reused.  Reusing them preserves the last frame and
         // avoids a black resume frame before Cocos schedules a new RAF draw.
-        let drawing_buffer = if let Some(db) = self.preserved_drawing_buffer.take() {
+        let staged_drawing_buffer = self
+            .canvases
+            .get_mut(&id)
+            .and_then(|entry| entry.drawing_buffer.take());
+        let drawing_buffer = if let Some(db) = staged_drawing_buffer {
             // Reuse the preserved DrawingBuffer AS-IS, at its own size. That
             // size is the canvas *backing store* the game chose
             // (canvas.width/height), which is INDEPENDENT of the EGL surface
@@ -1162,10 +1330,113 @@ impl CanvasManager {
             }
         }
         if had_2d_context && (!self.contexts_2d.contains_key(&id) || !resized_ok) {
-            context_2d_impl::init_skia_for_canvas(self, id)?;
+            if let Err(error) = context_2d_impl::init_skia_for_canvas(self, id) {
+                let cleanup = self.cleanup_failed_onscreen_install(id);
+                return Err(SurfaceInstallFailure::from_phase(
+                    error,
+                    had_usable_previous,
+                    InstallPhase::CandidateReferenced,
+                    cleanup,
+                ));
+            }
         }
 
         Ok(())
+    }
+
+    /// Release a partially-created candidate window surface.  `Released` is
+    /// returned only after the resource context is current and EGL confirms
+    /// destruction of the window surface.  A failed cleanup restores the slot
+    /// verbatim so the matching Surface lease must remain retained.
+    fn cleanup_pending_onscreen(&mut self) -> CandidateCleanup {
+        let Some(mut pending) = self.pending_onscreen.take() else {
+            return CandidateCleanup::NotRequired;
+        };
+
+        if let Err(error) = self.egl.make_current(
+            self.display,
+            Some(self.resource.surf),
+            Some(self.resource.surf),
+            Some(self.resource.ctx),
+        ) {
+            tracing::error!(
+                target = ?pending.target,
+                ?error,
+                "cannot unbind partial onscreen EGLSurface; retaining target"
+            );
+            self.pending_onscreen = Some(pending);
+            return CandidateCleanup::Failed;
+        }
+        self.bound = BoundContext::Resource;
+
+        if let Err(error) = self.egl.destroy_surface(self.display, pending.surface) {
+            tracing::error!(
+                target = ?pending.target,
+                ?error,
+                "eglDestroySurface failed for partial onscreen target; retaining target"
+            );
+            self.pending_onscreen = Some(pending);
+            return CandidateCleanup::Failed;
+        }
+
+        // The context does not reference the native window. Preserve it for a
+        // retry after the window surface has been conclusively destroyed; this
+        // also keeps the expensive share-group state alive across a transient
+        // make-current/Skia failure.
+        if let Some(context) = pending.context.take() {
+            if self.preserved_ctx.is_none() {
+                self.preserved_ctx = Some(context);
+                debug_assert!(self.preserved_drawing_buffer.is_none());
+                self.preserved_drawing_buffer = pending.drawing_buffer.take();
+            } else if self.preserved_ctx == Some(context) {
+                // Defensive merge for an idempotent retry. This state should
+                // not normally occur on the single render thread.
+                if self.preserved_drawing_buffer.is_none() {
+                    self.preserved_drawing_buffer = pending.drawing_buffer.take();
+                }
+            } else {
+                // Never replace a preserved context that may be paired with a
+                // preserved DrawingBuffer. The rejected candidate context is
+                // unreferenced after its window surface was destroyed.
+                if let Some(db) = pending.drawing_buffer.take() {
+                    if self
+                        .egl
+                        .make_current(
+                            self.display,
+                            Some(self.resource.surf),
+                            Some(self.resource.surf),
+                            Some(context),
+                        )
+                        .is_ok()
+                    {
+                        drawing_buffer::destroy(&self.gl, db);
+                    }
+                    let _ = self.egl.make_current(
+                        self.display,
+                        Some(self.resource.surf),
+                        Some(self.resource.surf),
+                        Some(self.resource.ctx),
+                    );
+                    self.bound = BoundContext::Resource;
+                }
+                let _ = self.egl.destroy_context(self.display, context);
+            }
+        }
+        CandidateCleanup::Released
+    }
+
+    fn cleanup_failed_onscreen_install(&mut self, id: CanvasId) -> CandidateCleanup {
+        match self.destroy_onscreen_internal(id) {
+            Ok(()) => CandidateCleanup::Released,
+            Err(error) => {
+                tracing::error!(
+                    canvas_id = %id,
+                    %error,
+                    "failed to detach rejected onscreen EGL target; retaining target"
+                );
+                CandidateCleanup::Failed
+            }
+        }
     }
 
     fn destroy_onscreen_internal(&mut self, id: CanvasId) -> EngineResult<()> {
@@ -1206,13 +1477,29 @@ impl CanvasManager {
 
             // Switch to the resource (pbuffer) context so the ANativeWindow is
             // properly disconnected before we destroy the onscreen surface.
-            let _ = self.egl.make_current(
+            if let Err(error) = self.egl.make_current(
                 self.display,
                 Some(self.resource.surf),
                 Some(self.resource.surf),
                 Some(self.resource.ctx),
-            );
-            let _ = self.egl.destroy_surface(self.display, entry.ctx.surf);
+            ) {
+                self.canvases.insert(id, entry);
+                self.evaluate_bypass();
+                return Err(ee(
+                    ErrorCode::RenderBackendError,
+                    format!("eglMakeCurrent(resource) before onscreen detach failed: {error:?}"),
+                ));
+            }
+            self.bound = BoundContext::Resource;
+            if let Err(error) = self.egl.destroy_surface(self.display, entry.ctx.surf) {
+                self.canvases.insert(id, entry);
+                self.evaluate_bypass();
+                return Err(ee(
+                    ErrorCode::RenderBackendError,
+                    format!("eglDestroySurface(onscreen) failed: {error:?}"),
+                ));
+            }
+            self.installed_surface = None;
             // Preserve the context for reuse on the next create_onscreen().
             // This avoids losing GL state (textures, shaders) across
             // Android surface destroy/recreate cycles (pause/resume).
@@ -1263,7 +1550,6 @@ impl CanvasManager {
                 self.preserved_drawing_buffer = Some(db);
             }
 
-            self.bound = BoundContext::Resource;
             self.last_swap_interval = -1;
             self.damage_history.clear();
             self.pending_present_plan = None;
@@ -1278,6 +1564,14 @@ impl CanvasManager {
     #[inline]
     pub(crate) fn is_context_lost(&self) -> bool {
         self.context_lost
+    }
+
+    /// Cold-path readiness for rebuilding a lost share group. Platform
+    /// preparation is never repeated here: the installed target is the stable
+    /// non-owning descriptor paired with RenderSurfaceBinding's live lease.
+    #[inline]
+    pub(crate) fn is_surface_recovery_ready(&self) -> bool {
+        self.installed_surface.is_some()
     }
 
     /// Low-memory signal handler (P1-12).  Called by the host
@@ -1465,8 +1759,12 @@ impl CanvasManager {
     ///      (shares the new resource context), and recreate the onscreen
     ///      canvas with a fresh context (`preserved_ctx` is cleared so
     ///      `create_onscreen` cannot reuse the dead one).
-    ///   3. Re-initialise the onscreen 2D (Skia) context if the game had one;
-    ///      offscreen canvases / the atlas rebuild lazily on next use.
+    ///   3. Re-create every other canvas JS still holds an id for — the
+    ///      onscreen 2D (Skia) context and all offscreen canvases — from the
+    ///      [`ShareGroupRestorePlan`] the teardown returned. These have no
+    ///      lazy-rebuild path: JS registers a canvas exactly once, so anything
+    ///      recovery drops is stranded for the life of the process. (The atlas
+    ///      and image registry do rebuild lazily.)
     ///   4. Probe the rebuilt context with a trivial clear + `glGetError` +
     ///      `glGetGraphicsResetStatus`. Only a passing probe returns `Ok(true)`
     ///      so the caller can honestly report `ContextRecovered { success }`.
@@ -1479,71 +1777,27 @@ impl CanvasManager {
         if !self.context_lost {
             return Ok(false);
         }
-        let Some(window) = self.last_window else {
-            tracing::warn!("Cannot recover EGL context: no window handle available");
+        // A previous recovery attempt may have failed after creating a window
+        // EGLSurface. Retry its proof-producing cleanup before touching the
+        // share group. Failed cleanup retains the target and defers recovery.
+        if self.pending_onscreen.is_some()
+            && self.cleanup_pending_onscreen() != CandidateCleanup::Released
+        {
+            tracing::warn!("Cannot recover EGL context: partial window target is still retained");
+            return Ok(false);
+        }
+        let Some(target) = self.installed_surface.clone() else {
+            tracing::warn!("Cannot recover EGL context: no prepared surface target available");
             return Ok(false);
         };
         tracing::warn!("EGL context loss: tearing down and rebuilding the share group");
 
         let onscreen_id = CanvasId::from(1u32);
-        let had_onscreen_2d = self.contexts_2d.contains_key(&onscreen_id);
 
         // ---- Phase 1: hard teardown of the dead share group ----
-        // No `glDelete` — the objects live in a context that is gone. Drop the
-        // Rust-side handles and release EGL objects (destroy_* is safe on a
-        // lost-but-allocated context).
-
-        // Skia contexts: abandoned on the loss path; drop every one so they
-        // rebuild against the new share group. `abandon()` makes Drop a no-op.
-        for (_id, mut ctx) in std::mem::take(&mut self.contexts_2d) {
-            ctx.abandon();
-        }
-        self.dirty_2d.clear();
-
-        // Every canvas's EGL surface + context (onscreen + offscreen).
-        for (_id, entry) in std::mem::take(&mut self.canvases) {
-            self.egl.destroy_surface(self.display, entry.ctx.surf).ok();
-            self.egl.destroy_context(self.display, entry.ctx.ctx).ok();
-        }
-        // Preserved onscreen ctx / DrawingBuffer from a prior resume are dead.
-        if let Some(c) = self.preserved_ctx.take() {
-            self.egl.destroy_context(self.display, c).ok();
-        }
-        self.preserved_drawing_buffer.take();
-
-        // Upload thread shares the dead resource context — stop it (Drop joins
-        // the thread; it does no GL in Drop) before we destroy that context.
-        self.upload_thread.take();
-        self.upload_server.take();
-        self.pending_uploads.clear();
-        self.cancelled_uploads.clear();
-
-        // Resource (root) context + surface.
-        self.egl.make_current(self.display, None, None, None).ok();
-        self.egl
-            .destroy_surface(self.display, self.resource.surf)
-            .ok();
-        self.egl
-            .destroy_context(self.display, self.resource.ctx)
-            .ok();
-
-        // Drop all GL-object bookkeeping (invalid handles; no glDelete).
-        self.programs.clear();
-        self.shaders.clear();
-        self.buffers.clear();
-        self.textures.clear();
-        self.framebuffers.clear();
-        self.renderbuffers.clear();
-        self.vaos.clear();
-        self.queries.clear();
-        self.transform_feedbacks.clear();
-        self.image_copy_fbos.clear();
-        self.gl_state.clear();
-        self.atlas = None;
-        self.image_registry = ImageRegistry::new();
-        self.damage_history.clear();
-        self.pending_present_plan = None;
-        self.last_swap_interval = -1;
+        // Returns the JS-visible canvases the teardown just destroyed; Phase 2
+        // owes their re-creation.
+        let restore = self.tear_down_share_group();
 
         // ---- Phase 2: rebuild the share group ----
         let (resource_ctx, resource_surf) = egl_ops::create_pbuffer_context(
@@ -1556,6 +1810,7 @@ impl CanvasManager {
             self.gles_major,
             self.has_robust_context,
         )?;
+        self.egl.track_resource(resource_ctx, resource_surf);
         self.resource = EglContextHandle {
             ctx: resource_ctx,
             surf: resource_surf,
@@ -1565,6 +1820,7 @@ impl CanvasManager {
         // Respawn the async upload thread on TierA (shares the new resource ctx).
         if self.device_caps.tier() == crate::device_caps::DeviceTier::TierA {
             self.upload_thread = crate::upload_thread::UploadThreadHandle::try_spawn(
+                std::sync::Arc::clone(&self.egl_provider),
                 &self.egl,
                 self.display,
                 self.config,
@@ -1580,7 +1836,7 @@ impl CanvasManager {
             }
         }
 
-        // Recreate the onscreen canvas + 2D context and probe, all inside one
+        // Recreate every canvas the teardown destroyed and probe, all inside one
         // fallible block. `context_lost` must NOT be cleared until the ENTIRE
         // sequence succeeds: `create_onscreen` clears it internally (line ~788)
         // and any later `?` failure or a failed probe would otherwise leave the
@@ -1591,12 +1847,11 @@ impl CanvasManager {
         let rebuilt = (|| -> EngineResult<bool> {
             // `canvases` is empty and `preserved_ctx` is None, so
             // `create_onscreen` builds a fresh onscreen context.
-            self.create_onscreen(window, None)?;
-            // Rebuild the onscreen 2D (Skia) context if the game had one so JS
-            // targeting canvas_id=1 keeps working after the reset.
-            if had_onscreen_2d {
-                context_2d_impl::init_skia_for_canvas(self, onscreen_id)?;
-            }
+            self.create_onscreen(target, RecreateKind::SameGeneration, None, false)
+                .map_err(|failure| failure.error)?;
+            // Settle the teardown's debt: the onscreen 2D context plus every
+            // offscreen canvas whose id JS still holds.
+            self.restore_share_group(&restore, onscreen_id)?;
             // ---- Phase 3: probe the rebuilt context for real usability ----
             Ok(self.probe_context_usable(onscreen_id))
         })();
@@ -1618,6 +1873,120 @@ impl CanvasManager {
                 Err(e)
             }
         }
+    }
+
+    /// Destroy the dead share group and report what the rebuild owes the game.
+    ///
+    /// No `glDelete` — the objects live in a context that is gone. Drop the
+    /// Rust-side handles and release EGL objects (`destroy_*` is safe on a
+    /// lost-but-allocated context).
+    ///
+    /// The returned [`ShareGroupRestorePlan`] is the whole point of the split:
+    /// canvas identity is owned by JS and survives the GPU state, so a teardown
+    /// that is not followed by a matching restore silently strands live JS
+    /// handles. Returning the plan makes that obligation explicit at the type
+    /// level instead of leaving it to whoever edits the recovery path next.
+    fn tear_down_share_group(&mut self) -> ShareGroupRestorePlan {
+        // Snapshot before anything is dropped: the live registry is the single
+        // source of truth for canvas identity and current size.
+        let plan = plan_share_group_restore(
+            self.canvases.iter().map(|(id, entry)| {
+                (
+                    *id,
+                    matches!(entry.kind, SurfaceKind::Pbuffer),
+                    entry.physical_width,
+                    entry.physical_height,
+                )
+            }),
+            |id| self.contexts_2d.contains_key(&id),
+        );
+
+        // Skia contexts: abandoned on the loss path; drop every one so they
+        // rebuild against the new share group. `abandon()` makes Drop a no-op.
+        for (_id, mut ctx) in std::mem::take(&mut self.contexts_2d) {
+            ctx.abandon();
+        }
+        self.dirty_2d.clear();
+
+        // Every canvas's EGL surface + context (onscreen + offscreen).
+        for (_id, entry) in std::mem::take(&mut self.canvases) {
+            self.egl.destroy_surface(self.display, entry.ctx.surf).ok();
+            self.egl.destroy_context(self.display, entry.ctx.ctx).ok();
+        }
+        // Preserved onscreen ctx / DrawingBuffer from a prior resume are dead.
+        if let Some(c) = self.preserved_ctx.take() {
+            self.egl.destroy_context(self.display, c).ok();
+        }
+        self.preserved_drawing_buffer.take();
+
+        // Upload thread shares the dead resource context — stop it (Drop joins
+        // the thread; it does no GL in Drop) before we destroy that context.
+        drop(self.upload_thread.take());
+        self.upload_server.take();
+        self.pending_uploads.clear();
+        self.cancelled_uploads.clear();
+
+        // Resource (root) context + surface.
+        if let Some((resource_ctx, resource_surf)) = self.egl.untrack_resource() {
+            self.egl.make_current(self.display, None, None, None).ok();
+            self.egl.destroy_surface(self.display, resource_surf).ok();
+            self.egl.destroy_context(self.display, resource_ctx).ok();
+        }
+
+        // Drop all GL-object bookkeeping (invalid handles; no glDelete).
+        self.programs.clear();
+        self.shaders.clear();
+        self.buffers.clear();
+        self.textures.clear();
+        self.framebuffers.clear();
+        self.renderbuffers.clear();
+        self.vaos.clear();
+        self.queries.clear();
+        self.transform_feedbacks.clear();
+        self.image_copy_fbos.clear();
+        self.gl_state.clear();
+        self.atlas = None;
+        self.image_registry = ImageRegistry::new();
+        self.damage_history.clear();
+        self.pending_present_plan = None;
+        self.last_swap_interval = -1;
+
+        plan
+    }
+
+    /// Re-create the canvases a [`ShareGroupRestorePlan`] recorded, into the
+    /// share group Phase 2 has just rebuilt.
+    ///
+    /// The onscreen canvas is already back (it needs the window target, so
+    /// `create_onscreen` owns it); this restores its Canvas2D context plus
+    /// every offscreen canvas. Their pixels are gone — same as a browser after
+    /// a GPU reset — but the ids resolve again, which is what keeps the game
+    /// running.
+    ///
+    /// Fails loudly: a partially populated share group is not a recovered one,
+    /// so the caller's all-or-nothing contract keeps `context_lost` set and the
+    /// render thread retries the whole recovery.
+    fn restore_share_group(
+        &mut self,
+        plan: &ShareGroupRestorePlan,
+        onscreen_id: CanvasId,
+    ) -> EngineResult<()> {
+        if plan.onscreen_2d {
+            context_2d_impl::init_skia_for_canvas(self, onscreen_id)?;
+        }
+        for spec in &plan.offscreen {
+            self.register_offscreen(spec.id, spec.width, spec.height)?;
+            if spec.had_2d {
+                context_2d_impl::init_skia_for_canvas(self, spec.id)?;
+            }
+        }
+        if !plan.offscreen.is_empty() {
+            tracing::info!(
+                "EGL recovery re-registered {} offscreen canvas(es)",
+                plan.offscreen.len()
+            );
+        }
+        Ok(())
     }
 
     /// Probe whether a freshly rebuilt onscreen context is actually usable:
@@ -1706,7 +2075,21 @@ impl CanvasManager {
         Ok(())
     }
 
-    pub(crate) fn destroy_all(&mut self, gl: &glow::Context) {
+    /// Idempotent owner teardown used by every explicit exit and by `Drop`.
+    ///
+    /// Order is intentional: the upload worker may still use the shared
+    /// display; Skia/GL objects need a live context; window/offscreen EGL
+    /// objects must go before the resource context; display termination is the
+    /// final authority that releases any driver-retained native window.
+    pub(crate) fn destroy_all(&mut self) {
+        if self.teardown_complete {
+            return;
+        }
+        self.teardown_complete = true;
+
+        drop(self.upload_thread.take());
+        self.upload_server.take();
+
         // destroy_canvas refuses id=1 (onscreen), so handle it separately.
         let onscreen_id = CanvasId::from(1u32);
         if self.canvases.contains_key(&onscreen_id) {
@@ -1723,61 +2106,84 @@ impl CanvasManager {
         unsafe {
             for (_id, p) in self.programs.drain() {
                 if let Some(h) = p.gl_handle {
-                    gl.delete_program(h);
+                    self.gl.delete_program(h);
                 }
             }
             for (_id, s) in self.shaders.drain() {
                 if let Some(h) = s.gl_handle {
-                    gl.delete_shader(h);
+                    self.gl.delete_shader(h);
                 }
             }
             for (_id, b) in self.buffers.drain() {
                 if let Some(h) = b.gl_handle {
-                    gl.delete_buffer(h);
+                    self.gl.delete_buffer(h);
                 }
             }
             for (_id, t) in self.textures.drain() {
                 if let Some(h) = t.gl_handle {
-                    gl.delete_texture(h);
+                    self.gl.delete_texture(h);
                 }
             }
             for (_id, f) in self.framebuffers.drain() {
                 if let Some(h) = f.gl_handle {
-                    gl.delete_framebuffer(h);
+                    self.gl.delete_framebuffer(h);
                 }
             }
             for (_id, fbo) in self.image_copy_fbos.drain() {
-                gl.delete_framebuffer(fbo);
+                self.gl.delete_framebuffer(fbo);
             }
             for (_id, entry) in self.canvas2d_snapshots.drain() {
-                gl.delete_texture(entry.tex);
+                self.gl.delete_texture(entry.tex);
             }
             self.canvas2d_snapshot_order.clear();
             if let Some(fbo) = self.canvas2d_snapshot_blit_fbo.take() {
-                gl.delete_framebuffer(fbo);
+                self.gl.delete_framebuffer(fbo);
             }
             if let Some(fbo) = self.canvas2d_snapshot_read_fbo.take() {
-                gl.delete_framebuffer(fbo);
+                self.gl.delete_framebuffer(fbo);
             }
             for (_id, r) in self.renderbuffers.drain() {
                 if let Some(h) = r.gl_handle {
-                    gl.delete_renderbuffer(h);
+                    self.gl.delete_renderbuffer(h);
                 }
             }
         }
 
         // Images
-        self.image_registry.destroy_all(gl);
+        self.image_registry.destroy_all(&self.gl);
 
-        // Destroy resource
-        let _ = self.egl.make_current(self.display, None, None, None);
-        self.egl
-            .destroy_surface(self.display, self.resource.surf)
-            .ok();
-        self.egl
-            .destroy_context(self.display, self.resource.ctx)
-            .ok();
-        self.egl.terminate(self.display).ok();
+        // A failed install can leave a candidate surface outside `canvases`.
+        // Try the ordinary proof-producing cleanup first; even if the driver
+        // rejects it, final `eglTerminate` below releases the display's native
+        // references before the render binding clears its leases.
+        let _ = self.cleanup_pending_onscreen();
+
+        if let Some(db) = self.preserved_drawing_buffer.take() {
+            if let Some(ctx) = self.preserved_ctx {
+                let _ = self.egl.make_current(
+                    self.display,
+                    Some(self.resource.surf),
+                    Some(self.resource.surf),
+                    Some(ctx),
+                );
+            }
+            drawing_buffer::destroy(&self.gl, db);
+        }
+        if let Some(ctx) = self.preserved_ctx.take() {
+            let _ = self.egl.make_current(
+                self.display,
+                Some(self.resource.surf),
+                Some(self.resource.surf),
+                Some(self.resource.ctx),
+            );
+            let _ = self.egl.destroy_context(self.display, ctx);
+        }
+
+        // Destroy the root pbuffer/context and terminate the display through
+        // the same idempotent owner used by constructor-error and Drop paths.
+        self.egl.shutdown();
+        self.pending_onscreen = None;
+        self.installed_surface = None;
     }
 
     // ==================== Context Binding ====================
@@ -2169,7 +2575,7 @@ impl CanvasManager {
             // the surface size — corrupting the canvas (content renders into a
             // corner of an over-sized DrawingBuffer instead of filling it).
             let (cur_w, cur_h) = match (entry.kind, entry.drawing_buffer.as_ref()) {
-                (SurfaceKind::Window(_), Some(db)) => (db.width, db.height),
+                (SurfaceKind::Window, Some(db)) => (db.width, db.height),
                 _ => (entry.physical_width, entry.physical_height),
             };
             (cur_w, cur_h, entry.kind, entry.ctx.ctx, entry.ctx.surf)
@@ -2186,7 +2592,7 @@ impl CanvasManager {
         // Resize only the DrawingBuffer so canvas.width/height reflects what JS
         // set, and WebGL renders at that resolution. The blit in swap_buffers
         // scales to the actual surface dimensions.
-        if matches!(kind, SurfaceKind::Window(_)) {
+        if matches!(kind, SurfaceKind::Window) {
             self.make_current_needed(id)?;
             if let Some(entry) = self.canvases.get_mut(&id) {
                 if let Some(ref mut db) = entry.drawing_buffer {
@@ -2274,11 +2680,11 @@ impl CanvasManager {
 
         // create new surface
         let new_surf = match kind {
-            SurfaceKind::Window(native_window) => {
-                self.last_swap_interval = -1;
-                self.damage_history.clear();
-                self.pending_present_plan = None;
-                egl_ops::create_window_surface(&self.egl, self.display, self.config, native_window)?
+            SurfaceKind::Window => {
+                return Err(ee(
+                    ErrorCode::InvalidOperation,
+                    "window DrawingBuffer resize must not recreate its platform EGLSurface",
+                ));
             }
             SurfaceKind::Pbuffer => {
                 let pbuf_attribs = [
@@ -2617,6 +3023,16 @@ impl CanvasManager {
                 );
             }
         }
+
+        // One-shot offscreen capture for the headless dev player: read the final
+        // frame from FBO 0 after the blit and before eglSwapBuffers, while the
+        // context is current and the back buffer is still valid. No-op (single
+        // atomic load) unless a capture was explicitly requested.
+        crate::frame_capture::capture_default_fbo(
+            &self.gl,
+            entry.physical_width,
+            entry.physical_height,
+        );
 
         // Only call eglSwapInterval when the value actually changes
         let interval = if wait_for_vsync { 1 } else { 0 };
@@ -4594,33 +5010,10 @@ impl CanvasManager {
 
 impl Drop for CanvasManager {
     fn drop(&mut self) {
-        // Tear down the upload thread first.  Its `Drop` joins the worker,
-        // which finalises the worker's `egl.make_current(None,..)` and
-        // `destroy_context` calls before our own EGL display/context
-        // disappear.  Without this the worker races with EGL teardown
-        // and emits `EGL_BAD_SURFACE` / `EGL_BAD_CONTEXT` at process exit.
-        drop(self.upload_thread.take());
-
-        if let Some(db) = self.preserved_drawing_buffer.take() {
-            if let Some(ctx) = self.preserved_ctx {
-                let _ = self.egl.make_current(
-                    self.display,
-                    Some(self.resource.surf),
-                    Some(self.resource.surf),
-                    Some(ctx),
-                );
-            }
-            drawing_buffer::destroy(&self.gl, db);
-            let _ = self.egl.make_current(
-                self.display,
-                Some(self.resource.surf),
-                Some(self.resource.surf),
-                Some(self.resource.ctx),
-            );
-        }
-        if let Some(ctx) = self.preserved_ctx.take() {
-            let _ = self.egl.destroy_context(self.display, ctx);
-        }
+        // Destructors must not double-panic if an EGL/GL wrapper encounters a
+        // broken driver while the render thread is already unwinding. The
+        // EglRuntime field remains an independent final terminate fallback.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.destroy_all()));
     }
 }
 
@@ -4659,10 +5052,235 @@ fn can_bypass_drawing_buffer(
         && onscreen_db_matches_surface
 }
 
+/// One offscreen canvas that must be re-created after the EGL share group is
+/// rebuilt, captured before the dead group is torn down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OffscreenRestore {
+    pub id: CanvasId,
+    pub width: u32,
+    pub height: u32,
+    /// The canvas had a Skia Canvas2D context. JS holds the corresponding
+    /// context object forever and never re-issues `getContext('2d')`, so
+    /// recovery must re-initialise it rather than wait for a call that
+    /// will not come.
+    pub had_2d: bool,
+}
+
+/// The JS-visible canvas state a share-group teardown destroyed, which the
+/// rebuild must re-create before recovery may report success.
+///
+/// JS owns canvas identity: it allocates offscreen ids itself and posts
+/// `RegisterOffscreen` exactly once, when the canvas is created
+/// (`op_create_offscreen_canvas` is fire-and-forget). Nothing re-registers a
+/// canvas later, and JS keeps its `Canvas`/`CanvasRenderingContext2D` objects
+/// across a context loss, so any canvas dropped by recovery strands a live JS
+/// handle: every later op on it fails `NotFound` and the game silently stops
+/// drawing. Identity therefore outlives the GPU state, and the teardown hands
+/// this plan to the rebuild rather than discarding it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[must_use = "a torn-down share group must be restored or JS-visible canvases silently vanish"]
+pub(super) struct ShareGroupRestorePlan {
+    /// The onscreen canvas had a Skia Canvas2D context. The canvas itself is
+    /// rebuilt by `create_onscreen` (it needs the window target), but its 2D
+    /// context is not.
+    pub onscreen_2d: bool,
+    /// Offscreen canvases, ordered by id.
+    pub offscreen: Vec<OffscreenRestore>,
+}
+
+/// Build the restore plan from the live canvas registry, which is the single
+/// source of truth for canvas identity and current size (`resize_canvas` keeps
+/// `physical_width`/`physical_height` in step with what JS asked for).
+///
+/// Pure so the policy — which canvases carry over, and what has to be rebuilt
+/// for each — is testable without an EGL display.
+fn plan_share_group_restore(
+    canvases: impl Iterator<Item = (CanvasId, bool, u32, u32)>,
+    had_2d: impl Fn(CanvasId) -> bool,
+) -> ShareGroupRestorePlan {
+    let onscreen_id = CanvasId::from(1u32);
+    let mut offscreen: Vec<OffscreenRestore> = canvases
+        .filter(|(id, is_pbuffer, _, _)| *is_pbuffer && *id != onscreen_id)
+        .map(|(id, _, width, height)| OffscreenRestore {
+            id,
+            width,
+            height,
+            had_2d: had_2d(id),
+        })
+        .collect();
+    // The caller iterates a HashMap: sort so recovery order — and the failure
+    // it reports when one canvas cannot be rebuilt — is reproducible.
+    offscreen.sort_unstable_by_key(|spec| spec.id);
+    ShareGroupRestorePlan {
+        onscreen_2d: had_2d(onscreen_id),
+        offscreen,
+    }
+}
+
+/// Source guards for the context-recovery contract. `CanvasManager` cannot be
+/// constructed without an EGL display, so the wiring that pairs the teardown
+/// with its restore is asserted against the source itself — the same technique
+/// `present_damage` and `surface_binding` use for their EGL-bound invariants.
+#[cfg(test)]
+mod recovery_source_guards {
+    const MGR: &str = include_str!("mod.rs");
+
+    fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .expect("function signature must exist");
+        let source = &source[start..];
+        let open = source.find('{').expect("function body must open");
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open + 1..open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("function body must close");
+    }
+
+    #[test]
+    fn teardown_captures_the_restore_plan_before_dropping_canvases() {
+        let body = function_body(MGR, "fn tear_down_share_group");
+        let plan = body
+            .find("plan_share_group_restore(")
+            .expect("teardown must capture what the rebuild owes the game");
+        let drop_canvases = body
+            .find("std::mem::take(&mut self.canvases)")
+            .expect("teardown must drop the canvas registry");
+        assert!(
+            plan < drop_canvases,
+            "the restore plan must be captured while the canvas registry is still populated"
+        );
+    }
+
+    #[test]
+    fn recovery_restores_the_canvases_the_teardown_destroyed() {
+        let body = function_body(MGR, "pub(crate) fn try_recover_context");
+        let teardown = body
+            .find("self.tear_down_share_group()")
+            .expect("recovery must tear down the dead share group");
+        let onscreen = body
+            .find("self.create_onscreen(")
+            .expect("recovery must rebuild the onscreen canvas");
+        let restore = body
+            .find("self.restore_share_group(")
+            .expect("recovery must restore the canvases the teardown destroyed");
+        assert!(
+            teardown < onscreen && onscreen < restore,
+            "order must be teardown -> onscreen rebuild -> restore of the remaining canvases"
+        );
+        let probe = body
+            .find("self.probe_context_usable(")
+            .expect("recovery must probe the rebuilt context");
+        assert!(
+            restore < probe,
+            "the probe must run against a fully restored share group"
+        );
+    }
+
+    #[test]
+    fn offscreen_restore_failure_keeps_the_context_lost() {
+        let body = function_body(MGR, "pub(crate) fn try_recover_context");
+        let restore = body
+            .find("self.restore_share_group(&restore, onscreen_id)?")
+            .expect("restore failure must propagate into the all-or-nothing block");
+        let clears_flag = body
+            .find("self.context_lost = false;")
+            .expect("successful recovery must clear the lost flag");
+        assert!(
+            restore < clears_flag,
+            "a half-restored share group must never report a recovered context"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::damage_effect::{DamageEffect, FrameDamageAccumulator};
+
+    // ---- Share-group restore planning (context-loss recovery) ----
+
+    /// `(id, is_pbuffer, width, height)` as the teardown reads them out of the
+    /// live canvas registry.
+    const ONSCREEN: (CanvasId, bool, u32, u32) = (1, false, 720, 1280);
+
+    #[test]
+    fn restore_plan_carries_offscreen_canvases_at_their_current_size() {
+        // Regression: recovery used to rebuild only the onscreen canvas, so a
+        // game holding an offscreen canvas id (Pixi allocates two at startup)
+        // hit `NotFound` on every later op and stopped rendering.
+        let plan = plan_share_group_restore(
+            [ONSCREEN, (16777217, true, 256, 128)].into_iter(),
+            |_| false,
+        );
+        assert_eq!(
+            plan.offscreen,
+            vec![OffscreenRestore {
+                id: 16777217,
+                width: 256,
+                height: 128,
+                had_2d: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn restore_plan_excludes_the_onscreen_canvas() {
+        // `create_onscreen` owns the onscreen canvas because it needs the
+        // window target; re-registering it as a pbuffer would fight that.
+        let plan = plan_share_group_restore([ONSCREEN].into_iter(), |_| false);
+        assert!(plan.offscreen.is_empty());
+        assert!(!plan.onscreen_2d);
+    }
+
+    #[test]
+    fn restore_plan_records_which_canvases_had_2d_contexts() {
+        // JS holds its 2D context objects across the loss and never re-issues
+        // `getContext('2d')`, so recovery must re-init Skia for both the
+        // onscreen canvas and any offscreen one that had a context.
+        let plan = plan_share_group_restore(
+            [ONSCREEN, (16777216, true, 1, 1), (16777217, true, 1, 1)].into_iter(),
+            |id| id == 1 || id == 16777217,
+        );
+        assert!(plan.onscreen_2d);
+        assert_eq!(
+            plan.offscreen
+                .iter()
+                .map(|spec| (spec.id, spec.had_2d))
+                .collect::<Vec<_>>(),
+            vec![(16777216, false), (16777217, true)]
+        );
+    }
+
+    #[test]
+    fn restore_plan_is_ordered_by_id() {
+        // The registry is a HashMap: without sorting, recovery order (and the
+        // canvas blamed when a rebuild fails) would vary run to run.
+        let plan = plan_share_group_restore(
+            [
+                (16777219, true, 1, 1),
+                ONSCREEN,
+                (16777217, true, 1, 1),
+                (16777218, true, 1, 1),
+            ]
+            .into_iter(),
+            |_| false,
+        );
+        assert_eq!(
+            plan.offscreen.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![16777217, 16777218, 16777219]
+        );
+    }
 
     #[test]
     fn bypass_ok_for_single_webgl_onscreen_canvas() {

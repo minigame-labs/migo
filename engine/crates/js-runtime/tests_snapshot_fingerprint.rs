@@ -413,7 +413,7 @@ fn write_snapshot_manifest_succeeds_without_git() {
     write_file(&fake_git, b"#!/bin/sh\nexit 128\n");
     std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let bin = tmp.join("SNAPSHOT-testarch.bin");
+    let bin = tmp.join("SNAPSHOT-aarch64.bin");
     std::fs::write(&bin, vec![0x53; 100_000]).unwrap();
     let v8_archive = tmp.join("librusty_v8.a");
     // Snapshot generation must use the materialized V8 archive. A tiny Git LFS
@@ -429,7 +429,7 @@ fn write_snapshot_manifest_succeeds_without_git() {
     let output = std::process::Command::new("bash")
         .arg(&script)
         .arg("full")
-        .arg("testarch")
+        .arg("aarch64")
         .arg(&bin)
         .arg("worker")
         .env("MIGO_V8_ARCHIVE", &v8_archive)
@@ -445,7 +445,11 @@ fn write_snapshot_manifest_succeeds_without_git() {
 
     let written = std::fs::read_to_string(&manifest).expect("manifest written");
     assert!(
-        written.contains("\"arch\": \"testarch\""),
+        written.contains("\"arch\": \"aarch64\""),
+        "manifest: {written}"
+    );
+    assert!(
+        written.contains("\"target_triple\": \"aarch64-linux-android\""),
         "manifest: {written}"
     );
     assert!(

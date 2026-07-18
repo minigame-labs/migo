@@ -754,11 +754,12 @@ mod tests {
     }
 
     #[test]
-    fn bind_buffer_other_targets_not_deduped() {
-        // UNIFORM_BUFFER (0x8A11) not tracked yet → always issue.
+    fn bind_buffer_uniform_target_is_deduped() {
+        // UNIFORM_BUFFER is a tracked WebGL 2 generic target: the first bind
+        // reaches GL and an identical repeat is suppressed.
         let mut s = fresh_state();
         assert!(update_bind_buffer(&mut s, 0x8A11, Some(1)));
-        assert!(update_bind_buffer(&mut s, 0x8A11, Some(1)));
+        assert!(!update_bind_buffer(&mut s, 0x8A11, Some(1)));
     }
 
     #[test]

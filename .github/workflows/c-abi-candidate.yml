@@ -1,0 +1,44 @@
+name: C ABI Candidate Contract
+
+on:
+  pull_request:
+    paths:
+      - "include/migo/**"
+      - "tests/c_abi/**"
+      - "scripts/test-c-abi-surface-candidate.sh"
+      - "docs/multiplatform-architecture.md"
+      - "docs/superpowers/specs/2026-07-16-c-abi-surface-v1-candidate-design.md"
+      - "docs/superpowers/plans/2026-07-16-c-abi-surface-v1-candidate.md"
+      - ".github/workflows/c-abi-candidate.yml"
+      - ".github/workflows/pr-ci.yml"
+      - ".github/workflows/release.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "include/migo/**"
+      - "tests/c_abi/**"
+      - "scripts/test-c-abi-surface-candidate.sh"
+      - "docs/multiplatform-architecture.md"
+      - "docs/superpowers/specs/2026-07-16-c-abi-surface-v1-candidate-design.md"
+      - "docs/superpowers/plans/2026-07-16-c-abi-surface-v1-candidate.md"
+      - ".github/workflows/c-abi-candidate.yml"
+      - ".github/workflows/pr-ci.yml"
+      - ".github/workflows/release.yml"
+
+concurrency:
+  group: c-abi-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Compile C ABI candidate with GCC and Clang
+        run: |
+          bash scripts/test-c-abi-surface-candidate.sh
+          CC=clang CXX=clang++ bash scripts/test-c-abi-surface-candidate.sh

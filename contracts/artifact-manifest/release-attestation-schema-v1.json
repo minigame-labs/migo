@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://migo.dev/contracts/artifact-manifest/release-attestation-schema-v1.json",
+  "title": "Migo external release attestation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "package_file",
+    "package_size_bytes",
+    "package_sha256",
+    "package_index_file",
+    "package_index_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "migo-release-attestation/v1" },
+    "package_file": { "type": "string", "minLength": 1, "pattern": "^[^/\\\\]+$" },
+    "package_size_bytes": { "type": "integer", "minimum": 0 },
+    "package_sha256": { "$ref": "schema-v1.json#/$defs/sha256" },
+    "package_index_file": { "type": "string", "minLength": 1, "pattern": "^[^/\\\\]+$" },
+    "package_index_sha256": { "$ref": "schema-v1.json#/$defs/sha256" }
+  }
+}

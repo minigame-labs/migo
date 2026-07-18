@@ -1,10 +1,157 @@
 extern crate khronos_egl as egl;
 
 use egl::EGL1_4;
-use libloading::Library;
 use shared::error::{EngineResult, ErrorCode};
 
+use crate::egl_platform::{EglInstance, EglProvider};
+
 use super::types::ee;
+
+/// Terminates an initialized display if configuration/probing returns early.
+/// The guard borrows the instance so it cannot outlive the exact dispatch
+/// table that initialized the display.
+struct InitializedDisplayGuard<'a> {
+    egl: &'a EglInstance,
+    display: egl::Display,
+    armed: bool,
+}
+
+impl<'a> InitializedDisplayGuard<'a> {
+    fn new(egl: &'a EglInstance, display: egl::Display) -> Self {
+        Self {
+            egl,
+            display,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InitializedDisplayGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.egl.terminate(self.display);
+        }
+    }
+}
+
+/// Owns one initialized EGLDisplay and the resource context that roots its
+/// share group.  It is installed in CanvasManager immediately after init so
+/// every constructor error and panic has the same best-effort EGL fallback.
+pub(super) struct EglRuntime {
+    instance: EglInstance,
+    display: egl::Display,
+    resource: Option<(egl::Context, egl::Surface)>,
+    initialized: bool,
+}
+
+impl EglRuntime {
+    fn new(instance: EglInstance, display: egl::Display) -> Self {
+        Self {
+            instance,
+            display,
+            resource: None,
+            initialized: true,
+        }
+    }
+
+    pub(super) fn track_resource(&mut self, context: egl::Context, surface: egl::Surface) {
+        assert!(
+            self.resource.is_none(),
+            "EGL resource owner cannot track two share-group roots"
+        );
+        self.resource = Some((context, surface));
+    }
+
+    pub(super) fn untrack_resource(&mut self) -> Option<(egl::Context, egl::Surface)> {
+        self.resource.take()
+    }
+
+    /// Idempotent final display teardown. Callers must release every window
+    /// and offscreen surface first; this method owns only the root pbuffer and
+    /// the final eglTerminate authority.
+    pub(super) fn shutdown(&mut self) {
+        if !self.initialized {
+            return;
+        }
+
+        // Disarm before calling driver code, and isolate each wrapper call.
+        // khronos-egl normally returns Result, but a non-conforming driver that
+        // reports EGL_FALSE without an EGL error can still trigger an internal
+        // unwrap. Drop must never double-panic during render-thread unwinding.
+        self.initialized = false;
+        let resource = self.resource.take();
+        let instance = &self.instance;
+        let display = self.display;
+        let ignore_driver_panic = |operation: &mut dyn FnMut()| {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        };
+
+        ignore_driver_panic(&mut || {
+            let _ = instance.make_current(display, None, None, None);
+        });
+        if let Some((context, surface)) = resource {
+            ignore_driver_panic(&mut || {
+                let _ = instance.destroy_surface(display, surface);
+            });
+            ignore_driver_panic(&mut || {
+                let _ = instance.destroy_context(display, context);
+            });
+        }
+        ignore_driver_panic(&mut || {
+            let _ = instance.terminate(display);
+        });
+    }
+}
+
+impl std::ops::Deref for EglRuntime {
+    type Target = EglInstance;
+
+    fn deref(&self) -> &Self::Target {
+        &self.instance
+    }
+}
+
+impl Drop for EglRuntime {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Destroys a newly-created context if pbuffer creation (or unwinding between
+/// the two EGL calls) does not complete the pair.
+struct ContextCleanupGuard<'a> {
+    egl: &'a EglInstance,
+    display: egl::Display,
+    context: Option<egl::Context>,
+}
+
+impl<'a> ContextCleanupGuard<'a> {
+    fn new(egl: &'a EglInstance, display: egl::Display, context: egl::Context) -> Self {
+        Self {
+            egl,
+            display,
+            context: Some(context),
+        }
+    }
+
+    fn disarm(mut self) -> egl::Context {
+        self.context
+            .take()
+            .expect("pbuffer context cleanup guard must be armed")
+    }
+}
+
+impl Drop for ContextCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(context) = self.context.take() {
+            let _ = self.egl.destroy_context(self.display, context);
+        }
+    }
+}
 
 // ---- EGL_EXT_create_context_robustness ----
 //
@@ -22,7 +169,7 @@ const EGL_LOSE_CONTEXT_ON_RESET_EXT: egl::Int = 0x31BF;
 
 /// EGL initialization result
 pub(super) struct EglInitResult {
-    pub egl: egl::DynamicInstance<EGL1_4>,
+    pub egl: EglRuntime,
     pub display: egl::Display,
     pub config: egl::Config,
     /// The GLES version actually negotiated (3 = ES 3.0+, 2 = ES 2.0 fallback).
@@ -35,26 +182,10 @@ pub(super) struct EglInitResult {
     pub has_robust_context: bool,
 }
 
-/// Initialize EGL with the given library path
-pub(super) fn init_egl(egl_lib_path: &str) -> EngineResult<EglInitResult> {
-    let egl_lib = unsafe { Library::new(egl_lib_path) }.map_err(|e| {
-        ee(
-            ErrorCode::RenderBackendError,
-            format!("load EGL failed: {e:?}"),
-        )
-    })?;
-
-    let egl = unsafe {
-        egl::DynamicInstance::<EGL1_4>::load_required_from(egl_lib).map_err(|e| {
-            ee(
-                ErrorCode::RenderBackendError,
-                format!("egl load_required failed: {e:?}"),
-            )
-        })?
-    };
-
-    let display = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }
-        .ok_or_else(|| ee(ErrorCode::RenderBackendError, "eglGetDisplay failed"))?;
+/// Initialize EGL exclusively through the platform-selected provider.
+pub(super) fn init_egl(provider: &dyn EglProvider) -> EngineResult<EglInitResult> {
+    let egl = provider.load()?;
+    let display = provider.display(&egl)?;
 
     egl.initialize(display).map_err(|_| {
         ee(
@@ -65,6 +196,7 @@ pub(super) fn init_egl(egl_lib_path: &str) -> EngineResult<EglInitResult> {
             ),
         )
     })?;
+    let mut initialized_display = InitializedDisplayGuard::new(&egl, display);
 
     // EGL_OPENGL_ES3_BIT_KHR — request configs that support ES 3.0.
     // Defined by EGL_KHR_create_context, widely available on Android 5.0+.
@@ -177,8 +309,11 @@ pub(super) fn init_egl(egl_lib_path: &str) -> EngineResult<EglInitResult> {
         );
     }
 
+    initialized_display.disarm();
+    drop(initialized_display);
+
     Ok(EglInitResult {
-        egl,
+        egl: EglRuntime::new(egl, display),
         display,
         config,
         gles_major,
@@ -242,6 +377,7 @@ pub(super) fn create_pbuffer_context(
                 format!("eglCreateContext failed: {e:?}"),
             )
         })?;
+    let context_cleanup = ContextCleanupGuard::new(egl, display, ctx);
 
     let pbuf_attribs = [
         egl::WIDTH as i32,
@@ -258,25 +394,77 @@ pub(super) fn create_pbuffer_context(
                 format!("eglCreatePbufferSurface failed: {e:?}"),
             )
         })?;
+    let ctx = context_cleanup.disarm();
 
     Ok((ctx, surf))
 }
 
-/// Create a window surface
-pub(super) fn create_window_surface(
-    egl: &egl::DynamicInstance<EGL1_4>,
-    display: egl::Display,
-    config: egl::Config,
-    window: usize,
-) -> EngineResult<egl::Surface> {
-    let native_win = window as egl::NativeWindowType;
-    unsafe {
-        egl.create_window_surface(display, config, native_win, None)
-            .map_err(|e| {
-                ee(
-                    ErrorCode::RenderBackendError,
-                    format!("eglCreateWindowSurface failed: {e:?}"),
-                )
-            })
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use crate::egl_platform::{EglInstance, EglProvider, GraphicsBackendId};
+    use shared::error::{EngineError, EngineResult, ErrorCode};
+
+    use super::init_egl;
+
+    const EGL_OPS_SOURCE: &str = include_str!("egl_ops.rs");
+
+    #[derive(Debug)]
+    struct InjectedFailureProvider {
+        loads: Arc<AtomicUsize>,
+    }
+
+    impl EglProvider for InjectedFailureProvider {
+        fn backend_id(&self) -> GraphicsBackendId {
+            GraphicsBackendId::of::<Self>()
+        }
+
+        fn label(&self) -> &str {
+            "sentinel-injected-egl"
+        }
+
+        fn load(&self) -> EngineResult<EglInstance> {
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            Err(EngineError::new(ErrorCode::RenderInitializeError)
+                .with_msg("sentinel provider load failure"))
+        }
+
+        fn display(&self, _egl: &EglInstance) -> EngineResult<khronos_egl::Display> {
+            panic!("display must not be requested after provider load failure")
+        }
+    }
+
+    #[test]
+    fn injected_egl_provider_is_the_only_loader_used_by_init() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let provider = InjectedFailureProvider {
+            loads: Arc::clone(&loads),
+        };
+
+        let error = init_egl(&provider).err().expect("provider must fail");
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert_eq!(error.msg, "sentinel provider load failure");
+    }
+
+    #[test]
+    fn initialized_display_and_partial_pbuffer_creation_have_raii_guards() {
+        assert!(EGL_OPS_SOURCE.contains("struct InitializedDisplayGuard"));
+        assert!(EGL_OPS_SOURCE.contains("struct ContextCleanupGuard"));
+
+        let init = EGL_OPS_SOURCE
+            .split("pub(super) fn init_egl")
+            .nth(1)
+            .expect("init_egl must exist");
+        assert!(init.contains("InitializedDisplayGuard::new"));
+
+        let pbuffer = EGL_OPS_SOURCE
+            .split("pub(super) fn create_pbuffer_context")
+            .nth(1)
+            .expect("create_pbuffer_context must exist");
+        assert!(pbuffer.contains("ContextCleanupGuard::new"));
     }
 }

@@ -1,0 +1,38 @@
+[package]
+name = "android-jni"
+version = "0.1.0"
+edition = "2024"
+
+# `libmigo.so` — the artifact Android loads via `System.loadLibrary("migo")`.
+# This crate is deliberately tiny: it exists only so that the cdylib boundary
+# lives somewhere other than `platform`. `platform` can then stay an rlib,
+# which is what lets host targets build and test it — the Linux V8 archive is
+# built with executable-model TLS and cannot be linked into a shared object
+# (`R_X86_64_TPOFF32 ... cannot be used with -shared`, CLAUDE.md §10).
+[lib]
+name = "migo"
+path = "lib.rs"
+crate-type = ["cdylib"]
+
+# Mirrored verbatim from `platform` so the build scripts can keep passing
+# `--no-default-features --features profile-<slim|full>` unchanged.
+[features]
+default = ["profile-full"]
+profile-full = ["platform/profile-full"]
+profile-slim = ["platform/profile-slim"]
+worker-snapshot = ["platform/worker-snapshot"]
+v8-limits = ["platform/v8-limits"]
+code-signing = ["platform/code-signing"]
+api-sensors = ["platform/api-sensors"]
+api-media = ["platform/api-media"]
+api-connectivity = ["platform/api-connectivity"]
+api-commerce = ["platform/api-commerce"]
+api-system = ["platform/api-system"]
+
+[dependencies]
+platform = { path = "../platform", default-features = false }
+
+# The JNI entry point is the only thing this crate contains, so `jni` is only
+# needed where it is compiled.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"

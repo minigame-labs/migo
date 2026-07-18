@@ -1,0 +1,38 @@
+[package]
+name = "player"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "migo-player"
+path = "src/main.rs"
+
+# Headless Linux dev player: drives the engine on x86_64-unknown-linux-gnu with
+# the offscreen (pbuffer) presenter. Executable (not cdylib), so it links the
+# existing linux-gnu V8 (executable/local-exec TLS) — no shared-TLS V8 rebuild
+# needed. See CLAUDE.md §10.
+
+[features]
+# Defaults to `profile-full`, matching every other workspace member, for two
+# reasons: the player's whole point is to surface bugs that affect the shipping
+# configuration, and Android ships full — running it slim would exercise a
+# different feature set. It also keeps workspace-wide commands working: the
+# profiles are mutually exclusive (`compile_error!`), and cargo unifies features
+# across a workspace, so a member defaulting to slim makes `cargo test
+# --workspace` fail to compile. Build a slim player explicitly with
+# `--no-default-features --features profile-slim`.
+#
+# (Either profile bundles the code-signing feature, but the player disables
+# signing at runtime via InitOptions, so no receipt is required.)
+default = ["profile-full"]
+profile-slim = ["core/profile-slim", "platform/profile-slim"]
+profile-full = ["core/profile-full", "platform/profile-full"]
+
+[dependencies]
+core = { path = "../core", default-features = false }
+platform = { path = "../platform", default-features = false }
+graphics = { path = "../graphics", default-features = false }
+shared = { path = "../shared", default-features = false }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+png = "0.17"

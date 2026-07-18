@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://migo.dev/contracts/artifact-manifest/package-index-schema-v1.json",
+  "title": "Migo embedded artifact package index v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "product_profile", "build_type", "codegen_profile", "slices"],
+  "properties": {
+    "schema": { "const": "migo-artifact-package-index/v1" },
+    "product_profile": { "enum": ["full", "slim"] },
+    "build_type": { "enum": ["debug", "release"] },
+    "codegen_profile": { "enum": ["z", "2", "3"] },
+    "slices": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target_triple", "arch", "manifest_path", "manifest_sha256", "artifact_id"],
+        "properties": {
+          "target_triple": { "type": "string", "minLength": 1 },
+          "arch": { "type": "string", "minLength": 1 },
+          "manifest_path": { "type": "string", "pattern": "^[^/\\\\][^\\\\]*$" },
+          "manifest_sha256": { "$ref": "schema-v1.json#/$defs/sha256" },
+          "artifact_id": { "$ref": "schema-v1.json#/$defs/sha256" }
+        }
+      }
+    }
+  }
+}

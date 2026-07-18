@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# scripts/dev-test-host.sh
+#
+# Build / test the migo engine natively on x86_64-unknown-linux-gnu (the §1.5
+# "minimum compatibility baseline" for the Linux support profile). This is the
+# host-side counterpart to scripts/build-android-so.sh.
+#
+# It wires up the three things a minimal Ubuntu / WSL2 host lacks for a migo
+# host build:
+#   1. A linux-gnu `librusty_v8.a` + `src_binding.rs` (V8 is NOT rebuilt here;
+#      point MIGO_HOST_V8_DIR at a prebuilt linux-gnu gn_out, or use the
+#      default sibling rusty_v8_src checkout).
+#   2. The system clang/clang++ as CC/CXX (NOT the Android NDK clang, whose
+#      libc++ vs system libstdc++-13 <chrono> mismatch breaks the Skia build),
+#      and ANDROID_NDK unset so skia-bindings does not pick the NDK toolchain.
+#   3. Khronos EGL/GL headers + libfontconfig/libfreetype/libEGL symlinks via
+#      scripts/dev-setup-skia.sh (idempotent).
+#
+# Usage:
+#   scripts/dev-test-host.sh [cargo-args...]
+#
+# Examples:
+#   scripts/dev-test-host.sh test -p js-runtime --lib          # V8 backend suite
+#   scripts/dev-test-host.sh test -p core --no-default-features --features profile-slim
+#   scripts/dev-test-host.sh build -p graphics --lib
+#
+# Env overrides:
+#   MIGO_HOST_V8_DIR  gn_out dir holding librusty_v8.a + src_binding.rs
+#                     (default: ../rusty_v8_src/target/x86_64-unknown-linux-gnu/release/gn_out)
+#   CC_HOST / CXX_HOST  host C/C++ compiler (default: /usr/bin/clang{,++})
+#
+# NOTE: every crate here links as an executable (test binaries, the player), so
+# the executable-model local-exec V8 archive is fine. Only a cdylib would need a
+# linux-gnu V8 built with a shared-compatible TLS model (`R_X86_64_TPOFF32 ...
+# cannot be used with -shared`), and the sole cdylib is `android-jni`
+# (libmigo.so), which is only ever built for Android.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ENGINE_DIR="$REPO_ROOT/engine"
+
+c_info() { echo -e "\033[0;36m[host] $*\033[0m"; }
+c_err()  { echo -e "\033[0;31m[host] $*\033[0m" >&2; }
+
+V8_DIR="${MIGO_HOST_V8_DIR:-$REPO_ROOT/../rusty_v8_src/target/x86_64-unknown-linux-gnu/release/gn_out}"
+V8_ARCHIVE="$V8_DIR/obj/librusty_v8.a"
+V8_BINDING="$V8_DIR/src_binding.rs"
+
+[[ -f "$V8_ARCHIVE" ]] || { c_err "linux-gnu V8 archive not found: $V8_ARCHIVE
+Set MIGO_HOST_V8_DIR to a prebuilt gn_out, or build one from rusty_v8_src."; exit 1; }
+[[ -f "$V8_BINDING" ]] || { c_err "linux-gnu V8 binding not found: $V8_BINDING"; exit 1; }
+[[ "$(stat -c %s "$V8_ARCHIVE")" -gt 1000000 ]] || { c_err "V8 archive looks like an LFS pointer: $V8_ARCHIVE"; exit 1; }
+
+# Host Skia deps (idempotent): EGL/GL headers + .so symlinks + ninja.
+c_info "ensuring host Skia deps (scripts/dev-setup-skia.sh)"
+bash "$SCRIPT_DIR/dev-setup-skia.sh" >/dev/null
+
+CC_HOST="${CC_HOST:-/usr/bin/clang}"
+CXX_HOST="${CXX_HOST:-/usr/bin/clang++}"
+
+export RUSTY_V8_ARCHIVE="$V8_ARCHIVE"
+export RUSTY_V8_SRC_BINDING_PATH="$V8_BINDING"
+export CC="$CC_HOST"
+export CXX="$CXX_HOST"
+export CPATH="$HOME/.local/skia-headers${CPATH:+:$CPATH}"
+export LIBRARY_PATH="$HOME/.local/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH="$HOME/.local/bin:$PATH"
+# Skia-bindings must not pick the Android NDK toolchain for a host build.
+unset ANDROID_NDK ANDROID_NDK_HOME || true
+
+c_info "V8: $V8_ARCHIVE"
+c_info "CC=$CC CXX=$CXX"
+
+ARGS=("$@")
+[[ ${#ARGS[@]} -gt 0 ]] || ARGS=(test -p js-runtime --lib --offline)
+
+cd "$ENGINE_DIR"
+c_info "cargo ${ARGS[*]}"
+exec cargo "${ARGS[@]}"

@@ -155,7 +155,7 @@ impl RenderCommand {
             | RenderCommand::Resume
             | RenderCommand::Shutdown
             | RenderCommand::Invalidate
-            | RenderCommand::SurfaceDestroyed
+            | RenderCommand::SurfaceDestroyed { .. }
             | RenderCommand::TrimTextCache { .. } => CommandClass::Lifecycle,
         }
     }

@@ -3,7 +3,7 @@ use shared::{
     protocol::render_cmd::CanvasCmd,
 };
 
-use crate::{CanvasManager, onscreen_window_from_surface};
+use crate::CanvasManager;
 
 pub(crate) struct CanvasHandler;
 
@@ -14,9 +14,10 @@ impl CanvasHandler {
 
     /// Handle a canvas command, returning the outcome to the render thread.
     ///
-    /// For `RecreateOnscreen`, the result is propagated so the render thread
-    /// can correctly track `has_surface`. Other commands communicate their
-    /// results through the `resp` channel and always return `Ok` here.
+    /// `RecreateOnscreen` must be intercepted by the render thread so generation
+    /// preflight runs before raw-handle extraction. If it is ever routed here,
+    /// fail closed and complete its responder without touching the Surface.
+    /// Other commands communicate results through `resp` and return `Ok` here.
     pub(crate) fn handle_command(
         &mut self,
         cm: &mut CanvasManager,
@@ -49,33 +50,11 @@ impl CanvasHandler {
                 let _ = resp.send(res);
             }
 
-            CanvasCmd::RecreateOnscreen { surface, resp } => {
-                let requested_size = surface.size();
-                tracing::info!(
-                    "CanvasCmd::RecreateOnscreen: requested={}x{}",
-                    requested_size.0,
-                    requested_size.1
-                );
-                let res = (|| -> EngineResult<()> {
-                    let win = onscreen_window_from_surface(surface.as_ref())?;
-                    cm.create_onscreen(win, Some(requested_size))?;
-                    Ok(())
-                })();
-                // Propagate to both host (via resp) and render thread (via return).
-                let err_detail = res.as_ref().err().map(|e| e.to_string());
-                let _ = resp.send(res);
-                if let Some(detail) = err_detail {
-                    tracing::warn!(
-                        "CanvasCmd::RecreateOnscreen failed: requested={}x{}, err={}",
-                        requested_size.0,
-                        requested_size.1,
-                        detail
-                    );
-                    return Err(EngineError::from_detail(
-                        ErrorCode::RenderBackendError,
-                        detail,
-                    ));
-                }
+            CanvasCmd::RecreateOnscreen { resp, .. } => {
+                let error = EngineError::new(ErrorCode::InvalidOperation)
+                    .with_msg("RecreateOnscreen must be preflighted by the render thread");
+                let _ = resp.send(Err(error.clone()));
+                return Err(error);
             }
 
             CanvasCmd::ResizeCanvas { id, w, h } => {

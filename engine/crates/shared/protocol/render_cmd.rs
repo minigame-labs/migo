@@ -8,7 +8,7 @@ pub use crate::protocol::color::Color;
 
 use crate::error::{EngineError, ErrorCode};
 use crate::protocol::FramePacket;
-use crate::surface::SurfaceRef;
+use crate::surface::{SurfaceGeneration, SurfaceLease};
 
 pub type CanvasId = u32;
 pub type ImageId = u32;
@@ -299,7 +299,9 @@ pub enum RenderCommand {
     ///
     /// The render thread keeps running and can still accept a later
     /// `RecreateOnscreen`, but must stop presenting until then.
-    SurfaceDestroyed,
+    SurfaceDestroyed {
+        generation: SurfaceGeneration,
+    },
 
     /// Trim the process-global text texture cache under OS memory
     /// pressure.  Routed to the render thread (rather than trimmed
@@ -371,7 +373,7 @@ pub enum CanvasCmd {
     },
 
     RecreateOnscreen {
-        surface: SurfaceRef,
+        lease: SurfaceLease,
         resp: RenderCmdResp<()>,
     },
 

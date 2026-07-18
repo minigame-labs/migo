@@ -1105,17 +1105,28 @@ mod tests {
     }
 
     #[test]
-    fn register_family_invalidates_measure_cache() {
+    fn register_family_invalidates_measure_cache_by_epoch() {
         // After registering a new typeface under an existing
-        // family name, previously cached metrics may be wrong.
+        // family name, previously cached metrics may be wrong. Invalidation
+        // is O(1): old entries remain resident but cannot match the new epoch.
         let mut ctx = TextContext::new();
         assert!(ctx.register_family("test-noto", NOTO_SANS));
         // Warm the cache.
         let _ = ctx.measure_text("hello", &test_attrs(16.0));
-        assert!(!ctx.measure_cache.borrow().is_empty());
-        // Registering another typeface must drop the cache.
+        let old_cache_len = ctx.measure_cache.borrow().len();
+        let old_epoch = ctx.font_epoch();
+        assert!(old_cache_len > 0);
+
+        // Registering another typeface advances identity without walking and
+        // clearing the old LRU entries on the render thread.
         assert!(ctx.register_family("test-noto", NOTO_SANS));
-        assert!(ctx.measure_cache.borrow().is_empty());
+        assert_eq!(ctx.font_epoch(), old_epoch.wrapping_add(1));
+        assert_eq!(ctx.measure_cache.borrow().len(), old_cache_len);
+
+        // The same logical query now inserts a distinct current-epoch key,
+        // proving the stale entry was not served.
+        let _ = ctx.measure_text("hello", &test_attrs(16.0));
+        assert_eq!(ctx.measure_cache.borrow().len(), old_cache_len + 1);
     }
 
     #[test]

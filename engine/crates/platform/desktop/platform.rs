@@ -1,7 +1,5 @@
-use core::PlatformServices;
 use core::services::DeviceServices;
-use deno_core::Extension;
-use shared::config::InitOptions;
+use core::{DeviceServiceProvider, FrameClock, HostNotifier};
 use std::sync::Arc;
 
 pub struct DesktopPlatform;
@@ -12,15 +10,15 @@ impl DesktopPlatform {
     }
 }
 
-impl PlatformServices for DesktopPlatform {
-    fn extensions(&self, _opts: &InitOptions) -> Vec<Extension> {
-        vec![]
-    }
-
+impl DeviceServiceProvider for DesktopPlatform {
     fn create_device_services(&self, _host_id: i32) -> Option<Arc<dyn DeviceServices>> {
         None
     }
 }
+
+impl FrameClock for DesktopPlatform {}
+
+impl HostNotifier for DesktopPlatform {}
 
 #[cfg(test)]
 mod tests {

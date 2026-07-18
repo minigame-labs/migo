@@ -1021,13 +1021,14 @@ mod wiring_source_guards {
 
     #[test]
     fn onscreen_drawing_buffer_resize_invalidates_present_state() {
-        let start = MGR
-            .find("if matches!(kind, SurfaceKind::Window(_))")
-            .expect("window DrawingBuffer resize branch must exist");
-        let end = MGR[start..]
-            .find("return Ok(());")
-            .expect("window DrawingBuffer resize branch must return");
-        let branch = &MGR[start..start + end];
+        let resize = function_body(MGR, "pub(crate) fn resize_canvas");
+        let start = resize
+            .find("drawing_buffer::resize")
+            .expect("DrawingBuffer resize policy must exist");
+        let end = resize[start..]
+            .find("self.evaluate_bypass()")
+            .expect("onscreen resize policy must re-evaluate bypass");
+        let branch = &resize[start..start + end];
         assert!(
             branch.contains("self.damage_history.clear()"),
             "DrawingBuffer resize must invalidate buffer-age history"
@@ -1044,13 +1045,14 @@ mod wiring_source_guards {
 
     #[test]
     fn same_window_surface_resize_updates_physical_extent() {
-        let start = MGR
+        let create = function_body(MGR, "pub(crate) fn create_onscreen");
+        let start = create
             .find("CanvasManager::create_onscreen fast resize")
             .expect("same-window surface resize branch must exist");
-        let end = MGR[start..]
-            .find("self.last_window = Some(window);")
+        let end = create[start..]
+            .find("Validate the client API")
             .expect("fast resize branch must precede full surface recreation");
-        let branch = &MGR[start..start + end];
+        let branch = &create[start..start + end];
         assert!(
             branch.contains("entry.physical_width =") && branch.contains("entry.physical_height ="),
             "surface-driven fast resize must update the dimensions used by present/blit"

@@ -53,6 +53,8 @@ pub(crate) mod damage_effect;
 pub mod device_caps;
 pub mod device_profile;
 pub mod dirty_region;
+pub mod egl_platform;
+pub mod frame_capture;
 pub mod frame_scheduler;
 pub mod image_decode_ahb;
 mod legacy_frame_bridge;
@@ -63,6 +65,7 @@ mod render_server;
 mod render_thread;
 mod renderergl;
 pub(crate) mod shader_cache;
+mod surface_binding;
 pub mod surface_system;
 pub mod text_measurer_impl;
 pub mod texture_import;
@@ -79,10 +82,6 @@ pub use surface_system::{SurfaceLifecycleState, SurfaceSystem};
 
 pub(crate) use renderergl::*;
 
-use raw_window_handle::RawWindowHandle;
-use shared::error::{EngineResult, ErrorCode};
-use shared::surface::Surface;
-
 /// Tracks which EGL context is currently bound.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum BoundContext {
@@ -90,20 +89,6 @@ pub(crate) enum BoundContext {
     Resource,
     /// A specific canvas's context.
     Canvas(shared::protocol::render_cmd::CanvasId),
-}
-
-/// Extract the native window handle from a platform-agnostic Surface.
-pub(crate) fn onscreen_window_from_surface(surface: &dyn Surface) -> EngineResult<usize> {
-    match surface.raw_window_handle() {
-        RawWindowHandle::AndroidNdk(h) => Ok(h.a_native_window.as_ptr() as usize),
-        other => {
-            shared::bail!(
-                ErrorCode::Unsupported,
-                "unsupported RawWindowHandle for current backend",
-                format!("{:?}", other)
-            );
-        }
-    }
 }
 
 #[cfg(test)]

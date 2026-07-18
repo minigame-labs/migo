@@ -199,8 +199,8 @@ mod q13_contract {
             .nth(1)
             .expect("render initialization must construct CanvasManager");
         let surface = render_init
-            .find("if let Some(surface) = initial_surface")
-            .expect("render initialization must resolve the initial surface");
+            .find("if let Some(lease) = initial_surface")
+            .expect("render initialization must resolve the initial SurfaceLease");
         let guarded_publish = render_init
             .find("if !startup_failed")
             .expect("failed surface setup must not publish successful caps");

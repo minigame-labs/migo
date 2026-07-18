@@ -1,0 +1,28 @@
+{
+  "schema": "migo-v8-build-lock/v1",
+  "rusty_v8_version": "145.0.0",
+  "rusty_v8_revision": "e6a88b35dd3d7f2849a0df33a71d338701c55316",
+  "v8_revision": "8defb67673c5483ae56258a2de01b07e947dc921",
+  "android_api": 26,
+  "targets": {
+    "aarch64": {
+      "triple": "aarch64-linux-android",
+      "cpu_baseline": "armv8-a",
+      "required_cpu_features": ["neon"]
+    },
+    "x86_64": {
+      "triple": "x86_64-linux-android",
+      "cpu_baseline": "x86-64-v1",
+      "required_cpu_features": ["cmov", "sse2"]
+    }
+  },
+  "required_patches": [
+    "0001-unset-bindgen-extra-clang-args",
+    "0002-use-sysroot-on-android",
+    "0003-custom-libcxx-for-snapshot-toolchain"
+  ],
+  "sources": {
+    "rusty_v8": "https://github.com/denoland/rusty_v8/tree/e6a88b35dd3d7f2849a0df33a71d338701c55316",
+    "v8": "https://chromium.googlesource.com/v8/v8/+/8defb67673c5483ae56258a2de01b07e947dc921"
+  }
+}

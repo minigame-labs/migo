@@ -193,14 +193,12 @@ mod v8_limits_tests {
 /// V8 entry a `HostJsRuntime` exposes.
 #[cfg(all(test, feature = "v8-limits"))]
 mod host_watchdog_tests {
-    use std::cell::RefCell;
     use std::path::PathBuf;
-    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
 
-    use deno_core::{FsModuleLoader, PollEventLoopOptions};
+    use deno_core::PollEventLoopOptions;
     use shared::{
         channel::ThreadWakeup,
         device::gpu_caps::GpuCaps,
@@ -257,15 +255,11 @@ mod host_watchdog_tests {
     }
 
     fn build_runtime(files_dir: PathBuf, cache_dir: PathBuf, timeout: Duration) -> HostJsRuntime {
-        let host_state = test_host_state(files_dir, cache_dir);
-        let mount_ref: crate::SharedMountTableRef = Rc::new(RefCell::new(None));
+        let host_state = test_host_state(files_dir, cache_dir.clone());
         let mut rt = HostJsRuntime::new(
             1,
             host_state,
-            Vec::new(),
-            Some(Rc::new(FsModuleLoader)),
-            None,
-            mount_ref,
+            &cache_dir,
             V8LimitsConfig::default(),
             #[cfg(feature = "code-signing")]
             false,

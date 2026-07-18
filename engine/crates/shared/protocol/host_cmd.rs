@@ -39,7 +39,7 @@
 
 use std::borrow::Cow;
 
-use crate::surface::SurfaceRef;
+use crate::surface::{SurfaceGeneration, SurfaceLease};
 
 /// Touch event payload, boxed inside `HostCommand::OnTouch`.
 ///
@@ -214,12 +214,15 @@ pub enum HostCommand {
     ///
     /// The render thread will recreate the EGL context with the new surface.
     UpdateSurface {
-        /// New surface reference from the platform layer.
-        surface: SurfaceRef,
+        /// Generation-tagged Surface lease from the platform layer.
+        lease: SurfaceLease,
     },
 
     /// Notify that the current rendering surface has been destroyed.
-    SurfaceDestroyed,
+    SurfaceDestroyed {
+        /// Exact retired generation; delayed commands cannot affect a newer one.
+        generation: SurfaceGeneration,
+    },
 
     // ---- Touch / Input ----
     /// Dispatch touch input events to the game.

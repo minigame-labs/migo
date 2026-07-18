@@ -30,7 +30,7 @@ show_help() {
     echo ""
     echo "Usage:"
     echo "  ./build-aar.sh [release|debug] [architectures...]"
-    echo "  ./build-aar.sh [--product-profile full|slim] [--codegen-profile z|2|3] [--worker-snapshot] [--build-type release|debug] [--output-dir dist] [--skip-rust] [architectures...]"
+    echo "  ./build-aar.sh [--product-profile full|slim] [--codegen-profile z|2|3] [--worker-snapshot] [--artifact-manifest required|optional|off] [--build-type release|debug] [--output-dir dist] [--skip-rust] [architectures...]"
     echo ""
     echo "Options:"
     echo "  release|debug    Build type (default: release)"
@@ -38,6 +38,7 @@ show_help() {
     echo "  --product-profile Product surface (full|slim, default: full)"
     echo "  --codegen-profile Hot-crate optimization (z|2|3, default: z; 2/3 require release)"
     echo "  --worker-snapshot Build the isolated full-release Worker snapshot candidate"
+    echo "  --artifact-manifest Manifest policy (release requires required; debug defaults optional)"
     echo "  --output-dir     Output directory under platforms/android (default: dist)"
     echo "  arm64-v8a        Build for ARM64"
     echo "  x86_64           Build for x86_64"
@@ -62,6 +63,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ANDROID_DIR="$REPO_ROOT/platforms/android"
 LIBRARY_DIR="$ANDROID_DIR/library"
 RUST_BUILD_SCRIPT="$SCRIPT_DIR/build-android-so.sh"
+MANIFEST_GENERATOR="$SCRIPT_DIR/generate-android-artifact-manifests.py"
+BUILD_METADATA_WRITER="$SCRIPT_DIR/write-android-build-metadata.py"
+AAR_MANIFEST_VERIFIER="$SCRIPT_DIR/verify-android-aar-manifests.py"
+MANIFEST_TOOL_MANIFEST="$REPO_ROOT/tools/artifact-manifest/Cargo.toml"
+MANIFEST_BUILD_ROOT="$LIBRARY_DIR/build/generated/migoArtifactManifest"
+MANIFEST_ASSET_ROOT="$MANIFEST_BUILD_ROOT/assets/migo/artifacts"
+MANIFEST_INDEX="$MANIFEST_ASSET_ROOT/package-index.json"
+MANIFEST_TOOL=""
 OUTPUT_DIR="dist"
 
 echo "========================================"
@@ -102,6 +111,7 @@ PRODUCT_PROFILE="full"
 CODEGEN_PROFILE="z"
 WORKER_SNAPSHOT=false
 SKIP_RUST=false
+ARTIFACT_MANIFEST_MODE="${MIGO_ARTIFACT_MANIFEST_MODE:-}"
 ARCHITECTURES=()
 USE_ALL_ARCH=false
 
@@ -116,6 +126,17 @@ while [[ $# -gt 0 ]]; do
             ;;
         --worker-snapshot)
             WORKER_SNAPSHOT=true
+            ;;
+        --artifact-manifest)
+            shift
+            if [[ $# -eq 0 ]]; then
+                print_error "--artifact-manifest requires a value"
+                exit 1
+            fi
+            ARTIFACT_MANIFEST_MODE="$1"
+            ;;
+        --artifact-manifest=*)
+            ARTIFACT_MANIFEST_MODE="${arg#*=}"
             ;;
         --build-type)
             shift
@@ -199,6 +220,21 @@ if [[ "$BUILD_TYPE" == "debug" && "$CODEGEN_PROFILE" != "z" ]]; then
 fi
 if [[ "$WORKER_SNAPSHOT" == true && ( "$BUILD_TYPE" != "release" || "$PRODUCT_PROFILE" != "full" ) ]]; then
     print_error "Worker snapshot requires a full release build"
+    exit 1
+fi
+if [[ -z "$ARTIFACT_MANIFEST_MODE" ]]; then
+    if [[ "$BUILD_TYPE" == "release" ]]; then
+        ARTIFACT_MANIFEST_MODE="required"
+    else
+        ARTIFACT_MANIFEST_MODE="optional"
+    fi
+fi
+if [[ "$ARTIFACT_MANIFEST_MODE" != "required" && "$ARTIFACT_MANIFEST_MODE" != "optional" && "$ARTIFACT_MANIFEST_MODE" != "off" ]]; then
+    print_error "Invalid artifact manifest mode: $ARTIFACT_MANIFEST_MODE (expected required|optional|off)"
+    exit 1
+fi
+if [[ "$BUILD_TYPE" == "release" && "$ARTIFACT_MANIFEST_MODE" != "required" ]]; then
+    print_error "Release AARs require --artifact-manifest required"
     exit 1
 fi
 
@@ -295,6 +331,87 @@ validate_native_libraries() {
 }
 
 # ------------------------------------------------------------
+# Generate verified per-slice identities after Gradle clean
+# ------------------------------------------------------------
+resolve_source_revision() {
+    local revision="${MIGO_SOURCE_REVISION:-${GITHUB_SHA:-}}"
+    if [[ -z "$revision" ]]; then
+        if ! revision="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)"; then
+            print_error "Cannot read the source revision; set MIGO_SOURCE_REVISION to the full commit" >&2
+            return 1
+        fi
+    fi
+    if [[ ! "$revision" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        print_error "A full MIGO_SOURCE_REVISION/GITHUB_SHA is required for artifact identity" >&2
+        return 1
+    fi
+    printf '%s\n' "$revision"
+}
+
+generate_verified_artifact_manifests() {
+    command -v cargo >/dev/null 2>&1 || { print_error "cargo is required for artifact manifests"; return 1; }
+    command -v python3 >/dev/null 2>&1 || { print_error "python3 is required for artifact manifests"; return 1; }
+    [[ -n "${ANDROID_NDK_HOME:-}" ]] || { print_error "ANDROID_NDK_HOME is required for artifact manifests"; return 1; }
+    [[ -f "$MANIFEST_GENERATOR" ]] || { print_error "Missing manifest generator: $MANIFEST_GENERATOR"; return 1; }
+    [[ -f "$BUILD_METADATA_WRITER" ]] || { print_error "Missing build metadata writer: $BUILD_METADATA_WRITER"; return 1; }
+    [[ -f "$AAR_MANIFEST_VERIFIER" ]] || { print_error "Missing AAR manifest verifier: $AAR_MANIFEST_VERIFIER"; return 1; }
+    [[ -f "$MANIFEST_TOOL_MANIFEST" ]] || { print_error "Missing manifest tool: $MANIFEST_TOOL_MANIFEST"; return 1; }
+
+    local tool_target="${MIGO_ARTIFACT_MANIFEST_TARGET_DIR:-$REPO_ROOT/tools/artifact-manifest/target}"
+    CARGO_TARGET_DIR="$tool_target" cargo build \
+        --manifest-path "$MANIFEST_TOOL_MANIFEST" --locked --release || return $?
+    MANIFEST_TOOL="$tool_target/release/migo-artifact-manifest"
+    [[ -x "$MANIFEST_TOOL" ]] || { print_error "Manifest tool was not produced: $MANIFEST_TOOL"; return 1; }
+
+    local revision
+    revision="$(resolve_source_revision)" || return $?
+    python3 "$BUILD_METADATA_WRITER" \
+        --repo-root "$REPO_ROOT" \
+        --output "$MANIFEST_BUILD_ROOT/build-metadata.json" \
+        --ndk-home "$ANDROID_NDK_HOME" \
+        --source-revision "$revision" || return $?
+
+    local -a generator_args=(
+        --repo-root "$REPO_ROOT"
+        --tool "$MANIFEST_TOOL"
+        --output-root "$MANIFEST_ASSET_ROOT"
+        --build-metadata "$MANIFEST_BUILD_ROOT/build-metadata.json"
+        --product-profile "$PRODUCT_PROFILE"
+        --build-type "$BUILD_TYPE"
+        --codegen-profile "$CODEGEN_PROFILE"
+    )
+    if [[ "$WORKER_SNAPSHOT" == true ]]; then
+        generator_args+=(--worker-snapshot)
+    fi
+    local arch
+    for arch in "${ARCHITECTURES[@]}"; do
+        generator_args+=(--arch "$arch")
+    done
+    python3 "$MANIFEST_GENERATOR" "${generator_args[@]}" || return $?
+}
+
+stage_artifact_manifests() {
+    if [[ "$ARTIFACT_MANIFEST_MODE" == "off" ]]; then
+        print_warning "Artifact manifest generation is disabled for this non-release build"
+        return 0
+    fi
+
+    local manifest_rc=0
+    generate_verified_artifact_manifests || manifest_rc=$?
+    if [[ $manifest_rc -eq 0 ]]; then
+        print_success "Verified artifact manifests staged"
+        return 0
+    fi
+    rm -rf "$MANIFEST_BUILD_ROOT"
+    if [[ "$ARTIFACT_MANIFEST_MODE" == "required" ]]; then
+        print_error "Verified artifact manifest generation failed (rc=$manifest_rc)"
+        return "$manifest_rc"
+    fi
+    print_warning "Verified artifact manifests unavailable; continuing debug-only build"
+    return 0
+}
+
+# ------------------------------------------------------------
 # Build AAR
 # ------------------------------------------------------------
 build_aar() {
@@ -317,13 +434,24 @@ build_aar() {
 
     $gradle_cmd clean
 
+    # clean removes generated assets; stage identity only after it succeeds.
+    stage_artifact_manifests
+
     local profile_task="${PRODUCT_PROFILE^}"
     local type_task="${BUILD_TYPE^}"
     local gradle_abis
+    local -a verified_release_args=()
+    if [[ "$BUILD_TYPE" == "release" ]]; then
+        verified_release_args=(
+            -PmigoVerifiedReleasePackaging=true
+            "-PmigoArtifactManifestTool=$MANIFEST_TOOL"
+        )
+    fi
     gradle_abis="$(IFS=,; echo "${ARCHITECTURES[*]}")"
     $gradle_cmd "-PmigoAbis=$gradle_abis" \
         "-PmigoCodegenProfile=$CODEGEN_PROFILE" \
         "-PmigoWorkerSnapshot=$WORKER_SNAPSHOT" \
+        "${verified_release_args[@]}" \
         "assemble${profile_task}${type_task}"
 
     popd > /dev/null
@@ -347,15 +475,36 @@ collect_outputs() {
         exit 1
     fi
     local artifact_name="migo-$PRODUCT_PROFILE-$BUILD_TYPE$ARTIFACT_SUFFIX.aar"
-    cp "$aar" "$out_dir/$artifact_name"
+    local output_aar="$out_dir/$artifact_name"
+    local version_metadata="$out_dir/version-$PRODUCT_PROFILE$ARTIFACT_SUFFIX.json"
+    rm -f "$output_aar" "$output_aar.attestation.json" "$version_metadata"
 
-    cat > "$out_dir/version-$PRODUCT_PROFILE$ARTIFACT_SUFFIX.json" << EOF
+    if [[ -f "$MANIFEST_INDEX" ]]; then
+        python3 "$AAR_MANIFEST_VERIFIER" \
+            --aar "$aar" \
+            --index "$MANIFEST_INDEX" \
+            --tool "$MANIFEST_TOOL"
+    elif [[ "$ARTIFACT_MANIFEST_MODE" == "required" ]]; then
+        print_error "Required package index was not generated: $MANIFEST_INDEX"
+        exit 1
+    fi
+
+    cp "$aar" "$output_aar"
+    if [[ -f "$MANIFEST_INDEX" ]]; then
+        local attestation="$output_aar.attestation.json"
+        "$MANIFEST_TOOL" attest "$output_aar" "$MANIFEST_INDEX" "$attestation" >/dev/null
+        "$MANIFEST_TOOL" verify-attestation "$attestation" "$output_aar" "$MANIFEST_INDEX" >/dev/null
+        print_success "Release attestation -> $attestation"
+    fi
+
+    cat > "$version_metadata" << EOF
 {
     "productProfile": "$PRODUCT_PROFILE",
     "buildType": "$BUILD_TYPE",
     "codegenProfile": "$CODEGEN_PROFILE",
     "cargoProfile": "$CARGO_PROFILE",
     "workerSnapshot": $WORKER_SNAPSHOT,
+    "artifactManifestMode": "$ARTIFACT_MANIFEST_MODE",
     "sourceDateEpoch": $SOURCE_DATE_EPOCH_JSON,
     "buildTime": "$(date '+%Y-%m-%d %H:%M:%S')"
 }

@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
-use core::PlatformServices;
 use core::services::DeviceServices;
-use deno_core::Extension;
-use shared::config::InitOptions;
+use core::{DeviceServiceProvider, FrameClock, HostNotifier};
 use tracing::error;
 
 use crate::android::jni;
@@ -17,15 +15,13 @@ impl AndroidPlatform {
     }
 }
 
-impl PlatformServices for AndroidPlatform {
-    fn extensions(&self, _opts: &InitOptions) -> Vec<Extension> {
-        vec![]
-    }
-
+impl DeviceServiceProvider for AndroidPlatform {
     fn create_device_services(&self, host_id: i32) -> Option<Arc<dyn DeviceServices>> {
         Some(Arc::new(AndroidDeviceServices::new(host_id)))
     }
+}
 
+impl FrameClock for AndroidPlatform {
     fn uses_external_vsync(&self) -> bool {
         true
     }
@@ -39,7 +35,9 @@ impl PlatformServices for AndroidPlatform {
             tracing::debug!("[Host {}] request_vsync JNI call failed: {}", host_id, e);
         }
     }
+}
 
+impl HostNotifier for AndroidPlatform {
     fn notify_game_ready(&self, host_id: i32) {
         if let Err(e) = jni::notify_game_ready(host_id) {
             error!(

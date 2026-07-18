@@ -73,6 +73,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "android-jni"
+version = "0.1.0"
+dependencies = [
+ "jni",
+ "platform",
+]
+
+[[package]]
 name = "android_log-sys"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -396,13 +404,13 @@ version = "0.1.0"
 dependencies = [
  "audio",
  "crossbeam-channel",
- "deno_core",
  "futures",
  "graphics",
  "io",
  "js-runtime",
  "parking_lot",
  "serde",
+ "serde_json",
  "shared",
  "tokio",
  "tracing",
@@ -1049,11 +1057,9 @@ dependencies = [
  "glow",
  "khronos-egl",
  "libc",
- "libloading",
  "lru",
  "parking_lot",
  "png 0.17.16",
- "raw-window-handle",
  "shared",
  "skia-safe",
  "smallvec",
@@ -2058,20 +2064,32 @@ dependencies = [
  "bytemuck",
  "core",
  "crossbeam-channel",
- "deno_core",
- "deno_error",
  "futures",
  "graphics",
  "io",
  "jni",
- "js-runtime",
+ "khronos-egl",
+ "libloading",
  "ndk-context",
- "raw-window-handle",
  "serde",
+ "serde_json",
  "shared",
  "tokio",
  "tracing",
  "tracing-android",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "player"
+version = "0.1.0"
+dependencies = [
+ "core",
+ "graphics",
+ "platform",
+ "png 0.17.16",
+ "shared",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -2295,12 +2313,6 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
 ]
-
-[[package]]
-name = "raw-window-handle"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 
 [[package]]
 name = "redox_syscall"
@@ -2678,7 +2690,6 @@ dependencies = [
  "lru",
  "md-5",
  "parking_lot",
- "raw-window-handle",
  "serde",
  "sha1",
  "sha2",

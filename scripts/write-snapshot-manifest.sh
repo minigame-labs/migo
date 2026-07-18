@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Writes <bin>.manifest.json next to a generated V8 snapshot, capturing the
-# schema/profile/feature/JS/Rust/deno fingerprint that
+# schema/profile/feature/JS/Rust/deno fingerprint and release identity that
 # check-snapshot-freshness.sh compares against.
 #
 # Shared by gen-snapshot.sh (arm64, on a real device) and build-snapshot.yml
@@ -37,6 +37,30 @@ V8_ARCHIVE="${MIGO_V8_ARCHIVE:-$ENGINE/third_party/rusty_v8/$ARCH/librusty_v8.a}
 snapshot_require_materialized_v8_archive "$V8_ARCHIVE" || exit 1
 V8_HASH="$(snapshot_v8_archive_hash "$V8_ARCHIVE")"
 
+case "$ARCH" in
+  aarch64) TARGET_TRIPLE="aarch64-linux-android" ;;
+  x86_64) TARGET_TRIPLE="x86_64-linux-android" ;;
+  *) echo "ERROR: unsupported Android snapshot arch: $ARCH" >&2; exit 1 ;;
+esac
+NORMALIZED_PARAMETERS_JSON="[\"--arch=$ARCH\",\"--cpu-policy=target-baseline\",\"--product-profile=$PRODUCT_PROFILE\",\"--runtime-kind=$SNAPSHOT_KIND\",\"--warmup=none\"]"
+# The Rust source fingerprint conservatively covers the external-reference/op
+# tables. The bootstrap identity binds every input consumed by snapshot-gen.
+EXTERNAL_REFERENCES_HASH="$RUST_HASH"
+BOOTSTRAP_INPUTS_HASH="$({
+  printf '%s\n' \
+    "schema=$SNAPSHOT_SCHEMA_VERSION" \
+    "snapshot_kind=$SNAPSHOT_KIND" \
+    "profile=$PRODUCT_PROFILE" \
+    "arch=$ARCH" \
+    "target_triple=$TARGET_TRIPLE" \
+    "parameters=$NORMALIZED_PARAMETERS_JSON" \
+    "features=$FEATURE_HASH" \
+    "rust=$RUST_HASH" \
+    "js=$JS_HASH" \
+    "v8=$V8_HASH" \
+    "deno_core=$DENO_CORE_VER"
+} | sha256sum | awk '{print $1}')"
+
 MANIFEST="$BIN.manifest.json"
 cat > "$MANIFEST" <<EOF
 {
@@ -44,6 +68,11 @@ cat > "$MANIFEST" <<EOF
   "snapshot_kind": "$SNAPSHOT_KIND",
   "profile": "$PRODUCT_PROFILE",
   "arch": "$ARCH",
+  "target_triple": "$TARGET_TRIPLE",
+  "generation_cpu_policy": "target-baseline",
+  "normalized_parameters": $NORMALIZED_PARAMETERS_JSON,
+  "external_references_sha256": "$EXTERNAL_REFERENCES_HASH",
+  "bootstrap_inputs_sha256": "$BOOTSTRAP_INPUTS_HASH",
   "features": $FEATURES_JSON,
   "features_sha256": "$FEATURE_HASH",
   "rust_sources_sha256": "$RUST_HASH",

@@ -26,7 +26,6 @@ serde.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
 tracing = { workspace = true }
-raw-window-handle = { workspace = true }
 sha2 = { version = "0.10" }
 ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
 crc32fast = "1"
