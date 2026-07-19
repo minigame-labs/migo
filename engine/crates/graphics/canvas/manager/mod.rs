@@ -1010,6 +1010,19 @@ impl CanvasManager {
         // needed for Android resume: the surface is a different native window
         // but the game's JS code still expects canvas_id=1 to work.
         let mut had_2d_context = false;
+        // The drawing state of that context, carried across the rebuild.
+        //
+        // JS shadows every Canvas2D state setter and skips sending a value it
+        // believes is already current, so this state is the authoritative half
+        // of a pair whose other half lives in the content. A context rebuilt at
+        // spec defaults desynchronises them permanently: the content goes on
+        // thinking its fillStyle is set, never re-sends it, and every later draw
+        // paints with the default. That is opaque black on an opaque black
+        // buffer -- a Canvas2D game returned from the background to a black
+        // screen while JS drew every frame, the context was healthy, and every
+        // boundary reported success. `Canvas2DContext::resize` preserves this
+        // state for the same reason; the destroy-and-recreate path must too.
+        let mut retained_2d_state = None;
 
         if let Some(_entry) = self.canvases.get(&id) {
             // Destroy and recreate the EGL surface when the ANativeWindow
@@ -1019,6 +1032,7 @@ impl CanvasManager {
             // surface leads to buffer size mismatches that SurfaceFlinger
             // rejects ("rejecting buffer"), causing flicker.
             had_2d_context = self.contexts_2d.contains_key(&id);
+            retained_2d_state = self.contexts_2d.get(&id).map(|ctx| ctx.drawing_state());
             self.destroy_onscreen_internal(id).map_err(|error| {
                 SurfaceInstallFailure::from_phase(
                     error,
@@ -1338,6 +1352,11 @@ impl CanvasManager {
                     InstallPhase::CandidateReferenced,
                     cleanup,
                 ));
+            }
+            // The fresh context starts at spec defaults; the content believes
+            // its own values are still in force and will not re-send them.
+            if let (Some(state), Some(ctx)) = (retained_2d_state, self.contexts_2d.get_mut(&id)) {
+                ctx.adopt_drawing_state(state);
             }
         }
 

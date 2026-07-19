@@ -698,6 +698,26 @@ impl Canvas2DContext {
         true
     }
 
+    /// The drawing-state machine (styles, alpha, line and text settings) this
+    /// context holds.
+    ///
+    /// JS keeps a shadow copy of every one of these setters and skips sending a
+    /// value it believes is already current, which makes this the authoritative
+    /// half of a pair split across the ABI. Any path that replaces a context
+    /// must carry the state across: a replacement that comes up at spec
+    /// defaults desynchronises the two halves permanently, because the content
+    /// has no way to learn its state was discarded and will never re-send it.
+    /// `resize` preserves this by keeping `renderer`; a destroy-and-recreate
+    /// has to ask for it explicitly.
+    pub fn drawing_state(&self) -> Canvas2DState {
+        self.renderer.state.clone()
+    }
+
+    /// Adopt drawing state captured from the context this one replaces.
+    pub fn adopt_drawing_state(&mut self, state: Canvas2DState) {
+        self.renderer.state = state;
+    }
+
     /// Clear the entire surface to transparent — spec'd fallout of
     /// `canvas.width = N`.  Does not mutate the state machine.
     pub fn clear_to_transparent(&mut self) {

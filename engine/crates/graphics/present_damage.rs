@@ -1020,6 +1020,40 @@ mod wiring_source_guards {
     }
 
     #[test]
+    fn onscreen_surface_recreate_carries_the_2d_drawing_state_across() {
+        // JS shadows every Canvas2D state setter and skips re-sending a value it
+        // believes is current, so the render-side state machine is the
+        // authoritative half of a pair. A context rebuilt at spec defaults
+        // desynchronises them for good: the content never re-sends its
+        // fillStyle, and every later fill paints the default opaque black. The
+        // symptom is a black screen on resume with JS still drawing, the
+        // context healthy, and blit and swap both reporting success -- nothing
+        // downstream can catch it, so the wiring is asserted here.
+        let create = function_body(MGR, "pub(crate) fn create_onscreen");
+        let capture = create
+            .find("drawing_state()")
+            .expect("surface recreate must capture the 2D drawing state");
+        let destroy = create
+            .find("self.destroy_onscreen_internal(id)")
+            .expect("surface recreate must destroy the previous onscreen canvas");
+        assert!(
+            capture < destroy,
+            "the 2D drawing state must be captured before the context is destroyed"
+        );
+
+        let reinit = create
+            .find("context_2d_impl::init_skia_for_canvas")
+            .expect("surface recreate must re-create the 2D context");
+        let adopt = create
+            .find("adopt_drawing_state")
+            .expect("surface recreate must restore the captured 2D drawing state");
+        assert!(
+            reinit < adopt,
+            "the captured state must be adopted by the context that replaces the old one"
+        );
+    }
+
+    #[test]
     fn onscreen_drawing_buffer_resize_invalidates_present_state() {
         let resize = function_body(MGR, "pub(crate) fn resize_canvas");
         let start = resize

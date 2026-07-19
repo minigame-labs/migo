@@ -515,6 +515,7 @@ pub unsafe extern "C" fn migo_session_set_focus(
 /// implemented yet, which makes a failed content load silent. Once callbacks
 /// land this becomes a convenience rather than the only channel.
 fn init_dev_logging() {
+    use shared::config::LogLevel;
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -523,16 +524,13 @@ fn init_dev_logging() {
         };
         let level = level.to_string_lossy().to_lowercase();
         let level = match level.as_str() {
-            "trace" => tracing::Level::TRACE,
-            "debug" => tracing::Level::DEBUG,
-            "warn" => tracing::Level::WARN,
-            "error" => tracing::Level::ERROR,
-            _ => tracing::Level::INFO,
+            "trace" => LogLevel::Trace,
+            "debug" => LogLevel::Debug,
+            "warn" => LogLevel::Warn,
+            "error" => LogLevel::Error,
+            _ => LogLevel::Info,
         };
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(level)
-            .with_target(true)
-            .try_init();
+        crate::platform::install_dev_logging(level);
     });
 }
 
