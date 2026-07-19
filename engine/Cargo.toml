@@ -3,6 +3,7 @@ resolver = "2"
 members = [
  "crates/android-jni",
  "crates/audio",
+ "crates/capi",
  "crates/core",
  "crates/graphics",
  "crates/io",

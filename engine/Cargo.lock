@@ -327,6 +327,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "capi"
+version = "0.1.0"
+dependencies = [
+ "core",
+ "graphics",
+ "platform",
+ "shared",
+ "tracing",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.51"
 source = "registry+https://github.com/rust-lang/crates.io-index"

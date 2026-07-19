@@ -9,10 +9,20 @@ typedef uint64_t MigoEngineFlags;
 typedef uint64_t MigoSessionFlags;
 #define MIGO_SESSION_FLAG_NONE UINT64_C(0)
 
+/*
+ * Storage roots belong to the host: Migo reads and writes only underneath the
+ * directories given here and never invents a location of its own. All three are
+ * NUL-terminated UTF-8, borrowed for the duration of migo_engine_create, and
+ * copied before it returns. Directories are created if missing.
+ */
 typedef struct MigoEngineConfig {
     uint32_t struct_size;
     uint32_t abi_version;
     MigoEngineFlags flags;
+    uint32_t reserved0;
+    const char *files_dir_utf8;
+    const char *cache_dir_utf8;
+    const char *code_cache_dir_utf8;
 } MigoEngineConfig;
 
 typedef struct MigoSessionConfig {
@@ -20,6 +30,29 @@ typedef struct MigoSessionConfig {
     uint32_t abi_version;
     MigoSessionFlags flags;
 } MigoSessionConfig;
+
+typedef uint32_t MigoContentFlags;
+#define MIGO_CONTENT_FLAG_NONE UINT32_C(0)
+
+/*
+ * Names content the host has already installed under the engine's files
+ * directory, in the same layout the platform SDKs install into
+ * (<files_dir>/migo/games/<content_id>/code/<entry>). Both strings are
+ * NUL-terminated UTF-8, borrowed for the duration of the call.
+ *
+ * Loading from an arbitrary host-chosen directory is deliberately not in v1:
+ * it would make the engine's content resolution part of the frozen ABI. A
+ * host-supplied bundle root is the natural v1.1 extension, added as a new
+ * flagged field rather than by changing this struct's meaning.
+ */
+typedef struct MigoContentDescriptor {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    MigoContentFlags flags;
+    uint32_t reserved0;
+    const char *content_id_utf8;
+    const char *entry_utf8;
+} MigoContentDescriptor;
 
 typedef uint32_t MigoLifecycleState;
 #define MIGO_LIFECYCLE_CREATED UINT32_C(0)
@@ -84,6 +117,16 @@ MIGO_API MigoResult MIGO_CALL migo_session_create(
     MigoEngine *engine,
     const MigoSessionConfig *config,
     MigoSession **out_session);
+
+/*
+ * Starts evaluating the named content. Argument and state problems are reported
+ * synchronously; failures raised while the content runs arrive through
+ * on_error, because by then the caller's stack is long gone. A Session loads
+ * content once: a second call returns MIGO_ERROR_INVALID_STATE.
+ */
+MIGO_API MigoResult MIGO_CALL migo_session_load_content(
+    MigoSession *session,
+    const MigoContentDescriptor *content);
 
 MIGO_API MigoResult MIGO_CALL migo_session_set_host_callbacks(
     MigoSession *session,
