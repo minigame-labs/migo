@@ -19,6 +19,7 @@ mod capabilities;
 mod host_kit;
 mod platform;
 mod input;
+mod layout;
 mod surface;
 #[cfg(test)]
 mod test_support;

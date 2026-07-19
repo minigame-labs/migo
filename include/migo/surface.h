@@ -1,6 +1,7 @@
 #ifndef MIGO_SURFACE_H_
 #define MIGO_SURFACE_H_
 
+#include <stddef.h> /* offsetof */
 #include <migo/types.h>
 
 typedef uint32_t MigoPlatformKind;
@@ -72,6 +73,11 @@ typedef struct MigoSurfaceMetrics {
     uint32_t reserved0;
 } MigoSurfaceMetrics;
 
+MIGO_STATIC_ASSERT(sizeof(MigoSurfaceMetrics) == 48, "MigoSurfaceMetrics size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoSurfaceMetrics, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+MIGO_STATIC_ASSERT(offsetof(MigoSurfaceMetrics, scale_factor) == 24, "MigoSurfaceMetrics.scale_factor moved");
+
 /*
  * platform_descriptor is borrowed for this call only. The implementation must
  * copy the descriptor and acquire any ref-counted native target before attach
@@ -97,6 +103,16 @@ typedef struct MigoSurfaceDescriptor {
     uint32_t reserved0;
     const void *platform_descriptor;
 } MigoSurfaceDescriptor;
+
+MIGO_STATIC_ASSERT(offsetof(MigoSurfaceDescriptor, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+#if MIGO_LP64
+MIGO_STATIC_ASSERT(sizeof(MigoSurfaceDescriptor) == 72, "MigoSurfaceDescriptor LP64 size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoSurfaceDescriptor, capability_flags) == 48,
+                   "MigoSurfaceDescriptor.capability_flags moved");
+MIGO_STATIC_ASSERT(offsetof(MigoSurfaceDescriptor, platform_descriptor) == 64,
+                   "MigoSurfaceDescriptor.platform_descriptor moved");
+#endif
 
 MIGO_BEGIN_DECLS
 

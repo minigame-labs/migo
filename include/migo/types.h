@@ -60,6 +60,29 @@
 #define MIGO_C_ABI_HAS_RUNTIME 0
 #endif
 
+/*
+ * Layout assertions, in the headers a host actually compiles.
+ *
+ * The Rust implementation pins the same numbers. Two independent assertions of
+ * one shape is the point: a change on either side fails on that side, at the
+ * moment it is made, instead of surfacing as a host writing one field and the
+ * library reading another.
+ */
+#if defined(__cplusplus)
+#define MIGO_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define MIGO_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+
+/* LP64 is the only shape that ships today (linux-x86_64, aarch64-linux-android).
+ * Sizes that contain a pointer are asserted only there; ILP32 needs its own
+ * numbers, and asserting invented ones would be worse than asserting none. */
+#if UINTPTR_MAX == UINT64_MAX
+#define MIGO_LP64 1
+#else
+#define MIGO_LP64 0
+#endif
+
 #define MIGO_ABI_VERSION_1 UINT32_C(1)
 #define MIGO_ABI_VERSION_CURRENT MIGO_ABI_VERSION_1
 

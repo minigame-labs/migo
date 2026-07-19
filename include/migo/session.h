@@ -132,6 +132,15 @@ typedef struct MigoHostCallbacks {
     MigoOnRequestFrameFn on_request_frame;
 } MigoHostCallbacks;
 
+MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+#if MIGO_LP64
+MIGO_STATIC_ASSERT(sizeof(MigoHostCallbacks) == 72, "MigoHostCallbacks LP64 size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, dispatch) == 24, "MigoHostCallbacks.dispatch moved");
+MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, on_request_frame) == 64,
+                   "MigoHostCallbacks.on_request_frame moved");
+#endif
+
 MIGO_API MigoResult MIGO_CALL
 migo_engine_create(const MigoEngineConfig *config, MigoEngine **out_engine);
 

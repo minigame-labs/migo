@@ -7,6 +7,7 @@
 #ifndef MIGO_INPUT_H
 #define MIGO_INPUT_H
 
+#include <stddef.h> /* offsetof */
 #include <migo/types.h>
 #include <migo/session.h>
 
@@ -54,6 +55,13 @@ typedef struct MigoTouchPoint {
     MigoTouchPointFlags flags;
 } MigoTouchPoint;
 
+MIGO_STATIC_ASSERT(sizeof(MigoTouchPoint) == 20, "MigoTouchPoint is 20 bytes on every target");
+MIGO_STATIC_ASSERT(offsetof(MigoTouchPoint, id) == 0, "MigoTouchPoint.id moved");
+MIGO_STATIC_ASSERT(offsetof(MigoTouchPoint, x) == 4, "MigoTouchPoint.x moved");
+MIGO_STATIC_ASSERT(offsetof(MigoTouchPoint, y) == 8, "MigoTouchPoint.y moved");
+MIGO_STATIC_ASSERT(offsetof(MigoTouchPoint, pressure) == 12, "MigoTouchPoint.pressure moved");
+MIGO_STATIC_ASSERT(offsetof(MigoTouchPoint, flags) == 16, "MigoTouchPoint.flags moved");
+
 /*
  * points is borrowed for the duration of the call: the implementation copies
  * what it needs before returning, so the caller may reuse or free the array
@@ -67,6 +75,14 @@ typedef struct MigoTouchEvent {
     int64_t timestamp_ms;
     const MigoTouchPoint *points;
 } MigoTouchEvent;
+
+MIGO_STATIC_ASSERT(offsetof(MigoTouchEvent, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+#if MIGO_LP64
+MIGO_STATIC_ASSERT(sizeof(MigoTouchEvent) == 32, "MigoTouchEvent LP64 size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoTouchEvent, timestamp_ms) == 16, "MigoTouchEvent.timestamp_ms moved");
+MIGO_STATIC_ASSERT(offsetof(MigoTouchEvent, points) == 24, "MigoTouchEvent.points moved");
+#endif
 
 /*
  * Deliver one touch event to the session's content.
