@@ -30,11 +30,31 @@
 #endif
 
 /*
- * This source-visible ABI is a design candidate. No migo_* implementation
- * symbols are exported by the repository in this slice.
+ * This source-visible ABI is still a design candidate: several freeze blockers
+ * listed in README.md are open, notably input contracts, asynchronous request
+ * identity, capability queries, and an Android implementation of this same
+ * contract. Do not treat it as stable.
  */
 #define MIGO_C_ABI_CANDIDATE 1
+
+/*
+ * Whether a linkable runtime implementing these declarations exists for the
+ * platform being compiled for.
+ *
+ * Desktop Linux ships one: scripts/build-linux-sdk.sh produces libmigo.so and
+ * libmigo.a exporting exactly the migo_* set declared here, with pkg-config and
+ * CMake integration. Android embeds through the Java/JNI SDK and exports no
+ * migo_* symbols, so the answer there is still no -- a host must not compile
+ * against these declarations expecting to link.
+ *
+ * This says a runtime exists, not that the ABI is frozen; MIGO_C_ABI_CANDIDATE
+ * remains 1 until the README's blockers are closed.
+ */
+#if defined(__linux__) && !defined(__ANDROID__)
+#define MIGO_C_ABI_HAS_RUNTIME 1
+#else
 #define MIGO_C_ABI_HAS_RUNTIME 0
+#endif
 
 #define MIGO_ABI_VERSION_1 UINT32_C(1)
 #define MIGO_ABI_VERSION_CURRENT MIGO_ABI_VERSION_1

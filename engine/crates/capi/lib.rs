@@ -16,6 +16,17 @@
 mod abi;
 mod callbacks;
 mod host_kit;
+mod surface;
+#[cfg(test)]
+mod test_support;
+
+// The surface entry points and the descriptors they read live in their
+// own module; re-exported so the crate's public surface is unchanged.
+pub use surface::{
+    migo_session_attach_surface, migo_surface_detach, migo_surface_update,
+    MigoSurfaceAttachment, MigoSurfaceDescriptor, MigoSurfaceMetrics,
+    MigoX11WindowDescriptor,
+};
 
 use std::{
     ffi::c_void,
@@ -64,35 +75,6 @@ struct MigoContentDescriptor {
     entry_utf8: *const c_char,
 }
 
-#[repr(C)]
-struct MigoSurfaceDescriptor {
-    header: VersionedHeader,
-    generation: u64,
-    platform_kind: u32,
-    flags: u32,
-    width_pixels: u32,
-    height_pixels: u32,
-    scale_factor: f32,
-    color_space: u32,
-    alpha_mode: u32,
-    preferred_presentation_mode: u32,
-    capability_flags: u64,
-    platform_descriptor_size: u32,
-    reserved0: u32,
-    platform_descriptor: *const c_void,
-}
-
-#[repr(C)]
-struct MigoX11WindowDescriptor {
-    header: VersionedHeader,
-    platform_kind: u32,
-    flags: u32,
-    display: *mut c_void,
-    window: usize,
-    screen: i32,
-    reserved0: u32,
-}
-
 // ---- Handles ----------------------------------------------------------------
 
 /// Process-level state: the storage roots the host granted, plus a live-session
@@ -132,11 +114,6 @@ pub struct MigoSession {
     /// Cleared by destroy so queued callbacks cancel instead of handing the
     /// host a session pointer it has already released.
     alive: Arc<std::sync::atomic::AtomicBool>,
-}
-
-pub struct MigoSurfaceAttachment {
-    session: NonNull<MigoSession>,
-    generation: u64,
 }
 
 // ---- Engine -----------------------------------------------------------------
@@ -481,123 +458,6 @@ pub unsafe extern "C" fn migo_session_set_focus(
 // ---- Surface ----------------------------------------------------------------
 
 /// # Safety
-/// `session` must be live; `descriptor` a `MigoSurfaceDescriptor` whose
-/// `platform_descriptor` points at the matching typed descriptor;
-/// `out_attachment` writable storage for one pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn migo_session_attach_surface(
-    session: *mut MigoSession,
-    descriptor: *const MigoSurfaceDescriptor,
-    out_attachment: *mut *mut MigoSurfaceAttachment,
-) -> MigoResult {
-    guard("migo_session_attach_surface", || {
-        let Some(session_ptr) = NonNull::new(session) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
-        };
-        let Some(out_attachment) = (unsafe { out_attachment.as_mut() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
-        };
-        if let Err(error) = unsafe {
-            validate_header(
-                descriptor as *const VersionedHeader,
-                size_of::<MigoSurfaceDescriptor>(),
-            )
-        } {
-            return error;
-        }
-        let descriptor = unsafe { &*descriptor };
-
-        let (surface, graphics_platform) = match unsafe { build_target(descriptor) } {
-            Ok(target) => target,
-            Err(error) => return error,
-        };
-
-        let session_ref = unsafe { session_ptr.as_ref() };
-        let Ok(mut state) = session_ref.state.lock() else {
-            return MIGO_ERROR_INTERNAL;
-        };
-        if state.attached {
-            return MIGO_ERROR_INVALID_STATE;
-        }
-
-        let host = match state.host {
-            // Re-attach after a detach: the host thread is still alive, so the
-            // surface joins it as a new generation rather than starting over.
-            Some(host) => match core::lease_surface(host, surface) {
-                Ok(_lease) => host,
-                Err(error) => {
-                    tracing::error!("migo_session_attach_surface: lease failed: {error}");
-                    return MIGO_ERROR_INTERNAL;
-                }
-            },
-            None => {
-                let notifier = state.callbacks.map(|callbacks| {
-                    callbacks::Notifier::new(
-                        callbacks,
-                        session_ptr.cast(),
-                        Arc::clone(&session_ref.alive),
-                    )
-                });
-                let host_kit: Arc<dyn PlatformServices> =
-                    Arc::new(host_kit::CapiHostKit::new(notifier));
-                let options = InitOptions::new()
-                    .with_files_dir(session_ref.engine.files_dir.clone())
-                    .with_cache_dir(session_ref.engine.cache_dir.clone())
-                    .with_code_cache_dir(session_ref.engine.code_cache_dir.clone())
-                    .with_pixel_ratio(descriptor.scale_factor.max(1.0))
-                    .with_target_fps(60)
-                    .with_code_signing_enabled(!session_ref.engine.allow_unsigned_content);
-                match spawn_host_thread(surface, graphics_platform, host_kit, options) {
-                    Ok(host) => {
-                        state.host = Some(host);
-                        host
-                    }
-                    Err(error) => {
-                        tracing::error!("migo_session_attach_surface: spawn failed: {error:?}");
-                        return MIGO_ERROR_INTERNAL;
-                    }
-                }
-            }
-        };
-        let _ = host;
-        state.attached = true;
-
-        let attachment = Box::new(MigoSurfaceAttachment {
-            session: session_ptr,
-            generation: descriptor.generation,
-        });
-        *out_attachment = Box::into_raw(attachment);
-        MIGO_OK
-    })
-}
-
-/// # Safety
-/// `attachment` must come from [`migo_session_attach_surface`] and its session
-/// must still be live. On `MIGO_OK` the handle is consumed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn migo_surface_detach(
-    attachment: *mut MigoSurfaceAttachment,
-) -> MigoResult {
-    guard("migo_surface_detach", || {
-        if attachment.is_null() {
-            return MIGO_ERROR_INVALID_ARGUMENT;
-        }
-        let attachment = unsafe { Box::from_raw(attachment) };
-        let session = unsafe { attachment.session.as_ref() };
-        let Ok(mut state) = session.state.lock() else {
-            return MIGO_ERROR_INTERNAL;
-        };
-        if let Some(host) = state.host {
-            // Retiring the generation is the synchronous completion boundary the
-            // header promises: no later present may reference it.
-            if let Err(error) = core::retire_surface(host) {
-                tracing::warn!("migo_surface_detach: retire failed: {error}");
-            }
-        }
-        state.attached = false;
-        MIGO_OK
-    })
-}
 
 /// Install a log subscriber when `MIGO_CAPI_LOG` is set.
 ///
@@ -628,104 +488,16 @@ fn init_dev_logging() {
     });
 }
 
-/// Translate a validated descriptor into the engine's surface + graphics
-/// platform pair.
-///
-/// # Safety
-/// `descriptor` must have passed [`validate_header`].
-unsafe fn build_target(
-    descriptor: &MigoSurfaceDescriptor,
-) -> Result<(SurfaceRef, graphics::egl_platform::GraphicsPlatform), MigoResult> {
-    if descriptor.platform_kind != MIGO_PLATFORM_X11_WINDOW {
-        return Err(MIGO_ERROR_UNSUPPORTED_PLATFORM);
-    }
-    // The envelope's size field and the payload's own struct_size are an
-    // intentional cross-check; disagreeing means the caller mismatched them.
-    if descriptor.platform_descriptor_size as usize != size_of::<MigoX11WindowDescriptor>() {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-    unsafe {
-        validate_header(
-            descriptor.platform_descriptor as *const VersionedHeader,
-            size_of::<MigoX11WindowDescriptor>(),
-        )
-    }?;
-    let x11 = unsafe { &*(descriptor.platform_descriptor as *const MigoX11WindowDescriptor) };
-    if x11.platform_kind != MIGO_PLATFORM_X11_WINDOW {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-    let Some(display) = NonNull::new(x11.display) else {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    };
-    if x11.window == 0 || descriptor.width_pixels == 0 || descriptor.height_pixels == 0 {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-
-    let surface: SurfaceRef = Arc::new(platform::desktop::presenter::LinuxX11Surface::new(
-        x11.window as std::ffi::c_ulong,
-        descriptor.width_pixels,
-        descriptor.height_pixels,
-    ));
-    let graphics_platform = platform::desktop::presenter::linux_x11_graphics_platform(display)
-        .map_err(|error| {
-            tracing::error!("migo_session_attach_surface: graphics platform: {error:?}");
-            MIGO_ERROR_INTERNAL
-        })?;
-    Ok((surface, graphics_platform))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI};
+    use crate::test_support::{engine_config, scratch_dirs, session_config, with_engine};
     use std::ffi::CString;
 
-    fn engine_config(
-        dirs: &(CString, CString, CString),
-        struct_size: u32,
-        abi_version: u32,
-    ) -> MigoEngineConfig {
-        MigoEngineConfig {
-            header: VersionedHeader {
-                struct_size,
-                abi_version,
-            },
-            flags: 0,
-            reserved0: 0,
-            files_dir_utf8: dirs.0.as_ptr(),
-            cache_dir_utf8: dirs.1.as_ptr(),
-            code_cache_dir_utf8: dirs.2.as_ptr(),
-        }
-    }
 
-    fn scratch_dirs(tag: &str) -> (CString, CString, CString) {
-        let root = std::env::temp_dir().join(format!("migo-capi-test-{tag}-{}", std::process::id()));
-        let make = |name: &str| {
-            CString::new(root.join(name).to_str().expect("utf-8 path")).expect("cstring")
-        };
-        (make("files"), make("cache"), make("code-cache"))
-    }
 
-    fn session_config() -> MigoSessionConfig {
-        MigoSessionConfig {
-            header: VersionedHeader {
-                struct_size: size_of::<MigoSessionConfig>() as u32,
-                abi_version: MIGO_ABI_VERSION_CURRENT,
-            },
-            flags: 0,
-        }
-    }
 
-    /// Create an engine, run `body`, then destroy it.
-    fn with_engine(tag: &str, body: impl FnOnce(*mut MigoEngine)) {
-        let dirs = scratch_dirs(tag);
-        let config = engine_config(&dirs, size_of::<MigoEngineConfig>() as u32, MIGO_ABI_VERSION_CURRENT);
-        let mut engine: *mut MigoEngine = std::ptr::null_mut();
-        assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
-        assert!(!engine.is_null());
-        body(engine);
-        assert_eq!(unsafe { migo_engine_destroy(engine) }, MIGO_OK);
-    }
 
     #[test]
     fn engine_rejects_a_config_from_a_different_abi() {
@@ -954,116 +726,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn non_x11_platforms_are_reported_as_unsupported_not_invalid() {
-        // A host on a platform this build does not implement should learn that,
-        // rather than think its descriptor was malformed.
-        let descriptor = MigoSurfaceDescriptor {
-            header: VersionedHeader {
-                struct_size: size_of::<MigoSurfaceDescriptor>() as u32,
-                abi_version: MIGO_ABI_VERSION_CURRENT,
-            },
-            generation: 1,
-            platform_kind: 2, // MIGO_PLATFORM_WIN32_HWND
-            flags: 0,
-            width_pixels: 640,
-            height_pixels: 480,
-            scale_factor: 1.0,
-            color_space: 0,
-            alpha_mode: 0,
-            preferred_presentation_mode: 0,
-            capability_flags: 0,
-            platform_descriptor_size: size_of::<MigoX11WindowDescriptor>() as u32,
-            reserved0: 0,
-            platform_descriptor: std::ptr::null(),
-        };
-        let error = unsafe { build_target(&descriptor) }.err().expect("rejected");
-        assert_eq!(error, MIGO_ERROR_UNSUPPORTED_PLATFORM);
-    }
 
-    #[test]
-    fn x11_descriptor_size_mismatch_is_rejected() {
-        // The envelope's platform_descriptor_size and the payload's struct_size
-        // are a deliberate cross-check; disagreement means a mismatched build.
-        let x11 = MigoX11WindowDescriptor {
-            header: VersionedHeader {
-                struct_size: size_of::<MigoX11WindowDescriptor>() as u32,
-                abi_version: MIGO_ABI_VERSION_CURRENT,
-            },
-            platform_kind: MIGO_PLATFORM_X11_WINDOW,
-            flags: 0,
-            display: 0xdead_beef_usize as *mut c_void,
-            window: 0x2a0_0001,
-            screen: 0,
-            reserved0: 0,
-        };
-        let descriptor = MigoSurfaceDescriptor {
-            header: VersionedHeader {
-                struct_size: size_of::<MigoSurfaceDescriptor>() as u32,
-                abi_version: MIGO_ABI_VERSION_CURRENT,
-            },
-            generation: 1,
-            platform_kind: MIGO_PLATFORM_X11_WINDOW,
-            flags: 0,
-            width_pixels: 640,
-            height_pixels: 480,
-            scale_factor: 1.0,
-            color_space: 0,
-            alpha_mode: 0,
-            preferred_presentation_mode: 0,
-            capability_flags: 0,
-            platform_descriptor_size: 8, // wrong on purpose
-            reserved0: 0,
-            platform_descriptor: &x11 as *const _ as *const c_void,
-        };
-        let error = unsafe { build_target(&descriptor) }.err().expect("rejected");
-        assert_eq!(error, MIGO_ERROR_INVALID_ARGUMENT);
-    }
 
-    #[test]
-    fn x11_descriptor_requires_a_real_window_and_display() {
-        let make = |display: *mut c_void, window: usize| MigoX11WindowDescriptor {
-            header: VersionedHeader {
-                struct_size: size_of::<MigoX11WindowDescriptor>() as u32,
-                abi_version: MIGO_ABI_VERSION_CURRENT,
-            },
-            platform_kind: MIGO_PLATFORM_X11_WINDOW,
-            flags: 0,
-            display,
-            window,
-            screen: 0,
-            reserved0: 0,
-        };
-        let describe = |x11: &MigoX11WindowDescriptor| MigoSurfaceDescriptor {
-            header: VersionedHeader {
-                struct_size: size_of::<MigoSurfaceDescriptor>() as u32,
-                abi_version: MIGO_ABI_VERSION_CURRENT,
-            },
-            generation: 1,
-            platform_kind: MIGO_PLATFORM_X11_WINDOW,
-            flags: 0,
-            width_pixels: 640,
-            height_pixels: 480,
-            scale_factor: 1.0,
-            color_space: 0,
-            alpha_mode: 0,
-            preferred_presentation_mode: 0,
-            capability_flags: 0,
-            platform_descriptor_size: size_of::<MigoX11WindowDescriptor>() as u32,
-            reserved0: 0,
-            platform_descriptor: x11 as *const _ as *const c_void,
-        };
-
-        let no_display = make(std::ptr::null_mut(), 0x2a0_0001);
-        assert_eq!(
-            unsafe { build_target(&describe(&no_display)) }.err(),
-            Some(MIGO_ERROR_INVALID_ARGUMENT)
-        );
-
-        let no_window = make(0xdead_beef_usize as *mut c_void, 0);
-        assert_eq!(
-            unsafe { build_target(&describe(&no_window)) }.err(),
-            Some(MIGO_ERROR_INVALID_ARGUMENT)
-        );
-    }
 }

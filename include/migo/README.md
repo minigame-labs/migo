@@ -1,15 +1,16 @@
 # Migo C ABI and Surface v1 candidate
 
-These headers are a **compile-only** design candidate. They make Migo's planned low-level embedding contract reviewable from C11 and C++17, but this repository does not export callable `migo_*` runtime symbols yet.
+These headers are a design candidate. They make Migo's planned low-level embedding contract reviewable from C11 and C++17. On desktop Linux they are also callable: `scripts/build-linux-sdk.sh` produces `libmigo.so` and `libmigo.a` exporting exactly the `migo_*` set declared here, with pkg-config and CMake integration. Everywhere else the headers remain compile-only.
 
 The public markers are intentional:
 
 ```c
-MIGO_C_ABI_CANDIDATE == 1
-MIGO_C_ABI_HAS_RUNTIME == 0
+MIGO_C_ABI_CANDIDATE  == 1     /* still a candidate everywhere */
+MIGO_C_ABI_HAS_RUNTIME == 1    /* desktop Linux: a linkable runtime exists */
+MIGO_C_ABI_HAS_RUNTIME == 0    /* Android and every other target */
 ```
 
-Do not ship these headers as a stable SDK, assign them a stable SONAME, or expect a program that calls the declarations to link. Android continues to use the existing Java/JNI SDK in this phase.
+A runtime existing is not the same as the ABI being frozen. Do not treat these headers as a stable SDK: the freeze blockers below are open, and the surface may still change. Android continues to use the existing Java/JNI SDK and exports no `migo_*` symbols.
 
 ## Header layout
 
@@ -70,12 +71,17 @@ Descriptors are parsed and converted once during attach/update control operation
 
 The candidate cannot be declared stable until all of the following exist:
 
-- performance-oriented batched pointer/touch, keyboard/text/IME, and gamepad contracts;
-- asynchronous request IDs, cancellation races, and late-completion rules;
-- capability and supported-structure/version queries;
-- Android and Linux implementations using this same contract;
-- export lists, symbol/version tests, old-client/new-library tests, and per-target ILP32/LP64 layout lanes;
-- Android/Linux compatibility and performance gates with no material regression.
+- performance-oriented batched pointer/touch, keyboard/text/IME, and gamepad contracts — **open**, no input contract exists yet;
+- asynchronous request IDs, cancellation races, and late-completion rules — **open**;
+- capability and supported-structure/version queries — **open**;
+- Android and Linux implementations using this same contract — **Linux done, Android open**; the ABI crate is desktop-only today;
+- export lists, symbol/version tests, old-client/new-library tests, and per-target ILP32/LP64 layout lanes — **export list and symbol/version tests done** for `linux-x86_64` (`scripts/test-linux-sdk-contract.sh`); old-client/new-library lanes **open**;
+- Android/Linux compatibility and performance gates with no material regression — **Linux compatibility gate done**, the rest open.
+
+The Linux artifact contract that is in place is described by
+`dist/migo-linux-x86_64/share/migo/linux-x86_64-manifest.json`: target triple, CPU
+baseline, glibc/GLIBCXX floor, sysroot, dynamic dependencies, and the exact V8
+revision and GN arguments the archive was built from.
 
 Compile the current consumer contract with:
 

@@ -1,0 +1,32 @@
+{
+  "schema": "migo-v8-component-v1",
+  "target": "x86_64-unknown-linux-gnu",
+  "rusty_v8_revision": "0b8cfc5ae9d2507031076df2acdf61b0742a4c4e",
+  "rusty_v8_describe": "v145.0.0-1-g0b8cfc5-dirty",
+  "v8_version": "14.5.201.2",
+  "gn_args": [
+    "is_official_build=true",
+    "symbol_level=0",
+    "chrome_pgo_phase=0",
+    "use_thin_lto=false",
+    "use_glib=false",
+    "is_cfi=false",
+    "exclude_unwind_tables=true",
+    "v8_enable_sandbox=false",
+    "v8_enable_pointer_compression=true",
+    "v8_enable_webassembly=true",
+    "v8_enable_i18n_support=true",
+    "use_sysroot=true",
+    "v8_monolithic=true",
+    "v8_monolithic_for_shared_library=true",
+    "v8_use_external_startup_data=false",
+    "use_allocator_shim=false",
+    "use_partition_alloc_as_malloc=false"
+  ],
+  "archive_sha256": "57cb3d0a0e195738d8ecd366cccbd3c2dd89839e1b9461a9fc43725aac79e911",
+  "archive_bytes": 126994448,
+  "verified": {
+    "glibc_238_entry_points": 0,
+    "local_exec_tls_relocations": 0
+  }
+}

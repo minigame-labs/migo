@@ -48,16 +48,13 @@ c_info "deployed '$CONTENT_ID' to $CODE_DIR"
 
 # ---- build the C host ----
 #
-# Cargo drives the link. A Rust staticlib does not carry the native archives
-# (Skia, V8) that build scripts ask cargo to link, and reproducing that link
-# line by hand goes wrong in subtle ways — pulling Skia's archives in explicitly
-# forces `skia-bindings`' translation unit to be linked whole, which then needs
-# symbols no `libskia.a` under target/ defines, while cargo's own link never
-# pulls those objects in at all. `crates/c-host-example` therefore compiles
-# examples/c-host/main.c through a `#![no_main]` bin crate: the C code still
-# sees nothing but the public headers, and cargo resolves the native
-# dependencies correctly. Emitting that link line for hosts that do NOT use
-# cargo (pkg-config/CMake) is the packaging slice.
+# Cargo drives the link: `crates/c-host-example` compiles examples/c-host/main.c
+# through a `#![no_main]` bin crate, so the C code sees nothing but the public
+# headers while cargo resolves the native dependencies.
+#
+# For the packaged path -- the same C file built with plain cc and pkg-config,
+# no cargo -- use examples/c-host/build-with-pkgconfig.sh after running
+# scripts/build-linux-sdk.sh.
 cd "$ENGINE_DIR"
 c_info "building the C host (cargo drives the link) ..."
 cargo build -p c-host-example --offline

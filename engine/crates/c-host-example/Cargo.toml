@@ -6,12 +6,12 @@ edition = "2024"
 # Builds `examples/c-host/main.c` — a host written in C against the public
 # headers only — and links it with the engine.
 #
-# Cargo drives the link on purpose. A Rust staticlib does not carry the native
-# archives (Skia, V8) that build scripts ask cargo to link, so a hand-written
-# link line has to rediscover them and gets it wrong in subtle ways. Letting
-# cargo link means this example always matches the engine's real requirements.
-# Shipping that link line to hosts that do *not* use cargo is the packaging
-# slice's job (pkg-config/CMake).
+# Cargo drives the link here so this example always matches the engine's real
+# requirements without restating them. Hosts that do not use cargo consume the
+# packaged form instead: scripts/build-linux-sdk.sh stages pkg-config and CMake
+# metadata, and examples/c-host/build-with-pkgconfig.sh builds this same C file
+# through it. (An earlier note here claimed a Rust staticlib omits the native
+# archives; it does not -- see CLAUDE.md 10.2.)
 [[bin]]
 name = "migo-c-host"
 path = "src/main.rs"

@@ -2,6 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The packaging gate points this at the staged package so the contract
+# tests the headers a consumer actually receives, not the source tree.
+INCLUDE_DIR="${MIGO_INCLUDE_DIR:-$ROOT/include}"
 CC_BIN="${CC:-cc}"
 CXX_BIN="${CXX:-c++}"
 MODE="${1:---all}"
@@ -12,24 +15,24 @@ compile_c() {
     local source="$1"
     local output="$2"
     "$CC_BIN" -std=c11 -Wall -Wextra -Werror -pedantic \
-        -I"$ROOT/include" -c "$source" -o "$output"
+        -I"$INCLUDE_DIR" -c "$source" -o "$output"
 }
 
 compile_cpp() {
     local source="$1"
     local output="$2"
     "$CXX_BIN" -std=c++17 -Wall -Wextra -Werror -pedantic \
-        -I"$ROOT/include" -c "$source" -o "$output"
+        -I"$INCLUDE_DIR" -c "$source" -o "$output"
 }
 
 compile_header_standalone() {
     local header="$1"
     local stem="${header//\//_}"
     "$CC_BIN" -x c -std=c11 -Wall -Wextra -Werror -pedantic \
-        -I"$ROOT/include" -include "$header" -c /dev/null \
+        -I"$INCLUDE_DIR" -include "$header" -c /dev/null \
         -o "$TMP_ROOT/${stem}.o"
     "$CXX_BIN" -x c++ -std=c++17 -Wall -Wextra -Werror -pedantic \
-        -I"$ROOT/include" -include "$header" -c /dev/null \
+        -I"$INCLUDE_DIR" -include "$header" -c /dev/null \
         -o "$TMP_ROOT/${stem}_cpp.o"
 }
 
@@ -101,7 +104,7 @@ check_repository_integration() {
     require_regex "$ROOT/.github/workflows/c-abi-candidate.yml" \
         '^[[:space:]]+CC=clang CXX=clang\+\+ bash scripts/test-c-abi-surface-candidate\.sh$' \
         "candidate docs/header Clang gate"
-    require_literal "$ROOT/include/migo/README.md" "compile-only" \
+    require_literal "$ROOT/include/migo/README.md" "design candidate" \
         "candidate status documentation"
     require_literal "$ROOT/include/migo/README.md" \
         "must not wait for another turn of the host dispatcher" \

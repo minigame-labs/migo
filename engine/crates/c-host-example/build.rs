@@ -24,11 +24,9 @@ fn main() {
         .warnings(true)
         .compile("c_host_main");
 
-    // The example owns its window, so it — not the engine — needs Xlib.
+    // The example owns its window, so it -- not the engine -- needs Xlib. GL and
+    // EGL are not declared here: the graphics crate now declares the GL
+    // dependency its Skia backend creates, and EGL arrives through the engine's
+    // own link libraries. A consumer should not have to know either.
     println!("cargo:rustc-link-lib=X11");
-    // Skia is built with `skia_use_gl`, so its objects reference `gl*` directly
-    // and the final binary has to supply libGL; the Rust player links it for the
-    // same reason.
-    println!("cargo:rustc-link-lib=GL");
-    println!("cargo:rustc-link-lib=EGL");
 }

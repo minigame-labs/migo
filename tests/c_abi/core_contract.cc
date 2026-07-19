@@ -12,7 +12,18 @@
     static_assert(offsetof(TYPE, abi_version) == 4, #TYPE " ABI prefix")
 
 static_assert(MIGO_C_ABI_CANDIDATE == 1, "candidate marker");
-static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "compile-only candidate");
+/*
+ * The macro answers "does a linkable runtime exist for this target", so the
+ * assertion checks the rule rather than a constant: desktop Linux ships one,
+ * every other target does not. Asserting a fixed 0 here would have to be
+ * relaxed the moment any platform gained an implementation, which is exactly
+ * when the check is worth having.
+ */
+#if defined(__linux__) && !defined(__ANDROID__)
+static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "desktop Linux ships a runtime");
+#else
+static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "no runtime outside desktop Linux");
+#endif
 static_assert(sizeof(MigoResult) == 4, "fixed-width result");
 
 MIGO_CHECK_CXX_RECORD(MigoError);

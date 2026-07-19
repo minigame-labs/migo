@@ -66,6 +66,19 @@ jobs:
       - name: Platform services capability contract
         run: bash scripts/test-platform-services-capability-contract.sh
 
+      - name: Linux SDK packaging tooling
+        # Unit tests only. The packaging gate itself
+        # (scripts/test-linux-sdk-contract.sh) needs the Debian bullseye
+        # sysroot, a linux-gnu V8 archive and lld, none of which a stock runner
+        # has -- it runs on the release machine after scripts/build-linux-sdk.sh.
+        # These tests cover the parsers that gate depends on, and they are where
+        # the subtle failures were: a substring match that counted local-dynamic
+        # relocations as local-exec, and an export audit that read nm instead of
+        # objdump and so reported 190 exports for a library that exports 12.
+        run: |
+          python3 scripts/ci/tests/test_abi_floor_audit.py
+          python3 scripts/ci/tests/test_gen_linux_package_metadata.py
+
       - name: Artifact manifest tooling and contract
         run: |
           cargo fmt --manifest-path tools/artifact-manifest/Cargo.toml -- --check

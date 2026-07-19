@@ -58,3 +58,15 @@ local.properties
 AI_PROJECT_OVERVIEW.md
 
 !docs/
+
+# Python bytecode from the packaging scripts
+__pycache__/
+*.pyc
+
+# Staged Linux SDK package (scripts/build-linux-sdk.sh output)
+dist/
+
+# Linux SDK V8 archive: a build product of scripts/build-v8-linux.sh.
+# Not tracked -- the repo's LFS quota is already exhausted, and the script plus
+# component-manifest.json reproduce and describe it.
+engine/third_party/rusty_v8/x86_64-linux-gnu/librusty_v8.a
