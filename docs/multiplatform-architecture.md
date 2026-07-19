@@ -773,7 +773,7 @@ Android 官方建议新项目评估 Vulkan，但 Migo 承载的是 WebGL/Canvas 
 
 - Qt/GTK adapter 只负责从 toolkit 获取实际 surface、输入和生命周期；
 - core 不链接 Qt/GTK；
-- winit 只用于 `migo-player`；
+- 独立窗口只出现在 `migo-player`，且**不使用 winit**：`scripts/test-surface-attachment-contract.sh` 禁止 window-handle 抽象层的符号出现在 `engine/crates` 下，而这正是 winit 暴露的接口。player 改为运行时 dlopen 系统窗口库（X11 走 `x11-dl`），既满足门禁，也保持"SDK/播放器都不产生链接期窗口系统依赖"；
 - Wayland 下宿主拥有 display connection、surface role 和 dispatch loop。
 
 **版本与工件合同：**

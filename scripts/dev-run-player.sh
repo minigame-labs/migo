@@ -24,6 +24,8 @@ c_err()  { echo -e "\033[0;31m[player] $*\033[0m" >&2; }
 
 GAME_DIR="${1:-$REPO_ROOT/../migo-bench/shells/migo-shell/app/src/main/assets/game}"
 SECS="${2:-8}"
+# Anything further (e.g. --window) goes straight to the player binary.
+PLAYER_ARGS=("${@:3}")
 
 # ---- host V8 + Skia toolchain env (see scripts/dev-test-host.sh) ----
 V8_DIR="${MIGO_HOST_V8_DIR:-$REPO_ROOT/../rusty_v8_src/target/x86_64-unknown-linux-gnu/release/gn_out}"
@@ -45,4 +47,4 @@ c_info "building player ..."
 cargo build -p player --offline
 
 c_info "running player: game=$GAME_DIR secs=$SECS"
-exec ./target/debug/migo-player "$GAME_DIR" "$SECS"
+exec ./target/debug/migo-player "$GAME_DIR" "$SECS" ${PLAYER_ARGS[@]+"${PLAYER_ARGS[@]}"}

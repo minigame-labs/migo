@@ -1,31 +1,42 @@
-//! Headless Linux dev player for the Migo engine.
+//! Linux dev player for the Migo engine.
 //!
 //! Drives the full engine (V8 + graphics + JS game) on
-//! `x86_64-unknown-linux-gnu` through the offscreen (pbuffer) presenter, with
-//! no window server. The game's own telemetry (`console.error` lines) proves
-//! rendering, exactly like the on-device bench harness.
+//! `x86_64-unknown-linux-gnu`, either offscreen (pbuffer, no window server) or
+//! in a real X11 window. The game's own telemetry (`console.error` lines)
+//! proves rendering, exactly like the on-device bench harness.
 //!
 //! Usage:
-//!   migo-player [GAME_BUNDLE_DIR] [SECONDS]
+//!   migo-player [GAME_BUNDLE_DIR] [SECONDS] [--window]
 //!
 //! GAME_BUNDLE_DIR must contain `game.json` + `game.js` (a wx-style minigame
 //! bundle). Defaults to the sibling migo-bench bunnymark bundle.
+//!
+//! `--window` (or `MIGO_PLAYER_WINDOW=1`) exercises the onscreen X11 presenter.
+//! Headless stays the default so CI and the PNG capture path are unaffected.
+
+mod x11_window;
 
 use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
 use core::{send_command_to_host, shutdown_host, spawn_host_thread, PlatformServices};
 use platform::desktop::platform::DesktopPlatform;
-use platform::desktop::presenter::{linux_graphics_platform, LinuxOffscreenSurface};
+use platform::desktop::presenter::{
+    linux_graphics_platform, linux_x11_graphics_platform, LinuxOffscreenSurface, LinuxX11Surface,
+};
 use shared::{
     config::InitOptions,
     protocol::host_cmd::HostCommand,
     surface::SurfaceRef,
 };
 
+use x11_window::X11Window;
+
 const GAME_ID: &str = "player-demo";
 const ENTRY: &str = "game.js";
 const SURFACE_W: u32 = 720;
 const SURFACE_H: u32 = 1280;
+/// How often the window mode drains X events while the game renders.
+const EVENT_POLL: Duration = Duration::from_millis(16);
 
 fn main() {
     tracing_subscriber::fmt()
@@ -33,21 +44,34 @@ fn main() {
         .with_target(true)
         .init();
 
-    let mut args = std::env::args().skip(1);
-    let bundle_dir = args.next().map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(
-            "/home/xg/wkspace/migo-bench/shells/migo-shell/app/src/main/assets/game",
-        )
-    });
-    let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let mut positional = Vec::new();
+    let mut windowed = std::env::var_os("MIGO_PLAYER_WINDOW").is_some_and(|v| v != "0");
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--window" => windowed = true,
+            "--offscreen" => windowed = false,
+            _ => positional.push(arg),
+        }
+    }
+    let bundle_dir = positional
+        .first()
+        .filter(|arg| !arg.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("/home/xg/wkspace/migo-bench/shells/migo-shell/app/src/main/assets/game")
+        });
+    let secs: u64 = positional
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
 
-    if let Err(err) = run(&bundle_dir, secs) {
+    if let Err(err) = run(&bundle_dir, secs, windowed) {
         tracing::error!("player failed: {err}");
         std::process::exit(1);
     }
 }
 
-fn run(bundle_dir: &PathBuf, secs: u64) -> Result<(), String> {
+fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     // ---- Scratch dirs (files / cache / code cache) ----
     let root = std::env::temp_dir().join(format!("migo-player-{}", std::process::id()));
     let files_dir = root.join("files");
@@ -77,12 +101,39 @@ fn run(bundle_dir: &PathBuf, secs: u64) -> Result<(), String> {
         .with_debug_enabled(true)
         .with_code_signing_enabled(false);
 
-    // ---- Offscreen surface + Linux graphics platform + desktop host kit ----
-    let surface: SurfaceRef = Arc::new(LinuxOffscreenSurface::new(SURFACE_W, SURFACE_H));
-    let graphics_platform = linux_graphics_platform().map_err(|e| format!("graphics platform: {e:?}"))?;
+    // ---- Render target: a real X11 window, or an offscreen pbuffer ----
+    // The window (when present) must outlive the engine session: the render
+    // thread holds an EGL surface built from its handles, so it is dropped only
+    // after `shutdown_host` below.
+    let mut window = if windowed {
+        Some(X11Window::open(
+            "migo-player",
+            SURFACE_W,
+            SURFACE_H,
+        )?)
+    } else {
+        None
+    };
+
+    let (surface, graphics_platform) = match window.as_ref() {
+        Some(window) => {
+            let (width, height) = window.size();
+            let surface: SurfaceRef = Arc::new(LinuxX11Surface::new(window.window(), width, height));
+            let platform = linux_x11_graphics_platform(window.display())
+                .map_err(|e| format!("x11 graphics platform: {e:?}"))?;
+            (surface, platform)
+        }
+        None => {
+            let surface: SurfaceRef = Arc::new(LinuxOffscreenSurface::new(SURFACE_W, SURFACE_H));
+            let platform =
+                linux_graphics_platform().map_err(|e| format!("graphics platform: {e:?}"))?;
+            (surface, platform)
+        }
+    };
     let host_kit: Arc<dyn PlatformServices> = Arc::new(DesktopPlatform::new());
 
-    tracing::info!("spawning host thread ({SURFACE_W}x{SURFACE_H} offscreen)");
+    let mode = if windowed { "x11 window" } else { "offscreen" };
+    tracing::info!("spawning host thread ({SURFACE_W}x{SURFACE_H} {mode})");
     let host_id =
         spawn_host_thread(surface, graphics_platform, host_kit, opt).map_err(|e| format!("spawn_host_thread: {e:?}"))?;
     tracing::info!("host {host_id} spawned; loading game");
@@ -101,14 +152,16 @@ fn run(bundle_dir: &PathBuf, secs: u64) -> Result<(), String> {
     // frame during the initial active-render burst — robust against the game
     // later going idle/erroring. The render thread fills FBO 0 (after the
     // DrawingBuffer blit, before eglSwapBuffers) exactly once.
+    // Defaults into the run's scratch dir, not the working tree: running the
+    // player from the repo root should not leave an untracked PNG behind.
     let png_path = std::env::var_os("MIGO_PLAYER_PNG")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or(root).join("migo-player-frame.png"));
+        .unwrap_or_else(|| root.join("migo-player-frame.png"));
     graphics::frame_capture::request();
     // Let the game render for the window; the render thread keeps overwriting
     // the capture slot with the latest present, so early blank warmup frames
     // are superseded by frames containing game content.
-    thread::sleep(Duration::from_secs(secs.max(4)));
+    run_for(&mut window, Duration::from_secs(secs.max(4)));
     match graphics::frame_capture::take() {
         Some(frame) => {
             write_png(&png_path, &frame)?;
@@ -125,8 +178,30 @@ fn run(bundle_dir: &PathBuf, secs: u64) -> Result<(), String> {
     tracing::info!("shutting down host {host_id}");
     shutdown_host(host_id).map_err(|e| format!("shutdown_host: {e}"))?;
     thread::sleep(Duration::from_millis(300));
+    // Only now may the window go: the render thread has stopped touching the
+    // EGL surface built from its handles.
+    drop(window);
     tracing::info!("player done");
     Ok(())
+}
+
+/// Wait for `total`, servicing window events when running windowed.
+///
+/// Returns early if the window manager asks the window to close, so the caller
+/// still runs its capture + shutdown path instead of being killed mid-frame.
+fn run_for(window: &mut Option<X11Window>, total: Duration) {
+    let Some(window) = window.as_mut() else {
+        thread::sleep(total);
+        return;
+    };
+    let deadline = std::time::Instant::now() + total;
+    while std::time::Instant::now() < deadline {
+        if !window.pump() {
+            tracing::info!("window close requested; stopping early");
+            return;
+        }
+        thread::sleep(EVENT_POLL);
+    }
 }
 
 /// Flip GL bottom-up rows to top-down and encode an RGBA8 PNG.
