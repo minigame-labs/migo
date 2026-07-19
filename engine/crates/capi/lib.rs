@@ -16,12 +16,14 @@
 mod abi;
 mod callbacks;
 mod host_kit;
+mod input;
 mod surface;
 #[cfg(test)]
 mod test_support;
 
 // The surface entry points and the descriptors they read live in their
 // own module; re-exported so the crate's public surface is unchanged.
+pub use input::{migo_session_send_touch, MigoTouchEvent, MigoTouchPoint};
 pub use surface::{
     migo_session_attach_surface, migo_surface_detach, migo_surface_update,
     MigoSurfaceAttachment, MigoSurfaceDescriptor, MigoSurfaceMetrics,

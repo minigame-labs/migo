@@ -71,6 +71,44 @@ static int fail(const char *what, MigoResult result) {
     return 1;
 }
 
+/*
+ * X11 reports physical pixels; the ABI takes CSS pixels. This one constant is
+ * used both for the attach descriptor and for converting input, so the two
+ * cannot drift -- sending physical pixels is what makes a game render correctly
+ * and respond in the wrong place.
+ */
+static const float SCALE_FACTOR = 1.0f;
+
+/* Maps one X11 pointer position onto a single-point touch event (id 0), which
+ * is what wx content listens for; there is no separate mouse event model. */
+static void send_touch(MigoSession *session, MigoTouchType type, int x, int y,
+                       int64_t timestamp_ms) {
+    int removed = (type == MIGO_TOUCH_END || type == MIGO_TOUCH_CANCEL);
+
+    MigoTouchPoint point;
+    memset(&point, 0, sizeof point);
+    point.id = 0;
+    point.x = (float)x / SCALE_FACTOR;
+    point.y = (float)y / SCALE_FACTOR;
+    point.pressure = removed ? 0.0f : 1.0f;
+    point.flags = MIGO_TOUCH_FLAG_CHANGED;
+    if (removed) point.flags |= MIGO_TOUCH_FLAG_REMOVED;
+
+    MigoTouchEvent event;
+    memset(&event, 0, sizeof event);
+    event.struct_size = (uint32_t)sizeof event;
+    event.abi_version = MIGO_ABI_VERSION_CURRENT;
+    event.type = type;
+    event.point_count = 1;
+    event.timestamp_ms = timestamp_ms;
+    event.points = &point;
+
+    MigoResult result = migo_session_send_touch(session, &event);
+    if (result != MIGO_OK) {
+        fprintf(stderr, "[c-host] touch not delivered: %d\n", (int)result);
+    }
+}
+
 int main(int argc, char **argv) {
     const char *files_dir = (argc > 1) ? argv[1] : "/tmp/migo-c-host/files";
     const char *content_id = (argc > 2) ? argv[2] : "c-host-demo";
@@ -93,7 +131,9 @@ int main(int argc, char **argv) {
                                         BlackPixel(display, screen),
                                         BlackPixel(display, screen));
     XStoreName(display, window, "migo-c-host");
-    XSelectInput(display, window, StructureNotifyMask);
+    XSelectInput(display, window,
+                 StructureNotifyMask | ButtonPressMask | ButtonReleaseMask |
+                     PointerMotionMask | LeaveWindowMask);
     Atom wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(display, window, &wm_delete, 1);
     XMapWindow(display, window);
@@ -162,7 +202,7 @@ int main(int argc, char **argv) {
     surface.flags = MIGO_SURFACE_DESCRIPTOR_FLAG_NONE;
     surface.width_pixels = WINDOW_WIDTH;
     surface.height_pixels = WINDOW_HEIGHT;
-    surface.scale_factor = 1.0f;
+    surface.scale_factor = SCALE_FACTOR;
     surface.color_space = MIGO_COLOR_SPACE_SRGB;
     surface.alpha_mode = MIGO_ALPHA_MODE_OPAQUE;
     surface.preferred_presentation_mode = MIGO_PRESENTATION_MODE_DEFAULT;
@@ -190,6 +230,7 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     /* ---- The host owns the event loop; Migo renders on its own thread. ---- */
+    int pressed = 0;
     for (int elapsed = 0; elapsed < seconds * 1000; elapsed += 16) {
         while (XPending(display) > 0) {
             XEvent event;
@@ -198,6 +239,41 @@ int main(int argc, char **argv) {
                 (Atom)event.xclient.data.l[0] == wm_delete) {
                 printf("[c-host] window close requested\n");
                 elapsed = seconds * 1000;
+                break;
+            }
+            switch (event.type) {
+            case ButtonPress:
+                if (event.xbutton.button == Button1) {
+                    pressed = 1;
+                    send_touch(session, MIGO_TOUCH_START, event.xbutton.x,
+                               event.xbutton.y, (int64_t)event.xbutton.time);
+                }
+                break;
+            case MotionNotify:
+                /* Only while a button is down: wx content has no hover concept,
+                 * so free motion would be a stream of events no game reads. */
+                if (pressed) {
+                    send_touch(session, MIGO_TOUCH_MOVE, event.xmotion.x,
+                               event.xmotion.y, (int64_t)event.xmotion.time);
+                }
+                break;
+            case ButtonRelease:
+                if (event.xbutton.button == Button1 && pressed) {
+                    pressed = 0;
+                    send_touch(session, MIGO_TOUCH_END, event.xbutton.x,
+                               event.xbutton.y, (int64_t)event.xbutton.time);
+                }
+                break;
+            case LeaveNotify:
+                /* The pointer left with a button still down, so the release will
+                 * never arrive: cancel rather than strand the touch. */
+                if (pressed) {
+                    pressed = 0;
+                    send_touch(session, MIGO_TOUCH_CANCEL, event.xcrossing.x,
+                               event.xcrossing.y, (int64_t)event.xcrossing.time);
+                }
+                break;
+            default:
                 break;
             }
         }

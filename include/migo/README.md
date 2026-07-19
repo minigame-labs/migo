@@ -71,7 +71,10 @@ Descriptors are parsed and converted once during attach/update control operation
 
 The candidate cannot be declared stable until all of the following exist:
 
-- performance-oriented batched pointer/touch, keyboard/text/IME, and gamepad contracts — **open**, no input contract exists yet;
+- performance-oriented batched pointer/touch, keyboard/text/IME, and gamepad contracts —
+  **pointer/touch done** (`migo_session_send_touch`: batched, one copy at the boundary, no
+  allocation, sharing the engine path Android already drives); keyboard/text/IME and gamepad
+  **open**;
 - asynchronous request IDs, cancellation races, and late-completion rules — **open**;
 - capability and supported-structure/version queries — **open**;
 - Android and Linux implementations using this same contract — **Linux done, Android open**; the ABI crate is desktop-only today;

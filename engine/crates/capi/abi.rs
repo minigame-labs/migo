@@ -29,6 +29,11 @@ pub const MIGO_ERROR_DISPATCH_REJECTED: MigoResult = -9;
 pub const MIGO_ERROR_OUT_OF_MEMORY: MigoResult = -10;
 pub const MIGO_ERROR_INTERNAL: MigoResult = -11;
 
+/// The host command queue was full and the event was not delivered. Transient:
+/// the same call may succeed later. Reported rather than swallowed because a
+/// dropped `MIGO_TOUCH_END` leaves content believing a finger is still down.
+pub const MIGO_ERROR_WOULD_BLOCK: MigoResult = -12;
+
 pub const MIGO_ABI_VERSION_CURRENT: u32 = 1;
 
 /// Header shared by every versioned struct the caller passes in.

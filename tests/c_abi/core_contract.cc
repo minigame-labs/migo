@@ -26,6 +26,23 @@ static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "no runtime outside desktop Linux");
 #endif
 static_assert(sizeof(MigoResult) == 4, "fixed-width result");
 
+static_assert(MIGO_ERROR_WOULD_BLOCK == -INT32_C(12), "would-block value");
+
+/* Must match Rust's TouchPoint, which asserts 20 bytes on its side. A mismatch
+ * here would corrupt every touch the host sends, silently. */
+static_assert(sizeof(MigoTouchPoint) == 20, "touch point layout");
+static_assert(offsetof(MigoTouchPoint, id) == 0, "touch point id offset");
+static_assert(offsetof(MigoTouchPoint, x) == 4, "touch point x offset");
+static_assert(offsetof(MigoTouchPoint, y) == 8, "touch point y offset");
+static_assert(offsetof(MigoTouchPoint, pressure) == 12, "touch point pressure offset");
+static_assert(offsetof(MigoTouchPoint, flags) == 16, "touch point flags offset");
+MIGO_CHECK_CXX_RECORD(MigoTouchEvent);
+static_assert(MIGO_TOUCH_MAX_POINTS == 10, "inline array capacity");
+static_assert(MIGO_TOUCH_START == UINT32_C(0), "touch start value");
+static_assert(MIGO_TOUCH_MOVE == UINT32_C(1), "touch move value");
+static_assert(MIGO_TOUCH_END == UINT32_C(2), "touch end value");
+static_assert(MIGO_TOUCH_CANCEL == UINT32_C(3), "touch cancel value");
+
 MIGO_CHECK_CXX_RECORD(MigoError);
 MIGO_CHECK_CXX_RECORD(MigoEngineConfig);
 MIGO_CHECK_CXX_RECORD(MigoSessionConfig);

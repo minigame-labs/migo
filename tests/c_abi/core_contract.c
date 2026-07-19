@@ -38,6 +38,23 @@ _Static_assert(MIGO_ERROR_DISPATCH_REJECTED == -INT32_C(9),
 _Static_assert(MIGO_ERROR_OUT_OF_MEMORY == -INT32_C(10), "out-of-memory value");
 _Static_assert(MIGO_ERROR_INTERNAL == -INT32_C(11), "internal error value");
 
+_Static_assert(MIGO_ERROR_WOULD_BLOCK == -INT32_C(12), "would-block value");
+
+/* Must match Rust's TouchPoint, which asserts 20 bytes on its side. A mismatch
+ * here would corrupt every touch the host sends, silently. */
+_Static_assert(sizeof(MigoTouchPoint) == 20, "touch point layout");
+_Static_assert(offsetof(MigoTouchPoint, id) == 0, "touch point id offset");
+_Static_assert(offsetof(MigoTouchPoint, x) == 4, "touch point x offset");
+_Static_assert(offsetof(MigoTouchPoint, y) == 8, "touch point y offset");
+_Static_assert(offsetof(MigoTouchPoint, pressure) == 12, "touch point pressure offset");
+_Static_assert(offsetof(MigoTouchPoint, flags) == 16, "touch point flags offset");
+MIGO_CHECK_PREFIX(MigoTouchEvent);
+_Static_assert(MIGO_TOUCH_MAX_POINTS == 10, "inline array capacity");
+_Static_assert(MIGO_TOUCH_START == UINT32_C(0), "touch start value");
+_Static_assert(MIGO_TOUCH_MOVE == UINT32_C(1), "touch move value");
+_Static_assert(MIGO_TOUCH_END == UINT32_C(2), "touch end value");
+_Static_assert(MIGO_TOUCH_CANCEL == UINT32_C(3), "touch cancel value");
+
 #ifdef MIGO_ERROR_ALREADY_DETACHED
 #error "a consumed attachment cannot safely report already-detached through the old pointer"
 #endif

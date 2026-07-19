@@ -74,6 +74,16 @@ typedef int32_t MigoResult;
 #define MIGO_ERROR_OUT_OF_MEMORY ((MigoResult)-10)
 #define MIGO_ERROR_INTERNAL ((MigoResult)-11)
 
+/*
+ * The host command queue was full, so the event was not delivered. Unlike every
+ * other error here this one is transient: the same call may succeed later. It
+ * exists because dropping input silently is worse than reporting it -- a lost
+ * MIGO_TOUCH_END leaves content believing a finger is still down, and no later
+ * event corrects that. The host decides whether to retry or coalesce, because
+ * only the host knows which of its events are safe to merge.
+ */
+#define MIGO_ERROR_WOULD_BLOCK ((MigoResult)-12)
+
 typedef uint32_t MigoErrorFlags;
 #define MIGO_ERROR_FLAG_NONE UINT32_C(0)
 #define MIGO_ERROR_FLAG_RECOVERABLE (UINT32_C(1) << 0)

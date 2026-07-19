@@ -38,7 +38,7 @@ compile_header_standalone() {
 
 compile_core() {
     local header
-    for header in migo/types.h migo/surface.h migo/session.h migo/migo.h; do
+    for header in migo/types.h migo/surface.h migo/session.h migo/input.h migo/migo.h; do
         compile_header_standalone "$header"
     done
     compile_c "$ROOT/tests/c_abi/core_contract.c" "$TMP_ROOT/core_contract.o"
