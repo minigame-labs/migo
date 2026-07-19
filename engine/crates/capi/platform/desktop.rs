@@ -23,6 +23,16 @@ pub(crate) enum PlatformTarget {
     X11 { window: c_ulong },
 }
 
+/// The surface kinds this build can attach, as a `MIGO_PLATFORM_*` bitmask.
+///
+/// `build_target` rejects by testing membership here rather than comparing
+/// against its own constant, so what `migo_query_capabilities` advertises and
+/// what an attach actually accepts cannot drift apart. A query that drifts is
+/// worse than no query: a host would plan around an answer that is false.
+pub(crate) const fn supported_platform_kinds() -> u64 {
+    1u64 << MIGO_PLATFORM_X11_WINDOW
+}
+
 pub(crate) fn rebuild_surface(target: PlatformTarget, width: u32, height: u32) -> SurfaceRef {
     match target {
         PlatformTarget::X11 { window } => Arc::new(
@@ -46,7 +56,7 @@ pub(crate) unsafe fn build_target(
     ),
     MigoResult,
 > {
-    if descriptor.platform_kind != MIGO_PLATFORM_X11_WINDOW {
+    if !crate::platform::kind_is_supported(descriptor.platform_kind) {
         return Err(MIGO_ERROR_UNSUPPORTED_PLATFORM);
     }
     // The envelope's size field and the payload's own struct_size are an

@@ -13,9 +13,21 @@ mod android;
 mod desktop;
 
 #[cfg(target_os = "android")]
-pub(crate) use android::{build_target, rebuild_surface, PlatformTarget};
+pub(crate) use android::{build_target, rebuild_surface, supported_platform_kinds, PlatformTarget};
 #[cfg(not(target_os = "android"))]
-pub(crate) use desktop::{build_target, rebuild_surface, PlatformTarget};
+pub(crate) use desktop::{build_target, rebuild_surface, supported_platform_kinds, PlatformTarget};
+
+/// Whether this build can attach the given `MIGO_PLATFORM_*` kind.
+///
+/// The single test both the attach path and the capability query go through. A
+/// kind outside the bitmask's width is unsupported by definition rather than by
+/// arithmetic accident.
+pub(crate) fn kind_is_supported(platform_kind: u32) -> bool {
+    if platform_kind >= u64::BITS {
+        return false;
+    }
+    supported_platform_kinds() & (1u64 << platform_kind) != 0
+}
 
 /// The platform's own `PlatformServices`, which `CapiHostKit` composes so it
 /// only has to override the notification capability.

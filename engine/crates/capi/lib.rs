@@ -15,6 +15,7 @@
 
 mod abi;
 mod callbacks;
+mod capabilities;
 mod host_kit;
 mod platform;
 mod input;

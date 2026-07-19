@@ -279,6 +279,28 @@ static int create_engine(struct host *h, const char *files_dir) {
     snprintf(cache_dir, sizeof cache_dir, "%s/migo-cache", files_dir);
     snprintf(code_cache_dir, sizeof code_cache_dir, "%s/migo-code-cache", files_dir);
 
+    /* Ask the library what it supports before building anything on top of it.
+     * MIGO_C_ABI_HAS_RUNTIME is a preprocessor macro and describes the headers
+     * this file compiled against; only this call describes the linked library.
+     * Checking the surface kind here turns an unsupported build into a clear
+     * message now instead of a failed attach later. */
+    MigoCapabilities caps;
+    memset(&caps, 0, sizeof caps);
+    caps.struct_size = (uint32_t)sizeof caps;
+    caps.abi_version = MIGO_ABI_VERSION_CURRENT;
+    MigoResult caps_result = migo_query_capabilities(&caps);
+    if (caps_result != MIGO_OK) {
+        LOGE("migo_query_capabilities failed: %d", (int)caps_result);
+        return 0;
+    }
+    LOGI("capabilities: abi %u..%u, platform kinds 0x%llx",
+         caps.abi_version_min, caps.abi_version_max,
+         (unsigned long long)caps.platform_kinds);
+    if ((caps.platform_kinds & (UINT64_C(1) << MIGO_PLATFORM_ANDROID_NATIVE_WINDOW)) == 0) {
+        LOGE("this build cannot attach an ANativeWindow");
+        return 0;
+    }
+
     MigoEngineConfig engine_config;
     memset(&engine_config, 0, sizeof engine_config);
     engine_config.struct_size = (uint32_t)sizeof engine_config;

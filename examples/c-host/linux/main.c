@@ -155,8 +155,27 @@ int main(int argc, char **argv) {
     engine_config.cache_dir_utf8 = cache_dir;
     engine_config.code_cache_dir_utf8 = code_cache_dir;
 
+    /* Ask the library what it supports before building anything on top of it.
+     * The MIGO_C_ABI_* macros describe the headers this file compiled against;
+     * only this call describes the library that got linked. Checking the
+     * surface kind here means an unsupported build is a clear message now
+     * rather than a failed attach after an engine, a session and a window. */
+    MigoCapabilities caps;
+    memset(&caps, 0, sizeof caps);
+    caps.struct_size = (uint32_t)sizeof caps;
+    caps.abi_version = MIGO_ABI_VERSION_CURRENT;
+    MigoResult result = migo_query_capabilities(&caps);
+    if (result != MIGO_OK) return fail("migo_query_capabilities", result);
+    fprintf(stderr, "migo: abi %u..%u, platform kinds 0x%llx\n",
+            caps.abi_version_min, caps.abi_version_max,
+            (unsigned long long)caps.platform_kinds);
+    if ((caps.platform_kinds & (UINT64_C(1) << MIGO_PLATFORM_X11_WINDOW)) == 0) {
+        fprintf(stderr, "migo: this build cannot attach an X11 window\n");
+        return 1;
+    }
+
     MigoEngine *engine = NULL;
-    MigoResult result = migo_engine_create(&engine_config, &engine);
+    result = migo_engine_create(&engine_config, &engine);
     if (result != MIGO_OK) return fail("migo_engine_create", result);
 
     MigoSessionConfig session_config;

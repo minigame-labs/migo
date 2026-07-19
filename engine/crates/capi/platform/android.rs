@@ -30,6 +30,15 @@ pub(crate) enum PlatformTarget {
 unsafe impl Send for PlatformTarget {}
 unsafe impl Sync for PlatformTarget {}
 
+/// The surface kinds this build can attach, as a `MIGO_PLATFORM_*` bitmask.
+///
+/// See the desktop counterpart: `build_target` tests membership here rather
+/// than carrying its own constant, so the capability query cannot drift out of
+/// step with what an attach really accepts.
+pub(crate) const fn supported_platform_kinds() -> u64 {
+    1u64 << MIGO_PLATFORM_ANDROID_NATIVE_WINDOW
+}
+
 pub(crate) fn rebuild_surface(target: PlatformTarget, width: u32, height: u32) -> SurfaceRef {
     match target {
         PlatformTarget::NativeWindow { window } => {
@@ -64,7 +73,7 @@ pub(crate) unsafe fn build_target(
     ),
     MigoResult,
 > {
-    if descriptor.platform_kind != MIGO_PLATFORM_ANDROID_NATIVE_WINDOW {
+    if !crate::platform::kind_is_supported(descriptor.platform_kind) {
         return Err(MIGO_ERROR_UNSUPPORTED_PLATFORM);
     }
     // The envelope's size field and the payload's own struct_size are an

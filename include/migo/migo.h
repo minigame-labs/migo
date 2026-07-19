@@ -2,6 +2,7 @@
 #define MIGO_MIGO_H_
 
 #include <migo/types.h>
+#include <migo/capabilities.h>
 #include <migo/surface.h>
 #include <migo/session.h>
 #include <migo/input.h>

@@ -15,7 +15,8 @@ A runtime existing is not the same as the ABI being frozen. Do not treat these h
 ## Header layout
 
 - `migo.h` is the engine/session/Surface umbrella header.
-- `types.h`, `session.h`, and `surface.h` contain only standard C types.
+- `types.h`, `capabilities.h`, `session.h`, and `surface.h` contain only standard C types.
+- `capabilities.h` answers what the *linked library* supports; the `MIGO_C_ABI_*` macros above can only report what the headers were compiled against.
 - `platform/*.h` contains strongly typed native target descriptors without including any platform SDK header.
 - iOS has no native Surface descriptor because its planned default backend is an embeddable `WKWebView` Host Kit.
 
@@ -63,6 +64,34 @@ User callbacks execute only inside the dispatched task, with no Migo engine/sess
 
 Successful `migo_session_destroy` and `migo_engine_destroy` calls consume and release their respective handles; those pointers are invalid afterward. All child Sessions must be destroyed before their Engine.
 
+## Asynchronous operations
+
+ABI v1 has exactly one: `migo_session_load_content` starts evaluating content and reports
+the outcome through `on_ready` or `on_error`. A Session loads content once, so at most one
+completion can ever be outstanding.
+
+The rules are contract, not description:
+
+- **Correlation.** None is needed or offered. With one outstanding completion per Session,
+  a request ID would be a constant. No entry point returns one, and hosts must not infer an
+  ordering guarantee between Sessions from the order completions arrive.
+- **Cancellation.** `migo_session_destroy` is the cancellation. There is no separate cancel
+  entry point, and destruction is always a legal thing to do while a load is in flight.
+- **Late completion.** A completion queued before destruction never runs after it. The
+  Session is marked dead before `migo_session_destroy` returns; a task already handed to
+  the dispatcher checks that when it runs and cancels itself, touching no `user_data`. A
+  task the dispatcher rejects returns to the engine, which drops it — it is never run on an
+  engine thread as a fallback.
+
+These three are asserted by `a_destroyed_session_cancels_queued_callbacks` and
+`a_rejected_dispatch_drops_the_task_instead_of_leaking_or_running` in
+`engine/crates/capi/callbacks.rs`, so the contract above is checkable rather than merely
+stated.
+
+A second asynchronous operation reopens the question. Request IDs, a cancel entry point and
+a late-completion state machine are not defined ahead of it: fields can be added to a struct
+under `struct_size` negotiation, whereas invented ones cannot be removed after they ship.
+
 ## Performance boundary
 
 Descriptors are parsed and converted once during attach/update control operations. This contract adds no per-frame virtual dispatch, allocation, serialization, native-handle conversion, or callback hop. Presenter selection is fixed after attach; future platform backends remain free to use their best zero-copy graphics path.
@@ -75,13 +104,24 @@ The candidate cannot be declared stable until all of the following exist:
   **pointer/touch done** (`migo_session_send_touch`: batched, one copy at the boundary, no
   allocation, sharing the engine path Android already drives); keyboard/text/IME and gamepad
   **open**;
-- asynchronous request IDs, cancellation races, and late-completion rules — **open**;
-- capability and supported-structure/version queries — **open**;
+- asynchronous request IDs, cancellation races, and late-completion rules — **settled for
+  v1**: v1 has exactly one asynchronous operation and it is single-shot per Session, so
+  there is nothing to correlate and no request ID to carry. The rules are normative under
+  "Asynchronous operations" below. A second asynchronous operation reopens this, and its
+  shape is designed against that operation's requirements rather than guessed now;
+- capability and supported-structure/version queries — **done**: `migo_query_capabilities`
+  (`capabilities.h`) reports the accepted ABI version range and the attachable
+  `MIGO_PLATFORM_*` kinds of the library actually linked. It is the one entry point that
+  answers rather than rejects an unrecognised `abi_version`, because it is the call that
+  resolves a version disagreement. The kinds it reports are the same fact the attach path
+  enforces, not a second copy;
 - Android and Linux implementations using this same contract — **Linux done, Android
   substantially done**: `engine/crates/capi/platform/android.rs` implements the surface
   backend and the NativeActivity host in `examples/c-host/android` renders and takes touch
-  on device. Open: rendering does not resume after the app is backgrounded and returned to,
-  though the detach/attach cycle itself runs;
+  on device, and rendering resumes after the app is backgrounded and returned to. Open:
+  multi-pointer delivery has never run on device, because a real two-finger gesture cannot
+  be synthesized there -- `sendevent` is refused by SELinux and `input motionevent` carries
+  one pointer. The ABI's batch conversion is covered by tests;
 - export lists, symbol/version tests, old-client/new-library tests, and per-target ILP32/LP64 layout lanes — **export list and symbol/version tests done** for `linux-x86_64` (`scripts/test-linux-sdk-contract.sh`); old-client/new-library lanes **open**;
 - Android/Linux compatibility and performance gates with no material regression — **Linux compatibility gate done**, the rest open.
 

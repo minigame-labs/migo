@@ -49,6 +49,10 @@
  *
  * This says a runtime exists, not that the ABI is frozen; MIGO_C_ABI_CANDIDATE
  * remains 1 until the README's blockers are closed.
+ *
+ * It also describes the headers you compiled against, not the library you
+ * linked -- it cannot do otherwise, being a preprocessor macro. Ask
+ * migo_query_capabilities (capabilities.h) about the library itself.
  */
 #if defined(__linux__) && !defined(__ANDROID__)
 #define MIGO_C_ABI_HAS_RUNTIME 1
