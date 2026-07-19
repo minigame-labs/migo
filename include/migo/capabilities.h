@@ -11,6 +11,7 @@
 #ifndef MIGO_CAPABILITIES_H
 #define MIGO_CAPABILITIES_H
 
+#include <stddef.h> /* offsetof */
 #include <migo/types.h>
 
 MIGO_BEGIN_DECLS
@@ -32,6 +33,13 @@ typedef struct MigoCapabilities {
      * array would raise a lifetime question for nothing. */
     uint64_t platform_kinds;
 } MigoCapabilities;
+
+MIGO_STATIC_ASSERT(sizeof(MigoCapabilities) == 24, "MigoCapabilities size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoCapabilities, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+MIGO_STATIC_ASSERT(offsetof(MigoCapabilities, abi_version_min) == 8, "abi_version_min moved");
+MIGO_STATIC_ASSERT(offsetof(MigoCapabilities, abi_version_max) == 12, "abi_version_max moved");
+MIGO_STATIC_ASSERT(offsetof(MigoCapabilities, platform_kinds) == 16, "platform_kinds moved");
 
 /*
  * Report what this library supports. Takes no handle: this answers what a host

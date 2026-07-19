@@ -23,6 +23,7 @@ use std::mem::{align_of, offset_of, size_of};
 
 use crate::{
     abi::VersionedHeader,
+    capabilities::MigoCapabilities,
     callbacks::{MigoError, MigoHostCallbacks},
     input::{MigoTouchEvent, MigoTouchPoint},
     surface::{
@@ -48,6 +49,7 @@ macro_rules! header_is_first {
 }
 
 header_is_first!(
+    MigoCapabilities,
     MigoEngineConfig,
     MigoSessionConfig,
     MigoContentDescriptor,
@@ -77,6 +79,15 @@ const _: () = assert!(offset_of!(MigoTouchPoint, x) == 4);
 const _: () = assert!(offset_of!(MigoTouchPoint, y) == 8);
 const _: () = assert!(offset_of!(MigoTouchPoint, pressure) == 12);
 const _: () = assert!(offset_of!(MigoTouchPoint, flags) == 16);
+
+// The negotiation entry point's own shape. It carries no pointer, so it is
+// identical on every target -- which matters more here than anywhere else: a
+// caller uses this struct to find out what the library supports, so it is the
+// one shape that has to be right before any other can be checked.
+const _: () = assert!(size_of::<MigoCapabilities>() == 24);
+const _: () = assert!(offset_of!(MigoCapabilities, abi_version_min) == 8);
+const _: () = assert!(offset_of!(MigoCapabilities, abi_version_max) == 12);
+const _: () = assert!(offset_of!(MigoCapabilities, platform_kinds) == 16);
 
 // Pointer-free structs: identical on ILP32 and LP64, so they are pinned for
 // every target rather than only the ones that ship today.
