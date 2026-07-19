@@ -46,42 +46,24 @@ for name in game.json game.js; do
 done
 c_info "deployed '$CONTENT_ID' to $CODE_DIR"
 
-# ---- build the staticlib, then the C host ----
+# ---- build the C host ----
+#
+# Cargo drives the link. A Rust staticlib does not carry the native archives
+# (Skia, V8) that build scripts ask cargo to link, and reproducing that link
+# line by hand goes wrong in subtle ways — pulling Skia's archives in explicitly
+# forces `skia-bindings`' translation unit to be linked whole, which then needs
+# symbols no `libskia.a` under target/ defines, while cargo's own link never
+# pulls those objects in at all. `crates/c-host-example` therefore compiles
+# examples/c-host/main.c through a `#![no_main]` bin crate: the C code still
+# sees nothing but the public headers, and cargo resolves the native
+# dependencies correctly. Emitting that link line for hosts that do NOT use
+# cargo (pkg-config/CMake) is the packaging slice.
 cd "$ENGINE_DIR"
-c_info "building capi staticlib ..."
-cargo build -p capi --offline
-
-STATIC_LIB="$ENGINE_DIR/target/debug/libmigo_capi.a"
-[[ -f "$STATIC_LIB" ]] || { c_err "staticlib not produced: $STATIC_LIB"; exit 1; }
+c_info "building the C host (cargo drives the link) ..."
+cargo build -p c-host-example --offline
 
 BIN="$ENGINE_DIR/target/debug/migo-c-host"
-OBJ="$ENGINE_DIR/target/debug/migo-c-host.o"
-c_info "compiling examples/c-host ..."
-# Compiled as plain C11 — the example must stay buildable by a C-only host.
-"$CC" -std=c11 -Wall -Wextra -O0 -g \
-    -I"$REPO_ROOT/include" \
-    -c "$REPO_ROOT/examples/c-host/main.c" -o "$OBJ"
-
-# ---- KNOWN GAP: linking a C host against the staticlib is unfinished ----
-#
-# A Rust staticlib carries the Rust code and its Rust dependencies, but NOT the
-# native archives a build script told cargo to link: those directives only apply
-# when cargo itself drives the link. Reproducing that link line by hand does not
-# work naively either — pulling Skia's archives in explicitly forces
-# `skia-bindings`' translation unit to be included whole, which then needs
-# symbols (JPEG/PDF/pathops) that no `libskia.a` in `target/` defines, while
-# cargo's own link never pulls those objects in at all.
-#
-# The fix belongs to the packaging slice, which must derive the link line from
-# cargo's link data and ship it as pkg-config/CMake instead of asking each host
-# to rediscover it. See docs/superpowers/plans/2026-07-18-c-abi-runtime-plan.md.
-#
-# Until then this script stops after proving the C host *compiles* against the
-# public headers, which is what keeps the example honest about the ABI surface.
-c_info "compile-only: examples/c-host builds against the public headers"
-c_err "linking is not implemented yet (see the KNOWN GAP note in this script);"
-c_err "the C ABI is exercised by 'cargo test -p capi' until packaging lands."
-exit 0
+[[ -x "$BIN" ]] || { c_err "C host binary not produced: $BIN"; exit 1; }
 
 c_info "running: $BIN $RUN_ROOT/files $CONTENT_ID $SECS"
 exec "$BIN" "$RUN_ROOT/files" "$CONTENT_ID" "$SECS"

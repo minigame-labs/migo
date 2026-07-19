@@ -4,6 +4,7 @@ members = [
  "crates/android-jni",
  "crates/audio",
  "crates/capi",
+ "crates/c-host-example",
  "crates/core",
  "crates/graphics",
  "crates/io",

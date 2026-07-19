@@ -1,0 +1,34 @@
+[package]
+name = "c-host-example"
+version = "0.1.0"
+edition = "2024"
+
+# Builds `examples/c-host/main.c` — a host written in C against the public
+# headers only — and links it with the engine.
+#
+# Cargo drives the link on purpose. A Rust staticlib does not carry the native
+# archives (Skia, V8) that build scripts ask cargo to link, so a hand-written
+# link line has to rediscover them and gets it wrong in subtle ways. Letting
+# cargo link means this example always matches the engine's real requirements.
+# Shipping that link line to hosts that do *not* use cargo is the packaging
+# slice's job (pkg-config/CMake).
+[[bin]]
+name = "migo-c-host"
+path = "src/main.rs"
+# `#![no_main]`: the entry point comes from the C side, so cargo cannot build a
+# test harness for this target. The example is exercised by
+# scripts/dev-run-c-host.sh, which runs it against a real game.
+test = false
+bench = false
+doctest = false
+
+[features]
+default = ["profile-full"]
+profile-full = ["capi/profile-full"]
+profile-slim = ["capi/profile-slim"]
+
+[dependencies]
+capi = { path = "../capi", default-features = false }
+
+[build-dependencies]
+cc = "1"

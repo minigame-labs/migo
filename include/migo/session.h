@@ -5,6 +5,13 @@
 
 typedef uint64_t MigoEngineFlags;
 #define MIGO_ENGINE_FLAG_NONE UINT64_C(0)
+/*
+ * Run content that carries no signing receipt. Development and testing only:
+ * production hosts leave this clear so unsigned content is refused. It is an
+ * explicit opt-in rather than a default because silently accepting unsigned
+ * content is exactly the failure a signing check exists to prevent.
+ */
+#define MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT (UINT64_C(1) << 0)
 
 typedef uint64_t MigoSessionFlags;
 #define MIGO_SESSION_FLAG_NONE UINT64_C(0)

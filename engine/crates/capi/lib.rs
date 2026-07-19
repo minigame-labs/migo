@@ -14,6 +14,8 @@
 //! `MIGO_C_ABI_HAS_RUNTIME` stays 0 so nothing advertises a complete runtime.
 
 mod abi;
+mod callbacks;
+mod host_kit;
 
 use std::{
     ffi::c_void,
@@ -100,8 +102,13 @@ struct EngineInner {
     files_dir: PathBuf,
     cache_dir: PathBuf,
     code_cache_dir: PathBuf,
+    /// `MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT`: opt-in, never a default.
+    allow_unsigned_content: bool,
     live_sessions: Mutex<usize>,
 }
+
+/// `MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT` from `include/migo/session.h`.
+const MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT: u64 = 1 << 0;
 
 pub struct MigoEngine {
     inner: Arc<EngineInner>,
@@ -109,6 +116,9 @@ pub struct MigoEngine {
 
 #[derive(Default)]
 struct SessionState {
+    /// Installed once, before the first attach, per the header's rule that a
+    /// queued task must never see a replaced pointer.
+    callbacks: Option<callbacks::HostCallbacks>,
     /// Set once a surface has been attached; the engine host thread owns the
     /// render loop from that point.
     host: Option<i32>,
@@ -119,6 +129,9 @@ struct SessionState {
 pub struct MigoSession {
     engine: Arc<EngineInner>,
     state: Mutex<SessionState>,
+    /// Cleared by destroy so queued callbacks cancel instead of handing the
+    /// host a session pointer it has already released.
+    alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct MigoSurfaceAttachment {
@@ -167,11 +180,14 @@ pub unsafe extern "C" fn migo_engine_create(
             }
         }
 
+        init_dev_logging();
+
         let engine = Box::new(MigoEngine {
             inner: Arc::new(EngineInner {
                 files_dir: PathBuf::from(files_dir),
                 cache_dir: PathBuf::from(cache_dir),
                 code_cache_dir: PathBuf::from(code_cache_dir),
+                allow_unsigned_content: config.flags & MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT != 0,
                 live_sessions: Mutex::new(0),
             }),
         });
@@ -234,6 +250,7 @@ pub unsafe extern "C" fn migo_session_create(
         let session = Box::new(MigoSession {
             engine: Arc::clone(&engine.inner),
             state: Mutex::new(SessionState::default()),
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         });
         *out_session = Box::into_raw(session);
         MIGO_OK
@@ -249,6 +266,11 @@ pub unsafe extern "C" fn migo_session_destroy(session: *mut MigoSession) -> Migo
             return MIGO_ERROR_INVALID_ARGUMENT;
         }
         let session = unsafe { Box::from_raw(session) };
+        // Cancel queued callbacks before anything else: from here on the
+        // session pointer must never reach host code again.
+        session
+            .alive
+            .store(false, std::sync::atomic::Ordering::Release);
         // Stopping the host also retires whatever surface is still attached,
         // which is why the header documents destroy as consuming every live
         // attachment.
@@ -321,6 +343,141 @@ pub unsafe extern "C" fn migo_session_load_content(
     })
 }
 
+/// # Safety
+/// `session` must be live; `callbacks` a `MigoHostCallbacks` borrowed for the
+/// call. Only the fields it declares are copied.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn migo_session_set_host_callbacks(
+    session: *mut MigoSession,
+    callbacks: *const callbacks::MigoHostCallbacks,
+) -> MigoResult {
+    guard("migo_session_set_host_callbacks", || {
+        let Some(session) = (unsafe { session.as_ref() }) else {
+            return MIGO_ERROR_INVALID_ARGUMENT;
+        };
+        if let Err(error) = unsafe {
+            validate_header(
+                callbacks as *const VersionedHeader,
+                size_of::<callbacks::MigoHostCallbacks>(),
+            )
+        } {
+            return error;
+        }
+        let copied = match unsafe { callbacks::HostCallbacks::from_c(&*callbacks) } {
+            Ok(copied) => copied,
+            Err(error) => return error,
+        };
+
+        let Ok(mut state) = session.state.lock() else {
+            return MIGO_ERROR_INTERNAL;
+        };
+        // Install-once, before the first attach: a second set would let tasks
+        // already queued against the old pointers run against the new ones.
+        if state.callbacks.is_some() || state.host.is_some() {
+            return MIGO_ERROR_INVALID_STATE;
+        }
+        state.callbacks = Some(copied);
+        MIGO_OK
+    })
+}
+
+/// Lifecycle states from `include/migo/session.h`.
+const MIGO_LIFECYCLE_CREATED: u32 = 0;
+const MIGO_LIFECYCLE_RUNNING: u32 = 1;
+const MIGO_LIFECYCLE_PAUSED: u32 = 2;
+
+/// Drive the engine's show/hide channel — the same one Android's `onShow` /
+/// `onHide` use, so a desktop host produces the lifecycle the content already
+/// expects instead of a second, divergent notion of "paused".
+///
+/// `send_critical_command_to_host` matches Android: lifecycle must not be
+/// dropped when the command queue is saturated.
+fn drive_visibility(session: &MigoSession, visible: bool) -> MigoResult {
+    let Ok(state) = session.state.lock() else {
+        return MIGO_ERROR_INTERNAL;
+    };
+    // No host thread yet means nothing to show or hide.
+    let Some(host) = state.host else {
+        return MIGO_ERROR_INVALID_STATE;
+    };
+    let command = if visible {
+        HostCommand::OnShow {
+            options_json: None,
+        }
+    } else {
+        HostCommand::OnHide
+    };
+    match core::send_critical_command_to_host(host, command) {
+        Ok(()) => MIGO_OK,
+        Err(error) => {
+            tracing::error!("lifecycle command failed: {error}");
+            MIGO_ERROR_INTERNAL
+        }
+    }
+}
+
+/// # Safety
+/// `session` must be a live session handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn migo_session_set_lifecycle(
+    session: *mut MigoSession,
+    state: u32,
+) -> MigoResult {
+    guard("migo_session_set_lifecycle", || {
+        let Some(session) = (unsafe { session.as_ref() }) else {
+            return MIGO_ERROR_INVALID_ARGUMENT;
+        };
+        match state {
+            MIGO_LIFECYCLE_RUNNING => drive_visibility(session, true),
+            MIGO_LIFECYCLE_PAUSED => drive_visibility(session, false),
+            // CREATED is where a session starts; asking to go back to it would
+            // mean unwinding a running engine, which the ABI does not define.
+            MIGO_LIFECYCLE_CREATED => MIGO_ERROR_INVALID_STATE,
+            _ => MIGO_ERROR_INVALID_ARGUMENT,
+        }
+    })
+}
+
+/// # Safety
+/// `session` must be a live session handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn migo_session_set_visibility(
+    session: *mut MigoSession,
+    visible: u8,
+) -> MigoResult {
+    guard("migo_session_set_visibility", || {
+        let Some(session) = (unsafe { session.as_ref() }) else {
+            return MIGO_ERROR_INVALID_ARGUMENT;
+        };
+        drive_visibility(session, visible != 0)
+    })
+}
+
+/// # Safety
+/// `session` must be a live session handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn migo_session_set_focus(
+    session: *mut MigoSession,
+    _focused: u8,
+) -> MigoResult {
+    guard("migo_session_set_focus", || {
+        let Some(session) = (unsafe { session.as_ref() }) else {
+            return MIGO_ERROR_INVALID_ARGUMENT;
+        };
+        let Ok(state) = session.state.lock() else {
+            return MIGO_ERROR_INTERNAL;
+        };
+        if state.host.is_none() {
+            return MIGO_ERROR_INVALID_STATE;
+        }
+        // Focus is validated and accepted, but the engine has no separate focus
+        // channel today: wx-style content observes show/hide, not focus. Wiring
+        // it to visibility would pause a game that merely lost keyboard focus
+        // while still on screen, so it stays a no-op until content needs it.
+        MIGO_OK
+    })
+}
+
 // ---- Surface ----------------------------------------------------------------
 
 /// # Safety
@@ -374,14 +531,22 @@ pub unsafe extern "C" fn migo_session_attach_surface(
                 }
             },
             None => {
+                let notifier = state.callbacks.map(|callbacks| {
+                    callbacks::Notifier::new(
+                        callbacks,
+                        session_ptr.cast(),
+                        Arc::clone(&session_ref.alive),
+                    )
+                });
                 let host_kit: Arc<dyn PlatformServices> =
-                    Arc::new(platform::desktop::platform::DesktopPlatform::new());
+                    Arc::new(host_kit::CapiHostKit::new(notifier));
                 let options = InitOptions::new()
                     .with_files_dir(session_ref.engine.files_dir.clone())
                     .with_cache_dir(session_ref.engine.cache_dir.clone())
                     .with_code_cache_dir(session_ref.engine.code_cache_dir.clone())
                     .with_pixel_ratio(descriptor.scale_factor.max(1.0))
-                    .with_target_fps(60);
+                    .with_target_fps(60)
+                    .with_code_signing_enabled(!session_ref.engine.allow_unsigned_content);
                 match spawn_host_thread(surface, graphics_platform, host_kit, options) {
                     Ok(host) => {
                         state.host = Some(host);
@@ -432,6 +597,35 @@ pub unsafe extern "C" fn migo_surface_detach(
         state.attached = false;
         MIGO_OK
     })
+}
+
+/// Install a log subscriber when `MIGO_CAPI_LOG` is set.
+///
+/// A library has no business hijacking the process's global logger, so this is
+/// opt-in and off by default. It exists because a C host currently has no other
+/// way to see engine diagnostics: `on_error` is declared in the headers but not
+/// implemented yet, which makes a failed content load silent. Once callbacks
+/// land this becomes a convenience rather than the only channel.
+fn init_dev_logging() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let Some(level) = std::env::var_os("MIGO_CAPI_LOG") else {
+            return;
+        };
+        let level = level.to_string_lossy().to_lowercase();
+        let level = match level.as_str() {
+            "trace" => tracing::Level::TRACE,
+            "debug" => tracing::Level::DEBUG,
+            "warn" => tracing::Level::WARN,
+            "error" => tracing::Level::ERROR,
+            _ => tracing::Level::INFO,
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_target(true)
+            .try_init();
+    });
 }
 
 /// Translate a validated descriptor into the engine's surface + graphics
@@ -550,6 +744,28 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_content_is_refused_unless_the_host_opts_in() {
+        // The signing check is the default; a host that wants unsigned content
+        // has to say so, because silently accepting it defeats the check.
+        let dirs = scratch_dirs("signing");
+        let mut config =
+            engine_config(&dirs, size_of::<MigoEngineConfig>() as u32, MIGO_ABI_VERSION_CURRENT);
+        let mut engine: *mut MigoEngine = std::ptr::null_mut();
+        assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
+        assert!(
+            !unsafe { &*engine }.inner.allow_unsigned_content,
+            "MIGO_ENGINE_FLAG_NONE must keep signing enforced"
+        );
+        assert_eq!(unsafe { migo_engine_destroy(engine) }, MIGO_OK);
+
+        config.flags = MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT;
+        let mut engine: *mut MigoEngine = std::ptr::null_mut();
+        assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
+        assert!(unsafe { &*engine }.inner.allow_unsigned_content);
+        assert_eq!(unsafe { migo_engine_destroy(engine) }, MIGO_OK);
+    }
+
+    #[test]
     fn engine_requires_storage_roots() {
         let dirs = scratch_dirs("roots");
         let mut config = engine_config(&dirs, size_of::<MigoEngineConfig>() as u32, MIGO_ABI_VERSION_CURRENT);
@@ -619,6 +835,103 @@ mod tests {
             };
             assert_eq!(
                 unsafe { migo_session_load_content(session, &content) },
+                MIGO_ERROR_INVALID_STATE
+            );
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn lifecycle_calls_need_an_attached_surface() {
+        // Without a surface there is no host thread, so show/hide has no
+        // recipient — a state error, not a silent success.
+        with_engine("lifecycle", |engine| {
+            let session_config = session_config();
+            let mut session: *mut MigoSession = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config, &mut session) },
+                MIGO_OK
+            );
+            assert_eq!(
+                unsafe { migo_session_set_lifecycle(session, MIGO_LIFECYCLE_RUNNING) },
+                MIGO_ERROR_INVALID_STATE
+            );
+            assert_eq!(
+                unsafe { migo_session_set_visibility(session, 1) },
+                MIGO_ERROR_INVALID_STATE
+            );
+            assert_eq!(
+                unsafe { migo_session_set_focus(session, 1) },
+                MIGO_ERROR_INVALID_STATE
+            );
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn unknown_lifecycle_states_are_told_apart_from_unsupported_transitions() {
+        // A value outside the enum is a bad argument; going back to CREATED is
+        // a defined value the ABI simply does not support.
+        with_engine("lifecycle-values", |engine| {
+            let session_config = session_config();
+            let mut session: *mut MigoSession = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config, &mut session) },
+                MIGO_OK
+            );
+            assert_eq!(
+                unsafe { migo_session_set_lifecycle(session, 99) },
+                MIGO_ERROR_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                unsafe { migo_session_set_lifecycle(session, MIGO_LIFECYCLE_CREATED) },
+                MIGO_ERROR_INVALID_STATE
+            );
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn callbacks_install_only_once() {
+        // A second install would let tasks queued against the old pointers run
+        // against the new ones.
+        with_engine("callbacks-once", |engine| {
+            let session_config = session_config();
+            let mut session: *mut MigoSession = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config, &mut session) },
+                MIGO_OK
+            );
+
+            unsafe extern "C" fn dispatch(
+                _dispatcher: *mut c_void,
+                task: callbacks::MigoTaskFn,
+                context: *mut c_void,
+            ) -> MigoResult {
+                unsafe { task(context) };
+                MIGO_OK
+            }
+            unsafe extern "C" fn on_ready(_user: *mut c_void, _session: *mut c_void) {}
+
+            let host_callbacks = callbacks::MigoHostCallbacks {
+                header: VersionedHeader {
+                    struct_size: size_of::<callbacks::MigoHostCallbacks>() as u32,
+                    abi_version: MIGO_ABI_VERSION_CURRENT,
+                },
+                user_data: std::ptr::null_mut(),
+                dispatcher_data: std::ptr::null_mut(),
+                dispatch: Some(dispatch),
+                on_ready: Some(on_ready),
+                on_error: None,
+                on_exit_requested: None,
+                on_surface_lost: None,
+            };
+            assert_eq!(
+                unsafe { migo_session_set_host_callbacks(session, &host_callbacks) },
+                MIGO_OK
+            );
+            assert_eq!(
+                unsafe { migo_session_set_host_callbacks(session, &host_callbacks) },
                 MIGO_ERROR_INVALID_STATE
             );
             assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);

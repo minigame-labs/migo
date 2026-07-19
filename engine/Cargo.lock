@@ -297,6 +297,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
 
 [[package]]
+name = "c-host-example"
+version = "0.1.0"
+dependencies = [
+ "capi",
+ "cc",
+]
+
+[[package]]
 name = "calendrical_calculations"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -335,6 +343,7 @@ dependencies = [
  "platform",
  "shared",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

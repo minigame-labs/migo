@@ -33,6 +33,39 @@ static void sleep_ms(long ms) {
     nanosleep(&ts, NULL);
 }
 
+/* ---- Host callbacks. The engine never calls these directly: it hands a task
+ * to our dispatcher, and we run it where we choose. This example runs it
+ * inline, which is legal — "exactly once, inline or later". ---- */
+static MigoResult MIGO_CALL dispatch_inline(void *dispatcher_context, MigoTaskFn task,
+                                            void *task_context) {
+    (void)dispatcher_context;
+    task(task_context);
+    return MIGO_OK;
+}
+
+static void MIGO_CALL on_ready(void *user_data, MigoSession *session) {
+    (void)user_data;
+    (void)session;
+    printf("[c-host] callback: content is ready\n");
+    fflush(stdout);
+}
+
+static void MIGO_CALL on_error(void *user_data, MigoSession *session,
+                               const MigoError *error) {
+    (void)user_data;
+    (void)session;
+    fprintf(stderr, "[c-host] callback: engine error %d: %.*s\n", (int)error->code,
+            (int)error->message_length, error->message_utf8);
+    fflush(stderr);
+}
+
+static void MIGO_CALL on_exit_requested(void *user_data, MigoSession *session) {
+    (void)user_data;
+    (void)session;
+    printf("[c-host] callback: content asked to exit\n");
+    fflush(stdout);
+}
+
 static int fail(const char *what, MigoResult result) {
     fprintf(stderr, "[c-host] %s failed: %d\n", what, (int)result);
     return 1;
@@ -76,7 +109,8 @@ int main(int argc, char **argv) {
     memset(&engine_config, 0, sizeof(engine_config));
     engine_config.struct_size = (uint32_t)sizeof(engine_config);
     engine_config.abi_version = MIGO_ABI_VERSION_CURRENT;
-    engine_config.flags = MIGO_ENGINE_FLAG_NONE;
+    /* Development example: the bundled game carries no signing receipt. */
+    engine_config.flags = MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT;
     engine_config.files_dir_utf8 = files_dir;
     engine_config.cache_dir_utf8 = cache_dir;
     engine_config.code_cache_dir_utf8 = code_cache_dir;
@@ -94,6 +128,19 @@ int main(int argc, char **argv) {
     MigoSession *session = NULL;
     result = migo_session_create(engine, &session_config, &session);
     if (result != MIGO_OK) return fail("migo_session_create", result);
+
+    /* ---- Callbacks install once, before the first attach. ---- */
+    MigoHostCallbacks host_callbacks;
+    memset(&host_callbacks, 0, sizeof(host_callbacks));
+    host_callbacks.struct_size = (uint32_t)sizeof(host_callbacks);
+    host_callbacks.abi_version = MIGO_ABI_VERSION_CURRENT;
+    host_callbacks.dispatch = dispatch_inline;
+    host_callbacks.on_ready = on_ready;
+    host_callbacks.on_error = on_error;
+    host_callbacks.on_exit_requested = on_exit_requested;
+
+    result = migo_session_set_host_callbacks(session, &host_callbacks);
+    if (result != MIGO_OK) return fail("migo_session_set_host_callbacks", result);
 
     /* ---- Hand the window over as a strongly typed platform descriptor. ---- */
     MigoX11WindowDescriptor x11;
