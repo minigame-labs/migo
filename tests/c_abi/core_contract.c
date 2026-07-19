@@ -21,6 +21,10 @@ _Static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "desktop Linux ships a runtime");
 _Static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "no runtime outside desktop Linux");
 #endif
 _Static_assert(MIGO_ABI_VERSION_1 == UINT32_C(1), "ABI version value");
+/* 72, not 64: on_request_frame was appended in the frame-pacing slice. Appending
+ * is what keeps this compatible -- an older host's struct_size still describes a
+ * valid prefix, and such a host simply does not drive frames. Growing the struct
+ * anywhere but the end would silently reinterpret existing fields. */
 _Static_assert(sizeof(MigoResult) == 4, "fixed-width result");
 _Static_assert(MIGO_OK == INT32_C(0), "success value");
 _Static_assert(MIGO_ERROR_INVALID_ARGUMENT == -INT32_C(1), "invalid argument value");
@@ -76,7 +80,7 @@ _Static_assert(sizeof(MigoSurfaceMetrics) == 48, "metrics v1 layout");
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(MigoError) == 32, "LP64 error layout");
 _Static_assert(sizeof(MigoSurfaceDescriptor) == 72, "LP64 Surface layout");
-_Static_assert(sizeof(MigoHostCallbacks) == 64, "LP64 callback layout");
+_Static_assert(sizeof(MigoHostCallbacks) == 72, "LP64 callback layout");
 #elif UINTPTR_MAX == UINT32_MAX
 _Static_assert(sizeof(MigoError) == 28, "ILP32 error layout");
 _Static_assert(sizeof(MigoSurfaceDescriptor) ==

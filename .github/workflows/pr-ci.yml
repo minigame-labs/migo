@@ -220,6 +220,13 @@ jobs:
           CXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi26-clang++" \
             bash scripts/test-c-abi-surface-candidate.sh
 
+
+      # The C ABI must compile for every platform it claims to support. This
+      # lives in the Android job because it needs the NDK and the aarch64 V8
+      # archive; the quality-gate job has neither.
+      - name: C ABI platform contract
+        run: bash scripts/test-capi-platform-contract.sh
+
       - name: Gradle cache
         uses: actions/cache@v5
         with:

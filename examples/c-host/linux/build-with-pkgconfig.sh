@@ -13,7 +13,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 PREFIX="${MIGO_PREFIX:-$REPO_ROOT/dist/migo-linux-x86_64}"
 OUT="${1:-$SCRIPT_DIR/c-host}"
 

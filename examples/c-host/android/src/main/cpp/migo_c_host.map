@@ -1,0 +1,15 @@
+/* NativeActivity looks up exactly one symbol in this library; everything else
+ * is internal.
+ *
+ * This is not only hygiene. --gc-sections can collect skia-bindings' JPEG, PDF
+ * and pathops wrappers -- which reference symbols that do not exist, because
+ * Skia is built without those features -- only once they are local. Leaving
+ * them global makes the link fail on SkJpegEncoder::Encode and friends. The
+ * Linux SDK solves the same problem the same way; see CLAUDE.md 10.3.
+ */
+MIGO_C_HOST {
+    global:
+        ANativeActivity_onCreate;
+    local:
+        *;
+};

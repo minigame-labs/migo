@@ -85,6 +85,24 @@ typedef void(MIGO_CALL *MigoOnErrorFn)(void *user_data,
                                        const MigoError *error);
 typedef void(MIGO_CALL *MigoOnExitRequestedFn)(void *user_data,
                                                MigoSession *session);
+/*
+ * The engine asks the host to schedule exactly one frame.
+ *
+ * A host that installs this owns frame pacing: arm one callback with whatever
+ * its platform provides -- AChoreographer on Android, the compositor's frame
+ * callback on Wayland -- and call migo_session_notify_vsync when it fires. One
+ * request means one frame; the engine asks again when it wants another.
+ *
+ * A host that leaves this NULL is saying it does not drive frames, and the
+ * engine paces itself. That is the right answer for a host with no display
+ * synchronisation to offer, and the wrong one where the platform has a vsync
+ * signal, because self-pacing cannot align to the display.
+ *
+ * Delivered through the host's dispatcher like every other callback, so it
+ * never runs on an engine thread.
+ */
+typedef void(MIGO_CALL *MigoOnRequestFrameFn)(void *user_data,
+                                              MigoSession *session);
 typedef void(MIGO_CALL *MigoOnSurfaceLostFn)(void *user_data,
                                              MigoSession *session,
                                              uint64_t generation,
@@ -109,6 +127,9 @@ typedef struct MigoHostCallbacks {
     MigoOnErrorFn on_error;
     MigoOnExitRequestedFn on_exit_requested;
     MigoOnSurfaceLostFn on_surface_lost;
+    /* Appended: a smaller struct_size from an older host simply omits it, and
+     * that host is then engine-paced, which is the pre-existing behaviour. */
+    MigoOnRequestFrameFn on_request_frame;
 } MigoHostCallbacks;
 
 MIGO_API MigoResult MIGO_CALL
@@ -148,6 +169,18 @@ migo_session_set_visibility(MigoSession *session, uint8_t visible);
 
 MIGO_API MigoResult MIGO_CALL
 migo_session_set_focus(MigoSession *session, uint8_t focused);
+
+/*
+ * Report that a frame boundary arrived, in response to on_request_frame.
+ *
+ * frame_time_nanos is the platform's frame timestamp -- AChoreographer's
+ * callback argument on Android. Calling this without having been asked is
+ * harmless but pointless: the engine renders at most one frame per request.
+ *
+ * Returns MIGO_ERROR_INVALID_STATE when no surface is attached.
+ */
+MIGO_API MigoResult MIGO_CALL
+migo_session_notify_vsync(MigoSession *session, int64_t frame_time_nanos);
 
 /*
  * Queued callbacks are canceled before return. Reentrant destruction from the

@@ -29,6 +29,7 @@ pub type MigoOnReadyFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 pub type MigoOnErrorFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const MigoError);
 pub type MigoOnExitRequestedFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 pub type MigoOnSurfaceLostFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32);
+pub type MigoOnRequestFrameFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 
 /// Mirrors `MigoError` in `include/migo/types.h`.
 #[repr(C)]
@@ -52,6 +53,7 @@ pub struct MigoHostCallbacks {
     pub on_error: Option<MigoOnErrorFn>,
     pub on_exit_requested: Option<MigoOnExitRequestedFn>,
     pub on_surface_lost: Option<MigoOnSurfaceLostFn>,
+    pub on_request_frame: Option<MigoOnRequestFrameFn>,
 }
 
 /// The copy the session keeps.
@@ -67,6 +69,7 @@ pub struct HostCallbacks {
     on_error: Option<MigoOnErrorFn>,
     on_exit_requested: Option<MigoOnExitRequestedFn>,
     on_surface_lost: Option<MigoOnSurfaceLostFn>,
+    on_request_frame: Option<MigoOnRequestFrameFn>,
 }
 
 // SAFETY: the pointers are opaque tokens owned by the host and are only ever
@@ -85,7 +88,8 @@ impl HostCallbacks {
         let has_callback = callbacks.on_ready.is_some()
             || callbacks.on_error.is_some()
             || callbacks.on_exit_requested.is_some()
-            || callbacks.on_surface_lost.is_some();
+            || callbacks.on_surface_lost.is_some()
+            || callbacks.on_request_frame.is_some();
         let Some(dispatch) = callbacks.dispatch else {
             // Without a dispatcher there is nowhere safe to run host code.
             return if has_callback {
@@ -102,6 +106,7 @@ impl HostCallbacks {
             on_error: callbacks.on_error,
             on_exit_requested: callbacks.on_exit_requested,
             on_surface_lost: callbacks.on_surface_lost,
+            on_request_frame: callbacks.on_request_frame,
         })
     }
 }
@@ -112,6 +117,7 @@ enum Event {
     ExitRequested,
     Error { code: MigoResult, message: CString },
     SurfaceLost { generation: u64, reason: u32 },
+    RequestFrame,
 }
 
 /// Payload owned by a dispatched task until it runs.
@@ -170,6 +176,11 @@ unsafe extern "C" fn run_task(context: *mut c_void) {
         Event::SurfaceLost { generation, reason } => {
             if let Some(on_surface_lost) = task.callbacks.on_surface_lost {
                 unsafe { on_surface_lost(user_data, task.session, *generation, *reason) };
+            }
+        }
+        Event::RequestFrame => {
+            if let Some(on_request_frame) = task.callbacks.on_request_frame {
+                unsafe { on_request_frame(user_data, task.session) };
             }
         }
     }
@@ -241,6 +252,20 @@ impl Notifier {
     }
 
     #[allow(dead_code)]
+    /// Ask the host to schedule one frame. Silent when the host installed no
+    /// frame callback: that host is engine-paced and never asked to be told.
+    pub fn request_frame(&self) {
+        if self.callbacks.on_request_frame.is_some() {
+            self.post(Event::RequestFrame);
+        }
+    }
+
+    /// Whether the host offered to drive frames, which is the honest answer to
+    /// `FrameClock::uses_external_vsync` rather than a fixed one.
+    pub fn drives_frames(&self) -> bool {
+        self.callbacks.on_request_frame.is_some()
+    }
+
     pub fn surface_lost(&self, generation: u64, reason: u32) {
         self.post(Event::SurfaceLost { generation, reason });
     }
@@ -253,6 +278,11 @@ mod tests {
 
     static READY_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DISPATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// The counters above are process-global, and cargo runs tests in parallel,
+    /// so any two tests that reset and read them race. Serialising the ones that
+    /// do is what makes their assertions mean what they say.
+    static COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static LAST_ERROR_CODE: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "C" fn inline_dispatch(
@@ -296,6 +326,7 @@ mod tests {
             on_error: Some(on_error),
             on_exit_requested: None,
             on_surface_lost: None,
+            on_request_frame: None,
         }
     }
 
@@ -311,6 +342,7 @@ mod tests {
     fn events_reach_the_host_through_its_dispatcher() {
         // The engine must never call host code directly: the dispatcher is what
         // moves it to a thread the host chose.
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         READY_CALLS.store(0, Ordering::SeqCst);
         DISPATCH_CALLS.store(0, Ordering::SeqCst);
         let notifier = notifier(inline_dispatch, Arc::new(AtomicBool::new(true)));
@@ -323,6 +355,7 @@ mod tests {
     fn a_destroyed_session_cancels_queued_callbacks() {
         // Header rule: destroy cancels queued callbacks. Without this the host
         // would be handed a session pointer it has already released.
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         READY_CALLS.store(0, Ordering::SeqCst);
         let alive = Arc::new(AtomicBool::new(true));
         let notifier = notifier(inline_dispatch, Arc::clone(&alive));
@@ -378,6 +411,7 @@ mod tests {
             on_error: None,
             on_exit_requested: None,
             on_surface_lost: None,
+            on_request_frame: None,
         };
         assert_eq!(
             unsafe { HostCallbacks::from_c(&raw) }.err(),

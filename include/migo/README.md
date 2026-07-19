@@ -77,7 +77,11 @@ The candidate cannot be declared stable until all of the following exist:
   **open**;
 - asynchronous request IDs, cancellation races, and late-completion rules — **open**;
 - capability and supported-structure/version queries — **open**;
-- Android and Linux implementations using this same contract — **Linux done, Android open**; the ABI crate is desktop-only today;
+- Android and Linux implementations using this same contract — **Linux done, Android
+  substantially done**: `engine/crates/capi/platform/android.rs` implements the surface
+  backend and the NativeActivity host in `examples/c-host/android` renders and takes touch
+  on device. Open: rendering does not resume after the app is backgrounded and returned to,
+  though the detach/attach cycle itself runs;
 - export lists, symbol/version tests, old-client/new-library tests, and per-target ILP32/LP64 layout lanes — **export list and symbol/version tests done** for `linux-x86_64` (`scripts/test-linux-sdk-contract.sh`); old-client/new-library lanes **open**;
 - Android/Linux compatibility and performance gates with no material regression — **Linux compatibility gate done**, the rest open.
 

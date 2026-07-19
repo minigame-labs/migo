@@ -11,7 +11,7 @@ fn main() {
         .join("../../..")
         .canonicalize()
         .expect("repo root");
-    let source = repo_root.join("examples/c-host/main.c");
+    let source = repo_root.join("examples/c-host/linux/main.c");
     let include = repo_root.join("include");
 
     println!("cargo:rerun-if-changed={}", source.display());

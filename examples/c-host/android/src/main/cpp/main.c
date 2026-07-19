@@ -1,0 +1,514 @@
+/*
+ * A NativeActivity host that embeds migo through the public C ABI.
+ *
+ * There is no Java in this application. NativeActivity loads this library and
+ * calls ANativeActivity_onCreate; the NDK's glue turns the framework callbacks
+ * into a command queue this file drains. Everything migo-related below uses
+ * nothing but the headers under include/migo -- if this file ever needs
+ * something else, the ABI is incomplete, and finding that out is why the
+ * example exists.
+ *
+ * The Linux counterpart is examples/c-host/main.c. The three things that differ
+ * are marked: the dispatcher runs on the glue's looper, touch carries every
+ * pointer, and the lifecycle comes from real Android commands.
+ */
+#include <android/choreographer.h>
+#include <android/log.h>
+#include <android/native_window.h>
+#include <android_native_app_glue.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <migo/migo.h>
+/* migo.h aggregates the portable headers; a platform descriptor is opt-in, so
+ * a host includes exactly the one platform it targets. */
+#include <migo/platform/android.h>
+
+#define TAG "migo-c-host"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+/* Content id is fixed here; the probe bundle and a game are both pushed to the
+ * app's files dir, so switching is a matter of which id this names. */
+#define MIGO_DEFAULT_CONTENT_ID "bunnymark"
+
+/* Reads <files>/content-id if the host left one there, else the default. A real
+ * embedder knows its content; this example has to be pointed at different
+ * bundles during validation, and a file is the smallest thing that behaves the
+ * way a host's own configuration would. */
+static void read_content_id(const char *files_dir, char *out, size_t cap) {
+    snprintf(out, cap, "%s", MIGO_DEFAULT_CONTENT_ID);
+    char path[512];
+    snprintf(path, sizeof path, "%s/content-id", files_dir);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return;
+    char buf[128] = {0};
+    if (fgets(buf, sizeof buf, f) != NULL) {
+        buf[strcspn(buf, "\r\n")] = 0;
+        if (buf[0] != 0) snprintf(out, cap, "%s", buf);
+    }
+    fclose(f);
+}
+
+struct dispatch_msg {
+    MigoTaskFn fn;
+    void *ctx;
+};
+
+struct host {
+    MigoEngine *engine;
+    MigoSession *session;
+    MigoSurfaceAttachment *attachment;
+    float density;
+    int content_loaded;
+    char content_id[128];
+    int dispatch_pipe[2]; /* [0] read, [1] write */
+};
+
+static struct host g_host;
+
+/* ---- Callbacks, delivered through the host's own dispatcher ------------- */
+
+/*
+ * The engine must never run host code on an engine thread, so the dispatcher
+ * hands the task to the looper the glue already runs: write it to a pipe the
+ * looper polls, and run it on the main thread when the loop drains it.
+ * Inventing a queue here would demonstrate a bespoke threading scheme rather
+ * than Android integration.
+ */
+static MigoResult dispatch(void *context, MigoTaskFn task, void *task_context) {
+    struct host *h = (struct host *)context;
+    struct dispatch_msg msg = {task, task_context};
+    ssize_t written = write(h->dispatch_pipe[1], &msg, sizeof msg);
+    if (written != (ssize_t)sizeof msg) {
+        /* Returning the rejection hands ownership back to the engine, which
+         * drops the task rather than leaking it or running it on its own
+         * thread. Silently succeeding here would do the latter. */
+        LOGE("dispatch rejected: %s", strerror(errno));
+        return MIGO_ERROR_DISPATCH_REJECTED;
+    }
+    return MIGO_OK;
+}
+
+static int drain_dispatch(int fd, int events, void *data) {
+    (void)events;
+    (void)data;
+    struct dispatch_msg msg;
+    while (read(fd, &msg, sizeof msg) == (ssize_t)sizeof msg) {
+        msg.fn(msg.ctx);
+    }
+    return 1; /* keep the descriptor registered */
+}
+
+/*
+ * Frame pacing.
+ *
+ * The engine asks for one frame at a time through on_request_frame; the host
+ * answers with the display's own vsync. AChoreographer is what Android provides
+ * for that, available since API 24 -- below this project's API 26 floor -- and
+ * is the same signal the Java SDK uses. Letting the engine pace itself instead
+ * would run the render loop off a timer that cannot align to the display.
+ */
+static void deliver_vsync(struct host *h, int64_t frame_time_nanos) {
+    if (h->session == NULL) return;
+    MigoResult result = migo_session_notify_vsync(h->session, frame_time_nanos);
+    if (result != MIGO_OK && result != MIGO_ERROR_INVALID_STATE) {
+        LOGE("notify_vsync failed: %d", (int)result);
+    }
+}
+
+/*
+ * Two callback shapes, because the API changed under us.
+ *
+ * AChoreographer_postFrameCallback takes a `long`, which cannot hold a
+ * nanosecond timestamp on 32-bit, so API 29 deprecated it in favour of
+ * postFrameCallback64. The modern entry is resolved at runtime and the legacy
+ * one kept for the API 26-28 range this project still supports -- the same
+ * shape as the EGL extension entry points elsewhere in the engine, and the
+ * reason is the same: a compile-time choice would either break the floor or
+ * leave newer devices on a deprecated path.
+ */
+static void on_frame64(int64_t frame_time_nanos, void *data) {
+    deliver_vsync((struct host *)data, frame_time_nanos);
+}
+
+static void on_frame_legacy(long frame_time_nanos, void *data) {
+    deliver_vsync((struct host *)data, (int64_t)frame_time_nanos);
+}
+
+typedef void (*post_frame_callback64_fn)(AChoreographer *, void (*)(int64_t, void *), void *);
+
+/* Runs on the main thread: the engine posted this through our dispatcher. */
+static void on_request_frame(void *user_data, MigoSession *session) {
+    (void)session;
+    struct host *h = (struct host *)user_data;
+    AChoreographer *grapher = AChoreographer_getInstance();
+    if (grapher == NULL) {
+        LOGE("no Choreographer on this thread");
+        return;
+    }
+
+    static post_frame_callback64_fn post64 = NULL;
+    static int resolved = 0;
+    if (!resolved) {
+        resolved = 1;
+        post64 = (post_frame_callback64_fn)dlsym(RTLD_DEFAULT,
+                                                 "AChoreographer_postFrameCallback64");
+        LOGI("frame pacing: %s", post64 ? "postFrameCallback64" : "legacy postFrameCallback");
+    }
+
+    if (post64 != NULL) {
+        post64(grapher, on_frame64, h);
+    } else {
+        AChoreographer_postFrameCallback(grapher, on_frame_legacy, h);
+    }
+}
+
+static void on_ready(void *user_data, MigoSession *session) {
+    (void)user_data;
+    (void)session;
+    LOGI("callback: content is ready");
+}
+
+static void on_exit_requested(void *user_data, MigoSession *session) {
+    (void)user_data;
+    (void)session;
+    LOGI("callback: content requested exit");
+}
+
+static void on_error(void *user_data, MigoSession *session, const MigoError *error) {
+    (void)user_data;
+    (void)session;
+    LOGE("callback: error %d: %s", error ? (int)error->code : 0,
+         (error && error->message_utf8) ? error->message_utf8 : "(none)");
+}
+
+/* ---- Touch ------------------------------------------------------------- */
+
+/*
+ * Every pointer is carried, which is the part the Linux example cannot test:
+ * there one mouse maps to one point, so the multi-point path and the
+ * per-pointer flags have never run until here.
+ */
+static void forward_touch(struct host *h, AInputEvent *event) {
+    if (h->session == NULL || h->attachment == NULL) return;
+
+    int32_t action = AMotionEvent_getAction(event);
+    int32_t masked = action & AMOTION_EVENT_ACTION_MASK;
+    size_t count = AMotionEvent_getPointerCount(event);
+    if (count > MIGO_TOUCH_MAX_POINTS) count = MIGO_TOUCH_MAX_POINTS;
+    if (count == 0) return;
+
+    MigoTouchType type;
+    switch (masked) {
+    case AMOTION_EVENT_ACTION_DOWN:
+    case AMOTION_EVENT_ACTION_POINTER_DOWN:
+        type = MIGO_TOUCH_START;
+        break;
+    case AMOTION_EVENT_ACTION_MOVE:
+        type = MIGO_TOUCH_MOVE;
+        break;
+    case AMOTION_EVENT_ACTION_UP:
+    case AMOTION_EVENT_ACTION_POINTER_UP:
+        type = MIGO_TOUCH_END;
+        break;
+    case AMOTION_EVENT_ACTION_CANCEL:
+        type = MIGO_TOUCH_CANCEL;
+        break;
+    default:
+        return;
+    }
+
+    /* For the pointer-specific actions exactly one pointer changed; for MOVE
+     * they all did. Getting this wrong shows up as content seeing the wrong
+     * finger lift -- precisely what a single-pointer host cannot catch. */
+    size_t changed_index =
+        (size_t)((action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >>
+                 AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+    int all_changed = (masked == AMOTION_EVENT_ACTION_MOVE);
+
+    MigoTouchPoint points[MIGO_TOUCH_MAX_POINTS];
+    memset(points, 0, sizeof points);
+    for (size_t i = 0; i < count; i++) {
+        points[i].id = (uint32_t)AMotionEvent_getPointerId(event, i);
+        /* Android reports physical pixels; the ABI takes CSS pixels. */
+        points[i].x = AMotionEvent_getX(event, i) / h->density;
+        points[i].y = AMotionEvent_getY(event, i) / h->density;
+        points[i].pressure = AMotionEvent_getPressure(event, i);
+        if (all_changed || i == changed_index) {
+            points[i].flags |= MIGO_TOUCH_FLAG_CHANGED;
+            if (type == MIGO_TOUCH_END || type == MIGO_TOUCH_CANCEL) {
+                points[i].flags |= MIGO_TOUCH_FLAG_REMOVED;
+            }
+        }
+    }
+
+    MigoTouchEvent touch;
+    memset(&touch, 0, sizeof touch);
+    touch.struct_size = (uint32_t)sizeof touch;
+    touch.abi_version = MIGO_ABI_VERSION_CURRENT;
+    touch.type = type;
+    touch.point_count = (uint32_t)count;
+    touch.timestamp_ms = (int64_t)(AMotionEvent_getEventTime(event) / 1000000);
+    touch.points = points;
+
+    MigoResult result = migo_session_send_touch(h->session, &touch);
+    if (result != MIGO_OK) {
+        LOGE("touch not delivered: %d (points=%u)", (int)result, (unsigned)count);
+    }
+}
+
+static int32_t on_input(struct android_app *app, AInputEvent *event) {
+    struct host *h = (struct host *)app->userData;
+    if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION) {
+        forward_touch(h, event);
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- Engine and session ------------------------------------------------ */
+
+static int create_engine(struct host *h, const char *files_dir) {
+    char cache_dir[512];
+    char code_cache_dir[512];
+    snprintf(cache_dir, sizeof cache_dir, "%s/migo-cache", files_dir);
+    snprintf(code_cache_dir, sizeof code_cache_dir, "%s/migo-code-cache", files_dir);
+
+    MigoEngineConfig engine_config;
+    memset(&engine_config, 0, sizeof engine_config);
+    engine_config.struct_size = (uint32_t)sizeof engine_config;
+    engine_config.abi_version = MIGO_ABI_VERSION_CURRENT;
+    /* Development example: the pushed content carries no signing receipt.
+     * A production host leaves this clear and ships signed content. */
+    engine_config.flags = MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT;
+    engine_config.files_dir_utf8 = files_dir;
+    engine_config.cache_dir_utf8 = cache_dir;
+    engine_config.code_cache_dir_utf8 = code_cache_dir;
+
+    MigoResult result = migo_engine_create(&engine_config, &h->engine);
+    if (result != MIGO_OK) {
+        LOGE("migo_engine_create failed: %d", (int)result);
+        return 0;
+    }
+
+    MigoSessionConfig session_config;
+    memset(&session_config, 0, sizeof session_config);
+    session_config.struct_size = (uint32_t)sizeof session_config;
+    session_config.abi_version = MIGO_ABI_VERSION_CURRENT;
+    session_config.flags = MIGO_SESSION_FLAG_NONE;
+
+    result = migo_session_create(h->engine, &session_config, &h->session);
+    if (result != MIGO_OK) {
+        LOGE("migo_session_create failed: %d", (int)result);
+        return 0;
+    }
+
+    /* Callbacks install once, before the first attach: a queued task must never
+     * see a replaced function pointer. */
+    MigoHostCallbacks callbacks;
+    memset(&callbacks, 0, sizeof callbacks);
+    callbacks.struct_size = (uint32_t)sizeof callbacks;
+    callbacks.abi_version = MIGO_ABI_VERSION_CURRENT;
+    callbacks.user_data = h;
+    callbacks.dispatcher_data = h;
+    callbacks.dispatch = dispatch;
+    callbacks.on_ready = on_ready;
+    callbacks.on_exit_requested = on_exit_requested;
+    callbacks.on_error = on_error;
+    /* Installing this is what tells the engine the host paces frames. */
+    callbacks.on_request_frame = on_request_frame;
+
+    result = migo_session_set_host_callbacks(h->session, &callbacks);
+    if (result != MIGO_OK) {
+        LOGE("migo_session_set_host_callbacks failed: %d", (int)result);
+        return 0;
+    }
+    return 1;
+}
+
+static void attach_window(struct host *h, ANativeWindow *window) {
+    if (h->session == NULL || window == NULL || h->attachment != NULL) return;
+
+    int32_t width = ANativeWindow_getWidth(window);
+    int32_t height = ANativeWindow_getHeight(window);
+
+    MigoAndroidNativeWindowDescriptor native;
+    memset(&native, 0, sizeof native);
+    native.struct_size = (uint32_t)sizeof native;
+    native.abi_version = MIGO_ABI_VERSION_CURRENT;
+    native.platform_kind = MIGO_PLATFORM_ANDROID_NATIVE_WINDOW;
+    native.flags = MIGO_PLATFORM_DESCRIPTOR_FLAG_NONE;
+    /* The engine acquires its own reference; this one stays ours. */
+    native.native_window = window;
+
+    MigoSurfaceDescriptor surface;
+    memset(&surface, 0, sizeof surface);
+    surface.struct_size = (uint32_t)sizeof surface;
+    surface.abi_version = MIGO_ABI_VERSION_CURRENT;
+    surface.generation = 1;
+    surface.platform_kind = MIGO_PLATFORM_ANDROID_NATIVE_WINDOW;
+    surface.flags = MIGO_SURFACE_DESCRIPTOR_FLAG_NONE;
+    surface.width_pixels = (uint32_t)width;
+    surface.height_pixels = (uint32_t)height;
+    surface.scale_factor = h->density;
+    surface.color_space = MIGO_COLOR_SPACE_SRGB;
+    surface.alpha_mode = MIGO_ALPHA_MODE_OPAQUE;
+    surface.preferred_presentation_mode = MIGO_PRESENTATION_MODE_DEFAULT;
+    surface.capability_flags = MIGO_SURFACE_CAPABILITY_NONE;
+    surface.platform_descriptor_size = (uint32_t)sizeof native;
+    surface.platform_descriptor = &native;
+
+    MigoResult result = migo_session_attach_surface(h->session, &surface, &h->attachment);
+    if (result != MIGO_OK) {
+        LOGE("migo_session_attach_surface failed: %d", (int)result);
+        return;
+    }
+    LOGI("attached %dx%d density=%.2f", width, height, h->density);
+
+    if (!h->content_loaded) {
+        MigoContentDescriptor content;
+        memset(&content, 0, sizeof content);
+        content.struct_size = (uint32_t)sizeof content;
+        content.abi_version = MIGO_ABI_VERSION_CURRENT;
+        content.flags = MIGO_CONTENT_FLAG_NONE;
+        content.content_id_utf8 = h->content_id;
+        content.entry_utf8 = "game.js";
+        result = migo_session_load_content(h->session, &content);
+        if (result != MIGO_OK) {
+            LOGE("migo_session_load_content failed: %d", (int)result);
+            return;
+        }
+        h->content_loaded = 1;
+        LOGI("loaded content '%s'", h->content_id);
+    }
+}
+
+static void detach_window(struct host *h) {
+    if (h->attachment == NULL) return;
+    MigoResult result = migo_surface_detach(h->attachment);
+    if (result != MIGO_OK) {
+        LOGE("migo_surface_detach failed: %d", (int)result);
+        return;
+    }
+    h->attachment = NULL;
+    LOGI("detached");
+}
+
+static void update_surface(struct host *h, ANativeWindow *window) {
+    if (h->attachment == NULL || window == NULL) return;
+
+    MigoSurfaceMetrics metrics;
+    memset(&metrics, 0, sizeof metrics);
+    metrics.struct_size = (uint32_t)sizeof metrics;
+    metrics.abi_version = MIGO_ABI_VERSION_CURRENT;
+    metrics.generation = 1;
+    metrics.width_pixels = (uint32_t)ANativeWindow_getWidth(window);
+    metrics.height_pixels = (uint32_t)ANativeWindow_getHeight(window);
+    metrics.scale_factor = h->density;
+    metrics.color_space = MIGO_COLOR_SPACE_SRGB;
+    metrics.alpha_mode = MIGO_ALPHA_MODE_OPAQUE;
+    metrics.preferred_presentation_mode = MIGO_PRESENTATION_MODE_DEFAULT;
+    metrics.flags = MIGO_SURFACE_DESCRIPTOR_FLAG_NONE;
+
+    MigoResult result = migo_surface_update(h->attachment, &metrics);
+    if (result != MIGO_OK) LOGE("migo_surface_update failed: %d", (int)result);
+}
+
+static void set_visibility(struct host *h, int visible) {
+    if (h->session == NULL) return;
+    /* The setter takes a plain boolean, not an enum. */
+    MigoResult result = migo_session_set_visibility(h->session, visible ? 1 : 0);
+    if (result != MIGO_OK) LOGE("migo_session_set_visibility failed: %d", (int)result);
+}
+
+/* ---- Glue command handling --------------------------------------------- */
+
+static void on_cmd(struct android_app *app, int32_t cmd) {
+    struct host *h = (struct host *)app->userData;
+    switch (cmd) {
+    case APP_CMD_INIT_WINDOW:
+        attach_window(h, app->window);
+        break;
+    case APP_CMD_TERM_WINDOW:
+        detach_window(h);
+        break;
+    case APP_CMD_WINDOW_RESIZED:
+    case APP_CMD_CONFIG_CHANGED:
+        update_surface(h, app->window);
+        break;
+    case APP_CMD_GAINED_FOCUS:
+        if (h->session) migo_session_set_focus(h->session, 1);
+        break;
+    case APP_CMD_LOST_FOCUS:
+        if (h->session) migo_session_set_focus(h->session, 0);
+        break;
+    case APP_CMD_RESUME:
+        set_visibility(h, 1);
+        break;
+    case APP_CMD_PAUSE:
+        set_visibility(h, 0);
+        break;
+    default:
+        break;
+    }
+}
+
+void android_main(struct android_app *app) {
+    memset(&g_host, 0, sizeof g_host);
+    g_host.density = (float)AConfiguration_getDensity(app->config) / 160.0f;
+    if (g_host.density <= 0.0f) g_host.density = 1.0f;
+
+    app->userData = &g_host;
+    app->onAppCmd = on_cmd;
+    app->onInputEvent = on_input;
+
+    /*
+     * O_NONBLOCK is required, not a nicety. drain_dispatch reads until the pipe
+     * is empty, and on a blocking pipe that final read never returns: the
+     * looper callback holds the thread forever, nothing else on the looper is
+     * ever polled again, and any Choreographer callback posted from inside it
+     * is never delivered. That presented as "the engine asks for one frame and
+     * nothing ever renders".
+     */
+    if (pipe2(g_host.dispatch_pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
+        LOGE("dispatch pipe: %s", strerror(errno));
+        return;
+    }
+    ALooper_addFd(app->looper, g_host.dispatch_pipe[0], ALOOPER_POLL_CALLBACK,
+                  ALOOPER_EVENT_INPUT, drain_dispatch, NULL);
+
+    LOGI("starting, internalDataPath=%s density=%.2f", app->activity->internalDataPath,
+         g_host.density);
+    read_content_id(app->activity->internalDataPath, g_host.content_id,
+                    sizeof g_host.content_id);
+    if (!create_engine(&g_host, app->activity->internalDataPath)) return;
+
+    while (1) {
+        int events;
+        struct android_poll_source *source;
+        /*
+         * pollOnce, not pollAll. ALooper_pollAll is deprecated because it loops
+         * internally and discards ALOOPER_POLL_CALLBACK, which silently drops
+         * callbacks other components registered on the looper -- AChoreographer
+         * among them. With pollAll the engine asked for frames, the host armed
+         * a Choreographer callback, and the callback never arrived.
+         */
+        while (ALooper_pollOnce(-1, NULL, &events, (void **)&source) >= 0) {
+            if (source != NULL) source->process(app, source);
+            if (app->destroyRequested != 0) {
+                LOGI("destroy requested, tearing down");
+                detach_window(&g_host);
+                if (g_host.session) migo_session_destroy(g_host.session);
+                if (g_host.engine) migo_engine_destroy(g_host.engine);
+                close(g_host.dispatch_pipe[0]);
+                close(g_host.dispatch_pipe[1]);
+                return;
+            }
+        }
+    }
+}

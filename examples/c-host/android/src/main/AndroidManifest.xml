@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  No Java at all: android.app.NativeActivity loads the library named below and
+  calls its ANativeActivity_onCreate. That is the point of this example - it
+  demonstrates that a host embedding migo through the C ABI needs no JVM code
+  of its own. android:hasCode="false" is what makes that claim checkable.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application
+        android:label="Migo C Host"
+        android:hasCode="false">
+        <activity
+            android:name="android.app.NativeActivity"
+            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:exported="true"
+            android:screenOrientation="portrait">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="migo_c_host" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

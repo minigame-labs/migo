@@ -16,6 +16,7 @@
 mod abi;
 mod callbacks;
 mod host_kit;
+mod platform;
 mod input;
 mod surface;
 #[cfg(test)]
@@ -26,7 +27,8 @@ mod test_support;
 pub use input::{migo_session_send_touch, MigoTouchEvent, MigoTouchPoint};
 pub use surface::{
     migo_session_attach_surface, migo_surface_detach, migo_surface_update,
-    MigoSurfaceAttachment, MigoSurfaceDescriptor, MigoSurfaceMetrics,
+    MigoAndroidNativeWindowDescriptor, MigoSurfaceAttachment, MigoSurfaceDescriptor,
+    MigoSurfaceMetrics,
     MigoX11WindowDescriptor,
 };
 
@@ -47,6 +49,10 @@ use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::Surf
 
 /// `MIGO_PLATFORM_X11_WINDOW` from `include/migo/surface.h`.
 const MIGO_PLATFORM_X11_WINDOW: u32 = 6;
+
+/// `MIGO_PLATFORM_ANDROID_NATIVE_WINDOW` from `include/migo/surface.h`.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+const MIGO_PLATFORM_ANDROID_NATIVE_WINDOW: u32 = 1;
 
 // ---- C struct mirrors -------------------------------------------------------
 // Field-for-field mirrors of the headers. Any divergence is an ABI break, so
@@ -108,6 +114,13 @@ struct SessionState {
     host: Option<i32>,
     content_loaded: bool,
     attached: bool,
+    /// Visibility the host set before a surface existed.
+    ///
+    /// Visibility is a property of the session, not of the surface, and every
+    /// Android lifecycle delivers RESUME before the window arrives. Rejecting
+    /// the call until something is attached would make correct hosts look
+    /// wrong; the value is remembered and applied when the surface lands.
+    pending_visible: Option<bool>,
 }
 
 pub struct MigoSession {
@@ -371,14 +384,47 @@ const MIGO_LIFECYCLE_PAUSED: u32 = 2;
 ///
 /// `send_critical_command_to_host` matches Android: lifecycle must not be
 /// dropped when the command queue is saturated.
+/// Report that a frame boundary arrived, in response to `on_request_frame`.
+///
+/// # Safety
+/// `session` must be live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn migo_session_notify_vsync(
+    session: *mut MigoSession,
+    frame_time_nanos: i64,
+) -> MigoResult {
+    guard("migo_session_notify_vsync", || {
+        let Some(session) = (unsafe { session.as_ref() }) else {
+            return MIGO_ERROR_INVALID_ARGUMENT;
+        };
+        let Ok(state) = session.state.lock() else {
+            return MIGO_ERROR_INTERNAL;
+        };
+        // Nothing is rendering yet, so there is no frame to pace. Reporting
+        // success would tell the host its tick was consumed.
+        let Some(host) = state.host else {
+            return MIGO_ERROR_INVALID_STATE;
+        };
+        drop(state);
+        // The engine measures frame time in milliseconds; the host reports the
+        // platform's nanosecond timestamp, so the conversion belongs here
+        // rather than in every host.
+        core::send_vsync(host, frame_time_nanos as f64 / 1_000_000.0);
+        MIGO_OK
+    })
+}
+
 fn drive_visibility(session: &MigoSession, visible: bool) -> MigoResult {
-    let Ok(state) = session.state.lock() else {
+    let Ok(mut state) = session.state.lock() else {
         return MIGO_ERROR_INTERNAL;
     };
-    // No host thread yet means nothing to show or hide.
+    // Before a surface exists there is nothing to show or hide yet, but the
+    // host is not wrong to have said so: remember it for attach.
     let Some(host) = state.host else {
-        return MIGO_ERROR_INVALID_STATE;
+        state.pending_visible = Some(visible);
+        return MIGO_OK;
     };
+    state.pending_visible = None;
     let command = if visible {
         HostCommand::OnShow {
             options_json: None,
@@ -443,12 +489,12 @@ pub unsafe extern "C" fn migo_session_set_focus(
         let Some(session) = (unsafe { session.as_ref() }) else {
             return MIGO_ERROR_INVALID_ARGUMENT;
         };
-        let Ok(state) = session.state.lock() else {
+        // No surface requirement: focus is a property of the session, and every
+        // Android lifecycle reports it before the window exists. Rejecting it
+        // there would make a correct host look wrong.
+        let Ok(_state) = session.state.lock() else {
             return MIGO_ERROR_INTERNAL;
         };
-        if state.host.is_none() {
-            return MIGO_ERROR_INVALID_STATE;
-        }
         // Focus is validated and accepted, but the engine has no separate focus
         // channel today: wx-style content observes show/hide, not focus. Wiring
         // it to visibility would pause a game that merely lost keyboard focus
@@ -616,9 +662,11 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_calls_need_an_attached_surface() {
-        // Without a surface there is no host thread, so show/hide has no
-        // recipient — a state error, not a silent success.
+    fn lifecycle_calls_are_accepted_before_a_surface_exists() {
+        // These describe the session, not the surface, and every Android
+        // lifecycle delivers resume and focus before the window arrives.
+        // Rejecting them there would make a correct host look wrong; the
+        // visibility is remembered and applied when the surface attaches.
         with_engine("lifecycle", |engine| {
             let session_config = session_config();
             let mut session: *mut MigoSession = std::ptr::null_mut();
@@ -628,14 +676,48 @@ mod tests {
             );
             assert_eq!(
                 unsafe { migo_session_set_lifecycle(session, MIGO_LIFECYCLE_RUNNING) },
-                MIGO_ERROR_INVALID_STATE
+                MIGO_OK
+            );
+            assert_eq!(unsafe { migo_session_set_visibility(session, 1) }, MIGO_OK);
+            assert_eq!(unsafe { migo_session_set_focus(session, 1) }, MIGO_OK);
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn returning_to_the_created_state_is_still_rejected() {
+        // Unlike the ordering cases above, this is a genuinely undefined
+        // transition: unwinding a running engine is not something the ABI
+        // describes, so it stays an error rather than becoming a deferral.
+        with_engine("lifecycle-created", |engine| {
+            let session_config = session_config();
+            let mut session: *mut MigoSession = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config, &mut session) },
+                MIGO_OK
             );
             assert_eq!(
-                unsafe { migo_session_set_visibility(session, 1) },
+                unsafe { migo_session_set_lifecycle(session, MIGO_LIFECYCLE_CREATED) },
                 MIGO_ERROR_INVALID_STATE
             );
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn a_vsync_without_a_surface_is_a_state_error() {
+        // Unlike the session-level calls, a frame tick has nothing to pace
+        // until something is rendering, and reporting success would tell the
+        // host its tick was consumed.
+        with_engine("vsync-detached", |engine| {
+            let session_config = session_config();
+            let mut session: *mut MigoSession = std::ptr::null_mut();
             assert_eq!(
-                unsafe { migo_session_set_focus(session, 1) },
+                unsafe { migo_session_create(engine, &session_config, &mut session) },
+                MIGO_OK
+            );
+            assert_eq!(
+                unsafe { migo_session_notify_vsync(session, 1_000_000) },
                 MIGO_ERROR_INVALID_STATE
             );
             assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
@@ -699,6 +781,7 @@ mod tests {
                 on_error: None,
                 on_exit_requested: None,
                 on_surface_lost: None,
+                on_request_frame: None,
             };
             assert_eq!(
                 unsafe { migo_session_set_host_callbacks(session, &host_callbacks) },
