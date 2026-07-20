@@ -12,16 +12,16 @@
 //!   payload until it does.
 
 use std::{
-    ffi::{c_void, CString},
+    ffi::{CString, c_void},
     os::raw::c_char,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
-use crate::abi::{MigoResult, VersionedHeader, MIGO_ERROR_INVALID_ARGUMENT, MIGO_OK};
+use crate::abi::{MIGO_ERROR_INVALID_ARGUMENT, MIGO_OK, MigoResult, VersionedHeader};
 
 pub type MigoTaskFn = unsafe extern "C" fn(*mut c_void);
 pub type MigoDispatchFn = unsafe extern "C" fn(*mut c_void, MigoTaskFn, *mut c_void) -> MigoResult;
@@ -33,7 +33,8 @@ pub type MigoOnRequestFrameFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 pub type MigoOnShowKeyboardFn =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *const MigoKeyboardShowOptions);
 pub type MigoOnHideKeyboardFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
-pub type MigoOnUpdateKeyboardFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char, u32);
+pub type MigoOnUpdateKeyboardFn =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char, u32);
 
 /// Mirrors `MigoError` in `include/migo/types.h`.
 #[repr(C)]
@@ -359,7 +360,8 @@ impl Notifier {
         let context = Box::into_raw(task) as *mut c_void;
         // SAFETY: `dispatch` came from the host and is called with the token it
         // supplied plus a task it must run exactly once.
-        let result = unsafe { (self.callbacks.dispatch)(self.callbacks.dispatcher_data, run_task, context) };
+        let result =
+            unsafe { (self.callbacks.dispatch)(self.callbacks.dispatcher_data, run_task, context) };
         if result != MIGO_OK {
             // Rejected: take the payload back and drop it, so the task neither
             // leaks nor runs.
@@ -468,7 +470,11 @@ mod tests {
         READY_CALLS.fetch_add(1, Ordering::SeqCst);
     }
 
-    unsafe extern "C" fn on_error(_user: *mut c_void, _session: *mut c_void, error: *const MigoError) {
+    unsafe extern "C" fn on_error(
+        _user: *mut c_void,
+        _session: *mut c_void,
+        error: *const MigoError,
+    ) {
         let error = unsafe { &*error };
         LAST_ERROR_CODE.store((-error.code) as usize, Ordering::SeqCst);
         // The message must be readable for the duration of this callback.
@@ -524,7 +530,9 @@ mod tests {
                 options.default_value_length as usize,
             )
         };
-        *SHOWN_DEFAULT_VALUE.lock().unwrap_or_else(|e| e.into_inner()) =
+        *SHOWN_DEFAULT_VALUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
             std::str::from_utf8(bytes).expect("utf-8").to_string();
     }
 
@@ -615,7 +623,7 @@ mod tests {
         let buffer = truncated_caller(72);
         let copied = unsafe {
             crate::abi::copy_versioned::<MigoHostCallbacks>(
-                buffer.0.as_ptr() as *const VersionedHeader,
+                buffer.0.as_ptr() as *const VersionedHeader
             )
         }
         .expect("a client from the previous header must be accepted");
@@ -641,7 +649,7 @@ mod tests {
         let buffer = truncated_caller(32);
         let copied = unsafe {
             crate::abi::copy_versioned::<MigoHostCallbacks>(
-                buffer.0.as_ptr() as *const VersionedHeader,
+                buffer.0.as_ptr() as *const VersionedHeader
             )
         }
         .expect("the minimum must be accepted");
@@ -763,7 +771,9 @@ mod tests {
 
         assert_eq!(SHOWN_MAX_LENGTH.load(Ordering::SeqCst), 140);
         assert_eq!(
-            *SHOWN_DEFAULT_VALUE.lock().unwrap_or_else(|e| e.into_inner()),
+            *SHOWN_DEFAULT_VALUE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
             "seed"
         );
     }

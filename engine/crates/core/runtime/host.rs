@@ -886,13 +886,8 @@ impl Host {
                 axis_count,
                 button_count,
             } => {
-                self.js.dispatch_gamepad_connected(
-                    index,
-                    &id,
-                    &mapping,
-                    axis_count,
-                    button_count,
-                );
+                self.js
+                    .dispatch_gamepad_connected(index, &id, &mapping, axis_count, button_count);
                 Ok(())
             }
 

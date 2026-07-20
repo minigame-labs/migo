@@ -22,17 +22,17 @@
 use std::mem::{align_of, offset_of, size_of};
 
 use crate::{
+    MigoContentDescriptor, MigoEngineConfig, MigoSessionConfig,
     abi::VersionedHeader,
-    capabilities::MigoCapabilities,
     callbacks::{MigoError, MigoHostCallbacks, MigoKeyboardShowOptions},
-    input::{MigoTouchEvent, MigoTouchPoint},
+    capabilities::MigoCapabilities,
     gamepad::{MigoGamepadButton, MigoGamepadInfo, MigoGamepadStateEvent},
+    input::{MigoTouchEvent, MigoTouchPoint},
     keyboard::{MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent},
     surface::{
         MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
         MigoX11WindowDescriptor,
     },
-    MigoContentDescriptor, MigoEngineConfig, MigoSessionConfig,
 };
 
 /// Every versioned struct must begin with its header.

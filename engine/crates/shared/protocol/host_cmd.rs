@@ -450,9 +450,7 @@ pub enum HostCommand {
     /// string, not the delta -- the same rule the soft keyboard's value follows,
     /// and for the same reason: a host sending only what changed leaves content
     /// unable to reconstruct the rest.
-    OnCompositionUpdate {
-        data: String,
-    },
+    OnCompositionUpdate { data: String },
 
     /// Composition finished.
     ///
@@ -460,9 +458,7 @@ pub enum HostCommand {
     /// when the user cancelled. Content that has been drawing the preedit must
     /// clear it on this event; the committed text arrives here and, for a host
     /// that also drives the soft keyboard, again as an input value.
-    OnCompositionEnd {
-        data: String,
-    },
+    OnCompositionEnd { data: String },
 
     // ---- Gamepad Events ----
     /// A gamepad became available in `index`.
@@ -492,9 +488,7 @@ pub enum HostCommand {
     ///
     /// Triggers a `gamepaddisconnected` event and empties the slot, so content
     /// polling `getGamepads()` sees a hole rather than a stale pad.
-    OnGamepadDisconnected {
-        index: u32,
-    },
+    OnGamepadDisconnected { index: u32 },
 
     /// New axis and button values for a connected gamepad.
     ///

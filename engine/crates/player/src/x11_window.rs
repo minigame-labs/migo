@@ -19,7 +19,7 @@
 //! `docs/superpowers/specs/2026-07-18-linux-x11-presenter-design.md`.
 
 use std::{
-    ffi::{c_ulong, c_void, CString},
+    ffi::{CString, c_ulong, c_void},
     ptr::NonNull,
 };
 
@@ -65,17 +65,8 @@ impl X11Window {
             let screen = (xlib.XDefaultScreen)(display_ptr);
             let root = (xlib.XRootWindow)(display_ptr, screen);
             let black = (xlib.XBlackPixel)(display_ptr, screen);
-            let window = (xlib.XCreateSimpleWindow)(
-                display_ptr,
-                root,
-                0,
-                0,
-                width,
-                height,
-                0,
-                black,
-                black,
-            );
+            let window =
+                (xlib.XCreateSimpleWindow)(display_ptr, root, 0, 0, width, height, 0, black, black);
 
             if let Ok(title) = CString::new(title) {
                 (xlib.XStoreName)(display_ptr, window, title.as_ptr());

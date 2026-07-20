@@ -16,12 +16,12 @@
 mod abi;
 mod callbacks;
 mod capabilities;
-mod host_kit;
-mod platform;
 mod gamepad;
+mod host_kit;
 mod input;
 mod keyboard;
 mod layout;
+mod platform;
 mod surface;
 #[cfg(test)]
 mod test_support;
@@ -29,19 +29,18 @@ mod test_support;
 // The surface entry points and the descriptors they read live in their
 // own module; re-exported so the crate's public surface is unchanged.
 pub use gamepad::{
-    migo_session_send_gamepad_state, migo_session_set_gamepad_connected, MigoGamepadButton,
-    MigoGamepadInfo, MigoGamepadStateEvent,
+    MigoGamepadButton, MigoGamepadInfo, MigoGamepadStateEvent, migo_session_send_gamepad_state,
+    migo_session_set_gamepad_connected,
 };
-pub use input::{migo_session_send_touch, MigoTouchEvent, MigoTouchPoint};
+pub use input::{MigoTouchEvent, MigoTouchPoint, migo_session_send_touch};
 pub use keyboard::{
-    migo_session_send_composition_event, migo_session_send_key_event,
-    migo_session_send_keyboard_event, MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent,
+    MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent, migo_session_send_composition_event,
+    migo_session_send_key_event, migo_session_send_keyboard_event,
 };
 pub use surface::{
-    migo_session_attach_surface, migo_surface_detach, migo_surface_update,
     MigoAndroidNativeWindowDescriptor, MigoSurfaceAttachment, MigoSurfaceDescriptor,
-    MigoSurfaceMetrics,
-    MigoX11WindowDescriptor,
+    MigoSurfaceMetrics, MigoX11WindowDescriptor, migo_session_attach_surface, migo_surface_detach,
+    migo_surface_update,
 };
 
 use std::{
@@ -53,10 +52,11 @@ use std::{
 };
 
 use abi::{
-    copy_utf8, guard, validate_header, MigoResult, VersionedHeader, MIGO_ERROR_INTERNAL,
-    MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE, MIGO_ERROR_UNSUPPORTED_PLATFORM, MIGO_OK,
+    MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE,
+    MIGO_ERROR_UNSUPPORTED_PLATFORM, MIGO_OK, MigoResult, VersionedHeader, copy_utf8, guard,
+    validate_header,
 };
-use core::{send_command_to_host, shutdown_host, spawn_host_thread, PlatformServices};
+use core::{PlatformServices, send_command_to_host, shutdown_host, spawn_host_thread};
 use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceRef};
 
 /// `MIGO_PLATFORM_X11_WINDOW` from `include/migo/surface.h`.
@@ -366,9 +366,7 @@ pub unsafe extern "C" fn migo_session_set_host_callbacks(
         // leaves the rest null, which is what "that host never had this
         // callback" already means.
         let raw = match unsafe {
-            abi::copy_versioned::<callbacks::MigoHostCallbacks>(
-                callbacks as *const VersionedHeader,
-            )
+            abi::copy_versioned::<callbacks::MigoHostCallbacks>(callbacks as *const VersionedHeader)
         } {
             Ok(raw) => raw,
             Err(error) => return error,
@@ -444,9 +442,7 @@ fn drive_visibility(session: &MigoSession, visible: bool) -> MigoResult {
     };
     state.pending_visible = None;
     let command = if visible {
-        HostCommand::OnShow {
-            options_json: None,
-        }
+        HostCommand::OnShow { options_json: None }
     } else {
         HostCommand::OnHide
     };
@@ -555,13 +551,9 @@ fn init_dev_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI};
     use crate::test_support::{engine_config, scratch_dirs, session_config, with_engine};
+    use abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI};
     use std::ffi::CString;
-
-
-
-
 
     #[test]
     fn engine_rejects_a_config_from_a_different_abi() {
@@ -584,8 +576,11 @@ mod tests {
         // The signing check is the default; a host that wants unsigned content
         // has to say so, because silently accepting it defeats the check.
         let dirs = scratch_dirs("signing");
-        let mut config =
-            engine_config(&dirs, size_of::<MigoEngineConfig>() as u32, MIGO_ABI_VERSION_CURRENT);
+        let mut config = engine_config(
+            &dirs,
+            size_of::<MigoEngineConfig>() as u32,
+            MIGO_ABI_VERSION_CURRENT,
+        );
         let mut engine: *mut MigoEngine = std::ptr::null_mut();
         assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
         assert!(
@@ -604,7 +599,11 @@ mod tests {
     #[test]
     fn engine_requires_storage_roots() {
         let dirs = scratch_dirs("roots");
-        let mut config = engine_config(&dirs, size_of::<MigoEngineConfig>() as u32, MIGO_ABI_VERSION_CURRENT);
+        let mut config = engine_config(
+            &dirs,
+            size_of::<MigoEngineConfig>() as u32,
+            MIGO_ABI_VERSION_CURRENT,
+        );
         config.files_dir_utf8 = std::ptr::null();
         let mut engine: *mut MigoEngine = std::ptr::null_mut();
         assert_eq!(
@@ -619,7 +618,10 @@ mod tests {
         let files = PathBuf::from(dirs.0.to_str().expect("utf-8"));
         let _ = std::fs::remove_dir_all(&files);
         with_engine("mkdir", |_| {});
-        assert!(files.is_dir(), "engine must create the roots the host named");
+        assert!(
+            files.is_dir(),
+            "engine must create the roots the host named"
+        );
     }
 
     #[test]
@@ -627,7 +629,11 @@ mod tests {
         // Otherwise the session would keep reading configuration that just got
         // freed underneath it.
         let dirs = scratch_dirs("children");
-        let config = engine_config(&dirs, size_of::<MigoEngineConfig>() as u32, MIGO_ABI_VERSION_CURRENT);
+        let config = engine_config(
+            &dirs,
+            size_of::<MigoEngineConfig>() as u32,
+            MIGO_ABI_VERSION_CURRENT,
+        );
         let mut engine: *mut MigoEngine = std::ptr::null_mut();
         assert_eq!(unsafe { migo_engine_create(&config, &mut engine) }, MIGO_OK);
 
@@ -829,7 +835,4 @@ mod tests {
             MIGO_ERROR_INVALID_ARGUMENT
         );
     }
-
-
-
 }

@@ -277,19 +277,18 @@ impl JsBindings {
             composition_start,
             composition_update,
             composition_end,
-        ) = self
-            .with_main_context(rt, |scope, _ctx, global| {
-                let bridge = resolve_host_bridge(scope, global);
-                (
-                    get_global_fn(scope, bridge, "_internalTriggerWebglContextEvent"),
-                    get_global_fn(scope, bridge, "_internalTriggerGamepadConnected"),
-                    get_global_fn(scope, bridge, "_internalTriggerGamepadDisconnected"),
-                    get_global_fn(scope, bridge, "_internalTriggerGamepadState"),
-                    get_global_fn(scope, bridge, "_internalTriggerCompositionStart"),
-                    get_global_fn(scope, bridge, "_internalTriggerCompositionUpdate"),
-                    get_global_fn(scope, bridge, "_internalTriggerCompositionEnd"),
-                )
-            });
+        ) = self.with_main_context(rt, |scope, _ctx, global| {
+            let bridge = resolve_host_bridge(scope, global);
+            (
+                get_global_fn(scope, bridge, "_internalTriggerWebglContextEvent"),
+                get_global_fn(scope, bridge, "_internalTriggerGamepadConnected"),
+                get_global_fn(scope, bridge, "_internalTriggerGamepadDisconnected"),
+                get_global_fn(scope, bridge, "_internalTriggerGamepadState"),
+                get_global_fn(scope, bridge, "_internalTriggerCompositionStart"),
+                get_global_fn(scope, bridge, "_internalTriggerCompositionUpdate"),
+                get_global_fn(scope, bridge, "_internalTriggerCompositionEnd"),
+            )
+        });
         self.webgl_context_event_fn = webgl_context_event;
         self.gamepad_connected_fn = gamepad_connected;
         self.gamepad_disconnected_fn = gamepad_disconnected;
@@ -928,11 +927,7 @@ impl JsBindings {
         }
     }
 
-    pub(crate) fn dispatch_gamepad_disconnected(
-        &self,
-        rt: &mut deno_core::JsRuntime,
-        index: u32,
-    ) {
+    pub(crate) fn dispatch_gamepad_disconnected(&self, rt: &mut deno_core::JsRuntime, index: u32) {
         if let Some(func_g) = self.gamepad_disconnected_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
                 let args = [v8::Integer::new_from_unsigned(scope, index).into()];

@@ -9,11 +9,11 @@ use core::send_command_to_host;
 use shared::protocol::host_cmd::{HostCommand, TouchData, TouchPoint, TouchType};
 
 use crate::{
-    abi::{
-        guard, validate_header, MigoResult, VersionedHeader, MIGO_ERROR_INTERNAL,
-        MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE, MIGO_ERROR_WOULD_BLOCK, MIGO_OK,
-    },
     MigoSession,
+    abi::{
+        MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE,
+        MIGO_ERROR_WOULD_BLOCK, MIGO_OK, MigoResult, VersionedHeader, guard, validate_header,
+    },
 };
 
 /// `MIGO_TOUCH_*` from `include/migo/input.h`.
@@ -215,9 +215,27 @@ mod tests {
     #[test]
     fn a_batch_arrives_with_every_field_in_place() {
         let points = [
-            MigoTouchPoint { id: 7, x: 11.0, y: 22.0, pressure: 0.25, flags: 1 },
-            MigoTouchPoint { id: 8, x: 33.0, y: 44.0, pressure: 0.50, flags: 0 },
-            MigoTouchPoint { id: 9, x: 55.0, y: 66.0, pressure: 0.75, flags: 1 },
+            MigoTouchPoint {
+                id: 7,
+                x: 11.0,
+                y: 22.0,
+                pressure: 0.25,
+                flags: 1,
+            },
+            MigoTouchPoint {
+                id: 8,
+                x: 33.0,
+                y: 44.0,
+                pressure: 0.50,
+                flags: 0,
+            },
+            MigoTouchPoint {
+                id: 9,
+                x: 55.0,
+                y: 66.0,
+                pressure: 0.75,
+                flags: 1,
+            },
         ];
         let mut e = event(&points, points.len() as u32);
         e.touch_type = MIGO_TOUCH_MOVE;
@@ -247,8 +265,20 @@ mod tests {
     #[test]
     fn points_beyond_the_count_are_left_untouched() {
         let points = [
-            MigoTouchPoint { id: 1, x: 1.0, y: 2.0, pressure: 1.0, flags: 1 },
-            MigoTouchPoint { id: 2, x: 3.0, y: 4.0, pressure: 1.0, flags: 1 },
+            MigoTouchPoint {
+                id: 1,
+                x: 1.0,
+                y: 2.0,
+                pressure: 1.0,
+                flags: 1,
+            },
+            MigoTouchPoint {
+                id: 2,
+                x: 3.0,
+                y: 4.0,
+                pressure: 1.0,
+                flags: 1,
+            },
         ];
         // Announce one point while supplying two.
         let e = event(&points, 1);
@@ -262,10 +292,16 @@ mod tests {
         // would widen a shared type's API for a local convenience.
         let ghost = data.points[1];
         let fresh = TouchPoint::default();
-        assert_eq!(ghost.id, fresh.id, "the second slot must stay at its default");
+        assert_eq!(
+            ghost.id, fresh.id,
+            "the second slot must stay at its default"
+        );
         assert_eq!(ghost.x, fresh.x, "the second slot must stay at its default");
         assert_eq!(ghost.y, fresh.y, "the second slot must stay at its default");
-        assert_eq!(ghost.flags, fresh.flags, "the second slot must stay at its default");
+        assert_eq!(
+            ghost.flags, fresh.flags,
+            "the second slot must stay at its default"
+        );
     }
 
     #[test]

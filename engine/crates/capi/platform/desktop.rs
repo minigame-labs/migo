@@ -5,12 +5,12 @@ use std::{ffi::c_ulong, ptr::NonNull, sync::Arc};
 use shared::surface::SurfaceRef;
 
 use crate::{
+    MIGO_PLATFORM_X11_WINDOW,
     abi::{
-        validate_header, MigoResult, VersionedHeader, MIGO_ERROR_INTERNAL,
-        MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_UNSUPPORTED_PLATFORM,
+        MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_UNSUPPORTED_PLATFORM,
+        MigoResult, VersionedHeader, validate_header,
     },
     surface::{MigoSurfaceDescriptor, MigoX11WindowDescriptor},
-    MIGO_PLATFORM_X11_WINDOW,
 };
 
 /// What a resize needs in order to rebuild the surface.
@@ -124,7 +124,9 @@ mod tests {
             reserved0: 0,
             platform_descriptor: std::ptr::null(),
         };
-        let error = unsafe { build_target(&descriptor) }.err().expect("rejected");
+        let error = unsafe { build_target(&descriptor) }
+            .err()
+            .expect("rejected");
         assert_eq!(error, MIGO_ERROR_UNSUPPORTED_PLATFORM);
     }
 
@@ -163,7 +165,9 @@ mod tests {
             reserved0: 0,
             platform_descriptor: &x11 as *const _ as *const c_void,
         };
-        let error = unsafe { build_target(&descriptor) }.err().expect("rejected");
+        let error = unsafe { build_target(&descriptor) }
+            .err()
+            .expect("rejected");
         assert_eq!(error, MIGO_ERROR_INVALID_ARGUMENT);
     }
 

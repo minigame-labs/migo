@@ -7,16 +7,16 @@
 
 use core::send_command_to_host;
 use shared::protocol::host_cmd::{
-    GamepadButtonState, GamepadState, HostCommand, GAMEPAD_MAX_AXES, GAMEPAD_MAX_BUTTONS,
+    GAMEPAD_MAX_AXES, GAMEPAD_MAX_BUTTONS, GamepadButtonState, GamepadState, HostCommand,
 };
 
 use crate::{
+    MigoSession,
     abi::{
-        copy_utf8, guard, validate_header, MigoResult, VersionedHeader,
-        MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_WOULD_BLOCK, MIGO_OK,
+        MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_WOULD_BLOCK, MIGO_OK, MigoResult, VersionedHeader,
+        copy_utf8, guard, validate_header,
     },
     keyboard::attached_host,
-    MigoSession,
 };
 
 /// `MIGO_GAMEPAD_BUTTON_FLAG_*` from `include/migo/input.h`.
@@ -145,9 +145,9 @@ pub unsafe extern "C" fn migo_session_set_gamepad_connected(
         let Some(session) = (unsafe { session.as_ref() }) else {
             return MIGO_ERROR_INVALID_ARGUMENT;
         };
-        if let Err(error) = unsafe {
-            validate_header(info as *const VersionedHeader, size_of::<MigoGamepadInfo>())
-        } {
+        if let Err(error) =
+            unsafe { validate_header(info as *const VersionedHeader, size_of::<MigoGamepadInfo>()) }
+        {
             return error;
         }
         let info = unsafe { &*info };
@@ -160,10 +160,9 @@ pub unsafe extern "C" fn migo_session_set_gamepad_connected(
             {
                 return MIGO_ERROR_INVALID_ARGUMENT;
             }
-            let (id, mapping) = match (
-                unsafe { copy_utf8(info.id_utf8) },
-                unsafe { copy_utf8(info.mapping_utf8) },
-            ) {
+            let (id, mapping) = match (unsafe { copy_utf8(info.id_utf8) }, unsafe {
+                copy_utf8(info.mapping_utf8)
+            }) {
                 (Ok(id), Ok(mapping)) => (id, mapping),
                 _ => return MIGO_ERROR_INVALID_ARGUMENT,
             };
@@ -261,7 +260,8 @@ mod tests {
             button(false, true, 0.25),
             button(false, false, 0.0),
         ];
-        let state = unsafe { to_gamepad_state(&state_event(&axes, &buttons)) }.expect("well-formed");
+        let state =
+            unsafe { to_gamepad_state(&state_event(&axes, &buttons)) }.expect("well-formed");
 
         assert_eq!(state.axis_count, 4);
         assert_eq!(state.button_count, 3);
@@ -283,7 +283,10 @@ mod tests {
         let buttons = [button(true, false, 0.0), button(false, false, 0.9)];
         let state = unsafe { to_gamepad_state(&state_event(&[], &buttons)) }.expect("well-formed");
         assert!(state.buttons[0].pressed, "a pressed button at rest value");
-        assert!(!state.buttons[1].pressed, "an unpressed button near full travel");
+        assert!(
+            !state.buttons[1].pressed,
+            "an unpressed button near full travel"
+        );
     }
 
     /// Slots past the announced counts belong to nobody.
@@ -291,7 +294,8 @@ mod tests {
     fn entries_beyond_the_counts_keep_their_defaults() {
         let axes = [1.0f32];
         let buttons = [button(true, true, 1.0)];
-        let state = unsafe { to_gamepad_state(&state_event(&axes, &buttons)) }.expect("well-formed");
+        let state =
+            unsafe { to_gamepad_state(&state_event(&axes, &buttons)) }.expect("well-formed");
         assert_eq!(state.axes[1], 0.0);
         assert_eq!(state.buttons[1], GamepadButtonState::default());
     }

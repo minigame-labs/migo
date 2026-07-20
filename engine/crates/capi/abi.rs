@@ -110,11 +110,7 @@ pub unsafe fn copy_versioned<T: AbiStruct>(
     // `size` bytes the caller announced are read.
     let mut value: T = unsafe { std::mem::zeroed() };
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            header as *const u8,
-            &mut value as *mut T as *mut u8,
-            size,
-        );
+        std::ptr::copy_nonoverlapping(header as *const u8, &mut value as *mut T as *mut u8, size);
     }
     Ok(value)
 }

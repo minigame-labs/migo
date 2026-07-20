@@ -5,12 +5,12 @@ use std::{ffi::c_void, ptr::NonNull, sync::Arc};
 use shared::surface::SurfaceRef;
 
 use crate::{
+    MIGO_PLATFORM_ANDROID_NATIVE_WINDOW,
     abi::{
-        validate_header, MigoResult, VersionedHeader, MIGO_ERROR_INTERNAL,
-        MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_UNSUPPORTED_PLATFORM,
+        MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_UNSUPPORTED_PLATFORM,
+        MigoResult, VersionedHeader, validate_header,
     },
     surface::{MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor},
-    MIGO_PLATFORM_ANDROID_NATIVE_WINDOW,
 };
 
 /// What a resize needs in order to rebuild the surface.

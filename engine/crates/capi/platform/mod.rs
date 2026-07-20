@@ -13,9 +13,9 @@ mod android;
 mod desktop;
 
 #[cfg(target_os = "android")]
-pub(crate) use android::{build_target, rebuild_surface, supported_platform_kinds, PlatformTarget};
+pub(crate) use android::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
 #[cfg(not(target_os = "android"))]
-pub(crate) use desktop::{build_target, rebuild_surface, supported_platform_kinds, PlatformTarget};
+pub(crate) use desktop::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
 
 /// Whether this build can attach the given `MIGO_PLATFORM_*` kind.
 ///

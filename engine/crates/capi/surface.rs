@@ -15,18 +15,21 @@ use std::{
     sync::Arc,
 };
 
-use core::{lease_surface, retire_surface, send_critical_command_to_host, spawn_host_thread,
-           PlatformServices};
+use core::{
+    PlatformServices, lease_surface, retire_surface, send_critical_command_to_host,
+    spawn_host_thread,
+};
 use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceRef};
 
 use crate::{
-    platform::{build_target, rebuild_surface, PlatformTarget},
+    MIGO_PLATFORM_X11_WINDOW, MigoSession,
     abi::{
-        guard, validate_header, MigoResult, VersionedHeader, MIGO_ERROR_INTERNAL,
-        MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE, MIGO_ERROR_UNSUPPORTED_PLATFORM,
-        MIGO_OK,
+        MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE,
+        MIGO_ERROR_UNSUPPORTED_PLATFORM, MIGO_OK, MigoResult, VersionedHeader, guard,
+        validate_header,
     },
-    callbacks, host_kit, MigoSession, MIGO_PLATFORM_X11_WINDOW,
+    callbacks, host_kit,
+    platform::{PlatformTarget, build_target, rebuild_surface},
 };
 
 // ---- C struct mirrors -------------------------------------------------------
@@ -155,18 +158,19 @@ pub unsafe extern "C" fn migo_session_attach_surface(
             Some(host) => {
                 host_for_pending = host;
                 match lease_surface(host, surface) {
-                Ok(lease) => {
-                    if let Err(error) =
-                        send_critical_command_to_host(host, HostCommand::UpdateSurface { lease })
-                    {
-                        tracing::error!("migo_session_attach_surface: send failed: {error}");
+                    Ok(lease) => {
+                        if let Err(error) = send_critical_command_to_host(
+                            host,
+                            HostCommand::UpdateSurface { lease },
+                        ) {
+                            tracing::error!("migo_session_attach_surface: send failed: {error}");
+                            return MIGO_ERROR_INTERNAL;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!("migo_session_attach_surface: lease failed: {error}");
                         return MIGO_ERROR_INTERNAL;
                     }
-                }
-                Err(error) => {
-                    tracing::error!("migo_session_attach_surface: lease failed: {error}");
-                    return MIGO_ERROR_INTERNAL;
-                }
                 }
             }
             None => {
@@ -276,7 +280,8 @@ pub unsafe extern "C" fn migo_surface_update(
         };
         // Critical, like Android's path: a dropped resize strands the app on a
         // stale-sized frame with no further callback to recover from.
-        if let Err(error) = send_critical_command_to_host(host, HostCommand::UpdateSurface { lease })
+        if let Err(error) =
+            send_critical_command_to_host(host, HostCommand::UpdateSurface { lease })
         {
             tracing::error!("migo_surface_update: send failed: {error}");
             return MIGO_ERROR_INTERNAL;
@@ -292,9 +297,7 @@ pub unsafe extern "C" fn migo_surface_update(
 /// `attachment` must come from [`migo_session_attach_surface`] and its session
 /// must still be live. On `MIGO_OK` the handle is consumed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn migo_surface_detach(
-    attachment: *mut MigoSurfaceAttachment,
-) -> MigoResult {
+pub unsafe extern "C" fn migo_surface_detach(attachment: *mut MigoSurfaceAttachment) -> MigoResult {
     guard("migo_surface_detach", || {
         if attachment.is_null() {
             return MIGO_ERROR_INVALID_ARGUMENT;
@@ -315,7 +318,6 @@ pub unsafe extern "C" fn migo_surface_detach(
         MIGO_OK
     })
 }
-
 
 #[cfg(test)]
 #[cfg(test)]

@@ -156,13 +156,12 @@ impl EglProvider for LinuxEglProvider {
 
     fn display(&self, egl: &EglInstance) -> EngineResult<egl::Display> {
         match self.target {
-            LinuxDisplayTarget::Offscreen => {
-                unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }.ok_or_else(|| {
+            LinuxDisplayTarget::Offscreen => unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }
+                .ok_or_else(|| {
                     EngineError::new(ErrorCode::RenderInitializeError)
                         .with_msg("Linux eglGetDisplay failed")
                         .with_detail(format!("provider={}", self.label()))
-                })
-            }
+                }),
             // Naming the platform explicitly beats letting the driver infer it
             // from the pointer, so the EXT entry point is preferred and the
             // legacy call is only a fallback for drivers without it.
@@ -464,7 +463,9 @@ mod tests {
     fn x11_surface_prepares_and_reports_its_size() {
         let surface = LinuxX11Surface::new(0x2a0_0001, 800, 600);
         assert_eq!(surface.size(), (800, 600));
-        let prepared = LinuxEglSurfaceFactory.prepare(&surface).expect("prepare x11");
+        let prepared = LinuxEglSurfaceFactory
+            .prepare(&surface)
+            .expect("prepare x11");
         assert!(prepared.same_native_surface(prepared.as_ref()));
     }
 
@@ -480,7 +481,10 @@ mod tests {
         };
         let resized = prepare(0x2a0_0001, 1024, 768);
         assert!(prepare(0x2a0_0001, 800, 600).same_native_surface(resized.as_ref()));
-        assert!(!prepare(0x2a0_0002, 800, 600).same_native_surface(prepare(0x2a0_0001, 800, 600).as_ref()));
+        assert!(
+            !prepare(0x2a0_0002, 800, 600)
+                .same_native_surface(prepare(0x2a0_0001, 800, 600).as_ref())
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! and a window.
 
 use crate::{
-    abi::{guard, MigoResult, VersionedHeader, MIGO_ERROR_INVALID_ARGUMENT, MIGO_OK},
+    abi::{MIGO_ERROR_INVALID_ARGUMENT, MIGO_OK, MigoResult, VersionedHeader, guard},
     platform::supported_platform_kinds,
 };
 

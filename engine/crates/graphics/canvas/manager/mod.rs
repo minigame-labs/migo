@@ -5238,10 +5238,10 @@ mod tests {
         // Regression: recovery used to rebuild only the onscreen canvas, so a
         // game holding an offscreen canvas id (Pixi allocates two at startup)
         // hit `NotFound` on every later op and stopped rendering.
-        let plan = plan_share_group_restore(
-            [ONSCREEN, (16777217, true, 256, 128)].into_iter(),
-            |_| false,
-        );
+        let plan =
+            plan_share_group_restore([ONSCREEN, (16777217, true, 256, 128)].into_iter(), |_| {
+                false
+            });
         assert_eq!(
             plan.offscreen,
             vec![OffscreenRestore {

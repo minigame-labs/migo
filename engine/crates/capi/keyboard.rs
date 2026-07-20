@@ -11,11 +11,11 @@ use core::send_command_to_host;
 use shared::protocol::host_cmd::HostCommand;
 
 use crate::{
-    abi::{
-        guard, validate_header, MigoResult, VersionedHeader, MIGO_ERROR_INTERNAL,
-        MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE, MIGO_ERROR_WOULD_BLOCK, MIGO_OK,
-    },
     MigoSession,
+    abi::{
+        MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE,
+        MIGO_ERROR_WOULD_BLOCK, MIGO_OK, MigoResult, VersionedHeader, guard, validate_header,
+    },
 };
 
 /// `MIGO_KEYBOARD_EVENT_*` from `include/migo/input.h`.
@@ -105,9 +105,7 @@ pub struct MigoCompositionEvent {
 ///
 /// # Safety
 /// `data_utf8` must point at `data_length` readable bytes.
-unsafe fn to_composition_command(
-    event: &MigoCompositionEvent,
-) -> Result<HostCommand, MigoResult> {
+unsafe fn to_composition_command(event: &MigoCompositionEvent) -> Result<HostCommand, MigoResult> {
     // Read before the type is matched so an unknown type and an unreadable
     // string are told apart rather than both surfacing as the first failure.
     let data = unsafe { copy_utf8_with_length(event.data_utf8, event.data_length) }?;
@@ -248,9 +246,9 @@ pub unsafe extern "C" fn migo_session_send_key_event(
         let Some(session) = (unsafe { session.as_ref() }) else {
             return MIGO_ERROR_INVALID_ARGUMENT;
         };
-        if let Err(error) = unsafe {
-            validate_header(event as *const VersionedHeader, size_of::<MigoKeyEvent>())
-        } {
+        if let Err(error) =
+            unsafe { validate_header(event as *const VersionedHeader, size_of::<MigoKeyEvent>()) }
+        {
             return error;
         }
         let event = unsafe { &*event };
@@ -382,7 +380,10 @@ mod tests {
         ];
         for (kind, data) in cases {
             let event = composition_event(kind, data);
-            match (kind, unsafe { to_composition_command(&event) }.expect("well-formed")) {
+            match (
+                kind,
+                unsafe { to_composition_command(&event) }.expect("well-formed"),
+            ) {
                 (MIGO_COMPOSITION_EVENT_START, HostCommand::OnCompositionStart { data: got }) => {
                     assert_eq!(got, data)
                 }
@@ -465,7 +466,11 @@ mod tests {
         for (kind, expect_down) in [(MIGO_KEY_EVENT_DOWN, true), (MIGO_KEY_EVENT_UP, false)] {
             let event = key_event(kind, "a", "KeyA");
             match unsafe { to_key_command(&event) }.expect("well-formed") {
-                HostCommand::OnKeyDown { key, code, timestamp_ms } => {
+                HostCommand::OnKeyDown {
+                    key,
+                    code,
+                    timestamp_ms,
+                } => {
                     assert!(expect_down, "a down arm produced an up command");
                     assert_eq!(key, "a");
                     assert_eq!(code, "KeyA");

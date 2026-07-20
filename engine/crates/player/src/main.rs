@@ -18,16 +18,12 @@ mod x11_window;
 
 use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
-use core::{send_command_to_host, shutdown_host, spawn_host_thread, PlatformServices};
+use core::{PlatformServices, send_command_to_host, shutdown_host, spawn_host_thread};
 use platform::desktop::platform::DesktopPlatform;
 use platform::desktop::presenter::{
-    linux_graphics_platform, linux_x11_graphics_platform, LinuxOffscreenSurface, LinuxX11Surface,
+    LinuxOffscreenSurface, LinuxX11Surface, linux_graphics_platform, linux_x11_graphics_platform,
 };
-use shared::{
-    config::InitOptions,
-    protocol::host_cmd::HostCommand,
-    surface::SurfaceRef,
-};
+use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceRef};
 
 use x11_window::X11Window;
 
@@ -60,10 +56,7 @@ fn main() {
         .unwrap_or_else(|| {
             PathBuf::from("/home/xg/wkspace/migo-bench/shells/migo-shell/app/src/main/assets/game")
         });
-    let secs: u64 = positional
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
+    let secs: u64 = positional.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
 
     if let Err(err) = run(&bundle_dir, secs, windowed) {
         tracing::error!("player failed: {err}");
@@ -79,7 +72,11 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     let code_cache_dir = root.join("code-cache");
 
     // Deploy the game bundle into files_dir/migo/games/<id>/code/.
-    let code_dir = files_dir.join("migo").join("games").join(GAME_ID).join("code");
+    let code_dir = files_dir
+        .join("migo")
+        .join("games")
+        .join(GAME_ID)
+        .join("code");
     std::fs::create_dir_all(&code_dir).map_err(|e| format!("mkdir code_dir: {e}"))?;
     for name in ["game.json", "game.js"] {
         let src = bundle_dir.join(name);
@@ -106,11 +103,7 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     // thread holds an EGL surface built from its handles, so it is dropped only
     // after `shutdown_host` below.
     let mut window = if windowed {
-        Some(X11Window::open(
-            "migo-player",
-            SURFACE_W,
-            SURFACE_H,
-        )?)
+        Some(X11Window::open("migo-player", SURFACE_W, SURFACE_H)?)
     } else {
         None
     };
@@ -118,7 +111,8 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     let (surface, graphics_platform) = match window.as_ref() {
         Some(window) => {
             let (width, height) = window.size();
-            let surface: SurfaceRef = Arc::new(LinuxX11Surface::new(window.window(), width, height));
+            let surface: SurfaceRef =
+                Arc::new(LinuxX11Surface::new(window.window(), width, height));
             let platform = linux_x11_graphics_platform(window.display())
                 .map_err(|e| format!("x11 graphics platform: {e:?}"))?;
             (surface, platform)
@@ -134,8 +128,8 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
 
     let mode = if windowed { "x11 window" } else { "offscreen" };
     tracing::info!("spawning host thread ({SURFACE_W}x{SURFACE_H} {mode})");
-    let host_id =
-        spawn_host_thread(surface, graphics_platform, host_kit, opt).map_err(|e| format!("spawn_host_thread: {e:?}"))?;
+    let host_id = spawn_host_thread(surface, graphics_platform, host_kit, opt)
+        .map_err(|e| format!("spawn_host_thread: {e:?}"))?;
     tracing::info!("host {host_id} spawned; loading game");
 
     send_command_to_host(
@@ -224,11 +218,14 @@ fn write_png(
         let src = &frame.rgba_bottom_up[(h - 1 - y) * stride..(h - y) * stride];
         top_down[y * stride..(y + 1) * stride].copy_from_slice(src);
     }
-    let file = std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    let file =
+        std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.width, frame.height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header().map_err(|e| format!("png header: {e}"))?;
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| format!("png header: {e}"))?;
     writer
         .write_image_data(&top_down)
         .map_err(|e| format!("png data: {e}"))?;
