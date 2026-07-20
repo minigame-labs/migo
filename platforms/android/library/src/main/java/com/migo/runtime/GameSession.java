@@ -22,6 +22,7 @@ import com.migo.runtime.internal.ThreadCheck;
 import com.migo.runtime.internal.TouchEventHandler;
 import com.migo.runtime.internal.VsyncScheduler;
 import com.migo.runtime.internal.platform.AudioFocusManager;
+import com.migo.runtime.internal.platform.DisplayCompat;
 
 import java.io.Closeable;
 import java.io.File;
@@ -73,7 +74,10 @@ import java.util.concurrent.atomic.AtomicReference;
  *
  * <h3>Thread Safety</h3>
  * <p>
- * This class is thread-safe. Methods can be called from any thread.
+ * Session state and asynchronous native callbacks are thread-safe. Methods
+ * that interact with Android UI objects are main-thread confined and enforce
+ * that contract: game start, lifecycle transitions, Surface replacement,
+ * touch dispatch, and {@link #close()}.
  *
  */
 public final class GameSession implements Closeable {
@@ -83,6 +87,7 @@ public final class GameSession implements Closeable {
     private final int sessionId;
     private final String gameId;
     private final RuntimeConfig config;
+    private final Context context;
     private final GamePaths paths;
     private final TouchEventHandler touchHandler;
     private final AudioFocusManager audioFocusManager;
@@ -120,6 +125,7 @@ public final class GameSession implements Closeable {
         this.sessionId = sessionId;
         this.gameId = gameId;
         this.config = config;
+        this.context = context;
         this.paths = new GamePaths(config, gameId);
         this.touchHandler = new TouchEventHandler(config.getDisplayDensity());
         this.audioFocusManager = BuildConfig.MIGO_API_MEDIA ? new AudioFocusManager(sessionId, context) : null;
@@ -531,8 +537,10 @@ public final class GameSession implements Closeable {
             if (state.get() == SessionState.DESTROYED) return;
             Log.i(TAG, "updateSurface: session=" + sessionId + ", valid=" + surface.isValid()
                     + ", size=" + width + "x" + height);
+            final float density = DisplayCompat.getDensity(context);
+            touchHandler.updateDensity(density);
             hasLiveSurface = surface.isValid();
-            NativeMethods.updateSurface(sessionId, surface, width, height);
+            NativeMethods.updateSurface(sessionId, surface, width, height, density);
             vsyncScheduler.setSurfaceReady(hasLiveSurface);
 
             // Auto-attach debug overlay as a WindowManager panel on first surface update.
@@ -647,17 +655,22 @@ public final class GameSession implements Closeable {
 
     /**
      * Dispatch a touch event to the game.
+     * <p>
+     * This method must be called synchronously on the main thread while the
+     * {@link MotionEvent} is valid. That is the thread used by Android Views
+     * and gives the reusable direct input buffer a single writer without a
+     * monitor on the 60-120 Hz input path.
      *
      * @param event The MotionEvent from the view
      * @return true if the event was handled
+     * @throws IllegalStateException if called off the main thread
      */
     public boolean dispatchTouchEvent(MotionEvent event) {
+        ThreadCheck.ensureMainThread();
         if (event == null) return false;
-        synchronized (lock) {
-            if (state.get() == SessionState.DESTROYED) return false;
-            touchHandler.dispatch(sessionId, event);
-            return true;
-        }
+        if (state.get() == SessionState.DESTROYED) return false;
+        touchHandler.dispatch(sessionId, event);
+        return true;
     }
 
     // ==================== Callback ====================

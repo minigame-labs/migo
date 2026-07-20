@@ -1,6 +1,12 @@
 use std::fmt;
 
-use shared::surface::{SurfaceGeneration, SurfaceLease};
+use shared::{
+    error::{EngineError, EngineResult, ErrorCode},
+    surface::{
+        PublicSurfaceGeneration, SurfaceGeneration, SurfaceLease, SurfaceReleaseDisposition,
+        SurfaceReleaseTransactionError, release_retired_resource,
+    },
+};
 
 /// EGL recreation policy derived before native-window extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +140,35 @@ pub(crate) fn run_surface_recreate<T>(
     }
 }
 
+/// Apply a direct render-control release without ever dropping the installed
+/// native resource before EGL teardown succeeds.
+pub(crate) fn release_surface_binding(
+    binding: &mut RenderSurfaceBinding,
+    generation: SurfaceGeneration,
+    teardown: impl FnOnce() -> EngineResult<()>,
+) -> EngineResult<SurfaceReleaseDisposition> {
+    if binding.pending.is_some() {
+        return Err(EngineError::new(ErrorCode::InvalidOperation)
+            .with_msg("cannot release Surface during recreate transaction"));
+    }
+
+    release_retired_resource(
+        &mut binding.current,
+        generation,
+        SurfaceLease::generation,
+        SurfaceLease::is_live,
+        teardown,
+    )
+    .map_err(|error| match error {
+        SurfaceReleaseTransactionError::GenerationStillLive => {
+            EngineError::new(ErrorCode::InvalidOperation)
+                .with_msg("render release requested for a live Surface generation")
+                .with_detail(format!("generation={}", generation.get()))
+        }
+        SurfaceReleaseTransactionError::Teardown(error) => error,
+    })
+}
+
 /// Classify a failed onscreen install without inferring native ownership from
 /// an error code. A referenced candidate remains retained unless cleanup
 /// explicitly proved that its EGL objects were released.
@@ -205,6 +240,11 @@ impl RenderSurfaceBinding {
     #[inline]
     pub(crate) fn generation(&self) -> Option<SurfaceGeneration> {
         self.current.as_ref().map(SurfaceLease::generation)
+    }
+
+    #[inline]
+    pub(crate) fn public_generation(&self) -> Option<PublicSurfaceGeneration> {
+        self.current.as_ref().map(SurfaceLease::public_generation)
     }
 
     pub(crate) fn pending_generation(&self) -> Option<SurfaceGeneration> {
@@ -284,6 +324,32 @@ impl RenderSurfaceBinding {
         self.pending = None;
         self.current = None;
     }
+
+    /// Permanently retain native ownership when EGL teardown produced no proof
+    /// that the driver released its references.
+    ///
+    /// This is a fail-safe terminal path: leaking one retired native target is
+    /// preferable to returning it to a host while an EGL implementation may
+    /// still dereference it. No allocation is used here, so the path remains
+    /// safe during OOM/panic cleanup as well.
+    pub(crate) fn quarantine_after_failed_egl_teardown(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            std::mem::forget(pending);
+        }
+        if let Some(current) = self.current.take() {
+            std::mem::forget(current);
+        }
+    }
+}
+
+impl Drop for RenderSurfaceBinding {
+    fn drop(&mut self) {
+        // Every proven-success path clears explicitly. Reaching Drop with a
+        // lease means unwind or an unhandled terminal path interrupted EGL
+        // teardown, so fail closed instead of guessing that native ownership
+        // is safe to return.
+        self.quarantine_after_failed_egl_teardown();
+    }
 }
 
 impl Default for RenderSurfaceBinding {
@@ -301,12 +367,14 @@ mod tests {
 
     use shared::surface::{
         Surface, SurfaceGenerationGate, SurfaceLease, SurfaceLivenessToken, SurfaceRef,
+        SurfaceReleasePhase,
     };
 
     use super::{
         CandidateCleanup, CandidateLeaseDisposition, InstallPhase, PresentationDisposition,
         RecreateKind, RenderSurfaceBinding, SurfaceBindingError, SurfaceInstallFailure,
-        SurfaceRecreateError, install_failure_disposition, run_surface_recreate,
+        SurfaceRecreateError, install_failure_disposition, release_surface_binding,
+        run_surface_recreate,
     };
 
     const RENDER_THREAD: &str = include_str!("render_thread.rs");
@@ -465,6 +533,23 @@ mod tests {
 
         binding.clear_after_egl_teardown();
         assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn dropping_without_egl_release_proof_quarantines_native_ownership() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let lease = lease(gate.attach_or_update().unwrap(), 1, &drops);
+        let mut binding = RenderSurfaceBinding::new();
+        binding.commit(lease);
+
+        drop(binding);
+
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            0,
+            "an unproven EGL teardown must never return the native resource"
+        );
     }
 
     #[test]
@@ -712,7 +797,7 @@ mod tests {
             .find(".preflight(&lease)")
             .expect("generation preflight must be explicit before platform preparation");
         let prepare = helper
-            .find(".prepare_surface(")
+            .find(".prepare_surface_for_lease(")
             .expect("platform preparation must remain on the attach cold path");
         let transaction = helper
             .find("run_surface_recreate(")
@@ -758,6 +843,12 @@ mod tests {
         assert!(teardown.contains("drop(self.upload_thread.take())"));
         assert!(teardown.contains("self.egl.shutdown()"));
         assert!(
+            teardown.contains("windows_explicitly_released || display_terminated"),
+            "native ownership needs an explicit-surface or display-termination proof"
+        );
+        assert!(teardown.contains("self.native_release_confirmed"));
+        assert!(teardown.contains("self.quarantine_prepared_native_targets()"));
+        assert!(
             teardown.find("self.egl.shutdown()").unwrap()
                 < teardown.find("self.installed_surface = None").unwrap(),
             "the native target must remain retained through final EGL display teardown"
@@ -766,6 +857,24 @@ mod tests {
         let drop_body = function_body(CANVAS_MANAGER, "fn drop(&mut self)");
         assert!(drop_body.contains("catch_unwind"));
         assert!(drop_body.contains("self.destroy_all()"));
+        assert!(drop_body.contains("!self.native_release_confirmed"));
+        assert!(drop_body.contains("self.quarantine_prepared_native_targets()"));
+    }
+
+    #[test]
+    fn render_owner_releases_native_lease_only_with_teardown_proof() {
+        let teardown = function_body(RENDER_THREAD, "fn destroy_render_owner");
+        let proof = teardown
+            .find("if cm.destroy_all()")
+            .expect("CanvasManager must supply the native-release proof");
+        let release = teardown
+            .find("render_binding.clear_after_egl_teardown()")
+            .expect("the proven branch must release the render lease");
+        let quarantine = teardown
+            .find("render_binding.quarantine_after_failed_egl_teardown()")
+            .expect("the unproven branch must quarantine the render lease");
+
+        assert!(proof < release && release < quarantine);
     }
 
     #[test]
@@ -774,6 +883,143 @@ mod tests {
         assert!(detach.contains("if let Err(error) = self.egl.destroy_surface"));
         assert!(detach.contains("self.canvases.insert(id, entry)"));
         assert!(detach.contains("eglDestroySurface(onscreen) failed"));
+    }
+
+    #[test]
+    fn live_egl_fast_paths_keep_the_installed_platform_target() {
+        let create = function_body(CANVAS_MANAGER, "pub(crate) fn create_onscreen");
+        let skip_start = create
+            .find("InstallPolicy::Skip")
+            .expect("skip policy must exist");
+        let resize_start = create
+            .find("InstallPolicy::FastResize")
+            .expect("fast-resize policy must exist");
+        let full_start = create
+            .find("Validate the client API")
+            .expect("full recreation must follow the fast paths");
+        let skip = &create[skip_start..resize_start];
+        let resize = &create[resize_start..full_start];
+
+        assert!(
+            !skip.contains("self.installed_surface = Some(target)"),
+            "Skip must discard the candidate while EGL retains the installed target"
+        );
+        assert!(
+            resize.contains("installed.reconfigure_from(target.as_ref())"),
+            "FastResize must reconfigure the installed target in place"
+        );
+        assert!(
+            !resize.contains("self.installed_surface = Some(target)"),
+            "FastResize must not replace a target still referenced by EGL"
+        );
+    }
+
+    #[test]
+    fn matching_retired_binding_releases_only_after_egl_teardown_succeeds() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let lease = lease(gate.attach_or_update().unwrap(), 1, &drops);
+        let generation = lease.generation();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let release = lease
+            .prepare_release(Arc::clone(&pending), None)
+            .unwrap()
+            .commit();
+        let mut binding = RenderSurfaceBinding::new();
+        binding.commit(lease);
+        gate.retire_current().unwrap();
+
+        let disposition = release_surface_binding(&mut binding, generation, || {
+            assert_eq!(release.phase(), SurfaceReleasePhase::Pending);
+            assert_eq!(drops.load(Ordering::Acquire), 0);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            disposition,
+            shared::surface::SurfaceReleaseDisposition::Released
+        );
+        assert_eq!(binding.generation(), None);
+        assert_eq!(release.phase(), SurfaceReleasePhase::Released);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn failed_egl_teardown_retains_binding_and_release_stays_pending() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let lease = lease(gate.attach_or_update().unwrap(), 1, &drops);
+        let generation = lease.generation();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let release = lease
+            .prepare_release(Arc::clone(&pending), None)
+            .unwrap()
+            .commit();
+        let mut binding = RenderSurfaceBinding::new();
+        binding.commit(lease);
+        gate.retire_current().unwrap();
+
+        let error = release_surface_binding(&mut binding, generation, || {
+            Err(shared::error::EngineError::new(
+                shared::error::ErrorCode::RenderBackendError,
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, shared::error::ErrorCode::RenderBackendError);
+        assert_eq!(binding.generation(), Some(generation));
+        assert_eq!(release.phase(), SurfaceReleasePhase::Pending);
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+
+        binding.clear_after_egl_teardown();
+        assert_eq!(release.phase(), SurfaceReleasePhase::Released);
+    }
+
+    #[test]
+    fn stale_release_never_tears_down_a_newer_live_binding() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let first = lease(gate.attach_or_update().unwrap(), 1, &drops);
+        let first_generation = first.generation();
+        gate.retire_current().unwrap();
+        let second = lease(gate.attach_or_update().unwrap(), 2, &drops);
+        let second_generation = second.generation();
+        let mut binding = RenderSurfaceBinding::new();
+        binding.commit(second);
+
+        let disposition = release_surface_binding(&mut binding, first_generation, || {
+            panic!("a stale release must not touch a newer EGLSurface")
+        })
+        .unwrap();
+
+        assert_eq!(
+            disposition,
+            shared::surface::SurfaceReleaseDisposition::Superseded
+        );
+        assert_eq!(binding.generation(), Some(second_generation));
+        assert!(binding.is_live());
+        drop(first);
+    }
+
+    #[test]
+    fn release_without_an_installed_binding_is_idempotent() {
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let generation = gate.attach_or_update().unwrap().generation();
+        gate.retire_current().unwrap();
+        let mut binding = RenderSurfaceBinding::new();
+
+        let disposition = release_surface_binding(&mut binding, generation, || {
+            panic!("no EGL teardown exists when no binding is installed")
+        })
+        .unwrap();
+
+        assert_eq!(
+            disposition,
+            shared::surface::SurfaceReleaseDisposition::AlreadyAbsent
+        );
     }
 
     #[test]

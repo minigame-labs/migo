@@ -7,52 +7,24 @@
 //! physical key is a discrete press of an identified key. Content reads the two
 //! through different listeners.
 
-use core::send_command_to_host;
 use shared::protocol::host_cmd::HostCommand;
 
 use crate::{
     MigoSession,
-    abi::{
-        MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE,
-        MIGO_ERROR_WOULD_BLOCK, MIGO_OK, MigoResult, VersionedHeader, guard, validate_header,
-    },
+    abi::{MIGO_ERROR_INVALID_ARGUMENT, MigoResult, guard},
+    map_ingress_result, pin_session,
 };
 
-/// `MIGO_KEYBOARD_EVENT_*` from `include/migo/input.h`.
-const MIGO_KEYBOARD_EVENT_INPUT: u32 = 0;
-const MIGO_KEYBOARD_EVENT_CONFIRM: u32 = 1;
-const MIGO_KEYBOARD_EVENT_COMPLETE: u32 = 2;
-const MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE: u32 = 3;
+use migo_capi_abi::input::{
+    MIGO_COMPOSITION_EVENT_END, MIGO_COMPOSITION_EVENT_START, MIGO_COMPOSITION_EVENT_UPDATE,
+    MIGO_KEY_EVENT_DOWN, MIGO_KEY_EVENT_UP, MIGO_KEYBOARD_EVENT_COMPLETE,
+    MIGO_KEYBOARD_EVENT_CONFIRM, MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE, MIGO_KEYBOARD_EVENT_INPUT,
+    ValidatedCompositionEvent, ValidatedKeyEvent, ValidatedKeyboardEvent,
+};
+pub use migo_capi_abi::input::{MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent};
 
-#[repr(C)]
-pub struct MigoKeyboardEvent {
-    pub(crate) header: VersionedHeader,
-    pub(crate) event_type: u32,
-    pub(crate) value_length: u32,
-    pub(crate) value_utf8: *const std::os::raw::c_char,
-    pub(crate) height_css_px: f64,
-}
-
-/// Copy a length-delimited UTF-8 value from the host.
-///
-/// `abi::copy_utf8` cannot serve here: it derives the length by scanning for a
-/// NUL, and this contract lets a host supply a buffer that has none. Scanning
-/// one of those reads past the host's allocation.
-///
-/// # Safety
-/// `value` must point at `length` readable bytes.
-unsafe fn copy_utf8_with_length(
-    value: *const std::os::raw::c_char,
-    length: u32,
-) -> Result<String, MigoResult> {
-    if value.is_null() {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(value as *const u8, length as usize) };
-    std::str::from_utf8(bytes)
-        .map(str::to_owned)
-        .map_err(|_| MIGO_ERROR_INVALID_ARGUMENT)
-}
+#[cfg(test)]
+use crate::abi::MIGO_ERROR_INVALID_STATE;
 
 /// Translate a validated event into the engine's command.
 ///
@@ -61,60 +33,34 @@ unsafe fn copy_utf8_with_length(
 /// becomes the right engine command or the wrong one, and the entry point's
 /// state checks cannot tell those apart.
 ///
-/// # Safety
-/// For a text event, `event.value_utf8` must point at `event.value_length`
-/// readable bytes.
-unsafe fn to_host_command(event: &MigoKeyboardEvent) -> Result<HostCommand, MigoResult> {
-    match event.event_type {
-        MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE => {
-            // NaN or a negative height would reach content's layout arithmetic
-            // and there is no later event that repairs it.
-            if !event.height_css_px.is_finite() || event.height_css_px < 0.0 {
-                return Err(MIGO_ERROR_INVALID_ARGUMENT);
-            }
-            Ok(HostCommand::OnKeyboardHeightChange {
-                height: event.height_css_px,
-            })
-        }
-        kind => {
-            let value = unsafe { copy_utf8_with_length(event.value_utf8, event.value_length) }?;
-            match kind {
-                MIGO_KEYBOARD_EVENT_INPUT => Ok(HostCommand::OnKeyboardInput { value }),
-                MIGO_KEYBOARD_EVENT_CONFIRM => Ok(HostCommand::OnKeyboardConfirm { value }),
-                MIGO_KEYBOARD_EVENT_COMPLETE => Ok(HostCommand::OnKeyboardComplete { value }),
-                _ => Err(MIGO_ERROR_INVALID_ARGUMENT),
-            }
+fn validated_keyboard_to_command(event: ValidatedKeyboardEvent) -> HostCommand {
+    match event {
+        ValidatedKeyboardEvent::Input(value) => HostCommand::OnKeyboardInput { value },
+        ValidatedKeyboardEvent::Confirm(value) => HostCommand::OnKeyboardConfirm { value },
+        ValidatedKeyboardEvent::Complete(value) => HostCommand::OnKeyboardComplete { value },
+        ValidatedKeyboardEvent::HeightChange(height) => {
+            HostCommand::OnKeyboardHeightChange { height }
         }
     }
 }
 
-/// `MIGO_COMPOSITION_EVENT_*` from `include/migo/input.h`.
-const MIGO_COMPOSITION_EVENT_START: u32 = 0;
-const MIGO_COMPOSITION_EVENT_UPDATE: u32 = 1;
-const MIGO_COMPOSITION_EVENT_END: u32 = 2;
-
-#[repr(C)]
-pub struct MigoCompositionEvent {
-    pub(crate) header: VersionedHeader,
-    pub(crate) event_type: u32,
-    pub(crate) data_length: u32,
-    pub(crate) data_utf8: *const std::os::raw::c_char,
+/// Testable composition of pure boundary validation and command conversion.
+unsafe fn to_host_command(event: &MigoKeyboardEvent) -> Result<HostCommand, MigoResult> {
+    unsafe { event.validate() }.map(validated_keyboard_to_command)
 }
 
 /// Translate a validated composition event into the engine's command.
 ///
-/// # Safety
-/// `data_utf8` must point at `data_length` readable bytes.
-unsafe fn to_composition_command(event: &MigoCompositionEvent) -> Result<HostCommand, MigoResult> {
-    // Read before the type is matched so an unknown type and an unreadable
-    // string are told apart rather than both surfacing as the first failure.
-    let data = unsafe { copy_utf8_with_length(event.data_utf8, event.data_length) }?;
-    match event.event_type {
-        MIGO_COMPOSITION_EVENT_START => Ok(HostCommand::OnCompositionStart { data }),
-        MIGO_COMPOSITION_EVENT_UPDATE => Ok(HostCommand::OnCompositionUpdate { data }),
-        MIGO_COMPOSITION_EVENT_END => Ok(HostCommand::OnCompositionEnd { data }),
-        _ => Err(MIGO_ERROR_INVALID_ARGUMENT),
+fn validated_composition_to_command(event: ValidatedCompositionEvent) -> HostCommand {
+    match event {
+        ValidatedCompositionEvent::Start(data) => HostCommand::OnCompositionStart { data },
+        ValidatedCompositionEvent::Update(data) => HostCommand::OnCompositionUpdate { data },
+        ValidatedCompositionEvent::End(data) => HostCommand::OnCompositionEnd { data },
     }
+}
+
+unsafe fn to_composition_command(event: &MigoCompositionEvent) -> Result<HostCommand, MigoResult> {
+    unsafe { event.validate() }.map(validated_composition_to_command)
 }
 
 /// Deliver one IME composition event to the session's content.
@@ -129,54 +75,26 @@ pub unsafe extern "C" fn migo_session_send_composition_event(
     event: *const MigoCompositionEvent,
 ) -> MigoResult {
     guard("migo_session_send_composition_event", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
-        };
-        if let Err(error) = unsafe {
-            validate_header(
-                event as *const VersionedHeader,
-                size_of::<MigoCompositionEvent>(),
-            )
-        } {
-            return error;
-        }
-        let event = unsafe { &*event };
-
-        let command = match unsafe { to_composition_command(event) } {
-            Ok(command) => command,
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
             Err(error) => return error,
         };
-        let host = match attached_host(session) {
-            Ok(host) => host,
+        let command = match unsafe { MigoCompositionEvent::parse(event) } {
+            Ok(event) => validated_composition_to_command(event),
+            Err(error) => return error,
+        };
+        let ingress = match session.active_ingress() {
+            Ok(ingress) => ingress,
             Err(error) => return error,
         };
 
         // A dropped END leaves content drawing a preedit that will never be
         // cleared, and no later event corrects it.
-        match send_command_to_host(host, command) {
-            Ok(()) => MIGO_OK,
-            Err(error) => {
-                tracing::debug!("migo_session_send_composition_event: not delivered: {error}");
-                MIGO_ERROR_WOULD_BLOCK
-            }
-        }
+        map_ingress_result(
+            "migo_session_send_composition_event",
+            ingress.try_send(command),
+        )
     })
-}
-
-/// `MIGO_KEY_EVENT_*` from `include/migo/input.h`.
-const MIGO_KEY_EVENT_DOWN: u32 = 0;
-const MIGO_KEY_EVENT_UP: u32 = 1;
-
-#[repr(C)]
-pub struct MigoKeyEvent {
-    pub(crate) header: VersionedHeader,
-    pub(crate) event_type: u32,
-    pub(crate) key_length: u32,
-    pub(crate) key_utf8: *const std::os::raw::c_char,
-    pub(crate) code_utf8: *const std::os::raw::c_char,
-    pub(crate) code_length: u32,
-    pub(crate) reserved0: u32,
-    pub(crate) timestamp_ms: f64,
 }
 
 /// Translate a validated physical-key event into the engine's command.
@@ -184,51 +102,31 @@ pub struct MigoKeyEvent {
 /// # Safety
 /// `key_utf8` and `code_utf8` must each point at their announced number of
 /// readable bytes.
-unsafe fn to_key_command(event: &MigoKeyEvent) -> Result<HostCommand, MigoResult> {
-    if event.event_type != MIGO_KEY_EVENT_DOWN && event.event_type != MIGO_KEY_EVENT_UP {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-    if !event.timestamp_ms.is_finite() {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-    // An empty `key` is legitimate -- a dead key produces no text -- but `code`
-    // always identifies a physical key, so an empty one means the host has not
-    // filled it in rather than that the key has no identity.
-    let key = unsafe { copy_utf8_with_length(event.key_utf8, event.key_length) }?;
-    let code = unsafe { copy_utf8_with_length(event.code_utf8, event.code_length) }?;
-    if code.is_empty() {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-
-    let timestamp_ms = event.timestamp_ms;
-    Ok(if event.event_type == MIGO_KEY_EVENT_DOWN {
-        HostCommand::OnKeyDown {
+fn validated_key_to_command(event: ValidatedKeyEvent) -> HostCommand {
+    match event {
+        ValidatedKeyEvent::Down {
             key,
             code,
             timestamp_ms,
-        }
-    } else {
-        HostCommand::OnKeyUp {
+        } => HostCommand::OnKeyDown {
             key,
             code,
             timestamp_ms,
-        }
-    })
+        },
+        ValidatedKeyEvent::Up {
+            key,
+            code,
+            timestamp_ms,
+        } => HostCommand::OnKeyUp {
+            key,
+            code,
+            timestamp_ms,
+        },
+    }
 }
 
-/// The session's live host, or the reason there is not one.
-///
-/// Shared by both entry points so the state checks cannot drift: reporting
-/// success with nothing attached would tell a host its event was delivered when
-/// there is no content to deliver it to.
-pub(crate) fn attached_host(session: &MigoSession) -> Result<i32, MigoResult> {
-    let Ok(state) = session.state.lock() else {
-        return Err(MIGO_ERROR_INTERNAL);
-    };
-    if !state.attached {
-        return Err(MIGO_ERROR_INVALID_STATE);
-    }
-    state.host.ok_or(MIGO_ERROR_INVALID_STATE)
+unsafe fn to_key_command(event: &MigoKeyEvent) -> Result<HostCommand, MigoResult> {
+    unsafe { event.validate() }.map(validated_key_to_command)
 }
 
 /// Deliver one physical key press or release to the session's content.
@@ -243,34 +141,22 @@ pub unsafe extern "C" fn migo_session_send_key_event(
     event: *const MigoKeyEvent,
 ) -> MigoResult {
     guard("migo_session_send_key_event", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
-        };
-        if let Err(error) =
-            unsafe { validate_header(event as *const VersionedHeader, size_of::<MigoKeyEvent>()) }
-        {
-            return error;
-        }
-        let event = unsafe { &*event };
-
-        let command = match unsafe { to_key_command(event) } {
-            Ok(command) => command,
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
             Err(error) => return error,
         };
-        let host = match attached_host(session) {
-            Ok(host) => host,
+        let command = match unsafe { MigoKeyEvent::parse(event) } {
+            Ok(event) => validated_key_to_command(event),
+            Err(error) => return error,
+        };
+        let ingress = match session.active_ingress() {
+            Ok(ingress) => ingress,
             Err(error) => return error,
         };
 
         // A dropped UP leaves content believing the key is still held, and no
         // later event corrects it.
-        match send_command_to_host(host, command) {
-            Ok(()) => MIGO_OK,
-            Err(error) => {
-                tracing::debug!("migo_session_send_key_event: not delivered: {error}");
-                MIGO_ERROR_WOULD_BLOCK
-            }
-        }
+        map_ingress_result("migo_session_send_key_event", ingress.try_send(command))
     })
 }
 
@@ -286,49 +172,38 @@ pub unsafe extern "C" fn migo_session_send_keyboard_event(
     event: *const MigoKeyboardEvent,
 ) -> MigoResult {
     guard("migo_session_send_keyboard_event", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
+            Err(error) => return error,
         };
-        if let Err(error) = unsafe {
-            validate_header(
-                event as *const VersionedHeader,
-                size_of::<MigoKeyboardEvent>(),
-            )
-        } {
-            return error;
-        }
-        let event = unsafe { &*event };
-
         // Validated before the session lock so a malformed event is rejected on
         // its own terms rather than reporting whatever the session state is.
-        let command = match unsafe { to_host_command(event) } {
-            Ok(command) => command,
+        let command = match unsafe { MigoKeyboardEvent::parse(event) } {
+            Ok(event) => validated_keyboard_to_command(event),
             Err(error) => return error,
         };
 
-        let host = match attached_host(session) {
-            Ok(host) => host,
+        let ingress = match session.active_ingress() {
+            Ok(ingress) => ingress,
             Err(error) => return error,
         };
 
         // Dropping a COMPLETE would leave content believing the keyboard is
         // still open, and no later event corrects that -- the same reason the
         // touch path refuses to drop an END.
-        match send_command_to_host(host, command) {
-            Ok(()) => MIGO_OK,
-            Err(error) => {
-                tracing::debug!("migo_session_send_keyboard_event: not delivered: {error}");
-                MIGO_ERROR_WOULD_BLOCK
-            }
-        }
+        map_ingress_result(
+            "migo_session_send_keyboard_event",
+            ingress.try_send(command),
+        )
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI};
+    use crate::abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI, VersionedHeader};
     use crate::test_support::with_session;
+    use std::mem::size_of;
 
     fn text_event(kind: u32, value: &str) -> MigoKeyboardEvent {
         MigoKeyboardEvent {

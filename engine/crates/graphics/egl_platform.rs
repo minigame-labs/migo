@@ -12,7 +12,7 @@ use std::{
 use khronos_egl as egl;
 use shared::{
     error::{EngineError, EngineResult, ErrorCode},
-    surface::Surface,
+    surface::{Surface, SurfaceLease, SurfaceResourceLease},
 };
 
 pub type EglInstance = egl::DynamicInstance<egl::EGL1_4>;
@@ -50,6 +50,20 @@ pub trait PreparedEglSurface: Debug + Send + Sync {
     /// Return false when concrete types differ or a downcast fails.
     fn same_native_surface(&self, other: &dyn PreparedEglSurface) -> bool;
 
+    /// Reconfigure this already-installed native target from an equivalent
+    /// candidate without replacing the object EGL references.
+    ///
+    /// Backends whose native target needs no explicit resize use this checked
+    /// default. Wayland overrides it to resize the unique `wl_egl_window`.
+    fn reconfigure_from(&self, candidate: &dyn PreparedEglSurface) -> EngineResult<()> {
+        if self.same_native_surface(candidate) {
+            Ok(())
+        } else {
+            Err(EngineError::new(ErrorCode::InvalidOperation)
+                .with_msg("cannot reconfigure from a different native Surface"))
+        }
+    }
+
     /// Repeatable native surface creation. Returning `Err` guarantees this
     /// call retained no newly-created EGL object.
     fn create_window_surface(
@@ -61,6 +75,53 @@ pub trait PreparedEglSurface: Debug + Send + Sync {
 }
 
 pub type PreparedEglSurfaceRef = Arc<dyn PreparedEglSurface>;
+
+/// Structural pairing between a prepared platform target and the attachment
+/// resource it may reach. Field order makes the native target drop before its
+/// final resource lease.
+struct ResourceBoundPreparedSurface {
+    inner: PreparedEglSurfaceRef,
+    _resource: SurfaceResourceLease,
+}
+
+impl Debug for ResourceBoundPreparedSurface {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResourceBoundPreparedSurface")
+            .field("inner", &self.inner)
+            .field("resource", &self._resource)
+            .finish()
+    }
+}
+
+impl PreparedEglSurface for ResourceBoundPreparedSurface {
+    fn backend_id(&self) -> GraphicsBackendId {
+        self.inner.backend_id()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        // Platform comparisons/downcasts intentionally see the concrete inner
+        // target, not this ownership-only wrapper.
+        self.inner.as_any()
+    }
+
+    fn same_native_surface(&self, other: &dyn PreparedEglSurface) -> bool {
+        self.inner.same_native_surface(other)
+    }
+
+    fn reconfigure_from(&self, candidate: &dyn PreparedEglSurface) -> EngineResult<()> {
+        self.inner.reconfigure_from(candidate)
+    }
+
+    fn create_window_surface(
+        &self,
+        egl: &EglInstance,
+        display: egl::Display,
+        config: egl::Config,
+    ) -> EngineResult<egl::Surface> {
+        self.inner.create_window_surface(egl, display, config)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct GraphicsPlatform {
@@ -110,6 +171,19 @@ impl GraphicsPlatform {
         let prepared = self.surface_factory.prepare(surface)?;
         self.validate_prepared(prepared.as_ref())?;
         Ok(prepared)
+    }
+
+    /// Prepare a platform target and structurally bind it to the native
+    /// resource lease before it can reach EGL.
+    pub fn prepare_surface_for_lease(
+        &self,
+        lease: &SurfaceLease,
+    ) -> EngineResult<PreparedEglSurfaceRef> {
+        let prepared = self.prepare_surface(lease.surface().as_ref())?;
+        Ok(Arc::new(ResourceBoundPreparedSurface {
+            inner: prepared,
+            _resource: lease.resource_lease(),
+        }))
     }
 
     pub fn validate_prepared(&self, prepared: &dyn PreparedEglSurface) -> EngineResult<()> {

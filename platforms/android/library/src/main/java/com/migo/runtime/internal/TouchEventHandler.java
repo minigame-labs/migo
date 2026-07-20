@@ -16,6 +16,8 @@ import java.nio.ByteOrder;
  *   <li>Early reject of unsupported action types</li>
  *   <li>Correct FLAG_CHANGED for multi-touch (all pointers for MOVE/CANCEL)</li>
  * </ul>
+ * Instances are confined to Android's main thread by {@code GameSession}.
+ * The direct buffer therefore has exactly one writer and needs no lock.
  *
  * @hide
  */
@@ -43,8 +45,9 @@ public final class TouchEventHandler {
      */
     public static final int FLAG_REMOVED = 2;
 
-    // Multiply is faster than divide; computed once in constructor.
-    private final float inverseDensity;
+    // Multiply is faster than divide. Both density updates and dispatch are
+    // main-thread confined, so ordinary field access is sufficient.
+    private float inverseDensity;
     private final ByteBuffer buffer;
 
     /**
@@ -53,9 +56,23 @@ public final class TouchEventHandler {
      * @param density Display density for coordinate scaling (physical → CSS pixels)
      */
     public TouchEventHandler(float density) {
-        this.inverseDensity = 1.0f / (density > 0 ? density : 1.0f);
+        updateDensity(density);
         this.buffer = ByteBuffer.allocateDirect(MAX_POINTERS * TOUCH_POINT_SIZE);
         this.buffer.order(ByteOrder.nativeOrder());
+    }
+
+    /**
+     * Update the physical-to-CSS conversion after a display/configuration move.
+     * Invalid platform values fail closed to 1 rather than poisoning every
+     * coordinate with NaN or infinity.
+     */
+    public void updateDensity(float density) {
+        final float validated = density > 0.0f
+                && !Float.isNaN(density)
+                && !Float.isInfinite(density)
+                ? density
+                : 1.0f;
+        inverseDensity = 1.0f / validated;
     }
 
     /**
@@ -134,8 +151,7 @@ public final class TouchEventHandler {
             buffer.putInt(event.getPointerId(i));
             buffer.putFloat(event.getX(i) * scale);
             buffer.putFloat(event.getY(i) * scale);
-            float pressure = event.getPressure(i);
-            buffer.putFloat(pressure > 0 ? pressure : 1.0f);
+            buffer.putFloat(TouchInputNormalizer.pressure(event.getPressure(i)));
             int flags = (!perPointer || i == actionIndex) ? FLAG_CHANGED : 0;
             if (cancel || (up && i == actionIndex)) {
                 flags |= FLAG_REMOVED;

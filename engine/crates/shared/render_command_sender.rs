@@ -146,7 +146,9 @@ impl RenderCommand {
             // responders; route them through the blocking sync
             // lane so the responder is guaranteed to arrive at
             // the render thread.
-            RenderCommand::Canvas(_) | RenderCommand::LoadFont { .. } => CommandClass::Sync,
+            RenderCommand::Canvas(_)
+            | RenderCommand::LoadFont { .. }
+            | RenderCommand::ReleaseOnscreen { .. } => CommandClass::Sync,
             RenderCommand::GetTextLineHeight { .. } => CommandClass::Sync,
 
             // Control plane — safe to race with shutdown.

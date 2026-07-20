@@ -62,7 +62,7 @@ const NATIVE_CORE: &[JniMethod] = methods![
     ("onShow", "(ILjava/lang/String;)V"),
     ("onHide", "(I)V"),
     ("onRestart", "(I)V"),
-    ("updateSurface", "(ILjava/lang/Object;II)V"),
+    ("updateSurface", "(ILjava/lang/Object;IIF)V"),
     ("onSurfaceDestroyed", "(I)V"),
     ("onTouchEvent", "(IIJILjava/nio/ByteBuffer;)V"),
     ("modMain", "(ILjava/lang/String;Ljava/lang/String;)I"),

@@ -1,19 +1,25 @@
 //! Platform services for a C host.
 //!
-//! The platform's own `PlatformServices` already provides device info and the
-//! frame clock; only the notification capability differs, because engine events have to reach C
-//! through the host's dispatcher instead of being dropped. Composing rather
-//! than reimplementing keeps that difference to exactly one trait — which is
-//! what the step-6 capability split was for.
+//! A C host is its own platform integration boundary. It must expose only the
+//! capabilities the host actually installed; forwarding Android's Java-backed
+//! services from a pure-native embedding would advertise a JVM that does not
+//! exist. Window information is the one always-available service because it is
+//! supplied directly by the versioned Surface descriptor.
 
-use core::services::KeyboardService;
+use core::services::{
+    CommerceServices, ConnectivityServices, KeyboardService, MediaServices, SensorServices,
+    SystemInfoService, SystemUtilServices,
+};
 use core::{DeviceServiceProvider, FrameClock, HostNotifier};
 use shared::protocol::error::ServiceError;
-use std::sync::Arc;
-
-use crate::platform::InnerPlatform;
+use shared::surface::{PixelRatio, SafeArea, WindowInfo};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicU32, AtomicU64, Ordering},
+};
 
 use crate::{
+    MigoSession,
     abi::MIGO_ERROR_INTERNAL,
     callbacks::{
         MIGO_KEYBOARD_CONFIRM_DONE, MIGO_KEYBOARD_CONFIRM_GO, MIGO_KEYBOARD_CONFIRM_NEXT,
@@ -77,13 +83,17 @@ fn show_options_from_json(options_json: &str) -> ShowOptions {
 }
 
 pub struct CapiHostKit {
-    inner: InnerPlatform,
     notifier: Option<Arc<Notifier>>,
+    device_services: Arc<CapiDeviceServices>,
+    session: Weak<MigoSession>,
 }
 
 impl CapiHostKit {
-    pub fn new(notifier: Option<Notifier>) -> Self {
-        let notifier = notifier.map(Arc::new);
+    pub fn new(
+        notifier: Option<Arc<Notifier>>,
+        session: Weak<MigoSession>,
+        window: Arc<CapiWindowState>,
+    ) -> Self {
         // Offered exactly when the host installed the callbacks -- never
         // because the platform claims a keyboard. On Android the platform's own
         // accessor claims one unconditionally and reaches a JVM a pure-native
@@ -98,9 +108,150 @@ impl CapiHostKit {
                 }) as Arc<dyn KeyboardService>
             });
         Self {
-            inner: InnerPlatform::with_host_keyboard(host_keyboard),
             notifier,
+            session,
+            device_services: Arc::new(CapiDeviceServices {
+                keyboard: host_keyboard,
+                window,
+            }),
         }
+    }
+}
+
+/// One coherent physical-window snapshot supplied by a C host.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CapiWindowMetrics {
+    width_pixels: u32,
+    height_pixels: u32,
+    pixel_ratio: PixelRatio,
+}
+
+impl CapiWindowMetrics {
+    #[inline]
+    pub(crate) const fn new(
+        width_pixels: u32,
+        height_pixels: u32,
+        pixel_ratio: PixelRatio,
+    ) -> Self {
+        Self {
+            width_pixels,
+            height_pixels,
+            pixel_ratio,
+        }
+    }
+}
+
+/// A single-writer seqlock for window metrics.
+///
+/// Surface transitions are serialized by `SessionControl`, while JS may query
+/// window information concurrently. Atomics avoid taking a platform lock from
+/// V8 and guarantee that width, height and DPR always come from one update.
+pub(crate) struct CapiWindowState {
+    sequence: AtomicU64,
+    width_pixels: AtomicU32,
+    height_pixels: AtomicU32,
+    pixel_ratio_bits: AtomicU32,
+}
+
+impl CapiWindowState {
+    pub(crate) fn new(metrics: CapiWindowMetrics) -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            width_pixels: AtomicU32::new(metrics.width_pixels),
+            height_pixels: AtomicU32::new(metrics.height_pixels),
+            pixel_ratio_bits: AtomicU32::new(metrics.pixel_ratio.get().to_bits()),
+        }
+    }
+
+    /// Publish all fields as one logical update and return the old snapshot so
+    /// a rejected command enqueue can roll the change back.
+    pub(crate) fn replace(&self, metrics: CapiWindowMetrics) -> CapiWindowMetrics {
+        let previous = self.snapshot();
+        let prior = self.sequence.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(prior & 1, 0, "C Surface updates must be serialized");
+        self.width_pixels
+            .store(metrics.width_pixels, Ordering::Relaxed);
+        self.height_pixels
+            .store(metrics.height_pixels, Ordering::Relaxed);
+        self.pixel_ratio_bits
+            .store(metrics.pixel_ratio.get().to_bits(), Ordering::Relaxed);
+        self.sequence.fetch_add(1, Ordering::Release);
+        previous
+    }
+
+    pub(crate) fn snapshot(&self) -> CapiWindowMetrics {
+        loop {
+            let before = self.sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let width_pixels = self.width_pixels.load(Ordering::Relaxed);
+            let height_pixels = self.height_pixels.load(Ordering::Relaxed);
+            let pixel_ratio_bits = self.pixel_ratio_bits.load(Ordering::Relaxed);
+            let after = self.sequence.load(Ordering::Acquire);
+            if before == after {
+                let pixel_ratio = PixelRatio::new(f32::from_bits(pixel_ratio_bits))
+                    .expect("CapiWindowState stores only validated ratios");
+                return CapiWindowMetrics {
+                    width_pixels,
+                    height_pixels,
+                    pixel_ratio,
+                };
+            }
+        }
+    }
+}
+
+struct CapiDeviceServices {
+    keyboard: Option<Arc<dyn KeyboardService>>,
+    window: Arc<CapiWindowState>,
+}
+
+impl SensorServices for CapiDeviceServices {}
+impl MediaServices for CapiDeviceServices {}
+impl ConnectivityServices for CapiDeviceServices {}
+impl CommerceServices for CapiDeviceServices {}
+
+impl SystemUtilServices for CapiDeviceServices {
+    fn keyboard(&self) -> Option<Arc<dyn KeyboardService>> {
+        self.keyboard.clone()
+    }
+
+    fn system_info(&self) -> Option<Arc<dyn SystemInfoService>> {
+        Some(Arc::new(CapiSystemInfo {
+            window: Arc::clone(&self.window),
+        }))
+    }
+}
+
+struct CapiSystemInfo {
+    window: Arc<CapiWindowState>,
+}
+
+impl SystemInfoService for CapiSystemInfo {
+    fn get_window_info_json(&self) -> Result<String, ServiceError> {
+        let metrics = self.window.snapshot();
+        let physical_width = metrics.width_pixels as f32;
+        let physical_height = metrics.height_pixels as f32;
+        let info = WindowInfo {
+            pixel_ratio: metrics.pixel_ratio.get(),
+            screen_width: physical_width,
+            screen_height: physical_height,
+            window_width: physical_width,
+            window_height: physical_height,
+            status_bar_height: 0.0,
+            screen_top: 0.0,
+            safe_area: SafeArea {
+                left: 0.0,
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+            },
+        }
+        .to_logical();
+        serde_json::to_string(&info)
+            .map_err(|error| ServiceError::system(format!("getWindowInfo:fail serialize: {error}")))
     }
 }
 
@@ -154,7 +305,8 @@ impl DeviceServiceProvider for CapiHostKit {
         &self,
         host_id: i32,
     ) -> Option<std::sync::Arc<dyn shared::services::DeviceServices>> {
-        self.inner.create_device_services(host_id)
+        let _ = host_id;
+        Some(self.device_services.clone())
     }
 }
 
@@ -187,21 +339,21 @@ impl FrameClock for CapiHostKit {
 
 impl HostNotifier for CapiHostKit {
     fn notify_game_ready(&self, host_id: i32) {
-        self.inner.notify_game_ready(host_id);
+        let _ = host_id;
         if let Some(notifier) = &self.notifier {
             notifier.ready();
         }
     }
 
     fn notify_exit(&self, host_id: i32) {
-        self.inner.notify_exit(host_id);
+        let _ = host_id;
         if let Some(notifier) = &self.notifier {
             notifier.exit_requested();
         }
     }
 
     fn notify_error(&self, host_id: i32, code: u16, msg: &str, detail: &str) {
-        self.inner.notify_error(host_id, code, msg, detail);
+        let _ = host_id;
         if let Some(notifier) = &self.notifier {
             // The engine's own code space is not the ABI's, so report a stable
             // ABI code and carry the engine's numbering in the message where a
@@ -214,11 +366,42 @@ impl HostNotifier for CapiHostKit {
             notifier.error(MIGO_ERROR_INTERNAL, text);
         }
     }
+
+    fn notify_surface_lost(
+        &self,
+        host_id: i32,
+        public_generation: shared::surface::PublicSurfaceGeneration,
+        reason: shared::surface::SurfaceLossReason,
+    ) {
+        let _ = host_id;
+        let generation = public_generation.get();
+        let Some(session) = self.session.upgrade() else {
+            return;
+        };
+        if !session.mark_surface_lost(generation, reason) {
+            return;
+        }
+        if let Some(notifier) = &self.notifier {
+            notifier.surface_lost(generation, reason.as_u32());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window(width: u32, height: u32, ratio: f32) -> Arc<CapiWindowState> {
+        Arc::new(CapiWindowState::new(CapiWindowMetrics::new(
+            width,
+            height,
+            PixelRatio::new(ratio).expect("valid test ratio"),
+        )))
+    }
+
+    fn session() -> Arc<MigoSession> {
+        crate::test_support::callback_session_pin()
+    }
 
     /// Every wx field must survive the trip into the C struct. A field dropped
     /// here is a keyboard that opens with the wrong type, or that loses the
@@ -233,7 +416,8 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     #[test]
     fn without_host_callbacks_no_keyboard_is_offered() {
-        let kit = CapiHostKit::new(None);
+        let session = session();
+        let kit = CapiHostKit::new(None, Arc::downgrade(&session), window(640, 480, 2.0));
         assert!(
             kit.create_device_services(1)
                 .and_then(|services| services.keyboard())
@@ -250,10 +434,10 @@ mod tests {
     #[test]
     fn installed_callbacks_reach_content_as_a_working_keyboard() {
         use crate::abi::{MIGO_ABI_VERSION_CURRENT, MIGO_OK};
-        use crate::callbacks::{HostCallbacks, MigoHostCallbacks, MigoKeyboardShowOptions};
+        use crate::callbacks::{MigoHostCallbacks, MigoKeyboardShowOptions};
+        use crate::test_support::callback_session_pin;
         use std::ffi::c_void;
-        use std::ptr::NonNull;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         static SHOWS: AtomicUsize = AtomicUsize::new(0);
 
@@ -297,15 +481,22 @@ mod tests {
             on_show_keyboard: Some(show),
             on_hide_keyboard: Some(hide),
             on_update_keyboard: Some(update),
+            on_surface_released: None,
         };
-        let notifier = Notifier::new(
-            unsafe { HostCallbacks::from_c(&raw) }.expect("all three verbs is valid"),
-            NonNull::new(0x1000usize as *mut c_void).expect("non-null session token"),
-            Arc::new(AtomicBool::new(true)),
-        );
+        let session = callback_session_pin();
+        let notifier = Arc::new(Notifier::new(
+            raw.validate()
+                .expect("all three verbs are valid")
+                .expect("dispatcher is configured"),
+            Arc::downgrade(&session),
+        ));
 
         SHOWS.store(0, Ordering::SeqCst);
-        let kit = CapiHostKit::new(Some(notifier));
+        let kit = CapiHostKit::new(
+            Some(notifier),
+            Arc::downgrade(&session),
+            window(640, 480, 2.0),
+        );
         let keyboard = kit
             .create_device_services(1)
             .and_then(|services| services.keyboard())
@@ -370,5 +561,71 @@ mod tests {
     fn an_out_of_range_max_length_falls_back_to_the_default() {
         let options = show_options_from_json(r#"{"maxLength":99999999999}"#);
         assert_eq!(options.max_length, WX_DEFAULT_MAX_LENGTH);
+    }
+
+    #[test]
+    fn window_info_is_logical_and_tracks_the_latest_surface_metrics() {
+        let state = window(1200, 800, 2.0);
+        let session = session();
+        let kit = CapiHostKit::new(None, Arc::downgrade(&session), Arc::clone(&state));
+        let system = kit
+            .create_device_services(1)
+            .and_then(|services| services.system_info())
+            .expect("a Surface descriptor always supplies window information");
+
+        let initial: serde_json::Value = serde_json::from_str(
+            &system
+                .get_window_info_json()
+                .expect("window JSON must serialize"),
+        )
+        .expect("valid JSON");
+        assert_eq!(initial["pixel_ratio"], 2.0);
+        assert_eq!(initial["window_width"], 600.0);
+        assert_eq!(initial["window_height"], 400.0);
+        assert_eq!(initial["safe_area"]["right"], 0.0);
+        assert_eq!(initial["safe_area"]["bottom"], 0.0);
+
+        state.replace(CapiWindowMetrics::new(
+            900,
+            600,
+            PixelRatio::new(1.5).expect("valid ratio"),
+        ));
+        let updated: serde_json::Value = serde_json::from_str(
+            &system
+                .get_window_info_json()
+                .expect("window JSON must serialize"),
+        )
+        .expect("valid JSON");
+        assert_eq!(updated["pixel_ratio"], 1.5);
+        assert_eq!(updated["window_width"], 600.0);
+        assert_eq!(updated["window_height"], 400.0);
+    }
+
+    #[test]
+    fn readers_never_observe_fields_from_different_window_updates() {
+        let state = window(100, 200, 1.0);
+        let writer_state = Arc::clone(&state);
+        let writer = std::thread::spawn(move || {
+            let a = CapiWindowMetrics::new(100, 200, PixelRatio::new(1.0).expect("valid ratio"));
+            let b = CapiWindowMetrics::new(300, 400, PixelRatio::new(2.0).expect("valid ratio"));
+            for index in 0..20_000 {
+                writer_state.replace(if index & 1 == 0 { a } else { b });
+            }
+        });
+
+        for _ in 0..20_000 {
+            let metrics = state.snapshot();
+            assert!(
+                metrics
+                    == CapiWindowMetrics::new(100, 200, PixelRatio::new(1.0).expect("valid ratio"),)
+                    || metrics
+                        == CapiWindowMetrics::new(
+                            300,
+                            400,
+                            PixelRatio::new(2.0).expect("valid ratio"),
+                        )
+            );
+        }
+        writer.join().expect("writer must finish");
     }
 }

@@ -69,6 +69,9 @@ pub(crate) struct JsBindings {
     // ---- WebGL context-loss lifecycle (webglcontextlost/restored) ----
     webgl_context_event_fn: Option<v8::Global<v8::Function>>,
 
+    // ---- Profile-neutral host focus adapter ----
+    focus_changed_fn: Option<v8::Global<v8::Function>>,
+
     // ---- Keyboard (soft keyboard + physical key events) ----
     keyboard_input_fn: Option<v8::Global<v8::Function>>,
     keyboard_height_change_fn: Option<v8::Global<v8::Function>>,
@@ -122,6 +125,7 @@ impl JsBindings {
             ble_mtu_change_fn: None,
             memory_warning_fn: None,
             webgl_context_event_fn: None,
+            focus_changed_fn: None,
             keyboard_input_fn: None,
             keyboard_height_change_fn: None,
             keyboard_confirm_fn: None,
@@ -271,6 +275,7 @@ impl JsBindings {
         // Resolved separately to avoid growing the tuple above; init-time only.
         let (
             webgl_context_event,
+            focus_changed,
             gamepad_connected,
             gamepad_disconnected,
             gamepad_state,
@@ -281,6 +286,7 @@ impl JsBindings {
             let bridge = resolve_host_bridge(scope, global);
             (
                 get_global_fn(scope, bridge, "_internalTriggerWebglContextEvent"),
+                get_global_fn(scope, bridge, "_internalTriggerFocusChanged"),
                 get_global_fn(scope, bridge, "_internalTriggerGamepadConnected"),
                 get_global_fn(scope, bridge, "_internalTriggerGamepadDisconnected"),
                 get_global_fn(scope, bridge, "_internalTriggerGamepadState"),
@@ -290,6 +296,7 @@ impl JsBindings {
             )
         });
         self.webgl_context_event_fn = webgl_context_event;
+        self.focus_changed_fn = focus_changed;
         self.gamepad_connected_fn = gamepad_connected;
         self.gamepad_disconnected_fn = gamepad_disconnected;
         self.gamepad_state_fn = gamepad_state;
@@ -779,6 +786,17 @@ impl JsBindings {
                 let args = [v8::String::new(scope, kind)
                     .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
                     .into()];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Update retained focus state and notify the selected profile adapter.
+    pub(crate) fn dispatch_focus_changed(&self, rt: &mut deno_core::JsRuntime, focused: bool) {
+        if let Some(func_g) = self.focus_changed_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::Boolean::new(scope, focused).into()];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);
             });

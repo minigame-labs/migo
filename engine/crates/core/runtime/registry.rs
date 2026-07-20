@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicI32, Ordering},
+        atomic::{AtomicI32, Ordering},
     },
 };
 
@@ -13,11 +13,109 @@ use tracing::{debug, warn};
 use shared::{
     host_channel::CriticalHostCommandSender,
     op_state::HostTx,
-    protocol::host_cmd::HostCommand,
-    surface::{SurfaceGeneration, SurfaceGenerationGate, SurfaceLease, SurfaceRef},
+    payload_pool::PayloadPool,
+    protocol::host_cmd::{GamepadState, HostCommand, TouchData},
+    surface::{
+        PublicSurfaceGeneration, SurfaceControl, SurfaceGeneration, SurfaceLease, SurfaceRef,
+        SurfaceResourceLease,
+    },
 };
 
 use crate::runtime::HostId;
+
+/// Pending normal commands allowed per Host. Payload pools carry one extra
+/// slot because the receiver releases a queue permit before it finishes
+/// processing the command it just removed.
+pub(crate) const HOST_NORMAL_COMMAND_CAPACITY: usize = 512;
+const HOST_PAYLOAD_POOL_CAPACITY: usize = HOST_NORMAL_COMMAND_CAPACITY + 1;
+
+/// Allocation-free error returned by a direct per-Session Host ingress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostIngressSendError {
+    Full,
+    Closed,
+}
+
+/// Cloneable data-plane handles captured once after Host startup.
+///
+/// Calls through this value never acquire the global Host/VSync registries.
+#[derive(Clone)]
+pub struct HostIngress {
+    host_id: HostId,
+    tx: HostTx,
+    vsync_tx: Option<crossbeam_channel::Sender<f64>>,
+    touch_pool: PayloadPool<TouchData>,
+    gamepad_pool: PayloadPool<GamepadState>,
+}
+
+impl HostIngress {
+    #[inline]
+    pub const fn host_id(&self) -> HostId {
+        self.host_id
+    }
+
+    #[inline]
+    pub fn try_send(&self, command: HostCommand) -> Result<(), HostIngressSendError> {
+        match self.tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                if let Some(stats) = shared::stats::get_stats(self.host_id) {
+                    stats.command_drops.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(HostIngressSendError::Full)
+            }
+            Err(TrySendError::Closed(_)) => Err(HostIngressSendError::Closed),
+        }
+    }
+
+    /// Enqueue a touch batch in a preallocated payload slot.
+    #[inline]
+    pub fn try_send_touch(&self, touch: TouchData) -> Result<(), HostIngressSendError> {
+        let payload = self.touch_pool.try_insert(touch).map_err(|_| {
+            self.record_command_drop();
+            HostIngressSendError::Full
+        })?;
+        self.try_send(HostCommand::OnTouch(payload))
+    }
+
+    /// Enqueue a gamepad sample in a preallocated payload slot.
+    #[inline]
+    pub fn try_send_gamepad_state(&self, state: GamepadState) -> Result<(), HostIngressSendError> {
+        let payload = self.gamepad_pool.try_insert(state).map_err(|_| {
+            self.record_command_drop();
+            HostIngressSendError::Full
+        })?;
+        self.try_send(HostCommand::OnGamepadState(payload))
+    }
+
+    #[inline]
+    fn record_command_drop(&self) {
+        if let Some(stats) = shared::stats::get_stats(self.host_id) {
+            stats.command_drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Deliver one externally paced frame timestamp. A Host without external
+    /// pacing deliberately has no sender, making this a harmless no-op.
+    #[inline]
+    pub fn try_send_vsync(&self, frame_time_ms: f64) -> Result<(), HostIngressSendError> {
+        let Some(tx) = &self.vsync_tx else {
+            return Ok(());
+        };
+        match tx.try_send(frame_time_ms) {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                if let Some(stats) = shared::stats::get_stats(self.host_id) {
+                    stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(HostIngressSendError::Full)
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                Err(HostIngressSendError::Closed)
+            }
+        }
+    }
+}
 
 static NEXT_HOST_ID: AtomicI32 = AtomicI32::new(1);
 
@@ -29,8 +127,9 @@ static NEXT_HOST_ID: AtomicI32 = AtomicI32::new(1);
 pub(crate) struct HostHandle {
     tx: HostTx,
     critical_tx: CriticalHostCommandSender,
-    shutdown: Arc<AtomicBool>,
-    surface_gate: Arc<SurfaceGenerationGate>,
+    surface_control: Arc<SurfaceControl>,
+    touch_pool: PayloadPool<TouchData>,
+    gamepad_pool: PayloadPool<GamepadState>,
 }
 
 static HOST_SENDERS: OnceLock<RwLock<HashMap<HostId, HostHandle>>> = OnceLock::new();
@@ -50,8 +149,7 @@ pub(crate) fn register_sender(
     id: HostId,
     tx: HostTx,
     critical_tx: CriticalHostCommandSender,
-    shutdown: Arc<AtomicBool>,
-    surface_gate: Arc<SurfaceGenerationGate>,
+    surface_control: Arc<SurfaceControl>,
 ) -> Option<HostHandle> {
     let mut map = host_senders().write();
     map.insert(
@@ -59,8 +157,9 @@ pub(crate) fn register_sender(
         HostHandle {
             tx,
             critical_tx,
-            shutdown,
-            surface_gate,
+            surface_control,
+            touch_pool: PayloadPool::new(HOST_PAYLOAD_POOL_CAPACITY),
+            gamepad_pool: PayloadPool::new(HOST_PAYLOAD_POOL_CAPACITY),
         },
     )
 }
@@ -75,43 +174,77 @@ pub(crate) fn unregister_sender(id: HostId) -> Option<HostHandle> {
 /// Pair a candidate Surface with the registered Host's current live
 /// generation. The registry lock is released before the lock-free gate
 /// transition and before the Surface lease is constructed.
-pub fn lease_surface(host_id: HostId, surface: SurfaceRef) -> Result<SurfaceLease, String> {
-    let (gate, shutdown) = {
+fn registered_surface_control(host_id: HostId) -> Result<Arc<SurfaceControl>, String> {
+    {
+        let map = host_senders().read();
+        map.get(&host_id)
+            .map(|handle| Arc::clone(&handle.surface_control))
+    }
+    .ok_or_else(|| {
+        debug!("surface control: host_id={host_id} not found (likely already shut down)");
+        format!("Cannot find host_id={host_id} Surface control")
+    })
+}
+
+/// Capture direct data-plane handles after Host initialization completes.
+pub fn host_ingress(host_id: HostId) -> Result<HostIngress, String> {
+    let (tx, touch_pool, gamepad_pool) = {
         let map = host_senders().read();
         map.get(&host_id).map(|handle| {
             (
-                Arc::clone(&handle.surface_gate),
-                Arc::clone(&handle.shutdown),
+                handle.tx.clone(),
+                handle.touch_pool.clone(),
+                handle.gamepad_pool.clone(),
             )
         })
     }
-    .ok_or_else(|| {
-        debug!("lease_surface: host_id={host_id} not found (likely already shut down)");
-        format!("Cannot find host_id={host_id} Surface generation gate")
-    })?;
+    .ok_or_else(|| format!("Cannot find host_id={host_id} ingress"))?;
 
-    if shutdown.load(Ordering::Acquire) {
-        return Err(format!(
-            "Cannot lease Surface for host_id={host_id}: host is shutting down"
-        ));
-    }
+    Ok(HostIngress {
+        host_id,
+        tx,
+        vsync_tx: crate::runtime::vsync::sender(host_id),
+        touch_pool,
+        gamepad_pool,
+    })
+}
 
-    let token = gate.attach_or_update().map_err(|error| {
+fn issue_surface_token(host_id: HostId) -> Result<shared::surface::SurfaceLivenessToken, String> {
+    let control = registered_surface_control(host_id)?;
+
+    control.attach_or_update().map_err(|error| {
         warn!("lease_surface: host_id={host_id} failed: {error}");
         format!("Cannot lease Surface for host_id={host_id}: {error}")
-    })?;
+    })
+}
 
-    // Close the race where shutdown begins after the first check but before
-    // attach_or_update. The candidate has not escaped yet, and retiring the
-    // current generation is correct for every concurrent shutdown contender.
-    if shutdown.load(Ordering::Acquire) {
-        gate.retire_current();
-        return Err(format!(
-            "Cannot lease Surface for host_id={host_id}: host is shutting down"
-        ));
-    }
-
+pub fn lease_surface(host_id: HostId, surface: SurfaceRef) -> Result<SurfaceLease, String> {
+    let token = issue_surface_token(host_id)?;
     Ok(SurfaceLease::new(surface, token))
+}
+
+/// Start a resource lifetime carrying the embedding host's public generation.
+pub fn lease_surface_tracked(
+    host_id: HostId,
+    surface: SurfaceRef,
+    public_generation: PublicSurfaceGeneration,
+) -> Result<SurfaceLease, String> {
+    let token = issue_surface_token(host_id)?;
+    Ok(SurfaceLease::new_tracked(surface, token, public_generation))
+}
+
+/// Build a same-attachment metrics update while retaining the original native
+/// resource lifetime and public generation.
+pub fn lease_surface_with_resource(
+    host_id: HostId,
+    surface: SurfaceRef,
+    resource: SurfaceResourceLease,
+) -> Result<SurfaceLease, String> {
+    let token = issue_surface_token(host_id)?;
+    SurfaceLease::with_resource(surface, token, resource).map_err(|error| {
+        warn!("lease_surface_with_resource: host_id={host_id} failed: {error}");
+        format!("Cannot update Surface for host_id={host_id}: {error}")
+    })
 }
 
 /// Synchronously retire the registered Host's current Surface generation.
@@ -120,17 +253,7 @@ pub fn lease_surface(host_id: HostId, surface: SurfaceRef) -> Result<SurfaceLeas
 /// `None` means the generation was already retired and no duplicate lifecycle
 /// command should be emitted.
 pub fn retire_surface(host_id: HostId) -> Result<Option<SurfaceGeneration>, String> {
-    let gate = {
-        let map = host_senders().read();
-        map.get(&host_id)
-            .map(|handle| Arc::clone(&handle.surface_gate))
-    }
-    .ok_or_else(|| {
-        debug!("retire_surface: host_id={host_id} not found (likely already shut down)");
-        format!("Cannot find host_id={host_id} Surface generation gate")
-    })?;
-
-    Ok(gate.retire_current())
+    Ok(registered_surface_control(host_id)?.retire_current_and_request())
 }
 
 pub fn send_command_to_host(host_id: HostId, cmd: HostCommand) -> Result<(), String> {
@@ -209,19 +332,18 @@ pub fn shutdown_host(id: HostId) -> Result<(), String> {
     // does not preempt a runaway synchronous JS section that never yields (an
     // inherent bound of the cooperative loop; the v8-limits ANR watchdog covers
     // that case), so this is not an instantaneous hard kill.
-    let (sender, surface_gate) = {
+    let (sender, surface_control) = {
         let map = host_senders().read();
         let Some(handle) = map.get(&id) else {
             // Already unregistered => the host is gone => shutdown goal achieved.
             debug!("shutdown_host: host_id={id} not found (already shut down)");
             return Ok(());
         };
-        handle.shutdown.store(true, Ordering::Release);
-        (handle.tx.clone(), Arc::clone(&handle.surface_gate))
+        (handle.tx.clone(), Arc::clone(&handle.surface_control))
     };
     // Queue-independent presentation barrier. This happens before the nudge
     // and before render join; late attach attempts observe shutdown and fail.
-    surface_gate.retire_current();
+    surface_control.shutdown();
     // Best-effort nudge so a host parked on `recv()` reacts immediately; if the
     // normal budget is full this send is dropped, but the flag above still stops
     // the loop when it next iterates.
@@ -231,7 +353,7 @@ pub fn shutdown_host(id: HostId) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use shared::surface::{Surface, SurfaceGenerationGate, SurfaceRef};
+    use shared::surface::{Surface, SurfaceControl, SurfaceRef};
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
@@ -273,10 +395,8 @@ mod tests {
 
     fn register_test_host(id: HostId) -> RegisteredHost {
         let (tx, critical_tx, _rx) = shared::host_channel::channel(1);
-        let gate = Arc::new(SurfaceGenerationGate::new());
-        assert!(
-            register_sender(id, tx, critical_tx, Arc::new(AtomicBool::new(false)), gate,).is_none()
-        );
+        let control = Arc::new(SurfaceControl::new());
+        assert!(register_sender(id, tx, critical_tx, control).is_none());
         RegisteredHost(id)
     }
 
@@ -333,16 +453,7 @@ mod tests {
     fn critical_commands_bypass_saturated_normal_budget_in_fifo_order() {
         let id = alloc_host_id();
         let (tx, critical_tx, mut rx) = shared::host_channel::channel(1);
-        assert!(
-            register_sender(
-                id,
-                tx,
-                critical_tx,
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(SurfaceGenerationGate::new()),
-            )
-            .is_none()
-        );
+        assert!(register_sender(id, tx, critical_tx, Arc::new(SurfaceControl::new()),).is_none());
         let _registration = RegisteredHost(id);
 
         send_command_to_host(id, HostCommand::Restart).unwrap();
@@ -356,5 +467,44 @@ mod tests {
             rx.try_recv(),
             Ok(HostCommand::OnShow { options_json: None })
         ));
+    }
+
+    #[test]
+    fn direct_touch_ingress_reuses_preallocated_payloads_and_preserves_backpressure() {
+        use shared::protocol::host_cmd::{TouchData, TouchPoint, TouchType};
+
+        fn touch(timestamp_ms: i64) -> TouchData {
+            TouchData {
+                touch_type: TouchType::Move,
+                count: 1,
+                points: [TouchPoint::default(); 10],
+                timestamp_ms,
+            }
+        }
+
+        let id = alloc_host_id();
+        let (tx, critical_tx, mut rx) = shared::host_channel::channel(1);
+        assert!(register_sender(id, tx, critical_tx, Arc::new(SurfaceControl::new())).is_none());
+        let _registration = RegisteredHost(id);
+        let ingress = host_ingress(id).expect("registered Host has direct ingress");
+
+        assert_eq!(ingress.try_send_touch(touch(1)), Ok(()));
+        assert_eq!(
+            ingress.try_send_touch(touch(2)),
+            Err(HostIngressSendError::Full)
+        );
+        match rx.try_recv() {
+            Ok(HostCommand::OnTouch(payload)) => assert_eq!(payload.timestamp_ms, 1),
+            other => panic!("unexpected first command: {other:?}"),
+        }
+
+        // Receiving and dropping the first command returns both its queue
+        // permit and its payload slot, so the same bounded resources work
+        // again without a heap fallback.
+        assert_eq!(ingress.try_send_touch(touch(3)), Ok(()));
+        match rx.try_recv() {
+            Ok(HostCommand::OnTouch(payload)) => assert_eq!(payload.timestamp_ms, 3),
+            other => panic!("unexpected reused command: {other:?}"),
+        }
     }
 }

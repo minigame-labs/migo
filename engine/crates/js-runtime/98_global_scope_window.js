@@ -137,6 +137,15 @@ const WindowGlobalScope = {
         appLifecycle._internalTriggerOnHide();
         timersInternal._internalSetTimerBackgrounded(true);
     }),
+    _internalTriggerFocusChanged: core.propNonEnumerable(
+        appLifecycle._internalTriggerFocusChanged,
+    ),
+    _internalInstallFocusAdapter: core.propNonEnumerable(
+        appLifecycle._internalInstallFocusAdapter,
+    ),
+    _internalGetFocusState: core.propNonEnumerable(
+        appLifecycle._internalGetFocusState,
+    ),
     onAddToFavorites: core.propNonEnumerable(appLifecycle.onAddToFavorites),
     offAddToFavorites: core.propNonEnumerable(appLifecycle.offAddToFavorites),
     _internalTriggerAddToFavorites: core.propNonEnumerable(appLifecycle._internalTriggerAddToFavorites),
@@ -172,10 +181,9 @@ const WindowGlobalScope = {
     _internalTriggerMouseUp: core.propNonEnumerable(mouseApi._internalTriggerMouseUp),
     _internalTriggerWheel: core.propNonEnumerable(mouseApi._internalTriggerWheel),
 
-    // Gamepad. wx has no gamepad API, so the shape is the Web one Migo
-    // replaces -- see input/04_gamepad.js. getGamepads is also installed on
-    // navigator by 99_main.js, which is where existing HTML5 content looks for
-    // it; these are the wx-namespace spelling of the same state.
+    // Gamepad transport for the HTML5 content adapter. wx has no gamepad API,
+    // so 97_wx_namespace.js exposes these names on `migo` only; the adapter
+    // maps them to navigator.getGamepads() and Window connection events.
     getGamepads: core.propNonEnumerable(gamepadApi.getGamepads),
     onGamepadConnected: core.propNonEnumerable(gamepadApi.onGamepadConnected),
     offGamepadConnected: core.propNonEnumerable(gamepadApi.offGamepadConnected),

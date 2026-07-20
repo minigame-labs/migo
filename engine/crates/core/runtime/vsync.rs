@@ -16,6 +16,12 @@ fn senders() -> &'static RwLock<HashMap<i32, Sender<f64>>> {
     VSYNC_SENDERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Clone one registered sender for a long-lived direct platform ingress.
+/// Registry lookup is intentionally a cold attach-time operation.
+pub(crate) fn sender(id: i32) -> Option<Sender<f64>> {
+    senders().read().get(&id).cloned()
+}
+
 /// Register a VSync sender for the given host_id.
 pub fn register_vsync_sender(id: i32, tx: Sender<f64>) {
     senders().write().insert(id, tx);

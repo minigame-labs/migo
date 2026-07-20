@@ -340,6 +340,7 @@ version = "0.1.0"
 dependencies = [
  "core",
  "graphics",
+ "migo-capi-abi",
  "platform",
  "serde_json",
  "shared",
@@ -1754,6 +1755,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "migo-capi-abi"
+version = "0.1.0"
+
+[[package]]
 name = "migo-snapshot-gen"
 version = "0.1.0"
 dependencies = [
@@ -2092,6 +2097,7 @@ dependencies = [
  "khronos-egl",
  "libloading",
  "ndk-context",
+ "parking_lot",
  "serde",
  "serde_json",
  "shared",

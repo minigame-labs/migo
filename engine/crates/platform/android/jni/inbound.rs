@@ -3,7 +3,7 @@
 use shared::js_escape::{HOST_BRIDGE_EXPR, build_eval_script};
 
 use std::borrow::Cow;
-use std::ffi::c_void;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -116,20 +116,20 @@ macro_rules! jni_json_callback {
         }
     };
 }
-use jni::sys::{jdouble, jint, jlong, jobject, jstring};
+use jni::sys::{jdouble, jfloat, jint, jlong, jobject, jstring};
 use jni::{JNIEnv, JavaVM};
 
 use tracing::{error, info};
 
 use core::{
-    lease_surface, retire_surface, send_command_to_host, send_critical_command_to_host,
-    shutdown_host, spawn_host_thread,
+    HostIngress, HostIngressSendError, host_ingress, lease_surface, retire_surface,
+    send_command_to_host, send_critical_command_to_host, shutdown_host, spawn_host_thread,
 };
 use shared::protocol::camera_frame::{PlaneWindow, pack_yuv_planes};
 use shared::protocol::host_cmd::{
     BleCharacteristicData, HostCommand, TouchData, TouchPoint, TouchType,
 };
-use shared::surface::SurfaceRef;
+use shared::surface::{PixelRatio, SurfaceRef};
 
 use shared::config::InitOptions;
 
@@ -141,6 +141,48 @@ use crate::android::surface::{
     ANativeWindow_fromSurface, ANativeWindow_getHeight, ANativeWindow_getWidth,
     ANativeWindow_release, ANativeWindow_setBuffersGeometry, AndroidSurfaceWrapper,
 };
+
+thread_local! {
+    /// Android touch and Choreographer callbacks normally share the UI thread.
+    /// Cache immutable per-Host ingress there so steady-state delivery takes
+    /// neither the global Host registry lock nor a payload allocation.
+    static HOT_INGRESS: RefCell<Option<HostIngress>> = const { RefCell::new(None) };
+}
+
+fn with_hot_ingress<R>(host_id: jint, operation: impl FnOnce(&HostIngress) -> R) -> Option<R> {
+    HOT_INGRESS.with(|slot| {
+        let needs_refresh = slot
+            .borrow()
+            .as_ref()
+            .is_none_or(|ingress| ingress.host_id() != host_id);
+        if needs_refresh {
+            let ingress = match host_ingress(host_id) {
+                Ok(ingress) => ingress,
+                Err(error) => {
+                    tracing::debug!("Host {host_id} hot ingress unavailable: {error}");
+                    return None;
+                }
+            };
+            *slot.borrow_mut() = Some(ingress);
+        }
+        let ingress = slot.borrow();
+        Some(operation(
+            ingress.as_ref().expect("hot ingress was just installed"),
+        ))
+    })
+}
+
+fn invalidate_hot_ingress(host_id: jint) {
+    HOT_INGRESS.with(|slot| {
+        if slot
+            .borrow()
+            .as_ref()
+            .is_some_and(|ingress| ingress.host_id() == host_id)
+        {
+            *slot.borrow_mut() = None;
+        }
+    });
+}
 
 /// Body of the Android `JNI_OnLoad` entry point.
 ///
@@ -209,13 +251,12 @@ pub(crate) extern "system" fn getMinApiLevel<'local>(
 ///   runtime load is needed; the Java wrapper may still call this
 ///   for uniform handling, and we return `true` immediately.
 ///
-/// * With `--no-default-features --features external_icudtl`:
-///   `icudtl.dat` is NOT embedded; Skia needs `SkLoadICU(path)`
-///   invoked once before the first text layout op.  The wiring of
-///   that Skia entry point is pending a profile-validated cutover
-///   (see CLAUDE.md); until then this path returns `false` so
-///   callers surface a clear "ICU bootstrap incomplete" signal
-///   instead of crashing inside SkParagraph.
+/// * When the selected graphics artifact does not embed ICU data:
+///   Skia needs `SkLoadICU(path)` invoked once before the first text
+///   layout op. The wiring of that Skia entry point is pending a
+///   profile-validated cutover (see CLAUDE.md); until then this path
+///   returns `false` so callers surface a clear "ICU bootstrap
+///   incomplete" signal instead of crashing inside SkParagraph.
 pub(crate) extern "system" fn initIcuData<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -224,7 +265,7 @@ pub(crate) extern "system" fn initIcuData<'local>(
     jni_safe!("initIcuData", jni::sys::JNI_FALSE, {
         // Fast path: embedded data.  We still read the string so
         // Java doesn't leak the local ref but ignore the value.
-        if cfg!(not(feature = "external_icudtl")) {
+        if graphics::EMBEDS_ICU_DATA {
             let _ = env.get_string(&icu_path);
             return jni::sys::JNI_TRUE;
         }
@@ -430,8 +471,13 @@ pub(crate) extern "system" fn updateSurface<'local>(
     surface: JObject<'local>,
     width: jint,
     height: jint,
+    density: jfloat,
 ) {
     jni_safe!("updateSurface", {
+        let Some(pixel_ratio) = PixelRatio::new(density) else {
+            error!("updateSurface failed: invalid display density {density}");
+            return;
+        };
         // NOTE: ANativeWindow_fromSurface creates a new ANativeWindow reference.
         let raw_surface = surface.into_raw();
         let window = unsafe { ANativeWindow_fromSurface(env.get_native_interface(), raw_surface) };
@@ -512,8 +558,13 @@ pub(crate) extern "system" fn updateSurface<'local>(
         // The generation gate is the queue-independent liveness authority. The
         // render thread validates the lease before native-handle extraction and
         // commits it only after EGL recreation succeeds.
-        if let Err(e) = send_critical_command_to_host(host_id, HostCommand::UpdateSurface { lease })
-        {
+        if let Err(e) = send_critical_command_to_host(
+            host_id,
+            HostCommand::UpdateSurface {
+                lease,
+                pixel_ratio: Some(pixel_ratio),
+            },
+        ) {
             error!("Failed to send UpdateSurface for host {host_id}: {e}");
         }
 
@@ -652,17 +703,28 @@ pub(crate) extern "system" fn onTouch(
             1 | 6 => TouchType::End,
             2 => TouchType::Move,
             3 => TouchType::Cancel,
-            _ => TouchType::Move,
+            _ => {
+                tracing::warn!("onTouch rejected unsupported action {action}");
+                return;
+            }
         };
 
-        let cmd = HostCommand::OnTouch(Box::new(TouchData {
+        let touch = TouchData {
             touch_type,
             count: n as u8,
             points,
             timestamp_ms: time as i64,
-        }));
+        };
 
-        let _ = send_command_to_host(host_id, cmd);
+        match with_hot_ingress(host_id, |ingress| ingress.try_send_touch(touch)) {
+            Some(Ok(())) => {}
+            Some(Err(HostIngressSendError::Full)) => {
+                tracing::debug!("Host {host_id} touch ingress is saturated");
+            }
+            Some(Err(HostIngressSendError::Closed)) | None => {
+                invalidate_hot_ingress(host_id);
+            }
+        }
     });
 }
 
@@ -738,6 +800,7 @@ pub(crate) extern "system" fn shutdown<'local>(
         } else {
             info!("Host {} shut down successfully", host_id);
         }
+        invalidate_hot_ingress(host_id);
     });
 }
 
@@ -1441,7 +1504,12 @@ pub(crate) extern "system" fn onVsync(
 ) {
     jni_safe!("onVsync", {
         let frame_time_ms = frame_time_nanos as f64 / 1_000_000.0;
-        core::send_vsync(host_id, frame_time_ms);
+        match with_hot_ingress(host_id, |ingress| ingress.try_send_vsync(frame_time_ms)) {
+            Some(Ok(()) | Err(HostIngressSendError::Full)) => {}
+            Some(Err(HostIngressSendError::Closed)) | None => {
+                invalidate_hot_ingress(host_id);
+            }
+        }
     });
 }
 

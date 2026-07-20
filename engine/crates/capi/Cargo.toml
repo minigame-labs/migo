@@ -20,6 +20,7 @@ profile-slim = ["core/profile-slim", "platform/profile-slim"]
 
 [dependencies]
 core = { path = "../core", default-features = false }
+migo-capi-abi = { path = "../capi-abi" }
 platform = { path = "../platform", default-features = false }
 shared = { path = "../shared", default-features = false }
 graphics = { path = "../graphics", default-features = false }

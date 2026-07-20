@@ -14,38 +14,23 @@
 use std::{
     ffi::{CString, c_void},
     os::raw::c_char,
-    ptr::NonNull,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Weak},
 };
 
-use crate::abi::{MIGO_ERROR_INVALID_ARGUMENT, MIGO_OK, MigoResult, VersionedHeader};
+use crate::{
+    MigoSession,
+    abi::{MIGO_OK, MigoResult, VersionedHeader},
+};
 
-pub type MigoTaskFn = unsafe extern "C" fn(*mut c_void);
-pub type MigoDispatchFn = unsafe extern "C" fn(*mut c_void, MigoTaskFn, *mut c_void) -> MigoResult;
-pub type MigoOnReadyFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
-pub type MigoOnErrorFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const MigoError);
-pub type MigoOnExitRequestedFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
-pub type MigoOnSurfaceLostFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32);
-pub type MigoOnRequestFrameFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
-pub type MigoOnShowKeyboardFn =
-    unsafe extern "C" fn(*mut c_void, *mut c_void, *const MigoKeyboardShowOptions);
-pub type MigoOnHideKeyboardFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
-pub type MigoOnUpdateKeyboardFn =
-    unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char, u32);
-
-/// Mirrors `MigoError` in `include/migo/types.h`.
-#[repr(C)]
-pub struct MigoError {
-    pub header: VersionedHeader,
-    pub code: MigoResult,
-    pub flags: u32,
-    pub message_utf8: *const c_char,
-    pub message_length: u32,
-    pub reserved0: u32,
-}
+// Some aliases are currently referenced only by host-facing tests, but keeping
+// the complete callback vocabulary together prevents signature drift.
+#[allow(unused_imports)]
+pub use migo_capi_abi::callbacks::{
+    MigoDispatchFn, MigoError, MigoHostCallbacks, MigoKeyboardShowOptions, MigoOnErrorFn,
+    MigoOnExitRequestedFn, MigoOnHideKeyboardFn, MigoOnReadyFn, MigoOnRequestFrameFn,
+    MigoOnShowKeyboardFn, MigoOnSurfaceLostFn, MigoOnSurfaceReleasedFn, MigoOnUpdateKeyboardFn,
+    MigoTaskFn, ValidatedHostCallbacks as HostCallbacks,
+};
 
 /// `MIGO_KEYBOARD_FLAG_*` from `include/migo/session.h`.
 pub const MIGO_KEYBOARD_FLAG_NONE: u32 = 0;
@@ -63,22 +48,6 @@ pub const MIGO_KEYBOARD_CONFIRM_SEND: u32 = 4;
 pub const MIGO_KEYBOARD_TYPE_TEXT: u32 = 0;
 pub const MIGO_KEYBOARD_TYPE_NUMBER: u32 = 1;
 
-/// Mirrors `MigoKeyboardShowOptions` in `include/migo/session.h`.
-///
-/// Borrowed for the duration of the callback, like `MigoError`. A host that
-/// needs the default value afterwards copies it.
-#[repr(C)]
-pub struct MigoKeyboardShowOptions {
-    pub header: VersionedHeader,
-    pub flags: u32,
-    pub max_length: u32,
-    pub confirm_type: u32,
-    pub keyboard_type: u32,
-    pub default_value_utf8: *const c_char,
-    pub default_value_length: u32,
-    pub reserved0: u32,
-}
-
 /// The engine-side owned form, which a queued task holds until it runs.
 ///
 /// The C struct borrows a pointer; a task that outlives the call that created
@@ -92,119 +61,13 @@ pub struct ShowOptions {
     pub default_value: String,
 }
 
-/// Mirrors `MigoHostCallbacks` in `include/migo/session.h`.
-#[repr(C)]
-pub struct MigoHostCallbacks {
-    pub header: VersionedHeader,
-    pub user_data: *mut c_void,
-    pub dispatcher_data: *mut c_void,
-    pub dispatch: Option<MigoDispatchFn>,
-    pub on_ready: Option<MigoOnReadyFn>,
-    pub on_error: Option<MigoOnErrorFn>,
-    pub on_exit_requested: Option<MigoOnExitRequestedFn>,
-    pub on_surface_lost: Option<MigoOnSurfaceLostFn>,
-    pub on_request_frame: Option<MigoOnRequestFrameFn>,
-    pub on_show_keyboard: Option<MigoOnShowKeyboardFn>,
-    pub on_hide_keyboard: Option<MigoOnHideKeyboardFn>,
-    pub on_update_keyboard: Option<MigoOnUpdateKeyboardFn>,
-}
-
-// SAFETY: every member is a `u32`, a raw pointer or an `Option<fn>`, all of
-// which are valid when zeroed -- a zeroed callback is `None`, which is exactly
-// what an older caller who never had the field meant.
-//
-// The minimum stops after `dispatch` because everything past it is an optional
-// callback, and `session.h` has promised since the frame-pacing slice that a
-// host omitting one simply does not get that behaviour. A host with a
-// dispatcher and no callbacks at all is a legitimate, if quiet, host.
-unsafe impl crate::abi::AbiStruct for MigoHostCallbacks {
-    const MINIMUM_SIZE: usize = 32;
-}
-
-/// The copy the session keeps.
-///
-/// Only the fields above are retained — never the caller's struct, which the
-/// ABI borrows for the duration of the call only.
-#[derive(Clone, Copy)]
-pub struct HostCallbacks {
-    user_data: *mut c_void,
-    dispatcher_data: *mut c_void,
-    dispatch: MigoDispatchFn,
-    on_ready: Option<MigoOnReadyFn>,
-    on_error: Option<MigoOnErrorFn>,
-    on_exit_requested: Option<MigoOnExitRequestedFn>,
-    on_surface_lost: Option<MigoOnSurfaceLostFn>,
-    on_request_frame: Option<MigoOnRequestFrameFn>,
-    on_show_keyboard: Option<MigoOnShowKeyboardFn>,
-    on_hide_keyboard: Option<MigoOnHideKeyboardFn>,
-    on_update_keyboard: Option<MigoOnUpdateKeyboardFn>,
-}
-
-// SAFETY: the pointers are opaque tokens owned by the host and are only ever
-// handed back to host-provided function pointers. The engine never
-// dereferences them, and the ABI requires the host to keep them valid for the
-// session's lifetime, so moving them between engine threads adds no aliasing.
-unsafe impl Send for HostCallbacks {}
-unsafe impl Sync for HostCallbacks {}
-
-impl HostCallbacks {
-    /// Copy and validate a caller-supplied callback set.
-    ///
-    /// # Safety
-    /// `callbacks` must point to a validated [`MigoHostCallbacks`].
-    pub unsafe fn from_c(callbacks: &MigoHostCallbacks) -> Result<Self, MigoResult> {
-        let has_callback = callbacks.on_ready.is_some()
-            || callbacks.on_error.is_some()
-            || callbacks.on_exit_requested.is_some()
-            || callbacks.on_surface_lost.is_some()
-            || callbacks.on_request_frame.is_some();
-        let Some(dispatch) = callbacks.dispatch else {
-            // Without a dispatcher there is nowhere safe to run host code.
-            return if has_callback {
-                Err(MIGO_ERROR_INVALID_ARGUMENT)
-            } else {
-                Err(MIGO_ERROR_INVALID_ARGUMENT)
-            };
-        };
-        // A host that can show a keyboard but not hide it strands it on screen
-        // with no event that corrects the state, so partial support is refused
-        // at install time -- while the host can still fix it.
-        let keyboard_verbs = callbacks.on_show_keyboard.is_some() as u8
-            + callbacks.on_hide_keyboard.is_some() as u8
-            + callbacks.on_update_keyboard.is_some() as u8;
-        if keyboard_verbs != 0 && keyboard_verbs != 3 {
-            return Err(MIGO_ERROR_INVALID_ARGUMENT);
-        }
-        Ok(Self {
-            user_data: callbacks.user_data,
-            dispatcher_data: callbacks.dispatcher_data,
-            dispatch,
-            on_ready: callbacks.on_ready,
-            on_error: callbacks.on_error,
-            on_exit_requested: callbacks.on_exit_requested,
-            on_surface_lost: callbacks.on_surface_lost,
-            on_request_frame: callbacks.on_request_frame,
-            on_show_keyboard: callbacks.on_show_keyboard,
-            on_hide_keyboard: callbacks.on_hide_keyboard,
-            on_update_keyboard: callbacks.on_update_keyboard,
-        })
-    }
-
-    /// Whether the host offered to service the soft keyboard.
-    ///
-    /// All three verbs are present or none are, enforced above, so testing one
-    /// is testing the set.
-    pub fn supplies_keyboard(&self) -> bool {
-        self.on_show_keyboard.is_some()
-    }
-}
-
 /// What a queued task should invoke once the dispatcher runs it.
 enum Event {
     Ready,
     ExitRequested,
     Error { code: MigoResult, message: CString },
     SurfaceLost { generation: u64, reason: u32 },
+    SurfaceReleased { generation: u64 },
     RequestFrame,
     ShowKeyboard { options: ShowOptions },
     HideKeyboard,
@@ -214,8 +77,9 @@ enum Event {
 /// Payload owned by a dispatched task until it runs.
 struct Task {
     callbacks: HostCallbacks,
-    session: *mut c_void,
-    alive: Arc<AtomicBool>,
+    /// Pins the public allocation across the complete callback, including a
+    /// reentrant successful `migo_session_destroy` from within that callback.
+    session: Arc<MigoSession>,
     event: Event,
 }
 
@@ -228,22 +92,28 @@ unsafe extern "C" fn run_task(context: *mut c_void) {
         return;
     }
     let task = unsafe { Box::from_raw(context as *mut Task) };
-    // The session may have been destroyed between queueing and running; the
-    // header promises queued callbacks are cancelled, and this is where that
-    // promise is kept.
-    if !task.alive.load(Ordering::Acquire) {
+    // Entry and destruction share one atomic linearization gate. The Task's Arc
+    // keeps the allocation alive, while the permit makes destroy wait if this
+    // callback won entry on another thread.
+    let Some(permit) = task.session.callback_gate.try_enter() else {
         return;
-    }
+    };
+    permit.run(|| invoke_task(&task));
+}
+
+/// Invoke one user callback after [`run_task`] has acquired callback admission.
+fn invoke_task(task: &Task) {
     let user_data = task.callbacks.user_data;
+    let session = Arc::as_ptr(&task.session).cast_mut().cast::<c_void>();
     match &task.event {
         Event::Ready => {
             if let Some(on_ready) = task.callbacks.on_ready {
-                unsafe { on_ready(user_data, task.session) };
+                unsafe { on_ready(user_data, session) };
             }
         }
         Event::ExitRequested => {
             if let Some(on_exit) = task.callbacks.on_exit_requested {
-                unsafe { on_exit(user_data, task.session) };
+                unsafe { on_exit(user_data, session) };
             }
         }
         Event::Error { code, message } => {
@@ -261,17 +131,22 @@ unsafe extern "C" fn run_task(context: *mut c_void) {
                     reserved0: 0,
                 };
                 // `message` outlives the call because `task` is dropped after.
-                unsafe { on_error(user_data, task.session, &error) };
+                unsafe { on_error(user_data, session, &error) };
             }
         }
         Event::SurfaceLost { generation, reason } => {
             if let Some(on_surface_lost) = task.callbacks.on_surface_lost {
-                unsafe { on_surface_lost(user_data, task.session, *generation, *reason) };
+                unsafe { on_surface_lost(user_data, session, *generation, *reason) };
+            }
+        }
+        Event::SurfaceReleased { generation } => {
+            if let Some(on_surface_released) = task.callbacks.on_surface_released {
+                unsafe { on_surface_released(user_data, session, *generation) };
             }
         }
         Event::RequestFrame => {
             if let Some(on_request_frame) = task.callbacks.on_request_frame {
-                unsafe { on_request_frame(user_data, task.session) };
+                unsafe { on_request_frame(user_data, session) };
             }
         }
         Event::ShowKeyboard { options } => {
@@ -291,12 +166,12 @@ unsafe extern "C" fn run_task(context: *mut c_void) {
                     reserved0: 0,
                 };
                 // `options` outlives the call because `task` is dropped after.
-                unsafe { on_show_keyboard(user_data, task.session, &c_options) };
+                unsafe { on_show_keyboard(user_data, session, &c_options) };
             }
         }
         Event::HideKeyboard => {
             if let Some(on_hide_keyboard) = task.callbacks.on_hide_keyboard {
-                unsafe { on_hide_keyboard(user_data, task.session) };
+                unsafe { on_hide_keyboard(user_data, session) };
             }
         }
         Event::UpdateKeyboard { value } => {
@@ -305,7 +180,7 @@ unsafe extern "C" fn run_task(context: *mut c_void) {
                 unsafe {
                     on_update_keyboard(
                         user_data,
-                        task.session,
+                        session,
                         bytes.as_ptr() as *const c_char,
                         bytes.len() as u32,
                     )
@@ -318,22 +193,12 @@ unsafe extern "C" fn run_task(context: *mut c_void) {
 /// Routes engine notifications to the host's callbacks.
 pub struct Notifier {
     callbacks: HostCallbacks,
-    session: NonNull<c_void>,
-    alive: Arc<AtomicBool>,
+    session: Weak<MigoSession>,
 }
 
-// SAFETY: as for `HostCallbacks` — the session pointer is an opaque token
-// handed back to the host, never dereferenced by the engine.
-unsafe impl Send for Notifier {}
-unsafe impl Sync for Notifier {}
-
 impl Notifier {
-    pub fn new(callbacks: HostCallbacks, session: NonNull<c_void>, alive: Arc<AtomicBool>) -> Self {
-        Self {
-            callbacks,
-            session,
-            alive,
-        }
+    pub fn new(callbacks: HostCallbacks, session: Weak<MigoSession>) -> Self {
+        Self { callbacks, session }
     }
 
     /// Hand one event to the host's dispatcher.
@@ -348,20 +213,34 @@ impl Notifier {
     /// because content that believes its keyboard is opening waits for input
     /// that will never arrive.
     fn post(&self, event: Event) -> bool {
-        if !self.alive.load(Ordering::Acquire) {
+        let Some(session) = self.session.upgrade() else {
             return false;
-        }
+        };
+        // `dispatch` is itself a call into host code and reads
+        // `dispatcher_data`. It therefore shares the same lifetime boundary as
+        // the eventual callback. Acquiring before materialising the task makes
+        // Session destruction wait for a dispatcher already in flight, while
+        // a dispatcher that has not entered before close is rejected without
+        // touching host-owned memory.
+        let Some(dispatch_permit) = session.callback_gate.try_enter() else {
+            return false;
+        };
         let task = Box::new(Task {
             callbacks: self.callbacks,
-            session: self.session.as_ptr(),
-            alive: Arc::clone(&self.alive),
+            // The stack-owned Arc above pins the gate until `dispatch`
+            // returns. The task needs a distinct pin because a dispatcher may
+            // either queue it or execute it synchronously; in the latter case
+            // a reentrant callback can destroy the public Session before this
+            // outer dispatch permit is dropped.
+            session: Arc::clone(&session),
             event,
         });
         let context = Box::into_raw(task) as *mut c_void;
         // SAFETY: `dispatch` came from the host and is called with the token it
         // supplied plus a task it must run exactly once.
-        let result =
-            unsafe { (self.callbacks.dispatch)(self.callbacks.dispatcher_data, run_task, context) };
+        let result = dispatch_permit.run(|| unsafe {
+            (self.callbacks.dispatch)(self.callbacks.dispatcher_data, run_task, context)
+        });
         if result != MIGO_OK {
             // Rejected: take the payload back and drop it, so the task neither
             // leaks nor runs.
@@ -428,15 +307,60 @@ impl Notifier {
         self.callbacks.on_request_frame.is_some()
     }
 
+    #[inline]
+    pub fn notifies_surface_release(&self) -> bool {
+        self.callbacks.on_surface_released.is_some()
+    }
+
     pub fn surface_lost(&self, generation: u64, reason: u32) {
         let _ = self.post(Event::SurfaceLost { generation, reason });
+    }
+
+    /// Wake a host that may now query a stored release object. The callback is
+    /// deliberately not the source of truth and may be rejected or canceled.
+    pub fn surface_released(&self, generation: u64) {
+        if self.callbacks.on_surface_released.is_some() {
+            let _ = self.post(Event::SurfaceReleased { generation });
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use crate::abi::MIGO_ERROR_INVALID_ARGUMENT;
+    use crate::{
+        migo_session_create, migo_session_destroy,
+        test_support::{callback_session_pin, session_config, with_engine},
+    };
+    use std::{
+        ops::Deref,
+        sync::{
+            Condvar, Mutex,
+            atomic::{AtomicI32, AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
+
+    struct TestNotifier {
+        notifier: Notifier,
+        session: Arc<MigoSession>,
+    }
+
+    impl Deref for TestNotifier {
+        type Target = Notifier;
+
+        fn deref(&self) -> &Self::Target {
+            &self.notifier
+        }
+    }
+
+    fn test_notifier(callbacks: HostCallbacks) -> TestNotifier {
+        let session = callback_session_pin();
+        let notifier = Notifier::new(callbacks, Arc::downgrade(&session));
+        TestNotifier { notifier, session }
+    }
 
     static READY_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DISPATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -446,6 +370,8 @@ mod tests {
     /// do is what makes their assertions mean what they say.
     static COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static LAST_ERROR_CODE: AtomicUsize = AtomicUsize::new(0);
+    static DESTROY_RESULT: AtomicI32 = AtomicI32::new(i32::MIN);
+    static QUEUED_TASK: std::sync::Mutex<Option<(MigoTaskFn, usize)>> = std::sync::Mutex::new(None);
 
     unsafe extern "C" fn inline_dispatch(
         _dispatcher: *mut c_void,
@@ -466,8 +392,50 @@ mod tests {
         MIGO_ERROR_INVALID_ARGUMENT
     }
 
+    unsafe extern "C" fn queued_dispatch(
+        _dispatcher: *mut c_void,
+        task: MigoTaskFn,
+        context: *mut c_void,
+    ) -> MigoResult {
+        *QUEUED_TASK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((task, context as usize));
+        MIGO_OK
+    }
+
+    struct BlockingDispatch {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    unsafe extern "C" fn blocking_dispatch(
+        dispatcher: *mut c_void,
+        _task: MigoTaskFn,
+        _context: *mut c_void,
+    ) -> MigoResult {
+        let dispatcher = unsafe { &*(dispatcher as *const BlockingDispatch) };
+        let mut state = dispatcher
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.0 = true;
+        dispatcher.changed.notify_all();
+        while !state.1 {
+            state = dispatcher
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        MIGO_ERROR_INVALID_ARGUMENT
+    }
+
     unsafe extern "C" fn on_ready(_user: *mut c_void, _session: *mut c_void) {
         READY_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn on_ready_destroy(_user: *mut c_void, session: *mut c_void) {
+        let result = unsafe { migo_session_destroy(session.cast::<MigoSession>()) };
+        DESTROY_RESULT.store(result, Ordering::SeqCst);
     }
 
     unsafe extern "C" fn on_error(
@@ -496,6 +464,7 @@ mod tests {
             on_show_keyboard: None,
             on_hide_keyboard: None,
             on_update_keyboard: None,
+            on_surface_released: None,
         }
     }
 
@@ -555,13 +524,14 @@ mod tests {
             on_show_keyboard: None,
             on_hide_keyboard: None,
             on_update_keyboard: None,
+            on_surface_released: None,
         }
     }
 
     fn keyboard_notifier(
         dispatch: MigoDispatchFn,
         on_show_keyboard: Option<MigoOnShowKeyboardFn>,
-    ) -> Notifier {
+    ) -> TestNotifier {
         let callbacks = HostCallbacks {
             user_data: std::ptr::null_mut(),
             dispatcher_data: std::ptr::null_mut(),
@@ -574,12 +544,9 @@ mod tests {
             on_show_keyboard,
             on_hide_keyboard: Some(noop_hide_keyboard),
             on_update_keyboard: Some(noop_update_keyboard),
+            on_surface_released: None,
         };
-        Notifier::new(
-            callbacks,
-            NonNull::new(0x1000usize as *mut c_void).expect("non-null session token"),
-            Arc::new(AtomicBool::new(true)),
-        )
+        test_notifier(callbacks)
     }
 
     /// Storage aligned like the real struct, so a short caller can be built
@@ -635,10 +602,11 @@ mod tests {
             "fields that client never had must read as absent, not as its neighbouring bytes"
         );
         assert!(
-            unsafe { HostCallbacks::from_c(&copied) }
+            !copied
+                .validate()
                 .expect("valid")
+                .expect("dispatcher is configured")
                 .supplies_keyboard()
-                == false
         );
     }
 
@@ -696,7 +664,10 @@ mod tests {
     #[test]
     fn keyboard_callbacks_install_all_or_none() {
         // None of the three: accepted, and the capability is not offered.
-        let copied = unsafe { HostCallbacks::from_c(&raw_callbacks()) }.expect("none is valid");
+        let copied = raw_callbacks()
+            .validate()
+            .expect("none is valid")
+            .expect("dispatcher is configured");
         assert!(!copied.supplies_keyboard());
 
         // Each one alone, then two of three: all partial, all refused.
@@ -717,7 +688,7 @@ mod tests {
             ("two of three", &two),
         ] {
             assert_eq!(
-                unsafe { HostCallbacks::from_c(partial) }.err(),
+                partial.validate().err(),
                 Some(MIGO_ERROR_INVALID_ARGUMENT),
                 "{name} must be refused"
             );
@@ -728,7 +699,10 @@ mod tests {
         all.on_show_keyboard = Some(noop_show_keyboard);
         all.on_hide_keyboard = Some(noop_hide_keyboard);
         all.on_update_keyboard = Some(noop_update_keyboard);
-        let copied = unsafe { HostCallbacks::from_c(&all) }.expect("all three is valid");
+        let copied = all
+            .validate()
+            .expect("all three is valid")
+            .expect("dispatcher is configured");
         assert!(copied.supplies_keyboard());
     }
 
@@ -778,12 +752,8 @@ mod tests {
         );
     }
 
-    fn notifier(dispatch: MigoDispatchFn, alive: Arc<AtomicBool>) -> Notifier {
-        Notifier::new(
-            callbacks(dispatch),
-            NonNull::new(0x1000usize as *mut c_void).expect("non-null session token"),
-            alive,
-        )
+    fn notifier(dispatch: MigoDispatchFn) -> TestNotifier {
+        test_notifier(callbacks(dispatch))
     }
 
     #[test]
@@ -793,7 +763,7 @@ mod tests {
         let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         READY_CALLS.store(0, Ordering::SeqCst);
         DISPATCH_CALLS.store(0, Ordering::SeqCst);
-        let notifier = notifier(inline_dispatch, Arc::new(AtomicBool::new(true)));
+        let notifier = notifier(inline_dispatch);
         notifier.ready();
         assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(READY_CALLS.load(Ordering::SeqCst), 1);
@@ -805,9 +775,13 @@ mod tests {
         // would be handed a session pointer it has already released.
         let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         READY_CALLS.store(0, Ordering::SeqCst);
-        let alive = Arc::new(AtomicBool::new(true));
-        let notifier = notifier(inline_dispatch, Arc::clone(&alive));
-        alive.store(false, Ordering::Release);
+        let notifier = notifier(inline_dispatch);
+        notifier
+            .session
+            .callback_gate
+            .close()
+            .expect("first close")
+            .wait();
         notifier.ready();
         assert_eq!(
             READY_CALLS.load(Ordering::SeqCst),
@@ -817,10 +791,107 @@ mod tests {
     }
 
     #[test]
+    fn a_task_accepted_before_close_is_canceled_when_it_starts_after_close() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        READY_CALLS.store(0, Ordering::SeqCst);
+        *QUEUED_TASK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        let notifier = notifier(queued_dispatch);
+
+        notifier.ready();
+        notifier
+            .session
+            .callback_gate
+            .close()
+            .expect("first close")
+            .wait();
+        let (task, context) = QUEUED_TASK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("dispatcher accepted one task");
+        unsafe { task(context as *mut c_void) };
+
+        assert_eq!(READY_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn close_waits_for_a_dispatch_call_already_inside_host_code() {
+        let dispatcher = BlockingDispatch {
+            state: Mutex::new((false, false)),
+            changed: Condvar::new(),
+        };
+        let mut installed = callbacks(blocking_dispatch);
+        installed.dispatcher_data = (&dispatcher as *const BlockingDispatch).cast_mut().cast();
+        let notifier = test_notifier(installed);
+        let (drained_tx, drained_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| notifier.ready());
+
+            let mut state = dispatcher
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            while !state.0 {
+                state = dispatcher
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+            drop(state);
+
+            let drain = notifier.session.callback_gate.close().expect("first close");
+            scope.spawn(move || {
+                drain.wait();
+                drained_tx.send(()).expect("signal drain");
+            });
+            assert!(
+                drained_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+                "destroy must not pass a dispatcher still using dispatcher_data",
+            );
+
+            let mut state = dispatcher
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.1 = true;
+            dispatcher.changed.notify_all();
+            drop(state);
+            drained_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("drain completes after dispatch returns");
+        });
+    }
+
+    #[test]
+    fn a_callback_can_destroy_its_session_and_the_task_pins_allocation_until_return() {
+        with_engine("callback-reentrant-destroy", |engine| {
+            let mut raw_session = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config(), &mut raw_session) },
+                MIGO_OK,
+            );
+            let session = unsafe { crate::pin_session(raw_session) }.expect("Session pin");
+            let mut installed = callbacks(inline_dispatch);
+            installed.on_ready = Some(on_ready_destroy);
+            let notifier = Notifier::new(installed, Arc::downgrade(&session));
+            DESTROY_RESULT.store(i32::MIN, Ordering::SeqCst);
+
+            notifier.ready();
+
+            assert_eq!(DESTROY_RESULT.load(Ordering::SeqCst), MIGO_OK);
+            assert!(!session.is_open());
+            assert_eq!(Arc::strong_count(&session), 1);
+        });
+    }
+
+    #[test]
     fn a_rejected_dispatch_drops_the_task_instead_of_leaking_or_running() {
         READY_CALLS.store(0, Ordering::SeqCst);
         DISPATCH_CALLS.store(0, Ordering::SeqCst);
-        let notifier = notifier(rejecting_dispatch, Arc::new(AtomicBool::new(true)));
+        let notifier = notifier(rejecting_dispatch);
         notifier.ready();
         assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(READY_CALLS.load(Ordering::SeqCst), 0);
@@ -831,7 +902,7 @@ mod tests {
     #[test]
     fn error_messages_are_delivered_as_readable_c_strings() {
         LAST_ERROR_CODE.store(0, Ordering::SeqCst);
-        let notifier = notifier(inline_dispatch, Arc::new(AtomicBool::new(true)));
+        let notifier = notifier(inline_dispatch);
         notifier.error(MIGO_ERROR_INVALID_ARGUMENT, "content failed to load");
         assert_eq!(LAST_ERROR_CODE.load(Ordering::SeqCst), 1);
     }
@@ -840,7 +911,7 @@ mod tests {
     fn interior_nul_messages_still_report_the_error() {
         // Losing the report entirely would be worse than losing the detail.
         LAST_ERROR_CODE.store(0, Ordering::SeqCst);
-        let notifier = notifier(inline_dispatch, Arc::new(AtomicBool::new(true)));
+        let notifier = notifier(inline_dispatch);
         notifier.error(MIGO_ERROR_INVALID_ARGUMENT, "bad\0message");
         assert_eq!(LAST_ERROR_CODE.load(Ordering::SeqCst), 1);
     }
@@ -850,9 +921,6 @@ mod tests {
         let mut raw = raw_callbacks();
         raw.dispatch = None;
         raw.on_ready = Some(on_ready);
-        assert_eq!(
-            unsafe { HostCallbacks::from_c(&raw) }.err(),
-            Some(MIGO_ERROR_INVALID_ARGUMENT)
-        );
+        assert_eq!(raw.validate().err(), Some(MIGO_ERROR_INVALID_ARGUMENT));
     }
 }

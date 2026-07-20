@@ -8,7 +8,7 @@ pub use crate::protocol::color::Color;
 
 use crate::error::{EngineError, ErrorCode};
 use crate::protocol::FramePacket;
-use crate::surface::{SurfaceGeneration, SurfaceLease};
+use crate::surface::{PixelRatio, SurfaceGeneration, SurfaceLease, SurfaceReleaseDisposition};
 
 pub type CanvasId = u32;
 pub type ImageId = u32;
@@ -303,6 +303,16 @@ pub enum RenderCommand {
         generation: SurfaceGeneration,
     },
 
+    /// Must-deliver native-lifetime control request.
+    ///
+    /// Production sends travel on `SurfaceControl`'s dedicated stream, outside
+    /// the bounded draw queue.  `diagnostic` is optional and must never be used
+    /// as the public release completion boundary.
+    ReleaseOnscreen {
+        generation: SurfaceGeneration,
+        diagnostic: Option<SyncResp<SurfaceReleaseDisposition>>,
+    },
+
     /// Trim the process-global text texture cache under OS memory
     /// pressure.  Routed to the render thread (rather than trimmed
     /// inline on the host like `io::image_cache`) because the cache
@@ -374,6 +384,9 @@ pub enum CanvasCmd {
 
     RecreateOnscreen {
         lease: SurfaceLease,
+        /// Transactional DPR update. The backend commits this only after the
+        /// Surface installation succeeds; `None` preserves the current value.
+        pixel_ratio: Option<PixelRatio>,
         resp: RenderCmdResp<()>,
     },
 

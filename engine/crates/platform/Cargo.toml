@@ -41,6 +41,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 khronos-egl = { workspace = true }
 libloading = "^0.8"
+parking_lot = { workspace = true }
 
 # On non-Android platforms, enable Rust-native implementations:
 # - zip-extract: Unzip via Rust `zip` crate (Android uses java.util.zip via JNI)

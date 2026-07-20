@@ -46,6 +46,7 @@ pub(super) struct EglRuntime {
     display: egl::Display,
     resource: Option<(egl::Context, Option<egl::Surface>)>,
     initialized: bool,
+    termination_confirmed: bool,
 }
 
 impl EglRuntime {
@@ -55,6 +56,7 @@ impl EglRuntime {
             display,
             resource: None,
             initialized: true,
+            termination_confirmed: false,
         }
     }
 
@@ -72,10 +74,16 @@ impl EglRuntime {
 
     /// Idempotent final display teardown. Callers must release every window
     /// and offscreen surface first; this method owns only the root pbuffer and
-    /// the final eglTerminate authority.
-    pub(super) fn shutdown(&mut self) {
+    /// the final `eglTerminate` authority.
+    ///
+    /// Returns `true` only when the driver confirms `eglTerminate`. A caller
+    /// may independently prove that a native window is releasable by having
+    /// successfully destroyed every EGLSurface that referenced it, but must
+    /// not infer that proof from this runtime merely becoming disarmed.
+    #[must_use]
+    pub(super) fn shutdown(&mut self) -> bool {
         if !self.initialized {
-            return;
+            return self.termination_confirmed;
         }
 
         // Disarm before calling driver code, and isolate each wrapper call.
@@ -103,9 +111,22 @@ impl EglRuntime {
                 let _ = instance.destroy_context(display, context);
             });
         }
-        ignore_driver_panic(&mut || {
-            let _ = instance.terminate(display);
-        });
+        let termination =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| instance.terminate(display)));
+        self.termination_confirmed = matches!(termination, Ok(Ok(())));
+        if !self.termination_confirmed {
+            match termination {
+                Ok(Err(error)) => tracing::error!(
+                    ?error,
+                    "eglTerminate failed; native Surface ownership cannot be released"
+                ),
+                Err(_) => tracing::error!(
+                    "eglTerminate panicked; native Surface ownership cannot be released"
+                ),
+                Ok(Ok(())) => unreachable!(),
+            }
+        }
+        self.termination_confirmed
     }
 }
 
@@ -119,7 +140,7 @@ impl std::ops::Deref for EglRuntime {
 
 impl Drop for EglRuntime {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 

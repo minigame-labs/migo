@@ -1,44 +1,30 @@
 //! Pointer input.
 //!
 //! One batched entry point mirroring the engine's `HostCommand::OnTouch`: the
-//! host's points are validated and copied once into the fixed inline array that
-//! `TouchData` already uses, which is the same path Android drives from
-//! `platform/android/jni/inbound.rs`. No allocation on the input path.
+//! host's points are validated and copied into fixed inline storage before any
+//! Session state is touched. Direct ingress then transfers that bounded value
+//! through the per-Host payload pool, so steady-state touch delivery performs
+//! no heap allocation and takes no Session mutex.
 
-use core::send_command_to_host;
-use shared::protocol::host_cmd::{HostCommand, TouchData, TouchPoint, TouchType};
+use std::mem::{align_of, offset_of, size_of};
+
+use shared::protocol::host_cmd::{TouchData, TouchPoint, TouchType};
 
 use crate::{
     MigoSession,
-    abi::{
-        MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE,
-        MIGO_ERROR_WOULD_BLOCK, MIGO_OK, MigoResult, VersionedHeader, guard, validate_header,
-    },
+    abi::{MIGO_ERROR_INVALID_ARGUMENT, MigoResult, guard},
+    map_ingress_result, pin_session,
 };
 
-/// `MIGO_TOUCH_*` from `include/migo/input.h`.
-const MIGO_TOUCH_START: u32 = 0;
-const MIGO_TOUCH_MOVE: u32 = 1;
-const MIGO_TOUCH_END: u32 = 2;
-const MIGO_TOUCH_CANCEL: u32 = 3;
+use migo_capi_abi::input::{
+    MIGO_TOUCH_CANCEL, MIGO_TOUCH_END, MIGO_TOUCH_MOVE, MIGO_TOUCH_START, ValidatedTouchEvent,
+};
+pub use migo_capi_abi::input::{MigoTouchEvent, MigoTouchPoint};
 
-/// `MIGO_TOUCH_FLAG_CHANGED` from `include/migo/input.h`. Mirrored for the tests
-/// and for readers; the flags are the host's to set, not the ABI's.
-#[allow(dead_code)]
-const MIGO_TOUCH_FLAG_CHANGED: u32 = 1 << 0;
-
-/// `MIGO_TOUCH_MAX_POINTS`; bounded by `TouchData::points`.
-const MIGO_TOUCH_MAX_POINTS: u32 = 10;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct MigoTouchPoint {
-    pub(crate) id: u32,
-    pub(crate) x: f32,
-    pub(crate) y: f32,
-    pub(crate) pressure: f32,
-    pub(crate) flags: u32,
-}
+#[cfg(test)]
+use crate::abi::MIGO_ERROR_INVALID_STATE;
+#[cfg(test)]
+use migo_capi_abi::input::MIGO_TOUCH_FLAG_CHANGED;
 
 // The C header asserts the same 20 bytes. Both assertions exist because a
 // silent mismatch would corrupt every touch rather than fail loudly.
@@ -48,17 +34,13 @@ pub struct MigoTouchPoint {
 // size, which would turn every coordinate into another field's bits while both
 // assertions still pass. `a_batch_arrives_with_every_field_in_place` checks the
 // layout the copy actually depends on.
-const _: () = assert!(size_of::<MigoTouchPoint>() == 20);
 const _: () = assert!(size_of::<MigoTouchPoint>() == size_of::<TouchPoint>());
-
-#[repr(C)]
-pub struct MigoTouchEvent {
-    pub(crate) header: VersionedHeader,
-    pub(crate) touch_type: u32,
-    pub(crate) point_count: u32,
-    pub(crate) timestamp_ms: i64,
-    pub(crate) points: *const MigoTouchPoint,
-}
+const _: () = assert!(align_of::<MigoTouchPoint>() == align_of::<TouchPoint>());
+const _: () = assert!(offset_of!(MigoTouchPoint, id) == offset_of!(TouchPoint, id));
+const _: () = assert!(offset_of!(MigoTouchPoint, x) == offset_of!(TouchPoint, x));
+const _: () = assert!(offset_of!(MigoTouchPoint, y) == offset_of!(TouchPoint, y));
+const _: () = assert!(offset_of!(MigoTouchPoint, pressure) == offset_of!(TouchPoint, pressure));
+const _: () = assert!(offset_of!(MigoTouchPoint, flags) == offset_of!(TouchPoint, flags));
 
 /// Translate a validated event envelope into the engine's `TouchData`.
 ///
@@ -72,46 +54,36 @@ pub struct MigoTouchEvent {
 /// otherwise risk a ~200-byte copy per touch event that the previous
 /// build-it-in-place shape did not pay.
 ///
-/// # Safety
-/// `event.points` must hold at least `event.point_count` entries.
 #[inline]
-unsafe fn to_touch_data(event: &MigoTouchEvent) -> Result<TouchData, MigoResult> {
-    let touch_type = match event.touch_type {
+fn validated_to_touch_data(event: ValidatedTouchEvent) -> TouchData {
+    let (touch_type, count, points, timestamp_ms) = event.into_parts();
+    let touch_type = match touch_type {
         MIGO_TOUCH_START => TouchType::Start,
         MIGO_TOUCH_MOVE => TouchType::Move,
         MIGO_TOUCH_END => TouchType::End,
         MIGO_TOUCH_CANCEL => TouchType::Cancel,
-        // Android coerces unknown platform action codes to Move because it
-        // translates a fixed enum; a C host passing an undefined value has a
-        // bug, and reinterpreting it would hide that.
-        _ => return Err(MIGO_ERROR_INVALID_ARGUMENT),
+        _ => unreachable!("validated touch kind"),
     };
-    if event.point_count == 0 || event.point_count > MIGO_TOUCH_MAX_POINTS {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-    if event.points.is_null() {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
 
-    // One copy into the inline array, the same shape Android fills. Only the
-    // first `count` entries are read; the rest keep their default so a stale
-    // pointer from an earlier, longer batch can never be resurrected.
-    let count = event.point_count as usize;
-    let mut points = [TouchPoint::default(); 10];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            event.points as *const TouchPoint,
-            points.as_mut_ptr(),
-            count,
-        );
-    }
-
-    Ok(TouchData {
+    // Both records are repr(C), have identical field offsets/alignment, and the
+    // ABI validator has already copied/checked the complete array. Moving the
+    // array preserves the one caller-memory copy instead of mapping 10 points.
+    let points = unsafe { std::mem::transmute::<[MigoTouchPoint; 10], [TouchPoint; 10]>(points) };
+    TouchData {
         touch_type,
-        count: count as u8,
+        count,
         points,
-        timestamp_ms: event.timestamp_ms,
-    })
+        timestamp_ms,
+    }
+}
+
+/// Testable composition of boundary validation and engine conversion.
+///
+/// # Safety
+/// `event.points` must hold at least `event.point_count` entries.
+#[inline]
+unsafe fn to_touch_data(event: &MigoTouchEvent) -> Result<TouchData, MigoResult> {
+    unsafe { event.validate() }.map(validated_to_touch_data)
 }
 
 /// Deliver one touch event to the session's content.
@@ -126,56 +98,32 @@ pub unsafe extern "C" fn migo_session_send_touch(
     event: *const MigoTouchEvent,
 ) -> MigoResult {
     guard("migo_session_send_touch", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
+            Err(error) => return error,
         };
-        if let Err(error) =
-            unsafe { validate_header(event as *const VersionedHeader, size_of::<MigoTouchEvent>()) }
-        {
-            return error;
-        }
-        let event = unsafe { &*event };
-
         // Validated before the session lock so a malformed event is rejected on
         // its own terms rather than reporting whatever the session state is.
-        let touch_data = match unsafe { to_touch_data(event) } {
-            Ok(data) => data,
+        let touch_data = match unsafe { MigoTouchEvent::parse(event) } {
+            Ok(event) => validated_to_touch_data(event),
             Err(error) => return error,
         };
 
-        let host = {
-            let Ok(state) = session.state.lock() else {
-                return MIGO_ERROR_INTERNAL;
-            };
-            if !state.attached {
-                return MIGO_ERROR_INVALID_STATE;
-            }
-            match state.host {
-                Some(host) => host,
-                None => return MIGO_ERROR_INVALID_STATE,
-            }
+        let ingress = match session.active_ingress() {
+            Ok(ingress) => ingress,
+            Err(error) => return error,
         };
-
-        let command = HostCommand::OnTouch(Box::new(touch_data));
-
-        // The host was present a moment ago under the lock, so a send failure
-        // here is the queue being full rather than the session being gone. The
-        // narrow race where the host shuts down in between reports WOULD_BLOCK
-        // instead of INVALID_STATE; a host retrying then gets INVALID_STATE.
-        match send_command_to_host(host, command) {
-            Ok(()) => MIGO_OK,
-            Err(error) => {
-                tracing::debug!("migo_session_send_touch: not delivered: {error}");
-                MIGO_ERROR_WOULD_BLOCK
-            }
-        }
+        map_ingress_result(
+            "migo_session_send_touch",
+            ingress.try_send_touch(touch_data),
+        )
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI};
+    use crate::abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI, VersionedHeader};
     use crate::test_support::with_session;
 
     fn point() -> MigoTouchPoint {
@@ -201,7 +149,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// A batch of several pointers must arrive with every field where the
     /// engine expects it.
     ///

@@ -42,6 +42,16 @@
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]
 compile_error!("profile-full and profile-slim are mutually exclusive");
 
+#[cfg(all(feature = "embed_icudtl", feature = "external_icudtl"))]
+compile_error!("embed_icudtl and external_icudtl are mutually exclusive");
+
+/// Whether this concrete graphics artifact contains ICU data.
+///
+/// Feature tests are crate-local in Cargo: downstream crates must query this
+/// exported capability instead of repeating `cfg(feature = "embed_icudtl")`,
+/// which would inspect their own unrelated feature namespace.
+pub const EMBEDS_ICU_DATA: bool = cfg!(feature = "embed_icudtl");
+
 pub mod atlas;
 pub mod atrace;
 #[doc(hidden)]

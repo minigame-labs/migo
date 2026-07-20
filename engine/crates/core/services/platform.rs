@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use super::DeviceServices;
+use shared::surface::{PublicSurfaceGeneration, SurfaceLossReason};
 
 /// Device-service factory capability supplied by a platform Host Kit.
 pub trait DeviceServiceProvider: Send + Sync {
@@ -76,6 +77,18 @@ pub trait HostNotifier: Send + Sync {
     /// * `detail` - Additional debugging details
     fn notify_error(&self, _host_id: i32, _error_code: u16, _message: &str, _detail: &str) {
         // Default: no-op. Override on platforms with JNI / native callbacks.
+    }
+
+    /// Notify an embedding host that a live native Surface was retired after
+    /// an unexpected presentation failure. Ordinary host-requested detach must
+    /// never call this hook.
+    fn notify_surface_lost(
+        &self,
+        _host_id: i32,
+        _public_generation: PublicSurfaceGeneration,
+        _reason: SurfaceLossReason,
+    ) {
+        // Default: platform lifecycle owns Surface replacement.
     }
 
     /// Deliver a JS-to-host message to the host application.

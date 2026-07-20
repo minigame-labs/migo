@@ -30,6 +30,25 @@ impl NativeTextureFromRawShim for glow::NativeTexture {
 trait NativeFramebufferFromRawShim {
     fn try_from_raw(raw: u32) -> Option<glow::NativeFramebuffer>;
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EglSwapFailureClass {
+    ContextLost,
+    SurfaceLost,
+    Other,
+}
+
+#[inline]
+fn classify_egl_swap_failure(error: egl::Error) -> EglSwapFailureClass {
+    match error {
+        egl::Error::ContextLost => EglSwapFailureClass::ContextLost,
+        egl::Error::BadCurrentSurface
+        | egl::Error::BadSurface
+        | egl::Error::BadNativeWindow
+        | egl::Error::BadDisplay => EglSwapFailureClass::SurfaceLost,
+        _ => EglSwapFailureClass::Other,
+    }
+}
 impl NativeFramebufferFromRawShim for glow::NativeFramebuffer {
     #[inline]
     fn try_from_raw(raw: u32) -> Option<glow::NativeFramebuffer> {
@@ -44,6 +63,7 @@ use shared::{
             BufferId, CanvasId, FramebufferId, ProgramId, RenderbufferId, ShaderId, TextureId,
         },
     },
+    surface::PixelRatio,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -164,8 +184,7 @@ pub(crate) struct CanvasManager {
     /// See `EglInitResult::surfaceless`.
     surfaceless: bool,
 
-    #[allow(dead_code)]
-    pub(super) dpi: f32,
+    pub(super) dpi: PixelRatio,
 
     resource: EglContextHandle,
 
@@ -230,6 +249,12 @@ pub(crate) struct CanvasManager {
     /// The next `create_onscreen()` call will perform a full resource rebuild.
     context_lost: bool,
 
+    /// Set only for EGL failures that prove the native presentation target is
+    /// no longer usable. The render thread retires the matching generation;
+    /// allocation/access failures remain retryable and do not masquerade as a
+    /// host Surface loss.
+    surface_unavailable: bool,
+
     /// One-shot: force the next `create_onscreen()` to fully tear down and
     /// recreate the onscreen EGL surface, bypassing the same-window fast paths
     /// (skip-recreate and fast-resize). Set by the render thread when a
@@ -258,6 +283,10 @@ pub(crate) struct CanvasManager {
     /// Makes explicit shutdown and the `Drop` fallback share one idempotent
     /// teardown path.
     teardown_complete: bool,
+    /// True only after either every native window EGLSurface was explicitly
+    /// destroyed or final `eglTerminate` succeeded. Prepared platform targets
+    /// must not be dropped without this proof.
+    native_release_confirmed: bool,
 
     // GL object registries
     pub(crate) programs: HashMap<ProgramId, ProgramMeta>,
@@ -457,6 +486,12 @@ impl CanvasManager {
         cache_dir: Option<&std::path::Path>,
         gpu_caps: std::sync::Arc<shared::device::gpu_caps::GpuCaps>,
     ) -> EngineResult<Self> {
+        let dpi = PixelRatio::new(dpi).ok_or_else(|| {
+            ee(
+                ErrorCode::InvalidArgument,
+                "CanvasManager requires a finite positive pixel ratio",
+            )
+        })?;
         let init = egl_ops::init_egl(egl_provider.as_ref())?;
         let mut egl = init.egl;
         let display = init.display;
@@ -683,11 +718,13 @@ impl CanvasManager {
             canvas2d_snapshot_read_fbo: None,
             last_swap_interval: -1, // force first eglSwapInterval call
             context_lost: false,
+            surface_unavailable: false,
             force_onscreen_recreate: false,
             simulated_reset: false,
             installed_surface: None,
             pending_onscreen: None,
             teardown_complete: false,
+            native_release_confirmed: false,
             programs: HashMap::with_capacity(16),
             shaders: HashMap::with_capacity(32),
             buffers: HashMap::with_capacity(32),
@@ -809,6 +846,38 @@ impl CanvasManager {
         self.force_onscreen_recreate = true;
     }
 
+    /// Explicitly detach the installed window EGLSurface.
+    ///
+    /// Success is the only point at which the caller may drop the matching
+    /// `SurfaceResourceLease`.  Ordinary EGL failure leaves the platform target
+    /// installed and returns an error; `destroy_all` retains it through final
+    /// `eglTerminate` as the shutdown fallback.
+    pub(crate) fn release_onscreen(&mut self) -> EngineResult<()> {
+        let id = CanvasId::from(1u32);
+
+        if self.pending_onscreen.is_some()
+            && self.cleanup_pending_onscreen() != CandidateCleanup::Released
+        {
+            return Err(ee(
+                ErrorCode::RenderBackendError,
+                "partial onscreen EGL target remains referenced during release",
+            ));
+        }
+
+        if self.canvases.contains_key(&id) {
+            return self.destroy_onscreen_internal(id);
+        }
+
+        if self.installed_surface.is_some() {
+            return Err(ee(
+                ErrorCode::RenderBackendError,
+                "installed native target has no owned onscreen EGL canvas",
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Create or recreate the onscreen canvas (id=1).
     ///
     /// `surface_size`: expected physical dimensions from the SurfaceRef.
@@ -823,7 +892,12 @@ impl CanvasManager {
         recreate_kind: RecreateKind,
         surface_size: Option<(u32, u32)>,
         had_usable_previous: bool,
+        pixel_ratio: Option<PixelRatio>,
     ) -> Result<(), SurfaceInstallFailure> {
+        // The candidate ratio follows the same transaction as the native
+        // Surface. It may influence a fresh default backing store, but does not
+        // become observable render state until installation succeeds.
+        let effective_pixel_ratio = pixel_ratio.unwrap_or(self.dpi);
         // A prior failed cleanup may still own a window EGLSurface.  Retry its
         // cleanup before touching the new candidate, but never infer release
         // from the new operation's error code.
@@ -892,7 +966,12 @@ impl CanvasManager {
                             exp_w,
                             exp_h
                         );
-                        self.installed_surface = Some(target);
+                        // EGL still references the installed target. The
+                        // equivalent candidate is deliberately discarded; it
+                        // must never replace native ownership under a live
+                        // EGLSurface.
+                        self.dpi = effective_pixel_ratio;
+                        self.surface_unavailable = false;
                         return Ok(());
                     }
                 }
@@ -922,6 +1001,27 @@ impl CanvasManager {
                     if matches!(entry.kind, SurfaceKind::Window)
                         && self.contexts_2d.contains_key(&id)
                     {
+                        let installed = self.installed_surface.as_ref().ok_or_else(|| {
+                            SurfaceInstallFailure::from_phase(
+                                ee(
+                                    ErrorCode::RenderBackendError,
+                                    "window canvas has no installed platform target",
+                                ),
+                                had_usable_previous,
+                                InstallPhase::BeforePreviousInvalidation,
+                                CandidateCleanup::NotRequired,
+                            )
+                        })?;
+                        installed
+                            .reconfigure_from(target.as_ref())
+                            .map_err(|error| {
+                                SurfaceInstallFailure::from_phase(
+                                    error,
+                                    had_usable_previous,
+                                    InstallPhase::BeforePreviousInvalidation,
+                                    CandidateCleanup::NotRequired,
+                                )
+                            })?;
                         tracing::info!(
                             "CanvasManager::create_onscreen fast resize {}x{} -> {}x{} (same native surface)",
                             entry.physical_width,
@@ -983,7 +1083,11 @@ impl CanvasManager {
                         self.damage
                             .add(crate::damage_effect::DamageEffect::FullSurface);
                         self.evaluate_bypass();
-                        self.installed_surface = Some(target);
+                        // Keep `installed`: EGL references this exact platform
+                        // object, which was reconfigured in place above. The
+                        // candidate is discarded on return.
+                        self.dpi = effective_pixel_ratio;
+                        self.surface_unavailable = false;
                         return Ok(());
                     }
                 }
@@ -1273,10 +1377,11 @@ impl CanvasManager {
             // keeps it stable across the multiple surfaceChanged events fired
             // during startup layout (each fresh buffer is logical, not physical),
             // so a logical-sized game no longer races back to a corner.
-            let (def_w, def_h) = if self.dpi > 1.0 {
+            let dpi = effective_pixel_ratio.get();
+            let (def_w, def_h) = if dpi > 1.0 {
                 (
-                    ((physical_w as f32 / self.dpi).round() as u32).max(1),
-                    ((physical_h as f32 / self.dpi).round() as u32).max(1),
+                    ((physical_w as f32 / dpi).round() as u32).max(1),
+                    ((physical_h as f32 / dpi).round() as u32).max(1),
                 )
             } else {
                 (physical_w, physical_h)
@@ -1364,6 +1469,8 @@ impl CanvasManager {
             }
         }
 
+        self.dpi = effective_pixel_ratio;
+        self.surface_unavailable = false;
         Ok(())
     }
 
@@ -1595,6 +1702,11 @@ impl CanvasManager {
     #[inline]
     pub(crate) fn is_context_lost(&self) -> bool {
         self.context_lost
+    }
+
+    #[inline]
+    pub(crate) fn is_surface_unavailable(&self) -> bool {
+        self.surface_unavailable
     }
 
     /// Cold-path readiness for rebuilding a lost share group. Platform
@@ -1880,7 +1992,7 @@ impl CanvasManager {
         let rebuilt = (|| -> EngineResult<bool> {
             // `canvases` is empty and `preserved_ctx` is None, so
             // `create_onscreen` builds a fresh onscreen context.
-            self.create_onscreen(target, RecreateKind::SameGeneration, None, false)
+            self.create_onscreen(target, RecreateKind::SameGeneration, None, false, None)
                 .map_err(|failure| failure.error)?;
             // Settle the teardown's debt: the onscreen 2D context plus every
             // offscreen canvas whose id JS still holds.
@@ -2120,9 +2232,17 @@ impl CanvasManager {
     /// display; Skia/GL objects need a live context; window/offscreen EGL
     /// objects must go before the resource context; display termination is the
     /// final authority that releases any driver-retained native window.
-    pub(crate) fn destroy_all(&mut self) {
+    ///
+    /// Returns `true` only when native-window release is proven, either because
+    /// every referencing EGLSurface was explicitly destroyed or because final
+    /// display termination succeeded. A false result has already quarantined
+    /// the prepared native targets and must make the outer render owner retain
+    /// its corresponding [`crate::surface_binding::RenderSurfaceBinding`]
+    /// leases as well.
+    #[must_use]
+    pub(crate) fn destroy_all(&mut self) -> bool {
         if self.teardown_complete {
-            return;
+            return self.native_release_confirmed;
         }
         self.teardown_complete = true;
 
@@ -2220,9 +2340,33 @@ impl CanvasManager {
 
         // Destroy the root pbuffer/context and terminate the display through
         // the same idempotent owner used by constructor-error and Drop paths.
-        self.egl.shutdown();
-        self.pending_onscreen = None;
-        self.installed_surface = None;
+        let windows_explicitly_released =
+            self.pending_onscreen.is_none() && self.installed_surface.is_none();
+        let display_terminated = self.egl.shutdown();
+        self.native_release_confirmed = windows_explicitly_released || display_terminated;
+        if self.native_release_confirmed {
+            self.pending_onscreen = None;
+            self.installed_surface = None;
+        } else {
+            tracing::error!(
+                "EGL teardown produced no native-release proof; quarantining platform targets"
+            );
+            self.quarantine_prepared_native_targets();
+        }
+        self.native_release_confirmed
+    }
+
+    /// Fail-safe terminal ownership sink used only when EGL cannot prove it no
+    /// longer references a platform target. Intentionally leaking a bounded
+    /// target prevents a host-side use-after-free; this is never a recovery or
+    /// frame path.
+    fn quarantine_prepared_native_targets(&mut self) {
+        if let Some(pending) = self.pending_onscreen.take() {
+            std::mem::forget(pending);
+        }
+        if let Some(installed) = self.installed_surface.take() {
+            std::mem::forget(installed);
+        }
     }
 
     // ==================== Context Binding ====================
@@ -3086,11 +3230,16 @@ impl CanvasManager {
         self.egl
             .swap_buffers(self.display, entry_surf)
             .map_err(|e| {
-                if let Some(egl_err) = self.egl.get_error() {
-                    if egl_err == egl::Error::ContextLost {
+                match classify_egl_swap_failure(e) {
+                    EglSwapFailureClass::ContextLost => {
                         tracing::warn!("EGL context lost detected during swap_buffers");
                         self.context_lost = true;
                     }
+                    EglSwapFailureClass::SurfaceLost => {
+                        tracing::warn!(?e, "EGL native Surface became unavailable during swap");
+                        self.surface_unavailable = true;
+                    }
+                    EglSwapFailureClass::Other => {}
                 }
                 ee(
                     ErrorCode::RenderBackendError,
@@ -5055,7 +5204,12 @@ impl Drop for CanvasManager {
         // Destructors must not double-panic if an EGL/GL wrapper encounters a
         // broken driver while the render thread is already unwinding. The
         // EglRuntime field remains an independent final terminate fallback.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.destroy_all()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self.destroy_all();
+        }));
+        if result.is_err() || !self.native_release_confirmed {
+            self.quarantine_prepared_native_targets();
+        }
     }
 }
 
@@ -5249,6 +5403,29 @@ mod recovery_source_guards {
 mod tests {
     use super::*;
     use crate::damage_effect::{DamageEffect, FrameDamageAccumulator};
+
+    #[test]
+    fn egl_swap_failures_distinguish_context_surface_and_retryable_errors() {
+        assert_eq!(
+            classify_egl_swap_failure(egl::Error::ContextLost),
+            EglSwapFailureClass::ContextLost
+        );
+        for error in [
+            egl::Error::BadCurrentSurface,
+            egl::Error::BadSurface,
+            egl::Error::BadNativeWindow,
+            egl::Error::BadDisplay,
+        ] {
+            assert_eq!(
+                classify_egl_swap_failure(error),
+                EglSwapFailureClass::SurfaceLost
+            );
+        }
+        assert_eq!(
+            classify_egl_swap_failure(egl::Error::BadAlloc),
+            EglSwapFailureClass::Other
+        );
+    }
 
     // ---- Share-group restore planning (context-loss recovery) ----
 

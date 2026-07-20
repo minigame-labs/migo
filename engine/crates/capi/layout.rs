@@ -31,7 +31,7 @@ use crate::{
     keyboard::{MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent},
     surface::{
         MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
-        MigoWaylandSurfaceDescriptor, MigoX11WindowDescriptor,
+        MigoSurfaceReleaseStatus, MigoWaylandSurfaceDescriptor, MigoX11WindowDescriptor,
     },
 };
 
@@ -59,6 +59,7 @@ header_is_first!(
     MigoError,
     MigoSurfaceDescriptor,
     MigoSurfaceMetrics,
+    MigoSurfaceReleaseStatus,
     MigoAndroidNativeWindowDescriptor,
     MigoX11WindowDescriptor,
     MigoWaylandSurfaceDescriptor,
@@ -119,6 +120,11 @@ const _: () = assert!(offset_of!(MigoSurfaceMetrics, alpha_mode) == 32);
 const _: () = assert!(offset_of!(MigoSurfaceMetrics, preferred_presentation_mode) == 36);
 const _: () = assert!(offset_of!(MigoSurfaceMetrics, flags) == 40);
 
+const _: () = assert!(size_of::<MigoSurfaceReleaseStatus>() == 24);
+const _: () = assert!(offset_of!(MigoSurfaceReleaseStatus, generation) == 8);
+const _: () = assert!(offset_of!(MigoSurfaceReleaseStatus, state) == 16);
+const _: () = assert!(offset_of!(MigoSurfaceReleaseStatus, reserved0) == 20);
+
 /// LP64 sizes for the structs that contain a pointer.
 ///
 /// Split out so the pointer-free assertions above still run on a 32-bit target
@@ -153,7 +159,7 @@ mod lp64 {
     // Function pointers are `Option<fn>` on the Rust side, which is a plain
     // nullable pointer with no discriminant. Pinning the offsets is what keeps
     // that niche optimisation from being an assumption.
-    const _: () = assert!(size_of::<MigoHostCallbacks>() == 96);
+    const _: () = assert!(size_of::<MigoHostCallbacks>() == 104);
     const _: () = assert!(offset_of!(MigoHostCallbacks, user_data) == 8);
     const _: () = assert!(offset_of!(MigoHostCallbacks, dispatcher_data) == 16);
     const _: () = assert!(offset_of!(MigoHostCallbacks, dispatch) == 24);
@@ -165,6 +171,7 @@ mod lp64 {
     const _: () = assert!(offset_of!(MigoHostCallbacks, on_show_keyboard) == 72);
     const _: () = assert!(offset_of!(MigoHostCallbacks, on_hide_keyboard) == 80);
     const _: () = assert!(offset_of!(MigoHostCallbacks, on_update_keyboard) == 88);
+    const _: () = assert!(offset_of!(MigoHostCallbacks, on_surface_released) == 96);
 
     const _: () = assert!(size_of::<MigoKeyboardShowOptions>() == 40);
     const _: () = assert!(offset_of!(MigoKeyboardShowOptions, flags) == 8);

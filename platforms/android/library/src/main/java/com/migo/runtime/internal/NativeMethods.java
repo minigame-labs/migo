@@ -113,10 +113,12 @@ public final class NativeMethods {
      * @param surface   New Surface object
      * @param width     Surface buffer width in physical pixels
      * @param height    Surface buffer height in physical pixels
+     * @param density   Current device-pixel ratio for this display
      */
-    public static void updateSurface(int sessionId, Surface surface, int width, int height) {
+    public static void updateSurface(
+            int sessionId, Surface surface, int width, int height, float density) {
         if (sessionId >= 0 && surface != null) {
-            NativeBridge.updateSurface(sessionId, surface, width, height);
+            NativeBridge.updateSurface(sessionId, surface, width, height, density);
         }
     }
 

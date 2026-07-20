@@ -1,7 +1,48 @@
 use serde::{Deserialize, Serialize};
 
+/// A finite, strictly-positive device-pixel ratio.
+///
+/// Keeping this invariant in the type prevents an invalid scale from entering
+/// the asynchronous Host/Render command stream and failing much later on the
+/// render thread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PixelRatio(f32);
+
+impl PixelRatio {
+    #[inline]
+    pub fn new(value: f32) -> Option<Self> {
+        (value.is_finite() && value > 0.0).then_some(Self(value))
+    }
+
+    #[inline]
+    pub const fn get(self) -> f32 {
+        self.0
+    }
+}
+
+/// Stable reason categories for an unexpected live-Surface retirement.
+///
+/// Values intentionally match the public C ABI. `HostDestroyed` describes an
+/// expected host action and is never emitted as an unexpected-loss callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SurfaceLossReason {
+    Unknown = 0,
+    HostDestroyed = 1,
+    DeviceLost = 2,
+    PlatformError = 3,
+}
+
+impl SurfaceLossReason {
+    #[inline]
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct SafeArea {
+    /// Insets from the corresponding physical/logical window edges.
     pub left: f32,
     pub top: f32,
     pub right: f32,
@@ -75,5 +116,27 @@ impl WindowInfo {
                 bottom: self.safe_area.bottom / pr,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PixelRatio, SurfaceLossReason};
+
+    #[test]
+    fn pixel_ratio_accepts_only_finite_positive_values() {
+        assert_eq!(PixelRatio::new(2.5).map(PixelRatio::get), Some(2.5));
+        assert!(PixelRatio::new(0.0).is_none());
+        assert!(PixelRatio::new(-1.0).is_none());
+        assert!(PixelRatio::new(f32::NAN).is_none());
+        assert!(PixelRatio::new(f32::INFINITY).is_none());
+    }
+
+    #[test]
+    fn surface_loss_reason_values_are_stable_for_native_abis() {
+        assert_eq!(SurfaceLossReason::Unknown.as_u32(), 0);
+        assert_eq!(SurfaceLossReason::HostDestroyed.as_u32(), 1);
+        assert_eq!(SurfaceLossReason::DeviceLost.as_u32(), 2);
+        assert_eq!(SurfaceLossReason::PlatformError.as_u32(), 3);
     }
 }

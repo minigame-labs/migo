@@ -10,114 +10,155 @@
 //! meaning different things on different platforms.
 
 use std::{
-    ffi::{c_ulong, c_void},
+    mem::MaybeUninit,
     ptr::NonNull,
-    sync::Arc,
+    sync::{Arc, Weak},
 };
+
+#[cfg(test)]
+use std::{ffi::c_void, mem::size_of};
 
 use core::{
-    PlatformServices, lease_surface, retire_surface, send_critical_command_to_host,
-    spawn_host_thread,
+    PlatformServices, host_ingress, lease_surface_tracked, lease_surface_with_resource,
+    retire_surface, send_critical_command_to_host, spawn_host_thread_tracked,
 };
-use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceRef};
+use shared::{
+    config::InitOptions,
+    protocol::host_cmd::HostCommand,
+    surface::{
+        PixelRatio, PublicSurfaceGeneration, SurfaceLossReason, SurfaceReleaseNotification,
+        SurfaceReleaseObserver, SurfaceReleasePhase, SurfaceResourceLease,
+    },
+};
 
 use crate::{
-    MIGO_PLATFORM_X11_WINDOW, MigoSession,
+    MigoSession, SurfaceTransition,
     abi::{
         MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE,
-        MIGO_ERROR_UNSUPPORTED_PLATFORM, MIGO_OK, MigoResult, VersionedHeader, guard,
-        validate_header,
+        MIGO_ERROR_STALE_SURFACE, MIGO_OK, MigoResult, guard,
     },
-    callbacks, host_kit,
-    platform::{PlatformTarget, build_target, rebuild_surface},
+    callbacks, host_kit, pin_session,
+    platform::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds},
 };
 
-// ---- C struct mirrors -------------------------------------------------------
-
-#[repr(C)]
-pub struct MigoSurfaceDescriptor {
-    pub(crate) header: VersionedHeader,
-    pub(crate) generation: u64,
-    pub(crate) platform_kind: u32,
-    pub(crate) flags: u32,
-    pub(crate) width_pixels: u32,
-    pub(crate) height_pixels: u32,
-    pub(crate) scale_factor: f32,
-    pub(crate) color_space: u32,
-    pub(crate) alpha_mode: u32,
-    pub(crate) preferred_presentation_mode: u32,
-    pub(crate) capability_flags: u64,
-    pub(crate) platform_descriptor_size: u32,
-    pub(crate) reserved0: u32,
-    pub(crate) platform_descriptor: *const c_void,
-}
-
-/// `MigoSurfaceMetrics` from `include/migo/surface.h`. A resize supplies only
-/// the values that can change; the host is not asked to re-describe its window.
-#[repr(C)]
-pub struct MigoSurfaceMetrics {
-    pub(crate) header: VersionedHeader,
-    pub(crate) generation: u64,
-    pub(crate) width_pixels: u32,
-    pub(crate) height_pixels: u32,
-    pub(crate) scale_factor: f32,
-    pub(crate) color_space: u32,
-    pub(crate) alpha_mode: u32,
-    pub(crate) preferred_presentation_mode: u32,
-    pub(crate) flags: u32,
-    pub(crate) reserved0: u32,
-}
-
-/// Mirrors `MigoAndroidNativeWindowDescriptor` in
-/// `include/migo/platform/android.h`. `native_window` is an `ANativeWindow*`
-/// the host owns; attach acquires its own reference rather than consuming the
-/// caller's.
-#[repr(C)]
-pub struct MigoAndroidNativeWindowDescriptor {
-    pub(crate) header: VersionedHeader,
-    pub(crate) platform_kind: u32,
-    pub(crate) flags: u32,
-    pub(crate) native_window: *mut c_void,
-}
-
-#[repr(C)]
-pub struct MigoX11WindowDescriptor {
-    pub(crate) header: VersionedHeader,
-    pub(crate) platform_kind: u32,
-    pub(crate) flags: u32,
-    pub(crate) display: *mut c_void,
-    pub(crate) window: usize,
-    pub(crate) screen: i32,
-    pub(crate) reserved0: u32,
-}
-
-/// Mirrors `MigoWaylandSurfaceDescriptor` in `include/migo/platform/wayland.h`.
-///
-/// Both handles belong to the host, which also owns the surface's role and its
-/// event dispatch. Migo neither creates nor destroys either one.
-#[repr(C)]
-pub struct MigoWaylandSurfaceDescriptor {
-    pub(crate) header: VersionedHeader,
-    pub(crate) platform_kind: u32,
-    pub(crate) flags: u32,
-    pub(crate) display: *mut c_void,
-    pub(crate) surface: *mut c_void,
-}
+pub use migo_capi_abi::surface::{
+    MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
+    MigoSurfaceReleaseStatus, MigoWaylandSurfaceDescriptor, MigoX11WindowDescriptor,
+};
+use migo_capi_abi::surface::{
+    SurfaceDescriptorRef, validate_attach_generation, validate_update_generation,
+};
 
 // ---- Attachment handle ------------------------------------------------------
 
 pub struct MigoSurfaceAttachment {
     session: NonNull<MigoSession>,
-    generation: u64,
+    public_generation: PublicSurfaceGeneration,
+    resource: SurfaceResourceLease,
     target: PlatformTarget,
     width_pixels: u32,
     height_pixels: u32,
+    pixel_ratio: PixelRatio,
+    window_state: Arc<host_kit::CapiWindowState>,
+    lost: bool,
 }
 
+// SAFETY: the self-Session pointer is opaque identity produced from the Arc
+// allocation and is never dereferenced without first taking a strong Session
+// pin. All mutable attachment state remains behind SessionControl, and the C
+// contract requires calls through a unique attachment handle to be serialized.
+unsafe impl Send for MigoSurfaceAttachment {}
+
 impl MigoSurfaceAttachment {
-    fn rebuild_surface(&self, width: u32, height: u32) -> SurfaceRef {
-        rebuild_surface(self.target, width, height)
+    #[inline]
+    pub(crate) fn public_generation(&self) -> u64 {
+        self.public_generation.get()
     }
+
+    #[inline]
+    pub(crate) fn is_lost(&self) -> bool {
+        self.lost
+    }
+
+    #[inline]
+    pub(crate) fn mark_lost(&mut self) {
+        self.lost = true;
+    }
+}
+
+/// Level-triggered observer returned by `migo_surface_begin_detach`.
+///
+/// It intentionally owns no Surface resource lease and may therefore outlive
+/// the Session whose pending counter it once contributed to.
+pub struct MigoSurfaceRelease {
+    observer: SurfaceReleaseObserver,
+}
+
+struct DeferredSurfaceLoss {
+    notifier: Option<Arc<callbacks::Notifier>>,
+    generation: u64,
+    reason: SurfaceLossReason,
+}
+
+impl DeferredSurfaceLoss {
+    fn notify(self) {
+        if let Some(notifier) = self.notifier {
+            notifier.surface_lost(self.generation, self.reason.as_u32());
+        }
+    }
+}
+
+/// Apply and consume a renderer loss held while attach/update owned the
+/// Session's control transition. Caller holds SessionControl.
+fn consume_pending_surface_loss(
+    session: &MigoSession,
+    state: &mut crate::SessionState,
+) -> Option<DeferredSurfaceLoss> {
+    let loss = state.pending_surface_loss.take()?;
+    let active = state.active_attachment.as_mut()?;
+    if active.public_generation() != loss.generation || active.is_lost() {
+        return None;
+    }
+    active.mark_lost();
+    session
+        .active_surface_generation
+        .store(0, std::sync::atomic::Ordering::Release);
+    Some(DeferredSurfaceLoss {
+        notifier: state.notifier.clone(),
+        generation: loss.generation,
+        reason: loss.reason,
+    })
+}
+
+fn rollback_surface_transition(session: &MigoSession) {
+    let deferred_loss = {
+        // A failed pre-commit operation must always release its reservation.
+        // Recovering the data after poison is safer than permanently stranding
+        // the Session in a transition no caller can clear.
+        let mut state = session
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deferred_loss = consume_pending_surface_loss(session, &mut state);
+        state.surface_transition_generation = None;
+        state.surface_transition = SurfaceTransition::Idle;
+        deferred_loss
+    };
+    if let Some(loss) = deferred_loss {
+        loss.notify();
+    }
+}
+
+fn release_notification(
+    notifier: Option<&Arc<callbacks::Notifier>>,
+) -> Option<SurfaceReleaseNotification> {
+    let notifier = notifier.filter(|notifier| notifier.notifies_surface_release())?;
+    let notifier: Weak<callbacks::Notifier> = Arc::downgrade(notifier);
+    Some(Box::new(move |generation| {
+        if let Some(notifier) = notifier.upgrade() {
+            notifier.surface_released(generation.get());
+        }
+    }))
 }
 
 // ---- Entry points -----------------------------------------------------------
@@ -133,113 +174,273 @@ pub unsafe extern "C" fn migo_session_attach_surface(
     out_attachment: *mut *mut MigoSurfaceAttachment,
 ) -> MigoResult {
     guard("migo_session_attach_surface", || {
-        let Some(session_ptr) = NonNull::new(session) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
-        };
         let Some(out_attachment) = (unsafe { out_attachment.as_mut() }) else {
             return MIGO_ERROR_INVALID_ARGUMENT;
         };
-        if let Err(error) = unsafe {
-            validate_header(
-                descriptor as *const VersionedHeader,
-                size_of::<MigoSurfaceDescriptor>(),
-            )
-        } {
-            return error;
-        }
-        let descriptor = unsafe { &*descriptor };
-
-        let (surface, graphics_platform, target) = match unsafe { build_target(descriptor) } {
-            Ok(built) => built,
+        *out_attachment = std::ptr::null_mut();
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
             Err(error) => return error,
         };
-
-        let session_ref = unsafe { session_ptr.as_ref() };
-        let Ok(mut state) = session_ref.state.lock() else {
-            return MIGO_ERROR_INTERNAL;
+        let session_ptr = NonNull::from(Arc::as_ref(&session));
+        let descriptor = match unsafe {
+            SurfaceDescriptorRef::parse_for_platforms(descriptor, supported_platform_kinds())
+        } {
+            Ok(descriptor) => descriptor,
+            Err(error) => return error,
         };
-        if state.attached {
-            return MIGO_ERROR_INVALID_STATE;
-        }
+        let configuration = descriptor.configuration();
+        let pixel_ratio = PixelRatio::new(configuration.scale_factor())
+            .expect("the ABI validator rejects invalid scale factors");
+        let window_metrics = host_kit::CapiWindowMetrics::new(
+            configuration.width_pixels(),
+            configuration.height_pixels(),
+            pixel_ratio,
+        );
+        let public_generation = PublicSurfaceGeneration::new(descriptor.public_generation())
+            .expect("the ABI validator rejects generation zero");
 
-        let host_for_pending;
-        match state.host {
-            // Re-attach after a detach: the host thread is still alive, so the
-            // surface joins it as a new generation rather than starting over.
-            // The lease is delivered, not dropped -- dropping it would retire
-            // the generation it just created and leave nothing presenting.
+        let (existing_host, configured_callbacks, existing_window_state) = {
+            let Ok(mut state) = session.state.lock() else {
+                return MIGO_ERROR_INTERNAL;
+            };
+            if state.surface_transition != SurfaceTransition::Idle
+                || state.active_attachment.is_some()
+            {
+                return MIGO_ERROR_INVALID_STATE;
+            }
+            if let Err(error) = validate_attach_generation(
+                descriptor.public_generation(),
+                state.last_public_generation,
+            ) {
+                return error;
+            }
+            // Reserve this cold transition, then release SessionControl before
+            // native construction, Host startup, and any callback-capable work.
+            state.surface_transition = SurfaceTransition::Attaching;
+            state.surface_transition_generation = Some(public_generation.get());
+            debug_assert!(state.pending_surface_loss.is_none());
+            state.callbacks_frozen = true;
+            (state.host, state.callbacks, state.window_state.clone())
+        };
+
+        let (surface, graphics_platform, target) = match build_target(descriptor) {
+            Ok(built) => built,
+            Err(error) => {
+                rollback_surface_transition(&session);
+                return error;
+            }
+        };
+
+        let (host, resource, notifier, new_ingress, window_state) = match existing_host {
             Some(host) => {
-                host_for_pending = host;
-                match lease_surface(host, surface) {
-                    Ok(lease) => {
-                        if let Err(error) = send_critical_command_to_host(
-                            host,
-                            HostCommand::UpdateSurface { lease },
-                        ) {
-                            tracing::error!("migo_session_attach_surface: send failed: {error}");
-                            return MIGO_ERROR_INTERNAL;
-                        }
-                    }
+                let Some(window_state) = existing_window_state else {
+                    tracing::error!(
+                        "migo_session_attach_surface: existing Host has no window state"
+                    );
+                    rollback_surface_transition(&session);
+                    return MIGO_ERROR_INTERNAL;
+                };
+                let Some(ingress) = session.ingress.get() else {
+                    tracing::error!(
+                        "migo_session_attach_surface: existing Host has no direct ingress"
+                    );
+                    rollback_surface_transition(&session);
+                    return MIGO_ERROR_INTERNAL;
+                };
+                if ingress.host_id() != host {
+                    tracing::error!(
+                        "migo_session_attach_surface: Session ingress Host {} does not match {}",
+                        ingress.host_id(),
+                        host,
+                    );
+                    rollback_surface_transition(&session);
+                    return MIGO_ERROR_INTERNAL;
+                }
+                let lease = match lease_surface_tracked(host, surface, public_generation) {
+                    Ok(lease) => lease,
                     Err(error) => {
                         tracing::error!("migo_session_attach_surface: lease failed: {error}");
+                        rollback_surface_transition(&session);
                         return MIGO_ERROR_INTERNAL;
                     }
+                };
+                let resource = lease.resource_lease();
+                // Publish before enqueue so a render-complete resize event can
+                // never race ahead of the window metrics it announces.
+                let previous_metrics = window_state.replace(window_metrics);
+                if let Err(error) = send_critical_command_to_host(
+                    host,
+                    HostCommand::UpdateSurface {
+                        lease,
+                        pixel_ratio: Some(pixel_ratio),
+                    },
+                ) {
+                    window_state.replace(previous_metrics);
+                    // A token was issued but no Host owner accepted it. Retire
+                    // it immediately so a failed attach cannot leave a hidden
+                    // live generation behind.
+                    let _ = retire_surface(host);
+                    tracing::error!("migo_session_attach_surface: send failed: {error}");
+                    rollback_surface_transition(&session);
+                    return MIGO_ERROR_INTERNAL;
                 }
+                (host, resource, None, None, window_state)
             }
             None => {
-                let notifier = state.callbacks.map(|callbacks| {
-                    callbacks::Notifier::new(
+                debug_assert!(existing_window_state.is_none());
+                let window_state = Arc::new(host_kit::CapiWindowState::new(window_metrics));
+                let notifier = configured_callbacks.map(|callbacks| {
+                    Arc::new(callbacks::Notifier::new(
                         callbacks,
-                        session_ptr.cast(),
-                        Arc::clone(&session_ref.alive),
-                    )
+                        Arc::downgrade(&session),
+                    ))
                 });
-                let host_kit: Arc<dyn PlatformServices> =
-                    Arc::new(host_kit::CapiHostKit::new(notifier));
+                let host_kit: Arc<dyn PlatformServices> = Arc::new(host_kit::CapiHostKit::new(
+                    notifier.clone(),
+                    Arc::downgrade(&session),
+                    Arc::clone(&window_state),
+                ));
                 let options = InitOptions::new()
-                    .with_files_dir(session_ref.engine.files_dir.clone())
-                    .with_cache_dir(session_ref.engine.cache_dir.clone())
-                    .with_code_cache_dir(session_ref.engine.code_cache_dir.clone())
-                    .with_pixel_ratio(descriptor.scale_factor.max(1.0))
+                    .with_files_dir(session.engine.files_dir.clone())
+                    .with_cache_dir(session.engine.cache_dir.clone())
+                    .with_code_cache_dir(session.engine.code_cache_dir.clone())
+                    .with_pixel_ratio(configuration.scale_factor())
                     .with_target_fps(60)
-                    .with_code_signing_enabled(!session_ref.engine.allow_unsigned_content);
-                match spawn_host_thread(surface, graphics_platform, host_kit, options) {
-                    Ok(host) => {
-                        state.host = Some(host);
-                        host_for_pending = host;
+                    .with_code_signing_enabled(!session.engine.allow_unsigned_content);
+                match spawn_host_thread_tracked(
+                    surface,
+                    public_generation,
+                    graphics_platform,
+                    host_kit,
+                    options,
+                ) {
+                    Ok(started) => {
+                        let ingress = match host_ingress(started.host_id) {
+                            Ok(ingress) => ingress,
+                            Err(error) => {
+                                tracing::error!(
+                                    "migo_session_attach_surface: ingress capture failed: {error}"
+                                );
+                                let _ = retire_surface(started.host_id);
+                                let _ = core::shutdown_host(started.host_id);
+                                rollback_surface_transition(&session);
+                                return MIGO_ERROR_INTERNAL;
+                            }
+                        };
+                        (
+                            started.host_id,
+                            started.resource,
+                            notifier,
+                            Some(ingress),
+                            window_state,
+                        )
                     }
                     Err(error) => {
                         tracing::error!("migo_session_attach_surface: spawn failed: {error:?}");
+                        rollback_surface_transition(&session);
                         return MIGO_ERROR_INTERNAL;
                     }
                 }
             }
-        }
-        state.attached = true;
+        };
 
-        // Deliver any visibility the host set before the surface existed, which
-        // is the normal Android ordering.
-        if let Some(visible) = state.pending_visible.take() {
+        let attachment = Box::new(MigoSurfaceAttachment {
+            session: session_ptr,
+            public_generation,
+            resource,
+            target,
+            width_pixels: configuration.width_pixels(),
+            height_pixels: configuration.height_pixels(),
+            pixel_ratio,
+            window_state: Arc::clone(&window_state),
+            lost: false,
+        });
+        let attachment_ptr = NonNull::from(attachment.as_ref()).as_ptr();
+
+        if let Some(ingress) = new_ingress
+            && session.ingress.set(ingress).is_err()
+        {
+            tracing::error!("migo_session_attach_surface: direct ingress was installed twice");
+            let _ = retire_surface(host);
+            let _ = core::shutdown_host(host);
+            rollback_surface_transition(&session);
+            return MIGO_ERROR_INTERNAL;
+        }
+
+        let (visibility, focused, deferred_loss) = {
+            let Ok(mut state) = session.state.lock() else {
+                let _ = retire_surface(host);
+                let _ = shutdown_new_host(existing_host, host);
+                return MIGO_ERROR_INTERNAL;
+            };
+            debug_assert_eq!(state.surface_transition, SurfaceTransition::Attaching);
+            debug_assert!(state.active_attachment.is_none());
+            if existing_host.is_none() {
+                state.host = Some(host);
+                state.notifier = notifier;
+                state.window_state = Some(window_state);
+            } else {
+                debug_assert!(
+                    state
+                        .window_state
+                        .as_ref()
+                        .is_some_and(|installed| Arc::ptr_eq(installed, &window_state))
+                );
+            }
+            state.active_attachment = Some(attachment);
+            state.last_public_generation = descriptor.public_generation();
+            let deferred_loss = consume_pending_surface_loss(&session, &mut state);
+            if deferred_loss.is_none() {
+                // Publish the live data-plane generation before opening the
+                // control state to loss/detach observers.
+                session.active_surface_generation.store(
+                    public_generation.get(),
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
+            // The output handle is part of the same commit boundary: once the
+            // transition becomes Idle, an inline loss callback may re-enter
+            // detach and therefore must already be able to find this pointer.
+            *out_attachment = attachment_ptr;
+            state.surface_transition_generation = None;
+            state.surface_transition = SurfaceTransition::Idle;
+            (state.visibility, state.focused, deferred_loss)
+        };
+
+        if let Some(loss) = deferred_loss {
+            loss.notify();
+        }
+
+        // Deliver any visibility the host set before the surface existed,
+        // which is the normal Android ordering.
+        if let Some(visible) = visibility {
             let command = if visible {
                 HostCommand::OnShow { options_json: None }
             } else {
                 HostCommand::OnHide
             };
-            if let Err(error) = core::send_critical_command_to_host(host_for_pending, command) {
+            if let Err(error) = core::send_critical_command_to_host(host, command) {
                 tracing::error!("attach: deferred visibility failed: {error}");
             }
         }
-
-        let attachment = Box::new(MigoSurfaceAttachment {
-            session: session_ptr,
-            generation: descriptor.generation,
-            target,
-            width_pixels: descriptor.width_pixels,
-            height_pixels: descriptor.height_pixels,
-        });
-        *out_attachment = Box::into_raw(attachment);
+        if let Some(focused) = focused {
+            if let Err(error) =
+                core::send_critical_command_to_host(host, HostCommand::OnFocusChanged { focused })
+            {
+                tracing::error!("attach: deferred focus failed: {error}");
+            }
+        }
         MIGO_OK
     })
+}
+
+fn shutdown_new_host(existing_host: Option<i32>, host: i32) -> Result<(), String> {
+    if existing_host.is_none() {
+        core::shutdown_host(host)
+    } else {
+        Ok(())
+    }
 }
 
 /// Report a resize or a presentation-parameter change.
@@ -254,90 +455,333 @@ pub unsafe extern "C" fn migo_surface_update(
     metrics: *const MigoSurfaceMetrics,
 ) -> MigoResult {
     guard("migo_surface_update", || {
-        let Some(attachment) = (unsafe { attachment.as_mut() }) else {
+        let Some(attachment_ref) = (unsafe { attachment.as_ref() }) else {
             return MIGO_ERROR_INVALID_ARGUMENT;
         };
-        if let Err(error) = unsafe {
-            validate_header(
-                metrics as *const VersionedHeader,
-                size_of::<MigoSurfaceMetrics>(),
-            )
-        } {
-            return error;
-        }
-        let metrics = unsafe { &*metrics };
-        if metrics.width_pixels == 0 || metrics.height_pixels == 0 {
-            return MIGO_ERROR_INVALID_ARGUMENT;
-        }
-
-        let session = unsafe { attachment.session.as_ref() };
-        let Ok(state) = session.state.lock() else {
-            return MIGO_ERROR_INTERNAL;
+        let metrics = match unsafe { MigoSurfaceMetrics::parse(metrics) } {
+            Ok(metrics) => metrics,
+            Err(error) => return error,
         };
-        // Reporting success with nothing attached would tell the host its
-        // resize took effect when no surface exists to resize.
-        if !state.attached {
-            return MIGO_ERROR_INVALID_STATE;
-        }
-        let Some(host) = state.host else {
-            return MIGO_ERROR_INVALID_STATE;
+        let configuration = metrics.configuration();
+
+        let session = match unsafe { pin_session(attachment_ref.session.as_ptr()) } {
+            Ok(session) => session,
+            Err(error) => return error,
         };
 
-        let surface = attachment.rebuild_surface(metrics.width_pixels, metrics.height_pixels);
-        let lease = match lease_surface(host, surface) {
+        let (host, target, resource, window_state) = {
+            let Ok(mut state) = session.state.lock() else {
+                return MIGO_ERROR_INTERNAL;
+            };
+            if state.surface_transition != SurfaceTransition::Idle {
+                return MIGO_ERROR_INVALID_STATE;
+            }
+            let Some(active) = state.active_attachment.as_ref() else {
+                return MIGO_ERROR_STALE_SURFACE;
+            };
+            if !std::ptr::eq(active.as_ref(), attachment_ref) {
+                return MIGO_ERROR_STALE_SURFACE;
+            }
+            if active.lost {
+                return MIGO_ERROR_STALE_SURFACE;
+            }
+            if let Err(error) = validate_update_generation(
+                metrics.public_generation(),
+                active.public_generation.get(),
+            ) {
+                return error;
+            }
+            let Some(host) = state.host else {
+                return MIGO_ERROR_INVALID_STATE;
+            };
+            let transition_generation = active.public_generation();
+            let snapshot = (
+                host,
+                active.target,
+                active.resource.clone(),
+                Arc::clone(&active.window_state),
+            );
+            state.surface_transition = SurfaceTransition::Updating;
+            state.surface_transition_generation = Some(transition_generation);
+            debug_assert!(state.pending_surface_loss.is_none());
+            snapshot
+        };
+
+        let surface = match rebuild_surface(
+            target,
+            configuration.width_pixels(),
+            configuration.height_pixels(),
+        ) {
+            Ok(surface) => surface,
+            Err(error) => {
+                rollback_surface_transition(&session);
+                return error;
+            }
+        };
+        let lease = match lease_surface_with_resource(host, surface, resource) {
             Ok(lease) => lease,
             Err(error) => {
                 tracing::error!("migo_surface_update: lease failed: {error}");
+                rollback_surface_transition(&session);
                 return MIGO_ERROR_INTERNAL;
             }
         };
         // Critical, like Android's path: a dropped resize strands the app on a
         // stale-sized frame with no further callback to recover from.
-        if let Err(error) =
-            send_critical_command_to_host(host, HostCommand::UpdateSurface { lease })
-        {
+        let pixel_ratio =
+            PixelRatio::new(configuration.scale_factor()).expect("validated Surface scale factor");
+        let previous_metrics = window_state.replace(host_kit::CapiWindowMetrics::new(
+            configuration.width_pixels(),
+            configuration.height_pixels(),
+            pixel_ratio,
+        ));
+        if let Err(error) = send_critical_command_to_host(
+            host,
+            HostCommand::UpdateSurface {
+                lease,
+                pixel_ratio: Some(pixel_ratio),
+            },
+        ) {
+            window_state.replace(previous_metrics);
             tracing::error!("migo_surface_update: send failed: {error}");
+            rollback_surface_transition(&session);
             return MIGO_ERROR_INTERNAL;
         }
 
-        attachment.width_pixels = metrics.width_pixels;
-        attachment.height_pixels = metrics.height_pixels;
+        let deferred_loss = {
+            // Enqueue committed the update. Recover poison so the transition
+            // and any loss racing it cannot remain permanently stranded.
+            let mut state = session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let active = state
+                .active_attachment
+                .as_mut()
+                .expect("the reserved update attachment cannot disappear");
+            assert!(std::ptr::eq(active.as_ref(), attachment_ref));
+            active.width_pixels = configuration.width_pixels();
+            active.height_pixels = configuration.height_pixels();
+            active.pixel_ratio = pixel_ratio;
+            let deferred_loss = consume_pending_surface_loss(&session, &mut state);
+            state.surface_transition_generation = None;
+            state.surface_transition = SurfaceTransition::Idle;
+            deferred_loss
+        };
+        if let Some(loss) = deferred_loss {
+            loss.notify();
+        }
         MIGO_OK
     })
 }
 
+/// Begin asynchronous retirement of one unique attachment.
+///
+/// Successful retirement consumes the borrowed attachment identity and returns
+/// a level-triggered observer. The host must keep the native resource and its
+/// event loop alive until that observer reports RELEASED.
+///
 /// # Safety
-/// `attachment` must come from [`migo_session_attach_surface`] and its session
-/// must still be live. On `MIGO_OK` the handle is consumed.
+/// `attachment` must be the active pointer returned by
+/// [`migo_session_attach_surface`]. `out_release` must be writable for one
+/// pointer. On `MIGO_OK`, `attachment` is invalid and `out_release` owns the
+/// returned handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn migo_surface_detach(attachment: *mut MigoSurfaceAttachment) -> MigoResult {
-    guard("migo_surface_detach", || {
-        if attachment.is_null() {
+pub unsafe extern "C" fn migo_surface_begin_detach(
+    attachment: *mut MigoSurfaceAttachment,
+    out_release: *mut *mut MigoSurfaceRelease,
+) -> MigoResult {
+    guard("migo_surface_begin_detach", || {
+        let Some(out_release) = (unsafe { out_release.as_mut() }) else {
             return MIGO_ERROR_INVALID_ARGUMENT;
-        }
-        let attachment = unsafe { Box::from_raw(attachment) };
-        let session = unsafe { attachment.session.as_ref() };
-        let Ok(mut state) = session.state.lock() else {
-            return MIGO_ERROR_INTERNAL;
         };
-        if let Some(host) = state.host {
-            // Retiring the generation is the synchronous completion boundary the
-            // header promises: no later present may reference it.
-            if let Err(error) = retire_surface(host) {
-                tracing::warn!("migo_surface_detach: retire failed: {error}");
+        *out_release = std::ptr::null_mut();
+        let Some(attachment_ref) = (unsafe { attachment.as_ref() }) else {
+            return MIGO_ERROR_INVALID_ARGUMENT;
+        };
+        let session = match unsafe { pin_session(attachment_ref.session.as_ptr()) } {
+            Ok(session) => session,
+            Err(error) => return error,
+        };
+
+        // Allocate the public handle before retirement. Once the generation is
+        // retired the ABI call is committed and must not surface a retryable
+        // error whose retry would target a different state.
+        let release_storage = Box::<MaybeUninit<MigoSurfaceRelease>>::new(MaybeUninit::uninit());
+
+        let (host, internal_generation, prepared) = {
+            let Ok(mut state) = session.state.lock() else {
+                return MIGO_ERROR_INTERNAL;
+            };
+            if state.surface_transition != SurfaceTransition::Idle {
+                return MIGO_ERROR_INVALID_STATE;
+            }
+            let Some(active) = state.active_attachment.as_ref() else {
+                return MIGO_ERROR_STALE_SURFACE;
+            };
+            if !std::ptr::eq(active.as_ref(), attachment_ref) {
+                return MIGO_ERROR_STALE_SURFACE;
+            }
+            let Some(host) = state.host else {
+                return MIGO_ERROR_INVALID_STATE;
+            };
+            let notification = release_notification(state.notifier.as_ref());
+            let prepared = match active
+                .resource
+                .prepare_release(Arc::clone(&session.pending_surface_releases), notification)
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    tracing::error!("migo_surface_begin_detach: prepare failed: {error}");
+                    return MIGO_ERROR_INVALID_STATE;
+                }
+            };
+            let internal_generation = active.resource.internal_generation();
+            let transition_generation = active.public_generation();
+            state.surface_transition = SurfaceTransition::Detaching;
+            state.surface_transition_generation = Some(transition_generation);
+            debug_assert!(state.pending_surface_loss.is_none());
+            (host, internal_generation, prepared)
+        };
+
+        // Close data-plane admission before the irreversible presentation
+        // boundary. A caller that already acquired the old generation belongs
+        // to the pre-detach stream; new callers fail immediately.
+        session
+            .active_surface_generation
+            .store(0, std::sync::atomic::Ordering::Release);
+
+        // This is the irreversible presentation boundary. A missing registry
+        // means the Host has already exited and released (or is releasing) all
+        // render ownership, which is also terminal and safe to commit.
+        match retire_surface(host) {
+            Ok(Some(retired)) if retired != internal_generation => {
+                tracing::error!(
+                    "migo_surface_begin_detach: retired internal generation {} but attachment owns {}",
+                    retired.get(),
+                    internal_generation.get(),
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(
+                    "migo_surface_begin_detach: Host already unavailable during retire: {error}"
+                );
             }
         }
-        state.attached = false;
+
+        let (owned_attachment, observer) = {
+            // Retirement already committed. Recovering the contained state is
+            // the only ownership-safe response to an otherwise impossible
+            // poison here; returning an error would invite a stale retry and
+            // strand the pending-release registration.
+            let mut state = session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let owned_attachment = state
+                .active_attachment
+                .take()
+                .expect("the reserved attachment cannot disappear during detach");
+            debug_assert!(std::ptr::eq(owned_attachment.as_ref(), attachment_ref));
+            state.pending_surface_loss = None;
+            state.surface_transition_generation = None;
+            state.surface_transition = SurfaceTransition::Idle;
+            let observer = prepared.commit();
+            (owned_attachment, observer)
+        };
+
+        // Initialize and publish the preallocated handle before dropping the
+        // attachment's resource lease. That final drop may complete release and
+        // synchronously dispatch the optional wakeup callback.
+        let release_storage = Box::into_raw(release_storage);
+        unsafe {
+            (*release_storage).write(MigoSurfaceRelease { observer });
+        }
+        *out_release = release_storage.cast::<MigoSurfaceRelease>();
+
+        let _ = send_critical_command_to_host(
+            host,
+            HostCommand::SurfaceDestroyed {
+                generation: internal_generation,
+            },
+        );
+        drop(owned_attachment);
         MIGO_OK
     })
 }
 
-#[cfg(test)]
+/// Query authoritative native-resource release state without blocking.
+///
+/// # Safety
+/// `release` must be a live release handle and `out_status` a writable
+/// versioned output record.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn migo_surface_release_query(
+    release: *const MigoSurfaceRelease,
+    out_status: *mut MigoSurfaceReleaseStatus,
+) -> MigoResult {
+    guard("migo_surface_release_query", || {
+        let Some(release) = (unsafe { release.as_ref() }) else {
+            return MIGO_ERROR_INVALID_ARGUMENT;
+        };
+        let state = match release.observer.phase() {
+            SurfaceReleasePhase::Pending => migo_capi_abi::surface::MIGO_SURFACE_RELEASE_PENDING,
+            SurfaceReleasePhase::Released => migo_capi_abi::surface::MIGO_SURFACE_RELEASE_RELEASED,
+        };
+        unsafe {
+            migo_capi_abi::surface::write_surface_release_status(
+                out_status,
+                release.observer.public_generation().get(),
+                state,
+            )
+        }
+    })
+}
+
+/// Destroy a completed release observer.
+///
+/// # Safety
+/// `release` must be a unique live handle. `MIGO_OK` consumes it; a pending
+/// result leaves ownership with the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn migo_surface_release_destroy(
+    release: *mut MigoSurfaceRelease,
+) -> MigoResult {
+    guard("migo_surface_release_destroy", || {
+        let Some(release_ref) = (unsafe { release.as_ref() }) else {
+            return MIGO_ERROR_INVALID_ARGUMENT;
+        };
+        if release_ref.observer.phase() != SurfaceReleasePhase::Released {
+            return MIGO_ERROR_INVALID_STATE;
+        }
+        drop(unsafe { Box::from_raw(release) });
+        MIGO_OK
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI};
-    use crate::test_support::with_session;
+    use crate::abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI, VersionedHeader};
+    use crate::{
+        migo_session_create, migo_session_destroy,
+        test_support::{session_config, with_engine, with_session},
+    };
+    use shared::surface::{Surface, SurfaceControl, SurfaceLease, SurfaceResourceLease};
+
+    #[derive(Debug)]
+    struct TestSurface;
+
+    impl Surface for TestSurface {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn size(&self) -> (u32, u32) {
+            (640, 480)
+        }
+    }
 
     fn metrics(width: u32, height: u32) -> MigoSurfaceMetrics {
         MigoSurfaceMetrics {
@@ -364,13 +808,187 @@ mod tests {
     /// the engine. The session behind it is real, so the state lock and the
     /// `attached` check are the production ones.
     fn detached_attachment(session: *mut MigoSession) -> MigoSurfaceAttachment {
+        let control = SurfaceControl::new();
+        let token = control.attach_or_update().expect("test generation");
+        let surface: shared::surface::SurfaceRef = Arc::new(TestSurface);
+        let public_generation = PublicSurfaceGeneration::new(1).expect("non-zero");
+        let lease = SurfaceLease::new_tracked(surface, token, public_generation);
         MigoSurfaceAttachment {
             session: NonNull::new(session).expect("session"),
-            generation: 1,
-            target: PlatformTarget::X11 { window: 0x2a0_0001 },
+            public_generation,
+            resource: lease.resource_lease(),
+            target: test_platform_target(),
             width_pixels: 640,
             height_pixels: 480,
+            pixel_ratio: PixelRatio::new(1.0).expect("valid test pixel ratio"),
+            window_state: Arc::new(host_kit::CapiWindowState::new(
+                host_kit::CapiWindowMetrics::new(
+                    640,
+                    480,
+                    PixelRatio::new(1.0).expect("valid test pixel ratio"),
+                ),
+            )),
+            lost: false,
         }
+    }
+
+    fn install_active_attachment(
+        session: *mut MigoSession,
+        retain_extra_lease: bool,
+    ) -> (*mut MigoSurfaceAttachment, Option<SurfaceResourceLease>) {
+        let attachment = Box::new(detached_attachment(session));
+        let extra = retain_extra_lease.then(|| attachment.resource.clone());
+        let pointer = NonNull::from(attachment.as_ref()).as_ptr();
+        let session = unsafe { &*session };
+        let mut state = session.state.lock().expect("SessionControl");
+        state.host = Some(i32::MAX);
+        state.last_public_generation = 1;
+        state.active_attachment = Some(attachment);
+        session
+            .active_surface_generation
+            .store(1, std::sync::atomic::Ordering::Release);
+        (pointer, extra)
+    }
+
+    fn release_status(release: *const MigoSurfaceRelease) -> MigoSurfaceReleaseStatus {
+        let mut status = MigoSurfaceReleaseStatus {
+            header: VersionedHeader {
+                struct_size: size_of::<MigoSurfaceReleaseStatus>() as u32,
+                abi_version: MIGO_ABI_VERSION_CURRENT,
+            },
+            generation: 0,
+            state: u32::MAX,
+            reserved0: u32::MAX,
+        };
+        assert_eq!(
+            unsafe { migo_surface_release_query(release, &mut status) },
+            MIGO_OK,
+        );
+        status
+    }
+
+    #[test]
+    fn unexpected_loss_closes_input_once_and_leaves_attachment_for_release() {
+        crate::test_support::with_session("surface-loss-state", |session| {
+            let (attachment, _extra) = install_active_attachment(session, false);
+            let session_ref = unsafe { &*session };
+
+            assert!(session_ref.mark_surface_lost(1, SurfaceLossReason::PlatformError));
+            assert_eq!(
+                session_ref
+                    .active_surface_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            assert!(!session_ref.mark_surface_lost(1, SurfaceLossReason::PlatformError));
+            let state = session_ref.state.lock().expect("SessionControl");
+            assert!(
+                state
+                    .active_attachment
+                    .as_ref()
+                    .is_some_and(|active| active.lost)
+            );
+            drop(state);
+
+            let mut release = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_surface_begin_detach(attachment, &mut release) },
+                MIGO_OK
+            );
+            assert!(!release.is_null());
+            assert_eq!(unsafe { migo_surface_release_destroy(release) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn loss_during_update_is_deferred_until_the_control_transition_commits() {
+        crate::test_support::with_session("surface-loss-update-race", |session| {
+            let (_attachment, _extra) = install_active_attachment(session, false);
+            let session_ref = unsafe { &*session };
+            {
+                let mut state = session_ref.state.lock().expect("SessionControl");
+                state.surface_transition = SurfaceTransition::Updating;
+                state.surface_transition_generation = Some(1);
+            }
+
+            assert!(!session_ref.mark_surface_lost(1, SurfaceLossReason::PlatformError));
+            assert_eq!(
+                session_ref
+                    .active_surface_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+                1,
+                "the data-plane boundary moves atomically with transition completion",
+            );
+
+            rollback_surface_transition(session_ref);
+            assert_eq!(
+                session_ref
+                    .active_surface_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0,
+            );
+            let state = session_ref.state.lock().expect("SessionControl");
+            assert_eq!(state.surface_transition, SurfaceTransition::Idle);
+            assert!(state.surface_transition_generation.is_none());
+            assert!(
+                state
+                    .active_attachment
+                    .as_ref()
+                    .is_some_and(|active| active.lost),
+            );
+            assert!(state.pending_surface_loss.is_none());
+        });
+    }
+
+    #[test]
+    fn loss_for_the_generation_being_attached_is_recorded_before_installation() {
+        crate::test_support::with_session("surface-loss-attach-race", |session| {
+            let session_ref = unsafe { &*session };
+            {
+                let mut state = session_ref.state.lock().expect("SessionControl");
+                state.surface_transition = SurfaceTransition::Attaching;
+                state.surface_transition_generation = Some(7);
+            }
+
+            assert!(!session_ref.mark_surface_lost(7, SurfaceLossReason::PlatformError));
+            let state = session_ref.state.lock().expect("SessionControl");
+            assert_eq!(
+                state.pending_surface_loss.map(|loss| loss.generation),
+                Some(7),
+            );
+            drop(state);
+
+            // A synchronously failed attach has no public attachment to lose;
+            // rollback consumes the deferred report instead of leaking it into
+            // the next generation.
+            rollback_surface_transition(session_ref);
+            let state = session_ref.state.lock().expect("SessionControl");
+            assert!(state.pending_surface_loss.is_none());
+            assert!(state.surface_transition_generation.is_none());
+        });
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn test_platform_target() -> PlatformTarget {
+        PlatformTarget::X11 {
+            display: NonNull::new(0x1usize as *mut c_void).expect("display"),
+            window: 0x2a0_0001,
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn test_platform_target() -> PlatformTarget {
+        PlatformTarget::NativeWindow {
+            window: 0x2a0_0001usize as *mut c_void,
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos"))
+    )))]
+    fn test_platform_target() -> PlatformTarget {
+        PlatformTarget::TestOnly
     }
 
     #[test]
@@ -442,8 +1060,102 @@ mod tests {
             let mut attachment = detached_attachment(session);
             assert_eq!(
                 unsafe { migo_surface_update(&mut attachment, &metrics(800, 600)) },
-                MIGO_ERROR_INVALID_STATE
+                MIGO_ERROR_STALE_SURFACE
             );
+        });
+    }
+
+    #[test]
+    fn begin_detach_is_irreversible_and_release_remains_queryable_after_session_destroy() {
+        with_engine("release-after-session", |engine| {
+            let mut session = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config(), &mut session) },
+                MIGO_OK,
+            );
+            let (attachment, _extra) = install_active_attachment(session, false);
+            let mut release = std::ptr::null_mut();
+
+            assert_eq!(
+                unsafe { migo_surface_begin_detach(attachment, &mut release) },
+                MIGO_OK,
+            );
+            assert!(!release.is_null());
+            let status = release_status(release);
+            assert_eq!(status.generation, 1);
+            assert_eq!(
+                status.state,
+                migo_capi_abi::surface::MIGO_SURFACE_RELEASE_RELEASED,
+            );
+
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+            assert_eq!(
+                release_status(release).state,
+                migo_capi_abi::surface::MIGO_SURFACE_RELEASE_RELEASED,
+            );
+            assert_eq!(unsafe { migo_surface_release_destroy(release) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn pending_release_blocks_both_release_and_session_destroy_until_last_lease_drops() {
+        with_engine("release-pending", |engine| {
+            let mut session = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config(), &mut session) },
+                MIGO_OK,
+            );
+            let (attachment, extra) = install_active_attachment(session, true);
+            let mut release = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_surface_begin_detach(attachment, &mut release) },
+                MIGO_OK,
+            );
+            assert_eq!(
+                release_status(release).state,
+                migo_capi_abi::surface::MIGO_SURFACE_RELEASE_PENDING,
+            );
+            assert_eq!(
+                unsafe { migo_surface_release_destroy(release) },
+                MIGO_ERROR_INVALID_STATE,
+            );
+            assert_eq!(
+                unsafe { migo_session_destroy(session) },
+                MIGO_ERROR_INVALID_STATE,
+            );
+
+            drop(extra);
+            assert_eq!(
+                release_status(release).state,
+                migo_capi_abi::surface::MIGO_SURFACE_RELEASE_RELEASED,
+            );
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+            assert_eq!(unsafe { migo_surface_release_destroy(release) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn a_non_owned_attachment_pointer_cannot_mutate_or_retire_the_active_one() {
+        with_session("attachment-identity", |session| {
+            let (attachment, _extra) = install_active_attachment(session, false);
+            let mut impostor = detached_attachment(session);
+            let mut release = 1usize as *mut MigoSurfaceRelease;
+
+            assert_eq!(
+                unsafe { migo_surface_update(&mut impostor, &metrics(800, 600)) },
+                MIGO_ERROR_STALE_SURFACE,
+            );
+            assert_eq!(
+                unsafe { migo_surface_begin_detach(&mut impostor, &mut release) },
+                MIGO_ERROR_STALE_SURFACE,
+            );
+            assert!(release.is_null(), "rejected detach must clear stale output");
+
+            assert_eq!(
+                unsafe { migo_surface_begin_detach(attachment, &mut release) },
+                MIGO_OK,
+            );
+            assert_eq!(unsafe { migo_surface_release_destroy(release) }, MIGO_OK);
         });
     }
 

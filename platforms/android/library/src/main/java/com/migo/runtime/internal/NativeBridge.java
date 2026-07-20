@@ -91,8 +91,10 @@ public final class NativeBridge {
      * @param surface   New Android Surface object
      * @param width     Surface buffer width in physical pixels
      * @param height    Surface buffer height in physical pixels
+     * @param density   Current device-pixel ratio for this display
      */
-    public static native void updateSurface(int sessionId, Object surface, int width, int height);
+    public static native void updateSurface(
+            int sessionId, Object surface, int width, int height, float density);
 
     /**
      * Notify that the current rendering surface has been destroyed.

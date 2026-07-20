@@ -1,50 +1,43 @@
 //! `ANativeWindow` surface construction for Android hosts.
 
-use std::{ffi::c_void, ptr::NonNull, sync::Arc};
+use std::{ffi::c_void, sync::Arc};
 
+use migo_capi_abi::surface::{
+    MIGO_PLATFORM_ANDROID_NATIVE_WINDOW, SurfaceDescriptorRef, ValidatedPlatformSurface,
+};
 use shared::surface::SurfaceRef;
 
-use crate::{
-    MIGO_PLATFORM_ANDROID_NATIVE_WINDOW,
-    abi::{
-        MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_UNSUPPORTED_PLATFORM,
-        MigoResult, VersionedHeader, validate_header,
-    },
-    surface::{MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor},
-};
+use crate::abi::{MIGO_ERROR_INTERNAL, MIGO_ERROR_UNSUPPORTED_PLATFORM, MigoResult};
 
-/// What a resize needs in order to rebuild the surface.
+/// Native identity retained for a later resize.
 ///
-/// The pointer is the host's window, which outlives the attachment: the host
-/// owns it, and the engine holds a strong reference of its own for as long as a
-/// surface wraps it. A resize builds a new wrapper around the same window.
+/// The host contract keeps the window alive through attachment retirement.
+/// Every engine surface wrapper acquires and releases its own strong native
+/// reference, so overlapping old/new GPU generations never share one ref.
 #[derive(Clone, Copy)]
 pub(crate) enum PlatformTarget {
     NativeWindow { window: *mut c_void },
 }
 
-// The pointer is only ever handed back to ANativeWindow APIs, which are
-// thread-safe, and the engine holds its own reference for the lifetime of each
-// surface. Being able to send it is what lets a resize arrive on a thread other
-// than the one that attached.
+// ANativeWindow reference counting and buffer APIs are thread-safe. The token
+// is never dereferenced as Rust memory; it is only passed back to NDK APIs.
 unsafe impl Send for PlatformTarget {}
 unsafe impl Sync for PlatformTarget {}
 
-/// The surface kinds this build can attach, as a `MIGO_PLATFORM_*` bitmask.
-///
-/// See the desktop counterpart: `build_target` tests membership here rather
-/// than carrying its own constant, so the capability query cannot drift out of
-/// step with what an attach really accepts.
 pub(crate) const fn supported_platform_kinds() -> u64 {
     1u64 << MIGO_PLATFORM_ANDROID_NATIVE_WINDOW
 }
 
-pub(crate) fn rebuild_surface(target: PlatformTarget, width: u32, height: u32) -> SurfaceRef {
+pub(crate) fn rebuild_surface(
+    target: PlatformTarget,
+    width: u32,
+    height: u32,
+) -> Result<SurfaceRef, MigoResult> {
     match target {
         PlatformTarget::NativeWindow { window } => {
-            // Acquire again for the new wrapper rather than sharing: each
-            // wrapper releases in Drop, so two wrappers must not hold one
-            // reference between them.
+            // A separate acquire is required because both the retiring and new
+            // render generations may coexist until the render thread fences
+            // the old one.
             let wrapper = unsafe {
                 platform::android::surface::AndroidSurfaceWrapper::from_borrowed_acquire(
                     window.cast(),
@@ -52,19 +45,18 @@ pub(crate) fn rebuild_surface(target: PlatformTarget, width: u32, height: u32) -
                     height,
                 )
             }
-            .expect("window pointer was validated at attach");
-            Arc::new(wrapper)
+            .map_err(|error| {
+                tracing::error!("rebuild_surface: native window: {error}");
+                MIGO_ERROR_INTERNAL
+            })?;
+            Ok(Arc::new(wrapper))
         }
     }
 }
 
-/// Translate a validated descriptor into the engine's surface, graphics
-/// platform, and the values a later resize needs.
-///
-/// # Safety
-/// `descriptor` must have passed [`validate_header`].
-pub(crate) unsafe fn build_target(
-    descriptor: &MigoSurfaceDescriptor,
+/// Turn a fully copied and validated ABI value into Android engine objects.
+pub(crate) fn build_target(
+    descriptor: SurfaceDescriptorRef,
 ) -> Result<
     (
         SurfaceRef,
@@ -73,47 +65,23 @@ pub(crate) unsafe fn build_target(
     ),
     MigoResult,
 > {
-    if !crate::platform::kind_is_supported(descriptor.platform_kind) {
+    let ValidatedPlatformSurface::Android { native_window } = descriptor.platform() else {
         return Err(MIGO_ERROR_UNSUPPORTED_PLATFORM);
-    }
-    // The envelope's size field and the payload's own struct_size are an
-    // intentional cross-check; disagreeing means the caller mismatched them.
-    if descriptor.platform_descriptor_size as usize
-        != size_of::<MigoAndroidNativeWindowDescriptor>()
-    {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-    unsafe {
-        validate_header(
-            descriptor.platform_descriptor as *const VersionedHeader,
-            size_of::<MigoAndroidNativeWindowDescriptor>(),
-        )
-    }?;
-    let android =
-        unsafe { &*(descriptor.platform_descriptor as *const MigoAndroidNativeWindowDescriptor) };
-    if android.platform_kind != MIGO_PLATFORM_ANDROID_NATIVE_WINDOW {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-    let Some(window) = NonNull::new(android.native_window) else {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
     };
-    if descriptor.width_pixels == 0 || descriptor.height_pixels == 0 {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
+    let configuration = descriptor.configuration();
 
-    // from_borrowed_acquire, not from_surface_owned: the host keeps its own
-    // reference to the window, so the engine takes one of its own and releases
-    // it in Drop. This is the rule include/migo/platform/android.h states.
+    // The host retains its reference; Migo acquires an independent one and the
+    // wrapper releases exactly that reference from Drop.
     let wrapper = unsafe {
         platform::android::surface::AndroidSurfaceWrapper::from_borrowed_acquire(
-            window.as_ptr().cast(),
-            descriptor.width_pixels,
-            descriptor.height_pixels,
+            native_window.as_ptr().cast(),
+            configuration.width_pixels(),
+            configuration.height_pixels(),
         )
     }
     .map_err(|error| {
         tracing::error!("build_target: native window: {error}");
-        MIGO_ERROR_INVALID_ARGUMENT
+        migo_capi_abi::MIGO_ERROR_INVALID_ARGUMENT
     })?;
 
     let graphics_platform =
@@ -126,7 +94,7 @@ pub(crate) unsafe fn build_target(
         Arc::new(wrapper),
         graphics_platform,
         PlatformTarget::NativeWindow {
-            window: window.as_ptr(),
+            window: native_window.as_ptr(),
         },
     ))
 }
@@ -134,104 +102,12 @@ pub(crate) unsafe fn build_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::MIGO_ABI_VERSION_CURRENT;
-
-    fn envelope(
-        platform_kind: u32,
-        descriptor_size: u32,
-        payload: *const c_void,
-    ) -> MigoSurfaceDescriptor {
-        MigoSurfaceDescriptor {
-            header: VersionedHeader {
-                struct_size: size_of::<MigoSurfaceDescriptor>() as u32,
-                abi_version: MIGO_ABI_VERSION_CURRENT,
-            },
-            generation: 1,
-            platform_kind,
-            flags: 0,
-            width_pixels: 720,
-            height_pixels: 1280,
-            scale_factor: 3.0,
-            color_space: 0,
-            alpha_mode: 0,
-            preferred_presentation_mode: 0,
-            capability_flags: 0,
-            platform_descriptor_size: descriptor_size,
-            reserved0: 0,
-            platform_descriptor: payload,
-        }
-    }
-
-    fn payload(window: *mut c_void) -> MigoAndroidNativeWindowDescriptor {
-        MigoAndroidNativeWindowDescriptor {
-            header: VersionedHeader {
-                struct_size: size_of::<MigoAndroidNativeWindowDescriptor>() as u32,
-                abi_version: MIGO_ABI_VERSION_CURRENT,
-            },
-            platform_kind: MIGO_PLATFORM_ANDROID_NATIVE_WINDOW,
-            flags: 0,
-            native_window: window,
-        }
-    }
 
     #[test]
-    fn other_platforms_are_reported_as_unsupported_not_invalid() {
-        // A host on a platform this build does not implement should learn that,
-        // rather than think its descriptor was malformed.
-        let descriptor = envelope(
-            6, // MIGO_PLATFORM_X11_WINDOW
-            size_of::<MigoAndroidNativeWindowDescriptor>() as u32,
-            std::ptr::null(),
-        );
+    fn android_capability_mask_has_exactly_the_native_window_kind() {
         assert_eq!(
-            unsafe { build_target(&descriptor) }.err(),
-            Some(MIGO_ERROR_UNSUPPORTED_PLATFORM)
-        );
-    }
-
-    #[test]
-    fn descriptor_size_mismatch_is_rejected() {
-        let android = payload(0xdead_beef_usize as *mut c_void);
-        let descriptor = envelope(
-            MIGO_PLATFORM_ANDROID_NATIVE_WINDOW,
-            8, // wrong on purpose
-            &android as *const _ as *const c_void,
-        );
-        assert_eq!(
-            unsafe { build_target(&descriptor) }.err(),
-            Some(MIGO_ERROR_INVALID_ARGUMENT)
-        );
-    }
-
-    #[test]
-    fn a_null_window_is_rejected_before_any_native_call() {
-        // Rejecting here is what keeps a null from reaching
-        // ANativeWindow_acquire, where it would be undefined behaviour rather
-        // than an error code.
-        let android = payload(std::ptr::null_mut());
-        let descriptor = envelope(
-            MIGO_PLATFORM_ANDROID_NATIVE_WINDOW,
-            size_of::<MigoAndroidNativeWindowDescriptor>() as u32,
-            &android as *const _ as *const c_void,
-        );
-        assert_eq!(
-            unsafe { build_target(&descriptor) }.err(),
-            Some(MIGO_ERROR_INVALID_ARGUMENT)
-        );
-    }
-
-    #[test]
-    fn a_zero_sized_surface_is_rejected() {
-        let android = payload(0xdead_beef_usize as *mut c_void);
-        let mut descriptor = envelope(
-            MIGO_PLATFORM_ANDROID_NATIVE_WINDOW,
-            size_of::<MigoAndroidNativeWindowDescriptor>() as u32,
-            &android as *const _ as *const c_void,
-        );
-        descriptor.width_pixels = 0;
-        assert_eq!(
-            unsafe { build_target(&descriptor) }.err(),
-            Some(MIGO_ERROR_INVALID_ARGUMENT)
+            supported_platform_kinds(),
+            1u64 << MIGO_PLATFORM_ANDROID_NATIVE_WINDOW
         );
     }
 }

@@ -38,13 +38,19 @@
 use std::{any::Any, sync::Arc};
 
 mod attachment;
+mod control;
 mod geometry;
 
+pub use control::{SurfaceControl, SurfaceControlAttachError, SurfaceControlInstallError};
+
 pub use attachment::{
-    SurfaceGeneration, SurfaceGenerationError, SurfaceGenerationGate, SurfaceLease,
-    SurfaceLivenessToken,
+    PreparedSurfaceRelease, PublicSurfaceGeneration, SurfaceGeneration, SurfaceGenerationError,
+    SurfaceGenerationGate, SurfaceGenerationMismatch, SurfaceLease, SurfaceLivenessToken,
+    SurfaceReleaseDisposition, SurfaceReleaseNotification, SurfaceReleaseObserver,
+    SurfaceReleasePhase, SurfaceReleaseRegistrationError, SurfaceReleaseTransactionError,
+    SurfaceResourceLease, release_retired_resource,
 };
-pub use geometry::{SafeArea, WindowInfo};
+pub use geometry::{PixelRatio, SafeArea, SurfaceLossReason, WindowInfo};
 
 /// A platform window/surface abstraction used by the renderer.
 ///

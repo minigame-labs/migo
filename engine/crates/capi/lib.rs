@@ -6,14 +6,14 @@
 //! strings, handles consumed on success, no panic across the boundary) is
 //! enforced in [`abi`].
 //!
-//! Scope of this slice: engine and session lifetime, X11 surface attach/detach,
-//! and content loading — enough for a C host to put a game on screen. Callbacks
-//! and the lifecycle/visibility/focus calls are declared in the headers but not
-//! implemented yet; they are the next slice (see
-//! `docs/superpowers/plans/2026-07-18-c-abi-runtime-plan.md`), and until then
-//! `MIGO_C_ABI_HAS_RUNTIME` stays 0 so nothing advertises a complete runtime.
+//! The implementation is embedding-first: hosts retain their native window and
+//! event-loop ownership, while Migo owns engine/session state and explicit
+//! asynchronous Surface retirement. Platform availability and ABI stability
+//! are advertised by the public headers and artifact manifests, not inferred
+//! from which Rust modules happened to compile.
 
 mod abi;
+mod callback_gate;
 mod callbacks;
 mod capabilities;
 mod gamepad;
@@ -37,66 +37,31 @@ pub use keyboard::{
     MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent, migo_session_send_composition_event,
     migo_session_send_key_event, migo_session_send_keyboard_event,
 };
+pub use migo_capi_abi::config::{MigoContentDescriptor, MigoEngineConfig, MigoSessionConfig};
 pub use surface::{
     MigoAndroidNativeWindowDescriptor, MigoSurfaceAttachment, MigoSurfaceDescriptor,
-    MigoSurfaceMetrics, MigoX11WindowDescriptor, migo_session_attach_surface, migo_surface_detach,
-    migo_surface_update,
+    MigoSurfaceMetrics, MigoSurfaceRelease, MigoSurfaceReleaseStatus, MigoWaylandSurfaceDescriptor,
+    MigoX11WindowDescriptor, migo_session_attach_surface, migo_surface_begin_detach,
+    migo_surface_release_destroy, migo_surface_release_query, migo_surface_update,
 };
 
+#[cfg(test)]
+use migo_capi_abi::config::MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT;
+
 use std::{
-    ffi::c_void,
-    os::raw::c_char,
     path::PathBuf,
-    ptr::NonNull,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
 use abi::{
     MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE,
-    MIGO_ERROR_UNSUPPORTED_PLATFORM, MIGO_OK, MigoResult, VersionedHeader, copy_utf8, guard,
-    validate_header,
+    MIGO_ERROR_WOULD_BLOCK, MIGO_OK, MigoResult, guard,
 };
-use core::{PlatformServices, send_command_to_host, shutdown_host, spawn_host_thread};
-use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceRef};
-
-/// `MIGO_PLATFORM_X11_WINDOW` from `include/migo/surface.h`.
-const MIGO_PLATFORM_X11_WINDOW: u32 = 6;
-
-/// `MIGO_PLATFORM_WAYLAND_SURFACE` from `include/migo/surface.h`.
-const MIGO_PLATFORM_WAYLAND_SURFACE: u32 = 7;
-
-/// `MIGO_PLATFORM_ANDROID_NATIVE_WINDOW` from `include/migo/surface.h`.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-const MIGO_PLATFORM_ANDROID_NATIVE_WINDOW: u32 = 1;
-
-// ---- C struct mirrors -------------------------------------------------------
-// Field-for-field mirrors of the headers. Any divergence is an ABI break, so
-// they are checked against the headers by the layout tests below.
-
-#[repr(C)]
-struct MigoEngineConfig {
-    header: VersionedHeader,
-    flags: u64,
-    reserved0: u32,
-    files_dir_utf8: *const c_char,
-    cache_dir_utf8: *const c_char,
-    code_cache_dir_utf8: *const c_char,
-}
-
-#[repr(C)]
-struct MigoSessionConfig {
-    header: VersionedHeader,
-    flags: u64,
-}
-
-#[repr(C)]
-struct MigoContentDescriptor {
-    header: VersionedHeader,
-    flags: u32,
-    reserved0: u32,
-    content_id_utf8: *const c_char,
-    entry_utf8: *const c_char,
-}
+use core::{send_command_to_host, shutdown_host};
+use shared::{protocol::host_cmd::HostCommand, surface::SurfaceLossReason};
 
 // ---- Handles ----------------------------------------------------------------
 
@@ -112,38 +77,235 @@ struct EngineInner {
     live_sessions: Mutex<usize>,
 }
 
-/// `MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT` from `include/migo/session.h`.
-const MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT: u64 = 1 << 0;
-
 pub struct MigoEngine {
     inner: Arc<EngineInner>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SurfaceTransition {
+    #[default]
+    Idle,
+    Attaching,
+    Updating,
+    Detaching,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LifecycleState {
+    #[default]
+    Created,
+    Running,
+    Paused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingSurfaceLoss {
+    generation: u64,
+    reason: SurfaceLossReason,
+}
+
 struct SessionState {
+    lifecycle: LifecycleState,
     /// Installed once, before the first attach, per the header's rule that a
     /// queued task must never see a replaced pointer.
     callbacks: Option<callbacks::HostCallbacks>,
+    /// Distinguishes a deliberately empty callback set from not configured.
+    callbacks_configured: bool,
+    /// Frozen at the first attach or RUNNING transition.
+    callbacks_frozen: bool,
     /// Set once a surface has been attached; the engine host thread owns the
     /// render loop from that point.
     host: Option<i32>,
     content_loaded: bool,
-    attached: bool,
-    /// Visibility the host set before a surface existed.
+    /// Unique attachment allocation. The public pointer is borrowed identity;
+    /// only this slot owns and may drop the Box.
+    active_attachment: Option<Box<surface::MigoSurfaceAttachment>>,
+    /// Highest public generation accepted for this Session. Zero means no
+    /// attachment has ever been accepted.
+    last_public_generation: u64,
+    /// Serializes cold-path attach/update/detach work while SessionControl is
+    /// deliberately unlocked around platform/engine calls.
+    surface_transition: SurfaceTransition,
+    /// Public generation reserved by the current attach/update/detach. Keeping
+    /// it explicit lets a renderer-side loss be correlated even before an
+    /// attaching handle has been installed in `active_attachment`.
+    surface_transition_generation: Option<u64>,
+    /// First unexpected loss observed while attach/update owns the control
+    /// transition. Applied exactly once when that transition commits or rolls
+    /// back; detach intentionally suppresses its own retirement signal.
+    pending_surface_loss: Option<PendingSurfaceLoss>,
+    /// Immutable callback router created with the first Host. It owns only a
+    /// Weak Session reference, so this is not a reference cycle.
+    notifier: Option<Arc<callbacks::Notifier>>,
+    /// Dynamic physical window metrics shared with the C HostKit. Retained by
+    /// the Session so detach/reattach updates the same service object.
+    window_state: Option<Arc<host_kit::CapiWindowState>>,
+    /// Last visibility level set by the host.
     ///
     /// Visibility is a property of the session, not of the surface, and every
     /// Android lifecycle delivers RESUME before the window arrives. Rejecting
     /// the call until something is attached would make correct hosts look
     /// wrong; the value is remembered and applied when the surface lands.
-    pending_visible: Option<bool>,
+    visibility: Option<bool>,
+    /// Last focus level. Like visibility, this is a Session property retained
+    /// across native Surface replacement.
+    focused: Option<bool>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            lifecycle: LifecycleState::Created,
+            callbacks: None,
+            callbacks_configured: false,
+            callbacks_frozen: false,
+            host: None,
+            content_loaded: false,
+            active_attachment: None,
+            last_public_generation: 0,
+            surface_transition: SurfaceTransition::Idle,
+            surface_transition_generation: None,
+            pending_surface_loss: None,
+            notifier: None,
+            window_state: None,
+            visibility: None,
+            focused: None,
+        }
+    }
 }
 
 pub struct MigoSession {
     engine: Arc<EngineInner>,
     state: Mutex<SessionState>,
-    /// Cleared by destroy so queued callbacks cancel instead of handing the
-    /// host a session pointer it has already released.
-    alive: Arc<std::sync::atomic::AtomicBool>,
+    /// Logical lifetime and callback admission. The raw C handle owns one Arc
+    /// strong reference; every entry point and queued callback pins another.
+    /// Destruction closes this gate and drains callbacks that already started
+    /// on other threads before the raw handle is consumed.
+    callback_gate: callback_gate::CallbackGate,
+    /// Release observers do not retain the Session, so completion updates this
+    /// separate counter through an Arc without taking SessionControl.
+    pending_surface_releases: Arc<AtomicUsize>,
+    /// Installed exactly once after the first Host reaches its ready boundary.
+    /// Hot input/vsync calls read these cloned senders without a registry lock.
+    ingress: OnceLock<core::HostIngress>,
+    /// Public generation currently accepting data-plane events; zero means no
+    /// attached Surface. Release/Acquire pairs detach with hot callers.
+    active_surface_generation: AtomicU64,
+    /// Connected gamepad topology packed per stable Web index. Publication is
+    /// ordered after successful command enqueue.
+    gamepad_topology: gamepad::GamepadTopology,
+}
+
+impl MigoSession {
+    #[inline]
+    pub(crate) fn is_open(&self) -> bool {
+        self.callback_gate.is_open()
+    }
+
+    #[inline]
+    pub(crate) fn active_ingress(&self) -> Result<&core::HostIngress, MigoResult> {
+        if self.active_surface_generation.load(Ordering::Acquire) == 0 {
+            return Err(MIGO_ERROR_INVALID_STATE);
+        }
+        self.ingress.get().ok_or(MIGO_ERROR_INTERNAL)
+    }
+
+    /// Linearize an unexpected renderer-side Surface loss against host detach.
+    ///
+    /// Both paths take `SessionControl`: whichever reserves the attachment
+    /// first owns the observable outcome. A detach already in progress
+    /// suppresses loss notification; a loss that wins closes data admission and
+    /// leaves the handle available only for release.
+    pub(crate) fn mark_surface_lost(
+        &self,
+        public_generation: u64,
+        reason: SurfaceLossReason,
+    ) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(error) => error.into_inner(),
+        };
+        match state.surface_transition {
+            SurfaceTransition::Detaching => return false,
+            SurfaceTransition::Attaching | SurfaceTransition::Updating => {
+                if state.surface_transition_generation != Some(public_generation) {
+                    return false;
+                }
+                if state.pending_surface_loss.is_none() {
+                    state.pending_surface_loss = Some(PendingSurfaceLoss {
+                        generation: public_generation,
+                        reason,
+                    });
+                }
+                return false;
+            }
+            SurfaceTransition::Idle => {
+                debug_assert!(state.surface_transition_generation.is_none());
+                debug_assert!(state.pending_surface_loss.is_none());
+            }
+        }
+        let Some(active) = state.active_attachment.as_mut() else {
+            return false;
+        };
+        if active.public_generation() != public_generation || active.is_lost() {
+            return false;
+        }
+        match self.active_surface_generation.compare_exchange(
+            public_generation,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                active.mark_lost();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn map_ingress_result(
+    entry: &'static str,
+    result: Result<(), core::HostIngressSendError>,
+) -> MigoResult {
+    match result {
+        Ok(()) => MIGO_OK,
+        Err(core::HostIngressSendError::Full) => {
+            tracing::debug!("{entry}: Host queue or payload pool is full");
+            MIGO_ERROR_WOULD_BLOCK
+        }
+        Err(core::HostIngressSendError::Closed) => {
+            tracing::debug!("{entry}: Host ingress is closed");
+            MIGO_ERROR_INVALID_STATE
+        }
+    }
+}
+
+/// Temporarily pin a live raw Session handle for one ABI call.
+///
+/// As with every C handle API, the caller must not race destruction with a new
+/// call through the same raw pointer. Reentrant destruction is safe because an
+/// already-entered call or callback owns a strong pin until it returns.
+///
+/// # Safety
+/// `session` is null or is the still-owned raw pointer produced by
+/// `Arc::into_raw` in [`migo_session_create`].
+pub(crate) unsafe fn pin_session(
+    session: *mut MigoSession,
+) -> Result<Arc<MigoSession>, MigoResult> {
+    if session.is_null() {
+        return Err(MIGO_ERROR_INVALID_ARGUMENT);
+    }
+    // SAFETY: guaranteed by the function contract. The increment is balanced
+    // by the Arc returned from `from_raw`.
+    unsafe { Arc::increment_strong_count(session.cast_const()) };
+    let pinned = unsafe { Arc::from_raw(session.cast_const()) };
+    if !pinned.is_open() {
+        return Err(MIGO_ERROR_INVALID_STATE);
+    }
+    Ok(pinned)
 }
 
 // ---- Engine -----------------------------------------------------------------
@@ -160,28 +322,14 @@ pub unsafe extern "C" fn migo_engine_create(
         let Some(out_engine) = (unsafe { out_engine.as_mut() }) else {
             return MIGO_ERROR_INVALID_ARGUMENT;
         };
-        if let Err(error) = unsafe {
-            validate_header(
-                config as *const VersionedHeader,
-                size_of::<MigoEngineConfig>(),
-            )
-        } {
-            return error;
-        }
-        let config = unsafe { &*config };
-
-        let (files_dir, cache_dir, code_cache_dir) = match (
-            unsafe { copy_utf8(config.files_dir_utf8) },
-            unsafe { copy_utf8(config.cache_dir_utf8) },
-            unsafe { copy_utf8(config.code_cache_dir_utf8) },
-        ) {
-            (Ok(files), Ok(cache), Ok(code_cache)) => (files, cache, code_cache),
-            _ => return MIGO_ERROR_INVALID_ARGUMENT,
+        let config = match unsafe { MigoEngineConfig::parse(config) } {
+            Ok(config) => config,
+            Err(error) => return error,
         };
 
         // The host owns the layout; we only make sure the roots it named exist
         // before the engine starts writing under them.
-        for dir in [&files_dir, &cache_dir, &code_cache_dir] {
+        for dir in [&config.files_dir, &config.cache_dir, &config.code_cache_dir] {
             if std::fs::create_dir_all(dir).is_err() {
                 return MIGO_ERROR_INVALID_ARGUMENT;
             }
@@ -191,10 +339,10 @@ pub unsafe extern "C" fn migo_engine_create(
 
         let engine = Box::new(MigoEngine {
             inner: Arc::new(EngineInner {
-                files_dir: PathBuf::from(files_dir),
-                cache_dir: PathBuf::from(cache_dir),
-                code_cache_dir: PathBuf::from(code_cache_dir),
-                allow_unsigned_content: config.flags & MIGO_ENGINE_FLAG_ALLOW_UNSIGNED_CONTENT != 0,
+                files_dir: PathBuf::from(config.files_dir),
+                cache_dir: PathBuf::from(config.cache_dir),
+                code_cache_dir: PathBuf::from(config.code_cache_dir),
+                allow_unsigned_content: config.allow_unsigned_content,
                 live_sessions: Mutex::new(0),
             }),
         });
@@ -241,12 +389,7 @@ pub unsafe extern "C" fn migo_session_create(
         let Some(out_session) = (unsafe { out_session.as_mut() }) else {
             return MIGO_ERROR_INVALID_ARGUMENT;
         };
-        if let Err(error) = unsafe {
-            validate_header(
-                config as *const VersionedHeader,
-                size_of::<MigoSessionConfig>(),
-            )
-        } {
+        if let Err(error) = unsafe { MigoSessionConfig::parse(config) } {
             return error;
         }
 
@@ -254,12 +397,16 @@ pub unsafe extern "C" fn migo_session_create(
             Ok(mut live) => *live += 1,
             Err(_) => return MIGO_ERROR_INTERNAL,
         }
-        let session = Box::new(MigoSession {
+        let session = Arc::new(MigoSession {
             engine: Arc::clone(&engine.inner),
             state: Mutex::new(SessionState::default()),
-            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            callback_gate: callback_gate::CallbackGate::new(),
+            pending_surface_releases: Arc::new(AtomicUsize::new(0)),
+            ingress: OnceLock::new(),
+            active_surface_generation: AtomicU64::new(0),
+            gamepad_topology: gamepad::GamepadTopology::new(),
         });
-        *out_session = Box::into_raw(session);
+        *out_session = Arc::into_raw(session).cast_mut();
         MIGO_OK
     })
 }
@@ -269,25 +416,57 @@ pub unsafe extern "C" fn migo_session_create(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn migo_session_destroy(session: *mut MigoSession) -> MigoResult {
     guard("migo_session_destroy", || {
-        if session.is_null() {
-            return MIGO_ERROR_INVALID_ARGUMENT;
+        let pinned = match unsafe { pin_session(session) } {
+            Ok(session) => session,
+            Err(error) => return error,
+        };
+
+        // Acquire every fallible lock and validate every destroy guard before
+        // the logical/raw ownership boundary. A rejected destroy changes
+        // nothing and remains retryable.
+        let Ok(mut live_sessions) = pinned.engine.live_sessions.lock() else {
+            return MIGO_ERROR_INTERNAL;
+        };
+        let Ok(mut state) = pinned.state.lock() else {
+            return MIGO_ERROR_INTERNAL;
+        };
+        if state.surface_transition != SurfaceTransition::Idle
+            || state.active_attachment.is_some()
+            || pinned.pending_surface_releases.load(Ordering::Acquire) != 0
+        {
+            return MIGO_ERROR_INVALID_STATE;
         }
-        let session = unsafe { Box::from_raw(session) };
-        // Cancel queued callbacks before anything else: from here on the
-        // session pointer must never reach host code again.
-        session
-            .alive
-            .store(false, std::sync::atomic::Ordering::Release);
-        // Stopping the host also retires whatever surface is still attached,
-        // which is why the header documents destroy as consuming every live
-        // attachment.
-        let host = session.state.lock().ok().and_then(|state| state.host);
+        if *live_sessions == 0 {
+            return MIGO_ERROR_INTERNAL;
+        }
+
+        // The successful close is the logical destruction boundary. It rejects
+        // queued/later callbacks and new ABI operations. A concurrent second
+        // destroy can have passed `pin_session` before this boundary, so close
+        // is checked again while the Session state is serialized.
+        let callback_drain = match pinned.callback_gate.close() {
+            Ok(drain) => drain,
+            Err(_) => return MIGO_ERROR_INVALID_STATE,
+        };
+        let host = state.host.take();
+        state.notifier.take();
+        *live_sessions -= 1;
+        drop(state);
+        drop(live_sessions);
+
+        // Never wait while holding a Migo lock: an already-started callback may
+        // be finishing an ABI call. Callback frames on this thread are exempt,
+        // which preserves documented reentrant destruction.
+        callback_drain.wait();
+
         if let Some(host) = host {
             let _ = shutdown_host(host);
         }
-        if let Ok(mut live) = session.engine.live_sessions.lock() {
-            *live = live.saturating_sub(1);
-        }
+
+        // Consume exactly the one strong reference exported as the C handle.
+        // `pinned` (and any currently executing callback) keeps the allocation
+        // alive until its own stack has unwound.
+        drop(unsafe { Arc::from_raw(session.cast_const()) });
         MIGO_OK
     })
 }
@@ -301,22 +480,13 @@ pub unsafe extern "C" fn migo_session_load_content(
     content: *const MigoContentDescriptor,
 ) -> MigoResult {
     guard("migo_session_load_content", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
+            Err(error) => return error,
         };
-        if let Err(error) = unsafe {
-            validate_header(
-                content as *const VersionedHeader,
-                size_of::<MigoContentDescriptor>(),
-            )
-        } {
-            return error;
-        }
-        let content = unsafe { &*content };
-        let (Ok(content_id), Ok(entry)) = (unsafe { copy_utf8(content.content_id_utf8) }, unsafe {
-            copy_utf8(content.entry_utf8)
-        }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
+        let content = match unsafe { MigoContentDescriptor::parse(content) } {
+            Ok(content) => content,
+            Err(error) => return error,
         };
 
         let Ok(mut state) = session.state.lock() else {
@@ -334,8 +504,8 @@ pub unsafe extern "C" fn migo_session_load_content(
         match send_command_to_host(
             host,
             HostCommand::EvaluateModule {
-                game_id: content_id,
-                entry,
+                game_id: content.content_id,
+                entry: content.entry,
             },
         ) {
             Ok(()) => {
@@ -359,22 +529,11 @@ pub unsafe extern "C" fn migo_session_set_host_callbacks(
     callbacks: *const callbacks::MigoHostCallbacks,
 ) -> MigoResult {
     guard("migo_session_set_host_callbacks", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
-        };
-        // Copied rather than reinterpreted: a host compiled against an earlier
-        // header wrote fewer bytes than this struct now holds, and reading the
-        // appended fields straight from its pointer would read past what it
-        // allocated. `copy_versioned` reads only what the caller announced and
-        // leaves the rest null, which is what "that host never had this
-        // callback" already means.
-        let raw = match unsafe {
-            abi::copy_versioned::<callbacks::MigoHostCallbacks>(callbacks as *const VersionedHeader)
-        } {
-            Ok(raw) => raw,
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
             Err(error) => return error,
         };
-        let copied = match unsafe { callbacks::HostCallbacks::from_c(&raw) } {
+        let copied = match unsafe { callbacks::MigoHostCallbacks::parse(callbacks) } {
             Ok(copied) => copied,
             Err(error) => return error,
         };
@@ -384,10 +543,11 @@ pub unsafe extern "C" fn migo_session_set_host_callbacks(
         };
         // Install-once, before the first attach: a second set would let tasks
         // already queued against the old pointers run against the new ones.
-        if state.callbacks.is_some() || state.host.is_some() {
+        if state.callbacks_configured || state.callbacks_frozen || state.host.is_some() {
             return MIGO_ERROR_INVALID_STATE;
         }
-        state.callbacks = Some(copied);
+        state.callbacks = copied;
+        state.callbacks_configured = true;
         MIGO_OK
     })
 }
@@ -413,49 +573,63 @@ pub unsafe extern "C" fn migo_session_notify_vsync(
     frame_time_nanos: i64,
 ) -> MigoResult {
     guard("migo_session_notify_vsync", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
+            Err(error) => return error,
+        };
+        if frame_time_nanos < 0 {
             return MIGO_ERROR_INVALID_ARGUMENT;
+        }
+        let ingress = match session.active_ingress() {
+            Ok(ingress) => ingress,
+            Err(error) => return error,
         };
-        let Ok(state) = session.state.lock() else {
-            return MIGO_ERROR_INTERNAL;
-        };
-        // Nothing is rendering yet, so there is no frame to pace. Reporting
-        // success would tell the host its tick was consumed.
-        let Some(host) = state.host else {
-            return MIGO_ERROR_INVALID_STATE;
-        };
-        drop(state);
         // The engine measures frame time in milliseconds; the host reports the
         // platform's nanosecond timestamp, so the conversion belongs here
         // rather than in every host.
-        core::send_vsync(host, frame_time_nanos as f64 / 1_000_000.0);
-        MIGO_OK
+        match ingress.try_send_vsync(frame_time_nanos as f64 / 1_000_000.0) {
+            // Frame ticks are level-like and the channel retains an earlier
+            // pending tick. Saturation therefore coalesces instead of asking a
+            // host to retry an obsolete timestamp.
+            Ok(()) | Err(core::HostIngressSendError::Full) => MIGO_OK,
+            Err(core::HostIngressSendError::Closed) => MIGO_ERROR_INVALID_STATE,
+        }
     })
 }
 
-fn drive_visibility(session: &MigoSession, visible: bool) -> MigoResult {
-    let Ok(mut state) = session.state.lock() else {
-        return MIGO_ERROR_INTERNAL;
-    };
-    // Before a surface exists there is nothing to show or hide yet, but the
-    // host is not wrong to have said so: remember it for attach.
-    let Some(host) = state.host else {
-        state.pending_visible = Some(visible);
+fn drive_visibility_locked(state: &mut SessionState, visible: bool) -> MigoResult {
+    // Before a surface exists (including an in-progress attach/detach) there
+    // is nothing to show or hide yet, but the host is not wrong to have said
+    // so: remember it for the next completed attach.
+    let Some(host) = state.host.filter(|_| {
+        state.active_attachment.is_some()
+            && state.surface_transition != SurfaceTransition::Detaching
+    }) else {
+        state.visibility = Some(visible);
         return MIGO_OK;
     };
-    state.pending_visible = None;
     let command = if visible {
         HostCommand::OnShow { options_json: None }
     } else {
         HostCommand::OnHide
     };
     match core::send_critical_command_to_host(host, command) {
-        Ok(()) => MIGO_OK,
+        Ok(()) => {
+            state.visibility = Some(visible);
+            MIGO_OK
+        }
         Err(error) => {
             tracing::error!("lifecycle command failed: {error}");
             MIGO_ERROR_INTERNAL
         }
     }
+}
+
+fn drive_visibility(session: &MigoSession, visible: bool) -> MigoResult {
+    let Ok(mut state) = session.state.lock() else {
+        return MIGO_ERROR_INTERNAL;
+    };
+    drive_visibility_locked(&mut state, visible)
 }
 
 /// # Safety
@@ -466,17 +640,34 @@ pub unsafe extern "C" fn migo_session_set_lifecycle(
     state: u32,
 ) -> MigoResult {
     guard("migo_session_set_lifecycle", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
+            Err(error) => return error,
         };
-        match state {
-            MIGO_LIFECYCLE_RUNNING => drive_visibility(session, true),
-            MIGO_LIFECYCLE_PAUSED => drive_visibility(session, false),
+        let desired = match state {
+            MIGO_LIFECYCLE_RUNNING => LifecycleState::Running,
+            MIGO_LIFECYCLE_PAUSED => LifecycleState::Paused,
             // CREATED is where a session starts; asking to go back to it would
             // mean unwinding a running engine, which the ABI does not define.
-            MIGO_LIFECYCLE_CREATED => MIGO_ERROR_INVALID_STATE,
-            _ => MIGO_ERROR_INVALID_ARGUMENT,
+            MIGO_LIFECYCLE_CREATED => return MIGO_ERROR_INVALID_STATE,
+            _ => return MIGO_ERROR_INVALID_ARGUMENT,
+        };
+        let Ok(mut control) = session.state.lock() else {
+            return MIGO_ERROR_INTERNAL;
+        };
+        if control.lifecycle == desired {
+            return MIGO_OK;
         }
+        if desired == LifecycleState::Running {
+            // Freeze before enqueueing RUNNING work: once engine activity can
+            // produce callbacks, replacing callback tokens is unsafe.
+            control.callbacks_frozen = true;
+        }
+        let result = drive_visibility_locked(&mut control, desired == LifecycleState::Running);
+        if result == MIGO_OK {
+            control.lifecycle = desired;
+        }
+        result
     })
 }
 
@@ -488,10 +679,15 @@ pub unsafe extern "C" fn migo_session_set_visibility(
     visible: u8,
 ) -> MigoResult {
     guard("migo_session_set_visibility", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
+            Err(error) => return error,
         };
-        drive_visibility(session, visible != 0)
+        let visible = match migo_capi_abi::validate::validate_bool(visible) {
+            Ok(visible) => visible,
+            Err(error) => return error,
+        };
+        drive_visibility(&session, visible)
     })
 }
 
@@ -500,23 +696,44 @@ pub unsafe extern "C" fn migo_session_set_visibility(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn migo_session_set_focus(
     session: *mut MigoSession,
-    _focused: u8,
+    focused: u8,
 ) -> MigoResult {
     guard("migo_session_set_focus", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
+            Err(error) => return error,
         };
-        // No surface requirement: focus is a property of the session, and every
-        // Android lifecycle reports it before the window exists. Rejecting it
-        // there would make a correct host look wrong.
-        let Ok(_state) = session.state.lock() else {
+        let focused = match migo_capi_abi::validate::validate_bool(focused) {
+            Ok(focused) => focused,
+            Err(error) => return error,
+        };
+        let Ok(mut state) = session.state.lock() else {
             return MIGO_ERROR_INTERNAL;
         };
-        // Focus is validated and accepted, but the engine has no separate focus
-        // channel today: wx-style content observes show/hide, not focus. Wiring
-        // it to visibility would pause a game that merely lost keyboard focus
-        // while still on screen, so it stays a no-op until content needs it.
-        MIGO_OK
+        if state.focused == Some(focused) {
+            return MIGO_OK;
+        }
+
+        // No surface requirement: focus is a Session property, and Android can
+        // report it before its window exists. Retain it for attach in that
+        // case. It never drives show/hide, render pause, or audio pause.
+        let Some(host) = state.host.filter(|_| {
+            state.active_attachment.is_some()
+                && state.surface_transition != SurfaceTransition::Detaching
+        }) else {
+            state.focused = Some(focused);
+            return MIGO_OK;
+        };
+        match core::send_critical_command_to_host(host, HostCommand::OnFocusChanged { focused }) {
+            Ok(()) => {
+                state.focused = Some(focused);
+                MIGO_OK
+            }
+            Err(error) => {
+                tracing::error!("focus command failed: {error}");
+                MIGO_ERROR_INTERNAL
+            }
+        }
     })
 }
 
@@ -527,10 +744,8 @@ pub unsafe extern "C" fn migo_session_set_focus(
 /// Install a log subscriber when `MIGO_CAPI_LOG` is set.
 ///
 /// A library has no business hijacking the process's global logger, so this is
-/// opt-in and off by default. It exists because a C host currently has no other
-/// way to see engine diagnostics: `on_error` is declared in the headers but not
-/// implemented yet, which makes a failed content load silent. Once callbacks
-/// land this becomes a convenience rather than the only channel.
+/// opt-in and off by default. Hosts receive operational errors through
+/// `on_error`; this switch exists only for additional engine diagnostics.
 fn init_dev_logging() {
     use shared::config::LogLevel;
     use std::sync::Once;
@@ -555,8 +770,8 @@ fn init_dev_logging() {
 mod tests {
     use super::*;
     use crate::test_support::{engine_config, scratch_dirs, session_config, with_engine};
-    use abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI};
-    use std::ffi::CString;
+    use abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_ABI, VersionedHeader};
+    use std::ffi::{CString, c_void};
 
     #[test]
     fn engine_rejects_a_config_from_a_different_abi() {
@@ -710,6 +925,97 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_state_and_session_levels_are_retained_without_a_surface() {
+        with_engine("lifecycle-state", |engine| {
+            let mut session = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config(), &mut session) },
+                MIGO_OK
+            );
+
+            // A process may pause before its first window is attached. The
+            // level is valid and retained rather than inventing a Host command.
+            assert_eq!(
+                unsafe { migo_session_set_lifecycle(session, MIGO_LIFECYCLE_PAUSED) },
+                MIGO_OK
+            );
+            {
+                let state = unsafe { &*session }.state.lock().unwrap();
+                assert_eq!(state.lifecycle, LifecycleState::Paused);
+                assert_eq!(state.visibility, Some(false));
+            }
+
+            assert_eq!(
+                unsafe { migo_session_set_lifecycle(session, MIGO_LIFECYCLE_RUNNING) },
+                MIGO_OK
+            );
+            assert_eq!(unsafe { migo_session_set_focus(session, 1) }, MIGO_OK);
+            {
+                let state = unsafe { &*session }.state.lock().unwrap();
+                assert_eq!(state.lifecycle, LifecycleState::Running);
+                assert_eq!(state.visibility, Some(true));
+                assert_eq!(state.focused, Some(true));
+                assert!(state.callbacks_frozen);
+            }
+
+            // Repeating a level is idempotent and does not manufacture a
+            // duplicate show/focus event.
+            assert_eq!(
+                unsafe { migo_session_set_lifecycle(session, MIGO_LIFECYCLE_RUNNING) },
+                MIGO_OK
+            );
+            assert_eq!(unsafe { migo_session_set_focus(session, 1) }, MIGO_OK);
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn public_boolean_parameters_are_strict() {
+        with_engine("strict-booleans", |engine| {
+            let mut session = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config(), &mut session) },
+                MIGO_OK
+            );
+            for invalid in [2, u8::MAX] {
+                assert_eq!(
+                    unsafe { migo_session_set_visibility(session, invalid) },
+                    MIGO_ERROR_INVALID_ARGUMENT
+                );
+                assert_eq!(
+                    unsafe { migo_session_set_focus(session, invalid) },
+                    MIGO_ERROR_INVALID_ARGUMENT
+                );
+            }
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn an_entered_call_pins_the_arc_allocation_across_reentrant_destroy() {
+        with_engine("session-arc-pin", |engine| {
+            let mut session = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config(), &mut session) },
+                MIGO_OK,
+            );
+            let entered = unsafe { pin_session(session) }.expect("live Session pin");
+            assert!(entered.is_open());
+
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+            assert!(
+                !entered.is_open(),
+                "logical close must be visible before destroy returns"
+            );
+            assert_eq!(
+                Arc::strong_count(&entered),
+                1,
+                "the entered call is now the only allocation owner"
+            );
+        });
+    }
+
+    #[test]
     fn returning_to_the_created_state_is_still_rejected() {
         // Unlike the ordering cases above, this is a genuinely undefined
         // transition: unwinding a running engine is not something the ABI
@@ -744,6 +1050,22 @@ mod tests {
             assert_eq!(
                 unsafe { migo_session_notify_vsync(session, 1_000_000) },
                 MIGO_ERROR_INVALID_STATE
+            );
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn a_negative_vsync_timestamp_is_an_argument_error() {
+        with_engine("vsync-negative", |engine| {
+            let mut session = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config(), &mut session) },
+                MIGO_OK
+            );
+            assert_eq!(
+                unsafe { migo_session_notify_vsync(session, -1) },
+                MIGO_ERROR_INVALID_ARGUMENT
             );
             assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
         });
@@ -810,11 +1132,58 @@ mod tests {
                 on_show_keyboard: None,
                 on_hide_keyboard: None,
                 on_update_keyboard: None,
+                on_surface_released: None,
             };
             assert_eq!(
                 unsafe { migo_session_set_host_callbacks(session, &host_callbacks) },
                 MIGO_OK
             );
+            assert_eq!(
+                unsafe { migo_session_set_host_callbacks(session, &host_callbacks) },
+                MIGO_ERROR_INVALID_STATE
+            );
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn an_empty_callback_set_is_valid_and_still_installs_only_once() {
+        with_engine("callbacks-empty", |engine| {
+            let session_config = session_config();
+            let mut session: *mut MigoSession = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config, &mut session) },
+                MIGO_OK
+            );
+
+            let host_callbacks = callbacks::MigoHostCallbacks::empty();
+            assert_eq!(
+                unsafe { migo_session_set_host_callbacks(session, &host_callbacks) },
+                MIGO_OK
+            );
+            assert_eq!(
+                unsafe { migo_session_set_host_callbacks(session, &host_callbacks) },
+                MIGO_ERROR_INVALID_STATE
+            );
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn running_freezes_callback_configuration_before_surface_attach() {
+        with_engine("callbacks-running", |engine| {
+            let session_config = session_config();
+            let mut session: *mut MigoSession = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config, &mut session) },
+                MIGO_OK
+            );
+            assert_eq!(
+                unsafe { migo_session_set_lifecycle(session, MIGO_LIFECYCLE_RUNNING) },
+                MIGO_OK
+            );
+
+            let host_callbacks = callbacks::MigoHostCallbacks::empty();
             assert_eq!(
                 unsafe { migo_session_set_host_callbacks(session, &host_callbacks) },
                 MIGO_ERROR_INVALID_STATE
@@ -834,7 +1203,15 @@ mod tests {
             MIGO_ERROR_INVALID_ARGUMENT
         );
         assert_eq!(
-            unsafe { migo_surface_detach(std::ptr::null_mut()) },
+            unsafe { migo_surface_begin_detach(std::ptr::null_mut(), std::ptr::null_mut()) },
+            MIGO_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            unsafe { migo_surface_release_query(std::ptr::null(), std::ptr::null_mut()) },
+            MIGO_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            unsafe { migo_surface_release_destroy(std::ptr::null_mut()) },
             MIGO_ERROR_INVALID_ARGUMENT
         );
     }

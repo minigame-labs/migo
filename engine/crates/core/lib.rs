@@ -104,8 +104,9 @@ pub mod services;
 
 pub use runtime::vsync::send_vsync;
 pub use runtime::{
-    lease_surface, retire_surface, send_command_to_host, send_critical_command_to_host,
-    shutdown_host, spawn_host_thread,
+    HostIngress, HostIngressSendError, SpawnedSurfaceHost, host_ingress, lease_surface,
+    lease_surface_tracked, lease_surface_with_resource, retire_surface, send_command_to_host,
+    send_critical_command_to_host, shutdown_host, spawn_host_thread, spawn_host_thread_tracked,
 };
 pub use services::{DeviceServiceProvider, FrameClock, HostNotifier, PlatformServices};
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]

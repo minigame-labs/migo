@@ -8,23 +8,16 @@
 //! and a window.
 
 use crate::{
-    abi::{MIGO_ERROR_INVALID_ARGUMENT, MIGO_OK, MigoResult, VersionedHeader, guard},
+    abi::{MigoResult, guard},
     platform::supported_platform_kinds,
 };
+
+pub use migo_capi_abi::config::MigoCapabilities;
 
 /// The oldest ABI version this library still accepts on an entry point.
 const MIGO_ABI_VERSION_MIN: u32 = crate::abi::MIGO_ABI_VERSION_CURRENT;
 /// The newest it implements.
 const MIGO_ABI_VERSION_MAX: u32 = crate::abi::MIGO_ABI_VERSION_CURRENT;
-
-/// `MigoCapabilities` from `include/migo/capabilities.h`.
-#[repr(C)]
-pub struct MigoCapabilities {
-    pub(crate) header: VersionedHeader,
-    pub(crate) abi_version_min: u32,
-    pub(crate) abi_version_max: u32,
-    pub(crate) platform_kinds: u64,
-}
 
 /// Report what this library supports.
 ///
@@ -42,28 +35,22 @@ pub struct MigoCapabilities {
 /// with `struct_size` set by the caller before the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn migo_query_capabilities(out: *mut MigoCapabilities) -> MigoResult {
-    guard("migo_query_capabilities", || {
-        let Some(out) = (unsafe { out.as_mut() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
-        };
-        // Read before anything is written: on rejection the caller's storage
-        // must be exactly as it left it, so a failed query cannot be mistaken
-        // for a successful one that reported nothing.
-        if out.header.struct_size as usize != size_of::<MigoCapabilities>() {
-            return MIGO_ERROR_INVALID_ARGUMENT;
-        }
-
-        out.abi_version_min = MIGO_ABI_VERSION_MIN;
-        out.abi_version_max = MIGO_ABI_VERSION_MAX;
-        out.platform_kinds = supported_platform_kinds();
-        MIGO_OK
+    guard("migo_query_capabilities", || unsafe {
+        migo_capi_abi::config::write_capabilities(
+            out.cast::<u8>(),
+            MIGO_ABI_VERSION_MIN,
+            MIGO_ABI_VERSION_MAX,
+            supported_platform_kinds(),
+        )
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::MIGO_ABI_VERSION_CURRENT;
+    use crate::abi::{
+        MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_INVALID_ARGUMENT, MIGO_OK, VersionedHeader,
+    };
 
     fn request() -> MigoCapabilities {
         MigoCapabilities {
@@ -83,10 +70,20 @@ mod tests {
         assert_eq!(unsafe { migo_query_capabilities(&mut caps) }, MIGO_OK);
         assert_eq!(caps.abi_version_min, MIGO_ABI_VERSION_CURRENT);
         assert_eq!(caps.abi_version_max, MIGO_ABI_VERSION_CURRENT);
-        assert_ne!(
-            caps.platform_kinds, 0,
-            "a build with a runtime must be able to attach something"
-        );
+        if cfg!(any(
+            target_os = "android",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )) {
+            assert_ne!(
+                caps.platform_kinds, 0,
+                "a build with a runtime must be able to attach something"
+            );
+        } else {
+            assert_eq!(
+                caps.platform_kinds, 0,
+                "a compile-only target must not advertise another OS's windows"
+            );
+        }
     }
 
     /// The documented exception, asserted so it cannot be "tidied up" into

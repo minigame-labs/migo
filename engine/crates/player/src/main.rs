@@ -111,8 +111,12 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     let (surface, graphics_platform) = match window.as_ref() {
         Some(window) => {
             let (width, height) = window.size();
-            let surface: SurfaceRef =
-                Arc::new(LinuxX11Surface::new(window.window(), width, height));
+            let surface: SurfaceRef = Arc::new(LinuxX11Surface::new(
+                window.display(),
+                window.window(),
+                width,
+                height,
+            ));
             let platform = linux_x11_graphics_platform(window.display())
                 .map_err(|e| format!("x11 graphics platform: {e:?}"))?;
             (surface, platform)

@@ -130,7 +130,9 @@ mod global_surface_tests {
             "const coreNames = ['createCanvas', 'request', 'getFileSystemManager', \
                                 'setStorage', 'onTouchStart', 'setTimeout']; \
              const missingCore = coreNames.filter(k => typeof wx[k] === 'undefined'); \
-             let __ok = wx === migo && missingCore.length === 0; \
+             const missingMigo = coreNames.filter(k => typeof migo[k] === 'undefined'); \
+             let __ok = wx !== migo && missingCore.length === 0 && missingMigo.length === 0 \
+                 && wx.createCanvas === migo.createCanvas; \
              let __msg = 'missing core=' + JSON.stringify(missingCore)",
         );
 
@@ -155,6 +157,101 @@ mod global_surface_tests {
                 ),
             );
         }
+    }
+
+    /// Gamepad is a Web content capability, not a wx API. The engine namespace
+    /// exposes the transport primitives used by the HTML5 adapter, while the wx
+    /// compatibility namespace must not invent API names absent from wx.
+    #[test]
+    fn gamepad_transport_is_migo_only_and_native_hooks_remain_private() {
+        let mut rt = boot_runtime();
+        assert_js(
+            &mut rt,
+            "const names = ['getGamepads', 'onGamepadConnected', \
+                            'offGamepadConnected', 'onGamepadDisconnected', \
+                            'offGamepadDisconnected']; \
+             const missingMigo = names.filter(k => typeof migo[k] !== 'function'); \
+             const leakedWx = names.filter(k => typeof wx[k] !== 'undefined'); \
+             const bridge = globalThis[Symbol.for('Migo.hostBridge')]; \
+             let __ok = missingMigo.length === 0 && leakedWx.length === 0 \
+                 && typeof bridge._internalTriggerGamepadConnected === 'function' \
+                 && typeof globalThis._internalTriggerGamepadConnected === 'undefined'; \
+             let __msg = 'missing migo=' + JSON.stringify(missingMigo) \
+                 + ' leaked wx=' + JSON.stringify(leakedWx)",
+        );
+    }
+
+    #[test]
+    fn gamepad_views_are_live_but_web_read_only() {
+        let mut rt = boot_runtime();
+        assert_js(
+            &mut rt,
+            "const bridge = globalThis[Symbol.for('Migo.hostBridge')]; \
+             bridge._internalTriggerGamepadConnected(0, 'pad', 'standard', 2, 1); \
+             const pad = migo.getGamepads()[0]; \
+             const axes = pad.axes; const buttons = pad.buttons; \
+             try { pad.connected = false; pad.timestamp = 99; \
+                   axes[0] = 99; buttons[0].value = 99; } catch (_) {} \
+             bridge._internalTriggerGamepadState(0, 42, [2, 1, 0.5, -0.25, 1, 1, 0.75]); \
+             let __ok = Object.isFrozen(pad) && Object.isFrozen(axes) \
+                 && Object.isFrozen(buttons) && Object.isFrozen(buttons[0]) \
+                 && pad.connected === true && pad.timestamp === 42 \
+                 && axes[0] === 0.5 && axes[1] === -0.25 \
+                 && buttons[0].pressed === true \
+                 && buttons[0].touched === true && buttons[0].value === 0.75; \
+             let __msg = JSON.stringify(pad)",
+        );
+    }
+
+    /// Web Gamepad slots are explicitly nullable. A controller may be assigned
+    /// a non-zero stable index even when lower slots were never populated; a
+    /// sparse JavaScript array would expose `undefined` instead of the Web
+    /// contract's `null` for those slots.
+    #[test]
+    fn gamepad_slots_before_a_nonzero_index_are_explicitly_null() {
+        let mut rt = boot_runtime();
+        assert_js(
+            &mut rt,
+            "const bridge = globalThis[Symbol.for('Migo.hostBridge')]; \
+             bridge._internalTriggerGamepadConnected(2, 'pad', 'standard', 2, 1); \
+             const pads = migo.getGamepads(); \
+             let __ok = pads.length === 3 && pads[0] === null && pads[1] === null \
+                 && pads[2].index === 2; \
+             let __msg = JSON.stringify(pads)",
+        );
+    }
+
+    #[test]
+    fn gamepad_listener_mutation_does_not_change_the_current_dispatch_set() {
+        let mut rt = boot_runtime();
+        assert_js(
+            &mut rt,
+            "const bridge = globalThis[Symbol.for('Migo.hostBridge')]; \
+             const seen = []; \
+             function second() { seen.push('second'); } \
+             function first() { seen.push('first'); migo.offGamepadConnected(first); } \
+             migo.onGamepadConnected(first); migo.onGamepadConnected(second); \
+             bridge._internalTriggerGamepadConnected(0, 'pad', 'standard', 2, 1); \
+             let __ok = seen.join(',') === 'first,second'; \
+             let __msg = seen.join(',')",
+        );
+    }
+
+    #[test]
+    fn gamepad_listener_and_overridden_logger_failures_are_isolated() {
+        let mut rt = boot_runtime();
+        assert_js(
+            &mut rt,
+            "const bridge = globalThis[Symbol.for('Migo.hostBridge')]; \
+             const originalError = console.error; let reached = false; let escaped = false; \
+             migo.onGamepadConnected(() => { throw new Error('listener'); }); \
+             migo.onGamepadConnected(() => { reached = true; }); \
+             console.error = () => { throw new Error('logger'); }; \
+             try { bridge._internalTriggerGamepadConnected(0, 'pad', 'standard', 2, 1); } \
+             catch (_) { escaped = true; } finally { console.error = originalError; } \
+             let __ok = reached && !escaped; \
+             let __msg = 'reached=' + reached + ' escaped=' + escaped",
+        );
     }
 
     /// The eval-channel script shape the host builds must resolve to the holder

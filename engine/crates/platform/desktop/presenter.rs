@@ -1,10 +1,9 @@
 //! Desktop (Linux) system-EGL presenter boundary.
 //!
 //! Mirrors `platform/android/presenter.rs` for the `x86_64-unknown-linux-gnu`
-//! support profile, but targets **offscreen (pbuffer)** rendering: a headless
-//! player/CI render path that needs no window server. The onscreen X11/Wayland
-//! Presenter is a later addition; the injection contract
-//! (`EglProvider` / `EglSurfaceFactory` / `GraphicsPlatform`) is identical.
+//! support profile. It provides a headless pbuffer path plus host-owned X11 and
+//! Wayland onscreen targets through the same injection contract
+//! (`EglProvider` / `EglSurfaceFactory` / `GraphicsPlatform`).
 //!
 //! NOTE: the chosen `egl::Config` must advertise `EGL_PBUFFER_BIT` in its
 //! surface type for `create_pbuffer_surface` to succeed. The graphics EGL
@@ -28,6 +27,8 @@ use shared::{
     surface::Surface,
 };
 
+use super::egl_fallback;
+
 /// System EGL shared object on glibc Linux. The unversioned `libEGL.so` symlink
 /// ships only with `-dev` packages, so the runtime `.so.1` is loaded directly.
 const LINUX_EGL_LIBRARY: &str = "libEGL.so.1";
@@ -47,15 +48,15 @@ const EGL_PLATFORM_WAYLAND_EXT: egl::Enum = 0x31D8;
 /// never attaches a Wayland surface never loads this.
 const LINUX_WAYLAND_EGL_LIBRARY: &str = "libwayland-egl.so.1";
 
-/// Platform-display entry points from `EGL_EXT_platform_base`.
+/// Platform-display entry points from EGL 1.5 / `EGL_EXT_platform_base`.
 ///
 /// The engine's [`EglInstance`] is typed to **EGL 1.4** because that is the
 /// floor the Android support profile can rely on: `load_required_from` resolves
 /// every symbol of the requested version up front, so typing it to 1.5 would
 /// refuse to load on a 1.4-only driver and break the shipping platform. The
 /// 1.5 core calls are therefore unavailable through the instance, and the
-/// `EXT` entry points — resolved at runtime, exactly as GLFW/SDL/Qt do — are
-/// how an X11 platform display is obtained without touching that floor.
+/// platform entry points — resolved at runtime, exactly as GLFW/SDL/Qt do —
+/// are how a specific native platform is selected without touching that floor.
 ///
 /// When the extension is absent the caller falls back to the legacy calls,
 /// which let the driver infer the platform from the pointer.
@@ -85,6 +86,150 @@ mod platform_ext {
         egl.get_proc_address(name)
             .map(|pointer| unsafe { std::mem::transmute_copy::<_, F>(&pointer) })
     }
+
+    pub(super) fn first_resolved<F: Copy>(
+        names: &[&str],
+        mut resolve: impl FnMut(&str) -> Option<F>,
+    ) -> Option<F> {
+        names.iter().find_map(|name| resolve(name))
+    }
+
+    /// Prefer EGL 1.5 core entry points, then their EXT aliases. Both use the
+    /// same calling convention for the null attribute lists used here.
+    pub(super) unsafe fn first_entry_point<F: Copy>(
+        egl: &EglInstance,
+        names: &[&str],
+    ) -> Option<F> {
+        first_resolved(names, |name| unsafe { entry_point(egl, name) })
+    }
+}
+
+const GET_PLATFORM_DISPLAY_NAMES: [&str; 2] = ["eglGetPlatformDisplay", "eglGetPlatformDisplayEXT"];
+const CREATE_PLATFORM_WINDOW_SURFACE_NAMES: [&str; 2] = [
+    "eglCreatePlatformWindowSurface",
+    "eglCreatePlatformWindowSurfaceEXT",
+];
+
+fn native_platform_display(
+    egl: &EglInstance,
+    platform: egl::Enum,
+    native_display: NonNull<c_void>,
+    target: &str,
+) -> EngineResult<egl::Display> {
+    let platform_entry = unsafe {
+        platform_ext::first_entry_point::<platform_ext::GetPlatformDisplay>(
+            egl,
+            &GET_PLATFORM_DISPLAY_NAMES,
+        )
+    };
+    let entry_available = platform_entry.is_some();
+    let mut platform_error = None;
+    let mut legacy_error = None;
+    let raw = egl_fallback::preferred_or_fallback(
+        platform_entry,
+        |get_platform_display| {
+            // SAFETY: signature per EGL 1.5 / EXT_platform_base. The native
+            // display is host-owned and a null attribute list is valid for
+            // both the core EGLAttrib and EXT EGLint forms.
+            let raw = unsafe {
+                get_platform_display(platform, native_display.as_ptr(), std::ptr::null())
+            };
+            NonNull::new(raw).or_else(|| {
+                // A global loader may expose a non-null stub for an unsupported
+                // platform. Consume its error before trying the EGL 1.4 native
+                // binding so diagnostics and the next call remain well scoped.
+                platform_error = egl.get_error();
+                None
+            })
+        },
+        || {
+            let display = unsafe { egl.get_display(native_display.as_ptr()) };
+            display
+                .map(|display| {
+                    // EGL handle wrappers are guaranteed non-null on `Some`.
+                    NonNull::new(display.as_ptr()).expect("EGL Display invariant")
+                })
+                .or_else(|| {
+                    legacy_error = egl.get_error();
+                    None
+                })
+        },
+    );
+
+    raw.map(|raw| {
+        // SAFETY: non-null and produced by EGL itself.
+        unsafe { egl::Display::from_ptr(raw.as_ptr()) }
+    })
+    .ok_or_else(|| {
+        EngineError::new(ErrorCode::RenderInitializeError)
+            .with_msg(format!("Linux {target} EGL display unavailable"))
+            .with_detail(format!(
+                "platform_entry_available={entry_available}, platform_error={platform_error:?}, legacy_error={legacy_error:?}"
+            ))
+    })
+}
+
+fn create_native_window_surface(
+    egl: &EglInstance,
+    display: egl::Display,
+    config: egl::Config,
+    platform_native_window: *mut c_void,
+    legacy_native_window: *mut c_void,
+    target: &str,
+) -> EngineResult<egl::Surface> {
+    let platform_entry = unsafe {
+        platform_ext::first_entry_point::<platform_ext::CreatePlatformWindowSurface>(
+            egl,
+            &CREATE_PLATFORM_WINDOW_SURFACE_NAMES,
+        )
+    };
+    let entry_available = platform_entry.is_some();
+    let mut platform_error = None;
+    let mut legacy_error = None;
+    let surface = egl_fallback::preferred_or_fallback(
+        platform_entry,
+        |create_platform_window_surface| {
+            // SAFETY: signature per EGL 1.5 / EXT_platform_base. The caller
+            // supplies the platform-specific native-window representation;
+            // null attributes are valid for both entry-point variants.
+            let raw = unsafe {
+                create_platform_window_surface(
+                    display.as_ptr(),
+                    config.as_ptr(),
+                    platform_native_window,
+                    std::ptr::null(),
+                )
+            };
+            NonNull::new(raw)
+                .map(|raw| {
+                    // SAFETY: non-null and produced by EGL itself.
+                    unsafe { egl::Surface::from_ptr(raw.as_ptr()) }
+                })
+                .or_else(|| {
+                    platform_error = egl.get_error();
+                    None
+                })
+        },
+        || {
+            match unsafe { egl.create_window_surface(display, config, legacy_native_window, None) }
+            {
+                Ok(surface) => Some(surface),
+                Err(error) => {
+                    // The safe wrapper has already consumed eglGetError.
+                    legacy_error = Some(error);
+                    None
+                }
+            }
+        },
+    );
+
+    surface.ok_or_else(|| {
+        EngineError::new(ErrorCode::RenderBackendError)
+            .with_msg(format!("Linux {target} EGL window-surface creation failed"))
+            .with_detail(format!(
+                "platform_entry_available={entry_available}, platform_error={platform_error:?}, legacy_error={legacy_error:?}"
+            ))
+    })
 }
 
 #[derive(Debug)]
@@ -183,74 +328,17 @@ impl EglProvider for LinuxEglProvider {
                         .with_detail(format!("provider={}", self.label()))
                 }),
             // Naming the platform explicitly beats letting the driver infer it
-            // from the pointer, so the EXT entry point is preferred and the
-            // legacy call is only a fallback for drivers without it.
+            // from the pointer. A non-null proc address can still be a loader
+            // stub for an unsupported platform, so failure also falls through
+            // to the EGL 1.4 native X11 binding.
             LinuxDisplayTarget::X11(display) => {
-                let raw = match unsafe {
-                    platform_ext::entry_point::<platform_ext::GetPlatformDisplay>(
-                        egl,
-                        "eglGetPlatformDisplayEXT",
-                    )
-                } {
-                    // SAFETY: signature per EGL_EXT_platform_base; the display
-                    // pointer is the host's, kept alive per this module's
-                    // contract; a null attribute list means "no attributes".
-                    Some(get_platform_display) => unsafe {
-                        get_platform_display(
-                            EGL_PLATFORM_X11_EXT,
-                            display.as_ptr(),
-                            std::ptr::null(),
-                        )
-                    },
-                    // SAFETY: legacy eglGetDisplay accepts the native display
-                    // handle directly on X11.
-                    None => match unsafe { egl.get_display(display.as_ptr()) } {
-                        Some(display) => display.as_ptr(),
-                        None => std::ptr::null_mut(),
-                    },
-                };
-                NonNull::new(raw)
-                    // SAFETY: non-null and produced by EGL itself.
-                    .map(|raw| unsafe { egl::Display::from_ptr(raw.as_ptr()) })
-                    .ok_or_else(|| {
-                        EngineError::new(ErrorCode::RenderInitializeError)
-                            .with_msg("Linux X11 EGL display unavailable")
-                            .with_detail(format!("provider={}", self.label()))
-                    })
+                native_platform_display(egl, EGL_PLATFORM_X11_EXT, display, "X11")
             }
-            // No legacy fallback here, unlike X11: `eglGetDisplay` has no
-            // defined meaning for a `wl_display*`, so a driver without
-            // EGL_EXT_platform_base genuinely cannot serve Wayland and saying
-            // so beats handing it a pointer it will misread.
+            // EGL 1.4 Wayland bindings define EGLNativeDisplayType as
+            // wl_display*, which is the compatibility path when the preferred
+            // EGL 1.5/EXT platform call is absent or returns NO_DISPLAY.
             LinuxDisplayTarget::Wayland(display) => {
-                let get_platform_display = unsafe {
-                    platform_ext::entry_point::<platform_ext::GetPlatformDisplay>(
-                        egl,
-                        "eglGetPlatformDisplayEXT",
-                    )
-                }
-                .ok_or_else(|| {
-                    EngineError::new(ErrorCode::RenderInitializeError)
-                        .with_msg("Linux Wayland needs EGL_EXT_platform_base")
-                        .with_detail(format!("provider={}", self.label()))
-                })?;
-                // SAFETY: signature per EGL_EXT_platform_base; the display
-                // pointer is the host's, kept alive per this module's contract.
-                let raw = unsafe {
-                    get_platform_display(
-                        EGL_PLATFORM_WAYLAND_EXT,
-                        display.as_ptr(),
-                        std::ptr::null(),
-                    )
-                };
-                NonNull::new(raw)
-                    // SAFETY: non-null and produced by EGL itself.
-                    .map(|raw| unsafe { egl::Display::from_ptr(raw.as_ptr()) })
-                    .ok_or_else(|| {
-                        EngineError::new(ErrorCode::RenderInitializeError)
-                            .with_msg("Linux Wayland EGL display unavailable")
-                            .with_detail(format!("provider={}", self.label()))
-                    })
+                native_platform_display(egl, EGL_PLATFORM_WAYLAND_EXT, display, "Wayland")
             }
         }
     }
@@ -289,6 +377,7 @@ impl Surface for LinuxOffscreenSurface {
 /// window" rule true in code.
 #[derive(Debug)]
 pub struct LinuxX11Surface {
+    display: NonNull<c_void>,
     window: c_ulong,
     width: u32,
     height: u32,
@@ -297,14 +386,20 @@ pub struct LinuxX11Surface {
 impl LinuxX11Surface {
     /// `window` is an X11 `Window` XID belonging to the host, already mapped
     /// and sized to `width` x `height` physical pixels.
-    pub fn new(window: c_ulong, width: u32, height: u32) -> Self {
+    pub fn new(display: NonNull<c_void>, window: c_ulong, width: u32, height: u32) -> Self {
         Self {
+            display,
             window,
             width,
             height,
         }
     }
 }
+
+// SAFETY: Display* is an opaque identity token. The host has called
+// XInitThreads and keeps the connection alive through asynchronous release.
+unsafe impl Send for LinuxX11Surface {}
+unsafe impl Sync for LinuxX11Surface {}
 
 impl Surface for LinuxX11Surface {
     fn as_any(&self) -> &dyn Any {
@@ -316,13 +411,21 @@ impl Surface for LinuxX11Surface {
     }
 }
 
+/// Minimal injectable Wayland EGL boundary. Safe wrappers contain all FFI and
+/// let tests prove native-window ordering without a compositor.
+trait WaylandEglApi: std::fmt::Debug + Send + Sync {
+    fn create(&self, surface: NonNull<c_void>, width: i32, height: i32) -> Option<NonNull<c_void>>;
+    fn resize(&self, window: NonNull<c_void>, width: i32, height: i32);
+    fn destroy(&self, window: NonNull<c_void>);
+}
+
 /// The three `wl_egl_window` entry points, resolved once.
 ///
 /// Declared here rather than taken from a header: the SDK carries no Wayland
 /// build dependency, and these three signatures are the whole of what it needs.
 mod wayland_egl {
     use super::*;
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
 
     pub(super) type Create =
         unsafe extern "C" fn(*mut c_void, std::os::raw::c_int, std::os::raw::c_int) -> *mut c_void;
@@ -349,13 +452,42 @@ mod wayland_egl {
     unsafe impl Send for Glue {}
     unsafe impl Sync for Glue {}
 
-    static GLUE: OnceLock<Option<Glue>> = OnceLock::new();
+    impl std::fmt::Debug for Glue {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("WaylandEglGlue")
+        }
+    }
+
+    impl super::WaylandEglApi for Glue {
+        fn create(
+            &self,
+            surface: NonNull<c_void>,
+            width: i32,
+            height: i32,
+        ) -> Option<NonNull<c_void>> {
+            // SAFETY: the host keeps wl_surface alive and dimensions were
+            // range-checked before this call.
+            NonNull::new(unsafe { (self.create)(surface.as_ptr(), width, height) })
+        }
+
+        fn resize(&self, window: NonNull<c_void>, width: i32, height: i32) {
+            // SAFETY: this Glue created the uniquely-owned window.
+            unsafe { (self.resize)(window.as_ptr(), width, height, 0, 0) };
+        }
+
+        fn destroy(&self, window: NonNull<c_void>) {
+            // SAFETY: the owner calls this exactly once after EGL detaches.
+            unsafe { (self.destroy)(window.as_ptr()) };
+        }
+    }
+
+    static GLUE: OnceLock<Option<Arc<Glue>>> = OnceLock::new();
 
     /// Resolve the glue, or `None` when this system has no Wayland EGL.
     ///
     /// Loaded lazily and once: a host that only ever attaches X11 or renders
     /// offscreen must not pay for, or fail on, a library it never needs.
-    pub(super) fn glue() -> Option<&'static Glue> {
+    pub(super) fn glue() -> Option<Arc<dyn super::WaylandEglApi>> {
         GLUE.get_or_init(|| {
             let library = unsafe { libloading::Library::new(LINUX_WAYLAND_EGL_LIBRARY) }.ok()?;
             // SAFETY: the signatures above are the ones wayland-egl documents.
@@ -363,15 +495,16 @@ mod wayland_egl {
                 let create = *library.get::<Create>(b"wl_egl_window_create\0").ok()?;
                 let resize = *library.get::<Resize>(b"wl_egl_window_resize\0").ok()?;
                 let destroy = *library.get::<Destroy>(b"wl_egl_window_destroy\0").ok()?;
-                Some(Glue {
+                Some(Arc::new(Glue {
                     create,
                     resize,
                     destroy,
                     _library: library,
-                })
+                }))
             }
         })
         .as_ref()
+        .map(|glue| Arc::clone(glue) as Arc<dyn super::WaylandEglApi>)
     }
 }
 
@@ -380,6 +513,7 @@ mod wayland_egl {
 /// only ever hands the pointer to `wl_egl_window_create`.
 #[derive(Debug)]
 pub struct LinuxWaylandSurface {
+    display: NonNull<c_void>,
     surface: NonNull<c_void>,
     width: u32,
     height: u32,
@@ -394,8 +528,14 @@ unsafe impl Sync for LinuxWaylandSurface {}
 impl LinuxWaylandSurface {
     /// `surface` is a host-owned `wl_surface*` already given a role and sized
     /// to `width` x `height` physical pixels.
-    pub fn new(surface: NonNull<c_void>, width: u32, height: u32) -> Self {
+    pub fn new(
+        display: NonNull<c_void>,
+        surface: NonNull<c_void>,
+        width: u32,
+        height: u32,
+    ) -> Self {
         Self {
+            display,
             surface,
             width,
             height,
@@ -413,30 +553,116 @@ impl Surface for LinuxWaylandSurface {
     }
 }
 
-/// Non-owning onscreen target, plus the one thing it does own: the
-/// `wl_egl_window` built from the host's surface.
-///
-/// Identity is the `wl_surface`, not the `wl_egl_window`, for the same reason
-/// X11 identity is the XID: a resize must stay the same native surface, and
-/// only the host's surface says which one it is.
-#[derive(Debug)]
-pub struct LinuxWaylandPreparedSurface {
-    surface: NonNull<c_void>,
-    egl_window: NonNull<c_void>,
+struct WaylandEglWindow {
+    handle: NonNull<c_void>,
+    api: Arc<dyn WaylandEglApi>,
 }
 
-// SAFETY: both pointers are opaque tokens handed to EGL and to the wayland-egl
-// glue; this crate never dereferences either.
+unsafe impl Send for WaylandEglWindow {}
+unsafe impl Sync for WaylandEglWindow {}
+
+impl std::fmt::Debug for WaylandEglWindow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WaylandEglWindow")
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for WaylandEglWindow {
+    fn drop(&mut self) {
+        self.api.destroy(self.handle);
+    }
+}
+
+#[derive(Debug)]
+struct WaylandPreparedState {
+    width: i32,
+    height: i32,
+    window: Option<WaylandEglWindow>,
+}
+
+/// Non-owning Wayland identity with one lazily materialized native window.
+///
+/// Identity includes both `wl_display` and `wl_surface`. The mutable state is
+/// cold-path only and serializes create/resize against each other; frame
+/// presentation never touches this mutex.
+pub struct LinuxWaylandPreparedSurface {
+    display: NonNull<c_void>,
+    surface: NonNull<c_void>,
+    state: parking_lot::Mutex<WaylandPreparedState>,
+    api: Arc<dyn WaylandEglApi>,
+}
+
+// SAFETY: pointers are opaque tokens handed to EGL/wayland-egl and mutable
+// state is serialized by the cold-path mutex.
 unsafe impl Send for LinuxWaylandPreparedSurface {}
 unsafe impl Sync for LinuxWaylandPreparedSurface {}
 
-impl Drop for LinuxWaylandPreparedSurface {
-    fn drop(&mut self) {
-        if let Some(glue) = wayland_egl::glue() {
-            // SAFETY: created by `wl_egl_window_create` below and not destroyed
-            // anywhere else -- this type is the only owner.
-            unsafe { (glue.destroy)(self.egl_window.as_ptr()) };
+impl std::fmt::Debug for LinuxWaylandPreparedSurface {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LinuxWaylandPreparedSurface")
+            .field("display", &self.display)
+            .field("surface", &self.surface)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LinuxWaylandPreparedSurface {
+    fn new(
+        display: NonNull<c_void>,
+        surface: NonNull<c_void>,
+        width: u32,
+        height: u32,
+        api: Arc<dyn WaylandEglApi>,
+    ) -> EngineResult<Self> {
+        let width = i32::try_from(width).map_err(|_| {
+            EngineError::new(ErrorCode::InvalidOperation)
+                .with_msg("Wayland Surface width exceeds wl_egl_window range")
+        })?;
+        let height = i32::try_from(height).map_err(|_| {
+            EngineError::new(ErrorCode::InvalidOperation)
+                .with_msg("Wayland Surface height exceeds wl_egl_window range")
+        })?;
+        Ok(Self {
+            display,
+            surface,
+            state: parking_lot::Mutex::new(WaylandPreparedState {
+                width,
+                height,
+                window: None,
+            }),
+            api,
+        })
+    }
+
+    fn materialize_locked(
+        &self,
+        state: &mut WaylandPreparedState,
+    ) -> EngineResult<NonNull<c_void>> {
+        if let Some(window) = state.window.as_ref() {
+            return Ok(window.handle);
         }
+        let handle = self
+            .api
+            .create(self.surface, state.width, state.height)
+            .ok_or_else(|| {
+                EngineError::new(ErrorCode::RenderInitializeError)
+                    .with_msg("wl_egl_window_create failed")
+            })?;
+        state.window = Some(WaylandEglWindow {
+            handle,
+            api: Arc::clone(&self.api),
+        });
+        Ok(handle)
+    }
+
+    fn materialize_native_window(&self) -> EngineResult<NonNull<c_void>> {
+        let mut state = self.state.lock();
+        self.materialize_locked(&mut state)
     }
 }
 
@@ -453,7 +679,34 @@ impl PreparedEglSurface for LinuxWaylandPreparedSurface {
         other
             .as_any()
             .downcast_ref::<LinuxWaylandPreparedSurface>()
-            .is_some_and(|other| self.surface == other.surface)
+            .is_some_and(|other| self.display == other.display && self.surface == other.surface)
+    }
+
+    fn reconfigure_from(&self, candidate: &dyn PreparedEglSurface) -> EngineResult<()> {
+        let candidate = candidate
+            .as_any()
+            .downcast_ref::<LinuxWaylandPreparedSurface>()
+            .filter(|candidate| {
+                self.display == candidate.display && self.surface == candidate.surface
+            })
+            .ok_or_else(|| {
+                EngineError::new(ErrorCode::InvalidOperation)
+                    .with_msg("Wayland resize candidate has a different display or surface")
+            })?;
+        if std::ptr::eq(self, candidate) {
+            return Ok(());
+        }
+        let (width, height) = {
+            let candidate = candidate.state.lock();
+            (candidate.width, candidate.height)
+        };
+        let mut installed = self.state.lock();
+        if let Some(window) = installed.window.as_ref() {
+            self.api.resize(window.handle, width, height);
+        }
+        installed.width = width;
+        installed.height = height;
+        Ok(())
     }
 
     fn create_window_surface(
@@ -466,17 +719,6 @@ impl PreparedEglSurface for LinuxWaylandPreparedSurface {
         // on Wayland the native window is the `wl_egl_window` -- not the
         // `wl_surface`. Passing the surface here compiles, links, and produces
         // a surface that never presents.
-        let create_platform_window_surface = unsafe {
-            platform_ext::entry_point::<platform_ext::CreatePlatformWindowSurface>(
-                egl,
-                "eglCreatePlatformWindowSurfaceEXT",
-            )
-        }
-        .ok_or_else(|| {
-            EngineError::new(ErrorCode::RenderInitializeError)
-                .with_msg("Linux Wayland needs EGL_EXT_platform_base")
-        })?;
-
         // Calling conventions differ between platforms, and getting this wrong
         // fails at surface creation rather than anywhere useful. X11's native
         // window is an XID, so the EXT entry point takes a pointer *to* it.
@@ -484,29 +726,60 @@ impl PreparedEglSurface for LinuxWaylandPreparedSurface {
         // so it is passed directly. Wrapping it in another pointer, as the X11
         // path correctly does for its XID, makes EGL read the stack slot
         // holding the pointer as if it were the window.
-        //
-        // SAFETY: signature per EGL_EXT_platform_base; a null attribute list
-        // means "no attributes".
-        let raw = unsafe {
-            create_platform_window_surface(
-                display.as_ptr(),
-                config.as_ptr(),
-                self.egl_window.as_ptr(),
-                std::ptr::null(),
-            )
-        };
-        NonNull::new(raw)
-            // SAFETY: non-null and produced by EGL itself.
-            .map(|raw| unsafe { egl::Surface::from_ptr(raw.as_ptr()) })
-            .ok_or_else(|| {
-                EngineError::new(ErrorCode::RenderInitializeError)
-                    .with_msg("Linux Wayland eglCreatePlatformWindowSurface failed")
-            })
+        let mut state = self.state.lock();
+        let egl_window = self.materialize_locked(&mut state)?;
+        // EGL 1.4 and platform entry points both take wl_egl_window* by value.
+        let created = create_native_window_surface(
+            egl,
+            display,
+            config,
+            egl_window.as_ptr(),
+            egl_window.as_ptr(),
+            "Wayland",
+        );
+        if created.is_err() {
+            // EGL retained nothing on failure, so destroy the failed native
+            // candidate now. A later retry will materialize a fresh wrapper.
+            drop(state.window.take());
+        }
+        created
     }
 }
 
-#[derive(Debug, Default)]
-pub struct LinuxEglSurfaceFactory;
+#[derive(Clone, Copy, Debug)]
+enum LinuxSurfaceFactoryTarget {
+    Offscreen,
+    X11(NonNull<c_void>),
+    Wayland(NonNull<c_void>),
+}
+
+unsafe impl Send for LinuxSurfaceFactoryTarget {}
+unsafe impl Sync for LinuxSurfaceFactoryTarget {}
+
+#[derive(Debug)]
+pub struct LinuxEglSurfaceFactory {
+    target: LinuxSurfaceFactoryTarget,
+}
+
+impl LinuxEglSurfaceFactory {
+    fn offscreen() -> Self {
+        Self {
+            target: LinuxSurfaceFactoryTarget::Offscreen,
+        }
+    }
+
+    fn x11(display: NonNull<c_void>) -> Self {
+        Self {
+            target: LinuxSurfaceFactoryTarget::X11(display),
+        }
+    }
+
+    fn wayland(display: NonNull<c_void>) -> Self {
+        Self {
+            target: LinuxSurfaceFactoryTarget::Wayland(display),
+        }
+    }
+}
 
 impl EglSurfaceFactory for LinuxEglSurfaceFactory {
     fn backend_id(&self) -> GraphicsBackendId {
@@ -515,53 +788,62 @@ impl EglSurfaceFactory for LinuxEglSurfaceFactory {
 
     fn prepare(&self, surface: &dyn Surface) -> EngineResult<PreparedEglSurfaceRef> {
         let any = surface.as_any();
-        if let Some(offscreen) = any.downcast_ref::<LinuxOffscreenSurface>() {
+        if let (LinuxSurfaceFactoryTarget::Offscreen, Some(offscreen)) =
+            (self.target, any.downcast_ref::<LinuxOffscreenSurface>())
+        {
             return Ok(Arc::new(LinuxPreparedSurface {
                 width: offscreen.width,
                 height: offscreen.height,
             }));
         }
-        if let Some(x11) = any.downcast_ref::<LinuxX11Surface>() {
-            return Ok(Arc::new(LinuxX11PreparedSurface { window: x11.window }));
+        if let (LinuxSurfaceFactoryTarget::X11(display), Some(x11)) =
+            (self.target, any.downcast_ref::<LinuxX11Surface>())
+        {
+            if display != x11.display {
+                return Err(EngineError::new(ErrorCode::InvalidOperation)
+                    .with_msg("X11 Surface Display does not match EGL platform Display"));
+            }
+            return Ok(Arc::new(LinuxX11PreparedSurface {
+                display,
+                window: x11.window,
+            }));
         }
-        if let Some(wayland) = any.downcast_ref::<LinuxWaylandSurface>() {
-            let glue = wayland_egl::glue().ok_or_else(|| {
+        if let (LinuxSurfaceFactoryTarget::Wayland(display), Some(wayland)) =
+            (self.target, any.downcast_ref::<LinuxWaylandSurface>())
+        {
+            if display != wayland.display {
+                return Err(EngineError::new(ErrorCode::InvalidOperation)
+                    .with_msg("Wayland Surface display does not match EGL platform display"));
+            }
+            let api = wayland_egl::glue().ok_or_else(|| {
                 EngineError::new(ErrorCode::Unsupported)
                     .with_msg("Wayland surface attached but the Wayland EGL glue is absent")
                     .with_detail(format!("{LINUX_WAYLAND_EGL_LIBRARY} could not be loaded"))
             })?;
-            // Built here rather than in `create_window_surface` so this type is
-            // its sole owner and its `Drop` is the only place it is destroyed.
-            // SAFETY: the surface pointer is the host's, valid for the
-            // attachment; the dimensions are physical pixels.
-            let egl_window = unsafe {
-                (glue.create)(
-                    wayland.surface.as_ptr(),
-                    wayland.width as std::os::raw::c_int,
-                    wayland.height as std::os::raw::c_int,
-                )
-            };
-            let egl_window = NonNull::new(egl_window).ok_or_else(|| {
-                EngineError::new(ErrorCode::RenderInitializeError)
-                    .with_msg("wl_egl_window_create failed")
-            })?;
-            return Ok(Arc::new(LinuxWaylandPreparedSurface {
-                surface: wayland.surface,
-                egl_window,
-            }));
+            return Ok(Arc::new(LinuxWaylandPreparedSurface::new(
+                display,
+                wayland.surface,
+                wayland.width,
+                wayland.height,
+                api,
+            )?));
         }
         Err(EngineError::new(ErrorCode::Unsupported)
-            .with_msg("Linux presenter requires an offscreen, X11 or Wayland surface")
-            .with_detail(format!("surface={surface:?}")))
+            .with_msg("Surface kind does not match the Linux EGL platform")
+            .with_detail(format!("factory={:?}, surface={surface:?}", self.target)))
     }
 }
 
-/// Non-owning onscreen target. Identity is the window XID, so a resized window
-/// stays the same native surface while a different window never compares equal.
+/// Non-owning onscreen target. Identity is Display plus Window: XIDs are scoped
+/// to a connection and cannot be compared safely without that Display.
 #[derive(Debug)]
 pub struct LinuxX11PreparedSurface {
+    display: NonNull<c_void>,
     window: c_ulong,
 }
+
+unsafe impl Send for LinuxX11PreparedSurface {}
+unsafe impl Sync for LinuxX11PreparedSurface {}
 
 impl PreparedEglSurface for LinuxX11PreparedSurface {
     fn backend_id(&self) -> GraphicsBackendId {
@@ -576,7 +858,7 @@ impl PreparedEglSurface for LinuxX11PreparedSurface {
         other
             .as_any()
             .downcast_ref::<LinuxX11PreparedSurface>()
-            .is_some_and(|other| self.window == other.window)
+            .is_some_and(|other| self.display == other.display && self.window == other.window)
     }
 
     fn create_window_surface(
@@ -590,44 +872,14 @@ impl PreparedEglSurface for LinuxX11PreparedSurface {
         // takes the XID by value. Passing one where the other is expected reads
         // the XID as an address.
         let window = self.window;
-        let raw = match unsafe {
-            platform_ext::entry_point::<platform_ext::CreatePlatformWindowSurface>(
-                egl,
-                "eglCreatePlatformWindowSurfaceEXT",
-            )
-        } {
-            // SAFETY: signature per EGL_EXT_platform_base. `window` outlives the
-            // call, and the host owns the underlying X11 window for the whole
-            // session; a null attribute list means "no attributes".
-            Some(create_platform_window_surface) => unsafe {
-                create_platform_window_surface(
-                    display.as_ptr(),
-                    config.as_ptr(),
-                    &window as *const c_ulong as *mut c_void,
-                    std::ptr::null(),
-                )
-            },
-            // SAFETY: legacy path takes the XID by value in the pointer-sized
-            // native-window slot, which is the X11 convention.
-            None => match unsafe {
-                egl.create_window_surface(display, config, window as *mut c_void, None)
-            } {
-                Ok(surface) => surface.as_ptr(),
-                Err(error) => {
-                    return Err(EngineError::new(ErrorCode::RenderBackendError)
-                        .with_msg("Linux eglCreateWindowSurface failed")
-                        .with_detail(format!("window=0x{window:x}: {error:?}")));
-                }
-            },
-        };
-        NonNull::new(raw)
-            // SAFETY: non-null and produced by EGL itself.
-            .map(|raw| unsafe { egl::Surface::from_ptr(raw.as_ptr()) })
-            .ok_or_else(|| {
-                EngineError::new(ErrorCode::RenderBackendError)
-                    .with_msg("Linux eglCreatePlatformWindowSurfaceEXT failed")
-                    .with_detail(format!("window=0x{window:x}"))
-            })
+        create_native_window_surface(
+            egl,
+            display,
+            config,
+            &window as *const c_ulong as *mut c_void,
+            window as *mut c_void,
+            &format!("X11 window 0x{window:x}"),
+        )
     }
 }
 
@@ -683,7 +935,7 @@ impl PreparedEglSurface for LinuxPreparedSurface {
 pub fn linux_graphics_platform() -> EngineResult<GraphicsPlatform> {
     GraphicsPlatform::try_new(
         Arc::new(LinuxEglProvider::offscreen()),
-        Arc::new(LinuxEglSurfaceFactory),
+        Arc::new(LinuxEglSurfaceFactory::offscreen()),
     )
 }
 
@@ -696,7 +948,7 @@ pub fn linux_graphics_platform() -> EngineResult<GraphicsPlatform> {
 pub fn linux_x11_graphics_platform(display: NonNull<c_void>) -> EngineResult<GraphicsPlatform> {
     GraphicsPlatform::try_new(
         Arc::new(LinuxEglProvider::x11(display)),
-        Arc::new(LinuxEglSurfaceFactory),
+        Arc::new(LinuxEglSurfaceFactory::x11(display)),
     )
 }
 
@@ -708,30 +960,112 @@ pub fn linux_x11_graphics_platform(display: NonNull<c_void>) -> EngineResult<Gra
 pub fn linux_wayland_graphics_platform(display: NonNull<c_void>) -> EngineResult<GraphicsPlatform> {
     GraphicsPlatform::try_new(
         Arc::new(LinuxEglProvider::wayland(display)),
-        Arc::new(LinuxEglSurfaceFactory),
+        Arc::new(LinuxEglSurfaceFactory::wayland(display)),
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
+
     use super::*;
+
+    #[test]
+    fn egl15_core_entry_points_are_preferred_before_ext_aliases() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let resolved = platform_ext::first_resolved(&GET_PLATFORM_DISPLAY_NAMES, move |name| {
+            seen.lock().push(name.to_string());
+            (name == "eglGetPlatformDisplay").then_some(7_u8)
+        });
+        assert_eq!(resolved, Some(7));
+        assert_eq!(&*calls.lock(), &["eglGetPlatformDisplay"]);
+
+        let resolved =
+            platform_ext::first_resolved(&CREATE_PLATFORM_WINDOW_SURFACE_NAMES, |name| {
+                (name.ends_with("EXT")).then_some(9_u8)
+            });
+        assert_eq!(resolved, Some(9), "EXT remains the EGL 1.4 fallback");
+    }
+
+    #[derive(Debug)]
+    struct FakeWaylandEgl {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        window: NonNull<c_void>,
+    }
+
+    unsafe impl Send for FakeWaylandEgl {}
+    unsafe impl Sync for FakeWaylandEgl {}
+
+    impl WaylandEglApi for FakeWaylandEgl {
+        fn create(
+            &self,
+            _surface: NonNull<c_void>,
+            _width: i32,
+            _height: i32,
+        ) -> Option<NonNull<c_void>> {
+            self.events.lock().push("native-create");
+            Some(self.window)
+        }
+
+        fn resize(&self, _window: NonNull<c_void>, _width: i32, _height: i32) {
+            self.events.lock().push("native-resize");
+        }
+
+        fn destroy(&self, _window: NonNull<c_void>) {
+            self.events.lock().push("native-destroy");
+        }
+    }
+
+    #[test]
+    fn wayland_window_is_lazy_resized_in_place_and_destroyed_after_egl() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let api: Arc<dyn WaylandEglApi> = Arc::new(FakeWaylandEgl {
+            events: Arc::clone(&events),
+            window: NonNull::new(0x6a6a_0001usize as *mut c_void).unwrap(),
+        });
+        let display = NonNull::new(0x5a5a_1000usize as *mut c_void).unwrap();
+        let surface = NonNull::new(0x5a5a_0001usize as *mut c_void).unwrap();
+        let installed =
+            LinuxWaylandPreparedSurface::new(display, surface, 320, 240, Arc::clone(&api)).unwrap();
+        assert!(events.lock().is_empty(), "prepare must stay lazy");
+
+        installed.materialize_native_window().unwrap();
+        let candidate = LinuxWaylandPreparedSurface::new(display, surface, 1280, 720, api).unwrap();
+        installed.reconfigure_from(&candidate).unwrap();
+        drop(candidate);
+        assert_eq!(&*events.lock(), &["native-create", "native-resize"]);
+
+        // CanvasManager's successful EGL teardown happens before it drops the
+        // installed PreparedEglSurface. Record that external boundary here.
+        events.lock().push("egl-destroy");
+        drop(installed);
+        assert_eq!(
+            &*events.lock(),
+            &[
+                "native-create",
+                "native-resize",
+                "egl-destroy",
+                "native-destroy"
+            ]
+        );
+    }
 
     /// Two Wayland surfaces are the same native surface exactly when they wrap
     /// the same `wl_surface`, so a resize keeps the attachment and a different
     /// surface never inherits it.
     ///
-    /// Checked on the plain surface rather than the prepared one because
-    /// preparing calls into `wl_egl_window_create`, which needs a live
-    /// compositor -- and identity is a property of what the host handed over,
-    /// not of the window EGL builds from it.
+    /// Checked on the plain Surface because identity is a property of what the
+    /// host handed over, not of the lazily-created EGL wrapper.
     #[test]
     fn wayland_surface_identity_is_the_surface_not_the_size() {
         let handle = NonNull::new(0x5a5a_0001usize as *mut c_void).expect("token");
         let other = NonNull::new(0x5a5a_0002usize as *mut c_void).expect("token");
+        let display = NonNull::new(0x5a5a_1000usize as *mut c_void).expect("display");
 
-        let small = LinuxWaylandSurface::new(handle, 320, 240);
-        let large = LinuxWaylandSurface::new(handle, 1280, 720);
-        let different = LinuxWaylandSurface::new(other, 320, 240);
+        let small = LinuxWaylandSurface::new(display, handle, 320, 240);
+        let large = LinuxWaylandSurface::new(display, handle, 1280, 720);
+        let different = LinuxWaylandSurface::new(display, other, 320, 240);
 
         assert_eq!(small.surface, large.surface, "a resize is the same surface");
         assert_ne!(small.size(), large.size());
@@ -746,12 +1080,14 @@ mod tests {
     /// pointer of the wrong kind.
     #[test]
     fn wayland_and_x11_surfaces_are_never_confused() {
+        let display = NonNull::new(0x5a5a_1000usize as *mut c_void).expect("display");
         let wayland = LinuxWaylandSurface::new(
+            display,
             NonNull::new(0x5a5a_0001usize as *mut c_void).expect("token"),
             640,
             480,
         );
-        let x11 = LinuxX11Surface::new(0x2a0_0001, 640, 480);
+        let x11 = LinuxX11Surface::new(display, 0x2a0_0001, 640, 480);
 
         assert!(wayland.as_any().downcast_ref::<LinuxX11Surface>().is_none());
         assert!(x11.as_any().downcast_ref::<LinuxWaylandSurface>().is_none());
@@ -784,7 +1120,7 @@ mod tests {
     fn offscreen_surface_reports_its_size() {
         let surface = LinuxOffscreenSurface::new(320, 240);
         assert_eq!(surface.size(), (320, 240));
-        let prepared = LinuxEglSurfaceFactory
+        let prepared = LinuxEglSurfaceFactory::offscreen()
             .prepare(&surface)
             .expect("prepare offscreen");
         assert!(prepared.same_native_surface(prepared.as_ref()));
@@ -794,39 +1130,49 @@ mod tests {
 
     #[test]
     fn x11_surface_prepares_and_reports_its_size() {
-        let surface = LinuxX11Surface::new(0x2a0_0001, 800, 600);
+        let display = NonNull::new(0x5a5a_1000usize as *mut c_void).expect("display");
+        let surface = LinuxX11Surface::new(display, 0x2a0_0001, 800, 600);
         assert_eq!(surface.size(), (800, 600));
-        let prepared = LinuxEglSurfaceFactory
+        let prepared = LinuxEglSurfaceFactory::x11(display)
             .prepare(&surface)
             .expect("prepare x11");
         assert!(prepared.same_native_surface(prepared.as_ref()));
     }
 
     #[test]
-    fn x11_window_identity_is_the_xid_not_the_size() {
+    fn x11_window_identity_is_display_plus_xid_not_size() {
         // A window keeps its identity across a resize, and two windows that
         // happen to share a size are still different surfaces. Getting this
         // wrong would let the render binding reuse a dead EGLSurface.
-        let prepare = |window, w, h| {
-            LinuxEglSurfaceFactory
-                .prepare(&LinuxX11Surface::new(window, w, h))
+        let display = NonNull::new(0x5a5a_1000usize as *mut c_void).expect("display");
+        let other_display = NonNull::new(0x5a5a_2000usize as *mut c_void).expect("other display");
+        let prepare = |factory_display, surface_display, window, w, h| {
+            LinuxEglSurfaceFactory::x11(factory_display)
+                .prepare(&LinuxX11Surface::new(surface_display, window, w, h))
                 .expect("prepare x11")
         };
-        let resized = prepare(0x2a0_0001, 1024, 768);
-        assert!(prepare(0x2a0_0001, 800, 600).same_native_surface(resized.as_ref()));
+        let resized = prepare(display, display, 0x2a0_0001, 1024, 768);
         assert!(
-            !prepare(0x2a0_0002, 800, 600)
-                .same_native_surface(prepare(0x2a0_0001, 800, 600).as_ref())
+            prepare(display, display, 0x2a0_0001, 800, 600).same_native_surface(resized.as_ref())
+        );
+        assert!(
+            !prepare(display, display, 0x2a0_0002, 800, 600)
+                .same_native_surface(prepare(display, display, 0x2a0_0001, 800, 600).as_ref())
+        );
+        assert!(
+            !prepare(other_display, other_display, 0x2a0_0001, 800, 600)
+                .same_native_surface(resized.as_ref())
         );
     }
 
     #[test]
     fn offscreen_and_x11_targets_are_never_the_same_surface() {
-        let offscreen = LinuxEglSurfaceFactory
+        let display = NonNull::new(0x5a5a_1000usize as *mut c_void).expect("display");
+        let offscreen = LinuxEglSurfaceFactory::offscreen()
             .prepare(&LinuxOffscreenSurface::new(800, 600))
             .expect("prepare offscreen");
-        let x11 = LinuxEglSurfaceFactory
-            .prepare(&LinuxX11Surface::new(0x2a0_0001, 800, 600))
+        let x11 = LinuxEglSurfaceFactory::x11(display)
+            .prepare(&LinuxX11Surface::new(display, 0x2a0_0001, 800, 600))
             .expect("prepare x11");
         assert!(!offscreen.same_native_surface(x11.as_ref()));
         assert!(!x11.same_native_surface(offscreen.as_ref()));
@@ -846,7 +1192,7 @@ mod tests {
                 (1, 1)
             }
         }
-        let error = LinuxEglSurfaceFactory
+        let error = LinuxEglSurfaceFactory::offscreen()
             .prepare(&ForeignSurface)
             .expect_err("foreign surface must be rejected");
         assert_eq!(error.code, ErrorCode::Unsupported);

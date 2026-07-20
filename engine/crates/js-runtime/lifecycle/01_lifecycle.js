@@ -207,6 +207,36 @@ function _internalTriggerOnHide() {
     lifecycleManager._triggerHide();
 }
 
+// Focus is independent of visibility: a desktop window can lose keyboard
+// focus while remaining visible and rendering. Core retains the level and a
+// single profile callback. An HTML5 prelude maps this to focus/blur; wx leaves
+// the adapter unset because it has no matching public API.
+let _focused = false;
+let _focusAdapter = null;
+
+function _internalTriggerFocusChanged(focused) {
+    _focused = focused === true;
+    if (_focusAdapter !== null) {
+        try {
+            _focusAdapter(_focused);
+        } catch (e) {
+            console.error('focus adapter threw: ' + e);
+        }
+    }
+}
+
+function _internalInstallFocusAdapter(adapter) {
+    if (adapter !== null && typeof adapter !== 'function') {
+        throw new TypeError('focus adapter must be a function or null');
+    }
+    _focusAdapter = adapter;
+    if (_focusAdapter !== null) _focusAdapter(_focused);
+}
+
+function _internalGetFocusState() {
+    return _focused;
+}
+
 // ---- onAddToFavorites / offAddToFavorites ----------------------------------
 
 const _addToFavoritesListeners = createListenerGroup('onAddToFavorites');
@@ -248,6 +278,9 @@ export {
     getEnterOptionsSync,
     _internalTriggerOnHide,
     _internalTriggerOnShow,
+    _internalTriggerFocusChanged,
+    _internalInstallFocusAdapter,
+    _internalGetFocusState,
     onAddToFavorites,
     offAddToFavorites,
     _internalTriggerAddToFavorites,

@@ -5,13 +5,40 @@
 //! copies of a fixture drift, and a drifted fixture makes two tests that look
 //! identical prove different things.
 
-use std::ffi::CString;
+use std::{
+    ffi::CString,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, AtomicUsize},
+    },
+};
 
 use crate::{
-    MigoEngine, MigoEngineConfig, MigoSession, MigoSessionConfig,
+    EngineInner, MigoEngine, MigoEngineConfig, MigoSession, MigoSessionConfig, SessionState,
     abi::{MIGO_ABI_VERSION_CURRENT, MIGO_OK, VersionedHeader},
     migo_engine_create, migo_engine_destroy, migo_session_create, migo_session_destroy,
 };
+
+/// A Session allocation for callback-routing unit tests that do not need a
+/// public raw owner or a running Host.
+pub(crate) fn callback_session_pin() -> Arc<MigoSession> {
+    Arc::new(MigoSession {
+        engine: Arc::new(EngineInner {
+            files_dir: PathBuf::new(),
+            cache_dir: PathBuf::new(),
+            code_cache_dir: PathBuf::new(),
+            allow_unsigned_content: false,
+            live_sessions: Mutex::new(0),
+        }),
+        state: Mutex::new(SessionState::default()),
+        callback_gate: crate::callback_gate::CallbackGate::new(),
+        pending_surface_releases: Arc::new(AtomicUsize::new(0)),
+        ingress: OnceLock::new(),
+        active_surface_generation: AtomicU64::new(0),
+        gamepad_topology: crate::gamepad::GamepadTopology::new(),
+    })
+}
 
 pub(crate) fn engine_config(
     dirs: &(CString, CString, CString),

@@ -9,13 +9,25 @@
 
 #[cfg(target_os = "android")]
 mod android;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod desktop;
+#[cfg(not(any(
+    target_os = "android",
+    all(target_os = "linux", not(target_env = "ohos"))
+)))]
+mod unsupported;
 
 #[cfg(target_os = "android")]
 pub(crate) use android::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
-#[cfg(not(target_os = "android"))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) use desktop::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
+#[cfg(not(any(
+    target_os = "android",
+    all(target_os = "linux", not(target_env = "ohos"))
+)))]
+pub(crate) use unsupported::{
+    PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,
+};
 
 /// Whether this build can attach the given `MIGO_PLATFORM_*` kind.
 ///
@@ -28,13 +40,6 @@ pub(crate) fn kind_is_supported(platform_kind: u32) -> bool {
     }
     supported_platform_kinds() & (1u64 << platform_kind) != 0
 }
-
-/// The platform's own `PlatformServices`, which `CapiHostKit` composes so it
-/// only has to override the notification capability.
-#[cfg(target_os = "android")]
-pub(crate) type InnerPlatform = platform::android::platform::AndroidPlatform;
-#[cfg(not(target_os = "android"))]
-pub(crate) type InnerPlatform = platform::desktop::platform::DesktopPlatform;
 
 /// Send the opt-in developer log to wherever this platform's diagnostics go.
 ///

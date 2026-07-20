@@ -41,13 +41,18 @@
 
 use std::borrow::Cow;
 
-use crate::surface::{SurfaceGeneration, SurfaceLease};
+use crate::{
+    payload_pool::Pooled,
+    surface::{
+        PixelRatio, PublicSurfaceGeneration, SurfaceGeneration, SurfaceLease, SurfaceLossReason,
+    },
+};
 
-/// Touch event payload, boxed inside `HostCommand::OnTouch`.
+/// Touch event payload, stored in a preallocated `HostCommand::OnTouch` slot.
 ///
 /// Contains a fixed `[TouchPoint; 10]` array with a count field.
-/// Single memcpy from JNI DirectByteBuffer, then boxed to keep the
-/// `HostCommand` enum small on the channel.
+/// Single memcpy from JNI DirectByteBuffer into a bounded, preallocated
+/// payload slot keeps steady-state input allocation-free.
 #[derive(Debug)]
 pub struct TouchData {
     /// Type of touch event (start, move, end, cancel).
@@ -65,9 +70,9 @@ pub struct TouchData {
 ///
 /// The W3C standard mapping has 4 axes and 17 buttons; the headroom covers
 /// devices that report a few more without making the payload variable-length.
-/// A pad reporting past these is truncated rather than rejected, because a
-/// partly usable gamepad beats none -- unlike a touch batch, where an extra
-/// pointer means a finger the content would never see lift.
+/// The public ABI rejects a topology past these limits instead of silently
+/// truncating buttons or axes that content may rely on; a platform adapter may
+/// deliberately remap a device before it enters this transport.
 pub const GAMEPAD_MAX_AXES: usize = 8;
 pub const GAMEPAD_MAX_BUTTONS: usize = 20;
 
@@ -232,6 +237,13 @@ pub enum HostCommand {
     /// Triggers `migo.onHide` callbacks in the game.
     OnHide,
 
+    /// Window/input focus changed independently of app visibility.
+    ///
+    /// The runtime forwards this into a profile-neutral adapter hook. HTML5
+    /// adapters translate it to window focus/blur; wx profiles leave it as
+    /// retained engine state because wx has no equivalent public API.
+    OnFocusChanged { focused: bool },
+
     // ---- Audio Events ----
     /// Notify that audio playback has been interrupted.
     ///
@@ -262,6 +274,8 @@ pub enum HostCommand {
     UpdateSurface {
         /// Generation-tagged Surface lease from the platform layer.
         lease: SurfaceLease,
+        /// Host-authoritative DPR update. `None` preserves the current ratio.
+        pixel_ratio: Option<PixelRatio>,
     },
 
     /// Notify that the current rendering surface has been destroyed.
@@ -270,13 +284,19 @@ pub enum HostCommand {
         generation: SurfaceGeneration,
     },
 
+    /// The renderer retired a still-live Surface after an unrecoverable native
+    /// presentation failure. Expected host detach never emits this command.
+    SurfaceLost {
+        public_generation: PublicSurfaceGeneration,
+        reason: SurfaceLossReason,
+    },
+
     // ---- Touch / Input ----
     /// Dispatch touch input events to the game.
     ///
-    /// Boxed to keep the `HostCommand` enum small (~56-64 bytes instead of ~216).
-    /// Up to 512 normal commands can be pending, so enum size directly affects
-    /// bounded queue memory.
-    OnTouch(Box<TouchData>),
+    /// Stored in a bounded, preallocated payload slot. Up to 512 normal
+    /// commands can be pending, so enum size directly affects queue memory.
+    OnTouch(Pooled<TouchData>),
 
     // ---- Sensor Events ----
     /// Device motion sensor data (rotation angles from TYPE_ROTATION_VECTOR).
@@ -496,7 +516,7 @@ pub enum HostCommand {
     /// `getGamepads()` each frame and reads whatever is current. So this
     /// updates stored state instead of dispatching, and a host sends it as
     /// often as it samples.
-    OnGamepadState(Box<GamepadState>),
+    OnGamepadState(Pooled<GamepadState>),
 
     // ---- Bluetooth / BLE Events ----
     /// Bluetooth adapter state changed (available/discovering).

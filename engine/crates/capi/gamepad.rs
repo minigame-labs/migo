@@ -5,7 +5,8 @@
 //! it. Content polls `getGamepads()` -- the Web API is polled, not evented --
 //! so a sample updates stored state rather than being delivered to a listener.
 
-use core::send_command_to_host;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use shared::protocol::host_cmd::{
     GAMEPAD_MAX_AXES, GAMEPAD_MAX_BUTTONS, GamepadButtonState, GamepadState, HostCommand,
 };
@@ -13,121 +14,223 @@ use shared::protocol::host_cmd::{
 use crate::{
     MigoSession,
     abi::{
-        MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_WOULD_BLOCK, MIGO_OK, MigoResult, VersionedHeader,
-        copy_utf8, guard, validate_header,
+        MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_INVALID_STATE, MIGO_ERROR_WOULD_BLOCK, MIGO_OK,
+        MigoResult, guard,
     },
-    keyboard::attached_host,
+    map_ingress_result, pin_session,
 };
 
-/// `MIGO_GAMEPAD_BUTTON_FLAG_*` from `include/migo/input.h`.
-const MIGO_GAMEPAD_BUTTON_FLAG_PRESSED: u32 = 1 << 0;
-const MIGO_GAMEPAD_BUTTON_FLAG_TOUCHED: u32 = 1 << 1;
+pub(crate) use migo_capi_abi::input::MIGO_GAMEPAD_MAX_COUNT;
+use migo_capi_abi::input::{
+    MIGO_GAMEPAD_MAX_AXES, MIGO_GAMEPAD_MAX_BUTTONS, ValidatedGamepadConnection,
+    ValidatedGamepadState,
+};
+pub use migo_capi_abi::input::{MigoGamepadButton, MigoGamepadInfo, MigoGamepadStateEvent};
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct MigoGamepadButton {
-    pub(crate) flags: u32,
-    pub(crate) value: f32,
+#[cfg(test)]
+use migo_capi_abi::input::{MIGO_GAMEPAD_BUTTON_FLAG_PRESSED, MIGO_GAMEPAD_BUTTON_FLAG_TOUCHED};
+
+const _: () = assert!(GAMEPAD_MAX_AXES == MIGO_GAMEPAD_MAX_AXES);
+const _: () = assert!(GAMEPAD_MAX_BUTTONS == MIGO_GAMEPAD_MAX_BUTTONS);
+
+// Four bits cover 0..=8 axes and five cover 0..=20 buttons. The upper bits
+// carry a transition latch and an in-flight sample reader count so connect,
+// sample and disconnect stay ordered without a Session mutex on the hot path.
+const AXIS_MASK: u32 = 0x0f;
+const BUTTON_SHIFT: u32 = 4;
+const BUTTON_MASK: u32 = 0x1f << BUTTON_SHIFT;
+const CONNECTED: u32 = 1 << 9;
+const TRANSITION: u32 = 1 << 10;
+const READER_SHIFT: u32 = 11;
+const READER_ONE: u32 = 1 << READER_SHIFT;
+const READER_MASK: u32 = u32::MAX << READER_SHIFT;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopologyError {
+    Busy,
+    AlreadyConnected,
+    Disconnected,
+    Mismatch,
 }
 
-const _: () = assert!(size_of::<MigoGamepadButton>() == 8);
-
-#[repr(C)]
-pub struct MigoGamepadInfo {
-    pub(crate) header: VersionedHeader,
-    pub(crate) index: u32,
-    pub(crate) axis_count: u32,
-    pub(crate) button_count: u32,
-    pub(crate) reserved0: u32,
-    pub(crate) id_utf8: *const std::os::raw::c_char,
-    pub(crate) mapping_utf8: *const std::os::raw::c_char,
+pub(crate) struct GamepadTopology {
+    slots: [AtomicU32; MIGO_GAMEPAD_MAX_COUNT],
 }
 
-#[repr(C)]
-pub struct MigoGamepadStateEvent {
-    pub(crate) header: VersionedHeader,
-    pub(crate) index: u32,
-    pub(crate) axis_count: u32,
-    pub(crate) button_count: u32,
-    pub(crate) reserved0: u32,
-    pub(crate) axes: *const f32,
-    pub(crate) buttons: *const MigoGamepadButton,
-    pub(crate) timestamp_ms: f64,
+impl GamepadTopology {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+
+    fn begin_connect(
+        &self,
+        index: u32,
+        axis_count: u8,
+        button_count: u8,
+    ) -> Result<TopologyChange<'_>, TopologyError> {
+        let slot = &self.slots[index as usize];
+        let topology = encode_topology(axis_count, button_count);
+        slot.compare_exchange(
+            0,
+            TRANSITION | topology,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|observed| {
+            if observed & TRANSITION != 0 {
+                TopologyError::Busy
+            } else {
+                TopologyError::AlreadyConnected
+            }
+        })?;
+        Ok(TopologyChange {
+            slot,
+            rollback: 0,
+            commit: CONNECTED | topology,
+            committed: false,
+        })
+    }
+
+    fn begin_disconnect(&self, index: u32) -> Result<TopologyChange<'_>, TopologyError> {
+        let slot = &self.slots[index as usize];
+        loop {
+            let observed = slot.load(Ordering::Acquire);
+            if observed & TRANSITION != 0 || observed & READER_MASK != 0 {
+                return Err(TopologyError::Busy);
+            }
+            if observed & CONNECTED == 0 {
+                return Err(TopologyError::Disconnected);
+            }
+            match slot.compare_exchange(
+                observed,
+                observed | TRANSITION,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(TopologyChange {
+                        slot,
+                        rollback: observed,
+                        commit: 0,
+                        committed: false,
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn begin_sample(
+        &self,
+        index: u32,
+        axis_count: u8,
+        button_count: u8,
+    ) -> Result<GamepadSample<'_>, TopologyError> {
+        let slot = &self.slots[index as usize];
+        let expected_topology = encode_topology(axis_count, button_count);
+        loop {
+            let observed = slot.load(Ordering::Acquire);
+            if observed & TRANSITION != 0 {
+                return Err(TopologyError::Busy);
+            }
+            if observed & CONNECTED == 0 {
+                return Err(TopologyError::Disconnected);
+            }
+            if observed & (AXIS_MASK | BUTTON_MASK) != expected_topology {
+                return Err(TopologyError::Mismatch);
+            }
+            if observed & READER_MASK == READER_MASK {
+                return Err(TopologyError::Busy);
+            }
+            match slot.compare_exchange_weak(
+                observed,
+                observed + READER_ONE,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(GamepadSample { slot }),
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+fn encode_topology(axis_count: u8, button_count: u8) -> u32 {
+    debug_assert!(axis_count as usize <= MIGO_GAMEPAD_MAX_AXES);
+    debug_assert!(button_count as usize <= MIGO_GAMEPAD_MAX_BUTTONS);
+    u32::from(axis_count) | (u32::from(button_count) << BUTTON_SHIFT)
+}
+
+struct TopologyChange<'a> {
+    slot: &'a AtomicU32,
+    rollback: u32,
+    commit: u32,
+    committed: bool,
+}
+
+impl TopologyChange<'_> {
+    fn commit(mut self) {
+        self.slot.store(self.commit, Ordering::Release);
+        self.committed = true;
+    }
+}
+
+impl Drop for TopologyChange<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.slot.store(self.rollback, Ordering::Release);
+        }
+    }
+}
+
+struct GamepadSample<'a> {
+    slot: &'a AtomicU32,
+}
+
+impl Drop for GamepadSample<'_> {
+    fn drop(&mut self) {
+        let previous = self.slot.fetch_sub(READER_ONE, Ordering::Release);
+        debug_assert!(previous & READER_MASK != 0);
+    }
+}
+
+fn map_topology_error(error: TopologyError) -> MigoResult {
+    match error {
+        TopologyError::Busy => MIGO_ERROR_WOULD_BLOCK,
+        TopologyError::AlreadyConnected | TopologyError::Disconnected => MIGO_ERROR_INVALID_STATE,
+        TopologyError::Mismatch => MIGO_ERROR_INVALID_ARGUMENT,
+    }
 }
 
 /// Translate a validated sample into the engine's state payload.
 ///
+fn validated_to_gamepad_state(event: ValidatedGamepadState) -> GamepadState {
+    let (index, axis_count, button_count, axes, source_buttons, timestamp_ms) = event.into_parts();
+    let mut buttons = [GamepadButtonState::default(); GAMEPAD_MAX_BUTTONS];
+    for (destination, source) in buttons.iter_mut().zip(source_buttons) {
+        *destination = GamepadButtonState {
+            pressed: source.pressed(),
+            touched: source.touched(),
+            value: source.value(),
+        };
+    }
+
+    GamepadState {
+        index,
+        axis_count,
+        button_count,
+        axes,
+        buttons,
+        timestamp_ms,
+    }
+}
+
 /// # Safety
 /// `axes` and `buttons` must hold at least their announced counts.
 unsafe fn to_gamepad_state(event: &MigoGamepadStateEvent) -> Result<GamepadState, MigoResult> {
-    // Truncating here would silently drop a button content is watching, so an
-    // over-long sample is refused: the counts a host sends must be the counts it
-    // announced on connect, and a mismatch is a host bug worth surfacing.
-    if event.axis_count as usize > GAMEPAD_MAX_AXES
-        || event.button_count as usize > GAMEPAD_MAX_BUTTONS
-    {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-    if !event.timestamp_ms.is_finite() {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-    if (event.axis_count > 0 && event.axes.is_null())
-        || (event.button_count > 0 && event.buttons.is_null())
-    {
-        return Err(MIGO_ERROR_INVALID_ARGUMENT);
-    }
-
-    let axis_count = event.axis_count as usize;
-    let button_count = event.button_count as usize;
-
-    let mut axes = [0.0f32; GAMEPAD_MAX_AXES];
-    if axis_count > 0 {
-        let source = unsafe { std::slice::from_raw_parts(event.axes, axis_count) };
-        // A NaN axis would reach content's movement arithmetic with no way back.
-        if source.iter().any(|axis| !axis.is_finite()) {
-            return Err(MIGO_ERROR_INVALID_ARGUMENT);
-        }
-        axes[..axis_count].copy_from_slice(source);
-    }
-
-    let mut buttons = [GamepadButtonState::default(); GAMEPAD_MAX_BUTTONS];
-    if button_count > 0 {
-        let source = unsafe { std::slice::from_raw_parts(event.buttons, button_count) };
-        for (slot, raw) in buttons.iter_mut().zip(source) {
-            if !raw.value.is_finite() {
-                return Err(MIGO_ERROR_INVALID_ARGUMENT);
-            }
-            // `pressed` is carried rather than derived from `value`, because a
-            // device chooses its own press threshold and content must not have
-            // to guess one.
-            slot.pressed = raw.flags & MIGO_GAMEPAD_BUTTON_FLAG_PRESSED != 0;
-            slot.touched = raw.flags & MIGO_GAMEPAD_BUTTON_FLAG_TOUCHED != 0;
-            slot.value = raw.value;
-        }
-    }
-
-    Ok(GamepadState {
-        index: event.index,
-        axis_count: axis_count as u8,
-        button_count: button_count as u8,
-        axes,
-        buttons,
-        timestamp_ms: event.timestamp_ms,
-    })
-}
-
-fn deliver(session: &MigoSession, command: HostCommand, entry: &str) -> MigoResult {
-    let host = match attached_host(session) {
-        Ok(host) => host,
-        Err(error) => return error,
-    };
-    match send_command_to_host(host, command) {
-        Ok(()) => MIGO_OK,
-        Err(error) => {
-            tracing::debug!("{entry}: not delivered: {error}");
-            MIGO_ERROR_WOULD_BLOCK
-        }
-    }
+    unsafe { event.validate() }.map(validated_to_gamepad_state)
 }
 
 /// Announce a gamepad, or withdraw one by passing `connected` as 0.
@@ -142,39 +245,60 @@ pub unsafe extern "C" fn migo_session_set_gamepad_connected(
     connected: u32,
 ) -> MigoResult {
     guard("migo_session_set_gamepad_connected", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
+            Err(error) => return error,
         };
-        if let Err(error) =
-            unsafe { validate_header(info as *const VersionedHeader, size_of::<MigoGamepadInfo>()) }
-        {
-            return error;
-        }
-        let info = unsafe { &*info };
-
-        let command = if connected == 0 {
-            HostCommand::OnGamepadDisconnected { index: info.index }
-        } else {
-            if info.axis_count as usize > GAMEPAD_MAX_AXES
-                || info.button_count as usize > GAMEPAD_MAX_BUTTONS
-            {
-                return MIGO_ERROR_INVALID_ARGUMENT;
+        let connection = match unsafe { MigoGamepadInfo::parse_connection(info, connected) } {
+            Ok(connection) => connection,
+            Err(error) => return error,
+        };
+        let ingress = match session.active_ingress() {
+            Ok(ingress) => ingress,
+            Err(error) => return error,
+        };
+        let (command, reservation) = match connection {
+            ValidatedGamepadConnection::Disconnected { index } => {
+                let reservation = match session.gamepad_topology.begin_disconnect(index) {
+                    Ok(reservation) => reservation,
+                    Err(error) => return map_topology_error(error),
+                };
+                (HostCommand::OnGamepadDisconnected { index }, reservation)
             }
-            let (id, mapping) = match (unsafe { copy_utf8(info.id_utf8) }, unsafe {
-                copy_utf8(info.mapping_utf8)
-            }) {
-                (Ok(id), Ok(mapping)) => (id, mapping),
-                _ => return MIGO_ERROR_INVALID_ARGUMENT,
-            };
-            HostCommand::OnGamepadConnected {
-                index: info.index,
+            ValidatedGamepadConnection::Connected {
+                index,
                 id,
                 mapping,
-                axis_count: info.axis_count as u8,
-                button_count: info.button_count as u8,
+                axis_count,
+                button_count,
+            } => {
+                let reservation =
+                    match session
+                        .gamepad_topology
+                        .begin_connect(index, axis_count, button_count)
+                    {
+                        Ok(reservation) => reservation,
+                        Err(error) => return map_topology_error(error),
+                    };
+                (
+                    HostCommand::OnGamepadConnected {
+                        index,
+                        id,
+                        mapping,
+                        axis_count,
+                        button_count,
+                    },
+                    reservation,
+                )
             }
         };
-        deliver(session, command, "migo_session_set_gamepad_connected")
+        match ingress.try_send(command) {
+            Ok(()) => {
+                reservation.commit();
+                MIGO_OK
+            }
+            Err(error) => map_ingress_result("migo_session_set_gamepad_connected", Err(error)),
+        }
     })
 }
 
@@ -189,30 +313,32 @@ pub unsafe extern "C" fn migo_session_send_gamepad_state(
     event: *const MigoGamepadStateEvent,
 ) -> MigoResult {
     guard("migo_session_send_gamepad_state", || {
-        let Some(session) = (unsafe { session.as_ref() }) else {
-            return MIGO_ERROR_INVALID_ARGUMENT;
-        };
-        if let Err(error) = unsafe {
-            validate_header(
-                event as *const VersionedHeader,
-                size_of::<MigoGamepadStateEvent>(),
-            )
-        } {
-            return error;
-        }
-        let event = unsafe { &*event };
-
-        let state = match unsafe { to_gamepad_state(event) } {
-            Ok(state) => state,
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
             Err(error) => return error,
+        };
+        let state = match unsafe { MigoGamepadStateEvent::parse(event) } {
+            Ok(event) => validated_to_gamepad_state(event),
+            Err(error) => return error,
+        };
+        let ingress = match session.active_ingress() {
+            Ok(ingress) => ingress,
+            Err(error) => return error,
+        };
+        let _sample = match session.gamepad_topology.begin_sample(
+            state.index,
+            state.axis_count,
+            state.button_count,
+        ) {
+            Ok(sample) => sample,
+            Err(error) => return map_topology_error(error),
         };
         // A dropped sample is harmless: the API is polled, so the next one
         // replaces it wholesale. Reported anyway, because a host seeing this
         // every frame is sampling faster than the engine drains.
-        deliver(
-            session,
-            HostCommand::OnGamepadState(Box::new(state)),
+        map_ingress_result(
             "migo_session_send_gamepad_state",
+            ingress.try_send_gamepad_state(state),
         )
     })
 }
@@ -220,7 +346,90 @@ pub unsafe extern "C" fn migo_session_send_gamepad_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::MIGO_ABI_VERSION_CURRENT;
+    use crate::abi::{MIGO_ABI_VERSION_CURRENT, VersionedHeader};
+    use std::mem::size_of;
+
+    #[test]
+    fn topology_is_published_only_after_connect_commit_and_rolls_back_on_failure() {
+        let topology = GamepadTopology::new();
+        assert!(matches!(
+            topology.begin_sample(0, 2, 4),
+            Err(TopologyError::Disconnected)
+        ));
+
+        let pending = topology
+            .begin_connect(0, 2, 4)
+            .unwrap_or_else(|error| panic!("connect reservation failed: {error:?}"));
+        assert!(matches!(
+            topology.begin_sample(0, 2, 4),
+            Err(TopologyError::Busy)
+        ));
+        drop(pending); // models a rejected Host enqueue
+        assert!(matches!(
+            topology.begin_sample(0, 2, 4),
+            Err(TopologyError::Disconnected)
+        ));
+
+        topology
+            .begin_connect(0, 2, 4)
+            .unwrap_or_else(|error| panic!("connect retry failed: {error:?}"))
+            .commit();
+        assert!(topology.begin_sample(0, 2, 4).is_ok());
+        assert!(matches!(
+            topology.begin_connect(0, 2, 4),
+            Err(TopologyError::AlreadyConnected)
+        ));
+    }
+
+    #[test]
+    fn samples_must_match_topology_and_disconnect_cannot_overtake_one() {
+        let topology = GamepadTopology::new();
+        topology
+            .begin_connect(3, 4, 17)
+            .unwrap_or_else(|error| panic!("connect reservation failed: {error:?}"))
+            .commit();
+
+        assert!(matches!(
+            topology.begin_sample(3, 3, 17),
+            Err(TopologyError::Mismatch)
+        ));
+        assert!(matches!(
+            topology.begin_sample(3, 4, 16),
+            Err(TopologyError::Mismatch)
+        ));
+
+        let sample = topology
+            .begin_sample(3, 4, 17)
+            .unwrap_or_else(|error| panic!("matching sample failed: {error:?}"));
+        assert!(matches!(
+            topology.begin_disconnect(3),
+            Err(TopologyError::Busy)
+        ));
+        drop(sample);
+
+        let pending = topology
+            .begin_disconnect(3)
+            .unwrap_or_else(|error| panic!("disconnect reservation failed: {error:?}"));
+        assert!(matches!(
+            topology.begin_sample(3, 4, 17),
+            Err(TopologyError::Busy)
+        ));
+        drop(pending); // rejected enqueue restores the connected topology
+        assert!(topology.begin_sample(3, 4, 17).is_ok());
+
+        topology
+            .begin_disconnect(3)
+            .unwrap_or_else(|error| panic!("disconnect retry failed: {error:?}"))
+            .commit();
+        assert!(matches!(
+            topology.begin_sample(3, 4, 17),
+            Err(TopologyError::Disconnected)
+        ));
+        assert!(matches!(
+            topology.begin_disconnect(3),
+            Err(TopologyError::Disconnected)
+        ));
+    }
 
     fn button(pressed: bool, touched: bool, value: f32) -> MigoGamepadButton {
         let mut flags = 0;

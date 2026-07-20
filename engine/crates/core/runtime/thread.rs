@@ -1,10 +1,4 @@
-use std::{
-    panic,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{panic, sync::Arc};
 
 use tokio::runtime::{Builder, Runtime};
 use tracing::{error, info, warn};
@@ -13,7 +7,9 @@ use shared::{
     config::InitOptions,
     error::{EngineError, EngineResult, ErrorCode},
     protocol::host_cmd::HostCommand,
-    surface::{SurfaceGenerationGate, SurfaceLease, SurfaceRef},
+    surface::{
+        PublicSurfaceGeneration, SurfaceControl, SurfaceLease, SurfaceRef, SurfaceResourceLease,
+    },
 };
 
 use crate::runtime::{HostId, host::Host, registry};
@@ -24,42 +20,81 @@ use crate::services::PlatformServices;
 // process-wide Migo-IO executor instead.
 const HOST_BLOCKING_FALLBACK_THREADS: usize = 4;
 
+/// Result of starting a Host whose initial Surface belongs to a public
+/// embedding attachment.
+pub struct SpawnedSurfaceHost {
+    pub host_id: HostId,
+    pub resource: SurfaceResourceLease,
+}
+
 pub fn spawn_host_thread(
     surface: SurfaceRef,
     graphics_platform: graphics::egl_platform::GraphicsPlatform,
     platform: Arc<dyn PlatformServices>,
     opt: InitOptions,
 ) -> EngineResult<HostId> {
+    spawn_host_thread_inner(surface, graphics_platform, platform, opt, None)
+        .map(|started| started.host_id)
+}
+
+/// Start a Host while preserving the embedding host's generation and a
+/// resource lease for its unique public attachment handle.
+pub fn spawn_host_thread_tracked(
+    surface: SurfaceRef,
+    public_generation: PublicSurfaceGeneration,
+    graphics_platform: graphics::egl_platform::GraphicsPlatform,
+    platform: Arc<dyn PlatformServices>,
+    opt: InitOptions,
+) -> EngineResult<SpawnedSurfaceHost> {
+    spawn_host_thread_inner(
+        surface,
+        graphics_platform,
+        platform,
+        opt,
+        Some(public_generation),
+    )
+}
+
+fn spawn_host_thread_inner(
+    surface: SurfaceRef,
+    graphics_platform: graphics::egl_platform::GraphicsPlatform,
+    platform: Arc<dyn PlatformServices>,
+    opt: InitOptions,
+    public_generation: Option<PublicSurfaceGeneration>,
+) -> EngineResult<SpawnedSurfaceHost> {
     let id = registry::alloc_host_id();
 
     // Issue generation 1 before publishing the Host. A fresh gate cannot be
     // exhausted, but keep the failure path explicit so generation wrap always
     // fails closed rather than silently creating an untracked Surface.
-    let surface_gate = Arc::new(SurfaceGenerationGate::new());
-    let initial_token = surface_gate.attach_or_update().map_err(|_| {
+    let surface_control = Arc::new(SurfaceControl::new());
+    let initial_token = surface_control.attach_or_update().map_err(|_| {
         EngineError::new(ErrorCode::InvalidOperation)
             .with_msg("initial Surface generation exhausted")
     })?;
-    let initial_surface = SurfaceLease::new(surface, initial_token);
+    let initial_surface = match public_generation {
+        Some(public_generation) => {
+            SurfaceLease::new_tracked(surface, initial_token, public_generation)
+        }
+        None => SurfaceLease::new(surface, initial_token),
+    };
+    let initial_resource = initial_surface.resource_lease();
 
     // Bound all normal/game-controlled traffic while allowing the four trusted
     // lifecycle/surface callbacks to share the same FIFO without consuming
     // that quota. This preserves the old 512 pending-normal-command limit.
-    const HOST_NORMAL_COMMAND_CAPACITY: usize = 512;
     let (host_tx, critical_host_tx, mut host_rx) =
-        shared::host_channel::channel(HOST_NORMAL_COMMAND_CAPACITY);
+        shared::host_channel::channel(registry::HOST_NORMAL_COMMAND_CAPACITY);
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
 
     // Authoritative shutdown signal, independent of the normal-command budget:
     // `shutdown_host` sets this even when the budget is full (where its normal
     // Shutdown nudge is dropped) and the host loop polls it every iteration.
-    let shutdown = Arc::new(AtomicBool::new(false));
     registry::register_sender(
         id,
         host_tx.clone(),
-        critical_host_tx,
-        shutdown.clone(),
-        surface_gate,
+        critical_host_tx.clone(),
+        Arc::clone(&surface_control),
     );
 
     // Clone the platform Arc so we can use it in the catch_unwind path
@@ -73,10 +108,12 @@ pub fn spawn_host_thread(
                 let host = match Host::new(
                     id,
                     host_tx,
+                    critical_host_tx,
                     initial_surface,
                     graphics_platform,
                     platform,
                     opt,
+                    Arc::clone(&surface_control),
                 ) {
                     Ok(h) => h,
                     Err(e) => {
@@ -118,7 +155,7 @@ pub fn spawn_host_thread(
 
                 // Owned handle to the shutdown flag so the `async move` loop
                 // below can poll it (the thread closure only lends it to us).
-                let shutdown = shutdown.clone();
+                let surface_control = Arc::clone(&surface_control);
                 runtime.block_on(async move {
                     let mut host = host;
 
@@ -146,7 +183,7 @@ pub fn spawn_host_thread(
                         // Stops the loop the next time control returns here; a
                         // runaway JS section that never yields is handled by the
                         // deadline watchdog, not this flag.
-                        if shutdown.load(Ordering::Acquire) {
+                        if surface_control.is_shutting_down() {
                             break 'outer;
                         }
 
@@ -331,7 +368,10 @@ pub fn spawn_host_thread(
             .with_detail("init panic / early exit".to_string()));
     }
 
-    Ok(id)
+    Ok(SpawnedSurfaceHost {
+        host_id: id,
+        resource: initial_resource,
+    })
 }
 
 fn create_basic_runtime() -> EngineResult<Runtime> {

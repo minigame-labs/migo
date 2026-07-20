@@ -5,15 +5,14 @@
 // wx Android, `wx` is a distinct object that holds ~463 APIs (verified
 // against wx-android.json), separate from GameGlobal.
 //
-// migo currently registers all wx-style APIs directly on globalThis. To make
-// wx games run unmodified we expose a `wx` (and `migo`) object that mirrors
-// those APIs while keeping the existing globalThis registrations in place
-// for backward compatibility. A future pass will move APIs off globalThis
-// onto `wx` natively, matching wx Android exactly.
+// migo currently registers its low-level APIs directly on globalThis. Keep
+// those registrations for backward compatibility, then build two deliberate
+// projections: `migo` is the engine capability namespace consumed by adapters,
+// while `wx` contains only APIs that belong to the wx compatibility surface.
 //
 // Rules:
-//   - wx, migo are the SAME object (alias) -- both yield the same function
-//     references, additions on either are visible on both.
+//   - Shared APIs hold the same function references on both namespaces.
+//   - Engine/Web transport primitives that wx does not define stay on `migo`.
 //   - GameGlobal, global remain aliases of globalThis (matches wx behavior).
 //   - JS built-ins (Object/Array/Promise/...), self-references
 //     (globalThis/wx/migo/GameGlobal/global), and runtime internals
@@ -61,17 +60,25 @@ const _JS_BUILTINS = new Set([
     "WebAssembly",
 ]);
 
-// Self-references and runtime internals not part of the wx surface.
-const _NON_WX = new Set([
+// Self-references and runtime internals are not part of either API namespace.
+const _NON_API = new Set([
     "GameGlobal", "global", "migo", "wx",     // self-references (added below or by 99_main.js)
     "_perf",                                   // host-only profiler hook
     "console",                                 // standard JS, not wx-namespaced
     "_CCSettings",                             // engine-compat shim (Cocos)
 ]);
 
-function _shouldMirror(key) {
+// Browser content capabilities implemented by the native runtime and surfaced
+// by the HTML5 adapter. wx has no corresponding public names.
+const _NON_WX = new Set([
+    "getGamepads",
+    "onGamepadConnected", "offGamepadConnected",
+    "onGamepadDisconnected", "offGamepadDisconnected",
+]);
+
+function _shouldMirrorApi(key) {
     if (_JS_BUILTINS.has(key)) return false;
-    if (_NON_WX.has(key)) return false;
+    if (_NON_API.has(key)) return false;
     // Exclude any underscore-prefixed name. Two classes:
     //   - V8 / engine internals exposed on globalThis (e.g. wx's __wxConfig,
     //     __WAGameSubContextEndTime__).
@@ -83,32 +90,38 @@ function _shouldMirror(key) {
     return true;
 }
 
-function installWxNamespace() {
-    const wx = {};
+function _copyApiNamespace(excluded) {
+    const namespace = {};
     const keys = Object.getOwnPropertyNames(globalThis);
     for (let i = 0; i < keys.length; i++) {
         const key = keys[i];
-        if (!_shouldMirror(key)) continue;
+        if (!_shouldMirrorApi(key) || excluded.has(key)) continue;
         // Mirror the descriptor as-is so getters/setters and writability are
         // preserved.  The wx object holds the same function references as
         // globalThis -- equality holds, identity holds.
         try {
             const desc = Object.getOwnPropertyDescriptor(globalThis, key);
-            if (desc) ObjectDefineProperty(wx, key, desc);
+            if (desc) ObjectDefineProperty(namespace, key, desc);
         } catch (_) {
             // ignore property that cannot be mirrored
         }
     }
+    return namespace;
+}
 
-    // wx and migo: same object, two names. Future-added APIs assigned to
-    // either show up on both (because they ARE both). Enumerable to match
-    // wx Android, where `wx` appears in Object.getOwnPropertyNames(GameGlobal).
+function installApiNamespaces() {
+    const migo = _copyApiNamespace(new Set());
+    const wx = _copyApiNamespace(_NON_WX);
+
+    // Enumerable to match wx Android, where `wx` appears in
+    // Object.getOwnPropertyNames(GameGlobal). Namespace objects are distinct:
+    // app/adapters may extend migo without silently mutating the wx contract.
     ObjectDefineProperty(globalThis, "wx", {
         value: wx, writable: true, enumerable: true, configurable: true,
     });
     ObjectDefineProperty(globalThis, "migo", {
-        value: wx, writable: true, enumerable: true, configurable: true,
+        value: migo, writable: true, enumerable: true, configurable: true,
     });
 }
 
-export { installWxNamespace };
+export { installApiNamespaces };

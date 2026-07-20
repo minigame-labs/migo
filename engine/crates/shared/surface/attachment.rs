@@ -2,11 +2,14 @@ use std::{
     error::Error,
     fmt,
     num::NonZeroU64,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
+
+use parking_lot::Mutex;
 
 use super::SurfaceRef;
 
@@ -28,6 +31,42 @@ impl SurfaceGeneration {
     fn from_live_word(word: u64) -> Self {
         let generation = word >> 1;
         Self(NonZeroU64::new(generation).expect("a live Surface word has a non-zero generation"))
+    }
+
+    #[inline]
+    pub(super) fn from_non_zero_value(value: u64) -> Self {
+        Self(NonZeroU64::new(value).expect("Surface generations are always non-zero"))
+    }
+}
+
+/// A non-zero Surface generation supplied by an embedding host.
+///
+/// This is intentionally distinct from [`SurfaceGeneration`], which is the
+/// engine's private presentation epoch.  Keeping the types separate prevents
+/// callbacks and release observers from accidentally exposing an internal
+/// epoch in place of the host's correlation token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PublicSurfaceGeneration(NonZeroU64);
+
+impl PublicSurfaceGeneration {
+    /// Constructs a public generation, rejecting the reserved zero value.
+    #[inline]
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Returns the host-supplied numeric value.
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    #[inline]
+    const fn from_internal(generation: SurfaceGeneration) -> Self {
+        Self(generation.0)
     }
 }
 
@@ -122,6 +161,20 @@ impl SurfaceGenerationGate {
         }
     }
 
+    /// Retire only `expected`, leaving a concurrently attached newer
+    /// generation untouched.
+    pub(crate) fn retire_if_current(&self, expected: SurfaceGeneration) -> bool {
+        let live_word = (expected.get() << 1) | LIVE_BIT;
+        self.state
+            .compare_exchange(
+                live_word,
+                live_word & !LIVE_BIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     #[cfg(test)]
     fn from_max_retired_for_test() -> Self {
         Self {
@@ -133,6 +186,278 @@ impl SurfaceGenerationGate {
 impl Default for SurfaceGenerationGate {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Authoritative, level-triggered native-resource release state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SurfaceReleasePhase {
+    /// At least one engine lease may still reach the native resource.
+    Pending = 0,
+    /// Every resource lease has gone and the platform resource was released.
+    Released = 1,
+}
+
+/// One-shot wakeup posted after the release level has become observable.
+///
+/// The callback is deliberately an edge only.  It may be dropped or panic;
+/// [`SurfaceReleaseObserver::phase`] remains the source of truth.
+pub type SurfaceReleaseNotification = Box<dyn FnOnce(PublicSurfaceGeneration) + Send + 'static>;
+
+/// Failure to prepare a transactional Surface release registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceReleaseRegistrationError {
+    /// This attachment generation already has a prepared or committed release.
+    AlreadyRegistered,
+    /// The Session's pending-release counter cannot be incremented safely.
+    PendingCountExhausted,
+}
+
+impl fmt::Display for SurfaceReleaseRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyRegistered => formatter.write_str("Surface release is already registered"),
+            Self::PendingCountExhausted => {
+                formatter.write_str("Surface pending-release count exhausted")
+            }
+        }
+    }
+}
+
+impl Error for SurfaceReleaseRegistrationError {}
+
+struct ReleaseRegistration {
+    pending_count: Arc<AtomicUsize>,
+    notification: Option<SurfaceReleaseNotification>,
+}
+
+struct SurfaceReleaseShared {
+    public_generation: PublicSurfaceGeneration,
+    phase: AtomicU8,
+    registration: Mutex<Option<ReleaseRegistration>>,
+}
+
+impl SurfaceReleaseShared {
+    fn new(public_generation: PublicSurfaceGeneration) -> Self {
+        Self {
+            public_generation,
+            phase: AtomicU8::new(SurfaceReleasePhase::Pending as u8),
+            registration: Mutex::new(None),
+        }
+    }
+
+    #[inline]
+    fn phase(&self) -> SurfaceReleasePhase {
+        match self.phase.load(Ordering::Acquire) {
+            value if value == SurfaceReleasePhase::Pending as u8 => SurfaceReleasePhase::Pending,
+            value if value == SurfaceReleasePhase::Released as u8 => SurfaceReleasePhase::Released,
+            _ => unreachable!("Surface release phase is written only by this module"),
+        }
+    }
+
+    /// Publish completion only after the native anchor has been destroyed.
+    fn complete(&self) {
+        let notification = {
+            let mut registration = self.registration.lock();
+            let notification = registration.take().and_then(|mut registration| {
+                let previous = registration.pending_count.fetch_sub(1, Ordering::AcqRel);
+                debug_assert!(previous > 0, "pending-release count underflow");
+                registration.notification.take()
+            });
+
+            // Publish RELEASED only after the Session guard has been
+            // decremented. An Acquire query that sees RELEASED may therefore
+            // immediately destroy the Session without a transient false
+            // INVALID_STATE result. Holding the registration mutex through the
+            // store also closes a second-registration race at final drop.
+            self.phase
+                .store(SurfaceReleasePhase::Released as u8, Ordering::Release);
+            notification
+        };
+
+        if let Some(notification) = notification {
+            // A notification implementation may bridge into foreign host code.
+            // Panicking from Arc's final-drop path could abort during another
+            // unwind, while the level state is already authoritative.  Contain
+            // it exactly as the public FFI boundary contains host callbacks.
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                notification(self.public_generation);
+            }));
+        }
+    }
+}
+
+/// A read-only release observer that does not retain the native resource.
+#[derive(Clone)]
+pub struct SurfaceReleaseObserver {
+    shared: Arc<SurfaceReleaseShared>,
+}
+
+impl SurfaceReleaseObserver {
+    /// Returns the public generation this release describes.
+    #[inline]
+    pub fn public_generation(&self) -> PublicSurfaceGeneration {
+        self.shared.public_generation
+    }
+
+    /// Loads the authoritative level state with Acquire ordering.
+    #[inline]
+    pub fn phase(&self) -> SurfaceReleasePhase {
+        self.shared.phase()
+    }
+}
+
+impl fmt::Debug for SurfaceReleaseObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SurfaceReleaseObserver")
+            .field("public_generation", &self.public_generation())
+            .field("phase", &self.phase())
+            .finish()
+    }
+}
+
+/// Shared ownership of one attachment generation's native resource anchor.
+///
+/// `native_anchor` is dropped explicitly before RELEASED is published.  Every
+/// object capable of platform/GPU use must carry a [`SurfaceResourceLease`], so
+/// the final Arc drop is the native-lifetime completion boundary.
+struct SurfaceResource {
+    native_anchor: Option<SurfaceRef>,
+    public_generation: PublicSurfaceGeneration,
+    internal_generation: SurfaceGeneration,
+    release: Arc<SurfaceReleaseShared>,
+}
+
+impl Drop for SurfaceResource {
+    fn drop(&mut self) {
+        // Rust normally runs a type's Drop implementation before its fields.
+        // Taking the anchor makes the required platform-release-before-level-
+        // publication ordering explicit rather than relying on field order.
+        drop(self.native_anchor.take());
+        self.release.complete();
+    }
+}
+
+/// A cloneable proof that a consumer may still reach a native Surface.
+#[derive(Clone)]
+pub struct SurfaceResourceLease {
+    resource: Arc<SurfaceResource>,
+}
+
+impl SurfaceResourceLease {
+    fn new(
+        native_anchor: SurfaceRef,
+        public_generation: PublicSurfaceGeneration,
+        internal_generation: SurfaceGeneration,
+    ) -> Self {
+        let release = Arc::new(SurfaceReleaseShared::new(public_generation));
+        Self {
+            resource: Arc::new(SurfaceResource {
+                native_anchor: Some(native_anchor),
+                public_generation,
+                internal_generation,
+                release,
+            }),
+        }
+    }
+
+    /// Returns the host-supplied generation for callbacks and diagnostics.
+    #[inline]
+    pub fn public_generation(&self) -> PublicSurfaceGeneration {
+        self.resource.public_generation
+    }
+
+    /// Returns the private engine generation this resource belongs to.
+    #[inline]
+    pub fn internal_generation(&self) -> SurfaceGeneration {
+        self.resource.internal_generation
+    }
+
+    /// Prepares release bookkeeping before the irreversible generation
+    /// retirement boundary. Dropping the transaction rolls the registration
+    /// and pending count back; committing it cannot fail.
+    pub fn prepare_release(
+        &self,
+        pending_count: Arc<AtomicUsize>,
+        notification: Option<SurfaceReleaseNotification>,
+    ) -> Result<PreparedSurfaceRelease, SurfaceReleaseRegistrationError> {
+        let mut registration = self.resource.release.registration.lock();
+        if registration.is_some() {
+            return Err(SurfaceReleaseRegistrationError::AlreadyRegistered);
+        }
+
+        pending_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| SurfaceReleaseRegistrationError::PendingCountExhausted)?;
+
+        *registration = Some(ReleaseRegistration {
+            pending_count,
+            notification,
+        });
+        drop(registration);
+
+        Ok(PreparedSurfaceRelease {
+            release: Arc::clone(&self.resource.release),
+            resource_pin: Some(self.clone()),
+            committed: false,
+        })
+    }
+}
+
+impl fmt::Debug for SurfaceResourceLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SurfaceResourceLease")
+            .field("public_generation", &self.public_generation())
+            .field("internal_generation", &self.internal_generation())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A preallocated release transaction that can still roll back before the
+/// generation retirement CAS.
+#[must_use = "commit after retiring the generation, or drop to roll back"]
+pub struct PreparedSurfaceRelease {
+    release: Arc<SurfaceReleaseShared>,
+    resource_pin: Option<SurfaceResourceLease>,
+    committed: bool,
+}
+
+impl PreparedSurfaceRelease {
+    /// Irreversibly commits the registration and returns its non-retaining
+    /// observer.  All allocation and counter overflow checks happened in
+    /// [`SurfaceResourceLease::prepare_release`].
+    pub fn commit(mut self) -> SurfaceReleaseObserver {
+        self.committed = true;
+        let observer = SurfaceReleaseObserver {
+            shared: Arc::clone(&self.release),
+        };
+        // The caller's attachment lease still pins the resource.  Releasing
+        // this transactional pin here lets actual host/render ownership decide
+        // when the level becomes RELEASED.
+        drop(self.resource_pin.take());
+        observer
+    }
+}
+
+impl Drop for PreparedSurfaceRelease {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        let registration = self.release.registration.lock().take();
+        if let Some(registration) = registration {
+            let previous = registration.pending_count.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0, "pending-release rollback underflow");
+            // Dropping, rather than invoking, the notification is essential:
+            // retirement never happened and the attachment remains live.
+            drop(registration);
+        }
     }
 }
 
@@ -174,20 +499,69 @@ impl SurfaceLivenessToken {
 /// gate and the Host attachment slot.
 #[derive(Clone)]
 pub struct SurfaceLease {
+    // Keep the per-update Surface payload ahead of the resource lease so its
+    // platform reference drops first when this is the final consumer.
     surface: SurfaceRef,
     liveness: SurfaceLivenessToken,
+    resource: SurfaceResourceLease,
 }
 
 impl SurfaceLease {
-    /// Pairs a platform Surface with the liveness token issued for its handoff.
+    /// Pairs a platform Surface with a private generation for legacy/internal
+    /// hosts that do not expose a separate public generation.
     pub fn new(surface: SurfaceRef, liveness: SurfaceLivenessToken) -> Self {
-        Self { surface, liveness }
+        let public_generation = PublicSurfaceGeneration::from_internal(liveness.generation());
+        Self::new_tracked(surface, liveness, public_generation)
+    }
+
+    /// Starts a tracked native-resource lifetime for a new attachment.
+    pub fn new_tracked(
+        surface: SurfaceRef,
+        liveness: SurfaceLivenessToken,
+        public_generation: PublicSurfaceGeneration,
+    ) -> Self {
+        let resource = SurfaceResourceLease::new(
+            Arc::clone(&surface),
+            public_generation,
+            liveness.generation(),
+        );
+        Self {
+            surface,
+            liveness,
+            resource,
+        }
+    }
+
+    /// Creates an updated per-metrics Surface payload for the same attachment
+    /// resource and internal generation.
+    pub fn with_resource(
+        surface: SurfaceRef,
+        liveness: SurfaceLivenessToken,
+        resource: SurfaceResourceLease,
+    ) -> Result<Self, SurfaceGenerationMismatch> {
+        if liveness.generation() != resource.internal_generation() {
+            return Err(SurfaceGenerationMismatch {
+                token: liveness.generation(),
+                resource: resource.internal_generation(),
+            });
+        }
+        Ok(Self {
+            surface,
+            liveness,
+            resource,
+        })
     }
 
     /// Returns the generation associated with this Surface handoff.
     #[inline]
     pub const fn generation(&self) -> SurfaceGeneration {
         self.liveness.generation()
+    }
+
+    /// Returns the host-supplied generation represented by this resource.
+    #[inline]
+    pub fn public_generation(&self) -> PublicSurfaceGeneration {
+        self.resource.public_generation()
     }
 
     /// Returns whether this lease's exact generation is still live.
@@ -207,6 +581,24 @@ impl SurfaceLease {
     pub fn surface(&self) -> &SurfaceRef {
         &self.surface
     }
+
+    /// Clones the native-resource lifetime proof for a platform object that
+    /// may outlive this particular Surface payload.
+    #[inline]
+    pub fn resource_lease(&self) -> SurfaceResourceLease {
+        self.resource.clone()
+    }
+
+    /// Prepares release bookkeeping before the irreversible generation
+    /// retirement boundary.  Dropping the returned transaction rolls all
+    /// bookkeeping back; committing it cannot fail.
+    pub fn prepare_release(
+        &self,
+        pending_count: Arc<AtomicUsize>,
+        notification: Option<SurfaceReleaseNotification>,
+    ) -> Result<PreparedSurfaceRelease, SurfaceReleaseRegistrationError> {
+        self.resource.prepare_release(pending_count, notification)
+    }
 }
 
 impl fmt::Debug for SurfaceLease {
@@ -214,10 +606,95 @@ impl fmt::Debug for SurfaceLease {
         formatter
             .debug_struct("SurfaceLease")
             .field("generation", &self.generation())
+            .field("public_generation", &self.public_generation())
             .field("live", &self.is_live())
             .field("size", &self.size())
             .finish_non_exhaustive()
     }
+}
+
+/// A candidate liveness token cannot be paired with another attachment's
+/// resource even if the native pointer happens to compare equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfaceGenerationMismatch {
+    token: SurfaceGeneration,
+    resource: SurfaceGeneration,
+}
+
+impl fmt::Display for SurfaceGenerationMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Surface token generation {} does not match resource generation {}",
+            self.token.get(),
+            self.resource.get()
+        )
+    }
+}
+
+impl Error for SurfaceGenerationMismatch {}
+
+/// Result of applying a generation-tagged teardown request to an installed
+/// render binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceReleaseDisposition {
+    /// The matching (or older retired) binding was torn down and dropped.
+    Released,
+    /// No render binding remained installed.
+    AlreadyAbsent,
+    /// A newer binding is installed and was deliberately left untouched.
+    Superseded,
+}
+
+/// Failure of the teardown-before-drop ownership transaction.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SurfaceReleaseTransactionError<E> {
+    /// Control attempted to release a generation that is still presentation
+    /// live, indicating an ordering/programming error before retirement.
+    GenerationStillLive,
+    /// Platform/EGL teardown failed; the installed ownership is retained.
+    Teardown(E),
+}
+
+impl<E: fmt::Display> fmt::Display for SurfaceReleaseTransactionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GenerationStillLive => {
+                formatter.write_str("cannot release a live Surface generation")
+            }
+            Self::Teardown(error) => write!(formatter, "Surface teardown failed: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for SurfaceReleaseTransactionError<E> {}
+
+/// Runs a platform teardown before dropping a generation-tagged binding.
+///
+/// This pure ownership transaction is shared by the render implementation and
+/// host-runnable tests.  On any error `current` is bit-for-bit untouched; only
+/// successful teardown may release its final [`SurfaceResourceLease`].
+pub fn release_retired_resource<T, E>(
+    current: &mut Option<T>,
+    requested_generation: SurfaceGeneration,
+    generation: impl FnOnce(&T) -> SurfaceGeneration,
+    is_live: impl FnOnce(&T) -> bool,
+    teardown: impl FnOnce() -> Result<(), E>,
+) -> Result<SurfaceReleaseDisposition, SurfaceReleaseTransactionError<E>> {
+    let Some(installed) = current.as_ref() else {
+        return Ok(SurfaceReleaseDisposition::AlreadyAbsent);
+    };
+    let installed_generation = generation(installed);
+    if installed_generation > requested_generation {
+        return Ok(SurfaceReleaseDisposition::Superseded);
+    }
+    if is_live(installed) {
+        return Err(SurfaceReleaseTransactionError::GenerationStillLive);
+    }
+
+    teardown().map_err(SurfaceReleaseTransactionError::Teardown)?;
+    drop(current.take());
+    Ok(SurfaceReleaseDisposition::Released)
 }
 
 #[cfg(test)]
@@ -227,7 +704,11 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
-    use super::{SurfaceGenerationError, SurfaceGenerationGate, SurfaceLease};
+    use super::{
+        PublicSurfaceGeneration, SurfaceGenerationError, SurfaceGenerationGate, SurfaceLease,
+        SurfaceReleaseDisposition, SurfaceReleasePhase, SurfaceReleaseTransactionError,
+        release_retired_resource,
+    };
     use crate::surface::{Surface, SurfaceRef};
 
     #[derive(Debug)]
@@ -256,6 +737,15 @@ mod tests {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn lease(
+        token: super::SurfaceLivenessToken,
+        marker: u32,
+        drops: &Arc<AtomicUsize>,
+    ) -> SurfaceLease {
+        let surface: SurfaceRef = Arc::new(TestSurface::new((marker, marker), Arc::clone(drops)));
+        SurfaceLease::new(surface, token)
     }
 
     #[test]
@@ -418,5 +908,281 @@ mod tests {
             reader.join().unwrap();
         }
         assert!(!stale.is_live());
+    }
+
+    #[test]
+    fn public_generation_is_non_zero() {
+        assert!(PublicSurfaceGeneration::new(0).is_none());
+        assert_eq!(PublicSurfaceGeneration::new(41).unwrap().get(), 41);
+    }
+
+    #[test]
+    fn release_observer_does_not_keep_the_resource_alive() {
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let token = gate.attach_or_update().unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let surface: SurfaceRef = Arc::new(TestSurface::new((640, 480), drops.clone()));
+        let lease =
+            SurfaceLease::new_tracked(surface, token, PublicSurfaceGeneration::new(7).unwrap());
+        let pending = Arc::new(AtomicUsize::new(0));
+
+        let release = lease
+            .prepare_release(Arc::clone(&pending), None)
+            .unwrap()
+            .commit();
+        assert_eq!(release.public_generation().get(), 7);
+        assert_eq!(release.phase(), SurfaceReleasePhase::Pending);
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+
+        drop(lease);
+
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(release.phase(), SurfaceReleasePhase::Released);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn every_resource_lease_must_drop_before_release() {
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let token = gate.attach_or_update().unwrap();
+        let surface: SurfaceRef =
+            Arc::new(TestSurface::new((640, 480), Arc::new(AtomicUsize::new(0))));
+        let first =
+            SurfaceLease::new_tracked(surface, token, PublicSurfaceGeneration::new(9).unwrap());
+        let render = first.clone();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let release = first
+            .prepare_release(Arc::clone(&pending), None)
+            .unwrap()
+            .commit();
+
+        drop(first);
+        assert_eq!(release.phase(), SurfaceReleasePhase::Pending);
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+
+        drop(render);
+        assert_eq!(release.phase(), SurfaceReleasePhase::Released);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn release_notification_observes_published_level_state_and_fires_once() {
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let token = gate.attach_or_update().unwrap();
+        let surface: SurfaceRef =
+            Arc::new(TestSurface::new((640, 480), Arc::new(AtomicUsize::new(0))));
+        let lease =
+            SurfaceLease::new_tracked(surface, token, PublicSurfaceGeneration::new(11).unwrap());
+        let second = lease.clone();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notification_count = Arc::clone(&notifications);
+        let observed_generation = Arc::new(AtomicUsize::new(0));
+        let callback_generation = Arc::clone(&observed_generation);
+        let release = lease
+            .prepare_release(
+                Arc::clone(&pending),
+                Some(Box::new(move |generation| {
+                    callback_generation.store(generation.get() as usize, Ordering::Release);
+                    notification_count.fetch_add(1, Ordering::AcqRel);
+                })),
+            )
+            .unwrap()
+            .commit();
+
+        drop(lease);
+        assert_eq!(notifications.load(Ordering::Acquire), 0);
+        drop(second);
+
+        assert_eq!(release.phase(), SurfaceReleasePhase::Released);
+        assert_eq!(notifications.load(Ordering::Acquire), 1);
+        assert_eq!(observed_generation.load(Ordering::Acquire), 11);
+        drop(release);
+        assert_eq!(notifications.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn uncommitted_release_registration_rolls_back_without_notification() {
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let token = gate.attach_or_update().unwrap();
+        let surface: SurfaceRef =
+            Arc::new(TestSurface::new((640, 480), Arc::new(AtomicUsize::new(0))));
+        let lease =
+            SurfaceLease::new_tracked(surface, token, PublicSurfaceGeneration::new(13).unwrap());
+        let pending = Arc::new(AtomicUsize::new(0));
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notification_count = Arc::clone(&notifications);
+
+        let prepared = lease
+            .prepare_release(
+                Arc::clone(&pending),
+                Some(Box::new(move |_| {
+                    notification_count.fetch_add(1, Ordering::AcqRel);
+                })),
+            )
+            .unwrap();
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        drop(prepared);
+
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        drop(lease);
+        assert_eq!(notifications.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_final_drops_complete_release_once() {
+        const CLONES: usize = 16;
+
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let token = gate.attach_or_update().unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let surface: SurfaceRef = Arc::new(TestSurface::new((1, 1), Arc::clone(&drops)));
+        let lease =
+            SurfaceLease::new_tracked(surface, token, PublicSurfaceGeneration::new(17).unwrap());
+        let pending = Arc::new(AtomicUsize::new(0));
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notification_count = Arc::clone(&notifications);
+        let release = lease
+            .prepare_release(
+                Arc::clone(&pending),
+                Some(Box::new(move |_| {
+                    notification_count.fetch_add(1, Ordering::AcqRel);
+                })),
+            )
+            .unwrap()
+            .commit();
+        let mut threads = Vec::with_capacity(CLONES);
+        for clone in (0..CLONES).map(|_| lease.clone()) {
+            threads.push(std::thread::spawn(move || drop(clone)));
+        }
+        drop(lease);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(notifications.load(Ordering::Acquire), 1);
+        assert_eq!(release.phase(), SurfaceReleasePhase::Released);
+    }
+
+    #[test]
+    fn release_transaction_drops_binding_only_after_teardown_success() {
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let lease = lease(
+            gate.attach_or_update().unwrap(),
+            1,
+            &Arc::new(AtomicUsize::new(0)),
+        );
+        let generation = lease.generation();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let release = lease
+            .prepare_release(Arc::clone(&pending), None)
+            .unwrap()
+            .commit();
+        gate.retire_current().unwrap();
+        let mut current = Some(lease);
+        let teardown_called = AtomicBool::new(false);
+
+        let disposition = release_retired_resource(
+            &mut current,
+            generation,
+            |lease| lease.generation(),
+            |lease| lease.is_live(),
+            || {
+                assert_eq!(release.phase(), SurfaceReleasePhase::Pending);
+                teardown_called.store(true, Ordering::Release);
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(disposition, SurfaceReleaseDisposition::Released);
+        assert!(teardown_called.load(Ordering::Acquire));
+        assert!(current.is_none());
+        assert_eq!(release.phase(), SurfaceReleasePhase::Released);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn release_transaction_retains_binding_when_teardown_fails() {
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let lease = lease(
+            gate.attach_or_update().unwrap(),
+            1,
+            &Arc::new(AtomicUsize::new(0)),
+        );
+        let generation = lease.generation();
+        gate.retire_current().unwrap();
+        let mut current = Some(lease);
+
+        let result = release_retired_resource(
+            &mut current,
+            generation,
+            |lease| lease.generation(),
+            |lease| lease.is_live(),
+            || Err("eglDestroySurface failed"),
+        );
+
+        assert_eq!(
+            result,
+            Err(SurfaceReleaseTransactionError::Teardown(
+                "eglDestroySurface failed"
+            ))
+        );
+        assert!(current.is_some());
+    }
+
+    #[test]
+    fn release_transaction_ignores_older_request_for_newer_binding() {
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let first = gate.attach_or_update().unwrap().generation();
+        gate.retire_current().unwrap();
+        let current = lease(
+            gate.attach_or_update().unwrap(),
+            2,
+            &Arc::new(AtomicUsize::new(0)),
+        );
+        let mut current = Some(current);
+
+        let disposition = release_retired_resource(
+            &mut current,
+            first,
+            |lease| lease.generation(),
+            |lease| lease.is_live(),
+            || -> Result<(), ()> { panic!("an older request cannot tear down the newer binding") },
+        )
+        .unwrap();
+
+        assert_eq!(disposition, SurfaceReleaseDisposition::Superseded);
+        assert!(current.as_ref().unwrap().is_live());
+    }
+
+    #[test]
+    fn release_transaction_rejects_matching_live_generation() {
+        let gate = Arc::new(SurfaceGenerationGate::new());
+        let lease = lease(
+            gate.attach_or_update().unwrap(),
+            1,
+            &Arc::new(AtomicUsize::new(0)),
+        );
+        let generation = lease.generation();
+        let mut current = Some(lease);
+
+        let result = release_retired_resource(
+            &mut current,
+            generation,
+            |lease| lease.generation(),
+            |lease| lease.is_live(),
+            || -> Result<(), ()> {
+                panic!("a live generation cannot be torn down by release control")
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(SurfaceReleaseTransactionError::GenerationStillLive)
+        );
+        assert!(current.unwrap().is_live());
     }
 }

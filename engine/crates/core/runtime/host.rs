@@ -13,12 +13,13 @@ use tracing::{error, info, warn};
 use shared::{
     config::InitOptions,
     error::EngineResult,
+    host_channel::CriticalHostCommandSender,
     js_escape::{HOST_BRIDGE_EXPR, escape_for_js_string},
     op_state::{ContextLostState, HostOpState, HostTx, RafRx},
     protocol::host_cmd::HostCommand,
     protocol::render_cmd::{CanvasCmd, RenderCommand},
     render_event::{RenderEvent, RenderEventReceiver},
-    surface::SurfaceLease,
+    surface::{PixelRatio, SurfaceLease},
 };
 
 use crate::{
@@ -237,10 +238,12 @@ impl Host {
     pub(crate) fn new(
         id: HostId,
         host_tx: HostTx,
+        critical_host_tx: CriticalHostCommandSender,
         surface: SurfaceLease,
         graphics_platform: graphics::egl_platform::GraphicsPlatform,
         platform: Arc<dyn PlatformServices>,
         init_options: InitOptions,
+        surface_control: Arc<shared::surface::SurfaceControl>,
     ) -> EngineResult<Self> {
         // ---- Startup timing instrumentation ----
         let t_start = Instant::now();
@@ -328,6 +331,16 @@ impl Host {
         } else {
             None
         };
+        let report_surface_loss: Arc<
+            dyn Fn(shared::surface::PublicSurfaceGeneration, shared::surface::SurfaceLossReason)
+                + Send
+                + Sync,
+        > = Arc::new(move |public_generation, reason| {
+            let _ = critical_host_tx.send(HostCommand::SurfaceLost {
+                public_generation,
+                reason,
+            });
+        });
 
         let mut render = RenderService::new(
             raf_tx,
@@ -343,6 +356,8 @@ impl Host {
             render_wake,
             raf_demand.clone(),
             request_vsync.clone(),
+            surface_control,
+            report_surface_loss,
         )?;
         // Preserve the old two-second render-startup budget. V8 construction
         // below consumes this same deadline while the render thread initializes.
@@ -733,6 +748,11 @@ impl Host {
                 result
             }
 
+            HostCommand::OnFocusChanged { focused } => {
+                self.js.dispatch_focus_changed(focused);
+                Ok(())
+            }
+
             HostCommand::OnAudioInterruptionBegin => self.js.exec_script(
                 "audio_interruption_begin",
                 &format!("{HOST_BRIDGE_EXPR}._internalTriggerAudioInterruptionBegin()"),
@@ -753,9 +773,19 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::UpdateSurface { lease } => self.on_update_surface(lease),
+            HostCommand::UpdateSurface { lease, pixel_ratio } => {
+                self.on_update_surface(lease, pixel_ratio)
+            }
             HostCommand::SurfaceDestroyed { generation } => {
                 self.render.on_surface_destroyed(generation);
+                Ok(())
+            }
+            HostCommand::SurfaceLost {
+                public_generation,
+                reason,
+            } => {
+                self.platform
+                    .notify_surface_lost(self.id, public_generation, reason);
                 Ok(())
             }
 
@@ -1177,7 +1207,11 @@ impl Host {
         );
     }
 
-    fn on_update_surface(&mut self, lease: SurfaceLease) -> EngineResult<()> {
+    fn on_update_surface(
+        &mut self,
+        lease: SurfaceLease,
+        pixel_ratio: Option<PixelRatio>,
+    ) -> EngineResult<()> {
         let (w, h) = lease.size();
         info!(
             "[Host {}] on_update_surface: requested={}x{}",
@@ -1189,15 +1223,15 @@ impl Host {
         // dropped recreate would strand the app on a black frame with no further
         // surface callback from Java. Surface updates are rare, so a few host-
         // thread retries are an acceptable tradeoff for not losing the surface.
-        let mut result = self.render.update_surface(lease.clone());
+        let mut result = self.render.update_surface(lease.clone(), pixel_ratio);
         let mut attempts = 1u32;
-        while result.is_err() && attempts < 3 {
+        while result.is_err() && lease.is_live() && attempts < 3 {
             attempts += 1;
             warn!(
                 "[Host {}] on_update_surface attempt {} after error: {:?}",
                 self.id, attempts, result
             );
-            result = self.render.update_surface(lease.clone());
+            result = self.render.update_surface(lease.clone(), pixel_ratio);
         }
 
         // Resume the foreground after the surface is (re)created — but only when

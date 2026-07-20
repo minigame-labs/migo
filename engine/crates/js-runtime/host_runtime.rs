@@ -500,6 +500,12 @@ impl HostJsRuntime {
         self.with_v8(|rt, bindings| bindings.dispatch_webgl_context_event(rt, kind));
     }
 
+    /// Forward host focus without conflating it with app visibility or
+    /// render/audio pause state.
+    pub fn dispatch_focus_changed(&mut self, focused: bool) {
+        self.with_v8(|rt, bindings| bindings.dispatch_focus_changed(rt, focused));
+    }
+
     pub fn dispatch_inner_audio_event(&mut self, id: u32, event_type: &str, current_time: f64) {
         let host_id = self.host_id;
         self.with_v8(|rt, bindings| {

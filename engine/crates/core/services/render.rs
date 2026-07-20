@@ -9,7 +9,7 @@ use shared::{
     error::{EngineError, EngineResult, ErrorCode},
     protocol::render_cmd::{CanvasCmd, RenderCmdResp, RenderCommand},
     render_event::RenderEventReceiver,
-    surface::{SurfaceGeneration, SurfaceLease},
+    surface::{PixelRatio, SurfaceGeneration, SurfaceLease},
 };
 
 use super::{SurfaceAttachmentSlot, SurfaceTransitionError};
@@ -63,6 +63,12 @@ impl RenderService {
         wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
         raf_demand: shared::raf_signal::RafDemandRef,
         request_vsync: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        surface_control: std::sync::Arc<shared::surface::SurfaceControl>,
+        report_surface_loss: std::sync::Arc<
+            dyn Fn(shared::surface::PublicSurfaceGeneration, shared::surface::SurfaceLossReason)
+                + Send
+                + Sync,
+        >,
     ) -> EngineResult<Self> {
         let surface_size = initial_surface.size();
 
@@ -79,6 +85,8 @@ impl RenderService {
             wake,
             raf_demand,
             request_vsync,
+            surface_control,
+            report_surface_loss,
         )?;
         // Apply the host's configured target FPS to the render thread immediately
         // so the first vsync tick already runs at the right cadence.
@@ -121,7 +129,11 @@ impl RenderService {
     }
 
     /// Update onscreen surface and request backend recreate.
-    pub(crate) fn update_surface(&mut self, lease: SurfaceLease) -> EngineResult<()> {
+    pub(crate) fn update_surface(
+        &mut self,
+        lease: SurfaceLease,
+        pixel_ratio: Option<PixelRatio>,
+    ) -> EngineResult<()> {
         self.attachment
             .prepare(&lease)
             .map_err(|error| transition_error("recreate onscreen: rejected Surface", error))?;
@@ -130,6 +142,7 @@ impl RenderService {
         let (tx, rx) = bounded::<Result<(), EngineError>>(1);
         let cmd = RenderCommand::Canvas(CanvasCmd::RecreateOnscreen {
             lease: lease.clone(),
+            pixel_ratio,
             resp: RenderCmdResp::from_sync(tx),
         });
 
@@ -237,7 +250,7 @@ impl RenderService {
     /// After `on_surface_destroyed()`, the handle is cleared and callers must
     /// wait for a fresh `update_surface()` instead of reusing a stale surface.
     pub(crate) fn restore_surface(&mut self) -> EngineResult<()> {
-        self.update_surface(surface_for_restore(self.attachment.live_lease())?)
+        self.update_surface(surface_for_restore(self.attachment.live_lease())?, None)
     }
 
     pub(crate) fn shutdown(&mut self) {
