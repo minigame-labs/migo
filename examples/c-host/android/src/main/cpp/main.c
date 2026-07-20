@@ -218,6 +218,70 @@ static void send_keyboard(struct host *h, MigoKeyboardEventType type, const char
     }
 }
 
+/* ---- Composition and gamepad, scripted like the Linux example ----
+ *
+ * A real IME's text cannot be read from a NativeActivity without going through
+ * KeyEvent.getUnicodeChar over JNI, and reading a real gamepad needs device
+ * enumeration; both are host work rather than ABI. The script is what proves
+ * the ABI carries them, and it makes the expected pixels exact.
+ */
+static void send_composition(struct host *h, MigoCompositionEventType type, const char *data) {
+    if (h->session == NULL || h->attachment == NULL) return;
+
+    MigoCompositionEvent event;
+    memset(&event, 0, sizeof event);
+    event.struct_size = (uint32_t)sizeof event;
+    event.abi_version = MIGO_ABI_VERSION_CURRENT;
+    event.event_type = type;
+    event.data_utf8 = data;
+    event.data_length = data ? (uint32_t)strlen(data) : 0;
+
+    MigoResult result = migo_session_send_composition_event(h->session, &event);
+    if (result != MIGO_OK) {
+        LOGE("composition event %u not delivered: %d", (unsigned)type, (int)result);
+    }
+}
+
+#define PROBE_AXES 4
+#define PROBE_BUTTONS 17
+
+static void send_gamepad_script(struct host *h) {
+    if (h->session == NULL || h->attachment == NULL) return;
+
+    MigoGamepadInfo info;
+    memset(&info, 0, sizeof info);
+    info.struct_size = (uint32_t)sizeof info;
+    info.abi_version = MIGO_ABI_VERSION_CURRENT;
+    info.index = 0;
+    info.axis_count = PROBE_AXES;
+    info.button_count = PROBE_BUTTONS;
+    info.id_utf8 = "Migo Scripted Pad (Vendor: 0000 Product: 0000)";
+    info.mapping_utf8 = "standard";
+    LOGI("gamepad connect: %d", (int)migo_session_set_gamepad_connected(h->session, &info, 1));
+
+    float axes[PROBE_AXES] = {0.5f, -0.5f, 0.0f, 0.0f};
+    MigoGamepadButton buttons[PROBE_BUTTONS];
+    memset(buttons, 0, sizeof buttons);
+    buttons[0].flags = MIGO_GAMEPAD_BUTTON_FLAG_PRESSED | MIGO_GAMEPAD_BUTTON_FLAG_TOUCHED;
+    buttons[0].value = 1.0f;
+    /* Held at quarter travel but NOT pressed: the case that proves pressed is
+     * carried rather than derived from value. */
+    buttons[6].flags = MIGO_GAMEPAD_BUTTON_FLAG_TOUCHED;
+    buttons[6].value = 0.25f;
+
+    MigoGamepadStateEvent state;
+    memset(&state, 0, sizeof state);
+    state.struct_size = (uint32_t)sizeof state;
+    state.abi_version = MIGO_ABI_VERSION_CURRENT;
+    state.index = 0;
+    state.axis_count = PROBE_AXES;
+    state.button_count = PROBE_BUTTONS;
+    state.axes = axes;
+    state.buttons = buttons;
+    state.timestamp_ms = 16.0;
+    LOGI("gamepad sample: %d", (int)migo_session_send_gamepad_state(h->session, &state));
+}
+
 static void on_show_keyboard(void *user_data, MigoSession *session,
                              const MigoKeyboardShowOptions *options) {
     struct host *h = (struct host *)user_data;
@@ -242,6 +306,17 @@ static void on_show_keyboard(void *user_data, MigoSession *session,
     for (size_t i = 0; i < sizeof typed / sizeof typed[0]; ++i) {
         send_keyboard(h, MIGO_KEYBOARD_EVENT_INPUT, typed[i], 0.0);
     }
+    /* The IME half: a preedit that grows, then commits. Multi-byte on purpose --
+     * preedit text being non-ASCII is the whole reason composition exists, and
+     * a boundary that mangled it would look fine for ASCII. */
+    send_composition(h, MIGO_COMPOSITION_EVENT_START, "");
+    send_composition(h, MIGO_COMPOSITION_EVENT_UPDATE, "ni");
+    send_composition(h, MIGO_COMPOSITION_EVENT_UPDATE, "nihao");
+    send_composition(h, MIGO_COMPOSITION_EVENT_END, "\u4f60\u597d");
+    send_keyboard(h, MIGO_KEYBOARD_EVENT_INPUT, "migo\u4f60\u597d", 0.0);
+
+    send_gamepad_script(h);
+
     send_keyboard(h, MIGO_KEYBOARD_EVENT_CONFIRM, "migo", 0.0);
     send_keyboard(h, MIGO_KEYBOARD_EVENT_COMPLETE, "migo", 0.0);
     send_keyboard(h, MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE, NULL, 0.0);

@@ -225,6 +225,58 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_key_event(
     const MigoKeyEvent *event);
 
 /*
+ * IME composition.
+ *
+ * wx has no composition API, so the reference is the DOM CompositionEvent.
+ * Composition is the IN-PROGRESS state of IME input: typing pinyin shows a
+ * preedit string before any of it is committed. It is distinct from the soft
+ * keyboard above, which reports text that has ALREADY been committed.
+ *
+ * A game drawing its own text field needs both -- the preedit to show what is
+ * being typed, and the committed value to store -- so a host that supports an
+ * IME sends composition events alongside the keyboard ones, not instead of them.
+ */
+typedef uint32_t MigoCompositionEventType;
+#define MIGO_COMPOSITION_EVENT_START UINT32_C(0)
+#define MIGO_COMPOSITION_EVENT_UPDATE UINT32_C(1)
+#define MIGO_COMPOSITION_EVENT_END UINT32_C(2)
+
+/*
+ * data is the WHOLE current preedit string on start and update, never a delta:
+ * content that received only what changed could not reconstruct the rest. On
+ * end it is the committed text, and empty means the user cancelled -- which
+ * content must still see, so it can clear the preedit it has been drawing.
+ *
+ * Length-delimited, need not be NUL-terminated, borrowed for the call. A length
+ * that splits a multi-byte character is rejected rather than delivered mangled.
+ */
+typedef struct MigoCompositionEvent {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    MigoCompositionEventType event_type;
+    uint32_t data_length;
+    const char *data_utf8;
+} MigoCompositionEvent;
+
+MIGO_STATIC_ASSERT(offsetof(MigoCompositionEvent, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+#if MIGO_LP64
+MIGO_STATIC_ASSERT(sizeof(MigoCompositionEvent) == 24, "MigoCompositionEvent LP64 size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoCompositionEvent, data_utf8) == 16,
+                   "MigoCompositionEvent.data_utf8 moved");
+#endif
+
+/*
+ * Deliver one composition event.
+ *
+ * A full queue is MIGO_ERROR_WOULD_BLOCK rather than a silent drop: a dropped
+ * END leaves content drawing a preedit that will never be cleared.
+ */
+MIGO_API MigoResult MIGO_CALL migo_session_send_composition_event(
+    MigoSession *session,
+    const MigoCompositionEvent *event);
+
+/*
  * Gamepads.
  *
  * wx has no gamepad API, so the shape here is the Web one Migo replaces:

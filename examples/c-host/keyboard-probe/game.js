@@ -23,6 +23,8 @@ let value = '';
 let keyboardHeight = 0;
 let inputs = 0;
 let frames = 0;
+let preedit = '';
+let compositions = 0;
 
 function requestKeyboard() {
   state = 'waiting';
@@ -54,6 +56,17 @@ function paint() {
   ctx.fillText('value=' + value, 24, 108);
   ctx.fillText('height=' + keyboardHeight, 24, 152);
   ctx.fillText('inputs=' + inputs, 24, 196);
+  // The preedit is what composition adds over the keyboard alone: text that is
+  // being typed but not yet committed.
+  ctx.fillText('preedit=[' + preedit + ']', 24, 240);
+  ctx.fillText('compositions=' + compositions, 24, 284);
+  const pad = wx.getGamepads()[0];
+  ctx.fillText(pad
+    ? 'pad ax0=' + pad.axes[0].toFixed(2) +
+      ' b0=' + (pad.buttons[0].pressed ? 'down' : 'up') +
+      ' b6=' + pad.buttons[6].value.toFixed(2) +
+      '/' + (pad.buttons[6].pressed ? 'down' : 'up')
+    : 'pad none', 24, 328);
   requestAnimationFrame(paint);
 }
 paint();
@@ -86,6 +99,24 @@ wx.onKeyboardComplete(function (res) {
   state = 'complete';
   colour = COMPLETE;
   console.error('[kbprobe] complete value=' + value);
+});
+
+wx.onCompositionStart(function (res) {
+  compositions++;
+  preedit = res.data;
+  console.error('[kbprobe] compositionstart data=[' + res.data + ']');
+});
+
+wx.onCompositionUpdate(function (res) {
+  preedit = res.data;
+  console.error('[kbprobe] compositionupdate data=[' + res.data + ']');
+});
+
+wx.onCompositionEnd(function (res) {
+  // Cleared on end: the committed text arrives as a keyboard input value, and
+  // content that kept drawing the preedit would show it twice.
+  preedit = '';
+  console.error('[kbprobe] compositionend data=[' + res.data + ']');
 });
 
 wx.onKeyboardHeightChange(function (res) {

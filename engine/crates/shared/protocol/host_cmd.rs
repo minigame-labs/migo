@@ -34,6 +34,7 @@
 //! - **Camera** (2): `CameraEvent`, `CameraFrameData`
 //! - **Keyboard** (6): `OnKeyboardInput` .. `OnKeyUp`
 //! - **Gamepad** (3): `OnGamepadConnected` .. `OnGamepadState`
+//! - **IME composition** (3): `OnCompositionStart` .. `OnCompositionEnd`
 //! - **Bluetooth / BLE** (7): `OnBluetoothAdapterStateChange` .. `OnBeaconServiceChange`
 //! - **Video** (1): `OnVideoStateChange`
 //! - **System** (2): `OnMemoryWarning`, `OnUserCaptureScreen`
@@ -135,6 +136,7 @@ pub struct BleCharacteristicData {
 /// - **Touch / Input** (1): `OnTouch`
 /// - **Keyboard Events** (6): `OnKeyboardInput` .. `OnKeyUp`
 /// - **Gamepad Events** (3): `OnGamepadConnected` .. `OnGamepadState`
+/// - **IME Composition Events** (3): `OnCompositionStart` .. `OnCompositionEnd`
 /// - **Sensor Events** (5): `OnDeviceMotionChange` .. `OnAccelerometerChange`
 /// - **Network** (1): `OnNetworkStatusChange`
 /// - **Audio Events** (3): `OnAudioInterruptionBegin`, `OnAudioInterruptionEnd`, `InnerAudioEvent`
@@ -426,6 +428,40 @@ pub enum HostCommand {
         code: String,
         /// Event timestamp in milliseconds.
         timestamp_ms: f64,
+    },
+
+    // ---- IME Composition Events ----
+    /// The user began composing text through an IME.
+    ///
+    /// Triggers `compositionstart`. Composition is the in-progress state of IME
+    /// input -- typing pinyin shows a preedit string before any of it is
+    /// committed -- and it is distinct from the soft keyboard's
+    /// `OnKeyboardInput`, which reports text that has already been committed. A
+    /// game drawing its own text field needs both: the preedit to show what is
+    /// being typed, and the committed value to store.
+    OnCompositionStart {
+        /// The preedit text at the moment composition began; usually empty.
+        data: String,
+    },
+
+    /// The preedit text changed.
+    ///
+    /// Triggers `compositionupdate`. `data` is the whole current preedit
+    /// string, not the delta -- the same rule the soft keyboard's value follows,
+    /// and for the same reason: a host sending only what changed leaves content
+    /// unable to reconstruct the rest.
+    OnCompositionUpdate {
+        data: String,
+    },
+
+    /// Composition finished.
+    ///
+    /// Triggers `compositionend`. `data` is the committed text, which is empty
+    /// when the user cancelled. Content that has been drawing the preedit must
+    /// clear it on this event; the committed text arrives here and, for a host
+    /// that also drives the soft keyboard, again as an input value.
+    OnCompositionEnd {
+        data: String,
     },
 
     // ---- Gamepad Events ----

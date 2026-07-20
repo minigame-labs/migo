@@ -24,6 +24,7 @@ import * as tcpSocket from 'ext:host_v8_network/08_tcp_socket.js';
 import * as udpSocket from 'ext:host_v8_network/09_udp_socket.js';
 import * as mouseApi from 'ext:host_v8_touch/03_mouse.js';
 import * as gamepadApi from 'ext:host_v8_touch/04_gamepad.js';
+import * as compositionApi from 'ext:host_v8_touch/05_composition.js';
 import * as timersInternal from 'ext:host_v8_web/02_timers.js';
 import * as imageApi from 'ext:host_v8_image/01_image.js';
 
@@ -187,6 +188,24 @@ const WindowGlobalScope = {
         gamepadApi._internalTriggerGamepadDisconnected,
     ),
     _internalTriggerGamepadState: core.propNonEnumerable(gamepadApi._internalTriggerGamepadState),
+
+    // IME composition. The in-progress half of text input, which the soft
+    // keyboard above does not report -- see input/05_composition.js.
+    onCompositionStart: core.propNonEnumerable(compositionApi.onCompositionStart),
+    offCompositionStart: core.propNonEnumerable(compositionApi.offCompositionStart),
+    onCompositionUpdate: core.propNonEnumerable(compositionApi.onCompositionUpdate),
+    offCompositionUpdate: core.propNonEnumerable(compositionApi.offCompositionUpdate),
+    onCompositionEnd: core.propNonEnumerable(compositionApi.onCompositionEnd),
+    offCompositionEnd: core.propNonEnumerable(compositionApi.offCompositionEnd),
+    _internalTriggerCompositionStart: core.propNonEnumerable(
+        compositionApi._internalTriggerCompositionStart,
+    ),
+    _internalTriggerCompositionUpdate: core.propNonEnumerable(
+        compositionApi._internalTriggerCompositionUpdate,
+    ),
+    _internalTriggerCompositionEnd: core.propNonEnumerable(
+        compositionApi._internalTriggerCompositionEnd,
+    ),
 };
 
 export { WindowGlobalScope };

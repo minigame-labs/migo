@@ -79,6 +79,9 @@ pub(crate) struct JsBindings {
     gamepad_connected_fn: Option<v8::Global<v8::Function>>,
     gamepad_disconnected_fn: Option<v8::Global<v8::Function>>,
     gamepad_state_fn: Option<v8::Global<v8::Function>>,
+    composition_start_fn: Option<v8::Global<v8::Function>>,
+    composition_update_fn: Option<v8::Global<v8::Function>>,
+    composition_end_fn: Option<v8::Global<v8::Function>>,
 
     // ---- Video ----
     video_event_fn: Option<v8::Global<v8::Function>>,
@@ -128,6 +131,9 @@ impl JsBindings {
             gamepad_connected_fn: None,
             gamepad_disconnected_fn: None,
             gamepad_state_fn: None,
+            composition_start_fn: None,
+            composition_update_fn: None,
+            composition_end_fn: None,
             video_event_fn: None,
         };
 
@@ -263,7 +269,15 @@ impl JsBindings {
         self.video_event_fn = video_event;
 
         // Resolved separately to avoid growing the tuple above; init-time only.
-        let (webgl_context_event, gamepad_connected, gamepad_disconnected, gamepad_state) = self
+        let (
+            webgl_context_event,
+            gamepad_connected,
+            gamepad_disconnected,
+            gamepad_state,
+            composition_start,
+            composition_update,
+            composition_end,
+        ) = self
             .with_main_context(rt, |scope, _ctx, global| {
                 let bridge = resolve_host_bridge(scope, global);
                 (
@@ -271,12 +285,18 @@ impl JsBindings {
                     get_global_fn(scope, bridge, "_internalTriggerGamepadConnected"),
                     get_global_fn(scope, bridge, "_internalTriggerGamepadDisconnected"),
                     get_global_fn(scope, bridge, "_internalTriggerGamepadState"),
+                    get_global_fn(scope, bridge, "_internalTriggerCompositionStart"),
+                    get_global_fn(scope, bridge, "_internalTriggerCompositionUpdate"),
+                    get_global_fn(scope, bridge, "_internalTriggerCompositionEnd"),
                 )
             });
         self.webgl_context_event_fn = webgl_context_event;
         self.gamepad_connected_fn = gamepad_connected;
         self.gamepad_disconnected_fn = gamepad_disconnected;
         self.gamepad_state_fn = gamepad_state;
+        self.composition_start_fn = composition_start;
+        self.composition_update_fn = composition_update;
+        self.composition_end_fn = composition_end;
 
         if self.enqueue_touch_event_fn.is_none() {
             warn!("[Host {}] _internalEnqueueRawTouchEvent not found", host_id);
@@ -842,6 +862,41 @@ impl JsBindings {
                 let _ = func.call(scope, global.into(), &args);
             });
         }
+    }
+
+    /// Dispatch one IME composition event.
+    ///
+    /// The three share a body because they differ only in which listener group
+    /// receives them: `data` means the same thing in each -- the whole current
+    /// preedit, or the committed text at the end -- so a separate method per
+    /// event would be three copies of one call.
+    fn dispatch_composition(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        func_g: Option<&v8::Global<v8::Function>>,
+        data: &str,
+    ) {
+        if let Some(func_g) = func_g {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::String::new(scope, data)
+                    .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
+                    .into()];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    pub(crate) fn dispatch_composition_start(&self, rt: &mut deno_core::JsRuntime, data: &str) {
+        self.dispatch_composition(rt, self.composition_start_fn.as_ref(), data);
+    }
+
+    pub(crate) fn dispatch_composition_update(&self, rt: &mut deno_core::JsRuntime, data: &str) {
+        self.dispatch_composition(rt, self.composition_update_fn.as_ref(), data);
+    }
+
+    pub(crate) fn dispatch_composition_end(&self, rt: &mut deno_core::JsRuntime, data: &str) {
+        self.dispatch_composition(rt, self.composition_end_fn.as_ref(), data);
     }
 
     /// Announce a gamepad. The id and mapping are the Web API's own fields.

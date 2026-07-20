@@ -668,6 +668,18 @@ impl HostJsRuntime {
     }
 
     #[inline]
+    pub fn dispatch_composition_start(&mut self, data: &str) {
+        self.with_v8(|rt, bindings| bindings.dispatch_composition_start(rt, data));
+    }
+
+    pub fn dispatch_composition_update(&mut self, data: &str) {
+        self.with_v8(|rt, bindings| bindings.dispatch_composition_update(rt, data));
+    }
+
+    pub fn dispatch_composition_end(&mut self, data: &str) {
+        self.with_v8(|rt, bindings| bindings.dispatch_composition_end(rt, data));
+    }
+
     pub fn dispatch_gamepad_connected(
         &mut self,
         index: u32,

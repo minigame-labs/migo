@@ -239,6 +239,22 @@ static void send_keyboard(MigoSession *session, MigoKeyboardEventType type,
  * The height is CSS pixels, converted from this host's own pixels by the same
  * SCALE_FACTOR the attach descriptor used.
  */
+static void send_composition(MigoSession *session, MigoCompositionEventType type,
+                             const char *data) {
+    MigoCompositionEvent event;
+    memset(&event, 0, sizeof event);
+    event.struct_size = (uint32_t)sizeof event;
+    event.abi_version = MIGO_ABI_VERSION_CURRENT;
+    event.event_type = type;
+    event.data_utf8 = data;
+    event.data_length = data ? (uint32_t)strlen(data) : 0;
+
+    MigoResult result = migo_session_send_composition_event(session, &event);
+    if (result != MIGO_OK) {
+        fprintf(stderr, "[c-host] composition not delivered: %d\n", (int)result);
+    }
+}
+
 static void feed_scripted_keyboard(MigoSession *session) {
     static const char *const typed[] = {"m", "mi", "mig", "migo"};
 
@@ -247,6 +263,17 @@ static void feed_scripted_keyboard(MigoSession *session) {
     for (size_t i = 0; i < sizeof typed / sizeof typed[0]; ++i) {
         send_keyboard(session, MIGO_KEYBOARD_EVENT_INPUT, typed[i], 0.0);
     }
+    /* What an IME does before anything is committed: a preedit that grows, then
+     * resolves. The committed text arrives as a keyboard input value, which is
+     * why the two are sent together rather than one instead of the other. */
+    send_composition(session, MIGO_COMPOSITION_EVENT_START, "");
+    send_composition(session, MIGO_COMPOSITION_EVENT_UPDATE, "ni");
+    send_composition(session, MIGO_COMPOSITION_EVENT_UPDATE, "nihao");
+    /* Multi-byte on purpose: preedit text is the whole reason composition
+     * exists, and a boundary that mangles it would look fine for ASCII. */
+    send_composition(session, MIGO_COMPOSITION_EVENT_END, "\u4f60\u597d");
+    send_keyboard(session, MIGO_KEYBOARD_EVENT_INPUT, "migo\u4f60\u597d", 0.0);
+
     send_keyboard(session, MIGO_KEYBOARD_EVENT_CONFIRM, "migo", 0.0);
     /* Complete is the keyboard being dismissed. It must arrive even though
      * content asked for the hide itself: content that never sees it goes on

@@ -34,8 +34,8 @@ pub use gamepad::{
 };
 pub use input::{migo_session_send_touch, MigoTouchEvent, MigoTouchPoint};
 pub use keyboard::{
-    migo_session_send_key_event, migo_session_send_keyboard_event, MigoKeyEvent,
-    MigoKeyboardEvent,
+    migo_session_send_composition_event, migo_session_send_key_event,
+    migo_session_send_keyboard_event, MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent,
 };
 pub use surface::{
     migo_session_attach_surface, migo_surface_detach, migo_surface_update,

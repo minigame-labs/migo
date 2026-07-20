@@ -113,9 +113,12 @@ The candidate cannot be declared stable until all of the following exist:
   timestamp on the engine's existing `OnKeyDown`/`OnKeyUp` path. Not batched, unlike touch --
   keys arrive at typing speed, so a batch API would be shape without a requirement. The host
   translates its platform keycodes into DOM values, because a portable runtime that accepted
-  platform codes would have to carry a mapping per platform. **Open**: IME composition, which
-  is engine work before it is ABI work -- there is no way to represent a preedit string
-  because wx has none, so there is nothing for a contract to carry. **gamepad done**: the engine had none at all -- no JS
+  platform codes would have to carry a mapping per platform. **IME composition done**: the engine had no way to
+  represent a preedit string, so this added both halves. wx has none, so the shape is the DOM
+  `CompositionEvent` -- `compositionstart`/`update`/`end` carrying the whole current preedit,
+  driven by `migo_session_send_composition_event`. It sits alongside the soft keyboard rather
+  than replacing it: the keyboard reports committed text, composition reports what is still
+  being typed, and content drawing its own text field needs both. **gamepad done**: the engine had none at all -- no JS
   API, no `HostCommand`, no dispatch -- so this added both halves. wx has no gamepad API, so
   the shape is the W3C one Migo replaces: `navigator.getGamepads()` plus
   `gamepadconnected`/`gamepaddisconnected`, driven by `migo_session_set_gamepad_connected`

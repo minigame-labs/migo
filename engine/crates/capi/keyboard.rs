@@ -88,6 +88,83 @@ unsafe fn to_host_command(event: &MigoKeyboardEvent) -> Result<HostCommand, Migo
     }
 }
 
+/// `MIGO_COMPOSITION_EVENT_*` from `include/migo/input.h`.
+const MIGO_COMPOSITION_EVENT_START: u32 = 0;
+const MIGO_COMPOSITION_EVENT_UPDATE: u32 = 1;
+const MIGO_COMPOSITION_EVENT_END: u32 = 2;
+
+#[repr(C)]
+pub struct MigoCompositionEvent {
+    pub(crate) header: VersionedHeader,
+    pub(crate) event_type: u32,
+    pub(crate) data_length: u32,
+    pub(crate) data_utf8: *const std::os::raw::c_char,
+}
+
+/// Translate a validated composition event into the engine's command.
+///
+/// # Safety
+/// `data_utf8` must point at `data_length` readable bytes.
+unsafe fn to_composition_command(
+    event: &MigoCompositionEvent,
+) -> Result<HostCommand, MigoResult> {
+    // Read before the type is matched so an unknown type and an unreadable
+    // string are told apart rather than both surfacing as the first failure.
+    let data = unsafe { copy_utf8_with_length(event.data_utf8, event.data_length) }?;
+    match event.event_type {
+        MIGO_COMPOSITION_EVENT_START => Ok(HostCommand::OnCompositionStart { data }),
+        MIGO_COMPOSITION_EVENT_UPDATE => Ok(HostCommand::OnCompositionUpdate { data }),
+        MIGO_COMPOSITION_EVENT_END => Ok(HostCommand::OnCompositionEnd { data }),
+        _ => Err(MIGO_ERROR_INVALID_ARGUMENT),
+    }
+}
+
+/// Deliver one IME composition event to the session's content.
+///
+/// # Safety
+/// `session` must be live; `event` must point at a `MigoCompositionEvent` whose
+/// `data_utf8` holds at least `data_length` bytes. Both are borrowed for the
+/// duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn migo_session_send_composition_event(
+    session: *mut MigoSession,
+    event: *const MigoCompositionEvent,
+) -> MigoResult {
+    guard("migo_session_send_composition_event", || {
+        let Some(session) = (unsafe { session.as_ref() }) else {
+            return MIGO_ERROR_INVALID_ARGUMENT;
+        };
+        if let Err(error) = unsafe {
+            validate_header(
+                event as *const VersionedHeader,
+                size_of::<MigoCompositionEvent>(),
+            )
+        } {
+            return error;
+        }
+        let event = unsafe { &*event };
+
+        let command = match unsafe { to_composition_command(event) } {
+            Ok(command) => command,
+            Err(error) => return error,
+        };
+        let host = match attached_host(session) {
+            Ok(host) => host,
+            Err(error) => return error,
+        };
+
+        // A dropped END leaves content drawing a preedit that will never be
+        // cleared, and no later event corrects it.
+        match send_command_to_host(host, command) {
+            Ok(()) => MIGO_OK,
+            Err(error) => {
+                tracing::debug!("migo_session_send_composition_event: not delivered: {error}");
+                MIGO_ERROR_WOULD_BLOCK
+            }
+        }
+    })
+}
+
 /// `MIGO_KEY_EVENT_*` from `include/migo/input.h`.
 const MIGO_KEY_EVENT_DOWN: u32 = 0;
 const MIGO_KEY_EVENT_UP: u32 = 1;
@@ -279,6 +356,88 @@ mod tests {
             value_utf8: std::ptr::null(),
             height_css_px: height,
         }
+    }
+
+    fn composition_event(kind: u32, data: &str) -> MigoCompositionEvent {
+        MigoCompositionEvent {
+            header: VersionedHeader {
+                struct_size: size_of::<MigoCompositionEvent>() as u32,
+                abi_version: MIGO_ABI_VERSION_CURRENT,
+            },
+            event_type: kind,
+            data_length: data.len() as u32,
+            data_utf8: data.as_ptr() as *const std::os::raw::c_char,
+        }
+    }
+
+    /// Each composition event must reach its own command. Content draws the
+    /// preedit on update and clears it on end, so a swapped arm leaves text on
+    /// screen that the user already committed or cancelled.
+    #[test]
+    fn every_composition_type_reaches_its_own_command() {
+        let cases = [
+            (MIGO_COMPOSITION_EVENT_START, ""),
+            (MIGO_COMPOSITION_EVENT_UPDATE, "nihao"),
+            (MIGO_COMPOSITION_EVENT_END, "\u{4f60}\u{597d}"),
+        ];
+        for (kind, data) in cases {
+            let event = composition_event(kind, data);
+            match (kind, unsafe { to_composition_command(&event) }.expect("well-formed")) {
+                (MIGO_COMPOSITION_EVENT_START, HostCommand::OnCompositionStart { data: got }) => {
+                    assert_eq!(got, data)
+                }
+                (MIGO_COMPOSITION_EVENT_UPDATE, HostCommand::OnCompositionUpdate { data: got }) => {
+                    assert_eq!(got, data)
+                }
+                (MIGO_COMPOSITION_EVENT_END, HostCommand::OnCompositionEnd { data: got }) => {
+                    assert_eq!(got, data)
+                }
+                (kind, other) => panic!("composition type {kind} produced {other:?}"),
+            }
+        }
+    }
+
+    /// Multi-byte preedit text is the whole point of composition, so a length
+    /// that splits a character must be refused rather than delivered mangled.
+    #[test]
+    fn a_composition_length_that_splits_a_character_is_rejected() {
+        let data = "\u{4f60}\u{597d}";
+        let mut event = composition_event(MIGO_COMPOSITION_EVENT_UPDATE, data);
+        event.data_length = 1; // half of the first code point
+        assert_eq!(
+            unsafe { to_composition_command(&event) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+    }
+
+    /// An empty end is a cancelled composition, which content must still see so
+    /// it can clear the preedit it has been drawing.
+    #[test]
+    fn an_empty_composition_end_is_valid_because_it_means_cancelled() {
+        let event = composition_event(MIGO_COMPOSITION_EVENT_END, "");
+        match unsafe { to_composition_command(&event) }.expect("well-formed") {
+            HostCommand::OnCompositionEnd { data } => assert_eq!(data, ""),
+            other => panic!("expected a composition end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_composition_type_is_rejected() {
+        assert_eq!(
+            unsafe { to_composition_command(&composition_event(99, "x")) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+    }
+
+    #[test]
+    fn send_composition_without_an_attached_surface_reports_invalid_state() {
+        with_session("composition-detached", |session| {
+            let event = composition_event(MIGO_COMPOSITION_EVENT_UPDATE, "ni");
+            assert_eq!(
+                unsafe { migo_session_send_composition_event(session, &event) },
+                MIGO_ERROR_INVALID_STATE
+            );
+        });
     }
 
     fn key_event(kind: u32, key: &str, code: &str) -> MigoKeyEvent {

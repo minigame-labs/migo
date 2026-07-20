@@ -864,6 +864,21 @@ impl Host {
                 Ok(())
             }
 
+            HostCommand::OnCompositionStart { data } => {
+                self.js.dispatch_composition_start(&data);
+                Ok(())
+            }
+
+            HostCommand::OnCompositionUpdate { data } => {
+                self.js.dispatch_composition_update(&data);
+                Ok(())
+            }
+
+            HostCommand::OnCompositionEnd { data } => {
+                self.js.dispatch_composition_end(&data);
+                Ok(())
+            }
+
             HostCommand::OnGamepadConnected {
                 index,
                 id,

@@ -43,6 +43,7 @@ esm = [
     "02_keyboard.js",
     "03_mouse.js",
     "04_gamepad.js",
+    "05_composition.js",
 ]
 );
 

@@ -27,7 +27,7 @@ use crate::{
     callbacks::{MigoError, MigoHostCallbacks, MigoKeyboardShowOptions},
     input::{MigoTouchEvent, MigoTouchPoint},
     gamepad::{MigoGamepadButton, MigoGamepadInfo, MigoGamepadStateEvent},
-    keyboard::{MigoKeyEvent, MigoKeyboardEvent},
+    keyboard::{MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent},
     surface::{
         MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
         MigoX11WindowDescriptor,
@@ -67,6 +67,7 @@ header_is_first!(
     MigoKeyEvent,
     MigoGamepadInfo,
     MigoGamepadStateEvent,
+    MigoCompositionEvent,
 );
 
 // The header itself. Two `u32`s, in this order, on every target: it is the one
@@ -220,6 +221,11 @@ mod lp64 {
     const _: () = assert!(offset_of!(MigoKeyEvent, code_length) == 32);
     const _: () = assert!(offset_of!(MigoKeyEvent, reserved0) == 36);
     const _: () = assert!(offset_of!(MigoKeyEvent, timestamp_ms) == 40);
+
+    const _: () = assert!(size_of::<MigoCompositionEvent>() == 24);
+    const _: () = assert!(offset_of!(MigoCompositionEvent, event_type) == 8);
+    const _: () = assert!(offset_of!(MigoCompositionEvent, data_length) == 12);
+    const _: () = assert!(offset_of!(MigoCompositionEvent, data_utf8) == 16);
 
     const _: () = assert!(size_of::<MigoGamepadInfo>() == 40);
     const _: () = assert!(offset_of!(MigoGamepadInfo, index) == 8);
