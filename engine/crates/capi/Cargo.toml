@@ -25,3 +25,7 @@ shared = { path = "../shared", default-features = false }
 graphics = { path = "../graphics", default-features = false }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The keyboard options arrive from the engine as JSON, which must not reach C:
+# a host should not have to link a parser to open a keyboard, so the boundary
+# translates it into `MigoKeyboardShowOptions`.
+serde_json = { workspace = true }

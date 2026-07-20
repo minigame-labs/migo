@@ -11,6 +11,7 @@ the reason these exist.
 | `linux/` | An X11 host. Built with plain `cc` and `pkg-config`, or with CMake through `find_package(migo)`. |
 | `android/` | A NativeActivity host. No Java at all: the manifest declares `android:hasCode="false"` and names this library's `ANativeActivity_onCreate`. |
 | `touch-probe/` | Content shared by both, for verifying that input arrives. |
+| `keyboard-probe/` | Content shared by both, for verifying the soft-keyboard round trip. |
 
 The Android module lives here rather than under `platforms/android/` because it
 is a *consumer* of what that tree ships, not part of the product. Gradle picks
@@ -44,3 +45,18 @@ and the per-pointer `CHANGED`/`REMOVED` flags are tested.
 Android is also the only place the lifecycle contract runs for real: nothing on
 a desktop takes the application away, so `migo_session_set_visibility` and the
 detach/attach cycle only meet genuine pause, resume and window loss here.
+
+The soft keyboard splits the same way. On Linux the host has no keyboard to
+raise, so `on_show_keyboard` only proves the callback arrives with the right
+options. On Android it drives the real system IME through
+`ANativeActivity_showSoftInput`, which is the only place content's
+`wx.showKeyboard` raises an actual keyboard — and the only place the rule that
+a host-supplied keyboard beats the platform's is load-bearing, since Android's
+own accessor claims a keyboard it reaches over JNI to a Java SDK that a pure
+native host does not have.
+
+Neither host reads text back from a real IME. Recovering Unicode text from a
+NativeActivity means `KeyEvent.getUnicodeChar` over JNI, which is the Java
+dependency this example exists to avoid, so both play the same fixed script.
+That covers the ABI; it does not cover a real IME's text, which is what the
+still-open IME-composition blocker is about.

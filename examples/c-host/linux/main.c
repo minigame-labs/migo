@@ -17,6 +17,7 @@
 
 #include <X11/Xlib.h>
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,6 +67,53 @@ static void MIGO_CALL on_exit_requested(void *user_data, MigoSession *session) {
     fflush(stdout);
 }
 
+/*
+ * ---- The soft keyboard, which is a capability this host supplies. ----
+ *
+ * X11 has no keyboard the engine can ask for, so a host here does what a real
+ * one does: it answers the request itself and feeds the resulting events back.
+ * This example plays a fixed script rather than opening a real IME, because the
+ * point is to prove the round trip and a scripted host makes the expected
+ * pixels exact.
+ *
+ * Install all three or none -- a host that can show a keyboard but not hide it
+ * strands it on screen, so a subset is refused at install time.
+ *
+ * The flag is atomic because these callbacks run on whichever thread our
+ * dispatcher chose (here, the engine's own), while the loop that reads it runs
+ * on main.
+ */
+static atomic_int g_keyboard_requested;
+
+static void MIGO_CALL on_show_keyboard(void *user_data, MigoSession *session,
+                                       const MigoKeyboardShowOptions *options) {
+    (void)user_data;
+    (void)session;
+    printf("[c-host] show keyboard: max_length=%u type=%u confirm=%u flags=0x%x default='%.*s'\n",
+           options->max_length, options->keyboard_type, options->confirm_type,
+           options->flags, (int)options->default_value_length,
+           options->default_value_utf8);
+    fflush(stdout);
+    atomic_store(&g_keyboard_requested, 1);
+}
+
+static void MIGO_CALL on_hide_keyboard(void *user_data, MigoSession *session) {
+    (void)user_data;
+    (void)session;
+    printf("[c-host] hide keyboard\n");
+    fflush(stdout);
+}
+
+static void MIGO_CALL on_update_keyboard(void *user_data, MigoSession *session,
+                                         const char *value_utf8, uint32_t value_length) {
+    (void)user_data;
+    (void)session;
+    /* Length-delimited and borrowed for this call only: print it, do not keep
+     * the pointer. */
+    printf("[c-host] update keyboard: '%.*s'\n", (int)value_length, value_utf8);
+    fflush(stdout);
+}
+
 static int fail(const char *what, MigoResult result) {
     fprintf(stderr, "[c-host] %s failed: %d\n", what, (int)result);
     return 1;
@@ -107,6 +155,50 @@ static void send_touch(MigoSession *session, MigoTouchType type, int x, int y,
     if (result != MIGO_OK) {
         fprintf(stderr, "[c-host] touch not delivered: %d\n", (int)result);
     }
+}
+
+static void send_keyboard(MigoSession *session, MigoKeyboardEventType type,
+                          const char *value, double height_css_px) {
+    MigoKeyboardEvent event;
+    memset(&event, 0, sizeof event);
+    event.struct_size = (uint32_t)sizeof event;
+    event.abi_version = MIGO_ABI_VERSION_CURRENT;
+    event.event_type = type;
+    event.value_utf8 = value;
+    event.value_length = value ? (uint32_t)strlen(value) : 0;
+    event.height_css_px = height_css_px;
+
+    MigoResult result = migo_session_send_keyboard_event(session, &event);
+    if (result != MIGO_OK) {
+        fprintf(stderr, "[c-host] keyboard event not delivered: %d\n", (int)result);
+    }
+}
+
+/*
+ * What a real IME would produce, once content asked for a keyboard: the
+ * keyboard taking up the lower part of the screen, the user typing, then
+ * confirming. Every text event carries the WHOLE current value, not the
+ * keystroke -- content reads it as the field's contents.
+ *
+ * The height is CSS pixels, converted from this host's own pixels by the same
+ * SCALE_FACTOR the attach descriptor used.
+ */
+static void feed_scripted_keyboard(MigoSession *session) {
+    static const char *const typed[] = {"m", "mi", "mig", "migo"};
+
+    send_keyboard(session, MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE, NULL,
+                  260.0f / SCALE_FACTOR);
+    for (size_t i = 0; i < sizeof typed / sizeof typed[0]; ++i) {
+        send_keyboard(session, MIGO_KEYBOARD_EVENT_INPUT, typed[i], 0.0);
+    }
+    send_keyboard(session, MIGO_KEYBOARD_EVENT_CONFIRM, "migo", 0.0);
+    /* Complete is the keyboard being dismissed. It must arrive even though
+     * content asked for the hide itself: content that never sees it goes on
+     * believing the keyboard is still up, and nothing later corrects that. */
+    send_keyboard(session, MIGO_KEYBOARD_EVENT_COMPLETE, "migo", 0.0);
+    /* The keyboard going away is also a height change back to zero, which is
+     * how content learns to lay itself back out. */
+    send_keyboard(session, MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE, NULL, 0.0);
 }
 
 int main(int argc, char **argv) {
@@ -197,6 +289,10 @@ int main(int argc, char **argv) {
     host_callbacks.on_ready = on_ready;
     host_callbacks.on_error = on_error;
     host_callbacks.on_exit_requested = on_exit_requested;
+    /* All three or none: a subset is refused with MIGO_ERROR_INVALID_ARGUMENT. */
+    host_callbacks.on_show_keyboard = on_show_keyboard;
+    host_callbacks.on_hide_keyboard = on_hide_keyboard;
+    host_callbacks.on_update_keyboard = on_update_keyboard;
 
     result = migo_session_set_host_callbacks(session, &host_callbacks);
     if (result != MIGO_OK) return fail("migo_session_set_host_callbacks", result);
@@ -295,6 +391,13 @@ int main(int argc, char **argv) {
             default:
                 break;
             }
+        }
+        /* Answer a keyboard request from our own loop, not from inside the
+         * callback: the callback runs on the engine's thread, and a host that
+         * fed events from there would be doing its work on a thread it never
+         * agreed to own. */
+        if (atomic_exchange(&g_keyboard_requested, 0)) {
+            feed_scripted_keyboard(session);
         }
         sleep_ms(16);
     }

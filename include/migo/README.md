@@ -102,8 +102,16 @@ The candidate cannot be declared stable until all of the following exist:
 
 - performance-oriented batched pointer/touch, keyboard/text/IME, and gamepad contracts —
   **pointer/touch done** (`migo_session_send_touch`: batched, one copy at the boundary, no
-  allocation, sharing the engine path Android already drives); keyboard/text/IME and gamepad
-  **open**;
+  allocation, sharing the engine path Android already drives); **soft keyboard done**: it is
+  a capability the host supplies rather than one Migo has, so `on_show_keyboard` /
+  `on_hide_keyboard` / `on_update_keyboard` install together on `MigoHostCallbacks` (all
+  three or none — a host that can open a keyboard but not close it strands it on screen),
+  and `migo_session_send_keyboard_event` carries input/confirm/complete/height back on the
+  path Android already drives. The host's keyboard wins over the platform's, because
+  Android's own accessor claims one unconditionally and reaches a JVM a pure-native host has
+  not got. **Open**: physical keys (`OnKeyDown`/`OnKeyUp` exist in the engine but have no C
+  contract yet) and IME composition, which the engine cannot represent today because wx has
+  no model for a preedit string. Gamepad **open**;
 - asynchronous request IDs, cancellation races, and late-completion rules — **settled for
   v1**: v1 has exactly one asynchronous operation and it is single-shot per Session, so
   there is nothing to correlate and no request ID to carry. The rules are normative under
@@ -122,7 +130,7 @@ The candidate cannot be declared stable until all of the following exist:
   multi-pointer delivery has never run on device, because a real two-finger gesture cannot
   be synthesized there -- `sendevent` is refused by SELinux and `input motionevent` carries
   one pointer. The ABI's batch conversion is covered by tests;
-- export lists, symbol/version tests, old-client/new-library tests, and per-target ILP32/LP64 layout lanes — **export list and symbol/version tests done** for `linux-x86_64` (`scripts/test-linux-sdk-contract.sh`); old-client/new-library lanes **open**;
+- export lists, symbol/version tests, old-client/new-library tests, and per-target ILP32/LP64 layout lanes — **export list and symbol/version tests done** for `linux-x86_64` (`scripts/test-linux-sdk-contract.sh`); old-client/new-library lanes **open**, and the gap is now known rather than suspected: the `MigoHostCallbacks` comment below describes appended fields as tolerating a smaller `struct_size` from an older host, but `validate_header` requires exact equality, so such a host is rejected with `MIGO_ERROR_INVALID_ARGUMENT` instead. The comment states an intent the code does not implement. Closing it is an ABI-wide decision — which versioned structs accept a smaller size, how a partially copied struct's absent fields are defaulted, and what a *larger* size from a newer host means — so it belongs to this lane rather than to whichever slice next appends a field;
 - Android/Linux compatibility and performance gates with no material regression — **Linux compatibility gate done**, the rest open.
 
 The Linux artifact contract that is in place is described by

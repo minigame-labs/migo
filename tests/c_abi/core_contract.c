@@ -80,13 +80,13 @@ _Static_assert(sizeof(MigoSurfaceMetrics) == 48, "metrics v1 layout");
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(MigoError) == 32, "LP64 error layout");
 _Static_assert(sizeof(MigoSurfaceDescriptor) == 72, "LP64 Surface layout");
-_Static_assert(sizeof(MigoHostCallbacks) == 72, "LP64 callback layout");
+_Static_assert(sizeof(MigoHostCallbacks) == 96, "LP64 callback layout");
 #elif UINTPTR_MAX == UINT32_MAX
 _Static_assert(sizeof(MigoError) == 28, "ILP32 error layout");
 _Static_assert(sizeof(MigoSurfaceDescriptor) ==
                    (_Alignof(uint64_t) == 8 ? 72 : 68),
                "ILP32 Surface layout follows the target uint64_t alignment");
-_Static_assert(sizeof(MigoHostCallbacks) == 36, "ILP32 callback layout");
+_Static_assert(sizeof(MigoHostCallbacks) == 48, "ILP32 callback layout");
 #else
 #error "unsupported pointer width"
 #endif

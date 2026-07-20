@@ -19,11 +19,24 @@ use crate::android::jni;
 /// Android device services aggregator.
 pub struct AndroidDeviceServices {
     host_id: i32,
+    /// Set when an embedding host services the keyboard itself; see
+    /// `AndroidPlatform::with_host_keyboard`.
+    host_keyboard: Option<Arc<dyn KeyboardService>>,
 }
 
 impl AndroidDeviceServices {
     pub fn new(host_id: i32) -> Self {
-        Self { host_id }
+        Self::with_host_keyboard(host_id, None)
+    }
+
+    pub fn with_host_keyboard(
+        host_id: i32,
+        host_keyboard: Option<Arc<dyn KeyboardService>>,
+    ) -> Self {
+        Self {
+            host_id,
+            host_keyboard,
+        }
     }
 }
 
@@ -167,6 +180,12 @@ impl SystemUtilServices for AndroidDeviceServices {
         }))
     }
     fn keyboard(&self) -> Option<Arc<dyn KeyboardService>> {
+        // The host's own comes first: `AndroidKeyboard` reaches the Java SDK
+        // over JNI, which a pure-native host has not got, and this accessor
+        // would otherwise claim a capability it cannot deliver.
+        if let Some(host_keyboard) = &self.host_keyboard {
+            return Some(Arc::clone(host_keyboard));
+        }
         Some(Arc::new(AndroidKeyboard {
             host_id: self.host_id,
         }))

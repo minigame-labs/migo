@@ -67,6 +67,9 @@ struct host {
     int content_loaded;
     char content_id[128];
     int dispatch_pipe[2]; /* [0] read, [1] write */
+    /* Needed for the soft keyboard: showing and hiding the system IME is an
+     * activity-level operation, and this host has no Java side to ask. */
+    ANativeActivity *activity;
 };
 
 static struct host g_host;
@@ -178,6 +181,87 @@ static void on_exit_requested(void *user_data, MigoSession *session) {
     (void)user_data;
     (void)session;
     LOGI("callback: content requested exit");
+}
+
+/* ---- Soft keyboard ------------------------------------------------------
+ *
+ * The engine has no keyboard of its own, and on Android its platform accessor
+ * reaches the Java SDK over JNI -- which this host, being pure native, has not
+ * got. So the keyboard is a capability supplied here, through the three
+ * callbacks that install together.
+ *
+ * Show and hide drive the real system IME through the NDK's activity API, so
+ * content's wx.showKeyboard genuinely raises the keyboard on the device.
+ *
+ * The text is scripted rather than read back from the IME: recovering Unicode
+ * text from a NativeActivity means going through KeyEvent.getUnicodeChar over
+ * JNI, which is a Java dependency this example exists to avoid. The script is
+ * enough to prove the inbound ABI path on device, and it makes the expected
+ * pixels exact.
+ */
+static void send_keyboard(struct host *h, MigoKeyboardEventType type, const char *value,
+                          double height_css_px) {
+    if (h->session == NULL || h->attachment == NULL) return;
+
+    MigoKeyboardEvent event;
+    memset(&event, 0, sizeof event);
+    event.struct_size = (uint32_t)sizeof event;
+    event.abi_version = MIGO_ABI_VERSION_CURRENT;
+    event.event_type = type;
+    event.value_utf8 = value;
+    event.value_length = value ? (uint32_t)strlen(value) : 0;
+    event.height_css_px = height_css_px;
+
+    MigoResult result = migo_session_send_keyboard_event(h->session, &event);
+    if (result != MIGO_OK) {
+        LOGE("keyboard event %u not delivered: %d", (unsigned)type, (int)result);
+    }
+}
+
+static void on_show_keyboard(void *user_data, MigoSession *session,
+                             const MigoKeyboardShowOptions *options) {
+    struct host *h = (struct host *)user_data;
+    (void)session;
+    LOGI("callback: show keyboard max_length=%u type=%u confirm=%u flags=0x%x default='%.*s'",
+         options->max_length, options->keyboard_type, options->confirm_type, options->flags,
+         (int)options->default_value_length, options->default_value_utf8);
+
+    if (h->activity != NULL) {
+        ANativeActivity_showSoftInput(h->activity, ANATIVEACTIVITY_SHOW_SOFT_INPUT_IMPLICIT);
+    }
+
+    /* Fed straight from here, unlike the Linux example: this callback already
+     * runs on the main thread, because our dispatcher hands tasks to the
+     * looper. The engine's JS thread returned from showKeyboard as soon as the
+     * task was queued, so nothing is re-entered. */
+    static const char *const typed[] = {"m", "mi", "mig", "migo"};
+    /* The IME covering the lower part of the screen, in CSS pixels: the device
+     * reports physical ones, and density is the same factor the attach
+     * descriptor used. */
+    send_keyboard(h, MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE, NULL, 700.0 / h->density);
+    for (size_t i = 0; i < sizeof typed / sizeof typed[0]; ++i) {
+        send_keyboard(h, MIGO_KEYBOARD_EVENT_INPUT, typed[i], 0.0);
+    }
+    send_keyboard(h, MIGO_KEYBOARD_EVENT_CONFIRM, "migo", 0.0);
+    send_keyboard(h, MIGO_KEYBOARD_EVENT_COMPLETE, "migo", 0.0);
+    send_keyboard(h, MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE, NULL, 0.0);
+}
+
+static void on_hide_keyboard(void *user_data, MigoSession *session) {
+    struct host *h = (struct host *)user_data;
+    (void)session;
+    LOGI("callback: hide keyboard");
+    if (h->activity != NULL) {
+        ANativeActivity_hideSoftInput(h->activity, ANATIVEACTIVITY_HIDE_SOFT_INPUT_IMPLICIT_ONLY);
+    }
+}
+
+static void on_update_keyboard(void *user_data, MigoSession *session, const char *value_utf8,
+                               uint32_t value_length) {
+    (void)user_data;
+    (void)session;
+    /* Length-delimited and borrowed for this call only. */
+    LOGI("callback: update keyboard '%.*s'", (int)value_length, value_utf8);
 }
 
 static void on_error(void *user_data, MigoSession *session, const MigoError *error) {
@@ -344,6 +428,11 @@ static int create_engine(struct host *h, const char *files_dir) {
     callbacks.on_error = on_error;
     /* Installing this is what tells the engine the host paces frames. */
     callbacks.on_request_frame = on_request_frame;
+    /* All three or none: a host that can open a keyboard but not close it would
+     * strand it on screen, so a subset is refused at install time. */
+    callbacks.on_show_keyboard = on_show_keyboard;
+    callbacks.on_hide_keyboard = on_hide_keyboard;
+    callbacks.on_update_keyboard = on_update_keyboard;
 
     result = migo_session_set_host_callbacks(h->session, &callbacks);
     if (result != MIGO_OK) {
@@ -504,6 +593,7 @@ void android_main(struct android_app *app) {
     ALooper_addFd(app->looper, g_host.dispatch_pipe[0], ALOOPER_POLL_CALLBACK,
                   ALOOPER_EVENT_INPUT, drain_dispatch, NULL);
 
+    g_host.activity = app->activity;
     LOGI("starting, internalDataPath=%s density=%.2f", app->activity->internalDataPath,
          g_host.density);
     read_content_id(app->activity->internalDataPath, g_host.content_id,

@@ -24,8 +24,9 @@ use std::mem::{align_of, offset_of, size_of};
 use crate::{
     abi::VersionedHeader,
     capabilities::MigoCapabilities,
-    callbacks::{MigoError, MigoHostCallbacks},
+    callbacks::{MigoError, MigoHostCallbacks, MigoKeyboardShowOptions},
     input::{MigoTouchEvent, MigoTouchPoint},
+    keyboard::MigoKeyboardEvent,
     surface::{
         MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
         MigoX11WindowDescriptor,
@@ -60,6 +61,8 @@ header_is_first!(
     MigoAndroidNativeWindowDescriptor,
     MigoX11WindowDescriptor,
     MigoTouchEvent,
+    MigoKeyboardEvent,
+    MigoKeyboardShowOptions,
 );
 
 // The header itself. Two `u32`s, in this order, on every target: it is the one
@@ -138,7 +141,7 @@ mod lp64 {
     // Function pointers are `Option<fn>` on the Rust side, which is a plain
     // nullable pointer with no discriminant. Pinning the offsets is what keeps
     // that niche optimisation from being an assumption.
-    const _: () = assert!(size_of::<MigoHostCallbacks>() == 72);
+    const _: () = assert!(size_of::<MigoHostCallbacks>() == 96);
     const _: () = assert!(offset_of!(MigoHostCallbacks, user_data) == 8);
     const _: () = assert!(offset_of!(MigoHostCallbacks, dispatcher_data) == 16);
     const _: () = assert!(offset_of!(MigoHostCallbacks, dispatch) == 24);
@@ -147,6 +150,18 @@ mod lp64 {
     const _: () = assert!(offset_of!(MigoHostCallbacks, on_exit_requested) == 48);
     const _: () = assert!(offset_of!(MigoHostCallbacks, on_surface_lost) == 56);
     const _: () = assert!(offset_of!(MigoHostCallbacks, on_request_frame) == 64);
+    const _: () = assert!(offset_of!(MigoHostCallbacks, on_show_keyboard) == 72);
+    const _: () = assert!(offset_of!(MigoHostCallbacks, on_hide_keyboard) == 80);
+    const _: () = assert!(offset_of!(MigoHostCallbacks, on_update_keyboard) == 88);
+
+    const _: () = assert!(size_of::<MigoKeyboardShowOptions>() == 40);
+    const _: () = assert!(offset_of!(MigoKeyboardShowOptions, flags) == 8);
+    const _: () = assert!(offset_of!(MigoKeyboardShowOptions, max_length) == 12);
+    const _: () = assert!(offset_of!(MigoKeyboardShowOptions, confirm_type) == 16);
+    const _: () = assert!(offset_of!(MigoKeyboardShowOptions, keyboard_type) == 20);
+    const _: () = assert!(offset_of!(MigoKeyboardShowOptions, default_value_utf8) == 24);
+    const _: () = assert!(offset_of!(MigoKeyboardShowOptions, default_value_length) == 32);
+    const _: () = assert!(offset_of!(MigoKeyboardShowOptions, reserved0) == 36);
 
     const _: () = assert!(size_of::<MigoSurfaceDescriptor>() == 72);
     const _: () = assert!(offset_of!(MigoSurfaceDescriptor, generation) == 8);
@@ -173,4 +188,13 @@ mod lp64 {
     const _: () = assert!(offset_of!(MigoTouchEvent, point_count) == 12);
     const _: () = assert!(offset_of!(MigoTouchEvent, timestamp_ms) == 16);
     const _: () = assert!(offset_of!(MigoTouchEvent, points) == 24);
+
+    // `height_css_px` is an f64 after a pointer, so nothing here shares a slot;
+    // a reordering that put the two u32s after the pointer would still size to
+    // 32 and silently read the value pointer's high half as a length.
+    const _: () = assert!(size_of::<MigoKeyboardEvent>() == 32);
+    const _: () = assert!(offset_of!(MigoKeyboardEvent, event_type) == 8);
+    const _: () = assert!(offset_of!(MigoKeyboardEvent, value_length) == 12);
+    const _: () = assert!(offset_of!(MigoKeyboardEvent, value_utf8) == 16);
+    const _: () = assert!(offset_of!(MigoKeyboardEvent, height_css_px) == 24);
 }

@@ -7,17 +7,35 @@ use tracing::error;
 use crate::android::jni;
 use crate::android::services::AndroidDeviceServices;
 
-pub struct AndroidPlatform;
+pub struct AndroidPlatform {
+    host_keyboard: Option<Arc<dyn core::services::KeyboardService>>,
+}
 
 impl AndroidPlatform {
     pub fn new() -> Self {
-        Self
+        Self::with_host_keyboard(None)
+    }
+
+    /// Build a platform that prefers a host-supplied keyboard over the JNI one.
+    ///
+    /// `AndroidKeyboard` reaches the Java SDK over JNI, and its accessor claims
+    /// support unconditionally -- a claim that is false for a pure-native host,
+    /// which has no JVM to reach. A host that supplied its own therefore wins,
+    /// for the same reason `uses_external_vsync` reports what the host
+    /// installed rather than what this platform would prefer.
+    pub fn with_host_keyboard(
+        host_keyboard: Option<Arc<dyn core::services::KeyboardService>>,
+    ) -> Self {
+        Self { host_keyboard }
     }
 }
 
 impl DeviceServiceProvider for AndroidPlatform {
     fn create_device_services(&self, host_id: i32) -> Option<Arc<dyn DeviceServices>> {
-        Some(Arc::new(AndroidDeviceServices::new(host_id)))
+        Some(Arc::new(AndroidDeviceServices::with_host_keyboard(
+            host_id,
+            self.host_keyboard.clone(),
+        )))
     }
 }
 

@@ -30,6 +30,10 @@ pub type MigoOnErrorFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const M
 pub type MigoOnExitRequestedFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 pub type MigoOnSurfaceLostFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32);
 pub type MigoOnRequestFrameFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+pub type MigoOnShowKeyboardFn =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, *const MigoKeyboardShowOptions);
+pub type MigoOnHideKeyboardFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+pub type MigoOnUpdateKeyboardFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char, u32);
 
 /// Mirrors `MigoError` in `include/migo/types.h`.
 #[repr(C)]
@@ -40,6 +44,51 @@ pub struct MigoError {
     pub message_utf8: *const c_char,
     pub message_length: u32,
     pub reserved0: u32,
+}
+
+/// `MIGO_KEYBOARD_FLAG_*` from `include/migo/session.h`.
+pub const MIGO_KEYBOARD_FLAG_NONE: u32 = 0;
+pub const MIGO_KEYBOARD_FLAG_MULTIPLE: u32 = 1 << 0;
+pub const MIGO_KEYBOARD_FLAG_CONFIRM_HOLD: u32 = 1 << 1;
+
+/// `MIGO_KEYBOARD_CONFIRM_*`, in wx's order.
+pub const MIGO_KEYBOARD_CONFIRM_DONE: u32 = 0;
+pub const MIGO_KEYBOARD_CONFIRM_NEXT: u32 = 1;
+pub const MIGO_KEYBOARD_CONFIRM_SEARCH: u32 = 2;
+pub const MIGO_KEYBOARD_CONFIRM_GO: u32 = 3;
+pub const MIGO_KEYBOARD_CONFIRM_SEND: u32 = 4;
+
+/// `MIGO_KEYBOARD_TYPE_*`.
+pub const MIGO_KEYBOARD_TYPE_TEXT: u32 = 0;
+pub const MIGO_KEYBOARD_TYPE_NUMBER: u32 = 1;
+
+/// Mirrors `MigoKeyboardShowOptions` in `include/migo/session.h`.
+///
+/// Borrowed for the duration of the callback, like `MigoError`. A host that
+/// needs the default value afterwards copies it.
+#[repr(C)]
+pub struct MigoKeyboardShowOptions {
+    pub header: VersionedHeader,
+    pub flags: u32,
+    pub max_length: u32,
+    pub confirm_type: u32,
+    pub keyboard_type: u32,
+    pub default_value_utf8: *const c_char,
+    pub default_value_length: u32,
+    pub reserved0: u32,
+}
+
+/// The engine-side owned form, which a queued task holds until it runs.
+///
+/// The C struct borrows a pointer; a task that outlives the call that created
+/// it cannot, so the two shapes are deliberately different.
+#[derive(Default, Clone)]
+pub struct ShowOptions {
+    pub flags: u32,
+    pub max_length: u32,
+    pub confirm_type: u32,
+    pub keyboard_type: u32,
+    pub default_value: String,
 }
 
 /// Mirrors `MigoHostCallbacks` in `include/migo/session.h`.
@@ -54,6 +103,9 @@ pub struct MigoHostCallbacks {
     pub on_exit_requested: Option<MigoOnExitRequestedFn>,
     pub on_surface_lost: Option<MigoOnSurfaceLostFn>,
     pub on_request_frame: Option<MigoOnRequestFrameFn>,
+    pub on_show_keyboard: Option<MigoOnShowKeyboardFn>,
+    pub on_hide_keyboard: Option<MigoOnHideKeyboardFn>,
+    pub on_update_keyboard: Option<MigoOnUpdateKeyboardFn>,
 }
 
 /// The copy the session keeps.
@@ -70,6 +122,9 @@ pub struct HostCallbacks {
     on_exit_requested: Option<MigoOnExitRequestedFn>,
     on_surface_lost: Option<MigoOnSurfaceLostFn>,
     on_request_frame: Option<MigoOnRequestFrameFn>,
+    on_show_keyboard: Option<MigoOnShowKeyboardFn>,
+    on_hide_keyboard: Option<MigoOnHideKeyboardFn>,
+    on_update_keyboard: Option<MigoOnUpdateKeyboardFn>,
 }
 
 // SAFETY: the pointers are opaque tokens owned by the host and are only ever
@@ -98,6 +153,15 @@ impl HostCallbacks {
                 Err(MIGO_ERROR_INVALID_ARGUMENT)
             };
         };
+        // A host that can show a keyboard but not hide it strands it on screen
+        // with no event that corrects the state, so partial support is refused
+        // at install time -- while the host can still fix it.
+        let keyboard_verbs = callbacks.on_show_keyboard.is_some() as u8
+            + callbacks.on_hide_keyboard.is_some() as u8
+            + callbacks.on_update_keyboard.is_some() as u8;
+        if keyboard_verbs != 0 && keyboard_verbs != 3 {
+            return Err(MIGO_ERROR_INVALID_ARGUMENT);
+        }
         Ok(Self {
             user_data: callbacks.user_data,
             dispatcher_data: callbacks.dispatcher_data,
@@ -107,7 +171,18 @@ impl HostCallbacks {
             on_exit_requested: callbacks.on_exit_requested,
             on_surface_lost: callbacks.on_surface_lost,
             on_request_frame: callbacks.on_request_frame,
+            on_show_keyboard: callbacks.on_show_keyboard,
+            on_hide_keyboard: callbacks.on_hide_keyboard,
+            on_update_keyboard: callbacks.on_update_keyboard,
         })
+    }
+
+    /// Whether the host offered to service the soft keyboard.
+    ///
+    /// All three verbs are present or none are, enforced above, so testing one
+    /// is testing the set.
+    pub fn supplies_keyboard(&self) -> bool {
+        self.on_show_keyboard.is_some()
     }
 }
 
@@ -118,6 +193,9 @@ enum Event {
     Error { code: MigoResult, message: CString },
     SurfaceLost { generation: u64, reason: u32 },
     RequestFrame,
+    ShowKeyboard { options: ShowOptions },
+    HideKeyboard,
+    UpdateKeyboard { value: String },
 }
 
 /// Payload owned by a dispatched task until it runs.
@@ -183,6 +261,44 @@ unsafe extern "C" fn run_task(context: *mut c_void) {
                 unsafe { on_request_frame(user_data, task.session) };
             }
         }
+        Event::ShowKeyboard { options } => {
+            if let Some(on_show_keyboard) = task.callbacks.on_show_keyboard {
+                let default_value = options.default_value.as_bytes();
+                let c_options = MigoKeyboardShowOptions {
+                    header: VersionedHeader {
+                        struct_size: size_of::<MigoKeyboardShowOptions>() as u32,
+                        abi_version: crate::abi::MIGO_ABI_VERSION_CURRENT,
+                    },
+                    flags: options.flags,
+                    max_length: options.max_length,
+                    confirm_type: options.confirm_type,
+                    keyboard_type: options.keyboard_type,
+                    default_value_utf8: default_value.as_ptr() as *const c_char,
+                    default_value_length: default_value.len() as u32,
+                    reserved0: 0,
+                };
+                // `options` outlives the call because `task` is dropped after.
+                unsafe { on_show_keyboard(user_data, task.session, &c_options) };
+            }
+        }
+        Event::HideKeyboard => {
+            if let Some(on_hide_keyboard) = task.callbacks.on_hide_keyboard {
+                unsafe { on_hide_keyboard(user_data, task.session) };
+            }
+        }
+        Event::UpdateKeyboard { value } => {
+            if let Some(on_update_keyboard) = task.callbacks.on_update_keyboard {
+                let bytes = value.as_bytes();
+                unsafe {
+                    on_update_keyboard(
+                        user_data,
+                        task.session,
+                        bytes.as_ptr() as *const c_char,
+                        bytes.len() as u32,
+                    )
+                };
+            }
+        }
     }
 }
 
@@ -212,9 +328,15 @@ impl Notifier {
     /// If the dispatcher refuses the task, ownership stays here and the payload
     /// is dropped — the header's rule that a rejected dispatch leaves the task
     /// with Migo.
-    fn post(&self, event: Event) {
+    ///
+    /// Returns whether the dispatcher accepted the task, which is as much as
+    /// this side can know: acceptance is not evidence the host has acted.
+    /// Notifications discard it, but the keyboard verbs answer content with it,
+    /// because content that believes its keyboard is opening waits for input
+    /// that will never arrive.
+    fn post(&self, event: Event) -> bool {
         if !self.alive.load(Ordering::Acquire) {
-            return;
+            return false;
         }
         let task = Box::new(Task {
             callbacks: self.callbacks,
@@ -231,15 +353,17 @@ impl Notifier {
             // leaks nor runs.
             drop(unsafe { Box::from_raw(context as *mut Task) });
             tracing::warn!("host dispatcher rejected a callback task: {result}");
+            return false;
         }
+        true
     }
 
     pub fn ready(&self) {
-        self.post(Event::Ready);
+        let _ = self.post(Event::Ready);
     }
 
     pub fn exit_requested(&self) {
-        self.post(Event::ExitRequested);
+        let _ = self.post(Event::ExitRequested);
     }
 
     pub fn error(&self, code: MigoResult, message: impl Into<Vec<u8>>) {
@@ -248,7 +372,7 @@ impl Notifier {
         let message = CString::new(message).unwrap_or_else(|_| {
             CString::new("engine error (message contained an interior NUL)").expect("static")
         });
-        self.post(Event::Error { code, message });
+        let _ = self.post(Event::Error { code, message });
     }
 
     #[allow(dead_code)]
@@ -256,8 +380,32 @@ impl Notifier {
     /// frame callback: that host is engine-paced and never asked to be told.
     pub fn request_frame(&self) {
         if self.callbacks.on_request_frame.is_some() {
-            self.post(Event::RequestFrame);
+            let _ = self.post(Event::RequestFrame);
         }
+    }
+
+    /// Ask the host to show, hide or update its keyboard.
+    ///
+    /// The returned flag means the dispatcher accepted the task, not that the
+    /// host has done anything: the ABI is asynchronous and cannot promise more.
+    /// A refusal has to reach content as a failure.
+    pub fn show_keyboard(&self, options: ShowOptions) -> bool {
+        self.post(Event::ShowKeyboard { options })
+    }
+
+    pub fn hide_keyboard(&self) -> bool {
+        self.post(Event::HideKeyboard)
+    }
+
+    pub fn update_keyboard(&self, value: String) -> bool {
+        self.post(Event::UpdateKeyboard { value })
+    }
+
+    /// Whether the host offered to service the soft keyboard, which is what
+    /// decides whether the capability is offered to content at all — the same
+    /// rule `drives_frames` follows for the frame clock.
+    pub fn supplies_keyboard(&self) -> bool {
+        self.callbacks.supplies_keyboard()
     }
 
     /// Whether the host offered to drive frames, which is the honest answer to
@@ -267,7 +415,7 @@ impl Notifier {
     }
 
     pub fn surface_lost(&self, generation: u64, reason: u32) {
-        self.post(Event::SurfaceLost { generation, reason });
+        let _ = self.post(Event::SurfaceLost { generation, reason });
     }
 }
 
@@ -327,7 +475,177 @@ mod tests {
             on_exit_requested: None,
             on_surface_lost: None,
             on_request_frame: None,
+            on_show_keyboard: None,
+            on_hide_keyboard: None,
+            on_update_keyboard: None,
         }
+    }
+
+    static SHOWN_MAX_LENGTH: AtomicUsize = AtomicUsize::new(0);
+    static SHOWN_DEFAULT_VALUE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+    unsafe extern "C" fn noop_show_keyboard(
+        _user: *mut c_void,
+        _session: *mut c_void,
+        _options: *const MigoKeyboardShowOptions,
+    ) {
+    }
+    unsafe extern "C" fn noop_hide_keyboard(_user: *mut c_void, _session: *mut c_void) {}
+    unsafe extern "C" fn noop_update_keyboard(
+        _user: *mut c_void,
+        _session: *mut c_void,
+        _value_utf8: *const c_char,
+        _value_length: u32,
+    ) {
+    }
+
+    unsafe extern "C" fn recording_show_keyboard(
+        _user: *mut c_void,
+        _session: *mut c_void,
+        options: *const MigoKeyboardShowOptions,
+    ) {
+        let options = unsafe { &*options };
+        SHOWN_MAX_LENGTH.store(options.max_length as usize, Ordering::SeqCst);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                options.default_value_utf8 as *const u8,
+                options.default_value_length as usize,
+            )
+        };
+        *SHOWN_DEFAULT_VALUE.lock().unwrap_or_else(|e| e.into_inner()) =
+            std::str::from_utf8(bytes).expect("utf-8").to_string();
+    }
+
+    /// A raw callback set with a working dispatcher and no keyboard, which the
+    /// install tests then vary one field at a time.
+    fn raw_callbacks() -> MigoHostCallbacks {
+        MigoHostCallbacks {
+            header: VersionedHeader {
+                struct_size: size_of::<MigoHostCallbacks>() as u32,
+                abi_version: crate::abi::MIGO_ABI_VERSION_CURRENT,
+            },
+            user_data: std::ptr::null_mut(),
+            dispatcher_data: std::ptr::null_mut(),
+            dispatch: Some(inline_dispatch),
+            on_ready: None,
+            on_error: None,
+            on_exit_requested: None,
+            on_surface_lost: None,
+            on_request_frame: None,
+            on_show_keyboard: None,
+            on_hide_keyboard: None,
+            on_update_keyboard: None,
+        }
+    }
+
+    fn keyboard_notifier(
+        dispatch: MigoDispatchFn,
+        on_show_keyboard: Option<MigoOnShowKeyboardFn>,
+    ) -> Notifier {
+        let callbacks = HostCallbacks {
+            user_data: std::ptr::null_mut(),
+            dispatcher_data: std::ptr::null_mut(),
+            dispatch,
+            on_ready: None,
+            on_error: None,
+            on_exit_requested: None,
+            on_surface_lost: None,
+            on_request_frame: None,
+            on_show_keyboard,
+            on_hide_keyboard: Some(noop_hide_keyboard),
+            on_update_keyboard: Some(noop_update_keyboard),
+        };
+        Notifier::new(
+            callbacks,
+            NonNull::new(0x1000usize as *mut c_void).expect("non-null session token"),
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    /// A host that can open a keyboard but not close it strands it on screen
+    /// with no event that corrects the state. Partial support is refused at
+    /// install time, where the host can still fix it.
+    #[test]
+    fn keyboard_callbacks_install_all_or_none() {
+        // None of the three: accepted, and the capability is not offered.
+        let copied = unsafe { HostCallbacks::from_c(&raw_callbacks()) }.expect("none is valid");
+        assert!(!copied.supplies_keyboard());
+
+        // Each one alone, then two of three: all partial, all refused.
+        let mut show_only = raw_callbacks();
+        show_only.on_show_keyboard = Some(noop_show_keyboard);
+        let mut hide_only = raw_callbacks();
+        hide_only.on_hide_keyboard = Some(noop_hide_keyboard);
+        let mut update_only = raw_callbacks();
+        update_only.on_update_keyboard = Some(noop_update_keyboard);
+        let mut two = raw_callbacks();
+        two.on_show_keyboard = Some(noop_show_keyboard);
+        two.on_hide_keyboard = Some(noop_hide_keyboard);
+
+        for (name, partial) in [
+            ("show only", &show_only),
+            ("hide only", &hide_only),
+            ("update only", &update_only),
+            ("two of three", &two),
+        ] {
+            assert_eq!(
+                unsafe { HostCallbacks::from_c(partial) }.err(),
+                Some(MIGO_ERROR_INVALID_ARGUMENT),
+                "{name} must be refused"
+            );
+        }
+
+        // All three: accepted, and the capability is offered.
+        let mut all = raw_callbacks();
+        all.on_show_keyboard = Some(noop_show_keyboard);
+        all.on_hide_keyboard = Some(noop_hide_keyboard);
+        all.on_update_keyboard = Some(noop_update_keyboard);
+        let copied = unsafe { HostCallbacks::from_c(&all) }.expect("all three is valid");
+        assert!(copied.supplies_keyboard());
+    }
+
+    /// The verbs must report whether the dispatcher took the task. Reporting
+    /// success for a refused dispatch would tell content its keyboard is
+    /// opening when nothing will ever open it.
+    #[test]
+    fn a_refused_dispatch_is_reported_to_the_caller() {
+        let accepting = keyboard_notifier(inline_dispatch, Some(noop_show_keyboard));
+        assert!(accepting.show_keyboard(ShowOptions::default()));
+        assert!(accepting.hide_keyboard());
+        assert!(accepting.update_keyboard("x".to_string()));
+
+        let refusing = keyboard_notifier(rejecting_dispatch, Some(noop_show_keyboard));
+        assert!(!refusing.show_keyboard(ShowOptions::default()));
+        assert!(!refusing.hide_keyboard());
+        assert!(!refusing.update_keyboard("x".to_string()));
+    }
+
+    /// The options and their string are borrowed for the callback only, so the
+    /// payload must still own them while the host reads them. A payload dropped
+    /// before the call would hand the host a pointer into freed memory.
+    #[test]
+    fn show_options_reach_the_host_intact() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SHOWN_MAX_LENGTH.store(0, Ordering::SeqCst);
+        SHOWN_DEFAULT_VALUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+
+        let notifier = keyboard_notifier(inline_dispatch, Some(recording_show_keyboard));
+        assert!(notifier.show_keyboard(ShowOptions {
+            flags: MIGO_KEYBOARD_FLAG_MULTIPLE,
+            max_length: 140,
+            confirm_type: MIGO_KEYBOARD_CONFIRM_SEND,
+            keyboard_type: MIGO_KEYBOARD_TYPE_TEXT,
+            default_value: "seed".to_string(),
+        }));
+
+        assert_eq!(SHOWN_MAX_LENGTH.load(Ordering::SeqCst), 140);
+        assert_eq!(
+            *SHOWN_DEFAULT_VALUE.lock().unwrap_or_else(|e| e.into_inner()),
+            "seed"
+        );
     }
 
     fn notifier(dispatch: MigoDispatchFn, alive: Arc<AtomicBool>) -> Notifier {
@@ -399,20 +717,9 @@ mod tests {
 
     #[test]
     fn callbacks_without_a_dispatcher_are_refused() {
-        let raw = MigoHostCallbacks {
-            header: VersionedHeader {
-                struct_size: size_of::<MigoHostCallbacks>() as u32,
-                abi_version: crate::abi::MIGO_ABI_VERSION_CURRENT,
-            },
-            user_data: std::ptr::null_mut(),
-            dispatcher_data: std::ptr::null_mut(),
-            dispatch: None,
-            on_ready: Some(on_ready),
-            on_error: None,
-            on_exit_requested: None,
-            on_surface_lost: None,
-            on_request_frame: None,
-        };
+        let mut raw = raw_callbacks();
+        raw.dispatch = None;
+        raw.on_ready = Some(on_ready);
         assert_eq!(
             unsafe { HostCallbacks::from_c(&raw) }.err(),
             Some(MIGO_ERROR_INVALID_ARGUMENT)

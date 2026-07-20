@@ -108,6 +108,69 @@ typedef void(MIGO_CALL *MigoOnSurfaceLostFn)(void *user_data,
                                              uint64_t generation,
                                              MigoSurfaceLossReason reason);
 
+typedef uint32_t MigoKeyboardFlags;
+#define MIGO_KEYBOARD_FLAG_NONE UINT32_C(0)
+/* The field accepts more than one line. */
+#define MIGO_KEYBOARD_FLAG_MULTIPLE (UINT32_C(1) << 0)
+/* Keep the keyboard up after confirm instead of dismissing it. */
+#define MIGO_KEYBOARD_FLAG_CONFIRM_HOLD (UINT32_C(1) << 1)
+
+typedef uint32_t MigoKeyboardConfirmType;
+#define MIGO_KEYBOARD_CONFIRM_DONE UINT32_C(0)
+#define MIGO_KEYBOARD_CONFIRM_NEXT UINT32_C(1)
+#define MIGO_KEYBOARD_CONFIRM_SEARCH UINT32_C(2)
+#define MIGO_KEYBOARD_CONFIRM_GO UINT32_C(3)
+#define MIGO_KEYBOARD_CONFIRM_SEND UINT32_C(4)
+
+typedef uint32_t MigoKeyboardType;
+#define MIGO_KEYBOARD_TYPE_TEXT UINT32_C(0)
+#define MIGO_KEYBOARD_TYPE_NUMBER UINT32_C(1)
+
+/*
+ * What content asked for when it opened the keyboard.
+ *
+ * The struct and default_value_utf8 are borrowed for the duration of the
+ * callback only; a host that needs them afterwards copies them.
+ * default_value_utf8 is length-delimited and need not be NUL-terminated.
+ */
+typedef struct MigoKeyboardShowOptions {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    MigoKeyboardFlags flags;
+    uint32_t max_length;
+    MigoKeyboardConfirmType confirm_type;
+    MigoKeyboardType keyboard_type;
+    const char *default_value_utf8;
+    uint32_t default_value_length;
+    uint32_t reserved0;
+} MigoKeyboardShowOptions;
+
+MIGO_STATIC_ASSERT(offsetof(MigoKeyboardShowOptions, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+#if MIGO_LP64
+MIGO_STATIC_ASSERT(sizeof(MigoKeyboardShowOptions) == 40,
+                   "MigoKeyboardShowOptions LP64 size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoKeyboardShowOptions, default_value_utf8) == 24,
+                   "MigoKeyboardShowOptions.default_value_utf8 moved");
+#endif
+
+/*
+ * The soft keyboard is a capability the host supplies, not one Migo has.
+ *
+ * Install all three or none: a host that can show a keyboard but not hide it
+ * strands it on screen with no event that corrects the state, so installing a
+ * subset returns MIGO_ERROR_INVALID_ARGUMENT. A host that installs none simply
+ * has no keyboard capability, and content's wx.showKeyboard reports failure.
+ *
+ * value_utf8 in the update callback is the whole current text -- content
+ * correcting the value -- length-delimited and borrowed for the call.
+ */
+typedef void(MIGO_CALL *MigoOnShowKeyboardFn)(void *user_data, MigoSession *session,
+                                              const MigoKeyboardShowOptions *options);
+typedef void(MIGO_CALL *MigoOnHideKeyboardFn)(void *user_data, MigoSession *session);
+typedef void(MIGO_CALL *MigoOnUpdateKeyboardFn)(void *user_data, MigoSession *session,
+                                                const char *value_utf8, uint32_t value_length);
+
 /*
  * The implementation copies known fields covered by struct_size. A non-null
  * callback requires a non-null dispatcher. User callbacks run without Migo
@@ -130,15 +193,22 @@ typedef struct MigoHostCallbacks {
     /* Appended: a smaller struct_size from an older host simply omits it, and
      * that host is then engine-paced, which is the pre-existing behaviour. */
     MigoOnRequestFrameFn on_request_frame;
+    /* Appended: the soft keyboard, all three or none. A host that installs none
+     * has no keyboard capability, which is the pre-existing behaviour. */
+    MigoOnShowKeyboardFn on_show_keyboard;
+    MigoOnHideKeyboardFn on_hide_keyboard;
+    MigoOnUpdateKeyboardFn on_update_keyboard;
 } MigoHostCallbacks;
 
 MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, struct_size) == 0,
                    "every versioned struct must begin with struct_size");
 #if MIGO_LP64
-MIGO_STATIC_ASSERT(sizeof(MigoHostCallbacks) == 72, "MigoHostCallbacks LP64 size changed");
+MIGO_STATIC_ASSERT(sizeof(MigoHostCallbacks) == 96, "MigoHostCallbacks LP64 size changed");
 MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, dispatch) == 24, "MigoHostCallbacks.dispatch moved");
 MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, on_request_frame) == 64,
                    "MigoHostCallbacks.on_request_frame moved");
+MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, on_update_keyboard) == 88,
+                   "MigoHostCallbacks.on_update_keyboard moved");
 #endif
 
 MIGO_API MigoResult MIGO_CALL

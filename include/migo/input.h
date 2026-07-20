@@ -99,6 +99,63 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_touch(
     MigoSession *session,
     const MigoTouchEvent *event);
 
+/*
+ * Soft keyboard, wx model.
+ *
+ * The value a text event carries is the field's WHOLE CURRENT TEXT, not the
+ * keystroke that changed it. A host that sends only the newly typed character
+ * leaves content whose text never grows past one character. In the other
+ * direction, MigoOnUpdateKeyboardFn is content correcting that same value.
+ */
+typedef uint32_t MigoKeyboardEventType;
+#define MIGO_KEYBOARD_EVENT_INPUT UINT32_C(0)
+#define MIGO_KEYBOARD_EVENT_CONFIRM UINT32_C(1)
+#define MIGO_KEYBOARD_EVENT_COMPLETE UINT32_C(2)
+#define MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE UINT32_C(3)
+
+/*
+ * value_utf8 is length-delimited and need not be NUL-terminated; only
+ * value_length bytes are read, and it is borrowed for the duration of the call.
+ * A zero length with a non-null pointer is valid: it is the field being
+ * cleared.
+ *
+ * height_css_px applies to MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE only and is CSS
+ * pixels -- logical, not physical, the same units as touch coordinates. Zero
+ * means the keyboard is gone. Sending physical pixels lays content out for a
+ * keyboard of the wrong size on every display whose scale factor is not 1.
+ */
+typedef struct MigoKeyboardEvent {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    MigoKeyboardEventType event_type;
+    uint32_t value_length;
+    const char *value_utf8;
+    double height_css_px;
+} MigoKeyboardEvent;
+
+MIGO_STATIC_ASSERT(offsetof(MigoKeyboardEvent, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+#if MIGO_LP64
+MIGO_STATIC_ASSERT(sizeof(MigoKeyboardEvent) == 32, "MigoKeyboardEvent LP64 size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoKeyboardEvent, value_utf8) == 16,
+                   "MigoKeyboardEvent.value_utf8 moved");
+MIGO_STATIC_ASSERT(offsetof(MigoKeyboardEvent, height_css_px) == 24,
+                   "MigoKeyboardEvent.height_css_px moved");
+#endif
+
+/*
+ * Deliver one soft-keyboard event. Callable from any thread; ordering between
+ * concurrent calls is the host's to guarantee.
+ *
+ * Returns MIGO_ERROR_INVALID_STATE when no surface is attached and
+ * MIGO_ERROR_WOULD_BLOCK when the queue is full. A full queue is reported
+ * rather than swallowed: a dropped COMPLETE leaves content believing the
+ * keyboard is still open, and no later event corrects it.
+ */
+MIGO_API MigoResult MIGO_CALL migo_session_send_keyboard_event(
+    MigoSession *session,
+    const MigoKeyboardEvent *event);
+
 MIGO_END_DECLS
 
 #endif /* MIGO_INPUT_H */
