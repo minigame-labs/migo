@@ -23,6 +23,7 @@ import * as storageApi from 'ext:host_v8_storage/01_storage.js';
 import * as tcpSocket from 'ext:host_v8_network/08_tcp_socket.js';
 import * as udpSocket from 'ext:host_v8_network/09_udp_socket.js';
 import * as mouseApi from 'ext:host_v8_touch/03_mouse.js';
+import * as gamepadApi from 'ext:host_v8_touch/04_gamepad.js';
 import * as timersInternal from 'ext:host_v8_web/02_timers.js';
 import * as imageApi from 'ext:host_v8_image/01_image.js';
 
@@ -169,6 +170,23 @@ const WindowGlobalScope = {
     _internalTriggerMouseMove: core.propNonEnumerable(mouseApi._internalTriggerMouseMove),
     _internalTriggerMouseUp: core.propNonEnumerable(mouseApi._internalTriggerMouseUp),
     _internalTriggerWheel: core.propNonEnumerable(mouseApi._internalTriggerWheel),
+
+    // Gamepad. wx has no gamepad API, so the shape is the Web one Migo
+    // replaces -- see input/04_gamepad.js. getGamepads is also installed on
+    // navigator by 99_main.js, which is where existing HTML5 content looks for
+    // it; these are the wx-namespace spelling of the same state.
+    getGamepads: core.propNonEnumerable(gamepadApi.getGamepads),
+    onGamepadConnected: core.propNonEnumerable(gamepadApi.onGamepadConnected),
+    offGamepadConnected: core.propNonEnumerable(gamepadApi.offGamepadConnected),
+    onGamepadDisconnected: core.propNonEnumerable(gamepadApi.onGamepadDisconnected),
+    offGamepadDisconnected: core.propNonEnumerable(gamepadApi.offGamepadDisconnected),
+    _internalTriggerGamepadConnected: core.propNonEnumerable(
+        gamepadApi._internalTriggerGamepadConnected,
+    ),
+    _internalTriggerGamepadDisconnected: core.propNonEnumerable(
+        gamepadApi._internalTriggerGamepadDisconnected,
+    ),
+    _internalTriggerGamepadState: core.propNonEnumerable(gamepadApi._internalTriggerGamepadState),
 };
 
 export { WindowGlobalScope };

@@ -115,10 +115,13 @@ The candidate cannot be declared stable until all of the following exist:
   translates its platform keycodes into DOM values, because a portable runtime that accepted
   platform codes would have to carry a mapping per platform. **Open**: IME composition, which
   is engine work before it is ABI work -- there is no way to represent a preedit string
-  because wx has none, so there is nothing for a contract to carry. Gamepad **open, and also
-  engine work first**: there is no `Gamepad` anywhere in `engine/crates` -- no JS API, no
-  `HostCommand`, no dispatch -- so unlike the keyboard, where the engine was complete and only
-  the C entry point was missing, there is nothing yet to write a contract against;
+  because wx has none, so there is nothing for a contract to carry. **gamepad done**: the engine had none at all -- no JS
+  API, no `HostCommand`, no dispatch -- so this added both halves. wx has no gamepad API, so
+  the shape is the W3C one Migo replaces: `navigator.getGamepads()` plus
+  `gamepadconnected`/`gamepaddisconnected`, driven by `migo_session_set_gamepad_connected`
+  and `migo_session_send_gamepad_state`. The Web API is polled rather than evented, so a
+  sample updates stored state instead of being dispatched, and `pressed` is carried rather
+  than derived from `value` because a device picks its own threshold;
 - asynchronous request IDs, cancellation races, and late-completion rules — **settled for
   v1**: v1 has exactly one asynchronous operation and it is single-shot per Session, so
   there is nothing to correlate and no request ID to carry. The rules are normative under

@@ -76,6 +76,9 @@ pub(crate) struct JsBindings {
     keyboard_complete_fn: Option<v8::Global<v8::Function>>,
     key_down_fn: Option<v8::Global<v8::Function>>,
     key_up_fn: Option<v8::Global<v8::Function>>,
+    gamepad_connected_fn: Option<v8::Global<v8::Function>>,
+    gamepad_disconnected_fn: Option<v8::Global<v8::Function>>,
+    gamepad_state_fn: Option<v8::Global<v8::Function>>,
 
     // ---- Video ----
     video_event_fn: Option<v8::Global<v8::Function>>,
@@ -122,6 +125,9 @@ impl JsBindings {
             keyboard_complete_fn: None,
             key_down_fn: None,
             key_up_fn: None,
+            gamepad_connected_fn: None,
+            gamepad_disconnected_fn: None,
+            gamepad_state_fn: None,
             video_event_fn: None,
         };
 
@@ -257,10 +263,20 @@ impl JsBindings {
         self.video_event_fn = video_event;
 
         // Resolved separately to avoid growing the tuple above; init-time only.
-        self.webgl_context_event_fn = self.with_main_context(rt, |scope, _ctx, global| {
-            let bridge = resolve_host_bridge(scope, global);
-            get_global_fn(scope, bridge, "_internalTriggerWebglContextEvent")
-        });
+        let (webgl_context_event, gamepad_connected, gamepad_disconnected, gamepad_state) = self
+            .with_main_context(rt, |scope, _ctx, global| {
+                let bridge = resolve_host_bridge(scope, global);
+                (
+                    get_global_fn(scope, bridge, "_internalTriggerWebglContextEvent"),
+                    get_global_fn(scope, bridge, "_internalTriggerGamepadConnected"),
+                    get_global_fn(scope, bridge, "_internalTriggerGamepadDisconnected"),
+                    get_global_fn(scope, bridge, "_internalTriggerGamepadState"),
+                )
+            });
+        self.webgl_context_event_fn = webgl_context_event;
+        self.gamepad_connected_fn = gamepad_connected;
+        self.gamepad_disconnected_fn = gamepad_disconnected;
+        self.gamepad_state_fn = gamepad_state;
 
         if self.enqueue_touch_event_fn.is_none() {
             warn!("[Host {}] _internalEnqueueRawTouchEvent not found", host_id);
@@ -821,6 +837,96 @@ impl JsBindings {
                         .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
                         .into(),
                     v8::Number::new(scope, timestamp_ms).into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Announce a gamepad. The id and mapping are the Web API's own fields.
+    pub(crate) fn dispatch_gamepad_connected(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        index: u32,
+        id: &str,
+        mapping: &str,
+        axis_count: u8,
+        button_count: u8,
+    ) {
+        if let Some(func_g) = self.gamepad_connected_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [
+                    v8::Integer::new_from_unsigned(scope, index).into(),
+                    v8::String::new(scope, id)
+                        .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
+                        .into(),
+                    v8::String::new(scope, mapping)
+                        .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
+                        .into(),
+                    v8::Integer::new_from_unsigned(scope, axis_count as u32).into(),
+                    v8::Integer::new_from_unsigned(scope, button_count as u32).into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    pub(crate) fn dispatch_gamepad_disconnected(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        index: u32,
+    ) {
+        if let Some(func_g) = self.gamepad_disconnected_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [v8::Integer::new_from_unsigned(scope, index).into()];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Push one sample of a gamepad's axes and buttons.
+    ///
+    /// Packed into a single flat array rather than nested objects: this runs
+    /// once per pad per frame while a pad is connected, and building a JS object
+    /// per button would allocate a dozen short-lived objects every frame for a
+    /// payload the JS side immediately copies into the state it already holds.
+    ///
+    /// Layout: `[axis_count, button_count, ...axes, ...(pressed, touched, value)]`.
+    pub(crate) fn dispatch_gamepad_state(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        state: &shared::protocol::host_cmd::GamepadState,
+    ) {
+        if let Some(func_g) = self.gamepad_state_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let axis_count = state.axis_count as usize;
+                let button_count = state.button_count as usize;
+                let packed = v8::Array::new(scope, (2 + axis_count + button_count * 3) as i32);
+
+                let mut at = 0u32;
+                let mut push = |scope: &v8::PinScope, value: f64| {
+                    let number = v8::Number::new(scope, value);
+                    packed.set_index(scope, at, number.into());
+                    at += 1;
+                };
+                push(scope, axis_count as f64);
+                push(scope, button_count as f64);
+                for axis in &state.axes[..axis_count] {
+                    push(scope, *axis as f64);
+                }
+                for button in &state.buttons[..button_count] {
+                    push(scope, if button.pressed { 1.0 } else { 0.0 });
+                    push(scope, if button.touched { 1.0 } else { 0.0 });
+                    push(scope, button.value as f64);
+                }
+
+                let args = [
+                    v8::Integer::new_from_unsigned(scope, state.index).into(),
+                    v8::Number::new(scope, state.timestamp_ms).into(),
+                    packed.into(),
                 ];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);

@@ -668,6 +668,27 @@ impl HostJsRuntime {
     }
 
     #[inline]
+    pub fn dispatch_gamepad_connected(
+        &mut self,
+        index: u32,
+        id: &str,
+        mapping: &str,
+        axis_count: u8,
+        button_count: u8,
+    ) {
+        self.with_v8(|rt, bindings| {
+            bindings.dispatch_gamepad_connected(rt, index, id, mapping, axis_count, button_count)
+        });
+    }
+
+    pub fn dispatch_gamepad_disconnected(&mut self, index: u32) {
+        self.with_v8(|rt, bindings| bindings.dispatch_gamepad_disconnected(rt, index));
+    }
+
+    pub fn dispatch_gamepad_state(&mut self, state: &shared::protocol::host_cmd::GamepadState) {
+        self.with_v8(|rt, bindings| bindings.dispatch_gamepad_state(rt, state));
+    }
+
     pub fn dispatch_key_down(&mut self, key: &str, code: &str, timestamp_ms: f64) {
         self.with_v8(|rt, bindings| bindings.dispatch_key_down(rt, key, code, timestamp_ms));
     }

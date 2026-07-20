@@ -26,6 +26,7 @@ use crate::{
     capabilities::MigoCapabilities,
     callbacks::{MigoError, MigoHostCallbacks, MigoKeyboardShowOptions},
     input::{MigoTouchEvent, MigoTouchPoint},
+    gamepad::{MigoGamepadButton, MigoGamepadInfo, MigoGamepadStateEvent},
     keyboard::{MigoKeyEvent, MigoKeyboardEvent},
     surface::{
         MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
@@ -64,6 +65,8 @@ header_is_first!(
     MigoKeyboardEvent,
     MigoKeyboardShowOptions,
     MigoKeyEvent,
+    MigoGamepadInfo,
+    MigoGamepadStateEvent,
 );
 
 // The header itself. Two `u32`s, in this order, on every target: it is the one
@@ -83,6 +86,12 @@ const _: () = assert!(offset_of!(MigoTouchPoint, x) == 4);
 const _: () = assert!(offset_of!(MigoTouchPoint, y) == 8);
 const _: () = assert!(offset_of!(MigoTouchPoint, pressure) == 12);
 const _: () = assert!(offset_of!(MigoTouchPoint, flags) == 16);
+
+// `MigoGamepadButton` likewise has no header: it is an array element whose count
+// comes from the sample that points at it. Pointer-free, so pinned everywhere.
+const _: () = assert!(size_of::<MigoGamepadButton>() == 8);
+const _: () = assert!(offset_of!(MigoGamepadButton, flags) == 0);
+const _: () = assert!(offset_of!(MigoGamepadButton, value) == 4);
 
 // The negotiation entry point's own shape. It carries no pointer, so it is
 // identical on every target -- which matters more here than anywhere else: a
@@ -211,4 +220,17 @@ mod lp64 {
     const _: () = assert!(offset_of!(MigoKeyEvent, code_length) == 32);
     const _: () = assert!(offset_of!(MigoKeyEvent, reserved0) == 36);
     const _: () = assert!(offset_of!(MigoKeyEvent, timestamp_ms) == 40);
+
+    const _: () = assert!(size_of::<MigoGamepadInfo>() == 40);
+    const _: () = assert!(offset_of!(MigoGamepadInfo, index) == 8);
+    const _: () = assert!(offset_of!(MigoGamepadInfo, axis_count) == 12);
+    const _: () = assert!(offset_of!(MigoGamepadInfo, button_count) == 16);
+    const _: () = assert!(offset_of!(MigoGamepadInfo, id_utf8) == 24);
+    const _: () = assert!(offset_of!(MigoGamepadInfo, mapping_utf8) == 32);
+
+    const _: () = assert!(size_of::<MigoGamepadStateEvent>() == 48);
+    const _: () = assert!(offset_of!(MigoGamepadStateEvent, index) == 8);
+    const _: () = assert!(offset_of!(MigoGamepadStateEvent, axes) == 24);
+    const _: () = assert!(offset_of!(MigoGamepadStateEvent, buttons) == 32);
+    const _: () = assert!(offset_of!(MigoGamepadStateEvent, timestamp_ms) == 40);
 }

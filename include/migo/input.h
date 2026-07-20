@@ -224,6 +224,125 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_key_event(
     MigoSession *session,
     const MigoKeyEvent *event);
 
+/*
+ * Gamepads.
+ *
+ * wx has no gamepad API, so the shape here is the Web one Migo replaces:
+ * content calls navigator.getGamepads() and listens for gamepadconnected.
+ * Inventing a Migo-shaped API instead would make existing HTML5 games not work
+ * for no reason.
+ *
+ * The Web API is POLLED, not evented: content reads whatever is current each
+ * frame. So a host announces a pad once, then pushes samples as often as it
+ * samples, and a dropped sample is harmless because the next one replaces it
+ * wholesale.
+ */
+
+/* Bounded by the engine's fixed inline arrays; larger counts are rejected
+ * rather than truncated, because a dropped button is one content is watching. */
+#define MIGO_GAMEPAD_MAX_AXES 8
+#define MIGO_GAMEPAD_MAX_BUTTONS 20
+
+typedef uint32_t MigoGamepadButtonFlags;
+#define MIGO_GAMEPAD_BUTTON_FLAG_NONE UINT32_C(0)
+#define MIGO_GAMEPAD_BUTTON_FLAG_PRESSED (UINT32_C(1) << 0)
+#define MIGO_GAMEPAD_BUTTON_FLAG_TOUCHED (UINT32_C(1) << 1)
+
+/*
+ * One button. value is the analogue position -- 0.0 to 1.0 for a trigger, and
+ * 0.0 or 1.0 for a digital button.
+ *
+ * PRESSED is carried rather than derived from value, and the two are genuinely
+ * independent: a device picks its own press threshold, and a trigger resting at
+ * 0.25 may or may not count as pressed depending on the pad. Deriving it here
+ * would overrule the device.
+ *
+ * No struct_size: this is an array element, like MigoTouchPoint.
+ */
+typedef struct MigoGamepadButton {
+    MigoGamepadButtonFlags flags;
+    float value;
+} MigoGamepadButton;
+
+MIGO_STATIC_ASSERT(sizeof(MigoGamepadButton) == 8,
+                   "MigoGamepadButton is 8 bytes on every target");
+MIGO_STATIC_ASSERT(offsetof(MigoGamepadButton, value) == 4, "MigoGamepadButton.value moved");
+
+/*
+ * A gamepad's identity, supplied when it appears and again when it goes away.
+ *
+ * axis_count and button_count are given on connect rather than inferred from
+ * the first sample, because getGamepads() must return correctly sized arrays
+ * from the moment the gamepadconnected listener runs -- content commonly reads
+ * buttons.length there to decide which layout it is looking at.
+ *
+ * id is the device's own name, which content shows to a player. mapping is
+ * "standard" when the host has mapped the pad onto the standard layout and ""
+ * when it has not; content reads it to decide whether the button order can be
+ * trusted. Both are NUL-terminated and borrowed for the call.
+ */
+typedef struct MigoGamepadInfo {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint32_t index; /* the slot the pad holds for as long as it stays connected */
+    uint32_t axis_count;
+    uint32_t button_count;
+    uint32_t reserved0;
+    const char *id_utf8;
+    const char *mapping_utf8;
+} MigoGamepadInfo;
+
+MIGO_STATIC_ASSERT(offsetof(MigoGamepadInfo, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+#if MIGO_LP64
+MIGO_STATIC_ASSERT(sizeof(MigoGamepadInfo) == 40, "MigoGamepadInfo LP64 size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoGamepadInfo, id_utf8) == 24, "MigoGamepadInfo.id_utf8 moved");
+#endif
+
+/*
+ * One sample. axes and buttons are borrowed for the duration of the call and
+ * must each hold at least their announced count.
+ */
+typedef struct MigoGamepadStateEvent {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint32_t index;
+    uint32_t axis_count;
+    uint32_t button_count;
+    uint32_t reserved0;
+    const float *axes; /* each -1.0..1.0, in the standard mapping order */
+    const MigoGamepadButton *buttons;
+    double timestamp_ms;
+} MigoGamepadStateEvent;
+
+MIGO_STATIC_ASSERT(offsetof(MigoGamepadStateEvent, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+#if MIGO_LP64
+MIGO_STATIC_ASSERT(sizeof(MigoGamepadStateEvent) == 48,
+                   "MigoGamepadStateEvent LP64 size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoGamepadStateEvent, axes) == 24,
+                   "MigoGamepadStateEvent.axes moved");
+MIGO_STATIC_ASSERT(offsetof(MigoGamepadStateEvent, buttons) == 32,
+                   "MigoGamepadStateEvent.buttons moved");
+#endif
+
+/*
+ * Announce a gamepad, or withdraw it by passing 0 for connected. Withdrawing
+ * reads only info->index, so a host may pass the same struct it connected with.
+ *
+ * An emptied slot stays empty rather than shifting the pads after it: content
+ * holds on to an index.
+ */
+MIGO_API MigoResult MIGO_CALL migo_session_set_gamepad_connected(
+    MigoSession *session,
+    const MigoGamepadInfo *info,
+    uint32_t connected);
+
+/* Push one sample for a connected pad. */
+MIGO_API MigoResult MIGO_CALL migo_session_send_gamepad_state(
+    MigoSession *session,
+    const MigoGamepadStateEvent *event);
+
 MIGO_END_DECLS
 
 #endif /* MIGO_INPUT_H */

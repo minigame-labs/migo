@@ -864,6 +864,33 @@ impl Host {
                 Ok(())
             }
 
+            HostCommand::OnGamepadConnected {
+                index,
+                id,
+                mapping,
+                axis_count,
+                button_count,
+            } => {
+                self.js.dispatch_gamepad_connected(
+                    index,
+                    &id,
+                    &mapping,
+                    axis_count,
+                    button_count,
+                );
+                Ok(())
+            }
+
+            HostCommand::OnGamepadDisconnected { index } => {
+                self.js.dispatch_gamepad_disconnected(index);
+                Ok(())
+            }
+
+            HostCommand::OnGamepadState(state) => {
+                self.js.dispatch_gamepad_state(&state);
+                Ok(())
+            }
+
             HostCommand::OnKeyDown {
                 key,
                 code,

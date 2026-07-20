@@ -114,6 +114,62 @@ static void MIGO_CALL on_update_keyboard(void *user_data, MigoSession *session,
     fflush(stdout);
 }
 
+/*
+ * ---- A scripted gamepad. ----
+ *
+ * X11 has no gamepad this example can read without pulling in evdev or SDL, and
+ * the point here is the ABI, not device enumeration. So the host plays a fixed
+ * script: announce a standard pad, sweep an axis and press a button for a while,
+ * then withdraw it. A scripted host makes the expected pixels exact.
+ */
+#define PROBE_AXES 4
+#define PROBE_BUTTONS 17
+
+static void gamepad_info(MigoGamepadInfo *info) {
+    memset(info, 0, sizeof *info);
+    info->struct_size = (uint32_t)sizeof *info;
+    info->abi_version = MIGO_ABI_VERSION_CURRENT;
+    info->index = 0;
+    info->axis_count = PROBE_AXES;
+    info->button_count = PROBE_BUTTONS;
+    info->id_utf8 = "Migo Scripted Pad (Vendor: 0000 Product: 0000)";
+    info->mapping_utf8 = "standard";
+}
+
+static void send_gamepad_sample(MigoSession *session, double phase, int elapsed_ms) {
+    float axes[PROBE_AXES];
+    axes[0] = (float)phase;       /* swept, so a stuck axis is visible */
+    axes[1] = (float)-phase;
+    axes[2] = 0.0f;
+    axes[3] = 0.0f;
+
+    MigoGamepadButton buttons[PROBE_BUTTONS];
+    memset(buttons, 0, sizeof buttons);
+    /* Button 0 held: a digital press with value 1.0. */
+    buttons[0].flags = MIGO_GAMEPAD_BUTTON_FLAG_PRESSED | MIGO_GAMEPAD_BUTTON_FLAG_TOUCHED;
+    buttons[0].value = 1.0f;
+    /* Button 6 is a trigger at quarter travel and NOT pressed -- the case that
+     * proves pressed is carried rather than derived from value. */
+    buttons[6].flags = MIGO_GAMEPAD_BUTTON_FLAG_TOUCHED;
+    buttons[6].value = 0.25f;
+
+    MigoGamepadStateEvent event;
+    memset(&event, 0, sizeof event);
+    event.struct_size = (uint32_t)sizeof event;
+    event.abi_version = MIGO_ABI_VERSION_CURRENT;
+    event.index = 0;
+    event.axis_count = PROBE_AXES;
+    event.button_count = PROBE_BUTTONS;
+    event.axes = axes;
+    event.buttons = buttons;
+    event.timestamp_ms = (double)elapsed_ms;
+
+    MigoResult result = migo_session_send_gamepad_state(session, &event);
+    if (result != MIGO_OK) {
+        fprintf(stderr, "[c-host] gamepad sample not delivered: %d\n", (int)result);
+    }
+}
+
 static int fail(const char *what, MigoResult result) {
     fprintf(stderr, "[c-host] %s failed: %d\n", what, (int)result);
     return 1;
@@ -398,6 +454,23 @@ int main(int argc, char **argv) {
          * agreed to own. */
         if (atomic_exchange(&g_keyboard_requested, 0)) {
             feed_scripted_keyboard(session);
+        }
+
+        /* The scripted pad: connect at 1s, sample until 6s, withdraw. */
+        if (elapsed == 1008) {
+            MigoGamepadInfo info;
+            gamepad_info(&info);
+            MigoResult r = migo_session_set_gamepad_connected(session, &info, 1);
+            printf("[c-host] gamepad connect: %d\n", (int)r);
+            fflush(stdout);
+        } else if (elapsed > 1008 && elapsed < 6000) {
+            send_gamepad_sample(session, (double)((elapsed / 16) % 100) / 100.0, elapsed);
+        } else if (elapsed == 6000) {
+            MigoGamepadInfo info;
+            gamepad_info(&info);
+            MigoResult r = migo_session_set_gamepad_connected(session, &info, 0);
+            printf("[c-host] gamepad disconnect: %d\n", (int)r);
+            fflush(stdout);
         }
         sleep_ms(16);
     }

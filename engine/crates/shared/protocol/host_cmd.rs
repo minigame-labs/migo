@@ -33,6 +33,7 @@
 //! - **Recorder** (2): `RecorderEvent`, `RecorderFrameData`
 //! - **Camera** (2): `CameraEvent`, `CameraFrameData`
 //! - **Keyboard** (6): `OnKeyboardInput` .. `OnKeyUp`
+//! - **Gamepad** (3): `OnGamepadConnected` .. `OnGamepadState`
 //! - **Bluetooth / BLE** (7): `OnBluetoothAdapterStateChange` .. `OnBeaconServiceChange`
 //! - **Video** (1): `OnVideoStateChange`
 //! - **System** (2): `OnMemoryWarning`, `OnUserCaptureScreen`
@@ -57,6 +58,48 @@ pub struct TouchData {
     pub points: [TouchPoint; 10],
     /// Event timestamp in milliseconds (from system boot or epoch).
     pub timestamp_ms: i64,
+}
+
+/// The largest gamepad this runtime carries state for.
+///
+/// The W3C standard mapping has 4 axes and 17 buttons; the headroom covers
+/// devices that report a few more without making the payload variable-length.
+/// A pad reporting past these is truncated rather than rejected, because a
+/// partly usable gamepad beats none -- unlike a touch batch, where an extra
+/// pointer means a finger the content would never see lift.
+pub const GAMEPAD_MAX_AXES: usize = 8;
+pub const GAMEPAD_MAX_BUTTONS: usize = 20;
+
+/// One button's state, matching the Web `GamepadButton`.
+///
+/// `value` is the analogue position for a trigger and 0.0/1.0 for a digital
+/// button; `pressed` is not derivable from it, because a device chooses its own
+/// press threshold and content must not have to guess one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GamepadButtonState {
+    pub pressed: bool,
+    pub touched: bool,
+    pub value: f32,
+}
+
+/// A gamepad's current state, boxed inside `HostCommand::OnGamepadState`.
+///
+/// Fixed inline arrays with counts, like `TouchData`: this arrives once per pad
+/// per frame while a pad is connected, and a `Vec` here would allocate on the
+/// input path for a payload whose maximum size is under 200 bytes.
+#[derive(Debug)]
+pub struct GamepadState {
+    /// The slot this pad occupies, matching its index in `getGamepads()`.
+    pub index: u32,
+    /// Valid entries in `axes`.
+    pub axis_count: u8,
+    /// Valid entries in `buttons`.
+    pub button_count: u8,
+    /// Each in -1.0..=1.0, in the standard mapping's order.
+    pub axes: [f32; GAMEPAD_MAX_AXES],
+    pub buttons: [GamepadButtonState; GAMEPAD_MAX_BUTTONS],
+    /// When the host sampled this state, in milliseconds.
+    pub timestamp_ms: f64,
 }
 
 /// BLE characteristic value change payload, boxed inside
@@ -91,6 +134,7 @@ pub struct BleCharacteristicData {
 /// - **Rendering / Surface** (1): `UpdateSurface`
 /// - **Touch / Input** (1): `OnTouch`
 /// - **Keyboard Events** (6): `OnKeyboardInput` .. `OnKeyUp`
+/// - **Gamepad Events** (3): `OnGamepadConnected` .. `OnGamepadState`
 /// - **Sensor Events** (5): `OnDeviceMotionChange` .. `OnAccelerometerChange`
 /// - **Network** (1): `OnNetworkStatusChange`
 /// - **Audio Events** (3): `OnAudioInterruptionBegin`, `OnAudioInterruptionEnd`, `InnerAudioEvent`
@@ -383,6 +427,46 @@ pub enum HostCommand {
         /// Event timestamp in milliseconds.
         timestamp_ms: f64,
     },
+
+    // ---- Gamepad Events ----
+    /// A gamepad became available in `index`.
+    ///
+    /// Triggers a `gamepadconnected` event. The id is the device's own name,
+    /// which content shows to a player and uses to recognise a known pad.
+    OnGamepadConnected {
+        /// The slot the pad occupies for as long as it stays connected.
+        index: u32,
+        /// Human-readable device name, as the Web API's `Gamepad.id`.
+        id: String,
+        /// `"standard"` when the host mapped the pad onto the standard layout,
+        /// and empty when it did not -- content reads it to decide whether the
+        /// button order can be trusted.
+        mapping: String,
+        /// How many axes and buttons this pad reports.
+        ///
+        /// Carried on connect rather than inferred from the first state sample
+        /// because `getGamepads()` must return correctly sized arrays from the
+        /// moment the `gamepadconnected` listener runs -- content commonly reads
+        /// `buttons.length` there to decide which layout it is looking at.
+        axis_count: u8,
+        button_count: u8,
+    },
+
+    /// The gamepad in `index` went away.
+    ///
+    /// Triggers a `gamepaddisconnected` event and empties the slot, so content
+    /// polling `getGamepads()` sees a hole rather than a stale pad.
+    OnGamepadDisconnected {
+        index: u32,
+    },
+
+    /// New axis and button values for a connected gamepad.
+    ///
+    /// The Web API is polled rather than evented: content calls
+    /// `getGamepads()` each frame and reads whatever is current. So this
+    /// updates stored state instead of dispatching, and a host sends it as
+    /// often as it samples.
+    OnGamepadState(Box<GamepadState>),
 
     // ---- Bluetooth / BLE Events ----
     /// Bluetooth adapter state changed (available/discovering).

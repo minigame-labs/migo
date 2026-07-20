@@ -18,6 +18,7 @@ mod callbacks;
 mod capabilities;
 mod host_kit;
 mod platform;
+mod gamepad;
 mod input;
 mod keyboard;
 mod layout;
@@ -27,6 +28,10 @@ mod test_support;
 
 // The surface entry points and the descriptors they read live in their
 // own module; re-exported so the crate's public surface is unchanged.
+pub use gamepad::{
+    migo_session_send_gamepad_state, migo_session_set_gamepad_connected, MigoGamepadButton,
+    MigoGamepadInfo, MigoGamepadStateEvent,
+};
 pub use input::{migo_session_send_touch, MigoTouchEvent, MigoTouchPoint};
 pub use keyboard::{
     migo_session_send_key_event, migo_session_send_keyboard_event, MigoKeyEvent,

@@ -146,7 +146,7 @@ unsafe fn to_key_command(event: &MigoKeyEvent) -> Result<HostCommand, MigoResult
 /// Shared by both entry points so the state checks cannot drift: reporting
 /// success with nothing attached would tell a host its event was delivered when
 /// there is no content to deliver it to.
-fn attached_host(session: &MigoSession) -> Result<i32, MigoResult> {
+pub(crate) fn attached_host(session: &MigoSession) -> Result<i32, MigoResult> {
     let Ok(state) = session.state.lock() else {
         return Err(MIGO_ERROR_INTERNAL);
     };
