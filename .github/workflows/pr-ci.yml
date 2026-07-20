@@ -55,7 +55,11 @@ jobs:
           CC=clang CXX=clang++ bash scripts/test-c-abi-surface-candidate.sh
 
       - name: SurfaceAttachment lifecycle contract
-        run: bash scripts/test-surface-attachment-contract.sh
+        # ripgrep is not preinstalled on the runners, and the contract needs it
+        # for its multiline patterns.
+        run: |
+          command -v rg >/dev/null 2>&1 || sudo apt-get install -y ripgrep
+          bash scripts/test-surface-attachment-contract.sh
 
       - name: Platform/V8 dependency boundary contract
         run: bash scripts/test-platform-v8-boundary-contract.sh

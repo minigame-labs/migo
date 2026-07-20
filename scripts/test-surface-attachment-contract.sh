@@ -9,6 +9,22 @@ fail() {
     exit 1
 }
 
+# A gate whose tool is missing must say so, not report the invariant it was
+# unable to check.
+#
+# `require_multiline_regex` runs `rg` inside an `if !` condition, where a
+# missing binary exits 127 and reads as "the pattern was not found" -- so on a
+# runner without ripgrep this script announced that SurfaceDestroyed is not
+# generation-tagged. It said that for weeks on CI. The invariant was fine; the
+# gate was checking nothing and blaming the code, which is worse than not
+# running at all, because it sends whoever reads it hunting for a bug that does
+# not exist.
+if ! command -v rg >/dev/null 2>&1; then
+    echo "SurfaceAttachment contract could not run: ripgrep (rg) is not installed." >&2
+    echo "This is a missing tool, NOT a contract violation. Install ripgrep and re-run." >&2
+    exit 127
+fi
+
 require_literal() {
     local file="$1"
     local literal="$2"
