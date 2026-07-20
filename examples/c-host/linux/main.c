@@ -284,10 +284,41 @@ static void feed_scripted_keyboard(MigoSession *session) {
     send_keyboard(session, MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE, NULL, 0.0);
 }
 
+/* Shared with wayland_host.c so both hosts report the engine identically and
+ * neither grows its own copy that can drift. */
+MigoResult MIGO_CALL wl_dispatch_inline(void *dispatcher_context, MigoTaskFn task,
+                                        void *task_context) {
+    return dispatch_inline(dispatcher_context, task, task_context);
+}
+
+void MIGO_CALL wl_on_ready(void *user_data, MigoSession *session) {
+    on_ready(user_data, session);
+}
+
+void MIGO_CALL wl_on_error(void *user_data, MigoSession *session, const MigoError *error) {
+    on_error(user_data, session, error);
+}
+
+int run_wayland_host(const char *files_dir, const char *content_id, int seconds);
+
 int main(int argc, char **argv) {
     const char *files_dir = (argc > 1) ? argv[1] : "/tmp/migo-c-host/files";
     const char *content_id = (argc > 2) ? argv[2] : "c-host-demo";
     const int seconds = (argc > 3) ? atoi(argv[3]) : 10;
+
+    /* Which window system, chosen by the host rather than guessed: a machine
+     * running both (WSLg does) would otherwise get whichever this file probed
+     * first, and the point of the example is that the host decides. */
+    const char *backend = getenv("MIGO_C_HOST_BACKEND");
+    if (backend != NULL && strcmp(backend, "wayland") == 0) {
+#ifdef MIGO_C_HOST_NO_WAYLAND
+        fprintf(stderr, "[c-host] this build has no Wayland host "
+                        "(wayland-protocols was missing at build time)\n");
+        return 1;
+#else
+        return run_wayland_host(files_dir, content_id, seconds);
+#endif
+    }
 
     /* ---- Host-owned window. Migo never creates one. ---- */
     if (!XInitThreads()) {

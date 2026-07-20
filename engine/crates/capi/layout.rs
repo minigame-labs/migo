@@ -31,7 +31,7 @@ use crate::{
     keyboard::{MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent},
     surface::{
         MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
-        MigoX11WindowDescriptor,
+        MigoWaylandSurfaceDescriptor, MigoX11WindowDescriptor,
     },
 };
 
@@ -61,6 +61,7 @@ header_is_first!(
     MigoSurfaceMetrics,
     MigoAndroidNativeWindowDescriptor,
     MigoX11WindowDescriptor,
+    MigoWaylandSurfaceDescriptor,
     MigoTouchEvent,
     MigoKeyboardEvent,
     MigoKeyboardShowOptions,
@@ -188,6 +189,12 @@ mod lp64 {
 
     const _: () = assert!(size_of::<MigoAndroidNativeWindowDescriptor>() == 24);
     const _: () = assert!(offset_of!(MigoAndroidNativeWindowDescriptor, native_window) == 16);
+
+    const _: () = assert!(size_of::<MigoWaylandSurfaceDescriptor>() == 32);
+    const _: () = assert!(offset_of!(MigoWaylandSurfaceDescriptor, platform_kind) == 8);
+    const _: () = assert!(offset_of!(MigoWaylandSurfaceDescriptor, flags) == 12);
+    const _: () = assert!(offset_of!(MigoWaylandSurfaceDescriptor, display) == 16);
+    const _: () = assert!(offset_of!(MigoWaylandSurfaceDescriptor, surface) == 24);
 
     const _: () = assert!(size_of::<MigoX11WindowDescriptor>() == 40);
     const _: () = assert!(offset_of!(MigoX11WindowDescriptor, display) == 16);

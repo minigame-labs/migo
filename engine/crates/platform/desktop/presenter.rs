@@ -36,6 +36,16 @@ const LINUX_EGL_LIBRARY: &str = "libEGL.so.1";
 /// `EGL_KHR_platform_x11`. Not re-exported by `khronos-egl`, which carries core
 /// enums only.
 const EGL_PLATFORM_X11_EXT: egl::Enum = 0x31D5;
+const EGL_PLATFORM_WAYLAND_EXT: egl::Enum = 0x31D8;
+
+/// The Wayland EGL glue, loaded at run time rather than linked.
+///
+/// EGL cannot make a surface out of a `wl_surface` directly: it needs a
+/// `wl_egl_window`, and only this library can build one. Resolving it at run
+/// time keeps the SDK free of a build-time Wayland dependency, exactly as the
+/// X11 path takes an opaque window token and links no X library — a host that
+/// never attaches a Wayland surface never loads this.
+const LINUX_WAYLAND_EGL_LIBRARY: &str = "libwayland-egl.so.1";
 
 /// Platform-display entry points from `EGL_EXT_platform_base`.
 ///
@@ -91,6 +101,8 @@ enum LinuxDisplayTarget {
     Offscreen,
     /// Onscreen X11: the host's `Display*`.
     X11(NonNull<c_void>),
+    /// Onscreen Wayland: the host's `wl_display*`.
+    Wayland(NonNull<c_void>),
 }
 
 // SAFETY: the pointer is an opaque token passed to EGL, never dereferenced
@@ -127,6 +139,13 @@ impl LinuxEglProvider {
             target: LinuxDisplayTarget::X11(display),
         }
     }
+
+    /// Onscreen provider bound to a host-owned `wl_display*`.
+    pub fn wayland(display: NonNull<c_void>) -> Self {
+        Self {
+            target: LinuxDisplayTarget::Wayland(display),
+        }
+    }
 }
 
 impl EglProvider for LinuxEglProvider {
@@ -138,6 +157,7 @@ impl EglProvider for LinuxEglProvider {
         match self.target {
             LinuxDisplayTarget::Offscreen => "linux-system-egl",
             LinuxDisplayTarget::X11(_) => "linux-system-egl-x11",
+            LinuxDisplayTarget::Wayland(_) => "linux-system-egl-wayland",
         }
     }
 
@@ -195,6 +215,40 @@ impl EglProvider for LinuxEglProvider {
                     .ok_or_else(|| {
                         EngineError::new(ErrorCode::RenderInitializeError)
                             .with_msg("Linux X11 EGL display unavailable")
+                            .with_detail(format!("provider={}", self.label()))
+                    })
+            }
+            // No legacy fallback here, unlike X11: `eglGetDisplay` has no
+            // defined meaning for a `wl_display*`, so a driver without
+            // EGL_EXT_platform_base genuinely cannot serve Wayland and saying
+            // so beats handing it a pointer it will misread.
+            LinuxDisplayTarget::Wayland(display) => {
+                let get_platform_display = unsafe {
+                    platform_ext::entry_point::<platform_ext::GetPlatformDisplay>(
+                        egl,
+                        "eglGetPlatformDisplayEXT",
+                    )
+                }
+                .ok_or_else(|| {
+                    EngineError::new(ErrorCode::RenderInitializeError)
+                        .with_msg("Linux Wayland needs EGL_EXT_platform_base")
+                        .with_detail(format!("provider={}", self.label()))
+                })?;
+                // SAFETY: signature per EGL_EXT_platform_base; the display
+                // pointer is the host's, kept alive per this module's contract.
+                let raw = unsafe {
+                    get_platform_display(
+                        EGL_PLATFORM_WAYLAND_EXT,
+                        display.as_ptr(),
+                        std::ptr::null(),
+                    )
+                };
+                NonNull::new(raw)
+                    // SAFETY: non-null and produced by EGL itself.
+                    .map(|raw| unsafe { egl::Display::from_ptr(raw.as_ptr()) })
+                    .ok_or_else(|| {
+                        EngineError::new(ErrorCode::RenderInitializeError)
+                            .with_msg("Linux Wayland EGL display unavailable")
                             .with_detail(format!("provider={}", self.label()))
                     })
             }
@@ -262,6 +316,195 @@ impl Surface for LinuxX11Surface {
     }
 }
 
+/// The three `wl_egl_window` entry points, resolved once.
+///
+/// Declared here rather than taken from a header: the SDK carries no Wayland
+/// build dependency, and these three signatures are the whole of what it needs.
+mod wayland_egl {
+    use super::*;
+    use std::sync::OnceLock;
+
+    pub(super) type Create =
+        unsafe extern "C" fn(*mut c_void, std::os::raw::c_int, std::os::raw::c_int) -> *mut c_void;
+    pub(super) type Resize = unsafe extern "C" fn(
+        *mut c_void,
+        std::os::raw::c_int,
+        std::os::raw::c_int,
+        std::os::raw::c_int,
+        std::os::raw::c_int,
+    );
+    pub(super) type Destroy = unsafe extern "C" fn(*mut c_void);
+
+    pub(super) struct Glue {
+        pub(super) create: Create,
+        pub(super) resize: Resize,
+        pub(super) destroy: Destroy,
+        // Kept alive so the resolved pointers stay valid; never used directly.
+        _library: libloading::Library,
+    }
+
+    // SAFETY: the three entries are plain function pointers into a library that
+    // stays loaded for the process, and `libloading::Library` is itself Send +
+    // Sync. Nothing here is mutated after construction.
+    unsafe impl Send for Glue {}
+    unsafe impl Sync for Glue {}
+
+    static GLUE: OnceLock<Option<Glue>> = OnceLock::new();
+
+    /// Resolve the glue, or `None` when this system has no Wayland EGL.
+    ///
+    /// Loaded lazily and once: a host that only ever attaches X11 or renders
+    /// offscreen must not pay for, or fail on, a library it never needs.
+    pub(super) fn glue() -> Option<&'static Glue> {
+        GLUE.get_or_init(|| {
+            let library = unsafe { libloading::Library::new(LINUX_WAYLAND_EGL_LIBRARY) }.ok()?;
+            // SAFETY: the signatures above are the ones wayland-egl documents.
+            unsafe {
+                let create = *library.get::<Create>(b"wl_egl_window_create\0").ok()?;
+                let resize = *library.get::<Resize>(b"wl_egl_window_resize\0").ok()?;
+                let destroy = *library.get::<Destroy>(b"wl_egl_window_destroy\0").ok()?;
+                Some(Glue {
+                    create,
+                    resize,
+                    destroy,
+                    _library: library,
+                })
+            }
+        })
+        .as_ref()
+    }
+}
+
+/// Onscreen Wayland target. The `wl_surface` belongs to the host, which also
+/// owns its role (xdg_toplevel or otherwise) and its event dispatch; this crate
+/// only ever hands the pointer to `wl_egl_window_create`.
+#[derive(Debug)]
+pub struct LinuxWaylandSurface {
+    surface: NonNull<c_void>,
+    width: u32,
+    height: u32,
+}
+
+// SAFETY: as for the X11 display handle -- an opaque token this crate passes on
+// and never dereferences, so moving it between threads adds no aliasing. The
+// host guarantees it outlives the attachment.
+unsafe impl Send for LinuxWaylandSurface {}
+unsafe impl Sync for LinuxWaylandSurface {}
+
+impl LinuxWaylandSurface {
+    /// `surface` is a host-owned `wl_surface*` already given a role and sized
+    /// to `width` x `height` physical pixels.
+    pub fn new(surface: NonNull<c_void>, width: u32, height: u32) -> Self {
+        Self {
+            surface,
+            width,
+            height,
+        }
+    }
+}
+
+impl Surface for LinuxWaylandSurface {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+}
+
+/// Non-owning onscreen target, plus the one thing it does own: the
+/// `wl_egl_window` built from the host's surface.
+///
+/// Identity is the `wl_surface`, not the `wl_egl_window`, for the same reason
+/// X11 identity is the XID: a resize must stay the same native surface, and
+/// only the host's surface says which one it is.
+#[derive(Debug)]
+pub struct LinuxWaylandPreparedSurface {
+    surface: NonNull<c_void>,
+    egl_window: NonNull<c_void>,
+}
+
+// SAFETY: both pointers are opaque tokens handed to EGL and to the wayland-egl
+// glue; this crate never dereferences either.
+unsafe impl Send for LinuxWaylandPreparedSurface {}
+unsafe impl Sync for LinuxWaylandPreparedSurface {}
+
+impl Drop for LinuxWaylandPreparedSurface {
+    fn drop(&mut self) {
+        if let Some(glue) = wayland_egl::glue() {
+            // SAFETY: created by `wl_egl_window_create` below and not destroyed
+            // anywhere else -- this type is the only owner.
+            unsafe { (glue.destroy)(self.egl_window.as_ptr()) };
+        }
+    }
+}
+
+impl PreparedEglSurface for LinuxWaylandPreparedSurface {
+    fn backend_id(&self) -> GraphicsBackendId {
+        GraphicsBackendId::of::<LinuxSystemEglBackend>()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn same_native_surface(&self, other: &dyn PreparedEglSurface) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<LinuxWaylandPreparedSurface>()
+            .is_some_and(|other| self.surface == other.surface)
+    }
+
+    fn create_window_surface(
+        &self,
+        egl: &EglInstance,
+        display: egl::Display,
+        config: egl::Config,
+    ) -> EngineResult<egl::Surface> {
+        // The platform entry point takes a *pointer to* the native window, and
+        // on Wayland the native window is the `wl_egl_window` -- not the
+        // `wl_surface`. Passing the surface here compiles, links, and produces
+        // a surface that never presents.
+        let create_platform_window_surface = unsafe {
+            platform_ext::entry_point::<platform_ext::CreatePlatformWindowSurface>(
+                egl,
+                "eglCreatePlatformWindowSurfaceEXT",
+            )
+        }
+        .ok_or_else(|| {
+            EngineError::new(ErrorCode::RenderInitializeError)
+                .with_msg("Linux Wayland needs EGL_EXT_platform_base")
+        })?;
+
+        // Calling conventions differ between platforms, and getting this wrong
+        // fails at surface creation rather than anywhere useful. X11's native
+        // window is an XID, so the EXT entry point takes a pointer *to* it.
+        // Wayland's native window is already a pointer -- the wl_egl_window --
+        // so it is passed directly. Wrapping it in another pointer, as the X11
+        // path correctly does for its XID, makes EGL read the stack slot
+        // holding the pointer as if it were the window.
+        //
+        // SAFETY: signature per EGL_EXT_platform_base; a null attribute list
+        // means "no attributes".
+        let raw = unsafe {
+            create_platform_window_surface(
+                display.as_ptr(),
+                config.as_ptr(),
+                self.egl_window.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        NonNull::new(raw)
+            // SAFETY: non-null and produced by EGL itself.
+            .map(|raw| unsafe { egl::Surface::from_ptr(raw.as_ptr()) })
+            .ok_or_else(|| {
+                EngineError::new(ErrorCode::RenderInitializeError)
+                    .with_msg("Linux Wayland eglCreatePlatformWindowSurface failed")
+            })
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LinuxEglSurfaceFactory;
 
@@ -281,8 +524,34 @@ impl EglSurfaceFactory for LinuxEglSurfaceFactory {
         if let Some(x11) = any.downcast_ref::<LinuxX11Surface>() {
             return Ok(Arc::new(LinuxX11PreparedSurface { window: x11.window }));
         }
+        if let Some(wayland) = any.downcast_ref::<LinuxWaylandSurface>() {
+            let glue = wayland_egl::glue().ok_or_else(|| {
+                EngineError::new(ErrorCode::Unsupported)
+                    .with_msg("Wayland surface attached but the Wayland EGL glue is absent")
+                    .with_detail(format!("{LINUX_WAYLAND_EGL_LIBRARY} could not be loaded"))
+            })?;
+            // Built here rather than in `create_window_surface` so this type is
+            // its sole owner and its `Drop` is the only place it is destroyed.
+            // SAFETY: the surface pointer is the host's, valid for the
+            // attachment; the dimensions are physical pixels.
+            let egl_window = unsafe {
+                (glue.create)(
+                    wayland.surface.as_ptr(),
+                    wayland.width as std::os::raw::c_int,
+                    wayland.height as std::os::raw::c_int,
+                )
+            };
+            let egl_window = NonNull::new(egl_window).ok_or_else(|| {
+                EngineError::new(ErrorCode::RenderInitializeError)
+                    .with_msg("wl_egl_window_create failed")
+            })?;
+            return Ok(Arc::new(LinuxWaylandPreparedSurface {
+                surface: wayland.surface,
+                egl_window,
+            }));
+        }
         Err(EngineError::new(ErrorCode::Unsupported)
-            .with_msg("Linux presenter requires LinuxOffscreenSurface or LinuxX11Surface")
+            .with_msg("Linux presenter requires an offscreen, X11 or Wayland surface")
             .with_detail(format!("surface={surface:?}")))
     }
 }
@@ -431,9 +700,73 @@ pub fn linux_x11_graphics_platform(display: NonNull<c_void>) -> EngineResult<Gra
     )
 }
 
+/// Onscreen Wayland platform bound to a host-owned `wl_display*`.
+///
+/// The host owns the connection, the surface's role and its event dispatch;
+/// this crate only hands the display to EGL. The pointer must stay valid for
+/// the whole attachment.
+pub fn linux_wayland_graphics_platform(display: NonNull<c_void>) -> EngineResult<GraphicsPlatform> {
+    GraphicsPlatform::try_new(
+        Arc::new(LinuxEglProvider::wayland(display)),
+        Arc::new(LinuxEglSurfaceFactory),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two Wayland surfaces are the same native surface exactly when they wrap
+    /// the same `wl_surface`, so a resize keeps the attachment and a different
+    /// surface never inherits it.
+    ///
+    /// Checked on the plain surface rather than the prepared one because
+    /// preparing calls into `wl_egl_window_create`, which needs a live
+    /// compositor -- and identity is a property of what the host handed over,
+    /// not of the window EGL builds from it.
+    #[test]
+    fn wayland_surface_identity_is_the_surface_not_the_size() {
+        let handle = NonNull::new(0x5a5a_0001usize as *mut c_void).expect("token");
+        let other = NonNull::new(0x5a5a_0002usize as *mut c_void).expect("token");
+
+        let small = LinuxWaylandSurface::new(handle, 320, 240);
+        let large = LinuxWaylandSurface::new(handle, 1280, 720);
+        let different = LinuxWaylandSurface::new(other, 320, 240);
+
+        assert_eq!(small.surface, large.surface, "a resize is the same surface");
+        assert_ne!(small.size(), large.size());
+        assert_ne!(
+            small.surface, different.surface,
+            "a different wl_surface must never compare equal"
+        );
+    }
+
+    /// A Wayland surface must not be mistaken for an X11 one: the factory
+    /// downcasts, and an arm that matched the wrong type would hand EGL a
+    /// pointer of the wrong kind.
+    #[test]
+    fn wayland_and_x11_surfaces_are_never_confused() {
+        let wayland = LinuxWaylandSurface::new(
+            NonNull::new(0x5a5a_0001usize as *mut c_void).expect("token"),
+            640,
+            480,
+        );
+        let x11 = LinuxX11Surface::new(0x2a0_0001, 640, 480);
+
+        assert!(wayland.as_any().downcast_ref::<LinuxX11Surface>().is_none());
+        assert!(x11.as_any().downcast_ref::<LinuxWaylandSurface>().is_none());
+    }
+
+    #[test]
+    fn wayland_platform_pairs_provider_and_factory() {
+        let display = NonNull::new(0xdead_beefusize as *mut c_void).expect("token");
+        let platform = linux_wayland_graphics_platform(display).expect("wayland graphics platform");
+        assert_eq!(
+            platform.egl_provider().backend_id(),
+            platform.surface_factory().backend_id(),
+        );
+        assert_eq!(platform.egl_provider().label(), "linux-system-egl-wayland");
+    }
 
     #[test]
     fn provider_and_factory_share_backend_id() {

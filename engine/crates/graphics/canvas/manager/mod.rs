@@ -161,6 +161,8 @@ pub(crate) struct CanvasManager {
     gl: glow::Context,
     display: egl::Display,
     config: egl::Config,
+    /// See `EglInitResult::surfaceless`.
+    surfaceless: bool,
 
     #[allow(dead_code)]
     pub(super) dpi: f32,
@@ -459,6 +461,7 @@ impl CanvasManager {
         let mut egl = init.egl;
         let display = init.display;
         let config = init.config;
+        let surfaceless = init.surfaceless;
         let gles_major = init.gles_major;
         let has_robust_context = init.has_robust_context;
 
@@ -472,6 +475,7 @@ impl CanvasManager {
             16,
             gles_major,
             has_robust_context,
+            surfaceless,
         )?;
         // From this point onward EglRuntime owns the share-group root. Any
         // later constructor error/panic destroys it and terminates the display.
@@ -482,18 +486,13 @@ impl CanvasManager {
         };
 
         // Make resource current once.
-        egl.make_current(
-            display,
-            Some(resource.surf),
-            Some(resource.surf),
-            Some(resource.ctx),
-        )
-        .map_err(|e| {
-            ee(
-                ErrorCode::RenderBackendError,
-                format!("eglMakeCurrent(resource) failed: {e:?}"),
-            )
-        })?;
+        egl.make_current(display, resource.surf, resource.surf, Some(resource.ctx))
+            .map_err(|e| {
+                ee(
+                    ErrorCode::RenderBackendError,
+                    format!("eglMakeCurrent(resource) failed: {e:?}"),
+                )
+            })?;
 
         let gl = unsafe {
             glow::Context::from_loader_function(|s| {
@@ -584,6 +583,7 @@ impl CanvasManager {
                 resource.ctx,
                 gles_major,
                 has_robust_context,
+                surfaceless,
             )
         } else {
             None
@@ -667,6 +667,7 @@ impl CanvasManager {
             gl,
             display,
             config,
+            surfaceless,
             dpi,
             resource,
             bound: BoundContext::Resource,
@@ -772,6 +773,7 @@ impl CanvasManager {
             h,
             self.gles_major,
             self.has_robust_context,
+            self.surfaceless,
         )?;
 
         let info = CanvasInfo {
@@ -1182,7 +1184,9 @@ impl CanvasManager {
                 physical_height: physical_h,
                 ctx: EglContextHandle {
                     ctx: installed_ctx,
-                    surf: pending.surface,
+                    // An onscreen canvas always has a real window surface; the
+                    // Option exists for the surfaceless offscreen ones.
+                    surf: Some(pending.surface),
                 },
                 // A preserved buffer moves with its context before the first
                 // make-current. A fresh buffer is initialized below.
@@ -1374,8 +1378,8 @@ impl CanvasManager {
 
         if let Err(error) = self.egl.make_current(
             self.display,
-            Some(self.resource.surf),
-            Some(self.resource.surf),
+            self.resource.surf,
+            self.resource.surf,
             Some(self.resource.ctx),
         ) {
             tracing::error!(
@@ -1422,8 +1426,8 @@ impl CanvasManager {
                         .egl
                         .make_current(
                             self.display,
-                            Some(self.resource.surf),
-                            Some(self.resource.surf),
+                            self.resource.surf,
+                            self.resource.surf,
                             Some(context),
                         )
                         .is_ok()
@@ -1432,8 +1436,8 @@ impl CanvasManager {
                     }
                     let _ = self.egl.make_current(
                         self.display,
-                        Some(self.resource.surf),
-                        Some(self.resource.surf),
+                        self.resource.surf,
+                        self.resource.surf,
                         Some(self.resource.ctx),
                     );
                     self.bound = BoundContext::Resource;
@@ -1464,8 +1468,8 @@ impl CanvasManager {
                 .egl
                 .make_current(
                     self.display,
-                    Some(entry.ctx.surf),
-                    Some(entry.ctx.surf),
+                    entry.ctx.surf,
+                    entry.ctx.surf,
                     Some(entry.ctx.ctx),
                 )
                 .is_ok();
@@ -1498,8 +1502,8 @@ impl CanvasManager {
             // properly disconnected before we destroy the onscreen surface.
             if let Err(error) = self.egl.make_current(
                 self.display,
-                Some(self.resource.surf),
-                Some(self.resource.surf),
+                self.resource.surf,
+                self.resource.surf,
                 Some(self.resource.ctx),
             ) {
                 self.canvases.insert(id, entry);
@@ -1510,13 +1514,21 @@ impl CanvasManager {
                 ));
             }
             self.bound = BoundContext::Resource;
-            if let Err(error) = self.egl.destroy_surface(self.display, entry.ctx.surf) {
-                self.canvases.insert(id, entry);
-                self.evaluate_bypass();
-                return Err(ee(
-                    ErrorCode::RenderBackendError,
-                    format!("eglDestroySurface(onscreen) failed: {error:?}"),
-                ));
+            // An onscreen canvas always has a window surface, so this is not a
+            // conditional teardown -- it is the same unconditional one, written
+            // to keep the destroy-then-check ordering that
+            // `onscreen_detach_checks_egl_destroy_before_releasing_native_ownership`
+            // pins. Releasing native ownership before the destroy is checked is
+            // the bug that guard exists for.
+            if let Some(onscreen_surf) = entry.ctx.surf {
+                if let Err(error) = self.egl.destroy_surface(self.display, onscreen_surf) {
+                    self.canvases.insert(id, entry);
+                    self.evaluate_bypass();
+                    return Err(ee(
+                        ErrorCode::RenderBackendError,
+                        format!("eglDestroySurface(onscreen) failed: {error:?}"),
+                    ));
+                }
             }
             self.installed_surface = None;
             // Preserve the context for reuse on the next create_onscreen().
@@ -1537,15 +1549,15 @@ impl CanvasManager {
                     // current, then switch away before destroying that context.
                     let _ = self.egl.make_current(
                         self.display,
-                        Some(self.resource.surf),
-                        Some(self.resource.surf),
+                        self.resource.surf,
+                        self.resource.surf,
                         Some(old_ctx),
                     );
                     drawing_buffer::destroy(&self.gl, old_db);
                     let _ = self.egl.make_current(
                         self.display,
-                        Some(self.resource.surf),
-                        Some(self.resource.surf),
+                        self.resource.surf,
+                        self.resource.surf,
                         Some(self.resource.ctx),
                     );
                     let _ = self.egl.destroy_context(self.display, old_ctx);
@@ -1828,6 +1840,7 @@ impl CanvasManager {
             16,
             self.gles_major,
             self.has_robust_context,
+            self.surfaceless,
         )?;
         self.egl.track_resource(resource_ctx, resource_surf);
         self.resource = EglContextHandle {
@@ -1846,6 +1859,7 @@ impl CanvasManager {
                 self.resource.ctx,
                 self.gles_major,
                 self.has_robust_context,
+                self.surfaceless,
             );
             if self.upload_thread.is_some() {
                 self.upload_server = Some(crate::upload_server::UploadServer::for_device(
@@ -1929,7 +1943,9 @@ impl CanvasManager {
 
         // Every canvas's EGL surface + context (onscreen + offscreen).
         for (_id, entry) in std::mem::take(&mut self.canvases) {
-            self.egl.destroy_surface(self.display, entry.ctx.surf).ok();
+            if let Some(surf) = entry.ctx.surf {
+                self.egl.destroy_surface(self.display, surf).ok();
+            }
             self.egl.destroy_context(self.display, entry.ctx.ctx).ok();
         }
         // Preserved onscreen ctx / DrawingBuffer from a prior resume are dead.
@@ -1948,7 +1964,9 @@ impl CanvasManager {
         // Resource (root) context + surface.
         if let Some((resource_ctx, resource_surf)) = self.egl.untrack_resource() {
             self.egl.make_current(self.display, None, None, None).ok();
-            self.egl.destroy_surface(self.display, resource_surf).ok();
+            if let Some(resource_surf) = resource_surf {
+                self.egl.destroy_surface(self.display, resource_surf).ok();
+            }
             self.egl.destroy_context(self.display, resource_ctx).ok();
         }
 
@@ -2049,8 +2067,8 @@ impl CanvasManager {
                 .egl
                 .make_current(
                     self.display,
-                    Some(entry.ctx.surf),
-                    Some(entry.ctx.surf),
+                    entry.ctx.surf,
+                    entry.ctx.surf,
                     Some(entry.ctx.ctx),
                 )
                 .is_ok();
@@ -2064,7 +2082,9 @@ impl CanvasManager {
             if skia_ctx_current {
                 let _ = self.bind_resource();
             }
-            self.egl.destroy_surface(self.display, entry.ctx.surf).ok();
+            if let Some(surf) = entry.ctx.surf {
+                self.egl.destroy_surface(self.display, surf).ok();
+            }
             self.egl.destroy_context(self.display, entry.ctx.ctx).ok();
             if let Some(tag) = ctx_tag {
                 self.image_registry
@@ -2181,8 +2201,8 @@ impl CanvasManager {
             if let Some(ctx) = self.preserved_ctx {
                 let _ = self.egl.make_current(
                     self.display,
-                    Some(self.resource.surf),
-                    Some(self.resource.surf),
+                    self.resource.surf,
+                    self.resource.surf,
                     Some(ctx),
                 );
             }
@@ -2191,8 +2211,8 @@ impl CanvasManager {
         if let Some(ctx) = self.preserved_ctx.take() {
             let _ = self.egl.make_current(
                 self.display,
-                Some(self.resource.surf),
-                Some(self.resource.surf),
+                self.resource.surf,
+                self.resource.surf,
                 Some(self.resource.ctx),
             );
             let _ = self.egl.destroy_context(self.display, ctx);
@@ -2211,8 +2231,8 @@ impl CanvasManager {
         self.egl
             .make_current(
                 self.display,
-                Some(self.resource.surf),
-                Some(self.resource.surf),
+                self.resource.surf,
+                self.resource.surf,
                 Some(self.resource.ctx),
             )
             .map_err(|e| {
@@ -2481,8 +2501,8 @@ impl CanvasManager {
         self.egl
             .make_current(
                 self.display,
-                Some(entry.ctx.surf),
-                Some(entry.ctx.surf),
+                entry.ctx.surf,
+                entry.ctx.surf,
                 Some(entry.ctx.ctx),
             )
             .map_err(|e| {
@@ -2688,14 +2708,20 @@ impl CanvasManager {
         }
 
         // destroy old surface
-        self.egl
-            .destroy_surface(self.display, old_surf)
-            .map_err(|e| {
-                ee(
-                    ErrorCode::RenderBackendError,
-                    format!("resize_canvas: destroy_surface failed: {e:?}"),
-                )
-            })?;
+        // A surfaceless share group has no pbuffer to swap: the offscreen canvas
+        // renders into an FBO whose size is what actually changes here, and the
+        // context is current against EGL_NO_SURFACE either way. Destroying and
+        // recreating nothing is exactly right; only the recorded metrics move.
+        if let Some(old_surf) = old_surf {
+            self.egl
+                .destroy_surface(self.display, old_surf)
+                .map_err(|e| {
+                    ee(
+                        ErrorCode::RenderBackendError,
+                        format!("resize_canvas: destroy_surface failed: {e:?}"),
+                    )
+                })?;
+        }
 
         // create new surface
         let new_surf = match kind {
@@ -2705,6 +2731,7 @@ impl CanvasManager {
                     "window DrawingBuffer resize must not recreate its platform EGLSurface",
                 ));
             }
+            SurfaceKind::Pbuffer if self.surfaceless => None,
             SurfaceKind::Pbuffer => {
                 let pbuf_attribs = [
                     egl::WIDTH as i32,
@@ -2713,49 +2740,29 @@ impl CanvasManager {
                     new_h as i32,
                     egl::NONE as i32,
                 ];
-                self.egl
-                    .create_pbuffer_surface(self.display, self.config, &pbuf_attribs)
-                    .map_err(|e| {
-                        ee(
-                            ErrorCode::RenderBackendError,
-                            format!("resize_canvas: create_pbuffer_surface failed: {e:?}"),
-                        )
-                    })?
+                Some(
+                    self.egl
+                        .create_pbuffer_surface(self.display, self.config, &pbuf_attribs)
+                        .map_err(|e| {
+                            ee(
+                                ErrorCode::RenderBackendError,
+                                format!("resize_canvas: create_pbuffer_surface failed: {e:?}"),
+                            )
+                        })?,
+                )
             }
         };
 
-        if was_current {
-            self.egl
-                .make_current(
-                    self.display,
-                    Some(new_surf),
-                    Some(new_surf),
-                    Some(ctx_handle),
+        self.egl
+            .make_current(self.display, new_surf, new_surf, Some(ctx_handle))
+            .map_err(|e| {
+                ee(
+                    ErrorCode::RenderBackendError,
+                    format!("resize_canvas: make_current(resized surf) failed: {e:?}"),
                 )
-                .map_err(|e| {
-                    ee(
-                        ErrorCode::RenderBackendError,
-                        format!("resize_canvas: make_current(new surf) failed: {e:?}"),
-                    )
-                })?;
-            self.bound = BoundContext::Canvas(id);
-        }
-        if !was_current {
-            self.egl
-                .make_current(
-                    self.display,
-                    Some(new_surf),
-                    Some(new_surf),
-                    Some(ctx_handle),
-                )
-                .map_err(|e| {
-                    ee(
-                        ErrorCode::RenderBackendError,
-                        format!("resize_canvas: make_current(resized surf) failed: {e:?}"),
-                    )
-                })?;
-            self.bound = BoundContext::Canvas(id);
-        }
+            })?;
+        self.bound = BoundContext::Canvas(id);
+        let _ = was_current;
 
         // Keep canvas metrics aligned with JS-requested dimensions. On some
         // devices EGL surface queries may return rotated values for window
@@ -2833,10 +2840,19 @@ impl CanvasManager {
                 let db_matches = e.drawing_buffer.as_ref().map_or(false, |db| {
                     db.width == e.physical_width && db.height == e.physical_height
                 });
+                // Buffer age and partial repair are properties of a window
+                // surface. A canvas without one is offscreen and never reaches
+                // here, but a full plan is the safe answer if it ever did.
+                let Some(surf) = e.ctx.surf else {
+                    return PresentDamagePlan {
+                        current: DamageRegion::FullSurface,
+                        repair: DamageRegion::FullSurface,
+                    };
+                };
                 (
                     e.physical_width,
                     e.physical_height,
-                    e.ctx.surf,
+                    surf,
                     db_matches,
                     e.bypass_drawing_buffer,
                 )
@@ -3060,8 +3076,15 @@ impl CanvasManager {
             self.last_swap_interval = interval;
         }
 
+        // Only a window surface is ever presented, and only a window canvas
+        // reaches here. An offscreen one has nothing to swap; FullSurface is
+        // the conservative answer, since a caller reading it repairs everything
+        // rather than trusting a region no present ever wrote.
+        let Some(entry_surf) = entry.ctx.surf else {
+            return Ok(ResolvedDamage::FullSurface);
+        };
         self.egl
-            .swap_buffers(self.display, entry.ctx.surf)
+            .swap_buffers(self.display, entry_surf)
             .map_err(|e| {
                 if let Some(egl_err) = self.egl.get_error() {
                     if egl_err == egl::Error::ContextLost {

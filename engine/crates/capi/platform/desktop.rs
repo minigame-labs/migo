@@ -1,16 +1,20 @@
-//! X11 surface construction for desktop hosts.
+//! X11 and Wayland surface construction for desktop hosts.
 
-use std::{ffi::c_ulong, ptr::NonNull, sync::Arc};
+use std::{
+    ffi::{c_ulong, c_void},
+    ptr::NonNull,
+    sync::Arc,
+};
 
 use shared::surface::SurfaceRef;
 
 use crate::{
-    MIGO_PLATFORM_X11_WINDOW,
+    MIGO_PLATFORM_WAYLAND_SURFACE, MIGO_PLATFORM_X11_WINDOW,
     abi::{
         MIGO_ERROR_INTERNAL, MIGO_ERROR_INVALID_ARGUMENT, MIGO_ERROR_UNSUPPORTED_PLATFORM,
         MigoResult, VersionedHeader, validate_header,
     },
-    surface::{MigoSurfaceDescriptor, MigoX11WindowDescriptor},
+    surface::{MigoSurfaceDescriptor, MigoWaylandSurfaceDescriptor, MigoX11WindowDescriptor},
 };
 
 /// What a resize needs in order to rebuild the surface.
@@ -20,7 +24,13 @@ use crate::{
 /// keeping it would outlive the caller's storage.
 #[derive(Clone, Copy)]
 pub(crate) enum PlatformTarget {
-    X11 { window: c_ulong },
+    X11 {
+        window: c_ulong,
+    },
+    Wayland {
+        surface: NonNull<c_void>,
+        display: NonNull<c_void>,
+    },
 }
 
 /// The surface kinds this build can attach, as a `MIGO_PLATFORM_*` bitmask.
@@ -30,13 +40,16 @@ pub(crate) enum PlatformTarget {
 /// what an attach actually accepts cannot drift apart. A query that drifts is
 /// worse than no query: a host would plan around an answer that is false.
 pub(crate) const fn supported_platform_kinds() -> u64 {
-    1u64 << MIGO_PLATFORM_X11_WINDOW
+    (1u64 << MIGO_PLATFORM_X11_WINDOW) | (1u64 << MIGO_PLATFORM_WAYLAND_SURFACE)
 }
 
 pub(crate) fn rebuild_surface(target: PlatformTarget, width: u32, height: u32) -> SurfaceRef {
     match target {
         PlatformTarget::X11 { window } => Arc::new(
             platform::desktop::presenter::LinuxX11Surface::new(window, width, height),
+        ),
+        PlatformTarget::Wayland { surface, .. } => Arc::new(
+            platform::desktop::presenter::LinuxWaylandSurface::new(surface, width, height),
         ),
     }
 }
@@ -58,6 +71,9 @@ pub(crate) unsafe fn build_target(
 > {
     if !crate::platform::kind_is_supported(descriptor.platform_kind) {
         return Err(MIGO_ERROR_UNSUPPORTED_PLATFORM);
+    }
+    if descriptor.platform_kind == MIGO_PLATFORM_WAYLAND_SURFACE {
+        return unsafe { build_wayland_target(descriptor) };
     }
     // The envelope's size field and the payload's own struct_size are an
     // intentional cross-check; disagreeing means the caller mismatched them.
@@ -95,11 +111,166 @@ pub(crate) unsafe fn build_target(
     Ok((surface, graphics_platform, PlatformTarget::X11 { window }))
 }
 
+/// Translate a validated Wayland descriptor.
+///
+/// Split from `build_target` rather than folded into it: the two platforms
+/// share only the envelope checks, and interleaving them made it easy to read
+/// one platform's payload with the other's rules.
+///
+/// # Safety
+/// `descriptor` must have passed [`validate_header`] and name the Wayland kind.
+unsafe fn build_wayland_target(
+    descriptor: &MigoSurfaceDescriptor,
+) -> Result<
+    (
+        SurfaceRef,
+        graphics::egl_platform::GraphicsPlatform,
+        PlatformTarget,
+    ),
+    MigoResult,
+> {
+    if descriptor.platform_descriptor_size as usize != size_of::<MigoWaylandSurfaceDescriptor>() {
+        return Err(MIGO_ERROR_INVALID_ARGUMENT);
+    }
+    unsafe {
+        validate_header(
+            descriptor.platform_descriptor as *const VersionedHeader,
+            size_of::<MigoWaylandSurfaceDescriptor>(),
+        )
+    }?;
+    let wayland =
+        unsafe { &*(descriptor.platform_descriptor as *const MigoWaylandSurfaceDescriptor) };
+    if wayland.platform_kind != MIGO_PLATFORM_WAYLAND_SURFACE {
+        return Err(MIGO_ERROR_INVALID_ARGUMENT);
+    }
+    let (Some(display), Some(surface)) =
+        (NonNull::new(wayland.display), NonNull::new(wayland.surface))
+    else {
+        return Err(MIGO_ERROR_INVALID_ARGUMENT);
+    };
+    if descriptor.width_pixels == 0 || descriptor.height_pixels == 0 {
+        return Err(MIGO_ERROR_INVALID_ARGUMENT);
+    }
+
+    let surface_ref: SurfaceRef = Arc::new(platform::desktop::presenter::LinuxWaylandSurface::new(
+        surface,
+        descriptor.width_pixels,
+        descriptor.height_pixels,
+    ));
+    let graphics_platform = platform::desktop::presenter::linux_wayland_graphics_platform(display)
+        .map_err(|error| {
+            tracing::error!("build_wayland_target: graphics platform: {error:?}");
+            MIGO_ERROR_INTERNAL
+        })?;
+    Ok((
+        surface_ref,
+        graphics_platform,
+        PlatformTarget::Wayland { surface, display },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::abi::{MIGO_ABI_VERSION_CURRENT, MIGO_ERROR_UNSUPPORTED_PLATFORM};
     use std::ffi::c_void;
+
+    fn wayland_descriptor(
+        display: *mut c_void,
+        surface: *mut c_void,
+    ) -> MigoWaylandSurfaceDescriptor {
+        MigoWaylandSurfaceDescriptor {
+            header: VersionedHeader {
+                struct_size: size_of::<MigoWaylandSurfaceDescriptor>() as u32,
+                abi_version: MIGO_ABI_VERSION_CURRENT,
+            },
+            platform_kind: MIGO_PLATFORM_WAYLAND_SURFACE,
+            flags: 0,
+            display,
+            surface,
+        }
+    }
+
+    fn wayland_envelope(payload: &MigoWaylandSurfaceDescriptor) -> MigoSurfaceDescriptor {
+        MigoSurfaceDescriptor {
+            header: VersionedHeader {
+                struct_size: size_of::<MigoSurfaceDescriptor>() as u32,
+                abi_version: MIGO_ABI_VERSION_CURRENT,
+            },
+            generation: 1,
+            platform_kind: MIGO_PLATFORM_WAYLAND_SURFACE,
+            flags: 0,
+            width_pixels: 720,
+            height_pixels: 1280,
+            scale_factor: 1.0,
+            color_space: 0,
+            alpha_mode: 0,
+            preferred_presentation_mode: 0,
+            capability_flags: 0,
+            platform_descriptor_size: size_of::<MigoWaylandSurfaceDescriptor>() as u32,
+            reserved0: 0,
+            platform_descriptor: payload as *const _ as *const c_void,
+        }
+    }
+
+    /// Both handles are required. A null one would reach EGL, which has no way
+    /// to tell it apart from a display that simply has no surface yet.
+    #[test]
+    fn a_wayland_descriptor_requires_both_a_display_and_a_surface() {
+        let no_display = wayland_descriptor(std::ptr::null_mut(), 0x5a5a_0001usize as *mut c_void);
+        assert_eq!(
+            unsafe { build_target(&wayland_envelope(&no_display)) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+
+        let no_surface = wayland_descriptor(0xdead_beefusize as *mut c_void, std::ptr::null_mut());
+        assert_eq!(
+            unsafe { build_target(&wayland_envelope(&no_surface)) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+    }
+
+    /// The envelope's size field and the payload's own must agree, the same
+    /// cross-check X11 gets: a mismatch means the caller paired descriptors
+    /// from different builds.
+    #[test]
+    fn a_wayland_descriptor_size_mismatch_is_rejected() {
+        let payload = wayland_descriptor(
+            0xdead_beefusize as *mut c_void,
+            0x5a5a_0001usize as *mut c_void,
+        );
+        let mut envelope = wayland_envelope(&payload);
+        envelope.platform_descriptor_size = 8;
+        assert_eq!(
+            unsafe { build_target(&envelope) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+    }
+
+    /// A payload claiming a different kind than its envelope is a mismatched
+    /// pair, not a Wayland surface -- reading it as one would hand EGL an X11
+    /// display.
+    #[test]
+    fn a_wayland_envelope_wrapping_another_kind_is_rejected() {
+        let mut payload = wayland_descriptor(
+            0xdead_beefusize as *mut c_void,
+            0x5a5a_0001usize as *mut c_void,
+        );
+        payload.platform_kind = MIGO_PLATFORM_X11_WINDOW;
+        assert_eq!(
+            unsafe { build_target(&wayland_envelope(&payload)) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+    }
+
+    /// The capability query and the attach path must agree about Wayland, or a
+    /// host plans around an answer that is false.
+    #[test]
+    fn wayland_is_advertised_as_supported() {
+        assert!(crate::platform::kind_is_supported(
+            MIGO_PLATFORM_WAYLAND_SURFACE
+        ));
+    }
 
     #[test]
     fn non_x11_platforms_are_reported_as_unsupported_not_invalid() {

@@ -12,21 +12,63 @@ fn main() {
         .canonicalize()
         .expect("repo root");
     let source = repo_root.join("examples/c-host/linux/main.c");
+    let wayland_source = repo_root.join("examples/c-host/linux/wayland_host.c");
     let include = repo_root.join("include");
 
     println!("cargo:rerun-if-changed={}", source.display());
+    println!("cargo:rerun-if-changed={}", wayland_source.display());
     println!("cargo:rerun-if-changed={}", include.display());
 
-    cc::Build::new()
+    // xdg-shell is a protocol, not a library: wayland-scanner turns its XML
+    // into the stubs and interface tables a client links. Generated at build
+    // time rather than vendored so the example always matches the
+    // wayland-protocols the machine actually has.
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let xml = PathBuf::from("/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml");
+    let generated = xml.exists() && generate_xdg_shell(&xml, &out_dir);
+
+    let mut build = cc::Build::new();
+    build
         .file(&source)
         .include(&include)
         .std("c11")
-        .warnings(true)
-        .compile("c_host_main");
+        .warnings(true);
+
+    if generated {
+        build
+            .file(&wayland_source)
+            .file(out_dir.join("xdg-shell-protocol.c"))
+            .include(&out_dir);
+        println!("cargo:rustc-link-lib=wayland-client");
+    } else {
+        // Without the protocol XML there is no Wayland host to build. Say so
+        // rather than emitting a binary whose --backend=wayland silently does
+        // nothing.
+        println!(
+            "cargo:warning=wayland-protocols not found; the Wayland host is omitted from this build"
+        );
+        build.define("MIGO_C_HOST_NO_WAYLAND", None);
+    }
+    build.compile("c_host_main");
 
     // The example owns its window, so it -- not the engine -- needs Xlib. GL and
     // EGL are not declared here: the graphics crate now declares the GL
     // dependency its Skia backend creates, and EGL arrives through the engine's
     // own link libraries. A consumer should not have to know either.
     println!("cargo:rustc-link-lib=X11");
+}
+
+/// Run wayland-scanner for the client header and the private protocol code.
+fn generate_xdg_shell(xml: &std::path::Path, out_dir: &std::path::Path) -> bool {
+    let run = |mode: &str, output: PathBuf| {
+        std::process::Command::new("wayland-scanner")
+            .arg(mode)
+            .arg(xml)
+            .arg(&output)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    };
+    run("client-header", out_dir.join("xdg-shell-client-protocol.h"))
+        && run("private-code", out_dir.join("xdg-shell-protocol.c"))
 }

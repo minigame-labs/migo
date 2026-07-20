@@ -117,6 +117,7 @@ impl UploadThreadHandle {
         share_ctx: khronos_egl::Context,
         gles_major: u32,
         has_robust_context: bool,
+        surfaceless: bool,
     ) -> Option<Self> {
         // Create shared context matching the render context's GLES
         // version.  R-3: mirror the render context's robustness
@@ -142,20 +143,29 @@ impl UploadThreadHandle {
             .map_err(|e| warn!("Upload thread: eglCreateContext failed: {e:?}"))
             .ok()?;
 
-        let pbuf_attribs = [
-            khronos_egl::WIDTH as i32,
-            1,
-            khronos_egl::HEIGHT as i32,
-            1,
-            khronos_egl::NONE as i32,
-        ];
-        let pbuf = egl
-            .create_pbuffer_surface(display, config, &pbuf_attribs)
-            .map_err(|e| {
-                warn!("Upload thread: eglCreatePbufferSurface failed: {e:?}");
-                egl.destroy_context(display, shared_ctx).ok();
-            })
-            .ok()?;
+        // A 1x1 pbuffer purely so eglMakeCurrent has a surface to accept. Where
+        // the driver publishes no pbuffer config there is none to create, and
+        // the context is made current against EGL_NO_SURFACE instead -- uploads
+        // go to texture objects, never to this surface.
+        let pbuf = if surfaceless {
+            None
+        } else {
+            let pbuf_attribs = [
+                khronos_egl::WIDTH as i32,
+                1,
+                khronos_egl::HEIGHT as i32,
+                1,
+                khronos_egl::NONE as i32,
+            ];
+            Some(
+                egl.create_pbuffer_surface(display, config, &pbuf_attribs)
+                    .map_err(|e| {
+                        warn!("Upload thread: eglCreatePbufferSurface failed: {e:?}");
+                        egl.destroy_context(display, shared_ctx).ok();
+                    })
+                    .ok()?,
+            )
+        };
 
         let (job_tx, job_rx) = bounded::<UploadJob>(JOB_QUEUE_CAPACITY);
         let (result_tx, result_rx) = bounded::<CompletedUpload>(JOB_QUEUE_CAPACITY);
@@ -172,7 +182,7 @@ impl UploadThreadHandle {
         let expected_backend = egl_provider.backend_id();
         let display_raw = display.as_ptr() as usize;
         let ctx_raw = shared_ctx.as_ptr() as usize;
-        let pbuf_raw = pbuf.as_ptr() as usize;
+        let pbuf_raw = pbuf.map_or(0usize, |pbuf| pbuf.as_ptr() as usize);
 
         let handle = std::thread::Builder::new()
             .name("Migo-Upload".into())
@@ -274,13 +284,14 @@ fn upload_thread_main(
     // Reconstruct opaque handles from raw pointers.
     let display = unsafe { khronos_egl::Display::from_ptr(display_raw as *mut _) };
     let ctx = unsafe { khronos_egl::Context::from_ptr(ctx_raw as *mut _) };
-    let pbuf = unsafe { khronos_egl::Surface::from_ptr(pbuf_raw as *mut _) };
+    // Zero is how "surfaceless" crosses the thread boundary: the spawn side has
+    // no surface to hand over, and rebuilding one from a null pointer would
+    // make eglMakeCurrent fail instead of doing the surfaceless thing.
+    let pbuf =
+        (pbuf_raw != 0).then(|| unsafe { khronos_egl::Surface::from_ptr(pbuf_raw as *mut _) });
 
     // Make the shared context current on this thread.
-    if egl
-        .make_current(display, Some(pbuf), Some(pbuf), Some(ctx))
-        .is_err()
-    {
+    if egl.make_current(display, pbuf, pbuf, Some(ctx)).is_err() {
         warn!("Upload thread: eglMakeCurrent failed");
         return;
     }
@@ -367,7 +378,9 @@ fn upload_thread_main(
     // Cleanup.
     egl.make_current(display, None, None, None).ok();
     egl.destroy_context(display, ctx).ok();
-    egl.destroy_surface(display, pbuf).ok();
+    if let Some(pbuf) = pbuf {
+        egl.destroy_surface(display, pbuf).ok();
+    }
     info!("Upload thread: exited");
 }
 

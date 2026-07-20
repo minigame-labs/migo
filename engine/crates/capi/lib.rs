@@ -62,6 +62,9 @@ use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::Surf
 /// `MIGO_PLATFORM_X11_WINDOW` from `include/migo/surface.h`.
 const MIGO_PLATFORM_X11_WINDOW: u32 = 6;
 
+/// `MIGO_PLATFORM_WAYLAND_SURFACE` from `include/migo/surface.h`.
+const MIGO_PLATFORM_WAYLAND_SURFACE: u32 = 7;
+
 /// `MIGO_PLATFORM_ANDROID_NATIVE_WINDOW` from `include/migo/surface.h`.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 const MIGO_PLATFORM_ANDROID_NATIVE_WINDOW: u32 = 1;

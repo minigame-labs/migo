@@ -91,6 +91,19 @@ pub struct MigoX11WindowDescriptor {
     pub(crate) reserved0: u32,
 }
 
+/// Mirrors `MigoWaylandSurfaceDescriptor` in `include/migo/platform/wayland.h`.
+///
+/// Both handles belong to the host, which also owns the surface's role and its
+/// event dispatch. Migo neither creates nor destroys either one.
+#[repr(C)]
+pub struct MigoWaylandSurfaceDescriptor {
+    pub(crate) header: VersionedHeader,
+    pub(crate) platform_kind: u32,
+    pub(crate) flags: u32,
+    pub(crate) display: *mut c_void,
+    pub(crate) surface: *mut c_void,
+}
+
 // ---- Attachment handle ------------------------------------------------------
 
 pub struct MigoSurfaceAttachment {

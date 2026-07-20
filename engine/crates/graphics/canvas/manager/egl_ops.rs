@@ -44,7 +44,7 @@ impl Drop for InitializedDisplayGuard<'_> {
 pub(super) struct EglRuntime {
     instance: EglInstance,
     display: egl::Display,
-    resource: Option<(egl::Context, egl::Surface)>,
+    resource: Option<(egl::Context, Option<egl::Surface>)>,
     initialized: bool,
 }
 
@@ -58,7 +58,7 @@ impl EglRuntime {
         }
     }
 
-    pub(super) fn track_resource(&mut self, context: egl::Context, surface: egl::Surface) {
+    pub(super) fn track_resource(&mut self, context: egl::Context, surface: Option<egl::Surface>) {
         assert!(
             self.resource.is_none(),
             "EGL resource owner cannot track two share-group roots"
@@ -66,7 +66,7 @@ impl EglRuntime {
         self.resource = Some((context, surface));
     }
 
-    pub(super) fn untrack_resource(&mut self) -> Option<(egl::Context, egl::Surface)> {
+    pub(super) fn untrack_resource(&mut self) -> Option<(egl::Context, Option<egl::Surface>)> {
         self.resource.take()
     }
 
@@ -94,9 +94,11 @@ impl EglRuntime {
             let _ = instance.make_current(display, None, None, None);
         });
         if let Some((context, surface)) = resource {
-            ignore_driver_panic(&mut || {
-                let _ = instance.destroy_surface(display, surface);
-            });
+            if let Some(surface) = surface {
+                ignore_driver_panic(&mut || {
+                    let _ = instance.destroy_surface(display, surface);
+                });
+            }
             ignore_driver_panic(&mut || {
                 let _ = instance.destroy_context(display, context);
             });
@@ -172,6 +174,14 @@ pub(super) struct EglInitResult {
     pub egl: EglRuntime,
     pub display: egl::Display,
     pub config: egl::Config,
+    /// Whether the share group's offscreen contexts have no surface at all.
+    ///
+    /// False everywhere a config supports both window and pbuffer surfaces,
+    /// which is every platform that shipped before Wayland. True only on a
+    /// driver that publishes no pbuffer config -- Mesa's Wayland platform
+    /// publishes thirty configs and not one of them is pbuffer-capable -- where
+    /// the offscreen contexts are made current against EGL_NO_SURFACE instead.
+    pub surfaceless: bool,
     /// The GLES version actually negotiated (3 = ES 3.0+, 2 = ES 2.0 fallback).
     pub gles_major: u32,
     /// Whether the driver supports `EGL_EXT_create_context_robustness` so
@@ -256,9 +266,7 @@ pub(super) fn init_egl(provider: &dyn EglProvider) -> EngineResult<EglInitResult
         },
     ];
 
-    let mut config = None;
-    let mut gles_major = 2u32;
-    for c in &candidates {
+    let pick = |surface_type: egl::Int, c: &ConfigCandidate| {
         let attrs = [
             egl::RED_SIZE,
             8,
@@ -273,18 +281,79 @@ pub(super) fn init_egl(provider: &dyn EglProvider) -> EngineResult<EglInitResult
             egl::STENCIL_SIZE,
             c.stencil,
             egl::SURFACE_TYPE,
-            egl::WINDOW_BIT | egl::PBUFFER_BIT,
+            surface_type,
             egl::RENDERABLE_TYPE,
             c.renderable,
             egl::NONE,
         ];
-        if let Ok(Some(cfg)) = egl.choose_first_config(display, &attrs) {
+        egl.choose_first_config(display, &attrs).ok().flatten()
+    };
+
+    // A config that serves both surface types is still asked for first, and
+    // found on every platform that shipped before Wayland -- so those keep
+    // selecting exactly the config they selected before this fallback existed.
+    let mut config = None;
+    let mut gles_major = 2u32;
+    let mut surfaceless = false;
+    for c in &candidates {
+        if let Some(cfg) = pick(egl::WINDOW_BIT | egl::PBUFFER_BIT, c) {
             config = Some(cfg);
             gles_major = c.gles_major;
             break;
         }
     }
+
+    if config.is_none() {
+        // No pbuffer config anywhere. The offscreen contexts can still exist
+        // without a surface, but only if the driver says so -- making a context
+        // current against EGL_NO_SURFACE without the extension is an error, and
+        // a clear refusal here beats one at the first canvas.
+        let extensions = egl
+            .query_string(Some(display), egl::EXTENSIONS)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if extensions.contains("EGL_KHR_surfaceless_context") {
+            for c in &candidates {
+                if let Some(cfg) = pick(egl::WINDOW_BIT, c) {
+                    tracing::info!(
+                        "no pbuffer-capable EGL config; offscreen contexts will be surfaceless"
+                    );
+                    config = Some(cfg);
+                    gles_major = c.gles_major;
+                    surfaceless = true;
+                    break;
+                }
+            }
+        }
+    }
     let config = config.ok_or_else(|| {
+        // Reached when no candidate offers a window config at all, or offers
+        // one without a pbuffer while the driver also lacks
+        // EGL_KHR_surfaceless_context.
+        //
+        // Historical note, because the shape of the fallback above is otherwise
+        // hard to justify: on Wayland every candidate above asks for
+        // WINDOW_BIT | PBUFFER_BIT, and Mesa's Wayland platform offers no
+        // pbuffer config at all. Enumerated against a live compositor: 30
+        // configs, 30 window-capable, 0 pbuffer-capable.
+        //
+        // Two fixes were tried against that fact and neither works:
+        //
+        //  * Relaxing the mask to WINDOW_BIT gets a window and then breaks the
+        //    resource context, the upload thread and every offscreen canvas,
+        //    which build their surfaces from this same config. Offscreen
+        //    canvases are not optional -- bunnymark makes its sprite textures
+        //    with `createCanvas`.
+        //  * Choosing two configs, one window and one pbuffer, cannot help
+        //    either: with zero pbuffer configs published there is no second one
+        //    to choose. That fallback would be dead code on the only platform
+        //    it was written for.
+        //
+        // The fix, implemented above, is to stop needing a pbuffer:
+        // `EGL_KHR_surfaceless_context` lets the resource, upload and offscreen
+        // contexts be made current against EGL_NO_SURFACE. Everything they draw
+        // already goes to an FBO, so the pbuffer was never a render target --
+        // only something for eglMakeCurrent to accept.
         ee(
             ErrorCode::RenderChooseConfigError,
             "all EGL config candidates failed",
@@ -316,6 +385,7 @@ pub(super) fn init_egl(provider: &dyn EglProvider) -> EngineResult<EglInitResult
         egl: EglRuntime::new(egl, display),
         display,
         config,
+        surfaceless,
         gles_major,
         has_robust_context,
     })
@@ -359,7 +429,8 @@ pub(super) fn create_pbuffer_context(
     height: u32,
     gles_major: u32,
     has_robust_context: bool,
-) -> EngineResult<(egl::Context, egl::Surface)> {
+    surfaceless: bool,
+) -> EngineResult<(egl::Context, Option<egl::Surface>)> {
     let ctx_attribs = build_ctx_attribs(gles_major, has_robust_context);
 
     egl.bind_api(egl::OPENGL_ES_API).map_err(|e| {
@@ -379,21 +450,30 @@ pub(super) fn create_pbuffer_context(
         })?;
     let context_cleanup = ContextCleanupGuard::new(egl, display, ctx);
 
-    let pbuf_attribs = [
-        egl::WIDTH as i32,
-        width as i32,
-        egl::HEIGHT as i32,
-        height as i32,
-        egl::NONE as i32,
-    ];
-    let surf = egl
-        .create_pbuffer_surface(display, config, &pbuf_attribs)
-        .map_err(|e| {
-            ee(
-                ErrorCode::RenderBackendError,
-                format!("eglCreatePbufferSurface failed: {e:?}"),
-            )
-        })?;
+    // Surfaceless means exactly that: no pbuffer is created, and the caller
+    // makes this context current against EGL_NO_SURFACE. Everything drawn
+    // through it already goes to an FBO, so the pbuffer was never a render
+    // target -- only something for eglMakeCurrent to accept.
+    let surf = if surfaceless {
+        None
+    } else {
+        let pbuf_attribs = [
+            egl::WIDTH as i32,
+            width as i32,
+            egl::HEIGHT as i32,
+            height as i32,
+            egl::NONE as i32,
+        ];
+        Some(
+            egl.create_pbuffer_surface(display, config, &pbuf_attribs)
+                .map_err(|e| {
+                    ee(
+                        ErrorCode::RenderBackendError,
+                        format!("eglCreatePbufferSurface failed: {e:?}"),
+                    )
+                })?,
+        )
+    };
     let ctx = context_cleanup.disarm();
 
     Ok((ctx, surf))

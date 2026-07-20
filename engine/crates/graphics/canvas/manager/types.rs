@@ -557,7 +557,9 @@ pub(crate) struct TransformFeedbackMeta {
 #[derive(Clone)]
 pub(super) struct EglContextHandle {
     pub ctx: egl::Context,
-    pub surf: egl::Surface,
+    /// `None` when the share group is surfaceless; see
+    /// `EglInitResult::surfaceless`.
+    pub surf: Option<egl::Surface>,
 }
 
 #[derive(Clone, Copy)]
