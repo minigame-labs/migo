@@ -1,10 +1,11 @@
-//! The soft keyboard's inbound half.
+//! Keyboard input, inbound.
 //!
-//! One entry point carrying the wx keyboard model: the value a text event
-//! carries is the field's whole current text, not the keystroke that changed
-//! it, because that is what `HostCommand::OnKeyboardInput` means and what
-//! content reads. A host that sends only the newly typed character leaves
-//! content whose text never grows past one character.
+//! Two capabilities that share a noun and nothing else. The soft keyboard is
+//! text: the host owns an IME and reports the field's whole current value, not
+//! the keystroke that changed it -- a host that sends only the newly typed
+//! character leaves content whose text never grows past one character. A
+//! physical key is a discrete press of an identified key. Content reads the two
+//! through different listeners.
 
 use core::send_command_to_host;
 use shared::protocol::host_cmd::HostCommand;
@@ -87,6 +88,117 @@ unsafe fn to_host_command(event: &MigoKeyboardEvent) -> Result<HostCommand, Migo
     }
 }
 
+/// `MIGO_KEY_EVENT_*` from `include/migo/input.h`.
+const MIGO_KEY_EVENT_DOWN: u32 = 0;
+const MIGO_KEY_EVENT_UP: u32 = 1;
+
+#[repr(C)]
+pub struct MigoKeyEvent {
+    pub(crate) header: VersionedHeader,
+    pub(crate) event_type: u32,
+    pub(crate) key_length: u32,
+    pub(crate) key_utf8: *const std::os::raw::c_char,
+    pub(crate) code_utf8: *const std::os::raw::c_char,
+    pub(crate) code_length: u32,
+    pub(crate) reserved0: u32,
+    pub(crate) timestamp_ms: f64,
+}
+
+/// Translate a validated physical-key event into the engine's command.
+///
+/// # Safety
+/// `key_utf8` and `code_utf8` must each point at their announced number of
+/// readable bytes.
+unsafe fn to_key_command(event: &MigoKeyEvent) -> Result<HostCommand, MigoResult> {
+    if event.event_type != MIGO_KEY_EVENT_DOWN && event.event_type != MIGO_KEY_EVENT_UP {
+        return Err(MIGO_ERROR_INVALID_ARGUMENT);
+    }
+    if !event.timestamp_ms.is_finite() {
+        return Err(MIGO_ERROR_INVALID_ARGUMENT);
+    }
+    // An empty `key` is legitimate -- a dead key produces no text -- but `code`
+    // always identifies a physical key, so an empty one means the host has not
+    // filled it in rather than that the key has no identity.
+    let key = unsafe { copy_utf8_with_length(event.key_utf8, event.key_length) }?;
+    let code = unsafe { copy_utf8_with_length(event.code_utf8, event.code_length) }?;
+    if code.is_empty() {
+        return Err(MIGO_ERROR_INVALID_ARGUMENT);
+    }
+
+    let timestamp_ms = event.timestamp_ms;
+    Ok(if event.event_type == MIGO_KEY_EVENT_DOWN {
+        HostCommand::OnKeyDown {
+            key,
+            code,
+            timestamp_ms,
+        }
+    } else {
+        HostCommand::OnKeyUp {
+            key,
+            code,
+            timestamp_ms,
+        }
+    })
+}
+
+/// The session's live host, or the reason there is not one.
+///
+/// Shared by both entry points so the state checks cannot drift: reporting
+/// success with nothing attached would tell a host its event was delivered when
+/// there is no content to deliver it to.
+fn attached_host(session: &MigoSession) -> Result<i32, MigoResult> {
+    let Ok(state) = session.state.lock() else {
+        return Err(MIGO_ERROR_INTERNAL);
+    };
+    if !state.attached {
+        return Err(MIGO_ERROR_INVALID_STATE);
+    }
+    state.host.ok_or(MIGO_ERROR_INVALID_STATE)
+}
+
+/// Deliver one physical key press or release to the session's content.
+///
+/// # Safety
+/// `session` must be live; `event` must point at a `MigoKeyEvent` whose two
+/// strings each hold at least their announced length. All are borrowed for the
+/// duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn migo_session_send_key_event(
+    session: *mut MigoSession,
+    event: *const MigoKeyEvent,
+) -> MigoResult {
+    guard("migo_session_send_key_event", || {
+        let Some(session) = (unsafe { session.as_ref() }) else {
+            return MIGO_ERROR_INVALID_ARGUMENT;
+        };
+        if let Err(error) = unsafe {
+            validate_header(event as *const VersionedHeader, size_of::<MigoKeyEvent>())
+        } {
+            return error;
+        }
+        let event = unsafe { &*event };
+
+        let command = match unsafe { to_key_command(event) } {
+            Ok(command) => command,
+            Err(error) => return error,
+        };
+        let host = match attached_host(session) {
+            Ok(host) => host,
+            Err(error) => return error,
+        };
+
+        // A dropped UP leaves content believing the key is still held, and no
+        // later event corrects it.
+        match send_command_to_host(host, command) {
+            Ok(()) => MIGO_OK,
+            Err(error) => {
+                tracing::debug!("migo_session_send_key_event: not delivered: {error}");
+                MIGO_ERROR_WOULD_BLOCK
+            }
+        }
+    })
+}
+
 /// Deliver one soft-keyboard event to the session's content.
 ///
 /// # Safety
@@ -119,17 +231,9 @@ pub unsafe extern "C" fn migo_session_send_keyboard_event(
             Err(error) => return error,
         };
 
-        let host = {
-            let Ok(state) = session.state.lock() else {
-                return MIGO_ERROR_INTERNAL;
-            };
-            if !state.attached {
-                return MIGO_ERROR_INVALID_STATE;
-            }
-            match state.host {
-                Some(host) => host,
-                None => return MIGO_ERROR_INVALID_STATE,
-            }
+        let host = match attached_host(session) {
+            Ok(host) => host,
+            Err(error) => return error,
         };
 
         // Dropping a COMPLETE would leave content believing the keyboard is
@@ -175,6 +279,149 @@ mod tests {
             value_utf8: std::ptr::null(),
             height_css_px: height,
         }
+    }
+
+    fn key_event(kind: u32, key: &str, code: &str) -> MigoKeyEvent {
+        MigoKeyEvent {
+            header: VersionedHeader {
+                struct_size: size_of::<MigoKeyEvent>() as u32,
+                abi_version: MIGO_ABI_VERSION_CURRENT,
+            },
+            event_type: kind,
+            key_length: key.len() as u32,
+            key_utf8: key.as_ptr() as *const std::os::raw::c_char,
+            code_utf8: code.as_ptr() as *const std::os::raw::c_char,
+            code_length: code.len() as u32,
+            reserved0: 0,
+            timestamp_ms: 1234.0,
+        }
+    }
+
+    /// `key` and `code` are different values and must not be swapped: a host
+    /// that sends `code` in both leaves content reading "KeyA" as typed text.
+    /// Distinct values on each side are what makes a swap show up here rather
+    /// than in a game.
+    #[test]
+    fn down_and_up_carry_key_and_code_in_the_right_places() {
+        for (kind, expect_down) in [(MIGO_KEY_EVENT_DOWN, true), (MIGO_KEY_EVENT_UP, false)] {
+            let event = key_event(kind, "a", "KeyA");
+            match unsafe { to_key_command(&event) }.expect("well-formed") {
+                HostCommand::OnKeyDown { key, code, timestamp_ms } => {
+                    assert!(expect_down, "a down arm produced an up command");
+                    assert_eq!(key, "a");
+                    assert_eq!(code, "KeyA");
+                    assert_eq!(timestamp_ms, 1234.0);
+                }
+                HostCommand::OnKeyUp { key, code, .. } => {
+                    assert!(!expect_down, "an up arm produced a down command");
+                    assert_eq!(key, "a");
+                    assert_eq!(code, "KeyA");
+                }
+                other => panic!("expected a key command, got {other:?}"),
+            }
+        }
+    }
+
+    /// A dead key produces no text, so an empty `key` is a real event.
+    #[test]
+    fn an_empty_key_is_valid_because_some_keys_produce_no_text() {
+        let event = key_event(MIGO_KEY_EVENT_DOWN, "", "Backquote");
+        match unsafe { to_key_command(&event) }.expect("well-formed") {
+            HostCommand::OnKeyDown { key, code, .. } => {
+                assert_eq!(key, "");
+                assert_eq!(code, "Backquote");
+            }
+            other => panic!("expected a key down, got {other:?}"),
+        }
+    }
+
+    /// `code` always identifies a physical key, so an empty one means the host
+    /// did not fill it in -- not that the key has no identity.
+    #[test]
+    fn an_empty_code_is_rejected() {
+        let event = key_event(MIGO_KEY_EVENT_DOWN, "a", "");
+        assert_eq!(
+            unsafe { to_key_command(&event) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_event_type_is_rejected() {
+        assert_eq!(
+            unsafe { to_key_command(&key_event(99, "a", "KeyA")) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+    }
+
+    #[test]
+    fn a_non_finite_key_timestamp_is_rejected() {
+        let mut event = key_event(MIGO_KEY_EVENT_DOWN, "a", "KeyA");
+        event.timestamp_ms = f64::NAN;
+        assert_eq!(
+            unsafe { to_key_command(&event) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+    }
+
+    #[test]
+    fn a_key_event_with_a_null_string_is_rejected() {
+        let mut null_key = key_event(MIGO_KEY_EVENT_DOWN, "a", "KeyA");
+        null_key.key_utf8 = std::ptr::null();
+        assert_eq!(
+            unsafe { to_key_command(&null_key) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+
+        let mut null_code = key_event(MIGO_KEY_EVENT_DOWN, "a", "KeyA");
+        null_code.code_utf8 = std::ptr::null();
+        assert_eq!(
+            unsafe { to_key_command(&null_code) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+    }
+
+    /// Only the announced lengths are read: a host may hold either string in a
+    /// larger buffer with no NUL, and reading past would leak its memory into
+    /// content.
+    #[test]
+    fn only_the_announced_key_lengths_are_read() {
+        let mut event = key_event(MIGO_KEY_EVENT_DOWN, "abcdef", "KeyAxxxx");
+        event.key_length = 1;
+        event.code_length = 4;
+        match unsafe { to_key_command(&event) }.expect("well-formed") {
+            HostCommand::OnKeyDown { key, code, .. } => {
+                assert_eq!(key, "a");
+                assert_eq!(code, "KeyA");
+            }
+            other => panic!("expected a key down, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_key_without_an_attached_surface_reports_invalid_state() {
+        with_session("key-detached", |session| {
+            let event = key_event(MIGO_KEY_EVENT_DOWN, "a", "KeyA");
+            assert_eq!(
+                unsafe { migo_session_send_key_event(session, &event) },
+                MIGO_ERROR_INVALID_STATE
+            );
+        });
+    }
+
+    #[test]
+    fn send_key_rejects_a_null_session_and_a_null_event() {
+        let event = key_event(MIGO_KEY_EVENT_DOWN, "a", "KeyA");
+        assert_eq!(
+            unsafe { migo_session_send_key_event(std::ptr::null_mut(), &event) },
+            MIGO_ERROR_INVALID_ARGUMENT
+        );
+        with_session("key-null-event", |session| {
+            assert_eq!(
+                unsafe { migo_session_send_key_event(session, std::ptr::null()) },
+                MIGO_ERROR_INVALID_ARGUMENT
+            );
+        });
     }
 
     /// Each event type must reach the matching engine command carrying its

@@ -109,9 +109,16 @@ The candidate cannot be declared stable until all of the following exist:
   and `migo_session_send_keyboard_event` carries input/confirm/complete/height back on the
   path Android already drives. The host's keyboard wins over the platform's, because
   Android's own accessor claims one unconditionally and reaches a JVM a pure-native host has
-  not got. **Open**: physical keys (`OnKeyDown`/`OnKeyUp` exist in the engine but have no C
-  contract yet) and IME composition, which the engine cannot represent today because wx has
-  no model for a preedit string. Gamepad **open**;
+  not got. **physical keys done**: `migo_session_send_key_event` carries DOM `key`/`code` and a
+  timestamp on the engine's existing `OnKeyDown`/`OnKeyUp` path. Not batched, unlike touch --
+  keys arrive at typing speed, so a batch API would be shape without a requirement. The host
+  translates its platform keycodes into DOM values, because a portable runtime that accepted
+  platform codes would have to carry a mapping per platform. **Open**: IME composition, which
+  is engine work before it is ABI work -- there is no way to represent a preedit string
+  because wx has none, so there is nothing for a contract to carry. Gamepad **open, and also
+  engine work first**: there is no `Gamepad` anywhere in `engine/crates` -- no JS API, no
+  `HostCommand`, no dispatch -- so unlike the keyboard, where the engine was complete and only
+  the C entry point was missing, there is nothing yet to write a contract against;
 - asynchronous request IDs, cancellation races, and late-completion rules — **settled for
   v1**: v1 has exactly one asynchronous operation and it is single-shot per Session, so
   there is nothing to correlate and no request ID to carry. The rules are normative under

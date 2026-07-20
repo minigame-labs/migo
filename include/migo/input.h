@@ -156,6 +156,74 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_keyboard_event(
     MigoSession *session,
     const MigoKeyboardEvent *event);
 
+/*
+ * Physical keys.
+ *
+ * A different capability from the soft keyboard above, despite the shared word.
+ * The soft keyboard is text: the host owns an IME and reports the field's whole
+ * current value. This is a discrete press of an identified key, and content
+ * reads the two through different listeners.
+ *
+ * Not batched, unlike touch: keys arrive at human typing speed, one at a time,
+ * so a batch API would be shape without a requirement.
+ */
+typedef uint32_t MigoKeyEventType;
+#define MIGO_KEY_EVENT_DOWN UINT32_C(0)
+#define MIGO_KEY_EVENT_UP UINT32_C(1)
+
+/*
+ * key and code are DOM values, and they are NOT interchangeable:
+ *
+ *   code  identifies the physical key   -- "KeyA", "ArrowLeft", "Escape"
+ *   key   is what it produces, given the current modifiers and layout
+ *                                       -- "a", "A", "ArrowLeft"
+ *
+ * A host has platform keycodes -- AKEYCODE_A, an X11 keysym -- and translating
+ * them is the host's work. That table lives here rather than in Migo because a
+ * portable runtime that accepted platform codes would have to carry a mapping
+ * per platform. Sending code in both fields is the likely mistake, and it
+ * produces content that reads "KeyA" as typed text.
+ *
+ * An empty key is legitimate: a dead key produces no text. An empty code is
+ * rejected, because a code always identifies something.
+ *
+ * Both strings are length-delimited, need not be NUL-terminated, and are
+ * borrowed for the duration of the call.
+ */
+typedef struct MigoKeyEvent {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    MigoKeyEventType event_type;
+    uint32_t key_length;
+    const char *key_utf8;
+    const char *code_utf8;
+    uint32_t code_length;
+    uint32_t reserved0;
+    double timestamp_ms;
+} MigoKeyEvent;
+
+MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+#if MIGO_LP64
+MIGO_STATIC_ASSERT(sizeof(MigoKeyEvent) == 48, "MigoKeyEvent LP64 size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, key_utf8) == 16, "MigoKeyEvent.key_utf8 moved");
+MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, code_utf8) == 24, "MigoKeyEvent.code_utf8 moved");
+MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, timestamp_ms) == 40,
+                   "MigoKeyEvent.timestamp_ms moved");
+#endif
+
+/*
+ * Deliver one key press or release. Callable from any thread; ordering between
+ * concurrent calls is the host's to guarantee.
+ *
+ * A full queue is reported as MIGO_ERROR_WOULD_BLOCK rather than swallowed: a
+ * dropped UP leaves content believing the key is still held, and no later event
+ * corrects it.
+ */
+MIGO_API MigoResult MIGO_CALL migo_session_send_key_event(
+    MigoSession *session,
+    const MigoKeyEvent *event);
+
 MIGO_END_DECLS
 
 #endif /* MIGO_INPUT_H */

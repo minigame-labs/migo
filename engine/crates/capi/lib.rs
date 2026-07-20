@@ -28,7 +28,10 @@ mod test_support;
 // The surface entry points and the descriptors they read live in their
 // own module; re-exported so the crate's public surface is unchanged.
 pub use input::{migo_session_send_touch, MigoTouchEvent, MigoTouchPoint};
-pub use keyboard::{migo_session_send_keyboard_event, MigoKeyboardEvent};
+pub use keyboard::{
+    migo_session_send_key_event, migo_session_send_keyboard_event, MigoKeyEvent,
+    MigoKeyboardEvent,
+};
 pub use surface::{
     migo_session_attach_surface, migo_surface_detach, migo_surface_update,
     MigoAndroidNativeWindowDescriptor, MigoSurfaceAttachment, MigoSurfaceDescriptor,

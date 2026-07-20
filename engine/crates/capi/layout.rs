@@ -26,7 +26,7 @@ use crate::{
     capabilities::MigoCapabilities,
     callbacks::{MigoError, MigoHostCallbacks, MigoKeyboardShowOptions},
     input::{MigoTouchEvent, MigoTouchPoint},
-    keyboard::MigoKeyboardEvent,
+    keyboard::{MigoKeyEvent, MigoKeyboardEvent},
     surface::{
         MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
         MigoX11WindowDescriptor,
@@ -63,6 +63,7 @@ header_is_first!(
     MigoTouchEvent,
     MigoKeyboardEvent,
     MigoKeyboardShowOptions,
+    MigoKeyEvent,
 );
 
 // The header itself. Two `u32`s, in this order, on every target: it is the one
@@ -197,4 +198,17 @@ mod lp64 {
     const _: () = assert!(offset_of!(MigoKeyboardEvent, value_length) == 12);
     const _: () = assert!(offset_of!(MigoKeyboardEvent, value_utf8) == 16);
     const _: () = assert!(offset_of!(MigoKeyboardEvent, height_css_px) == 24);
+
+    // Two pointers with a u32 on either side: `code_length` and `reserved0`
+    // share the slot after the second pointer, and the f64 lands last. A
+    // reordering that put both lengths together would still size to 48 while
+    // moving every field the copy depends on.
+    const _: () = assert!(size_of::<MigoKeyEvent>() == 48);
+    const _: () = assert!(offset_of!(MigoKeyEvent, event_type) == 8);
+    const _: () = assert!(offset_of!(MigoKeyEvent, key_length) == 12);
+    const _: () = assert!(offset_of!(MigoKeyEvent, key_utf8) == 16);
+    const _: () = assert!(offset_of!(MigoKeyEvent, code_utf8) == 24);
+    const _: () = assert!(offset_of!(MigoKeyEvent, code_length) == 32);
+    const _: () = assert!(offset_of!(MigoKeyEvent, reserved0) == 36);
+    const _: () = assert!(offset_of!(MigoKeyEvent, timestamp_ms) == 40);
 }
