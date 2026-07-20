@@ -18,6 +18,7 @@ import HTMLElement, { Node, Element, HTMLImageElement, HTMLCanvasElement,
                        HTMLAudioElement, HTMLMediaElement, HTMLVideoElement } from "./element.js";
 import EventTarget from "./event-target.js";
 import { Event, TouchEvent, MouseEvent, DeviceMotionEvent } from "./events.js";
+import { GamepadEvent, connectGamepadEvents } from "./gamepad.js";
 import Image from "./image.js";
 import Canvas from "./canvas.js";
 import Audio from "./audio.js";
@@ -61,6 +62,15 @@ if (!globalThis.__migoAdapterInjected) {
   if (typeof migo.onTouchEnd === "function") migo.onTouchEnd(_forward("touchend"));
   if (typeof migo.onTouchCancel === "function") migo.onTouchCancel(_forward("touchcancel"));
 
+  // 2b. Gamepad connection events. Browsers fire these on window only -- not on
+  //     document and not on the canvas -- so unlike touch above this routes to
+  //     exactly one target.
+  connectGamepadEvents((event) => {
+    _winTarget.dispatchEvent(event);
+    const sink = globalThis["on" + event.type];
+    if (typeof sink === "function") try { sink(event); } catch {}
+  });
+
   // 3. Patch the document → window self-reference.
   document.documentElement = globalThis;
 
@@ -82,7 +92,7 @@ if (!globalThis.__migoAdapterInjected) {
     HTMLElement, Element, Node,
     HTMLImageElement, HTMLCanvasElement, HTMLAudioElement,
     HTMLMediaElement, HTMLVideoElement,
-    EventTarget, Event, TouchEvent, MouseEvent, DeviceMotionEvent,
+    EventTarget, Event, TouchEvent, MouseEvent, DeviceMotionEvent, GamepadEvent,
     Image, Audio,
     XMLHttpRequest, WebSocket, FileReader,
     localStorage,

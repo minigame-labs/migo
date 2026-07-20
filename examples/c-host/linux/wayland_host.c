@@ -105,6 +105,52 @@ static int wl_fail(const char *what, MigoResult result) {
     return 1;
 }
 
+#define WL_RELEASE_TIMEOUT_MS 2000
+#define WL_RELEASE_POLL_MS 4
+
+/*
+ * Retire the attachment and wait for the compositor-side resources to be free.
+ *
+ * Same rule as X11 -- begin_detach starts retirement rather than completing it,
+ * so wl_surface_destroy before RELEASED is a use-after-free -- but the wait
+ * itself must differ. Releasing a Wayland buffer can require round-trips with
+ * the compositor, so a wait that only sleeps can stall until the timeout while
+ * the reply sits unread in the queue. This keeps dispatching the display, which
+ * is the same reason the main loop does not simply sleep either.
+ */
+static int wl_detach_and_await_release(struct wl_display *display,
+                                       MigoSurfaceAttachment *attachment) {
+    MigoSurfaceRelease *release = NULL;
+    MigoResult result = migo_surface_begin_detach(attachment, &release);
+    if (result != MIGO_OK) return wl_fail("migo_surface_begin_detach", result);
+
+    for (long waited = 0; waited < WL_RELEASE_TIMEOUT_MS; waited += WL_RELEASE_POLL_MS) {
+        MigoSurfaceReleaseStatus status;
+        memset(&status, 0, sizeof status);
+        status.struct_size = (uint32_t)sizeof status;
+        status.abi_version = MIGO_ABI_VERSION_CURRENT;
+        result = migo_surface_release_query(release, &status);
+        if (result != MIGO_OK) return wl_fail("migo_surface_release_query", result);
+        if (status.state == MIGO_SURFACE_RELEASE_RELEASED) {
+            result = migo_surface_release_destroy(release);
+            if (result != MIGO_OK) return wl_fail("migo_surface_release_destroy", result);
+            return 0;
+        }
+
+        wl_display_flush(display);
+        struct pollfd pfd = {wl_display_get_fd(display), POLLIN, 0};
+        if (poll(&pfd, 1, WL_RELEASE_POLL_MS) > 0 && (pfd.revents & POLLIN)) {
+            wl_display_dispatch(display);
+        } else {
+            wl_display_dispatch_pending(display);
+        }
+    }
+
+    /* Leaked on purpose; see the X11 host for why discarding the observer is
+     * worse than leaking it. */
+    return wl_fail("surface release timed out", MIGO_ERROR_INTERNAL);
+}
+
 /* Declared in main.c; shared so both hosts report the engine identically. */
 MigoResult MIGO_CALL wl_dispatch_inline(void *dispatcher_context, MigoTaskFn task,
                                         void *task_context);
@@ -278,8 +324,7 @@ int run_wayland_host(const char *files_dir, const char *content_id, int seconds)
         wl_display_dispatch_pending(h.display);
     }
 
-    result = migo_surface_detach(attachment);
-    if (result != MIGO_OK) return wl_fail("migo_surface_detach", result);
+    if (wl_detach_and_await_release(h.display, attachment) != 0) return 1;
     result = migo_session_destroy(session);
     if (result != MIGO_OK) return wl_fail("migo_session_destroy", result);
     result = migo_engine_destroy(engine);

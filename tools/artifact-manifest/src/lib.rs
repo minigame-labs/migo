@@ -16,6 +16,17 @@ pub const SLICE_SCHEMA_V1: &str = "migo-artifact-manifest/v1";
 pub const V8_COMPONENT_SCHEMA_V1: &str = "migo-v8-component-manifest/v1";
 pub const PACKAGE_INDEX_SCHEMA_V1: &str = "migo-artifact-package-index/v1";
 pub const RELEASE_ATTESTATION_SCHEMA_V1: &str = "migo-release-attestation/v1";
+pub const LINUX_PACKAGE_SCHEMA_V1: &str = "migo-linux-package-v1";
+
+/// Loader ABI floor for the Linux GNU slice.
+///
+/// These are policy, not measurement: the build is pinned to a Debian bullseye
+/// sysroot and the SDK contract audits the shipped binaries for any `GLIBC_*` or
+/// `GLIBCXX_*` requirement above them. Measured values today sit below both
+/// (2.27 / 3.4.26), and the headroom is deliberate -- the floor is what is
+/// promised to consumers, so it may only be raised as a breaking change.
+pub const LINUX_GLIBC_FLOOR: &str = "2.31";
+pub const LINUX_GLIBCXX_FLOOR: &str = "3.4.28";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -133,6 +144,56 @@ pub struct V8ComponentHashes {
     pub rust_binding: String,
 }
 
+/// One shipped Linux GNU slice.
+///
+/// Kept separate from [`SliceManifest`] rather than folded into it. The Android
+/// slice pins an `android_api` floor and always carries a snapshot; the Linux
+/// one pins glibc and GLIBCXX floors and currently carries none. Widening the
+/// Android type to accommodate both would have made every one of those fields
+/// optional, which is precisely how a missing floor becomes unnoticeable.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxPackageManifest {
+    pub schema: String,
+    pub version: String,
+    pub target: String,
+    pub os: String,
+    pub abi: String,
+    pub arch: String,
+    pub cpu_baseline: String,
+    pub required_cpu_features: Vec<String>,
+    pub glibc_floor: String,
+    pub glibcxx_floor: String,
+    pub sysroot: String,
+    pub dynamic_dependencies: Vec<String>,
+    pub snapshot_policy: String,
+    pub snapshots: Vec<LinuxSnapshotIdentity>,
+    pub v8: LinuxV8Provenance,
+    pub artifacts: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxSnapshotIdentity {
+    pub runtime_kind: String,
+    pub target_triple: String,
+    pub arch: String,
+    pub normalized_parameters: Vec<String>,
+    pub bytes_hash: String,
+}
+
+/// The subset of the V8 component manifest the package copies in. Unknown
+/// fields are tolerated here, unlike everywhere else: this is a copy of another
+/// document that may legitimately gain fields of its own.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LinuxV8Provenance {
+    pub schema: String,
+    pub target: String,
+    pub rusty_v8_revision: String,
+    #[serde(flatten)]
+    pub rest: BTreeMap<String, Value>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SliceManifestSource {
     pub package_path: String,
@@ -239,6 +300,134 @@ pub fn validate_slice_manifest(manifest: &SliceManifest) -> Result<(), ManifestE
             "artifact_id mismatch (manifest={}, computed={expected})",
             manifest.artifact_id
         )));
+    }
+    Ok(())
+}
+
+/// Validate one Linux GNU package manifest.
+///
+/// The rule this exists to enforce is that a library and the things built into
+/// it must describe the same machine. A V8 archive compiled for another OS, ABI
+/// or architecture links successfully often enough to reach a user, and then
+/// fails as a crash with no provenance attached to it.
+pub fn validate_linux_package_manifest(
+    manifest: &LinuxPackageManifest,
+) -> Result<(), ManifestError> {
+    require_equal("schema", &manifest.schema, LINUX_PACKAGE_SCHEMA_V1)?;
+    require_non_placeholder("version", &manifest.version)?;
+    require_equal("target", &manifest.target, "x86_64-unknown-linux-gnu")?;
+    require_equal("os", &manifest.os, "linux")?;
+    // "linux" is a kernel, not an ABI. Android and OpenHarmony are Linux
+    // kernels with userspaces this package cannot load against.
+    require_equal("abi", &manifest.abi, "gnu")?;
+    require_equal("arch", &manifest.arch, "x86_64")?;
+    require_equal("cpu_baseline", &manifest.cpu_baseline, "x86-64-v1")?;
+    require_sorted_unique("required_cpu_features", &manifest.required_cpu_features)?;
+    if manifest.required_cpu_features != ["cmov", "sse2"] {
+        return Err(ManifestError::new(
+            "required_cpu_features for x86_64 must be [\"cmov\", \"sse2\"]",
+        ));
+    }
+    require_equal("glibc_floor", &manifest.glibc_floor, LINUX_GLIBC_FLOOR)?;
+    require_equal(
+        "glibcxx_floor",
+        &manifest.glibcxx_floor,
+        LINUX_GLIBCXX_FLOOR,
+    )?;
+    require_non_placeholder("sysroot", &manifest.sysroot)?;
+
+    if manifest.dynamic_dependencies.is_empty() {
+        return Err(ManifestError::new(
+            "dynamic_dependencies must list the shipped library's DT_NEEDED entries",
+        ));
+    }
+    require_sorted_unique("dynamic_dependencies", &manifest.dynamic_dependencies)?;
+    for dependency in &manifest.dynamic_dependencies {
+        require_non_placeholder("dynamic_dependencies", dependency)?;
+    }
+
+    validate_linux_snapshots(manifest)?;
+
+    require_equal("v8.schema", &manifest.v8.schema, "migo-v8-component-v1")?;
+    // The mixing check. Everything else in this function describes the package;
+    // this one compares the package against what was built into it.
+    if manifest.v8.target != manifest.target {
+        return Err(ManifestError::new(format!(
+            "v8.target {} does not match package target {}: a V8 built for one \
+             OS/ABI/arch cannot be shipped in a package for another",
+            manifest.v8.target, manifest.target
+        )));
+    }
+    require_revision("v8.rusty_v8_revision", &manifest.v8.rusty_v8_revision)?;
+
+    if manifest.artifacts.is_empty() {
+        return Err(ManifestError::new("artifacts must not be empty"));
+    }
+    for (name, size) in &manifest.artifacts {
+        require_non_placeholder("artifacts", name)?;
+        if *size == 0 {
+            return Err(ManifestError::new(format!(
+                "artifacts.{name} has size 0, which cannot be a shipped binary"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_linux_snapshots(manifest: &LinuxPackageManifest) -> Result<(), ManifestError> {
+    require_one_of(
+        "snapshot_policy",
+        &manifest.snapshot_policy,
+        &["none", "embedded"],
+    )?;
+    // Policy and content must agree. Stating the policy is what makes "ships no
+    // snapshot" a decision rather than an omission, and cross-checking it is
+    // what keeps the statement true once a snapshot is added.
+    match manifest.snapshot_policy.as_str() {
+        "none" if !manifest.snapshots.is_empty() => {
+            return Err(ManifestError::new(
+                "snapshot_policy is none but snapshots were listed",
+            ));
+        }
+        "embedded" if manifest.snapshots.is_empty() => {
+            return Err(ManifestError::new(
+                "snapshot_policy is embedded but no snapshot was listed",
+            ));
+        }
+        _ => {}
+    }
+
+    let mut kinds: HashSet<&str> = HashSet::new();
+    for snapshot in &manifest.snapshots {
+        require_one_of(
+            "snapshot.runtime_kind",
+            &snapshot.runtime_kind,
+            &["host", "worker"],
+        )?;
+        if !kinds.insert(snapshot.runtime_kind.as_str()) {
+            return Err(ManifestError::new(format!(
+                "duplicate snapshot runtime_kind: {}",
+                snapshot.runtime_kind
+            )));
+        }
+        // A snapshot is V8 machine code: one built for another triple or arch is
+        // not merely suboptimal, it is not loadable.
+        require_equal(
+            "snapshot.target_triple",
+            &snapshot.target_triple,
+            &manifest.target,
+        )?;
+        require_equal("snapshot.arch", &snapshot.arch, &manifest.arch)?;
+        require_sorted_unique(
+            "snapshot.normalized_parameters",
+            &snapshot.normalized_parameters,
+        )?;
+        if snapshot.normalized_parameters.is_empty() {
+            return Err(ManifestError::new(
+                "snapshot.normalized_parameters must record the generation parameters",
+            ));
+        }
+        require_sha256("snapshot.bytes_hash", &snapshot.bytes_hash)?;
     }
     Ok(())
 }

@@ -574,15 +574,62 @@ static void attach_window(struct host *h, ANativeWindow *window) {
     }
 }
 
+/* Long enough that a busy driver finishes, short enough that a stuck one shows
+ * up as a logged timeout instead of an ANR with no explanation. */
+#define RELEASE_TIMEOUT_MS 2000
+#define RELEASE_POLL_US 2000
+
+/*
+ * Retire the attachment and block until the ANativeWindow is genuinely unused.
+ *
+ * This must block, and it must block here. android_native_app_glue frees its
+ * reference to the window once the APP_CMD_TERM_WINDOW handler returns, so
+ * returning while the release is still pending hands a live window back to the
+ * framework while the GL driver may still be reading it. Blocking briefly on
+ * the app thread during teardown is the cheaper of the two costs.
+ *
+ * The observer is level-triggered, so a release completing before the first
+ * query is still observed; there is no window between begin and poll to lose.
+ */
 static void detach_window(struct host *h) {
     if (h->attachment == NULL) return;
-    MigoResult result = migo_surface_detach(h->attachment);
+
+    MigoSurfaceRelease *release = NULL;
+    MigoResult result = migo_surface_begin_detach(h->attachment, &release);
     if (result != MIGO_OK) {
-        LOGE("migo_surface_detach failed: %d", (int)result);
+        LOGE("migo_surface_begin_detach failed: %d", (int)result);
         return;
     }
+    /* Retirement is irreversible, so the attachment is gone regardless of how
+     * the wait below turns out. Clearing it now keeps a failed wait from
+     * leaving a dangling pointer that a later command would reuse. */
     h->attachment = NULL;
-    LOGI("detached");
+
+    for (long waited_us = 0; waited_us < RELEASE_TIMEOUT_MS * 1000L;
+         waited_us += RELEASE_POLL_US) {
+        MigoSurfaceReleaseStatus status;
+        memset(&status, 0, sizeof status);
+        status.struct_size = (uint32_t)sizeof status;
+        status.abi_version = MIGO_ABI_VERSION_CURRENT;
+        result = migo_surface_release_query(release, &status);
+        if (result != MIGO_OK) {
+            LOGE("migo_surface_release_query failed: %d", (int)result);
+            return;
+        }
+        if (status.state == MIGO_SURFACE_RELEASE_RELEASED) {
+            result = migo_surface_release_destroy(release);
+            if (result != MIGO_OK) {
+                LOGE("migo_surface_release_destroy failed: %d", (int)result);
+            }
+            LOGI("detached");
+            return;
+        }
+        usleep(RELEASE_POLL_US);
+    }
+
+    /* Leaked deliberately: it is the only remaining way to learn when the
+     * window becomes safe, and the framework is about to reclaim it anyway. */
+    LOGE("surface release timed out; window may still be in use by the driver");
 }
 
 static void update_surface(struct host *h, ANativeWindow *window) {

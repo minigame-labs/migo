@@ -78,7 +78,7 @@ game that *also* imports the ESM entry.
 | BOM scalars | `innerWidth`, `innerHeight`, `outerWidth`, `outerHeight`, `screenWidth`, `screenHeight`, `devicePixelRatio` |
 | BOM objects | `screen`, `navigator`, `location`, `document`, `localStorage` |
 | Window self-references | `window`, `self`, `parent`, `top` |
-| Constructors / classes | `Image`, `Audio`, `XMLHttpRequest`, `WebSocket`, `FileReader`, `HTMLElement`, `Element`, `Node`, `EventTarget`, `Event`, `TouchEvent`, `MouseEvent`, `DeviceMotionEvent`, `HTMLImageElement`, `HTMLCanvasElement`, `HTMLAudioElement`, `HTMLMediaElement`, `HTMLVideoElement` |
+| Constructors / classes | `Image`, `Audio`, `XMLHttpRequest`, `WebSocket`, `FileReader`, `HTMLElement`, `Element`, `Node`, `EventTarget`, `Event`, `TouchEvent`, `MouseEvent`, `DeviceMotionEvent`, `GamepadEvent`, `HTMLImageElement`, `HTMLCanvasElement`, `HTMLAudioElement`, `HTMLMediaElement`, `HTMLVideoElement` |
 | On-screen canvas | `globalThis.canvas` (also `document.getElementById("GameCanvas")`) |
 
 ## Mapping to `migo.*`
@@ -94,6 +94,8 @@ game that *also* imports the ESM entry.
 | `new XMLHttpRequest()` | `migo.request()` |
 | `new WebSocket(url)` | `migo.connectSocket()` |
 | `addEventListener('touchstart' …)` on `window`, `document`, `canvas` | `migo.onTouchStart` / `onTouchMove` / `onTouchEnd` / `onTouchCancel` |
+| `navigator.getGamepads()` | `migo.getGamepads()` — forwarded directly, so the returned pads keep their identity between frames |
+| `addEventListener('gamepadconnected' / 'gamepaddisconnected')` on `window` | `migo.onGamepadConnected` / `migo.onGamepadDisconnected` |
 
 ## BOM semantics
 
@@ -120,6 +122,7 @@ If you need any of the above, extend the adapter — the source is small, ESM, a
 src/
   index.js          entry — wires everything onto globalThis
   bom.js            innerWidth / innerHeight / screen / devicePixelRatio
+  gamepad.js        W3C Gamepad API over the migo gamepad transport
   navigator.js      navigator stub
   location.js       location stub
   document.js       document object (createElement, getElementById, …)

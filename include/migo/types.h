@@ -64,7 +64,37 @@
  * linked -- it cannot do otherwise, being a preprocessor macro. Ask
  * migo_query_capabilities (capabilities.h) about the library itself.
  */
-#if defined(__linux__)
+/*
+ * These three targets must be told apart before the question can be answered.
+ * Android and OpenHarmony both define __linux__ -- their kernels are Linux --
+ * so testing __linux__ alone silently answers for three different ABIs at once,
+ * and would claim a runtime on OpenHarmony, where none is built.
+ * __ANDROID__ comes from the NDK; OpenHarmony's toolchain defines __OHOS__.
+ * Order matters: the specific targets must be excluded before the generic one.
+ */
+#if defined(__ANDROID__)
+#define MIGO_PLATFORM_IS_ANDROID 1
+#else
+#define MIGO_PLATFORM_IS_ANDROID 0
+#endif
+
+#if defined(__OHOS__) || defined(__OHOS_FAMILY__)
+#define MIGO_PLATFORM_IS_OPENHARMONY 1
+#else
+#define MIGO_PLATFORM_IS_OPENHARMONY 0
+#endif
+
+/* Desktop Linux with glibc: what build-linux-sdk.sh targets. Deliberately not
+ * "any non-Android Linux" -- a musl or Bionic userspace is a different ABI with
+ * a different floor, and claiming this one for it would be a false promise. */
+#if defined(__linux__) && !MIGO_PLATFORM_IS_ANDROID && !MIGO_PLATFORM_IS_OPENHARMONY \
+    && defined(__GLIBC__)
+#define MIGO_PLATFORM_IS_LINUX_GNU 1
+#else
+#define MIGO_PLATFORM_IS_LINUX_GNU 0
+#endif
+
+#if MIGO_PLATFORM_IS_LINUX_GNU || MIGO_PLATFORM_IS_ANDROID
 #define MIGO_C_ABI_HAS_RUNTIME 1
 #else
 #define MIGO_C_ABI_HAS_RUNTIME 0

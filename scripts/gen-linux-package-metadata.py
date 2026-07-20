@@ -19,9 +19,19 @@ import sys
 _NOTE_RE = re.compile(r"native-static-libs:\s*(?P<libs>.+)")
 
 TARGET = "x86_64-unknown-linux-gnu"
+OS = "linux"
+ABI = "gnu"
+ARCH = "x86_64"
 CPU_BASELINE = "x86-64-v1"
+REQUIRED_CPU_FEATURES = ["cmov", "sse2"]
 GLIBC_FLOOR = "2.31"
 GLIBCXX_FLOOR = "3.4.28"
+
+# The Linux SDK links V8 without a startup snapshot. Stated rather than implied:
+# an absent key cannot be told apart from a forgotten one, and "no snapshot" is
+# exactly the claim a future Linux snapshot would have to stop making. The
+# validator requires the policy and the list to agree, so neither can drift.
+SNAPSHOT_POLICY = "none"
 
 
 def parse_native_static_libs(text: str) -> list[str]:
@@ -115,11 +125,21 @@ def render_manifest(*, version, needed, v8, sysroot, artifacts) -> dict:
         "schema": "migo-linux-package-v1",
         "version": version,
         "target": TARGET,
+        # os/abi/arch are carried separately from the triple so a consumer can
+        # reject a mismatch without parsing the triple. "linux" alone is not an
+        # ABI: Android and OpenHarmony are Linux kernels too, and a package built
+        # for one is not loadable on another.
+        "os": OS,
+        "abi": ABI,
+        "arch": ARCH,
         "cpu_baseline": CPU_BASELINE,
+        "required_cpu_features": sorted(REQUIRED_CPU_FEATURES),
         "glibc_floor": GLIBC_FLOOR,
         "glibcxx_floor": GLIBCXX_FLOOR,
         "sysroot": sysroot,
         "dynamic_dependencies": sorted(needed),
+        "snapshot_policy": SNAPSHOT_POLICY,
+        "snapshots": [],
         "v8": v8,
         "artifacts": artifacts,
     }

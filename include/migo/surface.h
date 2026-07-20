@@ -114,6 +114,39 @@ MIGO_STATIC_ASSERT(offsetof(MigoSurfaceDescriptor, platform_descriptor) == 64,
                    "MigoSurfaceDescriptor.platform_descriptor moved");
 #endif
 
+/*
+ * Opaque observer of one asynchronous native-Surface release.
+ *
+ * It owns no Surface resource lease, so it may outlive the Session that
+ * produced it. That is deliberate: the host needs an answer to "may I destroy
+ * my window now?" even along teardown paths that destroy the Session first.
+ */
+typedef struct MigoSurfaceRelease MigoSurfaceRelease;
+
+/* Level-triggered, not edge-triggered: a late first query still observes a
+ * release that already completed. An edge would be missable exactly once, on
+ * the path where missing it means destroying a window the GPU still reads. */
+typedef uint32_t MigoSurfaceReleaseState;
+#define MIGO_SURFACE_RELEASE_PENDING UINT32_C(0)
+#define MIGO_SURFACE_RELEASE_RELEASED UINT32_C(1)
+
+typedef struct MigoSurfaceReleaseStatus {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint64_t generation;
+    MigoSurfaceReleaseState state;
+    uint32_t reserved0;
+} MigoSurfaceReleaseStatus;
+
+MIGO_STATIC_ASSERT(sizeof(MigoSurfaceReleaseStatus) == 24,
+                   "MigoSurfaceReleaseStatus size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoSurfaceReleaseStatus, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+MIGO_STATIC_ASSERT(offsetof(MigoSurfaceReleaseStatus, generation) == 8,
+                   "MigoSurfaceReleaseStatus.generation moved");
+MIGO_STATIC_ASSERT(offsetof(MigoSurfaceReleaseStatus, state) == 16,
+                   "MigoSurfaceReleaseStatus.state moved");
+
 MIGO_BEGIN_DECLS
 
 MIGO_API MigoResult MIGO_CALL migo_session_attach_surface(
@@ -126,18 +159,61 @@ MIGO_API MigoResult MIGO_CALL migo_surface_update(
     const MigoSurfaceMetrics *metrics);
 
 /*
- * Synchronous completion boundary. attachment is a unique handle and must not
- * be copied into independently owned aliases. MIGO_OK consumes and releases
- * the handle: after return, the pointer is invalid and no future GPU operation
- * or presentation may reference its generation. Calling any API again through
- * that pointer is invalid. A non-OK result leaves ownership with the caller so
- * detach can be retried or the owning Session can be destroyed. Detach must not
- * enqueue or wait for another task through the host dispatcher. If required
- * platform-thread affinity is not satisfied, it returns MIGO_ERROR_WRONG_THREAD
- * before retiring the generation or changing ownership.
+ * Begin retiring one attachment. This is the irreversible presentation
+ * boundary, and it is asynchronous because the GPU cannot be made to forget a
+ * Surface synchronously: driver-side references outlive the call.
+ *
+ * attachment is a unique handle and must not be copied into independently owned
+ * aliases. MIGO_OK consumes it -- the pointer is invalid on return, no future
+ * GPU operation or presentation references its generation, and *out_release
+ * owns a new observer the caller must eventually destroy. out_release is set to
+ * NULL before any fallible work, so it is always well-defined to read.
+ *
+ * A non-OK result changes nothing and consumes nothing:
+ *   MIGO_ERROR_INVALID_ARGUMENT  attachment or out_release was NULL
+ *   MIGO_ERROR_INVALID_STATE     another Surface transition is already running,
+ *                                or the Session has no live host
+ *   MIGO_ERROR_STALE_SURFACE     attachment is not the Session's active one
+ *
+ * This call must not wait for another turn of the host dispatcher. It is
+ * callable from the thread that owns the Session; concurrent calls through the
+ * same Session are the caller's to serialize.
+ *
+ * THE HOST MUST NOT DESTROY THE NATIVE WINDOW HERE. Returning MIGO_OK means
+ * retirement started, not that the driver is finished. Keep the native
+ * resource and its event loop alive until migo_surface_release_query reports
+ * MIGO_SURFACE_RELEASE_RELEASED; destroying it earlier is a use-after-free
+ * inside the driver, which the engine cannot detect or prevent.
+ */
+MIGO_API MigoResult MIGO_CALL migo_surface_begin_detach(
+    MigoSurfaceAttachment *attachment,
+    MigoSurfaceRelease **out_release);
+
+/*
+ * Read the authoritative release state. Never blocks, so it is safe to poll
+ * from a UI thread or an event-loop idle handler.
+ *
+ * release stays valid and queryable after the owning Session is destroyed --
+ * that is the whole reason the observer holds no lease. Returns
+ * MIGO_ERROR_INVALID_ARGUMENT if either pointer is NULL. out_status is written
+ * only on MIGO_OK, never partially.
+ */
+MIGO_API MigoResult MIGO_CALL migo_surface_release_query(
+    const MigoSurfaceRelease *release,
+    MigoSurfaceReleaseStatus *out_status);
+
+/*
+ * Destroy a completed observer. MIGO_OK consumes the handle and its pointer
+ * becomes invalid.
+ *
+ * Returns MIGO_ERROR_INVALID_STATE while the release is still
+ * MIGO_SURFACE_RELEASE_PENDING, leaving ownership with the caller. Refusing is
+ * the point: destroying the observer early would discard the only means of
+ * learning when the native resource became safe to free, and the host would
+ * have nothing left to wait on.
  */
 MIGO_API MigoResult MIGO_CALL
-migo_surface_detach(MigoSurfaceAttachment *attachment);
+migo_surface_release_destroy(MigoSurfaceRelease *release);
 
 MIGO_END_DECLS
 

@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn loss_during_update_is_deferred_until_the_control_transition_commits() {
         crate::test_support::with_session("surface-loss-update-race", |session| {
-            let (_attachment, _extra) = install_active_attachment(session, false);
+            let (attachment, _extra) = install_active_attachment(session, false);
             let session_ref = unsafe { &*session };
             {
                 let mut state = session_ref.state.lock().expect("SessionControl");
@@ -937,6 +937,20 @@ mod tests {
                     .is_some_and(|active| active.lost),
             );
             assert!(state.pending_surface_loss.is_none());
+            drop(state);
+
+            // Retire it before the Session goes away. A Session refuses to be
+            // destroyed while an attachment is live, so leaving one installed
+            // would make the harness's teardown fail for a reason that has
+            // nothing to do with what this test is about -- and losing the
+            // Surface does not detach it, which is precisely the distinction
+            // the assertions above are pinning down.
+            let mut release = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_surface_begin_detach(attachment, &mut release) },
+                MIGO_OK,
+            );
+            assert_eq!(unsafe { migo_surface_release_destroy(release) }, MIGO_OK);
         });
     }
 
@@ -1093,6 +1107,41 @@ mod tests {
                 release_status(release).state,
                 migo_capi_abi::surface::MIGO_SURFACE_RELEASE_RELEASED,
             );
+            assert_eq!(unsafe { migo_surface_release_destroy(release) }, MIGO_OK);
+        });
+    }
+
+    #[test]
+    fn a_live_attachment_blocks_session_destroy_rather_than_being_consumed_by_it() {
+        with_engine("destroy-with-live-attachment", |engine| {
+            let mut session = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_session_create(engine, &session_config(), &mut session) },
+                MIGO_OK,
+            );
+            let (attachment, _extra) = install_active_attachment(session, false);
+
+            // Refusing is the contract. Consuming the attachment here instead
+            // would tear the Session down while the GPU may still reference its
+            // Surface, and would silently invalidate a pointer the caller still
+            // believes it owns. A refusal leaves everything retryable.
+            assert_eq!(
+                unsafe { migo_session_destroy(session) },
+                MIGO_ERROR_INVALID_STATE,
+            );
+
+            let mut release = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { migo_surface_begin_detach(attachment, &mut release) },
+                MIGO_OK,
+            );
+            assert_eq!(
+                release_status(release).state,
+                migo_capi_abi::surface::MIGO_SURFACE_RELEASE_RELEASED,
+            );
+
+            // The Session was never damaged by the refusal above.
+            assert_eq!(unsafe { migo_session_destroy(session) }, MIGO_OK);
             assert_eq!(unsafe { migo_surface_release_destroy(release) }, MIGO_OK);
         });
     }

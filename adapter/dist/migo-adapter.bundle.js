@@ -29,6 +29,94 @@
     orientation: { angle: 0, type: innerWidth > innerHeight ? "landscape-primary" : "portrait-primary" }
   };
 
+  // src/events.js
+  var Event = class {
+    constructor(type, init = {}) {
+      this.type = type;
+      this.bubbles = !!init.bubbles;
+      this.cancelable = !!init.cancelable;
+      this.target = null;
+      this.currentTarget = null;
+      this.timeStamp = Date.now();
+      this.defaultPrevented = false;
+    }
+    preventDefault() {
+      if (this.cancelable) this.defaultPrevented = true;
+    }
+    stopPropagation() {
+    }
+    stopImmediatePropagation() {
+    }
+  };
+  var TouchEvent = class extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.touches = init.touches || [];
+      this.targetTouches = init.targetTouches || this.touches;
+      this.changedTouches = init.changedTouches || this.touches;
+    }
+  };
+  var MouseEvent = class extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.clientX = init.clientX || 0;
+      this.clientY = init.clientY || 0;
+      this.pageX = init.pageX || this.clientX;
+      this.pageY = init.pageY || this.clientY;
+      this.button = init.button || 0;
+      this.buttons = init.buttons || 0;
+    }
+  };
+  var DeviceMotionEvent = class extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.acceleration = init.acceleration || null;
+      this.accelerationIncludingGravity = init.accelerationIncludingGravity || null;
+      this.rotationRate = init.rotationRate || null;
+      this.interval = init.interval || 0;
+    }
+  };
+
+  // src/gamepad.js
+  var GamepadEvent = class extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.gamepad = init.gamepad != null ? init.gamepad : null;
+    }
+  };
+  var _NO_GAMEPADS = Object.freeze([]);
+  function _transport() {
+    try {
+      return typeof migo !== "undefined" ? migo : null;
+    } catch {
+      return null;
+    }
+  }
+  function getGamepads() {
+    const runtime = _transport();
+    if (!runtime || typeof runtime.getGamepads !== "function") return _NO_GAMEPADS;
+    const pads = runtime.getGamepads();
+    return pads != null ? pads : _NO_GAMEPADS;
+  }
+  function connectGamepadEvents(dispatch) {
+    const runtime = _transport();
+    if (!runtime) return false;
+    const forward = (type) => (payload) => {
+      const gamepad = payload != null && payload.gamepad != null ? payload.gamepad : null;
+      dispatch(new GamepadEvent(type, { gamepad }));
+    };
+    let wired = false;
+    if (typeof runtime.onGamepadConnected === "function") {
+      runtime.onGamepadConnected(forward("gamepadconnected"));
+      wired = true;
+    }
+    if (typeof runtime.onGamepadDisconnected === "function") {
+      runtime.onGamepadDisconnected(forward("gamepaddisconnected"));
+      wired = true;
+    }
+    return wired;
+  }
+
   // src/navigator.js
   var _info2 = {};
   try {
@@ -51,6 +139,9 @@
     onLine: true,
     hardwareConcurrency: 4,
     maxTouchPoints: 5,
+    // Polled every frame by content; see gamepad.js for why this forwards
+    // straight to the runtime instead of wrapping what it returns.
+    getGamepads,
     // Stubs for APIs the runtime doesn't bridge yet.
     geolocation: {
       getCurrentPosition: () => {
@@ -500,54 +591,6 @@
   };
   var document_default = document;
 
-  // src/events.js
-  var Event = class {
-    constructor(type, init = {}) {
-      this.type = type;
-      this.bubbles = !!init.bubbles;
-      this.cancelable = !!init.cancelable;
-      this.target = null;
-      this.currentTarget = null;
-      this.timeStamp = Date.now();
-      this.defaultPrevented = false;
-    }
-    preventDefault() {
-      if (this.cancelable) this.defaultPrevented = true;
-    }
-    stopPropagation() {
-    }
-    stopImmediatePropagation() {
-    }
-  };
-  var TouchEvent = class extends Event {
-    constructor(type, init = {}) {
-      super(type, init);
-      this.touches = init.touches || [];
-      this.targetTouches = init.targetTouches || this.touches;
-      this.changedTouches = init.changedTouches || this.touches;
-    }
-  };
-  var MouseEvent = class extends Event {
-    constructor(type, init = {}) {
-      super(type, init);
-      this.clientX = init.clientX || 0;
-      this.clientY = init.clientY || 0;
-      this.pageX = init.pageX || this.clientX;
-      this.pageY = init.pageY || this.clientY;
-      this.button = init.button || 0;
-      this.buttons = init.buttons || 0;
-    }
-  };
-  var DeviceMotionEvent = class extends Event {
-    constructor(type, init = {}) {
-      super(type, init);
-      this.acceleration = init.acceleration || null;
-      this.accelerationIncludingGravity = init.accelerationIncludingGravity || null;
-      this.rotationRate = init.rotationRate || null;
-      this.interval = init.interval || 0;
-    }
-  };
-
   // src/local-storage.js
   var localStorage = {
     get length() {
@@ -947,6 +990,14 @@
     if (typeof migo.onTouchMove === "function") migo.onTouchMove(_forward("touchmove"));
     if (typeof migo.onTouchEnd === "function") migo.onTouchEnd(_forward("touchend"));
     if (typeof migo.onTouchCancel === "function") migo.onTouchCancel(_forward("touchcancel"));
+    connectGamepadEvents((event) => {
+      _winTarget.dispatchEvent(event);
+      const sink = globalThis["on" + event.type];
+      if (typeof sink === "function") try {
+        sink(event);
+      } catch {
+      }
+    });
     document_default.documentElement = globalThis;
     const surface = {
       // BOM scalars (data values, snapshotted; bom.js refreshes on resize)
@@ -977,6 +1028,7 @@
       TouchEvent,
       MouseEvent,
       DeviceMotionEvent,
+      GamepadEvent,
       Image,
       Audio,
       XMLHttpRequest,

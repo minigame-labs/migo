@@ -175,6 +175,52 @@ static int fail(const char *what, MigoResult result) {
     return 1;
 }
 
+/* A driver holding the window past detach is normal; holding it this long is
+ * not, and blocking forever would turn a stall into a hang with no diagnosis. */
+#define RELEASE_TIMEOUT_MS 2000
+#define RELEASE_POLL_MS 4
+
+/*
+ * Retire the attachment, then wait until the native window is genuinely unused.
+ *
+ * migo_surface_begin_detach returning MIGO_OK means retirement started, not
+ * that the driver finished with the window. XDestroyWindow at that point is a
+ * use-after-free inside the GL driver -- one the engine cannot detect, because
+ * the reference it would have to observe belongs to the driver.
+ *
+ * The observer is level-triggered, so this poll cannot miss a completion that
+ * lands before the first query. Polling (rather than a callback) keeps teardown
+ * on the host's own thread, which is where the window is owned.
+ */
+static int detach_and_await_release(MigoSurfaceAttachment *attachment) {
+    MigoSurfaceRelease *release = NULL;
+    MigoResult result = migo_surface_begin_detach(attachment, &release);
+    if (result != MIGO_OK) return fail("migo_surface_begin_detach", result);
+
+    for (long waited = 0; waited < RELEASE_TIMEOUT_MS; waited += RELEASE_POLL_MS) {
+        MigoSurfaceReleaseStatus status;
+        memset(&status, 0, sizeof status);
+        /* Output records are the mirror of input ones: the caller declares the
+         * shape it understands and the library writes no more than that. */
+        status.struct_size = (uint32_t)sizeof status;
+        status.abi_version = MIGO_ABI_VERSION_CURRENT;
+        result = migo_surface_release_query(release, &status);
+        if (result != MIGO_OK) return fail("migo_surface_release_query", result);
+        if (status.state == MIGO_SURFACE_RELEASE_RELEASED) {
+            result = migo_surface_release_destroy(release);
+            if (result != MIGO_OK) return fail("migo_surface_release_destroy", result);
+            return 0;
+        }
+        sleep_ms(RELEASE_POLL_MS);
+    }
+
+    /* Deliberately leaks the observer. It is the only thing that could still
+     * report when the window becomes safe to touch, so destroying it here would
+     * discard the answer; and the window must now outlive us rather than be
+     * torn down while the driver may still be reading it. */
+    return fail("surface release timed out", MIGO_ERROR_INTERNAL);
+}
+
 /*
  * X11 reports physical pixels; the ABI takes CSS pixels. This one constant is
  * used both for the attach descriptor and for converting input, so the two
@@ -534,8 +580,7 @@ int main(int argc, char **argv) {
     }
 
     /* ---- Teardown in the order the headers require. ---- */
-    result = migo_surface_detach(attachment);
-    if (result != MIGO_OK) return fail("migo_surface_detach", result);
+    if (detach_and_await_release(attachment) != 0) return 1;
     result = migo_session_destroy(session);
     if (result != MIGO_OK) return fail("migo_session_destroy", result);
     result = migo_engine_destroy(engine);

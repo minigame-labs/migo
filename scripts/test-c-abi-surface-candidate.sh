@@ -86,6 +86,50 @@ require_regex() {
     fi
 }
 
+# Every migo_* the headers declare must be exported by the Rust implementation,
+# and every export must be declared. Compiling the headers proves they are valid
+# C; it does not prove anything links. A declaration with no export is a link
+# error in the host's build, discovered by the host -- which is the worst place
+# to discover it.
+check_export_parity() {
+    python3 - "$INCLUDE_DIR" "$ROOT/engine/crates/capi" <<'PY'
+import pathlib
+import re
+import sys
+
+include_dir, capi_dir = (pathlib.Path(a) for a in sys.argv[1:3])
+
+# Comments name entry points when explaining them, so they must go before any
+# identifier is believed. Prose is not a declaration.
+block_comment = re.compile(r"/\*.*?\*/", re.S)
+line_comment = re.compile(r"//[^\n]*")
+call = re.compile(r"\bmigo_[A-Za-z0-9_]*\s*\(")
+
+declared = set()
+for header in sorted(include_dir.rglob("*.h")):
+    text = line_comment.sub("", block_comment.sub("", header.read_text()))
+    declared.update(m.group(0)[:-1].strip() for m in call.finditer(text))
+
+exported = set()
+export = re.compile(
+    r'#\[unsafe\(no_mangle\)\]\s*(?:#\[[^\]]*\]\s*)*'
+    r'pub\s+(?:unsafe\s+)?extern\s+"C"\s+fn\s+(migo_[A-Za-z0-9_]*)'
+)
+for source in sorted(capi_dir.rglob("*.rs")):
+    exported.update(export.findall(source.read_text()))
+
+missing = sorted(declared - exported)
+undeclared = sorted(exported - declared)
+if missing:
+    print("declared in include/ but not exported by Rust: " + ", ".join(missing), file=sys.stderr)
+if undeclared:
+    print("exported by Rust but not declared in include/: " + ", ".join(undeclared), file=sys.stderr)
+if missing or undeclared:
+    sys.exit(1)
+print(f"C ABI export parity: {len(declared)} entry points agree")
+PY
+}
+
 check_repository_integration() {
     require_regex "$ROOT/.github/workflows/pr-ci.yml" \
         '^[[:space:]]+bash scripts/test-c-abi-surface-candidate\.sh$' \
@@ -135,13 +179,17 @@ case "$MODE" in
     --platforms)
         compile_platforms
         ;;
+    --parity)
+        check_export_parity
+        ;;
     --all)
         compile_core
         compile_platforms
+        check_export_parity
         check_repository_integration
         ;;
     *)
-        echo "usage: $0 [--core|--platforms|--all]" >&2
+        echo "usage: $0 [--core|--platforms|--parity|--all]" >&2
         exit 2
         ;;
 esac

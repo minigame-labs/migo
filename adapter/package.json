@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "build": "node scripts/build-bundle.mjs",
-    "test": "node tests/adapter.test.mjs && node tests/bundle.test.mjs",
+    "test": "node tests/adapter.test.mjs && node tests/gamepad.test.mjs && node tests/bundle.test.mjs",
     "prepack": "npm run build"
   },
   "license": "MIT",

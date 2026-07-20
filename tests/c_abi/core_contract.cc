@@ -56,7 +56,11 @@ using AttachFn = MigoResult(MIGO_CALL *)(MigoSession *,
                                          MigoSurfaceAttachment **);
 using UpdateFn = MigoResult(MIGO_CALL *)(MigoSurfaceAttachment *,
                                          const MigoSurfaceMetrics *);
-using DetachFn = MigoResult(MIGO_CALL *)(MigoSurfaceAttachment *);
+using BeginDetachFn = MigoResult(MIGO_CALL *)(MigoSurfaceAttachment *,
+                                              MigoSurfaceRelease **);
+using ReleaseQueryFn = MigoResult(MIGO_CALL *)(const MigoSurfaceRelease *,
+                                               MigoSurfaceReleaseStatus *);
+using ReleaseDestroyFn = MigoResult(MIGO_CALL *)(MigoSurfaceRelease *);
 using EngineCreateFn = MigoResult(MIGO_CALL *)(const MigoEngineConfig *,
                                                MigoEngine **);
 using EngineDestroyFn = MigoResult(MIGO_CALL *)(MigoEngine *);
@@ -74,8 +78,12 @@ static_assert(std::is_same<decltype(&migo_session_attach_surface), AttachFn>::va
               "attach declaration");
 static_assert(std::is_same<decltype(&migo_surface_update), UpdateFn>::value,
               "update declaration");
-static_assert(std::is_same<decltype(&migo_surface_detach), DetachFn>::value,
-              "detach declaration");
+static_assert(std::is_same<decltype(&migo_surface_begin_detach), BeginDetachFn>::value,
+              "begin detach declaration");
+static_assert(std::is_same<decltype(&migo_surface_release_query), ReleaseQueryFn>::value,
+              "release query declaration");
+static_assert(std::is_same<decltype(&migo_surface_release_destroy), ReleaseDestroyFn>::value,
+              "release destroy declaration");
 static_assert(std::is_same<decltype(&migo_engine_create), EngineCreateFn>::value,
               "engine create declaration");
 static_assert(std::is_same<decltype(&migo_engine_destroy), EngineDestroyFn>::value,

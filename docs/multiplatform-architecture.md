@@ -215,6 +215,20 @@ flowchart TB
 
 Host Kit 可以提供一个方便的 View/Control，但 View 不等于 Window。宿主仍决定它位于哪个页面、窗口或 UI 树中。
 
+`migo-player` 是**可选 shell**，不是运行时的一部分：它存在是为了让示例、bench、截图和 CI 有一个能自己开窗的入口，嵌入式集成永远不经过它。事件循环同样属于宿主——引擎不 spin 宿主的 loop，帧驱动通过宿主安装的 `on_request_frame` + `migo_session_notify_vsync` 回到引擎（Android SDK 走 Choreographer，纯原生宿主自己提供）。
+
+#### 4.1.1 谁拥有窗口的生命周期
+
+宿主拥有窗口，因此**只有宿主能销毁它**——但它必须等引擎说可以。
+
+`migo_surface_begin_detach` 返回 `MIGO_OK` 只表示退役已经开始，不表示 driver 已经用完这个窗口：GPU 无法被同步地忘记一个 Surface。宿主必须轮询 `migo_surface_release_query` 到 `MIGO_SURFACE_RELEASE_RELEASED` 之后，才能 `XDestroyWindow` / `wl_surface_destroy` / 释放 `ANativeWindow`。提前销毁是 driver 内部的 use-after-free，**引擎既检测不到也阻止不了**，因为它要观察的引用不属于自己。
+
+对称地，`migo_session_destroy` 在还有存活 attachment、正在进行的 transition 或未完成的 release 时会返回 `MIGO_ERROR_INVALID_STATE` 而不是替宿主收尾。这是引擎**还能**捕获的错误，所以它拒绝；拆解顺序因此永远是 begin_detach → 轮询到 RELEASED → destroy。
+
+release observer 不持有 Surface 资源租约，所以它可以活过自己的 Session——这正是「先销毁 Session」的拆解顺序仍然安全的原因。
+
+三个 C 宿主示例（X11、Wayland、Android NativeActivity）都实现了这个等待，且 Wayland 那份在等待时必须继续 dispatch display：释放 buffer 可能需要与合成器往返，只 sleep 会一直等到超时。
+
 ### 4.2 两级接入 API
 
 **高级接入**面向普通 App：
@@ -274,11 +288,27 @@ MigoResult migo_session_set_host_callbacks(
 MigoResult migo_session_set_visibility(MigoSession*, uint8_t visible);
 MigoResult migo_session_set_focus(MigoSession*, uint8_t focused);
 
-MigoResult migo_surface_detach(MigoSurfaceAttachment*);
+/* Surface 退役是异步的：GPU 无法被同步地「忘记」一个 Surface，
+   driver 侧引用会活过调用返回。begin_detach 只是开始退役，
+   宿主必须轮询到 RELEASED 才能销毁自己的原生窗口。 */
+MigoResult migo_surface_begin_detach(
+    MigoSurfaceAttachment*,
+    MigoSurfaceRelease** out_release);
+MigoResult migo_surface_release_query(
+    const MigoSurfaceRelease*,
+    MigoSurfaceReleaseStatus* out_status);
+MigoResult migo_surface_release_destroy(MigoSurfaceRelease*);
+
 MigoResult migo_session_destroy(MigoSession*);
 ```
 
-仓库现已提供 [`include/migo/migo.h`](../include/migo/migo.h) 与强类型平台 descriptor 作为 **compile-only v1 candidate**；`MIGO_C_ABI_HAS_RUNTIME == 0` 明确表示当前没有可链接的 `migo_*` 实现符号，Android 仍走既有 Java/JNI API。它用于设计评审和 C11/C++17 布局门禁，不是 stable SDK，也不能随 release artifact 对外宣称可用。正式 C ABI 必须：
+[`include/migo/migo.h`](../include/migo/migo.h) 与强类型平台 descriptor 已经**有可链接实现**，不再是 compile-only：`engine/crates/capi` 导出 22 个 `migo_*` 入口点，desktop Linux 与 Android 各自有一份可链接 runtime，所以 `MIGO_C_ABI_HAS_RUNTIME` 在这两个平台上是 1。
+
+⚠️ 这个宏问的是「该 target 是否存在可链接 runtime」，**不是「ABI 是否已冻结」**——`MIGO_C_ABI_CANDIDATE` 仍为 1，`include/migo/README.md` 列的冻结阻塞项仍有未满足项。
+
+判定这个宏时**必须区分三个 Linux-kernel target**：Android 与 OpenHarmony 同样定义 `__linux__`，只测 `__linux__` 会一次性替三个不同 ABI 作答，并且会在没有构建产物的 OpenHarmony 上谎称有 runtime。因此 `types.h` 按 `__ANDROID__` / `__OHOS__` / `__linux__ && __GLIBC__` 精确分类，`tests/c_abi/core_contract.c` 断言三者互斥。
+
+Android 的差距是**打包而不是能力**：静态库可链接并已在真机跑通，但没有 pkg-config、CMake package 或带版本的 .so，宿主只能从源码树链接；desktop Linux 三样齐全。正式 C ABI 必须：
 
 - 每个结构带 `struct_size` 与 `abi_version`；
 - 返回稳定错误码，不允许 panic/exception 穿过 ABI；
@@ -392,6 +422,7 @@ Skia Vulkan 可以与 GL 同时构建，但官方仍提示真实设备驱动问�
 4. Canvas2D、WebGL、图片解码上传和 onscreen present 必须尽量处于同一个 GPU device family。
 5. 如果混用两个 API 会导致跨 device copy，即使单项 benchmark 更快也不得成为默认。
 6. software renderer 只用于 CI/fallback，不冒充正式 GPU 后端性能。
+7. **runtime 热路径不得引入服务端框架**（`actix`、`tokio` 多线程 runtime、Web 框架、通用 actor/消息总线等）。它们为吞吐和公平调度而设计，代价是每条消息的分配、跨线程唤醒和调度延迟——正是渲染与输入路径最不能付的开销。输入、命令流、draw/present 必须是直接调用或预先特化的路径；需要并发的地方用已有的有界命令队列与 generation gate。构建期工具（如 `tools/artifact-manifest`）不受此限，因为它们不链接进 `libmigo.so`。
 
 ### 5.4 资源互操作
 
@@ -685,7 +716,7 @@ SnapshotId = {
 |---|---|---|---|
 | Android AAR / `arm64-v8a` | `aarch64`；ARMv8-A + AdvSIMD，不静态要求可选 ARMv8.x 扩展 | `android_api: 26` | bundled V8；精确 V8 revision/GN args；host/worker snapshot 按 ABI、profile 和 target-baseline 参数生成 |
 | Android AAR / `x86_64` | `x86_64`；`x86-64-v1`，至少 `cmov`/`sse2` | `android_api: 26` | bundled V8；与 arm64 分开的 archive、binding、revision tuple 和 snapshot |
-| Linux GNU / `x86_64` | `x86_64`；`x86-64-v1`，至少 `cmov`/`sse2` | `glibc: 2.31` | bundled V8；精确 V8 revision/GN args；per-arch host/worker snapshot；kernel 5.10 只进入 `minimum_test_baseline` |
+| Linux GNU / `x86_64` | `x86_64`；`x86-64-v1`，至少 `cmov`/`sse2` | `glibc: 2.31`、`glibcxx: 3.4.28` | bundled V8；精确 V8 revision/GN args；**当前 `snapshot_policy: "none"`、`snapshots: []`**（Linux 尚未生成 startup snapshot）；kernel 5.10 只进入 `minimum_test_baseline` |
 | Linux GNU / `aarch64` | `aarch64`；ARMv8-A + AdvSIMD | `glibc: 2.31` | 仅在承诺该 profile 时发布独立 V8 archive/binding/snapshot，不能复用 Android arm64 |
 | Windows MSVC / `x86_64` | `x86_64`；`x86-64-v1`，至少 `cmov`/`sse2` | `windows_build: 17763` | bundled V8；精确 V8 revision/GN args；per-arch snapshot；同时记录 MSVC/UCRT 与 VC runtime 部署方式 |
 | macOS / `arm64` | `aarch64`；Apple arm64 ABI（AArch64 + AdvSIMD），不静态要求可选 ARMv8.x 扩展 | `macos: 13.0` | bundled V8；精确 V8 revision/GN args；arm64 snapshot；universal 分发包仍保留 per-slice identity |
@@ -693,6 +724,16 @@ SnapshotId = {
 | OpenHarmony bundled-V8 / `aarch64` | `aarch64`；目标 OHOS SDK ABI，首批基线 ARMv8-A + AdvSIMD | `openharmony_api: 10` | 精确 OHOS SDK/Clang/sysroot、V8 revision/GN args；per-profile host/worker snapshot |
 | OpenHarmony system-JSVM / `aarch64` | `aarch64`；目标 OHOS SDK ABI，首批基线 ARMv8-A + AdvSIMD | `openharmony_api: 12` | `v8_revision: null`、`snapshots: []`；记录 JSVM API/SDK identity、bridge schema；API 14+ DVSync 只写 optimized capability |
 | iOS device / `arm64` | `aarch64`；Apple arm64 ABI（AArch64 + AdvSIMD） | `ios: 15.0` | `v8_revision: null`、`snapshots: []`；记录 WebKit/SDK identity、bridge schema；simulator slice 使用独立 target/manifest |
+
+上表不是文档承诺而是**被校验的合同**。每个 slice manifest 都有 JSON schema 与工具校验：Android slice 走 `contracts/artifact-manifest/schema-v1.json` + `migo-artifact-manifest verify-slice`；Linux GNU slice 走 `contracts/artifact-manifest/linux-package-schema-v1.json` + `migo-artifact-manifest verify-linux-package`，并由 `scripts/test-linux-sdk-contract.sh` 对照真实产物核对 DT_NEEDED、导出符号与 loader floor。
+
+其中三条规则是**禁止混用**，因为它们的失败方式都是「链接得上、跑起来才炸，且现场没有 provenance」：
+
+1. **V8 必须按 OS/ABI/arch 分别构建。** manifest 记录的 `v8.target` 必须等于 slice 自身的 target；一个为 Android 构建的 V8 放进 Linux 包会被 `verify-linux-package` 直接拒绝。
+2. **snapshot 必须与 V8 revision、生成参数和 CPU baseline 匹配。** snapshot 是 V8 机器码，`target_triple`/`arch` 不符不是「次优」而是不可加载。
+3. **「不带 snapshot」必须显式声明。** `snapshot_policy` 与 `snapshots` 必须互相一致（`none` ⇔ 空数组），否则缺失的 snapshot 与遗忘的 snapshot 在 manifest 里长得一模一样。
+
+`linux` 是内核而不是 ABI：Android 与 OpenHarmony 同样跑 Linux 内核，所以 manifest 把 `os`/`abi`/`arch` 分开记录，`abi: "gnu"` 才是 desktop Linux 这一格。
 
 Windows ARM64、Linux musl/RISC-V、商业 HarmonyOS 以及任何更高指令集构建不是上述 profile 的别名；如果发布，必须增加独立行、artifact identity、最低版本与测试矩阵。V8 JIT 可以在运行时探测并使用较新指令，但通用静态工件仍以上表 baseline 编译；面向 AVX2、ARMv8.2-A 等的专用构建只能作为经过 benchmark 证明有价值的独立 optimized artifact。
 
@@ -995,10 +1036,10 @@ tools/
    固定 API 26 minimum-compatibility lane；另行固定最新稳定 Android、代表性当前设备、release artifact/snapshot、游戏场景和性能采集方法，报告与门禁不得合并。
 
 2. **先过 C ABI + Surface 契约设计门，不急于宣称 stable**  
-   评审 `SurfaceDescriptor`、ownership、generation、callback/dispatcher、线程、错误码、结构扩展和重入销毁；提交可编译 header skeleton 与 ABI compatibility test。当前 [`include/migo/migo.h`](../include/migo/migo.h) 以 `MIGO_C_ABI_HAS_RUNTIME == 0` 落地这一 compile-only 设计门；此时形成 v1 candidate，尚不导出实现符号，也不对外冻结。
+   评审 `SurfaceDescriptor`、ownership、generation、callback/dispatcher、线程、错误码、结构扩展和重入销毁；提交可编译 header skeleton 与 ABI compatibility test。该设计门已经走完：[`include/migo/migo.h`](../include/migo/migo.h) 现已导出实现符号，`MIGO_C_ABI_HAS_RUNTIME` 在 desktop Linux 与 Android 上为 1。仍是 v1 candidate（`MIGO_C_ABI_CANDIDATE == 1`），未对外冻结。
 
 3. **抽 Surface 状态机，不改变 Android 行为——内部层已完成**  
-   当前实现以每个 Session/Host 一个 packed `AtomicU64` generation gate 作为 queue-independent liveness authority；`SurfaceLease` 贯穿 JNI→Host→render handoff，Host 持有唯一逻辑 attachment，render thread 持有一个有界资源 binding。update/destroy 命令均携带 generation；过期命令不能影响新 Surface，shutdown 在 render join 前同步 retire，`ANativeWindow` 引用只在 EGL teardown/replacement 后释放。Android API 26+ 仍使用既有 Java/JNI、`ANativeWindow` 与系统 EGL/GLES 路径，同 generation 的 `surfaceChanged` 保留 resize fast path。该完成状态仅指内部生命周期重构：`MIGO_C_ABI_HAS_RUNTIME == 0` 仍成立，尚无可链接 C runtime，也未冻结 ABI v1。
+   当前实现以每个 Session/Host 一个 packed `AtomicU64` generation gate 作为 queue-independent liveness authority；`SurfaceLease` 贯穿 JNI→Host→render handoff，Host 持有唯一逻辑 attachment，render thread 持有一个有界资源 binding。update/destroy 命令均携带 generation；过期命令不能影响新 Surface，shutdown 在 render join 前同步 retire，`ANativeWindow` 引用只在 EGL teardown/replacement 后释放。Android API 26+ 仍使用既有 Java/JNI、`ANativeWindow` 与系统 EGL/GLES 路径，同 generation 的 `surfaceChanged` 保留 resize fast path。该条目原本只指内部生命周期重构，现已被 C ABI 切片超越：`MIGO_C_ABI_HAS_RUNTIME` 在 desktop Linux 与 Android 上为 1，两平台都有可链接 runtime；ABI v1 仍未冻结。
 
 4. **移出 EGL、RWH 与 Android 假设——Android 内部路径已完成**  
    Android JNI bootstrap 现在构造经过 backend identity 配对校验的 `GraphicsPlatform`，并显式注入 system-EGL provider 与 `ANativeWindow` surface factory；render/upload thread 使用同一 provider identity，只有 Android provider 持有 `libEGL.so` 选择。shared/core/graphics 已移除 RWH、`AndroidNdk` match、裸 window integer 与 `last_window` recovery。attach 先校验 generation，再在冷路径 prepare/revalidate target；initial/update 共用有界 pending-lease transaction，partial EGL failure、panic、shutdown 都保证 EGL teardown 先于 native lease 释放；复用的 EGLContext 与 preserved DrawingBuffer 在首次 make-current 前作为同一恢复单元转移，瞬时失败不会丢失保留帧。相同 generation + 相同 native target 的 skip/resize fast path 保留，新 generation 必定完整重建。EGL display/root context 由 RAII owner 覆盖初始化早退、正常退出和 panic fallback；context recovery 只使用 live lease 配对的 installed target。该完成状态没有引入 SDK-owned window、Linux/ANGLE/OpenHarmony 实现、公开 C runtime 或 ABI v1 freeze，也没有改变 Android API 26 floor、Java/JNI descriptor、V8 或 snapshot 输入。

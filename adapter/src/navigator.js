@@ -2,6 +2,8 @@
 // migo.getDeviceInfo() / getSystemInfoSync(), we do; the rest fall back to
 // browser-default-ish values.
 
+import { getGamepads } from "./gamepad.js";
+
 let _info = {};
 try { if (typeof migo.getSystemInfoSync === "function") _info = migo.getSystemInfoSync() || {}; } catch {}
 
@@ -22,6 +24,10 @@ const navigator = {
   onLine: true,
   hardwareConcurrency: 4,
   maxTouchPoints: 5,
+
+  // Polled every frame by content; see gamepad.js for why this forwards
+  // straight to the runtime instead of wrapping what it returns.
+  getGamepads,
 
   // Stubs for APIs the runtime doesn't bridge yet.
   geolocation: {

@@ -402,6 +402,18 @@ mod tests {
         panic!("function body must close");
     }
 
+    /// Whether `haystack` contains `needle`, ignoring whitespace entirely.
+    ///
+    /// These assertions are about structure, not layout. Spelling one as a
+    /// single-line literal makes rustfmt an author of the contract: reflowing
+    /// `a.b(c)` across two lines then reads as the call having been removed.
+    /// That is not hypothetical -- it is how this check started failing.
+    fn contains_ignoring_whitespace(haystack: &str, needle: &str) -> bool {
+        let strip =
+            |text: &str| -> String { text.chars().filter(|ch| !ch.is_whitespace()).collect() };
+        strip(haystack).contains(&strip(needle))
+    }
+
     #[derive(Debug)]
     struct TestSurface {
         marker: u32,
@@ -901,15 +913,15 @@ mod tests {
         let resize = &create[resize_start..full_start];
 
         assert!(
-            !skip.contains("self.installed_surface = Some(target)"),
+            !contains_ignoring_whitespace(skip, "self.installed_surface = Some(target)"),
             "Skip must discard the candidate while EGL retains the installed target"
         );
         assert!(
-            resize.contains("installed.reconfigure_from(target.as_ref())"),
+            contains_ignoring_whitespace(resize, "installed.reconfigure_from(target.as_ref())"),
             "FastResize must reconfigure the installed target in place"
         );
         assert!(
-            !resize.contains("self.installed_surface = Some(target)"),
+            !contains_ignoring_whitespace(resize, "self.installed_surface = Some(target)"),
             "FastResize must not replace a target still referenced by EGL"
         );
     }

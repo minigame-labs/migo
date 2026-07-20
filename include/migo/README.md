@@ -40,11 +40,21 @@ A future implementation copies every retained structure, rejects an unsupported 
 
 ## Surface generation and completion
 
-The host chooses a non-zero generation that increases monotonically within a Session. Only one attachment is active at a time. Resize/DPI/color/presentation updates repeat the generation; a stale generation is rejected. Replacing a native target always means synchronous detach followed by attach with a newer generation.
+The host chooses a non-zero generation that increases monotonically within a Session. Only one attachment is active at a time. Resize/DPI/color/presentation updates repeat the generation; a stale generation is rejected. Replacing a native target means detaching, waiting for release, then attaching with a newer generation.
 
-`MigoSurfaceAttachment*` is a unique handle; callers must not create independently owned aliases. Detach is a cold-path completion boundary. After `migo_surface_detach` returns `MIGO_OK`, the handle has been consumed and released, its pointer is invalid, no future GPU call or present may reference that generation, and the host may destroy its borrowed native resources. A non-success result leaves ownership with the caller for retry or Session destruction. Destroying the Session consumes any remaining live attachment and invalidates all caller-held attachment pointers. This avoids retaining one tombstone object for every Surface recreation.
+`MigoSurfaceAttachment*` is a unique handle; callers must not create independently owned aliases. Retirement is a cold-path boundary and it is **asynchronous**, because the GPU cannot be made to forget a Surface synchronously: driver-side references outlive the call, and no return value can honestly claim otherwise.
 
-A future implementation can marshal detach to Migo-owned render/platform workers but cannot require an SDK-owned window or event loop, and it must not wait for another turn of the host dispatcher. When required platform-thread affinity is not satisfied, detach returns `MIGO_ERROR_WRONG_THREAD` before retiring the generation or changing handle ownership. Consequently a callback running on a single-threaded UI dispatcher can detach reentrantly without blocking on its own queue.
+`migo_surface_begin_detach` returning `MIGO_OK` consumes the attachment — its pointer is invalid, and no future GPU call or present references that generation — and produces a `MigoSurfaceRelease*` observer. A non-success result consumes nothing and changes nothing: `MIGO_ERROR_INVALID_ARGUMENT` for a NULL argument, `MIGO_ERROR_INVALID_STATE` when another Surface transition is running or the Session has no live host, `MIGO_ERROR_STALE_SURFACE` when the handle is not the active attachment.
+
+**The host must not destroy its native resources when `begin_detach` returns.** It must wait until `migo_surface_release_query` reports `MIGO_SURFACE_RELEASE_RELEASED`. Destroying earlier is a use-after-free inside the driver, which the engine can neither detect nor prevent — the reference it would have to observe is not its own. `migo_surface_release_destroy` refuses with `MIGO_ERROR_INVALID_STATE` while the release is still pending, so the observer cannot be discarded while it is still the only thing that knows the answer.
+
+The observer is level-triggered, so a release that completes before the first query is still reported; there is no edge to miss. It holds no Surface resource lease, and therefore stays valid and queryable after the owning Session is destroyed — which is what makes teardown orders that destroy the Session first still safe.
+
+Detach can be marshalled to Migo-owned render/platform workers but cannot require an SDK-owned window or event loop, and it must not wait for another turn of the host dispatcher. Consequently a callback running on a single-threaded UI dispatcher can begin a detach reentrantly without blocking on its own queue.
+
+**Destroying a Session does not detach for you.** `migo_session_destroy` returns `MIGO_ERROR_INVALID_STATE` while an attachment is still live, while a Surface transition is running, or while any release is still pending; the Session stays valid and the call can be retried. Teardown is therefore always the same three steps, in order: `migo_surface_begin_detach`, poll until `RELEASED`, then `migo_session_destroy`. Refusing is what keeps a host from tearing down a Session while the GPU still references its Surface — an error the engine can still catch, unlike the host destroying its own window early, which it cannot. No tombstone is retained per Surface recreation.
+
+Losing a Surface is not detaching it. After a loss the attachment is still live and still owned by the caller, so the sequence above is unchanged.
 
 ## Native target ownership
 
@@ -68,11 +78,21 @@ Successful `migo_session_destroy` and `migo_engine_destroy` calls consume and re
 
 ## Asynchronous operations
 
-ABI v1 has exactly one: `migo_session_load_content` starts evaluating content and reports
-the outcome through `on_ready` or `on_error`. A Session loads content once, so at most one
-completion can ever be outstanding.
+ABI v1 has two, and they are deliberately shaped differently.
 
-The rules are contract, not description:
+**Surface release is observed, not reported.** `migo_surface_begin_detach` hands back a
+`MigoSurfaceRelease*` the host polls with `migo_surface_release_query`. It uses no callback
+and no dispatcher, because the host asks this question precisely when it is about to destroy
+its own window — on its own thread, often inside a platform teardown handler that cannot
+yield. A completion callback would arrive on some other thread at some other time, which is
+the wrong shape for "may I free this now?". The observer handle is its own correlation
+token, so no request ID is needed; the release cannot be cancelled, because retirement is
+already irreversible when `begin_detach` returns `MIGO_OK`; and it cannot complete late in
+any harmful sense, because it is level-triggered and outlives its Session.
+
+**Content load is reported.** `migo_session_load_content` starts evaluating content and
+reports the outcome through `on_ready` or `on_error`. A Session loads content once, so at
+most one completion can ever be outstanding. Its rules are contract, not description:
 
 - **Correlation.** None is needed or offered. With one outstanding completion per Session,
   a request ID would be a constant. No entry point returns one, and hosts must not infer an
@@ -90,9 +110,33 @@ These three are asserted by `a_destroyed_session_cancels_queued_callbacks` and
 `engine/crates/capi/callbacks.rs`, so the contract above is checkable rather than merely
 stated.
 
-A second asynchronous operation reopens the question. Request IDs, a cancel entry point and
-a late-completion state machine are not defined ahead of it: fields can be added to a struct
-under `struct_size` negotiation, whereas invented ones cannot be removed after they ship.
+A *third* asynchronous operation, if it is a reported one, reopens the question. Request IDs,
+a cancel entry point and a late-completion state machine are still not defined ahead of it:
+fields can be added to a struct under `struct_size` negotiation, whereas invented ones cannot
+be removed after they ship.
+
+## Handle concurrency and destruction
+
+Four handle kinds cross this ABI. Their rules differ, and conflating them is the most likely
+way to get memory safety wrong:
+
+| Handle | Uniqueness | Concurrency | Destruction |
+|---|---|---|---|
+| `MigoEngine*` | Unique, owned by the host | Entry points are thread-safe; the host serializes its own calls | `migo_engine_destroy` after every child Session is destroyed |
+| `MigoSession*` | Unique, owned by the host | Calls through one Session must be serialized by the host | `migo_session_destroy` consumes it and cancels queued callbacks, but **refuses** while an attachment is live, a transition is running, or a release is pending |
+| `MigoSurfaceAttachment*` | Unique; aliases are forbidden | Serialized with its Session; only one is active at a time | Consumed by `migo_surface_begin_detach` only. Destroying the Session does not consume it — it fails instead |
+| `MigoSurfaceRelease*` | Unique, owned by the host | Queryable from any thread the host serializes; holds no lease | `migo_surface_release_destroy`, and only once `RELEASED` |
+
+`dispatcher_data` is not a handle and is never owned by the engine. It is copied out of the
+callback record at install time and passed back verbatim on every dispatch. Because callbacks
+can be installed only once per Session, it cannot be replaced while tasks referencing it are
+queued — which is why it needs no lifetime protocol of its own. It must remain valid until
+the owning Session is destroyed.
+
+The one ordering that is not obvious: `MigoSurfaceRelease*` may outlive its `MigoSession*`.
+Destroying the Session does not invalidate an outstanding release observer, and querying one
+afterwards is well-defined. Any other cross-handle survival goes the other way — children
+never outlive parents.
 
 ## Performance boundary
 

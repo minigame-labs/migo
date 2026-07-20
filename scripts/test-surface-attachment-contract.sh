@@ -93,12 +93,24 @@ require_multiline_regex "$CRATES/shared/protocol/render_cmd.rs" \
 require_multiline_regex "$CRATES/shared/protocol/render_cmd.rs" \
     'RecreateOnscreen[[:space:]]*\{[[:space:]]*lease:[[:space:]]*SurfaceLease' \
     "onscreen recreation does not carry a SurfaceLease"
+# Two literals, because the gate moved behind SurfaceControl: the registry holds
+# the control, and the control holds the gate. Pinning only the registry field
+# would pass for a SurfaceControl that had quietly stopped owning a gate, which
+# is the invariant actually worth protecting.
 require_literal "$CRATES/core/runtime/registry.rs" \
-    "surface_gate: Arc<SurfaceGenerationGate>" \
-    "Host registry is missing the queue-independent generation gate"
+    "surface_control: Arc<SurfaceControl>" \
+    "Host registry is missing the queue-independent Surface control"
+require_literal "$CRATES/shared/surface/control.rs" \
+    "gate: Arc<SurfaceGenerationGate>" \
+    "SurfaceControl no longer owns the queue-independent generation gate"
 require_literal "$CRATES/core/runtime/registry.rs" \
-    "surface_gate.retire_current();" \
+    "surface_control.shutdown();" \
     "shutdown does not retire the current Surface before render join"
+# ...and shutdown must still mean retirement, not just a flag. Without this the
+# check above would pass for a shutdown() that stopped retiring.
+require_multiline_regex "$CRATES/shared/surface/control.rs" \
+    'pub fn shutdown\(&self\)[^{]*\{[[:space:]]*self\.shutting_down[^;]*;[[:space:]]*self\.retire_current_and_request\(\)' \
+    "SurfaceControl::shutdown no longer retires the current Surface"
 require_literal "$CRATES/core/services/render.rs" \
     "attachment: SurfaceAttachmentSlot" \
     "Host render service is missing its unique attachment slot"
@@ -171,11 +183,22 @@ require_literal "$CRATES/platform/android/jni/inbound.rs" \
     "android_graphics_platform()" \
     "Android bootstrap does not inject its matched graphics platform"
 
+# The ABI is no longer compile-only: desktop Linux and Android each ship a
+# linkable runtime. What must hold now is that the macro answers per target
+# rather than for "Linux" as a whole -- Android and OpenHarmony are Linux
+# kernels too, so a classifier written on __linux__ alone would claim a runtime
+# on OpenHarmony, where none is built.
 require_literal "$ROOT/include/migo/types.h" \
-    "#define MIGO_C_ABI_HAS_RUNTIME 0" \
-    "C ABI candidate must remain compile-only"
+    "#if defined(__ANDROID__)" \
+    "C ABI runtime macro no longer distinguishes Android from desktop Linux"
+require_literal "$ROOT/include/migo/types.h" \
+    "MIGO_PLATFORM_IS_OPENHARMONY" \
+    "C ABI runtime macro no longer distinguishes OpenHarmony from desktop Linux"
+require_literal "$ROOT/include/migo/types.h" \
+    "#define MIGO_C_ABI_CANDIDATE 1" \
+    "C ABI must remain a candidate until the README blockers are closed"
 require_literal "$CRATES/platform/android/jni/profile_contract.rs" \
-    '("updateSurface", "(ILjava/lang/Object;II)V")' \
+    '("updateSurface", "(ILjava/lang/Object;IIF)V")' \
     "Android updateSurface JNI descriptor changed"
 require_literal "$CRATES/platform/android/jni/profile_contract.rs" \
     '("onSurfaceDestroyed", "(I)V")' \

@@ -10,15 +10,33 @@
 _Static_assert(MIGO_C_ABI_CANDIDATE == 1, "candidate marker");
 /*
  * The macro answers "does a linkable runtime exist for this target", so the
- * assertion checks the rule rather than a constant: desktop Linux ships one,
- * every other target does not. Asserting a fixed 0 here would have to be
- * relaxed the moment any platform gained an implementation, which is exactly
- * when the check is worth having.
+ * assertion checks the rule rather than a constant: desktop Linux and Android
+ * each ship one, every other target does not. Asserting a fixed 0 here would
+ * have to be relaxed the moment any platform gained an implementation, which is
+ * exactly when the check is worth having.
+ *
+ * The three target macros are asserted mutually exclusive first. They are not
+ * independent facts: Android and OpenHarmony are Linux kernels and define
+ * __linux__ too, so a classifier written in terms of __linux__ alone answers
+ * for all three at once. Getting that wrong promises a runtime on OpenHarmony,
+ * where none is built.
  */
-#if defined(__linux__) && !defined(__ANDROID__)
+_Static_assert(MIGO_PLATFORM_IS_ANDROID + MIGO_PLATFORM_IS_OPENHARMONY +
+                       MIGO_PLATFORM_IS_LINUX_GNU <= 1,
+               "at most one Linux-kernel target may claim a translation unit");
+#if defined(__ANDROID__)
+_Static_assert(MIGO_PLATFORM_IS_ANDROID == 1, "Android must classify as Android");
+_Static_assert(MIGO_PLATFORM_IS_LINUX_GNU == 0, "Android is not desktop Linux");
+_Static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "Android ships a static runtime");
+#elif defined(__OHOS__) || defined(__OHOS_FAMILY__)
+_Static_assert(MIGO_PLATFORM_IS_OPENHARMONY == 1, "OpenHarmony must classify as itself");
+_Static_assert(MIGO_PLATFORM_IS_LINUX_GNU == 0, "OpenHarmony is not desktop Linux");
+_Static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "OpenHarmony has no runtime yet");
+#elif defined(__linux__) && defined(__GLIBC__)
+_Static_assert(MIGO_PLATFORM_IS_LINUX_GNU == 1, "glibc Linux is the desktop target");
 _Static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "desktop Linux ships a runtime");
 #else
-_Static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "no runtime outside desktop Linux");
+_Static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "no runtime on unclassified targets");
 #endif
 _Static_assert(MIGO_ABI_VERSION_1 == UINT32_C(1), "ABI version value");
 /* 72, not 64: on_request_frame was appended in the frame-pacing slice. Appending
@@ -77,6 +95,18 @@ _Static_assert(offsetof(MigoSurfaceDescriptor, platform_descriptor) == 64,
                "platform payload pointer is append-safe");
 _Static_assert(sizeof(MigoSurfaceMetrics) == 48, "metrics v1 layout");
 
+/* Mirrors capi-abi's assertions on MigoSurfaceReleaseStatus. The Rust side
+ * spells the first eight bytes as a nested VersionedHeader and this side spells
+ * them flat; the offsets are what make those two spellings the same record. */
+MIGO_CHECK_PREFIX(MigoSurfaceReleaseStatus);
+_Static_assert(sizeof(MigoSurfaceReleaseStatus) == 24, "release status v1 layout");
+_Static_assert(offsetof(MigoSurfaceReleaseStatus, generation) == 8,
+               "release status generation offset");
+_Static_assert(offsetof(MigoSurfaceReleaseStatus, state) == 16,
+               "release status state offset");
+_Static_assert(MIGO_SURFACE_RELEASE_PENDING == UINT32_C(0), "pending state value");
+_Static_assert(MIGO_SURFACE_RELEASE_RELEASED == UINT32_C(1), "released state value");
+
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(MigoError) == 32, "LP64 error layout");
 _Static_assert(sizeof(MigoSurfaceDescriptor) == 72, "LP64 Surface layout");
@@ -112,7 +142,14 @@ int migo_core_c_contract(void) {
     MigoResult(MIGO_CALL *update_fn)(MigoSurfaceAttachment *,
                                      const MigoSurfaceMetrics *) =
         &migo_surface_update;
-    MigoResult(MIGO_CALL *detach_fn)(MigoSurfaceAttachment *) = &migo_surface_detach;
+    MigoResult(MIGO_CALL *begin_detach_fn)(MigoSurfaceAttachment *,
+                                           MigoSurfaceRelease **) =
+        &migo_surface_begin_detach;
+    MigoResult(MIGO_CALL *release_query_fn)(const MigoSurfaceRelease *,
+                                            MigoSurfaceReleaseStatus *) =
+        &migo_surface_release_query;
+    MigoResult(MIGO_CALL *release_destroy_fn)(MigoSurfaceRelease *) =
+        &migo_surface_release_destroy;
     MigoResult(MIGO_CALL *engine_create_fn)(const MigoEngineConfig *, MigoEngine **) =
         &migo_engine_create;
     MigoResult(MIGO_CALL *engine_destroy_fn)(MigoEngine *) = &migo_engine_destroy;
@@ -130,7 +167,9 @@ int migo_core_c_contract(void) {
 
     return (int)(engine_config.struct_size + session_config.struct_size +
                  surface.struct_size + callbacks.struct_size +
-                 (attach_fn != NULL) + (update_fn != NULL) + (detach_fn != NULL) +
+                 (attach_fn != NULL) + (update_fn != NULL) +
+                 (begin_detach_fn != NULL) + (release_query_fn != NULL) +
+                 (release_destroy_fn != NULL) +
                  (engine_create_fn != NULL) + (engine_destroy_fn != NULL) +
                  (session_create_fn != NULL) + (set_callbacks_fn != NULL) +
                  (set_lifecycle_fn != NULL) + (set_visibility_fn != NULL) +

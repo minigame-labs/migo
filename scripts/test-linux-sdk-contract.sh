@@ -91,6 +91,25 @@ else
     skip "soname and version chain (no libmigo.so staged yet)"
 fi
 
+# --- 3b. The manifest describes one coherent machine -----------------------
+# Section 4 below checks the manifest against the library it ships beside. This
+# checks the manifest against itself: arch, ABI, CPU baseline, loader floors,
+# snapshot policy, and -- the one that matters most -- that the V8 built into
+# the package targets the same triple as the package. A V8 for another OS or
+# arch links often enough to reach a user and then fails with no provenance.
+MANIFEST_TOOL="$REPO_ROOT/tools/artifact-manifest"
+if [[ -f "$MANIFEST" ]]; then
+    if MANIFEST_TOOL_OUT="$(cargo run --quiet --offline \
+            --manifest-path "$MANIFEST_TOOL/Cargo.toml" \
+            -- verify-linux-package "$MANIFEST" 2>&1)"; then
+        pass "manifest is internally consistent ($MANIFEST_TOOL_OUT)"
+    else
+        fail "manifest failed validation: $MANIFEST_TOOL_OUT"
+    fi
+else
+    fail "no artifact manifest at $MANIFEST"
+fi
+
 # --- 4. Declared dependencies match reality --------------------------------
 # The manifest is a claim this gate verifies, not documentation that drifts.
 if [[ -f "$MANIFEST" ]]; then
