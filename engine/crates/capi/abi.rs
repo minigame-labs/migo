@@ -48,12 +48,83 @@ pub struct VersionedHeader {
     pub abi_version: u32,
 }
 
+/// A `#[repr(C)]` ABI struct that a caller may pass in a shorter form.
+///
+/// Two facts belong together and are therefore on one trait: how small the
+/// struct may legitimately be, and whether it is sound to build one by zeroing.
+/// Splitting them across a lookup table is how one of them gets forgotten when a
+/// struct is added.
+///
+/// # Safety
+/// Implementors must contain only integers, floats, `Option<fn>` and raw
+/// pointers — no references, no `NonNull`, no enum with a niche. All-zeroes has
+/// to be a valid value, because [`copy_versioned`] produces one for any caller
+/// whose struct stops short. `MINIMUM_SIZE` must cover every field the entry
+/// point cannot proceed without, and must never be lowered below a size this
+/// library has actually accepted.
+pub unsafe trait AbiStruct: Sized {
+    /// The smallest `struct_size` this library will accept.
+    ///
+    /// Defaults to the whole struct, which is the right answer whenever every
+    /// field is required — lowering it is a deliberate statement that the
+    /// fields past that point are optional.
+    const MINIMUM_SIZE: usize = size_of::<Self>();
+}
+
+/// Copy a caller-supplied versioned struct, tolerating an older, shorter one.
+///
+/// A caller compiled against an earlier header wrote fewer bytes than this
+/// build's struct holds. Reinterpreting its pointer as the current type would
+/// read past its allocation, so the bytes it did write are copied into a zeroed
+/// value instead and the rest read as absent. Zero is already what "not
+/// specified" means in these structs, so an absent field and an explicitly
+/// defaulted one are indistinguishable downstream — which is the point.
+///
+/// A *larger* struct is rejected: those extra bytes are fields from a contract
+/// this library has never seen, and ignoring them would be agreeing to
+/// semantics it cannot deliver. `MIGO_ERROR_UNSUPPORTED_ABI` says what is
+/// actually wrong — the caller's headers are newer — and
+/// `migo_query_capabilities` is how it discovers the range.
+///
+/// # Safety
+/// `header` must either be null or point at `struct_size` readable bytes, with
+/// `struct_size` set by the caller before the call.
+pub unsafe fn copy_versioned<T: AbiStruct>(
+    header: *const VersionedHeader,
+) -> Result<T, MigoResult> {
+    let Some(head) = (unsafe { header.as_ref() }) else {
+        return Err(MIGO_ERROR_INVALID_ARGUMENT);
+    };
+    if head.abi_version != MIGO_ABI_VERSION_CURRENT {
+        return Err(MIGO_ERROR_UNSUPPORTED_ABI);
+    }
+    let size = head.struct_size as usize;
+    if size > size_of::<T>() {
+        return Err(MIGO_ERROR_UNSUPPORTED_ABI);
+    }
+    if size < T::MINIMUM_SIZE {
+        return Err(MIGO_ERROR_INVALID_ARGUMENT);
+    }
+
+    // SAFETY: `AbiStruct` promises all-zeroes is valid for `T`, and only the
+    // `size` bytes the caller announced are read.
+    let mut value: T = unsafe { std::mem::zeroed() };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            header as *const u8,
+            &mut value as *mut T as *mut u8,
+            size,
+        );
+    }
+    Ok(value)
+}
+
 /// Validate a caller-supplied versioned struct.
 ///
 /// `expected_size` is the size this build compiled; a caller from a newer or
-/// older header is rejected rather than silently reinterpreted. ABI v1 requires
-/// an exact match — growth happens through new flagged fields in a later ABI
-/// version, not by accepting short structs today.
+/// older header is rejected rather than silently reinterpreted. Used where the
+/// struct has no optional tail, so short and long are both wrong. Structs whose
+/// appended fields are optional go through [`copy_versioned`] instead.
 ///
 /// # Safety
 /// `header` must either be null or point to a readable [`VersionedHeader`].
@@ -65,6 +136,12 @@ pub unsafe fn validate_header(
         return Err(MIGO_ERROR_INVALID_ARGUMENT);
     };
     if header.abi_version != MIGO_ABI_VERSION_CURRENT {
+        return Err(MIGO_ERROR_UNSUPPORTED_ABI);
+    }
+    // A larger struct is a newer contract, not a malformed argument: those
+    // bytes are fields this library has never seen. Saying so lets the caller
+    // reach for `migo_query_capabilities` instead of auditing its own call.
+    if header.struct_size as usize > expected_size {
         return Err(MIGO_ERROR_UNSUPPORTED_ABI);
     }
     if header.struct_size as usize != expected_size {

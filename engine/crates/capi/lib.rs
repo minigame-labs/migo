@@ -351,15 +351,21 @@ pub unsafe extern "C" fn migo_session_set_host_callbacks(
         let Some(session) = (unsafe { session.as_ref() }) else {
             return MIGO_ERROR_INVALID_ARGUMENT;
         };
-        if let Err(error) = unsafe {
-            validate_header(
+        // Copied rather than reinterpreted: a host compiled against an earlier
+        // header wrote fewer bytes than this struct now holds, and reading the
+        // appended fields straight from its pointer would read past what it
+        // allocated. `copy_versioned` reads only what the caller announced and
+        // leaves the rest null, which is what "that host never had this
+        // callback" already means.
+        let raw = match unsafe {
+            abi::copy_versioned::<callbacks::MigoHostCallbacks>(
                 callbacks as *const VersionedHeader,
-                size_of::<callbacks::MigoHostCallbacks>(),
             )
         } {
-            return error;
-        }
-        let copied = match unsafe { callbacks::HostCallbacks::from_c(&*callbacks) } {
+            Ok(raw) => raw,
+            Err(error) => return error,
+        };
+        let copied = match unsafe { callbacks::HostCallbacks::from_c(&raw) } {
             Ok(copied) => copied,
             Err(error) => return error,
         };

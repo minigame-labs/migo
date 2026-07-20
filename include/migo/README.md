@@ -130,7 +130,22 @@ The candidate cannot be declared stable until all of the following exist:
   multi-pointer delivery has never run on device, because a real two-finger gesture cannot
   be synthesized there -- `sendevent` is refused by SELinux and `input motionevent` carries
   one pointer. The ABI's batch conversion is covered by tests;
-- export lists, symbol/version tests, old-client/new-library tests, and per-target ILP32/LP64 layout lanes — **export list and symbol/version tests done** for `linux-x86_64` (`scripts/test-linux-sdk-contract.sh`); old-client/new-library lanes **open**, and the gap is now known rather than suspected: the `MigoHostCallbacks` comment below describes appended fields as tolerating a smaller `struct_size` from an older host, but `validate_header` requires exact equality, so such a host is rejected with `MIGO_ERROR_INVALID_ARGUMENT` instead. The comment states an intent the code does not implement. Closing it is an ABI-wide decision — which versioned structs accept a smaller size, how a partially copied struct's absent fields are defaulted, and what a *larger* size from a newer host means — so it belongs to this lane rather than to whichever slice next appends a field;
+- export lists, symbol/version tests, old-client/new-library tests, and per-target ILP32/LP64 layout lanes — **export list and symbol/version tests done** for `linux-x86_64` (`scripts/test-linux-sdk-contract.sh`); old-client/new-library lanes **inbound done, outbound open**. The append rule
+  `MigoHostCallbacks` documents is now real: a caller's struct is copied, not
+  reinterpreted, so a client compiled against an earlier header is accepted at its
+  own `struct_size` and the fields it never had read as absent rather than as its
+  neighbouring bytes. Smaller than the struct's documented minimum is
+  `MIGO_ERROR_INVALID_ARGUMENT`; larger is `MIGO_ERROR_UNSUPPORTED_ABI`, because
+  those bytes are a newer contract and ignoring them would be agreeing to
+  semantics this library cannot deliver. Two lanes cover it:
+  `tests/c_abi/old_client_contract.c` carries a previous header's shape and
+  asserts it is still a byte-exact prefix of the current one — which catches a
+  field *swap* that leaves the size and every pinned offset unchanged, and that
+  the layout pins cannot see — while `capi`'s own tests cover the runtime
+  behaviour against a truncated buffer with poisoned trailing bytes. **Open**:
+  the structs the library writes into (`MigoCapabilities`, `MigoSurfaceMetrics`)
+  have the mirror-image rule — write no more than the caller's `struct_size` —
+  and still validate exact sizes. They have no appended fields yet;
 - Android/Linux compatibility and performance gates with no material regression — **Linux compatibility gate done**, the rest open.
 
 The Linux artifact contract that is in place is described by

@@ -108,6 +108,18 @@ pub struct MigoHostCallbacks {
     pub on_update_keyboard: Option<MigoOnUpdateKeyboardFn>,
 }
 
+// SAFETY: every member is a `u32`, a raw pointer or an `Option<fn>`, all of
+// which are valid when zeroed -- a zeroed callback is `None`, which is exactly
+// what an older caller who never had the field meant.
+//
+// The minimum stops after `dispatch` because everything past it is an optional
+// callback, and `session.h` has promised since the frame-pacing slice that a
+// host omitting one simply does not get that behaviour. A host with a
+// dispatcher and no callbacks at all is a legitimate, if quiet, host.
+unsafe impl crate::abi::AbiStruct for MigoHostCallbacks {
+    const MINIMUM_SIZE: usize = 32;
+}
+
 /// The copy the session keeps.
 ///
 /// Only the fields above are retained — never the caller's struct, which the
@@ -560,6 +572,114 @@ mod tests {
             NonNull::new(0x1000usize as *mut c_void).expect("non-null session token"),
             Arc::new(AtomicBool::new(true)),
         )
+    }
+
+    /// Storage aligned like the real struct, so a short caller can be built
+    /// byte-exactly. A `Vec<u8>` would not be guaranteed 8-aligned, and reading
+    /// a `struct_size` out of a misaligned buffer is not the thing under test.
+    #[repr(align(8))]
+    struct ShortCaller([u8; size_of::<MigoHostCallbacks>()]);
+
+    /// Build the first `size` bytes of a full callback set, as an older client's
+    /// compiled code would have written them.
+    fn truncated_caller(size: usize) -> ShortCaller {
+        let mut full = raw_callbacks();
+        full.header.struct_size = size as u32;
+        let mut buffer = ShortCaller([0u8; size_of::<MigoHostCallbacks>()]);
+        // SAFETY: both are exactly `size_of::<MigoHostCallbacks>()` bytes, and
+        // the struct is plain data.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &full as *const MigoHostCallbacks as *const u8,
+                buffer.0.as_mut_ptr(),
+                size_of::<MigoHostCallbacks>(),
+            );
+        }
+        // Everything past the announced size belongs to nobody: an older client
+        // never allocated it, so leaving real bytes there would let a passing
+        // test hide a read past the caller's storage.
+        for byte in &mut buffer.0[size..] {
+            *byte = 0xAA;
+        }
+        buffer
+    }
+
+    /// A host compiled before the keyboard existed must still install.
+    ///
+    /// This is the case `session.h` has promised since the frame-pacing slice
+    /// and the code did not honour: exact-size validation rejected it outright.
+    #[test]
+    fn a_client_from_before_the_keyboard_still_installs() {
+        // 72 bytes: through `on_request_frame`, which is what the struct was
+        // before the keyboard verbs were appended.
+        let buffer = truncated_caller(72);
+        let copied = unsafe {
+            crate::abi::copy_versioned::<MigoHostCallbacks>(
+                buffer.0.as_ptr() as *const VersionedHeader,
+            )
+        }
+        .expect("a client from the previous header must be accepted");
+
+        assert!(
+            copied.on_show_keyboard.is_none()
+                && copied.on_hide_keyboard.is_none()
+                && copied.on_update_keyboard.is_none(),
+            "fields that client never had must read as absent, not as its neighbouring bytes"
+        );
+        assert!(
+            unsafe { HostCallbacks::from_c(&copied) }
+                .expect("valid")
+                .supplies_keyboard()
+                == false
+        );
+    }
+
+    /// The documented floor: a dispatcher and nothing else. A host that wants no
+    /// notifications at all is quiet, not wrong.
+    #[test]
+    fn a_client_with_only_a_dispatcher_installs() {
+        let buffer = truncated_caller(32);
+        let copied = unsafe {
+            crate::abi::copy_versioned::<MigoHostCallbacks>(
+                buffer.0.as_ptr() as *const VersionedHeader,
+            )
+        }
+        .expect("the minimum must be accepted");
+        assert!(copied.dispatch.is_some());
+        assert!(copied.on_ready.is_none());
+    }
+
+    /// One byte below the floor is missing part of `dispatch`, and there is no
+    /// call to make without it.
+    #[test]
+    fn a_client_below_the_minimum_is_rejected() {
+        let buffer = truncated_caller(31);
+        assert_eq!(
+            unsafe {
+                crate::abi::copy_versioned::<MigoHostCallbacks>(
+                    buffer.0.as_ptr() as *const VersionedHeader
+                )
+            }
+            .err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
+    }
+
+    /// A bigger struct is a newer contract, and the caller needs to hear that
+    /// rather than have its unknown fields silently dropped.
+    #[test]
+    fn a_client_from_a_newer_header_is_told_the_abi_is_unsupported() {
+        let mut raw = raw_callbacks();
+        raw.header.struct_size = size_of::<MigoHostCallbacks>() as u32 + 8;
+        assert_eq!(
+            unsafe {
+                crate::abi::copy_versioned::<MigoHostCallbacks>(
+                    &raw as *const MigoHostCallbacks as *const VersionedHeader,
+                )
+            }
+            .err(),
+            Some(crate::abi::MIGO_ERROR_UNSUPPORTED_ABI)
+        );
     }
 
     /// A host that can open a keyboard but not close it strands it on screen

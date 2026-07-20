@@ -43,6 +43,11 @@ compile_core() {
     done
     compile_c "$ROOT/tests/c_abi/core_contract.c" "$TMP_ROOT/core_contract.o"
     compile_cpp "$ROOT/tests/c_abi/core_contract.cc" "$TMP_ROOT/core_contract_cpp.o"
+    # The old-client lane: a translation unit carrying a previous header's shape,
+    # asserting it is still a byte-exact prefix of the current one. An inserted
+    # field would keep the size a short client announces and change what every
+    # byte after it means, which no size check can catch.
+    compile_c "$ROOT/tests/c_abi/old_client_contract.c" "$TMP_ROOT/old_client_contract.o"
 }
 
 compile_platforms() {
