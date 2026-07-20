@@ -1,16 +1,18 @@
 # Migo C ABI and Surface v1 candidate
 
-These headers are a design candidate. They make Migo's planned low-level embedding contract reviewable from C11 and C++17. On desktop Linux they are also callable: `scripts/build-linux-sdk.sh` produces `libmigo.so` and `libmigo.a` exporting exactly the `migo_*` set declared here, with pkg-config and CMake integration. Everywhere else the headers remain compile-only.
+These headers are a design candidate. They make Migo's planned low-level embedding contract reviewable from C11 and C++17. On Linux they are also callable: `scripts/build-linux-sdk.sh` produces `libmigo.so` and `libmigo.a` exporting exactly the `migo_*` set declared here, with pkg-config and CMake integration, and `scripts/build-android-c-host.sh` cross-compiles the same implementation as a static library for Android. Everywhere else the headers remain compile-only.
 
 The public markers are intentional:
 
 ```c
 MIGO_C_ABI_CANDIDATE  == 1     /* still a candidate everywhere */
-MIGO_C_ABI_HAS_RUNTIME == 1    /* desktop Linux: a linkable runtime exists */
-MIGO_C_ABI_HAS_RUNTIME == 0    /* Android and every other target */
+MIGO_C_ABI_HAS_RUNTIME == 1    /* Linux, desktop and Android: a linkable runtime exists */
+MIGO_C_ABI_HAS_RUNTIME == 0    /* every other target */
 ```
 
-A runtime existing is not the same as the ABI being frozen. Do not treat these headers as a stable SDK: the freeze blockers below are open, and the surface may still change. Android continues to use the existing Java/JNI SDK and exports no `migo_*` symbols.
+A runtime existing is not the same as the ABI being frozen. Do not treat these headers as a stable SDK: the freeze blockers below are open, and the surface may still change.
+
+Android's runtime is a **static library built from the source tree** (`scripts/build-android-c-host.sh`), driven by `examples/c-host/android` — a NativeActivity with no Java of its own. It is not packaged: no pkg-config, no CMake package, no versioned shared object, which desktop Linux does have. The `libmigo.so` the Java/JNI SDK ships is a different artifact and still exports no `migo_*` symbols.
 
 ## Header layout
 
@@ -159,7 +161,12 @@ The candidate cannot be declared stable until all of the following exist:
   the structs the library writes into (`MigoCapabilities`, `MigoSurfaceMetrics`)
   have the mirror-image rule — write no more than the caller's `struct_size` —
   and still validate exact sizes. They have no appended fields yet;
-- Android/Linux compatibility and performance gates with no material regression — **Linux compatibility gate done**, the rest open.
+- Android/Linux compatibility and performance gates with no material regression — **Linux compatibility gate done**, the rest open;
+- Android packaging for a third-party consumer — **open**. `MIGO_C_ABI_HAS_RUNTIME` is 1 on
+  Android because a linkable runtime genuinely exists and runs on device, but a host links it
+  out of the source tree: there is no pkg-config file, no CMake package and no versioned
+  shared object, all of which desktop Linux has. That is packaging, not capability, and it is
+  what stands between "callable" and "shippable" on Android.
 
 The Linux artifact contract that is in place is described by
 `dist/migo-linux-x86_64/share/migo/linux-x86_64-manifest.json`: target triple, CPU

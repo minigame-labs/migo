@@ -43,9 +43,19 @@
  *
  * Desktop Linux ships one: scripts/build-linux-sdk.sh produces libmigo.so and
  * libmigo.a exporting exactly the migo_* set declared here, with pkg-config and
- * CMake integration. Android embeds through the Java/JNI SDK and exports no
- * migo_* symbols, so the answer there is still no -- a host must not compile
- * against these declarations expecting to link.
+ * CMake integration.
+ *
+ * Android ships one too, as a static library: scripts/build-android-c-host.sh
+ * cross-compiles it, and examples/c-host/android is a NativeActivity with no
+ * Java of its own that links it and drives surface attach, lifecycle, touch,
+ * the soft keyboard, physical keys, IME composition and gamepads on device.
+ * The separate libmigo.so that the Java/JNI SDK ships still exports no migo_*
+ * symbols -- that is a different artifact, and this macro is about whether a
+ * linkable runtime exists, not about which artifact carries it.
+ *
+ * What Android does NOT have yet is packaging: no pkg-config, no CMake package,
+ * no versioned shared object. A host links the static library from the source
+ * tree. That gap is tracked in README.md, not here.
  *
  * This says a runtime exists, not that the ABI is frozen; MIGO_C_ABI_CANDIDATE
  * remains 1 until the README's blockers are closed.
@@ -54,7 +64,7 @@
  * linked -- it cannot do otherwise, being a preprocessor macro. Ask
  * migo_query_capabilities (capabilities.h) about the library itself.
  */
-#if defined(__linux__) && !defined(__ANDROID__)
+#if defined(__linux__)
 #define MIGO_C_ABI_HAS_RUNTIME 1
 #else
 #define MIGO_C_ABI_HAS_RUNTIME 0
