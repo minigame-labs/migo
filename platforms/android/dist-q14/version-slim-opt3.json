@@ -1,7 +1,0 @@
-{
-    "productProfile": "slim",
-    "buildType": "release",
-    "codegenProfile": "3",
-    "cargoProfile": "release-hot3",
-    "buildTime": "2026-07-14 09:26:32"
-}
