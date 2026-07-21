@@ -48,6 +48,11 @@ compile_core() {
     # field would keep the size a short client announces and change what every
     # byte after it means, which no size check can catch.
     compile_c "$ROOT/tests/c_abi/old_client_contract.c" "$TMP_ROOT/old_client_contract.o"
+    # The output-side mirror: library-written structs must grow append-only too,
+    # so a v1 client's buffer is never overrun. Independent redeclaration catches
+    # a same-type field swap that size and header pins cannot see.
+    compile_c "$ROOT/tests/c_abi/old_client_outbound_contract.c" \
+        "$TMP_ROOT/old_client_outbound_contract.o"
 }
 
 compile_platforms() {

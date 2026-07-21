@@ -201,10 +201,19 @@ The candidate cannot be declared stable until all of the following exist:
   asserts it is still a byte-exact prefix of the current one — which catches a
   field *swap* that leaves the size and every pinned offset unchanged, and that
   the layout pins cannot see — while `capi`'s own tests cover the runtime
-  behaviour against a truncated buffer with poisoned trailing bytes. **Open**:
-  the structs the library writes into (`MigoCapabilities`, `MigoSurfaceMetrics`)
-  have the mirror-image rule — write no more than the caller's `struct_size` —
-  and still validate exact sizes. They have no appended fields yet;
+  behaviour against a truncated buffer with poisoned trailing bytes. The structs the
+  library writes into (`MigoCapabilities`, `MigoSurfaceReleaseStatus`) have the
+  mirror-image rule — write no more than the caller's `struct_size`, so a short old
+  client is never overrun — and **outbound is now covered by the same two lanes**:
+  `tests/c_abi/old_client_outbound_contract.c` independently redeclares each
+  library-written struct and pins every field offset, catching a same-type field
+  swap (e.g. `MigoCapabilities`'s adjacent `abi_version_min`/`abi_version_max`) that
+  leaves `sizeof` and the header pins unchanged; and `migo_capi_abi`'s
+  `output_prefix` tests cover the runtime behaviour against a *grown* struct whose
+  appended field is poisoned, proving the library writes only the old client's prefix
+  and leaves that field untouched. No library-written struct has appended a field
+  yet, so the C lane's declared shape is the current one today; it becomes a true
+  old-versus-new prefix check the moment one grows;
 - Android/Linux compatibility and performance gates with no material regression — **Linux compatibility gate done**, the rest open;
 - Android packaging for a third-party consumer — **open**. `MIGO_C_ABI_HAS_RUNTIME` is 1 on
   Android because a linkable runtime genuinely exists and runs on device, but a host links it
