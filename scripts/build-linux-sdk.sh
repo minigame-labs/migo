@@ -79,7 +79,7 @@ fi
 info "sysroot: $MIGO_SYSROOT"
 info "building capi staticlib (release, $TARGET)"
 cargo build --manifest-path "$ENGINE_DIR/Cargo.toml" \
-    -p capi --release --target "$TARGET"
+    -p migo-capi --release --target "$TARGET"
 
 info "built: $ENGINE_DIR/target/$TARGET/release/libmigo_capi.a"
 
@@ -90,12 +90,12 @@ info "built: $ENGINE_DIR/target/$TARGET/release/libmigo_capi.a"
 # build host's newer symbols.
 info "building the reference consumer used for the floor audit"
 cargo build --manifest-path "$ENGINE_DIR/Cargo.toml" \
-    -p c-host-example --release --target "$TARGET"
+    -p migo-c-host-example --release --target "$TARGET"
 
 info "capturing the link line cargo uses"
 LINK_NOTE="$ENGINE_DIR/target/$TARGET/release/native-static-libs.txt"
 cargo rustc --manifest-path "$ENGINE_DIR/Cargo.toml" \
-    -p capi --lib --release --target "$TARGET" --crate-type staticlib -- \
+    -p migo-capi --lib --release --target "$TARGET" --crate-type staticlib -- \
     --print native-static-libs > "$LINK_NOTE" 2>&1
 grep -q 'native-static-libs:' "$LINK_NOTE" \
     || { echo "[linux-sdk] cargo did not report native-static-libs" >&2; exit 1; }

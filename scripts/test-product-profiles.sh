@@ -12,13 +12,13 @@ fail() {
 
 tree_for() {
   local profile="$1"
-  (cd "$ENGINE" && cargo tree -p platform -e features \
+  (cd "$ENGINE" && cargo tree -p migo-platform -e features \
     --no-default-features --features "profile-$profile" --locked --offline)
 }
 
 js_features_for() {
   local profile="$1"
-  (cd "$ENGINE" && cargo tree -p platform -e features -i js-runtime \
+  (cd "$ENGINE" && cargo tree -p migo-platform -e features -i migo-runtime-v8 \
     --no-default-features --features "profile-$profile" --locked --offline)
 }
 
@@ -37,22 +37,22 @@ MISSING_DEFAULTS="$(
 )"
 [[ -z "$MISSING_DEFAULTS" ]] \
   || fail "internal dependencies must disable defaults:\n$MISSING_DEFAULTS"
-grep -q 'js-runtime feature "v8-limits"' <<<"$SLIM_JS_FEATURES" \
-  || fail "slim must retain js-runtime/v8-limits"
-grep -q 'js-runtime feature "code-signing"' <<<"$SLIM_JS_FEATURES" \
-  || fail "slim must retain js-runtime/code-signing"
-if grep -Eq 'js-runtime feature "api-(sensors|media|connectivity|commerce|system)"' \
+grep -q 'migo-runtime-v8 feature "v8-limits"' <<<"$SLIM_JS_FEATURES" \
+  || fail "slim must retain runtime-v8/v8-limits"
+grep -q 'migo-runtime-v8 feature "code-signing"' <<<"$SLIM_JS_FEATURES" \
+  || fail "slim must retain runtime-v8/code-signing"
+if grep -Eq 'migo-runtime-v8 feature "api-(sensors|media|connectivity|commerce|system)"' \
     <<<"$SLIM_JS_FEATURES"; then
-  fail "slim leaked an optional js-runtime API group"
+  fail "slim leaked an optional runtime-v8 API group"
 fi
-if grep -Eq '(^|[[:space:]])(audio|cpal) v[0-9]' <<<"$SLIM_TREE"; then
+if grep -Eq '(^|[[:space:]])(migo-audio|cpal) v[0-9]' <<<"$SLIM_TREE"; then
   fail "slim leaked the native audio dependency graph"
 fi
 for feature in api-sensors api-media api-connectivity api-commerce api-system; do
-  grep -q "js-runtime feature \"$feature\"" <<<"$FULL_JS_FEATURES" \
-    || fail "full did not enable js-runtime/$feature"
+  grep -q "migo-runtime-v8 feature \"$feature\"" <<<"$FULL_JS_FEATURES" \
+    || fail "full did not enable runtime-v8/$feature"
 done
-grep -Eq '(^|[[:space:]])audio v[0-9]' <<<"$FULL_TREE" \
+grep -Eq '(^|[[:space:]])migo-audio v[0-9]' <<<"$FULL_TREE" \
   || fail "full must retain native audio"
 
 echo "[3/7] checking Gradle native artifacts are profile-exact"
@@ -79,18 +79,18 @@ fi
 
 echo "[4/7] checking named-profile exactness and mutual exclusion"
 grep -Rqs 'all(feature = "profile-full", feature = "profile-slim")' \
-  "$ENGINE/crates/platform" "$ENGINE/crates/core" "$ENGINE/crates/js-runtime" \
+  "$ENGINE/crates/platform" "$ENGINE/crates/core" "$ENGINE/crates/runtime-v8" \
   || fail "named full+slim profiles are not rejected at compile time"
-if (cd "$ENGINE" && cargo check -p js-runtime --no-default-features \
+if (cd "$ENGINE" && cargo check -p migo-runtime-v8 --no-default-features \
     --features profile-slim,api-media --locked --offline >/dev/null 2>&1); then
   fail "profile-slim must reject optional API groups added outside the named profile"
 fi
 
 echo "[5/7] running full/slim game-visible surface tests"
-(cd "$ENGINE" && cargo test -j1 -p js-runtime --lib --no-default-features \
+(cd "$ENGINE" && cargo test -j1 -p migo-runtime-v8 --lib --no-default-features \
   --features profile-slim --locked --offline \
   tests_global_surface::global_surface_tests::product_profile_surface_matches_features -- --exact)
-(cd "$ENGINE" && cargo test -j1 -p js-runtime --lib --no-default-features \
+(cd "$ENGINE" && cargo test -j1 -p migo-runtime-v8 --lib --no-default-features \
   --features profile-full --locked --offline \
   tests_global_surface::global_surface_tests::product_profile_surface_matches_features -- --exact)
 
@@ -127,7 +127,7 @@ grep -q -- '-PmigoCodegenProfile=' "$ROOT/scripts/build-aar.ps1" \
 
 echo "[7/7] checking snapshot inputs use the same named product"
 grep -q 'SNAPSHOT-{product_profile}-{target_arch}' \
-  "$ENGINE/crates/js-runtime/build.rs" \
+  "$ENGINE/crates/runtime-v8/build.rs" \
   || fail "snapshot selection is not profile-qualified"
 
 echo "PASS: R6 full/slim product contract holds"

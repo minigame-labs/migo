@@ -377,6 +377,13 @@ tasks.configureEach { task ->
 preBuild.dependsOn generateBuildInfo
 
 dependencies {
-    // Zero dependencies - no AndroidX required
-    // All annotations are replaced with JavaDoc comments
+    // Zero *shipping* dependencies - no AndroidX required.
+    // All annotations are replaced with JavaDoc comments.
+    //
+    // JUnit is `testImplementation`, so it is on the unit-test compile/runtime
+    // classpath only and never enters the published AAR. The host-JVM state
+    // machines it exercises (VsyncSchedulerState, LifecycleRequestState, ...)
+    // are deliberately free of android.* precisely so they can be tested here
+    // rather than on a device.
+    testImplementation 'junit:junit:4.13.2'
 }

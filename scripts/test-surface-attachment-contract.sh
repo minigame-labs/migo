@@ -78,86 +78,86 @@ fi
 # review is the point of the gate. Build scripts are exempt because they
 # configure link flags at compile time, not runtime implementation selection.
 if rg -n 'libEGL\.so' "$CRATES" \
-    --glob '!**/platform/android/presenter.rs' \
-    --glob '!**/platform/desktop/presenter.rs' \
+    --glob '!**/platform/src/android/presenter.rs' \
+    --glob '!**/platform/src/desktop/presenter.rs' \
     --glob '!**/build.rs'; then
     fail "EGL implementation selection escaped the platform providers"
 fi
 
-require_multiline_regex "$CRATES/shared/protocol/host_cmd.rs" \
+require_multiline_regex "$CRATES/shared/src/protocol/host_cmd.rs" \
     'SurfaceDestroyed[[:space:]]*\{[^}]*generation:[[:space:]]*SurfaceGeneration' \
     "Host SurfaceDestroyed command is not generation-tagged"
-require_multiline_regex "$CRATES/shared/protocol/render_cmd.rs" \
+require_multiline_regex "$CRATES/shared/src/protocol/render_cmd.rs" \
     'SurfaceDestroyed[[:space:]]*\{[[:space:]]*generation:[[:space:]]*SurfaceGeneration' \
     "render SurfaceDestroyed command is not generation-tagged"
-require_multiline_regex "$CRATES/shared/protocol/render_cmd.rs" \
+require_multiline_regex "$CRATES/shared/src/protocol/render_cmd.rs" \
     'RecreateOnscreen[[:space:]]*\{[[:space:]]*lease:[[:space:]]*SurfaceLease' \
     "onscreen recreation does not carry a SurfaceLease"
 # Two literals, because the gate moved behind SurfaceControl: the registry holds
 # the control, and the control holds the gate. Pinning only the registry field
 # would pass for a SurfaceControl that had quietly stopped owning a gate, which
 # is the invariant actually worth protecting.
-require_literal "$CRATES/core/runtime/registry.rs" \
+require_literal "$CRATES/core/src/runtime/registry.rs" \
     "surface_control: Arc<SurfaceControl>" \
     "Host registry is missing the queue-independent Surface control"
-require_literal "$CRATES/shared/surface/control.rs" \
+require_literal "$CRATES/shared/src/surface/control.rs" \
     "gate: Arc<SurfaceGenerationGate>" \
     "SurfaceControl no longer owns the queue-independent generation gate"
-require_literal "$CRATES/core/runtime/registry.rs" \
+require_literal "$CRATES/core/src/runtime/registry.rs" \
     "surface_control.shutdown();" \
     "shutdown does not retire the current Surface before render join"
 # ...and shutdown must still mean retirement, not just a flag. Without this the
 # check above would pass for a shutdown() that stopped retiring.
-require_multiline_regex "$CRATES/shared/surface/control.rs" \
+require_multiline_regex "$CRATES/shared/src/surface/control.rs" \
     'pub fn shutdown\(&self\)[^{]*\{[[:space:]]*self\.shutting_down[^;]*;[[:space:]]*self\.retire_current_and_request\(\)' \
     "SurfaceControl::shutdown no longer retires the current Surface"
-require_literal "$CRATES/core/services/render.rs" \
+require_literal "$CRATES/core/src/services/render.rs" \
     "attachment: SurfaceAttachmentSlot" \
     "Host render service is missing its unique attachment slot"
-require_literal "$CRATES/graphics/render_thread.rs" \
+require_literal "$CRATES/graphics/src/render_thread.rs" \
     "let mut render_binding = RenderSurfaceBinding::new();" \
     "render thread is missing its retained Surface binding"
-require_literal "$CRATES/graphics/canvas/handler.rs" \
+require_literal "$CRATES/graphics/src/canvas/handler.rs" \
     "RecreateOnscreen must be preflighted by the render thread" \
     "CanvasHandler can bypass generation preflight"
-require_literal "$CRATES/graphics/surface_binding.rs" \
+require_literal "$CRATES/graphics/src/surface_binding.rs" \
     "pub(crate) fn clear_after_egl_teardown" \
     "native Surface resource release is not ordered after EGL teardown"
-require_multiline_regex "$CRATES/graphics/render_thread.rs" \
+require_multiline_regex "$CRATES/graphics/src/render_thread.rs" \
     'binding[[:space:]]*\.[[:space:]]*preflight\(&lease\)' \
     "Surface generation is not rejected before presenter preparation"
-require_literal "$CRATES/graphics/render_thread.rs" \
+require_literal "$CRATES/graphics/src/render_thread.rs" \
     "cm.is_surface_recovery_ready()" \
     "context recovery is not gated on a fully installed prepared target"
-require_literal "$CRATES/graphics/render_thread.rs" \
+require_literal "$CRATES/graphics/src/render_thread.rs" \
     ".validate_prepared(prepared.as_ref())" \
     "prepared presenter backend is not revalidated inside installation"
-require_literal "$CRATES/graphics/canvas/manager/mod.rs" \
+require_literal "$CRATES/graphics/src/canvas/manager/mod.rs" \
     "installed_surface: Option<PreparedEglSurfaceRef>" \
     "CanvasManager does not retain the prepared presentation target"
-require_literal "$CRATES/graphics/canvas/manager/mod.rs" \
+require_literal "$CRATES/graphics/src/canvas/manager/mod.rs" \
     "drawing_buffer: Option<drawing_buffer::DrawingBuffer>" \
     "partial onscreen EGL ownership does not keep the preserved DrawingBuffer paired with its context"
-require_literal "$CRATES/graphics/canvas/manager/mod.rs" \
+require_literal "$CRATES/graphics/src/canvas/manager/mod.rs" \
     "self.preserved_drawing_buffer = pending.drawing_buffer.take()" \
     "partial onscreen cleanup does not restore the preserved context/DB pair"
-require_literal "$CRATES/graphics/canvas/manager/types.rs" \
+require_literal "$CRATES/graphics/src/canvas/manager/types.rs" \
     "Window," \
     "window SurfaceKind still carries a platform-native integer"
-require_literal "$CRATES/graphics/canvas/manager/egl_ops.rs" \
+require_literal "$CRATES/graphics/src/canvas/manager/egl_ops.rs" \
     "struct InitializedDisplayGuard" \
     "initialized EGL display has no early-return teardown guard"
-require_literal "$CRATES/graphics/canvas/manager/egl_ops.rs" \
+require_literal "$CRATES/graphics/src/canvas/manager/egl_ops.rs" \
     "struct ContextCleanupGuard" \
     "partial pbuffer creation has no EGLContext teardown guard"
-require_literal "$CRATES/graphics/canvas/manager/egl_ops.rs" \
+require_literal "$CRATES/graphics/src/canvas/manager/egl_ops.rs" \
     "pub(super) struct EglRuntime" \
     "CanvasManager construction has no owned EGL display fallback"
-require_literal "$CRATES/graphics/upload_thread.rs" \
+require_literal "$CRATES/graphics/src/upload_thread.rs" \
     "provider.backend_id() != expected_backend" \
     "upload EGL dispatch does not fail closed on provider identity mismatch"
 
-ANDROID_PRESENTER="$CRATES/platform/android/presenter.rs"
+ANDROID_PRESENTER="$CRATES/platform/src/android/presenter.rs"
 require_literal "$ANDROID_PRESENTER" \
     "pub struct AndroidEglProvider" \
     "Android system-EGL provider is missing"
@@ -179,7 +179,7 @@ require_multiline_regex "$ANDROID_PRESENTER" \
 if [[ -f "$ANDROID_PRESENTER" ]] && rg -n 'ANativeWindow_(acquire|release)' "$ANDROID_PRESENTER"; then
     fail "prepared Android presenter target must remain non-owning ($ANDROID_PRESENTER)"
 fi
-require_literal "$CRATES/platform/android/jni/inbound.rs" \
+require_literal "$CRATES/platform/src/android/jni/inbound.rs" \
     "android_graphics_platform()" \
     "Android bootstrap does not inject its matched graphics platform"
 
@@ -197,10 +197,10 @@ require_literal "$ROOT/include/migo/types.h" \
 require_literal "$ROOT/include/migo/types.h" \
     "#define MIGO_C_ABI_CANDIDATE 1" \
     "C ABI must remain a candidate until the README blockers are closed"
-require_literal "$CRATES/platform/android/jni/profile_contract.rs" \
+require_literal "$CRATES/platform/src/android/jni/profile_contract.rs" \
     '("updateSurface", "(ILjava/lang/Object;IIF)V")' \
     "Android updateSurface JNI descriptor changed"
-require_literal "$CRATES/platform/android/jni/profile_contract.rs" \
+require_literal "$CRATES/platform/src/android/jni/profile_contract.rs" \
     '("onSurfaceDestroyed", "(I)V")' \
     "Android onSurfaceDestroyed JNI descriptor changed"
 
@@ -211,7 +211,7 @@ require_active_run .github/workflows/release.yml \
 
 (
     cd "$ROOT/engine"
-    cargo test -p shared surface::attachment --lib --locked --offline
+    cargo test -p migo-shared surface::attachment --lib --locked --offline
 )
 
 echo "SurfaceAttachment lifecycle contract: PASS"

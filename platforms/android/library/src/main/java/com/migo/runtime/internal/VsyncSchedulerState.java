@@ -7,7 +7,7 @@ package com.migo.runtime.internal;
  * <p>Holds only the four scheduling booleans and returns the {@link Action} the
  * caller must perform against the {@code Choreographer} on the UI thread. It
  * deliberately has <b>no</b> {@code android.*} dependency so it can be unit
- * tested on a host JVM (see {@code scripts/test-vsync-scheduler-state.sh}).
+ * tested on a host JVM by {@code :library:testFullDebugUnitTest}.
  *
  * <p>Model: a frame callback is posted only on demand ({@link #requestFrame()}),
  * never self-reposted from {@code doFrame}. Demand that cannot be posted right

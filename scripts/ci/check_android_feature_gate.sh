@@ -51,7 +51,7 @@ trap 'rm -f "$FEATURES_OUT"' EXIT
 cargo tree \
     --target "$TARGET" \
     -e features \
-    --package platform \
+    --package migo-platform \
     --prefix none \
     --no-default-features \
     --quiet \

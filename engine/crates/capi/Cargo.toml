@@ -1,5 +1,5 @@
 [package]
-name = "capi"
+name = "migo-capi"
 version = "0.1.0"
 edition = "2024"
 
@@ -10,20 +10,19 @@ edition = "2024"
 # testable from Rust.
 [lib]
 name = "migo_capi"
-path = "lib.rs"
 crate-type = ["staticlib", "rlib"]
 
 [features]
 default = ["profile-full"]
-profile-full = ["core/profile-full", "platform/profile-full"]
-profile-slim = ["core/profile-slim", "platform/profile-slim"]
+profile-full = ["migo-core/profile-full", "platform/profile-full"]
+profile-slim = ["migo-core/profile-slim", "platform/profile-slim"]
 
 [dependencies]
-core = { path = "../core", default-features = false }
-migo-capi-abi = { path = "../capi-abi" }
-platform = { path = "../platform", default-features = false }
-shared = { path = "../shared", default-features = false }
-graphics = { path = "../graphics", default-features = false }
+migo-core = { path = "../core", default-features = false }
+migo-capi-abi = { path = "../capi-abi", default-features = false }
+platform = { package = "migo-platform", path = "../platform", default-features = false }
+shared = { package = "migo-shared", path = "../shared", default-features = false }
+graphics = { package = "migo-graphics", path = "../graphics", default-features = false }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The keyboard options arrive from the engine as JSON, which must not reach C:

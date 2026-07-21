@@ -30,8 +30,13 @@ ANDROID_API=26
 # The cdylib is its own crate so that `platform` can stay an rlib (host builds
 # and tests cannot link V8 into a shared object; see CLAUDE.md §10). Its
 # `[lib] name` is `migo`, so cargo emits the shipping name directly.
-CRATE_NAME="android-jni"
-CRATE_DIR="crates/$CRATE_NAME"
+# The package name and the directory name are deliberately two variables: every
+# package carries the `migo-` prefix, while the directories do not repeat it.
+# Deriving one from the other is what broke this script when the packages were
+# renamed -- `pushd` into a non-existent directory left cargo running at the
+# repository root, which has no manifest.
+CRATE_NAME="migo-android-jni"
+CRATE_DIR="crates/android-jni"
 
 CRATE_SO_NAME="libmigo.so"
 OUTPUT_SO_NAME="libmigo.so"
@@ -62,6 +67,16 @@ V8_LIBS_DIR="$ENGINE_ROOT/third_party/rusty_v8"
 
 if [[ ! -d "$ENGINE_ROOT" ]]; then
     print_error "engine directory not found at $ENGINE_ROOT"
+    exit 1
+fi
+
+# Checked here rather than at the `pushd` below, because a failed `pushd` does
+# not stop the build: cargo simply runs in whatever directory the script was
+# invoked from, and the error it reports is a missing manifest -- which reads
+# like a broken checkout instead of a wrong path in this file.
+if [[ ! -f "$CRATE_PATH/Cargo.toml" ]]; then
+    print_error "crate manifest not found at $CRATE_PATH/Cargo.toml"
+    print_error "CRATE_DIR ($CRATE_DIR) does not name a directory under $ENGINE_ROOT"
     exit 1
 fi
 
@@ -381,7 +396,11 @@ build_platform() {
     # amalgamation compile.  Space-separated, no quoting needed.
     export LIBSQLITE3_FLAGS="${sqlite_omit_flags[*]}"
 
-    pushd "$CRATE_PATH" > /dev/null
+    pushd "$CRATE_PATH" > /dev/null || {
+        print_error "cannot enter crate directory $CRATE_PATH"
+        export RUSTFLAGS="$orig_rustflags"
+        return 1
+    }
 
     # NB: `if !` / `||` around a function disables bash's `set -e` inside
     # it, which previously let a failed cargo build slip through because

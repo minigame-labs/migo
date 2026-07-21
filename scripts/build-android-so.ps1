@@ -28,11 +28,18 @@ param(
 # promote minSdk for the whole engine.
 $ANDROID_API = 26
 
-$CRATE_NAME = "platform"
-$CRATE_DIR  = "crates/$CRATE_NAME"
+# Kept in step with the shell script, which is the lane that is actually
+# exercised; this one had drifted two changes behind (the cdylib moved out of
+# `platform` into its own crate, and every package later gained a `migo-`
+# prefix), so it pointed at a crate and an output file that no longer exist.
+# Package name and directory name are separate variables on purpose: packages
+# carry the prefix, directories do not.
+$CRATE_NAME = "migo-android-jni"
+$CRATE_DIR  = "crates/android-jni"
 
-# cargo output naming rule: lib{crate}.so
-$CRATE_SO_NAME = "lib$CRATE_NAME.so"
+# Not `lib$CRATE_NAME.so`: the crate sets `[lib] name = "migo"`, so cargo emits
+# the shipping file name directly.
+$CRATE_SO_NAME = "libmigo.so"
 
 $OUTPUT_SO_NAME = "libmigo.so"
 

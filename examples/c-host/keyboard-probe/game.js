@@ -60,7 +60,7 @@ function paint() {
   // being typed but not yet committed.
   ctx.fillText('preedit=[' + preedit + ']', 24, 240);
   ctx.fillText('compositions=' + compositions, 24, 284);
-  const pad = wx.getGamepads()[0];
+  const pad = migo.getGamepads()[0];
   ctx.fillText(pad
     ? 'pad ax0=' + pad.axes[0].toFixed(2) +
       ' b0=' + (pad.buttons[0].pressed ? 'down' : 'up') +

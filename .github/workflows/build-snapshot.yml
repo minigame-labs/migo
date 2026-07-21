@@ -18,7 +18,7 @@ name: Build V8 Snapshot
 #             so an arm64 Android emulator cannot be hardware-accelerated and
 #             this approach is not available on hosted runners. Generate the
 #             arm64 snapshot on a real arm64 device and commit/upload
-#             engine/crates/js-runtime/snapshots/SNAPSHOT-<profile>-aarch64.bin.
+#             engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-aarch64.bin.
 #             The exact device steps are documented in snapshot-gen/src/main.rs.
 #             (A self-hosted arm64 runner with an attached device could automate
 #             this later.)
@@ -54,12 +54,12 @@ on:
     # and snapshot-gen Rust/feature inputs, Cargo.lock, product features, and the
     # exact Android V8 archive, so every one of those changes must run the gate.
     paths:
-      - "engine/crates/js-runtime/**/*.js"
-      - "engine/crates/js-runtime/**/*.rs"
-      - "engine/crates/js-runtime/Cargo.toml"
-      - "engine/crates/js-runtime/snapshots/**"
-      - "engine/crates/snapshot-gen/**/*.rs"
-      - "engine/crates/snapshot-gen/Cargo.toml"
+      - "engine/crates/runtime-v8/**/*.js"
+      - "engine/crates/runtime-v8/**/*.rs"
+      - "engine/crates/runtime-v8/Cargo.toml"
+      - "engine/crates/runtime-v8/snapshots/**"
+      - "engine/tools/snapshot-gen/**/*.rs"
+      - "engine/tools/snapshot-gen/Cargo.toml"
       - "engine/third_party/rusty_v8/**/librusty_v8.a"
       - "engine/Cargo.lock"
       - "scripts/lib/snapshot-fingerprint.sh"
@@ -213,18 +213,18 @@ jobs:
             adb push engine/target/x86_64-linux-android/debug/migo-snapshot-gen /data/local/tmp/migo-snapshot-gen
             adb shell chmod 755 /data/local/tmp/migo-snapshot-gen
             adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp MIGO_SNAPSHOT_KIND=$SNAPSHOT_KIND MIGO_SNAPSHOT_OUT=/data/local/tmp/SNAPSHOT.bin ./migo-snapshot-gen"
-            mkdir -p engine/crates/js-runtime/snapshots
-            adb pull /data/local/tmp/SNAPSHOT.bin engine/crates/js-runtime/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
+            mkdir -p engine/crates/runtime-v8/snapshots
+            adb pull /data/local/tmp/SNAPSHOT.bin engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
 
       - name: Inspect snapshot
         run: |
-          f=engine/crates/js-runtime/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
+          f=engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
           ls -la "$f"
           echo "size:  $(stat -c %s "$f") bytes"
           echo "sha256:"; sha256sum "$f"
 
       - name: Write manifest
-        run: bash scripts/write-snapshot-manifest.sh ${{ inputs.product_profile }} x86_64 engine/crates/js-runtime/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin $SNAPSHOT_KIND
+        run: bash scripts/write-snapshot-manifest.sh ${{ inputs.product_profile }} x86_64 engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin $SNAPSHOT_KIND
 
       # Push the regenerated snapshot to a branch and surface a one-click
       # "create PR" link in the run summary. We deliberately do NOT call
@@ -235,7 +235,7 @@ jobs:
       - name: Push regen branch + surface PR link
         run: |
           set -euo pipefail
-          bin=engine/crates/js-runtime/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
+          bin=engine/crates/runtime-v8/snapshots/$SNAPSHOT_PREFIX-${{ inputs.product_profile }}-x86_64.bin
           man="$bin.manifest.json"
           # `git diff` ignores untracked files, so require both artifacts to be
           # tracked before considering the first Worker generation unchanged.
@@ -285,6 +285,6 @@ jobs:
         with:
           name: snapshot-${{ inputs.snapshot_kind }}-${{ inputs.product_profile }}-x86_64
           path: |
-            engine/crates/js-runtime/snapshots/${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}-${{ inputs.product_profile }}-x86_64.bin
-            engine/crates/js-runtime/snapshots/${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}-${{ inputs.product_profile }}-x86_64.bin.manifest.json
+            engine/crates/runtime-v8/snapshots/${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}-${{ inputs.product_profile }}-x86_64.bin
+            engine/crates/runtime-v8/snapshots/${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}-${{ inputs.product_profile }}-x86_64.bin.manifest.json
           if-no-files-found: error

@@ -221,7 +221,7 @@ def validate_snapshot(
 ) -> dict[str, Any]:
     prefix = "SNAPSHOT" if kind == "host" else "SNAPSHOT-worker"
     name = f"{prefix}-{profile}-{target['arch']}.bin"
-    snapshot_path = repo_root / "engine/crates/js-runtime/snapshots" / name
+    snapshot_path = repo_root / "engine/crates/runtime-v8/snapshots" / name
     manifest_path = pathlib.Path(f"{snapshot_path}.manifest.json")
     manifest = read_json(manifest_path, f"{kind} snapshot manifest")
     required = {

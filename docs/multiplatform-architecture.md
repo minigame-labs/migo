@@ -119,9 +119,9 @@ Linux 不用 Ubuntu/Fedora 等发行版营销版本作为 ABI。官方 `linux-gn
 | AHardwareBuffer 路径 | Android 零拷贝能力进入通用 graphics 代码 | 收敛为 Android capability，不假装成统一资源类型 |
 | `engine/crates/platform/desktop` | 主要是软件 frame ticker 和空设备服务 | 按 Linux、Windows、macOS 分开实现 |
 | `PlatformServices` | **Platform/V8 Phase A 已完成，§9.2 step 6 拆分也已完成**：不再返回 `deno_core::Extension`，`platform` crate 已移除对 `js-runtime`/`deno_core`/`deno_error` 的直接依赖；`PlatformServices` 已拆成 `DeviceServiceProvider`/`FrameClock`/`HostNotifier` 三个能力接口（marker 超 trait + 全覆盖 blanket impl，`core` 消费侧 `Arc<dyn PlatformServices>` 与调用点不变），由 `scripts/test-platform-services-capability-contract.sh` 门禁固化 | 新增能力按接口逐个加，不回到巨型 trait；runtime backend 的完整抽象（`JsBackend` trait 与 contract 提取）属于 §9.2 step 5 之后的工作 |
-| `engine/crates/js-runtime` | 纯 JS shim、deno_core op 和 V8 snapshot 构建混在一起 | 明确为 V8 backend，并抽取引擎无关契约 |
-| `engine/crates/core` | **Platform/V8 Phase B 已完成**：module loader、V8 code cache 和 isolate prewarm 已移入 `js-runtime`，`HostJsRuntime::new` 与事件循环 poll 改为后端无关签名；`core` 源码不再命名 `deno_core`/`deno_error`/`v8::`，`core/Cargo.toml` 已移除对 `deno_core` 的直接依赖（仅经 `js-runtime` 传递）。由 `scripts/test-core-v8-boundary-contract.sh` 在 PR/release 门禁固化 | 尚未完成：`core` 仍以直接方法调用消费宽口径 `HostJsRuntime` 表面（无 `JsBackend` trait），且尚未从 `js-runtime` 提取 schema/纯 JS/conformance；`runtime-v8` 目录重命名仍为后续机械步骤 |
-| `engine/crates/snapshot-gen` | 已把 snapshot 可执行生成器部分拆出，但身份校验、选择与部分构建逻辑仍在 `js-runtime` | 保留生成器，进一步形成按 target tuple 管理的 V8 artifact/snapshot pipeline |
+| `engine/crates/runtime-v8` | 纯 JS shim、deno_core op 和 V8 snapshot 构建仍混在一起（目录已按 §9.1 更名到位） | 明确为 V8 backend，并抽取引擎无关契约 |
+| `engine/crates/core` | **Platform/V8 Phase B 已完成**：module loader、V8 code cache 和 isolate prewarm 已移入 `runtime-v8`，`HostJsRuntime::new` 与事件循环 poll 改为后端无关签名；`core` 源码不再命名 `deno_core`/`deno_error`/`v8::`，`core/Cargo.toml` 已移除对 `deno_core` 的直接依赖（仅经 `runtime-v8` 传递）。由 `scripts/test-core-v8-boundary-contract.sh` 在 PR/release 门禁固化。**`runtime-v8` 目录重命名已于 2026-07-21 完成**（原 `js-runtime`；同批把源码收进 `src/`、包名统一 `migo-*`） | 尚未完成：`core` 仍以直接方法调用消费宽口径 `HostJsRuntime` 表面（无 `JsBackend` trait，全仓 grep 为 0），且尚未从 `runtime-v8` 提取 schema/纯 JS/conformance |
+| `engine/tools/snapshot-gen` | 已把 snapshot 可执行生成器部分拆出，但身份校验、选择与部分构建逻辑仍在 `runtime-v8`。2026-07-21 起它与 player/c-host-example 一同移入 `engine/tools/`：`crates/` 只放引擎库，`tools/` 放构建与驱动引擎的东西，并由 `default-members` 把链 X11/GL 的桌面工具排除出默认构建集 | 保留生成器，进一步形成按 target tuple 管理的 V8 artifact/snapshot pipeline |
 
 ### 2.3 旧方案中需要纠正的判断
 
@@ -1050,7 +1050,14 @@ tools/
 6. **拆 platform services——已完成**  
    `PlatformServices` 拆成 `DeviceServiceProvider`/`FrameClock`/`HostNotifier` 三个 `Send + Sync` 能力接口；`PlatformServices` 降为 `DeviceServiceProvider + FrameClock + HostNotifier` 的 marker 超 trait，配 `impl<T> PlatformServices for T` 全覆盖 blanket impl，使平台只实现小接口而 `core` 仍持单一 `Arc<dyn PlatformServices>`、调用点零改动。Android/desktop 两个实现按能力拆分（方法逐字迁移，行为不变），由 `scripts/test-platform-services-capability-contract.sh` 在 PR/release 门禁固化。后续新增设备/通知/时钟能力按接口逐个加，不回到巨型 trait。
 
-7. **建立 Linux backend 并冻结 C ABI v1——进行中(runtime baseline 已达)**  
+7. **建立 Linux backend 并冻结 C ABI v1——Linux backend 已完成，只剩 ABI v1 冻结**
+
+   **2026-07-21 校订**：本条原列的三项"仍未做"中，①②**都已完成**，文档此前滞后于代码。
+   - ① *cdylib/TLS* —— 已解决，但不是靠重建 V8：cdylib 边界搬进了新的 `android-jni` crate（`[lib] name = "migo"`），`platform` 降为纯 rlib，于是 host 能构建和测试它。可执行档形态的 Linux player 不需要 shared-TLS V8；`.so` 形态的 Linux SDK 需要，且 `scripts/build-v8-linux.sh` 已经产出（`v8_monolithic_for_shared_library=true`，见 CLAUDE.md §10.4）。
+   - ② *非 Android Presenter / Player / 外部宿主* —— 已完成：`platform/desktop/presenter.rs` 有 X11 与 Wayland presenter（SDK 不链任何窗口库，只收不透明句柄再调 EGL）；`engine/tools/player` 是可跑真实 wx 包的 Linux player（离屏 + X11 窗口 + PNG 回读）；`engine/crates/capi` 是公开 C ABI，`examples/c-host/linux` 是纯 C 宿主；`scripts/build-linux-sdk.sh` 产出带 pkg-config/CMake 的 SDK，两个不经 cargo 的外部消费者已实测渲染。
+   - ③ *ABI v1 冻结* —— **仍未完成**，是本条唯一剩余项。阻塞项见 `include/migo/README.md`：Android 多指投递未在真机验证（`sendevent` 被 SELinux 拒绝、`input motionevent` 只带一个指针）、Android 兼容/性能门未跑、Android `x86_64` 包缺其启动 snapshot（只能在 CI 模拟器生成）。
+
+   以下为原文（记录当时状态）：  
    已达 §1.5 的 Linux **minimum compatibility baseline**:用 linux-gnu `librusty_v8.a`(v8=145.0.0)在 `x86_64-unknown-linux-gnu` 原生构建并跑通 `js-runtime` 全套 **424/424** 测试、`core`(profile-slim)**30/30**;`graphics`(Skia from source)在 host 编译通过。宿主构建链已固化为 `scripts/dev-test-host.sh`(linux V8 + 系统 clang 而非 NDK clang + `dev-setup-skia.sh` 的 EGL/GL 头与 .so symlink)。这同时证明 Phase B(core→deno_core)与 step 6(能力接口拆分)在非 Android target 成立。**仍未做**:①`platform` 是 `cdylib`(libmigo.so),现有 linux V8 归档是可执行档 TLS(local-exec),链 `.so` 会 `R_X86_64_TPOFF32 ... cannot be used with -shared`——需用 shared/PIC 兼容 TLS 重建 linux V8(desktop 可放更多能力如 i18n/debug,但有界);②非 Android EGL/X11/Wayland Presenter、Player、外部宿主接入均为 greenfield;③C ABI v1 冻结待 Android/Linux compatibility + symbol/version test 通过。
 
 8. **接入 ANGLE family**  

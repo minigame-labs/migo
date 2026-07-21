@@ -112,7 +112,7 @@ fi
 # file. If they disagree the package ships a snapshot the manifest does not
 # describe.
 if [[ -f "$MANIFEST" ]]; then
-    SNAP="$REPO_ROOT/engine/crates/js-runtime/snapshots/SNAPSHOT-full-$ARCH.bin"
+    SNAP="$REPO_ROOT/engine/crates/runtime-v8/snapshots/SNAPSHOT-full-$ARCH.bin"
     if [[ -f "$SNAP" ]]; then
         WANT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshots"][0]["bytes_hash"])' "$MANIFEST")"
         GOT="$(sha256sum "$SNAP" | cut -d" " -f1)"

@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python3 - "$ROOT_DIR" <<'PY'
 from __future__ import annotations
 
+import re
 import pathlib
 import sys
 import tomllib
@@ -77,15 +78,19 @@ for source_path in sorted(core_root.rglob("*.rs")):
         "deno_error" not in source,
         f"core source must not name deno_error: {relative}",
     )
+    # A path *starting* at `v8`, not the substring: the V8 backend crate is
+    # named `runtime-v8`, so `runtime_v8::HostJsRuntime` contains "v8::" while
+    # naming no V8 type at all. Matching the substring made this gate fail on a
+    # crate rename and would have pushed someone to weaken it outright.
     require(
-        "v8::" not in source,
+        re.search(r"(?<![A-Za-z0-9_])v8::", source) is None,
         f"core source must not name v8:: types: {relative}",
     )
 
 for relative in (
-    "engine/crates/core/runtime/loader.rs",
-    "engine/crates/core/runtime/code_cache.rs",
-    "engine/crates/core/runtime/isolate_pool.rs",
+    "engine/crates/core/src/runtime/loader.rs",
+    "engine/crates/core/src/runtime/code_cache.rs",
+    "engine/crates/core/src/runtime/isolate_pool.rs",
 ):
     require(
         not (root / relative).exists(),
@@ -93,9 +98,9 @@ for relative in (
     )
 
 for relative in (
-    "engine/crates/js-runtime/loader.rs",
-    "engine/crates/js-runtime/code_cache.rs",
-    "engine/crates/js-runtime/isolate_pool.rs",
+    "engine/crates/runtime-v8/src/loader.rs",
+    "engine/crates/runtime-v8/src/code_cache.rs",
+    "engine/crates/runtime-v8/src/isolate_pool.rs",
 ):
     require(
         (root / relative).exists(),

@@ -9,7 +9,7 @@
 #   .\build-snapshot.ps1 -Clean     # clean build artifacts first
 #
 # Output:
-#   engine/crates/js-runtime/SNAPSHOT.bin
+#   engine/crates/runtime-v8/SNAPSHOT.bin
 #
 # Notes:
 #   - Requires a host-platform V8 static library.  If RUSTY_V8_ARCHIVE
@@ -46,7 +46,7 @@ function Print-Error   { param($m) Write-Host "[ERROR] $m"   -ForegroundColor Re
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot  = Resolve-Path (Join-Path $ScriptDir "..")
 $EngineDir = Join-Path $RepoRoot "engine"
-$SnapshotBin = Join-Path $EngineDir "crates/js-runtime/SNAPSHOT.bin"
+$SnapshotBin = Join-Path $EngineDir "crates/runtime-v8/SNAPSHOT.bin"
 
 if (-not (Test-Path $EngineDir)) {
     Print-Error "Engine directory not found: $EngineDir"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/dev-run-player.sh
 #
-# Build + run the headless Linux dev player (engine/crates/player) on
+# Build + run the headless Linux dev player (engine/tools/player) on
 # x86_64-unknown-linux-gnu, rendering a wx-style minigame bundle offscreen.
 #
 # Usage:
@@ -44,7 +44,7 @@ unset ANDROID_NDK ANDROID_NDK_HOME || true
 
 cd "$ENGINE_DIR"
 c_info "building player ..."
-cargo build -p player --offline
+cargo build -p migo-player --offline
 
 c_info "running player: game=$GAME_DIR secs=$SECS"
 exec ./target/debug/migo-player "$GAME_DIR" "$SECS" ${PLAYER_ARGS[@]+"${PLAYER_ARGS[@]}"}

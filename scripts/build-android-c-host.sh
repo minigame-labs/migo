@@ -35,7 +35,7 @@ V8_DIR="$ENGINE_DIR/third_party/rusty_v8/aarch64"
 info "building capi staticlib for $TARGET"
 RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
 RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
-    cargo build -p capi --release --target "$TARGET" --manifest-path "$ENGINE_DIR/Cargo.toml"
+    cargo build -p migo-capi --release --target "$TARGET" --manifest-path "$ENGINE_DIR/Cargo.toml"
 
 STAGE="$REPO_ROOT/examples/c-host/android/src/main/jniLibs-static/$ABI"
 mkdir -p "$STAGE"

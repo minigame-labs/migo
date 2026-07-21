@@ -2,19 +2,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-AHB="$ROOT/engine/crates/shared/protocol/ahb.rs"
-DECODER="$ROOT/engine/crates/graphics/image_decode_ahb.rs"
-GRAPHICS_LIB="$ROOT/engine/crates/graphics/lib.rs"
-JNI_ENV="$ROOT/engine/crates/platform/android/jni/env.rs"
-PBO="$ROOT/engine/crates/graphics/canvas/manager/pbo_upload.rs"
-GPU_CAPS="$ROOT/engine/crates/shared/device/gpu_caps.rs"
-DEVICE_CAPS="$ROOT/engine/crates/graphics/device_caps.rs"
-CANVAS_MANAGER="$ROOT/engine/crates/graphics/canvas/manager/mod.rs"
-IMAGE_MANAGER="$ROOT/engine/crates/graphics/canvas/manager/image.rs"
-TEXTURE_IMPORT="$ROOT/engine/crates/graphics/texture_import.rs"
-IMAGE_OPS="$ROOT/engine/crates/io/image_ops.rs"
-INLINE_SRC="$ROOT/engine/crates/js-runtime/rendering/image/inline_src.rs"
-IMAGE_MOD="$ROOT/engine/crates/js-runtime/rendering/image/mod.rs"
+AHB="$ROOT/engine/crates/shared/src/protocol/ahb.rs"
+DECODER="$ROOT/engine/crates/graphics/src/image_decode_ahb.rs"
+GRAPHICS_LIB="$ROOT/engine/crates/graphics/src/lib.rs"
+JNI_ENV="$ROOT/engine/crates/platform/src/android/jni/env.rs"
+PBO="$ROOT/engine/crates/graphics/src/canvas/manager/pbo_upload.rs"
+GPU_CAPS="$ROOT/engine/crates/shared/src/device/gpu_caps.rs"
+DEVICE_CAPS="$ROOT/engine/crates/graphics/src/device_caps.rs"
+CANVAS_MANAGER="$ROOT/engine/crates/graphics/src/canvas/manager/mod.rs"
+IMAGE_MANAGER="$ROOT/engine/crates/graphics/src/canvas/manager/image.rs"
+TEXTURE_IMPORT="$ROOT/engine/crates/graphics/src/texture_import.rs"
+IMAGE_OPS="$ROOT/engine/crates/io/src/image_ops.rs"
+INLINE_SRC="$ROOT/engine/crates/runtime-v8/src/rendering/image/inline_src.rs"
+IMAGE_MOD="$ROOT/engine/crates/runtime-v8/src/rendering/image/mod.rs"
 
 fail() {
   printf 'R7 contract failure: %s\n' "$*" >&2

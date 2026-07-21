@@ -49,6 +49,19 @@ jobs:
         working-directory: engine
         run: cargo fmt --all -- --check
 
+      # Several contract gates run cargo with `--locked --offline`: `--locked`
+      # proves they cannot rewrite the lockfile, `--offline` proves they cannot
+      # reach for a dependency that is not already pinned. Both are worth
+      # keeping, but `--offline` needs a populated registry, and the rust-cache
+      # key includes Cargo.lock -- so the first PR that changes the lockfile
+      # (a crate rename, a dependency bump) gets a cache miss and every one of
+      # those gates fails with "config.json not found in registry", which reads
+      # like a registry outage rather than a cold cache. Fetching once here
+      # populates it without giving the gates network access.
+      - name: Populate the cargo registry for the offline gates
+        working-directory: engine
+        run: cargo fetch --locked
+
       - name: C ABI and Surface candidate contract
         run: |
           bash scripts/test-c-abi-surface-candidate.sh
@@ -69,6 +82,13 @@ jobs:
 
       - name: Platform services capability contract
         run: bash scripts/test-platform-services-capability-contract.sh
+
+      # Source-only, so it belongs here rather than in the device lane -- which
+      # is the point: the failure it catches (content calling a capability on
+      # the wx namespace, which does not carry it) presents on a device as a
+      # black screen with every host callback reporting success.
+      - name: Example content namespace contract
+        run: bash scripts/test-example-content-namespace-contract.sh
 
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself
@@ -105,7 +125,7 @@ jobs:
       # backlog blocking. Remove the cap after the dedicated lint-cleanup PR.
       - name: Run clippy lints (host-buildable crates)
         working-directory: engine
-        run: cargo clippy -p shared -p io -p js-runtime --all-targets -- --cap-lints warn
+        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi --all-targets -- --cap-lints warn
 
       # Blocking gate for the host-buildable crates (shared + io + js-runtime).
       # All their lib tests must pass. Previously-masked failures have been
@@ -114,10 +134,20 @@ jobs:
       # image-run counter) that deadlocked or raced under parallel execution and
       # is now per-instance. The handful of io tests needing image fixtures
       # absent in CI stay #[ignore]d. graphics/audio still can't build here (skia
-      # EGL / alsa system deps) — android build-aar.sh is their real gate.
+      # EGL / alsa system deps) — android build-aar.sh is their real gate, and
+      # core/capi inherit that limitation through their graphics dependency.
+      #
+      # `migo-capi-abi` has no dependencies at all, which is why it was split out
+      # of `capi` in the first place: the ABI validation rules are exactly the
+      # part that must be provable without a device or a graphics stack. Its
+      # tests run with `--all-targets`, not `--lib`, because the boundary rules
+      # live in `tests/` (struct prefixes, versioned-copy truncation, output
+      # policy) and `--lib` would silently skip all 50 of them.
       - name: Run Rust tests (host-buildable crates)
         working-directory: engine
-        run: cargo test -p shared -p io -p js-runtime --lib
+        run: |
+          cargo test -p migo-shared -p migo-io -p migo-runtime-v8 --lib
+          cargo test -p migo-capi-abi --all-targets
         env:
           RUST_BACKTRACE: 1
 
@@ -149,7 +179,7 @@ jobs:
 
     steps:
       # LFS is required: the android V8 archives (third_party/rusty_v8/**/*.a)
-      # AND the per-arch V8 snapshots (crates/js-runtime/snapshots/*.bin) are
+      # AND the per-arch V8 snapshots (crates/runtime-v8/snapshots/*.bin) are
       # stored via Git LFS. Without this they are ~130-byte pointer stubs and
       # the .so link (and snapshot embedding) would break.
       - name: Checkout (with LFS for V8 archives + snapshots)
@@ -165,14 +195,14 @@ jobs:
       # this job links/embeds (both shipped ABIs) and guard against a pointer.
       - name: Materialize LFS objects (V8 archives + snapshots)
         run: |
-          git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/js-runtime/snapshots/SNAPSHOT-*.bin"
+          git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/runtime-v8/snapshots/SNAPSHOT-*.bin"
           for f in \
             engine/third_party/rusty_v8/aarch64/librusty_v8.a \
             engine/third_party/rusty_v8/x86_64/librusty_v8.a \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-full-aarch64.bin \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-full-x86_64.bin \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-slim-aarch64.bin \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-slim-x86_64.bin ; do
+            engine/crates/runtime-v8/snapshots/SNAPSHOT-full-aarch64.bin \
+            engine/crates/runtime-v8/snapshots/SNAPSHOT-full-x86_64.bin \
+            engine/crates/runtime-v8/snapshots/SNAPSHOT-slim-aarch64.bin \
+            engine/crates/runtime-v8/snapshots/SNAPSHOT-slim-x86_64.bin ; do
             sz=$(stat -c %s "$f")
             echo "$f: $sz bytes"
             [ "$sz" -gt 100000 ] || { echo "ERROR: $f is still an LFS pointer"; exit 1; }
@@ -242,6 +272,16 @@ jobs:
 
       - name: Release artifact manifest gate contract
         run: bash scripts/test-android-release-manifest-gate.sh
+
+      # Host-JVM tests for the android.*-free state machines (VSync scheduling,
+      # lifecycle requests, touch normalization). They used to be hand-rolled
+      # `main()` runners invoked by two bespoke shell scripts that nothing in CI
+      # called, so a state machine could regress unnoticed; one of them had no
+      # runner at all. Both product flavors run because the flavor dimension
+      # selects different Java sources.
+      - name: Android library unit tests
+        working-directory: platforms/android
+        run: ./gradlew :library:testFullDebugUnitTest :library:testSlimDebugUnitTest
 
       # Build both products for both shipped ABIs. build.rs embeds only the
       # matching SNAPSHOT-<profile>-<arch>.bin after schema-v2 validation.

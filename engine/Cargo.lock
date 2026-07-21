@@ -73,14 +73,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "android-jni"
-version = "0.1.0"
-dependencies = [
- "jni",
- "platform",
-]
-
-[[package]]
 name = "android_log-sys"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -106,23 +98,6 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
-
-[[package]]
-name = "audio"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "futures-util",
- "hound",
- "lewton",
- "minimp3",
- "ndk-context",
- "reqwest",
- "ringbuf",
- "shared",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "autocfg"
@@ -297,14 +272,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
 
 [[package]]
-name = "c-host-example"
-version = "0.1.0"
-dependencies = [
- "capi",
- "cc",
-]
-
-[[package]]
 name = "calendrical_calculations"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -332,20 +299,6 @@ checksum = "3b4a6cae9efc04cc6cbb8faf338d2c497c165c83e74509cf4dbedea948bbf6e5"
 dependencies = [
  "quote",
  "syn",
-]
-
-[[package]]
-name = "capi"
-version = "0.1.0"
-dependencies = [
- "core",
- "graphics",
- "migo-capi-abi",
- "platform",
- "serde_json",
- "shared",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -419,26 +372,6 @@ name = "cooked-waker"
 version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "147be55d677052dabc6b22252d5dd0fd4c29c8c27aa4f2fbef0f94aa003b406f"
-
-[[package]]
-name = "core"
-version = "0.1.0"
-dependencies = [
- "audio",
- "crossbeam-channel",
- "futures",
- "graphics",
- "io",
- "js-runtime",
- "parking_lot",
- "serde",
- "serde_json",
- "shared",
- "tokio",
- "tracing",
- "tracing-android",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "core-foundation-sys"
@@ -1071,25 +1004,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "graphics"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "crossbeam-channel",
- "glow",
- "khronos-egl",
- "libc",
- "lru",
- "parking_lot",
- "png 0.17.16",
- "shared",
- "skia-safe",
- "smallvec",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "gzip-header"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1459,32 +1373,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "io"
-version = "0.1.0"
-dependencies = [
- "base64",
- "brotli",
- "deno_core",
- "digest",
- "hex",
- "image",
- "lru",
- "md-5",
- "memmap2",
- "parking_lot",
- "rusqlite",
- "sha1",
- "sha2",
- "shared",
- "tempfile",
- "tokio",
- "tracing",
- "zip",
- "zune-core",
- "zune-image",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1558,37 +1446,6 @@ name = "jpeg-encoder"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b0b36cbb4e6704f12f5b5d7b01dac593982c6550859ebd5a66fb15c9ea27fd5"
-
-[[package]]
-name = "js-runtime"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bytemuck",
- "bytes",
- "crossbeam-channel",
- "data-url",
- "deno_core",
- "deno_error",
- "futures",
- "glow",
- "http",
- "image",
- "io",
- "parking_lot",
- "percent-encoding",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "shared",
- "thiserror 2.0.17",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "zip",
-]
 
 [[package]]
 name = "js-sys"
@@ -1755,16 +1612,224 @@ dependencies = [
 ]
 
 [[package]]
+name = "migo-android-jni"
+version = "0.1.0"
+dependencies = [
+ "jni",
+ "migo-platform",
+]
+
+[[package]]
+name = "migo-audio"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "futures-util",
+ "hound",
+ "lewton",
+ "migo-shared",
+ "minimp3",
+ "ndk-context",
+ "reqwest",
+ "ringbuf",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "migo-c-host-example"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "migo-capi",
+]
+
+[[package]]
+name = "migo-capi"
+version = "0.1.0"
+dependencies = [
+ "migo-capi-abi",
+ "migo-core",
+ "migo-graphics",
+ "migo-platform",
+ "migo-shared",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "migo-capi-abi"
 version = "0.1.0"
+
+[[package]]
+name = "migo-core"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "futures",
+ "migo-audio",
+ "migo-graphics",
+ "migo-io",
+ "migo-runtime-v8",
+ "migo-shared",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-android",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "migo-graphics"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "crossbeam-channel",
+ "glow",
+ "khronos-egl",
+ "libc",
+ "lru",
+ "migo-shared",
+ "parking_lot",
+ "png 0.17.16",
+ "skia-safe",
+ "smallvec",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "migo-io"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "brotli",
+ "deno_core",
+ "digest",
+ "hex",
+ "image",
+ "lru",
+ "md-5",
+ "memmap2",
+ "migo-shared",
+ "parking_lot",
+ "rusqlite",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zip",
+ "zune-core",
+ "zune-image",
+]
+
+[[package]]
+name = "migo-platform"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "crossbeam-channel",
+ "futures",
+ "jni",
+ "khronos-egl",
+ "libloading",
+ "migo-core",
+ "migo-graphics",
+ "migo-io",
+ "migo-shared",
+ "ndk-context",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-android",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "migo-player"
+version = "0.1.0"
+dependencies = [
+ "migo-core",
+ "migo-graphics",
+ "migo-platform",
+ "migo-shared",
+ "png 0.17.16",
+ "tracing",
+ "tracing-subscriber",
+ "x11-dl",
+]
+
+[[package]]
+name = "migo-runtime-v8"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytemuck",
+ "bytes",
+ "crossbeam-channel",
+ "data-url",
+ "deno_core",
+ "deno_error",
+ "futures",
+ "glow",
+ "http",
+ "image",
+ "migo-io",
+ "migo-shared",
+ "parking_lot",
+ "percent-encoding",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "zip",
+]
+
+[[package]]
+name = "migo-shared"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bitflags 2.10.0",
+ "bytemuck",
+ "crc32fast",
+ "crossbeam-channel",
+ "deno_core",
+ "digest",
+ "ed25519-dalek",
+ "encoding_rs",
+ "hex",
+ "libc",
+ "lru",
+ "md-5",
+ "parking_lot",
+ "serde",
+ "sha1",
+ "sha2",
+ "smallvec",
+ "tokio",
+ "tracing",
+ "zstd",
+]
 
 [[package]]
 name = "migo-snapshot-gen"
 version = "0.1.0"
 dependencies = [
  "deno_core",
- "js-runtime",
- "shared",
+ "migo-runtime-v8",
+ "migo-shared",
 ]
 
 [[package]]
@@ -2082,44 +2147,6 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
-
-[[package]]
-name = "platform"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "core",
- "crossbeam-channel",
- "futures",
- "graphics",
- "io",
- "jni",
- "khronos-egl",
- "libloading",
- "ndk-context",
- "parking_lot",
- "serde",
- "serde_json",
- "shared",
- "tokio",
- "tracing",
- "tracing-android",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "player"
-version = "0.1.0"
-dependencies = [
- "core",
- "graphics",
- "platform",
- "png 0.17.16",
- "shared",
- "tracing",
- "tracing-subscriber",
- "x11-dl",
-]
 
 [[package]]
 name = "png"
@@ -2698,33 +2725,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
-]
-
-[[package]]
-name = "shared"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bitflags 2.10.0",
- "bytemuck",
- "crc32fast",
- "crossbeam-channel",
- "deno_core",
- "digest",
- "ed25519-dalek",
- "encoding_rs",
- "hex",
- "libc",
- "lru",
- "md-5",
- "parking_lot",
- "serde",
- "sha1",
- "sha2",
- "smallvec",
- "tokio",
- "tracing",
- "zstd",
 ]
 
 [[package]]

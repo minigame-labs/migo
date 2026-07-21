@@ -10,7 +10,7 @@ gen = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gen)
 
 
-# Captured from `cargo rustc -p capi --lib --crate-type staticlib --
+# Captured from `cargo rustc -p migo-capi --lib --crate-type staticlib --
 # --print native-static-libs` on 2026-07-19, after the graphics crate began
 # declaring -lGL.
 CARGO_OUTPUT = """

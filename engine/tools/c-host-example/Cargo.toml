@@ -1,0 +1,34 @@
+[package]
+name = "migo-c-host-example"
+version = "0.1.0"
+edition = "2024"
+
+# Builds `examples/c-host/main.c` — a host written in C against the public
+# headers only — and links it with the engine.
+#
+# Cargo drives the link here so this example always matches the engine's real
+# requirements without restating them. Hosts that do not use cargo consume the
+# packaged form instead: scripts/build-linux-sdk.sh stages pkg-config and CMake
+# metadata, and examples/c-host/build-with-pkgconfig.sh builds this same C file
+# through it. (An earlier note here claimed a Rust staticlib omits the native
+# archives; it does not -- see CLAUDE.md 10.2.)
+[[bin]]
+name = "migo-c-host"
+path = "src/main.rs"
+# `#![no_main]`: the entry point comes from the C side, so cargo cannot build a
+# test harness for this target. The example is exercised by
+# scripts/dev-run-c-host.sh, which runs it against a real game.
+test = false
+bench = false
+doctest = false
+
+[features]
+default = ["profile-full"]
+profile-full = ["capi/profile-full"]
+profile-slim = ["capi/profile-slim"]
+
+[dependencies]
+capi = { package = "migo-capi", path = "../../crates/capi", default-features = false }
+
+[build-dependencies]
+cc = "1"

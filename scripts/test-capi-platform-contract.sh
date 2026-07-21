@@ -43,6 +43,6 @@ fi
 info "cross-checking capi for $TARGET"
 RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
 RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
-    cargo check -p capi --target "$TARGET" --manifest-path "$ENGINE_DIR/Cargo.toml"
+    cargo check -p migo-capi --target "$TARGET" --manifest-path "$ENGINE_DIR/Cargo.toml"
 
 info "OK: the C ABI compiles for $TARGET"

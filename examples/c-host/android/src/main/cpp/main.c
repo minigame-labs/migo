@@ -67,6 +67,8 @@ struct host {
     int content_loaded;
     char content_id[128];
     int dispatch_pipe[2]; /* [0] read, [1] write */
+    /* Drives the scripted pad; see GAMEPAD_SCRIPT_FRAME. */
+    unsigned frames_delivered;
     /* Needed for the soft keyboard: showing and hiding the system IME is an
      * activity-level operation, and this host has no Java side to ask. */
     ANativeActivity *activity;
@@ -116,12 +118,29 @@ static int drain_dispatch(int fd, int events, void *data) {
  * is the same signal the Java SDK uses. Letting the engine pace itself instead
  * would run the render loop off a timer that cannot align to the display.
  */
+static void send_gamepad_script(struct host *h);
+
+/*
+ * The scripted pad runs on the host's own timeline, not off a keyboard
+ * callback.
+ *
+ * It used to be sent from on_show_keyboard, which meant only content that asked
+ * for the keyboard ever saw a gamepad -- so gamepad-probe, which asks for no
+ * keyboard, sat on its "no pad has connected" colour forever and the one probe
+ * written to exercise the gamepad round trip could not be exercised at all on
+ * Android. The Linux host already drives the pad from its own clock; this
+ * matches it, one second in, so both probes are fed the same way.
+ */
+#define GAMEPAD_SCRIPT_FRAME 60
+
 static void deliver_vsync(struct host *h, int64_t frame_time_nanos) {
     if (h->session == NULL) return;
     MigoResult result = migo_session_notify_vsync(h->session, frame_time_nanos);
     if (result != MIGO_OK && result != MIGO_ERROR_INVALID_STATE) {
         LOGE("notify_vsync failed: %d", (int)result);
     }
+    if (h->frames_delivered == GAMEPAD_SCRIPT_FRAME) send_gamepad_script(h);
+    h->frames_delivered++;
 }
 
 /*
@@ -315,8 +334,6 @@ static void on_show_keyboard(void *user_data, MigoSession *session,
     send_composition(h, MIGO_COMPOSITION_EVENT_END, "\u4f60\u597d");
     send_keyboard(h, MIGO_KEYBOARD_EVENT_INPUT, "migo\u4f60\u597d", 0.0);
 
-    send_gamepad_script(h);
-
     send_keyboard(h, MIGO_KEYBOARD_EVENT_CONFIRM, "migo", 0.0);
     send_keyboard(h, MIGO_KEYBOARD_EVENT_COMPLETE, "migo", 0.0);
     send_keyboard(h, MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE, NULL, 0.0);
@@ -432,6 +449,23 @@ static int32_t on_input(struct android_app *app, AInputEvent *event) {
 
 /* ---- Engine and session ------------------------------------------------ */
 
+/*
+ * A note on diagnosing this example, because the usual channel is missing here.
+ *
+ * The library does not hijack the process logger; it only installs one when
+ * MIGO_CAPI_LOG is set, and a NativeActivity cannot be handed an environment
+ * through `am start`. So a pure-native host on Android has no engine-side log
+ * unless it asks for one -- and without it, a content-side exception (a
+ * TypeError in the first paint, say) looks exactly like a dead frame loop or a
+ * broken surface: the host's own callbacks all report success and the screen
+ * stays black. To get the engine's view, call
+ *
+ *     setenv("MIGO_CAPI_LOG", "info", 1);
+ *
+ * here, before the first engine call, and rebuild. It is left out of the
+ * shipping path on purpose: a host in production receives operational failures
+ * through on_error, not through logcat.
+ */
 static int create_engine(struct host *h, const char *files_dir) {
     char cache_dir[512];
     char code_cache_dir[512];

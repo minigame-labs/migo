@@ -43,19 +43,40 @@ def dependency_names(node: object) -> set[str]:
 
 
 direct_dependencies = dependency_names(platform_manifest)
+
+# The V8 backend package has been renamed once already (`js-runtime` ->
+# `migo-runtime-v8`). A forbidden list that names a package which no longer
+# exists cannot fail: the gate goes green by looking for the wrong string. So
+# the name is asserted against the workspace before it is used as a rule.
+V8_BACKEND_PACKAGE = "migo-runtime-v8"
+backend_manifest_path = root / "engine/crates/runtime-v8/Cargo.toml"
+require(
+    backend_manifest_path.is_file(),
+    f"V8 backend manifest not found at {backend_manifest_path}",
+)
+if backend_manifest_path.is_file():
+    backend_manifest = tomllib.loads(backend_manifest_path.read_text(encoding="utf-8"))
+    declared_name = backend_manifest.get("package", {}).get("name")
+    require(
+        declared_name == V8_BACKEND_PACKAGE,
+        "this gate forbids a package name that the workspace no longer uses "
+        f"(forbidding {V8_BACKEND_PACKAGE!r}, workspace declares {declared_name!r}); "
+        "update V8_BACKEND_PACKAGE or the gate silently passes",
+    )
+
 aliased_runtime_fixture = {
     "dependencies": {
         "runtime_backend": {
-            "package": "js-runtime",
-            "path": "../js-runtime",
+            "package": V8_BACKEND_PACKAGE,
+            "path": "../runtime-v8",
         }
     }
 }
 require(
-    "js-runtime" in dependency_names(aliased_runtime_fixture),
+    V8_BACKEND_PACKAGE in dependency_names(aliased_runtime_fixture),
     "boundary checker must resolve Cargo dependency aliases to package identity",
 )
-for forbidden in ("js-runtime", "deno_core", "deno_error"):
+for forbidden in (V8_BACKEND_PACKAGE, "deno_core", "deno_error"):
     require(
         forbidden not in direct_dependencies,
         f"platform Cargo.toml must not directly depend on {forbidden}",
@@ -69,7 +90,7 @@ features = platform_manifest.get("features", {})
 for feature, values in features.items():
     for value in values:
         require(
-            not value.startswith("js-runtime/"),
+            not value.startswith(f"{V8_BACKEND_PACKAGE}/"),
             f"platform feature {feature!r} must forward runtime features through core, got {value!r}",
         )
 
@@ -81,7 +102,7 @@ for source_path in sorted(platform_root.rglob("*.rs")):
         f"platform source must not name deno_core: {source_path.relative_to(root)}",
     )
 
-platform_service_path = root / "engine/crates/core/services/platform.rs"
+platform_service_path = root / "engine/crates/core/src/services/platform.rs"
 platform_service = platform_service_path.read_text(encoding="utf-8")
 require(
     "deno_core" not in platform_service,
@@ -97,8 +118,8 @@ require(
 )
 
 for relative in (
-    "engine/crates/platform/android/platform.rs",
-    "engine/crates/platform/desktop/platform.rs",
+    "engine/crates/platform/src/android/platform.rs",
+    "engine/crates/platform/src/desktop/platform.rs",
 ):
     source = (root / relative).read_text(encoding="utf-8")
     require(
@@ -106,7 +127,7 @@ for relative in (
         f"platform implementation must not manufacture runtime extensions: {relative}",
     )
 
-host_path = root / "engine/crates/core/runtime/host.rs"
+host_path = root / "engine/crates/core/src/runtime/host.rs"
 host = host_path.read_text(encoding="utf-8")
 require(
     "platform.extensions(" not in host,
@@ -117,7 +138,7 @@ require(
     "core Host must not stage platform V8 extensions",
 )
 
-host_runtime_path = root / "engine/crates/js-runtime/host_runtime.rs"
+host_runtime_path = root / "engine/crates/runtime-v8/src/host_runtime.rs"
 host_runtime = host_runtime_path.read_text(encoding="utf-8")
 require(
     "extra_extensions" not in host_runtime,

@@ -39,6 +39,19 @@ jobs:
           cache-on-failure: true
 
       - name: Check Rust formatting
+
+      # Several contract gates run cargo with `--locked --offline`: `--locked`
+      # proves they cannot rewrite the lockfile, `--offline` proves they cannot
+      # reach for a dependency that is not already pinned. Both are worth
+      # keeping, but `--offline` needs a populated registry, and the rust-cache
+      # key includes Cargo.lock -- so the first PR that changes the lockfile
+      # (a crate rename, a dependency bump) gets a cache miss and every one of
+      # those gates fails with "config.json not found in registry", which reads
+      # like a registry outage rather than a cold cache. Fetching once here
+      # populates it without giving the gates network access.
+      - name: Populate the cargo registry for the offline gates
+        working-directory: engine
+        run: cargo fetch --locked
         working-directory: engine
         run: cargo fmt --all -- --check
 
@@ -62,6 +75,9 @@ jobs:
 
       - name: Platform services capability contract
         run: bash scripts/test-platform-services-capability-contract.sh
+
+      - name: Example content namespace contract
+        run: bash scripts/test-example-content-namespace-contract.sh
 
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself
@@ -87,11 +103,11 @@ jobs:
       # the pre-existing backlog. Mirrors pr-ci.yml so the tag gate matches PR CI.
       - name: Run clippy lints (host-buildable crates)
         working-directory: engine
-        run: cargo clippy -p shared -p io -p js-runtime --all-targets -- --cap-lints warn
+        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 --all-targets -- --cap-lints warn
 
       - name: Run Rust tests (host-buildable crates)
         working-directory: engine
-        run: cargo test -p shared -p io -p js-runtime --lib
+        run: cargo test -p migo-shared -p migo-io -p migo-runtime-v8 --lib
         env:
           RUST_BACKTRACE: 1
 
@@ -129,14 +145,14 @@ jobs:
       # take the slower source-JS fallback.
       - name: Materialize LFS objects (V8 archives + snapshots)
         run: |
-          git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/js-runtime/snapshots/SNAPSHOT-*.bin"
+          git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/runtime-v8/snapshots/SNAPSHOT-*.bin"
           for f in \
             engine/third_party/rusty_v8/aarch64/librusty_v8.a \
             engine/third_party/rusty_v8/x86_64/librusty_v8.a \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-full-aarch64.bin \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-full-x86_64.bin \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-slim-aarch64.bin \
-            engine/crates/js-runtime/snapshots/SNAPSHOT-slim-x86_64.bin ; do
+            engine/crates/runtime-v8/snapshots/SNAPSHOT-full-aarch64.bin \
+            engine/crates/runtime-v8/snapshots/SNAPSHOT-full-x86_64.bin \
+            engine/crates/runtime-v8/snapshots/SNAPSHOT-slim-aarch64.bin \
+            engine/crates/runtime-v8/snapshots/SNAPSHOT-slim-x86_64.bin ; do
             sz=$(stat -c %s "$f")
             echo "$f: $sz bytes"
             [ "$sz" -gt 100000 ] || { echo "ERROR: $f is still an LFS pointer"; exit 1; }

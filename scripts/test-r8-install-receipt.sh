@@ -2,11 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INTEGRITY="$ROOT/engine/crates/shared/vfs/integrity.rs"
-GAME_PATHS="$ROOT/engine/crates/shared/vfs/game_paths.rs"
-IO_TASK="$ROOT/engine/crates/io/task.rs"
-IO_SCHEDULER="$ROOT/engine/crates/io/scheduler.rs"
-HOST_RUNTIME="$ROOT/engine/crates/js-runtime/host_runtime.rs"
+INTEGRITY="$ROOT/engine/crates/shared/src/vfs/integrity.rs"
+GAME_PATHS="$ROOT/engine/crates/shared/src/vfs/game_paths.rs"
+IO_TASK="$ROOT/engine/crates/io/src/task.rs"
+IO_SCHEDULER="$ROOT/engine/crates/io/src/scheduler.rs"
+HOST_RUNTIME="$ROOT/engine/crates/runtime-v8/src/host_runtime.rs"
 
 fail() {
   printf 'R8 install-receipt contract failure: %s\n' "$*" >&2

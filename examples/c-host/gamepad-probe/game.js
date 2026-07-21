@@ -1,4 +1,9 @@
-// Gamepad probe: renders what navigator.getGamepads() reports, as pixels.
+// Gamepad probe: renders what migo.getGamepads() reports, as pixels.
+//
+// The name is `migo.`, not `wx.`: wx has no gamepad API, so 97_wx_namespace.js
+// keeps these names off the wx namespace deliberately. Content that runs
+// through the HTML5 adapter sees them as navigator.getGamepads(); content like
+// this probe, which runs directly on the runtime, calls them on `migo`.
 //
 // The JS Gamepad implementation has no unit tests -- it is state held in JS and
 // driven from native -- so this content is where it is actually exercised. The
@@ -18,7 +23,7 @@ let disconnectEvents = 0;
 let lastId = '';
 let summary = '';
 
-wx.onGamepadConnected(function (e) {
+migo.onGamepadConnected(function (e) {
   connectEvents++;
   lastId = e.gamepad.id;
   colour = CONNECTED;
@@ -31,7 +36,7 @@ wx.onGamepadConnected(function (e) {
     ' buttons=' + e.gamepad.buttons.length);
 });
 
-wx.onGamepadDisconnected(function (e) {
+migo.onGamepadDisconnected(function (e) {
   disconnectEvents++;
   colour = GONE;
   console.error('[gpprobe] disconnected index=' + e.gamepad.index);
@@ -39,7 +44,7 @@ wx.onGamepadDisconnected(function (e) {
 
 function paint() {
   // Polled, as the Web API is: read whatever is current, every frame.
-  const pads = wx.getGamepads();
+  const pads = migo.getGamepads();
   const pad = pads[0];
   if (pad && pad.timestamp > 0) {
     if (colour === CONNECTED) colour = SAMPLED;
@@ -58,7 +63,7 @@ function paint() {
   ctx.fillText('id=' + lastId, 24, 56);
   ctx.fillText('connect=' + connectEvents + ' disconnect=' + disconnectEvents, 24, 96);
   ctx.fillText(summary, 24, 136);
-  ctx.fillText('pads=' + wx.getGamepads().length, 24, 176);
+  ctx.fillText('pads=' + migo.getGamepads().length, 24, 176);
   requestAnimationFrame(paint);
 }
 paint();

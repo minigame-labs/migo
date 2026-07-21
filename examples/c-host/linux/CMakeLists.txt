@@ -21,3 +21,7 @@ find_package(X11 REQUIRED)
 add_executable(c-host-cmake main.c)
 target_link_libraries(c-host-cmake PRIVATE migo::migo ${X11_LIBRARIES})
 target_compile_options(c-host-cmake PRIVATE -Wall -Wextra)
+
+# X11 only -- see build-with-pkgconfig.sh for why the Wayland host is not part of
+# what a packaged-SDK consumer builds.
+target_compile_definitions(c-host-cmake PRIVATE MIGO_C_HOST_NO_WAYLAND)

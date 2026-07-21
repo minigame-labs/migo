@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE="$ROOT/engine"
-JS_RUNTIME="$ENGINE/crates/js-runtime"
+JS_RUNTIME="$ENGINE/crates/runtime-v8"
 FINGERPRINT="$ROOT/scripts/lib/snapshot-fingerprint.sh"
 WRITE_MANIFEST="$ROOT/scripts/write-snapshot-manifest.sh"
 FRESHNESS="$ROOT/scripts/check-snapshot-freshness.sh"
@@ -17,8 +17,8 @@ AAR="$ROOT/scripts/build-aar.sh"
 AAR_PS="$ROOT/scripts/build-aar.ps1"
 GRADLE="$ROOT/platforms/android/library/build.gradle"
 WORKFLOW="$ROOT/.github/workflows/build-snapshot.yml"
-WORKER_JS="$JS_RUNTIME/99_worker_main.js"
-WORKER_RS="$JS_RUNTIME/worker/mod.rs"
+WORKER_JS="$JS_RUNTIME/src/99_worker_main.js"
+WORKER_RS="$JS_RUNTIME/src/worker/mod.rs"
 TEST_TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/migo-r9-contract.XXXXXX")"
 trap 'rm -rf "$TEST_TMP_ROOT"' EXIT
 
@@ -102,11 +102,11 @@ PY
 echo "[3/5] checking dedicated Cargo/runtime selection"
 require_literal "$JS_RUNTIME/Cargo.toml" "worker-snapshot" \
     "js-runtime lacks the non-default worker-snapshot feature"
-require_literal "$JS_RUNTIME/snapshot.rs" "WORKER_SNAPSHOT_BYTES" \
+require_literal "$JS_RUNTIME/src/snapshot.rs" "WORKER_SNAPSHOT_BYTES" \
     "runtime lacks dedicated Worker snapshot bytes"
 require_literal "$JS_RUNTIME/build.rs" "migo_has_worker_snapshot" \
     "build.rs lacks an independent Worker snapshot cfg"
-require_literal "$ENGINE/crates/snapshot-gen/src/main.rs" "MIGO_SNAPSHOT_KIND" \
+require_literal "$ENGINE/tools/snapshot-gen/src/main.rs" "MIGO_SNAPSHOT_KIND" \
     "snapshot generator lacks kind selection"
 require_literal "$WORKFLOW" 'git ls-files --error-unmatch "$bin" "$man"' \
     "snapshot workflow would mistake a new untracked Worker artifact for unchanged bytes"

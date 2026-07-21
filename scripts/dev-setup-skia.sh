@@ -11,7 +11,7 @@
 #      These are required to compile Skia's EGL / Ganesh GL interface but are
 #      not shipped in minimal Ubuntu / WSL installations.
 #   3) Prints the `export` lines to append to the current shell so that
-#      `cargo check -p graphics` can pick them up.  Intended to be `source`-d:
+#      `cargo check -p migo-graphics` can pick them up.  Intended to be `source`-d:
 #
 #        source scripts/dev-setup-skia.sh
 #
@@ -55,7 +55,7 @@ link_runtime_so "libfontconfig.so.1"
 link_runtime_so "libfreetype.so.6"
 link_runtime_so "libEGL.so.1"
 # Desktop GL exports the gl* entry points Skia (skia_use_gl=true) references;
-# the Linux dev player links -lGL against it (see engine/crates/player/build.rs).
+# the Linux dev player links -lGL against it (see engine/tools/player/build.rs).
 link_runtime_so "libGL.so.1"
 
 # ---- ninja --------------------------------------------------------------

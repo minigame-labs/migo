@@ -5,4 +5,4 @@ engine/third_party/rusty_v8/**/librusty_v8.a filter=lfs diff=lfs merge=lfs -text
 # release builds are hermetic/reproducible (and so the arm64 snapshot — which
 # hosted CI cannot generate — has a home). Freshness enforced by
 # scripts/check-snapshot-freshness.sh. The sibling *.manifest.json stay plain.
-engine/crates/js-runtime/snapshots/*.bin filter=lfs diff=lfs merge=lfs -text
+engine/crates/runtime-v8/snapshots/*.bin filter=lfs diff=lfs merge=lfs -text

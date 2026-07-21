@@ -50,7 +50,7 @@ release = profiles.get("release")
 if not isinstance(release, dict) or release.get("opt-level") != "z":
     raise SystemExit("release baseline must remain opt-level=z")
 
-hot_packages = {"audio", "core", "graphics", "io", "js-runtime"}
+hot_packages = {"migo-audio", "migo-core", "migo-graphics", "migo-io", "migo-runtime-v8"}
 for profile_name, expected_level in (("release-hot2", 2), ("release-hot3", 3)):
     profile = profiles.get(profile_name)
     if not isinstance(profile, dict):

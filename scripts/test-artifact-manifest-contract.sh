@@ -147,7 +147,7 @@ for arch, target in targets.items():
     write(native_root / "libc++_shared.so", f"fixture-libcxx-{arch}".encode())
 
     snapshot = f"fixture-snapshot-{arch}".encode()
-    snapshot_path = root / "engine/crates/js-runtime/snapshots" / f"SNAPSHOT-full-{arch}.bin"
+    snapshot_path = root / "engine/crates/runtime-v8/snapshots" / f"SNAPSHOT-full-{arch}.bin"
     write(snapshot_path, snapshot)
     snapshot_manifest = {
         "schema_version": 3,

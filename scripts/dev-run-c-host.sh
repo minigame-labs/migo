@@ -48,7 +48,7 @@ c_info "deployed '$CONTENT_ID' to $CODE_DIR"
 
 # ---- build the C host ----
 #
-# Cargo drives the link: `crates/c-host-example` compiles examples/c-host/main.c
+# Cargo drives the link: `tools/c-host-example` compiles examples/c-host/main.c
 # through a `#![no_main]` bin crate, so the C code sees nothing but the public
 # headers while cargo resolves the native dependencies.
 #
@@ -57,7 +57,7 @@ c_info "deployed '$CONTENT_ID' to $CODE_DIR"
 # scripts/build-linux-sdk.sh.
 cd "$ENGINE_DIR"
 c_info "building the C host (cargo drives the link) ..."
-cargo build -p c-host-example --offline
+cargo build -p migo-c-host-example --offline
 
 BIN="$ENGINE_DIR/target/debug/migo-c-host"
 [[ -x "$BIN" ]] || { c_err "C host binary not produced: $BIN"; exit 1; }

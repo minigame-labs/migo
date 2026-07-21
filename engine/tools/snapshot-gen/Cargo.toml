@@ -1,0 +1,31 @@
+[package]
+name = "migo-snapshot-gen"
+version = "0.1.0"
+edition = "2024"
+
+# This crate is a build tool, not part of the runtime.
+# It generates a V8 startup snapshot (SNAPSHOT.bin) that is then
+# embedded into js-runtime at compile time via include_bytes!.
+#
+# Usage:
+#   cargo run -p migo-snapshot-gen
+#
+# Output:
+#   engine/crates/runtime-v8/SNAPSHOT.bin
+
+[[bin]]
+name = "migo-snapshot-gen"
+path = "src/main.rs"
+
+[features]
+default = ["profile-full"]
+profile-full = ["runtime-v8/profile-full"]
+profile-slim = ["runtime-v8/profile-slim"]
+
+[dependencies]
+deno_core.workspace = true
+# IMPORTANT: features must match the runtime build exactly.
+# Mismatched features → different op count → different ExternalReferenceTable::kSize
+# → V8 snapshot magic number mismatch → crash at runtime.
+runtime-v8 = { package = "migo-runtime-v8", path = "../../crates/runtime-v8", default-features = false }
+shared = { package = "migo-shared", path = "../../crates/shared", default-features = false }

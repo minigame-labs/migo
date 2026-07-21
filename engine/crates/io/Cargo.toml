@@ -1,10 +1,10 @@
 [package]
-name = "io"
+name = "migo-io"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-path = "lib.rs"
+name = "migo_io"
 
 [features]
 default = ["zip-extract", "rust-image-decode", "compress-brotli"]
@@ -15,7 +15,7 @@ compress-brotli = ["dep:brotli"]
 [dependencies]
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
-shared = { path = "../shared", default-features = false }
+shared = { package = "migo-shared", path = "../shared", default-features = false }
 deno_core.workspace = true
 parking_lot = "0.12.4"
 

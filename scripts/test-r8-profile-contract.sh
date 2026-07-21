@@ -69,7 +69,7 @@ CONTRACT_TEST="$(mktemp -t migo-r6-jni-contract.XXXXXX)"
 trap 'rm -f "$CONTRACT_TEST"' EXIT
 rustc --edition 2024 --test \
   -A dead-code -A unused-mut \
-  "$ROOT/engine/crates/platform/android/jni/profile_contract.rs" \
+  "$ROOT/engine/crates/platform/src/android/jni/profile_contract.rs" \
   -o "$CONTRACT_TEST"
 "$CONTRACT_TEST"
 

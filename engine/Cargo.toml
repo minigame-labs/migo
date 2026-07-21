@@ -5,15 +5,36 @@ members = [
  "crates/audio",
  "crates/capi",
  "crates/capi-abi",
- "crates/c-host-example",
  "crates/core",
  "crates/graphics",
  "crates/io",
- "crates/js-runtime",
  "crates/platform",
- "crates/player",
+ "crates/runtime-v8",
  "crates/shared",
- "crates/snapshot-gen",
+ "tools/c-host-example",
+ "tools/player",
+ "tools/snapshot-gen",
+]
+
+# `crates/` is the engine; `tools/` is what builds or drives it. The split is
+# not cosmetic: the two desktop tools link X11/GL/Xlib, so a bare
+# `cargo build`/`cargo test` used to fail on any machine (and every Android
+# cross-check) that has no desktop graphics stack, which is why the contract
+# scripts all carried `--exclude` lists. `default-members` keeps them in the
+# workspace -- one lockfile, one `cargo update`, still buildable with `-p` --
+# while leaving them out of the default set.
+default-members = [
+ "crates/android-jni",
+ "crates/audio",
+ "crates/capi",
+ "crates/capi-abi",
+ "crates/core",
+ "crates/graphics",
+ "crates/io",
+ "crates/platform",
+ "crates/runtime-v8",
+ "crates/shared",
+ "tools/snapshot-gen",
 ]
 
 [workspace.dependencies]
@@ -158,19 +179,19 @@ opt-level = "z"
 codegen-units = 1
 debug = false
 
-[profile.release-hot2.package.audio]
+[profile.release-hot2.package.migo-audio]
 opt-level = 2
 
-[profile.release-hot2.package.core]
+[profile.release-hot2.package.migo-core]
 opt-level = 2
 
-[profile.release-hot2.package.graphics]
+[profile.release-hot2.package.migo-graphics]
 opt-level = 2
 
-[profile.release-hot2.package.io]
+[profile.release-hot2.package.migo-io]
 opt-level = 2
 
-[profile.release-hot2.package.js-runtime]
+[profile.release-hot2.package.migo-runtime-v8]
 opt-level = 2
 
 [profile.release-hot3]
@@ -185,19 +206,19 @@ opt-level = "z"
 codegen-units = 1
 debug = false
 
-[profile.release-hot3.package.audio]
+[profile.release-hot3.package.migo-audio]
 opt-level = 3
 
-[profile.release-hot3.package.core]
+[profile.release-hot3.package.migo-core]
 opt-level = 3
 
-[profile.release-hot3.package.graphics]
+[profile.release-hot3.package.migo-graphics]
 opt-level = 3
 
-[profile.release-hot3.package.io]
+[profile.release-hot3.package.migo-io]
 opt-level = 3
 
-[profile.release-hot3.package.js-runtime]
+[profile.release-hot3.package.migo-runtime-v8]
 opt-level = 3
 
 # =============================================================================

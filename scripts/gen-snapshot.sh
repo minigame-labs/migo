@@ -8,7 +8,7 @@
 # links. We therefore cross-compile `migo-snapshot-gen` to the target ABI
 # (linking the committed android V8 archive) and RUN it on that ABI's
 # emulator/device (Deno issue #27496 approach), then pull the result into
-#   engine/crates/js-runtime/snapshots/SNAPSHOT-<profile>-<arch>.bin
+#   engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<arch>.bin
 # which js-runtime/build.rs embeds (android targets only) at .so build time.
 #
 # Usage:
@@ -28,8 +28,8 @@
 #   ADB               adb path (default: ~/Android/Sdk/platform-tools/adb, then PATH)
 #
 # Output:
-#   engine/crates/js-runtime/snapshots/SNAPSHOT-<profile>-<arch>.bin
-#   engine/crates/js-runtime/snapshots/SNAPSHOT-<profile>-<arch>.bin.manifest.json
+#   engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<arch>.bin
+#   engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<arch>.bin.manifest.json
 #
 # After generating BOTH ABIs, build with embedding:
 #   bash scripts/build-aar.sh release arm64-v8a x86_64
@@ -144,7 +144,7 @@ c_info "generating snapshot on device ..."
 "${ADBD[@]}" shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp MIGO_SNAPSHOT_KIND=$SNAPSHOT_KIND MIGO_SNAPSHOT_OUT=/data/local/tmp/SNAPSHOT.bin ./migo-snapshot-gen"
 
 # ---- 3. pull + manifest -----------------------------------------------------
-OUT_DIR="$ENGINE/crates/js-runtime/snapshots"
+OUT_DIR="$ENGINE/crates/runtime-v8/snapshots"
 mkdir -p "$OUT_DIR"
 if [[ "$SNAPSHOT_KIND" == "host" ]]; then
   OUT="$OUT_DIR/SNAPSHOT-$PRODUCT_PROFILE-$RUST_ARCH.bin"

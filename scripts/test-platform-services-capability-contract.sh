@@ -20,7 +20,7 @@ def require(condition: bool, message: str) -> None:
         errors.append(message)
 
 
-platform_rs = (root / "engine/crates/core/services/platform.rs").read_text(encoding="utf-8")
+platform_rs = (root / "engine/crates/core/src/services/platform.rs").read_text(encoding="utf-8")
 
 for trait in ("DeviceServiceProvider", "FrameClock", "HostNotifier"):
     require(
@@ -75,8 +75,8 @@ require(
     "the `trait PlatformServices` block must be a marker (no inherent `fn` methods)",
 )
 
-android = (root / "engine/crates/platform/android/platform.rs").read_text(encoding="utf-8")
-desktop = (root / "engine/crates/platform/desktop/platform.rs").read_text(encoding="utf-8")
+android = (root / "engine/crates/platform/src/android/platform.rs").read_text(encoding="utf-8")
+desktop = (root / "engine/crates/platform/src/desktop/platform.rs").read_text(encoding="utf-8")
 
 for name, source in (("android", android), ("desktop", desktop)):
     require(

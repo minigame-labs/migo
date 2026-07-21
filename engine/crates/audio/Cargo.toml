@@ -1,7 +1,10 @@
 [package]
-name = "audio"
+name = "migo-audio"
 version = "0.1.0"
 edition = "2024"
+
+[lib]
+name = "audio"
 
 [dependencies]
 # Cross-platform audio output
@@ -23,7 +26,7 @@ reqwest = { workspace = true }
 futures-util = "0.3"
 
 # Shared
-shared = { path = "../shared", default-features = false }
+shared = { package = "migo-shared", path = "../shared", default-features = false }
 tracing = { workspace = true }
 
 # Android specific: use oboe backend + shared C++ STL.

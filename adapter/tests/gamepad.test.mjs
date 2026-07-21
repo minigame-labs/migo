@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 
 const runtime = await import(
-  "../../engine/crates/js-runtime/input/04_gamepad.js"
+  "../../engine/crates/runtime-v8/input/04_gamepad.js"
 );
 
 // ---- Fake migo carrying the real gamepad transport ------------------------

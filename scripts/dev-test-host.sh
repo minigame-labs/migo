@@ -20,9 +20,9 @@
 #   scripts/dev-test-host.sh [cargo-args...]
 #
 # Examples:
-#   scripts/dev-test-host.sh test -p js-runtime --lib          # V8 backend suite
-#   scripts/dev-test-host.sh test -p core --no-default-features --features profile-slim
-#   scripts/dev-test-host.sh build -p graphics --lib
+#   scripts/dev-test-host.sh test -p migo-runtime-v8 --lib          # V8 backend suite
+#   scripts/dev-test-host.sh test -p migo-core --no-default-features --features profile-slim
+#   scripts/dev-test-host.sh build -p migo-graphics --lib
 #
 # Env overrides:
 #   MIGO_HOST_V8_DIR  gn_out dir holding librusty_v8.a + src_binding.rs
@@ -75,7 +75,7 @@ c_info "V8: $V8_ARCHIVE"
 c_info "CC=$CC CXX=$CXX"
 
 ARGS=("$@")
-[[ ${#ARGS[@]} -gt 0 ]] || ARGS=(test -p js-runtime --lib --offline)
+[[ ${#ARGS[@]} -gt 0 ]] || ARGS=(test -p migo-runtime-v8 --lib --offline)
 
 cd "$ENGINE_DIR"
 c_info "cargo ${ARGS[*]}"

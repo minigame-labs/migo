@@ -57,21 +57,21 @@ export RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a"
 export RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs"
 
 info "building capi staticlib (release, $TARGET)"
-cargo build -p capi --release --target "$TARGET" --manifest-path "$ENGINE_DIR/Cargo.toml"
+cargo build -p migo-capi --release --target "$TARGET" --manifest-path "$ENGINE_DIR/Cargo.toml"
 STATIC_LIB="$ENGINE_DIR/target/$TARGET/release/libmigo_capi.a"
 [[ -f "$STATIC_LIB" ]] || { err "no static library produced"; exit 1; }
 info "built: $STATIC_LIB ($(stat -c %s "$STATIC_LIB") bytes)"
 
 info "capturing the link line cargo uses"
 CARGO_OUT="$ENGINE_DIR/target/$TARGET/release/migo-android-native-static-libs.txt"
-cargo rustc -p capi --release --target "$TARGET" \
+cargo rustc -p migo-capi --release --target "$TARGET" \
     --manifest-path "$ENGINE_DIR/Cargo.toml" -- --print native-static-libs \
     > "$CARGO_OUT" 2>&1 \
     || { err "cargo did not report native-static-libs"; cat "$CARGO_OUT" >&2; exit 1; }
 grep -q "native-static-libs:" "$CARGO_OUT" \
     || { err "no native-static-libs note in cargo output"; exit 1; }
 
-SNAPSHOT_BIN="$ENGINE_DIR/crates/js-runtime/snapshots/SNAPSHOT-full-$ARCH.bin"
+SNAPSHOT_BIN="$ENGINE_DIR/crates/runtime-v8/snapshots/SNAPSHOT-full-$ARCH.bin"
 [[ -f "$SNAPSHOT_BIN" ]] || { err "missing embedded snapshot $SNAPSHOT_BIN (run gen-snapshot.sh)"; exit 1; }
 V8_LOCK="$REPO_ROOT/contracts/artifact-manifest/android-v8.lock.json"
 

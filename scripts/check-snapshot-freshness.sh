@@ -10,7 +10,7 @@ die()    { c_err "$*"; exit 2; }
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$ROOT/engine"
-SNAP_DIR="$ENGINE/crates/js-runtime/snapshots"
+SNAP_DIR="$ENGINE/crates/runtime-v8/snapshots"
 # shellcheck source=scripts/lib/snapshot-fingerprint.sh
 source "$ROOT/scripts/lib/snapshot-fingerprint.sh"
 

@@ -1,5 +1,5 @@
 [package]
-name = "android-jni"
+name = "migo-android-jni"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,7 +11,6 @@ edition = "2024"
 # (`R_X86_64_TPOFF32 ... cannot be used with -shared`, CLAUDE.md §10).
 [lib]
 name = "migo"
-path = "lib.rs"
 crate-type = ["cdylib"]
 
 # Mirrored verbatim from `platform` so the build scripts can keep passing
@@ -30,7 +29,7 @@ api-commerce = ["platform/api-commerce"]
 api-system = ["platform/api-system"]
 
 [dependencies]
-platform = { path = "../platform", default-features = false }
+platform = { package = "migo-platform", path = "../platform", default-features = false }
 
 # The JNI entry point is the only thing this crate contains, so `jni` is only
 # needed where it is compiled.

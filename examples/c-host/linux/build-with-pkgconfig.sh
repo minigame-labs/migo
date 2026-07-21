@@ -41,7 +41,14 @@ echo "[c-host] cflags: $(pkg-config --cflags migo)"
 echo "[c-host] libs:   $MIGO_LIBS"
 
 # shellcheck disable=SC2046,SC2086  # word splitting of pkg-config output is intended
+# X11 only. The Wayland host needs wayland-scanner plus generated xdg-shell
+# protocol code, which is example plumbing rather than anything a consumer of the
+# packaged SDK has to do -- and the point of this script is to prove the SDK is
+# consumable with nothing but cc and pkg-config. The define is the same switch
+# cargo's build.rs sets when it cannot build the Wayland half, so
+# MIGO_C_HOST_BACKEND=wayland reports that clearly instead of failing to link.
 "${CC:-cc}" -std=c11 -Wall -Wextra -o "$OUT" "$SCRIPT_DIR/main.c" \
+    -DMIGO_C_HOST_NO_WAYLAND \
     $(pkg-config --cflags migo) \
     $MIGO_LIBS \
     -Wl,-rpath,"$PREFIX/lib" \

@@ -1,30 +1,30 @@
 [package]
-name = "core"
+name = "migo-core"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-path = "lib.rs"
+name = "migo_core"
 
 [features]
 default = ["profile-full"]
-profile-full = ["js-runtime/profile-full", "v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system", "graphics/profile-full"]
-profile-slim = ["js-runtime/profile-slim", "v8-limits", "code-signing", "graphics/profile-slim"]
-worker-snapshot = ["js-runtime/worker-snapshot"]
-v8-limits = ["js-runtime/v8-limits", "shared/v8-limits"]
-code-signing = ["js-runtime/code-signing", "shared/code-signing"]
-api-sensors = ["js-runtime/api-sensors"]
-api-media = ["js-runtime/api-media", "dep:audio"]
-api-connectivity = ["js-runtime/api-connectivity"]
-api-commerce = ["js-runtime/api-commerce"]
-api-system = ["js-runtime/api-system"]
+profile-full = ["runtime-v8/profile-full", "v8-limits", "code-signing", "api-sensors", "api-media", "api-connectivity", "api-commerce", "api-system", "graphics/profile-full"]
+profile-slim = ["runtime-v8/profile-slim", "v8-limits", "code-signing", "graphics/profile-slim"]
+worker-snapshot = ["runtime-v8/worker-snapshot"]
+v8-limits = ["runtime-v8/v8-limits", "shared/v8-limits"]
+code-signing = ["runtime-v8/code-signing", "shared/code-signing"]
+api-sensors = ["runtime-v8/api-sensors"]
+api-media = ["runtime-v8/api-media", "dep:audio"]
+api-connectivity = ["runtime-v8/api-connectivity"]
+api-commerce = ["runtime-v8/api-commerce"]
+api-system = ["runtime-v8/api-system"]
 
 [dependencies]
-shared = { path = "../shared", default-features = false }
-js-runtime = { path = "../js-runtime", default-features = false }
-graphics = { path = "../graphics", default-features = false }
-io = { path = "../io", default-features = false }
-audio = { path = "../audio", default-features = false, optional = true }
+shared = { package = "migo-shared", path = "../shared", default-features = false }
+runtime-v8 = { package = "migo-runtime-v8", path = "../runtime-v8", default-features = false }
+graphics = { package = "migo-graphics", path = "../graphics", default-features = false }
+migo-io = { path = "../io", default-features = false }
+audio = { package = "migo-audio", path = "../audio", default-features = false, optional = true }
 crossbeam-channel = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
@@ -40,5 +40,5 @@ parking_lot = { workspace = true }
 # - codec-gbk: GBK encoding via `encoding_rs` crate (Android uses java.nio.charset via JNI)
 # - rust-image-decode: image/zune-image decoders (Android uses BitmapFactory via JNI)
 [target.'cfg(not(target_os = "android"))'.dependencies]
-io = { path = "../io", default-features = false, features = ["zip-extract", "rust-image-decode"] }
-shared = { path = "../shared", default-features = false, features = ["codec-gbk"] }
+migo-io = { path = "../io", default-features = false, features = ["zip-extract", "rust-image-decode"] }
+shared = { package = "migo-shared", path = "../shared", default-features = false, features = ["codec-gbk"] }

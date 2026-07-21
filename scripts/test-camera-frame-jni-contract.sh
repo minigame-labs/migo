@@ -15,8 +15,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ANDROID_DIR="$REPO_ROOT/platforms/android"
-REG_RS="$REPO_ROOT/engine/crates/platform/android/jni/registration.rs"
-PROFILE_CONTRACT_RS="$REPO_ROOT/engine/crates/platform/android/jni/profile_contract.rs"
+REG_RS="$REPO_ROOT/engine/crates/platform/src/android/jni/registration.rs"
+PROFILE_CONTRACT_RS="$REPO_ROOT/engine/crates/platform/src/android/jni/profile_contract.rs"
 EXPECTED='(IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIII)V'
 
 fail() { echo "FAIL: $1" >&2; exit 1; }

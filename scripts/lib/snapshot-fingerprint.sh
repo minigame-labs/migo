@@ -124,7 +124,7 @@ snapshot_require_materialized_snapshot() {
 # sha256 of every extension *.js on disk under js-runtime.
 #
 # This MUST stay byte-identical to the Rust helper
-# engine/crates/js-runtime/build_snapshot.rs (shared by build.rs and its
+# engine/crates/runtime-v8/build_snapshot.rs (shared by build.rs and its
 # regression test). Both:
 #   * enumerate via a filesystem walk (NOT `git ls-files`), so it works in a
 #     worktree without a .git directory and untracked/generated embedded JS also
@@ -139,7 +139,7 @@ snapshot_require_materialized_snapshot() {
 snapshot_js_hash() {
   local root="$1"
   ( cd "$root" && \
-    find engine/crates/js-runtime -type f -name '*.js' \
+    find engine/crates/runtime-v8 -type f -name '*.js' \
       | LC_ALL=C sort \
       | xargs -r -d '\n' sha256sum \
       | sha256sum | awk '{print $1}' )
@@ -148,11 +148,11 @@ snapshot_js_hash() {
 snapshot_runtime_hash() {
   local root="$1"
   ( cd "$root" && \
-    { find engine/crates/js-runtime engine/crates/snapshot-gen \
+    { find engine/crates/runtime-v8 engine/tools/snapshot-gen \
         -type f -name '*.rs' || exit 1; \
       printf '%s\n' \
-        engine/crates/js-runtime/Cargo.toml \
-        engine/crates/snapshot-gen/Cargo.toml \
+        engine/crates/runtime-v8/Cargo.toml \
+        engine/tools/snapshot-gen/Cargo.toml \
         engine/Cargo.lock || exit 1; } \
       | LC_ALL=C sort \
       | xargs -r -d '\n' sha256sum \

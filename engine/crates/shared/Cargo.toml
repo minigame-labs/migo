@@ -1,10 +1,10 @@
 [package]
-name = "shared"
+name = "migo-shared"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-path = "lib.rs"
+name = "shared"
 
 [features]
 default = ["v8-limits", "code-signing"]
