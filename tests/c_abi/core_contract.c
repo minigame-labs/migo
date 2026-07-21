@@ -116,7 +116,12 @@ _Static_assert(sizeof(MigoError) == 28, "ILP32 error layout");
 _Static_assert(sizeof(MigoSurfaceDescriptor) ==
                    (_Alignof(uint64_t) == 8 ? 72 : 68),
                "ILP32 Surface layout follows the target uint64_t alignment");
-_Static_assert(sizeof(MigoHostCallbacks) == 48, "ILP32 callback layout");
+/* 8 bytes of header plus eleven pointers. This was wrong from the commit that
+ * appended on_request_frame until 2026-07-21: the LP64 line was updated and
+ * this one was not, and the soft-keyboard callbacks were then added on top of
+ * the wrong base. Nothing caught it because every lane ran on an LP64 host, so
+ * this branch had never once been compiled. */
+_Static_assert(sizeof(MigoHostCallbacks) == 52, "ILP32 callback layout");
 #else
 #error "unsupported pointer width"
 #endif
