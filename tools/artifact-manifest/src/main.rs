@@ -8,11 +8,11 @@ use std::{
 };
 
 use artifact_manifest::{
-    LinuxPackageManifest, PackageIndex, ReleaseAttestation, SliceManifest, SliceManifestSource,
-    V8ComponentManifest, build_package_index, build_release_attestation, seal_slice_manifest,
-    seal_v8_component_manifest, validate_linux_package_manifest, validate_slice_manifest,
-    validate_v8_component_manifest, verify_package_index, verify_release_attestation,
-    verify_v8_component_files,
+    AndroidPackageManifest, LinuxPackageManifest, PackageIndex, ReleaseAttestation, SliceManifest,
+    SliceManifestSource, V8ComponentManifest, build_package_index, build_release_attestation,
+    seal_slice_manifest, seal_v8_component_manifest, validate_android_package_manifest,
+    validate_linux_package_manifest, validate_slice_manifest, validate_v8_component_manifest,
+    verify_package_index, verify_release_attestation, verify_v8_component_files,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -25,7 +25,8 @@ const USAGE: &str = "usage:
   migo-artifact-manifest verify-index <index.json> <package-root>
   migo-artifact-manifest attest <package> <index.json> <output.json>
   migo-artifact-manifest verify-attestation <attestation.json> <package> <index.json>
-  migo-artifact-manifest verify-linux-package <manifest.json>";
+  migo-artifact-manifest verify-linux-package <manifest.json>
+  migo-artifact-manifest verify-android-package <manifest.json>";
 
 fn main() {
     if let Err(error) = run(env::args_os().skip(1).collect()) {
@@ -78,6 +79,12 @@ fn run(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
             let manifest: LinuxPackageManifest = read_json(Path::new(&arguments[0]))?;
             validate_linux_package_manifest(&manifest)?;
             println!("{} {}", manifest.target, manifest.version);
+        }
+        "verify-android-package" => {
+            require_count(command, arguments, 1)?;
+            let manifest: AndroidPackageManifest = read_json(Path::new(&arguments[0]))?;
+            validate_android_package_manifest(&manifest)?;
+            println!("{} {}", manifest.target_triple, manifest.version);
         }
         "verify-slice" => {
             require_count(command, arguments, 1)?;

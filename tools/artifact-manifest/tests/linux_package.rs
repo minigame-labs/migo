@@ -6,7 +6,7 @@
 //! loader floor quietly raised past what consumers were promised.
 
 use artifact_manifest::{
-    LinuxPackageManifest, LinuxSnapshotIdentity, validate_linux_package_manifest,
+    LinuxPackageManifest, PackageSnapshotIdentity, validate_linux_package_manifest,
 };
 
 fn shipped_manifest() -> LinuxPackageManifest {
@@ -155,8 +155,8 @@ fn a_zero_length_artifact_is_not_a_shipped_binary() {
     );
 }
 
-fn host_snapshot() -> LinuxSnapshotIdentity {
-    LinuxSnapshotIdentity {
+fn host_snapshot() -> PackageSnapshotIdentity {
+    PackageSnapshotIdentity {
         runtime_kind: "host".to_string(),
         target_triple: "x86_64-unknown-linux-gnu".to_string(),
         arch: "x86_64".to_string(),

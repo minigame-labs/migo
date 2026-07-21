@@ -28,6 +28,13 @@ pub const LINUX_PACKAGE_SCHEMA_V1: &str = "migo-linux-package-v1";
 pub const LINUX_GLIBC_FLOOR: &str = "2.31";
 pub const LINUX_GLIBCXX_FLOOR: &str = "3.4.28";
 
+pub const ANDROID_PACKAGE_SCHEMA_V1: &str = "migo-android-package-v1";
+
+/// The project's minimum Android API. Pinned as policy: raising it is a support
+/// contract change, so a manifest declaring anything else is rejected rather
+/// than silently accepted.
+pub const ANDROID_API_FLOOR: &str = "26";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SliceManifest {
@@ -167,14 +174,14 @@ pub struct LinuxPackageManifest {
     pub sysroot: String,
     pub dynamic_dependencies: Vec<String>,
     pub snapshot_policy: String,
-    pub snapshots: Vec<LinuxSnapshotIdentity>,
-    pub v8: LinuxV8Provenance,
+    pub snapshots: Vec<PackageSnapshotIdentity>,
+    pub v8: PackageV8Provenance,
     pub artifacts: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct LinuxSnapshotIdentity {
+pub struct PackageSnapshotIdentity {
     pub runtime_kind: String,
     pub target_triple: String,
     pub arch: String,
@@ -182,11 +189,44 @@ pub struct LinuxSnapshotIdentity {
     pub bytes_hash: String,
 }
 
+/// One shipped Android C ABI package slice, one Android ABI.
+///
+/// Kept separate from [`LinuxPackageManifest`] for the same reason that is kept
+/// separate from the AAR [`SliceManifest`]: the fields that must be present are
+/// different, and making them optional to share a type is how a missing floor or
+/// a missing snapshot stops being noticed. Android is cross-compiled, ships a
+/// static library rather than a versioned shared object, pins an `android_api`
+/// floor rather than glibc, and always embeds a snapshot -- where Linux embeds
+/// none.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AndroidPackageManifest {
+    pub schema: String,
+    pub version: String,
+    pub os: String,
+    pub abi: String,
+    pub arch: String,
+    pub android_abi: String,
+    pub target_triple: String,
+    pub cpu_baseline: String,
+    pub required_cpu_features: Vec<String>,
+    pub min_android_api: String,
+    /// The `-l` flags the consumer must add when it links the static library
+    /// into its own `.so`. The Android analogue of the Linux package's
+    /// `dynamic_dependencies`: a static archive carries no DT_NEEDED of its own,
+    /// so the transitive system libraries are the consumer's to provide.
+    pub link_libraries: Vec<String>,
+    pub snapshot_policy: String,
+    pub snapshots: Vec<PackageSnapshotIdentity>,
+    pub v8: PackageV8Provenance,
+    pub artifacts: BTreeMap<String, u64>,
+}
+
 /// The subset of the V8 component manifest the package copies in. Unknown
 /// fields are tolerated here, unlike everywhere else: this is a copy of another
 /// document that may legitimately gain fields of its own.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct LinuxV8Provenance {
+pub struct PackageV8Provenance {
     pub schema: String,
     pub target: String,
     pub rusty_v8_revision: String,
@@ -380,16 +420,35 @@ fn validate_linux_snapshots(manifest: &LinuxPackageManifest) -> Result<(), Manif
         &manifest.snapshot_policy,
         &["none", "embedded"],
     )?;
+    validate_package_snapshots(
+        &manifest.snapshots,
+        &manifest.snapshot_policy,
+        &manifest.target,
+        &manifest.arch,
+    )
+}
+
+/// The snapshot rules shared by every package manifest: policy and content must
+/// agree, and each snapshot must be for this package's own triple and arch,
+/// because a snapshot is V8 machine code that only loads in the V8 it was made
+/// for. The policy string is validated against its allowed set by the caller,
+/// which differs by platform (Linux permits `none`, Android does not).
+fn validate_package_snapshots(
+    snapshots: &[PackageSnapshotIdentity],
+    snapshot_policy: &str,
+    target_triple: &str,
+    arch: &str,
+) -> Result<(), ManifestError> {
     // Policy and content must agree. Stating the policy is what makes "ships no
     // snapshot" a decision rather than an omission, and cross-checking it is
     // what keeps the statement true once a snapshot is added.
-    match manifest.snapshot_policy.as_str() {
-        "none" if !manifest.snapshots.is_empty() => {
+    match snapshot_policy {
+        "none" if !snapshots.is_empty() => {
             return Err(ManifestError::new(
                 "snapshot_policy is none but snapshots were listed",
             ));
         }
-        "embedded" if manifest.snapshots.is_empty() => {
+        "embedded" if snapshots.is_empty() => {
             return Err(ManifestError::new(
                 "snapshot_policy is embedded but no snapshot was listed",
             ));
@@ -398,7 +457,7 @@ fn validate_linux_snapshots(manifest: &LinuxPackageManifest) -> Result<(), Manif
     }
 
     let mut kinds: HashSet<&str> = HashSet::new();
-    for snapshot in &manifest.snapshots {
+    for snapshot in snapshots {
         require_one_of(
             "snapshot.runtime_kind",
             &snapshot.runtime_kind,
@@ -415,9 +474,9 @@ fn validate_linux_snapshots(manifest: &LinuxPackageManifest) -> Result<(), Manif
         require_equal(
             "snapshot.target_triple",
             &snapshot.target_triple,
-            &manifest.target,
+            target_triple,
         )?;
-        require_equal("snapshot.arch", &snapshot.arch, &manifest.arch)?;
+        require_equal("snapshot.arch", &snapshot.arch, arch)?;
         require_sorted_unique(
             "snapshot.normalized_parameters",
             &snapshot.normalized_parameters,
@@ -428,6 +487,111 @@ fn validate_linux_snapshots(manifest: &LinuxPackageManifest) -> Result<(), Manif
             ));
         }
         require_sha256("snapshot.bytes_hash", &snapshot.bytes_hash)?;
+    }
+    Ok(())
+}
+
+/// Validate one Android C ABI package slice.
+///
+/// Same north star as the Linux validator -- the library and the things built
+/// into it must describe the same machine -- with Android's differences pinned:
+/// the `android_api` floor is the project minimum, the artifact is a static
+/// library, and a snapshot is always embedded rather than absent.
+pub fn validate_android_package_manifest(
+    manifest: &AndroidPackageManifest,
+) -> Result<(), ManifestError> {
+    require_equal("schema", &manifest.schema, ANDROID_PACKAGE_SCHEMA_V1)?;
+    require_non_placeholder("version", &manifest.version)?;
+    require_equal("os", &manifest.os, "android")?;
+    // "android" is the userspace ABI, distinct from the Linux kernel it runs on
+    // and from OpenHarmony. It is what a static library built here can be linked
+    // against.
+    require_equal("abi", &manifest.abi, "android")?;
+    require_equal(
+        "min_android_api",
+        &manifest.min_android_api,
+        ANDROID_API_FLOOR,
+    )?;
+
+    // arch determines triple, ABI name, CPU baseline and features together;
+    // splitting them lets a mismatch through.
+    match manifest.arch.as_str() {
+        "aarch64" => {
+            require_equal(
+                "target_triple",
+                &manifest.target_triple,
+                "aarch64-linux-android",
+            )?;
+            require_equal("android_abi", &manifest.android_abi, "arm64-v8a")?;
+            require_equal("cpu_baseline", &manifest.cpu_baseline, "armv8-a")?;
+            require_sorted_unique("required_cpu_features", &manifest.required_cpu_features)?;
+            if manifest.required_cpu_features != ["neon"] {
+                return Err(ManifestError::new(
+                    "required_cpu_features for aarch64 must be [\"neon\"]",
+                ));
+            }
+        }
+        "x86_64" => {
+            require_equal(
+                "target_triple",
+                &manifest.target_triple,
+                "x86_64-linux-android",
+            )?;
+            require_equal("android_abi", &manifest.android_abi, "x86_64")?;
+            require_equal("cpu_baseline", &manifest.cpu_baseline, "x86-64-v1")?;
+            require_sorted_unique("required_cpu_features", &manifest.required_cpu_features)?;
+            if manifest.required_cpu_features != ["cmov", "sse2"] {
+                return Err(ManifestError::new(
+                    "required_cpu_features for x86_64 must be [\"cmov\", \"sse2\"]",
+                ));
+            }
+        }
+        other => {
+            return Err(ManifestError::new(format!(
+                "unsupported Android package arch: {other}"
+            )));
+        }
+    }
+
+    if manifest.link_libraries.is_empty() {
+        return Err(ManifestError::new(
+            "link_libraries must list the system libraries the consumer links the static archive against",
+        ));
+    }
+    require_sorted_unique("link_libraries", &manifest.link_libraries)?;
+    for library in &manifest.link_libraries {
+        require_non_placeholder("link_libraries", library)?;
+    }
+
+    // Android always embeds a snapshot; `none` is a Linux-only policy.
+    require_equal("snapshot_policy", &manifest.snapshot_policy, "embedded")?;
+    validate_package_snapshots(
+        &manifest.snapshots,
+        &manifest.snapshot_policy,
+        &manifest.target_triple,
+        &manifest.arch,
+    )?;
+
+    require_equal("v8.schema", &manifest.v8.schema, "migo-v8-component-v1")?;
+    if manifest.v8.target != manifest.target_triple {
+        return Err(ManifestError::new(format!(
+            "v8.target {} does not match package target {}: a V8 built for one \
+             OS/ABI/arch cannot be shipped in a package for another",
+            manifest.v8.target, manifest.target_triple
+        )));
+    }
+    require_revision("v8.rusty_v8_revision", &manifest.v8.rusty_v8_revision)?;
+
+    if manifest.artifacts.is_empty() {
+        return Err(ManifestError::new("artifacts must not be empty"));
+    }
+    for (name, size) in &manifest.artifacts {
+        require_non_placeholder("artifacts", name)?;
+        if *size == 0 {
+            return Err(ManifestError::new(format!(
+                "artifacts.{name} has size 0, which cannot be a shipped binary"
+            )));
+        }
     }
     Ok(())
 }

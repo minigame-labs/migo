@@ -14,15 +14,26 @@
 static_assert(MIGO_C_ABI_CANDIDATE == 1, "candidate marker");
 /*
  * The macro answers "does a linkable runtime exist for this target", so the
- * assertion checks the rule rather than a constant: desktop Linux ships one,
- * every other target does not. Asserting a fixed 0 here would have to be
- * relaxed the moment any platform gained an implementation, which is exactly
- * when the check is worth having.
+ * assertion checks the rule rather than a constant: desktop Linux and Android
+ * each ship one, every other target does not. The three Linux-kernel targets
+ * are told apart first -- Android and OpenHarmony define __linux__ too, so a
+ * classifier written on __linux__ alone answers for all three at once.
  */
-#if defined(__linux__) && !defined(__ANDROID__)
+static_assert(MIGO_PLATFORM_IS_ANDROID + MIGO_PLATFORM_IS_OPENHARMONY +
+                      MIGO_PLATFORM_IS_LINUX_GNU <= 1,
+              "at most one Linux-kernel target may claim a translation unit");
+#if defined(__ANDROID__)
+static_assert(MIGO_PLATFORM_IS_ANDROID == 1, "Android must classify as Android");
+static_assert(MIGO_PLATFORM_IS_LINUX_GNU == 0, "Android is not desktop Linux");
+static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "Android ships a static runtime");
+#elif defined(__OHOS__) || defined(__OHOS_FAMILY__)
+static_assert(MIGO_PLATFORM_IS_OPENHARMONY == 1, "OpenHarmony must classify as itself");
+static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "OpenHarmony has no runtime yet");
+#elif defined(__linux__) && defined(__GLIBC__)
+static_assert(MIGO_PLATFORM_IS_LINUX_GNU == 1, "glibc Linux is the desktop target");
 static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "desktop Linux ships a runtime");
 #else
-static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "no runtime outside desktop Linux");
+static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "no runtime on unclassified targets");
 #endif
 static_assert(sizeof(MigoResult) == 4, "fixed-width result");
 

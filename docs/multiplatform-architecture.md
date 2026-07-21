@@ -725,7 +725,7 @@ SnapshotId = {
 | OpenHarmony system-JSVM / `aarch64` | `aarch64`；目标 OHOS SDK ABI，首批基线 ARMv8-A + AdvSIMD | `openharmony_api: 12` | `v8_revision: null`、`snapshots: []`；记录 JSVM API/SDK identity、bridge schema；API 14+ DVSync 只写 optimized capability |
 | iOS device / `arm64` | `aarch64`；Apple arm64 ABI（AArch64 + AdvSIMD） | `ios: 15.0` | `v8_revision: null`、`snapshots: []`；记录 WebKit/SDK identity、bridge schema；simulator slice 使用独立 target/manifest |
 
-上表不是文档承诺而是**被校验的合同**。每个 slice manifest 都有 JSON schema 与工具校验：Android slice 走 `contracts/artifact-manifest/schema-v1.json` + `migo-artifact-manifest verify-slice`；Linux GNU slice 走 `contracts/artifact-manifest/linux-package-schema-v1.json` + `migo-artifact-manifest verify-linux-package`，并由 `scripts/test-linux-sdk-contract.sh` 对照真实产物核对 DT_NEEDED、导出符号与 loader floor。
+上表不是文档承诺而是**被校验的合同**。每个 slice manifest 都有 JSON schema 与工具校验：Android AAR slice 走 `contracts/artifact-manifest/schema-v1.json` + `migo-artifact-manifest verify-slice`；Linux GNU 包走 `linux-package-schema-v1.json` + `verify-linux-package`,由 `scripts/test-linux-sdk-contract.sh` 对照真实产物核对 DT_NEEDED、导出符号与 loader floor;**Android C ABI 包**走 `android-package-schema-v1.json` + `verify-android-package`,由 `scripts/test-android-sdk-contract.sh` 核对静态库导出面(恰好 22 个 `migo_*`)、嵌入 snapshot 的 hash、NDK 下 header 编译,以及一个真实 `find_package(migo)` 消费者(`examples/c-host/android-package-consumer`)能否把每个 `migo_*` 链接解析。Android C ABI 以**静态库 + CMake**分发(NDK 消费方式),不出 versioned .so / pkg-config;C++ 运行时由消费者的 `-DANDROID_STL` 经工具链提供,故不进包的链接行。
 
 其中三条规则是**禁止混用**，因为它们的失败方式都是「链接得上、跑起来才炸，且现场没有 provenance」：
 

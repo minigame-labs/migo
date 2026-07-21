@@ -1,0 +1,6 @@
+{
+    global:
+        migo_consumer_probe;
+    local:
+        *;
+};

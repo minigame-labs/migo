@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://migo.dev/contracts/artifact-manifest/android-package-schema-v1.json",
+  "title": "Migo Android C ABI package manifest v1",
+  "description": "Describes one shipped Android C ABI package slice, one Android ABI. The primary artifact is a static library the host links into its own .so; every field is a claim scripts/test-android-sdk-contract.sh checks against the staged package.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "os",
+    "abi",
+    "arch",
+    "android_abi",
+    "target_triple",
+    "cpu_baseline",
+    "required_cpu_features",
+    "min_android_api",
+    "link_libraries",
+    "snapshot_policy",
+    "snapshots",
+    "v8",
+    "artifacts"
+  ],
+  "properties": {
+    "schema": { "const": "migo-android-package-v1" },
+    "version": { "type": "string", "minLength": 1 },
+    "os": { "const": "android" },
+    "abi": {
+      "description": "Userspace ABI. Android is a Linux kernel with a Bionic userspace; a static library built here cannot be linked into a glibc or OpenHarmony consumer.",
+      "const": "android"
+    },
+    "arch": { "enum": ["aarch64", "x86_64"] },
+    "android_abi": {
+      "description": "The Android ABI directory name, distinct from arch (arm64-v8a vs aarch64).",
+      "enum": ["arm64-v8a", "x86_64"]
+    },
+    "target_triple": { "enum": ["aarch64-linux-android", "x86_64-linux-android"] },
+    "cpu_baseline": { "enum": ["armv8-a", "x86-64-v1"] },
+    "required_cpu_features": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "min_android_api": {
+      "description": "Minimum Android API. Pinned to the project floor; raising it is a support contract change.",
+      "const": "26"
+    },
+    "link_libraries": {
+      "description": "The -l flags the consumer must add when linking the static archive into its own .so. A static archive has no DT_NEEDED, so the transitive system libraries are the consumer's to provide. Sorted and unique.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "snapshot_policy": {
+      "description": "Android always embeds a startup snapshot; 'none' is a Linux-only policy. Must agree with the snapshots array.",
+      "const": "embedded"
+    },
+    "snapshots": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "runtime_kind",
+          "target_triple",
+          "arch",
+          "normalized_parameters",
+          "bytes_hash"
+        ],
+        "properties": {
+          "runtime_kind": { "enum": ["host", "worker"] },
+          "target_triple": { "type": "string", "minLength": 1 },
+          "arch": { "type": "string", "minLength": 1 },
+          "normalized_parameters": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "bytes_hash": { "$ref": "schema-v1.json#/$defs/sha256" }
+        }
+      }
+    },
+    "v8": {
+      "description": "Provenance of the V8 this package was cross-compiled against, copied from the V8 component manifest. Its target must equal this package's target_triple: a V8 built for another arch cannot be mixed in.",
+      "type": "object",
+      "required": ["schema", "target", "rusty_v8_revision"],
+      "properties": {
+        "schema": { "const": "migo-v8-component-v1" },
+        "target": { "enum": ["aarch64-linux-android", "x86_64-linux-android"] },
+        "rusty_v8_revision": { "$ref": "schema-v1.json#/$defs/revision" }
+      }
+    },
+    "artifacts": {
+      "description": "Shipped file names mapped to their size in bytes; the static library must be present.",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    }
+  }
+}

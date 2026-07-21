@@ -12,7 +12,7 @@ MIGO_C_ABI_HAS_RUNTIME == 0    /* every other target */
 
 A runtime existing is not the same as the ABI being frozen. Do not treat these headers as a stable SDK: the freeze blockers below are open, and the surface may still change.
 
-Android's runtime is a **static library built from the source tree** (`scripts/build-android-c-host.sh`), driven by `examples/c-host/android` — a NativeActivity with no Java of its own. It is not packaged: no pkg-config, no CMake package, no versioned shared object, which desktop Linux does have. The `libmigo.so` the Java/JNI SDK ships is a different artifact and still exports no `migo_*` symbols.
+Android's runtime is a **static library** a host links into its own `.so`, driven by `examples/c-host/android` — a NativeActivity with no Java of its own. It is now packaged for third-party NDK consumption: `scripts/build-android-sdk.sh` stages headers, `libmigo_capi.a`, a CMake package (`find_package(migo)`), and a per-ABI artifact manifest, and `scripts/test-android-sdk-contract.sh` verifies the export surface, the embedded snapshot, and that a `find_package(migo)` consumer (`examples/c-host/android-package-consumer`) links with every `migo_*` resolved. It deliberately ships a static library rather than a versioned shared object and CMake rather than pkg-config, because that is how an NDK host consumes a native dependency; those are not omissions. The `libmigo.so` the Java/JNI SDK ships is a different artifact and still exports no `migo_*` symbols.
 
 ## Header layout
 
@@ -215,11 +215,15 @@ The candidate cannot be declared stable until all of the following exist:
   yet, so the C lane's declared shape is the current one today; it becomes a true
   old-versus-new prefix check the moment one grows;
 - Android/Linux compatibility and performance gates with no material regression — **Linux compatibility gate done**, the rest open;
-- Android packaging for a third-party consumer — **open**. `MIGO_C_ABI_HAS_RUNTIME` is 1 on
-  Android because a linkable runtime genuinely exists and runs on device, but a host links it
-  out of the source tree: there is no pkg-config file, no CMake package and no versioned
-  shared object, all of which desktop Linux has. That is packaging, not capability, and it is
-  what stands between "callable" and "shippable" on Android.
+- Android packaging for a third-party consumer — **done for arm64-v8a**.
+  `scripts/build-android-sdk.sh` stages a CMake package (headers, `libmigo_capi.a`,
+  `find_package(migo)`, per-ABI manifest); `scripts/test-android-sdk-contract.sh` verifies the
+  22-symbol export surface, the embedded snapshot's hash, and that a real `find_package(migo)`
+  consumer links with every `migo_*` resolved. A versioned shared object and pkg-config are
+  deliberately not provided — an NDK host links a static library through CMake, so those would
+  be shape without a consumer. **Open**: the `x86_64` Android package, which is blocked only on
+  its startup snapshot (generated on a CI emulator, never in-tree); and a `-DANDROID_STL`
+  matrix beyond the `c++_shared` the consumer is proven against.
 
 The Linux artifact contract that is in place is described by
 `dist/migo-linux-x86_64/share/migo/linux-x86_64-manifest.json`: target triple, CPU
