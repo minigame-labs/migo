@@ -55,6 +55,51 @@ compile_core() {
         "$TMP_ROOT/old_client_outbound_contract.o"
 }
 
+# The ILP32 lane.
+#
+# Every layout assertion in tests/c_abi is written twice, once per pointer
+# width, but until 2026-07-21 only the LP64 half had ever been compiled: every
+# lane ran on an LP64 host, so `#elif UINTPTR_MAX == UINT32_MAX` was dead
+# source. It had been wrong since the commit that appended `on_request_frame`
+# -- that commit updated the LP64 size and not the ILP32 one, and the
+# soft-keyboard callbacks were then appended on top of the wrong base. A
+# 32-bit compile is what makes that half real.
+#
+# `-ffreestanding` is what keeps this cheap: the lanes need only stdint.h and
+# stddef.h, which the compiler supplies itself, so this needs a multilib
+# compiler but not a 32-bit libc.
+compile_c_ilp32() {
+    local source="$1"
+    "$CC_BIN" -m32 -ffreestanding -std=c11 -Wall -Wextra -Werror -pedantic \
+        -I"$INCLUDE_DIR" -c "$source" -o "$2"
+}
+
+ilp32_available() {
+    echo 'int main(void){return 0;}' > "$TMP_ROOT/probe32.c"
+    "$CC_BIN" -m32 -ffreestanding -c "$TMP_ROOT/probe32.c" \
+        -o "$TMP_ROOT/probe32.o" 2>/dev/null
+}
+
+compile_ilp32() {
+    if ! ilp32_available; then
+        # Reported, never silent. A skipped lane that prints nothing is
+        # indistinguishable from a lane that passed, which is how the wrong
+        # size survived this long.
+        echo "C ABI ILP32 lane: SKIPPED ($CC_BIN cannot target -m32; install a multilib compiler)" >&2
+        if [[ "${MIGO_ABI_REQUIRE_ILP32:-0}" == "1" ]]; then
+            echo "C ABI ILP32 lane: required by MIGO_ABI_REQUIRE_ILP32=1" >&2
+            return 1
+        fi
+        return 0
+    fi
+    local source
+    for source in core_contract old_client_contract old_client_outbound_contract \
+                  platform_contract; do
+        compile_c_ilp32 "$ROOT/tests/c_abi/$source.c" "$TMP_ROOT/${source}_ilp32.o"
+    done
+    echo "C ABI ILP32 lane: PASS"
+}
+
 compile_platforms() {
     local header
     for header in \
@@ -187,14 +232,18 @@ case "$MODE" in
     --parity)
         check_export_parity
         ;;
+    --ilp32)
+        compile_ilp32
+        ;;
     --all)
         compile_core
         compile_platforms
+        compile_ilp32
         check_export_parity
         check_repository_integration
         ;;
     *)
-        echo "usage: $0 [--core|--platforms|--parity|--all]" >&2
+        echo "usage: $0 [--core|--platforms|--ilp32|--parity|--all]" >&2
         exit 2
         ;;
 esac
