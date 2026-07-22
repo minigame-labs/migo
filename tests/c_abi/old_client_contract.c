@@ -83,6 +83,49 @@ MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, dispatch) + sizeof(MigoDispatchFn
 #endif
 
 /*
+ * MigoKeyEvent as it stood before modifiers and repeat were appended: 48 bytes
+ * on LP64, 40 on ILP32. A host built then still writes exactly this and
+ * announces that size, and the library must read its absent tail as zero --
+ * no modifier held, not an auto-repeat -- rather than rejecting it.
+ */
+typedef struct OldKeyEvent {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    MigoKeyEventType event_type;
+    uint32_t key_length;
+    const char *key_utf8;
+    const char *code_utf8;
+    uint32_t code_length;
+    uint32_t reserved0;
+    double timestamp_ms;
+} OldKeyEvent;
+
+#define MIGO_KEY_SAME_OFFSET(field)                                                              \
+    MIGO_STATIC_ASSERT(offsetof(OldKeyEvent, field) == offsetof(MigoKeyEvent, field),            \
+                       "MigoKeyEvent." #field " moved; appended fields must only append")
+
+MIGO_KEY_SAME_OFFSET(struct_size);
+MIGO_KEY_SAME_OFFSET(abi_version);
+MIGO_KEY_SAME_OFFSET(event_type);
+MIGO_KEY_SAME_OFFSET(key_length);
+MIGO_KEY_SAME_OFFSET(key_utf8);
+MIGO_KEY_SAME_OFFSET(code_utf8);
+MIGO_KEY_SAME_OFFSET(code_length);
+MIGO_KEY_SAME_OFFSET(reserved0);
+MIGO_KEY_SAME_OFFSET(timestamp_ms);
+
+MIGO_STATIC_ASSERT(sizeof(OldKeyEvent) <= sizeof(MigoKeyEvent),
+                   "the current MigoKeyEvent must still contain the old one");
+MIGO_STATIC_ASSERT(sizeof(OldKeyEvent) == offsetof(MigoKeyEvent, modifiers),
+                   "the appended tail must begin exactly where the old struct ended");
+
+#if MIGO_LP64
+MIGO_STATIC_ASSERT(sizeof(OldKeyEvent) == 48, "the pre-modifier LP64 shape was 48 bytes");
+#else
+MIGO_STATIC_ASSERT(sizeof(OldKeyEvent) == 40, "the pre-modifier ILP32 shape was 40 bytes");
+#endif
+
+/*
  * A compiled-and-linked old client would do exactly this: fill the shape it
  * knows, announce its own size, and hand over a pointer. Kept as a function so
  * the compiler checks the call is well typed against the current header.

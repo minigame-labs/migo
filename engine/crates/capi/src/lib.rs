@@ -34,7 +34,10 @@ pub use gamepad::{
     MigoGamepadButton, MigoGamepadInfo, MigoGamepadStateEvent, migo_session_send_gamepad_state,
     migo_session_set_gamepad_connected,
 };
-pub use input::{MigoTouchEvent, MigoTouchPoint, migo_session_send_touch};
+pub use input::{
+    MigoPointerEvent, MigoTouchEvent, MigoTouchPoint, MigoWheelEvent,
+    migo_session_send_pointer_event, migo_session_send_touch, migo_session_send_wheel_event,
+};
 pub use keyboard::{
     MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent, migo_session_send_composition_event,
     migo_session_send_key_event, migo_session_send_keyboard_event,

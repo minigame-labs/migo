@@ -26,7 +26,7 @@ use crate::{
     callbacks::{MigoError, MigoHostCallbacks, MigoKeyboardShowOptions},
     capabilities::MigoCapabilities,
     gamepad::{MigoGamepadButton, MigoGamepadInfo, MigoGamepadStateEvent},
-    input::{MigoTouchEvent, MigoTouchPoint},
+    input::{MigoPointerEvent, MigoTouchEvent, MigoTouchPoint, MigoWheelEvent},
     keyboard::{MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent},
     surface::{
         MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
@@ -64,6 +64,8 @@ header_is_first!(
     MigoX11WindowDescriptor,
     MigoWaylandSurfaceDescriptor,
     MigoTouchEvent,
+    MigoPointerEvent,
+    MigoWheelEvent,
     MigoKeyboardEvent,
     MigoKeyboardShowOptions,
     MigoKeyEvent,
@@ -124,6 +126,29 @@ const _: () = assert!(size_of::<MigoSurfaceReleaseStatus>() == 24);
 const _: () = assert!(offset_of!(MigoSurfaceReleaseStatus, generation) == 8);
 const _: () = assert!(offset_of!(MigoSurfaceReleaseStatus, state) == 16);
 const _: () = assert!(offset_of!(MigoSurfaceReleaseStatus, reserved0) == 20);
+
+// Two u32s then two f32s then an f64: the f64 forces 8-alignment, so the four
+// 4-byte fields fill the first two slots exactly and there is no tail padding
+// to absorb a reordering. Swapping `x` and `button` -- a u32 and an f32 that
+// both sit in the second slot -- would leave the size at 32 and deliver a
+// coordinate as a button ordinal.
+const _: () = assert!(size_of::<MigoPointerEvent>() == 32);
+const _: () = assert!(offset_of!(MigoPointerEvent, event_type) == 8);
+const _: () = assert!(offset_of!(MigoPointerEvent, button) == 12);
+const _: () = assert!(offset_of!(MigoPointerEvent, x) == 16);
+const _: () = assert!(offset_of!(MigoPointerEvent, y) == 20);
+const _: () = assert!(offset_of!(MigoPointerEvent, timestamp_ms) == 24);
+
+// `reserved0` exists to pad `delta_mode` out to the f64 alignment rather than
+// leaving an unnamed hole: a caller must write it as zero, and validation
+// rejects it otherwise, so the bytes stay available for a later meaning.
+const _: () = assert!(size_of::<MigoWheelEvent>() == 48);
+const _: () = assert!(offset_of!(MigoWheelEvent, delta_mode) == 8);
+const _: () = assert!(offset_of!(MigoWheelEvent, reserved0) == 12);
+const _: () = assert!(offset_of!(MigoWheelEvent, delta_x) == 16);
+const _: () = assert!(offset_of!(MigoWheelEvent, delta_y) == 24);
+const _: () = assert!(offset_of!(MigoWheelEvent, delta_z) == 32);
+const _: () = assert!(offset_of!(MigoWheelEvent, timestamp_ms) == 40);
 
 /// LP64 sizes for the structs that contain a pointer.
 ///
@@ -227,7 +252,7 @@ mod lp64 {
     // share the slot after the second pointer, and the f64 lands last. A
     // reordering that put both lengths together would still size to 48 while
     // moving every field the copy depends on.
-    const _: () = assert!(size_of::<MigoKeyEvent>() == 48);
+    const _: () = assert!(size_of::<MigoKeyEvent>() == 56);
     const _: () = assert!(offset_of!(MigoKeyEvent, event_type) == 8);
     const _: () = assert!(offset_of!(MigoKeyEvent, key_length) == 12);
     const _: () = assert!(offset_of!(MigoKeyEvent, key_utf8) == 16);
@@ -235,6 +260,9 @@ mod lp64 {
     const _: () = assert!(offset_of!(MigoKeyEvent, code_length) == 32);
     const _: () = assert!(offset_of!(MigoKeyEvent, reserved0) == 36);
     const _: () = assert!(offset_of!(MigoKeyEvent, timestamp_ms) == 40);
+    // Appended after the record shipped; `reserved0` above stays reserved.
+    const _: () = assert!(offset_of!(MigoKeyEvent, modifiers) == 48);
+    const _: () = assert!(offset_of!(MigoKeyEvent, flags) == 52);
 
     const _: () = assert!(size_of::<MigoCompositionEvent>() == 24);
     const _: () = assert!(offset_of!(MigoCompositionEvent, event_type) == 8);

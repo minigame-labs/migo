@@ -1,6 +1,14 @@
 #include <migo/linux/qt6/x11_surface_view.hpp>
 
+#include "dom_key_names.hpp"
+
 #include <QCloseEvent>
+#include <QFocusEvent>
+#include <QInputMethodEvent>
+#include <QKeyEvent>
+#include <QMouseEvent>
+#include <QTouchEvent>
+#include <QWheelEvent>
 #include <QGuiApplication>
 #include <QPaintEngine>
 #include <QPlatformSurfaceEvent>
@@ -18,7 +26,10 @@
 
 #include <X11/Xlib.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 namespace migo::linux_host::qt6 {
@@ -44,6 +55,17 @@ MigoQtX11SurfaceView::MigoQtX11SurfaceView(SurfaceHost &surface_host, QWidget &p
     setAttribute(Qt::WA_PaintOnScreen);
     setAttribute(Qt::WA_OpaquePaintEvent);
     setAttribute(Qt::WA_NoSystemBackground);
+    // Input is delivered to this widget only if it can hold focus and is
+    // offered touch and IME events; none of these installs a filter or takes
+    // anything away from the App's own widgets.
+    setAttribute(Qt::WA_AcceptTouchEvents);
+    setAttribute(Qt::WA_InputMethodEnabled);
+    setFocusPolicy(Qt::StrongFocus);
+    // Hover reaches the mouse stream, which is the point of having one: PC wx
+    // content listens for `onMouseMove` without a button held. The touch stream
+    // still only sees motion while pressed, because wx content on a phone has
+    // no hover concept and a free motion stream would be events no game reads.
+    setMouseTracking(true);
     release_timer_.setInterval(kFastReleasePollIntervalMs);
     release_timer_.setTimerType(Qt::PreciseTimer);
     connect(&release_timer_, &QTimer::timeout, this, [this] {
@@ -289,6 +311,427 @@ void MigoQtX11SurfaceView::closeEvent(QCloseEvent *event) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Input
+//
+// Every handler below runs in the Qt event loop on the GUI thread, which is the
+// Session owner thread this view was constructed on, so nothing here hops
+// threads, filters events globally, or polls. Coordinates need no conversion:
+// Qt's logical position is physical pixels divided by the same device pixel
+// ratio this view reports as `scale_factor` at attach, and CSS pixels are
+// defined the same way. That equality is why this code looks like it forgot to
+// convert -- writing `position() * devicePixelRatio()` here is the mistake, and
+// it lands every touch in the wrong place on a HiDPI screen.
+// ---------------------------------------------------------------------------
+
+bool MigoQtX11SurfaceView::inputIsDeliverable() const noexcept {
+    return owns_surface_ && surface_host_.state() == SurfaceState::Attached &&
+           surface_host_.generation() == owned_generation_ &&
+           surface_host_.session() != nullptr;
+}
+
+void MigoQtX11SurfaceView::recordInputResult(MigoResult result) {
+    if (result != MIGO_OK) Q_EMIT inputRejected(result);
+}
+
+namespace {
+
+MigoKeyModifiers dom_modifiers(Qt::KeyboardModifiers modifiers) noexcept {
+    MigoKeyModifiers result = MIGO_KEY_MODIFIER_NONE;
+    if (modifiers & Qt::ControlModifier) result |= MIGO_KEY_MODIFIER_CONTROL;
+    if (modifiers & Qt::ShiftModifier) result |= MIGO_KEY_MODIFIER_SHIFT;
+    if (modifiers & Qt::AltModifier) result |= MIGO_KEY_MODIFIER_ALT;
+    if (modifiers & Qt::MetaModifier) result |= MIGO_KEY_MODIFIER_META;
+    return result;
+}
+
+// DOM MouseEvent.button ordinals. Qt's enum is a bitmask, so it cannot be cast.
+std::uint32_t dom_button(Qt::MouseButton button) noexcept {
+    switch (button) {
+        case Qt::LeftButton:
+            return 0;
+        case Qt::MiddleButton:
+            return 1;
+        case Qt::RightButton:
+            return 2;
+        case Qt::BackButton:
+            return 3;
+        case Qt::ForwardButton:
+            return 4;
+        default:
+            return 0;
+    }
+}
+
+}  // namespace
+
+void MigoQtX11SurfaceView::deliverPointer(const QMouseEvent &event, std::uint32_t kind) {
+    MigoPointerEvent out{};
+    out.struct_size = static_cast<std::uint32_t>(sizeof(out));
+    out.abi_version = MIGO_ABI_VERSION_1;
+    out.event_type = kind;
+    out.button = held_button_;
+    out.x = last_pointer_x_;
+    out.y = last_pointer_y_;
+    out.timestamp_ms = static_cast<double>(event.timestamp());
+    recordInputResult(migo_session_send_pointer_event(surface_host_.session(), &out));
+}
+
+void MigoQtX11SurfaceView::deliverMouseAsTouch(const QMouseEvent &event, MigoTouchType kind) {
+    // wx content has no hover concept, so a mouse maps to one finger with id 0
+    // and only while a button is held. A free-motion stream would be events no
+    // game reads.
+    MigoTouchPoint &point = touch_points_[0];
+    point.id = 0;
+    point.x = last_pointer_x_;
+    point.y = last_pointer_y_;
+    point.pressure = kind == MIGO_TOUCH_END || kind == MIGO_TOUCH_CANCEL ? 0.0F : 1.0F;
+    point.flags = MIGO_TOUCH_FLAG_CHANGED;
+    if (kind == MIGO_TOUCH_END || kind == MIGO_TOUCH_CANCEL) {
+        point.flags |= MIGO_TOUCH_FLAG_REMOVED;
+    }
+
+    MigoTouchEvent out{};
+    out.struct_size = static_cast<std::uint32_t>(sizeof(out));
+    out.abi_version = MIGO_ABI_VERSION_1;
+    out.type = kind;
+    out.point_count = 1;
+    out.timestamp_ms = static_cast<std::int64_t>(event.timestamp());
+    out.points = touch_points_.data();
+    recordInputResult(migo_session_send_touch(surface_host_.session(), &out));
+}
+
+void MigoQtX11SurfaceView::mousePressEvent(QMouseEvent *event) {
+    QWidget::mousePressEvent(event);
+    if (!inputIsDeliverable()) return;
+    last_pointer_x_ = static_cast<float>(event->position().x());
+    last_pointer_y_ = static_cast<float>(event->position().y());
+    held_button_ = dom_button(event->button());
+    const bool first_press = !mouse_pressed_;
+    mouse_pressed_ = true;
+    if (pointer_delivery_ != PointerDelivery::TouchOnly) {
+        deliverPointer(*event, MIGO_POINTER_EVENT_DOWN);
+    }
+    if (pointer_delivery_ != PointerDelivery::MouseOnly && first_press) {
+        deliverMouseAsTouch(*event, MIGO_TOUCH_START);
+    }
+}
+
+void MigoQtX11SurfaceView::mouseMoveEvent(QMouseEvent *event) {
+    QWidget::mouseMoveEvent(event);
+    if (!inputIsDeliverable()) return;
+    last_pointer_x_ = static_cast<float>(event->position().x());
+    last_pointer_y_ = static_cast<float>(event->position().y());
+    if (pointer_delivery_ != PointerDelivery::TouchOnly) {
+        deliverPointer(*event, MIGO_POINTER_EVENT_MOVE);
+    }
+    if (pointer_delivery_ != PointerDelivery::MouseOnly && mouse_pressed_) {
+        deliverMouseAsTouch(*event, MIGO_TOUCH_MOVE);
+    }
+}
+
+void MigoQtX11SurfaceView::mouseReleaseEvent(QMouseEvent *event) {
+    QWidget::mouseReleaseEvent(event);
+    if (!inputIsDeliverable()) return;
+    last_pointer_x_ = static_cast<float>(event->position().x());
+    last_pointer_y_ = static_cast<float>(event->position().y());
+    held_button_ = dom_button(event->button());
+    const bool was_pressed = mouse_pressed_;
+    mouse_pressed_ = false;
+    if (pointer_delivery_ != PointerDelivery::TouchOnly) {
+        deliverPointer(*event, MIGO_POINTER_EVENT_UP);
+    }
+    if (pointer_delivery_ != PointerDelivery::MouseOnly && was_pressed) {
+        deliverMouseAsTouch(*event, MIGO_TOUCH_END);
+    }
+}
+
+void MigoQtX11SurfaceView::wheelEvent(QWheelEvent *event) {
+    QWidget::wheelEvent(event);
+    if (!inputIsDeliverable()) return;
+
+    MigoWheelEvent out{};
+    out.struct_size = static_cast<std::uint32_t>(sizeof(out));
+    out.abi_version = MIGO_ABI_VERSION_1;
+    out.timestamp_ms = static_cast<double>(event->timestamp());
+
+    // A trackpad reports pixel deltas; a wheel reports eighths of a degree.
+    // Neither is converted into the other here: the ABI carries the unit
+    // precisely so the host does not have to guess a line height it does not
+    // have. The DOM sign convention is the opposite of Qt's -- scrolling the
+    // content down is a positive deltaY -- so both axes are negated.
+    const QPoint pixels = event->pixelDelta();
+    if (!pixels.isNull()) {
+        out.delta_mode = MIGO_WHEEL_DELTA_MODE_PIXEL;
+        out.delta_x = -static_cast<double>(pixels.x());
+        out.delta_y = -static_cast<double>(pixels.y());
+    } else {
+        const QPoint angle = event->angleDelta();
+        if (angle.isNull()) return;
+        // One notch is 120 eighths of a degree and scrolls three lines, which
+        // is the step every toolkit and browser settled on.
+        constexpr double kEighthsPerNotch = 120.0;
+        constexpr double kLinesPerNotch = 3.0;
+        out.delta_mode = MIGO_WHEEL_DELTA_MODE_LINE;
+        out.delta_x = -static_cast<double>(angle.x()) / kEighthsPerNotch * kLinesPerNotch;
+        out.delta_y = -static_cast<double>(angle.y()) / kEighthsPerNotch * kLinesPerNotch;
+    }
+    recordInputResult(migo_session_send_wheel_event(surface_host_.session(), &out));
+}
+
+void MigoQtX11SurfaceView::deliverKey(const QKeyEvent &event, std::uint32_t kind) {
+    char key_buffer[32];
+    const std::size_t key_length =
+        detail::dom_key_from_qt_event(event, key_buffer, sizeof(key_buffer));
+    const char *code = detail::dom_code_from_x11_keycode(event.nativeScanCode());
+
+    MigoKeyEvent out{};
+    out.struct_size = static_cast<std::uint32_t>(sizeof(out));
+    out.abi_version = MIGO_ABI_VERSION_1;
+    out.event_type = kind;
+    out.key_utf8 = key_buffer;
+    out.key_length = static_cast<std::uint32_t>(key_length);
+    out.code_utf8 = code;
+    out.code_length = static_cast<std::uint32_t>(std::strlen(code));
+    out.timestamp_ms = static_cast<double>(event.timestamp());
+    out.modifiers = dom_modifiers(event.modifiers());
+    out.flags = event.isAutoRepeat() ? MIGO_KEY_EVENT_FLAG_REPEAT : MIGO_KEY_EVENT_FLAG_NONE;
+    recordInputResult(migo_session_send_key_event(surface_host_.session(), &out));
+}
+
+void MigoQtX11SurfaceView::keyPressEvent(QKeyEvent *event) {
+    if (!inputIsDeliverable()) {
+        QWidget::keyPressEvent(event);
+        return;
+    }
+    deliverKey(*event, MIGO_KEY_EVENT_DOWN);
+    event->accept();
+}
+
+void MigoQtX11SurfaceView::keyReleaseEvent(QKeyEvent *event) {
+    if (!inputIsDeliverable()) {
+        QWidget::keyReleaseEvent(event);
+        return;
+    }
+    deliverKey(*event, MIGO_KEY_EVENT_UP);
+    event->accept();
+}
+
+void MigoQtX11SurfaceView::deliverTouch(const QTouchEvent &event) {
+    const auto &points = event.points();
+    if (points.empty()) return;
+    // A batch larger than the ABI accepts is refused rather than truncated: the
+    // point that would be dropped is one content is tracking.
+    const std::size_t count =
+        std::min<std::size_t>(points.size(), touch_points_.size());
+
+    MigoTouchType kind = MIGO_TOUCH_MOVE;
+    switch (event.type()) {
+        case QEvent::TouchBegin:
+            kind = MIGO_TOUCH_START;
+            break;
+        case QEvent::TouchEnd:
+            kind = MIGO_TOUCH_END;
+            break;
+        case QEvent::TouchCancel:
+            kind = MIGO_TOUCH_CANCEL;
+            break;
+        default:
+            kind = MIGO_TOUCH_MOVE;
+            break;
+    }
+
+    for (std::size_t index = 0; index < count; ++index) {
+        const QEventPoint &source = points[static_cast<int>(index)];
+        MigoTouchPoint &point = touch_points_[index];
+        point.id = static_cast<std::uint32_t>(source.id());
+        point.x = static_cast<float>(source.position().x());
+        point.y = static_cast<float>(source.position().y());
+        const float pressure = static_cast<float>(source.pressure());
+        // Qt reports -1 for a device without pressure, which the ABI's 0..1
+        // range refuses; the touch itself is still real.
+        point.pressure = pressure >= 0.0F && pressure <= 1.0F ? pressure : 1.0F;
+        point.flags = MIGO_TOUCH_FLAG_NONE;
+        if (source.state() != QEventPoint::Stationary) point.flags |= MIGO_TOUCH_FLAG_CHANGED;
+        if (source.state() == QEventPoint::Released) {
+            point.flags |= MIGO_TOUCH_FLAG_REMOVED;
+            point.pressure = 0.0F;
+        }
+    }
+
+    MigoTouchEvent out{};
+    out.struct_size = static_cast<std::uint32_t>(sizeof(out));
+    out.abi_version = MIGO_ABI_VERSION_1;
+    out.type = kind;
+    out.point_count = static_cast<std::uint32_t>(count);
+    out.timestamp_ms = static_cast<std::int64_t>(event.timestamp());
+    out.points = touch_points_.data();
+    recordInputResult(migo_session_send_touch(surface_host_.session(), &out));
+}
+
+void MigoQtX11SurfaceView::deliverComposition(std::uint32_t kind, const char *data,
+                                              std::uint32_t length) {
+    MigoCompositionEvent out{};
+    out.struct_size = static_cast<std::uint32_t>(sizeof(out));
+    out.abi_version = MIGO_ABI_VERSION_1;
+    out.event_type = kind;
+    out.data_utf8 = data;
+    out.data_length = length;
+    recordInputResult(migo_session_send_composition_event(surface_host_.session(), &out));
+}
+
+void MigoQtX11SurfaceView::inputMethodEvent(QInputMethodEvent *event) {
+    if (!inputIsDeliverable()) {
+        QWidget::inputMethodEvent(event);
+        return;
+    }
+
+    // The IME's two halves are different events, not one: the preedit is what
+    // is still being typed and the commit is what was accepted. Content drawing
+    // its own field needs both, so neither is inferred from the other.
+    //
+    // Encoding matters here more than anywhere else on this path: Qt is UTF-16
+    // and the ABI is length-delimited UTF-8, and a length that splits a
+    // multi-byte character is rejected rather than delivered mangled -- which is
+    // exactly what a pinyin preedit is made of.
+    const QByteArray commit = event->commitString().toUtf8();
+    const QByteArray preedit = event->preeditString().toUtf8();
+
+    if (!preedit.isEmpty()) {
+        if (!composing_) {
+            composing_ = true;
+            deliverComposition(MIGO_COMPOSITION_EVENT_START, preedit.constData(),
+                               static_cast<std::uint32_t>(preedit.size()));
+        }
+        deliverComposition(MIGO_COMPOSITION_EVENT_UPDATE, preedit.constData(),
+                           static_cast<std::uint32_t>(preedit.size()));
+    }
+
+    if (!commit.isEmpty() || (composing_ && preedit.isEmpty())) {
+        // An empty commit while composing is a cancellation, which content must
+        // still see so it can clear the preedit it has been drawing.
+        if (!composing_) {
+            composing_ = true;
+            deliverComposition(MIGO_COMPOSITION_EVENT_START, nullptr, 0);
+        }
+        composing_ = false;
+        deliverComposition(MIGO_COMPOSITION_EVENT_END, commit.constData(),
+                           static_cast<std::uint32_t>(commit.size()));
+    }
+
+    event->accept();
+}
+
+QVariant MigoQtX11SurfaceView::inputMethodQuery(Qt::InputMethodQuery query) const {
+    switch (query) {
+        case Qt::ImEnabled:
+            return QVariant(true);
+        case Qt::ImCursorRectangle:
+            // The engine has no text-field geometry to report, so the candidate
+            // window is anchored to the view itself rather than to a caret that
+            // does not exist here. Content draws its own field; a wrong caret
+            // rectangle would put the candidate list somewhere arbitrary.
+            return QVariant(QRect(0, height(), 1, 1));
+        case Qt::ImHints:
+            return QVariant(static_cast<int>(Qt::ImhNone));
+        default:
+            return QWidget::inputMethodQuery(query);
+    }
+}
+
+void MigoQtX11SurfaceView::retractPendingInput() {
+    if (!inputIsDeliverable()) {
+        mouse_pressed_ = false;
+        composing_ = false;
+        return;
+    }
+    if (mouse_pressed_) {
+        mouse_pressed_ = false;
+        MigoTouchPoint &point = touch_points_[0];
+        point.id = 0;
+        point.x = last_pointer_x_;
+        point.y = last_pointer_y_;
+        point.pressure = 0.0F;
+        point.flags = MIGO_TOUCH_FLAG_CHANGED | MIGO_TOUCH_FLAG_REMOVED;
+
+        MigoTouchEvent out{};
+        out.struct_size = static_cast<std::uint32_t>(sizeof(out));
+        out.abi_version = MIGO_ABI_VERSION_1;
+        out.type = MIGO_TOUCH_CANCEL;
+        out.point_count = 1;
+        out.timestamp_ms = 0;
+        out.points = touch_points_.data();
+        recordInputResult(migo_session_send_touch(surface_host_.session(), &out));
+    }
+    if (composing_) {
+        composing_ = false;
+        // An empty end is the DOM's cancellation, which is what a focus loss
+        // mid-composition is.
+        deliverComposition(MIGO_COMPOSITION_EVENT_END, nullptr, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frame clock
+// ---------------------------------------------------------------------------
+
+MigoResult MigoQtX11SurfaceView::requestFrame() {
+    if (QThread::currentThread() != owner_thread_) return MIGO_ERROR_WRONG_THREAD;
+    if (!inputIsDeliverable()) return MIGO_ERROR_INVALID_STATE;
+    // Already asked. Qt coalesces its own update requests, and the engine asks
+    // again when it wants another frame, so arming twice would report two
+    // boundaries for one and run the content's clock at double rate.
+    if (frame_requested_) return MIGO_OK;
+
+    QWindow *native_window = windowHandle();
+    if (native_window == nullptr) return MIGO_ERROR_INVALID_STATE;
+    frame_requested_ = true;
+    native_window->requestUpdate();
+    return MIGO_OK;
+}
+
+void MigoQtX11SurfaceView::notifyFrameBoundary() {
+    if (!frame_requested_) return;
+    frame_requested_ = false;
+    if (!inputIsDeliverable()) return;
+    // Qt does not hand the platform's frame timestamp to the update it
+    // delivers, so this reports when the boundary was observed. It is the same
+    // clock `QElapsedTimer` uses and the closest honest answer available; the
+    // engine treats it as a monotonic frame time, not as a display timestamp.
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    recordInputResult(
+        migo_session_notify_vsync(surface_host_.session(), static_cast<std::int64_t>(nanos)));
+}
+
+void MigoQtX11SurfaceView::paintEvent(QPaintEvent *event) {
+    // The view paints nothing itself -- Migo renders into the native window on
+    // its own thread -- so this exists only as the frame boundary Qt delivers
+    // after `requestUpdate()`. Not calling the base implementation is
+    // deliberate: `WA_PaintOnScreen` with a null paint engine means Qt must not
+    // try to back this widget with a surface of its own.
+    Q_UNUSED(event);
+    notifyFrameBoundary();
+}
+
+void MigoQtX11SurfaceView::focusInEvent(QFocusEvent *event) {
+    QWidget::focusInEvent(event);
+    if (!inputIsDeliverable()) return;
+    recordInputResult(migo_session_set_focus(surface_host_.session(), 1));
+}
+
+void MigoQtX11SurfaceView::focusOutEvent(QFocusEvent *event) {
+    QWidget::focusOutEvent(event);
+    // Order matters: the press and the preedit are retracted while content
+    // still believes it has focus, so a listener that ignores input while
+    // unfocused still sees them end. Held keys are deliberately not synthesized
+    // as released -- a browser does not either, and inventing an up for a key
+    // the user may still be holding is its own wrong answer.
+    retractPendingInput();
+    if (!inputIsDeliverable()) return;
+    recordInputResult(migo_session_set_focus(surface_host_.session(), 0));
+}
+
 bool MigoQtX11SurfaceView::event(QEvent *event) {
     if (owns_surface_ && event->type() == QEvent::PlatformSurface) {
         const auto *surface_event = static_cast<QPlatformSurfaceEvent *>(event);
@@ -297,6 +740,28 @@ bool MigoQtX11SurfaceView::event(QEvent *event) {
             surface_host_.state() != SurfaceState::Detached) {
             qFatal("Qt attempted to destroy an X11 Surface before Migo reported RELEASED");
         }
+    }
+    switch (event->type()) {
+        case QEvent::UpdateRequest:
+            // Qt delivers the answer to `requestUpdate()` here on some paths and
+            // as a paint event on others, depending on whether the platform
+            // window backs the widget. Both are the same boundary, and
+            // `notifyFrameBoundary` reports it once because the pending flag is
+            // cleared by whichever arrives first.
+            notifyFrameBoundary();
+            break;
+        case QEvent::TouchBegin:
+        case QEvent::TouchUpdate:
+        case QEvent::TouchEnd:
+        case QEvent::TouchCancel:
+            if (inputIsDeliverable()) {
+                deliverTouch(*static_cast<QTouchEvent *>(event));
+                event->accept();
+                return true;
+            }
+            break;
+        default:
+            break;
     }
     return QWidget::event(event);
 }

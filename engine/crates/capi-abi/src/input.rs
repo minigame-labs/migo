@@ -23,6 +23,20 @@ pub const MIGO_TOUCH_FLAG_REMOVED: u32 = 1 << 1;
 const MIGO_TOUCH_FLAG_KNOWN_MASK: u32 = MIGO_TOUCH_FLAG_CHANGED | MIGO_TOUCH_FLAG_REMOVED;
 pub const MIGO_TOUCH_MAX_POINTS: usize = 10;
 
+pub const MIGO_POINTER_EVENT_DOWN: u32 = 0;
+pub const MIGO_POINTER_EVENT_MOVE: u32 = 1;
+pub const MIGO_POINTER_EVENT_UP: u32 = 2;
+/// Highest accepted `MouseEvent.button` ordinal.
+///
+/// The DOM defines five, and content switches on the value. The bound is well
+/// past them so a real device is never refused, while an uninitialised field
+/// still fails instead of reaching content as a button that cannot exist.
+pub const MIGO_POINTER_BUTTON_MAX: u32 = 31;
+
+pub const MIGO_WHEEL_DELTA_MODE_PIXEL: u32 = 0;
+pub const MIGO_WHEEL_DELTA_MODE_LINE: u32 = 1;
+pub const MIGO_WHEEL_DELTA_MODE_PAGE: u32 = 2;
+
 pub const MIGO_KEYBOARD_EVENT_INPUT: u32 = 0;
 pub const MIGO_KEYBOARD_EVENT_CONFIRM: u32 = 1;
 pub const MIGO_KEYBOARD_EVENT_COMPLETE: u32 = 2;
@@ -30,6 +44,24 @@ pub const MIGO_KEYBOARD_EVENT_HEIGHT_CHANGE: u32 = 3;
 
 pub const MIGO_KEY_EVENT_DOWN: u32 = 0;
 pub const MIGO_KEY_EVENT_UP: u32 = 1;
+
+/// DOM `KeyboardEvent` modifier state, as a bitmask.
+///
+/// Content cannot tell `Ctrl+S` from `S` without it, and `key` alone does not
+/// carry it: a modified press still reports the character it produces.
+pub const MIGO_KEY_MODIFIER_CONTROL: u32 = 1 << 0;
+pub const MIGO_KEY_MODIFIER_SHIFT: u32 = 1 << 1;
+pub const MIGO_KEY_MODIFIER_ALT: u32 = 1 << 2;
+pub const MIGO_KEY_MODIFIER_META: u32 = 1 << 3;
+const MIGO_KEY_MODIFIER_KNOWN_MASK: u32 = MIGO_KEY_MODIFIER_CONTROL
+    | MIGO_KEY_MODIFIER_SHIFT
+    | MIGO_KEY_MODIFIER_ALT
+    | MIGO_KEY_MODIFIER_META;
+
+/// This press was produced by the platform's auto-repeat, not by the user
+/// pressing the key again. DOM `KeyboardEvent.repeat`.
+pub const MIGO_KEY_EVENT_FLAG_REPEAT: u32 = 1 << 0;
+const MIGO_KEY_EVENT_FLAG_KNOWN_MASK: u32 = MIGO_KEY_EVENT_FLAG_REPEAT;
 
 pub const MIGO_COMPOSITION_EVENT_START: u32 = 0;
 pub const MIGO_COMPOSITION_EVENT_UPDATE: u32 = 1;
@@ -158,6 +190,140 @@ impl MigoTouchEvent {
     }
 }
 
+/// One mouse button or motion event.
+///
+/// Carries no pointer, so its layout is identical on LP64, LLP64 and ILP32 --
+/// unlike the string-bearing records, where the two halves of every layout
+/// assertion really do differ.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MigoPointerEvent {
+    pub header: VersionedHeader,
+    pub event_type: u32,
+    pub button: u32,
+    pub x: f32,
+    pub y: f32,
+    pub timestamp_ms: f64,
+}
+
+// SAFETY: all fields are zero-valid and v1 requires the complete record.
+unsafe impl AbiStruct for MigoPointerEvent {}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ValidatedPointerEvent {
+    pub event_type: u32,
+    pub button: u32,
+    pub x: f32,
+    pub y: f32,
+    pub timestamp_ms: f64,
+}
+
+impl MigoPointerEvent {
+    /// # Safety
+    /// `event` must be readable for its announced size.
+    pub unsafe fn parse(event: *const Self) -> Result<ValidatedPointerEvent, MigoResult> {
+        let raw = unsafe { copy_versioned::<Self>(event.cast()) }?;
+        raw.validate_fields()
+    }
+
+    pub fn validate(&self) -> Result<ValidatedPointerEvent, MigoResult> {
+        // SAFETY: Self is complete and readable through this borrow.
+        let raw = unsafe { copy_versioned::<Self>((self as *const Self).cast()) }?;
+        raw.validate_fields()
+    }
+
+    fn validate_fields(self) -> Result<ValidatedPointerEvent, MigoResult> {
+        match self.event_type {
+            MIGO_POINTER_EVENT_DOWN | MIGO_POINTER_EVENT_MOVE | MIGO_POINTER_EVENT_UP => {}
+            _ => return Err(MIGO_ERROR_INVALID_ARGUMENT),
+        }
+        if self.button > MIGO_POINTER_BUTTON_MAX {
+            return Err(MIGO_ERROR_INVALID_ARGUMENT);
+        }
+        // Same rule the touch path applies to a point: a non-finite coordinate
+        // reaches content as NaN and silently removes whatever it hit-tests.
+        if !self.x.is_finite() || !self.y.is_finite() || !self.timestamp_ms.is_finite() {
+            return Err(MIGO_ERROR_INVALID_ARGUMENT);
+        }
+        Ok(ValidatedPointerEvent {
+            event_type: self.event_type,
+            button: self.button,
+            x: self.x,
+            y: self.y,
+            timestamp_ms: self.timestamp_ms,
+        })
+    }
+}
+
+/// One wheel or trackpad scroll event.
+///
+/// Also pointer-free, so it too has one layout on every target.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MigoWheelEvent {
+    pub header: VersionedHeader,
+    pub delta_mode: u32,
+    pub reserved0: u32,
+    pub delta_x: f64,
+    pub delta_y: f64,
+    pub delta_z: f64,
+    pub timestamp_ms: f64,
+}
+
+// SAFETY: all fields are zero-valid and v1 requires the complete record.
+unsafe impl AbiStruct for MigoWheelEvent {}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ValidatedWheelEvent {
+    pub delta_x: f64,
+    pub delta_y: f64,
+    pub delta_z: f64,
+    pub delta_mode: u32,
+    pub timestamp_ms: f64,
+}
+
+impl MigoWheelEvent {
+    /// # Safety
+    /// `event` must be readable for its announced size.
+    pub unsafe fn parse(event: *const Self) -> Result<ValidatedWheelEvent, MigoResult> {
+        let raw = unsafe { copy_versioned::<Self>(event.cast()) }?;
+        raw.validate_fields()
+    }
+
+    pub fn validate(&self) -> Result<ValidatedWheelEvent, MigoResult> {
+        // SAFETY: Self is complete and readable through this borrow.
+        let raw = unsafe { copy_versioned::<Self>((self as *const Self).cast()) }?;
+        raw.validate_fields()
+    }
+
+    fn validate_fields(self) -> Result<ValidatedWheelEvent, MigoResult> {
+        match self.delta_mode {
+            MIGO_WHEEL_DELTA_MODE_PIXEL
+            | MIGO_WHEEL_DELTA_MODE_LINE
+            | MIGO_WHEEL_DELTA_MODE_PAGE => {}
+            // An unknown mode is refused rather than assumed to be pixels: a
+            // line-sized number read as pixels scrolls by a hundredth of what
+            // the user asked for, and nothing later corrects it.
+            _ => return Err(MIGO_ERROR_INVALID_ARGUMENT),
+        }
+        validate_reserved(self.reserved0.into())?;
+        if !self.delta_x.is_finite()
+            || !self.delta_y.is_finite()
+            || !self.delta_z.is_finite()
+            || !self.timestamp_ms.is_finite()
+        {
+            return Err(MIGO_ERROR_INVALID_ARGUMENT);
+        }
+        Ok(ValidatedWheelEvent {
+            delta_x: self.delta_x,
+            delta_y: self.delta_y,
+            delta_z: self.delta_z,
+            delta_mode: self.delta_mode,
+            timestamp_ms: self.timestamp_ms,
+        })
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MigoKeyboardEvent {
@@ -233,10 +399,19 @@ pub struct MigoKeyEvent {
     pub code_length: u32,
     pub reserved0: u32,
     pub timestamp_ms: f64,
+    pub modifiers: u32,
+    pub flags: u32,
 }
 
-// SAFETY: all fields are zero-valid and v1 requires the complete record.
-unsafe impl AbiStruct for MigoKeyEvent {}
+// SAFETY: all fields are zero-valid, and the appended tail is optional: a host
+// built before modifiers existed announces the shorter size, and zero is
+// exactly what it means -- no modifier held, not an auto-repeat.
+unsafe impl AbiStruct for MigoKeyEvent {
+    // Expressed as an offset rather than a literal so it stays correct on every
+    // pointer width; the record holds two pointers, so the number differs
+    // between LP64 and ILP32 and a literal would be right for only one.
+    const MINIMUM_SIZE: usize = offset_of!(MigoKeyEvent, modifiers);
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValidatedKeyEvent {
@@ -244,11 +419,15 @@ pub enum ValidatedKeyEvent {
         key: String,
         code: String,
         timestamp_ms: f64,
+        modifiers: u32,
+        repeat: bool,
     },
     Up {
         key: String,
         code: String,
         timestamp_ms: f64,
+        modifiers: u32,
+        repeat: bool,
     },
 }
 
@@ -273,6 +452,8 @@ impl MigoKeyEvent {
             _ => return Err(MIGO_ERROR_INVALID_ARGUMENT),
         }
         validate_reserved(self.reserved0.into())?;
+        validate_flags(self.modifiers.into(), MIGO_KEY_MODIFIER_KNOWN_MASK.into())?;
+        validate_flags(self.flags.into(), MIGO_KEY_EVENT_FLAG_KNOWN_MASK.into())?;
         if !self.timestamp_ms.is_finite() {
             return Err(MIGO_ERROR_INVALID_ARGUMENT);
         }
@@ -281,17 +462,23 @@ impl MigoKeyEvent {
         if code.is_empty() {
             return Err(MIGO_ERROR_INVALID_ARGUMENT);
         }
+        let modifiers = self.modifiers;
+        let repeat = self.flags & MIGO_KEY_EVENT_FLAG_REPEAT != 0;
         Ok(if self.event_type == MIGO_KEY_EVENT_DOWN {
             ValidatedKeyEvent::Down {
                 key,
                 code,
                 timestamp_ms: self.timestamp_ms,
+                modifiers,
+                repeat,
             }
         } else {
             ValidatedKeyEvent::Up {
                 key,
                 code,
                 timestamp_ms: self.timestamp_ms,
+                modifiers,
+                repeat,
             }
         })
     }
@@ -624,6 +811,26 @@ const _: () = assert!(offset_of!(MigoTouchEvent, header) == 0);
 const _: () = assert!(offset_of!(MigoKeyboardEvent, header) == 0);
 const _: () = assert!(offset_of!(MigoKeyEvent, header) == 0);
 const _: () = assert!(offset_of!(MigoCompositionEvent, header) == 0);
+// Pointer-free, so these are asserted unconditionally rather than under a
+// pointer-width cfg: one layout serves LP64, LLP64 and ILP32, and putting them
+// behind a cfg would leave the other widths' halves uncompiled -- exactly the
+// dead-branch mistake `MigoHostCallbacks`'s ILP32 size hid for two appends.
+const _: () = assert!(size_of::<MigoPointerEvent>() == 32);
+const _: () = assert!(offset_of!(MigoPointerEvent, header) == 0);
+const _: () = assert!(offset_of!(MigoPointerEvent, event_type) == 8);
+const _: () = assert!(offset_of!(MigoPointerEvent, button) == 12);
+const _: () = assert!(offset_of!(MigoPointerEvent, x) == 16);
+const _: () = assert!(offset_of!(MigoPointerEvent, y) == 20);
+const _: () = assert!(offset_of!(MigoPointerEvent, timestamp_ms) == 24);
+const _: () = assert!(size_of::<MigoWheelEvent>() == 48);
+const _: () = assert!(offset_of!(MigoWheelEvent, header) == 0);
+const _: () = assert!(offset_of!(MigoWheelEvent, delta_mode) == 8);
+const _: () = assert!(offset_of!(MigoWheelEvent, reserved0) == 12);
+const _: () = assert!(offset_of!(MigoWheelEvent, delta_x) == 16);
+const _: () = assert!(offset_of!(MigoWheelEvent, delta_y) == 24);
+const _: () = assert!(offset_of!(MigoWheelEvent, delta_z) == 32);
+const _: () = assert!(offset_of!(MigoWheelEvent, timestamp_ms) == 40);
+
 const _: () = assert!(size_of::<MigoGamepadButton>() == 8);
 const _: () = assert!(offset_of!(MigoGamepadButton, value) == 4);
 const _: () = assert!(offset_of!(MigoGamepadInfo, header) == 0);
@@ -638,9 +845,17 @@ const _: () = assert!(size_of::<MigoKeyboardEvent>() == 32);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(offset_of!(MigoKeyboardEvent, value_utf8) == 16);
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<MigoKeyEvent>() == 48);
+const _: () = assert!(size_of::<MigoKeyEvent>() == 56);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(offset_of!(MigoKeyEvent, timestamp_ms) == 40);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(offset_of!(MigoKeyEvent, modifiers) == 48);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(offset_of!(MigoKeyEvent, flags) == 52);
+// The appended tail must stay optional: an old host announces exactly this many
+// bytes, and a MINIMUM_SIZE that crept up to the full size would reject it.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(<MigoKeyEvent as AbiStruct>::MINIMUM_SIZE == 48);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<MigoCompositionEvent>() == 24);
 #[cfg(target_pointer_width = "64")]

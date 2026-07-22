@@ -158,8 +158,12 @@ jobs:
             qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins \
             libx11-dev libxkbcommon-x11-dev libxcb-cursor0
 
+      # --sanitize reruns the same binaries under ASan/UBSan. Enforced here
+      # rather than left to a developer's machine: the input tests count
+      # allocations, and that counter has to use ASan's hook instead of
+      # interposing malloc, so the combination breaks silently if nobody runs it.
       - name: Linux Qt Host Kit contract
-        run: bash scripts/test-linux-qt-host-kit.sh
+        run: bash scripts/test-linux-qt-host-kit.sh --sanitize
 
   # ── Job 3: Release AAR build ────────────────────────────────────────
   release-android:

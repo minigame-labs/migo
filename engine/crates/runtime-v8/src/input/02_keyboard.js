@@ -87,12 +87,40 @@ function offKeyUp(listener) {
     _keyUpListeners.off(listener);
 }
 
-function _internalTriggerKeyDown(key, code, timeStamp) {
-    _keyDownListeners.trigger({ key, code, timeStamp });
+// Modifier bits, matching the C ABI's MIGO_KEY_MODIFIER_* values. Content sees
+// the DOM booleans instead of the mask, because that is what a KeyboardEvent
+// carries and what an HTML5 game already reads.
+const _MOD_CONTROL = 1;
+const _MOD_SHIFT = 2;
+const _MOD_ALT = 4;
+const _MOD_META = 8;
+
+// modifiers and repeat are appended AFTER timeStamp rather than placed beside
+// key and code, for the same reason the C ABI appends struct fields: editing
+// this file makes the V8 snapshot stale, and on-device validation deliberately
+// runs a debug build against one. A snapshot holding the previous
+// three-parameter function then still binds key/code/timeStamp correctly and
+// reports no modifiers, instead of binding a modifier mask into timeStamp.
+function _keyEventDetail(key, code, timeStamp, modifiers, repeat) {
+    const mask = modifiers | 0;
+    return {
+        key,
+        code,
+        timeStamp,
+        ctrlKey: (mask & _MOD_CONTROL) !== 0,
+        shiftKey: (mask & _MOD_SHIFT) !== 0,
+        altKey: (mask & _MOD_ALT) !== 0,
+        metaKey: (mask & _MOD_META) !== 0,
+        repeat: repeat === true,
+    };
 }
 
-function _internalTriggerKeyUp(key, code, timeStamp) {
-    _keyUpListeners.trigger({ key, code, timeStamp });
+function _internalTriggerKeyDown(key, code, timeStamp, modifiers, repeat) {
+    _keyDownListeners.trigger(_keyEventDetail(key, code, timeStamp, modifiers, repeat));
+}
+
+function _internalTriggerKeyUp(key, code, timeStamp, modifiers, repeat) {
+    _keyUpListeners.trigger(_keyEventDetail(key, code, timeStamp, modifiers, repeat));
 }
 
 // ==================== Async control APIs ====================

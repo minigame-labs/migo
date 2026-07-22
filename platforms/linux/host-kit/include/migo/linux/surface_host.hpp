@@ -80,6 +80,16 @@ public:
     [[nodiscard]] SurfaceState state() const noexcept { return state_; }
     [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
 
+    /// The Session this controller drives, for the input path.
+    ///
+    /// Input is addressed to the Session, not to the attachment, but it is only
+    /// meaningful while a Surface is attached -- the ABI answers
+    /// `MIGO_ERROR_INVALID_STATE` otherwise. Reading the Session from here
+    /// rather than having the App hand the same pointer to a second object
+    /// removes the possibility of the two disagreeing, which would deliver
+    /// input to a different Session than the one being drawn to.
+    [[nodiscard]] MigoSession *session() const noexcept { return session_; }
+
 private:
     [[nodiscard]] MigoResult attach_descriptor(
         MigoPlatformKind platform_kind,

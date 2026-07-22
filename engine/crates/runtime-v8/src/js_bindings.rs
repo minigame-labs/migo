@@ -85,6 +85,10 @@ pub(crate) struct JsBindings {
     composition_start_fn: Option<v8::Global<v8::Function>>,
     composition_update_fn: Option<v8::Global<v8::Function>>,
     composition_end_fn: Option<v8::Global<v8::Function>>,
+    mouse_down_fn: Option<v8::Global<v8::Function>>,
+    mouse_move_fn: Option<v8::Global<v8::Function>>,
+    mouse_up_fn: Option<v8::Global<v8::Function>>,
+    wheel_fn: Option<v8::Global<v8::Function>>,
 
     // ---- Video ----
     video_event_fn: Option<v8::Global<v8::Function>>,
@@ -138,6 +142,10 @@ impl JsBindings {
             composition_start_fn: None,
             composition_update_fn: None,
             composition_end_fn: None,
+            mouse_down_fn: None,
+            mouse_move_fn: None,
+            mouse_up_fn: None,
+            wheel_fn: None,
             video_event_fn: None,
         };
 
@@ -303,6 +311,24 @@ impl JsBindings {
         self.composition_start_fn = composition_start;
         self.composition_update_fn = composition_update;
         self.composition_end_fn = composition_end;
+
+        // Desktop pointer, resolved in its own group for the same reason as the
+        // one above: the first tuple is already at the limit of what is
+        // readable, not because these hooks are optional in a different way.
+        let (mouse_down, mouse_move, mouse_up, wheel) =
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let bridge = resolve_host_bridge(scope, global);
+                (
+                    get_global_fn(scope, bridge, "_internalTriggerMouseDown"),
+                    get_global_fn(scope, bridge, "_internalTriggerMouseMove"),
+                    get_global_fn(scope, bridge, "_internalTriggerMouseUp"),
+                    get_global_fn(scope, bridge, "_internalTriggerWheel"),
+                )
+            });
+        self.mouse_down_fn = mouse_down;
+        self.mouse_move_fn = mouse_move;
+        self.mouse_up_fn = mouse_up;
+        self.wheel_fn = wheel;
 
         if self.enqueue_touch_event_fn.is_none() {
             warn!("[Host {}] _internalEnqueueRawTouchEvent not found", host_id);
@@ -863,9 +889,15 @@ impl JsBindings {
         key: &str,
         code: &str,
         timestamp_ms: f64,
+        modifiers: u32,
+        repeat: bool,
     ) {
         if let Some(func_g) = self.key_down_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
+                // modifiers and repeat are appended after the arguments the
+                // previous signature had, so a stale V8 snapshot's shorter
+                // function still binds key/code/timeStamp correctly and simply
+                // misses the new ones; see 02_keyboard.js.
                 let args = [
                     v8::String::new(scope, key)
                         .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
@@ -874,6 +906,103 @@ impl JsBindings {
                         .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
                         .into(),
                     v8::Number::new(scope, timestamp_ms).into(),
+                    v8::Number::new(scope, f64::from(modifiers)).into(),
+                    v8::Boolean::new(scope, repeat).into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    /// Dispatch one mouse button or motion event (PC platform).
+    ///
+    /// The three share a body because they differ only in which listener group
+    /// receives them; the argument list is the wx callback shape
+    /// `{x, y, button, timeStamp}`, and `x`/`y` are CSS pixels, the same
+    /// logical space touch uses. A host that sends physical pixels here
+    /// produces content that renders correctly and clicks in the wrong place.
+    fn dispatch_mouse(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        func_g: Option<&v8::Global<v8::Function>>,
+        x: f32,
+        y: f32,
+        button: u32,
+        timestamp_ms: f64,
+    ) {
+        if let Some(func_g) = func_g {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                let args = [
+                    v8::Number::new(scope, f64::from(x)).into(),
+                    v8::Number::new(scope, f64::from(y)).into(),
+                    v8::Number::new(scope, f64::from(button)).into(),
+                    v8::Number::new(scope, timestamp_ms).into(),
+                ];
+                let func = v8::Local::new(scope, func_g);
+                let _ = func.call(scope, global.into(), &args);
+            });
+        }
+    }
+
+    pub(crate) fn dispatch_mouse_down(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        x: f32,
+        y: f32,
+        button: u32,
+        timestamp_ms: f64,
+    ) {
+        self.dispatch_mouse(rt, self.mouse_down_fn.as_ref(), x, y, button, timestamp_ms);
+    }
+
+    pub(crate) fn dispatch_mouse_move(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        x: f32,
+        y: f32,
+        button: u32,
+        timestamp_ms: f64,
+    ) {
+        self.dispatch_mouse(rt, self.mouse_move_fn.as_ref(), x, y, button, timestamp_ms);
+    }
+
+    pub(crate) fn dispatch_mouse_up(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        x: f32,
+        y: f32,
+        button: u32,
+        timestamp_ms: f64,
+    ) {
+        self.dispatch_mouse(rt, self.mouse_up_fn.as_ref(), x, y, button, timestamp_ms);
+    }
+
+    /// Dispatch one wheel event (PC platform).
+    ///
+    /// `delta_mode` travels with the deltas rather than being normalized here:
+    /// converting a line- or page-based delta into pixels needs the content's
+    /// own line height, which the engine does not have.
+    pub(crate) fn dispatch_wheel(
+        &self,
+        rt: &mut deno_core::JsRuntime,
+        delta_x: f64,
+        delta_y: f64,
+        delta_z: f64,
+        delta_mode: u32,
+        timestamp_ms: f64,
+    ) {
+        if let Some(func_g) = self.wheel_fn.as_ref() {
+            self.with_main_context(rt, |scope, _ctx, global| {
+                // delta_mode goes last to match the JS signature, which appends
+                // it so a stale snapshot's four-parameter function still binds
+                // the timestamp correctly; see 03_mouse.js.
+                let args = [
+                    v8::Number::new(scope, delta_x).into(),
+                    v8::Number::new(scope, delta_y).into(),
+                    v8::Number::new(scope, delta_z).into(),
+                    v8::Number::new(scope, timestamp_ms).into(),
+                    v8::Number::new(scope, f64::from(delta_mode)).into(),
                 ];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);
@@ -1009,9 +1138,15 @@ impl JsBindings {
         key: &str,
         code: &str,
         timestamp_ms: f64,
+        modifiers: u32,
+        repeat: bool,
     ) {
         if let Some(func_g) = self.key_up_fn.as_ref() {
             self.with_main_context(rt, |scope, _ctx, global| {
+                // modifiers and repeat are appended after the arguments the
+                // previous signature had, so a stale V8 snapshot's shorter
+                // function still binds key/code/timeStamp correctly and simply
+                // misses the new ones; see 02_keyboard.js.
                 let args = [
                     v8::String::new(scope, key)
                         .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
@@ -1020,6 +1155,8 @@ impl JsBindings {
                         .unwrap_or_else(|| v8::Local::new(scope, &self.empty_string))
                         .into(),
                     v8::Number::new(scope, timestamp_ms).into(),
+                    v8::Number::new(scope, f64::from(modifiers)).into(),
+                    v8::Boolean::new(scope, repeat).into(),
                 ];
                 let func = v8::Local::new(scope, func_g);
                 let _ = func.call(scope, global.into(), &args);

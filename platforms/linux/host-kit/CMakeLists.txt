@@ -52,6 +52,10 @@ if(MIGO_LINUX_HOST_KIT_BUILD_QT6_X11)
     add_library(migo_qt6_x11_surface_view STATIC
         include/migo/linux/qt6/x11_surface_view.hpp
         src/qt6/x11_surface_view.cpp
+        # Internal, not installed: the DOM key/code tables are an implementation
+        # detail of this adapter, not part of the Host Kit's public contract.
+        src/qt6/dom_key_names.hpp
+        src/qt6/dom_key_names.cpp
     )
     add_library(migo::qt6-x11-surface-view ALIAS migo_qt6_x11_surface_view)
     set_target_properties(migo_qt6_x11_surface_view PROPERTIES

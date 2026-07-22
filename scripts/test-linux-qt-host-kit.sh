@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
 # Build and exercise the Linux Qt 6 Host Kit without building the Migo engine
 # or V8. The tests link a strict fake implementation of the public C ABI.
+#
+# `--sanitize` reruns the two test binaries under AddressSanitizer and
+# UndefinedBehaviorSanitizer. It is a mode rather than a separate script so the
+# sanitizer result is reproducible from the repository instead of being a claim
+# in a report; the input tests count allocations, and that counter has to switch
+# to ASan's own hook there, so this combination has to be exercised rather than
+# assumed.
 set -euo pipefail
+
+SANITIZE=0
+for argument in "$@"; do
+    case "$argument" in
+        --sanitize) SANITIZE=1 ;;
+        *) printf 'usage: %s [--sanitize]\n' "$0" >&2; exit 2 ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -33,6 +48,24 @@ require_literal() {
 for command in cmake c++ ninja rg xvfb-run; do
     require_command "$command"
 done
+
+# CMake takes the compiler from CXX; the `c++` probed above is only its
+# fallback. A machine with the Android NDK exported builds this lane with an
+# NDK clang whose libc++ does not match the system Qt, and the resulting error
+# reads as a Qt or STL problem rather than a toolchain substitution. Refuse it
+# instead: this lane builds host executables and then runs them. Deliberate
+# compiler matrix runs (CXX=g++, CXX=clang++-18) are unaffected -- only an
+# Android toolchain is rejected. The check is the version banner because
+# `-dumpmachine` reports the host triple for an NDK clang and cannot see it.
+HOST_CXX="${CXX:-c++}"
+command -v "$HOST_CXX" >/dev/null 2>&1 || fail "CXX='$HOST_CXX' is not an executable compiler"
+HOST_CXX_BANNER="$("$HOST_CXX" --version 2>&1 | head -n 1)"
+case "$HOST_CXX_BANNER" in
+    Android\ *)
+        fail "CXX='$HOST_CXX' is an Android NDK compiler ($HOST_CXX_BANNER), but this lane builds and runs host executables against the system Qt. Unset CC/CXX or point them at a host compiler."
+        ;;
+esac
+printf 'Linux Qt Host Kit contract: host compiler %s -- %s\n' "$HOST_CXX" "$HOST_CXX_BANNER"
 
 require_file "$SDK_SOURCE_ROOT/include/migo/migo.h"
 require_file "$HOST_KIT_ROOT/CMakeLists.txt"
@@ -151,9 +184,32 @@ require_file "$BUILD_DIR/install-consumer/migo-host-kit-install-consumer"
 
 "$BUILD_DIR/migo-surface-host-test"
 env QT_QPA_PLATFORM=offscreen "$BUILD_DIR/migo-qt-x11-view-test"
+env QT_QPA_PLATFORM=offscreen "$BUILD_DIR/migo-qt-x11-input-test"
 # Pin xcb explicitly: developer desktops often export WAYLAND_DISPLAY, while
 # this adapter and its positive-path test intentionally exercise X11 only.
 xvfb-run -a env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb \
     "$BUILD_DIR/migo-qt-x11-view-test"
+xvfb-run -a env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb \
+    "$BUILD_DIR/migo-qt-x11-input-test"
+
+if [[ "$SANITIZE" == "1" ]]; then
+    SANITIZER_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+    cmake \
+        -S "$HOST_KIT_ROOT/tests" \
+        -B "$BUILD_DIR/sanitize" \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_CXX_FLAGS="$SANITIZER_FLAGS" \
+        -DCMAKE_EXE_LINKER_FLAGS="$SANITIZER_FLAGS" \
+        -DMIGO_REPOSITORY_ROOT="$SDK_SOURCE_ROOT"
+    cmake --build "$BUILD_DIR/sanitize" --parallel
+    "$BUILD_DIR/sanitize/migo-surface-host-test"
+    env QT_QPA_PLATFORM=offscreen "$BUILD_DIR/sanitize/migo-qt-x11-view-test"
+    xvfb-run -a env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb \
+        "$BUILD_DIR/sanitize/migo-qt-x11-view-test"
+    xvfb-run -a env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb \
+        "$BUILD_DIR/sanitize/migo-qt-x11-input-test"
+    printf 'Linux Qt Host Kit contract: ASan/UBSan PASS\n'
+fi
 
 printf 'Linux Qt Host Kit contract: PASS\n'

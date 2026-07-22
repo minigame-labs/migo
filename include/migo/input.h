@@ -1,8 +1,9 @@
 /*
  * Migo C ABI: input.
  *
- * Pointer input only in this slice. Keyboard, text/IME and gamepad contracts are
- * still open freeze blockers (see README.md).
+ * Touch, the desktop pointer (mouse buttons, motion, wheel), soft keyboard,
+ * physical keys, IME composition and gamepads are all carried here. See
+ * README.md for the state of each contract against the v1 freeze.
  */
 #ifndef MIGO_INPUT_H
 #define MIGO_INPUT_H
@@ -100,6 +101,118 @@ MIGO_API MigoResult MIGO_CALL migo_session_send_touch(
     const MigoTouchEvent *event);
 
 /*
+ * Desktop pointer: mouse buttons, motion, and the wheel.
+ *
+ * Separate from touch above, and a host chooses which streams it sends. wx
+ * content written for a phone listens for touch; wx content written for PC
+ * WeChat listens for the mouse, which is why these names are on the wx surface
+ * at all. A desktop host serving phone-first content may send both. Migo
+ * synthesizes neither from the other: only the host knows what its content and
+ * its device call for, and a runtime that guessed would double-deliver every
+ * click to content that listens for both.
+ *
+ * Neither record carries a pointer, so both have one layout on every target --
+ * LP64, LLP64 and ILP32 agree, unlike the string-bearing records below.
+ */
+typedef uint32_t MigoPointerEventType;
+#define MIGO_POINTER_EVENT_DOWN UINT32_C(0)
+#define MIGO_POINTER_EVENT_MOVE UINT32_C(1)
+#define MIGO_POINTER_EVENT_UP UINT32_C(2)
+
+/* Highest accepted button ordinal; the DOM defines five. */
+#define MIGO_POINTER_BUTTON_MAX UINT32_C(31)
+
+/*
+ * x and y are CSS pixels, exactly as in MigoTouchPoint -- the same conversion
+ * from the host's own pixels using the scale_factor supplied at attach. Sending
+ * physical pixels here has the same symptom it has for touch: the game renders
+ * correctly and the click lands somewhere else. Sending touch in one unit and
+ * the pointer in the other is worse, because one press then reports two
+ * different positions.
+ *
+ * button follows DOM MouseEvent.button: 0 primary, 1 auxiliary, 2 secondary.
+ * On a move it names the button being held.
+ */
+typedef struct MigoPointerEvent {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    MigoPointerEventType event_type;
+    uint32_t button;
+    float x;
+    float y;
+    double timestamp_ms;
+} MigoPointerEvent;
+
+MIGO_STATIC_ASSERT(offsetof(MigoPointerEvent, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+MIGO_STATIC_ASSERT(sizeof(MigoPointerEvent) == 32, "MigoPointerEvent size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoPointerEvent, event_type) == 8, "MigoPointerEvent.event_type moved");
+MIGO_STATIC_ASSERT(offsetof(MigoPointerEvent, button) == 12, "MigoPointerEvent.button moved");
+MIGO_STATIC_ASSERT(offsetof(MigoPointerEvent, x) == 16, "MigoPointerEvent.x moved");
+MIGO_STATIC_ASSERT(offsetof(MigoPointerEvent, y) == 20, "MigoPointerEvent.y moved");
+MIGO_STATIC_ASSERT(offsetof(MigoPointerEvent, timestamp_ms) == 24,
+                   "MigoPointerEvent.timestamp_ms moved");
+
+/*
+ * Deliver one mouse button or motion event. Callable from any thread; ordering
+ * between concurrent calls is the host's to guarantee.
+ *
+ * Returns MIGO_ERROR_INVALID_STATE when no surface is attached and
+ * MIGO_ERROR_WOULD_BLOCK when the queue is full. A dropped UP leaves content
+ * believing the button is still held, and no later event corrects it.
+ */
+MIGO_API MigoResult MIGO_CALL migo_session_send_pointer_event(
+    MigoSession *session,
+    const MigoPointerEvent *event);
+
+/* DOM WheelEvent.deltaMode: what unit the deltas are in. */
+typedef uint32_t MigoWheelDeltaMode;
+#define MIGO_WHEEL_DELTA_MODE_PIXEL UINT32_C(0)
+#define MIGO_WHEEL_DELTA_MODE_LINE UINT32_C(1)
+#define MIGO_WHEEL_DELTA_MODE_PAGE UINT32_C(2)
+
+/*
+ * One scroll. The deltas follow DOM WheelEvent, and delta_mode travels with
+ * them rather than being normalized to pixels by the host, because converting a
+ * line- or page-based delta needs the content's own line height. A toolkit that
+ * reports scroll in degrees (Qt's angleDelta is eighths of a degree) converts to
+ * one of these units; it must not report degrees as pixels.
+ *
+ * An unrecognised delta_mode is rejected rather than assumed to be pixels: a
+ * line-sized number read as pixels scrolls by a fraction of what the user asked
+ * for, and nothing later corrects it.
+ */
+typedef struct MigoWheelEvent {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    MigoWheelDeltaMode delta_mode;
+    uint32_t reserved0;
+    double delta_x;
+    double delta_y;
+    double delta_z; /* 0.0 on the devices that do not report depth */
+    double timestamp_ms;
+} MigoWheelEvent;
+
+MIGO_STATIC_ASSERT(offsetof(MigoWheelEvent, struct_size) == 0,
+                   "every versioned struct must begin with struct_size");
+MIGO_STATIC_ASSERT(sizeof(MigoWheelEvent) == 48, "MigoWheelEvent size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoWheelEvent, delta_mode) == 8, "MigoWheelEvent.delta_mode moved");
+MIGO_STATIC_ASSERT(offsetof(MigoWheelEvent, reserved0) == 12, "MigoWheelEvent.reserved0 moved");
+MIGO_STATIC_ASSERT(offsetof(MigoWheelEvent, delta_x) == 16, "MigoWheelEvent.delta_x moved");
+MIGO_STATIC_ASSERT(offsetof(MigoWheelEvent, delta_y) == 24, "MigoWheelEvent.delta_y moved");
+MIGO_STATIC_ASSERT(offsetof(MigoWheelEvent, delta_z) == 32, "MigoWheelEvent.delta_z moved");
+MIGO_STATIC_ASSERT(offsetof(MigoWheelEvent, timestamp_ms) == 40,
+                   "MigoWheelEvent.timestamp_ms moved");
+
+/*
+ * Deliver one wheel event. Callable from any thread; ordering between
+ * concurrent calls is the host's to guarantee.
+ */
+MIGO_API MigoResult MIGO_CALL migo_session_send_wheel_event(
+    MigoSession *session,
+    const MigoWheelEvent *event);
+
+/*
  * Soft keyboard, wx model.
  *
  * The value a text event carries is the field's WHOLE CURRENT TEXT, not the
@@ -190,6 +303,28 @@ typedef uint32_t MigoKeyEventType;
  * Both strings are length-delimited, need not be NUL-terminated, and are
  * borrowed for the duration of the call.
  */
+typedef uint32_t MigoKeyModifiers;
+#define MIGO_KEY_MODIFIER_NONE UINT32_C(0)
+#define MIGO_KEY_MODIFIER_CONTROL (UINT32_C(1) << 0)
+#define MIGO_KEY_MODIFIER_SHIFT (UINT32_C(1) << 1)
+#define MIGO_KEY_MODIFIER_ALT (UINT32_C(1) << 2)
+#define MIGO_KEY_MODIFIER_META (UINT32_C(1) << 3)
+
+typedef uint32_t MigoKeyEventFlags;
+#define MIGO_KEY_EVENT_FLAG_NONE UINT32_C(0)
+/* The platform's auto-repeat produced this press, not the user pressing again.
+ * DOM KeyboardEvent.repeat. */
+#define MIGO_KEY_EVENT_FLAG_REPEAT (UINT32_C(1) << 0)
+
+/*
+ * modifiers and flags were appended after this record shipped, so they are the
+ * optional tail: a host built against the earlier header announces the smaller
+ * struct_size and its absent fields read as zero, which is exactly what they
+ * mean -- no modifier held, not a repeat. reserved0 stays reserved.
+ *
+ * modifiers cannot be derived from key: a modified press still reports the
+ * character it produces, so without this content cannot tell Ctrl+S from S.
+ */
 typedef struct MigoKeyEvent {
     uint32_t struct_size;
     uint32_t abi_version;
@@ -200,16 +335,26 @@ typedef struct MigoKeyEvent {
     uint32_t code_length;
     uint32_t reserved0;
     double timestamp_ms;
+    MigoKeyModifiers modifiers;
+    MigoKeyEventFlags flags;
 } MigoKeyEvent;
 
 MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, struct_size) == 0,
                    "every versioned struct must begin with struct_size");
 #if MIGO_LP64
-MIGO_STATIC_ASSERT(sizeof(MigoKeyEvent) == 48, "MigoKeyEvent LP64 size changed");
+MIGO_STATIC_ASSERT(sizeof(MigoKeyEvent) == 56, "MigoKeyEvent LP64 size changed");
 MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, key_utf8) == 16, "MigoKeyEvent.key_utf8 moved");
 MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, code_utf8) == 24, "MigoKeyEvent.code_utf8 moved");
 MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, timestamp_ms) == 40,
                    "MigoKeyEvent.timestamp_ms moved");
+MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, modifiers) == 48, "MigoKeyEvent.modifiers moved");
+MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, flags) == 52, "MigoKeyEvent.flags moved");
+#else
+MIGO_STATIC_ASSERT(sizeof(MigoKeyEvent) == 48, "MigoKeyEvent ILP32 size changed");
+MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, timestamp_ms) == 32,
+                   "MigoKeyEvent.timestamp_ms moved");
+MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, modifiers) == 40, "MigoKeyEvent.modifiers moved");
+MIGO_STATIC_ASSERT(offsetof(MigoKeyEvent, flags) == 44, "MigoKeyEvent.flags moved");
 #endif
 
 /*

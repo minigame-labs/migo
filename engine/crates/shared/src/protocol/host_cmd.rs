@@ -28,6 +28,7 @@
 //! - **Audio** (3): `OnAudioInterruptionBegin`, `OnAudioInterruptionEnd`, `InnerAudioEvent`
 //! - **Rendering / Surface** (1): `UpdateSurface`
 //! - **Touch / Input** (1): `OnTouch`
+//! - **Desktop pointer** (4): `OnMouseDown` .. `OnWheel`
 //! - **Sensor Events** (5): `OnDeviceMotionChange` .. `OnAccelerometerChange`
 //! - **Network** (1): `OnNetworkStatusChange`
 //! - **Recorder** (2): `RecorderEvent`, `RecorderFrameData`
@@ -139,6 +140,7 @@ pub struct BleCharacteristicData {
 /// - **Lifecycle** (4): `Restart`, `Shutdown`, `OnShow`, `OnHide`
 /// - **Rendering / Surface** (1): `UpdateSurface`
 /// - **Touch / Input** (1): `OnTouch`
+/// - **Desktop pointer** (4): `OnMouseDown` .. `OnWheel`
 /// - **Keyboard Events** (6): `OnKeyboardInput` .. `OnKeyUp`
 /// - **Gamepad Events** (3): `OnGamepadConnected` .. `OnGamepadState`
 /// - **IME Composition Events** (3): `OnCompositionStart` .. `OnCompositionEnd`
@@ -436,6 +438,13 @@ pub enum HostCommand {
         code: String,
         /// Event timestamp in milliseconds.
         timestamp_ms: f64,
+        /// DOM modifier state as a bitmask. `key` alone cannot carry it: a
+        /// modified press still reports the character it produces, so content
+        /// could not tell `Ctrl+S` from `S`.
+        modifiers: u32,
+        /// DOM `KeyboardEvent.repeat`: the platform's auto-repeat produced this
+        /// press, rather than the user pressing the key again.
+        repeat: bool,
     },
 
     /// Physical/PC keyboard key up event.
@@ -446,6 +455,79 @@ pub enum HostCommand {
         key: String,
         /// Web KeyEvent.code value.
         code: String,
+        /// Event timestamp in milliseconds.
+        timestamp_ms: f64,
+        /// DOM modifier state as a bitmask.
+        modifiers: u32,
+        /// DOM `KeyboardEvent.repeat`. Always false for a release on every
+        /// platform that reports one, but carried so the two commands keep the
+        /// same shape.
+        repeat: bool,
+    },
+
+    // ---- Desktop pointer ----
+    /// Mouse button pressed.
+    ///
+    /// Triggers `migo.onMouseDown` callbacks. Distinct from `OnTouch`, and a
+    /// host chooses which it sends: wx content written for a phone listens for
+    /// touch, wx content written for PC WeChat listens for the mouse, and only
+    /// the host knows which streams its content and its device call for. The
+    /// engine synthesizes neither from the other.
+    OnMouseDown {
+        /// CSS pixels, the same logical coordinate space as `OnTouch`.
+        x: f32,
+        /// CSS pixels, the same logical coordinate space as `OnTouch`.
+        y: f32,
+        /// Which button, in DOM `MouseEvent.button` order (0 = primary).
+        button: u32,
+        /// Event timestamp in milliseconds.
+        timestamp_ms: f64,
+    },
+
+    /// Mouse moved.
+    ///
+    /// Triggers `migo.onMouseMove` callbacks.
+    OnMouseMove {
+        /// CSS pixels, the same logical coordinate space as `OnTouch`.
+        x: f32,
+        /// CSS pixels, the same logical coordinate space as `OnTouch`.
+        y: f32,
+        /// Which button is held, in DOM `MouseEvent.button` order.
+        button: u32,
+        /// Event timestamp in milliseconds.
+        timestamp_ms: f64,
+    },
+
+    /// Mouse button released.
+    ///
+    /// Triggers `migo.onMouseUp` callbacks.
+    OnMouseUp {
+        /// CSS pixels, the same logical coordinate space as `OnTouch`.
+        x: f32,
+        /// CSS pixels, the same logical coordinate space as `OnTouch`.
+        y: f32,
+        /// Which button, in DOM `MouseEvent.button` order (0 = primary).
+        button: u32,
+        /// Event timestamp in milliseconds.
+        timestamp_ms: f64,
+    },
+
+    /// Wheel or trackpad scroll.
+    ///
+    /// Triggers `migo.onWheel` callbacks. The wheel has no touch equivalent, so
+    /// unlike the mouse buttons above there is no other stream that could carry
+    /// it.
+    OnWheel {
+        /// Horizontal delta, in the unit `delta_mode` names.
+        delta_x: f64,
+        /// Vertical delta, in the unit `delta_mode` names.
+        delta_y: f64,
+        /// Depth delta, in the unit `delta_mode` names; 0.0 on most devices.
+        delta_z: f64,
+        /// DOM `WheelEvent.deltaMode`: 0 = pixel, 1 = line, 2 = page. Carried
+        /// rather than normalized to pixels because converting a line-based
+        /// delta needs the content's line height, which only the content knows.
+        delta_mode: u32,
         /// Event timestamp in milliseconds.
         timestamp_ms: f64,
     },

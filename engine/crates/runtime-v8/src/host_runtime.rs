@@ -707,13 +707,62 @@ impl HostJsRuntime {
         self.with_v8(|rt, bindings| bindings.dispatch_gamepad_state(rt, state));
     }
 
-    pub fn dispatch_key_down(&mut self, key: &str, code: &str, timestamp_ms: f64) {
-        self.with_v8(|rt, bindings| bindings.dispatch_key_down(rt, key, code, timestamp_ms));
+    pub fn dispatch_key_down(
+        &mut self,
+        key: &str,
+        code: &str,
+        timestamp_ms: f64,
+        modifiers: u32,
+        repeat: bool,
+    ) {
+        self.with_v8(|rt, bindings| {
+            bindings.dispatch_key_down(rt, key, code, timestamp_ms, modifiers, repeat)
+        });
     }
 
     #[inline]
-    pub fn dispatch_key_up(&mut self, key: &str, code: &str, timestamp_ms: f64) {
-        self.with_v8(|rt, bindings| bindings.dispatch_key_up(rt, key, code, timestamp_ms));
+    pub fn dispatch_key_up(
+        &mut self,
+        key: &str,
+        code: &str,
+        timestamp_ms: f64,
+        modifiers: u32,
+        repeat: bool,
+    ) {
+        self.with_v8(|rt, bindings| {
+            bindings.dispatch_key_up(rt, key, code, timestamp_ms, modifiers, repeat)
+        });
+    }
+
+    // ---- Desktop pointer dispatch ----
+
+    #[inline]
+    pub fn dispatch_mouse_down(&mut self, x: f32, y: f32, button: u32, timestamp_ms: f64) {
+        self.with_v8(|rt, bindings| bindings.dispatch_mouse_down(rt, x, y, button, timestamp_ms));
+    }
+
+    #[inline]
+    pub fn dispatch_mouse_move(&mut self, x: f32, y: f32, button: u32, timestamp_ms: f64) {
+        self.with_v8(|rt, bindings| bindings.dispatch_mouse_move(rt, x, y, button, timestamp_ms));
+    }
+
+    #[inline]
+    pub fn dispatch_mouse_up(&mut self, x: f32, y: f32, button: u32, timestamp_ms: f64) {
+        self.with_v8(|rt, bindings| bindings.dispatch_mouse_up(rt, x, y, button, timestamp_ms));
+    }
+
+    #[inline]
+    pub fn dispatch_wheel(
+        &mut self,
+        delta_x: f64,
+        delta_y: f64,
+        delta_z: f64,
+        delta_mode: u32,
+        timestamp_ms: f64,
+    ) {
+        self.with_v8(|rt, bindings| {
+            bindings.dispatch_wheel(rt, delta_x, delta_y, delta_z, delta_mode, timestamp_ms)
+        });
     }
 
     // ---- Video event dispatch ----

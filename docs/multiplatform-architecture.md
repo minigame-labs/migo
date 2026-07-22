@@ -82,7 +82,7 @@
 | 平台 | 当前状态 | 已有能力 | 尚不能宣称的能力 |
 |---|---|---|---|
 | Android | 已实现，公开 ABI 仍是 candidate | API 26；JNI AAR；C ABI static SDK+CMake；`ANativeWindow`/EGL/GLES presenter；输入、IME、gamepad；arm64 snapshot 与 x86_64 emulator 生成链路 | 重建并提交各 ABI 的 v2 V8 component manifest；补齐 x86_64 full/slim snapshot；所有 ABI 的 release package 与最低/最新真机双门；全量多指真机验证 |
-| Linux GNU | 已实现，公开 ABI 仍是 candidate | x86_64；X11/Wayland host-owned Surface；EGL/GLES；`libmigo.so`/`.a`；pkg-config/CMake；外部 C consumer；toolkit-neutral `SurfaceHost` 与 Qt 6 Widgets/X11 Bound surface view | 用新 v2 component manifest 重建并发布的正式 artifact；发行版/驱动矩阵与性能门；Qt 输入/IME/frame clock/Managed wrapper；Qt Wayland/Quick |
+| Linux GNU | 已实现，公开 ABI 仍是 candidate | x86_64；X11/Wayland host-owned Surface；EGL/GLES；`libmigo.so`/`.a`；pkg-config/CMake；外部 C consumer；toolkit-neutral `SurfaceHost` 与 Qt 6 Widgets/X11 Bound view（含输入/焦点/IME/frame request） | 用新 v2 component manifest 重建并发布的正式 artifact；发行版/驱动矩阵与性能门；Qt Managed wrapper；Qt Wayland/Quick |
 | Windows | 候选 spike | C/C++ header 的 MSVC x64/x86 ABI lane；五个被探测 crate 的 MSVC `cargo check`；`EglProvider` 可承载 ANGLE | 完整 workspace；真实 V8 链接/启动；HWND/SwapChainPanel presenter；ANGLE 出帧；输入/音频/完整性；DLL/NuGet；真机 |
 | macOS | 目标 | 公开 typed descriptor 设计 | runtime、Metal presenter、V8 component、Host Kit、package、CI |
 | iOS | 目标 | 明确采用 WebKit Host Kit 的产品边界 | WKWebView backend、bridge、conformance、package、CI |
@@ -247,7 +247,7 @@ Host Kit 必须提供两种 Session 所有权形态，但不要求在同一个 c
 |---|---|---|---|
 | Android | `MigoGameView` 或 App 自己的 `Surface` | `MigoGameActivity` | 已实现 candidate |
 | Linux C/C++ | App 自己的 X11/Wayland target | `migo-player` | 已实现 candidate |
-| Linux Qt 6 Widgets/X11 | `MigoQtX11SurfaceView`，借用 Session-scoped `SurfaceHost` | 无；顶层窗口始终由 App 提供 | 已实现 surface-only candidate |
+| Linux Qt 6 Widgets/X11 | `MigoQtX11SurfaceView`，借用 Session-scoped `SurfaceHost` | 无；顶层窗口始终由 App 提供 | 已实现 candidate：Surface 生命周期 + 输入/焦点/IME/frame request |
 | Linux Qt 6/Wayland | toolkit adapter | 无 | Qt 6.4 环境没有满足本合同的公开 native handle API，不使用 private header |
 | Qt Quick | `QQuickItem` texture consumer | 无 | 等待零拷贝 texture/fence ABI；禁止 child-window overlay workaround |
 | GTK 4 | `MigoGtkWidget` | GTK sample | 后续独立 package |
@@ -262,7 +262,7 @@ Linux Qt 首个增量只负责最难且可独立验证的 Surface 生命周期�
 - `MigoQtX11SurfaceView` 只借用该 controller，并强制构造时传入 App-owned `QWidget& parent`，因此不能意外成为顶层窗口；每个 View 只保护自己成功绑定的 generation，提前构造的被动 replacement 不能 resize、retire 或阻止销毁另一个 View 的 attachment。
 - View、所有祖先 native widget、X11 `Display*`/XID 与 GUI event loop 必须活到 release observer 报告 `RELEASED`；析构或 `SurfaceAboutToBeDestroyed` 提前发生时 fail fast。
 - adapter 使用 `WA_NativeWindow`/`WA_PaintOnScreen`，并以 `WA_DontCreateNativeAncestors` 避免把宿主整条 Widget 祖先链强制 native；它不创建 `QPainter`、CPU bitmap 或额外合成层；resize 在 UI event loop 内 latest-wins 合并；release poll 只在退休期间运行，并在异常长等待时退避且发出一次 stalled 诊断，绝不以 timeout 销毁仍 pending 的 target。
-- 它不抢占 callback table，也不把“还没有输入/IME/frame-clock Managed wrapper”的 surface-only 控件宣传成完整 `GameView`。
+- 它不抢占 callback table：`on_request_frame` 由 App 安装，View 只提供 `requestFrame()` 供 App 在自己的回调里调用——Host Kit 抢走 callback table 就等于替 App 决定了帧策略。输入、焦点、IME 与 frame request 已交付（2026-07-22），仍未交付的是拥有 Session 的 Managed wrapper，所以它仍不是完整 `GameView`。
 
 该 Host Kit 默认以源码/CMake target 交付，使 adapter 与宿主的 Qt minor、编译器和 C++ runtime 一致。仓库提供的 install rule 是本地/发行方构建入口，不代表 release 已新增无 manifest 的预编译二进制；一旦官方 package 分发 `.a`/`.so`，必须把它们纳入第 8 节的逐 artifact identity 和 package verifier，并记录精确兼容的 core SDK manifest SHA-256。这样 Host Kit 的 arch、OS/glibc、GLIBCXX、CPU、Qt/C++ ABI 与 core package 的 V8 revision、GN args、snapshot 参数/hash 是一条可验证关系，而不是两个可任意组合的版本号。
 
@@ -656,7 +656,7 @@ Linux Qt Host Kit 属于隔离的 source contract job：只安装 Qt/X11/Xvfb，
 - Linux/Android C package manifest v2；
 - 完整 V8/snapshot identity 与 staged-file SHA-256 verifier；
 - Windows MSVC C ABI 持续 CI。
-- Linux toolkit-neutral `SurfaceHost` 与 Qt 6 Widgets/X11 Bound surface view，以及不构建 V8 的独立 contract gate。
+- Linux toolkit-neutral `SurfaceHost` 与 Qt 6 Widgets/X11 Bound view（Surface 生命周期、输入、焦点、IME、frame request），以及不构建 V8 的独立 contract gate。
 
 在指定 V8 builder 上继续完成：
 
@@ -670,11 +670,12 @@ Linux Qt Host Kit 属于隔离的 source contract job：只安装 Qt/X11/Xvfb，
 
 Linux Host Kit 的后续增量按独立能力交付，不扩张本次 surface-only 支持声明：
 
-1. 在 C ABI 的输入、IME、frame-request 与 lifecycle 合同稳定后实现 Qt Widgets Bound input/frame adapter；
-2. 再实现拥有 Session 的 Managed wrapper 和完整示例 App；
-3. 通过 toolkit 官方公开 API实现 GTK 4 X11/Wayland Host Kit；
-4. 设计同 GPU device 的 texture/fence ABI 后再实现 Qt Quick，不能先提交 readback 或 child-window overlay；
-5. 每个增量分别进入最低 Linux/Qt 兼容矩阵与最新系统性能矩阵。
+1. **桌面指针通道（2026-07-22 已完成）**：此前鼠标 button/move 与滚轮**没有任何入口**，而运行时已经把 `onMouseDown`/`onMouseMove`/`onMouseUp`/`onWheel` 发布给内容——这些是 wx 表面真实定义的名字（wx 小游戏在 PC 微信上跑）。JS 侧 listener 与 `_internalTrigger*` 都在，却没有任何引擎代码调用、也没有宿主能调用，内容注册后永远静默不触发。已按软键盘的形状补齐宿主通道（引擎暴露能力、宿主生产事件，两路互不合成），入口为 `migo_session_send_pointer_event` / `migo_session_send_wheel_event`。**它不是 Qt 专属前置**：Windows Milestone B 第 5 项与 macOS Milestone C 的 Host Kit 吃的是同一条通道。守卫为 `scripts/test-input-trigger-producer-contract.sh`（任何已发布的输入 listener 失去生产者即红）；权威状态见 `include/migo/README.md` 的 freeze blockers。**遗留代价**：改了嵌入 JS ⇒ Android 的 aarch64 snapshot 已 stale，需在真机重生成后 Android 宿主才能用这条通道（Linux 走源码 bootstrap，已即时生效）；
+2. **Qt Widgets Bound input/frame adapter（2026-07-22 已完成）**：转换全部发生在 view 自己的事件处理器里（没有任何 event filter）、GUI 线程内、热路径零分配（以 `malloc` 计数实测，Qt 容器不走 `operator new`）；坐标为 CSS 像素（与 Qt logical 恒等，不得再乘 DPR）；`code` 取自硬件扫描码而非布局；失焦撤回未结束的按压与 preedit；帧由 `QWindow::requestUpdate()` 驱动，未请求的重绘不报帧边界。明确不交付：preedit 的光标/选区（DOM 亦不提供）、失焦时合成按键 up、hover 映射为 touch；
+3. 再实现拥有 Session 的 Managed wrapper 和完整示例 App；
+4. 通过 toolkit 官方公开 API实现 GTK 4 X11/Wayland Host Kit；
+5. 设计同 GPU device 的 texture/fence ABI 后再实现 Qt Quick，不能先提交 readback 或 child-window overlay；
+6. 每个增量分别进入最低 Linux/Qt 兼容矩阵与最新系统性能矩阵。
 
 ### Milestone B：Windows production vertical slice
 

@@ -8,16 +8,17 @@
 
 use std::mem::{align_of, offset_of, size_of};
 
-use shared::protocol::host_cmd::{TouchData, TouchPoint, TouchType};
+use shared::protocol::host_cmd::{HostCommand, TouchData, TouchPoint, TouchType};
 
 use crate::panic_barrier::guard;
 use crate::{MigoSession, map_ingress_result, pin_session};
 use migo_capi_abi::{MIGO_ERROR_INVALID_ARGUMENT, MigoResult};
 
 use migo_capi_abi::input::{
-    MIGO_TOUCH_CANCEL, MIGO_TOUCH_END, MIGO_TOUCH_MOVE, MIGO_TOUCH_START, ValidatedTouchEvent,
+    MIGO_POINTER_EVENT_DOWN, MIGO_POINTER_EVENT_MOVE, MIGO_POINTER_EVENT_UP, MIGO_TOUCH_CANCEL,
+    MIGO_TOUCH_END, MIGO_TOUCH_MOVE, MIGO_TOUCH_START, ValidatedPointerEvent, ValidatedTouchEvent,
 };
-pub use migo_capi_abi::input::{MigoTouchEvent, MigoTouchPoint};
+pub use migo_capi_abi::input::{MigoPointerEvent, MigoTouchEvent, MigoTouchPoint, MigoWheelEvent};
 
 #[cfg(test)]
 use migo_capi_abi::MIGO_ERROR_INVALID_STATE;
@@ -115,6 +116,109 @@ pub unsafe extern "C" fn migo_session_send_touch(
             "migo_session_send_touch",
             ingress.try_send_touch(touch_data),
         )
+    })
+}
+
+/// Deliver one mouse button or motion event to the session's content.
+///
+/// Separate from `migo_session_send_touch` on purpose. A host chooses which
+/// streams its content needs: wx content written for a phone listens for touch,
+/// wx content written for PC WeChat listens for the mouse, and a desktop host
+/// serving phone-first content may send both. The engine synthesizes neither
+/// from the other, because only the host knows which its content expects.
+///
+/// # Safety
+/// `session` must be live and `event` must point at a readable
+/// `MigoPointerEvent`, borrowed for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn migo_session_send_pointer_event(
+    session: *mut MigoSession,
+    event: *const MigoPointerEvent,
+) -> MigoResult {
+    guard("migo_session_send_pointer_event", || {
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
+            Err(error) => return error,
+        };
+        let command = match unsafe { MigoPointerEvent::parse(event) } {
+            Ok(event) => pointer_to_command(event),
+            Err(error) => return error,
+        };
+
+        let ingress = match session.active_ingress() {
+            Ok(ingress) => ingress,
+            Err(error) => return error,
+        };
+        map_ingress_result("migo_session_send_pointer_event", ingress.try_send(command))
+    })
+}
+
+#[inline]
+fn pointer_to_command(event: ValidatedPointerEvent) -> HostCommand {
+    let ValidatedPointerEvent {
+        event_type,
+        button,
+        x,
+        y,
+        timestamp_ms,
+    } = event;
+    match event_type {
+        MIGO_POINTER_EVENT_DOWN => HostCommand::OnMouseDown {
+            x,
+            y,
+            button,
+            timestamp_ms,
+        },
+        MIGO_POINTER_EVENT_MOVE => HostCommand::OnMouseMove {
+            x,
+            y,
+            button,
+            timestamp_ms,
+        },
+        MIGO_POINTER_EVENT_UP => HostCommand::OnMouseUp {
+            x,
+            y,
+            button,
+            timestamp_ms,
+        },
+        _ => unreachable!("validated pointer kind"),
+    }
+}
+
+/// Deliver one wheel or trackpad scroll event to the session's content.
+///
+/// Unlike the mouse buttons above, the wheel has no touch equivalent: there is
+/// no other stream that could carry it.
+///
+/// # Safety
+/// `session` must be live and `event` must point at a readable
+/// `MigoWheelEvent`, borrowed for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn migo_session_send_wheel_event(
+    session: *mut MigoSession,
+    event: *const MigoWheelEvent,
+) -> MigoResult {
+    guard("migo_session_send_wheel_event", || {
+        let session = match unsafe { pin_session(session) } {
+            Ok(session) => session,
+            Err(error) => return error,
+        };
+        let command = match unsafe { MigoWheelEvent::parse(event) } {
+            Ok(event) => HostCommand::OnWheel {
+                delta_x: event.delta_x,
+                delta_y: event.delta_y,
+                delta_z: event.delta_z,
+                delta_mode: event.delta_mode,
+                timestamp_ms: event.timestamp_ms,
+            },
+            Err(error) => return error,
+        };
+
+        let ingress = match session.active_ingress() {
+            Ok(ingress) => ingress,
+            Err(error) => return error,
+        };
+        map_ingress_result("migo_session_send_wheel_event", ingress.try_send(command))
     })
 }
 
@@ -355,6 +459,172 @@ mod tests {
             assert_eq!(
                 unsafe { migo_session_send_touch(session, &e) },
                 MIGO_ERROR_INVALID_ARGUMENT
+            );
+        });
+    }
+
+    fn pointer(event_type: u32) -> MigoPointerEvent {
+        MigoPointerEvent {
+            header: VersionedHeader {
+                struct_size: size_of::<MigoPointerEvent>() as u32,
+                abi_version: MIGO_ABI_VERSION_CURRENT,
+            },
+            event_type,
+            button: 0,
+            x: 12.5,
+            y: 34.25,
+            timestamp_ms: 99.0,
+        }
+    }
+
+    fn wheel() -> MigoWheelEvent {
+        MigoWheelEvent {
+            header: VersionedHeader {
+                struct_size: size_of::<MigoWheelEvent>() as u32,
+                abi_version: MIGO_ABI_VERSION_CURRENT,
+            },
+            delta_mode: 0,
+            reserved0: 0,
+            delta_x: 1.0,
+            delta_y: -2.0,
+            delta_z: 0.0,
+            timestamp_ms: 7.0,
+        }
+    }
+
+    /// Each pointer kind must select its own command with every field in place.
+    ///
+    /// The three commands have identical field lists, so a copy/paste error in
+    /// the match would produce a `move` for a `down` while still compiling and
+    /// still carrying the right coordinates: content would see the button never
+    /// press. Distinct values per field make a crossed assignment visible too.
+    #[test]
+    fn each_pointer_kind_maps_to_its_own_command() {
+        let mut event = pointer(MIGO_POINTER_EVENT_DOWN);
+        event.button = 2;
+        match pointer_to_command(event.validate().expect("valid pointer event")) {
+            HostCommand::OnMouseDown {
+                x,
+                y,
+                button,
+                timestamp_ms,
+            } => {
+                assert_eq!(x, 12.5);
+                assert_eq!(y, 34.25);
+                assert_eq!(button, 2);
+                assert_eq!(timestamp_ms, 99.0);
+            }
+            other => panic!("down must map to OnMouseDown, got {other:?}"),
+        }
+
+        let moved = pointer(MIGO_POINTER_EVENT_MOVE);
+        assert!(matches!(
+            pointer_to_command(moved.validate().expect("valid pointer event")),
+            HostCommand::OnMouseMove { .. }
+        ));
+
+        let up = pointer(MIGO_POINTER_EVENT_UP);
+        assert!(matches!(
+            pointer_to_command(up.validate().expect("valid pointer event")),
+            HostCommand::OnMouseUp { .. }
+        ));
+    }
+
+    #[test]
+    fn pointer_rejects_an_undefined_kind_or_an_impossible_button() {
+        let mut event = pointer(99);
+        assert_eq!(event.validate(), Err(MIGO_ERROR_INVALID_ARGUMENT));
+
+        event = pointer(MIGO_POINTER_EVENT_DOWN);
+        event.button = 32;
+        assert_eq!(event.validate(), Err(MIGO_ERROR_INVALID_ARGUMENT));
+    }
+
+    /// A NaN coordinate must be refused at the boundary, as touch refuses one.
+    ///
+    /// It cannot be detected later: content hit-tests it, every comparison is
+    /// false, and the press silently lands nowhere.
+    #[test]
+    fn pointer_rejects_a_non_finite_coordinate() {
+        let mut event = pointer(MIGO_POINTER_EVENT_MOVE);
+        event.x = f32::NAN;
+        assert_eq!(event.validate(), Err(MIGO_ERROR_INVALID_ARGUMENT));
+
+        event = pointer(MIGO_POINTER_EVENT_MOVE);
+        event.y = f32::INFINITY;
+        assert_eq!(event.validate(), Err(MIGO_ERROR_INVALID_ARGUMENT));
+    }
+
+    /// An unknown delta_mode must not be treated as pixels.
+    ///
+    /// Lines read as pixels scroll by a fraction of what the user asked for,
+    /// and there is no later event that corrects the difference.
+    #[test]
+    fn wheel_rejects_an_unknown_delta_mode() {
+        let mut event = wheel();
+        event.delta_mode = 3;
+        assert_eq!(event.validate(), Err(MIGO_ERROR_INVALID_ARGUMENT));
+    }
+
+    #[test]
+    fn wheel_rejects_a_dirty_reserved_field() {
+        // Reserved bytes are the room a later contract occupies; accepting a
+        // non-zero one now means a host is already relying on them meaning
+        // nothing.
+        let mut event = wheel();
+        event.reserved0 = 1;
+        assert_eq!(event.validate(), Err(MIGO_ERROR_INVALID_ARGUMENT));
+    }
+
+    #[test]
+    fn wheel_carries_every_delta_and_its_mode() {
+        let mut event = wheel();
+        event.delta_mode = 1;
+        event.delta_z = 3.5;
+        let validated = event.validate().expect("valid wheel event");
+        assert_eq!(validated.delta_x, 1.0);
+        assert_eq!(validated.delta_y, -2.0);
+        assert_eq!(validated.delta_z, 3.5);
+        assert_eq!(validated.delta_mode, 1);
+        assert_eq!(validated.timestamp_ms, 7.0);
+    }
+
+    #[test]
+    fn pointer_and_wheel_reject_a_null_session_or_event() {
+        let p = pointer(MIGO_POINTER_EVENT_DOWN);
+        let w = wheel();
+        assert_eq!(
+            unsafe { migo_session_send_pointer_event(std::ptr::null_mut(), &p) },
+            MIGO_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            unsafe { migo_session_send_wheel_event(std::ptr::null_mut(), &w) },
+            MIGO_ERROR_INVALID_ARGUMENT
+        );
+        with_session("pointer-null-event", |session| {
+            assert_eq!(
+                unsafe { migo_session_send_pointer_event(session, std::ptr::null()) },
+                MIGO_ERROR_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                unsafe { migo_session_send_wheel_event(session, std::ptr::null()) },
+                MIGO_ERROR_INVALID_ARGUMENT
+            );
+        });
+    }
+
+    #[test]
+    fn pointer_and_wheel_without_an_attached_surface_report_invalid_state() {
+        with_session("pointer-detached", |session| {
+            let p = pointer(MIGO_POINTER_EVENT_DOWN);
+            let w = wheel();
+            assert_eq!(
+                unsafe { migo_session_send_pointer_event(session, &p) },
+                MIGO_ERROR_INVALID_STATE
+            );
+            assert_eq!(
+                unsafe { migo_session_send_wheel_event(session, &w) },
+                MIGO_ERROR_INVALID_STATE
             );
         });
     }

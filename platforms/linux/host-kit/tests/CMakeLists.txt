@@ -49,6 +49,14 @@ target_link_libraries(migo-qt-x11-view-test PRIVATE
     Qt6::Test
 )
 
+add_executable(migo-qt-x11-input-test qt_x11_input_test.cpp)
+set_target_properties(migo-qt-x11-input-test PROPERTIES AUTOMOC ON)
+target_link_libraries(migo-qt-x11-input-test PRIVATE
+    migo::qt6-x11-surface-view
+    migo_host_kit_fake_capi
+    Qt6::Test
+)
+
 add_library(migo-gnu-extension-consumer-test STATIC
     gnu_extension_consumer_test.cpp
 )
@@ -66,6 +74,7 @@ foreach(target
         migo_host_kit_fake_capi
         migo-surface-host-test
         migo-qt-x11-view-test
+        migo-qt-x11-input-test
         migo-gnu-extension-consumer-test)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
 endforeach()
@@ -77,4 +86,7 @@ enable_testing()
 add_test(NAME migo-surface-host COMMAND migo-surface-host-test)
 add_test(NAME migo-qt-x11-offscreen COMMAND migo-qt-x11-view-test)
 set_tests_properties(migo-qt-x11-offscreen PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+add_test(NAME migo-qt-x11-input-offscreen COMMAND migo-qt-x11-input-test)
+set_tests_properties(migo-qt-x11-input-offscreen PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

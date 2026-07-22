@@ -4,14 +4,63 @@ This directory contains source-level adapters for embedding Migo in an
 application-owned Linux UI. It does not create an application, a top-level
 window, or an event loop.
 
-The current milestone is deliberately narrow:
+What is claimed:
 
 - `migo::linux-surface-host` is a toolkit-neutral C++17 lifecycle controller
   for X11 and Wayland handles supplied by a host.
 - `migo::qt6-x11-surface-view` is a Qt 6.4+ Widgets adapter for the `xcb`
-  platform plugin. It is surface-only and uses a native child `QWidget`.
-- Qt Wayland, Qt Quick, GTK convenience widgets, input translation and a
-  Managed Session wrapper are not claimed by this milestone.
+  platform plugin, using a native child `QWidget`. It carries the Surface
+  lifecycle, input, focus, IME composition and the frame request.
+- Qt Wayland, Qt Quick, GTK convenience widgets and a Managed Session wrapper
+  are not claimed.
+
+## Input, focus and frames
+
+Translation happens in the view's own event handlers on the GUI thread. There is
+no event filter of any kind, no private Qt API, no polling and no thread hop: a
+call from another thread returns `MIGO_ERROR_WRONG_THREAD` before touching Qt
+state or entering Migo.
+
+- **Coordinates are CSS pixels, which need no conversion.** Qt's logical
+  position is physical pixels divided by the device pixel ratio, and that is the
+  same ratio the view reports as `scale_factor` at attach. Multiplying by it
+  here -- the conversion that looks missing -- puts every tap in the wrong place
+  on a HiDPI screen.
+- **A mouse drives both streams by default.** wx content written for a phone
+  listens for touch; wx content written for PC WeChat listens for the mouse.
+  Neither is synthesized from the other by the engine, so the view sends both
+  and `setPointerDelivery()` narrows it. Content that listens for both would
+  otherwise act on one press twice. Hover reaches the mouse stream only: wx
+  content on a phone has no hover concept.
+- **`code` comes from the hardware scan code, `key` from the layout.** The key
+  that produces "a" on a French keyboard is still `KeyQ`, so WASD movement works
+  for every layout. A key this build cannot name is reported as
+  `"Unidentified"`, never as an empty `code`, which the C ABI rejects.
+- **Losing focus retracts what is still in progress**: a held press becomes a
+  touch cancel and an open preedit is ended. Both are states with no later event
+  that would correct them.
+- **Frames follow Qt's clock.** The App calls `requestFrame()` from its own
+  `on_request_frame` callback -- the view never installs the callback table --
+  and the view arms `QWindow::requestUpdate()`. A repaint Qt performs for its
+  own reasons is not reported as a frame boundary. There is no interval timer
+  driving frames anywhere in this adapter.
+- **The delivery path allocates nothing per event**, verified by counting
+  `malloc` (Qt's containers do not use `operator new`) across a delivered burst
+  against an identical undelivered one.
+
+Deliberately not delivered, so they are not mistaken for gaps to be filled
+later:
+
+- **The preedit's cursor and selection.** `QInputMethodEvent` carries them, but
+  the DOM `CompositionEvent` does not, so a browser does not give them to canvas
+  content either. Matching the Web contract is the point; adding them would be
+  Migo-specific API that no existing HTML5 game reads.
+- **A synthetic key release on focus loss.** A browser does not synthesize one,
+  and inventing an "up" for a key the user may still be holding is its own wrong
+  answer. Unlike a press or a preedit, the engine makes no promise about held
+  keys across a focus change.
+- **Hover as touch.** wx content has no hover concept; a free motion stream
+  would be events no game reads.
 
 The public Migo C ABI is still marked `MIGO_C_ABI_CANDIDATE`. Treat this Host
 Kit as an integration preview until that ABI is frozen.

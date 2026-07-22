@@ -1,6 +1,7 @@
 #ifndef MIGO_LINUX_QT6_X11_SURFACE_VIEW_HPP_
 #define MIGO_LINUX_QT6_X11_SURFACE_VIEW_HPP_
 
+#include <migo/input.h>
 #include <migo/linux/surface_host.hpp>
 
 #include <QElapsedTimer>
@@ -8,11 +9,20 @@
 #include <QTimer>
 #include <QWidget>
 
+#include <array>
+
 class QCloseEvent;
+class QFocusEvent;
+class QInputMethodEvent;
+class QKeyEvent;
+class QMouseEvent;
 class QPaintEngine;
+class QPaintEvent;
 class QResizeEvent;
 class QShowEvent;
 class QThread;
+class QTouchEvent;
+class QWheelEvent;
 
 namespace migo::linux_host::qt6 {
 
@@ -41,6 +51,17 @@ class MigoQtX11SurfaceView final : public QWidget {
     Q_OBJECT
 
 public:
+    /// Which pointer streams a mouse produces.
+    ///
+    /// The C ABI carries both because a host, not the engine, knows what its
+    /// content listens for: wx content written for a phone listens for touch,
+    /// wx content written for PC WeChat listens for the mouse, and neither is
+    /// synthesized from the other. The default sends both, because a desktop
+    /// host most often runs phone-first content that would otherwise receive
+    /// nothing at all. Content that listens for both -- rare in wx, common in
+    /// HTML5 -- would act on one press twice, so it narrows this explicitly.
+    enum class PointerDelivery : std::uint8_t { TouchAndMouse, TouchOnly, MouseOnly };
+
     MigoQtX11SurfaceView(SurfaceHost &surface_host, QWidget &parent);
     ~MigoQtX11SurfaceView() override;
 
@@ -50,6 +71,30 @@ public:
     [[nodiscard]] MigoResult attachSurface();
     [[nodiscard]] MigoResult beginDetach();
     [[nodiscard]] MigoResult pollDetach(bool *released);
+
+    void setPointerDelivery(PointerDelivery delivery) noexcept { pointer_delivery_ = delivery; }
+    [[nodiscard]] PointerDelivery pointerDelivery() const noexcept { return pointer_delivery_; }
+
+    /// Ask the toolkit for one frame, in response to the engine asking for one.
+    ///
+    /// The App calls this from its own `on_request_frame` callback. The view
+    /// does not install that callback itself: the callback table is the App's,
+    /// installable once per Session, and a Host Kit that claimed it would
+    /// decide the App's frame policy for it.
+    ///
+    /// One request produces at most one `migo_session_notify_vsync`. A second
+    /// call before the frame arrives coalesces into the first rather than
+    /// queueing another, because the engine asks again when it wants another
+    /// frame and two notifications for one request would run the content's
+    /// clock at double speed.
+    ///
+    /// Paced by `QWindow::requestUpdate()`, which is Qt's own frame clock.
+    /// A fixed-interval timer would be a second, unsynchronised clock competing
+    /// with the compositor's.
+    [[nodiscard]] MigoResult requestFrame();
+
+    /// Whether a requested frame has not yet been reported to the engine.
+    [[nodiscard]] bool isFramePending() const noexcept { return frame_requested_; }
 
     [[nodiscard]] SurfaceState surfaceState() const noexcept {
         return owns_surface_ ? surface_host_.state() : SurfaceState::Detached;
@@ -63,12 +108,27 @@ Q_SIGNALS:
     void surfaceReleased(quint64 generation);
     void surfaceReleaseStalled(quint64 generation, qint64 elapsed_ms);
     void surfaceError(MigoResult error);
+    /// One input event was refused. Reported separately from `surfaceError`
+    /// because a full queue is backpressure, not a Surface fault, and a host
+    /// that treats the two alike would tear down a working Surface.
+    void inputRejected(MigoResult error);
 
 protected:
     [[nodiscard]] QPaintEngine *paintEngine() const override;
     void showEvent(QShowEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
+    void paintEvent(QPaintEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void mouseReleaseEvent(QMouseEvent *event) override;
+    void wheelEvent(QWheelEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void keyReleaseEvent(QKeyEvent *event) override;
+    void focusInEvent(QFocusEvent *event) override;
+    void focusOutEvent(QFocusEvent *event) override;
+    void inputMethodEvent(QInputMethodEvent *event) override;
+    [[nodiscard]] QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
     bool event(QEvent *event) override;
 
 private:
@@ -76,6 +136,24 @@ private:
     void scheduleMetricsUpdate();
     void updateReleasePollCadence();
     void recordError(MigoResult error);
+
+    /// True while this view owns a live attachment, which is the only state in
+    /// which the ABI accepts input at all.
+    [[nodiscard]] bool inputIsDeliverable() const noexcept;
+    void recordInputResult(MigoResult result);
+    void deliverPointer(const QMouseEvent &event, std::uint32_t kind);
+    void deliverMouseAsTouch(const QMouseEvent &event, MigoTouchType kind);
+    void deliverKey(const QKeyEvent &event, std::uint32_t kind);
+    void deliverTouch(const QTouchEvent &event);
+    void deliverComposition(std::uint32_t kind, const char *data, std::uint32_t length);
+    /// Report the frame boundary the toolkit just delivered.
+    void notifyFrameBoundary();
+    /// Retract whatever the content still believes is in progress.
+    ///
+    /// A press or a preedit that never ends leaves content waiting forever, and
+    /// no later event corrects it -- the same reason the ABI reports a full
+    /// queue instead of dropping an END.
+    void retractPendingInput();
 
     SurfaceHost &surface_host_;
     QThread *const owner_thread_;
@@ -88,6 +166,21 @@ private:
     bool close_pending_ = false;
     bool release_stall_reported_ = false;
     QMetaObject::Connection screen_changed_connection_;
+
+    PointerDelivery pointer_delivery_ = PointerDelivery::TouchAndMouse;
+    /// Fixed storage for one touch batch. The ABI's maximum is small and known,
+    /// so the delivery path never allocates however many fingers arrive.
+    std::array<MigoTouchPoint, MIGO_TOUCH_MAX_POINTS> touch_points_{};
+    /// The mouse button currently held, tracked so a focus loss can retract the
+    /// press the content is still waiting to see released.
+    bool mouse_pressed_ = false;
+    std::uint32_t held_button_ = 0;
+    float last_pointer_x_ = 0.0F;
+    float last_pointer_y_ = 0.0F;
+    /// True between compositionstart and compositionend.
+    bool composing_ = false;
+    /// True between a frame request and the frame boundary it produced.
+    bool frame_requested_ = false;
 };
 
 }  // namespace migo::linux_host::qt6

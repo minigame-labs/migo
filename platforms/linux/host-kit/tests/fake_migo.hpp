@@ -1,9 +1,13 @@
 #ifndef MIGO_LINUX_HOST_KIT_TESTS_FAKE_MIGO_HPP_
 #define MIGO_LINUX_HOST_KIT_TESTS_FAKE_MIGO_HPP_
 
+#include <migo/input.h>
 #include <migo/migo.h>
 #include <migo/platform/wayland.h>
 #include <migo/platform/x11.h>
+
+#include <string>
+#include <vector>
 
 namespace fake_migo {
 
@@ -13,7 +17,68 @@ struct Calls {
     int begin_detach = 0;
     int query = 0;
     int destroy_release = 0;
+    int touch = 0;
+    int pointer = 0;
+    int wheel = 0;
+    int key = 0;
+    int composition = 0;
+    int focus = 0;
+    int vsync = 0;
 };
+
+/// One delivered input event, flattened.
+///
+/// The payload is recorded, not just the count: a bridge that sends the right
+/// number of events with physical pixels instead of CSS pixels, or with `code`
+/// in the `key` field, passes every counting assertion while being wrong in the
+/// way that actually reaches a game.
+struct TouchRecord {
+    MigoTouchType type = 0;
+    std::vector<MigoTouchPoint> points;
+    int64_t timestamp_ms = 0;
+};
+
+struct PointerRecord {
+    MigoPointerEventType event_type = 0;
+    uint32_t button = 0;
+    float x = 0.0F;
+    float y = 0.0F;
+    double timestamp_ms = 0.0;
+};
+
+struct WheelRecord {
+    double delta_x = 0.0;
+    double delta_y = 0.0;
+    double delta_z = 0.0;
+    MigoWheelDeltaMode delta_mode = 0;
+    double timestamp_ms = 0.0;
+};
+
+struct KeyRecord {
+    MigoKeyEventType event_type = 0;
+    std::string key;
+    std::string code;
+    MigoKeyModifiers modifiers = 0;
+    MigoKeyEventFlags flags = 0;
+    double timestamp_ms = 0.0;
+};
+
+struct CompositionRecord {
+    MigoCompositionEventType event_type = 0;
+    std::string data;
+};
+
+const std::vector<TouchRecord> &touches() noexcept;
+const std::vector<PointerRecord> &pointers() noexcept;
+const std::vector<WheelRecord> &wheels() noexcept;
+const std::vector<KeyRecord> &keys() noexcept;
+const std::vector<CompositionRecord> &compositions() noexcept;
+const std::vector<uint8_t> &focus_changes() noexcept;
+const std::vector<int64_t> &vsyncs() noexcept;
+
+/// Make every input entry point report a full queue, so a caller that ignores
+/// the result can be caught.
+void set_input_result(MigoResult result) noexcept;
 
 void reset() noexcept;
 

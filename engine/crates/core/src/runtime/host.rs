@@ -935,8 +935,11 @@ impl Host {
                 key,
                 code,
                 timestamp_ms,
+                modifiers,
+                repeat,
             } => {
-                self.js.dispatch_key_down(&key, &code, timestamp_ms);
+                self.js
+                    .dispatch_key_down(&key, &code, timestamp_ms, modifiers, repeat);
                 Ok(())
             }
 
@@ -944,8 +947,53 @@ impl Host {
                 key,
                 code,
                 timestamp_ms,
+                modifiers,
+                repeat,
             } => {
-                self.js.dispatch_key_up(&key, &code, timestamp_ms);
+                self.js
+                    .dispatch_key_up(&key, &code, timestamp_ms, modifiers, repeat);
+                Ok(())
+            }
+
+            HostCommand::OnMouseDown {
+                x,
+                y,
+                button,
+                timestamp_ms,
+            } => {
+                self.js.dispatch_mouse_down(x, y, button, timestamp_ms);
+                Ok(())
+            }
+
+            HostCommand::OnMouseMove {
+                x,
+                y,
+                button,
+                timestamp_ms,
+            } => {
+                self.js.dispatch_mouse_move(x, y, button, timestamp_ms);
+                Ok(())
+            }
+
+            HostCommand::OnMouseUp {
+                x,
+                y,
+                button,
+                timestamp_ms,
+            } => {
+                self.js.dispatch_mouse_up(x, y, button, timestamp_ms);
+                Ok(())
+            }
+
+            HostCommand::OnWheel {
+                delta_x,
+                delta_y,
+                delta_z,
+                delta_mode,
+                timestamp_ms,
+            } => {
+                self.js
+                    .dispatch_wheel(delta_x, delta_y, delta_z, delta_mode, timestamp_ms);
                 Ok(())
             }
 

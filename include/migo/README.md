@@ -149,19 +149,48 @@ Descriptors are parsed and converted once during attach/update control operation
 The candidate cannot be declared stable until all of the following exist:
 
 - performance-oriented batched pointer/touch, keyboard/text/IME, and gamepad contracts —
-  **pointer/touch done** (`migo_session_send_touch`: batched, one copy at the boundary, no
-  allocation, sharing the engine path Android already drives); **soft keyboard done**: it is
+  **touch done** (`migo_session_send_touch`: batched, one copy at the boundary, no
+  allocation, sharing the engine path Android already drives). **Desktop pointer done**:
+  `migo_session_send_pointer_event` and `migo_session_send_wheel_event`. Until 2026-07-22 the
+  runtime published `onMouseDown`/`onMouseMove`/`onMouseUp`/`onWheel` — names the wx surface
+  really defines, because wx mini-games run on PC WeChat — with the JS listener groups and
+  their `_internalTrigger*` hooks present but *no producer anywhere*: no engine code called
+  them and no host could, so content registering one was silently never called, on every
+  platform, with no error. Deleting the listeners would not have been the fix; they are part
+  of the wx surface Migo clones, and removing them turns a silent no-op into a `TypeError`
+  for PC wx content. The fix was the missing host channel, in the shape the soft keyboard
+  already used: the engine exposes the capability, the host produces the events, and neither
+  stream is synthesized from the other — an Android host sends touch, a desktop host sends
+  the mouse, and a desktop host serving phone-first content may send both, because only the
+  host knows which its content expects. Both records are pointer-free, so one layout serves
+  LP64, LLP64 and ILP32 rather than the two halves every string-bearing record needs.
+  `delta_mode` travels with the wheel deltas instead of being normalized to pixels, because
+  converting a line-based delta needs the content's own line height, and an unrecognised
+  mode is refused rather than assumed to be pixels.
+  `scripts/test-input-trigger-producer-contract.sh` now fails if any published input listener
+  loses its producer again; **soft keyboard done**: it is
   a capability the host supplies rather than one Migo has, so `on_show_keyboard` /
   `on_hide_keyboard` / `on_update_keyboard` install together on `MigoHostCallbacks` (all
   three or none — a host that can open a keyboard but not close it strands it on screen),
   and `migo_session_send_keyboard_event` carries input/confirm/complete/height back on the
   path Android already drives. The host's keyboard wins over the platform's, because
   Android's own accessor claims one unconditionally and reaches a JVM a pure-native host has
-  not got. **physical keys done**: `migo_session_send_key_event` carries DOM `key`/`code` and a
-  timestamp on the engine's existing `OnKeyDown`/`OnKeyUp` path. Not batched, unlike touch --
-  keys arrive at typing speed, so a batch API would be shape without a requirement. The host
-  translates its platform keycodes into DOM values, because a portable runtime that accepted
-  platform codes would have to carry a mapping per platform. **IME composition done**: the engine had no way to
+  not got. **physical keys done**: `migo_session_send_key_event` carries DOM `key`/`code`, a
+  timestamp, the modifier state and `repeat` on the engine's existing `OnKeyDown`/`OnKeyUp`
+  path. Not batched, unlike touch -- keys arrive at typing speed, so a batch API would be
+  shape without a requirement. The host translates its platform keycodes into DOM values,
+  because a portable runtime that accepted platform codes would have to carry a mapping per
+  platform. Modifiers cannot be derived from `key`: a modified press still reports the
+  character it produces, so without them content cannot tell `Ctrl+S` from `S`. They were
+  appended after this record shipped and are therefore its optional tail -- a host built
+  against the earlier header announces the smaller `struct_size`, and its absent fields read
+  as zero, which is exactly what they mean. That is the first real exercise of the append
+  rule on an input record rather than on `MigoHostCallbacks`, and it is covered on both
+  sides: `tests/c_abi/old_client_contract.c` redeclares the pre-modifier shape and asserts it
+  is still a byte-exact prefix, while `capi`'s own test hands the library a truncated buffer
+  whose tail holds *valid* modifier bits -- garbage there would be caught by the known-bits
+  check and surface as an error, whereas a plausible value would surface as content being
+  told Ctrl and Alt are held when the host said nothing at all. **IME composition done**: the engine had no way to
   represent a preedit string, so this added both halves. wx has none, so the shape is the DOM
   `CompositionEvent` -- `compositionstart`/`update`/`end` carrying the whole current preedit,
   driven by `migo_session_send_composition_event`. It sits alongside the soft keyboard rather

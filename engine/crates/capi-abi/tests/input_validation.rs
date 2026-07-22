@@ -218,6 +218,8 @@ fn key_event(kind: u32, key: &[u8], code: &[u8]) -> MigoKeyEvent {
         code_length: code.len() as u32,
         reserved0: 0,
         timestamp_ms: -1.0,
+        modifiers: 0,
+        flags: 0,
     }
 }
 

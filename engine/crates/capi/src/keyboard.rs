@@ -23,6 +23,11 @@ pub use migo_capi_abi::input::{MigoCompositionEvent, MigoKeyEvent, MigoKeyboardE
 
 #[cfg(test)]
 use migo_capi_abi::MIGO_ERROR_INVALID_STATE;
+#[cfg(test)]
+use migo_capi_abi::input::{
+    MIGO_KEY_EVENT_FLAG_REPEAT, MIGO_KEY_MODIFIER_ALT, MIGO_KEY_MODIFIER_CONTROL,
+    MIGO_KEY_MODIFIER_SHIFT,
+};
 
 /// Translate a validated event into the engine's command.
 ///
@@ -106,19 +111,27 @@ fn validated_key_to_command(event: ValidatedKeyEvent) -> HostCommand {
             key,
             code,
             timestamp_ms,
+            modifiers,
+            repeat,
         } => HostCommand::OnKeyDown {
             key,
             code,
             timestamp_ms,
+            modifiers,
+            repeat,
         },
         ValidatedKeyEvent::Up {
             key,
             code,
             timestamp_ms,
+            modifiers,
+            repeat,
         } => HostCommand::OnKeyUp {
             key,
             code,
             timestamp_ms,
+            modifiers,
+            repeat,
         },
     }
 }
@@ -327,7 +340,87 @@ mod tests {
             code_length: code.len() as u32,
             reserved0: 0,
             timestamp_ms: 1234.0,
+            modifiers: 0,
+            flags: 0,
         }
+    }
+
+    /// A host built before modifiers existed must still be accepted.
+    ///
+    /// It announces the smaller `struct_size` and never allocated the tail, so
+    /// the bytes past it are poisoned here: a library that read them would see
+    /// 0xAAAAAAAA as a modifier mask, fail the known-bits check, and reject a
+    /// perfectly valid old caller -- or, worse, accept it and hand content four
+    /// modifiers nobody was holding.
+    #[test]
+    fn a_client_from_before_modifiers_is_accepted_and_reads_as_none() {
+        const OLD_SIZE: usize = std::mem::offset_of!(MigoKeyEvent, modifiers);
+        let key = "s";
+        let code = "KeyS";
+        let mut full = key_event(MIGO_KEY_EVENT_DOWN, key, code);
+        full.header.struct_size = OLD_SIZE as u32;
+        // Deliberately VALID bits rather than garbage. Garbage past the
+        // announced size would be caught by the known-bits check and surface as
+        // an error, which is the easy failure; a plausible value surfaces as
+        // content being told Ctrl and Alt are held when the host said nothing
+        // at all, which nothing downstream can detect.
+        full.modifiers = MIGO_KEY_MODIFIER_CONTROL | MIGO_KEY_MODIFIER_ALT;
+        full.flags = MIGO_KEY_EVENT_FLAG_REPEAT;
+
+        let mut buffer = [0u8; size_of::<MigoKeyEvent>()];
+        // SAFETY: both regions are exactly `size_of::<MigoKeyEvent>()` bytes of
+        // plain data, and `buffer` is written, not read, through this pointer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &full as *const MigoKeyEvent as *const u8,
+                buffer.as_mut_ptr(),
+                size_of::<MigoKeyEvent>(),
+            );
+        }
+
+        // SAFETY: the buffer holds a well-formed prefix of the announced size,
+        // and both strings outlive the call.
+        let command = unsafe { MigoKeyEvent::parse(buffer.as_ptr() as *const MigoKeyEvent) }
+            .map(validated_key_to_command)
+            .expect("a caller from the previous header must be accepted");
+        match command {
+            HostCommand::OnKeyDown {
+                modifiers, repeat, ..
+            } => {
+                assert_eq!(modifiers, 0, "an absent tail must read as no modifiers");
+                assert!(!repeat, "an absent tail must not read as an auto-repeat");
+            }
+            other => panic!("expected OnKeyDown, got {other:?}"),
+        }
+    }
+
+    /// Modifiers and repeat must survive the boundary, and unknown bits must not.
+    #[test]
+    fn modifiers_and_repeat_cross_the_boundary_and_unknown_bits_are_refused() {
+        let mut event = key_event(MIGO_KEY_EVENT_DOWN, "s", "KeyS");
+        event.modifiers = MIGO_KEY_MODIFIER_CONTROL | MIGO_KEY_MODIFIER_SHIFT;
+        event.flags = MIGO_KEY_EVENT_FLAG_REPEAT;
+        match unsafe { to_key_command(&event) }.expect("well-formed") {
+            HostCommand::OnKeyDown {
+                modifiers, repeat, ..
+            } => {
+                assert_eq!(
+                    modifiers,
+                    MIGO_KEY_MODIFIER_CONTROL | MIGO_KEY_MODIFIER_SHIFT
+                );
+                assert!(repeat);
+            }
+            other => panic!("expected OnKeyDown, got {other:?}"),
+        }
+
+        // A bit this version does not define may mean something in a later one;
+        // accepting it now would let a host rely on being ignored.
+        let mut unknown = key_event(MIGO_KEY_EVENT_DOWN, "s", "KeyS");
+        unknown.modifiers = 1 << 16;
+        assert_eq!(
+            unsafe { to_key_command(&unknown) }.err(),
+            Some(MIGO_ERROR_INVALID_ARGUMENT)
+        );
     }
 
     /// `key` and `code` are different values and must not be swapped: a host
@@ -343,6 +436,7 @@ mod tests {
                     key,
                     code,
                     timestamp_ms,
+                    ..
                 } => {
                     assert!(expect_down, "a down arm produced an up command");
                     assert_eq!(key, "a");
