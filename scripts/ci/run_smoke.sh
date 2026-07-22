@@ -6,6 +6,9 @@ set -euo pipefail
 echo "=== Smoke: Shell script syntax ==="
 bash -n scripts/*.sh
 bash -n scripts/ci/*.sh
+# Platform spike drivers live outside scripts/ by design, which silently put
+# them outside this gate too until 2026-07-22.
+bash -n platforms/*/spike/*.sh
 echo "    OK"
 
 echo "=== Smoke: Rust formatting ==="

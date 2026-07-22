@@ -12,7 +12,12 @@ use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
+// Only the `#[cfg(unix)]` block that replays a zip entry's unix mode logs at
+// warn level; a zip entry's mode has no counterpart on other targets, so the
+// import has to carry the same gate or it is unused there.
+#[cfg(unix)]
+use tracing::warn;
 use zip::ZipArchive;
 
 use crate::{

@@ -1063,6 +1063,18 @@ tools/
 8. **接入 ANGLE family**  
    Windows D3D11 和 macOS Metal 分别有 Presenter、frame clock 与打包。
 
+   **2026-07-22 Windows 可行性 spike 已完成，结论见 `platforms/windows/SPIKE-REPORT.md`。** 三条要点：
+   ①`migo-shared`/`migo-io`/`migo-runtime-v8` 在 `x86_64-pc-windows-msvc` 上 `cargo check` 全部通过，
+   整个引擎侧只发现 **1 处**可移植性缺陷（已修）；②**ANGLE 不需要修改 `EglProvider` trait**——
+   `libloading` 跨平台、ANGLE 是 EGL 1.5（钉定 1.4 的超集）、`display()` 把取得 display 整个交给实现者，
+   所以本条对 `graphics-core`/`graphics-gles` 拆分的紧迫性**低于**规划时的预估，拆分的真实价值在为
+   D3D12/Metal 这类**非 EGL** 后端留位置；③真实成本不在 migo 代码里，而在构建环境：Skia 在 Windows 上
+   无预构建、必须全量源码构建，且需要**八项**前置（MSVC/SDK、钉定的 Rust 工具链、LLVM/clang-cl、
+   开发者模式解 symlink、ninja、可达 googlesource、短路径绕开 `GetFullPathNameA` 的 MAX_PATH、
+   Khronos EGL 头）。**`migo-graphics` 已验证通过**（0 error / 55 warning，Skia 全量构建 + bindgen 通过），
+   spike 无留白。最后一个阻塞是 Android NDK 的 clang 12 遮蔽工具链解析，解法是构建脚本自己构造
+   **剔除 NDK 的白名单 PATH**——把 LLVM 前置是不够的。
+
 9. **OpenHarmony/HarmonyOS spike**  
    先确定 JSVM/V8，再产品化 Host Kit。
 

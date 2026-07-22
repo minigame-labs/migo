@@ -170,6 +170,33 @@ SKIA_GN_ARGS = "skia_use_fontconfig=false skia_enable_fontmgr_fontconfig=false e
 CC = "clang-18"
 CXX = "clang++-18"
 
+# The two entries above have no per-target form -- cargo's `[env]` applies to
+# every target -- so on Windows they name a compiler that does not exist and
+# every cc-rs build script in the graph dies with `ToolNotFound: clang-18`.
+#
+# cc-rs resolves `CC_<target>` before plain `CC`, so naming the target here is
+# provably inert for Android and Linux: those targets never read these keys.
+# It is equally inert for the host-test path, which exports a plain `CC` to
+# beat this non-forcing block (scripts/dev-test-host.sh) -- that precedence is
+# unchanged because a plain `CC` is what it overrides.
+#
+# clang-cl rather than MSVC's cl: skia-bindings on Windows probes fixed paths
+# for clang-cl.exe and refuses to build without it, so LLVM is already a hard
+# prerequisite there. Naming the same compiler keeps one toolchain in play
+# instead of two. Resolved through PATH, not an absolute path, so a non-default
+# LLVM location still works.
+#
+# ⚠ PATH order matters, and getting it wrong fails deep instead of early. An
+# Android NDK on PATH ships its own clang-cl.exe -- r23c's is clang 12 -- and
+# it will be found first if it comes before the LLVM install. The failure
+# surfaces a thousand build steps later inside MSVC's own headers
+# (`STL1000: Unexpected compiler version, expected Clang 19.0.0 or newer`),
+# which reads like a broken STL rather than a shadowed compiler. Put the LLVM
+# directory ahead of the NDK's, or set CC_x86_64_pc_windows_msvc to an
+# absolute path for that machine.
+CC_x86_64_pc_windows_msvc = "clang-cl"
+CXX_x86_64_pc_windows_msvc = "clang-cl"
+
 # Khronos EGL/GL/GLES headers for Skia's GL EGL interface are expected in the
 # environment via CPATH.  On WSL / minimal Ubuntu hosts without root access,
 # run `scripts/dev-setup-skia.sh` once to fetch them to ~/.local/skia-headers

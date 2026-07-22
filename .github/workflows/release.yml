@@ -112,7 +112,7 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Shell script syntax check
-        run: bash -n scripts/*.sh scripts/ci/*.sh
+        run: bash -n scripts/*.sh scripts/ci/*.sh platforms/*/spike/*.sh
 
       - name: Artifact manifest Python syntax check
         run: |
