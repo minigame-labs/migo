@@ -134,7 +134,7 @@ for arch in "${ARCHES[@]}"; do
     [[ "$m_profile" != "$PRODUCT_PROFILE" ]] && echo "        profile: manifest=${m_profile:-missing} current=$PRODUCT_PROFILE"
     [[ "$m_arch" != "$arch" ]] && echo "        arch: manifest=${m_arch:-missing} current=$arch"
     [[ "$m_features" != "$CUR_FEATURES" ]] && echo "        product feature set changed"
-    [[ "$m_rust" != "$CUR_RUST" ]] && echo "        js-runtime Rust/op sources changed"
+    [[ "$m_rust" != "$CUR_RUST" ]] && echo "        runtime-v8 Rust/op sources changed"
     [[ "$m_v8" != "$actual_v8" ]] && echo "        Android V8 archive/build changed"
     [[ "$m_js" != "$CUR_JS" ]] && echo "        extension JS changed"
     [[ "$m_deno" != "$CUR_DENO" ]] && echo "        deno_core: manifest=${m_deno:-missing} current=$CUR_DENO"

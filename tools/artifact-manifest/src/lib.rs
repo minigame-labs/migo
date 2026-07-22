@@ -8,7 +8,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -16,7 +16,7 @@ pub const SLICE_SCHEMA_V1: &str = "migo-artifact-manifest/v1";
 pub const V8_COMPONENT_SCHEMA_V1: &str = "migo-v8-component-manifest/v1";
 pub const PACKAGE_INDEX_SCHEMA_V1: &str = "migo-artifact-package-index/v1";
 pub const RELEASE_ATTESTATION_SCHEMA_V1: &str = "migo-release-attestation/v1";
-pub const LINUX_PACKAGE_SCHEMA_V1: &str = "migo-linux-package-v1";
+pub const LINUX_PACKAGE_SCHEMA_V2: &str = "migo-linux-package-manifest/v2";
 
 /// Loader ABI floor for the Linux GNU slice.
 ///
@@ -28,7 +28,7 @@ pub const LINUX_PACKAGE_SCHEMA_V1: &str = "migo-linux-package-v1";
 pub const LINUX_GLIBC_FLOOR: &str = "2.31";
 pub const LINUX_GLIBCXX_FLOOR: &str = "3.4.28";
 
-pub const ANDROID_PACKAGE_SCHEMA_V1: &str = "migo-android-package-v1";
+pub const ANDROID_PACKAGE_SCHEMA_V2: &str = "migo-android-package-manifest/v2";
 
 /// The project's minimum Android API. Pinned as policy: raising it is a support
 /// contract change, so a manifest declaring anything else is rejected rather
@@ -163,6 +163,9 @@ pub struct V8ComponentHashes {
 pub struct LinuxPackageManifest {
     pub schema: String,
     pub version: String,
+    pub product_profile: String,
+    pub build_type: String,
+    pub codegen_profile: String,
     pub target: String,
     pub os: String,
     pub abi: String,
@@ -175,18 +178,47 @@ pub struct LinuxPackageManifest {
     pub dynamic_dependencies: Vec<String>,
     pub snapshot_policy: String,
     pub snapshots: Vec<PackageSnapshotIdentity>,
-    pub v8: PackageV8Provenance,
-    pub artifacts: BTreeMap<String, u64>,
+    pub v8: V8ComponentManifest,
+    pub toolchain: ToolchainIdentity,
+    pub graphics: GraphicsIdentity,
+    pub provenance: ProvenanceIdentity,
+    pub artifacts: BTreeMap<String, PackageArtifactIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageSnapshotIdentity {
     pub runtime_kind: String,
+    pub product_profile: String,
     pub target_triple: String,
     pub arch: String,
+    pub schema: String,
+    pub generator: String,
+    pub generation_cpu_policy: String,
     pub normalized_parameters: Vec<String>,
+    pub external_references_hash: String,
+    pub bootstrap_inputs_hash: String,
+    pub features: Vec<String>,
+    pub features_hash: String,
+    pub rust_sources_hash: String,
+    pub v8_archive_hash: String,
+    pub bytes_size: u64,
     pub bytes_hash: String,
+    pub js_sources_hash: String,
+    pub deno_core_version: String,
+}
+
+/// Identity of one regular file shipped in a staged SDK package.
+///
+/// The map is the complete regular-file set except for the manifest itself;
+/// the verifier rejects undeclared extras and platform-invalid symlinks. The
+/// key is package-relative. Size catches truncation cheaply; SHA-256 binds the
+/// manifest to actual bytes rather than a plausible file name.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageArtifactIdentity {
+    pub size_bytes: u64,
+    pub sha256: String,
 }
 
 /// One shipped Android C ABI package slice, one Android ABI.
@@ -203,6 +235,9 @@ pub struct PackageSnapshotIdentity {
 pub struct AndroidPackageManifest {
     pub schema: String,
     pub version: String,
+    pub product_profile: String,
+    pub build_type: String,
+    pub codegen_profile: String,
     pub os: String,
     pub abi: String,
     pub arch: String,
@@ -218,20 +253,11 @@ pub struct AndroidPackageManifest {
     pub link_libraries: Vec<String>,
     pub snapshot_policy: String,
     pub snapshots: Vec<PackageSnapshotIdentity>,
-    pub v8: PackageV8Provenance,
-    pub artifacts: BTreeMap<String, u64>,
-}
-
-/// The subset of the V8 component manifest the package copies in. Unknown
-/// fields are tolerated here, unlike everywhere else: this is a copy of another
-/// document that may legitimately gain fields of its own.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PackageV8Provenance {
-    pub schema: String,
-    pub target: String,
-    pub rusty_v8_revision: String,
-    #[serde(flatten)]
-    pub rest: BTreeMap<String, Value>,
+    pub v8: V8ComponentManifest,
+    pub toolchain: ToolchainIdentity,
+    pub graphics: GraphicsIdentity,
+    pub provenance: ProvenanceIdentity,
+    pub artifacts: BTreeMap<String, PackageArtifactIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -331,7 +357,7 @@ pub fn validate_slice_manifest(manifest: &SliceManifest) -> Result<(), ManifestE
     require_non_placeholder("graphics.backend_family", &manifest.graphics.backend_family)?;
     require_non_placeholder("graphics.required_api", &manifest.graphics.required_api)?;
     validate_hashes(&manifest.hashes)?;
-    validate_provenance(&manifest.provenance)?;
+    validate_migo_provenance(&manifest.provenance)?;
 
     require_sha256("artifact_id", &manifest.artifact_id)?;
     let expected = recompute_artifact_id(manifest)?;
@@ -353,8 +379,17 @@ pub fn validate_slice_manifest(manifest: &SliceManifest) -> Result<(), ManifestE
 pub fn validate_linux_package_manifest(
     manifest: &LinuxPackageManifest,
 ) -> Result<(), ManifestError> {
-    require_equal("schema", &manifest.schema, LINUX_PACKAGE_SCHEMA_V1)?;
-    require_non_placeholder("version", &manifest.version)?;
+    require_equal("schema", &manifest.schema, LINUX_PACKAGE_SCHEMA_V2)?;
+    validate_package_version(&manifest.version)?;
+    validate_package_build_identity(
+        &manifest.product_profile,
+        &manifest.build_type,
+        &manifest.codegen_profile,
+    )?;
+    validate_toolchain(&manifest.toolchain)?;
+    require_equal("toolchain.sdk", &manifest.toolchain.sdk, &manifest.sysroot)?;
+    validate_gles_package_graphics(&manifest.graphics)?;
+    validate_migo_package_provenance(&manifest.provenance, "scripts/build-linux-sdk.sh")?;
     require_equal("target", &manifest.target, "x86_64-unknown-linux-gnu")?;
     require_equal("os", &manifest.os, "linux")?;
     // "linux" is a kernel, not an ABI. Android and OpenHarmony are Linux
@@ -386,32 +421,81 @@ pub fn validate_linux_package_manifest(
         require_non_placeholder("dynamic_dependencies", dependency)?;
     }
 
+    validate_v8_component_manifest(&manifest.v8)?;
+    validate_package_v8_target(
+        &manifest.v8,
+        &manifest.target,
+        &manifest.os,
+        &manifest.abi,
+        &manifest.arch,
+        &manifest.cpu_baseline,
+        &manifest.required_cpu_features,
+    )?;
+    require_equal(
+        "v8.toolchain.sdk",
+        &manifest.v8.toolchain.sdk,
+        &manifest.sysroot,
+    )?;
+    require_equal(
+        "v8.target.runtime_floor.glibc",
+        manifest
+            .v8
+            .target
+            .runtime_floor
+            .get("glibc")
+            .map(String::as_str)
+            .unwrap_or(""),
+        &manifest.glibc_floor,
+    )?;
+    require_equal(
+        "v8.target.runtime_floor.glibcxx",
+        manifest
+            .v8
+            .target
+            .runtime_floor
+            .get("glibcxx")
+            .map(String::as_str)
+            .unwrap_or(""),
+        &manifest.glibcxx_floor,
+    )?;
+
     validate_linux_snapshots(manifest)?;
 
-    require_equal("v8.schema", &manifest.v8.schema, "migo-v8-component-v1")?;
-    // The mixing check. Everything else in this function describes the package;
-    // this one compares the package against what was built into it.
-    if manifest.v8.target != manifest.target {
-        return Err(ManifestError::new(format!(
-            "v8.target {} does not match package target {}: a V8 built for one \
-             OS/ABI/arch cannot be shipped in a package for another",
-            manifest.v8.target, manifest.target
-        )));
+    validate_package_artifacts(&manifest.artifacts)?;
+    if !manifest.artifacts.contains_key("lib/libmigo.a") {
+        return Err(ManifestError::new("artifacts must include lib/libmigo.a"));
     }
-    require_revision("v8.rusty_v8_revision", &manifest.v8.rusty_v8_revision)?;
-
-    if manifest.artifacts.is_empty() {
-        return Err(ManifestError::new("artifacts must not be empty"));
-    }
-    for (name, size) in &manifest.artifacts {
-        require_non_placeholder("artifacts", name)?;
-        if *size == 0 {
-            return Err(ManifestError::new(format!(
-                "artifacts.{name} has size 0, which cannot be a shipped binary"
-            )));
-        }
+    let versioned_shared_object = format!("lib/libmigo.so.{}", manifest.version);
+    if !manifest.artifacts.contains_key(&versioned_shared_object) {
+        return Err(ManifestError::new(
+            "artifacts must include lib/libmigo.so.<version> for the exact manifest version",
+        ));
     }
     Ok(())
+}
+
+/// Validate a Linux package manifest and bind every declared artifact identity
+/// to the regular file staged under `package_root`.
+pub fn verify_linux_package(
+    manifest: &LinuxPackageManifest,
+    package_root: &Path,
+) -> Result<(), ManifestError> {
+    validate_linux_package_manifest(manifest)?;
+    let manifest_path = "share/migo/linux-x86_64-manifest.json";
+    verify_packaged_manifest(package_root, manifest_path, manifest)?;
+    let expected_links = BTreeMap::from([
+        ("lib/libmigo.so".to_string(), "libmigo.so.1".to_string()),
+        (
+            "lib/libmigo.so.1".to_string(),
+            format!("libmigo.so.{}", manifest.version),
+        ),
+    ]);
+    verify_package_tree(
+        &manifest.artifacts,
+        package_root,
+        manifest_path,
+        &expected_links,
+    )
 }
 
 fn validate_linux_snapshots(manifest: &LinuxPackageManifest) -> Result<(), ManifestError> {
@@ -425,6 +509,8 @@ fn validate_linux_snapshots(manifest: &LinuxPackageManifest) -> Result<(), Manif
         &manifest.snapshot_policy,
         &manifest.target,
         &manifest.arch,
+        &manifest.product_profile,
+        &manifest.v8.hashes.archive,
     )
 }
 
@@ -438,6 +524,8 @@ fn validate_package_snapshots(
     snapshot_policy: &str,
     target_triple: &str,
     arch: &str,
+    product_profile: &str,
+    v8_archive_hash: &str,
 ) -> Result<(), ManifestError> {
     // Policy and content must agree. Stating the policy is what makes "ships no
     // snapshot" a decision rather than an omission, and cross-checking it is
@@ -477,6 +565,18 @@ fn validate_package_snapshots(
             target_triple,
         )?;
         require_equal("snapshot.arch", &snapshot.arch, arch)?;
+        require_equal(
+            "snapshot.product_profile",
+            &snapshot.product_profile,
+            product_profile,
+        )?;
+        require_equal("snapshot.schema", &snapshot.schema, "3")?;
+        require_non_placeholder("snapshot.generator", &snapshot.generator)?;
+        require_equal(
+            "snapshot.generation_cpu_policy",
+            &snapshot.generation_cpu_policy,
+            "target-baseline",
+        )?;
         require_sorted_unique(
             "snapshot.normalized_parameters",
             &snapshot.normalized_parameters,
@@ -486,7 +586,55 @@ fn validate_package_snapshots(
                 "snapshot.normalized_parameters must record the generation parameters",
             ));
         }
+        for parameter in &snapshot.normalized_parameters {
+            require_non_placeholder("snapshot.normalized_parameters", parameter)?;
+        }
+        for required in [
+            format!("--arch={arch}"),
+            "--cpu-policy=target-baseline".to_string(),
+            format!("--product-profile={product_profile}"),
+            format!("--runtime-kind={}", snapshot.runtime_kind),
+        ] {
+            if snapshot
+                .normalized_parameters
+                .binary_search_by(|value| value.as_bytes().cmp(required.as_bytes()))
+                .is_err()
+            {
+                return Err(ManifestError::new(format!(
+                    "snapshot.normalized_parameters is missing {required}"
+                )));
+            }
+        }
+        require_sha256(
+            "snapshot.external_references_hash",
+            &snapshot.external_references_hash,
+        )?;
+        require_sha256(
+            "snapshot.bootstrap_inputs_hash",
+            &snapshot.bootstrap_inputs_hash,
+        )?;
+        if snapshot.features.is_empty() {
+            return Err(ManifestError::new(
+                "snapshot.features must record the generated product surface",
+            ));
+        }
+        require_sorted_unique("snapshot.features", &snapshot.features)?;
+        require_sha256("snapshot.features_hash", &snapshot.features_hash)?;
+        require_sha256("snapshot.rust_sources_hash", &snapshot.rust_sources_hash)?;
+        require_sha256("snapshot.v8_archive_hash", &snapshot.v8_archive_hash)?;
+        require_equal(
+            "snapshot.v8_archive_hash",
+            &snapshot.v8_archive_hash,
+            v8_archive_hash,
+        )?;
+        if snapshot.bytes_size == 0 {
+            return Err(ManifestError::new(
+                "snapshot.bytes_size must be greater than zero",
+            ));
+        }
         require_sha256("snapshot.bytes_hash", &snapshot.bytes_hash)?;
+        require_sha256("snapshot.js_sources_hash", &snapshot.js_sources_hash)?;
+        require_non_placeholder("snapshot.deno_core_version", &snapshot.deno_core_version)?;
     }
     Ok(())
 }
@@ -500,8 +648,16 @@ fn validate_package_snapshots(
 pub fn validate_android_package_manifest(
     manifest: &AndroidPackageManifest,
 ) -> Result<(), ManifestError> {
-    require_equal("schema", &manifest.schema, ANDROID_PACKAGE_SCHEMA_V1)?;
-    require_non_placeholder("version", &manifest.version)?;
+    require_equal("schema", &manifest.schema, ANDROID_PACKAGE_SCHEMA_V2)?;
+    validate_package_version(&manifest.version)?;
+    validate_package_build_identity(
+        &manifest.product_profile,
+        &manifest.build_type,
+        &manifest.codegen_profile,
+    )?;
+    validate_toolchain(&manifest.toolchain)?;
+    validate_gles_package_graphics(&manifest.graphics)?;
+    validate_migo_package_provenance(&manifest.provenance, "scripts/build-android-sdk.sh")?;
     require_equal("os", &manifest.os, "android")?;
     // "android" is the userspace ABI, distinct from the Linux kernel it runs on
     // and from OpenHarmony. It is what a static library built here can be linked
@@ -563,6 +719,33 @@ pub fn validate_android_package_manifest(
         require_non_placeholder("link_libraries", library)?;
     }
 
+    validate_v8_component_manifest(&manifest.v8)?;
+    require_equal(
+        "v8.toolchain.sdk",
+        &manifest.v8.toolchain.sdk,
+        &manifest.toolchain.sdk,
+    )?;
+    validate_package_v8_target(
+        &manifest.v8,
+        &manifest.target_triple,
+        &manifest.os,
+        &manifest.abi,
+        &manifest.arch,
+        &manifest.cpu_baseline,
+        &manifest.required_cpu_features,
+    )?;
+    require_equal(
+        "v8.target.runtime_floor.android_api",
+        manifest
+            .v8
+            .target
+            .runtime_floor
+            .get("android_api")
+            .map(String::as_str)
+            .unwrap_or(""),
+        &manifest.min_android_api,
+    )?;
+
     // Android always embeds a snapshot; `none` is a Linux-only policy.
     require_equal("snapshot_policy", &manifest.snapshot_policy, "embedded")?;
     validate_package_snapshots(
@@ -570,30 +753,380 @@ pub fn validate_android_package_manifest(
         &manifest.snapshot_policy,
         &manifest.target_triple,
         &manifest.arch,
+        &manifest.product_profile,
+        &manifest.v8.hashes.archive,
     )?;
 
-    require_equal("v8.schema", &manifest.v8.schema, "migo-v8-component-v1")?;
-    if manifest.v8.target != manifest.target_triple {
-        return Err(ManifestError::new(format!(
-            "v8.target {} does not match package target {}: a V8 built for one \
-             OS/ABI/arch cannot be shipped in a package for another",
-            manifest.v8.target, manifest.target_triple
-        )));
+    validate_package_artifacts(&manifest.artifacts)?;
+    if !manifest.artifacts.contains_key("lib/libmigo_capi.a") {
+        return Err(ManifestError::new(
+            "artifacts must include lib/libmigo_capi.a",
+        ));
     }
-    require_revision("v8.rusty_v8_revision", &manifest.v8.rusty_v8_revision)?;
+    Ok(())
+}
 
-    if manifest.artifacts.is_empty() {
+/// Validate an Android C ABI package manifest and verify the staged static
+/// library bytes it identifies.
+pub fn verify_android_package(
+    manifest: &AndroidPackageManifest,
+    package_root: &Path,
+) -> Result<(), ManifestError> {
+    validate_android_package_manifest(manifest)?;
+    let manifest_path = format!("share/migo/android-{}-manifest.json", manifest.android_abi);
+    verify_packaged_manifest(package_root, &manifest_path, manifest)?;
+    verify_package_tree(
+        &manifest.artifacts,
+        package_root,
+        &manifest_path,
+        &BTreeMap::new(),
+    )
+}
+
+fn validate_package_artifacts(
+    artifacts: &BTreeMap<String, PackageArtifactIdentity>,
+) -> Result<(), ManifestError> {
+    if artifacts.is_empty() {
         return Err(ManifestError::new("artifacts must not be empty"));
     }
-    for (name, size) in &manifest.artifacts {
-        require_non_placeholder("artifacts", name)?;
-        if *size == 0 {
+    for (path, identity) in artifacts {
+        validate_package_path("artifacts path", path)?;
+        if identity.size_bytes == 0 {
             return Err(ManifestError::new(format!(
-                "artifacts.{name} has size 0, which cannot be a shipped binary"
+                "artifacts.{path}.size_bytes is 0, which cannot describe a shipped binary"
+            )));
+        }
+        require_sha256("artifacts.sha256", &identity.sha256)?;
+    }
+    Ok(())
+}
+
+fn validate_package_build_identity(
+    product_profile: &str,
+    build_type: &str,
+    codegen_profile: &str,
+) -> Result<(), ManifestError> {
+    require_one_of("product_profile", product_profile, &["full", "slim"])?;
+    // SDK artifacts are release inputs. Accepting a debug package under this
+    // schema would make the performance and hardening properties unknowable to
+    // consumers even if every ABI field matched.
+    require_equal("build_type", build_type, "release")?;
+    require_one_of("codegen_profile", codegen_profile, &["z", "2", "3"])
+}
+
+/// Validate the package version as SemVer without accepting path, shell, or
+/// generated-build-file syntax as part of a version-derived file name.
+///
+/// Keeping this parser local avoids adding a release-tool dependency solely
+/// for three numeric components and dot-separated identifiers. It implements
+/// the SemVer 2.0.0 grammar needed by Cargo package versions, including the
+/// leading-zero rule for core and numeric pre-release identifiers.
+fn validate_package_version(version: &str) -> Result<(), ManifestError> {
+    require_non_placeholder("version", version)?;
+    if version.len() > 128 || !version.is_ascii() {
+        return Err(ManifestError::new(
+            "version must be an ASCII SemVer no longer than 128 bytes",
+        ));
+    }
+
+    let (without_build, build) = split_once_unique(version, '+', "version build metadata")?;
+    if let Some(build) = build {
+        validate_semver_identifiers(build, true, "version build metadata")?;
+    }
+    let (core, prerelease) = match without_build.split_once('-') {
+        Some((core, prerelease)) if !core.is_empty() && !prerelease.is_empty() => {
+            (core, Some(prerelease))
+        }
+        Some(_) => {
+            return Err(ManifestError::new("version pre-release must not be empty"));
+        }
+        None => (without_build, None),
+    };
+    if let Some(prerelease) = prerelease {
+        validate_semver_identifiers(prerelease, false, "version pre-release")?;
+    }
+
+    let mut components = core.split('.');
+    for field in ["major", "minor", "patch"] {
+        let component = components
+            .next()
+            .ok_or_else(|| ManifestError::new("version must contain major.minor.patch"))?;
+        if component.is_empty()
+            || !component.bytes().all(|byte| byte.is_ascii_digit())
+            || (component.len() > 1 && component.starts_with('0'))
+        {
+            return Err(ManifestError::new(format!(
+                "version {field} must be a decimal integer without leading zeroes"
+            )));
+        }
+    }
+    if components.next().is_some() {
+        return Err(ManifestError::new(
+            "version must contain exactly major.minor.patch",
+        ));
+    }
+    Ok(())
+}
+
+fn split_once_unique<'a>(
+    value: &'a str,
+    separator: char,
+    field: &str,
+) -> Result<(&'a str, Option<&'a str>), ManifestError> {
+    let Some((head, tail)) = value.split_once(separator) else {
+        return Ok((value, None));
+    };
+    if head.is_empty() || tail.is_empty() || tail.contains(separator) {
+        return Err(ManifestError::new(format!(
+            "{field} must occur at most once and must not be empty"
+        )));
+    }
+    Ok((head, Some(tail)))
+}
+
+fn validate_semver_identifiers(
+    value: &str,
+    numeric_leading_zeroes_allowed: bool,
+    field: &str,
+) -> Result<(), ManifestError> {
+    for identifier in value.split('.') {
+        if identifier.is_empty()
+            || !identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(ManifestError::new(format!(
+                "{field} must contain non-empty ASCII alphanumeric/hyphen identifiers"
+            )));
+        }
+        if !numeric_leading_zeroes_allowed
+            && identifier.len() > 1
+            && identifier.bytes().all(|byte| byte.is_ascii_digit())
+            && identifier.starts_with('0')
+        {
+            return Err(ManifestError::new(format!(
+                "numeric {field} identifiers must not contain leading zeroes"
             )));
         }
     }
     Ok(())
+}
+
+fn validate_package_v8_target(
+    component: &V8ComponentManifest,
+    target_triple: &str,
+    os: &str,
+    abi: &str,
+    arch: &str,
+    cpu_baseline: &str,
+    required_cpu_features: &[String],
+) -> Result<(), ManifestError> {
+    let target = &component.target;
+    for (field, actual, expected) in [
+        ("v8.target.triple", target.triple.as_str(), target_triple),
+        ("v8.target.os", target.os.as_str(), os),
+        ("v8.target.abi", target.abi.as_str(), abi),
+        ("v8.target.arch", target.arch.as_str(), arch),
+        (
+            "v8.target.cpu_baseline",
+            target.cpu_baseline.as_str(),
+            cpu_baseline,
+        ),
+    ] {
+        if actual != expected {
+            return Err(ManifestError::new(format!(
+                "{field} {actual} does not match package target {expected}: a V8 built for one OS/ABI/arch/CPU baseline cannot be shipped for another"
+            )));
+        }
+    }
+    if target.required_cpu_features != required_cpu_features {
+        return Err(ManifestError::new(format!(
+            "v8.target.required_cpu_features {:?} do not match package features {:?}",
+            target.required_cpu_features, required_cpu_features
+        )));
+    }
+    Ok(())
+}
+
+fn verify_package_tree(
+    artifacts: &BTreeMap<String, PackageArtifactIdentity>,
+    package_root: &Path,
+    manifest_path: &str,
+    expected_symlinks: &BTreeMap<String, String>,
+) -> Result<(), ManifestError> {
+    let root_metadata = fs::symlink_metadata(package_root).map_err(|error| {
+        ManifestError::new(format!(
+            "read package root {}: {error}",
+            package_root.display()
+        ))
+    })?;
+    if !root_metadata.file_type().is_dir() {
+        return Err(ManifestError::new(format!(
+            "package root {} must be a directory, not a symlink or file",
+            package_root.display()
+        )));
+    }
+
+    for (relative_path, identity) in artifacts {
+        // Validation above guarantees a relative path made exclusively of
+        // normal components, so joining cannot escape package_root.
+        let path = package_root.join(relative_path);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            ManifestError::new(format!("read staged artifact {}: {error}", path.display()))
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(ManifestError::new(format!(
+                "staged artifact {} must be a regular file, not a symlink or directory",
+                path.display()
+            )));
+        }
+        if metadata.len() != identity.size_bytes {
+            return Err(ManifestError::new(format!(
+                "artifacts.{relative_path}.size_bytes mismatch (manifest={}, file={})",
+                identity.size_bytes,
+                metadata.len()
+            )));
+        }
+        let actual_sha256 = sha256_file(&path)?;
+        if actual_sha256 != identity.sha256 {
+            return Err(ManifestError::new(format!(
+                "artifacts.{relative_path}.sha256 mismatch (manifest={}, file={actual_sha256})",
+                identity.sha256
+            )));
+        }
+    }
+
+    let mut directories = vec![package_root.to_path_buf()];
+    let mut observed_symlinks = HashSet::new();
+    while let Some(directory) = directories.pop() {
+        let entries = fs::read_dir(&directory).map_err(|error| {
+            ManifestError::new(format!(
+                "read package directory {}: {error}",
+                directory.display()
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ManifestError::new(format!(
+                    "read package directory entry under {}: {error}",
+                    directory.display()
+                ))
+            })?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                ManifestError::new(format!("read package entry {}: {error}", path.display()))
+            })?;
+            let relative = package_relative_path(package_root, &path)?;
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file() {
+                if relative != manifest_path && !artifacts.contains_key(&relative) {
+                    return Err(ManifestError::new(format!(
+                        "package contains undeclared regular file: {relative}"
+                    )));
+                }
+            } else if file_type.is_symlink() {
+                let Some(expected_target) = expected_symlinks.get(&relative) else {
+                    return Err(ManifestError::new(format!(
+                        "package contains undeclared symlink: {relative}"
+                    )));
+                };
+                let target = fs::read_link(&path).map_err(|error| {
+                    ManifestError::new(format!("read package symlink {}: {error}", path.display()))
+                })?;
+                if target != Path::new(expected_target) {
+                    return Err(ManifestError::new(format!(
+                        "package symlink target mismatch for {relative} (expected={expected_target}, actual={})",
+                        target.display()
+                    )));
+                }
+                observed_symlinks.insert(relative);
+            } else {
+                return Err(ManifestError::new(format!(
+                    "package contains unsupported special file: {relative}"
+                )));
+            }
+        }
+    }
+
+    for path in expected_symlinks.keys() {
+        if !observed_symlinks.contains(path) {
+            return Err(ManifestError::new(format!(
+                "package is missing required symlink: {path}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_packaged_manifest<T>(
+    package_root: &Path,
+    relative_path: &str,
+    expected: &T,
+) -> Result<(), ManifestError>
+where
+    T: DeserializeOwned + PartialEq,
+{
+    let path = package_root.join(relative_path);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        ManifestError::new(format!(
+            "read packaged manifest {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(ManifestError::new(format!(
+            "packaged manifest {} must be a regular file",
+            path.display()
+        )));
+    }
+    let bytes = fs::read(&path).map_err(|error| {
+        ManifestError::new(format!(
+            "read packaged manifest {}: {error}",
+            path.display()
+        ))
+    })?;
+    let actual: T = serde_json::from_slice(&bytes).map_err(|error| {
+        ManifestError::new(format!(
+            "parse packaged manifest {}: {error}",
+            path.display()
+        ))
+    })?;
+    if &actual != expected {
+        return Err(ManifestError::new(format!(
+            "packaged manifest {} does not match the manifest being verified",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn package_relative_path(package_root: &Path, path: &Path) -> Result<String, ManifestError> {
+    let relative = path.strip_prefix(package_root).map_err(|error| {
+        ManifestError::new(format!(
+            "package entry {} is outside root {}: {error}",
+            path.display(),
+            package_root.display()
+        ))
+    })?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(ManifestError::new(format!(
+                "package entry has a non-normal path component: {}",
+                relative.display()
+            )));
+        };
+        let part = part.to_str().ok_or_else(|| {
+            ManifestError::new(format!(
+                "package entry path must be valid UTF-8: {}",
+                relative.display()
+            ))
+        })?;
+        parts.push(part);
+    }
+    Ok(parts.join("/"))
 }
 
 pub fn seal_v8_component_manifest(manifest: &mut V8ComponentManifest) -> Result<(), ManifestError> {
@@ -615,7 +1148,7 @@ pub fn validate_v8_component_manifest(manifest: &V8ComponentManifest) -> Result<
         &manifest.schema,
         V8_COMPONENT_SCHEMA_V1,
     )?;
-    validate_android_target(&manifest.target)?;
+    validate_v8_component_target(&manifest.target)?;
     validate_toolchain(&manifest.toolchain)?;
     validate_v8_runtime(&manifest.runtime)?;
     require_sha256("V8 component hashes.archive", &manifest.hashes.archive)?;
@@ -1093,11 +1626,60 @@ fn validate_android_target(target: &TargetIdentity) -> Result<(), ManifestError>
     Ok(())
 }
 
+fn validate_v8_component_target(target: &TargetIdentity) -> Result<(), ManifestError> {
+    match (target.os.as_str(), target.abi.as_str()) {
+        ("android", "android") => validate_android_target(target),
+        ("linux", "gnu") => validate_linux_v8_target(target),
+        (os, abi) => Err(ManifestError::new(format!(
+            "unsupported V8 component target OS/ABI: {os}/{abi}"
+        ))),
+    }
+}
+
+fn validate_linux_v8_target(target: &TargetIdentity) -> Result<(), ManifestError> {
+    require_equal("target.triple", &target.triple, "x86_64-unknown-linux-gnu")?;
+    require_equal("target.os", &target.os, "linux")?;
+    require_equal("target.abi", &target.abi, "gnu")?;
+    require_equal("target.arch", &target.arch, "x86_64")?;
+    require_equal("target.cpu_baseline", &target.cpu_baseline, "x86-64-v1")?;
+    require_sorted_unique(
+        "target.required_cpu_features",
+        &target.required_cpu_features,
+    )?;
+    if target.required_cpu_features != ["cmov", "sse2"] {
+        return Err(ManifestError::new(
+            "target.required_cpu_features for Linux x86_64 must be [\"cmov\", \"sse2\"]",
+        ));
+    }
+    if target.runtime_floor.len() != 2
+        || target.runtime_floor.get("glibc").map(String::as_str) != Some(LINUX_GLIBC_FLOOR)
+        || target.runtime_floor.get("glibcxx").map(String::as_str) != Some(LINUX_GLIBCXX_FLOOR)
+    {
+        return Err(ManifestError::new(format!(
+            "Linux V8 target.runtime_floor must be exactly glibc={LINUX_GLIBC_FLOOR}, glibcxx={LINUX_GLIBCXX_FLOOR}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_toolchain(toolchain: &ToolchainIdentity) -> Result<(), ManifestError> {
     require_non_placeholder("toolchain.rustc", &toolchain.rustc)?;
     require_non_placeholder("toolchain.compiler", &toolchain.compiler)?;
     require_non_placeholder("toolchain.sdk", &toolchain.sdk)?;
     require_non_placeholder("toolchain.linker", &toolchain.linker)
+}
+
+fn validate_gles_package_graphics(graphics: &GraphicsIdentity) -> Result<(), ManifestError> {
+    require_equal(
+        "graphics.backend_family",
+        &graphics.backend_family,
+        "gles-native",
+    )?;
+    require_equal(
+        "graphics.required_api",
+        &graphics.required_api,
+        "OpenGL ES 3.0",
+    )
 }
 
 fn validate_v8_runtime(runtime: &RuntimeIdentity) -> Result<(), ManifestError> {
@@ -1134,9 +1716,6 @@ fn validate_v8_runtime(runtime: &RuntimeIdentity) -> Result<(), ManifestError> {
                 "duplicate GN argument key: {key}"
             )));
         }
-    }
-    if runtime.patches.is_empty() {
-        return Err(ManifestError::new("runtime.patches must not be empty"));
     }
     let mut patch_ids = HashSet::new();
     for patch in &runtime.patches {
@@ -1268,6 +1847,32 @@ fn validate_provenance(provenance: &ProvenanceIdentity) -> Result<(), ManifestEr
         require_non_placeholder("provenance.licenses", license)?;
     }
     Ok(())
+}
+
+fn validate_migo_provenance(provenance: &ProvenanceIdentity) -> Result<(), ManifestError> {
+    validate_provenance(provenance)?;
+    if !provenance
+        .licenses
+        .iter()
+        .any(|license| license == "BSL-1.1")
+    {
+        return Err(ManifestError::new(
+            "Migo artifact provenance must record the repository's current BSL-1.1 license",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_migo_package_provenance(
+    provenance: &ProvenanceIdentity,
+    expected_recipe: &str,
+) -> Result<(), ManifestError> {
+    validate_migo_provenance(provenance)?;
+    require_equal(
+        "provenance.build_recipe",
+        &provenance.build_recipe,
+        expected_recipe,
+    )
 }
 
 fn require_option<'a>(field: &str, value: &'a Option<String>) -> Result<&'a str, ManifestError> {

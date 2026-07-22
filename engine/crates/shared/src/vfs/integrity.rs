@@ -249,12 +249,11 @@ impl IntegrityVerifier {
         self.verify_signature(&manifest_bytes, &sig_bytes)?;
 
         // 4. Parse manifest
-        let manifest: Manifest =
-            deno_core::serde_json::from_slice(&manifest_bytes).map_err(|e| {
-                EngineError::new(ErrorCode::CodeSignatureInvalid)
-                    .with_msg("parse manifest.json")
-                    .with_detail(e.to_string())
-            })?;
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
+            EngineError::new(ErrorCode::CodeSignatureInvalid)
+                .with_msg("parse manifest.json")
+                .with_detail(e.to_string())
+        })?;
 
         // 5. Validate schema version
         if manifest.version != 1 {
@@ -379,7 +378,7 @@ impl IntegrityVerifier {
                 return Ok(None);
             }
         };
-        let receipt: InstallReceipt = match deno_core::serde_json::from_slice(&receipt_bytes) {
+        let receipt: InstallReceipt = match serde_json::from_slice(&receipt_bytes) {
             Ok(receipt) => receipt,
             Err(error) => {
                 tracing::warn!(
@@ -566,12 +565,11 @@ impl IntegrityVerifier {
     ) -> EngineResult<Manifest> {
         #[cfg(test)]
         MANIFEST_PARSE_COUNT.with(|count| count.set(count.get() + 1));
-        let manifest: Manifest =
-            deno_core::serde_json::from_slice(&manifest_bytes).map_err(|e| {
-                EngineError::new(ErrorCode::CodeSignatureInvalid)
-                    .with_msg("parse manifest.json")
-                    .with_detail(e.to_string())
-            })?;
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
+            EngineError::new(ErrorCode::CodeSignatureInvalid)
+                .with_msg("parse manifest.json")
+                .with_detail(e.to_string())
+        })?;
         if manifest.version != 1 {
             return Err(EngineError::new(ErrorCode::CodeSignatureInvalid)
                 .with_msg("unsupported manifest version")
@@ -1011,7 +1009,7 @@ fn active_receipt_generation(receipt_path: &Path) -> u64 {
         "install receipt",
         ErrorCode::CodeIntegrityFailed,
     ) {
-        Ok(bytes) => deno_core::serde_json::from_slice::<InstallReceipt>(&bytes)
+        Ok(bytes) => serde_json::from_slice::<InstallReceipt>(&bytes)
             .ok()
             .filter(|receipt| receipt.schema == INSTALL_RECEIPT_SCHEMA)
             .map(|receipt| receipt.generation)
@@ -1033,7 +1031,7 @@ fn write_receipt_atomic(receipt_path: &Path, receipt: &InstallReceipt) -> Engine
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("install-receipt");
-    let bytes = deno_core::serde_json::to_vec(receipt).map_err(|error| {
+    let bytes = serde_json::to_vec(receipt).map_err(|error| {
         EngineError::new(ErrorCode::CodeIntegrityFailed)
             .with_msg("serialize install receipt")
             .with_detail(error.to_string())
@@ -1445,7 +1443,7 @@ mod tests {
             files,
         };
 
-        let manifest_json = deno_core::serde_json::to_vec_pretty(&manifest).unwrap();
+        let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap();
 
         // Sign and write
         let sig = sign_manifest(&signing_key, &manifest_json);
@@ -1586,12 +1584,12 @@ mod tests {
 
         // Tamper with manifest.json (change timestamp) without re-signing
         let manifest_path = dir.join("manifest.json");
-        let mut manifest_json: deno_core::serde_json::Value =
-            deno_core::serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        manifest_json["timestamp"] = deno_core::serde_json::json!(9999999);
+        let mut manifest_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest_json["timestamp"] = serde_json::json!(9999999);
         fs::write(
             &manifest_path,
-            deno_core::serde_json::to_vec_pretty(&manifest_json).unwrap(),
+            serde_json::to_vec_pretty(&manifest_json).unwrap(),
         )
         .unwrap();
 
@@ -1665,7 +1663,7 @@ mod tests {
         };
         fs::write(
             dir.join("manifest.json"),
-            deno_core::serde_json::to_vec_pretty(&manifest).unwrap(),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
         fs::write(dir.join("game.js"), "console.log('hello');").unwrap();
@@ -1755,7 +1753,7 @@ mod tests {
             timestamp: 1709078400,
             files,
         };
-        let manifest_json = deno_core::serde_json::to_vec_pretty(&manifest).unwrap();
+        let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap();
         let sig = sign_manifest(&signing_key, &manifest_json);
         fs::write(dir.join("manifest.json"), &manifest_json).unwrap();
         fs::write(dir.join("manifest.sig"), &sig).unwrap();
@@ -1789,7 +1787,7 @@ mod tests {
             timestamp: 1709078400,
             files,
         };
-        let manifest_json = deno_core::serde_json::to_vec_pretty(&manifest).unwrap();
+        let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap();
         let sig = sign_manifest(&signing_key, &manifest_json);
         fs::write(dir.join("manifest.json"), &manifest_json).unwrap();
         fs::write(dir.join("manifest.sig"), &sig).unwrap();
@@ -1873,7 +1871,7 @@ mod tests {
             timestamp: 1709078400,
             files,
         };
-        let manifest_json = deno_core::serde_json::to_vec_pretty(&manifest).unwrap();
+        let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap();
         let sig = sign_manifest(&signing_key, &manifest_json);
         fs::write(dir.join("manifest.json"), &manifest_json).unwrap();
         fs::write(dir.join("manifest.sig"), &sig).unwrap();
@@ -1904,7 +1902,7 @@ mod tests {
             timestamp: 1709078400,
             files,
         };
-        let manifest_json = deno_core::serde_json::to_vec_pretty(&manifest).unwrap();
+        let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap();
         fs::write(dir.join("manifest.json"), &manifest_json).unwrap();
         // Write a truncated signature
         fs::write(dir.join("manifest.sig"), &[0u8; 32]).unwrap();
@@ -1936,7 +1934,7 @@ mod tests {
             timestamp: 1709078400,
             files,
         };
-        let manifest_json = deno_core::serde_json::to_vec_pretty(&manifest).unwrap();
+        let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap();
         let sig = sign_manifest(&signing_key, &manifest_json);
         fs::write(dir.join("manifest.json"), &manifest_json).unwrap();
         fs::write(dir.join("manifest.sig"), &sig).unwrap();
@@ -1964,7 +1962,7 @@ mod tests {
             timestamp: 1709078400,
             files,
         };
-        let manifest_json = deno_core::serde_json::to_vec_pretty(&manifest).unwrap();
+        let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap();
         let sig = sign_manifest(&signing_key, &manifest_json);
         fs::write(dir.join("manifest.json"), &manifest_json).unwrap();
         fs::write(dir.join("manifest.sig"), &sig).unwrap();
@@ -2163,11 +2161,11 @@ mod tests {
         let (signing_key, pubkey) = setup_signed_package(&dir, "game.js", "trusted code");
         let manifest_path = dir.join("manifest.json");
         let mut manifest: Manifest =
-            deno_core::serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         manifest
             .files
             .insert("game.js".to_string(), "ABCDEF".repeat(10) + "ABCD");
-        let bytes = deno_core::serde_json::to_vec_pretty(&manifest).unwrap();
+        let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
         fs::write(&manifest_path, &bytes).unwrap();
         fs::write(
             dir.join("manifest.sig"),
@@ -2572,11 +2570,11 @@ mod tests {
             .verify_and_promote_for_launch(&dir, &receipt, "game.js")
             .unwrap();
         let original = fs::read(&receipt).unwrap();
-        let parsed: InstallReceipt = deno_core::serde_json::from_slice(&original).unwrap();
+        let parsed: InstallReceipt = serde_json::from_slice(&original).unwrap();
 
         let mut changed = parsed.clone();
         changed.pubkey_sha256 = "0".repeat(64);
-        fs::write(&receipt, deno_core::serde_json::to_vec(&changed).unwrap()).unwrap();
+        fs::write(&receipt, serde_json::to_vec(&changed).unwrap()).unwrap();
         assert!(
             verifier
                 .verify_launch_receipt(&dir, &receipt, "game.js")
@@ -2586,7 +2584,7 @@ mod tests {
 
         changed = parsed.clone();
         changed.entry = "other.js".to_string();
-        fs::write(&receipt, deno_core::serde_json::to_vec(&changed).unwrap()).unwrap();
+        fs::write(&receipt, serde_json::to_vec(&changed).unwrap()).unwrap();
         assert!(
             verifier
                 .verify_launch_receipt(&dir, &receipt, "game.js")
@@ -2596,7 +2594,7 @@ mod tests {
 
         changed = parsed;
         changed.root.ino = changed.root.ino.wrapping_add(1);
-        fs::write(&receipt, deno_core::serde_json::to_vec(&changed).unwrap()).unwrap();
+        fs::write(&receipt, serde_json::to_vec(&changed).unwrap()).unwrap();
         assert!(
             verifier
                 .verify_launch_receipt(&dir, &receipt, "game.js")
@@ -2640,9 +2638,9 @@ mod tests {
     fn resign_manifest_timestamp(dir: &Path, signing_key: &SigningKey, timestamp: u64) {
         let manifest_path = dir.join("manifest.json");
         let mut manifest: Manifest =
-            deno_core::serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         manifest.timestamp = timestamp;
-        let bytes = deno_core::serde_json::to_vec_pretty(&manifest).unwrap();
+        let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
         fs::write(&manifest_path, &bytes).unwrap();
         fs::write(dir.join("manifest.sig"), sign_manifest(signing_key, &bytes)).unwrap();
     }

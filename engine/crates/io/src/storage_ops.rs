@@ -37,7 +37,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Summary returned by [`storage_info`]. Wire format of the JS
-/// `getStorageInfoSync` is built in the js-runtime layer; this type
+/// `getStorageInfoSync` is built in the runtime-v8 layer; this type
 /// is the structured equivalent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageInfo {
@@ -182,7 +182,7 @@ pub fn storage_info(dir: &Path, quota_bytes: u64) -> Result<StorageInfo, EngineE
 // Scheduler-routed wrappers (host-thread entry points)
 // ---------------------------------------------------------------------------
 //
-// These match the shape of the pre-existing js-runtime integration
+// These match the shape of the pre-existing runtime-v8 integration
 // — the JS op calls `*_sync_with_scheduler` which dispatches through
 // the IoScheduler so budget/priority accounting keeps working.
 // Internally each closure calls the direct helpers above; the thin

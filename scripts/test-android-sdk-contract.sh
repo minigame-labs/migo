@@ -53,8 +53,8 @@ skip() { echo -e "\033[0;33mSKIP\033[0m  $*"; SKIPS=$((SKIPS + 1)); }
 # device with no provenance attached. verify-android-package rejects a mismatch.
 if [[ -f "$MANIFEST" ]]; then
     if OUT="$(cargo run --quiet --offline --manifest-path "$MANIFEST_TOOL/Cargo.toml" \
-            -- verify-android-package "$MANIFEST" 2>&1)"; then
-        pass "manifest is internally consistent ($OUT)"
+            -- verify-android-package "$MANIFEST" "$PREFIX" 2>&1)"; then
+        pass "manifest and staged artifact bytes are consistent ($OUT)"
     else
         fail "manifest failed validation: $OUT"
     fi
@@ -107,17 +107,17 @@ else
     skip "header compile (no NDK API-26 clang for $ARCH)"
 fi
 
-# --- 4. The embedded snapshot the manifest names is actually present -------
-# The manifest records the snapshot's bytes_hash; the build embeds that very
-# file. If they disagree the package ships a snapshot the manifest does not
-# describe.
+# --- 4. The manifest names the exact freshness-gated snapshot build input ---
+# build-android-sdk.sh refuses a stale/pointer snapshot before compiling, so
+# runtime-v8 cannot take its source-JS fallback in a package claiming embedded.
+# This post-build check binds the manifest back to those exact input bytes.
 if [[ -f "$MANIFEST" ]]; then
     SNAP="$REPO_ROOT/engine/crates/runtime-v8/snapshots/SNAPSHOT-full-$ARCH.bin"
     if [[ -f "$SNAP" ]]; then
         WANT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshots"][0]["bytes_hash"])' "$MANIFEST")"
         GOT="$(sha256sum "$SNAP" | cut -d" " -f1)"
         if [[ "$WANT" == "$GOT" ]]; then
-            pass "manifest snapshot bytes_hash matches the embedded snapshot"
+            pass "manifest snapshot bytes_hash matches the freshness-gated build input"
         else
             fail "manifest snapshot bytes_hash does not match SNAPSHOT-full-$ARCH.bin"
         fi

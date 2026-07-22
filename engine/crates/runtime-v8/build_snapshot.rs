@@ -169,7 +169,7 @@ pub fn collect_js_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     collect_files_with_extension(dir, "js")
 }
 
-/// Conservatively fingerprint every Rust source in `js-runtime` and
+/// Conservatively fingerprint every Rust source in `runtime-v8` and
 /// `snapshot-gen`, both crates' feature manifests, and the workspace lockfile.
 /// This covers op names/signatures/order, extension assembly, generator options,
 /// dependency resolution, and V8 configuration. A non-snapshot refactor may
@@ -179,7 +179,7 @@ pub fn collect_rust_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let crates_dir = dir.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "js-runtime directory has no crates parent",
+            "runtime-v8 directory has no crates parent",
         )
     })?;
     let engine_dir = crates_dir.parent().ok_or_else(|| {

@@ -4,8 +4,9 @@
 #include <migo/surface.h>
 
 /*
- * native_window is an ANativeWindow*. A future implementation acquires its
- * own strong reference before attach returns and releases it during detach.
+ * native_window is an ANativeWindow*. Migo acquires its own strong reference
+ * before attach returns success and releases that reference before the release
+ * observer reaches MIGO_SURFACE_RELEASE_RELEASED.
  */
 typedef struct MigoAndroidNativeWindowDescriptor {
     uint32_t struct_size;

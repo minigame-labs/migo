@@ -2,7 +2,7 @@
 //! command-kind-aware backpressure.
 //!
 //! Lives in `shared` so both `graphics` (render_thread) and
-//! `core`/`js-runtime` (producers) can reference the type without
+//! `core`/`runtime-v8` (producers) can reference the type without
 //! circular dependencies.
 //!
 //! ## Backpressure model

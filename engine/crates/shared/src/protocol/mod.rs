@@ -49,7 +49,7 @@ static MEASURE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(4);
 
 /// Classify a sync op for timeout selection.
 ///
-/// Declared `pub` so downstream crates (e.g. `js-runtime`)
+/// Declared `pub` so downstream crates (e.g. `runtime-v8`)
 /// can tag their own op names without threading through
 /// `shared::protocol` internals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

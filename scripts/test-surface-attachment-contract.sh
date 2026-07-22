@@ -73,13 +73,13 @@ if rg -n \
 fi
 # Choosing which EGL shared object to dlopen at runtime is a platform-provider
 # concern: it belongs in that platform's presenter and must never leak into
-# graphics/core/js-runtime, which stay backend-agnostic. Presenters are listed
+# graphics/core/runtime-v8, which stay backend-agnostic. Presenters are listed
 # one per platform on purpose — a new backend has to add itself here, and that
 # review is the point of the gate. Build scripts are exempt because they
 # configure link flags at compile time, not runtime implementation selection.
 if rg -n 'libEGL\.so' "$CRATES" \
     --glob '!**/platform/src/android/presenter.rs' \
-    --glob '!**/platform/src/desktop/presenter.rs' \
+    --glob '!**/platform/src/linux/presenter.rs' \
     --glob '!**/build.rs'; then
     fail "EGL implementation selection escaped the platform providers"
 fi

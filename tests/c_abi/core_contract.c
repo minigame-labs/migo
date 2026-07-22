@@ -110,18 +110,22 @@ _Static_assert(MIGO_SURFACE_RELEASE_RELEASED == UINT32_C(1), "released state val
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(MigoError) == 32, "LP64 error layout");
 _Static_assert(sizeof(MigoSurfaceDescriptor) == 72, "LP64 Surface layout");
-_Static_assert(sizeof(MigoHostCallbacks) == 96, "LP64 callback layout");
+_Static_assert(sizeof(MigoHostCallbacks) == 104, "LP64 callback layout");
+_Static_assert(offsetof(MigoHostCallbacks, on_surface_released) == 96,
+               "release wakeup must remain the append-only tail field");
 #elif UINTPTR_MAX == UINT32_MAX
 _Static_assert(sizeof(MigoError) == 28, "ILP32 error layout");
 _Static_assert(sizeof(MigoSurfaceDescriptor) ==
                    (_Alignof(uint64_t) == 8 ? 72 : 68),
                "ILP32 Surface layout follows the target uint64_t alignment");
-/* 8 bytes of header plus eleven pointers. This was wrong from the commit that
+/* 8 bytes of header plus twelve pointers. This was wrong from the commit that
  * appended on_request_frame until 2026-07-21: the LP64 line was updated and
  * this one was not, and the soft-keyboard callbacks were then added on top of
  * the wrong base. Nothing caught it because every lane ran on an LP64 host, so
  * this branch had never once been compiled. */
-_Static_assert(sizeof(MigoHostCallbacks) == 52, "ILP32 callback layout");
+_Static_assert(sizeof(MigoHostCallbacks) == 56, "ILP32 callback layout");
+_Static_assert(offsetof(MigoHostCallbacks, on_surface_released) == 52,
+               "ILP32 release wakeup tail offset");
 #else
 #error "unsupported pointer width"
 #endif
@@ -131,6 +135,7 @@ int migo_core_c_contract(void) {
     MigoSessionConfig session_config = {0};
     MigoSurfaceDescriptor surface = {0};
     MigoHostCallbacks callbacks = {0};
+    MigoOnSurfaceReleasedFn release_wakeup = callbacks.on_surface_released;
 
     engine_config.struct_size = (uint32_t)sizeof(engine_config);
     engine_config.abi_version = MIGO_ABI_VERSION_1;
@@ -172,6 +177,7 @@ int migo_core_c_contract(void) {
 
     return (int)(engine_config.struct_size + session_config.struct_size +
                  surface.struct_size + callbacks.struct_size +
+                 (release_wakeup != NULL) +
                  (attach_fn != NULL) + (update_fn != NULL) +
                  (begin_detach_fn != NULL) + (release_query_fn != NULL) +
                  (release_destroy_fn != NULL) +

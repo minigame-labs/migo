@@ -5,7 +5,9 @@ on:
     paths:
       - "include/migo/**"
       - "tests/c_abi/**"
+      - "engine/crates/capi-abi/**"
       - "scripts/test-c-abi-surface-candidate.sh"
+      - "scripts/test-c-abi-msvc-lane.ps1"
       - "docs/multiplatform-architecture.md"
       - "docs/superpowers/specs/2026-07-16-c-abi-surface-v1-candidate-design.md"
       - "docs/superpowers/plans/2026-07-16-c-abi-surface-v1-candidate.md"
@@ -18,7 +20,9 @@ on:
     paths:
       - "include/migo/**"
       - "tests/c_abi/**"
+      - "engine/crates/capi-abi/**"
       - "scripts/test-c-abi-surface-candidate.sh"
+      - "scripts/test-c-abi-msvc-lane.ps1"
       - "docs/multiplatform-architecture.md"
       - "docs/superpowers/specs/2026-07-16-c-abi-surface-v1-candidate-design.md"
       - "docs/superpowers/plans/2026-07-16-c-abi-surface-v1-candidate.md"
@@ -42,3 +46,25 @@ jobs:
         run: |
           bash scripts/test-c-abi-surface-candidate.sh
           CC=clang CXX=clang++ bash scripts/test-c-abi-surface-candidate.sh
+
+  msvc-contract:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Compile C ABI candidate for LLP64 and x86 ILP32 with MSVC
+        shell: pwsh
+        run: ./scripts/test-c-abi-msvc-lane.ps1 -RepoRoot $PWD.Path
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: i686-pc-windows-msvc
+
+      - name: Verify the dependency-free Rust ABI records on LLP64 and ILP32
+        working-directory: engine
+        run: |
+          cargo test -p migo-capi-abi --all-targets --locked
+          cargo test -p migo-capi-abi --all-targets --target i686-pc-windows-msvc --locked

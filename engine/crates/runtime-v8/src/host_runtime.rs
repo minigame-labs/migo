@@ -94,7 +94,7 @@ pub struct HostJsRuntime {
 impl HostJsRuntime {
     /// Create a fully initialized JS runtime + bindings cache.
     ///
-    /// - `host_state` will be consumed by js-runtime extensions
+    /// - `host_state` will be consumed by runtime-v8 extensions
     /// - `cache_dir` is where the V8 code cache persists compiled bytecode;
     ///   the module loader and code cache are assembled internally
     /// - `v8_limits` configures heap limits when `v8-limits` feature is enabled

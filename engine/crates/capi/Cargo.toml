@@ -3,11 +3,12 @@ name = "migo-capi"
 version = "0.1.0"
 edition = "2024"
 
-# `staticlib` so a C host can link the engine into an executable today: the
-# Linux V8 archive is built with executable-model TLS and cannot go into a
-# shared object (CLAUDE.md §10). `cdylib` — and the shared-TLS V8 rebuild it
-# needs — is deferred to the packaging slice. `rlib` keeps the boundary unit
-# testable from Rust.
+# `staticlib` is the controlled packaging input. The Linux SDK links it into
+# `libmigo.so` with the public version script and audits the final dynamic
+# symbol table; declaring a Rust `cdylib` here would add rustc's own export map
+# and previously widened the public surface. `rlib` keeps the boundary directly
+# testable from Rust. The verified Linux V8 component used for release is built
+# for shared-library linkage by `scripts/build-v8-linux.sh`.
 [lib]
 name = "migo_capi"
 crate-type = ["staticlib", "rlib"]

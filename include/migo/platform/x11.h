@@ -5,8 +5,8 @@
 
 /*
  * display is a host-owned Display* and window is its X11 Window/XID. Migo
- * never closes the display or destroys the window. Both remain valid until
- * synchronous detach returns.
+ * never closes the display or destroys the window. Both remain valid until the
+ * release observer reaches MIGO_SURFACE_RELEASE_RELEASED.
  */
 typedef struct MigoX11WindowDescriptor {
     uint32_t struct_size;

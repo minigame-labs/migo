@@ -188,9 +188,8 @@ fn invalidate_hot_ingress(host_id: jint) {
 ///
 /// The exported `JNI_OnLoad` symbol itself lives in the `android-jni` cdylib
 /// crate, which exists only to be `libmigo.so`. Keeping the logic here — and
-/// the one exported symbol there — is what lets `platform` stay an rlib, so
-/// host targets can build and test it (a cdylib cannot link the
-/// executable-TLS Linux V8; see CLAUDE.md §10).
+/// the one exported symbol there — is what lets `platform` stay a reusable
+/// rlib while every target owns a separate, audited delivery boundary.
 pub fn on_load(vm: JavaVM) -> jint {
     // Initialize logging/tracing once.
     logging::init_logging();

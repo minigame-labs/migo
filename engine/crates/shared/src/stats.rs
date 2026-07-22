@@ -430,7 +430,7 @@ impl DebugStats {
 // Process-global WebGL error-queue overflow counter
 // ---------------------------------------------------------------------------
 //
-// Lives here rather than `js-runtime` so `DebugStats::snapshot()`
+// Lives here rather than `runtime-v8` so `DebugStats::snapshot()`
 // can pull the current value without taking a cross-crate
 // dependency.  The producer (WebGL error state) calls
 // `bump_webgl_error_overflow()` every time the per-context queue
@@ -798,7 +798,7 @@ mod tests {
     #[test]
     fn io_metrics_global_is_a_process_singleton() {
         // Two calls must return the same object so increments from
-        // different crates (io, js-runtime, graphics) accumulate
+        // different crates (io, runtime-v8, graphics) accumulate
         // into one view.
         let a = io_metrics_global() as *const IoMetrics;
         let b = io_metrics_global() as *const IoMetrics;

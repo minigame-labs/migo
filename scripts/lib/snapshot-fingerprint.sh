@@ -4,7 +4,7 @@
 # compute identical values.
 #
 # The fingerprint captures the inputs that make a snapshot valid/stale:
-#   * js_sources_sha256  — every extension *.js on disk under js-runtime. A
+#   * js_sources_sha256  — every extension *.js on disk under runtime-v8. A
 #       snapshot bakes the post-execution heap of these, and with a snapshot the
 #       extension JS is NOT re-loaded from source at runtime, so changing JS
 #       without regenerating silently runs the OLD code.
@@ -13,7 +13,7 @@
 #
 # Schema v3 also binds the runtime kind (host versus Worker), fingerprints the
 # named product feature set, every Rust source
-# in js-runtime + snapshot-gen, both feature manifests, and Cargo.lock,
+# in runtime-v8 + snapshot-gen, both feature manifests, and Cargo.lock,
 # conservatively covering op signatures/order, generator options, dependencies,
 # and V8 flags.
 
@@ -121,7 +121,7 @@ snapshot_require_materialized_snapshot() {
   snapshot_require_materialized_artifact "$1" "snapshot"
 }
 
-# sha256 of every extension *.js on disk under js-runtime.
+# sha256 of every extension *.js on disk under runtime-v8.
 #
 # This MUST stay byte-identical to the Rust helper
 # engine/crates/runtime-v8/build_snapshot.rs (shared by build.rs and its

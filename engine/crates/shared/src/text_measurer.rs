@@ -16,7 +16,7 @@
 //!   * `graphics` provides the concrete implementation (registered
 //!     at render-thread startup) and hides the Skia types behind
 //!     the trait.
-//!   * `js-runtime` holds an `Arc<dyn TextMeasurer>` on
+//!   * `runtime-v8` holds an `Arc<dyn TextMeasurer>` on
 //!     `CanvasOpState` and skips the RenderCommand round-trip for
 //!     every `op_measure_text*` call, falling back to the
 //!     existing sync-op path only when the handle is missing

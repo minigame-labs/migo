@@ -139,7 +139,7 @@ impl ImageStore {
     /// Delegates to the process-global counter in
     /// `shared::image_id` so the JS thread can allocate ids without
     /// a render-thread round-trip — see `op_create_image` in
-    /// `js-runtime/rendering/image/mod.rs` for the JS-side caller.
+    /// `runtime-v8/src/rendering/image/mod.rs` for the JS-side caller.
     pub fn generate_id(&self) -> u32 {
         shared::image_id::next_image_id()
     }

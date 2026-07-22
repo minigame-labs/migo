@@ -18,11 +18,11 @@ hex = "0.4.3"
 digest = "0.10"
 md-5 = "0.10"
 sha1 = "0.10"
-tokio  = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
 bytemuck.workspace = true
 encoding_rs = { version = "0.8.35", optional = true }
-deno_core.workspace=true
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
 tracing = { workspace = true }
@@ -34,5 +34,11 @@ bitflags = "2"
 lru = { workspace = true }
 smallvec = { workspace = true }
 
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+tokio = { workspace = true, features = ["net"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt"] }

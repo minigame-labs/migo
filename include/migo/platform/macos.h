@@ -3,7 +3,11 @@
 
 #include <migo/surface.h>
 
-/* ns_view is an NSView*. Migo retains it for the attachment lifetime. */
+/*
+ * ns_view is an NSView*. A future implementation retains it before attach
+ * returns success and releases it before the release observer reaches
+ * MIGO_SURFACE_RELEASE_RELEASED.
+ */
 typedef struct MigoMacosNsViewDescriptor {
     uint32_t struct_size;
     uint32_t abi_version;
@@ -14,7 +18,8 @@ typedef struct MigoMacosNsViewDescriptor {
 
 /*
  * ca_metal_layer is a CAMetalLayer*. Keeping this separate from NSView avoids
- * a tagless pointer and permits a compositor-owned layer integration.
+ * a tagless pointer and permits a compositor-owned layer integration. A future
+ * implementation retains it through asynchronous Surface retirement.
  */
 typedef struct MigoMacosMetalLayerDescriptor {
     uint32_t struct_size;

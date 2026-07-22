@@ -5,12 +5,10 @@
 //! `platform::android::jni::registration`), so this crate stays a one-function
 //! shim over the real implementation in `platform`.
 //!
-//! It is a separate crate purely to keep the cdylib boundary out of
-//! `platform`: a crate that is `cdylib` is built as one for every target, and
-//! on a glibc host the Linux V8 archive cannot be linked into a shared object
-//! (`R_X86_64_TPOFF32 ... cannot be used with -shared`). With `platform` an
-//! rlib, host builds and `cargo test -p platform` work, and the Linux player
-//! links it directly instead of the build script rewriting its crate-type.
+//! It is a separate crate to keep Android's `cdylib` boundary out of
+//! `platform`. With `platform` an rlib, each target chooses its own delivery
+//! artifact, host builds can test the implementation directly, and the Linux
+//! player links the same policy without inheriting a JNI library shape.
 
 #![allow(non_snake_case)]
 

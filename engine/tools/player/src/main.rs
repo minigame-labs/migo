@@ -19,8 +19,8 @@ mod x11_window;
 use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
 use migo_core::{PlatformServices, send_command_to_host, shutdown_host, spawn_host_thread};
-use platform::desktop::platform::DesktopPlatform;
-use platform::desktop::presenter::{
+use platform::linux::platform::LinuxPlatform;
+use platform::linux::presenter::{
     LinuxOffscreenSurface, LinuxX11Surface, linux_graphics_platform, linux_x11_graphics_platform,
 };
 use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceRef};
@@ -128,7 +128,7 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
             (surface, platform)
         }
     };
-    let host_kit: Arc<dyn PlatformServices> = Arc::new(DesktopPlatform::new());
+    let host_kit: Arc<dyn PlatformServices> = Arc::new(LinuxPlatform::new());
 
     let mode = if windowed { "x11 window" } else { "offscreen" };
     tracing::info!("spawning host thread ({SURFACE_W}x{SURFACE_H} {mode})");

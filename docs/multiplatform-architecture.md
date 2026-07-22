@@ -1,1293 +1,754 @@
 # Migo 多平台架构设计
 
-> 状态：架构提案；Android Artifact Manifest v1 经 Claude 二轮独立复审，结论 `Ready to merge: Yes`（2026-07-16）<br>
-> 当前正式支持：Android API 26+  
-> 规划目标：OpenHarmony/HarmonyOS、Linux、Windows、macOS、iOS  
-> 核心原则：平台最佳方案优先；只统一不会损害性能、能力与原生集成体验的部分。
+> 状态：规范性设计与当前实现基线
+>
+> 校订日期：2026-07-22
+>
+> 适用范围：Migo engine、平台 Host Kit、公开 C ABI、构建与发布工件
+>
+> 决策原则：正确性与平台约束优先；在这些约束内以端到端性能为第一优化目标
+
+本文不是“把 Android 实现套到所有平台”的移植清单，也不是未来能力宣传页。它同时回答三个问题：
+
+1. 每个平台的最佳宿主、窗口、帧调度、图形与 JavaScript runtime 方案是什么；
+2. 当前仓库已经实现了什么、还缺什么；
+3. 怎样改造仓库而不为了表面统一牺牲正确性、性能或平台生态集成。
+
+文中的状态只有三种：
+
+- **已实现**：当前仓库存在实现和自动化契约；仍可能是未冻结的 candidate API。
+- **候选**：有可复现实验或编译验证，但未完成生产链路。
+- **目标**：设计方向，不能据此宣称平台支持。
 
 ## 0. 结论
 
-Migo 不采用“一个 JS 引擎、一个窗口库、一个 GPU API 强行跑遍所有平台”的方案，也不为表面上的统一牺牲单个平台的最佳路径。
+1. **Migo SDK 不拥有顶层窗口。** App 或 UI toolkit 拥有窗口、View 树、事件循环和系统生命周期；Migo 接收宿主提供的原生 Surface，并在其内部运行内容。独立播放器是单独的工具，不是 SDK 的窗口依赖。
+2. **统一语义和边界，不统一平台实现。** Session、Surface 生命周期、输入、错误、artifact identity 和 JS API 行为统一；Presenter、frame clock、graphics backend、audio、IME、权限和打包方式按平台实现。
+3. **热路径不经过通用跨平台抽象税。** 平台/backend 在创建或 attach 时选择并固定；draw、command decode、resource lookup、submit 和 present 不做每帧服务发现、序列化、堆分配或通用 actor 跳转。
+4. **Android 最低 API 固定为 26。** 更高 API 的能力通过运行时探测启用，不能反向抬高基础 artifact 的最低版本。
+5. **Linux GNU 首个合同是 x86_64、glibc 2.31、GLIBCXX 3.4.28、x86-64-v1。** 这是构建 sysroot 和符号审计共同保证的发布合同，不是开发机版本。
+6. **Windows 首个目标是 Windows 10 1809/build 17763、x86_64、ANGLE D3D11。** 当前只有 ABI/MSVC 和部分 crate 编译 spike，尚无生产 presenter、真实 runtime/package 或真机出帧，因此不能标为已支持。
+7. **macOS 使用 Metal family；iOS App Store 默认使用 WKWebView。** macOS 可用 ANGLE Metal 承接 WebGL/GLES 语义，但最终 Canvas2D/WebGL 是否共享 ANGLE 或使用原生 Skia Metal，必须由零拷贝互操作和整帧 benchmark 决定。iOS 不把 V8 方案伪装成通用 App Store backend。
+8. **OpenHarmony 使用 XComponent/NativeWindow 与 EGL/GLES。** 系统 JSVM 从 API 11 起可作为独立实验 backend；它只有在 JS conformance、snapshot/启动、调试和性能全部达标后才可替代嵌入式 V8。
+9. **每个 native-V8 slice 都要单独构建 V8。** OS、arch、ABI、工具链、链接模型、CPU baseline 或 GN 参数任一不同，就是不同 component；其 snapshot 也不得复用。
+10. **每个平台的每个交付 artifact 必须自描述。** manifest 必须包含 arch、最低 OS/API 或 glibc floor、CPU baseline、runtime/V8 revision、snapshot policy 与参数、工具链、输入和交付文件哈希。
+11. **最低版本测试只负责兼容性，最新系统测试只负责性能。** 两条 lane 必须运行同一 package hash，并分别出报告，不能用新系统 benchmark 证明旧系统可用，也不能用旧设备性能抬高支持下限。
+12. **当前 repo 不需要 Actix。** 它不解决 runtime/render 的核心问题，并会给消息热路径带来不必要的调度、分配和生命周期复杂度。新依赖只能由明确的平台能力、可测收益和维护合同驱动。
+13. **Desktop Host Kit 默认按源码构建。** toolkit adapter 与 App 使用同一 Qt/GTK/编译器 ABI 构建；正式分发预编译 Host Kit 时，它才成为必须写入 arch、OS/glibc、CPU 与依赖版本身份的独立 native artifact。
 
-本文的决策顺序是：**硬约束先界定可行集合，性能再决定集合内的默认方案。** 正确性、安全、平台分发规则、宿主所有权和 Android API 26 等约束不可突破；满足这些约束后，端到端性能优先于统一性、代码复用率、实现方便或依赖数量。
+## 1. 硬约束与决策顺序
 
-目标架构是：
+### 1.1 不可交换的约束
 
-- **共享契约核心**：统一小游戏/HTML5 API 语义、生命周期、能力模型、错误模型、资源协议、测试和基准。
-- **平台原生宿主**：顶层窗口、消息循环、View 生命周期、权限和系统服务由宿主 App 与平台 Host Kit 管理。
-- **多后端家族**：JS、图形、帧调度和音频输出按平台编译选择；每 primitive/draw/texture 等高频数据路径不经过通用动态分发。
-- **SDK 不拥有顶层窗口**：SDK 提供可嵌入 View/Control 和底层 Surface API；独立窗口只存在于可选 Player。
-- **一个实现 monorepo**：契约、核心、平台适配和 conformance 同仓演进，允许一次 PR 原子更新契约与全部后端；黑盒 benchmark harness 可以保留为独立公开 consumer repo。
+- 不允许 native window、GPU resource、callback user data 或 Session 发生 use-after-free。
+- 不允许平台线程规则被跨平台封装隐藏；UI/main thread 要求必须保留。
+- 不允许因异常、dispatcher 拒绝或 teardown race 破坏后续事件投递。
+- 不允许 snapshot 与 V8 archive、external reference、feature set 或 JS/Rust bootstrap 输入不匹配。
+- 不允许 artifact manifest 只描述“应该交付什么”而不校验 staging tree 中的真实字节。
+- 不允许为兼容一个平台而让其他平台走低性能 fallback。
+- 不允许把编译通过、header 中存在 descriptor 或一次 spike 等同于 production support。
 
-这不是“最低公分母”架构。Windows 以 ANGLE→D3D11、macOS 以 ANGLE→Metal 作为首个原生基线，是因为它们适合 WebGL/GLES 语义；Android、Linux 和 OpenHarmony/HarmonyOS 可以继续以原生 EGL/GLES 起步；iOS 则允许 WebKit 拥有自己的 JS 与渲染管线。它们只有通过各自端到端性能门后才成为 supported 默认，不是靠本文措辞永久锁定。
+### 1.2 决策优先级
 
-## 1. 范围、术语与硬约束
+遇到冲突时按以下顺序裁决：
 
-### 1.1 范围
+1. 内存安全、数据完整性、内容安全和平台政策；
+2. native resource 生命周期、线程模型和 ABI 正确性；
+3. 端到端 latency、稳定 frame time、内存、功耗与包体；
+4. 可诊断性、可复现构建和长期维护成本；
+5. 源码复用率与 API 外观一致性。
 
-本文定义：
+“统一代码更多”不是独立目标。只有不改变上述排序时才复用实现。
 
-- 各目标平台的 JS、graphics、window/surface、frame pacing、audio 方案；
-- 第三方 App 如何嵌入 Migo；
-- 当前仓库需要怎样拆分、适配和升级；
-- 平台能力、兼容性和性能如何验收；
-- 开放开发项目在构建、依赖、治理和发布方面的架构要求。
+### 1.3 性能定义
 
-本文不定义账号、商店、CDN、支付结算、内容运营等平台业务。
+性能不是单一平均 FPS。每个平台至少同时观察：
 
-### 1.2 术语
+- cold/warm start 的 p50、p95；
+- frame time p50、p95、p99、jank 和 missed-vsync；
+- input-to-photon latency；
+- steady-state RSS、GPU memory、峰值内存；
+- image decode/upload、shader/program warm-up；
+- Surface 重建、前后台切换和 device/context loss 恢复时间；
+- 持续负载下的功耗、温升和降频；
+- artifact 下载体积、安装体积与符号/调试包体积。
 
-- **Engine**：进程级运行时，拥有共享配置、缓存、工作线程和能力注册。
-- **Session**：一个小游戏实例，拥有独立 JS realm、生命周期、资源和错误域。
-- **SurfaceAttachment**：Session 与一个宿主绘制目标的临时绑定；由 generation 标识。
-- **Host Kit**：平台原生的嵌入层，例如 Android View、Windows Control、macOS NSView。
-- **Player**：Migo 自己创建顶层窗口的开发工具，不是嵌入式 SDK 的组成部分。
-- **Backend family**：一组端到端兼容的 JS/graphics/presenter 实现，不代表所有平台使用同一底层 API。
+优化必须比较完整链路。局部 microbenchmark 更快但引入跨 GPU device copy、额外合成层或更差 p99，不能成为默认方案。
 
-### 1.3 硬约束
+## 2. 当前仓库事实
 
-1. Android 最低版本固定为 **API 26**；Gradle `minSdk` 与 NDK target 必须保持为 26。
-2. Android API 27+ 的能力必须经过版本、扩展或动态符号检测，API 26 设备不得因未保护的调用而失败。
-3. 宿主 App 始终拥有顶层窗口、UI 线程和事件循环；Migo 不劫持它们。
-4. 不允许为了跨平台抽象增加稳定存在的 CPU readback、额外纹理复制或多一层合成。
-5. 每个平台先建立原生基线，再用相同硬件、内容、构建和热状态比较候选方案；没有数据时不宣称更快。
-6. 新平台通过 conformance 和性能门禁之前，只能标为 experimental，不得写入“正式支持”列表。
-7. JS 可观察语义、内存/线程安全、隐私、平台审核/签名规则和稳定 ABI 不得用性能理由绕过；不满足者不进入候选集合。
+### 2.1 支持状态
 
-### 1.4 决策优先级：约束内性能第一
-
-对 JS runtime、GPU backend、window/surface、frame pacing、audio、I/O、打包和抽象边界的任何选择，统一使用以下顺序：
-
-1. **先过硬约束**：correctness/conformance、安全与隐私、平台政策、API 26、宿主生命周期/线程、ABI 和“无隐式 CPU copy/readback”。
-2. **再比端到端性能**：真实游戏的 cold/warm start、frame time p95/p99、input-to-present、CPU/GPU time、RSS/peak memory、功耗、温升与降频、包体和更新成本。
-3. **按平台和 workload profile 选择**：没有一个候选在全部指标占优时，公开权重、原始数据和取舍；可以让不同设备族使用不同已验证默认值。
-4. **统一性只作次级因素**：性能相当且约束都满足时，再比较复用、维护、构建和社区贡献成本；若平台专用实现有可重复的实质收益，就保留平台专用实现。
-5. **微基准不能单独定案**：JS 引擎分数、单个 draw call 或理论 API 新旧都不能替代包含 JS→render→present/audio/I/O 的完整链路。
-
-这里的“性能优先”包含持续性能与资源效率，不等于只追求瞬时平均 FPS。会造成热降频、内存压力、启动恶化或包体不可接受的方案，必须把这些代价放在同一份平台决策记录中。
-
-### 1.5 版本合同：运行下限、兼容基线与性能层分离
-
-每个 support profile 必须同时定义三个不同概念，不能用一个“最低版本”替代全部含义：
-
-- **runtime/ABI floor**：工件可以被加载并正确运行的最低 OS、API、libc/CRT、架构与 CPU 指令集；这是发布合同，写入工件 manifest。
-- **minimum compatibility baseline**：CI、模拟器/虚拟机或真机必须持续覆盖的最低受支持环境；它验证加载、ABI、生命周期和功能正确性，不承担性能选型。
-- **optimized tier**：较新系统、驱动或硬件上可一次性选择的原生快路径；它在初始化或 attach 冷路径完成 capability/availability 检测，不能把版本判断散落到每个 draw、command decode、texture lookup 等热路径。
-
-所有平台使用最新稳定 SDK/工具链编译，同时显式设置较低的 deployment/runtime floor。高版本 API 必须使用 availability、扩展、动态符号或 capability guard；若启用更高 CPU 指令集的静态编译，则必须发布不同 artifact identity，禁止用 `target-cpu=native` 生成无法说明基线的通用发布物。
-
-首批平衡基线如下。这里列的是各平台独立得出的要求，不是为了统一数字而人为抬高或降低门槛：
-
-| support profile | runtime/ABI floor | minimum compatibility baseline | optimized tier / 说明 |
+| 平台 | 当前状态 | 已有能力 | 尚不能宣称的能力 |
 |---|---|---|---|
-| Android V8 | API 26；`minSdk` 与 NDK platform 26 | API 26 emulator，并在可获得设备上补充 API 26 真机 | 高版本 frame-rate、AHardwareBuffer/driver 能力逐项检测 |
-| Windows V8/ANGLE | Windows 10 1809，build 17763；MSVC ABI | 1809 VM/设备完成 DLL load、Win32 Presenter、V8/snapshot 与音频测试 | Windows 11 能力可独立启用，不抬高基础 D3D11/ANGLE 门槛 |
-| macOS V8/ANGLE | macOS 13.0；`x86_64`、`arm64` 分工件 | macOS 13，两个架构在进入 supported 前都完成 artifact 与运行测试 | macOS 14+ 优先使用 `NSView.displayLink`；13 使用验证过的 fallback |
-| iOS/iPadOS WebKit | iOS/iPadOS 15.0；`arm64` device | iOS 15 真机为必需基线，simulator 在对应 runtime 可用时补充 Host Kit/bridge 测试 | 最新 WebKit/系统能力按 capability 使用，不自带 V8 |
-| OpenHarmony bundled V8 | API 10；实际 OHOS SDK target/ABI 单独固定 | API 10 设备验证 NativeWindow、NativeVSync、OHAudio 与 V8 工件 | API 14+ DVSync 是增强能力，不改变基础门槛 |
-| OpenHarmony system JSVM | API 12 | API 12 设备验证 JSVM 语义、线程与 native bridge | API 14+ DVSync；JSVM 版本继续写入 manifest |
-| Linux GNU V8 | 首发 `x86_64`，承诺后再加独立 `aarch64`；glibc 2.31；EGL/GLES 3.0 能力合同 | Debian 11 级 sysroot/用户态与 kernel 5.10 测试基线 | kernel 不是动态库 loader ABI；更新内核、Mesa/厂商驱动用于性能门 |
+| Android | 已实现，公开 ABI 仍是 candidate | API 26；JNI AAR；C ABI static SDK+CMake；`ANativeWindow`/EGL/GLES presenter；输入、IME、gamepad；arm64 snapshot 与 x86_64 emulator 生成链路 | 重建并提交各 ABI 的 v2 V8 component manifest；补齐 x86_64 full/slim snapshot；所有 ABI 的 release package 与最低/最新真机双门；全量多指真机验证 |
+| Linux GNU | 已实现，公开 ABI 仍是 candidate | x86_64；X11/Wayland host-owned Surface；EGL/GLES；`libmigo.so`/`.a`；pkg-config/CMake；外部 C consumer；toolkit-neutral `SurfaceHost` 与 Qt 6 Widgets/X11 Bound surface view | 用新 v2 component manifest 重建并发布的正式 artifact；发行版/驱动矩阵与性能门；Qt 输入/IME/frame clock/Managed wrapper；Qt Wayland/Quick |
+| Windows | 候选 spike | C/C++ header 的 MSVC x64/x86 ABI lane；五个被探测 crate 的 MSVC `cargo check`；`EglProvider` 可承载 ANGLE | 完整 workspace；真实 V8 链接/启动；HWND/SwapChainPanel presenter；ANGLE 出帧；输入/音频/完整性；DLL/NuGet；真机 |
+| macOS | 目标 | 公开 typed descriptor 设计 | runtime、Metal presenter、V8 component、Host Kit、package、CI |
+| iOS | 目标 | 明确采用 WebKit Host Kit 的产品边界 | WKWebView backend、bridge、conformance、package、CI |
+| OpenHarmony | 目标 | 公开 typed descriptor 设计与官方 NativeWindow/JSVM 可行性依据 | XComponent presenter、runtime 决策、HAR/HAP 集成、component、真机 CI |
 
-Linux 不用 Ubuntu/Fedora 等发行版营销版本作为 ABI。官方 `linux-gnu` 工件以 glibc、CPU baseline、动态依赖和 EGL/GLES capability 定义合同；musl、RISC-V 或更高 CPU baseline 都是独立 profile。商业 HarmonyOS 也必须使用自己的 SDK/API/签名 profile，不能继承 OpenHarmony 的 API 数字。
+如果表格和代码冲突，以可执行 contract 和 package verifier 为准，并立即修正文档。
 
-任何 runtime/ABI floor 的提高都属于 support contract 变更：必须先进入 deprecated 状态、给出迁移窗口，并在新的 artifact manifest schema/profile 中显式发布，不能由一次依赖升级静默改变。
+### 2.2 目录结构
 
-## 2. 现状审计
-
-### 2.1 可直接保留的基础
-
-当前 Android 已具备正确的 SDK 形态：
-
-- `MigoRuntime` 是进程级入口；
-- `GameSession` 是单游戏实例；
-- `MigoGameView` 已经是推荐的可嵌入组件，内部使用 `SurfaceView`；
-- `MigoGameActivity` 是便利型全屏宿主；
-- Surface 生命周期已使用 generation-tagged、queue-independent 的内部状态机；
-- core、graphics、audio、I/O 和 platform 已分 crate；
-- V8 snapshot 已有身份与新鲜度校验基础。
-
-因此，多平台改造不应重新发明“嵌入式 View”或推翻 Android 公共 API。重点是把 Android 专用实现从共享边界中移出，同时保持 Android 行为和性能不回退。
-
-### 2.2 已隔离与仍待实现的平台部分
-
-| 位置 | 当前事实 | 需要改造 |
-|---|---|---|
-| `engine/crates/shared/surface` | generation gate/lease 负责资源存活；共享 trait 只暴露 size 与 attach 冷路径的类型视图，已不暴露 RWH/平台句柄 | 正式 C ABI runtime 落地后，由强类型 `SurfaceDescriptor` adapter 构造具体平台 Surface；不把 Rust trait object 暴露到 ABI |
-| graphics↔platform boundary | 已有匹配校验的 `GraphicsPlatform`、`EglProvider`、`EglSurfaceFactory` 与 immutable prepared target；graphics 不再匹配 `AndroidNdk` 或保存裸 window integer | 为 Linux X11/Wayland、Windows/macOS ANGLE、OpenHarmony 分别实现 provider/factory，不在 common graphics 添加平台分支 |
-| graphics render/upload thread | EGL provider 由 Android bootstrap 显式注入；render/upload 校验同一 backend identity，graphics 内无 `libEGL.so` | ANGLE 必须使用随包、绝对定位且具 artifact identity 的 provider；不允许静默回落到 system EGL |
-| graphics EGL manager | EGL config/context/share-group、fast resize、recovery 与 teardown 已面向 prepared target；当前可运行的 window Presenter 仍只有 Android `ANativeWindow` | 增加各平台 Presenter，并通过各自正确性与性能门；不要求它们采用同一种 native descriptor |
-| AHardwareBuffer 路径 | Android 零拷贝能力进入通用 graphics 代码 | 收敛为 Android capability，不假装成统一资源类型 |
-| `engine/crates/platform/desktop` | 主要是软件 frame ticker 和空设备服务 | 按 Linux、Windows、macOS 分开实现 |
-| `PlatformServices` | **Platform/V8 Phase A 已完成，§9.2 step 6 拆分也已完成**：不再返回 `deno_core::Extension`，`platform` crate 已移除对 `js-runtime`/`deno_core`/`deno_error` 的直接依赖；`PlatformServices` 已拆成 `DeviceServiceProvider`/`FrameClock`/`HostNotifier` 三个能力接口（marker 超 trait + 全覆盖 blanket impl，`core` 消费侧 `Arc<dyn PlatformServices>` 与调用点不变），由 `scripts/test-platform-services-capability-contract.sh` 门禁固化 | 新增能力按接口逐个加，不回到巨型 trait；runtime backend 的完整抽象（`JsBackend` trait 与 contract 提取）属于 §9.2 step 5 之后的工作 |
-| `engine/crates/runtime-v8` | 纯 JS shim、deno_core op 和 V8 snapshot 构建仍混在一起（目录已按 §9.1 更名到位） | 明确为 V8 backend，并抽取引擎无关契约 |
-| `engine/crates/core` | **Platform/V8 Phase B 已完成**：module loader、V8 code cache 和 isolate prewarm 已移入 `runtime-v8`，`HostJsRuntime::new` 与事件循环 poll 改为后端无关签名；`core` 源码不再命名 `deno_core`/`deno_error`/`v8::`，`core/Cargo.toml` 已移除对 `deno_core` 的直接依赖（仅经 `runtime-v8` 传递）。由 `scripts/test-core-v8-boundary-contract.sh` 在 PR/release 门禁固化。**`runtime-v8` 目录重命名已于 2026-07-21 完成**（原 `js-runtime`；同批把源码收进 `src/`、包名统一 `migo-*`） | 尚未完成：`core` 仍以直接方法调用消费宽口径 `HostJsRuntime` 表面（无 `JsBackend` trait，全仓 grep 为 0），且尚未从 `runtime-v8` 提取 schema/纯 JS/conformance |
-| `engine/tools/snapshot-gen` | 已把 snapshot 可执行生成器部分拆出，但身份校验、选择与部分构建逻辑仍在 `runtime-v8`。2026-07-21 起它与 player/c-host-example 一同移入 `engine/tools/`：`crates/` 只放引擎库，`tools/` 放构建与驱动引擎的东西，并由 `default-members` 把链 X11/GL 的桌面工具排除出默认构建集 | 保留生成器，进一步形成按 target tuple 管理的 V8 artifact/snapshot pipeline |
-
-### 2.3 旧方案中需要纠正的判断
-
-- `raw-window-handle` 是 Rust 生态内的句柄互操作格式，不等于 graphics 已经支持所有平台。当前 engine 已从共享 Surface/graphics 入口移除它；未来某个具体 Presenter 可以在自身内部采用 RWH，但不得重新把它升级成跨平台 ABI 或 common graphics 的窗口模型。
-- winit 适合 Player 和自动化工具，不适合作为所有宿主 App 的窗口所有者。
-- “Skia GL 一套实现覆盖所有平台”不是长期承诺；它是当前最短迁移路径，必须允许平台后端演进。
-- iOS 不能简单概括成“只有一种 JIT 方案”。全球默认产品应选低风险的 WKWebView；其他引擎 entitlement 属于受地区、资格和分发方式约束的独立决策。
-- 多平台契约不需要拆成四个仓库。对开放协作项目而言，同仓原子变更比跨仓版本锁定更重要。
-
-## 3. 选择的架构
-
-### 3.1 考虑过的路线
-
-| 路线 | 优点 | 不接受的代价 |
-|---|---|---|
-| V8 + GLES/ANGLE 单栈 | 初始复用最多 | 容易把临时可运行路径误当成每个平台的永久最佳方案 |
-| 每个平台完全独立 | 理论自由度最高 | API 语义、修复和测试快速发散，社区维护门槛过高 |
-| **共享契约 + 后端家族 + 原生 Host Kit** | 平台可独立优化，同时共享产品语义与质量门 | 需要先把当前 V8/Android 耦合边界拆清楚 |
-
-采用第三条路线。
-
-### 3.2 目标分层
-
-```mermaid
-flowchart TB
-    App["宿主 App<br/>拥有 Window / UI 线程 / 事件循环"]
-
-    subgraph Host["平台 Host Kit（原生、可替换）"]
-        View["View / Control Adapter"]
-        Surface["Surface Presenter"]
-        Input["Input / IME / Accessibility"]
-        Services["权限与设备服务"]
-        Clock["Frame Clock"]
-    end
-
-    subgraph Contract["共享契约核心"]
-        API["JS API Schema + 语义"]
-        Life["Engine / Session / Surface 状态机"]
-        Caps["Capability + Error Model"]
-        Protocol["Render / Audio / Host Protocol"]
-        Tests["Conformance + Benchmark"]
-    end
-
-    subgraph Backends["编译期选择的后端家族"]
-        JS["V8 / JSVM candidate / WebKit"]
-        GPU["Native GLES / ANGLE / WebKit GPU"]
-        Audio["cpal/native drivers / WebKit audio"]
-    end
-
-    App --> Host
-    Host --> Contract
-    Contract --> Backends
-    Surface --> GPU
-    Clock --> GPU
-    API --> JS
-```
-
-### 3.3 统一边界
-
-应该统一：
-
-- JS 可见 API 的名称、输入、结果、错误、异步时序和权限语义；
-- Engine、Session、SurfaceAttachment 状态机；
-- 输入、生命周期、host message 和资源请求的数据模型；
-- 能力发现与明确的 unsupported 行为；
-- conformance、render golden、故障注入和性能度量方法；
-- 版本、日志、诊断、崩溃信息和安全策略。
-
-不应统一：
-
-- 顶层窗口、UI 框架和消息循环；
-- JS 引擎嵌入 API；
-- GPU device、swapchain/EGLSurface、VSync 和资源共享句柄；
-- 音频设备和系统 audio session/focus；
-- 权限请求 UI、文件选择器、输入法和无障碍实现；
-- 发布包格式和宿主语言的惯用 API。
-
-## 4. SDK 与窗口：第三方 App 的集成模型
-
-### 4.1 SDK 不带顶层窗口
-
-嵌入式 SDK 只需要一个宿主提供的绘制目标，不应自行创建 `Activity`、`HWND`、`NSWindow`、Wayland toplevel 或 `WindowStage`。
-
-推荐交付三层产品：
-
-| 层 | 是否创建顶层窗口 | 用途 |
-|---|---:|---|
-| `migo-core` | 否 | Engine、Session、JS、graphics、audio、I/O |
-| Platform Host Kit | 否 | 可嵌入 View/Control 与底层 Surface Adapter |
-| `migo-player` | 是 | 示例、调试、bench、截图、CI、独立运行 |
-
-Host Kit 可以提供一个方便的 View/Control，但 View 不等于 Window。宿主仍决定它位于哪个页面、窗口或 UI 树中。
-
-`migo-player` 是**可选 shell**，不是运行时的一部分：它存在是为了让示例、bench、截图和 CI 有一个能自己开窗的入口，嵌入式集成永远不经过它。事件循环同样属于宿主——引擎不 spin 宿主的 loop，帧驱动通过宿主安装的 `on_request_frame` + `migo_session_notify_vsync` 回到引擎（Android SDK 走 Choreographer，纯原生宿主自己提供）。
-
-#### 4.1.1 谁拥有窗口的生命周期
-
-宿主拥有窗口，因此**只有宿主能销毁它**——但它必须等引擎说可以。
-
-`migo_surface_begin_detach` 返回 `MIGO_OK` 只表示退役已经开始，不表示 driver 已经用完这个窗口：GPU 无法被同步地忘记一个 Surface。宿主必须轮询 `migo_surface_release_query` 到 `MIGO_SURFACE_RELEASE_RELEASED` 之后，才能 `XDestroyWindow` / `wl_surface_destroy` / 释放 `ANativeWindow`。提前销毁是 driver 内部的 use-after-free，**引擎既检测不到也阻止不了**，因为它要观察的引用不属于自己。
-
-对称地，`migo_session_destroy` 在还有存活 attachment、正在进行的 transition 或未完成的 release 时会返回 `MIGO_ERROR_INVALID_STATE` 而不是替宿主收尾。这是引擎**还能**捕获的错误，所以它拒绝；拆解顺序因此永远是 begin_detach → 轮询到 RELEASED → destroy。
-
-release observer 不持有 Surface 资源租约，所以它可以活过自己的 Session——这正是「先销毁 Session」的拆解顺序仍然安全的原因。
-
-三个 C 宿主示例（X11、Wayland、Android NativeActivity）都实现了这个等待，且 Wayland 那份在等待时必须继续 dispatch display：释放 buffer 可能需要与合成器往返，只 sleep 会一直等到超时。
-
-### 4.2 两级接入 API
-
-**高级接入**面向普通 App：
-
-- Android：`MigoGameView`；
-- Windows：计划中的 Win32/WinUI Host Control；
-- macOS：计划中的 `MigoView : NSView`；
-- Linux：可选 Qt 6/GTK 4 adapter；
-- OpenHarmony/HarmonyOS：ArkUI `XComponent` wrapper；
-- iOS：包装 `WKWebView` 的 `MigoView : UIView`。
-
-高级组件负责 surface callback、输入、IME、DPI、可见性和宿主生命周期。
-
-**低级接入**面向编辑器、自研 UI 框架和游戏引擎：
-
-```c
-MigoResult migo_engine_create(
-    const MigoEngineConfig*, MigoEngine** out_engine);
-MigoResult migo_session_create(
-    MigoEngine*, const MigoSessionConfig*, MigoSession** out_session);
-
-MigoResult migo_session_attach_surface(
-    MigoSession*,
-    const MigoSurfaceDescriptor*,
-    MigoSurfaceAttachment** out_attachment);
-
-MigoResult migo_surface_update(
-    MigoSurfaceAttachment*,
-    const MigoSurfaceMetrics*);
-
-typedef void (*MigoTaskFn)(void* task_context);
-typedef MigoResult (*MigoDispatchFn)(
-    void* dispatcher_context,
-    MigoTaskFn task,
-    void* task_context);
-
-typedef struct MigoHostCallbacks {
-    uint32_t struct_size;
-    uint32_t abi_version;
-    void* user_data;
-    void* dispatcher_data;
-    MigoDispatchFn dispatch;
-    void (*on_ready)(void* user_data, MigoSession*);
-    void (*on_error)(void* user_data, MigoSession*, const MigoError*);
-    void (*on_exit_requested)(void* user_data, MigoSession*);
-    void (*on_surface_lost)(
-        void* user_data,
-        MigoSession*,
-        uint64_t generation,
-        MigoSurfaceLossReason reason);
-} MigoHostCallbacks;
-
-MigoResult migo_session_set_host_callbacks(
-    MigoSession*,
-    const MigoHostCallbacks*);
-
-MigoResult migo_session_set_visibility(MigoSession*, uint8_t visible);
-MigoResult migo_session_set_focus(MigoSession*, uint8_t focused);
-
-/* Surface 退役是异步的：GPU 无法被同步地「忘记」一个 Surface，
-   driver 侧引用会活过调用返回。begin_detach 只是开始退役，
-   宿主必须轮询到 RELEASED 才能销毁自己的原生窗口。 */
-MigoResult migo_surface_begin_detach(
-    MigoSurfaceAttachment*,
-    MigoSurfaceRelease** out_release);
-MigoResult migo_surface_release_query(
-    const MigoSurfaceRelease*,
-    MigoSurfaceReleaseStatus* out_status);
-MigoResult migo_surface_release_destroy(MigoSurfaceRelease*);
-
-MigoResult migo_session_destroy(MigoSession*);
-```
-
-[`include/migo/migo.h`](../include/migo/migo.h) 与强类型平台 descriptor 已经**有可链接实现**，不再是 compile-only：`engine/crates/capi` 导出 22 个 `migo_*` 入口点，desktop Linux 与 Android 各自有一份可链接 runtime，所以 `MIGO_C_ABI_HAS_RUNTIME` 在这两个平台上是 1。
-
-⚠️ 这个宏问的是「该 target 是否存在可链接 runtime」，**不是「ABI 是否已冻结」**——`MIGO_C_ABI_CANDIDATE` 仍为 1，`include/migo/README.md` 列的冻结阻塞项仍有未满足项。
-
-判定这个宏时**必须区分三个 Linux-kernel target**：Android 与 OpenHarmony 同样定义 `__linux__`，只测 `__linux__` 会一次性替三个不同 ABI 作答，并且会在没有构建产物的 OpenHarmony 上谎称有 runtime。因此 `types.h` 按 `__ANDROID__` / `__OHOS__` / `__linux__ && __GLIBC__` 精确分类，`tests/c_abi/core_contract.c` 断言三者互斥。
-
-Android 的差距是**打包而不是能力**：静态库可链接并已在真机跑通，但没有 pkg-config、CMake package 或带版本的 .so，宿主只能从源码树链接；desktop Linux 三样齐全。正式 C ABI 必须：
-
-- 每个结构带 `struct_size` 与 `abi_version`；
-- 返回稳定错误码，不允许 panic/exception 穿过 ABI；
-- 不暴露 Rust enum 布局、trait object 或 `raw-window-handle` 版本；
-- 枚举型公开值使用显式定宽整数 typedef 与数值常量，不依赖 C enum 的实现相关底层宽度；明确调用线程、回调线程和 handle 所有权；
-- 回调必须经过宿主提供的 dispatcher；当前 candidate 在配置任意回调时要求 dispatcher 非空，不能从任意 worker/render 线程直接进入宿主 UI；
-- `set_host_callbacks` 复制调用方 `struct_size` 覆盖的已知字段，不长期借用临时结构；destroy 返回前取消或排空尚未投递的回调任务；
-- callback 配置只能在首次 attach/运行前成功安装一次，避免已排队任务与替换后的函数指针或 `user_data` 竞态；
-- 允许宿主在 Session 不销毁的情况下反复 attach/detach Surface；
-- 平台扩展通过带版本的结构链或 capability 查询增加，不能破坏旧 ABI。
-
-上面的 callback、visibility 和 focus 同样只是契约形状示意。ABI v1 还必须覆盖 pause/resume、输入、Surface loss、异步请求取消以及回调中重入/销毁的规则；只给 attach 函数而不定义事件如何回到宿主，不算完成嵌入式 ABI。
-
-### 4.3 SurfaceDescriptor
-
-共享 header 只保存真正通用的数据：
-
-- ABI version、platform kind、surface generation；
-- width/height（physical pixels）、scale factor；
-- color space、alpha mode、期望 presentation mode；
-- 平台描述符大小和 capability flags。
-
-平台 payload 使用强类型描述符：
-
-- Android：`ANativeWindow` 的受控引用；
-- Win32：child `HWND`；
-- WinUI：专用 composition/swapchain attachment，而不是假装成 HWND；
-- macOS：`NSView`/`CAMetalLayer` adapter；
-- Linux X11：Display + Window；
-- Linux Wayland：`wl_display` + `wl_surface`，role 和 event loop 仍由宿主拥有；
-- OpenHarmony/HarmonyOS：`OHNativeWindow`；
-- iOS WKWebView backend 不经过通用 native GPU Surface。
-
-具体 Presenter 可以在 attach 冷路径把 payload 转换成该平台最合适的 immutable prepared target；是否在 Presenter 内部借助 `raw-window-handle` 是实现细节。当前 Android Presenter 直接以非 owning `NonNull<ANativeWindow>` prepared target 对接 system EGL，shared/core/graphics 不读取该指针。prepared target 的有效期由 generation-tagged `SurfaceLease` 保证，任何 EGL 引用都必须先销毁，之后才能释放 lease。
-
-### 4.4 生命周期与线程
+当前结构的方向正确，继续沿用：
 
 ```text
-Engine create
-  └─ Session create
-       ├─ Surface attach (generation N)
-       ├─ start / pause / resume
-       ├─ resize / DPI / color-space update
-       ├─ Surface detach (generation N)
-       ├─ Surface attach (generation N+1)
-       └─ Session destroy
+migo/
+├── adapter/                       # JS API compatibility layer 与纯 JS 测试
+├── contracts/artifact-manifest/  # versioned JSON Schema 与 V8 source lock
+├── engine/
+│   ├── crates/
+│   │   ├── capi-abi/              # 零依赖 ABI record/validation
+│   │   ├── capi/                  # C ABI 实现与平台 surface glue
+│   │   ├── core/                  # Session/Host orchestration
+│   │   ├── runtime-v8/            # V8/deno_core runtime 与 JS extensions
+│   │   ├── graphics/              # Canvas/WebGL/Skia/GPU resource pipeline
+│   │   ├── audio/                 # audio engine
+│   │   ├── io/                    # network/storage/decode/VFS support
+│   │   ├── platform/              # 平台 policy/presenter
+│   │   │   └── src/{android,linux}/ # 按 OS 命名；不把 Linux 伪装成 generic desktop
+│   │   ├── android-jni/           # Android JNI cdylib 边界
+│   │   └── shared/                # 无平台所有权的共享协议与状态
+│   └── tools/
+│       ├── snapshot-gen/          # 链接 engine 的 snapshot 工具
+│       ├── player/                # 独立 Linux player
+│       └── c-host-example/        # 链接 engine 的 C host driver
+├── include/migo/                  # 公共 C ABI 与 typed platform descriptors
+├── platforms/                     # 平台 package/Host Kit；不是 engine core
+│   ├── android/
+│   ├── linux/                     # Linux Host Kit；核心仍不依赖 Qt/GTK/SDL
+│   └── windows/                   # 当前仅 spike 与设计输入
+├── tools/                         # 不链接 engine 的 repo/release 工具
+│   ├── artifact-manifest/
+│   └── wx-api-diff/
+├── scripts/                       # 可复现 build/package/contract recipes
+├── examples/                      # 外部消费方式与设备 probes
+└── tests/                         # 跨语言/ABI contract tests
 ```
 
-不变量：
+目录规则：
 
-- Session 生命周期与 Surface 生命周期分离；
-- 过期 generation 的 resize、present 和 callback 必须被拒绝；
-- `SurfaceAttachment` 是唯一 handle；detach 成功会消费并释放它，之后指针无效，且不得再向旧 Surface present；Session destroy 会消费仍存活的 attachment；
-- 平台需要 UI 线程的 attach 操作由 Host Kit 调度，render loop 不在 UI 线程运行；
-- 同步 detach 不得等待宿主 dispatcher 的下一次调度；线程亲和性不满足时，必须在改变 generation/ownership 前返回 `MIGO_ERROR_WRONG_THREAD`；
-- 回调通过宿主配置的 dispatcher/executor 投递，不能假设所有宿主都使用同一种消息循环；
-- SDK 不主动退出宿主进程，不接管全局键盘、焦点或窗口状态。
+- `engine/crates` 只放可复用 runtime libraries；平台 delivery artifact 不能靠临时改 `crate-type` 产生。
+- `engine/tools` 放需要链接 engine workspace 的可执行工具；顶层 `tools` 放独立构建/发布工具，避免把 V8、Skia、系统图形库拖入 manifest 校验器。
+- `platforms/<os>` 只有在该平台存在 package、Host Kit、spike 或 CI 时创建；不预建空目录制造“已支持”错觉。
+- 平台实现先在 `platform/src/<os>` 或 `graphics/src/backend/<family>` 内形成稳定边界。只有出现独立 consumer、不同依赖图或显著构建隔离收益时才拆 crate。
+- `desktop` 不是平台边界：Linux、Windows 和 macOS 的窗口、线程、图形与发布合同不同，目录和类型必须使用真实 OS 名称；toolkit adapter 放在独立 Host Kit。
+- 不创建一个包含所有 native window 的无类型大 union；公开 envelope 指向平台强类型 descriptor。
 
-### 4.5 桌面接入矩阵
+### 2.3 依赖方向
 
-| 宿主 | 第一阶段接入 | 性能要求 |
+当前 Cargo 依赖方向如下。箭头表示“左侧依赖右侧”，不是控制流：
+
+```text
+capi-abi                         (zero dependency)
+io / graphics / audio ────────► shared
+runtime-v8 ───────────────────► shared + io
+core ─────────────────────────► shared + io + graphics + audio + runtime-v8
+platform ─────────────────────► shared + io + graphics + core
+capi / android-jni / tools ───► 上述所需层
+```
+
+图表示所有权，不要求每条 Cargo edge 与图一一对应。不可违反的规则是：
+
+- `capi-abi` 保持零依赖，可在没有 V8/Skia/系统 SDK 的环境验证布局。
+- `shared` 不依赖 UI toolkit、JNI、Win32、AppKit 或 ArkUI；`shared` 与 `io` 都不得依赖 `deno_core`、`deno_error`、V8 或 `runtime-v8`。
+- 基础 crate 必须直接声明自己使用的 `serde_json`、Serde derive 和 Tokio feature，不能依赖上层 crate 的 Cargo feature unification 才能单独构建。
+- `runtime-v8` 不拥有 native window；`graphics` 不拥有 App lifecycle。
+- 平台包可以依赖 engine，engine core 不能依赖 Gradle、WinUI、SwiftUI 或 ArkUI package 层。
+- 平台 Host Kit 不通过修改 JS API 语义来迁就平台实现。
+
+## 3. SDK 与宿主边界
+
+### 3.1 SDK 为什么不带顶层窗口
+
+第三方 App 已经拥有自己的 UI 树、导航、窗口、输入法、accessibility、权限和前后台生命周期。SDK 自己创建顶层窗口会造成：
+
+- 与 App 的窗口层级、焦点、IME、无障碍和路由冲突；
+- 无法自然嵌入 Qt、GTK、WinUI、AppKit、ArkUI 或 Android View；
+- 多窗口、分屏、DPI、refresh rate 和 Surface 重建的所有权不清；
+- 额外合成层和不可控的 present 时序。
+
+因此 SDK 核心只接受 host-owned native target。`engine/tools/player` 可以创建窗口，因为它是一个 App，而不是 SDK 行为。
+
+### 3.2 所有权
+
+宿主负责：
+
+- 顶层/子窗口、View/Control 节点和系统 event loop；
+- native target 在 Migo 明确释放前保持有效；
+- UI-thread API、输入、IME、clipboard、权限和生命周期桥接；
+- 最佳平台 frame clock，并在被请求后回传 vsync；
+- 宿主目录、内容安装来源与用户可见错误 UI。
+
+Migo 负责：
+
+- Session、JS runtime、内容生命周期和 capability policy；
+- render worker、GPU context/resource、Canvas2D/WebGL command execution；
+- 在 release 状态到达前持有自己应持有的 native reference；
+- callback cancellation、generation gate 和 stale target 拒绝；
+- artifact/runtime identity、自检和可诊断错误。
+
+### 3.3 第三方桌面 App 的接入
+
+低层稳定边界是 C ABI；平台 Host Kit 是薄适配，不是另一个 engine：
+
+| 宿主 | 目标接入方式 | 窗口所有者 |
 |---|---|---|
-| Win32/C++ | 宿主创建 child HWND，传给 Win32 Presenter | ANGLE/DXGI 直接 present，不经过 CPU bitmap |
-| WinForms/WPF | 通过 child HWND/HwndHost | 不以 `D3DImage` readback 作为通用路径 |
-| WinUI 3 | 专用 `SwapChainPanel`/composition adapter | 单独做 ANGLE/DXGI interop spike；必须零拷贝 |
-| AppKit | 嵌入 Migo NSView | ANGLE Metal 直接绑定 layer |
-| SwiftUI on macOS | `NSViewRepresentable` 包装 Migo NSView | 不增加离屏复制 |
-| Qt 6 | 可选 adapter 获取实际 X11/Wayland target | 不让 winit 再创建第二个 event loop |
-| GTK 4 | 在 realize/unrealize 中 attach/detach | 遵守 GDK backend 与 UI 线程规则 |
-| 自研引擎/编辑器 | C ABI + platform descriptor | 可增加平台专用 ExternalTextureTarget |
+| C/C++/自研引擎 | headers + CMake/pkg-config/NuGet/xcframework | App |
+| Qt Widgets/X11 | 独立源码 Host Kit，以宿主 parent `QWidget` 的 native child XID 接入；当前增量只负责 Surface | Qt |
+| Qt Wayland/Qt Quick | 等公开 native handle 或零拷贝 texture/fence 合同后分别实现，不走 private API/overlay/readback | Qt |
+| GTK | 独立 `migo-gtk` adapter，按 X11/Wayland backend 获取 display/surface | GTK |
+| SDL/GLFW | 示例 adapter，复用其窗口与输入循环 | SDL/GLFW |
+| WinUI 3 | Host Kit 接受 SwapChainPanel interop 或 child HWND | WinUI/App |
+| AppKit/SwiftUI | Host Kit 嵌入 `NSView`/`CAMetalLayer` | AppKit/SwiftUI |
 
-[WinUI 3 `SwapChainPanel`](https://learn.microsoft.com/en-us/windows/windows-app-sdk/api/winrt/microsoft.ui.xaml.controls.swapchainpanel) 可以进入 XAML visual tree，并有自己的 UI/threading 约束，因此不能只提供一个“万能 window pointer”。
+adapter 不能缓存超过合同生命周期的 native handle，也不能替 SDK 启动第二个 UI loop。toolkit 没有稳定公开 native surface 时，应提供该 toolkit 专用 Host Kit，而不是依赖私有字段或地址偏移。
 
-### 4.6 外部纹理模式
+### 3.4 平台原生 Host Kit 产品层
 
-部分编辑器或已有 GPU compositor 不希望 Migo 自己 present，而希望把画面作为纹理合成。可在 onscreen 模式稳定后增加 `ExternalTextureTarget`：
-
-- D3D11 shared texture / keyed mutex 或明确的 fence；
-- IOSurface/Metal texture；
-- DMA-BUF + sync fd；
-- AHardwareBuffer；
-- OHNativeBuffer。
-
-这是五套平台能力，不设计一个伪通用的 CPU RGBA buffer。只有在资源共享、同步和生命周期均可证明零拷贝时才启用。
-
-## 5. 图形架构
-
-### 5.1 当前基线
-
-当前 graphics 使用 Skia Ganesh GL、`glow`、EGL/GLES；Canvas2D 与 WebGL 可以共享 GPU context/resource 路径。EGL 实现选择和 window-surface 创建已通过冷路径 `GraphicsPlatform` 注入，Android 使用 system EGL + `ANativeWindow` Presenter；draw/present/swap 热路径没有新增 Presenter downcast、分配、锁或虚调用。这是 Android 的已实现基线，也是 Linux/OpenHarmony 初期的合理起点。
-
-### 5.2 后端家族
-
-| family | 目标平台 | 组成 |
-|---|---|---|
-| `gles-native` | Android、Linux、OpenHarmony/HarmonyOS | 系统 EGL/GLES + 平台 Presenter |
-| `angle` | Windows、macOS | ANGLE EGL/GLES → D3D11/Metal |
-| `webkit` | iOS | WebKit 拥有 Canvas/WebGL/GPU 合成 |
-| `vulkan-experimental` | Android、Linux 候选 | 仅在完整 WebGL+Canvas2D 路径胜出后升级 |
-| `native-modern-experimental` | Windows/macOS 候选 | Graphite/Dawn/direct native，只作为长期实验 |
-
-ANGLE 的目标就是把 WebGL/OpenGL ES 映射到平台 GPU API。Windows D3D11 是成熟度最高的主力后端；macOS Metal 是受支持并已实际部署的后端，但仍须用 Migo 的 Intel/Apple Silicon 与窗口组合矩阵做独立 spike，不能假定它与 D3D11 具有相同成熟度。因此这里使用 ANGLE 是有证据的起点，不是永久免评估的统一层。[ANGLE 官方仓库](https://github.com/google/angle)
-
-Skia Vulkan 可以与 GL 同时构建，但官方仍提示真实设备驱动问题；Migo 不做大爆炸式迁移。[Skia Vulkan 文档](https://docs.skia.org/docs/user/special/vulkan/)
-
-### 5.3 后端选择规则
-
-1. 后端按 target/profile 编译决定；每 primitive、draw、texture lookup、command decode 等高频数据路径不得做通用 trait-object 分发。
-2. SurfaceFactory、Presenter、FrameClock 和 capability discovery 属于控制路径，可以使用小接口或枚举；每帧一次的 VSync request/present control 允许动态派发，但必须独立计量调用和唤醒开销。
-3. command decode、draw batching、texture lookup 和 submit 数据路径必须静态特化或一次选择后固定。
-4. Canvas2D、WebGL、图片解码上传和 onscreen present 必须尽量处于同一个 GPU device family。
-5. 如果混用两个 API 会导致跨 device copy，即使单项 benchmark 更快也不得成为默认。
-6. software renderer 只用于 CI/fallback，不冒充正式 GPU 后端性能。
-7. **runtime 热路径不得引入服务端框架**（`actix`、`tokio` 多线程 runtime、Web 框架、通用 actor/消息总线等）。它们为吞吐和公平调度而设计，代价是每条消息的分配、跨线程唤醒和调度延迟——正是渲染与输入路径最不能付的开销。输入、命令流、draw/present 必须是直接调用或预先特化的路径；需要并发的地方用已有的有界命令队列与 generation gate。构建期工具（如 `tools/artifact-manifest`）不受此限，因为它们不链接进 `libmigo.so`。
-
-### 5.4 资源互操作
-
-通用层描述“资源能做什么”，不描述“资源是什么”：
-
-- `CpuPixels`：明确 stride、format、color space 和所有权；
-- `GpuImage`：后端内部 opaque handle；
-- `ExternalImage`：平台能力 + import contract；
-- `SyncPrimitive`：后端内部 fence/semaphore；
-- `Readback`：显式慢路径，带诊断计数。
-
-AHardwareBuffer、DMA-BUF、IOSurface、D3D shared resource 和 OHNativeBuffer 分别留在平台模块。上层只能通过 capability 请求零拷贝，不能假定每个平台都支持相同组合。
-
-### 5.5 帧调度
-
-- 逻辑更新、render submit 和 present timing 分开测量；
-- FrameClock 提供 timestamp、refresh period、deadline 和 generation；
-- render 线程按需请求下一帧，静止内容不持续唤醒；
-- host callback 晚到、Surface 被替换和 refresh rate 改变都必须有状态机测试。
-
-Android 当前使用 demand-driven Choreographer。Android 官方指出单独使用 Choreographer 仍可能发生 buffer stuffing；应将 [Android Frame Pacing/Swappy](https://developer.android.com/games/sdk/frame-pacing) 作为 API 26 设备上的决策实验，而不是未经测量直接替换。
-
-Windows ANGLE/DXGI Presenter 应评估 frame-latency waitable object，以在上一帧完成 presentation 后安排下一帧。[DXGI frame latency waitable object](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject)
-
-## 6. JavaScript Runtime 与 API 契约
-
-### 6.1 契约是产品本体
-
-当前 `js-runtime` 同时包含：
-
-- 后端无关的 JS shim；
-- deno_core/V8 op 注册与 Rust 实现；
-- snapshot 构建和指纹；
-- 渲染、设备、网络等模块入口。
-
-Platform/V8 Phase A 移除了 `PlatformServices::extensions()` 和 `platform` 的直接 runtime 依赖，Phase B 又把 module loader、code cache、isolate prewarm 和事件循环 poll 的所有权移入 `js-runtime`，`engine/crates/core` 源码已不再直接使用 deno_core/V8 类型。但 `core` 仍以直接方法调用消费 `HostJsRuntime` 的宽口径表面，尚未成为完全引擎无关层。`engine/crates/snapshot-gen` 已经拆出了可执行生成器，但 snapshot 身份和选择仍有一部分留在 `js-runtime`。
-
-目标是抽取语言中立的 schema 和测试，但不强制所有 JS 引擎使用同一种 bridge。这里的“core”是目标边界，不是把当前同名 crate 原样宣布为通用层：平台服务不暴露 `deno_core::Extension`、core 源码不再命名 deno_core 的门已经成立；仍须把宽口径 `HostJsRuntime` 表面收敛到 `JsBackend` trait，并从 `js-runtime` 提取 schema/纯 JS/conformance，完整不变量才成立。
+低层 C ABI 是正确性和长期兼容边界，但不能要求每个 App 重写 Surface、输入、IME、frame clock 和异步退休逻辑。每个正式支持的平台都应在 C ABI 之上交付原生 Host Kit；统一的是产品分层和生命周期语义，不是 UI class 或窗口实现：
 
 ```text
-contracts/
-  api-schema/       # 参数、结果、错误、能力、同步/异步语义
-  js/               # 后端无关的纯 JS 层
-  types/            # TypeScript declarations
-  conformance/      # fixtures、assertions、goldens
-
-runtime-v8/
-  engine/           # 从当前 core 移入的 host/isolate/loader/code-cache
-  ops/              # deno_core/V8 adapter；平台 V8 extension 在这里注册
-  snapshot/
-
-runtime-jsvm/       # 决策实验通过后才落地
-runtime-webkit/     # iOS bridge 与 JS bootstrap
+L2  optional standalone shell   Activity / Window / Player / sample App
+                 │
+L1  native embeddable Host Kit  View / Widget / Control / ArkUI Component
+                 │
+L0  stable engine boundary      C ABI + host-owned native Surface
 ```
 
-### 6.2 同步与异步语义
+- L0 永远不创建顶层窗口、UI loop 或 toolkit object。
+- L1 可以创建自己内部的子 Surface/View，但它必须像普通平台控件一样由宿主布局、裁剪、显示和销毁；不得启动第二个 UI loop。
+- L2 只是零样板 convenience 和验收工具。Android `MigoGameActivity`、Linux `migo-player` 即使随 SDK 发布，也不改变 L0/L1 的窗口所有权。
+- toolkit 依赖只能存在于独立 Host Kit package。Qt、GTK、WinUI、AppKit、SwiftUI 或 ArkUI 不得进入 engine Cargo graph 或基础 C SDK。
 
-契约必须逐 API 标记：
+Host Kit 必须提供两种 Session 所有权形态，但不要求在同一个 class 中用布尔参数切换：
 
-- pure JS synchronous；
-- engine-local synchronous；
-- async host request；
-- cached synchronous view；
-- platform unsupported。
-
-iOS 的 `WKScriptMessageHandlerWithReply` 是异步 bridge。[Apple WebKit 文档](https://developer.apple.com/documentation/webkit/wkscriptmessagehandlerwithreply)  
-不能为了假装同步而阻塞 WebKit/UI 线程。需要同步读取的状态应在 JS 侧缓存，或在契约中改为异步；不同后端必须保持 JS 可观察语义一致。
-
-### 6.3 Capability 模型
-
-每项能力属于以下一种：
-
-- `required`：该 support profile 的强制能力；
-- `optional`：可查询、不可假定；
-- `host-provided`：由宿主注册实现；
-- `permission-gated`：需要平台权限；
-- `unsupported`：返回稳定错误，不提供空成功或静默 no-op。
-
-Capability 包含版本和限制，例如最大 texture size、audio channel、外部纹理格式、传感器精度和 API 速率限制。平台差异应被显式表达，而不是用假实现抹平。
-
-### 6.4 V8 静态库与 snapshot 工件矩阵
-
-**只要某个平台选择 native V8，就必须为该目标单独构建或取得匹配的 `librusty_v8`；不能按 CPU 名称复用其他 OS 的库。** Android arm64、Linux arm64 和 OpenHarmony arm64 虽然 CPU 都是 AArch64，但它们的 target OS、sysroot、libc、链接 ABI 与工具链不同，是三套工件。反过来，使用 system JSVM 的 OpenHarmony/HarmonyOS 与使用 WKWebView 的 iOS 不携带 V8。
-
-官方 V8 构建用 GN 的 `target_os`、`target_cpu`/`v8_target_cpu` 选择目标，Android 也有独立交叉编译流程；Rust 绑定 `rusty_v8` 的预编译产物同样是按目标配置发布的静态库。[V8 GN 构建](https://v8.dev/docs/build-gn)、[V8 ARM/Android 交叉编译](https://v8.dev/docs/cross-compile-arm)、[rusty_v8 构建说明](https://github.com/denoland/rusty_v8#binary-build)
-
-#### 6.4.1 工件身份
-
-不能只用 `aarch64/librusty_v8.a` 作为长期身份。一个可链接、可复现的 V8 工件至少由以下 tuple 唯一确定：
-
-```text
-V8ArtifactId = {
-  rusty_v8 version + V8 revision,
-  target triple / target_os / target_cpu,
-  architecture + static CPU baseline + required instruction features,
-  minimum OS/API or libc/CRT runtime floor,
-  ABI + compiler + sysroot version,
-  libc / C++ runtime / Windows CRT,
-  normalized GN args and patches,
-  release/debug + security/runtime flags
-}
-```
-
-只要其中一项影响 ABI、external references 或运行时布局，就必须生成新工件和新 identity；不同 product profile 若只改变 Migo API feature 而不改变 GN 配置，可以共享 V8 archive，但不能共享错误 profile 的 startup snapshot。
-
-建议目标布局：
-
-```text
-engine/third_party/rusty_v8/
-  <rusty-v8-version>/
-    <target-triple>/
-      <config-id>/
-        <target-static-v8-archive>
-        src_binding.rs
-        artifact-manifest.json
-```
-
-`artifact-manifest.json` 记录完整 tuple、architecture/CPU baseline、最低 OS/API 或 glibc/CRT、编译器/NDK/Xcode/Visual Studio 版本、V8 revision、GN args、patch、archive/binding hash、许可证和来源。大二进制可放 Git LFS 或签名的 release artifact，但公开仓库必须拥有从 pinned source 重建它的 recipe；核心构建不能只依赖维护者私有 binary cache。
-
-#### 6.4.2 首批目标矩阵
-
-| runtime backend / 平台 | 首批 V8 目标 | 规则 |
-|---|---|---|
-| Android V8 | `aarch64-linux-android`、`x86_64-linux-android` | 两套必需；NDK target/API 固定 26，archive、binding 与 snapshot 均按 ABI 校验 |
-| Linux V8 | `x86_64-unknown-linux-gnu`；需要 ARM 主机时增加 `aarch64-unknown-linux-gnu` | 不能复用 Android archive；glibc 是首个 support profile，musl 若承诺支持则是独立 target/工件 |
-| Windows V8 | `x86_64-pc-windows-msvc` 首发；ARM64 作为后续独立 profile | 使用 MSVC ABI 并固定 CRT/链接参数；MinGW 不是同一工件，也不作为隐含 fallback |
-| macOS V8 | `aarch64-apple-darwin`、`x86_64-apple-darwin` | 两个架构分别构建和测试；分发层可做 universal/XCFramework slices，但运行时 identity 和 snapshot 仍按实际进程架构区分 |
-| OpenHarmony/HarmonyOS system JSVM | 无 | 默认候选若验证通过，不构建、不分发 V8 |
-| OpenHarmony/HarmonyOS bundled V8 | 对选定 OHOS target/arch 单独构建 | 必须使用对应 SDK 的 Clang/sysroot/ABI；绝不能复用 Android arm64 archive |
-| iOS WKWebView | 无 | 全球默认 backend 不链接 V8；不因 V8 官方可交叉编译 iOS 就增加审核、JIT/JITless 和包体复杂度 |
-
-这不是要求“先把所有可能平台全部编完”。只有进入 native-V8 support profile 的 target 才进入构建矩阵，并且先从实际承诺的架构开始。V8 官方也明确以其 CI bot 覆盖来界定受支持配置，因此每个 Migo target 都要核对 upstream support，并维护自己的构建与运行测试，不能从“V8 支持很多配置”推导出“任意 tuple 都稳定”。[V8 官方支持配置](https://v8.dev/docs/official-support)
-
-#### 6.4.3 当前 repo 差距
-
-当前仓库已有：
-
-- `engine/third_party/rusty_v8/aarch64` 与 `x86_64` 两套 Android archive/binding；
-- `scripts/build-v8-android.sh`，支持 Android API 26 的 aarch64/x86_64 构建；
-- `snapshot-gen`、schema-v3 manifest 与 archive/JS/runtime 指纹校验。
-
-但现有目录只以 CPU 命名，跨平台后会产生歧义；`js-runtime/build.rs` 也只对 Android 选择 snapshot。当前工作树实际存在的 host/worker snapshot 文件只有 aarch64，尽管 snapshot README 描述了 x86_64 目标。因此在宣称 Android 双 ABI release 完整前，必须补齐或明确禁用缺失 ABI 的 snapshot candidate；桌面支持前则要把 archive 和 snapshot selector 升级为 target-triple identity。
-
-#### 6.4.4 Snapshot 不是通用资源
-
-V8 archive 与 startup snapshot 是两类工件。每个 snapshot 还必须绑定：
-
-```text
-SnapshotId = {
-  V8ArtifactId,
-  target OS + target arch,
-  CPU baseline and snapshot-generation CPU policy,
-  Migo product feature/profile,
-  runtime kind (host or worker),
-  deno_core + extension/op order + external references,
-  bootstrap JS/Rust input hashes,
-  snapshot schema + bytes hash
-}
-```
-
-规则如下：
-
-- Android snapshot 不能给 Linux 使用，arm64 snapshot 不能给 x86_64 使用；
-- macOS 即使分发 universal library，也分别嵌入当前 Rust target 对应的 snapshot，不能制造“universal snapshot”；
-- V8 revision、GN args、extension/op 表、runtime kind 或 product profile 变化都重新生成；
-- 生成器必须使用目标兼容的 V8 工件；无法证明 identity 时回退 source bootstrap，显式性能 candidate 则 fail closed；
-- snapshot 只有在真实设备证明冷启动收益大于包体/内存代价后才成为该 profile 默认。
-
-#### 6.4.5 SDK 分发方式
-
-桌面 App 的接入者不应手工寻找和链接 V8。每个平台的 Migo runtime package 默认将对应目标的 `rusty_v8` 静态链接进 `libmigo.so`、`migo.dll` 或 framework/dylib，并隐藏 V8 C++ symbols；Host Kit 再以正常的 C/C++、NuGet、SwiftPM 或 toolkit adapter 交付。一个下载仓库可以发布多平台 artifacts，但单个平台安装包只携带它需要的 architecture slices，不能把 Android、Linux、Windows、macOS 的 V8 库一起塞入最终 App。
-
-每次 V8 升级需在全部 supported native-V8 targets 上完成：从公开 recipe 重建、archive/manifest 校验、最小 isolate 启动、Migo conformance、snapshot restore、ASan/平台安全检查以及包体/启动回归。任一 supported target 未完成时，该次升级不能只在 Android 验证后整体发布。
-
-### 6.5 全平台发布工件 manifest
-
-每个可分发平台工件都必须携带机器可读的 per-slice manifest；这项要求不只适用于 V8 archive。Android AAR、Windows DLL/NuGet、macOS/iOS XCFramework/SwiftPM bundle、Linux tar/package、OpenHarmony HAR/HSP 共享身份字段与验证语义，但按平台 profile 校验各自的 floor/backend。当前 repo 的可执行 `v1` validator 先实现 Android profile；桌面或 system-runtime profile 进入 supported 前必须增加对应 schema 条件与测试，不能绕过 Android validator 或把不适用字段伪造为 Android。
-
-当前 Android slice 的 wire shape 如下；尖括号表示构建流程写入的实际、不可省略值，不是允许留在 release 中的占位符：
-
-```jsonc
-{
-  "schema": "migo-artifact-manifest/v1",
-  "artifact_id": "<content-addressed-id>",
-  "product_profile": "full",
-  "build_type": "release",
-  "codegen_profile": "z",
-  "target": {
-    "triple": "aarch64-linux-android",
-    "os": "android",
-    "arch": "aarch64",
-    "abi": "android",
-    "cpu_baseline": "armv8-a",
-    "required_cpu_features": ["neon"],
-    "runtime_floor": { "android_api": "26" }
-  },
-  "toolchain": {
-    "rustc": "<exact-version>",
-    "compiler": "<exact-clang-or-msvc-version>",
-    "sdk": "<exact-sdk-and-sysroot-version>",
-    "linker": "<exact-version>"
-  },
-  "runtime": {
-    "backend": "v8",
-    "rusty_v8_version": "<exact-version>",
-    "rusty_v8_revision": "<full-rusty-v8-revision>",
-    "v8_revision": "<full-upstream-revision>",
-    "normalized_gn_args": ["is_debug=false", "<remaining-sorted-args>"],
-    "patches": [
-      { "id": "<ordered-patch-id>", "sha256": "<sha256>" }
-    ]
-  },
-  "snapshots": [
-    {
-      "runtime_kind": "host",
-      "product_profile": "full",
-      "target_triple": "aarch64-linux-android",
-      "arch": "aarch64",
-      "schema": "<snapshot-schema-version>",
-      "generator": "<snapshot-generator-version-and-hash>",
-      "generation_cpu_policy": "target-baseline",
-      "normalized_parameters": [
-        "--arch=aarch64",
-        "--cpu-policy=target-baseline",
-        "--product-profile=full",
-        "--runtime-kind=host",
-        "--warmup=none"
-      ],
-      "external_references_hash": "<sha256>",
-      "bootstrap_inputs_hash": "<sha256>",
-      "bytes_hash": "<sha256>"
-    }
-  ],
-  "graphics": {
-    "backend_family": "gles-native",
-    "required_api": "OpenGL ES 3.0"
-  },
-  "hashes": {
-    "runtime_binary": "<sha256>",
-    "v8_archive": "<sha256>",
-    "rust_binding": "<sha256>",
-    "cxx_runtime": "<sha256>"
-  },
-  "provenance": {
-    "source_revision": "<migo-full-revision>",
-    "build_recipe": "<repository-relative-path>",
-    "build_recipe_sha256": "<sha256>",
-    "licenses": ["<sorted-SPDX-expression>"]
-  }
-}
-```
-
-最终容器包的 SHA-256 **不能嵌入该包自身**，否则会形成不可解的自引用。发布身份因此固定为三层：
-
-1. 每个 architecture slice 内嵌一份 manifest；`artifact_id` 是删除自身 `artifact_id` 后，对规范化 JSON 求 SHA-256。对象键按字节序排序，数组保持已验证顺序，浮点数禁止进入 identity。
-2. 容器内嵌一份 `migo-artifact-package-index/v1`，记录每个 slice 的包内相对路径、manifest 文件 SHA-256 与 `artifact_id`。
-3. 完成 AAR/NuGet/XCFramework/tar/HAR 后，在包外生成 `migo-release-attestation/v1` sidecar，记录最终文件名、大小、package SHA-256 与内嵌 index SHA-256。签名/SBOM 包装 sidecar 与 package，而不是修改已经哈希的包。
-
-这里必须区分**完整性**与**来源真实性**：未签名的 v1 content hash 能证明字段与所校验字节一致、稳定地产生同一 identity，却不能证明这些字节来自 Migo 官方构建者；攻击者可以同时替换 package、manifest 和 hash。开源、pinned revision 与公开 recipe 支持独立复现，但也不等于发布者认证。正式公开 release 必须由受保护的 builder 对 package 与 sidecar 签名（或写入可验证 transparency log），并发布验证公钥/策略；在该链路落地前只能称为 `verified identity`，不能称为 trusted/signed artifact。attestation 的 `package_index_sha256` 已传递绑定 index 中的 product/build/codegen 和所有 slices，无需在 sidecar 重复这些字段。
-
-```jsonc
-// embedded package-index.json
-{
-  "schema": "migo-artifact-package-index/v1",
-  "product_profile": "full",
-  "build_type": "release",
-  "codegen_profile": "z",
-  "slices": [{
-    "target_triple": "aarch64-linux-android",
-    "arch": "aarch64",
-    "manifest_path": "assets/migo/artifacts/slices/arm64-v8a.json",
-    "manifest_sha256": "<sha256>",
-    "artifact_id": "<sha256>"
-  }]
-}
-
-// external migo-full-release.aar.attestation.json
-{
-  "schema": "migo-release-attestation/v1",
-  "package_file": "migo-full-release.aar",
-  "package_size_bytes": 123,
-  "package_sha256": "<final-aar-sha256>",
-  "package_index_file": "package-index.json",
-  "package_index_sha256": "<embedded-index-sha256>"
-}
-```
-
-首批 profile 写入 manifest 的固定合同如下。表中的“精确 V8 revision”表示构建时写入完整 upstream commit/revision，不能只写 `rusty_v8` crate 版本或分支名；“per-slice”表示同一个容器包中的每个 ABI/architecture 都有独立 manifest 和 identity。
-
-| artifact/profile | `arch` 与静态 CPU baseline | `runtime_floor` | runtime、V8 revision 与 snapshot |
+| 形态 | Session 所有者 | View 消失时 | 适用场景 |
 |---|---|---|---|
-| Android AAR / `arm64-v8a` | `aarch64`；ARMv8-A + AdvSIMD，不静态要求可选 ARMv8.x 扩展 | `android_api: 26` | bundled V8；精确 V8 revision/GN args；host/worker snapshot 按 ABI、profile 和 target-baseline 参数生成 |
-| Android AAR / `x86_64` | `x86_64`；`x86-64-v1`，至少 `cmov`/`sse2` | `android_api: 26` | bundled V8；与 arm64 分开的 archive、binding、revision tuple 和 snapshot |
-| Linux GNU / `x86_64` | `x86_64`；`x86-64-v1`，至少 `cmov`/`sse2` | `glibc: 2.31`、`glibcxx: 3.4.28` | bundled V8；精确 V8 revision/GN args；**当前 `snapshot_policy: "none"`、`snapshots: []`**（Linux 尚未生成 startup snapshot）；kernel 5.10 只进入 `minimum_test_baseline` |
-| Linux GNU / `aarch64` | `aarch64`；ARMv8-A + AdvSIMD | `glibc: 2.31` | 仅在承诺该 profile 时发布独立 V8 archive/binding/snapshot，不能复用 Android arm64 |
-| Windows MSVC / `x86_64` | `x86_64`；`x86-64-v1`，至少 `cmov`/`sse2` | `windows_build: 17763` | bundled V8；精确 V8 revision/GN args；per-arch snapshot；同时记录 MSVC/UCRT 与 VC runtime 部署方式 |
-| macOS / `arm64` | `aarch64`；Apple arm64 ABI（AArch64 + AdvSIMD），不静态要求可选 ARMv8.x 扩展 | `macos: 13.0` | bundled V8；精确 V8 revision/GN args；arm64 snapshot；universal 分发包仍保留 per-slice identity |
-| macOS / `x86_64` | `x86_64`；`x86-64-v1`，至少 `cmov`/`sse2` | `macos: 13.0` | bundled V8；与 arm64 分开的 archive、binding 和 snapshot |
-| OpenHarmony bundled-V8 / `aarch64` | `aarch64`；目标 OHOS SDK ABI，首批基线 ARMv8-A + AdvSIMD | `openharmony_api: 10` | 精确 OHOS SDK/Clang/sysroot、V8 revision/GN args；per-profile host/worker snapshot |
-| OpenHarmony system-JSVM / `aarch64` | `aarch64`；目标 OHOS SDK ABI，首批基线 ARMv8-A + AdvSIMD | `openharmony_api: 12` | `v8_revision: null`、`snapshots: []`；记录 JSVM API/SDK identity、bridge schema；API 14+ DVSync 只写 optimized capability |
-| iOS device / `arm64` | `aarch64`；Apple arm64 ABI（AArch64 + AdvSIMD） | `ios: 15.0` | `v8_revision: null`、`snapshots: []`；记录 WebKit/SDK identity、bridge schema；simulator slice 使用独立 target/manifest |
+| Managed | convenience Host Kit | 先异步 retire Surface，再按产品策略销毁 Session | 简单页面、独立游戏容器 |
+| Bound | App | 只 retire attachment；Session 可继续 paused 并绑定新 View | 导航、预热、重挂载、多窗口、自研引擎 |
+
+`Session` 生命周期不得隐式等同于 toolkit object 生命周期。尤其在 X11/Wayland 上，native target 没有 Android `ANativeWindow_acquire` 等价物；Widget/QWindow 销毁前必须先 begin-detach，并等 release query 到 `RELEASED`。通用 wrapper 的析构函数不能阻塞 UI thread、销毁 pending observer 或静默丢失 attachment；无法完成异步清理时必须 fail fast，让 Host Kit 修正所有权而不是制造 driver use-after-free。
+
+显示集成分成两个独立合同：
+
+1. **Direct Surface**：Android `SurfaceView`、X11 child window、Wayland surface、child HWND、`NSView`/`CAMetalLayer`、XComponent。Migo 直接 present 到宿主放置的 native target，这是首个默认路径。
+2. **Compositor texture**：Qt Quick、复杂 GTK scene graph、自研 GPU compositor。必须使用同 device 的 native texture import/export 和显式 fence；CPU readback、每帧 bitmap upload 或把 native child window 浮在 scene graph 上都不能作为 fallback。
+
+第二条路径需要新的平台强类型 descriptor 和同步合同，不得把 texture/fence 塞入现有 window descriptor。没有该合同的平台 Host Kit 必须明确不提供对应控件，而不是以低性能兼容层冒充实现。
 
-上表不是文档承诺而是**被校验的合同**。每个 slice manifest 都有 JSON schema 与工具校验：Android AAR slice 走 `contracts/artifact-manifest/schema-v1.json` + `migo-artifact-manifest verify-slice`；Linux GNU 包走 `linux-package-schema-v1.json` + `verify-linux-package`,由 `scripts/test-linux-sdk-contract.sh` 对照真实产物核对 DT_NEEDED、导出符号与 loader floor;**Android C ABI 包**走 `android-package-schema-v1.json` + `verify-android-package`,由 `scripts/test-android-sdk-contract.sh` 核对静态库导出面(恰好 22 个 `migo_*`)、嵌入 snapshot 的 hash、NDK 下 header 编译,以及一个真实 `find_package(migo)` 消费者(`examples/c-host/android-package-consumer`)能否把每个 `migo_*` 链接解析。Android C ABI 以**静态库 + CMake**分发(NDK 消费方式),不出 versioned .so / pkg-config;C++ 运行时由消费者的 `-DANDROID_STL` 经工具链提供,故不进包的链接行。
+音频默认由 Migo 解码、混音并打开平台输出；Host Kit 负责 audio focus/session、权限、路由和 interruption。已经拥有全局 mixer 的大型宿主以后可选择实时安全的 host audio sink，但它是独立可选能力，普通 View 集成不能因此被迫提供 PCM callback。
+
+首批原生集成形态为：
+
+| 平台/宿主 | 原生可嵌入层 | 独立 convenience | 当前合同 |
+|---|---|---|---|
+| Android | `MigoGameView` 或 App 自己的 `Surface` | `MigoGameActivity` | 已实现 candidate |
+| Linux C/C++ | App 自己的 X11/Wayland target | `migo-player` | 已实现 candidate |
+| Linux Qt 6 Widgets/X11 | `MigoQtX11SurfaceView`，借用 Session-scoped `SurfaceHost` | 无；顶层窗口始终由 App 提供 | 已实现 surface-only candidate |
+| Linux Qt 6/Wayland | toolkit adapter | 无 | Qt 6.4 环境没有满足本合同的公开 native handle API，不使用 private header |
+| Qt Quick | `QQuickItem` texture consumer | 无 | 等待零拷贝 texture/fence ABI；禁止 child-window overlay workaround |
+| GTK 4 | `MigoGtkWidget` | GTK sample | 后续独立 package |
+| Windows | child HWND / WinUI Control | sample Window | Milestone B |
+| macOS | `NSView`/SwiftUI wrapper | sample controller | Milestone C |
+| iOS | `UIView`/SwiftUI wrapper 内嵌 WKWebView | sample controller | Milestone E |
+| OpenHarmony | ArkUI Component/XComponent wrapper | sample Page | Milestone D |
 
-其中三条规则是**禁止混用**，因为它们的失败方式都是「链接得上、跑起来才炸，且现场没有 provenance」：
+Linux Qt 首个增量只负责最难且可独立验证的 Surface 生命周期：从 Qt 的公开 X11 native interface 取得 `Display*`/XID、把 logical size 转为 physical pixels、合并同一 event-loop turn 的 resize、attach/update、非阻塞退休和 release 后关闭。具体合同是：
 
-1. **V8 必须按 OS/ABI/arch 分别构建。** manifest 记录的 `v8.target` 必须等于 slice 自身的 target；一个为 Android 构建的 V8 放进 Linux 包会被 `verify-linux-package` 直接拒绝。
-2. **snapshot 必须与 V8 revision、生成参数和 CPU baseline 匹配。** snapshot 是 V8 机器码，`target_triple`/`arch` 不符不是「次优」而是不可加载。
-3. **「不带 snapshot」必须显式声明。** `snapshot_policy` 与 `snapshots` 必须互相一致（`none` ⇔ 空数组），否则缺失的 snapshot 与遗忘的 snapshot 在 manifest 里长得一模一样。
+- App 在 Session owner/Qt GUI thread 为每个 `MigoSession` 创建一个地址稳定、不可复制也不可移动的 `SurfaceHost`；它保存该 Session 的 generation high-water mark，替换 View 必须复用它，不能从 1 重新开始；controller 和 Qt View 的跨线程控制调用必须在读取 Qt/native 状态或进入 C ABI 前返回 `MIGO_ERROR_WRONG_THREAD`。
+- `MigoQtX11SurfaceView` 只借用该 controller，并强制构造时传入 App-owned `QWidget& parent`，因此不能意外成为顶层窗口；每个 View 只保护自己成功绑定的 generation，提前构造的被动 replacement 不能 resize、retire 或阻止销毁另一个 View 的 attachment。
+- View、所有祖先 native widget、X11 `Display*`/XID 与 GUI event loop 必须活到 release observer 报告 `RELEASED`；析构或 `SurfaceAboutToBeDestroyed` 提前发生时 fail fast。
+- adapter 使用 `WA_NativeWindow`/`WA_PaintOnScreen`，并以 `WA_DontCreateNativeAncestors` 避免把宿主整条 Widget 祖先链强制 native；它不创建 `QPainter`、CPU bitmap 或额外合成层；resize 在 UI event loop 内 latest-wins 合并；release poll 只在退休期间运行，并在异常长等待时退避且发出一次 stalled 诊断，绝不以 timeout 销毁仍 pending 的 target。
+- 它不抢占 callback table，也不把“还没有输入/IME/frame-clock Managed wrapper”的 surface-only 控件宣传成完整 `GameView`。
 
-`linux` 是内核而不是 ABI：Android 与 OpenHarmony 同样跑 Linux 内核，所以 manifest 把 `os`/`abi`/`arch` 分开记录，`abi: "gnu"` 才是 desktop Linux 这一格。
+该 Host Kit 默认以源码/CMake target 交付，使 adapter 与宿主的 Qt minor、编译器和 C++ runtime 一致。仓库提供的 install rule 是本地/发行方构建入口，不代表 release 已新增无 manifest 的预编译二进制；一旦官方 package 分发 `.a`/`.so`，必须把它们纳入第 8 节的逐 artifact identity 和 package verifier，并记录精确兼容的 core SDK manifest SHA-256。这样 Host Kit 的 arch、OS/glibc、GLIBCXX、CPU、Qt/C++ ABI 与 core package 的 V8 revision、GN args、snapshot 参数/hash 是一条可验证关系，而不是两个可任意组合的版本号。
 
-Windows ARM64、Linux musl/RISC-V、商业 HarmonyOS 以及任何更高指令集构建不是上述 profile 的别名；如果发布，必须增加独立行、artifact identity、最低版本与测试矩阵。V8 JIT 可以在运行时探测并使用较新指令，但通用静态工件仍以上表 baseline 编译；面向 AVX2、ARMv8.2-A 等的专用构建只能作为经过 benchmark 证明有价值的独立 optimized artifact。
+## 4. C ABI、Session 与 Surface 生命周期
 
-约束如下：
+### 4.1 ABI 规则
 
-1. `arch` 只表示 ISA 家族，不能代替 CPU baseline；x86-64 发布物至少记录静态要求，AArch64 发布物记录 ARMv8-A/扩展基线。V8 在运行时探测并选择 SSE4/AVX 等 JIT 路径，不等于 Rust、Skia、ANGLE 或静态 V8 archive 可以隐式提高最低指令集。
-2. `runtime_floor` 按 profile 使用 `android_api`、`windows_build`、`macos`、`ios`、`openharmony_api` 或 `glibc` 等明确键；不得只写自由文本 `minimum_os`。
-3. `normalized_gn_args`、patch 顺序、每个 host/worker snapshot 的 `normalized_parameters` 和所有 identity hash 必须可重算。release manifest 中存在尖括号、空字符串、未知 revision 或缺失 hash 时直接构建失败；native-V8 profile 缺少任一实际内嵌 snapshot 的数组项也失败。
-4. 构建时校验 Cargo target、NDK/SDK deployment target、archive、binding、snapshot、package profile、内嵌 index 与真实容器内容完全匹配。运行时在 V8、GPU 或音频初始化前验证 OS/API/glibc 与 required CPU features；不满足时返回稳定的 unsupported-environment 错误，不能等到非法指令或动态链接失败。
-5. 正式公开 release 的 slice manifest、package index、最终 package 与外部 attestation 必须一起签名并进入 SBOM；当前未签名 v1 只提供完整性 identity，不能冒充来源认证。任何字段变化只要影响 ABI、代码生成、snapshot external references 或运行下限，就产生新的 `artifact_id`；最终 package 字节变化只改变外部 attestation，不制造自引用。
-6. 非 V8 profile 仍需记录 WebKit/JSVM 的系统版本或 SDK identity、bridge schema 和 graphics backend；不能因为 runtime 由系统提供就省略兼容性身份。
-7. AAR、XCFramework、macOS universal framework、HAR/HSP 等多架构容器必须携带 package-level index，并引用每个 target slice 的 manifest/hash；不允许用一个 `arch: universal` 掩盖 slice 之间的 CPU baseline、V8 archive 或 snapshot 差异。
+- C consumer 的唯一总入口是 `include/migo/migo.h`；子头可供实现内部组织，但示例、package smoke 和外部文档不得让用户拼装 include 顺序。
+- `MIGO_C_ABI_HAS_RUNTIME` 是编译期 platform-capability 宏，只表示当前 target 的交付物是否存在可链接 runtime；它不是运行时 backend 探测，也不能把尚未交付的目标平台宣传成支持。
+- 所有可扩展 struct 以 `struct_size`、`abi_version` 开头，调用者完整清零后填写。
+- 公开 enum-like 类型使用固定宽度整数和数值宏，不使用 C enum 或 packing pragma。
+- 输入 struct 按已声明 prefix 复制；旧 client 的较短 prefix 可兼容，未知较长版本 fail closed。
+- 输出 struct 只写调用者声明的 prefix，不越界覆盖未来字段。
+- descriptor pointer 只在调用期间借用；实现成功返回前必须复制 token，并对 ref-counted target 取得自己的引用。
+- LP64、LLP64、GCC/Clang ILP32、MSVC x86 都是 layout contract；“当前只交付 64 位”不能成为不测 32 位布局的理由。
+- ABI 冻结前必须同时通过 old-client/new-library、symbol allowlist、calling convention 和平台 descriptor 测试。
 
-### 6.6 当前 repo 的 manifest 落地
+### 4.2 Typed Surface descriptor
 
-manifest 必须由构建链生成，不能靠发布者手写。当前 repo 的第一阶段已经按以下边界落地：
+公共 envelope 是 `MigoSurfaceDescriptor`，payload 按平台强类型化：
 
-1. `contracts/artifact-manifest/` 保存 slice、V8 component、package index 与 release attestation 的 versioned JSON Schema，以及固定的 Android V8 source lock。
-2. 独立的 `tools/artifact-manifest` Rust 构建工具负责 canonical identity、SHA-256、fail-closed 校验、index 与 attestation；它不进入 `engine` workspace，也不链接进 `libmigo.so`，因此 render/JS/audio 热路径开销为零。
-3. `scripts/build-v8-android.sh` 只在 pinned rusty_v8/V8 revision、API 26、patch、GN args、NDK/compiler/linker 与 archive/binding 均可记录时生成 `component-manifest.json`。当前仓库中没有这些 component manifest 的旧 archive 不得回填猜测值，必须从 lock 指定的源码重建。
-4. snapshot manifest 记录 target triple、`target-baseline` CPU policy、排序后的生成参数、external-reference 保守指纹、bootstrap input hash、V8 archive 与 snapshot bytes。缺字段或 V8 hash 不匹配的 snapshot 不能进入 verified release。
-5. `build-aar.sh` 在 `gradle clean` 之后生成 `assets/migo/artifacts/slices/*.json` 与 `package-index.json`；Gradle release gate 禁止绕过该脚本直接生成无 identity AAR，并在编译前调用 canonical verifier、核对 index/slice 及当前 JNI 输入 hash。构建后 verifier 再对 AAR ZIP 内每个 ABI 的 `libmigo.so`、`libc++_shared.so` 和内嵌 manifest/index 真实字节重新求 hash，最后输出 `*.aar.attestation.json`。release 默认且强制 `required`；debug 在迁移期默认 `optional`，缺 provenance 时明确不生成 verified identity，不能当 release 发布。
-6. PR/release CI 运行 Rust 单测、fixture contract、Bash/Python 语法门。下一阶段再从 manifest 生成 `minimum-compatibility` 与 `latest-performance` 矩阵；两条 lane 使用同一 package SHA-256，但报告与发布判定保持独立。
-7. target-triple/config-id 目录迁移仍按 §6.4.1 单独实施；在迁移完成前，现有 Android CPU 目录只能由 component manifest 中的完整 target tuple 消除歧义，桌面库绝不能复用它。
+- Android：`ANativeWindow*`；
+- Linux X11：`Display*` + `Window`；
+- Linux Wayland：`wl_display*` + `wl_surface*`；
+- Windows：child `HWND` 或 WinUI SwapChainPanel interop，二者不可混为一个 handle；
+- macOS：`NSView*` 或 `CAMetalLayer*`，二者语义独立；
+- OpenHarmony：`OHNativeWindow*`。
 
-手工调用 Gradle 并传入内部 gate 属性最多得到一个已授权装配的 candidate；它没有完成 AAR 打包后字节复核与外部 attestation，不能作为完整 release 分发。只有 `scripts/build-aar.sh` 成功执行到 `verify-android-aar-manifests.py`、`attest` 和 `verify-attestation` 之后的输出才是本合同定义的 release。指定 V8 构建机还必须把 GN/Ninja/out 产物放在被忽略或源码树外的位置；component writer 在构建后发现任何非预期 tracked/untracked 源码变化都应失败，而不是放宽 provenance。
+iOS v1 不提供 native Surface descriptor，因为 App Store 默认 backend 是 `WKWebView` Host Kit。将来若增加非 App Store native backend，必须使用新 platform kind，不能改变现有含义。
 
-## 7. 各平台最佳方案
+descriptor 解析发生在 attach/update 控制路径。它不能造成 per-frame handle conversion、字符串匹配或 backend discovery。
 
-### 7.1 Android：正式基线，API 26+
+### 4.3 generation 与异步 detach
 
-**保留：**
+一个 Session 同时最多有一个 attachment。宿主为每个新 native target 选择单调递增且非零的 generation；resize、scale、color space 和 presentation mode 更新沿用当前 generation。
 
-- V8 + deno_core；
-- `MigoRuntime`、`GameSession`、`MigoGameView`；
-- `SurfaceView` 默认绘制组件；
-- Skia Ganesh GL + WebGL GLES/EGL 当前路径；
-- `cpal` 当前输出边界（Android 使用其 Oboe backend）+ Audio Focus；
-- 单进程默认，多 Session 隔离。
+```text
+Detached
+   │ attach(generation=N)
+   ▼
+Attached(N) ── update(N) ──► Attached(N)
+   │ begin_detach consumes attachment
+   ▼
+Retiring(N) ── GPU/driver retirement ──► Released(N)
+   │                                      │
+   │ query=PENDING                        ├─ host may destroy native target
+   │                                      └─ release observer may be destroyed
+   └─ Session destroy is refused
+```
 
-**硬要求：**
+规范行为：
 
-- Gradle `minSdk 26`；NDK target/platform 26；
-- CI 至少覆盖 API 26 emulator 的启动、ABI、生命周期和基础 render；
-- 所有更高 API 调用显式 guard；
-- snapshot 按 product profile、ABI、runtime identity 生成和校验；
-- `arm64-v8a` 与 `x86_64` 的发布策略、产物和测试保持可追踪。
+1. `migo_surface_begin_detach` 成功时消费 `MigoSurfaceAttachment*`，返回唯一的 `MigoSurfaceRelease*`；失败时不消费任何对象。
+2. begin-detach 返回不代表 native resource 已安全。宿主必须保持窗口、Surface、display connection 和需要的 event loop 有效。
+3. `migo_surface_release_query` 是权威 level；`on_surface_released` 只是可选 dispatcher wakeup edge。丢边、延迟或被取消都不能改变正确性。
+4. release 为 `PENDING` 时，observer 不能销毁，Session 也不能销毁。
+5. release 为 `RELEASED` 后，宿主可释放 native target。已 released 的 observer 不持有 Session/Surface lease，因此可在随后成功销毁 Session 后再做最终 query/destroy。
+6. `migo_session_destroy` 不隐式 detach；live attachment、transition 或 pending release 都返回 `MIGO_ERROR_INVALID_STATE`，所有权留给调用者重试。
+7. Surface loss 不等于 detach。attachment 仍由宿主持有，必须走同一 retirement 协议。
 
-**版本与工件合同：**
+### 4.4 callbacks 与线程
 
-- AAR 使用 package index 引用 `arm64-v8a`、`x86_64` 的 per-slice manifest；每个 slice 固定 `android_api: 26`、target triple、CPU baseline、NDK/sysroot、精确 V8 revision/GN args、archive/binding hash 和完整 snapshot 参数。
-- `arm64-v8a` 通用工件以 ARMv8-A + AdvSIMD 为静态基线；`x86_64` 工件以 `x86-64-v1`（至少 `cmov`/`sse2`）为基线。任何更高静态指令集版本必须成为单独 artifact，不能替换通用 slice。
-- API 26 lane 是 release-blocking 的**最低版本兼容性门**，验证加载、source/snapshot 启动、Surface 生命周期、基础 render/audio/network 与稳定错误；它不参与 ANGLE/Vulkan、frame pacing 或性能预算选型。
-- 最新稳定 Android + 代表性当前设备/驱动 lane 是**性能门**，采集启动、frame pacing、延迟、内存、功耗与温升；API 26 兼容通过不能抵消最新设备性能回退，反之亦然。
+- 一个 Session 的公开调用由宿主串行化；Engine 的独立 Session 可以并行。
+- callback table 在 Session 首次运行/attach 前安装一次并复制，之后不可替换。
+- 任一用户 callback 非空时必须提供 dispatcher；dispatcher 可从 engine worker 调用，必须线程安全且快速返回。
+- 用户 callback 只在 dispatcher task 中运行，期间不持有 engine/session/attachment lock。
+- dispatcher 拒绝 task 时，Migo 回收 task；不得在 engine thread 上 fallback 执行用户代码。
+- Session destruction 取消未开始的 callback；已排队 task 后续只能释放自身存储，不能再访问 `user_data`。
+- listener 的异常只能影响当前 listener；即使宿主替换的诊断 sink 自身抛异常，也不能阻断后续 listener。
 
-**需要实验：**
+## 5. 图形与帧调度架构
 
-- Choreographer 与 Swappy 的 frame pacing、输入延迟、功耗比较；
-- 原生 GLES、ANGLE-over-Vulkan 和直接 Vulkan family 的端到端比较；
-- `Surface.setFrameRate` 等高版本能力的条件启用；
-- 多窗口、foldable、refresh-rate change、Surface 重建。
+### 5.1 三条平面
 
-Android 官方建议新项目评估 Vulkan，但 Migo 承载的是 WebGL/Canvas 语义，最终选择必须包括 shader translation、Canvas2D、纹理上传和 present 的全链路数据，而不是只测 draw call。[Android Vulkan 指南](https://developer.android.com/games/develop/vulkan/overview)
+```text
+Control plane: attach / resize / lifecycle / capability / backend construction
+Data plane:    decoded commands / resource ids / upload payload / input batches
+Render plane:  execute / submit / present / fence / device-loss recovery
+```
 
-`SurfaceView` 继续作为默认；`TextureView` 只在宿主确实需要 View 变换或特殊合成时作为 opt-in，因为官方文档明确提示它可能比 `SurfaceView` 更慢。[TextureView 文档](https://developer.android.com/reference/android/view/TextureView)
+通用多态只允许出现在 control plane。当前 `GraphicsPlatform` 将 `EglProvider` 与 `EglSurfaceFactory` 注入 graphics；backend identity 在初始化/attach 时验证并固定。不要把这个冷路径 seam 扩散成每个 draw call 的 trait object。
 
-### 7.2 Linux：原生 EGL/GLES，宿主选择 X11/Wayland
+### 5.2 当前 EGL family
 
-**默认：**
+Android 与 Linux 当前共享的是 EGL/GLES 行为合同，而不是 window 实现：
 
-- V8；
-- Mesa/system EGL/GLES；
-- X11 与 Wayland 两个 Presenter；
-- 当前 `cpal`/ALSA 作为可运行基线；native PipeWire 与 ALSA low-latency 路径用真实发行版/设备数据决定默认；
-- `libmigo.so` + C header + pkg-config/CMake package。
+- Android provider 动态加载系统 `libEGL.so`，从持有强引用的 `ANativeWindow` 创建 EGLSurface。
+- Linux provider 动态加载 `libEGL.so.1`；X11 使用宿主 `Display*`/`Window`，Wayland 使用宿主 `wl_display*`/`wl_surface*` 和运行时加载的 `libwayland-egl.so.1`。
+- EGL loader 保持 1.4 必需符号下限，平台 display/window entry point 在运行时解析 EGL 1.5/EXT 版本并有受控 fallback。
+- Skia、Canvas2D、WebGL 和 onscreen present 尽量处在同一 device/share-group，禁止默认路径做 CPU readback 或跨 device copy。
 
-**集成：**
+### 5.3 backend 选择规则
 
-- Qt/GTK adapter 只负责从 toolkit 获取实际 surface、输入和生命周期；
-- core 不链接 Qt/GTK；
-- 独立窗口只出现在 `migo-player`，且**不使用 winit**：`scripts/test-surface-attachment-contract.sh` 禁止 window-handle 抽象层的符号出现在 `engine/crates` 下，而这正是 winit 暴露的接口。player 改为运行时 dlopen 系统窗口库（X11 走 `x11-dl`），既满足门禁，也保持"SDK/播放器都不产生链接期窗口系统依赖"；
-- Wayland 下宿主拥有 display connection、surface role 和 dispatch loop。
+1. 每个发布 slice 编译进有限、明确的 backend family；不在每帧自动猜测。
+2. 首次初始化可以按驱动能力选择该 family 内的安全变体，并记录 telemetry。
+3. fallback 必须保持正确性，但不能被性能报告当成主 backend。
+4. software rendering 只用于 CI、诊断或明确兼容模式。
+5. 新 Vulkan/Metal/D3D backend 必须先通过像素 conformance、resource lifetime、device-loss 和整帧性能门，再替换默认。
+6. 如果两个 API 之间不能证明零拷贝同步与资源共享，宁可使用成熟的单 family 路径。
 
-**版本与工件合同：**
+### 5.4 帧调度
 
-- 首个官方 `linux-gnu` profile 支持 `x86_64-unknown-linux-gnu`，静态 CPU baseline 为 `x86-64-v1`（至少 `cmov`/`sse2`）；只有实际承诺 ARM 主机时才发布 `aarch64-unknown-linux-gnu`，其 baseline 为 ARMv8-A + AdvSIMD。
-- loader ABI floor 是 **glibc 2.31**。构建使用受控 sysroot，并以 symbol-version audit 保证没有引入高于该版本的 `GLIBC_*`/`GLIBCXX_*` 依赖；kernel 5.10 是最低测试基线，不伪装成动态库 ABI。
-- EGL/OpenGL ES 3.0 是 capability contract，不由发行版名称替代。musl、RISC-V、专用 GPU runtime 或更高 CPU baseline 都建立独立 artifact/profile。
-- 每个 tar/package 的 per-target manifest 固定 arch/CPU、glibc、sysroot、动态依赖、精确 V8 revision/GN args 和 snapshot 参数。最低 glibc 2.31 + kernel 5.10 VM/设备 lane 只阻塞兼容性；最新受支持 kernel、Mesa/厂商驱动与代表性 GPU lane 才阻塞性能预算和 backend 选型。
+engine 在需要画面时发出一次 `on_request_frame`。宿主使用平台最佳 frame clock 安排一次 callback，再调用 `migo_session_notify_vsync(timestamp)`：
 
-Mesa 驱动和平台能力并不完全一致，运行时需记录 renderer、driver、EGL extensions，并维护已验证矩阵。[Mesa 平台文档](https://docs.mesa3d.org/systems.html)
-
-Linux 是第一个桌面落地点，因为与 Android 的 EGL/GLES 路径最接近，但“最先落地”不等于永远拒绝 Vulkan；Vulkan family 必须通过相同门禁后才能成为某些设备的默认。
-
-### 7.3 Windows：ANGLE D3D11 起步，原生嵌入优先
-
-**默认：**
-
-- V8；
-- ANGLE EGL/GLES → D3D11；
-- Win32 child HWND Presenter；
-- DXGI flip-model、frame-latency pacing；
-- `cpal`→WASAPI 作为基线；只有测得路由、恢复或延迟缺口时才增加 direct WASAPI driver；
-- DLL + import library + C header；C++ wrapper 优先，C#/NuGet 可随后提供。
-
-**宿主适配：**
-
-- Win32 原生接入作为第一条稳定 ABI；
-- WPF/WinForms 通过 child HWND；
-- WinUI 3 使用独立 SwapChainPanel/composition spike；
-- 不使用 CPU bitmap 作为 XAML 通用桥；
-- SDK 不创建宿主 message loop。
-
-**版本与工件合同：**
-
-- 首发支持 `x86_64-pc-windows-msvc`，最低 **Windows 10 1809 / build 17763**；使用最新稳定 Windows SDK/MSVC 构建，但所有 Win32/WinRT API 按 17763 availability 合同调用。Windows ARM64 以后作为独立 profile，不与 x64 共用 V8/snapshot identity。[Windows App SDK 版本与 OS 支持](https://learn.microsoft.com/en-us/windows/apps/get-started/versioning-overview)
-- x64 通用工件的静态 CPU baseline 为 `x86-64-v1`（至少 `cmov`/`sse2`）；VC runtime 的静态/动态部署选择、UCRT、MSVC toolset、ANGLE revision、精确 V8 revision/GN args 与 snapshot 参数全部写入 NuGet/DLL manifest。
-- build 17763 VM/设备 lane 是 release-blocking 兼容性门，验证 DLL load、C ABI、child HWND/ANGLE present、WASAPI、V8 source/snapshot 和宿主销毁重建；Windows 11 + 当前驱动/代表性 GPU lane 是独立性能门。最低版本不用于证明性能，最新版本性能通过也不能覆盖 17763 加载失败。
-
-D3D12 可以降低部分 CPU-bound renderer 的管理开销，但 Migo 当前是 GLES/WebGL 语义和 Skia GL 管线；直接 D3D12/Graphite/Dawn 只有在真实游戏端到端获益时才升级，不因“API 更新”自动迁移。
-
-### 7.4 macOS：ANGLE Metal，Host Kit 提供 NSView
-
-**默认：**
-
-- V8；
-- ANGLE EGL/GLES → Metal；
-- AppKit `NSView`/`CAMetalLayer` Presenter；
-- SwiftUI 使用 `NSViewRepresentable`；
-- `cpal`→CoreAudio 作为基线；direct CoreAudio driver 由端到端数据决定；
-- XCFramework + C/Objective-C/Swift wrapper，SwiftPM 作为推荐分发入口。
-
-Apple 已在 macOS 10.14 弃用 OpenGL，并建议高性能 GPU 代码使用 Metal，因此系统 OpenGL 只能作为诊断 fallback，不能成为长期默认。[Apple OpenGL 指南](https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/OpenGL-MacProgGuide/opengl_intro/opengl_intro.html)
-
-嵌入 V8 的宿主需要正确配置 hardened runtime/JIT entitlement；Host Kit 必须给出签名、notarization 和 sandbox 文档，不能在 SDK 内偷偷改变宿主 entitlement。[allow-jit entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.allow-jit)
-
-**版本与工件合同：**
-
-- deployment target 固定为 **macOS 13.0**；`arm64-apple-darwin` 与 `x86_64-apple-darwin` 都必须在进入 supported 前有可加载、可运行的 slice。universal/XCFramework 只是分发容器，内部继续维护 per-slice manifest、V8 archive/binding 和 snapshot identity。
-- arm64 slice 使用 Apple arm64 ABI（AArch64 + AdvSIMD）且不静态要求可选 ARMv8.x 扩展；x86_64 slice 使用 `x86-64-v1`（至少 `cmov`/`sse2`）。两者都记录精确 V8 revision/GN args、Xcode/SDK、deployment target、ANGLE revision、签名模式和 snapshot 参数。
-- macOS 14+ 优先使用 `NSView.displayLink`；macOS 13 使用绑定当前 display 的 `CVDisplayLink` fallback，并在窗口跨屏、遮挡、刷新率改变时重绑/暂停。availability 只在初始化、view attach 或 display 变化冷路径判断，不进入每帧 command 热路径。[macOS 14 AppKit release notes](https://developer.apple.com/documentation/macos-release-notes/appkit-release-notes-for-macos-14)
-- macOS 13 的 Intel/Apple Silicon lane 阻塞最低版本兼容性；最新稳定 macOS、当前 Apple Silicon/仍受支持 Intel 设备和不同刷新率显示器 lane 阻塞性能。最低版本只验证正确性和 fallback，最新系统才决定 frame clock/backend 性能结论，两者不可合并为一次“支持测试”。
-
-### 7.5 OpenHarmony/HarmonyOS：原生 XComponent/GLES，JS 引擎做决策实验
-
-**默认宿主候选：**
-
-- ArkUI `XComponent`；
-- `OHNativeWindow`；
-- system EGL/GLES；
-- `OH_NativeVSync`；
-- OHAudio；
-- HAR/HSP/ohpm 交付形态由目标 SDK 的可分发能力验证。
-
-OpenHarmony 官方文档将 XComponent/NativeWindow 用于 native 绘制及 EGL swap，适合 Migo 的嵌入模型。[XComponent 指南](https://gitee.com/openharmony/docs/blob/master/zh-cn/application-dev/ui/napi-xcomponent-guidelines.md)、[NativeWindow 指南](https://gitee.com/openharmony/docs/blob/master/zh-cn/application-dev/graphics/native-window-guidelines.md)、[Native VSync 指南](https://gitee.com/openharmony/docs/blob/43726785b4033887cd1a838aaaca5e255897a71e/en/application-dev/graphics/native-vsync-guidelines.md)
-
-**JS runtime 不预先拍板：**
-
-| 候选 | 价值 | 必须验证 |
-|---|---|---|
-| system JSVM | 平台原生、可能有更好体积与系统协同 | JS 语义、JIT/部署资格、线程模型、native bridge、长期 API 稳定性 |
-| bundled V8 | 与 Android 行为和工具链接近 | 包体、内存、JIT 权限、构建可复现性 |
-| ArkWeb | 兼容 fallback | 启动/内存、bridge、WebView 路径是否违背产品目标 |
-
-[OpenHarmony JSVM 使用流程](https://gitee.com/openharmony/docs/blob/dec0c0aa2860a39a1e19a718b5a99263572c9303/en/application-dev/napi/use-jsvm-process.md) 说明了系统 JSVM 的 native 接入方式，但这不足以证明它已经满足 Migo 全部语义。必须运行 Test262 子集、Migo conformance、启动/RSS 和真实游戏 benchmark。
-
-**版本与工件合同：**
-
-- `bundled-v8` profile 的最低版本为 **OpenHarmony API 10**：NativeWindow 从 API 8、NativeVSync 从 API 9、OHAudio 从 API 10 提供，API 10 因而是这条完整 native baseline 的 floor；per-slice manifest 固定 OHOS SDK/Clang/sysroot、arch/CPU baseline、精确 V8 revision/GN args、archive/binding 与 snapshot 参数。[NativeWindow API](https://gitee.com/openharmony/docs/blob/43726785b4033887cd1a838aaaca5e255897a71e/en/application-dev/reference/apis-arkgraphics2d/_native_window.md)、[NativeVSync API](https://gitcode.com/openharmony/docs/blob/OpenHarmony-5.1.0-Release/zh-cn/application-dev/reference/apis-arkgraphics2d/_native_vsync.md)、[OHAudio API](https://gitee.com/openharmony/docs/blob/master/en/application-dev/reference/apis-audio-kit/_o_h_audio.md)
-- `system-jsvm` profile 的最低版本为 **OpenHarmony API 12**，manifest 记录 JSVM API/SDK identity 与 bridge schema，并显式写 `v8_revision: null`、`snapshots: []`。API 14+ 的 DVSync 是一次性 capability 选择的 optimized tier，不抬高任一基础 profile 的 floor。[OpenHarmony 5.0 / API 12 JSVM](https://github.com/openharmony/docs/blob/master/en/release-notes/OpenHarmony-v5.0.0-release.md)
-- 首批设备 slice 以 `aarch64`、ARMv8-A + AdvSIMD 为 baseline；模拟器或其他设备架构若发布，使用独立 manifest。API 10 bundled-V8 与 API 12 system-JSVM 分别有最低版本兼容性 lane；最新 OpenHarmony + 代表性设备 lane 才执行性能 A/B。两个 runtime profile 的结果不能互相代替。
-- 商业 HarmonyOS 不继承这些 API 数字；只有在对应 SDK、签名和设备矩阵确定后，才以独立 product profile 声明 floor、arch、runtime 和性能层。
-
-OpenHarmony 与商业 HarmonyOS SDK 的 API、签名、商店和可分发依赖应分别建立 support profile，不假设二者完全相同。
-
-### 7.6 iOS：WKWebView 为全球默认 backend
-
-**默认：**
-
-- Host Kit 提供 UIView/WKWebView 组件，不创建 UIWindow；
-- JS 与 Canvas/WebGL 由 WebKit 管理；
-- Migo 共享 API contract、JS shim、资源格式和 conformance；
-- native bridge 使用异步 message handler；
-- AVAudioSession、权限、输入和生命周期由 iOS Host Kit 处理；
-- XCFramework + SwiftPM。
-
-这条路径不复用 Migo 的 V8/Skia GPU backend，但仍属于同一产品：共享的是开发者契约、内容兼容性、安全策略和质量门。
-
-WKWebView 不是“脱离约束后的理论最快 JS/GPU”宣称，而是全球 App Store 可分发、审核/JIT 约束内的默认候选；仍需以真实游戏与系统 WebView 基线验证启动、帧延迟、内存和持续性能。若某个独立 distribution profile 合法获得其他引擎资格，再在该可行集合内重新以性能优先比较，不能让全球默认反向限制它。
-
-**版本与工件合同：**
-
-- iOS/iPadOS deployment target 固定为 **15.0**，首发 device slice 为 `arm64`、Apple arm64 ABI（AArch64 + AdvSIMD）；simulator 的 `arm64`（以及工具链仍支持时的 `x86_64`）slice 是独立 target/manifest，不能复用 device identity。iOS 15 的 WebKit 已提供 WebGL 2，并以 Metal 支撑 WebGL，满足此 backend 的基础图形能力合同。[Safari 15 WebKit features](https://webkit.org/blog/11989/new-webkit-features-in-safari-15/)
-- XCFramework package index 引用每个 slice manifest；manifest 记录 Xcode/iOS SDK、deployment target、WebKit/system runtime identity、bridge schema、graphics contract 与签名/entitlement profile，并显式写 `v8_revision: null`、`snapshots: []`。[Xcode 支持矩阵](https://developer.apple.com/support/xcode)
-- iOS 15 真机 lane 是最低版本兼容性门；对应 simulator runtime 可用时作为补充，两者验证 Host Kit、async bridge、WebGL2、AVAudioSession、后台/前台与资源恢复。最新稳定 iOS + 当前代表性设备 lane 是性能门，负责启动、frame time、input-to-present、内存、功耗与温升。最低版本数字不能被拿来选性能 backend，最新设备的好成绩也不能覆盖 iOS 15 行为错误。
-
-Apple 当前允许 App 承载 HTML5/JavaScript mini apps 和 mini games，但 4.7 同时要求内容治理、隐私、支付、内容索引、年龄分级，并限制未经许可向下载内容暴露 native API。[App Review Guidelines 4.7](https://developer.apple.com/app-store/review/guidelines/)
-
-因此：
-
-- 每个 native API 都要进入 allowlist/capability/permission 模型；
-- 宿主需要内容清单、年龄和隐私 hook；
-- 不把 EU 等特定地区的 alternative browser engine entitlement 当作全球默认；
-- JSC + native renderer 或 alternative engine 只可作为独立 distribution profile 的实验，不进入首发承诺。
-
-## 8. Audio、I/O 与系统服务
-
-### 8.1 Audio
-
-共享：
-
-- WebAudio 风格 graph、参数语义、decode contract；
-- mixer、session resource accounting、错误与诊断；
-- 音频资源的 pause/resume 逻辑。
-
-平台专用：
-
-| 平台 | 输出/会话 |
+| 平台 | 首选 frame clock |
 |---|---|
-| Android | `cpal`（Oboe backend）+ Audio Focus |
-| Linux | `cpal`/ALSA baseline；native PipeWire 与 ALSA low-latency 候选 |
-| Windows | `cpal`（WASAPI backend）baseline；direct WASAPI 候选 |
-| macOS | `cpal`（CoreAudio backend）baseline；direct CoreAudio 候选 |
-| iOS | AVAudioSession/WebKit backend 协同 |
-| OpenHarmony/HarmonyOS | OHAudio |
+| Android | AAR Host Kit 使用 Java `android.view.Choreographer`；纯 NDK/C host 使用 `AChoreographer`；新 API 运行时探测 |
+| Wayland | `wl_surface.frame`，由拥有 display dispatch 的宿主处理 |
+| X11 | Present extension MSC/complete notify；不具备时才用受测的 swap-interval fallback |
+| Windows | DXGI frame-latency waitable object/DirectComposition 或 WinUI compositor timing，按 presenter 类型实现 |
+| macOS | `CVDisplayLink`/display link；所有 AppKit object 操作仍回 main thread |
+| iOS | `CADisplayLink` 或 WKWebView 自身 compositor；两种 backend 不共用假的统一 clock |
+| OpenHarmony | XComponent/ArkUI 提供的期望帧率与平台回调 |
 
-当前仓库的事实边界是 `cpal = 0.15`，Android 通过 `oboe-shared-stdcxx` feature 使用 Oboe；Migo 并没有一层直接 Oboe 实现。可以继续使用 cpal 作为达标平台的薄适配，但它不是不可替换的架构边界。每个平台先以 cpal backend 建立基线，再与 direct native driver 比较 output latency、underrun、CPU、路由、focus/session、中断恢复和功耗；native driver 有可重复实质收益时优先采用。
+frame clock 只负责 pacing，不在 callback 中执行输入、网络或任意长任务。
 
-### 8.2 I/O
+## 6. JavaScript runtime 与 V8 component
 
-共享：
+### 6.1 统一的是 JS 行为
 
-- VFS、bundle、缓存、网络策略、配额、取消和超时；
-- 资源寻址和完整性校验；
-- 安全沙箱策略。
+产品合同是 observable JavaScript semantics：global、module loading、timers、Canvas2D/WebGL、audio、network、storage、lifecycle、input、错误和异步顺序。它由 `adapter` conformance 与 engine tests 定义，而不是由“所有平台都叫 V8”定义。
 
-平台专用：
+当前 engine 的 production native runtime 是 `runtime-v8`（`deno_core` + V8）。增加第二 runtime 时：
 
-- app sandbox/bookmark、content URI、Windows package path；
-- 文件选择器和权限 UI；
-- 系统 codec、硬件 decoder 与零拷贝 import；
-- TLS/certificate policy 的宿主扩展。
+- extension registration、op surface 与 capability 必须生成/验证，不能手工维护两份漂移表；
+- runtime 选择是 compile-time/package-time 决策，不在每个 op 上做动态分派；
+- async ordering、microtask、exception、typed array、WebGL object identity 必须逐项 conformance；
+- backend 特有能力只能通过显式 capability 暴露，不能静默改语义。
 
-### 8.3 拆分 PlatformServices
+当前 **Platform/V8 Phase A 已完成**：platform crate 不直接依赖或组装 `deno_core::Extension`，V8 extension assembly 留在 `runtime-v8`，`shared`/`io` 也已从 V8 依赖图中解耦。完整的多 runtime backend 边界尚未完成，当前无 `JsBackend` trait；在第二个 runtime 有可运行 vertical slice 前，不为想象中的复用提前加入热路径动态分派。
 
-目标接口：
+### 6.2 每个平台是否都要编译 libV8
 
-- `HostCallbacks`：ready、exit request、error、host message；
-- `FrameClock`：request/cancel frame；
-- `SurfaceFactory`：平台绘制目标；
-- `DeviceServices`：传感器、网络、剪贴板等；
-- `PermissionBroker`：权限状态与请求；
-- `AudioDevice`：输出、focus/session；
-- `ExternalImageProvider`：平台零拷贝资源；
-- `CallbackDispatcher`：回调投递线程。
-
-这些接口按 capability 组合，平台不必实现一个拥有全部方法的巨型 trait。
-
-## 9. 仓库目标布局与迁移映射
-
-### 9.1 保持 monorepo
+所有使用 native V8 的交付目标都要自己的 V8 component。最小 identity 是：
 
 ```text
-contracts/
-  api-schema/
-  js/
-  types/
-  conformance/
-
-engine/crates/
-  core/              # 目标：仅后端无关 lifecycle/orchestration；当前 crate 需拆分
-  runtime-v8/
-  render-protocol/
-  graphics-core/
-  graphics-gles/
-  audio/
-  io/
-  shared/
-
-platforms/
-  android/
-  openharmony/
-  linux/
-  windows/
-  macos/
-  ios/
-
-tools/
-  player/
-  conformance-runner/
+(target triple, OS, arch, ABI, runtime floor, toolchain, linkage model,
+ CPU baseline, rusty_v8 revision, upstream V8 revision, normalized GN args,
+ applied patches, source/build recipe)
 ```
 
-这是目标依赖边界，不要求一次 PR 完成所有目录重命名。先抽依赖和接口，最后做机械迁移。
+任一维度不同就不能复用 archive。特别是：
 
-当前真实设备 benchmark harness 位于公开 sibling repo `../migo-bench`。建议继续把它作为“从外部消费发布物”的黑盒仓库，并在结果中固定 Migo commit/artifact hash；本仓只保留 benchmark schema、workload manifest、性能计数器协议和 conformance。若以后迁回 monorepo，必须保留独立构建/安装已发布 SDK 的路径，不能只测内部 crate。
+- Android Bionic archive 不能用于 Linux glibc；
+- Linux `.so` 需要满足共享库/PIC/TLS 链接合同，不能拿仅适合 executable 的 archive；
+- Windows MSVC `.lib` 不能与 GNU archive 混用；
+- macOS universal package 内的 arm64/x86_64 是两个独立 component，`lipo` 只发生在最终 package 层；
+- debug/release GN 参数、pointer compression、sandbox、i18n、startup data 和 CPU flags 都属于 identity；
+- 一个来源不明但“能链接”的上游预编译 archive 可用于 spike，不能成为 Migo verified release。
 
-### 9.2 精确改造顺序
+计划矩阵：
 
-1. **冻结 Android 双基线**<br>
-   固定 API 26 minimum-compatibility lane；另行固定最新稳定 Android、代表性当前设备、release artifact/snapshot、游戏场景和性能采集方法，报告与门禁不得合并。
-
-2. **先过 C ABI + Surface 契约设计门，不急于宣称 stable**  
-   评审 `SurfaceDescriptor`、ownership、generation、callback/dispatcher、线程、错误码、结构扩展和重入销毁；提交可编译 header skeleton 与 ABI compatibility test。该设计门已经走完：[`include/migo/migo.h`](../include/migo/migo.h) 现已导出实现符号，`MIGO_C_ABI_HAS_RUNTIME` 在 desktop Linux 与 Android 上为 1。仍是 v1 candidate（`MIGO_C_ABI_CANDIDATE == 1`），未对外冻结。
-
-3. **抽 Surface 状态机，不改变 Android 行为——内部层已完成**  
-   当前实现以每个 Session/Host 一个 packed `AtomicU64` generation gate 作为 queue-independent liveness authority；`SurfaceLease` 贯穿 JNI→Host→render handoff，Host 持有唯一逻辑 attachment，render thread 持有一个有界资源 binding。update/destroy 命令均携带 generation；过期命令不能影响新 Surface，shutdown 在 render join 前同步 retire，`ANativeWindow` 引用只在 EGL teardown/replacement 后释放。Android API 26+ 仍使用既有 Java/JNI、`ANativeWindow` 与系统 EGL/GLES 路径，同 generation 的 `surfaceChanged` 保留 resize fast path。该条目原本只指内部生命周期重构，现已被 C ABI 切片超越：`MIGO_C_ABI_HAS_RUNTIME` 在 desktop Linux 与 Android 上为 1，两平台都有可链接 runtime；ABI v1 仍未冻结。
-
-4. **移出 EGL、RWH 与 Android 假设——Android 内部路径已完成**  
-   Android JNI bootstrap 现在构造经过 backend identity 配对校验的 `GraphicsPlatform`，并显式注入 system-EGL provider 与 `ANativeWindow` surface factory；render/upload thread 使用同一 provider identity，只有 Android provider 持有 `libEGL.so` 选择。shared/core/graphics 已移除 RWH、`AndroidNdk` match、裸 window integer 与 `last_window` recovery。attach 先校验 generation，再在冷路径 prepare/revalidate target；initial/update 共用有界 pending-lease transaction，partial EGL failure、panic、shutdown 都保证 EGL teardown 先于 native lease 释放；复用的 EGLContext 与 preserved DrawingBuffer 在首次 make-current 前作为同一恢复单元转移，瞬时失败不会丢失保留帧。相同 generation + 相同 native target 的 skip/resize fast path 保留，新 generation 必定完整重建。EGL display/root context 由 RAII owner 覆盖初始化早退、正常退出和 panic fallback；context recovery 只使用 live lease 配对的 installed target。该完成状态没有引入 SDK-owned window、Linux/ANGLE/OpenHarmony 实现、公开 C runtime 或 ABI v1 freeze，也没有改变 Android API 26 floor、Java/JNI descriptor、V8 或 snapshot 输入。
-
-5. **先解除 core→deno_core，再抽 API contract——Phase A 与 Phase B 均已完成**  
-   Phase A 已删除空的 `PlatformServices::extensions()` 钩子及 `platform` 对 `js-runtime`、`deno_core`、`deno_error` 的直接依赖；Android/desktop Host Kit 不再制造 V8 类型，`HostJsRuntime` 在 backend 内部组装既有 source/snapshot extension 集，平台 JSON 使用显式 `serde_json` 依赖。Phase B 进一步把 module loader、V8 code cache 和 isolate prewarm 从 `core` 移入 `js-runtime`，并把 `HostJsRuntime::new`（改收 `cache_dir`，内部装配 loader/cache/mount-ref）与事件循环 poll（新增后端无关 `pump_event_loop()`）改为不跨界暴露 `deno_core` 类型；`core` 源码已不再命名 `deno_core`/`deno_error`/`v8::`，`core/Cargo.toml` 去掉了 `deno_core` 直接依赖（仅经 `js-runtime` 传递）。这些变化是逐红绿切片的代码归属迁移，不改变 extension 顺序、snapshot bytes、op 表、JS 可观察行为或帧/热路径，由 `scripts/test-core-v8-boundary-contract.sh` 在 PR/release 门禁固化。保守 snapshot identity 绑定 js-runtime Rust source，Phase A/B 均会使旧 manifest stale；release 必须保持 fail closed，并由指定 artifact builder 重生成 full/slim × aarch64/x86_64 工件，本机只允许安全 source fallback。**仍未完成**：`core` 仍以直接方法调用消费宽口径 `HostJsRuntime` 表面（无 `JsBackend` trait），需再从 `js-runtime` 提取 schema、纯 JS、类型和 conformance，这才是 contract 不依赖 V8 的前置条件；`js-runtime → runtime-v8` 目录重命名为后续机械步骤。
-
-6. **拆 platform services——已完成**  
-   `PlatformServices` 拆成 `DeviceServiceProvider`/`FrameClock`/`HostNotifier` 三个 `Send + Sync` 能力接口；`PlatformServices` 降为 `DeviceServiceProvider + FrameClock + HostNotifier` 的 marker 超 trait，配 `impl<T> PlatformServices for T` 全覆盖 blanket impl，使平台只实现小接口而 `core` 仍持单一 `Arc<dyn PlatformServices>`、调用点零改动。Android/desktop 两个实现按能力拆分（方法逐字迁移，行为不变），由 `scripts/test-platform-services-capability-contract.sh` 在 PR/release 门禁固化。后续新增设备/通知/时钟能力按接口逐个加，不回到巨型 trait。
-
-7. **建立 Linux backend 并冻结 C ABI v1——Linux backend 已完成，只剩 ABI v1 冻结**
-
-   **2026-07-21 校订**：本条原列的三项"仍未做"中，①②**都已完成**，文档此前滞后于代码。
-   - ① *cdylib/TLS* —— 已解决，但不是靠重建 V8：cdylib 边界搬进了新的 `android-jni` crate（`[lib] name = "migo"`），`platform` 降为纯 rlib，于是 host 能构建和测试它。可执行档形态的 Linux player 不需要 shared-TLS V8；`.so` 形态的 Linux SDK 需要，且 `scripts/build-v8-linux.sh` 已经产出（`v8_monolithic_for_shared_library=true`，见 CLAUDE.md §10.4）。
-   - ② *非 Android Presenter / Player / 外部宿主* —— 已完成：`platform/desktop/presenter.rs` 有 X11 与 Wayland presenter（SDK 不链任何窗口库，只收不透明句柄再调 EGL）；`engine/tools/player` 是可跑真实 wx 包的 Linux player（离屏 + X11 窗口 + PNG 回读）；`engine/crates/capi` 是公开 C ABI，`examples/c-host/linux` 是纯 C 宿主；`scripts/build-linux-sdk.sh` 产出带 pkg-config/CMake 的 SDK，两个不经 cargo 的外部消费者已实测渲染。
-   - ③ *ABI v1 冻结* —— **仍未完成**，是本条唯一剩余项。阻塞项见 `include/migo/README.md`：Android 多指投递未在真机验证（`sendevent` 被 SELinux 拒绝、`input motionevent` 只带一个指针）、Android 兼容/性能门未跑、Android `x86_64` 包缺其启动 snapshot（只能在 CI 模拟器生成）。
-
-   以下为原文（记录当时状态）：  
-   已达 §1.5 的 Linux **minimum compatibility baseline**:用 linux-gnu `librusty_v8.a`(v8=145.0.0)在 `x86_64-unknown-linux-gnu` 原生构建并跑通 `js-runtime` 全套 **424/424** 测试、`core`(profile-slim)**30/30**;`graphics`(Skia from source)在 host 编译通过。宿主构建链已固化为 `scripts/dev-test-host.sh`(linux V8 + 系统 clang 而非 NDK clang + `dev-setup-skia.sh` 的 EGL/GL 头与 .so symlink)。这同时证明 Phase B(core→deno_core)与 step 6(能力接口拆分)在非 Android target 成立。**仍未做**:①`platform` 是 `cdylib`(libmigo.so),现有 linux V8 归档是可执行档 TLS(local-exec),链 `.so` 会 `R_X86_64_TPOFF32 ... cannot be used with -shared`——需用 shared/PIC 兼容 TLS 重建 linux V8(desktop 可放更多能力如 i18n/debug,但有界);②非 Android EGL/X11/Wayland Presenter、Player、外部宿主接入均为 greenfield;③C ABI v1 冻结待 Android/Linux compatibility + symbol/version test 通过。
-
-8. **接入 ANGLE family**  
-   Windows D3D11 和 macOS Metal 分别有 Presenter、frame clock 与打包。
-
-   **2026-07-22 Windows 可行性 spike 已完成，结论见 `platforms/windows/SPIKE-REPORT.md`。** 三条要点：
-   ①`migo-shared`/`migo-io`/`migo-runtime-v8` 在 `x86_64-pc-windows-msvc` 上 `cargo check` 全部通过，
-   整个引擎侧只发现 **1 处**可移植性缺陷（已修）；②**ANGLE 不需要修改 `EglProvider` trait**——
-   `libloading` 跨平台、ANGLE 是 EGL 1.5（钉定 1.4 的超集）、`display()` 把取得 display 整个交给实现者，
-   所以本条对 `graphics-core`/`graphics-gles` 拆分的紧迫性**低于**规划时的预估，拆分的真实价值在为
-   D3D12/Metal 这类**非 EGL** 后端留位置；③真实成本不在 migo 代码里，而在构建环境：Skia 在 Windows 上
-   无预构建、必须全量源码构建，且需要**八项**前置（MSVC/SDK、钉定的 Rust 工具链、LLVM/clang-cl、
-   开发者模式解 symlink、ninja、可达 googlesource、短路径绕开 `GetFullPathNameA` 的 MAX_PATH、
-   Khronos EGL 头）。**`migo-graphics` 已验证通过**（0 error / 55 warning，Skia 全量构建 + bindgen 通过），
-   spike 无留白。最后一个阻塞是 Android NDK 的 clang 12 遮蔽工具链解析，解法是构建脚本自己构造
-   **剔除 NDK 的白名单 PATH**——把 LLVM 前置是不够的。
-
-9. **OpenHarmony/HarmonyOS spike**  
-   先确定 JSVM/V8，再产品化 Host Kit。
-
-10. **iOS WebKit backend**  
-   共享 contract/conformance，保持平台原生 bridge 和审核约束。
-
-### 9.3 依赖方向
-
-```text
-platform Host Kit
-    ↓
-public ABI / core lifecycle
-    ↓
-contract + protocol
-    ↓
-compile-selected runtime / graphics / audio backend
-    ↓
-OS APIs and packaged third-party dependencies
-```
-
-禁止反向依赖：contract 不依赖 Android class、HWND、NSView、OHNativeWindow、V8 op 或 WebKit message type。
-
-这是目标不变量，当前仓库部分满足：`PlatformServices`（Phase A）与 `engine/crates/core`（Phase B）都已不再直接依赖 deno_core。但“core/contract 与 JS backend 解耦”尚未完全实现——core 仍直接调用宽口径 `HostJsRuntime` 表面，contract/schema 也未从 `js-runtime` 提取；在此之前，架构图对这部分表示迁移目的地而非当前事实。
-
-## 10. 开放开发与许可证决策
-
-### 10.1 本文输入：目标定位已确定为真正的开源项目
-
-根据维护者给本文的输入，Migo 的目标产品定位已经确定为 **open source / 开源**，不是只允许查看源码的商业源码许可项目；许可证迁移本身仍须 copyright holder/法律确认。架构和发布流程必须保证：
-
-- 社区版本不依赖私有仓库、私有二进制或内部服务才能构建核心功能；
-- 平台 backend、build recipe、patch 和版本锁定在公开仓库中；
-- V8、Skia、ANGLE 等大依赖有可复现的来源、hash、patch 列表与许可证清单；
-- conformance 与 benchmark 方法公开，性能数字能被第三方复现；
-- 默认不收集 telemetry；诊断上传由宿主显式选择；
-- 平台支持状态、已知限制和实验能力公开；
-- 安全问题有 `SECURITY.md`、威胁模型、披露和修复流程；
-- release 提供校验和、签名、SBOM 和第三方 NOTICE；
-- 文档 CI 校验 Markdown、Mermaid、仓库内链接；外部官方链接做定期检查，避免一次性网络波动阻塞每个代码 PR；
-- 外部贡献可以在同一 CI 中验证，不要求维护者私有设备才能完成全部 pre-submit。
-
-### 10.2 当前许可证与“开源”称谓冲突
-
-当前仓库 [`LICENSE`](../LICENSE) 是 BSL 1.1：
-
-- 限制竞争性 runtime/SDK 的使用与分发；
-- Change Date 为 2029-01-01；
-- 到期后转 Apache License 2.0。
-
-OSI 的 Open Source Definition 要求自由再分发，并且不得限制使用领域；OSI 也明确指出带延迟开放结果的 BUSL/BSL 类条件许可证不满足其批准标准。[OSI Open Source Definition](https://opensource.org/osd)、[OSI 常见拒绝原因](https://opensource.org/licenses/common-reasons-for-rejection-of-licenses)
-
-因此在 Change Date 前，当前发行版更准确的称谓是 **source-available / 源码可见、延迟开源**，而不是严格意义的 OSI open source。既然项目定位已经确定为开源，许可证迁移不是“是否要做”的架构候选，而是必须完成的发布阻塞项；实际改动仍需 copyright holder/法律确认，本文不擅自替他们修改 `LICENSE`。
-
-| 已确定目标 | 许可证路径 | 对外称谓 |
+| 平台 slice | runtime | V8 component |
 |---|---|---|
-| **Migo Open Source** | core 现在改为 Apache-2.0 或其他 OSI-approved license；现有 BSL 的 Change License 已是 Apache-2.0，因此优先评估直接切换以减少语义跳变。商业化放在支持、认证、托管、商标或独立服务 | Open Source |
+| Android arm64-v8a | native V8 | 必须独立构建 |
+| Android x86_64 | native V8 | 必须独立构建 |
+| Linux GNU x86_64 | native V8 | 必须独立构建，shared-library-compatible |
+| Windows MSVC x86_64 | native V8 | 必须独立构建；当前尚无 verified component |
+| macOS arm64 | native V8 | 必须独立构建 |
+| macOS x86_64 | native V8 | 必须独立构建 |
+| OpenHarmony arm64（若选 embedded V8） | native V8 | 必须独立构建，不能复用 Android |
+| OpenHarmony API 11+（若选 JSVM） | system JSVM | `v8_revision=null`，必须记录 JSVM/OS runtime floor |
+| iOS App Store 默认 | WKWebView/WebKit | 不携带 V8；记录 WebKit/OS floor 与 backend policy |
 
-如果 copyright holder 最终选择继续保留竞争限制，那将改变本文输入的“开源项目”定位；届时只能称 Source Available，并需要重新评审社区与发布策略，不能被视为当前架构的一条等价实现路线。
+### 6.3 snapshot 不是通用资源
 
-不能同时保留“竞争者不得使用”的限制，又把当前版本宣传成无条件开源。当前 `README.md:1/7/19/27` 与 `README_EN.md:19/27` 已使用“开源/Open source/Open & auditable”，而 `LEGAL.md:7/11` 明确承认当前是 source-available；这是已经上线的自相矛盾。任何继续以“开源”名义的公开发布前，必须二选一并原子更新：
+snapshot 必须绑定：
 
-1. 完成 OSI-approved 许可证切换，同时更新 LICENSE、LEGAL、README、CONTRIBUTING、网站、包元数据与第三方 NOTICE；这是符合已确定定位的路径。
-2. 若许可证审批尚未完成，所有首屏、功能表和宣传暂时统一为 Source Available，并明确 Change Date；不得提前使用 Open Source 称谓。
+- target triple/arch 和 CPU policy；
+- runtime kind、product profile、feature set 与 hash；
+- generator schema/版本和规范化参数；
+- external-reference table hash；
+- bootstrap inputs、Rust runtime sources、JS sources；
+- `deno_core` 版本；
+- 生成它的 V8 archive SHA-256；
+- snapshot bytes size/SHA-256。
 
-这项门禁不改变 runtime 热路径，但决定社区能否合法使用、分发和贡献，因此与 supported 平台发布同级阻塞。
+Android snapshot 必须在目标架构的真实 runtime 环境或等价受控 runner 上生成。不能因 host 工具方便而用 x86_64 host snapshot 填入 arm64 包。Linux 当前若采用 `snapshot_policy=none`，manifest 仍必须显式记录 `none` 和空列表，不能省略字段。
 
-### 10.3 社区友好的技术边界
+## 7. 平台最佳方案
 
-- platform backend 在同一仓库，避免“开源 core + 私有可用平台适配”；
-- 稳定 C ABI 允许社区创建语言绑定和 UI toolkit adapter；
-- 实验后端使用 feature flag 和 support tier，不阻塞稳定构建；
-- ADR、benchmark 原始数据和 backend 选择理由进入仓库；
-- vendor workaround 必须带设备/驱动条件和测试，不能成为不可解释的黑盒；
-- trademark policy 与代码许可证分离；
-- CLA/DCO 策略应与最终许可证和社区治理匹配。
+版本只有同时写入 artifact manifest、由工具链限制并在最低版本 lane 通过后才成为支持承诺。下面“目标”版本在此之前仍是设计值。
 
-## 11. 验收门禁
+| 平台 | 最低版本合同 | 首批 arch/CPU | 默认图形/宿主 | 状态 |
+|---|---|---|---|---|
+| Android | API 26 | arm64-v8a/armv8-a；x86_64/x86-64-v1 | `ANativeWindow` + EGL/GLES + Skia；Java/NDK Choreographer | 已实现 candidate |
+| Linux GNU | glibc 2.31、GLIBCXX 3.4.28 | x86_64/x86-64-v1 | host X11/Wayland + system EGL/GLES | 已实现 candidate |
+| Windows | Windows 10 1809/build 17763 | x86_64/x86-64-v1 | HWND/SwapChainPanel + ANGLE D3D11 | 目标；编译 spike only |
+| macOS | macOS 12.0（提议） | arm64/armv8-a、x86_64/x86-64-v1 | NSView/CAMetalLayer + Metal family | 目标 |
+| iOS/iPadOS | iOS 15.0（提议） | arm64 | WKWebView/WebKit Host Kit | 目标 |
+| OpenHarmony | API 10 native surface；API 11 system JSVM 实验 | arm64/armv8-a | XComponent/NativeWindow + EGL/GLES | 目标 |
 
-### 11.1 最低版本兼容性门
+### 7.1 Android
 
-每个 supported artifact/profile 都必须在其 manifest 声明的 minimum compatibility baseline 上通过 release-blocking 测试。测试对象必须是准备发布的同一 package/hash，不能用较低编译选项的“兼容测试专用包”替代。最低版本 lane 负责证明**能加载、语义正确、fallback 正确**：
+- `minSdk=26` 是产品合同。编译、manifest、AAR metadata、C SDK 和设备 CI 必须一致。
+- 宿主提供 `ANativeWindow*`；Migo 在 attach 成功前 `acquire` 自己的引用，每个可能重叠退休的 generation 各自持有引用。
+- 默认使用系统 EGL/GLES 与 Skia GL family，避免中间 bitmap、Java Canvas 或额外 Surface 合成。
+- AAR 当前使用 Java `android.view.Choreographer`；纯 NDK/C host 使用 `AChoreographer`。两者都保持 demand-driven、一次请求最多挂一个 callback。API 30/31/33 增加的预分配、frame-rate/timeline 能力只做动态探测。
+- audio 优先使用 Oboe/AAudio 路径并保留经验证 fallback；API26 恰好是 AAudio floor，但具体默认仍由 latency/underrun/设备矩阵决定。
+- AAR 是 Java/Kotlin Host Kit；C SDK 是 NDK static archive + CMake。二者是不同交付物，不能混淆 `libmigo.so` 的 JNI export 与公开 `migo_*` C ABI。
 
-- package index、per-slice manifest、签名/hash/SBOM 与实际二进制一致；
-- OS/API、glibc/CRT、arch 和 required CPU features 在 V8/GPU/audio 初始化前校验；不满足时稳定拒绝，不发生 loader failure、非法指令或半初始化；
-- 动态符号、availability 与 capability guard 在最低版本不会解析高版本 API；optimized tier 关闭后 fallback 仍正确；
-- C ABI/symbol version、Host Kit 加载、创建/销毁、source bootstrap 和 snapshot restore；
-- JS API schema/类型测试与选定 Test262 子集；
-- Canvas2D/WebGL render golden、主流引擎与代表性游戏 fixtures；
-- lifecycle chaos：后台、前台、Surface 重建、窗口缩放、DPI/刷新率变化；
-- context/device loss 与资源恢复；
-- 输入、IME、音频中断、权限拒绝；
-- ABI 向后兼容、错误注入、network/TLS、文件与资源加载的代表性路径；
-- 多架构容器中每个承诺 slice 的实际加载测试，不能只检查文件存在。
+### 7.2 Linux
 
-最低版本 lane 可以有防止死锁、OOM 或分钟级退化的安全 timeout/resource ceiling，但**不使用 frame time、启动耗时或功耗成绩选择 backend，也不承担性能回归结论**。最低版本设备过旧、虚拟化抖动大或驱动保守，都不能成为静默抬高 runtime floor 的理由；提高 floor 必须走 §1.5 的 support contract 变更流程。
+- SDK 不链接或拥有 toolkit；它接收 X11 或 Wayland token。
+- X11 宿主在跨线程使用同一 `Display*` 时必须在打开连接前满足 Xlib threading 合同，并保持 display/window 到 release。
+- Wayland 宿主拥有 object role 与 dispatch loop；Migo 不能私自 dispatch 宿主 queue。`wl_egl_window` 只在 presenter 内创建和退休。
+- 首批发布只承诺 glibc GNU x86_64，不把 musl、Bionic 或其他 libc 归入“Linux”。它们需要独立 target/schema/package。
+- 图形保持 system EGL/GLES。Mesa、NVIDIA 和主要 Wayland compositor 都要进兼容矩阵。
+- audio 当前可运行基线可保留；PipeWire 原生低延迟路径只有在真实发行版的 latency、设备切换与维护成本优于现状后才升为默认，ALSA fallback 仍单独验证。
 
-### 11.2 最新系统性能门
+### 7.3 Windows
 
-每个 release 在**最新稳定且仍受 Migo 支持的 OS、SDK runtime、驱动/固件和代表性当前硬件**上运行独立 performance lane。该 lane 使用与最低版本 lane 相同的 release artifact/hash；若测试独立 optimized artifact，则它有自己的 manifest、floor 和兼容性门。性能 lane 负责 backend 选择与性能回归，至少采集：
+- 首个 presenter 分两种：Win32 child `HWND` 和 WinUI SwapChainPanel interop。二者有不同线程、COM 与 composition 生命周期，不能互相 reinterpret。
+- ANGLE D3D11 是首个默认 backend：成熟、覆盖广，且现有 EGL/GLES/Skia GL 数据路径可复用。通过 `EGL_ANGLE_platform_angle` 明确请求 backend，不依赖 ANGLE 隐式默认。
+- D3D12/Vulkan backend 只有在 shader warm-up、frame p99、device-loss、显存和功耗全链路胜出时替换默认；不因“更新”自动升级。
+- App 拥有 message loop；SDK 不创建隐藏顶层窗口。COM apartment 和 WinUI object 访问必须留在宿主规定线程。
+- 当前 spike 只验证五个 crate 的 `cargo check` 与接口可承载性。下一里程碑必须用真实 Windows V8 component 链接并启动 isolate、创建真实 HWND EGLSurface、完成像素/readback/present，再讨论支持等级。
+- Windows 文件完整性不能沿用 Unix inode/flock/mode 假设；需要 `CreateFile` reparse policy、file ID、`LockFileEx` 和 ACL/read-only 策略的独立安全设计。
+
+### 7.4 macOS
+
+- 宿主提供 `NSView` 或 `CAMetalLayer`；所有 AppKit object 操作遵守 main-thread 规则，render command 可在专用线程编码。
+- native family 是 Metal。WebGL/GLES 兼容层首选 ANGLE Metal；Canvas2D 可先使用同一 ANGLE family，避免跨 device copy。
+- 原生 Skia Metal/Graphite 只有在能与 ANGLE 证明共享 device、texture、fence 且没有额外 blit 时才作为优化。否则“原生 API”标签不等于更快。
+- arm64 与 x86_64 分别构建 V8/engine slice，最后组成 xcframework/universal distribution；manifest 保留每个 slice identity。
+- 首个部署目标提议为 macOS 12，构建使用当前稳定 SDK并通过 availability check 使用新 API。最终 floor 以 CI 与 artifact schema 为准。
+
+### 7.5 iOS/iPadOS
+
+- 全球 App Store 默认 backend 是 `WKWebView`：它是平台原生可嵌入 View，并符合 WebKit/动态内容政策边界。
+- Host Kit 负责 navigation policy、JS/native bridge、content install、lifecycle、audio session、input 和错误映射；不能假设 native-V8 engine 的内部线程/Surface 模型存在。
+- JS API conformance 必须与 native backend 共用测试向量，但允许 WebKit 实现采用不同内部路径。
+- 自带 V8/JIT 仅可作为明确的企业、研究或获批准 entitlement 的独立 distribution；不得和 App Store artifact 共用支持声明、manifest 或性能数字。
+- iOS 15 是初始建议 floor，不是当前支持承诺。
+
+### 7.6 OpenHarmony
+
+- ArkUI `XComponent` 提供 native Surface 生命周期；Host Kit 将 `OHNativeWindow*` 交给 EGL/GLES presenter，并按 native object 引用规则持有/释放。
+- API 10 可覆盖目标 native XComponent/EGL 集成；系统 JSVM C API 从 API 11 起，因此两层 floor 必须分别记录。
+- 系统 JSVM 可减少 V8 包体并更贴合平台，但不能直接假设兼容 `deno_core`、Migo snapshot 或 V8 行为。先做独立 prototype：JS conformance、microtask/exception、native binding、snapshot、debugging、冷启动、RSS、frame p99。
+- 如果 JSVM 未达合同，使用 OpenHarmony 自己的 V8 component；绝不复用 Android Bionic archive。
+- HAR/HAP、ArkUI lifecycle、权限和输入都属于平台 Host Kit，不进入 engine core。
+
+## 8. Artifact manifest 与可复现发布
+
+### 8.1 当前 schema
+
+当前仓库的版本化合同是：
+
+- `migo-artifact-manifest/v1`：Android AAR 内单 slice identity；
+- `migo-v8-component-manifest/v1`：一个 V8 component；
+- `migo-artifact-package-index/v1`：多 slice package index；
+- `migo-release-attestation/v1`：package/index hash 绑定；
+- `migo-linux-package-manifest/v2`：Linux C SDK package；
+- `migo-android-package-manifest/v2`：Android C SDK per-ABI package。
+
+旧 package v1 schema 只用于读取历史 fixture；release generator 只能产生 v2。
+
+### 8.2 每个平台 artifact 的必填身份
+
+每个实际可下载/安装的 artifact 都必须写入自己的 manifest，至少包含：
+
+```text
+schema/version
+product_profile/build_type/codegen_profile
+target triple + OS + arch + ABI
+minimum OS/API/glibc/GLIBCXX/system-runtime floor
+CPU baseline + required CPU features
+compiler/Rust/SDK/linker/sysroot identity
+runtime backend
+rusty_v8 version/revision + upstream V8 revision + normalized GN args + patches
+V8 archive/binding hashes，或显式 not-applicable/null 与非 V8 backend identity
+snapshot policy + normalized parameters + all input/output hashes
+graphics backend family + required API
+package-relative regular files: size_bytes + SHA-256
+source revision + build recipe/hash + licenses
+```
+
+“version requirements 写在 README”不构成发布合同。loader/installer 可以比文档更早地拒绝不兼容 artifact，但不能比 manifest 更宽松。
+
+### 8.3 v2 package verifier 的行为
+
+Linux/Android C package v2 必须：
+
+- `version` 是最长 128 字节的 ASCII SemVer 2.0.0；在把版本插入路径、CMake 或 pkg-config 内容前先验证，拒绝路径分隔符、空白、前导零和其他非 SemVer 输入；
+- 只接受 release build、已知 profile/codegen profile 和精确 target/floor；Linux 记录路径无关的 sysroot recipe identity，并要求 engine package 与 V8 component 完全一致；
+- 完整验证 V8 component，而不是只比较 `rusty_v8_revision`；
+- 验证 package target 与 V8 target、runtime floor 一致；
+- 验证 snapshot 的 V8 archive hash、参数、输入、features 和 bytes；
+- 从 staging root 重新读取每个 package-relative path；
+- 拒绝绝对路径、`..`、非普通文件、size 不符和 SHA-256 不符；
+- 拒绝未声明的额外普通文件；Android 拒绝任意 symlink；Linux 的真实库必须精确为 `lib/libmigo.so.<manifest.version>`，且只接受并核对 `libmigo.so -> libmigo.so.1 -> libmigo.so.<manifest.version>` 这一条 soname chain；
+- 在链接 engine 前重新验证 V8 component manifest 对应的实际 archive 与 Rust binding bytes；
+- Android release package 在 Rust 编译前必须拒绝未 materialize 或过期的目标 ABI snapshot；不得让 `runtime-v8` 安全回退到 source JS 后仍生成声称 `snapshot_policy=embedded` 的 manifest；
+- 验证必需 headers/library/metadata 存在。
+
+manifest 生成后修改一个 staged byte 必须导致 verifier 失败。只记录 filename/size 而不读取实际文件不再允许。
+
+### 8.4 integrity 与 authenticity 分离
+
+SHA-256 和 canonical manifest 能证明内部一致性，不能证明发布者身份；攻击者可同时替换 package 和 sidecar。正式公开 release 还需要：
+
+- 受保护 builder；
+- package/index attestation 签名或透明日志；
+- 公布 verifier、公钥轮换和撤销策略；
+- SBOM、第三方许可证和 source/build recipe；
+- reproducible build 差异报告，无法 bit-for-bit 时说明不可复现输入。
+
+在签名链路落地前只能称 verified identity，不能称 trusted/signed artifact。
+
+## 9. 测试与发布门
+
+### 9.1 最低版本兼容性门
+
+每个 manifest floor 至少有一条真实或官方等价环境 lane：
+
+- 加载/链接完整 artifact，不是只编译源码；
+- JS/API conformance、Canvas2D/WebGL golden、代表性内容；
+- lifecycle chaos：前后台、resize、Surface 重建、window destroy race；
+- context/device loss 与 resource recovery；
+- input、IME、audio interruption、permission denial；
+- ABI old-client/new-library、symbol/version、错误注入；
+- network/TLS、storage/VFS/content integrity；
+- 每个承诺 arch slice 实际启动。
+
+该 lane 允许设置防死锁/OOM 的 ceiling，但不根据 frame time、启动耗时或功耗选择 backend，也不承担性能回归结论。
+
+### 9.2 最新系统性能门
+
+使用当前 stable OS/driver/SDK 和代表性低中高设备，运行同一个 package SHA-256：
 
 - cold/warm start；
-- RSS/PSS 与 peak memory；
-- frame time p50/p95/p99、missed frame；
-- input-to-present latency；
-- main/render/JS thread CPU time；
-- GPU time、提交与 present wait；
-- 功耗、温升与降频；
-- draw call、纹理上传、readback、跨 API copy 次数；
-- 包体与动态依赖。
+- frame p50/p95/p99、jank、input latency；
+- decode/upload/shader warm-up；
+- RSS/GPU memory/峰值；
+- 30 分钟以上 sustained workload 的功耗、温升、降频；
+- Surface resize/recreate、refresh-rate/DPI/color-space 变化；
+- 与上一 release、平台 WebView/系统方案和备选 backend 做 A/B。
 
-选择规则：
+性能门可拒绝 release 或回退 backend，但不能据此宣告提高最低 OS。提高 floor 是独立的支持合同变更，需要使用数据、迁移期和 major/minor policy。
 
-1. 同一设备、release 构建、游戏版本、snapshot、刷新率和热状态做随机化/平衡顺序对比。
-2. 用置信区间和原始样本判断，不使用一次运行的平均 FPS。
-3. 新抽象不得引入持续额外 copy/readback。
-4. 相对平台原生基线出现可重复的实质回退时，保留平台专用实现。
-5. 性能预算在实现前为每个平台单独冻结；不能用一个平台的阈值替代另一个平台。
-6. 在硬约束内，端到端性能结论决定默认 backend；代码复用率、依赖数量和实现便利不得推翻稳定、可重复的性能胜者，只能在性能等价区间内作为 tie-breaker。
-7. 记录 artifact hash、OS build、设备型号、CPU/GPU、驱动/固件、刷新率、温度和电源状态。最新系统升级导致环境变化时，先在可行范围内双跑旧/新环境并留下 rebaseline ADR，不能静默覆盖历史基线。
-8. 性能通过不代表最低版本兼容；最新系统上的 correctness 冒烟也不能替代 §11.1 的真实 floor 测试。
+### 9.3 CI 分层
 
-### 11.3 双门发布判定
+1. source contract：format、lint、unit、JS tests、C/C++ layout、schema、script syntax；
+2. cross-target compile：Android NDK、MSVC、Apple/OpenHarmony toolchain；
+3. package contract：真实 staging、exports、dependency floor、manifest/hash、外部 consumer；
+4. minimum compatibility devices；
+5. latest performance devices；
+6. release signing/attestation/reproducibility。
 
-| 门禁 | 固定环境与职责 | 失败含义 |
-|---|---|---|
-| Artifact identity | 构建阶段；校验每个 slice 的 arch、CPU baseline、OS/glibc floor、V8 revision/GN args、snapshot 参数与 hash | 工件不可识别或不可复现，禁止发布，也不能进入后续测试 |
-| Minimum compatibility | manifest 声明的最低 OS/API/glibc + 最低测试硬件/VM；只判加载、ABI、功能、生命周期和 fallback | support contract 已破坏；即使最新系统更快也禁止发布 |
-| Latest performance | 最新稳定系统 + 当前代表性硬件/驱动；只用冻结 workload/预算判断端到端性能 | 当前用户体验或平台最佳方案回退；即使最低版本功能通过也禁止发布 |
+没有 V8/Skia/平台 SDK 的普通 PR runner 不应伪造 release 结论。它只运行不需要这些 component 的 source contract；真实 component/package lane 在指定 builder 上执行。
 
-正式 release 必须同时通过三项。报告、dashboard 和 PR status 分别展示 `artifact-identity`、`minimum-compatibility`、`latest-performance`，禁止合并成一个平均分或用其中一项 waiver 自动豁免另一项。因实验设备暂缺而无法执行 performance gate 的平台只能保持 experimental/preview，不能以最低版本兼容结果升级为 supported。
+Linux Qt Host Kit 属于隔离的 source contract job：只安装 Qt/X11/Xvfb，链接严格 fake C ABI，验证 controller state machine、native child widget、DPI/resize、异步 release、安装导出和非 XCB fail-closed；它不得链接或构建 V8，也不得让 Qt 进入 engine Cargo 依赖图。Xvfb 的 X11 正向路径和 `offscreen` 负向路径都必须运行，不能因开发机当前使用 Wayland 而静默 skip。
 
-### 11.4 支持等级
+## 10. 依赖策略
 
-| 等级 | 含义 |
-|---|---|
-| experimental | 可构建/运行，API 和性能未承诺 |
-| preview | conformance 基本通过，有已知限制，不建议关键生产 |
-| supported | CI、设备矩阵、升级和安全维护有明确承诺 |
-| deprecated | 有迁移路径和停止支持日期 |
+### 10.1 是否引入 Actix
 
-只有 supported 平台进入 README 的“正式支持”列表。
+不引入。Actix 的主要价值是 HTTP server/actor workload，不是嵌入式游戏 runtime 的 render/input/present。将它放进 engine 会增加：
 
-## 12. 分阶段路线
+- message envelope 与调度层；
+- runtime ownership 和 shutdown 复杂度；
+- 跨线程唤醒、潜在分配和尾延迟；
+- Android/iOS/OpenHarmony package 体积与审计面。
 
-| 阶段 | 工作 | 退出条件 |
-|---|---|---|
-| 0. 约束与基线 | 完成开源许可证/临时公开称谓门禁、版本合同与 artifact manifest v1、Android API 26 最低兼容基线、最新系统性能基线、contract inventory | 许可与文案一致；每个计划 profile 的 floor/arch/CPU/runtime identity 可机读；两套测试报告独立且可复现 |
-| 1A. Android Surface/ABI 无行为重构 | 对应 §9.2 step 2–4：C ABI/Surface v1 candidate、SurfaceAttachment、EGL/RWH 内化 | Android lifecycle/render correctness 全通过且性能无实质回退；ABI candidate 评审通过但尚未宣称 stable |
-| 1B. Runtime/service 边界重构 | 对应 §9.2 step 5–6：core→deno_core 解耦、service/contract 拆分、V8 target identity | 依赖方向有自动门禁；source/snapshot 与 conformance 通过；Android 性能无实质回退 |
-| 2. Linux | X11/Wayland Presenter、Linux V8 artifacts、C ABI、Player、Qt/GTK 示例 | glibc 2.31/kernel 5.10 兼容门与最新系统性能门独立通过；Android/Linux 验证后冻结 ABI v1；SDK 不拥有窗口 |
-| 3. Windows | ANGLE D3D11、HWND、WPF/WinForms、WinUI spike、WASAPI | build 17763 兼容门与 Windows 11 当前设备性能门独立通过；零 CPU bitmap 主路径 |
-| 4. macOS | ANGLE Metal、NSView、SwiftUI、签名/JIT 文档、CoreAudio | macOS 13 arm64/x86_64 兼容门与最新系统性能门独立通过；两条 display-link 路径达标 |
-| 5. OpenHarmony/HarmonyOS | JSVM/V8 决策、XComponent、NativeWindow/VSync/OHAudio | API 10 bundled-V8 与 API 12 system-JSVM 分 profile 验证；最新设备性能 A/B 给出默认结论 |
-| 6. iOS | WKWebView Host Kit、async bridge、4.7 compliance hooks | iOS 15 兼容门与最新设备性能门独立通过；审核与能力限制公开 |
-| 7. 现代 GPU 实验 | Vulkan、Graphite/Dawn/direct native 候选 | 仅在端到端获益时调整默认 |
+现有 Tokio 只应服务 async I/O、timer 和 runtime worker，并保持 feature 最小化、有界队列和明确 shutdown；render/input/present 热路径不经 Tokio task 或通用 actor。
 
-阶段编号表达依赖关系，不阻止不同维护者并行做 spike；任何平台都不能绕过 contract、ABI 和 benchmark 门。
+### 10.2 新依赖准入
 
-## 13. 决策门与风险
+引入 dependency 前必须回答：
 
-### 13.1 尚未拍板或待数据确认
+1. 它替代哪段明确能力，谁拥有 lifecycle；
+2. 是否进入 shipped artifact 和热路径；
+3. 支持哪些 target/floor/arch，是否带 C/C++ runtime 或系统依赖；
+4. 二进制/RSS/startup/frame p99 的 A/B 数据；
+5. unsafe surface、漏洞响应、license、维护活跃度；
+6. 能否锁定版本、离线构建、生成 SBOM 和复现；
+7. 移除或 backend 失败时的迁移方案。
 
-- 开源定位已确定；具体 OSI-approved license 的 copyright holder/法律审批和切换日期仍是执行门，不再把“继续用 BSL 但称开源”列为候选；
-- Android 默认继续 GLES，还是在部分设备切换 ANGLE/Vulkan；
-- Swappy 是否替代或补充当前 Choreographer；
-- 哪些平台长期保留 cpal backend，哪些平台由 direct native audio driver 获得实质收益；
-- Windows WinUI 3 与 ANGLE 的最佳零拷贝组合；
-- macOS 13 `CVDisplayLink` fallback 与 macOS 14+ `NSView.displayLink` 在跨屏、遮挡、可变刷新率下的精确 pacing 参数和性能预算；
-- OpenHarmony/HarmonyOS 使用 JSVM 还是 bundled V8；
-- iOS 哪些同步 API 需要重定义或 JS-side cache；
-- ExternalTextureTarget 的首批宿主和同步协议。
+可接受的未来依赖类型包括平台官方 bindings、ANGLE、签名/attestation 工具和有明确 benchmark 的 native audio backend。不得为了“架构更现代”引入 wgpu、通用窗口库、ECS 或 server framework。
 
-### 13.2 主要风险
+## 11. 实施路线
 
-| 风险 | 控制方式 |
-|---|---|
-| 后端行为发散 | schema + conformance 是合并门 |
-| 抽象进入热路径 | 编译期后端、性能基线、copy/readback 计数 |
-| 为复用牺牲平台性能 | 约束内性能第一；平台独立 baseline、ADR 与可重复 A/B 是默认选择门 |
-| ANGLE/Skia/V8 构建复杂 | pinned revision、公开 patch、缓存、可复现脚本、SBOM |
-| 依赖/工具链升级静默抬高 OS、glibc 或 CPU 下限 | 受控 sysroot/deployment target、symbol/ISA audit、per-slice manifest diff 与最低版本启动门 |
-| 把最低版本与最新系统结果混成“平台通过” | 独立 CI lane、独立报告和双门发布判定；任何一门失败都不能由另一门抵消 |
-| Surface 销毁竞态 | generation、明确 retain/release、lifecycle chaos tests |
-| 桌面 UI toolkit 组合过多 | 稳定 C ABI + 少量官方 adapter，社区可扩展 |
-| Apple 审核/entitlement | distribution profile 与技术 backend 分开决策 |
-| Harmony API 差异 | OpenHarmony 与 HarmonyOS 分开 support profile |
-| “开源”宣传与许可证冲突 | 发布前许可证门和一致的公开文案 |
+### Milestone A：收紧当前 Android/Linux 候选发布
 
-### 13.3 明确非目标
+当前代码侧已经完成：
 
-- 让 core 自己管理所有平台的顶层窗口；
-- 在嵌入式 SDK 中强制使用 winit；
-- 用 CPU bitmap 作为所有 UI 框架的统一输出；
-- 让每个平台使用相同 JS/GPU/audio implementation；
-- 为提高代码复用率而覆盖一个在硬约束内稳定更快的平台专用实现；
-- 在没有设备数据时承诺 Vulkan、D3D12、Graphite 或 JSVM 更快；
-- 为了一个虚假的统一接口静默模拟不存在的平台能力；
-- 在多平台基础尚未稳定前拆成多个仓库。
+- C/Rust callback layout 对齐，并补齐 LP64/LLP64/ILP32 lanes；
+- `on_surface_released` 作为可选 wakeup，query 仍是权威状态；
+- listener exception 与诊断 sink exception 隔离；
+- Linux/Android C package manifest v2；
+- 完整 V8/snapshot identity 与 staged-file SHA-256 verifier；
+- Windows MSVC C ABI 持续 CI。
+- Linux toolkit-neutral `SurfaceHost` 与 Qt 6 Widgets/X11 Bound surface view，以及不构建 V8 的独立 contract gate。
+
+在指定 V8 builder 上继续完成：
+
+1. 从 pinned source/recipe 重建 Linux 与 Android 各 slice V8 component；
+2. 生成完整 `component-manifest.json`，不得为旧 archive 猜 revision/GN args；
+3. 用对应 archive 重建 snapshot，并验证所有 fingerprint；
+4. 构建 Linux/Android packages，运行外部 CMake/pkg-config consumer；
+5. 在最低与最新系统运行同一 artifact 的兼容/性能双门；
+6. 关闭 Android x86_64 snapshot/package 与多指真机验证缺口；
+7. 只有上述全部通过后冻结 C ABI v1。
+
+Linux Host Kit 的后续增量按独立能力交付，不扩张本次 surface-only 支持声明：
+
+1. 在 C ABI 的输入、IME、frame-request 与 lifecycle 合同稳定后实现 Qt Widgets Bound input/frame adapter；
+2. 再实现拥有 Session 的 Managed wrapper 和完整示例 App；
+3. 通过 toolkit 官方公开 API实现 GTK 4 X11/Wayland Host Kit；
+4. 设计同 GPU device 的 texture/fence ABI 后再实现 Qt Quick，不能先提交 readback 或 child-window overlay；
+5. 每个增量分别进入最低 Linux/Qt 兼容矩阵与最新系统性能矩阵。
+
+### Milestone B：Windows production vertical slice
+
+1. `build-v8-windows` + component manifest + isolate smoke；
+2. pinned ANGLE D3D11 package 与 provenance；
+3. Win32 child HWND presenter，真实 attach/resize/detach/present；
+4. WinUI SwapChainPanel presenter，单独 COM/thread contract；
+5. input/IME/frame clock/audio 与 Windows integrity 实现；
+6. `migo.dll` export allowlist、CMake/NuGet consumer；
+7. Windows 10 1809 compatibility 与最新 Windows performance lanes。
+
+该里程碑的退出条件是外部 App 使用已打包 DLL 在真机出帧并通过 teardown/device-loss，不是 `cargo check` 变绿。
+
+### Milestone C：macOS Metal vertical slice
+
+1. 两个 V8 arch component；
+2. NSView/CAMetalLayer Host Kit；
+3. ANGLE Metal 基线；
+4. 与原生 Skia Metal 方案做零拷贝/整帧 A/B；
+5. xcframework/SwiftPM、codesign/notarization 与双版本 CI。
+
+### Milestone D：OpenHarmony runtime decision
+
+1. XComponent/EGL/GLES vertical slice；
+2. JSVM 与 embedded V8 两个 prototype；
+3. 同一 conformance/performance/device matrix；
+4. 以数据选择默认，另一方案不自动成为 shipped fallback；
+5. HAR/HAP 和 artifact schema。
+
+### Milestone E：iOS WebKit Host Kit
+
+1. WKWebView container 与 lifecycle/audio/input bridge；
+2. JS API conformance 差异清单和可接受 capability；
+3. content/security/App Review policy gate；
+4. iOS 15 floor 与最新设备 performance lane；
+5. xcframework/SwiftPM artifact identity。
+
+## 12. 开源定位与发布阻塞
+
+项目定位被定义为开源，但当前根 `LICENSE` 是带竞争用途限制、到 2029-01-01 转 Apache-2.0 的 BSL 1.1。Change Date 之前它是 source-available，不满足 OSI 对自由再分发和不得限制使用领域的要求；这与 README 中“开源”的当前宣传不一致。
+
+技术架构不能代替 copyright holder 的法律决定，因此本文不擅自修改许可证。但公开 release 前必须原子完成其一：
+
+- 切换到 Apache-2.0 或其他 OSI-approved license，并同步 LICENSE/README/LEGAL/artifact metadata；或
+- 保留 BSL，并把当前版本准确称为 source-available，而不是 open source。
+
+如果坚持“开源项目”定位，许可证迁移是 release blocker，不是可选优化。平台 backend、build recipe、schema、verifier 和 conformance tests 也应在同一公开仓库，避免“开源 core、不可复现平台包”。
+
+## 13. 明确非目标
+
+- 一个跨平台顶层窗口框架；
+- 一个所有平台共享的 GPU backend 或 lowest-common-denominator renderer；
+- 运行时下载不受 manifest/签名约束的 native component；
+- 在一个 App 包里携带所有平台/arch 的 V8；
+- 用容器、QEMU 或 compile-only 结果替代所有真机门；
+- 为未来想象提前拆出大量空 crate；
+- 把 Actix、通用 actor 或 server framework 放进 render/input/present；
+- 在 iOS 全球 App Store artifact 中默认承诺 native V8/JIT；
+- 用一次 benchmark 永久固定 backend，不再持续测量。
 
 ## 14. 官方参考
 
-- Android：[Vulkan](https://developer.android.com/games/develop/vulkan/overview)、[Frame Pacing](https://developer.android.com/games/sdk/frame-pacing)、[TextureView](https://developer.android.com/reference/android/view/TextureView)
-- ANGLE：[官方仓库与 backend 支持矩阵](https://github.com/google/angle)
-- Skia：[Vulkan backend](https://docs.skia.org/docs/user/special/vulkan/)
-- Windows：[Windows App SDK 版本与 OS 支持](https://learn.microsoft.com/en-us/windows/apps/get-started/versioning-overview)、[SwapChainPanel](https://learn.microsoft.com/en-us/windows/windows-app-sdk/api/winrt/microsoft.ui.xaml.controls.swapchainpanel)、[DXGI frame latency](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject)
-- macOS：[macOS 14 AppKit display link](https://developer.apple.com/documentation/macos-release-notes/appkit-release-notes-for-macos-14)、[Chromium macOS 13 minimum change](https://chromium.googlesource.com/chromium/src/build/config/+/a81a7adbc68a0682ae811e1841ef8a6c9c6c9fa4%5E%21/)、[OpenGL 弃用说明](https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/OpenGL-MacProgGuide/opengl_intro/opengl_intro.html)、[JIT entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.allow-jit)
-- iOS：[Safari 15 WebGL 2/Metal](https://webkit.org/blog/11989/new-webkit-features-in-safari-15/)、[Xcode 支持矩阵](https://developer.apple.com/support/xcode)、[App Review Guidelines 4.7](https://developer.apple.com/app-store/review/guidelines/)、[WKScriptMessageHandlerWithReply](https://developer.apple.com/documentation/webkit/wkscriptmessagehandlerwithreply)
-- Linux：[Rust platform support](https://doc.rust-lang.org/rustc/platform-support.html)、[Chromium Linux sysroots](https://chromium.googlesource.com/chromium/src/build/+/refs/heads/main/linux/sysroot_scripts/sysroots.json)、[Mesa 平台与驱动](https://docs.mesa3d.org/systems.html)、[Wayland protocol](https://wayland.freedesktop.org/docs/html/apa.html)
-- OpenHarmony：[XComponent](https://gitee.com/openharmony/docs/blob/master/zh-cn/application-dev/ui/napi-xcomponent-guidelines.md)、[NativeWindow API](https://gitee.com/openharmony/docs/blob/43726785b4033887cd1a838aaaca5e255897a71e/en/application-dev/reference/apis-arkgraphics2d/_native_window.md)、[Native VSync API](https://gitcode.com/openharmony/docs/blob/OpenHarmony-5.1.0-Release/zh-cn/application-dev/reference/apis-arkgraphics2d/_native_vsync.md)、[OHAudio API](https://gitee.com/openharmony/docs/blob/master/en/application-dev/reference/apis-audio-kit/_o_h_audio.md)、[OpenHarmony 5.0 / API 12 JSVM](https://github.com/openharmony/docs/blob/master/en/release-notes/OpenHarmony-v5.0.0-release.md)
-- V8/rusty_v8：[V8 source build](https://v8.dev/docs/build)、[GN target configuration](https://v8.dev/docs/build-gn)、[ARM/Android cross compile](https://v8.dev/docs/cross-compile-arm)、[official support configurations](https://v8.dev/docs/official-support)、[rusty_v8 binary/source build](https://github.com/denoland/rusty_v8#binary-build)
-- CPU baseline：[V8 x64 assembler CPU feature contract](https://chromium.googlesource.com/v8/v8/+/main/src/codegen/x64/assembler-x64.cc)
-- 开源定义：[OSI Open Source Definition](https://opensource.org/osd)、[MariaDB BSL FAQ](https://mariadb.com/bsl-faq-mariadb/)
+- Android NDK Native Window：<https://developer.android.com/ndk/reference/group/a-native-window>
+- Android NDK Choreographer：<https://developer.android.com/ndk/reference/group/choreographer>
+- Windows 版本与 SDK 分离：<https://learn.microsoft.com/en-us/windows/apps/get-started/versioning-overview>
+- Windows App SDK 与既有 Win32/WPF/WinForms 集成：<https://learn.microsoft.com/en-us/windows/apps/windows-app-sdk/>
+- ANGLE backend 与平台支持：<https://chromium.googlesource.com/angle/angle/+/main>
+- ANGLE `EGL_ANGLE_platform_angle` 选择：<https://chromium.googlesource.com/angle/angle/+/main/doc/DevSetup.md>
+- Apple `WKWebView`：<https://developer.apple.com/documentation/webkit/wkwebview/>
+- Apple App Review Guidelines：<https://developer.apple.com/app-store/review/guidelines/>
+- Apple `CAMetalLayer`：<https://developer.apple.com/documentation/quartzcore/cametallayer>
+- OpenHarmony NativeWindow：<https://gitee.com/openharmony/docs/blob/master/en/application-dev/reference/apis-arkgraphics2d/_native_window.md>
+- OpenHarmony Native XComponent：<https://gitee.com/openharmony/docs/blob/master/en/application-dev/reference/apis-arkui/native__interface__xcomponent_8h.md>
+- OpenHarmony JSVM API（`@since 11`）：<https://gitee.com/openharmony/interface_sdk_c/tree/master/ark_runtime/jsvm>
+- OSI Open Source Definition：<https://opensource.org/osd>
 
----
-
-本文是目标架构和决策框架，不代表所有目标平台已经实现。具体实现计划应在本设计通过审阅后，按阶段拆成可验证、可回滚的小任务。
+这些参考说明平台能力和政策边界；Migo 的实际支持合同仍由仓库中的 versioned schema、artifact manifest、package verifier 和双测试门共同定义。

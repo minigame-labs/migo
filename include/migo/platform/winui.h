@@ -6,7 +6,8 @@
 /*
  * swap_chain_panel_native is an ISwapChainPanelNative-compatible COM pointer,
  * not an HWND. A future implementation takes its own COM reference before
- * attach returns and releases it during detach.
+ * attach returns success and releases it before the release observer reaches
+ * MIGO_SURFACE_RELEASE_RELEASED.
  */
 typedef struct MigoWinuiSwapChainPanelDescriptor {
     uint32_t struct_size;

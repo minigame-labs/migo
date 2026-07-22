@@ -20,7 +20,7 @@
 //!
 //! When run without `MIGO_SNAPSHOT_OUT`, it writes to
 //! `crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<arch>.bin` (arch = the ABI this
-//! binary was compiled for). `js-runtime/build.rs` embeds the matching file
+//! binary was compiled for). `runtime-v8/build.rs` embeds the matching file
 //! for android targets at compile time.
 //!
 //! # When to regenerate
@@ -37,6 +37,8 @@
 //! final release artifact.
 
 use std::path::PathBuf;
+
+const DEFAULT_SNAPSHOT_DIR_FROM_MANIFEST: &str = "../../crates/runtime-v8/snapshots";
 
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]
 compile_error!("profile-full and profile-slim are mutually exclusive");
@@ -141,15 +143,11 @@ fn main() {
     // `crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<arch>.bin`.
     //
     // The default path is per-arch (`std::env::consts::ARCH` is the arch this
-    // generator was compiled for), matching what `js-runtime/build.rs` selects.
+    // generator was compiled for), matching what `runtime-v8/build.rs` selects.
     let snapshot_path: PathBuf = match std::env::var_os("MIGO_SNAPSHOT_OUT") {
-        Some(p) => PathBuf::from(p),
-        None => [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "js-runtime",
-            "snapshots",
-            &match snapshot_kind {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let file_name = match snapshot_kind {
                 SnapshotKind::Host => format!(
                     "SNAPSHOT-{}-{}.bin",
                     PRODUCT_PROFILE,
@@ -160,10 +158,11 @@ fn main() {
                     PRODUCT_PROFILE,
                     std::env::consts::ARCH
                 ),
-            },
-        ]
-        .iter()
-        .collect(),
+            };
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(DEFAULT_SNAPSHOT_DIR_FROM_MANIFEST)
+                .join(file_name)
+        }
     };
 
     if let Some(dir) = snapshot_path.parent() {

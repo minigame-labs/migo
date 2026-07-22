@@ -6,7 +6,8 @@
 
 /*
  * display and surface are host-owned wl_display* and wl_surface*. The host
- * owns dispatch and the surface role; both objects remain valid until detach.
+ * owns dispatch and the surface role; both objects remain valid until the
+ * release observer reaches MIGO_SURFACE_RELEASE_RELEASED.
  */
 typedef struct MigoWaylandSurfaceDescriptor {
     uint32_t struct_size;

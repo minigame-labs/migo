@@ -31,7 +31,14 @@ export default class EventTarget {
     for (let i = 0; i < snapshot.length; i++) {
       try { snapshot[i].call(this, event); } catch (e) {
         // Match browser behavior: a listener throwing must not stop others.
-        if (typeof console !== "undefined" && console.error) console.error(e);
+        // Diagnostics are also untrusted embedder code. If console.error is
+        // replaced with a throwing function, that failure must not escape this
+        // catch block and abort the remaining listeners.
+        try {
+          if (typeof console !== "undefined" && console.error) console.error(e);
+        } catch {
+          // Reporting is best-effort; listener isolation is the contract.
+        }
       }
     }
     return !event.defaultPrevented;

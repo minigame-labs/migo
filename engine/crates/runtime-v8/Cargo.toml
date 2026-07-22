@@ -16,7 +16,7 @@ profile-slim = ["v8-limits", "code-signing"]
 worker-snapshot = []
 v8-limits = ["shared/v8-limits"]
 code-signing = ["shared/code-signing"]
-# Gate the image crate behind a feature flag — js-runtime does not use it directly.
+# Gate the image crate behind a feature flag — runtime-v8 does not use it directly.
 # Image decoding is handled by the `io` crate (which has its own `rust-image-decode` feature).
 rust-image-decode = ["dep:image"]
 

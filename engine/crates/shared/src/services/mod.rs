@@ -1,7 +1,7 @@
 //! Platform service traits for cross-platform device abstractions.
 //!
 //! These traits define the interface for device capabilities. Each platform
-//! implements these traits, and ops in js-runtime call them through HostOpState.
+//! implements these traits, and ops in runtime-v8 call them through HostOpState.
 //!
 //! # Error Convention
 //!

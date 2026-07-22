@@ -219,3 +219,20 @@ const _: () = assert!(offset_of!(MigoHostCallbacks, on_request_frame) == 64);
 const _: () = assert!(offset_of!(MigoHostCallbacks, on_update_keyboard) == 88);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(offset_of!(MigoHostCallbacks, on_surface_released) == 96);
+
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(size_of::<MigoError>() == 28);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(size_of::<MigoKeyboardShowOptions>() == 36);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(offset_of!(MigoKeyboardShowOptions, default_value_utf8) == 24);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(size_of::<MigoHostCallbacks>() == 56);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(offset_of!(MigoHostCallbacks, dispatch) == 16);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(offset_of!(MigoHostCallbacks, on_request_frame) == 36);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(offset_of!(MigoHostCallbacks, on_update_keyboard) == 48);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(offset_of!(MigoHostCallbacks, on_surface_released) == 52);

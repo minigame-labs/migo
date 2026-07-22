@@ -30,10 +30,9 @@
 #endif
 
 /*
- * This source-visible ABI is still a design candidate: several freeze blockers
- * listed in README.md are open, notably input contracts, asynchronous request
- * identity, capability queries, and an Android implementation of this same
- * contract. Do not treat it as stable.
+ * This source-visible ABI is still a design candidate. The remaining freeze
+ * blockers and target verification matrix are listed in README.md. Do not
+ * treat it as stable merely because linkable Android and Linux packages exist.
  */
 #define MIGO_C_ABI_CANDIDATE 1
 
@@ -53,9 +52,9 @@
  * symbols -- that is a different artifact, and this macro is about whether a
  * linkable runtime exists, not about which artifact carries it.
  *
- * What Android does NOT have yet is packaging: no pkg-config, no CMake package,
- * no versioned shared object. A host links the static library from the source
- * tree. That gap is tracked in README.md, not here.
+ * The Android C host SDK packages that static library with headers and CMake
+ * metadata. It deliberately has no pkg-config file or versioned shared object:
+ * an NDK consumer links the archive into its own native shared library.
  *
  * This says a runtime exists, not that the ABI is frozen; MIGO_C_ABI_CANDIDATE
  * remains 1 until the README's blockers are closed.
@@ -114,9 +113,9 @@
 #define MIGO_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
 #endif
 
-/* LP64 is the only shape that ships today (linux-x86_64, aarch64-linux-android).
- * Sizes that contain a pointer are asserted only there; ILP32 needs its own
- * numbers, and asserting invented ones would be worse than asserting none. */
+/* Shipping runtime slices are currently 64-bit, but the public ABI is checked
+ * on LP64, Windows LLP64, and ILP32 with both C and C++ compilers. This macro is
+ * a layout helper only; it must never be used as a support-target decision. */
 #if UINTPTR_MAX == UINT64_MAX
 #define MIGO_LP64 1
 #else

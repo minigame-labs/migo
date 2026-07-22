@@ -280,72 +280,29 @@ mkdir -p "$OUT_DIR"
 cp "$ARCHIVE" "$OUT_DIR/librusty_v8.a"
 cp "$GN_OUT/src_binding.rs" "$OUT_DIR/src_binding.rs"
 
-# Provenance. scripts/write-v8-component-manifest.py is not reused here: it
-# asserts Android specifics (NDK root, android_ndk_api_level, the Android patch
-# set) and reshaping it around a host build would make one tool answer to two
-# contracts. The Linux package manifest consumes this file through
-# gen-linux-package-metadata.py --v8-component-manifest.
-info "recording V8 provenance"
-MIGO_V8_ARCHIVE="$OUT_DIR/librusty_v8.a" \
-MIGO_V8_GN_ARGS="$GN_ARGS" \
-MIGO_V8_SRC="$RUSTY_V8_SRC" \
-MIGO_V8_OUT="$OUT_DIR/component-manifest.json" \
-python3 - <<'PY'
-import hashlib, json, os, pathlib, subprocess
-
-archive = pathlib.Path(os.environ["MIGO_V8_ARCHIVE"])
-source = pathlib.Path(os.environ["MIGO_V8_SRC"])
-
-def git(*args: str) -> str:
-    try:
-        return subprocess.run(["git", "-C", str(source), *args],
-                              capture_output=True, text=True, check=True).stdout.strip()
-    except (subprocess.CalledProcessError, OSError):
-        return ""
-
-def v8_version() -> str:
-    """major.minor.build.patch from v8-version.h, or "" if it cannot be read."""
-    header = source / "v8/include/v8-version.h"
-    if not header.is_file():
-        return ""
-    # The four macros are not named uniformly: MAJOR/MINOR carry a _VERSION
-    # suffix, the other two do not.
-    import re as _re
-    text = header.read_text()
-    parts = []
-    for macro in ("V8_MAJOR_VERSION", "V8_MINOR_VERSION", "V8_BUILD_NUMBER",
-                  "V8_PATCH_LEVEL"):
-        found = _re.search(rf"#define\s+{macro}\s+(\d+)", text)
-        if not found:
-            return ""
-        parts.append(found.group(1))
-    return ".".join(parts)
-
-
-digest = hashlib.sha256()
-with archive.open("rb") as handle:
-    for chunk in iter(lambda: handle.read(1 << 20), b""):
-        digest.update(chunk)
-
-manifest = {
-    "schema": "migo-v8-component-v1",
-    "target": "x86_64-unknown-linux-gnu",
-    "rusty_v8_revision": git("rev-parse", "HEAD"),
-    "rusty_v8_describe": git("describe", "--tags", "--always", "--dirty"),
-    "v8_version": v8_version(),
-    "gn_args": os.environ["MIGO_V8_GN_ARGS"].split(),
-    "archive_sha256": digest.hexdigest(),
-    "archive_bytes": archive.stat().st_size,
-    # The two properties this build exists to guarantee; the build fails before
-    # reaching here if either is violated, so recording them is a statement of
-    # what was verified, not a claim taken on trust.
-    "verified": {
-        "glibc_238_entry_points": 0,
-        "local_exec_tls_relocations": 0,
-    },
+# Emit the same sealed component contract Android uses, with Linux's target and
+# loader floors. The package generator embeds this complete identity; it no
+# longer accepts the old three-field provenance note.
+info "recording and verifying V8 component identity"
+V8_SYSROOT="$RUSTY_V8_SRC/build/linux/debian_bullseye_amd64-sysroot"
+[[ -d "$V8_SYSROOT" ]] || {
+    err "the GN build did not materialize its Debian bullseye sysroot at $V8_SYSROOT"
+    exit 1
 }
-pathlib.Path(os.environ["MIGO_V8_OUT"]).write_text(json.dumps(manifest, indent=2) + "\n")
-print(f"wrote {os.environ['MIGO_V8_OUT']}")
-PY
+PATCH_ARGS=()
+PREBUILT_BINDING_PATCH="$ENGINE_ROOT/third_party/v8-patches/migo-build-rs-prebuilt-binding.diff"
+if git -C "$RUSTY_V8_SRC" apply --reverse --check "$PREBUILT_BINDING_PATCH" \
+        >/dev/null 2>&1; then
+    PATCH_ARGS+=(--patch "migo-build-rs-prebuilt-binding=$PREBUILT_BINDING_PATCH")
+fi
+python3 "$SCRIPT_DIR/write-linux-v8-component-manifest.py" \
+    --repo-root "$PROJECT_ROOT" \
+    --rusty-v8-src "$RUSTY_V8_SRC" \
+    --gn-args "$GN_ARGS" \
+    --archive "$OUT_DIR/librusty_v8.a" \
+    --binding "$OUT_DIR/src_binding.rs" \
+    --sysroot "$V8_SYSROOT" \
+    --output "$OUT_DIR/component-manifest.json" \
+    "${PATCH_ARGS[@]}"
 
 info "done: $OUT_DIR/librusty_v8.a ($(stat -c %s "$OUT_DIR/librusty_v8.a") bytes)"

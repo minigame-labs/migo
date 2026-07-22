@@ -52,9 +52,55 @@ ln -sf "$NDK_BIN/llvm-ar" "$SHIM_DIR/$TARGET-ar"
 export PATH="$SHIM_DIR:$PATH"
 
 V8_DIR="$ENGINE_DIR/third_party/rusty_v8/$ARCH"
-[[ -f "$V8_DIR/librusty_v8.a" ]] || { err "missing $V8_DIR/librusty_v8.a"; exit 1; }
-export RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a"
-export RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs"
+V8_ARCHIVE="$V8_DIR/librusty_v8.a"
+V8_BINDING="$V8_DIR/src_binding.rs"
+[[ -f "$V8_ARCHIVE" ]] || { err "missing $V8_ARCHIVE"; exit 1; }
+[[ -f "$V8_BINDING" ]] || { err "missing $V8_BINDING"; exit 1; }
+V8_MANIFEST="$V8_DIR/component-manifest.json"
+[[ -f "$V8_MANIFEST" ]] || {
+    err "missing verified V8 component manifest $V8_MANIFEST"
+    err "rebuild this platform's V8 artifact on the V8 build machine"
+    exit 1
+}
+export RUSTY_V8_ARCHIVE="$V8_ARCHIVE"
+export RUSTY_V8_SRC_BINDING_PATH="$V8_BINDING"
+
+MANIFEST_TOOL="${MIGO_ARTIFACT_MANIFEST_TOOL:-}"
+if [[ -z "$MANIFEST_TOOL" ]]; then
+    MANIFEST_TOOL_TARGET="${MIGO_ARTIFACT_MANIFEST_TARGET_DIR:-$REPO_ROOT/tools/artifact-manifest/target}"
+    CARGO_TARGET_DIR="$MANIFEST_TOOL_TARGET" cargo build \
+        --manifest-path "$REPO_ROOT/tools/artifact-manifest/Cargo.toml" \
+        --locked --release
+    MANIFEST_TOOL="$MANIFEST_TOOL_TARGET/release/migo-artifact-manifest"
+fi
+[[ -x "$MANIFEST_TOOL" ]] || { err "artifact manifest verifier is not executable: $MANIFEST_TOOL"; exit 1; }
+
+info "verifying V8 component bytes before linking"
+"$MANIFEST_TOOL" verify-v8-component \
+    "$V8_MANIFEST" "$V8_ARCHIVE" "$V8_BINDING" >/dev/null
+
+SNAPSHOT_BIN="$ENGINE_DIR/crates/runtime-v8/snapshots/SNAPSHOT-full-$ARCH.bin"
+SNAPSHOT_MANIFEST="$SNAPSHOT_BIN.manifest.json"
+[[ -f "$SNAPSHOT_MANIFEST" ]] || {
+    err "missing snapshot identity $SNAPSHOT_MANIFEST (regenerate the snapshot)"
+    exit 1
+}
+# Freshness-only CI accepts a Git LFS pointer as an artifact identity. A package
+# build cannot: runtime-v8 must embed the real bytes, and a source-JS fallback
+# must never be mislabeled as snapshot_policy=embedded in the package manifest.
+# shellcheck source=scripts/lib/snapshot-fingerprint.sh
+source "$SCRIPT_DIR/lib/snapshot-fingerprint.sh"
+snapshot_require_materialized_snapshot "$SNAPSHOT_BIN"
+info "verifying the target host/full snapshot before compiling"
+bash "$SCRIPT_DIR/check-snapshot-freshness.sh" --product-profile full "$ARCH"
+
+BUILD_METADATA="$ENGINE_DIR/target/$TARGET/release/migo-android-build-metadata.json"
+python3 "$SCRIPT_DIR/write-android-build-metadata.py" \
+    --repo-root "$REPO_ROOT" \
+    --output "$BUILD_METADATA" \
+    --ndk-home "$ANDROID_NDK_HOME" \
+    --target-triple "$TARGET" \
+    --build-recipe scripts/build-android-sdk.sh
 
 info "building capi staticlib (release, $TARGET)"
 cargo build -p migo-capi --release --target "$TARGET" --manifest-path "$ENGINE_DIR/Cargo.toml"
@@ -71,10 +117,6 @@ cargo rustc -p migo-capi --release --target "$TARGET" \
 grep -q "native-static-libs:" "$CARGO_OUT" \
     || { err "no native-static-libs note in cargo output"; exit 1; }
 
-SNAPSHOT_BIN="$ENGINE_DIR/crates/runtime-v8/snapshots/SNAPSHOT-full-$ARCH.bin"
-[[ -f "$SNAPSHOT_BIN" ]] || { err "missing embedded snapshot $SNAPSHOT_BIN (run gen-snapshot.sh)"; exit 1; }
-V8_LOCK="$REPO_ROOT/contracts/artifact-manifest/android-v8.lock.json"
-
 info "staging package at $PREFIX"
 rm -rf "$PREFIX"
 mkdir -p "$PREFIX/include" "$PREFIX/lib"
@@ -85,7 +127,12 @@ python3 "$SCRIPT_DIR/gen-android-package-metadata.py" \
     --prefix "$PREFIX" --version "$VERSION" --arch "$ARCH" --cargo-output "$CARGO_OUT"
 python3 "$SCRIPT_DIR/gen-android-package-metadata.py" --manifest \
     --prefix "$PREFIX" --version "$VERSION" --arch "$ARCH" --cargo-output "$CARGO_OUT" \
-    --snapshot-bin "$SNAPSHOT_BIN" --v8-lock "$V8_LOCK"
+    --snapshot-bin "$SNAPSHOT_BIN" --snapshot-manifest "$SNAPSHOT_MANIFEST" \
+    --v8-component-manifest "$V8_MANIFEST" --build-metadata "$BUILD_METADATA"
+
+PACKAGE_MANIFEST="$PREFIX/share/migo/android-$ABI-manifest.json"
+info "verifying the complete staged package tree"
+"$MANIFEST_TOOL" verify-android-package "$PACKAGE_MANIFEST" "$PREFIX" >/dev/null
 
 info "package staged:"
 find "$PREFIX" -type f | sed "s#^$PREFIX#  <prefix>#" | sort

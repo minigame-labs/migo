@@ -101,8 +101,8 @@ MANIFEST_TOOL="$REPO_ROOT/tools/artifact-manifest"
 if [[ -f "$MANIFEST" ]]; then
     if MANIFEST_TOOL_OUT="$(cargo run --quiet --offline \
             --manifest-path "$MANIFEST_TOOL/Cargo.toml" \
-            -- verify-linux-package "$MANIFEST" 2>&1)"; then
-        pass "manifest is internally consistent ($MANIFEST_TOOL_OUT)"
+            -- verify-linux-package "$MANIFEST" "$PREFIX" 2>&1)"; then
+        pass "manifest and staged artifact bytes are consistent ($MANIFEST_TOOL_OUT)"
     else
         fail "manifest failed validation: $MANIFEST_TOOL_OUT"
     fi

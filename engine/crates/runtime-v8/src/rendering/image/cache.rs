@@ -29,7 +29,7 @@ pub type ImageCacheKey = (String, u64);
 /// and mount generation.
 ///
 /// Internally the resize dimensions are folded into the path with a
-/// NUL-delimited suffix (`"{src}\0{tw}x{th}"`) so the js-runtime-side
+/// NUL-delimited suffix (`"{src}\0{tw}x{th}"`) so the runtime-v8-side
 /// alias table can key on a single `(String, u64)` per logical
 /// (path, size) pair.  For boundary lookups into the decoded-RGBA
 /// `migo_io::global_cache` (which uses a native `(path, gen, tw, th)` tuple),
@@ -48,7 +48,7 @@ pub fn make_cache_key(
     (canonical, mount_generation)
 }
 
-/// Convert a js-runtime-side `ImageCacheKey` (mangled-suffix form) into
+/// Convert a runtime-v8-side `ImageCacheKey` (mangled-suffix form) into
 /// the native 4-tuple used by `migo_io::global_cache`.  Unmangled keys
 /// (no NUL delimiter) map to the `(path, gen, 0, 0)` full-resolution
 /// slot that [`migo_io::image_cache::full_res_key`] produces.

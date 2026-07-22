@@ -1,23 +1,13 @@
 name: PR CI
 
 on:
-  # Skip pure-docs changes: they can't affect the Rust build or the Android AAR,
-  # so there's no point spending ~23 min on the build job for a README/NOTICE
-  # edit. `paths-ignore` only skips a run when EVERY changed file matches, so a
-  # PR touching any non-doc file still runs. pr-ci is not a required check, so a
-  # skipped docs-only PR is not blocked from merging.
+  # Architecture Markdown is part of executable boundary contracts, and legal
+  # metadata is part of the release identity. A docs-only PR therefore still
+  # needs the quality gate; do not add a blanket Markdown paths-ignore rule.
   pull_request:
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE*"
-      - "NOTICE*"
   push:
     branches:
       - master
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE*"
-      - "NOTICE*"
 
 # Cancel in-progress runs for the same PR/branch
 concurrency:
@@ -35,7 +25,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
 
@@ -80,6 +70,9 @@ jobs:
       - name: Core/V8 dependency boundary contract
         run: bash scripts/test-core-v8-boundary-contract.sh
 
+      - name: Foundation/runtime dependency boundary contract
+        run: bash scripts/test-foundation-runtime-boundary-contract.sh
+
       - name: Platform services capability contract
         run: bash scripts/test-platform-services-capability-contract.sh
 
@@ -102,6 +95,9 @@ jobs:
         run: |
           python3 scripts/ci/tests/test_abi_floor_audit.py
           python3 scripts/ci/tests/test_gen_linux_package_metadata.py
+          python3 scripts/ci/tests/test_gen_android_package_metadata.py
+          python3 scripts/ci/tests/test_write_linux_build_metadata.py
+          python3 scripts/ci/tests/test_write_linux_v8_component_manifest.py
 
       - name: Artifact manifest tooling and contract
         run: |
@@ -110,7 +106,7 @@ jobs:
           bash scripts/test-artifact-manifest-contract.sh
 
       # Host clippy/test are SCOPED to the crates that build on a plain Linux
-      # host: shared, io, js-runtime. The graphics (skia → needs EGL/GLES dev
+      # host: shared, io, runtime-v8. The graphics (skia → needs EGL/GLES dev
       # headers) and audio (alsa-sys → needs libasound) crates only build with
       # their system deps, which this fast gate does not install — they are
       # compiled for the real target by the Android `build` job below
@@ -127,9 +123,9 @@ jobs:
         working-directory: engine
         run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi --all-targets -- --cap-lints warn
 
-      # Blocking gate for the host-buildable crates (shared + io + js-runtime).
+      # Blocking gate for the host-buildable crates (shared + io + runtime-v8).
       # All their lib tests must pass. Previously-masked failures have been
-      # fixed at the root: shared/js-runtime had 5 real defects / stale
+      # fixed at the root: shared/runtime-v8 had 5 real defects / stale
       # assertions; io had test-only global state (domain/scheduler hooks + an
       # image-run counter) that deadlocked or raced under parallel execution and
       # is now per-instance. The handful of io tests needing image fixtures
@@ -164,16 +160,42 @@ jobs:
           python3 -m py_compile \
             scripts/ci/compare_baseline.py \
             scripts/ci/check_migo_test_suite.py \
+            scripts/gen-android-package-metadata.py \
+            scripts/gen-linux-package-metadata.py \
             scripts/generate-android-artifact-manifests.py \
             scripts/write-android-build-metadata.py \
+            scripts/write-linux-build-metadata.py \
+            scripts/write-linux-v8-component-manifest.py \
             scripts/write-v8-component-manifest.py \
             scripts/verify-android-aar-manifests.py
 
-  # ── Job 2: Android AAR build — the real "does the whole project compile,
+  # ── Job 2: Linux Qt Host Kit (isolated source contract; no V8/LFS) ──
+  linux-qt-host-kit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout (without LFS)
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Install Qt/X11 Host Kit dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build g++ ripgrep xvfb xauth \
+            qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins \
+            libx11-dev libxkbcommon-x11-dev libxcb-cursor0
+
+      - name: Linux Qt Host Kit contract
+        run: bash scripts/test-linux-qt-host-kit.sh
+
+  # ── Job 3: Android AAR build — the real "does the whole project compile,
   # link, and embed the profile/ABI snapshot" gate (cross-compiles graphics/audio
   # via the NDK, where skia/alsa deps are handled). ───────────────────
   build:
-    needs: quality-gate
+    needs: [quality-gate, linux-qt-host-kit]
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -192,7 +214,10 @@ jobs:
       # (and profile/ABI snapshots) as ~130-byte pointer stubs — which makes the
       # rusty_v8 build script emit "could not find native static library
       # rusty_v8" and the .so link fail. Force the smudge for exactly the files
-      # this job links/embeds (both shipped ABIs) and guard against a pointer.
+      # this job links and the committed arm64 snapshots it embeds. x86_64
+      # debug builds intentionally exercise the source-JS fallback until the
+      # emulator workflow's full/slim snapshots are reviewed and committed;
+      # the tag/release job remains fail-closed for those required artifacts.
       - name: Materialize LFS objects (V8 archives + snapshots)
         run: |
           git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/runtime-v8/snapshots/SNAPSHOT-*.bin"
@@ -200,9 +225,7 @@ jobs:
             engine/third_party/rusty_v8/aarch64/librusty_v8.a \
             engine/third_party/rusty_v8/x86_64/librusty_v8.a \
             engine/crates/runtime-v8/snapshots/SNAPSHOT-full-aarch64.bin \
-            engine/crates/runtime-v8/snapshots/SNAPSHOT-full-x86_64.bin \
-            engine/crates/runtime-v8/snapshots/SNAPSHOT-slim-aarch64.bin \
-            engine/crates/runtime-v8/snapshots/SNAPSHOT-slim-x86_64.bin ; do
+            engine/crates/runtime-v8/snapshots/SNAPSHOT-slim-aarch64.bin ; do
             sz=$(stat -c %s "$f")
             echo "$f: $sz bytes"
             [ "$sz" -gt 100000 ] || { echo "ERROR: $f is still an LFS pointer"; exit 1; }
@@ -220,7 +243,7 @@ jobs:
           python-version: "3.11"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
@@ -283,8 +306,9 @@ jobs:
         working-directory: platforms/android
         run: ./gradlew :library:testFullDebugUnitTest :library:testSlimDebugUnitTest
 
-      # Build both products for both shipped ABIs. build.rs embeds only the
-      # matching SNAPSHOT-<profile>-<arch>.bin after schema-v2 validation.
+      # Build both products for both candidate ABIs. build.rs embeds only a
+      # matching validated snapshot; the x86_64 debug slice currently verifies
+      # the explicit source-JS fallback and is not a release-support claim.
       - name: Build Android AARs (debug)
         run: |
           bash scripts/build-aar.sh --product-profile full debug arm64-v8a x86_64

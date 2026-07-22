@@ -32,28 +32,57 @@ export LIBRARY_PATH="$LINK_DIR:${LIBRARY_PATH:-}"
 # host GCC's copy. A plain -L lands after those built-ins and loses the race.
 RUSTFLAGS_SYSROOT_LINK+=" -C link-arg=-B$LINK_DIR -C link-arg=-L$LINK_DIR"
 
-# Prefer the archive scripts/build-v8-linux.sh installed: it is the one built
-# against the sysroot and configured so it can enter a shared object. The
-# rusty_v8_src build directory is only a fallback for a checkout that has not
-# run that script yet, and it cannot produce libmigo.so.
+# SDK packages accept only the archive installed by build-v8-linux.sh together
+# with its verified component manifest. An arbitrary development archive may be
+# useful for a local executable, but it cannot make a reproducible support-floor
+# or provenance claim and therefore must never enter a published SDK.
 V8_SDK_DIR="$ENGINE_DIR/third_party/rusty_v8/x86_64-linux-gnu"
-if [[ -f "$V8_SDK_DIR/librusty_v8.a" ]]; then
-    V8_ARCHIVE="$V8_SDK_DIR/librusty_v8.a"
-    V8_BINDING="$V8_SDK_DIR/src_binding.rs"
-    V8_MANIFEST="$V8_SDK_DIR/component-manifest.json"
-else
-    V8_DIR="${MIGO_HOST_V8_DIR:-$REPO_ROOT/../rusty_v8_src/target/$TARGET/release/gn_out}"
-    V8_ARCHIVE="$V8_DIR/obj/librusty_v8.a"
-    V8_BINDING="$V8_DIR/src_binding.rs"
-    V8_MANIFEST=""
-    echo "[linux-sdk] warning: using $V8_ARCHIVE; run scripts/build-v8-linux.sh" >&2
-    echo "[linux-sdk] warning: for an archive that meets the floor and can build libmigo.so" >&2
-fi
+V8_ARCHIVE="$V8_SDK_DIR/librusty_v8.a"
+V8_BINDING="$V8_SDK_DIR/src_binding.rs"
+V8_MANIFEST="$V8_SDK_DIR/component-manifest.json"
 [[ -f "$V8_ARCHIVE" ]] || { echo "[linux-sdk] no V8 archive at $V8_ARCHIVE" >&2; exit 1; }
+[[ -f "$V8_BINDING" ]] || { echo "[linux-sdk] no V8 Rust binding at $V8_BINDING" >&2; exit 1; }
+[[ -f "$V8_MANIFEST" ]] || {
+    echo "[linux-sdk] no verified V8 component manifest at $V8_MANIFEST" >&2
+    echo "[linux-sdk] rebuild V8 on the V8 build machine before packaging" >&2
+    exit 1
+}
 [[ "$(stat -c %s "$V8_ARCHIVE")" -gt 1000000 ]] \
     || { echo "[linux-sdk] V8 archive looks like a stub or LFS pointer" >&2; exit 1; }
 export RUSTY_V8_ARCHIVE="$V8_ARCHIVE"
 export RUSTY_V8_SRC_BINDING_PATH="$V8_BINDING"
+
+MANIFEST_TOOL="${MIGO_ARTIFACT_MANIFEST_TOOL:-}"
+if [[ -z "$MANIFEST_TOOL" ]]; then
+    MANIFEST_TOOL_TARGET="${MIGO_ARTIFACT_MANIFEST_TARGET_DIR:-$REPO_ROOT/tools/artifact-manifest/target}"
+    CARGO_TARGET_DIR="$MANIFEST_TOOL_TARGET" cargo build \
+        --manifest-path "$REPO_ROOT/tools/artifact-manifest/Cargo.toml" \
+        --locked --release
+    MANIFEST_TOOL="$MANIFEST_TOOL_TARGET/release/migo-artifact-manifest"
+fi
+[[ -x "$MANIFEST_TOOL" ]] || {
+    echo "[linux-sdk] artifact manifest verifier is not executable: $MANIFEST_TOOL" >&2
+    exit 1
+}
+
+info "verifying V8 component bytes before linking"
+"$MANIFEST_TOOL" verify-v8-component \
+    "$V8_MANIFEST" "$V8_ARCHIVE" "$V8_BINDING" >/dev/null
+V8_SYSROOT_IDENTITY="$(python3 - "$V8_MANIFEST" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(manifest["toolchain"]["sdk"])
+PY
+)"
+if [[ "$V8_SYSROOT_IDENTITY" != "$MIGO_SYSROOT_IDENTITY" ]]; then
+    echo "[linux-sdk] V8 component sysroot identity does not match the engine sysroot" >&2
+    echo "[linux-sdk] V8:     $V8_SYSROOT_IDENTITY" >&2
+    echo "[linux-sdk] engine: $MIGO_SYSROOT_IDENTITY" >&2
+    exit 1
+fi
 
 # The NDK must not be visible, or skia-bindings picks its toolchain over ours.
 unset ANDROID_NDK ANDROID_NDK_HOME
@@ -164,6 +193,14 @@ if [[ -z "$LLD_BIN" ]]; then
     exit 1
 fi
 
+BUILD_METADATA="$ENGINE_DIR/target/$TARGET/release/migo-linux-build-metadata.json"
+python3 "$SCRIPT_DIR/write-linux-build-metadata.py" \
+    --repo-root "$REPO_ROOT" \
+    --output "$BUILD_METADATA" \
+    --compiler "$CXX" \
+    --linker "$LLD_BIN" \
+    --sysroot-identity "$MIGO_SYSROOT_IDENTITY"
+
 info "linking libmigo.so (linker: $LLD_BIN)"
 SO_MAP="$ENGINE_DIR/crates/capi/migo.map"
 ENTRY_POINTS=$(grep -ohE '\bmigo_[a-z0-9_]+[[:space:]]*\(' "$REPO_ROOT"/include/migo/*.h \
@@ -211,8 +248,12 @@ NEEDED_FILE="$ENGINE_DIR/target/$TARGET/release/dt-needed.txt"
 python3 "$SCRIPT_DIR/abi-floor-audit.py" needed "$SO_BUILD" > "$NEEDED_FILE"
 python3 "$SCRIPT_DIR/gen-linux-package-metadata.py" --manifest \
     --prefix "$PREFIX" --version "$VERSION" \
-    --needed-from "$NEEDED_FILE" --sysroot "$MIGO_SYSROOT" \
-    ${V8_MANIFEST:+--v8-component-manifest "$V8_MANIFEST"}
+    --needed-from "$NEEDED_FILE" --sysroot "$MIGO_SYSROOT_IDENTITY" \
+    --v8-component-manifest "$V8_MANIFEST" --build-metadata "$BUILD_METADATA"
+
+PACKAGE_MANIFEST="$PREFIX/share/migo/linux-x86_64-manifest.json"
+info "verifying the complete staged package tree"
+"$MANIFEST_TOOL" verify-linux-package "$PACKAGE_MANIFEST" "$PREFIX" >/dev/null
 
 info "staged:"
 find "$PREFIX" -type f -o -type l | sed "s|$PREFIX|  <prefix>|" | sort

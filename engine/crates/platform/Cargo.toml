@@ -5,11 +5,12 @@ edition = "2024"
 
 [lib]
 name = "platform"
-# rlib only. The Android cdylib (`libmigo.so`) is the separate `android-jni`
-# crate: a cdylib here would be built for every target, and on a glibc host the
-# Linux V8 archive cannot be linked into a shared object (CLAUDE.md §10), which
-# is what previously kept `cargo test -p platform` and the Linux player from
-# building without a crate-type toggle.
+# rlib only. This crate contains reusable platform policy and presenters, while
+# each delivery boundary chooses its native artifact independently: Android's
+# JNI `libmigo.so` lives in `android-jni`, and the Linux SDK links the C ABI
+# static archive under an audited version script. Keeping artifact shape out of
+# this crate also leaves host tests and the standalone player ordinary Rust
+# consumers instead of forcing every target to emit the same library kind.
 crate-type = ["rlib"]
 
 [features]

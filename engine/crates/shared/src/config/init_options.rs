@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use deno_core::serde_json::{Map, Value};
+use serde_json::{Map, Value};
 
 /// Extra options for platform-specific or experimental features.
 ///
@@ -576,7 +576,7 @@ mod tests {
         // newline + quote in the source to exercise escaping.
         let json =
             r#"[{"name":"<a>","source":"line1\nline2"},{"name":"<b>","source":"alert(\"hi\")"}]"#;
-        let parsed: Vec<Entry> = deno_core::serde_json::from_str(json).unwrap();
+        let parsed: Vec<Entry> = serde_json::from_str(json).unwrap();
         let pairs: Vec<(String, String)> = parsed.into_iter().map(|e| (e.name, e.source)).collect();
 
         let opt = InitOptions::new().with_prelude_scripts(pairs);

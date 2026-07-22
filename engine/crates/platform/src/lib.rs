@@ -1,10 +1,10 @@
 #[cfg(target_os = "android")]
 pub mod android;
 
-#[cfg(not(target_os = "android"))]
-pub mod desktop;
 #[path = "android/jni/profile_contract.rs"]
 pub(crate) mod jni_profile_contract;
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+pub mod linux;
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]
 compile_error!("profile-full and profile-slim are mutually exclusive");
 #[cfg(all(feature = "worker-snapshot", not(feature = "profile-full")))]

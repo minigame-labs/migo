@@ -16,6 +16,7 @@ import tempfile
 
 
 REVISION = re.compile(r"^[0-9a-fA-F]{40}$")
+MIGO_LICENSES = ["Apache-2.0", "BSD-3-Clause", "BSL-1.1", "MIT"]
 
 
 def command_output(command: list[str], label: str) -> str:
@@ -71,6 +72,20 @@ def source_revision(repo_root: pathlib.Path, explicit: str | None) -> str:
     return value
 
 
+def repository_recipe(repo_root: pathlib.Path, value: str) -> tuple[str, pathlib.Path]:
+    candidate = pathlib.PurePosixPath(value)
+    if (
+        candidate.is_absolute()
+        or not candidate.parts
+        or any(part in ("", ".", "..") for part in candidate.parts)
+    ):
+        raise RuntimeError("build recipe must be a safe repository-relative path")
+    path = repo_root.joinpath(*candidate.parts)
+    if not path.is_file():
+        raise RuntimeError(f"build recipe does not exist: {path}")
+    return candidate.as_posix(), path
+
+
 def write_json_atomic(path: pathlib.Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -93,6 +108,8 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--ndk-home", type=pathlib.Path)
     parser.add_argument("--source-revision")
+    parser.add_argument("--build-recipe", default="scripts/build-aar.sh")
+    parser.add_argument("--target-triple", default="aarch64-linux-android")
     arguments = parser.parse_args()
 
     try:
@@ -111,11 +128,11 @@ def main() -> int:
         if not match:
             raise RuntimeError(f"NDK revision is missing from {properties}")
         prebuilt = find_prebuilt(ndk)
-        clang = prebuilt / "bin/aarch64-linux-android26-clang++"
+        clang = prebuilt / f"bin/{arguments.target_triple}26-clang++"
         if not clang.is_file():
             clang = prebuilt / "bin/clang++"
         linker = prebuilt / "bin/ld.lld"
-        recipe = repo_root / "scripts/build-aar.sh"
+        recipe_name, recipe = repository_recipe(repo_root, arguments.build_recipe)
         metadata = {
             "schema": "migo-android-build-metadata/v1",
             "toolchain": {
@@ -129,9 +146,9 @@ def main() -> int:
             },
             "provenance": {
                 "source_revision": source_revision(repo_root, arguments.source_revision),
-                "build_recipe": "scripts/build-aar.sh",
+                "build_recipe": recipe_name,
                 "build_recipe_sha256": file_hash(recipe),
-                "licenses": ["Apache-2.0", "BSD-3-Clause", "MIT"],
+                "licenses": MIGO_LICENSES,
             },
         }
         write_json_atomic(arguments.output.resolve(), metadata)

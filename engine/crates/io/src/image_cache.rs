@@ -189,7 +189,7 @@ impl TrimLevel {
 /// split: a non-zero pin count promotes the entry to the "live"
 /// set.  Eviction and trim both skip pinned entries; callers lift
 /// the pin via [`Self::unpin`] exactly when the upstream reference
-/// count reaches zero (see `js-runtime/rendering/image/cache.rs`).
+/// count reaches zero (see `runtime-v8/src/rendering/image/cache.rs`).
 ///
 /// When the cache is at its byte budget and every remaining entry
 /// is pinned, new inserts still succeed — the invariant "bytes for
@@ -294,7 +294,7 @@ impl ImageCache {
             // Defensive: unpin without a matching pin.  Don't
             // panic — log once so the bug is visible but the
             // runtime keeps going.  Common cause would be a
-            // refcount accounting drift in `js-runtime::image::
+            // refcount accounting drift in `runtime-v8::image::
             // cache::ImageCache`.
             shared::warn_once!(
                 path = key.0.as_str(),

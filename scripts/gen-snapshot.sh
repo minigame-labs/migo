@@ -9,7 +9,7 @@
 # (linking the committed android V8 archive) and RUN it on that ABI's
 # emulator/device (Deno issue #27496 approach), then pull the result into
 #   engine/crates/runtime-v8/snapshots/SNAPSHOT-<profile>-<arch>.bin
-# which js-runtime/build.rs embeds (android targets only) at .so build time.
+# which runtime-v8/build.rs embeds (android targets only) at .so build time.
 #
 # Usage:
 #   scripts/gen-snapshot.sh <x86_64|arm64> [--product-profile full|slim]

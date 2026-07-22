@@ -1221,7 +1221,7 @@ fn read_zip_entries_from_reader<R: Read + std::io::Seek>(
     reader: R,
     entries_json: &str,
 ) -> Result<Vec<ZipEntryResult>, EngineError> {
-    use deno_core::serde_json;
+    use serde_json;
 
     let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
         EngineError::new(ErrorCode::IoError).with_detail(format!("invalid zip: {}", e))
@@ -1535,7 +1535,7 @@ pub fn get_file_info(
 mod tests {
     use super::*;
     use std::{
-        io::{self, Write as _},
+        io,
         path::Path,
         sync::{
             Arc,

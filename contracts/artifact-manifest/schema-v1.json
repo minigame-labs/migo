@@ -43,6 +43,11 @@
       "minLength": 1,
       "not": { "enum": ["unknown", "UNKNOWN", "unset", "UNSET"] }
     },
+    "packageVersion": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
@@ -91,6 +96,28 @@
         "android_api": { "const": "26" }
       }
     },
+    "linuxV8Target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["triple", "os", "arch", "abi", "cpu_baseline", "required_cpu_features", "runtime_floor"],
+      "properties": {
+        "triple": { "const": "x86_64-unknown-linux-gnu" },
+        "os": { "const": "linux" },
+        "arch": { "const": "x86_64" },
+        "abi": { "const": "gnu" },
+        "cpu_baseline": { "const": "x86-64-v1" },
+        "required_cpu_features": { "const": ["cmov", "sse2"] },
+        "runtime_floor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["glibc", "glibcxx"],
+          "properties": {
+            "glibc": { "const": "2.31" },
+            "glibcxx": { "const": "3.4.28" }
+          }
+        }
+      }
+    },
     "toolchain": {
       "type": "object",
       "additionalProperties": false,
@@ -119,7 +146,6 @@
         },
         "patches": {
           "type": "array",
-          "minItems": 1,
           "items": { "$ref": "#/$defs/patch" }
         }
       }

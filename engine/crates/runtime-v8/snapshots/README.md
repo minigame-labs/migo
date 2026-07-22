@@ -25,7 +25,7 @@ sidecar data (module map, op count, extension names).
 | Change | If you DON'T regenerate |
 |---|---|
 | **Extension JS** (any `*.js` under `crates/runtime-v8`: `99_main.js`, `97_wx_namespace.js`, a feature's ESM, …) | ⚠️ **Silent staleness** — with a snapshot the extension JS is *not* re-loaded from source, so the runtime runs the OLD baked code. |
-| **Op/runtime/generator changes** (`js-runtime` or `snapshot-gen` Rust/Cargo inputs) | 💥 May change the external-ref table, extension assembly, or snapshot options. Schema v3 rejects all such changes conservatively. |
+| **Op/runtime/generator changes** (`runtime-v8` or `snapshot-gen` Rust/Cargo inputs) | 💥 May change the external-ref table, extension assembly, or snapshot options. Schema v3 rejects all such changes conservatively. |
 | **Snapshot kind substitution** (host bytes renamed as Worker, or the reverse) | 💥 Different extension/op table and bootstrap heap. Schema v3 binds `snapshot_kind` and rejects substitution. |
 | **Extension set/order** (`api-*` feature flags, add/remove an extension) | 💥 Op set / extension list mismatch → crash. |
 | **deno_core / V8 version bump** | 💥 builtins + external refs change → magic mismatch. |
@@ -82,7 +82,7 @@ engine/crates/runtime-v8/snapshots/
   SNAPSHOT-worker-full-<arch>.bin.manifest.json
 ```
 
-`js-runtime/build.rs` embeds `SNAPSHOT-<Cargo profile>-<target arch>.bin` **only
+`runtime-v8/build.rs` embeds `SNAPSHOT-<Cargo profile>-<target arch>.bin` **only
 for Android targets**. Host builds and every missing/mismatched host identity use
 the source-JS fallback. Worker source bootstrap remains the shipping default.
 An explicit `build-aar.sh --product-profile full --worker-snapshot release`
@@ -109,7 +109,7 @@ a stale/mismatched one is dangerous (§1). How does a release guarantee
    CI *cannot* generate (no arm64 KVM) — a home.
 
 2. **Schema-v3 identity manifest per snapshot.** It records runtime kind, product profile,
-   canonical Cargo features, all extension JS, `js-runtime` + `snapshot-gen`
+   canonical Cargo features, all extension JS, `runtime-v8` + `snapshot-gen`
    Rust/Cargo inputs, Cargo.lock, `deno_core`, the exact Android V8 archive,
    architecture, and materialized snapshot bytes/size. Build-time validation
    rejects malformed, stale, or unresolved LFS inputs and falls back to source

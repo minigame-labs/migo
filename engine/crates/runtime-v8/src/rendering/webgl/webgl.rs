@@ -3416,7 +3416,7 @@ fn resolve_cached_image_rgba(image_id: u32) -> RgbaLookup {
     // H-5: the migo_io::global_cache is now the single source of truth
     // for decoded RGBA bytes, with `pin()` / `unpin()` keeping
     // actively referenced entries exempt from LRU eviction.  The
-    // js-runtime IMAGE_CACHE just tells us whether we have an
+    // runtime-v8 IMAGE_CACHE just tells us whether we have an
     // alias for this caller `image_id` at all (and maps it to
     // the canonical cache key); the byte lookup then runs
     // against migo_io::global_cache directly.

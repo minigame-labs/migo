@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 
 const runtime = await import(
-  "../../engine/crates/runtime-v8/input/04_gamepad.js"
+  "../../engine/crates/runtime-v8/src/input/04_gamepad.js"
 );
 
 // ---- Fake migo carrying the real gamepad transport ------------------------
@@ -158,5 +158,33 @@ for (const hidden of [
   assert.equal(navigator[hidden], undefined, `${hidden} is not on navigator`);
 }
 
+// ---- 12. A broken diagnostic sink cannot break dispatch -------------------
+// Embedders may replace console.error. EventTarget's listener isolation must
+// remain true even when that replacement itself throws.
+globalThis.removeEventListener("gamepaddisconnected", thrower);
+globalThis.removeEventListener("gamepaddisconnected", survivor);
+const survivedBrokenLogger = [];
+const loggerThrower = () => { throw new Error("listener still fails"); };
+const afterBrokenLogger = () => survivedBrokenLogger.push("ran");
+globalThis.addEventListener("gamepaddisconnected", loggerThrower);
+globalThis.addEventListener("gamepaddisconnected", afterBrokenLogger);
+const _capturingError = console.error;
+console.error = () => { throw new Error("diagnostic sink failed"); };
+try {
+  assert.doesNotThrow(
+    () => runtime._internalTriggerGamepadDisconnected(0),
+    "a throwing diagnostic sink does not escape dispatch",
+  );
+} finally {
+  console.error = _capturingError;
+}
+assert.deepEqual(
+  survivedBrokenLogger,
+  ["ran"],
+  "later listeners still run when reporting an earlier failure also throws",
+);
+globalThis.removeEventListener("gamepaddisconnected", loggerThrower);
+globalThis.removeEventListener("gamepaddisconnected", afterBrokenLogger);
+
 console.error = _realError;
-console.log("ALL GAMEPAD ASSERTIONS PASSED (11 sections)");
+console.log("ALL GAMEPAD ASSERTIONS PASSED (12 sections)");

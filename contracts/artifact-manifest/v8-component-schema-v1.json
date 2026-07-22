@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://migo.dev/contracts/artifact-manifest/v8-component-schema-v1.json",
-  "title": "Migo Android V8 component manifest v1",
+  "title": "Migo V8 component manifest v1",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -16,7 +16,12 @@
   "properties": {
     "schema": { "const": "migo-v8-component-manifest/v1" },
     "component_id": { "$ref": "schema-v1.json#/$defs/sha256" },
-    "target": { "$ref": "schema-v1.json#/$defs/androidTarget" },
+    "target": {
+      "oneOf": [
+        { "$ref": "schema-v1.json#/$defs/androidTarget" },
+        { "$ref": "schema-v1.json#/$defs/linuxV8Target" }
+      ]
+    },
     "toolchain": { "$ref": "schema-v1.json#/$defs/toolchain" },
     "runtime": { "$ref": "schema-v1.json#/$defs/v8Runtime" },
     "hashes": {

@@ -107,6 +107,15 @@ typedef void(MIGO_CALL *MigoOnSurfaceLostFn)(void *user_data,
                                              MigoSession *session,
                                              uint64_t generation,
                                              MigoSurfaceLossReason reason);
+/*
+ * Optional wakeup after the named retired Surface reaches RELEASED. The
+ * callback is an edge only: rejection, cancellation, or delayed dispatch does
+ * not change release state. Hosts must use migo_surface_release_query as the
+ * authoritative level check before destroying the native resource.
+ */
+typedef void(MIGO_CALL *MigoOnSurfaceReleasedFn)(void *user_data,
+                                                 MigoSession *session,
+                                                 uint64_t generation);
 
 typedef uint32_t MigoKeyboardFlags;
 #define MIGO_KEYBOARD_FLAG_NONE UINT32_C(0)
@@ -198,17 +207,22 @@ typedef struct MigoHostCallbacks {
     MigoOnShowKeyboardFn on_show_keyboard;
     MigoOnHideKeyboardFn on_hide_keyboard;
     MigoOnUpdateKeyboardFn on_update_keyboard;
+    /* Appended: optional event-loop wakeup for asynchronous Surface release.
+     * Older hosts continue to poll the release observer. */
+    MigoOnSurfaceReleasedFn on_surface_released;
 } MigoHostCallbacks;
 
 MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, struct_size) == 0,
                    "every versioned struct must begin with struct_size");
 #if MIGO_LP64
-MIGO_STATIC_ASSERT(sizeof(MigoHostCallbacks) == 96, "MigoHostCallbacks LP64 size changed");
+MIGO_STATIC_ASSERT(sizeof(MigoHostCallbacks) == 104, "MigoHostCallbacks LP64 size changed");
 MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, dispatch) == 24, "MigoHostCallbacks.dispatch moved");
 MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, on_request_frame) == 64,
                    "MigoHostCallbacks.on_request_frame moved");
 MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, on_update_keyboard) == 88,
                    "MigoHostCallbacks.on_update_keyboard moved");
+MIGO_STATIC_ASSERT(offsetof(MigoHostCallbacks, on_surface_released) == 96,
+                   "MigoHostCallbacks.on_surface_released moved");
 #endif
 
 MIGO_API MigoResult MIGO_CALL
@@ -264,10 +278,11 @@ migo_session_notify_vsync(MigoSession *session, int64_t frame_time_nanos);
 /*
  * Queued callbacks are canceled before return. Reentrant destruction from the
  * current callback invalidates the session immediately and lets that stack
- * unwind without starting another user callback. Destruction also consumes
- * every still-live SurfaceAttachment; all caller-held attachment pointers are
- * invalid afterward. MIGO_OK consumes and releases the Session handle; its
- * pointer is invalid afterward.
+ * unwind without starting another user callback. Destruction refuses with
+ * MIGO_ERROR_INVALID_STATE while a Surface transition is active, an attachment
+ * is still live, or any retired Surface is still PENDING; ownership remains
+ * with the caller and the Session can be retried after release. MIGO_OK consumes
+ * and releases the Session handle; its pointer is invalid afterward.
  */
 MIGO_API MigoResult MIGO_CALL migo_session_destroy(MigoSession *session);
 

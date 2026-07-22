@@ -71,7 +71,7 @@
 //!
 //! ## Usage
 //!
-//! The js-runtime is created by the core module and not directly instantiated:
+//! The V8 runtime is created by the core module and not directly instantiated:
 //!
 //! ```rust,ignore
 //! use runtime_v8::HostJsRuntime;

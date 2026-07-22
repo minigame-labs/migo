@@ -48,7 +48,7 @@ pub fn escape_for_js_string(s: &str) -> String {
 /// the hook name with this prefix instead of calling a bare global identifier.
 ///
 /// Keep this in sync with the Symbol key used in `99_main.js` and the lookup
-/// in `js-runtime/js_bindings.rs`.
+/// in `runtime-v8/src/js_bindings.rs`.
 pub const HOST_BRIDGE_EXPR: &str = "globalThis[Symbol.for('Migo.hostBridge')]";
 
 /// Build a complete `<holder>.callbackName('escaped_json');` JS source string

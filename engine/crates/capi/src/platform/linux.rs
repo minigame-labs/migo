@@ -47,10 +47,10 @@ pub(crate) fn rebuild_surface(
 ) -> Result<SurfaceRef, MigoResult> {
     match target {
         PlatformTarget::X11 { display, window } => Ok(Arc::new(
-            platform::desktop::presenter::LinuxX11Surface::new(display, window, width, height),
+            platform::linux::presenter::LinuxX11Surface::new(display, window, width, height),
         )),
         PlatformTarget::Wayland { surface, display } => Ok(Arc::new(
-            platform::desktop::presenter::LinuxWaylandSurface::new(display, surface, width, height),
+            platform::linux::presenter::LinuxWaylandSurface::new(display, surface, width, height),
         )),
     }
 }
@@ -72,13 +72,13 @@ pub(crate) fn build_target(
             display, window, ..
         } => {
             let window = window as c_ulong;
-            let surface: SurfaceRef = Arc::new(platform::desktop::presenter::LinuxX11Surface::new(
+            let surface: SurfaceRef = Arc::new(platform::linux::presenter::LinuxX11Surface::new(
                 display,
                 window,
                 configuration.width_pixels(),
                 configuration.height_pixels(),
             ));
-            let graphics_platform = platform::desktop::presenter::linux_x11_graphics_platform(
+            let graphics_platform = platform::linux::presenter::linux_x11_graphics_platform(
                 display,
             )
             .map_err(|error| {
@@ -93,13 +93,13 @@ pub(crate) fn build_target(
         }
         ValidatedPlatformSurface::Wayland { display, surface } => {
             let surface_ref: SurfaceRef =
-                Arc::new(platform::desktop::presenter::LinuxWaylandSurface::new(
+                Arc::new(platform::linux::presenter::LinuxWaylandSurface::new(
                     display,
                     surface,
                     configuration.width_pixels(),
                     configuration.height_pixels(),
                 ));
-            let graphics_platform = platform::desktop::presenter::linux_wayland_graphics_platform(
+            let graphics_platform = platform::linux::presenter::linux_wayland_graphics_platform(
                 display,
             )
             .map_err(|error| {

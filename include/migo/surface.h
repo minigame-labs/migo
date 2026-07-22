@@ -117,9 +117,9 @@ MIGO_STATIC_ASSERT(offsetof(MigoSurfaceDescriptor, platform_descriptor) == 64,
 /*
  * Opaque observer of one asynchronous native-Surface release.
  *
- * It owns no Surface resource lease, so it may outlive the Session that
- * produced it. That is deliberate: the host needs an answer to "may I destroy
- * my window now?" even along teardown paths that destroy the Session first.
+ * It owns no Surface resource lease. Once it reports RELEASED it may outlive a
+ * later successful destruction of the Session that produced it. A pending
+ * observer cannot: migo_session_destroy refuses while any release is pending.
  */
 typedef struct MigoSurfaceRelease MigoSurfaceRelease;
 
@@ -193,8 +193,9 @@ MIGO_API MigoResult MIGO_CALL migo_surface_begin_detach(
  * Read the authoritative release state. Never blocks, so it is safe to poll
  * from a UI thread or an event-loop idle handler.
  *
- * release stays valid and queryable after the owning Session is destroyed --
- * that is the whole reason the observer holds no lease. Returns
+ * A release that has reached RELEASED stays valid and queryable after the
+ * owning Session is destroyed. Session destruction refuses while it is still
+ * PENDING. Returns
  * MIGO_ERROR_INVALID_ARGUMENT if either pointer is NULL. out_status is written
  * only on MIGO_OK, never partially.
  */

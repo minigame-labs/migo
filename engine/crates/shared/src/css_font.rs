@@ -113,7 +113,6 @@ pub fn parse_css_font(input: &str) -> ParsedFont {
 
     let mut tokens = stripped.split_whitespace().peekable();
     let mut family_start: Option<usize> = None;
-    let mut cursor = 0usize;
     // Re-iterate with byte offsets so we can slice the family tail
     // by a single byte range at the end.  `split_whitespace` eats
     // arbitrary runs of whitespace so re-use the input bytes to
@@ -124,11 +123,10 @@ pub fn parse_css_font(input: &str) -> ParsedFont {
         // `stripped`; the pointer arithmetic maps back to the
         // byte offset.
         let tok_start = (tok.as_ptr() as usize).saturating_sub(stripped.as_ptr() as usize);
-        cursor = tok_start + tok.len();
         if classify_as_size(tok, &mut out) {
             // Everything after the size is the family list; save
             // the cursor and stop iterating tokens.
-            family_start = Some(cursor);
+            family_start = Some(tok_start + tok.len());
             break;
         }
         if let Some(w) = classify_as_weight(tok) {

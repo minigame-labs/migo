@@ -24,7 +24,7 @@ name: Build V8 Snapshot
 #             this later.)
 #
 # This workflow uploads the snapshot as an artifact. Embedding into the .so is
-# done by js-runtime/build.rs at .so build time: it picks
+# done by runtime-v8/build.rs at .so build time: it picks
 # snapshots/SNAPSHOT-<profile>-<target arch>.bin for android targets only.
 
 on:
@@ -50,7 +50,7 @@ on:
     branches:
       - "**"
     # On push only the fast `freshness` gate runs (the x86_64 generator is
-    # workflow_dispatch-only). Schema v3 binds runtime kind and fingerprints extension JS, js-runtime
+    # workflow_dispatch-only). Schema v3 binds runtime kind and fingerprints extension JS, runtime-v8
     # and snapshot-gen Rust/feature inputs, Cargo.lock, product features, and the
     # exact Android V8 archive, so every one of those changes must run the gate.
     paths:

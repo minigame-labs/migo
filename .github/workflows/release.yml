@@ -28,7 +28,7 @@ jobs:
           bash scripts/check-snapshot-freshness.sh --product-profile slim
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
 
@@ -39,6 +39,8 @@ jobs:
           cache-on-failure: true
 
       - name: Check Rust formatting
+        working-directory: engine
+        run: cargo fmt --all -- --check
 
       # Several contract gates run cargo with `--locked --offline`: `--locked`
       # proves they cannot rewrite the lockfile, `--offline` proves they cannot
@@ -52,8 +54,6 @@ jobs:
       - name: Populate the cargo registry for the offline gates
         working-directory: engine
         run: cargo fetch --locked
-        working-directory: engine
-        run: cargo fmt --all -- --check
 
       - name: C ABI and Surface candidate contract
         run: |
@@ -73,6 +73,9 @@ jobs:
       - name: Core/V8 dependency boundary contract
         run: bash scripts/test-core-v8-boundary-contract.sh
 
+      - name: Foundation/runtime dependency boundary contract
+        run: bash scripts/test-foundation-runtime-boundary-contract.sh
+
       - name: Platform services capability contract
         run: bash scripts/test-platform-services-capability-contract.sh
 
@@ -91,6 +94,9 @@ jobs:
         run: |
           python3 scripts/ci/tests/test_abi_floor_audit.py
           python3 scripts/ci/tests/test_gen_linux_package_metadata.py
+          python3 scripts/ci/tests/test_gen_android_package_metadata.py
+          python3 scripts/ci/tests/test_write_linux_build_metadata.py
+          python3 scripts/ci/tests/test_write_linux_v8_component_manifest.py
 
       - name: Artifact manifest tooling and contract
         run: |
@@ -103,11 +109,13 @@ jobs:
       # the pre-existing backlog. Mirrors pr-ci.yml so the tag gate matches PR CI.
       - name: Run clippy lints (host-buildable crates)
         working-directory: engine
-        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 --all-targets -- --cap-lints warn
+        run: cargo clippy -p migo-shared -p migo-io -p migo-runtime-v8 -p migo-capi-abi --all-targets -- --cap-lints warn
 
       - name: Run Rust tests (host-buildable crates)
         working-directory: engine
-        run: cargo test -p migo-shared -p migo-io -p migo-runtime-v8 --lib
+        run: |
+          cargo test -p migo-shared -p migo-io -p migo-runtime-v8 --lib
+          cargo test -p migo-capi-abi --all-targets
         env:
           RUST_BACKTRACE: 1
 
@@ -117,8 +125,12 @@ jobs:
       - name: Artifact manifest Python syntax check
         run: |
           python3 -m py_compile \
+            scripts/gen-android-package-metadata.py \
+            scripts/gen-linux-package-metadata.py \
             scripts/generate-android-artifact-manifests.py \
             scripts/write-android-build-metadata.py \
+            scripts/write-linux-build-metadata.py \
+            scripts/write-linux-v8-component-manifest.py \
             scripts/write-v8-component-manifest.py \
             scripts/verify-android-aar-manifests.py
 
@@ -127,9 +139,31 @@ jobs:
           bash scripts/test-product-profiles.sh
           bash scripts/test-r8-profile-contract.sh
 
-  # ── Job 2: Release AAR build ────────────────────────────────────────
+  # ── Job 2: Linux Qt Host Kit (isolated source contract; no V8/LFS) ──
+  linux-qt-host-kit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout (without LFS)
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Install Qt/X11 Host Kit dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build g++ ripgrep xvfb xauth \
+            qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins \
+            libx11-dev libxkbcommon-x11-dev libxcb-cursor0
+
+      - name: Linux Qt Host Kit contract
+        run: bash scripts/test-linux-qt-host-kit.sh
+
+  # ── Job 3: Release AAR build ────────────────────────────────────────
   release-android:
-    needs: quality-gate
+    needs: [quality-gate, linux-qt-host-kit]
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -170,7 +204,7 @@ jobs:
           python-version: "3.11"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 

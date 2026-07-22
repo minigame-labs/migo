@@ -13,10 +13,10 @@ rust-image-decode = ["dep:image", "dep:zune-image", "dep:zune-core"]
 compress-brotli = ["dep:brotli"]
 
 [dependencies]
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 shared = { package = "migo-shared", path = "../shared", default-features = false }
-deno_core.workspace = true
+serde_json.workspace = true
 parking_lot = "0.12.4"
 
 # Image decoders — optional, excluded on Android (uses BitmapFactory via JNI)
@@ -58,3 +58,4 @@ rusqlite = { version = "0.32", default-features = false, features = ["bundled", 
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread"] }

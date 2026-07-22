@@ -11,6 +11,7 @@ FINGERPRINT="$ROOT/scripts/lib/snapshot-fingerprint.sh"
 WRITE_MANIFEST="$ROOT/scripts/write-snapshot-manifest.sh"
 FRESHNESS="$ROOT/scripts/check-snapshot-freshness.sh"
 GENERATOR="$ROOT/scripts/gen-snapshot.sh"
+SNAPSHOT_GEN="$ENGINE/tools/snapshot-gen/src/main.rs"
 ANDROID_SO="$ROOT/scripts/build-android-so.sh"
 ANDROID_SO_PS="$ROOT/scripts/build-android-so.ps1"
 AAR="$ROOT/scripts/build-aar.sh"
@@ -101,13 +102,32 @@ PY
 
 echo "[3/5] checking dedicated Cargo/runtime selection"
 require_literal "$JS_RUNTIME/Cargo.toml" "worker-snapshot" \
-    "js-runtime lacks the non-default worker-snapshot feature"
+    "runtime-v8 lacks the non-default worker-snapshot feature"
 require_literal "$JS_RUNTIME/src/snapshot.rs" "WORKER_SNAPSHOT_BYTES" \
     "runtime lacks dedicated Worker snapshot bytes"
 require_literal "$JS_RUNTIME/build.rs" "migo_has_worker_snapshot" \
     "build.rs lacks an independent Worker snapshot cfg"
-require_literal "$ENGINE/tools/snapshot-gen/src/main.rs" "MIGO_SNAPSHOT_KIND" \
+require_literal "$SNAPSHOT_GEN" "MIGO_SNAPSHOT_KIND" \
     "snapshot generator lacks kind selection"
+python3 - "$SNAPSHOT_GEN" "$ENGINE/tools/snapshot-gen" "$JS_RUNTIME/snapshots" <<'PY'
+import pathlib
+import re
+import sys
+
+source_path, manifest_dir, expected_dir = map(pathlib.Path, sys.argv[1:])
+source = source_path.read_text(encoding="utf-8")
+match = re.search(
+    r'const DEFAULT_SNAPSHOT_DIR_FROM_MANIFEST: &str = "([^"]+)";', source
+)
+if match is None:
+    raise SystemExit("snapshot generator must expose its default relative output directory")
+actual = (manifest_dir / match.group(1)).resolve()
+expected = expected_dir.resolve()
+if actual != expected:
+    raise SystemExit(
+        f"snapshot generator default output resolves to {actual}, expected {expected}"
+    )
+PY
 require_literal "$WORKFLOW" 'git ls-files --error-unmatch "$bin" "$man"' \
     "snapshot workflow would mistake a new untracked Worker artifact for unchanged bytes"
 

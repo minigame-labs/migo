@@ -50,7 +50,7 @@ jobs:
           echo "Android: $(adb shell getprop ro.build.version.release)"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 

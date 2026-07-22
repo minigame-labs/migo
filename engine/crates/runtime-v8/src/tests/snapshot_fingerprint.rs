@@ -186,10 +186,10 @@ fn rust_and_shell_fingerprints_match_on_the_real_tree() {
     let repo_root = manifest_dir
         .ancestors()
         .nth(3)
-        .expect("js-runtime lives under <repo>/engine/crates");
+        .expect("runtime-v8 lives under <repo>/engine/crates");
 
     let files = collect_js_files(manifest_dir).unwrap();
-    assert!(!files.is_empty(), "expected extension JS under js-runtime");
+    assert!(!files.is_empty(), "expected extension JS under runtime-v8");
     let rust_hash = snapshot_js_hash(repo_root, &files).unwrap();
 
     let script = repo_root.join("scripts/lib/snapshot-fingerprint.sh");
@@ -223,7 +223,7 @@ fn rust_and_shell_profile_runtime_fingerprints_match() {
     let repo_root = manifest_dir
         .ancestors()
         .nth(3)
-        .expect("js-runtime lives under <repo>/engine/crates");
+        .expect("runtime-v8 lives under <repo>/engine/crates");
     let rust_files = collect_rust_files(manifest_dir).unwrap();
     let rust_runtime_hash = snapshot_runtime_hash(repo_root, &rust_files).unwrap();
     let rust_feature_hash = snapshot_feature_hash(snapshot_profile_features("slim").unwrap());
@@ -258,7 +258,7 @@ fn shell_v8_fingerprint_uses_content_hash_for_archive_and_lfs_pointer() {
     let repo_root = manifest_dir
         .ancestors()
         .nth(3)
-        .expect("js-runtime lives under <repo>/engine/crates");
+        .expect("runtime-v8 lives under <repo>/engine/crates");
     let script = repo_root.join("scripts/lib/snapshot-fingerprint.sh");
     let root = unique_tmp_dir("v8-lfs");
     let archive = root.join("librusty_v8.a");
@@ -402,7 +402,7 @@ fn write_snapshot_manifest_succeeds_without_git() {
     let repo_root = manifest_dir
         .ancestors()
         .nth(3)
-        .expect("js-runtime lives under <repo>/engine/crates");
+        .expect("runtime-v8 lives under <repo>/engine/crates");
     let script = repo_root.join("scripts/write-snapshot-manifest.sh");
 
     let tmp = unique_tmp_dir("manifest-nogit");
@@ -561,7 +561,7 @@ fn runtime_fingerprint_changes_when_an_op_source_changes() {
 
     write_file(
         &snapshot_gen.join("Cargo.toml"),
-        b"[features]\nprofile-slim=[\"js-runtime/profile-slim\"]\n",
+        b"[features]\nprofile-slim=[\"runtime-v8/profile-slim\"]\n",
     );
     assert_ne!(
         generator_after,

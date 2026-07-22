@@ -119,7 +119,7 @@ require(
 
 for relative in (
     "engine/crates/platform/src/android/platform.rs",
-    "engine/crates/platform/src/desktop/platform.rs",
+    "engine/crates/platform/src/linux/platform.rs",
 ):
     source = (root / relative).read_text(encoding="utf-8")
     require(

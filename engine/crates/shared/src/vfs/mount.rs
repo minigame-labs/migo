@@ -1265,7 +1265,7 @@ impl PackageManifest {
     pub fn load(pkg_store_dir: &Path) -> Self {
         let path = pkg_store_dir.join("manifest.json");
         match std::fs::read_to_string(&path) {
-            Ok(json) => deno_core::serde_json::from_str(&json).unwrap_or_default(),
+            Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
@@ -1273,7 +1273,7 @@ impl PackageManifest {
     /// Write manifest to `{pkg_store_dir}/manifest.json`.
     pub fn save(&self, pkg_store_dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(pkg_store_dir)?;
-        let json = deno_core::serde_json::to_string_pretty(self)
+        let json = serde_json::to_string_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         std::fs::write(pkg_store_dir.join("manifest.json"), json)
     }

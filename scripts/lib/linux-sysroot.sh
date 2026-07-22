@@ -13,7 +13,10 @@
 # stdlib.h, Skia compiled against GCC 13's libstdc++ headers, and pthread/dl
 # symbols resolved against a post-2.34 libc.
 
-MIGO_SYSROOT="${MIGO_SYSROOT:-/home/xg/wkspace/rusty_v8_src/build/linux/debian_bullseye_amd64-sysroot}"
+_MIGO_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MIGO_RUSTY_V8_SRC="${MIGO_RUSTY_V8_SRC:-$_MIGO_REPO_ROOT/../rusty_v8_src}"
+MIGO_SYSROOT="${MIGO_SYSROOT:-$MIGO_RUSTY_V8_SRC/build/linux/debian_bullseye_amd64-sysroot}"
+MIGO_SYSROOT_RECIPE="${MIGO_SYSROOT_RECIPE:-$(dirname "$MIGO_SYSROOT")/sysroot_scripts/sysroots.json}"
 
 migo_sysroot_require() {
     if [[ ! -d "$MIGO_SYSROOT" ]]; then
@@ -26,6 +29,10 @@ migo_sysroot_require() {
     local libstdcxx="$MIGO_SYSROOT/usr/lib/x86_64-linux-gnu/libstdc++.so.6"
     if [[ ! -f "$libstdcxx" ]]; then
         echo "[linux-sdk] sysroot is missing libstdc++: $libstdcxx" >&2
+        return 1
+    fi
+    if [[ ! -f "$MIGO_SYSROOT_RECIPE" ]]; then
+        echo "[linux-sdk] Chromium sysroot recipe not found: $MIGO_SYSROOT_RECIPE" >&2
         return 1
     fi
 }
@@ -71,7 +78,12 @@ migo_sysroot_link_dir() {
 migo_sysroot_export() {
     migo_sysroot_require || return 1
 
+    # Record a relocatable recipe identity, never a builder-specific absolute
+    # path. The Linux package verifier requires the engine and V8 component to
+    # name this exact same identity.
+    MIGO_SYSROOT_IDENTITY="Debian bullseye amd64 sysroot; sysroots.json sha256=$(sha256sum "$MIGO_SYSROOT_RECIPE" | awk '{print $1}')"
     export MIGO_SYSROOT
+    export MIGO_SYSROOT_IDENTITY
     export CC="${CC_HOST:-/usr/bin/clang}"
     export CXX="${CXX_HOST:-/usr/bin/clang++}"
 

@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://migo.dev/contracts/artifact-manifest/android-package-schema-v2.json",
+  "title": "Migo Android C ABI package manifest v2",
+  "description": "Binds one Android ABI package to API 26, its CPU baseline, exact V8/snapshot identity, and every staged regular-file byte outside the manifest itself.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "version", "product_profile", "build_type", "codegen_profile",
+    "os", "abi", "arch", "android_abi", "target_triple", "cpu_baseline",
+    "required_cpu_features", "min_android_api", "link_libraries",
+    "snapshot_policy", "snapshots", "v8", "toolchain", "graphics",
+    "provenance", "artifacts"
+  ],
+  "properties": {
+    "schema": { "const": "migo-android-package-manifest/v2" },
+    "version": { "$ref": "schema-v1.json#/$defs/packageVersion" },
+    "product_profile": { "enum": ["full", "slim"] },
+    "build_type": { "const": "release" },
+    "codegen_profile": { "enum": ["z", "2", "3"] },
+    "os": { "const": "android" },
+    "abi": { "const": "android" },
+    "arch": { "enum": ["aarch64", "x86_64"] },
+    "android_abi": { "enum": ["arm64-v8a", "x86_64"] },
+    "target_triple": { "enum": ["aarch64-linux-android", "x86_64-linux-android"] },
+    "cpu_baseline": { "enum": ["armv8-a", "x86-64-v1"] },
+    "required_cpu_features": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": { "$ref": "schema-v1.json#/$defs/nonPlaceholder" }
+    },
+    "min_android_api": { "const": "26" },
+    "link_libraries": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": { "$ref": "schema-v1.json#/$defs/nonPlaceholder" }
+    },
+    "snapshot_policy": { "const": "embedded" },
+    "snapshots": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": { "$ref": "#/$defs/snapshot" }
+    },
+    "v8": { "$ref": "v8-component-schema-v1.json" },
+    "toolchain": { "$ref": "schema-v1.json#/$defs/toolchain" },
+    "graphics": { "$ref": "schema-v1.json#/$defs/graphics" },
+    "provenance": { "$ref": "schema-v1.json#/$defs/provenance" },
+    "artifacts": { "$ref": "#/$defs/artifacts" }
+  },
+  "$defs": {
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime_kind", "product_profile", "target_triple", "arch", "schema",
+        "generator", "generation_cpu_policy", "normalized_parameters",
+        "external_references_hash", "bootstrap_inputs_hash", "features",
+        "features_hash", "rust_sources_hash", "v8_archive_hash", "bytes_size",
+        "bytes_hash", "js_sources_hash", "deno_core_version"
+      ],
+      "properties": {
+        "runtime_kind": { "enum": ["host", "worker"] },
+        "product_profile": { "enum": ["full", "slim"] },
+        "target_triple": { "enum": ["aarch64-linux-android", "x86_64-linux-android"] },
+        "arch": { "enum": ["aarch64", "x86_64"] },
+        "schema": { "const": "3" },
+        "generator": { "$ref": "schema-v1.json#/$defs/nonPlaceholder" },
+        "generation_cpu_policy": { "const": "target-baseline" },
+        "normalized_parameters": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "$ref": "schema-v1.json#/$defs/nonPlaceholder" }
+        },
+        "external_references_hash": { "$ref": "schema-v1.json#/$defs/sha256" },
+        "bootstrap_inputs_hash": { "$ref": "schema-v1.json#/$defs/sha256" },
+        "features": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "$ref": "schema-v1.json#/$defs/nonPlaceholder" }
+        },
+        "features_hash": { "$ref": "schema-v1.json#/$defs/sha256" },
+        "rust_sources_hash": { "$ref": "schema-v1.json#/$defs/sha256" },
+        "v8_archive_hash": { "$ref": "schema-v1.json#/$defs/sha256" },
+        "bytes_size": { "type": "integer", "minimum": 1 },
+        "bytes_hash": { "$ref": "schema-v1.json#/$defs/sha256" },
+        "js_sources_hash": { "$ref": "schema-v1.json#/$defs/sha256" },
+        "deno_core_version": { "$ref": "schema-v1.json#/$defs/nonPlaceholder" }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["size_bytes", "sha256"],
+        "properties": {
+          "size_bytes": { "type": "integer", "minimum": 1 },
+          "sha256": { "$ref": "schema-v1.json#/$defs/sha256" }
+        }
+      }
+    }
+  }
+}

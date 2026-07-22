@@ -62,6 +62,22 @@ MIGO_CHECK_CXX_RECORD(MigoSurfaceMetrics);
 MIGO_CHECK_CXX_RECORD(MigoSurfaceDescriptor);
 MIGO_CHECK_CXX_RECORD(MigoHostCallbacks);
 
+#if UINTPTR_MAX == UINT64_MAX
+static_assert(sizeof(MigoHostCallbacks) == 104, "LP64/LLP64 callback layout");
+static_assert(offsetof(MigoHostCallbacks, on_surface_released) == 96,
+              "release wakeup must remain the append-only tail field");
+#elif UINTPTR_MAX == UINT32_MAX
+static_assert(sizeof(MigoHostCallbacks) == 56, "ILP32 callback layout");
+static_assert(offsetof(MigoHostCallbacks, on_surface_released) == 52,
+              "ILP32 release wakeup tail offset");
+#else
+#error "unsupported pointer width"
+#endif
+
+using SurfaceReleasedCallback = void(MIGO_CALL *)(void *, MigoSession *, std::uint64_t);
+static_assert(std::is_same<MigoOnSurfaceReleasedFn, SurfaceReleasedCallback>::value,
+              "release wakeup callback declaration");
+
 using AttachFn = MigoResult(MIGO_CALL *)(MigoSession *,
                                          const MigoSurfaceDescriptor *,
                                          MigoSurfaceAttachment **);

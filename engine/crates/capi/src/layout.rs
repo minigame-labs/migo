@@ -12,12 +12,12 @@
 //! meet the changed library in the field, which is when it would otherwise be
 //! discovered.
 //!
-//! The size numbers below are LP64 (`linux-x86_64` and `aarch64-linux-android`,
-//! the two targets that ship). ILP32 needs its own numbers and its own lane;
-//! that part of the freeze blocker stays open until a 32-bit target exists,
-//! because writing expected values for a target nobody builds would be
-//! guesswork asserted as fact. The offset assertions that do not mention a
-//! pointer hold on any target and are checked everywhere.
+//! The pointer-bearing size numbers in this module are LP64
+//! (`linux-x86_64` and `aarch64-linux-android`, the runtime slices that ship).
+//! The dependency-free `migo-capi-abi` crate pins the corresponding Rust ILP32
+//! callback records, while `tests/c_abi` compiles the public C/C++ records for
+//! SysV ILP32, Windows x86 and LLP64. Pointer-free assertions below hold on
+//! every target and are checked wherever this crate builds.
 
 use std::mem::{align_of, offset_of, size_of};
 

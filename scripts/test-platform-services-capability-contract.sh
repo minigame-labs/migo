@@ -76,9 +76,9 @@ require(
 )
 
 android = (root / "engine/crates/platform/src/android/platform.rs").read_text(encoding="utf-8")
-desktop = (root / "engine/crates/platform/src/desktop/platform.rs").read_text(encoding="utf-8")
+linux = (root / "engine/crates/platform/src/linux/platform.rs").read_text(encoding="utf-8")
 
-for name, source in (("android", android), ("desktop", desktop)):
+for name, source in (("android", android), ("linux", linux)):
     require(
         "impl PlatformServices for" not in source,
         f"{name} platform must implement the capability traits, not `impl PlatformServices for`",

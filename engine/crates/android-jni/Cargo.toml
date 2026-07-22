@@ -4,11 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 # `libmigo.so` — the artifact Android loads via `System.loadLibrary("migo")`.
-# This crate is deliberately tiny: it exists only so that the cdylib boundary
-# lives somewhere other than `platform`. `platform` can then stay an rlib,
-# which is what lets host targets build and test it — the Linux V8 archive is
-# built with executable-model TLS and cannot be linked into a shared object
-# (`R_X86_64_TPOFF32 ... cannot be used with -shared`, CLAUDE.md §10).
+# This crate is deliberately tiny: it owns only Android's JNI `cdylib`
+# boundary. `platform` stays an rlib so its policy and presenters can be reused
+# by host tests, native C packages, and standalone tools without imposing
+# Android's artifact shape on any other target.
 [lib]
 name = "migo"
 crate-type = ["cdylib"]

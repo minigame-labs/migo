@@ -6,7 +6,7 @@ The public markers are intentional:
 
 ```c
 MIGO_C_ABI_CANDIDATE  == 1     /* still a candidate everywhere */
-MIGO_C_ABI_HAS_RUNTIME == 1    /* Linux, desktop and Android: a linkable runtime exists */
+MIGO_C_ABI_HAS_RUNTIME == 1    /* Linux and Android: a linkable runtime exists */
 MIGO_C_ABI_HAS_RUNTIME == 0    /* every other target */
 ```
 
@@ -48,7 +48,7 @@ The host chooses a non-zero generation that increases monotonically within a Ses
 
 **The host must not destroy its native resources when `begin_detach` returns.** It must wait until `migo_surface_release_query` reports `MIGO_SURFACE_RELEASE_RELEASED`. Destroying earlier is a use-after-free inside the driver, which the engine can neither detect nor prevent — the reference it would have to observe is not its own. `migo_surface_release_destroy` refuses with `MIGO_ERROR_INVALID_STATE` while the release is still pending, so the observer cannot be discarded while it is still the only thing that knows the answer.
 
-The observer is level-triggered, so a release that completes before the first query is still reported; there is no edge to miss. It holds no Surface resource lease, and therefore stays valid and queryable after the owning Session is destroyed — which is what makes teardown orders that destroy the Session first still safe.
+The observer is level-triggered, so a release that completes before the first query is still reported; there is no edge to miss. It holds no Surface resource lease. A **released** observer may therefore remain valid after a later successful Session destruction. A pending observer cannot: `migo_session_destroy` refuses while any release is pending.
 
 Detach can be marshalled to Migo-owned render/platform workers but cannot require an SDK-owned window or event loop, and it must not wait for another turn of the host dispatcher. Consequently a callback running on a single-threaded UI dispatcher can begin a detach reentrantly without blocking on its own queue.
 
@@ -60,13 +60,13 @@ Losing a Surface is not detaching it. After a loss the attachment is still live 
 
 | Target | Lifetime rule |
 |---|---|
-| Android `ANativeWindow*` | Migo acquires a strong reference before attach succeeds and releases it before detach returns. |
-| OpenHarmony `OHNativeWindow*` | Migo takes/releases a native-object reference around the attachment. |
-| macOS `NSView*` / `CAMetalLayer*` | Migo retains/releases the Objective-C object; the two target kinds remain distinct. |
-| WinUI native SwapChainPanel interface | Migo takes/releases its own COM reference; this is not modeled as an HWND. |
-| Win32 child `HWND` | Host-owned and valid through detach; Migo neither destroys it nor owns the message loop. |
-| X11 `Display*` + `Window` | Host-owned and valid through detach; Migo does not close/destroy them. |
-| Wayland `wl_display*` + `wl_surface*` | Host-owned and valid through detach; the host owns the role and dispatch loop. |
+| Android `ANativeWindow*` | Migo acquires a strong reference before attach succeeds and releases its reference before the release observer reaches `RELEASED`. |
+| OpenHarmony `OHNativeWindow*` | Migo takes its own native-object reference and releases it before `RELEASED`. |
+| macOS `NSView*` / `CAMetalLayer*` | Migo retains the Objective-C object until retirement completes; the two target kinds remain distinct. |
+| WinUI native SwapChainPanel interface | Migo keeps its own COM reference until retirement completes; this is not modeled as an HWND. |
+| Win32 child `HWND` | Host-owned and valid until `RELEASED`; Migo neither destroys it nor owns the message loop. |
+| X11 `Display*` + `Window` | Host-owned and valid until `RELEASED`; Migo does not close/destroy them. |
+| Wayland `wl_display*` + `wl_surface*` | Host-owned and valid until `RELEASED`; the host owns the role and dispatch loop. |
 
 ## Dispatcher, callbacks, and destruction
 
@@ -80,15 +80,16 @@ Successful `migo_session_destroy` and `migo_engine_destroy` calls consume and re
 
 ABI v1 has two, and they are deliberately shaped differently.
 
-**Surface release is observed, not reported.** `migo_surface_begin_detach` hands back a
-`MigoSurfaceRelease*` the host polls with `migo_surface_release_query`. It uses no callback
-and no dispatcher, because the host asks this question precisely when it is about to destroy
-its own window — on its own thread, often inside a platform teardown handler that cannot
-yield. A completion callback would arrive on some other thread at some other time, which is
-the wrong shape for "may I free this now?". The observer handle is its own correlation
-token, so no request ID is needed; the release cannot be cancelled, because retirement is
-already irreversible when `begin_detach` returns `MIGO_OK`; and it cannot complete late in
-any harmful sense, because it is level-triggered and outlives its Session.
+**Surface release is observed authoritatively and may be reported as a wakeup.**
+`migo_surface_begin_detach` hands back a `MigoSurfaceRelease*`; the host reads the
+authoritative level with `migo_surface_release_query`. A host that installs the optional
+`on_surface_released` callback may use that dispatched edge to schedule a query instead of
+polling continuously. The callback is never proof that a native resource can be freed, and
+older hosts remain correct without it. The observer handle is its own correlation token, so
+no request ID is needed; the release cannot be cancelled because retirement is already
+irreversible when `begin_detach` returns `MIGO_OK`. Once the query reports `RELEASED`, the
+observer holds no Session or Surface lease and may outlive a later successful Session
+destruction.
 
 **Content load is reported.** `migo_session_load_content` starts evaluating content and
 reports the outcome through `on_ready` or `on_error`. A Session loads content once, so at
@@ -133,10 +134,11 @@ can be installed only once per Session, it cannot be replaced while tasks refere
 queued — which is why it needs no lifetime protocol of its own. It must remain valid until
 the owning Session is destroyed.
 
-The one ordering that is not obvious: `MigoSurfaceRelease*` may outlive its `MigoSession*`.
-Destroying the Session does not invalidate an outstanding release observer, and querying one
-afterwards is well-defined. Any other cross-handle survival goes the other way — children
-never outlive parents.
+The one ordering that is not obvious: a **released** `MigoSurfaceRelease*` may outlive its
+`MigoSession*`. Session destruction refuses while that observer is pending; after it reaches
+`RELEASED`, destroying the Session does not invalidate it and a final query/destroy remains
+well-defined. Any other cross-handle survival goes the other way — children never outlive
+parents.
 
 ## Performance boundary
 
@@ -215,20 +217,25 @@ The candidate cannot be declared stable until all of the following exist:
   yet, so the C lane's declared shape is the current one today; it becomes a true
   old-versus-new prefix check the moment one grows;
 - Android/Linux compatibility and performance gates with no material regression — **Linux compatibility gate done**, the rest open;
-- Android packaging for a third-party consumer — **done for arm64-v8a**.
+- Android packaging for a third-party consumer — **the two-ABI mechanism is implemented;
+  current release bytes are blocked on artifact regeneration**.
   `scripts/build-android-sdk.sh` stages a CMake package (headers, `libmigo_capi.a`,
   `find_package(migo)`, per-ABI manifest); `scripts/test-android-sdk-contract.sh` verifies the
-  22-symbol export surface, the embedded snapshot's hash, and that a real `find_package(migo)`
-  consumer links with every `migo_*` resolved. A versioned shared object and pkg-config are
-  deliberately not provided — an NDK host links a static library through CMake, so those would
-  be shape without a consumer. **Open**: the `x86_64` Android package, which is blocked only on
-  its startup snapshot (generated on a CI emulator, never in-tree); and a `-DANDROID_STL`
-  matrix beyond the `c++_shared` the consumer is proven against.
+  22-symbol export surface, the freshness-gated snapshot identity, the complete staged-file
+  hashes, and that a real `find_package(migo)` consumer links with every `migo_*` resolved. A
+  versioned shared object and pkg-config are deliberately not provided — an NDK host links a
+  static library through CMake, so those would be shape without a consumer. **Open before any
+  release**: regenerate verified V8 component manifests for both ABIs; regenerate the now-stale
+  arm64 full/slim/Worker snapshots; add the missing x86_64 full/slim snapshots; then rebuild and
+  run the minimum/latest device gates. The `-DANDROID_STL` matrix beyond the proven
+  `c++_shared` consumer also remains open.
 
 The Linux artifact contract that is in place is described by
 `dist/migo-linux-x86_64/share/migo/linux-x86_64-manifest.json`: target triple, CPU
-baseline, glibc/GLIBCXX floor, sysroot, dynamic dependencies, and the exact V8
-revision and GN arguments the archive was built from.
+baseline, glibc/GLIBCXX floor, path-independent sysroot identity, engine toolchain,
+graphics contract, source/build provenance, dynamic dependencies, complete staged-file hashes,
+and the exact V8 revision and GN arguments the archive was built from. The engine and V8
+sysroot identities must match exactly.
 
 Compile the current consumer contract with:
 

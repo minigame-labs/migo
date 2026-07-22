@@ -2,7 +2,7 @@
 //!
 //! Provides `read_image_rgba8`, `preload_images`, `clear_image_cache`, and
 //! `get_image_cache_stats` as standalone async functions called directly
-//! from js-runtime ops.
+//! from runtime-v8 ops.
 //!
 //! Budget limiting and decode-concurrency semaphore keep memory behaviour
 //! bounded.

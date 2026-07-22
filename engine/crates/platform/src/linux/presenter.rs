@@ -1,4 +1,4 @@
-//! Desktop (Linux) system-EGL presenter boundary.
+//! Linux system-EGL presenter boundary.
 //!
 //! Mirrors `platform/android/presenter.rs` for the `x86_64-unknown-linux-gnu`
 //! support profile. It provides a headless pbuffer path plus host-owned X11 and
