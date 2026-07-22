@@ -107,7 +107,14 @@ parking_lot = "0.12"
 tracing = { version = "0.1.41", default-features = false, features = ["std"] }
 tracing-android = "0.2.0"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["std"] }
-smallvec = "1.15.1"
+# `const_generics` is declared here rather than inherited: `graphics` uses
+# `SmallVec<[u8; 65]>`, and without this feature smallvec implements `Array`
+# only for a fixed set of sizes, so 65 is not one of them. It used to compile
+# anyway because a larger package selection pulled the feature in through
+# unification -- `cargo check -p migo-graphics` on its own failed on Linux and
+# on Windows alike, which is how a Windows probe found a defect that was never
+# Windows-specific.
+smallvec = { version = "1.15.1", features = ["const_generics"] }
 bytemuck = { version = "1.23.2", features = ["extern_crate_alloc"] }
 deno_core = {version = "0.385.0", default-features = false}
 zstd = { version = "0.13", default-features = false }
