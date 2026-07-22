@@ -1,6 +1,7 @@
 #include "fake_migo.hpp"
 
 #include <cstring>
+#include <thread>
 
 namespace {
 
@@ -28,6 +29,14 @@ std::vector<fake_migo::KeyRecord> g_keys;
 std::vector<fake_migo::CompositionRecord> g_compositions;
 std::vector<uint8_t> g_focus_changes;
 std::vector<int64_t> g_vsyncs;
+MigoHostCallbacks g_callbacks{};
+bool g_session_alive = false;
+std::string g_content_id;
+MigoResult g_session_create_result = MIGO_OK;
+MigoResult g_set_callbacks_result = MIGO_OK;
+MigoResult g_load_content_result = MIGO_OK;
+MigoResult g_session_destroy_result = MIGO_OK;
+constexpr uintptr_t kEngineToken = 0x4040;
 
 constexpr uintptr_t kSessionToken = 0x1010;
 constexpr uintptr_t kAttachmentToken = 0x2020;
@@ -65,6 +74,13 @@ void reset() noexcept {
     g_compositions.clear();
     g_focus_changes.clear();
     g_vsyncs.clear();
+    g_callbacks = {};
+    g_session_alive = false;
+    g_content_id.clear();
+    g_session_create_result = MIGO_OK;
+    g_set_callbacks_result = MIGO_OK;
+    g_load_content_result = MIGO_OK;
+    g_session_destroy_result = MIGO_OK;
     // Reserved, not merely cleared: the allocation test measures the delivery
     // path by differencing a delivered burst against an undelivered one, and a
     // vector growing here would land in that difference and be read as the
@@ -133,6 +149,71 @@ const std::vector<KeyRecord> &keys() noexcept { return g_keys; }
 const std::vector<CompositionRecord> &compositions() noexcept { return g_compositions; }
 const std::vector<uint8_t> &focus_changes() noexcept { return g_focus_changes; }
 const std::vector<int64_t> &vsyncs() noexcept { return g_vsyncs; }
+MigoEngine *engine() noexcept { return reinterpret_cast<MigoEngine *>(kEngineToken); }
+const MigoHostCallbacks &installed_callbacks() noexcept { return g_callbacks; }
+bool session_is_alive() noexcept { return g_session_alive; }
+const std::string &loaded_content_id() noexcept { return g_content_id; }
+void set_session_create_result(MigoResult result) noexcept { g_session_create_result = result; }
+void set_set_callbacks_result(MigoResult result) noexcept { g_set_callbacks_result = result; }
+void set_load_content_result(MigoResult result) noexcept { g_load_content_result = result; }
+void set_session_destroy_result(MigoResult result) noexcept { g_session_destroy_result = result; }
+
+namespace {
+
+/// Run one engine-side callback the way the real library does: hand it to the
+/// host's dispatcher from a thread that is not the GUI thread. A test that
+/// called the callback directly would never exercise the marshalling, which is
+/// the part that can go wrong.
+void dispatch_from_engine_thread(void (*body)(const MigoHostCallbacks &)) {
+    if (g_callbacks.dispatch == nullptr) return;
+    static void (*s_body)(const MigoHostCallbacks &) = nullptr;
+    s_body = body;
+    std::thread engine_thread([] {
+        g_callbacks.dispatch(
+            g_callbacks.dispatcher_data,
+            [](void *) {
+                if (s_body != nullptr) s_body(g_callbacks);
+            },
+            nullptr);
+    });
+    engine_thread.join();
+}
+
+MigoResult g_pending_error_code = MIGO_OK;
+std::string g_pending_error_message;
+
+}  // namespace
+
+void deliver_ready_from_engine_thread() noexcept {
+    dispatch_from_engine_thread([](const MigoHostCallbacks &callbacks) {
+        if (callbacks.on_ready != nullptr) {
+            callbacks.on_ready(callbacks.user_data, session());
+        }
+    });
+}
+
+void deliver_error_from_engine_thread(MigoResult code, const char *message) noexcept {
+    g_pending_error_code = code;
+    g_pending_error_message = message != nullptr ? message : "";
+    dispatch_from_engine_thread([](const MigoHostCallbacks &callbacks) {
+        if (callbacks.on_error == nullptr) return;
+        MigoError error{};
+        error.struct_size = sizeof(error);
+        error.abi_version = MIGO_ABI_VERSION_CURRENT;
+        error.code = g_pending_error_code;
+        error.message_utf8 = g_pending_error_message.c_str();
+        error.message_length = static_cast<uint32_t>(g_pending_error_message.size());
+        callbacks.on_error(callbacks.user_data, session(), &error);
+    });
+}
+
+void deliver_frame_request_from_engine_thread() noexcept {
+    dispatch_from_engine_thread([](const MigoHostCallbacks &callbacks) {
+        if (callbacks.on_request_frame != nullptr) {
+            callbacks.on_request_frame(callbacks.user_data, session());
+        }
+    });
+}
 
 }  // namespace fake_migo
 
@@ -280,4 +361,62 @@ extern "C" MigoResult MIGO_CALL migo_session_notify_vsync(MigoSession *session,
     if (session == nullptr) return MIGO_ERROR_INVALID_ARGUMENT;
     g_vsyncs.push_back(frame_time_nanos);
     return g_input_result;
+}
+
+extern "C" MigoResult MIGO_CALL migo_session_create(MigoEngine *engine,
+                                                    const MigoSessionConfig *config,
+                                                    MigoSession **out_session) {
+    ++g_calls.session_create;
+    if (out_session != nullptr) *out_session = nullptr;
+    if (engine == nullptr || config == nullptr || out_session == nullptr) {
+        return MIGO_ERROR_INVALID_ARGUMENT;
+    }
+    if (config->struct_size != sizeof(*config)) return MIGO_ERROR_INVALID_ARGUMENT;
+    if (g_session_create_result != MIGO_OK) return g_session_create_result;
+    g_session_alive = true;
+    *out_session = fake_migo::session();
+    return MIGO_OK;
+}
+
+extern "C" MigoResult MIGO_CALL
+migo_session_set_host_callbacks(MigoSession *session, const MigoHostCallbacks *callbacks) {
+    ++g_calls.set_callbacks;
+    if (session == nullptr || callbacks == nullptr) return MIGO_ERROR_INVALID_ARGUMENT;
+    if (callbacks->struct_size > sizeof(*callbacks)) return MIGO_ERROR_UNSUPPORTED_ABI;
+    // A non-null callback requires a non-null dispatcher: the real library
+    // refuses otherwise, and a fake that accepted it would let a host ship a
+    // table whose callbacks can never be delivered.
+    const bool has_callback = callbacks->on_ready != nullptr || callbacks->on_error != nullptr ||
+                              callbacks->on_exit_requested != nullptr ||
+                              callbacks->on_request_frame != nullptr;
+    if (has_callback && callbacks->dispatch == nullptr) return MIGO_ERROR_INVALID_ARGUMENT;
+    // All three keyboard callbacks or none.
+    const int keyboard_installed = (callbacks->on_show_keyboard != nullptr ? 1 : 0) +
+                                   (callbacks->on_hide_keyboard != nullptr ? 1 : 0) +
+                                   (callbacks->on_update_keyboard != nullptr ? 1 : 0);
+    if (keyboard_installed != 0 && keyboard_installed != 3) return MIGO_ERROR_INVALID_ARGUMENT;
+    if (g_set_callbacks_result != MIGO_OK) return g_set_callbacks_result;
+    g_callbacks = *callbacks;
+    return MIGO_OK;
+}
+
+extern "C" MigoResult MIGO_CALL migo_session_load_content(MigoSession *session,
+                                                          const MigoContentDescriptor *content) {
+    ++g_calls.load_content;
+    if (session == nullptr || content == nullptr) return MIGO_ERROR_INVALID_ARGUMENT;
+    if (content->struct_size != sizeof(*content)) return MIGO_ERROR_INVALID_ARGUMENT;
+    if (content->content_id_utf8 == nullptr || content->entry_utf8 == nullptr) {
+        return MIGO_ERROR_INVALID_ARGUMENT;
+    }
+    if (g_load_content_result != MIGO_OK) return g_load_content_result;
+    g_content_id = content->content_id_utf8;
+    return MIGO_OK;
+}
+
+extern "C" MigoResult MIGO_CALL migo_session_destroy(MigoSession *session) {
+    ++g_calls.session_destroy;
+    if (session == nullptr) return MIGO_ERROR_INVALID_ARGUMENT;
+    if (g_session_destroy_result != MIGO_OK) return g_session_destroy_result;
+    g_session_alive = false;
+    return MIGO_OK;
 }

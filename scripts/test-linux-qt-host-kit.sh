@@ -167,6 +167,7 @@ cmake --install "$BUILD_DIR"
 
 require_file "$BUILD_DIR/prefix/include/migo/linux/surface_host.hpp"
 require_file "$BUILD_DIR/prefix/include/migo/linux/qt6/x11_surface_view.hpp"
+require_file "$BUILD_DIR/prefix/include/migo/linux/qt6/managed_session.hpp"
 require_file "$BUILD_DIR/prefix/share/doc/migo-linux-host-kit/README.md"
 require_file "$BUILD_DIR/prefix/lib/cmake/migo-linux-host-kit/migo-linux-host-kit-config.cmake"
 require_file "$BUILD_DIR/prefix/lib/cmake/migo-linux-host-kit/migo-linux-host-kit-targets.cmake"
@@ -185,15 +186,22 @@ require_file "$BUILD_DIR/install-consumer/migo-host-kit-install-consumer"
 "$BUILD_DIR/migo-surface-host-test"
 env QT_QPA_PLATFORM=offscreen "$BUILD_DIR/migo-qt-x11-view-test"
 env QT_QPA_PLATFORM=offscreen "$BUILD_DIR/migo-qt-x11-input-test"
+env QT_QPA_PLATFORM=offscreen "$BUILD_DIR/migo-qt-managed-session-test"
 # Pin xcb explicitly: developer desktops often export WAYLAND_DISPLAY, while
 # this adapter and its positive-path test intentionally exercise X11 only.
 xvfb-run -a env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb \
     "$BUILD_DIR/migo-qt-x11-view-test"
 xvfb-run -a env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb \
     "$BUILD_DIR/migo-qt-x11-input-test"
+xvfb-run -a env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb \
+    "$BUILD_DIR/migo-qt-managed-session-test"
 
 if [[ "$SANITIZE" == "1" ]]; then
-    SANITIZER_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+    # -fno-sanitize-recover=all is what makes this a gate rather than a report:
+    # UndefinedBehaviorSanitizer prints and CONTINUES by default, so a run that
+    # diagnosed real undefined behaviour still exited 0 and the lane called it a
+    # pass. That is how the uninitialised read below reached this branch.
+    SANITIZER_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
     cmake \
         -S "$HOST_KIT_ROOT/tests" \
         -B "$BUILD_DIR/sanitize" \
@@ -209,6 +217,8 @@ if [[ "$SANITIZE" == "1" ]]; then
         "$BUILD_DIR/sanitize/migo-qt-x11-view-test"
     xvfb-run -a env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb \
         "$BUILD_DIR/sanitize/migo-qt-x11-input-test"
+    xvfb-run -a env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb \
+        "$BUILD_DIR/sanitize/migo-qt-managed-session-test"
     printf 'Linux Qt Host Kit contract: ASan/UBSan PASS\n'
 fi
 

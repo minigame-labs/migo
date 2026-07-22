@@ -82,7 +82,7 @@
 | 平台 | 当前状态 | 已有能力 | 尚不能宣称的能力 |
 |---|---|---|---|
 | Android | 已实现，公开 ABI 仍是 candidate | API 26；JNI AAR；C ABI static SDK+CMake；`ANativeWindow`/EGL/GLES presenter；输入、IME、gamepad；arm64 snapshot 与 x86_64 emulator 生成链路 | 重建并提交各 ABI 的 v2 V8 component manifest；补齐 x86_64 full/slim snapshot；所有 ABI 的 release package 与最低/最新真机双门；全量多指真机验证 |
-| Linux GNU | 已实现，公开 ABI 仍是 candidate | x86_64；X11/Wayland host-owned Surface；EGL/GLES；`libmigo.so`/`.a`；pkg-config/CMake；外部 C consumer；toolkit-neutral `SurfaceHost` 与 Qt 6 Widgets/X11 Bound view（含输入/焦点/IME/frame request） | 用新 v2 component manifest 重建并发布的正式 artifact；发行版/驱动矩阵与性能门；Qt Managed wrapper；Qt Wayland/Quick |
+| Linux GNU | 已实现，公开 ABI 仍是 candidate | x86_64；X11/Wayland host-owned Surface；EGL/GLES；`libmigo.so`/`.a`；pkg-config/CMake；外部 C consumer；toolkit-neutral `SurfaceHost` 与 Qt 6 Widgets/X11 的 Bound + Managed 两种所有权形态（含输入/焦点/IME/frame request） | 用新 v2 component manifest 重建并发布的正式 artifact；发行版/驱动矩阵与性能门；Qt Wayland；Qt Quick 与 GTK 4（同一 texture/fence 前置） |
 | Windows | 候选 spike | C/C++ header 的 MSVC x64/x86 ABI lane；五个被探测 crate 的 MSVC `cargo check`；`EglProvider` 可承载 ANGLE | 完整 workspace；真实 V8 链接/启动；HWND/SwapChainPanel presenter；ANGLE 出帧；输入/音频/完整性；DLL/NuGet；真机 |
 | macOS | 目标 | 公开 typed descriptor 设计 | runtime、Metal presenter、V8 component、Host Kit、package、CI |
 | iOS | 目标 | 明确采用 WebKit Host Kit 的产品边界 | WKWebView backend、bridge、conformance、package、CI |
@@ -247,10 +247,10 @@ Host Kit 必须提供两种 Session 所有权形态，但不要求在同一个 c
 |---|---|---|---|
 | Android | `MigoGameView` 或 App 自己的 `Surface` | `MigoGameActivity` | 已实现 candidate |
 | Linux C/C++ | App 自己的 X11/Wayland target | `migo-player` | 已实现 candidate |
-| Linux Qt 6 Widgets/X11 | `MigoQtX11SurfaceView`，借用 Session-scoped `SurfaceHost` | 无；顶层窗口始终由 App 提供 | 已实现 candidate：Surface 生命周期 + 输入/焦点/IME/frame request |
+| Linux Qt 6 Widgets/X11 | `MigoQtX11SurfaceView`，借用 Session-scoped `SurfaceHost`（Bound） | `MigoManagedSession`，拥有 Session 与 callback table（Managed）；顶层窗口两者都由 App 提供 | 已实现 candidate：Surface 生命周期 + 输入/焦点/IME/frame request + 两种所有权形态 |
 | Linux Qt 6/Wayland | toolkit adapter | 无 | Qt 6.4 环境没有满足本合同的公开 native handle API，不使用 private header |
 | Qt Quick | `QQuickItem` texture consumer | 无 | 等待零拷贝 texture/fence ABI；禁止 child-window overlay workaround |
-| GTK 4 | `MigoGtkWidget` | GTK sample | 后续独立 package |
+| GTK 4 | 无 Direct Surface 路径 | 无 | **与 Qt Quick 同一阻塞**：GTK 4 只给实现 `GtkNative` 的 widget（顶层/popover）`GdkSurface`，并移除了 `GtkSocket`/`GtkPlug`，宿主布局里放不进可 present 的原生子目标；证据见 `scripts/test-gtk4-surface-capability.sh` |
 | Windows | child HWND / WinUI Control | sample Window | Milestone B |
 | macOS | `NSView`/SwiftUI wrapper | sample controller | Milestone C |
 | iOS | `UIView`/SwiftUI wrapper 内嵌 WKWebView | sample controller | Milestone E |
@@ -672,9 +672,8 @@ Linux Host Kit 的后续增量按独立能力交付，不扩张本次 surface-on
 
 1. **桌面指针通道（2026-07-22 已完成）**：此前鼠标 button/move 与滚轮**没有任何入口**，而运行时已经把 `onMouseDown`/`onMouseMove`/`onMouseUp`/`onWheel` 发布给内容——这些是 wx 表面真实定义的名字（wx 小游戏在 PC 微信上跑）。JS 侧 listener 与 `_internalTrigger*` 都在，却没有任何引擎代码调用、也没有宿主能调用，内容注册后永远静默不触发。已按软键盘的形状补齐宿主通道（引擎暴露能力、宿主生产事件，两路互不合成），入口为 `migo_session_send_pointer_event` / `migo_session_send_wheel_event`。**它不是 Qt 专属前置**：Windows Milestone B 第 5 项与 macOS Milestone C 的 Host Kit 吃的是同一条通道。守卫为 `scripts/test-input-trigger-producer-contract.sh`（任何已发布的输入 listener 失去生产者即红）；权威状态见 `include/migo/README.md` 的 freeze blockers。**遗留代价**：改了嵌入 JS ⇒ Android 的 aarch64 snapshot 已 stale，需在真机重生成后 Android 宿主才能用这条通道（Linux 走源码 bootstrap，已即时生效）；
 2. **Qt Widgets Bound input/frame adapter（2026-07-22 已完成）**：转换全部发生在 view 自己的事件处理器里（没有任何 event filter）、GUI 线程内、热路径零分配（以 `malloc` 计数实测，Qt 容器不走 `operator new`）；坐标为 CSS 像素（与 Qt logical 恒等，不得再乘 DPR）；`code` 取自硬件扫描码而非布局；失焦撤回未结束的按压与 preedit；帧由 `QWindow::requestUpdate()` 驱动，未请求的重绘不报帧边界。明确不交付：preedit 的光标/选区（DOM 亦不提供）、失焦时合成按键 up、hover 映射为 touch；
-3. 再实现拥有 Session 的 Managed wrapper 和完整示例 App；
-4. 通过 toolkit 官方公开 API实现 GTK 4 X11/Wayland Host Kit；
-5. 设计同 GPU device 的 texture/fence ABI 后再实现 Qt Quick，不能先提交 readback 或 child-window overlay；
+3. **拥有 Session 的 Managed wrapper（2026-07-22 已完成）**:`MigoManagedSession` 拥有 Session、callback table 与 view,但**不拥有 `MigoEngine`**(一个 App 可在一个 engine 上开多个 Session)。engine 回调经宿主自己的 dispatcher 投递到 GUI 线程,teardown 开始后 dispatcher **拒绝**而非排队(拒绝把任务所有权退回引擎,排队则会让它跑在已消失的 Session 上)。**三个软键盘回调一个都不装**——wx 的软键盘模型要求宿主拥有文本字段并回报全文,桌面宿主有物理键盘、内容已直接收到按键与组合态,装了不实现就是伪装支持。销毁顺序恒为 begin_detach → 等 `RELEASED` → destroy,`close()` 不阻塞 GUI 线程,仍活动时析构 fail fast。示例 App 待补;
+4. **先设计同 GPU device 的零拷贝 texture/fence ABI**，然后 Qt Quick 与 GTK 4 才可能实现——两者卡在**同一个**前置条件上，此前把 GTK 4 排在 Qt Quick 之前是错的排序。GTK 4 的实测结论（2026-07-22）：子 widget 不是 `GtkNative`、没有 `GdkSurface`，`GtkSocket`/`GtkPlug` 已移除，唯一的原生 surface 是顶层窗口的；往它 present 就是被明令禁止的 child-window overlay（无视布局、裁剪与 z-order）。门禁 `scripts/test-gtk4-surface-capability.sh` 固化该结论，GTK 改变答案的那天它会红——那是解锁信号而不是回归；
 6. 每个增量分别进入最低 Linux/Qt 兼容矩阵与最新系统性能矩阵。
 
 ### Milestone B：Windows production vertical slice

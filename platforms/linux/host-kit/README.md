@@ -11,8 +11,37 @@ What is claimed:
 - `migo::qt6-x11-surface-view` is a Qt 6.4+ Widgets adapter for the `xcb`
   platform plugin, using a native child `QWidget`. It carries the Surface
   lifecycle, input, focus, IME composition and the frame request.
-- Qt Wayland, Qt Quick, GTK convenience widgets and a Managed Session wrapper
-  are not claimed.
+- `migo::qt6-managed-session` is the Managed ownership shape: `MigoManagedSession`
+  owns the Session, its callback table and the view. The Bound shape is the view
+  driven by an App-owned `SurfaceHost`. They are separate targets, so an App that
+  owns its own Session never links a type that creates and destroys Sessions.
+- Qt Wayland, Qt Quick and GTK 4 are not claimed, and the last two are blocked
+  on the same thing -- see "Render-path limits".
+
+## Managed or Bound
+
+| | Bound | Managed |
+|---|---|---|
+| Session owner | the App | `MigoManagedSession` |
+| Callback table | the App installs it | the wrapper installs it |
+| `MigoEngine` | the App | the App -- the wrapper never owns one |
+| View disappears | only the attachment retires; the Session can stay paused and bind a new view | Surface retires, then the Session is destroyed |
+
+They are two types rather than one type with a flag, because what differs is who
+is responsible for an asynchronous teardown, and a boolean cannot answer that.
+
+`MigoManagedSession` deliberately declines the soft-keyboard capability, and
+declines it whole: the three callbacks install together or not at all, and wx's
+model requires the host to own a text field and report its whole current value.
+A desktop host has a physical keyboard whose input already reaches content as
+key and composition events, so claiming the capability and not maintaining a
+field would be worse than not having it -- content's `wx.showKeyboard` correctly
+reports failure instead.
+
+Teardown is the C ABI's three steps and cannot be shortened: `close()` begins
+the detach and returns immediately, the view's release observer reports
+`RELEASED`, and only then is the Session destroyed. Destroying the wrapper while
+it is still running terminates, for the same reason the view does.
 
 ## Input, focus and frames
 
@@ -210,6 +239,17 @@ overlay would break clipping, transforms and frame scheduling. It remains
 unsupported until Migo exposes an explicit zero-copy texture plus synchronization
 contract. Qt 6.4 also does not expose the Wayland display/surface pair needed by
 this adapter through a supported public API; private Qt headers are forbidden.
+
+GTK 4 is blocked by the same missing contract, which is not obvious from the
+roadmap's ordering: it gives a `GdkSurface` only to widgets implementing
+`GtkNative` -- the toplevel and popovers -- and removed `GtkSocket`/`GtkPlug`, so
+there is no public way to place a native target inside an App's layout for Migo
+to present into. The only thing on offer is the toplevel's own surface, and
+presenting there ignores layout, clipping and z-order, which is precisely the
+child-window overlay this project refuses as a fallback.
+`scripts/test-gtk4-surface-capability.sh` runs a probe that establishes this, so
+the claim is evidence rather than a documentation reading -- and so that the day
+GTK 4 changes its answer, the gate fails and somebody re-reads the roadmap.
 
 Run the isolated contract without building V8:
 

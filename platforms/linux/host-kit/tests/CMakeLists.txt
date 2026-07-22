@@ -57,6 +57,14 @@ target_link_libraries(migo-qt-x11-input-test PRIVATE
     Qt6::Test
 )
 
+add_executable(migo-qt-managed-session-test qt_managed_session_test.cpp)
+set_target_properties(migo-qt-managed-session-test PROPERTIES AUTOMOC ON)
+target_link_libraries(migo-qt-managed-session-test PRIVATE
+    migo::qt6-managed-session
+    migo_host_kit_fake_capi
+    Qt6::Test
+)
+
 add_library(migo-gnu-extension-consumer-test STATIC
     gnu_extension_consumer_test.cpp
 )
@@ -75,12 +83,14 @@ foreach(target
         migo-surface-host-test
         migo-qt-x11-view-test
         migo-qt-x11-input-test
+        migo-qt-managed-session-test
         migo-gnu-extension-consumer-test)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
 endforeach()
 
 target_compile_options(migo_linux_surface_host PRIVATE -Wall -Wextra -Werror)
 target_compile_options(migo_qt6_x11_surface_view PRIVATE -Wall -Wextra -Werror)
+target_compile_options(migo_qt6_managed_session PRIVATE -Wall -Wextra -Werror)
 
 enable_testing()
 add_test(NAME migo-surface-host COMMAND migo-surface-host-test)
@@ -89,4 +99,7 @@ set_tests_properties(migo-qt-x11-offscreen PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 add_test(NAME migo-qt-x11-input-offscreen COMMAND migo-qt-x11-input-test)
 set_tests_properties(migo-qt-x11-input-offscreen PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+add_test(NAME migo-qt-managed-session-offscreen COMMAND migo-qt-managed-session-test)
+set_tests_properties(migo-qt-managed-session-offscreen PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

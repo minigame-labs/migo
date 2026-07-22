@@ -157,6 +157,11 @@ private:
 
     SurfaceHost &surface_host_;
     QThread *const owner_thread_;
+    // Parented in the constructor body, not here. `QTimer(this)` calls
+    // QObject::setParent, which sends a ChildAdded event synchronously -- and
+    // because `event()` is overridden, that reaches this class before the
+    // members declared after these two have been initialised. Reading one there
+    // is undefined behaviour; on the heap it reads the allocator's fill byte.
     QTimer release_timer_;
     QTimer metrics_update_timer_;
     QElapsedTimer release_elapsed_;

@@ -25,6 +25,7 @@ set_target_properties(migo-host-kit-install-consumer PROPERTIES
 )
 target_link_libraries(migo-host-kit-install-consumer PRIVATE
     migo::qt6-x11-surface-view
+    migo::qt6-managed-session
 )
 target_compile_definitions(migo-host-kit-install-consumer PRIVATE
     QT_NO_KEYWORDS

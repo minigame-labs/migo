@@ -24,6 +24,10 @@ struct Calls {
     int composition = 0;
     int focus = 0;
     int vsync = 0;
+    int session_create = 0;
+    int session_destroy = 0;
+    int set_callbacks = 0;
+    int load_content = 0;
 };
 
 /// One delivered input event, flattened.
@@ -79,6 +83,24 @@ const std::vector<int64_t> &vsyncs() noexcept;
 /// Make every input entry point report a full queue, so a caller that ignores
 /// the result can be caught.
 void set_input_result(MigoResult result) noexcept;
+
+MigoEngine *engine() noexcept;
+/// The callback table the host installed, copied.
+const MigoHostCallbacks &installed_callbacks() noexcept;
+/// True while a Session handle the fake handed out has not been destroyed.
+bool session_is_alive() noexcept;
+const std::string &loaded_content_id() noexcept;
+
+void set_session_create_result(MigoResult result) noexcept;
+void set_set_callbacks_result(MigoResult result) noexcept;
+void set_load_content_result(MigoResult result) noexcept;
+void set_session_destroy_result(MigoResult result) noexcept;
+
+/// Drive the engine-side callbacks the way the real library would: through the
+/// host's dispatcher, from a thread that is not the GUI thread.
+void deliver_ready_from_engine_thread() noexcept;
+void deliver_error_from_engine_thread(MigoResult code, const char *message) noexcept;
+void deliver_frame_request_from_engine_thread() noexcept;
 
 void reset() noexcept;
 

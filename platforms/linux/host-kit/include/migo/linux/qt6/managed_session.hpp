@@ -1,0 +1,104 @@
+#ifndef MIGO_LINUX_QT6_MANAGED_SESSION_HPP_
+#define MIGO_LINUX_QT6_MANAGED_SESSION_HPP_
+
+#include <migo/linux/qt6/x11_surface_view.hpp>
+#include <migo/linux/surface_host.hpp>
+
+#include <QObject>
+#include <QString>
+
+#include <memory>
+
+namespace migo::linux_host::qt6 {
+
+/// A Qt 6 Widgets container that owns one Migo Session.
+///
+/// This is the Managed half of the Host Kit's two ownership shapes. The Bound
+/// half is `MigoQtX11SurfaceView` driven by an App-owned `SurfaceHost`: there
+/// the App owns the Session, keeps it alive across views, and installs its own
+/// callback table. Here the Host Kit owns the Session, its callbacks and its
+/// view, and retires all three on request. The two are separate types rather
+/// than one type with a flag, because the difference is who is responsible for
+/// an asynchronous teardown -- a question a boolean cannot answer.
+///
+/// What this does NOT own is the `MigoEngine`: one App may run several Sessions
+/// on one engine (preloading, multiple windows), and a wrapper that created its
+/// own would make that impossible. The engine, the parent widget and the
+/// QApplication must each outlive this object.
+///
+/// Teardown is the C ABI's three steps and cannot be shortened: begin the
+/// detach, wait for the release observer to report RELEASED, then destroy the
+/// Session. `close()` starts that and returns immediately; `sessionClosed`
+/// arrives once the Session is really gone. Destroying this object while it is
+/// still running is a programming error and terminates, for the same reason the
+/// view does: silently dropping the only release handle leaves the host unable
+/// to destroy its own window safely, and no later call can recover it.
+///
+/// The whole public API is confined to the GUI thread, which is the Session's
+/// owner thread. Engine callbacks arrive on engine threads and are marshalled
+/// here before any of them runs.
+class MigoManagedSession final : public QObject {
+    Q_OBJECT
+
+public:
+    /// Constructs the Session and its view, and installs the callback table.
+    ///
+    /// The callback table can be installed only once per Session and only
+    /// before the first attach, so it happens here rather than being exposed:
+    /// a later install would be refused, and a host that could try would have a
+    /// window in which queued callbacks observed replaced function pointers.
+    MigoManagedSession(MigoEngine &engine, QWidget &parent, QObject *object_parent = nullptr);
+    ~MigoManagedSession() override;
+
+    MigoManagedSession(const MigoManagedSession &) = delete;
+    MigoManagedSession &operator=(const MigoManagedSession &) = delete;
+
+    /// Whether construction produced a usable Session.
+    [[nodiscard]] bool isValid() const noexcept;
+
+    /// The result of the failing construction step, or MIGO_OK.
+    [[nodiscard]] MigoResult lastError() const noexcept;
+
+    /// The view to place in the App's layout. Never null while this object is
+    /// alive; owned by the parent widget passed to the constructor.
+    [[nodiscard]] MigoQtX11SurfaceView *view() const noexcept;
+
+    /// Start evaluating the named content.
+    ///
+    /// Argument and state problems are reported synchronously through the
+    /// return value; a failure raised once the content is running arrives later
+    /// through `contentFailed`, because by then this call's stack is gone. The
+    /// two are deliberately not merged into one signal: a caller can act on the
+    /// first and can only report the second.
+    [[nodiscard]] MigoResult loadContent(const QString &content_id, const QString &entry);
+
+    /// Begin the asynchronous teardown. Safe to call more than once.
+    ///
+    /// Returns MIGO_OK when teardown has started or already finished. Does not
+    /// block: `sessionClosed` reports completion.
+    [[nodiscard]] MigoResult close();
+
+    /// Whether the Session has been destroyed.
+    [[nodiscard]] bool isClosed() const noexcept;
+
+Q_SIGNALS:
+    /// Content finished loading and is running.
+    void contentReady();
+    /// Content raised an error after it started running.
+    void contentFailed(MigoResult code, const QString &message);
+    /// Content asked to exit.
+    void exitRequested();
+    /// The Session has been destroyed and this object can be deleted.
+    void sessionClosed();
+    /// A Surface or input call was refused. Forwarded from the view so an App
+    /// using the Managed shape does not have to connect to it separately.
+    void migoError(MigoResult code);
+
+private:
+    class Impl;
+    const std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace migo::linux_host::qt6
+
+#endif  // MIGO_LINUX_QT6_MANAGED_SESSION_HPP_

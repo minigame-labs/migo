@@ -77,6 +77,32 @@ if(MIGO_LINUX_HOST_KIT_BUILD_QT6_X11)
             X11::X11
     )
     list(APPEND _migo_linux_host_kit_targets migo_qt6_x11_surface_view)
+
+    # The Managed wrapper is a separate target, not a mode of the view: an App
+    # that owns its own Session (the Bound shape) must not be made to link a
+    # type that creates and destroys Sessions.
+    add_library(migo_qt6_managed_session STATIC
+        include/migo/linux/qt6/managed_session.hpp
+        src/qt6/managed_session.cpp
+    )
+    add_library(migo::qt6-managed-session ALIAS migo_qt6_managed_session)
+    set_target_properties(migo_qt6_managed_session PROPERTIES
+        AUTOMOC ON
+        EXPORT_NAME qt6-managed-session
+        POSITION_INDEPENDENT_CODE ON
+    )
+    target_compile_features(migo_qt6_managed_session PUBLIC cxx_std_17)
+    target_include_directories(migo_qt6_managed_session
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+    target_link_libraries(migo_qt6_managed_session
+        PUBLIC
+            migo::qt6-x11-surface-view
+            Qt6::Widgets
+    )
+    list(APPEND _migo_linux_host_kit_targets migo_qt6_managed_session)
 endif()
 
 if(MIGO_LINUX_HOST_KIT_ENABLE_INSTALL)
@@ -93,6 +119,7 @@ if(MIGO_LINUX_HOST_KIT_ENABLE_INSTALL)
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/migo/linux")
     if(MIGO_LINUX_HOST_KIT_BUILD_QT6_X11)
         install(FILES include/migo/linux/qt6/x11_surface_view.hpp
+                      include/migo/linux/qt6/managed_session.hpp
             DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/migo/linux/qt6")
     endif()
     install(FILES README.md

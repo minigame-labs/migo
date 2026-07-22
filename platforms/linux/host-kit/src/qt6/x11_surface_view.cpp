@@ -47,9 +47,13 @@ constexpr qint64 kReleaseStallThresholdMs = 2000;
 MigoQtX11SurfaceView::MigoQtX11SurfaceView(SurfaceHost &surface_host, QWidget &parent)
     : QWidget(&parent),
       surface_host_(surface_host),
-      owner_thread_(QThread::currentThread()),
-      release_timer_(this),
-      metrics_update_timer_(this) {
+      owner_thread_(QThread::currentThread()) {
+    // Parenting happens here rather than in the initialiser list: it sends a
+    // ChildAdded event synchronously, and this class overrides `event()`, so
+    // doing it earlier would run that override against members that do not
+    // exist yet.
+    release_timer_.setParent(this);
+    metrics_update_timer_.setParent(this);
     setAttribute(Qt::WA_DontCreateNativeAncestors);
     setAttribute(Qt::WA_NativeWindow);
     setAttribute(Qt::WA_PaintOnScreen);
