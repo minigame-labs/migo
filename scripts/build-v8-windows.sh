@@ -215,13 +215,31 @@ set V8_FROM_SOURCE=1
 rem Kept in step with the Android and Linux recipes: WebAssembly and pointer
 rem compression on, sandbox off, i18n on because rusty_v8's binding.cc includes
 rem <unicode/locid.h> unconditionally and fails to compile without it.
-set EXTRA_GN_ARGS=v8_enable_webassembly=true v8_enable_pointer_compression=true v8_enable_i18n_support=true v8_enable_sandbox=false
+rem use_allocator_shim / use_partition_alloc_as_malloc: Chromium's allocator
+rem shim replaces malloc/free process-wide. Linked into a host it would free
+rem pointers the host allocated with the system allocator, and it also makes
+rem the archive redefine ucrt's malloc/free/realloc/calloc/_msize, which fails
+rem the link outright. scripts/build-v8-linux.sh turns both off for the same
+rem reason: an engine that hijacks its host's allocator is not embeddable.
+rem treat_warnings_as_errors: building V8 against the MSVC STL is a
+rem configuration upstream does not test, and it trips exactly one warning --
+rem -Wctad-maybe-unsupported on std::atomic_ref, 78 times. libc++ annotates
+rem that template as deduction-friendly and the MSVC STL does not; the code is
+rem valid either way. Chromium exposes no per-warning argument, and rusty_v8's
+rem own build.rs already turns this off whenever it uses a system clang. It
+rem changes no generated code, only whether a warning fails the build.
+set EXTRA_GN_ARGS=v8_enable_webassembly=true v8_enable_pointer_compression=true v8_enable_i18n_support=true v8_enable_sandbox=false use_allocator_shim=false use_partition_alloc_as_malloc=false
 
 cd /d ${RUSTY_V8_SRC_WIN} || exit /b 90
-rem --no-default-features turns OFF the crate's use_custom_libcxx feature, which
-rem is what makes build.rs emit use_custom_libcxx=false and put V8 on the MSVC
-rem STL. That is the whole point of this script; see the header.
-cargo build --release --no-default-features --target ${TARGET}
+rem V8 is built WITH its bundled libc++ (the crate default), because it cannot
+rem be compiled against the MSVC STL: measured 2026-07-24, clang-cl crashes
+rem (frontend signal) on 32 torque-generated translation units, and before that
+rem 78 -Wctad-maybe-unsupported errors. Chromium compiles those with
+rem -D_HAS_EXCEPTIONS=0 and /std:c++23preview, a combination Microsoft does not
+rem support for its own STL. So `use_custom_libcxx=false` is not an option here,
+rem and the Skia/V8 std::terminate collision needs a different answer -- see
+rem platforms/windows/SPIKE-REPORT.md.
+cargo build --release --target ${TARGET}
 rem Capture before echoing: an echo succeeds and would otherwise become the
 rem batch file's exit status, making a failed build look like a pass.
 set CARGO_EXIT=%errorlevel%

@@ -13,8 +13,17 @@
  
  use_custom_libcxx =
      use_custom_libcxx || (use_custom_libcxx_for_host && !is_a_target_toolchain)
++# Give the snapshot toolchain the custom libc++ when it is a *separate*
++# toolchain, i.e. when cross-compiling. On a native build the snapshot
++# toolchain IS the target toolchain, so without the first condition this
++# silently ORs `use_custom_libcxx` back to true for the whole target build and
++# overrides an explicit `use_custom_libcxx=false`. That packages libc++ into
++# the archive, and its `std::terminate` then collides with the one Skia carries
++# when both are linked into a single binary.
 +use_custom_libcxx =
-+    use_custom_libcxx || (use_custom_libcxx_for_host && current_toolchain == v8_snapshot_toolchain)
++    use_custom_libcxx || (use_custom_libcxx_for_host &&
++                          v8_snapshot_toolchain != default_toolchain &&
++                          current_toolchain == v8_snapshot_toolchain)
  
  declare_args() {
    # WARNING: Setting this to a non-default value is highly discouraged.
