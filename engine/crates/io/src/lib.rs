@@ -12,6 +12,8 @@ pub mod ktx2;
 pub mod kv_store;
 pub mod mmap_reader;
 #[cfg(feature = "zip-extract")]
+#[cfg(feature = "rust-image-decode")]
+mod ingest_transcode;
 pub mod package_ingest;
 pub mod pools;
 pub mod scheduler;

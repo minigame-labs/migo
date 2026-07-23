@@ -16,6 +16,27 @@ use crate::{
     task::{IoRequest, PriorityClass},
     zip_extract::ExtractBudget,
 };
+#[cfg(feature = "rust-image-decode")]
+use crate::ingest_transcode::{is_transcodable_image, transcode_image};
+
+// Without the image decoder there is nothing to transcode with, so the ingest
+// loop compiles to its original streaming-only form: `is_transcodable_image` is
+// always false and the sidecar branch is dead. Keeping the call sites
+// unconditional (rather than sprinkling `#[cfg]` through the loop body) keeps
+// the two builds structurally identical.
+#[cfg(not(feature = "rust-image-decode"))]
+fn is_transcodable_image(_name: &str) -> bool {
+    false
+}
+#[cfg(not(feature = "rust-image-decode"))]
+struct TranscodedSidecar {
+    name: String,
+    bytes: Vec<u8>,
+}
+#[cfg(not(feature = "rust-image-decode"))]
+fn transcode_image(_name: &str, _bytes: &[u8]) -> Option<TranscodedSidecar> {
+    None
+}
 
 fn package_ingest_request_for(zip_path: &Path) -> IoRequest {
     let compressed_bytes = std::fs::metadata(zip_path)
@@ -183,19 +204,27 @@ pub fn ingest_zip_to_package_with_budget(
                 }
             }
 
-            // Streaming add: the zip `entry` is itself a `Read`
-            // source, so we never materialise the uncompressed
-            // bytes as a single `Vec<u8>`. Peak memory per entry
-            // is bounded by the package writer's chunk size
-            // (default 64 KiB).
+            // Transcodable images are read whole so they can be decoded and
+            // ETC2-encoded; everything else streams, so the uncompressed bytes
+            // of a large asset are never materialised as one `Vec<u8>`.
             let before = ingested_total;
-            {
+            let image_bytes: Option<Vec<u8>> = if is_transcodable_image(&name) {
+                // `cap` already bounds this read to the per-entry and remaining
+                // total budget, so an image cannot blow the archive limit here.
+                let mut buf = Vec::new();
+                let mut limited = (&mut entry).take(cap as u64);
+                let read = limited.read_to_end(&mut buf)? as u64;
+                ingested_total = ingested_total.saturating_add(read);
+                writer.add_entry(&name, &buf)?;
+                Some(buf)
+            } else {
                 let mut counting = CountingReader {
                     inner: &mut entry,
                     counted: &mut ingested_total,
                 };
                 writer.add_entry_streaming(&name, &mut counting, cap)?;
-            }
+                None
+            };
             if ingested_total > budget.max_total_uncompressed {
                 return Err(PackageError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -207,6 +236,27 @@ pub fn ingest_zip_to_package_with_budget(
                         budget.max_total_uncompressed
                     ),
                 )));
+            }
+
+            // Produce the ETC2/KTX2 sidecar beside the original. A failed
+            // decode or a non-4-aligned image yields no sidecar (the original
+            // still carries the asset), so this never fails ingest. The sidecar
+            // counts against the archive budget like any other entry.
+            if let Some(bytes) = image_bytes {
+                if let Some(sidecar) = transcode_image(&name, &bytes) {
+                    let sidecar_len = sidecar.bytes.len() as u64;
+                    if ingested_total.saturating_add(sidecar_len) > budget.max_total_uncompressed {
+                        return Err(PackageError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "transcoded sidecar '{}' ({} bytes) would exceed budget {}",
+                                sidecar.name, sidecar_len, budget.max_total_uncompressed
+                            ),
+                        )));
+                    }
+                    writer.add_entry(&sidecar.name, &sidecar.bytes)?;
+                    ingested_total = ingested_total.saturating_add(sidecar_len);
+                }
             }
         }
 
@@ -302,6 +352,66 @@ mod tests {
 
         zip.finish().unwrap();
         zip_path
+    }
+
+    /// A real, 4-aligned RGBA PNG so the transcode path actually runs, unlike
+    /// the fake `\x89PNG_...` bytes in `create_test_zip` (which exercise the
+    /// decode-fails-so-no-sidecar branch).
+    #[cfg(feature = "rust-image-decode")]
+    fn real_png(width: u32, height: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[(x * 4) as u8, (y * 4) as u8, 0x80, 0xFF]);
+            }
+        }
+        let buffer = image::RgbaImage::from_raw(width, height, rgba).unwrap();
+        let mut out = std::io::Cursor::new(Vec::new());
+        buffer
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    /// End-to-end: a package built from a zip containing a real aligned PNG
+    /// carries BOTH the original and a `.ktx2` ETC2 sidecar, and the sidecar is
+    /// exactly what the runtime's KTX2 parser recognises. This is the whole
+    /// point of the ingest wiring: the runtime already prefers the `.ktx2`
+    /// companion (VARIANT_EXTENSIONS lists it first), so producing it here makes
+    /// the zero-decode path live without any runtime change.
+    #[cfg(feature = "rust-image-decode")]
+    #[test]
+    fn an_aligned_png_gains_an_etc2_sidecar_the_runtime_parser_accepts() {
+        use shared::vfs::package::PackageReader;
+
+        let dir = make_test_dir("ingest_sidecar");
+        let zip_path = dir.join("in.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("game.js", opts).unwrap();
+            zip.write_all(b"//game").unwrap();
+            zip.start_file("img/hero.png", opts).unwrap();
+            zip.write_all(&real_png(32, 32)).unwrap();
+            zip.finish().unwrap();
+        }
+        let pkg_path = dir.join("out.mpkg");
+        ingest_zip_to_package(&zip_path, &pkg_path, "g", "1").unwrap();
+
+        let reader = PackageReader::open(&pkg_path, "g", "1").unwrap();
+        let names: Vec<String> = reader.entry_paths().map(|s| s.to_string()).collect();
+
+        // The original survives (ES 2.0 / getImageData fallback).
+        assert!(names.iter().any(|n| n == "img/hero.png"), "names: {names:?}");
+        // And the sidecar was produced next to it, on the companion path the
+        // runtime probes first.
+        assert!(names.iter().any(|n| n == "img/hero.ktx2"), "names: {names:?}");
+
+        let ktx2 = reader.read_entry("img/hero.ktx2").unwrap();
+        let parsed = crate::ktx2::parse_ktx2(&ktx2).expect("runtime parser accepts the sidecar");
+        assert_eq!(parsed.header.format, crate::ktx2::VkFormat::Etc2R8G8B8UnormBlock);
+        assert_eq!((parsed.header.width, parsed.header.height), (32, 32));
     }
 
     #[test]
