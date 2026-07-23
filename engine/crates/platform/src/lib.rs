@@ -5,6 +5,9 @@ pub mod android;
 pub(crate) mod jni_profile_contract;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux;
+
+#[cfg(target_os = "windows")]
+pub mod windows;
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]
 compile_error!("profile-full and profile-slim are mutually exclusive");
 #[cfg(all(feature = "worker-snapshot", not(feature = "profile-full")))]
