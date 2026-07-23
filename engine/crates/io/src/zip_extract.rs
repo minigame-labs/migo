@@ -260,7 +260,17 @@ pub fn extract_zip_with_budget(
 
         trace!("extract_zip: processing [{}] {}", i, file_name);
 
-        let outpath = dest_dir.join(&file_name);
+        // Base the entry path on the *canonical* destination, not the raw
+        // `dest_dir`. On Windows `canonicalize()` returns a verbatim path
+        // (`\\?\C:\...`), and the containment check below compares against
+        // `dest_canonical`; joining onto the non-verbatim `dest_dir` produced a
+        // path that never shared that prefix, so `starts_with(&dest_canonical)`
+        // was false for *every* entry and rejected even a plain "a.txt" as a
+        // traversal. Joining onto the canonical base makes both sides carry the
+        // same prefix (verbatim on Windows, none on Unix), so the comparison is
+        // correct on both. A `..`/absolute entry still normalizes outside the
+        // base and is still rejected.
+        let outpath = dest_canonical.join(&file_name);
 
         if file.is_symlink() {
             error!("extract_zip: symlink entry rejected: {}", file_name);

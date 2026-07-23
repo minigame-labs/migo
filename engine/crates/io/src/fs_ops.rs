@@ -2038,8 +2038,15 @@ mod tests {
         let bad = "/does/not/exist/migo_errno_probe";
         let err = read_file(bad, None, None, true).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
-        // -2 is ENOENT on every Linux/Android build we target.
-        assert_eq!(err.errno, Some(-2), "errno not captured: {err:?}");
+        // errno is the raw OS error, negated (Node convention). Its numeric
+        // value is platform-specific (ENOENT=2 on Unix, ERROR_PATH_NOT_FOUND=3
+        // on Windows), so assert against ground truth from the same failing
+        // syscall rather than a hardcoded Unix value. This still guards the real
+        // invariant: the wrapping layer must carry the OS errno through, negated,
+        // and not drop or invent it.
+        let expected = -(std::fs::File::open(bad).unwrap_err().raw_os_error().unwrap());
+        assert_eq!(err.errno, Some(expected), "errno not captured: {err:?}");
+        assert!(err.errno.unwrap() < 0, "errno must be negative: {err:?}");
         assert_eq!(err.path.as_deref(), Some(bad));
         assert_eq!(err.op, Some("read_file"));
     }
@@ -2049,7 +2056,10 @@ mod tests {
         let bad = "/does/not/exist/migo_unlink_probe";
         let err = unlink(bad).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
-        assert_eq!(err.errno, Some(-2));
+        // Platform-specific errno; derive ground truth from std (see
+        // io_err_captures_errno_and_path_for_missing_file).
+        let expected = -(std::fs::remove_file(bad).unwrap_err().raw_os_error().unwrap());
+        assert_eq!(err.errno, Some(expected));
         assert_eq!(err.op, Some("unlink"));
         assert_eq!(err.path.as_deref(), Some(bad));
     }
@@ -2059,7 +2069,10 @@ mod tests {
         let src = "/does/not/exist/migo_rename_src";
         let dst = "/tmp/migo_rename_dst";
         let err = rename(src, dst).unwrap_err();
-        assert_eq!(err.errno, Some(-2));
+        // Platform-specific errno; derive ground truth from the same failing
+        // std::fs::rename rather than hardcoding the Unix ENOENT value.
+        let expected = -(std::fs::rename(src, dst).unwrap_err().raw_os_error().unwrap());
+        assert_eq!(err.errno, Some(expected));
         assert_eq!(err.op, Some("rename"));
         assert_eq!(err.path.as_deref(), Some(src));
         // detail should still mention the destination so diagnosis is self-contained.

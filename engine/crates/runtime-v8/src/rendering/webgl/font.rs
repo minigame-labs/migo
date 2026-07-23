@@ -252,7 +252,15 @@ mod tests {
         let resolved =
             resolve_font_src_path("", Some(&vfs), "/user/gamecaches/resources/test.ttf").unwrap();
 
-        assert_eq!(resolved, font_path.to_string_lossy());
+        // Compare as paths, not raw strings. The VFS rebuilds the path component
+        // by component, so its output uses the OS-native separator throughout
+        // ("...\resources\test.ttf" on Windows). `font_path` was built by joining
+        // a "gamecaches/resources/test.ttf" literal, and Windows `PathBuf` keeps
+        // the embedded '/' inside that component, yielding a mixed-separator
+        // string that only equals `resolved` on platforms where '/' is native.
+        // A component-wise `Path` comparison is separator-agnostic on Windows and
+        // exact on Unix, so it asserts the real invariant (same file) on both.
+        assert_eq!(std::path::Path::new(&resolved), font_path.as_path());
 
         let _ = fs::remove_dir_all(base);
     }
