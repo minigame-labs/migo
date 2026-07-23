@@ -151,12 +151,28 @@ fn parse_gles_version(version: &str) -> (u32, u32) {
 /// Returns the Android API level at runtime, or 0 on non-Android.
 #[cfg(target_os = "android")]
 pub(crate) fn android_api_level() -> u32 {
-    // android_get_device_api_level() is available in all NDK API levels.
+    // Read `ro.build.version.sdk` directly rather than calling
+    // `android_get_device_api_level()`. That function is only an exported
+    // library symbol from API 29 on; at API 21..=28 it is a `static inline` in
+    // <android/api-level.h> that reads this very property. A bare `extern "C"`
+    // declaration bypasses the inline and pins the API-29 dynamic symbol, so the
+    // whole `libmigo.so` fails to `dlopen` on an API-26 device -- the floor Migo
+    // claims to support -- with "cannot locate symbol
+    // android_get_device_api_level". `__system_property_get` has been stable
+    // since API 1, so reading the property ourselves works on every level.
     unsafe extern "C" {
-        fn android_get_device_api_level() -> i32;
+        fn __system_property_get(name: *const u8, value: *mut u8) -> i32;
     }
-    let level = unsafe { android_get_device_api_level() };
-    level.max(0) as u32
+    // PROP_VALUE_MAX is 92; the buffer must hold that plus the NUL.
+    let mut buf = [0u8; 93];
+    let len = unsafe { __system_property_get(c"ro.build.version.sdk".as_ptr() as *const u8, buf.as_mut_ptr()) };
+    if len <= 0 {
+        return 0;
+    }
+    core::str::from_utf8(&buf[..len as usize])
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 #[cfg(not(target_os = "android"))]
