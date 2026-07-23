@@ -81,9 +81,9 @@
 
 | 平台 | 当前状态 | 已有能力 | 尚不能宣称的能力 |
 |---|---|---|---|
-| Android | 已实现，公开 ABI 仍是 candidate | API 26；JNI AAR；C ABI static SDK+CMake；`ANativeWindow`/EGL/GLES presenter；输入、IME、gamepad；arm64 snapshot 与 x86_64 emulator 生成链路 | 重建并提交各 ABI 的 v2 V8 component manifest；补齐 x86_64 full/slim snapshot；所有 ABI 的 release package 与最低/最新真机双门；全量多指真机验证 |
+| Android | 已实现，公开 ABI 仍是 candidate | API 26；JNI AAR；C ABI static SDK+CMake；`ANativeWindow`/EGL/GLES presenter；输入、IME、gamepad；**两个 ABI 的 V8 component manifest 已验证产出**；**六份 snapshot 齐备**（full/slim/worker × aarch64 真机 + x86_64 模拟器，x86_64 已端到端证明 restore） | 所有 ABI 的 release package 与最低/最新真机双门；全量多指真机验证；`-DANDROID_STL` 矩阵 |
 | Linux GNU | 已实现，公开 ABI 仍是 candidate | x86_64；X11/Wayland host-owned Surface；EGL/GLES；`libmigo.so`/`.a`；pkg-config/CMake；外部 C consumer；toolkit-neutral `SurfaceHost` 与 Qt 6 Widgets/X11 的 Bound + Managed 两种所有权形态（含输入/焦点/IME/frame request） | 用新 v2 component manifest 重建并发布的正式 artifact；发行版/驱动矩阵与性能门；Qt Wayland；Qt Quick 与 GTK 4（同一 texture/fence 前置） |
-| Windows | 候选 spike | C/C++ header 的 MSVC x64/x86 ABI lane；**`engine/crates` 全部九个 crate 的 MSVC `cargo check`**（2026-07-23，一次连续运行）；`EglProvider` 可承载 ANGLE | 真实 V8 链接/启动；HWND/SwapChainPanel presenter；ANGLE 出帧；输入/音频/完整性；DLL/NuGet；真机 |
+| Windows | runtime 已跑通，图形未出帧 | C/C++ header 的 MSVC x64/x86 ABI lane；`engine/crates` 全部九个 crate 的 MSVC `cargo check`；**真实 V8 链接与启动**（`migo-runtime-v8` 424/426、`migo-io` 225/225 在 MSVC 上真跑）；**从源码构建的 Windows V8**（`scripts/build-v8-windows.sh`，`use_custom_libcxx=false` 让 Skia 与 V8 共用 MSVC STL，消除二者同链时的 `std::terminate` 重复定义）；`EglProvider` 可承载 ANGLE | HWND/SwapChainPanel presenter；ANGLE 出帧；输入/音频/完整性；DLL/NuGet；真机 |
 | macOS | 目标 | 公开 typed descriptor 设计 | runtime、Metal presenter、V8 component、Host Kit、package、CI |
 | iOS | 目标 | 明确采用 WebKit Host Kit 的产品边界 | WKWebView backend、bridge、conformance、package、CI |
 | OpenHarmony | 目标 | 公开 typed descriptor 设计与官方 NativeWindow/JSVM 可行性依据 | XComponent presenter、runtime 决策、HAR/HAP 集成、component、真机 CI |
