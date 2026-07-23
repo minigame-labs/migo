@@ -12,7 +12,10 @@
 //! RGBA still resolve the original through the same companion list. The sidecar
 //! is an optimisation the runtime opts into per device, never a replacement.
 
-use crate::etc2::{VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, encode_etc2_rgb};
+use crate::etc2::{
+    VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, encode_etc2_rgb,
+    encode_etc2_rgba,
+};
 use crate::fast_image_decoder::decode_image_fast;
 use crate::ktx2::write_ktx2;
 
@@ -67,13 +70,26 @@ pub(crate) fn transcode_image(name: &str, bytes: &[u8]) -> Option<TranscodedSide
     if image.width == 0 || image.height == 0 || image.width % 4 != 0 || image.height % 4 != 0 {
         return None;
     }
-    let blocks = encode_etc2_rgb(&image.rgba, image.width, image.height).ok()?;
-    let container = write_ktx2(
-        VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK,
-        image.width,
-        image.height,
-        &blocks,
-    );
+
+    // A fully-opaque image uses ETC2 RGB, whose blocks are half the size; only
+    // an image with real transparency pays for the EAC alpha block. Checking the
+    // pixels rather than the file's colour type is what lets an RGBA PNG whose
+    // alpha is all 255 still take the smaller format.
+    let has_alpha = image.rgba.chunks_exact(4).any(|px| px[3] != 0xFF);
+
+    let (vk_format, blocks) = if has_alpha {
+        (
+            VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
+            encode_etc2_rgba(&image.rgba, image.width, image.height).ok()?,
+        )
+    } else {
+        (
+            VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK,
+            encode_etc2_rgb(&image.rgba, image.width, image.height).ok()?,
+        )
+    };
+
+    let container = write_ktx2(vk_format, image.width, image.height, &blocks);
     Some(TranscodedSidecar {
         name: sidecar_name(name),
         bytes: container,
@@ -129,6 +145,41 @@ mod tests {
         assert_eq!(parsed.header.width, 16);
         assert_eq!(parsed.header.height, 16);
         // 4x4 blocks, 8 bytes each: (16/4)^2 * 8.
+        assert_eq!(parsed.data.len(), (16 / 4) * (16 / 4) * 8);
+    }
+
+    fn png_with_alpha(width: u32, height: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                // A diagonal transparency ramp so the image has real alpha.
+                rgba.extend_from_slice(&[0x40, 0x80, 0xC0, ((x + y) * 8) as u8]);
+            }
+        }
+        let buffer = image::RgbaImage::from_raw(width, height, rgba).unwrap();
+        let mut out = std::io::Cursor::new(Vec::new());
+        buffer.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn an_image_with_alpha_produces_an_rgba_etc2_sidecar() {
+        let bytes = png_with_alpha(16, 16);
+        let sidecar = transcode_image("hero.png", &bytes).expect("transcodes");
+        let parsed = parse_ktx2(&sidecar.bytes).expect("parses");
+        assert_eq!(parsed.header.format, VkFormat::Etc2R8G8B8A8UnormBlock);
+        // RGBA is 16 bytes/block, twice the RGB size.
+        assert_eq!(parsed.data.len(), (16 / 4) * (16 / 4) * 16);
+    }
+
+    #[test]
+    fn an_opaque_image_stays_on_the_smaller_rgb_format() {
+        // `png()` writes alpha 0xFF everywhere, so despite being an RGBA PNG it
+        // must transcode to the half-size RGB format.
+        let bytes = png(16, 16);
+        let sidecar = transcode_image("bg.png", &bytes).expect("transcodes");
+        let parsed = parse_ktx2(&sidecar.bytes).expect("parses");
+        assert_eq!(parsed.header.format, VkFormat::Etc2R8G8B8UnormBlock);
         assert_eq!(parsed.data.len(), (16 / 4) * (16 / 4) * 8);
     }
 
