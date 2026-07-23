@@ -1,5 +1,9 @@
 *.a filter=lfs diff=lfs merge=lfs -text
 engine/third_party/rusty_v8/**/librusty_v8.a filter=lfs diff=lfs merge=lfs -text
+# The MSVC toolchain names the same artifact rusty_v8.lib, which neither rule
+# above matches -- without this a ~190 MB static library would be committed as
+# an ordinary blob and stay in history forever.
+engine/third_party/rusty_v8/**/rusty_v8.lib filter=lfs diff=lfs merge=lfs -text
 
 # Per-arch V8 startup snapshots: ~1.9 MB binary build inputs, committed so
 # release builds are hermetic/reproducible (and so the arm64 snapshot — which

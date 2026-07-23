@@ -196,55 +196,62 @@ pub fn is_ktx2(data: &[u8]) -> bool {
     data.len() >= 12 && data[..12] == KTX2_MAGIC
 }
 
+/// Write a single-level, non-supercompressed KTX2 container around already
+/// compressed block data.
+///
+/// This is the ingest-side counterpart of [`parse_ktx2`]: transcoding a source
+/// image at package-install time produces block data that still needs a
+/// container the runtime can recognise. Keeping the writer beside the parser is
+/// deliberate -- they share the offset constants and the magic, so the layout
+/// cannot drift apart, and `parse_ktx2` is the round-trip oracle for the writer.
+///
+/// Emits exactly what the parser needs and nothing else: no DFD, no key/value
+/// data, no supercompression global data. Those sections are optional in the
+/// spec, and every consumer in this engine reads only the header, the level
+/// index and the level 0 bytes.
+pub fn write_ktx2(vk_format: u32, width: u32, height: u32, level0: &[u8]) -> Vec<u8> {
+    let level0_offset = (HEADER_SIZE + LEVEL_INDEX_ENTRY_SIZE) as u64;
+    let level0_length = level0.len() as u64;
+
+    let mut buf = vec![0u8; HEADER_SIZE + LEVEL_INDEX_ENTRY_SIZE + level0.len()];
+
+    buf[..12].copy_from_slice(&KTX2_MAGIC);
+    buf[12..16].copy_from_slice(&vk_format.to_le_bytes());
+    // typeSize is 1 for every block-compressed format.
+    buf[16..20].copy_from_slice(&1u32.to_le_bytes());
+    buf[20..24].copy_from_slice(&width.to_le_bytes());
+    buf[24..28].copy_from_slice(&height.to_le_bytes());
+    // pixelDepth 0 = 2D, layerCount 0 = non-array, faceCount 1 = not a cubemap.
+    buf[28..32].copy_from_slice(&0u32.to_le_bytes());
+    buf[32..36].copy_from_slice(&0u32.to_le_bytes());
+    buf[36..40].copy_from_slice(&1u32.to_le_bytes());
+    buf[40..44].copy_from_slice(&1u32.to_le_bytes());
+    // supercompressionScheme 0 = none; the parser rejects anything else.
+    buf[44..48].copy_from_slice(&0u32.to_le_bytes());
+
+    // The dfd/kvd/sgd index entries stay zero: those sections are absent.
+
+    let li = HEADER_SIZE;
+    buf[li..li + 8].copy_from_slice(&level0_offset.to_le_bytes());
+    buf[li + 8..li + 16].copy_from_slice(&level0_length.to_le_bytes());
+    // uncompressedByteLength equals byteLength when nothing is supercompressed.
+    buf[li + 16..li + 24].copy_from_slice(&level0_length.to_le_bytes());
+
+    buf[level0_offset as usize..].copy_from_slice(level0);
+
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Build a minimal valid KTX2 buffer for testing.
+    ///
+    /// Delegates to the production writer so these tests exercise the real
+    /// layout rather than a second copy of it that could drift from it.
     fn make_test_ktx2(vk_format: u32, width: u32, height: u32, payload: &[u8]) -> Vec<u8> {
-        // Header: 80 bytes
-        // Level index: 1 entry = 24 bytes
-        // Then payload
-        let level0_offset = (HEADER_SIZE + LEVEL_INDEX_ENTRY_SIZE) as u64;
-        let level0_length = payload.len() as u64;
-
-        let mut buf = vec![0u8; HEADER_SIZE + LEVEL_INDEX_ENTRY_SIZE + payload.len()];
-
-        // Magic
-        buf[..12].copy_from_slice(&KTX2_MAGIC);
-        // vkFormat
-        buf[12..16].copy_from_slice(&vk_format.to_le_bytes());
-        // typeSize = 1 for block-compressed
-        buf[16..20].copy_from_slice(&1u32.to_le_bytes());
-        // pixelWidth
-        buf[20..24].copy_from_slice(&width.to_le_bytes());
-        // pixelHeight
-        buf[24..28].copy_from_slice(&height.to_le_bytes());
-        // pixelDepth = 0 (2D)
-        buf[28..32].copy_from_slice(&0u32.to_le_bytes());
-        // layerCount = 0
-        buf[32..36].copy_from_slice(&0u32.to_le_bytes());
-        // faceCount = 1
-        buf[36..40].copy_from_slice(&1u32.to_le_bytes());
-        // levelCount = 1
-        buf[40..44].copy_from_slice(&1u32.to_le_bytes());
-        // supercompressionScheme = 0 (none)
-        buf[44..48].copy_from_slice(&0u32.to_le_bytes());
-
-        // Index section (dfd/kvd/sgd offsets -- zero for this minimal test)
-        // already zeroed
-
-        // Level index entry for level 0
-        let li = HEADER_SIZE;
-        buf[li..li + 8].copy_from_slice(&level0_offset.to_le_bytes());
-        buf[li + 8..li + 16].copy_from_slice(&level0_length.to_le_bytes());
-        // uncompressedByteLength (not used for non-supercompressed)
-        buf[li + 16..li + 24].copy_from_slice(&level0_length.to_le_bytes());
-
-        // Payload
-        buf[level0_offset as usize..].copy_from_slice(payload);
-
-        buf
+        write_ktx2(vk_format, width, height, payload)
     }
 
     #[test]

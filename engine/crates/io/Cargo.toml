@@ -58,4 +58,5 @@ rusqlite = { version = "0.32", default-features = false, features = ["bundled", 
 
 [dev-dependencies]
 tempfile = "3"
+texture2ddecoder = "0.1.2"
 tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -1720,6 +1720,7 @@ dependencies = [
  "sha1",
  "sha2",
  "tempfile",
+ "texture2ddecoder",
  "tokio",
  "tracing",
  "zip",
@@ -3032,6 +3033,15 @@ dependencies = [
  "timezone_provider",
  "tinystr",
  "writeable",
+]
+
+[[package]]
+name = "texture2ddecoder"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "427ae8ec7f2f0fdd3146b77cfa44bea880caf066f7e55398a8467afe2645c832"
+dependencies = [
+ "paste",
 ]
 
 [[package]]
