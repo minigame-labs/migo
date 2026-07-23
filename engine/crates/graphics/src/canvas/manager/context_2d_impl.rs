@@ -58,7 +58,15 @@ pub(super) fn init_skia_for_canvas(
         }
     };
 
-    let ctx = Canvas2DContext::new(fbo_id, width, height, kind).ok_or_else(|| {
+    // Scoped so the immutable borrow for the loader ends before `cm` is used
+    // mutably below. Skia resolves its GL entry points through the same EGL
+    // implementation this manager was built with, rather than through whichever
+    // one Skia itself linked.
+    let created = {
+        let load_gl = |symbol: &str| cm.gl_proc_address(symbol);
+        Canvas2DContext::new(fbo_id, width, height, kind, &load_gl)
+    };
+    let ctx = created.ok_or_else(|| {
         ee(
             ErrorCode::RenderBackendError,
             format!("Skia Canvas2DContext::new failed for canvas_id={canvas_id} ({width}x{height} fbo={fbo_id})"),
