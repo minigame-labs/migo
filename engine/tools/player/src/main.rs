@@ -19,6 +19,8 @@
 // host owns, which is a separate piece of work.
 #[cfg(target_os = "linux")]
 mod x11_window;
+#[cfg(target_os = "windows")]
+mod win32_window;
 
 use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
@@ -34,13 +36,15 @@ use platform::linux::presenter::{
 use platform::windows::platform::WindowsPlatform as HostPlatform;
 #[cfg(target_os = "windows")]
 use platform::windows::presenter::{
-    WindowsOffscreenSurface as OffscreenSurface,
-    windows_graphics_platform as offscreen_graphics_platform,
+    WindowsHwndSurface, WindowsOffscreenSurface as OffscreenSurface,
+    windows_graphics_platform as offscreen_graphics_platform, windows_hwnd_graphics_platform,
 };
 use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceRef};
 
 #[cfg(target_os = "linux")]
 use x11_window::X11Window;
+#[cfg(target_os = "windows")]
+use win32_window::Win32Window;
 
 const GAME_ID: &str = "player-demo";
 const ENTRY: &str = "game.js";
@@ -123,10 +127,16 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     } else {
         None
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    let mut window = if windowed {
+        Some(Win32Window::open("migo-player", SURFACE_W, SURFACE_H)?)
+    } else {
+        None
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     if windowed {
-        return Err("--window is only implemented on Linux (X11); \
-                    other platforms render offscreen"
+        return Err("--window is implemented on Linux (X11) and Windows (HWND); \
+                    this target renders offscreen"
             .to_string());
     }
 
@@ -151,7 +161,27 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
             (surface, platform)
         }
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    let (surface, graphics_platform) = match window.as_ref() {
+        Some(window) => {
+            let (width, height) = window.size();
+            // SAFETY: the window outlives the session -- it is dropped only
+            // after `shutdown_host` below, by which point the render thread has
+            // let go of the EGL surface built from this handle.
+            let surface: SurfaceRef =
+                Arc::new(unsafe { WindowsHwndSurface::new(window.hwnd(), width, height) });
+            let platform = windows_hwnd_graphics_platform()
+                .map_err(|e| format!("hwnd graphics platform: {e:?}"))?;
+            (surface, platform)
+        }
+        None => {
+            let surface: SurfaceRef = Arc::new(OffscreenSurface::new(SURFACE_W, SURFACE_H));
+            let platform =
+                offscreen_graphics_platform().map_err(|e| format!("graphics platform: {e:?}"))?;
+            (surface, platform)
+        }
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let (surface, graphics_platform) = {
         let surface: SurfaceRef = Arc::new(OffscreenSurface::new(SURFACE_W, SURFACE_H));
         let platform =
@@ -160,8 +190,13 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     };
     let host_kit: Arc<dyn PlatformServices> = Arc::new(HostPlatform::new());
 
-    let mode = if windowed { "x11 window" } else { "offscreen" };
-    tracing::info!("spawning host thread ({SURFACE_W}x{SURFACE_H} {mode})");
+    let mode = if windowed { "window" } else { "offscreen" };
+    // The requested size is not always what the surface got: a window manager
+    // may clamp a frame that does not fit the display, and the engine renders
+    // into the client area it actually has. Logging the constants instead of the
+    // real extent made the line disagree with the pixels captured from it.
+    let (surface_w, surface_h) = surface.size();
+    tracing::info!("spawning host thread ({surface_w}x{surface_h} {mode})");
     let host_id = spawn_host_thread(surface, graphics_platform, host_kit, opt)
         .map_err(|e| format!("spawn_host_thread: {e:?}"))?;
     tracing::info!("host {host_id} spawned; loading game");
@@ -191,7 +226,9 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     // are superseded by frames containing game content.
     #[cfg(target_os = "linux")]
     run_for(&mut window, Duration::from_secs(secs.max(4)));
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    run_for(&mut window, Duration::from_secs(secs.max(4)));
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     run_for(Duration::from_secs(secs.max(4)));
     match graphics::frame_capture::take() {
         Some(frame) => {
@@ -211,7 +248,7 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     thread::sleep(Duration::from_millis(300));
     // Only now may the window go: the render thread has stopped touching the
     // EGL surface built from its handles.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     drop(window);
     tracing::info!("player done");
     Ok(())
@@ -237,8 +274,25 @@ fn run_for(window: &mut Option<X11Window>, total: Duration) {
     }
 }
 
+/// Same contract as the Linux one, over the Win32 message queue.
+#[cfg(target_os = "windows")]
+fn run_for(window: &mut Option<Win32Window>, total: Duration) {
+    let Some(window) = window.as_mut() else {
+        thread::sleep(total);
+        return;
+    };
+    let deadline = std::time::Instant::now() + total;
+    while std::time::Instant::now() < deadline {
+        if !window.pump() {
+            tracing::info!("window close requested; stopping early");
+            return;
+        }
+        thread::sleep(EVENT_POLL);
+    }
+}
+
 /// Offscreen has no event source to service, so waiting is the whole job.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn run_for(total: Duration) {
     thread::sleep(total);
 }
