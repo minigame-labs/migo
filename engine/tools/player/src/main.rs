@@ -14,17 +14,32 @@
 //! `--window` (or `MIGO_PLAYER_WINDOW=1`) exercises the onscreen X11 presenter.
 //! Headless stays the default so CI and the PNG capture path are unaffected.
 
+// X11 is the Linux windowed path. The offscreen path below is portable, which is
+// what the PNG capture and CI use; Windows gets its window through an HWND the
+// host owns, which is a separate piece of work.
+#[cfg(target_os = "linux")]
 mod x11_window;
 
 use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
 use migo_core::{PlatformServices, send_command_to_host, shutdown_host, spawn_host_thread};
-use platform::linux::platform::LinuxPlatform;
+#[cfg(target_os = "linux")]
+use platform::linux::platform::LinuxPlatform as HostPlatform;
+#[cfg(target_os = "linux")]
 use platform::linux::presenter::{
-    LinuxOffscreenSurface, LinuxX11Surface, linux_graphics_platform, linux_x11_graphics_platform,
+    LinuxOffscreenSurface as OffscreenSurface, LinuxX11Surface,
+    linux_graphics_platform as offscreen_graphics_platform, linux_x11_graphics_platform,
+};
+#[cfg(target_os = "windows")]
+use platform::windows::platform::WindowsPlatform as HostPlatform;
+#[cfg(target_os = "windows")]
+use platform::windows::presenter::{
+    WindowsOffscreenSurface as OffscreenSurface,
+    windows_graphics_platform as offscreen_graphics_platform,
 };
 use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceRef};
 
+#[cfg(target_os = "linux")]
 use x11_window::X11Window;
 
 const GAME_ID: &str = "player-demo";
@@ -102,12 +117,20 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     // The window (when present) must outlive the engine session: the render
     // thread holds an EGL surface built from its handles, so it is dropped only
     // after `shutdown_host` below.
+    #[cfg(target_os = "linux")]
     let mut window = if windowed {
         Some(X11Window::open("migo-player", SURFACE_W, SURFACE_H)?)
     } else {
         None
     };
+    #[cfg(not(target_os = "linux"))]
+    if windowed {
+        return Err("--window is only implemented on Linux (X11); \
+                    other platforms render offscreen"
+            .to_string());
+    }
 
+    #[cfg(target_os = "linux")]
     let (surface, graphics_platform) = match window.as_ref() {
         Some(window) => {
             let (width, height) = window.size();
@@ -122,13 +145,20 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
             (surface, platform)
         }
         None => {
-            let surface: SurfaceRef = Arc::new(LinuxOffscreenSurface::new(SURFACE_W, SURFACE_H));
+            let surface: SurfaceRef = Arc::new(OffscreenSurface::new(SURFACE_W, SURFACE_H));
             let platform =
-                linux_graphics_platform().map_err(|e| format!("graphics platform: {e:?}"))?;
+                offscreen_graphics_platform().map_err(|e| format!("graphics platform: {e:?}"))?;
             (surface, platform)
         }
     };
-    let host_kit: Arc<dyn PlatformServices> = Arc::new(LinuxPlatform::new());
+    #[cfg(not(target_os = "linux"))]
+    let (surface, graphics_platform) = {
+        let surface: SurfaceRef = Arc::new(OffscreenSurface::new(SURFACE_W, SURFACE_H));
+        let platform =
+            offscreen_graphics_platform().map_err(|e| format!("graphics platform: {e:?}"))?;
+        (surface, platform)
+    };
+    let host_kit: Arc<dyn PlatformServices> = Arc::new(HostPlatform::new());
 
     let mode = if windowed { "x11 window" } else { "offscreen" };
     tracing::info!("spawning host thread ({SURFACE_W}x{SURFACE_H} {mode})");
