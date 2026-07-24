@@ -17,10 +17,10 @@
 // X11 is the Linux windowed path. The offscreen path below is portable, which is
 // what the PNG capture and CI use; Windows gets its window through an HWND the
 // host owns, which is a separate piece of work.
-#[cfg(target_os = "linux")]
-mod x11_window;
 #[cfg(target_os = "windows")]
 mod win32_window;
+#[cfg(target_os = "linux")]
+mod x11_window;
 
 use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
@@ -41,10 +41,10 @@ use platform::windows::presenter::{
 };
 use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceRef};
 
-#[cfg(target_os = "linux")]
-use x11_window::X11Window;
 #[cfg(target_os = "windows")]
 use win32_window::Win32Window;
+#[cfg(target_os = "linux")]
+use x11_window::X11Window;
 
 const GAME_ID: &str = "player-demo";
 const ENTRY: &str = "game.js";
@@ -135,9 +135,11 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     };
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     if windowed {
-        return Err("--window is implemented on Linux (X11) and Windows (HWND); \
+        return Err(
+            "--window is implemented on Linux (X11) and Windows (HWND); \
                     this target renders offscreen"
-            .to_string());
+                .to_string(),
+        );
     }
 
     #[cfg(target_os = "linux")]
