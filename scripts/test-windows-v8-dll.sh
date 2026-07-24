@@ -51,14 +51,88 @@ cat > "$WORK_UNIX/probe.c" <<'PROBE'
 #include <stdio.h>
 
 extern const char* v8__V8__GetVersion(void);
+extern int v8__register_host_callback(const char* name, void* fn);
+extern int v8__host_callbacks_ready(void);
+
+/* The callbacks the DLL expects the host to supply. Listed explicitly rather
+   than derived from the DLL, because this is the contract: if upstream adds one
+   and the host side is not updated, registering these leaves a slot empty and
+   v8__host_callbacks_ready stays 0, which is exactly the failure this catches
+   -- and it catches it here rather than at the first serialization. */
+static const char* const kExpected[] = {
+    "v8__ValueSerializer__Delegate__ThrowDataCloneError",
+    "v8__ValueSerializer__Delegate__HasCustomHostObject",
+    "v8__ValueSerializer__Delegate__IsHostObject",
+    "v8__ValueSerializer__Delegate__WriteHostObject",
+    "v8__ValueSerializer__Delegate__GetSharedArrayBufferId",
+    "v8__ValueSerializer__Delegate__GetWasmModuleTransferId",
+    "v8__ValueSerializer__Delegate__ReallocateBufferMemory",
+    "v8__ValueSerializer__Delegate__FreeBufferMemory",
+    "v8__ValueDeserializer__Delegate__ReadHostObject",
+    "v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId",
+    "v8__ValueDeserializer__Delegate__GetWasmModuleFromId",
+    "rusty_v8_RustObj_trace",
+    "rusty_v8_RustObj_get_name",
+    "rusty_v8_RustObj_drop",
+    "v8_inspector__V8Inspector__Channel__BASE__sendResponse",
+    "v8_inspector__V8Inspector__Channel__BASE__sendNotification",
+    "v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications",
+    "v8_inspector__V8InspectorClient__BASE__generateUniqueId",
+    "v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause",
+    "v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause",
+    "v8_inspector__V8InspectorClient__BASE__runIfWaitingForDebugger",
+    "v8_inspector__V8InspectorClient__BASE__consoleAPIMessage",
+    "v8_inspector__V8InspectorClient__BASE__ensureDefaultContextInGroup",
+    "v8_inspector__V8InspectorClient__BASE__resourceNameToUrl",
+};
+static const int kExpectedCount = (int)(sizeof kExpected / sizeof kExpected[0]);
+
+/* Only ever used as a distinct non-null address; never called. */
+static void placeholder(void) {}
 
 int main(void) {
     const char* version = v8__V8__GetVersion();
+    int i;
+
     if (version == NULL || version[0] == '\0') {
         printf("PROBE-FAIL empty version\n");
         return 1;
     }
-    printf("PROBE-OK %s\n", version);
+
+    /* Nothing registered yet, so the DLL must not claim to be ready. A ready
+       DLL at this point would mean the check is not looking at anything. */
+    if (v8__host_callbacks_ready() != 0) {
+        printf("PROBE-FAIL ready before anything was registered\n");
+        return 1;
+    }
+
+    /* A name the DLL does not know must be refused, not silently accepted --
+       otherwise a renamed callback would bind nowhere and fail much later. */
+    if (v8__register_host_callback("v8__no_such_callback", (void*)placeholder) != 0) {
+        printf("PROBE-FAIL unknown callback name was accepted\n");
+        return 1;
+    }
+
+    for (i = 0; i < kExpectedCount; i++) {
+        if (v8__register_host_callback(kExpected[i], (void*)placeholder) != 1) {
+            printf("PROBE-FAIL DLL rejected known callback: %s\n", kExpected[i]);
+            return 1;
+        }
+        /* Every registration before the last must leave the set incomplete;
+           otherwise the DLL knows fewer callbacks than this list does. */
+        if (i < kExpectedCount - 1 && v8__host_callbacks_ready() != 0) {
+            printf("PROBE-FAIL ready after only %d of %d registrations\n",
+                   i + 1, kExpectedCount);
+            return 1;
+        }
+    }
+
+    if (v8__host_callbacks_ready() != 1) {
+        printf("PROBE-FAIL not ready after registering all %d\n", kExpectedCount);
+        return 1;
+    }
+
+    printf("PROBE-OK %s callbacks=%d\n", version, kExpectedCount);
     return 0;
 }
 PROBE
@@ -97,6 +171,7 @@ case "$RESULT" in
 esac
 
 VERSION="${RESULT#PROBE-OK }"
+VERSION="${VERSION%% *}"
 # Shape check only. Pinning the exact version here would make a routine V8 bump
 # fail in a place that has nothing to say about it; an empty or garbage string
 # is what this is guarding against.
@@ -105,5 +180,8 @@ if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.'; then
     exit 1
 fi
 
+COUNT="${RESULT##*callbacks=}"
+
 ok "C consumer linked the import library, loaded rusty_v8.dll and called into V8"
 ok "v8 version reported: $VERSION"
+ok "host-callback contract holds: unknown name refused, all $COUNT known names bound, ready only once complete"
