@@ -40,20 +40,22 @@ std::atomic<std::size_t> g_allocations{0};
 
 }  // namespace
 
-// AddressSanitizer replaces the allocator wholesale, so interposing `malloc`
-// underneath it crashes on the first call -- which it did, silently turning the
-// sanitizer lane into a run with no allocation assertion at all. ASan publishes
-// a hook for exactly this, so both lanes keep measuring rather than one of them
-// quietly skipping.
-// Use ASan's malloc/free hook only when AddressSanitizer is on AND its
-// interface header is actually present. `<sanitizer/allocator_interface.h>`
-// ships with clang's compiler-rt but NOT with gcc's libasan, so keying only on
-// `__SANITIZE_ADDRESS__` (which gcc also defines under -fsanitize=address) made
-// the file `#include` a header gcc does not have, failing the build outright on
-// a CXX=g++ sanitize run. Probing the header lets a gcc sanitize build fall
-// through to the dlsym-based malloc interposer below instead.
-#if (defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))) \
-    && defined(__has_include) && __has_include(<sanitizer/allocator_interface.h>)
+// AddressSanitizer replaces the allocator wholesale and enters interceptors from
+// inside its own startup -- `AsanInitInternal` resolves the real functions via
+// `dlsym`, which allocates, before `main` and before ASan installs its SIGSEGV
+// handler. A raw `malloc` interposer is therefore called during ASan init and
+// faults the process before any test runs (the crash lands with no ASan report,
+// because ASan's handler is not up yet). So whenever ASan is on, the counting
+// MUST go through ASan's own hook, never the interposer below.
+//
+// The hook is declared in `<sanitizer/allocator_interface.h>`, which clang's
+// compiler-rt ships but gcc's libasan does not -- yet gcc's libasan still exports
+// the `__sanitizer_install_malloc_and_free_hooks` symbol. So key the decision on
+// "is ASan on" alone, never on the header: an earlier version added the header to
+// this condition, which sent a gcc sanitize build down the interposer path and
+// into exactly the startup crash described above. When ASan is on but the header
+// is absent, declare the stable hook prototype ourselves instead.
+#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
 #define MIGO_COUNT_ALLOCATIONS_WITH_SANITIZER 1
 #else
 #define MIGO_COUNT_ALLOCATIONS_WITH_SANITIZER 0
@@ -61,7 +63,12 @@ std::atomic<std::size_t> g_allocations{0};
 
 #if MIGO_COUNT_ALLOCATIONS_WITH_SANITIZER
 
+#if defined(__has_include) && __has_include(<sanitizer/allocator_interface.h>)
 #include <sanitizer/allocator_interface.h>
+#else
+extern "C" int __sanitizer_install_malloc_and_free_hooks(
+    void (*)(const volatile void *, std::size_t), void (*)(const volatile void *));
+#endif
 
 namespace {
 
