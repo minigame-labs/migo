@@ -23,8 +23,37 @@
 /// Bytes in one encoded 4x4 ETC2 RGB block.
 pub const ETC2_RGB_BLOCK_BYTES: usize = 8;
 
-/// `VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK`, the format this encoder produces.
+/// Bytes in one encoded 4x4 ETC2 RGBA block: an 8-byte EAC alpha block followed
+/// by the 8-byte ETC2 RGB block.
+pub const ETC2_RGBA_BLOCK_BYTES: usize = 16;
+
+/// `VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK`, the RGB format this encoder produces.
 pub const VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK: u32 = 147;
+
+/// `VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK`, the RGBA (EAC alpha) format.
+pub const VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK: u32 = 151;
+
+/// EAC per-pixel alpha modifiers: a 3-bit index selects one of eight, scaled by
+/// the block's multiplier and added to the base. Same table the decoders use,
+/// and identical for the standalone EAC and the ETC2-RGBA8 alpha block.
+const ALPHA_MODIFIER_TABLE: [[i32; 8]; 16] = [
+    [-3, -6, -9, -15, 2, 5, 8, 14],
+    [-3, -7, -10, -13, 2, 6, 9, 12],
+    [-2, -5, -8, -13, 1, 4, 7, 12],
+    [-2, -4, -6, -13, 1, 3, 5, 12],
+    [-3, -6, -8, -12, 2, 5, 7, 11],
+    [-3, -7, -9, -11, 2, 6, 8, 10],
+    [-4, -7, -8, -11, 3, 6, 7, 10],
+    [-3, -5, -8, -11, 2, 4, 7, 10],
+    [-2, -6, -8, -10, 1, 5, 7, 9],
+    [-2, -5, -8, -10, 1, 4, 7, 9],
+    [-2, -4, -8, -10, 1, 3, 7, 9],
+    [-2, -5, -7, -10, 1, 4, 6, 9],
+    [-3, -4, -7, -10, 2, 3, 6, 9],
+    [-1, -2, -3, -10, 0, 1, 2, 9],
+    [-4, -6, -8, -9, 3, 5, 7, 8],
+    [-3, -5, -7, -9, 2, 4, 6, 8],
+];
 
 /// Per-pixel modifier magnitudes, selected by a 3-bit codeword per sub-block.
 ///
@@ -99,6 +128,145 @@ pub fn encode_etc2_rgb(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
 
     Ok(out)
 }
+
+/// Encode RGBA8 pixels as ETC2 RGBA blocks (EAC alpha + ETC2 RGB), 16 bytes
+/// each, `VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK`.
+///
+/// Use this only when the image carries meaningful alpha; a fully-opaque image
+/// should use [`encode_etc2_rgb`], whose blocks are half the size. The runtime
+/// tells the two apart by the KTX2 `vkFormat`, so the container [`super::ktx2`]
+/// wraps it in decides which path the GPU takes.
+///
+/// Same alignment rule and error semantics as [`encode_etc2_rgb`].
+pub fn encode_etc2_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, &'static str> {
+    if width == 0 || height == 0 {
+        return Err("etc2: zero dimensions");
+    }
+    if width % 4 != 0 || height % 4 != 0 {
+        return Err("etc2: dimensions must be multiples of 4");
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|p| p.checked_mul(4))
+        .ok_or("etc2: image dimensions overflow")?;
+    if rgba.len() != expected {
+        return Err("etc2: pixel buffer length does not match dimensions");
+    }
+
+    let blocks_x = (width / 4) as usize;
+    let blocks_y = (height / 4) as usize;
+    let mut out = Vec::with_capacity(blocks_x * blocks_y * ETC2_RGBA_BLOCK_BYTES);
+
+    let mut rgb = [[0u8; 3]; 16];
+    let mut alpha = [0u8; 16];
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            for y in 0..4 {
+                for x in 0..4 {
+                    let px = (by * 4 + y) * width as usize + (bx * 4 + x);
+                    let base = px * 4;
+                    rgb[y * 4 + x] = [rgba[base], rgba[base + 1], rgba[base + 2]];
+                    alpha[y * 4 + x] = rgba[base + 3];
+                }
+            }
+            // Order matters: the GPU (and the reference decoder) read the alpha
+            // block first, then the colour block.
+            out.extend_from_slice(&encode_alpha_block(&alpha));
+            out.extend_from_slice(&encode_block(&rgb));
+        }
+    }
+
+    Ok(out)
+}
+
+/// Encode a 4x4 alpha tile as an 8-byte EAC alpha block.
+///
+/// Layout, matching the ETC2-RGBA8 alpha block the decoders read:
+/// - byte 0: base alpha;
+/// - byte 1: high nibble = multiplier, low nibble = modifier-table index;
+/// - bytes 2..8: sixteen 3-bit pixel indices, packed big-endian (pixel 0's
+///   index in the most-significant position), in raster order.
+///
+/// base, table and multiplier are chosen by exhaustive search over all 16
+/// tables and the 1..=15 multipliers -- the same "try them all, no heuristic
+/// cliff" approach the colour path takes. A block whose alpha is constant is
+/// encoded with multiplier 0, which the decoder treats as "every pixel = base".
+fn encode_alpha_block(alpha: &[u8; 16]) -> [u8; 8] {
+    // Constant alpha (the common case for a sprite's flat interior or a fully
+    // transparent border) needs no modulation: multiplier 0, base = the value.
+    if alpha.iter().all(|&a| a == alpha[0]) {
+        let mut bytes = [0u8; 8];
+        bytes[0] = alpha[0];
+        // byte 1 = 0 => multiplier nibble 0 => decoder fills every pixel with base.
+        return bytes;
+    }
+
+    let mut best_base = 0u8;
+    let mut best_table = 0usize;
+    let mut best_multiplier = 1i32;
+    let mut best_indices = [0u8; 16];
+    let mut best_error = u64::MAX;
+
+    // A small set of base candidates: the extremes and the mean bracket where
+    // the modifier table is centred. Searching every 0..=255 base as well would
+    // multiply the cost 256x for negligible gain at ingest quality.
+    let min = *alpha.iter().min().unwrap() as i32;
+    let max = *alpha.iter().max().unwrap() as i32;
+    let mean = (alpha.iter().map(|&a| a as i32).sum::<i32>() + 8) / 16;
+    let base_candidates = [min, max, mean, (min + max) / 2];
+
+    for &base_i in &base_candidates {
+        let base = base_i.clamp(0, 255);
+        for (table_idx, table) in ALPHA_MODIFIER_TABLE.iter().enumerate() {
+            for multiplier in 1..=15i32 {
+                let mut error = 0u64;
+                let mut indices = [0u8; 16];
+                for (pixel, &target) in alpha.iter().enumerate() {
+                    let mut pixel_best = u64::MAX;
+                    let mut pixel_index = 0u8;
+                    for (idx, &modifier) in table.iter().enumerate() {
+                        let value = (base + multiplier * modifier).clamp(0, 255);
+                        let delta = value - target as i32;
+                        let cost = (delta * delta) as u64;
+                        if cost < pixel_best {
+                            pixel_best = cost;
+                            pixel_index = idx as u8;
+                        }
+                    }
+                    error += pixel_best;
+                    indices[pixel] = pixel_index;
+                }
+                if error < best_error {
+                    best_error = error;
+                    best_base = base as u8;
+                    best_table = table_idx;
+                    best_multiplier = multiplier;
+                    best_indices = indices;
+                }
+            }
+        }
+    }
+
+    let mut bytes = [0u8; 8];
+    bytes[0] = best_base;
+    bytes[1] = ((best_multiplier as u8) << 4) | (best_table as u8);
+    // Invert the decoder exactly. It reads `from_be_bytes(data[0..8])` and, for
+    // iteration i, takes bits [3i, 3i+3) and writes raster pixel
+    // WRITE_ORDER_TABLE_REV[i]. So the index for raster pixel
+    // WRITE_ORDER_TABLE_REV[i] must sit at bit position 3i. The sixteen indices
+    // fill bits 0..47 = bytes 2..8; bytes 0..1 (top 16 bits) stay base/mult.
+    let mut packed: u64 = 0;
+    for (i, &raster) in ALPHA_WRITE_ORDER.iter().enumerate() {
+        packed |= (best_indices[raster] as u64 & 0x7) << (3 * i);
+    }
+    bytes[2..8].copy_from_slice(&packed.to_be_bytes()[2..8]);
+    bytes
+}
+
+/// Iteration-to-raster-pixel mapping the EAC alpha block uses (the decoders'
+/// `WRITE_ORDER_TABLE_REV`): iteration i's 3-bit index selects raster pixel
+/// `ALPHA_WRITE_ORDER[i]`.
+const ALPHA_WRITE_ORDER: [usize; 16] = [15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0];
 
 /// One candidate encoding of a sub-block: its quantized base colour, codeword,
 /// per-slot selectors and the squared error it costs.
@@ -390,6 +558,144 @@ mod tests {
         assert_eq!(parsed.header.format, VkFormat::Etc2R8G8B8UnormBlock);
         assert_eq!(parsed.header.width, width);
         assert_eq!(parsed.header.height, height);
+        assert_eq!(parsed.data, &blocks[..]);
+    }
+
+    // --- EAC alpha (ETC2 RGBA, VK 151) ---
+
+    /// Decode RGBA blocks with the independent reference decoder. Returns
+    /// `(rgb, alpha)` per pixel; the decoder packs BGRA in a little-endian u32.
+    fn decode_reference_rgba(blocks: &[u8], width: u32, height: u32) -> Vec<[u8; 4]> {
+        let blocks_x = (width / 4) as usize;
+        let blocks_y = (height / 4) as usize;
+        let mut image = vec![[0u8; 4]; (width * height) as usize];
+        let mut decoded = [0u32; 16];
+
+        for by in 0..blocks_y {
+            for bx in 0..blocks_x {
+                let offset = (by * blocks_x + bx) * ETC2_RGBA_BLOCK_BYTES;
+                texture2ddecoder::decode_etc2_rgba8_block(
+                    &blocks[offset..offset + ETC2_RGBA_BLOCK_BYTES],
+                    &mut decoded,
+                );
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let p = decoded[y * 4 + x];
+                        let rgba = [
+                            ((p >> 16) & 0xff) as u8,
+                            ((p >> 8) & 0xff) as u8,
+                            (p & 0xff) as u8,
+                            ((p >> 24) & 0xff) as u8,
+                        ];
+                        image[(by * 4 + y) * width as usize + (bx * 4 + x)] = rgba;
+                    }
+                }
+            }
+        }
+        image
+    }
+
+    /// An RGBA source with a smooth colour gradient and a smooth alpha ramp, so
+    /// both the colour and the alpha encoders are exercised on non-constant data.
+    fn rgba_gradient(width: u32, height: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.push((x * 255 / width.max(1)) as u8);
+                rgba.push((y * 255 / height.max(1)) as u8);
+                rgba.push(0x60);
+                rgba.push(((x + y) * 255 / (width + height).max(1)) as u8);
+            }
+        }
+        rgba
+    }
+
+    #[test]
+    fn rgba_output_is_sixteen_bytes_per_block() {
+        let rgba = rgba_gradient(16, 8);
+        let blocks = encode_etc2_rgba(&rgba, 16, 8).expect("aligned image encodes");
+        assert_eq!(blocks.len(), (16 / 4) * (8 / 4) * ETC2_RGBA_BLOCK_BYTES);
+    }
+
+    #[test]
+    fn a_constant_alpha_block_round_trips_exactly() {
+        // Fully opaque interior: the alpha encoder should take the constant path
+        // (multiplier 0), and 255 must come back as exactly 255.
+        let mut rgba = Vec::new();
+        for _ in 0..16 {
+            rgba.extend_from_slice(&[0x40, 0x80, 0xC0, 0xFF]);
+        }
+        let blocks = encode_etc2_rgba(&rgba, 4, 4).expect("encodes");
+        let decoded = decode_reference_rgba(&blocks, 4, 4);
+        for pixel in &decoded {
+            assert_eq!(
+                pixel[3], 0xFF,
+                "opaque alpha must survive exactly: {pixel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fully_transparent_block_round_trips_exactly() {
+        let mut rgba = Vec::new();
+        for _ in 0..16 {
+            rgba.extend_from_slice(&[0x10, 0x20, 0x30, 0x00]);
+        }
+        let blocks = encode_etc2_rgba(&rgba, 4, 4).expect("encodes");
+        let decoded = decode_reference_rgba(&blocks, 4, 4);
+        for pixel in &decoded {
+            assert_eq!(
+                pixel[3], 0x00,
+                "transparent alpha must survive exactly: {pixel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_alpha_ramp_round_trips_through_the_reference_decoder() {
+        let (width, height) = (64u32, 64u32);
+        let rgba = rgba_gradient(width, height);
+        let blocks = encode_etc2_rgba(&rgba, width, height).expect("encodes");
+        let decoded = decode_reference_rgba(&blocks, width, height);
+
+        // Alpha-only PSNR: a correct EAC alpha encoder clears 30 dB comfortably
+        // on a smooth ramp, while any bit-packing mistake collapses it.
+        let mut squared = 0f64;
+        for (i, pixel) in decoded.iter().enumerate() {
+            let delta = rgba[i * 4 + 3] as f64 - pixel[3] as f64;
+            squared += delta * delta;
+        }
+        let mean = squared / decoded.len() as f64;
+        let psnr = if mean == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (255.0f64 * 255.0 / mean).log10()
+        };
+        assert!(psnr > 30.0, "alpha PSNR too low: {psnr:.2} dB");
+
+        // Colour must still be fine too (same encoder as the RGB path).
+        let rgb: Vec<[u8; 3]> = decoded.iter().map(|p| [p[0], p[1], p[2]]).collect();
+        let mut c_sq = 0f64;
+        for (i, pixel) in rgb.iter().enumerate() {
+            for c in 0..3 {
+                let delta = rgba[i * 4 + c] as f64 - pixel[c] as f64;
+                c_sq += delta * delta;
+            }
+        }
+        let c_mean = c_sq / (rgb.len() * 3) as f64;
+        let c_psnr = 10.0 * (255.0f64 * 255.0 / c_mean).log10();
+        assert!(c_psnr > 30.0, "colour PSNR too low: {c_psnr:.2} dB");
+    }
+
+    #[test]
+    fn rgba_blocks_survive_the_ktx2_container() {
+        let (width, height) = (16u32, 16u32);
+        let rgba = rgba_gradient(width, height);
+        let blocks = encode_etc2_rgba(&rgba, width, height).expect("encodes");
+
+        let container = write_ktx2(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, width, height, &blocks);
+        let parsed = parse_ktx2(&container).expect("the runtime parser accepts what we write");
+        assert_eq!(parsed.header.format, VkFormat::Etc2R8G8B8A8UnormBlock);
         assert_eq!(parsed.data, &blocks[..]);
     }
 }
