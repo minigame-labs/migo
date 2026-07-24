@@ -68,11 +68,12 @@ impl EglProvider for WindowsEglProvider {
     }
 
     fn load(&self) -> EngineResult<EglInstance> {
-        let library = unsafe { libloading::Library::new(WINDOWS_EGL_LIBRARY) }.map_err(|error| {
-            EngineError::new(ErrorCode::RenderBackendError)
-                .with_msg("load ANGLE libEGL.dll failed")
-                .with_detail(format!("{WINDOWS_EGL_LIBRARY}: {error}"))
-        })?;
+        let library =
+            unsafe { libloading::Library::new(WINDOWS_EGL_LIBRARY) }.map_err(|error| {
+                EngineError::new(ErrorCode::RenderBackendError)
+                    .with_msg("load ANGLE libEGL.dll failed")
+                    .with_detail(format!("{WINDOWS_EGL_LIBRARY}: {error}"))
+            })?;
         unsafe { EglInstance::load_required_from(library) }.map_err(|error| {
             EngineError::new(ErrorCode::RenderBackendError)
                 .with_msg("resolve required ANGLE EGL symbols failed")
@@ -305,7 +306,12 @@ impl PreparedEglSurface for WindowsPreparedSurface {
                 // Wayland passes its `wl_egl_window*` directly. Passing the
                 // wrong one here would have EGL dereference a window handle.
                 unsafe {
-                    egl.create_window_surface(display, config, hwnd.as_ptr() as egl::NativeWindowType, None)
+                    egl.create_window_surface(
+                        display,
+                        config,
+                        hwnd.as_ptr() as egl::NativeWindowType,
+                        None,
+                    )
                 }
                 .map_err(|error| {
                     EngineError::new(ErrorCode::RenderBackendError)
@@ -406,6 +412,9 @@ mod tests {
             offscreen.backend_id(),
             GraphicsBackendId::of::<WindowsAngleEglBackend>()
         );
-        assert_eq!(WindowsEglProvider::new().backend_id(), offscreen.backend_id());
+        assert_eq!(
+            WindowsEglProvider::new().backend_id(),
+            offscreen.backend_id()
+        );
     }
 }

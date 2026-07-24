@@ -165,7 +165,12 @@ pub(crate) fn android_api_level() -> u32 {
     }
     // PROP_VALUE_MAX is 92; the buffer must hold that plus the NUL.
     let mut buf = [0u8; 93];
-    let len = unsafe { __system_property_get(c"ro.build.version.sdk".as_ptr() as *const u8, buf.as_mut_ptr()) };
+    let len = unsafe {
+        __system_property_get(
+            c"ro.build.version.sdk".as_ptr() as *const u8,
+            buf.as_mut_ptr(),
+        )
+    };
     if len <= 0 {
         return 0;
     }
