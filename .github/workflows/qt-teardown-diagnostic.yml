@@ -38,57 +38,46 @@ jobs:
           ulimit -c unlimited
           cat /proc/sys/kernel/core_pattern
 
-      - name: Build the sanitize test binaries (mirrors the gate)
-        run: |
-          set -euxo pipefail
-          FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g"
-          cmake -S platforms/linux/host-kit/tests -B build-san -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_FLAGS="$FLAGS" \
-            -DCMAKE_EXE_LINKER_FLAGS="$FLAGS" \
-            -DMIGO_REPOSITORY_ROOT="$PWD"
-          cmake --build build-san --parallel
-
-      - name: Reproduce under load and capture a core
+      - name: Run the real gate (cleanup neutered) so a crash preserves its binary
         run: |
           set -uo pipefail
           ulimit -c unlimited
-          BIN=build-san/migo-qt-x11-view-test
-          # Background CPU/scheduler load to mimic the gate's build+run pressure,
-          # which is what makes the teardown race deterministic.
-          for _ in $(seq 1 "$(nproc)"); do ( yes >/dev/null & ) ; done
-          found=""
-          for i in $(seq 1 60); do
-            env QT_QPA_PLATFORM=offscreen ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 "$BIN" >/dev/null 2>&1 || true
-            xvfb-run -a env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb \
-              ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 "$BIN" >/dev/null 2>&1 || true
-            core=$(ls -1 core.* 2>/dev/null | head -n1 || true)
-            if [ -n "$core" ]; then found="$core"; echo "captured core on iteration $i: $core"; break; fi
-          done
-          pkill yes || true
-          if [ -z "$found" ]; then
-            echo "no core captured in 60 iterations"; exit 0
-          fi
-          echo "$found" > core-path.txt
+          # Only the gate's exact sequence reproduces the teardown crash; a
+          # standalone loop does not. Run the real script but keep its mktemp
+          # build dir (its EXIT trap would otherwise delete the crashing binary
+          # before it can be symbolized), and steer that dir + the core file to
+          # known, absolute locations.
+          mkdir -p "$PWD/gatetmp"
+          cp scripts/test-linux-qt-host-kit.sh "$PWD/gate.sh"
+          sed -i 's/^trap cleanup EXIT$/: # cleanup trap disabled for diagnosis/' "$PWD/gate.sh"
+          TMPDIR="$PWD/gatetmp" bash "$PWD/gate.sh" --sanitize || echo "gate exited non-zero (expected on crash)"
+          core=$(ls -1 "$PWD"/core.* 2>/dev/null | head -n1 || true)
+          echo "core=$core" | tee core-path.txt
+          find "$PWD/gatetmp" -type f -name 'migo-qt-*-test' 2>/dev/null | tee bins.txt
 
       - name: Symbolize the core
         if: always()
         run: |
-          core=$(cat core-path.txt 2>/dev/null || true)
-          [ -z "$core" ] && { echo "no core to symbolize"; exit 0; }
-          echo "=== gdb backtrace for $core ==="
+          core=$(sed -n 's/^core=//p' core-path.txt 2>/dev/null || true)
+          if [ -z "$core" ] || [ ! -f "$core" ]; then
+            echo "no core captured — the gate did not crash this run"; exit 0
+          fi
+          # %e in the core name is the crashing executable's basename.
+          exe_base=$(basename "$core" | sed -E 's/^core\.([^.]+)\..*/\1/')
+          bin=$(grep "/$exe_base$" bins.txt | head -n1 || true)
+          echo "=== crashing exe: $exe_base -> $bin ; core: $core ==="
           gdb -batch -nx \
             -ex "set pagination off" \
             -ex "thread apply all bt" \
             -ex "bt full" \
-            build-san/migo-qt-x11-view-test "$core" 2>&1 | head -200
+            "$bin" "$core" 2>&1 | head -250
 
-      - name: Upload core and binary
+      - name: Upload core and binaries
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: qt-teardown-core
           path: |
             core.*
-            build-san/migo-qt-x11-view-test
+            gatetmp/**/migo-qt-*-test
           if-no-files-found: ignore
