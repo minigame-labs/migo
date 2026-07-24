@@ -178,8 +178,14 @@ fn every_callback_field_participates_in_dispatcher_validation() {
 
 #[test]
 fn the_pre_release_callback_prefix_remains_compatible() {
+    // A client built before `on_surface_released` was appended declares a prefix
+    // that ends where that final field begins: 96 on LP64, 52 on ILP32. Deriving
+    // it keeps the copy in bounds on a 32-bit target instead of overrunning both
+    // buffers by the width of the missing tail.
+    const PRE_RELEASE_PREFIX: usize = std::mem::offset_of!(MigoHostCallbacks, on_surface_released);
+
     let mut full = MigoHostCallbacks::empty();
-    full.header.struct_size = 96;
+    full.header.struct_size = PRE_RELEASE_PREFIX as u32;
     full.dispatch = Some(dispatch);
     full.on_surface_released = Some(on_surface_released);
     let mut bytes = CallbackBytes([0xA5; size_of::<MigoHostCallbacks>()]);
@@ -187,7 +193,7 @@ fn the_pre_release_callback_prefix_remains_compatible() {
         std::ptr::copy_nonoverlapping(
             (&full as *const MigoHostCallbacks).cast::<u8>(),
             bytes.0.as_mut_ptr(),
-            96,
+            PRE_RELEASE_PREFIX,
         );
     }
 
@@ -219,8 +225,14 @@ struct CallbackBytes([u8; size_of::<MigoHostCallbacks>()]);
 
 #[test]
 fn a_short_pre_keyboard_callback_prefix_is_zero_extended() {
+    // The prefix an old (pre-keyboard) client declared ends exactly where the
+    // first keyboard callback begins. That offset is 72 on LP64 but only 40 on
+    // ILP32, where pointers are 4 bytes -- hardcoding 72 would copy past both
+    // the source and this destination on a 32-bit target. Derive it instead.
+    const PRE_KEYBOARD_PREFIX: usize = std::mem::offset_of!(MigoHostCallbacks, on_show_keyboard);
+
     let mut full = MigoHostCallbacks::empty();
-    full.header.struct_size = 72;
+    full.header.struct_size = PRE_KEYBOARD_PREFIX as u32;
     full.dispatch = Some(dispatch);
     full.on_request_frame = Some(on_request_frame);
     let mut bytes = CallbackBytes([0xA5; size_of::<MigoHostCallbacks>()]);
@@ -228,7 +240,7 @@ fn a_short_pre_keyboard_callback_prefix_is_zero_extended() {
         std::ptr::copy_nonoverlapping(
             (&full as *const MigoHostCallbacks).cast::<u8>(),
             bytes.0.as_mut_ptr(),
-            72,
+            PRE_KEYBOARD_PREFIX,
         );
     }
 
