@@ -57,6 +57,29 @@ if [[ -z "${MIGO_WIN_V8_ARCHIVE:-}" ]]; then
     exit 94
 fi
 
+# Rebuilding the V8 archive in place leaves cargo none the wiser: rusty_v8's
+# build script copies it once, and neither the path nor the crate version
+# changes, so cargo replays the cached build-script output and relinks the old
+# copy. The symptom is a link that keeps failing on symbols the archive
+# demonstrably exports, with an identical libv8-<hash>.rlib across runs -- it
+# cost three full rebuilds to recognise here, and the Linux SDK build already
+# carries the same stamp for the same reason. Dropping only the copied archive
+# is not enough: the build script does not re-run, so its fingerprint, its
+# output and the rlib have to go with it.
+V8_STAMP_DIR="$(win_to_unix_path "$WIN_TARGET_DOS")/.migo-v8-archive-stamp"
+v8_archive_unix="$(win_to_unix_path "$MIGO_WIN_V8_ARCHIVE")"
+if [[ -f "$v8_archive_unix" ]]; then
+    v8_archive_sha="$(sha256sum "$v8_archive_unix" | cut -d' ' -f1)"
+    if [[ ! -f "$V8_STAMP_DIR" ]] || [[ "$(cat "$V8_STAMP_DIR" 2>/dev/null)" != "$v8_archive_sha" ]]; then
+        echo "[test] V8 archive changed since the last run -- forcing a v8 rebuild"
+        deps="$(win_to_unix_path "$WIN_TARGET_DOS")/$WIN_TARGET_TRIPLE/debug"
+        rm -rf "$deps/.fingerprint"/v8-* "$deps/build"/v8-* 2>/dev/null || true
+        find "$deps/deps" -maxdepth 1 -name 'libv8-*.rlib' -delete 2>/dev/null || true
+        mkdir -p "$(dirname "$V8_STAMP_DIR")"
+        printf '%s' "$v8_archive_sha" > "$V8_STAMP_DIR"
+    fi
+fi
+
 # rusty_v8 needs a bindings file matching the archive. If one is staged next to
 # the archive, hand it over so the build never invokes bindgen (whose libclang
 # resolution is the NDK-pollution minefield documented in the spike report).

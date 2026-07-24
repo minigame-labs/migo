@@ -122,3 +122,8 @@ require_synced_worktree() {
         exit 92
     fi
 }
+
+# DOS path as WSL sees it. Used to inspect Windows-side build state from here.
+win_to_unix_path() {
+    printf '/mnt/%s' "$(printf '%s' "$1" | sed 's|\\|/|g; s|^\(.\):|\L\1|')"
+}
