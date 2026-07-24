@@ -169,6 +169,58 @@ fi
 check_ready || { err "prerequisites unmet; run --check for the list"; exit 1; }
 
 # ------------------------------------------------------------
+# Patches
+# ------------------------------------------------------------
+# Same mechanism the Android and Linux builds use: apply only the patches this
+# platform needs, then assert each one took effect, so a patch that silently
+# stops matching upstream fails the build rather than producing a V8 that
+# quietly lacks it. Windows previously had no patch step at all -- its tree was
+# edited by hand -- so a clean checkout could not reproduce the Windows V8 and
+# the artifact-manifest provenance chain did not hold on this platform.
+PATCH_DIR="$ENGINE_ROOT/third_party/v8-patches"
+EXPORTS_DEF="$PATCH_DIR/rusty_v8-windows-exports.def"
+
+apply_windows_patches() {
+    # target_file|sentinel|patch_glob
+    local specs=(
+        "src/binding.cc|v8__register_host_callbacks|0005-*.patch"
+        "BUILD.gn|shared_library(\"rusty_v8\")|0006-*.patch"
+    )
+    local spec
+    for spec in "${specs[@]}"; do
+        local tgt="${spec%%|*}"; local rest="${spec#*|}"
+        local sentinel="${rest%%|*}"; local glob="${rest##*|}"
+        local -a matches=("$PATCH_DIR"/$glob)
+        local pf="${matches[0]}"
+        [[ -f "$pf" ]] || { err "missing patch: $glob"; return 1; }
+        if grep -qF "$sentinel" "$SRC_UNIX/$tgt" 2>/dev/null; then
+            echo "  = already in effect: $(basename "$pf")"
+            continue
+        fi
+        # No `</dev/null` here: a second redirect on the same descriptor wins,
+        # so it would feed patch an empty stdin -- it then exits 0 having done
+        # nothing, which the sentinel check below is what catches. `--batch`
+        # already suppresses the prompting that redirect was meant to avoid.
+        if ! patch -p1 -d "$SRC_UNIX" --batch --forward < "$pf"; then
+            err "patch failed: $(basename "$pf")"; return 1
+        fi
+        if ! grep -qF "$sentinel" "$SRC_UNIX/$tgt" 2>/dev/null; then
+            err "patch ran but sentinel missing in $tgt: $(basename "$pf")"; return 1
+        fi
+        echo "  ✓ applied $(basename "$pf")"
+    done
+
+    # The DLL exports exactly the C binding surface, listed in a generated file
+    # (scripts/gen-windows-v8-def.sh) rather than hand-kept, so it cannot drift
+    # from what rusty_v8 actually defines. BUILD.gn references it by this name.
+    [[ -f "$EXPORTS_DEF" ]] || { err "missing export list: $EXPORTS_DEF"; return 1; }
+    cp "$EXPORTS_DEF" "$SRC_UNIX/rusty_v8.def" || return 1
+    echo "  ✓ staged rusty_v8.def ($(grep -c '^    ' "$EXPORTS_DEF") exports)"
+}
+
+apply_windows_patches || { err "patch stage failed"; exit 1; }
+
+# ------------------------------------------------------------
 # Build
 # ------------------------------------------------------------
 BATCH_UNIX="/mnt/c/migo-win-spike-tmp/migo-build-v8-windows.bat"
@@ -254,16 +306,28 @@ info "building V8 for $TARGET in $RUSTY_V8_SRC_WIN (this takes several minutes)"
 # Install artifacts
 # ------------------------------------------------------------
 GN_OUT_UNIX="$(win_to_unix "$V8_TARGET_DIR_WIN")/$TARGET/release/gn_out"
-ARCHIVE="$GN_OUT_UNIX/obj/rusty_v8.lib"
 BINDING="$GN_OUT_UNIX/src_binding.rs"
 
-[[ -f "$ARCHIVE" ]] || { err "rusty_v8.lib not found after build: $ARCHIVE"; exit 1; }
+# rusty_v8 is a shared_library here (see the BUILD.gn patch): the products are
+# the DLL plus its import library, both in the build root rather than obj/.
+# gn names the import library after the DLL, so accept either spelling instead
+# of pinning one and failing opaquely if the toolchain uses the other.
+DLL="$GN_OUT_UNIX/rusty_v8.dll"
+IMPLIB=""
+for candidate in "$GN_OUT_UNIX/rusty_v8.dll.lib" "$GN_OUT_UNIX/rusty_v8.lib"; do
+    [[ -f "$candidate" ]] && { IMPLIB="$candidate"; break; }
+done
+
+[[ -f "$DLL" ]] || { err "rusty_v8.dll not found after build: $DLL"; exit 1; }
+[[ -n "$IMPLIB" ]] || { err "no import library beside $DLL"; exit 1; }
 [[ -f "$BINDING" ]] || { err "src_binding.rs not found after build: $BINDING"; exit 1; }
 
 mkdir -p "$OUT_DIR"
-cp "$ARCHIVE" "$OUT_DIR/rusty_v8.lib"
+cp "$DLL" "$OUT_DIR/rusty_v8.dll"
+cp "$IMPLIB" "$OUT_DIR/rusty_v8.dll.lib"
 cp "$BINDING" "$OUT_DIR/src_binding.rs"
-ok "archive -> $OUT_DIR/rusty_v8.lib ($(du -h "$OUT_DIR/rusty_v8.lib" | cut -f1))"
+ok "dll     -> $OUT_DIR/rusty_v8.dll ($(du -h "$OUT_DIR/rusty_v8.dll" | cut -f1))"
+ok "implib  -> $OUT_DIR/rusty_v8.dll.lib ($(du -h "$OUT_DIR/rusty_v8.dll.lib" | cut -f1))"
 ok "binding -> $OUT_DIR/src_binding.rs"
 
 # The component manifest is deliberately not written yet. Its writer is

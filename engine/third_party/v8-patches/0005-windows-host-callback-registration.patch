@@ -1,0 +1,348 @@
+--- a/src/binding.cc
++++ b/src/binding.cc
+@@ -3040,6 +3040,25 @@
+   return ptr.use_count();
+ }
+ 
++// MIGO: same Windows-only indirection as the serializer delegate; see the note
++// there. The inspector's Channel callbacks are host-supplied the same way.
++#if defined(_WIN32)
++void (*p_v8_inspector__V8Inspector__Channel__BASE__sendResponse)(
++    v8_inspector::V8Inspector::Channel* self, int callId,
++    v8_inspector::StringBuffer* message);
++void (*p_v8_inspector__V8Inspector__Channel__BASE__sendNotification)(
++    v8_inspector::V8Inspector::Channel* self,
++    v8_inspector::StringBuffer* message);
++void (*p_v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications)(
++    v8_inspector::V8Inspector::Channel* self);
++
++#define v8_inspector__V8Inspector__Channel__BASE__sendResponse \
++  p_v8_inspector__V8Inspector__Channel__BASE__sendResponse
++#define v8_inspector__V8Inspector__Channel__BASE__sendNotification \
++  p_v8_inspector__V8Inspector__Channel__BASE__sendNotification
++#define v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications \
++  p_v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications
++#else
+ void v8_inspector__V8Inspector__Channel__BASE__sendResponse(
+     v8_inspector::V8Inspector::Channel* self, int callId,
+     v8_inspector::StringBuffer* message);
+@@ -3048,6 +3067,7 @@
+     v8_inspector::StringBuffer* message);
+ void v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
+     v8_inspector::V8Inspector::Channel* self);
++#endif
+ 
+ void v8_inspector__V8Inspector__DELETE(v8_inspector::V8Inspector* self) {
+   delete self;
+@@ -3174,6 +3194,45 @@
+   self->flushProtocolNotifications();
+ }
+ 
++// MIGO: same Windows-only indirection; see the serializer delegate note.
++#if defined(_WIN32)
++int64_t (*p_v8_inspector__V8InspectorClient__BASE__generateUniqueId)(
++    v8_inspector::V8InspectorClient* self);
++void (*p_v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause)(
++    v8_inspector::V8InspectorClient* self, int contextGroupId);
++void (*p_v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause)(
++    v8_inspector::V8InspectorClient* self);
++void (*p_v8_inspector__V8InspectorClient__BASE__runIfWaitingForDebugger)(
++    v8_inspector::V8InspectorClient* self, int contextGroupId);
++void (*p_v8_inspector__V8InspectorClient__BASE__consoleAPIMessage)(
++    v8_inspector::V8InspectorClient* self, int contextGroupId,
++    v8::Isolate::MessageErrorLevel level,
++    const v8_inspector::StringView& message,
++    const v8_inspector::StringView& url, unsigned lineNumber,
++    unsigned columnNumber, v8_inspector::V8StackTrace* stackTrace);
++v8::Context* (
++    *p_v8_inspector__V8InspectorClient__BASE__ensureDefaultContextInGroup)(
++    v8_inspector::V8InspectorClient* self, int context_group_id);
++v8_inspector::StringBuffer* (
++    *p_v8_inspector__V8InspectorClient__BASE__resourceNameToUrl)(
++    v8_inspector::V8InspectorClient* self,
++    const v8_inspector::StringView& resource_name_view);
++
++#define v8_inspector__V8InspectorClient__BASE__generateUniqueId \
++  p_v8_inspector__V8InspectorClient__BASE__generateUniqueId
++#define v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause \
++  p_v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause
++#define v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause \
++  p_v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause
++#define v8_inspector__V8InspectorClient__BASE__runIfWaitingForDebugger \
++  p_v8_inspector__V8InspectorClient__BASE__runIfWaitingForDebugger
++#define v8_inspector__V8InspectorClient__BASE__consoleAPIMessage \
++  p_v8_inspector__V8InspectorClient__BASE__consoleAPIMessage
++#define v8_inspector__V8InspectorClient__BASE__ensureDefaultContextInGroup \
++  p_v8_inspector__V8InspectorClient__BASE__ensureDefaultContextInGroup
++#define v8_inspector__V8InspectorClient__BASE__resourceNameToUrl \
++  p_v8_inspector__V8InspectorClient__BASE__resourceNameToUrl
++#else
+ int64_t v8_inspector__V8InspectorClient__BASE__generateUniqueId(
+     v8_inspector::V8InspectorClient* self);
+ void v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause(
+@@ -3194,6 +3253,7 @@
+ v8_inspector__V8InspectorClient__BASE__resourceNameToUrl(
+     v8_inspector::V8InspectorClient* self,
+     const v8_inspector::StringView& resource_name_view);
++#endif
+ 
+ }  // extern "C"
+ 
+@@ -3500,6 +3560,71 @@
+ 
+ // v8::ValueSerializer::Delegate
+ 
++// MIGO: A Windows DLL must have every symbol it references resolved at link
++// time; unlike ELF it cannot leave these host-supplied callbacks undefined for
++// the final link to satisfy. Once rusty_v8 is built as a shared_library there is
++// no host module to import them from -- naming one would tie the DLL to a single
++// executable, and the cargo test binaries have hashed names. So on Windows the
++// callbacks arrive through a table the host fills in via
++// `v8__register_host_callbacks` (defined at the end of this file) before V8 is
++// initialised, and the call sites below reach them through that table.
++//
++// Everywhere else the direct externs stay exactly as they were: on ELF targets
++// rusty_v8 is a static library and the Rust crate supplies these at the final
++// link, so Android and Linux keep generating byte-for-byte identical code and
++// need no revalidation for this change.
++#if defined(_WIN32)
++extern "C" {
++void (*p_v8__ValueSerializer__Delegate__ThrowDataCloneError)(
++    v8::ValueSerializer::Delegate* self, v8::Local<v8::String> message);
++
++bool (*p_v8__ValueSerializer__Delegate__HasCustomHostObject)(
++    v8::ValueSerializer::Delegate* self, v8::Isolate* isolate);
++
++MaybeBool (*p_v8__ValueSerializer__Delegate__IsHostObject)(
++    v8::ValueSerializer::Delegate* self, v8::Isolate* isolate,
++    v8::Local<v8::Object> object);
++
++MaybeBool (*p_v8__ValueSerializer__Delegate__WriteHostObject)(
++    v8::ValueSerializer::Delegate* self, v8::Isolate* isolate,
++    v8::Local<v8::Object> object);
++
++bool (*p_v8__ValueSerializer__Delegate__GetSharedArrayBufferId)(
++    v8::ValueSerializer::Delegate* self, v8::Isolate* isolate,
++    v8::Local<v8::SharedArrayBuffer> shared_array_buffer, uint32_t* result);
++
++bool (*p_v8__ValueSerializer__Delegate__GetWasmModuleTransferId)(
++    v8::ValueSerializer::Delegate* self, v8::Isolate* isolate,
++    v8::Local<v8::WasmModuleObject> module, uint32_t* result);
++
++void* (*p_v8__ValueSerializer__Delegate__ReallocateBufferMemory)(
++    v8::ValueSerializer::Delegate* self, void* old_buffer, size_t size,
++    size_t* actual_size);
++
++void (*p_v8__ValueSerializer__Delegate__FreeBufferMemory)(
++    v8::ValueSerializer::Delegate* self, void* buffer);
++}
++
++// Redirect the unchanged call sites below onto the table. Object-like macros
++// only replace whole identifiers, so the `p_`-prefixed names they expand to are
++// themselves untouched.
++#define v8__ValueSerializer__Delegate__ThrowDataCloneError \
++  p_v8__ValueSerializer__Delegate__ThrowDataCloneError
++#define v8__ValueSerializer__Delegate__HasCustomHostObject \
++  p_v8__ValueSerializer__Delegate__HasCustomHostObject
++#define v8__ValueSerializer__Delegate__IsHostObject \
++  p_v8__ValueSerializer__Delegate__IsHostObject
++#define v8__ValueSerializer__Delegate__WriteHostObject \
++  p_v8__ValueSerializer__Delegate__WriteHostObject
++#define v8__ValueSerializer__Delegate__GetSharedArrayBufferId \
++  p_v8__ValueSerializer__Delegate__GetSharedArrayBufferId
++#define v8__ValueSerializer__Delegate__GetWasmModuleTransferId \
++  p_v8__ValueSerializer__Delegate__GetWasmModuleTransferId
++#define v8__ValueSerializer__Delegate__ReallocateBufferMemory \
++  p_v8__ValueSerializer__Delegate__ReallocateBufferMemory
++#define v8__ValueSerializer__Delegate__FreeBufferMemory \
++  p_v8__ValueSerializer__Delegate__FreeBufferMemory
++#else
+ extern "C" {
+ void v8__ValueSerializer__Delegate__ThrowDataCloneError(
+     v8::ValueSerializer::Delegate* self, v8::Local<v8::String> message);
+@@ -3530,6 +3655,7 @@
+ void v8__ValueSerializer__Delegate__FreeBufferMemory(
+     v8::ValueSerializer::Delegate* self, void* buffer);
+ }
++#endif
+ 
+ struct v8__ValueSerializer__Delegate : public v8::ValueSerializer::Delegate {
+   void ThrowDataCloneError(v8::Local<v8::String> message) override {
+@@ -3659,6 +3785,29 @@
+ 
+ // v8::ValueDeserializer::Delegate
+ 
++// MIGO: same Windows-only indirection as the serializer delegate above.
++#if defined(_WIN32)
++extern "C" {
++v8::Object* (*p_v8__ValueDeserializer__Delegate__ReadHostObject)(
++    v8::ValueDeserializer::Delegate* self, v8::Isolate* isolate);
++
++v8::SharedArrayBuffer* (
++    *p_v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId)(
++    v8::ValueDeserializer::Delegate* self, v8::Isolate* isolate,
++    uint32_t transfer_id);
++
++v8::WasmModuleObject* (*p_v8__ValueDeserializer__Delegate__GetWasmModuleFromId)(
++    v8::ValueDeserializer::Delegate* self, v8::Isolate* isolate,
++    uint32_t clone_id);
++}
++
++#define v8__ValueDeserializer__Delegate__ReadHostObject \
++  p_v8__ValueDeserializer__Delegate__ReadHostObject
++#define v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId \
++  p_v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId
++#define v8__ValueDeserializer__Delegate__GetWasmModuleFromId \
++  p_v8__ValueDeserializer__Delegate__GetWasmModuleFromId
++#else
+ extern "C" {
+ v8::Object* v8__ValueDeserializer__Delegate__ReadHostObject(
+     v8::ValueDeserializer::Delegate* self, v8::Isolate* isolate);
+@@ -3672,6 +3821,7 @@
+     v8::ValueDeserializer::Delegate* self, v8::Isolate* isolate,
+     uint32_t clone_id);
+ }
++#endif
+ 
+ struct v8__ValueDeserializer__Delegate
+     : public v8::ValueDeserializer::Delegate {
+@@ -3935,9 +4085,20 @@
+ 
+ extern "C" {
+ 
++// MIGO: same Windows-only indirection; see the serializer delegate above.
++#if defined(_WIN32)
++void (*p_rusty_v8_RustObj_trace)(const RustObj*, cppgc::Visitor*);
++const char* (*p_rusty_v8_RustObj_get_name)(const RustObj*);
++void (*p_rusty_v8_RustObj_drop)(RustObj*);
++
++#define rusty_v8_RustObj_trace p_rusty_v8_RustObj_trace
++#define rusty_v8_RustObj_get_name p_rusty_v8_RustObj_get_name
++#define rusty_v8_RustObj_drop p_rusty_v8_RustObj_drop
++#else
+ void rusty_v8_RustObj_trace(const RustObj*, cppgc::Visitor*);
+ const char* rusty_v8_RustObj_get_name(const RustObj*);
+ void rusty_v8_RustObj_drop(RustObj*);
++#endif
+ 
+ RustObj::~RustObj() { rusty_v8_RustObj_drop(this); }
+ 
+@@ -4094,3 +4255,118 @@
+ }
+ 
+ }  // extern "C"
++
++#if defined(_WIN32)
++
++// MIGO: the Windows entry point for the callback table described at the
++// ValueSerializer delegate above. Placed last so every type it mentions is
++// already declared. The host must call this once, before it initialises V8 and
++// before any ValueSerializer, ValueDeserializer or cppgc-managed Rust object is
++// used; the pointers start null, so calling it late faults rather than silently
++// misbehaving.
++//
++// Member order is part of the ABI between this DLL and the Rust side -- the
++// matching #[repr(C)] struct lists them in exactly this order.
++struct v8__HostCallbacks {
++  void (*value_serializer_throw_data_clone_error)(
++      v8::ValueSerializer::Delegate*, v8::Local<v8::String>);
++  bool (*value_serializer_has_custom_host_object)(
++      v8::ValueSerializer::Delegate*, v8::Isolate*);
++  MaybeBool (*value_serializer_is_host_object)(v8::ValueSerializer::Delegate*,
++                                               v8::Isolate*,
++                                               v8::Local<v8::Object>);
++  MaybeBool (*value_serializer_write_host_object)(
++      v8::ValueSerializer::Delegate*, v8::Isolate*, v8::Local<v8::Object>);
++  bool (*value_serializer_get_shared_array_buffer_id)(
++      v8::ValueSerializer::Delegate*, v8::Isolate*,
++      v8::Local<v8::SharedArrayBuffer>, uint32_t*);
++  bool (*value_serializer_get_wasm_module_transfer_id)(
++      v8::ValueSerializer::Delegate*, v8::Isolate*,
++      v8::Local<v8::WasmModuleObject>, uint32_t*);
++  void* (*value_serializer_reallocate_buffer_memory)(
++      v8::ValueSerializer::Delegate*, void*, size_t, size_t*);
++  void (*value_serializer_free_buffer_memory)(v8::ValueSerializer::Delegate*,
++                                              void*);
++  v8::Object* (*value_deserializer_read_host_object)(
++      v8::ValueDeserializer::Delegate*, v8::Isolate*);
++  v8::SharedArrayBuffer* (*value_deserializer_get_shared_array_buffer_from_id)(
++      v8::ValueDeserializer::Delegate*, v8::Isolate*, uint32_t);
++  v8::WasmModuleObject* (*value_deserializer_get_wasm_module_from_id)(
++      v8::ValueDeserializer::Delegate*, v8::Isolate*, uint32_t);
++  void (*rust_obj_trace)(const RustObj*, cppgc::Visitor*);
++  const char* (*rust_obj_get_name)(const RustObj*);
++  void (*rust_obj_drop)(RustObj*);
++  void (*inspector_channel_send_response)(v8_inspector::V8Inspector::Channel*,
++                                          int, v8_inspector::StringBuffer*);
++  void (*inspector_channel_send_notification)(
++      v8_inspector::V8Inspector::Channel*, v8_inspector::StringBuffer*);
++  void (*inspector_channel_flush_protocol_notifications)(
++      v8_inspector::V8Inspector::Channel*);
++  int64_t (*inspector_client_generate_unique_id)(
++      v8_inspector::V8InspectorClient*);
++  void (*inspector_client_run_message_loop_on_pause)(
++      v8_inspector::V8InspectorClient*, int);
++  void (*inspector_client_quit_message_loop_on_pause)(
++      v8_inspector::V8InspectorClient*);
++  void (*inspector_client_run_if_waiting_for_debugger)(
++      v8_inspector::V8InspectorClient*, int);
++  void (*inspector_client_console_api_message)(
++      v8_inspector::V8InspectorClient*, int, v8::Isolate::MessageErrorLevel,
++      const v8_inspector::StringView&, const v8_inspector::StringView&,
++      unsigned, unsigned, v8_inspector::V8StackTrace*);
++  v8::Context* (*inspector_client_ensure_default_context_in_group)(
++      v8_inspector::V8InspectorClient*, int);
++  v8_inspector::StringBuffer* (*inspector_client_resource_name_to_url)(
++      v8_inspector::V8InspectorClient*, const v8_inspector::StringView&);
++};
++
++extern "C" void v8__register_host_callbacks(
++    const struct v8__HostCallbacks* callbacks) {
++  p_v8__ValueSerializer__Delegate__ThrowDataCloneError =
++      callbacks->value_serializer_throw_data_clone_error;
++  p_v8__ValueSerializer__Delegate__HasCustomHostObject =
++      callbacks->value_serializer_has_custom_host_object;
++  p_v8__ValueSerializer__Delegate__IsHostObject =
++      callbacks->value_serializer_is_host_object;
++  p_v8__ValueSerializer__Delegate__WriteHostObject =
++      callbacks->value_serializer_write_host_object;
++  p_v8__ValueSerializer__Delegate__GetSharedArrayBufferId =
++      callbacks->value_serializer_get_shared_array_buffer_id;
++  p_v8__ValueSerializer__Delegate__GetWasmModuleTransferId =
++      callbacks->value_serializer_get_wasm_module_transfer_id;
++  p_v8__ValueSerializer__Delegate__ReallocateBufferMemory =
++      callbacks->value_serializer_reallocate_buffer_memory;
++  p_v8__ValueSerializer__Delegate__FreeBufferMemory =
++      callbacks->value_serializer_free_buffer_memory;
++  p_v8__ValueDeserializer__Delegate__ReadHostObject =
++      callbacks->value_deserializer_read_host_object;
++  p_v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId =
++      callbacks->value_deserializer_get_shared_array_buffer_from_id;
++  p_v8__ValueDeserializer__Delegate__GetWasmModuleFromId =
++      callbacks->value_deserializer_get_wasm_module_from_id;
++  p_rusty_v8_RustObj_trace = callbacks->rust_obj_trace;
++  p_rusty_v8_RustObj_get_name = callbacks->rust_obj_get_name;
++  p_rusty_v8_RustObj_drop = callbacks->rust_obj_drop;
++  p_v8_inspector__V8Inspector__Channel__BASE__sendResponse =
++      callbacks->inspector_channel_send_response;
++  p_v8_inspector__V8Inspector__Channel__BASE__sendNotification =
++      callbacks->inspector_channel_send_notification;
++  p_v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications =
++      callbacks->inspector_channel_flush_protocol_notifications;
++  p_v8_inspector__V8InspectorClient__BASE__generateUniqueId =
++      callbacks->inspector_client_generate_unique_id;
++  p_v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause =
++      callbacks->inspector_client_run_message_loop_on_pause;
++  p_v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause =
++      callbacks->inspector_client_quit_message_loop_on_pause;
++  p_v8_inspector__V8InspectorClient__BASE__runIfWaitingForDebugger =
++      callbacks->inspector_client_run_if_waiting_for_debugger;
++  p_v8_inspector__V8InspectorClient__BASE__consoleAPIMessage =
++      callbacks->inspector_client_console_api_message;
++  p_v8_inspector__V8InspectorClient__BASE__ensureDefaultContextInGroup =
++      callbacks->inspector_client_ensure_default_context_in_group;
++  p_v8_inspector__V8InspectorClient__BASE__resourceNameToUrl =
++      callbacks->inspector_client_resource_name_to_url;
++}
++
++#endif  // defined(_WIN32)
