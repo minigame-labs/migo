@@ -93,7 +93,33 @@ snapshot_artifact_size() {
 }
 
 snapshot_v8_archive_hash() {
-  snapshot_artifact_hash "$1"
+  local artifact="$1"
+
+  # The archive is a git-ignored build product fetched from a release asset, so
+  # it is usually absent in a checkout. Its sha256 is recorded in the sibling
+  # component-manifest.json -- the same value the release gate treats as the
+  # authority on a valid archive -- so identity does not need the bytes. This
+  # keeps the freshness gate a zero-download check, which is what it was when the
+  # archive was an LFS pointer it could read the oid from.
+  if [[ ! -s "$artifact" ]]; then
+    local manifest="$(dirname "$artifact")/component-manifest.json"
+    if [[ -f "$manifest" ]]; then
+      local recorded
+      recorded="$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    print(json.load(f).get('hashes', {}).get('archive', ''))
+" "$manifest" 2>/dev/null)"
+      if [[ "$recorded" =~ ^[0-9a-f]{64}$ ]]; then
+        printf '%s\n' "$recorded"
+        return 0
+      fi
+    fi
+    echo "V8 archive absent and no usable hash in $manifest" >&2
+    return 1
+  fi
+
+  snapshot_artifact_hash "$artifact"
 }
 
 # Generation and native linking require real bytes. Unlike freshness, these

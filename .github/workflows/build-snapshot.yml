@@ -108,14 +108,12 @@ jobs:
       SNAPSHOT_KIND: ${{ inputs.snapshot_kind }}
       SNAPSHOT_PREFIX: ${{ inputs.snapshot_kind == 'worker' && 'SNAPSHOT-worker' || 'SNAPSHOT' }}
     steps:
-      # LFS is required: engine/third_party/rusty_v8/**/librusty_v8.a (the
-      # self-built android V8 archives) are stored via Git LFS, and snapshot-gen
       # must link the android-x86_64 one so the snapshot's external-reference
       # table matches the .so's V8 exactly.
-      - name: Checkout (with LFS for the android V8 archive)
+      - name: Checkout
         uses: actions/checkout@v5
         with:
-          lfs: true
+          lfs: false
 
       - name: Validate snapshot identity selection
         run: |
@@ -124,19 +122,12 @@ jobs:
             exit 1
           fi
 
-      # actions/checkout sets GIT_LFS_SKIP_SMUDGE during the initial checkout and
-      # doesn't always smudge large objects back into the working tree, leaving
-      # third_party/rusty_v8/x86_64/librusty_v8.a as a ~130-byte pointer — which
-      # makes the rusty_v8 build script emit "could not find native static
-      # library rusty_v8". Force the smudge and guard against a pointer.
-      - name: Materialize android V8 archive from LFS
-        run: |
-          git lfs pull --include="engine/third_party/rusty_v8/x86_64/librusty_v8.a"
-          sz=$(stat -c %s engine/third_party/rusty_v8/x86_64/librusty_v8.a)
-          echo "x86_64 V8 archive: $sz bytes"
-          [ "$sz" -gt 1000000 ] || { echo "ERROR: librusty_v8.a is still an LFS pointer"; exit 1; }
+      # Same as the other workflows: the archive comes from a release asset and is
+      # checked against the component manifest, so this job no longer depends on
+      # LFS bandwidth to get a V8 it can link.
+      - name: Fetch and verify the Android V8 archives
+        run: bash scripts/fetch-v8-archives.sh
 
-      # Pinned to match engine/rust-toolchain.toml (frozen build chain).
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
         with:

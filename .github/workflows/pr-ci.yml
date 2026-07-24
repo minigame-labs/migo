@@ -204,36 +204,23 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      # LFS is required: the android V8 archives (third_party/rusty_v8/**/*.a)
-      # AND the per-arch V8 snapshots (crates/runtime-v8/snapshots/*.bin) are
-      # stored via Git LFS. Without this they are ~130-byte pointer stubs and
-      # the .so link (and snapshot embedding) would break.
-      - name: Checkout (with LFS for V8 archives + snapshots)
+      # No LFS anywhere in this repository any more. The snapshots are ordinary
+      # blobs, and the V8 archives are fetched from a release asset by the step
+      # below -- see .gitattributes for why.
+      - name: Checkout
         uses: actions/checkout@v5
         with:
-          lfs: true
+          lfs: false
 
-      # actions/checkout sets GIT_LFS_SKIP_SMUDGE during checkout and does not
-      # reliably smudge large objects back into the tree, leaving the V8 archives
-      # (and profile/ABI snapshots) as ~130-byte pointer stubs — which makes the
-      # rusty_v8 build script emit "could not find native static library
-      # rusty_v8" and the .so link fail. Force the smudge for exactly the files
-      # this job links and the committed arm64 snapshots it embeds. x86_64
-      # debug builds intentionally exercise the source-JS fallback until the
-      # emulator workflow's full/slim snapshots are reviewed and committed;
-      # the tag/release job remains fail-closed for those required artifacts.
-      - name: Materialize LFS objects (V8 archives + snapshots)
-        run: |
-          git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/runtime-v8/snapshots/SNAPSHOT-*.bin"
-          for f in \
-            engine/third_party/rusty_v8/aarch64/librusty_v8.a \
-            engine/third_party/rusty_v8/x86_64/librusty_v8.a \
-            engine/crates/runtime-v8/snapshots/SNAPSHOT-full-aarch64.bin \
-            engine/crates/runtime-v8/snapshots/SNAPSHOT-slim-aarch64.bin ; do
-            sz=$(stat -c %s "$f")
-            echo "$f: $sz bytes"
-            [ "$sz" -gt 100000 ] || { echo "ERROR: $f is still an LFS pointer"; exit 1; }
-          done
+      # The V8 archives are not in the repository: they were what exhausted the
+      # LFS quota, at which point checkout failed and nothing could build for a
+      # reason unrelated to the change under test. They come from a release asset
+      # instead, verified against the sha256 in the committed
+      # component-manifest.json -- the same file the release gate already treats
+      # as the authority on a valid archive. Snapshots are ordinary blobs now, so
+      # checkout brings them in directly.
+      - name: Fetch and verify the Android V8 archives
+        run: bash scripts/fetch-v8-archives.sh
 
       - name: Setup Java
         uses: actions/setup-java@v5

@@ -172,29 +172,17 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Checkout (with LFS for V8 archives + snapshots)
+      - name: Checkout
         uses: actions/checkout@v5
         with:
-          lfs: true
+          lfs: false
 
-      # checkout leaves LFS objects as ~130-byte pointers; force-smudge the V8
-      # archives + profile/ABI snapshots this release links/embeds. build.rs also
-      # rejects unresolved pointers, but a release must fail rather than silently
-      # take the slower source-JS fallback.
-      - name: Materialize LFS objects (V8 archives + snapshots)
-        run: |
-          git lfs pull --include="engine/third_party/rusty_v8/aarch64/librusty_v8.a,engine/third_party/rusty_v8/x86_64/librusty_v8.a,engine/crates/runtime-v8/snapshots/SNAPSHOT-*.bin"
-          for f in \
-            engine/third_party/rusty_v8/aarch64/librusty_v8.a \
-            engine/third_party/rusty_v8/x86_64/librusty_v8.a \
-            engine/crates/runtime-v8/snapshots/SNAPSHOT-full-aarch64.bin \
-            engine/crates/runtime-v8/snapshots/SNAPSHOT-full-x86_64.bin \
-            engine/crates/runtime-v8/snapshots/SNAPSHOT-slim-aarch64.bin \
-            engine/crates/runtime-v8/snapshots/SNAPSHOT-slim-x86_64.bin ; do
-            sz=$(stat -c %s "$f")
-            echo "$f: $sz bytes"
-            [ "$sz" -gt 100000 ] || { echo "ERROR: $f is still an LFS pointer"; exit 1; }
-          done
+      # The V8 archives live on a release asset rather than in LFS; see
+      # scripts/fetch-v8-archives.sh. It fails closed on a missing or mismatched
+      # archive, which is what a release needs -- silently taking the slower
+      # source-JS fallback would ship a different artifact than intended.
+      - name: Fetch and verify the Android V8 archives
+        run: bash scripts/fetch-v8-archives.sh
 
       - name: Setup Java
         uses: actions/setup-java@v5

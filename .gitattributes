@@ -1,12 +1,23 @@
-*.a filter=lfs diff=lfs merge=lfs -text
-engine/third_party/rusty_v8/**/librusty_v8.a filter=lfs diff=lfs merge=lfs -text
-# The MSVC toolchain names the same artifact rusty_v8.lib, which neither rule
-# above matches -- without this a ~190 MB static library would be committed as
-# an ordinary blob and stay in history forever.
-engine/third_party/rusty_v8/**/rusty_v8.lib filter=lfs diff=lfs merge=lfs -text
-
-# Per-arch V8 startup snapshots: ~1.9 MB binary build inputs, committed so
-# release builds are hermetic/reproducible (and so the arm64 snapshot — which
-# hosted CI cannot generate — has a home). Freshness enforced by
-# scripts/check-snapshot-freshness.sh. The sibling *.manifest.json stay plain.
-engine/crates/runtime-v8/snapshots/*.bin filter=lfs diff=lfs merge=lfs -text
+# Nothing is routed through Git LFS any more.
+#
+# The repository used to keep the two Android V8 archives (~247 MB together) in
+# LFS. Every CI checkout spent that much LFS bandwidth, the quota ran out, and
+# checkout then failed for a reason unrelated to any change being tested -- the
+# build job was red for days with `batch response: This repository exceeded its
+# LFS budget`. Release assets do not count against that quota, so the archives
+# now live on a release and `scripts/fetch-v8-archives.sh` pulls them, verifying
+# each against the `hashes.archive` sha256 in the committed
+# component-manifest.json. That is a stronger guarantee than LFS gave: LFS proved
+# the bytes matched an object id, but nothing tied that object to the manifest
+# the release gate trusts.
+#
+# The V8 startup snapshots stayed behind as ordinary blobs. At 1.4-2.1 MB each
+# they are far below the size where LFS earns its keep, and keeping them plain
+# means the repository has no LFS dependency at all -- so no future quota can
+# take CI down again. They are still committed (release builds are hermetic, and
+# the arm64 snapshot has no other home because hosted CI cannot generate it), and
+# scripts/check-snapshot-freshness.sh still enforces that they match the tree.
+#
+# The V8 archives themselves are git-ignored build products; see .gitignore.
+# If a large binary genuinely needs tracking here again, prefer a release asset
+# plus a checksum in a manifest over reintroducing LFS.
