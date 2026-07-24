@@ -7,6 +7,17 @@
 # shows up as an unresolved symbol in a downstream link. GNU nm reads the COFF
 # archive directly, so this runs on Linux and needs no Windows round-trip.
 #
+# The selection is "everything the binding translation unit defines that is not
+# C++-mangled", NOT a name prefix. An earlier version filtered on `v8__` and
+# looked right -- 646 symbols -- but silently dropped 68 more the Rust side
+# calls: v8_inspector__*, cppgc__*, std__shared_ptr__*, icu_*, and
+# {Serialize,Deserialize}InternalFields, which carry no shared prefix at all.
+# That only surfaced as 50 unresolved externals when a consumer finally linked
+# the DLL. Restricting to binding.obj is what makes "not mangled" sufficient:
+# the rest of the archive is V8's own C++, whose symbols are all mangled anyway,
+# but scoping to the one translation unit that defines the C surface says what
+# is meant instead of relying on that.
+#
 # Usage: bash scripts/gen-windows-v8-def.sh [path/to/rusty_v8.lib]
 set -euo pipefail
 
@@ -18,11 +29,14 @@ OUT="$ROOT/engine/third_party/v8-patches/rusty_v8-windows-exports.def"
 command -v nm >/dev/null || { printf 'nm not found\n' >&2; exit 1; }
 
 symbols="$(nm -g --defined-only "$LIB" 2>/dev/null \
-  | awk '$2 == "T" && $3 ~ /^v8__/ { print $3 }' | LC_ALL=C sort -u)"
+  | awk '
+      /^.*\.obj:$/ { in_binding = ($0 ~ /binding\.obj:$/); next }
+      in_binding && $2 == "T" && $3 !~ /^\?/ { print $3 }
+    ' | LC_ALL=C sort -u)"
 count="$(printf '%s\n' "$symbols" | grep -c .)"
 # A plausibility floor, not an exact pin: upstream may add bindings, but a jump
 # to near-zero means nm read the wrong file or the filter stopped matching.
-(( count >= 600 )) || { printf 'only %s exports found; refusing to write\n' "$count" >&2; exit 1; }
+(( count >= 700 )) || { printf 'only %s exports found; refusing to write\n' "$count" >&2; exit 1; }
 
 {
   printf '; Export surface of the Windows rusty_v8 DLL.\n'
