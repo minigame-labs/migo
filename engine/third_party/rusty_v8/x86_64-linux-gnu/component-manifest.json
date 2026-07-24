@@ -1,0 +1,69 @@
+{
+  "schema": "migo-v8-component-manifest/v1",
+  "component_id": "6fa9bb8448a38de198ce4ec7b97922f3d1d75ff37c84ec25e1adc6ba54468749",
+  "target": {
+    "triple": "x86_64-unknown-linux-gnu",
+    "os": "linux",
+    "arch": "x86_64",
+    "abi": "gnu",
+    "cpu_baseline": "x86-64-v1",
+    "required_cpu_features": [
+      "cmov",
+      "sse2"
+    ],
+    "runtime_floor": {
+      "glibc": "2.31",
+      "glibcxx": "3.4.28"
+    }
+  },
+  "toolchain": {
+    "rustc": "rustc 1.89.0 (29483883e 2025-08-04) | binary: rustc | commit-hash: 29483883eed69d5fb4db01964cdf2af4d86e9cb2 | commit-date: 2025-08-04 | host: x86_64-unknown-linux-gnu | release: 1.89.0 | LLVM version: 20.1.7",
+    "compiler": "Android (8481493, based on r416183c2) clang version 12.0.9 (https://android.googlesource.com/toolchain/llvm-project c935d99d7cf2016289302412d708641d52d2f7ee) | Target: x86_64-unknown-linux-gnu | Thread model: posix | InstalledDir: /home/xg/Android/Ndk/toolchains/llvm/prebuilt/linux-x86_64/bin",
+    "sdk": "Debian bullseye amd64 sysroot; sysroots.json sha256=fad7d0037e5f1da91f66f28fb666522e4d2884322e3c89db8387dad2b275291d",
+    "linker": "Ubuntu LLD 18.1.3 (compatible with GNU linkers)"
+  },
+  "runtime": {
+    "backend": "v8",
+    "rusty_v8_version": "145.0.0",
+    "rusty_v8_revision": "e6a88b35dd3d7f2849a0df33a71d338701c55316",
+    "v8_revision": "8defb67673c5483ae56258a2de01b07e947dc921",
+    "normalized_gn_args": [
+      "chrome_pgo_phase=0",
+      "exclude_unwind_tables=true",
+      "is_cfi=false",
+      "is_official_build=true",
+      "symbol_level=0",
+      "use_allocator_shim=false",
+      "use_glib=false",
+      "use_partition_alloc_as_malloc=false",
+      "use_sysroot=true",
+      "use_thin_lto=false",
+      "v8_enable_i18n_support=true",
+      "v8_enable_pointer_compression=true",
+      "v8_enable_sandbox=false",
+      "v8_enable_webassembly=true",
+      "v8_monolithic=true",
+      "v8_monolithic_for_shared_library=true",
+      "v8_use_external_startup_data=false"
+    ],
+    "patches": [
+      {
+        "id": "migo-build-rs-prebuilt-binding",
+        "sha256": "3e4686943815a35044d6b40aa5e84b3cb27ccf2676c6062d3de0d6d6ec9c99f6"
+      }
+    ]
+  },
+  "hashes": {
+    "archive": "57cb3d0a0e195738d8ecd366cccbd3c2dd89839e1b9461a9fc43725aac79e911",
+    "rust_binding": "47369bfb3ee9a7e6e0f451ae20242595d5a7f0b3afcc0b9447e4f99ff174686a"
+  },
+  "provenance": {
+    "source_revision": "e6a88b35dd3d7f2849a0df33a71d338701c55316",
+    "build_recipe": "scripts/build-v8-linux.sh",
+    "build_recipe_sha256": "8b5fa5040ff29c59069801791ec4cb28a9f981efa141a036d0b6ada09da6786e",
+    "licenses": [
+      "BSD-3-Clause",
+      "MIT"
+    ]
+  }
+}

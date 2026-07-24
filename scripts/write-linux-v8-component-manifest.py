@@ -235,10 +235,33 @@ def verify_source_changes(
             raise RuntimeError(f"declared patch is not applied: {patch_id} ({path})")
         identities.append({"id": patch_id, "sha256": hash_file(path)})
 
+    # `build` is a nested git submodule. When its working tree carries changes,
+    # git reports the parent's view of it as a dirty pointer (status " m build"
+    # for an in-tree change, " M build" for a moved pointer) -- which no `--patch`
+    # ever declares, because patches touch paths *inside* the submodule. The
+    # Linux build declares no build-submodule patches: it uses the bullseye
+    # sysroot and its own GN args, not the Android sysroot/libcxx patches. So the
+    # correct invariant is that the `build` submodule is pristine, and the check
+    # is separated out to say so instead of surfacing a cryptic " m build".
+    build_submodule = source / "build"
+    if (build_submodule / ".git").exists():
+        build_changes = changed_paths(build_submodule)
+        if build_changes:
+            raise RuntimeError(
+                "the `build` submodule has working-tree changes, but a Linux V8 "
+                "build declares no build-submodule patches (it uses the bullseye "
+                "sysroot, not the Android build patches). Reset it before "
+                f"building: {[f'{s} {p}' for s, p in build_changes]}"
+            )
+
+    # The parent's dirty pointer for a pristine `build` submodule (git can still
+    # report " m build" transiently) is expected and allowed alongside the
+    # declared top-level patches; nothing else is.
+    allowed_top = allowed | {"build"}
     unexpected = [
         f"{status} {path}"
         for status, path in changed_paths(source)
-        if path not in allowed or status not in {" M", "M ", "MM"}
+        if path not in allowed_top or status not in {" M", "M ", "MM", " m", "m "}
     ]
     if unexpected:
         raise RuntimeError(

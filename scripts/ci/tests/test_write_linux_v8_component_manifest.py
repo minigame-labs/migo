@@ -82,6 +82,52 @@ class LinuxV8ComponentWriterTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "exactly reproduce"):
                 writer.verify_source_changes(source, [("declared", patch)])
 
+    def test_a_dirty_build_submodule_is_rejected_with_a_clear_message(self):
+        # A tree shared with the Android build can carry the Android build-submodule
+        # patches (build/config/c++/c++.gni, build/rust/gni_impl/run_bindgen.py). The
+        # Linux build declares none of those, so it must refuse -- and say why, not
+        # surface git's cryptic " m build" pointer.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "rusty_v8"
+            source.mkdir()
+
+            def git_in(path, *arguments):
+                subprocess.run(
+                    ["git", "-C", str(path), *arguments],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            git_in(source, "init", "--quiet")
+            git_in(source, "config", "user.name", "Migo Test")
+            git_in(source, "config", "user.email", "migo-test@example.invalid")
+            (source / "build.rs").write_text("fn main() {}\n", encoding="utf-8")
+            (source / ".gitignore").write_text("v8/\n", encoding="utf-8")
+            git_in(source, "add", ".gitignore", "build.rs")
+            git_in(source, "commit", "--quiet", "-m", "baseline")
+
+            # v8 and build are nested submodule-like checkouts.
+            for nested in ("v8", "build"):
+                path = source / nested
+                path.mkdir()
+                git_in(path, "init", "--quiet")
+                git_in(path, "config", "user.name", "Migo Test")
+                git_in(path, "config", "user.email", "migo-test@example.invalid")
+                (path / "README").write_text("baseline\n", encoding="utf-8")
+                git_in(path, "add", "README")
+                git_in(path, "commit", "--quiet", "-m", "baseline")
+
+            # Simulate an Android build-submodule patch left in the tree.
+            (source / "build" / "config").mkdir(parents=True)
+            (source / "build" / "config" / "c++.gni").write_text(
+                "use_custom_libcxx = true\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(RuntimeError, r"`build` submodule"):
+                writer.verify_source_changes(source, [])
+
     def test_gn_arguments_are_sorted_and_duplicate_keys_are_rejected(self):
         self.assertEqual(
             writer.normalized_gn_arguments(
