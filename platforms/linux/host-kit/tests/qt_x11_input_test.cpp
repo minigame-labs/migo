@@ -45,7 +45,15 @@ std::atomic<std::size_t> g_allocations{0};
 // sanitizer lane into a run with no allocation assertion at all. ASan publishes
 // a hook for exactly this, so both lanes keep measuring rather than one of them
 // quietly skipping.
-#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+// Use ASan's malloc/free hook only when AddressSanitizer is on AND its
+// interface header is actually present. `<sanitizer/allocator_interface.h>`
+// ships with clang's compiler-rt but NOT with gcc's libasan, so keying only on
+// `__SANITIZE_ADDRESS__` (which gcc also defines under -fsanitize=address) made
+// the file `#include` a header gcc does not have, failing the build outright on
+// a CXX=g++ sanitize run. Probing the header lets a gcc sanitize build fall
+// through to the dlsym-based malloc interposer below instead.
+#if (defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))) \
+    && defined(__has_include) && __has_include(<sanitizer/allocator_interface.h>)
 #define MIGO_COUNT_ALLOCATIONS_WITH_SANITIZER 1
 #else
 #define MIGO_COUNT_ALLOCATIONS_WITH_SANITIZER 0
