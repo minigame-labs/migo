@@ -101,7 +101,10 @@ const WM_QUIT: u32 = 0x0012;
 const CW_USEDEFAULT: i32 = i32::MIN;
 
 fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, w: Wparam, l: Lparam) -> Lresult {
