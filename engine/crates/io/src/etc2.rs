@@ -237,7 +237,7 @@ fn fit_subblock(pixels: &[[u8; 3]; 16], slots: &[usize]) -> SubBlockFit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ktx2::{parse_ktx2, write_ktx2, VkFormat};
+    use crate::ktx2::{VkFormat, parse_ktx2, write_ktx2};
 
     /// Decode with an independent implementation, never with our own encoder's
     /// inverse: a round trip through code that shares assumptions with the
