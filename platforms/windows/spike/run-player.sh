@@ -26,6 +26,21 @@ if [[ ! "$SECS" =~ ^[0-9]+$ ]]; then
     echo "error: seconds must be a number" >&2
     exit 2
 fi
+shift || true
+
+# Remaining arguments go to the player (e.g. --window). They were previously
+# dropped on the floor, so asking for the windowed path silently produced
+# another offscreen run that looked like a pass -- the driver has to either
+# forward them or refuse them, never ignore them.
+PLAYER_ARGS=()
+for a in "$@"; do
+    if [[ ! "$a" =~ ^--[A-Za-z0-9-]+$ ]]; then
+        echo "error: invalid player arg '$a' (expected a --flag)" >&2
+        exit 2
+    fi
+    PLAYER_ARGS+=("$a")
+done
+PLAYER_ARGS_STR="${PLAYER_ARGS[*]:-}"
 # Interpolated unquoted into a generated batch, so keep it to a tame path class
 # for the same reason run-tests.sh validates its package name.
 if [[ ! "$GAME_DIR_DOS" =~ ^[A-Za-z]:[A-Za-z0-9_.:\\-]+$ ]]; then
@@ -77,8 +92,8 @@ ${BINDING_LINE}
 ${PROXY_LINES}
 
 cd /d ${WIN_WORKTREE_DOS}\\engine || exit /b 90
-echo [player] game=${GAME_DIR_DOS} secs=${SECS} sha=${WORKTREE_SHA}
-cargo run -p migo-player --target ${WIN_TARGET_TRIPLE} -- ${GAME_DIR_DOS} ${SECS} 2>&1
+echo [player] game=${GAME_DIR_DOS} secs=${SECS} args=${PLAYER_ARGS_STR} sha=${WORKTREE_SHA}
+cargo run -p migo-player --target ${WIN_TARGET_TRIPLE} -- ${GAME_DIR_DOS} ${SECS} ${PLAYER_ARGS_STR} 2>&1
 rem Capture before echoing: echo succeeds and would otherwise become the exit
 rem status, turning a crashed player into a pass.
 set RUN_EXIT=%errorlevel%
@@ -86,7 +101,8 @@ echo === EXIT=%RUN_EXIT% ===
 exit /b %RUN_EXIT%
 BAT
 
-run_windows_batch "$BATCH"
+RUN_LOG="$WIN_TMP_UNIX/runplayer.log"
+run_windows_batch "$BATCH" | tee "$RUN_LOG"
 
 if [[ ! -f "$PNG_UNIX" ]]; then
     echo "error: player exited 0 but wrote no frame to $PNG_DOS" >&2
@@ -96,3 +112,13 @@ fi
 
 size="$(stat -c%s "$PNG_UNIX")"
 printf '[player] captured frame: %s (%s bytes)\n' "$PNG_DOS" "$size"
+
+# The player logs which surface it actually used. Checking it is what turns
+# "the flag reached the binary" from an assumption into a result.
+if [[ " ${PLAYER_ARGS_STR} " == *" --window "* ]]; then
+    if ! grep -aq "spawning host thread.*window)" "$RUN_LOG"; then
+        echo "error: --window was requested but the player reported another mode" >&2
+        exit 1
+    fi
+    printf '[player] mode confirmed: windowed (HWND presenter)\n'
+fi
