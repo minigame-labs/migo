@@ -189,7 +189,10 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     // Let the game render for the window; the render thread keeps overwriting
     // the capture slot with the latest present, so early blank warmup frames
     // are superseded by frames containing game content.
+    #[cfg(target_os = "linux")]
     run_for(&mut window, Duration::from_secs(secs.max(4)));
+    #[cfg(not(target_os = "linux"))]
+    run_for(Duration::from_secs(secs.max(4)));
     match graphics::frame_capture::take() {
         Some(frame) => {
             write_png(&png_path, &frame)?;
@@ -208,6 +211,7 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     thread::sleep(Duration::from_millis(300));
     // Only now may the window go: the render thread has stopped touching the
     // EGL surface built from its handles.
+    #[cfg(target_os = "linux")]
     drop(window);
     tracing::info!("player done");
     Ok(())
@@ -217,6 +221,7 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
 ///
 /// Returns early if the window manager asks the window to close, so the caller
 /// still runs its capture + shutdown path instead of being killed mid-frame.
+#[cfg(target_os = "linux")]
 fn run_for(window: &mut Option<X11Window>, total: Duration) {
     let Some(window) = window.as_mut() else {
         thread::sleep(total);
@@ -230,6 +235,12 @@ fn run_for(window: &mut Option<X11Window>, total: Duration) {
         }
         thread::sleep(EVENT_POLL);
     }
+}
+
+/// Offscreen has no event source to service, so waiting is the whole job.
+#[cfg(not(target_os = "linux"))]
+fn run_for(total: Duration) {
+    thread::sleep(total);
 }
 
 /// Flip GL bottom-up rows to top-down and encode an RGBA8 PNG.
