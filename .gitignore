@@ -71,6 +71,12 @@ dist/
 # component-manifest.json reproduce and describe it.
 engine/third_party/rusty_v8/x86_64-linux-gnu/librusty_v8.a
 
+# Windows V8 build products of scripts/build-v8-windows.sh, same policy as the
+# Linux archive above (the ~190 MB .lib and its generated binding are not
+# tracked; the script reproduces them). Ignoring the whole dir also stops a
+# stray `git add -A` from committing a 190 MB library into LFS.
+engine/third_party/rusty_v8/x86_64-pc-windows-msvc/
+
 # Binaries built by the out-of-tree consumer examples. They are proof the
 # package works, not source; examples/c-host/build-with-pkgconfig.sh and the
 # CMake project regenerate them.
