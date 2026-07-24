@@ -123,7 +123,13 @@ apply_patches() {
         if grep -qF "$sentinel" "$RUSTY_V8_SRC/$tgt" 2>/dev/null; then
             echo "  = already in effect: $(basename "$pf")"
         else
-            if patch -p1 -d "$RUSTY_V8_SRC" --batch --forward < "$pf" </dev/null; then
+            # No `</dev/null`: a second redirect on the same descriptor wins, so
+            # it fed patch an empty stdin -- patch then exited 0 having applied
+            # nothing. It went unnoticed because this tree normally already
+            # carries the patches as uncommitted changes, so the sentinel check
+            # above takes the "already in effect" branch and this line never
+            # runs. `--batch` already suppresses the prompting it guarded against.
+            if patch -p1 -d "$RUSTY_V8_SRC" --batch --forward < "$pf"; then
                 # confirm it actually took
                 if grep -qF "$sentinel" "$RUSTY_V8_SRC/$tgt" 2>/dev/null; then
                     echo "  ✓ applied $(basename "$pf")"
