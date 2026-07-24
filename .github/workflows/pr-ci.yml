@@ -318,6 +318,14 @@ jobs:
           bash scripts/build-aar.sh --product-profile full debug arm64-v8a x86_64
           bash scripts/build-aar.sh --product-profile slim debug arm64-v8a x86_64
 
+      # A symbol the platform only added after API 26 makes the whole libmigo.so
+      # fail to dlopen on a floor device, and that is invisible on the newer
+      # emulators and phones we test on. This checks every strong import against
+      # the NDK's own API-26 stub libraries, so it needs the freshly built .so
+      # (both ABIs land under engine/jniLibs/ from the step above).
+      - name: Android minimum-API symbol floor
+        run: bash scripts/test-android-symbol-floor.sh
+
       - name: Analyze AAR size report
         run: |
           python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-full-debug.aar \

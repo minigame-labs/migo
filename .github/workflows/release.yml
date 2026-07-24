@@ -260,6 +260,12 @@ jobs:
           bash scripts/build-aar.sh --product-profile full release
           bash scripts/build-aar.sh --product-profile slim release
 
+      # No release may ship a libmigo.so that cannot dlopen on the API 26 floor
+      # Migo claims to support. Checks every strong import against the NDK's
+      # API-26 stub libraries; see scripts/test-android-symbol-floor.sh.
+      - name: Android minimum-API symbol floor
+        run: bash scripts/test-android-symbol-floor.sh
+
       - name: Analyze AAR size report
         run: |
           python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-full-release.aar \
