@@ -104,9 +104,25 @@ pub mod services;
 
 pub use runtime::vsync::send_vsync;
 pub use runtime::{
-    HostIngress, HostIngressSendError, SpawnedSurfaceHost, host_ingress, lease_surface,
-    lease_surface_tracked, lease_surface_with_resource, retire_surface, send_command_to_host,
-    send_critical_command_to_host, shutdown_host, spawn_host_thread, spawn_host_thread_tracked,
+    // Exported because it is already part of the public signature of
+    // `host_ingress`, `send_command_to_host` and `shutdown_host`. Without it a
+    // caller cannot name the type those functions take, which pushes hosts into
+    // guessing a width and writing a cast -- and a cast that guesses wrong
+    // truncates silently instead of failing to compile.
+    HostId,
+    HostIngress,
+    HostIngressSendError,
+    SpawnedSurfaceHost,
+    host_ingress,
+    lease_surface,
+    lease_surface_tracked,
+    lease_surface_with_resource,
+    retire_surface,
+    send_command_to_host,
+    send_critical_command_to_host,
+    shutdown_host,
+    spawn_host_thread,
+    spawn_host_thread_tracked,
 };
 pub use services::{DeviceServiceProvider, FrameClock, HostNotifier, PlatformServices};
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]

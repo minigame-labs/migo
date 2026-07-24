@@ -96,9 +96,16 @@ ADB="${ADB:-$HOME/Android/Sdk/platform-tools/adb}"
 
 V8_ARCHIVE="$ENGINE/third_party/rusty_v8/$V8_DIR/librusty_v8.a"
 V8_BINDING="$ENGINE/third_party/rusty_v8/$V8_DIR/src_binding.rs"
-[[ -f "$V8_ARCHIVE" ]] || die "android V8 archive missing: $V8_ARCHIVE (git lfs pull?)"
+# The archives are build products fetched from a release asset, not tracked, so
+# a fresh checkout legitimately has none. Name the command that gets them:
+# pointing at LFS, which this repository no longer uses, sends the reader after
+# a mechanism that is gone.
+[[ -f "$V8_ARCHIVE" ]] || die "android V8 archive missing: $V8_ARCHIVE (run: bash scripts/fetch-v8-archives.sh)"
 # Guard against an unresolved Git LFS pointer (a ~130-byte text stub).
-[[ "$(stat -c %s "$V8_ARCHIVE")" -gt 1000000 ]] || die "V8 archive looks like an unresolved LFS pointer: $V8_ARCHIVE (run: git lfs pull)"
+# A truncated or partial download is the failure this catches now that the
+# archive arrives over HTTP rather than as an LFS pointer; fetch-v8-archives.sh
+# verifies the sha256, so reaching here with a small file means it was bypassed.
+[[ "$(stat -c %s "$V8_ARCHIVE")" -gt 1000000 ]] || die "V8 archive is too small to be real: $V8_ARCHIVE (run: bash scripts/fetch-v8-archives.sh)"
 
 LIBCXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$LIBCXX_TRIPLE/libc++_shared.so"
 [[ -f "$LIBCXX" ]] || die "libc++_shared.so not found: $LIBCXX"

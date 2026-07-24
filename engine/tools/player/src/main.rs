@@ -24,6 +24,8 @@ mod x11_window;
 
 use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
+#[cfg(target_os = "windows")]
+use migo_core::{HostId, host_ingress};
 use migo_core::{PlatformServices, send_command_to_host, shutdown_host, spawn_host_thread};
 #[cfg(target_os = "linux")]
 use platform::linux::platform::LinuxPlatform as HostPlatform;
@@ -39,6 +41,8 @@ use platform::windows::presenter::{
     WindowsHwndSurface, WindowsOffscreenSurface as OffscreenSurface,
     windows_graphics_platform as offscreen_graphics_platform, windows_hwnd_graphics_platform,
 };
+#[cfg(target_os = "windows")]
+use shared::protocol::host_cmd::{TouchData, TouchPoint, TouchType};
 use shared::{config::InitOptions, protocol::host_cmd::HostCommand, surface::SurfaceRef};
 
 #[cfg(target_os = "windows")]
@@ -229,7 +233,7 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     run_for(&mut window, Duration::from_secs(secs.max(4)));
     #[cfg(target_os = "windows")]
-    run_for(&mut window, Duration::from_secs(secs.max(4)));
+    run_for(&mut window, Duration::from_secs(secs.max(4)), host_id);
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     run_for(Duration::from_secs(secs.max(4)));
     match graphics::frame_capture::take() {
@@ -278,10 +282,26 @@ fn run_for(window: &mut Option<X11Window>, total: Duration) {
 
 /// Same contract as the Linux one, over the Win32 message queue.
 #[cfg(target_os = "windows")]
-fn run_for(window: &mut Option<Win32Window>, total: Duration) {
+fn run_for(window: &mut Option<Win32Window>, total: Duration, host_id: HostId) {
     let Some(window) = window.as_mut() else {
         thread::sleep(total);
         return;
+    };
+    // Acquired once, not per event. `send_command_to_host` takes a read lock on
+    // the global host map and clones the sender on every call; a mouse move can
+    // fire hundreds of times a second, so paying that per event would put a
+    // lock acquisition and an Arc clone on the input hot path. The ingress
+    // handle holds the sender directly, which is also how the C ABI delivers
+    // input.
+    let mut pointer = match host_ingress(host_id) {
+        Ok(ingress) => Some(PointerState::new(ingress)),
+        Err(e) => {
+            // Rendering still proves out without input, so this degrades rather
+            // than aborts -- but it is said plainly, because a window that
+            // silently ignores clicks looks exactly like content that does.
+            tracing::warn!("no input: host ingress unavailable ({e})");
+            None
+        }
     };
     let deadline = std::time::Instant::now() + total;
     while std::time::Instant::now() < deadline {
@@ -289,7 +309,125 @@ fn run_for(window: &mut Option<Win32Window>, total: Duration) {
             tracing::info!("window close requested; stopping early");
             return;
         }
+        if let Some(pointer) = pointer.as_mut() {
+            for event in window.drain_pointer() {
+                pointer.deliver(event);
+            }
+        }
         thread::sleep(EVENT_POLL);
+    }
+}
+
+/// Translates what the window saw into the two streams content may listen on.
+///
+/// Deliberately the same shape the Qt X11 view uses on Linux: a desktop host
+/// sends the mouse stream, and also maps the mouse to a single finger so that
+/// touch-only content -- which is nearly all wx content -- responds at all.
+///
+/// One physical click therefore reaches BOTH `onMouseDown` and `onTouchStart`.
+/// That matches Linux, but content listening on both (rare in wx, common in
+/// HTML5) acts on one press twice. The web platform avoids this by firing
+/// compatibility mouse events only after a touch sequence ends and letting
+/// `preventDefault` suppress them; this runtime has no such suppression, and
+/// adding it belongs at the engine level rather than being solved differently in
+/// every host.
+///
+/// Nothing here allocates per event: the touch batch goes through the
+/// preallocated pool, and the points array is reused in place.
+#[cfg(target_os = "windows")]
+struct PointerState {
+    ingress: migo_core::HostIngress,
+    buttons_held: u32,
+    points: [TouchPoint; 10],
+}
+
+#[cfg(target_os = "windows")]
+impl PointerState {
+    fn new(ingress: migo_core::HostIngress) -> Self {
+        Self {
+            ingress,
+            buttons_held: 0,
+            points: [TouchPoint::default(); 10],
+        }
+    }
+
+    fn deliver(&mut self, event: win32_window::PointerEvent) {
+        use win32_window::PointerEvent;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+
+        match event {
+            PointerEvent::Down { x, y, button } => {
+                let first = self.buttons_held == 0;
+                self.buttons_held |= 1 << button;
+                self.send(HostCommand::OnMouseDown {
+                    x,
+                    y,
+                    button,
+                    timestamp_ms: now,
+                });
+                if first {
+                    self.send_touch(TouchType::Start, x, y, now);
+                }
+            }
+            PointerEvent::Move { x, y } => {
+                self.send(HostCommand::OnMouseMove {
+                    x,
+                    y,
+                    button: 0,
+                    timestamp_ms: now,
+                });
+                // Touch has no hover: a finger that is not down cannot move, so
+                // free motion would be events no game reads.
+                if self.buttons_held != 0 {
+                    self.send_touch(TouchType::Move, x, y, now);
+                }
+            }
+            PointerEvent::Up { x, y, button } => {
+                self.buttons_held &= !(1 << button);
+                self.send(HostCommand::OnMouseUp {
+                    x,
+                    y,
+                    button,
+                    timestamp_ms: now,
+                });
+                // The finger lifts when the LAST button does: ending on the
+                // first release would strand a drag another button still holds.
+                if self.buttons_held == 0 {
+                    self.send_touch(TouchType::End, x, y, now);
+                }
+            }
+        }
+    }
+
+    fn send(&self, cmd: HostCommand) {
+        // A dropped input event is not worth ending the session over, but it is
+        // worth saying: silence looks identical to content ignoring input.
+        if let Err(e) = self.ingress.try_send(cmd) {
+            tracing::warn!("input not delivered: {e:?}");
+        }
+    }
+
+    fn send_touch(&mut self, kind: TouchType, x: f32, y: f32, now: f64) {
+        let ending = matches!(kind, TouchType::End | TouchType::Cancel);
+        self.points[0] = TouchPoint {
+            id: 0,
+            x,
+            y,
+            pressure: if ending { 0.0 } else { 1.0 },
+            // bit 0 = in changedTouches, bit 1 = removed from the surface.
+            flags: if ending { 0b11 } else { 0b01 },
+        };
+        if let Err(e) = self.ingress.try_send_touch(TouchData {
+            touch_type: kind,
+            count: 1,
+            points: self.points,
+            timestamp_ms: now as i64,
+        }) {
+            tracing::warn!("touch not delivered: {e:?}");
+        }
     }
 }
 

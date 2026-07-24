@@ -98,6 +98,13 @@ const PM_REMOVE: u32 = 0x0001;
 const WM_DESTROY: u32 = 0x0002;
 const WM_CLOSE: u32 = 0x0010;
 const WM_QUIT: u32 = 0x0012;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
 const CW_USEDEFAULT: i32 = i32::MIN;
 
 fn wide(s: &str) -> Vec<u16> {
@@ -120,6 +127,32 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, w: Wparam, l: Lparam) -
     }
 }
 
+/// What the window observed, in the window's own terms.
+///
+/// This module stays free of engine types on purpose: it is the host's window,
+/// and translating these into engine commands is the host's job, one layer up.
+/// Keeping the translation out of here is what lets the window be tested and
+/// reasoned about as plain Win32.
+#[derive(Clone, Copy, Debug)]
+pub enum PointerEvent {
+    /// `button` is in DOM `MouseEvent.button` order: 0 primary, 1 middle,
+    /// 2 secondary -- the same numbering wx documents for `onMouseDown`.
+    Down {
+        x: f32,
+        y: f32,
+        button: u32,
+    },
+    Move {
+        x: f32,
+        y: f32,
+    },
+    Up {
+        x: f32,
+        y: f32,
+        button: u32,
+    },
+}
+
 /// A shown, host-owned window. Dropping it destroys the native window, so it
 /// must outlive the engine session that renders into it.
 pub struct Win32Window {
@@ -127,6 +160,7 @@ pub struct Win32Window {
     width: u32,
     height: u32,
     closing: bool,
+    pointer: Vec<PointerEvent>,
 }
 
 impl Win32Window {
@@ -201,8 +235,38 @@ impl Win32Window {
                 width: w,
                 height: h,
                 closing: false,
+                pointer: Vec::new(),
             })
         }
+    }
+
+    /// Note what a pointer message reported, for the caller to drain.
+    ///
+    /// Mouse coordinates arrive in the low and high words of `lParam`, as signed
+    /// client-area pixels -- signed because a drag that leaves the window keeps
+    /// reporting, and treating them as unsigned turns a cursor just above the
+    /// client area into a coordinate near 65535.
+    fn record_pointer(&mut self, msg: &Msg) {
+        let x = ((msg.l_param & 0xFFFF) as u16) as i16 as f32;
+        let y = (((msg.l_param >> 16) & 0xFFFF) as u16) as i16 as f32;
+        // DOM button ordinals, which is also what wx documents: 0 left,
+        // 1 middle, 2 right. Win32 has a message per button rather than a code.
+        let event = match msg.message {
+            WM_MOUSEMOVE => PointerEvent::Move { x, y },
+            WM_LBUTTONDOWN => PointerEvent::Down { x, y, button: 0 },
+            WM_MBUTTONDOWN => PointerEvent::Down { x, y, button: 1 },
+            WM_RBUTTONDOWN => PointerEvent::Down { x, y, button: 2 },
+            WM_LBUTTONUP => PointerEvent::Up { x, y, button: 0 },
+            WM_MBUTTONUP => PointerEvent::Up { x, y, button: 1 },
+            WM_RBUTTONUP => PointerEvent::Up { x, y, button: 2 },
+            _ => return,
+        };
+        self.pointer.push(event);
+    }
+
+    /// Take the pointer events seen since the last call.
+    pub fn drain_pointer(&mut self) -> Vec<PointerEvent> {
+        std::mem::take(&mut self.pointer)
     }
 
     /// The `HWND`, for `WindowsHwndSurface`.
@@ -233,6 +297,7 @@ impl Win32Window {
                     self.closing = true;
                     return false;
                 }
+                self.record_pointer(&msg);
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }

@@ -40,8 +40,33 @@ function offMouseMove(listener) {
     _mouseMove.off(listener);
 }
 
+// wx's onMouseMove carries movementX/movementY, the offset from the previous
+// move. It is derived here rather than in each host: every host already sends
+// consecutive positions, so computing it once keeps Android, Linux and Windows
+// from arriving at three different answers, and there is no pointer lock in this
+// runtime -- the one case where the cursor stops moving but movement must still
+// be reported, and the only case a host could answer and this cannot.
+//
+// The position is not reset when the pointer leaves and re-enters. DOM
+// movementX is defined as the difference from the previous event's position and
+// browsers do report that jump, so clearing it here would be this runtime
+// inventing a behaviour rather than matching the platform content expects.
+let _lastMoveX = null;
+let _lastMoveY = null;
+
 function _internalTriggerMouseMove(x, y, button, timeStamp) {
-    _mouseMove.trigger({ x: x, y: y, button: button, timeStamp: timeStamp });
+    const movementX = _lastMoveX === null ? 0 : x - _lastMoveX;
+    const movementY = _lastMoveY === null ? 0 : y - _lastMoveY;
+    _lastMoveX = x;
+    _lastMoveY = y;
+    _mouseMove.trigger({
+        x: x,
+        y: y,
+        button: button,
+        movementX: movementX,
+        movementY: movementY,
+        timeStamp: timeStamp,
+    });
 }
 
 // ---- Mouse Up ----
