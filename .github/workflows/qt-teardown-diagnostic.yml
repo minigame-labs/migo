@@ -43,14 +43,23 @@ jobs:
           set -uo pipefail
           ulimit -c unlimited
           # Only the gate's exact sequence reproduces the teardown crash; a
-          # standalone loop does not. Run the real script but keep its mktemp
-          # build dir (its EXIT trap would otherwise delete the crashing binary
-          # before it can be symbolized), and steer that dir + the core file to
-          # known, absolute locations.
+          # standalone loop does not. Edit the script in place (disposable CI
+          # checkout) rather than copying it -- the gate derives its source root
+          # from its own path, so a copy resolves the wrong root. Keep its mktemp
+          # build dir (the EXIT trap would delete the crashing binary before it
+          # can be symbolized) and steer that dir + the core to known locations.
           mkdir -p "$PWD/gatetmp"
-          cp scripts/test-linux-qt-host-kit.sh "$PWD/gate.sh"
-          sed -i 's/^trap cleanup EXIT$/: # cleanup trap disabled for diagnosis/' "$PWD/gate.sh"
-          TMPDIR="$PWD/gatetmp" bash "$PWD/gate.sh" --sanitize || echo "gate exited non-zero (expected on crash)"
+          sed -i 's/^trap cleanup EXIT$/: # cleanup trap disabled for diagnosis/' \
+            scripts/test-linux-qt-host-kit.sh
+          # The crash is intermittent; loop the whole gate until a core appears.
+          for attempt in 1 2 3 4 5; do
+            echo "=== gate attempt $attempt ==="
+            TMPDIR="$PWD/gatetmp" bash scripts/test-linux-qt-host-kit.sh --sanitize \
+              && echo "gate attempt $attempt passed" \
+              || echo "gate attempt $attempt exited non-zero"
+            core=$(ls -1 "$PWD"/core.* 2>/dev/null | head -n1 || true)
+            [ -n "$core" ] && { echo "core appeared after attempt $attempt"; break; }
+          done
           core=$(ls -1 "$PWD"/core.* 2>/dev/null | head -n1 || true)
           echo "core=$core" | tee core-path.txt
           find "$PWD/gatetmp" -type f -name 'migo-qt-*-test' 2>/dev/null | tee bins.txt
