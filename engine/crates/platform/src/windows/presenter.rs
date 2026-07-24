@@ -33,8 +33,8 @@ use shared::{
 /// ANGLE's EGL entry point on Windows.
 ///
 /// Loaded by plain name so the normal Windows search order applies and the host
-/// decides which ANGLE it ships, the same delegation Linux makes by loading
-/// `libEGL.so.1` rather than a pinned path.
+/// decides which ANGLE it ships, the same delegation Linux makes by loading its
+/// EGL runtime by bare soname rather than a pinned absolute path.
 const WINDOWS_EGL_LIBRARY: &str = "libEGL.dll";
 
 /// Backend identity for every surface and provider in this module.
