@@ -25,7 +25,6 @@ use skia_safe::{
     Surface as SkSurface, TileMode,
     gpu::{
         self, DirectContext, SurfaceOrigin, backend_render_targets, direct_contexts, gl as sk_gl,
-        interfaces,
     },
 };
 
@@ -273,6 +272,11 @@ pub mod gr_state_bits {
 pub struct Canvas2DContext {
     pub gr_ctx: DirectContext,
     pub surface: SkSurface,
+    /// The assembled GL interface this context's `GrDirectContext` was built
+    /// from, kept so [`Canvas2DContext::resize`] can rebuild the context
+    /// without needing the entry-point loader threaded back in. It is
+    /// reference-counted on the Skia side, so holding it costs a refcount.
+    interface: sk_gl::Interface,
     pub renderer: Canvas2DRenderer,
     pub width: u32,
     pub height: u32,
@@ -311,9 +315,47 @@ impl Canvas2DContext {
     ///
     /// Returns `None` if Skia could not build a GL interface for the
     /// current EGL context — usually indicates a driver issue on device.
-    pub fn new(fbo_id: u32, width: u32, height: u32, kind: FboKind) -> Option<Self> {
-        let interface = interfaces::make_egl()?;
-        let mut gr_ctx = direct_contexts::make_gl(interface, None)?;
+    ///
+    /// `load_gl` resolves a GL entry point. It must come from the *same* EGL
+    /// implementation the caller injected for this manager, which is why it is
+    /// a parameter rather than something Skia looks up for itself: Skia's own
+    /// `interfaces::make_egl()` calls whichever `eglGetProcAddress` Skia was
+    /// linked against, and on a host that supplies its own EGL (the Linux X11
+    /// and Wayland presenters, or a test double) that is not necessarily the
+    /// one Migo is driving. Assembling the interface from the injected loader
+    /// makes both halves of the process agree by construction.
+    ///
+    /// It also removes Skia's need to link EGL at all, which is what lets this
+    /// crate link on Windows: Skia's GL-interface selection is an if/else-if
+    /// chain where `skia_use_egl` makes the Windows branch unreachable, while
+    /// skia-bindings emits its `GrGLInterfaces::MakeWin` wrapper on every
+    /// Windows build regardless — an unresolvable pair for as long as we asked
+    /// Skia for the EGL interface.
+    pub fn new(
+        fbo_id: u32,
+        width: u32,
+        height: u32,
+        kind: FboKind,
+        load_gl: &dyn Fn(&str) -> *const std::ffi::c_void,
+    ) -> Option<Self> {
+        let interface = sk_gl::Interface::new_load_with(|symbol| load_gl(symbol))?;
+        Self::with_interface(interface, fbo_id, width, height, kind)
+    }
+
+    /// Build a context around an already-assembled GL interface.
+    ///
+    /// Split out so `resize` can rebuild the `GrDirectContext` from the
+    /// interface this context already holds. Re-assembling one there would mean
+    /// carrying the loader through every resize call site, across borrows of
+    /// the canvas manager that the entry-point table is a sibling field of.
+    fn with_interface(
+        interface: sk_gl::Interface,
+        fbo_id: u32,
+        width: u32,
+        height: u32,
+        kind: FboKind,
+    ) -> Option<Self> {
+        let mut gr_ctx = direct_contexts::make_gl(interface.clone(), None)?;
 
         let fb_info = sk_gl::FramebufferInfo {
             fboid: fbo_id,
@@ -356,6 +398,7 @@ impl Canvas2DContext {
         Some(Self {
             gr_ctx,
             surface,
+            interface,
             renderer: Canvas2DRenderer::new(),
             width,
             height,
@@ -674,7 +717,9 @@ impl Canvas2DContext {
         height: u32,
         image_store: &mut ImageStore,
     ) -> bool {
-        let Some(new_self) = Self::new(fbo_id, width, height, self.kind) else {
+        let Some(new_self) =
+            Self::with_interface(self.interface.clone(), fbo_id, width, height, self.kind)
+        else {
             return false;
         };
         // Drop every SkImage wrapper this context produced: they hold

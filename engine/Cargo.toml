@@ -81,7 +81,12 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 # feature set, not here, so downstream crates can build without
 # it by passing `--no-default-features --features external_icudtl`
 # (see `crates/graphics/Cargo.toml`).
-skia-safe = { version = "0.93", default-features = false, features = ["gl", "egl", "textlayout", "binary-cache", "embed-freetype"] }
+# `egl` is deliberately absent: Migo assembles Skia's GL interface from the
+# EGL implementation it injects itself (see Canvas2DContext::new), so Skia
+# must not link an EGL of its own. Keeping it would also make Skia's
+# GL-interface selection skip the Windows branch, leaving skia-bindings'
+# unconditional MakeWin wrapper unresolvable there.
+skia-safe = { version = "0.93", default-features = false, features = ["gl", "textlayout", "binary-cache", "embed-freetype"] }
 
 # Image decoding - only enable formats actually needed
 # Removing unused formats can save 500KB-1MB

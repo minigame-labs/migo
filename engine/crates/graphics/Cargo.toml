@@ -56,3 +56,12 @@ libc = "0.2"
 # PNG encode/decode for golden image pixel-diff tests.
 # Avoid the workspace `image` crate (drops PNG in release profile).
 png = "0.17"
+
+# Windows only. skia-bindings always compiles its jpeg/pdf/pathops wrappers,
+# but Skia builds pathops only as a dependency of optional("pdf"), so with pdf
+# off those wrappers reference symbols that do not exist. Unix hides this with
+# --gc-sections; MSVC cannot, because /OPT:REF discards unreferenced COMDATs
+# only after symbol resolution. Enabling pdf here (and nowhere else, so Android
+# keeps the smaller Skia) makes the symbols real instead of hidden.
+[target.'cfg(windows)'.dependencies]
+skia-safe = { workspace = true, features = ["pdf"] }

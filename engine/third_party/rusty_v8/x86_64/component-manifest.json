@@ -1,6 +1,6 @@
 {
   "schema": "migo-v8-component-manifest/v1",
-  "component_id": "124ce252550869bac85888d0f61dd4d16f0a2ca0e96795e17f7c81d624a3de3f",
+  "component_id": "415e8b8d33bde71a84a988f2d6054148c98cc54c79ef029698f495a8b0b63481",
   "target": {
     "triple": "x86_64-linux-android",
     "os": "android",
@@ -51,7 +51,7 @@
       },
       {
         "id": "0003-custom-libcxx-for-snapshot-toolchain",
-        "sha256": "fea891a5b0558976b4b8e76fef8dabbd3f78c51e5b09c3632ad40f882f3334b3"
+        "sha256": "91322bd709eac0aee6e1c5d19db9e13b2db9953172f92359fa147e334de62e2e"
       }
     ]
   },
