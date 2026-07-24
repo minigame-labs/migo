@@ -1,0 +1,94 @@
+# Diagnostic-only workflow: capture a backtrace for the intermittent SIGSEGV the
+# Linux Qt Host Kit sanitize gate hits at process teardown. The crash reproduces
+# only under the gate's build+run load and kills the process via SIGSEGV's default
+# action (no ASan/user handler runs), so a real core dump is the only way to see
+# the faulting frame. Runs on demand; not part of pr-ci/release.
+name: Qt teardown diagnostic
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - "diag/qt-teardown**"
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (without LFS)
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Install dependencies (+ gdb and Qt debug symbols)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build g++ gdb ripgrep xvfb xauth \
+            qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins \
+            libx11-dev libxkbcommon-x11-dev libxcb-cursor0
+          # Qt debug symbols are best-effort: the ddebs mirror is not always
+          # reachable, and a bare libQt backtrace still names the frame.
+          sudo apt-get install -y libqt6core6-dbgsym libqt6gui6-dbgsym || true
+
+      - name: Enable core dumps to a known path
+        run: |
+          sudo sysctl -w kernel.core_pattern="$PWD/core.%e.%p"
+          ulimit -c unlimited
+          cat /proc/sys/kernel/core_pattern
+
+      - name: Build the sanitize test binaries (mirrors the gate)
+        run: |
+          set -euxo pipefail
+          FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g"
+          cmake -S platforms/linux/host-kit/tests -B build-san -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="$FLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS="$FLAGS" \
+            -DMIGO_REPOSITORY_ROOT="$PWD"
+          cmake --build build-san --parallel
+
+      - name: Reproduce under load and capture a core
+        run: |
+          set -uo pipefail
+          ulimit -c unlimited
+          BIN=build-san/migo-qt-x11-view-test
+          # Background CPU/scheduler load to mimic the gate's build+run pressure,
+          # which is what makes the teardown race deterministic.
+          for _ in $(seq 1 "$(nproc)"); do ( yes >/dev/null & ) ; done
+          found=""
+          for i in $(seq 1 60); do
+            env QT_QPA_PLATFORM=offscreen ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 "$BIN" >/dev/null 2>&1 || true
+            xvfb-run -a env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb \
+              ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 "$BIN" >/dev/null 2>&1 || true
+            core=$(ls -1 core.* 2>/dev/null | head -n1 || true)
+            if [ -n "$core" ]; then found="$core"; echo "captured core on iteration $i: $core"; break; fi
+          done
+          pkill yes || true
+          if [ -z "$found" ]; then
+            echo "no core captured in 60 iterations"; exit 0
+          fi
+          echo "$found" > core-path.txt
+
+      - name: Symbolize the core
+        if: always()
+        run: |
+          core=$(cat core-path.txt 2>/dev/null || true)
+          [ -z "$core" ] && { echo "no core to symbolize"; exit 0; }
+          echo "=== gdb backtrace for $core ==="
+          gdb -batch -nx \
+            -ex "set pagination off" \
+            -ex "thread apply all bt" \
+            -ex "bt full" \
+            build-san/migo-qt-x11-view-test "$core" 2>&1 | head -200
+
+      - name: Upload core and binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-teardown-core
+          path: |
+            core.*
+            build-san/migo-qt-x11-view-test
+          if-no-files-found: ignore
