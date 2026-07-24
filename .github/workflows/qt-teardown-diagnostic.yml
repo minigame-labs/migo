@@ -1,0 +1,92 @@
+# Diagnostic-only workflow: capture a backtrace for the intermittent SIGSEGV the
+# Linux Qt Host Kit sanitize gate hits at process teardown. The crash reproduces
+# only under the gate's build+run load and kills the process via SIGSEGV's default
+# action (no ASan/user handler runs), so a real core dump is the only way to see
+# the faulting frame. Runs on demand; not part of pr-ci/release.
+name: Qt teardown diagnostic
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - "diag/qt-teardown**"
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (without LFS)
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+
+      - name: Install dependencies (+ gdb and Qt debug symbols)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build g++ gdb ripgrep xvfb xauth \
+            qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins \
+            libx11-dev libxkbcommon-x11-dev libxcb-cursor0
+          # Qt debug symbols are best-effort: the ddebs mirror is not always
+          # reachable, and a bare libQt backtrace still names the frame.
+          sudo apt-get install -y libqt6core6-dbgsym libqt6gui6-dbgsym || true
+
+      - name: Enable core dumps to a known path
+        run: |
+          sudo sysctl -w kernel.core_pattern="$PWD/core.%e.%p"
+          ulimit -c unlimited
+          cat /proc/sys/kernel/core_pattern
+
+      - name: Run the real gate (cleanup neutered) so a crash preserves its binary
+        run: |
+          set -uo pipefail
+          ulimit -c unlimited
+          # Only the gate's exact sequence reproduces the teardown crash; a
+          # standalone loop does not. Edit the script in place (disposable CI
+          # checkout) rather than copying it -- the gate derives its source root
+          # from its own path, so a copy resolves the wrong root. Keep its mktemp
+          # build dir (the EXIT trap would delete the crashing binary before it
+          # can be symbolized) and steer that dir + the core to known locations.
+          mkdir -p "$PWD/gatetmp"
+          sed -i 's/^trap cleanup EXIT$/: # cleanup trap disabled for diagnosis/' \
+            scripts/test-linux-qt-host-kit.sh
+          # The crash is intermittent; loop the whole gate until a core appears.
+          for attempt in 1 2 3 4 5; do
+            echo "=== gate attempt $attempt ==="
+            TMPDIR="$PWD/gatetmp" bash scripts/test-linux-qt-host-kit.sh --sanitize \
+              && echo "gate attempt $attempt passed" \
+              || echo "gate attempt $attempt exited non-zero"
+            core=$(ls -1 "$PWD"/core.* 2>/dev/null | head -n1 || true)
+            [ -n "$core" ] && { echo "core appeared after attempt $attempt"; break; }
+          done
+          core=$(ls -1 "$PWD"/core.* 2>/dev/null | head -n1 || true)
+          echo "core=$core" | tee core-path.txt
+          find "$PWD/gatetmp" -type f -name 'migo-qt-*-test' 2>/dev/null | tee bins.txt
+
+      - name: Symbolize the core
+        if: always()
+        run: |
+          core=$(sed -n 's/^core=//p' core-path.txt 2>/dev/null || true)
+          if [ -z "$core" ] || [ ! -f "$core" ]; then
+            echo "no core captured — the gate did not crash this run"; exit 0
+          fi
+          # %e in the core name is the crashing executable's basename.
+          exe_base=$(basename "$core" | sed -E 's/^core\.([^.]+)\..*/\1/')
+          bin=$(grep "/$exe_base$" bins.txt | head -n1 || true)
+          echo "=== crashing exe: $exe_base -> $bin ; core: $core ==="
+          gdb -batch -nx \
+            -ex "set pagination off" \
+            -ex "thread apply all bt" \
+            -ex "bt full" \
+            "$bin" "$core" 2>&1 | head -250
+
+      - name: Upload core and binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-teardown-core
+          path: |
+            core.*
+            gatetmp/**/migo-qt-*-test
+          if-no-files-found: ignore
