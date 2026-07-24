@@ -66,9 +66,12 @@ __pycache__/
 # Staged Linux SDK package (scripts/build-linux-sdk.sh output)
 dist/
 
-# Linux SDK V8 archive: a build product of scripts/build-v8-linux.sh.
-# Not tracked -- the repo's LFS quota is already exhausted, and the script plus
-# component-manifest.json reproduce and describe it.
+# V8 archives for every ABI are build products, not source. None are tracked:
+# they were what exhausted the repo's LFS quota and took CI down. Each is
+# reproduced by scripts/build-v8-<os>.sh, described by the committed
+# component-manifest.json beside it, and fetched in CI by
+# scripts/fetch-v8-archives.sh, which verifies the sha256 that manifest records.
+engine/third_party/rusty_v8/*/librusty_v8.a
 engine/third_party/rusty_v8/x86_64-linux-gnu/librusty_v8.a
 
 # Windows V8 build products of scripts/build-v8-windows.sh, same policy as the
