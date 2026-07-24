@@ -191,7 +191,12 @@ fn run(bundle_dir: &PathBuf, secs: u64, windowed: bool) -> Result<(), String> {
     let host_kit: Arc<dyn PlatformServices> = Arc::new(HostPlatform::new());
 
     let mode = if windowed { "window" } else { "offscreen" };
-    tracing::info!("spawning host thread ({SURFACE_W}x{SURFACE_H} {mode})");
+    // The requested size is not always what the surface got: a window manager
+    // may clamp a frame that does not fit the display, and the engine renders
+    // into the client area it actually has. Logging the constants instead of the
+    // real extent made the line disagree with the pixels captured from it.
+    let (surface_w, surface_h) = surface.size();
+    tracing::info!("spawning host thread ({surface_w}x{surface_h} {mode})");
     let host_id = spawn_host_thread(surface, graphics_platform, host_kit, opt)
         .map_err(|e| format!("spawn_host_thread: {e:?}"))?;
     tracing::info!("host {host_id} spawned; loading game");
