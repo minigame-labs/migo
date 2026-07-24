@@ -185,6 +185,7 @@ apply_windows_patches() {
     local specs=(
         "src/binding.cc|v8__register_host_callback|0005-*.patch"
         "BUILD.gn|shared_library(\"rusty_v8\")|0006-*.patch"
+        "src/V8.rs|register_host_callbacks_once|0007-*.patch"
     )
     local spec
     for spec in "${specs[@]}"; do
