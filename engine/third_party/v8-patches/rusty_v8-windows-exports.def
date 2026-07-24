@@ -651,4 +651,5 @@ EXPORTS
     v8__WeakCallbackInfo__GetIsolate
     v8__WeakCallbackInfo__GetParameter
     v8__WeakCallbackInfo__SetSecondPassCallback
-    v8__register_host_callbacks
+    v8__register_host_callback
+    v8__host_callbacks_ready

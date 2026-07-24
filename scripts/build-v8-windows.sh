@@ -183,7 +183,7 @@ EXPORTS_DEF="$PATCH_DIR/rusty_v8-windows-exports.def"
 apply_windows_patches() {
     # target_file|sentinel|patch_glob
     local specs=(
-        "src/binding.cc|v8__register_host_callbacks|0005-*.patch"
+        "src/binding.cc|v8__register_host_callback|0005-*.patch"
         "BUILD.gn|shared_library(\"rusty_v8\")|0006-*.patch"
     )
     local spec

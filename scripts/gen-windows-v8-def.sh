@@ -33,9 +33,10 @@ count="$(printf '%s\n' "$symbols" | grep -c .)"
   printf 'LIBRARY rusty_v8\n'
   printf 'EXPORTS\n'
   printf '%s\n' "$symbols" | sed 's/^/    /'
-  # Added by the migo host-callback-registration patch, so it is not in the
+  # Added by the migo host-callback-registration patch, so neither is in the
   # archive the list above is read from.
-  printf '    v8__register_host_callbacks\n'
+  printf '    v8__register_host_callback\n'
+  printf '    v8__host_callbacks_ready\n'
 } > "$OUT"
 
-printf 'wrote %s (%s exports + v8__register_host_callbacks)\n' "$OUT" "$count"
+printf 'wrote %s (%s exports + 2 registration entry points)\n' "$OUT" "$count"

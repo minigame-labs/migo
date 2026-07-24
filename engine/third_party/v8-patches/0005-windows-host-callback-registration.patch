@@ -98,7 +98,7 @@
 +// no host module to import them from -- naming one would tie the DLL to a single
 +// executable, and the cargo test binaries have hashed names. So on Windows the
 +// callbacks arrive through a table the host fills in via
-+// `v8__register_host_callbacks` (defined at the end of this file) before V8 is
++// `v8__register_host_callback` (defined at the end of this file) before V8 is
 +// initialised, and the call sites below reach them through that table.
 +//
 +// Everywhere else the direct externs stay exactly as they were: on ELF targets
@@ -227,122 +227,117 @@
  
  RustObj::~RustObj() { rusty_v8_RustObj_drop(this); }
  
-@@ -4094,3 +4255,118 @@
+@@ -4094,3 +4255,113 @@
  }
  
  }  // extern "C"
 +
 +#if defined(_WIN32)
 +
++// Included here rather than with the headers at the top of the file so that
++// nothing about the non-Windows translation unit changes.
++#include <cstring>
++
 +// MIGO: the Windows entry point for the callback table described at the
-+// ValueSerializer delegate above. Placed last so every type it mentions is
-+// already declared. The host must call this once, before it initialises V8 and
-+// before any ValueSerializer, ValueDeserializer or cppgc-managed Rust object is
-+// used; the pointers start null, so calling it late faults rather than silently
-+// misbehaving.
++// ValueSerializer delegate above. Placed last so every slot it mentions is
++// already declared.
 +//
-+// Member order is part of the ABI between this DLL and the Rust side -- the
-+// matching #[repr(C)] struct lists them in exactly this order.
-+struct v8__HostCallbacks {
-+  void (*value_serializer_throw_data_clone_error)(
-+      v8::ValueSerializer::Delegate*, v8::Local<v8::String>);
-+  bool (*value_serializer_has_custom_host_object)(
-+      v8::ValueSerializer::Delegate*, v8::Isolate*);
-+  MaybeBool (*value_serializer_is_host_object)(v8::ValueSerializer::Delegate*,
-+                                               v8::Isolate*,
-+                                               v8::Local<v8::Object>);
-+  MaybeBool (*value_serializer_write_host_object)(
-+      v8::ValueSerializer::Delegate*, v8::Isolate*, v8::Local<v8::Object>);
-+  bool (*value_serializer_get_shared_array_buffer_id)(
-+      v8::ValueSerializer::Delegate*, v8::Isolate*,
-+      v8::Local<v8::SharedArrayBuffer>, uint32_t*);
-+  bool (*value_serializer_get_wasm_module_transfer_id)(
-+      v8::ValueSerializer::Delegate*, v8::Isolate*,
-+      v8::Local<v8::WasmModuleObject>, uint32_t*);
-+  void* (*value_serializer_reallocate_buffer_memory)(
-+      v8::ValueSerializer::Delegate*, void*, size_t, size_t*);
-+  void (*value_serializer_free_buffer_memory)(v8::ValueSerializer::Delegate*,
-+                                              void*);
-+  v8::Object* (*value_deserializer_read_host_object)(
-+      v8::ValueDeserializer::Delegate*, v8::Isolate*);
-+  v8::SharedArrayBuffer* (*value_deserializer_get_shared_array_buffer_from_id)(
-+      v8::ValueDeserializer::Delegate*, v8::Isolate*, uint32_t);
-+  v8::WasmModuleObject* (*value_deserializer_get_wasm_module_from_id)(
-+      v8::ValueDeserializer::Delegate*, v8::Isolate*, uint32_t);
-+  void (*rust_obj_trace)(const RustObj*, cppgc::Visitor*);
-+  const char* (*rust_obj_get_name)(const RustObj*);
-+  void (*rust_obj_drop)(RustObj*);
-+  void (*inspector_channel_send_response)(v8_inspector::V8Inspector::Channel*,
-+                                          int, v8_inspector::StringBuffer*);
-+  void (*inspector_channel_send_notification)(
-+      v8_inspector::V8Inspector::Channel*, v8_inspector::StringBuffer*);
-+  void (*inspector_channel_flush_protocol_notifications)(
-+      v8_inspector::V8Inspector::Channel*);
-+  int64_t (*inspector_client_generate_unique_id)(
-+      v8_inspector::V8InspectorClient*);
-+  void (*inspector_client_run_message_loop_on_pause)(
-+      v8_inspector::V8InspectorClient*, int);
-+  void (*inspector_client_quit_message_loop_on_pause)(
-+      v8_inspector::V8InspectorClient*);
-+  void (*inspector_client_run_if_waiting_for_debugger)(
-+      v8_inspector::V8InspectorClient*, int);
-+  void (*inspector_client_console_api_message)(
-+      v8_inspector::V8InspectorClient*, int, v8::Isolate::MessageErrorLevel,
-+      const v8_inspector::StringView&, const v8_inspector::StringView&,
-+      unsigned, unsigned, v8_inspector::V8StackTrace*);
-+  v8::Context* (*inspector_client_ensure_default_context_in_group)(
-+      v8_inspector::V8InspectorClient*, int);
-+  v8_inspector::StringBuffer* (*inspector_client_resource_name_to_url)(
-+      v8_inspector::V8InspectorClient*, const v8_inspector::StringView&);
++// Registration is BY NAME rather than by a struct of ordered fields. An ordered
++// struct would put the same 24 entries in two independently maintained lists --
++// this file and the Rust side -- where getting the order wrong compiles cleanly
++// on both sides and only shows up as a call through the wrong pointer at run
++// time. Keying on the symbol name removes that failure mode entirely: a name
++// that does not match any slot is reported to the caller instead of silently
++// binding to the wrong one, and `v8__host_callbacks_ready` lets the host assert
++// every slot was filled before it initialises V8.
++//
++// The host must register all of these before initialising V8 and before any
++// ValueSerializer, ValueDeserializer, inspector or cppgc-managed Rust object is
++// used. Slots start null, so using one early faults rather than misbehaving.
++namespace {
++
++struct HostCallbackSlot {
++  const char* name;
++  // Address of the function-pointer variable. Held as void* and written with
++  // memcpy: assigning through a `void**` alias of a differently typed function
++  // pointer would be undefined behaviour even where it happens to work.
++  void* slot;
 +};
 +
-+extern "C" void v8__register_host_callbacks(
-+    const struct v8__HostCallbacks* callbacks) {
-+  p_v8__ValueSerializer__Delegate__ThrowDataCloneError =
-+      callbacks->value_serializer_throw_data_clone_error;
-+  p_v8__ValueSerializer__Delegate__HasCustomHostObject =
-+      callbacks->value_serializer_has_custom_host_object;
-+  p_v8__ValueSerializer__Delegate__IsHostObject =
-+      callbacks->value_serializer_is_host_object;
-+  p_v8__ValueSerializer__Delegate__WriteHostObject =
-+      callbacks->value_serializer_write_host_object;
-+  p_v8__ValueSerializer__Delegate__GetSharedArrayBufferId =
-+      callbacks->value_serializer_get_shared_array_buffer_id;
-+  p_v8__ValueSerializer__Delegate__GetWasmModuleTransferId =
-+      callbacks->value_serializer_get_wasm_module_transfer_id;
-+  p_v8__ValueSerializer__Delegate__ReallocateBufferMemory =
-+      callbacks->value_serializer_reallocate_buffer_memory;
-+  p_v8__ValueSerializer__Delegate__FreeBufferMemory =
-+      callbacks->value_serializer_free_buffer_memory;
-+  p_v8__ValueDeserializer__Delegate__ReadHostObject =
-+      callbacks->value_deserializer_read_host_object;
-+  p_v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId =
-+      callbacks->value_deserializer_get_shared_array_buffer_from_id;
-+  p_v8__ValueDeserializer__Delegate__GetWasmModuleFromId =
-+      callbacks->value_deserializer_get_wasm_module_from_id;
-+  p_rusty_v8_RustObj_trace = callbacks->rust_obj_trace;
-+  p_rusty_v8_RustObj_get_name = callbacks->rust_obj_get_name;
-+  p_rusty_v8_RustObj_drop = callbacks->rust_obj_drop;
-+  p_v8_inspector__V8Inspector__Channel__BASE__sendResponse =
-+      callbacks->inspector_channel_send_response;
-+  p_v8_inspector__V8Inspector__Channel__BASE__sendNotification =
-+      callbacks->inspector_channel_send_notification;
-+  p_v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications =
-+      callbacks->inspector_channel_flush_protocol_notifications;
-+  p_v8_inspector__V8InspectorClient__BASE__generateUniqueId =
-+      callbacks->inspector_client_generate_unique_id;
-+  p_v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause =
-+      callbacks->inspector_client_run_message_loop_on_pause;
-+  p_v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause =
-+      callbacks->inspector_client_quit_message_loop_on_pause;
-+  p_v8_inspector__V8InspectorClient__BASE__runIfWaitingForDebugger =
-+      callbacks->inspector_client_run_if_waiting_for_debugger;
-+  p_v8_inspector__V8InspectorClient__BASE__consoleAPIMessage =
-+      callbacks->inspector_client_console_api_message;
-+  p_v8_inspector__V8InspectorClient__BASE__ensureDefaultContextInGroup =
-+      callbacks->inspector_client_ensure_default_context_in_group;
-+  p_v8_inspector__V8InspectorClient__BASE__resourceNameToUrl =
-+      callbacks->inspector_client_resource_name_to_url;
++const HostCallbackSlot kHostCallbackSlots[] = {
++    {"v8__ValueSerializer__Delegate__ThrowDataCloneError",
++     &p_v8__ValueSerializer__Delegate__ThrowDataCloneError},
++    {"v8__ValueSerializer__Delegate__HasCustomHostObject",
++     &p_v8__ValueSerializer__Delegate__HasCustomHostObject},
++    {"v8__ValueSerializer__Delegate__IsHostObject",
++     &p_v8__ValueSerializer__Delegate__IsHostObject},
++    {"v8__ValueSerializer__Delegate__WriteHostObject",
++     &p_v8__ValueSerializer__Delegate__WriteHostObject},
++    {"v8__ValueSerializer__Delegate__GetSharedArrayBufferId",
++     &p_v8__ValueSerializer__Delegate__GetSharedArrayBufferId},
++    {"v8__ValueSerializer__Delegate__GetWasmModuleTransferId",
++     &p_v8__ValueSerializer__Delegate__GetWasmModuleTransferId},
++    {"v8__ValueSerializer__Delegate__ReallocateBufferMemory",
++     &p_v8__ValueSerializer__Delegate__ReallocateBufferMemory},
++    {"v8__ValueSerializer__Delegate__FreeBufferMemory",
++     &p_v8__ValueSerializer__Delegate__FreeBufferMemory},
++    {"v8__ValueDeserializer__Delegate__ReadHostObject",
++     &p_v8__ValueDeserializer__Delegate__ReadHostObject},
++    {"v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId",
++     &p_v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId},
++    {"v8__ValueDeserializer__Delegate__GetWasmModuleFromId",
++     &p_v8__ValueDeserializer__Delegate__GetWasmModuleFromId},
++    {"rusty_v8_RustObj_trace", &p_rusty_v8_RustObj_trace},
++    {"rusty_v8_RustObj_get_name", &p_rusty_v8_RustObj_get_name},
++    {"rusty_v8_RustObj_drop", &p_rusty_v8_RustObj_drop},
++    {"v8_inspector__V8Inspector__Channel__BASE__sendResponse",
++     &p_v8_inspector__V8Inspector__Channel__BASE__sendResponse},
++    {"v8_inspector__V8Inspector__Channel__BASE__sendNotification",
++     &p_v8_inspector__V8Inspector__Channel__BASE__sendNotification},
++    {"v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications",
++     &p_v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications},
++    {"v8_inspector__V8InspectorClient__BASE__generateUniqueId",
++     &p_v8_inspector__V8InspectorClient__BASE__generateUniqueId},
++    {"v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause",
++     &p_v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause},
++    {"v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause",
++     &p_v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause},
++    {"v8_inspector__V8InspectorClient__BASE__runIfWaitingForDebugger",
++     &p_v8_inspector__V8InspectorClient__BASE__runIfWaitingForDebugger},
++    {"v8_inspector__V8InspectorClient__BASE__consoleAPIMessage",
++     &p_v8_inspector__V8InspectorClient__BASE__consoleAPIMessage},
++    {"v8_inspector__V8InspectorClient__BASE__ensureDefaultContextInGroup",
++     &p_v8_inspector__V8InspectorClient__BASE__ensureDefaultContextInGroup},
++    {"v8_inspector__V8InspectorClient__BASE__resourceNameToUrl",
++     &p_v8_inspector__V8InspectorClient__BASE__resourceNameToUrl},
++};
++
++}  // namespace
++
++// Returns 1 if `name` matched a slot, 0 otherwise. A 0 means the host and this
++// DLL disagree about the callback set and must be treated as fatal -- carrying
++// on would leave a null slot to be called later.
++extern "C" int v8__register_host_callback(const char* name, void* fn) {
++  if (name == nullptr || fn == nullptr) return 0;
++  for (const HostCallbackSlot& entry : kHostCallbackSlots) {
++    if (std::strcmp(entry.name, name) == 0) {
++      std::memcpy(entry.slot, &fn, sizeof fn);
++      return 1;
++    }
++  }
++  return 0;
++}
++
++// Returns 1 once every slot is bound. The host calls this after registering and
++// before initialising V8, so a callback added upstream but not yet supplied by
++// the host fails immediately instead of at the first serialization.
++extern "C" int v8__host_callbacks_ready(void) {
++  for (const HostCallbackSlot& entry : kHostCallbackSlots) {
++    void* bound = nullptr;
++    std::memcpy(&bound, entry.slot, sizeof bound);
++    if (bound == nullptr) return 0;
++  }
++  return 1;
 +}
 +
 +#endif  // defined(_WIN32)
