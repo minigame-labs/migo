@@ -10,14 +10,14 @@ use std::sync::Arc;
 use shared::protocol::io_cmd::MAX_READ_LENGTH;
 use shared::vfs::package::{PackageError, PackageIdentity, PackageWriter};
 
+#[cfg(feature = "rust-image-decode")]
+use crate::ingest_transcode::{is_transcodable_image, transcode_image};
 use crate::{
     pools::PoolError,
     scheduler::IoScheduler,
     task::{IoRequest, PriorityClass},
     zip_extract::ExtractBudget,
 };
-#[cfg(feature = "rust-image-decode")]
-use crate::ingest_transcode::{is_transcodable_image, transcode_image};
 
 // Without the image decoder there is nothing to transcode with, so the ingest
 // loop compiles to its original streaming-only form: `is_transcodable_image` is
@@ -367,9 +367,7 @@ mod tests {
         }
         let buffer = image::RgbaImage::from_raw(width, height, rgba).unwrap();
         let mut out = std::io::Cursor::new(Vec::new());
-        buffer
-            .write_to(&mut out, image::ImageFormat::Png)
-            .unwrap();
+        buffer.write_to(&mut out, image::ImageFormat::Png).unwrap();
         out.into_inner()
     }
 
@@ -403,14 +401,23 @@ mod tests {
         let names: Vec<String> = reader.entry_paths().map(|s| s.to_string()).collect();
 
         // The original survives (ES 2.0 / getImageData fallback).
-        assert!(names.iter().any(|n| n == "img/hero.png"), "names: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "img/hero.png"),
+            "names: {names:?}"
+        );
         // And the sidecar was produced next to it, on the companion path the
         // runtime probes first.
-        assert!(names.iter().any(|n| n == "img/hero.ktx2"), "names: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "img/hero.ktx2"),
+            "names: {names:?}"
+        );
 
         let ktx2 = reader.read_entry("img/hero.ktx2").unwrap();
         let parsed = crate::ktx2::parse_ktx2(&ktx2).expect("runtime parser accepts the sidecar");
-        assert_eq!(parsed.header.format, crate::ktx2::VkFormat::Etc2R8G8B8UnormBlock);
+        assert_eq!(
+            parsed.header.format,
+            crate::ktx2::VkFormat::Etc2R8G8B8UnormBlock
+        );
         assert_eq!((parsed.header.width, parsed.header.height), (32, 32));
     }
 

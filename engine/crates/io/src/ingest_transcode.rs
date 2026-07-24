@@ -12,7 +12,7 @@
 //! RGBA still resolve the original through the same companion list. The sidecar
 //! is an optimisation the runtime opts into per device, never a replacement.
 
-use crate::etc2::{encode_etc2_rgb, VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK};
+use crate::etc2::{VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, encode_etc2_rgb};
 use crate::fast_image_decoder::decode_image_fast;
 use crate::ktx2::write_ktx2;
 
@@ -83,7 +83,7 @@ pub(crate) fn transcode_image(name: &str, bytes: &[u8]) -> Option<TranscodedSide
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ktx2::{parse_ktx2, VkFormat};
+    use crate::ktx2::{VkFormat, parse_ktx2};
 
     fn png(width: u32, height: u32) -> Vec<u8> {
         let mut rgba = Vec::with_capacity((width * height * 4) as usize);

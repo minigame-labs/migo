@@ -8,12 +8,12 @@ mod fast_image_decoder;
 pub mod fs_ops;
 pub mod image_cache;
 pub mod image_ops;
-pub mod ktx2;
-pub mod kv_store;
-pub mod mmap_reader;
 #[cfg(feature = "zip-extract")]
 #[cfg(feature = "rust-image-decode")]
 mod ingest_transcode;
+pub mod ktx2;
+pub mod kv_store;
+pub mod mmap_reader;
 pub mod package_ingest;
 pub mod pools;
 pub mod scheduler;

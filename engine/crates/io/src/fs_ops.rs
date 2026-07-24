@@ -2044,7 +2044,10 @@ mod tests {
         // syscall rather than a hardcoded Unix value. This still guards the real
         // invariant: the wrapping layer must carry the OS errno through, negated,
         // and not drop or invent it.
-        let expected = -(std::fs::File::open(bad).unwrap_err().raw_os_error().unwrap());
+        let expected = -(std::fs::File::open(bad)
+            .unwrap_err()
+            .raw_os_error()
+            .unwrap());
         assert_eq!(err.errno, Some(expected), "errno not captured: {err:?}");
         assert!(err.errno.unwrap() < 0, "errno must be negative: {err:?}");
         assert_eq!(err.path.as_deref(), Some(bad));
@@ -2058,7 +2061,10 @@ mod tests {
         assert_eq!(err.code, ErrorCode::NotFound);
         // Platform-specific errno; derive ground truth from std (see
         // io_err_captures_errno_and_path_for_missing_file).
-        let expected = -(std::fs::remove_file(bad).unwrap_err().raw_os_error().unwrap());
+        let expected = -(std::fs::remove_file(bad)
+            .unwrap_err()
+            .raw_os_error()
+            .unwrap());
         assert_eq!(err.errno, Some(expected));
         assert_eq!(err.op, Some("unlink"));
         assert_eq!(err.path.as_deref(), Some(bad));
@@ -2071,7 +2077,10 @@ mod tests {
         let err = rename(src, dst).unwrap_err();
         // Platform-specific errno; derive ground truth from the same failing
         // std::fs::rename rather than hardcoding the Unix ENOENT value.
-        let expected = -(std::fs::rename(src, dst).unwrap_err().raw_os_error().unwrap());
+        let expected = -(std::fs::rename(src, dst)
+            .unwrap_err()
+            .raw_os_error()
+            .unwrap());
         assert_eq!(err.errno, Some(expected));
         assert_eq!(err.op, Some("rename"));
         assert_eq!(err.path.as_deref(), Some(src));
