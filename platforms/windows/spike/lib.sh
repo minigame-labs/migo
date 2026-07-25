@@ -87,6 +87,31 @@ find_vcvars64() {
     printf '%s\\VC\\Auxiliary\\Build\\vcvars64.bat' "$root"
 }
 
+# Prints the DOS path of the CMake bin directory that VS Build Tools bundles.
+# VS ships cmake + ninja under Common7/IDE/CommonExtensions, and they are not on
+# PATH by default -- a consumer that wants find_package(migo) needs this on PATH.
+find_windows_cmake_dir() {
+    local vswhere="/mnt/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+    if [[ ! -f "$vswhere" ]]; then
+        echo "error: vswhere not found at $vswhere -- install Visual Studio Build Tools with the C++ workload" >&2
+        exit 93
+    fi
+    local root root_unix cmake_bin_unix
+    root="$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+        -latest -format value -property installationPath 2>/dev/null | tr -d '\r')"
+    if [[ -z "$root" ]]; then
+        echo "error: no Visual Studio install carries the MSVC x86/x64 build tools" >&2
+        exit 93
+    fi
+    root_unix="$(echo "$root" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/mnt/\L\1|')"
+    cmake_bin_unix="$root_unix/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin"
+    if [[ ! -f "$cmake_bin_unix/cmake.exe" ]]; then
+        echo "error: no CMake under $cmake_bin_unix -- add the 'C++ CMake tools' component to the VS install" >&2
+        exit 93
+    fi
+    printf '%s\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin' "$root"
+}
+
 # Runs a batch file on the Windows side and returns its exit code.
 #
 # A .bat is used rather than `cmd.exe /c "<command>"` because quoting a Windows
