@@ -209,12 +209,10 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
+      # Pins one NDK for the whole job (see the action for why every NDK env var
+      # must point at it, not just ANDROID_NDK_HOME).
       - name: Install Android NDK + cargo-ndk
-        run: |
-          sdkmanager "ndk;23.2.8568313"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
-          echo "$ANDROID_HOME/ndk/23.2.8568313/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
-          cargo install cargo-ndk --locked
+        uses: ./.github/actions/setup-android-ndk
 
       # Layout-only compatibility check; official Android release slices stay
       # arm64-v8a/x86_64 until an ARMv7 artifact profile is explicitly added.
