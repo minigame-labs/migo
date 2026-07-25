@@ -145,17 +145,11 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      # Pin the NDK to the same version the .so build uses (pr-ci.yml build job)
-      # and export ANDROID_NDK_HOME via $GITHUB_ENV so it is set for the
-      # cross-compile AND emulator steps. NOTE: do NOT set it from
-      # `${{ env.ANDROID_NDK_LATEST_HOME }}` — runner OS env vars are not in the
-      # Actions `env` expression context, so that resolves to "" and breaks
-      # cargo-ndk's NDK detection.
+      # Pins the same NDK the .so build uses, exported via $GITHUB_ENV for the
+      # cross-compile AND emulator steps. See the action for why every NDK env
+      # var must point at it, not just ANDROID_NDK_HOME.
       - name: Install Android NDK + cargo-ndk
-        run: |
-          sdkmanager "ndk;23.2.8568313"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/23.2.8568313" >> "$GITHUB_ENV"
-          cargo install cargo-ndk --locked
+        uses: ./.github/actions/setup-android-ndk
 
       # ReactiveCircus/android-emulator-runner needs /dev/kvm group-accessible.
       - name: Enable KVM
