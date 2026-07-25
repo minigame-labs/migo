@@ -36,6 +36,20 @@ export class MouseEvent extends Event {
     this.pageY = init.pageY || this.clientY;
     this.button = init.button || 0;
     this.buttons = init.buttons || 0;
+    this.movementX = init.movementX || 0;
+    this.movementY = init.movementY || 0;
+  }
+}
+
+// WheelEvent extends MouseEvent in the DOM. deltaMode reports the unit
+// (0 = pixel, 1 = line, 2 = page); it is carried, not normalized.
+export class WheelEvent extends MouseEvent {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.deltaX = init.deltaX || 0;
+    this.deltaY = init.deltaY || 0;
+    this.deltaZ = init.deltaZ || 0;
+    this.deltaMode = init.deltaMode || 0;
   }
 }
 
