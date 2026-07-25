@@ -17,7 +17,7 @@ import document from "./document.js";
 import HTMLElement, { Node, Element, HTMLImageElement, HTMLCanvasElement,
                        HTMLAudioElement, HTMLMediaElement, HTMLVideoElement } from "./element.js";
 import EventTarget from "./event-target.js";
-import { Event, TouchEvent, MouseEvent, DeviceMotionEvent } from "./events.js";
+import { Event, TouchEvent, MouseEvent, WheelEvent, DeviceMotionEvent } from "./events.js";
 import { GamepadEvent, connectGamepadEvents } from "./gamepad.js";
 import Image from "./image.js";
 import Canvas from "./canvas.js";
@@ -42,25 +42,98 @@ if (!globalThis.__migoAdapterInjected) {
   //    document AND window, so games listen on any of the three. Migo's
   //    globalThis has no native EventTarget, so back `window` with our own.
   const _winTarget = new EventTarget();
-  const _forward = (type) => (e) => {
-    // `type` must come AFTER `...e`: the host event may carry its own `type`
-    // field which would otherwise clobber the DOM event name and make
-    // `addEventListener('touchstart', ...)` never match.
-    const ev = { ...e, type, target: canvas };
+
+  // Dispatch a real (cancelable) Event to canvas + document + window + the
+  // `on<type>` sinks engines sometimes set directly. Returns whether a listener
+  // called preventDefault() -- real Event objects are required so that call
+  // works at all (the previous plain-object spread had no preventDefault, so a
+  // touchstart handler calling it threw and was swallowed).
+  const _emit = (ev) => {
+    ev.target = canvas;
     canvas.dispatchEvent && canvas.dispatchEvent(ev);
     document.dispatchEvent(ev);
     _winTarget.dispatchEvent(ev);
-    // Also trigger document.ontouch* / window.ontouch* sinks if engines set
-    // those directly.
-    const sink = document["on" + type];
+    const sink = document["on" + ev.type];
     if (typeof sink === "function") try { sink(ev); } catch {}
-    const wsink = globalThis["on" + type];
+    const wsink = globalThis["on" + ev.type];
     if (typeof wsink === "function") try { wsink(ev); } catch {}
+    return ev.defaultPrevented;
   };
-  if (typeof migo.onTouchStart === "function") migo.onTouchStart(_forward("touchstart"));
-  if (typeof migo.onTouchMove === "function") migo.onTouchMove(_forward("touchmove"));
-  if (typeof migo.onTouchEnd === "function") migo.onTouchEnd(_forward("touchend"));
-  if (typeof migo.onTouchCancel === "function") migo.onTouchCancel(_forward("touchcancel"));
+
+  // ---- Touch -> DOM touch events, tracking W3C compat-mouse suppression. ----
+  // `_touchCompat` is null when no touch interaction is concurrent; otherwise it
+  // is the current interaction's touchstart `defaultPrevented`, which decides
+  // whether the paired compatibility mouse events are dropped. See
+  // docs/superpowers/specs/2026-07-25-desktop-pointer-touch-compat-events-design.md.
+  let _touchCompat = null;
+  const _forwardTouch = (type) => (e) => {
+    const ev = new TouchEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      touches: e.touches || [],
+      changedTouches: e.changedTouches || e.touches || [],
+    });
+    ev.timeStamp = e.timeStamp;
+    const prevented = _emit(ev);
+    if (type === "touchstart") {
+      _touchCompat = prevented;
+    } else if (type === "touchend" || type === "touchcancel") {
+      // Keep the flag through the (microtask-deferred) compat-mouse burst, then
+      // clear on a macrotask so a later standalone mouse click is not gated.
+      setTimeout(() => { _touchCompat = null; }, 0);
+    }
+  };
+  if (typeof migo.onTouchStart === "function") migo.onTouchStart(_forwardTouch("touchstart"));
+  if (typeof migo.onTouchMove === "function") migo.onTouchMove(_forwardTouch("touchmove"));
+  if (typeof migo.onTouchEnd === "function") migo.onTouchEnd(_forwardTouch("touchend"));
+  if (typeof migo.onTouchCancel === "function") migo.onTouchCancel(_forwardTouch("touchcancel"));
+
+  // ---- Mouse -> DOM as W3C compatibility mouse events. ----------------------
+  // The embedded layer delivers mouse synchronously but touch on a microtask,
+  // so the adapter sees mouse before touch regardless of host send order.
+  // Deferring the mouse dispatch by TWO microtasks guarantees it runs after the
+  // single-microtask touch drain, so the touchstart's preventDefault is known
+  // before we decide whether this compat mouse event is suppressed.
+  const _emitCompatMouse = (type, src, extra) => {
+    Promise.resolve().then().then(() => {
+      if (_touchCompat === true) return; // paired touch was preventDefault()ed
+      const ev = new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        clientX: src.x,
+        clientY: src.y,
+        button: src.button,
+        buttons: type === "mouseup" ? 0 : 1,
+        ...extra,
+      });
+      ev.timeStamp = src.timeStamp;
+      _emit(ev);
+      if (type === "mouseup") {
+        // DOM fires `click` after `mouseup`; it is part of the same suppressible
+        // compat burst, so it only reaches content when the mouse was not dropped.
+        const click = new MouseEvent("click", {
+          bubbles: true, cancelable: true, clientX: src.x, clientY: src.y, button: src.button,
+        });
+        click.timeStamp = src.timeStamp;
+        _emit(click);
+      }
+    });
+  };
+  if (typeof migo.onMouseDown === "function") migo.onMouseDown((e) => _emitCompatMouse("mousedown", e));
+  if (typeof migo.onMouseMove === "function") migo.onMouseMove((e) => _emitCompatMouse("mousemove", e, { movementX: e.movementX, movementY: e.movementY }));
+  if (typeof migo.onMouseUp === "function") migo.onMouseUp((e) => _emitCompatMouse("mouseup", e));
+
+  // ---- Wheel -> DOM wheel event (no touch equivalent, no compat gating). ----
+  if (typeof migo.onWheel === "function") {
+    migo.onWheel((e) => {
+      const ev = new WheelEvent("wheel", {
+        bubbles: true, cancelable: true,
+        deltaX: e.deltaX, deltaY: e.deltaY, deltaZ: e.deltaZ, deltaMode: e.deltaMode,
+      });
+      ev.timeStamp = e.timeStamp;
+      _emit(ev);
+    });
+  }
 
   // 2b. Gamepad connection events. Browsers fire these on window only -- not on
   //     document and not on the canvas -- so unlike touch above this routes to
