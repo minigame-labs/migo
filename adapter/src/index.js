@@ -173,6 +173,22 @@ if (!globalThis.__migoAdapterInjected) {
   if (typeof migo.onCompositionUpdate === "function") migo.onCompositionUpdate(_forwardComposition("compositionupdate"));
   if (typeof migo.onCompositionEnd === "function") migo.onCompositionEnd(_forwardComposition("compositionend"));
 
+  // ---- App lifecycle -> DOM Page Visibility (document.hidden + change event). -
+  // HTML5 games pause audio and their loop on `visibilitychange` and read
+  // `document.hidden`. migo fires onShow/onHide; wire them to the visibility
+  // state and event. The state is set BEFORE dispatch so a handler reading
+  // `document.hidden` sees the new value, as the spec requires.
+  const _setVisibility = (hidden) => {
+    document.hidden = hidden;
+    document.visibilityState = hidden ? "hidden" : "visible";
+    const ev = new Event("visibilitychange", { bubbles: true, cancelable: false });
+    ev.target = document;
+    document.dispatchEvent(ev);
+    if (typeof document.onvisibilitychange === "function") try { document.onvisibilitychange(ev); } catch {}
+  };
+  if (typeof migo.onHide === "function") migo.onHide(() => _setVisibility(true));
+  if (typeof migo.onShow === "function") migo.onShow(() => _setVisibility(false));
+
   // 2b. Gamepad connection events. Browsers fire these on window only -- not on
   //     document and not on the canvas -- so unlike touch above this routes to
   //     exactly one target.
