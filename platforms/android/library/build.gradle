@@ -131,8 +131,14 @@ android {
 
     buildTypes {
         release {
-            minifyEnabled true
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-common.pro'
+            // A library must not minify its own public API: R8 marks
+            // MigoGameActivity's overridable hooks final, widens the documented
+            // protected API to public, and renames the private RuntimeConfig
+            // fields the native init reads by name via JNI -- each breaks an
+            // external consumer of the shipped AAR. The size is in the native
+            // .so, not the tiny classes.jar, so minifying Java saves ~nothing.
+            // The consumer minifies using the shipped consumerProguardFiles.
+            minifyEnabled false
         }
         debug {
             debuggable true

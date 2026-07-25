@@ -338,13 +338,16 @@ build_platform() {
     # occurrence, which is safe (identical NDK ABI) but lld defaults to
     # erroring.  The flag only needs to exist on the final link of
     # libmigo.so, which happens inside the cargo invocation below.
-    # `embed-bitcode=no` must be repeated here: exporting RUSTFLAGS below
-    # OVERRIDES (does not merge with) config.toml's [target] rustflags, so the
-    # config's embed-bitcode=no would be dropped — and a fresh v8 crate build
-    # then emits an LLVM-bitcode binding.o that the NDK lld cannot link
-    # ("Invalid value (Producer: 'LLVM..' Reader: 'LLVM..')"). Normally hidden
-    # because the v8 crate is cached; surfaces after `cargo clean -p v8`.
-    local common_rustflags="-C link-arg=-Wl,--allow-multiple-definition -C embed-bitcode=no"
+    #
+    # Do NOT add `-C embed-bitcode=no` here. The shipping [profile.release] uses
+    # lto="fat", and rustc rejects `-C embed-bitcode=no` together with `-C lto`
+    # as a hard error on the final cdylib. Under fat LTO cargo forces bitcode on
+    # and the LTO step consumes every crate's bitcode (including the v8 binding
+    # compiled from the prebuilt src_binding.rs) into native code before the
+    # final link, so the NDK lld never sees a raw-bitcode object -- the failure
+    # that once motivated embed-bitcode=no ("Invalid value Producer/Reader LLVM")
+    # only happens without LTO, where cargo's default is already embed-bitcode=no.
+    local common_rustflags="-C link-arg=-Wl,--allow-multiple-definition"
 
     if [[ "$platform" == "arm64-v8a" ]]; then
         local builtins
