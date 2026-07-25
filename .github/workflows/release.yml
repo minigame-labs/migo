@@ -165,7 +165,28 @@ jobs:
       - name: Linux Qt Host Kit contract
         run: bash scripts/test-linux-qt-host-kit.sh --sanitize
 
-  # ── Job 3: Release AAR build ────────────────────────────────────────
+  # ── Job 3: Adapter browser-compat tests (pure JS; mirrors pr-ci.yml) ─
+  adapter-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: false
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: adapter/package-lock.json
+      - name: Adapter browser-compat tests
+        working-directory: adapter
+        run: |
+          npm ci
+          npm test
+
+  # ── Job 4: Release AAR build ────────────────────────────────────────
   release-android:
     needs: [quality-gate, linux-qt-host-kit]
     runs-on: ubuntu-latest
