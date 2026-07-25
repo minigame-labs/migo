@@ -1,10 +1,10 @@
-# Migo — 为游戏而生的开源原生运行时
+# Migo — 为游戏而生的原生运行时
 
 [中文](README.md) | [English](README_EN.md)
 
 **嵌入式 HTML5 / 小游戏的 WebView 替代方案。**
 
-Migo 是一个开源、高性能、可嵌入的 HTML5 / Canvas2D / WebGL 原生游戏运行时。App 厂商把它嵌入自己的应用，就能跑 HTML5 与小游戏内容——**无需 WebView**：没有浏览器、DOM、CSS、layout 与合成层的开销，启动更快、内存更低，运行时版本由你打包钉死，不随 OEM 与系统版本漂移。
+Migo 是一个源码可审计、高性能、可嵌入的 HTML5 / Canvas2D / WebGL 原生游戏运行时。App 厂商把它嵌入自己的应用，就能跑 HTML5 与小游戏内容——**无需 WebView**：没有浏览器、DOM、CSS、layout 与合成层的开销，启动更快、内存更低，运行时版本由你打包钉死，不随 OEM 与系统版本漂移。
 
 兼容两个适配 profile，现有游戏**零改动或少量改动**直接运行：
 
@@ -16,7 +16,7 @@ Migo 是一个开源、高性能、可嵌入的 HTML5 / Canvas2D / WebGL 原生�
 | 维度 | Migo | Android System WebView |
 |---|---|---|
 | 版本一致性 | 运行时由你打包、版本钉死，跨 OEM/系统可控 | 随用户系统与 OEM 自升级、自漂移，你无法控制 |
-| 可审计性 | 开源、沙箱边界可逐行审计（fintech/政务/出海合规） | 闭源，无法审计 |
+| 可审计性 | 源码可审计，沙箱边界可逐行审计（fintech/政务/出海合规） | 闭源，无法审计 |
 | 启动 / 内存 | 无 DOM/layout、V8 snapshot 预热，体积小、启动快、内存低 | 带整个 Chromium，常驻开销大 |
 | 跨引擎兼容 | 同一 API 跑多引擎，不绑定单一引擎 | — |
 
@@ -193,6 +193,8 @@ Migo 采用 **source-available** 的 [Business Source License 1.1](LICENSE)（BS
 - **把 Migo 作为独立 SDK 转售，或提供托管运行时服务** —— 需要商业许可。
 
 完整说明见 [LEGAL.md](LEGAL.md)；商业许可见 [COMMERCIAL.md](COMMERCIAL.md)。
+
+「Migo」与 Migo logo 是 Migo Authors 的商标。许可证授予的是**软件**，不授予名称与标识的权利：代码可以 fork，名字不行。
 
 ## 贡献
 

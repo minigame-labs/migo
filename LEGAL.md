@@ -14,7 +14,19 @@ Migo is **source-available** under the [Business Source License 1.1](LICENSE) (B
 
 Please refer to [LICENSE](LICENSE) for the authoritative and binding terms. This document is a plain-language summary and does not override the license text.
 
-## Trademarks and API Compatibility
+## The Migo Name and Logo
+
+"Migo" and the Migo logo are trademarks of the Migo Authors. The BSL 1.1 grant covers the **software**; it grants no rights in the name or logo (see the Terms section of [LICENSE](LICENSE)).
+
+Concretely, and independent of what the software license permits:
+
+- **Permitted without asking.** Referring to Migo by name to say what your product uses or is compatible with — "built on Migo", "runs Migo", "compatible with Migo" — in plain, truthful, descriptive terms. Reproducing this repository with its name and notices intact.
+- **Not permitted without written permission.** Naming your own product, service, company, domain, app-store listing or package "Migo" or a confusingly similar variant; using the logo as your own mark or in a way that implies you are Migo or are endorsed by us; and describing a modified build as "Migo" without making clear it is modified and not the official distribution.
+- **Forks.** The license lets you fork and modify the code. It does not let you keep the name. A fork must be released under a name that is not confusable with Migo, and must not present itself as the official Migo, as "Migo-compatible" in a certification sense, or as passing any Migo conformance criteria.
+
+If in doubt, ask at **licensing@minigame-labs.com** — permission for reasonable uses is normally straightforward.
+
+## Third-Party Trademarks and API Compatibility
 
 Migo implements a mini-game API surface that is **compatible in style** with mainstream mini-game platforms. To be precise about what this means:
 

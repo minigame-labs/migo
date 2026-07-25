@@ -1,10 +1,10 @@
-# Migo — The Open Native Runtime for HTML5 & Mini-games
+# Migo — The Native Runtime for HTML5 & Mini-games
 
 [中文](README.md) | [English](README_EN.md)
 
 **A WebView replacement built for games — embeddable HTML5 / mini-game content without a browser.**
 
-Migo is an open, high-performance, embeddable native runtime for HTML5 / Canvas2D / WebGL games. Embed it in your app to run HTML5 and mini-game content **without a WebView**: no browser, DOM, CSS, layout, or compositor overhead — faster startup, lower memory, and a runtime version you pin yourself instead of one that drifts across OEMs and OS updates.
+Migo is a source-available, high-performance, embeddable native runtime for HTML5 / Canvas2D / WebGL games. Embed it in your app to run HTML5 and mini-game content **without a WebView**: no browser, DOM, CSS, layout, or compositor overhead — faster startup, lower memory, and a runtime version you pin yourself instead of one that drifts across OEMs and OS updates.
 
 Two adapter profiles let existing games run with **zero or minimal changes**:
 
@@ -16,7 +16,7 @@ Two adapter profiles let existing games run with **zero or minimal changes**:
 | Dimension | Migo | Android System WebView |
 |---|---|---|
 | Version consistency | Runtime packaged and version-pinned by you; controllable across OEMs/OS versions | Auto-updates and drifts with the user's system and OEM, outside your control |
-| Auditability | Open source; sandbox boundary auditable line by line (fintech/gov/overseas compliance) | Closed source, not auditable |
+| Auditability | Source-available; sandbox boundary auditable line by line (fintech/gov/overseas compliance) | Closed source, not auditable |
 | Startup / memory | No DOM/layout, V8 snapshot warm-up — small footprint, fast startup, low memory | Ships the whole Chromium, heavy resident cost |
 | Cross-engine | One API across multiple engines, not locked to a single engine | — |
 
@@ -193,6 +193,8 @@ Migo is **source-available** under the [Business Source License 1.1](LICENSE) (B
 - **Resell Migo as a standalone SDK, or run it as a hosted service** — needs a commercial license.
 
 See [LEGAL.md](LEGAL.md) for the full statement, and [COMMERCIAL.md](COMMERCIAL.md) for commercial licensing.
+
+"Migo" and the Migo logo are trademarks of the Migo Authors. The license grants rights in the **software**, not in the name or logo: you may fork the code, but not the name.
 
 ## Contributing
 
