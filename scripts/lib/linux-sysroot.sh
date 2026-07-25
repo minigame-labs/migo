@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sourced, not executed. Pins every host compilation at the Debian bullseye
 # sysroot so the produced artifacts stay inside the glibc 2.31 loader floor
-# (docs/multiplatform-architecture.md 7.2).
+# that scripts/abi-floor-audit.py enforces.
 #
 # This is the sysroot Chromium ships and the one the linux-gnu V8 archive was
 # built in, so the engine's C++ and V8's C++ see the same libc and libstdc++

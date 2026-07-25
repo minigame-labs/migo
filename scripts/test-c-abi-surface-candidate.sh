@@ -216,10 +216,10 @@ check_repository_integration() {
     require_literal "$ROOT/include/migo/README.md" \
         '`MigoSurfaceDescriptor.platform_descriptor_size` deliberately duplicates' \
         "platform descriptor cross-check rationale"
-    require_literal "$ROOT/docs/multiplatform-architecture.md" \
-        "include/migo/migo.h" "architecture header reference"
-    require_literal "$ROOT/docs/multiplatform-architecture.md" \
-        "MIGO_C_ABI_HAS_RUNTIME" "architecture no-runtime marker"
+    require_literal "$ROOT/include/migo/README.md" \
+        "migo.h" "ABI header reference"
+    require_literal "$ROOT/include/migo/README.md" \
+        "MIGO_C_ABI_HAS_RUNTIME" "ABI runtime-presence marker"
 }
 
 case "$MODE" in

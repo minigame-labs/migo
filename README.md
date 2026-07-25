@@ -177,6 +177,7 @@ migo/
 ├── platforms/
 │   └── android/            # Android SDK
 ├── scripts/                # 构建脚本
+├── BUILD.md                # 从源码构建指南（各平台前置、构建流程、常见报错）
 ├── LICENSE                 # 许可证（BSL 1.1）
 ├── LEGAL.md                # 法律声明（许可/商标/测试内容）
 ├── COMMERCIAL.md           # 商业许可：谁需要、谁不需要、怎么谈

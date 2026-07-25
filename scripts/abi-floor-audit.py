@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Audit an ELF artifact against migo's Linux ABI contract.
 
-The loader floor (docs/multiplatform-architecture.md 7.2) is a claim about what
-migo's own artifacts require, so it is checked on linked output rather than on
-source. Parsing is kept separate from process invocation so it can be unit
-tested without any binary on disk.
+The loader floor is a claim about what migo's own artifacts require, so it is
+checked on linked output rather than on source. The defaults below -- GLIBC
+2.31 and GLIBCXX 3.4.28 -- are this repository's authority for that floor:
+they admit any distribution no older than Ubuntu 20.04 / Debian 11, which is
+what the first Linux release commits to. Host builds are pinned to Chromium's
+bullseye sysroot and land comfortably inside it. Parsing is kept separate from
+process invocation so it can be unit tested without any binary on disk.
 """
 
 from __future__ import annotations

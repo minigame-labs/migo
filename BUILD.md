@@ -5,9 +5,7 @@ How to set up a development environment and build Migo on **Linux**,
 (unit tests, smoke checks) and Android cross-compilation
 (`libmigo.so`, AAR packaging).
 
-> This file describes *how* to build the engine. For *what* it is made of
-> and where the platform boundaries sit, see
-> [`multiplatform-architecture.md`](multiplatform-architecture.md).
+> This file describes *how* to build the engine from source.
 
 ---
 

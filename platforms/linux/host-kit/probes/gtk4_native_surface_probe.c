@@ -61,8 +61,9 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         g_exit_code = 2;
     } else if (box_is_native || child_is_native) {
         g_printerr("gtk4-native-surface-probe: a child widget now owns a native surface. "
-                   "GTK 4 may have gained the Direct Surface path; re-read "
-                   "docs/multiplatform-architecture.md before treating this as a failure\n");
+                   "GTK 4 may have gained the Direct Surface path, so this "
+                   "probe's assumption needs revisiting before treating this "
+                   "as a failure\n");
         g_exit_code = 1;
     } else {
         g_exit_code = 0;

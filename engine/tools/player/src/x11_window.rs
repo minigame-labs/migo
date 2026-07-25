@@ -1,8 +1,8 @@
 //! Minimal X11 window for the dev player.
 //!
-//! The player is the one component allowed to own a toplevel window
-//! (`docs/multiplatform-architecture.md` §7.2: the SDK renders into a
-//! host-provided surface and never creates a window itself). Here the player
+//! The player is the one component allowed to own a toplevel window: the SDK
+//! renders into a host-provided surface and never creates a window itself,
+//! which `scripts/test-surface-attachment-contract.sh` enforces. Here the player
 //! *is* the host: it opens the display, creates the window, and hands the two
 //! opaque handles to `linux_x11_graphics_platform` / `LinuxX11Surface`.
 //!

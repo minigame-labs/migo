@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The Linux SDK's contract gate (docs/multiplatform-architecture.md 7.2).
+# The Linux SDK's contract gate. The loader floor it upholds is defined by
+# scripts/abi-floor-audit.py.
 #
 # Every check fails the build outright. There is no warn-and-continue path: an
 # artifact that silently misses the loader floor is worse than no artifact,

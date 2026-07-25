@@ -64,6 +64,6 @@ set -e
 
 case "$PROBE_STATUS" in
     0) printf 'GTK 4 surface capability: PASS (no native child surface, so Direct Surface stays blocked)\n' ;;
-    1) fail "a GTK 4 child widget now owns a native surface; re-read docs/multiplatform-architecture.md" ;;
+    1) fail "a GTK 4 child widget now owns a native surface; the Direct Surface path may now be reachable and this gate's assumption needs revisiting" ;;
     *) fail "the probe could not answer (exit $PROBE_STATUS)" ;;
 esac

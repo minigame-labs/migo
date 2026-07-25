@@ -12,8 +12,8 @@
 #      undefined __isoc23_* references in it (platform-linux.o, string.o,
 #      locale.o, ...). Those are renamed entry points introduced in glibc 2.38,
 #      not versioned aliases, so nothing at link time can satisfy them against
-#      the 2.31 loader floor that docs/multiplatform-architecture.md 7.2
-#      promises. use_sysroot=true builds against the Debian bullseye sysroot.
+#      the 2.31 loader floor that scripts/abi-floor-audit.py enforces.
+#      use_sysroot=true builds against the Debian bullseye sysroot.
 #
 #   2. SHARED-OBJECT LINKAGE. An archive compiled for executables may use the
 #      local-exec TLS model, whose relocations cannot appear in a shared object

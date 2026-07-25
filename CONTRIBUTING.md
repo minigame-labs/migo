@@ -55,7 +55,7 @@ Feature requests are welcome. Please include:
 
 > For the full, platform-specific build guide (Linux / macOS / Windows),
 > including Skia-from-source requirements and troubleshooting, see
-> [`docs/BUILD.md`](docs/BUILD.md). This section is the short version.
+> [`BUILD.md`](BUILD.md). This section is the short version.
 
 ### Prerequisites
 
@@ -93,7 +93,7 @@ bash scripts/build-aar.sh release
 
 For ABI selection, single-step `.so` builds, and troubleshooting (NDK
 env vars, Skia source-build deps, proxy setup, WSL2 memory), see
-[`docs/BUILD.md`](docs/BUILD.md).
+[`BUILD.md`](BUILD.md).
 
 ## Coding Guidelines
 

@@ -177,6 +177,7 @@ migo/
 ├── platforms/
 │   └── android/            # Android SDK
 ├── scripts/                # Build scripts
+├── BUILD.md                # Build-from-source guide (prerequisites, workflows, troubleshooting)
 ├── LICENSE                 # License (BSL 1.1)
 ├── LEGAL.md                # Legal notice (license/trademarks/test content)
 ├── COMMERCIAL.md           # Commercial licensing: who needs one, who doesn't

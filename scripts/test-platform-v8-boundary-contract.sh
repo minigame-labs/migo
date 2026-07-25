@@ -209,15 +209,6 @@ for relative in (".github/workflows/pr-ci.yml", ".github/workflows/release.yml")
         f"{relative} must contain an active Platform/V8 boundary contract step",
     )
 
-architecture = (root / "docs/multiplatform-architecture.md").read_text(encoding="utf-8")
-require(
-    "Platform/V8 Phase A 已完成" in architecture,
-    "architecture status must record Platform/V8 Phase A completion",
-)
-require(
-    "无 `JsBackend` trait" in architecture,
-    "architecture status must say that full runtime-backend abstraction remains incomplete",
-)
 
 if errors:
     for error in errors:
