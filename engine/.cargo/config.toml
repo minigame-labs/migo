@@ -46,9 +46,11 @@ rustflags = [
   # Strip all symbols including debug
   "-C", "link-arg=-Wl,--strip-all",
   
-  # Disable embed bitcode (not needed for final binary)
-  "-C", "embed-bitcode=no",
-  
+  # NOTE: do not add `embed-bitcode=no` here. [profile.release] uses lto="fat",
+  # and rustc rejects `-C embed-bitcode=no` together with `-C lto` as a hard
+  # error (breaks the release AAR link). cargo embeds bitcode as LTO requires,
+  # and --strip-all drops it from the shipped .so, so there is no size cost.
+
   # Exclude frame pointers (smaller but harder to debug crashes)
   "-C", "force-frame-pointers=no",
 
@@ -80,7 +82,6 @@ rustflags = [
   "-C", "link-arg=-Wl,--icf=all",
   "-C", "link-arg=-Wl,--hash-style=gnu",
   "-C", "link-arg=-Wl,--strip-all",
-  "-C", "embed-bitcode=no",
   "-C", "force-frame-pointers=no",
   "-C", "force-unwind-tables=no",
 
@@ -109,7 +110,6 @@ rustflags = [
   "-C", "link-arg=-Wl,--icf=all",
   "-C", "link-arg=-Wl,--hash-style=gnu",
   "-C", "link-arg=-Wl,--strip-all",
-  "-C", "embed-bitcode=no",
   "-C", "force-frame-pointers=no",
   "-C", "force-unwind-tables=no",
 
