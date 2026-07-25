@@ -66,6 +66,13 @@ export class KeyboardEvent extends Event {
   }
 }
 
+export class CompositionEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.data = init.data != null ? init.data : "";
+  }
+}
+
 export class DeviceMotionEvent extends Event {
   constructor(type, init = {}) {
     super(type, init);

@@ -17,7 +17,7 @@ import document from "./document.js";
 import HTMLElement, { Node, Element, HTMLImageElement, HTMLCanvasElement,
                        HTMLAudioElement, HTMLMediaElement, HTMLVideoElement } from "./element.js";
 import EventTarget from "./event-target.js";
-import { Event, TouchEvent, MouseEvent, WheelEvent, KeyboardEvent, DeviceMotionEvent } from "./events.js";
+import { Event, TouchEvent, MouseEvent, WheelEvent, KeyboardEvent, CompositionEvent, DeviceMotionEvent } from "./events.js";
 import { GamepadEvent, connectGamepadEvents } from "./gamepad.js";
 import Image from "./image.js";
 import Canvas from "./canvas.js";
@@ -135,11 +135,21 @@ if (!globalThis.__migoAdapterInjected) {
     });
   }
 
+  // Dispatch to document + window + `on<type>` sinks, NOT the canvas: keyboard
+  // and IME composition target the document/window, not the drawing surface.
+  const _emitDocWin = (ev) => {
+    ev.target = document;
+    document.dispatchEvent(ev);
+    _winTarget.dispatchEvent(ev);
+    const sink = document["on" + ev.type];
+    if (typeof sink === "function") try { sink(ev); } catch {}
+    const wsink = globalThis["on" + ev.type];
+    if (typeof wsink === "function") try { wsink(ev); } catch {}
+  };
+
   // ---- Physical keyboard -> DOM keydown/keyup. ------------------------------
-  // Keyboard events target the document/window in the DOM -- there is no focused
-  // element model here -- so unlike pointer events they are not routed to the
-  // canvas. HTML5 games listen via `window`/`document` addEventListener (WASD,
-  // arrows). migo.onKeyDown/onKeyUp already carry DOM `key`/`code`/modifiers.
+  // HTML5 games listen via `window`/`document` addEventListener (WASD, arrows).
+  // migo.onKeyDown/onKeyUp already carry DOM `key`/`code`/modifiers.
   const _forwardKey = (type) => (e) => {
     const ev = new KeyboardEvent(type, {
       bubbles: true, cancelable: true,
@@ -148,16 +158,20 @@ if (!globalThis.__migoAdapterInjected) {
       repeat: e.repeat,
     });
     ev.timeStamp = e.timeStamp;
-    ev.target = document;
-    document.dispatchEvent(ev);
-    _winTarget.dispatchEvent(ev);
-    const sink = document["on" + type];
-    if (typeof sink === "function") try { sink(ev); } catch {}
-    const wsink = globalThis["on" + type];
-    if (typeof wsink === "function") try { wsink(ev); } catch {}
+    _emitDocWin(ev);
   };
   if (typeof migo.onKeyDown === "function") migo.onKeyDown(_forwardKey("keydown"));
   if (typeof migo.onKeyUp === "function") migo.onKeyUp(_forwardKey("keyup"));
+
+  // ---- IME composition -> DOM compositionstart/update/end. ------------------
+  // CJK text input reads `event.data` (the running preedit) on these events.
+  // migo publishes onComposition* with `{type, data}`.
+  const _forwardComposition = (type) => (e) => {
+    _emitDocWin(new CompositionEvent(type, { bubbles: true, cancelable: true, data: e.data }));
+  };
+  if (typeof migo.onCompositionStart === "function") migo.onCompositionStart(_forwardComposition("compositionstart"));
+  if (typeof migo.onCompositionUpdate === "function") migo.onCompositionUpdate(_forwardComposition("compositionupdate"));
+  if (typeof migo.onCompositionEnd === "function") migo.onCompositionEnd(_forwardComposition("compositionend"));
 
   // 2b. Gamepad connection events. Browsers fire these on window only -- not on
   //     document and not on the canvas -- so unlike touch above this routes to
@@ -189,7 +203,7 @@ if (!globalThis.__migoAdapterInjected) {
     HTMLElement, Element, Node,
     HTMLImageElement, HTMLCanvasElement, HTMLAudioElement,
     HTMLMediaElement, HTMLVideoElement,
-    EventTarget, Event, TouchEvent, MouseEvent, WheelEvent, KeyboardEvent, DeviceMotionEvent, GamepadEvent,
+    EventTarget, Event, TouchEvent, MouseEvent, WheelEvent, KeyboardEvent, CompositionEvent, DeviceMotionEvent, GamepadEvent,
     Image, Audio,
     XMLHttpRequest, WebSocket, FileReader,
     localStorage,
