@@ -40,11 +40,29 @@ Use Limitation:
 Additional Use Grant:
   Subject to the terms of this License, and notwithstanding the Use Limitation,
   Licensor grants you a limited right to make production use of the Licensed Work
-  only as part of Your App.
+  only as part of Your App, and only for so long as you are a Small Entity.
 
   "Your App" means an application that you (or your affiliates) own and control
   and that is distributed to end users primarily to provide your own application
   functionality (not primarily to provide a mini-game runtime/engine SDK).
+
+  "Small Entity" means an entity that, together with its affiliates, satisfies
+  both of the following as of its most recently completed fiscal year:
+    (a) total annual gross revenue, from all sources and not only from Your App,
+        of no more than USD 1,000,000 (or the equivalent in another currency);
+        AND
+    (b) no more than 3,000,000 monthly active users across all instances of
+        Your App in any single month of that year.
+
+  If you cease to be a Small Entity, this Additional Use Grant continues to
+  cover your production use for 90 days, so that you have time to obtain a
+  commercial license from Licensor without interrupting your service.
+
+  Non-production use is not affected by the Small Entity thresholds. The Terms
+  below grant everyone, at any scale, the right to copy, modify, create
+  derivative works from, redistribute, and make non-production use of the
+  Licensed Work -- including reading, auditing, building, testing, evaluating,
+  benchmarking, and porting it.
 
   Permitted production uses:
     1) Integrate the Licensed Work into Your App to run and deliver mini-games
@@ -69,7 +87,13 @@ Additional Use Grant:
       if bundled with additional code, unless you have a separate commercial
       license from Licensor.
 
-Change Date: 2029-01-01
+Change Date: The fourth anniversary of the date on which the specific version
+             of the Licensed Work to which this License is attached was first
+             made publicly available by Licensor.
+
+             This License applies separately to each version, so each version
+             carries its own Change Date and converts to the Change License
+             four years after that version was published.
 
 Change License: Apache License 2.0
 

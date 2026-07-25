@@ -715,14 +715,13 @@ Linux Host Kit 的后续增量按独立能力交付，不扩张本次 surface-on
 
 ## 12. 开源定位与发布阻塞
 
-项目定位被定义为开源，但当前根 `LICENSE` 是带竞争用途限制、到 2029-01-01 转 Apache-2.0 的 BSL 1.1。Change Date 之前它是 source-available，不满足 OSI 对自由再分发和不得限制使用领域的要求；这与 README 中“开源”的当前宣传不一致。
+**已决（保留 BSL + 如实称呼）。** 根 `LICENSE` 是 BSL 1.1：带竞争用途限制，每个版本在自身发布满 4 年时转 Apache-2.0（Change Date 按版本滚动，不是单一固定日期）。Change Date 之前它是 source-available，不满足 OSI 对自由再分发和不得限制使用领域的要求。
 
-技术架构不能代替 copyright holder 的法律决定，因此本文不擅自修改许可证。但公开 release 前必须原子完成其一：
+此前本节记录的 release blocker 是"README 宣传开源、LICENSE 却是 BSL"的不一致。该项已通过**如实称呼**关闭：README/README_EN 改为"源码可审计 / source-available"，不再自称 open source；许可边界与商业许可入口分别落在 `LEGAL.md` 与 `COMMERCIAL.md`。
 
-- 切换到 Apache-2.0 或其他 OSI-approved license，并同步 LICENSE/README/LEGAL/artifact metadata；或
-- 保留 BSL，并把当前版本准确称为 source-available，而不是 open source。
+生产使用的分界写在 Additional Use Grant 里：嵌入自有 App 在 Small Entity 阈值内免费；作为独立 SDK 转售或提供托管运行时服务需商业许可；**非生产用途（阅读/审计/构建/测试/评测/移植）对任何规模无条件授予**——这条是"可审计"叙事能成立的前提，改许可证时不能动它。
 
-如果坚持“开源项目”定位，许可证迁移是 release blocker，不是可选优化。平台 backend、build recipe、schema、verifier 和 conformance tests 也应在同一公开仓库，避免“开源 core、不可复现平台包”。
+平台 backend、build recipe、schema、verifier 和 conformance tests 保持在同一公开仓库，避免"可审计 core、不可复现平台包"。
 
 ## 13. 明确非目标
 

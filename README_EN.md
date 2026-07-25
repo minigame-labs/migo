@@ -24,7 +24,7 @@ Two adapter profiles let existing games run with **zero or minimal changes**:
 
 - **WebView replacement** — native runtime for embedded HTML5 / mini-games, no browser-layer overhead
 - **Zero-change cross-engine** — Cocos / Egret / Pixi / vanilla Canvas games run unmodified
-- **Open & auditable** — sandbox boundary auditable line by line, compliance-friendly ([BSL 1.1](LICENSE), converts to Apache 2.0 on 2029-01-01)
+- **Source-available & auditable** — sandbox boundary auditable line by line, compliance-friendly ([BSL 1.1](LICENSE); each release converts to Apache 2.0 four years after it ships)
 - **High performance** — Rust core engine with an optimized rendering pipeline; fast startup, low memory
 - **Canvas 2D & WebGL** — full support for 2D canvas and WebGL rendering
 - **Audio support** — WebAudio-style APIs (including streaming playback)
@@ -179,13 +179,20 @@ migo/
 ├── scripts/                # Build scripts
 ├── LICENSE                 # License (BSL 1.1)
 ├── LEGAL.md                # Legal notice (license/trademarks/test content)
+├── COMMERCIAL.md           # Commercial licensing: who needs one, who doesn't
 ├── NOTICE                  # Third-party notices
 └── README.md
 ```
 
 ## License
 
-Migo is **source-available** under the [Business Source License 1.1](LICENSE) (BSL 1.1) and **converts to Apache 2.0 on 2029-01-01**. See [LEGAL.md](LEGAL.md) for the full statement on licensing, trademarks, and test content.
+Migo is **source-available** under the [Business Source License 1.1](LICENSE) (BSL 1.1). **Each released version converts to Apache 2.0 four years after it is published.**
+
+- **Read, audit, build, test, benchmark, modify and port** — granted to everyone, at any scale, unconditionally.
+- **Ship Migo inside your own app** — free while under USD 1,000,000 annual revenue and 3,000,000 MAU.
+- **Resell Migo as a standalone SDK, or run it as a hosted service** — needs a commercial license.
+
+See [LEGAL.md](LEGAL.md) for the full statement, and [COMMERCIAL.md](COMMERCIAL.md) for commercial licensing.
 
 ## Contributing
 

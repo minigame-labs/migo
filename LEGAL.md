@@ -6,9 +6,11 @@ This document clarifies the legal and licensing position of the Migo runtime.
 
 Migo is **source-available** under the [Business Source License 1.1](LICENSE) (BSL 1.1).
 
-- **Change Date:** 2029-01-01 — on this date the license converts to **Apache License 2.0**.
-- Until the Change Date, use is governed by the BSL 1.1 terms and the Additional Use Grant stated in [LICENSE](LICENSE).
-- "Source-available" is **not** the same as "open source under an OSI license" today; after the Change Date, Migo becomes Apache-2.0.
+- **Change Date:** each released version converts to **Apache License 2.0** on the fourth anniversary of its own publication. The Change Date is per-version, not a single fixed date, so every release carries a four-year term rather than the remainder of a countdown.
+- Until a version's Change Date, use of that version is governed by the BSL 1.1 terms and the Additional Use Grant stated in [LICENSE](LICENSE).
+- **Production use is free for small entities.** The Additional Use Grant lets you ship Migo inside your own app at no cost while you are under USD 1,000,000 in annual gross revenue and under 3,000,000 monthly active users. Above either threshold, production use needs a commercial license — see [COMMERCIAL.md](COMMERCIAL.md).
+- **Non-production use is unrestricted at any scale.** Reading, auditing, building, testing, benchmarking, modifying and porting the source is granted to everyone by the BSL Terms, with no revenue or user thresholds.
+- "Source-available" is **not** the same as "open source under an OSI license" today; after a version's Change Date, that version becomes Apache-2.0.
 
 Please refer to [LICENSE](LICENSE) for the authoritative and binding terms. This document is a plain-language summary and does not override the license text.
 
@@ -43,4 +45,4 @@ To report a vulnerability, follow the process in [SECURITY.md](SECURITY.md). Do 
 
 ---
 
-*This notice is provided for informational purposes and does not constitute legal advice. For questions about commercial licensing or use beyond the BSL 1.1 grant, contact the maintainers.*
+*This notice is provided for informational purposes and does not constitute legal advice. For commercial licensing, or for any use beyond the BSL 1.1 grant, see [COMMERCIAL.md](COMMERCIAL.md).*

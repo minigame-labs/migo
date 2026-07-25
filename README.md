@@ -24,7 +24,7 @@ Migo 是一个开源、高性能、可嵌入的 HTML5 / Canvas2D / WebGL 原生�
 
 - **WebView 替代** - 嵌入式 HTML5 / 小游戏的原生运行时，无浏览器层开销
 - **跨引擎零改动** - Cocos / Egret / Pixi / 原生 Canvas 游戏直接运行
-- **开源可审计** - 沙箱边界可逐行审计，合规友好（[BSL 1.1](LICENSE)，2029-01-01 转 Apache 2.0）
+- **源码可审计** - 沙箱边界可逐行审计，合规友好（[BSL 1.1](LICENSE)，每个版本发布 4 年后转 Apache 2.0）
 - **高性能** - Rust 核心引擎，优化的渲染管线，启动快、内存低
 - **Canvas 2D & WebGL** - 完整支持 2D 画布与 WebGL 渲染
 - **音频支持** - WebAudio 风格 API（含流式播放能力）
@@ -179,13 +179,20 @@ migo/
 ├── scripts/                # 构建脚本
 ├── LICENSE                 # 许可证（BSL 1.1）
 ├── LEGAL.md                # 法律声明（许可/商标/测试内容）
+├── COMMERCIAL.md           # 商业许可：谁需要、谁不需要、怎么谈
 ├── NOTICE                  # 第三方声明
 └── README.md
 ```
 
 ## 许可证
 
-Migo 采用 **source-available** 的 [Business Source License 1.1](LICENSE)（BSL 1.1），**2029-01-01 自动转为 Apache 2.0**。许可、商标与测试内容的完整说明见 [LEGAL.md](LEGAL.md)。
+Migo 采用 **source-available** 的 [Business Source License 1.1](LICENSE)（BSL 1.1）。**每个发布版本在其发布满 4 年时自动转为 Apache 2.0。**
+
+- **阅读、审计、构建、测试、评测、修改、移植** —— 任何规模、任何主体，无条件授予。
+- **把 Migo 嵌进你自己的 App 上线** —— 年营收 ≤ USD 1,000,000 且月活 ≤ 3,000,000 时免费。
+- **把 Migo 作为独立 SDK 转售，或提供托管运行时服务** —— 需要商业许可。
+
+完整说明见 [LEGAL.md](LEGAL.md)；商业许可见 [COMMERCIAL.md](COMMERCIAL.md)。
 
 ## 贡献
 
