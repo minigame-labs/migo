@@ -111,3 +111,7 @@ docs/superpowers/
 docs/gtm-*.md
 platforms/windows/SPIKE-REPORT.md
 tools/wx-api-diff/
+
+# Local-only operational notes (`*.local.md`). Same policy as the working
+# notes above: they are for the maintainer's machine, not for consumers.
+*.local.md
