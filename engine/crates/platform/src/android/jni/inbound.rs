@@ -253,7 +253,7 @@ pub(crate) extern "system" fn getMinApiLevel<'local>(
 /// * When the selected graphics artifact does not embed ICU data:
 ///   Skia needs `SkLoadICU(path)` invoked once before the first text
 ///   layout op. The wiring of that Skia entry point is pending a
-///   profile-validated cutover (see CLAUDE.md); until then this path
+///   profile-validated cutover; until then this path
 ///   returns `false` so callers surface a clear "ICU bootstrap
 ///   incomplete" signal instead of crashing inside SkParagraph.
 pub(crate) extern "system" fn initIcuData<'local>(

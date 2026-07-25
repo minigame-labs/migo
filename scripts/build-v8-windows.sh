@@ -290,8 +290,7 @@ rem (frontend signal) on 32 torque-generated translation units, and before that
 rem 78 -Wctad-maybe-unsupported errors. Chromium compiles those with
 rem -D_HAS_EXCEPTIONS=0 and /std:c++23preview, a combination Microsoft does not
 rem support for its own STL. So `use_custom_libcxx=false` is not an option here,
-rem and the Skia/V8 std::terminate collision needs a different answer -- see
-rem platforms/windows/SPIKE-REPORT.md.
+rem and the Skia/V8 std::terminate collision needs a different answer.
 cargo build --release --target ${TARGET}
 rem Capture before echoing: an echo succeeds and would otherwise become the
 rem batch file's exit status, making a failed build look like a pass.

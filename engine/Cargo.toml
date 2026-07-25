@@ -75,7 +75,7 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 #   The asset-based path requires a separate bootstrap step that
 #   copies the asset to a known path and calls
 #   `SkLoadICU(path)` / `SkInitializeICU` before the first text
-#   layout call.  See CLAUDE.md section 4 (Android bootstrap).
+#   layout call.
 #
 # `embed-icudtl` is opted in by the `graphics` crate's default
 # feature set, not here, so downstream crates can build without

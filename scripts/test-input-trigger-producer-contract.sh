@@ -6,7 +6,7 @@
 # event. When the trigger has no caller anywhere in the engine, the listener is
 # still advertised and still accepts a callback -- it simply never runs. Content
 # registering it sees nothing happen, on every platform, with no error: the same
-# failure shape as the `wx.getGamepads()` bug (CLAUDE.md §10.5), where a black
+# failure shape as the `wx.getGamepads()` bug, where a black
 # screen was read for days as a rendering fault.
 #
 # Both producer channels count, and checking only the first misreports the second:

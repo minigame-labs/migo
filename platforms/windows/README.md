@@ -2,9 +2,7 @@
 
 Windows 平台支持处于**可行性调查（spike）**阶段，尚无可用产物。
 
-- 设计：`docs/superpowers/specs/2026-07-21-windows-platform-spike-design.md`
-- 计划：`docs/superpowers/plans/2026-07-21-windows-platform-spike.md`
-- 结论：`platforms/windows/SPIKE-REPORT.md`
+构建与探测脚本在 `platforms/windows/spike/`，从 WSL 侧驱动 Windows 工具链。
 
 ## spike/ 下的脚本
 

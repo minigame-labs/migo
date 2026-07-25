@@ -1,7 +1,7 @@
 // Desktop pointer: touch + W3C compatibility-mouse events, in the adapter.
 // Run with `node tests/pointer-compat.test.mjs`.
 //
-// Contract (see docs/superpowers/specs/2026-07-25-desktop-pointer-touch-compat-events-design.md):
+// Contract:
 //  - Touch DOM events are dispatched and support preventDefault (real Event).
 //  - Mouse/wheel are forwarded to DOM (previously not forwarded at all).
 //  - A tap that maps to BOTH touch and mouse fires the compat mouse events

@@ -11,7 +11,7 @@
 # so the player links it directly — no crate-type juggling. (A cdylib is built
 # for every target, and on a glibc host the executable-TLS Linux V8 cannot be
 # linked into a shared object: `R_X86_64_TPOFF32 ... cannot be used with
-# -shared`. See CLAUDE.md §10.)
+# -shared`.)
 
 set -euo pipefail
 

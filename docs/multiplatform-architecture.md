@@ -121,8 +121,7 @@ migo/
 │   ├── linux/                     # Linux Host Kit；核心仍不依赖 Qt/GTK/SDL
 │   └── windows/                   # 当前仅 spike 与设计输入
 ├── tools/                         # 不链接 engine 的 repo/release 工具
-│   ├── artifact-manifest/
-│   └── wx-api-diff/
+│   └── artifact-manifest/
 ├── scripts/                       # 可复现 build/package/contract recipes
 ├── examples/                      # 外部消费方式与设备 probes
 └── tests/                         # 跨语言/ABI contract tests
@@ -237,7 +236,7 @@ Host Kit 必须提供两种 Session 所有权形态，但不要求在同一个 c
 1. **Direct Surface**：Android `SurfaceView`、X11 child window、Wayland surface、child HWND、`NSView`/`CAMetalLayer`、XComponent。Migo 直接 present 到宿主放置的 native target，这是首个默认路径。
 2. **Compositor texture**：Qt Quick、复杂 GTK scene graph、自研 GPU compositor。必须使用**同 GPU device** 的 native texture import/export，且 acquire 与 release **两个方向的同步都必须存在**；CPU readback、每帧 bitmap upload 或把 native child window 浮在 scene graph 上都不能作为 fallback。
 
-   ⚠️**同步不等于"显式 fence 随 descriptor 传入"**（2026-07-22 实测订正）：两个真实消费者的公开导入 API **都收不了 fence**——GTK 4.14 `GdkDmabufTextureBuilder` 的字段里没有任何 fence/sync 参数，Qt 6.4 四个 `QSGxxxTexture::fromNative()` 亦然。Linux dmabuf 的生态标准是内核**隐式同步**，Vulkan/D3D/Metal 才用显式 semaphore/fence，且要由宿主在自己的渲染钩子里插入等待，而不是塞进纹理句柄旁边。按字面要求"显式 fence 经 descriptor 传入"会让 Qt Quick 与 GTK 4 **都不可实现**。分层结论与取证见 `docs/superpowers/specs/2026-07-22-compositor-texture-contract-design.md`。
+   ⚠️**同步不等于"显式 fence 随 descriptor 传入"**（2026-07-22 实测订正）：两个真实消费者的公开导入 API **都收不了 fence**——GTK 4.14 `GdkDmabufTextureBuilder` 的字段里没有任何 fence/sync 参数，Qt 6.4 四个 `QSGxxxTexture::fromNative()` 亦然。Linux dmabuf 的生态标准是内核**隐式同步**，Vulkan/D3D/Metal 才用显式 semaphore/fence，且要由宿主在自己的渲染钩子里插入等待，而不是塞进纹理句柄旁边。按字面要求"显式 fence 经 descriptor 传入"会让 Qt Quick 与 GTK 4 **都不可实现**。
 
 第二条路径需要新的平台强类型 descriptor 和同步合同，不得把 texture/fence 塞入现有 window descriptor。没有该合同的平台 Host Kit 必须明确不提供对应控件，而不是以低性能兼容层冒充实现。
 

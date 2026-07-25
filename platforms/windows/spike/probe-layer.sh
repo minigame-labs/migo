@@ -32,7 +32,7 @@ VCVARS_DOS="$(find_vcvars64)"
 
 # Optional; only the V8-dependent layers need it. Left unset, rusty_v8's build
 # script tries to download the archive itself, which on this machine ran at
-# ~4 KB/s and stalled -- see SPIKE-REPORT.md.
+# ~4 KB/s and stalled.
 V8_ARCHIVE_LINE=""
 if [[ -n "${MIGO_WIN_V8_ARCHIVE:-}" ]]; then
     V8_ARCHIVE_LINE="set RUSTY_V8_ARCHIVE=${MIGO_WIN_V8_ARCHIVE}"

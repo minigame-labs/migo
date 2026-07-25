@@ -1,5 +1,5 @@
 {
-  "_comment": "Performance baseline thresholds for Migo Android runtime. Metrics collected from DebugStats (Rust) and Java-side instrumentation. See CLAUDE.md section 11 for data sources.",
+  "_comment": "Performance baseline thresholds for Migo Android runtime. Metrics collected from DebugStats (Rust) and Java-side instrumentation.",
   "version": 1,
   "metrics": {
     "fps": {

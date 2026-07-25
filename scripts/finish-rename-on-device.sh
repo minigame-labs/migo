@@ -44,7 +44,7 @@ fi
 echo "using device $SERIAL"
 
 # The device sleeps into zero frames and zero telemetry, so pin it awake before
-# anything is measured (CLAUDE.md section 2).
+# anything is measured.
 "$ADB" -s "$SERIAL" shell svc power stayon true >/dev/null 2>&1 || true
 "$ADB" -s "$SERIAL" shell input keyevent KEYCODE_WAKEUP >/dev/null 2>&1 || true
 
@@ -95,7 +95,7 @@ the device, because it cannot be asserted from a script:
 
   * install the AAR into the bench shell and confirm rendering, the
     background-and-return path (the Canvas2D state-carry fix), and clean
-    lifecycle -- see CLAUDE.md section 1 for the launch commands;
+    lifecycle;
   * run examples/c-host/android to re-check the pure-native host after the
     rename (build with scripts/build-android-c-host.sh);
   * only then is the rename branch mergeable, because a release AAR needs the

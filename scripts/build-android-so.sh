@@ -28,7 +28,7 @@ set -euo pipefail
 ANDROID_API=26
 
 # The cdylib is its own crate so that `platform` can stay an rlib (host builds
-# and tests cannot link V8 into a shared object; see CLAUDE.md §10). Its
+# and tests cannot link V8 into a shared object). Its
 # `[lib] name` is `migo`, so cargo emits the shipping name directly.
 # The package name and the directory name are deliberately two variables: every
 # package carries the `migo-` prefix, while the directories do not repeat it.

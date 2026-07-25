@@ -3811,9 +3811,7 @@ impl CanvasManager {
         // on Mali tile-based GPUs (Kirin 980 / HUAWEI EMUI) we have
         // observed the blit reading pre-draw tile contents when no
         // explicit sync is inserted — symptom: cocos text labels
-        // intermittently upload as blank textures.  See section
-        // "Mali Canvas2D snapshot sync" in CLAUDE.md for full
-        // background.
+        // intermittently upload as blank textures.
         //
         // `glFenceSync` + `glClientWaitSync` is the targeted form of
         // `glFinish`: it only waits for the commands queued before

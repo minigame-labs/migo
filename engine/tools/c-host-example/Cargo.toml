@@ -11,7 +11,7 @@ edition = "2024"
 # packaged form instead: scripts/build-linux-sdk.sh stages pkg-config and CMake
 # metadata, and examples/c-host/build-with-pkgconfig.sh builds this same C file
 # through it. (An earlier note here claimed a Rust staticlib omits the native
-# archives; it does not -- see CLAUDE.md 10.2.)
+# archives; it does not.)
 [[bin]]
 name = "migo-c-host"
 path = "src/main.rs"

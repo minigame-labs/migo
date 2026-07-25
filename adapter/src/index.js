@@ -63,8 +63,7 @@ if (!globalThis.__migoAdapterInjected) {
   // ---- Touch -> DOM touch events, tracking W3C compat-mouse suppression. ----
   // `_touchCompat` is null when no touch interaction is concurrent; otherwise it
   // is the current interaction's touchstart `defaultPrevented`, which decides
-  // whether the paired compatibility mouse events are dropped. See
-  // docs/superpowers/specs/2026-07-25-desktop-pointer-touch-compat-events-design.md.
+  // whether the paired compatibility mouse events are dropped.
   let _touchCompat = null;
   const _forwardTouch = (type) => (e) => {
     const ev = new TouchEvent(type, {

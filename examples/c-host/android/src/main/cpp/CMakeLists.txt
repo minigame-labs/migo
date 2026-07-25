@@ -34,7 +34,7 @@ target_include_directories(migo_c_host PRIVATE ${MIGO_ROOT}/include)
 # those features, so that object references symbols that do not exist. An
 # executable survives because the unreferenced wrappers are collected before
 # their references have to resolve; a shared library keeps every global unless
-# told otherwise. See CLAUDE.md 10.2.
+# told otherwise.
 # No --exclude-libs,ALL here. That flag belongs on a library with an ABI to
 # pin, which is what the Linux SDK does; on an application it hides
 # ANativeActivity_onCreate, which comes from the *static* native_app_glue, and

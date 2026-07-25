@@ -94,3 +94,20 @@ examples/c-host/android/build/
 examples/c-host/android/.cxx/
 examples/c-host/android/src/main/jniLibs-static/
 examples/c-host/linux/c-host
+
+# Maintainer working notes, internal planning documents and one-off audit
+# tooling. These are deliberately not published: they are the accumulated
+# record of which trap was hit on which device and how each was resolved,
+# which is the expensive half of this project to rebuild and is worth nothing
+# to someone consuming the runtime. What a consumer needs is README.md,
+# docs/BUILD.md, docs/multiplatform-architecture.md and include/migo/.
+# Placed last so these win over the `!docs/` re-inclusion above.
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.codex/
+.superpowers/
+docs/superpowers/
+docs/gtm-*.md
+platforms/windows/SPIKE-REPORT.md
+tools/wx-api-diff/

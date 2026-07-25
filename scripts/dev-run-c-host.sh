@@ -3,7 +3,7 @@
 #
 # Build and run examples/c-host: a third-party host written in C that drives the
 # engine through the public C ABI only. It links the `capi` staticlib, which is
-# why no shared-TLS V8 rebuild is needed yet (CLAUDE.md §10) — a staticlib goes
+# why no shared-TLS V8 rebuild is needed yet — a staticlib goes
 # into a normal executable.
 #
 # Usage:

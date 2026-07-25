@@ -1,6 +1,4 @@
 //! Process-wide, poll-scoped deadline watchdog (R4).
-//!
-//! See `docs/superpowers/specs/2026-07-12-process-deadline-watchdog-design.md`.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;

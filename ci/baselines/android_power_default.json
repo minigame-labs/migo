@@ -1,5 +1,5 @@
 {
-  "_comment": "Power/resource baseline thresholds for Migo Android runtime. Metrics collected from Java-side instrumentation (Debug.getNativeHeapAllocatedSize, /proc/self/stat, BatteryManager). See CLAUDE.md section 11.1.",
+  "_comment": "Power/resource baseline thresholds for Migo Android runtime. Metrics collected from Java-side instrumentation (Debug.getNativeHeapAllocatedSize, /proc/self/stat, BatteryManager).",
   "version": 1,
   "metrics": {
     "cpu_avg_pct": {

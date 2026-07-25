@@ -5,9 +5,9 @@ How to set up a development environment and build Migo on **Linux**,
 (unit tests, smoke checks) and Android cross-compilation
 (`libmigo.so`, AAR packaging).
 
-> This is the operational companion to [`CLAUDE.md`](../CLAUDE.md),
-> which describes *what* the engine does. This file describes *how*
-> to build it.
+> This file describes *how* to build the engine. For *what* it is made of
+> and where the platform boundaries sit, see
+> [`multiplatform-architecture.md`](multiplatform-architecture.md).
 
 ---
 
@@ -420,5 +420,5 @@ Things the build guarantees (verified by `scripts/ci/run_smoke.sh`):
   (+2.08% vs the M0 pre-refactor baseline). Significant regressions
   should be justified in the commit.
 
-If any of these change, update **this file**, `CLAUDE.md` Section 13,
-and the corresponding CI check in lock-step.
+If any of these change, update **this file** and the corresponding CI
+check in lock-step.

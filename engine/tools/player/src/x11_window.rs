@@ -15,8 +15,7 @@
 //! `scripts/test-surface-attachment-contract.sh` forbids anywhere under
 //! `engine/crates` (it greps for the symbol names, so even naming them here
 //! would fail the gate). The enforced gate wins over the unimplemented
-//! intention; the reasoning is written out in
-//! `docs/superpowers/specs/2026-07-18-linux-x11-presenter-design.md`.
+//! intention.
 
 use std::{
     ffi::{CString, c_ulong, c_void},
