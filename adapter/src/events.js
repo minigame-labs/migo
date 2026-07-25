@@ -53,6 +53,19 @@ export class WheelEvent extends MouseEvent {
   }
 }
 
+export class KeyboardEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.key = init.key || "";
+    this.code = init.code || "";
+    this.ctrlKey = !!init.ctrlKey;
+    this.shiftKey = !!init.shiftKey;
+    this.altKey = !!init.altKey;
+    this.metaKey = !!init.metaKey;
+    this.repeat = !!init.repeat;
+  }
+}
+
 export class DeviceMotionEvent extends Event {
   constructor(type, init = {}) {
     super(type, init);

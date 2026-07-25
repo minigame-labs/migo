@@ -15,7 +15,7 @@
   "scripts": {
     "build": "node scripts/build-bundle.mjs",
     "pretest": "npm run build",
-    "test": "node tests/adapter.test.mjs && node tests/gamepad.test.mjs && node tests/bundle.test.mjs && node tests/pointer-compat.test.mjs",
+    "test": "node tests/adapter.test.mjs && node tests/gamepad.test.mjs && node tests/bundle.test.mjs && node tests/pointer-compat.test.mjs && node tests/keyboard-events.test.mjs",
     "prepack": "npm run build"
   },
   "license": "MIT",
