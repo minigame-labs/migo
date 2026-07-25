@@ -1,6 +1,6 @@
 {
   "schema": "migo-v8-component-manifest/v1",
-  "component_id": "415e8b8d33bde71a84a988f2d6054148c98cc54c79ef029698f495a8b0b63481",
+  "component_id": "753117d758e1c9097ed136f315c95551a123739a17b070a4343ba62154eb259d",
   "target": {
     "triple": "x86_64-linux-android",
     "os": "android",
@@ -62,7 +62,7 @@
   "provenance": {
     "source_revision": "e6a88b35dd3d7f2849a0df33a71d338701c55316",
     "build_recipe": "scripts/build-v8-android.sh",
-    "build_recipe_sha256": "f8669cda3b1171cc99a0654009878c5a947b7e73328e6114032b0c720845b3a2",
+    "build_recipe_sha256": "55c4bc2ee5d15be4293e5679813f64a7089a0bb4def8b95d0e583d094a4fd033",
     "licenses": [
       "BSD-3-Clause",
       "MIT"
