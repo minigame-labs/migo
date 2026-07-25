@@ -17,7 +17,7 @@ import document from "./document.js";
 import HTMLElement, { Node, Element, HTMLImageElement, HTMLCanvasElement,
                        HTMLAudioElement, HTMLMediaElement, HTMLVideoElement } from "./element.js";
 import EventTarget from "./event-target.js";
-import { Event, TouchEvent, MouseEvent, WheelEvent, DeviceMotionEvent } from "./events.js";
+import { Event, TouchEvent, MouseEvent, WheelEvent, KeyboardEvent, DeviceMotionEvent } from "./events.js";
 import { GamepadEvent, connectGamepadEvents } from "./gamepad.js";
 import Image from "./image.js";
 import Canvas from "./canvas.js";
@@ -135,6 +135,30 @@ if (!globalThis.__migoAdapterInjected) {
     });
   }
 
+  // ---- Physical keyboard -> DOM keydown/keyup. ------------------------------
+  // Keyboard events target the document/window in the DOM -- there is no focused
+  // element model here -- so unlike pointer events they are not routed to the
+  // canvas. HTML5 games listen via `window`/`document` addEventListener (WASD,
+  // arrows). migo.onKeyDown/onKeyUp already carry DOM `key`/`code`/modifiers.
+  const _forwardKey = (type) => (e) => {
+    const ev = new KeyboardEvent(type, {
+      bubbles: true, cancelable: true,
+      key: e.key, code: e.code,
+      ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, metaKey: e.metaKey,
+      repeat: e.repeat,
+    });
+    ev.timeStamp = e.timeStamp;
+    ev.target = document;
+    document.dispatchEvent(ev);
+    _winTarget.dispatchEvent(ev);
+    const sink = document["on" + type];
+    if (typeof sink === "function") try { sink(ev); } catch {}
+    const wsink = globalThis["on" + type];
+    if (typeof wsink === "function") try { wsink(ev); } catch {}
+  };
+  if (typeof migo.onKeyDown === "function") migo.onKeyDown(_forwardKey("keydown"));
+  if (typeof migo.onKeyUp === "function") migo.onKeyUp(_forwardKey("keyup"));
+
   // 2b. Gamepad connection events. Browsers fire these on window only -- not on
   //     document and not on the canvas -- so unlike touch above this routes to
   //     exactly one target.
@@ -165,7 +189,7 @@ if (!globalThis.__migoAdapterInjected) {
     HTMLElement, Element, Node,
     HTMLImageElement, HTMLCanvasElement, HTMLAudioElement,
     HTMLMediaElement, HTMLVideoElement,
-    EventTarget, Event, TouchEvent, MouseEvent, DeviceMotionEvent, GamepadEvent,
+    EventTarget, Event, TouchEvent, MouseEvent, WheelEvent, KeyboardEvent, DeviceMotionEvent, GamepadEvent,
     Image, Audio,
     XMLHttpRequest, WebSocket, FileReader,
     localStorage,
