@@ -288,11 +288,6 @@ jobs:
           python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-slim-release.aar \
             > platforms/android/dist/size-report-slim.txt || true
 
-      - name: Generate checksums
-        run: |
-          cd platforms/android/dist
-          sha256sum * > SHA256SUMS.txt
-
       - name: Write version metadata
         run: |
           cat > platforms/android/dist/version.json <<VEOF
@@ -303,6 +298,16 @@ jobs:
             "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           }
           VEOF
+
+      # Must stay last among the steps that write into dist: SHA256SUMS.txt
+      # is a manifest over "everything currently in dist", so anything that
+      # writes here after this step runs would ship uncovered by the
+      # checksums. If you add a step below that writes into dist, either move
+      # it above this one or accept that gap explicitly.
+      - name: Generate checksums
+        run: |
+          cd platforms/android/dist
+          sha256sum * > SHA256SUMS.txt
 
       - name: Optional power baseline compare
         run: |
@@ -320,13 +325,20 @@ jobs:
         # otherwise publish a release missing an artifact without failing
         # anything -- consumers would just find the asset absent. Named
         # explicitly (not a glob) so a missing file fails loudly here rather
-        # than at publish time.
+        # than at publish time. Covers everything the job unconditionally
+        # produces; the size reports are written with `|| true` (legitimately
+        # optional) and are intentionally excluded -- they are published via
+        # a glob instead, see the publish step below.
         run: |
           for f in \
             platforms/android/dist/migo-full-release.aar \
             platforms/android/dist/migo-full-release.aar.attestation.json \
             platforms/android/dist/migo-slim-release.aar \
             platforms/android/dist/migo-slim-release.aar.attestation.json \
+            platforms/android/dist/version.json \
+            platforms/android/dist/version-full.json \
+            platforms/android/dist/version-slim.json \
+            platforms/android/dist/SHA256SUMS.txt \
           ; do
             if [ ! -f "$f" ]; then
               echo "missing release artifact: $f" >&2
@@ -342,5 +354,10 @@ jobs:
             platforms/android/dist/migo-full-release.aar.attestation.json
             platforms/android/dist/migo-slim-release.aar
             platforms/android/dist/migo-slim-release.aar.attestation.json
+            platforms/android/dist/version.json
+            platforms/android/dist/version-full.json
+            platforms/android/dist/version-slim.json
+            platforms/android/dist/SHA256SUMS.txt
+            platforms/android/dist/size-report-*.txt
             reports/*.json
           generate_release_notes: true
