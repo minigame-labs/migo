@@ -15,6 +15,18 @@
 # This is source-only: it parses .github/workflows/release.yml with PyYAML
 # and inspects each step's `run:` text. It never executes the workflow or any
 # step's script.
+#
+# Deny-by-default, not allow-by-default: an earlier version of this gate
+# recognized three write shapes (redirection, cp/mv, cd+relative-write) and
+# called anything that didn't match one of them "clean". Review found
+# `tee file`, `install ... file`, an `env FOO=bar cp ... file` prefix, and a
+# `python3 -c "...write..."` one-liner all sailed through as clean -- the
+# allowlist of write shapes was necessarily incomplete, and every shape
+# nobody had thought of yet was silently safe. Inverted: once a step's `run`
+# text mentions platforms/android/dist anywhere (or `cd`s into it), every
+# command in that step must be affirmatively recognized as read-only, or the
+# gate fails and names the command it could not clear. Being unable to
+# classify a command is treated exactly like proof that it writes.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,10 +35,15 @@ WORKFLOW="${1:-$ROOT_DIR/.github/workflows/release.yml}"
 # A gate whose tool is missing must say so, not silently report the
 # invariant as satisfied (or as broken) -- see
 # scripts/test-surface-attachment-contract.sh for the same principle applied
-# to a missing `rg`.
+# to a missing `rg`. Deliberately does NOT try to `pip install` PyYAML itself:
+# Ubuntu 24.04+ enforces PEP 668 (externally-managed-environment), so a bare
+# `pip install` here can fail on the very runner this is meant to protect.
+# The call site (pr-ci.yml) is responsible for making PyYAML available before
+# invoking this script; this script only verifies and reports.
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
-    echo "Release asset ordering contract could not run: PyYAML is not installed for python3." >&2
-    echo "This is a missing tool, NOT a contract violation. Install PyYAML (pip install pyyaml) and re-run." >&2
+    echo "Release asset ordering contract could not run: PyYAML is not importable by python3." >&2
+    echo "This is a missing tool, NOT a contract violation. Make PyYAML available (the CI step" >&2
+    echo "that calls this script is responsible for that) and re-run." >&2
     exit 127
 fi
 
@@ -89,90 +106,204 @@ if len(matches) > 1:
 job_name, steps, checksum_idx = matches[0]
 checksum_step_name = (steps[checksum_idx] or {}).get("name", f"<step {checksum_idx}>")
 
+# --- Narrow, explicit allowlist of read-only shapes -------------------------
+#
+# Anything not recognized below is treated as a write (fail closed). This is
+# deliberately small: it exists to let genuinely read-only shell plumbing
+# (an existence-check loop, an `if`/`for` control structure, a diagnostic
+# `echo` to stderr) pass, not to anticipate every safe command that could
+# ever be written. Extend it only for a concrete, reviewed case.
 
-def split_shell_words(s: str):
+# Shell keywords/builtins that never touch the filesystem by themselves.
+SAFE_LEADING_TOKENS = {
+    "then", "else", "elif", "fi", "do", "done", "in", "esac", ":",
+    "true", "false", "exit", "return", "cd",
+}
+# Commands that are read-only UNLESS they carry an output redirection; their
+# redirection targets (if any) still have to be proven to land outside DIST.
+SAFE_IF_REDIRECTS_ARE_SAFE = {"echo", "printf"}
+# The POSIX test command, in both spellings; same redirection caveat.
+READONLY_TEST_COMMANDS = {"[", "test"}
+
+IF_PREFIX_RE = re.compile(r"^(if|elif|while|until)\s+(.*)$")
+FOR_HEADER_RE = re.compile(r"^for\s+\w+\s+in\b")
+CD_RE = re.compile(r"^cd\s+(.+)$")
+
+
+def logical_lines(run_text: str) -> list[str]:
+    """Join backslash line-continuations the way a shell would, so a
+    multi-line `for f in \\ ... \\ ; do` becomes one line to classify."""
+    joined: list[str] = []
+    buf = ""
+    for raw_line in run_text.splitlines():
+        line = (buf + " " + raw_line) if buf else raw_line
+        stripped = line.rstrip()
+        if stripped.endswith("\\") and not stripped.endswith("\\\\"):
+            buf = stripped[:-1]
+            continue
+        buf = ""
+        joined.append(line)
+    if buf:
+        joined.append(buf)
+    return joined
+
+
+def split_top_level(line: str, seps=(";", "&&", "||", "|", "&")) -> list[str]:
+    """Split a logical shell line into commands at top-level `;`, `&&`,
+    `||`, `|`, `&`, respecting simple quoting and leaving fd-duplication
+    redirects like `>&1` / `2>&1` intact (a bare `&` there is not a
+    backgrounding operator)."""
+    chunks: list[str] = []
+    buf = ""
+    i = 0
+    n = len(line)
+    in_squote = False
+    in_dquote = False
+    seps_sorted = sorted(seps, key=len, reverse=True)
+    while i < n:
+        c = line[i]
+        if in_squote:
+            buf += c
+            if c == "'":
+                in_squote = False
+            i += 1
+            continue
+        if in_dquote:
+            buf += c
+            if c == '"' and line[i - 1] != "\\":
+                in_dquote = False
+            i += 1
+            continue
+        if c == "'":
+            in_squote = True
+            buf += c
+            i += 1
+            continue
+        if c == '"':
+            in_dquote = True
+            buf += c
+            i += 1
+            continue
+        if c == "&" and i > 0 and line[i - 1] == ">":
+            buf += c
+            i += 1
+            continue
+        matched = next((sep for sep in seps_sorted if line.startswith(sep, i)), None)
+        if matched:
+            chunks.append(buf)
+            buf = ""
+            i += len(matched)
+            continue
+        buf += c
+        i += 1
+    chunks.append(buf)
+    return [c.strip() for c in chunks if c.strip() != ""]
+
+
+def split_shell_words(chunk: str):
     try:
-        return shlex.split(s)
+        return shlex.split(chunk)
     except ValueError:
         return None
 
 
-def analyze_run(run_text: str):
-    """Return ('clean' | 'writes' | 'undetermined', reason) for one step's
-    `run:` text, scanning for the three write shapes named in the contract:
-    a redirection into DIST, a cp/mv targeting DIST, or a `cd` into DIST
-    followed by an output-producing command using a path relative to it.
-    Conservative: anything this cannot resolve statically (a variable or
-    expression standing in for a path) is 'undetermined', which the caller
-    treats the same as a violation.
+def redirect_targets(chunk: str) -> list[tuple[str, str]]:
+    return [(op, target) for op, _q, target in re.findall(r"(>>?)\s*(\"?)([^\s\"|&;]+)", chunk)]
+
+
+def redirect_is_safe(target: str, cwd_is_dist: bool) -> bool:
+    if target.startswith("&") or target.isdigit():
+        return True  # fd duplication (`>&2`), not a filesystem write
+    if DIST in target:
+        return False
+    if "$" in target or "{{" in target:
+        return False  # unresolvable -- conservative: not provably safe
+    if cwd_is_dist and not target.startswith("/"):
+        return False
+    return True
+
+
+def is_safe_chunk(chunk: str, cwd_is_dist: bool) -> tuple[bool, str | None]:
+    """Return (True, None) if this single command is affirmatively provable
+    as read-only; otherwise (False, reason). No catch-all 'else clean' path:
+    anything not matched by the allowlist below falls through to the final
+    `return False`."""
+    chunk = chunk.strip()
+    if not chunk or chunk.startswith("#"):
+        return True, None
+
+    m = IF_PREFIX_RE.match(chunk)
+    if m:
+        chunk = m.group(2).strip()
+
+    if FOR_HEADER_RE.match(chunk):
+        return True, None
+
+    words = split_shell_words(chunk)
+    if words is None:
+        return False, f"could not tokenize `{chunk}` to classify it"
+    if not words:
+        return True, None
+
+    # A bare `NAME=value` with nothing after it assigns a shell variable and
+    # executes nothing. `NAME=value some_command ...` is multiple tokens and
+    # falls through instead -- it runs `some_command`, which must itself be
+    # cleared.
+    if len(words) == 1 and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+        return True, None
+
+    head = words[0]
+
+    if head in SAFE_LEADING_TOKENS or head in READONLY_TEST_COMMANDS or head in SAFE_IF_REDIRECTS_ARE_SAFE:
+        for op, target in redirect_targets(chunk):
+            if not redirect_is_safe(target, cwd_is_dist):
+                return False, f"`{chunk}` redirects ({op}) into `{target}`"
+        return True, None
+
+    return False, f"`{head}` is not a recognized read-only command (`{chunk}`)"
+
+
+def analyze_run(run_text: str) -> tuple[str, str]:
+    """Return ('clean' | 'writes' | 'undetermined', reason).
+
+    If DIST is not mentioned anywhere in this step's `run` text, there is
+    nothing for this text-based contract to scrutinize -- 'clean'. Otherwise
+    every command in the step must clear is_safe_chunk(); the first one that
+    doesn't determines the verdict. 'undetermined' (an unresolvable `cd`
+    target) is handled identically to 'writes' by the caller -- both fail
+    the gate.
     """
+    if DIST not in run_text:
+        return "clean", ""
+
     cwd_is_dist = False
-    for raw_line in run_text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        cd_match = re.match(r"^cd\s+(.+)$", line)
-        if cd_match:
-            target_raw = cd_match.group(1).split("&&")[0].split(";")[0].strip()
-            target = target_raw.strip("\"'").rstrip("/")
-            if target in (DIST, f"./{DIST}"):
-                cwd_is_dist = True
-                continue
-            if "$" in target or "{{" in target:
-                return (
-                    "undetermined",
-                    f"`cd {target_raw}` targets a variable/expression path that cannot be "
-                    "statically resolved against " + DIST,
-                )
-            cwd_is_dist = False
-            continue
-
-        # Redirection: `> target` / `>> target`, skipping fd-duplication like `2>&1`.
-        for op, _quote, target in re.findall(r"(>>?)\s*(\"?)([^\s\"|&;]+)", line):
-            if target.startswith("&") or target.isdigit():
-                continue
-            if DIST in target:
-                return ("writes", f"redirects ({op}) into `{target}`")
-            if cwd_is_dist:
-                if "$" in target or "{{" in target:
+    for logical in logical_lines(run_text):
+        for chunk in split_top_level(logical):
+            candidate = chunk
+            m = IF_PREFIX_RE.match(candidate)
+            if m:
+                candidate = m.group(2).strip()
+            cd_match = CD_RE.match(candidate)
+            if cd_match:
+                target_raw = cd_match.group(1).strip()
+                target = target_raw.strip("\"'").rstrip("/")
+                if target in (DIST, f"./{DIST}"):
+                    cwd_is_dist = True
+                elif "$" in target or "{{" in target:
                     return (
                         "undetermined",
-                        f"redirects into variable path `{target}` while cwd is {DIST} "
-                        f"(via a prior `cd {DIST}`)",
+                        f"`cd {target_raw}` targets an unresolvable path, and this step "
+                        f"otherwise mentions {DIST}",
                     )
-                if not target.startswith("/"):
-                    return (
-                        "writes",
-                        f"redirects ({op}) into `{target}` while cwd is {DIST} "
-                        f"(via a prior `cd {DIST}`)",
-                    )
+                else:
+                    cwd_is_dist = False
+                continue
 
-        cpmv_match = re.match(r"^(cp|mv)\s+(.*)$", line)
-        if cpmv_match:
-            cmd, rest = cpmv_match.groups()
-            words = split_shell_words(rest)
-            if words is None:
-                return ("undetermined", f"`{line}` could not be tokenized to find its destination")
-            args = [w for w in words if not w.startswith("-")]
-            if not args:
-                return ("undetermined", f"`{line}` has no discernible destination argument")
-            dest = args[-1]
-            if DIST in dest:
-                return ("writes", f"`{cmd}` targets `{dest}`")
-            if "$" in dest or "{{" in dest:
-                return (
-                    "undetermined",
-                    f"`{cmd}` destination `{dest}` is a variable/expression that cannot be "
-                    "statically resolved",
-                )
-            if cwd_is_dist and not dest.startswith("/"):
-                return (
-                    "writes",
-                    f"`{cmd}` targets `{dest}` while cwd is {DIST} (via a prior `cd {DIST}`)",
-                )
+            ok, reason = is_safe_chunk(chunk, cwd_is_dist)
+            if not ok:
+                return "writes", reason
 
-    return ("clean", "")
+    return "clean", ""
 
 
 violations: list[tuple[str, str]] = []
@@ -185,8 +316,8 @@ for idx in range(checksum_idx + 1, len(steps)):
     if run is None:
         # No shell text for this text-based contract to read (e.g. a `uses:`
         # step like the publish action, which reads from dist to upload
-        # elsewhere but has no run body that could write into it). Not
-        # flagged -- there is nothing here to find a write in.
+        # elsewhere but has no run body). Not flagged -- there is no text
+        # here to find anything in, safe or not.
         continue
     if not isinstance(run, str):
         undetermined.append((step_name, "`run` is not a plain string"))
@@ -201,9 +332,9 @@ for idx in range(checksum_idx + 1, len(steps)):
 if undetermined:
     for name, reason in undetermined:
         print(
-            f"ERROR: cannot determine whether step '{name}' (after '{checksum_step_name}' "
-            f"in job '{job_name}') writes into {DIST}: {reason} -- being conservative, "
-            "treating this as a violation",
+            f"ERROR: could not establish that step '{name}' (after '{checksum_step_name}' "
+            f"in job '{job_name}') is read-only with respect to {DIST}: {reason} -- being "
+            "conservative, treating this as a violation",
             file=sys.stderr,
         )
     sys.exit(1)
@@ -211,16 +342,17 @@ if undetermined:
 if violations:
     for name, reason in violations:
         print(
-            f"ERROR: step '{name}' runs after '{checksum_step_name}' in job '{job_name}' and "
-            f"writes into {DIST} ({reason}) -- SHA256SUMS.txt is generated before this step "
-            "runs, so the published manifest would stop covering everything the release "
+            f"ERROR: step '{name}' runs after '{checksum_step_name}' in job '{job_name}', "
+            f"mentions {DIST}, and could not be proven read-only ({reason}) -- "
+            "SHA256SUMS.txt is generated before this step runs, so if this step writes into "
+            f"{DIST} the published manifest would stop covering everything the release "
             "publishes",
             file=sys.stderr,
         )
     sys.exit(1)
 
 print(
-    f"OK: '{checksum_step_name}' (job '{job_name}') is the sole SHA256SUMS.txt writer, and no "
-    f"later step in that job writes into {DIST}"
+    f"OK: '{checksum_step_name}' (job '{job_name}') is the sole SHA256SUMS.txt writer, and "
+    f"every later step in that job is either unrelated to {DIST} or proven read-only against it"
 )
 PY
