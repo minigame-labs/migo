@@ -77,10 +77,16 @@ jobs:
         run: bash scripts/test-platform-services-capability-contract.sh
 
       - name: Release asset ordering contract
-        # PyYAML is not guaranteed preinstalled on the runner image; mirrors
-        # the ripgrep fallback above rather than assuming it's there.
+        # PyYAML is not guaranteed preinstalled on the runner image, so this
+        # mirrors the ripgrep fallback above rather than assuming it's there
+        # -- but a bare `pip install` is not enough: Ubuntu 24.04 runners
+        # enforce PEP 668 (an EXTERNALLY-MANAGED marker on the system
+        # Python), and pip refuses to touch it without an explicit override.
+        # --break-system-packages is that override, deliberately scoped to
+        # this disposable CI container rather than a shared machine, and is
+        # only reached at all if `import yaml` already fails.
         run: |
-          python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet pyyaml
+          python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet --break-system-packages pyyaml
           bash scripts/test-release-asset-ordering-contract.sh
 
       # Source-only, so it belongs here rather than in the device lane -- which
