@@ -346,6 +346,18 @@ jobs:
             fi
           done
 
+      # fail_on_unmatched_files defaults to false in this action (checked
+      # against its action.yml), so without setting it a named file missing
+      # at publish time would ship the release silently incomplete instead of
+      # failing -- the assertion step above makes that unreachable today, but
+      # only by step adjacency, which is exactly the kind of thing a later
+      # edit can quietly break. This step's file list must stay limited to
+      # paths the assertion step just proved exist: action-gh-release resolves
+      # `fail_on_unmatched_files` per glob pattern (src/util.ts,
+      # unmatchedPatterns/run.ts in softprops/action-gh-release), so a
+      # pattern matching zero files fails the step regardless of whether
+      # other patterns matched. Mixing in the legitimately-optional globs
+      # below would turn "no size report this run" into a failed release.
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v3
         with:
@@ -358,6 +370,23 @@ jobs:
             platforms/android/dist/version-full.json
             platforms/android/dist/version-slim.json
             platforms/android/dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      # Separate, best-effort invocation for the assets that are legitimately
+      # variable in count: the size reports are written with `|| true` (an
+      # analyzer failure must not block the release) and the power-baseline
+      # comparison above only runs when ci/metrics/current_power_metrics.json
+      # is present, so `reports/*.json` can match zero files on an ordinary
+      # run. fail_on_unmatched_files is deliberately left at its default
+      # (false) here -- turning it on would fail every release that skipped
+      # a size report or had nothing to compare power against. Calling the
+      # action again for the same tag is safe: it looks the release up by
+      # tag (github.ts, release()) and appends to what the step above already
+      # created, it does not recreate it.
+      - name: Publish optional Android size/power reports
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
             platforms/android/dist/size-report-*.txt
             reports/*.json
-          generate_release_notes: true
