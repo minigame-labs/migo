@@ -76,6 +76,13 @@ jobs:
       - name: Platform services capability contract
         run: bash scripts/test-platform-services-capability-contract.sh
 
+      - name: Release asset ordering contract
+        # PyYAML is not guaranteed preinstalled on the runner image; mirrors
+        # the ripgrep fallback above rather than assuming it's there.
+        run: |
+          python3 -c "import yaml" >/dev/null 2>&1 || pip install --quiet pyyaml
+          bash scripts/test-release-asset-ordering-contract.sh
+
       # Source-only, so it belongs here rather than in the device lane -- which
       # is the point: the failure it catches (content calling a capability on
       # the wx namespace, which does not carry it) presents on a device as a
