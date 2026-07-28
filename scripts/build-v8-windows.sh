@@ -68,7 +68,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGINE_ROOT="$PROJECT_ROOT/engine"
 TARGET="x86_64-pc-windows-msvc"
 OUT_DIR="$ENGINE_ROOT/third_party/rusty_v8/$TARGET"
-V8_BUILD_LOCK="$PROJECT_ROOT/contracts/artifact-manifest/android-v8.lock.json"
+V8_BUILD_LOCK="$PROJECT_ROOT/contracts/artifact-manifest/windows-v8.lock.json"
 
 # Windows-side paths. All DOS form: they are written into a batch file.
 RUSTY_V8_SRC_WIN="${RUSTY_V8_SRC_WIN:-C:\\v8src}"
@@ -107,6 +107,13 @@ SRC_UNIX="$(win_to_unix "$RUSTY_V8_SRC_WIN")"
 # script three layers down.
 check_ready() {
     local failures=0
+
+    # Same assertion build-v8-android.sh makes: the pin has to exist before the
+    # build, not after it. Without it there is nothing to check the resulting
+    # bytes against, and this build takes hours to discover that at the end.
+    if [[ ! -f "$V8_BUILD_LOCK" ]]; then
+        err "V8 source lock not found: $V8_BUILD_LOCK"; failures=$((failures + 1))
+    fi
 
     if [[ ! -f "$SRC_UNIX/build.rs" ]]; then
         err "not a rusty_v8 checkout: $RUSTY_V8_SRC_WIN (no build.rs)"; failures=$((failures + 1))
@@ -330,10 +337,20 @@ ok "dll     -> $OUT_DIR/rusty_v8.dll ($(du -h "$OUT_DIR/rusty_v8.dll" | cut -f1)
 ok "implib  -> $OUT_DIR/rusty_v8.dll.lib ($(du -h "$OUT_DIR/rusty_v8.dll.lib" | cut -f1))"
 ok "binding -> $OUT_DIR/src_binding.rs"
 
-# The component manifest is deliberately not written yet. Its writer is
-# per-platform (scripts/write-{,linux-}v8-component-manifest.py) and a Windows
-# one needs a windows-v8.lock.json to verify against; $V8_BUILD_LOCK covers the
-# Android targets only. Producing an unverified manifest would defeat the point
-# of having one, so this reports the gap instead of papering over it.
-info "component manifest not written: needs a Windows lock + writer (see $V8_BUILD_LOCK for the Android shape)"
+# The component manifest is not written yet: the source lock exists
+# ($V8_BUILD_LOCK, pinning the rusty_v8/V8 revisions and GN args this build
+# uses), but the writer does not. Writers are per-platform
+# (scripts/write-{,linux-}v8-component-manifest.py) because each records a
+# different toolchain and artifact shape -- Windows ships a DLL plus an import
+# library, not a single archive.
+#
+# It must be written HERE, in the build, not reconstructed afterwards: the
+# manifest asserts which sources and toolchain produced these exact bytes, and
+# only the build knows that. Generating one later from whatever the checkout
+# happens to look like would produce a provenance record that reads as
+# authoritative while attesting to nothing, which is worse than its absence --
+# scripts/fetch-v8-archives.sh keys its integrity check on these manifests, so
+# a fabricated one would be trusted.
+info "component manifest not written: $V8_BUILD_LOCK exists, its writer does not"
+info "  -> until then this target cannot be published; see scripts/fetch-v8-archives.sh"
 ok "V8 build complete for $TARGET"
