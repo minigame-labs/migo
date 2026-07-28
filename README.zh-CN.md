@@ -25,12 +25,15 @@
 
 ## 平台支持
 
-| 平台 | 状态 | 交付物 |
+| 平台 | 状态 | 已发布产物 |
 |---|---|---|
-| **Android**（arm64-v8a、x86_64） | 主要目标 | 含 Java/Kotlin SDK 的 AAR；含 C ABI 的 NDK 静态库 |
-| **Linux**（x86_64） | 已实现 | 静态库与共享库、pkg-config 与 CMake 包、Qt 6 / X11 host kit |
-| **Windows**（x86_64） | 可渲染、可接收输入；打包未完成 | — |
+| **Android**（arm64-v8a、x86_64） | 已发布 | 含 Java/Kotlin SDK 的 AAR;按 ABI 发布的 C ABI 包(头文件、静态库、CMake 包) |
+| **Linux**（x86_64） | 已发布 | 静态库与共享库、pkg-config 与 CMake 包;Qt 6 / X11 host kit 在仓库内 |
+| **Windows**（x86_64） | 可构建可运行;未发布 | 经 ANGLE 渲染、可接收输入;SDK 可在本地打包,但其 V8 组件尚未发布 |
 | iOS、macOS、鸿蒙 | 计划中 | — |
+
+已发布产物见 [releases 页面](https://github.com/minigame-labs/migo/releases)。每个产物都带
+`.attestation.json`,记录归档的名称、大小与 sha256 —— 使用前请对照校验。
 
 [`include/migo/`](include/migo/) 中的 C ABI 目前是 **candidate**——在 Android 与 Linux 上已有可用运行时，但尚未冻结。冻结前还剩哪些事项，以该目录下的 README 为准。
 
