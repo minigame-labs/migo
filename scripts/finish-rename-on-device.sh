@@ -82,7 +82,7 @@ for g in test-core-v8-boundary-contract test-platform-v8-boundary-contract \
          test-platform-services-capability-contract test-surface-attachment-contract \
          test-c-abi-surface-candidate test-capi-platform-contract \
          test-r9-worker-snapshot test-product-profiles \
-         test-example-content-namespace-contract; do
+         test-content-namespace-contract; do
     printf '%-46s ' "$g"
     if bash "scripts/$g.sh" >/tmp/finish-rename-$g.log 2>&1; then echo PASS; else echo FAIL; fail "$g"; fi
 done
@@ -96,7 +96,7 @@ the device, because it cannot be asserted from a script:
   * install the AAR into the bench shell and confirm rendering, the
     background-and-return path (the Canvas2D state-carry fix), and clean
     lifecycle;
-  * run examples/c-host/android to re-check the pure-native host after the
+  * run tests/c_host/android to re-check the pure-native host after the
     rename (build with scripts/build-android-c-host.sh);
   * only then is the rename branch mergeable, because a release AAR needs the
     snapshot chain this script restored.

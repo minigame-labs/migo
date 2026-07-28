@@ -52,7 +52,7 @@ Migo 是一个源码可审计、高性能、可嵌入的 HTML5 / Canvas2D / WebG
 
 ### Android 集成
 
-> 完整示例项目请参考 [migo-android-demo](https://github.com/minigame-labs/migo-android-demo)
+> 完整示例项目请参考 [migo-examples](https://github.com/minigame-labs/migo-examples)
 
 1. 添加 AAR 依赖到项目：
 

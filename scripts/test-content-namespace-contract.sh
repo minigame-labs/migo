@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The example content must not call capabilities on a namespace that does not
-# carry them.
+# Content in this repository must not call capabilities on a namespace that
+# does not carry them.
 #
 # `97_wx_namespace.js` mirrors most globals onto `wx`, but deliberately keeps a
 # few off it: wx has no gamepad API, so those names live on `migo` (and reach
@@ -14,6 +14,11 @@
 # The forbidden set is parsed out of the runtime source rather than repeated
 # here, so a capability added to `_NON_WX` later is covered without touching
 # this file.
+#
+# Scope: the conformance content under tests/c_host. The host-integration
+# examples that used to live beside it moved to minigame-labs/migo-examples,
+# which carries its own copy of this gate reading the same `_NON_WX` set from
+# this repository -- so the rule still covers both, from two places.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,15 +54,25 @@ if not forbidden:
     print("ERROR: the _NON_WX set parsed empty; the gate would pass vacuously", file=sys.stderr)
     sys.exit(1)
 
-examples = root / "examples"
+content_root = root / "tests" / "c_host"
 scanned = 0
-for source_path in sorted(examples.rglob("*.js")):
+for source_path in sorted(content_root.rglob("*.js")):
     if "/build/" in str(source_path):
         continue
     scanned += 1
     source = source_path.read_text(encoding="utf-8")
     for name in forbidden:
         # Word boundary, not substring: `wx.getGamepadsLater` is a different name.
+        #
+        # Deliberate limit, not an oversight: this matches only the literal
+        # `wx.<name>` form. Bracket notation (wx["getGamepads"]()), aliasing
+        # through another binding, and whitespace or a newline between the
+        # object and the property all evade it. Detecting those would mean
+        # deciding aliasing and computed property access statically, which is
+        # not possible in general; the mistake this gate exists to catch is the
+        # one as it is actually written in hand-authored content -- the literal
+        # form. Do not read this gate as proving no content can reach a
+        # non-wx capability.
         if re.search(r"\bwx\." + re.escape(name) + r"\b", source):
             relative = source_path.relative_to(root)
             errors.append(
@@ -67,7 +82,7 @@ for source_path in sorted(examples.rglob("*.js")):
             )
 
 if scanned == 0:
-    print("ERROR: no example JS found to scan; the gate would pass vacuously", file=sys.stderr)
+    print("ERROR: no content JS found to scan; the gate would pass vacuously", file=sys.stderr)
     sys.exit(1)
 
 if errors:
@@ -75,5 +90,5 @@ if errors:
         print(f"ERROR: {error}", file=sys.stderr)
     sys.exit(1)
 
-print(f"OK: {scanned} example sources use no wx-namespaced capability that wx does not carry")
+print(f"OK: {scanned} content sources use no wx-namespaced capability that wx does not carry")
 PY

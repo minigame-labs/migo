@@ -80,7 +80,7 @@ jobs:
         run: bash scripts/test-platform-services-capability-contract.sh
 
       - name: Example content namespace contract
-        run: bash scripts/test-example-content-namespace-contract.sh
+        run: bash scripts/test-content-namespace-contract.sh
 
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself
@@ -264,6 +264,14 @@ jobs:
 
       - name: Build Android AARs (release)
         run: |
+          # Start clean: build-aar.sh does not clear the output directory
+          # before writing, so a checkout with history (or a re-run) can
+          # leave stale AARs from earlier builds or older naming schemes
+          # sitting next to this run's output. The publish step below ships
+          # whatever is in this directory, so anything stale here would be
+          # uploaded as a release asset with no way for a consumer to tell
+          # it apart from the real thing.
+          rm -rf platforms/android/dist
           bash scripts/build-aar.sh --product-profile full release
           bash scripts/build-aar.sh --product-profile slim release
 
@@ -280,11 +288,6 @@ jobs:
           python3 scripts/size_report/analyze_so.py platforms/android/dist/migo-slim-release.aar \
             > platforms/android/dist/size-report-slim.txt || true
 
-      - name: Generate checksums
-        run: |
-          cd platforms/android/dist
-          sha256sum * > SHA256SUMS.txt
-
       - name: Write version metadata
         run: |
           cat > platforms/android/dist/version.json <<VEOF
@@ -295,6 +298,16 @@ jobs:
             "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           }
           VEOF
+
+      # Must stay last among the steps that write into dist: SHA256SUMS.txt
+      # is a manifest over "everything currently in dist", so anything that
+      # writes here after this step runs would ship uncovered by the
+      # checksums. If you add a step below that writes into dist, either move
+      # it above this one or accept that gap explicitly.
+      - name: Generate checksums
+        run: |
+          cd platforms/android/dist
+          sha256sum * > SHA256SUMS.txt
 
       - name: Optional power baseline compare
         run: |
@@ -307,10 +320,66 @@ jobs:
             echo "skip power baseline compare: ci/metrics/current_power_metrics.json not found"
           fi
 
+      - name: Verify Android release artifacts are present
+        # A build that silently stopped producing one of these would
+        # otherwise publish a release missing an artifact without failing
+        # anything -- consumers would just find the asset absent. Named
+        # explicitly (not a glob) so a missing file fails loudly here rather
+        # than at publish time. Covers everything the job unconditionally
+        # produces; the size reports are written with `|| true` (legitimately
+        # optional) and are intentionally excluded -- they are published via
+        # a glob instead, see the publish step below.
+        run: |
+          for f in \
+            platforms/android/dist/migo-full-release.aar \
+            platforms/android/dist/migo-full-release.aar.attestation.json \
+            platforms/android/dist/migo-slim-release.aar \
+            platforms/android/dist/migo-slim-release.aar.attestation.json \
+            platforms/android/dist/version.json \
+            platforms/android/dist/version-full.json \
+            platforms/android/dist/version-slim.json \
+            platforms/android/dist/SHA256SUMS.txt \
+          ; do
+            if [ ! -f "$f" ]; then
+              echo "missing release artifact: $f" >&2
+              exit 1
+            fi
+          done
+
+      # fail_on_unmatched_files is deliberately left at its default (false),
+      # NOT set to true. action-gh-release resolves it per glob pattern
+      # (softprops/action-gh-release src/util.ts unmatchedPatterns(), called
+      # from src/run.ts), so a single pattern matching zero files fails the
+      # whole step regardless of whether every other pattern matched. Two of
+      # the patterns below are legitimately variable in count --
+      # size-report-*.txt is written with `|| true` (an analyzer failure must
+      # not block the release) and reports/*.json only gets a file when
+      # ci/metrics/current_power_metrics.json exists to compare against --
+      # so enabling the flag would fail every release that skipped one of
+      # them. (A two-step split that set the flag only for the guaranteed
+      # files was tried and reverted: action-gh-release's createRelease
+      # defaults to draft: true and every invocation's finalizeRelease
+      # un-drafts it, so the first step would publish and un-draft the
+      # release, and a failure in the second step -- including the
+      # immutable-release rejection its own code path anticipates,
+      # isImmutableReleaseAssetUploadFailure -- would leave an already-public
+      # release permanently missing assets. That is worse than the gap this
+      # was meant to close.) The guarantee `fail_on_unmatched_files: true`
+      # would have provided for the eight required files is instead provided
+      # by the assertion step directly above, which runs first and fails the
+      # job before this step is ever reached.
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            platforms/android/dist/*
+            platforms/android/dist/migo-full-release.aar
+            platforms/android/dist/migo-full-release.aar.attestation.json
+            platforms/android/dist/migo-slim-release.aar
+            platforms/android/dist/migo-slim-release.aar.attestation.json
+            platforms/android/dist/version.json
+            platforms/android/dist/version-full.json
+            platforms/android/dist/version-slim.json
+            platforms/android/dist/SHA256SUMS.txt
+            platforms/android/dist/size-report-*.txt
             reports/*.json
           generate_release_notes: true

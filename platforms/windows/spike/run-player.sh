@@ -16,7 +16,7 @@ set -euo pipefail
 # at run time, exactly as the engine loads them on a user's machine.
 #
 # VERIFYING INPUT reaches content: run with --window against
-# examples/c-host/touch-probe (staged Windows-side). The probe paints the whole
+# tests/c_host/touch-probe (staged Windows-side). The probe paints the whole
 # screen one colour and changes it only when input arrives, so the captured frame
 # is the evidence: red = nothing ever arrived, green = a pointer is down, blue =
 # a press and release both reached JS. Click in the window while it runs.

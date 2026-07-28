@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/dev-run-c-host.sh
 #
-# Build and run examples/c-host: a third-party host written in C that drives the
+# Build and run tests/c_host: a third-party host written in C that drives the
 # engine through the public C ABI only. It links the `capi` staticlib, which is
 # why no shared-TLS V8 rebuild is needed yet — a staticlib goes
 # into a normal executable.
@@ -48,12 +48,12 @@ c_info "deployed '$CONTENT_ID' to $CODE_DIR"
 
 # ---- build the C host ----
 #
-# Cargo drives the link: `tools/c-host-example` compiles examples/c-host/main.c
+# Cargo drives the link: `tools/c-host-example` compiles tests/c_host/main.c
 # through a `#![no_main]` bin crate, so the C code sees nothing but the public
 # headers while cargo resolves the native dependencies.
 #
 # For the packaged path -- the same C file built with plain cc and pkg-config,
-# no cargo -- use examples/c-host/build-with-pkgconfig.sh after running
+# no cargo -- use tests/c_host/build-with-pkgconfig.sh after running
 # scripts/build-linux-sdk.sh.
 cd "$ENGINE_DIR"
 c_info "building the C host (cargo drives the link) ..."

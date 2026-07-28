@@ -131,7 +131,7 @@ fi
 # migo_* through find_package(migo) with the NDK toolchain and produces a
 # loadable shared object. This is what a packaging defect -- a missing link
 # library, a wrong CMake path, an unresolved entry point -- actually breaks.
-CONSUMER="$REPO_ROOT/examples/c-host/android-package-consumer"
+CONSUMER="$REPO_ROOT/tests/c_host/android-package-consumer"
 if [[ -x "$NDK_BIN/$ARCH-linux-android26-clang" ]] && command -v cmake >/dev/null 2>&1 \
         && [[ -f "$CONSUMER/build.sh" ]]; then
     if ANDROID_ABI="$ABI" MIGO_ANDROID_PREFIX="$PREFIX" \

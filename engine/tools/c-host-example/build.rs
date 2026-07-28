@@ -1,6 +1,6 @@
 //! Compiles the C host example and links the window-system libraries it needs.
 //!
-//! The C source lives outside the crate (`examples/c-host/main.c`) because it is
+//! The C source lives outside the crate (`tests/c_host/main.c`) because it is
 //! documentation as much as it is a test: a host author should be able to read
 //! it without knowing anything about cargo.
 
@@ -11,8 +11,8 @@ fn main() {
         .join("../../..")
         .canonicalize()
         .expect("repo root");
-    let source = repo_root.join("examples/c-host/linux/main.c");
-    let wayland_source = repo_root.join("examples/c-host/linux/wayland_host.c");
+    let source = repo_root.join("tests/c_host/linux/main.c");
+    let wayland_source = repo_root.join("tests/c_host/linux/wayland_host.c");
     let include = repo_root.join("include");
 
     println!("cargo:rerun-if-changed={}", source.display());

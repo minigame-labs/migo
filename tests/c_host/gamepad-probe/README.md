@@ -17,7 +17,7 @@ pad at 1s, sweeps axis 0 (and axis 1 as its negation) while holding button 0 and
 resting button 6 at quarter travel, then withdraws it at 6s.
 
 ```sh
-MIGO_CAPI_LOG=info bash scripts/dev-run-c-host.sh examples/c-host/gamepad-probe 12
+MIGO_CAPI_LOG=info bash scripts/dev-run-c-host.sh tests/c_host/gamepad-probe 12
 ```
 
 Two things on screen are load-bearing rather than decorative:
