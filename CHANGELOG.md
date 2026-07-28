@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Network fetch API
 - Touch input handling
 - Android platform support with JNI bindings
-- Android demo project ([migo-android-demo](https://github.com/minigame-labs/migo-android-demo))
+- Android demo project ([migo-examples](https://github.com/minigame-labs/migo-examples), `android-java/`)
 
 ### Changed
 - Renamed project from `minigame_host` to `migo`

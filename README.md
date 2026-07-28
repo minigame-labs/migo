@@ -28,7 +28,7 @@ Two adapter profiles let existing games run with **zero or minimal changes**:
 - **High performance** — Rust core engine with an optimized rendering pipeline; fast startup, low memory
 - **Canvas 2D & WebGL** — full support for 2D canvas and WebGL rendering
 - **Audio support** — WebAudio-style APIs (including streaming playback)
-- **Cross-platform** — Android (iOS and Windows planned)
+- **Cross-platform** — Android (primary target), with Linux and Windows host support implemented; iOS and HarmonyOS planned
 - **Lightweight** — small footprint and fast startup
 
 ## Architecture
@@ -38,13 +38,13 @@ Two adapter profiles let existing games run with **zero or minimal changes**:
 |                                      Your App                                      |
 +------------------------------------------------------------------------------------+
 |                                      Migo SDK                                      |
-+---------------------+------------------- +------------------+----------------------+
-|      Graphics       |       Audio        |        I/O       |      JS Runtime      |
-|      (OpenGL)       |     (WebAudio)     |     (File/Net)   |    (deno_core/V8)    |
-+---------------------+--------------------+------------------+----------------------+
-|                                   Rust Core Engine                                 |
++---------------------+--------------------+--------------------+--------------------+
+|       Graphics      |       Audio        |        I/O         |     JS Runtime     |
+|     (Skia / GL)     |     (WebAudio)     |     (File/Net)     |   (deno_core/V8)   |
++---------------------+--------------------+--------------------+--------------------+
+|                                  Rust Core Engine                                  |
 +------------------------------------------------------------------------------------+
-|                         Platform Layer (Android | iOS | Windows)                   |
+|                     Platform Layer (Android | Linux | Windows)                     |
 +------------------------------------------------------------------------------------+
 ```
 
