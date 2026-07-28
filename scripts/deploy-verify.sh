@@ -15,7 +15,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DEMO_DIR="$REPO_ROOT/../migo-android-demo"
+EXAMPLES_ROOT="${MIGO_EXAMPLES_ROOT:-$REPO_ROOT/../migo-examples}"
+DEMO_DIR="$EXAMPLES_ROOT/android-java"
 ADB="${ADB:-$HOME/Android/Sdk/platform-tools/adb}"
 PKG="com.minigame.androiddemo"
 ABI="arm64-v8a"
@@ -40,9 +41,23 @@ if [[ "$SKIP_SO" == false ]]; then
     bash "$SCRIPT_DIR/build-android-so.sh" "$ABI" release
 fi
 
-# 2) build AAR (debug variant 产出 demo 期望的 migo-debug.aar;.so 已是 release)
+# 2) build AAR (debug variant 产出 migo-full-debug.aar;.so 已是 release)
 info "打包 AAR (debug variant + 现有 release .so)"
 bash "$SCRIPT_DIR/build-aar.sh" debug --skip-rust "$ABI"
+
+# 2.5) 把刚建好的 AAR 交给示例仓库
+#
+# 示例已迁至 minigame-labs/migo-examples,不再从相对路径直接引用本仓库的 dist —
+# 它通过自己的 resolver 取产物,本地模式由 MIGO_LOCAL_REPO 指回这里。产物名由
+# resolver 决定(migo-<profile>-debug.aar),所以这里不硬编码文件名。
+if [[ ! -x "$EXAMPLES_ROOT/scripts/resolve-migo-artifact.sh" ]]; then
+    err "找不到示例仓库: $EXAMPLES_ROOT"
+    err "克隆 https://github.com/minigame-labs/migo-examples 到该位置,或设 MIGO_EXAMPLES_ROOT"
+    exit 1
+fi
+info "解析 AAR 到示例仓库"
+MIGO_LOCAL_REPO="$REPO_ROOT" bash "$EXAMPLES_ROOT/scripts/resolve-migo-artifact.sh" \
+    android-aar "$DEMO_DIR/libs/migo.aar"
 
 # 3) build demo APK
 info "构建 demo APK"

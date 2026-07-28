@@ -52,7 +52,7 @@ Two adapter profiles let existing games run with **zero or minimal changes**:
 
 ### Android Integration
 
-> For a complete sample project, see [migo-android-demo](https://github.com/minigame-labs/migo-android-demo)
+> For complete sample projects, see [migo-examples](https://github.com/minigame-labs/migo-examples)
 
 1. Add the AAR dependency:
 
