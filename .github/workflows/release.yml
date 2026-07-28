@@ -80,7 +80,7 @@ jobs:
         run: bash scripts/test-platform-services-capability-contract.sh
 
       - name: Example content namespace contract
-        run: bash scripts/test-example-content-namespace-contract.sh
+        run: bash scripts/test-content-namespace-contract.sh
 
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself

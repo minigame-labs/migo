@@ -82,7 +82,7 @@ for g in test-core-v8-boundary-contract test-platform-v8-boundary-contract \
          test-platform-services-capability-contract test-surface-attachment-contract \
          test-c-abi-surface-candidate test-capi-platform-contract \
          test-r9-worker-snapshot test-product-profiles \
-         test-example-content-namespace-contract; do
+         test-content-namespace-contract; do
     printf '%-46s ' "$g"
     if bash "scripts/$g.sh" >/tmp/finish-rename-$g.log 2>&1; then echo PASS; else echo FAIL; fail "$g"; fi
 done
