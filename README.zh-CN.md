@@ -2,34 +2,55 @@
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-**嵌入式 HTML5 / 小游戏的 WebView 替代方案。**
+[![CI](https://github.com/minigame-labs/migo/actions/workflows/pr-ci.yml/badge.svg)](https://github.com/minigame-labs/migo/actions/workflows/pr-ci.yml)
+[![License](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](LICENSE)
 
-Migo 是一个源码可审计、高性能、可嵌入的 HTML5 / Canvas2D / WebGL 原生游戏运行时。App 厂商把它嵌入自己的应用，就能跑 HTML5 与小游戏内容——**无需 WebView**：没有浏览器、DOM、CSS、layout 与合成层的开销，启动更快、内存更低，运行时版本由你打包钉死，不随 OEM 与系统版本漂移。
+**为游戏而生的 WebView 替代方案。** 把 Migo 嵌进你的 App，就能原生运行 HTML5 与小游戏内容——没有浏览器、DOM、CSS 与合成层。启动更快、内存更低，运行时版本由你自己钉死，不随 OEM 与系统版本漂移。
 
-兼容两个适配 profile，现有游戏**零改动或少量改动**直接运行：
+两套适配层让现有游戏零改动或极小改动即可运行：
 
-- **跨引擎 HTML5 / Canvas2D / WebGL** —— 零改动跑 Cocos / Egret / Pixi / 原生 Canvas 游戏（`adapter` + `prelude` 提供浏览器风格 BOM/DOM）。
-- **主流小游戏 API 风格** —— 兼容主流小游戏平台风格的 API 环境（`wx` 命名空间适配层）。
+- **跨引擎 HTML5 / Canvas2D / WebGL** —— Cocos、Egret、Pixi 与原生 Canvas 游戏无需修改；适配层提供浏览器风格的 BOM/DOM。
+- **小游戏 API 风格** —— 通过 `wx` 命名空间适配层提供小游戏平台风格的 API 环境。
 
-## 为什么选 Migo（对比 WebView）
+## 为什么用 Migo
 
-| 维度 | Migo | Android System WebView |
+| | Migo | Android 系统 WebView |
 |---|---|---|
-| 版本一致性 | 运行时由你打包、版本钉死，跨 OEM/系统可控 | 随用户系统与 OEM 自升级、自漂移，你无法控制 |
-| 可审计性 | 源码可审计，沙箱边界可逐行审计（fintech/政务/出海合规） | 闭源，无法审计 |
-| 启动 / 内存 | 无 DOM/layout、V8 snapshot 预热，体积小、启动快、内存低 | 带整个 Chromium，常驻开销大 |
-| 跨引擎兼容 | 同一 API 跑多引擎，不绑定单一引擎 | — |
+| **版本一致性** | 运行时由你打包并钉死版本，跨 OEM 与系统版本完全一致 | 随用户系统自动更新，不受你控制 |
+| **可审计性** | 源码可获取，沙箱边界可逐行审计 | 闭源 |
+| **启动 / 内存** | 无 DOM 与 layout，V8 快照预热——体积小、启动快 | 打包整个 Chromium，常驻开销重 |
+| **跨引擎** | 一套 API 覆盖多引擎 | — |
 
-## 特性
+与系统 WebView 的可复现对比测试（同游戏、同设备、同 session）见 [migo-bench](https://github.com/minigame-labs/migo-bench)。
 
-- **WebView 替代** - 嵌入式 HTML5 / 小游戏的原生运行时，无浏览器层开销
-- **跨引擎零改动** - Cocos / Egret / Pixi / 原生 Canvas 游戏直接运行
-- **源码可审计** - 沙箱边界可逐行审计，合规友好（[BSL 1.1](LICENSE)，每个版本发布 4 年后转 Apache 2.0）
-- **高性能** - Rust 核心引擎，优化的渲染管线，启动快、内存低
-- **Canvas 2D & WebGL** - 完整支持 2D 画布与 WebGL 渲染
-- **音频支持** - WebAudio 风格 API（含流式播放能力）
-- **跨平台** - Android（主要目标），Linux 与 Windows 宿主支持已实现；iOS 与鸿蒙计划中
-- **轻量级** - 体积小，启动快
+## 平台支持
+
+| 平台 | 状态 | 交付物 |
+|---|---|---|
+| **Android**（arm64-v8a、x86_64） | 主要目标 | 含 Java/Kotlin SDK 的 AAR；含 C ABI 的 NDK 静态库 |
+| **Linux**（x86_64） | 已实现 | 静态库与共享库、pkg-config 与 CMake 包、Qt 6 / X11 host kit |
+| **Windows**（x86_64） | 可渲染、可接收输入；打包未完成 | — |
+| iOS、macOS、鸿蒙 | 计划中 | — |
+
+[`include/migo/`](include/migo/) 中的 C ABI 目前是 **candidate**——在 Android 与 Linux 上已有可用运行时，但尚未冻结。冻结前还剩哪些事项，以该目录下的 README 为准。
+
+## 快速开始
+
+**把 Migo 集成进 App** —— 各平台宿主的完整示例（含构建与运行步骤）在 [migo-examples](https://github.com/minigame-labs/migo-examples)。请从那里开始而不是本仓库：它自带可运行的游戏，并会替你解析运行时产物。
+
+**从源码构建运行时** —— 前置条件、各平台配置与构建流程见 [BUILD.md](BUILD.md)。
+
+```bash
+# Android AAR（在 Linux/macOS 上构建）
+./scripts/build-aar.sh release arm64-v8a
+```
+
+预构建的 V8 归档不入库，而是下载后对其 component manifest 校验：
+
+```bash
+bash scripts/fetch-v8-archives.sh          # Android 目标（构建默认）
+bash scripts/fetch-v8-archives.sh --all    # 所有带 manifest 的目标
+```
 
 ## 架构
 
@@ -48,118 +69,7 @@ Migo 是一个源码可审计、高性能、可嵌入的 HTML5 / Canvas2D / WebG
 +------------------------------------------------------------------------------------+
 ```
 
-## 快速开始
-
-### Android 集成
-
-> 完整示例项目请参考 [migo-examples](https://github.com/minigame-labs/migo-examples)
-
-1. 添加 AAR 依赖到项目：
-
-```gradle
-dependencies {
-    implementation files("libs/migo.aar")
-}
-```
-
-2. 在 Activity 中初始化引擎：
-
-```java
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
-import com.migo.runtime.MigoRuntime;
-import com.migo.runtime.RuntimeConfig;
-import com.migo.runtime.GameSession;
-
-public class GameActivity extends Activity {
-    private SurfaceView surfaceView;
-    private GameSession session;
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-
-        surfaceView = new SurfaceView(this);
-        setContentView(surfaceView);
-
-        surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
-            @Override
-            public void surfaceCreated(SurfaceHolder holder) {
-                // 1. 创建配置
-                RuntimeConfig config = new RuntimeConfig.Builder(GameActivity.this)
-                    .setDebugEnabled(true)
-                    .build();
-
-                // 2. 创建会话
-                // "gameId" 用于隔离不同游戏的数据目录
-                session = MigoRuntime.getInstance().createSession(
-                    GameActivity.this,
-                    holder.getSurface(),
-                    config,
-                    "gameId" 
-                );
-
-                // 3.1 可选：注册宿主回调（建议在 startGame 前）
-                // session.setAuthHandler(authHandler);
-                // session.setGameLogHandler(gameLogHandler);
-                // session.setSubpackageHandler(subpackageHandler);
-
-                // 3. 启动游戏
-                session.startGame("game.js");
-            }
-
-            @Override
-            public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-                if (session != null) {
-                    session.updateSurface(holder.getSurface(), width, height);
-                }
-            }
-
-            @Override
-            public void surfaceDestroyed(SurfaceHolder holder) {
-                if (session != null) {
-                    session.onSurfaceDestroyed();
-                }
-            }
-        });
-    }
-
-    @Override
-    protected void onDestroy() {
-        if (session != null) {
-            session.close();
-            session = null;
-        }
-        super.onDestroy();
-    }
-}
-```
-
-### 从源码构建
-
-#### 前置要求
-
-- Rust 1.85+（需要 Edition 2024），需安装以下 target：
-  - `aarch64-linux-android`
-  - `x86_64-linux-android`
-- Android NDK r23+
-- JDK 17+（Android Gradle Plugin 8.x 要求）
-
-#### 构建命令
-
-```bash
-# Linux/macOS
-./scripts/build-aar.sh release
-
-# Windows (PowerShell)
-./scripts/build-aar.ps1 -BuildType release
-
-# 构建指定架构
-./scripts/build-aar.sh release arm64-v8a  # Linux/macOS
-./scripts/build-aar.ps1 -Architectures arm64-v8a  # Windows
-```
-
-## 项目结构
+## 仓库结构
 
 ```text
 migo/
@@ -186,13 +96,20 @@ migo/
 ├── tests/                  # 一致性资产（C ABI lane、C 宿主、探针内容）
 ├── contracts/              # 产物 manifest schema
 ├── scripts/                # 构建与契约门禁脚本
-├── BUILD.md                # 从源码构建指南（各平台前置、构建流程、常见报错）
+├── BUILD.md                # 从源码构建指南
 ├── LICENSE                 # 许可证（BSL 1.1）
 ├── LEGAL.md                # 法律声明（许可/商标/测试内容）
 ├── COMMERCIAL.md           # 商业许可：谁需要、谁不需要、怎么谈
-├── NOTICE                  # 第三方声明
-└── README.md
+└── NOTICE                  # 第三方声明
 ```
+
+## 相关仓库
+
+| 仓库 | 用途 |
+|---|---|
+| [migo-examples](https://github.com/minigame-labs/migo-examples) | 各平台宿主集成示例，一个平台一个目录 |
+| [migo-bench](https://github.com/minigame-labs/migo-bench) | Migo 与 WebView 的可复现对比测试 |
+| [migo-test-suite](https://github.com/minigame-labs/migo-test-suite) | 小游戏 API 兼容性测试套件 |
 
 ## 许可证
 
@@ -202,33 +119,19 @@ Migo 采用 **source-available** 的 [Business Source License 1.1](LICENSE)（BS
 - **把 Migo 嵌进你自己的 App 上线** —— 年营收 ≤ USD 1,000,000 且月活 ≤ 3,000,000 时免费。
 - **把 Migo 作为独立 SDK 转售，或提供托管运行时服务** —— 需要商业许可。
 
-完整说明见 [LEGAL.md](LEGAL.md)；商业许可见 [COMMERCIAL.md](COMMERCIAL.md)。
+完整声明见 [LEGAL.md](LEGAL.md)，商业许可见 [COMMERCIAL.md](COMMERCIAL.md)。
 
-「Migo」与 Migo logo 是 Migo Authors 的商标。许可证授予的是**软件**，不授予名称与标识的权利：代码可以 fork，名字不行。
+"Migo" 及 Migo logo 是 Migo Authors 的商标。许可证授予的是**软件**上的权利，不含名称：你可以 fork 代码，但不能沿用名称。
 
-## 贡献
+## 参与贡献
 
-欢迎贡献代码！请参阅 [CONTRIBUTING.md](CONTRIBUTING.md) 了解贡献指南。
-
-提交 Pull Request 前请确保：
-
-1. 代码风格与现有代码保持一致
-2. 为新功能添加/更新测试
-3. 更新相关文档
-4. 签署贡献者许可协议 (CLA)
+欢迎贡献 —— 见 [CONTRIBUTING.md](CONTRIBUTING.md)。提交 Pull Request 前，请确认 `scripts/test-*-contract.sh` 下的契约门禁仍然通过；它们编码了普通测试覆盖不到的不变量。
 
 ## 致谢
 
-Migo 基于以下优秀的开源项目构建：
-
-- [Deno Core](https://github.com/denoland/deno_core) - JavaScript/TypeScript 运行时基础
-- [V8](https://v8.dev/) - JavaScript 引擎
-- [Tokio](https://tokio.rs/) - Rust 异步运行时
-- [Skia](https://skia.org/) - 2D 图形库（Ganesh GL 后端 + SkParagraph 文本排版）
-
-完整第三方依赖列表与许可证信息请参阅 [NOTICE](NOTICE)。
+Migo 构建于 [Deno Core](https://github.com/denoland/deno_core)、[V8](https://v8.dev/)、[Tokio](https://tokio.rs/) 与 [Skia](https://skia.org/)（Ganesh GL 后端 + SkParagraph 文本排版）之上。完整依赖与许可清单见 [NOTICE](NOTICE)。
 
 ## 支持
 
-- GitHub Issues：https://github.com/minigame-labs/migo/issues
-- 文档/Wiki：https://github.com/minigame-labs/migo/wiki
+- Issues: https://github.com/minigame-labs/migo/issues
+- 文档: https://github.com/minigame-labs/migo/wiki
