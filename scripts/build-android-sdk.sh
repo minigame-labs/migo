@@ -123,6 +123,49 @@ mkdir -p "$PREFIX/include" "$PREFIX/lib"
 cp -r "$REPO_ROOT/include/migo" "$PREFIX/include/"
 cp "$STATIC_LIB" "$PREFIX/lib/"
 
+# Two settings a consumer cannot infer from the package, and whose absence
+# fails with errors that point somewhere else: find_package reports the package
+# as missing, and the STL mismatch reports duplicate std:: symbols. Both were
+# hit while verifying this package from a consumer's side, so they ship with it.
+cat > "$PREFIX/README.md" <<'CONSUMER_README'
+# Migo Android SDK (C ABI)
+
+Headers, a static library and a CMake package for embedding Migo in an NDK app.
+
+## Consume it
+
+```cmake
+find_package(migo REQUIRED)
+target_link_libraries(your_target PRIVATE migo::migo)
+```
+
+```bash
+cmake -S . -B build \
+    -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+    -DANDROID_ABI=<abi> -DANDROID_PLATFORM=android-26 \
+    -DANDROID_STL=c++_shared \
+    -DCMAKE_PREFIX_PATH=<this-prefix> -DCMAKE_FIND_ROOT_PATH=<this-prefix>
+```
+
+Two of those flags are not optional:
+
+- **`-DCMAKE_FIND_ROOT_PATH`** — the NDK toolchain sets
+  `CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY`, which confines `find_package` to the
+  find-root. Without it CMake reports the package as missing even though
+  `CMAKE_PREFIX_PATH` points straight at it.
+- **`-DANDROID_STL=c++_shared`** — the library carries its own C++ runtime.
+  Linking it alongside the NDK's static libc++ produces duplicate `std::`
+  symbol errors that name neither Migo nor the STL setting.
+
+`android-26` is the minimum supported platform level.
+
+## Verify what you downloaded
+
+Each release asset ships a `.attestation.json` recording the archive's
+`package_file`, `package_size_bytes` and `package_sha256`. Check the archive
+against it before use.
+CONSUMER_README
+
 python3 "$SCRIPT_DIR/gen-android-package-metadata.py" \
     --prefix "$PREFIX" --version "$VERSION" --arch "$ARCH" --cargo-output "$CARGO_OUT"
 python3 "$SCRIPT_DIR/gen-android-package-metadata.py" --manifest \
