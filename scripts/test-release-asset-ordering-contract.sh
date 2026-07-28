@@ -13,8 +13,20 @@
 # gates) is a parsed, executable check instead.
 #
 # This is source-only: it parses .github/workflows/release.yml with PyYAML
-# and inspects each step's `run:` text. It never executes the workflow or any
-# step's script.
+# and never executes the workflow or any step's script.
+#
+# A step is put in scope if the dist path can reach it through any of the
+# three channels a static reader can see: the step's `run:` text, its
+# `working-directory:` (including one inherited from the job's
+# `defaults.run`), or a value in its `env:` map (including the job-level
+# `env:` it inherits). Scoping on `run:` text alone was itself
+# allow-by-default -- review found `working-directory: <dist>` with a
+# relative redirect, and an `env:` entry holding the path used as
+# `> "$OUT_DIR/f"`, both dismissed before any per-command scrutiny ran. What
+# remains undetectable is a path assembled at runtime from data (read out of
+# a file, computed by an earlier step). That boundary is real and is stated
+# here rather than papered over: this gate covers the statically visible
+# channels, not every conceivable one.
 #
 # Deny-by-default, not allow-by-default: an earlier version of this gate
 # recognized three write shapes (redirection, cp/mv, cd+relative-write) and
@@ -76,13 +88,13 @@ CHECKSUM_TARGET_RE = re.compile(r"\bSHA256SUMS\.txt\b")
 # (nothing to anchor the ordering check to); more than one means the gate
 # cannot tell which is authoritative. Either way that is itself a finding,
 # not something to guess past.
-matches: list[tuple[str, list[dict], int]] = []
+matches: list[tuple[str, dict, list[dict], int]] = []
 for job_name, job in jobs.items():
     steps = (job or {}).get("steps") or []
     for idx, step in enumerate(steps):
         run = step.get("run") if isinstance(step, dict) else None
         if isinstance(run, str) and CHECKSUM_CMD_RE.search(run) and CHECKSUM_TARGET_RE.search(run):
-            matches.append((job_name, steps, idx))
+            matches.append((job_name, job or {}, steps, idx))
 
 if len(matches) == 0:
     print(
@@ -94,7 +106,8 @@ if len(matches) == 0:
 
 if len(matches) > 1:
     where = ", ".join(
-        f"{jn}:{(steps[idx] or {}).get('name', f'<step {idx}>')}" for jn, steps, idx in matches
+        f"{jn}:{(steps[idx] or {}).get('name', f'<step {idx}>')}"
+        for jn, _job, steps, idx in matches
     )
     print(
         "ERROR: more than one step's `run` block invokes sha256sum while writing "
@@ -103,7 +116,7 @@ if len(matches) > 1:
     )
     sys.exit(1)
 
-job_name, steps, checksum_idx = matches[0]
+job_name, job, steps, checksum_idx = matches[0]
 checksum_step_name = (steps[checksum_idx] or {}).get("name", f"<step {checksum_idx}>")
 
 # --- Narrow, explicit allowlist of read-only shapes -------------------------
@@ -263,20 +276,24 @@ def is_safe_chunk(chunk: str, cwd_is_dist: bool) -> tuple[bool, str | None]:
     return False, f"`{head}` is not a recognized read-only command (`{chunk}`)"
 
 
-def analyze_run(run_text: str) -> tuple[str, str]:
+def analyze_run(run_text: str, cwd_is_dist: bool = False) -> tuple[str, str]:
     """Return ('clean' | 'writes' | 'undetermined', reason).
 
-    If DIST is not mentioned anywhere in this step's `run` text, there is
-    nothing for this text-based contract to scrutinize -- 'clean'. Otherwise
-    every command in the step must clear is_safe_chunk(); the first one that
+    Called only for steps the caller has already placed in scope, so there is
+    deliberately no early return on "DIST is absent from run_text": the path
+    can reach a step through `working-directory` or `env` instead of through
+    the shell text, and returning clean on those would put the scrutiny below
+    behind an allow-by-default filter.
+
+    Every command in the step must clear is_safe_chunk(); the first one that
     doesn't determines the verdict. 'undetermined' (an unresolvable `cd`
     target) is handled identically to 'writes' by the caller -- both fail
     the gate.
-    """
-    if DIST not in run_text:
-        return "clean", ""
 
-    cwd_is_dist = False
+    `cwd_is_dist` seeds the working directory, so a step whose
+    `working-directory` is the dist directory starts out with relative
+    redirects already counting as writes into it.
+    """
     for logical in logical_lines(run_text):
         for chunk in split_top_level(logical):
             candidate = chunk
@@ -306,6 +323,29 @@ def analyze_run(run_text: str) -> tuple[str, str]:
     return "clean", ""
 
 
+def working_directory_of(mapping) -> str:
+    value = (mapping or {}).get("working-directory")
+    return value if isinstance(value, str) else ""
+
+
+def env_entry_naming_dist(env) -> str:
+    """Describe the first env entry whose value names DIST, else ''."""
+    if not isinstance(env, dict):
+        return ""
+    for key, value in env.items():
+        if isinstance(value, str) and DIST in value:
+            return f"env `{key}` is `{value}`"
+    return ""
+
+
+def normalise_dir(path: str) -> str:
+    return path.strip().strip("\"'").rstrip("/")
+
+
+# Inherited by any step that does not override them.
+job_default_wd = working_directory_of(((job or {}).get("defaults") or {}).get("run"))
+job_env_reason = env_entry_naming_dist((job or {}).get("env"))
+
 violations: list[tuple[str, str]] = []
 undetermined: list[tuple[str, str]] = []
 
@@ -313,21 +353,51 @@ for idx in range(checksum_idx + 1, len(steps)):
     step = steps[idx] or {}
     step_name = step.get("name", f"<step {idx}>")
     run = step.get("run")
+
+    # A step is in scope if the dist path can reach it through ANY statically
+    # visible channel, not just the shell text. Scoping on `run` alone was
+    # allow-by-default: `working-directory: <dist>` with a relative redirect,
+    # or an `env:` value holding the path and a `"$VAR/f"` redirect, both
+    # sailed past before any per-command scrutiny happened.
+    step_wd = working_directory_of(step)
+    effective_wd = step_wd or job_default_wd
+    wd_inherited = not step_wd and bool(job_default_wd)
+    cwd_is_dist = bool(effective_wd) and normalise_dir(effective_wd) in (DIST, f"./{DIST}")
+
+    reasons: list[str] = []
+    if effective_wd and DIST in effective_wd:
+        reasons.append(
+            f"working-directory is `{effective_wd}`"
+            + (" (inherited from the job's defaults.run)" if wd_inherited else "")
+        )
+    step_env_reason = env_entry_naming_dist(step.get("env"))
+    if step_env_reason:
+        reasons.append(step_env_reason)
+    elif job_env_reason:
+        reasons.append(f"{job_env_reason} (inherited from the job)")
+    if isinstance(run, str) and DIST in run:
+        reasons.append("its `run` text names the directory")
+
+    if not reasons:
+        # Out of scope through every channel this contract can see. A `uses:`
+        # step such as the publish action lands here: it reads from dist to
+        # upload elsewhere, and names it nowhere this gate can read.
+        continue
+
     if run is None:
-        # No shell text for this text-based contract to read (e.g. a `uses:`
-        # step like the publish action, which reads from dist to upload
-        # elsewhere but has no run body). Not flagged -- there is no text
-        # here to find anything in, safe or not.
+        undetermined.append(
+            (step_name, f"{reasons[0]}, but the step has no `run` text to scrutinize")
+        )
         continue
     if not isinstance(run, str):
         undetermined.append((step_name, "`run` is not a plain string"))
         continue
 
-    verdict, reason = analyze_run(run)
+    verdict, reason = analyze_run(run, cwd_is_dist)
     if verdict == "writes":
-        violations.append((step_name, reason))
+        violations.append((step_name, f"{reasons[0]}; {reason}"))
     elif verdict == "undetermined":
-        undetermined.append((step_name, reason))
+        undetermined.append((step_name, f"{reasons[0]}; {reason}"))
 
 if undetermined:
     for name, reason in undetermined:
@@ -343,7 +413,7 @@ if violations:
     for name, reason in violations:
         print(
             f"ERROR: step '{name}' runs after '{checksum_step_name}' in job '{job_name}', "
-            f"mentions {DIST}, and could not be proven read-only ({reason}) -- "
+            f"is in scope for {DIST}, and could not be proven read-only ({reason}) -- "
             "SHA256SUMS.txt is generated before this step runs, so if this step writes into "
             f"{DIST} the published manifest would stop covering everything the release "
             "publishes",
