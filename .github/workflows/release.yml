@@ -82,6 +82,16 @@ jobs:
       - name: Example content namespace contract
         run: bash scripts/test-content-namespace-contract.sh
 
+      # An input listener published to content must have native code that can
+      # fire it. This caught `migo.onMouseDown` and friends being live on the
+      # content surface with no producer anywhere -- registering them worked and
+      # they simply never fired.
+      - name: Input trigger producer contract
+        run: bash scripts/test-input-trigger-producer-contract.sh
+
+      - name: Camera frame JNI descriptor contract
+        run: bash scripts/test-camera-frame-jni-contract.sh
+
       - name: Linux SDK packaging tooling
         # Unit tests only. The packaging gate itself
         # (scripts/test-linux-sdk-contract.sh) needs the Debian bullseye
@@ -280,6 +290,21 @@ jobs:
       # API-26 stub libraries; see scripts/test-android-symbol-floor.sh.
       - name: Android minimum-API symbol floor
         run: bash scripts/test-android-symbol-floor.sh
+
+      # The C ABI package is published by this release too, so it is verified
+      # here rather than only by hand. Runs per ABI: the entry-point set, the
+      # standalone header compile and the find_package consumer are all
+      # per-target, and a package that is correct for one is not evidence for
+      # the other. Placed after the AAR build so it reuses the NDK, Rust
+      # toolchain and verified V8 archives already set up above.
+      - name: Android C SDK package contract
+        run: |
+          for arch in aarch64 x86_64; do
+            echo "::group::android C SDK ($arch)"
+            bash scripts/build-android-sdk.sh --arch "$arch"
+            bash scripts/test-android-sdk-contract.sh --arch "$arch"
+            echo "::endgroup::"
+          done
 
       - name: Analyze AAR size report
         run: |
