@@ -81,19 +81,19 @@ engine/third_party/rusty_v8/x86_64-linux-gnu/librusty_v8.a
 engine/third_party/rusty_v8/x86_64-pc-windows-msvc/
 
 # Binaries built by the out-of-tree consumer examples. They are proof the
-# package works, not source; examples/c-host/build-with-pkgconfig.sh and the
+# package works, not source; tests/c_host/build-with-pkgconfig.sh and the
 # CMake project regenerate them.
-examples/c-host/linux/c-host
-examples/c-host/linux/c-host-cmake
+tests/c_host/linux/c-host
+tests/c_host/linux/c-host-cmake
 
 # Screenshots dropped in the repo root are scratch, not project content.
 Snipaste_*.png
 
 # Android example build outputs
-examples/c-host/android/build/
-examples/c-host/android/.cxx/
-examples/c-host/android/src/main/jniLibs-static/
-examples/c-host/linux/c-host
+tests/c_host/android/build/
+tests/c_host/android/.cxx/
+tests/c_host/android/src/main/jniLibs-static/
+tests/c_host/linux/c-host
 
 # Maintainer working notes, internal planning documents and one-off audit
 # tooling. These are deliberately not published: they are the accumulated

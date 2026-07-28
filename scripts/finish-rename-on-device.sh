@@ -96,7 +96,7 @@ the device, because it cannot be asserted from a script:
   * install the AAR into the bench shell and confirm rendering, the
     background-and-return path (the Canvas2D state-carry fix), and clean
     lifecycle;
-  * run examples/c-host/android to re-check the pure-native host after the
+  * run tests/c_host/android to re-check the pure-native host after the
     rename (build with scripts/build-android-c-host.sh);
   * only then is the rename branch mergeable, because a release AAR needs the
     snapshot chain this script restored.

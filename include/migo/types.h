@@ -45,7 +45,7 @@
  * CMake integration.
  *
  * Android ships one too, as a static library: scripts/build-android-c-host.sh
- * cross-compiles it, and examples/c-host/android is a NativeActivity with no
+ * cross-compiles it, and tests/c_host/android is a NativeActivity with no
  * Java of its own that links it and drives surface attach, lifecycle, touch,
  * the soft keyboard, physical keys, IME composition and gamepads on device.
  * The separate libmigo.so that the Java/JNI SDK ships still exports no migo_*

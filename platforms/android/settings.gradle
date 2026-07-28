@@ -19,4 +19,4 @@ include ':library'
 // The example is a *consumer* of what platforms/android ships, so it lives with
 // the other examples rather than inside the product tree.
 include ':c-host-example'
-project(':c-host-example').projectDir = file('../../examples/c-host/android')
+project(':c-host-example').projectDir = file('../../tests/c_host/android')

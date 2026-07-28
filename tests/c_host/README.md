@@ -21,15 +21,15 @@ it up through `projectDir` in `platforms/android/settings.gradle`.
 
 ```sh
 bash scripts/build-linux-sdk.sh              # stages dist/migo-linux-x86_64
-bash examples/c-host/linux/build-with-pkgconfig.sh
-./examples/c-host/linux/c-host <files-dir> <content-id> <seconds>
+bash tests/c_host/linux/build-with-pkgconfig.sh
+./tests/c_host/linux/c-host <files-dir> <content-id> <seconds>
 ```
 
 ## Android
 
 ```sh
 bash scripts/build-android-c-host.sh         # cross-compiles capi, builds the APK
-adb install -r examples/c-host/android/build/outputs/apk/debug/*.apk
+adb install -r tests/c_host/android/build/outputs/apk/debug/*.apk
 ```
 
 Content goes where the engine resolves it, under the app's own files directory:

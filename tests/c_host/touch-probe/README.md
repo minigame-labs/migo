@@ -13,13 +13,13 @@ Run it against the packaged SDK:
 
 ```sh
 bash scripts/build-linux-sdk.sh
-bash examples/c-host/build-with-pkgconfig.sh
+bash tests/c_host/build-with-pkgconfig.sh
 
 RUN=/tmp/migo-touch-probe
 mkdir -p "$RUN/files/migo/games/touchprobe/code"
-cp examples/c-host/touch-probe/game.{js,json} "$RUN/files/migo/games/touchprobe/code/"
+cp tests/c_host/touch-probe/game.{js,json} "$RUN/files/migo/games/touchprobe/code/"
 
-./examples/c-host/c-host "$RUN/files" touchprobe 25
+./tests/c_host/c-host "$RUN/files" touchprobe 25
 ```
 
 Then click the window. It turns green while held and blue on release, and the log

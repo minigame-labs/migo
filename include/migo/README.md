@@ -12,7 +12,7 @@ MIGO_C_ABI_HAS_RUNTIME == 0    /* every other target */
 
 A runtime existing is not the same as the ABI being frozen. Do not treat these headers as a stable SDK: the freeze blockers below are open, and the surface may still change.
 
-Android's runtime is a **static library** a host links into its own `.so`, driven by `examples/c-host/android` — a NativeActivity with no Java of its own. It is now packaged for third-party NDK consumption: `scripts/build-android-sdk.sh` stages headers, `libmigo_capi.a`, a CMake package (`find_package(migo)`), and a per-ABI artifact manifest, and `scripts/test-android-sdk-contract.sh` verifies the export surface, the embedded snapshot, and that a `find_package(migo)` consumer (`examples/c-host/android-package-consumer`) links with every `migo_*` resolved. It deliberately ships a static library rather than a versioned shared object and CMake rather than pkg-config, because that is how an NDK host consumes a native dependency; those are not omissions. The `libmigo.so` the Java/JNI SDK ships is a different artifact and still exports no `migo_*` symbols.
+Android's runtime is a **static library** a host links into its own `.so`, driven by `tests/c_host/android` — a NativeActivity with no Java of its own. It is now packaged for third-party NDK consumption: `scripts/build-android-sdk.sh` stages headers, `libmigo_capi.a`, a CMake package (`find_package(migo)`), and a per-ABI artifact manifest, and `scripts/test-android-sdk-contract.sh` verifies the export surface, the embedded snapshot, and that a `find_package(migo)` consumer (`tests/c_host/android-package-consumer`) links with every `migo_*` resolved. It deliberately ships a static library rather than a versioned shared object and CMake rather than pkg-config, because that is how an NDK host consumes a native dependency; those are not omissions. The `libmigo.so` the Java/JNI SDK ships is a different artifact and still exports no `migo_*` symbols.
 
 ## Header layout
 
@@ -215,7 +215,7 @@ The candidate cannot be declared stable until all of the following exist:
   enforces, not a second copy;
 - Android and Linux implementations using this same contract — **Linux done, Android
   substantially done**: `engine/crates/capi/platform/android.rs` implements the surface
-  backend and the NativeActivity host in `examples/c-host/android` renders and takes touch
+  backend and the NativeActivity host in `tests/c_host/android` renders and takes touch
   on device, and rendering resumes after the app is backgrounded and returned to. Open:
   multi-pointer delivery has never run on device, because a real two-finger gesture cannot
   be synthesized there -- `sendevent` is refused by SELinux and `input motionevent` carries

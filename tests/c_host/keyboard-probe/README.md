@@ -22,7 +22,7 @@ Run it against the Linux host, whose scripted "IME" types `m`, `mi`, `mig`,
 `migo` and then confirms:
 
 ```sh
-MIGO_CAPI_LOG=info bash scripts/dev-run-c-host.sh examples/c-host/keyboard-probe 15
+MIGO_CAPI_LOG=info bash scripts/dev-run-c-host.sh tests/c_host/keyboard-probe 15
 ```
 
 Expect, in the host's output, `show keyboard: max_length=140 type=0 confirm=0

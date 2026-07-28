@@ -37,7 +37,7 @@ RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
 RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
     cargo build -p migo-capi --release --target "$TARGET" --manifest-path "$ENGINE_DIR/Cargo.toml"
 
-STAGE="$REPO_ROOT/examples/c-host/android/src/main/jniLibs-static/$ABI"
+STAGE="$REPO_ROOT/tests/c_host/android/src/main/jniLibs-static/$ABI"
 mkdir -p "$STAGE"
 cp "$ENGINE_DIR/target/$TARGET/release/libmigo_capi.a" "$STAGE/"
 info "staged $(stat -c %s "$STAGE/libmigo_capi.a") bytes at $STAGE/libmigo_capi.a"
@@ -46,6 +46,6 @@ info "building the APK"
 cd "$REPO_ROOT/platforms/android"
 ./gradlew --no-daemon :c-host-example:assembleDebug
 
-APK="$(find "$REPO_ROOT/examples/c-host/android/build/outputs/apk" -name '*.apk' | head -1)"
+APK="$(find "$REPO_ROOT/tests/c_host/android/build/outputs/apk" -name '*.apk' | head -1)"
 [[ -n "$APK" ]] || { err "no APK produced"; exit 1; }
 info "APK: $APK ($(stat -c %s "$APK") bytes)"
