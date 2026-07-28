@@ -140,7 +140,11 @@ target_link_libraries(your_target PRIVATE migo::migo)
 ```
 
 ```bash
-cmake -S . -B build     -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"     -DANDROID_ABI=<abi> -DANDROID_PLATFORM=android-26     -DANDROID_STL=c++_shared     -DCMAKE_PREFIX_PATH=<this-prefix> -DCMAKE_FIND_ROOT_PATH=<this-prefix>
+cmake -S . -B build \
+    -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+    -DANDROID_ABI=<abi> -DANDROID_PLATFORM=android-26 \
+    -DANDROID_STL=c++_shared \
+    -DCMAKE_PREFIX_PATH=<this-prefix> -DCMAKE_FIND_ROOT_PATH=<this-prefix>
 ```
 
 Two of those flags are not optional:
