@@ -14,14 +14,19 @@
 #   * The export allowlist is a `.def` file consumed by `link /DEF:`, not a GNU
 #     version script. It is generated from include/migo/*.h so it cannot drift
 #     from the headers.
-#   * V8 on Windows is built as a shared library (so V8 and Skia share the MSVC
-#     STL instead of colliding on std::terminate), which yields both a DLL and a
-#     201 MB static archive in gn_out. This links the ARCHIVE, not the import
-#     library: migo.dll absorbs V8 exactly the way it absorbs librusty_v8.a on
-#     Linux, and `dumpbin /DEPENDENTS migo.dll` lists no rusty_v8.dll. The DLL
-#     form matters for how V8 is *compiled* (its libc++ stays internal); it is
-#     not what gets shipped. Verified 2026-07-29 against the built artifact --
-#     an earlier version of this comment claimed the opposite.
+#   * V8 on Windows is built with its own libc++ (clang-cl crashes on 32 torque
+#     translation units without it), so V8 and Skia disagree about the C++
+#     runtime. This links V8's IMPORT library and ships rusty_v8.dll beside
+#     migo.dll, which is the only arrangement that keeps that libc++ out of this
+#     link -- inside a DLL it does not participate in symbol resolution. Linking
+#     the 201 MB static archive instead fails with LNK2005 on std::terminate,
+#     defined strongly by libc++'s exception.obj and as a COMDAT by Skia's
+#     MSVC-STL objects.
+#     An earlier version of this script linked the archive and succeeded, which
+#     is why the comment here used to claim the archive was equivalent. It only
+#     linked because the C ABI had no Windows platform layer: nothing reached
+#     GraphicsPlatform, so /OPT:REF discarded Skia's core and the two runtimes
+#     never met. That artifact could not attach a surface at all.
 #   * The MSVC linker's /OPT:REF is the analog of --gc-sections: skia-bindings
 #     compiles one translation unit with JPEG/PDF/pathops wrappers that Skia is
 #     built without, so it references symbols that do not exist; /OPT:REF must
@@ -72,7 +77,7 @@ ANGLE_DIR_UNIX="${MIGO_WIN_ANGLE_DIR_UNIX:-$WIN_TMP_UNIX/angle}"
 [[ -d "$ANGLE_DIR_UNIX" ]] || ANGLE_DIR_UNIX="$WIN_TMP_UNIX"   # spike staged them flat once
 
 # ---- Preconditions -------------------------------------------------------
-for f in rusty_v8.dll rusty_v8.lib src_binding.rs; do
+for f in rusty_v8.dll rusty_v8.dll.lib src_binding.rs; do
     [[ -f "$V8_DIR_UNIX/$f" ]] || { echo "[win-sdk] missing Windows V8 artifact: $V8_DIR_UNIX/$f" >&2; exit 1; }
 done
 for f in libEGL.dll libGLESv2.dll; do
@@ -97,7 +102,11 @@ info "generated export allowlist: $DEF_COUNT migo_* symbols"
 DEF_DOS="$(wslpath -w "$DEF_UNIX")"
 
 # ---- Build the staticlib, capture native libs, and link the DLL on Windows ----
-V8_ARCHIVE_DOS="$V8_DIR_DOS\\rusty_v8.lib"
+# The import library, so V8 is absorbed as a DLL dependency rather than as
+# objects in this link. See the note at the top of this file: linking the static
+# archive puts V8's own libc++ into the same link as Skia's MSVC STL, and they
+# define std::terminate incompatibly.
+V8_ARCHIVE_DOS="$V8_DIR_DOS\\rusty_v8.dll.lib"
 OUT_DOS="$WIN_TMP_UNIX/sdk-out"
 OUT_UNIX="$WIN_TMP_UNIX/sdk-out"
 mkdir -p "$OUT_UNIX"
