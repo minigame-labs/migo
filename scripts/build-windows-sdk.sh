@@ -34,9 +34,16 @@
 # Usage: scripts/build-windows-sdk.sh [--prefix WSL_DIR]
 #
 # Required env (same identities the spike uses):
-#   MIGO_WIN_V8_DIR   DOS path to the committed Windows V8 dir holding
-#                     rusty_v8.dll, rusty_v8.lib, src_binding.rs. Defaults to
-#                     the in-repo engine/third_party/rusty_v8/x86_64-pc-windows-msvc.
+#   MIGO_WIN_V8_DIR   DOS path to the Windows V8 artifacts (rusty_v8.dll,
+#                     rusty_v8.lib, src_binding.rs). Defaults to the WSL-side
+#                     engine/third_party/rusty_v8/x86_64-pc-windows-msvc, which
+#                     is where build-v8-windows.sh puts them.
+#
+#                     NOT the synced worktree copy: that whole directory is
+#                     git-ignored (.gitignore), so sync-worktree.sh -- which
+#                     clones -- can never carry it across. Pointing there
+#                     produced an empty path and a V8 build script panic
+#                     ("系统找不到指定的路径") several layers away from the cause.
 #   MIGO_WIN_ANGLE_DIR DOS path to the ANGLE runtime DLLs (libEGL.dll,
 #                     libGLESv2.dll, d3dcompiler_47.dll). Defaults to the spike tmp.
 #   MIGO_WIN_PROXY    optional http proxy for the V8 crate's build script.
@@ -60,7 +67,7 @@ TRIPLE="$WIN_TARGET_TRIPLE"                      # x86_64-pc-windows-msvc
 # the synced worktree copy on a local disk -- a wslpath UNC path is unusable for
 # the toolchain, which is the whole reason the worktree lives on C:.
 V8_DIR_UNIX="$REPO_ROOT/engine/third_party/rusty_v8/x86_64-pc-windows-msvc"
-V8_DIR_DOS="${MIGO_WIN_V8_DIR:-$WIN_WORKTREE_DOS\\engine\\third_party\\rusty_v8\\x86_64-pc-windows-msvc}"
+V8_DIR_DOS="${MIGO_WIN_V8_DIR:-$(wslpath -w "$V8_DIR_UNIX")}"
 ANGLE_DIR_UNIX="${MIGO_WIN_ANGLE_DIR_UNIX:-$WIN_TMP_UNIX/angle}"
 [[ -d "$ANGLE_DIR_UNIX" ]] || ANGLE_DIR_UNIX="$WIN_TMP_UNIX"   # spike staged them flat once
 
