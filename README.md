@@ -29,7 +29,7 @@ Reproducible benchmarks against the system WebView — same game, same device, s
 |---|---|---|
 | **Android** (arm64-v8a, x86_64) | Released | AAR with the Java/Kotlin SDK; a C ABI package per ABI (headers, static library, CMake package) |
 | **Linux** (x86_64) | Released | Static and shared library, pkg-config and CMake packages; Qt 6 / X11 host kit in-tree |
-| **Windows** (x86_64) | Builds and runs; not released | Renders through ANGLE and takes input; the SDK packages locally, but its V8 component is not published yet |
+| **Windows** (x86_64) | Released | `migo.dll` with its import library, headers, a CMake package and the ANGLE runtime it loads |
 | iOS, macOS, HarmonyOS | Planned | — |
 
 Released artifacts are on the [releases page](https://github.com/minigame-labs/migo/releases). Each ships an `.attestation.json` recording the archive's name, size and sha256 — verify a download against it before use.

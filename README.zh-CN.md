@@ -29,7 +29,7 @@
 |---|---|---|
 | **Android**（arm64-v8a、x86_64） | 已发布 | 含 Java/Kotlin SDK 的 AAR;按 ABI 发布的 C ABI 包(头文件、静态库、CMake 包) |
 | **Linux**（x86_64） | 已发布 | 静态库与共享库、pkg-config 与 CMake 包;Qt 6 / X11 host kit 在仓库内 |
-| **Windows**（x86_64） | 可构建可运行;未发布 | 经 ANGLE 渲染、可接收输入;SDK 可在本地打包,但其 V8 组件尚未发布 |
+| **Windows**（x86_64） | 已发布 | `migo.dll` 及其导入库、头文件、CMake 包,以及它加载时依赖的 ANGLE 运行时 |
 | iOS、macOS、鸿蒙 | 计划中 | — |
 
 已发布产物见 [releases 页面](https://github.com/minigame-labs/migo/releases)。每个产物都带
