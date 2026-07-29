@@ -267,5 +267,15 @@ CMAKE
 
 info "staged:"
 find "$PREFIX" -type f | sed "s|$PREFIX|  <prefix>|" | sort
-info "NOTE: NuGet packaging and the V8 component-manifest provenance are the next"
-info "      steps; this stages a linkable, runnable migo.dll + headers + CMake package."
+
+# No CI runner builds this package, so this gate is the only thing standing
+# between a broken link and a published SDK. Running it here rather than leaving
+# it to the operator makes producing a package that fails its own contract
+# impossible: windows-sdk-0.1.0 shipped a library that loaded, exported every
+# entry point, and could not attach a window, because the gate was a separate
+# step that answered a narrower question than "is this usable".
+info "verifying the staged package against the Windows SDK contract"
+MIGO_WINDOWS_PREFIX="$PREFIX" bash "$SCRIPT_DIR/test-windows-sdk-contract.sh" --strict
+
+info "NOTE: NuGet packaging is the remaining packaging step; this stages a"
+info "      linkable, runnable migo.dll + headers + CMake package."

@@ -49,14 +49,17 @@ for required in "$DLL" "$IMPLIB" "$HEADERS/migo.h" \
 done
 (( missing )) || pass "package carries the DLL, import library, headers and CMake package"
 
-# ANGLE is a runtime dependency the consumer cannot supply itself: migo.dll
-# resolves EGL at load time, and a package without these loads on a developer
-# machine that happens to have them and fails on a clean one.
-angle_missing=0
-for runtime in libEGL.dll libGLESv2.dll d3dcompiler_47.dll; do
-    [[ -f "$PREFIX/bin/$runtime" ]] || { fail "missing ANGLE runtime: bin/$runtime"; angle_missing=1; }
+# Runtime DLLs the consumer cannot supply itself: migo.dll resolves EGL through
+# ANGLE and imports V8 from rusty_v8.dll, both by name at load time. A package
+# missing one loads on a developer machine that happens to have it and fails on
+# a clean one. The load probe below is what proves resolution actually works;
+# this list exists so a missing file is named instead of surfacing as a bare
+# LoadLibrary error code.
+runtime_missing=0
+for runtime in libEGL.dll libGLESv2.dll d3dcompiler_47.dll rusty_v8.dll; do
+    [[ -f "$PREFIX/bin/$runtime" ]] || { fail "missing runtime DLL: bin/$runtime"; runtime_missing=1; }
 done
-(( angle_missing )) || pass "ANGLE runtime DLLs ship alongside migo.dll"
+(( runtime_missing )) || pass "ANGLE and V8 runtime DLLs ship alongside migo.dll"
 
 # --- 2. Toolchain-dependent checks ------------------------------------------
 find_vcvars() {
