@@ -75,7 +75,8 @@ if [[ -z "$VCVARS" ]]; then
     skip "DLL loads with its imports resolved (no MSVC toolchain)"
     skip "staged headers compile standalone under MSVC"
 else
-    WORK="$(mktemp -d)"
+    WORK="$(mktemp -d /mnt/c/Windows/Temp/migo-winsdk.XXXXXX)"
+    WORK_DOS="$(wslpath -w "$WORK")"
     trap 'rm -rf "$WORK"' EXIT
 
     run_msvc() {
@@ -89,7 +90,11 @@ else
             echo "call \"$VCVARS\" >nul"
             echo "$body"
         } > "$bat"
-        ( cd /tmp && cmd.exe /c "$(wslpath -w "$bat")" 2>/dev/null | tr -d '\r' )
+        # cd into the scratch directory first: cmd refuses a UNC working
+        # directory and silently falls back to C:\Windows, where cl cannot
+        # write its .obj -- reported as "Permission denied" on a path the
+        # command never mentioned.
+        ( cd /tmp && cmd.exe /c "cd /d $WORK_DOS && $(wslpath -w "$bat")" 2>/dev/null | tr -d '\r' )
     }
 
     # --- 2a. Export surface is exactly the documented migo_* set ------------
@@ -145,13 +150,18 @@ int main(int argc, char **argv) {
 }
 PROBE
     PROBE_EXE="$WORK/loadprobe.exe"
-    BUILD_OUT="$(run_msvc "cl /nologo /Fe:\"$(wslpath -w "$PROBE_EXE")\" \"$(wslpath -w "$LOADER_SRC")\" /link /OUT:\"$(wslpath -w "$PROBE_EXE")\"" build || true)"
+    BUILD_OUT="$(run_msvc "cl /nologo /Fe:loadprobe.exe loadprobe.c" build || true)"
     if [[ ! -f "$PROBE_EXE" ]]; then
         fail "could not compile the load probe with MSVC: $BUILD_OUT"
     else
         # Run from bin/ so the ANGLE DLLs beside migo.dll are on the search path,
         # which is exactly how a consumer ships them.
-        LOAD_OUT="$(run_msvc "cd /d \"$(wslpath -w "$PREFIX/bin")\" && \"$(wslpath -w "$PROBE_EXE")\" migo.dll" load || true)"
+        # Stage the package's bin/ next to the probe from the WSL side. Handing
+        # cmd a UNC source path mangles it (the leading \\ is eaten and the copy
+        # silently matches nothing), and the point of this check is to load the
+        # DLL the way a consumer ships it: beside its ANGLE runtimes.
+        cp "$PREFIX/bin/"*.dll "$WORK/"
+        LOAD_OUT="$(run_msvc "loadprobe.exe migo.dll" load || true)"
         if grep -q LOAD_OK <<<"$LOAD_OUT"; then
             pass "migo.dll loads and resolves migo_query_capabilities"
         else
@@ -165,7 +175,7 @@ PROBE
     HDR_SRC="$WORK/hdrprobe.c"
     printf '#include <migo/migo.h>\nint main(void){return 0;}\n' > "$HDR_SRC"
     HDR_EXE="$WORK/hdrprobe.exe"
-    HDR_OUT="$(run_msvc "cl /nologo /std:c11 /W4 /WX /I\"$(wslpath -w "$PREFIX/include")\" /Fe:\"$(wslpath -w "$HDR_EXE")\" \"$(wslpath -w "$HDR_SRC")\"" hdr || true)"
+    HDR_OUT="$(run_msvc "cl /nologo /std:c11 /W4 /WX /I\"$(wslpath -w "$PREFIX/include")\" /Fe:hdrprobe.exe hdrprobe.c" hdr || true)"
     if [[ -f "$HDR_EXE" ]]; then
         pass "staged headers compile standalone under MSVC C11 (/W4 /WX)"
     else
