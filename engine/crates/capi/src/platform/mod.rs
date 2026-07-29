@@ -11,21 +11,19 @@
 mod android;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod linux;
-#[cfg(target_os = "windows")]
-mod windows;
 #[cfg(not(any(
     target_os = "android",
     target_os = "windows",
     all(target_os = "linux", not(target_env = "ohos"))
 )))]
 mod unsupported;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "android")]
 pub(crate) use android::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) use linux::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
-#[cfg(target_os = "windows")]
-pub(crate) use windows::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
 #[cfg(not(any(
     target_os = "android",
     target_os = "windows",
@@ -34,6 +32,8 @@ pub(crate) use windows::{PlatformTarget, build_target, rebuild_surface, supporte
 pub(crate) use unsupported::{
     PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,
 };
+#[cfg(target_os = "windows")]
+pub(crate) use windows::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
 
 #[cfg(test)]
 mod contract_tests {

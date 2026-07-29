@@ -69,9 +69,9 @@ pub(crate) fn build_target(
             });
             let graphics_platform = platform::windows::presenter::windows_hwnd_graphics_platform()
                 .map_err(|error| {
-                tracing::error!("build_target: Win32 graphics platform: {error:?}");
-                MIGO_ERROR_INTERNAL
-            })?;
+                    tracing::error!("build_target: Win32 graphics platform: {error:?}");
+                    MIGO_ERROR_INTERNAL
+                })?;
             Ok((surface, graphics_platform, PlatformTarget::Win32 { hwnd }))
         }
         // Listed rather than matched with a wildcard: a new platform payload
