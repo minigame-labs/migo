@@ -5,15 +5,17 @@ use migo_capi_abi::{
     MIGO_ERROR_UNSUPPORTED_CAPABILITY, MIGO_ERROR_UNSUPPORTED_PLATFORM, VersionedHeader,
     surface::{
         MIGO_ALPHA_MODE_OPAQUE, MIGO_ALPHA_MODE_POSTMULTIPLIED, MIGO_ALPHA_MODE_PREMULTIPLIED,
-        MIGO_COLOR_SPACE_DISPLAY_P3, MIGO_COLOR_SPACE_EXTENDED_SRGB, MIGO_COLOR_SPACE_SRGB,
-        MIGO_PLATFORM_ANDROID_NATIVE_WINDOW, MIGO_PLATFORM_WAYLAND_SURFACE,
-        MIGO_PLATFORM_WIN32_HWND, MIGO_PLATFORM_X11_WINDOW, MIGO_PRESENTATION_MODE_DEFAULT,
-        MIGO_PRESENTATION_MODE_FIFO, MIGO_PRESENTATION_MODE_IMMEDIATE,
-        MIGO_PRESENTATION_MODE_MAILBOX, MIGO_SURFACE_CAPABILITY_TRANSPARENT,
-        MIGO_SURFACE_CAPABILITY_WIDE_COLOR, MigoAndroidNativeWindowDescriptor,
-        MigoSurfaceDescriptor, MigoSurfaceMetrics, MigoWaylandSurfaceDescriptor,
-        MigoX11WindowDescriptor, SurfaceDescriptorRef, ValidatedPlatformSurface,
-        validate_attach_generation, validate_update_generation,
+        MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS, MIGO_COLOR_SPACE_DISPLAY_P3,
+        MIGO_COLOR_SPACE_EXTENDED_SRGB, MIGO_COLOR_SPACE_SRGB, MIGO_PLATFORM_ANDROID_NATIVE_WINDOW,
+        MIGO_PLATFORM_WAYLAND_SURFACE, MIGO_PLATFORM_WIN32_HWND,
+        MIGO_PLATFORM_WINUI_SWAP_CHAIN_PANEL, MIGO_PLATFORM_X11_WINDOW,
+        MIGO_PRESENTATION_MODE_DEFAULT, MIGO_PRESENTATION_MODE_FIFO,
+        MIGO_PRESENTATION_MODE_IMMEDIATE, MIGO_PRESENTATION_MODE_MAILBOX,
+        MIGO_SURFACE_CAPABILITY_TRANSPARENT, MIGO_SURFACE_CAPABILITY_WIDE_COLOR,
+        MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
+        MigoWaylandSurfaceDescriptor, MigoWin32HwndDescriptor, MigoX11WindowDescriptor,
+        SurfaceDescriptorRef, ValidatedPlatformSurface, validate_attach_generation,
+        validate_update_generation,
     },
 };
 
@@ -377,6 +379,37 @@ fn x11_wayland_and_android_native_identity_must_be_non_null() {
 }
 
 #[test]
+fn a_win32_hwnd_payload_is_copied_and_required_to_be_non_null() {
+    let mut win32 = MigoWin32HwndDescriptor {
+        header: header::<MigoWin32HwndDescriptor>(),
+        platform_kind: MIGO_PLATFORM_WIN32_HWND,
+        flags: 0,
+        hwnd: std::ptr::null_mut(),
+    };
+    let envelope = descriptor(
+        MIGO_PLATFORM_WIN32_HWND,
+        size_of::<MigoWin32HwndDescriptor>() as u32,
+        std::ptr::null(),
+    );
+    // A null HWND is the shape a host passes when its window creation failed
+    // and it did not check. Accepting it defers the failure to EGL, which
+    // reports it as a surface-creation error naming nothing the host controls.
+    assert_eq!(
+        parse_with_payload(&envelope, &win32).unwrap_err(),
+        MIGO_ERROR_INVALID_ARGUMENT
+    );
+
+    win32.hwnd = 0xdead_beefusize as *mut c_void;
+    let validated = parse_with_payload(&envelope, &win32).expect("valid Win32 surface");
+    match validated.platform() {
+        ValidatedPlatformSurface::Win32 { hwnd } => {
+            assert_eq!(hwnd.as_ptr() as usize, 0xdead_beef);
+        }
+        other => panic!("expected a Win32 surface, got {other:?}"),
+    }
+}
+
+#[test]
 fn unsupported_platforms_are_rejected_before_their_payload_is_touched() {
     let unsupported_descriptor = descriptor(MIGO_PLATFORM_X11_WINDOW, 0, std::ptr::null());
     let only_wayland = 1u64 << MIGO_PLATFORM_WAYLAND_SURFACE;
@@ -386,7 +419,17 @@ fn unsupported_platforms_are_rejected_before_their_payload_is_touched() {
         MIGO_ERROR_UNSUPPORTED_PLATFORM,
     );
 
-    let known_but_unimplemented = descriptor(MIGO_PLATFORM_WIN32_HWND, 0, std::ptr::null());
+    // Asserted rather than assumed. This case used MIGO_PLATFORM_WIN32_HWND
+    // until Win32 was implemented, at which point it stopped testing what it
+    // was named for: the payload started being read and the error changed. A
+    // case that depends on something staying unimplemented has to say so.
+    const KNOWN_BUT_UNIMPLEMENTED: u32 = MIGO_PLATFORM_WINUI_SWAP_CHAIN_PANEL;
+    assert_eq!(
+        MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS & (1u64 << KNOWN_BUT_UNIMPLEMENTED),
+        0,
+        "this case needs a platform kind the crate does not implement",
+    );
+    let known_but_unimplemented = descriptor(KNOWN_BUT_UNIMPLEMENTED, 0, std::ptr::null());
     assert_eq!(
         unsafe { SurfaceDescriptorRef::parse(&known_but_unimplemented) }.unwrap_err(),
         MIGO_ERROR_UNSUPPORTED_PLATFORM,
