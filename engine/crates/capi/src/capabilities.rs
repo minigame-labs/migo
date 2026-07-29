@@ -69,8 +69,14 @@ mod tests {
         assert_eq!(unsafe { migo_query_capabilities(&mut caps) }, MIGO_OK);
         assert_eq!(caps.abi_version_min, MIGO_ABI_VERSION_CURRENT);
         assert_eq!(caps.abi_version_max, MIGO_ABI_VERSION_CURRENT);
+        // The targets `platform/mod.rs` gives a real module rather than
+        // `unsupported`. Keeping the list here is the point: it is the claim
+        // being checked. Windows was absent from it while Windows fell through
+        // to `unsupported`, so this assertion passed on a build that shipped an
+        // SDK able to attach nothing.
         if cfg!(any(
             target_os = "android",
+            target_os = "windows",
             all(target_os = "linux", not(target_env = "ohos"))
         )) {
             assert_ne!(

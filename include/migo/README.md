@@ -219,7 +219,16 @@ The candidate cannot be declared stable until all of the following exist:
   on device, and rendering resumes after the app is backgrounded and returned to. Open:
   multi-pointer delivery has never run on device, because a real two-finger gesture cannot
   be synthesized there -- `sendevent` is refused by SELinux and `input motionevent` carries
-  one pointer. The ABI's batch conversion is covered by tests;
+  one pointer. The ABI's batch conversion is covered by tests. **Windows attaches an
+  `HWND`** through `engine/crates/capi/src/platform/windows.rs`. That file did not exist
+  until 2026-07-29: `platform/win32.h` declared `MigoWin32HwndDescriptor` and the
+  `tests/c_abi` lanes pinned its layout for both pointer widths, so every gate agreed with
+  every other gate while no implementation existed, and `migo_query_capabilities` reported
+  no attachable kind at all. A published SDK loaded, resolved all 24 entry points, and
+  could attach nothing. Header-to-header checks cannot see a missing implementation; the
+  check that does is asking the built library what it supports, which
+  `scripts/test-windows-sdk-contract.sh` now does and `scripts/build-windows-sdk.sh`
+  refuses to package without;
 - export lists, symbol/version tests, old-client/new-library tests, and per-target ILP32/LP64 layout lanes — **export list and symbol/version tests done** for `linux-x86_64` (`scripts/test-linux-sdk-contract.sh`); old-client/new-library lanes **done, inbound and outbound**; **layout lanes done for both pointer widths and both compiler families**. Every layout assertion in `tests/c_abi` is written twice, once per pointer width, but until 2026-07-21 only the LP64 half had ever been compiled — every lane ran on an LP64 host, so `#elif UINTPTR_MAX == UINT32_MAX` was dead source, and it had been wrong since the commit that appended `on_request_frame`: that commit updated the LP64 size and not the ILP32 one, and the soft-keyboard callbacks were then appended on top of the wrong base. `scripts/test-c-abi-surface-candidate.sh --ilp32` now compiles the lanes at `-m32` (freestanding, so it needs a multilib compiler but no 32-bit libc) and reports a skip loudly rather than passing silently when one is absent. `scripts/test-c-abi-msvc-lane.ps1` covers what no SysV compiler reaches: LLP64, MSVC's own C dialect under `/std:c11 /W4 /WX /permissive-`, `__cdecl` on x86, and the `__declspec(dllexport)`/`__declspec(dllimport)` branches of `MIGO_API`, which collapse to the GNU visibility attribute everywhere else. All four ABIs — LP64, LLP64, and ILP32 under both GCC and MSVC — agree. The append rule
   `MigoHostCallbacks` documents is now real: a caller's struct is copied, not
   reinterpreted, so a client compiled against an earlier header is accepted at its

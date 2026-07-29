@@ -112,7 +112,12 @@ pub(crate) fn build_target(
                 PlatformTarget::Wayland { surface, display },
             ))
         }
-        ValidatedPlatformSurface::Android { .. } => Err(MIGO_ERROR_UNSUPPORTED_PLATFORM),
+        // Listed rather than matched with a wildcard: a new platform payload
+        // must not compile until every platform module has taken a position on
+        // it.
+        ValidatedPlatformSurface::Android { .. } | ValidatedPlatformSurface::Win32 { .. } => {
+            Err(MIGO_ERROR_UNSUPPORTED_PLATFORM)
+        }
     }
 }
 

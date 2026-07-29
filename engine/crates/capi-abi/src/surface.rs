@@ -57,6 +57,7 @@ const MIGO_SURFACE_CAPABILITY_KNOWN_MASK: u64 = MIGO_SURFACE_CAPABILITY_WIDE_COL
     | MIGO_SURFACE_CAPABILITY_MAILBOX_PRESENT;
 
 pub const MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS: u64 = (1 << MIGO_PLATFORM_ANDROID_NATIVE_WINDOW)
+    | (1 << MIGO_PLATFORM_WIN32_HWND)
     | (1 << MIGO_PLATFORM_X11_WINDOW)
     | (1 << MIGO_PLATFORM_WAYLAND_SURFACE);
 
@@ -194,6 +195,19 @@ unsafe impl AbiStruct for MigoAndroidNativeWindowDescriptor {}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+pub struct MigoWin32HwndDescriptor {
+    pub header: VersionedHeader,
+    pub platform_kind: u32,
+    pub flags: u32,
+    pub hwnd: *mut c_void,
+}
+
+// SAFETY: every field has an all-zero representation and v1 requires the
+// complete record.
+unsafe impl AbiStruct for MigoWin32HwndDescriptor {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct MigoX11WindowDescriptor {
     pub header: VersionedHeader,
     pub platform_kind: u32,
@@ -271,6 +285,9 @@ impl SurfaceConfiguration {
 pub enum ValidatedPlatformSurface {
     Android {
         native_window: NonNull<c_void>,
+    },
+    Win32 {
+        hwnd: NonNull<c_void>,
     },
     X11 {
         display: NonNull<c_void>,
@@ -350,6 +367,16 @@ impl SurfaceDescriptorRef {
                 let native_window =
                     NonNull::new(payload.native_window).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
                 ValidatedPlatformSurface::Android { native_window }
+            }
+            MIGO_PLATFORM_WIN32_HWND => {
+                require_payload_size::<MigoWin32HwndDescriptor>(raw.platform_descriptor_size)?;
+                // SAFETY: the caller contract covers the selected payload.
+                let payload = unsafe {
+                    copy_versioned::<MigoWin32HwndDescriptor>(raw.platform_descriptor.cast())
+                }?;
+                validate_payload_prefix(payload.platform_kind, payload.flags, raw.platform_kind)?;
+                let hwnd = NonNull::new(payload.hwnd).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
+                ValidatedPlatformSurface::Win32 { hwnd }
             }
             MIGO_PLATFORM_X11_WINDOW => {
                 require_payload_size::<MigoX11WindowDescriptor>(raw.platform_descriptor_size)?;

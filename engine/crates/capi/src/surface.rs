@@ -43,7 +43,8 @@ use migo_capi_abi::{
 
 pub use migo_capi_abi::surface::{
     MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
-    MigoSurfaceReleaseStatus, MigoWaylandSurfaceDescriptor, MigoX11WindowDescriptor,
+    MigoSurfaceReleaseStatus, MigoWaylandSurfaceDescriptor, MigoWin32HwndDescriptor,
+    MigoX11WindowDescriptor,
 };
 use migo_capi_abi::surface::{
     SurfaceDescriptorRef, validate_attach_generation, validate_update_generation,
@@ -998,8 +999,16 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn test_platform_target() -> PlatformTarget {
+        PlatformTarget::Win32 {
+            hwnd: NonNull::new(0x2a0_0001usize as *mut c_void).expect("hwnd"),
+        }
+    }
+
     #[cfg(not(any(
         target_os = "android",
+        target_os = "windows",
         all(target_os = "linux", not(target_env = "ohos"))
     )))]
     fn test_platform_target() -> PlatformTarget {
