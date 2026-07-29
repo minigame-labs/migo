@@ -11,8 +11,11 @@
 mod android;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod linux;
+#[cfg(target_os = "windows")]
+mod windows;
 #[cfg(not(any(
     target_os = "android",
+    target_os = "windows",
     all(target_os = "linux", not(target_env = "ohos"))
 )))]
 mod unsupported;
@@ -21,13 +24,40 @@ mod unsupported;
 pub(crate) use android::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) use linux::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
+#[cfg(target_os = "windows")]
+pub(crate) use windows::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
 #[cfg(not(any(
     target_os = "android",
+    target_os = "windows",
     all(target_os = "linux", not(target_env = "ohos"))
 )))]
 pub(crate) use unsupported::{
     PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,
 };
+
+#[cfg(test)]
+mod contract_tests {
+    use super::supported_platform_kinds;
+    use migo_capi_abi::surface::MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS;
+
+    /// Attaching a kind requires both halves: a platform module that can build
+    /// the native objects, and a parser that will decode its payload.
+    ///
+    /// A kind present in only one half fails in a way that misdirects. Missing
+    /// from the parser, attach returns UNSUPPORTED_PLATFORM even though the
+    /// platform layer is right there, reading like the host passed the wrong
+    /// kind. Missing from the platform module, the library loads, exports
+    /// everything and advertises nothing -- which is how a Windows package
+    /// shipped that could not attach a window.
+    #[test]
+    fn every_attachable_kind_is_also_parseable() {
+        assert_eq!(
+            supported_platform_kinds() & !MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS,
+            0,
+            "this build attaches a platform kind the ABI parser rejects"
+        );
+    }
+}
 
 /// Whether this build can attach the given `MIGO_PLATFORM_*` kind.
 ///

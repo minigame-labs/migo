@@ -43,7 +43,8 @@ use migo_capi_abi::{
 
 pub use migo_capi_abi::surface::{
     MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
-    MigoSurfaceReleaseStatus, MigoWaylandSurfaceDescriptor, MigoX11WindowDescriptor,
+    MigoSurfaceReleaseStatus, MigoWaylandSurfaceDescriptor, MigoWin32HwndDescriptor,
+    MigoX11WindowDescriptor,
 };
 use migo_capi_abi::surface::{
     SurfaceDescriptorRef, validate_attach_generation, validate_update_generation,

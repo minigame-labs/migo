@@ -132,7 +132,9 @@ else
     # and it is why this gate needs Windows rather than a PE parser.
     LOADER_SRC="$WORK/loadprobe.c"
     cat > "$LOADER_SRC" <<'PROBE'
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <windows.h>
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
@@ -145,7 +147,35 @@ int main(int argc, char **argv) {
         fprintf(stderr, "migo_query_capabilities not resolvable\n");
         return 1;
     }
-    printf("LOAD_OK\n");
+    /* Loading and resolving is not the same as being usable. A build whose C
+     * ABI has no platform layer for this OS exports every entry point, loads
+     * cleanly, and then reports it can attach nothing -- which is exactly what
+     * shipped once. Ask the library what it supports, the way a host must
+     * before it builds a window. */
+    typedef struct { uint32_t struct_size; uint32_t abi_version;
+                     uint32_t abi_version_min; uint32_t abi_version_max;
+                     uint64_t platform_kinds; } Caps;
+    typedef int (*QueryFn)(Caps *);
+    QueryFn query = (QueryFn)(void *)GetProcAddress(module, "migo_query_capabilities");
+    Caps caps;
+    memset(&caps, 0, sizeof caps);
+    caps.struct_size = (uint32_t)sizeof caps;
+    caps.abi_version = 1;
+    if (query(&caps) != 0) {
+        fprintf(stderr, "migo_query_capabilities failed\n");
+        return 1;
+    }
+    if (caps.platform_kinds == 0) {
+        fprintf(stderr, "the library supports no surface platform (platform_kinds=0)\n");
+        return 1;
+    }
+    /* MIGO_PLATFORM_WIN32_HWND is 2. */
+    if ((caps.platform_kinds & (1ull << 2)) == 0) {
+        fprintf(stderr, "cannot attach a Win32 HWND (platform_kinds=0x%llx)\n",
+                (unsigned long long)caps.platform_kinds);
+        return 1;
+    }
+    printf("LOAD_OK platform_kinds=0x%llx\n", (unsigned long long)caps.platform_kinds);
     return 0;
 }
 PROBE
@@ -163,9 +193,9 @@ PROBE
         cp "$PREFIX/bin/"*.dll "$WORK/"
         LOAD_OUT="$(run_msvc "loadprobe.exe migo.dll" load || true)"
         if grep -q LOAD_OK <<<"$LOAD_OUT"; then
-            pass "migo.dll loads and resolves migo_query_capabilities"
+            pass "migo.dll loads and reports it can attach a Win32 HWND"
         else
-            fail "migo.dll did not load: $LOAD_OUT"
+            fail "migo.dll is not usable as a Windows host runtime: $LOAD_OUT"
         fi
     fi
 

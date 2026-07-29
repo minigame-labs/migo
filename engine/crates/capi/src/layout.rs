@@ -30,7 +30,8 @@ use crate::{
     keyboard::{MigoCompositionEvent, MigoKeyEvent, MigoKeyboardEvent},
     surface::{
         MigoAndroidNativeWindowDescriptor, MigoSurfaceDescriptor, MigoSurfaceMetrics,
-        MigoSurfaceReleaseStatus, MigoWaylandSurfaceDescriptor, MigoX11WindowDescriptor,
+        MigoSurfaceReleaseStatus, MigoWaylandSurfaceDescriptor, MigoWin32HwndDescriptor,
+        MigoX11WindowDescriptor,
     },
 };
 use migo_capi_abi::VersionedHeader;
@@ -61,6 +62,7 @@ header_is_first!(
     MigoSurfaceMetrics,
     MigoSurfaceReleaseStatus,
     MigoAndroidNativeWindowDescriptor,
+    MigoWin32HwndDescriptor,
     MigoX11WindowDescriptor,
     MigoWaylandSurfaceDescriptor,
     MigoTouchEvent,
@@ -221,6 +223,11 @@ mod lp64 {
 
     const _: () = assert!(size_of::<MigoAndroidNativeWindowDescriptor>() == 24);
     const _: () = assert!(offset_of!(MigoAndroidNativeWindowDescriptor, native_window) == 16);
+
+    const _: () = assert!(size_of::<MigoWin32HwndDescriptor>() == 24);
+    const _: () = assert!(offset_of!(MigoWin32HwndDescriptor, platform_kind) == 8);
+    const _: () = assert!(offset_of!(MigoWin32HwndDescriptor, flags) == 12);
+    const _: () = assert!(offset_of!(MigoWin32HwndDescriptor, hwnd) == 16);
 
     const _: () = assert!(size_of::<MigoWaylandSurfaceDescriptor>() == 32);
     const _: () = assert!(offset_of!(MigoWaylandSurfaceDescriptor, platform_kind) == 8);
