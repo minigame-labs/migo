@@ -234,6 +234,36 @@ apply_windows_patches || { err "patch stage failed"; exit 1; }
 BATCH_UNIX="/mnt/c/migo-win-spike-tmp/migo-build-v8-windows.bat"
 mkdir -p "$(dirname "$BATCH_UNIX")"
 
+# rusty_v8's build.rs only adds clang's resource directory to the bindgen
+# arguments when target_os == "linux" (see its bindgen setup); on Windows it
+# passes -nostdinc++ with V8's vendored libc++ but no builtin headers. Bindgen
+# then mis-parses the C++ namespace nesting: the binding it emits drops the
+# enclosing scope (v8_String_WriteFlags_kNullTerminate becomes
+# WriteFlags_kNullTerminate), loses cppgc_Visitor_Key entirely and lays
+# cppgc_Visitor out as one byte. That does not fail in bindgen -- it surfaces
+# much later as a static assertion inside the generated file computing
+# `1_usize - 8_usize`, which reads like broken V8 sources.
+#
+# The binding describes V8's C++ API, so it is fixed by the V8 revision -- which
+# windows-v8.lock.json pins and this build verifies. Reusing the committed one
+# is therefore the same artifact bindgen would produce if it parsed correctly,
+# and build-v8-linux.sh already does this for its own reason (older libclang).
+BINDING_BACKUP="$OUT_DIR/src_binding.rs"
+PREBUILT_BINDING_LINE=""
+if [[ -f "$BINDING_BACKUP" ]]; then
+    PREBUILT_BINDING_LINE="set \"V8_PREBUILT_BINDING=$(wslpath -w "$BINDING_BACKUP" 2>/dev/null || echo "$BINDING_BACKUP")\""
+    info "reusing committed binding: $BINDING_BACKUP"
+else
+    err "no committed src_binding.rs at $BINDING_BACKUP"
+    err "bindgen on Windows cannot produce a correct one (see the comment above)"
+    exit 1
+fi
+
+# One definition, interpolated into the batch below and handed to the manifest
+# writer. Writing them twice would let the recorded provenance drift from the
+# arguments the build actually used -- silently, since nothing compares them.
+GN_ARGS="v8_enable_webassembly=true v8_enable_pointer_compression=true v8_enable_i18n_support=true v8_enable_sandbox=false use_allocator_shim=false use_partition_alloc_as_malloc=false"
+
 PROXY_LINES=""
 [[ -n "$PROXY" ]] && PROXY_LINES="set HTTPS_PROXY=${PROXY}
 set HTTP_PROXY=${PROXY}"
@@ -252,6 +282,16 @@ rem clang resource directory, and the resolution inside bindgen does not consult
 rem PATH order, so the NDK directory has to be ABSENT rather than merely later.
 set "PATH=C:\\Program Files\\LLVM\\bin;%USERPROFILE%\\.cargo\\bin;%SystemRoot%\\system32;%SystemRoot%;%SystemRoot%\\System32\\Wbem"
 
+rem PATH alone does not decide which libclang bindgen loads: rusty_v8's build.rs
+rem resolves it through LIBCLANG_PATH and otherwise falls back to whatever the
+rem clang-sys crate finds -- including the libclang shipped inside
+rem v8\third_party\rust-toolchain, which is older than the Clang 20+ that V8's
+rem vendored libc++ headers need. Parsing them with it does not fail loudly: it
+rem silently mis-lays out C++ types, and the first sign is a static assertion
+rem deep in the generated bindings ("Size of cppgc_Visitor" computing 1 - 8).
+rem So the path is pinned here, not merely made reachable.
+set "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin"
+
 set CARGO_HOME=${CARGO_HOME_WIN}
 set CARGO_TARGET_DIR=${V8_TARGET_DIR_WIN}
 ${PROXY_LINES}
@@ -259,6 +299,7 @@ ${PROXY_LINES}
 rem rusty_v8 resolves python via PYTHON and otherwise calls "python3"; Windows
 rem installs python.exe and no python3.exe.
 set PYTHON=${PYTHON_WIN}
+${PREBUILT_BINDING_LINE}
 
 rem With GN and NINJA set, need_gn_ninja_download() is false and the CIPD
 rem resolve call -- the one download in this build that ignores HTTPS_PROXY,
@@ -288,7 +329,7 @@ rem that template as deduction-friendly and the MSVC STL does not; the code is
 rem valid either way. Chromium exposes no per-warning argument, and rusty_v8's
 rem own build.rs already turns this off whenever it uses a system clang. It
 rem changes no generated code, only whether a warning fails the build.
-set EXTRA_GN_ARGS=v8_enable_webassembly=true v8_enable_pointer_compression=true v8_enable_i18n_support=true v8_enable_sandbox=false use_allocator_shim=false use_partition_alloc_as_malloc=false
+set EXTRA_GN_ARGS=${GN_ARGS}
 
 cd /d ${RUSTY_V8_SRC_WIN} || exit /b 90
 rem V8 is built WITH its bundled libc++ (the crate default), because it cannot
@@ -320,6 +361,11 @@ BINDING="$GN_OUT_UNIX/src_binding.rs"
 # gn names the import library after the DLL, so accept either spelling instead
 # of pinning one and failing opaquely if the toolchain uses the other.
 DLL="$GN_OUT_UNIX/rusty_v8.dll"
+# The static archive is a product of this build too, and it is what
+# build-windows-sdk.sh actually links (see its header). Leaving it in gn_out and
+# letting the SDK reach in there is how the tree ended up with a .lib and a .dll
+# from two different builds: nothing tied them together, and nothing said so.
+ARCHIVE="$GN_OUT_UNIX/obj/rusty_v8.lib"
 IMPLIB=""
 for candidate in "$GN_OUT_UNIX/rusty_v8.dll.lib" "$GN_OUT_UNIX/rusty_v8.lib"; do
     [[ -f "$candidate" ]] && { IMPLIB="$candidate"; break; }
@@ -328,29 +374,60 @@ done
 [[ -f "$DLL" ]] || { err "rusty_v8.dll not found after build: $DLL"; exit 1; }
 [[ -n "$IMPLIB" ]] || { err "no import library beside $DLL"; exit 1; }
 [[ -f "$BINDING" ]] || { err "src_binding.rs not found after build: $BINDING"; exit 1; }
+[[ -f "$ARCHIVE" ]] || { err "rusty_v8.lib not found after build: $ARCHIVE"; exit 1; }
 
 mkdir -p "$OUT_DIR"
 cp "$DLL" "$OUT_DIR/rusty_v8.dll"
 cp "$IMPLIB" "$OUT_DIR/rusty_v8.dll.lib"
+# In prebuilt mode this copy is an identity: build.rs placed the committed
+# binding at $BINDING itself. Asserting that rather than trusting it, because
+# the alternative -- silently replacing the known-good binding with one bindgen
+# mis-generated -- is exactly the failure this reuse exists to prevent, and it
+# would only surface on the next build.
+if ! cmp -s "$BINDING" "$BINDING_BACKUP"; then
+    err "the build produced a binding that differs from the committed one"
+    err "  built:     $BINDING"
+    err "  committed: $BINDING_BACKUP"
+    err "refusing to overwrite it; V8_PREBUILT_BINDING did not take effect"
+    exit 1
+fi
 cp "$BINDING" "$OUT_DIR/src_binding.rs"
+cp "$ARCHIVE" "$OUT_DIR/rusty_v8.lib"
+ok "archive -> $OUT_DIR/rusty_v8.lib ($(du -h "$OUT_DIR/rusty_v8.lib" | cut -f1))"
 ok "dll     -> $OUT_DIR/rusty_v8.dll ($(du -h "$OUT_DIR/rusty_v8.dll" | cut -f1))"
 ok "implib  -> $OUT_DIR/rusty_v8.dll.lib ($(du -h "$OUT_DIR/rusty_v8.dll.lib" | cut -f1))"
 ok "binding -> $OUT_DIR/src_binding.rs"
 
-# The component manifest is not written yet: the source lock exists
-# ($V8_BUILD_LOCK, pinning the rusty_v8/V8 revisions and GN args this build
-# uses), but the writer does not. Writers are per-platform
-# (scripts/write-{,linux-}v8-component-manifest.py) because each records a
-# different toolchain and artifact shape -- Windows ships a DLL plus an import
-# library, not a single archive.
-#
-# It must be written HERE, in the build, not reconstructed afterwards: the
-# manifest asserts which sources and toolchain produced these exact bytes, and
-# only the build knows that. Generating one later from whatever the checkout
+# The component manifest is written HERE, in the build, not reconstructed
+# afterwards: it asserts which sources and toolchain produced these exact bytes,
+# and only the build knows that. Generating one later from whatever the checkout
 # happens to look like would produce a provenance record that reads as
-# authoritative while attesting to nothing, which is worse than its absence --
-# scripts/fetch-v8-archives.sh keys its integrity check on these manifests, so
-# a fabricated one would be trusted.
-info "component manifest not written: $V8_BUILD_LOCK exists, its writer does not"
-info "  -> until then this target cannot be published; see scripts/fetch-v8-archives.sh"
+# authoritative while attesting to nothing -- and scripts/fetch-v8-archives.sh
+# keys its integrity check on these manifests, so a fabricated one is trusted.
+#
+# Toolchain versions come from the installation this build actually used, not
+# from constants: a manifest that names a compiler the build did not run is a
+# worse record than one that names none.
+# VS_ROOT is a DOS path (vswhere reports Windows form); reading it from this
+# shell needs the same conversion every other Windows path here gets.
+VS_ROOT_UNIX="$(win_to_unix "$VS_ROOT")"
+MSVC_VERSION="$(ls "$VS_ROOT_UNIX/VC/Tools/MSVC" 2>/dev/null | sort -V | tail -1)"
+[[ -n "$MSVC_VERSION" ]] || { err "cannot determine the MSVC toolset version under $VS_ROOT_UNIX"; exit 1; }
+SDK_VERSION="$(ls "/mnt/c/Program Files (x86)/Windows Kits/10/Include" 2>/dev/null | sort -V | tail -1)"
+[[ -n "$SDK_VERSION" ]] || { err "cannot determine the Windows SDK version"; exit 1; }
+info "toolchain: MSVC $MSVC_VERSION, Windows SDK $SDK_VERSION"
+
+python3 "$SCRIPT_DIR/write-windows-v8-component-manifest.py" \
+    --repo-root "$PROJECT_ROOT" \
+    --rusty-v8-src "$SRC_UNIX" \
+    --gn-args "$GN_ARGS" \
+    --archive "$OUT_DIR/rusty_v8.lib" \
+    --binding "$OUT_DIR/src_binding.rs" \
+    --dll "$OUT_DIR/rusty_v8.dll" \
+    --implib "$OUT_DIR/rusty_v8.dll.lib" \
+    --output "$OUT_DIR/component-manifest.json" \
+    --lock "$V8_BUILD_LOCK" \
+    --msvc-version "$MSVC_VERSION" \
+    --sdk-version "$SDK_VERSION"
+ok "component manifest -> $OUT_DIR/component-manifest.json"
 ok "V8 build complete for $TARGET"

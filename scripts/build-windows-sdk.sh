@@ -14,10 +14,14 @@
 #   * The export allowlist is a `.def` file consumed by `link /DEF:`, not a GNU
 #     version script. It is generated from include/migo/*.h so it cannot drift
 #     from the headers.
-#   * V8 on Windows is a DLL (built that way so V8 and Skia can share the MSVC
-#     STL without a std::terminate ODR clash). migo.dll links against its import
-#     library and the DLL ships alongside; it is not absorbed into a static
-#     archive the way librusty_v8.a is on Linux.
+#   * V8 on Windows is built as a shared library (so V8 and Skia share the MSVC
+#     STL instead of colliding on std::terminate), which yields both a DLL and a
+#     201 MB static archive in gn_out. This links the ARCHIVE, not the import
+#     library: migo.dll absorbs V8 exactly the way it absorbs librusty_v8.a on
+#     Linux, and `dumpbin /DEPENDENTS migo.dll` lists no rusty_v8.dll. The DLL
+#     form matters for how V8 is *compiled* (its libc++ stays internal); it is
+#     not what gets shipped. Verified 2026-07-29 against the built artifact --
+#     an earlier version of this comment claimed the opposite.
 #   * The MSVC linker's /OPT:REF is the analog of --gc-sections: skia-bindings
 #     compiles one translation unit with JPEG/PDF/pathops wrappers that Skia is
 #     built without, so it references symbols that do not exist; /OPT:REF must
