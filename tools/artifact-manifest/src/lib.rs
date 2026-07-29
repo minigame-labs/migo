@@ -25,6 +25,12 @@ pub const LINUX_PACKAGE_SCHEMA_V2: &str = "migo-linux-package-manifest/v2";
 /// `GLIBCXX_*` requirement above them. Measured values today sit below both
 /// (2.27 / 3.4.26), and the headroom is deliberate -- the floor is what is
 /// promised to consumers, so it may only be raised as a breaking change.
+/// Which C runtime the Windows V8 is compiled against. Unlike the Linux floors
+/// this is not a version the loader enforces -- the MSVC runtime is a
+/// redistributable the host ships -- so what matters is that every artifact in
+/// one binary agrees on it. Mixing /MD and /MT is what produced the LNK4098
+/// libcmt conflict this build recipe exists to avoid.
+pub const WINDOWS_MSVC_RUNTIME: &str = "MD (dynamic CRT)";
 pub const LINUX_GLIBC_FLOOR: &str = "2.31";
 pub const LINUX_GLIBCXX_FLOOR: &str = "3.4.28";
 
@@ -1630,6 +1636,7 @@ fn validate_v8_component_target(target: &TargetIdentity) -> Result<(), ManifestE
     match (target.os.as_str(), target.abi.as_str()) {
         ("android", "android") => validate_android_target(target),
         ("linux", "gnu") => validate_linux_v8_target(target),
+        ("windows", "msvc") => validate_windows_v8_target(target),
         (os, abi) => Err(ManifestError::new(format!(
             "unsupported V8 component target OS/ABI: {os}/{abi}"
         ))),
@@ -1657,6 +1664,32 @@ fn validate_linux_v8_target(target: &TargetIdentity) -> Result<(), ManifestError
     {
         return Err(ManifestError::new(format!(
             "Linux V8 target.runtime_floor must be exactly glibc={LINUX_GLIBC_FLOOR}, glibcxx={LINUX_GLIBCXX_FLOOR}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_windows_v8_target(target: &TargetIdentity) -> Result<(), ManifestError> {
+    require_equal("target.triple", &target.triple, "x86_64-pc-windows-msvc")?;
+    require_equal("target.os", &target.os, "windows")?;
+    require_equal("target.abi", &target.abi, "msvc")?;
+    require_equal("target.arch", &target.arch, "x86_64")?;
+    require_equal("target.cpu_baseline", &target.cpu_baseline, "x86-64-v1")?;
+    require_sorted_unique(
+        "target.required_cpu_features",
+        &target.required_cpu_features,
+    )?;
+    if target.required_cpu_features != ["cmov", "sse2"] {
+        return Err(ManifestError::new(
+            "target.required_cpu_features for Windows x86_64 must be [\"cmov\", \"sse2\"]",
+        ));
+    }
+    if target.runtime_floor.len() != 1
+        || target.runtime_floor.get("msvc_runtime").map(String::as_str)
+            != Some(WINDOWS_MSVC_RUNTIME)
+    {
+        return Err(ManifestError::new(format!(
+            "Windows V8 target.runtime_floor must be exactly msvc_runtime={WINDOWS_MSVC_RUNTIME}"
         )));
     }
     Ok(())

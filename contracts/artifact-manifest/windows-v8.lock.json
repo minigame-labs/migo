@@ -1,33 +1,38 @@
 {
-  "schema": "migo-v8-build-lock/v1",
-  "rusty_v8_version": "145.0.0",
-  "rusty_v8_revision": "0b8cfc5ae9d2507031076df2acdf61b0742a4c4e",
-  "v8_revision": "8defb67673c5483ae56258a2de01b07e947dc921",
+  "cargo_features": {
+    "use_custom_libcxx": true
+  },
   "component_kind": "shared_library",
-  "targets": {
-    "x86_64": {
-      "triple": "x86_64-pc-windows-msvc",
-      "cpu_baseline": "x86-64-v1",
-      "required_cpu_features": ["cmov", "sse2"]
-    }
-  },
   "gn_args": {
-    "use_custom_libcxx": false,
-    "v8_enable_webassembly": true,
-    "v8_enable_pointer_compression": true,
-    "v8_enable_i18n_support": true,
-    "v8_enable_sandbox": false,
     "use_allocator_shim": false,
-    "use_partition_alloc_as_malloc": false
+    "use_partition_alloc_as_malloc": false,
+    "v8_enable_i18n_support": true,
+    "v8_enable_pointer_compression": true,
+    "v8_enable_sandbox": false,
+    "v8_enable_webassembly": true
   },
+  "notes": "V8 is built as a shared library (rusty_v8.dll + import lib) WITH its own bundled libc++ -- use_custom_libcxx stays on. An earlier plan set it false so V8 and Skia would share the MSVC STL, and this lock recorded that; it was measured infeasible on 2026-07-24 (clang-cl crashes on 32 torque-generated translation units, preceded by 78 -Wctad-maybe-unsupported errors, because Chromium compiles them with -D_HAS_EXCEPTIONS=0 and /std:c++23preview, which Microsoft's STL does not support). The Skia/V8 std::terminate collision is instead answered by the shared-library form keeping V8's libc++ internal. Note use_custom_libcxx is a cargo feature, not a GN argument: build.rs derives the GN value from CARGO_FEATURE_USE_CUSTOM_LIBCXX and overrides EXTRA_GN_ARGS, so it is recorded under cargo_features. component_kind, gn_args and cargo_features are Windows-specific extensions to the migo-v8-build-lock/v1 shape used by android-v8.lock.json.",
   "required_patches": [
     "0005-windows-host-callback-registration",
     "0006-windows-rusty-v8-shared-library",
     "0007-windows-register-host-callbacks-from-rust"
   ],
-  "notes": "V8 is built as a shared library (rusty_v8.dll + import lib) with use_custom_libcxx=false so V8 and Skia share the MSVC STL; the published static rusty_v8 bundles V8's own libc++ and collides (LNK2005 std::terminate) when linked with Skia. component_kind and gn_args are Windows-specific extensions to the migo-v8-build-lock/v1 shape used by android-v8.lock.json.",
+  "rusty_v8_revision": "0b8cfc5ae9d2507031076df2acdf61b0742a4c4e",
+  "rusty_v8_version": "145.0.0",
+  "schema": "migo-v8-build-lock/v1",
   "sources": {
     "rusty_v8": "https://github.com/denoland/rusty_v8/tree/0b8cfc5ae9d2507031076df2acdf61b0742a4c4e",
     "v8": "https://chromium.googlesource.com/v8/v8/+/8defb67673c5483ae56258a2de01b07e947dc921"
-  }
+  },
+  "targets": {
+    "x86_64": {
+      "cpu_baseline": "x86-64-v1",
+      "required_cpu_features": [
+        "cmov",
+        "sse2"
+      ],
+      "triple": "x86_64-pc-windows-msvc"
+    }
+  },
+  "v8_revision": "8defb67673c5483ae56258a2de01b07e947dc921"
 }

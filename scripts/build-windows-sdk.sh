@@ -14,10 +14,14 @@
 #   * The export allowlist is a `.def` file consumed by `link /DEF:`, not a GNU
 #     version script. It is generated from include/migo/*.h so it cannot drift
 #     from the headers.
-#   * V8 on Windows is a DLL (built that way so V8 and Skia can share the MSVC
-#     STL without a std::terminate ODR clash). migo.dll links against its import
-#     library and the DLL ships alongside; it is not absorbed into a static
-#     archive the way librusty_v8.a is on Linux.
+#   * V8 on Windows is built as a shared library (so V8 and Skia share the MSVC
+#     STL instead of colliding on std::terminate), which yields both a DLL and a
+#     201 MB static archive in gn_out. This links the ARCHIVE, not the import
+#     library: migo.dll absorbs V8 exactly the way it absorbs librusty_v8.a on
+#     Linux, and `dumpbin /DEPENDENTS migo.dll` lists no rusty_v8.dll. The DLL
+#     form matters for how V8 is *compiled* (its libc++ stays internal); it is
+#     not what gets shipped. Verified 2026-07-29 against the built artifact --
+#     an earlier version of this comment claimed the opposite.
 #   * The MSVC linker's /OPT:REF is the analog of --gc-sections: skia-bindings
 #     compiles one translation unit with JPEG/PDF/pathops wrappers that Skia is
 #     built without, so it references symbols that do not exist; /OPT:REF must
@@ -30,9 +34,16 @@
 # Usage: scripts/build-windows-sdk.sh [--prefix WSL_DIR]
 #
 # Required env (same identities the spike uses):
-#   MIGO_WIN_V8_DIR   DOS path to the committed Windows V8 dir holding
-#                     rusty_v8.dll, rusty_v8.lib, src_binding.rs. Defaults to
-#                     the in-repo engine/third_party/rusty_v8/x86_64-pc-windows-msvc.
+#   MIGO_WIN_V8_DIR   DOS path to the Windows V8 artifacts (rusty_v8.dll,
+#                     rusty_v8.lib, src_binding.rs). Defaults to the WSL-side
+#                     engine/third_party/rusty_v8/x86_64-pc-windows-msvc, which
+#                     is where build-v8-windows.sh puts them.
+#
+#                     NOT the synced worktree copy: that whole directory is
+#                     git-ignored (.gitignore), so sync-worktree.sh -- which
+#                     clones -- can never carry it across. Pointing there
+#                     produced an empty path and a V8 build script panic
+#                     ("系统找不到指定的路径") several layers away from the cause.
 #   MIGO_WIN_ANGLE_DIR DOS path to the ANGLE runtime DLLs (libEGL.dll,
 #                     libGLESv2.dll, d3dcompiler_47.dll). Defaults to the spike tmp.
 #   MIGO_WIN_PROXY    optional http proxy for the V8 crate's build script.
@@ -56,7 +67,7 @@ TRIPLE="$WIN_TARGET_TRIPLE"                      # x86_64-pc-windows-msvc
 # the synced worktree copy on a local disk -- a wslpath UNC path is unusable for
 # the toolchain, which is the whole reason the worktree lives on C:.
 V8_DIR_UNIX="$REPO_ROOT/engine/third_party/rusty_v8/x86_64-pc-windows-msvc"
-V8_DIR_DOS="${MIGO_WIN_V8_DIR:-$WIN_WORKTREE_DOS\\engine\\third_party\\rusty_v8\\x86_64-pc-windows-msvc}"
+V8_DIR_DOS="${MIGO_WIN_V8_DIR:-$(wslpath -w "$V8_DIR_UNIX")}"
 ANGLE_DIR_UNIX="${MIGO_WIN_ANGLE_DIR_UNIX:-$WIN_TMP_UNIX/angle}"
 [[ -d "$ANGLE_DIR_UNIX" ]] || ANGLE_DIR_UNIX="$WIN_TMP_UNIX"   # spike staged them flat once
 
