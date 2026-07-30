@@ -19,17 +19,22 @@
 #   scripts/build-ohos-sdk.sh [x86_64|aarch64]   (default: aarch64)
 #   scripts/build-ohos-sdk.sh --all
 #
-# The build itself is not run here; point it at an already-built archive. Build
-# with:
-#   RUSTY_V8_ARCHIVE=engine/third_party/rusty_v8/<arch>-linux-ohos/librusty_v8.a \
-#   RUSTY_V8_SRC_BINDING_PATH=.../src_binding.rs \
-#   cargo build -p migo-capi --release --no-default-features \
-#       --features profile-slim --target <arch>-unknown-linux-ohos
+# ONE COMMAND. From a clean checkout this builds V8, builds migo-capi, stages
+# the package and gates it, in that order, reusing whatever already exists. The
+# delivery criterion this project holds every platform to is a single command
+# with no human step in the middle, and "run these three and remember two
+# environment variables" does not meet it.
 #
-# ⚠ profile-slim is required, not a preference: the full profile pulls
-# audio -> cpal -> alsa-sys -> pkg-config, and OpenHarmony has no ALSA. Its
-# audio surface is OHAudio (libohaudio.so, present in the sysroot), which the
-# engine does not consume yet.
+# Env:
+#   MIGO_OHOS_NO_BUILD=1   fail instead of building missing inputs. For CI
+#                          lanes that mean to check an existing package rather
+#                          than produce one.
+#   MIGO_OHOS_MIN_API      declared floor (default 20)
+#
+# ⚠ profile-slim is used, and that is a requirement rather than a preference:
+# the full profile pulls audio -> cpal -> alsa-sys -> pkg-config, and
+# OpenHarmony has no ALSA. Its audio surface is OHAudio (libohaudio.so, present
+# in the sysroot), which the engine does not consume yet.
 # =============================================================================
 set -euo pipefail
 
@@ -63,9 +68,49 @@ for ARCH in "${ARCHES[@]}"; do
     STATIC_LIB="$REPO_ROOT/engine/target/$TRIPLE/release/libmigo_capi.a"
     PREFIX="$REPO_ROOT/dist/migo-ohos-$ARCH"
 
+    # ---- build what is missing ---------------------------------------------
+    # One command, no human step in the middle: that is the delivery criterion
+    # this project holds every platform to, and three commands with two
+    # environment variables to remember is not it. Existing artifacts are
+    # reused, so the expensive parts run once.
+    V8_DIR="$REPO_ROOT/engine/third_party/rusty_v8/$ARCH-linux-ohos"
+    if [[ ! -f "$V8_DIR/librusty_v8.a" ]]; then
+        if [[ "${MIGO_OHOS_NO_BUILD:-0}" == "1" ]]; then
+            err "missing $V8_DIR/librusty_v8.a and MIGO_OHOS_NO_BUILD=1"
+            exit 1
+        fi
+        info "$ARCH: V8 archive absent, building it (this takes a while)"
+        bash "$SCRIPT_DIR/build-v8-ohos.sh" "$ARCH"
+    fi
+    [[ -f "$V8_DIR/librusty_v8.a" ]] || { err "V8 build produced no archive"; exit 1; }
+    [[ -f "$V8_DIR/src_binding.rs" ]] || { err "V8 build produced no binding"; exit 1; }
+
     if [[ ! -f "$STATIC_LIB" ]]; then
-        err "static library not found: ${STATIC_LIB#"$REPO_ROOT"/}"
-        err "build it first (see this script's header for the command)"
+        if [[ "${MIGO_OHOS_NO_BUILD:-0}" == "1" ]]; then
+            err "static library not found: ${STATIC_LIB#"$REPO_ROOT"/}"
+            err "and MIGO_OHOS_NO_BUILD=1 forbids building it"
+            exit 1
+        fi
+        info "$ARCH: building migo-capi"
+        # dev-setup-ohos.sh supplies the compiler pins; without them a machine
+        # with an Android NDK on PATH silently compiles the C dependencies with
+        # the NDK's clang and bionic headers for a musl target.
+        OHOS_ENV="$(bash "$SCRIPT_DIR/dev-setup-ohos.sh" | grep '^export ')"
+        (
+            eval "$OHOS_ENV"
+            cd "$REPO_ROOT/engine"
+            # Run from engine/ so rust-toolchain.toml applies: it is resolved
+            # from the working directory, not from --manifest-path.
+            RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
+            RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
+                cargo build -p migo-capi --release \
+                    --no-default-features --features profile-slim \
+                    --target "$TRIPLE"
+        )
+    fi
+
+    if [[ ! -f "$STATIC_LIB" ]]; then
+        err "build reported success but produced no ${STATIC_LIB#"$REPO_ROOT"/}"
         exit 1
     fi
 
