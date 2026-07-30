@@ -132,6 +132,28 @@ if [[ -d "$NATIVE/sysroot/usr/lib" ]]; then
     info "sysroot targets: ${TRIPLES:-none found}"
 fi
 
+# ---- assert the target-prefixed drivers cargo's config.toml names ----------
+# The SDK ships one clang driver per target, named exactly after the Rust
+# target triple, and each one already knows its own sysroot (verified with
+# `-print-search-dirs`: it resolves ../../sysroot/usr/lib without --sysroot).
+# So .cargo/config.toml can name the driver directly, the same way the Android
+# entries name the NDK's own wrappers -- no hand-rolled wrapper is needed, and
+# nothing machine-specific has to be committed.
+DRIVERS_OK=1
+for triple in x86_64-unknown-linux-ohos aarch64-unknown-linux-ohos; do
+    if [[ -x "$NATIVE/llvm/bin/$triple-clang" ]]; then
+        info "  ok   llvm/bin/$triple-clang"
+    else
+        err  "  MISS llvm/bin/$triple-clang"
+        DRIVERS_OK=0
+    fi
+done
+if [[ $DRIVERS_OK -ne 1 ]]; then
+    err "the SDK does not ship the target-prefixed clang drivers that"
+    err "engine/.cargo/config.toml names as linkers"
+    exit 1
+fi
+
 if [[ $CHECK_ONLY -eq 1 ]]; then
     exit 0
 fi
@@ -141,4 +163,5 @@ cat <<EOF
 # Consume these in the current shell:
 export OHOS_NDK_HOME="$NDK_HOME"
 export OHOS_SDK_NATIVE="$NATIVE"
+export PATH="$NATIVE/llvm/bin:\$PATH"
 EOF
