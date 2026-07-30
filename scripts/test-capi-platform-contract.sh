@@ -40,9 +40,81 @@ fi
 
 # Set inline, never exported: leaking these into a host build makes it link the
 # Android archive and fail confusingly.
+# Run from inside engine/ rather than passing --manifest-path from the repo
+# root. rust-toolchain.toml is resolved from the working directory, so the
+# manifest-path form silently used the machine's default toolchain instead of
+# the pinned one -- a gate checking a different compiler than the product ships
+# with. Observed: the repo root resolved to stable, which lacks the aarch64
+# OpenHarmony std that engine's pinned 1.95.0 has.
 info "cross-checking capi for $TARGET"
-RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
-RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
-    cargo check -p migo-capi --target "$TARGET" --manifest-path "$ENGINE_DIR/Cargo.toml"
+(
+    cd "$ENGINE_DIR"
+    RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
+    RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
+        cargo check -p migo-capi --target "$TARGET"
+)
 
 info "OK: the C ABI compiles for $TARGET"
+
+# -----------------------------------------------------------------------------
+# OpenHarmony round.
+#
+# This is not "one more platform for completeness". OpenHarmony targets report
+# `target_os = "linux"` with `target_env = "ohos"`, so every bare
+# `cfg(target_os = "linux")` in the tree matches them too -- and the Android
+# round above is structurally incapable of catching that class, because Android
+# reports its own target_os. platform/src/lib.rs and capi/src/platform/mod.rs
+# spell `not(target_env = "ohos")` today; this round is what keeps them that
+# way.
+#
+# profile-slim is required rather than preferred: the full profile pulls
+# audio -> cpal -> alsa-sys -> pkg-config, and OpenHarmony has no ALSA.
+# -----------------------------------------------------------------------------
+OHOS_TARGET="${MIGO_OHOS_TARGET:-aarch64-unknown-linux-ohos}"
+OHOS_ARCH="${OHOS_TARGET%%-*}"
+OHOS_V8_DIR="$ENGINE_DIR/third_party/rusty_v8/$OHOS_ARCH-linux-ohos"
+
+ohos_skip() {
+    # Loud on stderr, never silent. A quietly skipped lane is exactly how the
+    # ILP32 layout assertions stayed broken for two releases.
+    echo -e "\033[0;33m[capi-platform] SKIPPED OpenHarmony round: $1\033[0m" >&2
+    if [[ "${MIGO_CAPI_REQUIRE_OHOS:-0}" == "1" ]]; then
+        err "MIGO_CAPI_REQUIRE_OHOS=1 makes that skip an error"
+        exit 1
+    fi
+    exit 0
+}
+
+# Every export, not just the OHOS_* ones: skia-bindings resolves its compiler
+# through CLANGCC (then plain CC, then the literal "clang"), so filtering to
+# OHOS_* leaves it building Skia with whatever compiler the machine happens to
+# have -- which on a machine with an Android NDK is the NDK's clang, against
+# bionic headers, for a musl target.
+if ! OHOS_EXPORTS="$(bash "$SCRIPT_DIR/dev-setup-ohos.sh" 2>/dev/null | grep '^export ')"; then
+    ohos_skip "no usable OpenHarmony SDK (see scripts/dev-setup-ohos.sh)"
+fi
+eval "$OHOS_EXPORTS"
+[[ -n "${OHOS_SDK_NATIVE:-}" ]] || ohos_skip "dev-setup-ohos.sh produced no OHOS_SDK_NATIVE"
+[[ -f "$OHOS_V8_DIR/librusty_v8.a" ]] || \
+    ohos_skip "missing $OHOS_V8_DIR/librusty_v8.a (build it with scripts/build-v8-ohos.sh $OHOS_ARCH)"
+
+info "cross-checking capi for $OHOS_TARGET"
+# `env` rather than an assignment prefix: cc-rs wants CC_<target with
+# underscores>, and bash does not expand a variable to form the NAME of an
+# assignment prefix -- `CC_${x}=v cmd` is parsed as a command named
+# "CC_...=v", which exits 127 and reads like a missing compiler.
+OHOS_TARGET_U="${OHOS_TARGET//-/_}"
+(
+    cd "$ENGINE_DIR"
+    env \
+        PATH="$OHOS_SDK_NATIVE/llvm/bin:$PATH" \
+        "CC_${OHOS_TARGET_U}=$OHOS_SDK_NATIVE/llvm/bin/$OHOS_TARGET-clang" \
+        "CXX_${OHOS_TARGET_U}=$OHOS_SDK_NATIVE/llvm/bin/$OHOS_TARGET-clang++" \
+        "AR_${OHOS_TARGET_U}=$OHOS_SDK_NATIVE/llvm/bin/llvm-ar" \
+        RUSTY_V8_ARCHIVE="$OHOS_V8_DIR/librusty_v8.a" \
+        RUSTY_V8_SRC_BINDING_PATH="$OHOS_V8_DIR/src_binding.rs" \
+        cargo check -p migo-capi --target "$OHOS_TARGET" \
+            --no-default-features --features profile-slim
+)
+
+info "OK: the C ABI compiles for $OHOS_TARGET"
