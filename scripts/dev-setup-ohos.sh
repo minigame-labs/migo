@@ -164,4 +164,30 @@ cat <<EOF
 export OHOS_NDK_HOME="$NDK_HOME"
 export OHOS_SDK_NATIVE="$NATIVE"
 export PATH="$NATIVE/llvm/bin:\$PATH"
+
+# ---- pin every C/C++ compiler resolution at the SDK's own clang -------------
+# Without these, a machine with an Android NDK on PATH silently builds the C
+# dependencies (zstd, sqlite3, ...) with the NDK's clang 12 and its bionic
+# headers, for a musl target. It COMPILES -- cc-rs passes --target so the
+# object files carry the right triple -- and the mismatch only shows up at
+# runtime as struct layouts that disagree. Verified 2026-07-30: the first
+# ohos build here produced zstd_preSplit.o stamped
+# "Android (8481493 ...) clang version 12.0.9".
+#
+# cc-rs resolves CC_<target> before plain CC, which is the same lever
+# engine/.cargo/config.toml already uses for the Windows MSVC target, so these
+# win over an ambient CC without disturbing any other target.
+export CC_x86_64_unknown_linux_ohos="$NATIVE/llvm/bin/x86_64-unknown-linux-ohos-clang"
+export CXX_x86_64_unknown_linux_ohos="$NATIVE/llvm/bin/x86_64-unknown-linux-ohos-clang++"
+export AR_x86_64_unknown_linux_ohos="$NATIVE/llvm/bin/llvm-ar"
+export CC_aarch64_unknown_linux_ohos="$NATIVE/llvm/bin/aarch64-unknown-linux-ohos-clang"
+export CXX_aarch64_unknown_linux_ohos="$NATIVE/llvm/bin/aarch64-unknown-linux-ohos-clang++"
+export AR_aarch64_unknown_linux_ohos="$NATIVE/llvm/bin/llvm-ar"
+
+# skia-bindings does NOT use cc-rs's target prefixes. It reads CLANGCC, then
+# plain CC, then the literal "clang" -- so the target-scoped names above are
+# invisible to it and it needs its own pin. CLANGCC exists precisely for
+# SDK-supplied toolchains, which is what this is.
+export CLANGCC="$NATIVE/llvm/bin/clang"
+export CLANGCXX="$NATIVE/llvm/bin/clang++"
 EOF
