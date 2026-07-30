@@ -1,9 +1,9 @@
 diff --git a/build/toolchain/ohos/BUILD.gn b/build/toolchain/ohos/BUILD.gn
 new file mode 100644
-index 000000000..d28d75e88
+index 000000000..4144e088f
 --- /dev/null
 +++ b/build/toolchain/ohos/BUILD.gn
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,206 @@
 +# Copyright 2026 The Chromium Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -40,10 +40,42 @@ index 000000000..d28d75e88
 +  # directory containing llvm/ and sysroot/. Required; there is no sensible
 +  # default because the SDK is not vendored.
 +  ohos_sdk_native = ""
++
++  # Absolute path to a directory holding the compiler wrappers that
++  # scripts/build-v8-ohos.sh generates. Required, and it exists for a reason
++  # that took a full build to establish:
++  #
++  # The SDK's own clang is 15.0.4, and V8 145 compiles as C++23. clang 15
++  # only accepts the draft spelling `-std=c++2b` and rejects `-std=c++23`
++  # outright, along with `-Wno-thread-safety-reference-return`,
++  # `-Wno-nontrivial-memcall` and `-Wno-uninitialized-const-pointer`, all of
++  # which Chromium passes unconditionally. So V8 cannot be built with the SDK
++  # compiler at all -- that is a compiler-version wall, not a configuration
++  # problem.
++  #
++  # The remaining route is Chromium's own clang (22) with the OpenHarmony
++  # sysroot, which is exactly what the Android build does with the NDK. But
++  # Chromium hardcodes `--target=` per `current_os` in
++  # //build/config/compiler/BUILD.gn, and with `current_os = "linux"` that is
++  # `x86_64-unknown-linux-gnu` -- glibc. There is no `extra_cflags` argument
++  # in this tree to append after it (that is a Skia argument, not a Chromium
++  # one), so the override has to happen in the driver.
++  #
++  # The wrappers therefore invoke Chromium's clang and append
++  # `--target=<ohos triple> --sysroot=<sdk sysroot>` AFTER the caller's
++  # arguments. clang honours the last `--target`, verified with
++  # `-dumpmachine` reporting x86_64-unknown-linux-ohos when both are present.
++  #
++  # V8 keeps Chromium's vendored libc++ while Skia uses the SDK's. That is the
++  # same arrangement Android already ships and tolerates via
++  # --allow-multiple-definition; it is not new risk introduced here.
++  ohos_clang_wrapper_dir = ""
 +}
 +
 +assert(ohos_sdk_native != "",
 +       "ohos_sdk_native must be set to the OpenHarmony SDK's native/ directory")
++assert(ohos_clang_wrapper_dir != "",
++       "ohos_clang_wrapper_dir must be set; run scripts/build-v8-ohos.sh")
 +
 +# Wraps a toolchain for one OpenHarmony target triple.
 +#
@@ -70,19 +102,22 @@ index 000000000..d28d75e88
 +# derives nothing), and the host-side companions are declared separately below
 +# against the host compiler -- which is what they were always meant to use.
 +template("ohos_clang_toolchain") {
-+  _bin = "$ohos_sdk_native/llvm/bin"
++  _host_bin_abs = "$clang_base_path/bin"
++  _wrap = "$ohos_clang_wrapper_dir/${invoker.triple}"
 +
 +  single_gcc_toolchain(target_name) {
-+    cc = "$_bin/${invoker.triple}-clang"
-+    cxx = "$_bin/${invoker.triple}-clang++"
++    # Chromium's clang, reached through the wrapper that appends the
++    # OpenHarmony target and sysroot. See ohos_clang_wrapper_dir above.
++    cc = "$_wrap-clang"
++    cxx = "$_wrap-clang++"
 +    ld = cxx
 +
-+    # The LLVM binutils are not target-prefixed; they read the object's own
-+    # triple. Using the SDK's copies rather than the host's keeps one LLVM
-+    # version in play across compile and archive.
-+    ar = "$_bin/llvm-ar"
-+    nm = "$_bin/llvm-nm"
-+    readelf = "$_bin/llvm-readelf"
++    # Binutils need no wrapper: they are not target-prefixed and read each
++    # object's own triple. These come from Chromium's LLVM so that one LLVM
++    # version spans compile, archive and inspect.
++    ar = "$_host_bin_abs/llvm-ar"
++    nm = "$_host_bin_abs/llvm-nm"
++    readelf = "$_host_bin_abs/llvm-readelf"
 +
 +    toolchain_args = {
 +      current_cpu = invoker.toolchain_cpu
@@ -146,12 +181,12 @@ index 000000000..d28d75e88
 +  }
 +
 +  gcc_system_allocator_toolchain("${target_name}_with_system_allocator") {
-+    cc = "$_bin/${invoker.triple}-clang"
-+    cxx = "$_bin/${invoker.triple}-clang++"
++    cc = "$_wrap-clang"
++    cxx = "$_wrap-clang++"
 +    ld = cxx
-+    ar = "$_bin/llvm-ar"
-+    nm = "$_bin/llvm-nm"
-+    readelf = "$_bin/llvm-readelf"
++    ar = "$_host_bin_abs/llvm-ar"
++    nm = "$_host_bin_abs/llvm-nm"
++    readelf = "$_host_bin_abs/llvm-readelf"
 +
 +    toolchain_args = {
 +      current_cpu = invoker.toolchain_cpu
