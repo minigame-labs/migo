@@ -48,6 +48,9 @@ struct Host {
     std::string files_dir;
     std::string cache_dir;
     std::string content_id;
+    /* Physical pixels per CSS pixel. Kept because touch coordinates cross the
+     * ABI in CSS pixels while the platform reports physical ones. */
+    float scale_factor = 3.0f;
 };
 
 Host g_host;
@@ -142,7 +145,7 @@ void attach_surface(OH_NativeXComponent *component, void *window) {
     /* Physical pixels per CSS pixel. A wrong value here still renders, but puts
      * every touch in the wrong place -- the failure is silent and looks like an
      * input bug rather than a configuration one. */
-    surface.scale_factor = 3.0f;
+    surface.scale_factor = g_host.scale_factor;
     surface.color_space = MIGO_COLOR_SPACE_SRGB;
     surface.alpha_mode = MIGO_ALPHA_MODE_OPAQUE;
     surface.preferred_presentation_mode = MIGO_PRESENTATION_MODE_DEFAULT;
@@ -225,9 +228,83 @@ void OnSurfaceDestroyedCB(OH_NativeXComponent *component, void *window) {
     detach_surface();
 }
 
+/*
+ * Touch, translated rather than forwarded.
+ *
+ * Two things are easy to get wrong here and neither fails loudly:
+ *   - Coordinates cross the ABI in CSS pixels, while OpenHarmony reports
+ *     physical ones. Skipping the division renders correctly and puts every
+ *     touch in the wrong place.
+ *   - The event type belongs to the whole event; per-point types exist but a wx
+ *     content model expects one phase per delivery, which is what the engine's
+ *     MIGO_TOUCH_* values encode.
+ */
 void DispatchTouchEventCB(OH_NativeXComponent *component, void *window) {
-    (void)component;
-    (void)window;
+    if (g_host.session == nullptr) {
+        return;
+    }
+    OH_NativeXComponent_TouchEvent event;
+    memset(&event, 0, sizeof event);
+    if (OH_NativeXComponent_GetTouchEvent(component, window, &event) != 0) {
+        LOGE("OH_NativeXComponent_GetTouchEvent failed");
+        return;
+    }
+
+    MigoTouchType type;
+    switch (event.type) {
+        case OH_NATIVEXCOMPONENT_DOWN:   type = MIGO_TOUCH_START;  break;
+        case OH_NATIVEXCOMPONENT_MOVE:   type = MIGO_TOUCH_MOVE;   break;
+        case OH_NATIVEXCOMPONENT_UP:     type = MIGO_TOUCH_END;    break;
+        case OH_NATIVEXCOMPONENT_CANCEL: type = MIGO_TOUCH_CANCEL; break;
+        default:
+            return;  /* UNKNOWN carries no phase the engine can act on. */
+    }
+
+    uint32_t count = event.numPoints;
+    if (count == 0) count = 1;
+    if (count > MIGO_TOUCH_MAX_POINTS) count = MIGO_TOUCH_MAX_POINTS;
+
+    MigoTouchPoint points[MIGO_TOUCH_MAX_POINTS];
+    memset(points, 0, sizeof points);
+    const float inv_scale = (g_host.scale_factor > 0.0f) ? (1.0f / g_host.scale_factor) : 1.0f;
+    /* MIGO_TOUCH_FLAG_CHANGED is what separates `touches` from
+     * `changedTouches` on the JS side. Omitting it is not a cosmetic loss: on a
+     * touchend the lifted finger stays in `touches`, so content that waits for
+     * the list to empty never sees it empty. That is a silent wrong-behaviour
+     * bug, not an error -- it was found by a probe whose colour never reached
+     * the released state.
+     *
+     * For MOVE every point changed; for the pointer-specific phases exactly one
+     * did, and OpenHarmony names it in the event's own id field. */
+    const bool all_changed = (type == MIGO_TOUCH_MOVE);
+    for (uint32_t i = 0; i < count; ++i) {
+        const OH_NativeXComponent_TouchPoint &tp = event.touchPoints[i];
+        points[i].id = (uint32_t)tp.id;
+        points[i].x = tp.x * inv_scale;
+        points[i].y = tp.y * inv_scale;
+        points[i].pressure = tp.force;
+        points[i].flags = (all_changed || tp.id == event.id) ? MIGO_TOUCH_FLAG_CHANGED : 0;
+    }
+
+    MigoTouchEvent out;
+    memset(&out, 0, sizeof out);
+    out.struct_size = (uint32_t)sizeof out;
+    out.abi_version = MIGO_ABI_VERSION_CURRENT;
+    out.type = type;
+    out.point_count = count;
+    out.timestamp_ms = event.timeStamp / 1000000;  /* ns -> ms */
+    out.points = points;
+
+    LOGI("touch type=%{public}u points=%{public}u ev.id=%{public}d p0.id=%{public}u flags=%{public}u",
+         (unsigned)type, count, event.id, points[0].id, (unsigned)points[0].flags);
+    MigoResult rc = migo_session_send_touch(g_host.session, &out);
+    if (rc != MIGO_OK) {
+        /* WOULD_BLOCK is transient and the host decides whether to retry;
+         * dropping an END silently would leave content believing a finger is
+         * still down, with no later event to correct it. */
+        LOGE("migo_session_send_touch(type=%{public}u) failed: %{public}d", (unsigned)type,
+             (int)rc);
+    }
 }
 
 OH_NativeXComponent_Callback g_callbacks = {
