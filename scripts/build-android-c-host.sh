@@ -33,9 +33,31 @@ V8_DIR="$ENGINE_DIR/third_party/rusty_v8/aarch64"
 [[ -f "$V8_DIR/librusty_v8.a" ]] || { err "missing $V8_DIR/librusty_v8.a"; exit 1; }
 
 info "building capi staticlib for $TARGET"
-RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
-RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
-    cargo build -p migo-capi --release --target "$TARGET" --manifest-path "$ENGINE_DIR/Cargo.toml"
+# Built from inside engine/ so engine/rust-toolchain.toml applies -- it is
+# resolved from the working directory, not from --manifest-path, so building
+# from the repository root silently used the machine's default toolchain
+# instead of the pinned one.
+#
+# ⚠ That move also activates engine/.cargo/config.toml's `[env]`, which sets a
+# bare CC=clang-18 for every target; cc-rs would then build the C dependencies
+# for Android with the host compiler and fail on bits/libc-header-start.h. It
+# does not fail on a machine that exports a CC pointing at the NDK, so the
+# failure only appears on a clean runner. cc-rs resolves CC_<target> before bare
+# CC, so pinning the target-scoped names settles it.
+NDK_API="${MIGO_ANDROID_API:-26}"
+NDK_CC="$NDK_BIN/${TARGET}${NDK_API}-clang"
+[[ -x "$NDK_CC" ]] || { err "NDK clang driver not found: $NDK_CC"; exit 1; }
+TARGET_U="${TARGET//-/_}"
+(
+    cd "$ENGINE_DIR"
+    env \
+        "CC_${TARGET_U}=$NDK_CC" \
+        "CXX_${TARGET_U}=${NDK_CC}++" \
+        "AR_${TARGET_U}=$NDK_BIN/llvm-ar" \
+        RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
+        RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
+        cargo build -p migo-capi --release --target "$TARGET"
+)
 
 STAGE="$REPO_ROOT/tests/c_host/android/src/main/jniLibs-static/$ABI"
 mkdir -p "$STAGE"

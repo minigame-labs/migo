@@ -1,0 +1,212 @@
+diff --git a/build/toolchain/ohos/BUILD.gn b/build/toolchain/ohos/BUILD.gn
+new file mode 100644
+index 000000000..4144e088f
+--- /dev/null
++++ b/build/toolchain/ohos/BUILD.gn
+@@ -0,0 +1,206 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++#
++# OpenHarmony toolchain for migo.
++#
++# Upstream Chromium has no OpenHarmony support: `target_os` is not in any
++# whitelist, and neither build/ nor buildtools/ mentions it. Rather than teach
++# the build system a new OS, this uses the extension point BUILDCONFIG.gn
++# already provides -- `custom_toolchain` -- and keeps `current_os = "linux"`.
++#
++# That is not a workaround, it is the same judgement Rust makes: the ohos
++# targets report target_os="linux" with target_env="ohos", because OpenHarmony
++# IS a Linux kernel; only the userspace (musl, not glibc) differs. Every
++# kernel-level assumption in the Linux configs therefore holds, and the
++# userspace difference is carried entirely by the compiler driver below.
++#
++# The drivers are the SDK's own target-prefixed ones. Each already resolves its
++# sysroot (verified with `-print-search-dirs`: it finds ../../sysroot/usr/lib
++# without --sysroot), so no sysroot argument is threaded through here and
++# nothing machine-specific is baked in beyond `ohos_sdk_native`.
++#
++# Using the SDK's clang rather than Chromium's bundled one is deliberate. Skia
++# is already compiled with it, and the SDK's compatible_config.json defines the
++# native ABI generations by clang version -- ABI_3 is "clang 15, API 10+". A V8
++# built with a different clang would pair a different libc++ with Skia's, and
++# that mismatch surfaces at runtime rather than at link time.
++
++import("//build/config/clang/clang.gni")
++import("//build/toolchain/gcc_toolchain.gni")
++
++declare_args() {
++  # Absolute path to the OpenHarmony SDK's `native` directory, i.e. the
++  # directory containing llvm/ and sysroot/. Required; there is no sensible
++  # default because the SDK is not vendored.
++  ohos_sdk_native = ""
++
++  # Absolute path to a directory holding the compiler wrappers that
++  # scripts/build-v8-ohos.sh generates. Required, and it exists for a reason
++  # that took a full build to establish:
++  #
++  # The SDK's own clang is 15.0.4, and V8 145 compiles as C++23. clang 15
++  # only accepts the draft spelling `-std=c++2b` and rejects `-std=c++23`
++  # outright, along with `-Wno-thread-safety-reference-return`,
++  # `-Wno-nontrivial-memcall` and `-Wno-uninitialized-const-pointer`, all of
++  # which Chromium passes unconditionally. So V8 cannot be built with the SDK
++  # compiler at all -- that is a compiler-version wall, not a configuration
++  # problem.
++  #
++  # The remaining route is Chromium's own clang (22) with the OpenHarmony
++  # sysroot, which is exactly what the Android build does with the NDK. But
++  # Chromium hardcodes `--target=` per `current_os` in
++  # //build/config/compiler/BUILD.gn, and with `current_os = "linux"` that is
++  # `x86_64-unknown-linux-gnu` -- glibc. There is no `extra_cflags` argument
++  # in this tree to append after it (that is a Skia argument, not a Chromium
++  # one), so the override has to happen in the driver.
++  #
++  # The wrappers therefore invoke Chromium's clang and append
++  # `--target=<ohos triple> --sysroot=<sdk sysroot>` AFTER the caller's
++  # arguments. clang honours the last `--target`, verified with
++  # `-dumpmachine` reporting x86_64-unknown-linux-ohos when both are present.
++  #
++  # V8 keeps Chromium's vendored libc++ while Skia uses the SDK's. That is the
++  # same arrangement Android already ships and tolerates via
++  # --allow-multiple-definition; it is not new risk introduced here.
++  ohos_clang_wrapper_dir = ""
++}
++
++assert(ohos_sdk_native != "",
++       "ohos_sdk_native must be set to the OpenHarmony SDK's native/ directory")
++assert(ohos_clang_wrapper_dir != "",
++       "ohos_clang_wrapper_dir must be set; run scripts/build-v8-ohos.sh")
++
++# Wraps a toolchain for one OpenHarmony target triple.
++#
++# `triple` is the SDK driver's prefix, which is also the Rust target triple --
++# they agree, which is why nothing has to translate between them.
++#
++# ⚠ This deliberately does NOT use `gcc_toolchain`. That template derives three
++# extra toolchains (`_for_rust_host_build_tools`,
++# `_host_with_system_allocator`, `_with_system_allocator`) by forwarding every
++# invoker variable, including `cc`/`cxx`. Two of those are meant to build
++# *host* tools, so they would end up invoking the OpenHarmony cross-compiler to
++# produce binaries meant to run on the build machine, and then look for the
++# host clang runtime under the cross-compiler's tree. The observed failure is
++# a missing `.../llvm/lib/clang/22/lib/x86_64-unknown-linux-gnu/
++# libclang_rt.builtins.a` -- clang 22 being Chromium's bundled version and the
++# path being inside the OpenHarmony SDK, a combination that can never exist.
++#
++# V8 145 really does need this: `third_party/rust/temporal_capi` is Rust, so
++# the host build tools are not optional, and turning Rust off would drop the
++# Temporal implementation and make OpenHarmony's JS surface differ from the
++# other three platforms.
++#
++# So the target toolchain is declared with `single_gcc_toolchain` (which
++# derives nothing), and the host-side companions are declared separately below
++# against the host compiler -- which is what they were always meant to use.
++template("ohos_clang_toolchain") {
++  _host_bin_abs = "$clang_base_path/bin"
++  _wrap = "$ohos_clang_wrapper_dir/${invoker.triple}"
++
++  single_gcc_toolchain(target_name) {
++    # Chromium's clang, reached through the wrapper that appends the
++    # OpenHarmony target and sysroot. See ohos_clang_wrapper_dir above.
++    cc = "$_wrap-clang"
++    cxx = "$_wrap-clang++"
++    ld = cxx
++
++    # Binutils need no wrapper: they are not target-prefixed and read each
++    # object's own triple. These come from Chromium's LLVM so that one LLVM
++    # version spans compile, archive and inspect.
++    ar = "$_host_bin_abs/llvm-ar"
++    nm = "$_host_bin_abs/llvm-nm"
++    readelf = "$_host_bin_abs/llvm-readelf"
++
++    toolchain_args = {
++      current_cpu = invoker.toolchain_cpu
++      current_os = "linux"
++      is_clang = true
++
++      # Chromium's Debian sysroot is glibc; OpenHarmony is musl. The driver
++      # supplies the correct sysroot itself, so this must stay off or the two
++      # would be mixed.
++      use_sysroot = false
++
++      # PartitionAlloc's shim hijacks malloc/free process-wide. An engine
++      # embedded in a host application must not do that -- it would free
++      # pointers the host allocated with the system allocator.
++      use_allocator_shim = false
++      use_partition_alloc_as_malloc = false
++
++      if (defined(invoker.toolchain_args)) {
++        forward_variables_from(invoker.toolchain_args, "*")
++      }
++    }
++  }
++
++  # Host-side companions. These build tools that run on the build machine, so
++  # they use the host compiler and host cpu/os -- never the OpenHarmony
++  # cross-compiler. The names are fixed: gn resolves them by appending these
++  # suffixes to the target toolchain's name.
++  _host_bin = rebase_path("$clang_base_path/bin", root_build_dir)
++
++  gcc_rust_host_build_tools_toolchain(
++      "${target_name}_for_rust_host_build_tools") {
++    cc = "$_host_bin/clang"
++    cxx = "$_host_bin/clang++"
++    ld = cxx
++    ar = "$_host_bin/llvm-ar"
++    nm = "$_host_bin/llvm-nm"
++    readelf = "$_host_bin/llvm-readelf"
++
++    toolchain_args = {
++      current_cpu = host_cpu
++      current_os = host_os
++      is_clang = true
++      use_allocator_shim = false
++      use_partition_alloc_as_malloc = false
++    }
++  }
++
++  gcc_system_allocator_toolchain("${target_name}_host_with_system_allocator") {
++    cc = "$_host_bin/clang"
++    cxx = "$_host_bin/clang++"
++    ld = cxx
++    ar = "$_host_bin/llvm-ar"
++    nm = "$_host_bin/llvm-nm"
++    readelf = "$_host_bin/llvm-readelf"
++
++    toolchain_args = {
++      current_cpu = host_cpu
++      current_os = host_os
++      is_clang = true
++    }
++  }
++
++  gcc_system_allocator_toolchain("${target_name}_with_system_allocator") {
++    cc = "$_wrap-clang"
++    cxx = "$_wrap-clang++"
++    ld = cxx
++    ar = "$_host_bin_abs/llvm-ar"
++    nm = "$_host_bin_abs/llvm-nm"
++    readelf = "$_host_bin_abs/llvm-readelf"
++
++    toolchain_args = {
++      current_cpu = invoker.toolchain_cpu
++      current_os = "linux"
++      is_clang = true
++      use_sysroot = false
++    }
++  }
++}
++
++ohos_clang_toolchain("clang_x64") {
++  triple = "x86_64-unknown-linux-ohos"
++  toolchain_cpu = "x64"
++  toolchain_args = {
++  }
++}
++
++ohos_clang_toolchain("clang_arm64") {
++  triple = "aarch64-unknown-linux-ohos"
++  toolchain_cpu = "arm64"
++  toolchain_args = {
++  }
++}

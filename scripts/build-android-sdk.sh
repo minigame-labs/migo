@@ -103,16 +103,52 @@ python3 "$SCRIPT_DIR/write-android-build-metadata.py" \
     --build-recipe scripts/build-android-sdk.sh
 
 info "building capi staticlib (release, $TARGET)"
-cargo build -p migo-capi --release --target "$TARGET" --manifest-path "$ENGINE_DIR/Cargo.toml"
+# Built from inside engine/ so that engine/rust-toolchain.toml applies. It is
+# resolved from the working directory, never from --manifest-path, so building
+# from the repository root used whichever toolchain the machine defaults to --
+# for a file whose own comment calls itself "Pinned for a frozen, reproducible
+# build chain", that is the one thing it must not do. Shipped bytes were being
+# produced by an unpinned compiler.
+#
+# ⚠ Moving into engine/ also activates engine/.cargo/config.toml's `[env]`,
+# which sets a bare CC=clang-18 for every target. cc-rs would then compile the C
+# dependencies for Android with the host compiler against /usr/include and fail
+# on bits/libc-header-start.h. It does NOT fail on a developer machine that
+# exports a CC pointing at the NDK, because an exported variable beats the
+# non-forcing [env] -- so the failure is invisible locally and appears only on a
+# clean runner. Pinning the target-scoped names is the fix: cc-rs resolves
+# CC_<target> before bare CC, the same lever that config.toml already uses for
+# the Windows target.
+NDK_API="${MIGO_ANDROID_API:-26}"
+NDK_CC="$NDK_BIN/${TARGET}${NDK_API}-clang"
+[[ -x "$NDK_CC" ]] || { err "NDK clang driver not found: $NDK_CC"; exit 1; }
+TARGET_U="${TARGET//-/_}"
+(
+    cd "$ENGINE_DIR"
+    env \
+        "CC_${TARGET_U}=$NDK_CC" \
+        "CXX_${TARGET_U}=${NDK_CC}++" \
+        "AR_${TARGET_U}=$NDK_BIN/llvm-ar" \
+        cargo build -p migo-capi --release --target "$TARGET"
+)
 STATIC_LIB="$ENGINE_DIR/target/$TARGET/release/libmigo_capi.a"
 [[ -f "$STATIC_LIB" ]] || { err "no static library produced"; exit 1; }
 info "built: $STATIC_LIB ($(stat -c %s "$STATIC_LIB") bytes)"
 
 info "capturing the link line cargo uses"
 CARGO_OUT="$ENGINE_DIR/target/$TARGET/release/migo-android-native-static-libs.txt"
-cargo rustc -p migo-capi --release --target "$TARGET" \
-    --manifest-path "$ENGINE_DIR/Cargo.toml" -- --print native-static-libs \
-    > "$CARGO_OUT" 2>&1 \
+# Same working directory and same compiler pins as the build above: this
+# reports the link line a consumer must reproduce, so it has to describe the
+# artifact that was actually built rather than a differently-configured one.
+(
+    cd "$ENGINE_DIR"
+    env \
+        "CC_${TARGET_U}=$NDK_CC" \
+        "CXX_${TARGET_U}=${NDK_CC}++" \
+        "AR_${TARGET_U}=$NDK_BIN/llvm-ar" \
+        cargo rustc -p migo-capi --release --target "$TARGET" \
+            -- --print native-static-libs
+) > "$CARGO_OUT" 2>&1 \
     || { err "cargo did not report native-static-libs"; cat "$CARGO_OUT" >&2; exit 1; }
 grep -q "native-static-libs:" "$CARGO_OUT" \
     || { err "no native-static-libs note in cargo output"; exit 1; }
