@@ -61,11 +61,36 @@ const _JS_BUILTINS = new Set([
 ]);
 
 // Self-references and runtime internals are not part of either API namespace.
+//
+// ORDERING HAZARD -- read before adding anything to globalThis.
+//
+// These namespaces are built here, during bootstrap. `harden_global_scope`
+// (Rust, `lib.rs`) deletes the deno_core internals from globalThis *after*
+// that, because deleting them from JS breaks deno_core's snapshot restore
+// path. So a mirror built first captures whatever hardening deletes later, and
+// deleting the global afterwards does nothing to the copy.
+//
+// That is not hypothetical: `Deno` was mirrored onto both namespaces and
+// `wx.Deno.core.ops` handed content 616 invocable ops -- the whole native
+// surface, past every JS-level API and policy. `__bootstrap` escaped only
+// because it happens to start with an underscore.
+//
+// So anything hardening removes must be listed here too, and the two lists are
+// kept in agreement by `scripts/test-runtime-internals-not-published.sh`. The
+// behavioural backstop is `tests/published_namespace_isolation.rs`, which
+// searches the published namespaces for an op table by shape rather than by
+// name -- a new internal that leaks fails there even if nobody updates a list.
+const _RUNTIME_INTERNALS = new Set([
+    "Deno",             // deno_core: `.core.ops` is the entire native surface
+    "__bootstrap",      // deno_core: internal module registry
+]);
+
 const _NON_API = new Set([
     "GameGlobal", "global", "migo", "wx",     // self-references (added below or by 99_main.js)
     "_perf",                                   // host-only profiler hook
     "console",                                 // standard JS, not wx-namespaced
     "_CCSettings",                             // engine-compat shim (Cocos)
+    ..._RUNTIME_INTERNALS,
 ]);
 
 // Browser content capabilities implemented by the native runtime and surfaced
