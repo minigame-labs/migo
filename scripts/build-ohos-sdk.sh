@@ -85,12 +85,21 @@ for ARCH in "${ARCHES[@]}"; do
     [[ -f "$V8_DIR/librusty_v8.a" ]] || { err "V8 build produced no archive"; exit 1; }
     [[ -f "$V8_DIR/src_binding.rs" ]] || { err "V8 build produced no binding"; exit 1; }
 
-    if [[ ! -f "$STATIC_LIB" ]]; then
-        if [[ "${MIGO_OHOS_NO_BUILD:-0}" == "1" ]]; then
+    # Unlike V8 -- a separate multi-hour build with its own provenance record,
+    # correctly reused when present -- cargo is always run. Cargo is the only
+    # thing that knows whether the sources changed, so skipping it because the
+    # archive already exists ships whatever was built last time. That is not
+    # hypothetical: this script packaged an aarch64 archive predating the
+    # OpenHarmony surface backend, and the package gated cleanly because every
+    # check agreed with the stale bytes. An up-to-date build is a no-op.
+    if [[ "${MIGO_OHOS_NO_BUILD:-0}" == "1" ]]; then
+        if [[ ! -f "$STATIC_LIB" ]]; then
             err "static library not found: ${STATIC_LIB#"$REPO_ROOT"/}"
             err "and MIGO_OHOS_NO_BUILD=1 forbids building it"
             exit 1
         fi
+        info "$ARCH: MIGO_OHOS_NO_BUILD=1, checking the existing archive as-is"
+    else
         info "$ARCH: building migo-capi"
         # dev-setup-ohos.sh supplies the compiler pins; without them a machine
         # with an Android NDK on PATH silently compiles the C dependencies with
@@ -156,10 +165,15 @@ set(MIGO_INCLUDE_DIRS "\${MIGO_PREFIX}/include")
 set(MIGO_LIBRARY "\${MIGO_PREFIX}/lib/libmigo_capi.a")
 
 add_library(migo::migo STATIC IMPORTED)
+# native_window is needed by the surface backend, which takes its own reference
+# on the OHNativeWindow* a consumer attaches. Omitting it is invisible until a
+# consumer actually attaches: until then --gc-sections drops the backend and the
+# link succeeds without it. That is how it was missing from this package for a
+# while, and why the contract's consumer now references the attach entry point.
 set_target_properties(migo::migo PROPERTIES
     IMPORTED_LOCATION "\${MIGO_LIBRARY}"
     INTERFACE_INCLUDE_DIRECTORIES "\${MIGO_INCLUDE_DIRS}"
-    INTERFACE_LINK_LIBRARIES "EGL;GLESv3;c++;m;dl;pthread")
+    INTERFACE_LINK_LIBRARIES "EGL;GLESv3;native_window;c++;m;dl;pthread")
 
 # Required, not tuning: skia-bindings carries a translation unit referencing
 # JPEG/PDF/pathops symbols for features this build disables. Only section
@@ -194,6 +208,33 @@ EOF
     LIB_SHA="$(sha256sum "$PREFIX/lib/libmigo_capi.a" | cut -d' ' -f1)"
     GIT_COMMIT="$(cd "$REPO_ROOT" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
+    # ---- what the built bytes say they can attach ---------------------------
+    # Read out of the archive, not written down here. A surface backend cannot
+    # exist without calling the platform to reference the window it was handed,
+    # so an archive that imports OH_NativeWindow_NativeObjectReference has one
+    # compiled in and an archive that does not, does not -- regardless of what
+    # any header, macro or hand-maintained list claims. That distinction is the
+    # whole difference between this package and the Windows SDK this project
+    # published with a declared descriptor and no implementation behind it.
+    #
+    # grep -c, not grep -q: -q exits at the first match and SIGPIPEs nm, which
+    # under `set -o pipefail` makes the whole pipeline fail. The first version of
+    # this used -q and silently took the "no backend" branch on an archive that
+    # plainly had one -- the failure looked like a missing backend, not like a
+    # shell bug, and only disagreeing with the gate exposed it.
+    BACKEND_REFS="$(nm --undefined-only "$PREFIX/lib/libmigo_capi.a" 2>/dev/null \
+        | grep -c 'OH_NativeWindow_NativeObjectReference' || true)"
+    if [[ "$BACKEND_REFS" -gt 0 ]]; then
+        KINDS_JSON='["MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW"]'
+        KINDS_NOTE="The archive imports OH_NativeWindow_NativeObjectReference, so an OpenHarmony surface backend is compiled in. Verified end to end on an API 20 emulator: attach, content load, render, and a full touch lifecycle confirmed by reading back rendered pixels."
+        SURFACE_GAP=""
+    else
+        KINDS_JSON='[]'
+        KINDS_NOTE="This archive imports no OpenHarmony window API, so no surface backend is compiled in and migo_query_capabilities reports no attachable kind."
+        SURFACE_GAP='
+    "surface attach: no backend in this archive, see capabilities.attachable_platform_kinds",'
+    fi
+
     cat > "$PREFIX/share/migo/ohos-$ARCH-manifest.json" <<EOF
 {
   "schema": "migo/ohos-package/v1",
@@ -208,15 +249,16 @@ EOF
   },
   "abi_note": "OpenHarmony userspace is musl. This archive is not interchangeable with an Android (bionic) or a glibc build.",
   "entry_points": $ENTRY_POINTS,
-  "link_libraries": ["EGL", "GLESv3", "c++", "m", "dl", "pthread"],
+  "link_libraries": ["EGL", "GLESv3", "native_window", "c++", "m", "dl", "pthread"],
   "required_link_options": ["-Wl,--gc-sections"],
   "capabilities": {
-    "attachable_platform_kinds": [],
-    "note": "No OpenHarmony surface backend is implemented yet, so migo_query_capabilities reports no attachable kind. Headers describing MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW are a compile-time contract only."
+    "attachable_platform_kinds": $KINDS_JSON,
+    "note": "$KINDS_NOTE"
   },
-  "known_gaps": [
+  "known_gaps": [$SURFACE_GAP
     "audio: OHAudio (libohaudio.so) is not wired up; this package is built with profile-slim",
-    "surface attach: not implemented, see capabilities.attachable_platform_kinds"
+    "arch coverage: only x86_64 has been run on a device (API 20 emulator); aarch64 is built and gated but unverified until real HarmonyOS NEXT hardware is available",
+    "multi-touch: verified single-pointer only; hdc cannot synthesise a second pointer"
   ],
   "artifacts": {
     "lib/libmigo_capi.a": "$LIB_SHA"
@@ -246,18 +288,28 @@ cmake -DCMAKE_TOOLCHAIN_FILE=\$OHOS_NDK_HOME/native/build/cmake/ohos.toolchain.c
       -DCMAKE_PREFIX_PATH=<this directory> ...
 \`\`\`
 
+## Attaching a surface
+
+The attachable platform kind is \`MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW\`,
+which carries the \`OHNativeWindow*\` an ArkUI XComponent hands to its native
+module. Migo takes its own reference on that window and releases it before it
+reports \`RELEASED\`, so the host must not destroy the window until then.
+\`platforms/openharmony\` in the migo repository is a complete working host if
+you want the wiring in full.
+
+Do not take the claim in the manifest on faith: it is derived from the archive
+itself, by checking that the surface backend imports the OpenHarmony window API
+it cannot work without. A package whose \`attachable_platform_kinds\` is empty
+has no backend compiled in, whatever the headers declare.
+
 ## What this package does not do yet
 
-\`migo_query_capabilities\` reports **no attachable platform kind**: the
-OpenHarmony surface backend is not implemented. The headers declaring
-\`MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW\` are a compile-time contract, and
-this package deliberately does not claim otherwise -- a published SDK that
-loads, resolves every entry point and can attach nothing is a failure mode this
-project has already shipped once on another platform.
+Audio is absent: the package is built with \`profile-slim\` because the full
+profile requires ALSA, which OpenHarmony does not have. Its audio surface is
+OHAudio, which the engine does not consume yet.
 
-Audio is likewise absent: the package is built with \`profile-slim\` because
-the full profile requires ALSA, which OpenHarmony does not have. Wiring the
-engine to OHAudio is separate work.
+Only \`x86_64\` has been run on a device -- an API 20 emulator. The \`aarch64\`
+package is built and gated the same way but has not run on real hardware.
 
 Declared minimum OpenHarmony API: **$MIN_OHOS_API**.
 See \`share/migo/ohos-$ARCH-manifest.json\` for the complete record.

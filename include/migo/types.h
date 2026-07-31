@@ -94,29 +94,27 @@
 #endif
 
 /*
- * OpenHarmony is deliberately absent, and the reason is a judgement rather
- * than an oversight.
+ * Whether this platform has a linkable migo runtime.
  *
- * A linkable OpenHarmony runtime does now exist: scripts/build-ohos-sdk.sh
- * stages libmigo_capi.a for arm64 and x86_64, an external consumer links it
- * with every migo_* resolved, and scripts/test-ohos-sdk-contract.sh gates
- * that. By the narrow reading -- "is there something to link?" -- it qualifies.
+ * A third party greps this to decide whether the platform is usable at all, so
+ * the bar for setting it is not "does something link" but "can a surface be
+ * attached and driven" -- the bar Android was held to, and the reason
+ * OpenHarmony stayed 0 for a while after its static library already linked.
  *
- * But this macro is what a third party greps for to decide whether the
- * platform is usable, and Android only flipped to 1 once surface attach,
- * lifecycle, and input had run on a device. OpenHarmony has no surface backend
- * yet: the library links, answers migo_query_capabilities, and can display
- * nothing. Claiming a runtime for it would be true in the letter and
- * misleading in the effect. Flipping late costs nothing; flipping early
- * misleads everyone who trusts it.
+ * OpenHarmony cleared that bar on 2026-07-31 on an API 20 emulator: an
+ * XComponent's OHNativeWindow* attached (generation 1), content loaded and
+ * reported ready, the surface rendered, and a full touch lifecycle reached JS
+ * and was confirmed by reading the rendered pixel back -- red before the tap,
+ * blue after the finger lifted. scripts/build-ohos-sdk.sh stages the package
+ * for aarch64 and x86_64 and scripts/test-ohos-sdk-contract.sh gates it,
+ * including that the manifest claims no platform kind the library cannot
+ * actually attach.
  *
- * Flip it when an OpenHarmony surface can be attached and driven -- the same
- * bar every other platform here cleared. The library's own answer
- * (migo_query_capabilities, reporting no attachable kind today) is what should
- * be consulted meanwhile; it describes the library that was linked, which a
- * preprocessor macro can never do.
+ * The macro still cannot describe the library that was linked -- only the
+ * platform it was compiled for. migo_query_capabilities answers the narrower
+ * question and should be preferred wherever the answer must be exact.
  */
-#if MIGO_PLATFORM_IS_LINUX_GNU || MIGO_PLATFORM_IS_ANDROID
+#if MIGO_PLATFORM_IS_LINUX_GNU || MIGO_PLATFORM_IS_ANDROID || MIGO_PLATFORM_IS_OPENHARMONY
 #define MIGO_C_ABI_HAS_RUNTIME 1
 #else
 #define MIGO_C_ABI_HAS_RUNTIME 0
