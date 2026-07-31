@@ -6,6 +6,12 @@ pub(crate) mod jni_profile_contract;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux;
 
+// OpenHarmony reports target_os = "linux" with target_env = "ohos", so it must
+// be selected on the env rather than the OS -- the desktop Linux module above
+// excludes it for the same reason.
+#[cfg(all(target_os = "linux", target_env = "ohos"))]
+pub mod ohos;
+
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(all(feature = "profile-full", feature = "profile-slim"))]

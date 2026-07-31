@@ -11,10 +11,13 @@
 mod android;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod linux;
+#[cfg(all(target_os = "linux", target_env = "ohos"))]
+mod ohos;
 #[cfg(not(any(
     target_os = "android",
     target_os = "windows",
-    all(target_os = "linux", not(target_env = "ohos"))
+    all(target_os = "linux", not(target_env = "ohos")),
+    all(target_os = "linux", target_env = "ohos")
 )))]
 mod unsupported;
 #[cfg(target_os = "windows")]
@@ -24,10 +27,13 @@ mod windows;
 pub(crate) use android::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) use linux::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
+#[cfg(all(target_os = "linux", target_env = "ohos"))]
+pub(crate) use ohos::{PlatformTarget, build_target, rebuild_surface, supported_platform_kinds};
 #[cfg(not(any(
     target_os = "android",
     target_os = "windows",
-    all(target_os = "linux", not(target_env = "ohos"))
+    all(target_os = "linux", not(target_env = "ohos")),
+    all(target_os = "linux", target_env = "ohos")
 )))]
 pub(crate) use unsupported::{
     PlatformTarget, build_target, rebuild_surface, supported_platform_kinds,

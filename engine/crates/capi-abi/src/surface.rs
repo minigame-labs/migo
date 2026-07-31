@@ -193,6 +193,27 @@ pub struct MigoAndroidNativeWindowDescriptor {
 // complete record.
 unsafe impl AbiStruct for MigoAndroidNativeWindowDescriptor {}
 
+/// Layout-identical to the Android descriptor, and kept a separate type anyway.
+///
+/// The two platforms present the same shape -- one opaque native window handle
+/// -- but they are different ABIs with different ownership calls, and the
+/// `platform_kind` in the envelope is what selects between them. Collapsing
+/// them into one type would make a host that set the wrong kind compile and
+/// parse cleanly, only to hand a `OHNativeWindow*` to Android's reference
+/// counting.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MigoOpenHarmonyNativeWindowDescriptor {
+    pub header: VersionedHeader,
+    pub platform_kind: u32,
+    pub flags: u32,
+    pub native_window: *mut c_void,
+}
+
+// SAFETY: every field has an all-zero representation and v1 requires the
+// complete record.
+unsafe impl AbiStruct for MigoOpenHarmonyNativeWindowDescriptor {}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MigoWin32HwndDescriptor {
@@ -298,6 +319,9 @@ pub enum ValidatedPlatformSurface {
         display: NonNull<c_void>,
         surface: NonNull<c_void>,
     },
+    OpenHarmony {
+        native_window: NonNull<c_void>,
+    },
 }
 
 /// An owned snapshot of a caller's borrowed surface records.
@@ -367,6 +391,21 @@ impl SurfaceDescriptorRef {
                 let native_window =
                     NonNull::new(payload.native_window).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
                 ValidatedPlatformSurface::Android { native_window }
+            }
+            MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW => {
+                require_payload_size::<MigoOpenHarmonyNativeWindowDescriptor>(
+                    raw.platform_descriptor_size,
+                )?;
+                // SAFETY: the caller contract covers the selected payload.
+                let payload = unsafe {
+                    copy_versioned::<MigoOpenHarmonyNativeWindowDescriptor>(
+                        raw.platform_descriptor.cast(),
+                    )
+                }?;
+                validate_payload_prefix(payload.platform_kind, payload.flags, raw.platform_kind)?;
+                let native_window =
+                    NonNull::new(payload.native_window).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
+                ValidatedPlatformSurface::OpenHarmony { native_window }
             }
             MIGO_PLATFORM_WIN32_HWND => {
                 require_payload_size::<MigoWin32HwndDescriptor>(raw.platform_descriptor_size)?;
@@ -612,6 +651,12 @@ const _: () = assert!(offset_of!(MigoSurfaceDescriptor, platform_descriptor) == 
 const _: () = assert!(size_of::<MigoAndroidNativeWindowDescriptor>() == 24);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(offset_of!(MigoAndroidNativeWindowDescriptor, native_window) == 16);
+// The OpenHarmony descriptor is pinned independently rather than by reference
+// to Android's. If either moves, the one that moved fails here -- which is the
+// point of asserting a layout twice.
+const _: () = assert!(offset_of!(MigoOpenHarmonyNativeWindowDescriptor, header) == 0);
+const _: () = assert!(size_of::<MigoOpenHarmonyNativeWindowDescriptor>() == 24);
+const _: () = assert!(offset_of!(MigoOpenHarmonyNativeWindowDescriptor, native_window) == 16);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<MigoX11WindowDescriptor>() == 40);
 #[cfg(target_pointer_width = "64")]
