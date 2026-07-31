@@ -1064,6 +1064,18 @@ jni_void_json!(scan_code, "scanCode");
 
 jni_void_json!(game_log_report, "gameLogReport");
 
+// ==================== Ads ====================
+//
+// Fire-and-forget: every ad result -- including the reward verdict -- comes
+// back on the `onAdEvent` channel, never as a return value here.
+
+jni_void_json!(ad_create, "adCreate");
+jni_void_json!(ad_load, "adLoad");
+jni_void_json!(ad_show, "adShow");
+jni_void_json!(ad_hide, "adHide");
+jni_void_json!(ad_update_style, "adUpdateStyle");
+jni_void_json!(ad_destroy, "adDestroy");
+
 // ==================== Auth ====================
 
 jni_void_json!(auth_login, "authLogin");

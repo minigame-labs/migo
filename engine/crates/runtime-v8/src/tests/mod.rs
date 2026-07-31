@@ -5,6 +5,7 @@
 //! sources, and three of them were named after internal ticket ids whose
 //! meaning lived only in the performance audit document.
 
+mod ad_reward_integrity;
 mod binary_helper;
 mod global_surface;
 mod install_receipt;

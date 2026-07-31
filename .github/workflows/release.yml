@@ -89,6 +89,14 @@ jobs:
       - name: Input trigger producer contract
         run: bash scripts/test-input-trigger-producer-contract.sh
 
+      # The runtime must not be able to mint an ad reward. `isEnded` on a
+      # rewarded-video close is what content uses to pay the player, so it has
+      # to originate in the host's ad SDK. A regression here is invisible in a
+      # demo -- every callback still fires -- and only surfaces in someone's
+      # revenue reconciliation weeks later.
+      - name: Ad reward integrity contract
+        run: bash scripts/test-ad-reward-integrity-contract.sh
+
       - name: Camera frame JNI descriptor contract
         run: bash scripts/test-camera-frame-jni-contract.sh
 

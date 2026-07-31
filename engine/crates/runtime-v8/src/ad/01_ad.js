@@ -1,10 +1,99 @@
-// Ad APIs - compatible mock implementation
-// All ad types simulate successful load/show flow with proper event callbacks.
+// Ad APIs -- host-authoritative bridge with a no-reward fallback.
+//
+// Every ad object is a thin handle over an ad that the *host* owns. Commands
+// go out through `op_ad_*`; events come back on the inbound host bridge as
+// `_internalOnAdEvent` and are routed here by `adId`.
+//
+// REWARD INTEGRITY (the reason this file is shaped the way it is):
+//
+//   `isEnded` on a rewarded-video `close` event is what content uses to decide
+//   whether to grant a reward. It must come from the host's ad SDK. This file
+//   therefore never writes a truthy `isEnded` literal: the hosted path forwards
+//   `event.isEnded === true` from native, and the no-host path reports
+//   `isEnded: false` because no advert was shown and no reward is owed.
+//
+//   Guarded by `scripts/test-ad-reward-integrity-contract.sh`.
+//
+// This module is baked into the V8 startup snapshot, so it must stay ASCII and
+// must not call ops at module scope (there is no HostOpState at snapshot time).
 
 import { createListenerGroup } from "ext:host_v8_base/02_async.js";
+import {
+  op_ad_is_supported,
+  op_ad_create,
+  op_ad_load,
+  op_ad_show,
+  op_ad_hide,
+  op_ad_update_style,
+  op_ad_destroy,
+} from "ext:core/ops";
 
-const MOCK_LOAD_DELAY_MS = 100;
-const MOCK_REWARDED_VIDEO_DURATION_MS = 500;
+const FALLBACK_LOAD_DELAY_MS = 100;
+const FALLBACK_INTERSTITIAL_DURATION_MS = 100;
+const FALLBACK_REWARDED_VIDEO_DURATION_MS = 500;
+
+// Layout fields that a positioned ad forwards to the host when content mutates
+// them (wx content does `banner.style.top = y` directly on the style object).
+const POSITION_KEYS = ["left", "top", "width", "height"];
+
+// ==================== Host availability (memoised) ====================
+
+// null = not yet probed. Probed lazily on first ad creation so that the op is
+// never called while the snapshot is being built.
+let _hostAdSupport = null;
+
+function _hostAdsAvailable() {
+  if (_hostAdSupport === null) {
+    try {
+      _hostAdSupport = op_ad_is_supported() === true;
+    } catch (_) {
+      _hostAdSupport = false;
+    }
+  }
+  return _hostAdSupport;
+}
+
+// ==================== Ad handle registry ====================
+
+let _nextAdId = 1;
+const _adRegistry = new Map();
+
+function _allocAdId() {
+  const id = _nextAdId;
+  _nextAdId += 1;
+  return id;
+}
+
+function _parseEventJson(json) {
+  if (typeof json !== "string" || json.length === 0) return null;
+  try {
+    const parsed = JSON.parse(json);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Inbound host bridge hook: the single entry point for every ad event.
+//
+// Payload shape: {"adId":<number>,"event":"<name>", ...event fields}
+function _internalOnAdEvent(eventJson) {
+  const event = _parseEventJson(eventJson);
+  if (!event) return;
+
+  const adId = Number(event.adId);
+  if (!Number.isFinite(adId)) return;
+
+  const ad = _adRegistry.get(adId);
+  if (!ad) return;
+
+  const type = typeof event.event === "string" ? event.event : "";
+  if (!type) return;
+
+  ad._handleHostEvent(type, event);
+}
+
+// ==================== Direct ad status ====================
 
 const _directAdStatus = {
   isInMask: false,
@@ -44,16 +133,39 @@ function _internalTriggerDirectAdStatusChange(status) {
   _notifyDirectAdStatus(getDirectAdStatusSync());
 }
 
-// ==================== AdBase (shared listener pattern) ====================
+// ==================== AdBase ====================
 
 class AdBase {
   #listeners = {};
   #destroyed = false;
+  #adId = 0;
+  #hosted = false;
 
-  constructor(eventTypes) {
+  // `adType` and `adUnitId` are what the host needs to resolve a real ad slot;
+  // `options` carries the remaining wx-style creation fields verbatim.
+  constructor(eventTypes, adType, adUnitId, options) {
     for (const type of eventTypes) {
       this.#listeners[type] = createListenerGroup(`Ad ${type}`);
     }
+    this.#adId = _allocAdId();
+    this.#hosted = _hostAdsAvailable();
+    _adRegistry.set(this.#adId, this);
+
+    if (this.#hosted) {
+      this._command(op_ad_create, {
+        adType,
+        adUnitId,
+        options: options || {},
+      });
+    }
+  }
+
+  get _adId() {
+    return this.#adId;
+  }
+
+  get _hosted() {
+    return this.#hosted;
   }
 
   _on(type, listener) {
@@ -81,17 +193,111 @@ class AdBase {
 
   _markDestroyed() {
     this.#destroyed = true;
+    _adRegistry.delete(this.#adId);
     for (const type in this.#listeners) {
       this.#listeners[type].off();
     }
   }
 
-  _scheduleLoad() {
+  // Send one command to the host. Host-side failures surface as an `error`
+  // event rather than a thrown exception, matching wx semantics (content
+  // listens on onError; it does not try/catch show()).
+  _command(op, extra) {
+    if (!this.#hosted || this.#destroyed) return;
+    const request = { adId: this.#adId };
+    if (extra) {
+      for (const key in extra) {
+        request[key] = extra[key];
+      }
+    }
+    try {
+      op(JSON.stringify(request));
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      queueMicrotask(() => {
+        if (!this.#destroyed) {
+          this._fire("error", { errCode: -1, errMsg: message });
+        }
+      });
+    }
+  }
+
+  // Wrap a style object so layout writes reach the host.
+  //
+  // Wrapping happens once per ad at construction rather than on every `.style`
+  // read: content touches `.style` from its own layout code, and allocating a
+  // Proxy per read would put an allocation on that path. Unhosted ads get the
+  // bare object back, so the no-host path stays allocation-identical to before.
+  _trackStyle(raw, keys) {
+    if (!this.#hosted) return raw;
+    const ad = this;
+    return new Proxy(raw, {
+      set(target, prop, value) {
+        target[prop] = value;
+        if (keys.indexOf(prop) !== -1) {
+          const style = {};
+          style[prop] = value;
+          ad._command(op_ad_update_style, { style });
+        }
+        return true;
+      },
+    });
+  }
+
+  // Route one host event onto this ad's listener groups. Payloads are rebuilt
+  // field by field rather than forwarded wholesale so that content can never
+  // observe transport-level fields, and so that every value crossing into
+  // content has a known type.
+  _handleHostEvent(type, event) {
+    if (this.#destroyed) return;
+    switch (type) {
+      case "load":
+        this._fire("load", this._loadPayload(event));
+        break;
+      case "error":
+        this._fire("error", {
+          errCode: Number.isFinite(Number(event.errCode))
+            ? Number(event.errCode)
+            : -1,
+          errMsg: typeof event.errMsg === "string" ? event.errMsg : "ad error",
+        });
+        break;
+      case "close":
+        this._fire("close", this._closePayload(event));
+        break;
+      case "resize":
+        this._fire("resize", {
+          width: Number(event.width) || 0,
+          height: Number(event.height) || 0,
+        });
+        break;
+      case "hide":
+        this._fire("hide");
+        break;
+      default:
+        break;
+    }
+  }
+
+  // Overridden by ad types that carry data on `load`.
+  _loadPayload(_event) {
+    return undefined;
+  }
+
+  // Overridden by ad types that carry data on `close`.
+  _closePayload(_event) {
+    return undefined;
+  }
+
+  // No-host fallback: report a successful load so content's UI flow proceeds.
+  // Showing is what stays inert -- see each type's show().
+  _scheduleFallbackLoad() {
+    if (this.#hosted) return;
     setTimeout(() => {
       if (!this.#destroyed) {
-        this._fire("load");
+        this._fire("load", this._loadPayload({}));
       }
-    }, MOCK_LOAD_DELAY_MS);
+    }, FALLBACK_LOAD_DELAY_MS);
   }
 }
 
@@ -99,27 +305,28 @@ class AdBase {
 
 class BannerAd extends AdBase {
   #style;
-  #adUnitId;
   #adIntervals;
   #refreshTimer = null;
   #visible = false;
 
   constructor({ adUnitId, adIntervals, style }) {
-    super(["load", "error", "resize"]);
-    this.#adUnitId = adUnitId;
+    super(["load", "error", "resize"], "banner", adUnitId, {
+      adIntervals,
+      style,
+    });
     this.#adIntervals = adIntervals;
     const ratio = 0.35;
     const w = Math.max(300, style.width || 300);
     const h = Math.round(w * ratio);
-    this.#style = {
+    this.#style = this._trackStyle({
       left: style.left || 0,
       top: style.top || 0,
       width: w,
       height: style.height || h,
       realWidth: w,
       realHeight: h,
-    };
-    this._scheduleLoad();
+    }, POSITION_KEYS);
+    this._scheduleFallbackLoad();
   }
 
   get style() {
@@ -131,6 +338,10 @@ class BannerAd extends AdBase {
       return Promise.reject({ errMsg: "createBannerAd:fail already destroyed" });
     }
     this.#visible = true;
+    if (this._hosted) {
+      this._command(op_ad_show);
+      return Promise.resolve();
+    }
     this._fire("resize", {
       width: this.#style.realWidth,
       height: this.#style.realHeight,
@@ -138,7 +349,7 @@ class BannerAd extends AdBase {
     if (this.#adIntervals && this.#adIntervals >= 30 && !this.#refreshTimer) {
       this.#refreshTimer = setInterval(() => {
         if (!this._isDestroyed() && this.#visible) {
-          this._scheduleLoad();
+          this._scheduleFallbackLoad();
         }
       }, this.#adIntervals * 1000);
     }
@@ -147,6 +358,7 @@ class BannerAd extends AdBase {
 
   hide() {
     this.#visible = false;
+    this._command(op_ad_hide);
   }
 
   destroy() {
@@ -155,6 +367,7 @@ class BannerAd extends AdBase {
       this.#refreshTimer = null;
     }
     this.#visible = false;
+    this._command(op_ad_destroy);
     this._markDestroyed();
   }
 
@@ -170,21 +383,22 @@ class BannerAd extends AdBase {
 
 class CustomAd extends AdBase {
   #style;
-  #adUnitId;
   #adIntervals;
   #refreshTimer = null;
   #visible = false;
 
   constructor({ adUnitId, adIntervals, style }) {
-    super(["load", "error", "close", "hide", "resize"]);
-    this.#adUnitId = adUnitId;
+    super(["load", "error", "close", "hide", "resize"], "custom", adUnitId, {
+      adIntervals,
+      style,
+    });
     this.#adIntervals = adIntervals;
-    this.#style = {
+    this.#style = this._trackStyle({
       left: style.left || 0,
       top: style.top || 0,
       fixed: style.fixed || false,
-    };
-    this._scheduleLoad();
+    }, ["left", "top"]);
+    this._scheduleFallbackLoad();
   }
 
   get style() {
@@ -196,10 +410,14 @@ class CustomAd extends AdBase {
       return Promise.reject({ errMsg: "createCustomAd:fail already destroyed" });
     }
     this.#visible = true;
+    if (this._hosted) {
+      this._command(op_ad_show);
+      return Promise.resolve();
+    }
     if (this.#adIntervals && this.#adIntervals >= 30 && !this.#refreshTimer) {
       this.#refreshTimer = setInterval(() => {
         if (!this._isDestroyed() && this.#visible) {
-          this._scheduleLoad();
+          this._scheduleFallbackLoad();
         }
       }, this.#adIntervals * 1000);
     }
@@ -212,7 +430,11 @@ class CustomAd extends AdBase {
     }
     if (this.#visible) {
       this.#visible = false;
-      this._fire("hide");
+      if (this._hosted) {
+        this._command(op_ad_hide);
+      } else {
+        this._fire("hide");
+      }
     }
     return Promise.resolve();
   }
@@ -227,7 +449,15 @@ class CustomAd extends AdBase {
       this.#refreshTimer = null;
     }
     this.#visible = false;
+    this._command(op_ad_destroy);
     this._markDestroyed();
+  }
+
+  _handleHostEvent(type, event) {
+    if (type === "hide") {
+      this.#visible = false;
+    }
+    super._handleHostEvent(type, event);
   }
 
   onClose(listener) { this._on("close", listener); }
@@ -246,7 +476,6 @@ class CustomAd extends AdBase {
 
 class GridAd extends AdBase {
   #style;
-  #adUnitId;
   #adIntervals;
   #adTheme;
   #gridCount;
@@ -254,22 +483,26 @@ class GridAd extends AdBase {
   #visible = false;
 
   constructor({ adUnitId, adIntervals, style, adTheme, gridCount }) {
-    super(["load", "error", "resize"]);
-    this.#adUnitId = adUnitId;
+    super(["load", "error", "resize"], "grid", adUnitId, {
+      adIntervals,
+      style,
+      adTheme,
+      gridCount,
+    });
     this.#adIntervals = adIntervals;
     this.#adTheme = adTheme || "white";
     this.#gridCount = gridCount || 5;
     const w = Math.max(300, style.width || 300);
     const h = style.height || w;
-    this.#style = {
+    this.#style = this._trackStyle({
       left: style.left || 0,
       top: style.top || 0,
       width: w,
       height: h,
       realWidth: w,
       realHeight: h,
-    };
-    this._scheduleLoad();
+    }, POSITION_KEYS);
+    this._scheduleFallbackLoad();
   }
 
   get style() {
@@ -289,6 +522,10 @@ class GridAd extends AdBase {
       return Promise.reject({ errMsg: "createGridAd:fail already destroyed" });
     }
     this.#visible = true;
+    if (this._hosted) {
+      this._command(op_ad_show);
+      return Promise.resolve();
+    }
     this._fire("resize", {
       width: this.#style.realWidth,
       height: this.#style.realHeight,
@@ -296,7 +533,7 @@ class GridAd extends AdBase {
     if (this.#adIntervals && this.#adIntervals >= 30 && !this.#refreshTimer) {
       this.#refreshTimer = setInterval(() => {
         if (!this._isDestroyed() && this.#visible) {
-          this._scheduleLoad();
+          this._scheduleFallbackLoad();
         }
       }, this.#adIntervals * 1000);
     }
@@ -305,6 +542,7 @@ class GridAd extends AdBase {
 
   hide() {
     this.#visible = false;
+    this._command(op_ad_hide);
   }
 
   destroy() {
@@ -313,6 +551,7 @@ class GridAd extends AdBase {
       this.#refreshTimer = null;
     }
     this.#visible = false;
+    this._command(op_ad_destroy);
     this._markDestroyed();
   }
 
@@ -327,27 +566,26 @@ class GridAd extends AdBase {
 // ==================== InterstitialAd ====================
 
 class InterstitialAd extends AdBase {
-  #adUnitId;
-  #loaded = false;
-
   constructor({ adUnitId }) {
-    super(["load", "error", "close"]);
-    this.#adUnitId = adUnitId;
-    this._scheduleLoad();
+    super(["load", "error", "close"], "interstitial", adUnitId, {});
+    this._scheduleFallbackLoad();
   }
 
   load() {
     if (this._isDestroyed()) {
       return Promise.reject({ errMsg: "createInterstitialAd:fail already destroyed" });
     }
+    if (this._hosted) {
+      this._command(op_ad_load);
+      return Promise.resolve();
+    }
     return new Promise((resolve) => {
       setTimeout(() => {
         if (!this._isDestroyed()) {
-          this.#loaded = true;
           this._fire("load");
         }
         resolve();
-      }, MOCK_LOAD_DELAY_MS);
+      }, FALLBACK_LOAD_DELAY_MS);
     });
   }
 
@@ -355,17 +593,22 @@ class InterstitialAd extends AdBase {
     if (this._isDestroyed()) {
       return Promise.reject({ errMsg: "createInterstitialAd:fail already destroyed" });
     }
-    this.#loaded = false;
-    // Mock: auto-close after a short delay
+    if (this._hosted) {
+      this._command(op_ad_show);
+      return Promise.resolve();
+    }
+    // No host: nothing is displayed. Close immediately so content's flow
+    // continues instead of stalling on a modal that never appears.
     setTimeout(() => {
       if (!this._isDestroyed()) {
         this._fire("close");
       }
-    }, MOCK_LOAD_DELAY_MS);
+    }, FALLBACK_INTERSTITIAL_DURATION_MS);
     return Promise.resolve();
   }
 
   destroy() {
+    this._command(op_ad_destroy);
     this._markDestroyed();
   }
 
@@ -383,26 +626,40 @@ const _rewardedVideoSingletons = new Map();
 
 class RewardedVideoAd extends AdBase {
   #adUnitId;
-  #loaded = false;
 
-  constructor({ adUnitId }) {
-    super(["load", "error", "close"]);
+  constructor({ adUnitId, multiton }) {
+    super(["load", "error", "close"], "rewardedVideo", adUnitId, { multiton });
     this.#adUnitId = adUnitId;
-    this._scheduleLoad();
+    this._scheduleFallbackLoad();
+  }
+
+  // The reward verdict. `event.isEnded` is produced by the host's ad SDK and
+  // is the only source of a truthy value here; anything else collapses to
+  // false. Do not "simplify" this to a pass-through of event.isEnded -- the
+  // strict comparison is what stops a non-boolean from being forwarded.
+  _closePayload(event) {
+    return { isEnded: event.isEnded === true };
+  }
+
+  _loadPayload(event) {
+    return { useFallbackSharePage: event.useFallbackSharePage === true };
   }
 
   load() {
     if (this._isDestroyed()) {
       return Promise.reject({ errMsg: "createRewardedVideoAd:fail already destroyed" });
     }
+    if (this._hosted) {
+      this._command(op_ad_load);
+      return Promise.resolve();
+    }
     return new Promise((resolve) => {
       setTimeout(() => {
         if (!this._isDestroyed()) {
-          this.#loaded = true;
-          this._fire("load", { useFallbackSharePage: false });
+          this._fire("load", this._loadPayload({}));
         }
         resolve();
-      }, MOCK_LOAD_DELAY_MS);
+      }, FALLBACK_LOAD_DELAY_MS);
     });
   }
 
@@ -410,18 +667,25 @@ class RewardedVideoAd extends AdBase {
     if (this._isDestroyed()) {
       return Promise.reject({ errMsg: "createRewardedVideoAd:fail already destroyed" });
     }
-    this.#loaded = false;
-    // Mock: simulate video watched to completion, then fire close
+    if (this._hosted) {
+      this._command(op_ad_show);
+      return Promise.resolve();
+    }
+    // No host ad service: no advert was played, so no reward is owed. The
+    // close event still fires so content is not left waiting forever, but it
+    // reports an unfinished view. This is the whole point -- the runtime
+    // cannot mint rewards.
     setTimeout(() => {
       if (!this._isDestroyed()) {
-        this._fire("close", { isEnded: true });
+        this._fire("close", this._closePayload({}));
       }
-    }, MOCK_REWARDED_VIDEO_DURATION_MS);
+    }, FALLBACK_REWARDED_VIDEO_DURATION_MS);
     return Promise.resolve();
   }
 
   destroy() {
     _rewardedVideoSingletons.delete(this.#adUnitId);
+    this._command(op_ad_destroy);
     this._markDestroyed();
   }
 
@@ -526,24 +790,22 @@ function getShowSplashAdStatus(obj = {}) {
 
 class GameBanner extends AdBase {
   #style;
-  #adUnitId;
   #visible = false;
 
   constructor({ adUnitId, style }) {
-    super(["load", "error", "resize"]);
-    this.#adUnitId = adUnitId;
+    super(["load", "error", "resize"], "gameBanner", adUnitId, { style });
     const s = style || {};
     const w = Math.max(300, s.width || 300);
     const h = s.height || Math.round(w * 0.35);
-    this.#style = {
+    this.#style = this._trackStyle({
       left: s.left || 0,
       top: s.top || 0,
       width: w,
       height: h,
       realWidth: w,
       realHeight: h,
-    };
-    this._scheduleLoad();
+    }, POSITION_KEYS);
+    this._scheduleFallbackLoad();
   }
 
   get style() { return this.#style; }
@@ -551,14 +813,22 @@ class GameBanner extends AdBase {
   show() {
     if (this._isDestroyed()) return Promise.reject({ errMsg: "createGameBanner:fail already destroyed" });
     this.#visible = true;
+    if (this._hosted) {
+      this._command(op_ad_show);
+      return Promise.resolve();
+    }
     this._fire("resize", { width: this.#style.realWidth, height: this.#style.realHeight });
     return Promise.resolve();
   }
 
-  hide() { this.#visible = false; }
+  hide() {
+    this.#visible = false;
+    this._command(op_ad_hide);
+  }
 
   destroy() {
     this.#visible = false;
+    this._command(op_ad_destroy);
     this._markDestroyed();
   }
 
@@ -581,22 +851,20 @@ function createGameBanner(obj) {
 
 class GameIcon extends AdBase {
   #style;
-  #adUnitId;
   #count;
   #visible = false;
 
   constructor({ adUnitId, count, style }) {
-    super(["load", "error", "resize"]);
-    this.#adUnitId = adUnitId;
+    super(["load", "error", "resize"], "gameIcon", adUnitId, { count, style });
     this.#count = count || 1;
     const s = style || {};
-    this.#style = {
+    this.#style = this._trackStyle({
       left: s.left || 0,
       top: s.top || 0,
       width: s.width || 40,
       height: s.height || 40,
-    };
-    this._scheduleLoad();
+    }, POSITION_KEYS);
+    this._scheduleFallbackLoad();
   }
 
   get style() { return this.#style; }
@@ -605,14 +873,22 @@ class GameIcon extends AdBase {
   show() {
     if (this._isDestroyed()) return Promise.reject({ errMsg: "createGameIcon:fail already destroyed" });
     this.#visible = true;
+    if (this._hosted) {
+      this._command(op_ad_show);
+      return Promise.resolve();
+    }
     this._fire("resize", { width: this.#style.width, height: this.#style.height });
     return Promise.resolve();
   }
 
-  hide() { this.#visible = false; }
+  hide() {
+    this.#visible = false;
+    this._command(op_ad_hide);
+  }
 
   destroy() {
     this.#visible = false;
+    this._command(op_ad_destroy);
     this._markDestroyed();
   }
 
@@ -635,37 +911,45 @@ function createGameIcon(obj) {
 // Similar to InterstitialAd: load -> show -> close.
 
 class GamePortal extends AdBase {
-  #adUnitId;
-
   constructor({ adUnitId }) {
-    super(["load", "error", "close"]);
-    this.#adUnitId = adUnitId;
-    this._scheduleLoad();
+    super(["load", "error", "close"], "gamePortal", adUnitId, {});
+    this._scheduleFallbackLoad();
   }
 
   load() {
     if (this._isDestroyed()) return Promise.reject({ errMsg: "createGamePortal:fail already destroyed" });
+    if (this._hosted) {
+      this._command(op_ad_load);
+      return Promise.resolve();
+    }
     return new Promise((resolve) => {
       setTimeout(() => {
         if (!this._isDestroyed()) {
           this._fire("load");
         }
         resolve();
-      }, MOCK_LOAD_DELAY_MS);
+      }, FALLBACK_LOAD_DELAY_MS);
     });
   }
 
   show() {
     if (this._isDestroyed()) return Promise.reject({ errMsg: "createGamePortal:fail already destroyed" });
+    if (this._hosted) {
+      this._command(op_ad_show);
+      return Promise.resolve();
+    }
     setTimeout(() => {
       if (!this._isDestroyed()) {
         this._fire("close");
       }
-    }, MOCK_LOAD_DELAY_MS);
+    }, FALLBACK_INTERSTITIAL_DURATION_MS);
     return Promise.resolve();
   }
 
-  destroy() { this._markDestroyed(); }
+  destroy() {
+    this._command(op_ad_destroy);
+    this._markDestroyed();
+  }
 
   onLoad(listener) { this._on("load", listener); }
   offLoad(listener) { this._off("load", listener); }
@@ -692,6 +976,7 @@ export {
   onDirectAdStatusChange,
   offDirectAdStatusChange,
   _internalTriggerDirectAdStatusChange,
+  _internalOnAdEvent,
   getShowSplashAdStatus,
   createGameBanner,
   createGameIcon,

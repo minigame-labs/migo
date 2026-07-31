@@ -10,7 +10,7 @@ use crate::{
         onAccelerometerChange, onActionSheetResult, onAudioInterruptionBegin,
         onAudioInterruptionEnd, onBLECharacteristicValueChange, onBLEConnectionStateChange,
         onBLEMTUChange, onBeaconServiceChange, onBeaconUpdate, onBluetoothAdapterStateChange,
-        onBluetoothDeviceFound, onCameraEvent, onCameraFrameData, onCheckSessionResult,
+        onAdEvent, onBluetoothDeviceFound, onCameraEvent, onCameraFrameData, onCheckSessionResult,
         onChooseImageResult, onChooseMessageFileResult, onCompassChange, onCompressImageResult,
         onDeviceMotionChange, onDeviceOrientationChange, onFuzzyLocationResult,
         onGetPhoneNumberResult, onGetUserInfoResult, onGyroscopeChange, onHide, onKeyboardComplete,
@@ -124,6 +124,8 @@ fn native_fn_ptr(name: &str) -> Option<*mut c_void> {
         "onOpenSettingResult" => onOpenSettingResult as *mut c_void,
         #[cfg(feature = "api-connectivity")]
         "onNavigateToMiniProgramResult" => onNavigateToMiniProgramResult as *mut c_void,
+        #[cfg(feature = "api-commerce")]
+        "onAdEvent" => onAdEvent as *mut c_void,
         #[cfg(feature = "api-commerce")]
         "onShareAppMessageResult" => onShareAppMessageResult as *mut c_void,
         #[cfg(feature = "api-commerce")]

@@ -11,6 +11,7 @@
 //! - `Err(ServiceError::system("vibrateShort:fail system error"))` - Runtime error
 //! - `Err(ServiceError::invalid_param("vibrateShort:fail invalid type"))` - Bad input
 
+mod ad;
 mod auth;
 mod camera;
 mod clipboard;
@@ -30,6 +31,7 @@ mod subpackage;
 mod system_info;
 mod video;
 
+pub use ad::AdService;
 pub use auth::AuthService;
 pub use camera::CameraService;
 pub use clipboard::ClipboardService;

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use migo_core::services::{
-    AccelerometerService, AudioPlatformService, AuthService, BatteryService, BluetoothService,
+    AccelerometerService, AdService, AudioPlatformService, AuthService, BatteryService, BluetoothService,
     CameraService, ClipboardService, CodecService, CommerceServices, CompassService,
     ConnectivityServices, DeviceMotionService, FileService, GameLogService, GyroscopeService,
     ImageApiService, InteractionService, KeyboardService, LocationService, MediaServices,
@@ -166,6 +166,12 @@ impl CommerceServices for AndroidDeviceServices {
     #[cfg(feature = "api-commerce")]
     fn payment(&self) -> Option<Arc<dyn PaymentService>> {
         Some(Arc::new(AndroidPayment {
+            host_id: self.host_id,
+        }))
+    }
+    #[cfg(feature = "api-commerce")]
+    fn ad(&self) -> Option<Arc<dyn AdService>> {
+        Some(Arc::new(AndroidAd {
             host_id: self.host_id,
         }))
     }
@@ -911,6 +917,43 @@ impl NavigateService for AndroidNavigate {
             self.host_id,
             options_json,
         )?)
+    }
+}
+
+// ==================== Ads ====================
+
+/// Forwards ad commands to the Java `AdHandler` the embedder installed.
+///
+/// Nothing is decided here: the reward verdict for incentivised video is
+/// whatever the host's ad SDK reports on the `onAdEvent` channel. See
+/// `shared/src/services/ad.rs` for why that has to be true.
+struct AndroidAd {
+    host_id: i32,
+}
+
+impl AdService for AndroidAd {
+    fn create_ad(&self, request_json: &str) -> Result<(), ServiceError> {
+        Ok(jni::ad_create(self.host_id, request_json)?)
+    }
+
+    fn load_ad(&self, request_json: &str) -> Result<(), ServiceError> {
+        Ok(jni::ad_load(self.host_id, request_json)?)
+    }
+
+    fn show_ad(&self, request_json: &str) -> Result<(), ServiceError> {
+        Ok(jni::ad_show(self.host_id, request_json)?)
+    }
+
+    fn hide_ad(&self, request_json: &str) -> Result<(), ServiceError> {
+        Ok(jni::ad_hide(self.host_id, request_json)?)
+    }
+
+    fn update_ad_style(&self, request_json: &str) -> Result<(), ServiceError> {
+        Ok(jni::ad_update_style(self.host_id, request_json)?)
+    }
+
+    fn destroy_ad(&self, request_json: &str) -> Result<(), ServiceError> {
+        Ok(jni::ad_destroy(self.host_id, request_json)?)
     }
 }
 

@@ -140,6 +140,7 @@ const NATIVE_CONNECTIVITY: &[JniMethod] = methods![
 
 const NATIVE_COMMERCE: &[JniMethod] = methods![
     ("onShareAppMessageResult", "(ILjava/lang/String;)V"),
+    ("onAdEvent", "(ILjava/lang/String;)V"),
     ("onMidasPaymentResult", "(ILjava/lang/String;)V"),
     ("onMidasPaymentGameItemResult", "(ILjava/lang/String;)V"),
 ];
@@ -300,6 +301,12 @@ const JAVA_COMMERCE: &[JniMethod] = methods![
     ),
     ("requestMidasPayment", "(ILjava/lang/String;)V"),
     ("requestMidasPaymentGameItem", "(ILjava/lang/String;)V"),
+    ("adCreate", "(ILjava/lang/String;)V"),
+    ("adLoad", "(ILjava/lang/String;)V"),
+    ("adShow", "(ILjava/lang/String;)V"),
+    ("adHide", "(ILjava/lang/String;)V"),
+    ("adUpdateStyle", "(ILjava/lang/String;)V"),
+    ("adDestroy", "(ILjava/lang/String;)V"),
 ];
 
 const JAVA_SYSTEM: &[JniMethod] = methods![
@@ -411,8 +418,13 @@ mod tests {
         let native = methods_for(ProductProfile::Full, MethodDirection::JavaToNative);
         let java = methods_for(ProductProfile::Full, MethodDirection::NativeToJava);
 
-        assert_eq!(native.len(), 66, "full NativeBridge surface changed");
-        assert_eq!(java.len(), 117, "full NativeExports surface changed");
+        // Counts are pinned so that growing the JNI surface is a deliberate
+        // edit rather than a side effect. Last moved by the host-authoritative
+        // ad bridge: +1 native (`onAdEvent`, the single inbound ad channel)
+        // and +6 Java (`adCreate`/`adLoad`/`adShow`/`adHide`/`adUpdateStyle`/
+        // `adDestroy`).
+        assert_eq!(native.len(), 67, "full NativeBridge surface changed");
+        assert_eq!(java.len(), 123, "full NativeExports surface changed");
         assert_unique(&native);
         assert_unique(&java);
     }
