@@ -115,9 +115,9 @@ pub(crate) fn build_target(
         // Listed rather than matched with a wildcard: a new platform payload
         // must not compile until every platform module has taken a position on
         // it.
-        ValidatedPlatformSurface::Android { .. } | ValidatedPlatformSurface::Win32 { .. } => {
-            Err(MIGO_ERROR_UNSUPPORTED_PLATFORM)
-        }
+        ValidatedPlatformSurface::Android { .. }
+        | ValidatedPlatformSurface::Win32 { .. }
+        | ValidatedPlatformSurface::OpenHarmony { .. } => Err(MIGO_ERROR_UNSUPPORTED_PLATFORM),
     }
 }
 

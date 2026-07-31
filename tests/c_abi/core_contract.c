@@ -18,8 +18,9 @@ _Static_assert(MIGO_C_ABI_CANDIDATE == 1, "candidate marker");
  * The three target macros are asserted mutually exclusive first. They are not
  * independent facts: Android and OpenHarmony are Linux kernels and define
  * __linux__ too, so a classifier written in terms of __linux__ alone answers
- * for all three at once. Getting that wrong promises a runtime on OpenHarmony,
- * where none is built.
+ * for all three at once. Getting that wrong routes a host to the wrong surface
+ * descriptor and the wrong platform library, on a target that compiles cleanly
+ * either way.
  */
 _Static_assert(MIGO_PLATFORM_IS_ANDROID + MIGO_PLATFORM_IS_OPENHARMONY +
                        MIGO_PLATFORM_IS_LINUX_GNU <= 1,
@@ -31,7 +32,7 @@ _Static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "Android ships a static runtime");
 #elif defined(__OHOS__) || defined(__OHOS_FAMILY__)
 _Static_assert(MIGO_PLATFORM_IS_OPENHARMONY == 1, "OpenHarmony must classify as itself");
 _Static_assert(MIGO_PLATFORM_IS_LINUX_GNU == 0, "OpenHarmony is not desktop Linux");
-_Static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "OpenHarmony has no runtime yet");
+_Static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "OpenHarmony ships a static runtime");
 #elif defined(__linux__) && defined(__GLIBC__)
 _Static_assert(MIGO_PLATFORM_IS_LINUX_GNU == 1, "glibc Linux is the desktop target");
 _Static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "desktop Linux ships a runtime");

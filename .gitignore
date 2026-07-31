@@ -114,3 +114,7 @@ tools/wx-api-diff/
 # Local-only operational notes (`*.local.md`). Same policy as the working
 # notes above: they are for the maintainer's machine, not for consumers.
 *.local.md
+
+# OpenHarmony host build inputs staged by scripts/build-ohos-host.sh
+platforms/openharmony/entry/src/main/cpp/libs/
+platforms/openharmony/entry/src/main/cpp/migo-include/

@@ -6,7 +6,7 @@ The public markers are intentional:
 
 ```c
 MIGO_C_ABI_CANDIDATE  == 1     /* still a candidate everywhere */
-MIGO_C_ABI_HAS_RUNTIME == 1    /* Linux, Android, Windows: a linkable runtime exists */
+MIGO_C_ABI_HAS_RUNTIME == 1    /* Linux, Android, Windows, OpenHarmony: a linkable runtime exists */
 MIGO_C_ABI_HAS_RUNTIME == 0    /* every other target */
 ```
 
@@ -21,7 +21,7 @@ which is the harmless direction, but still a wrong one.
 
 A runtime existing is not the same as the ABI being frozen. Do not treat these headers as a stable SDK: the freeze blockers below are open, and the surface may still change.
 
-**OpenHarmony has a linkable runtime but is deliberately still 0.** `scripts/build-ohos-sdk.sh` stages `libmigo_capi.a` for `aarch64` and `x86_64` with a CMake package and a manifest, an external consumer links it with every `migo_*` resolved, and `scripts/test-ohos-sdk-contract.sh` gates all of that — including that the consumer binary uses the musl loader, and that the manifest does not claim a platform kind the library cannot attach. What it has no backend for is the surface: `migo_query_capabilities` reports no attachable kind, so the library links, answers, and can display nothing. Android only flipped to 1 once attach, lifecycle and input had run on a device; holding OpenHarmony to the same bar costs nothing, while flipping early would mislead everyone who greps this macro to decide whether the platform is usable. The macro's own comment in `types.h` records the condition for flipping it.
+OpenHarmony's runtime is a **static library**, packaged the same way Android's is and for the same reason: an OpenHarmony native module links its dependencies into its own `.so`. `scripts/build-ohos-sdk.sh` stages headers, `libmigo_capi.a`, a CMake package and a manifest for `aarch64` and `x86_64`, and `scripts/test-ohos-sdk-contract.sh` gates them — including that an external consumer links with every `migo_*` resolved, that the consumer binary uses the musl loader, and that the manifest claims no platform kind the library cannot attach. The surface is an ArkUI XComponent's `OHNativeWindow*`; `platforms/openharmony` is the host that drives it, and the whole chain — attach, content load, render, and a full touch lifecycle read back as pixels — was verified on an API 20 emulator before this macro was flipped. Only `x86_64` has run on a device: `aarch64` is built and gated but unverified, because that needs real HarmonyOS NEXT hardware.
 
 Android's runtime is a **static library** a host links into its own `.so`, driven by `tests/c_host/android` — a NativeActivity with no Java of its own. It is now packaged for third-party NDK consumption: `scripts/build-android-sdk.sh` stages headers, `libmigo_capi.a`, a CMake package (`find_package(migo)`), and a per-ABI artifact manifest, and `scripts/test-android-sdk-contract.sh` verifies the export surface, the embedded snapshot, and that a `find_package(migo)` consumer (`tests/c_host/android-package-consumer`) links with every `migo_*` resolved. It deliberately ships a static library rather than a versioned shared object and CMake rather than pkg-config, because that is how an NDK host consumes a native dependency; those are not omissions. The `libmigo.so` the Java/JNI SDK ships is a different artifact and still exports no `migo_*` symbols.
 

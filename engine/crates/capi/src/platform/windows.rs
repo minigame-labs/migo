@@ -80,7 +80,8 @@ pub(crate) fn build_target(
         // was added to fix.
         ValidatedPlatformSurface::Android { .. }
         | ValidatedPlatformSurface::X11 { .. }
-        | ValidatedPlatformSurface::Wayland { .. } => Err(MIGO_ERROR_UNSUPPORTED_PLATFORM),
+        | ValidatedPlatformSurface::Wayland { .. }
+        | ValidatedPlatformSurface::OpenHarmony { .. } => Err(MIGO_ERROR_UNSUPPORTED_PLATFORM),
     }
 }
 

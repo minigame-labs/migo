@@ -68,6 +68,21 @@ declare -A COMPILERS=()
 while IFS= read -r output_file; do
     while IFS= read -r compiler; do
         [[ -n "$compiler" ]] || continue
+        # These `output` files also carry skia's ninja log, where a line such as
+        #   ACTION //third_party/icu:make_data_assembly(//gn/toolchain:gcc_like)
+        # matches the path-shaped pattern below. That is a GN label, not a
+        # compiler, and it made this gate report a foreign compiler for a build
+        # whose every real compiler was correct.
+        #
+        # A GN label is excluded by its syntax -- `//target:name` -- rather than
+        # by its text: a colon does not appear in a compiler path any build
+        # produces. Existence on disk is deliberately NOT the test. The case
+        # this gate exists for is a poisoned object recorded by a compiler that
+        # may since have been uninstalled, and skipping what no longer exists
+        # would make the guard quietly stop guarding exactly then.
+        case "$compiler" in
+            *:*) continue ;;
+        esac
         SEEN=$((SEEN + 1))
         COMPILERS["$compiler"]=1
         if [[ "$compiler" != "$OHOS_SDK_NATIVE"/* ]]; then

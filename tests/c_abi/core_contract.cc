@@ -28,7 +28,7 @@ static_assert(MIGO_PLATFORM_IS_LINUX_GNU == 0, "Android is not desktop Linux");
 static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "Android ships a static runtime");
 #elif defined(__OHOS__) || defined(__OHOS_FAMILY__)
 static_assert(MIGO_PLATFORM_IS_OPENHARMONY == 1, "OpenHarmony must classify as itself");
-static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "OpenHarmony has no runtime yet");
+static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "OpenHarmony ships a static runtime");
 #elif defined(__linux__) && defined(__GLIBC__)
 static_assert(MIGO_PLATFORM_IS_LINUX_GNU == 1, "glibc Linux is the desktop target");
 static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "desktop Linux ships a runtime");

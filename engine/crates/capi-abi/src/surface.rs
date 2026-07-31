@@ -59,7 +59,14 @@ const MIGO_SURFACE_CAPABILITY_KNOWN_MASK: u64 = MIGO_SURFACE_CAPABILITY_WIDE_COL
 pub const MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS: u64 = (1 << MIGO_PLATFORM_ANDROID_NATIVE_WINDOW)
     | (1 << MIGO_PLATFORM_WIN32_HWND)
     | (1 << MIGO_PLATFORM_X11_WINDOW)
-    | (1 << MIGO_PLATFORM_WAYLAND_SURFACE);
+    | (1 << MIGO_PLATFORM_WAYLAND_SURFACE)
+    // Added only after an attach succeeded on a device, not when the backend
+    // compiled. The Windows incident is why: a published SDK loaded, resolved
+    // every entry point, and could attach nothing, because every gate agreed
+    // with every other gate while no implementation existed. The evidence here
+    // is an OpenHarmony emulator log reading "surface attached, generation 1"
+    // after "surface created 1316 x 2598".
+    | (1 << MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW);
 
 /// Authoritative, level-triggered state returned by a release query.
 pub const MIGO_SURFACE_RELEASE_PENDING: u32 = 0;
@@ -193,6 +200,27 @@ pub struct MigoAndroidNativeWindowDescriptor {
 // complete record.
 unsafe impl AbiStruct for MigoAndroidNativeWindowDescriptor {}
 
+/// Layout-identical to the Android descriptor, and kept a separate type anyway.
+///
+/// The two platforms present the same shape -- one opaque native window handle
+/// -- but they are different ABIs with different ownership calls, and the
+/// `platform_kind` in the envelope is what selects between them. Collapsing
+/// them into one type would make a host that set the wrong kind compile and
+/// parse cleanly, only to hand a `OHNativeWindow*` to Android's reference
+/// counting.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MigoOpenHarmonyNativeWindowDescriptor {
+    pub header: VersionedHeader,
+    pub platform_kind: u32,
+    pub flags: u32,
+    pub native_window: *mut c_void,
+}
+
+// SAFETY: every field has an all-zero representation and v1 requires the
+// complete record.
+unsafe impl AbiStruct for MigoOpenHarmonyNativeWindowDescriptor {}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MigoWin32HwndDescriptor {
@@ -298,6 +326,9 @@ pub enum ValidatedPlatformSurface {
         display: NonNull<c_void>,
         surface: NonNull<c_void>,
     },
+    OpenHarmony {
+        native_window: NonNull<c_void>,
+    },
 }
 
 /// An owned snapshot of a caller's borrowed surface records.
@@ -367,6 +398,21 @@ impl SurfaceDescriptorRef {
                 let native_window =
                     NonNull::new(payload.native_window).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
                 ValidatedPlatformSurface::Android { native_window }
+            }
+            MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW => {
+                require_payload_size::<MigoOpenHarmonyNativeWindowDescriptor>(
+                    raw.platform_descriptor_size,
+                )?;
+                // SAFETY: the caller contract covers the selected payload.
+                let payload = unsafe {
+                    copy_versioned::<MigoOpenHarmonyNativeWindowDescriptor>(
+                        raw.platform_descriptor.cast(),
+                    )
+                }?;
+                validate_payload_prefix(payload.platform_kind, payload.flags, raw.platform_kind)?;
+                let native_window =
+                    NonNull::new(payload.native_window).ok_or(MIGO_ERROR_INVALID_ARGUMENT)?;
+                ValidatedPlatformSurface::OpenHarmony { native_window }
             }
             MIGO_PLATFORM_WIN32_HWND => {
                 require_payload_size::<MigoWin32HwndDescriptor>(raw.platform_descriptor_size)?;
@@ -612,6 +658,21 @@ const _: () = assert!(offset_of!(MigoSurfaceDescriptor, platform_descriptor) == 
 const _: () = assert!(size_of::<MigoAndroidNativeWindowDescriptor>() == 24);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(offset_of!(MigoAndroidNativeWindowDescriptor, native_window) == 16);
+// The OpenHarmony descriptor is pinned independently rather than by reference
+// to Android's. If either moves, the one that moved fails here -- which is the
+// point of asserting a layout twice.
+//
+// The size and the pointer offset depend on the pointer width and are gated
+// like every other one here; only the header offset holds on both. Written
+// ungated, they were true on this machine and broke the ILP32 lane, where the
+// descriptor is 20 bytes. That lane pins both widths for this type already
+// (tests/c_abi/platform_contract.c), so gating loses no coverage -- it is also
+// the only lane that compiles for ILP32 at all.
+const _: () = assert!(offset_of!(MigoOpenHarmonyNativeWindowDescriptor, header) == 0);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<MigoOpenHarmonyNativeWindowDescriptor>() == 24);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(offset_of!(MigoOpenHarmonyNativeWindowDescriptor, native_window) == 16);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<MigoX11WindowDescriptor>() == 40);
 #[cfg(target_pointer_width = "64")]
