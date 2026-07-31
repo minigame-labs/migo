@@ -7,10 +7,10 @@ use crate::{
     android::jni::{
         JAVA_METHOD_CACHE, JavaMethodCache, executeScript, getConsoleLogs, getDebugStats,
         getMinApiLevel, init, initIcuData, mod_main, nativeAhbPointerFromHardwareBuffer,
-        onAccelerometerChange, onActionSheetResult, onAudioInterruptionBegin,
+        onAccelerometerChange, onActionSheetResult, onAdEvent, onAudioInterruptionBegin,
         onAudioInterruptionEnd, onBLECharacteristicValueChange, onBLEConnectionStateChange,
         onBLEMTUChange, onBeaconServiceChange, onBeaconUpdate, onBluetoothAdapterStateChange,
-        onAdEvent, onBluetoothDeviceFound, onCameraEvent, onCameraFrameData, onCheckSessionResult,
+        onBluetoothDeviceFound, onCameraEvent, onCameraFrameData, onCheckSessionResult,
         onChooseImageResult, onChooseMessageFileResult, onCompassChange, onCompressImageResult,
         onDeviceMotionChange, onDeviceOrientationChange, onFuzzyLocationResult,
         onGetPhoneNumberResult, onGetUserInfoResult, onGyroscopeChange, onHide, onKeyboardComplete,

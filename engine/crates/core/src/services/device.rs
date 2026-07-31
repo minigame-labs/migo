@@ -4,11 +4,11 @@
 
 pub use shared::services::{
     AccelerometerService, AdService, AudioPlatformService, AuthService, BatteryService,
-    BluetoothService,
-    CameraService, ClipboardService, CodecService, CommerceServices, CompassService,
-    ConnectivityServices, DeviceMotionService, DeviceServices, FileService, GameLogService,
-    GyroscopeService, ImageApiService, InteractionService, KeyboardService, LocationService,
-    MediaServices, NavigateService, NetworkService, PaymentService, RecorderService,
-    ScanCodeService, ScreenService, SensorServices, ServiceError, ServiceErrorCode, ShareService,
-    SubpackageService, SystemInfoService, SystemUtilServices, VibrationService, VideoService,
+    BluetoothService, CameraService, ClipboardService, CodecService, CommerceServices,
+    CompassService, ConnectivityServices, DeviceMotionService, DeviceServices, FileService,
+    GameLogService, GyroscopeService, ImageApiService, InteractionService, KeyboardService,
+    LocationService, MediaServices, NavigateService, NetworkService, PaymentService,
+    RecorderService, ScanCodeService, ScreenService, SensorServices, ServiceError,
+    ServiceErrorCode, ShareService, SubpackageService, SystemInfoService, SystemUtilServices,
+    VibrationService, VideoService,
 };

@@ -252,10 +252,7 @@ mod ad_reward_integrity_tests {
         exec(&mut rt, "globalThis.__ad.show();");
         drain_ready(&mut rt).await;
 
-        deliver_ad_event(
-            &mut rt,
-            r#"{"adId":1,"event":"close","isEnded":true}"#,
-        );
+        deliver_ad_event(&mut rt, r#"{"adId":1,"event":"close","isEnded":true}"#);
         drain_ready(&mut rt).await;
 
         assert_js(&mut rt, "globalThis.__closes.length === 1");
@@ -269,10 +266,7 @@ mod ad_reward_integrity_tests {
         exec(&mut rt, "globalThis.__ad.show();");
         drain_ready(&mut rt).await;
 
-        deliver_ad_event(
-            &mut rt,
-            r#"{"adId":1,"event":"close","isEnded":false}"#,
-        );
+        deliver_ad_event(&mut rt, r#"{"adId":1,"event":"close","isEnded":false}"#);
         drain_ready(&mut rt).await;
 
         assert_js(&mut rt, "globalThis.__closes[0].isEnded === false");
@@ -367,10 +361,7 @@ mod ad_reward_integrity_tests {
         exec(&mut rt, WATCH_REWARDED);
         drain_ready(&mut rt).await;
 
-        deliver_ad_event(
-            &mut rt,
-            r#"{"adId":9999,"event":"close","isEnded":true}"#,
-        );
+        deliver_ad_event(&mut rt, r#"{"adId":9999,"event":"close","isEnded":true}"#);
         drain_ready(&mut rt).await;
 
         assert_js(&mut rt, "globalThis.__closes.length === 0");
@@ -383,10 +374,7 @@ mod ad_reward_integrity_tests {
         exec(&mut rt, "globalThis.__ad.destroy();");
         drain_ready(&mut rt).await;
 
-        deliver_ad_event(
-            &mut rt,
-            r#"{"adId":1,"event":"close","isEnded":true}"#,
-        );
+        deliver_ad_event(&mut rt, r#"{"adId":1,"event":"close","isEnded":true}"#);
         drain_ready(&mut rt).await;
 
         assert_js(&mut rt, "globalThis.__closes.length === 0");
@@ -438,7 +426,8 @@ mod ad_reward_integrity_tests {
 
         // The create request must carry what a host needs to resolve a slot.
         assert!(
-            log[0].contains("\"adType\":\"rewardedVideo\"") && log[0].contains("\"adUnitId\":\"unit-1\""),
+            log[0].contains("\"adType\":\"rewardedVideo\"")
+                && log[0].contains("\"adUnitId\":\"unit-1\""),
             "create request should identify the slot; got {}",
             log[0]
         );
@@ -578,10 +567,7 @@ mod ad_reward_integrity_tests {
             "handles should be distinct; got {log:?}"
         );
 
-        deliver_ad_event(
-            &mut rt,
-            r#"{"adId":2,"event":"close","isEnded":true}"#,
-        );
+        deliver_ad_event(&mut rt, r#"{"adId":2,"event":"close","isEnded":true}"#);
         drain_ready(&mut rt).await;
 
         assert_js(

@@ -5,12 +5,12 @@
 use std::sync::Arc;
 
 use migo_core::services::{
-    AccelerometerService, AdService, AudioPlatformService, AuthService, BatteryService, BluetoothService,
-    CameraService, ClipboardService, CodecService, CommerceServices, CompassService,
-    ConnectivityServices, DeviceMotionService, FileService, GameLogService, GyroscopeService,
-    ImageApiService, InteractionService, KeyboardService, LocationService, MediaServices,
-    NavigateService, NetworkService, PaymentService, RecorderService, ScanCodeService,
-    ScreenService, SensorServices, ServiceError, ShareService, SubpackageService,
+    AccelerometerService, AdService, AudioPlatformService, AuthService, BatteryService,
+    BluetoothService, CameraService, ClipboardService, CodecService, CommerceServices,
+    CompassService, ConnectivityServices, DeviceMotionService, FileService, GameLogService,
+    GyroscopeService, ImageApiService, InteractionService, KeyboardService, LocationService,
+    MediaServices, NavigateService, NetworkService, PaymentService, RecorderService,
+    ScanCodeService, ScreenService, SensorServices, ServiceError, ShareService, SubpackageService,
     SystemInfoService, SystemUtilServices, VibrationService, VideoService,
 };
 
