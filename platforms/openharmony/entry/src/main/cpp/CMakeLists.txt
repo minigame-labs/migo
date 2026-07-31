@@ -1,0 +1,69 @@
+# Native bridge for the OpenHarmony host.
+#
+# This links migo's C ABI static library into the module's own .so, which is
+# how an OpenHarmony native dependency is consumed -- the same arrangement the
+# Android C SDK uses, and the reason neither ships a versioned shared object.
+
+cmake_minimum_required(VERSION 3.5.0)
+project(migo_ohos_host)
+
+set(NATIVERENDER_ROOT_PATH ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Staged by scripts/build-ohos-host.sh next to this file, one directory per ABI.
+# Not committed: it is a build output, exactly like the Android host's
+# jniLibs-static.
+set(MIGO_LIB "${NATIVERENDER_ROOT_PATH}/libs/${OHOS_ARCH}/libmigo_capi.a")
+if(NOT EXISTS "${MIGO_LIB}")
+    message(FATAL_ERROR
+        "missing ${MIGO_LIB}\n"
+        "build it first: scripts/build-ohos-host.sh --arch <arch>")
+endif()
+
+include_directories(
+    ${NATIVERENDER_ROOT_PATH}
+    ${NATIVERENDER_ROOT_PATH}/include
+    ${NATIVERENDER_ROOT_PATH}/migo-include
+)
+
+add_library(migohost SHARED napi_init.cpp)
+
+# Two link options that are requirements, not tuning. Both were established by
+# a failing link, and both fail in ways that name neither Skia nor this file.
+#
+# --gc-sections: skia-bindings carries a translation unit referencing
+# JPEG/PDF/pathops symbols for features this Skia build disables. Without
+# section garbage collection the link fails with about twenty undefined
+# symbols.
+#
+# --allow-multiple-definition: Skia and V8 each embed parts of a C++ runtime, so
+# std::runtime_error, std::logic_error and friends are defined more than once in
+# the archive. The linker takes the first definition, which is safe because both
+# were built against the same libc++ ABI. Android's build carries this flag for
+# exactly the same reason; the alternative -- statically linking another libc++
+# on top -- is what produced the duplicates in the first place.
+target_link_options(migohost PRIVATE
+    -Wl,--gc-sections
+    -Wl,--allow-multiple-definition
+    # Without this --gc-sections cannot collect anything: in a shared library
+    # every global symbol is an entry point, so skia-bindings' JPEG/PDF/pathops
+    # wrappers stay live and their undefined references fail the link. The
+    # module is reached through a constructor, not an exported symbol, so a
+    # fully local map costs nothing.
+    "-Wl,--version-script=${NATIVERENDER_ROOT_PATH}/migohost.map"
+)
+
+# libc++ is deliberately absent from this list: it arrives with the archive and
+# with the platform, and naming it again is what the duplicate-symbol errors
+# were. This mirrors the Android C SDK's -DANDROID_STL=c++_shared requirement.
+target_link_libraries(migohost PUBLIC
+    ${MIGO_LIB}
+    libace_napi.z.so
+    libace_ndk.z.so
+    libnative_window.so
+    libEGL.so
+    libGLESv3.so
+    libhilog_ndk.z.so
+    dl
+    m
+    pthread
+)
