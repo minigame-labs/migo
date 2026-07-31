@@ -80,6 +80,7 @@ fi
 if rg -n 'libEGL\.so' "$CRATES" \
     --glob '!**/platform/src/android/presenter.rs' \
     --glob '!**/platform/src/linux/presenter.rs' \
+    --glob '!**/platform/src/ohos/presenter.rs' \
     --glob '!**/build.rs'; then
     fail "EGL implementation selection escaped the platform providers"
 fi
