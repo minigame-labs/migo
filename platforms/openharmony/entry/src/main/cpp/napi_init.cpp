@@ -452,7 +452,19 @@ napi_value Init(napi_env env, napi_value exports) {
 
     /* Bind to the XComponent declared in the ArkTS page. Without this the
      * surface callbacks never fire and the engine is handed nothing to draw
-     * on -- which presents as a silent black screen, not as an error. */
+     * on -- which presents as a silent black screen, not as an error.
+     *
+     * ArkUI calls this function more than once: once when the module itself is
+     * registered, before any XComponent exists, and again once a component has
+     * been bound to it. The first pass therefore finds nothing to unwrap, and
+     * that is the normal path, not a fault. It used to be logged at error level,
+     * so every healthy launch printed a failure -- on a platform where this log
+     * is the only diagnostic channel a host has, a permanent false error is
+     * worse than no message, because it teaches the reader to skip errors.
+     *
+     * The signal that matters is positive: "surface callbacks registered" must
+     * appear. If it never does, nothing below will run and the screen stays
+     * black with no error anywhere. */
     napi_value exportInstance = nullptr;
     if (napi_get_named_property(env, exports, OH_NATIVE_XCOMPONENT_OBJ, &exportInstance) ==
         napi_ok) {
@@ -471,10 +483,10 @@ napi_value Init(napi_env env, napi_value exports) {
                 LOGI("surface callbacks registered");
             }
         } else {
-            LOGE("napi_unwrap of the XComponent instance failed");
+            LOGI("module registration pass: no XComponent bound yet");
         }
     } else {
-        LOGE("no native XComponent object on exports; is the XComponent declared?");
+        LOGI("module registration pass: no native XComponent object on exports yet");
     }
     return exports;
 }

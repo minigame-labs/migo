@@ -30,11 +30,12 @@ Reproducible benchmarks against the system WebView — same game, same device, s
 | **Android** (arm64-v8a, x86_64) | Released | AAR with the Java/Kotlin SDK; a C ABI package per ABI (headers, static library, CMake package) |
 | **Linux** (x86_64) | Released | Static and shared library, pkg-config and CMake packages; Qt 6 / X11 host kit in-tree |
 | **Windows** (x86_64) | Released | `migo.dll` with its import library, headers, a CMake package, and the ANGLE and V8 runtime DLLs it loads by name |
-| iOS, macOS, HarmonyOS | Planned | — |
+| **OpenHarmony / HarmonyOS NEXT** (aarch64, x86_64) | Buildable and gated | A C ABI package per architecture (headers, static library, CMake package, manifest), produced and gated by one command; not on the releases page yet |
+| iOS, macOS | Planned | — |
 
 Released artifacts are on the [releases page](https://github.com/minigame-labs/migo/releases). Each ships an `.attestation.json` recording the archive's name, size and sha256 — verify a download against it before use.
 
-The C ABI in [`include/migo/`](include/migo/) is a **candidate** — it has a working runtime on Android and Linux but is not frozen. Its own README tracks what remains before it can be.
+The C ABI in [`include/migo/`](include/migo/) is a **candidate** — it has a working runtime on Android, Linux and OpenHarmony but is not frozen. Its own README tracks what remains before it can be.
 
 ## Quick start
 
@@ -94,6 +95,7 @@ migo/
 ├── platforms/
 │   ├── android/            # Android SDK (AAR)
 │   ├── linux/              # Linux host kit (Qt 6 / X11)
+│   ├── openharmony/        # OpenHarmony host (ArkUI XComponent)
 │   └── windows/            # Windows
 ├── tests/                  # conformance assets (C ABI lanes, C hosts, probes)
 ├── contracts/              # artifact manifest schemas

@@ -30,12 +30,13 @@
 | **Android**（arm64-v8a、x86_64） | 已发布 | 含 Java/Kotlin SDK 的 AAR;按 ABI 发布的 C ABI 包(头文件、静态库、CMake 包) |
 | **Linux**（x86_64） | 已发布 | 静态库与共享库、pkg-config 与 CMake 包;Qt 6 / X11 host kit 在仓库内 |
 | **Windows**（x86_64） | 已发布 | `migo.dll` 及其导入库、头文件、CMake 包,以及它按名加载的 ANGLE 与 V8 运行时 DLL |
-| iOS、macOS、鸿蒙 | 计划中 | — |
+| **OpenHarmony / HarmonyOS NEXT**（aarch64、x86_64） | 可构建、已门禁 | 按架构产出的 C ABI 包(头文件、静态库、CMake 包、manifest),一条命令产出并自带门禁;尚未上 releases 页面 |
+| iOS、macOS | 计划中 | — |
 
 已发布产物见 [releases 页面](https://github.com/minigame-labs/migo/releases)。每个产物都带
 `.attestation.json`,记录归档的名称、大小与 sha256 —— 使用前请对照校验。
 
-[`include/migo/`](include/migo/) 中的 C ABI 目前是 **candidate**——在 Android 与 Linux 上已有可用运行时，但尚未冻结。冻结前还剩哪些事项，以该目录下的 README 为准。
+[`include/migo/`](include/migo/) 中的 C ABI 目前是 **candidate**——在 Android、Linux 与 OpenHarmony 上已有可用运行时，但尚未冻结。冻结前还剩哪些事项，以该目录下的 README 为准。
 
 ## 快速开始
 
@@ -95,6 +96,7 @@ migo/
 ├── platforms/
 │   ├── android/            # Android SDK（AAR）
 │   ├── linux/              # Linux host kit（Qt 6 / X11）
+│   ├── openharmony/        # OpenHarmony 宿主（ArkUI XComponent）
 │   └── windows/            # Windows
 ├── tests/                  # 一致性资产（C ABI lane、C 宿主、探针内容）
 ├── contracts/              # 产物 manifest schema
