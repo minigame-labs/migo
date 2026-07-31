@@ -61,6 +61,25 @@ case "${1:-}" in
     --check)  CHECK_ONLY=1 ;;
     aarch64)  ARCH="aarch64" ;;
     x86_64|"") ARCH="x86_64" ;;
+    armv7|arm|loongarch64)
+        # Recognised and declined on purpose, rather than falling through to
+        # "unknown argument" -- a bare rejection reads like a gap in the script
+        # and invites someone to re-derive this decision.
+        #
+        # The SDK ships clang drivers for four architectures but sysroot
+        # libraries for three (loongarch64 has a driver and no lib directory),
+        # and of those three only two matter here: aarch64 is every HarmonyOS
+        # NEXT device, x86_64 is the emulator. NEXT has no 32-bit devices, and
+        # LoongArch is not in the market this runtime targets.
+        #
+        # Each additional architecture costs another ~160 MB V8 archive, another
+        # build lane, and another artifact that has to stay verified. Adding one
+        # should be triggered by a real consumer, not by symmetry: add a case
+        # here and the matching gn toolchain in build/toolchain/ohos/BUILD.gn.
+        err "$1 is deliberately not built; only x86_64 (emulator) and aarch64 (device) are"
+        err "see the comment at this line for the reasoning and how to add one"
+        exit 1
+        ;;
     *) err "unknown argument: $1"; exit 1 ;;
 esac
 
