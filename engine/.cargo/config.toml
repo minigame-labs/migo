@@ -125,6 +125,55 @@ rustflags = [
 ]
 
 # -----------------------------------------------------------------------------
+# OpenHarmony (arm64 + x86_64)
+# -----------------------------------------------------------------------------
+# ⚠ These targets report target_os = "linux" with target_env = "ohos", so every
+# bare `cfg(target_os = "linux")` in the tree matches OHOS too. `platform/src/
+# lib.rs` and `capi/src/platform/mod.rs` already spell
+# `not(target_env = "ohos")` to keep the X11/Wayland presenters out; do not
+# "simplify" those back to a bare linux check.
+#
+# The linker is the SDK's own target-prefixed driver, named exactly after the
+# Rust triple -- the same arrangement as the Android entries above naming the
+# NDK's wrappers. Each driver already resolves its own sysroot (verified with
+# `-print-search-dirs`), so nothing machine-specific is committed here; the
+# SDK's llvm/bin only has to be on PATH, which scripts/dev-setup-ohos.sh
+# exports.
+#
+# The flag set is deliberately smaller than Android's. Only correctness and
+# hardening flags are here. Android's --strip-all / --icf=all / -s are size
+# optimizations from the .so-shrinking work, and OHOS ships a static library to
+# an NDK consumer rather than a size-capped .so -- so those are a measurement
+# to make, not a default to inherit. Nothing is added here without a number
+# behind it.
+# -----------------------------------------------------------------------------
+[target.x86_64-unknown-linux-ohos]
+linker = "x86_64-unknown-linux-ohos-clang"
+rustflags = [
+  # Skia and V8 each define a handful of the same std::* symbols; the linker
+  # takes the first definition, which is safe because both archives are built
+  # against the same libc++ ABI. Android carries this for the same reason.
+  "-C", "link-arg=-Wl,--allow-multiple-definition",
+  # skia-bindings has a translation unit referencing JPEG/PDF/pathops symbols
+  # for features Skia was built without; an executable or .so only links
+  # because --gc-sections reclaims the unreferenced sections.
+  "-C", "link-arg=-Wl,--gc-sections",
+  "-C", "link-arg=-Wl,--as-needed",
+  "-C", "link-arg=-Wl,-z,relro",
+  "-C", "link-arg=-Wl,-z,now",
+]
+
+[target.aarch64-unknown-linux-ohos]
+linker = "aarch64-unknown-linux-ohos-clang"
+rustflags = [
+  "-C", "link-arg=-Wl,--allow-multiple-definition",
+  "-C", "link-arg=-Wl,--gc-sections",
+  "-C", "link-arg=-Wl,--as-needed",
+  "-C", "link-arg=-Wl,-z,relro",
+  "-C", "link-arg=-Wl,-z,now",
+]
+
+# -----------------------------------------------------------------------------
 # Build Configuration
 # -----------------------------------------------------------------------------
 [build]

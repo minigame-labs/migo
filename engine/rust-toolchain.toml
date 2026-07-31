@@ -10,4 +10,15 @@ components = ["rustfmt", "clippy"]
 targets = [
   "aarch64-linux-android",
   "x86_64-linux-android",
+  # OpenHarmony. Named here for the same reason the Android pair is: this file
+  # is the reproducible-build contract, and a target that happens to be present
+  # because someone ran `rustup target add` is not reproducible. Cost: two more
+  # std copies per developer, which is already the situation for Android std on
+  # Windows machines.
+  #
+  # NOTE `rustup target list --installed` under-reports these -- it can omit an
+  # ohos target whose std is really present. The authoritative check is whether
+  # `$(rustup toolchain dir)/lib/rustlib/<target>/` exists.
+  "aarch64-unknown-linux-ohos",
+  "x86_64-unknown-linux-ohos",
 ]
