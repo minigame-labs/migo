@@ -181,6 +181,77 @@ for required_op in ("op_ad_is_supported", "op_ad_show", "op_ad_create"):
         )
 
 # ---------------------------------------------------------------------------
+# 4. The Java sink and the JS reader must agree on the wire format.
+#
+# The ad event channel is JSON crossing Java -> JNI -> JS with nothing checking
+# it: rename a key on one side and every callback still fires, the payload just
+# arrives with the field missing. For `isEnded` that reads as "advert not
+# watched" and silently stops paying players; for `event` it drops the callback
+# entirely. Both sides are parsed from source here rather than listed, so a new
+# event added later is covered without editing this file.
+# ---------------------------------------------------------------------------
+
+sink_java = root / (
+    "platforms/android/library/src/main/java/com/migo/runtime/internal/NativeExports.java"
+)
+
+if not sink_java.exists():
+    failures.append(
+        f"{sink_java} not found; the Java half of the ad event contract cannot be checked"
+    )
+else:
+    # Commented-out code must not count as an implementation. Without this a
+    # `// payload.put("adId", adId);` still satisfies the check, and the gate
+    # goes green on a channel whose events can no longer be routed.
+    def strip_comments(text: str) -> str:
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        return "\n".join(line.split("//", 1)[0] for line in text.splitlines())
+
+    sink_source = strip_comments(sink_java.read_text(encoding="utf-8"))
+
+    # Java side: the event names it emits, and the payload keys it puts.
+    emitted_events = set(re.findall(r'emit\(\s*adId\s*,\s*"([A-Za-z]+)"', sink_source))
+    java_keys = set(re.findall(r'extra\.put\(\s*"([A-Za-z]+)"', sink_source))
+    java_keys |= set(re.findall(r'payload\.put\(\s*"([A-Za-z]+)"', sink_source))
+
+    # JS side: the event names it routes, and the payload fields it reads.
+    handled_events = set(re.findall(r'case\s+"([A-Za-z]+)":', ad_js_source))
+    js_fields = set(re.findall(r"\bevent\.([A-Za-z][A-Za-z0-9_]*)", ad_js_source))
+
+    if not emitted_events:
+        failures.append(
+            f"{sink_java.relative_to(root)}: no ad events are emitted; the Java "
+            "half of the channel is gone (or this check stopped matching it)"
+        )
+    if not handled_events:
+        failures.append(
+            f"{ad_js.relative_to(root)}: no ad events are handled; the JS half of "
+            "the channel is gone (or this check stopped matching it)"
+        )
+
+    for name in sorted(emitted_events - handled_events):
+        failures.append(
+            f"the host emits ad event `{name}` but the runtime handles no such "
+            f"event ({ad_js.relative_to(root)}); it would be dropped in silence"
+        )
+
+    # Keys the runtime reads out of an event payload, minus the routing fields it
+    # supplies itself. Everything left has to be something the host actually puts.
+    ROUTING_FIELDS = {"adId", "event"}
+    for name in sorted(js_fields - ROUTING_FIELDS - java_keys):
+        failures.append(
+            f"{ad_js.relative_to(root)}: reads `event.{name}` from ad payloads, "
+            f"but {sink_java.relative_to(root)} never puts that key; the field "
+            "would always arrive undefined"
+        )
+
+    for name in sorted(ROUTING_FIELDS - java_keys):
+        failures.append(
+            f"{sink_java.relative_to(root)}: ad payloads must carry `{name}`; "
+            "without it events cannot be routed to an ad object"
+        )
+
+# ---------------------------------------------------------------------------
 
 if failures:
     print("FAIL: ad reward integrity contract", file=sys.stderr)
