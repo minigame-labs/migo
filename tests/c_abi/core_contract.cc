@@ -32,7 +32,12 @@ static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "OpenHarmony has no runtime yet");
 #elif defined(__linux__) && defined(__GLIBC__)
 static_assert(MIGO_PLATFORM_IS_LINUX_GNU == 1, "glibc Linux is the desktop target");
 static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "desktop Linux ships a runtime");
+#elif defined(_WIN32) && !defined(__CYGWIN__)
+static_assert(MIGO_PLATFORM_IS_WINDOWS == 1, "Windows must classify as Windows");
+static_assert(MIGO_PLATFORM_IS_LINUX_GNU == 0, "Windows is not desktop Linux");
+static_assert(MIGO_C_ABI_HAS_RUNTIME == 1, "Windows ships migo.lib with a Win32 surface backend");
 #else
+static_assert(MIGO_PLATFORM_IS_WINDOWS == 0, "only _WIN32 targets classify as Windows");
 static_assert(MIGO_C_ABI_HAS_RUNTIME == 0, "no runtime on unclassified targets");
 #endif
 static_assert(sizeof(MigoResult) == 4, "fixed-width result");
