@@ -85,10 +85,11 @@ pub(crate) fn build_target(
         migo_capi_abi::MIGO_ERROR_INVALID_ARGUMENT
     })?;
 
-    let graphics_platform = platform::ohos::presenter::ohos_graphics_platform().map_err(|error| {
-        tracing::error!("build_target: graphics platform: {error:?}");
-        MIGO_ERROR_INTERNAL
-    })?;
+    let graphics_platform =
+        platform::ohos::presenter::ohos_graphics_platform().map_err(|error| {
+            tracing::error!("build_target: graphics platform: {error:?}");
+            MIGO_ERROR_INTERNAL
+        })?;
 
     Ok((
         Arc::new(wrapper),

@@ -661,8 +661,17 @@ const _: () = assert!(offset_of!(MigoAndroidNativeWindowDescriptor, native_windo
 // The OpenHarmony descriptor is pinned independently rather than by reference
 // to Android's. If either moves, the one that moved fails here -- which is the
 // point of asserting a layout twice.
+//
+// The size and the pointer offset depend on the pointer width and are gated
+// like every other one here; only the header offset holds on both. Written
+// ungated, they were true on this machine and broke the ILP32 lane, where the
+// descriptor is 20 bytes. That lane pins both widths for this type already
+// (tests/c_abi/platform_contract.c), so gating loses no coverage -- it is also
+// the only lane that compiles for ILP32 at all.
 const _: () = assert!(offset_of!(MigoOpenHarmonyNativeWindowDescriptor, header) == 0);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<MigoOpenHarmonyNativeWindowDescriptor>() == 24);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(offset_of!(MigoOpenHarmonyNativeWindowDescriptor, native_window) == 16);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<MigoX11WindowDescriptor>() == 40);
