@@ -261,29 +261,74 @@ void DispatchTouchEventCB(OH_NativeXComponent *component, void *window) {
     }
 
     uint32_t count = event.numPoints;
-    if (count == 0) count = 1;
     if (count > MIGO_TOUCH_MAX_POINTS) count = MIGO_TOUCH_MAX_POINTS;
 
     MigoTouchPoint points[MIGO_TOUCH_MAX_POINTS];
     memset(points, 0, sizeof points);
     const float inv_scale = (g_host.scale_factor > 0.0f) ? (1.0f / g_host.scale_factor) : 1.0f;
-    /* MIGO_TOUCH_FLAG_CHANGED is what separates `touches` from
-     * `changedTouches` on the JS side. Omitting it is not a cosmetic loss: on a
-     * touchend the lifted finger stays in `touches`, so content that waits for
-     * the list to empty never sees it empty. That is a silent wrong-behaviour
-     * bug, not an error -- it was found by a probe whose colour never reached
-     * the released state.
+
+    /*
+     * Two independent flags, and getting either wrong is silent.
      *
-     * For MOVE every point changed; for the pointer-specific phases exactly one
-     * did, and OpenHarmony names it in the event's own id field. */
+     * MIGO_TOUCH_FLAG_CHANGED selects `changedTouches`. For a move every point
+     * changed at once; for the pointer-specific phases exactly one did, and
+     * OpenHarmony names it in the event's own id field.
+     *
+     * MIGO_TOUCH_FLAG_REMOVED is what takes a point *out* of `touches`, and it
+     * is a separate decision -- the engine's JS keeps every point that is not
+     * flagged removed, regardless of the event phase. Sending a touchend whose
+     * point carries only CHANGED delivers an end event in which the lifted
+     * finger is still listed as on the surface, so content waiting for
+     * `touches.length === 0` never sees it. That is the bug the probe caught:
+     * it turned green on touchstart and stayed green after the finger lifted.
+     *
+     * Which point left is decided from the event's id, and the per-point `type`
+     * field is deliberately not used for it. That field looks like the direct
+     * answer and is not: on an UP event the emulator reports the lifted point's
+     * own type as MOVE, not UP (logged below, API 20 / Mate 70 Pro emulator).
+     * Testing it would remove nothing and reproduce exactly the bug this comment
+     * describes. `isPressed` does go false on the same event and agrees with the
+     * rule used here; it is left as a cross-check rather than the source of
+     * truth because one signal deciding it keeps start and end symmetric.
+     *
+     * Multi-finger behaviour is unverified on a device: hdc cannot synthesise a
+     * second pointer. The per-point lines below are what a real multi-touch
+     * session would be read against.
+     */
     const bool all_changed = (type == MIGO_TOUCH_MOVE);
+    const bool phase_removes = (type == MIGO_TOUCH_END || type == MIGO_TOUCH_CANCEL);
+    LOGI("touch type=%{public}u numPoints=%{public}u subject.id=%{public}d",
+         (unsigned)type, event.numPoints, event.id);
     for (uint32_t i = 0; i < count; ++i) {
         const OH_NativeXComponent_TouchPoint &tp = event.touchPoints[i];
+        const bool is_subject = (tp.id == event.id);
         points[i].id = (uint32_t)tp.id;
         points[i].x = tp.x * inv_scale;
         points[i].y = tp.y * inv_scale;
         points[i].pressure = tp.force;
-        points[i].flags = (all_changed || tp.id == event.id) ? MIGO_TOUCH_FLAG_CHANGED : 0;
+        points[i].flags = 0;
+        if (all_changed || is_subject) points[i].flags |= MIGO_TOUCH_FLAG_CHANGED;
+        if (phase_removes && is_subject) points[i].flags |= MIGO_TOUCH_FLAG_REMOVED;
+        LOGI("  point[%{public}u] id=%{public}d type=%{public}d pressed=%{public}d "
+             "flags=0x%{public}x",
+             i, tp.id, (int)tp.type, (int)tp.isPressed, (unsigned)points[i].flags);
+    }
+
+    /*
+     * An event with no points still has to be delivered. The event itself
+     * carries the pointer's id and position, so it is described here from its
+     * own fields rather than dropped -- dropping an end leaves content believing
+     * a finger is still down, and no later event corrects that.
+     */
+    if (count == 0) {
+        LOGI("  event carries no points; describing it from the event fields");
+        count = 1;
+        points[0].id = (uint32_t)event.id;
+        points[0].x = event.x * inv_scale;
+        points[0].y = event.y * inv_scale;
+        points[0].pressure = event.force;
+        points[0].flags = MIGO_TOUCH_FLAG_CHANGED
+            | (phase_removes ? MIGO_TOUCH_FLAG_REMOVED : 0u);
     }
 
     MigoTouchEvent out;
@@ -295,8 +340,6 @@ void DispatchTouchEventCB(OH_NativeXComponent *component, void *window) {
     out.timestamp_ms = event.timeStamp / 1000000;  /* ns -> ms */
     out.points = points;
 
-    LOGI("touch type=%{public}u points=%{public}u ev.id=%{public}d p0.id=%{public}u flags=%{public}u",
-         (unsigned)type, count, event.id, points[0].id, (unsigned)points[0].flags);
     MigoResult rc = migo_session_send_touch(g_host.session, &out);
     if (rc != MIGO_OK) {
         /* WOULD_BLOCK is transient and the host decides whether to retry;
