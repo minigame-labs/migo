@@ -46,11 +46,34 @@ fi
 # the pinned one -- a gate checking a different compiler than the product ships
 # with. Observed: the repo root resolved to stable, which lacks the aarch64
 # OpenHarmony std that engine's pinned 1.95.0 has.
+#
+# ⚠ Moving into engine/ also makes engine/.cargo/config.toml's `[env]` block
+# apply, and that block sets a bare `CC = "clang-18"` for every target. cc-rs
+# then compiles zstd for aarch64-linux-android with the host clang against
+# /usr/include, which fails on `bits/libc-header-start.h`. It does not fail on a
+# developer machine that already exports a `CC` pointing at the NDK -- an
+# exported variable beats the non-forcing `[env]` -- so this is invisible
+# locally and only appears on a clean CI runner. Pinning the target-scoped
+# names is the fix, because cc-rs resolves CC_<target> before bare CC; that is
+# the same lever engine/.cargo/config.toml already uses for the Windows target.
+TARGET_U="${TARGET//-/_}"
+NDK_API="${MIGO_ANDROID_API:-26}"
+NDK_CC="$NDK_BIN/aarch64-linux-android${NDK_API}-clang"
+if [[ ! -x "$NDK_CC" ]]; then
+    err "NDK clang driver not found: $NDK_CC"
+    err "the contract would otherwise compile Android code with the host compiler"
+    exit 1
+fi
+
 info "cross-checking capi for $TARGET"
 (
     cd "$ENGINE_DIR"
-    RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
-    RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
+    env \
+        "CC_${TARGET_U}=$NDK_CC" \
+        "CXX_${TARGET_U}=${NDK_CC}++" \
+        "AR_${TARGET_U}=$NDK_BIN/llvm-ar" \
+        RUSTY_V8_ARCHIVE="$V8_DIR/librusty_v8.a" \
+        RUSTY_V8_SRC_BINDING_PATH="$V8_DIR/src_binding.rs" \
         cargo check -p migo-capi --target "$TARGET"
 )
 
