@@ -36,26 +36,38 @@ const FALLBACK_REWARDED_VIDEO_DURATION_MS = 500;
 // them (wx content does `banner.style.top = y` directly on the style object).
 const POSITION_KEYS = ["left", "top", "width", "height"];
 
-// ==================== Host availability (memoised) ====================
+// ==================== Host availability ====================
 
-// null = not yet probed. Probed lazily on first ad creation so that the op is
-// never called while the snapshot is being built.
-let _hostAdSupport = null;
-
+// Asked once per ad object rather than cached at module scope.
+//
+// A module-level cache would be sound only after proving that no isolate ever
+// outlives the services it was asked about -- isolates are pooled and prewarmed
+// here, so that is a real question rather than an obvious no. The op is a borrow
+// and an Option check, and ad objects are created a handful of times per
+// session, so paying it per construction costs nothing measurable and removes
+// the question entirely.
+//
+// Called from the AdBase constructor, never at module scope: embedded modules
+// are evaluated while the V8 startup snapshot is built, where there is no
+// HostOpState to ask.
 function _hostAdsAvailable() {
-  if (_hostAdSupport === null) {
-    try {
-      _hostAdSupport = op_ad_is_supported() === true;
-    } catch (_) {
-      _hostAdSupport = false;
-    }
+  try {
+    return op_ad_is_supported() === true;
+  } catch (_) {
+    return false;
   }
-  return _hostAdSupport;
 }
 
 // ==================== Ad handle registry ====================
 
 let _nextAdId = 1;
+
+// adId -> ad object. Strong references on purpose, and not a WeakRef registry:
+// the host holds native resources for every live ad and may deliver an event at
+// any moment, so an ad must stay routable until content destroys it. Letting GC
+// reclaim one early would drop the host's events on the floor -- including a
+// reward verdict -- with no way for either side to notice. Entries are released
+// in `_markDestroyed`, which is also where the host is told to let go.
 const _adRegistry = new Map();
 
 function _allocAdId() {
@@ -222,26 +234,44 @@ class AdBase {
     }
   }
 
-  // Wrap a style object so layout writes reach the host.
+  // Make layout writes on a style object reach the host.
   //
-  // Wrapping happens once per ad at construction rather than on every `.style`
-  // read: content touches `.style` from its own layout code, and allocating a
-  // Proxy per read would put an allocation on that path. Unhosted ads get the
-  // bare object back, so the no-host path stays allocation-identical to before.
+  // wx content mutates the style object directly (`banner.style.top = y`), so
+  // the write has to be intercepted. Accessors are installed in place, once per
+  // ad, over just the positional keys.
+  //
+  // Deliberately not a Proxy. Content also *reads* `.style` from its own layout
+  // code, and V8 cannot inline-cache a property access through a Proxy -- every
+  // read would take the generic path, which is exactly the megamorphic dispatch
+  // this engine has measured as its dominant cost elsewhere. A plain accessor
+  // gets a monomorphic IC and optimises down to roughly a field load, while a
+  // Proxy would also add one allocation and an extra object in the chain.
+  //
+  // Untracked fields (`realWidth`, `fixed`, ...) stay plain data properties:
+  // they are not layout inputs, so a write to them owes the host nothing.
   _trackStyle(raw, keys) {
     if (!this.#hosted) return raw;
     const ad = this;
-    return new Proxy(raw, {
-      set(target, prop, value) {
-        target[prop] = value;
-        if (keys.indexOf(prop) !== -1) {
+    for (const key of keys) {
+      if (!(key in raw)) continue;
+      let current = raw[key];
+      Object.defineProperty(raw, key, {
+        configurable: true,
+        // Enumerable so the object still serialises and iterates the way a
+        // plain style object does -- content does `JSON.stringify(style)`.
+        enumerable: true,
+        get() {
+          return current;
+        },
+        set(next) {
+          current = next;
           const style = {};
-          style[prop] = value;
+          style[key] = next;
           ad._command(op_ad_update_style, { style });
-        }
-        return true;
-      },
-    });
+        },
+      });
+    }
+    return raw;
   }
 
   // Route one host event onto this ad's listener groups. Payloads are rebuilt

@@ -528,6 +528,38 @@ mod ad_reward_integrity_tests {
         );
         // The local object still reflects the write.
         assert_js(&mut rt, "globalThis.__banner.style.top === 120");
+
+        // A tracked write must not cost the style object its plain-object
+        // behaviour: content serialises and iterates it.
+        assert_js(
+            &mut rt,
+            "JSON.parse(JSON.stringify(globalThis.__banner.style)).top === 120",
+        );
+        assert_js(
+            &mut rt,
+            "Object.keys(globalThis.__banner.style).indexOf('top') !== -1",
+        );
+    }
+
+    /// Writing a field the host does not lay out must not generate traffic.
+    /// `realWidth` is a rendered-size readback, not a layout input; forwarding
+    /// it would have the host chasing its own reported geometry.
+    #[tokio::test(start_paused = true)]
+    async fn untracked_style_fields_do_not_reach_the_host() {
+        let (mut rt, calls) = boot_hosted();
+        exec(
+            &mut rt,
+            "globalThis.__banner = createBannerAd({ adUnitId: 'b-1', style: { left: 0, top: 0, width: 300 } }); \
+             globalThis.__banner.style.realWidth = 999;",
+        );
+        drain_ready(&mut rt).await;
+
+        let log = calls.lock().expect("ad call log").clone();
+        assert!(
+            !log.iter().any(|entry| entry.starts_with("style:")),
+            "an untracked style field should send nothing; got {log:?}"
+        );
+        assert_js(&mut rt, "globalThis.__banner.style.realWidth === 999");
     }
 
     #[tokio::test(start_paused = true)]
