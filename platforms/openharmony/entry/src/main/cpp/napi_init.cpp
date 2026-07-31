@@ -37,6 +37,12 @@ struct Host {
     MigoEngine *engine = nullptr;
     MigoSession *session = nullptr;
     MigoSurfaceAttachment *attachment = nullptr;
+    /* The surface can arrive before the engine exists: ArkUI creates it when
+     * the component is laid out, while the engine is created from the page's
+     * onLoad. Whichever happens second performs the attach, so neither
+     * ordering loses the window. */
+    OH_NativeXComponent *pending_component = nullptr;
+    void *pending_window = nullptr;
     uint64_t generation = 0;
     bool content_loaded = false;
     std::string files_dir;
@@ -86,7 +92,21 @@ void on_exit_requested(void *user_data, MigoSession *session) {
 }
 
 void attach_surface(OH_NativeXComponent *component, void *window) {
-    if (g_host.session == nullptr || window == nullptr || g_host.attachment != nullptr) {
+    /* Every early return says why. A silent one here is how a surface that
+     * never attaches presents as an ordinary black screen -- the exact failure
+     * mode this host exists to rule out. */
+    if (window == nullptr) {
+        LOGE("attach skipped: null window");
+        return;
+    }
+    if (g_host.attachment != nullptr) {
+        LOGI("attach skipped: already attached");
+        return;
+    }
+    if (g_host.session == nullptr) {
+        LOGI("surface arrived before the engine; deferring attach");
+        g_host.pending_component = component;
+        g_host.pending_window = window;
         return;
     }
 
@@ -144,7 +164,10 @@ void attach_surface(OH_NativeXComponent *component, void *window) {
         content.abi_version = MIGO_ABI_VERSION_CURRENT;
         content.flags = 0;
         content.content_id_utf8 = g_host.content_id.c_str();
-        content.entry_utf8 = nullptr;
+        /* Not optional: the engine rejects a null entry with
+         * MIGO_ERROR_INVALID_ARGUMENT. Both the Android and the Linux host name
+         * game.js here, and wx content always has one. */
+        content.entry_utf8 = "game.js";
 
         rc = migo_session_load_content(g_host.session, &content);
         if (rc != MIGO_OK) {
@@ -286,6 +309,17 @@ napi_value Start(napi_env env, napi_callback_info info) {
     }
 
     LOGI("engine and session created");
+
+    /* If the surface won the race, attach it now. */
+    if (g_host.pending_window != nullptr) {
+        LOGI("attaching the surface that arrived first");
+        OH_NativeXComponent *component = g_host.pending_component;
+        void *window = g_host.pending_window;
+        g_host.pending_component = nullptr;
+        g_host.pending_window = nullptr;
+        attach_surface(component, window);
+    }
+
     napi_create_int32(env, (int32_t)MIGO_OK, &out);
     return out;
 }
@@ -310,7 +344,12 @@ napi_value Init(napi_env env, napi_value exports) {
             if (OH_NativeXComponent_GetXComponentId(component, id, &id_len) == 0) {
                 LOGI("bound XComponent id=%{public}s", id);
             }
-            OH_NativeXComponent_RegisterCallback(component, &g_callbacks);
+            int32_t reg = OH_NativeXComponent_RegisterCallback(component, &g_callbacks);
+            if (reg != 0) {
+                LOGE("OH_NativeXComponent_RegisterCallback failed: %{public}d", reg);
+            } else {
+                LOGI("surface callbacks registered");
+            }
         } else {
             LOGE("napi_unwrap of the XComponent instance failed");
         }

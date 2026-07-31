@@ -1,21 +1,56 @@
 /*
- * The page exists to own an XComponent and nothing else.
+ * The page owns an XComponent and stages the bundled content.
  *
  * `libraryname` is what makes ArkUI load libmigohost.so and hand its native
  * module the XComponent instance; the native side then registers the surface
  * callbacks. Without it the component renders an empty surface and the native
  * code never learns a window exists -- which looks exactly like a rendering bug
  * rather than a wiring one.
+ *
+ * The content ships inside the HAP as a rawfile and is copied into the app's
+ * files directory on first run. It cannot be pushed there from outside: the
+ * sandbox path is visible only to this process, and hdc runs as the unprivileged
+ * `shell` user. Shipping it in the package is also what a real application does.
  */
 
 import migohost from 'libmigohost.so';
+import { common } from '@kit.AbilityKit';
+import { fileIo } from '@kit.CoreFileKit';
 
-const CONTENT_PATH: string = '/data/storage/el2/base/haps/entry/files/content';
+const CONTENT_ID: string = 'touchprobe';
+const CONTENT_FILES: string[] = ['game.js', 'game.json'];
 
 @Entry
 @Component
 struct Index {
   @State status: string = 'starting';
+
+  /* Layout the engine expects: <filesDir>/migo/games/<id>/code/<entry> */
+  private stageContent(filesDir: string): void {
+    const codeDir: string = `${filesDir}/migo/games/${CONTENT_ID}/code`;
+    // mkdir -p, one level at a time: fileIo has no recursive create.
+    let acc: string = filesDir;
+    for (const part of ['migo', 'games', CONTENT_ID, 'code']) {
+      acc = `${acc}/${part}`;
+      try {
+        fileIo.mkdirSync(acc);
+      } catch (_e) {
+        // Already present on a second run; any real failure surfaces below when
+        // the file write fails, with a path in the message.
+      }
+    }
+
+    const ctx = getContext(this) as common.UIAbilityContext;
+    for (const name of CONTENT_FILES) {
+      const bytes: Uint8Array = ctx.resourceManager.getRawFileContentSync(`content/${name}`);
+      const target: string = `${codeDir}/${name}`;
+      const file = fileIo.openSync(target, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE
+        | fileIo.OpenMode.TRUNC);
+      fileIo.writeSync(file.fd, bytes.buffer);
+      fileIo.closeSync(file);
+    }
+    console.info(`[migo] staged ${CONTENT_FILES.length} files into ${codeDir}`);
+  }
 
   build() {
     Stack() {
@@ -28,9 +63,18 @@ struct Index {
           // Started here rather than in aboutToAppear: onLoad fires once the
           // native module is loaded and bound to this component, so the native
           // side is guaranteed to exist before it is called into.
-          const rc: number = migohost.start(CONTENT_PATH);
-          this.status = rc === 0 ? 'engine started' : `start failed: ${rc}`;
-          console.info(`[migo] start -> ${rc}`);
+          try {
+            const ctx = getContext(this) as common.UIAbilityContext;
+            const filesDir: string = ctx.filesDir;
+            const cacheDir: string = ctx.cacheDir;
+            this.stageContent(filesDir);
+            const rc: number = migohost.start(filesDir, cacheDir, CONTENT_ID);
+            this.status = rc === 0 ? `engine started (${CONTENT_ID})` : `start failed: ${rc}`;
+            console.info(`[migo] start -> ${rc}`);
+          } catch (e) {
+            this.status = `staging failed: ${e}`;
+            console.error(`[migo] ${e}`);
+          }
         })
         .width('100%')
         .height('100%')

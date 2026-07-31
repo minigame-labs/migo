@@ -59,7 +59,14 @@ const MIGO_SURFACE_CAPABILITY_KNOWN_MASK: u64 = MIGO_SURFACE_CAPABILITY_WIDE_COL
 pub const MIGO_CAPI_IMPLEMENTED_PLATFORM_KINDS: u64 = (1 << MIGO_PLATFORM_ANDROID_NATIVE_WINDOW)
     | (1 << MIGO_PLATFORM_WIN32_HWND)
     | (1 << MIGO_PLATFORM_X11_WINDOW)
-    | (1 << MIGO_PLATFORM_WAYLAND_SURFACE);
+    | (1 << MIGO_PLATFORM_WAYLAND_SURFACE)
+    // Added only after an attach succeeded on a device, not when the backend
+    // compiled. The Windows incident is why: a published SDK loaded, resolved
+    // every entry point, and could attach nothing, because every gate agreed
+    // with every other gate while no implementation existed. The evidence here
+    // is an OpenHarmony emulator log reading "surface attached, generation 1"
+    // after "surface created 1316 x 2598".
+    | (1 << MIGO_PLATFORM_OPENHARMONY_NATIVE_WINDOW);
 
 /// Authoritative, level-triggered state returned by a release query.
 pub const MIGO_SURFACE_RELEASE_PENDING: u32 = 0;
