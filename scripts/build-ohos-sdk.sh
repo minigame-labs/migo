@@ -257,6 +257,7 @@ EOF
   },
   "known_gaps": [$SURFACE_GAP
     "audio: OHAudio (libohaudio.so) is not wired up; this package is built with profile-slim",
+    "V8 provenance: no component manifest binds this archive's embedded V8 to a source revision and GN argument set, as contracts/artifact-manifest does for Android and Linux. The same item is open on Windows. Publishing these bytes should wait on it",
     "arch coverage: only x86_64 has been run on a device (API 20 emulator); aarch64 is built and gated but unverified until real HarmonyOS NEXT hardware is available",
     "multi-touch: verified single-pointer only; hdc cannot synthesise a second pointer"
   ],
