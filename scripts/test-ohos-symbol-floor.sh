@@ -78,6 +78,41 @@ fi
 info "floor sysroot: $FLOOR_SYSROOT (API ${FLOOR_API:-unknown})"
 info "triple:        $TRIPLE"
 
+# The triple selects which sysroot the artifact is measured against, and it
+# defaults rather than being derived, so pointing this gate at an aarch64
+# artifact without setting it measures against x86_64 libraries. Most symbol
+# names are identical across architectures, so that mistake passes -- a gate
+# reporting a result for something it did not examine. Check the artifact's own
+# machine instead of trusting the caller.
+case "$TRIPLE" in
+    x86_64-linux-ohos)  WANT_MACHINE="X86-64" ;;
+    aarch64-linux-ohos) WANT_MACHINE="AArch64" ;;
+    *) err "unknown triple: $TRIPLE"; exit 1 ;;
+esac
+for artifact in "$@"; do
+    [[ -f "$artifact" ]] || { err "artifact not found: $artifact"; exit 1; }
+    # One member is enough: an archive mixing architectures would not have
+    # linked. `readelf -h` on an archive prints a header per member -- thousands
+    # of them here -- so the reader stops at the first Machine line. Stopping
+    # early SIGPIPEs readelf, which under `set -o pipefail` fails the pipeline
+    # and, under `set -e`, killed this script with status 141 before it could
+    # report anything. The `|| true` is what makes an intentional early exit
+    # distinguishable from a real failure.
+    GOT_MACHINE="$(readelf -h "$artifact" 2>/dev/null \
+        | awk '/Machine:/ { sub(/^[[:space:]]*Machine:[[:space:]]*/, ""); print; exit }' \
+        || true)"
+    if [[ -z "$GOT_MACHINE" ]]; then
+        err "cannot read the machine type of $artifact; refusing to report a"
+        err "floor result for an artifact this gate could not identify"
+        exit 1
+    fi
+    if [[ "$GOT_MACHINE" != *"$WANT_MACHINE"* ]]; then
+        err "$artifact is $GOT_MACHINE but the floor sysroot selected is $TRIPLE"
+        err "set MIGO_OHOS_TRIPLE to match the artifact"
+        exit 1
+    fi
+done
+
 # ---- 1. index every symbol the floor platform exports -----------------------
 FLOOR_SYMS="$(mktemp)"
 trap 'rm -f "$FLOOR_SYMS" "${ARTIFACT_UNDEF:-}"' EXIT

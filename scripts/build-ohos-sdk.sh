@@ -326,3 +326,19 @@ info "running the package contract"
 for ARCH in "${ARCHES[@]}"; do
     bash "$SCRIPT_DIR/test-ohos-sdk-contract.sh" "$REPO_ROOT/dist/migo-ohos-$ARCH"
 done
+
+# The API floor gate runs here for the same reason, and it was previously wired
+# to nothing at all: it existed, passed when invoked by hand, and no path in the
+# project ever invoked it. On OpenHarmony it is the only check of its kind --
+# there is no __INTRODUCED_IN annotation and no per-API stub library, so nothing
+# else can tell that an import postdates the declared floor.
+info "running the API floor gate"
+for ARCH in "${ARCHES[@]}"; do
+    # The triple must be passed: the gate defaults to x86_64, and most symbol
+    # names are identical across architectures, so an aarch64 archive measured
+    # against x86_64 libraries passes without having been examined. The gate
+    # now rejects that mismatch rather than trusting this loop to be right.
+    MIGO_OHOS_TRIPLE="$ARCH-linux-ohos" \
+        bash "$SCRIPT_DIR/test-ohos-symbol-floor.sh" \
+            "$REPO_ROOT/dist/migo-ohos-$ARCH/lib/libmigo_capi.a"
+done
