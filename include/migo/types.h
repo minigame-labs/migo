@@ -56,6 +56,12 @@
  * metadata. It deliberately has no pkg-config file or versioned shared object:
  * an NDK consumer links the archive into its own native shared library.
  *
+ * Windows ships one as well: scripts/build-windows-sdk.sh produces migo.lib
+ * with a CMake package, scripts/test-windows-sdk-contract.sh gates its export
+ * surface, and the Win32 surface backend attaches an HWND -- the ANGLE path
+ * renders and pointer input reaches content. It reached the same bar Android
+ * did before this macro was allowed to answer for it.
+ *
  * This says a runtime exists, not that the ABI is frozen; MIGO_C_ABI_CANDIDATE
  * remains 1 until the README's blockers are closed.
  *
@@ -93,6 +99,14 @@
 #define MIGO_PLATFORM_IS_LINUX_GNU 0
 #endif
 
+/* Windows. Cygwin is excluded: it defines _WIN32 but presents a POSIX
+ * userspace, and nothing here is built or verified for it. */
+#if defined(_WIN32) && !defined(__CYGWIN__)
+#define MIGO_PLATFORM_IS_WINDOWS 1
+#else
+#define MIGO_PLATFORM_IS_WINDOWS 0
+#endif
+
 /*
  * Whether this platform has a linkable migo runtime.
  *
@@ -114,7 +128,7 @@
  * platform it was compiled for. migo_query_capabilities answers the narrower
  * question and should be preferred wherever the answer must be exact.
  */
-#if MIGO_PLATFORM_IS_LINUX_GNU || MIGO_PLATFORM_IS_ANDROID || MIGO_PLATFORM_IS_OPENHARMONY
+#if MIGO_PLATFORM_IS_LINUX_GNU || MIGO_PLATFORM_IS_ANDROID || MIGO_PLATFORM_IS_WINDOWS || MIGO_PLATFORM_IS_OPENHARMONY
 #define MIGO_C_ABI_HAS_RUNTIME 1
 #else
 #define MIGO_C_ABI_HAS_RUNTIME 0

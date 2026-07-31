@@ -6,9 +6,18 @@ The public markers are intentional:
 
 ```c
 MIGO_C_ABI_CANDIDATE  == 1     /* still a candidate everywhere */
-MIGO_C_ABI_HAS_RUNTIME == 1    /* Linux, Android, OpenHarmony: a linkable runtime exists */
+MIGO_C_ABI_HAS_RUNTIME == 1    /* Linux, Android, Windows, OpenHarmony: a linkable runtime exists */
 MIGO_C_ABI_HAS_RUNTIME == 0    /* every other target */
 ```
+
+Windows joined that list once it met the same bar the others did, not when its
+package first appeared: `scripts/build-windows-sdk.sh` produces `migo.lib` with
+a CMake package, `scripts/test-windows-sdk-contract.sh` gates its export surface
+and refuses to package without it, and the Win32 backend in
+`engine/crates/capi/src/platform/windows.rs` attaches an `HWND` that renders
+through ANGLE and receives pointer input. The macro had said 0 for some time
+after all of that was true — a stale answer in the direction of understating,
+which is the harmless direction, but still a wrong one.
 
 A runtime existing is not the same as the ABI being frozen. Do not treat these headers as a stable SDK: the freeze blockers below are open, and the surface may still change.
 
