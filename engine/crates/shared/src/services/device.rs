@@ -7,8 +7,8 @@ use crate::protocol::error::ServiceError;
 use super::{
     AdService, AuthService, CameraService, ClipboardService, CodecService, FileService,
     GameLogService, ImageApiService, InteractionService, LocationService, NavigateService,
-    NetworkService, PaymentService, ScanCodeService, ShareService, SubpackageService,
-    SystemInfoService, VideoService,
+    NetworkService, PaymentService, PermissionService, ScanCodeService, ShareService,
+    SubpackageService, SystemInfoService, VideoService,
 };
 
 // ==================== Battery ====================
@@ -635,6 +635,14 @@ pub trait SystemUtilServices: Send + Sync {
         None
     }
     fn file(&self) -> Option<Arc<dyn FileService>> {
+        None
+    }
+    /// Host-provided permission decisions.
+    ///
+    /// Returning `None` means the host installed no permission integration, and
+    /// every scope is then denied -- the runtime does not grant on its own. See
+    /// [`PermissionService`] for why that is the only safe default here.
+    fn permission(&self) -> Option<Arc<dyn PermissionService>> {
         None
     }
     fn scan_code(&self) -> Option<Arc<dyn ScanCodeService>> {
