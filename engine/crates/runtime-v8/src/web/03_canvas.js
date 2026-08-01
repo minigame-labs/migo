@@ -23,6 +23,21 @@ class Canvas {
     constructor(rid) {
         this._rid = rid;
         this._offscreen = rid !== 1;
+        // Has the content picked the backing-store size itself?
+        //
+        // Until it does, the main canvas tracks the surface: the platform can
+        // hand us a different one after the content is already running (Android
+        // delivers `surfaceCreated` at one size and `surfaceChanged` at another
+        // when the system bars hide), and a canvas still reporting the old size
+        // leaves the content drawing into part of the window.
+        //
+        // Once the content assigns `width` or `height` it owns the backing
+        // store and this must never be overwritten -- a DPR-naive engine
+        // (Phaser's `Scale.NONE`, vanilla 2D at resolution 1) chooses a fixed
+        // backing on purpose, and one that moved under it would be the same
+        // defect in the other direction. That is also what a browser does: an
+        // explicitly sized canvas does not resize because the window did.
+        this._sizedByContent = false;
         flushGlCommandStream();
         const info = op_get_canvas_info(rid);
         this._width = info['0'];
@@ -45,6 +60,7 @@ class Canvas {
         // Flush pending GL stream before resize so GL commands encoded before this
         // resize arrive at the render thread before the ResizeCanvas command.
         flushGlCommandStream();
+        this._sizedByContent = true;
         op_resize_canvas(this._rid, v, undefined);
         this._width = v;
         if (this._context && this._context._resetShadowState) {
@@ -54,6 +70,7 @@ class Canvas {
     set height(v) {
         // Flush pending GL stream before resize (same ordering invariant as width setter).
         flushGlCommandStream();
+        this._sizedByContent = true;
         op_resize_canvas(this._rid, undefined, v);
         this._height = v;
         if (this._context && this._context._resetShadowState) {
@@ -164,6 +181,40 @@ const getMainCanvas = () => {
     return _mainCanvas;
 };
 
+// The surface changed. Re-read what the render thread now backs the main
+// canvas with, so `canvas.width`/`height` keep describing the pixels the
+// content actually draws into.
+//
+// Without this the canvas reports whatever the surface measured at the instant
+// the content first asked for it, forever. On Android that instant is often the
+// short-lived pre-system-bar-hide surface, and every game that fills its canvas
+// ends up with a dead band along the edge the surface grew into -- with nothing
+// in the rendering path wrong, so no rendering test catches it.
+//
+// Deliberately does NOT create the main canvas: content that never asked for
+// one must not acquire it because the window moved.
+//
+// The 2D drawing state is left alone on purpose. The content did not assign
+// `canvas.width`, so nothing about its context was reset -- and the JS setters
+// de-duplicate against a shadow, so clearing that shadow here (or letting the
+// render side clear its half) would leave the two halves permanently
+// disagreeing about a value the content will never send again.
+const adoptMainCanvasSurfaceSize = () => {
+    const canvas = _mainCanvas;
+    if (!canvas || canvas._sizedByContent) return;
+    let info;
+    try {
+        info = op_get_canvas_info(canvas._rid);
+    } catch (e) {
+        // A surface that cannot be measured is not a reason to stop delivering
+        // the resize; keep the last known size rather than reporting zeroes.
+        console.error("adopt surface size: canvas info read failed:", e);
+        return;
+    }
+    canvas._width = info['0'];
+    canvas._height = info['1'];
+};
+
 // Host-driven WebGL context-loss lifecycle. When the render thread rebuilds the
 // GL share group after a real GPU reset (or a WEBGL_lose_context.loseContext
 // simulation), it drives these events so the engine can drop and rebuild its
@@ -210,5 +261,6 @@ export {
     createCanvas,
     createOffscreenCanvas,
     getMainCanvas,
+    adoptMainCanvasSurfaceSize,
     dispatchWebglContextEvent,
 };
