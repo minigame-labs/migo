@@ -897,6 +897,36 @@ public final class NativeMethods {
         }
     }
 
+    // ==================== Permission Callbacks ====================
+
+    /**
+     * Settle one pending {@code wx.authorize()}.
+     *
+     * @param sessionId The session ID
+     * @param resultJson JSON: {"requestId":N,"granted":true} or {"requestId":N,"error":"..."}
+     */
+    public static void onAuthorizeResult(int sessionId, String resultJson) {
+        if (sessionId >= 0 && resultJson != null) {
+            NativeBridge.onAuthorizeResult(sessionId, resultJson);
+        }
+    }
+
+    /**
+     * Record the host's standing decision for one scope.
+     * <p>
+     * Goes into the native cache that capability checks read. Not routed to
+     * JavaScript: state content could reach is state content could rewrite.
+     *
+     * @param sessionId The session ID
+     * @param scope     wx scope name, e.g. "scope.camera"
+     * @param granted   whether the game may use it
+     */
+    public static void updatePermission(int sessionId, String scope, boolean granted) {
+        if (sessionId >= 0 && scope != null && !scope.isEmpty()) {
+            NativeBridge.updatePermission(sessionId, scope, granted);
+        }
+    }
+
     // ==================== Ad Callbacks ====================
 
     /**

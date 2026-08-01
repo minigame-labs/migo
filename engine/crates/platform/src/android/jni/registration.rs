@@ -8,20 +8,20 @@ use crate::{
         JAVA_METHOD_CACHE, JavaMethodCache, executeScript, getConsoleLogs, getDebugStats,
         getMinApiLevel, init, initIcuData, mod_main, nativeAhbPointerFromHardwareBuffer,
         onAccelerometerChange, onActionSheetResult, onAdEvent, onAudioInterruptionBegin,
-        onAudioInterruptionEnd, onBLECharacteristicValueChange, onBLEConnectionStateChange,
-        onBLEMTUChange, onBeaconServiceChange, onBeaconUpdate, onBluetoothAdapterStateChange,
-        onBluetoothDeviceFound, onCameraEvent, onCameraFrameData, onCheckSessionResult,
-        onChooseImageResult, onChooseMessageFileResult, onCompassChange, onCompressImageResult,
-        onDeviceMotionChange, onDeviceOrientationChange, onFuzzyLocationResult,
-        onGetPhoneNumberResult, onGetUserInfoResult, onGyroscopeChange, onHide, onKeyboardComplete,
-        onKeyboardConfirm, onKeyboardHeightChange, onKeyboardInput, onLocationResult,
-        onLoginResult, onMemoryWarning, onMidasPaymentGameItemResult, onMidasPaymentResult,
-        onModalResult, onNavigateToMiniProgramResult, onNetworkStatusChange,
+        onAudioInterruptionEnd, onAuthorizeResult, onBLECharacteristicValueChange,
+        onBLEConnectionStateChange, onBLEMTUChange, onBeaconServiceChange, onBeaconUpdate,
+        onBluetoothAdapterStateChange, onBluetoothDeviceFound, onCameraEvent, onCameraFrameData,
+        onCheckSessionResult, onChooseImageResult, onChooseMessageFileResult, onCompassChange,
+        onCompressImageResult, onDeviceMotionChange, onDeviceOrientationChange,
+        onFuzzyLocationResult, onGetPhoneNumberResult, onGetUserInfoResult, onGyroscopeChange,
+        onHide, onKeyboardComplete, onKeyboardConfirm, onKeyboardHeightChange, onKeyboardInput,
+        onLocationResult, onLoginResult, onMemoryWarning, onMidasPaymentGameItemResult,
+        onMidasPaymentResult, onModalResult, onNavigateToMiniProgramResult, onNetworkStatusChange,
         onOpenAppAuthorizeSetting, onOpenSettingResult, onOpenSystemBluetoothSetting,
         onRecorderEvent, onRecorderFrameData, onRestart, onScanCodeResult, onShareAppMessageResult,
         onShow, onSubpackageProgress, onSubpackageResult, onSurfaceDestroyed,
         onThermalStatusChanged, onTouch, onUserCaptureScreen, onVideoEvent, onVsync,
-        setDisplayRefreshRate, shutdown, updateSurface, version,
+        setDisplayRefreshRate, shutdown, updatePermission, updateSurface, version,
     },
     jni_profile_contract::{self, JniMethod, MethodDirection},
 };
@@ -124,6 +124,10 @@ fn native_fn_ptr(name: &str) -> Option<*mut c_void> {
         "onOpenSettingResult" => onOpenSettingResult as *mut c_void,
         #[cfg(feature = "api-connectivity")]
         "onNavigateToMiniProgramResult" => onNavigateToMiniProgramResult as *mut c_void,
+        #[cfg(feature = "api-system")]
+        "onAuthorizeResult" => onAuthorizeResult as *mut c_void,
+        #[cfg(feature = "api-system")]
+        "updatePermission" => updatePermission as *mut c_void,
         #[cfg(feature = "api-commerce")]
         "onAdEvent" => onAdEvent as *mut c_void,
         #[cfg(feature = "api-commerce")]

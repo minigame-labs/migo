@@ -7,6 +7,7 @@
 use deno_core::{Extension, OpState, op2};
 use deno_error::JsErrorBox;
 use shared::op_state::HostOpState;
+use shared::services::{Scope, ScopeState};
 
 // ==================== Bluetooth Settings ====================
 
@@ -30,6 +31,7 @@ pub fn op_open_bluetooth_adapter(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -43,6 +45,7 @@ pub fn op_open_bluetooth_adapter(
 
 #[op2(fast)]
 pub fn op_close_bluetooth_adapter(state: &mut OpState) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -57,6 +60,7 @@ pub fn op_close_bluetooth_adapter(state: &mut OpState) -> Result<(), JsErrorBox>
 #[op2]
 #[string]
 pub fn op_get_bluetooth_adapter_state(state: &mut OpState) -> Result<String, JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -73,6 +77,7 @@ pub fn op_start_bluetooth_devices_discovery(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -88,6 +93,7 @@ pub fn op_start_bluetooth_devices_discovery(
 
 #[op2(fast)]
 pub fn op_stop_bluetooth_devices_discovery(state: &mut OpState) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -102,6 +108,7 @@ pub fn op_stop_bluetooth_devices_discovery(state: &mut OpState) -> Result<(), Js
 #[op2]
 #[string]
 pub fn op_get_bluetooth_devices(state: &mut OpState) -> Result<String, JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -119,6 +126,7 @@ pub fn op_get_connected_bluetooth_devices(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<String, JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -137,6 +145,7 @@ pub fn op_make_bluetooth_pair(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -151,6 +160,7 @@ pub fn op_is_bluetooth_device_paired(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -171,6 +181,7 @@ pub fn op_create_ble_connection(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -189,6 +200,7 @@ pub fn op_close_ble_connection(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -206,6 +218,7 @@ pub fn op_get_ble_device_services(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<String, JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -225,6 +238,7 @@ pub fn op_get_ble_device_characteristics(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<String, JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -243,6 +257,7 @@ pub fn op_read_ble_characteristic_value(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -261,6 +276,7 @@ pub fn op_write_ble_characteristic_value(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -279,6 +295,7 @@ pub fn op_notify_ble_characteristic_value_change(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -298,6 +315,7 @@ pub fn op_get_ble_device_rssi(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<String, JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -314,6 +332,7 @@ pub fn op_set_ble_mtu(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -329,6 +348,7 @@ pub fn op_get_ble_mtu(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<String, JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -345,6 +365,7 @@ pub fn op_start_beacon_discovery(
     state: &mut OpState,
     #[string] options_json: String,
 ) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -360,6 +381,7 @@ pub fn op_start_beacon_discovery(
 
 #[op2(fast)]
 pub fn op_stop_beacon_discovery(state: &mut OpState) -> Result<(), JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -374,6 +396,7 @@ pub fn op_stop_beacon_discovery(state: &mut OpState) -> Result<(), JsErrorBox> {
 #[op2]
 #[string]
 pub fn op_get_beacons(state: &mut OpState) -> Result<String, JsErrorBox> {
+    crate::permission::require_scope(state, Scope::Bluetooth)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(bt) = services.bluetooth() {
@@ -384,6 +407,59 @@ pub fn op_get_beacons(state: &mut OpState) -> Result<String, JsErrorBox> {
 }
 
 // ==================== Open Setting (Mode C) ====================
+
+// ==================== Permission (getSetting / authorize) ====================
+
+/// Report the host's decision for every wx scope.
+///
+/// Backs `wx.getSetting()`. Returns the wx-shaped map, e.g.
+/// `{"scope.camera":true,"scope.record":false}`.
+///
+/// Only `Granted` becomes `true`. `Unknown` reports `false` because content
+/// reads this as "may I", and "nobody has been asked" is not a yes -- the
+/// difference between never-asked and refused matters for whether to prompt,
+/// which is `authorize`'s business, not this one's.
+///
+/// The map this replaces was a JavaScript object with every scope hardcoded to
+/// `true`, so content was told it held permissions nobody had granted.
+#[op2]
+#[string]
+pub fn op_get_auth_setting(state: &mut OpState) -> String {
+    let mut out = String::from("{");
+    for (index, scope) in Scope::ALL.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let granted = crate::permission::scope_state(state, *scope) == ScopeState::Granted;
+        out.push('"');
+        out.push_str(scope.as_wx_str());
+        out.push_str("\":");
+        out.push_str(if granted { "true" } else { "false" });
+    }
+    out.push('}');
+    out
+}
+
+/// Ask the host to decide a scope, prompting the user if it sees fit.
+///
+/// Backs `wx.authorize()`. Mode C: the reply arrives on the permission-result
+/// channel, because there may be a human in the loop.
+///
+/// Fails when no host permission service is installed rather than reporting
+/// success. `wx.authorize()` exists to obtain consent; returning success with
+/// nobody asked is the defect this replaces.
+#[op2(fast)]
+pub fn op_authorize(state: &mut OpState, #[string] request_json: String) -> Result<(), JsErrorBox> {
+    let host = state.borrow::<HostOpState>();
+    if let Some(ref services) = host.device_services {
+        if let Some(permission) = services.permission() {
+            return permission
+                .request_scope(&request_json)
+                .map_err(JsErrorBox::generic);
+        }
+    }
+    Err(JsErrorBox::generic("authorize:fail no permission handler"))
+}
 
 #[op2(fast)]
 pub fn op_open_setting(
@@ -648,6 +724,8 @@ deno_core::extension!(
         op_get_device_info,
         op_get_app_authorization_setting,
         op_game_log_report,
+        op_get_auth_setting,
+        op_authorize,
         op_open_setting,
         op_navigate_to_mini_program,
         op_navigate_back_mini_program,

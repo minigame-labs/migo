@@ -56,9 +56,17 @@ jobs:
         run: cargo fetch --locked
 
       - name: C ABI and Surface candidate contract
+        # gcc-multilib is what lets the ILP32 lane compile at all. Without it
+        # the lane prints SKIPPED and passes, and the layout assertions for
+        # 32-bit hosts go unchecked -- which is how `sizeof(MigoHostCallbacks)`
+        # sat wrong on ILP32 for two appended fields before anyone compiled it.
+        # `MIGO_ABI_REQUIRE_ILP32=1` turns a skip into a failure, so an install
+        # that regresses is loud instead of invisible.
         run: |
-          bash scripts/test-c-abi-surface-candidate.sh
-          CC=clang CXX=clang++ bash scripts/test-c-abi-surface-candidate.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-multilib
+          MIGO_ABI_REQUIRE_ILP32=1 bash scripts/test-c-abi-surface-candidate.sh
+          CC=clang CXX=clang++ MIGO_ABI_REQUIRE_ILP32=1 bash scripts/test-c-abi-surface-candidate.sh
 
       - name: SurfaceAttachment lifecycle contract
         # ripgrep is not preinstalled on the runners, and the contract needs it
@@ -103,6 +111,24 @@ jobs:
       # mirror too -- `wx.Deno.core.ops` once handed content 616 invocable ops.
       - name: Runtime internals not published contract
         run: bash scripts/test-runtime-internals-not-published.sh
+
+      # Every op reaching a gated capability must ask the host first. A
+      # permission system covering most of its surface advertises a guarantee it
+      # does not hold, to a customer making a compliance decision on it -- so the
+      # required set is derived from the sources, not from a register someone
+      # has to remember to update.
+      - name: Permission coverage contract
+        run: bash scripts/test-permission-coverage-contract.sh
+
+      # Embedders compile against com.migo.runtime and ship that binding inside
+      # their app, so a method that quietly changes shape costs them a release.
+      # Read from the compiled classes rather than scraped from sources: a rule
+      # for what "looks public" misses things, and what it misses is what
+      # changes unnoticed.
+      - name: Android host API v0 contract
+        run: |
+          (cd platforms/android && ./gradlew --no-daemon :library:compileFullDebugJavaWithJavac)
+          bash scripts/test-android-host-api-contract.sh
 
       # The prescreen scanner answers "which APIs does this bundle need". Its
       # dangerous failure is silent under-reporting -- an alias or computed key
@@ -305,6 +331,16 @@ jobs:
           rm -rf platforms/android/dist
           bash scripts/build-aar.sh --product-profile full release
           bash scripts/build-aar.sh --product-profile slim release
+          # arm64-only variants. The Rust artefacts are already built, so these
+          # only re-run Gradle with abiFilters -- a host shipping arm64 alone
+          # should not have to carry the x86_64 payload, and quoting the
+          # multi-ABI size at an integrator overstates it by roughly double.
+          # Procurement asks what is inside the binary and under what licences.
+          # Generated from the resolved graph, so it describes the tree that was
+          # built rather than what the manifests permit.
+          bash scripts/generate-sbom.sh --out platforms/android/dist/migo-sbom.cdx.json
+          bash scripts/build-aar.sh --product-profile full release arm64-v8a
+          bash scripts/build-aar.sh --product-profile slim release arm64-v8a
 
       # No release may ship a libmigo.so that cannot dlopen on the API 26 floor
       # Migo claims to support. Checks every strong import against the NDK's
@@ -381,6 +417,11 @@ jobs:
             platforms/android/dist/migo-full-release.aar.attestation.json \
             platforms/android/dist/migo-slim-release.aar \
             platforms/android/dist/migo-slim-release.aar.attestation.json \
+            platforms/android/dist/migo-sbom.cdx.json \
+            platforms/android/dist/migo-full-release-arm64-v8a.aar \
+            platforms/android/dist/migo-full-release-arm64-v8a.aar.attestation.json \
+            platforms/android/dist/migo-slim-release-arm64-v8a.aar \
+            platforms/android/dist/migo-slim-release-arm64-v8a.aar.attestation.json \
             platforms/android/dist/version.json \
             platforms/android/dist/version-full.json \
             platforms/android/dist/version-slim.json \
@@ -420,6 +461,11 @@ jobs:
           files: |
             platforms/android/dist/migo-full-release.aar
             platforms/android/dist/migo-full-release.aar.attestation.json
+            platforms/android/dist/migo-sbom.cdx.json
+            platforms/android/dist/migo-full-release-arm64-v8a.aar
+            platforms/android/dist/migo-full-release-arm64-v8a.aar.attestation.json
+            platforms/android/dist/migo-slim-release-arm64-v8a.aar
+            platforms/android/dist/migo-slim-release-arm64-v8a.aar.attestation.json
             platforms/android/dist/migo-slim-release.aar
             platforms/android/dist/migo-slim-release.aar.attestation.json
             platforms/android/dist/version.json

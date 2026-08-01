@@ -82,6 +82,7 @@ ObjectDefineProperties(globalThis, {
     authorize: core.propNonEnumerable(settingApi.authorize),
     openSetting: core.propNonEnumerable(settingApi.openSetting),
     _internalOnOpenSettingResult: core.propNonEnumerable(settingApi._internalOnOpenSettingResult),
+    _internalOnAuthorizeResult: core.propNonEnumerable(settingApi._internalOnAuthorizeResult),
     _internalUpdateAuthSetting: core.propNonEnumerable(settingApi._internalUpdateAuthSetting),
     requestSubscribeSystemMessage: core.propNonEnumerable(settingApi.requestSubscribeSystemMessage),
     requestSubscribeWhatsNew: core.propNonEnumerable(settingApi.requestSubscribeWhatsNew),

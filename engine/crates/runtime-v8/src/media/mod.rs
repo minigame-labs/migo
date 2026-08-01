@@ -4,13 +4,14 @@ use deno_core::{Extension, OpState, op2};
 use deno_error::JsErrorBox;
 use shared::op_state::HostOpState;
 use shared::protocol::error::ServiceError;
-use shared::services::{CameraService, ImageApiService, VideoService};
+use shared::services::{CameraService, ImageApiService, Scope, VideoService};
 
 /// Look up the camera service and call `f` on it.
 fn with_camera<F, T>(state: &mut OpState, err_msg: &'static str, f: F) -> Result<T, JsErrorBox>
 where
     F: FnOnce(&dyn CameraService) -> Result<T, ServiceError>,
 {
+    crate::permission::require_scope(state, Scope::Camera)?;
     let host = state.borrow::<HostOpState>();
     if let Some(ref services) = host.device_services {
         if let Some(svc) = services.camera() {

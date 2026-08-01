@@ -4,36 +4,28 @@
 // openSetting delegates to the host via op (Mode C) so the native settings UI
 // can be shown; falls back to returning current state if no host op available.
 
-import { op_open_setting } from "ext:core/ops";
+import { op_open_setting, op_get_auth_setting, op_authorize } from "ext:core/ops";
 import { wrapAsync, createDeferredApi, createListenerGroup } from "ext:host_v8_base/02_async.js";
 
-// ---- authorisation state (scope -> boolean) --------------------------------
-
-const _authSetting = {
-    "scope.userInfo": true,
-    "scope.userLocation": true,
-    "scope.userLocationBackground": false,
-    "scope.address": true,
-    "scope.invoiceTitle": true,
-    "scope.invoice": true,
-    "scope.werun": true,
-    "scope.record": true,
-    "scope.writePhotosAlbum": true,
-    "scope.camera": true,
-    "scope.bluetooth": true,
-    "scope.addPhoneContact": true,
-    "scope.addPhoneCalendar": true,
-    "scope.WxFriendInteraction": true,
-    "scope.gameClubData": true,
-};
+// ---- authorisation state ---------------------------------------------------
+//
+// The host owns this. There is no local map seeded with defaults: the previous
+// one initialised every scope to `true`, so `wx.getSetting()` told content it
+// held permissions nobody had granted, and a game that checked before acting
+// was misled precisely because it checked.
+//
+// Nothing is cached here either. The host may revise a decision at any time --
+// the user can revoke in system settings while the game runs -- and a cache
+// would answer from a snapshot of when the game started. `op_get_auth_setting`
+// reads the host's current answer.
 
 function _cloneAuthSetting() {
-    const out = {};
-    const keys = Object.keys(_authSetting);
-    for (let i = 0; i < keys.length; i++) {
-        out[keys[i]] = _authSetting[keys[i]];
+    try {
+        return JSON.parse(op_get_auth_setting());
+    } catch (_) {
+        // A malformed reply is not evidence of a grant.
+        return {};
     }
-    return out;
 }
 
 // ---- getSetting ------------------------------------------------------------
@@ -46,16 +38,35 @@ function getSetting(options) {
 
 // ---- authorize -------------------------------------------------------------
 
+// ---- authorize (Mode C - host decides) -------------------------------------
+//
+// Asks the host, which may put the question to the user. The previous version
+// set its own map entry and returned success: an API whose entire purpose is to
+// obtain consent, obtaining none.
+
+const _authorizeApi = createDeferredApi('authorize');
+
 function authorize(options) {
-    return wrapAsync('authorize', function () {
-        const opts = options || {};
-        const scope = opts.scope;
-        if (typeof scope !== 'string' || scope.length === 0) {
+    const opts = options || {};
+    const scope = opts.scope;
+    if (typeof scope !== 'string' || scope.length === 0) {
+        return wrapAsync('authorize', function () {
             throw new Error('scope is required');
-        }
-        _authSetting[scope] = true;
-        return {};
-    }, options);
+        }, options);
+    }
+    return _authorizeApi.invoke(options, function (o, requestId) {
+        op_authorize(JSON.stringify({
+            requestId: requestId,
+            scope: scope,
+            // The reason text the game declared in game.json. A host cannot
+            // write an honest prompt without it; empty when none was declared.
+            desc: typeof o.desc === 'string' ? o.desc : '',
+        }));
+    });
+}
+
+function _internalOnAuthorizeResult(resultJson) {
+    _authorizeApi.settle(resultJson);
 }
 
 // ---- openSetting (Mode C - host op) ---------------------------------------
@@ -72,12 +83,9 @@ function _internalOnOpenSettingResult(resultJson) {
     // Sync authSetting from host result before settling the promise
     var parsed;
     try { parsed = JSON.parse(resultJson); } catch (_) { parsed = {}; }
-    if (parsed.authSetting && typeof parsed.authSetting === 'object') {
-        var keys = Object.keys(parsed.authSetting);
-        for (var i = 0; i < keys.length; i++) {
-            _authSetting[keys[i]] = !!parsed.authSetting[keys[i]];
-        }
-    }
+    // No local sync: the host is the authority and `getSetting` reads it
+    // directly, so copying the reply into a shadow map would only create a
+    // second answer that can disagree with the first.
     _openSettingApi.settle(resultJson);
 }
 
@@ -85,11 +93,13 @@ function _internalOnOpenSettingResult(resultJson) {
 
 // Called from Rust / EvalScript to update a specific scope's auth state.
 //   _internalUpdateAuthSetting('scope.userLocation', false)
-function _internalUpdateAuthSetting(scope, authorized) {
-    if (typeof scope === 'string' && scope.length > 0) {
-        _authSetting[scope] = !!authorized;
-    }
-}
+// Retained for the host-bridge surface, but it no longer stores anything:
+// permission state lives with the host and `getSetting` reads it there. It used
+// to write a local map that `getSetting` returned, which made the state
+// writable by anything that could reach the bridge -- and the bridge holder is
+// reachable from content (`Symbol.for` uses the global registry). A permission
+// answer content can write is not a permission answer.
+function _internalUpdateAuthSetting(_scope, _authorized) {}
 
 // ---- Privacy APIs --------------------------------------------------------
 // @stub getPrivacySetting returns hardcoded { needAuthorization: false }.
@@ -246,6 +256,7 @@ export {
     authorize,
     openSetting,
     _internalOnOpenSettingResult,
+    _internalOnAuthorizeResult,
     _internalUpdateAuthSetting,
     getPrivacySetting,
     openPrivacyContract,
