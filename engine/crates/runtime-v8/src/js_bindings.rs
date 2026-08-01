@@ -31,6 +31,21 @@ pub(crate) struct JsBindings {
     empty_string: v8::Global<v8::String>,
 
     // ---- Touch / Input ----
+    /// The host-bridge dispatcher.
+    ///
+    /// Held as a handle so host callbacks stop being eval'd source that has to
+    /// name `globalThis[Symbol.for('Migo.hostBridge')]` -- a name content
+    /// reaches too, because `Symbol.for` reads the global symbol registry. The
+    /// handle keeps the holder alive through the dispatcher's closure, so the
+    /// symbol can be removed from globalThis once every call site has moved.
+    dispatch_hook_fn: Option<v8::Global<v8::Function>>,
+
+    /// The host-bridge holder itself.
+    ///
+    /// Retained so that reaching a hook never requires looking the holder up by
+    /// name again -- which matters because [`Self::reload`] retires that name
+    /// from the global object as soon as it has resolved it.
+    bridge_holder: Option<v8::Global<v8::Object>>,
     enqueue_touch_event_fn: Option<v8::Global<v8::Function>>,
 
     // ---- Audio ----
@@ -108,6 +123,8 @@ impl JsBindings {
         let mut this = Self {
             main_js_context,
             empty_string,
+            dispatch_hook_fn: None,
+            bridge_holder: None,
             enqueue_touch_event_fn: None,
             enqueue_inner_audio_event_fn: None,
             recorder_event_fn: None,
@@ -185,7 +202,38 @@ impl JsBindings {
             }
         }
 
+        /// Remove `Symbol.for('Migo.hostBridge')` from the global object.
+        ///
+        /// The symbol is in the *global* registry, so any script that asks for
+        /// it gets the same one -- content included, which is how the holder
+        /// was reachable in the first place. Deleting the property does not
+        /// disturb the holder: `99_main.js` closes over it and the caller below
+        /// keeps a handle, so both sides still reach every hook, and nobody who
+        /// only knows the name reaches any of them.
+        fn retire_bridge_name(scope: &v8::PinScope<'_, '_>, global: v8::Local<v8::Object>) {
+            let Some(name) = v8::String::new(scope, "Migo.hostBridge") else {
+                return;
+            };
+            let sym = v8::Symbol::for_key(scope, name);
+            global.delete(scope, sym.into());
+        }
+
+        // Resolve the holder once, keep it, and retire the name in the same
+        // scope. Ordering is the safety property: a reload after the name is
+        // gone finds nothing, so it must use what was retained the first time.
+        let previously_retained = self.bridge_holder.clone();
+        let holder = self.with_main_context(rt, |scope, _ctx, global| {
+            let bridge = match &previously_retained {
+                Some(retained) => v8::Local::new(scope, retained),
+                None => resolve_host_bridge(scope, global),
+            };
+            retire_bridge_name(scope, global);
+            v8::Global::new(scope, bridge)
+        });
+        self.bridge_holder = Some(holder.clone());
+
         let (
+            dispatch_hook,
             enqueue_touch,
             enqueue_audio,
             rec_event,
@@ -213,11 +261,12 @@ impl JsBindings {
             key_down,
             key_up,
             video_event,
-        ) = self.with_main_context(rt, |scope, _ctx, global| {
+        ) = self.with_main_context(rt, |scope, _ctx, _global| {
             // Hooks were relocated off the global onto the host-bridge holder
-            // (see 99_main.js). Resolve it once, then look up every hook there.
-            let bridge = resolve_host_bridge(scope, global);
+            // (see 99_main.js); look every one of them up there.
+            let bridge = v8::Local::new(scope, &holder);
             (
+                get_global_fn(scope, bridge, "_internalDispatch"),
                 get_global_fn(scope, bridge, "_internalEnqueueRawTouchEvent"),
                 get_global_fn(scope, bridge, "_internalEnqueueInnerAudioEvent"),
                 get_global_fn(scope, bridge, "_internalOnRecorderEvent"),
@@ -252,6 +301,7 @@ impl JsBindings {
             )
         });
 
+        self.dispatch_hook_fn = dispatch_hook;
         self.enqueue_touch_event_fn = enqueue_touch;
         self.enqueue_inner_audio_event_fn = enqueue_audio;
         self.recorder_event_fn = rec_event;
@@ -290,8 +340,8 @@ impl JsBindings {
             composition_start,
             composition_update,
             composition_end,
-        ) = self.with_main_context(rt, |scope, _ctx, global| {
-            let bridge = resolve_host_bridge(scope, global);
+        ) = self.with_main_context(rt, |scope, _ctx, _global| {
+            let bridge = v8::Local::new(scope, &holder);
             (
                 get_global_fn(scope, bridge, "_internalTriggerWebglContextEvent"),
                 get_global_fn(scope, bridge, "_internalTriggerFocusChanged"),
@@ -316,8 +366,8 @@ impl JsBindings {
         // one above: the first tuple is already at the limit of what is
         // readable, not because these hooks are optional in a different way.
         let (mouse_down, mouse_move, mouse_up, wheel) =
-            self.with_main_context(rt, |scope, _ctx, global| {
-                let bridge = resolve_host_bridge(scope, global);
+            self.with_main_context(rt, |scope, _ctx, _global| {
+                let bridge = v8::Local::new(scope, &holder);
                 (
                     get_global_fn(scope, bridge, "_internalTriggerMouseDown"),
                     get_global_fn(scope, bridge, "_internalTriggerMouseMove"),
@@ -393,6 +443,32 @@ impl JsBindings {
 
             let func = v8::Local::new(scope, func_g);
             let _ = func.call(scope, global.into(), &args);
+        });
+    }
+
+    /// Call one host-bridge hook by name, with arguments encoded as a JSON array.
+    ///
+    /// Replaces building JS source that names the holder. The four call shapes
+    /// in use -- no arguments, one JSON string, one parsed object, plain numbers
+    /// -- all encode as an array, so the caller does not have to say which it is.
+    ///
+    /// Silent when the dispatcher is missing: that means bindings have not been
+    /// resolved yet, which is a start-up ordering question rather than anything
+    /// content did, and the old channel is still in place until every site has
+    /// moved.
+    pub fn invoke_host_hook(&self, rt: &mut deno_core::JsRuntime, hook: &str, args_json: &str) {
+        let Some(func_g) = self.dispatch_hook_fn.clone() else {
+            return;
+        };
+        self.with_main_context(rt, |scope, _ctx, global| {
+            let Some(name) = v8::String::new(scope, hook) else {
+                return;
+            };
+            let Some(args) = v8::String::new(scope, args_json) else {
+                return;
+            };
+            let func = v8::Local::new(scope, func_g);
+            let _ = func.call(scope, global.into(), &[name.into(), args.into()]);
         });
     }
 

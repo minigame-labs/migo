@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::{
     collections::HashMap,
     sync::{
@@ -14,7 +15,7 @@ use shared::{
     config::InitOptions,
     error::EngineResult,
     host_channel::CriticalHostCommandSender,
-    js_escape::{HOST_BRIDGE_EXPR, escape_for_js_string},
+    js_escape::{HOOK_ARGS_NONE, hook_args_one},
     op_state::{ContextLostState, HostOpState, HostTx, RafRx},
     protocol::host_cmd::HostCommand,
     protocol::render_cmd::{CanvasCmd, RenderCommand},
@@ -190,7 +191,7 @@ pub(crate) struct Host {
     /// but has not yet delivered a fresh Surface.  WeChat/Chromium effectively
     /// dispatch visibility callbacks only once the page can render again; doing
     /// it earlier lets game code run against a paused render/audio subsystem.
-    pending_on_show_script: Option<String>,
+    pending_on_show_args: Option<Cow<'static, str>>,
 
     /// Per-session GPU caps shared with the render thread.
     /// Survives JS runtime restarts (same GL context).
@@ -523,7 +524,7 @@ impl Host {
             last_dispatched_context_lost: false,
             last_context_epoch: 0,
             render_error_throttle: HashMap::new(),
-            pending_on_show_script: None,
+            pending_on_show_args: None,
             gpu_caps,
             render_notify,
         };
@@ -702,13 +703,18 @@ impl Host {
             }
             HostCommand::EvalScript { source } => self.on_eval_script(source),
 
+            HostCommand::InvokeHostHook { hook, args_json } => {
+                self.js.invoke_host_hook(hook, &args_json);
+                Ok(())
+            }
+
             HostCommand::Restart => self.on_restart().await,
 
             HostCommand::OnShow { options_json } => {
                 // Mark foreground so network polling ops resume normal rate.
                 self.backgrounded.store(false, Ordering::Relaxed);
 
-                let script = self.build_on_show_script(options_json.as_deref());
+                let on_show_args = self.build_on_show_args(options_json.as_deref());
 
                 if self.render.has_live_surface() {
                     // The SurfaceView surface survived the hide (Android does not
@@ -718,12 +724,13 @@ impl Host {
                     // stay frozen and onShow would never fire.
                     self.enter_foreground();
                     self.js.set_timer_backgrounded(false);
-                    let _ = self.js.exec_script("onshow", &script);
+                    self.js
+                        .invoke_host_hook("_internalTriggerOnShow", &on_show_args);
                 } else {
                     // Android fires Activity.onResume before surfaceCreated: the
                     // old surface is already gone. Defer render/audio resume and
                     // onShow until the new surface arrives (on_update_surface).
-                    self.pending_on_show_script = Some(script);
+                    self.pending_on_show_args = Some(on_show_args);
                 }
                 Ok(())
             }
@@ -738,14 +745,12 @@ impl Host {
                 // The host/V8 thread stays alive for timers, network, etc.
                 self.render.pause();
                 self.audio.pause();
-                self.pending_on_show_script = None;
+                self.pending_on_show_args = None;
 
-                let result = self.js.exec_script(
-                    "onhide",
-                    &format!("{HOST_BRIDGE_EXPR}._internalTriggerOnHide()"),
-                );
+                self.js
+                    .invoke_host_hook("_internalTriggerOnHide", HOOK_ARGS_NONE);
                 self.js.set_timer_backgrounded(true);
-                result
+                Ok(())
             }
 
             HostCommand::OnFocusChanged { focused } => {
@@ -753,15 +758,17 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnAudioInterruptionBegin => self.js.exec_script(
-                "audio_interruption_begin",
-                &format!("{HOST_BRIDGE_EXPR}._internalTriggerAudioInterruptionBegin()"),
-            ),
+            HostCommand::OnAudioInterruptionBegin => {
+                self.js
+                    .invoke_host_hook("_internalTriggerAudioInterruptionBegin", HOOK_ARGS_NONE);
+                Ok(())
+            }
 
-            HostCommand::OnAudioInterruptionEnd => self.js.exec_script(
-                "audio_interruption_end",
-                &format!("{HOST_BRIDGE_EXPR}._internalTriggerAudioInterruptionEnd()"),
-            ),
+            HostCommand::OnAudioInterruptionEnd => {
+                self.js
+                    .invoke_host_hook("_internalTriggerAudioInterruptionEnd", HOOK_ARGS_NONE);
+                Ok(())
+            }
 
             HostCommand::OnTouch(touch) => {
                 let count = (touch.count as usize).min(touch.points.len());
@@ -1085,10 +1092,11 @@ impl Host {
                 Ok(())
             }
 
-            HostCommand::OnUserCaptureScreen => self.js.exec_script(
-                "user_capture_screen",
-                &format!("{HOST_BRIDGE_EXPR}._internalTriggerUserCaptureScreen()"),
-            ),
+            HostCommand::OnUserCaptureScreen => {
+                self.js
+                    .invoke_host_hook("_internalTriggerUserCaptureScreen", HOOK_ARGS_NONE);
+                Ok(())
+            }
 
             // Android ADPF thermal status (PowerManager.THERMAL_STATUS_*).
             HostCommand::OnThermalStatusChanged { status } => {
@@ -1204,34 +1212,31 @@ impl Host {
         self.js.exec_script("eval-script", &source)
     }
 
-    /// Build the JS snippet that fires the game's `onShow`, embedding launch
-    /// options (if any) via `JSON.parse` of a safely escaped string.
-    fn build_on_show_script(&self, options_json: Option<&str>) -> String {
+    /// Build the argument list for the game's `onShow`, carrying the launch
+    /// options (if any) as a value rather than as text.
+    ///
+    /// This used to build JS source, which made U+2028/U+2029 a hazard: both
+    /// are valid inside a JSON string yet terminate a line in JS source, so the
+    /// options had to be escaped for a syntax they no longer travel through.
+    /// Nothing here is parsed as source, so that class of escaping bug is gone
+    /// rather than handled.
+    fn build_on_show_args(&self, options_json: Option<&str>) -> Cow<'static, str> {
         let Some(options_json) = options_json else {
-            return format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()");
+            return Cow::Borrowed(HOOK_ARGS_NONE);
         };
         let options_json = options_json.trim();
         if options_json.is_empty() {
-            return format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()");
+            return Cow::Borrowed(HOOK_ARGS_NONE);
         }
         match serde_json::from_str::<Value>(options_json) {
-            Ok(value) if value.is_object() => {
-                // Round-trip through serde_json::to_string and pass via
-                // JSON.parse() with proper JS string escaping. Display on a
-                // serde_json::Value is *mostly* JS-safe, but U+2028/U+2029 are
-                // valid JSON yet act as line terminators in JS source, so
-                // JSON.parse(escaped_string) is universally safe.
-                let json_str = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
-                let escaped = escape_for_js_string(&json_str);
-                format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow(JSON.parse('{escaped}'))")
-            }
-            Ok(_) => format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()"),
+            Ok(value) if value.is_object() => hook_args_one(value),
+            Ok(_) => Cow::Borrowed(HOOK_ARGS_NONE),
             Err(e) => {
                 warn!(
                     "[Host {}] invalid onShow options JSON, fallback to default: {}",
                     self.id, e
                 );
-                format!("{HOST_BRIDGE_EXPR}._internalTriggerOnShow()")
+                Cow::Borrowed(HOOK_ARGS_NONE)
             }
         }
     }
@@ -1249,10 +1254,8 @@ impl Host {
             "raf_resume_kick",
             "globalThis.__migo_restart_raf_loop && globalThis.__migo_restart_raf_loop()",
         );
-        let _ = self.js.exec_script(
-            "window_resize",
-            &format!("{HOST_BRIDGE_EXPR}._internalTriggerWindowResize()"),
-        );
+        self.js
+            .invoke_host_hook("_internalTriggerWindowResize", HOOK_ARGS_NONE);
     }
 
     fn on_update_surface(
@@ -1291,9 +1294,9 @@ impl Host {
         if result.is_ok() {
             if !self.backgrounded.load(Ordering::Relaxed) {
                 self.enter_foreground();
-                if let Some(script) = self.pending_on_show_script.take() {
+                if let Some(args) = self.pending_on_show_args.take() {
                     self.js.set_timer_backgrounded(false);
-                    let _ = self.js.exec_script("onshow", &script);
+                    self.js.invoke_host_hook("_internalTriggerOnShow", &args);
                 }
             }
             info!("[Host {}] on_update_surface completed", self.id);

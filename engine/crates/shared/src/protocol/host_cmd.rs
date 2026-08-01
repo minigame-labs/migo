@@ -212,6 +212,32 @@ pub enum HostCommand {
         source: String,
     },
 
+    /// Call one host-bridge hook by name, arguments encoded as a JSON array.
+    ///
+    /// This is how every host callback is delivered. It replaced [`Self::EvalScript`]
+    /// source, which had to name the hook's holder -- and named it with a symbol
+    /// from the *global* registry, so content could ask for the same one and call
+    /// any of the 78 hooks behind it, rewarded-video completion included.
+    ///
+    /// Dispatching through a handle the runtime resolved at start-up needs no
+    /// name, so there is no longer one to install: `js_bindings` deletes it as
+    /// soon as it has resolved it.
+    ///
+    /// [`Self::EvalScript`] remains for the embedder's own `executeScript`,
+    /// which is the host running its own code and not a callback channel.
+    InvokeHostHook {
+        /// Hook name on the host bridge, e.g. `_internalOnLoginResult`.
+        ///
+        /// `&'static str` on purpose: every hook name is a literal chosen by
+        /// the runtime, and a type that cannot hold a computed string cannot
+        /// carry one that came from somewhere else.
+        hook: &'static str,
+        /// Arguments as a JSON array. Covers every shape in use: `[]` for no
+        /// arguments, `["{...}"]` for a JSON string, `[{...}]` for an object,
+        /// `[1, 0]` for numbers.
+        args_json: Cow<'static, str>,
+    },
+
     // ---- Lifecycle Events ----
     /// Restart the current game runtime.
     ///

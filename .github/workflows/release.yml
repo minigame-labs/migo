@@ -120,6 +120,14 @@ jobs:
       - name: Permission coverage contract
         run: bash scripts/test-permission-coverage-contract.sh
 
+      # The host-bridge holder is reachable from content (`Symbol.for` reads the
+      # global registry), and closing that is an all-or-nothing migration of
+      # every call site -- one left behind evaluates against a deleted holder
+      # and fails silently on the channel every async result travels. Until that
+      # lands, the debt is pinned so it cannot grow unnoticed.
+      - name: Host bridge channel inventory
+        run: bash scripts/test-host-bridge-channel-contract.sh
+
       # Embedders compile against com.migo.runtime and ship that binding inside
       # their app, so a method that quietly changes shape costs them a release.
       # Read from the compiled classes rather than scraped from sources: a rule

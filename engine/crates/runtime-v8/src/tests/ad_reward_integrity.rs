@@ -321,25 +321,16 @@ mod ad_reward_integrity_tests {
 
     /// The ad event hook is not a string-keyed global.
     ///
-    /// That is all this proves, and the name says so. It is *not* proof that
-    /// content cannot reach the channel: the host-bridge holder lives at
+    /// That is all this proves, and the name says so -- it looks at string keys
+    /// only, and says nothing about symbol-keyed ones.
+    ///
+    /// The side it does not cover used to be open: the holder was installed at
     /// `globalThis[Symbol.for('Migo.hostBridge')]`, and `Symbol.for` reads the
-    /// **global** symbol registry, so content can retrieve the same symbol and
-    /// call any of the ~78 hooks -- verified against a real runtime.
-    ///
-    /// That does not weaken the reward invariant this file exists for, which is
-    /// that *the runtime* cannot mint a reward: the host remains authoritative
-    /// for what it reports to its ad network, and content forging its own
-    /// `close` callback only deceives itself. It does matter wherever the JS
-    /// context holds more than one trust domain -- a publisher-injected
-    /// anti-cheat or analytics prelude expecting to observe real host events is
-    /// the concrete case -- and it weakens the auditable-boundary claim.
-    ///
-    /// Closing it means host callbacks stop travelling as eval'd source that
-    /// has to name a holder content can also name, and go through the
-    /// already-resolved binding table in `js_bindings.rs` instead. That is an
-    /// architectural change to the callback channel, not something to bolt on
-    /// here; tracked in CLAUDE.md §8.
+    /// **global** registry, so content could retrieve the same symbol and call
+    /// any of the 78 hooks on it -- `_internalOnAdEvent` among them. It is
+    /// closed now: the runtime resolves the holder once, keeps a handle, and
+    /// deletes the name. Covered by `tests/host_bridge_dispatch.rs`, which is
+    /// where that invariant belongs; this file stays about reward integrity.
     #[tokio::test(start_paused = true)]
     async fn the_ad_event_hook_is_not_a_string_keyed_global() {
         let (mut rt, _calls) = boot_hosted();

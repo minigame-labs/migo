@@ -53,23 +53,18 @@ installApiNamespaces();
 // (Engine JS uses `import { core } from "ext:core/mod.js"`, never global Deno.)
 
 // Move host-bridge hooks (_internal*) off the game-visible global onto a
-// Symbol-keyed holder. These are the engine's event-pump entry points the
-// HOST calls -- input/sensor/keyboard dispatch (via js_bindings.rs name
-// lookup) and result callbacks for login/payment/modal/etc. (via the host's
-// EvalScript channel). Games must never see them: an audit dump of
+// holder. These are the engine's event-pump entry points the HOST calls --
+// input/sensor/keyboard dispatch, and result callbacks for
+// login/payment/modal/etc. Games must never see them: an audit dump of
 // `Object.getOwnPropertyNames(globalThis)` would otherwise reveal payment and
 // login callback entry points.
 //
 // `getOwnPropertyNames` does not enumerate Symbol keys, so relocating the
 // hooks behind `Symbol.for('Migo.hostBridge')` keeps the audit surface clean.
-// NOTE: the Symbol is in the global registry and therefore guessable -- this
-// hardens the AUDIT SURFACE, it is not a forgery defense. Preventing a
-// malicious script from invoking these hooks requires host-side origin
-// checks, tracked separately.
-//
-// Both host channels resolve the holder by this same Symbol:
-//   - js_bindings.rs reads global[Symbol.for('Migo.hostBridge')] then the hook
-//   - build_eval_script() emits globalThis[Symbol.for('Migo.hostBridge')].<hook>(...)
+// That alone was never a forgery defense: the Symbol is in the *global*
+// registry, so content asking for the same one got the holder and every hook
+// on it. What closes that is below -- the name exists only long enough for
+// js_bindings.rs to resolve it, and is deleted once it holds a handle.
 const _hostBridge = { __proto__: null };
 const _globalKeys = Object.getOwnPropertyNames(globalThis);
 for (let i = 0; i < _globalKeys.length; i++) {
@@ -83,9 +78,51 @@ for (let i = 0; i < _globalKeys.length; i++) {
         }
     }
 }
+// One entry point the host holds a handle to, so its callbacks need no name
+// content could also use.
+//
+// `js_bindings` resolves this once at start-up and keeps a handle; the handle
+// keeps the holder alive, and `_hostBridge` above is a module-scope binding
+// nothing looks up by name. That is why deleting the global symbol below costs
+// nothing on this side.
+//
+// Uniform shape on purpose. The call sites it replaces take four forms -- no
+// arguments, one JSON string, one parsed object, and plain numbers -- and
+// `apply` over a decoded array covers all of them without the caller having to
+// say which it is.
+Object.defineProperty(_hostBridge, "_internalDispatch", {
+    value: function (name, argsJson) {
+        const hook = _hostBridge[name];
+        if (typeof hook !== "function") return;
+        let args;
+        try {
+            args = JSON.parse(argsJson);
+        } catch (_) {
+            // A malformed payload is dropped rather than guessed at: calling a
+            // host hook with the wrong arguments is worse than not calling it.
+            return;
+        }
+        if (!Array.isArray(args)) return;
+        hook.apply(_hostBridge, args);
+    },
+    enumerable: false,
+    configurable: false,
+    writable: false,
+});
+
+// The one thing this property is for: letting `js_bindings` find the holder
+// once. It removes it immediately afterwards (`retire_bridge_name`), so by the
+// time content runs there is nothing here to retrieve.
 Object.defineProperty(globalThis, Symbol.for("Migo.hostBridge"), {
     value: _hostBridge,
     enumerable: false,
-    configurable: false,
+    // Configurable because a non-configurable property cannot be deleted, and
+    // `delete` on one is a silent no-op -- the holder would stay reachable with
+    // nothing reporting a failure. Guarded by
+    // scripts/test-host-bridge-channel-contract.sh.
+    //
+    // Nothing runs between this line and the removal except runtime start-up,
+    // so there is no window in which content could redefine it.
+    configurable: true,
     writable: false,
 });

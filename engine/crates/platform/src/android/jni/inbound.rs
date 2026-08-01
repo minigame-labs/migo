@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-use shared::js_escape::{HOST_BRIDGE_EXPR, build_eval_script};
+use shared::js_escape::{hook_args_one, hook_args_two};
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -80,15 +80,19 @@ fn forward_json_result_to_js(
     env: &mut JNIEnv,
     host_id: jint,
     result_json: &JString,
-    js_callback: &str,
+    js_callback: &'static str,
     fallback_json: &str,
 ) {
     let json: String = env
         .get_string(result_json)
         .map(|s| s.into())
         .unwrap_or_else(|_| fallback_json.to_string());
-    let cmd = HostCommand::EvalScript {
-        source: build_eval_script(js_callback, &json),
+    // The hook is handed the JSON *string* and parses it itself, which is what
+    // it has always received. Decoding here would change the argument every
+    // one of these callbacks sees.
+    let cmd = HostCommand::InvokeHostHook {
+        hook: js_callback,
+        args_json: hook_args_one(json.as_str()),
     };
     let _ = send_command_to_host(host_id, cmd);
 }
@@ -613,16 +617,9 @@ pub(crate) extern "system" fn onOpenSystemBluetoothSetting<'local>(
                 enabled
             )
         };
-        let escaped = json
-            .replace('\\', "\\\\")
-            .replace('\'', "\\'")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r");
-        let cmd = HostCommand::EvalScript {
-            source: format!(
-                "{HOST_BRIDGE_EXPR}._internalOnOpenBluetoothSettingResult('{}');",
-                escaped
-            ),
+        let cmd = HostCommand::InvokeHostHook {
+            hook: "_internalOnOpenBluetoothSettingResult",
+            args_json: hook_args_one(json.as_str()),
         };
         let _ = send_command_to_host(host_id, cmd);
     });
@@ -635,11 +632,9 @@ pub(crate) extern "system" fn onOpenAppAuthorizeSetting<'local>(
     code: jint,
 ) {
     jni_safe!("onOpenAppAuthorizeSetting", {
-        let cmd = HostCommand::EvalScript {
-            source: format!(
-                "{HOST_BRIDGE_EXPR}._internalOnOpenAppAuthorizeSettingFinished({});",
-                code
-            ),
+        let cmd = HostCommand::InvokeHostHook {
+            hook: "_internalOnOpenAppAuthorizeSettingFinished",
+            args_json: hook_args_one(code),
         };
         let _ = send_command_to_host(host_id, cmd);
     });
@@ -880,11 +875,9 @@ pub(crate) extern "system" fn onModalResult<'local>(
     cancel: jint,
 ) {
     jni_safe!("onModalResult", {
-        let cmd = HostCommand::EvalScript {
-            source: format!(
-                "{HOST_BRIDGE_EXPR}._internalOnModalResult({},{});",
-                confirm, cancel
-            ),
+        let cmd = HostCommand::InvokeHostHook {
+            hook: "_internalOnModalResult",
+            args_json: hook_args_two(confirm, cancel),
         };
         let _ = send_command_to_host(host_id, cmd);
     });
@@ -897,11 +890,9 @@ pub(crate) extern "system" fn onActionSheetResult<'local>(
     tap_index: jint,
 ) {
     jni_safe!("onActionSheetResult", {
-        let cmd = HostCommand::EvalScript {
-            source: format!(
-                "{HOST_BRIDGE_EXPR}._internalOnActionSheetResult({});",
-                tap_index
-            ),
+        let cmd = HostCommand::InvokeHostHook {
+            hook: "_internalOnActionSheetResult",
+            args_json: hook_args_one(tap_index),
         };
         let _ = send_command_to_host(host_id, cmd);
     });

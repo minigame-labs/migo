@@ -8,6 +8,7 @@
 mod ad_reward_integrity;
 mod binary_helper;
 mod global_surface;
+mod host_bridge_dispatch;
 mod install_receipt;
 mod permission_reporting;
 mod prelude;
