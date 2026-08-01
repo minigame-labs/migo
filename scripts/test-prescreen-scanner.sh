@@ -22,7 +22,18 @@ for required in "$FIXTURE/bundle" "$FIXTURE/surface.json" "$SCANNER"; do
     [[ -e "$required" ]] || { echo "ERROR: missing $required" >&2; exit 1; }
 done
 
-report="$(bash "$SCANNER" "$FIXTURE/bundle" --surface "$FIXTURE/surface.json" 2>/dev/null)"
+# Hermetic: the fixture carries its own wx reference. The repo's real dump is
+# git-ignored, so a test that reached for it passed on the author's machine and
+# failed on a fresh checkout -- which is exactly what happened.
+report="$(bash "$SCANNER" "$FIXTURE/bundle" \
+    --surface "$FIXTURE/surface.json" \
+    --wx-reference "$FIXTURE/wx-reference.json" 2>/dev/null)"
+
+# And the degraded path is a behaviour worth pinning: without a reference the
+# report must say so, not silently merge the two buckets.
+degraded="$(bash "$SCANNER" "$FIXTURE/bundle" \
+    --surface "$FIXTURE/surface.json" \
+    --wx-reference "$FIXTURE/definitely-absent.json" 2>/dev/null)"
 
 [[ -n "$report" ]] || { echo "FAIL: scanner produced no report" >&2; exit 1; }
 
@@ -76,6 +87,28 @@ refute "does not claim complete coverage while sites are unresolved" \
 # The caveats are the difference between a report and a claim.
 check "states it is not a compatibility verdict" 'Not a compatibility verdict'
 check "states Linux cannot answer it" 'Linux player has no device services'
+
+# --- degraded path -------------------------------------------------------
+check_degraded() {
+    if grep -qE "$2" <<<"$degraded"; then
+        printf '  ok    %s\n' "$1"
+    else
+        printf '  FAIL  %s\n' "$1" >&2
+        failures=$((failures + 1))
+    fi
+}
+refute_degraded() {
+    if grep -qE "$2" <<<"$degraded"; then
+        printf '  FAIL  %s\n' "$1" >&2
+        failures=$((failures + 1))
+    else
+        printf '  ok    %s\n' "$1"
+    fi
+}
+check_degraded "says the wx reference is unavailable" 'wx reference table unavailable'
+check_degraded "warns the gap count is overstated" 'overstates them'
+refute_degraded "does not claim a classified gap count without a reference" \
+    '\*\*not published, and wx has it\*\*'
 
 if [[ $failures -gt 0 ]]; then
     echo "FAIL: prescreen scanner contract ($failures check(s))" >&2

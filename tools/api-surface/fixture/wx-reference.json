@@ -1,0 +1,13 @@
+{
+  "wx": {
+    "createBannerAd": {},
+    "createCanvas": {},
+    "createInnerAudioContext": {},
+    "createOffScreenCanvas": {},
+    "getLaunchOptionsSync": {},
+    "getSystemInfoSync": {},
+    "offTouchStart": {},
+    "onTouchStart": {},
+    "reportMonitor": {}
+  }
+}

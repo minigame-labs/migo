@@ -33,6 +33,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUNDLE=""
 SURFACE=""
 OUT=""
+# Defaults to the local wx dump, which is git-ignored: absent for anyone who has
+# not produced one, so the report says so rather than quietly merging buckets.
+WXREF="$ROOT_DIR/tools/wx-api-diff/wx-android.json"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -40,6 +43,8 @@ while [[ $# -gt 0 ]]; do
         --surface=*) SURFACE="${1#*=}"; shift ;;
         --out) OUT="${2:?--out requires a path}"; shift 2 ;;
         --out=*) OUT="${1#*=}"; shift ;;
+        --wx-reference) WXREF="${2:?--wx-reference requires a path}"; shift 2 ;;
+        --wx-reference=*) WXREF="${1#*=}"; shift ;;
         -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) BUNDLE="$1"; shift ;;
     esac
@@ -55,7 +60,7 @@ if [[ -z "$SURFACE" ]]; then
     bash "$ROOT_DIR/scripts/dump-api-surface.sh" --out "$SURFACE" >/dev/null
 fi
 
-python3 - "$ROOT_DIR" "$BUNDLE" "$SURFACE" <<'PY' > "${OUT:-/dev/stdout}"
+python3 - "$ROOT_DIR" "$BUNDLE" "$SURFACE" "$WXREF" <<'PY' > "${OUT:-/dev/stdout}"
 from __future__ import annotations
 
 import json
@@ -74,7 +79,11 @@ if not published_wx:
     print("ERROR: the surface dump has no `wx` names; refusing to report", file=sys.stderr)
     raise SystemExit(1)
 
-reference_path = root / "tools/wx-api-diff/wx-android.json"
+# The wx reference table separates "this build lacks it" from "wx lacks it
+# too", which are different findings. It is git-ignored, so it is absent on a
+# fresh checkout -- and a report that silently merged the two buckets would
+# inflate the gap count without saying why.
+reference_path = pathlib.Path(sys.argv[4])
 reference_wx: set[str] = set()
 if reference_path.exists():
     reference_wx = set(json.loads(reference_path.read_text(encoding="utf-8")).get("wx", {}).keys())
@@ -172,16 +181,45 @@ out.append("| | count |")
 out.append("|---|---:|")
 out.append(f"| `wx.*` names referenced | {len(wx_used)} |")
 out.append(f"| of those, published by this build | {len(wx_ok)} |")
-out.append(f"| **not published, and wx has it** | **{len(missing_but_wx_has)}** |")
-out.append(f"| not published, and not a wx API either | {len(missing_in_wx_too)} |")
+if reference_wx:
+    out.append(f"| **not published, and wx has it** | **{len(missing_but_wx_has)}** |")
+    out.append(f"| not published, and not a wx API either | {len(missing_in_wx_too)} |")
+else:
+    out.append(f"| **not published by this build** | **{len(missing_but_wx_has)}** |")
+    out.append("| of those, how many wx has | *unknown -- no reference table* |")
 out.append(f"| `migo.*` names not published | {len(migo_missing)} |")
 out.append(f"| **sites this scanner cannot resolve** | **{len(opaque)}** |")
 out.append("")
 
-if missing_but_wx_has:
-    out.append("## Referenced, wx has it, this build does not")
+if not reference_wx:
+    out.append("## wx reference table unavailable")
     out.append("")
-    out.append("Each of these is a real gap for this bundle.")
+    out.append(
+        f"`{reference_path}` was not found, so this report **cannot separate** "
+        "\"this build lacks it\" from \"wx lacks it too\". Every unpublished name "
+        "below is listed as a gap, which overstates them: some are likely adapter "
+        "shims or other platforms' SDKs that wx never had either."
+    )
+    out.append("")
+    out.append(
+        "Produce one with `tools/wx-api-diff/wx-api-dump.js` against a real wx "
+        "runtime, or pass `--wx-reference FILE`."
+    )
+    out.append("")
+
+if missing_but_wx_has:
+    header = (
+        "## Referenced, wx has it, this build does not"
+        if reference_wx
+        else "## Referenced but not published by this build"
+    )
+    out.append(header)
+    out.append("")
+    out.append(
+        "Each of these is a real gap for this bundle."
+        if reference_wx
+        else "Unclassified -- see the note above about the missing reference table."
+    )
     out.append("")
     for name in missing_but_wx_has:
         out.append(f"- `wx.{name}`")
