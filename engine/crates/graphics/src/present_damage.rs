@@ -1029,18 +1029,39 @@ mod wiring_source_guards {
         // symptom is a black screen on resume with JS still drawing, the
         // context healthy, and blit and swap both reporting success -- nothing
         // downstream can catch it, so the wiring is asserted here.
-        let create = function_body(MGR, "pub(crate) fn create_onscreen");
-        let capture = create
-            .find("drawing_state()")
-            .expect("surface recreate must capture the 2D drawing state");
-        let destroy = create
-            .find("self.destroy_onscreen_internal(id)")
-            .expect("surface recreate must destroy the previous onscreen canvas");
+        //
+        // The capture lives in the *teardown*, not in the install. On Android
+        // those are separate events: `surfaceDestroyed` takes the context away
+        // when the app is backgrounded and `surfaceCreated` arrives whenever
+        // the user returns. An install that asks `contexts_2d` whether this
+        // canvas had a 2D context is asking after the answer was destroyed --
+        // it reads `false`, skips the rebuild, and the game paints into nothing
+        // for the rest of its life. Measured on a Mate30 Pro: ~900k
+        // `2d context not found` per 8s with rAF still running at 60fps.
+        let teardown = function_body(MGR, "fn destroy_onscreen_internal");
+        let stash = teardown
+            .find("self.stash_onscreen_2d_restore(id)")
+            .expect("teardown must record what the next install owes the content");
+        let drop = teardown
+            .find("self.drop_2d_context(id")
+            .expect("teardown must drop the 2D context");
         assert!(
-            capture < destroy,
-            "the 2D drawing state must be captured before the context is destroyed"
+            stash < drop,
+            "the 2D drawing state must be recorded before the context is dropped"
         );
 
+        let helper = function_body(MGR, "fn stash_onscreen_2d_restore");
+        assert!(
+            helper.contains("drawing_state()"),
+            "the recorded obligation must carry the drawing state, not just a flag"
+        );
+
+        let create = function_body(MGR, "pub(crate) fn create_onscreen");
+        let take = create.find("self.onscreen_2d_restore.take()").expect(
+            "the install must discharge the obligation a teardown recorded -- deriving it \
+                 from `contexts_2d` here reads a context an earlier surfaceDestroyed \
+                 already removed",
+        );
         let reinit = create
             .find("context_2d_impl::init_skia_for_canvas")
             .expect("surface recreate must re-create the 2D context");
@@ -1048,8 +1069,8 @@ mod wiring_source_guards {
             .find("adopt_drawing_state")
             .expect("surface recreate must restore the captured 2D drawing state");
         assert!(
-            reinit < adopt,
-            "the captured state must be adopted by the context that replaces the old one"
+            take < reinit && reinit < adopt,
+            "the obligation must be read first, then the context rebuilt, then the state adopted"
         );
     }
 
