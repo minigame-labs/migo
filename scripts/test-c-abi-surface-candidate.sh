@@ -185,14 +185,14 @@ check_repository_integration() {
         '^[[:space:]]+bash scripts/test-c-abi-surface-candidate\.sh$' \
         "active PR quality gate"
     require_regex "$ROOT/.github/workflows/release.yml" \
-        '^[[:space:]]+bash scripts/test-c-abi-surface-candidate\.sh$' \
-        "active release quality gate"
+        '^[[:space:]]+MIGO_ABI_REQUIRE_ILP32=1 bash scripts/test-c-abi-surface-candidate\.sh$' \
+        "active release quality gate (ILP32 required)"
     require_regex "$ROOT/.github/workflows/pr-ci.yml" \
-        '^[[:space:]]+CC=clang CXX=clang\+\+ bash scripts/test-c-abi-surface-candidate\.sh$' \
-        "Clang PR quality gate"
+        '^[[:space:]]+CC=clang CXX=clang\+\+ MIGO_ABI_REQUIRE_ILP32=1 bash scripts/test-c-abi-surface-candidate\.sh$' \
+        "Clang PR quality gate (ILP32 required)"
     require_regex "$ROOT/.github/workflows/release.yml" \
-        '^[[:space:]]+CC=clang CXX=clang\+\+ bash scripts/test-c-abi-surface-candidate\.sh$' \
-        "Clang release quality gate"
+        '^[[:space:]]+CC=clang CXX=clang\+\+ MIGO_ABI_REQUIRE_ILP32=1 bash scripts/test-c-abi-surface-candidate\.sh$' \
+        "Clang release quality gate (ILP32 required)"
     require_literal "$ROOT/.github/workflows/pr-ci.yml" \
         "armv7a-linux-androideabi26-clang" "API 26 ARMv7 PR layout gate"
     require_literal "$ROOT/.github/workflows/release.yml" \

@@ -53,9 +53,17 @@ jobs:
         run: cargo fetch --locked
 
       - name: C ABI and Surface candidate contract
+        # gcc-multilib is what lets the ILP32 lane compile at all. Without it
+        # the lane prints SKIPPED and passes, and the layout assertions for
+        # 32-bit hosts go unchecked -- which is how `sizeof(MigoHostCallbacks)`
+        # sat wrong on ILP32 for two appended fields before anyone compiled it.
+        # `MIGO_ABI_REQUIRE_ILP32=1` turns a skip into a failure, so an install
+        # that regresses is loud instead of invisible.
         run: |
-          bash scripts/test-c-abi-surface-candidate.sh
-          CC=clang CXX=clang++ bash scripts/test-c-abi-surface-candidate.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-multilib
+          MIGO_ABI_REQUIRE_ILP32=1 bash scripts/test-c-abi-surface-candidate.sh
+          CC=clang CXX=clang++ MIGO_ABI_REQUIRE_ILP32=1 bash scripts/test-c-abi-surface-candidate.sh
 
       - name: SurfaceAttachment lifecycle contract
         # ripgrep is not preinstalled on the runners, and the contract needs it
